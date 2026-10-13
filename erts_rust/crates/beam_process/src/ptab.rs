@@ -44,9 +44,11 @@
 //!   propagation (a signal to a blocked/idle peer is still applied before the caller returns).
 //!
 //! Servicing drains a receiver's queue **in FIFO order** and applies each signal through
-//! [`exit_policy`] (terminate / trap as `{'EXIT', …}` / ignore) or builds the `{'DOWN', …}`
-//! message. A termination cascades through an explicit worklist (the pending-service queue),
-//! never through recursion, so a link cycle (A↔B) terminates in a bounded number of steps.
+//! [`exit_policy`] (terminate / trap as `{'EXIT', …}` / ignore) — evaluated with the signal's
+//! stored [`ExitFamily`], so a `kill` **link** exit is trappable while an explicit `erlang:exit/2`
+//! `kill` is not — or builds the `{'DOWN', …}` message. A termination cascades through an explicit
+//! worklist (the pending-service queue), never through recursion, so a link cycle (A↔B) terminates
+//! in a bounded number of steps.
 //! [`crate::signal_queue`] states the exact ordering guarantee (and its limits).
 //!
 //! A local **link exit** and a local **monitor-DOWN** go through the queue. A **remote**
@@ -102,7 +104,7 @@ use crate::remote::{
 use crate::run_queue::Priority;
 use crate::signal::{
     build_down_message_port, build_down_message_remote, build_down_message_term,
-    build_exit_message, build_exit_message_term, exit_policy, ExitPolicy, ExitSignal, ReasonClass,
+    build_exit_message, build_exit_message_term, exit_policy, ExitFamily, ExitPolicy, ExitSignal,
     SignalAtoms,
 };
 use crate::signal_queue::PendingSignal;
@@ -896,6 +898,12 @@ impl ProcessTable {
     // --- signals / links / monitors -----------------------------------------
     /// Sends an exit signal to `target`, following [`crate::signal::exit_policy`].
     ///
+    /// This is the **explicit `erlang:exit/2` family** entry point
+    /// ([`ExitFamily::Explicit`]): `kill` is untrappable here, and an ordinary reason is trapped
+    /// when `target` traps exits. [`ProcessTable::link`]'s `noproc` signal also goes through it —
+    /// `noproc` is neither `kill` nor `normal`, so the two families agree on it, and its
+    /// [`ExitEffect`] is the same as what [`ProcessTable::apply_head_signal`] will do.
+    ///
     /// The signal is **enqueued** on the target's [`SignalQueue`](crate::signal_queue) — never
     /// applied inline (the reason is copied into the target's own heap, so it outlives the
     /// signaller) — and then serviced **eagerly** unless the target is the currently executing
@@ -921,7 +929,7 @@ impl ProcessTable {
             return Err(error::unknown_process());
         };
         let trapping = process.is_trapping_exit();
-        let effect = match exit_policy(signal.reason, trapping, &self.atoms) {
+        let effect = match exit_policy(signal.reason, trapping, ExitFamily::Explicit, &self.atoms) {
             ExitPolicy::Ignore => ExitEffect::Ignored,
             ExitPolicy::Trap => ExitEffect::Trapped,
             ExitPolicy::Terminate(_) => ExitEffect::Terminated,
@@ -934,7 +942,13 @@ impl ProcessTable {
         let src = self
             .source_off_heap(target, signal.from, &fallback)
             .map(snapshot_off_heap);
-        self.enqueue_exit_signal(target, signal.from, signal.reason, src.as_ref())?;
+        self.enqueue_exit_signal(
+            target,
+            signal.from,
+            signal.reason,
+            ExitFamily::Explicit,
+            src.as_ref(),
+        )?;
 
         // Eagerly service unless the target is the currently executing process, whose signal
         // is deferred to its next schedule-in.
@@ -2057,7 +2071,10 @@ impl ProcessTable {
         let mut receivers: Vec<ProcessId> = Vec::new();
 
         // 1. Links: drop the back-link, then queue an exit signal on the peer. The peer decides
-        //    (through `exit_policy`, at service time) whether it terminates or traps.
+        //    (through `exit_policy`, at service time) whether it terminates or traps. This is the
+        //    **link-exit family** ([`ExitFamily::Linked`]): `kill` IS trappable here and the
+        //    reason is never rewritten, so a trapping peer receives `{'EXIT', pid, kill}` and
+        //    survives while a non-trapping one terminates with `kill` (never `killed`).
         //
         //    Best-effort (see the fn docs): a peer whose heap cannot take the reason copy is
         //    dropped-and-logged and the cascade continues — `pid` is already reclaimed, so the
@@ -2070,9 +2087,13 @@ impl ProcessTable {
                 // The peer died earlier in this same propagation.
                 continue;
             }
-            if let Err(failure) =
-                self.enqueue_exit_signal(target, pid, reason, Some(process.off_heap()))
-            {
+            if let Err(failure) = self.enqueue_exit_signal(
+                target,
+                pid,
+                reason,
+                ExitFamily::Linked,
+                Some(process.off_heap()),
+            ) {
                 beam_common::beam_error!(
                     "beam_process: dropping exit signal {:?} -> {:?}: {:?}; termination continues",
                     pid,
@@ -2333,12 +2354,16 @@ impl ProcessTable {
             return Ok(false);
         };
         match signal {
-            PendingSignal::Exit { from, reason } => {
+            PendingSignal::Exit {
+                from,
+                reason,
+                family,
+            } => {
                 let Some(process) = self.get(pid) else {
                     return Ok(false);
                 };
                 let trapping = process.is_trapping_exit();
-                match exit_policy(reason, trapping, &self.atoms) {
+                match exit_policy(reason, trapping, family, &self.atoms) {
                     ExitPolicy::Ignore => {
                         // A `normal` reason to a non-trapping process is discarded.
                         self.pop_head_signal(pid);
@@ -2534,16 +2559,22 @@ impl ProcessTable {
     /// described by `src` (the signaller's off-heap table, or `None` for a self-signal whose
     /// reason already lives in `to`'s heap) so the queued reason always outlives the signaller.
     ///
+    /// `family` is the signal's [`ExitFamily`] (`erlang:exit/2` vs a link exit), stored verbatim
+    /// on the queued signal and consumed by [`ProcessTable::apply_head_signal`] — `kill` is
+    /// untrappable **only** in the explicit family.
+    ///
     /// A `to` whose live terms are not all in the crate root set
     /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) **or**
     /// whose relocating collection the host's [`CollectionGate`] declines, and whose
     /// full nursery refuses that copy, is the one case the queue cannot serve — the queued reason
     /// must live on the receiver's own heap (the queue is an in-heap sub-rootset) and that heap
-    /// must not be collected or grown — so a **trapping** receiver gets the
-    /// `{'EXIT', From, Reason}` the queue would have delivered built into a heap fragment instead
-    /// ([`ProcessTable::deliver_exit_fragment`]). A **non-trapping** one would receive no message
-    /// at all (the signal carries the exit *policy*, and terminating the receiver is the caller's
-    /// cascade), so its raw refusal is surfaced unchanged.
+    /// must not be collected or grown — so a receiver the **family-aware policy says will trap**
+    /// gets the `{'EXIT', From, Reason}` the queue would have delivered built into a heap fragment
+    /// instead ([`ProcessTable::deliver_exit_fragment`]). Any other outcome receives no message at
+    /// all (the signal carries the exit *policy*, and terminating the receiver is the caller's
+    /// cascade), so its raw refusal is surfaced unchanged. Keying on the policy rather than on
+    /// `is_trapping_exit()` alone is what keeps an **untrappable explicit `kill`** from being
+    /// delivered as a `{'EXIT', From, kill}` fragment to a trapping receiver — a wrong result.
     ///
     /// An unknown `to` is skipped: the caller is propagating a signal through the table and
     /// the target may have died earlier in the same propagation.
@@ -2552,28 +2583,34 @@ impl ProcessTable {
         to: ProcessId,
         from: ProcessId,
         reason: Eterm,
+        family: ExitFamily,
         src: Option<&OffHeapTable>,
     ) -> Result<()> {
         let decline = self.declines_signal_collection(to);
+        let atoms = self.atoms; // Copy: usable while `recipient` borrows `self.slots`.
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        // Both are read before the copy: the fragment route below needs `self` again, and
-        // `recipient`'s borrow must be over by then.
+        // All read before the copy: the fragment route below needs `self` again, and
+        // `recipient`'s borrow must be over by then. The policy decides whether the receiver
+        // would have taken the signal as a message at all.
         let refuses_collect = recipient.has_unpublished_roots() || decline;
-        let trapping = recipient.is_trapping_exit();
+        let traps = matches!(
+            exit_policy(reason, recipient.is_trapping_exit(), family, &atoms),
+            ExitPolicy::Trap
+        );
         match copy_reason_onto(recipient, reason, src, decline) {
             Ok(reason) => {
                 recipient
                     .signals_mut()
-                    .push(PendingSignal::exit(from, reason));
+                    .push(PendingSignal::exit(from, reason, family));
                 Ok(())
             }
             Err(BeamError::Alloc(failure))
                 if refuses_collect
                     && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
-                if trapping {
+                if traps {
                     self.deliver_exit_fragment(to, from, reason, src)
                 } else {
                     Err(BeamError::Alloc(failure))
@@ -2629,11 +2666,11 @@ impl ProcessTable {
         }
     }
 
-    /// Builds the `{'EXIT', From, Reason}` a **trapping** receiver's queued exit signal would have
-    /// been materialised into and enqueues it as a **heap fragment** — the enqueue-time route of
-    /// [`enqueue_fragment_payload`], taken when `to` is **relocation-exempt**/`Running` or the
-    /// host's [`CollectionGate`] declines and its full nursery
-    /// refused the reason copy ([`ProcessTable::enqueue_exit_signal`]).
+    /// Builds the `{'EXIT', From, Reason}` a receiver the family-aware [`exit_policy`] says will
+    /// **trap** would have had materialised from its queued exit signal, and enqueues it as a
+    /// **heap fragment** — the enqueue-time route of [`enqueue_fragment_payload`], taken when `to`
+    /// is **relocation-exempt**/`Running` or the host's [`CollectionGate`] declines and its full
+    /// nursery refused the reason copy ([`ProcessTable::enqueue_exit_signal`]).
     ///
     /// The signal never reaches the queue (its reason cannot live there), so this wakes a blocked
     /// `to` itself, exactly as [`ProcessTable::deliver_head_signal`] does for the queued form.
@@ -3120,20 +3157,24 @@ impl ProcessTable {
     ///
     /// `untrappable` selects the C **operation family**, which is what decides the trap rule:
     ///
-    /// * `untrappable == false` — the **link-exit** family (`ERTS_SIG_Q_OP_EXIT_LINKED`, what
-    ///   `DOP_EXIT`/`DOP_PAYLOAD_EXIT` become). The recorded incoming remote link `from` is
-    ///   removed from `to`'s `remote_links` **first**, and **if no such link is recorded the
-    ///   signal is ignored entirely** (`ignore = destroy = !0`,
+    /// * `untrappable == false` — the **link-exit** family ([`ExitFamily::Linked`], the C's
+    ///   `ERTS_SIG_Q_OP_EXIT_LINKED`, what `DOP_EXIT`/`DOP_PAYLOAD_EXIT` become). The recorded
+    ///   incoming remote link `from` is removed from `to`'s `remote_links` **first**, and **if no
+    ///   such link is recorded the signal is ignored entirely** (`ignore = destroy = !0`,
     ///   `erl_proc_sig_queue.c:4674-4680`). The trap rule is then: a **trapping** `to` receives
     ///   `{'EXIT', RemotePid, Reason}` for *every* reason, while a non-trapping one **ignores**
     ///   `normal` and is otherwise terminated with the reason **unchanged** — a link exit of
     ///   reason `kill` to a non-trapping process terminates it with `kill`, *not* `killed`,
     ///   because the `reason = am_killed` rewrite is guarded by `op == ERTS_SIG_Q_OP_EXIT`
     ///   (`erl_proc_sig_queue.c:4740`/`:4768`).
-    /// * `untrappable == true` — the **`erlang:exit/2`** family (`ERTS_SIG_Q_OP_EXIT`, what
-    ///   `DOP_EXIT2`/`DOP_PAYLOAD_EXIT2` become, `dist.c:2863`): **no link is consulted or
-    ///   removed**, and the trap rule is the crate's [`exit_policy`] — trapping traps everything
-    ///   **except** `kill`, which terminates even a trapping receiver, with reason `killed`.
+    /// * `untrappable == true` — the **`erlang:exit/2`** family ([`ExitFamily::Explicit`], the C's
+    ///   `ERTS_SIG_Q_OP_EXIT`, what `DOP_EXIT2`/`DOP_PAYLOAD_EXIT2` become, `dist.c:2863`): **no
+    ///   link is consulted or removed**, and the trap rule is the crate's [`exit_policy`] —
+    ///   trapping traps everything **except** `kill`, which terminates even a trapping receiver,
+    ///   with reason `killed`.
+    ///
+    /// Both bodies are one [`exit_policy`] call on the family; only the link removal is
+    /// family-specific.
     ///
     /// The `to`'s recorded remote link is removed *before* the policy runs, exactly as the C
     /// deletes the link in `handle_exit_signal` regardless of what it then decides.
@@ -3155,35 +3196,26 @@ impl ProcessTable {
         reason: Eterm,
         untrappable: bool,
     ) -> Result<()> {
+        let family = if untrappable {
+            ExitFamily::Explicit
+        } else {
+            ExitFamily::Linked
+        };
         let trapping = match self.get(to) {
             Some(process) => process.is_trapping_exit(),
             None => return Err(error::unknown_process()),
         };
-        if untrappable {
-            // The `erlang:exit/2` family: no link is consulted, and `exit_policy` already spells
-            // this family's rule (trapping traps everything but `kill`; `kill` ⇒ `killed`).
-            match exit_policy(reason, trapping, &self.atoms) {
-                ExitPolicy::Ignore => Ok(()),
-                ExitPolicy::Trap => self.enqueue_remote_exit_message(to, from, reason),
-                ExitPolicy::Terminate(peer_reason) => self.terminate(to, peer_reason),
-            }
-        } else {
-            // The link-exit family: the link record goes first, and an exit with no matching link
-            // is ignored outright (`erl_proc_sig_queue.c:4674-4680`).
+        if family == ExitFamily::Linked {
+            // The link-recorded-first rule, and an exit with no matching link is ignored outright
+            // (`erl_proc_sig_queue.c:4674-4680`). The explicit family consults no link at all.
             if !self.remove_remote_link(to, from) {
                 return Ok(());
             }
-            if trapping {
-                // A link exit is trappable for *every* reason, `kill` included.
-                return self.enqueue_remote_exit_message(to, from, reason);
-            }
-            match self.atoms.classify(reason) {
-                // A `normal` link exit is ignored by a non-trapping process.
-                ReasonClass::Normal => Ok(()),
-                // ... any other reason terminates it with the reason UNCHANGED (`kill` is not
-                // rewritten to `killed` in the link-exit family — see the method docs).
-                ReasonClass::Kill | ReasonClass::Other => self.terminate(to, reason),
-            }
+        }
+        match exit_policy(reason, trapping, family, &self.atoms) {
+            ExitPolicy::Ignore => Ok(()),
+            ExitPolicy::Trap => self.enqueue_remote_exit_message(to, from, reason),
+            ExitPolicy::Terminate(peer_reason) => self.terminate(to, peer_reason),
         }
     }
 
@@ -3458,7 +3490,8 @@ impl ProcessTable {
     ///
     /// 1. every outgoing monitor on `node` queues `{'DOWN', Ref, process, RemotePid, Reason}`
     ///    on its watcher and wakes a blocked watcher;
-    /// 2. every link to `node` follows [`exit_policy`] on the local peer: `Ignore` does
+    /// 2. every link to `node` follows [`exit_policy`] **in the link-exit family**
+    ///    ([`ExitFamily::Linked`], the C's `ERTS_SIG_Q_OP_EXIT_LINKED`): `Ignore` does
     ///    nothing, `Trap` queues `{'EXIT', RemotePid, Reason}`, anything else terminates the
     ///    peer (with the usual cascading propagation);
     /// 3. every record mentioning `node` is purged.
@@ -3504,7 +3537,7 @@ impl ProcessTable {
                 continue;
             };
             let trapping = process.is_trapping_exit();
-            match exit_policy(reason, trapping, &self.atoms) {
+            match exit_policy(reason, trapping, ExitFamily::Linked, &self.atoms) {
                 ExitPolicy::Ignore => {}
                 ExitPolicy::Trap => self.enqueue_remote_exit_message(peer, remote, reason)?,
                 ExitPolicy::Terminate(peer_reason) => self.terminate(peer, peer_reason)?,
@@ -3685,9 +3718,11 @@ impl ProcessTable {
     /// resolves the monitor on both sides, exactly as [`ProcessTable::terminate`] resolves a
     /// process monitor — so `erlang:process_info(Watcher, monitors)` stops listing it.
     ///
-    /// A linked process follows [`exit_policy`]: a trapping peer receives the `{'EXIT', …}`
-    /// message, a non-trapping one terminates with `reason` (cascading through its own links
-    /// and monitors), and a `normal` reason is ignored. A peer that already died is skipped.
+    /// A linked process follows [`exit_policy`] **in the link-exit family**
+    /// ([`ExitFamily::Linked`], the C's `ERTS_SIG_Q_OP_EXIT_LINKED`): a trapping peer receives the
+    /// `{'EXIT', …}` message, a non-trapping one terminates with `reason` (cascading through its
+    /// own links and monitors), and a `normal` reason is ignored. A peer that already died is
+    /// skipped.
     ///
     /// # Errors
     ///
@@ -3717,14 +3752,16 @@ impl ProcessTable {
             self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, tag, reason)?;
         }
 
-        // 2. Links: each linked process either traps the exit or follows it.
+        // 2. Links: each linked process either traps the exit or follows it. This is the
+        //    **link-exit family** (`ERTS_SIG_Q_OP_EXIT_LINKED`): `kill` is trappable, and the
+        //    reason is never rewritten.
         for pid in closed.links {
             let Some(peer) = self.get(pid) else {
                 // The peer died earlier.
                 continue;
             };
             let trapping = peer.is_trapping_exit();
-            match exit_policy(reason, trapping, &self.atoms) {
+            match exit_policy(reason, trapping, ExitFamily::Linked, &self.atoms) {
                 ExitPolicy::Ignore => {}
                 ExitPolicy::Trap => self.enqueue_port_exit_message(pid, port, reason)?,
                 ExitPolicy::Terminate(peer_reason) => self.terminate_with_ports(ports, pid, peer_reason)?,

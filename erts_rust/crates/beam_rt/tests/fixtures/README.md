@@ -265,12 +265,11 @@ message can arrive. The per-iteration deadline keeps a pass stepping, so the dis
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
-## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload` · `pt_gc`, committed)
+## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload` · `pt_gc` · `churn`, committed)
 
-These six are committed oracle fixtures for the process-heap collector
+These seven are committed oracle fixtures for the process-heap collector
 (`tests/gc_collect.rs`, `tests/heap_growth.rs`, `tests/gc_strategy.rs`,
-`tests/gc_immix_payload.rs` and `tests/persistent_term.rs`):
-
+`tests/gc_immix_payload.rs`, `tests/persistent_term.rs` and `tests/rss_bound.rs`):
 * `gc_loop.beam` — `loop/1` tail-recursively conses every iteration (`build/1`), so a
   scheduled process really allocates; the acceptance evidence that the collector runs at the
   engine's heap-admission point.
@@ -298,12 +297,19 @@ These six are committed oracle fixtures for the process-heap collector
   The witness for `tests/persistent_term.rs::a_stored_value_survives_a_process_heap_collection`:
   a store that kept a raw young-heap word without stabilizing it hands back a dangling/recycled
   term (observed: a 2-element list instead of 64 elements).
+* `churn.beam` — `run(N)` is the allocate-and-abandon churn loop mirrored from the `gc_bound`
+  benchmark workload's embedded source (`../../tools/bench/src/workloads/gc_bound.rs`): every
+  iteration builds a 256-element list (interpreted recursion), a 256-byte binary and a
+  256-element tuple, discards all three, checks the two O(1)-checkable ones and adds 1, so
+  `run(N)` returns exactly `N`. The **RSS-bound** witness for `tests/rss_bound.rs`: the peak
+  `VmHWM` must be flat across a 10× `N` step (the pre-fix curve in `tools/bench/RESULTS.md`
+  §6.7 grew roughly linearly), and the deterministic companion asserts
+  `Runtime::gc_stats().collections > 0` for a scheduled run.
 
-All six are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
+All seven are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
 
 ```sh
-for f in gc_loop gc_ints gc_floats heap_growth gc_payload pt_gc; do
-    SCRATCH="$TMPDIR/beam_rt_${f}_fix"
+for f in gc_loop gc_ints gc_floats heap_growth gc_payload pt_gc churn; do    SCRATCH="$TMPDIR/beam_rt_${f}_fix"
     rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
     cp "$f.erl" "$SCRATCH/gen/"
     ( cd "$SCRATCH/gen" && erlc +deterministic "$f.erl" )
@@ -327,7 +333,7 @@ Each rebuilt `.beam` must be **force-added** (`git add -f gc_loop.beam`), like t
 | `raise_structured:badmap/0` | `try raise_structured:badmap() catch C:R -> {C,R} end` | `{error,{badmap,not_a_map}}` |
 | `function_clause_fixture:f/1` | `function_clause_fixture:f(a)` | `ok` |
 | `function_clause_fixture:f/1` | `try function_clause_fixture:f(b) catch C:R -> {C,R} end` | `{error,function_clause}` |
-| `recv_after:after20/0` | `recv_after:after20()` | `timeout` (after ≈ 20 ms) |
+| `churn:run/1` | `churn:run(N)` | `N` (each churn checks `byte_size`/`tuple_size` and adds 1) || `recv_after:after20/0` | `recv_after:after20()` | `timeout` (after ≈ 20 ms) |
 | `recv_after:afterzero/0` | `recv_after:afterzero()` | `timeout` (no suspend) |
 | `recv_after:self_send/0` | `recv_after:self_send()` | `hello` |
 | `recv_after:after2000/0` | a receiver matching nothing, then a `hello` send | `hello` (the send **cancels** the deadline); with no send it is `timeout` |

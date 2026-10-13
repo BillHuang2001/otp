@@ -24,9 +24,11 @@
 //! image that carries an atom names it by its global index, so decoding a name
 //! the runtime has never seen must **extend the runtime's atom table**. The
 //! context only borrows that table immutably ([`BifContext::atoms`]), so the
-//! create path is the [`AtomInterner`] seam: the decoder interns into a clone of
-//! the context's table and then hands every appended name to the hook, in order —
-//! so the hook must assign exactly the index the decoder wrote into the term.
+//! create path is the [`AtomInterner`] seam: the decoder interns into a
+//! memoized, per-thread *image* of the context's table and then hands every
+//! appended name to the hook, in order — so the hook must assign exactly the
+//! index the decoder wrote into the term. (The memo's reuse correctness is
+//! pinned by `tests/decode_scratch.rs`.)
 //!
 //! These tests drive the registry exactly as `beam_rt` must: a real
 //! `beam_alloc::Heap`, a real seeded `beam_term::AtomTable`, and an

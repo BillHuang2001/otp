@@ -134,6 +134,16 @@ impl<'a> RuntimeContext<'a> {
         let tables_handle = Rc::clone(&self.runtime.tables);
         let ports_handle = Rc::clone(&self.runtime.ports);
         let mut heap = self.runtime.take_bif_heap()?;
+        // Whether the pooled heap came to this call **clean**. The pool is shared: a heap is
+        // popped here and pushed back by every other caller too (the native floor's
+        // `mint_reference`/`reference_term`, trace, the ETS owner sweep), and those put it back
+        // **without** resetting it — the heap a reference or a spawned pid was just built on is
+        // still holding that live term when this call receives it. A rewind to the base would
+        // recycle those words and hand a later caller the *same* address for a different term
+        // (the `assert_ne!` in `native::process::tests::alias_…` is exactly that), so the
+        // copy-out/rewind below is applied **only** when no other caller owns a word of it.
+        // See [`Self::call_registered`]'s copy-out rule.
+        let pool_clean = heap.used() == 0;
         // `self_pid` is the pid this context runs as: `erlang:self/0` reports it, and a
         // `receive` in a fun a BIF applies resolves its mailbox against it.
         let self_pid = self.mailbox_pid;
@@ -228,7 +238,39 @@ impl<'a> RuntimeContext<'a> {
         } else {
             None
         };
-        let result = {
+        // Whether this call can **re-enter** the runtime by applying a fun argument (see
+        // [`Self::reentrancy_capable`]). Hoisted out of the dispatch block below because the
+        // result-rewind gate needs it too.
+        let reentrant = Self::reentrancy_capable(args);
+        // Whether the BIF's result may be **moved out of the pooled BIF heap onto the running
+        // process's own young heap** and the pooled heap then **rewound** — the tail of this
+        // method (see [`Self::move_result_into_process_heap`]).
+        //
+        // Six of the `DispatchHooks` arms ([`super::dispatch`]) each let a term the BIF built on
+        // `ctx.heap()` **escape** into state that outlives the call, which is exactly what a
+        // rewind would invalidate:
+        //
+        // * `dict` — the process dictionary ([`DictBridge`]);
+        // * `process_hook` — the process/port registry ([`ProcessBridge`]);
+        // * `nif_loader` — a loaded NIF library's private data ([`NifBridge`]);
+        // * `send_hook` — a delivered message ([`SendBridge`]);
+        // * `persistent_term` — the node-global store ([`PersistentTermBridge`]);
+        // * `runtime_hooks` — the timer heap / reference space / link set
+        //   ([`RuntimeHooksBridge`]).
+        //
+        // A **reentrant** call (a fun-applying BIF) is excluded outright: the nested run can push
+        // an argument that lives on this very heap into any of those seams. The remaining arms —
+        // `record_source`, `module_info` and the `fun_identity`/`memory_hook` build gates — are
+        // pure reads of loader/runtime state, and the output sink is pure output, so none of them
+        // retains a heap word.
+        let safe_to_rewind = !hooks.dict
+            && !hooks.process_hook
+            && !hooks.nif_loader
+            && !hooks.send_hook
+            && !hooks.persistent_term
+            && !hooks.runtime_hooks
+            && !reentrant;
+        let mut result = {
             let RuntimeContext {
                 runtime,
                 output,
@@ -247,8 +289,8 @@ impl<'a> RuntimeContext<'a> {
             // argument is a fun, therefore, do **not** install the tables — the cell stays
             // free for the nested call. Nothing is lost: a BIF that takes a fun scans it
             // with `lists`/`maps` logic and does not touch ETS itself (no M1 BIF both needs
-            // ETS *and* applies a fun argument).
-            let reentrant = Self::reentrancy_capable(args);
+            // ETS *and* applies a fun argument). `reentrant` was computed above the block (the
+            // result-rewind gate needs it there too).
             let mut tables = if reentrant {
                 None
             } else {
@@ -552,6 +594,42 @@ impl<'a> RuntimeContext<'a> {
                 registry.call(module, function, arity, &mut context, args)
             }
         };
+        // The result is still on the pooled BIF heap. Left there it is a container in a region
+        // the running process's copying collector does **not** scan, so the unscanned-root valve
+        // ([`super::gc::root_is_unscanned`]) declines every collection while it is live in an x
+        // register — and a churn loop that keeps such a result alive then grows peak memory with
+        // its iteration count. Move it onto the running process's own young heap (a scanned
+        // region) and rewind the pool, so the result is collectable and the heap returns to its
+        // base.
+        //
+        // The rewind happens only when the move is both **safe** and **complete**:
+        //
+        // * `safe_to_rewind` — no seam can have retained a heap word (see its definition above);
+        // * an **`Ok`** result — a raise may carry a live reason term
+        //   ([`beam_common::Raise::live_reason`], the `{badkey,K}`/`{case_clause,V}` shapes) that
+        //   points into this heap, so the error path never rewinds;
+        // * a **container** result — an immediate is neither boxed nor a cons and a literal lives
+        //   in the frozen literal area, so neither can reach a word on this heap; skipping the
+        //   copy keeps the arithmetic/immediate hot path free (dispatch cost is measured —
+        //   see `TRACE_AND_PERF.md`);
+        // * a move that **succeeded** — no scheduled process, a nursery that cannot be grown, or
+        //   a graph the copier refuses all leave the result where it is;
+        // * a **clean** pooled heap — `heap` must not have been handed over with a live word below
+        //   this call's own base (see `pool_clean` above): rewinding then would recycle a term
+        //   another caller is still holding.
+        let mut rewind = false;
+        if safe_to_rewind && pool_clean {
+            if let Ok(term) = result {
+                if !Self::result_is_foreign_container(term) {
+                    // Nothing reachable lives on this heap, so no byte of it was handed out for
+                    // anything that survives the call: rewinding disturbs nothing.
+                    rewind = true;
+                } else if let Some(copied) = self.move_result_into_process_heap(term) {
+                    result = Ok(copied);
+                    rewind = true;
+                }
+            }
+        }
         // The BIF (and any NIF a bridge ran) is done and every borrow released, so commit the
         // names interned during the call: each lands at the index the interner predicted,
         // keeping the BIF's/NIF's atom terms (and every printer/comparison that resolves them)
@@ -567,10 +645,99 @@ impl<'a> RuntimeContext<'a> {
         if !pending.is_empty() {
             pending.commit(self.runtime.code_server.atoms_mut());
         }
+        if rewind {
+            // Every word this call handed out of the pooled heap is now either unreachable (the
+            // BIF's intermediate terms) or has a scanned copy in the process's young heap, so the
+            // bump pointer can safely return to the heap's base. The pooled heap then serves the
+            // next call from word 0 instead of marching toward the pool's capacity.
+            heap.reset();
+        }
         self.runtime.put_bif_heap(heap);
         // A registered BIF that ran its heap dry is the emulator's documented hard limit,
         // not a host-level allocation abort (see `error::enforce_term_heap_limit`).
         result.map_err(error::enforce_term_heap_limit)
+    }
+
+    /// Whether `term` is a **container the pooled BIF heap could own** — the mirror of the
+    /// container test in [`super::gc::root_is_unscanned`].
+    ///
+    /// An **immediate** (a small integer, an atom, `NIL`, a local pid/port/reference) is neither
+    /// boxed nor a cons, and a **literal** (a frozen code constant) lives in the literal area,
+    /// never on the pooled heap — so only a boxed, non-literal term or a cons cell can reach a
+    /// word this call handed out of the pool. Everything else may rewind the pool with no copy,
+    /// which keeps the arithmetic/immediate hot path free.
+    fn result_is_foreign_container(term: Eterm) -> bool {
+        (beam_term::prelude::is_boxed(term) || beam_term::prelude::is_list(term))
+            && !beam_term::literal::is_literal(term)
+    }
+
+    /// Moves a registered BIF's result `term` off the pooled BIF heap onto the running process's
+    /// **own young heap**, returning the copy — or `None` when it cannot be re-homed, in which
+    /// case the caller leaves both the result and the pool exactly as they were.
+    ///
+    /// # The destination is the process's SCANNED heap
+    ///
+    /// The target is [`Process::heap_mut`](beam_process::Process::heap_mut) — the very young heap
+    /// the engine's own allocation seams bump ([`super::gc::alloc_words_rooted`]) — and a region
+    /// the process's collector **scans**, so the moved result is kept alive by the root set the
+    /// engine already publishes (it lands in `x(0)` on return) and is relocated by a later
+    /// collection, instead of declining every one through the unscanned-root valve.
+    ///
+    /// # Growth is the NO-RELOCATION seam
+    ///
+    /// A full nursery is met by [`Process::grow_nursery`](beam_process::Process::grow_nursery) and
+    /// **one** retry — deliberately **not** by
+    /// [`ensure_capacity`](beam_process::Process::ensure_capacity), which collects first over
+    /// `process.regs.gather_roots()`, the process's *published* root set. Inside a BIF call the
+    /// machine's live x registers and Erlang stack are **not** published, so collecting here would
+    /// free live terms. `grow_nursery` retires the space it replaces and moves no live term, which
+    /// its own docs declare legal and correct for a host holding an incomplete or unpublished root
+    /// set — exactly this situation.
+    ///
+    /// # The EMPTY source table is load-bearing
+    ///
+    /// The copy's source [`OffHeapTable`](beam_message::OffHeapTable) is empty because the BIF
+    /// heap owns no off-heap handle. `beam_message`'s copier resolves a refc binary's payload
+    /// through `ctx.src_off_heap().binary_by_data_ptr(val)`; with no owner it falls back to
+    /// **flattening** the window into a self-contained on-heap bitstring — byte-faithful, nothing
+    /// registered in the destination table, no refcount to lose. An off-heap **MSO** reference
+    /// with no resolvable owner is the copier's typed `bad_term` instead, so this function returns
+    /// `None` (the caller then does not rewind the pool) — never a dangling payload. The empty
+    /// source table can therefore only ever produce a *complete* copy, and the destination
+    /// (`Runtime::eval_off_heap`) grows by at most one entry per distinct node an external
+    /// pid/port/reference names.
+    fn move_result_into_process_heap(&mut self, term: Eterm) -> Option<Eterm> {
+        // `ProcessId` is `Copy`, so read it before the destructure (match ergonomics, as the
+        // dispatch block above does).
+        let pid = self.mailbox_pid;
+        let RuntimeContext {
+            runtime,
+            mailbox_table,
+            ..
+        } = self;
+        // No caller-supplied table is the `-eval`/single-pass shape: leave today's behaviour byte
+        // for byte (the result stays on the pooled heap, which is then not rewound).
+        let table = mailbox_table.as_deref_mut()?;
+        let process = table.get_mut(pid)?;
+        let copied = {
+            let src = beam_message::OffHeapTable::new();
+            let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
+            beam_message::copy_struct(term, process.heap_mut(), &mut ctx)
+        };
+        if let Ok(copied) = copied {
+            return Some(copied);
+        }
+        // The nursery could not serve the copy: GROW (retiring the old space, moving nothing) and
+        // retry once. `size_object` is the graph's flat word count and the floor of 256 keeps a
+        // small result from landing exactly on the current space's edge.
+        let hint = beam_term::size::size_object(term).max(256);
+        process.grow_nursery(hint).ok()?;
+        // A fresh `CopyContext` over the (now current) grown space, whose bump pointer is at its
+        // base. Nothing the first attempt wrote needs unwinding: a non-clean destination takes
+        // `copy_struct`'s preflight path, which refuses **before** writing any destination word.
+        let src = beam_message::OffHeapTable::new();
+        let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
+        beam_message::copy_struct(term, process.heap_mut(), &mut ctx).ok()
     }
 
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
@@ -581,9 +748,12 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The NIF runs against a **fresh** per-call [`NifHostImpl`] over a pooled BIF heap, with a
     /// fresh [`PendingInterner`] rooted at the shared table's current length. The term it
-    /// returns lives on that pooled heap, which is pointer-stable and never reset (no GC in
-    /// Milestone 1), so it stays valid after the heap is put back — the same convention
-    /// [`Self::call_registered`] relies on.
+    /// returns lives on that pooled heap, which is pointer-stable and **not** rewound: a NIF
+    /// result is **not** copied out — unlike a registered BIF's (see
+    /// [`Self::move_result_into_process_heap`] and the rewind in [`Self::call_registered`]) — so
+    /// it stays where it was built and keeps declining a collection through the unscanned-root
+    /// valve while it is live. That is a deliberate Milestone-1 residual (see
+    /// [`Self::open_gate_for_foreign_result`]).
     ///
     /// # Errors
     ///

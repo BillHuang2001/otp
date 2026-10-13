@@ -18,17 +18,19 @@
 //
 // %CopyrightEnd%
 
-//! The workload **type** and the four shapes the baseline tier does **not** inline.
+//! The workload **type** and the five shapes the baseline tier does **not** inline.
 //!
 //! Each workload is a [`Workload`] — a [`Module`] assembled with the loader's own block
 //! decomposition ([`beam_loader::lower::build_blocks`]), an exported `function/arity`,
 //! how to obtain the call arguments, and a value check that pins the result the body is
 //! *supposed* to compute (so a tier that "agrees" on a wrong answer still fails).
 //!
-//! This file owns the four shapes whose lowering story is "every instruction is a
+//! This file owns the five shapes whose lowering story is "every instruction is a
 //! `jit_step_one` helper round-trip on a native tier": `build/0`
-//! (`put_tuple2`/`put_list`), `map/2` (the map family), `select/1` (`select_val`) and
-//! `walk/2` (a tail-recursive cons-list walk), plus the two-module `cross/2` shape,
+//! (`put_tuple2`/`put_list`), `map/2` (the map family), `select/1` (`select_val`),
+//! `walk/2` (a tail-recursive cons-list walk) and `sum/1` (the **non**-tail-recursive
+//! list sum, whose live Y slot forces its `gc_bif '+'/2` off the tier's inlined
+//! small-int fast path), plus the two-module `cross/2` shape,
 //! whose transfer is neither: its `call_ext_last` deopts, but the *driver* then lands
 //! the call cross-module. The shapes the tier *inlines* are in [`super::inlined`],
 //! and [`workloads`] is the concatenation of all three.
@@ -49,7 +51,9 @@ use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 use crate::context::{BifHook, MinimalContext};
 use crate::terms;
 
-use super::checks::{verify_build, verify_cross, verify_map, verify_select, verify_walk};
+use super::checks::{
+    verify_build, verify_call_ext, verify_cross, verify_map, verify_select, verify_sum, verify_walk,
+};
 use super::support::{arith_hook, Fixture};
 
 // ---------------------------------------------------------------------------
@@ -69,11 +73,39 @@ pub(super) const SELECT_ROUNDS: usize = 32;
 /// The number of cons cells in the list the walk workload traverses.
 pub(super) const WALK_LENGTH: usize = 64;
 
+/// The number of cons cells in the list a `sum/1` run consumes.
+///
+/// Cell `i` (1-based) holds the small integer `i`, so the sum is the triangular number
+/// `SUM_LENGTH * (SUM_LENGTH + 1) / 2` — a figure a wrong length, a wrong cell value,
+/// or a head the recursion failed to keep alive in its Y slot cannot produce. It is
+/// deliberately the same magnitude as [`WALK_LENGTH`], so the two list walks are
+/// comparable.
+pub(super) const SUM_LENGTH: usize = 64;
+
 /// The number of cross-module `call_ext_last` transfers one `cross/2` run performs.
 ///
 /// Every transfer increments the accumulator exactly once, so the exported result is
 /// this count — a loop that ran a different number of transfers cannot produce it.
 pub(super) const CROSS_STEPS: usize = 64;
+
+/// The number of **declined** `erlang:'+'/2` `call_ext` calls one `call_ext/0` run makes.
+///
+/// Every call adds [`CALL_EXT_INCREMENT`] to the accumulator, and the loop trips when
+/// the accumulator reaches `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT`, so the exported
+/// result is that product — a run that skipped, repeated or reordered a call cannot
+/// produce it.
+pub(super) const CALL_EXT_ROUNDS: i64 = 256;
+
+/// The small integer the declined `erlang:'+'/2` `call_ext` adds on every call.
+///
+/// A value `> 1` (rather than a unit increment) means the accumulator only reaches the
+/// loop limit — itself `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT` — after exactly
+/// [`CALL_EXT_ROUNDS`] calls, so the pinned result is only reproduced if the loop trips
+/// at the right iteration.
+pub(super) const CALL_EXT_INCREMENT: i64 = 3;
+
+/// The module the declined-`call_ext` workload is entered through.
+const CALL_EXT_MODULE: &str = "jit_bench_call_ext";
 
 /// The module the cross-module workload is **entered** through (the caller side).
 const PING_MODULE: &str = "jit_bench_cross_a";
@@ -276,18 +308,20 @@ impl Workload {
     }
 }
 /// Every workload the tier table measures: the shapes the baseline tier **deopts**
-/// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]) followed
-/// by the shapes it **inlines** (`super::inlined`) and the cross-module transfer
-/// ([`cross_workload`]).
+/// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]/[`sum_workload`])
+/// followed by the shapes it **inlines** (`super::inlined`), the cross-module transfer
+/// ([`cross_workload`]) and the declined `call_ext` seam ([`call_ext_workload`]).
 pub(super) fn workloads() -> Vec<Workload> {
     let mut all = vec![
         build_workload(),
         map_workload(),
         select_workload(),
         walk_workload(),
+        sum_workload(),
     ];
     all.extend(super::inlined::inlined_workloads());
     all.push(cross_workload());
+    all.push(call_ext_workload());
     all
 }
 /// `build/0` — [`BUILD_ROUNDS`] `put_tuple2` + `put_list` pairs, then `return`.
@@ -573,6 +607,108 @@ fn walk_workload() -> Workload {
     }
 }
 
+/// `sum/1` — the **non-tail-recursive** cons-list sum, i.e. the compiled lowering of
+///
+/// ```text
+///   sum([])     -> 0;
+///   sum([H|T])  -> H + sum(T).
+/// ```
+///
+/// ```text
+///   test is_nonempty_list Fail base [x0]   ; a `test` jumps on FAILURE, so this
+///                                          ; branches to `base` exactly when x0 is []
+///   get_list x0 x1 x0                      ; x1 = head, x0 = tail
+///   allocate 2 2                           ; the frame this call needs (2 Y slots)
+///   move x1 y0                             ; the head survives the recursion in Y(0)
+///   call 1 entry                           ; NON-tail: the continuation is saved in the frame
+///   y1 = y0 + x0                           ; gc_bif '+'/2 — DEOPTED (a Y operand)
+///   move y1 x0
+///   deallocate 2
+///   return
+/// base:
+///   x0 = 0
+///   return
+/// ```
+///
+/// Where `walk/2` recurses **tail** (so its `'+'` is over two cached x-registers and the
+/// tier inlines it natively), this one genuinely needs the caller's frame across the
+/// recursive call — which is exactly the shape `src/jit/baseline/emit/arith.rs`'s
+/// `loadable()` refuses: a `gc_bif '+'/2` whose operand is an `Operand::Y(k)` is not a
+/// small-int fast-path candidate, so the **whole instruction** deopts to one
+/// `jit_step_one` interpreter step. That is the gap this workload exists to measure (the
+/// `sum/1` figure is the BEFORE baseline for closing it). The list
+/// `[1, 2, …, SUM_LENGTH]` is built once per measurement in the run's own context by
+/// [`sum_args`].
+///
+/// The `gc_bif` writes its result to a Y slot as well (`{y,1}`), a second reason the
+/// fast path refuses the instruction; the interpreter accepts both the Y operand and the
+/// Y destination, so the tier agreement check pins the exact triangular sum.
+fn sum_workload() -> Workload {
+    let fixture = Fixture::with_plus("jit_bench_sum");
+    let entry = Label(1);
+    let base = Label(3);
+    let code = vec![
+        Instr::Label(entry),
+        Instr::Test {
+            kind: TestKind::IsNonemptyList,
+            fail: base,
+            args: vec![Operand::X(0)],
+        },
+        Instr::GetList {
+            source: Operand::X(0),
+            head: Operand::X(1),
+            tail: Operand::X(0),
+        },
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(2),
+            live: 2,
+        },
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::Y(0),
+        },
+        Instr::Call {
+            arity: 1,
+            target: entry,
+        },
+        // `y1 = y0 + x0` — the Y operand (and the Y destination) put this `gc_bif`
+        // outside the tier's inlined small-int fast path.
+        Instr::GcBif {
+            arity: 2,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 1,
+            args: vec![Operand::Y(0), Operand::X(0)],
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+        Instr::Label(base),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+
+    let (module, function) = fixture.finish("sum", 1, code);
+    Workload {
+        label: format!(
+            "sum/1 (non-tail-recursive list sum + a Y-operand '+'/2 over {SUM_LENGTH} cells)"
+        ),
+        module,
+        function,
+        arity: 1,
+        args: Args::InContext(sum_args),
+        verify: verify_sum,
+        cross: None,
+    }
+}
+
 /// `cross/2` — [`CROSS_STEPS`] cross-module `call_ext_last` transfers between **two**
 /// modules, a `ping/2` ⇄ `pong/2` ping-pong.
 ///
@@ -702,6 +838,102 @@ fn cross_body(fixture: &Fixture, cross: ImportRef) -> Vec<Instr> {
     ]
 }
 
+/// `call_ext/0` — [`CALL_EXT_ROUNDS`] **declined** `erlang:'+'/2` `call_ext` calls in a
+/// counted loop.
+///
+/// ```text
+/// entry:
+///   x0 = 0                                 ; move (the accumulator)
+///   x1 = CALL_EXT_INCREMENT                ; move (the addend)
+///   allocate 0 2                           ; the frame the non-tail call_ext needs
+/// loop:
+///   call_ext 2 erlang:'+'/2                ; resolved through the host seam, DECLINED
+///   test is_ge Fail=loop x0 limit          ; loop while x0 < limit
+///   deallocate 0
+///   return
+/// ```
+///
+/// This is the workload for the **declined** `call_ext*` path — a `call_ext` whose host
+/// answer is "run it synchronously in this process" (`Ok(None)`, the common BIF shape
+/// and the `MinimalContext` default) rather than a module this machine can enter. On the
+/// baseline tier the `call_ext` is not a plain deopt: it is lowered through the native
+/// `jit_ext_call` helper, which consults the host's cross-module seam **once**; on the
+/// decline the same instruction is then handed to `jit_step_ext` with that already-computed
+/// answer, so `Machine::call_ext_dispatch` never re-asks the seam. Before that helper
+/// existed the tier resolved the same import **twice** (once in `jit_ext_call`, once
+/// inside the `jit_step_one` fallback), so measuring the decline from now on is exactly
+/// what keeps the one-consultation property honest at the benchmark level. The
+/// deterministic per-instruction pin lives in
+/// `src/jit/baseline/tests.rs::the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count`;
+/// this workload is its end-to-end, hot-loop counterpart.
+///
+/// The import is `erlang:'+'/2` (`Fixture::with_plus`'s index-0 import), the same shape
+/// the per-instruction pin uses: it is answered by the harness's [`arith_hook`] on the
+/// synchronous `call_bif` route, so every call is a **declined** `call_ext` that lands on
+/// the BIF. It is deliberately *synthetic* — `erlc` emits `+`/2 as a `gc_bif`, not a
+/// `call_ext` — because the instruction under measurement is the `call_ext` **seam**, not
+/// the arithmetic: the seam is identical for any declined import, and `'+'/2` is the one
+/// the harness's `Fixture` interns and its hook answers.
+///
+/// The frame discipline is load-bearing. A `run_export` body pushes a bottom `Halt`
+/// frame; a non-tail `call_ext` would overwrite *that* frame's continuation, so the loop
+/// `allocate`s its own frame first and `deallocate`s it before its final `return`. Each
+/// call adds [`CALL_EXT_INCREMENT`] to the accumulator, the `test is_ge` trips once it
+/// reaches `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT`, so the exported result is that product
+/// and the loop made exactly [`CALL_EXT_ROUNDS`] calls (a `test` branches on the
+/// *negation* of its predicate, so `is_ge` loops while `x0 <` the limit).
+fn call_ext_workload() -> Workload {
+    let fixture = Fixture::with_plus(CALL_EXT_MODULE);
+    let entry = Label(1);
+    let loop_label = Label(2);
+    let limit = CALL_EXT_ROUNDS * CALL_EXT_INCREMENT;
+    let code = vec![
+        Instr::Label(entry),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(CALL_EXT_INCREMENT),
+            dst: Operand::X(1),
+        },
+        // The frame the non-tail `call_ext` needs (see the doc above): allocated once,
+        // outside the loop, and popped before the final `return`.
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(0),
+            live: 2,
+        },
+        Instr::Label(loop_label),
+        // `x0 = x0 + x1` — a `call_ext` the host's seam declines (`Ok(None)`), i.e. the
+        // duplicate-resolution shape `jit_step_ext` removes.
+        Instr::CallExt {
+            arity: 2,
+            target: ImportRef(0),
+        },
+        // A `test` jumps on FAILURE, so `is_ge` loops while `x0 < limit` and falls
+        // through once the accumulator reaches it.
+        Instr::Test {
+            kind: TestKind::IsGe,
+            fail: loop_label,
+            args: vec![Operand::X(0), Operand::Integer(limit)],
+        },
+        Instr::Deallocate(0),
+        Instr::Return,
+    ];
+
+    let (module, function) = fixture.finish("call_ext", 0, code);
+    Workload::new(
+        format!(
+            "call_ext/0 ({CALL_EXT_ROUNDS} declined erlang:'+'/2 call_ext calls in a loop)"
+        ),
+        module,
+        function,
+        0,
+        Args::Fixed(Vec::new()),
+        verify_call_ext,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Argument preparation (heap terms must live in the run's own context)
 // ---------------------------------------------------------------------------
@@ -726,4 +958,99 @@ fn walk_args(ctx: &mut MinimalContext) -> Result<Vec<Eterm>> {
         list = terms::make_cons(ctx, make_small(1), list)?;
     }
     Ok(vec![list, make_small(0)])
+}
+
+/// The `sum/1` argument: the `[1, 2, …, SUM_LENGTH]` list, built in `ctx`.
+///
+/// The cells are prepended from the tail, so cell `i` holds `i` (1-based); distinct cell
+/// values mean the pinned triangular sum is only reproduced if every head is carried
+/// across the recursive call correctly.
+fn sum_args(ctx: &mut MinimalContext) -> Result<Vec<Eterm>> {
+    let mut list = NIL;
+    for value in (1..=SUM_LENGTH as i64).rev() {
+        list = terms::make_cons(ctx, make_small(value), list)?;
+    }
+    Ok(vec![list])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `sum/1` workload exists to measure exactly one gap: a `gc_bif '+'/2` whose
+    /// operand is an `Operand::Y(k)`, which the baseline tier's small-int fast path
+    /// refuses (`src/jit/baseline/emit/arith.rs::loadable`), so the whole instruction
+    /// deopts to one interpreter step. Drop that Y operand and the workload would keep
+    /// passing the tier-agreement check while silently measuring nothing, so the shape is
+    /// pinned here. The Y **destination** is the second half of the same refusal.
+    #[test]
+    fn the_sum_workload_keeps_its_y_slot_operand_and_destination() {
+        let workload = sum_workload();
+        let mut y_operands = 0;
+        let mut y_destinations = 0;
+        for function in &workload.module.functions {
+            for instr in &function.code {
+                let Instr::GcBif { args, dst, .. } = instr else {
+                    continue;
+                };
+                if args.iter().any(|operand| matches!(operand, Operand::Y(_))) {
+                    y_operands += 1;
+                }
+                if matches!(dst, Operand::Y(_)) {
+                    y_destinations += 1;
+                }
+            }
+        }
+        assert_eq!(
+            y_operands, 1,
+            "sum/1 must keep exactly one `gc_bif` with a Y-slot operand"
+        );
+        assert_eq!(
+            y_destinations, 1,
+            "sum/1 must keep exactly one `gc_bif` writing to a Y slot"
+        );
+    }
+
+    /// The `call_ext/0` workload exists to measure exactly one path: a `call_ext` the
+    /// host **declines** (the synchronous BIF route through `jit_step_ext`). Swap it for
+    /// a `gc_bif` — or drop the import — and the workload would keep passing the
+    /// tier-agreement check while silently measuring nothing, so the shape is pinned
+    /// here: exactly one `call_ext 2 erlang:'+'/2`, no `gc_bif` anywhere, and the one
+    /// import is the `erlang:'+'/2` [`Fixture::with_plus`] installs.
+    #[test]
+    fn the_call_ext_workload_keeps_a_declined_call_ext_in_its_loop() {
+        let workload = call_ext_workload();
+        let mut call_exts = 0;
+        let mut gc_bifs = 0;
+        for function in &workload.module.functions {
+            for instr in &function.code {
+                match instr {
+                    Instr::CallExt { arity, target }
+                        if *arity == 2 && matches!(target, ImportRef(0)) =>
+                    {
+                        call_exts += 1;
+                    }
+                    Instr::GcBif { .. } => gc_bifs += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            call_exts, 1,
+            "call_ext/0 must keep exactly one `call_ext 2` in its loop"
+        );
+        assert_eq!(
+            gc_bifs, 0,
+            "the declined path must stay a `call_ext`, never a `gc_bif`"
+        );
+
+        let import = workload
+            .module
+            .imports
+            .first()
+            .expect("the module imports the one BIF its `call_ext` names");
+        assert_eq!(workload.module.atom_name(import.module), Some("erlang"));
+        assert_eq!(workload.module.atom_name(import.function), Some("+"));
+        assert_eq!(import.arity, 2);
+    }
 }

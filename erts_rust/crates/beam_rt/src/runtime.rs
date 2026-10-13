@@ -1024,10 +1024,27 @@ impl Runtime {
     ///
     /// The pool is a stack: a call takes a heap, runs, and puts it back
     /// ([`Runtime::put_bif_heap`]). Reusing the same heap for sequential calls costs
-    /// nothing and keeps every term built on it valid (a `beam_alloc::Heap` never moves
-    /// its terms and Milestone-1 never resets one — there is no GC). A **nested** call (a
-    /// fun a BIF applied) finds the pool empty and gets a fresh heap, so the outer call's
-    /// heap is never aliased.
+    /// nothing and keeps every term built on it valid. A **nested** call (a fun a BIF
+    /// applied) finds the pool empty and gets a fresh heap, so the outer call's heap is
+    /// never aliased.
+    ///
+    /// # Copy out, then rewind
+    ///
+    /// A `beam_alloc::Heap` never moves its terms, and the pool is **not** reset between the
+    /// calls of a plain `-eval`/nested run — so a term built here really is valid for the
+    /// runtime's lifetime, which is what those paths rely on. A **scheduled** process's call is
+    /// different: [`RuntimeContext::call_registered`](crate::context::RuntimeContext) **moves**
+    /// the BIF's result onto the running process's own (scanned) young heap and then
+    /// [`Heap::reset`](beam_alloc::Heap::reset)s the pooled heap before returning it here, so a
+    /// BIF-churn loop's peak memory is bounded by its live set instead of growing with the loop
+    /// count. The rewind is *not* applied when a heap word can outlive the call — one of the six
+    /// escaping `DispatchHooks` arms (process dictionary, process/port registry, NIF private
+    /// data, message send, `persistent_term`, timer heap / link set), a **reentrant**
+    /// fun-applying call, an **error** result (whose live reason term may point into this heap),
+    /// **no scheduled process**, or a heap that was handed over **dirty** — the pool is shared
+    /// with the native floor (`mint_reference`/`reference_term`), trace and the ETS-owner sweep,
+    /// which put a heap back *without* resetting it, so a rewind is applied only to a heap taken
+    /// at `used() == 0` — see that method for the exact rule.
     ///
     /// # Errors
     ///

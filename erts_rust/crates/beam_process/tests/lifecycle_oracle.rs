@@ -331,6 +331,106 @@ fn oracle_kill_under_trap_exit_is_untrappable_and_its_link_peer_sees_killed() {
 }
 
 // ---------------------------------------------------------------------------
+// The exit-signal family: `kill` is untrappable ONLY over `erlang:exit/2`
+// ---------------------------------------------------------------------------
+
+/// A **link** exit of reason `kill` is trappable and is never rewritten, unlike the explicit
+/// `erlang:exit/2` `kill` of the previous test.
+///
+/// The C's `handle_exit_signal` confines the untrappable-`kill` sentinel and the `kill`→`killed`
+/// rewrite to the `ERTS_SIG_Q_OP_EXIT` family (`erl_proc_sig_queue.c:4740`/`:4768`), so a
+/// `trap_exit` process linked to a peer that terminates with reason `kill` receives
+/// `{'EXIT', Peer, kill}` and **survives**, while a non-trapping linked peer is terminated with
+/// reason `kill` (**not** `killed`).
+///
+/// An earlier family-blind policy terminated the trapping peer here — a wrong result.
+#[test]
+fn oracle_kill_link_exit_is_trappable_and_not_rewritten_to_killed() {
+    // Probe 1 — the TRAPPING receiver: it gets `{'EXIT', P, kill}` (from `P`) and stays alive.
+    let expr = r#"
+        process_flag(trap_exit, true),
+        P = spawn(fun() -> receive go -> exit(kill) end end),
+        link(P), P ! go,
+        R = receive M -> M after 1000 -> timeout end,
+        io:format("~p|~p|~p~n",
+                  [{element(1, R), element(2, R) =:= P, element(3, R)},
+                   is_process_alive(P), is_process_alive(self())])
+    "#;
+    if !expect_oracle(expr, "{'EXIT',true,kill}|false|true") {
+        return;
+    }
+
+    // Probe 2 — the NON-trapping receiver: it follows the link exit with the reason UNCHANGED
+    // (`kill`, never `killed`), observable through a monitor's DOWN reason.
+    let expr = r#"
+        Parent = self(),
+        P = spawn(fun() -> receive go -> exit(kill) end end),
+        N = spawn(fun() -> link(P), Parent ! {n, self()}, receive never -> ok end end),
+        receive {n, _} -> ok end,
+        M = erlang:monitor(process, N),
+        P ! go,
+        R = receive {_, M, process, N, Rn} -> Rn after 2000 -> timeout end,
+        io:format("~p|~p~n", [R, is_process_alive(N)])
+    "#;
+    if !expect_oracle(expr, "kill|false") {
+        return;
+    }
+
+    let mut f = Fixture::new();
+    let exit_atom = f.atom("EXIT");
+    let down = f.atom("DOWN");
+    let process = f.atom("process");
+    let kill = f.atom_term("kill");
+    let killed = f.atom_term("killed");
+
+    // Rust side — probe 1: the trapping `w` linked to the dying peer `p` survives with the EXIT.
+    let p = f.table.spawn_default().expect("the peer");
+    let w = f.spawn_trapping();
+    f.table.link(p, w).expect("both pids are live");
+
+    f.table.terminate(p, kill).expect("the peer is live");
+
+    assert!(!f.table.contains(p), "the peer is gone");
+    assert!(
+        f.table.contains(w),
+        "a trapping receiver survives a `kill` link exit"
+    );
+    let payload = f.sole_payload(w);
+    assert_exit_message(payload, exit_atom, p.to_eterm(), kill, &f.names);
+    // SAFETY: `payload` is the live `{'EXIT', p, kill}` tuple; slot 2 is in bounds.
+    unsafe {
+        assert_ne!(
+            tuple_element(payload, 2),
+            killed,
+            "the link-exit reason is delivered unchanged, not rewritten to `killed`"
+        );
+    }
+
+    // Rust side — probe 2: a non-trapping linked peer `n` dies with reason `kill`.
+    let p2 = f.table.spawn_default().expect("the second peer");
+    let n = f.table.spawn_default().expect("the non-trapping peer");
+    let watcher = f.table.spawn_default().expect("the watcher");
+    f.table.link(p2, n).expect("both pids are live");
+    f.table
+        .monitor(watcher, n, MonitorKind::Process)
+        .expect("both pids are live");
+
+    f.table.terminate(p2, kill).expect("the second peer is live");
+
+    assert!(!f.table.contains(n), "the non-trapping peer follows the link exit");
+    let payload = f.sole_payload(watcher);
+    assert_pid_down(payload, down, process, n.to_eterm(), kill, &f.names);
+    // SAFETY: `payload` is the live `{'DOWN', _, process, n, kill}` tuple; slot 4 is in bounds.
+    unsafe {
+        assert_ne!(
+            tuple_element(payload, 4),
+            killed,
+            "a non-trapping link exit of reason `kill` is not rewritten to `killed`"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The exit-reason shapes at a trapping peer
 // ---------------------------------------------------------------------------
 

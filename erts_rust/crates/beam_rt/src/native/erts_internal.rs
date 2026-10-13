@@ -405,12 +405,27 @@ impl RuntimeContext<'_> {
     /// `async` form answers the oracle's `async` and records the same request, so the target's
     /// collection happens at its next serving point.
     ///
-    /// The one thing this runtime does **not** reproduce is the async form's **follow-up
-    /// message**: the oracle's request is a cross-process system task the target eventually
-    /// answers with `{garbage_collect, ReqId, GCResult}` to the requester, and this runtime
-    /// has no system-task protocol (the same limitation `/1`'s blocking form documents). The
-    /// **return value** is the oracle's exactly; only that notification never arrives — it is
-    /// not faked with a fabricated reply.
+    /// The async form's **follow-up message is reproduced**: the request also records the
+    /// completion it owes its caller ([`Runtime::request_gc_async`](crate::runtime::Runtime)),
+    /// and `{garbage_collect, ReqId, Result}` is delivered into the requester's mailbox at the
+    /// next scheduler-pass boundary
+    /// ([`Runtime::deliver_gc_completions`](crate::runtime::Runtime)) — the C's
+    /// `notify_sys_task_executed` (`erts/emulator/beam/erl_process.c:10574-10623`), whose
+    /// `Result` is `true` for a live target and `false` for one that has terminated
+    /// (`liveness_notify_sys_task_executed`, `erl_process.c:11488-11490`). A target that is
+    /// already gone is the same shape with nothing armed: `async`, then `false`.
+    ///
+    /// The **timing** differs from ERTS's in one respect: ERTS runs the request as a system task
+    /// and replies once the collection has finished, whereas here the message is emitted at the
+    /// request's discharge point and the armed collection is served at the target's own next
+    /// collection site (a valve that refuses the move drops it, exactly as `/1`'s does). The
+    /// reply's content is a **liveness** fact in ERTS too, so the value is the oracle's; only a
+    /// consumer that timed the reply against its own allocation pattern could tell the two
+    /// apart.
+    ///
+    /// The emission cannot happen *here*: a delivery may collect the **receiver's** heap, and
+    /// a BIF owns no root set (see [`Self::request_own_gc`]), so it happens where a delivery is
+    /// already legal — the pass boundary.
     ///
     /// # Errors
     ///
@@ -420,7 +435,7 @@ impl RuntimeContext<'_> {
     pub(super) fn garbage_collect_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let target = *args.first().ok_or(BeamError::BadArg)?;
         let options = *args.get(1).ok_or(BeamError::BadArg)?;
-        let (is_async, mode) = self.gc_options(options)?;
+        let (is_async, req_id, mode) = self.gc_options(options)?;
         // The eager validation `request_system_task` performs, ahead of any liveness check.
         let pid = ProcessId::from_eterm(target).map_err(|_| BeamError::BadArg)?;
         if !matches!(mode.as_deref(), Some("major") | Some("minor")) {
@@ -435,7 +450,20 @@ impl RuntimeContext<'_> {
         }
         if is_async {
             // The wrapper returns `async` without waiting, whether or not the target is still
-            // alive (a dead target's request is simply dropped).
+            // alive, and the target's collection owes the **caller**
+            // `{garbage_collect, ReqId, Result}` (the C's `notify_sys_task_executed`): record
+            // the requester and its `ReqId` so the runtime can emit it when the request is
+            // discharged (`Runtime::deliver_gc_completions`). A dead target still owes the
+            // message — with the oracle's `false` — so it is recorded with nothing armed.
+            //
+            // `ReqId` is any term, built by the caller and possibly on its **own** (movable)
+            // young heap, so it is copied onto the runtime's pointer-stable arena before it is
+            // stored: a recorded term that outlives the heap it was parsed from must not dangle.
+            if let Some(req_id) = req_id {
+                let req_id = self.runtime.stabilize_term(req_id)?;
+                let requester = self.pid();
+                self.runtime.request_gc_async(pid, requester, req_id, live);
+            }
             return self.atom("async");
         }
         self.atom(if live { "true" } else { "false" })
@@ -449,12 +477,20 @@ impl RuntimeContext<'_> {
     /// atom, a 1- or 3-tuple, a non-atom tag, an improper tail, a non-list — is the wrapper's
     /// `throw(bad_option)`, i.e. the caller's `badarg`.
     ///
-    /// Returns `(is_async, type)` where `type` is the **atom name** of the last `{type, _}`
-    /// value (`None` when it is not an atom). The default is `major` — `#gcopt{}`'s own
-    /// default — and the type is *not* validated here: `request_system_task` validates it,
-    /// after this parse, so the caller does both in that order.
-    fn gc_options(&self, options: Eterm) -> Result<(bool, Option<String>)> {
+    /// Returns `(is_async, req_id, type)` where:
+    ///
+    /// * `is_async` is whether an `{async, _}` element appeared;
+    /// * `req_id` is the **last** such element's value (`None` when there was none) — the
+    ///   `ReqId` the completion message carries;
+    /// * `type` is the **atom name** of the last `{type, _}` value (`None` when it is not an
+    ///   atom).
+    ///
+    /// The default type is `major` — `#gcopt{}`'s own default — and the type is *not* validated
+    /// here: `request_system_task` validates it, after this parse, so the caller does both in that
+    /// order.
+    fn gc_options(&self, options: Eterm) -> Result<(bool, Option<Eterm>, Option<String>)> {
         let mut is_async = false;
+        let mut req_id = None;
         let mut mode = Some("major".to_string());
         for option in terms::list_elements(options)? {
             if terms::tuple_arity(option)? != 2 {
@@ -463,12 +499,15 @@ impl RuntimeContext<'_> {
             let tag = self.atom_name(terms::tuple_element(option, 0)?);
             let value = terms::tuple_element(option, 1)?;
             match tag.as_deref() {
-                Some("async") => is_async = true,
+                Some("async") => {
+                    is_async = true;
+                    req_id = Some(value);
+                }
                 Some("type") => mode = self.atom_name(value),
                 _ => return Err(BeamError::BadArg),
             }
         }
-        Ok((is_async, mode))
+        Ok((is_async, req_id, mode))
     }
 
     /// Records a GC request for the **calling** process — the body `erlang:garbage_collect/0`

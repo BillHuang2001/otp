@@ -88,9 +88,12 @@ fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let spec = compile(args[1], ctx.atoms())?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     // `Table::select_reverse` needs the atom table *and* the caller heap at once;
-    // the same clone pattern `super::select_2` uses (identical indices, read-only).
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select_reverse(&spec, &atoms, ctx.heap());
+    // the two disjoint fields are split in a single borrow
+    // (`ctx.atom_and_heap()`) rather than cloned, exactly as `super::select_2`.
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select_reverse(&spec, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     copy_out_list(outcome?, ctx)
 }
@@ -113,8 +116,10 @@ fn select_reverse_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let limit = element_pos(args[2])?;
 
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select_reverse_limit(&spec, limit, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select_reverse_limit(&spec, limit, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
     finish_chunk(ctx, handle, results, cont, true)

@@ -125,16 +125,27 @@ the process's own root set. A collection driven while the process is parked — 
 cascade (`beam_process`) is **not** gated by `Runtime::gc_process_enabled` — relocates the process's heap
 against its own `regs`, so a parked machine that had not published its roots would be collected against a
 partial root set and left with a stale word in its `x`.
-[`run`] therefore calls `publish_parked_roots(table, pid, machine)` at **both** park arms — the
-pre-emption/`Yield` arm and the `Ok(EngineRunOutcome::Wait)` arm — right before `engines.insert`, and
-`resume_from_process_roots(ctx, pid, machine)` after `ctx.enter_module(module)` when
+[`run`] therefore calls `publish_parked_roots(table, pid, machine, publish_fr)` at **both** park arms —
+the pre-emption/`Yield` arm and the `Ok(EngineRunOutcome::Wait)` arm — right before `engines.insert`, and
+`resume_from_process_roots(ctx, pid, machine, publish_fr)` after `ctx.enter_module(module)` when
 `engine.parked.is_some()`.
 Both delegate to the **one** shared implementation in [`context::gc`](../context/CONTEXT.md)
-(`publish_roots`/`scatter_roots`), which the in-slice heap-admission point (`ensure_heap`) also uses, so
-the park/resume and the admission point can never drift:
+(`publish_roots_full`/`scatter_roots_full`, the `publish_fr` parameter selecting the FR words), which the
+in-slice heap-admission points (`ensure_heap_full`/`alloc_words_rooted`) also use — those always pass
+`publish_fr = true` — so the park/resume and the admission points can never drift:
 * `publish_parked_roots` hands the machine's roots over with `RootSet::ALL_LIVE` — the conservative
   (always-safe) choice, since a parked machine's live count is not exposed and over-approximating a
   copying collector's root set can only keep a term alive, never free a live one.
+* **The 1024-slot FR file is published only when it is live.** The runner computes `fr_is_live` **once**
+  from the post-slice scan (any FR slot `!= NIL`) and reuses it for both the `pin_process` and the
+  `publish_parked_roots(.., fr_is_live)` call in the same slice; `fr_is_live == true` also pins the
+  process, so a live FR is always published (a `Yield`-parked process is never exempt, and a
+  delivery-driven collection is not gated by `gc_process_enabled`, so a live FR must still relocate).
+  An all-`NIL` FR roots nothing (NIL immediates keep no term alive), and every collection site only ever
+  moves a process whose FR was measured dead at the end of its last slice, so a float-free park skips the
+  1024 words instead of scattering them onto `process.regs`. The choice is stored on
+  `ProcessEngine::fr_published` at the park and replayed at the resume, so `scatter_roots_full` never
+  sees a length mismatch (which would halt the process's collection).
 * `publish_parked_roots` **also** publishes the parked machine's live pending-exception reason
   (`Machine::pending_exception`) — the one term a parked machine holds that the closed `RootSet`
   shape cannot carry, because it is a machine *field*, not an `x`/stack/FR slot — as the process's
@@ -142,8 +153,10 @@ the park/resume and the admission point can never drift:
   `beam_process`'s `gather_roots`/`scatter_roots` relocate in place). With **no** live pending
   exception the extra-root set is left **empty** (cleared, never a NIL/placeholder), so a stale root
   can never keep an otherwise-dead term alive.
-* `resume_from_process_roots` is the context's `RuntimeContext::resync_parked_roots`: it copies the
-  process's authoritative root set back into the machine, reads the (already-relocated) extra-root
+* `resume_from_process_roots(ctx, pid, machine, publish_fr)` is the context's
+  `RuntimeContext::resync_parked_roots`, called with the **same** `publish_fr` the matching park used
+  (`engine.fr_published`): it copies the process's authoritative root set back into the machine (the FR
+  words only when `publish_fr`), reads the (already-relocated) extra-root
   reason out and writes it into `Machine::pending_exception_mut()`, **clears** the process's extra
   roots (the machine owns the relocated term now), and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.

@@ -107,11 +107,13 @@ fn match_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     // `Table::match_` needs the atom table *and* the caller heap at once; the
-    // context lends them through two conflicting borrows, so it is given a clone
-    // of the atom table (identical indices, and the call only reads it — the same
-    // pattern `select_2`/`update_counter` use).
-    let atoms = ctx.atoms().clone();
-    let outcome = table.match_(args[1], &atoms, ctx.heap());
+    // context splits the two disjoint fields in a single borrow
+    // (`ctx.atom_and_heap()`) rather than cloning the table — the same pattern
+    // `select_2`/`update_counter` use.
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.match_(args[1], atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     copy_out_list(outcome?, ctx)
 }
@@ -125,8 +127,10 @@ fn match_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let limit = element_pos(args[2])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.match_limit(args[1], limit, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.match_limit(args[1], limit, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
     finish_chunk(ctx, handle, results, cont, false)
@@ -153,8 +157,10 @@ fn match_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn match_object_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.match_object(args[1], &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.match_object(args[1], atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     copy_out_list(outcome?, ctx)
 }
@@ -164,8 +170,10 @@ fn match_object_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let limit = element_pos(args[2])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.match_object_limit(args[1], limit, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.match_object_limit(args[1], limit, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
     finish_chunk(ctx, handle, results, cont, false)
@@ -195,8 +203,10 @@ fn select_count_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select_count(&spec, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select_count(&spec, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     count_term(ctx, outcome?)
 }
@@ -213,8 +223,10 @@ fn select_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select_delete(&spec, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select_delete(&spec, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     count_term(ctx, outcome?)
 }
@@ -241,8 +253,10 @@ fn select_replace_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select_replace(&spec, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select_replace(&spec, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     count_term(ctx, outcome?)
 }
@@ -253,8 +267,10 @@ fn select_replace_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn match_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.match_delete(args[1], &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.match_delete(args[1], atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     // The count is not observable through this BIF (the oracle returns `true`), but
     // the call's failure is: propagate `badarg` rather than reporting a deletion.

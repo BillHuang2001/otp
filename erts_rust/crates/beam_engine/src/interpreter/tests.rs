@@ -989,3 +989,99 @@ fn import_cache_is_absent_on_a_hand_built_label_map() {
         import_target(&module, ImportRef(1)).unwrap()
     );
 }
+
+// ---- the shared `call_ext*` entry point --------------------------------
+
+/// A one-function module importing `erlang:f/1`: neither `erlang:apply/3` nor
+/// `erlang:send/2`, so [`Machine::call_ext_dispatch`] runs its ordinary resolution
+/// order (the two special-case seams decline, then the `seam` parameter).
+fn call_ext_module() -> Module {
+    let (mut module, _) =
+        module_with_function(vec![Instr::Label(Label(2)), Instr::Return], Vec::new());
+    let erlang = module.atom_table.intern("erlang");
+    let name = module.atom_table.intern("f");
+    module.imports.push(Import {
+        module: erlang,
+        function: name,
+        arity: 1,
+    });
+    module
+}
+
+/// The `seam` parameter's `None` (resolve the host's cross-module seam here) and
+/// `Some(None)` (the host has already consulted that seam and declined) are
+/// indistinguishable: both fall through to the same synchronous BIF route with the
+/// instruction's own arity, so the refactor that hoisted the arm bodies into
+/// `call_ext_dispatch` cannot have changed what an import call does.
+#[test]
+fn call_ext_dispatch_seam_none_and_some_none_agree() {
+    let module = call_ext_module();
+    let labels = build_label_map(&module);
+    let mut ctx = MinimalContext::new();
+
+    // Resolved here: `resolve_external_entry` consults the context's own
+    // `resolve_external_call` (the `MinimalContext` default declines).
+    let resolved_here = Machine::new()
+        .call_ext_dispatch(
+            &module,
+            &labels,
+            ImportRef(0),
+            1,
+            0,
+            0,
+            ImportFrame::Only,
+            &mut ctx,
+            None,
+        )
+        .unwrap_err();
+    // Reported by the host as declined: the same route, without re-asking.
+    let host_declined = Machine::new()
+        .call_ext_dispatch(
+            &module,
+            &labels,
+            ImportRef(0),
+            1,
+            0,
+            0,
+            ImportFrame::Only,
+            &mut ctx,
+            Some(None),
+        )
+        .unwrap_err();
+    assert_eq!(format!("{resolved_here:?}"), format!("{host_declined:?}"));
+    // The `MinimalContext` floor rejects every BIF, and an ext call carries no fail
+    // label, so the shared route raises its typed error (no live frame to land in).
+    assert!(format!("{host_declined:?}").contains("unsupported_opcode: bif erlang:f"));
+}
+
+/// A host's *answer* (`Some(Some(..))`) is taken verbatim as a callee this machine
+/// can enter — the import's own resolution is skipped — and the arm's [`ImportFrame`]
+/// then decides the frame discipline (`Enter` under `Only` stores nothing).
+#[test]
+fn call_ext_dispatch_honors_the_hosts_seam_answer_verbatim() {
+    let module = call_ext_module();
+    let labels = build_label_map(&module);
+    let mut ctx = MinimalContext::new();
+
+    let step = Machine::new()
+        .call_ext_dispatch(
+            &module,
+            &labels,
+            ImportRef(0),
+            1,
+            0,
+            0,
+            ImportFrame::Only,
+            &mut ctx,
+            Some(Some((0, 7, 3))),
+        )
+        .unwrap();
+    assert_eq!(
+        step,
+        Step::Enter {
+            context: 0,
+            func: 7,
+            pc: 3
+        }
+    );
+}

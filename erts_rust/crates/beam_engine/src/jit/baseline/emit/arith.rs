@@ -28,9 +28,12 @@ use beam_term::{MAX_SMALL, MIN_SMALL, TAG_IMMED1_MASK, TAG_IMMED1_SIZE, TAG_IMME
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
-use super::operands::{constant_word, x_offset, x_register};
+use super::operands::{
+    constant_word, emit_guarded_y_load, emit_guarded_y_store, x_offset, x_register, y_addressable,
+    y_register,
+};
+use super::r#move::move_shape;
 use super::{emit_step_and_continue, touch, Allocation};
-
 // ---------------------------------------------------------------------------
 // The small-int arithmetic fast path
 // ---------------------------------------------------------------------------
@@ -58,9 +61,40 @@ use super::{emit_step_and_continue, touch, Allocation};
 //   **untagged** product, because `p * 16` silently wraps for `|p| >= 2^59` and can
 //   land back inside the valid tagged-word interval (a wrong result).
 //
-// Everything else (another BIF, another module, an operand that is not a cached
-// x-register or a small constant, a destination that is not a cached x-register)
-// keeps today's behaviour: one `jit_step_one` call.
+// Everything else (another BIF, another module, an operand that is a static literal,
+// a destination that is a literal or a float register, a register index outside the
+// engine's bound) keeps today's behaviour: one `jit_step_one` call.
+//
+// ## Y-slot operands and a Y-slot destination
+//
+// A `Y` operand is a slot in the **current call frame's** Y area, which lives in
+// `machine.stack` — a Rust `Vec` that a frame push may reallocate. The runtime
+// therefore publishes the live frame's Y window (`JitRuntime::y_base`/`y_end`,
+// refreshed by the driver before every native entry and by every frame-changing
+// helper) and the emitted Y access is **guarded** against it:
+//
+// ```text
+//   mov  reg,       [rsp + RUNTIME_SLOT_DISP]  ; rt
+//   mov  scratch,   [reg + RUNTIME_YEND_DISP]  ; y_end
+//   mov  reg,       [reg + RUNTIME_YBASE_DISP] ; y_base
+//   lea  scratch2,  [reg + k*8]                ; the slot address
+//   cmp  scratch2,  scratch
+//   jae  fallback                              ; outside the frame -> interpreter
+//   mov  reg,       [scratch2]                 ; (the store writes r11 instead)
+// ```
+//
+// The guard can only ever **reject**: a slot outside the frame jumps to the same
+// `jit_step_one` fallback as any other un-lowered shape, and the interpreter's own
+// `y(k)` bounds check then produces exactly its error — so no out-of-frame
+// dereference and no wrong value is possible. The frame-less case is covered too:
+// `y_base == y_end == null` makes `lea k*8; cmp; jae` reject every slot. A Y index so
+// large that `y_offset` would overflow the `disp32` is refused at compile time
+// ([`super::operands::y_addressable`]).
+//
+// A Y slot is **not** an x-register, so neither a Y operand nor a Y destination is
+// charged to `highest_touched` — that bound is the x-register file's
+// (`machine.x.len() > bound`), and raising it for a stack slot would wrongly refuse
+// native entry.
 
 /// The three BIFs the fast path lowers — `erlang:'+'/2`, `erlang:'-'/2` and
 /// `erlang:'*'/2`, and nothing else.
@@ -121,22 +155,37 @@ pub(crate) const FAST_C: Reg = Reg::Rcx;
 /// The computed result word.
 pub(crate) const FAST_R: Reg = Reg::R11;
 
+/// Where the fast path writes its result.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FastDest {
+    /// A cacheable (or directly addressable) x-register.
+    X(u32),
+    /// A slot in the current call frame's Y area, written through the guarded Y
+    /// window (see the section comment).
+    Y(u32),
+}
+
 /// A `gc_bif` shape the fast path can lower.
 pub(crate) struct FastArith<'a> {
     /// Which of the two BIFs is called.
     pub(crate) op: SmallArith,
-    /// The first operand (a cacheable `x(i)` or a small-int constant).
+    /// The first operand (an addressable `x(i)`/`y(k)` or a small-int constant).
     pub(crate) a: &'a Operand,
     /// The second operand.
     pub(crate) b: &'a Operand,
-    /// The x-register index the result is written to.
-    pub(crate) dst_x: u32,
+    /// Where the result is written.
+    pub(crate) dst: FastDest,
 }
 
 impl FastArith<'_> {
     /// The x-register indices the shape needs cached, in load order (the
-    /// operands first, then the destination) — exactly the order
-    /// [`super::regalloc::allocate_registers`] caches them in.
+    /// x-register operands first, then the destination **when it is an
+    /// x-register**) — exactly the order [`super::regalloc::allocate_registers`]
+    /// caches them in.
+    ///
+    /// A `Y` operand and a `Y` destination contribute nothing: they are stack slots,
+    /// not x-registers, so they must not enter the x-register usage counts (a
+    /// spurious entry would evict a real x-register from the cache).
     pub(super) fn registers(&self) -> Vec<u32> {
         let mut registers = Vec::with_capacity(3);
         for operand in [self.a, self.b] {
@@ -144,9 +193,45 @@ impl FastArith<'_> {
                 registers.push(x);
             }
         }
-        registers.push(self.dst_x);
+        if let FastDest::X(x) = self.dst {
+            registers.push(x);
+        }
         registers
     }
+
+    /// Whether the lowered sequence reads the current frame's Y window.
+    ///
+    /// A `Y` operand or a `Y` destination is read/written through
+    /// `JitRuntime::y_base`/`y_end`, so the emitted code needs the window published.
+    /// This is the **one** predicate the emitter's Y-window gate rests on: the arith
+    /// fast path is the only lowering that reads the window (a `move`/`get_list`/… with
+    /// a Y operand deopts to the interpreter, which reads `machine.stack` itself). Any
+    /// future lowering that reads `y_base`/`y_end` MUST be reflected here, or the window
+    /// it reads would not be published.
+    pub(crate) fn uses_y(&self) -> bool {
+        matches!(self.dst, FastDest::Y(_))
+            || y_register(self.a).is_some()
+            || y_register(self.b).is_some()
+    }
+}
+
+/// Whether lowering `instr` would read the current frame's Y window — the emitter's
+/// per-instruction Y gate ([`super::Allocation::y_last`]).
+///
+/// True exactly for the two lowerings that read the window: the arithmetic fast path
+/// ([`FastArith::uses_y`], for a `Y` operand or `Y` destination `gc_bif`) and a `move`
+/// whose inlined shape has a `Y` source or `Y` destination ([`move_shape`] +
+/// [`super::r#move::MoveShape::uses_y`]). MUST stay in exact agreement with the inliners: a `move`
+/// shape the move inliner **refuses** deopts and reads nothing, so it must be false
+/// here too, or a later in-block Y access would use a window published before a
+/// `machine.stack` reallocation. Gate conservatively at the call site — a block whose
+/// code contains any such instruction publishes the window in its prologue, and
+/// refreshes it after an in-block helper call when one still follows.
+pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
+    if let Instr::Move { src, dst } = instr {
+        return move_shape(src, dst).map_or(false, |shape| shape.uses_y());
+    }
+    fast_arith(module, instr).map_or(false, |fast| fast.uses_y())
 }
 
 /// The fast path's shape test for `instr`, a *purely syntactic* check (it never
@@ -154,8 +239,8 @@ impl FastArith<'_> {
 /// agree on which `gc_bif`s the fast path targets).
 ///
 /// The shape is the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` of `args.len() == 2`
-/// whose every operand is a cacheable x-register or a small-int constant and whose
-/// destination is a cacheable x-register.
+/// whose every operand is an in-bound x-register, an addressable Y slot or a small-int
+/// constant and whose destination is an in-bound x-register or an addressable Y slot.
 pub(crate) fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastArith<'a>> {
     let Instr::GcBif {
         arity, bif, args, dst, ..
@@ -173,27 +258,42 @@ pub(crate) fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastAr
         "*" => SmallArith::Mul,
         _ => return None,
     };
-    let dst_x = x_register(dst)?;
-    if dst_x >= MAX_REGISTER || args.iter().any(|operand| !loadable(operand)) {
+    let dst = destination(dst)?;
+    if args.iter().any(|operand| !loadable(operand)) {
         return None;
     }
     Some(FastArith {
         op,
         a: &args[0],
         b: &args[1],
-        dst_x,
+        dst,
     })
 }
 
-/// Whether `operand` is something the fast path can load into a scratch
-/// register: a cacheable x-register or a small-int constant.
-fn loadable(operand: &Operand) -> bool {
-    match x_register(operand) {
-        Some(x) => x < MAX_REGISTER,
-        None => small_constant(operand).is_some(),
+/// The [`FastDest`] for `operand`, or `None` when it is neither an in-bound
+/// x-register nor an addressable Y slot.
+fn destination(operand: &Operand) -> Option<FastDest> {
+    if let Some(x) = x_register(operand) {
+        return (x < MAX_REGISTER).then_some(FastDest::X(x));
     }
+    if let Some(k) = y_register(operand) {
+        return y_addressable(k).then_some(FastDest::Y(k));
+    }
+    None
 }
 
+/// Whether `operand` is something the fast path can load into a scratch
+/// register: an in-bound x-register, an addressable Y slot, or a small-int
+/// constant.
+fn loadable(operand: &Operand) -> bool {
+    if let Some(x) = x_register(operand) {
+        return x < MAX_REGISTER;
+    }
+    if let Some(k) = y_register(operand) {
+        return y_addressable(k);
+    }
+    small_constant(operand).is_some()
+}
 /// The raw `Eterm` word of a **small-int** constant operand (`integer`/
 /// `character`), or `None` for anything else — including the non-small `atom`/
 /// `nil` constants, which the run-time guard would reject anyway (so refusing
@@ -223,32 +323,51 @@ enum FastSource {
     Cached(Reg),
     /// A non-cached x-register, read straight from its `machine.x` slot.
     Memory(u32),
+    /// A Y slot, read through the guarded frame window.
+    YSlot(u32),
     /// A small-int constant, loaded as a raw `Eterm` word.
     Constant(i64),
 }
 
 /// The [`FastSource`] for `operand`, or `None` when it is neither an addressable
-/// x-register nor a small constant.
+/// x-register, an addressable Y slot nor a small constant.
 ///
 /// A non-cached x-register is a `machine.x` read, not a deopt: the register
 /// allocator's four-register budget decides only *where* the value is read from,
-/// never whether the instruction can be lowered.
+/// never whether the instruction can be lowered. A Y slot is likewise read natively,
+/// behind the run-time frame-window guard.
 fn fast_source(operand: &Operand, allocation: &Allocation) -> Option<FastSource> {
-    match x_register(operand) {
-        Some(x) if x < MAX_REGISTER => match allocation.slot(x) {
-            Some(reg) => Some(FastSource::Cached(reg)),
-            None => Some(FastSource::Memory(x)),
-        },
-        Some(_) => None,
-        None => small_constant(operand).map(FastSource::Constant),
+    if let Some(x) = x_register(operand) {
+        if x >= MAX_REGISTER {
+            return None;
+        }
+        return Some(match allocation.slot(x) {
+            Some(reg) => FastSource::Cached(reg),
+            None => FastSource::Memory(x),
+        });
     }
+    if let Some(k) = y_register(operand) {
+        return y_addressable(k).then_some(FastSource::YSlot(k));
+    }
+    small_constant(operand).map(FastSource::Constant)
 }
 
-/// Load `source` into scratch register `reg`, recording a `machine.x` read.
+/// Load `source` into scratch register `reg`, recording a `machine.x` read and
+/// jumping to `fallback` when a **Y slot** lies outside the current frame.
+///
+/// The Y branch is the only one that can transfer control at run time: every other
+/// source is a compile-time-addressable x-register slot or an immediate.
+///
+/// The Y-slot guard itself is the shared [`emit_guarded_y_load`]: `reg` receives the
+/// slot's word and [`FAST_C`] is its window-bound scratch (caller-saved and dead at
+/// operand-load time — the mask constant is loaded into it only **after** both operands
+/// are loaded). See that helper for the exact emitted sequence and why the guard can
+/// only ever reject.
 fn load_into(
     buffer: &mut CodeBuffer,
     source: FastSource,
     reg: Reg,
+    fallback: CodeLabel,
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
     match source {
@@ -257,26 +376,46 @@ fn load_into(
             touch(highest_touched, x);
             buffer.mov_rm(reg, Reg::Rbx, x_offset(x))
         }
+        FastSource::YSlot(k) => emit_guarded_y_load(buffer, reg, FAST_C, k, fallback),
         FastSource::Constant(word) => buffer.mov_ri(reg, word),
     }
+}
+
+/// Emit the **guarded** store of the fast path's result (`FAST_R`) into Y slot `k`,
+/// jumping to `fallback` when the slot lies outside the current frame's Y window.
+///
+/// The store is the shared [`emit_guarded_y_store`]: [`FAST_A`] holds the slot address
+/// and [`FAST_C`] the window bound. Both are dead when this runs (the arithmetic is
+/// complete), and the value being stored lives in [`FAST_R`] — so the three are distinct.
+/// A rejection falls back to `jit_step_one`, which re-runs the **whole** instruction in
+/// the interpreter — nothing has been committed to the machine before this store, so the
+/// interpreter sees exactly the state it would have seen.
+fn emit_y_store(buffer: &mut CodeBuffer, k: u32, fallback: CodeLabel) -> Result<()> {
+    emit_guarded_y_store(buffer, FAST_R, FAST_A, FAST_C, k, fallback)
 }
 
 /// Lower a fast-path-eligible `gc_bif` natively, or report that the block must
 /// helper it.
 ///
 /// Returns `true` when the whole guarded sequence was emitted, leaving the
-/// result in the destination (its cached machine register, or its `machine.x`
-/// slot when it is beyond the cache budget) and letting the block continue with
-/// the next instruction. Returns `false` **without having emitted a byte** when
-/// the shape matched ([`fast_arith`]) but an operand names a register outside the
-/// engine's bound or the destination is not an addressable x-register — the caller
-/// then emits exactly today's `jit_step_one` fallback.
+/// result in the destination (its cached machine register, its `machine.x` slot
+/// when it is beyond the cache budget, or its Y slot behind the frame-window
+/// guard) and letting the block continue with the next instruction. Returns
+/// `false` **without having emitted a byte** when the shape matched
+/// ([`fast_arith`]) but an operand or the destination names neither an
+/// in-bound x-register nor an addressable Y slot — the caller then emits exactly
+/// today's `jit_step_one` fallback.
+///
+/// A Y operand or a Y destination additionally carries a **run-time** rejection:
+/// the emitted frame-window guard can branch to the same `fallback` when the slot
+/// lies outside the current frame, so an in-frame Y `gc_bif` runs natively and a
+/// malformed frame keeps the interpreter's exact error.
 ///
 /// The emitted shape (see the section comment above for why it is exact):
 ///
 /// ```text
-///   mov  rax, a          ; the operand: a cached register, `[rbx + x*8]`, or a
-///                        ; movabs of a small constant
+///   mov  rax, a          ; the operand: a cached register, `[rbx + x*8]`, a
+///                        ; movabs of a small constant, or the guarded Y read below
 ///   mov  r8,  b
 ///   mov  rcx, SMALL_MASK
 ///   mov  r10, rax ; and r10, rcx ; cmp r10, rcx ; jne fallback   ; a is small?
@@ -301,8 +440,9 @@ fn load_into(
 ///   shl  r11, SMALL_SHIFT   ; make_small(p) == p * 16 + 15, safe after the check
 ///   mov  rcx, SMALL_TAG
 ///   or   r11, rcx
-///   mov  <dst>, r11         ; cached destination: its machine register;
-///                           ; otherwise `mov [rbx + dst*8], r11`
+///   mov  <dst>, r11         ; cached destination: its machine register; a
+///                           ; non-cached one: `mov [rbx + dst*8], r11`; a Y slot:
+///                           ; the guarded Y store (see `emit_y_store`)
 ///   jmp  fast_done
 /// fallback:
 ///   <the `emit_step_and_continue` sequence: spill, call `jit_step_one`, continue
@@ -339,10 +479,11 @@ pub(super) fn try_inline_gc_bif(
     let fallback: CodeLabel = buffer.label();
     let fast_done: CodeLabel = buffer.label();
 
-    // Load both operands into scratch registers.
-    load_into(buffer, a_source, FAST_A, highest_touched)?;
-    load_into(buffer, b_source, FAST_B, highest_touched)?;
-
+    // Load both operands into scratch registers. A Y operand carries its own
+    // frame-window guard, whose rejection jumps to `fallback` before anything is
+    // committed.
+    load_into(buffer, a_source, FAST_A, fallback, highest_touched)?;
+    load_into(buffer, b_source, FAST_B, fallback, highest_touched)?;
     // Both operands must be small integers: `(word & 0xF) == 0xF`. The mask and
     // the tag are the same nibble (asserted above), so one register serves both.
     buffer.mov_ri(FAST_C, SMALL_MASK)?;
@@ -416,18 +557,22 @@ pub(super) fn try_inline_gc_bif(
         }
     }
 
-    // Success: store the result — in the destination's cached register, or
-    // straight into its `machine.x` slot when the budget could not cache it —
-    // and skip the fallback.
-    match allocation.slot(fast.dst_x) {
-        Some(dst_reg) => buffer.mov_rr(dst_reg, FAST_R)?,
-        None => {
-            buffer.mov_mr(Reg::Rbx, x_offset(fast.dst_x), FAST_R)?;
-            touch(highest_touched, fast.dst_x);
-        }
+    // Success: store the result — in the destination's cached register, straight
+    // into its `machine.x` slot when the budget could not cache it, or into the
+    // destination Y slot behind the same frame-window guard — and skip the fallback.
+    match fast.dst {
+        FastDest::X(dst_x) => match allocation.slot(dst_x) {
+            Some(dst_reg) => buffer.mov_rr(dst_reg, FAST_R)?,
+            None => {
+                buffer.mov_mr(Reg::Rbx, x_offset(dst_x), FAST_R)?;
+                touch(highest_touched, dst_x);
+            }
+        },
+        // A Y destination is not an x-register, so it never raises the x-register
+        // bound the driver's entry guard reads.
+        FastDest::Y(k) => emit_y_store(buffer, k, fallback)?,
     }
     buffer.jmp(fast_done)?;
-
     // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
     buffer.bind(fallback)?;
     emit_step_and_continue(buffer, done, allocation, func, pc)?;

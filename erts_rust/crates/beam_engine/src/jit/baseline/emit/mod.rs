@@ -30,12 +30,13 @@
 //! guarded aggregate readers plus the tuple writer ([`aggregate`]: the cons-cell
 //! readers `get_list`/`get_hd`/`get_tl`, the tuple readers `get_tuple_element` /
 //! `select_tuple_arity`, and the destructive `set_tuple_element`).
-//! Two compilation entry points produce the artifact: [`compile_module`] lowers
-//! **every** function of a module up front into one shared, eagerly-compiled
-//! [`CompiledModule`], while [`compile_function`] lowers **one** function into its own
-//! sealed artifact (the [`CompiledFunction`] the lazy layout fills on first entry).
-//! Both share the per-function [`emit_function`]. See `super` for the block ABI (in
-//! `runtime`) and the driver that runs the emitted code.
+//! Two compilation entry points produce the artifact — in [`compile`]: [`compile_module`]
+//! lowers **every** function of a module up front into one shared, eagerly-compiled
+//! [`CompiledModule`](super::code::CompiledModule), while [`compile_function`] lowers
+//! **one** function into its own sealed artifact (the
+//! [`CompiledFunction`](super::code::CompiledFunction) the lazy layout fills on first
+//! entry). Both share the per-function [`emit_function`](compile::emit_function). See
+//! `super` for the block ABI (in `runtime`) and the driver that runs the emitted code.
 //!
 //! **Only [`CACHE_REGISTERS`]`.len()` x-registers are held in machine registers**;
 //! every other x-register a block names is addressed **directly in `machine.x`**
@@ -51,11 +52,12 @@
 //! machine register (and written back at every block exit) or *never* cached, so
 //! the two representations can never disagree. The highest x-register index a block
 //! touches natively — cached or direct — is recorded per function (in the function's
-//! [`Summary`]); [`compile_module`] merges those into the whole-module [`Summary`],
-//! and that whole-module bound is the register-file guard the driver applies when
-//! entering an **eager** artifact — the one shared mapping whose seal-time links may
-//! tail-call across functions — while the **lazy** layout guards on the single
-//! function it is about to enter (see [`enter_compiled`](super::enter_compiled)).
+//! [`Summary`](super::code::Summary)); [`compile_module`] merges those into the
+//! whole-module [`Summary`](super::code::Summary), and that whole-module bound is the
+//! register-file guard the driver applies when entering an **eager** artifact — the one
+//! shared mapping whose seal-time links may tail-call across functions — while the
+//! **lazy** layout guards on the single function it is about to enter (see
+//! [`enter_compiled`](super::enter_compiled)).
 //!
 //! **Direct block-to-block linking.** A taken branch to a successor basic block
 //! that this compilation emitted does not return its `(func, pc)` word to the
@@ -86,8 +88,9 @@
 //!
 //! The emitter is split by responsibility across this directory: this file owns the
 //! compiled-block shape (the register-file constants, the allocation artifact,
-//! [`emit_block`], the deopt-and-continue sequence and the two entry points
-//! [`compile_module`] and [`compile_function`] via [`emit_function`]);
+//! [`emit_block`] and the deopt-and-continue sequence); [`compile`] the compilation
+//! entry points ([`compile_module`]/[`compile_function`] via
+//! [`emit_function`](compile::emit_function)) and the continuation sub-blocks;
 //! [`regalloc`] the register allocator, [`operands`] the operand/constant readers,
 //! [`r#move`] the inline `move`/`swap`, [`test`] the word-level `test` subset,
 //! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path,
@@ -100,19 +103,21 @@ use std::collections::BTreeMap;
 use beam_common::Result;
 use beam_loader::{ImportRef, Instr, Module};
 
-use crate::interpreter::{self, LabelMap};
-use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
+use crate::interpreter::LabelMap;
+use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
-use super::code::{CompiledFunction, CompiledModule, Summary};
 use super::runtime::{
-    encode_target, ExtCallHelper, PositionHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
-    EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
+    encode_target, ExtCallHelper, PositionHelper, RefreshHelper, StepHelper, EXT_CALL,
+    EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
 };
 use super::{jit_ext_call, jit_set_position, jit_step_one};
+use super::runtime::{jit_publish_y, jit_refresh_y};
 
 mod aggregate;
 mod arith;
 mod compare;
+mod compile;
+mod frame;
 mod link;
 mod r#move;
 mod operands;
@@ -126,6 +131,7 @@ use aggregate::{
 };
 use arith::try_inline_gc_bif;
 use compare::try_inline_comparison;
+use frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use link::{emit_frame_teardown, Linker};
 use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
@@ -137,12 +143,20 @@ use test::try_inline_test;
 // submodules changed no item path. Only the tests use them, hence `cfg(test)`.
 #[cfg(test)]
 pub(crate) use arith::{
-    fast_arith, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T, MAX_SMALL_WORD, MIN_SMALL_WORD,
-    SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
+    fast_arith, uses_y, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T,
+    MAX_SMALL_WORD, MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
 };
 #[cfg(test)]
-pub(crate) use operands::{constant_word, x_register};
+pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
+#[cfg(test)]
+pub(crate) use r#move::{move_shape, MoveShape};
 pub(crate) use regalloc::allocate_registers;
+
+// The compilation entry points live in the `compile` submodule; re-export them here
+// so every item path outside this module (`emit::compile_module`,
+// `emit::compile_function` — named by `baseline/mod.rs` and `baseline/code.rs`) stays
+// exactly what it was.
+pub(crate) use compile::{compile_function, compile_module};
 
 // ---------------------------------------------------------------------------
 // Compilation
@@ -205,6 +219,22 @@ pub(super) fn touch(highest: &mut Option<u32>, x: u32) {
 pub(crate) struct Allocation {
     /// The slots, in assignment order (`src` before `dst` within a `move`).
     pub(crate) slots: Vec<(u32, Reg)>,
+    /// The **highest pc of the block whose instruction accesses a Y slot**, or `None`
+    /// when no instruction of the block does.
+    ///
+    /// The emitter's two Y-window decisions both read it, and both are compile-time
+    /// (so a Y-free block pays nothing at run time):
+    ///
+    /// * the **prologue** publishes the current frame's Y window iff `y_last.is_some()`
+    ///   (a block that may read `JitRuntime::y_base`/`y_end`);
+    /// * the **post-deopt refresh** ([`Allocation::refresh_y_after`]) is emitted only
+    ///   when a still-later instruction accesses a Y slot.
+    ///
+    /// Only the arithmetic fast path reads the window (see the Y-operand contract in
+    /// [`arith`]): an instruction "accesses a Y slot" exactly when [`arith::uses_y`]
+    /// says so. A `move`/`get_list`/… with a Y operand is *not* a window access — it
+    /// deopts to the interpreter, which reads `machine.stack` itself.
+    pub(crate) y_last: Option<u32>,
 }
 
 impl Allocation {
@@ -215,287 +245,21 @@ impl Allocation {
             .find(|(n, _)| *n == x)
             .map(|(_, reg)| *reg)
     }
-}
 
-/// Lower every `Function`'s every `Block` of `module` into **one** native artifact.
-///
-/// This is the **eager** layout: every function is lowered up front into a single
-/// shared [`CodeBuffer`], and the whole-module block map is registered before any
-/// code is emitted, so a taken branch to a successor block — including one of
-/// **another** function (`fib/1`'s tail call into `fib/3`) — is linked directly at
-/// `bind` time (see [`Linker`]). It is what
-/// [`JitBackend::compile`](crate::jit::JitBackend::compile) and
-/// [`CodeCache::get_or_compile`](crate::jit::cache::CodeCache::get_or_compile)
-/// produce, and the layout every whole-module introspection query answers for.
-pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
-    let labels = interpreter::build_label_map(module);
-    let mut buffer = CodeBuffer::with_capacity(code_capacity_estimate(module))?;
-    // A flat `[func][pc]` table, not a `HashMap`: the driver's per-block lookup sits on
-    // the hot path of every cross-block jump — a `fib`-style loop re-enters the driver
-    // once per iteration — so SipHash on a `(u32, u32)` key is a measurable share of the
-    // run. Two indexed `Vec` loads replace it.
-    let mut entries: Vec<Vec<Option<*const u8>>> = module
-        .functions
-        .iter()
-        .map(|function| vec![None; function.code.len()])
-        .collect();
-
-    // Reserve one entry label per non-empty compiled block **before** emitting any
-    // code, so a branch to a successor block — usually a forward reference, e.g. a
-    // `jump` to a block emitted later, a `fail` label, or a block of a **later
-    // function** — is resolved by the buffer's ordinary `rel32` fixup machinery at
-    // `bind` time, before `seal` flips the mapping to read+execute. Each label is
-    // bound at its block's entry offset below, exactly where the driver's `entries`
-    // slot points.
-    let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
-    for (func_index, function) in module.functions.iter().enumerate() {
-        let code = &function.code;
-        for block in &function.blocks {
-            let start = block.start;
-            let end = block.end.min(code.len());
-            if start >= end {
-                continue;
-            }
-            block_labels.insert((func_index as u32, start as u32), buffer.label());
-        }
+    /// Whether a helper call made at `pc` — whose `Step::Next` continues the block
+    /// in-block at `pc + 1` — must be followed by a Y-window refresh.
+    ///
+    /// True only when a later instruction of the block still accesses a Y slot: the
+    /// helper ran one instruction in the interpreter, which may have pushed a frame,
+    /// `trim`med one, or **reallocated** `machine.stack`, so the window the block
+    /// published in its prologue may be stale. When no later instruction accesses a Y
+    /// slot the refresh is not emitted at all — and when the helper leaves the block to
+    /// the driver, the next block's prologue publishes instead, so no driver
+    /// round-trip ever refreshes.
+    pub(crate) fn refresh_y_after(&self, pc: u32) -> bool {
+        matches!(self.y_last, Some(last) if last > pc)
     }
-
-    let mut summary = Summary::default();
-    for func_index in 0..module.functions.len() {
-        let func_summary = emit_function(
-            &mut buffer,
-            module,
-            &labels,
-            &block_labels,
-            func_index as u32,
-            &mut entries[func_index],
-        )?;
-        summary.merge(&func_summary);
-    }
-
-    buffer.seal()?;
-    Ok(CompiledModule::eager(buffer, entries, summary))
 }
-
-/// Lower **one** function of `module` into its own native artifact.
-///
-/// This is the **lazy** layout's unit of work: the artifact ([`CompiledFunction`])
-/// owns its own sealed [`CodeBuffer`], and its block map — `(func, pc)` keys, all of
-/// them this one function — is registered before any code is emitted, so a branch to
-/// a successor block of **this** function is still linked directly. A branch to a
-/// block of another function is simply absent from that map, which is exactly the
-/// documented unlinkable exit: the block returns the target's `(func, pc)` word to
-/// the driver, which compiles that function on entry (see
-/// [`CompiledModule::native_entry`](super::code::CompiledModule::native_entry)).
-///
-/// Each function gets its **own** mapping ([`CodeBuffer`]), so a lazy artifact never
-/// holds code for a function the run has not entered.
-pub(crate) fn compile_function(
-    module: &Module,
-    labels: &LabelMap,
-    func: u32,
-) -> Result<CompiledFunction> {
-    let function = module
-        .functions
-        .get(func as usize)
-        .ok_or_else(|| crate::error::unsupported("jit: no such function"))?;
-    let mut buffer =
-        CodeBuffer::with_capacity(function_capacity_estimate(&function.code, function.blocks.len()) + DEFAULT_CAPACITY)?;
-    let mut entries: Vec<Option<*const u8>> = vec![None; function.code.len()];
-    let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
-    for block in &function.blocks {
-        let start = block.start;
-        let end = block.end.min(function.code.len());
-        if start >= end {
-            continue;
-        }
-        block_labels.insert((func, start as u32), buffer.label());
-    }
-    let summary = emit_function(&mut buffer, module, labels, &block_labels, func, &mut entries)?;
-    buffer.seal()?;
-    Ok(CompiledFunction {
-        buffer,
-        entries,
-        summary,
-    })
-}
-
-/// Lower every non-empty block of function `func` into `buffer`, binding the
-/// pre-reserved entry label of each and filling `entries[start]` with its native
-/// entry point.
-///
-/// Returns the function's register/block [`Summary`]. `block_labels` is the block map
-/// a taken branch is resolved against: the **whole-module** map for [`compile_module`]
-/// (so a cross-function branch links directly) or just this function's blocks for
-/// [`compile_function`] (so a cross-function branch is the unlinkable exit the driver
-/// turns into compile-on-entry). The reserved label of a block always exists, and no
-/// label is created without being bound here, so a buffer always seals.
-fn emit_function(
-    buffer: &mut CodeBuffer,
-    module: &Module,
-    labels: &LabelMap,
-    block_labels: &BTreeMap<(u32, u32), CodeLabel>,
-    func: u32,
-    entries: &mut [Option<*const u8>],
-) -> Result<Summary> {
-    let function = &module.functions[func as usize];
-    let code = &function.code;
-    let mut summary = Summary::default();
-    for block in &function.blocks {
-        let start = block.start;
-        let end = block.end.min(code.len());
-        if start >= end {
-            // An empty block has no instruction to run natively; the interpreter
-            // step handles that address exactly as before.
-            continue;
-        }
-        let allocation = allocate_registers(module, code, start, end);
-        for (x, _) in &allocation.slots {
-            touch(&mut summary.highest_cached_register, *x);
-            if !summary.cached_registers.contains(x) {
-                summary.cached_registers.push(*x);
-            }
-        }
-
-        // Bind this block's reserved entry label to the offset it is about to be
-        // emitted at (the slot `entries[start]` will point at). The key always
-        // exists: it was reserved for exactly these non-empty blocks.
-        buffer.bind(block_labels[&(func, start as u32)])?;
-        let offset = buffer.len();
-        emit_block(
-            buffer,
-            module,
-            labels,
-            block_labels,
-            func,
-            code,
-            start,
-            end,
-            &allocation,
-            &mut summary.highest_native_register,
-        )?;
-        // SAFETY: the block was fully emitted (no error), so `offset` is the
-        // start of a complete native function inside the buffer;
-        // `offset + emitted < capacity` was enforced by every emission call.
-        let entry = unsafe { buffer.code_ptr().add(offset) };
-        // `start < end <= code.len()`, so the slot always exists.
-        entries[start] = Some(entry);
-        summary.block_count += 1;
-    }
-    summary.cached_registers.sort_unstable();
-    summary.cached_registers.dedup();
-    Ok(summary)
-}
-/// A generous byte-count estimate for the code `module` lowers to.
-///
-/// A block costs a prologue/epilogue pair plus its inlined
-/// instructions; the prologue carries the six callee-saved pushes, the `rt`-slot
-/// setup, the position-store helper call ([`emit_position_store`] — the same
-/// three-argument indirect-call sequence as one deopt, ~40 bytes) and the cached
-/// register loads, so [`BLOCK_BYTES`] covers it. A `move`/`swap` whose operands live
-/// in `machine.x` is at most two
-/// loads plus two stores (~28 bytes), so [`INSTRUCTION_BYTES`] is budgeted per
-/// instruction. A `gc_bif` costs either the helper call sequence (~50 bytes) or,
-/// when the small-int fast path lowers it, the whole guarded sequence plus its
-/// helper fallback ([`FAST_PATH_BYTES`]); a `get_list`/`get_hd`/`get_tl` likewise
-/// costs its guarded sequence plus the helper fallback it may still branch to
-/// ([`LIST_PATH_BYTES`]), and a `get_tuple_element`/`set_tuple_element`/
-/// `select_tuple_arity` its own guarded sequence plus one spill-and-return stub per
-/// arity alternative ([`TUPLE_PATH_BYTES`]).
-/// Under-estimating would turn a large module into a `SystemLimit` compile error,
-/// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
-/// *every* `gc_bif` and [`LIST_PATH_BYTES`] for every cons-cell read, whether or
-/// not the fast path claims it, and [`CodeBuffer::with_capacity`] rounds the total
-/// up to whole pages.
-fn code_capacity_estimate(module: &Module) -> usize {
-    module
-        .functions
-        .iter()
-        .map(|function| function_capacity_estimate(&function.code, function.blocks.len()))
-        .sum::<usize>()
-        + DEFAULT_CAPACITY
-}
-
-/// The per-function part of [`code_capacity_estimate`]; also the base of the lazy
-/// layout's per-function buffer size ([`compile_function`], which adds its own
-/// [`DEFAULT_CAPACITY`] headroom).
-fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
-    let instructions = code.len();
-    let mut gc_bifs = 0usize;
-    let mut cmp_bifs = 0usize;
-    let mut list_reads = 0usize;
-    let mut tuple_paths = 0usize;
-    for instr in code {
-        match instr {
-            Instr::Bif { .. } => cmp_bifs += 1,
-            Instr::GcBif { .. } => {
-                gc_bifs += 1;
-                cmp_bifs += 1;
-            }
-            Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => list_reads += 1,
-            Instr::GetTupleElement { .. } => tuple_paths += 1,
-            Instr::SetTupleElement { .. } => tuple_paths += 1,
-            Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
-            _ => {}
-        }
-    }
-    BLOCK_BYTES * blocks
-        + INSTRUCTION_BYTES * instructions
-        + FAST_PATH_BYTES * gc_bifs
-        + COMPARE_PATH_BYTES * cmp_bifs
-        + LIST_PATH_BYTES * list_reads
-        + TUPLE_PATH_BYTES * tuple_paths
-}
-/// The code-size budget reserved for one compiled block (see
-/// [`code_capacity_estimate`]): the prologue (six callee-saved pushes, the 24-byte
-/// `rt`-slot reservation, the `rbx` load, the [`emit_position_store`] helper call)
-/// and the epilogue (the frame teardown and `ret`) plus their padding.
-const BLOCK_BYTES: usize = 192;
-
-/// The code-size budget reserved for one instruction (see
-/// [`code_capacity_estimate`]).
-///
-/// Every instruction the block does not lower natively is emitted as the full
-/// [`emit_step_and_continue`] sequence — the exit spill, the three helper arguments,
-/// the indirect call, the continuation check and the reload ([`Fill`]) — which is
-/// the largest per-instruction lowering the emitter produces (~150 bytes with five
-/// cached registers). Budgeting for the deopt form for *every* instruction also
-/// covers the inlined forms, which are smaller.
-const INSTRUCTION_BYTES: usize = 192;
-
-/// The code-size budget reserved for one `gc_bif` (see
-/// [`code_capacity_estimate`]): the guarded small-int fast path (~140 bytes with
-/// `machine.x` operand loads and a `machine.x` result store, ~150 for the
-/// `erlang:'*'/2` sequence, which adds the untag/re-tag shifts and a second
-/// constant compare) plus the [`emit_step_and_continue`] fallback it branches to
-/// (~150 bytes).
-const FAST_PATH_BYTES: usize = 384;
-
-/// The code-size budget reserved for one comparison BIF (see
-/// [`code_capacity_estimate`]): the two operand loads (~20 bytes), the two small-int
-/// guards with their mask materialisation (~40), the compare/branch (~10), both
-/// `true`/`false` materialisations with their skip jumps (~45) and the
-/// [`emit_step_and_continue`] fallback it branches to (~150, also covered by the
-/// per-instruction [`INSTRUCTION_BYTES`]). Deliberately loose: under-estimating
-/// would turn a large module into a `SystemLimit` compile error.
-const COMPARE_PATH_BYTES: usize = 256;
-
-/// The code-size budget reserved for one `get_list`/`get_hd`/`get_tl` (see
-/// [`code_capacity_estimate`]): the guarded cons-cell read — a mask/test/branch, the
-/// pointer computation and the CAR/CDR loads with their stores to cached or
-/// `machine.x` destinations (~90 bytes) — emitted *in front of* the
-/// [`emit_step_and_continue`] fallback it may still branch to, which the
-/// per-instruction [`INSTRUCTION_BYTES`] already budgets.
-const LIST_PATH_BYTES: usize = 128;
-
-/// The code-size budget reserved for one `get_tuple_element` — and one
-/// `select_tuple_arity` *alternative* (see [`code_capacity_estimate`]): the guarded
-/// header read (the boxed test, the pointer computation, the arityval test and the
-/// range compare, ~70 bytes) plus — for the arity switch — one `mov_ri`/`cmp`/`jcc`
-/// and its spill-and-return stub (~45 bytes each). It is emitted *in front of* the
-/// [`emit_step_and_continue`] fallback the guard may still branch to, which the
-/// per-instruction [`INSTRUCTION_BYTES`] already budgets.
-const TUPLE_PATH_BYTES: usize = 160;
 
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
 ///
@@ -534,7 +298,18 @@ fn emit_block(
     // returns to the driver. A parked `receive` and a raise stay exact because both go
     // through the interpreted deopt (`jit_step_one`), which records the *instruction*
     // address itself. See `jit_set_position`.
-    emit_position_store(buffer, func, start as u32)?;
+    //
+    // A block that accesses a Y slot ([`Allocation::y_last`]) publishes the current
+    // frame's Y window through `jit_publish_y` **instead**, which does the position
+    // store *and* refreshes the window in the one call — so publishing costs such a
+    // block nothing extra, and a Y-free block keeps emitting the plain position store
+    // (it pays literally nothing). See `jit_publish_y` for why the prologue is the
+    // sound, cheapest publish point.
+    if allocation.y_last.is_some() {
+        emit_publish_y(buffer, func, start as u32)?;
+    } else {
+        emit_position_store(buffer, func, start as u32)?;
+    }
     for (x, reg) in &allocation.slots {
         touch(highest_touched, *x);
         buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
@@ -568,7 +343,16 @@ fn emit_block(
             | Instr::ExecutableLine { .. }
             | Instr::DebugLine { .. } => {}
             Instr::Move { src, dst } => {
-                if !try_inline_move(buffer, src, dst, allocation, highest_touched)? {
+                if !try_inline_move(
+                    buffer,
+                    src,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }
@@ -752,6 +536,55 @@ fn emit_block(
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }
+            // `deallocate N` — the **checked frame pop**. What a compiled block cannot
+            // do itself is address the call-frame stack: `Machine::frames`/`stack` are
+            // Rust-side `Vec`s with no layout a block could compute an offset into, and
+            // the pop is *checked* (a `Deallocate` operand that no longer matches the
+            // live frame must raise the interpreter's own error). So the pop goes
+            // through the dedicated `jit_deallocate` helper (the [`frame`] submodule), which
+            // makes the interpreter's own `Machine::pop_frame_checked` call and answers
+            // "the next instruction" on success or `ERROR` (the pop's typed diagnostic)
+            // otherwise — the interpreter's arm is `pop_frame_checked` then `Step::Next`.
+            // Unlike a `jit_step_one` deopt this pays no interpreter dispatch, no `Step`
+            // decode and **no register refill** (the pop touches no x-register), so the
+            // block continues in-block on success.
+            //
+            // The adjacent `deallocate N; return` pair — the loader fuses it into
+            // `Instr::DeallocateReturn` (`beam_loader::lower::fuse`), but a hand-built
+            // module (the crate's own test modules, the bench fixtures) still holds the
+            // separate pair — is lowered as **one** helper round-trip, the same shape the
+            // loaded IR pays, with the `return`'s own `pc` recorded (the position the
+            // interpreter would have recorded last in that code shape).
+            Instr::Deallocate(n) => {
+                if matches!(code.get(start + i + 1), Some(Instr::Return)) {
+                    emit_deallocate_return(buffer, allocation, done, func, pc + 1, *n)?;
+                    terminated = true;
+                    break;
+                }
+                emit_deallocate(buffer, allocation, done, func, pc, *n)?;
+            }
+            // `return` — follow the current frame's continuation (the frame is **not**
+            // popped; that is `deallocate`'s job). The dedicated `jit_return` helper makes
+            // the interpreter's own `Machine::continuation()` read and encodes it as a
+            // block-ABI word, so the block leaves with it in `rax`: a `(func, pc)` target
+            // the driver enters (including a continuation **sub-block**), `HALT` on the
+            // bottom frame, or `ENTER` for a caller in another module context. A `return`
+            // always transfers control (the interpreter's `return_step` never yields
+            // `Step::Next`), so the block ends here.
+            Instr::Return => {
+                emit_return(buffer, allocation, done, func, pc)?;
+                terminated = true;
+                break;
+            }
+            // The loader's fused superinstruction — the shape **every** compiler-produced
+            // function body ends with. One `jit_deallocate_return` helper round-trip: the
+            // interpreter's checked pop, then the continuation read, in the interpreter's
+            // own order.
+            Instr::DeallocateReturn(n) => {
+                emit_deallocate_return(buffer, allocation, done, func, pc, *n)?;
+                terminated = true;
+                break;
+            }
             Instr::Jump { target } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
                     // A compiled successor is entered **directly** (the linker tears
@@ -924,10 +757,54 @@ fn emit_block(
 /// (see [`SAVED_REGISTERS`]). The helper returns nothing — a position store cannot
 /// fail — so `rax` is not consulted.
 fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
+    let helper: PositionHelper = jit_set_position;
+    emit_prologue_helper(buffer, func, pc, helper as *const ())
+}
+
+/// Emit the prologue's **Y-window publish**: call `jit_publish_y(rt, func, pc)`, which
+/// records this block's entry `(func, pc)` as the machine's position *and* re-publishes
+/// the current frame's Y window.
+///
+/// A block whose body accesses a Y slot ([`Allocation::y_last`]) emits this in place of
+/// [`emit_position_store`] — same three-argument call shape, so the block pays no extra
+/// call for publishing. The window must be live before the block's first Y access
+/// because the Erlang stack is a `Vec` a frame push may reallocate; see `jit_publish_y`.
+fn emit_publish_y(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
+    let helper: PositionHelper = jit_publish_y;
+    emit_prologue_helper(buffer, func, pc, helper as *const ())
+}
+
+/// Emit the prologue's three-argument helper call — `helper(rt, func, pc)` — shared by
+/// [`emit_position_store`] and [`emit_publish_y`] (the two differ only in the helper's
+/// body).
+///
+/// `rt` is read out of the prologue-reserved stack slot ([`RUNTIME_SLOT_DISP`]), so this
+/// may be emitted anywhere after that slot is written. The helper clobbers only
+/// caller-saved registers, so a block must have loaded nothing it needs into them at
+/// the call; every cached x-register and `rbx` live in callee-saved registers, which
+/// the helper preserves ([`emit_block`] emits this before loading the cached
+/// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
+/// (see [`SAVED_REGISTERS`]). Neither helper returns a value, so `rax` is not consulted.
+fn emit_prologue_helper(buffer: &mut CodeBuffer, func: u32, pc: u32, helper: *const ()) -> Result<()> {
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     buffer.mov_ri(Reg::Rsi, i64::from(func))?;
     buffer.mov_ri(Reg::Rdx, i64::from(pc))?;
-    let helper: PositionHelper = jit_set_position;
+    buffer.mov_ri(Reg::R11, helper as i64)?;
+    buffer.call_r(Reg::R11)
+}
+
+/// Emit the **gated Y-window refresh**: call `jit_refresh_y(rt)` so the block's next Y
+/// access compares against the live frame.
+///
+/// Emitted on the *continue* arm of an in-block helper call ([`emit_continue_check`])
+/// only when a later instruction of the block still accesses a Y slot
+/// ([`Allocation::refresh_y_after`]): the helper ran one instruction in the interpreter,
+/// which may have pushed a frame, `trim`med one, or reallocated `machine.stack`. The
+/// register arguments are the same as a deopt's (`rt` from the block's own stack slot);
+/// the helper clobbers only caller-saved registers and returns nothing.
+fn emit_refresh_y(buffer: &mut CodeBuffer) -> Result<()> {
+    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    let helper: RefreshHelper = jit_refresh_y;
     buffer.mov_ri(Reg::R11, helper as *const () as i64)?;
     buffer.call_r(Reg::R11)
 }
@@ -1059,7 +936,18 @@ fn emit_continue_check(
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)?;
-    fill(buffer, allocation)
+    fill(buffer, allocation)?;
+    // Continuing in-block past the helper: the instruction it ran may have pushed or
+    // popped a frame (moving the Y window) or reallocated `machine.stack` (freeing the
+    // published one), so re-publish the window before the next instruction when a later
+    // instruction of this block still accesses a Y slot. The gate is compile-time, so a
+    // block that never touches Y emits nothing here, and the refresh sits on the
+    // *continue* arm only — a helper that leaves the block to the driver pays nothing
+    // (the next block's prologue publishes).
+    if allocation.refresh_y_after(pc) {
+        emit_refresh_y(buffer)?;
+    }
+    Ok(())
 }
 
 /// Write every cached x-register back into `machine.x` (`rbx` holds the base).

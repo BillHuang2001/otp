@@ -133,6 +133,7 @@
 //!   answered and the pid is taken structurally (documented M1 gap) —
 //!   `beam_rt` installs the hook, so the real runtime is exact.
 
+use beam_alloc::Heap;
 use beam_common::Result;
 use beam_ets::{Access, OwnerId, SetOpt, Table};
 use beam_process::ProcessId;
@@ -147,7 +148,7 @@ use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
 use super::resolve::{caller_owner, owner_of, resolve_handle, Gate};
-use super::{copy_out, restore_table, take_table_gated};
+use super::{restore_table, take_table_gated};
 
 /// Registers the adopted `ets:*` verbs (see the module docs for the scope and for
 /// the honest gaps).
@@ -413,12 +414,14 @@ fn fold(ctx: &mut BifContext<'_>, args: &[Eterm], reverse: bool) -> Result<Eterm
     let handle = resolve_handle(ctx, args[2])?;
     let table = take_table_gated(ctx, handle, Gate::Read)?;
     let mut objects = Vec::new();
-    // `collect_objects` walks the table *and* the caller heap, and the context
-    // lends the atom table through a conflicting borrow — so it is given a clone
-    // (identical indices, read-only; the same pattern the sibling `select`/the
-    // `update_counter` BIFs use).
-    let atoms = ctx.atoms().clone();
-    let collected = collect_objects(&table, &atoms, reverse, &mut objects, ctx);
+    // `collect_objects` walks the table *and* the caller heap, and the context lends
+    // the atom table through a conflicting borrow — so the two disjoint fields are
+    // split in a single borrow (`ctx.atom_and_heap()`) rather than cloned (the same
+    // pattern the sibling `select`/the `update_counter` BIFs use).
+    let collected = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        collect_objects(&table, atoms, reverse, &mut objects, heap)
+    };
     restore_table(ctx, handle, table)?;
     collected?;
     if objects.is_empty() {
@@ -451,14 +454,14 @@ fn fold(ctx: &mut BifContext<'_>, args: &[Eterm], reverse: bool) -> Result<Eterm
 /// * the **object list of each key** — reversed for `foldr` (the `lists:foldr`
 ///   over `Objects`), for every kind.
 ///
-/// The copies go through [`super::copy_out`] so the fun never sees a term aliasing
-/// table storage (the fun may allocate on the caller heap).
+/// The copies go through `beam_message::copy_struct_simple` so the fun never sees a
+/// term aliasing table storage (the fun may allocate on the caller heap).
 fn collect_objects(
     table: &Table,
     atoms: &AtomTable,
     reverse: bool,
     out: &mut Vec<Eterm>,
-    ctx: &mut BifContext<'_>,
+    heap: &mut Heap,
 ) -> Result<()> {
     let mut key = if reverse {
         table.last(atoms)
@@ -469,11 +472,11 @@ fn collect_objects(
         let objects = table.lookup(current, atoms);
         if reverse {
             for object in objects.iter().rev() {
-                out.push(copy_out(*object, ctx)?);
+                out.push(beam_message::copy_struct_simple(*object, heap)?);
             }
         } else {
             for object in objects {
-                out.push(copy_out(object, ctx)?);
+                out.push(beam_message::copy_struct_simple(object, heap)?);
             }
         }
         key = match if reverse {

@@ -45,7 +45,10 @@
 //!   on its own first entry and keeps its native loop. Each function links only its own
 //!   blocks, so this layout's register-file guard is the **entered function's** own
 //!   bound; a cross-function transfer returns the `(func, pc)` word to the driver, which
-//!   re-checks the target function's bound on its own entry.
+//!   re-checks the target function's bound on its own entry. On top of its IR blocks a
+//!   function also carries **continuation sub-blocks** — one per `pc + 1` a
+//!   frame-preserving call stores — so the driver has a native entry at the address a
+//!   callee returns to, not only at IR block starts (see [`CompiledFunction`]).
 //!
 //! The two layouts answer the same queries, and every multi-mapping (lazy) answer is
 //! the aggregate over the functions **currently** compiled: introspection that must
@@ -57,6 +60,7 @@ use std::rc::Rc;
 
 use beam_loader::Module;
 
+use crate::jit::cache::module_fingerprint;
 use crate::jit::emitter::CodeBuffer;
 use crate::jit::CodeRegion;
 
@@ -69,6 +73,24 @@ use super::emit::compile_function;
 /// An entry is a raw pointer into a sealed executable mapping, so a `CompiledModule`
 /// must outlive every call into it and is neither `Send` nor `Sync`.
 pub struct CompiledModule {
+    /// The module-wide label map, built **once** at artifact creation.
+    ///
+    /// Every driver run resolves its labels/imports against it, so storing it here
+    /// removes a per-run [`build_label_map`](crate::interpreter::build_label_map) — a
+    /// per-module value does not need rebuilding for each run of the same artifact (the
+    /// lazy layout already built one per compile, and the eager layout one per
+    /// `compile_module`). `Module` is immutable once loaded, so the map is valid for
+    /// the artifact's whole life.
+    labels: crate::interpreter::LabelMap,
+    /// The content fingerprint of the module this artifact was compiled for
+    /// ([`module_fingerprint`]), computed **once** here at creation.
+    ///
+    /// The artifact *is* the cache's sound identity for a module — its content never
+    /// changes — so keeping the fingerprint next to the code removes the per-lookup
+    /// re-hash of the whole decoded IR that a [`ModuleKey`](crate::jit::cache) built
+    /// from the `Module` alone would pay (see
+    /// [`CodeCache::compiled_handle`](crate::jit::cache::CodeCache::compiled_handle)).
+    fingerprint: u64,
     /// Which compilation layout this artifact has (see the module docs).
     layout: Layout,
 }
@@ -89,17 +111,24 @@ struct EagerLayout {
     /// that address compiled no block. A flat index (not a `HashMap`) because the
     /// driver probes it on every cross-block jump.
     entries: Vec<Vec<Option<*const u8>>>,
+    /// The native entry point of the **continuation sub-block** starting at `[func][pc]`,
+    /// or `None` (indexed `[func][pc]`).
+    ///
+    /// The eager twin of [`CompiledFunction::sub_entries`]: the `pc + 1` a
+    /// frame-preserving call stores in the live frame is generally *not* a block start
+    /// (only an [`Instr::Label`] is), so [`compile_module`](super::emit::compile_module)
+    /// lowers each such address as its own sub-block and records its native entry here.
+    /// Consulted by [`eager_entry`] **only after** `entries` came up empty, so a compiled
+    /// IR-block start always wins.
+    ///
+    /// [`Instr::Label`]: beam_loader::Instr::Label
+    sub_entries: Vec<Vec<Option<*const u8>>>,
     /// The whole-module register/block summary.
     summary: Summary,
 }
 
 /// The lazy layout: one sealed mapping per compiled function, filled on first entry.
 struct LazyLayout {
-    /// The module-wide label map, built once: every on-demand function compilation
-    /// resolves its `jump`/`call_last`/`call_only` targets against it. It is a
-    /// per-module value, not per function, so it is built once here rather than per
-    /// compile.
-    labels: crate::interpreter::LabelMap,
     /// One slot per module function, filled by the first entry into that function.
     ///
     /// `RefCell` because compile-on-entry happens through [`CompiledModule::native_entry`],
@@ -114,6 +143,19 @@ pub(crate) struct CompiledFunction {
     /// The native entry point of the block starting at `pc`, or `None` (indexed by
     /// `pc`, so the driver's block probe stays two `Vec` loads).
     pub(crate) entries: Vec<Option<*const u8>>,
+    /// The native entry point of the **continuation sub-block** starting at `pc`, or
+    /// `None` (indexed by `pc`).
+    ///
+    /// The loader cuts a function into blocks only at [`Instr::Label`]s, so the `pc + 1`
+    /// a frame-preserving call stores in the live frame — where the driver resumes once
+    /// the callee returns — usually lies *inside* a block. The lazy layout lowers each
+    /// such address as its own sub-block (see
+    /// [`compile_function`](super::emit::compile_function)), and this table is where its
+    /// native entry lives. Probed by [`CompiledModule::entry`]/[`CompiledModule::native_entry`]
+    /// only after `entries` came up empty, so a compiled IR-block start always wins.
+    ///
+    /// [`Instr::Label`]: beam_loader::Instr::Label
+    pub(crate) sub_entries: Vec<Option<*const u8>>,
     /// This function's own register/block summary.
     pub(crate) summary: Summary,
 }
@@ -161,7 +203,8 @@ fn max_option(a: Option<u32>, b: Option<u32>) -> Option<u32> {
 
 impl CompiledModule {
     /// The **eager** artifact: the sealed buffer `buffer` holds every function's
-    /// blocks and `entries[func][pc]` is the block table.
+    /// blocks, `entries[func][pc]` is the block table and `sub_entries[func][pc]` the
+    /// continuation-sub-block table (see [`EagerLayout::sub_entries`]).
     ///
     /// The register-file guard for the eager layout is the **whole-module**
     /// [`Summary::highest_native_register`] (carried in `summary`), never a per-function
@@ -172,12 +215,18 @@ impl CompiledModule {
     pub(crate) fn eager(
         buffer: CodeBuffer,
         entries: Vec<Vec<Option<*const u8>>>,
+        sub_entries: Vec<Vec<Option<*const u8>>>,
         summary: Summary,
+        labels: crate::interpreter::LabelMap,
+        fingerprint: u64,
     ) -> CompiledModule {
         CompiledModule {
+            labels,
+            fingerprint,
             layout: Layout::Eager(EagerLayout {
                 buffer,
                 entries,
+                sub_entries,
                 summary,
             }),
         }
@@ -186,29 +235,57 @@ impl CompiledModule {
     /// The **lazy** artifact for `module`: nothing compiled yet, one slot per function.
     ///
     /// The module-wide label map is built here (once) so each on-demand function
-    /// compilation can resolve its targets without re-scanning the module.
+    /// compilation can resolve its targets — and so every driver run of the artifact
+    /// can reuse it — without re-scanning the module. The module's content fingerprint
+    /// is likewise computed here, **once**, and kept on the artifact (see
+    /// [`CompiledModule::fingerprint`]) so a cross-run cache can identify the module
+    /// without re-hashing its whole decoded IR on every lookup.
     pub(crate) fn lazy(module: &Module) -> CompiledModule {
         CompiledModule {
+            labels: crate::interpreter::build_label_map(module),
+            fingerprint: module_fingerprint(module),
             layout: Layout::Lazy(LazyLayout {
-                labels: crate::interpreter::build_label_map(module),
                 functions: RefCell::new(vec![None; module.functions.len()]),
             }),
         }
     }
 
+    /// The content fingerprint of the module this artifact was compiled for.
+    ///
+    /// Equal to [`module_fingerprint`] of that module, but read in O(1) from the
+    /// artifact instead of re-hashing the decoded IR.
+    pub(crate) fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+    /// The module-wide label map this artifact holds, built once at creation.
+    ///
+    /// The native driver resolves a run's entry label and every import through it
+    /// instead of rebuilding one per run (see [`super::NativeCode::labels`]).
+    pub(crate) fn labels(&self) -> &crate::interpreter::LabelMap {
+        &self.labels
+    }
+
     /// The native entry point of the block starting at `(func, pc)`, if it is already
     /// compiled.
     ///
-    /// A **pure lookup** — it never compiles. For the lazy layout an uncompiled
-    /// function simply has no entry here; the driver's compile-on-entry runs through
-    /// [`CompiledModule::native_entry`].
+    /// A **pure lookup** — it never compiles. An address that names a compiled IR block
+    /// start answers from the block table; otherwise, for the lazy layout, it may still
+    /// be the start of a **continuation sub-block** ([`CompiledFunction::sub_entries`]),
+    /// which is consulted second so a real block start always wins. For the lazy layout an
+    /// uncompiled function simply has no entry here; the driver's compile-on-entry runs
+    /// through [`CompiledModule::native_entry`].
     pub fn entry(&self, func: u32, pc: u32) -> Option<*const u8> {
         match &self.layout {
             Layout::Eager(eager) => eager_entry(eager, func, pc),
             Layout::Lazy(lazy) => {
                 let functions = lazy.functions.borrow();
                 let function = functions.get(func as usize)?.as_ref()?;
-                function.entries.get(pc as usize).copied().flatten()
+                function
+                    .entries
+                    .get(pc as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())
             }
         }
     }
@@ -248,7 +325,12 @@ impl CompiledModule {
             }
             Layout::Lazy(_) => {
                 let function = self.function(module, func)?;
-                let entry = function.entries.get(pc as usize).copied().flatten()?;
+                let entry = function
+                    .entries
+                    .get(pc as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())?;
                 Some((entry, function.summary.highest_native_register))
             }
         }
@@ -276,7 +358,7 @@ impl CompiledModule {
         // First entry into this function: lower it once and keep the artifact. Codegen
         // never calls back into the host, so the compile cannot re-enter this store;
         // the `is_none` re-check below only guards against a future change that would.
-        let compiled = Rc::new(compile_function(module, &lazy.labels, func).ok()?);
+        let compiled = Rc::new(compile_function(module, &self.labels, func).ok()?);
         let mut functions = lazy.functions.borrow_mut();
         let slot = functions.get_mut(func as usize)?;
         if slot.is_none() {
@@ -452,10 +534,20 @@ impl EagerLayout {
     }
 }
 
-/// The eager block-table probe: `entries[func][pc]`.
+/// The eager block-table probe: `entries[func][pc]` first (so a real IR-block start
+/// always wins), then the continuation-sub-block table `sub_entries[func][pc]`.
 fn eager_entry(eager: &EagerLayout, func: u32, pc: u32) -> Option<*const u8> {
-    eager
+    if let Some(entry) = eager
         .entries
+        .get(func as usize)?
+        .get(pc as usize)
+        .copied()
+        .flatten()
+    {
+        return Some(entry);
+    }
+    eager
+        .sub_entries
         .get(func as usize)?
         .get(pc as usize)
         .copied()

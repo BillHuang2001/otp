@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use beam_common::{BeamError, ExceptionClass, ExitReason};
+use beam_engine::context::RootSet;
 use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
 use beam_engine::machine::WaitDeadline;
 use beam_engine::{terms, Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
@@ -1739,7 +1740,7 @@ fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
     let mut machine = machine_with_pending_reason(reason);
 
     // Publish the parked machine's roots: the reason rides the process's extra roots.
-    publish_parked_roots(&mut table, pid, &mut machine);
+    publish_parked_roots(&mut table, pid, &mut machine, false);
     let extra = table.get(pid).expect("the process").registers().extra_roots();
     assert_eq!(
         extra.len(),
@@ -1789,7 +1790,7 @@ fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
     // Resume: the machine reads the relocated reason back, and the extra roots are consumed.
     {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        ctx.resync_parked_roots(pid, &mut machine);
+        ctx.resync_parked_roots(pid, &mut machine, false);
     }
     assert_eq!(
         machine.pending_exception(),
@@ -1813,7 +1814,7 @@ fn publishing_a_machine_without_a_pending_exception_leaves_no_extra_root() {
     let mut machine = Machine::new();
     assert_eq!(machine.pending_exception(), None, "a fresh machine has no raise");
 
-    publish_parked_roots(&mut table, pid, &mut machine);
+    publish_parked_roots(&mut table, pid, &mut machine, false);
     assert!(
         table.get(pid).expect("the process").registers().extra_roots().is_empty(),
         "a machine with no pending exception publishes no extra root"
@@ -1838,7 +1839,7 @@ fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extr
     };
     let mut machine = machine_with_pending_reason(reason);
 
-    publish_parked_roots(&mut table, pid, &mut machine);
+    publish_parked_roots(&mut table, pid, &mut machine, false);
     assert_eq!(
         table.get(pid).expect("the process").registers().extra_roots(),
         &[reason][..],
@@ -1849,7 +1850,7 @@ fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extr
     machine.reset();
     assert_eq!(machine.pending_exception(), None, "the raise is gone after a reset");
 
-    publish_parked_roots(&mut table, pid, &mut machine);
+    publish_parked_roots(&mut table, pid, &mut machine, false);
     assert!(
         table.get(pid).expect("the process").registers().extra_roots().is_empty(),
         "the stale extra root is cleared, never left as a leftover/NIL placeholder"
@@ -1971,5 +1972,170 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
     assert!(
         !table.is_relocation_exempt(pid).expect("the pid is live"),
         "the resume cleared the park window's exemption, so the process collects normally again"
+    );
+}
+
+/// **A park of a float-free process does NOT publish the 1024-slot FR file.**
+///
+/// `publish_roots_full` *can* publish the machine's whole float-register file by appending its
+/// [`MAX_FLOAT_REGISTER`](beam_engine::machine::MAX_FLOAT_REGISTER) `Eterm` slots to the
+/// process's Erlang stack — real cost on every park and every collection that follows it. For a
+/// process whose FR is entirely `NIL` (the overwhelming majority: it never touched a float)
+/// those words are immediates that can root nothing, so the runner skips them: the post-slice
+/// scan computes the FR's liveness **once** and the park publishes the FR only when it is live.
+///
+/// `recv_after.beam`'s `wait_forever/0` is `receive X -> X after infinity end` — no local
+/// variables, so its Erlang stack is shorter than the FR file — and it leaves no float register
+/// set. The parked process's published stack must therefore be exactly the machine's own stack,
+/// never that plus the FR file.
+#[test]
+fn a_float_free_park_does_not_publish_the_fr_file() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
+
+    let machine_stack_len = state
+        .engines
+        .get_mut(&pid)
+        .expect("the parked engine")
+        .machine
+        .with_roots(RootSet::ALL_LIVE, |roots| roots.stack.len());
+    assert!(
+        machine_stack_len < beam_engine::machine::MAX_FLOAT_REGISTER as usize,
+        "the fixture's `wait_forever/0` has no Y slots, so its stack is shorter than the FR file \
+         (got {machine_stack_len}); the equality below would otherwise be vacuous"
+    );
+    let published = table
+        .get(pid)
+        .expect("the parked process")
+        .registers()
+        .stack()
+        .len();
+    assert_eq!(
+        published, machine_stack_len,
+        "a float-free park publishes only the machine's Erlang stack, never the 1024-slot FR file"
+    );
+    assert_eq!(
+        rt.gc_stats().pinned,
+        0,
+        "a process whose FR is all NIL is not pinned"
+    );
+}
+
+/// **A park whose FR *is* live still publishes the whole FR file and pins the process.**
+///
+/// The dead-FR fast path must not weaken the live case: a process whose FR holds a term is
+/// pinned (its FR can point into the heap, so its heap must never move) **and** its FR slots
+/// must ride the process stack so a collection that does run — a `Yield`-window one, or a
+/// delivery-driven one, neither gated by the pin — relocates them rather than leaving them on
+/// the abandoned from-space.
+///
+/// A parked machine is not reset on resume, so an FR slot written while the process is parked
+/// survives into the next slice: setting it stands in for a float computation that left a
+/// register set (the exact residue the post-slice scan exists to catch), and the *second* park
+/// then observes a live FR. This pins both halves of the design — the published FR length and
+/// `ProcessEngine::fr_published`'s record of it — without needing compiled float code.
+#[test]
+fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // Slice 1: park with a dead FR — no FR published, and the process is NOT pinned.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait);
+    assert_eq!(rt.gc_stats().pinned, 0, "a dead FR does not pin");
+
+    // Make the FR live while the machine is parked (a resume does not reset the machine).
+    let fr_len = beam_engine::machine::MAX_FLOAT_REGISTER as usize;
+    state
+        .engines
+        .get_mut(&pid)
+        .expect("the parked engine")
+        .machine
+        .fr_mut()[0] = make_small(42);
+
+    // Slice 2: resuming with an empty mailbox parks again — now with a live FR.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks again");
+
+    assert_eq!(
+        rt.gc_stats().pinned,
+        1,
+        "a live FR pins the process, so its heap is never moved again"
+    );
+    let machine_stack_len = state
+        .engines
+        .get_mut(&pid)
+        .expect("the parked engine")
+        .machine
+        .with_roots(RootSet::ALL_LIVE, |roots| roots.stack.len());
+    let published = table
+        .get(pid)
+        .expect("the parked process")
+        .registers()
+        .stack()
+        .len();
+    assert_eq!(
+        published,
+        machine_stack_len + fr_len,
+        "a live-FR park publishes the machine's stack plus the whole FR file"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .fr_published,
+        "the engine records the FR decision, so the resume scatters exactly the region the park \
+         published"
     );
 }

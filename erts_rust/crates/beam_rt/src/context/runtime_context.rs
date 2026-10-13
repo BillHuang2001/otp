@@ -384,9 +384,20 @@ impl<'a> RuntimeContext<'a> {
     /// no stale root outlives the resume. The reason is read out **before** the machine is
     /// borrowed by `with_roots` (the mutable accessor cannot be reached inside the closure).
     ///
+    /// `publish_fr` must be the value the matching **park** published with (the runner stores
+    /// it on the engine state): `true` scatters the relocated FR file back into the machine's
+    /// FR slots, `false` leaves `roots.fr` untouched — a process whose FR was dead (all `NIL`)
+    /// at the park. Passing a value the park did not use makes the lengths disagree and
+    /// **halts** the process's collection rather than write a mis-sized block back.
+    ///
     /// A `pid` with no process reconciles nothing: the runner only calls this for a parked pid
     /// whose process it owns.
-    pub(crate) fn resync_parked_roots(&mut self, pid: ProcessId, machine: &mut Machine) {
+    pub(crate) fn resync_parked_roots(
+        &mut self,
+        pid: ProcessId,
+        machine: &mut Machine,
+        publish_fr: bool,
+    ) {
         // The relocated reason, read out before `machine` is borrowed by `with_roots`.
         let relocated_reason = self
             .process_table()
@@ -395,7 +406,7 @@ impl<'a> RuntimeContext<'a> {
         let reconciled = match self.process_table().get(pid) {
             Some(process) => machine.with_roots(RootSet::ALL_LIVE, |roots| {
                 let mut roots = roots;
-                gc::scatter_roots_full(process, &mut roots)
+                gc::scatter_roots_full(process, &mut roots, publish_fr)
             }),
             None => true,
         };

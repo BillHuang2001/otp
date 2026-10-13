@@ -30,7 +30,9 @@
 //! compiled real `.beam` live in the crate's `tests/` (`jit_real_module`, `jit_bench`).
 use super::emit::*;
 use super::runtime::{
-    EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP,
+    jit_deallocate, jit_deallocate_return, jit_publish_y, jit_refresh_y, jit_return, EXT_CALL,
+    EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP, RUNTIME_YBASE_DISP,
+    RUNTIME_YEND_DISP,
 };
 use super::*;
 use crate::jit::emitter::Reg;
@@ -71,8 +73,11 @@ fn sentinels_are_distinct_from_every_valid_target() {
 
 #[test]
 fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
-    // Generated code loads `rt.x_regs` from `[rt + 8]` (`RUNTIME_XREGS_DISP`) and
-    // the helper is handed `rt` itself; this pins the two offsets.
+    // Generated code loads `rt.x_regs` from `[rt + 8]` (`RUNTIME_XREGS_DISP`) and reads
+    // the current frame's Y window through `rt.y_base`/`rt.y_end`
+    // (`RUNTIME_YBASE_DISP`/`RUNTIME_YEND_DISP`, the guarded Y load/store in
+    // `arith::emit_y_load`/`emit_y_store`); the helper is handed `rt` itself. This pins
+    // all four offsets against the real `JitRuntime` field addresses.
     let module = Module::default();
     let labels = LabelMap::new();
     let mut machine = Machine::new();
@@ -85,12 +90,28 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         ctx: &mut ctx,
         error: None,
         enter: None,
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
     let x_regs_field = &rt.x_regs as *const *mut Eterm as usize;
+    let y_base_field = &rt.y_base as *const *mut Eterm as usize;
+    let y_end_field = &rt.y_end as *const *mut Eterm as usize;
     assert_eq!(machine_field - base, RUNTIME_MACHINE_DISP as usize);
     assert_eq!(x_regs_field - base, RUNTIME_XREGS_DISP as usize);
+    assert_eq!(y_base_field - base, RUNTIME_YBASE_DISP as usize);
+    assert_eq!(y_end_field - base, RUNTIME_YEND_DISP as usize);
+    // The window follows the x-register base, so the three pointer fields are
+    // consecutive machine words.
+    assert_eq!(
+        RUNTIME_YBASE_DISP,
+        RUNTIME_XREGS_DISP + std::mem::size_of::<*const u8>() as i32
+    );
+    assert_eq!(
+        RUNTIME_YEND_DISP,
+        RUNTIME_YBASE_DISP + std::mem::size_of::<*const u8>() as i32
+    );
     assert_eq!(RUNTIME_SLOT_DISP, 0);
 }
 
@@ -296,13 +317,37 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
             "import {index}"
         );
     }
-    // Shapes the fast path refuses: a Y destination, a Y operand, a non-small
-    // constant operand, a wrong argument count, an out-of-bound register.
+
     let plus = refs[0];
     let atom = module.name;
+
+    // The fast path claims both a Y **destination** and a Y **operand**: the slot is
+    // read/written through the guarded current-frame window (`RUNTIME_YBASE_DISP`/
+    // `RUNTIME_YEND_DISP`), so the shape lowers and records `FastDest::Y`.
+    let y_destination_instr = gc_bif(plus, args.clone(), Operand::Y(0));
+    let y_destination = fast_arith(&module, &y_destination_instr).expect("a Y destination lowers");
+    assert_eq!(y_destination.dst, FastDest::Y(0));
+    assert!(
+        fast_arith(
+            &module,
+            &gc_bif(plus, vec![Operand::X(0), Operand::Y(1)], Operand::X(0))
+        )
+        .is_some(),
+        "a Y operand lowers"
+    );
+    assert!(
+        fast_arith(
+            &module,
+            &gc_bif(plus, vec![Operand::Y(1), Operand::X(0)], Operand::X(0))
+        )
+        .is_some(),
+        "a Y operand lowers on either side"
+    );
+
+    // Shapes the fast path still refuses: a non-small constant operand (`atom`/`nil`),
+    // a wrong argument count, an out-of-bound x-register operand or destination, and a
+    // Y slot the emitted `disp32` cannot address.
     for instr in [
-        gc_bif(plus, args.clone(), Operand::Y(0)),
-        gc_bif(plus, vec![Operand::X(0), Operand::Y(1)], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0), Operand::Atom(atom)], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0), Operand::Nil], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0)], Operand::X(0)),
@@ -312,6 +357,8 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
             Operand::X(0),
         ),
         gc_bif(plus, args.clone(), Operand::X(MAX_REGISTER)),
+        gc_bif(plus, args.clone(), Operand::Y(u32::MAX)),
+        gc_bif(plus, vec![Operand::X(0), Operand::Y(u32::MAX)], Operand::X(0)),
     ] {
         assert!(fast_arith(&module, &instr).is_none(), "{instr:?}");
     }
@@ -908,6 +955,88 @@ fn un_lowered_instructions_deopt_to_the_interpreter_with_identical_outcomes() {
             );
         }
     });
+}
+
+/// A frame-preserving `call` whose continuation address falls **inside** an IR block
+/// (the loader cuts a function into blocks only at labels) gets its own native
+/// **sub-block** in each layout, so the driver has a native entry at the address
+/// the callee returns to rather than one interpreter round-trip per remaining
+/// instruction of the block. The sub-block is *not* a block: the driver's block table,
+/// `block_count` and the code map still describe IR blocks only.
+#[test]
+fn a_call_continuation_inside_a_block_gets_its_own_native_sub_block() {
+    let (module, _) = local_call_case();
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+
+    // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
+    // continuation pc 4 is strictly inside that block.
+    assert!(function.entries[4].is_none(), "pc 4 is not an IR block start");
+    assert!(function.sub_entries[4].is_some(), "pc 4 has a sub-block entry");
+    // An IR block start is still served by the block table, and gains no sub-block.
+    assert!(function.entries[1].is_some(), "pc 1 is the `Label(2)` block start");
+    assert!(function.sub_entries[1].is_none(), "a block start needs no sub-block");
+    // A sub-block is not a block: the summary counts the two IR blocks only.
+    assert_eq!(function.summary.block_count, 2, "only the IR blocks are counted");
+
+    // The artifact consults the sub-block table only after the block table, so a block
+    // start still wins and the continuation address is natively enterable.
+    let compiled = CompiledModule::lazy(&module);
+    let (block, _) = compiled.native_entry(&module, 0, 1).expect("pc 1 is a block");
+    assert_eq!(compiled.entry(0, 1), Some(block), "the block entry wins");
+    let (sub, _) = compiled.native_entry(&module, 0, 4).expect("pc 4 is a sub-block");
+    assert_eq!(
+        compiled.entry(0, 4),
+        Some(sub),
+        "the continuation address is natively enterable"
+    );
+    assert_eq!(compiled.block_count(), 2, "sub-blocks add no block");
+
+    // The eager layout lowers the same continuation sub-blocks, so the continuation
+    // address is natively enterable there too; a block start still wins and the
+    // sub-block is still not counted as a block.
+    let eager = compile_module(&module).expect("the module compiles eagerly");
+    let (eager_block, _) = eager.native_entry(&module, 0, 1).expect("pc 1 is a block");
+    assert_eq!(eager.entry(0, 1), Some(eager_block), "the block entry wins");
+    assert!(
+        eager.entry(0, 4).is_some(),
+        "the eager layout has a sub-block at the continuation address"
+    );
+    assert_eq!(eager.block_count(), 3, "sub-blocks add no block");
+}
+
+/// The **eager** layout — the one the mandated `jit_bench` harness compiles — lowers the
+/// same continuation sub-blocks as the lazy layout, so its driver has a native entry at the
+/// `pc + 1` a frame-preserving call returns to even though that address is not an IR block
+/// start. An address with no code at all still answers `None`, and `block_count` still
+/// counts the non-empty IR blocks only (sub-blocks are not blocks).
+#[test]
+fn the_eager_layout_lowers_continuation_sub_blocks() {
+    let (module, _) = local_call_case();
+    let compiled = compile_module(&module).expect("the module compiles eagerly");
+
+    // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
+    // continuation pc 4 is strictly inside that block: the eager artifact now has a
+    // native entry there, in addition to the IR block start at pc 1.
+    let (block, _) = compiled.native_entry(&module, 0, 1).expect("pc 1 is a block");
+    assert_eq!(compiled.entry(0, 1), Some(block), "pc 1 is the block start");
+    assert!(
+        compiled.entry(0, 4).is_some(),
+        "the eager continuation pc 4 has a native sub-block entry"
+    );
+    // An address with no code at all (past the end of the function) still has no entry.
+    assert!(
+        compiled.entry(0, module.functions[0].code.len() as u32).is_none(),
+        "an address past the end of the function has no entry"
+    );
+
+    // A sub-block is not a block: `block_count` equals the number of non-empty IR blocks.
+    let ir_blocks: usize = module.functions.iter().map(|f| f.blocks.len()).sum();
+    assert_eq!(
+        compiled.block_count(),
+        ir_blocks,
+        "sub-blocks add no compiled block"
+    );
 }
 
 /// A context that answers `erlang:'+'/2` with a fixed small-int result (recording
@@ -1769,6 +1898,8 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
         ctx: &mut ctx,
         error: None,
         enter: None,
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
     };
     assert_eq!(
         enter_compiled(&eager, &module, &mut rt as *mut JitRuntime<'_>, 0, f_pc),
@@ -2159,6 +2290,8 @@ fn run_ext_call(
         ctx: &mut ctx,
         error: None,
         enter: None,
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
     };
     // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
     let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);
@@ -2322,6 +2455,150 @@ fn jit_ext_call_falls_back_to_the_synchronous_path_when_no_callee_resolves() {
     );
 }
 
+/// The host's **decline** (`Ok(None)`) is answered through the dispatching seam
+/// ([`jit_step_ext`] with `Some(None)`), so the host's `resolve_external_call` is
+/// consulted **exactly once** per declined `call_ext*` — not once by
+/// [`jit_ext_call`]'s own resolution and again by the interpreter step it used to
+/// fall back to. The result is unchanged: the synchronous `call_bif` route still
+/// runs the BIF and advances by one.
+#[test]
+fn jit_ext_call_consults_the_host_seam_once_per_declined_call() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    // A counting resolver that declines *every* import: the host's seam answer is
+    // `Ok(None)`, so the call must reach `call_bif` — but be asked only once.
+    let asks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = std::rc::Rc::clone(&asks);
+    let mut ctx = MinimalContext::new();
+    ctx.set_external_resolver(Box::new(move |_module, _function, _arity| {
+        counter.set(counter.get() + 1);
+        Ok(None)
+    }));
+    ctx.set_bif_hook(Box::new(|module, function, arity, _args| {
+        assert_eq!(
+            (module, function, arity),
+            ("callee_x", "g", 0),
+            "the declined import still reaches the synchronous BIF route"
+        );
+        Ok(make_small(7))
+    }));
+
+    let probe = run_ext_call(&caller, (func, pc), ctx, EXT_CALL, 0);
+
+    assert_eq!(
+        asks.get(),
+        1,
+        "the host's cross-module seam must be consulted exactly once per declined \
+         `call_ext` (the duplicate `resolve_external_entry` pass is gone)"
+    );
+    assert_eq!(
+        probe.word,
+        encode_target(func, pc + 1),
+        "a declined call_ext still runs the interpreter's CallExt and advances by one"
+    );
+    assert_eq!(
+        probe.enter, None,
+        "no cross-module transfer is reported on the synchronous path"
+    );
+    assert_eq!(
+        probe.x0,
+        Some(make_small(7)),
+        "the synchronous call_bif wrote its result to x(0)"
+    );
+    assert_eq!(
+        probe.frame_depth, 1,
+        "the synchronous path keeps the caller's frame"
+    );
+}
+
+/// A module whose whole body is `rounds` `call_ext` calls to an import the host
+/// declines: `erlang:'+'/2` on two small integers. Every call is therefore the
+/// exact shape the duplicate-resolution bug covered.
+///
+/// `x(0)` is the accumulator (starting at `0`), `x(1)` is the constant `1`, so the
+/// returned value is `rounds` — a figure a run that skipped, repeated or reordered
+/// a call cannot produce.
+fn declined_call_ext_module(rounds: usize) -> (Module, Atom) {
+    let mut code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(1),
+        },
+    ];
+    for _ in 0..rounds {
+        code.push(Instr::CallExt {
+            arity: 2,
+            target: ImportRef(0),
+        });
+    }
+    code.push(Instr::Return);
+    let module = build_module(
+        "declined_ext",
+        &[("erlang", "+", 2)],
+        vec![("f", 0, code)],
+        &[("f", 0, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+    (module, name)
+}
+
+/// End-to-end tier agreement over the duplicate-resolution path: a body of
+/// `call_ext` instructions the host declines runs on the interpreter and on the
+/// baseline tier, producing the same value **and** consulting the host's
+/// cross-module seam the same number of times (once per call) on both.
+///
+/// This is the regression pin for the decline path: before `jit_step_ext`, the
+/// baseline tier asked the host's seam twice per declined `call_ext` (once in
+/// `jit_ext_call`'s own resolution, once inside the `jit_step_one` fallback's
+/// `resolve_external_entry`) while the interpreter asked once, so any counting
+/// host saw a tier-dependent seam-call count.
+#[test]
+fn the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count() {
+    const ROUNDS: usize = 5;
+    let (module, name) = declined_call_ext_module(ROUNDS);
+
+    let mut counts = Vec::new();
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let asks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = std::rc::Rc::clone(&asks);
+        let mut ctx = MinimalContext::new();
+        ctx.set_bif_hook(crate::jit::bench::support::arith_hook(None, None));
+        ctx.set_external_resolver(Box::new(move |_module, _function, _arity| {
+            counter.set(counter.get() + 1);
+            Ok(None)
+        }));
+
+        let mut machine = Machine::new();
+        let outcome = machine
+            .run_export_outcome_with_tier(&module, name, 0, &[], &mut ctx, tier)
+            .unwrap_or_else(|err| panic!("{tier:?}: the declined call_ext run returns: {err:?}"));
+        assert_eq!(
+            outcome,
+            RunOutcome::Returned(make_small(ROUNDS as i64)),
+            "{tier:?}: {ROUNDS} declined `erlang:'+'/2` calls accumulate to {ROUNDS}"
+        );
+        counts.push(asks.get());
+    }
+
+    assert_eq!(
+        counts[0], ROUNDS,
+        "the interpreter consults the host's cross-module seam once per call_ext"
+    );
+    assert_eq!(
+        counts[1], counts[0],
+        "the baseline tier must consult the host's cross-module seam the SAME number \
+         of times as the interpreter ({ROUNDS} calls, no duplicate resolution)"
+    );
+}
+
 /// A `call_ext_last` whose `Deallocate` operand is **stale** (its frame size no
 /// longer matches the live frame — the shape `trim` produces) must not fabricate
 /// a wrong `ENTER`: the frame discipline's checked pop rejects the mismatch, the
@@ -2392,3 +2669,1268 @@ fn the_compiled_block_wires_the_ext_call_helper_into_native_code() {
          emit arm did not wire the native `call_ext*` helper"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the artifact owns the module-wide label map
+// ---------------------------------------------------------------------------
+
+/// The compiled artifact **owns** the module-wide label map, so a run of it resolves
+/// its entry label and imports against that one map instead of rebuilding a per-module
+/// value on every run.
+///
+/// Before this, the native driver called [`interpreter::build_label_map`] again on
+/// every `run_compiled`/`run_compiled_outcome` (in `enter_machine`) **and** on every
+/// resume (in `run_compiled_resume_outcome`) — a whole traversal of the module's
+/// per-function `BTreeMap` label tables — even though the map is a property of the
+/// (immutable) module the artifact was compiled from. It is now built once, when the
+/// artifact is created: at `compile_module` for the eager layout,
+/// [`CompiledModule::lazy`] for the lazy one, and the driver reuses it through
+/// [`NativeCode::labels`].
+///
+/// The counter is thread-local, so it sees only this test's own builds. The one build
+/// still attributable to a run is the export-entry resolution
+/// (`interpreter::resolve_label`, out of this crate-node's scope) — the assertion is
+/// therefore "at most one per run, never two", which is exactly what distinguishes the
+/// driver's map reuse from the old double build.
+#[test]
+fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
+    // `label; label; move 7 -> x0; return`, exported as `f/0`: every run returns 7.
+    let (module, name) = exported_module(
+        "f",
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Integer(7),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+
+    crate::interpreter::reset_label_map_builds();
+    // The eager artifact stores the module-wide map it built at compile time.
+    let compiled = compile_module(&module).expect("the module compiles");
+    let built_at_compilation = crate::interpreter::label_map_builds();
+    assert!(
+        built_at_compilation >= 1,
+        "the eager artifact holds a module-wide label map built at compile time, got \
+         {built_at_compilation}"
+    );
+
+    // One exported run.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let value = run_compiled(&compiled, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the exported run returns");
+    assert_eq!(value, make_small(7), "the exported run returns the moved x(0)");
+    let built_by_one_run = crate::interpreter::label_map_builds() - built_at_compilation;
+    assert!(
+        built_by_one_run <= 1,
+        "a run of an artifact that holds its own label map must NOT rebuild it in the \
+         driver: this run built {built_by_one_run} maps, and two would mean the \
+         driver's per-run build is back"
+    );
+
+    // Two more runs: the per-run cost is a constant, so nothing accumulates.
+    for run in 1..3 {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let value = run_compiled(&compiled, &mut machine, &module, name, 0, &[], &mut ctx)
+            .expect("the exported run returns");
+        assert_eq!(value, make_small(7), "run {run} returns the moved x(0)");
+    }
+    assert_eq!(
+        crate::interpreter::label_map_builds() - built_at_compilation,
+        3 * built_by_one_run,
+        "every run of one eager artifact builds the same number of maps: the driver \
+         adds none of its own"
+    );
+
+    // The label-addressed entry resolves against the run's map, so on top of the
+    // export-path constant it adds nothing at all.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let outcome = run_compiled_label_outcome(
+        &compiled,
+        &mut machine,
+        &module,
+        Label(2),
+        0,
+        &[],
+        &mut ctx,
+    )
+    .expect("the label run returns");
+    assert_eq!(outcome, RunOutcome::Returned(make_small(7)));
+    assert_eq!(
+        crate::interpreter::label_map_builds() - built_at_compilation,
+        3 * built_by_one_run,
+        "the label-addressed entry builds no map: it resolves against the artifact's"
+    );
+
+    // The lazy artifact builds exactly one map, at creation.
+    let lazy = CompiledModule::lazy(&module);
+    assert_eq!(
+        crate::interpreter::label_map_builds() - built_at_compilation,
+        3 * built_by_one_run + 1,
+        "CompiledModule::lazy builds exactly one map, at creation"
+    );
+
+    // Its first entry compiles the function (a one-time cost); every run after that
+    // still pays only the export-path constant, never a second map.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let value = run_compiled(&lazy, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the lazy artifact's first entry compiles the function and returns");
+    assert_eq!(value, make_small(7));
+    let after_first_entry = crate::interpreter::label_map_builds();
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let value = run_compiled(&lazy, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the second lazy run returns");
+    assert_eq!(value, make_small(7));
+    assert_eq!(
+        crate::interpreter::label_map_builds() - after_first_entry,
+        built_by_one_run,
+        "a lazy run whose function is already compiled costs the same per-run constant \
+         as an eager one (the driver rebuilds nothing, and the lazy artifact's map is \
+         the one built at creation)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Measurement (not an assertion): the declined `call_ext*` seam cost
+// ---------------------------------------------------------------------------
+
+/// The `call_ext` calls one measured run makes, and the timed run count.
+///
+/// Sized like the crate's JIT workloads (`WALK_LENGTH`/`CROSS_STEPS` are 64; this is
+/// larger so the per-run setup — `Machine::reset` + the label-map build — is a small
+/// fraction of a run, which is what makes the figure track the call itself).
+const MEASURED_CALL_EXT_ROUNDS: usize = 256;
+
+/// The timed runs per tier after one warm-up run.
+const MEASURED_CALL_EXT_RUNS: u32 = 1_000;
+
+/// **A measurement, never an assertion**: the cost of a body of
+/// [`MEASURED_CALL_EXT_ROUNDS`] `call_ext` BIF calls whose host seam answers `Ok(None)`
+/// ("run it synchronously"), on both tiers.
+///
+/// This is the shape the duplicate host-seam resolution covered: a native tier lowered
+/// the `call_ext*` through [`jit_ext_call`], consulted the host's cross-module seam,
+/// and — on the host's decline — handed the whole instruction back to [`jit_step_one`],
+/// whose `call_ext*` arm consulted the **same** seam a second time. The fix routes that
+/// decline through [`jit_step_ext`]'s `Some(None)` answer, so the seam is consulted once.
+/// The seam-counter test above pins the **count**; this one reports the **cost**, so the
+/// before/after figures for one build can be compared by running the same `#[ignore]`d
+/// test against both.
+///
+/// `#[ignore]`d because it is a benchmark, not a unit test, and because it is
+/// timing-sensitive: run it alone with
+/// `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
+/// --lib -- --ignored --nocapture measure_declined_call_ext` (one test, so no other
+/// workload's timing can contaminate it) and read the ratios across builds, never the
+/// absolute nanoseconds (this is a shared, high-load sandbox).
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_declined_call_ext() {
+    let (module, name) = declined_call_ext_module(MEASURED_CALL_EXT_ROUNDS);
+
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let mut ctx = MinimalContext::new();
+        // The reference implementation of the BIF the calls reach synchronously; the
+        // host's cross-module seam keeps its default `Ok(None)` (the decline).
+        ctx.set_bif_hook(crate::jit::bench::support::arith_hook(None, None));
+        let mut machine = Machine::new();
+
+        // One warm-up run (the first execution through the artifact), not timed.
+        machine
+            .run_export_outcome_with_tier(&module, name, 0, &[], &mut ctx, tier)
+            .unwrap_or_else(|err| panic!("{tier:?}: the warm-up run returns: {err:?}"));
+
+        let start = std::time::Instant::now();
+        for _ in 0..MEASURED_CALL_EXT_RUNS {
+            let outcome = machine
+                .run_export_outcome_with_tier(&module, name, 0, &[], &mut ctx, tier)
+                .unwrap_or_else(|err| panic!("{tier:?}: a timed run returns: {err:?}"));
+            assert_eq!(
+                outcome,
+                RunOutcome::Returned(make_small(MEASURED_CALL_EXT_ROUNDS as i64)),
+                "{tier:?}: the measured body must still compute the same value"
+            );
+        }
+        let elapsed = start.elapsed();
+        let ns_per_run = elapsed.as_secs_f64() * 1e9 / f64::from(MEASURED_CALL_EXT_RUNS);
+        println!(
+            "measure_declined_call_ext | tier={:<12} runs={:<5} total={:>9.3} ms | \
+             {:>12.1} ns/run | {:>8.2} ns/call_ext",
+            tier.name(),
+            MEASURED_CALL_EXT_RUNS,
+            elapsed.as_secs_f64() * 1e3,
+            ns_per_run,
+            ns_per_run / MEASURED_CALL_EXT_ROUNDS as f64,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Y-slot arithmetic: the frame-window publication across a frame change
+//
+// A `gc_bif '+'/2`/`'-'/2`/`'*'/2` whose operand or destination is a Y slot is
+// lowered natively, reading/writing the current call frame's Y window through
+// `JitRuntime::y_base`/`y_end`. The window is published by the block **prologue**
+// (`jit_publish_y`, in place of the plain position store) and re-published after an
+// in-block helper call (`jit_refresh_y`) only when the block still accesses Y later
+// (`Allocation::refresh_y_after`). Both decisions are compile-time, so a Y-free block
+// emits neither.
+// ---------------------------------------------------------------------------
+
+/// `f/1`'s body in the Y-slot arithmetic shape the loader emits for a clause whose
+/// `gc_bif '+'/2` reads a Y operand and writes a Y destination:
+/// `Allocate{2}` · `Move X(0)->Y(0)` · `GcBif '+'/2 [Y(0),X(0)] -> Y(1)` ·
+/// `Move Y(1)->X(0)` · `Deallocate 2` · `Return`.
+fn y_slot_arith_module(name: &str) -> (Module, Atom) {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 2,
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        },
+        gc_bif(
+            ImportRef(0),
+            vec![Operand::Y(0), Operand::X(0)],
+            Operand::Y(1),
+        ),
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ];
+    let module = build_module(
+        name,
+        &[("erlang", "+", 2)],
+        vec![("f", 1, code)],
+        &[("f", 1, Label(2))],
+    );
+    let atom = export_atom(&module, "f");
+    (module, atom)
+}
+
+/// The `GcBif` instruction of [`y_slot_arith_module`], as the compile-time lowerer
+/// sees it (`fast_arith` takes the instruction, not a code index).
+fn y_slot_arith_instr() -> Instr {
+    gc_bif(
+        ImportRef(0),
+        vec![Operand::Y(0), Operand::X(0)],
+        Operand::Y(1),
+    )
+}
+
+/// Run exported `name/1` with one small-int argument on both tiers and hand the two
+/// outcomes to `check`.
+///
+/// The unary twin of [`with_both_tiers`] (that one hard-codes arity 0): each run builds
+/// its boxed terms on its **own** [`MinimalContext`] heap, so the comparison has to
+/// happen *inside* this call — returning the outcomes and comparing them after the
+/// contexts were dropped would dereference freed memory.
+fn with_both_tiers_unary<R>(
+    module: &Module,
+    name: Atom,
+    arg: i64,
+    check: impl FnOnce(&Result<RunOutcome>, &Result<RunOutcome>) -> R,
+) -> R {
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = AddCtx::new();
+    let interpreter_outcome = interpreter.run_export_outcome_with_tier(
+        module,
+        name,
+        1,
+        &[make_small(arg)],
+        &mut interpreter_ctx,
+        Tier::Interpreter,
+    );
+    let mut baseline = Machine::new();
+    let mut baseline_ctx = AddCtx::new();
+    let baseline_outcome = baseline.run_export_outcome_with_tier(
+        module,
+        name,
+        1,
+        &[make_small(arg)],
+        &mut baseline_ctx,
+        Tier::BaselineJit,
+    );
+    check(&interpreter_outcome, &baseline_outcome)
+}
+
+/// A context that answers `erlang:'+'/2` with the **true** small-int sum of its two
+/// arguments (the interpreter route a `gc_bif` that could not be lowered takes), and
+/// delegates everything else to a [`MinimalContext`].
+///
+/// The Y-slot arithmetic tests need the two routes to agree: the baseline tier inlines
+/// the small-int fast path, while the interpreter reaches this hook.
+struct AddCtx {
+    inner: MinimalContext,
+}
+
+impl AddCtx {
+    fn new() -> AddCtx {
+        AddCtx {
+            inner: MinimalContext::new(),
+        }
+    }
+
+    /// The small integer a tagged word encodes (the inverse of `make_small`).
+    fn small_of(term: Eterm) -> i64 {
+        (term.raw() as i64 - SMALL_TAG as i64) >> SMALL_SHIFT
+    }
+}
+
+impl ExecutionContext for AddCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        if module == "erlang" && function == "+" && arity == 2 {
+            return Ok(make_small(Self::small_of(args[0]) + Self::small_of(args[1])));
+        }
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+}
+
+/// The Y-operand / Y-destination `gc_bif '+'/2` shape both **lowers** (the compile-time
+/// fast path claims it behind its frame-window guard) and **executes identically** on
+/// the baseline tier and the interpreter.
+#[test]
+fn a_y_slot_arith_shape_lowers_and_agrees_across_tiers() {
+    let (module, name) = y_slot_arith_module("yslot_eq");
+    assert!(
+        fast_arith(&module, &y_slot_arith_instr()).is_some(),
+        "a Y-operand / Y-destination small-int '+'/2 must lower at compile time"
+    );
+    with_both_tiers_unary(&module, name, 10, |interpreter, baseline| {
+        assert_same_outcome("y-slot arith", interpreter, baseline, &module.atom_table);
+        match (interpreter, baseline) {
+            (Ok(RunOutcome::Returned(value)), _) => {
+                assert_eq!(*value, make_small(20), "10 + 10");
+            }
+            other => panic!("the y-slot arithmetic did not return: {other:?}"),
+        }
+    });
+}
+
+/// The published Y window must be **refreshed across a frame change**.
+///
+/// `f/1` pushes a 2-slot frame, poisons its own Y window (`Y(0) = 555`, `Y(1) = 1000`)
+/// and then makes a local `Call` to a region that pushes **its own** 2-slot frame and
+/// runs `'+'(Y(0), 7) -> Y(1)` there. If the callee's block read the caller's stale
+/// window it would compute `555 + 7 = 562` (and write into the caller's Y(1)); the
+/// correct answer is `10 + 7 = 17`. The callee block's prologue publishes the window
+/// while the *caller's* frame is on top, and its `Allocate` then pushes the callee
+/// frame — so the `'+'` reaches its Y slot only through the post-deopt `jit_refresh_y`
+/// the frame change forces, on both tiers.
+#[test]
+fn a_y_slot_read_after_a_frame_change_sees_the_new_frame() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 1,
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::X(0),
+        },
+        // Poison the caller frame's own Y window, so a stale window read by the
+        // callee is observably wrong rather than accidentally equal.
+        Instr::Move {
+            src: Operand::Integer(555),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(1000),
+            dst: Operand::Y(1),
+        },
+        Instr::Call {
+            arity: 1,
+            target: Label(3),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+        // The callee region: a forward local `Call` target inside the same function,
+        // exactly how the loader decomposes a non-tail-recursive clause.
+        Instr::Label(Label(3)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 1,
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        },
+        gc_bif(
+            ImportRef(0),
+            vec![Operand::Y(0), Operand::Integer(7)],
+            Operand::Y(1),
+        ),
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ];
+    let module = build_module(
+        "yslot_frame",
+        &[("erlang", "+", 2)],
+        vec![("f", 1, code)],
+        &[("f", 1, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+    assert!(
+        fast_arith(
+            &module,
+            &gc_bif(
+                ImportRef(0),
+                vec![Operand::Y(0), Operand::Integer(7)],
+                Operand::Y(1)
+            )
+        )
+        .is_some(),
+        "the callee's Y-slot '+'/2 must lower too"
+    );
+    with_both_tiers_unary(&module, name, 10, |interpreter, baseline| {
+        assert_same_outcome("y-slot frame change", interpreter, baseline, &module.atom_table);
+        match (interpreter, baseline) {
+            (Ok(RunOutcome::Returned(value)), _) => assert_eq!(
+                *value,
+                make_small(17),
+                "the callee must read its own frame (10 + 7), never the caller's poisoned window"
+            ),
+            other => panic!("the frame-change arithmetic did not return: {other:?}"),
+        }
+    });
+}
+
+/// A Y access with **no live frame's slot to name** is rejected identically by both
+/// tiers.
+///
+/// The instruction names `Y(0)` inside a function that never pushes a frame, so the
+/// process's only frame owns zero Y slots and the window is empty. The emitted guard's
+/// `lea` lands at (or past) `y_end`, so it branches to `jit_step_one`, and the
+/// interpreter's own `machine.y(0)` judgement — a typed error, never a wrong value and
+/// never a panic — surfaces on the baseline tier unchanged.
+#[test]
+fn a_y_access_with_no_live_frame_is_rejected_identically_on_both_tiers() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        gc_bif(
+            ImportRef(0),
+            vec![Operand::Y(0), Operand::X(0)],
+            Operand::X(0),
+        ),
+        Instr::Return,
+    ];
+    let module = build_module(
+        "yslot_noframe",
+        &[("erlang", "+", 2)],
+        vec![("f", 1, code)],
+        &[("f", 1, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+    assert!(
+        fast_arith(&module, &y_slot_arith_instr()).is_some(),
+        "the shape still lowers; the frame window is a run-time guard"
+    );
+    with_both_tiers_unary(&module, name, 10, |interpreter, baseline| {
+        assert!(
+            interpreter.is_err(),
+            "the interpreter must reject a Y slot in an empty frame: {interpreter:?}"
+        );
+        assert!(
+            baseline.is_err(),
+            "the baseline tier must reject a Y slot in an empty frame: {baseline:?}"
+        );
+        assert_same_outcome("empty-frame Y slot", interpreter, baseline, &module.atom_table);
+    });
+}
+
+/// An out-of-frame Y slot (`Y(1)` in a frame that allocated exactly **one** slot) is
+/// rejected identically by both tiers.
+///
+/// The emitted guard only ever *rejects* (branching to `jit_step_one`), so the
+/// interpreter's own judgement of the malformed frame — a typed error, never a wrong
+/// value and never a panic — surfaces on the baseline tier unchanged.
+#[test]
+fn an_out_of_frame_y_slot_is_rejected_identically_on_both_tiers() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(1),
+            live: 1,
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        },
+        gc_bif(
+            ImportRef(0),
+            vec![Operand::Y(0), Operand::X(0)],
+            Operand::Y(1),
+        ),
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+    ];
+    let module = build_module(
+        "yslot_bad",
+        &[("erlang", "+", 2)],
+        vec![("f", 1, code)],
+        &[("f", 1, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+    assert!(
+        fast_arith(&module, &y_slot_arith_instr()).is_some(),
+        "the shape still lowers; the frame window is a run-time guard"
+    );
+    with_both_tiers_unary(&module, name, 10, |interpreter, baseline| {
+        assert!(
+            interpreter.is_err(),
+            "the interpreter must reject an out-of-frame Y slot: {interpreter:?}"
+        );
+        assert!(
+            baseline.is_err(),
+            "the baseline tier must reject an out-of-frame Y slot: {baseline:?}"
+        );
+        assert_same_outcome(
+            "out-of-frame Y slot",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Y-slot `move`: the source and/or the destination may be an in-frame Y slot
+// ---------------------------------------------------------------------------
+//
+// A `move` whose source and/or destination is a `Y` slot is lowered natively behind
+// the **same shared frame-window guard** the arithmetic fast path uses
+// (`operands.rs::emit_guarded_y_load`/`emit_guarded_y_store` § the guarded Y-window
+// access), so the shape is purely syntactic [`move_shape`] and the run-time guard can
+// only ever *reject*. The compile-time Y gate ([`uses_y`]) must claim **exactly** those
+// moves — otherwise a later in-block Y access after a helper call would read a window
+// published before a `machine.stack` reallocation.
+// ---------------------------------------------------------------------------
+
+/// `f/0`'s body as a chain of Y-slot moves — `Allocate{2}` · `Move 7 -> Y(0)` (a **Y
+/// destination**) · `Move Y(0) -> Y(1)` (**Y source and destination**) ·
+/// `Move Y(1) -> X(0)` (a **Y source**) · `Deallocate 2` · `Return`.
+fn y_slot_move_code() -> Vec<Instr> {
+    vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ]
+}
+
+/// Every Y-slot `move` shape (a `Y` source, a `Y` destination, or both) **lowers** at
+/// compile time and **executes identically** on the baseline tier and the interpreter.
+#[test]
+fn a_y_source_and_a_y_destination_move_lower_and_agree_across_tiers() {
+    let code = y_slot_move_code();
+    for instr in &code {
+        if let Instr::Move { src, dst } = instr {
+            assert!(
+                move_shape(src, dst).is_some(),
+                "a Y-slot move must lower at compile time: {src:?} -> {dst:?}"
+            );
+        }
+    }
+    let module = build_module("yslot_move", &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
+    let name = export_atom(&module, "f");
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome("y-slot move", interpreter, baseline, &module.atom_table);
+        match (interpreter, baseline) {
+            (Ok(RunOutcome::Returned(value)), _) => {
+                assert_eq!(*value, make_small(7), "the constant travelled through Y(0)/Y(1)");
+            }
+            other => panic!("the Y-slot moves did not return: {other:?}"),
+        }
+    });
+}
+
+/// A `move` naming a Y slot **outside** the current frame is rejected identically by
+/// both tiers — as a destination and as a source.
+///
+/// The emitted guard only ever *rejects* (branching to `jit_step_one`), so the
+/// interpreter's own `y(k)` judgement — a typed error, never a wrong value and never a
+/// panic — surfaces on the baseline tier unchanged. This is exactly the case a
+/// fabricated value would show up in: `Move 7 -> Y(1)` must not silently succeed.
+#[test]
+fn an_out_of_frame_y_move_is_rejected_identically_on_both_tiers() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(1),
+            live: 0,
+        },
+        // A frame of exactly one Y slot: `Y(1)` is outside it, both as a store …
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::Y(1),
+        },
+        // … and as a load.
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+    ];
+    for instr in &code {
+        if let Instr::Move { src, dst } = instr {
+            assert!(
+                move_shape(src, dst).is_some(),
+                "the shape still lowers; the frame window is a run-time guard: {src:?} -> {dst:?}"
+            );
+        }
+    }
+    let module = build_module("yslot_move_bad", &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
+    let name = export_atom(&module, "f");
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert!(
+            interpreter.is_err(),
+            "the interpreter must reject an out-of-frame Y move: {interpreter:?}"
+        );
+        assert!(
+            baseline.is_err(),
+            "the baseline tier must reject an out-of-frame Y move: {baseline:?}"
+        );
+        assert_same_outcome(
+            "out-of-frame Y move",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+    });
+}
+
+/// A `move` naming a Y index the emitted `disp32` cannot address is refused at
+/// **compile** time (a deopt — the interpreter reports the faithful error), and the
+/// compile-time Y gate agrees: a refused move accesses no window, so it must not make
+/// the block publish one.
+#[test]
+fn an_unaddressable_y_move_index_is_refused_at_compile_time() {
+    let module = Module::default();
+    assert!(!y_addressable(u32::MAX));
+    for (src, dst) in [
+        (Operand::X(0), Operand::Y(u32::MAX)),
+        (Operand::Y(u32::MAX), Operand::X(0)),
+        (Operand::Y(u32::MAX), Operand::Y(0)),
+        (Operand::Integer(1), Operand::Y(u32::MAX)),
+    ] {
+        assert!(
+            move_shape(&src, &dst).is_none(),
+            "an un-addressable Y index must be refused at compile time: {src:?} -> {dst:?}"
+        );
+        assert!(
+            !uses_y(&module, &Instr::Move { src, dst }),
+            "a refused Y move accesses no window"
+        );
+    }
+
+    // The largest index the `lea ... disp32` still addresses IS claimed, so the refusal
+    // is the displacement bound and nothing else.
+    let biggest = (i32::MAX / std::mem::size_of::<Eterm>() as i32) as u32;
+    assert!(y_addressable(biggest));
+    assert!(move_shape(&Operand::X(0), &Operand::Y(biggest)).is_some());
+}
+
+/// The compile-time Y gate ([`uses_y`]) is true **exactly** for the `move` shapes the
+/// inliner claims *and* that read the frame window — the invariant `Allocation::y_last`
+/// / `refresh_y_after` rest on. A move the inliner refuses deopts and reads nothing, so
+/// the gate must be false for it too.
+#[test]
+fn the_move_y_gate_matches_the_move_inliner_exactly() {
+    let module = Module::default();
+    let typed_y = Operand::Typed {
+        reg: RegRef::Y(1),
+        ty: beam_loader::TypeIndex(0),
+    };
+    let typed_x = Operand::Typed {
+        reg: RegRef::X(2),
+        ty: beam_loader::TypeIndex(0),
+    };
+    let moves = vec![
+        // x-only: lowered, but no window read.
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::X(1),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(1),
+        },
+        Instr::Move {
+            src: Operand::Nil,
+            dst: Operand::X(1),
+        },
+        Instr::Move {
+            src: typed_x,
+            dst: Operand::X(1),
+        },
+        // Y source and/or destination, plain and `Typed`: lowered AND a window read.
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: typed_y.clone(),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: typed_y.clone(),
+        },
+        // refused shapes: an out-of-bound register or Y index (`fr`/literal operands
+        // cannot even be spelled), so the whole instruction deopts.
+        Instr::Move {
+            src: Operand::X(MAX_REGISTER),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::X(MAX_REGISTER),
+        },
+        Instr::Move {
+            src: Operand::Y(u32::MAX),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(u32::MAX),
+        },
+    ];
+
+    for instr in &moves {
+        let Instr::Move { src, dst } = instr else {
+            unreachable!("the table holds only moves")
+        };
+        let shape = move_shape(src, dst);
+        let claimed_reads_y = shape.as_ref().map_or(false, MoveShape::uses_y);
+        // The operand-level restatement of the same predicate: the shape is claimed and
+        // one of its two sides is an addressable Y slot. The inliner claims exactly the
+        // shapes `move_shape` accepts (it refuses nothing else), so the three must agree.
+        let in_bound_y =
+            |operand: &Operand| matches!(y_register(operand), Some(k) if y_addressable(k));
+        let expected = shape.is_some() && (in_bound_y(src) || in_bound_y(dst));
+        assert_eq!(claimed_reads_y, expected, "{src:?} -> {dst:?}");
+        assert_eq!(
+            uses_y(&module, instr),
+            expected,
+            "the Y gate must match the inliner for {src:?} -> {dst:?}"
+        );
+    }
+
+    // An x-only move is still charged its x-registers, and a Y slot never is.
+    let y_only = Instr::Move {
+        src: Operand::Y(0),
+        dst: Operand::Y(1),
+    };
+    let Instr::Move { src, dst } = &y_only else {
+        unreachable!()
+    };
+    assert!(move_shape(src, dst).expect("Y->Y lowers").registers().is_empty());
+}
+
+/// A block whose inlined Y moves follow an in-block helper call is covered by the
+/// compile-time gate: `y_last` names the last Y access, so the helper's deopt arm
+/// (`Allocate`, which may reallocate `machine.stack`) re-publishes the window
+/// (`refresh_y_after`) before the move reads it.
+#[test]
+fn the_y_window_gate_covers_the_inlined_y_moves() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let module = build_module(
+        "yslot_move_gate",
+        &[],
+        vec![("f", 0, code)],
+        &[("f", 0, Label(2))],
+    );
+    let code = &module.functions[0].code;
+    let allocation = allocate_registers(&module, code, 1, code.len());
+    assert_eq!(
+        allocation.y_last,
+        Some(4),
+        "the block's last Y access is the Y-source move at pc 4"
+    );
+    assert!(
+        allocation.refresh_y_after(3),
+        "the Y-destination move's own fallback is followed by the Y-source move"
+    );
+    assert!(
+        !allocation.refresh_y_after(4),
+        "nothing follows the last Y access, so its own fallback refreshes nothing"
+    );
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_publish_y as *const ()),
+        "a block with an inlined Y move publishes the window from its prologue"
+    );
+    assert!(
+        code_contains_helper(&function, jit_refresh_y as *const ()),
+        "the `allocate` deopt re-publishes the window before the Y move reads it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the Y-window publication is gated at compile time
+// ---------------------------------------------------------------------------
+/// Whether the function's sealed machine code contains a `movabs r11, <helper>`
+/// immediate — the `49 BB <imm64>` shape every helper call emits (the same probe
+/// `the_compiled_block_wires_the_ext_call_helper_into_native_code` uses).
+fn code_contains_helper(function: &super::code::CompiledFunction, helper: *const ()) -> bool {
+    let start = function.buffer.code_ptr() as usize;
+    let len = function.buffer.len();
+    // SAFETY: `[start, start + len)` is the function's live, sealed executable mapping,
+    // which `function` owns and keeps mapped for this borrow; reading it as bytes is
+    // valid and does not execute it.
+    let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+    let mut needle = vec![0x49u8, 0xBB];
+    needle.extend_from_slice(&(helper as u64).to_le_bytes());
+    code.windows(needle.len())
+        .any(|window| window == needle.as_slice())
+}
+
+/// `Allocation::y_last` / `Allocation::refresh_y_after` gate both Y-window emissions,
+/// and the emitted code follows: a block whose body accesses a Y slot publishes the
+/// window in its prologue (`jit_publish_y`) and re-publishes it after an in-block
+/// helper call while a later instruction still accesses Y (`jit_refresh_y`), while a
+/// Y-free block emits neither.
+///
+/// The code-generation probe searches the sealed machine code for each helper's
+/// `movabs r11, <helper>` immediate. The publish is a **substitution** for the plain
+/// position store `jit_set_position` — the two share the identical three-argument call
+/// shape, so their byte lengths are equal and a length comparison would not isolate the
+/// gate; the helper-address probe pins it exactly instead.
+#[test]
+fn the_y_window_publication_is_gated_at_compile_time() {
+    // Two `gc_bif`s in one block: the first's fallback (emitted on the **continue** arm)
+    // is gated on the second, later Y access, so both the prologue publish and the
+    // gated refresh are emitted.
+    let y_module = build_module(
+        "ywin_y",
+        &[("erlang", "+", 2)],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::Y(0),
+                },
+                gc_bif(
+                    ImportRef(0),
+                    vec![Operand::Y(0), Operand::Integer(1)],
+                    Operand::Y(1),
+                ),
+                gc_bif(
+                    ImportRef(0),
+                    vec![Operand::Y(1), Operand::Integer(1)],
+                    Operand::X(0),
+                ),
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let y_code = &y_module.functions[0].code;
+    let allocation = allocate_registers(&y_module, y_code, 1, y_code.len());
+    // pc 4 (the second `gc_bif`) is the block's last Y access.
+    assert_eq!(allocation.y_last, Some(4), "the last Y access is at pc 4");
+    assert!(
+        !allocation.refresh_y_after(4),
+        "nothing follows the last Y access, so its own fallback refreshes nothing"
+    );
+    assert!(
+        allocation.refresh_y_after(3),
+        "the first `gc_bif`'s fallback is followed by the second Y access"
+    );
+    assert!(allocation.refresh_y_after(2), "the `move` is followed by a Y access");
+
+    let labels = crate::interpreter::build_label_map(&y_module);
+    let y_function = compile_function(&y_module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&y_function, jit_publish_y as *const ()),
+        "a Y-touching block publishes the window from its prologue"
+    );
+    assert!(
+        code_contains_helper(&y_function, jit_refresh_y as *const ()),
+        "a Y-touching block refreshes the window after an in-block helper call"
+    );
+
+    // The same block over x-registers only: no Y access, so `y_last` is `None` and
+    // neither helper is emitted anywhere.
+    let x_module = build_module(
+        "ywin_x",
+        &[("erlang", "+", 2)],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(1),
+                },
+                gc_bif(
+                    ImportRef(0),
+                    vec![Operand::X(0), Operand::Integer(1)],
+                    Operand::X(1),
+                ),
+                gc_bif(
+                    ImportRef(0),
+                    vec![Operand::X(1), Operand::Integer(1)],
+                    Operand::X(0),
+                ),
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let x_code = &x_module.functions[0].code;
+    let allocation = allocate_registers(&x_module, x_code, 1, x_code.len());
+    assert!(allocation.y_last.is_none(), "the x-register block accesses no Y slot");
+    for pc in 1..x_code.len() as u32 {
+        assert!(
+            !allocation.refresh_y_after(pc),
+            "a Y-free block refreshes nothing at pc {pc}"
+        );
+    }
+    let labels = crate::interpreter::build_label_map(&x_module);
+    let x_function = compile_function(&x_module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        !code_contains_helper(&x_function, jit_publish_y as *const ()),
+        "a Y-free block emits the plain position store, not the window publish"
+    );
+    assert!(
+        !code_contains_helper(&x_function, jit_refresh_y as *const ()),
+        "a Y-free block emits no window refresh"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the continuation sub-block runs natively
+// ---------------------------------------------------------------------------
+
+/// A frame-preserving `call`'s continuation address — which falls **inside** an IR
+/// block — executes on a native sub-block in the lazy per-function layout the runtime
+/// driver uses (`CodeCache::compiled_handle`), and the run returns the same value as
+/// the interpreter.
+///
+/// `local_call_case`'s `f/0` calls `g/0` at pc 3; the continuation pc 4 is strictly
+/// inside `f/0`'s `Label(2)` block `[1, 5)`, so the driver re-enters `f/0` at the
+/// sub-block after `g/0` returns rather than stepping the interpreter. The compile-time
+/// assertions pin the LAZY per-function table (`entries[4]` empty, `sub_entries[4]`
+/// present) as the sub-block path that ran.
+#[test]
+fn a_continuation_sub_block_executes_and_agrees_across_tiers() {
+    let (module, name) = local_call_case();
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(function.entries[4].is_none(), "pc 4 is not an IR block start");
+    assert!(
+        function.sub_entries[4].is_some(),
+        "pc 4 is a continuation sub-block of the lazy function"
+    );
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "continuation sub-block",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        match interpreter {
+            Ok(RunOutcome::Returned(value)) => {
+                assert_eq!(*value, make_small(7), "g/0 moved 7 into x(0)")
+            }
+            other => panic!("the continuation sub-block run did not return: {other:?}"),
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// the frame-discipline inliners: `deallocate` / `return` / `deallocate_return`
+//
+// The three instructions that end a function body are lowered natively instead of
+// paying a full `jit_step_one` interpreter step. Each makes one dedicated helper
+// round-trip (`jit_deallocate`/`jit_return`/`jit_deallocate_return`) that performs
+// only *this* instruction's `Machine` work — the interpreter's own
+// `Machine::pop_frame_checked` and `Machine::continuation()` calls — and hands the
+// outcome back as the block-ABI word the driver already decodes. The agreement
+// tests below pin the interpreter-identical outcome; the code probes pin that the
+// lowering is the dedicated helper (a deopt would carry `jit_step_one` instead).
+// ---------------------------------------------------------------------------
+
+/// A **separate** `deallocate N; return` pair (the hand-built shape — the loader
+/// fuses it into `Instr::DeallocateReturn`, but a synthetic module keeps both
+/// instructions) is lowered as **one** fused helper round-trip and returns the
+/// interpreter's value.
+#[test]
+fn a_separate_deallocate_return_pair_is_fused_and_agrees_across_tiers() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(0),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(0),
+        Instr::Return,
+    ]);
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_deallocate_return as *const ()),
+        "the adjacent `deallocate 0; return` pair lowers as one fused helper round-trip"
+    );
+    assert!(
+        !code_contains_helper(&function, jit_deallocate as *const ()),
+        "the pair is fused, so no lone `deallocate` helper is emitted"
+    );
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "separate deallocate/return",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        match interpreter {
+            Ok(RunOutcome::Returned(value)) => {
+                assert_eq!(*value, make_small(7), "the constant reached x(0)")
+            }
+            other => panic!("the frame-exit body did not return: {other:?}"),
+        }
+    });
+}
+
+/// The loader's fused superinstruction `Instr::DeallocateReturn(N)` — the shape every
+/// compiler-produced function body ends with — is lowered through the dedicated
+/// helper and returns the interpreter's value.
+#[test]
+fn the_fused_deallocate_return_lowers_and_agrees_across_tiers() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(0),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(9),
+            dst: Operand::X(0),
+        },
+        Instr::DeallocateReturn(0),
+    ]);
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_deallocate_return as *const ()),
+        "the fused superinstruction lowers through `jit_deallocate_return`"
+    );
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "fused deallocate_return",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        match interpreter {
+            Ok(RunOutcome::Returned(value)) => {
+                assert_eq!(*value, make_small(9), "the constant reached x(0)")
+            }
+            other => panic!("the fused exit did not return: {other:?}"),
+        }
+    });
+}
+
+/// A `deallocate` operand that no longer matches the live frame is rejected by the
+/// tier's checked pop with the interpreter's **exact** typed error, and nothing is
+/// fabricated — the `jit_step_one` fallback the interpreter would take is gone, so
+/// the helper's own error is the only path.
+#[test]
+fn a_checked_pop_mismatch_is_rejected_identically_on_both_tiers() {
+    // A frame of exactly one Y slot; the `deallocate` operand claims two.
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(1),
+            live: 0,
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ]);
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert!(
+            interpreter.is_err(),
+            "the interpreter's checked pop rejects the mismatch: {interpreter:?}"
+        );
+        assert!(
+            baseline.is_err(),
+            "the baseline tier's checked pop rejects the mismatch too: {baseline:?}"
+        );
+        assert_same_outcome(
+            "stale deallocate operand",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        assert_eq!(
+            error_reason(interpreter.as_ref().expect_err("the pop raised")),
+            "unsupported_opcode: deallocate: frame size mismatch",
+            "the tier must report the interpreter's own checked-pop error"
+        );
+    });
+}
+
+/// A bare `return` with **no** `deallocate` (a frame-less function's exit) is lowered
+/// through `jit_return` and follows the bottom frame's `Continuation::Halt`, yielding
+/// `x(0)` on both tiers.
+#[test]
+fn a_return_on_the_bottom_frame_halts_identically_on_both_tiers() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(5),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_return as *const ()),
+        "a bare `return` lowers through the dedicated `jit_return` helper"
+    );
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "bottom-frame return",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        assert!(
+            matches!(interpreter, Ok(RunOutcome::Returned(value)) if *value == make_small(5)),
+            "the bottom `Halt` must yield x(0): {interpreter:?}"
+        );
+    });
+}
+

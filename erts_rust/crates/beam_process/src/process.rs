@@ -34,7 +34,7 @@
 
 use beam_alloc::{Heap, RefcBinary};
 use beam_common::{AllocKind, BeamError, Result};
-use beam_gc::{AnyCollector, Collection, HeapPolicy, OffHeap, OffHeapEntry};
+use beam_gc::{AnyCollector, Collection, HeapPolicy, OffHeap, OffHeapEntry, ReachableObject};
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::{Eterm, HEADER_BIN_REF};
 use std::collections::HashSet;
@@ -147,27 +147,25 @@ const MESSAGE_ROOT_TOKEN: usize = 2;
 /// off-heap binary handle.
 ///
 /// This is the per-object test [`Process::sweep_off_heap_binaries_reachable`] applies to the
-/// `(header, ptr)` pairs [`beam_gc::AnyCollector::for_each_reachable_object`] reports. An off-heap
-/// refc binary's on-heap handle is the frozen `[BinRef(3 words)][ErlSubBits(5 words)]` pair
-/// (`beam_term::refc`), and the payload pointer — the frozen `BinRef.val` contract, identical to
-/// [`RefcBinary::data_ptr`] — is exactly `BinRef`'s word 1.
+/// [`beam_gc::ReachableObject`] views [`beam_gc::AnyCollector::for_each_reachable_object_view`]
+/// reports. An off-heap refc binary's on-heap handle is the frozen `[BinRef(3 words)][ErlSubBits(5
+/// words)]` pair (`beam_term::refc`), and the payload pointer — the frozen `BinRef.val` contract,
+/// identical to [`RefcBinary::data_ptr`] — is exactly `BinRef`'s word 1, read here through the
+/// view's **safe** [`word`](ReachableObject::word) accessor (no raw-pointer arithmetic of our own).
 ///
 /// The collector's walk descends an `ErlSubBits`'s `orig` slot unconditionally (the canonical copy
 /// child walk of `beam_term::layout::for_each_child_slot`), so the `BinRef` behind **every**
 /// reachable `ErlSubBits` is reported to the walk as an object of its own; testing the header word
 /// alone therefore covers the whole refc pair, whichever of the two objects is reached first (and a
 /// match-context `ErlSubBits`, whose `orig` is an on-heap bitstring, is correctly ignored).
-fn reachable_bin_ref_payload(header: Eterm, ptr: *const Eterm) -> Option<usize> {
-    if header != HEADER_BIN_REF {
+fn reachable_bin_ref_payload(object: &ReachableObject<'_>) -> Option<usize> {
+    if object.header() != HEADER_BIN_REF {
         return None;
     }
-    // SAFETY: the walk guarantees `ptr` addresses the live header word `header` of a reachable
-    // object, and `header == HEADER_BIN_REF` fixes that object's shape at the frozen 3-word
-    // `[HEADER_BIN_REF, val, next]` `BinRef` (`beam_term::refc`), so word 1 is its initialized
-    // `val` slot and is readable. This is a plain **read** of one `Eterm` word: it writes nothing,
-    // follows no pointer and moves no term, so it can neither invalidate the walk nor disturb the
-    // heap.
-    Some(unsafe { *ptr.add(1) }.raw())
+    // Word 1 of a `BinRef` is its `val` slot — the payload's first data byte. The view reports the
+    // object's header plus that word, so the lookup is a plain safe read; a narrower object (a shape
+    // whose header lied) simply has no word 1 and names nothing.
+    object.word(1).map(|val| val.raw())
 }
 
 impl ProcessFlags {
@@ -809,9 +807,11 @@ impl Process {
     /// This is the **reachability-driven** half of the off-heap reclamation seam. Instead of the
     /// conservative "release only what the caller declared dead"
     /// ([`Process::sweep_off_heap_binaries`]), it enumerates the process heap with
-    /// [`beam_gc::AnyCollector::for_each_reachable_object`] and releases exactly the owned payloads
-    /// whose [`RefcBinary::data_ptr`] — the frozen `BinRef.val` contract — is not named by any
-    /// reachable `BinRef`. The release goes through the existing
+    /// [`beam_gc::AnyCollector::for_each_reachable_object_view`] and releases exactly the owned
+    /// payloads whose [`RefcBinary::data_ptr`] — the frozen `BinRef.val` contract — is not named by
+    /// any reachable `BinRef`. The walk hands each object over as a safe
+    /// [`beam_gc::ReachableObject`] view, so this half needs no `unsafe` of its own. The release goes
+    /// through the existing
     /// [`Process::retain_off_heap_binaries`] seam, so slot stability holds: a survivor keeps its
     /// original slot and a released slot is never reused.
     ///
@@ -863,8 +863,8 @@ impl Process {
         }
         let mut reachable: HashSet<usize> = HashSet::new();
         self.collector
-            .for_each_reachable_object(roots, |header, ptr| {
-                if let Some(payload) = reachable_bin_ref_payload(header, ptr) {
+            .for_each_reachable_object_view(roots, |object| {
+                if let Some(payload) = reachable_bin_ref_payload(&object) {
                     reachable.insert(payload);
                 }
             })?;
@@ -2120,59 +2120,78 @@ mod tests {
     }
 
     /// The per-object reachability test keys on the object's **header word** alone: the `BinRef` of
-    /// the frozen refc pair is identified (and its `val` word read), while the pair's `ErlSubBits`
-    /// root and an unrelated boxed shape are rejected.
+    /// the frozen refc pair is identified (and its `val` word read as the payload pointer), while the
+    /// pair's `ErlSubBits` root and an unrelated boxed shape name no off-heap payload.
+    ///
+    /// A [`beam_gc::ReachableObject`] view cannot be built outside `beam_gc`, so the discrimination is
+    /// driven through a **real walk** — [`Process::sweep_off_heap_binaries_reachable`] over the
+    /// process's own rooted young heap — and read off which registered payload survives:
+    ///
+    /// * a reachable `BinRef` (the one behind the rooted pair) ⇒ its payload is **retained**;
+    /// * the rooted term is the pair's `ErlSubBits`, not its `BinRef`: only the walk's descent of the
+    ///   `ErlSubBits`'s `orig` slot makes the `BinRef` an object of the walk at all, so an
+    ///   identification that found no `BinRef` behind an `ErlSubBits` root would release the payload
+    ///   (a dangle) and the retention assertion below would fail;
+    /// * an unrelated boxed shape (a tuple) is not a handle either, even when its word 1 spells a
+    ///   real payload address, so the payload only that spoofed word names is still reclaimed.
     #[test]
-    fn the_reachability_test_identifies_a_bin_ref_by_its_header() {
-        use beam_term::prelude::{
-            boxed_val, write_refc_binary, ERL_BIN_REF_SIZE, ERL_REFC_BITS_SIZE, HEADER_FLONUM,
-            HEADER_SUB_BITS,
-        };
+    fn the_reachability_test_identifies_a_bin_ref_by_its_header() -> Result<()> {
+        use beam_term::prelude::{write_refc_binary, ERL_REFC_BITS_SIZE};
 
-        // A scratch `[BinRef][ErlSubBits]` pair; `write_refc_binary` returns the `ErlSubBits` root.
-        let mut words = vec![Eterm::default(); ERL_REFC_BITS_SIZE];
-        let payload = words.as_mut_ptr() as *mut u8;
-        // SAFETY: `words` owns `ERL_REFC_BITS_SIZE` writable words, `payload` points at the start of
-        // that storage (word-aligned, and covering the zero-bit window requested), and both outlive
-        // the returned term.
-        let root = unsafe {
+        // The payload the rooted pair names, and one that no on-heap handle names.
+        let named = RefcBinary::new(b"a payload named by the rooted refc pair").expect("allocate");
+        let named_ptr = named.data_ptr();
+        let unrooted = RefcBinary::new(b"a payload no on-heap handle names").expect("allocate");
+        let unrooted_ptr = unrooted.data_ptr();
+
+        let mut process = Process::new(pid(31)).expect("the default heap allocates");
+        let named_slot = process.register_off_heap_binary(named.clone());
+        let unrooted_slot = process.register_off_heap_binary(unrooted);
+
+        // The frozen `[BinRef(3)][ErlSubBits(5)]` pair, written on the process's **own young heap**;
+        // the returned root — the `ErlSubBits` — is the term a caller roots.
+        // SAFETY: `alloc_words` hands back `ERL_REFC_BITS_SIZE` exclusively-owned, writable words of
+        // the process's young heap; `named_ptr` is the live, word-aligned first data byte of the
+        // payload the registered `named` handle keeps alive, and `0..named.len() * 8` covers exactly
+        // that payload.
+        let pair = unsafe {
             write_refc_binary(
-                words.as_mut_ptr(),
-                payload as *mut Eterm,
+                process.heap_mut().alloc_words(ERL_REFC_BITS_SIZE)?,
+                named_ptr as *mut Eterm,
                 core::ptr::null_mut(),
-                payload,
+                named_ptr,
                 0,
-                0,
+                named.len() * 8,
             )
         };
+        // An unrelated boxed shape: the walk reports it as an object too, and its header — not the
+        // word below it — decides what it is. Its word 1 deliberately spells the **unrooted**
+        // payload's address (a bare word whose primary tag is the frozen non-value `HEADER` tag, so
+        // the walk itself ignores it): an identification that dropped the `HEADER_BIN_REF` test and
+        // read word 1 of *every* boxed object would read this word as a payload pointer and retain
+        // that payload, so the reclaim assertion below has teeth.
+        let unrelated = process
+            .heap_mut()
+            .tuple(&[Eterm::from_raw(unrooted_ptr as usize), make_small(0)])?;
 
-        let sub_bits = boxed_val(root) as *const Eterm;
-        // SAFETY: `sub_bits` addresses word `ERL_BIN_REF_SIZE` of the pair `write_refc_binary` just
-        // wrote, so its header word is live and readable.
-        let sub_bits_header = unsafe { *sub_bits };
-        assert_eq!(sub_bits_header, HEADER_SUB_BITS, "the root is the `ErlSubBits`");
-        assert_eq!(
-            reachable_bin_ref_payload(sub_bits_header, sub_bits),
-            None,
-            "an `ErlSubBits` root carries no payload pointer in its header word"
-        );
+        process.registers_mut().x_mut().set_live(2)?;
+        process.registers_mut().x_mut().set(0, pair)?;
+        process.registers_mut().x_mut().set(1, unrelated)?;
 
-        // The `BinRef` sits `ERL_BIN_REF_SIZE` words before the root; word 1 is its `val` slot.
-        let bin_ref = sub_bits.wrapping_sub(ERL_BIN_REF_SIZE);
-        // SAFETY: `bin_ref` addresses word 0 of the pair `write_refc_binary` just wrote.
-        let header = unsafe { *bin_ref };
-        assert_eq!(header, HEADER_BIN_REF);
         assert_eq!(
-            reachable_bin_ref_payload(header, bin_ref),
-            Some(payload as usize),
-            "the `BinRef` header yields its `val` word (the payload's first data byte)"
+            process.sweep_off_heap_binaries_reachable()?,
+            1,
+            "the pair's `BinRef` names its payload (retained); the payload no handle names is reclaimed"
         );
-
-        // Any other boxed shape is rejected — its header alone never names an off-heap payload.
-        assert_eq!(
-            reachable_bin_ref_payload(HEADER_FLONUM, sub_bits),
-            None,
-            "a float header is not an off-heap binary handle"
+        let held = process
+            .off_heap_binary(named_slot)
+            .expect("the `BinRef` behind the rooted `ErlSubBits` named its payload");
+        assert_eq!(held.data_ptr(), named_ptr, "the payload pointer is the `BinRef.val` word");
+        assert_eq!(held.as_bytes(), named.as_bytes(), "the payload bytes are untouched");
+        assert!(
+            process.off_heap_binary(unrooted_slot).is_none(),
+            "an unrelated boxed shape is not an off-heap handle, so its spoofed payload word retained nothing"
         );
+        Ok(())
     }
 }

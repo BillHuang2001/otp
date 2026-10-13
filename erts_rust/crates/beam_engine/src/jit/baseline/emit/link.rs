@@ -486,6 +486,7 @@ mod tests {
         // the linked path too, because the successor's prologue reloads `machine.x`.
         let allocation = Allocation {
             slots: vec![(0u32, Reg::R12)],
+            y_last: None,
         };
         let store = encoded(|buffer| buffer.mov_mr(Reg::Rbx, 0, Reg::R12).unwrap());
         let spill = spill_bytes(&allocation);
@@ -556,6 +557,7 @@ mod tests {
         assert!(linker.is_compiled(0, 7) && !linker.is_compiled(0, 8));
         let allocation = Allocation {
             slots: vec![(0u32, Reg::R12)],
+            y_last: None,
         };
 
         linker

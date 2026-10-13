@@ -37,9 +37,10 @@ use super::aggregate::{
     get_hd_shape, get_list_shape, get_tl_shape, get_tuple_element_shape, select_tuple_arity_plan,
     set_tuple_element_shape,
 };
-use super::arith::fast_arith;
+use super::arith::{fast_arith, uses_y};
 use super::compare::comparison_shape;
-use super::operands::{constant_word, x_register};
+use super::r#move::move_shape;
+use super::operands::x_register;
 use super::select::select_val_plan;
 use super::test::{test_plan, TestSrc};
 use super::{Allocation, CACHE_REGISTERS};
@@ -128,6 +129,19 @@ fn allocate_registers_with_labels(
             .slots
             .push((x, CACHE_REGISTERS[allocation.slots.len()]));
     }
+
+    // The last pc in the block whose native lowering reads or writes a `Y` slot. The
+    // engine publishes the frame's Y window (see [`super::super::runtime`]) only in the
+    // prologue of a block that touches Y, and refreshes it after an in-block deopt whose
+    // helper may have moved `machine.stack` — this is the compile-time gate for both.
+    // A `Y` slot is **not** an x-register, so it is never charged to the touch counts
+    // above (it must not enter `highest_native_register`).
+    allocation.y_last = code[start..end]
+        .iter()
+        .enumerate()
+        .filter(|(_, instr)| uses_y(module, instr))
+        .map(|(offset, _)| (start + offset) as u32)
+        .max();
     allocation
 }
 
@@ -154,27 +168,14 @@ fn cacheable_touches(
     let mut touches = Vec::new();
     match instr {
         Instr::Move { src, dst } => {
-            let Some(dst_x) = x_register(dst) else {
-                return touches;
-            };
-            if dst_x >= MAX_REGISTER {
-                return touches;
+            // Charged exactly the x-register operands of the shape
+            // [`super::r#move::try_inline_move`] lowers. A `Y` source or `Y` destination is
+            // a stack slot, **not** an x-register, so it is never charged: a spurious
+            // entry would both evict a real x-register from the cache and raise the
+            // x-register bound the driver's native-entry guard reads.
+            if let Some(shape) = move_shape(src, dst) {
+                touches.extend(shape.registers());
             }
-            match x_register(src) {
-                Some(src_x) => {
-                    if src_x >= MAX_REGISTER {
-                        return touches;
-                    }
-                    touches.push(src_x);
-                }
-                // A non-register source must be a constant word, else the move deopts.
-                None => {
-                    if constant_word(src).is_none() {
-                        return touches;
-                    }
-                }
-            }
-            touches.push(dst_x);
         }
         Instr::Swap { a, b } => {
             let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {

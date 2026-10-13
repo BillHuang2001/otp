@@ -380,46 +380,17 @@ impl Machine {
                 if self.trace_on {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
-                // A host that can run the callee **in this machine** suspends and
-                // resumes *this* process through it: enter the callee's code with the
-                // caller's return address stored in the live frame, exactly like the
-                // local `Instr::Call` (the callee's `return` reads it back).
-                if let Some(target) =
-                    self.resolve_call_ext_apply(module, labels, *target, ctx)?
-                {
-                    return self.apply_import_target(target, ImportFrame::Call, func, pc);
-                }
-                // `erlang:send/2` / `erlang:'!'/2` deliver through the host's
-                // off-heap-aware send seam (so an engine-built refc binary in the
-                // message is *shared*, not flattened), while every other import —
-                // and every destination the two routes do not resolve identically —
-                // keeps the route below.
-                if let Some(target) =
-                    self.resolve_call_ext_send(module, labels, *target, ctx)?
-                {
-                    return self.apply_import_target(target, ImportFrame::Call, func, pc);
-                }
-                if let Some((context, callee, callee_pc)) =
-                    self.resolve_external_entry(module, labels, *target, ctx)?
-                {
-                    self.set_continuation(Continuation::Address {
-                        func,
-                        pc: pc + 1,
-                        context: self.current_context(),
-                    })?;
-                    return Ok(Step::Enter {
-                        context,
-                        func: callee,
-                        pc: callee_pc,
-                    });
-                }
-                match self.call_import(module, labels, *target, *arity, ctx) {
-                    Ok(value) => {
-                        self.set_x(0, value)?;
-                        Ok(Step::Next)
-                    }
-                    Err(e) => self.raise_bif_error(module, e).map_err(Box::new),
-                }
+                self.call_ext_dispatch(
+                    module,
+                    labels,
+                    *target,
+                    *arity,
+                    func,
+                    pc,
+                    ImportFrame::Call,
+                    ctx,
+                    None,
+                )
             }
             Instr::CallExtOnly { target, arity } => {
                 if self.trace_on {
@@ -428,33 +399,17 @@ impl Machine {
                 // A tail call: the caller's frame is reused, so nothing is stored —
                 // the callee's `return` follows the frame's *existing* continuation
                 // (exactly like the local `Instr::CallOnly`).
-                if let Some(target) =
-                    self.resolve_call_ext_apply(module, labels, *target, ctx)?
-                {
-                    return self.apply_import_target(target, ImportFrame::Only, func, pc);
-                }
-                // `erlang:send/2` / `erlang:'!'/2` — see the `CallExt` arm.
-                if let Some(target) =
-                    self.resolve_call_ext_send(module, labels, *target, ctx)?
-                {
-                    return self.apply_import_target(target, ImportFrame::Only, func, pc);
-                }
-                if let Some((context, callee, callee_pc)) =
-                    self.resolve_external_entry(module, labels, *target, ctx)?
-                {
-                    return Ok(Step::Enter {
-                        context,
-                        func: callee,
-                        pc: callee_pc,
-                    });
-                }
-                match self.call_import(module, labels, *target, *arity, ctx) {
-                    Ok(value) => {
-                        self.set_x(0, value)?;
-                        self.continuation_step().map_err(Box::new)
-                    }
-                    Err(e) => self.raise_bif_error(module, e).map_err(Box::new),
-                }
+                self.call_ext_dispatch(
+                    module,
+                    labels,
+                    *target,
+                    *arity,
+                    func,
+                    pc,
+                    ImportFrame::Only,
+                    ctx,
+                    None,
+                )
             }
             Instr::CallExtLast {
                 target,
@@ -489,38 +444,22 @@ impl Machine {
                 // behind (the local `Instr::CallLast` discipline); once it is
                 // resolved, entering the callee is the only step that depends on the
                 // popped frame and nothing may fail after it.
-                if let Some(target) =
-                    self.resolve_call_ext_apply(module, labels, *target, ctx)?
-                {
-                    return self.apply_import_target(target, ImportFrame::Last(*deallocate), func, pc);
-                }
-                // `erlang:send/2` / `erlang:'!'/2` — see the `CallExt` arm. The
-                // delivery runs before the `deallocate` pop (the same order the
-                // synchronous BIF success path below applies), so a raise leaves the
-                // live frame untouched and a success pops it exactly once.
-                if let Some(target) =
-                    self.resolve_call_ext_send(module, labels, *target, ctx)?
-                {
-                    return self.apply_import_target(target, ImportFrame::Last(*deallocate), func, pc);
-                }
-                if let Some((context, callee, callee_pc)) =
-                    self.resolve_external_entry(module, labels, *target, ctx)?
-                {
-                    self.pop_frame_checked(*deallocate)?;
-                    return Ok(Step::Enter {
-                        context,
-                        func: callee,
-                        pc: callee_pc,
-                    });
-                }
-                match self.call_import(module, labels, *target, *arity, ctx) {
-                    Ok(value) => {
-                        self.set_x(0, value)?;
-                        self.pop_frame_checked(*deallocate)?;
-                        self.continuation_step().map_err(Box::new)
-                    }
-                    Err(e) => self.raise_bif_error(module, e).map_err(Box::new),
-                }
+                //
+                // `erlang:send/2` / `erlang:'!'/2` delivery runs before the
+                // `deallocate` pop (the same order the synchronous BIF success path
+                // applies), so a raise leaves the live frame untouched and a success
+                // pops it exactly once.
+                self.call_ext_dispatch(
+                    module,
+                    labels,
+                    *target,
+                    *arity,
+                    func,
+                    pc,
+                    ImportFrame::Last(*deallocate),
+                    ctx,
+                    None,
+                )
             }
             Instr::Allocate { stack_need, .. } => {
                 // `stack_need` is a `HeapNeed` (either a bare word count or a
@@ -906,8 +845,77 @@ impl Machine {
             Err(e) => Ok(Some(ApplyTarget::Raised(self.raise_bif_error(module, e)?))),
         }
     }
-    /// Apply an arm's own frame discipline to an [`ApplyTarget`] produced by
-    /// [`Machine::resolve_call_ext_apply`].
+    /// The **single shared body** of the three `call_ext*` arms.
+    ///
+    /// The three forms differ **only** in their frame discipline ([`ImportFrame`]),
+    /// so the callee-resolution order below is one implementation shared by
+    /// `call_ext`, `call_ext_only` and `call_ext_last`; each arm traces the callee's
+    /// entry first (contract A.8) and then delegates here.
+    ///
+    /// The resolution order is the arms' historical order, unchanged:
+    /// 1. [`Machine::resolve_call_ext_apply`] — a host that can run the callee **in
+    ///    this machine** (the `erlang:apply/3` special case + the cross-module call
+    ///    seam): the callee's code is entered with the caller's return address stored
+    ///    in the live frame, exactly like the local `Instr::Call`.
+    /// 2. [`Machine::resolve_call_ext_send`] — `erlang:send/2` / `erlang:'!'/2`
+    ///    deliver through the host's off-heap-aware send seam (so an engine-built
+    ///    refc binary in the message is *shared*, not flattened), while every other
+    ///    import — and every destination the two routes do not resolve identically —
+    ///    keeps the route below.
+    /// 3. The host's cross-module seam — `seam`:
+    ///    * `None` — resolve through [`Machine::resolve_external_entry`] here (the
+    ///      import-table arity is what the seam consults);
+    ///    * `Some(answer)` — the host has **already** consulted its seam for this
+    ///      import and reports its answer verbatim: `Some((context, func, pc))` is a
+    ///      callee the host can run in this machine, `Some(None)` is "the host
+    ///      declined" (skip straight to step 4, never re-asking).
+    /// 4. Otherwise the synchronous BIF route, [`Machine::call_import`], marshalled
+    ///    with the instruction's own `arity` operand (not the import table's).
+    ///
+    /// Every outcome is then handed to [`Machine::apply_import_target`] with the
+    /// arm's `frame`, which is the only place the three forms diverge. The error path
+    /// is the shared catch-aware raise
+    /// ([`Machine::raise_bif_error`]), so a failure lands in a live `try`/`catch`
+    /// frame when there is one.
+    pub(crate) fn call_ext_dispatch(
+        &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        target: ImportRef,
+        arity: u32,
+        func: u32,
+        pc: u32,
+        frame: ImportFrame,
+        ctx: &mut dyn ExecutionContext,
+        seam: Option<Option<(u32, u32, u32)>>,
+    ) -> StepResult {
+        let apply_target =
+            if let Some(t) = self.resolve_call_ext_apply(module, labels, target, ctx)? {
+                t
+            } else if let Some(t) = self.resolve_call_ext_send(module, labels, target, ctx)? {
+                t
+            } else {
+                let resolved = match seam {
+                    None => self.resolve_external_entry(module, labels, target, ctx)?,
+                    Some(answer) => answer,
+                };
+                match resolved {
+                    Some((context, target_func, target_pc)) => ApplyTarget::Enter {
+                        context,
+                        func: target_func,
+                        pc: target_pc,
+                    },
+                    None => match self.call_import(module, labels, target, arity, ctx) {
+                        Ok(value) => ApplyTarget::Called(value),
+                        Err(e) => return self.raise_bif_error(module, e).map_err(Box::new),
+                    },
+                }
+            };
+        self.apply_import_target(apply_target, frame, func, pc)
+    }
+    /// Apply an arm's own frame discipline to the [`ApplyTarget`]
+    /// [`Machine::call_ext_dispatch`] resolved for it (from either special-case
+    /// seam, the host's cross-module seam, or the synchronous BIF route).
     ///
     /// The `call_ext*` forms differ only in their frame handling
     /// ([`ImportFrame`]): a non-tail `call_ext` stores its continuation on the
@@ -965,8 +973,10 @@ impl Machine {
 
 /// The frame discipline a `call_ext*` form applies to its resolved target.
 ///
-/// See [`Machine::apply_import_target`].
-enum ImportFrame {
+/// See [`Machine::apply_import_target`]. It is `pub(crate)` (re-exported as
+/// `crate::interpreter::ImportFrame`) so a sibling module can drive
+/// [`Machine::call_ext_dispatch`] for a given `call_ext*` form.
+pub(crate) enum ImportFrame {
     /// `call_ext`: a non-tail call — the caller's next instruction is stored as the
     /// live frame's continuation on the enter path, and a synchronous value is
     /// followed by `Step::Next`.

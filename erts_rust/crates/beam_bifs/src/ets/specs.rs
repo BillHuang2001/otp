@@ -148,11 +148,12 @@ fn match_spec_run_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         tables.spec_raw(handle).ok_or_else(badarg)?
     };
     // `beam_ets::match_spec_run` needs the atom table and the caller heap at once;
-    // the context lends them through two conflicting borrows, so it is given a
-    // clone of the atom table (identical indices, read-only — the `select_2`
-    // pattern).
-    let atoms = ctx.atoms().clone();
-    let results = beam_ets::match_spec_run(args[0], raw, &atoms, ctx.heap())?;
+    // the context splits the two disjoint fields in a single borrow
+    // (`ctx.atom_and_heap()`) rather than cloning the table (the `select_2` pattern).
+    let results = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        beam_ets::match_spec_run(args[0], raw, atoms, heap)?
+    };
     // Every result aliases the caller's list, the stored spec or a term freshly
     // built on the caller's heap, so they only need to be consed into a list (the
     // oracle's `ets:match_spec_run/2` likewise shares structure with its input).
@@ -190,10 +191,12 @@ fn match_spec_run_r_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm>
     }
     // The `match_spec_run_2` pattern: `beam_ets::match_spec_run` needs the atom
     // table and the caller heap at once, and those are two conflicting context
-    // borrows, so it is given a clone of the atom table (identical indices,
-    // read-only).
-    let atoms = ctx.atoms().clone();
-    let results = beam_ets::match_spec_run(args[0], raw, &atoms, ctx.heap())?;
+    // borrows, so the two disjoint fields are split in a single borrow
+    // (`ctx.atom_and_heap()`) rather than cloned.
+    let results = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        beam_ets::match_spec_run(args[0], raw, atoms, heap)?
+    };
     // `results` is in list order; consing each onto the accumulator reverses it, so
     // the last match ends up at the head and `Acc` at the tail — the C
     // `CONS(hp, res, ret)` fold. Every result aliases the caller's list, the stored

@@ -35,28 +35,30 @@ Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-pa
 - **Caveat.** The figure is the `MinimalContext` *test* arena; the measured per-BIF interpreter path still allocates nothing per call (`tests/bif_alloc.rs`, above), and the production heap is `beam_rt`'s, not this arena.
 
 ## Measured (JIT tier micro-benchmark -- `tests/jit_bench.rs` over `src/jit/bench/**`)
-`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench -- --ignored --nocapture` (add `--features jit-cranelift` for the Cranelift column). Ten workloads, `3000` timed runs each, warm-up excluded; a native tier is compiled **once** outside the timed loop (that one-time `compile` is **excluded**, and reported separately — 12 us-1.4 ms for the baseline, 0.3-120 ms for Cranelift). `ns/op` is the **mean** and includes the per-run setup (`Machine::reset` + the label-map build).
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench -- --ignored --nocapture` (add `--features jit-cranelift` for the Cranelift column). Twelve workloads, `3000` timed runs each, warm-up excluded; a native tier is compiled **once** outside the timed loop (that one-time `compile` is **excluded**, and reported separately — 12 us-1.4 ms for the baseline, 0.3-120 ms for Cranelift). `ns/op` is the **mean** and includes the per-run setup (`Machine::reset` + the label-map build).
 
 Every workload **asserts the tiers agree** on its intended value (structural `beam_term::cmp`; the tiers have separate heaps) — never "the JIT is faster" (that is environment-dependent). These tiers are **correctness-first mechanisms, not optimisers** (Part II §F).
 
 **`beam_rt` selects the tier per process** from `BEAM_RT_TIER` — unset/`auto`/`baseline` all select `Tier::BaselineJit` for **every** process entry, and the process keeps that tier across pre-emptions and suspends; `interpreter` is the only kill switch — so these are still **ENGINE-Mechanism** figures, not end-to-end runtime figures. No module is barred from the baseline tier: the engine's `Step::Enter` in-machine module-context transfer is implemented and driver-mediated (pinned by `tests/jit_cross_module.rs`), so no per-module switch-safety predicate gates the JIT. Note `beam_rt`'s `-eval` root expression is a tree-walk evaluator with no `Machine`, so a selected native tier applies to module-run (`run <file.beam>`) and spawned-child slices, not to the `-eval` expression itself.
 
-**Feature OFF** — interpreter -> baseline-jit (two runs, showing the sandbox spread):
+**Feature OFF** — interpreter -> baseline-jit (one coherent run, host loadavg ≈7.9; the sandbox is shared/high-load, so read the absolute ns/op as a range and the ratios as the signal):
 
 | workload (category) | interpreter ns/op | baseline-jit ns/op | speed-up |
 |---|---|---|---|
-| `build/0` (tuple/list BUILDING: `put_tuple2`/`put_list`) | 7.9k-14.3k | 6.7k-8.7k | 1.2-1.7x |
-| `map/2` (map build + get + put) | 10.1k-10.5k | 9.1k-9.2k | 1.1-1.2x |
-| `select/1` (`select_val`-heavy branches) | 2.5k-2.6k | 1.5k | 1.7x |
-| `walk/2` (recursive non-allocating list walk) | 3.3k | 0.40k-0.41k | 8.1-8.2x |
-| `slice:fib/1 (20)` (real `.beam` fixture) | 1.96k | 0.59k | 3.3x |
-| `kernel/2` (256 chained `gc_bif '+'/2`) | 3.8k | 0.56k | 6.7-6.8x |
-| `wide/2` (256 steps over 8 x-registers) | 5.5k | 0.59k | 9.2-9.3x |
-| `aggr/2` (128 steps of aggregate reads + `'*'/2`) | 9.9k | 2.2k | 4.4x |
-| `cmp/2` (64 rounds of the eight comparison BIFs) | 7.8k | 1.9k | 4.1x |
-| `cross/2` (cross-module `call_ext_last` ping-pong -- see the note below) | 11.8k | 16.1k | 0.73x |
+| `build/0` (tuple/list BUILDING: `put_tuple2`/`put_list`) | 13.0k | 9.3k | 1.39x |
+| `map/2` (map build + get + put) | 10.2k | 8.5k | 1.20x |
+| `select/1` (`select_val`-heavy branches) | 2.0k | 1.3k | 1.56x |
+| `walk/2` (recursive non-allocating list walk) | 2.1k | 0.42k | 5.09x |
+| `sum/1` (non-tail-recursive list sum; a Y-operand `'+'/2`) | 4.0k | 2.4k | 1.67x |
+| `slice:fib/1 (20)` (real `.beam` fixture) | 1.26k | 0.42k | 2.96x |
+| `kernel/2` (256 chained `gc_bif '+'/2`) | 3.3k | 0.55k | 5.93x |
+| `wide/2` (256 steps over 8 x-registers) | 4.3k | 0.57k | 7.55x |
+| `aggr/2` (128 steps of aggregate reads + `'*'/2`) | 7.3k | 2.2k | 3.27x |
+| `cmp/2` (64 rounds of the eight comparison BIFs) | 6.8k | 1.5k | 4.59x |
+| `cross/2` (cross-module `call_ext_last` ping-pong -- see the note below) | 6.9k | 6.7k | 1.03x |
+| `call_ext/0` (256 declined `call_ext` BIFs in a loop) | 9.0k | 5.4k | 1.68x |
 
-`cross/2` is the one workload whose baseline figure is **below** the interpreter's (≈0.73×): a `call_ext_last` is not inlined and a cross-module transfer cannot be linked (separate executable mappings, buffer-local `rel32` fixups), so every hop pays the caller's per-instruction deopt **plus** a driver-visible `switch_into` (context switch + the callee's literal/block resolution) and a fresh callee block entry. The transfer is deliberately **un-amortised** by construction -- the callee's blocks still run natively; only the transfer is not. Detail in `src/jit/bench/CONTEXT.md`.
+`cross/2` is the one workload whose baseline figure only reaches **parity** (≈1.03×): a `call_ext_last` is not inlined and a cross-module transfer cannot be linked (separate executable mappings, buffer-local `rel32` fixups), so every hop pays the caller's per-instruction deopt **plus** a driver-visible `switch_into` (context switch + the callee's literal/block resolution) and a fresh callee block entry -- the transfer is deliberately **un-amortised** by construction (the callee's blocks still run natively; only the transfer is not). It used to be **below** the interpreter (≈0.73×) because the driver re-hashed the callee's whole decoded IR on every `Step::Enter`; that per-slice re-hash is gone (see the cache section below). Detail in `src/jit/bench/CONTEXT.md`.
 **Feature ON** (`--features jit-cranelift`) — interpreter -> baseline-jit -> Cranelift (`cl` speed-up over the interpreter; one run — the sandbox was busier, e.g. `build` interpreter read 17.7k vs 7.9k feature-off):
 
 | workload | interpreter ns/op | baseline-jit ns/op | Cranelift ns/op | baseline speed-up | Cranelift speed-up |
@@ -103,8 +105,14 @@ Every workload **asserts the tiers agree** on its intended value (structural `be
 ## Measured (baseline-JIT cold start — lazy per-function compilation)
 The baseline tier's runtime path compiles **per function, lazily** (see `../CONTEXT.md` Intent): one sealed mapping per function, lowered on first entry of a `(func, pc)`, so a fresh `beam_rt` OS process pays only the functions it enters rather than the whole module. The eager whole-module layout (`JitBackend::compile`) is retained for the whole-module introspection surface and `jit_bench`.
 - Repro shape (from the sibling `../beam_rt/PERF.md`): `beam_rt run <bslice_string.beam> bslice_string:str_length/1 '"hello"'` (`string:length/1` is ~7995 IR instructions). N=30 **interleaved** samples: default (baseline-JIT) **31.86–45.45 ms (min 31.86)** vs `BEAM_RT_TIER=interpreter` **25.51–40.48 ms (min 25.51)** → ~**1.22–1.25x**. The equivalent `tools/bench` `slice` workload read **31.97 ms default / 31.92 ms interpreter** (min-of-3). The eager whole-module compile it replaced measured **405.29 ms default / 33.68 ms interpreter** (~12.3x) on the same shape, so the cold-start regression is gone.
-- **No hot-loop regression:** the eager/hot path is unchanged (`--test jit_bench -- --ignored`, all 10 workloads, within the ranges above; `--test engine_bench` interpreter figures unchanged — the change touches zero interpreter source).
+- **No hot-loop regression:** the eager/hot path is unchanged (`--test jit_bench -- --ignored`, all twelve workloads, within the ranges above; `--test engine_bench` interpreter figures unchanged — the change touches zero interpreter source).
 - Caveat: `jit_bench` drives the **eager** artifact only, so it pins the eager/hot path, not the lazy path's per-entry cost.
 
 ## Measured (native-tier soundness — the forced-tier differential gate)
 `erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p beam_rt -p differential` then `BEAM_RT_TIER=baseline erts_rust/tools/differential/gate.sh --strict --allowlist erts_rust/tools/differential/known-gaps.txt`. `select_entry_tier` returns `Tier::BaselineJit` unconditionally for `JitMode::Auto | JitMode::Baseline`, and the harness never scrubs the environment (`tools/differential/src/runtime.rs` adds env vars *in addition* to the inherited one), so the module-run third of the corpus executes on the native tier. Result: `total=1848 agree=1845 mismatch=0 unsupported=3 skipped=0 allowed=3 unauthorized=0 stale=0`, exit 0 — the same 3 allowlisted A.5/A.9 gaps, **no divergence**. The tier's cross-module / nested A→B→C / parked-then-resumed-slice / dynamic-`apply` shapes are pinned end-to-end by `tests/jit_cross_module.rs` (real `erlc` fixtures, both tiers asserted equal).
+## Measured (baseline-JIT cache lookup — no IR re-hash on a hit)
+`CodeCache`'s key is `(module name, content fingerprint)`, and the fingerprint hashes the whole decoded IR (`Debug` of `exports|imports|functions|funs|records|code_version|types|line` + every atom name + the raw blobs + every literal word): ~2 µs for a tiny bench module, ~141 µs for a 2048-instruction one. `compiled_handle` recomputed it on every call including hits, once per slice/resume entry (`run_baseline_cached*`) and once per module context from the driver's `NativeCode::module_blocks` hook on every cross-module `Step::Enter` — which is why `cross/2` was the only row slower than the interpreter. Fix: the fingerprint is now stored on the artifact (`CompiledModule::fingerprint`, computed once at creation), and `CodeCache` gained an address-keyed resolution memo validated by a `Weak<Module>` liveness proof (filled only by `cached_module_blocks`, which takes the callee's shared `Arc<Module>`).
+- Instrumentation (test-only thread-local counters, since removed): `cross/2` resolves **2** module contexts per run, so **2** `cached_module_blocks` calls and **2** `module_fingerprint` calls per run (6000 of each over 3000 runs); every other workload and the interpreter tier: **0**. A memo scoped to one `drive` call would see 2 distinct modules and 0 hits — the driver already dedups a context's blocks for a run (`DriverContext::callees`), so the memo must live in the cache to pay.
+- Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench --no-run`, then `<jit_bench binary> --ignored --nocapture interpreter_versus`, BEFORE/AFTER **interleaved 3x** (same host, same path; loadavg ~1.0 before every run). ns/op baseline-jit min (median): `cross/2` **11100.9 (11170.7) → 6485.5 (6500.6) = 1.71x**, i.e. from *slower than* the interpreter (7594.5) to matching it (6771.2); `sum/1` 4391.4→4373.9, `walk/2` 399.1→400.4, `kernel/2` 513.4→515.5 (all unchanged within noise).
+- Honest caveats: the gain is a driver-round-trip shape, so the native tier can at best **match** the interpreter on `cross/2` (it does); the AFTER binary's *interpreter* tier also reads faster on `kernel/2` (~4719→~3200) although the interpreter never touches `CodeCache` — a binary-level code-layout/TLS effect of the added code, present in every run of each binary and not attributable to this change.
+- This is **not** the `LabelMap` memo DECLINED above: that was rejected because every *sound* key (a full `Function::labels` traversal, or exactly this content fingerprint) costs at least the single-pass build it would replace. Here the fingerprint is not a key to be recomputed — it is already stored once on the per-module compiled artifact, so the hit path is O(1) and never touches the IR.

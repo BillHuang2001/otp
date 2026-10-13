@@ -71,9 +71,16 @@
 //!
 //! # Cache miss vs. cache hit
 //!
-//! Both are O(1) map operations plus the (bounded) fingerprint: a miss inserts; a hit
-//! just returns the stored reference. No unbounded work is added to the run path —
-//! every subsequent run of the same module pays only the key probe.
+//! The authoritative key is `(module name, content fingerprint)` — two same-named but
+//! differently-bodied modules must never collide — and a **miss** derives it by hashing
+//! the module's whole decoded IR, which is far too expensive to repeat: it is paid once
+//! per `cross/2` cross-module transfer in the JIT bench. A **hit** therefore costs one
+//! `usize` probe through the address-keyed [`CodeCache::memo`] (plus the owning map
+//! probe), with no re-hash of the IR and no allocation. The memo is a *hint* only — it
+//! is trusted solely while a `Weak<Module>` proves the module is still alive at that
+//! address, and the key it yields is still verified against the authoritative entry map;
+//! with no memo — or a dead one — the lookup falls back to the content hash. No
+//! unbounded work is added to the run path.
 //!
 //! # Two artifact layouts (eager / lazy)
 //!
@@ -94,6 +101,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::{Arc, Weak};
 
 use beam_common::Result;
 use beam_loader::{Atom, Label, Module};
@@ -103,6 +111,21 @@ use crate::context::ExecutionContext;
 use crate::jit::baseline::{self, CompiledModule};
 use crate::jit::CodeRegion;
 use crate::machine::{Machine, RunOutcome};
+
+// Test-only count of `module_fingerprint` invocations **on this thread**.
+//
+// Pins the O(1)-hit contract: a cached lookup must not re-hash the IR. Compiled only
+// for the crate's own unit tests, so it costs nothing in a production build.
+#[cfg(test)]
+thread_local! {
+    static FINGERPRINT_CALLS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+/// Test-only: how many times [`module_fingerprint`] has run on this thread.
+#[cfg(test)]
+pub(crate) fn fingerprint_calls() -> u64 {
+    FINGERPRINT_CALLS.with(|calls| calls.get())
+}
 
 /// A `fmt::Write` sink that feeds every written byte into a [`Hasher`].
 ///
@@ -133,6 +156,8 @@ impl<H: Hasher> std::fmt::Write for HashWriter<'_, H> {
 /// through [`HashWriter`]. `LiteralArea`'s own `Debug` is content-blind (it prints only
 /// counts), so the decoded literal words are hashed directly.
 pub fn module_fingerprint(module: &Module) -> u64 {
+    #[cfg(test)]
+    FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut hasher = DefaultHasher::new();
 
     // The module name as a string (not the per-module atom index).
@@ -192,13 +217,31 @@ struct ModuleKey {
 impl ModuleKey {
     /// The key of `module`.
     fn of(module: &Module) -> ModuleKey {
+        ModuleKey::with_fingerprint(module, module_fingerprint(module))
+    }
+
+    /// The key of `module` whose content fingerprint is **already known**.
+    ///
+    /// Identical to [`ModuleKey::of`] except that it does not hash the IR — used when the
+    /// fingerprint comes from the compiled artifact that carries it
+    /// ([`CompiledModule::fingerprint`]).
+    fn with_fingerprint(module: &Module, fingerprint: u64) -> ModuleKey {
         ModuleKey {
             // An unnamed module (no interned name) keys on the empty string; the
             // fingerprint still distinguishes it from any named module.
             name: module.atom_name(module.name).unwrap_or_default().to_owned(),
-            fingerprint: module_fingerprint(module),
+            fingerprint,
         }
     }
+}
+
+/// The address of `module`, the [`CodeCache`]'s resolution-memo key.
+///
+/// [`Arc::as_ptr`] and a plain `&Module` yield the same address for the same live module
+/// (an `Arc`'s payload *is* the `Module`), so a memo entry recorded from an
+/// `Arc<Module>` is found when the driver later hands the entry module as a `&Module`.
+fn module_address(module: &Module) -> usize {
+    module as *const Module as usize
 }
 
 /// A cache of compiled baseline-JIT artifacts, keyed by [`ModuleKey`].
@@ -220,8 +263,37 @@ pub struct CodeCache {
     /// driver needs exactly that: a cross-module callee's blocks stay mapped and unmoved
     /// while the driver runs in another module and may touch the cache again.
     entries: HashMap<ModuleKey, Rc<CompiledModule>>,
+    /// An **address-keyed resolution memo**: a module's address → the key it was last
+    /// resolved under, so a repeat lookup costs one `HashMap` probe on a `usize` instead
+    /// of a full re-hash of the module's decoded IR.
+    ///
+    /// # Soundness
+    ///
+    /// A pointer key is only trustworthy while the pointed-to `Module` is provably
+    /// alive, so every entry carries a [`Weak`] to the module it was created from and is
+    /// **only** honoured while [`Weak::upgrade`] succeeds. That proves the module is
+    /// still allocated *at that address* (a live `Module` cannot move out of its `Arc`,
+    /// and no other object can occupy the address while it lives), so a hit can never
+    /// name a different module — the failure mode a bare pointer key would have after a
+    /// module is dropped and its address recycled. When the module does die the upgrade
+    /// fails, the entry is ignored, and the lookup falls back to the honest content hash.
+    ///
+    /// The memo is therefore a *hint*: it never decides identity on its own — a hit still
+    /// has to find the [`ModuleKey`] in [`CodeCache::entries`], which stays the
+    /// authority. It is filled only where an `Arc<Module>` is available to downgrade
+    /// ([`cached_module_blocks`]).
+    memo: HashMap<usize, MemoEntry>,
     /// How many times a module has actually been compiled (cache misses).
     compiles: u64,
+}
+
+/// One entry of the [`CodeCache`]'s address-keyed resolution memo.
+struct MemoEntry {
+    /// Liveness proof for the address key: the memo entry is honoured only while this
+    /// upgrades (see [`CodeCache::memo`]).
+    module: Weak<Module>,
+    /// The key `module` resolved to, so a hit needs no hashing and no allocation.
+    key: ModuleKey,
 }
 
 impl CodeCache {
@@ -229,6 +301,7 @@ impl CodeCache {
     pub fn new() -> CodeCache {
         CodeCache {
             entries: HashMap::new(),
+            memo: HashMap::new(),
             compiles: 0,
         }
     }
@@ -257,9 +330,10 @@ impl CodeCache {
     }
 
     /// Drop every cached artifact (freeing its executable mapping) and reset the
-    /// compile counter.
+    /// compile counter and the resolution memo.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.memo.clear();
         self.compiles = 0;
     }
 
@@ -302,7 +376,29 @@ impl CodeCache {
     /// across arbitrary other cache access — it stays alive even if the entry is later
     /// cleared. This is what a cross-module caller (the native driver entering a callee's
     /// blocks) needs.
+    ///
+    /// # The lookup is O(1) on a hit
+    ///
+    /// The identity is `(module name, content fingerprint)`, and the fingerprint of a
+    /// [`Module`] is a hash of its whole decoded IR — far too expensive to recompute on
+    /// every call (it is paid per `cross/2` cross-module *transfer* in the JIT bench).
+    /// So a module whose address this cache has already resolved is looked up through the
+    /// address-keyed [`CodeCache::memo`], which yields the key the module resolved to
+    /// last time — sound because the memo only answers while a [`Weak<Module>`] proves
+    /// the module is still alive at that address — and the memoized key is then verified
+    /// against the authoritative [`CodeCache::entries`] map. A memo miss (a first sight
+    /// of this address, a module that has since died, or an entry dropped by
+    /// [`CodeCache::clear`]) falls back to the honest content hash, exactly as before.
     pub(crate) fn compiled_handle(&mut self, module: &Module) -> Result<Rc<CompiledModule>> {
+        // Fast path: the address memo proves the identity of this very module and the
+        // artifact it names is still cached. No hashing, no allocation.
+        if let Some(key) = self.memoized_key(module) {
+            if let Some(existing) = self.entries.get(key) {
+                return Ok(Rc::clone(existing));
+            }
+        }
+        // Slow path: derive the key from the content (the only sound way), then either
+        // reuse the artifact of an identically-loaded copy or stage a fresh lazy one.
         let key = ModuleKey::of(module);
         if let Some(existing) = self.entries.get(&key) {
             return Ok(Rc::clone(existing));
@@ -312,6 +408,48 @@ impl CodeCache {
         let handle = Rc::new(compiled);
         self.entries.insert(key, Rc::clone(&handle));
         Ok(handle)
+    }
+
+    /// The key `module` is memoized under, **iff** the memo proves it belongs to this
+    /// module (see [`CodeCache::memo`]).
+    ///
+    /// A `None` here is not an error: it means "ask the content" — the caller falls back
+    /// to [`ModuleKey::of`].
+    fn memoized_key(&self, module: &Module) -> Option<&ModuleKey> {
+        let entry = self.memo.get(&module_address(module))?;
+        // A live module cannot have been replaced at this address, so `upgrade`
+        // succeeding is exactly the proof the pointer key needs; the upgraded `Arc` is
+        // dropped immediately (the entry holds only a `Weak`).
+        entry.module.upgrade().is_some().then_some(&entry.key)
+    }
+
+    /// Memoize `module`'s identity under its address (see [`CodeCache::memo`]).
+    ///
+    /// Only possible with an `Arc<Module>` (the [`Weak`] liveness proof needs one), which
+    /// is why the memo is filled from [`cached_module_blocks`] — the cross-module
+    /// resolution path, where the driver hands the callee's shared `Arc` — rather than
+    /// from the `&Module`-only entries. The key reuses the artifact's own stored
+    /// fingerprint, so memoizing never re-hashes the IR.
+    ///
+    /// Recording is a no-op (and allocates nothing) when the address is **already**
+    /// memoized for a live module: a live module cannot be replaced at its address, so
+    /// that entry already names this very module. It is called on every
+    /// [`cached_module_blocks`] lookup — hit or miss — so the hot path must stay cheap.
+    fn remember(&mut self, module: &Arc<Module>, compiled: &CompiledModule) {
+        let address = module_address(module);
+        if let Some(entry) = self.memo.get(&address) {
+            if entry.module.upgrade().is_some() {
+                return;
+            }
+        }
+        let key = ModuleKey::with_fingerprint(module, compiled.fingerprint());
+        self.memo.insert(
+            address,
+            MemoEntry {
+                module: Arc::downgrade(module),
+                key,
+            },
+        );
     }
 
     /// Run exported `function/arity` against `module`'s cached artifact; yields `x(0)`.
@@ -451,15 +589,25 @@ pub(crate) fn run_baseline_cached(
 /// and an owned handle is returned so the driver holds the code across its own
 /// `&mut Machine` calls.
 ///
+/// Takes the callee's **shared** `Arc<Module>` (the driver holds it for the whole call
+/// via its `CalleeCode`, and [`Machine::contexts`](crate::Machine) keeps it alive while
+/// any suspended frame can return into it) rather than a bare `&Module`. That lets the
+/// cache **memoize** the module's identity under its address
+/// ([`CodeCache::remember`]) — a `Weak` derived from this `Arc` is the liveness proof
+/// the address key needs — so a repeated cross-module resolution is an O(1) probe
+/// instead of a full re-hash of the module's decoded IR.
+///
 /// `None` means "no native blocks available here": the cache is genuinely re-entrant
 /// (its `RefCell` is already borrowed, e.g. a driver reached through another cached
 /// entry). The driver then runs that module on its per-instruction interpreter step,
 /// exactly as it does an address its entry artifact did not compile, so the run stays
 /// interpreter-identical.
-pub(crate) fn cached_module_blocks(module: &Module) -> Option<Rc<CompiledModule>> {
+pub(crate) fn cached_module_blocks(module: &Arc<Module>) -> Option<Rc<CompiledModule>> {
     CODE_CACHE.with(|cell| {
         let mut cache = cell.try_borrow_mut().ok()?;
-        cache.compiled_handle(module).ok()
+        let handle = cache.compiled_handle(module).ok()?;
+        cache.remember(module, &handle);
+        Some(handle)
     })
 }
 
@@ -713,5 +861,97 @@ mod tests {
         cache.clear();
         assert!(cache.is_empty());
         assert_eq!(cache.compiles(), 0);
+    }
+
+    #[test]
+    fn the_artifact_records_the_modules_content_fingerprint() {
+        let module = slice_module();
+        let mut cache = CodeCache::new();
+        // `compiled_handle` stages a lazy artifact; it must carry the module's content
+        // fingerprint so a memoized resolution can rebuild the key without re-hashing.
+        let compiled = cache.compiled_handle(&module).expect("stage the artifact");
+        assert_eq!(compiled.fingerprint(), module_fingerprint(&module));
+    }
+
+    #[test]
+    fn a_memoized_lookup_does_not_rehash_the_ir() {
+        let module = Arc::new(slice_module());
+        let mut cache = CodeCache::new();
+
+        // First resolution: the key is derived from the content (one hash) and the memo
+        // is filled under the module's address — exactly what `cached_module_blocks`
+        // does on the cross-module path.
+        let first = cache.compiled_handle(&module).expect("stage the artifact");
+        cache.remember(&module, &first);
+        assert_eq!(cache.compiles(), 1);
+        assert_eq!(cache.len(), 1);
+
+        // A second lookup is an O(1) memo hit: the same artifact, no re-hash, no compile.
+        let before = fingerprint_calls();
+        let second = cache.compiled_handle(&module).expect("memoized hit");
+        assert_eq!(
+            fingerprint_calls(),
+            before,
+            "a memoized hit must not re-hash the module's IR"
+        );
+        assert!(Rc::ptr_eq(&first, &second), "a hit returns the same artifact");
+        assert_eq!(cache.compiles(), 1, "a hit must not recompile");
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn a_dead_memo_entry_is_ignored_and_falls_back_to_the_content_hash() {
+        let mut cache = CodeCache::new();
+        // Resolve a module and memoize it under its address, then **drop** it: the memo
+        // entry now outlives its module, so it must never be trusted again.
+        let first = {
+            let module = Arc::new(slice_module());
+            let handle = cache.compiled_handle(&module).expect("stage the artifact");
+            cache.remember(&module, &handle);
+            handle
+        };
+
+        // A separately loaded copy of the same content: its address may or may not reuse
+        // the dead module's, but either way the lookup must fall back to the content hash
+        // and land on the identical-content entry (never a stale pointer-keyed guess).
+        let fresh = slice_module();
+        let before = fingerprint_calls();
+        let second = cache.compiled_handle(&fresh).expect("content lookup");
+        assert_eq!(
+            fingerprint_calls(),
+            before + 1,
+            "a dead memo entry must fall back to the honest content hash"
+        );
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "identical content resolves to the same artifact"
+        );
+        assert_eq!(cache.compiles(), 1, "the content hit must not recompile");
+        assert_eq!(cache.len(), 1, "no stale pointer key may add a second entry");
+    }
+
+    #[test]
+    fn cached_module_blocks_reuses_the_memo_across_resolutions() {
+        // The real cross-module path (the thread-local cache the native driver consults).
+        clear_baseline_cache();
+        let module = Arc::new(slice_module());
+
+        // First resolution: one content hash, then the memo is filled.
+        let first = cached_module_blocks(&module).expect("stage the callee's blocks");
+        let hashes_after_first = fingerprint_calls();
+
+        // Repeated resolutions are O(1): the same artifact, no re-hash.
+        for _ in 0..3 {
+            let again = cached_module_blocks(&module).expect("memoized resolution");
+            assert!(Rc::ptr_eq(&first, &again), "a hit returns the same artifact");
+        }
+        assert_eq!(
+            fingerprint_calls(),
+            hashes_after_first,
+            "repeated cross-module resolutions must not re-hash the IR"
+        );
+        assert_eq!(baseline_compile_count(), 1, "the module is staged once");
+
+        clear_baseline_cache();
     }
 }

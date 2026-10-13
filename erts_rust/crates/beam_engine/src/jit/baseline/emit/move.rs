@@ -18,19 +18,141 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's inline `move`/`swap`: shuffling an x-register value between its
-//! machine register (when the allocator caches it) and its `machine.x` slot.
+//! The baseline JIT's inline `move`/`swap`: shuffling a value between an x-register
+//! (its machine register when the allocator caches it, else its `machine.x` slot), a
+//! `Y` slot behind the shared frame-window guard, or an immediate constant.
 
 use beam_common::Result;
 use beam_loader::Operand;
 
-use crate::jit::emitter::{CodeBuffer, Reg};
+use crate::jit::emitter::{CodeBuffer, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
-use super::operands::{constant_word, x_offset, x_register};
-use super::{touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
+use super::operands::{
+    constant_word, emit_guarded_y_load, emit_guarded_y_store, x_offset, x_register, y_addressable,
+    y_register,
+};
+use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
-/// Where a `move`'s source value comes from.
+/// The third caller-saved scratch a Y-operand `move` needs.
+///
+/// The guarded Y address computation holds the slot address **and** the window bound at
+/// once, and a Y-destination store holds the value being transferred as well: three
+/// registers. Two are [`MOVE_SCRATCH`]/[`MOVE_SCRATCH_2`]; this is the third. It is
+/// used strictly *within* one instruction's lowering — no value survives into the next
+/// instruction, and no helper call happens in between — so any caller-saved register
+/// works; this one is neither a cache register ([`super::CACHE_REGISTERS`]) nor the
+/// block's reserved `rbx` (the `machine.x` base) / `rsp` (the `rt` slot).
+const Y_SCRATCH: Reg = Reg::R9;
+
+/// Where a `move`'s source value comes from, syntactically.
+#[derive(Clone, Copy)]
+enum MoveValue {
+    /// An x-register inside the engine's [`MAX_REGISTER`] bound.
+    X(u32),
+    /// A `Y` slot the emitted `disp32` can address, read through the guarded
+    /// current-frame window.
+    Y(u32),
+    /// A constant operand, materialised as its raw `Eterm` word.
+    Constant(i64),
+}
+
+/// Where a `move`'s value is written, syntactically.
+#[derive(Clone, Copy)]
+enum MoveDest {
+    /// An x-register inside the engine's [`MAX_REGISTER`] bound.
+    X(u32),
+    /// An addressable `Y` slot, written through the guarded current-frame window.
+    Y(u32),
+}
+
+/// The inlinable shape of a `move`, or `None` when the whole instruction must stay on
+/// the helper.
+///
+/// Purely syntactic (it never consults the register allocation, so
+/// [`super::regalloc::allocate_registers`] and [`super::emit_block`] agree on which
+/// moves are lowered): the destination must be an in-bound x-register or an
+/// addressable `Y` slot, and the source an in-bound x-register, an addressable `Y`
+/// slot, or a constant word. A destination or source outside that subset (`fr`, a
+/// literal, an x-register past [`MAX_REGISTER`], an un-addressable `Y` index) is the
+/// documented deopt — the helper reports the interpreter's exact result, including its
+/// faithful `bad_register` error.
+pub(crate) struct MoveShape {
+    /// The source value's location.
+    source: MoveValue,
+    /// The destination's location.
+    destination: MoveDest,
+}
+
+impl MoveShape {
+    /// The x-register indices the shape's native lowering touches, in emission order
+    /// (the source first, then the destination).
+    ///
+    /// A `Y` slot is **not** an x-register, so it is never charged: raising the
+    /// x-register bound the driver's entry guard reads for a stack slot would wrongly
+    /// refuse native entry.
+    pub(crate) fn registers(&self) -> Vec<u32> {
+        let mut registers = Vec::with_capacity(2);
+        if let MoveValue::X(x) = self.source {
+            registers.push(x);
+        }
+        if let MoveDest::X(x) = self.destination {
+            registers.push(x);
+        }
+        registers
+    }
+
+    /// Whether the lowered sequence reads the current frame's Y window.
+    ///
+    /// A `Y` source or a `Y` destination is read/written through
+    /// `JitRuntime::y_base`/`y_end`, so the emitted code needs the window published.
+    /// This is the gate [`super::arith::uses_y`] consults for a `move` (see that
+    /// function for why the two must agree exactly).
+    pub(crate) fn uses_y(&self) -> bool {
+        matches!(self.source, MoveValue::Y(_)) || matches!(self.destination, MoveDest::Y(_))
+    }
+}
+
+/// The inlinable shape of a `move`, or `None` when the whole instruction must stay on
+/// the helper (see [`MoveShape`]).
+pub(crate) fn move_shape(src: &Operand, dst: &Operand) -> Option<MoveShape> {
+    let destination = if let Some(x) = x_register(dst) {
+        if x >= MAX_REGISTER {
+            // `machine.x` is at most `MAX_REGISTER` long, so addressing `x` directly
+            // would be out of bounds; the helper reports the faithful `bad_register`.
+            return None;
+        }
+        MoveDest::X(x)
+    } else if let Some(k) = y_register(dst) {
+        if !y_addressable(k) {
+            return None;
+        }
+        MoveDest::Y(k)
+    } else {
+        return None;
+    };
+
+    let source = if let Some(x) = x_register(src) {
+        if x >= MAX_REGISTER {
+            return None;
+        }
+        MoveValue::X(x)
+    } else if let Some(k) = y_register(src) {
+        if !y_addressable(k) {
+            return None;
+        }
+        MoveValue::Y(k)
+    } else {
+        MoveValue::Constant(constant_word(src)?)
+    };
+
+    Some(MoveShape {
+        source,
+        destination,
+    })
+}
+
+/// Where an x-only `move`'s source value comes from.
 enum MoveSource {
     /// An x-register the block holds in a machine register.
     Cached(Reg),
@@ -44,48 +166,66 @@ enum MoveSource {
 
 /// Emit `move Src Dst` natively, or report that the block must helper it.
 ///
-/// Returns `true` when the move was emitted. **Any** destination that names an
-/// x-register inside the engine's [`MAX_REGISTER`] bound is inlined, whether or not
-/// the register allocator could cache it:
+/// Returns `true` when the move was emitted. The inlinable shapes are those of
+/// [`move_shape`]:
 ///
-/// * a **cached** destination is written in its machine register;
-/// * a destination **beyond the cache budget** is written straight into `machine.x`
-///   (`mov [rbx + dst*8], …`) — the very slot [`super::spill`] would have written, so the
-///   tier's liveness model is unchanged (cached values live in registers *within* a
-///   block and are always back in `machine.x` at a block boundary).
+/// * an **x-only** move (a source and a destination that both name x-registers or a
+///   constant) is emitted as the direct register/`machine.x` shuffle it always was —
+///   `mov` between the two representations, with no run-time guard;
+/// * a move whose **source and/or destination is an addressable `Y` slot** is emitted
+///   behind the shared frame-window guard ([`emit_guarded_y_load`] /
+///   [`emit_guarded_y_store`]), mirroring the arithmetic fast path: the emitted code
+///   computes the slot address, compares it against `y_end`, and branches to the
+///   `jit_step_one` fallback when the slot lies outside the current frame — so an
+///   in-frame `Y` move runs natively and a malformed frame keeps the interpreter's exact
+///   error. Nothing is committed before a guard can reject, so a rejected guard leaves
+///   the machine exactly as the interpreter will re-run it.
 ///
-/// The source is read from its cached register, from its `machine.x` slot, or from
-/// a constant word. A `move` with a Y destination (or any other operand shape), or
-/// one naming an x-register no machine can hold, still deopts to the helper — which
-/// reports the interpreter's exact result (including its faithful `bad_register`
-/// error).
+/// A destination that is neither an in-bound x-register nor an addressable `Y` slot, a
+/// source that is none of the three, or an operand index past its bound, still deopts
+/// to the helper — which reports the interpreter's exact result (including its faithful
+/// `bad_register` error).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn try_inline_move(
     buffer: &mut CodeBuffer,
     src: &Operand,
     dst: &Operand,
     allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
     highest_touched: &mut Option<u32>,
 ) -> Result<bool> {
-    let Some(dst_x) = x_register(dst) else {
+    let Some(shape) = move_shape(src, dst) else {
         return Ok(false);
     };
-    if dst_x >= MAX_REGISTER {
-        // `machine.x` is at most `MAX_REGISTER` long, so addressing `dst_x` directly
-        // would be out of bounds; the helper reports the faithful `bad_register`.
-        return Ok(false);
+
+    if shape.uses_y() {
+        emit_move_y(
+            buffer,
+            &shape,
+            allocation,
+            done,
+            func,
+            pc,
+            highest_touched,
+        )?;
+        return Ok(true);
     }
-    let source = match x_register(src) {
-        Some(src_x) if src_x < MAX_REGISTER => match allocation.slot(src_x) {
+
+    // X-only: the direct shuffle. `uses_y()` is false, so the destination is an
+    // x-register and the source an x-register or a constant; anything else (which the
+    // shape cannot produce) refuses the lowering rather than fabricating a store.
+    let MoveDest::X(dst_x) = shape.destination else {
+        return Ok(false);
+    };
+    let source = match shape.source {
+        MoveValue::X(src_x) => match allocation.slot(src_x) {
             Some(reg) => MoveSource::Cached(reg),
             None => MoveSource::Memory(src_x),
         },
-        // A register index outside the engine's bound (same rule as the
-        // destination): the interpreter step reports the exact error.
-        Some(_) => return Ok(false),
-        None => match constant_word(src) {
-            Some(word) => MoveSource::Constant(word),
-            None => return Ok(false),
-        },
+        MoveValue::Constant(word) => MoveSource::Constant(word),
+        MoveValue::Y(_) => return Ok(false),
     };
 
     match (allocation.slot(dst_x), source) {
@@ -112,6 +252,83 @@ pub(super) fn try_inline_move(
     }
     touch(highest_touched, dst_x);
     Ok(true)
+}
+
+/// Lower a `move` whose source and/or destination is an addressable `Y` slot (see
+/// [`try_inline_move`]). The emitted shape:
+///
+/// ```text
+///   <load the source into MOVE_SCRATCH>
+///     ; an x-register: its cache register, or `mov MOVE_SCRATCH, [rbx + x*8]`
+///     ; a constant:    `movabs MOVE_SCRATCH, word`
+///     ; a Y slot:      the guarded Y read (Y_SCRATCH holds `y_end`)
+///   <store MOVE_SCRATCH into the destination>
+///     ; an x-register: its cache register, or `mov [rbx + x*8], MOVE_SCRATCH`
+///     ; a Y slot:      the guarded Y store (MOVE_SCRATCH_2 = the slot address,
+///     ;                Y_SCRATCH = `y_end`, MOVE_SCRATCH = the value)
+///   jmp  fast_done
+/// fallback:
+///   <the `emit_step_and_continue` sequence: spend one `jit_step_one` on the
+///    instruction — which either advances and lets the block carry on at
+///    `pc + 1`, or exits to the driver with the helper's word>
+/// fast_done:
+///   <emit the rest of the block>
+/// ```
+///
+/// Both Y guards reject to the **same** `fallback`, and neither is reached after any
+/// state has been committed: the source is read into a scratch and the destination is
+/// written once, so a rejected guard (an out-of-frame slot, or no live frame) leaves
+/// the machine exactly as it was — the interpreter then re-runs the whole instruction.
+/// A Y slot is never charged to `highest_touched` (it is not an x-register); the
+/// x-register operands are, exactly as [`MoveShape::registers`] lists them.
+#[allow(clippy::too_many_arguments)]
+fn emit_move_y(
+    buffer: &mut CodeBuffer,
+    shape: &MoveShape,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    let fallback: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+
+    // The source into the value scratch. A Y source carries its own frame-window
+    // guard, whose rejection jumps to `fallback` before anything is written.
+    match shape.source {
+        MoveValue::X(src_x) => match allocation.slot(src_x) {
+            Some(reg) => buffer.mov_rr(MOVE_SCRATCH, reg)?,
+            None => {
+                buffer.mov_rm(MOVE_SCRATCH, Reg::Rbx, x_offset(src_x))?;
+                touch(highest_touched, src_x);
+            }
+        },
+        MoveValue::Y(k) => emit_guarded_y_load(buffer, MOVE_SCRATCH, Y_SCRATCH, k, fallback)?,
+        MoveValue::Constant(word) => buffer.mov_ri(MOVE_SCRATCH, word)?,
+    }
+
+    // The destination, from the value scratch. A Y destination carries the same
+    // guard; a rejection still commits nothing (the value lives only in a scratch).
+    match shape.destination {
+        MoveDest::X(dst_x) => match allocation.slot(dst_x) {
+            Some(reg) => buffer.mov_rr(reg, MOVE_SCRATCH)?,
+            None => {
+                buffer.mov_mr(Reg::Rbx, x_offset(dst_x), MOVE_SCRATCH)?;
+                touch(highest_touched, dst_x);
+            }
+        },
+        MoveDest::Y(k) => {
+            emit_guarded_y_store(buffer, MOVE_SCRATCH, MOVE_SCRATCH_2, Y_SCRATCH, k, fallback)?
+        }
+    }
+    buffer.jmp(fast_done)?;
+
+    // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
+    Ok(())
 }
 
 /// Emit `swap A B` natively, or report that the block must helper it.
