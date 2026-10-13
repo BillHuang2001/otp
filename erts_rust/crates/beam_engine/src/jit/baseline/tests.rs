@@ -31,7 +31,6 @@
 use super::emit::*;
 use super::runtime::{
     EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP,
-    RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP,
 };
 use super::*;
 use crate::jit::emitter::Reg;
@@ -81,8 +80,6 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
     let rt = JitRuntime {
         machine: &mut machine,
         x_regs: machine.x.as_mut_ptr(),
-        y_base: std::ptr::null_mut(),
-        y_end: std::ptr::null_mut(),
         module: &module,
         labels: &labels,
         ctx: &mut ctx,
@@ -92,12 +89,8 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
     let x_regs_field = &rt.x_regs as *const *mut Eterm as usize;
-    let y_base_field = &rt.y_base as *const *mut Eterm as usize;
-    let y_end_field = &rt.y_end as *const *mut Eterm as usize;
     assert_eq!(machine_field - base, RUNTIME_MACHINE_DISP as usize);
     assert_eq!(x_regs_field - base, RUNTIME_XREGS_DISP as usize);
-    assert_eq!(y_base_field - base, RUNTIME_YBASE_DISP as usize);
-    assert_eq!(y_end_field - base, RUNTIME_YEND_DISP as usize);
     assert_eq!(RUNTIME_SLOT_DISP, 0);
 }
 
@@ -303,27 +296,13 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
             "import {index}"
         );
     }
-    // A Y destination and a Y operand now lower too (behind the frame-window guard):
-    // the guard rejects an out-of-frame slot at run time, so the shape itself is
-    // accepted at compile time.
+    // Shapes the fast path refuses: a Y destination, a Y operand, a non-small
+    // constant operand, a wrong argument count, an out-of-bound register.
     let plus = refs[0];
-    let y_dst = gc_bif(plus, args.clone(), Operand::Y(0));
-    assert_eq!(
-        fast_arith(&module, &y_dst).map(|fast| fast.dst),
-        Some(FastDest::Y(0)),
-        "a Y destination lowers"
-    );
-    let y_operand = gc_bif(plus, vec![Operand::X(0), Operand::Y(1)], Operand::X(0));
-    assert!(
-        fast_arith(&module, &y_operand).is_some(),
-        "a Y operand lowers"
-    );
-
-    // Shapes the fast path still refuses: a non-small constant operand, a wrong
-    // argument count, an out-of-bound x-register, and a Y index so large its offset
-    // would overflow the emitted `disp32` (the interpreter runs those).
     let atom = module.name;
     for instr in [
+        gc_bif(plus, args.clone(), Operand::Y(0)),
+        gc_bif(plus, vec![Operand::X(0), Operand::Y(1)], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0), Operand::Atom(atom)], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0), Operand::Nil], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0)], Operand::X(0)),
@@ -333,8 +312,6 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
             Operand::X(0),
         ),
         gc_bif(plus, args.clone(), Operand::X(MAX_REGISTER)),
-        gc_bif(plus, args.clone(), Operand::Y(u32::MAX)),
-        gc_bif(plus, vec![Operand::Y(u32::MAX), Operand::X(0)], Operand::X(0)),
     ] {
         assert!(fast_arith(&module, &instr).is_none(), "{instr:?}");
     }
@@ -1787,8 +1764,6 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
     let mut rt = JitRuntime {
         machine: &mut machine,
         x_regs: machine.x.as_mut_ptr(),
-        y_base: std::ptr::null_mut(),
-        y_end: std::ptr::null_mut(),
         module: &module,
         labels: &labels,
         ctx: &mut ctx,
@@ -2179,8 +2154,6 @@ fn run_ext_call(
     let mut rt = JitRuntime {
         machine: &mut machine,
         x_regs,
-        y_base: std::ptr::null_mut(),
-        y_end: std::ptr::null_mut(),
         module: caller,
         labels: &labels,
         ctx: &mut ctx,
@@ -2547,324 +2520,4 @@ fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
          as an eager one (the driver rebuilds nothing, and the lazy artifact's map is \
          the one built at creation)"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Y-slot arithmetic: the frame-window refresh across a frame change
-// ---------------------------------------------------------------------------
-
-/// `f/1`'s body in the Y-slot arithmetic shape the loader emits for a clause whose
-/// `gc_bif '+'/2` reads a Y operand and writes a Y destination:
-/// `Allocate{2}` · `Move X(0)->Y(0)` · `GcBif '+'/2 [Y(0),X(0)] -> Y(1)` ·
-/// `Move Y(1)->X(0)` · `Deallocate 2` · `Return`.
-fn y_slot_arith_module(name: &str) -> (Module, Atom) {
-    let code = vec![
-        Instr::Label(Label(1)),
-        Instr::Label(Label(2)),
-        Instr::Allocate {
-            stack_need: beam_loader::HeapNeed::Words(2),
-            live: 2,
-        },
-        Instr::Move {
-            src: Operand::X(0),
-            dst: Operand::Y(0),
-        },
-        gc_bif(
-            ImportRef(0),
-            vec![Operand::Y(0), Operand::X(0)],
-            Operand::Y(1),
-        ),
-        Instr::Move {
-            src: Operand::Y(1),
-            dst: Operand::X(0),
-        },
-        Instr::Deallocate(2),
-        Instr::Return,
-    ];
-    let module = build_module(
-        name,
-        &[("erlang", "+", 2)],
-        vec![("f", 1, code)],
-        &[("f", 1, Label(2))],
-    );
-    let atom = export_atom(&module, "f");
-    (module, atom)
-}
-
-/// The `GcBif` instruction of [`y_slot_arith_module`], as the compile-time lowerer
-/// sees it (`fast_arith` takes the instruction, not a code index).
-fn y_slot_arith_instr() -> Instr {
-    gc_bif(
-        ImportRef(0),
-        vec![Operand::Y(0), Operand::X(0)],
-        Operand::Y(1),
-    )
-}
-
-/// Run exported `name/1` with one small-int argument on both tiers and hand the two
-/// outcomes to `check`.
-///
-/// The unary twin of `with_both_tiers` (that one hard-codes arity 0): each run builds
-/// its boxed terms on its **own** [`MinimalContext`] heap, so the comparison has to
-/// happen *inside* this call — returning the outcomes and comparing them after the
-/// contexts were dropped would dereference freed memory.
-fn with_both_tiers_unary<R>(
-    module: &Module,
-    name: Atom,
-    arg: i64,
-    check: impl FnOnce(&Result<RunOutcome>, &Result<RunOutcome>) -> R,
-) -> R {
-    let mut interpreter = Machine::new();
-    let mut interpreter_ctx = AddCtx::new();
-    let interpreter_outcome = interpreter.run_export_outcome_with_tier(
-        module,
-        name,
-        1,
-        &[make_small(arg)],
-        &mut interpreter_ctx,
-        Tier::Interpreter,
-    );
-    let mut baseline = Machine::new();
-    let mut baseline_ctx = AddCtx::new();
-    let baseline_outcome = baseline.run_export_outcome_with_tier(
-        module,
-        name,
-        1,
-        &[make_small(arg)],
-        &mut baseline_ctx,
-        Tier::BaselineJit,
-    );
-    check(&interpreter_outcome, &baseline_outcome)
-}
-
-/// TAKE 2 (a): the Y-operand / Y-destination `gc_bif '+'/2` shape both **lowers**
-/// (proving the compile-time fast path still claims it behind its frame-window guard)
-/// and **executes identically** on the baseline tier and the interpreter.
-#[test]
-fn a_y_slot_arith_shape_lowers_and_agrees_across_tiers() {
-    let (module, name) = y_slot_arith_module("yslot_eq");
-    assert!(
-        fast_arith(&module, &y_slot_arith_instr()).is_some(),
-        "a Y-operand / Y-destination small-int '+'/2 must lower at compile time"
-    );
-    with_both_tiers_unary(&module, name, 10, |interpreter, baseline| {
-        assert_same_outcome("y-slot arith", interpreter, baseline, &module.atom_table);
-        match (interpreter, baseline) {
-            (Ok(RunOutcome::Returned(value)), _) => {
-                assert_eq!(*value, make_small(20), "10 + 10");
-            }
-            other => panic!("the y-slot arithmetic did not return: {other:?}"),
-        }
-    });
-}
-
-/// TAKE 1.3: the published Y window must be **refreshed across a frame change**.
-///
-/// `f/1` pushes a 2-slot frame, poisons its own Y window (`Y(0) = 555`, `Y(1) = 1000`)
-/// and then makes a local `Call` to a region that pushes **its own** 2-slot frame and
-/// runs `'+'(Y(0), 7) -> Y(1)` there. If the callee's block read the caller's stale
-/// window it would compute `555 + 7 = 562` (and write into the caller's Y(1)); the
-/// correct answer is `10 + 7 = 17`. The test therefore exercises the refresh the
-/// function-scoped `Allocate` forces, on both tiers.
-#[test]
-fn a_y_slot_read_after_a_frame_change_sees_the_new_frame() {
-    let code = vec![
-        Instr::Label(Label(1)),
-        Instr::Label(Label(2)),
-        Instr::Allocate {
-            stack_need: beam_loader::HeapNeed::Words(2),
-            live: 1,
-        },
-        Instr::Move {
-            src: Operand::X(0),
-            dst: Operand::Y(0),
-        },
-        Instr::Move {
-            src: Operand::Y(0),
-            dst: Operand::X(0),
-        },
-        // Poison the caller frame's own Y window, so a stale window read by the
-        // callee is observably wrong rather than accidentally equal.
-        Instr::Move {
-            src: Operand::Integer(555),
-            dst: Operand::Y(0),
-        },
-        Instr::Move {
-            src: Operand::Integer(1000),
-            dst: Operand::Y(1),
-        },
-        Instr::Call {
-            arity: 1,
-            target: Label(3),
-        },
-        Instr::Move {
-            src: Operand::X(0),
-            dst: Operand::Y(1),
-        },
-        Instr::Move {
-            src: Operand::Y(1),
-            dst: Operand::X(0),
-        },
-        Instr::Deallocate(2),
-        Instr::Return,
-        // The callee region (a forward local `Call` target inside the same function,
-        // exactly how the loader decomposes a non-tail-recursive clause).
-        Instr::Label(Label(3)),
-        Instr::Allocate {
-            stack_need: beam_loader::HeapNeed::Words(2),
-            live: 1,
-        },
-        Instr::Move {
-            src: Operand::X(0),
-            dst: Operand::Y(0),
-        },
-        gc_bif(
-            ImportRef(0),
-            vec![Operand::Y(0), Operand::Integer(7)],
-            Operand::Y(1),
-        ),
-        Instr::Move {
-            src: Operand::Y(1),
-            dst: Operand::X(0),
-        },
-        Instr::Deallocate(2),
-        Instr::Return,
-    ];
-    let module = build_module(
-        "yslot_frame",
-        &[("erlang", "+", 2)],
-        vec![("f", 1, code)],
-        &[("f", 1, Label(2))],
-    );
-    let name = export_atom(&module, "f");
-    assert!(
-        fast_arith(
-            &module,
-            &gc_bif(
-                ImportRef(0),
-                vec![Operand::Y(0), Operand::Integer(7)],
-                Operand::Y(1)
-            )
-        )
-        .is_some(),
-        "the callee's Y-slot '+'/2 must lower too"
-    );
-    with_both_tiers_unary(&module, name, 10, |interpreter, baseline| {
-        assert_same_outcome("y-slot frame change", interpreter, baseline, &module.atom_table);
-        match (interpreter, baseline) {
-            (Ok(RunOutcome::Returned(value)), _) => assert_eq!(
-                *value,
-                make_small(17),
-                "the callee must read its own frame (10 + 7), never the caller's poisoned window"
-            ),
-            other => panic!("the frame-change arithmetic did not return: {other:?}"),
-        }
-    });
-}
-
-/// TAKE 2 (b): an out-of-frame Y slot is rejected identically by both tiers.
-///
-/// The instruction names `Y(1)` inside a frame that allocated exactly **one** Y slot.
-/// The emitted guard only ever *rejects* (branching to `jit_step_one`), so the
-/// interpreter's own judgement of the malformed frame — a typed error, never a wrong
-/// value and never a panic — has to surface on the baseline tier unchanged.
-#[test]
-fn an_out_of_frame_y_slot_is_rejected_identically_on_both_tiers() {
-    let code = vec![
-        Instr::Label(Label(1)),
-        Instr::Label(Label(2)),
-        Instr::Allocate {
-            stack_need: beam_loader::HeapNeed::Words(1),
-            live: 1,
-        },
-        Instr::Move {
-            src: Operand::X(0),
-            dst: Operand::Y(0),
-        },
-        gc_bif(
-            ImportRef(0),
-            vec![Operand::Y(0), Operand::X(0)],
-            Operand::Y(1),
-        ),
-        Instr::Move {
-            src: Operand::Y(1),
-            dst: Operand::X(0),
-        },
-        Instr::Deallocate(1),
-        Instr::Return,
-    ];
-    let module = build_module(
-        "yslot_bad",
-        &[("erlang", "+", 2)],
-        vec![("f", 1, code)],
-        &[("f", 1, Label(2))],
-    );
-    let name = export_atom(&module, "f");
-    assert!(
-        fast_arith(&module, &y_slot_arith_instr()).is_some(),
-        "the shape still lowers; the frame window is a run-time guard"
-    );
-    with_both_tiers_unary(&module, name, 10, |interpreter, baseline| {
-        assert!(
-            interpreter.is_err(),
-            "the interpreter must reject an out-of-frame Y slot: {interpreter:?}"
-        );
-        assert!(
-            baseline.is_err(),
-            "the baseline tier must reject an out-of-frame Y slot: {baseline:?}"
-        );
-        assert_same_outcome(
-            "out-of-frame Y slot",
-            interpreter,
-            baseline,
-            &module.atom_table,
-        );
-    });
-}
-
-/// A context that answers `erlang:'+'/2` with the **true** small-int sum of its two
-/// arguments (the interpreter route a `gc_bif` that could not be lowered takes), and
-/// delegates everything else to a [`MinimalContext`].
-///
-/// The Y-slot arithmetic tests need the two routes to agree: the baseline tier
-/// inlines the small-int fast path, while the interpreter reaches this hook.
-struct AddCtx {
-    inner: MinimalContext,
-}
-impl AddCtx {
-    fn new() -> AddCtx {
-        AddCtx {
-            inner: MinimalContext::new(),
-        }
-    }
-    /// The small integer a tagged word encodes (the inverse of `make_small`).
-    fn small_of(term: Eterm) -> i64 {
-        (term.raw() as i64 - SMALL_TAG as i64) >> SMALL_SHIFT
-    }
-}
-impl ExecutionContext for AddCtx {
-    fn call_bif(
-        &mut self,
-        module: &str,
-        function: &str,
-        arity: u32,
-        args: &[Eterm],
-    ) -> Result<Eterm> {
-        if module == "erlang" && function == "+" && arity == 2 {
-            return Ok(make_small(Self::small_of(args[0]) + Self::small_of(args[1])));
-        }
-        self.inner.call_bif(module, function, arity, args)
-    }
-    fn ensure_heap(
-        &mut self,
-        heap_need: u32,
-        live: u32,
-        x_regs: &mut [Eterm],
-        stack: &mut [Eterm],
-    ) -> Result<()> {
-        self.inner.ensure_heap(heap_need, live, x_regs, stack)
-    }
-    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
-        self.inner.alloc_words(n)
-    }
 }

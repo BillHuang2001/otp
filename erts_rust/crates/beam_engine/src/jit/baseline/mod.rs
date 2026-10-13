@@ -874,8 +874,6 @@ fn drive(
     let mut rt = JitRuntime {
         machine: machine_ptr,
         x_regs,
-        y_base: std::ptr::null_mut(),
-        y_end: std::ptr::null_mut(),
         module: state.module,
         labels: state.labels,
         ctx: ctx_ptr,
@@ -883,16 +881,6 @@ fn drive(
         enter: None,
     };
 
-    // Publish the current top frame's Y window **once**, before the first native
-    // entry. Every later change to `machine.stack` or to the frame stack happens
-    // either inside a helper (`jit_step_one`, `jit_tail_call` and `jit_ext_call` all
-    // re-publish at their end) or inside this driver's own per-instruction interpreter
-    // step below (which re-publishes too), so no loop edge can leave the window stale
-    // -- while a per-iteration refresh charged every driver round-trip (one per
-    // non-linked `call`/`return`) for a recomputation that is almost always a no-op.
-    // `Machine::reset` has already run (`enter_machine`) and the resume path does not
-    // reset, so this call also publishes a resumed slice's already-live frame.
-    rt.refresh_y_base();
     loop {
         // Native entry for the ACTIVE module: the caller-owned artifact in context
         // `0`, the callee's blocks (if the tier has any) in a non-entry context.
@@ -1039,11 +1027,5 @@ fn drive(
                 return unsafe { (*machine_ptr).finish() }.map(RunOutcome::Returned);
             }
         }
-        // This driver ran exactly one instruction through the interpreter, and it may
-        // have pushed/`trim`med a frame or **reallocated** `machine.stack` (an
-        // `allocate`'s `push_frame`, a `deallocate`/`return`'s pop). Re-publish the Y
-        // window before the next native entry, exactly as the helpers do for the
-        // in-block continue. This is the one loop edge the helpers do not cover.
-        rt.refresh_y_base();
     }
 }

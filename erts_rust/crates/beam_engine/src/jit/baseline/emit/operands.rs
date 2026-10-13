@@ -33,25 +33,6 @@ pub(super) fn x_offset(x: u32) -> i32 {
     (x as i32) * (mem::size_of::<Eterm>() as i32)
 }
 
-/// The byte offset of Y-slot `k` inside the current frame's Y area (a `[Eterm]` of
-/// 8-byte words), i.e. the displacement an emitted `lea [y_base + k*8]` carries.
-///
-/// `k` must satisfy [`y_addressable`]; beyond that bound the `disp32` would not fit,
-/// so `fast_arith`/`fast_source` refuse the operand at **compile** time (a deopt is
-/// always correct — the interpreter runs the instruction).
-pub(super) fn y_offset(k: u32) -> i32 {
-    (k as i32) * (mem::size_of::<Eterm>() as i32)
-}
-
-/// Whether Y-slot `k` is an index the emitted `lea ... disp32` can address.
-///
-/// A Y index an actual frame could never have (the engine's frames hold far fewer
-/// slots, and `y_offset` would wrap `i32`) is refused: the fast path then deopts to
-/// the interpreter, whose own `y(k)` bounds check reports the faithful error.
-pub(super) fn y_addressable(k: u32) -> bool {
-    k <= (i32::MAX / mem::size_of::<Eterm>() as i32) as u32
-}
-
 /// The x-register index an operand names, if any (`X(n)` or the `tr`-annotated
 /// `Typed { reg: X(n), .. }` — the `Type` annotation is irrelevant to the value).
 pub(crate) fn x_register(operand: &Operand) -> Option<u32> {
@@ -65,21 +46,6 @@ pub(crate) fn x_register(operand: &Operand) -> Option<u32> {
     }
 }
 
-/// The Y-slot index an operand names, if any (`Y(k)` or the `tr`-annotated
-/// `Typed { reg: Y(k), .. }` — the `Type` annotation is irrelevant to the value).
-///
-/// The caller decides addressability ([`y_addressable`]); this is the purely
-/// syntactic read, mirroring [`x_register`].
-pub(crate) fn y_register(operand: &Operand) -> Option<u32> {
-    match operand {
-        Operand::Y(n) => Some(*n),
-        Operand::Typed {
-            reg: RegRef::Y(n),
-            ..
-        } => Some(*n),
-        _ => None,
-    }
-}
 /// The raw `Eterm` word of a constant operand, as [`crate::operand::read_operand`]
 /// evaluates it (`make_small`/`make_atom`/`NIL`).
 ///
