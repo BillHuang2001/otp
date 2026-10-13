@@ -457,52 +457,150 @@ fn semantic_lint_errors_are_a_typed_gap() {
 }
 
 #[test]
-fn a_head_pattern_with_a_map_is_a_typed_gap() {
-    // ORACLE probes (all `table`, all mismatched by a literal `=:=` comparison):
-    //   (#{a => 1, b => 2}, [{#{a => 1}, [], [ok]}])       => {ok,ok,[],[]}
-    //   (#{a => 1}, [{#{a => '$2'}, [], ['$2']}])          => {ok,1,[],[]}
-    //   (#{a => 1}, [{#{'$1' => '$2'}, [], ['$1']}])       => {error,[{error,
-    //                                      "Variable found in map key."}]}
-    //   ({x, #{a => 1}}, [{{x, #{a => 1}}, [], [ok]}])     => {ok,ok,[],[]}
-    // `beam_ets::pattern` compares a head map as an exact literal, so every one
-    // of these would be answered *wrongly* — the runtime refuses instead.
+fn map_head_patterns_delegate_to_beam_ets_and_agree_with_the_oracle() {
+    // ORACLE probes (all `table`). A head map's **keys stay literal** and its
+    // **values recurse structurally** (`beam_ets::select::pattern::decode`),
+    // which the `table` dialect delegates to wholesale:
+    //   (#{a => 1, b => 2}, [{#{a => 1}, [], [ok]}])                  => {ok,ok,[],[]}
+    //   (#{a => 1}, [{#{a => '$2'}, [], ['$2']}])                     => {ok,1,[],[]}
+    //   ({x, #{a => 1, b => 2}}, [{{x, #{a => 1}}, [], [ok]}])        => {ok,ok,[],[]}
+    //   (#{a => 1}, [{#{a => 1}, [], [ok]}])                          => {ok,ok,[],[]}
+    //   (#{a => 1}, [{#{a => '_'}, [], [ok]}])                        => {ok,ok,[],[]}
+    //   (#{a => 1, b => 2}, [{#{a => '$2', b => '$1'}, [], ['$1','$2']}])
+    //                                                                 => {ok,1,[],[]}
     let reg = default_registry();
     let mut heap = test_heap();
     let atoms = seeded_atoms();
     let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
 
     let table = ctx.atom("table").expect("seeded");
+    let ok = ctx.atom("ok").expect("seeded");
     let v1 = ctx.atom("$1").expect("seeded");
+    let v2 = ctx.atom("$2").expect("seeded");
+    let underscore = ctx.atom("_").expect("seeded");
     let a = ctx.atom("a").expect("seeded");
     let b = ctx.atom("b").expect("seeded");
     let x = ctx.atom("x").expect("seeded");
     let one = ctx.int(1).expect("fits");
+    let two = ctx.int(2).expect("fits");
+
+    // Runs one case and asserts the oracle's `{ok, Value, [], []}` shape (the
+    // two trailing elements are the empty `Flags`/`Errors` lists).
+    let check = |ctx: &mut BifContext<'_>, against: Eterm, spec: Eterm, value: Eterm| {
+        let got = call(&reg, ctx, against, spec, table).expect("map head");
+        let want = ctx.tuple(&[ok, value, NIL, NIL]).expect("fits");
+        assert!(
+            beam_term::compare::eq(got, want, &atoms),
+            "expected the oracle's {{ok,_,[],[]}} shape"
+        );
+    };
+
+    // `#{a => 1}` against `#{a => 1, b => 2}` — the pattern matches a **superset**
+    // object (extra keys are allowed), so this is `ok`, not a literal `=:=`.
+    let obj = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
     let guards = ctx.list(&[]).expect("fits");
+    let body_ok = ctx.list(&[ok]).expect("fits");
+    let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+    let c = ctx.tuple(&[head, guards, body_ok]).expect("fits");
+    let spec = ctx.list(&[c]).expect("fits");
+    check(&mut ctx, obj, spec, ok);
+
+    // `#{a => '$2'}` — a map **value** is a binding sub-pattern.
+    let single = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+    let body_v2 = ctx.list(&[v2]).expect("fits");
+    let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, v2)]).expect("fits");
+    let c = ctx.tuple(&[head, guards, body_v2]).expect("fits");
+    let spec = ctx.list(&[c]).expect("fits");
+    check(&mut ctx, single, spec, one);
+
+    // A map nested inside a tuple head recurses structurally.
+    let inner_obj = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
+    let nested_obj = ctx.tuple(&[x, inner_obj]).expect("fits");
+    let inner_head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+    let nested_head = ctx.tuple(&[x, inner_head]).expect("fits");
+    let c = ctx.tuple(&[nested_head, guards, body_ok]).expect("fits");
+    let spec = ctx.list(&[c]).expect("fits");
+    check(&mut ctx, nested_obj, spec, ok);
+
+    // An all-literal map head matching an equal object.
+    let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+    let c = ctx.tuple(&[head, guards, body_ok]).expect("fits");
+    let spec = ctx.list(&[c]).expect("fits");
+    check(&mut ctx, single, spec, ok);
+
+    // `#{a => '_'}` — a wildcard **value** matches any value for that key.
+    let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, underscore)]).expect("fits");
+    let c = ctx.tuple(&[head, guards, body_ok]).expect("fits");
+    let spec = ctx.list(&[c]).expect("fits");
+    check(&mut ctx, single, spec, ok);
+
+    // Two variable **values** bind independently; the body returns the last.
+    let object = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
+    let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, v2), (b, v1)]).expect("fits");
+    let body_both = ctx.list(&[v1, v2]).expect("fits");
+    let c = ctx.tuple(&[head, guards, body_both]).expect("fits");
+    let spec = ctx.list(&[c]).expect("fits");
+    check(&mut ctx, object, spec, one);
+}
+
+#[test]
+fn a_variable_or_wildcard_map_key_is_a_typed_gap() {
+    // ORACLE probes (all `table`; the C's map-key linter, `erl_db_util.c:1788-1800`):
+    //   (#{a => 1}, [{#{'$1' => '$2'}, [], ['$1']}])       => {error,[{error,
+    //                                    "Variable found in map key."}]}
+    //   (#{a => 1}, [{#{'_' => 1}, [], [ok]}])             => {error,[{error,
+    //                                    "Underscore found in map key."}]}
+    //   ({x, #{a => 1}}, [{{x, #{'$1' => 1}}, [], [ok]}])  => {error,[{error,
+    //                                    "Variable found in map key."}]}
+    // `beam_ets::select::pattern::decode` refuses such a spec with a plain
+    // `badarg`, which `test_table` reports as the typed capability gap;
+    // reproducing the C's semantic lint diagnostic is a separate port (module
+    // docs).
+    let reg = default_registry();
+    let mut heap = test_heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let table = ctx.atom("table").expect("seeded");
+    let ok = ctx.atom("ok").expect("seeded");
+    let v1 = ctx.atom("$1").expect("seeded");
+    let v2 = ctx.atom("$2").expect("seeded");
+    let underscore = ctx.atom("_").expect("seeded");
+    let a = ctx.atom("a").expect("seeded");
+    let x = ctx.atom("x").expect("seeded");
+    let one = ctx.int(1).expect("fits");
+    let guards = ctx.list(&[]).expect("fits");
+
+    let obj = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+
+    // `#{'$1' => '$2'}` — a variable map key.
     let body = ctx.list(&[v1]).expect("fits");
-    let obj = ctx.tuple(&[x, v1]).expect("fits");
-
-    // `#{a => '$1'}` — a map **value** is a binding sub-pattern for the C.
-    let map_head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, v1)]).expect("fits");
-    let c = ctx.tuple(&[map_head, guards, body]).expect("fits");
+    let head = beam_codec::term::make_flatmap(ctx.heap(), &[(v1, v2)]).expect("fits");
+    let c = ctx.tuple(&[head, guards, body]).expect("fits");
     let spec = ctx.list(&[c]).expect("fits");
-    let err = call(&reg, &mut ctx, obj, spec, table).expect_err("map value pattern");
-    assert!(is_raise_atom(&err, "unsupported_bif"), "map value: {err:?}");
+    let err = call(&reg, &mut ctx, obj, spec, table).expect_err("variable map key");
+    assert!(is_raise_atom(&err, "unsupported_bif"), "var key: {err:?}");
 
-    // `#{a => 1}` — even an all-literal map may under-match (the C matches a
-    // superset object).
-    let map_head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
-    let c = ctx.tuple(&[map_head, guards, body]).expect("fits");
+    // `#{'_' => 1}` — a wildcard map key.
+    let body_ok = ctx.list(&[ok]).expect("fits");
+    let head = beam_codec::term::make_flatmap(ctx.heap(), &[(underscore, one)]).expect("fits");
+    let c = ctx.tuple(&[head, guards, body_ok]).expect("fits");
     let spec = ctx.list(&[c]).expect("fits");
-    let err = call(&reg, &mut ctx, obj, spec, table).expect_err("literal map head");
-    assert!(is_raise_atom(&err, "unsupported_bif"), "literal map: {err:?}");
+    let err = call(&reg, &mut ctx, obj, spec, table).expect_err("wildcard map key");
+    assert!(is_raise_atom(&err, "unsupported_bif"), "wildcard key: {err:?}");
 
-    // A map nested inside a tuple head is caught too.
-    let inner = beam_codec::term::make_flatmap(ctx.heap(), &[(b, one)]).expect("fits");
+    // The check fires at nesting depth too: a variable key inside a map nested in
+    // a tuple head.
+    let inner = beam_codec::term::make_flatmap(ctx.heap(), &[(v1, one)]).expect("fits");
     let nested_head = ctx.tuple(&[x, inner]).expect("fits");
-    let c = ctx.tuple(&[nested_head, guards, body]).expect("fits");
+    let c = ctx.tuple(&[nested_head, guards, body_ok]).expect("fits");
     let spec = ctx.list(&[c]).expect("fits");
-    let err = call(&reg, &mut ctx, obj, spec, table).expect_err("nested map head");
-    assert!(is_raise_atom(&err, "unsupported_bif"), "nested map: {err:?}");
+    let nested_obj = ctx.tuple(&[x, obj]).expect("fits");
+    let err = call(&reg, &mut ctx, nested_obj, spec, table).expect_err("nested variable map key");
+    assert!(
+        is_raise_atom(&err, "unsupported_bif"),
+        "nested var key: {err:?}"
+    );
 }
 
 #[test]
