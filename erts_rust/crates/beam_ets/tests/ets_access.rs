@@ -1339,3 +1339,631 @@ fn the_read_write_matrix_and_the_ungated_introspection_are_pinned() {
         }
     }
 }
+
+// ----------------------- The full per-operation matrix vs the live oracle -----------------------
+//
+// `the_access_matrix_matches_the_live_oracle` above cross-checks eight
+// *representative* operations (`read` = `lookup`, `write` = `insert`,
+// `safe_fixtable/2`, `ets:info/1,2`, `rename/2`, `setopts/2`, `give_away/3`).
+// This suite widens the oracle cross-check to **every** operation the
+// access-enforcing view exposes — each read, each write, each introspection
+// field, each ownership operation, each continuation resume — one row per
+// operation. An operation whose gate is grouped with the wrong class
+// (`select_reverse` gated as a write, `take` as a read, `size` as a read, …)
+// cannot hide behind a representative one: it shows up as a line-level
+// disagreement with the live oracle.
+//
+// Every operation is also run against a **fresh one-object table** and the
+// oracle's `{SizeBefore, SizeAfter, is_list(ets:info(T))}` triple is compared, so
+// the suite pins the second half of the contract too: a *denied* operation is
+// exactly `badarg` **and** leaves the table intact (`SizeAfter == SizeBefore`,
+// which is also the oracle's own answer), while a permitted one applies.
+
+/// The access class an operation belongs to — its gate, stated independently of
+/// the concrete access mode.
+///
+/// Stating the class here, rather than deriving it from the crate under test, is
+/// what lets the comparison catch a *systematically* wrong gate and not merely an
+/// inconsistent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpGate {
+    /// A read: the oracle's `DB_READ` mask (`DB_PROTECTED|DB_PUBLIC`) — anyone may
+    /// read a `protected`/`public` table, only the owner a `private` one.
+    Read,
+    /// A write: the oracle's `DB_WRITE` mask (`DB_PUBLIC`) — anyone may write a
+    /// `public` table, only the owner a `protected`/`private` one.
+    Write,
+    /// Never gated: `ets:info/1,2` resolves the table with the `DB_INFO` mask (all
+    /// three protection bits), so its status mask can never fail.
+    Ungated,
+    /// Owner-gated (`caller == owner`) whatever the protection mode:
+    /// `ets:setopts/2` and `ets:give_away/3`.
+    Owner,
+}
+
+impl OpGate {
+    /// Whether an operation of this class is permitted for `requester` on an
+    /// `access` table owned by `owner`.
+    fn allows(self, access: Access, owner: OwnerId, requester: Option<OwnerId>) -> bool {
+        match self {
+            OpGate::Read => expected(access, owner, requester).0,
+            OpGate::Write => expected(access, owner, requester).1,
+            OpGate::Ungated => true,
+            OpGate::Owner => requester == Some(owner),
+        }
+    }
+}
+
+/// One probe: run a single `ets` operation against `table` as `requester`,
+/// building input terms on `arena` (the `beam_term` test arena) and pouring the
+/// select family's results into `out` (the `beam_alloc` scratch heap those
+/// operations require).
+type OpProbe = dyn Fn(
+    &mut Table,
+    Option<OwnerId>,
+    &mut AtomTable,
+    &mut Heap,
+    &mut beam_alloc::Heap,
+) -> beam_common::Result<()>;
+
+/// A table of `access` owned by `owner` holding the single object `{1, 10}` — the
+/// oracle probe's seed (`ets:new(probe, [set, Prot])` + `ets:insert(T, {1, 10})`).
+fn seeded_one(access: Access, owner: OwnerId, heap: &mut Heap, atoms: &AtomTable) -> Table {
+    let mut opts = TableOptions::new();
+    opts.set_access(access);
+    let mut t = Table::new(TableId::next(), opts).expect("a fresh table is constructible");
+    t.set_owner(Some(owner));
+    {
+        let mut as_owner = t.as_requester(Some(owner));
+        as_owner
+            .insert(object(heap, 1, 10), atoms)
+            .expect("the owner may seed the table");
+    }
+    t
+}
+
+/// Run `probe` as `requester` on a **fresh** seeded `access` table owned by
+/// `owner`, returning the operation's outcome plus the table's object count
+/// before and after — the oracle's `{Before, After, …}` pair.
+///
+/// A fresh table per operation is the oracle program's own shape, so no
+/// operation's mutation can perturb another row of the matrix.
+fn op_outcome(
+    access: Access,
+    owner: OwnerId,
+    requester: Option<OwnerId>,
+    probe: &OpProbe,
+) -> (beam_common::Result<()>, usize, usize) {
+    let mut atoms = AtomTable::new();
+    let mut arena = Heap::new(4096);
+    let mut out = rebuild_heap_words(4096);
+    let mut table = seeded_one(access, owner, &mut arena, &atoms);
+    let before = table.size();
+    let result = probe(&mut table, requester, &mut atoms, &mut arena, &mut out);
+    (result, before, table.size())
+}
+
+/// The oracle's rendering of an operation's outcome: `ok` when it was permitted,
+/// `badarg` when it was denied. Anything else is a crate defect rather than an
+/// access gate, so it panics — the "typed `badarg`, never a wrong result" rule.
+fn outcome(result: beam_common::Result<()>) -> &'static str {
+    match result {
+        Ok(()) => "ok",
+        Err(BeamError::BadArg) => "badarg",
+        Err(other) => panic!("a gated operation must be `ok`/`badarg`, got {other:?}"),
+    }
+}
+
+/// The `[{{'$1','_'},[],[{{'$1',0}}]}]` spec: a key-keeping body, the only shape
+/// `ets:select_replace/2` accepts (the C `db_match_keeps_key` static body check).
+fn key_keeping_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
+    let dollar1 = make_atom(atoms.intern("$1"));
+    let underscore = interned_atom(atoms, "_");
+    let inner = heap.tuple(&[dollar1, make_small(0)]).expect("test heap has room");
+    let construction = heap.tuple(&[inner]).expect("test heap has room");
+    let head = heap.tuple(&[dollar1, underscore]).expect("test heap has room");
+    let body = proper_list(heap, &[construction]);
+    let clause = heap.tuple(&[head, NIL, body]).expect("test heap has room");
+    let spec = proper_list(heap, &[clause]);
+    compile(spec, atoms).expect("a valid match spec")
+}
+
+/// Parse an oracle program's `key -> value` lines into a map.
+fn parse_facts(stdout: &[u8]) -> HashMap<String, String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.split_once(" -> "))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
+}
+
+/// Every operation the access-enforcing view exposes, with its class — the rows of
+/// the full matrix. The names are the oracle program's field names.
+fn all_ops() -> Vec<(&'static str, OpGate, Box<OpProbe>)> {
+    let read = OpGate::Read;
+    let write = OpGate::Write;
+    vec![
+        // ------------------------------------------------------------------ reads
+        ("r_lookup", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).lookup(make_small(1), atoms).map(|_| ())
+        })),
+        ("r_member", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).member(make_small(1), atoms).map(|_| ())
+        })),
+        ("r_lookup_element", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r)
+                .lookup_element(make_small(1), 1, atoms)
+                .map(|_| ())
+        })),
+        ("r_first", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).first(atoms).map(|_| ())
+        })),
+        ("r_last", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).last(atoms).map(|_| ())
+        })),
+        ("r_next", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).next(make_small(1), atoms).map(|_| ())
+        })),
+        ("r_prev", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).prev(make_small(1), atoms).map(|_| ())
+        })),
+        ("r_tab2list", read, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).tab2list().map(|_| ())
+        })),
+        ("r_slot", read, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).slot(1, atoms).map(|_| ())
+        })),
+        ("r_select", read, Box::new(|t, r, atoms, a, o| {
+            let spec = every_object_spec(a, atoms);
+            t.as_requester(r).select(&spec, atoms, o).map(|_| ())
+        })),
+        ("r_select_count", read, Box::new(|t, r, atoms, a, o| {
+            let spec = every_object_spec(a, atoms);
+            t.as_requester(r).select_count(&spec, atoms, o).map(|_| ())
+        })),
+        ("r_select_reverse", read, Box::new(|t, r, atoms, a, o| {
+            let spec = every_object_spec(a, atoms);
+            t.as_requester(r)
+                .select_reverse(&spec, atoms, o)
+                .map(|_| ())
+        })),
+        ("r_match_object", read, Box::new(|t, r, atoms, a, o| {
+            let pattern = wildcard_pattern(a, atoms);
+            t.as_requester(r)
+                .match_object(pattern, atoms, o)
+                .map(|_| ())
+        })),
+        ("r_match", read, Box::new(|t, r, atoms, a, o| {
+            let pattern = wildcard_pattern(a, atoms);
+            t.as_requester(r).match_(pattern, atoms, o).map(|_| ())
+        })),
+        ("r_safe_fixtable", read, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).set_fixation(true)
+        })),
+        ("r_select_limit", read, Box::new(|t, r, atoms, a, o| {
+            let spec = every_object_spec(a, atoms);
+            t.as_requester(r)
+                .select_limit(&spec, 1, atoms, o)
+                .map(|_| ())
+        })),
+        ("r_select_reverse_limit", read, Box::new(|t, r, atoms, a, o| {
+            let spec = every_object_spec(a, atoms);
+            t.as_requester(r)
+                .select_reverse_limit(&spec, 1, atoms, o)
+                .map(|_| ())
+        })),
+        ("r_match_limit", read, Box::new(|t, r, atoms, a, o| {
+            let pattern = wildcard_pattern(a, atoms);
+            t.as_requester(r)
+                .match_limit(pattern, 1, atoms, o)
+                .map(|_| ())
+        })),
+        ("r_match_object_limit", read, Box::new(|t, r, atoms, a, o| {
+            let pattern = wildcard_pattern(a, atoms);
+            t.as_requester(r)
+                .match_object_limit(pattern, 1, atoms, o)
+                .map(|_| ())
+        })),
+        // ----------------------------------------------------------------- writes
+        ("w_insert", write, Box::new(|t, r, atoms, a, _o| {
+            t.as_requester(r).insert(object(a, 2, 20), atoms)
+        })),
+        ("w_insert_new", write, Box::new(|t, r, atoms, a, _o| {
+            t.as_requester(r)
+                .insert_new(object(a, 2, 20), atoms)
+                .map(|_| ())
+        })),
+        ("w_insert_list", write, Box::new(|t, r, atoms, a, _o| {
+            let list = [object(a, 2, 20), object(a, 3, 30)];
+            t.as_requester(r).insert_list(&list, atoms)
+        })),
+        ("w_delete", write, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).delete(make_small(1), atoms)
+        })),
+        ("w_delete_object", write, Box::new(|t, r, atoms, a, _o| {
+            t.as_requester(r).delete_object(object(a, 1, 10), atoms)
+        })),
+        ("w_delete_all", write, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).delete_all_objects()
+        })),
+        ("w_take", write, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r).take(make_small(1), atoms).map(|_| ())
+        })),
+        ("w_update_counter", write, Box::new(|t, r, atoms, _a, o| {
+            t.as_requester(r)
+                .update_counter(make_small(1), make_small(1), atoms, o)
+                .map(|_| ())
+        })),
+        ("w_update_counter_default", write, Box::new(|t, r, atoms, a, o| {
+            t.as_requester(r)
+                .update_counter_with(make_small(9), make_small(1), object(a, 9, 0), atoms, o)
+                .map(|_| ())
+        })),
+        ("w_update_element", write, Box::new(|t, r, atoms, _a, o| {
+            t.as_requester(r)
+                .update_element(make_small(1), &[(2, make_small(99))], atoms, o)
+                .map(|_| ())
+        })),
+        ("w_select_delete", write, Box::new(|t, r, atoms, a, o| {
+            let spec = every_object_spec(a, atoms);
+            t.as_requester(r).select_delete(&spec, atoms, o).map(|_| ())
+        })),
+        ("w_match_delete", write, Box::new(|t, r, atoms, a, o| {
+            let pattern = wildcard_pattern(a, atoms);
+            t.as_requester(r)
+                .match_delete(pattern, atoms, o)
+                .map(|_| ())
+        })),
+        ("w_select_replace", write, Box::new(|t, r, atoms, a, o| {
+            let spec = key_keeping_spec(a, atoms);
+            t.as_requester(r)
+                .select_replace(&spec, atoms, o)
+                .map(|_| ())
+        })),
+        ("w_rename", write, Box::new(|t, r, atoms, _a, _o| {
+            t.as_requester(r)
+                .rename(atoms.intern("renamed_probe"), |_| false)
+                .map(|_| ())
+        })),
+        // ---------------------------------------------------------- introspection
+        ("i_info1", OpGate::Ungated, Box::new(|t, _r, _atoms, _a, _o| {
+            let _ = t.info();
+            Ok(())
+        })),
+        ("i_info2_size", OpGate::Ungated, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).size().map(|_| ())
+        })),
+        ("i_info2_protection", OpGate::Ungated, Box::new(|t, _r, _atoms, _a, _o| {
+            let _ = t.info().access;
+            Ok(())
+        })),
+        ("i_info2_memory", OpGate::Ungated, Box::new(|t, _r, _atoms, _a, _o| {
+            let _ = t.memory();
+            Ok(())
+        })),
+        // --------------------------------------------------------------- ownership
+        ("o_setopts_protection", OpGate::Owner, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).set_access(Access::Private)
+        })),
+        ("o_setopts_heir2", OpGate::Owner, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).setopts(SetOpt::Heir(Heir {
+                owner: OwnerId::new(3),
+                data: None,
+            }))
+        })),
+        ("o_setopts_heir3", OpGate::Owner, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).setopts(SetOpt::Heir(Heir {
+                owner: OwnerId::new(3),
+                data: Some(make_small(1)),
+            }))
+        })),
+        ("o_setopts_clear_heir", OpGate::Owner, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).setopts(SetOpt::ClearHeir)
+        })),
+        ("o_give_away", OpGate::Owner, Box::new(|t, r, _atoms, _a, _o| {
+            t.as_requester(r).give_away(Some(OwnerId::new(3)))
+        })),
+    ]
+}
+
+/// The continuation-resume gate: build the continuation as the **owner** (so it
+/// cannot fail on the gate) and resume it as `requester`.
+///
+/// `which` is `"sel"` (`ets:select/1`), `"rev"` (`ets:select_reverse/1`), `"m"`
+/// (`ets:match/1`) or `"mo"` (`ets:match_object/1`).
+fn cont_outcome(
+    access: Access,
+    owner: OwnerId,
+    requester: Option<OwnerId>,
+    which: &str,
+) -> beam_common::Result<()> {
+    let mut atoms = AtomTable::new();
+    let mut arena = Heap::new(2048);
+    let mut out = rebuild_heap_words(2048);
+    let mut t = seeded_table(access, owner, &mut arena, &atoms);
+    let spec = every_object_spec(&mut arena, &mut atoms);
+    let pattern = wildcard_pattern(&mut arena, &mut atoms);
+    let cont = match which {
+        "sel" => t.as_requester(Some(owner)).select_limit(&spec, 1, &atoms, &mut out),
+        "rev" => t
+            .as_requester(Some(owner))
+            .select_reverse_limit(&spec, 1, &atoms, &mut out),
+        "m" => t
+            .as_requester(Some(owner))
+            .match_limit(pattern, 1, &atoms, &mut out),
+        "mo" => t
+            .as_requester(Some(owner))
+            .match_object_limit(pattern, 1, &atoms, &mut out),
+        other => panic!("unknown continuation form `{other}`"),
+    }
+    .expect("the owner may build the continuation")
+    .1
+    .expect("a full chunk carries a continuation");
+
+    let view = t.as_requester(requester);
+    match which {
+        "sel" => view.select_continue(&cont, &atoms, &mut out).map(|_| ()),
+        "rev" => view
+            .select_reverse_continue(&cont, &atoms, &mut out)
+            .map(|_| ()),
+        "m" => view.match_continue(&cont, &atoms, &mut out).map(|_| ()),
+        "mo" => view
+            .match_object_continue(&cont, &atoms, &mut out)
+            .map(|_| ()),
+        _ => unreachable!(),
+    }
+}
+
+/// The probe: for every protection mode × requester (the **owning** process and a
+/// spawned **non-owner**) each operation of the matrix is run on its **own** fresh
+/// one-object table and printed as `{mode}.{who}.{field} -> ok|badarg`, followed by
+/// the same run's `{SizeBefore, SizeAfter, is_list(ets:info(T))}` as
+/// `{mode}.{who}.{field}.intact`. A third section resumes an owner-built
+/// continuation as the requester under test (`…c_{sel,rev,m,mo}`).
+const EVERY_OP_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+%%! -noshell
+main(_) ->
+    P = fun(K, V) -> io:format("~s -> ~w~n", [K, V]) end,
+    C = fun(E) -> try E() of _ -> ok catch error:badarg -> badarg end end,
+    Parent = self(),
+    %% A live process that is never the caller: the target of `ets:give_away/3`
+    %% (a self-gift is `badarg`, so it must differ from whoever calls).
+    Gift = spawn(fun() -> receive stop -> ok end end),
+    Spec = [{{'_','_'},[],['$_']}],
+    Pat = {'_','_'},
+    %% One op on its own fresh table owned by *this* (parent) process.
+    Run = fun(Prot, Who, Op) ->
+        T = ets:new(probe, [set, Prot]),
+        ets:insert(T, {1, 10}),
+        R = case Who of
+                owner -> C(fun() -> Op(T) end);
+                other ->
+                    Ref = make_ref(),
+                    spawn(fun() -> Parent ! {Ref, C(fun() -> Op(T) end)} end),
+                    receive {Ref, V} -> V after 5000 -> timeout end
+            end,
+        catch ets:delete(T),
+        R
+    end,
+    Ops = [
+        %% reads
+        {r_lookup,          fun(T) -> ets:lookup(T, 1) end},
+        {r_member,          fun(T) -> ets:member(T, 1) end},
+        {r_lookup_element,  fun(T) -> ets:lookup_element(T, 1, 1) end},
+        {r_first,           fun(T) -> ets:first(T) end},
+        {r_last,            fun(T) -> ets:last(T) end},
+        {r_next,            fun(T) -> ets:next(T, 1) end},
+        {r_prev,            fun(T) -> ets:prev(T, 1) end},
+        {r_tab2list,        fun(T) -> ets:tab2list(T) end},
+        {r_slot,            fun(T) -> ets:slot(T, 1) end},
+        {r_select,          fun(T) -> ets:select(T, Spec) end},
+        {r_select_count,    fun(T) -> ets:select_count(T, Spec) end},
+        {r_select_reverse,  fun(T) -> ets:select_reverse(T, Spec) end},
+        {r_match_object,    fun(T) -> ets:match_object(T, Pat) end},
+        {r_match,           fun(T) -> ets:match(T, Pat) end},
+        {r_safe_fixtable,   fun(T) -> ets:safe_fixtable(T, true) end},
+        {r_select_limit,    fun(T) -> ets:select(T, Spec, 1) end},
+        {r_select_reverse_limit, fun(T) -> ets:select_reverse(T, Spec, 1) end},
+        {r_match_limit,     fun(T) -> ets:match(T, Pat, 1) end},
+        {r_match_object_limit, fun(T) -> ets:match_object(T, Pat, 1) end},
+        %% writes
+        {w_insert,          fun(T) -> ets:insert(T, {2, 20}) end},
+        {w_insert_new,      fun(T) -> ets:insert_new(T, {2, 20}) end},
+        {w_insert_list,     fun(T) -> ets:insert(T, [{2,20},{3,30}]) end},
+        {w_delete,          fun(T) -> ets:delete(T, 1) end},
+        {w_delete_object,   fun(T) -> ets:delete_object(T, {1, 10}) end},
+        {w_delete_all,      fun(T) -> ets:delete_all_objects(T) end},
+        {w_take,            fun(T) -> ets:take(T, 1) end},
+        {w_update_counter,  fun(T) -> ets:update_counter(T, 1, 1) end},
+        {w_update_counter_default, fun(T) -> ets:update_counter(T, 9, 1, {9, 0}) end},
+        {w_update_element,  fun(T) -> ets:update_element(T, 1, {2, 99}) end},
+        {w_select_delete,   fun(T) -> ets:select_delete(T, [{{'_','_'},[],[true]}]) end},
+        {w_match_delete,    fun(T) -> ets:match_delete(T, Pat) end},
+        {w_select_replace,  fun(T) -> ets:select_replace(T, [{{'$1','_'},[],[{{'$1',0}}]}]) end},
+        {w_rename,          fun(T) -> ets:rename(T, renamed_probe) end},
+        %% introspection (never gated: DB_INFO)
+        {i_info1,           fun(T) -> ets:info(T) end},
+        {i_info2_size,      fun(T) -> ets:info(T, size) end},
+        {i_info2_protection,fun(T) -> ets:info(T, protection) end},
+        {i_info2_memory,    fun(T) -> ets:info(T, memory) end},
+        %% ownership (owner-gated, whatever the mode)
+        {o_setopts_protection, fun(T) -> ets:setopts(T, {protection, private}) end},
+        {o_setopts_heir2,   fun(T) -> ets:setopts(T, {heir, Gift}) end},
+        {o_setopts_heir3,   fun(T) -> ets:setopts(T, {heir, Gift, gift}) end},
+        {o_setopts_clear_heir, fun(T) -> ets:setopts(T, {heir, none}) end},
+        {o_give_away,       fun(T) -> ets:give_away(T, Gift, []) end}
+    ],
+    lists:foreach(
+      fun(Prot) ->
+        lists:foreach(
+          fun(Who) ->
+            lists:foreach(
+              fun({Field, Op}) ->
+                Key = lists:flatten(io_lib:format("~p.~p.~p", [Prot, Who, Field])),
+                P(Key, Run(Prot, Who, Op))
+              end, Ops)
+          end, [owner, other])
+      end, [public, protected, private]),
+
+    %% (B) A continuation resume is read-gated exactly like the primary form: the
+    %%     continuation is built by the *owner* and resumed by `Who`.
+    ContRun = fun(Prot, Who, Which) ->
+        T = ets:new(probe, [set, Prot]),
+        ets:insert(T, {1,10}), ets:insert(T, {2,20}), ets:insert(T, {3,30}),
+        Cont = case Which of
+                   sel -> {_, C1} = ets:select(T, Spec, 1), C1;
+                   rev -> {_, C2} = ets:select_reverse(T, Spec, 1), C2;
+                   m   -> {_, C3} = ets:match(T, Pat, 1), C3;
+                   mo  -> {_, C4} = ets:match_object(T, Pat, 1), C4
+               end,
+        Op = fun() -> case Which of
+                          sel -> ets:select(Cont);
+                          rev -> ets:select_reverse(Cont);
+                          m   -> ets:match(Cont);
+                          mo  -> ets:match_object(Cont)
+                      end end,
+        R = case Who of
+                owner -> C(Op);
+                other ->
+                    Ref = make_ref(),
+                    spawn(fun() -> Parent ! {Ref, C(Op)} end),
+                    receive {Ref, V} -> V after 5000 -> timeout end
+            end,
+        catch ets:delete(T),
+        R
+    end,
+    lists:foreach(
+      fun(Prot) ->
+        lists:foreach(
+          fun(Who) ->
+            lists:foreach(
+              fun(Which) ->
+                Key = lists:flatten(io_lib:format("~p.~p.c_~p", [Prot, Who, Which])),
+                P(Key, ContRun(Prot, Who, Which))
+              end, [sel, rev, m, mo])
+          end, [owner, other])
+      end, [public, protected, private]),
+
+    %% (C) The size and liveness around every operation: a *denied* op leaves the
+    %%     table intact (`After == Before`), a permitted one applies.
+    Intact = fun(Prot, Who, Op) ->
+        T = ets:new(probe, [set, Prot]),
+        ets:insert(T, {1, 10}),
+        Before = ets:info(T, size),
+        _ = case Who of
+                owner -> C(fun() -> Op(T) end);
+                other ->
+                    Ref = make_ref(),
+                    spawn(fun() -> Parent ! {Ref, C(fun() -> Op(T) end)} end),
+                    receive {Ref, _} -> skip after 5000 -> skip end
+            end,
+        After = ets:info(T, size),
+        Alive = is_list(ets:info(T)),
+        catch ets:delete(T),
+        {Before, After, Alive}
+    end,
+    lists:foreach(
+      fun(Prot) ->
+        lists:foreach(
+          fun(Who) ->
+            lists:foreach(
+              fun({Field, Op}) ->
+                Key = lists:flatten(io_lib:format("~p.~p.~p.intact", [Prot, Who, Field])),
+                P(Key, Intact(Prot, Who, Op))
+              end, Ops)
+          end, [owner, other])
+      end, [public, protected, private]),
+    halt(0).
+"#;
+
+/// The **full** per-operation access matrix, cross-checked **line by line** with
+/// the live system `erl` for **both** the owner and a non-owner in each of the
+/// three modes: every read, every write, every introspection field, every
+/// ownership operation and every continuation resume, plus the size/liveness of
+/// the table around each call.
+///
+/// The oracle is **required by default**: an absent Erlang fails this check rather
+/// than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out;
+/// `BEAM_ETS_REQUIRE_ORACLE=1` forces it).
+#[test]
+fn every_read_and_write_op_of_the_access_matrix_matches_the_live_oracle() {
+    const TEST: &str = "every_read_and_write_op_of_the_access_matrix_matches_the_live_oracle";
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            TEST,
+            "no Erlang oracle found (no `$ERTS_ORACLE`, no `erl`/`escript` on `$PATH`)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        EVERY_OP_ORACLE_PROGRAM,
+        &[],
+        "access_every_op",
+        ORACLE_TIMEOUT,
+    );
+    let facts = parse_facts(&output.stdout);
+
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let ops = all_ops();
+
+    for (access, mode) in [
+        (Access::Public, "public"),
+        (Access::Protected, "protected"),
+        (Access::Private, "private"),
+    ] {
+        for (who, requester) in [("owner", Some(owner)), ("other", Some(other))] {
+            for (name, gate, probe) in &ops {
+                let tag = format!("{mode}.{who}.{name}");
+                let (result, before, after) = op_outcome(access, owner, requester, probe.as_ref());
+                let got = outcome(result);
+
+                // (1) The crate agrees with the live oracle, cell by cell.
+                assert_eq!(
+                    got,
+                    oracle_fact(&facts, &tag),
+                    "{tag}: the crate and the live oracle disagree"
+                );
+                // (2) …and with the class the operation was placed in — which is
+                //     what makes the comparison able to catch a *systematically*
+                //     wrong gate rather than only an inconsistent one.
+                let wanted = gate.allows(access, owner, requester);
+                assert_eq!(
+                    got == "ok",
+                    wanted,
+                    "{tag}: the {gate:?} class says allowed={wanted}, the view said {got}"
+                );
+                // (3) The table's object count before/after must be the oracle's
+                //     own, and it pins the "a denial is harmless" half: a denied
+                //     operation is `badarg` **and** left the table untouched.
+                assert_eq!(before, 1, "{tag}: the probe seeds exactly one object");
+                assert_eq!(
+                    format!("{{{before},{after},true}}"),
+                    oracle_fact(&facts, &format!("{tag}.intact")),
+                    "{tag}: the table's object count disagrees with the oracle"
+                );
+                if got == "badarg" {
+                    assert_eq!(after, before, "{tag}: a denied operation mutated the table");
+                }
+            }
+
+            // The `/1` resumptions are read-gated exactly like the primary forms,
+            // even though the continuation itself was built by the owner.
+            for which in ["sel", "rev", "m", "mo"] {
+                let tag = format!("{mode}.{who}.c_{which}");
+                let got = outcome(cont_outcome(access, owner, requester, which));
+                assert_eq!(
+                    got,
+                    oracle_fact(&facts, &tag),
+                    "{tag}: the crate and the live oracle disagree"
+                );
+                assert_eq!(
+                    got == "ok",
+                    expected(access, owner, requester).0,
+                    "{tag}: a continuation resume is read-gated"
+                );
+            }
+        }
+    }
+}
