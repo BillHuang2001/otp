@@ -501,6 +501,8 @@ and derives the report from that observed state.
     `DOP_UNLINK_ID`→`DOP_UNLINK_ID_ACK`, and **fragmented >`DIST_FRAGMENT_SIZE` messages both ways**.
     `live_accept.rs` completes the handshake as **server** and does the Rust->node->Rust round trip (the
     full `node@host` name + epmd-assigned creation) plus published-vs-hidden peer visibility.
+    `live_accept_blocking.rs` pins the **blocking** `accept_server`/`Connection::server` against a real
+    peer and decodes the inbound `Send`/`Link`/`Monitor` signals the peer initiates against our pid.
     `live_driver.rs` drives the `ConnectionDriver` over a genuine non-blocking `TcpStream`. The shared
     spawn/harness lives in `tests/common/mod.rs`. All skip honestly (clear `eprintln`) only when `erl`
     is absent on `PATH`; never fake a pass. Opcodes/paths that cannot be exercised against a live peer
