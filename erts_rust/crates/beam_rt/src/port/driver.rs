@@ -917,6 +917,10 @@ pub(crate) struct LoadedDriver {
     ///
     /// `None` for a driver opened by `open_port({spawn_driver, …})`: its handle lives in the
     /// **port's** adapter, so forgetting the record must never unload it.
+    // Held for its `Drop`: dropping the record runs the driver's `finish` and `dlclose`s the
+    // object. The field is deliberately never *read* (the C's handle is opaque to the
+    // runtime), which is exactly why the dead-code lint must not fire on it.
+    #[allow(dead_code)]
     pub(crate) library: Option<DriverLibrary>,
 }
 
