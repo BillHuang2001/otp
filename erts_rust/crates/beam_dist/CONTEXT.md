@@ -515,6 +515,11 @@ and derives the report from that observed state.
     (`DeliveryOutcome::Delivered`, not `Unsupported`); a `ConnectionDriver` pair over two real
     non-blocking `TcpStream`s; peer-death evidence (clean close → `Closed`, abrupt drop → typed error);
     and the v6 "no `DOP_NODEUP`/`DOP_NODEDOWN`" pin.
+  - `tests/two_node_session.rs` — the **full inbound signal-family** loopback: 11 tests drive every
+    two-node-session family (`Link`, `UnlinkId`/`_Ack`, `DemonitorP`, `Exit`/`Exit2`, `PayloadExit`/
+    `_Exit2`, `GroupLeader`, `AliasSend`, `SpawnRequest`/`SpawnReply`, `AltactSigSend` token/non-token,
+    plus a `_TT` token field) across a real loopback socket in **both** directions with typed `Delivery`
+    asserts, and a spy transport pins a real `'D'` header on the wire.
   - `tests/hermetic_epmd.rs` — a test-local `epmd` **registry stub** (an **independent** hand-written
     request decoder / reply encoder, so the round-trip is not self-consistent by construction) driving
     the crate's `EpmdClient` (`publish`/`port_please`/`names`/`stop`) and the address-taking
