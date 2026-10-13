@@ -414,24 +414,36 @@ erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release 
 #    only the six Runtimes::Both workloads, so both sides see the same machine conditions
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --full --runtime all --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/results/m9-bench-xrun.json --verbose
+    --out-file erts_rust/tools/bench/results/m10-bench-xrun.json --verbose
+
+# 2b. the SAME workloads with the interpreter pinned — the Rust-vs-Rust tier-effect control
+#     (rust only: it has NO sys rows, so it is never a system-ERTS comparison)
+BEAM_RT_TIER=interpreter erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --full --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
+    --out-file erts_rust/tools/bench/results/m10-bench-xrun-interp.json
 
 # 3. the FULL sys-only external targets (erlc/elixirc/cowboy/khepri) in one report
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --full --runtime sys --workloads erlc_compiler,elixir_compiler,cowboy,khepri \
-    --out-file erts_rust/tools/bench/results/m9-bench-external.json --verbose
+    --out-file erts_rust/tools/bench/results/m10-bench-external.json --verbose
 
-# 4. the tool-driven observations (plb runs; emqx skips on this OTP-29 host)
+# 4. the tool-driven targets (plb runs; emqx skips on this OTP-29 host)
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --quick --runtime sys --workloads plb  --out-file erts_rust/tools/bench/results/m9-bench-plb.json  --verbose
+    run --quick --runtime sys --workloads plb  --out-file erts_rust/tools/bench/results/m10-bench-plb.json  --verbose
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --quick --runtime sys --workloads emqx --out-file erts_rust/tools/bench/results/m9-bench-emqx.json --verbose
-# (plb resolves the greatest dotnet >= 9.0 by version, so it now runs even with an older dotnet on PATH; §4.1 of RESULTS.md)
+    run --quick --runtime sys --workloads emqx --out-file erts_rust/tools/bench/results/m10-bench-emqx.json --verbose
+# (plb resolves the greatest dotnet >= 9.0 by version, so it runs even with an older dotnet on PATH; §4.1 of RESULTS.md)
 # (emqx needs an OTP-28 host — here it reports skipped(emqx-requires-otp-28))
 
 # 5. compare (cross-runtime inside one report, or two files)
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m9-bench-xrun.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m10-bench-xrun.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m10-bench-xrun-interp.json \
+    erts_rust/tools/bench/results/m10-bench-xrun.json      # tier effect: interp -> default
 ```
+
+Archive the `out/` copies into `results/` with only the two mechanical path normalisations
+(`runtimes[].program` worktree prefix → `erts_rust/target/release/beam_rt`; a scratch `$TMPDIR` prefix in
+`notes` → `$TMPDIR/`). **Never edit a metric value.**
 
 `foreign`, `list_walk`, `copy_bound` and `gc_bound` run under **both** runtimes; every other repo workload is
 `sys`-only, so a `--runtime all` report shows a genuine sys-vs-rust row only for `baseline`, `slice`,
