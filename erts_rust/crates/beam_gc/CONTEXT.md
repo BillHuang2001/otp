@@ -607,6 +607,17 @@ constructors only (no new error enum).
   (`relocate_major`), or a larger region when an in-place fullsweep's reclaim cannot fit the nursery's
   promotion (`grow_major`). A growable heap therefore never fails a collectable collection; only a
   `max_heap_words` ceiling the promotion cannot fit returns the typed `heap_exhausted` (before any copy).
+- **A growth-only loop (no collection) grows the nursery chain without bound.** `Nursery::grow`
+  (`src/nursery.rs:146`) pushes the replaced space into `retired: Vec<HeapSpace>` (`src/nursery.rs:58`),
+  and the *only* thing that drains it is `Nursery::collapse` (`src/nursery.rs:161` = `retired.clear()`),
+  which runs **solely** at the end of `collect_minor`/`collect_major` (`src/collector.rs:187,258`). So a
+  caller that repeatedly calls `grow_nursery` — the runtime's un-rooted `alloc_words` seam
+  (`beam_rt/src/context/gc.rs`, which never collects) — retains one whole `HeapSpace` backing allocation
+  per growth until some collection collapses the chain: memory grows with the number of growths, not with
+  the live set. Every collection collapses the chain, and `ensure_capacity` (`src/collector.rs:279-292`)
+  always collects first, so a workload that reaches a rooted heap-admission point reclaims the chain each
+  round. Documented invariant, not a bug — but a pure un-rooted growth loop is unbounded in the iteration
+  count.
 - **Promotion atomicity is guaranteed only on the *total* line budget.** A minor promotes only when
   `mature.free_lines() >= needed` (the exact line count of the live nursery graph), and a major checks the
   same after reclaiming. Line-granular allocation means an object needs a *contiguous* run of its lines, so
