@@ -225,8 +225,11 @@ pub const PORT_INFO_ATOMS: &[&str] = &[
 /// (`erts/emulator/beam/erl_bif_port.c`).
 ///
 /// Anything outside this list — including `list` (a list stream is already the default) — is
-/// [`BeamError::BadArg`], never silently ignored. Only `binary` and `exit_status` change the
-/// port here; the rest are recognized and accepted without effect.
+/// [`BeamError::BadArg`], never silently ignored. `binary` (the stream shape),
+/// `line` (line framing at the default length), `use_stdio`/`nouse_stdio`, `stream` (the
+/// packet-framing cancellation), `stderr_to_stdout` and `exit_status` all change the port;
+/// `in`, `out`, `eof`, `hide` and `overlapped_io` are recognized and accepted without effect.
+/// The last section of [`RuntimePorts::port_options`] documents what each one does.
 const PORT_OPTION_ATOMS: &[&str] = &[
     "stream",
     "use_stdio",
@@ -245,8 +248,10 @@ const PORT_OPTION_ATOMS: &[&str] = &[
 /// The option **tuple tags** an `open_port/2` call accepts — the oracle's strict whitelist
 /// (`erts/emulator/beam/erl_bif_port.c`).
 ///
-/// `cd`, `env` and `args` are honored; the rest are recognized and accepted without effect.
-/// A tag outside this list is [`BeamError::BadArg`].
+/// `cd`, `env` and `args` are honored in the child, `line` sets the line framing and `packet`
+/// is what the `line`/`packet` mutual-exclusion check reads; the remaining tags
+/// (`arg0`, `parallelism`, `busy_limits_port`, `busy_limits_msgq`) are recognized and
+/// accepted without effect. A tag outside this list is [`BeamError::BadArg`].
 const PORT_OPTION_TUPLES: &[&str] = &[
     "packet",
     "line",
