@@ -793,8 +793,10 @@ line (no timestamps/addresses/ports) and exits `0`:
 - `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation,
   plus the `connect_client_with_flags`/`accept_server_with_flags` overrides and the
   `accept_server_with_decision` accept-policy seam + `Connection::server_with_decision`),
-  `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
-  `send_control`/`send_message`/`send_tick`/`recv`/`recv_delivery`/`dispatch_inbound` + the typed
+  `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache + the private
+  `our_name` used by the checked path) with
+  `send_control`/`send_message`/`send_tick`/`recv`/`recv_delivery`/`recv_delivery_checked`/
+  `dispatch_inbound`/`dispatch_inbound_checked` + the typed
   `send_reg_send`/`send_link`/`send_exit`/`send_monitor_p`/`send_demonitor_p` helpers, and the
   `read_message_body` frame read that reports a clean peer EOF as `Io(UnexpectedEof)` (the
   `TcpTransport` `read_exact_or_eof` override)
