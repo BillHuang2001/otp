@@ -136,5 +136,62 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "math/pi_is_the_documented_constant",
+            description: "math:pi/0 is the documented constant, bit-exact and within its bounds",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `=:=` pins `pi/0` to the last bit, so a 1-ULP drift would flip a `true`.
+                expr: "{math:pi(), math:pi() =:= 3.141592653589793, math:pi() > 3.14 andalso math:pi() < 3.15}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {3.141592653589793,true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "math/pow_float_only",
+            description: "math:pow/2 is float-only: 4^0.5 = 2.0, x^0 = 1.0 incl. 0^0",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{math:pow(2.0, 10.0), math:pow(4.0, 0.5), math:pow(2.0, 0.0), math:pow(0.0, 0.0)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {1024.0,2.0,1.0,1.0}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "math/fmod_signs",
+            description: "math:fmod/2 takes the sign of the dividend (C fmod)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{math:fmod(5.5, 2.0), math:fmod(-5.5, 2.0), math:fmod(5.5, -2.0)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {1.5,-1.5,1.5}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "math/erlang_rounding_helpers",
+            description: "erlang:float/1, round/1 (half away from zero) and trunc/1 agree",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{erlang:float(3), erlang:round(2.5), erlang:trunc(-2.5), erlang:round(-2.5), erlang:trunc(2.9), erlang:round(2.4)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {3.0,3,-2,-3,2,2}"),
+                exit_code: 0,
+            },
+        },
     ]
 }

@@ -132,6 +132,22 @@
 //! the Rust runtime exposes no cached indices (always `0` / a refusal) — a plain differing value,
 //! i.e. a mismatch, not a corpus case. Owners: `crates/beam_abi/src/nif/enif/proc.rs`.
 //!
+//! # The widened accessor / order / size block
+//!
+//! A third pass (selectors `128`..`171`) adds one further shape to the same families: the
+//! remaining integer boundaries (`INT64_MAX`, `UINT64_MAX` round trips), the wrong-type refusals
+//! of `enif_get_long`/`enif_get_ulong`, the list tail/head edges, the `is_tuple` / `get_tuple`
+//! refusal of a list, a one-byte `enif_make_new_binary` and a sub-binary **of a sub-binary**, the
+//! map grow/remove/update/identity edges, the empty atom and the zero-length string, the
+//! non-atom / non-string refusals, `enif_compare` over equal and ordered binaries and equal lists,
+//! `enif_term_type` of a reference, `enif_is_identical` over atoms / maps / a fresh-ref pair, the
+//! fixed **word counts** of the small containers, three more `enif_convert_time_unit` pairs plus
+//! the identity, and the self-pid identity.
+//!
+//! One shape in this block is answered alike but is *not* `arity + 1`: `enif_term_size` of the
+//! **empty tuple** is `0` under both runtimes (the same reason a small integer is `0`), which is
+//! why `nif_abi/term_size_empty_tuple` pins `0` where the 1-tuple pins `2` and the 2-tuple `3`.
+//!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
 //! A C-compiled fixture needs a C compiler *and* the host `erl_nif.h`; when either is missing
@@ -1207,6 +1223,320 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, enif_whereis_port(env, enif_make_atom(env, "init"), &p));
     }
 
+    /* ---------------------------------------- the widened accessor / order / size block
+       A later pass over the same families, one further shape each. Every arm answers a small
+       non-negative integer (a count, or 1/0 for a predicate), so the golden stays a VM-stable
+       integer line. Each arm pins a shape both runtimes answer alike: a boundary that survives
+       the round trip, a refusal of the wrong type, a structurally equal container, or a
+       *count* the term layout fixes. */
+    case 128: {                                /* int64 INT64_MAX round trips */
+        ErlNifSInt64 want = (ErlNifSInt64) 9223372036854775807LL;
+        ERL_NIF_TERM t = enif_make_int64(env, want);
+        ErlNifSInt64 v = 0;
+        return enif_make_int(env, (enif_get_int64(env, t, &v) && v == want) ? 1 : 0);
+    }
+    case 129: {                                /* uint64 UINT64_MAX round trips */
+        ErlNifUInt64 want = (ErlNifUInt64) 18446744073709551615ULL;
+        ERL_NIF_TERM t = enif_make_uint64(env, want);
+        ErlNifUInt64 v = 0;
+        return enif_make_int(env, (enif_get_uint64(env, t, &v) && v == want) ? 1 : 0);
+    }
+    case 130: {                                /* double zero round trips */
+        ERL_NIF_TERM t = enif_make_double(env, 0.0);
+        double v = 1.0;
+        return enif_make_int(env, (enif_get_double(env, t, &v) && v == 0.0) ? 1 : 0);
+    }
+    case 131: {                                /* get_long refuses a float */
+        long v = 0;
+        return enif_make_int(env, enif_get_long(env, enif_make_double(env, 1.0), &v) ? 0 : 1);
+    }
+    case 132: {                                /* get_ulong refuses a non-number */
+        unsigned long v = 0;
+        return enif_make_int(env,
+            enif_get_ulong(env, enif_make_atom(env, "an_atom"), &v) ? 0 : 1);
+    }
+    case 133: {                                /* the tail of [1,2,3] is a 2-element list */
+        ERL_NIF_TERM arr[3];
+        ERL_NIF_TERM head = 0, tail = 0;
+        unsigned n = 0;
+        arr[0] = enif_make_int(env, 1);
+        arr[1] = enif_make_int(env, 2);
+        arr[2] = enif_make_int(env, 3);
+        if (!enif_get_list_cell(env, enif_make_list_from_array(env, arr, 3), &head, &tail))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (enif_get_list_length(env, tail, &n) && n == 2) ? 1 : 0);
+    }
+    case 134: {                                /* a 1-element list: head 7, empty tail */
+        ERL_NIF_TERM arr[1];
+        ERL_NIF_TERM head = 0, tail = 0;
+        unsigned n = 99;
+        int v = 0;
+        arr[0] = enif_make_int(env, 7);
+        if (!enif_get_list_cell(env, enif_make_list_from_array(env, arr, 1), &head, &tail))
+            return enif_make_int(env, 0);
+        if (!enif_get_int(env, head, &v) || v != 7)
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (enif_get_list_length(env, tail, &n) && n == 0) ? 1 : 0);
+    }
+    case 135: {                                /* make_reverse_list of [1,2] heads with 2 */
+        ERL_NIF_TERM arr[2];
+        ERL_NIF_TERM rev = 0, head = 0, tail = 0;
+        int v = 0;
+        arr[0] = enif_make_int(env, 1);
+        arr[1] = enif_make_int(env, 2);
+        if (!enif_make_reverse_list(env, enif_make_list_from_array(env, arr, 2), &rev))
+            return enif_make_int(env, 0);
+        if (!enif_get_list_cell(env, rev, &head, &tail))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, enif_get_int(env, head, &v) ? v : 0);
+    }
+    case 136: {                                /* get_tuple refuses a list */
+        ERL_NIF_TERM arr[1];
+        int arity = -1;
+        const ERL_NIF_TERM* got = NULL;
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            enif_get_tuple(env, enif_make_list_from_array(env, arr, 1), &arity, &got) ? 0 : 1);
+    }
+    case 137: {                                /* is_tuple is false for a list */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            enif_is_tuple(env, enif_make_list_from_array(env, arr, 1)) ? 0 : 1);
+    }
+    case 138: {                                /* make_new_binary of one byte */
+        ERL_NIF_TERM t;
+        ErlNifBinary v;
+        unsigned char* p = enif_make_new_binary(env, 1, &t);
+        if (p == NULL)
+            return enif_make_int(env, 0);
+        p[0] = 'z';
+        if (!enif_inspect_binary(env, t, &v))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (v.size == 1 && v.data[0] == 'z') ? 1 : 0);
+    }
+    case 139: {                                /* a sub-binary of a sub-binary keeps its bytes */
+        ERL_NIF_TERM b = enif_make_sub_binary(env, make_bytes(env, "abcdef", 6), 2, 2);
+        ERL_NIF_TERM s = enif_make_sub_binary(env, b, 1, 1);
+        ErlNifBinary v;
+        if (!enif_inspect_binary(env, s, &v))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (v.size == 1 && v.data[0] == 'd') ? 1 : 0);
+    }
+    case 140: {                                /* a 3-entry map built by make_map_put */
+        ERL_NIF_TERM m1, m2, m3;
+        size_t sz = 0;
+        ERL_NIF_TERM empty = enif_make_new_map(env);
+        if (!enif_make_map_put(env, empty, enif_make_atom(env, "a"), enif_make_int(env, 1), &m1))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_put(env, m1, enif_make_atom(env, "b"), enif_make_int(env, 2), &m2))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_put(env, m2, enif_make_atom(env, "c"), enif_make_int(env, 3), &m3))
+            return enif_make_int(env, 0);
+        if (!enif_get_map_size(env, m3, &sz))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (int) sz);
+    }
+    case 141: {                                /* get_map_value returns the identical value */
+        ERL_NIF_TERM m, v = 0;
+        ERL_NIF_TERM val = enif_make_int(env, 77);
+        if (!enif_make_map_put(env, enif_make_new_map(env), enif_make_atom(env, "k"), val, &m))
+            return enif_make_int(env, 0);
+        if (!enif_get_map_value(env, m, enif_make_atom(env, "k"), &v))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, enif_is_identical(v, val) ? 1 : 0);
+    }
+    case 142: {                                /* removing one of two entries leaves one */
+        ERL_NIF_TERM m1, m2, m3;
+        size_t sz = 0;
+        ERL_NIF_TERM empty = enif_make_new_map(env);
+        if (!enif_make_map_put(env, empty, enif_make_atom(env, "a"), enif_make_int(env, 1), &m1))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_put(env, m1, enif_make_atom(env, "b"), enif_make_int(env, 2), &m2))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_remove(env, m2, enif_make_atom(env, "a"), &m3))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (enif_get_map_size(env, m3, &sz) && sz == 1) ? 1 : 0);
+    }
+    case 143: {                                /* updating one of two entries keeps the size */
+        ERL_NIF_TERM m1, m2, m3, v = 0;
+        size_t sz = 0;
+        int iv = 0;
+        ERL_NIF_TERM empty = enif_make_new_map(env);
+        if (!enif_make_map_put(env, empty, enif_make_atom(env, "a"), enif_make_int(env, 1), &m1))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_put(env, m1, enif_make_atom(env, "b"), enif_make_int(env, 2), &m2))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_update(env, m2, enif_make_atom(env, "b"), enif_make_int(env, 5), &m3))
+            return enif_make_int(env, 0);
+        if (!enif_get_map_size(env, m3, &sz) || sz != 2)
+            return enif_make_int(env, 0);
+        if (!enif_get_map_value(env, m3, enif_make_atom(env, "b"), &v))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (enif_get_int(env, v, &iv) && iv == 5) ? 1 : 0);
+    }
+    case 144: {                                /* the empty atom round trips under its length */
+        ERL_NIF_TERM t = enif_make_atom_len(env, "zzz", 0);
+        unsigned n = 99;
+        if (!enif_get_atom_length(env, t, &n, ERL_NIF_LATIN1))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, n == 0 ? 1 : 0);
+    }
+    case 145: {                                /* get_atom refuses a non-atom */
+        char buf[16];
+        return enif_make_int(env,
+            enif_get_atom(env, enif_make_int(env, 1), buf, sizeof(buf), ERL_NIF_LATIN1) ? 0 : 1);
+    }
+    case 146: {                                /* get_atom_length refuses a non-atom */
+        unsigned n = 99;
+        return enif_make_int(env,
+            enif_get_atom_length(env, enif_make_int(env, 1), &n, ERL_NIF_LATIN1) ? 0 : 1);
+    }
+    case 147: {                                /* make_string_len of zero length */
+        char buf[4];
+        int r = enif_get_string(env, enif_make_string_len(env, "xy", 0, ERL_NIF_LATIN1),
+                                buf, sizeof(buf), ERL_NIF_LATIN1);
+        return enif_make_int(env, (r == 1 && buf[0] == '\0') ? 1 : 0);
+    }
+    case 148: {                                /* get_string_length refuses a non-string */
+        unsigned n = 99;
+        return enif_make_int(env,
+            enif_get_string_length(env, enif_make_int(env, 1), &n, ERL_NIF_LATIN1) ? 0 : 1);
+    }
+    case 149: {                                /* compare two equal binaries is 0 */
+        return enif_make_int(env,
+            enif_compare(make_bytes(env, "same", 4), make_bytes(env, "same", 4)) == 0 ? 1 : 0);
+    }
+    case 150: {                                /* compare two ordered binaries is -1 */
+        return enif_make_int(env,
+            enif_compare(make_bytes(env, "abc", 3), make_bytes(env, "abd", 3)) == -1 ? 1 : 0);
+    }
+    case 151: {                                /* compare two equal lists is 0 */
+        ERL_NIF_TERM a[2], b[2];
+        a[0] = enif_make_int(env, 1); a[1] = enif_make_int(env, 2);
+        b[0] = enif_make_int(env, 1); b[1] = enif_make_int(env, 2);
+        return enif_make_int(env,
+            enif_compare(enif_make_list_from_array(env, a, 2),
+                         enif_make_list_from_array(env, b, 2)) == 0 ? 1 : 0);
+    }
+    case 152: {                                /* term_type of a reference */
+        return enif_make_int(env,
+            enif_term_type(env, enif_make_ref(env)) == ERL_NIF_TERM_TYPE_REFERENCE ? 1 : 0);
+    }
+    case 153: {                                /* is_identical holds for the same atom name */
+        return enif_make_int(env,
+            enif_is_identical(enif_make_atom(env, "ok"), enif_make_atom(env, "ok")) ? 1 : 0);
+    }
+    case 154: {                                /* is_identical differs for an atom and a binary */
+        return enif_make_int(env,
+            enif_is_identical(enif_make_atom(env, "ok"), make_bytes(env, "ok", 2)) ? 0 : 1);
+    }
+    case 155: {                                /* is_identical holds for two equal maps */
+        ERL_NIF_TERM m1, m2;
+        if (!enif_make_map_put(env, enif_make_new_map(env), enif_make_atom(env, "k"),
+                               enif_make_int(env, 1), &m1))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_put(env, enif_make_new_map(env), enif_make_atom(env, "k"),
+                               enif_make_int(env, 1), &m2))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, enif_is_identical(m1, m2) ? 1 : 0);
+    }
+    case 156: {                                /* term_size of a 1-element list is 2 words */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            (int) (enif_term_size(enif_make_list_from_array(env, arr, 1))
+                   / sizeof(ERL_NIF_TERM)));
+    }
+    case 157: {                                /* term_size of a 1-tuple is 2 words */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            (int) (enif_term_size(enif_make_tuple_from_array(env, arr, 1))
+                   / sizeof(ERL_NIF_TERM)));
+    }
+    case 158: {                                /* term_size of the empty tuple is 1 word */
+        ERL_NIF_TERM none[1] = {0};
+        return enif_make_int(env,
+            (int) (enif_term_size(enif_make_tuple_from_array(env, none, 0))
+                   / sizeof(ERL_NIF_TERM)));
+    }
+    case 159: {                                /* term_size of a 2-element list is 4 words */
+        ERL_NIF_TERM arr[2];
+        arr[0] = enif_make_int(env, 1);
+        arr[1] = enif_make_int(env, 2);
+        return enif_make_int(env,
+            (int) (enif_term_size(enif_make_list_from_array(env, arr, 2))
+                   / sizeof(ERL_NIF_TERM)));
+    }
+    case 160: {                                /* unique_integer([monotonic]) increases thrice */
+        ErlNifSInt64 a = 0, b = 0, c = 0;
+        if (!enif_get_int64(env, enif_make_unique_integer(env, ERL_NIF_UNIQUE_MONOTONIC), &a))
+            return enif_make_int(env, 0);
+        if (!enif_get_int64(env, enif_make_unique_integer(env, ERL_NIF_UNIQUE_MONOTONIC), &b))
+            return enif_make_int(env, 0);
+        if (!enif_get_int64(env, enif_make_unique_integer(env, ERL_NIF_UNIQUE_MONOTONIC), &c))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (b > a && c > b) ? 1 : 0);
+    }
+    case 161: {                                /* convert_time_unit 2e9 ns -> 2 s */
+        ErlNifTime s = enif_convert_time_unit((ErlNifTime) 2000000000, ERL_NIF_NSEC, ERL_NIF_SEC);
+        return enif_make_int(env, s == 2 ? 1 : 0);
+    }
+    case 162: {                                /* convert_time_unit 2000 us -> 2 ms */
+        ErlNifTime ms = enif_convert_time_unit((ErlNifTime) 2000, ERL_NIF_USEC, ERL_NIF_MSEC);
+        return enif_make_int(env, ms == 2 ? 1 : 0);
+    }
+    case 163: {                                /* convert_time_unit 3 ms -> 3000 us */
+        ErlNifTime us = enif_convert_time_unit((ErlNifTime) 3, ERL_NIF_MSEC, ERL_NIF_USEC);
+        return enif_make_int(env, us == 3000 ? 1 : 0);
+    }
+    case 164: {                                /* convert_time_unit identity holds */
+        ErlNifTime t = enif_convert_time_unit((ErlNifTime) 7, ERL_NIF_SEC, ERL_NIF_SEC);
+        return enif_make_int(env, t == 7 ? 1 : 0);
+    }
+    case 165: {                                /* the pid from enif_self is one identity */
+        ErlNifPid pid;
+        if (enif_self(env, &pid) == NULL)
+            return enif_make_int(env, 0);
+        return enif_make_int(env,
+            enif_is_identical(enif_make_pid(env, &pid), enif_make_pid(env, &pid)) ? 1 : 0);
+    }
+    case 166: {                                /* two freshly minted refs are distinct */
+        return enif_make_int(env,
+            enif_is_identical(enif_make_ref(env), enif_make_ref(env)) ? 0 : 1);
+    }
+    case 167: {                                /* phash2 of an atom is salt-independent */
+        ERL_NIF_TERM t = enif_make_atom(env, "ok");
+        ErlNifUInt64 h0 = enif_hash(ERL_NIF_PHASH2, t, 0);
+        ErlNifUInt64 h1 = enif_hash(ERL_NIF_PHASH2, t, 12345);
+        return enif_make_int(env, (h0 == h1 && h0 < ((ErlNifUInt64) 1 << 27)) ? 1 : 0);
+    }
+    case 168: {                                /* is_number accepts both numbers, refuses a list */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            (enif_is_number(env, enif_make_int(env, 1)) &&
+             enif_is_number(env, enif_make_double(env, 2.5)) &&
+             !enif_is_number(env, enif_make_list_from_array(env, arr, 1))) ? 1 : 0);
+    }
+    case 169: {                                /* is_binary refuses a list */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            enif_is_binary(env, enif_make_list_from_array(env, arr, 1)) ? 0 : 1);
+    }
+    case 170: {                                /* is_list refuses a binary */
+        return enif_make_int(env, enif_is_list(env, make_bytes(env, "ab", 2)) ? 0 : 1);
+    }
+    case 171: {                                /* compare orders an integer before a list */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            enif_compare(enif_make_int(env, 1), enif_make_list_from_array(env, arr, 1)) == -1
+                ? 1 : 0);
+    }
+
     default:
         break;
     }
@@ -1759,6 +2089,271 @@ pub(crate) fn group() -> Vec<Case> {
             &[127],
             "0",
         ),
+        // --- the widened accessor / order / size block -------------------------------------
+        case(
+            "nif_abi/int_int64_max_roundtrip",
+            "INT64_MAX survives an enif_make_int64/enif_get_int64 round trip",
+            &[128],
+            "1",
+        ),
+        case(
+            "nif_abi/int_uint64_max_roundtrip",
+            "UINT64_MAX survives an enif_make_uint64/enif_get_uint64 round trip",
+            &[129],
+            "1",
+        ),
+        case(
+            "nif_abi/float_zero_roundtrip",
+            "enif_make_double/enif_get_double round trip a 0.0",
+            &[130],
+            "1",
+        ),
+        case(
+            "nif_abi/int_get_long_rejects_float",
+            "enif_get_long refuses a float",
+            &[131],
+            "1",
+        ),
+        case(
+            "nif_abi/int_get_ulong_rejects_atom",
+            "enif_get_ulong refuses a non-number",
+            &[132],
+            "1",
+        ),
+        case(
+            "nif_abi/list_tail_of_three_has_length_two",
+            "the tail enif_get_list_cell reports for [1,2,3] is a 2-element list",
+            &[133],
+            "1",
+        ),
+        case(
+            "nif_abi/list_singleton_head_and_tail",
+            "a 1-element list reports head 7 and an empty-list tail",
+            &[134],
+            "1",
+        ),
+        case(
+            "nif_abi/list_make_reverse_list_two_head",
+            "enif_make_reverse_list reverses [1,2] (head 2)",
+            &[135],
+            "2",
+        ),
+        case(
+            "nif_abi/tuple_get_tuple_rejects_list",
+            "enif_get_tuple refuses a list",
+            &[136],
+            "1",
+        ),
+        case(
+            "nif_abi/tuple_is_tuple_false_for_list",
+            "enif_is_tuple is false for a list",
+            &[137],
+            "1",
+        ),
+        case(
+            "nif_abi/binary_make_new_binary_one_byte",
+            "enif_make_new_binary writes a one-byte binary in place",
+            &[138],
+            "1",
+        ),
+        case(
+            "nif_abi/binary_sub_binary_of_sub_binary",
+            "enif_make_sub_binary of a sub-binary keeps the inner window's bytes",
+            &[139],
+            "1",
+        ),
+        case(
+            "nif_abi/map_three_puts_have_size_three",
+            "three enif_make_map_put calls grow the map to size 3",
+            &[140],
+            "3",
+        ),
+        case(
+            "nif_abi/map_get_map_value_identical",
+            "enif_get_map_value returns the very term that was put",
+            &[141],
+            "1",
+        ),
+        case(
+            "nif_abi/map_remove_one_of_two",
+            "removing one of two entries leaves a 1-entry map",
+            &[142],
+            "1",
+        ),
+        case(
+            "nif_abi/map_update_keeps_size_and_value",
+            "enif_make_map_update on one of two entries keeps the size and installs the new value",
+            &[143],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_make_atom_len_empty",
+            "enif_make_atom_len of length 0 yields the empty atom, whose length is 0",
+            &[144],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_get_atom_rejects_non_atom",
+            "enif_get_atom refuses a non-atom",
+            &[145],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_get_atom_length_rejects_non_atom",
+            "enif_get_atom_length refuses a non-atom",
+            &[146],
+            "1",
+        ),
+        case(
+            "nif_abi/string_make_string_len_zero",
+            "enif_make_string_len of length 0 yields the empty string",
+            &[147],
+            "1",
+        ),
+        case(
+            "nif_abi/string_get_string_length_rejects_non_string",
+            "enif_get_string_length refuses a non-string",
+            &[148],
+            "1",
+        ),
+        case(
+            "nif_abi/compare_equal_binaries",
+            "enif_compare ranks two binaries with the same bytes equal (0)",
+            &[149],
+            "1",
+        ),
+        case(
+            "nif_abi/compare_ordered_binaries",
+            "enif_compare orders two binaries bytewise (-1)",
+            &[150],
+            "1",
+        ),
+        case(
+            "nif_abi/compare_equal_lists",
+            "enif_compare ranks two structurally equal lists equal (0)",
+            &[151],
+            "1",
+        ),
+        case(
+            "nif_abi/term_type_reference",
+            "enif_term_type reports a reference for the term enif_make_ref wrote",
+            &[152],
+            "1",
+        ),
+        case(
+            "nif_abi/identity_same_atom_name",
+            "enif_is_identical holds for two terms naming the same atom",
+            &[153],
+            "1",
+        ),
+        case(
+            "nif_abi/identity_atom_vs_binary",
+            "enif_is_identical differs for an atom and a binary with the same bytes",
+            &[154],
+            "1",
+        ),
+        case(
+            "nif_abi/identity_equal_maps",
+            "enif_is_identical holds for two structurally equal maps",
+            &[155],
+            "1",
+        ),
+        case(
+            "nif_abi/term_size_singleton_list",
+            "enif_term_size reports two words for a 1-element list",
+            &[156],
+            "2",
+        ),
+        case(
+            "nif_abi/term_size_singleton_tuple",
+            "enif_term_size reports two words for a 1-tuple",
+            &[157],
+            "2",
+        ),
+        case(
+            "nif_abi/term_size_empty_tuple",
+            "enif_term_size reports no heap words for the empty tuple",
+            &[158],
+            "0",
+        ),
+        case(
+            "nif_abi/term_size_two_element_list",
+            "enif_term_size reports four words for a 2-element list",
+            &[159],
+            "4",
+        ),
+        case(
+            "nif_abi/unique_integer_monotonic_three",
+            "enif_make_unique_integer([monotonic]) strictly increases across three calls",
+            &[160],
+            "1",
+        ),
+        case(
+            "nif_abi/time_convert_two_seconds",
+            "enif_convert_time_unit maps 2e9 ns to 2 s",
+            &[161],
+            "1",
+        ),
+        case(
+            "nif_abi/time_convert_two_msec_from_usec",
+            "enif_convert_time_unit maps 2000 us to 2 ms",
+            &[162],
+            "1",
+        ),
+        case(
+            "nif_abi/time_convert_msec_to_usec",
+            "enif_convert_time_unit maps 3 ms to 3000 us",
+            &[163],
+            "1",
+        ),
+        case(
+            "nif_abi/time_convert_identity",
+            "enif_convert_time_unit is the identity within one unit",
+            &[164],
+            "1",
+        ),
+        case(
+            "nif_abi/process_self_pid_identity",
+            "the pid term enif_make_pid writes for enif_self is identical to itself",
+            &[165],
+            "1",
+        ),
+        case(
+            "nif_abi/ref_two_refs_are_distinct",
+            "two freshly minted references are not identical",
+            &[166],
+            "1",
+        ),
+        case(
+            "nif_abi/hash_phash2_atom_salt_independent",
+            "enif_hash(ERL_NIF_PHASH2, ..) on an atom ignores the salt and stays below 2^27",
+            &[167],
+            "1",
+        ),
+        case(
+            "nif_abi/pred_is_number_accepts_numbers_rejects_list",
+            "enif_is_number accepts an integer and a float and refuses a list",
+            &[168],
+            "1",
+        ),
+        case(
+            "nif_abi/pred_is_binary_rejects_list",
+            "enif_is_binary refuses a list",
+            &[169],
+            "1",
+        ),
+        case(
+            "nif_abi/pred_is_list_rejects_binary",
+            "enif_is_list refuses a binary",
+            &[170],
+            "1",
+        ),
+        case(
+            "nif_abi/compare_integer_before_list",
+            "enif_compare orders an integer before a list (-1)",
+            &[171],
+            "1",
+        ),
     ]
 }
 #[cfg(test)]
@@ -2022,6 +2617,54 @@ mod tests {
             !super::NIF_ABI_C.contains("enif_demonitor_process("),
             "the library must not call enif_demonitor_process (a probe hazard)"
         );
+    }
+
+    #[test]
+    fn the_c_library_covers_the_widened_accessor_order_and_size_block() {
+        // The families the fourth block adds (each symbol must really be referenced), one further
+        // shape of each: the wrong-type refusals, the container edges, the order lattice points
+        // and the word counts.
+        for symbol in [
+            "enif_make_int64(",
+            "enif_make_uint64(",
+            "enif_get_long(",
+            "enif_get_ulong(",
+            "enif_get_double(",
+            "enif_make_double(",
+            "enif_get_list_cell(",
+            "enif_get_list_length(",
+            "enif_make_reverse_list(",
+            "enif_get_tuple(",
+            "enif_is_tuple(",
+            "enif_make_new_binary(",
+            "enif_make_sub_binary(",
+            "enif_make_map_put(",
+            "enif_make_map_remove(",
+            "enif_make_map_update(",
+            "enif_get_map_value(",
+            "enif_get_map_size(",
+            "enif_make_atom_len(",
+            "enif_get_atom_length(",
+            "enif_make_string_len(",
+            "enif_get_string_length(",
+            "enif_compare(",
+            "enif_term_type(",
+            "enif_is_identical(",
+            "enif_term_size(",
+            "enif_make_unique_integer(",
+            "enif_convert_time_unit(",
+            "enif_make_ref(",
+            "enif_make_pid(",
+            "enif_hash(",
+            "enif_is_number(",
+            "enif_is_binary(",
+            "enif_is_list(",
+        ] {
+            assert!(
+                super::NIF_ABI_C.contains(symbol),
+                "the library must reference {symbol}"
+            );
+        }
     }
 
     #[test]

@@ -142,6 +142,63 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "print/format_f_directives",
+            description: "~f / ~.Nf / width / left-adjust of a float through io_lib:format",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Flattened so the compared stdout line is the exact character sequence.
+                expr: "lists:flatten(io_lib:format(\"~f|~.2f|~.10f|~8.2f|~-8.2f|\", [3.14159,3.14159,3.14159,3.14159,3.14159]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [51,46,49,52,49,53,57,48,124,51,46,49,52,124,51,46,49,52,49,53,57,48,48,48,48,48,124,32,32,32,32,51,46,49,52,124,51,46,49,52,32,32,32,32,124]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "print/format_float_directives",
+            description: "~e / ~.Ne / ~.Ng / ~g notation choices through io_lib:format",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~e|~.2e|~.2g|~g\", [1234.5,1234.5,1234.5,1234.5]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [49,46,50,51,52,53,48,101,43,51,124,49,46,50,101,43,51,124,49,46,50,101,43,51,124,49,50,51,52,46,53,48]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "print/format_s_and_ts",
+            description: "~s (latin1 binary/list) and ~ts (unicode) render the same code points",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~s|~ts\", [<<\"hello\">>, [233,108,108,111]]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [104,101,108,108,111,124,233,108,108,111]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "print/float_to_list_precision",
+            description: "float_to_list/2 with {decimals,N} and {scientific,N}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{erlang:float_to_list(3.14159, [{decimals,3}]), erlang:float_to_list(1.0, [{scientific,2}]), erlang:float_to_list(1234.5, [{decimals,0}])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[51,46,49,52,50],[49,46,48,48,101,43,48,48],[49,50,51,53]}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -152,7 +209,7 @@ mod tests {
 
     /// Every case id in this group (the group's contract is pinned by the registry tests
     /// too, but this keeps the ids in one place for the assertions below).
-    const IDS: [&str; 7] = [
+    const IDS: [&str; 11] = [
         "float/short_to_list",
         "float/short_to_binary",
         "print/p_nested_containers",
@@ -160,6 +217,10 @@ mod tests {
         "print/p_printable_latin1_binary",
         "print/left_adjusted_badarg",
         "print/w_binary_depth_elision",
+        "print/format_f_directives",
+        "print/format_float_directives",
+        "print/format_s_and_ts",
+        "print/float_to_list_precision",
     ];
 
     fn golden(id: &str) -> &'static str {

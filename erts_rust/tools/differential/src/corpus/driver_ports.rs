@@ -24,7 +24,12 @@
 //! (`os:cmd/1`, the read path, `port_command/2,3` round trips, `port_info/1,2`); this one
 //! pins what `open_port/2` does with the arguments it must **reject** (an empty or non-string
 //! name, a name that is not a tuple, an unknown option) or with a `spawn_executable` child
-//! that cannot be started.
+//! that cannot be started — plus the widened rejection grammar: an option argument that is not
+//! a list at all, plain integers in the option list, a non-string `spawn`/`spawn_executable`
+//! command, a port-type tag the emulator does not know, an empty `spawn_driver` name, a bare
+//! `{packet_size, N}` without its `{packet, N}` companion, and the socket-family
+//! `{active, …}`/`{mode, …}` options a port does not accept. Every rejection is `badarg`
+//! (bar the `spawn_executable` `enoent`).
 //!
 //! Like every port case these open real (or deliberately unopenable) OS processes, so they
 //! stay small and fast. An empty name is validated *before* any driver runs, so it never
@@ -126,6 +131,102 @@ pub(crate) fn group() -> Vec<Case> {
             "driver/open_port_unknown_option_is_badarg",
             "open_port/2 rejects an unknown option with badarg (before any child is spawned)",
             "try open_port({spawn,\"cat\"},[nope]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_option_list_must_be_a_list",
+            "open_port/2 rejects an option argument that is not a list with badarg",
+            "try open_port({spawn,\"cat\"},{}) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_non_option_elements_are_badarg",
+            "open_port/2 rejects an option list of plain integers with badarg",
+            "try open_port({spawn,\"cat\"},[1,2,3]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_spawn_executable_non_string_name_badarg",
+            "open_port/2 rejects a non-string {spawn_executable, 42} name with badarg",
+            "try open_port({spawn_executable,42},[]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_spawn_executable_missing_path_with_bad_options",
+            "a missing spawn_executable path is badarg when the option list itself is not a list",
+            "try open_port({spawn_executable,\"/nonexistent/x\"},{}) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_spawn_non_string_name_tuple_is_badarg",
+            "open_port/2 rejects a {spawn, …} whose command is not a string with badarg",
+            "try open_port({spawn,{bad,name}},[binary]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_spawn_then_bad_option_is_badarg",
+            "a {spawn, 42} name is rejected with badarg even when the options are valid",
+            "try open_port({spawn,42},[binary]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_spawn_driver_empty_name_badarg",
+            "open_port/2 rejects an empty {spawn_driver, \"\"} name with badarg",
+            "try open_port({spawn_driver,\"\"},[]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_unknown_port_type_is_badarg",
+            "open_port/2 rejects a port-type tag that is not spawn/spawn_driver/spawn_executable",
+            "try open_port({\"bad\",\"name\"},[]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_packet_size_option_without_packet_is_badarg",
+            "open_port/2 rejects a bare {packet_size, N} (it needs a {packet, N} companion) with badarg",
+            "try open_port({spawn,\"cat\"},[{packet_size,0}]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_active_option_is_badarg",
+            "open_port/2 rejects the socket-family {active, …} option with badarg",
+            "try open_port({spawn,\"cat\"},[{active,true}]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_mode_option_is_badarg",
+            "open_port/2 rejects the socket-family {mode, …} option with badarg",
+            "try open_port({spawn,\"cat\"},[{mode,binary}]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_unknown_atom_option_is_badarg",
+            "open_port/2 rejects a bare unknown option atom appended to a valid option list with badarg",
+            "try open_port({spawn,\"cat\"},[binary,unknown_atom]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_string_option_is_badarg",
+            "open_port/2 rejects a string where an option is expected with badarg",
+            "try open_port({spawn,\"cat\"},[binary,\"str\"]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_active_once_option_is_badarg",
+            "open_port/2 rejects the socket-family {active, once} option with badarg",
+            "try open_port({spawn,\"cat\"},[binary,{active,once}]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_packet_size_without_packet_is_badarg",
+            "open_port/2 rejects a non-zero {packet_size, N} without its {packet, N} companion with badarg",
+            "try open_port({spawn,\"cat\"},[binary,{packet_size,1}]) catch error:Reason -> Reason end",
+            "ok badarg",
+        ),
+        case(
+            "driver/open_port_packet_size_non_integer_is_badarg",
+            "open_port/2 rejects a non-integer {packet_size, …} with badarg",
+            "try open_port({spawn,\"cat\"},[binary,{packet,4},{packet_size,ab}]) catch error:Reason -> Reason end",
             "ok badarg",
         ),
     ]
@@ -231,5 +332,52 @@ mod tests {
             expr.contains("spawn_executable") && expr.contains("/nonexistent/"),
             "the enoent case must open a spawn_executable on a missing absolute path, got {expr:?}"
         );
+    }
+
+    /// The rejection grammar widened past the original six: a bad option *container*, plain
+    /// integers in the option list, a non-string `spawn`/`spawn_executable` command, an unknown
+    /// port-type tag, an empty `spawn_driver` name, and the socket-family options a port does
+    /// not accept. Every one of them is the oracle's `badarg`.
+    const WIDENED_REJECTION_IDS: &[&str] = &[
+        "driver/open_port_option_list_must_be_a_list",
+        "driver/open_port_non_option_elements_are_badarg",
+        "driver/open_port_spawn_executable_non_string_name_badarg",
+        "driver/open_port_spawn_executable_missing_path_with_bad_options",
+        "driver/open_port_spawn_non_string_name_tuple_is_badarg",
+        "driver/open_port_spawn_then_bad_option_is_badarg",
+        "driver/open_port_spawn_driver_empty_name_badarg",
+        "driver/open_port_unknown_port_type_is_badarg",
+        "driver/open_port_packet_size_option_without_packet_is_badarg",
+        "driver/open_port_active_option_is_badarg",
+        "driver/open_port_mode_option_is_badarg",
+        "driver/open_port_unknown_atom_option_is_badarg",
+        "driver/open_port_string_option_is_badarg",
+        "driver/open_port_active_once_option_is_badarg",
+        "driver/open_port_packet_size_without_packet_is_badarg",
+        "driver/open_port_packet_size_non_integer_is_badarg",
+    ];
+
+    #[test]
+    fn the_widened_rejection_grammar_is_badarg_for_every_member() {
+        let cases = group();
+        assert_eq!(
+            cases.len(),
+            WIDENED_REJECTION_IDS.len() + 6,
+            "the group is the original six rejections plus the widened {}",
+            WIDENED_REJECTION_IDS.len()
+        );
+        for id in WIDENED_REJECTION_IDS {
+            let case = cases
+                .iter()
+                .find(|c| c.id == *id)
+                .unwrap_or_else(|| panic!("case {id} is not registered"));
+            assert_eq!(case.golden.stdout, Some("ok badarg"), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
+        }
+        // The widened set is disjoint from the original six, so the count is exact.
+        let mut ids: Vec<&str> = cases.iter().map(|c| c.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), cases.len(), "the ids are unique");
     }
 }

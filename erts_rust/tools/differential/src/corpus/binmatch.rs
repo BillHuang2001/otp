@@ -171,6 +171,124 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the plain `binary` module surface (encoding, slicing, hex, sub-binaries) --------
+        Case {
+            id: "binary/encode_hex_roundtrip",
+            description: "encode_hex/1,2 (upper/lower) and decode_hex/1 round trip byte-for-byte",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:encode_hex(<<1,2,255>>), binary:encode_hex(<<1,2,255>>, lowercase), binary:decode_hex(<<48,49,48,50,102,102>>)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<48,49,48,50,70,70>>,<<48,49,48,50,102,102>>,<<1,2,255>>}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/at_first_last",
+            description: "binary:at/2, first/1 and last/1 index the documented ends",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:at(<<1,2,3>>, 1), binary:last(<<1,2,9>>), binary:first(<<8,9,10>>)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {2,9,8}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/copy_and_bitsize",
+            description: "binary:copy/2 repeats a subject (count 0 is empty) and bit_size/1 counts bits",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `bit_size/1` is a BIF that counts **bits** (24 here), not bytes.
+                expr: "{binary:copy(<<>>, 5), binary:copy(<<1,2>>, 3), bit_size(<<1,2,3>>)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<>>,<<1,2,1,2,1,2>>,24}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/part_split_list_to_bin",
+            description: "binary:part/3 slicing, list_to_bin/1 and bin_to_list/1,3 agree",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{{binary:part(<<1,2,3,4>>, 0, 2), binary:part(<<1,2,3,4>>, 2, 2)}, binary:list_to_bin([1,2,3]), binary:bin_to_list(<<1,2,3>>), binary:bin_to_list(<<1,2,3>>, 1, 2)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {{<<1,2>>,<<3,4>>},<<1,2,3>>,[1,2,3],[2,3]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/longest_common",
+            description: "binary:longest_common_prefix/1 and longest_common_suffix/1 agree",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:longest_common_prefix([<<1,2,3>>, <<1,2,4>>]), binary:longest_common_suffix([<<1,2,3>>, <<0,2,3>>])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {2,2}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/sub_binary_patterns",
+            description: "the sub-binary match patterns <<B:N/binary, Rest/binary>> agree at two sizes",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A sub-binary pattern yields a *reference into* the same binary; the shapes
+                // (and the tail split) are what an observable program depends on.
+                expr: "{begin <<A:4/binary, B/binary>> = <<1,2,3,4,5,6>>, {A, B} end, begin <<D:2/binary, E/binary>> = <<2,3,4>>, {D, E} end}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {{<<1,2,3,4>>,<<5,6>>},{<<2,3>>,<<4>>}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/replace_family",
+            description: "binary:replace/3,4: first-only by default, [global], a literal with no match, and a pattern list",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:replace(<<\"abcabc\">>, <<\"b\">>, <<\"X\">>), binary:replace(<<\"abcabc\">>, <<\"b\">>, <<\"X\">>, [global]), binary:replace(<<\"abc\">>, <<\"z\">>, <<\"X\">>), binary:replace(<<\"abcabc\">>, [<<\"b\">>,<<\"c\">>], <<\"X\">>, [global])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<97,88,99,97,98,99>>,<<97,88,99,97,88,99>>,<<97,98,99>>,<<97,88,88,97,88,88>>}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/badarg_surface",
+            description: "the rejected binary-argument shapes (out-of-range index, over-long part, odd hex, non-byte-aligned, negative count, non-binary subject) are badarg",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Only the **reason** is observed for each call (a bare `catch` would embed a
+                // volatile stack trace).
+                expr: "[begin try binary:at(<<1,2>>, 5) catch error:R1 -> R1 end end, begin try binary:part(<<1,2>>, 0, 3) catch error:R2 -> R2 end end, begin try binary:decode_hex(<<48,49,48>>) catch error:R3 -> R3 end end, begin try binary:encode_hex(<<1:3>>) catch error:R4 -> R4 end end, begin try binary:copy(<<1,2>>, -1) catch error:R5 -> R5 end end, begin try binary:at(foo, 0) catch error:R6 -> R6 end end]",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [badarg,badarg,badarg,badarg,badarg,badarg]"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 

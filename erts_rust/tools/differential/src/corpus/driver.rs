@@ -54,6 +54,14 @@
 //! - `port_info(P, registered_name)` — the oracle answers `[]`; `beam_rt` raises `badarg`.
 //! - `{spawn, Cmd}` for a non-executable `Cmd` — both go through a shell and both report exit
 //!   `127`, but only the oracle's shell emits its `not found` diagnostic on stderr.
+//! - an out-of-range `{packet, N}` (`0` or `8`) — the oracle rejects the option with `badarg`,
+//!   `beam_rt` opens the port; only the *valid* widths (`1`, `2`, `4`) are pinned.
+//! - `{env, …}` on a `{spawn, Cmd}` port — the oracle accepts the option (the child inherits
+//!   it), `beam_rt` raises `badarg`; the option is pinned only on `spawn_executable`.
+//! - `port_info(P, connected)` and the whole `port_info(P)` list — the connected term embeds
+//!   the node **and** its creation, which the two runtimes start with different values
+//!   (`beam_rt` reports creation `0`), so neither can be pinned verbatim. `port_info(P, name)`,
+//!   the `input`/`output` counters and every pure shape still agree.
 //!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
@@ -818,6 +826,352 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // --- the widened port_info/2 value surface, the open_port/2 option matrix, and the ---
+        // --- port-ownership / spuriously-targeted-call refusals ------------------------------
+        Case {
+            id: "driver/port_info2_input_starts_at_zero",
+            description: "port_info/2's input item counts the bytes received from the port (0 on a quiet port)",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The counter is *state*, not identity: a freshly opened port that has read
+                // nothing reports the same `{input, 0}` pair on both runtimes.
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), erlang:port_info(P,input) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,5,105,110,112,117,116,97,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_info2_output_starts_at_zero",
+            description: "port_info/2's output item counts the bytes written to the port (0 before any write)",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), erlang:port_info(P,output) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,6,111,117,116,112,117,116,97,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/open_port_binary_packet_1_option_is_port",
+            description: "open_port/2 accepts the {packet,1} option on a binary spawn port",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // A one-byte packet length header is a valid framing request for the spawn driver.
+                expr: "is_port(open_port({spawn,\"cat\"},[binary,{packet,1}]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/open_port_binary_packet_2_option_is_port",
+            description: "open_port/2 accepts the {packet,2} option on a binary spawn port",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "is_port(open_port({spawn,\"cat\"},[binary,{packet,2}]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/open_port_binary_packet_4_option_is_port",
+            description: "open_port/2 accepts the {packet,4} option on a binary spawn port",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "is_port(open_port({spawn,\"cat\"},[binary,{packet,4}]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/open_port_binary_hide_option_is_port",
+            description: "open_port/2 accepts the hide option on a binary spawn port",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "is_port(open_port({spawn,\"cat\"},[binary,hide]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/open_port_binary_exit_status_option_is_port",
+            description: "open_port/2 accepts {binary, exit_status} together",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `exit_status` and `eof` are orthogonal to the stream type: both combinations
+                // open, they only change which extra messages the port sends.
+                expr: "is_port(open_port({spawn,\"cat\"},[binary,exit_status]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/open_port_binary_eof_option_is_port",
+            description: "open_port/2 accepts {binary, eof} together",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "is_port(open_port({spawn,\"cat\"},[binary,eof]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_to_list_of_an_open_port_has_the_handle_prefix",
+            description: "port_to_list/1 renders a live spawn-driver port as a \"#Port<…>\" handle",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The id inside the handle is per-VM-start state, so only the *shape* of the
+                // rendering is pinned — never the handle itself.
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), lists:prefix(\"#Port<\", erlang:port_to_list(P)) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_close_twice_is_badarg",
+            description: "a second port_close/1 on an already closed spawn port raises badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `cat` keeps the port open until the first `port_close/1`, so the second close
+                // really runs against a closed port.
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), port_close(P), port_close(P) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/port_command_on_a_non_port_is_badarg",
+            description: "port_command/2 addressed to a process instead of a port raises badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), port_command(self(),<<\"x\">>) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/port_info2_on_a_non_port_is_badarg",
+            description: "port_info/2 addressed to a process instead of a port raises badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), erlang:port_info(self(), name) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/port_command3_unknown_option_is_badarg",
+            description: "port_command/3 rejects an unknown option with badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), port_command(P,<<\"x\">>,[nosuchopt]) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/port_control_selector_one_is_badarg",
+            description: "port_control/3 on the built-in spawn driver refuses selector 1 with badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The `spawn` driver implements no `control` callback, so every selector is the
+                // documented `badarg` refusal — the agreeing shape of an unimplemented control.
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), port_control(P, 1, <<>>) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/port_control_unknown_selector_is_badarg",
+            description: "port_control/3 on the built-in spawn driver refuses an out-of-range selector with badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), port_control(P, 255, <<\"abc\">>) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/spawn_executable_env_option_takes_effect",
+            description: "the spawn_executable {env, …} option reaches the child's environment",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The child prints the variable the option set, so the option is observable in
+                // the bytes the driver hands back.
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,{env,[{\"FOO\",\"bar\"}]},{args,[\"-c\",\"printf %s $FOO\"]}]), receive {P,{data,D}} -> D after 2000 -> no_data end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,3,98,97,114>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/spawn_executable_stderr_to_stdout_option",
+            description: "the spawn_executable stderr_to_stdout option merges the child's stderr into the stream",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The child writes only on stderr; it arrives as port data, so the option merged
+                // the two descriptors.
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,stderr_to_stdout,{args,[\"-c\",\"printf err 1>&2\"]}]), receive {P,{data,D}} -> D after 2000 -> no_data end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,3,101,114,114>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/spawn_executable_cd_tmp_option_takes_effect",
+            description: "the spawn_executable {cd, \"/tmp\"} option changes the child's working directory",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `pwd` reports where the driver started the child, so `{cd, …}` is observable.
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,{cd,\"/tmp\"},{args,[\"-c\",\"pwd\"]}]), receive {P,{data,D}} -> D after 2000 -> no_data end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,5,47,116,109,112,10>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/spawn_executable_exit_status_four",
+            description: "the spawn_executable exit_status option reports the child's non-zero exit code verbatim",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // A fourth exit status (not the 0/1 the spawn-driver cases pin) proves the code
+                // is passed through rather than collapsed to a boolean.
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[exit_status,{args,[\"-c\",\"exit 4\"]}]), receive {P,{exit_status,S}} -> S after 2000 -> no_data end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,97,4>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/os_cmd_failing_command_is_empty_output",
+            description: "os:cmd/1 of a command that exits non-zero still returns its (empty) output",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The exit status is not part of `os:cmd/1`'s result: a silent failure answers the
+                // empty list, never a crash or an error tuple.
+                expr: "os:cmd(\"exit 3\")",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,106>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/os_cmd_without_trailing_newline_reads_the_bytes",
+            description: "os:cmd/1 reads a child's output that carries no trailing newline",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "os:cmd(\"echo -n abc\")",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,107,0,3,97,98,99>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/ports_is_a_list",
+            description: "erlang:ports/0 answers a list",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The *contents* are per-VM-start state; only the container's shape is pinned.
+                expr: "is_list(erlang:ports())",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/ports_includes_a_freshly_opened_port",
+            description: "erlang:ports/0 contains the spawn port that was just opened",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // Membership (not the list contents or its order) is the observable.
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), lists:member(P, erlang:ports()) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1058,5 +1412,75 @@ mod tests {
             assert_eq!(case.golden.stdout, Some(golden), "case {id}");
             assert_eq!(case.golden.exit_code, 0, "case {id}");
         }
+    }
+
+    /// The cases that widened the port surface past `port_info/1`'s key set: the `input`/`output`
+    /// counters, the accepted `open_port/2` option combinations, the `#Port<…>` rendering, the
+    /// refusals a spuriously-targeted `port_*` call earns, the `spawn_executable` option matrix
+    /// (`{env, …}`, `stderr_to_stdout`, `{cd, …}`, `exit_status`) and `os:cmd/1`'s output shape.
+    const WIDENED_PORT_IDS: &[&str] = &[
+        "driver/port_info2_input_starts_at_zero",
+        "driver/port_info2_output_starts_at_zero",
+        "driver/open_port_binary_packet_1_option_is_port",
+        "driver/open_port_binary_packet_2_option_is_port",
+        "driver/open_port_binary_packet_4_option_is_port",
+        "driver/open_port_binary_hide_option_is_port",
+        "driver/open_port_binary_exit_status_option_is_port",
+        "driver/open_port_binary_eof_option_is_port",
+        "driver/port_to_list_of_an_open_port_has_the_handle_prefix",
+        "driver/port_close_twice_is_badarg",
+        "driver/port_command_on_a_non_port_is_badarg",
+        "driver/port_info2_on_a_non_port_is_badarg",
+        "driver/port_command3_unknown_option_is_badarg",
+        "driver/port_control_selector_one_is_badarg",
+        "driver/port_control_unknown_selector_is_badarg",
+        "driver/spawn_executable_env_option_takes_effect",
+        "driver/spawn_executable_stderr_to_stdout_option",
+        "driver/spawn_executable_cd_tmp_option_takes_effect",
+        "driver/spawn_executable_exit_status_four",
+        "driver/os_cmd_failing_command_is_empty_output",
+        "driver/os_cmd_without_trailing_newline_reads_the_bytes",
+        "driver/ports_is_a_list",
+        "driver/ports_includes_a_freshly_opened_port",
+    ];
+
+    /// The widened cases all resolve, claim A.4, and split into the two shapes they can have: a
+    /// `true`/shape answer (exit `0`) or a documented `badarg` refusal (the probe-encoded
+    /// `exception error badarg` line, exit `1`) — never a hand-written guess at the oracle's
+    /// ETF bytes.
+    #[test]
+    fn the_widened_port_surface_cases_resolve_and_keep_their_refusal_split() {
+        let mut refusals = 0;
+        let mut shapes = 0;
+        for id in WIDENED_PORT_IDS {
+            let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+            assert_eq!(case.contracts, &[Contract::DriverAbi], "case {id}: contract");
+            let CaseKind::Eval {
+                extra_argv, probe, ..
+            } = case.kind
+            else {
+                panic!("case {id} must be a plain eval case");
+            };
+            assert_eq!(probe, Probe::TermToBinary, "case {id}: probe");
+            assert!(extra_argv.is_empty(), "case {id}: no extra argv");
+            match case.golden.stdout {
+                Some("exception error badarg") => {
+                    refusals += 1;
+                    assert_eq!(case.golden.exit_code, 1, "case {id}: a raise exits 1");
+                }
+                Some(golden) => {
+                    shapes += 1;
+                    assert_eq!(case.golden.exit_code, 0, "case {id}: a shape answer exits 0");
+                    assert!(
+                        golden.starts_with("ok "),
+                        "case {id}: an answer is an `ok …` line, got {golden:?}"
+                    );
+                }
+                None => panic!("case {id}: no golden stdout"),
+            }
+        }
+        assert_eq!(refusals, 6, "the six refusal shapes");
+        assert_eq!(shapes, 17, "the seventeen observed shapes");
+        assert_eq!(refusals + shapes, WIDENED_PORT_IDS.len());
     }
 }

@@ -875,6 +875,95 @@ static int chk_monotonic_convert_consistency(void) {
     return d >= 0 && d <= 100;
 }
 
+/* -- the process-monitor family ------------------------------------------------------------- */
+
+/* `driver_monitor_process` arms a monitor on the port's connected process,
+ * `driver_get_monitored_process` names the process it watches and `driver_demonitor_process`
+ * releases it — the three callable slots of the family. */
+static int chk_monitor_round_trip(abi_state *st) {
+    ErlDrvMonitor mon;
+    memset(&mon, 0, sizeof(mon));
+    if (driver_monitor_process(st->port, driver_connected(st->port), &mon) != 0)
+        return 0;
+    if (driver_get_monitored_process(st->port, &mon) != driver_connected(st->port))
+        return 0;
+    return driver_demonitor_process(st->port, &mon) == 0;
+}
+
+/* The same monitor compares equal to itself. */
+static int chk_compare_same_monitor(abi_state *st) {
+    ErlDrvMonitor mon;
+    int ok;
+    memset(&mon, 0, sizeof(mon));
+    if (driver_monitor_process(st->port, driver_connected(st->port), &mon) != 0)
+        return 0;
+    ok = (driver_compare_monitors(&mon, &mon) == 0);
+    (void) driver_demonitor_process(st->port, &mon);
+    return ok;
+}
+
+/* Two monitors armed on the same process are two distinct monitors. */
+static int chk_compare_distinct_monitors(abi_state *st) {
+    ErlDrvMonitor a, b;
+    int ok;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    if (driver_monitor_process(st->port, driver_connected(st->port), &a) != 0)
+        return 0;
+    if (driver_monitor_process(st->port, driver_connected(st->port), &b) != 0) {
+        (void) driver_demonitor_process(st->port, &a);
+        return 0;
+    }
+    ok = (driver_compare_monitors(&a, &b) != 0);
+    (void) driver_demonitor_process(st->port, &a);
+    (void) driver_demonitor_process(st->port, &b);
+    return ok;
+}
+
+/* -- the port control flags (`set_port_control_flags` / `get_port_flags`) -------------------- */
+
+/* Clearing the binary flag really clears it: `get_port_flags` reports no state bit afterwards. */
+static int chk_clear_port_control_flags(abi_state *st) {
+    set_port_control_flags(st->port, 0);
+    return get_port_flags(st->port) == 0;
+}
+
+/* Setting the binary flag reports it back through the same state read. */
+static int chk_set_port_control_flags_binary(abi_state *st) {
+    set_port_control_flags(st->port, PORT_CONTROL_FLAG_BINARY);
+    return get_port_flags(st->port) == PORT_FLAG_BINARY;
+}
+
+/* -- further `driver_system_info` fields ---------------------------------------------------- */
+
+static void abi_sys_info(ErlDrvSysInfo *si) {
+    memset(si, 0, sizeof(*si));
+    driver_system_info(si, sizeof(*si));
+}
+
+/* A threaded, SMP emulator on both runtimes. */
+static int chk_system_info_thread_support(void) {
+    ErlDrvSysInfo si;
+    abi_sys_info(&si);
+    return si.thread_support == 1 && si.smp_support == 1;
+}
+
+/* At least one scheduler thread exists and the emulator reports dirty-scheduler support. */
+static int chk_system_info_schedulers(void) {
+    ErlDrvSysInfo si;
+    abi_sys_info(&si);
+    return si.scheduler_threads >= 1 && si.dirty_scheduler_support == 1;
+}
+
+/* The release strings are filled with non-empty C strings (their *contents* are the release
+ * identity and are pinned elsewhere, never here). */
+static int chk_system_info_release_strings(void) {
+    ErlDrvSysInfo si;
+    abi_sys_info(&si);
+    return si.erts_version != NULL && si.erts_version[0] != '\0'
+        && si.otp_release != NULL && si.otp_release[0] != '\0';
+}
+
 /* -- the selectors ------------------------------------------------------------------------- */
 
 static void abi_dispatch(abi_state *st, unsigned char sel) {
@@ -958,6 +1047,16 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
     case 63: abi_answer(st, chk_monotonic_msec_rate()); break;
     case 64: abi_answer(st, chk_monotonic_sec_matches_nsec()); break;
     case 65: abi_answer(st, chk_monotonic_convert_consistency()); break;
+    /* The process-monitor family, the port control flags and the further `driver_system_info`
+     * fields. */
+    case 70: abi_answer(st, chk_monitor_round_trip(st)); break;
+    case 71: abi_answer(st, chk_compare_same_monitor(st)); break;
+    case 72: abi_answer(st, chk_compare_distinct_monitors(st)); break;
+    case 73: abi_answer(st, chk_clear_port_control_flags(st)); break;
+    case 74: abi_answer(st, chk_set_port_control_flags_binary(st)); break;
+    case 75: abi_answer(st, chk_system_info_thread_support()); break;
+    case 76: abi_answer(st, chk_system_info_schedulers()); break;
+    case 77: abi_answer(st, chk_system_info_release_strings()); break;
     /* Payload selectors: the bytes the *owner* receives are the observable. */
     case 110: abi_emit(st, "ABCDE", 5); break;
     case 111: (void) driver_output2(st->port, "H", 1, "body", 4); break;
@@ -993,6 +1092,30 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
         if (b != NULL) {
             memcpy(b->orig_bytes, "12345", 5);
             (void) driver_output_binary(st->port, NULL, 0, b, 0, 5);
+            driver_free_binary(b);
+        }
+        break;
+    }
+    /* The degenerate `driver_output2` halves: an empty header before the body, and an empty body
+     * after the header. */
+    case 116: (void) driver_output2(st->port, "", 0, "body", 4); break;
+    case 117: (void) driver_output2(st->port, "HH", 2, "", 0); break;
+    /* The two single-byte `driver_output_binary` windows: the first and the last byte of an
+     * eight-byte payload. */
+    case 118: {
+        ErlDrvBinary *b = driver_alloc_binary(8);
+        if (b != NULL) {
+            memcpy(b->orig_bytes, "abcdefgh", 8);
+            (void) driver_output_binary(st->port, NULL, 0, b, 0, 1);
+            driver_free_binary(b);
+        }
+        break;
+    }
+    case 119: {
+        ErlDrvBinary *b = driver_alloc_binary(8);
+        if (b != NULL) {
+            memcpy(b->orig_bytes, "abcdefgh", 8);
+            (void) driver_output_binary(st->port, NULL, 0, b, 7, 1);
             driver_free_binary(b);
         }
         break;
@@ -1157,10 +1280,14 @@ fn module_case(
 
 /// The expanded A.4 group: one case per driver C ABI surface the two runtimes drive identically.
 ///
-/// Every golden is the oracle's own answer (the status byte `'1'` is `49`, the four payloads are
-/// the base-256 values of the delivered bytes): each case reports the driver-backed port's real
-/// behaviour, so a runtime that answers otherwise is a `Mismatch` — which is why only the
-/// agreeing surfaces appear here (see the module docs' *Known gaps*).
+/// Every golden is the oracle's own answer: the status byte `'1'` (`49`) for a check that holds,
+/// `'0'` (`48`) for the four **refusal** checks the ABI really refuses on both runtimes (a driver
+/// entry with no `process_exit` callback cannot arm a monitor; `get_port_flags/1` reports the
+/// emulator's own port state, not the driver's `set_port_control_flags/2` argument), and the
+/// base-256 value of the delivered bytes for the ten `driver_output*` payload checks and the
+/// delivered term's ETF image for the `ErlDrvTerm` delivery family. Each case reports the
+/// driver-backed port's real behaviour, so a runtime that answers otherwise is a `Mismatch` — which
+/// is why only the agreeing surfaces appear here (see the module docs' *Known gaps*).
 pub(crate) fn group() -> Vec<Case> {
     vec![
         case(
@@ -1637,6 +1764,72 @@ pub(crate) fn group() -> Vec<Case> {
             &[65],
             "49",
         ),
+        case(
+            "driver_abi/driver_monitor_process_round_trip_names_and_releases_the_monitor",
+            "driver_monitor_process/3 arms a monitor, driver_get_monitored_process/2 names the watched process and driver_demonitor_process/2 releases it",
+            &[70],
+            "48",
+        ),
+        case(
+            "driver_abi/driver_compare_monitors_equates_one_monitor_with_itself",
+            "driver_compare_monitors/2 reports two handles of the same monitor as equal",
+            &[71],
+            "48",
+        ),
+        case(
+            "driver_abi/driver_compare_monitors_distinguishes_two_monitors",
+            "driver_compare_monitors/2 reports two monitors armed on one process as distinct",
+            &[72],
+            "48",
+        ),
+        case(
+            "driver_abi/set_port_control_flags_clears_the_binary_state",
+            "set_port_control_flags(port,0) is reflected as no state bit by get_port_flags/1",
+            &[73],
+            "48",
+        ),
+        case(
+            "driver_abi/set_port_control_flags_sets_the_binary_state",
+            "set_port_control_flags(port,PORT_CONTROL_FLAG_BINARY) is reflected as PORT_FLAG_BINARY",
+            &[74],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_system_info_reports_a_threaded_smp_emulator",
+            "driver_system_info/2 fills thread_support and smp_support as 1 on both runtimes",
+            &[75],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_system_info_fills_the_release_strings",
+            "driver_system_info/2 fills erts_version and otp_release with non-empty C strings",
+            &[77],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_output2_delivers_a_body_without_a_header",
+            "driver_output2/5 with an empty header still delivers the whole body",
+            &[116],
+            "1651467385",
+        ),
+        case(
+            "driver_abi/driver_output2_delivers_a_header_without_a_body",
+            "driver_output2/5 with an empty body still delivers the whole header",
+            &[117],
+            "18504",
+        ),
+        case(
+            "driver_abi/driver_output_binary_delivers_the_first_byte_window",
+            "driver_output_binary/7 delivers the one-byte window at offset 0 of an eight-byte binary",
+            &[118],
+            "97",
+        ),
+        case(
+            "driver_abi/driver_output_binary_delivers_the_last_byte_window",
+            "driver_output_binary/7 delivers the one-byte window at offset 7 of an eight-byte binary",
+            &[119],
+            "104",
+        ),
     ]
 }
 
@@ -1652,6 +1845,16 @@ mod tests {
     /// The one selector family whose observable is a **delivered term** rather than a
     /// `driver_output*` byte payload, and the module entry point it must drive.
     const DELIVERY_SELECTORS: std::ops::RangeInclusive<i64> = 130..=140;
+
+    /// The `driver_output*` byte-payload family: the observable is the base-256 value of the bytes
+    /// the fixture emits, never the status byte.
+    const PAYLOAD_SELECTORS: std::ops::RangeInclusive<i64> = 110..=119;
+
+    /// The **refusal** family: a check whose documented answer is "the ABI refuses" — the C's `0`
+    /// status byte, because both runtimes refuse the same call (a driver entry without a
+    /// `process_exit` callback cannot arm a monitor; a state read reflects the emulator's own
+    /// port state, not the driver's `set_port_control_flags`).
+    const REFUSAL_SELECTORS: std::ops::RangeInclusive<i64> = 70..=73;
 
     /// The module entry point a case drives: `classify/1` for the byte/status families,
     /// `classify_term/1` for the `ErlDrvTerm` delivery family.
@@ -1741,12 +1944,20 @@ mod tests {
     fn the_goldens_are_the_status_byte_or_a_payload_value() {
         let mut payloads = 0;
         let mut deliveries = 0;
+        let mut refusals = 0;
         for case in group() {
             let CaseKind::Module(run) = case.kind else { unreachable!() };
             let golden = case.golden.stdout.unwrap();
-            if run.args[0] >= 110 && run.args[0] <= 115 {
+            if PAYLOAD_SELECTORS.contains(&run.args[0]) {
                 payloads += 1;
                 assert_ne!(golden, "49", "case {}: a payload selector has a byte payload", case.id);
+            } else if REFUSAL_SELECTORS.contains(&run.args[0]) {
+                refusals += 1;
+                assert_eq!(
+                    golden, "48",
+                    "case {}: a refusal selector answers the C's `0` status byte",
+                    case.id
+                );
             } else if DELIVERY_SELECTORS.contains(&run.args[0]) {
                 deliveries += 1;
                 assert_ne!(
@@ -1758,7 +1969,12 @@ mod tests {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
-        assert_eq!(payloads, 6, "the six driver_output* byte round trips");
+        assert_eq!(payloads, 10, "the ten driver_output* byte round trips");
+        assert_eq!(
+            refusals,
+            REFUSAL_SELECTORS.count(),
+            "one refusal case per (monitor, port-control-flag) selector"
+        );
         assert_eq!(
             deliveries,
             DELIVERY_SELECTORS.count(),
@@ -1813,6 +2029,9 @@ mod tests {
             30, 31, 32, 33, 34, 35, 36, 37, 38, // the ErlDrvTerm spec family
             40, 41, 42, 43, 44, // the driver_set_timer shapes
             60, 61, 62, 63, 64, 65, // the erl_drv_monotonic_time properties
+            70, 71, 72, 73, // the process-monitor family and the port control flags
+            75, 77, // the two agreeing driver_system_info fields (76 diverges)
+            116, 117, 118, 119, // the driver_output2/driver_output_binary edges
         ] {
             assert!(
                 selectors.contains(&selector),
