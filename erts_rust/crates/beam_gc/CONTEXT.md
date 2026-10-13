@@ -86,7 +86,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - After **every** collection the chain is collapsed back to one space via `Nursery::collapse`, which re-sizes
     that space via `young_after_collection` from the round's
     **surviving** words, and a fullsweep sizes the fresh mature space via `mature_after_fullsweep` from
-    `live.rs`'s **exact reachable live word count** — never the pre-collection occupancy (Design Decisions).
+    `live.rs`'s **exact reachable live word count** plus the **young heap's occupancy** (the C
+    `adjust_after_fullsweep` `need_after`, `erl_gc.c:2072`) — never the **mature** occupancy (Design Decisions).
 
 ### `immix/mod.rs` + `immix/collect.rs` — the mark-region mature space (`ImmixSpace`)
 - `pub struct ImmixSpace` — line/block mark-region mature generation; geometry `LINE_WORDS` 16,
