@@ -195,10 +195,7 @@ pub(crate) fn group() -> Vec<Case> {
         t("re/compile-error_hex-brace-non-hex", "re compile errors case `compile-error/hex-brace-non-hex`", r#"re:compile("\\x{zz}")"#, "ok <<131,104,2,119,5,101,114,114,111,114,104,2,107,0,50,110,111,110,45,104,101,120,32,99,104,97,114,97,99,116,101,114,32,105,110,32,92,120,123,125,32,40,99,108,111,115,105,110,103,32,98,114,97,99,101,32,109,105,115,115,105,110,103,63,41,97,4>>"),
         t("re/compile-error_unknown-posix-class", "re compile errors case `compile-error/unknown-posix-class`", r#"re:compile("[[:foo:]]")"#, "ok <<131,104,2,119,5,101,114,114,111,114,104,2,107,0,24,117,110,107,110,111,119,110,32,80,79,83,73,88,32,99,108,97,115,115,32,110,97,109,101,97,8>>"),
         t("re/compile-error_hex-brace-too-large", "re compile errors case `compile-error/hex-brace-too-large`", r#"re:compile("\\x{110000}")"#, "ok <<131,104,2,119,5,101,114,114,111,114,104,2,107,0,55,99,104,97,114,97,99,116,101,114,32,99,111,100,101,32,112,111,105,110,116,32,118,97,108,117,101,32,105,110,32,92,120,123,125,32,111,114,32,92,111,123,125,32,105,115,32,116,111,111,32,108,97,114,103,101,97,9>>"),
-        t("re/compile_control-caseless-shape", "re compile errors case `compile/control-caseless-shape`", r#"case re:compile("a",[caseless]) of
-                     {ok,{re_pattern,N,U,Ca,_}} -> {ok,{re_pattern,N,U,Ca}};
-                     X -> X
-                   end"#, "ok <<131,104,2,119,2,111,107,104,4,119,10,114,101,95,112,97,116,116,101,114,110,97,0,97,0,97,0>>"),
+        t("re/compile_control-caseless-shape", "re compile errors case `compile/control-caseless-shape`", r#"case re:compile("a",[caseless]) of                      {ok,{re_pattern,N,U,Ca,_}} -> {ok,{re_pattern,N,U,Ca}};                      X -> X                    end"#, "ok <<131,104,2,119,2,111,107,104,4,119,10,114,101,95,112,97,116,116,101,114,110,97,0,97,0,97,0>>"),
         t("re/syntax_dot", "re pattern syntax case `syntax/dot`", r#"re:run("xabcy",".")"#, "ok <<131,104,2,119,5,109,97,116,99,104,108,0,0,0,1,104,2,97,0,97,1,106>>"),
         t("re/syntax_dotall-newline", "re pattern syntax case `syntax/dotall-newline`", r#"re:run("a\nb","a.b",[dotall])"#, "ok <<131,104,2,119,5,109,97,116,99,104,108,0,0,0,1,104,2,97,0,97,3,106>>"),
         t("re/syntax_class-range", "re pattern syntax case `syntax/class-range`", r#"re:run("abc","[a-c]+")"#, "ok <<131,104,2,119,5,109,97,116,99,104,108,0,0,0,1,104,2,97,0,97,3,106>>"),
@@ -258,10 +255,7 @@ pub(crate) fn group() -> Vec<Case> {
         t("re/export-import_round-trip", "re pre-compiled patterns / run variants case `export-import/round-trip`", r#"re:run("xabcy", re:import(element(2,re:compile("(b)(c)", [export]))))"#, "ok <<131,104,2,119,5,109,97,116,99,104,108,0,0,0,3,104,2,97,2,97,2,104,2,97,2,97,1,104,2,97,3,97,1,106>>"),
         terr("re/import_non-exported", "re pre-compiled patterns / run variants case `import/non-exported`", r#"re:import(zzz)"#, "exception error badarg"),
         terr("re/run_raw-export-form-is-badarg", "re pre-compiled patterns / run variants case `run/raw-export-form-is-badarg`", r#"re:run("xabcy", element(2,re:compile("(b)(c)", [export])))"#, "exception error badarg"),
-        t("re/export_projected-pattern-and-options", "re pre-compiled patterns / run variants case `export/projected-pattern-and-options`", r#"case re:compile("(b)(c)",[export]) of
-                     {ok,{re_exported_pattern,_,P,O,_}} -> {P,O};
-                     X -> X
-                   end"#, "ok <<131,104,2,109,0,0,0,6,40,98,41,40,99,41,108,0,0,0,1,119,6,101,120,112,111,114,116,106>>"),
+        t("re/export_projected-pattern-and-options", "re pre-compiled patterns / run variants case `export/projected-pattern-and-options`", r#"case re:compile("(b)(c)",[export]) of                      {ok,{re_exported_pattern,_,P,O,_}} -> {P,O};                      X -> X                    end"#, "ok <<131,104,2,109,0,0,0,6,40,98,41,40,99,41,108,0,0,0,1,119,6,101,120,112,111,114,116,106>>"),
         // -- re:replace/3,4 (added on top of the live-oracle source) --------------------
         t("re/replace_global", "re:replace/4 with [global] replaces every occurrence", r#"re:replace("hello world","o","0",[global])"#, "ok <<131,108,0,0,0,4,109,0,0,0,4,104,101,108,108,109,0,0,0,1,48,109,0,0,0,2,32,119,109,0,0,0,1,48,109,0,0,0,3,114,108,100>>"),
         t("re/replace_return_binary", "re:replace/4 with {return,binary} returns a binary subject copy", r#"re:replace("hello world","o","0",[{return,binary},global])"#, "ok <<131,109,0,0,0,11,104,101,108,108,48,32,119,48,114,108,100>>"),
