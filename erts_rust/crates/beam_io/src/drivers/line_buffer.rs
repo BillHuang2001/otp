@@ -23,7 +23,7 @@
 //! A faithful Rust port of the C `LineBuf` used by the emulator's line-oriented port I/O
 //! (`erts/emulator/beam/io.c`: `allocate_linebuf`/`read_linebuf`/`flush_linebuf` and the
 //! `LINEBUF_*` states). [`LineBuffer::push`] accumulates raw bytes and
-//! [`LineBuffer::take_lines`] hands out one frame per **complete** line:
+//! [`LineBuffer::take_frames`] hands out one [`LineFrame`] per **complete** line:
 //!
 //! * a line is terminated by `\n`;
 //! * a `\r` immediately followed by `\n` belongs to the terminator and is dropped, while
@@ -34,11 +34,20 @@
 //!
 //! The terminator bytes are **not** part of the delivered frames — like the emulator,
 //! which delivers a line's content without its `\n` (`read_linebuf` reports `retlen`
-//! excluding the newline). Because the port input queue is purely bytes, this byte-only
-//! API does not distinguish a newline-terminated line from a length-split fragment: both
-//! are just frames. A trailing partial line (no terminator yet) is held back until either
-//! more input completes it or [`LineBuffer::flush_all`] delivers it as-is (the C's
-//! `flush_linebuf`, called on EOF/`stop`).
+//! excluding the newline).
+//!
+//! Every frame carries the C's [`LINEBUF_EOL`] vs `LINEBUF_NOEOL` result (`io.c:3252-3307`)
+//! as its [`LineFrame::eol`] marker, which the port turns into the `{eol|noeol, Data}`
+//! wrapper of `deliver_linebuf_message` (`io.c:3454`):
+//!
+//! * a `\n`-terminated line is `eol: true` — including a **blank** line, whose frame is
+//!   empty (`{eol,[]}` is a real message);
+//! * a `max_len`-byte chunk split out of an over-long line is `eol: false`;
+//! * [`LineBuffer::flush_frames`]/[`LineBuffer::flush_all`] (the C's `flush_linebuf`, run
+//!   from `driver_eof` on a trailing partial line) always answer `eol: false`.
+//!
+//! A trailing partial line (no terminator yet) is held back until either more input
+//! completes it or the flush delivers it as-is (the C's `flush_linebuf`, called on EOF).
 
 use std::collections::VecDeque;
 
@@ -60,11 +69,52 @@ enum State {
     CrAfter,
 }
 
+/// One delivered line frame: the line's content bytes plus its `eol` marker.
+///
+/// The marker is the C's `LINEBUF_EOL` vs `LINEBUF_NOEOL` result (`io.c:3252-3307`), which
+/// the port renders as the `{eol, Data}` / `{noeol, Data}` wrapper of
+/// `deliver_linebuf_message` (`io.c:3454`). A frame is `eol` only when it was terminated by
+/// a newline; a length-limited chunk and a partial line flushed at end-of-file are `noeol`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LineFrame {
+    /// The line's content bytes (the `\n`/`\r\n` terminator is not included).
+    pub bytes: Vec<u8>,
+    /// Whether the frame was terminated by a newline (`true`, the C `LINEBUF_EOL`) or is a
+    /// length-split fragment / a partial line flushed at end-of-file (`false`,
+    /// `LINEBUF_NOEOL`).
+    pub eol: bool,
+}
+
+impl LineFrame {
+    /// A frame carrying `bytes` and the `eol` marker.
+    pub fn new(bytes: Vec<u8>, eol: bool) -> LineFrame {
+        LineFrame { bytes, eol }
+    }
+
+    /// Whether this frame was terminated by a newline.
+    pub fn is_eol(&self) -> bool {
+        self.eol
+    }
+
+    /// The frame's content bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes the frame, returning its content bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 /// Accumulates raw input and hands out complete lines (the `{line, N}` mode).
 ///
 /// The buffer is fed with [`LineBuffer::push`] and drains either through
-/// [`LineBuffer::take_lines`] / [`LineBuffer::drain`] (every complete frame so far) or
-/// through [`LineBuffer::flush_all`] (the trailing partial line, delivered as-is).
+/// [`LineBuffer::take_frames`] / [`LineBuffer::drain_frames`] (every complete frame so far,
+/// each with its `eol` marker) or through [`LineBuffer::flush_frames`] (the trailing partial
+/// line, delivered as-is and always `noeol`). The byte-only views
+/// [`LineBuffer::take_lines`] / [`LineBuffer::flush_all`] / [`LineBuffer::drain`] are the same
+/// frames with the marker dropped.
 pub struct LineBuffer {
     /// The maximum line length in bytes; `0` means "no length limit".
     max_len: usize,
@@ -73,7 +123,7 @@ pub struct LineBuffer {
     /// The bytes of the line currently being assembled (its terminator is not included).
     line: Vec<u8>,
     /// Complete frames awaiting delivery, in arrival order.
-    ready: VecDeque<Vec<u8>>,
+    ready: VecDeque<LineFrame>,
 }
 
 impl LineBuffer {
@@ -118,7 +168,8 @@ impl LineBuffer {
             // `\r`, which is then dropped as part of a `\r\n` terminator (`LINEBUF_EOL`).
             if c == b'\n' {
                 self.state = State::Main;
-                self.ready.push_back(std::mem::take(&mut self.line));
+                self.ready
+                    .push_back(LineFrame::new(std::mem::take(&mut self.line), true));
                 i += 1;
                 continue;
             }
@@ -143,7 +194,8 @@ impl LineBuffer {
                     } else {
                         // Over-long line: deliver the full chunk and re-dispatch on this
                         // byte as the start of the next chunk (`LINEBUF_NOEOL`).
-                        self.ready.push_back(std::mem::take(&mut self.line));
+                        self.ready
+                            .push_back(LineFrame::new(std::mem::take(&mut self.line), false));
                         self.state = State::Main;
                     }
                 }
@@ -154,44 +206,65 @@ impl LineBuffer {
                 }
                 State::CrAfter => {
                     // The full line plus a held `\r`: emit the full chunk, keep the `\r`.
-                    self.ready.push_back(std::mem::take(&mut self.line));
+                    self.ready
+                        .push_back(LineFrame::new(std::mem::take(&mut self.line), false));
                     self.state = State::CrInside;
                 }
             }
         }
     }
 
-    /// Takes every complete line buffered so far (in arrival order).
+    /// Takes every complete frame buffered so far (in arrival order), with its `eol` marker.
     ///
-    /// A trailing partial line is *not* included — use [`LineBuffer::flush_all`] for it.
-    pub fn take_lines(&mut self) -> Vec<Vec<u8>> {
+    /// A trailing partial line is *not* included — use [`LineBuffer::flush_frames`] for it.
+    pub fn take_frames(&mut self) -> Vec<LineFrame> {
         self.ready.drain(..).collect()
     }
 
-    /// Drains every complete line buffered so far to `f`, in arrival order.
-    pub fn drain(&mut self, f: &mut impl FnMut(&[u8])) {
+    /// Takes the bytes of every complete line buffered so far (in arrival order).
+    ///
+    /// The `eol`/`noeol` marker is dropped; use [`LineBuffer::take_frames`] when it matters.
+    /// A trailing partial line is *not* included — use [`LineBuffer::flush_all`] for it.
+    pub fn take_lines(&mut self) -> Vec<Vec<u8>> {
+        self.take_frames()
+            .into_iter()
+            .map(LineFrame::into_bytes)
+            .collect()
+    }
+
+    /// Drains every complete frame buffered so far to `f`, in arrival order.
+    pub fn drain_frames(&mut self, f: &mut impl FnMut(&LineFrame)) {
         while let Some(frame) = self.ready.pop_front() {
             f(&frame);
         }
     }
 
-    /// Delivers the trailing partial line as-is (called on EOF or `stop`).
+    /// Drains the bytes of every complete line buffered so far to `f`, in arrival order.
     ///
-    /// Returns the buffered bytes as frames (with a held `\r` restored), or an empty vector
-    /// when nothing is held. Complete lines handed out by [`LineBuffer::take_lines`] are
-    /// unaffected; the buffer is left empty and back in its initial state.
+    /// The `eol`/`noeol` marker is dropped; use [`LineBuffer::drain_frames`] when it matters.
+    pub fn drain(&mut self, f: &mut impl FnMut(&[u8])) {
+        while let Some(frame) = self.ready.pop_front() {
+            f(&frame.bytes);
+        }
+    }
+
+    /// Delivers the trailing partial line as-is (called on EOF; the C `flush_linebuf`).
+    ///
+    /// Returns the buffered bytes as `noeol` frames (with a held `\r` restored), or an empty
+    /// vector when nothing is held. Complete lines handed out by [`LineBuffer::take_frames`]
+    /// are unaffected; the buffer is left empty and back in its initial state.
     ///
     /// A full line at the length limit followed by a held `\r` is delivered as **two**
     /// frames — `[full-line]` then `["\r"]` — matching the two `flush_linebuf` calls the C
     /// makes in that state (`io.c:3221-3226`: the `LINEBUF_CR_AFTER` arm returns the full
     /// line and resets to `LINEBUF_CR_INSIDE`, whose next call restores the `\r`). The bytes
     /// are identical to joining them; only the split differs.
-    pub fn flush_all(&mut self) -> Vec<Vec<u8>> {
+    pub fn flush_frames(&mut self) -> Vec<LineFrame> {
         match std::mem::replace(&mut self.state, State::Main) {
             State::CrInside => {
                 // Restore the `\r` that was withheld pending a possible `\n`.
                 self.line.push(b'\r');
-                vec![std::mem::take(&mut self.line)]
+                vec![LineFrame::new(std::mem::take(&mut self.line), false)]
             }
             State::CrAfter => {
                 // A full line at the limit plus a held `\r`: the C delivers the line and
@@ -199,16 +272,38 @@ impl LineBuffer {
                 // construction (`CrAfter` is entered only from `Full`, which implies the
                 // limit was reached and `max_len != 0`).
                 let line = std::mem::take(&mut self.line);
-                vec![line, vec![b'\r']]
+                vec![LineFrame::new(line, false), LineFrame::new(vec![b'\r'], false)]
             }
             State::Main | State::Full => {
                 if self.line.is_empty() {
                     Vec::new()
                 } else {
-                    vec![std::mem::take(&mut self.line)]
+                    vec![LineFrame::new(std::mem::take(&mut self.line), false)]
                 }
             }
         }
+    }
+
+    /// Moves the trailing partial line onto the ready queue as `noeol` frame(s).
+    ///
+    /// This is [`LineBuffer::flush_frames`] with the frames *staged* for the next
+    /// [`LineBuffer::take_frames`] instead of returned — the shape the port needs at
+    /// end-of-file, where the flushed partial line must be reported on the next harvest
+    /// alongside any complete lines still queued.
+    pub fn flush_into_ready(&mut self) {
+        let flushed = self.flush_frames();
+        self.ready.extend(flushed);
+    }
+
+    /// Delivers the bytes of the trailing partial line as-is (called on EOF or `stop`).
+    ///
+    /// The byte-only view of [`LineBuffer::flush_frames`]: every frame it returns is
+    /// `noeol`.
+    pub fn flush_all(&mut self) -> Vec<Vec<u8>> {
+        self.flush_frames()
+            .into_iter()
+            .map(LineFrame::into_bytes)
+            .collect()
     }
 
     /// Whether the line currently being assembled reached the configured limit.
@@ -222,11 +317,23 @@ impl LineBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineBuffer, DEFAULT_MAX_LINE_LEN};
+    use super::{LineBuffer, LineFrame, DEFAULT_MAX_LINE_LEN};
+
+    fn frames(buf: &mut LineBuffer, data: &[u8]) -> Vec<LineFrame> {
+        buf.push(data);
+        buf.take_frames()
+    }
+
+    fn bytes(frames: &[LineFrame]) -> Vec<Vec<u8>> {
+        frames.iter().map(|f| f.bytes.clone()).collect()
+    }
 
     fn lines(buf: &mut LineBuffer, data: &[u8]) -> Vec<Vec<u8>> {
-        buf.push(data);
-        buf.take_lines()
+        bytes(&frames(buf, data))
+    }
+
+    fn eols(frames: &[LineFrame]) -> Vec<bool> {
+        frames.iter().map(LineFrame::is_eol).collect()
     }
 
     #[test]
@@ -397,5 +504,106 @@ mod tests {
         assert!(lines(&mut buf, b"abc").is_empty());
         assert!(lines(&mut buf, b"\r").is_empty());
         assert_eq!(lines(&mut buf, b"\n"), vec![b"abc".to_vec()]);
+    }
+
+    // --- the `eol`/`noeol` marker (the `{eol|noeol, Data}` wrapper) --------------------
+
+    #[test]
+    fn a_newline_terminated_line_is_eol_and_a_length_split_is_noeol() {
+        let mut buf = LineBuffer::new(4);
+        // `abcdefgh\n` at the limit of 4: the first two chunks are length splits (noeol),
+        // the third is newline-terminated (eol).
+        let frames = frames(&mut buf, b"abcdefgh\n");
+        assert_eq!(
+            bytes(&frames),
+            vec![b"abcd".to_vec(), b"efgh".to_vec()],
+            "a line exactly at the limit is one frame per chunk"
+        );
+        assert_eq!(
+            eols(&frames),
+            vec![false, true],
+            "…the first noeol, the last eol"
+        );
+    }
+
+    #[test]
+    fn the_limit_hit_emit_in_the_full_state_is_noeol() {
+        let mut buf = LineBuffer::new(4);
+        // 9 bytes then a newline: `LINEBUF_FULL` emits `abcd`, `efgh`, then `LINEBUF_MAIN`
+        // holds `i` until the `\n`.
+        let frames = frames(&mut buf, b"abcdefghi\n");
+        assert_eq!(
+            bytes(&frames),
+            vec![b"abcd".to_vec(), b"efgh".to_vec(), b"i".to_vec()]
+        );
+        assert_eq!(eols(&frames), vec![false, false, true]);
+    }
+
+    #[test]
+    fn the_cr_after_emit_is_noeol() {
+        // A full line followed by a `\r`, then a byte: the `LINEBUF_CR_AFTER` arm emits the
+        // full chunk (noeol) and keeps the `\r` as the start of the next line.
+        let mut buf = LineBuffer::new(4);
+        let frames = frames(&mut buf, b"abcd\rx");
+        assert_eq!(bytes(&frames), vec![b"abcd".to_vec()]);
+        assert_eq!(eols(&frames), vec![false]);
+    }
+
+    #[test]
+    fn a_blank_line_is_an_eol_frame_with_no_bytes() {
+        // The oracle delivers `{data,{eol,[]}}` for a lone newline, so an empty `eol` frame
+        // is a real message and must not be dropped by the buffer.
+        let mut buf = LineBuffer::new(DEFAULT_MAX_LINE_LEN);
+        let frames = frames(&mut buf, b"\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(bytes(&frames), vec![Vec::<u8>::new()]);
+        assert_eq!(eols(&frames), vec![true]);
+    }
+
+    #[test]
+    fn every_flushed_frame_is_noeol() {
+        // A full line at the limit plus a held `\r`: nothing is emitted while the `\r`'s fate
+        // is undecided, and the C's `flush_linebuf` (run from `driver_eof`) reports
+        // `LINEBUF_NOEOL` for both frames it delivers.
+        let mut buf = LineBuffer::new(4);
+        assert!(frames(&mut buf, b"abcd\r").is_empty());
+        assert_eq!(buf.pending(), 5, "the full line plus the held `\\r`");
+        let flushed = buf.flush_frames();
+        assert_eq!(bytes(&flushed), vec![b"abcd".to_vec(), b"\r".to_vec()]);
+        assert_eq!(eols(&flushed), vec![false, false]);
+    }
+
+    #[test]
+    fn flush_into_ready_stages_the_flush_after_the_complete_frames() {
+        let mut buf = LineBuffer::new(DEFAULT_MAX_LINE_LEN);
+        // A complete line plus a held partial: the complete frame sits on the ready queue and
+        // the flush stages the partial *after* it, so `take_frames` observes the arrival order.
+        buf.push(b"done\npartial");
+        assert_eq!(buf.pending(), 7, "`partial` is held back");
+        buf.flush_into_ready();
+        let frames = buf.take_frames();
+        assert_eq!(bytes(&frames), vec![b"done".to_vec(), b"partial".to_vec()]);
+        assert_eq!(eols(&frames), vec![true, false]);
+        // The flush is idempotent: a second call has nothing to stage.
+        buf.flush_into_ready();
+        assert!(buf.take_frames().is_empty());
+    }
+
+    #[test]
+    fn drain_frames_preserves_the_marker() {
+        let mut buf = LineBuffer::new(4);
+        buf.push(b"abcd\r\n");
+        let mut seen = Vec::new();
+        buf.drain_frames(&mut |frame| seen.push((frame.bytes.clone(), frame.eol)));
+        assert_eq!(seen, vec![(b"abcd".to_vec(), true)]);
+    }
+
+    #[test]
+    fn the_frame_constructors_and_accessors_agree() {
+        let frame = LineFrame::new(b"hi".to_vec(), true);
+        assert!(frame.is_eol());
+        assert_eq!(frame.bytes(), b"hi");
+        assert_eq!(frame.clone().into_bytes(), b"hi".to_vec());
+        assert!(!LineFrame::new(Vec::new(), false).is_eol());
     }
 }

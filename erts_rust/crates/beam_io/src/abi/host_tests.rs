@@ -93,8 +93,41 @@ fn the_new_host_starts_empty_and_has_a_term_heap() {
     assert_eq!(host.state().in_flight(), 0);
     assert_eq!(host.heap().capacity(), super::DRIVER_HEAP_WORDS);
     assert_eq!(host.heap().used(), 0);
+    assert!(!host.is_busy(), "a fresh port is not busy");
+    assert!(!host.state().is_busy());
 }
 
+/// `set_busy_port` (`io.c:5208`) records the port's busy state and answers the C's `0`, and the
+/// recorded state is readable through [`AbiHost::is_busy`] (the accessor the port layer consults).
+///
+/// The C's `void set_busy_port` only moves the port's scheduler flags, so the host's return code is
+/// discarded by `beam_abi`'s `driver_*` function — the observable is the flag. This pins both: the
+/// hook's `0` and the flag it sets/clears, in both directions.
+#[test]
+fn set_busy_port_records_and_clears_the_busy_flag() {
+    let mut host = new_host();
+    assert!(!host.is_busy(), "the port starts idle");
+
+    assert_eq!(
+        DriverHost::set_busy_port(&mut host, true),
+        0,
+        "a live port accepts the busy transition (the C's 0)"
+    );
+    assert!(
+        host.is_busy(),
+        "the busy flag is recorded on the port's host state"
+    );
+    assert!(host.state().is_busy());
+
+    assert_eq!(DriverHost::set_busy_port(&mut host, false), 0);
+    assert!(!host.is_busy(), "a cleared busy flag reads back idle");
+    assert!(!host.state().is_busy());
+
+    // Idempotent in both directions (a driver may re-assert the same state).
+    assert_eq!(DriverHost::set_busy_port(&mut host, true), 0);
+    assert_eq!(DriverHost::set_busy_port(&mut host, true), 0);
+    assert!(host.is_busy());
+}
 #[test]
 fn driver_output_lands_in_the_port_input_queue() {
     let mut host = new_host();

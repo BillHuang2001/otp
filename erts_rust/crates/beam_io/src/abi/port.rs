@@ -286,6 +286,22 @@ impl DriverPort {
         })
     }
 
+    /// Whether the driver last marked this port **busy** through the C `set_busy_port`
+    /// (`io.c:5208`).
+    ///
+    /// The C keeps the flag on the port (`ERTS_PORT_SFLG_*`); here it is the per-port
+    /// [`AbiHost::is_busy`] this delegates to. It is the accessor a port layer consults to decide
+    /// what a `port_command/2,3` on a busy port should do — `false` until a driver calls
+    /// `set_busy_port(port, 1)` (from `start`/`output`/`control`/`timeout`, whichever it chooses),
+    /// and back to `false` when it clears the flag.
+    ///
+    /// The caller-blocking half of the C's busy semantics (a `port_command/2,3` that suspends the
+    /// caller, answers `false` for `[nosuspend]` or `{error,notsup}` for `[force]` on a driver
+    /// without `ERL_DRV_FLAG_SOFT_BUSY`) is deliberately **not** part of this crate: it belongs to
+    /// the runtime's `erlang:port_command/2,3`, which is the handoff recorded for `beam_rt`.
+    pub fn is_busy(&self) -> bool {
+        self.abi.is_busy()
+    }
     /// Runs a driver callback with the port context installed, clearing it afterwards.
     ///
     /// `f` receives the loaded library and the driver's private data — never `&mut self`, so this
@@ -721,6 +737,10 @@ impl Driver for DriverPort {
     ///   `!prt->drv_ptr->control ⇒ BADARG`, `io.c:4035`) or when the driver returned a negative
     ///   result (`io.c:4074`).
     ///
+    /// A driver that returns `cres > 0` while pointing `*rbuf` at `NULL` yields the **empty reply**
+    /// `[]`, exactly as the C does (`erts/doc/references/driver_entry.md` › *control*: "If `*rbuf`
+    /// is set to `NULL`, an empty list is returned"); only a negative `cres` is `badarg`.
+    ///
     /// The driver may re-point the reply pointer at its own buffer and must keep it valid until the
     /// next `control` call (the C contract). That is a trust boundary: a driver is native code the
     /// runtime loaded, and a reply larger than the buffer handed in is that driver's bug.
@@ -754,7 +774,9 @@ impl Driver for DriverPort {
             return Ok(Vec::new());
         }
         if rbuf.is_null() {
-            return Err(error::badarg());
+            // The C's documented `*rbuf == NULL` reply: an empty list, not `badarg`
+            // (`erts/doc/references/driver_entry.md` › *control*). Only `cres < 0` is an error.
+            return Ok(Vec::new());
         }
         // SAFETY: the driver reported `n` readable bytes at `rbuf` — either the buffer handed in
         // (still alive: `reply` is a local here) or the driver's own memory, which the C `control`
@@ -762,7 +784,6 @@ impl Driver for DriverPort {
         let bytes = unsafe { core::slice::from_raw_parts(rbuf as *const u8, n) }.to_vec();
         Ok(bytes)
     }
-
     /// `ready_async`/`async_free`: hand the driver its finished `driver_async` jobs.
     ///
     /// This is the `Driver::drive_async` drive point over the C entry's async slots; the work

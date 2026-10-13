@@ -57,15 +57,19 @@
 //! members of the struct. Do **not** add a combined accessor that hands out `&mut` to both
 //! the driver and the queues at once — that cannot borrow-check.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use beam_common::Result;
 use beam_process::PortId;
 
 use crate::driver::{Driver, DriverContext, PortArms, PortExitReason};
+use crate::drivers::line_buffer::LineBuffer;
 use crate::error;
 use crate::poller::Poller;
-use crate::port_task::{PortNotification, PortTask, PortTaskKind, PortTaskQueue, PORT_REDS_EXECUTE};
+use crate::port_task::{
+    LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue, PORT_REDS_EXECUTE,
+};
 use crate::queue::ByteQueue;
 
 // The registry lives in the sibling [`crate::registry`] module; re-export it here so the
@@ -112,6 +116,19 @@ pub struct Port {
     /// Set once a [`PortExitReason`] has been delivered to the driver, so
     /// [`Port::notify_exit`] delivers the port-exit notification **at most once**.
     exit_notified: bool,
+    /// The line-framing mode (`{line, N}`): `None` delivers raw bytes
+    /// ([`PortNotification::Data`]), `Some(max_len)` splits the input into
+    /// [`LineNotification`] frames of at most `max_len` bytes. The C's
+    /// `ERTS_PORT_SFLG_LINEBUF_IO` plus `linebuf->max_len` (`erl_port.h:330`).
+    line_mode: Option<usize>,
+    /// The line accumulator used in line mode (the C's `allocate_linebuf` state; untouched
+    /// while [`Port::line_mode`] is `None`).
+    line: LineBuffer,
+    /// The line frames staged for the owner in line mode, in arrival order. Populated by
+    /// [`Port::take_input_notifications`] (which frames the buffered input) and drained by
+    /// [`Port::take_line_frames`] — the separate channel a `{line, N}` port reports through,
+    /// so its input never rides [`PortNotification`].
+    pending_lines: VecDeque<LineNotification>,
 }
 
 impl Port {
@@ -128,6 +145,9 @@ impl Port {
             tasks: PortTaskQueue::new(),
             arms: PortArms::default(),
             exit_notified: false,
+            line_mode: None,
+            line: LineBuffer::new(0),
+            pending_lines: VecDeque::new(),
         }
     }
 
@@ -363,10 +383,62 @@ impl Port {
         }
     }
 
+    /// Enables or disables **line framing** (`{line, N}`) for this port's input.
+    ///
+    /// `Some(max_len)` turns line mode on with an at-most-`max_len`-byte frame length (`0` =
+    /// no length limit); `None` turns it off, so the driver's bytes are delivered raw as
+    /// [`PortNotification::Data`]. This is the C's `open_port(..., [line])` /
+    /// `[binary, {line, N}]` option (`ERTS_PORT_SFLG_LINEBUF_IO` +
+    /// `allocate_linebuf(max_len)`, `erl_bif_port.c:862-869,986`), which the runtime applies
+    /// once the port is open.
+    ///
+    /// Switching **does not flush or discard** buffered input: bytes the driver already read
+    /// stay in the line accumulator and are delivered — framed if line mode is still on, raw
+    /// otherwise — by the next harvest (or by [`Port::flush_linebuf`]).
+    pub fn set_line_mode(&mut self, max_len: Option<usize>) {
+        self.line_mode = max_len;
+        if let Some(max_len) = max_len {
+            self.line.set_max_len(max_len);
+        }
+    }
+
+    /// This port's line-framing mode: `None` (the default) delivers raw bytes, `Some(max_len)`
+    /// splits the input into at-most-`max_len`-byte frames (see [`Port::set_line_mode`]).
+    pub fn line_mode(&self) -> Option<usize> {
+        self.line_mode
+    }
+
+    /// Releases the pending partial line as `noeol` frame(s) for the next harvest.
+    ///
+    /// This is the C's `flush_linebuf`/`flush_linebuf_messages` (`io.c:7221`), which the port
+    /// runs from `driver_eof`: when a `{line, N}` port's input stream ends, the bytes held
+    /// back because no `\n` had arrived yet are delivered **once** as a `noeol` frame
+    /// (`{Port, {data, {noeol, Data}}}`) — the oracle's `printf 'a\nb'` ⇒ `{eol,"a"} {noeol,"b"}`.
+    ///
+    /// The frames are *staged* (see [`LineBuffer::flush_into_ready`]) rather than returned, so
+    /// they ride the next [`Port::take_input_notifications`] together with any complete lines
+    /// still queued — and are then drained from the [`Port::take_line_frames`] channel. A port
+    /// in raw mode (`line_mode` is `None`) is untouched, and a repeat
+    /// call stages nothing (a flush is idempotent), so this is safe to call on every
+    /// end-of-file observation. [`Port::close`] never calls it: closing a port does **not**
+    /// flush the partial line (only end-of-file does).
+    pub fn flush_linebuf(&mut self) {
+        if self.line_mode.is_none() {
+            return;
+        }
+        // Any bytes the driver banked but the harvest has not framed yet must join the
+        // accumulator first, so an end-of-file flush never loses them.
+        if !self.input.is_empty() {
+            let bytes = self.drain_input();
+            self.line.push(&bytes);
+        }
+        self.line.flush_into_ready();
+    }
+
     /// Whether this port is holding input bytes it owes its owner.
     ///
     /// The buffered input queue is the single source of truth for a
-    /// [`PortNotification::Data`] report (see [`Port::take_input_notification`]): every byte a
+    /// [`PortNotification::Data`] report (see [`Port::take_input_notifications`]): every byte a
     /// driver hands up — whether from an `INPUT` task's `ready_input` **or** from a
     /// `driver_output` inside `start`/`control`/`timeout`/`output` — lands in this queue, and the
     /// port-task round reports whatever is there.
@@ -374,32 +446,67 @@ impl Port {
         !self.input.is_empty()
     }
 
-    /// Takes the [`PortNotification::Data`] this port owes, if any.
+    /// Takes the input notifications this port owes, if any.
     ///
-    /// The buffered input bytes are drained out of the input queue here, so a report happens
-    /// **exactly once per byte**: after this returns `Some`, the queue is empty and the next
-    /// call answers `None` until the driver hands up more input.
+    /// In raw mode ([`Port::line_mode`] is `None`) this is **at most one**
+    /// [`PortNotification::Data`]: the buffered input bytes are drained out of the input queue,
+    /// so a report happens **exactly once per byte**. An empty read reports nothing.
     ///
-    /// The condition is the *queue*, not "an `INPUT` task ran": the legacy C delivers
-    /// `driver_output` to the port owner as soon as the driver makes it, whatever callback it
-    /// came from (`io.c`'s `driver_output`/`erts_port_output`), so a `driver_output` made from
-    /// `start`/`control`/`timeout`/`output` — i.e. outside any `INPUT` task — must reach the
-    /// owner on the next port-task round exactly like one made from `ready_input`. Gating the
-    /// report on an `INPUT` task having run ([`Port::run_task`]) would strand those bytes in the
-    /// queue, which is why the gate was removed.
-    pub(crate) fn take_input_notification(&mut self) -> Option<PortNotification> {
-        if !self.has_input() {
-            return None;
-        }
-        let bytes = self.drain_input();
-        if bytes.is_empty() {
-            None
-        } else {
-            Some(PortNotification::Data {
+    /// In line mode this returns **no** notification: the whole buffered input is fed through
+    /// the line accumulator and every resulting frame is staged on the [`Port::take_line_frames`]
+    /// channel instead, so a single read can yield many frames (a 601-byte `[line,4]` chunk is
+    /// 150 of them: 149 `noeol` + 1 `eol`). An empty frame is **not** dropped here: a blank line
+    /// is the oracle's `{Port, {data, {eol, []}}}`.
+    ///
+    /// The condition is the *queue* (and, in line mode, the line accumulator), not "an `INPUT`
+    /// task ran": the legacy C delivers `driver_output` to the port owner as soon as the driver
+    /// makes it, whatever callback it came from (`io.c`'s `driver_output`/`erts_port_output`),
+    /// so a `driver_output` made from `start`/`control`/`timeout`/`output` — i.e. outside any
+    /// `INPUT` task — must reach the owner on the next port-task round exactly like one made
+    /// from `ready_input`. Gating the report on an `INPUT` task having run ([`Port::run_task`])
+    /// would strand those bytes in the queue, which is why the gate was removed.
+    ///
+    /// In line mode the framing side effect happens even though the return value is empty, so a
+    /// round must call this for every port (as [`crate::PortRegistry::execute_port_tasks`] does)
+    /// before the frames can be drained with [`Port::take_line_frames`].
+    pub(crate) fn take_input_notifications(&mut self) -> Vec<PortNotification> {
+        if self.line_mode.is_none() {
+            if !self.has_input() {
+                return Vec::new();
+            }
+            let bytes = self.drain_input();
+            if bytes.is_empty() {
+                return Vec::new();
+            }
+            return vec![PortNotification::Data {
                 port: self.id,
                 bytes,
-            })
+            }];
         }
+        if !self.input.is_empty() {
+            let bytes = self.drain_input();
+            self.line.push(&bytes);
+        }
+        let port = self.id;
+        let frames = self.line.take_frames();
+        self.pending_lines
+            .extend(frames.into_iter().map(|frame| LineNotification {
+                port,
+                bytes: frame.bytes,
+                eol: frame.eol,
+            }));
+        Vec::new()
+    }
+
+    /// Takes the line frames this port owes, in arrival order.
+    ///
+    /// This is the drain side of the `{line, N}` channel: the frames
+    /// [`Port::take_input_notifications`] staged out of the buffered input (plus any a
+    /// `driver_eof` flush staged, see [`Port::flush_linebuf`]). An empty `eol` frame is kept —
+    /// a blank line is the oracle's `{Port, {data, {eol, []}}}`. A port in raw mode never stages
+    /// anything, so this is empty there.
+    pub(crate) fn take_line_frames(&mut self) -> Vec<LineNotification> {
+        self.pending_lines.drain(..).collect()
     }
 
     /// Dispatches read readiness to the driver's `ready_input`.
@@ -590,7 +697,7 @@ impl Port {
         self.driver.take_exit_status()
     }
 
-    /// Takes the port's end-of-file notification, once.
+    /// Takes the port's end-of-file notification, once, and **flushes the line buffer**.
     ///
     /// Forwards to the driver's [`Driver::take_eof`]: `Ok(true)` means the port's input stream
     /// reached end-of-file and the port asked for the `eof` option — the signal a runtime turns
@@ -598,11 +705,22 @@ impl Port {
     /// (no `eof` option, no end-of-file yet, or already reported); a port whose driver never
     /// streams input always answers `Ok(false)`.
     ///
+    /// This is the crate's **driver-end-of-file observation point** (the C's `driver_eof`), so a
+    /// report also runs the line-buffer flush: a `{line, N}` port's pending partial line is
+    /// released as `noeol` frame(s) for the next harvest (see [`Port::flush_linebuf`]). The
+    /// flush is only performed when the driver actually reports the end of the stream, so a
+    /// caller polling this before then cannot release a line early; it is idempotent, so a
+    /// second observation stages nothing.
+    ///
     /// # Errors
     ///
     /// Returns whatever the driver's `take_eof` returns.
     pub fn take_eof(&mut self) -> Result<bool> {
-        self.driver.take_eof()
+        let eof = self.driver.take_eof()?;
+        if eof {
+            self.flush_linebuf();
+        }
+        Ok(eof)
     }
 
     /// Tells the driver this port is exiting, **at most once**.
@@ -739,5 +857,168 @@ impl PortCommandOptions {
     /// Whether the `force` option is set.
     pub const fn is_force(self) -> bool {
         self.force
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A driver that banks a fixed payload on its first `ready_input` and reports the end of
+    /// its input stream through the once-only [`Driver::take_eof`] seam.
+    ///
+    /// It registers no descriptor, so the port-level line-framing tests drive it directly
+    /// (`ready_input` + `take_input_notifications`) — the framing never looks at the poller.
+    struct BankBytesDriver {
+        payload: Vec<u8>,
+        fed: bool,
+        eof_reported: bool,
+    }
+
+    impl BankBytesDriver {
+        fn new(payload: &[u8]) -> BankBytesDriver {
+            BankBytesDriver {
+                payload: payload.to_vec(),
+                fed: false,
+                eof_reported: false,
+            }
+        }
+    }
+
+    impl Driver for BankBytesDriver {
+        fn name(&self) -> &str {
+            "bank-bytes-test"
+        }
+
+        fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+            if !self.fed {
+                self.fed = true;
+                let payload = self.payload.clone();
+                ctx.input().push(&payload);
+            }
+            Ok(())
+        }
+
+        fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn take_eof(&mut self) -> Result<bool> {
+            if self.eof_reported {
+                Ok(false)
+            } else {
+                self.eof_reported = true;
+                Ok(true)
+            }
+        }
+    }
+
+    fn port_with(payload: &[u8]) -> (Poller, Port) {
+        let poller = Poller::new().expect("a poll set");
+        let port = Port::new(PortId::new(1), Box::new(BankBytesDriver::new(payload)));
+        (poller, port)
+    }
+
+    /// The frames a port currently owes, as `(marker, bytes)` pairs: `None` is a raw
+    /// [`PortNotification::Data`] chunk, `Some(eol)` a [`LineNotification`] frame.
+    ///
+    /// A round harvests both channels: [`Port::take_input_notifications`] reports the raw
+    /// payloads (and stages the line frames), [`Port::take_line_frames`] drains the staged
+    /// line frames. A port is in exactly one mode, so the two never mix.
+    fn frames(port: &mut Port) -> Vec<(Option<bool>, Vec<u8>)> {
+        let mut frames: Vec<(Option<bool>, Vec<u8>)> = port
+            .take_input_notifications()
+            .into_iter()
+            .map(|notification| match notification {
+                PortNotification::Data { bytes, .. } => (None, bytes),
+                other => panic!("the port reported an unexpected notification: {other:?}"),
+            })
+            .collect();
+        frames.extend(
+            port.take_line_frames()
+                .into_iter()
+                .map(|frame| (Some(frame.eol), frame.bytes)),
+        );
+        frames
+    }
+
+    #[test]
+    fn line_mode_is_off_until_it_is_set_and_then_reports_the_limit() {
+        let (_poller, mut port) = port_with(b"x");
+        assert_eq!(port.line_mode(), None, "raw mode is the default");
+        port.set_line_mode(Some(4));
+        assert_eq!(port.line_mode(), Some(4));
+        port.set_line_mode(None);
+        assert_eq!(port.line_mode(), None);
+    }
+
+    #[test]
+    fn raw_mode_reports_the_whole_read_as_one_chunk() {
+        let (mut poller, mut port) = port_with(b"a\nb\n");
+        assert!(port.line_mode().is_none());
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert_eq!(frames(&mut port), vec![(None, b"a\nb\n".to_vec())]);
+    }
+
+    /// The partial-line flush is driven by **end of file**, never by a close: the C runs
+    /// `flush_linebuf_messages` from `driver_eof` (`io.c:7211`), and `port_close` does not.
+    ///
+    /// This pins it on the port itself (not through the registry, which drops the port on
+    /// close): the held partial line must survive the close and still be released by the
+    /// explicit flush, which would be impossible had the close reported it.
+    #[test]
+    fn closing_a_line_port_never_flushes_the_pending_partial_line() {
+        let (mut poller, mut port) = port_with(b"a\nb");
+        port.set_line_mode(Some(0));
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert_eq!(
+            frames(&mut port),
+            vec![(Some(true), b"a".to_vec())],
+            "the complete line is delivered, the terminator-less tail is held"
+        );
+        port.close(&mut poller).expect("the teardown succeeds");
+        assert!(
+            frames(&mut port).is_empty(),
+            "a close must not flush the held partial line"
+        );
+        // …and the partial line is still held, so the `driver_eof` flush still releases it:
+        // proof that the close neither reported nor discarded it.
+        port.flush_linebuf();
+        assert_eq!(frames(&mut port), vec![(Some(false), b"b".to_vec())]);
+    }
+
+    #[test]
+    fn take_eof_runs_the_flush_and_a_close_free_port_reports_an_empty_line() {
+        // A blank line is a **real** frame: the oracle delivers `{Port, {data, {eol, []}}}`, so
+        // the empty payload must not be dropped the way raw mode drops it.
+        let (mut poller, mut port) = port_with(b"\n");
+        port.set_line_mode(Some(0));
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert_eq!(frames(&mut port), vec![(Some(true), Vec::new())]);
+        // The stream's end is observed through `take_eof`, which stages a flush. Nothing is
+        // held here, so the flush stages nothing and the report stays once-only.
+        assert!(port.take_eof().expect("the check succeeds"));
+        assert!(frames(&mut port).is_empty());
+        assert!(!port.take_eof().expect("the check succeeds"));
+    }
+
+    #[test]
+    fn flushing_a_raw_port_is_a_no_op() {
+        let (mut poller, mut port) = port_with(b"a\nb");
+        port.ready_input(&mut poller).expect("the read succeeds");
+        port.flush_linebuf();
+        assert_eq!(
+            frames(&mut port),
+            vec![(None, b"a\nb".to_vec())],
+            "raw mode is untouched by the line flush"
+        );
     }
 }

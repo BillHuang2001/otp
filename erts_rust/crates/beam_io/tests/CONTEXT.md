@@ -21,13 +21,16 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## The C fixtures (`fixtures/`)
 - **`host_driver.c`** (`driver_name = "host_driver"`) — the base fixture. `start` parses
-  `fd=<n>`, `log=<path>`, `upper` and `hdl`. Its integer `control` verbs (documented at the top of
-  the file, the authoritative list) cover `driver_output`, timers, `driver_select` +
-  `ERL_DRV_USE` release, `erl_drv_output_term`, `driver_async`, the driver-queue family and a
-  `ERL_DRV_WRITE` arm:
+  `fd=<n>`, `log=<path>`, `upper` and `hdl`, plus the bare mode tokens `silent` (consume the command
+  and emit nothing) and `busy` (call `set_busy_port(port, 1)` at start time). Its integer `control`
+  verbs (documented at the top of the file, the authoritative list) cover `driver_output`, timers,
+  `driver_select` + `ERL_DRV_USE` release, `erl_drv_output_term`, `driver_async`, the driver-queue
+  family, a `ERL_DRV_WRITE` arm and the busy state:
   `19` `driver_enq`, `20` `driver_sizeq`, `21` `driver_peekq`, `22` `driver_deq`,
-  `23` `driver_peekqv`, `24` `driver_select(WRITE)`. Verbs 19–23 answer `key=value` text with a
-  trailing raw `bytes=` payload (the queue family's observation channel).
+  `23` `driver_peekqv`, `24` `driver_select(WRITE)`, `25` `set_busy_port(port,1)`,
+  `26` `set_busy_port(port,0)`, `27` the `control` reply that sets `*rbuf = NULL` and returns
+  `cres > 0`. Verbs 19–23 answer `key=value` text with a trailing raw `bytes=` payload (the queue
+  family's observation channel); 25/26 answer an empty reply, 27 must render as `[]`.
 - **Variant macro pattern.** Each overridable `ErlDrvEntry` slot has a `HOST_DRIVER_<SLOT>_SLOT`
   macro; a variant defines it *before* `#include "host_driver.c"`, which both selects the callback
   and omits the unused function. `HOST_DRIVER_OUTPUTV_SLOT` follows the same pattern with its
@@ -59,7 +62,7 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 18 suites, 173
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 19 suites, 180
 passing; the full crate total is in the parent node's *Test Strategy*.
 
 ## Known Issues / Notes for Agents
@@ -74,13 +77,17 @@ passing; the full crate total is in the parent node's *Test Strategy*.
 
 ## Routing Table
 - `abi_driver.rs` → the end-to-end C-driver path (incl. the driver-queue family round-trip, the
-  `outputv`-over-`output` preference and the empty-queue write-readiness case)
+  `outputv`-over-`output` preference, the empty-queue write-readiness case, the `NULL`-`*rbuf`
+  `control` reply and the silent-driver output pin)
+- `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
+  token and verbs 25/26)
 - `abi_async.rs`, `abi_vector.rs`, `abi_lifecycle.rs`, `abi_start_failure.rs` → the `driver_async`
   completion arms, the `outputv`-only entry, the port-exit adapter, a failing `start`
 - `driver_table.rs`, `driver_registry_slots.rs` → the process-global driver registry
 - `poller.rs`, `port.rs`, `port_task.rs`, `driver_seams.rs` → the reactor, the port, port-task
   scheduling, the driver-declared timer/port-exit seams
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
+  (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
 - `signal.rs`, `cpu_time.rs`, `ddll.rs` → the OS-signal facility, the CPU-time facility, `dlopen`
 - `fixture_builds.rs` → builds + loads every `fixtures/*.c` (a broken fixture is a hard failure)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers
