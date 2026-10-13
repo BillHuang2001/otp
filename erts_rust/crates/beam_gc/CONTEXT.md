@@ -510,7 +510,12 @@ constructors only (no new error enum).
 - `tests/immix_stress.rs` → multi-block promotion, fragmentation/reuse, repeated-minor promotion, a mixed
   workload equal under both strategies, an asserted live-set-bounded accounting.
 - `tests/steady_state.rs` → the DEFAULT-cadence steady state: nursery + mature capacity converge to a
-  constant (233 Copying / 512 Immix).
+  constant (233/**376** Copying, 233/512 Immix), with the occupancy cycle pinned per strategy.
+- `tests/generational_cadence.rs` → the regression gate for the mature-generation room policy: at the
+  default policy a churn workload runs **minors** (not a fullsweep every time), `minor_gcs()` advances on
+  a minor and resets on a fullsweep, survivors are resident in and structurally intact in the mature
+  generation after every collection, dead data is reclaimed, and both capacities converge — both
+  strategies.
 - `tests/offheap_liveness.rs` → an off-heap handle inside a moved container: refcount stable, payload
   byte-identical, handle relocated, freed once when the container dies.
 - `tests/offheap_slot_stability.rs` → a simulated on-heap `val`-slot container still resolves after a
