@@ -114,8 +114,18 @@ exercisable there).
 Fixed-capacity bump arena over a carrier-provided block; **never reallocates** (handed-out pointers
 stay valid; growth is a new heap + copy by `beam_gc`). `new(capacity_words)`,
 `with_allocator(alloc, capacity_words)`, `capacity`, `used`, `available`, `peak_used`, `reset`,
-`hp`, `hend`, `allocator`, `unsafe alloc_words`, `unsafe alloc_tuple`, `cons`, `tuple`, `Drop`
+`reset_to(used) -> Result<()>`, `hp`, `hend`, `allocator`, `unsafe alloc_words`,
+`unsafe alloc_tuple`, `cons`, `tuple`, `Drop`
 returns the block. Exhaustion ⇒ `BeamError::Alloc(AllocKind::Heap)` (= "collect", not fatal OOM).
+`reset()` rewinds to empty and `reset_to(used)` to a **mark** (the exact inverse of allocating `used`
+words, `used` in *term words*): the first `used` words stay owned and their contents are not touched,
+everything after them is only freed-and-reused (never wiped), and `peak_used` is preserved by both
+(the high-water mark is live-word history, not the offset) — `reset_to(0)` is therefore exactly
+`reset()`. A `used` **above** the current `used()` is the typed `BeamError::BadArg` with the heap left
+completely unchanged (never a silent clamp, never a panic): rewinding *forward* would claim words the
+heap never handed out — the same refusal rule [`ReservedHeap::relocate`] applies to an
+undersized reservation. This is what lets a *pooled* heap that reaches a caller already owning words
+handed over to another caller be rewound precisely instead of only when it is empty.
 
 ### `reserved_heap` — the reservation-capable per-process term heap (`ReservedHeap`)
 The **frozen seam** for hosts that must grow a live process heap. One backing block of
@@ -291,7 +301,7 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   exercisable in-module. Cross-module behaviour is tested through the **public** API.
 - Integration: `tests/allocator.rs` (alloc/dealloc/realloc round trips, alignment, dedicated-carrier
   path, stats deltas, `max_footprint` cap, typed/unsized entry points, `allocator_info`), `tests/heap.rs`
-  (`cons`/`tuple`/`alloc_words`/`alloc_tuple`/`reset`/peak, pointer stability, `Drop`),
+  (`cons`/`tuple`/`alloc_words`/`alloc_tuple`/`reset`/`reset_to`/peak, pointer stability, `Drop`),
   `tests/reserved_heap.rs` (in-place growth across the committed limit with a byte-identical `hp` and no
   extra allocation, reservation exhaustion ⇒ `MoveRequired` with no state change and still-usable old
   limit, the host move path with its constant delta and byte-identical live region, zero/small
@@ -300,8 +310,8 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - A **leak/steady-state** test drives alloc/free cycles and asserts the carrier/free-block counters
   return to baseline (no leak on the tested paths).
 - Gate (GREEN required, current): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  -p beam_alloc --no-fail-fast` → **237 lib + 18 (`tests/allocator.rs`) + 13 (`tests/heap.rs`) + 4
-  (`tests/hot_path.rs`) + 12 (`tests/reserved_heap.rs`) = 284 tests, 0 failures**;
+  -p beam_alloc --no-fail-fast` → **241 lib + 18 (`tests/allocator.rs`) + 13 (`tests/heap.rs`) + 4
+  (`tests/hot_path.rs`) + 12 (`tests/reserved_heap.rs`) = 288 tests, 0 failures**;
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets` is
   warning-free; and `... clippy -p beam_alloc --all-targets` reports nothing for this crate.
 - Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
@@ -343,7 +353,8 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - `src/size_class.rs` → `SizeClasses` (sbc/mbc ladders + thresholds)
 - `src/policy.rs` → `CarrierPolicy`/`PolicyOptionKind` (the 12 `+M<alloc><opt>` options)
 - `src/stats.rs` → `AllocStats`/`TypeStats`/`MsegStats`/`AllocatorInfo`/`InfoValue`/`STATS_TYPE_SLOTS`
-- `src/heap.rs` → the fixed-capacity per-process bump `Heap` (`alloc_words`/`cons`/`tuple`/`reset`)
+- `src/heap.rs` → the fixed-capacity per-process bump `Heap`
+  (`alloc_words`/`cons`/`tuple`/`reset`/`reset_to`)
 - `src/reserved_heap.rs` → `ReservedHeap`/`GrowOutcome`: the reservation-capable per-process term heap (in-place growth, `relocate`/delta) + the host-adoption contract
 - `src/bump.rs` → `pub(crate)` bump-pointer term-construction primitives shared by `Heap` and `ReservedHeap`
 - `src/refcount.rs` → `RefCount`: the shared atomic reference count

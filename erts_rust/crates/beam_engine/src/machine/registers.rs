@@ -149,6 +149,36 @@ impl Machine {
         self.regs_escaped = true;
         &mut self.fr
     }
+
+    /// The number of **live leading FR slots** — the exclusive high-water mark of
+    /// the float-register file.
+    ///
+    /// Returns exactly `(self.fr_mark as usize).min(MAX_FLOAT_REGISTER as usize) as
+    /// u32`: one past the highest FR slot an FR-write seam ([`Machine::set_fr`]) has
+    /// stored into since the last [`Machine::reset`]. `0` means **no live FR slot**
+    /// (every slot is `NIL`). It is the FR-file twin of the x-register root-set bound
+    /// `x[0..live)`: it lets a host publish/scan only the live leading FR slots
+    /// instead of all [`MAX_FLOAT_REGISTER`], since a `set_fr` only ever writes a
+    /// leading slot (the marks are raised, never lowered, by an in-range write).
+    ///
+    /// **Caveat — a slot-escaping writer may understate it.** The mark advances only
+    /// through [`Machine::set_fr`]. A writer that can reach the FR file without going
+    /// through it — a native JIT block (which stores straight into `machine.fr`
+    /// through the raw pointer the generated code holds) or a host handed a raw
+    /// mutable slice ([`Machine::fr_mut`]/[`Machine::x_mut`]/
+    /// [`Machine::with_roots`](crate::machine::Machine::with_roots)) — sets the
+    /// crate-internal `regs_escaped` flag instead of raising the mark, so in that
+    /// window the mark may name fewer slots than are actually dirty. A caller that
+    /// needs the honest upper bound in that window must account for it itself (e.g.
+    /// conservatively treat the whole FR file as live, or track whether it took a raw
+    /// slice). A caller that never runs a native block and never takes a raw slice
+    /// sees a mark that is **exact** after the ordinary interpret seams, because
+    /// every FR write goes through [`Machine::set_fr`].
+    #[inline]
+    pub fn fr_mark(&self) -> u32 {
+        (self.fr_mark as usize).min(MAX_FLOAT_REGISTER as usize) as u32
+    }
+
     /// Write `value` into float register `n`.
     ///
     /// Mirrors [`Machine::set_x`]: returns [`crate::error::bad_register`] if `n` is
@@ -361,6 +391,43 @@ mod tests {
         assert_eq!(machine.get_fr(MAX_FLOAT_REGISTER), None);
         let err = machine.set_fr(MAX_FLOAT_REGISTER, Eterm::from_raw(1));
         assert!(matches!(err, Err(beam_common::BeamError::BadArg)));
+    }
+
+    #[test]
+    fn fr_mark_tracks_the_live_leading_slots() {
+        // The FR high-water mark a host reads to publish only the live leading slots:
+        // a fresh machine touches none, an in-range write raises it to `n + 1`, a
+        // lower write does not lower it, and `reset` clears it.
+        let mut machine = Machine::new();
+        assert_eq!(machine.fr_mark(), 0, "a fresh machine has no live FR slot");
+
+        assert!(machine.set_fr(5, Eterm::from_raw(0x11)).is_ok());
+        assert_eq!(machine.fr_mark(), 6, "set_fr(5) marks six leading slots");
+
+        // A later write to a *lower* index must not lower the high-water mark.
+        assert!(machine.set_fr(2, Eterm::from_raw(0x22)).is_ok());
+        assert_eq!(machine.fr_mark(), 6, "a lower write keeps the mark");
+
+        // A deeper write raises it, and the top slot saturates at the file size.
+        assert!(machine.set_fr(9, Eterm::from_raw(0x33)).is_ok());
+        assert_eq!(machine.fr_mark(), 10);
+        assert!(machine
+            .set_fr(MAX_FLOAT_REGISTER - 1, Eterm::from_raw(0x44))
+            .is_ok());
+        assert_eq!(machine.fr_mark(), MAX_FLOAT_REGISTER);
+
+        // An out-of-range write is refused and does not touch the mark.
+        machine.reset();
+        assert!(machine
+            .set_fr(MAX_FLOAT_REGISTER, Eterm::from_raw(0x55))
+            .is_err());
+        assert_eq!(machine.fr_mark(), 0, "an out-of-range write marks nothing");
+
+        // `reset` returns the mark to zero.
+        assert!(machine.set_fr(3, Eterm::from_raw(0x66)).is_ok());
+        assert_eq!(machine.fr_mark(), 4);
+        machine.reset();
+        assert_eq!(machine.fr_mark(), 0, "reset clears the mark");
     }
 
     #[test]
