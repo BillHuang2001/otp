@@ -232,6 +232,24 @@ fn run_sized(
     decode(reg, ctx, ty, bin, opts).expect("decode_packet")
 }
 
+/// Decodes `bytes` as the **integer** packet type `ty` (`0`/`1`/`2`/`4`) with a
+/// single `{packet_size, Size}` option — the atom helper above cannot name the
+/// length-prefix types, which are selected by a small integer.
+fn run_sized_int(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    ty: i64,
+    bytes: &[u8],
+    size: i64,
+) -> Eterm {
+    let ty = ctx.int(ty).expect("fits");
+    let bin = binary_term(reg, ctx, bytes);
+    let value = ctx.int(size).expect("fits");
+    let opt = option(ctx, "packet_size", value);
+    let opts = ctx.list(&[opt]).expect("fits");
+    decode(reg, ctx, ty, bin, opts).expect("decode_packet")
+}
+
 // ---------------------------------------------------------------------------
 // `tpkt` (`TCP_PB_TPKT`, `packet_parser.c:451-463`)
 // ---------------------------------------------------------------------------
@@ -343,6 +361,73 @@ fn tpkt_reproduces_the_c_int_wraparound_with_a_huge_packet_size() {
     // plen = 0 => the sum is the 4-byte header.
     let out = run_sized(&reg, &mut ctx, "tpkt", &[3, 0, 0, 4, 65, 66], 4_294_967_295);
     assert_ok(&reg, &mut ctx, &atoms, out, &[3, 0, 0, 4], b"AB");
+}
+
+// ---------------------------------------------------------------------------
+// `1`/`2`/`4` (`TCP_PB_1`/`_2`/`_4`) — the shared `remain:` label
+// ---------------------------------------------------------------------------
+
+#[test]
+fn length_prefixes_reproduce_the_c_remain_narrowing() {
+    // The 1/2/4 arms reach the same `remain:` label as the protocol headers
+    // (`packet_parser.c:265-284, 486-494`), so they narrow `hlen + plen` to a
+    // 32-bit `int` too. With a `packet_size` past `INT_MAX` the ceiling stops
+    // bounding the sum, so both the wrap and the sign become observable:
+    // ORACLE: decode_packet(4, <<255,255,255,252,65>>, [{packet_size,4294967295}])
+    //            => {more,undefined}                          (4 + 4294967292 wraps to 0)
+    //         decode_packet(2, <<255,254,65>>, [{packet_size,4294967295}])
+    //            => {more,65536}
+    //         decode_packet(1, <<255,65>>, [{packet_size,4294967295}])
+    //            => {more,256}
+    //         decode_packet(4, <<128,0,0,0,65>>, [{packet_size,4294967295}])
+    //            => {error,invalid}                           (the sum's bit 31 is set)
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    const HUGE: i64 = 4_294_967_295;
+
+    // plen 0xFFFFFFFC => 4 + 0xFFFFFFFC wraps to 0 => `{more,undefined}`.
+    let out = run_sized_int(&reg, &mut ctx, 4, &[255, 255, 255, 252, 65], HUGE);
+    assert_more_undefined(&reg, &mut ctx, &atoms, out);
+
+    // plen 0xFFFE => 2 + 0xFFFE = 65536.
+    let out = run_sized_int(&reg, &mut ctx, 2, &[255, 254, 65], HUGE);
+    assert_more(&reg, &mut ctx, &atoms, out, 65536);
+
+    // plen 0xFF => 1 + 0xFF = 256.
+    let out = run_sized_int(&reg, &mut ctx, 1, &[255, 65], HUGE);
+    assert_more(&reg, &mut ctx, &atoms, out, 256);
+
+    // plen 0x80000000 => 4 + 0x80000000 = 0x80000004: the narrowed `int` is
+    // negative, which `decode_packet_3` reads as `{error, invalid}`.
+    let out = run_sized_int(&reg, &mut ctx, 4, &[128, 0, 0, 0, 65], HUGE);
+    assert_invalid(&reg, &mut ctx, &atoms, out);
+
+    // A length that fits is unaffected: the body starts after the prefix.
+    let out = run_sized_int(&reg, &mut ctx, 1, &[2, 1, 2], HUGE);
+    assert_ok(&reg, &mut ctx, &atoms, out, &[1, 2], b"");
+}
+
+#[test]
+fn a_wrapped_length_below_the_prefix_is_invalid_not_a_panic() {
+    // When the wrapped `hlen + plen` sum lands *below* the prefix size the C
+    // hands `packet_get_body` a negative body length and the oracle aborts (a
+    // `Cannot allocate … bytes` crash dump), e.g.
+    //   erl -noshell -eval 'erlang:decode_packet(4,<<255,255,255,253,65>>,
+    //                                         [{packet_size,4294967295}])'
+    // There is no defined oracle result to match, so the crate reports the
+    // inconsistent header as `{error, invalid}` — and, crucially, never builds
+    // the inverted `Body::Binary { start: 4, end: 1 }` that would panic.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // plen 0xFFFFFFFD => 4 + 0xFFFFFFFD wraps to 1 (< the 4-byte prefix).
+    let out = run_sized_int(&reg, &mut ctx, 4, &[255, 255, 255, 253, 65], 4_294_967_295);
+    assert_invalid(&reg, &mut ctx, &atoms, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -871,5 +956,25 @@ fn live_oracle_agrees_on_the_five_framed_types() {
          {ok,<<1,2,0,1,0,3,2,0,65,66,67>>,<<>>},\
          {error,invalid}]",
         "the live oracle disagrees with the pinned goldens"
+    );
+}
+
+#[test]
+fn live_oracle_agrees_on_the_length_prefix_narrowing() {
+    // The `1`/`2`/`4` `remain:` goldens above, re-checked against the system
+    // ERTS today. Skips loudly when the oracle is unavailable.
+    let Some(output) = oracle_eval(
+        "io:format(\"~w~n\",[[\
+             erlang:decode_packet(4,<<255,255,255,252,65>>,[{packet_size,4294967295}]),\
+             erlang:decode_packet(2,<<255,254,65>>,[{packet_size,4294967295}]),\
+             erlang:decode_packet(1,<<255,65>>,[{packet_size,4294967295}]),\
+             erlang:decode_packet(4,<<128,0,0,0,65>>,[{packet_size,4294967295}])]])",
+    ) else {
+        return;
+    };
+    assert_eq!(
+        output.trim(),
+        "[{more,undefined},{more,65536},{more,256},{error,invalid}]",
+        "the live oracle disagrees with the pinned length-prefix goldens"
     );
 }

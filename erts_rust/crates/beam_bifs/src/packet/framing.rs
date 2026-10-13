@@ -38,8 +38,9 @@
 //! * `1`/`2`/`4` (`TCP_PB_1`/`_2`/`_4`) — a 1/2/4-byte big-endian length prefix
 //!   (`:265-284`), then the shared `remain:` label (`:486-494`): an effective
 //!   `max_plen` of `packet_size` when given, else `INT_MAX - hlen`;
-//!   `plen > max_plen` is `{error, invalid}`, otherwise the packet is
-//!   `hlen + plen` bytes long and the body starts at `hlen` (`packet_get_body`).
+//!   `plen > max_plen` is `{error, invalid}`, otherwise the packet length is
+//!   `hlen + plen` summed in the C's 32-bit `unsigned` and narrowed to the
+//!   returned `int`, and the body starts at `hlen` (`packet_get_body`).
 //! * `line` (`TCP_PB_LINE_LF`) — a delimiter-terminated line (`:295-322`), the
 //!   delimiter being `\n` unless `{line_delimiter, C}` (only valid for `line`,
 //!   `C <= 255`). A not-yet-terminated line is `{more, undefined}` unless it
@@ -164,8 +165,9 @@ fn whole_packet(packet_sz: usize) -> PacketLength {
     PacketLength::Packet { packet_sz, body_start: 0, body_end: packet_sz }
 }
 
-/// The C `remain:` label (`packet_parser.c:486-494`), shared by the five
-/// protocol headers below.
+/// The C `remain:` label (`packet_parser.c:486-494`), shared by every
+/// length-framed type — the five protocol headers below and the `1`/`2`/`4`
+/// length prefixes (which reach it through [`remain_body`]).
 ///
 /// `plen` is the *declared* payload length. In the C it is `unsigned`, i.e. a
 /// 32-bit value: every producer below either reads a 1..=4-byte big-endian
@@ -181,12 +183,24 @@ fn whole_packet(packet_sz: usize) -> PacketLength {
 /// Probing the oracle pins them
 /// (`decode_packet(tpkt, <<3,0,0,3,65,66>>, [{packet_size,4294967295}])` =>
 /// `{ok,<<3,0,0>>,<<3,65,66>>}`, `<<3,0,0,0,…>>` => `{more,undefined}`,
-/// `decode_packet(cdr, <<"GIOP",1,2,0,0,255,255,255,240,…>>, …)` =>
-/// `{error,invalid}`), so they are reproduced here rather than "corrected".
+/// `decode_packet(4, <<255,255,255,252,65>>, [{packet_size,4294967295}])` =>
+/// `{more,undefined}`, `decode_packet(cdr, <<"GIOP",1,2,0,0,255,255,255,240,…>>,
+/// …)` => `{error,invalid}`), so they are reproduced here rather than
+/// "corrected".
 ///
 /// The body of every one of these types is the whole packet
 /// (`packet_get_body`'s `default:` arm); `fcgi` narrows it afterwards.
 fn remain(hlen: usize, plen: u64, opts: &Options) -> PacketLength {
+    remain_body(hlen, plen, 0, opts)
+}
+
+/// [`remain`] with the body's start offset made explicit.
+///
+/// `packet_get_body` advances the body pointer past the length prefix for
+/// `TCP_PB_1`/`_2`/`_4` (`packet_parser.h:155-157`), so their body begins at
+/// `hlen` rather than `0`; every other length-framed type returns the whole
+/// packet (`body_start == 0`).
+fn remain_body(hlen: usize, plen: u64, body_start: usize, opts: &Options) -> PacketLength {
     let max_plen = if opts.max_plen == 0 {
         // `INT_MAX - hlen` in C's `unsigned` arithmetic (`packet_parser.c:487`
         // asserts `INT_MAX >= hlen`, so this is a plain subtraction in practice).
@@ -202,7 +216,17 @@ fn remain(hlen: usize, plen: u64, opts: &Options) -> PacketLength {
         return PacketLength::Invalid;
     }
     let packet_sz = packet_sz as usize;
-    whole_packet(packet_sz)
+    // `packet_get_body` computes the body length as `packet_sz - body_start`. The
+    // wrapped 32-bit sum can land below the header size only for `TCP_PB_1`/`_2`/
+    // `_4` (whose body starts at `hlen`), where the C is handed a *negative* body
+    // length that wrecks the emulator (the oracle aborts on it). Report the
+    // header as inconsistent instead of building an inverted body. A zero packet
+    // size is a genuine `{more, undefined}` that never reaches the body, so it
+    // passes through for the caller to render.
+    if packet_sz != 0 && packet_sz < body_start {
+        return PacketLength::Invalid;
+    }
+    PacketLength::Packet { packet_sz, body_start, body_end: packet_sz }
 }
 
 /// The C `get_int32` (`sys.h:1274-1277`): a big-endian 32-bit read. The macro's
@@ -239,13 +263,9 @@ fn length_prefix(hlen: usize, bytes: &[u8], opts: &Options) -> PacketLength {
         2 => u64::from(be_u16(&bytes[0..2])),
         _ => u64::from(be_u32(&bytes[0..4])),
     };
-    // The default ceiling is `INT_MAX - hlen`, so `hlen + plen` never overflows.
-    let max_plen = if opts.max_plen == 0 { INT_MAX - hlen as u64 } else { opts.max_plen };
-    if plen > max_plen {
-        return PacketLength::Invalid;
-    }
-    let packet_sz = hlen + plen as usize;
-    PacketLength::Packet { packet_sz, body_start: hlen, body_end: packet_sz }
+    // The shared `remain:` label, with the body past the `hlen`-byte prefix
+    // (`packet_get_body`'s `TCP_PB_1`/`_2`/`_4` arms).
+    remain_body(hlen, plen, hlen, opts)
 }
 
 /// `TCP_PB_LINE_LF` (`packet_parser.c:295-322`).

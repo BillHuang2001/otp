@@ -140,11 +140,8 @@ pub(super) enum Body {
     /// A plain binary body: `bytes[start..end]`. The producing parser guarantees
     /// `start <= end <= packet_sz <= bytes.len()`.
     Binary { start: usize, end: usize },
-    /// A term already built by the family parser (http family, `ssl_tls`).
-    // The frozen seam a term-building family hands its packet back through. The
-    // families that build a term are typed gaps today, so nothing constructs it
-    // yet; the `allow` goes away with the first of them.
-    #[allow(dead_code)]
+    /// A term already built by the family parser — the http family and
+    /// `ssl_tls`, whose packet is a term rather than a slice of the input.
     Term(Eterm),
 }
 
