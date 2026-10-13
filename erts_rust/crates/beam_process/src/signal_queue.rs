@@ -30,7 +30,9 @@
 //!
 //! # What a queued signal is
 //!
-//! A signal is either an **exit signal** — `from: ProcessId`, `reason: Eterm` — or a
+//! A signal is either an **exit signal** — `from: ProcessId`, `reason: Eterm`, `family`
+//! ([`ExitFamily`]: an explicit `erlang:exit/2` signal or a link exit, which decides whether
+//! `kill` is untrappable) — or a
 //! **monitor-DOWN** notification — `reference`, `target`, `kind`, an optional **user tag**,
 //! `reason` ([`PendingSignal`]). Both carry the exit/monitor `reason` as a live term: the
 //! reason is **copied into the receiving process's own heap when the signal is enqueued** (see
@@ -81,6 +83,7 @@ use beam_term::prelude::Eterm;
 
 use crate::monitor::{MonitorKind, MonitorRef};
 use crate::pid::ProcessId;
+use crate::signal::ExitFamily;
 
 /// What kind of signal a [`PendingSignal`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,12 +102,15 @@ pub enum PendingSignalKind {
 /// after a collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingSignal {
-    /// An exit signal from `from` carrying `reason`.
+    /// An exit signal from `from` carrying `reason`, in the [`ExitFamily`] that decides its trap
+    /// rule (`kill` is untrappable only in the explicit `erlang:exit/2` family).
     Exit {
         /// The signalling process.
         from: ProcessId,
         /// The exit reason term (already owned by the receiver's heap).
         reason: Eterm,
+        /// The signal family: an explicit `erlang:exit/2` signal, or a link exit.
+        family: ExitFamily,
     },
     /// A monitor-DOWN notification: the watched `target` is down with `reason`.
     Down {
@@ -122,9 +128,13 @@ pub enum PendingSignal {
 }
 
 impl PendingSignal {
-    /// An exit signal from `from` with `reason`.
-    pub fn exit(from: ProcessId, reason: Eterm) -> PendingSignal {
-        PendingSignal::Exit { from, reason }
+    /// An exit signal from `from` with `reason`, belonging to `family`.
+    pub fn exit(from: ProcessId, reason: Eterm, family: ExitFamily) -> PendingSignal {
+        PendingSignal::Exit {
+            from,
+            reason,
+            family,
+        }
     }
 
     /// A monitor-DOWN notification, with the optional `erlang:monitor/3` user tag
@@ -298,6 +308,11 @@ mod tests {
         ProcessId::new(number, 0)
     }
 
+    /// A queued exit signal in the **explicit** `erlang:exit/2` family (the tests' default; the
+    /// queue stores the family verbatim and the trap rule is applied by the process table).
+    fn exit(from: ProcessId, reason: Eterm) -> PendingSignal {
+        PendingSignal::exit(from, reason, ExitFamily::Explicit)
+    }
     fn reference(id: u64) -> MonitorRef {
         // The allocator is the only constructor; use it for a real id.
         let mut allocator = crate::monitor::RefAllocator::new();
@@ -319,8 +334,8 @@ mod tests {
     #[test]
     fn push_pop_is_fifo() {
         let mut queue = SignalQueue::new();
-        queue.push(PendingSignal::exit(pid(1), make_small(1)));
-        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+        queue.push(exit(pid(1), make_small(1)));
+        queue.push(exit(pid(2), make_small(2)));
         queue.push(PendingSignal::down(
             reference(0),
             pid(3),
@@ -332,15 +347,15 @@ mod tests {
 
         assert_eq!(
             queue.peek().copied(),
-            Some(PendingSignal::exit(pid(1), make_small(1)))
+            Some(exit(pid(1), make_small(1)))
         );
         assert_eq!(
             queue.pop(),
-            Some(PendingSignal::exit(pid(1), make_small(1)))
+            Some(exit(pid(1), make_small(1)))
         );
         assert_eq!(
             queue.pop(),
-            Some(PendingSignal::exit(pid(2), make_small(2)))
+            Some(exit(pid(2), make_small(2)))
         );
         assert_eq!(queue.pop().map(|s| s.kind()), Some(PendingSignalKind::Down));
         assert!(queue.is_empty());
@@ -350,14 +365,14 @@ mod tests {
     #[test]
     fn drain_returns_the_signals_in_application_order() {
         let mut queue = SignalQueue::new();
-        queue.push(PendingSignal::exit(pid(1), make_small(1)));
-        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+        queue.push(exit(pid(1), make_small(1)));
+        queue.push(exit(pid(2), make_small(2)));
         let drained = queue.drain();
         assert_eq!(
             drained,
             vec![
-                PendingSignal::exit(pid(1), make_small(1)),
-                PendingSignal::exit(pid(2), make_small(2)),
+                exit(pid(1), make_small(1)),
+                exit(pid(2), make_small(2)),
             ]
         );
         assert!(queue.is_empty());
@@ -366,9 +381,9 @@ mod tests {
 
     #[test]
     fn introspection_exposes_kind_and_reason() {
-        let exit = PendingSignal::exit(pid(4), make_small(41));
-        assert_eq!(exit.kind(), PendingSignalKind::Exit);
-        assert_eq!(exit.reason(), make_small(41));
+        let signal = exit(pid(4), make_small(41));
+        assert_eq!(signal.kind(), PendingSignalKind::Exit);
+        assert_eq!(signal.reason(), make_small(41));
 
         let reference = reference(2);
         let down = PendingSignal::down(reference, pid(5), MonitorKind::Process, None, make_small(51));
@@ -395,13 +410,37 @@ mod tests {
         assert_eq!(tagged.tag(), Some(make_small(7)));
         assert_eq!(tagged.reason(), make_small(52));
         // An exit signal has no tag.
-        assert_eq!(PendingSignal::exit(pid(1), make_small(1)).tag(), None);
+        assert_eq!(exit(pid(1), make_small(1)).tag(), None);
+    }
+
+    #[test]
+    fn an_exit_signal_carries_its_family() {
+        // The queue stores the family verbatim; the trap rule that consumes it is the table's
+        // (`exit_policy`), so a link exit must not be silently downgraded to the explicit family.
+        let explicit = exit(pid(1), make_small(1));
+        let linked = PendingSignal::exit(pid(1), make_small(1), ExitFamily::Linked);
+        assert!(matches!(
+            explicit,
+            PendingSignal::Exit {
+                family: ExitFamily::Explicit,
+                ..
+            }
+        ));
+        assert!(matches!(
+            linked,
+            PendingSignal::Exit {
+                family: ExitFamily::Linked,
+                ..
+            }
+        ));
+        // Only the family differs, so the two signals are not the same signal.
+        assert_ne!(explicit, linked);
     }
 
     #[test]
     fn clear_empties_the_queue() {
         let mut queue = SignalQueue::new();
-        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.push(exit(pid(1), make_small(1)));
         queue.clear();
         assert!(queue.is_empty());
     }
@@ -409,8 +448,8 @@ mod tests {
     #[test]
     fn iter_yields_in_application_order() {
         let mut queue = SignalQueue::new();
-        queue.push(PendingSignal::exit(pid(1), make_small(1)));
-        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+        queue.push(exit(pid(1), make_small(1)));
+        queue.push(exit(pid(2), make_small(2)));
         let reasons: Vec<i64> = queue.iter().map(|s| signed(s.reason())).collect();
         assert_eq!(reasons, vec![1, 2]);
     }
@@ -418,7 +457,7 @@ mod tests {
     #[test]
     fn gather_and_scatter_round_trip() {
         let mut queue = SignalQueue::new();
-        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.push(exit(pid(1), make_small(1)));
         queue.push(PendingSignal::down(
             reference(0),
             pid(2),
@@ -485,8 +524,8 @@ mod tests {
     #[test]
     fn scatter_is_total_for_a_mismatched_slice() {
         let mut queue = SignalQueue::new();
-        queue.push(PendingSignal::exit(pid(1), make_small(1)));
-        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+        queue.push(exit(pid(1), make_small(1)));
+        queue.push(exit(pid(2), make_small(2)));
 
         // A slice covering only the first signal leaves the second untouched.
         queue.scatter_roots(&[make_small(101)], 0);
@@ -495,7 +534,7 @@ mod tests {
 
         // A `start` past the end is likewise a no-op.
         let mut queue = SignalQueue::new();
-        queue.push(PendingSignal::exit(pid(3), make_small(3)));
+        queue.push(exit(pid(3), make_small(3)));
         queue.scatter_roots(&[make_small(9)], 99);
         assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(3)));
     }
