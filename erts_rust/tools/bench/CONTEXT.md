@@ -478,25 +478,24 @@ comparable per-process memory metric. The figures are in `RESULTS.md`.
 No workload returns a hard-coded or estimated metric; a workload that fails to build/run is always
 `failed`/`skipped`, never a number (verified across `src/workloads/*.rs`, `src/compare.rs`,
 `src/report.rs`, `src/runtime.rs`). No `todo!`/`unimplemented!`/non-doc `unreachable!`, no `#[ignore]`.
-Remaining labelling wrinkles — none fabricates a value:
 
-- **`foreign` maps an `erlc` compile failure to `skipped(sources-missing)`** (`src/workloads/foreign.rs:560`):
-  when the sources *are* present but `erlc` fails, the row is a skip (the staging note carries the error),
-  not `failed` — a real compile regression of the foreign sources can read as a benign skip. Contrast
-  `list_walk`, `copy_bound` and `gc_bound`, which treat the identical shape as `failed(module-compile-failed)`
-  (`src/workloads/list_walk.rs:509`, `copy_bound.rs`, `gc_bound.rs`), and `slice`, which maps a failed fixture
-  rebuild to `skipped(fixture-missing)` (`src/workloads/slice.rs:560`).
-- **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` divide the *attempted* file/LOC count** by the wall time
-  (`src/workloads/erlc_compiler.rs:296,300`: `total_files`/`total_loc` from `files.len()`), not the
-  `files_compiled` (produced `.beam`) count, so a partial `erlc` run overstates throughput relative to
-  the `files_compiled` row beside it. `elixir_compiler` uses the produced count
-  (`produced as f64 / seconds`).
-- **Stale in-file doc:** `src/workloads/baseline.rs` (module doc and the `MEMORY_EVAL` comment) still says
-  `erlang:memory/0,1` "is not implemented by the Rust runtime yet"; `beam_rt` now serves it via the
-  `MemoryHook` seam and the workload records a real `vm_memory_total_bytes` for `rust` (`RESULTS.md` §3.2).
-  `is_capability_gap` survives only as a fallback classifier.
-- `proc.rs:126` (`h.join().unwrap_or_default()`) collapses a panicked stdout/stderr drain thread to an empty
-  string; the drain threads have no realistic panic path, so this is latent, not active.
+- **`foreign` classifies a staging failure honestly** (`src/workloads/foreign.rs`: `StageError` +
+  `stage_outcome`): a checkout whose foreign `.erl` sources are genuinely absent ⇒
+  `skipped(sources-missing)`, while a failure to compile the sources we *did* stage (the embedded driver or a
+  present foreign source) ⇒ `failed(module-compile-failed)` — matching the workloads whose sources are ours
+  (`list_walk`/`copy_bound`/`gc_bound`). `slice` treats a failed fixture rebuild as `skipped(fixture-missing)`.
+- **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` are computed from the *produced* counts**
+  (`rates_per_second` over `CorpusRun::produced` / `produced_loc`, the latter from `compiled_sources`, which
+  matches each newly written `.beam` back to its source by file stem), so a partial `erlc` run cannot overstate
+  throughput next to `files_compiled`. The attempted file/LOC totals are still reported, but only in a note.
+  `elixir_compiler` likewise uses the produced count.
+- `proc.rs`'s drain-thread join (`h.join().unwrap_or_default()`) is infallible **by construction** — the drain
+  threads run only `read_to_end` + a lossy UTF-8 conversion, neither of which can panic — so the
+  `unwrap_or_default` masks nothing real; the invariant is documented at the call site.
+
+`baseline.rs`'s docs correctly state that both runtimes serve `erlang:memory/0,1` (`beam_rt` via its
+`MemoryHook` seam), recording a real `vm_memory_total_bytes` for `rust`; `is_capability_gap` survives only as a
+fallback classifier.
 
 The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as
 `RESULTS.md` states (startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF
