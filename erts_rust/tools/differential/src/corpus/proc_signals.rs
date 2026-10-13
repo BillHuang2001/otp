@@ -400,6 +400,55 @@ pub(crate) fn group() -> Vec<Case> {
              erlang:demonitor(Ref) end",
             "ok true",
         ),
+        // --- process_info/1,2 documented-key shapes (values are VM-dependent) --------------
+        case(
+            "proc_signals/process_info_heap_size_is_integer",
+            "process_info(self(), heap_size) reports an integer element",
+            "is_integer(element(2, process_info(self(), heap_size)))",
+            "ok true",
+        ),
+        case(
+            "proc_signals/process_info_memory_is_integer",
+            "process_info(self(), memory) reports an integer element",
+            "is_integer(element(2, process_info(self(), memory)))",
+            "ok true",
+        ),
+        case(
+            "proc_signals/process_info_dictionary_empty",
+            "process_info(self(), dictionary) is empty for a process that stored no values",
+            "element(2, process_info(self(), dictionary))",
+            "ok []",
+        ),
+        case(
+            "proc_signals/process_info_monitors_empty",
+            "process_info(self(), monitors) is an empty list for a process that set no monitors",
+            "process_info(self(), monitors)",
+            "ok {monitors,[]}",
+        ),
+        case(
+            "proc_signals/processes_is_a_list",
+            "erlang:processes/0 returns a list",
+            "is_list(processes())",
+            "ok true",
+        ),
+        case(
+            "proc_signals/registered_is_a_list",
+            "erlang:registered/0 returns a list",
+            "is_list(registered())",
+            "ok true",
+        ),
+        case(
+            "proc_signals/whereis_init_is_a_pid",
+            "erlang:whereis(init) resolves the boot-registered init process to a pid",
+            "is_pid(whereis(init))",
+            "ok true",
+        ),
+        case(
+            "proc_signals/is_process_alive_self",
+            "erlang:is_process_alive/1 is true for the calling process",
+            "is_process_alive(self())",
+            "ok true",
+        ),
     ]
 }
 
@@ -429,6 +478,14 @@ mod tests {
         "proc_signals/statistics_reductions_is_two_integer_tuple",
         "proc_signals/statistics_context_switches_is_two_integer_tuple",
         "proc_signals/statistics_io_outer_shape",
+        "proc_signals/process_info_heap_size_is_integer",
+        "proc_signals/process_info_memory_is_integer",
+        "proc_signals/process_info_dictionary_empty",
+        "proc_signals/process_info_monitors_empty",
+        "proc_signals/processes_is_a_list",
+        "proc_signals/registered_is_a_list",
+        "proc_signals/whereis_init_is_a_pid",
+        "proc_signals/is_process_alive_self",
     ];
 
     /// The monitor / `spawn_monitor` family.

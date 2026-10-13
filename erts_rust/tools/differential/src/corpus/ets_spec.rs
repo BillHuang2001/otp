@@ -484,5 +484,114 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- widened: guards, projections and the counting/deleting queries ----------------
+        Case {
+            id: "ets/select_guard_projection",
+            description: "select/2 with a guard projects the key of the objects that pass it",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_spec_sg, [set]), ets:insert(T, [{a,1},{b,2}]), \
+                       ets:select(T, [{{'$1','$2'},[{'>','$2',1}],['$1']}]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [b]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/select_projection_swapped_pair",
+            description: "a select/2 body may return a compound (1-tuple) replacement value",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_spec_srp, [ordered_set]), \
+                       ets:insert(T, [{a,1},{b,2}]), \
+                       ets:select(T, [{{'$1','$2'},[],[{{'$2','$1'}}]}]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{1,a},{2,b}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/select_count_all_matches",
+            description: "select_count/2 counts every object whose spec body is true",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_spec_sca, [set]), ets:insert(T, [{a,1},{b,2}]), \
+                       ets:select_count(T, [{{'$1','$2'},[],[true]}]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/select_delete_all_matches",
+            description: "select_delete/2 deletes every object whose spec body is true",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_spec_sda, [ordered_set]), \
+                       ets:insert(T, [{a,1},{b,2},{c,3}]), \
+                       ets:select_delete(T, [{{'_','$2'},[],[true]}]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 3"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/match_spec_run_guard_projection",
+            description: "match_spec_run/2 runs a compiled spec with a guard over a plain list",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_spec_msr, [set]), \
+                       ets:match_spec_run([{a,1},{b,2}], \
+                       ets:match_spec_compile([{{'$1','$2'},[{'>','$2',1}],['$1']}])) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [b]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/match_object_wildcard_all",
+            description: "match_object/2 with the '_' wildcard returns every object",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_spec_mow, [set]), ets:insert(T, [{a,1}]), \
+                       ets:match_object(T, '_') end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{a,1}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/first_last_ordered_set_term_order",
+            description: "first/1 and last/1 of an ordered_set agree on term order, not insertion order",
+            contracts: &[Contract::LanguageSemantics, Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_spec_fl, [ordered_set]), \
+                       ets:insert(T, [{b,2},{a,1}]), {ets:first(T), ets:last(T)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {a,b}"),
+                exit_code: 0,
+            },
+        },
     ]
 }

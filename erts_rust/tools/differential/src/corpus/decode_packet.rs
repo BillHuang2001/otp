@@ -494,6 +494,91 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- widened: the HTTP end-of-headers / empty-line forms and zero-length frames --------
+        Case {
+            id: "decode_packet/http_empty_request_line_is_http_error",
+            description: "the http packet type reports {http_error, <<\"\\r\\n\">>} for an empty request line",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:decode_packet(http, <<\"\\r\\n\">>, [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,119,2,111,107,104,2,119,10,104,116,116,112,95,101,114,114,111,114,107,0,2,13,10,109,0,0,0,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "decode_packet/httph_blank_line_is_end_of_headers",
+            description: "the httph packet type decodes a blank line as the http_eoh marker",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:decode_packet(httph, <<\"\\r\\n\">>, [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,119,2,111,107,119,8,104,116,116,112,95,101,111,104,109,0,0,0,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "decode_packet/line_with_lf_only_ends_the_line",
+            description: "the line packet type accepts a bare line feed as the delimiter",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:decode_packet(line, <<\"abc\\n\">>, [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,119,2,111,107,109,0,0,0,4,97,98,99,10,109,0,0,0,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "decode_packet/one_byte_zero_length_packet",
+            description: "packet type 1 accepts a zero-length packet with a non-empty rest",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:decode_packet(1, <<0,88>>, [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,119,2,111,107,109,0,0,0,0,109,0,0,0,1,88>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "decode_packet/four_byte_zero_length_packet",
+            description: "packet type 4 accepts a zero-length packet with a non-empty rest",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:decode_packet(4, <<0,0,0,0,88>>, [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,119,2,111,107,109,0,0,0,0,109,0,0,0,1,88>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "decode_packet/four_byte_packet_size_exceeded_is_invalid",
+            description: "a four-byte length prefix above {packet_size, N} is {error, invalid}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:decode_packet(4, <<0,0,0,10,97,98,99>>, [{packet_size,4}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,5,101,114,114,111,114,119,7,105,110,118,97,108,105,100>>"),
+                exit_code: 0,
+            },
+        },
         // --- the rejected Type / argument shapes -----------------------------------------------
         Case {
             id: "decode_packet/integer_three_is_not_a_packet_type",
@@ -590,7 +675,7 @@ mod tests {
     #[test]
     fn the_group_covers_every_accepted_packet_type() {
         let cases = group();
-        assert_eq!(cases.len(), 37, "the A.7 decode_packet group has thirty-seven cases");
+        assert_eq!(cases.len(), 43, "the A.7 decode_packet group has forty-three cases");
         for case in &cases {
             assert!(case.id.starts_with("decode_packet/"), "{}", case.id);
             assert_eq!(case.contracts, &[Contract::OtpApps], "{}", case.id);

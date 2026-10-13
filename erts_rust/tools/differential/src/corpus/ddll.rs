@@ -279,6 +279,63 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // --- widened: the empty name / empty directory shapes and unload/1 --------------------
+        Case {
+            id: "ddll/try_load_empty_name",
+            description: "erl_ddll:try_load/3 with an empty object name is {error,{open_error,-10}}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erl_ddll:try_load(\".\", \"\", [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,5,101,114,114,111,114,104,2,119,10,111,112,101,110,95,101,114,114,111,114,98,255,255,255,246>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ddll/try_load_empty_directory",
+            description: "erl_ddll:try_load/3 with an empty directory is {error,{open_error,-10}}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erl_ddll:try_load(\"\", \"nosuch\", [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,5,101,114,114,111,114,104,2,119,10,111,112,101,110,95,101,114,114,111,114,98,255,255,255,246>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ddll/try_unload_empty_name",
+            description: "erl_ddll:try_unload/2 with an empty name is {error,not_loaded}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erl_ddll:try_unload(\"\", [])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,5,101,114,114,111,114,119,10,110,111,116,95,108,111,97,100,101,100>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ddll/unload_a_not_loaded_driver",
+            description: "erl_ddll:unload/1 of a driver that is not loaded is {error,not_loaded}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erl_ddll:unload(\"nosuch\")",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,5,101,114,114,111,114,119,10,110,111,116,95,108,111,97,100,101,100>>"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -290,7 +347,7 @@ mod tests {
     #[test]
     fn the_group_pins_the_loaded_drivers_try_load_try_unload_and_info_surface() {
         let cases = group();
-        assert_eq!(cases.len(), 16, "the A.7 erl_ddll group has sixteen cases");
+        assert_eq!(cases.len(), 20, "the A.7 erl_ddll group has twenty cases");
         assert_eq!(
             cases.iter().map(|case| case.id).collect::<Vec<_>>(),
             [
@@ -310,6 +367,10 @@ mod tests {
                 "ddll/info_of_an_unknown_name_is_badarg",
                 "ddll/info_of_an_unknown_key_is_badarg",
                 "ddll/info_of_a_non_string_name_is_badarg",
+                "ddll/try_load_empty_name",
+                "ddll/try_load_empty_directory",
+                "ddll/try_unload_empty_name",
+                "ddll/unload_a_not_loaded_driver",
             ]
         );
         for case in &cases {

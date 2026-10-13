@@ -763,5 +763,274 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- widened: the remaining table types and creation options `info/2` reflects ---
+        Case {
+            id: "ets/info_type_bag",
+            description: "info/2 type reports a bag table",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_type_bag, [bag]), ets:info(T, type) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok bag"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/info_type_duplicate_bag",
+            description: "info/2 type reports a duplicate_bag table",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_type_dbag, [duplicate_bag]), ets:info(T, type) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok duplicate_bag"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/info_compressed_true",
+            description: "info/2 compressed is true when the {compressed, true} option was given",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_cmpr2, [set, compressed]), ets:info(T, compressed) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/info_read_concurrency_true",
+            description: "info/2 read_concurrency is true when {read_concurrency, true} was given",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_rc, [set, {read_concurrency, true}]), \
+                       ets:info(T, read_concurrency) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/info_write_concurrency_true",
+            description: "info/2 write_concurrency is true when {write_concurrency, true} was given",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_wc, [set, {write_concurrency, true}]), \
+                       ets:info(T, write_concurrency) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/info_named_table_true",
+            description: "info/2 named_table is true when the named_table option was given",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_nt2, [named_table, set]), ets:info(T, named_table) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        // --- widened: mutation / lookup round trips ---
+        Case {
+            id: "ets/keypos_three_end_to_end",
+            description: "a {keypos,3} table keys on element 3 for insert and lookup",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_kp3, [{keypos,3}]), ets:insert(T, {x, y, 1}), \
+                       ets:lookup(T, 1) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{x,y,1}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/insert_new_list_keeps_existing",
+            description: "insert_new/2 over a list keeps the existing object and reports false",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_inlist, [set]), ets:insert(T, {a,1}), \
+                       ets:insert_new(T, [{a,9}]), ets:lookup(T, a) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{a,1}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/member_empty_table_is_false",
+            description: "member/2 is false on a table that has never been written",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_mem0, [set]), ets:member(T, a) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/delete_all_objects_returns_true",
+            description: "delete_all_objects/1 returns true",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_dao2, [set]), ets:insert(T, {a,1}), \
+                       ets:delete_all_objects(T) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/duplicate_bag_delete_object_removes_all",
+            description: "delete_object/2 in a duplicate_bag removes every identical object",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_dbd, [duplicate_bag]), ets:insert(T, {a,1}), \
+                       ets:insert(T, {a,1}), ets:delete_object(T, {a,1}), \
+                       length(ets:lookup(T, a)) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 0"),
+                exit_code: 0,
+            },
+        },
+        // --- widened: update_counter/4 (the default-object form) and the multi-spec list ---
+        Case {
+            id: "ets/update_counter4_default_insert",
+            description: "update_counter/4 with a default object inserts and increments it",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_ucd, [set]), \
+                       ets:update_counter(T, k, 1, {k, 100}) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 101"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/update_counter4_pos_spec_default",
+            description: "update_counter/4 with a {Pos,Incr} spec uses the default object's element",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_ucd2, [set]), \
+                       ets:update_counter(T, k, {2, 1}, {k, 0}) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/update_counter4_multi_spec_list",
+            description: "update_counter/3 with a list of {Pos,Incr} specs returns the new values",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_ucd3, [set]), ets:insert(T, {k, 1, 1}), \
+                       ets:update_counter(T, k, [{2,1},{3,1}]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [2,2]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/update_counter_missing_key_is_badarg",
+            description: "update_counter/3 without a default raises badarg for an absent key",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_ucbad, [set]), ets:update_counter(T, k, 1) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        // --- widened: update_element/3 (absent key, and a position list) ---
+        Case {
+            id: "ets/update_element_absent_key_is_false",
+            description: "update_element/3 on an absent key stores nothing and returns false",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_ueabs, [set]), ets:insert(T, {a,1}), \
+                       ets:update_element(T, b, {2, 1}) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets/update_element_list_of_positions",
+            description: "update_element/3 accepts a list of {Pos,Value} pairs",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_uelist, [set]), ets:insert(T, {a,1,2}), \
+                       ets:update_element(T, a, [{2,5},{3,6}]), ets:lookup(T, a) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{a,5,6}]"),
+                exit_code: 0,
+            },
+        },
+        // --- widened: the rejected argument shapes ---
+        Case {
+            id: "ets/insert_non_tuple_is_badarg",
+            description: "insert/2 with a non-tuple object raises badarg",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_tab_badins, [set]), ets:insert(T, not_a_tuple) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
     ]
 }
