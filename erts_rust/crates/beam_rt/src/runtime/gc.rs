@@ -99,6 +99,9 @@ pub struct GcStatsSnapshot {
 /// what the runtime needs to build that message when the request is discharged
 /// ([`Runtime::deliver_gc_completions`]).
 pub(crate) struct AsyncGcCompletion {
+    /// The **target** of the request — the process whose liveness the completion reports, and
+    /// the identity a later request for the same target replaces.
+    pub(crate) target: ProcessId,
     /// The process that made the call — `{garbage_collect, ReqId, Result}` is sent to it.
     pub(crate) requester: ProcessId,
     /// The caller's `ReqId` (any term), copied onto the runtime's pointer-stable arena by
@@ -126,12 +129,19 @@ pub(crate) struct GcState {
     /// [`Runtime::request_gc`]).
     requested: HashSet<ProcessId>,
     /// The **asynchronous** `erlang:garbage_collect/2` requests still owed a completion
-    /// message, keyed by the **target** pid (see [`AsyncGcCompletion`]).
+    /// message, in **request order**, at most one entry per **target** pid (see
+    /// [`AsyncGcCompletion`]).
     ///
     /// A record is dropped at the first pass boundary after the request
     /// ([`Runtime::deliver_gc_completions`]), which also emits the message: the target is then
     /// either still alive (the oracle's `true`) or gone (the oracle's `false`).
-    async_completions: HashMap<ProcessId, AsyncGcCompletion>,
+    ///
+    /// A **`Vec`**, not a map: the drain must emit the completions in **request order**, as the
+    /// oracle does, where a `HashMap`'s randomised per-process iteration order would make the
+    /// order run-to-run varying. A new request for a target that already has one **replaces
+    /// that entry in place** (keeping its position), mirroring the one-bit-per-process latch of
+    /// [`Runtime::request_gc`].
+    async_completions: Vec<AsyncGcCompletion>,
     /// The **descent gate**: the pids that have ever had a container from a region their
     /// collector does not scan enter their reachable term graph.
     ///
@@ -184,7 +194,7 @@ impl GcState {
             pinned: HashSet::new(),
             halted: HashSet::new(),
             requested: HashSet::new(),
-            async_completions: HashMap::new(),
+            async_completions: Vec::new(),
             foreign: HashSet::new(),
             walk: WalkScratch::default(),
             disabled: false,
@@ -285,9 +295,24 @@ impl Runtime {
         if live {
             self.gc.requested.insert(pid);
         }
-        self.gc
+        // One outstanding completion per target: a later request for the same target replaces
+        // the earlier entry **in place**, so the replace never reorders the outstanding requests.
+        match self
+            .gc
             .async_completions
-            .insert(pid, AsyncGcCompletion { requester, req_id });
+            .iter_mut()
+            .find(|completion| completion.target == pid)
+        {
+            Some(existing) => {
+                existing.requester = requester;
+                existing.req_id = req_id;
+            }
+            None => self.gc.async_completions.push(AsyncGcCompletion {
+                target: pid,
+                requester,
+                req_id,
+            }),
+        }
     }
 
     /// Emits the `{garbage_collect, ReqId, Result}` completion of every **asynchronous**
@@ -331,15 +356,15 @@ impl Runtime {
         }
         // Drained outright: every record is discharged here (the request was latched, the result
         // is the target's liveness at this boundary), so nothing may be left behind for a later
-        // boundary to re-report.
-        let pending: Vec<(ProcessId, AsyncGcCompletion)> =
-            self.gc.async_completions.drain().collect();
+        // boundary to re-report. The drain keeps the insertion (**request**) order.
+        let pending: Vec<AsyncGcCompletion> = self.gc.async_completions.drain(..).collect();
         let mut delivered = 0;
-        for (target, completion) in pending {
+        for completion in pending {
             if !table.contains(completion.requester) {
                 continue;
             }
-            let message = self.gc_completion_message(completion.req_id, table.contains(target))?;
+            let message =
+                self.gc_completion_message(completion.req_id, table.contains(completion.target))?;
             // The sender `from` is the emulator itself — the C queues the task reply as a
             // message of the emulator (`ERL_MESSAGE_TOKEN(mp) = am_undefined`, with the sending
             // process never consulted for the envelope), and an *immediate* is required because
