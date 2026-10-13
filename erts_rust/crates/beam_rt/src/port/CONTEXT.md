@@ -148,8 +148,14 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   `pump_until_exit` and `Fixture::args_option` helpers; the helper requires the target port to be the
   fixture's **only live port** (a round drains every live port and `beam_io::PortRegistry::take_exit_status`
   hands a status out once, so a foreign event would be lost) and fails loudly rather than starving the
-  caller. The oracle cross-checks run through `erl_eval`, which prints a **loud** skip banner when no
-  usable `erl` is on `PATH`.
+  caller. The oracle cross-checks run through `erl_eval` (`erl -noshell -eval <expr> -s init stop`, an
+  **unbounded** `.output()` — no poll/kill, unlike the bounded `tests/support/mod.rs` probe), which prints
+  a **loud** skip banner when no usable `erl` is on `PATH`. The five `driver/*_tests.rs` suites invoke
+  `erl` **only** to locate `erl_driver.h` (`code:lib_dir(erts,include)`, with a `$PATH`-sibling/`ERL_TOP`/
+  standard-root fallback) — never as a behavioral oracle — and compile their C fixture with `$CC`/`cc`
+  (`-shared -fPIC -D… -I<include> -o <stem>.so`), asserting against the fixture's marker file (and the
+  returned control reply), not oracle output; a missing compiler/header prints the same loud banner and
+  returns (skip), it never fails the test.
 - Colocated units in `driver.rs`: the registry-slot codes, the thread-local entry list, the
   `armed_event` rejection, and `binary_to_term` (a decoded image, an invalid one → `None`). The monitor tree + host hooks are pinned in `driver/monitor_tests.rs`; the provider's marking sweep in `monitor_tests.rs`; and the firing drive point in `driver/fire_tests.rs` (a real C `.so` whose `process_exit` writes a marker file, driven through a real `PortRegistry::execute_port_tasks` round — incl. the end-to-end case that opens the driver through the production `{spawn_driver,…}` path and marks via `Runtime::drain_driver_monitor_exits`); `driver/liveness_tests.rs` closes the loop over the same fixture pattern — a real C driver `.so` compiled at test time whose `control` verb calls the real `driver_monitor_process` entry point (handed to it as a function pointer) and reads back the code the entry point answered: `0` for a pid the last port round observed alive, the C's positive `1` for one it did not, and `0` for a pid no round has observed yet (the documented fallback). No `#[ignore]` remains anywhere in `src/port/`.
 - The A.4 **driver-private state suite** `driver/hooks_tests.rs` pins `DriverPort`'s `DriverHost`
