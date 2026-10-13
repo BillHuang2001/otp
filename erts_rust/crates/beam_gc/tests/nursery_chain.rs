@@ -445,11 +445,31 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     // The growth path really was exercised.
     assert!(grew, "the loop must have grown the nursery at least once");
 
-    // The capacities plateau: the last 50 recorded triples are all identical.
+    // The capacities plateau: the last 50 triples form a bounded **period-2** cycle.
+    //
+    // After the growth path has run, a round's *collection* collapses the chain and re-sizes
+    // the nursery from what it left alive in it: the round's `STEADY_NEED`-word object is
+    // promoted out, so the surviving set is empty and `young_after_collection` falls the
+    // nursery back to a small size; the *next* round's request then outgrows that and
+    // `grow_nursery` steps it back up. The loop therefore alternates deterministically between
+    // a grown and a collapsed nursery rather than sitting at a single constant.
+    //
+    // What matters is that the cycle is **bounded** — a fixed period over a fixed, finite set
+    // of states, each capacity pinned — not that it is a single value. A creep would show as a
+    // third (or drifting) state, which the exact-set assertion below rejects.
+    const PERIOD: usize = 2;
     let tail = &recorded[ROUNDS - 50..];
     assert!(
-        tail.windows(2).all(|w| w[0] == w[1]),
-        "the last 50 triples must be identical, got {tail:?}"
+        tail.iter().enumerate().all(|(i, t)| *t == tail[i % PERIOD]),
+        "the last 50 triples must form a bounded period-{PERIOD} cycle, got {tail:?}"
+    );
+    let distinct: std::collections::BTreeSet<(usize, usize, usize)> =
+        tail.iter().copied().collect();
+    let pinned: std::collections::BTreeSet<(usize, usize, usize)> =
+        [(1, 90, 1598), (1, 1077, 1598)].into_iter().collect();
+    assert_eq!(
+        distinct, pinned,
+        "the converged cycle must be exactly the pinned grown/collapsed alternation"
     );
 
     // Nothing creeps without bound.

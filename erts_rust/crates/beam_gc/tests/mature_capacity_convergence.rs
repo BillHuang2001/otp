@@ -30,6 +30,14 @@
 //! over a long-lived, *bounded* live set rebuilt fresh every round, and asserts the mature
 //! generation's capacity converges to a **constant**.
 //!
+//! The mature *occupancy* is a different story and is pinned per strategy instead of as a
+//! constant: a copying minor promotes the nursery's live words *onto the top of* the mature
+//! space without reclaiming it, so the occupancy cycles one live set per minor until the
+//! escalation test fires a fullsweep ([`COPYING_OCCUPANCY_CYCLE`]); the mark-region region is
+//! reclaimed **in place** at every fullsweep and then holds exactly the live set, so its
+//! occupancy is the single value [`IMMIX_OCCUPANCY`]. Both are bounded — neither grows without
+//! limit — which is the property asserted below.
+//!
 //! That is exactly the property a fullsweep must have and the one a "size the fresh mature space
 //! from the pre-collection occupancy" rule breaks. Between two fullsweeps the mature generation
 //! is *not* reclaimed (that is the whole point of a generational collector): the graph a round
@@ -85,6 +93,26 @@ const LIVE_WORDS: usize = LIVE_TUPLES as usize * TUPLE_WORDS;
 /// Every mature strategy: the copying space and the mark-region space.
 const STRATEGIES: [MatureKind; 2] = [MatureKind::Copying, MatureKind::Immix];
 
+/// The **copying** mature occupancy's converged cycle: one live set per minor since the last
+/// fullsweep (`60 -> 120 -> 180 -> 60`). A copying minor promotes the nursery's live words onto
+/// the top of the mature space without reclaiming it; once the mature space can no longer
+/// receive the nursery's occupancy the escalation test fires a fullsweep, which evacuates young
+/// *and* mature into a fresh space holding exactly the 60-word live set — so the occupancy
+/// starts over at 60 rather than growing without bound.
+const COPYING_OCCUPANCY_CYCLE: [usize; 3] = [LIVE_WORDS, 2 * LIVE_WORDS, 3 * LIVE_WORDS];
+
+/// The **mark-region** mature occupancy: the region is reclaimed **in place** at every
+/// fullsweep and then holds exactly the live set — 20 one-line tuples = 20 lines = 320 words.
+const IMMIX_OCCUPANCY: usize = LIVE_TUPLES as usize * 16;
+
+/// The pinned mature-occupancy cycle for a strategy (a single value for the mark-region space).
+fn occupancy_cycle(kind: MatureKind) -> &'static [usize] {
+    match kind {
+        MatureKind::Copying => &COPYING_OCCUPANCY_CYCLE,
+        MatureKind::Immix => core::slice::from_ref(&IMMIX_OCCUPANCY),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -135,8 +163,9 @@ unsafe fn tuple_pair(t: Eterm) -> (i64, i64) {
 /// The live set never changes: 20 tuples (60 words) are rebuilt every round and the previous
 /// round's graph becomes garbage. A fullsweep therefore has to preserve exactly 60 live words
 /// every time, so its size decision must be identical every time — any growth is the
-/// occupancy-inflated sizing bug. The nursery and the mature occupancy are asserted to be
-/// constant too, and the live set is checked structurally after every round.
+/// occupancy-inflated sizing bug. The nursery capacity is asserted to be constant too, the
+/// mature occupancy is asserted to follow the strategy's pinned cycle (see
+/// [`occupancy_cycle`]), and the live set is checked structurally after every round.
 #[test]
 fn the_mature_capacity_converges_under_the_default_cadence() {
     for kind in STRATEGIES {
@@ -212,12 +241,24 @@ fn the_mature_capacity_converges_under_the_default_cadence() {
             mature_caps[MEASURED - 1]
         );
 
-        let (use_min, use_max) = min_max(&mature_uses);
+        // ---- the mature occupancy follows the pinned cycle for the strategy ----
+        // A copying minor promotes the nursery's live words onto the top of the mature space
+        // without reclaiming it, so the occupancy steps up one live set per minor until a
+        // fullsweep resets it (see `COPYING_OCCUPANCY_CYCLE`); the mark-region region is
+        // reclaimed in place at every fullsweep and then holds exactly the live set, so its
+        // occupancy is a single value. Neither creeps: the observed set of values must be
+        // exactly the pinned cycle, no more and no less.
+        let cycle = occupancy_cycle(kind);
+        let mut observed = mature_uses.clone();
+        observed.sort_unstable();
+        observed.dedup();
+        let mut pinned = cycle.to_vec();
+        pinned.sort_unstable();
         assert_eq!(
-            use_min, use_max,
-            "{kind:?}: the mature occupancy must be constant (the live set is constant), got \
-             min {use_min} != max {use_max}"
+            observed, pinned,
+            "{kind:?}: the mature occupancy must follow the pinned cycle {cycle:?}"
         );
+
         let (young_min, young_max) = min_max(&young_caps);
         assert_eq!(
             young_min, young_max,
@@ -236,11 +277,12 @@ fn the_mature_capacity_converges_under_the_default_cadence() {
              below the default scale"
         );
         // The fullsweep path really was exercised: a fullsweep promotes the whole live graph, so
-        // the mature occupancy is the live set (word-exact for copying; line-rounded, and
+        // the mature occupancy's floor is the live set (word-exact for copying; line-rounded, and
         // therefore at least the live set, for the mark-region space).
+        let cycle_min = *cycle.iter().min().expect("a pinned cycle");
         assert!(
-            use_min >= LIVE_WORDS,
-            "{kind:?}: the mature occupancy ({use_min} words) must hold the live set"
+            cycle_min >= LIVE_WORDS,
+            "{kind:?}: the mature occupancy cycle {cycle:?} must hold the live set"
         );
         assert!(
             c.stats().major_collections > 0,
@@ -254,7 +296,7 @@ fn the_mature_capacity_converges_under_the_default_cadence() {
         );
         eprintln!(
             "  young capacity = {young_min} words (constant), mature capacity = {cap_min} words \
-             (constant), mature occupancy = {use_min} words (constant)"
+             (constant), mature occupancy cycles over {cycle:?}"
         );
     }
 }

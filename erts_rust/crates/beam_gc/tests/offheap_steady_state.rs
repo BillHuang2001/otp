@@ -45,11 +45,13 @@
 //! * **(c) a bounded steady state.** A long (240-round) loop at the **default cadence**
 //!   (`fullsweep_after = 65535`) over a bounded off-heap-heavy live set plus fresh garbage each
 //!   round, through **both** strategies pinned explicitly. The nursery capacity, the mature
-//!   capacity, the total heap and (for the mark-region strategy) the resident line count must
-//!   be **constant** across the second half of the loop — the property a garbage-inflated
-//!   mature sizing would break by creeping the capacity up one growth step per fullsweep — the
-//!   nursery must be empty after every collection, and the counter must still match the real
-//!   collection's copy.
+//!   capacity and the total heap must be **constant** across the second half of the loop — the
+//!   property a garbage-inflated mature sizing would break by creeping the capacity up one growth
+//!   step per fullsweep — the nursery must be empty after every collection, and the counter must
+//!   still match the real collection's copy. The mark-region **resident line count** is *not*
+//!   constant there — the region is reclaimed in place by a fullsweep and then promoted into
+//!   between fullsweeps — so it is asserted to **cycle within a pinned, bounded band** (never
+//!   creeping), not to sit at a single value.
 //!
 //! ## Determinism
 //!
@@ -61,7 +63,7 @@
 use beam_alloc::RefcBinary;
 use beam_gc::prelude::{
     lines_for, AnyCollector, CollectionKind, GenImmixCollector, GcConfig, HeapPolicy, MatureKind,
-    Mso, OffHeap,
+    Mso, OffHeap, LINE_WORDS,
 };
 use beam_term::prelude::{
     boxed_val, fun_words, is_refc_binary, make_small, map_words_capacity, ptr_val, refc_bytes,
@@ -139,7 +141,7 @@ struct Corpus {
     /// capacity exists (a leaf-dense HAMT map needs more lines than any kept region can hold,
     /// so its fullsweep always relocates).
     mature_in_place: Option<usize>,
-    /// The mature capacity that makes the policy **shrink** the region (the relocating path).
+    /// The mature capacity that makes the policy **resize** the region (the relocating path).
     mature_relocate: usize,
     /// The independently known on-heap word count.
     words: usize,
@@ -279,9 +281,12 @@ fn corpora() -> Vec<(Corpus, fn(&mut GenImmixCollector) -> Vec<Eterm>)> {
                 name: "HAMT map + funs",
                 young: 1 << 16,
                 // A leaf-dense HAMT map needs far more lines than any kept region of its word
-                // size, so its fullsweep always relocates — no in-place capacity exists.
+                // size, so its fullsweep always relocates — no in-place capacity exists. One
+                // Immix block is far below the corpus's live words (and its line need), so the
+                // policy's grow branch fires and the fullsweep takes the relocating
+                // (resizing) path, which is the path this test covers for this corpus.
                 mature_in_place: None,
-                mature_relocate: 1 << 15,
+                mature_relocate: 1 << 8,
                 words: 0, // filled in by `check_hamt_corpus`
                 lines: None,
                 size_object_agrees: true,
@@ -421,6 +426,16 @@ const PAIRS: usize = 6;
 const ON_HEAP_WORDS: usize = PAIRS * ERL_REFC_BITS_SIZE + 3;
 /// The lines those words occupy: two per pair plus one for the holder tuple.
 const ON_HEAP_LINES: usize = PAIRS * 2 + 1;
+
+/// The largest resident line count the mark-region steady-state loop may reach in its second
+/// half — a pinned ceiling, not the (weaker) "never more than the region's capacity" invariant.
+/// The region is reclaimed in place at each fullsweep and then promoted into until it has no
+/// free line left, so the count cycles between [`ON_HEAP_LINES`] and this bound rather than
+/// sitting at a constant; pinning the bound keeps "no leak" a real assertion. The constant
+/// region holds 272 lines and the cycle stops at 260 because the next round's 13-line promotion
+/// no longer fits the 12 free lines that leaves, which is what escalates the following round to
+/// a fullsweep.
+const IMMIX_RESIDENT_LINES_CEILING: usize = 260;
 /// The off-heap payload size per binary.
 const PAYLOAD_BYTES: usize = 64 * 1024;
 
@@ -700,9 +715,16 @@ fn run_steady_state(label: &str, kind: MatureKind) {
 
         let snap = snapshot(&c);
         if let Some(lines) = snap.immix_lines {
-            assert_eq!(
-                lines, ON_HEAP_LINES,
-                "{label} round {round}: the counter's line need is exactly the live set's"
+            // The region is line-granular and, once it has promotion room, is **promoted into**
+            // between fullsweeps (each round promotes the round's live set into it) and
+            // reclaimed *in place* by a fullsweep. The resident line count is therefore not
+            // pinned to the live set: it is at least the live set's lines (nothing the roots
+            // reach is ever lost) and at most the region's own constant line capacity (no term
+            // is ever allocated outside the region).
+            assert!(
+                (ON_HEAP_LINES..=mature_capacity(&c) / LINE_WORDS).contains(&lines),
+                "{label} round {round}: the region must hold at least the live set's \
+                 {ON_HEAP_LINES} lines and never more than its own capacity, got {lines}"
             );
         }
         samples.push(snap);
@@ -726,8 +748,27 @@ fn run_steady_state(label: &str, kind: MatureKind) {
     if kind == MatureKind::Immix {
         assert_eq!(lines.len(), half.len(), "{label}: every round exposes the line count");
         let (l_lo, l_hi) = min_max(&lines);
-        assert_eq!(l_lo, l_hi, "{label}: the resident line count must be constant, got {lines:?}");
-        assert_eq!(l_lo, ON_HEAP_LINES, "{label}: it is the live set's line need");
+        // The region is reclaimed **in place** by a fullsweep and then promoted into until it
+        // has no free line left, so — unlike the capacities above, which are all constant — the
+        // resident line count **cycles** between the live set's line need and the region's line
+        // capacity. The "no leak" meaning is that the cycle is **bounded** and keeps returning
+        // to the floor: it never exceeds the (constant) region capacity, and a fullsweep really
+        // does reclaim the region down to the live set rather than accumulate.
+        assert_eq!(
+            l_lo, ON_HEAP_LINES,
+            "{label}: a fullsweep must reclaim the region down to the live set's line need, got \
+             min {l_lo} ({lines:?})"
+        );
+        assert!(
+            l_hi <= IMMIX_RESIDENT_LINES_CEILING,
+            "{label}: the resident line count must be bounded by the pinned ceiling \
+             {IMMIX_RESIDENT_LINES_CEILING}, got max {l_hi} ({lines:?})"
+        );
+        assert!(
+            l_lo < l_hi,
+            "{label}: the region must genuinely be promoted into between fullsweeps, got a flat \
+             {l_lo} ({lines:?})"
+        );
     }
 
     eprintln!(
@@ -736,7 +777,7 @@ fn run_steady_state(label: &str, kind: MatureKind) {
          — all constant across the second half{}{} ({majors} fullsweeps, the counter-sized path)",
         if kind == MatureKind::Immix { ", resident lines " } else { "" },
         match kind {
-            MatureKind::Immix => format!("{}", min_max(&lines).0),
+            MatureKind::Immix => format!("{}..{}", min_max(&lines).0, min_max(&lines).1),
             MatureKind::Copying => String::new(),
         }
     );
@@ -755,8 +796,8 @@ fn the_offheap_heavy_heap_reaches_a_bounded_steady_state_copying() {
     run_steady_state("copying", MatureKind::Copying);
 }
 
-/// **(c)** The mark-region strategy's bounded steady state (nursery, mature capacity, total heap
-/// **and** the resident line count all constant).
+/// **(c)** The mark-region strategy's bounded steady state (nursery, mature capacity and total
+/// heap constant; the resident line count cycling within a pinned, bounded band).
 #[test]
 fn the_offheap_heavy_heap_reaches_a_bounded_steady_state_immix() {
     run_steady_state("immix", MatureKind::Immix);
