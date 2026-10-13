@@ -257,6 +257,17 @@ because it cannot be duplicated.
   `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot")`; system-install tests
   **skip loudly** when `erl`/`erlc` or the file are absent. The in-crate tests hand that path to `read`,
   never as a `-boot` CLI value, so its shape is not a factor here.
+- **The system-toolchain spawns are fixture generators, not live comparators; only three exist, all in
+  `bootscript.rs`.** `have_system_erlang()` (`erl -noshell -eval halt(0).`, PATH lookup, line 741)
+  probes availability; `build_fixture` compiles a fixture with `erlc -o <dir> <src>` (line 1365) and
+  writes the synthetic `.boot` with `erl -noshell -eval <expr … halt(0).>` (line 1388). Every spawn is
+  blocking (`Command::output()`); bounding is the tool's own `halt(0).`/exit self-termination, not a
+  poll/kill, and the result is only checked for `status.success()` (stderr quoted in the skip line).
+  **No test compares live oracle stdout** — `reads_the_real_start_boot_into_the_oracle_instruction_sequence`
+  compares the parsed script against a hard-coded golden vector, and every other assertion is on runtime
+  state (`runtime.module`, `whereis`, the `runtime.eval` side effects). No spawn sites in `boot.rs`,
+  `drive.rs` or `preloaded.rs` (whose `system_server()` skips on a `CodeServer::add_system_paths()`
+  error, a pure filesystem probe).
 - `boot/drive.rs`: **no in-file `#[cfg(test)]` module** (0 `#[test]`s) — the bounded burst/`drive_scheduler`
   logic is pinned indirectly by `bootscript.rs`'s synthetic-script tests
   (`a_boot_spawned_process_answers_a_blocked_apply`, `a_kernel_process_registers_its_own_directive_name`,
