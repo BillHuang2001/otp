@@ -18,8 +18,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
   binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine).
 - `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`; `x_mut`/`fr_mut` as
-  the single-view root-set accessors); `Machine::reset` clears the raise snapshot alongside the module
-  contexts (both belong to the run that is starting).
+  the single-view root-set accessors); `fr_mark()` — the **live leading FR-slot count** (the FR high-water
+  mark, `0` ⇒ no live FR slot), the FR twin of the `x[0..live)` root-set bound, so a host can publish/scan
+  only the slots an FR write actually touched (exact after the ordinary interpret seams; a native JIT block
+  or a caller that took a raw `fr_mut`/`with_roots` slice sets the crate-internal `regs_escaped` flag and may
+  understate it — the caller must account for that itself); `Machine::reset` clears the raise snapshot
+  alongside the module contexts (both belong to the run that is starting).
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
   caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).
