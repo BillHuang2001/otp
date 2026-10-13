@@ -487,6 +487,13 @@ line (no timestamps/addresses/ports) and exits `0`:
   - `tests/delivery.rs` — `Delivery::classify` over every opcode (arg-order pins; the
     `SpawnRequest`/`SpawnReply`/`AltactSigSend` flag decoding incl. the out-of-range `BadArg` negative;
     `DOP_UNLINK` ⇒ `Other`).
+  - `tests/validated_delivery.rs` — the **checked** per-link receive/dispatch entry points
+    (`Connection::recv_delivery_checked`/`dispatch_inbound_checked`,
+    `ConnectionDriver::next_delivery_checked`/`dispatch_inbound_checked`) over a real wire, with
+    **real** external pids/refs: a peer `DOP_LINK` validates; a third-node `from` ⇒ `Err(BadArg)`; a
+    `DOP_MONITOR_P` with a real peer-pid watcher validates and a small-int watcher ⇒ `Err`; and the
+    unchanged unchecked `recv_delivery`/`next_delivery` still accepts the same bytes (the driver is fed
+    the **byte-identical** frame twice, so the accept/reject pair differs in no byte).
   - `tests/fragment.rs` — byte-exact `'E'`/`'F'` prefixes, split/reassemble round-trips, negatives.
   - `tests/atom_cache.rs` — segment addressing, `New`/`Cached` classification, header apply, ref
     resolution through `beam_codec`, and `encode_control_cached` driven by a real `OutboundAtomCache`
