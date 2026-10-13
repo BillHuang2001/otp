@@ -1243,3 +1243,605 @@ fn oracle_cross_check_option_flags() {
         started.elapsed(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// The third corpus: `re:compile/1,2` compile-error fidelity
+// ---------------------------------------------------------------------------
+
+/// The atoms [`compile_error_corpus`] needs beyond the shared [`Fixture::new`]
+/// seed — the control case's `caseless` option.
+const COMPILE_ERROR_ATOMS: &[&str] = &["caseless"];
+
+/// `true` when `term` is the atom `name` in the fixture's atom table.
+fn is_atom_named(f: &Fixture, term: Eterm, name: &str) -> bool {
+    crate::access::is_atom(term) && f.atoms.name(beam_term::atom_val(term)) == Some(name)
+}
+
+/// Projects a `re:compile/2` result onto its **payload-free** prefix
+/// `{ok, {re_pattern, NCap, UnicodeFlag, CrlfFlag}}`, asserting the tag names and
+/// the 5-element arity on the way.
+///
+/// A whole `re:compile` result can never be compared byte-for-byte with the
+/// oracle's: element 5 of the inner tuple is the compiled pattern, which the
+/// oracle renders as PCRE2's opaque `#Ref<…>` and this engine as its own payload
+/// image. Dropping that element leaves exactly the fields the two runtimes must
+/// agree on.
+fn project_re_pattern(f: &mut Fixture, out: Eterm) -> Result<Eterm> {
+    use crate::access;
+    if !access::is_tuple(out)
+        || access::tuple_size(out) != 2
+        || !is_atom_named(f, access::tuple_element(out, 0), "ok")
+    {
+        panic!("re:compile did not return an `{{ok, …}}` pair");
+    }
+    let mp = access::tuple_element(out, 1);
+    if !access::is_tuple(mp)
+        || access::tuple_size(mp) != 5
+        || !is_atom_named(f, access::tuple_element(mp, 0), "re_pattern")
+    {
+        panic!("re:compile did not return a 5-element `{{re_pattern, …}}`");
+    }
+    let ncap = access::tuple_element(mp, 1);
+    let unicode = access::tuple_element(mp, 2);
+    let crlf = access::tuple_element(mp, 3);
+    let tag = a(f, "re_pattern");
+    let inner = t(f, &[tag, ncap, unicode, crlf]);
+    let ok = a(f, "ok");
+    Ok(t(f, &[ok, inner]))
+}
+
+/// The third corpus: the **compile-error** value of a malformed pattern — 17
+/// cases plus one payload-free shape control.
+///
+/// Every `erl` expression is `re:compile(PATTERN)`. On both sides a malformed
+/// pattern is a *returned* `{error, {Msg, Pos}}` value, never a raise, so the ETF
+/// bytes — the PCRE2 message string **and** its 0-based byte position — are
+/// byte-comparable. The diagnostic each malformed pattern pins:
+///
+/// * 1, 2, 11 — `missing closing parenthesis` (a group body, an unterminated
+///   `(?i` option run, and `a(b` where the group never closes);
+/// * 3, 4 — `missing terminating ] for character class` (an unclosed `[a`, and
+///   `[]` whose leading `]` is a literal);
+/// * 5, 6 — `numbers out of order in {} quantifier` (`a{2,1}`, `a{3,2}`);
+/// * 7, 8, 9 — `quantifier does not follow a repeatable item` (a leading `*`, a
+///   leading `{2}`, and a doubled `a**`);
+/// * 10 — `\ at end of pattern`;
+/// * 12 — `unmatched closing parenthesis`;
+/// * 13 — `two named subpatterns have the same name (PCRE2_DUPNAMES not set)`;
+/// * 14 — `range out of order in character class`;
+/// * 15 — `subpattern name must start with a non-digit`;
+/// * 16, 17 — the two `\x{}` diagnostics: `non-hex character in \x{} (closing
+///   brace missing?)` and `character code point value in \x{} or \o{} is too
+///   large`.
+///
+/// The final case is the **control**: `re:compile("a", [caseless])` must
+/// *succeed* on both sides, so it is not byte-comparable end to end (the oracle's
+/// element 5 is PCRE2's `#Ref<…>`). Its `erl` expression projects the result onto
+/// the payload-free `{ok, {re_pattern, NCap, UnicodeFlag, CrlfFlag}}` prefix and
+/// the Rust side does the same through [`project_re_pattern`], so the comparison
+/// pins the tag, `NCap`, the unicode flag and the crlf flag — never the payload.
+fn compile_error_corpus() -> Vec<Case> {
+    vec![
+        Case {
+            name: "compile-error/a(b",
+            erl: r#"re:compile("a(b")"#,
+            run: |f| {
+                let pattern = chr(f, "a(b");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/[a",
+            erl: r#"re:compile("[a")"#,
+            run: |f| {
+                let pattern = chr(f, "[a");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/[]",
+            erl: r#"re:compile("[]")"#,
+            run: |f| {
+                let pattern = chr(f, "[]");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/a{2,1}",
+            erl: r#"re:compile("a{2,1}")"#,
+            run: |f| {
+                let pattern = chr(f, "a{2,1}");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/a{3,2}",
+            erl: r#"re:compile("a{3,2}")"#,
+            run: |f| {
+                let pattern = chr(f, "a{3,2}");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/*a",
+            erl: r#"re:compile("*a")"#,
+            run: |f| {
+                let pattern = chr(f, "*a");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/{2}",
+            erl: r#"re:compile("{2}")"#,
+            run: |f| {
+                let pattern = chr(f, "{2}");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/a**",
+            erl: r#"re:compile("a**")"#,
+            run: |f| {
+                let pattern = chr(f, "a**");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/a\\",
+            erl: r#"re:compile("a\\")"#,
+            run: |f| {
+                let pattern = chr(f, "a\\");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/a)",
+            erl: r#"re:compile("a)")"#,
+            run: |f| {
+                let pattern = chr(f, "a)");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/(?i",
+            erl: r#"re:compile("(?i")"#,
+            run: |f| {
+                let pattern = chr(f, "(?i");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/duplicate-subpattern-name",
+            erl: r#"re:compile("(?<n>a)(?<n>b)")"#,
+            run: |f| {
+                let pattern = chr(f, "(?<n>a)(?<n>b)");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/[z-a]",
+            erl: r#"re:compile("[z-a]")"#,
+            run: |f| {
+                let pattern = chr(f, "[z-a]");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/(?<1a>x)",
+            erl: r#"re:compile("(?<1a>x)")"#,
+            run: |f| {
+                let pattern = chr(f, "(?<1a>x)");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/hex-brace-non-hex",
+            erl: r#"re:compile("\\x{zz}")"#,
+            run: |f| {
+                let pattern = chr(f, "\\x{zz}");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/unknown-posix-class",
+            erl: r#"re:compile("[[:foo:]]")"#,
+            run: |f| {
+                let pattern = chr(f, "[[:foo:]]");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        Case {
+            name: "compile-error/hex-brace-too-large",
+            erl: r#"re:compile("\\x{110000}")"#,
+            run: |f| {
+                let pattern = chr(f, "\\x{110000}");
+                f.call_fn("re", "compile", 1, &[pattern])
+            },
+        },
+        // ---- the control: a compile that must SUCCEED ----------------------
+        Case {
+            name: "compile/control-caseless-shape",
+            erl: r#"case re:compile("a",[caseless]) of
+                     {ok,{re_pattern,N,U,C,_}} -> {ok,{re_pattern,N,U,C}};
+                     X -> X
+                   end"#,
+            run: |f| {
+                let pattern = chr(f, "a");
+                let caseless = a(f, "caseless");
+                let opts = l(f, &[caseless]);
+                let out = f.call_fn("re", "compile", 2, &[pattern, opts])?;
+                project_re_pattern(f, out)
+            },
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// The fourth corpus: pattern-syntax constructs through `re:run/2,3`
+// ---------------------------------------------------------------------------
+
+/// The atoms [`pattern_syntax_corpus`] needs beyond the shared [`Fixture::new`]
+/// seed — the `dotall` run option (the rest — `global`, `capture`, `all`,
+/// `index` — are shared).
+const PATTERN_SYNTAX_ATOMS: &[&str] = &["dotall"];
+
+/// The fourth corpus: the **pattern syntax** constructs (28 cases) exercised
+/// through `re:run/2,3`, so each pins the construct's *effect* on a match and its
+/// captures rather than merely that it parses.
+///
+/// Coverage: `.` and its `dotall` interaction (1, 2, 22); the shorthand classes
+/// `\d`/`\w`/`\s` and a `[a-c]` range (3–6); the `\A`/`\z` absolute anchors vs the
+/// `\b`/`\B` boundary assertions (7–9, 27); a POSIX class (10); the `\Q…\E`
+/// literal run (11); a backreference (12); the `{n,}`/`{n,m}`/`+?`/`*+`
+/// greedy/lazy/possessive quantifiers and a nested group repeat (13–17);
+/// the `\x{…}` hex escape and `\t` (18, 24); a named group and the inline
+/// `(?i)`/`(?s)` option groups, scoped and unscoped (19–22); a non-capturing
+/// group (23); `^`/`$` with an alternation (25, 26); and a `global` sweep (28).
+fn pattern_syntax_corpus() -> Vec<Case> {
+    vec![
+        Case {
+            name: "syntax/dot",
+            erl: r#"re:run("xabcy",".")"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let pattern = bin(f, b".");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/dotall-newline",
+            erl: r#"re:run("a\nb","a.b",[dotall])"#,
+            run: |f| {
+                let subject = chr(f, "a\nb");
+                let pattern = bin(f, b"a.b");
+                let dotall = a(f, "dotall");
+                f.run_opts(subject, pattern, &[dotall])
+            },
+        },
+        Case {
+            name: "syntax/class-range",
+            erl: r#"re:run("abc","[a-c]+")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"[a-c]+");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/digit-class",
+            erl: r#"re:run("abc1","\\d+")"#,
+            run: |f| {
+                let subject = chr(f, "abc1");
+                let pattern = bin(f, br"\d+");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/word-class",
+            erl: r#"re:run("abc_1","\\w+")"#,
+            run: |f| {
+                let subject = chr(f, "abc_1");
+                let pattern = bin(f, br"\w+");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/space-class",
+            erl: r#"re:run("a b","\\s")"#,
+            run: |f| {
+                let subject = chr(f, "a b");
+                let pattern = bin(f, br"\s");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/anchor-absolute-start",
+            erl: r#"re:run("abc","\\Aabc")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, br"\Aabc");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/anchor-absolute-end",
+            erl: r#"re:run("abc","bc\\z")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, br"bc\z");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/word-boundary-nomatch",
+            erl: r#"re:run("abc","\\bb")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, br"\bb");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/posix-class",
+            erl: r#"re:run("abc","[[:alpha:]]+")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"[[:alpha:]]+");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/quoted-literal",
+            erl: r#"re:run("a+b","\\Qa+b\\E")"#,
+            run: |f| {
+                let subject = chr(f, "a+b");
+                let pattern = bin(f, br"\Qa+b\E");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/backreference",
+            erl: r#"re:run("abab","(a)(b)\\1")"#,
+            run: |f| {
+                let subject = chr(f, "abab");
+                let pattern = bin(f, br"(a)(b)\1");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/quantifier-open-range",
+            erl: r#"re:run("aaa","a{2,}")"#,
+            run: |f| {
+                let subject = chr(f, "aaa");
+                let pattern = bin(f, b"a{2,}");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/quantifier-closed-range",
+            erl: r#"re:run("aaaa","a{2,3}")"#,
+            run: |f| {
+                let subject = chr(f, "aaaa");
+                let pattern = bin(f, b"a{2,3}");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/quantifier-lazy",
+            erl: r#"re:run("aaa","a+?")"#,
+            run: |f| {
+                let subject = chr(f, "aaa");
+                let pattern = bin(f, b"a+?");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/quantifier-possessive-nomatch",
+            erl: r#"re:run("aaa","a*+a")"#,
+            run: |f| {
+                let subject = chr(f, "aaa");
+                let pattern = bin(f, b"a*+a");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/group-repeat",
+            erl: r#"re:run("aaa","(a)*")"#,
+            run: |f| {
+                let subject = chr(f, "aaa");
+                let pattern = bin(f, b"(a)*");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/hex-brace-escape",
+            erl: r#"re:run("A","\\x{41}")"#,
+            run: |f| {
+                let subject = chr(f, "A");
+                let pattern = bin(f, br"\x{41}");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/named-group",
+            erl: r#"re:run("abc","(?<foo>b)(c)")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"(?<foo>b)(c)");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/inline-caseless",
+            erl: r#"re:run("ABC","(?i)abc")"#,
+            run: |f| {
+                let subject = chr(f, "ABC");
+                let pattern = bin(f, b"(?i)abc");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/scoped-caseless",
+            erl: r#"re:run("abc","a(?i:BC)")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a(?i:BC)");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/inline-dotall",
+            erl: r#"re:run("a\nb","(?s)a.b")"#,
+            run: |f| {
+                let subject = chr(f, "a\nb");
+                let pattern = bin(f, b"(?s)a.b");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/non-capturing-group",
+            erl: r#"re:run("abc","(?:b)(c)",[{capture,all,index}])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"(?:b)(c)");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "index");
+                f.run_opts(subject, pattern, &[spec])
+            },
+        },
+        Case {
+            name: "syntax/tab-escape",
+            erl: r#"re:run("a\tb","a\\tb")"#,
+            run: |f| {
+                let subject = chr(f, "a\tb");
+                let pattern = bin(f, br"a\tb");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/anchored-alternation",
+            erl: r#"re:run("abc","^(?:a|b)(c)$")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"^(?:a|b)(c)$");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/quantifier-partial-range",
+            erl: r#"re:run("xaay","a{1,2}")"#,
+            run: |f| {
+                let subject = chr(f, "xaay");
+                let pattern = bin(f, b"a{1,2}");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/non-word-boundary",
+            erl: r#"re:run("abc","\\B")"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, br"\B");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "syntax/global-group-repeat",
+            erl: r#"re:run("abab","(a|b)+",[global])"#,
+            run: |f| {
+                let subject = chr(f, "abab");
+                let pattern = bin(f, b"(a|b)+");
+                let global = a(f, "global");
+                f.run_opts(subject, pattern, &[global])
+            },
+        },
+    ]
+}
+
+/// The shared sweep behind both new corpora: run every case on our side and
+/// through the real `erl`, and require the two to agree (or both to raise).
+///
+/// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH`.
+fn run_oracle_sweep(label: &str, cases: &[Case], atoms: &[&str]) {
+    let Some(oracle) = resolve_oracle() else {
+        eprintln!("[beam_bifs re] {label} oracle cross-check SKIPPED: no usable `erl` on $PATH");
+        eprintln!("($ERTS_ORACLE unset or not executable, and no `erl` on $PATH).");
+        eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+        return;
+    };
+
+    let mut fx = Fixture::new();
+    if !atoms.is_empty() {
+        fx.atoms.seed(atoms.iter().copied());
+    }
+    let started = Instant::now();
+    let mut ran = 0usize;
+
+    for case in cases {
+        // Our side, over the real dispatch path.
+        let ours = match (case.run)(&mut fx) {
+            Ok(term) => match fx.encode_hex(term) {
+                Ok(hex) => Answer::Hex(hex),
+                Err(e) => panic!(
+                    "case `{}` produced a term this crate cannot encode: {e:?}\n erl: {}",
+                    case.name, case.erl
+                ),
+            },
+            Err(_) => Answer::Raises,
+        };
+
+        // The oracle's answer for the same Erlang expression.
+        let Some(theirs) = oracle_answer(&oracle, case.erl) else {
+            eprintln!(
+                "[beam_bifs re] {label} oracle cross-check SKIPPED (the oracle could not \
+                 answer case `{}`).",
+                case.name
+            );
+            return;
+        };
+
+        match (&ours, &theirs) {
+            (Answer::Raises, Answer::Raises) => {}
+            (Answer::Hex(ours), Answer::Hex(theirs)) if ours == theirs => {}
+            _ => panic!(
+                "case `{}` disagrees with the oracle\n erl:    {}\n oracle: {theirs:?}\n ours:   {ours:?}",
+                case.name, case.erl
+            ),
+        }
+        ran += 1;
+    }
+
+    eprintln!(
+        "[beam_bifs re] {label} oracle cross-check RAN against '{}': {} cases agreed in {:?}.",
+        oracle.display(),
+        ran,
+        started.elapsed(),
+    );
+}
+
+/// The **compile-error** differential sweep over [`compile_error_corpus`] — the
+/// `{error, {Msg, Pos}}` values of malformed patterns, plus the payload-free
+/// `re:compile` shape control.
+///
+/// The fixture is the shared [`Fixture::new`] one plus [`COMPILE_ERROR_ATOMS`].
+///
+/// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH`.
+#[test]
+fn oracle_cross_check_compile_errors() {
+    run_oracle_sweep(
+        "compile-error",
+        &compile_error_corpus(),
+        COMPILE_ERROR_ATOMS,
+    );
+}
+
+/// The **pattern-syntax** differential sweep over [`pattern_syntax_corpus`] — the
+/// constructs each case exercises through `re:run/2,3`.
+///
+/// The fixture is the shared [`Fixture::new`] one plus [`PATTERN_SYNTAX_ATOMS`].
+///
+/// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH`.
+#[test]
+fn oracle_cross_check_pattern_syntax() {
+    run_oracle_sweep("pattern-syntax", &pattern_syntax_corpus(), PATTERN_SYNTAX_ATOMS);
+}

@@ -85,6 +85,7 @@ pub(crate) const E_NAME_DUP: &str =
 pub(crate) const E_NAME_DIGIT: &str = "subpattern name must start with a non-digit";
 pub(crate) const E_NAME_EXPECTED: &str = "subpattern name expected";
 pub(crate) const E_DIGITS_MISSING: &str = "digits missing after \\x or in \\x{} or \\o{} or \\N{U+}";
+pub(crate) const E_HEX_NON_HEX: &str = "non-hex character in \\x{} (closing brace missing?)";
 pub(crate) const E_OCTAL_TOO_BIG: &str = "octal value is greater than \\377 in 8-bit non-UTF-8 mode";
 pub(crate) const E_UTF_DISABLED: &str = "using UTF is disabled by the application";
 pub(crate) const E_POSIX_OUTSIDE: &str = "POSIX named classes are supported only within a class";
@@ -1286,16 +1287,36 @@ impl<'a> Parser<'a> {
                     _ => break,
                 };
                 any = true;
+                // Saturate just above every legal maximum (`0x10FFFF`) so the
+                // comparison below stays exact without overflowing on an absurdly
+                // long digit run.
                 value = (value * 16 + u64::from(d)).min(0x11_0000);
                 self.pos += 1;
             }
-            if !self.eat(b'}' as u32) || !any {
-                return Err(ParseError::new(E_DIGITS_MISSING, self.here()).into());
+            // PCRE2's `\x{}` diagnostics are reported in this order (verified
+            // against the live oracle for `\x{}`, `\x{`, `\x{zz}`, `\x{z}`,
+            // `\x{az}`, `\x{za}`, `\x{1z}`, `\x{1`, `\x{4}`, `\x{4z}`, `\x{FF}`,
+            // `\x{100}`, `\x{1000}`, `\x{1000000}` and `\x{1234567890123}`):
+            //
+            // 1. a value above the mode's maximum (`0xFF` without `unicode`,
+            //    else `0x10FFFF`), reported at the byte offset where the digit
+            //    run stopped — so `\x{123z}` is "too large" *before* the `z` is
+            //    ever seen as a non-hex character;
+            // 2. a run with no digits at all — the `}` of `\x{}`, or the end of
+            //    the pattern for an unterminated `\x{`;
+            // 3. a terminator that is not `}` — the "non-hex character" error,
+            //    reported at the byte just past the stopping character.
+            let stop = self.byte_pos(self.pos);
+            if value > u64::from(codepoint_max(self.flags.unicode)) {
+                return Err(ParseError::new(E_CODEPOINT_TOO_LARGE, stop).into());
             }
-            if value > 0x10FFFF {
-                return Err(ParseError::new(E_CODEPOINT_TOO_LARGE, self.here()).into());
+            if !any && (self.peek() == Some(b'}' as u32) || self.peek().is_none()) {
+                return Err(ParseError::new(E_DIGITS_MISSING, stop).into());
             }
-            return Ok(value as u32);
+            if self.eat(b'}' as u32) {
+                return Ok(value as u32);
+            }
+            return Err(ParseError::new(E_HEX_NON_HEX, stop + 1).into());
         }
         let mut value: u32 = 0;
         let mut any = false;
