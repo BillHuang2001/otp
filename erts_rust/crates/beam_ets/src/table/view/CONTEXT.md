@@ -67,7 +67,7 @@ later same-size insert silently reuses (a wrong, well-formed result).
 
 ## Routing Table
 - `src/table/view/mod.rs` → module docs, scratch-heap sizing, the retry predicate
-- `src/table/view/term.rs` → `TableTerm<'g>` (the lifetime-tagged term view)
+- `src/table/view/term.rs` → `TableTerm<'g>` (the lifetime-tagged term view) + `HeirView<'g>`
 - `src/table/view/read.rs` → `TableRead<'g>` (tagged reads + copy-out select)
 - `src/table/view/write.rs` → `TableWrite<'g>` (mutations, `take`, ownership, `as_requester`)
 - `src/table/view/iter.rs` → the view-borrowed traversal API + its unit tests
