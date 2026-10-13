@@ -312,7 +312,7 @@ pub(crate) fn scatter_roots(
 ///   can only keep a term alive that would otherwise die, never free a live one, and the
 ///   engine has no way to prove a register dead);
 /// * then every word of `roots.stack`; and
-/// * then every word of `roots.fr`.
+/// * then every word of `roots.fr` — **only when `publish_fr` is set** (see below).
 ///
 /// # Why the FR file rides in the stack container
 ///
@@ -329,10 +329,29 @@ pub(crate) fn scatter_roots(
 /// ([`ensure_heap_full`]) and the runner's **park** arm, so a parked machine's FR file cannot
 /// dangle either.
 ///
+/// # `publish_fr` — the dead-FR fast path
+///
+/// `publish_fr` decides whether the FR file is published with the stack:
+///
+/// * `true` — every word of `roots.fr` is appended after the stack words;
+/// * `false` — only `roots.stack` is published. This is sound **only** for a machine whose
+///   FR file is entirely [`NIL`](beam_term::NIL) — appending 1024 `NIL` immediates roots
+///   nothing, so the collection outcome is identical while the per-park cost (1024 words
+///   copied into the process stack and relocated on every hand-off) is avoided. The runner
+///   selects `false` exactly when its post-slice scan proved the FR dead (the same scan that
+///   would otherwise pin the pid — see [`crate::runner::run::publish_parked_roots`]); the
+///   in-slice heap-admission door always passes `true` (it cannot cheaply prove the FR dead
+///   and its hand-off is hot). The two halves of the FR length rule live here and in
+///   [`scatter_roots_full`], so a park/resume pair must pass the **same** `publish_fr`.
+///
 /// # Errors
 ///
 /// None: an impossible `set_live` is reported as `false` (the caller's "do not collect").
-pub(crate) fn publish_roots_full(process: &mut Process, roots: &RootSet<'_>) -> bool {
+pub(crate) fn publish_roots_full(
+    process: &mut Process,
+    roots: &RootSet<'_>,
+    publish_fr: bool,
+) -> bool {
     let live = roots.x.len().min(MAX_REG);
     let regs = process.registers_mut();
     match regs.x_mut().set_live(live) {
@@ -343,10 +362,13 @@ pub(crate) fn publish_roots_full(process: &mut Process, roots: &RootSet<'_>) -> 
             for word in roots.stack.iter() {
                 process_stack.push(*word);
             }
-            for word in roots.fr.iter() {
-                process_stack.push(*word);
+            if publish_fr {
+                for word in roots.fr.iter() {
+                    process_stack.push(*word);
+                }
             }
-            process.registers().stack().len() == roots.stack.len() + roots.fr.len()
+            process.registers().stack().len()
+                == roots.stack.len() + if publish_fr { roots.fr.len() } else { 0 }
         }
         Err(_) => false,
     }
@@ -357,24 +379,35 @@ pub(crate) fn publish_roots_full(process: &mut Process, roots: &RootSet<'_>) -> 
 ///
 /// The exact inverse of [`publish_roots_full`]: it requires the relocated x-register prefix
 /// to be as long as [`publish_roots_full`] published and the relocated stack to hold exactly
-/// the stack words **plus** the FR words, then splits that region back into `roots.stack` and
-/// `roots.fr` in the order they were appended. The collector preserves the slice lengths and
-/// the word order, so a length mismatch means the machine's slices can no longer be trusted:
-/// the function reports `false` and the caller must stop collecting over this process rather
-/// than write a mis-sized block back.
-pub(crate) fn scatter_roots_full(process: &Process, roots: &mut RootSet<'_>) -> bool {
+/// the stack words **plus** the FR words *when `publish_fr` is set*, then splits that region
+/// back into `roots.stack` and `roots.fr` in the order they were appended. `publish_fr` must
+/// be the **same** value the matching [`publish_roots_full`] was called with; a mismatch
+/// makes the length check below fail (a `false`, which halts the process's collection). The
+/// collector preserves the slice lengths and the word order, so a length mismatch means the
+/// machine's slices can no longer be trusted: the function reports `false` and the caller
+/// must stop collecting over this process rather than write a mis-sized block back.
+///
+/// With `publish_fr == false` the FR region was never published, so `roots.fr` is left
+/// **untouched** (the machine's FR file stays exactly as it was — dead, all `NIL`).
+pub(crate) fn scatter_roots_full(
+    process: &Process,
+    roots: &mut RootSet<'_>,
+    publish_fr: bool,
+) -> bool {
     let x_count = roots.x.len().min(MAX_REG);
+    let fr_words = if publish_fr { roots.fr.len() } else { 0 };
     let regs = process.registers();
     let relocated_x = regs.x().live_slice();
     let relocated_stack = regs.stack().as_slice();
-    if relocated_x.len() != x_count || relocated_stack.len() != roots.stack.len() + roots.fr.len()
-    {
+    if relocated_x.len() != x_count || relocated_stack.len() != roots.stack.len() + fr_words {
         return false;
     }
     roots.x[..x_count].copy_from_slice(relocated_x);
     let stack_words = roots.stack.len();
     roots.stack.copy_from_slice(&relocated_stack[..stack_words]);
-    roots.fr.copy_from_slice(&relocated_stack[stack_words..]);
+    if publish_fr {
+        roots.fr.copy_from_slice(&relocated_stack[stack_words..]);
+    }
     true
 }
 
@@ -686,7 +719,7 @@ pub(crate) fn ensure_heap_full(
         runtime.take_gc_request(pid);
     }
 
-    if !publish_roots_full(process, &roots) {
+    if !publish_roots_full(process, &roots, true) {
         runtime.halt_process_gc(pid);
         return Ok(());
     }
@@ -704,7 +737,7 @@ pub(crate) fn ensure_heap_full(
         }
     }
 
-    if !scatter_roots_full(process, &mut roots) {
+    if !scatter_roots_full(process, &mut roots, true) {
         runtime.halt_process_gc(pid);
         return Ok(());
     }
@@ -891,7 +924,7 @@ pub(crate) fn alloc_words_rooted(
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
-    if !publish_roots_full(process, &roots) {
+    if !publish_roots_full(process, &roots, true) {
         runtime.halt_process_gc(pid);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
@@ -906,7 +939,7 @@ pub(crate) fn alloc_words_rooted(
             return runtime.alloc_words(n);
         }
     }
-    if !scatter_roots_full(process, &mut roots) {
+    if !scatter_roots_full(process, &mut roots, true) {
         runtime.halt_process_gc(pid);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);

@@ -130,6 +130,20 @@ pub(super) struct ProcessEngine {
     /// `wait` with no timeout — including the `after infinity` the compiler emits as a plain
     /// `wait` — leaves it `None`, so the process parks indefinitely.
     pub(super) parked_timeout: Option<TimerHandle>,
+    /// Whether the machine's **float-register (FR) file** was published into the process's
+    /// Erlang stack at the last park, so the resume scatters exactly that region back.
+    ///
+    /// The runner computes the FR's liveness once per slice (the post-slice scan that also
+    /// pins a live-FR pid) and `publish_parked_roots` appends the 1024 FR slots only when it
+    /// is live. A process whose FR is all `NIL` needs
+    /// no FR roots at all, so skipping the append is both sound and cheap — but the
+    /// **resume** must make the same choice, because
+    /// [`scatter_roots_full`](crate::context::gc::scatter_roots_full) rejects a stack whose
+    /// length does not match what was published (and a `false` there halts the process's
+    /// collection). The flag is written by the park arms and read by the resume; it is
+    /// `false` on a fresh engine (a freshly reset machine's FR is all `NIL`, and such a
+    /// process never parks before its first slice).
+    pub(super) fr_published: bool,
     /// The execution tier this process is running on, chosen at its **first** entry and
     /// remembered for the rest of its life.
     ///
@@ -195,6 +209,9 @@ impl RunnerState {
                 args,
                 parked: None,
                 parked_timeout: None,
+                // A freshly reset machine's FR file is all `NIL`, so its first park (if any)
+                // takes the dead-FR path; the park arm overwrites this.
+                fr_published: false,
                 // Only a placeholder: the process's first entry selects the real tier and
                 // writes it here (see the field docs).
                 tier: Tier::Interpreter,
