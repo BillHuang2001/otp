@@ -207,9 +207,36 @@ const PROGRAMS: [(&str, &str, &str); 4] = [
 /// regression is a clean mismatch rather than a hang.
 ///
 /// Oracle (the same expression, terminated with `-s init stop`): `{true,true}`.
+///
+/// **KNOWN GAP — this case disagrees with the oracle (measured, not assumed).** This runtime
+/// prints `{true,false}` where the oracle prints `{true,true}`. The divergence is the **liveness
+/// `Result`** (the `{garbage_collect, ReqId, Result}` *shape* and the `ReqId` match are both
+/// right; only the `true`/`false` differs), and the `false` is honest: the **target is already
+/// gone** by the pass boundary that emits the completion, not a wrong answer from the completion
+/// logic.
+///
+/// The premise in the paragraph above does **not** hold here: a spawned `-eval` child's
+/// `receive … after 60000` does **not** park it for 60000 ms. The evaluator's `after` arm
+/// (`src/eval/mod.rs`, `Evaluator::receive`) polls the port poller once for the remaining time
+/// and then falls through to the `after` body — the `break` after that single round is
+/// unconditional, and with no live port `poll_port_messages` (`src/port.rs`) returns at once
+/// (there is no host timer to block on in M1). So the child runs `ok`, returns and terminates on
+/// its **first** slice; `is_process_alive(P)` is already `false` at the `erlang:garbage_collect(P,
+/// …)` call, where `erl` says `true` (verified directly). The completion then reports that dead
+/// target's `false` — exactly what the C's `liveness_notify_sys_task_executed`
+/// (`erts/emulator/beam/erl_process.c:11488-11490`) does for a dead target.
+///
+/// **Owner:** `src/eval/mod.rs`'s `receive` — the `after T` deadline must actually be waited out
+/// (or a spawned `-eval` child otherwise kept alive) before this case can match the oracle. The
+/// two modules the harness-level diagnosis points at are **downstream and correct**:
+/// `src/runtime/gc.rs::deliver_gc_completions` and the native floor `src/native/erts_internal.rs`
+/// (which passes `live` from the request instant and reports the target's real liveness) both
+/// answer `false` here because the target really is dead, and both would answer the oracle's
+/// `true` unchanged once the child survives the call. The assertion is deliberately **kept, not
+/// weakened**, so the gap stays visible.
 const EXPR_ASYNC_BLOCKED: &str = "\
 Self = self(), \
-P = spawn(fun() -> Self ! {ready, self()}, receive _ -> ok end after 60000 -> ok end end), \
+P = spawn(fun() -> Self ! {ready, self()}, receive _ -> ok after 60000 -> ok end end), \
 receive {ready, P} -> ok end, \
 Ref = make_ref(), \
 async = erlang:garbage_collect(P, [{async, Ref}]), \
@@ -487,6 +514,11 @@ fn the_async_completion_message_matches_the_live_oracle() {
             "{case}: `beam_rt -eval` must exit 0; stderr: {}",
             ours.err
         );
+        // KNOWN GAP: for the "blocked target" case (`EXPR_ASYNC_BLOCKED`) `ours.out` is
+        // `{true,false}` against the oracle's `{true,true}` — the sole divergence is the
+        // completion message's **liveness `Result`**, because this runtime's `-eval` evaluator
+        // lets the spawned child terminate immediately (its `receive … after 60000` does not
+        // wait). Kept, not weakened; the cause and owner are on `EXPR_ASYNC_BLOCKED`'s doc.
         assert_eq!(ours.out, expected, "{case}: our runtime's answer (stderr: {})", ours.err);
         let theirs = oracle_eval(&oracle, expr);
         assert_eq!(
