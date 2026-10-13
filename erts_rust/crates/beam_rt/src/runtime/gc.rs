@@ -55,14 +55,16 @@
 use std::collections::{HashMap, HashSet};
 
 use beam_common::{BeamError, Result};
+use beam_engine::terms;
 use beam_gc::CollectionKind;
 use beam_loader::Module;
 use beam_process::{ProcessId, ProcessTable};
-use beam_term::Eterm;
+use beam_term::{make_atom, Eterm};
 
 use super::{Runtime, SourcePayloads};
 
 use crate::context::gc_walk::WalkScratch;
+use crate::context::RuntimeContext;
 
 /// A snapshot of this runtime's process-heap collection activity.
 ///
@@ -89,6 +91,23 @@ pub struct GcStatsSnapshot {
     pub valve_trips: u64,
 }
 
+/// One **un-discharged** asynchronous `erlang:garbage_collect(Pid, [{async, ReqId}])` request.
+///
+/// The wrapper returns the atom `async` immediately and the target's collection owes the
+/// **requester** the message `{garbage_collect, ReqId, GCResult}` — the C's
+/// `notify_sys_task_executed` (`erts/emulator/beam/erl_process.c:10574-10623`). This record is
+/// what the runtime needs to build that message when the request is discharged
+/// ([`Runtime::deliver_gc_completions`]).
+pub(crate) struct AsyncGcCompletion {
+    /// The process that made the call — `{garbage_collect, ReqId, Result}` is sent to it.
+    pub(crate) requester: ProcessId,
+    /// The caller's `ReqId` (any term), copied onto the runtime's pointer-stable arena by
+    /// [`Runtime::stabilize_term`] before it is recorded, so it outlives both the caller's own
+    /// (movable) young heap and the BIF heap the option list was parsed from. It is read back
+    /// only when the completion message is built.
+    pub(crate) req_id: Eterm,
+}
+
 /// The runtime's process-heap collection state (see the module docs).
 pub(crate) struct GcState {
     /// Per-module answer to "may this module's code be collected over?" — `true` when the
@@ -106,6 +125,13 @@ pub(crate) struct GcState {
     /// BIF and served at a point that owns the executing machine's root set (see
     /// [`Runtime::request_gc`]).
     requested: HashSet<ProcessId>,
+    /// The **asynchronous** `erlang:garbage_collect/2` requests still owed a completion
+    /// message, keyed by the **target** pid (see [`AsyncGcCompletion`]).
+    ///
+    /// A record is dropped at the first pass boundary after the request
+    /// ([`Runtime::deliver_gc_completions`]), which also emits the message: the target is then
+    /// either still alive (the oracle's `true`) or gone (the oracle's `false`).
+    async_completions: HashMap<ProcessId, AsyncGcCompletion>,
     /// The **descent gate**: the pids that have ever had a container from a region their
     /// collector does not scan enter their reachable term graph.
     ///
@@ -158,6 +184,7 @@ impl GcState {
             pinned: HashSet::new(),
             halted: HashSet::new(),
             requested: HashSet::new(),
+            async_completions: HashMap::new(),
             foreign: HashSet::new(),
             walk: WalkScratch::default(),
             disabled: false,
@@ -227,6 +254,125 @@ impl Runtime {
     /// the honest reading of "that process was already due a collection".
     pub(crate) fn request_gc(&mut self, pid: ProcessId) {
         self.gc.requested.insert(pid);
+    }
+
+    /// Records an **asynchronous** `erlang:garbage_collect(Pid, [{async, ReqId}])` request: the
+    /// forced-GC request itself (when `live`, exactly as [`Runtime::request_gc`]) **plus** the
+    /// completion the target's collection owes `requester`.
+    ///
+    /// The wrapper answers the atom `async` and returns; the requester is later sent
+    /// `{garbage_collect, ReqId, GCResult}` — the C's `notify_sys_task_executed`
+    /// (`erts/emulator/beam/erl_process.c:10574-10623`), whose `GCResult` is `am_true` for a live
+    /// target and `am_false` when the target is already exiting/gone
+    /// (`liveness_notify_sys_task_executed`, `erl_process.c:11488-11490`).
+    ///
+    /// `live` is whether the caller's process table holds `pid`: a **dead** target has no heap to
+    /// collect, so no request is armed (nothing is ever collected for a pid that cannot be), but
+    /// the completion is still owed — the oracle's `async` reply is followed by the `false`
+    /// message.
+    ///
+    /// `req_id` must already be a **pointer-stable** term
+    /// ([`Runtime::stabilize_term`]): the caller's young heap may move (or die) long before the
+    /// message is built. A **later** async request for the same target replaces an earlier one,
+    /// mirroring the one-bit-per-process latch of [`Runtime::request_gc`].
+    pub(crate) fn request_gc_async(
+        &mut self,
+        pid: ProcessId,
+        requester: ProcessId,
+        req_id: Eterm,
+        live: bool,
+    ) {
+        if live {
+            self.gc.requested.insert(pid);
+        }
+        self.gc
+            .async_completions
+            .insert(pid, AsyncGcCompletion { requester, req_id });
+    }
+
+    /// Emits the `{garbage_collect, ReqId, Result}` completion of every **asynchronous**
+    /// `erlang:garbage_collect/2` request ([`Runtime::request_gc_async`]) into its requester's
+    /// mailbox, returning how many were delivered.
+    ///
+    /// This is the emission half of the async request, and it runs at a **scheduler-pass
+    /// boundary** (`crate::runtime::scheduler`). The BIF itself cannot emit: a receiver-side
+    /// delivery may collect the *receiver's* heap (`Process::deliver`'s rooted-collection path),
+    /// and a BIF runs inside the executing machine, whose root set is in the engine's own Rust
+    /// locals — the same reason a BIF may not collect (see [`Runtime::request_gc`]). The runner's
+    /// park arms are the other point that owns a root set, but they can only serve *their own*
+    /// pid, and the request the runner serves belongs to the very process being parked; emitting
+    /// there for those cases and here for everything else would split the one rule in two.
+    ///
+    /// # The result is the oracle's liveness answer, not a collection report
+    ///
+    /// ERTS replies `am_true` whenever the GC system task ran for a **live** target and
+    /// `am_false` only when the target was exiting/gone
+    /// (`liveness_notify_sys_task_executed`, `erts/emulator/beam/erl_process.c:11488-11490`) —
+    /// the reply is a *liveness* fact, not a report about the collector's own work. So the result
+    /// here is `table.contains(target)`, the same fact the oracle reports. The collection the
+    /// request armed is **not** lost by emitting first: the latch
+    /// ([`GcState::requested`]) stays armed and is served at the target's own next collection
+    /// site, exactly as a synchronous `/1` request is (and, like it, is dropped if a valve
+    /// refuses the move).
+    ///
+    /// A requester that has itself terminated has nobody to notify: the completion is dropped,
+    /// exactly as the C's `notify_sys_task_executed` drops it when `erts_pid2proc` finds no
+    /// process. A message that cannot be delivered (the requester's heap genuinely exhausted) is
+    /// the honest [`BeamError::SystemLimit`], propagated to the pass's caller — never silently
+    /// discarded and never a fabricated `true`.
+    ///
+    /// # Errors
+    ///
+    /// The term builder's allocation failure and the delivery path's own errors (translated to
+    /// the emulator's documented `error:system_limit`).
+    pub(crate) fn deliver_gc_completions(&mut self, table: &mut ProcessTable) -> Result<usize> {
+        if self.gc.async_completions.is_empty() {
+            return Ok(0);
+        }
+        // Drained outright: every record is discharged here (the request was latched, the result
+        // is the target's liveness at this boundary), so nothing may be left behind for a later
+        // boundary to re-report.
+        let pending: Vec<(ProcessId, AsyncGcCompletion)> =
+            self.gc.async_completions.drain().collect();
+        let mut delivered = 0;
+        for (target, completion) in pending {
+            if !table.contains(completion.requester) {
+                continue;
+            }
+            let message = self.gc_completion_message(completion.req_id, table.contains(target))?;
+            // The sender `from` is the emulator itself — the C queues the task reply as a
+            // message of the emulator (`ERL_MESSAGE_TOKEN(mp) = am_undefined`, with the sending
+            // process never consulted for the envelope), and an *immediate* is required because
+            // the envelope is not copied nor gathered as a GC root (`beam_message::Message::from`).
+            let from = make_atom(self.code_server.atoms_mut().intern("system"));
+            RuntimeContext::deliver_in_table(self, table, completion.requester, from, message)?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Builds the `{garbage_collect, ReqId, Result}` message the async completion is delivered
+    /// as — `TUPLE3(hp, st->reply_tag, req_id, st_result)` of the C's `notify_sys_task_executed`
+    /// (`erts/emulator/beam/erl_process.c:10618`), with the reply tag `am_garbage_collect` and
+    /// the `true`/`false` result atoms.
+    ///
+    /// The tuple is built on the runtime's **pointer-stable** arena
+    /// ([`RuntimeContext`]'s heap, which is never moved and never reset), so the delivery's own
+    /// receiver-heap copy is the only copy the message ever takes.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the tuple does not fit.
+    fn gc_completion_message(&mut self, req_id: Eterm, result: bool) -> Result<Eterm> {
+        let mut ctx = RuntimeContext::new(self);
+        let (tag, result) = {
+            let atoms = ctx.runtime.code_server.atoms_mut();
+            (
+                make_atom(atoms.intern("garbage_collect")),
+                make_atom(atoms.intern(if result { "true" } else { "false" })),
+            )
+        };
+        terms::make_tuple(&mut ctx, &[tag, req_id, result])
     }
 
     /// Whether `pid` has an **unserved** forced-GC request (see [`Runtime::request_gc`]).
@@ -319,6 +465,11 @@ impl Runtime {
     /// is noise that would otherwise accumulate for the runtime's whole lifetime, one per
     /// such process. The scheduler pass prunes at its boundary, where the pass's own table
     /// holds exactly the live processes.
+    ///
+    /// An **asynchronous** request ([`Runtime::request_gc_async`]) that is pruned here is not
+    /// silently forgotten: the completion it owes its requester reports the target as gone
+    /// (`false`), which is exactly what the C does, and is emitted by
+    /// [`Runtime::deliver_gc_completions`] — the pass runs it at this same boundary.
     pub(crate) fn prune_gc_requests(&mut self, table: &ProcessTable) {
         if !self.gc.requested.is_empty() {
             self.gc.requested.retain(|pid| table.contains(*pid));
@@ -671,6 +822,105 @@ mod tests {
         assert!(
             !rt.gc_request_pending(gone),
             "a pid the table does not hold is pruned"
+        );
+    }
+
+    /// **The async completion is emitted, with the oracle's shape and its liveness result.** A
+    /// recorded `{async, ReqId}` request owes its requester `{garbage_collect, ReqId, true}` for
+    /// a **live** target and `{garbage_collect, ReqId, false}` for one the table no longer holds
+    /// — the C's `notify_sys_task_executed` (`erl_process.c:10574-10623`) over
+    /// `liveness_notify_sys_task_executed`'s two results (`erl_process.c:11488-11490`). Only a
+    /// **live** target has the forced-GC latch armed, and a requester that is itself gone is not
+    /// notified at all.
+    ///
+    /// Oracle (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1): a live blocked target prints
+    /// `async` then `{garbage_collect, #Ref<…>, true}`; a terminated target prints `async` then
+    /// `{garbage_collect, #Ref<…>, false}`.
+    #[test]
+    fn an_async_garbage_collect_completion_is_delivered_to_the_requester() {
+        let mut rt = small_runtime();
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let target = table.spawn_default().expect("a target process");
+        let requester = table.spawn_default().expect("a requester process");
+        let gone = table.spawn_default().expect("a target that then terminates");
+        table.take(gone).expect("the terminated target");
+
+        // The `ReqId` is any term, built here on the runtime's own (pointer-stable) arena.
+        let elems = [make_small(1), make_small(2)];
+        let req_id = terms::make_list(&mut rt.arena, &elems).expect("the arena term");
+
+        rt.request_gc_async(target, requester, req_id, true);
+        rt.request_gc_async(gone, requester, req_id, false);
+        assert!(
+            rt.gc_request_pending(target),
+            "a live target's request is armed"
+        );
+        assert!(
+            !rt.gc_request_pending(gone),
+            "a target the table does not hold has nothing to collect"
+        );
+
+        assert_eq!(
+            rt.deliver_gc_completions(&mut table).expect("both send"),
+            2,
+            "one completion per request"
+        );
+        // Drained: a second boundary has nothing left to re-report.
+        assert_eq!(
+            rt.deliver_gc_completions(&mut table).expect("nothing left"),
+            0,
+            "a discharged request is never reported twice"
+        );
+
+        let payload = |table: &ProcessTable, at: usize| -> Eterm {
+            let process = table.get(requester).expect("the requester");
+            let cursor = process.mailbox().cursor_at(at);
+            process
+                .mailbox()
+                .message_at(cursor)
+                .expect("a completion message")
+                .payload()
+        };
+        let expected = |rt: &mut Runtime, result: &str| -> Eterm {
+            let mut ctx = RuntimeContext::new(rt);
+            let (tag, result) = {
+                let atoms = ctx.runtime.code_server.atoms_mut();
+                (
+                    make_atom(atoms.intern("garbage_collect")),
+                    make_atom(atoms.intern(result)),
+                )
+            };
+            terms::make_tuple(&mut ctx, &[tag, req_id, result]).expect("the expected tuple")
+        };
+        assert!(
+            compare::eq(payload(&table, 0), expected(&mut rt, "true"), rt.atoms()),
+            "a live target's completion is `{{garbage_collect, ReqId, true}}`"
+        );
+        assert!(
+            compare::eq(payload(&table, 1), expected(&mut rt, "false"), rt.atoms()),
+            "a gone target's completion is `{{garbage_collect, ReqId, false}}`"
+        );
+
+        // A requester that has itself terminated has nobody to notify: the completion is
+        // dropped, never delivered elsewhere and never reported as delivered.
+        let orphan = table.spawn_default().expect("a third requester");
+        table.take(orphan).expect("the requester terminates");
+        rt.request_gc_async(target, orphan, req_id, true);
+        assert_eq!(
+            rt.deliver_gc_completions(&mut table).expect("nothing to deliver"),
+            0,
+            "a dead requester is not notified"
+        );
+        assert_eq!(
+            table
+                .get(requester)
+                .expect("the requester")
+                .mailbox()
+                .len(),
+            2,
+            "and no message leaked into another process's mailbox"
         );
     }
 
