@@ -138,7 +138,7 @@ use test::try_inline_test;
 // submodules changed no item path. Only the tests use them, hence `cfg(test)`.
 #[cfg(test)]
 pub(crate) use arith::{
-    fast_arith, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T, MAX_SMALL_WORD,
+    fast_arith, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T, MAX_SMALL_WORD,
     MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
 };
 #[cfg(test)]
