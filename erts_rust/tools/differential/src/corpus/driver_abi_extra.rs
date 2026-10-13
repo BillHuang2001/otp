@@ -134,9 +134,10 @@
 //!   a non-library path answers `NULL` with a message in `driver_dl_error/0`) is already pinned by
 //!   [`super::driver_abi`]'s selector `49`. Owner: `beam_abi` / the oracle itself.
 //! * **the process-monitor family** (`driver_monitor_process` / `driver_demonitor_process` /
-//!   `driver_get_monitored_process` / `driver_compare_monitors`) — `beam_rt`'s driver host leaves
-//!   its hooks at the `DriverHost` default (`monitor_process` answers `None`), so the oracle
-//!   creates a monitor the Rust runtime refuses. Owner: `beam_rt` / `beam_io`.
+//!   `driver_get_monitored_process` / `driver_compare_monitors`) is **implemented** now
+//!   (`DriverPort::{monitor_process,monitor_process_result,demonitor_process,get_monitored_process}`,
+//!   `crates/beam_rt/src/port/driver.rs`), so the surface is pinnable; this group keeps no fixture
+//!   for it. Owner: `beam_rt` / `beam_io`.
 //! * **`erl_drv_time_offset/1`'s absolute value** — the C reports the real monotonic↔system
 //!   offset, the Rust runtime anchors monotonic time on the system clock and so reports `0`; only
 //!   its unit consistency is pinned (`4`, `9`), never the magnitude. Owner: `beam_rt` / `beam_abi`.
@@ -215,7 +216,8 @@ bytes_code(<<B, Rest/binary>>, Acc) -> bytes_code(Rest, Acc * 256 + B).
 %% Reach the driver the way each runtime can, without changing the argv:
 %%   * the oracle refuses a path in `{spawn_driver, _}` (`badarg`) and needs the object
 %%     pre-loaded by `erl_ddll:load_driver/2`, then opened by the bare driver name;
-%%   * the Rust runtime has no `erl_ddll` BIF and takes the object path as the name.
+%%   * the Rust runtime takes the object path as the name (`erl_ddll:load_driver/2` is not
+%%     yet usable there).
 open(Dir) ->
     try open_port({spawn_driver, Dir ++ "/driver_extra"}, [binary]) of
         P when is_port(P) -> P

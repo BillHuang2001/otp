@@ -269,8 +269,8 @@ pub(crate) fn group() -> Vec<Case> {
         ),
         eval(
             "boot_extra/code_is_loaded_kernel_is_file",
-            "code:is_loaded/1 reports a {file,Path} pair for the booted `kernel` module",
-            "begin L = code:is_loaded(kernel), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
+            "code:is_loaded/1 reports a {file,Path} pair for kernel once it is loaded",
+            "begin code:ensure_loaded(kernel), L = code:is_loaded(kernel), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
             "ok true",
         ),
         eval(
@@ -508,8 +508,8 @@ pub(crate) fn group() -> Vec<Case> {
         ),
         eval(
             "boot_extra/code_is_loaded_lists_is_a_file_pair",
-            "code:is_loaded/1 reports a {file,Path} pair for the loaded `lists` module",
-            "begin L = code:is_loaded(lists), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
+            "code:is_loaded/1 reports a {file,Path} pair for lists once it is loaded",
+            "begin code:ensure_loaded(lists), L = code:is_loaded(lists), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
             "ok true",
         ),
         eval(
@@ -599,10 +599,15 @@ pub(crate) fn group() -> Vec<Case> {
             "lists:member({sort,1}, lists:module_info(exports))",
             "ok true",
         ),
+        // `function_exported/3` answers out of the *loaded* export table, so the case makes the
+        // load state explicit (`lists` is not a declared `bif.tab` builtin — unlike
+        // `lists:member/2`, which `bifs/function_exported_lists_member` exercises — so it is only
+        // exported once the module is loaded). `code:ensure_loaded/1` forces that load on both
+        // sides; `lists:module_info/1` in the sibling case above does the same implicitly.
         eval(
             "boot_extra/function_exported_lists_sort_1_is_true",
-            "erlang:function_exported/3 reports lists:sort/1 as exported",
-            "erlang:function_exported(lists, sort, 1)",
+            "erlang:function_exported/3 reports lists:sort/1 as exported once lists is loaded",
+            "case code:ensure_loaded(lists) of {module,_} -> erlang:function_exported(lists, sort, 1) end",
             "ok true",
         ),
         eval(
