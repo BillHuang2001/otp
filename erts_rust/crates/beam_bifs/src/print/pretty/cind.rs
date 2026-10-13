@@ -183,7 +183,7 @@ fn cind_tail(
 ) -> Result<i64> {
     match elems.split_first() {
         None => match tail {
-            SeqTail::None | SeqTail::Dots => Ok(ind),
+            SeqTail::None | SeqTail::Dots(_) => Ok(ind),
             SeqTail::Improper(t) => {
                 if t.len + 1 < ll - col - (ld + 1) && t.len + 1 + w + (ld + 1) <= m && atomic(t) {
                     Ok(ind)

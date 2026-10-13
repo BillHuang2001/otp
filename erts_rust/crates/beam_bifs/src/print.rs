@@ -153,7 +153,7 @@ use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 
 mod pretty;
-pub(crate) use pretty::{pretty_chunk, pretty_chunk_order};
+pub(crate) use pretty::{pretty_chunk, pretty_chunk_limited, pretty_chunk_order, pretty_write_limited};
 
 /// The depth value that disables depth limiting — `io_lib` passes `-1` for `~w`.
 pub(crate) const UNLIMITED_DEPTH: i64 = -1;
