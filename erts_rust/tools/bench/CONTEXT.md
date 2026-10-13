@@ -462,14 +462,15 @@ regardless of `PATH` order); the rest probe ready, and `khepri` runs once the `r
 
 ## Status
 - The driver is a complete library + binary: 12 workloads, all implemented and tested; `cargo test -p bench`
-  is green.
-- **Current measurement session: `m9` (2026-10-13).** The full cross-runtime pass ran 12/12 rows `ok`
-  (six `Runtimes::Both` workloads × both runtimes); the full sys-only external-target pass ran 4/4 `ok`
-  (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`). A same-session smoke sub-run (14:49–14:53 UTC,
-  one workload each) then showed `plb` → `ok` after the version-aware tool-resolution fix and re-confirmed
-  `emqx` → `skipped(emqx-requires-otp-28)`; the only honest non-`ok` row is now `emqx`.
-- Read the figures from `RESULTS.md` / `results/` (`m9-*` current; `m6-*`/`m5-*`/`m4-*` the regression
-  baselines) — this file deliberately restates none of them.
+  is green (**250 passed / 0 failed** at the m10 commit).
+- **Current measurement session: `m10` (2026-10-13 23:06–23:15 UTC, commit `b4593818b3a27f47e3b682a1a50fbfcc0a1785fe`).**
+  The full cross-runtime pass ran 12/12 rows `ok` (six `Runtimes::Both` workloads × both runtimes); the
+  full sys-only external-target pass ran 4/4 `ok` (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`);
+  `plb` → `ok` (version-aware tool resolution picks `dotnet` 9.0.318); the only honest non-`ok` row is
+  `emqx` → `skipped(emqx-requires-otp-28)`. The pass also added `m10-bench-xrun-interp.json`, a
+  **Rust-only** `BEAM_RT_TIER=interpreter` run that keeps the tier effect separable from the `sys` column.
+- Read the figures from `RESULTS.md` / `results/` (`m10-*` current; `m9-*`/`m6-*`/`m5-*`/`m4-*` the
+  regression baselines) — this file deliberately restates none of them.
 
 ## Measured — where the numbers live
 
