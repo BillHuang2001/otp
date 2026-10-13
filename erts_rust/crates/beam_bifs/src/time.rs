@@ -238,6 +238,10 @@ fn convert_unit(ctx: &mut BifContext<'_>, native: i64, unit: &TimeUnit) -> Resul
 /// ([`arith_operators`]): one exact bignum multiply and one exact bignum divide,
 /// with no second copy of bignum math and no new dependency.
 ///
+/// This module's clocks (`erlang:monotonic_time/1`/`system_time/1`/`time_offset/1`)
+/// and [`crate::os_bif`]'s `os:system_time/1` share this one implementation: the
+/// bignum-unit path is byte-identical at both call sites.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`] for a product past `BIG_ARITY_MAX` limbs — the only
@@ -246,7 +250,11 @@ fn convert_unit(ctx: &mut BifContext<'_>, native: i64, unit: &TimeUnit) -> Resul
 /// `try ... catch _:_ -> badarg` folds the `system_limit` away, so
 /// `convert_time_unit(1000000, nanosecond, 1 bsl 4194239)` is `badarg` in the
 /// oracle and here.
-fn convert_unit_big(ctx: &mut BifContext<'_>, native: i64, per_second: &[u64]) -> Result<Eterm> {
+pub(crate) fn convert_unit_big(
+    ctx: &mut BifContext<'_>,
+    native: i64,
+    per_second: &[u64],
+) -> Result<Eterm> {
     // Every failure of the chain below is the class the oracle reports: its
     // `convert_time_unit/3` body runs inside `try ... catch _:_ -> badarg`, so the
     // `system_limit` an oversized product raises surfaces as `badarg`.
