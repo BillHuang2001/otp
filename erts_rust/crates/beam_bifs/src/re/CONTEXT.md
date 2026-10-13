@@ -1,127 +1,90 @@
 # `beam_bifs::re` — an in-crate regular-expression engine (the `re:*` BIFs)
 
 ## Intent
-Implement the 8 `re:*` BIFs (`version/0`, `compile/1,2`, `run/2,3`, `internal_run/4`, `inspect/2`, `import/1`) **for real** — a self-contained regular-expression engine written from scratch in safe Rust, with **no new dependency** (no PCRE, no `regex` crate; workspace licensing is Apache-2.0/MIT only).
+Implement the 8 declared `bif.tab` `re:*` keys (`version/0`, `compile/1,2`, `run/2,3`, `internal_run/4`, `inspect/2`, `import/1`) **for real** — a self-contained regular-expression engine written from scratch in safe Rust, with **no new dependency** (no PCRE, no `regex` crate; workspace licensing is Apache-2.0/MIT only).
+This is the only regex engine in the workspace, and `beam_rt` does **not** shadow `re`: `default_registry()` is the dispatch path.
+`lib/stdlib/src/re.erl` is almost pure Erlang on top of these NIFs, so `re:replace/3,4`, `re:split/2,3`, `re:grun/3`, `re:urun/3`, `re:compile/2` option handling and the `{capture,Spec}` → `process_parameters` machinery all work automatically once `run/2,3` and `internal_run/4` are real.
+**Do not re-implement what `re.erl` does** — notably the implicit-0-prepend for a list capture spec is `re.erl`'s `process_parameters`, NOT the BIF; the BIF renders exactly the requested ids.
+Ground truth (read-only): `lib/stdlib/src/re.erl`, `../../../../erts/emulator/beam/erl_bif_re.c`, `../../../../erts/emulator/pcre/pcre2_error.c` (the message table) and the live oracle `erl` on `PATH` (OTP 29 / erts-17.1).
 
-This is the only place in the workspace where a regex engine exists; the sibling `tools/differential/` gate drives it through `beam_rt`, and `beam_rt` is *not* shadowing `re` — this registry is the dispatch path.
+## API Surface
+The 8 keys are registered through `mod.rs`'s `pub(crate) fn register`, called from the parent family module `../runtime/other.rs`, whose `pub(crate) const REAL_BIFS` aliases `crate::re::REAL_BIFS` (the single-source roster of these keys).
+- `mod.rs` — the BIF entry points, `register`, `REAL_BIFS`, `RE_VERSION`, the two compiled-pattern forms + `pattern_image`, and the shared `pattern_form`/`flatten` iodata walk + `compile_error` renderer.
+- `options.rs` — the compile- and run-option parser (`parse`) and its types (`CompileFlags`, `Parsed`, `CaptureSpec`/`CapValue`/`CapType`/`CapId`, `Newline`, `Bsr`).
+- `syntax.rs` — pattern codepoints → AST, plus the exact `{Msg, Pos}` compile errors.
+- `prog.rs` — AST → the compiled backtracking program + the self-contained, versioned `Payload` image (encode/decode, `MAGIC = b"rustre2\0"`, `MAX_REPEAT_UNROLL = 4096`).
+- `exec.rs` — the iterative backtracking matcher, the single-shot search and the `global` loop.
+- `run.rs` — the `run/2,3`/`internal_run/4` bodies (option parse, RE resolve, subject flatten, start offset, result shaping).
+- `render.rs` — capture ids + matcher spans → the `{match, …}` / bare `match` result terms.
+- `oracle.rs` — `#[cfg(test)]`, the live-oracle differential sweep.
+Every file carries the OTP Apache-2.0 `// %CopyrightBegin% … // %CopyrightEnd%` header block; the compiler-side files are long only for their `#[cfg(test)]` suites.
+`re:version/0` returns `<<"10.47 2025-10-21">>` — the **compatibility-target version string of the modelled `re` surface** (what the reference oracle reports), *not* an assertion that PCRE2 is present.
 
-`lib/stdlib/src/re.erl` is almost pure Erlang on top of these NIFs, so `re:replace/3,4`, `re:split/2,3`, `re:grun/3`, `re:urun/3`, `re:compile/2` option handling and the `{capture,Spec}` → `process_parameters` machinery all work automatically once `run/2,3` and `internal_run/4` are real. **Do not re-implement what `re.erl` does** (notably: the *implicit-0-prepend for a list capture spec* is `re.erl`'s `process_parameters`, NOT the BIF — the BIF must render exactly the requested ids).
-
-Ground truth (read-only): `lib/stdlib/src/re.erl` and the live oracle `erl` on `PATH` (OTP 29.1.1 / erts-17.1).
-
-## API Surface (the seam `src/runtime/other.rs` calls)
-- `mod.rs` — the BIF entry points + `pub(crate) fn register(reg: &mut BifRegistry)` + `pub(crate) const REAL_BIFS: &[(&str, &str, u32)]` (exactly the 8 keys).
-- `options.rs` — compile-option and run-option parsing; `CompileOpts`, `RunOpts`, `CaptureSpec`, `CaptureType`.
-- `syntax.rs` — pattern text → AST, with the oracle's `{Msg, Pos}` compile errors.
-- `prog.rs` — AST → compiled program + the self-contained `Payload` term (encode/decode).
-- `exec.rs` — the matcher (produces match + capture spans over the flat subject).
-- `render.rs` — capture spans → the `{match, Caps}` / `nomatch` / `match` terms.
-
-Every file carries the OTP Apache-2.0 `// %CopyrightBegin% … // %CopyrightEnd%` header block (copy it byte-exactly from `../runtime/other.rs`). Files target ~1000 lines; split rather than grow (a longer file needs a top-of-file "why this must be long" comment).
-
-## The compiled pattern term (`Mp`) — oracle-verified shape
+## The compiled pattern term (`Mp`)
 `{re_pattern, NCap, UnicodeFlag, CrlfFlag, Payload}`:
-- `NCap` = integer count of capturing groups, excluding the whole match. `re:compile("(a)(?:b)(c)")` → element 2 = 2; `re:compile("(a)(b)",[no_auto_capture])` → 0; `re:compile("(?<A>A)|(?<B>B)|(?<C>C)")` → 3.
-- `UnicodeFlag` = `1` if the `unicode` compile option else `0`. `CrlfFlag` = `1` if `{newline,crlf}` else `0` (`re.erl`'s `check_for_unicode`/`check_for_crlf` pattern-match elements 3/4 as integers).
-- `Payload` = **our own self-contained** term (recommended: a custom binary image) carrying the compiled program + name table + option flags, so `run/2,3` and `inspect/2` need **no global registry**. It must round-trip through our own `compile → run` and `compile → inspect`. **Never** try to reproduce the oracle's `#Ref<…>` in element 5.
-- `export` compile option → `{ok, {re_exported_pattern, NCap, UnicodeFlag, CrlfFlag, Payload'}}`, where `Payload'` also carries the source string + options; `import/1` returns the `{re_pattern,…}` form (recompile if the payload is not usable).
+- `NCap` = the integer count of capturing groups excluding the whole match (`re:compile("(a)(?:b)(c)")` → 2, `[no_auto_capture]` → 0, a three-branch named alternation → 3).
+- `UnicodeFlag` = `1` iff the `unicode` compile option, else `0`; `CrlfFlag` = `1` iff `{newline,crlf}` (the oracle's `use_crlf` = `crlf|anycrlf|any`), else `0`. `re.erl`'s `check_for_unicode`/`check_for_crlf` pattern-match elements 3/4 as integers.
+- `Payload` = **our own** self-contained, versioned binary image (8-byte magic `b"rustre2\0"`): the instruction stream, the character-class table, `ncap`, the name table, the match-relevant compile flags and the raw pattern bytes, so `run/2,3` and `inspect/2` need **no** process-global registry. It round-trips our own `compile → run` and `compile → inspect`; the oracle's element 5 is a PCRE2 `#Ref<…>` and is never reproduced. `Payload::decode` is total — a truncated, foreign or version-mismatched image is a typed `badarg`, never a panic.
+- `export` → `{ok, {re_exported_pattern, Header, Pattern, Options, Payload}}` where `Header` is the image magic and `Pattern` the original pattern term; `import/1` rebuilds the `{re_pattern, …}` form **around the same image** with no recompilation (the documented purpose of the form).
 
-## Capture semantics (pin exactly)
+## Capture semantics
 Default capture for `run/2,3` **and** `internal_run/4` is `{capture, all, index}`.
-- non-global: `{match, [cap0, cap1, …]}` (flat; group 0 = whole match first).
-- `global`: `{match, [[cap0,…], [cap0,…], …]}`.
-- no match → `nomatch`; `{capture,none}` → bare atom `match`; an **empty list** spec `[]` → bare atom `match`; `all_names` with no named groups → bare atom `match`.
-- value specs: `all` (group 0 + every group), `all_but_first` (every group except 0), `first` (group 0 only), `none`, `all_names` (values of the *named* groups in **alphabetical name order**, group 0 NOT included), `[ids…]` where each id is an integer index or a name (string/atom). A non-participating group, or a requested name that does not exist → `{-1,0}` (index) / `[]` (list) / `<<>>` (binary).
-- types: `index` (default) `{Start,Len}` byte offsets into the flat subject; `list` charlist of small ints (Unicode-decode the UTF-8 slice when unicode); `binary` binary slice.
+- non-global → `{match, [cap0, cap1, …]}` (flat, group 0 first); `global` → `{match, [[cap0,…], …]}`.
+- no match → the bare atom `nomatch`; `{capture,none}`, the empty list `[]`, or an `all_names` that resolved to no names → the bare atom `match`.
+- value specs: `all` (group 0 + every group), `all_but_first` (every group except 0), `first` (group 0), `none`, `all_names` (the *named* groups in name-table order, group 0 excluded), and an explicit `[ids…]` list where each id is an integer index or a name (string/atom).
+- a non-participating group, a requested name no group carries, or an out-of-range index → the type's empty form `{-1,0}` (index) / `[]` (list) / `<<>>` (binary) — never an error.
+- types: `index` (default) `{Start,Len}` byte offsets into the flat subject; `list` a charlist (Unicode-decoded when the pattern is `unicode`); `binary` a binary slice.
 
 ## Options
-Compile: `unicode`, `anchored`, `caseless`, `dotall`, `multiline`, `extended`, `ungreedy`, `dollar_endonly`, `firstline`, `no_auto_capture`, `dupnames`, `{newline, cr|lf|crlf|nul|anycrlf|any}`, `never_utf`, `ucp`, `bsr_anycrlf`, `bsr_unicode`, `no_start_optimize`, `export`. Accept as no-ops **only where behaviour-preserving**; otherwise the typed `unsupported_bif`. The supported subset is documented honestly at this node.
-Run: `anchored`, `global`, `notbol`, `noteol`, `notempty`, `notempty_atstart`, `report_errors`, `{offset,N}`, `{match_limit,N}`, `{match_limit_recursion,N}`, `{capture,Spec}`, `{capture,Spec,Type}`, plus every compile option when `RE` is not precompiled.
+Compile: `unicode`, `anchored`, `caseless`, `dotall`, `multiline`, `extended`, `ungreedy`, `dollar_endonly`, `firstline`, `no_auto_capture`, `dupnames`, `{newline, cr|lf|crlf|nul|anycrlf|any}`, `export`, `never_utf`, `ucp`, `bsr_anycrlf`, `bsr_unicode`, `no_start_optimize`.
+`no_start_optimize` and `bsr_*` are accepted no-ops (behaviour-preserving: this engine has no start optimisation, and `bsr_*` only affects `\R`, itself a typed gap); `never_utf` interacts only with `unicode` (that combination raises the oracle's `E_UTF_DISABLED` compile error); `ucp` is the typed `unsupported_bif` (see the gaps).
+Run: `global`, `anchored`, `notbol`, `noteol`, `notempty`, `notempty_atstart`, `report_errors`, `{offset,N}`, `{match_limit,N}`, `{match_limit_recursion,N}`, `{capture,Spec}`, `{capture,Spec,Type}`, plus every compile option on the textual path. `{match_limit_recursion,N}` is accepted and ignored (this engine is not recursive); `export` in `run` is `badarg` (`PARSE_FLAG_EXPORT`), and a compile-only option alongside a precompiled `RE` is `badarg` (`PARSE_FLAG_UNIQUE_COMPILE_OPT`).
+Pattern syntax: literals; `.`; classes `[...]` (ranges, negation, `\d\D\w\W\s\S\h\H\v\V`, POSIX `[[:name:]]`, `\Q…\E`); anchors `^ $ \A \z \Z \b \B \G`; alternation; capturing / non-capturing / named groups; atomic groups `(?>…)`; backreferences `\1`, `\g{…}`, `\k<name>`; every quantifier form `* + ? {n} {n,} {n,m}` in greedy, lazy and **possessive** form; `\N` (any-but-newline); inline and scoped option groups `(?i)`/`(?i:…)`/`(?s)`/`(?m)`/`(?x)`/`(?U)`; `(?#…)` comments; the escapes `\n \r \t \f \a \e \0 \xHH \x{…} \o{…} \cX \ddd`; `unicode` mode (UTF-8 patterns and subjects).
+`caseless` folding is a simple-fold canonicaliser over ASCII, Latin-1 Supplement, Latin Extended-A, Greek and Cyrillic; a codepoint outside those ranges folds to itself — a documented coverage limit, not a silent mis-match for the covered set.
 
-Pattern syntax: literals; `.`; classes `[...]` incl. ranges, negation, `\d \D \w \W \s \S`, POSIX `[[:alpha:]]` etc.; anchors `^ $ \A \z \Z \b \B`; alternation; capturing `(...)`; non-capturing `(?:...)`; named `(?<name>...)`/`(?P<name>...)`; backreferences `\1`; quantifiers `* + ? {n} {n,} {n,m}` greedy, lazy (`*?`), possessive (`*+`); escapes `\n \t \r \f \v \0 \xHH \x{...} \uXXXX \\` + `\Q…\E`; inline option groups `(?i)`/`(?s)`/`(?m)`/`(?x)`/`(?U)` incl. scoped `(?i:…)`; the `unicode` option (patterns + subjects as Unicode charlists — reuse the crate's `src/unicode/` module).
-
-## Error behaviour (oracle-verified)
-- `compile` failure → `{error, {Msg, Pos}}` (0-based byte position). Reproduce **exactly** the messages you can; anything you cannot match exactly must raise the typed `unsupported_bif` — **never fabricate a message or a position**.
-- `run`/`internal_run` with `report_errors`: compile failure → `{error, {compile, {Msg,Pos}}}`; match-limit exhaustion → `{error, match_limit}`. Without `report_errors`: compile failure raises `badarg`; match-limit exhaustion → `nomatch`.
-- Non-iodata / non-`mp()` `RE`, or a non-iodata subject → `badarg`.
-
-## Oracle goldens to pin (all verified against OTP 29.1.1 / erts-17.1)
-```
-re:run("xabcy","b")                                     = {match,[{2,1}]}
-re:run("xabcy","(b)(c)")                                = {match,[{2,2},{2,1},{3,1}]}
-re:run("xabcy","b",[{capture,none}])                    = match
-re:run("xabcy","(b)(c)",[{capture,[],index}])           = match
-re:run("abab","a",[global])                             = {match,[[{0,1}],[{2,1}]]}
-re:run("abab","(a)(b)",[global,{capture,all,index}])    = {match,[[{0,2},{0,1},{1,1}],[{2,2},{2,1},{3,1}]]}
-re:run("xabcy","(b)(c)",[{capture,all,list}])           = {match,["bc","b","c"]}
-re:run("xabcy","(b)(c)",[{capture,all,binary}])         = {match,[<<"bc">>,<<"b">>,<<"c">>]}
-re:run("xabcy","(b)(c)",[{capture,all_but_first,index}]) = {match,[{2,1},{3,1}]}
-re:run("xabcy","(b)(c)",[{capture,[2,1],index}])        = {match,[{3,1},{2,1}]}
-re:run("xabcy","(b)(c)",[{capture,[0,1],index}])        = {match,[{2,2},{2,1}]}
-re:run("xabcy","(b)(c)",[{capture,first,list}])         = {match,["bc"]}
-re:run("xabcy","(?:b)(c)",[{capture,all,index}])        = {match,[{2,2},{3,1}]}
-re:run("xabcy","(z)?(b)",[{capture,all,index}])         = {match,[{2,1},{-1,0},{2,1}]}
-re:run("xabcy","(z)?(b)",[{capture,all,list}])          = {match,["b",[],"b"]}
-re:run("xabcy","(z)?(b)",[{capture,all,binary}])        = {match,[<<"b">>,<<>>,<<"b">>]}
-re:run("xabcy","(?<foo>b)(c)",[{capture,all_names,index}]) = {match,[{2,1}]}
-re:run("xabcy","(?<foo>b)(c)",[{capture,["foo"],index}])   = {match,[{2,1}]}
-re:run("xabcy","(?<foo>b)(c)",[{capture,["c"],index}])     = {match,[{-1,0}]}
-re:run("abcabc","b",[{offset,2}])                       = {match,[{4,1}]}
-re:run("ABC","abc",[caseless])                          = {match,[{0,3}]}
-re:run("abc",".")                                       = {match,[{0,1}]} ; re:run("a.c",".",[dotall]) = {match,[{0,1}]}
-re:run("a\nb","b$",[multiline])                         = {match,[{2,1}]}
-re:run("a\nb","(?s)a.b")                                = {match,[{0,3}]}
-re:run("abc","a  b  c",[extended])                      = {match,[{0,3}]}
-re:run("abc","\\Aabc") / re:run("abc","bc\\z")          = {match,[{0,3}]} / {match,[{1,2}]}
-re:run("abc","\\bb")                                    = nomatch
-re:run("abc","[a-c]+") / re:run("abc1","\\d+") / re:run("abc_1","\\w+") / re:run("a b","\\s")
-                                                        = {match,[{0,3}]} / {match,[{3,1}]} / {match,[{0,5}]} / {match,[{1,1}]}
-re:run("abab","(a)(b)\\1")                              = {match,[{0,3},{0,1},{1,1}]}
-re:run("aaa","a{2,}") / re:run("aaaa","a{2,3}") / re:run("aaa","a+?")
-                                                        = {match,[{0,3}]} / {match,[{0,3}]} / {match,[{0,1}]}
-re:run("ABC","(?i)abc") / re:run("abc","a(?i:BC)")      = {match,[{0,3}]} / {match,[{0,3}]}
-re:run("A","\\x{41}") / re:run("a","(a)*+") / re:run("aaa","(a)*")
-                                                        = {match,[{0,1}]} / {match,[{0,1},{0,1}]} / {match,[{0,3},{2,1}]}
-re:run("abc","[[:alpha:]]+") / re:run("a+b","\\Qa+b\\E") = {match,[{0,3}]} / {match,[{0,3}]}
-re:run("abc","^") / re:run("abc","") / re:run("","")     = {match,[{0,0}]} (all)
-re:run("","",[notempty,{capture,all,index}])             = nomatch
-re:run("abc","b",[notbol,{capture,all,index}])           = {match,[{1,1}]}
-re:run("abc","a",[anchored,{capture,all,index}])         = {match,[{0,1}]} ; re:run("bac","a",[anchored,{capture,all,index}]) = nomatch
-re:run("abc","a",[report_errors])                        = {match,[{0,1}]}
-re:run("abc","a",[{match_limit,0},report_errors])        = {error,match_limit}  ; without report_errors = nomatch
-re:compile("a(b")                                        = {error,{"missing closing parenthesis",3}}
-re:compile("[a")                                         = {error,{"missing terminating ] for character class",2}}
-re:compile("a{2,1}")                                     = {error,{"numbers out of order in {} quantifier",5}}
-re:compile("(?<n>a)(?<n>b)")                             = error (duplicate subpattern name) ; with [dupnames] = ok
-re:inspect(re:compile("(?<A>A)|(?<B>B)|(?<C>C)"), namelist) = {namelist,[<<"A">>,<<"B">>,<<"C">>]}
-re:run("abc",123) / re:compile(123)                      = badarg
-```
-Also: `re:internal_run("xabcy",MP,[{offset,0}],true)` = `{match,[{2,2},{2,1},{3,1}]}` for `MP = re:compile("(b)(c)")` (same default all/index shape as `run`, non-global flat); with `global` → `{match,[[{2,2},{2,1},{3,1}]]}`; nomatch → `nomatch`.
-The oracle's `re:version()` is `<<"10.47 2025-10-21">>`.
+## Error behaviour
+- a **malformed pattern** in `compile` → the `{error, {Msg, Pos}}` **value** (0-based byte position), with the message text taken verbatim from `pcre2_error.c`.
+- `run`/`internal_run` with `report_errors`: a malformed pattern → `{error, {compile, {Msg,Pos}}}`; a match-limit exhaustion → `{error, match_limit}`. Without `report_errors`: a malformed pattern raises `badarg`; an exhausted budget is the bare `nomatch`.
+- an argument the oracle refuses (a non-iodata pattern/subject, a non-`mp()` `RE`, a malformed option list, a negative `{offset|match_limit|match_limit_recursion,_}`, a non-boolean `internal_run/4` fourth argument) → `badarg`.
+- `{match_limit,N}` counts **our own dispatched instructions** (default `DEFAULT_MATCH_LIMIT`), not PCRE2's internal `match()` calls, so for a small `N` the give-up threshold differs from PCRE2's; `{match_limit,0}` is oracle-exact (the budget exhausts on the first dispatched instruction).
 
 ## Constraints
-- `#![deny(unsafe_code)]` at the crate root — **no `unsafe`** here.
-- Errors are `beam_common::{Result, BeamError}` only (`crate::error::badarg()` / `unsupported_bif()`); no crate-local error type, no `panic!`/`unwrap()` on runtime data.
-- Never a wrong result: an unsupported pattern construct, option or subject outside the implemented subset must raise the typed `unsupported_bif` — never a silently wrong match and never a fabricated `{Msg,Pos}`.
-- Term construction: `BifContext` has `int`/`atom`/`intern_atom`/`tuple`/`cons`/`list`/`make_float`/`boolean`/`ok` but **no** binary/map constructor — build binaries through `beam_codec::term::make_binary`/`make_bitstring` (see `../runtime/other.rs`'s siblings and `../binconv.rs`). Subject/pattern bytes and term inspection go through the crate-private `crate::access` / `crate::bits` and `beam_codec::term::*`.
-- Allocation stays on `beam_alloc::Heap` via `BifContext`; the engine's own working state is plain Rust (`Vec`/`String`) — it never allocates a term on the process heap by itself.
+- The crate is `#![deny(unsafe_code)]` — **no `unsafe`** here.
+- Errors are `beam_common::{Result, BeamError}` only (`crate::error::badarg()`/`unsupported_bif()`); no crate-local error type, no `panic!`/`unwrap()` on runtime data.
+- Never a wrong result: an unsupported pattern construct, option or subject outside the implemented subset raises the typed `unsupported_bif` — never a silently wrong match and never a fabricated `{Msg,Pos}`.
+- Term construction: `BifContext` has `int`/`atom`/`intern_atom`/`tuple`/`cons`/`list`/`make_float`/`boolean`/`ok` but **no** binary/map constructor — binary terms are built through `crate::bits::make_binary`; term inspection goes through the crate-private `crate::access`/`crate::bits`.
+- Allocation stays on `beam_alloc::Heap` via `BifContext`; the engine's own working state is plain Rust (`Vec`/`String`) and it never allocates a term on the process heap by itself.
+- The matcher is fully iterative (an explicit choice-point stack, undo log and mark stack), so a 20 000-codepoint subject cannot overflow the native stack.
 
 ## Test Strategy
-- In-module `#[cfg(test)]` unit tests per file (parser shapes, option parsing, matcher spans, payload round-trip, error positions) — no oracle needed.
-- The crate-level `../../tests/re.rs` integration file pins the oracle goldens above: it drives `default_registry().call("re", …)` (the crate's public seam), so it must work without the oracle present, and may *additionally* shell out to `erl` for live cross-checks (the `tests/checksum.rs` / `tests/calendar.rs` pattern). That file lives outside this node (the crate root owns `tests/`).
+- In-module `#[cfg(test)]` unit tests per file (parser shapes, option parsing, matcher spans, payload round-trip, error positions) — no oracle needed; `mod.rs` is roughly half tests.
+- The crate-level `../../tests/re.rs` (owned by the crate root, outside this node) pins the committed goldens over the **public** seam (`default_registry().call("re", …)`), so they run with no oracle present, and adds a live cross-check that skips loudly when no `erl` is on `PATH`.
+- `oracle.rs` is this node's **live-oracle differential sweep**: 136 cases across 6 corpora (capture shapes / `global` / `{offset,N}`; the option flags; compile-error fidelity; pattern syntax; subjects and `unicode` mode; `version`/`inspect`/precompiled/`export`-`import`). Each case runs twice — under the real `erl` and through the crate's dispatch — and the two must agree on the **ETF bytes** of the result (printer-free, byte-exact); the opaque `Payload` is never compared (it is ours) and the skip-loudly policy applies with no oracle.
 - Command: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast`.
 
 ## Known Issues / honest typed gaps
-- The compiled `Payload` is **ours**, not PCRE's — `inspect/2` supports only `namelist`; the oracle's PCRE-internals items (`size`, `options`, `capturecount`, …) must answer the typed `unsupported_bif` rather than a fabricated value.
-- `run/2,3`'s automatic unanchored scan, `bsr_*`/`ucp`/`never_utf`, and any PCRE construct outside the subset listed above are typed gaps until implemented.
-- Do **not** try to reproduce the oracle's `#Ref<…>` pattern id, nor PCRE's error strings that were not observed live.
+Each gap below raises the typed `unsupported_bif` (never a fabricated value), with its blocking reason.
+- **`ucp`, and therefore `\p{…}`/`\P{…}`** — the engine has no Unicode property tables, and every `ucp` pattern switches `\d\w\s` and the POSIX classes onto them; a Latin-1-only class would silently under-match, so the whole pattern is the gap.
+- **Lookahead/lookbehind `(?=…) (?!…) (?<=…) (?<!…)`** — the backtracking program has no zero-width sub-match instruction.
+- **`(?|…)` branch reset and `(?(…))` conditionals** — no group-number rebasing and no conditional instruction.
+- **`\K`, `\R`, `\X`, `\C` and `\N{…}`** (plain `\N` IS supported) — no reset/`\R`-newline-sequence/`\X`-grapheme/`\C`-code-unit/`\N{U+…}`-named-codepoint instruction.
+- **Recursion (`(?R)`, `(?1)`, `(?&name)`), callouts, `(*VERB)`, `(?(DEFINE)…)`** — not parsed.
+- **A repeat bound above `MAX_REPEAT_UNROLL` (4096)** — both bounded quantifier forms unroll, so a larger bound is a documented capability gap rather than a memory blow-up (the oracle compiles `a{65535}`).
+- **`re:inspect/2`'s items other than `namelist`** (`size`, `options`, `capturecount`, `newline`, …) — those describe PCRE2's own compiled blob, which this crate does not have; note the error-**class** difference: the oracle's `re.erl` raises `{error,badarg}` for the items it does not implement, while this node raises the typed `unsupported_bif`.
+- **`{match_limit,N}` counts our own dispatched instructions, not PCRE2's internal match calls** — the same result class with a different give-up threshold (see Error behaviour).
+
+## Handoffs
+- The differential gate `../../../../tools/differential/` (sibling, out of this node's scope) does not yet cover `re`; its corpus should add an `re` group, for which `src/re/oracle.rs` is the ready-made case source. Suggested coverage: capture shapes; `global`/`{offset,N}`; the option flags; pattern syntax (possessive/lazy quantifiers, backreferences, named groups, classes, anchors); the compile-error `{Msg,Pos}` positions; `inspect(MP, namelist)`; `version/0`; and the `export`→`import`→`run` round-trip.
+- `beam_rt` needs **no** seam for `re` — the engine is self-contained and the 8 keys reach the registry through the ordinary `crate::re::register` path, so the stdlib `re.erl` layer works unchanged.
 
 ## Routing Table
-- `./mod.rs` -> the 8 BIF entry points + `register` + `REAL_BIFS`
+- `./mod.rs` -> the 8 BIF entry points + `register` + `REAL_BIFS` + the pattern forms
 - `./options.rs` -> compile/run option and capture-spec parsing
-- `./syntax.rs` -> pattern text -> AST + `{Msg,Pos}` compile errors
+- `./syntax.rs` -> pattern codepoints -> AST + the `{Msg,Pos}` compile errors
 - `./prog.rs` -> AST -> program + the self-contained payload image
-- `./exec.rs` -> the matcher
+- `./exec.rs` -> the matcher + the `global` loop
+- `./run.rs` -> the `run/2,3` / `internal_run/4` bodies
 - `./render.rs` -> captures -> terms
-- `../runtime/other.rs` -> the parent family module that registers these real BIFs (`REAL_BIFS`)
+- `./oracle.rs` -> the live-oracle differential sweep (`#[cfg(test)]`)
+- `../runtime/other.rs` -> the parent family module that calls `crate::re::register` and aliases `REAL_BIFS`
 - `../../CONTEXT.md` -> the crate root
