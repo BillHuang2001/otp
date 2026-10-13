@@ -1758,7 +1758,465 @@ fn pattern_syntax_corpus() -> Vec<Case> {
     ]
 }
 
-/// The shared sweep behind both new corpora: run every case on our side and
+// ---------------------------------------------------------------------------
+// The fifth corpus: subjects (the iodata flattening) and the `unicode` mode
+// ---------------------------------------------------------------------------
+
+/// The atoms [`subjects_and_unicode_corpus`] needs beyond the shared
+/// [`Fixture::new`] seed — the `unicode` compile/run option (the `capture`/`all`/
+/// `list`/`binary`/`offset` names the other cases use are already seeded).
+const SUBJECT_UNICODE_ATOMS: &[&str] = &["unicode"];
+
+/// The fifth corpus: **subjects** and the `unicode` mode (16 cases).
+///
+/// The subject is the half of `re:run/2,3` the earlier corpora barely touch (they
+/// use plain charlists); each case here pins how an *iodata* subject is flattened
+/// and what the reported byte offsets mean:
+///
+/// * 1, 2 — nested iodata (`[<<"xa">>, "bcy"]`) and the empty charlist `[]`;
+/// * 3, 4 — the empty subject/pattern pair, and the `badarg` for a float element
+///   (a float is not iodata);
+/// * 5, 6 — the RE itself as a charlist and as a binary;
+/// * 7–14 — `unicode` mode: a UTF-8 binary subject, an equivalent charlist, the
+///   `list`/`binary` captures, a non-ASCII class, `.` matching one *codepoint*
+///   vs one *byte* (non-unicode), and `{offset, N}` counting **bytes**;
+/// * 15, 16 — an invalid-UTF-8 byte subject is `badarg` in `unicode` mode but a
+///   plain one-byte subject without it.
+fn subjects_and_unicode_corpus() -> Vec<Case> {
+    vec![
+        Case {
+            name: "subject/nested-iodata",
+            erl: r#"re:run([<<"xa">>,"bcy"],"b")"#,
+            run: |f| {
+                let inner = bin(f, b"xa");
+                let tail = chr(f, "bcy");
+                let subject = l(f, &[inner, tail]);
+                let pattern = bin(f, b"b");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "subject/empty-charlist",
+            erl: r#"re:run([],"a")"#,
+            run: |f| {
+                let subject = l(f, &[]);
+                let pattern = bin(f, b"a");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "subject/empty-both",
+            erl: r#"re:run("", "")"#,
+            run: |f| {
+                let subject = chr(f, "");
+                let pattern = bin(f, b"");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "subject/float-is-not-iodata",
+            erl: r#"re:run([1.0],"a")"#,
+            run: |f| {
+                let flt = crate::access::make_float(&mut f.heap, 1.0).expect("a float term");
+                let subject = l(f, &[flt]);
+                let pattern = bin(f, b"a");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "re/charlist",
+            erl: r#"re:run("abc",[97])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = chr(f, "a");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "re/binary",
+            erl: r#"re:run("abc",<<"a">>)"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "unicode/utf8-binary-subject",
+            erl: r#"re:run(<<"åäö"/utf8>>,<<"ä"/utf8>>,[unicode])"#,
+            run: |f| {
+                let subject = bin(f, "åäö".as_bytes());
+                let pattern = bin(f, "ä".as_bytes());
+                let unicode = a(f, "unicode");
+                f.run_opts(subject, pattern, &[unicode])
+            },
+        },
+        Case {
+            name: "unicode/charlist-subject",
+            erl: r#"re:run("åäö","ä",[unicode])"#,
+            run: |f| {
+                let subject = chr(f, "åäö");
+                let pattern = bin(f, "ä".as_bytes());
+                let unicode = a(f, "unicode");
+                f.run_opts(subject, pattern, &[unicode])
+            },
+        },
+        Case {
+            name: "unicode/capture-list",
+            erl: r#"re:run("åäö","ä",[unicode,{capture,all,list}])"#,
+            run: |f| {
+                let subject = chr(f, "åäö");
+                let pattern = bin(f, "ä".as_bytes());
+                let unicode = a(f, "unicode");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "list");
+                f.run_opts(subject, pattern, &[unicode, spec])
+            },
+        },
+        Case {
+            name: "unicode/capture-binary",
+            erl: r#"re:run("åäö","ä",[unicode,{capture,all,binary}])"#,
+            run: |f| {
+                let subject = chr(f, "åäö");
+                let pattern = bin(f, "ä".as_bytes());
+                let unicode = a(f, "unicode");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "binary");
+                f.run_opts(subject, pattern, &[unicode, spec])
+            },
+        },
+        Case {
+            name: "unicode/non-ascii-class",
+            erl: r#"re:run("åäö","[åä]",[unicode])"#,
+            run: |f| {
+                let subject = chr(f, "åäö");
+                let pattern = bin(f, "[åä]".as_bytes());
+                let unicode = a(f, "unicode");
+                f.run_opts(subject, pattern, &[unicode])
+            },
+        },
+        Case {
+            name: "unicode/dot-is-a-codepoint",
+            erl: r#"re:run("åäö",".",[unicode])"#,
+            run: |f| {
+                let subject = chr(f, "åäö");
+                let pattern = bin(f, b".");
+                let unicode = a(f, "unicode");
+                f.run_opts(subject, pattern, &[unicode])
+            },
+        },
+        Case {
+            name: "non-unicode/dot-is-a-byte",
+            erl: r#"re:run(<<"åäö"/utf8>>,".")"#,
+            run: |f| {
+                let subject = bin(f, "åäö".as_bytes());
+                let pattern = bin(f, b".");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        Case {
+            name: "unicode/offset-counts-bytes",
+            erl: r#"re:run("åäö","ö",[unicode,{offset,4}])"#,
+            run: |f| {
+                let subject = chr(f, "åäö");
+                let pattern = bin(f, "ö".as_bytes());
+                let unicode = a(f, "unicode");
+                let offset = pair(f, "offset", make_small(4));
+                f.run_opts(subject, pattern, &[unicode, offset])
+            },
+        },
+        Case {
+            name: "unicode/invalid-utf8-subject",
+            erl: r#"re:run(<<255>>,".",[unicode])"#,
+            run: |f| {
+                let subject = bin(f, &[255]);
+                let pattern = bin(f, b".");
+                let unicode = a(f, "unicode");
+                f.run_opts(subject, pattern, &[unicode])
+            },
+        },
+        Case {
+            name: "non-unicode/raw-byte-subject",
+            erl: r#"re:run(<<255>>,".")"#,
+            run: |f| {
+                let subject = bin(f, &[255]);
+                let pattern = bin(f, b".");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// The sixth corpus: `version/0`, `inspect/2`, the precompiled run path,
+// `internal_run/4`, and the `export`/`import` round-trip
+// ---------------------------------------------------------------------------
+
+/// The atoms [`run_variants_corpus`] needs beyond the shared [`Fixture::new`]
+/// seed — `namelist` (`inspect/2`'s item), `caseless`/`unicode`/`export` (compile
+/// options) and `zzz` (the `re:import(zzz)` control).
+const RUN_VARIANTS_ATOMS: &[&str] = &["namelist", "caseless", "unicode", "export", "zzz"];
+
+/// Compiles `pattern` (a charlist) under `opts` through the real registry and
+/// returns the tuple [`re:compile`](super::compile) produced *inside* its
+/// `{ok, …}` — the `{re_pattern, …}` (or `{re_exported_pattern, …}`) term the
+/// precompiled cases feed to `re:run`/`re:internal_run`/`re:import`.
+///
+/// This is the Rust half of a **precompiled** case: the oracle's expression
+/// compiles *its own* pattern, so the compiled term itself is never compared
+/// (this engine's `Payload` is its own, not PCRE2's `#Ref<…>`) — only the run
+/// result is. Panics only if our own `re:compile` fails, which no case here does.
+fn compile_pattern(f: &mut Fixture, pattern: &str, opts: &[Eterm]) -> Eterm {
+    let pat = chr(f, pattern);
+    let out = if opts.is_empty() {
+        f.call_fn("re", "compile", 1, &[pat])
+    } else {
+        let list = f.list(opts);
+        f.call_fn("re", "compile", 2, &[pat, list])
+    }
+    .expect("our re:compile succeeds for the case's pattern and options");
+    crate::access::tuple_element(out, 1)
+}
+
+/// Projects a `re:compile(P, [export])` result onto its **payload-free**
+/// `{Pattern, Options}` pair — the two elements of the `{re_exported_pattern,
+/// Header, Pattern, Options, Payload}` tuple the two runtimes must agree on.
+///
+/// The header binary and the encoded payload are implementation-private (this
+/// engine's image is its own, the oracle's is PCRE2's), so they are never
+/// compared; the original pattern and the option list are.
+fn project_exported_pattern(f: &mut Fixture, out: Eterm) -> Result<Eterm> {
+    use crate::access;
+    if !access::is_tuple(out)
+        || access::tuple_size(out) != 2
+        || !is_atom_named(f, access::tuple_element(out, 0), "ok")
+    {
+        panic!("re:compile did not return an `{{ok, …}}` pair");
+    }
+    let exported = access::tuple_element(out, 1);
+    if !access::is_tuple(exported)
+        || access::tuple_size(exported) != 5
+        || !is_atom_named(f, access::tuple_element(exported, 0), "re_exported_pattern")
+    {
+        panic!("re:compile with `export` did not return a 5-element `{{re_exported_pattern, …}}`");
+    }
+    let pattern = access::tuple_element(exported, 2);
+    let options = access::tuple_element(exported, 3);
+    Ok(t(f, &[pattern, options]))
+}
+
+/// The sixth corpus: `re:version/0`, `re:inspect/2`, the **precompiled** run
+/// path, `re:internal_run/4` and the `export`/`import` round-trip (18 cases).
+///
+/// * 1 — `re:version()` (the modelled `re` surface version binary);
+/// * 2, 3 — `re:inspect(MP, namelist)` with and without named groups;
+/// * 4–6 — a **precompiled** `{re_pattern, …}` fed to `re:run/2,3` with no options,
+///   with `global`, and with a flag baked into the pattern by `re:compile/2`;
+/// * 7–9 — a compile-only option (`caseless`, `unicode`, `export`) alongside a
+///   precompiled RE is `badarg`;
+/// * 10–12 — `re:internal_run/4` on a precompiled RE (`true`/`false` first-call
+///   flag, and `global`);
+/// * 13, 14 — a *textual* pattern through `re:internal_run/4`, and the `badarg`
+///   for a non-boolean fourth argument;
+/// * 15, 16 — the `export` → `import` → `run` round-trip, and `re:import(zzz)`
+///   (a `badarg`);
+/// * 17 — `re:run` on the raw `export` form is `badarg` (it must be imported
+///   first, exactly as the oracle refuses it);
+/// * 18 — the payload-free projection of the `export` form's `{Pattern, Options}`.
+///
+/// Every precompiled case writes its RE as `element(2, re:compile(…))` — the
+/// `{ok, MP}` `re:compile/1,2` returns is **not** itself an `mp()`; the oracle's
+/// `re:run`/`re:internal_run` reject the wrapped form (`badarg`), so the pattern
+/// must be unwrapped on both sides to exercise the precompiled path at all.
+fn run_variants_corpus() -> Vec<Case> {
+    vec![
+        Case {
+            name: "version/0",
+            erl: r#"re:version()"#,
+            run: |f| f.call_fn("re", "version", 0, &[]),
+        },
+        Case {
+            name: "inspect/namelist-named",
+            erl: r#"re:inspect(element(2,re:compile("(?<A>A)|(?<B>B)|(?<C>C)")), namelist)"#,
+            run: |f| {
+                let mp = compile_pattern(f, "(?<A>A)|(?<B>B)|(?<C>C)", &[]);
+                let item = a(f, "namelist");
+                f.call_fn("re", "inspect", 2, &[mp, item])
+            },
+        },
+        Case {
+            name: "inspect/namelist-empty",
+            erl: r#"re:inspect(element(2,re:compile("(b)(c)")), namelist)"#,
+            run: |f| {
+                let mp = compile_pattern(f, "(b)(c)", &[]);
+                let item = a(f, "namelist");
+                f.call_fn("re", "inspect", 2, &[mp, item])
+            },
+        },
+        Case {
+            name: "precompiled/run2",
+            erl: r#"re:run("xabcy", element(2,re:compile("(b)(c)")))"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let mp = compile_pattern(f, "(b)(c)", &[]);
+                f.run_opts(subject, mp, &[])
+            },
+        },
+        Case {
+            name: "precompiled/global",
+            erl: r#"re:run("abab", element(2,re:compile("a")), [global])"#,
+            run: |f| {
+                let subject = chr(f, "abab");
+                let mp = compile_pattern(f, "a", &[]);
+                let global = a(f, "global");
+                f.run_opts(subject, mp, &[global])
+            },
+        },
+        Case {
+            name: "precompiled/baked-caseless",
+            erl: r#"re:run("ABC", element(2,re:compile("abc", [caseless])))"#,
+            run: |f| {
+                let subject = chr(f, "ABC");
+                let caseless = a(f, "caseless");
+                let mp = compile_pattern(f, "abc", &[caseless]);
+                f.run_opts(subject, mp, &[])
+            },
+        },
+        Case {
+            name: "precompiled/compile-only-caseless",
+            erl: r#"re:run("abc", element(2,re:compile("a")), [caseless])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let mp = compile_pattern(f, "a", &[]);
+                let caseless = a(f, "caseless");
+                f.run_opts(subject, mp, &[caseless])
+            },
+        },
+        Case {
+            name: "precompiled/compile-only-unicode",
+            erl: r#"re:run("abc", element(2,re:compile("a")), [unicode])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let mp = compile_pattern(f, "a", &[]);
+                let unicode = a(f, "unicode");
+                f.run_opts(subject, mp, &[unicode])
+            },
+        },
+        Case {
+            name: "precompiled/compile-only-export",
+            erl: r#"re:run("abc", element(2,re:compile("a")), [export])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let mp = compile_pattern(f, "a", &[]);
+                let export = a(f, "export");
+                f.run_opts(subject, mp, &[export])
+            },
+        },
+        Case {
+            name: "internal_run/offset-true",
+            erl: r#"re:internal_run("xabcy", element(2,re:compile("(b)(c)")), [{offset,0}], true)"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let mp = compile_pattern(f, "(b)(c)", &[]);
+                let seq = pair(f, "offset", make_small(0));
+                let opts = l(f, &[seq]);
+                let tru = a(f, "true");
+                f.call_fn("re", "internal_run", 4, &[subject, mp, opts, tru])
+            },
+        },
+        Case {
+            name: "internal_run/offset-false",
+            erl: r#"re:internal_run("xabcy", element(2,re:compile("(b)(c)")), [{offset,0}], false)"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let mp = compile_pattern(f, "(b)(c)", &[]);
+                let seq = pair(f, "offset", make_small(0));
+                let opts = l(f, &[seq]);
+                let fals = a(f, "false");
+                f.call_fn("re", "internal_run", 4, &[subject, mp, opts, fals])
+            },
+        },
+        Case {
+            name: "internal_run/global",
+            erl: r#"re:internal_run("xabcy", element(2,re:compile("(b)(c)")), [global], true)"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let mp = compile_pattern(f, "(b)(c)", &[]);
+                let global = a(f, "global");
+                let opts = l(f, &[global]);
+                let tru = a(f, "true");
+                f.call_fn("re", "internal_run", 4, &[subject, mp, opts, tru])
+            },
+        },
+        Case {
+            name: "internal_run/textual-pattern",
+            erl: r#"re:internal_run("xabcy", "(b)(c)", [], true)"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let pattern = bin(f, b"(b)(c)");
+                let opts = l(f, &[]);
+                let tru = a(f, "true");
+                f.call_fn("re", "internal_run", 4, &[subject, pattern, opts, tru])
+            },
+        },
+        Case {
+            name: "internal_run/non-boolean-flag",
+            erl: r#"re:internal_run("xabcy", "(b)(c)", [], 1)"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let pattern = bin(f, b"(b)(c)");
+                let opts = l(f, &[]);
+                let one = make_small(1);
+                f.call_fn("re", "internal_run", 4, &[subject, pattern, opts, one])
+            },
+        },
+        Case {
+            name: "export-import/round-trip",
+            erl: r#"re:run("xabcy", re:import(element(2,re:compile("(b)(c)", [export]))))"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let export = a(f, "export");
+                let exported = compile_pattern(f, "(b)(c)", &[export]);
+                let mp = f.call_fn("re", "import", 1, &[exported])?;
+                f.run_opts(subject, mp, &[])
+            },
+        },
+        Case {
+            name: "import/non-exported",
+            erl: r#"re:import(zzz)"#,
+            run: |f| {
+                let zzz = a(f, "zzz");
+                f.call_fn("re", "import", 1, &[zzz])
+            },
+        },
+        Case {
+            name: "run/raw-export-form-is-badarg",
+            erl: r#"re:run("xabcy", element(2,re:compile("(b)(c)", [export])))"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let export = a(f, "export");
+                let exported = compile_pattern(f, "(b)(c)", &[export]);
+                f.run_opts(subject, exported, &[])
+            },
+        },
+        Case {
+            name: "export/projected-pattern-and-options",
+            erl: r#"case re:compile("(b)(c)",[export]) of
+                     {ok,{re_exported_pattern,_,P,O,_}} -> {P,O};
+                     X -> X
+                   end"#,
+            run: |f| {
+                let export = a(f, "export");
+                let pattern = chr(f, "(b)(c)");
+                let opts = l(f, &[export]);
+                let out = f.call_fn("re", "compile", 2, &[pattern, opts])?;
+                project_exported_pattern(f, out)
+            },
+        },
+    ]
+}
+
+/// The shared sweep used by the corpus tests: run every case on our side and
 /// through the real `erl`, and require the two to agree (or both to raise).
 ///
 /// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH`.
@@ -1844,4 +2302,32 @@ fn oracle_cross_check_compile_errors() {
 #[test]
 fn oracle_cross_check_pattern_syntax() {
     run_oracle_sweep("pattern-syntax", &pattern_syntax_corpus(), PATTERN_SYNTAX_ATOMS);
+}
+
+/// The **subjects & `unicode` mode** differential sweep over
+/// [`subjects_and_unicode_corpus`] — how an iodata subject is flattened and what
+/// the reported byte offsets mean, with and without `unicode`.
+///
+/// The fixture is the shared [`Fixture::new`] one plus [`SUBJECT_UNICODE_ATOMS`].
+///
+/// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH`.
+#[test]
+fn oracle_cross_check_subjects_and_unicode() {
+    run_oracle_sweep(
+        "subjects-unicode",
+        &subjects_and_unicode_corpus(),
+        SUBJECT_UNICODE_ATOMS,
+    );
+}
+
+/// The **run-variants** differential sweep over [`run_variants_corpus`] —
+/// `re:version/0`, `re:inspect/2`, the **precompiled** `re:run/2,3` path,
+/// `re:internal_run/4` and the `export`/`import` round-trip.
+///
+/// The fixture is the shared [`Fixture::new`] one plus [`RUN_VARIANTS_ATOMS`].
+///
+/// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH`.
+#[test]
+fn oracle_cross_check_run_variants() {
+    run_oracle_sweep("run-variants", &run_variants_corpus(), RUN_VARIANTS_ATOMS);
 }

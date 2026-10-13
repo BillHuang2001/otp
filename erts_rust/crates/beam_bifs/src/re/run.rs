@@ -181,7 +181,10 @@ enum Resolved {
 /// * a **precompiled** pattern tuple — [`super::pattern_image`] recognises the
 ///   `{re_pattern, …}` payload; the program is read straight out of the image
 ///   (no recompilation) and its own flag governs the subject, because the run
-///   option list cannot carry `unicode` here (see below);
+///   option list cannot carry `unicode` here (see below). Only the plain
+///   `{re_pattern, …}` form is accepted: the oracle's `run` refuses the
+///   `{re_exported_pattern, …}` form (`re:run(S, re:compile(P, [export]))` is
+///   `badarg`), which must go through `re:import/1` first;
 /// * anything else is a **textual** pattern, flattened and compiled with exactly
 ///   the calls [`super::compile`](super::compile) makes, so the program — and
 ///   therefore the match — is identical to `re:compile/1,2`'s for the same input
@@ -200,6 +203,14 @@ enum Resolved {
 /// raise that replaces an unreported malformed pattern.
 fn resolve_re(ctx: &mut BifContext<'_>, re_term: Eterm, parsed: &Parsed) -> Result<Resolved> {
     if let Some(image) = super::pattern_image(ctx, re_term) {
+        // Only the plain `{re_pattern, …}` form is a precompiled RE. The oracle's
+        // `run` recognises only the PCRE2 pattern object, so the `export` form
+        // (`re:run(S, re:compile(P, [export]))`) is `badarg` and must be passed
+        // through `re:import/1` first. `pattern_image` recognises both tags (it is
+        // shared with `import/1`), hence the explicit tag check here.
+        if !super::is_atom_named(ctx, access::tuple_element(re_term, 0), super::RE_PATTERN) {
+            return Err(badarg());
+        }
         if parsed.unique_compile {
             return Err(badarg());
         }
