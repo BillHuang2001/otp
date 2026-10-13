@@ -94,6 +94,7 @@
 //! | `suspending` | `[]` (no `suspend_process` in M1) |
 //! | `last_calls` | `false` — the oracle's own answer for a process with no saved-calls buffer |
 //! | `memory` | this process's real bytes (heap + stack + off-heap) |
+//! | `binary` | a list of `{Ptr, Size, Refc}` 3-tuples for the process's off-heap refc binaries (payload pointer as an integer, payload byte length, payload refcount); the empty list `[]` when the process holds none |
 //!
 //! ## Items this runtime honestly cannot answer (`unsupported`)
 //!
@@ -110,7 +111,6 @@
 //! | `async_dist` | no `async_dist` flag in [`beam_process::ProcessFlags`] |
 //! | `priority_messages` | no `priority_messages` flag in [`beam_process::ProcessFlags`] |
 //! | `garbage_collection_info` | [`beam_gc::HeapInfo`] tracks no per-generation block detail (the oracle's `old_heap_block_size`/`mbuf_size`/`recent_size`/`bin_vheap_block_size`/`bin_old_vheap_block_size` are unmeasured) |
-//! | `binary` | no process registers off-heap refc binaries in `Process::off_heap`; the engine holds them on `Machine::refc_binaries`, which this floor cannot enumerate |
 //!
 //! The **execution-position** items (`current_function`, `initial_call`, `current_location`,
 //! `current_stacktrace`) and `catchlevel` are therefore *conditionally* answerable rather
@@ -208,6 +208,7 @@ use beam_term::{make_small, Atom, Eterm, NIL};
 use super::RuntimeContext;
 use crate::config::MaxHeapFlags;
 
+mod binary;
 /// The C's `pi_1_keys[]` (`erl_bif_info.c:1008-1026`), in order — the item set *and* order
 /// `erlang:process_info/1` answers. `registered_name` is skipped when the process is
 /// unregistered (the C's `nil` skip), which is why the oracle emits 16 items.
@@ -270,6 +271,7 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
     "suspending",
     "last_calls",
     "memory",
+    "binary",
 ];
 
 /// The valid oracle item names this runtime cannot yet answer — a typed `unsupported`
@@ -285,7 +287,6 @@ const UNSUPPORTED_ITEMS: &[&str] = &[
     "async_dist",
     "priority_messages",
     "garbage_collection_info",
-    "binary",
 ];
 
 /// Why each item in [`UNSUPPORTED_ITEMS`] cannot be answered — the precise missing
@@ -327,11 +328,6 @@ const UNSUPPORTED_ITEM_REASONS: &[(&str, &str)] = &[
         "`beam_gc::HeapInfo` tracks no per-generation block detail: the oracle's \
          `old_heap_block_size`/`mbuf_size`/`recent_size`/`bin_vheap_block_size`/\
          `bin_old_vheap_block_size` are not measured by the collector",
-    ),
-    (
-        "binary",
-        "no process registers off-heap refc binaries in `Process::off_heap`: the engine holds \
-         them on `Machine::refc_binaries`, which this floor cannot enumerate",
     ),
 ];
 
@@ -476,6 +472,12 @@ struct Snapshot {
     policy: beam_gc::HeapPolicy,
     /// The off-heap (MSO + refc binary) overhead, in bytes.
     off_heap_bytes: usize,
+    /// The process's **live owned off-heap refc binaries**, in slot order, each as
+    /// `(payload pointer, payload byte length, payload refcount)` — the value behind the
+    /// `binary` item ([`RuntimeContext::binary_value`]). Copied out of
+    /// [`Process::off_heap_binaries`](beam_process::Process::off_heap_binaries) so the reply
+    /// can be built after the process table borrow ends.
+    off_heap_binaries: Vec<(usize, usize, usize)>,
 }
 
 /// The atom name of a boolean flag value (`true` / `false`).
@@ -801,6 +803,9 @@ impl RuntimeContext<'_> {
             // runtime runs: it never saves calls, so there is no `call`-flag call list to
             // report. Not a placeholder — the true value.
             "last_calls" => self.atom("false")?,
+            // The process's off-heap refc binaries as the oracle's `[{Ptr, Size, Refc}, …]`
+            // roster (the empty list when it owns none) — see [`Self::binary_value`].
+            "binary" => self.binary_value(snapshot)?,
             "memory" => make_small(
                 ((snapshot.total_heap_size + snapshot.stack_size) * 8 + snapshot.off_heap_bytes)
                     as i64,
@@ -948,6 +953,10 @@ impl RuntimeContext<'_> {
             minor_gcs: process.collector().minor_gcs(),
             policy: process.collector().policy().clone(),
             off_heap_bytes: process.off_heap().overhead_bytes(),
+            off_heap_binaries: process
+                .off_heap_binaries()
+                .map(|binary| (binary.data_ptr() as usize, binary.len(), binary.refcount()))
+                .collect(),
         })
     }
 

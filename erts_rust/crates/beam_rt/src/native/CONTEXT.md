@@ -255,7 +255,10 @@ the essentials:
   {minor_gcs,N}]`, `beam_gc::GARBAGE_COLLECTION_KEYS` order) and its three
   `min_heap_size`/`min_bin_vheap_size`/`fullsweep_after` components, `max_heap_size` (the flag
   **map**), `message_queue_data`, `trace`, `sequential_trace_token`, `suspending`, `last_calls`,
-  `memory`.
+  `memory`, `binary` (the process's **live owned** off-heap refc binaries —
+  `Process::off_heap_binaries`, released slots skipped — as a list of `{Ptr, Size, Refc}`
+  3-tuples: the payload pointer as an integer, its byte length and its total refcount; the empty
+  list `[]` when it owns none).
 * **The execution-position items** (`current_function`/`initial_call`/`current_location`/
   `current_stacktrace`) and `catchlevel` are read from the process's saved instruction pointer
   through the engine's read-only accessors (`beam_engine::Machine::current_function`/`initial_call`/
@@ -275,11 +278,8 @@ the essentials:
   `magic_ref` (the NIF resource API is unbound, so no resource is bound into a process),
   `parent`/`label` (no such PCB field), `async_dist`/`priority_messages` (no such
   `beam_process::ProcessFlags`), `garbage_collection_info` (`beam_gc::HeapInfo` measures no
-  per-generation block sizes), `binary` (`beam_alloc::RefcBinary` has `refcount()`/`len()`/
-  `data_ptr()`, but no process registers off-heap refc binaries in `Process::off_heap` — the engine
-  holds them privately on `Machine::refc_binaries` — so the `[{Ptr,Size,Refc},…]` roster cannot be
-  built). An item this runtime cannot answer is **omitted** by `/1` (the C's own mechanism for an
-  unregistered `registered_name`).
+  per-generation block sizes). An item this runtime cannot answer is **omitted** by `/1` (the
+  C's own mechanism for an unregistered `registered_name`).
 * **Documented divergences** (correct-but-different-by-construction — do NOT "fix" to a hardcoded
   figure): `/1` emits 15 (registered) / 14 (unregistered) items where the oracle emits 17/16 for a
   process with no readable execution position (the two engine keys); `heap_size` agrees with the
@@ -290,7 +290,8 @@ the essentials:
   (`runnable`/`waiting`/`suspended`/`exiting`) otherwise; `group_leader` is the process's own
   (`Runtime::group_leader_of`, default the root pid, set by `erlang:group_leader/2`, inherited on
   spawn) — this runtime's real pid, not the oracle's `<0.70.0>` io process; `reductions` is this
-  process's real counter; `error_handler` (the atom `error_handler`) and `suspending` (`[]`) are
+  process's real counter; `binary`'s `Ptr`/`Refc` are this runtime's own payload addresses and
+  reference counts (only the `{Ptr, Size, Refc}` shape is shared with the oracle); `error_handler` (the atom `error_handler`) and `suspending` (`[]`) are
   unchanging runtime defaults whose reported facts are true of this runtime;
   `message_queue_data` is `on_heap` — this runtime's real current placement
   (`beam_message::Queue` is heap-resident) — and the one divergence is an **explicit**
