@@ -540,15 +540,20 @@ whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_
 per-call/per-element/per-op rows are snapshots of the term-copy / per-element dispatch / GC cost and should be
 re-run via the Runbook rather than adjusted.
 
-## Known Issue — rust peak RSS scales with the loop count `N`
+## Known Issue — rust peak RSS still scales with the loop count `N` on some paths
 
-`beam_rt` now has a **GC adoption** (`crates/beam_rt/src/runtime/gc.rs`, `context/gc.rs` — a per-process
-collector at the engine's heap-admission point), but it does **not bound peak RSS on the paths `bench`
-drives**: a controlled probe (a fresh list built and walked in a tail loop) reads rust peak `VmHWM`
-growing with `N` while the oracle stays flat. So the rust `foreign`/`list_walk`/`copy_bound`/`gc_bound`
-per-case `case_<name>_peak_rss_bytes` grows with the calibrated loop count and sits **above** the sys
-figures — these are **not** like-for-like memory comparisons. `slice` (one call per process, `N`=1) is the
-comparable per-process memory metric. The figures are in `RESULTS.md`.
+`beam_rt` has a per-process collector at the engine's heap-admission point (`crates/beam_rt/src/runtime/gc.rs`,
+`context/gc.rs`) and the m10 BIF-result copy-out + pooled-heap rewind (`crates/beam_rt/src/context/calls.rs`)
+bounds the **BIF-churn** shape, so `gc_bound`'s and `list_walk`'s rust peak RSS now sit **below** the oracle's
+(m10: 15.40 / 15.32 MiB p50 vs sys 66.77 / 66.43 MiB). But the bound is **not** universal:
+- `copy_bound`'s `ets_copy` row still reaches **90.30 MiB** rust at `N` = 100 000 vs sys 66.26 MiB (it was
+  75.93 MiB at m9 — it *rose*), and the two `foreign` `cowboy_bstr` cases still track their `N`
+  (73.8–76.4 MiB rust at `N` = 15 000–20 000 vs sys 66.4 MiB).
+
+So the rust `foreign`/`copy_bound` per-case `case_<name>_peak_rss_bytes` is **not** a like-for-like memory
+comparison, and the loop-length-dependent rust RSS rows are listed in `RESULTS.md` §8 (items 5 onward).
+`slice` (one call per process, `N`=1) remains the comparable per-process memory metric. The figures are in
+`RESULTS.md` §3.3/§3.6/§6.7.
 
 ## Honesty audit — measurement-integrity notes (current state)
 
