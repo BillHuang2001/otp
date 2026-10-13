@@ -17,8 +17,12 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   prologue that binds the literal area and records the entry call), **`Machine::step_instruction`** (the one-instruction
   dispatcher — also the JIT deopt target — which wraps the body `step_instruction_inner` with the uniform raise
   funnel, see below), `return_step`, `resolve_call_ext_apply` (the `erlang:apply/3` special case — C's
-  `fixed_apply`→`apply()`), `resolve_external_entry` (the `call_ext*` cross-module seam), `apply_import_target` +
-  `ImportFrame` (the arm's own frame discipline over a resolved target).
+  `fixed_apply`→`apply()`), `resolve_call_ext_send` (the `erlang:send/2` / `'!'/2` off-heap-aware send),
+  `resolve_external_entry` (the `call_ext*` cross-module seam), `call_ext_dispatch` (the single shared body of the
+  three `call_ext*` arms — see below), `apply_import_target` + `ImportFrame` (the arm's own frame discipline over a
+  resolved target). `ImportFrame` is `pub(crate)` and re-exported from `mod.rs` as
+  `crate::interpreter::ImportFrame` (its variants inherit that visibility, so a sibling module can name
+  `crate::interpreter::ImportFrame::Call`).
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
   (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families — `families::funs::apply_target`
   for an applied-target host BIF error, and `families::funs::call_fun` for the closure-apply fallback),
@@ -28,12 +32,38 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
 - `trace.rs` — the contract-A.8 `call`/`return_from`/`return_to` emission (gated on `Machine::trace_on`).
 - `tests.rs` — the unit tests migrated from the former single-file `interpreter.rs`.
 
+### The shared `call_ext*` entry point (`Machine::call_ext_dispatch`)
+The three `call_ext*` forms differ **only** in their frame discipline, so their whole arm body lives in one method
+whose signature is frozen for a sibling module (`crate::jit`) to drive:
+```rust
+pub(crate) fn call_ext_dispatch(
+    &mut self, module: &Module, labels: &LabelMap, target: ImportRef, arity: u32,
+    func: u32, pc: u32, frame: ImportFrame, ctx: &mut dyn ExecutionContext,
+    seam: Option<Option<(u32, u32, u32)>>,
+) -> StepResult;   // `StepResult` = `Result<Step, Box<BeamError>>` (the crate-internal hot step result)
+```
+Its resolution order is the arms' historical order: `resolve_call_ext_apply` (the `erlang:apply/3` special case and
+the cross-module call seam), then `resolve_call_ext_send`, then the host's cross-module seam, then the synchronous
+`call_import` BIF route — the last one marshalled with the **instruction's own `arity` operand**, never the import
+table's arity (the seam's own resolution uses the table's). The resolved `ApplyTarget` is then handed to
+`apply_import_target` with the arm's `frame`, which is the only place the three forms diverge; every error is the
+shared catch-aware `raise_bif_error`.
+- `seam` is how a caller that has **already** consulted the host's cross-module seam for this import reports its
+  answer: `None` = "resolve it here" (through `resolve_external_entry`), `Some(None)` = "the host declined" (skip
+  straight to the BIF route, never re-asking), `Some(Some((context, func, pc)))` = the host's callee, entered
+  verbatim. The three `step_instruction` arms always pass `None`, so an interpreted `call_ext*` is byte-identical to
+  the pre-hoist arm bodies.
+- Each arm keeps its own tracing (`trace_call_import`) **before** delegating, so contract A.8 emission order is
+  unchanged.
+
 ## Instruction ownership
 - **Core arms executed inline in `step_instruction`** (`dispatch.rs`): the metadata no-ops (`Label`, `Line`,
   `IntCodeEnd`, `ExecutableLine`, `DebugLine`, `NifStart`, `OnLoad`); `FuncInfo`; `Move`/`Swap`/`InitYregs`;
   `Test`; `SelectVal`; `Jump`; `GcBif`/`Bif`/`Bif0`; `Call`/`CallLast`/`CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`
-  (each `CallExt*` arm first special-cases an `erlang:apply/3` import through `resolve_call_ext_apply`, and otherwise
-  resolves the callee through the `call_ext*` cross-module seam);
+  (each `CallExt*` arm traces the callee's entry and then delegates its whole body to `Machine::call_ext_dispatch`,
+  which runs the ordered resolution — the `erlang:apply/3` special case + the cross-module call seam, the
+  `erlang:send/2` seam, the host's cross-module seam, the synchronous BIF route — and applies the form's
+  `ImportFrame`);
   `Allocate`/`AllocateHeap`/`TestHeap`/`Deallocate`/`DeallocateReturn`/`Trim`; `Return`; `Generic`.
 - **Everything else** falls to the catch-all `other => families::dispatch(...)` arm → the single owning family (tuples,
   records, lists, funs, exceptions, floats, maps, bitstrings, receive); an unclaimed or declined variant is the typed
@@ -73,7 +103,8 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction`.
 
 ## Routing Table
-- `dispatch.rs` → the dispatcher + run entries; `Machine::step_instruction` is the JIT helper's deopt target.
+- `dispatch.rs` → the dispatcher + run entries; `Machine::step_instruction` is the JIT helper's deopt target, and
+  `Machine::call_ext_dispatch` + `ImportFrame` are the shared `call_ext*` body a tier drives.
 - `bif.rs` → BIF operand marshalling + the fail-label/raise split (cross-ref `../context.rs` `ExecutionContext::call_bif`).
 - `test.rs` → `TestKind` evaluation (raw type tests live in `../predicates.rs`).
 - `mod.rs` → `LabelMap`/import resolution (the label+import index every run entry builds).

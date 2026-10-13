@@ -57,6 +57,13 @@ mod tests;
 // The one definition of the failed-clause `function_clause` raise, shared with the
 // instruction families (the maps read path's absent-key `NO_FAIL` branch).
 pub(crate) use dispatch::raise_function_clause_no_fail;
+// The frame discipline of the `call_ext*` forms, shared with a sibling module that
+// drives `Machine::call_ext_dispatch` for a given form. Its consumer is the JIT tier
+// (`crate::jit`), so the import is not itself "used" by anything in this module today
+// — hence the `allow` (the same idiom `families/bitstrings/matching` uses for its
+// path-stability re-exports).
+#[allow(unused_imports)]
+pub(crate) use dispatch::ImportFrame;
 // The `tests` submodule is moved verbatim from the former single-file
 // `interpreter.rs`; it relies on `use super::*` for the names that file had in
 // scope, so the ones not otherwise needed here are imported test-only.
