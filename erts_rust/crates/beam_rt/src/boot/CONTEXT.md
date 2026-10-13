@@ -202,6 +202,30 @@ because it cannot be duplicated.
    The served device surface and the full gap list are itemised in `../native/CONTEXT.md`.
 3. **`beam_bifs`.** Whatever the started applications still need past the above.
 
+## The system code path resolution (`../codeserver.rs`)
+`CodeServer::add_system_paths` resolves the *system* ebin set through `codeserver.rs::resolve_system_ebins`:
+`$ERTS_STDLIB_DIR` when set, else the native filesystem probe `native_system_ebins` (over `native_roots` /
+`system_ebins_under`), else the `erl` shell-out `erl_system_ebins` as the documented **last resort**
+(`erl -noshell -eval 'code:lib_dir(...)'`).
+The native probe reads the *standard OTP installation layout* — `<root>/lib/<app>-<vsn>/ebin`, or an OTP
+source tree's `<root>/lib/<app>/ebin`, and the `erts` application at `<root>/lib/erts-<vsn>/ebin`,
+`<root>/erts-<vsn>/ebin` or `<root>/erts/preloaded/ebin`. A candidate root is accepted only when it really
+holds the probe module (`lists.beam` decides — stdlib is the hard requirement, `kernel`/`erts` are
+best-effort, exactly as in the oracle's answer), and the directories keep the `SYSTEM_APPS` order
+(`stdlib`, `kernel`, `erts`).
+Candidate roots, most specific first: the `erl` on `$PATH` — **resolved to a filesystem path and never
+executed**, so the installation this runtime is meant to be interchangeable with wins — then this
+executable's ancestors (an OTP source tree above `erts_rust/target/…`), then `$ERL_TOP`, then
+`/usr/lib/erlang`, `/usr/local/lib/erlang`, `/usr/lib64/erlang`, `/opt/erlang`; every seed is also tried as
+`<seed>/lib/erlang` (the `--prefix` release root, e.g. the Nix store layout).
+The `erl` shell-out is kept because no filesystem probe can see *every* installation: a version manager
+(`asdf`, `kerl`) may expose a **shim script** on `$PATH` while keeping the release under a layout reachable
+from neither the shim nor this executable, and a wrapper `erl` may live outside the release it starts.
+Asking `erl` is authoritative, and a path is never fabricated: if neither probe produces a stdlib the
+resolution fails with the typed `cannot locate the system code path: …` error (exit 1). Consequence: a
+normal installation pays **no** `erl` start-up (measured on this host: `run …slice.beam slice:add/2 2 3` in
+0.116 s total, where the spawn alone costs ≈0.5 s).
+
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
   one is the oracle's bare `error:undef`); the preloaded `.beam`s ship in the **erts** application's

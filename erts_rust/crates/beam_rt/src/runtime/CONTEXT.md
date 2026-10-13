@@ -57,11 +57,12 @@ The pass runs the **port-less** `Scheduler::run_ready` (its port half, `Runtime:
 accepting node (`dispatch_dist_inbound` → `dist::DistNode::dispatch_inbound`) and the connector
 (`dispatch_dist_client_inbound` → `dist_client::DistClient::dispatch_inbound`) — drain each link through
 `beam_dist::ConnectionDriver::dispatch_inbound_checked`, so a control message is checked against **that**
-link's own `peer_name()`/`our_name()` identity before it can reach a mailbox: `beam_dist`'s
-`Delivery::classify_validated` reproduces the C's per-opcode `invalid_message` shape checks (`dist.c`)
-plus the per-link anti-spoof check `dep != external_pid_dist_entry(from)`. The identity is interned into
-the **same** `AtomTable` the message was decoded against, so the node comparison is a raw term `==`. A
-validation failure is an `Err` — a **link-level** failure: the drive retires (kills) **just that link**
+link's own `peer_name()`/`our_name()` identity (the per-link `LinkIdentity`) before it can reach a
+mailbox: `beam_dist`'s `Delivery::classify_validated` reproduces the C's per-opcode `invalid_message`
+shape checks (`dist.c`) plus the per-link anti-spoof check `dep != external_pid_dist_entry(from)`. The
+identity is interned into the **same** `AtomTable` the message was decoded against, so the node
+comparison is a raw term `==`. A validation failure is an `Err` — a **link-level** failure that never
+reaches `beam_dist::InboundSink`: the drive retires (kills) **just that link**
 and records the reason in `DistNode::last_link_error`, the C's `invalid_message` connection kill, never a
 pass failure. The check cannot live in `LocalDeliverySink`: one sink is built per pass and shared by
 every link, so it has no peer to compare a `From` against.
@@ -93,6 +94,45 @@ records the honest gap. Evidence for the validated path: `../../tests/dist_deliv
 "(6b) Every inbound delivery is validated against **its own link**" — a forged `DOP_REG_SEND` (`From` a
 non-pid) and a `DOP_LINK` whose `From` names a third node are each refused, reach no mailbox and retire
 their link with a recorded `last_link_error`, while a well-formed message on the same link still delivers.
+
+### The node's public surface (both halves)
+`DistNode` is the *accepting* half: `start(configured, cookie)` **binds** a wildcard listener
+(`DIST_LISTEN_ADDR`, OS-assigned port; an unbindable address is a start-up error) and the first `pump()`
+**publishes** the node to `epmd` (`ALIVE2_REQ`). Accessors: `node_name()`/`advertised_name()`/`epmd_name()`/
+`is_short_name()`/`port()`/`creation()`/`is_registered()`/`is_alive()`/`registration_error()` (recorded,
+never raised)/`connections()`/`is_idle()`/`last_link_error()`. `NodeName::parse` splits a `-name`/`-sname`
+value into `full`, `advertised` (the full `node@host` name in **both** cases — a peer resolves it with
+`list_to_existing_atom/1` and aborts on a bare short name) and `epmd` (the short name for `-sname`,
+verbatim for `-name`; a bare value's host is `local_hostname()`); `resolve_cookie(init_args)` is
+`-setcookie`, else `$HOME/.erlang.cookie`, else `nocookie`. `DistConnection` wraps one accepted socket in
+a **server-side** `beam_dist::ConnectionDriver` (`'N'` → `'s'`/`'S'` → `'r'` → `'a'`); `pump()` registers
+once, accepts up to `MAX_ACCEPTS_PER_PUMP` (8) connections non-blocking, then steps every link under a
+per-link `DIST_READ_SLICE` (25 ms) read timeout, so one pump can never stall the scheduler (a link's
+protocol/write failure **retires** it and records why). The scheduler pass drives it from
+`Runtime::dispatch_dist_inbound`, **gated by `Runtime::inbound_delivery`** (default **ON**); the pass
+early-returns unless the runtime **is** a distribution node **and** that node has an established link, so a
+`nonode@nohost` run pays one bool test per pass and allocates nothing.
+The **envelope rule**: the mailbox `from` is always an **immediate** (`envelope_from` — the sender peer's
+node atom when the wire carried a sender pid, otherwise the word the peer put on the wire, `''` for the
+plain `DOP_SEND*` forms); a non-immediate is refused, because `beam_message` gathers only each queued
+message's payload as a GC root. `LocalDeliverySink` (`&mut ProcessTable` + this node's identity) routes
+`Delivery::Send`/`RegSend` through `ProcessTable::deliver_simple` (which wakes a blocked receiver; an
+unregistered name / a non-pid `to` follow the oracle's RegSend/Send arms) and `Delivery::AliasSend`
+through the table's alias resolution (consuming a `reply_demonitor` alias after a successful delivery; an
+unknown/inactive reference is the oracle's silent drop), plus the **plain** `Delivery::AltactSigSend`
+message sub-cases.
+
+`DistClient` / `ClientLink` / `DistClientInner` / `DistRouter` (`../dist_client.rs`) are the *connecting*
+half: `connect`/`connect_addr` dial a peer and run the **client** `beam_dist::ConnectionDriver` handshake
+(`DIST_CONNECT_TIMEOUT`); `pump` is the one place a live `DOP_*` is encoded (atom-table encode + socket
+write), with `send_reg_send`/`send_message_pid`/`is_connected_to_node`/`connected_nodes`/`last_error` as
+its accessors; `DistRouter` implements `beam_process::DistSignalRouter` — it materialises a signal's terms
+on a stable scratch heap and queues `{node, Dop, args}`, which `pump` then drains — and is installed on
+the **`ProcessTable`** (`../runtime.rs`), not the `Runtime`, because the table is moved out for every pass.
+There is **no** `{setup,…}`/`{nodeup,…}` control exchange in OTP distribution: after the final `$a`
+handshake ACK the link carries `DOP_*` immediately, and node-up is local bookkeeping
+(`net_kernel:mark_nodeup`). Driven from `Runtime::pump_dist_client` and
+`Runtime::dispatch_dist_client_inbound`.
 
 ## Test Strategy
 * **In-file `#[test]` inventory (this node = 59):** `../runtime.rs` 20 (inline `mod tests`), `scheduler.rs` 2 (the `quiescence_and_port_table_tests` module) + `scheduler/tests.rs` 20, `gc.rs` 7, `ets_owner.rs` 10; plus `ets_owner.rs`'s four `#[cfg(test)]`-only accessors. The sibling `../runner/tests.rs` adds 33 (its own node).
