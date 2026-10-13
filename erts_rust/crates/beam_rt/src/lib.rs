@@ -48,9 +48,13 @@
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
 //!   `erlang:apply`, `erlang:system_info`, `init:get_argument`) consulted before the registry.
-//! * [`dist`] — the **distributed node** (contract A.5, Phase 1): the `epmd`
-//!   registration, the bound distribution listener and the accepting half of the
-//!   `'N'` handshake, pumped from [`Runtime`]'s scheduler pass.
+//! * [`dist`] — the **distributed node** (contract A.5): the `epmd`
+//!   registration, the bound distribution listener, the accepting half of the
+//!   `'N'` handshake and the inbound delivery sink, pumped from [`Runtime`]'s
+//!   scheduler pass.
+//! * [`dist_client`] — the **connecting** half (contract A.5): the outbound client
+//!   handshake and the `beam_process::DistSignalRouter` that turns a
+//!   locally-initiated link/monitor/exit into wire `DOP_*`.
 //!
 //! # Contracts
 //!
