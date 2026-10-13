@@ -41,20 +41,18 @@ later same-size insert silently reuses (a wrong, well-formed result).
 - Errors are `beam_common::Result`/`BeamError`; the scratch retry loop retries **only**
   `Alloc(Heap)` exhaustion and returns every other error untouched (no swallowing).
 
-## Known Issues (escape hatches — the layer is NOT fully airtight)
-- `TableWrite::as_requester` (write.rs) hands out a `TableAccess<'_>` whose methods (`lookup`,
-  `tab2list`, `first`, …) return bare `Eterm`s aliasing table storage; those can be returned out
-  of a `with_write` closure (`T = Result<Vec<Eterm>>`, independent of the view lifetime). It is
-  documented as a "Residual hazard", but it bypasses the lifetime discipline and can reproduce
-  the very wrong-result hazard the views exist to prevent.
-- `TableWrite::heir` returns `Option<Heir>` whose `data: Option<Eterm>` (`table/ownership.rs`)
-  may be a **table-owned copy** (the `install_heir`/creation-time path), so a bare aliasing
-  `Eterm` escapes the guard; replacing the heir later reclaims those words.
+## Known Issues (a deliberate escape hatch)
+- `TableWrite::as_requester` (write.rs) is the crate's **raw access-enforcement seam**, and it is
+  deliberately **not** lifetime-tagged: it exists only so an access-checked operation is reachable
+  from a shared-table view (the tagged `TableRead` is owner-level, with no `requester` concept), and
+  its READ results are bare `Eterm`s aliasing table storage — a caller can return one out of a
+  `with_write` closure (`T = Result<Vec<Eterm>>`, independent of the view lifetime), and a later
+  same-word-size insert silently recycles its words. The airtight path for reads stays
+  `TableRead`/`TableTerm` + `copy_into`, and only what is copied out under the guard may be kept.
+  Pinned as the residual hazard by `as_requester_reads_are_a_documented_residual_hazard`.
 - Views are `!Send` in fact — but because `std`'s `RwLockReadGuard`/`RwLockWriteGuard` are `!Send`
   (and `TableRead` also carries a `!Send` `beam_alloc::Heap`), **not** because "they carry a
   scratch Heap": `TableWrite` has no scratch heap. No test pins the views' `!Send`.
-- `read.rs` uses `expect("scratch ensured above")` (in `run_with_scratch`/`copy_out`) — a
-  panic-on-invariant on a runtime path.
 
 ## Test Strategy
 - Inline `#[cfg(test)]`: `tests.rs` (the hazard + fix, view reads/writes, exact shapes) and
