@@ -78,6 +78,36 @@
 //! (`io:format("~tc",[1114112])` ⇒ `error:badarg`), while a valid scalar is written
 //! as its UTF-8 encoding (`io:format("~tc",[16#10FFFF])` ⇒ `F4 8F BF BF`).
 //!
+//! # `~ts`: the unicode string (decoded, not raw bytes)
+//!
+//! `~t` sets the directive's encoding to `unicode`
+//! (`io_lib_format:collect_cseq/2`; see [`Spec::unicode`]), which changes what
+//! `~s` renders: the oracle's `control_limited($s, …, unicode, …)` runs
+//! `cdata_to_chars/1` + `uniconv/1` in place of `iolist_to_chars/1`. The
+//! **plain** (unlimited, `CharsLimit < 0`) `cdata_to_chars/1` walk is reproduced
+//! here ([`cdata_chunk`]):
+//!
+//! * a **binary** is *decoded* as UTF-8 (`unicode:characters_to_list/1`) — so
+//!   `io_lib:format("~ts",[<<230,151,165>>])` ⇒ `[[26085]]`, not the raw bytes
+//!   `[[230,151,165]]` — and falls back to `binary_to_list/1` (the raw bytes)
+//!   when it is not valid UTF-8 (`<<200,201>>` ⇒ `[[200,201]]`);
+//! * a **list** keeps its nesting: a non-integer element recurses into a
+//!   sub-list, so `io_lib:format("~ts",[[<<230,151,165>>,100]])` ⇒
+//!   `[[[26085],100]]`;
+//! * a **non-negative integer** element is emitted verbatim (no upper bound —
+//!   `400`, the surrogate `55296` and a bignum all pass);
+//! * a negative integer, a float, a tuple, an improper tail, a non-byte-aligned
+//!   bitstring and a bare non-list/non-binary argument are the oracle's
+//!   `function_clause`, i.e. `badarg`.
+//!
+//! `~ts` of an **atom** is unaffected: an atom is a *small* control
+//! (`control_small($s, [A], …, unicode) when is_atom(A)`) and stays
+//! `string(atom_to_list(A), …)` — `io_lib:format("~ts",[abc])` ⇒ `[97,98,99]`.
+//!
+//! `~ts` under an active `{chars_limit, N}` (the grapheme-cluster-limited
+//! `cdata_to_chars/3` walk) is **not** this algorithm and stays the typed,
+//! catchable [`unsupported_bif`] — see [`render_limited_s`].
+//!
 //! Every integer directive — `~b`/`~B`, `~x`/`~X`, `~+`/`~#` — renders an
 //! **arbitrary-precision** integer: the digits come from the shared
 //! [`crate::numeric::integer_digits`] renderer (the same one `integer_to_list/2`
@@ -1440,22 +1470,27 @@ fn is_deep_char(term: Eterm) -> bool {
 /// **atom** is, so pass 1 of the limited path splices it flat while a list or a
 /// binary is captured for [`render_limited_s`].
 fn string_piece(ctx: &BifContext<'_>, arg: Eterm, spec: &Spec) -> Result<Piece> {
-    let (text, small) = string_arg(ctx, arg)?;
-    let chunk = string_field_chunk(text, spec.width, spec.left, spec.precision, spec.pad)?;
+    let (chunk, small) = string_arg(ctx, arg, spec.unicode)?;
+    let chunk = string_field_chunk(chunk, spec.width, spec.left, spec.precision, spec.pad)?;
     Ok(Piece { chunk, small })
 }
 
-/// Renders the `~s` argument: an atom's name, a proper list of byte-sized small
-/// integers, or a binary's bytes.
+/// Renders the `~s` argument: an atom's name, or — under the `latin1` encoding —
+/// a proper list of byte-sized small integers or a binary's bytes, or — under the
+/// `unicode` (`~ts`) encoding — the [`cdata_chunk`] walk of
+/// `io_lib_format:cdata_to_chars/1`, which *decodes* a binary as UTF-8.
 ///
 /// Also reports whether the control is "small": only `~s` of an **atom** is
-/// (`io_lib_format:control_small/7` has a clause for atoms alone), so a list or a
-/// binary is inserted as a single sub-list element while an atom's characters are
-/// spliced flat.
-fn string_arg(ctx: &BifContext<'_>, arg: Eterm) -> Result<(Chunk, bool)> {
+/// (`io_lib_format:control_small/7` has a clause for atoms alone — for both
+/// encodings), so a list or a binary is inserted as a single sub-list element
+/// while an atom's characters are spliced flat.
+fn string_arg(ctx: &BifContext<'_>, arg: Eterm, unicode: bool) -> Result<(Chunk, bool)> {
     if is_atom(arg) {
         let name = ctx.atoms().name(atom_val(arg)).ok_or_else(badarg)?;
         return Ok((Chunk::text(name), true));
+    }
+    if unicode {
+        return Ok((cdata_chunk(arg)?, false));
     }
     if bits::is_bitstring(arg) {
         if !bits::is_binary(arg) {
@@ -1467,6 +1502,166 @@ fn string_arg(ctx: &BifContext<'_>, arg: Eterm) -> Result<(Chunk, bool)> {
     }
     let elems = proper_list(arg).ok_or_else(badarg)?;
     Ok((Chunk::text(&byte_string(&elems)?), false))
+}
+
+/// `io_lib_format:cdata_to_chars/1` — the **plain** (unlimited) unicode rendering
+/// of a `~ts` argument, as the chunk tree the oracle's nesting implies.
+///
+/// ```text
+/// cdata_to_chars([C|Cs]) when is_integer(C), C >= $\000 -> [C | cdata_to_chars(Cs)];
+/// cdata_to_chars([I|Cs]) -> [cdata_to_chars(I) | cdata_to_chars(Cs)];
+/// cdata_to_chars([]) -> [];
+/// cdata_to_chars(B) when is_binary(B) ->
+///     try unicode:characters_to_list(B) of L when is_list(L) -> L;
+///         _ -> binary_to_list(B) catch _:_ -> binary_to_list(B) end.
+/// ```
+///
+/// The nesting is **kept**: a non-integer element recurses into a sub-list, so
+/// `~ts` of `[<<230,151,165>>,100]` is `[[26085],100]` — and the directive's own
+/// result is one further sub-list element of the output list
+/// (`[[[26085],100]]`).
+///
+/// # Errors
+///
+/// `badarg` (the oracle's `function_clause`) for a negative integer, a float, an
+/// atom, a tuple, an improper tail, a byte-aligned-ness failure, and for the bare
+/// non-list/non-binary argument itself (`~ts` of an integer or a tuple).
+fn cdata_chunk(term: Eterm) -> Result<Chunk> {
+    if bits::is_bitstring(term) {
+        // The only binary clause is guarded by `is_binary/1`; a non-byte-aligned
+        // bitstring matches no clause at all.
+        if !bits::is_binary(term) {
+            return Err(badarg());
+        }
+        return Ok(Chunk::List(cdata_binary_chars(&bits::bytes(term)?)));
+    }
+    let mut items = Vec::new();
+    let mut cursor = term;
+    loop {
+        if is_nil(cursor) {
+            return Ok(Chunk::List(items));
+        }
+        if !is_list(cursor) {
+            // Neither `[]` nor a cons — a bare integer, float, tuple or atom:
+            // `cdata_to_chars/1` has no clause for it.
+            return Err(badarg());
+        }
+        items.push(cdata_element(car(cursor))?);
+        cursor = cdr(cursor);
+    }
+}
+
+/// One element of `cdata_to_chars/1`'s list clause.
+///
+/// `head` is either the non-negative integer the first clause emits verbatim, or
+/// anything the second clause recurses into — `[cdata_to_chars(I) | …]` — keeping
+/// `I`'s own nesting (a sub-list for a list, the decoded/fallback bytes for a
+/// binary). A recursion into a negative integer, a float, a tuple or an atom is
+/// the oracle's `function_clause`.
+fn cdata_element(head: Eterm) -> Result<Chunk> {
+    if let Some(chunk) = cdata_integer_chunk(head) {
+        return Ok(chunk);
+    }
+    cdata_chunk(head)
+}
+
+/// The chunk for `C` when it is a non-negative integer (the oracle's first
+/// `cdata_to_chars/1` clause), `None` for anything else — including a **negative**
+/// integer, which the second clause recurses into and so raises.
+///
+/// A valid Unicode scalar becomes a [`Chunk::Char`] (so a `\n`/`\t` element keeps
+/// feeding the running indentation the way `io_lib_format:indentation/2` reads it);
+/// every other non-negative integer — the surrogate `55296`, `1114112`, and any
+/// bignum — is carried verbatim as a [`Chunk::Int`], with no upper bound.
+fn cdata_integer_chunk(term: Eterm) -> Option<Chunk> {
+    if !is_nonneg_integer(term) {
+        return None;
+    }
+    if is_small(term) {
+        if let Some(c) = u32::try_from(signed_value(term)).ok().and_then(char::from_u32) {
+            return Some(Chunk::Char(c));
+        }
+    }
+    Some(Chunk::Int(term))
+}
+
+/// `is_integer(T)` **and** `T >= 0` — the oracle's
+/// `cdata_to_chars([C|Cs]) when is_integer(C), C >= $\000` guard.
+///
+/// A bignum is never zero (`external.c` strips its leading digits), so its sign
+/// decides: a negative bignum takes the oracle's second clause and raises, a
+/// positive one is emitted verbatim.
+fn is_nonneg_integer(term: Eterm) -> bool {
+    if is_small(term) {
+        return signed_value(term) >= 0;
+    }
+    match big_parts(term) {
+        Ok((negative, _)) => !negative,
+        Err(_) => false,
+    }
+}
+
+/// `cdata_to_chars/1`'s binary clause: `unicode:characters_to_list(Bin)`'s code
+/// points when the whole binary is valid UTF-8, else `binary_to_list(Bin)` — the
+/// raw bytes.
+///
+/// `characters_to_list/1` returns an `{error|incomplete, _, _}` tuple for **any**
+/// invalid or truncated UTF-8 — an overlong sequence, a surrogate (the CESU-8
+/// `0xED 0xA0 0x80`), a code point past `16#10FFFF`, a stray continuation byte, a
+/// 5/6-byte lead, or a truncated trailing sequence, which poisons the whole image
+/// even when a valid prefix decoded — and the oracle's `of L when is_list(L)` then
+/// falls through to `binary_to_list/1`.
+fn cdata_binary_chars(bytes: &[u8]) -> Vec<Chunk> {
+    match decode_utf8_strict(bytes) {
+        Some(scalars) => scalars.into_iter().map(Chunk::Char).collect(),
+        None => bytes.iter().map(|&b| Chunk::Char(b as char)).collect(),
+    }
+}
+
+/// A strict UTF-8 decode: `Some` (the scalar values, in order) when the whole
+/// slice is well-formed UTF-8, `None` for any overlong, surrogate, out-of-range,
+/// stray or truncated sequence.
+///
+/// Reproduces the rule set `unicode:characters_to_list/1` applies (verified
+/// against erts-17.1 for the overlong, surrogate, `> 16#10FFFF`, 5/6-byte-lead,
+/// stray-continuation and truncated cases): the lead byte's range fixes the
+/// sequence length and its minimum code point, every continuation byte must be
+/// `10xxxxxx`, and surrogates are rejected.
+fn decode_utf8_strict(bytes: &[u8]) -> Option<Vec<char>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let lead = bytes[i];
+        if lead < 0x80 {
+            out.push(lead as char);
+            i += 1;
+            continue;
+        }
+        // `0x80..=0xC1` (continuations and the two overlong leads) and
+        // `0xF5..=0xFF` (including the 5/6-byte leads) are never lead bytes.
+        let (len, min) = match lead {
+            0xC2..=0xDF => (2usize, 0x80u32),
+            0xE0..=0xEF => (3, 0x800),
+            0xF0..=0xF4 => (4, 0x1_0000),
+            _ => return None,
+        };
+        if i + len > bytes.len() {
+            return None;
+        }
+        let mut code = u32::from(lead & (0x7F >> len));
+        for &cont in &bytes[i + 1..i + len] {
+            if cont & 0xC0 != 0x80 {
+                return None;
+            }
+            code = (code << 6) | u32::from(cont & 0x3F);
+        }
+        if code < min || code > 0x10FFFF || (0xD800..=0xDFFF).contains(&code) {
+            return None;
+        }
+        out.push(char::from_u32(code)?);
+        i += len;
+    }
+    Some(out)
 }
 
 /// Renders a proper list of byte-sized small integers as its latin1 string.
