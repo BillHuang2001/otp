@@ -204,7 +204,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   contention-immune** companion `case_list_walk_elements` = `N × LEN` (stays valid on a loaded host where
   the wall-clock rows do not). Each run's stdout is checked against the deterministic constant; a Rust exit
   `3` records the capability gap and emits **no** timing. `probe()` ⇒ `skipped(erlc-absent)` without `erlc`.
-- `copy_bound`: **the messaging / term-copy-bound metric** — the term-copy boundary run under *both* runtimes. One embedded `bench_copy_bound` module (generated from the crate's constants, so Rust and Erlang cannot drift) with three cases, each copying the **same structured payload** (a 5-key map) and validating the round-trip with a bound-variable pattern (a real equality test that raises on a corrupted copy): `etf_roundtrip` (`term_to_binary/1` + `binary_to_term/1` — the External Term Format wire codec, contract A.5); `ets_copy` (`ets:insert/2` + `ets:lookup/2` — the ETS copy boundary, one table+key per process so the measured work is the copy, not table growth); `send_recv` (a term sent to a second process, round-tripped through `term_to_binary/1` there, and sent back — **both directions** of the process copy boundary, with an `after` guard so a missing reply fails loudly, never hangs). It uses the shared startup-cancelled per-op recipe (run at `N` and at `0`, with a per-case per-runtime `N`; `etf_roundtrip` 5 000/1 500 000, `ets_copy` 100 000/2 000 000, `send_recv` 2 000/500 000 rust/sys; `--quick` ⇒ 3 runs/case, `--full` ⇒ 10), reporting `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, `case_<name>_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_<name>_ops` = `N`. A Rust exit `3` records the capability gap and emits **no** timing; an embedded-module compile failure is `failed(module-compile-failed)` (the source is ours), never a skip; `probe()` ⇒ `skipped(erlc-absent)` via the shared `slice::resolve_erlc()` lookup.
+- `copy_bound`: **the messaging / term-copy-bound metric** — the term-copy boundary run under *both* runtimes. One embedded `bench_copy_bound` module (generated from the crate's constants, so Rust and Erlang cannot drift) with three cases, each copying the **same structured payload** (a 5-key map) and validating the round-trip with a bound-variable pattern (a real equality test that raises on a corrupted copy): `etf_roundtrip` (`term_to_binary/1` + `binary_to_term/1` — the External Term Format wire codec, contract A.5); `ets_copy` (`ets:insert/2` + `ets:lookup/2` — the ETS copy boundary, one table+key per process so the measured work is the copy, not table growth); `send_recv` (a term sent to a second process, round-tripped through `term_to_binary/1` there, and sent back — **both directions** of the process copy boundary, with an `after` guard so a missing reply fails loudly, never hangs). It uses the shared startup-cancelled per-op recipe (run at `N` and at `0`, with a per-case per-runtime `N`; `etf_roundtrip` 5 000/1 500 000, `ets_copy` 100 000/2 000 000, `send_recv` 2 000/500 000 rust/sys; `--quick` ⇒ 3 runs/case, `--full` ⇒ 10), reporting `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, `case_<name>_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_<name>_ops` = `N`. A Rust exit `3` records the capability gap and emits **no** timing; an embedded-module compile failure is `failed(module-compile-failed)` (the source is ours), never a skip; `probe()` ⇒ `skipped(erlc-absent)` via the shared `slice::resolve_erlc()` lookup. **Attribution caveat:** `payload/0` is rebuilt inside every iteration (`src/workloads/copy_bound.rs:240`), and each iteration also runs the bound-variable equality match, so the `etf_roundtrip` per-op figure is the *whole iteration* (payload construction + `term_to_binary`/`binary_to_term` + the structural equality test), **not the codec alone** — the same shape holds for `ets_copy`/`send_recv`, and both runtimes pay the identical per-iteration setup.
 - `gc_bound`: **the GC-bound metric** — allocate-and-abandon garbage churn under *both* runtimes. One embedded `bench_gc_bound` module whose single `churn/1` case, per iteration, builds and abandons three `LEN`=256-sized structures — a pure-Erlang recursion list (`build_list/2`, *not* a native `lists:seq/2`), a 256-byte binary built from an Erlang-level char list, and a tuple built from another Erlang list — then checks the two O(1)-checkable ones (`byte_size`/`tuple_size`) so a silently-dropped allocation fails loudly. It uses the same shared startup-cancelled per-op recipe (run at `N` and at `0`; `n_rust` = 2 000, `n_sys` = 200 000; `--quick` ⇒ 3 runs, `--full` ⇒ 10), reporting `case_churn_wall_ms`, `case_churn_startup_ms`, `case_churn_peak_rss_bytes`, `case_churn_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_churn_ops` = `N`. The row measures the allocate-and-abandon wall time and **claims no collection count** (whether a runtime's collector runs during the loop is its own admission policy); a Rust exit `3` ⇒ an honest `skipped(unsupported-case)` with **no** timing, and a compile failure is `failed(module-compile-failed)`; `probe()` ⇒ `skipped(erlc-absent)` via `slice::resolve_erlc()`.
 
 ### Result JSON schema (stable — `SCHEMA_VERSION = 1`)
@@ -478,25 +478,24 @@ comparable per-process memory metric. The figures are in `RESULTS.md`.
 No workload returns a hard-coded or estimated metric; a workload that fails to build/run is always
 `failed`/`skipped`, never a number (verified across `src/workloads/*.rs`, `src/compare.rs`,
 `src/report.rs`, `src/runtime.rs`). No `todo!`/`unimplemented!`/non-doc `unreachable!`, no `#[ignore]`.
-Remaining labelling wrinkles — none fabricates a value:
 
-- **`foreign` maps an `erlc` compile failure to `skipped(sources-missing)`** (`src/workloads/foreign.rs:560`):
-  when the sources *are* present but `erlc` fails, the row is a skip (the staging note carries the error),
-  not `failed` — a real compile regression of the foreign sources can read as a benign skip. Contrast
-  `list_walk`, `copy_bound` and `gc_bound`, which treat the identical shape as `failed(module-compile-failed)`
-  (`src/workloads/list_walk.rs:509`, `copy_bound.rs`, `gc_bound.rs`), and `slice`, which maps a failed fixture
-  rebuild to `skipped(fixture-missing)` (`src/workloads/slice.rs:560`).
-- **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` divide the *attempted* file/LOC count** by the wall time
-  (`src/workloads/erlc_compiler.rs:296,300`: `total_files`/`total_loc` from `files.len()`), not the
-  `files_compiled` (produced `.beam`) count, so a partial `erlc` run overstates throughput relative to
-  the `files_compiled` row beside it. `elixir_compiler` uses the produced count
-  (`produced as f64 / seconds`).
-- **Stale in-file doc:** `src/workloads/baseline.rs` (module doc and the `MEMORY_EVAL` comment) still says
-  `erlang:memory/0,1` "is not implemented by the Rust runtime yet"; `beam_rt` now serves it via the
-  `MemoryHook` seam and the workload records a real `vm_memory_total_bytes` for `rust` (`RESULTS.md` §3.2).
-  `is_capability_gap` survives only as a fallback classifier.
-- `proc.rs:126` (`h.join().unwrap_or_default()`) collapses a panicked stdout/stderr drain thread to an empty
-  string; the drain threads have no realistic panic path, so this is latent, not active.
+- **`foreign` classifies a staging failure honestly** (`src/workloads/foreign.rs`: `StageError` +
+  `stage_outcome`): a checkout whose foreign `.erl` sources are genuinely absent ⇒
+  `skipped(sources-missing)`, while a failure to compile the sources we *did* stage (the embedded driver or a
+  present foreign source) ⇒ `failed(module-compile-failed)` — matching the workloads whose sources are ours
+  (`list_walk`/`copy_bound`/`gc_bound`). `slice` treats a failed fixture rebuild as `skipped(fixture-missing)`.
+- **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` are computed from the *produced* counts**
+  (`rates_per_second` over `CorpusRun::produced` / `produced_loc`, the latter from `compiled_sources`, which
+  matches each newly written `.beam` back to its source by file stem), so a partial `erlc` run cannot overstate
+  throughput next to `files_compiled`. The attempted file/LOC totals are still reported, but only in a note.
+  `elixir_compiler` likewise uses the produced count.
+- `proc.rs`'s drain-thread join (`h.join().unwrap_or_default()`) is infallible **by construction** — the drain
+  threads run only `read_to_end` + a lossy UTF-8 conversion, neither of which can panic — so the
+  `unwrap_or_default` masks nothing real; the invariant is documented at the call site.
+
+`baseline.rs`'s docs correctly state that both runtimes serve `erlang:memory/0,1` (`beam_rt` via its
+`MemoryHook` seam), recording a real `vm_memory_total_bytes` for `rust`; `is_capability_gap` survives only as a
+fallback classifier.
 
 The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as
 `RESULTS.md` states (startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF
