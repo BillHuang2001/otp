@@ -1060,6 +1060,11 @@ fn indentation_of(chunk: &Chunk, column: i64) -> i64 {
         // `indentation([C|Cs], I) when is_integer(C) -> indentation(Cs, I+1)`.
         Chunk::Int(_) => column + 1,
         Chunk::List(items) => items.iter().fold(column, |col, item| indentation_of(item, col)),
+        // `indentation(Bin, I) when is_binary(Bin) -> indentation(binary_to_list(Bin), I)`
+        // — the `~ts`-limited arm's binary element (see [`crate::print::Chunk::Bin`]).
+        Chunk::Bin(bytes) => bytes
+            .iter()
+            .fold(column, |col, &byte| indent_char(byte as char, col)),
     }
 }
 
@@ -1073,6 +1078,10 @@ fn splice_flat(out: &mut Vec<Chunk>, chunk: Chunk) {
                 splice_flat(out, item);
             }
         }
+        // A binary element never flows through a *small* control (only the
+        // `~ts`-limited element list builds one), but the walk stays total by
+        // splicing its bytes as individual characters, as `lists:flatten/1` does.
+        Chunk::Bin(bytes) => out.extend(bytes.iter().map(|&byte| Chunk::Char(byte as char))),
     }
 }
 
@@ -1086,7 +1095,8 @@ fn chunks_to_term(ctx: &mut BifContext<'_>, chunks: &[Chunk]) -> Result<Eterm> {
 }
 
 /// Materializes one chunk: a character is a small integer, a raw integer is that
-/// integer itself, a list a sub-list.
+/// integer itself, a list a sub-list and a binary a **binary** term (the
+/// `~ts`-limited arm's binary element — `io_lib:format` keeps it verbatim).
 fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
     match chunk {
         Chunk::Char(c) => ctx.int(i64::from(*c as u32)),
@@ -1098,6 +1108,7 @@ fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
             }
             ctx.list(&elems)
         }
+        Chunk::Bin(bytes) => bits::make_binary(ctx.heap(), bytes),
     }
 }
 
