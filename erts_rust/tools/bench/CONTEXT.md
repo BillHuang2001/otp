@@ -163,7 +163,8 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   The elixir env is declared containerised; with no working container runtime the workload drives it with
   `--no-docker` against the local `mix` toolchain. `HOME`, `DOTNET_CLI_HOME`, `NUGET_PACKAGES`, `MIX_HOME`
   and `TMPDIR` are redirected into the scratch (the sandbox `$HOME` is read-only) so the toolchain can write
-  and nothing lands in the read-only source. `dotnet` resolves via the store scan (newest installed SDK).
+  and nothing lands in the read-only source. `dotnet` resolves through the shared tool policy (`PATH` first,
+  then the version-ranked store scan) — see the `plb` Known Issue below for why `PATH`'s SDK decides it here.
   Honesty: no result JSON ⇒ `failed` (`plb-tool-failed` / `plb-no-results`), a broken build stage ⇒
   `failed(plb-build-failed)` — **never** `ok`, because the only other number on such a row is the tool's own
   wall time.
@@ -271,8 +272,9 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `copy_bound` Messaging·A.1+A.5, `gc_bound` Gc·A.1).
 - `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
 - `RESULTS.md` → the definitive results summary (tables, commands, verified skips, host-load record, caveats).
-- `results/` → committed raw `Report` JSON + `bench compare` diffs: `m6-*` = the current run; `m5-*`/`m4-*` =
-  the previous runs, kept as the regression baseline.
+- `results/` → committed raw `Report` JSON + `bench compare` diffs: `m9-*` = the **current** run (with the
+  `m9-load-record.md`/`m9-tool-targets-notes.md` records); `m6-*`/`m5-*`/`m4-*` = the previous runs, kept as
+  the regression baseline.
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
@@ -297,11 +299,10 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p bench`; a real run:
   `erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- run --quick --out-file erts_rust/tools/bench/out/target-bench.json`.
   Never hardcode the worktree path.
-- Toolchain in this sandbox: `erl`/`erlc`/`escript`/`make`/`mix`/`elixir`/`curl`/`git`/`nix`/`jq` **present**;
-  `rebar3`, `dotnet`, `wrk`, `h2load`, `bombardier`, `ab`, `/usr/bin/time` **absent from `PATH`** — but
-  `rebar3` and `dotnet` resolve from the Nix store via the shared store scan (see above), so `khepri` and
-  `plb` run with **no `PATH` prefix and no `$BENCH_TRY_NIX`** (the .NET 9 SDK must first be realized in the
-  store — see the tool-resolution section). Network is available (erlang.mk
+- Toolchain in this sandbox: `erl`/`erlc`/`escript`/`make`/`mix`/`elixir`/`curl`/`git`/`nix`/`jq`/`clang`
+  (21.1.8) **present**, and **`dotnet` IS on `PATH`** (SDK **8.0.425**, `/run/current-system/sw/bin/dotnet`);
+  `rebar3`, `wrk`, `h2load`, `bombardier`, `ab` and `/usr/bin/time` are **absent from `PATH`** — `rebar3`
+  resolves from the Nix store via the shared store scan (see above). Network is available (erlang.mk
   can git-fetch cowlib/ranch). Oracle is OTP 29.1.1 / erts-17.1. After
   `scripts/cargo.sh build --release --workspace`, `../../target/release/beam_rt` is built ⇒ the `rust`
   runtime resolves and passes the self-check (`supported: true`).
@@ -322,6 +323,15 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - **Cowboy** builds a relx release in the scratch copy (network fetch of cowlib+ranch); the release
   start script `foreground` **`exec`s** `erlexec`, so killing the spawned child stops the VM and its pid
   is the Erlang VM (so `VmHWM` polling works).
+- **`plb` fails on this host — the `dotnet` on `PATH` shadows the store's newer SDK.** The shared tool
+  policy consults **`PATH` first** (`src/workloads/tool.rs`: step 1 `PATH`, step 2 `$BENCH_TOOL_PATH`, step 3
+  the version-ranked Nix-store scan, step 4 the `$BENCH_TRY_NIX` shim) and only then the store scan, so the
+  `dotnet` **8.0.425** on `PATH` wins while the PLB elixir environment targets **`net9.0`**: `dotnet --task
+  build` aborts instantly with `NETSDK1045` and the row is `failed(plb-build-failed)` (no number). Because
+  `PATH` wins before the scan, **realizing `nixpkgs#dotnet-sdk_9` in the store is NOT by itself sufficient**
+  on this host — the store scan is never consulted while a too-old `dotnet` is on `PATH`. The honest fixes
+  are to put a ≥ 9.0 `dotnet` earlier on `PATH`, or to remove `dotnet` from `PATH` so step 3 can pick the
+  store SDK. `probe()` still reads ready (the tool resolves), so the row is `failed`, never a fabricated `ok`.
 - **The benchmark host is shared and usually loaded.** Absolute latencies/throughputs move several-fold
   with load, because the oracle `erl` (a 14-scheduler SMP VM) loses more to CPU contention than
   `beam_rt`. Prefer the **quiet** primary run and ratios over absolute values, always record
@@ -373,25 +383,27 @@ produced. Build both the driver and the Rust runtime once, then run the workload
 # 1. build the driver AND the runtime (from the repo root; the wrapper supplies a writable CARGO_HOME)
 erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt -p bench
 
-# 2. the FULL report (--full, BOTH runtimes, all 12 workloads) — minutes (host-load dependent)
-erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --full --runtime all --out-file erts_rust/tools/bench/results/m6-bench-full-runtimes-all.json --verbose
-
-# 3. the FOCUSED cross-runtime report — the reliable source for sys-vs-rust tables:
-#    only the six cross-runtime workloads, so both sides see the same machine conditions
+# 2. the FULL cross-runtime report — the reliable source for sys-vs-rust tables:
+#    only the six Runtimes::Both workloads, so both sides see the same machine conditions
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --full --runtime all --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/results/m6-bench-xrun.json --verbose
+    --out-file erts_rust/tools/bench/results/m9-bench-xrun.json --verbose
 
-# 4. the tool-driven workloads (rebar3/dotnet resolve from the Nix store — no PATH prefix, no BENCH_TRY_NIX)
+# 3. the FULL sys-only external targets (erlc/elixirc/cowboy/khepri) in one report
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --quick --runtime sys --workloads khepri,plb \
-    --out-file erts_rust/tools/bench/results/m6-bench-plb.json --verbose
-# (plb needs a .NET 9 SDK in the store: nix build --no-link nixpkgs#dotnet-sdk_9)
+    run --full --runtime sys --workloads erlc_compiler,elixir_compiler,cowboy,khepri \
+    --out-file erts_rust/tools/bench/results/m9-bench-external.json --verbose
+
+# 4. the tool-driven observations that fail/skip on this host
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime sys --workloads plb  --out-file erts_rust/tools/bench/results/m9-bench-plb.json  --verbose
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime sys --workloads emqx --out-file erts_rust/tools/bench/results/m9-bench-emqx.json --verbose
+# (plb resolves the dotnet on PATH first — here SDK 8.0.425 vs the net9.0 target ⇒ failed(plb-build-failed))
 # (emqx needs an OTP-28 host — here it reports skipped(emqx-requires-otp-28))
 
 # 5. compare (cross-runtime inside one report, or two files)
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m6-bench-xrun.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m9-bench-xrun.json
 ```
 
 `foreign`, `list_walk`, `copy_bound` and `gc_bound` run under **both** runtimes; every other repo workload is
@@ -405,18 +417,30 @@ milestone results (single host, finite sample counts).
 > loads). Run order is runtime-major (all `sys` rows, then all `rust`), so a *drifting* load can bias a
 > cross-runtime comparison — the focused `xrun` mitigates this.
 
-**Skip reasons on this host:** `emqx` → `skipped(emqx-requires-otp-28)` (EMQX pins OTP 28; host is OTP 29).
-Everything else probes ready; `khepri` runs once the `rebar3` store entry is present and `plb` once a .NET 9
-SDK is realized in the store (`nix build --no-link nixpkgs#dotnet-sdk_9`).
+**Non-`ok` rows on this host:** `emqx` → `skipped(emqx-requires-otp-28)` (EMQX pins OTP 28; host is OTP 29);
+`plb` → `failed(plb-build-failed)` (the `dotnet` on `PATH` is SDK 8.0.425 while PLB targets `net9.0` — `PATH`
+wins before the version-ranked store scan, so realizing a 9.x SDK in the store is not enough). Everything else
+probes ready; `khepri` runs once the `rebar3` store entry is present.
+
+## Status
+- The driver is a complete library + binary: 12 workloads, all implemented and tested; `cargo test -p bench`
+  is green.
+- **Current measurement session: `m9` (2026-10-13).** The full cross-runtime pass ran 12/12 rows `ok`
+  (six `Runtimes::Both` workloads × both runtimes); the full sys-only external-target pass ran 4/4 `ok`
+  (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`). The two honest non-`ok` rows are `plb`
+  (`failed(plb-build-failed)` — the `PATH` `dotnet` 8.0.425 shadows the store's 9.x SDK) and `emqx`
+  (`skipped(emqx-requires-otp-28)`).
+- Read the figures from `RESULTS.md` / `results/` (`m9-*` current; `m6-*`/`m5-*`/`m4-*` the regression
+  baselines) — this file deliberately restates none of them.
 
 ## Measured — where the numbers live
 
 **`RESULTS.md` is the authoritative source for every measured number** (one table per workload category,
 the environment record, the exact reproduction commands, the `/proc/loadavg` record, the stability bounds
 and a "what these numbers do and do not mean" section). The raw harness JSON behind it is committed under
-`results/`: `m6-*` = the current run (the focused cross-runtime report, the per-target external-workload
-reports, the cross-runtime diff, and the `m6-tool-targets-notes.md`/`m6-load-record.md` records); `m5-*`/`m4-*`
-= the previous runs, kept as the regression baseline.
+`results/`: `m9-*` = the **current** run (the full cross-runtime report, the full external-target report, the
+PLB/EMQX observations, the cross-runtime diff, and the `m9-load-record.md`/`m9-tool-targets-notes.md` records);
+`m6-*`/`m5-*`/`m4-*` = the previous runs, kept as the regression baseline.
 This file deliberately restates none of those numbers — read them there, and regenerate with the Runbook
 above rather than quoting a stale copy.
 
@@ -508,7 +532,7 @@ is **not** produced here; it is a `beam_rt` measurement.
 - `RESULTS.md` → the current results summary (one table per workload category, exact reproduction
   commands, verified skip reasons, host-load record, stability, and "what these numbers mean").
 - `results/` → the raw harness JSON behind `RESULTS.md` (committed, so the numbers stay reviewable)
-  plus the `bench compare` diffs (`m6-*` current, `m5-*`/`m4-*` previous).
+  plus the `bench compare` diffs (`m9-*` current, `m6-*`/`m5-*`/`m4-*` previous).
 - `../CONTEXT.md` → the `tools/` node's binding shared conventions (runtime resolution, exit codes, JSON, `out/`).
 - `../../CONTEXT.md` §6/§7 → test strategy, the differential gate, staging.
 - `../../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` → the concrete target workloads + build/bench entry points.
