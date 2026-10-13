@@ -50,7 +50,7 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 - Never panic / never a wrong result: an unsupported shape is the typed `error::unsupported`.
 
 ## Test Strategy
-`tests.rs` unit-tests the ABI encoding, the `#[repr(C)]` runtime layout, regalloc, the fast-path constants/arithmetic, and the deopt-path reduction charging / yield folding. Tier equivalence on real modules is in the crate's `tests/jit*.rs` (see `../CONTEXT.md`), which drive the **lazy** path through `Machine::run_with_tier`.
+`tests.rs` unit-tests the ABI encoding, the `#[repr(C)]` runtime layout, regalloc, the fast-path constants/arithmetic, the deopt/yield folding (a deopted `wait` folds to `RunOutcome::Wait`), and that a deopted collecting `test_heap` reaches the host's admission door exactly once and reloads the cached registers afterwards. Tier equivalence on real modules is in the crate's `tests/jit*.rs` (see `../CONTEXT.md`), which drive the **lazy** path through `Machine::run_with_tier`.
 
 ## Routing Table
 - `code.rs` → the artifact in its two layouts (`CompiledModule`/`CompiledFunction`/`Summary`) + the compile-on-entry point.
