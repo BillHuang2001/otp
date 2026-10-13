@@ -19,9 +19,16 @@
 %%
 %% %CopyrightEnd%
 %%
-%% beam_ssa_opt_diff_SUITE -- a randomized differential-equivalence harness for
-%% the opt-in Stage-2 SSA compiler passes (`loop_opt', `loop_arith_licm',
-%% `fusion_opt', `fbip_opt').
+%% beam_ssa_opt_diff_SUITE -- a differential harness for the opt-in Stage-2 SSA
+%% compiler passes (`loop_opt', `loop_arith_licm', `fusion_opt', `fbip_opt').
+%%
+%% It compares two corpora:
+%%   * a randomized, template-driven SYNTHETIC probe corpus, compiled under the
+%%     full 20-set option matrix and compared both behaviourally and at the
+%%     `Code'-chunk level (the three original test cases);
+%%   * the REAL module corpus `lib/stdlib/src/*.erl', compiled under a bounded
+%%     nine-set matrix and compared at the `Code'-chunk level only (the
+%%     `real_corpus/1' test case).
 %%
 %% THE IDEA
 %% The opt-in passes are default-OFF (see `beam_ssa_opt:expand_opt/2'), so a
@@ -48,7 +55,9 @@
 %% Every exported probe function is ARITY 1, so one fixed battery drives all of
 %% them; recursion lives in private helpers that the arity-1 wrapper calls, so
 %% no probe can warn about an unused function. The probe modules always compile
-%% with zero warnings (a warning fails `build/2'), and every probe terminates
+%% with zero warnings (a warning fails `build/2', which is only ever applied to
+%% the synthetic probes - a real library module may warn and its warnings are
+%% tolerated, see "THE REAL CORPUS" below), and every probe terminates
 %% for every battery argument: a loop is bounded by a literal or by its own
 %% argument-as-list, never by an unbounded integer derived from the argument,
 %% and no probe returns `self()', a ref, a port or an internally created fun -
@@ -97,19 +106,59 @@
 %%   * `control' - `no_ssa_opt', which disables the whole SSA optimizer: it is
 %%     compared behaviourally but is not expected to be code-identical.
 %%
-%% THE THREE TEST CASES (group `diff')
+%% THE REAL CORPUS (`real_option_sets/0')
+%% `real_corpus/1' runs a SECOND, independent comparison over a REAL module
+%% corpus - every `lib/stdlib/src/*.erl' (~96 modules) - under a bounded
+%% NINE-set matrix, all starting from `[binary,no_spawn_compiler_process]':
+%%   * the `baseline';
+%%   * the four transform sets `loop_opt', `loop_arith_licm', `fusion_opt' and
+%%     `fbip_opt';
+%%   * the four derived kill switches `no_ssa_opt_loop_opt',
+%%     `no_ssa_opt_loop_arith_licm', `no_ssa_opt_fus' and `no_ssa_opt_fbip'.
+%% The 20-set synthetic matrix is deliberately NOT run over the real corpus;
+%% 96 x 9 = 864 compilations is the whole budget this case spends.
+%%
+%% The real modules are found by resolving the repository root
+%% (`repo_root/0', the same beam-directory-then-repo-relative candidate scheme
+%% `ssa_opt_budget_SUITE:suite_source/0' uses) and compiling them with the
+%% include directories `lib/stdlib/src' needs (`real_base_opts/1', mirroring
+%% `stage2_bench:base_opts/1'). Real library modules MAY warn, so - unlike
+%% `build/2', which is only for the synthetic probes and treats a warning as a
+%% defect - `compile_real/2' tolerates warnings and uses the returned binary,
+%% while a compile ERROR under ANY set fails the case loudly, naming the module
+%% and the set.
+%%
+%% What the real-corpus case does and does NOT establish:
+%%   * it establishes that no real module fails to compile under any of the
+%%     nine sets;
+%%   * it establishes that every kill/identity set is `Code'-chunk-identical to
+%%     the baseline on every real module, and reports the per-transform-set
+%%     reach (the number of real modules whose `Code' chunk the set changes),
+%%     requiring every transform set to change at least one real module;
+%%   * it does NOT execute the compiled modules, so it claims NO behavioural
+%%     equivalence over the real corpus: the committed host rig runs on an older
+%%     OTP, which cannot load this tree's OTP-30 beams at all. Behavioural
+%%     equivalence is established by the synthetic probe battery, whose shapes
+%%     cover the firing shape of every pass.
+%%
+%% THE FOUR TEST CASES (group `diff')
 %%   * `behaviour_equivalence/1' - the battery comparison over the whole matrix,
 %%     with the compared-call and mismatch counts;
 %%   * `kill_switch_identity/1' - every `identity' set must be `Code'-identical
 %%     to the baseline, per probe module;
 %%   * `sensitivity/1' - the per-set table of "probe modules whose `Code' chunk
 %%     changed" and the assertion that every `transform' set changes at least
-%%     one module.
+%%     one module;
+%%   * `real_corpus/1' - the same two identity/reach questions asked of the real
+%%     `lib/stdlib/src' corpus under the bounded nine-set matrix, plus the
+%%     assertion that no real module fails to compile under any set (see "THE
+%%     REAL CORPUS" above for what it does not claim).
 %%
-%% Everything the test cases need (the probe files, the compiled builds) is
-%% produced once in `init_per_suite/1' and handed to them through the Config,
-%% which both Common Test and the committed host driver
-%% (`stage2_suite_driver.erl') do.
+%% Everything the synthetic test cases need (the probe files, the compiled
+%% builds) is produced once in `init_per_suite/1' and handed to them through the
+%% Config, which both Common Test and the committed host driver
+%% (`stage2_suite_driver.erl') do. The real corpus is resolved and compiled
+%% inside `real_corpus/1' itself, so the other three cases never pay for it.
 %%
 %% The `Code' chunk is extracted by hand from the FOR1 container: a host
 %% OTP-29 `beam_lib:chunks/2' cannot read it at all
@@ -121,7 +170,8 @@
 
 -export([all/0,suite/0,groups/0,init_per_suite/1,end_per_suite/1,
          init_per_group/2,end_per_group/2]).
--export([behaviour_equivalence/1,kill_switch_identity/1,sensitivity/1]).
+-export([behaviour_equivalence/1,kill_switch_identity/1,sensitivity/1,
+         real_corpus/1]).
 
 %% The one place the corpus seed lives. It is passed to `rand:seed/2' exactly
 %% once, at the start of corpus generation, so the generated corpus - and every
@@ -145,7 +195,8 @@ all() ->
     [{group,diff}].
 
 groups() ->
-    [{diff,[],[behaviour_equivalence,kill_switch_identity,sensitivity]}].
+    [{diff,[],[behaviour_equivalence,kill_switch_identity,sensitivity,
+               real_corpus]}].
 
 %% Generate the corpus, write it out and compile every probe module under every
 %% option set, keeping the files and the builds in the returned Config.
@@ -258,6 +309,200 @@ sensitivity(Config) ->
       end, Transform),
     ok.
 
+%% Compile the REAL module corpus (`lib/stdlib/src/*.erl') under the bounded
+%% nine-set matrix and require (a) that no real module fails to compile under
+%% any set, (b) that every kill/identity set leaves every real module's `Code'
+%% chunk identical to the baseline, and (c) that every transform set changes at
+%% least one real module. The per-set reach is printed. Behavioural equivalence
+%% over the real corpus is NOT claimed here - see "THE REAL CORPUS" in the
+%% header.
+real_corpus(_Config) ->
+    Root = repo_root(),
+    Files = real_corpus_files(Root),
+    Sets = real_option_sets(),
+    Total = length(Files),
+    {Cert, Failures} = real_corpus_digests(Files, real_base_opts(Root), Sets),
+    Baseline = proplists:get_value(baseline, Cert),
+
+    ct:pal("real corpus: ~w module(s) in ~s, compiled under ~w option set(s) "
+           "= ~w compilation(s); compile errors: ~w",
+           [Total, real_corpus_dir(Root), length(Sets), Total * length(Sets),
+            length(Failures)]),
+    real_report(Cert, Sets, Total),
+
+    case Failures of
+        [] ->
+            ok;
+        _ ->
+            %% A real module that fails to compile under some set is a defect of
+            %% that set (or of the compiler), never of the corpus: fail loudly,
+            %% naming the module and the set.
+            ct:fail({real_corpus_compile_failures, length(Failures),
+                     lists:sublist(Failures, ?MAX_MISMATCH_SAMPLES)})
+    end,
+
+    %% Every kill/identity set must leave every real module unchanged.
+    lists:foreach(
+      fun({Label, Opts, identity}) ->
+              case real_changed(Label, Cert, Baseline) of
+                  [] ->
+                      ct:pal("identity ~p ~p: 0 of ~w real module(s) changed",
+                             [Label, Opts, Total]);
+                  Changed ->
+                      ct:fail({real_identity_set_changed_code, Label, Opts,
+                               Changed})
+              end;
+         (_Other) ->
+              ok
+      end, Sets),
+
+    %% Every transform set must change at least one real module, mirroring
+    %% `sensitivity/1' for the synthetic corpus.
+    lists:foreach(
+      fun({Label, Opts, transform}) ->
+              case real_changed(Label, Cert, Baseline) of
+                  [_ | _] ->
+                      ok;
+                  [] ->
+                      ct:fail({real_transform_set_changed_no_code, Label, Opts})
+              end;
+         (_Other) ->
+              ok
+      end, Sets),
+    ok.
+
+%%============================================================================
+%% The real module corpus
+%%============================================================================
+
+%% The repository root (`$ERL_TOP'), resolved the way
+%% `ssa_opt_budget_SUITE:suite_source/0' resolves the path of its own source:
+%% the compiled suite's `.beam' directory first - the harness compiles the
+%% suites into `<root>/lib/compiler/test', so the root is four levels up - then
+%% the current directory (the committed host runner starts the node in the
+%% repository root) and finally `$ERL_TOP' when it is set. The first candidate
+%% under which `lib/stdlib/src' actually holds modules wins.
+repo_root() ->
+    Candidates = repo_root_candidates(),
+    case [Root || Root <- Candidates, real_corpus_files_or_empty(Root) =/= []] of
+        [Root | _] ->
+            Root;
+        [] ->
+            ct:fail({no_repo_root, Candidates})
+    end.
+
+repo_root_candidates() ->
+    FromBeam =
+        case code:which(?MODULE) of
+            Beam when is_list(Beam) ->
+                %% .../lib/compiler/test/<suite>.beam -> the repository root
+                [lists:foldl(fun(_, Dir) -> filename:dirname(Dir) end, Beam,
+                             [1, 2, 3, 4])];
+            _ ->
+                %% preloaded, or not loaded from a file: nothing to derive
+                []
+        end,
+    FromBeam ++ ["."] ++ env_root().
+
+env_root() ->
+    case os:getenv("ERL_TOP") of
+        false -> [];
+        "" -> [];
+        Root -> [Root]
+    end.
+
+%% The real corpus directory, and its modules: `..._or_empty/1' is the
+%% non-failing form used to probe a candidate root, `real_corpus_files/1' the
+%% strict form used once a root has been chosen.
+real_corpus_dir(Root) ->
+    filename:join([Root, "lib", "stdlib", "src"]).
+
+real_corpus_files_or_empty(Root) ->
+    filelib:wildcard(filename:join(real_corpus_dir(Root), "*.erl")).
+
+real_corpus_files(Root) ->
+    case lists:sort(real_corpus_files_or_empty(Root)) of
+        [] -> ct:fail({no_real_corpus, real_corpus_dir(Root)});
+        Files -> Files
+    end.
+
+%% The include directories `lib/stdlib/src' needs, mirroring
+%% `stage2_bench:base_opts/1'. The option sets themselves carry `binary' and
+%% `no_spawn_compiler_process'.
+real_base_opts(Root) ->
+    [{i, filename:join([Root, "lib", "stdlib", "include"])},
+     {i, filename:join([Root, "lib", "kernel", "include"])},
+     {i, filename:join([Root, "lib", "compiler", "src"])}].
+
+%% Compile every real module under every option set. Returns
+%% `{[{Label, [{ModBase, Digest}]}], [{Label, File, Errors}]}': the per-set
+%% digests in the corpus' (sorted) file order, and every compile error together
+%% with the set it happened under.
+real_corpus_digests(Files, Base, Sets) ->
+    {Cert, Failures} =
+        lists:foldl(
+          fun({Label, Opts, _Kind}, {Cert0, Fails0}) ->
+                  {Digests, Fails} = compile_real_set(Files, Base ++ Opts),
+                  {Cert0 ++ [{Label, Digests}],
+                   Fails0 ++ [{Label, File, Errors} || {File, Errors} <- Fails]}
+          end, {[], []}, Sets),
+    {Cert, Failures}.
+
+compile_real_set(Files, Opts) ->
+    {RevDigests, RevFails} =
+        lists:foldl(
+          fun(File, {Digests0, Fails0}) ->
+                  case compile_real(File, Opts) of
+                      {ok, Digest} ->
+                          {[{filename:basename(File), Digest} | Digests0],
+                           Fails0};
+                      {error, Errors} ->
+                          {Digests0, [{File, Errors} | Fails0]}
+                  end
+          end, {[], []}, Files),
+    {lists:reverse(RevDigests), lists:reverse(RevFails)}.
+
+%% Compile one real library module. A real module MAY warn, so - unlike
+%% `build/2', which is for the synthetic probes and treats a warning as a
+%% defect - the compiled binary is used as-is. An error is returned to the
+%% caller instead of failing here, so that `real_corpus/1' can report every
+%% failing module/set pair at once.
+compile_real(File, Opts) ->
+    try compile:file(File, [return_errors,return_warnings | Opts]) of
+        {ok, _Mod, Bin, _Warnings} ->
+            {ok, code_digest(Bin)};
+        {error, Errors, _Warnings} ->
+            {error, Errors};
+        Other ->
+            {error, {unexpected_compile_result, Other}}
+    catch
+        Class:Reason ->
+            {error, {Class, Reason}}
+    end.
+
+%% The real modules whose `Code' digest differs from the baseline under `Label'
+%% (the baseline itself yields `[]').
+real_changed(Label, Cert, Baseline) ->
+    [ModBase || {ModBase, Digest} <- proplists:get_value(Label, Cert),
+                proplists:get_value(ModBase, Baseline) =/= Digest].
+
+%% The per-set reach table for the real corpus: how many modules each set
+%% changes, and which ones.
+real_report(Cert, Sets, Total) ->
+    Baseline = proplists:get_value(baseline, Cert),
+    ct:pal("real corpus, modules whose Code chunk differs from the baseline "
+           "(label / opts / kind):"),
+    lists:foreach(
+      fun({Label, Opts, Kind}) ->
+              Changed = real_changed(Label, Cert, Baseline),
+              ct:pal("  ~-20s ~-52s ~-9s ~w of ~w~s",
+                     [Label, opts_str(Opts), Kind, length(Changed), Total,
+                      describe(Changed)])
+      end, Sets).
+
+opts_str(Opts) ->
+    lists:flatten(io_lib:format("~w", [Opts])).
+
 %%============================================================================
 %% Config plumbing
 %%============================================================================
@@ -327,6 +572,28 @@ baseline_opts() ->
     case [Opts || {baseline, Opts, _} <- option_sets()] of
         [Opts] -> Opts
     end.
+
+%% `{Label, Opts, Kind}' for the real module corpus: the bounded NINE-set matrix
+%% (baseline, the four transform sets, the four derived kill switches), with the
+%% same `Kind' vocabulary as `option_sets/0' but no `control' set and none of
+%% the budget/watchdog/gate identity sets - 96 real modules are compiled per
+%% set, so the matrix stays small on purpose.
+real_option_sets() ->
+    B = [binary,no_spawn_compiler_process],
+    [{baseline, B, baseline},
+
+     %% Transform sets: the opt-in pass must change the generated code of at
+     %% least one real module.
+     {loop_opt, B ++ [loop_opt], transform},
+     {loop_arith_licm, B ++ [loop_arith_licm], transform},
+     {fusion_opt, B ++ [fusion_opt], transform},
+     {fbip_opt, B ++ [fbip_opt], transform},
+
+     %% Identity sets: must not change the generated code of any real module.
+     {no_loop_opt, B ++ [no_ssa_opt_loop_opt], identity},
+     {no_loop_arith_licm, B ++ [no_ssa_opt_loop_arith_licm], identity},
+     {no_fus, B ++ [no_ssa_opt_fus], identity},
+     {no_fbip, B ++ [no_ssa_opt_fbip], identity}].
 
 %%============================================================================
 %% Code-chunk bookkeeping
