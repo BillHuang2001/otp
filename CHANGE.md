@@ -8,6 +8,74 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-14 — Milestone 9: inbound distribution + the connector, off-heap reachability reclamation, the mature-generation room policy, a `gc` corpus group, the distribution probe helper
+Scope: a capability-and-evidence milestone. The headline changes are **two-way live distribution**
+(inbound delivery routing plus a real connector), **reachability-based off-heap reclamation**, and a
+corrected **mature-generation room policy** that finally makes the generational payoff reachable.
+Verified: `cargo build --workspace --all-targets` warning-free, the workspace suite green
+(≈8150 passed / 0 failed), and the differential gate **`total=2161 agree=2159 mismatch=0
+unsupported=2 skipped=0 allowed=2`** → exit 0.
+- **Area:** `erts_rust/crates/beam_rt` (`src/dist.rs`, **`src/dist_client.rs`** (new),
+  **`src/native/net.rs`** (new), `src/runtime.rs`, `src/runtime/scheduler.rs`)
+- **Change:** distribution now works **inbound** and **outbound**. The inbound sink routes
+  `Send`/`RegSend`/`AliasSend`/plain-`AltactSigSend` into the *real* local signal path
+  (`ProcessTable::deliver_simple`, waking a blocked receiver) instead of refusing them; the remaining
+  families are typed `Unsupported` with the exact missing sibling API named per arm. A new **connector**
+  (`DistClient`/`ClientLink`/`DistRouter`) performs the client handshake and turns a locally-initiated
+  link/monitor/exit into real `DOP_*` through a `beam_process::DistSignalRouter` implementation,
+  reachable from Erlang via `nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` and remote `!`.
+  The `allow_inbound_delivery` switch is now **default ON** (a non-node runtime pays one bool test per
+  pass, so the hermetic corpus is byte-identical). A **dangling-envelope bug** is closed: the queued
+  `from` must be an immediate (the decode arena is reset per drain), enforced at the single
+  `envelope_from()` choke point. Live evidence: `tests/live_inbound.rs` (a real `erl -sname` peer's
+  `{hello, node()}` arrives in our running process), `tests/live_signals.rs` (our `DOP_LINK`+`DOP_EXIT`
+  observed on the peer's own stdout, with a negative control), `tests/remote_send.rs`, `tests/net_adm.rs`.
+- **Area:** `erts_rust/crates/beam_process` (`src/process.rs`)
+- **Change:** off-heap refc-binary reclamation is no longer caller-declared only. The end-of-collection
+  sweep now has a **reachability half** — `beam_gc::AnyCollector::for_each_reachable_object` over the
+  roots the collection *just gathered* (so the walk cannot disagree with the collection) releases every
+  owned payload no reachable on-heap `BinRef` names — followed by the unchanged declared-dead half. A
+  process with unpublished roots declines (retains everything), so the no-relocation invariant holds.
+  One minimal documented read-only `unsafe` word read is the probe's only new unsafe.
+- **Area:** `erts_rust/crates/beam_gc` (`src/collector.rs`, `src/immix_collector.rs`, **`src/reachable.rs`** (new))
+- **Change (algorithmic):** the fullsweep now sizes the fresh mature space with the C's
+  `adjust_after_fullsweep` **young-occupancy** term. Without it the mature could never hold a nursery's
+  worth of promotion, so after the first collection *every* collection escalated to a fullsweep
+  (`minor_gcs` stuck at 0) and the generational payoff never ran. Measured on a 220-round churn loop at
+  the crate-default policy: minors:fullsweeps went **1:219 → 147:73** (converged young/mature 233/233 →
+  233/376), and both capacities are now a single constant across the rounds (a fixed point, not creep) —
+  the mature occupancy itself stays forbidden from the growth target. `MatureKind::Copying` remains the
+  default (the policy is measurement-gated, recorded in `MEASURED.md`). Also new: a public, safe,
+  read-only `for_each_reachable_object` reachability enumeration (iterative, cycle-safe, layout-agnostic),
+  a shared `src/reachable.rs` walk that `live.rs` delegates to, and a **GC value-oracle**
+  (`tests/gc_value_oracle.rs`: 18 byte-identical `term_to_binary` comparisons vs the live oracle across
+  9 term shapes × 2 strategies, plus reclamation/counter/capacity invariants).
+- **Area:** `erts_rust/crates/beam_bifs` (`src/ets.rs`, `src/match_spec.rs`, `src/hook_sets.rs`)
+- **Change:** `ets:slot/2` adopted (read-gated; the ordered_set slot semantics exact), the stale
+  head-map refusal in the match-spec head pattern deleted (map heads now delegate to `beam_ets`,
+  oracle-verified), and the `RUNTIME_HOOKS_BIFS` roster reconciled (173 → 172; `erl_ddll:info/2` belongs
+  to the registry, not the `RuntimeHooks` seam) and **mechanically pinned by a re-derivation test**, so
+  it can no longer drift out of step with the runtime-BIF roster.
+- **Area:** `erts_rust/crates/beam_dist` (`src/delivery.rs`, `src/bin/dist_probe.rs`)
+- **Change:** `Delivery::classify_validated` + `LinkIdentity` add the C's **per-link** `invalid_message`
+  validation (the `dep != external_pid_dist_entry(from)` identity test) as an additive, opt-in path —
+  the check site is genuinely per-link, which the shared `beam_rt` sink structurally cannot know. The
+  `dist_probe` harness helper grew from 3 fixed-literal modes to 11 byte-comparable reports
+  (`nodeid`, `handshake`, `badcookie`, `frag`, `alias`, `monitor`, `regsend_missing`, `utf8`, …), each
+  deterministic and pinned by a CLI test — so the differential gate can now gate-check real distribution
+  behaviour.
+- **Area:** `erts_rust/tools/differential`
+- **Change:** the corpus grew **1871 → 2161** gate-checked cases: new groups for `re` (140 cases, the
+  engine promoted from `beam_bifs`'s live-oracle source), `erl_ddll` (16), `erlang:decode_packet/3`
+  (37, all 4 integer + 12 named types), `io_lib:format/3`'s `~ts` (17) and a `gc` group (32,
+  comparability limits in `GC_COMPARABILITY.md`), plus deeper A.3/A.4/A.9 coverage (+48). A
+  **boot-state-dependent** case (`boot_extra/function_exported_lists_sort_1_is_true`) was made
+  state-independent — it had been passing only because a wrong `function_exported/3` membership rule made
+  every stdlib fast path look exported; three sibling cases with the same latent dependence were fixed
+  and two genuine runtime divergences were recorded in `divergences.md` (`code:is_loaded/1` is
+  path-based instead of load-state-based; a multi-key **atom-keyed** map encodes in source order where
+  the oracle sorts).
+
 ## 2026-10-13 — Milestone 8: host decline-gate seam for signal delivery, the `beam_rt::context` module split, the reference-id provenance bridge, a self-contained `re` engine, port-level line framing, the legacy-C removal plan
 Scope: a breadth-and-structure milestone. The headline structural changes are the **host
 decline-gate seam** that closes the last known GC-relocation-against-an-incomplete-root-set hole
@@ -16,7 +84,7 @@ concern-scoped submodules, the **reference-id provenance bridge** that removes a
 hazard, and a **self-contained regex engine** replacing the last large BIF hole. Verified:
 `cargo build --workspace --all-targets` warning-free, the workspace test suite green
 (≈8600 passed / 0 failed; the `differential` live-oracle binary suite passes in 1791 s), and the
-differential gate **`total=1871 agree=1869 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0
+differential gate **`total=2161 agree=2159 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0
 in BOTH the default (baseline-JIT) and `BEAM_RT_TIER=interpreter` tiers.
 - **Area:** `erts_rust/crates/beam_process` (`src/process.rs`, `src/ptab.rs`)
 - **Change (correctness):** a new host seam, `trait CollectionGate { fn declines_relocation(&mut
@@ -118,7 +186,7 @@ compiled-`send` seam), **reference aliases** delivered end-to-end, the process c
 strategy-agnostic `AnyCollector`, and the `.beam` module MD5. The differential harness also gained the
 `ModuleEnv` case kind. Verified: `cargo build --workspace --all-targets` warning-free, the workspace
 test suite green (0 failed), the real `start.boot` still runs to `{progress,started}`, and the
-differential gate **`total=1871 agree=1869 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0
+differential gate **`total=2161 agree=2159 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0
 (identical with `BEAM_RT_TIER=interpreter`).
 - **Area:** `erts_rust/crates/beam_engine` (`src/interpreter/dispatch.rs`), `erts_rust/crates/beam_rt`
 - **Change:** the `call_ext*` → `erlang:apply/3` seam (`resolve_call_ext_apply`) now reproduces the C's
@@ -193,7 +261,7 @@ differential gate **`total=1871 agree=1869 mismatch=0 unsupported=2 skipped=0 al
 - **Area:** `erts_rust/tools/differential`
 - **Change:** a new **`ModuleEnv`** case kind — a module-run case that additionally carries an explicit
   spawn environment (so a compiled dir reaches the code path only through `-pa` in that environment,
-  not through argv) — pins the `ERL_*FLAGS` merge (contract A.6) end to end. The corpus grew to 1871
+  not through argv) — pins the `ERL_*FLAGS` merge (contract A.6) end to end. The corpus grew to 2161
   cases (1868 at `ModuleEnv`, +3 `dist/*`), with value invariants added for A.8
   (`process_count =:= length(processes())`).
 - **Area:** `erts_rust/crates/beam_rt` (`src/context/mod.rs`, `src/context/gc_walk.rs`,

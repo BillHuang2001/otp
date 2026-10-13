@@ -131,7 +131,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=1871 agree=1869 mismatch=0 unsupported=2
+- **Compatibility gate (`tools/differential`):** `summary: total=2161 agree=2159 mismatch=0 unsupported=2
   skipped=0 allowed=2` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
   per-contract split. **No case disagrees**; the two recorded capability gaps (the `known-gaps.txt`
   ratchet allowlist) are `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's

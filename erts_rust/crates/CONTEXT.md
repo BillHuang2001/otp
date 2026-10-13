@@ -160,9 +160,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) emits the oracle's full 15-field order
   (hand-reproduced from public `beam_ets::TableInfo` fields — `TableInfo::entries` needs `&mut AtomTable`,
   which a BIF context lacks); `owner` is still rendered as `undefined` (no pid term yet).
-- `beam_process`: register off-heap refc binaries (`RefcBinary`) in `beam_gc::OffHeap` and supply the `sweep`
-  liveness predicate (liveness of an off-heap entry is the caller's concern; the collector never walks
-  off-heap payloads).
+- `beam_process` owns the off-heap refc-binary sweep: it registers owned `RefcBinary` payloads in
+  `beam_gc::OffHeap` and sweeps them at the end of a rooted collection with a reachability half
+  (`beam_gc::AnyCollector::for_each_reachable_object` over the roots the collection just gathered)
+  plus the declared-dead half; a process with unpublished roots declines (retains everything).
 - **A live `code_server` process is not yet on the receive path.** `beam_rt` serves `code:*` / `code_server`
   requests from its native floor (`src/native.rs`), not from a registered `code_server` process, because
   OTP's real `code_server.beam` needs host facilities outside `beam_rt` (a host timer for `after T`,
@@ -246,7 +247,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=1871 agree=1869 mismatch=0 unsupported=2 skipped=0 allowed=2` (`../tools/differential/gate.sh`
+  `summary: total=2161 agree=2159 mismatch=0 unsupported=2 skipped=0 allowed=2` (`../tools/differential/gate.sh`
   → exit 0); re-run `gate.sh` for the live per-contract split. The two recorded capability gaps (the
   `known-gaps.txt` ratchet allowlist) are A.9 `wire/new_fun_ext_encode` and
   `boot_extra/init_script_id_names_the_running_otp_release` (the `-eval`/`run` path loads no boot script).
@@ -285,7 +286,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   boot/CLI/env, `system_info`/`process_info`, a native BIF floor, and its own observability modules
   (`src/trace.rs`/`src/seq_trace.rs`/`src/crash_dump.rs`/`src/perf_map.rs` — only `send` trace events are
   emitted and the perf map is empty because no code ranges cross the crate boundary yet); inbound
-  distribution is gated by `allow_inbound_delivery` (default OFF); `DEFAULT_HEAP_WORDS = 1<<24`, with
+  distribution runs by default (`allow_inbound_delivery`, `true` unless turned off) and routes the
+  `Send`/`RegSend`/`AliasSend`/plain-`AltactSigSend` families into the local signal path, with the
+  link/exit/monitor/group-leader families still typed `Unsupported`; `DEFAULT_HEAP_WORDS = 1<<24`, with
   heap exhaustion translated to `error:system_limit`. The registered-BIF dispatch hot path is
   allocation-free (the shared `AtomTable` is only committed when a call actually interns a name);
   dispatch/throughput figures and their measurement caveats live in `../tools/bench/RESULTS.md`.
@@ -392,8 +395,9 @@ is **no self-hosted build** (the Rust runtime does not compile and run itself).
 
 ## Known Structural Debt (candidates for the next pass)
 - The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`
-  (`src/term/{binary,record}.rs`) but keeps a crate-local oversized-*flat*-map writer, and no process
-  yet registers refc binaries in `beam_gc::OffHeap` (liveness is the caller's predicate).
+  (`src/term/{binary,record}.rs`) but keeps a crate-local oversized-*flat*-map writer. Off-heap refc
+  liveness is the process's: `beam_process` sweeps its owned payloads by reachability at the end of a
+  rooted collection (plus the caller's declared-dead assertions).
 - `wire/new_fun_ext_encode` remains `unsupported` *in the gate*: its `-eval` lambda is an `erl_eval`
   template closure whose identity/`num_free`/`env` are erl_eval internals no seam can derive faithfully.
   `beam_rt` installs `LocalFunIdentity`, so a **compiled module's** local fun encodes byte-exactly.
