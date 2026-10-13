@@ -23,8 +23,8 @@
 //! Every key here is either a genuine **constant** of this build/host (the version
 //! strings, the word size, the NIF/driver interface versions, the emulator's fixed
 //! feature switches) or is read from the host operating system (`os_type`, `os_version`)
-//! — never from the oracle's printed figures. `emu_flavor`, `smp_support` and `creation`
-//! are derived from this runtime's own configuration/node.
+//! — never from the oracle's printed figures. `emu_flavor`, `smp_support`, `creation` and
+//! `system_logger` are derived from this runtime's own configuration/node/process table.
 //!
 //! Key shapes (verified against OTP 29.1.1 / erts-17.1):
 //!
@@ -58,6 +58,7 @@
 //! | `kernel_poll` | bool |
 //! | `halt_flush_timeout` | atom, `infinity` |
 //! | `creation` | int |
+//! | `system_logger` | pid — the process registered as `logger`, else the atom `undefined` |
 //!
 //! # The emulator's own build/implementation flags
 //!
@@ -160,6 +161,7 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "kernel_poll" => Some(Ok(InfoValue::Bool(cfg!(unix)))),
         "halt_flush_timeout" => Some(Ok(InfoValue::Atom("infinity"))),
         "creation" => Some(Ok(InfoValue::Int(creation(rt)))),
+        "system_logger" => Some(Ok(system_logger(rt))),
         // The emulator's own build/implementation flags (see the module docs).
         "compat_rel" => Some(Ok(InfoValue::Int(i64::from(beam_common::otp_version().major)))),
         "endian" => Some(Ok(InfoValue::Atom(endian()))),
@@ -219,6 +221,44 @@ fn emu_type() -> InfoValue {
 /// one, else `0` (the oracle's `nonode@nohost` creation).
 fn creation(rt: &Runtime) -> i64 {
     rt.dist_node().map(|node| i64::from(node.creation())).unwrap_or(0)
+}
+
+/// `system_info(system_logger)` — the process this runtime's system logger is.
+///
+/// The oracle's answer is the value of its **`system_logger` flag**
+/// (`erts_get_system_logger`, `erl_bif_info.c:3560-3561` → `erl_trace.c:2480-2483`), which
+/// `logger_proxy` sets to its own pid at start-up with
+/// `erlang:system_flag(system_logger, self())` (`kernel/src/logger_proxy.erl:117`) — a pid
+/// while the proxy runs, the atom `undefined` after
+/// `erlang:system_flag(system_logger, undefined)` (`:147`), and the atom `logger` before
+/// anything has set it (`erl_trace.c:339` emits `am_logger` as the initial value).
+///
+/// This runtime implements no such flag (no `logger_proxy`, and
+/// `src/seq_trace.rs::system_flag_2` serves only `reset_seq_trace`), so the truthful
+/// answer is the process **this runtime has registered as `logger`** — exactly what
+/// `erlang:whereis(logger)` answers. The real `bootstrap/bin/start.boot` leaves one behind
+/// (instruction 13's `{kernelProcess,logger,{logger_server,start_link,[]}}`, see
+/// `crate::boot` and `../tests/boot.rs`), so a booted runtime answers a pid; a runtime that
+/// never ran a boot script (the preloaded-only `-eval`/`-run` path) has no logger process
+/// and answers the atom `undefined` — one of the two non-pid shapes the oracle itself
+/// produces for this key, never an invented pid.
+///
+/// # The caller's own state, not the oracle's
+///
+/// The oracle's figure is *its* logger proxy's pid, a different process of a different
+/// emulator: reporting it would be a lie about this runtime (the same rule `process_count`
+/// and `erlang:ports/0` follow). The value is therefore derived from
+/// [`Runtime::processes`]`().whereis(..)`, never copied.
+fn system_logger(rt: &Runtime) -> InfoValue {
+    // A name the atom table does not hold cannot have any process registered under it, so
+    // the answer is the same `undefined` — no name is interned just to probe it.
+    let Some(name) = rt.atoms().lookup("logger") else {
+        return InfoValue::Atom("undefined");
+    };
+    match rt.processes().whereis(name) {
+        Some(pid) => InfoValue::Pid(pid),
+        None => InfoValue::Atom("undefined"),
+    }
 }
 
 /// `system_info(os_version)` — the host kernel's `{Major,Minor,Patch}`.
