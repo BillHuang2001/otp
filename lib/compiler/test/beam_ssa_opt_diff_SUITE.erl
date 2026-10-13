@@ -25,7 +25,8 @@
 %% It compares two corpora:
 %%   * a randomized, template-driven SYNTHETIC probe corpus, compiled under the
 %%     full 20-set option matrix and compared both behaviourally and at the
-%%     `Code'-chunk level (the three original test cases);
+%%     `Code'-chunk level (the cases `behaviour_equivalence/1',
+%%     `kill_switch_identity/1' and `sensitivity/1');
 %%   * the REAL module corpus `lib/stdlib/src/*.erl', compiled under a bounded
 %%     nine-set matrix and compared at the `Code'-chunk level only (the
 %%     `real_corpus/1' test case).
