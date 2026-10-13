@@ -208,3 +208,22 @@ not here.)
   totals are never asserted.
 - `+Q N` / `ERL_MAX_PORTS` -> `system_info(port_limit)` **is** pinned (the `next_power_of_two` sizing
   matrix); `+Q legacy` / no `+Q` -> 65536.
+
+## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
+- `erl_ddll:loaded_drivers/0`'s **list contents** differ: the oracle lists its statically linked
+  `["tcp_inet","udp_inet","ram_file_drv"]` (the entries are *strings*, not atoms), the Rust runtime
+  answers `[]`. The members are therefore unpinnable; `ddll.rs` pins only order-stable shapes of
+  the result (`{ok, List}`, the 2-tuple, `is_list/1`, an all-strings fold and a filtered
+  projection that is empty on both).
+- `erl_ddll:try_load(".", "tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but the
+  generic `{error,{open_error,-10}}` in the Rust runtime.
+- `erl_ddll:try_unload("tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but
+  `{error,not_loaded}` in the Rust runtime.
+  (The missing-object / missing-directory / non-string-name `{error,{open_error,-10}}` and the
+  not-loaded `{error,not_loaded}` shapes, plus every `info/2` `error:badarg` refusal, DO agree and
+  are pinned in `ddll.rs`.)
+- `erlang:decode_packet/3` shows **no observed divergence**: the four integer forms (`0`/`raw`,
+  `1`, `2`, `4`) and all twelve named types (`raw`, `asn1`, `sunrm`, `cdr`, `fcgi`, `line`, `tpkt`,
+  `ssl_tls`, `http`, `httph`, `http_bin`, `httph_bin`), together with their `{more,N}` /
+  `{more,undefined}` / `{error,invalid}` / `error:badarg` shapes, agree and are pinned in
+  `decode_packet.rs` (`ftp` is not a packet type — `error:badarg` on both).
