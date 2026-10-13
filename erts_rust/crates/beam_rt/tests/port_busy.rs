@@ -360,12 +360,6 @@ impl Fixture {
             Err(error) => println!("note: could not remove {}: {error}", self.dir.display()),
         }
     }
-
-    /// The driver object's **stem** path (no suffix) for `name` — what an `erl_ddll`-less runtime
-    /// opens the port with.
-    fn stem(&self, name: &str) -> String {
-        self.dir.join(name).display().to_string()
-    }
 }
 
 /// Compiles the committed C fixture into one shared object per `driver_flags` variant, or `None`
