@@ -57,6 +57,18 @@
 //! `++` in `gc_ext_pict/3`, and the structured `{badarg, CP}` of `gc_1/2` — never a
 //! wrong result.
 
+// The two entry points this module exposes are consumed through the `pub(crate)`
+// re-export below by the `string:next_grapheme/1` / `string:length/1` BIF wiring
+// (and by the `~ts`-under-`{chars_limit, N}` path in `../../io.rs`) that lives in
+// sibling modules of this crate. Until that wiring is present in a given checkout,
+// the only in-crate caller of the port is the oracle corpus in `tests`, so rustc's
+// dead-code lint flags the whole faithful-port surface — every `gc_*` clause, the
+// `cp`/`cpl` normalisation front end in `chardata` and the generated property
+// tables in `props.rs`. Each of those items exists to reproduce the oracle's
+// generated `unicode_util:gc/1` clause-for-clause (the `gc_1/2` clause *order* is
+// load-bearing), so they are this module's API, not leftovers: keep them.
+#![allow(dead_code)]
+
 use beam_common::Result;
 use beam_term::{atom_val, Eterm, NIL};
 
@@ -70,6 +82,13 @@ mod api;
 mod chardata;
 mod props;
 
+// The module's frozen `pub(crate)` surface —
+// `crate::unicode::grapheme::{next_grapheme, grapheme_count}` — and the exact path
+// its consumers resolve. The re-export is what makes `api`'s two entry points
+// reachable, so it must stay even while no non-test code in this crate names it
+// (see the `dead_code` note above); the corpus in `tests` reaches both through
+// this path.
+#[allow(unused_imports)]
 pub(crate) use api::{grapheme_count, next_grapheme};
 
 use chardata::{cp, cp_no_bin, NoBin};
@@ -414,13 +433,13 @@ fn gc_1(ctx: &mut BifContext<'_>, r0: Eterm, cp1: Eterm) -> Result<Eterm> {
     }
     // %% Handle Hangul L / V / T
     if in_l(value) {
-        return gc_h_L(ctx, r0, vec![cp1]);
+        return gc_h_l(ctx, r0, vec![cp1]);
     }
     if in_v(value) {
-        return gc_h_V(ctx, r0, vec![cp1]);
+        return gc_h_v(ctx, r0, vec![cp1]);
     }
     if in_t(value) {
-        return gc_h_T(ctx, r0, vec![cp1]);
+        return gc_h_t(ctx, r0, vec![cp1]);
     }
     // %% Handle Hangul LV and LVT special, since they are large
     if (44000..=56000).contains(&value) {
@@ -590,33 +609,33 @@ fn gc_ext_pict_zwj(
     Err(function_clause())
 }
 
-/// `gc_h_L(R0, Acc)`.
-fn gc_h_L(ctx: &mut BifContext<'_>, r0: Eterm, mut acc: Vec<Eterm>) -> Result<Eterm> {
+/// The oracle's `gc_h_L(R0, Acc)` clause (Hangul `L` run, then optionally `V`/`T`).
+fn gc_h_l(ctx: &mut BifContext<'_>, r0: Eterm, mut acc: Vec<Eterm>) -> Result<Eterm> {
     let normalized = cp(ctx, r0)?;
     if let Some((cp1, r1)) = head_tail(normalized) {
         if in_l_term(cp1) {
             acc.insert(0, cp1);
-            return gc_h_L(ctx, r1, acc);
+            return gc_h_l(ctx, r1, acc);
         }
         if in_v_term(cp1) {
             acc.insert(0, cp1);
-            return gc_h_V(ctx, r1, acc);
+            return gc_h_v(ctx, r1, acc);
         }
     }
     gc_h_lv_lvt(ctx, normalized, r0, acc)
 }
 
-/// `gc_h_V(R0, Acc)`.
-fn gc_h_V(ctx: &mut BifContext<'_>, r0: Eterm, mut acc: Vec<Eterm>) -> Result<Eterm> {
+/// The oracle's `gc_h_V(R0, Acc)` clause (Hangul `V` run, then optionally `T`).
+fn gc_h_v(ctx: &mut BifContext<'_>, r0: Eterm, mut acc: Vec<Eterm>) -> Result<Eterm> {
     let normalized = cp(ctx, r0)?;
     if let Some((cp1, r1)) = head_tail(normalized) {
         if in_v_term(cp1) {
             acc.insert(0, cp1);
-            return gc_h_V(ctx, r1, acc);
+            return gc_h_v(ctx, r1, acc);
         }
         if in_t_term(cp1) {
             acc.insert(0, cp1);
-            return gc_h_T(ctx, r1, acc);
+            return gc_h_t(ctx, r1, acc);
         }
     }
     if acc.len() == 1 {
@@ -625,13 +644,13 @@ fn gc_h_V(ctx: &mut BifContext<'_>, r0: Eterm, mut acc: Vec<Eterm>) -> Result<Et
     gc_extend2(ctx, normalized, r0, acc)
 }
 
-/// `gc_h_T(R0, Acc)`.
-fn gc_h_T(ctx: &mut BifContext<'_>, r0: Eterm, mut acc: Vec<Eterm>) -> Result<Eterm> {
+/// The oracle's `gc_h_T(R0, Acc)` clause (Hangul `T` run).
+fn gc_h_t(ctx: &mut BifContext<'_>, r0: Eterm, mut acc: Vec<Eterm>) -> Result<Eterm> {
     let normalized = cp(ctx, r0)?;
     if let Some((cp1, r1)) = head_tail(normalized) {
         if in_t_term(cp1) {
             acc.insert(0, cp1);
-            return gc_h_T(ctx, r1, acc);
+            return gc_h_t(ctx, r1, acc);
         }
     }
     if acc.len() == 1 {
@@ -650,16 +669,16 @@ fn gc_h_lv_lvt(
 ) -> Result<Eterm> {
     if let Some((cp1, r1)) = head_tail(first) {
         // gc_h_lv_lvt([CP|_], _R0, _Acc) when not ?IS_CP(CP) -> error(badarg)
-        let Some(value) = cp_value(cp1) else {
+        if cp_value(cp1).is_none() {
             return Err(badarg());
-        };
+        }
         if in_lv_term(cp1) {
             acc.insert(0, cp1);
-            return gc_h_V(ctx, r1, acc);
+            return gc_h_v(ctx, r1, acc);
         }
         if in_lvt_term(cp1) {
             acc.insert(0, cp1);
-            return gc_h_T(ctx, r1, acc);
+            return gc_h_t(ctx, r1, acc);
         }
         if acc.is_empty() {
             let next = cp(ctx, r1)?;
@@ -720,650 +739,11 @@ fn gc_indic(
     Err(function_clause())
 }
 
+// The oracle corpus lives in its own file: it is data plus a harness (the verbatim
+// `~w` rendering of the system oracle's answers, the term builders it is expressed
+// with, and the live-oracle cross-check), not part of the walk. It belongs to this
+// module all the same — `use super::*;` reaches the port's private helpers and the
+// frozen `pub(crate)` re-export above, which the integration-test crate cannot see.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use beam_alloc::Heap;
-    use beam_codec::term::{make_big, make_binary, make_bitstring};
-    use beam_common::BeamError;
-    use beam_process::ProcessId;
-    use beam_term::compare::eq;
-    use beam_term::AtomTable;
+mod tests;
 
-    /// A term in the corpus, either as input or as an expected value.
-    #[derive(Clone, Debug)]
-    enum Expr {
-        Int(i64),
-        /// `1 bsl k` — a bignum.
-        BigPow2(u32),
-        Float(f64),
-        Bin(Vec<u8>),
-        /// `<<bytes:bits>>`.
-        Bits(Vec<u8>, usize),
-        Nil,
-        List(Vec<Expr>),
-        Cons(Box<Expr>, Box<Expr>),
-        Tuple(Vec<Expr>),
-        /// `{error, X}`.
-        ErrorTuple(Box<Expr>),
-    }
-
-    /// What the oracle does for a case.
-    #[derive(Clone, Debug)]
-    enum Outcome {
-        Value(Expr),
-        /// A bare `error` reason atom (`function_clause`, `badarg`).
-        AtomRaise(&'static str),
-        /// A structured `{badarg, X}` raise.
-        BadArgRaise(Expr),
-    }
-
-    struct Case {
-        name: &'static str,
-        input: Expr,
-        next: Outcome,
-        len: Outcome,
-    }
-
-    fn seeded_atoms() -> AtomTable {
-        let mut atoms = AtomTable::new();
-        atoms.seed(["error", "true", "false", "badarg", "function_clause"]);
-        atoms
-    }
-
-    fn pow2_limbs(k: u32) -> Vec<u64> {
-        let mut limbs = vec![0u64; (k / 36) as usize + 1];
-        limbs[(k / 36) as usize] = 1u64 << (k % 36);
-        limbs
-    }
-
-    fn build(ctx: &mut BifContext<'_>, expr: &Expr) -> Eterm {
-        match expr {
-            Expr::Int(value) => ctx.int(*value).expect("a small int fits"),
-            Expr::BigPow2(k) => make_big(ctx.heap(), false, &pow2_limbs(*k)).expect("a bignum"),
-            Expr::Float(value) => ctx.make_float(*value).expect("a float"),
-            Expr::Bin(bytes) => make_binary(ctx.heap(), bytes).expect("a binary"),
-            Expr::Bits(bytes, bits) => {
-                make_bitstring(ctx.heap(), bytes, *bits).expect("a bitstring")
-            }
-            Expr::Nil => NIL,
-            Expr::List(items) => {
-                let items: Vec<Eterm> = items.iter().map(|item| build(ctx, item)).collect();
-                ctx.list(&items).expect("a short list fits")
-            }
-            Expr::Cons(head, tail) => {
-                let head = build(ctx, head);
-                let tail = build(ctx, tail);
-                ctx.cons(head, tail).expect("a cons cell fits")
-            }
-            Expr::Tuple(items) => {
-                let items: Vec<Eterm> = items.iter().map(|item| build(ctx, item)).collect();
-                ctx.tuple(&items).expect("a short tuple fits")
-            }
-            Expr::ErrorTuple(payload) => {
-                let tag = ctx.atom("error").expect("the atom `error` is seeded");
-                let payload = build(ctx, payload);
-                ctx.tuple(&[tag, payload]).expect("a tuple fits")
-            }
-        }
-    }
-
-    /// The live reason term of a structured raise.
-    fn live_reason(error: &BeamError) -> Eterm {
-        match error {
-            BeamError::Raise(raise) => raise
-                .live_reason()
-                .and_then(|live| live.downcast_ref::<Eterm>().copied())
-                .expect("a structured raise carries its reason term"),
-            other => panic!("expected a raise, got {other:?}"),
-        }
-    }
-
-    fn check(
-        ctx: &mut BifContext<'_>,
-        atoms: &AtomTable,
-        case: &Case,
-        what: &str,
-        got: Result<Eterm>,
-        want: &Outcome,
-    ) {
-        match (got, want) {
-            (Ok(got), Outcome::Value(want)) => {
-                let want = build(ctx, want);
-                assert!(
-                    eq(got, want, atoms),
-                    "case `{}` {what}: got a different term",
-                    case.name
-                );
-            }
-            (Err(error), Outcome::AtomRaise(atom)) => {
-                assert_eq!(
-                    error.as_atom(),
-                    Some(*atom),
-                    "case `{}` {what}: wrong raise",
-                    case.name
-                );
-            }
-            (Err(error), Outcome::BadArgRaise(reason)) => {
-                let want = build(ctx, reason);
-                assert_eq!(error.as_atom(), None, "case `{}` {what}", case.name);
-                let got = live_reason(&error);
-                assert!(
-                    eq(got, want, atoms),
-                    "case `{}` {what}: wrong `{{badarg, _}}` payload",
-                    case.name
-                );
-            }
-            (Ok(_), want) => panic!("case `{}` {what}: expected {want:?}, got a value", case.name),
-            (Err(error), want) => panic!(
-                "case `{}` {what}: expected {want:?}, got the raise {error:?}",
-                case.name
-            ),
-        }
-    }
-
-    /// `nil` — a helper so the table reads like the oracle's `~w` output.
-    fn ints(values: &[i64]) -> Expr {
-        Expr::List(values.iter().copied().map(Expr::Int).collect())
-    }
-
-    fn bytes(bytes: &[u8]) -> Expr {
-        Expr::Bin(bytes.to_vec())
-    }
-
-    /// Every corpus case: `(input, next_grapheme, string:length)`.
-    ///
-    /// Each row is the verbatim `~w` rendering of the system oracle's answer
-    /// (OTP 29.1.1 / erts-17.1); a row is a `Value`, a bare `badarg`, or a bare
-    /// `function_clause`/`{badarg, X}` raise.
-    fn cases() -> Vec<Case> {
-        fn case(
-            name: &'static str,
-            input: Expr,
-            next: Outcome,
-            len: Outcome,
-        ) -> Case {
-            Case {
-                name,
-                input,
-                next,
-                len,
-            }
-        }
-        fn value(expr: Expr) -> Outcome {
-            Outcome::Value(expr)
-        }
-        fn err(payload: Expr) -> Outcome {
-            Outcome::BadArgRaise(payload)
-        }
-        let fc = Outcome::AtomRaise("function_clause");
-        let ba = Outcome::AtomRaise("badarg");
-        vec![
-            case(
-                "combining-mark list",
-                ints(&[97, 769, 98]),
-                value(Expr::List(vec![ints_raw(&[97, 769]), Expr::Int(98)])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "combining-mark binary",
-                bytes(&[97, 204, 129, 98]),
-                value(Expr::Cons(
-                    Box::new(ints_raw(&[97, 769])),
-                    Box::new(bytes(&[98])),
-                )),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "cjk binary tail",
-                bytes(&[230, 151, 165, 226, 130, 172]),
-                value(Expr::Cons(
-                    Box::new(Expr::Int(26085)),
-                    Box::new(bytes(&[226, 130, 172])),
-                )),
-                value(Expr::Int(2)),
-            ),
-            case("two latin1", ints(&[255, 254]), value(ints(&[255, 254])), value(Expr::Int(2))),
-            case(
-                "binary inside a list",
-                Expr::List(vec![bytes(b"abc"), Expr::Int(100)]),
-                value(Expr::List(vec![
-                    Expr::Int(97),
-                    bytes(&[98, 99]),
-                    Expr::Int(100),
-                ])),
-                value(Expr::Int(4)),
-            ),
-            case(
-                "nested lists",
-                Expr::List(vec![ints(&[97, 98]), ints(&[99, 100])]),
-                value(ints(&[97, 98, 99, 100])),
-                value(Expr::Int(4)),
-            ),
-            case(
-                "empty binary then a cp",
-                Expr::List(vec![bytes(b""), Expr::Int(97)]),
-                value(ints(&[97])),
-                value(Expr::Int(1)),
-            ),
-            case(
-                "improper cons with a binary tail",
-                Expr::Cons(Box::new(Expr::Int(97)), Box::new(bytes(&[98, 99]))),
-                value(Expr::Cons(Box::new(Expr::Int(97)), Box::new(bytes(&[98, 99])))),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "improper cons with an integer tail",
-                Expr::Cons(Box::new(Expr::Int(97)), Box::new(Expr::Int(98))),
-                value(Expr::Cons(Box::new(Expr::Int(97)), Box::new(Expr::Int(98)))),
-                fc,
-            ),
-            case(
-                "truncated utf-8 tail",
-                bytes(&[97, 204, 129, 200]),
-                value(Expr::List(vec![ints_raw(&[97, 769]), bytes(&[200])])),
-                err(bytes(&[200])),
-            ),
-            // A stray continuation byte at the head of a binary: `cp/1` has no
-            // clause for it, so the whole (unconsumed) binary comes back.
-            case(
-                "invalid utf-8 head",
-                bytes(&[169, 200]),
-                value(Expr::ErrorTuple(Box::new(bytes(&[169, 200])))),
-                err(bytes(&[169, 200])),
-            ),
-            case(
-                "invalid utf-8 head (cont)",
-                bytes(&[169, 199]),
-                value(Expr::ErrorTuple(Box::new(bytes(&[169, 199])))),
-                err(bytes(&[169, 199])),
-            ),
-            case(
-                "invalid utf-8 head (ascii)",
-                bytes(&[169, 97]),
-                value(Expr::ErrorTuple(Box::new(bytes(&[169, 97])))),
-                err(bytes(&[169, 97])),
-            ),
-            case(
-                "invalid utf-8 head (two lead bytes)",
-                bytes(&[200, 201]),
-                value(Expr::ErrorTuple(Box::new(bytes(&[200, 201])))),
-                err(bytes(&[200, 201])),
-            ),
-            case(
-                "invalid utf-8 head (nul)",
-                bytes(&[169, 0]),
-                value(Expr::ErrorTuple(Box::new(bytes(&[169, 0])))),
-                err(bytes(&[169, 0])),
-            ),
-            case(
-                "invalid utf-8 head (single byte)",
-                bytes(&[169]),
-                value(Expr::ErrorTuple(Box::new(bytes(&[169])))),
-                err(bytes(&[169])),
-            ),
-            case(
-                "invalid utf-8 head (single continuation)",
-                bytes(&[200]),
-                value(Expr::ErrorTuple(Box::new(bytes(&[200])))),
-                err(bytes(&[200])),
-            ),
-            // 173 (`SOFT HYPHEN`) is a control singleton: it must be caught before
-            // the Latin-1 fast path, so it does not absorb the following extend.
-            case(
-                "soft hyphen is a control",
-                ints(&[173, 769, 97]),
-                value(ints(&[173, 769, 97])),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "prepend then an ascii cp",
-                ints(&[1536, 97]),
-                value(Expr::List(vec![ints_raw(&[1536, 97])])),
-                value(Expr::Int(1)),
-            ),
-            case(
-                "prepend then a combining mark",
-                ints(&[1536, 769, 97]),
-                value(Expr::List(vec![ints_raw(&[1536, 769]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "prepend then a control",
-                ints(&[1536, 10, 97]),
-                value(ints(&[1536, 10, 97])),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "regional indicator pair",
-                ints(&[127462, 127463, 127464, 127465, 97]),
-                value(Expr::List(vec![
-                    ints_raw(&[127462, 127463]),
-                    Expr::Int(127464),
-                    Expr::Int(127465),
-                    Expr::Int(97),
-                ])),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "hangul L+V then a control",
-                ints(&[1100, 1161, 11, 97]),
-                value(Expr::List(vec![
-                    ints_raw(&[1100, 1161]),
-                    Expr::Int(11),
-                    Expr::Int(97),
-                ])),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "hangul L+V+T",
-                ints(&[4352, 4449, 4520, 97]),
-                value(Expr::List(vec![ints_raw(&[4352, 4449, 4520]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "hangul LV+T",
-                ints(&[44032, 4520, 97]),
-                value(Expr::List(vec![ints_raw(&[44032, 4520]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "hangul L+L",
-                ints(&[4352, 4352, 97]),
-                value(Expr::List(vec![ints_raw(&[4352, 4352]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "indic consonant + zwj",
-                ints(&[2325, 8205, 2326, 97]),
-                value(Expr::List(vec![ints_raw(&[2325, 8205]), Expr::Int(2326), Expr::Int(97)])),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "indic consonant + vowel sign",
-                ints(&[2325, 2366, 97]),
-                value(Expr::List(vec![ints_raw(&[2325, 2366]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "indic conjunct cluster",
-                ints(&[2325, 2366, 2381, 2326, 97]),
-                value(Expr::List(vec![
-                    ints_raw(&[2325, 2366, 2381, 2326]),
-                    Expr::Int(97),
-                ])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "lone indic linker",
-                ints(&[2381, 97]),
-                value(ints(&[2381, 97])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "emoji zwj sequence",
-                ints(&[128104, 8205, 128105, 97]),
-                value(Expr::List(vec![
-                    ints_raw(&[128104, 8205, 128105]),
-                    Expr::Int(97),
-                ])),
-                value(Expr::Int(2)),
-            ),
-            case("empty list", Expr::Nil, value(Expr::Nil), value(Expr::Int(0))),
-            case("empty binary", bytes(b""), value(Expr::Nil), value(Expr::Int(0))),
-            case("single cp", ints(&[400]), value(ints(&[400])), value(Expr::Int(1))),
-            case(
-                "single cp then ascii",
-                ints(&[400, 97]),
-                value(ints(&[400, 97])),
-                value(Expr::Int(2)),
-            ),
-            case("out-of-range cp", ints(&[1114112]), fc.clone(), fc.clone()),
-            case(
-                "negative then ascii",
-                Expr::List(vec![Expr::Int(-1), Expr::Int(97)]),
-                fc.clone(),
-                fc.clone(),
-            ),
-            case(
-                "bignum",
-                Expr::List(vec![Expr::BigPow2(70)]),
-                fc.clone(),
-                fc.clone(),
-            ),
-            case("float", Expr::Float(1.5), fc.clone(), fc.clone()),
-            case(
-                "tuple",
-                Expr::Tuple(vec![Expr::Int(1), Expr::Int(2)]),
-                fc.clone(),
-                fc.clone(),
-            ),
-            case(
-                "non-byte-aligned bitstring",
-                Expr::Bits(vec![1], 1),
-                fc.clone(),
-                fc.clone(),
-            ),
-            case(
-                "one nested list",
-                Expr::List(vec![ints(&[97, 98])]),
-                value(ints(&[97, 98])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "improper tail inside a list",
-                Expr::List(vec![Expr::Int(97), Expr::Cons(Box::new(Expr::Int(98)), Box::new(Expr::Int(99)))]),
-                value(Expr::Cons(Box::new(Expr::Int(97)), Box::new(Expr::Int(98)))),
-                fc.clone(),
-            ),
-            case(
-                "binary then an empty binary",
-                Expr::List(vec![bytes(&[97]), bytes(b"")]),
-                value(Expr::List(vec![Expr::Int(97), bytes(b""), bytes(b"")])),
-                value(Expr::Int(1)),
-            ),
-            case("nul", ints(&[0]), value(ints(&[0])), value(Expr::Int(1))),
-            case(
-                "crlf then ascii",
-                ints(&[13, 10, 97]),
-                value(Expr::List(vec![ints_raw(&[13, 10]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "ascii then crlf",
-                ints(&[97, 13, 10, 98]),
-                value(ints(&[97, 13, 10, 98])),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "two combining marks",
-                ints(&[776, 769]),
-                value(Expr::List(vec![ints_raw(&[776, 769])])),
-                value(Expr::Int(1)),
-            ),
-            case(
-                "two prepends",
-                ints(&[1536, 1537]),
-                value(Expr::List(vec![ints_raw(&[1536, 1537])])),
-                value(Expr::Int(1)),
-            ),
-            case("zwj alone", ints(&[8205]), value(ints(&[8205])), value(Expr::Int(1))),
-            case(
-                "ascii then crlf (no trailing)",
-                ints(&[97, 13, 10]),
-                value(ints(&[97, 13, 10])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "three nested lists",
-                Expr::List(vec![ints(&[97, 98]), ints(&[99, 100]), ints(&[101, 102])]),
-                value(Expr::List(vec![
-                    Expr::Int(97),
-                    Expr::Int(98),
-                    Expr::Int(99),
-                    Expr::Int(100),
-                    ints_raw(&[101, 102]),
-                ])),
-                value(Expr::Int(6)),
-            ),
-            case(
-                "surrogate-range integer",
-                ints(&[97, 204, 129, 200, 201]),
-                value(ints(&[97, 204, 129, 200, 201])),
-                value(Expr::Int(5)),
-            ),
-            case(
-                "extended pictographic below 256, binary roll-back",
-                Expr::List(vec![Expr::Int(169), bytes(&[200])]),
-                value(Expr::List(vec![
-                    Expr::Int(169),
-                    bytes(&[200]),
-                    bytes(&[200]),
-                ])),
-                err(Expr::List(vec![bytes(&[200]), bytes(&[200])])),
-            ),
-            case(
-                "extended pictographic then a suffix",
-                Expr::List(vec![Expr::Int(169), bytes(&[200]), Expr::Int(97)]),
-                value(Expr::List(vec![
-                    Expr::Int(169),
-                    bytes(&[200]),
-                    Expr::Int(97),
-                    Expr::List(vec![bytes(&[200]), Expr::Int(97)]),
-                ])),
-                err(Expr::List(vec![
-                    bytes(&[200]),
-                    Expr::Int(97),
-                    Expr::List(vec![bytes(&[200]), Expr::Int(97)]),
-                ])),
-            ),
-            case(
-                "extended pictographic 174, binary roll-back",
-                Expr::List(vec![Expr::Int(174), bytes(&[200])]),
-                value(Expr::List(vec![
-                    Expr::Int(174),
-                    bytes(&[200]),
-                    bytes(&[200]),
-                ])),
-                err(Expr::List(vec![bytes(&[200]), bytes(&[200])])),
-            ),
-            // The saved prefix is a binary here, so the `++` in `gc_ext_pict/3`
-            // raises the bare `badarg` (never `{badarg, _}`).
-            case(
-                "extended pictographic with a binary prefix",
-                Expr::List(vec![
-                    Expr::List(vec![Expr::Int(169)]),
-                    bytes(&[200]),
-                ]),
-                ba.clone(),
-                ba.clone(),
-            ),
-            case(
-                "one nested list of one cp",
-                Expr::List(vec![ints(&[169, 200])]),
-                value(ints(&[169, 200])),
-                value(Expr::Int(2)),
-            ),
-            case(
-                "soft hyphen then a cp",
-                ints(&[169, 200]),
-                value(ints(&[169, 200])),
-                value(Expr::Int(2)),
-            ),
-            case("control 8225", ints(&[8225, 97]), value(ints(&[8225, 97])), value(Expr::Int(2))),
-            case("ascii 111", ints(&[111]), value(ints(&[111])), value(Expr::Int(1))),
-            case("ascii 128", ints(&[128]), value(ints(&[128])), value(Expr::Int(1))),
-            case(
-                "ascii 128 twice",
-                ints(&[128, 128]),
-                value(ints(&[128, 128])),
-                value(Expr::Int(2)),
-            ),
-            case("indic linker+consonant", ints(&[2381, 2326, 97]), value(ints(&[2381, 2326, 97])), value(Expr::Int(3))),
-            case(
-                "two picTOgraphics",
-                ints(&[128104, 128105]),
-                value(ints(&[128104, 128105])),
-                value(Expr::Int(2)),
-            ),
-            case("soft hyphen alone (169)", ints(&[169]), value(ints(&[169])), value(Expr::Int(1))),
-            case("two combining marks (2)", ints(&[771, 775]), value(Expr::List(vec![ints_raw(&[771, 775])])), value(Expr::Int(1))),
-            case("cr alone", ints(&[13]), value(ints(&[13])), value(Expr::Int(1))),
-            case("two cr", ints(&[13, 13]), value(ints(&[13, 13])), value(Expr::Int(2))),
-            case("lf then cr", ints(&[10, 13]), value(ints(&[10, 13])), value(Expr::Int(2))),
-            case("prepend then ascii (2)", ints(&[1757, 97]), value(Expr::List(vec![ints_raw(&[1757, 97])])), value(Expr::Int(1))),
-            case(
-                "prepend then soft hyphen",
-                ints(&[1757, 173, 97]),
-                value(ints(&[1757, 173, 97])),
-                value(Expr::Int(3)),
-            ),
-            case("prepend then crlf", ints(&[1536, 13, 10]), value(ints(&[1536, 13, 10])), value(Expr::Int(2))),
-            case("ascii prepend ascii", ints(&[97, 1536, 97]), value(ints(&[97, 1536, 97])), value(Expr::Int(2))),
-            case("regional alone", ints(&[127462, 97]), value(ints(&[127462, 97])), value(Expr::Int(2))),
-            case(
-                "three regionals",
-                ints(&[127462, 127463, 127463]),
-                value(Expr::List(vec![ints_raw(&[127462, 127463]), Expr::Int(127463)])),
-                value(Expr::Int(2)),
-            ),
-            case("LV then L", ints(&[44032, 4352, 97]), value(ints(&[44032, 4352, 97])), value(Expr::Int(3))),
-            case(
-                "L then LV",
-                ints(&[4352, 44032, 97]),
-                value(Expr::List(vec![ints_raw(&[4352, 44032]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case("T then LV", ints(&[4520, 44032, 97]), value(ints(&[4520, 44032, 97])), value(Expr::Int(3))),
-            case("max cp", ints(&[1114111]), value(ints(&[1114111])), value(Expr::Int(1))),
-            case("max cp then ascii", ints(&[1114111, 97]), value(ints(&[1114111, 97])), value(Expr::Int(2))),
-            case(
-                "variation selectors",
-                ints(&[65024, 65024, 97]),
-                value(Expr::List(vec![ints_raw(&[65024, 65024]), Expr::Int(97)])),
-                value(Expr::Int(2)),
-            ),
-            case("control 8400", ints(&[8400, 97]), value(ints(&[8400, 97])), value(Expr::Int(2))),
-            case("control 8288", ints(&[8288, 97]), value(ints(&[8288, 97])), value(Expr::Int(2))),
-            case("169 then ascii", ints(&[169, 97]), value(ints(&[169, 97])), value(Expr::Int(2))),
-            case("174 then ascii", ints(&[174, 97]), value(ints(&[174, 97])), value(Expr::Int(2))),
-            case(
-                "169 and 174 then ascii",
-                ints(&[169, 174, 97]),
-                value(ints(&[169, 174, 97])),
-                value(Expr::Int(3)),
-            ),
-            case(
-                "hangul run",
-                ints(&[1100, 1161, 1161, 1162, 97]),
-                value(Expr::List(vec![
-                    ints_raw(&[1100, 1161, 1161]),
-                    Expr::Int(1162),
-                    Expr::Int(97),
-                ])),
-                value(Expr::Int(3)),
-            ),
-        ]
-    }
-
-    /// A list built from an owned slice of small integers.
-    fn ints_raw(values: &[i64]) -> Expr {
-        Expr::List(values.iter().copied().map(Expr::Int).collect())
-    }
-
-    #[test]
-    fn the_corpus_matches_the_oracle_bit_for_bit() {
-        let cases = cases();
-        assert!(!cases.is_empty(), "the grapheme corpus must not be empty");
-        let mut heap = Heap::new(1 << 22).expect("test heap");
-        let atoms = seeded_atoms();
-        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
-        for case in &cases {
-            let input = build(&mut ctx, &case.input);
-            let next = gc(&mut ctx, input);
-            check(&mut ctx, &atoms, case, "next_grapheme", next, &case.next);
-            let len = crate::unicode::grapheme::grapheme_count(&mut ctx, input);
-            check(&mut ctx, &atoms, case, "string:length", len, &case.len);
-        }
-    }
-}
