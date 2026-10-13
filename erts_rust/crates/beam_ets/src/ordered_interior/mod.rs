@@ -29,7 +29,9 @@
 //! exactly with `beam_term::compare::eq`.
 //!
 //! The index is a real B+-tree of order 32 rather than a sorted `Vec`, so exact
-//! lookup, insertion and deletion are `O(log n)` instead of `O(n)`:
+//! lookup, insertion and deletion are `O(log n)` node visits instead of the sorted
+//! `Vec`'s `O(n)` — amortized for insertion, `O(log^2 n)` (pointer chases, not term
+//! comparisons) for deletion; `tree.rs`'s `# Complexity` states the exact bounds:
 //!
 //! * [`node`] — the nodes (a sorted entry run in a leaf, children plus their
 //!   subtree maxima in a branch), the arena that owns them, and the two node-local
