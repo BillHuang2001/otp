@@ -22,23 +22,44 @@
 //!
 //! Every key here is a declared `bif.tab` entry whose implementation needs host
 //! machinery this crate does not own: the interpreter-level debugger tools
-//! (`erl_debugger`), the live driver registry (`erl_ddll`), the
-//! code-coverage bookkeeping (`code`), the `ets` scheduler fan-in
+//! (`erl_debugger`), the code-coverage bookkeeping (`code`), the `ets` scheduler fan-in
 //! (`internal_request_all/0`) and C-interior slot walk (`slot/2`), the
 //! tracing-state cleanup and literal-area copy protocols, and the `prim_file` NFC
 //! normalizer, `os` signal handling, `net_kernel` distribution flag and
 //! `error_logger` category map. Each is registered through the single
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so a call answers the typed
 //! `unsupported_bif` capability gap until the runtime installs a hook -- never
-//! `undef`, never a fabricated value. The `re` group is the exception: those 8 keys
-//! are served by the real in-crate engine (`crate::re`), not the seam.
+//! `undef`, never a fabricated value. Two groups are the exception: the 8 `re` keys are
+//! served by the real in-crate engine (`crate::re`) and the whole 6-key `erl_ddll`
+//! surface by the loaded-driver registry + `beam_abi`'s driver loader
+//! ([`crate::runtime::ddll`]), not the seam.
 
 use crate::registry::BifRegistry;
 
 /// The `(module, function, arity)` keys this module registers **for real** (not
-/// through the `RuntimeHooks` seam) — a single-source alias of [`crate::re`]'s own
-/// [`REAL_BIFS`](crate::re).
-pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = crate::re::REAL_BIFS;
+/// through the `RuntimeHooks` seam): the 8 [`crate::re`] engine keys registered by
+/// `crate::re::register` plus the 6 `erl_ddll` keys registered by
+/// [`crate::runtime::ddll::live::register`], [`crate::runtime::ddll::info::register`] and
+/// [`crate::runtime::ddll::monitor::register`].
+///
+/// (`erl_ddll:format_error_int/1` is the seventh real `erl_ddll` key, registered by
+/// `crate::runtime::ddll::register` in the containing family, not here.)
+pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
+    ("erl_ddll", "demonitor", 1),
+    ("erl_ddll", "info", 2),
+    ("erl_ddll", "loaded_drivers", 0),
+    ("erl_ddll", "monitor", 2),
+    ("erl_ddll", "try_load", 3),
+    ("erl_ddll", "try_unload", 2),
+    ("re", "compile", 1),
+    ("re", "compile", 2),
+    ("re", "import", 1),
+    ("re", "inspect", 2),
+    ("re", "internal_run", 4),
+    ("re", "run", 2),
+    ("re", "run", 3),
+    ("re", "version", 0),
+];
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
@@ -67,14 +88,15 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     // the in-crate engine (`crate::re`), not `RuntimeHooks` seam keys.
     crate::re::register(reg);
 
-    // `erl_ddll` -- the dynamically linked driver loader. `format_error_int/1` is
-    // the one self-contained key and is implemented for real in `src/runtime/ddll.rs`.
-    crate::runtime::runtime_bif!(reg, "erl_ddll", demonitor, 1);
-    crate::runtime::runtime_bif!(reg, "erl_ddll", info, 2);
-    crate::runtime::runtime_bif!(reg, "erl_ddll", loaded_drivers, 0);
-    crate::runtime::runtime_bif!(reg, "erl_ddll", monitor, 2);
-    crate::runtime::runtime_bif!(reg, "erl_ddll", try_load, 3);
-    crate::runtime::runtime_bif!(reg, "erl_ddll", try_unload, 2);
+    // `erl_ddll` -- the dynamically linked driver loader. The whole family is real: the
+    // error table `format_error_int/1` in `src/runtime/ddll.rs`; the loading keys
+    // (`loaded_drivers/0`, `try_load/3`, `try_unload/2`) by the loaded-driver registry +
+    // `beam_abi`'s driver loader in `src/runtime/ddll/live.rs`; the state report `info/2` in
+    // `src/runtime/ddll/info.rs`; and the event registrations `monitor/2`/`demonitor/1` in
+    // `src/runtime/ddll/monitor.rs`. No `erl_ddll` key is a `RuntimeHooks` seam key.
+    crate::runtime::ddll::live::register(reg);
+    crate::runtime::ddll::info::register(reg);
+    crate::runtime::ddll::monitor::register(reg);
 
     // `code` -- the module code-coverage bookkeeping.
     crate::runtime::runtime_bif!(reg, "code", coverage_support, 0);
@@ -105,14 +127,25 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     // `error_logger` -- the legacy warning-category map.
     crate::runtime::runtime_bif!(reg, "error_logger", warning_map, 0);
 
-    // The 8 keys this family owns for real (see `REAL_BIFS`) are registered by
-    // `crate::re::register` above; assert they really landed so the roster cannot drift
-    // from what was registered.
+    // The 14 keys this family owns for real (see `REAL_BIFS`) are registered by `crate::re::register`
+    // and the three `crate::runtime::ddll` submodule `register`s above; assert they really landed so
+    // the roster cannot drift from what was registered.
     debug_assert!(
         REAL_BIFS
             .iter()
             .all(|(module, function, arity)| reg.contains(module, function, *arity)),
         "REAL_BIFS lists a key that this module does not register"
+    );
+    // The combined literal must cover every source roster (`crate::re`'s 8 and the three
+    // `crate::runtime::ddll` submodules' 6), so a key added to any of them cannot go missing here.
+    debug_assert!(
+        crate::re::REAL_BIFS
+            .iter()
+            .chain(crate::runtime::ddll::live::REAL_BIFS)
+            .chain(crate::runtime::ddll::info::REAL_BIFS)
+            .chain(crate::runtime::ddll::monitor::REAL_BIFS)
+            .all(|(module, function, arity)| REAL_BIFS.contains(&(*module, *function, *arity))),
+        "REAL_BIFS must cover the `re` and every `erl_ddll` roster"
     );
 }
 
@@ -126,9 +159,9 @@ mod tests {
 
     /// Every `RuntimeHooks`-seam key registered here is reachable and, with no
     /// [`RuntimeHooks`] hook installed, answers the typed capability gap rather than a
-    /// fabricated value. The `re` keys are **not** seam keys, though: they are real
-    /// implementations (`crate::re`) and are asserted to *run* (`re:run/3` returns the
-    /// engine's `{match,[{2,1}]}`), not merely to be reachable.
+    /// fabricated value. The `re` and all six `erl_ddll` keys are **not** seam keys, though: they are
+    /// real implementations (`crate::re`, `crate::runtime::ddll`) and are asserted to *run*
+    /// (`re:run/3` returns the engine's `{match,[{2,1}]}`), not merely to be reachable.
     ///
     /// [`RuntimeHooks`]: crate::context::RuntimeHooks
     #[test]
@@ -198,7 +231,7 @@ mod tests {
     fn os_set_signal_is_a_roster_seam_key_forwarder() {
         assert!(
             crate::hook_sets::needs_runtime_hooks("os", "set_signal", 2),
-            "os:set_signal/2 must be in the 179-key RuntimeHooks roster"
+            "os:set_signal/2 must be in the 173-key RuntimeHooks roster"
         );
 
         let mut reg = BifRegistry::new();
@@ -221,5 +254,29 @@ mod tests {
                 other => panic!("expected unsupported_bif, got {other:?}"),
             }
         }
+    }
+
+    /// The keys this family serves for real are exactly [`super::REAL_BIFS`]: the 8 `re` engine keys
+    /// ([`crate::re::REAL_BIFS`]) plus the 6 `erl_ddll` keys
+    /// ([`crate::runtime::ddll::live::REAL_BIFS`] ∪ [`crate::runtime::ddll::info::REAL_BIFS`] ∪
+    /// [`crate::runtime::ddll::monitor::REAL_BIFS`]). Ties the source rosters to this file's
+    /// combined literal so any of them drifting is caught here.
+    #[test]
+    fn the_real_roster_is_the_re_and_ddll_keys() {
+        let real = super::REAL_BIFS;
+        assert_eq!(real.len(), 14);
+        for key in crate::re::REAL_BIFS {
+            assert!(real.contains(key), "missing re key {key:?}");
+        }
+        for key in crate::runtime::ddll::live::REAL_BIFS
+            .iter()
+            .chain(crate::runtime::ddll::info::REAL_BIFS)
+            .chain(crate::runtime::ddll::monitor::REAL_BIFS)
+        {
+            assert!(real.contains(key), "missing ddll key {key:?}");
+        }
+        let mut sorted = real.to_vec();
+        sorted.sort_unstable();
+        assert!(sorted.iter().eq(real.iter()), "REAL_BIFS is not sorted");
     }
 }
