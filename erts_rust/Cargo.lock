@@ -130,6 +130,7 @@ name = "beam_gc"
 version = "0.1.0"
 dependencies = [
  "beam_alloc",
+ "beam_codec",
  "beam_common",
  "beam_term",
  "libc",
