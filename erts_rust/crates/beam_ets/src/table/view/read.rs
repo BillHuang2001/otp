@@ -354,7 +354,12 @@ impl<'g> TableRead<'g> {
         let mut capacity = self.scratch_capacity();
         loop {
             self.ensure_scratch(capacity)?;
-            let scratch = self.scratch.as_mut().expect("scratch ensured above");
+            // The scratch heap was just ensured above; if it is somehow absent, that
+            // is a typed capability failure, never a panic on a runtime path.
+            let scratch = self
+                .scratch
+                .as_mut()
+                .ok_or_else(|| crate::error::unsupported("read view scratch heap unavailable"))?;
             scratch.reset();
             match run(&self.guard, scratch) {
                 Ok(value) => return Ok(value),
@@ -376,7 +381,12 @@ impl<'g> TableRead<'g> {
         let mut capacity = self.scratch_capacity();
         loop {
             self.ensure_scratch(capacity)?;
-            let scratch = self.scratch.as_mut().expect("scratch ensured above");
+            // As `run_with_scratch`: an absent scratch heap is a typed failure, not a
+            // panic on a runtime path.
+            let scratch = self
+                .scratch
+                .as_mut()
+                .ok_or_else(|| crate::error::unsupported("read view scratch heap unavailable"))?;
             scratch.reset();
             match run(&self.guard, scratch) {
                 Ok(raw) => {

@@ -34,7 +34,7 @@ use beam_common::Result;
 use beam_term::prelude::*;
 
 use crate::store::TermStore;
-use crate::table::Table;
+use crate::table::{OwnerId, Table};
 
 /// A term read out of table-owned storage under a live table guard.
 ///
@@ -88,6 +88,13 @@ use crate::table::Table;
 /// // A `{1, 10}` 2-tuple is a header plus two element words.
 /// assert_eq!(size_object(copy), 3);
 /// ```
+///
+/// A `TableTerm` is [`Copy`] (one word plus a zero-sized lifetime marker). That
+/// does **not** weaken the discipline: both the original and every copy stay
+/// bounded by `'g`, so a copy is never less confined than its source — it exists
+/// only so a tagged term can be handed back by value (e.g.
+/// [`HeirView::data`](super::HeirView) out of a live guard).
+#[derive(Clone, Copy)]
 pub struct TableTerm<'g> {
     /// The raw term word, read out of table-owned storage.
     term: Eterm,
@@ -327,5 +334,75 @@ impl core::fmt::Debug for TableTerm<'_> {
     /// could exist) or hostile word is never interpreted.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "TableTerm({:?})", self.term_class())
+    }
+}
+
+/// The installed heir, read under a live write guard.
+///
+/// [`data`](HeirView::data) is a [`TableTerm`] tagged to the view's borrow: the
+/// gift data may be a **table-owned** copy (the `install_heir`/creation-time path),
+/// so a bare aliasing [`Eterm`] must not escape the guard. Ownership metadata
+/// ([`owner`](HeirView::owner)) is owned and escapes freely.
+///
+/// Returning this from a `with_write` closure is a **compile error** — the view
+/// borrows the closure-local guard:
+///
+/// ```compile_fail
+/// use beam_ets::{Access, SharedTable, Table, TableId, TableKind, TableOptions};
+///
+/// let mut opts = TableOptions::new();
+/// opts.set_kind(TableKind::Set).set_access(Access::Public);
+/// let shared = SharedTable::new(Table::new(TableId::next(), opts).unwrap());
+///
+/// // Does not compile: the heir view borrows the closure-local write guard, so
+/// // neither it nor its tagged gift term may escape the closure.
+/// let leaked = shared.with_write(|write| write.heir()).unwrap();
+/// let _ = leaked.map(|heir| heir.owner());
+/// ```
+///
+/// Extracting **owned** metadata from inside the guard is fine — only the tagged
+/// term is confined to the closure (the same call shape as the failing example):
+///
+/// ```
+/// use beam_ets::{Access, SharedTable, Table, TableId, TableKind, TableOptions};
+///
+/// let mut opts = TableOptions::new();
+/// opts.set_kind(TableKind::Set).set_access(Access::Public);
+/// let shared = SharedTable::new(Table::new(TableId::next(), opts).unwrap());
+///
+/// let owner = shared
+///     .with_write(|write| write.heir().map(|heir| heir.owner()))
+///     .unwrap();
+/// assert!(owner.is_none(), "a fresh table has no heir");
+/// ```
+pub struct HeirView<'g> {
+    /// The heir process.
+    owner: OwnerId,
+    /// The gift data, tagged to the view's borrow (or `None` for the arity-2 form).
+    data: Option<TableTerm<'g>>,
+}
+
+impl<'g> HeirView<'g> {
+    /// Wrap the heir's owned metadata and its (possibly table-owned) gift term.
+    ///
+    /// Crate-internal: the [`TableWrite`](super::TableWrite) view is the only
+    /// producer, which is what keeps the gift term tagged to a live guard.
+    pub(super) fn new(owner: OwnerId, data: Option<Eterm>) -> HeirView<'g> {
+        HeirView {
+            owner,
+            data: data.map(TableTerm::new),
+        }
+    }
+
+    /// The heir process.
+    pub fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    /// The gift data (`{heir, Pid, Data}`'s `Data`), tagged to the view's borrow,
+    /// or `None` for the arity-2 `{heir, Pid}` form (which carries no gift data and
+    /// for which the oracle delivers **no** `{'ETS-TRANSFER', …}` message).
+    pub fn data(&self) -> Option<TableTerm<'g>> {
+        self.data
     }
 }

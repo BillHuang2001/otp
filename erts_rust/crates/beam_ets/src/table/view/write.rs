@@ -37,7 +37,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use super::TableTerm;
+use super::{HeirView, TableTerm};
 use crate::info::TableInfo;
 use crate::kind::{Access, TableKind};
 use crate::select::MatchSpec;
@@ -93,10 +93,18 @@ impl<'g> TableWrite<'g> {
         self.guard.owner()
     }
 
-    /// The installed heir, if any. Its [`data`](Heir::data) is `Some(term)` for an
-    /// arity-3 `{heir, Pid, Data}` and `None` for an arity-2 `{heir, Pid}`.
-    pub fn heir(&self) -> Option<Heir> {
-        self.guard.heir()
+    /// The installed heir, if any, read with its gift data tagged to this view's
+    /// borrow.
+    ///
+    /// The heir's `data` is `Some(term)` for an arity-3 `{heir, Pid, Data}` and
+    /// `None` for an arity-2 `{heir, Pid}`. That term may be a **table-owned** copy
+    /// (the `install_heir`/creation-time path), so it is handed back as a
+    /// [`TableTerm`] — it cannot escape the guard, exactly like every other tagged
+    /// read. Use [`TableTerm::copy_into`] to own it.
+    pub fn heir(&self) -> Option<HeirView<'_>> {
+        self.guard
+            .heir()
+            .map(|heir| HeirView::new(heir.owner, heir.data))
     }
 
     /// The registered table name, if any (independent of `named_table`).
@@ -138,16 +146,28 @@ impl<'g> TableWrite<'g> {
     /// table's `protection` on every operation (read **and** write) and raises
     /// `badarg` on a violation.
     ///
-    /// **Residual hazard.** [`TableAccess`] is the *raw* table view: it still hands
-    /// back bare `Eterm`s that alias table storage, so a result read through it can
-    /// outlive the guard. The returned value borrows `self`, so the guard cannot be
-    /// dropped while it is alive — but the terms it yields can be copied out of that
-    /// scope. Prefer the tagged reads on [`TableRead`](super::TableRead); this method
-    /// exists so an access-checked operation is reachable from a view at all.
+    /// This is the crate's **raw access-enforcement surface**, and it exists for one
+    /// reason: so that an access-checked operation is reachable from a shared-table
+    /// view at all (the tagged [`TableRead`](super::TableRead) is owner-level, with
+    /// no `requester` concept). It is therefore deliberate, **by design**, that its
+    /// **read** results are bare [`Eterm`]s aliasing table storage — a residual
+    /// aliasing hazard a caller owns:
+    ///
+    /// * [`TableAccess`] returns owned `Vec<Eterm>`s of bare terms, so a read result
+    ///   can be returned out of a `with_write` closure and outlive the guard;
+    /// * the returned value borrows `self`, so the guard cannot be *dropped* while
+    ///   the view is alive, but the terms it yields are not lifetime-tagged and a
+    ///   later same-word-size `insert` can silently recycle their words.
+    ///
+    /// A caller that needs a read it can keep must use the **airtight tagged path**
+    /// instead — [`TableRead`](super::TableRead)/[`TableTerm`], whose terms cannot
+    /// escape the guard — and copy what it needs out under the guard with
+    /// [`TableTerm::copy_into`]. The write side is safe to use directly (its inputs
+    /// are caller-owned); only the read results carry the hazard. Pinned by
+    /// `as_requester_reads_are_a_documented_residual_hazard`.
     pub fn as_requester(&mut self, requester: Option<OwnerId>) -> TableAccess<'_> {
         self.guard.as_requester(requester)
     }
-
     // -------------------------------------------------------------- insert / delete
 
     /// Insert `object` (upsert). `object` is the caller's own term; it is
