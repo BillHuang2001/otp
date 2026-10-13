@@ -344,8 +344,15 @@ constructors only (no new error enum).
   `Collector`/`GenImmixCollector` own a `Nursery` — a **current** space plus the spaces a growth
   **retired** — rather than a single `HeapSpace`. `HeapSpace` never reallocates, so growing the nursery by
   *replacement* would strand every live word; `Nursery::grow` instead **retains** the old space and points
-  the allocator at a fresh, larger one (`target = next_words(need_words, 0).max(current_capacity)`, one
-  bounded step), so every live word keeps its **original address** and nothing is moved. That is exactly what
+  the allocator at a fresh one (`target = next_words(need_words, 0).max(current_capacity)`, one
+  bounded step), so every live word keeps its **original address** and nothing is moved. The replacement is
+  **not necessarily larger**: when the current space is already full (`available_words() < need_words`) but
+  `need_words` does not exceed its capacity, `target == current_capacity` and a **same-size** fresh space is
+  installed. A caller that grows repeatedly at a constant request while the nursery stays full therefore
+  retires one same-size space **per call** — `grow` reclaims no garbage and nothing bounds the chain except a
+  collection's [`collapse`](crate::nursery::Nursery::collapse). In the runtime the collection-first pairing
+  ([`ensure_capacity`](crate::Collector::ensure_capacity) collects before it grows) collapses the chain each
+  admission, so `young_space_count` oscillates (≈`1`→`2`→`1`) rather than accumulating. That is exactly what
   makes the seam sound for a caller holding **no root set** — the un-rooted `beam_rt` allocation path, which
   must not collect (a copying collection may only run against a complete root set). That path **consumes** the
   seam: `beam_rt`'s `alloc_words` grows the nursery (`Process::grow_nursery`) and retries the bump before its
