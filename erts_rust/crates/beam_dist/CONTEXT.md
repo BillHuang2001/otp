@@ -90,6 +90,15 @@ in both directions: with `server_with_flags(..., preferred_flags() | publish_fla
 peer prints `PEER_VIS visible=true` / `PEER_NODES [rustacc2@billmini]`; with the default (hidden) it
 prints `visible=false`.
 
+**Live interop (blocking server path, `tests/live_accept_blocking.rs`).** The **blocking**
+`connection::accept_server` / `Connection::server` — the path that previously had only hermetic
+coverage — is now pinned against a real `erl -sname` peer dialling the Rust listener: `accept_server`
+completes the `'N'` handshake (peer name = full `node@host`, peer prints `CONN=true`), and
+`Connection::server` then decodes the inbound signals the peer *initiates* against this node's external
+pid — `Pid ! {hi,Seq}` → `Delivery::Send`, `erlang:link(Pid)` → `Delivery::Link`,
+`erlang:monitor(process,Pid)` → `Delivery::Monitor` — with the pid threaded through a `DOP_REG_SEND`.
+Both handshake implementations (blocking and driver) are therefore live-tested, so they cannot drift.
+
 **Live interop (non-blocking `ConnectionDriver`, `tests/live_driver.rs`).** A genuine non-blocking
 `TcpStream` is driven manually (`feed`/`step`/`take_output`/`next_message`) against a real `erl` node:
 the handshake completes incrementally and a `DOP_REG_SEND` is delivered (the node prints
