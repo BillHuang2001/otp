@@ -30,7 +30,8 @@
 mod common;
 
 use beam_ets::{
-    key_of, OrderedInterior, SetInterior, Table, TableId, TableKind, TableOptions, TermStore,
+    compile, key_of, OrderedInterior, SetInterior, Table, TableId, TableKind, TableOptions,
+    TermStore,
 };
 use beam_term::prelude::*;
 use common::*;
@@ -953,4 +954,373 @@ fn ets_info_memory_is_in_the_oracles_ballpark() {
         );
         println!("[ets] memory {kind:?}: crate={ours} words, oracle={oracle_mem} words");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Removal/`take` accounting against the oracle's *shape*
+// ---------------------------------------------------------------------------
+//
+// The oracle shapes these tests pin (system `erl`, OTP 29 / erts-17.1; the
+// absolute words are its own interior's, so they are never compared):
+//
+// * `ets:info(T, size)` is the **object count** and drops to `0` on every removal;
+// * `ets:info(T, memory)` is monotone with inserts, falls once the objects are
+//   gone, and a balanced removal (or an overwrite on the upsert kinds) returns it
+//   to a floor that does not move (`set` 306→9617→306, `ordered_set`
+//   140→8140→140, the hash kinds keep their bucket storage);
+// * `ets:take/2` moves the objects off the table, so `size` drops and the memory
+//   floor is NOT re-grown by a repeated `take` + re-`insert` churn.
+//
+// Probe: an `escript` inserting `{I, I*2}` for `I in 0..1000`, deleting every key,
+// then `delete_all_objects`, printed per kind (`erl`/`escript`, OTP 29.1.1 /
+// erts-17.1):
+// `set.empty -> 306 ; set.loaded -> 9617 ; set.size -> 1000 ;
+//  set.after_delete -> 2617 ; set.size_after_delete -> 0 ; set.after_all -> 306`
+// `ordered_set.empty -> 140 ; ordered_set.loaded -> 8140 ;
+//  ordered_set.after_delete -> 140 ; ordered_set.after_all -> 140`
+//
+// The crate's absolute figures differ (word counts of its own store + index); what
+// must hold is the counter *contract*: `size`/`is_empty`/`memory`/`info()` track
+// the removals, every removal reclaims, and no removal path leaks across churn.
+
+/// `ets:take/2` churn: taking a key hands its objects to the caller and reclaims
+/// the table's own originals, so `size`/`is_empty` fall to the empty state and the
+/// memory floor **stays put** cycle after cycle, while every checked-out object is
+/// still a valid, distinct copy.
+#[test]
+fn take_churn_reclaims_the_table_originals_and_keeps_the_counters_flat() {
+    let atoms = AtomTable::new();
+
+    for (shape, make) in all_shapes() {
+        let mut heap = Heap::new(1 << 20);
+        let keys: Vec<Eterm> = (0..KEYS as i64).map(|i| churn_key(&mut heap, i)).collect();
+        let per_key: Vec<Vec<Eterm>> = keys
+            .iter()
+            .enumerate()
+            .map(|(n, &key)| {
+                (0..2i64)
+                    .map(|variant| churn_object(&mut heap, key, n as i64, variant))
+                    .collect()
+            })
+            .collect();
+
+        let mut t = make();
+        // `set`/`ordered_set` upsert the two variants down to one; the multi kinds
+        // keep both.
+        let per_key_kept = if t.kind().is_multi() { 2 } else { 1 };
+        let total = per_key_kept * KEYS;
+
+        let mut floors = Vec::new();
+        let mut populated = Vec::new();
+        for cycle in 0..4 {
+            for objects in &per_key {
+                for &object in objects {
+                    t.insert(object, &atoms).unwrap();
+                }
+            }
+            assert_eq!(t.size(), total, "{shape} cycle {cycle}: size after insert");
+            assert!(!t.is_empty(), "{shape} cycle {cycle}: a loaded table is not empty");
+            populated.push(t.memory());
+
+            let mut taken_all = Vec::new();
+            for (n, &key) in keys.iter().enumerate() {
+                let taken = t.take(key, &atoms).unwrap();
+                assert_eq!(
+                    taken.len(),
+                    per_key_kept,
+                    "{shape} cycle {cycle}: `take` on key {n} returned the wrong object count"
+                );
+                for &object in &taken {
+                    let source = per_key[n]
+                        .iter()
+                        .find(|&&s| eq(s, object, &atoms))
+                        .unwrap_or_else(|| {
+                            panic!("{shape} cycle {cycle}: a taken object is not one of the key's")
+                        });
+                    assert!(
+                        object.raw() != source.raw(),
+                        "{shape} cycle {cycle}: `take` handed out the table's own storage, \
+                         not a copy"
+                    );
+                }
+                taken_all.extend(taken);
+            }
+            assert_eq!(t.size(), 0, "{shape} cycle {cycle}: size after take");
+            assert!(t.is_empty(), "{shape} cycle {cycle}: an emptied table is empty");
+            assert_eq!(t.info().size, 0, "{shape} cycle {cycle}: `info().size` after take");
+            let floor = t.memory();
+            assert_eq!(
+                t.info().memory,
+                floor,
+                "{shape} cycle {cycle}: `TableInfo::memory` disagrees with `Table::memory`"
+            );
+            assert!(
+                floor < populated[cycle],
+                "{shape} cycle {cycle}: `take` did not reclaim the originals \
+                 ({floor} !< {})",
+                populated[cycle]
+            );
+            floors.push(floor);
+
+            // The checked-out objects stay valid for the table's lifetime: each is
+            // still readable and keeps its own key element, and every key's objects
+            // are accounted for.
+            for &key in &keys {
+                let checked_out = taken_all
+                    .iter()
+                    .filter(|&&o| eq(key_of(o, 1).unwrap(), key, &atoms))
+                    .count();
+                assert_eq!(
+                    checked_out,
+                    per_key_kept,
+                    "{shape} cycle {cycle}: a checked-out object became unreadable"
+                );
+            }
+        }
+
+        // A `take` cycle reclaims the table's own objects, so the post-take floor
+        // is the **same** every cycle. The loaded figure also stabilizes: after the
+        // warm-up cycle the interior's index (e.g. the `ordered_set` node arena,
+        // which never shrinks) has reached its steady shape, and the store's part is
+        // unchanged, so no cycle after the first may grow the table.
+        for other in &floors[1..] {
+            assert_eq!(
+                *other, floors[0],
+                "{shape}: the take floor moved across cycles ({floors:?})"
+            );
+        }
+        for other in &populated[2..] {
+            assert_eq!(
+                *other, populated[1],
+                "{shape}: a take cycle grew the table ({populated:?})"
+            );
+        }
+
+        // The table is reusable and correct after the take churn.
+        for objects in &per_key {
+            for &object in objects {
+                t.insert(object, &atoms).unwrap();
+            }
+        }
+        assert_eq!(t.size(), total, "{shape}: the table is reusable after a take churn");
+        for &key in &keys {
+            assert!(t.member(key, &atoms), "{shape}: a key was lost to the take churn");
+        }
+    }
+}
+
+/// `ets:select_delete/2` and `ets:match_delete/2` remove every object through the
+/// same per-object free path as `delete`, so the object count drops to zero, the
+/// memory falls below the loaded figure and does **not** accumulate across cycles
+/// — for every kind and interior shape. The two paths land on the same floor.
+#[test]
+fn select_delete_and_match_delete_reclaim_and_zero_the_counters() {
+    for (shape, make) in all_shapes() {
+        let mut atoms = AtomTable::new();
+        let mut heap = Heap::new(1 << 20);
+        let keys: Vec<Eterm> = (0..KEYS as i64).map(|i| churn_key(&mut heap, i)).collect();
+        // One object per key with a boxed key *and* a boxed value, so a removal has
+        // table-owned storage to reclaim.
+        let objects: Vec<Eterm> = keys
+            .iter()
+            .enumerate()
+            .map(|(n, &key)| churn_object(&mut heap, key, n as i64, 0))
+            .collect();
+
+        // `[{{'_','_'},[],[true]}]` — the `select_delete` form of `match_delete`,
+        // and the `{'_','_'}` pattern for `match_delete` itself.
+        let wildcard = interned_atom(&mut atoms, "_");
+        let pattern = tuple_of(&mut heap, &[wildcard, wildcard]);
+        let body = proper_list(&mut heap, &[interned_atom(&mut atoms, "true")]);
+        let clause = tuple_of(&mut heap, &[pattern, NIL, body]);
+        let spec_term = proper_list(&mut heap, &[clause]);
+        let spec = compile(spec_term, &atoms).expect("the wildcard spec compiles");
+
+        let mut out = out_heap();
+        let mut t = make();
+        let empty = t.memory();
+        let mut floors = Vec::new();
+
+        for cycle in 0..3 {
+            for &object in &objects {
+                t.insert(object, &atoms).unwrap();
+            }
+            assert_eq!(t.size(), KEYS, "{shape} cycle {cycle}: size after insert");
+            let populated = t.memory();
+            assert!(populated > empty, "{shape} cycle {cycle}: a loaded table owns storage");
+
+            let deleted = t.select_delete(&spec, &atoms, &mut out).unwrap();
+            assert_eq!(deleted, KEYS, "{shape} cycle {cycle}: the deletion count");
+            assert_eq!(t.size(), 0, "{shape} cycle {cycle}: size after select_delete");
+            assert!(t.is_empty(), "{shape} cycle {cycle}: an emptied table is empty");
+            assert_eq!(
+                t.info().size,
+                0,
+                "{shape} cycle {cycle}: `info().size` after select_delete"
+            );
+            let floor = t.memory();
+            assert_eq!(
+                t.info().memory,
+                floor,
+                "{shape} cycle {cycle}: `TableInfo::memory` disagrees with `Table::memory`"
+            );
+            assert!(
+                floor < populated,
+                "{shape} cycle {cycle}: select_delete reclaimed nothing ({populated} -> {floor})"
+            );
+            assert!(
+                floor >= empty,
+                "{shape} cycle {cycle}: the floor fell below the empty floor ({floor} < {empty})"
+            );
+            floors.push(floor);
+        }
+
+        for cycle in 0..3 {
+            for &object in &objects {
+                t.insert(object, &atoms).unwrap();
+            }
+            let deleted = t.match_delete(pattern, &atoms, &mut out).unwrap();
+            assert_eq!(deleted, KEYS, "{shape} match cycle {cycle}: the deletion count");
+            assert_eq!(t.size(), 0, "{shape} match cycle {cycle}: size after match_delete");
+            assert!(t.is_empty(), "{shape} match cycle {cycle}");
+            assert_eq!(t.info().size, 0, "{shape} match cycle {cycle}: `info().size`");
+            assert_eq!(
+                t.info().memory,
+                t.memory(),
+                "{shape} match cycle {cycle}: `TableInfo::memory` disagrees"
+            );
+            floors.push(t.memory());
+        }
+
+        for other in &floors[1..] {
+            assert_eq!(
+                *other, floors[0],
+                "{shape}: a removal path changed the stable floor ({floors:?})"
+            );
+        }
+    }
+}
+
+/// The `TermStore` accounting behind `ets:take/2`: `relinquish` hands an object's
+/// storage to the caller — `words` drops by exactly its word count (so it stops
+/// counting toward `Table::memory` / `ets:info(Tab, memory)`) while the words stay
+/// valid for the store's lifetime, never to be handed out again (a later `copy`
+/// cannot alias the caller's term). `free` (the ordinary removal path) *does*
+/// return the words to the per-size free lists, so a copy/free churn reuses them
+/// and the store acquires no fresh block.
+#[test]
+fn term_store_relinquish_hands_storage_out_and_free_reuses_it() {
+    let mut heap = Heap::new(1 << 16);
+    let terms: Vec<Eterm> = (0..16)
+        .map(|i| {
+            let key = churn_key(&mut heap, i);
+            churn_object(&mut heap, key, i, 0)
+        })
+        .collect();
+
+    let mut store = TermStore::with_default_allocator();
+    assert_eq!(store.words(), 0, "a fresh store owns no words");
+
+    // Head every object out: copy it, then check it out.
+    let checked_out: Vec<Eterm> = terms.iter().map(|&t| store.copy(t).unwrap()).collect();
+    let live = store.words();
+    assert!(live > 0, "the checked-out objects own words while live");
+    let mut relinquished = 0;
+    for &root in &checked_out {
+        let words = store.relinquish(root);
+        assert!(words > 0, "the first relinquish reclaims exactly its own run");
+        relinquished += words;
+    }
+    assert_eq!(
+        relinquished, live,
+        "relinquishing every copy must account for exactly the live words"
+    );
+    assert_eq!(
+        store.words(),
+        0,
+        "a checked-out object no longer counts as table storage"
+    );
+    // A second relinquish is a harmless no-op (the root is no longer tracked).
+    for &root in &checked_out {
+        assert_eq!(store.relinquish(root), 0, "a checked-out root is not tracked twice");
+    }
+
+    // The ordinary removal path reuses runs: the copy/free churn acquires no fresh
+    // block, and a fresh copy never lands on a checked-out address.
+    let mut blocks = Vec::new();
+    for cycle in 0..5 {
+        let roots: Vec<Eterm> = terms.iter().map(|&t| store.copy(t).unwrap()).collect();
+        assert!(store.words() > 0, "cycle {cycle}: the copies own words");
+        if cycle == 0 {
+            for &root in &roots {
+                assert!(
+                    !checked_out.iter().any(|&c| c == root),
+                    "a later `copy` handed out a checked-out object's address"
+                );
+            }
+        }
+        for root in roots {
+            store.free(root);
+        }
+        assert_eq!(
+            store.words(),
+            0,
+            "cycle {cycle}: freeing every root must return the word count to zero"
+        );
+        blocks.push(store.blocks());
+    }
+    assert_eq!(
+        blocks[4], blocks[0],
+        "the free churn acquired a fresh arena block per cycle: {blocks:?}"
+    );
+}
+
+/// The other half of the `take`-storage contract, pinned explicitly: repeated
+/// `relinquish` (the `ets:take/2` check-out) **retains** its storage — every round
+/// grows the store's arena (`blocks`) — because a checked-out term must stay valid
+/// and can therefore never be handed out again. `words()` still returns to zero
+/// each round, so the *counters* stay correct and the retention is released only
+/// when the store is dropped or `reset` (`ets:delete_all_objects/1`).
+///
+/// This is the observable behaviour the oracle also has: `ets:info(T, memory)`
+/// (which `Table::memory` feeds from `store.words()`) does **not** grow across a
+/// `take` + re-`insert` churn, so the retained arena bytes are not table memory.
+/// The growth is inherent to the current `take` API, which hands back
+/// table-owned terms (the caller supplies no heap), so the audit records it as the
+/// known `relinquish` retention, not a counter defect.
+#[test]
+fn take_style_relinquish_churn_retains_its_arena_until_the_store_is_reset() {
+    let mut heap = Heap::new(1 << 16);
+    let terms: Vec<Eterm> = (0..16)
+        .map(|i| {
+            let key = churn_key(&mut heap, i);
+            churn_object(&mut heap, key, i, 0)
+        })
+        .collect();
+
+    let mut store = TermStore::with_default_allocator();
+    let mut blocks = Vec::new();
+    for cycle in 0..4 {
+        let roots: Vec<Eterm> = terms.iter().map(|&t| store.copy(t).unwrap()).collect();
+        for root in roots {
+            store.relinquish(root);
+        }
+        assert_eq!(
+            store.words(),
+            0,
+            "cycle {cycle}: a checked-out churn still returns the live-word count to zero"
+        );
+        blocks.push(store.blocks());
+    }
+    assert!(
+        blocks[3] > blocks[0],
+        "the relinquish churn retained no arena at all: {blocks:?}"
+    );
+    println!("[ets] relinquish churn arena blocks: {blocks:?}");
+
+    // `reset` — the storage side of `ets:delete_all_objects/1` — releases the
+    // retained arena.
+    store.reset();
+    assert_eq!(store.words(), 0, "reset clears the live-word count");
+    assert_eq!(store.blocks(), 0, "reset releases every retained arena block");
 }
