@@ -311,9 +311,9 @@ fn trap_arith_class(error: BeamError) -> BeamError {
 }
 
 /// The exact integer term for a conversion result: a small integer when it fits,
-/// else the heap bignum the oracle returns (a coarse integer unit such as
-/// `system_time(1 bsl 58)` promotes).
-fn int_from_i128(ctx: &mut BifContext<'_>, value: i128) -> Result<Eterm> {
+/// else the heap bignum the oracle returns (the `crate::arith` promotion
+/// convention).
+pub(crate) fn int_from_i128(ctx: &mut BifContext<'_>, value: i128) -> Result<Eterm> {
     if let Ok(small) = i64::try_from(value) {
         return arith::int_from_i64(ctx, small);
     }

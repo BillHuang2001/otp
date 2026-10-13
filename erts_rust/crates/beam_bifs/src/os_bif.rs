@@ -447,28 +447,14 @@ fn os_unit(ctx: &mut BifContext<'_>, term: Eterm) -> Result<OsUnit> {
     Err(badarg())
 }
 
-// The bignum-unit conversion is shared with the `erlang` clocks:
-// `crate::time::convert_unit_big` owns the single `TU * Time div FU`
-// arbitrary-precision chain (`crate::arith`'s registered operators) that both
-// `os:system_time/1` and `erlang:monotonic_time/1`/`system_time/1`/
-// `time_offset/1` run — see its docs for the floor adjustment and the
-// `BIG_ARITY_MAX` `badarg`.
-
-/// An arbitrarily large non-negative result: a small int when it fits, else a
-/// heap bignum (the promotion convention of [`crate::arith`]).
-fn int_from_i128(ctx: &mut BifContext<'_>, value: i128) -> Result<Eterm> {
-    if let Ok(small) = i64::try_from(value) {
-        return arith::int_from_i64(ctx, small);
-    }
-    let negative = value < 0;
-    let mut magnitude = value.unsigned_abs();
-    let mut limbs = Vec::new();
-    while magnitude != 0 {
-        limbs.push((magnitude & 0xFFFF_FFFF_FFFF_FFFF) as u64);
-        magnitude >>= 64;
-    }
-    arith::int_from_mag(ctx, negative, &limbs)
-}
+// The bignum-unit conversion and the int materialisation are shared with the
+// `erlang` clocks: `crate::time::convert_unit_big` owns the single
+// `TU * Time div FU` arbitrary-precision chain (`crate::arith`'s registered
+// operators) that both `os:system_time/1` and
+// `erlang:monotonic_time/1`/`system_time/1`/`time_offset/1` run — see its docs
+// for the floor adjustment and the `BIG_ARITY_MAX` `badarg` — and
+// `crate::time::int_from_i128` is the shared small-int-or-heap-bignum
+// materialiser for the result.
 
 // ---------------------------------------------------------------------------
 // The BIFs
@@ -534,7 +520,9 @@ fn os_system_time_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> 
 fn os_system_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let native = system_native()?;
     match os_unit(ctx, args[0])? {
-        OsUnit::PerSecond(per_second) => int_from_i128(ctx, convert_per_second(native, per_second)),
+        OsUnit::PerSecond(per_second) => {
+            crate::time::int_from_i128(ctx, convert_per_second(native, per_second))
+        }
         OsUnit::PerSecondBig(per_second) => crate::time::convert_unit_big(ctx, native, &per_second),
     }
 }
@@ -784,7 +772,7 @@ mod tests {
         };
         let value = convert_per_second(1_700_000_000_000_000_000, per_second);
         assert!(value > i64::MAX as i128);
-        let promoted = int_from_i128(&mut ctx, value).expect("promotes");
+        let promoted = crate::time::int_from_i128(&mut ctx, value).expect("promotes");
         assert!(
             beam_codec::term::big_parts(promoted).is_ok(),
             "a value past 2^63 must be a heap bignum"
