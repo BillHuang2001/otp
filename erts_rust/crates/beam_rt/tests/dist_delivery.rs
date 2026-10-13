@@ -38,6 +38,12 @@
 //! loopback TCP link** into a running runtime through the scheduler pass — still
 //! hermetic (no external toolchain).
 //!
+//! The `(7)` group goes one level lower: synthetic [`Delivery`] values are driven
+//! straight into the public [`LocalDeliverySink`] over a **standalone**
+//! [`ProcessTable`], pinning the routing table one family at a time (each routed
+//! family by its delivered effect, each unrouted family by its honest
+//! `Unsupported`).
+//!
 //! Small integers are used as the payload wherever the exact term matters: unlike
 //! atoms (whose raw encoding is table-local), a small integer is its own immediate
 //! value, so a term compares `==` across heaps.
@@ -53,7 +59,7 @@ use beam_dist::{
     AltactSigFlags, ConnectionDriver, Delivery, DeliveryOutcome, DistSpawnFlags, DriverState,
     InboundSink, StepOutcome,
 };
-use beam_process::{MonitorRef, ProcessId, ProcessTable, SignalAtoms, UnaliasMode};
+use beam_process::{ProcessId, ProcessTable, SignalAtoms, UnaliasMode};
 use beam_rt::dist::LocalDeliverySink;
 use beam_rt::{Runtime, RuntimeConfig};
 use beam_term::prelude::{is_immediate, make_atom, make_small, Atom, Eterm};
@@ -542,5 +548,675 @@ fn a_real_loopback_link_delivers_through_the_scheduler_pass() {
         only_message(&rt, pid),
         Some(message),
         "the scheduled pass must route an inbound send into the local mailbox"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (7) The routing table, driven **per family** through the public sink
+// ---------------------------------------------------------------------------
+//
+// The tests above reach the routing through the wire. These drive synthetic
+// [`Delivery`] values straight into a [`LocalDeliverySink`] over a standalone
+// [`ProcessTable`] — no runtime, no socket, no `epmd` — so every arm of the routing
+// match is pinned individually: each *routed* family by its delivered effect, and
+// every *unrouted* family by the honest `Unsupported`. A future change that starts
+// routing one of those families must therefore flip a row **consciously**.
+
+/// This test node's name; it is the sink's `local_node` atom.
+const NODE_NAME: &str = "delivery-under-test@host";
+/// A **different** node's name, interned alongside [`NODE_NAME`] so the two atom
+/// indices are distinct by construction.
+const FOREIGN_NODE_NAME: &str = "somewhere-else@host";
+/// This test node's creation (the incarnation an addressed external pid must carry to
+/// be a process of this node).
+const NODE_CREATION: u32 = 0x0123_4567;
+
+/// A **hermetic** routing fixture: a standalone process table, one spawned local
+/// process, and the atom table the fixture's atoms live in.
+struct Fixture {
+    /// The process table the sink routes into.
+    table: ProcessTable,
+    /// One spawned local process — the default addressee of these tests.
+    pid: ProcessId,
+    /// This node's name atom (the sink's `local_node`).
+    local_node: Atom,
+    /// A **different** node's name atom.
+    foreign_node: Atom,
+    /// The atom table `local_node`/`foreign_node` (and any name a test interns) live
+    /// in — the same table, so no index can collide across fixtures.
+    atoms: AtomTable,
+}
+
+impl Fixture {
+    /// A table with one spawned process, for a node named [`NODE_NAME`]/[`NODE_CREATION`].
+    fn new() -> Fixture {
+        let mut atoms = AtomTable::new();
+        let local_node = atoms.intern(NODE_NAME);
+        let foreign_node = atoms.intern(FOREIGN_NODE_NAME);
+        let signals = SignalAtoms::from_table(&mut atoms);
+        let mut table = ProcessTable::new(signals);
+        let pid = table.spawn_default().expect("spawn a local process");
+        Fixture {
+            table,
+            pid,
+            local_node,
+            foreign_node,
+            atoms,
+        }
+    }
+
+    /// Spawns one more local process in this fixture's table.
+    fn spawn(&mut self) -> ProcessId {
+        self.table.spawn_default().expect("spawn a local process")
+    }
+
+    /// The addressed pid term for `pid` as it arrives **from this node**: an external
+    /// pid thing — the shape the distribution decoder always materialises a pid as.
+    fn own_pid_term(&self, heap: &mut Heap, pid: ProcessId) -> Eterm {
+        external_pid_term(
+            heap,
+            make_atom(self.local_node),
+            pid.number(),
+            pid.serial(),
+            NODE_CREATION,
+        )
+    }
+}
+
+/// Writes an **external** pid thing for `node`/`number`/`serial`/`creation`.
+fn external_pid_term(
+    heap: &mut Heap,
+    node: Eterm,
+    number: u64,
+    serial: u64,
+    creation: u32,
+) -> Eterm {
+    make_external_pid(heap, node, number as u32, serial as u32, creation)
+        .expect("materialize the external pid thing")
+}
+
+/// Routes `delivery` through a `LocalDeliverySink` over `table` for the node named by
+/// `node` with [`NODE_CREATION`].
+fn route(table: &mut ProcessTable, node: Atom, delivery: &Delivery) -> DeliveryOutcome {
+    let mut sink = LocalDeliverySink::new(table, node, NODE_CREATION);
+    sink.deliver(delivery)
+        .expect("the sink routes without an internal error")
+}
+
+/// Every `(payload, envelope sender)` pair `pid`'s mailbox holds, in FIFO order.
+fn mailbox(table: &ProcessTable, pid: ProcessId) -> Vec<(Eterm, Eterm)> {
+    table
+        .get(pid)
+        .expect("the addressed process is live")
+        .mailbox()
+        .iter()
+        .map(|message| (message.payload(), message.from()))
+        .collect()
+}
+
+// --- `DOP_SEND*` ------------------------------------------------------------
+
+/// An **internal** pid immediate is a local process by construction, so a `DOP_SEND`
+/// to it reaches its mailbox.
+#[test]
+fn an_internal_pid_send_target_is_routed_to_its_mailbox() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let from = make_small(7);
+    let message = make_small(42);
+
+    let delivery = Delivery::Send {
+        from,
+        to: pid.to_eterm(),
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Delivered
+    );
+    assert_eq!(mailbox(&fixture.table, pid), vec![(message, from)]);
+}
+
+/// An **external** pid whose node atom and creation are *this* node's names a local
+/// process — looked up by number **and** serial.
+#[test]
+fn an_external_pid_on_this_node_is_routed_to_its_mailbox() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let to = fixture.own_pid_term(&mut heap, pid);
+    let from = make_small(7);
+    let message = make_small(42);
+
+    let delivery = Delivery::Send {
+        from,
+        to,
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Delivered
+    );
+    assert_eq!(mailbox(&fixture.table, pid), vec![(message, from)]);
+}
+
+/// A pid on **another node**, or a stale incarnation of this one, is never resolved
+/// by its slot number alone (the C drops such a message silently, `dist.c:2512-2561`).
+#[test]
+fn an_external_pid_of_another_node_or_incarnation_is_no_such_process() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let foreign_node = fixture.foreign_node;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let from = make_small(7);
+    let message = make_small(42);
+
+    let cases = [
+        (
+            "a pid on another node",
+            external_pid_term(
+                &mut heap,
+                make_atom(foreign_node),
+                pid.number(),
+                pid.serial(),
+                NODE_CREATION,
+            ),
+        ),
+        (
+            "a stale incarnation of this node",
+            external_pid_term(
+                &mut heap,
+                make_atom(node),
+                pid.number(),
+                pid.serial(),
+                NODE_CREATION.wrapping_add(1),
+            ),
+        ),
+    ];
+    for (what, to) in cases {
+        let delivery = Delivery::Send {
+            from,
+            to,
+            message,
+            token: None,
+        };
+        assert_eq!(
+            route(&mut fixture.table, node, &delivery),
+            DeliveryOutcome::NoSuchProcess,
+            "{what} must never be resolved to a process of this node"
+        );
+    }
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "nothing may be delivered for a foreign pid"
+    );
+}
+
+/// A `DOP_SEND` whose `To` is not a pid is outside the opcode's wire contract (the C
+/// treats it as an `invalid_message`, `dist.c:2512-2561`), so the sink refuses it
+/// rather than delivering to whichever process the *number* happens to name.
+#[test]
+fn a_non_pid_send_target_is_unsupported() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let from = make_small(7);
+    let message = make_small(42);
+
+    for to in [make_small(pid.number() as i64), make_atom(node)] {
+        let delivery = Delivery::Send {
+            from,
+            to,
+            message,
+            token: None,
+        };
+        assert_eq!(
+            route(&mut fixture.table, node, &delivery),
+            DeliveryOutcome::Unsupported,
+            "a non-pid `To` is outside DOP_SEND's contract"
+        );
+    }
+    assert!(mailbox(&fixture.table, pid).is_empty());
+}
+
+/// **The envelope regression.** A `DOP_SEND_SENDER*` sender pid arrives as a *boxed*
+/// external pid thing in the dispatch arena, which is reset after every drain, so
+/// storing it in the mailbox envelope would leave a dangling word (the collector
+/// gathers only each message's **payload**, `beam_message`'s enqueue tripwire). The
+/// sink must derive the peer **node atom** — an immediate — exactly as the C's
+/// `ERL_MESSAGE_FROM` rule does (`erl_message.c:307`), and the delivery must still
+/// read back after the arena is rewound.
+#[test]
+fn a_send_sender_envelope_is_an_immediate_that_survives_the_arena_reset() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+
+    // The `From` of a `DOP_SEND_SENDER`: a boxed external pid on *this* node.
+    let from = external_pid_term(&mut heap, make_atom(node), 9, 3, NODE_CREATION);
+    let message = make_small(4242);
+    let delivery = Delivery::Send {
+        from,
+        to: pid.to_eterm(),
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Delivered
+    );
+
+    let delivered = mailbox(&fixture.table, pid);
+    assert_eq!(delivered.len(), 1, "exactly one message was delivered");
+    assert_eq!(
+        delivered[0].0, message,
+        "the payload must sit in the addressed process's mailbox"
+    );
+    assert!(
+        is_immediate(delivered[0].1),
+        "the envelope's sender word must be an **immediate**, never the boxed sender \
+         pid — which would dangle into the evacuated arena"
+    );
+    assert_eq!(
+        delivered[0].1,
+        make_atom(node),
+        "the envelope's sender word is the sending pid's node atom, the C's own \
+         ERL_MESSAGE_FROM rule"
+    );
+
+    // Rewind the decode arena — every boxed word built above is gone — and read the
+    // mailbox back: what the sink stored must not point into the arena at all.
+    heap.reset();
+    let after = mailbox(&fixture.table, pid);
+    assert_eq!(
+        after, delivered,
+        "the mailbox must be unaffected by the decode arena's reset"
+    );
+    assert!(is_immediate(after[0].1));
+}
+
+// --- `DOP_REG_SEND*` --------------------------------------------------------
+
+/// `DOP_REG_SEND` routes a registered name to its holder, and refuses a non-atom name
+/// (the opcode's `ToName` is an atom, `dist.c:2486`).
+#[test]
+fn a_reg_send_routes_a_registered_name_and_refuses_a_non_atom_name() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let name = fixture.atoms.intern("delivery-fixture-name");
+    fixture.table.register(name, pid).expect("register the name");
+    let from = make_small(11);
+    let message = make_small(1234);
+
+    let delivery = Delivery::RegSend {
+        from,
+        cookie: make_small(0),
+        name: make_atom(name),
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Delivered
+    );
+    assert_eq!(mailbox(&fixture.table, pid), vec![(message, from)]);
+
+    let non_atom = Delivery::RegSend {
+        from,
+        cookie: make_small(0),
+        name: make_small(7),
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &non_atom),
+        DeliveryOutcome::Unsupported,
+        "a non-atom `ToName` is outside DOP_REG_SEND's contract"
+    );
+    assert_eq!(
+        mailbox(&fixture.table, pid),
+        vec![(message, from)],
+        "the refused delivery must add nothing"
+    );
+}
+
+/// An unheld name is a silent drop in the C (`dist.c:2506-2509`) — never a delivery to
+/// a same-indexed process.
+#[test]
+fn an_unregistered_name_is_no_such_process() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let name = fixture.atoms.intern("nobody-holds-this-name");
+
+    let delivery = Delivery::RegSend {
+        from: make_small(11),
+        cookie: make_small(0),
+        name: make_atom(name),
+        message: make_small(99),
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::NoSuchProcess
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "an unheld name must not be delivered anywhere"
+    );
+}
+
+// --- `DOP_ALIAS_SEND*` ------------------------------------------------------
+
+/// `DOP_ALIAS_SEND` resolves a live reference alias to its **owner**, and a
+/// `reply_demonitor` (`ALIAS_ONCE`) alias is **consumed** once the message really went
+/// through it (`erl_proc_sig_queue.c:6047-6064`).
+#[test]
+fn an_alias_send_reaches_the_owner_and_consumes_a_reply_alias() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let reference = fixture
+        .table
+        .create_alias(pid, UnaliasMode::ReplyDemonitor)
+        .expect("mint a reply alias");
+    let to = reference.to_eterm(&mut heap).expect("materialize the reference");
+    let from = make_small(5);
+    let message = make_small(2024);
+
+    let delivery = Delivery::AliasSend {
+        from,
+        to,
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Delivered
+    );
+    assert_eq!(
+        mailbox(&fixture.table, pid),
+        vec![(message, from)],
+        "an alias send must reach the alias owner's mailbox"
+    );
+
+    // The reply alias is spent: the same reference no longer resolves, and the C drops
+    // such a message silently rather than mis-delivering it.
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Dropped,
+        "a consumed reply alias must not deliver a second time"
+    );
+    assert_eq!(
+        mailbox(&fixture.table, pid),
+        vec![(message, from)],
+        "the second delivery must not arrive"
+    );
+}
+
+/// A reference that is not a live alias is a silent drop
+/// (`erl_proc_sig_queue.c:6036-6046`: *"Not an alias … drop message"*), and a target
+/// that is not a reference at all is outside the opcode's contract (`dist.c:2577`).
+#[test]
+fn an_unowned_reference_is_dropped_and_a_non_ref_target_is_unsupported() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let from = make_small(5);
+    let message = make_small(2024);
+
+    // A reference that *was* an alias and is not any more.
+    let spent = fixture
+        .table
+        .create_alias(pid, UnaliasMode::ExplicitUnalias)
+        .expect("mint an alias");
+    assert!(
+        fixture.table.unalias(pid, spent).expect("clear the alias"),
+        "the alias really was live before the unalias"
+    );
+    let spent_term = spent.to_eterm(&mut heap).expect("materialize the reference");
+    let dropped = Delivery::AliasSend {
+        from,
+        to: spent_term,
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &dropped),
+        DeliveryOutcome::Dropped,
+        "a reference that is no longer an alias must be dropped, not delivered"
+    );
+    assert!(mailbox(&fixture.table, pid).is_empty());
+
+    // `DOP_ALIAS_SEND`'s `To` must be a reference; a small integer is outside its
+    // wire contract, so it is refused rather than resolved by number.
+    let non_ref = Delivery::AliasSend {
+        from,
+        to: make_small(7),
+        message,
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &non_ref),
+        DeliveryOutcome::Unsupported
+    );
+    assert!(mailbox(&fixture.table, pid).is_empty());
+}
+
+// --- `DOP_ALTACT_SIG_SEND` --------------------------------------------------
+
+/// `DOP_ALTACT_SIG_SEND`'s plain **message** forms route exactly like the
+/// corresponding `DOP_*` family: `..._ALIAS` ⇒ a reference, `..._NAME` ⇒ a registered
+/// name, neither ⇒ a pid (`dist.c:2662-2696`).
+#[test]
+fn an_altact_sig_send_routes_the_plain_message_forms() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let by_pid = fixture.pid;
+    let by_name = fixture.spawn();
+    let by_alias = fixture.spawn();
+    let name = fixture.atoms.intern("delivery-altact-name");
+    fixture.table.register(name, by_name).expect("register the name");
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let alias = fixture
+        .table
+        .create_alias(by_alias, UnaliasMode::ExplicitUnalias)
+        .expect("mint an alias");
+    let from = make_small(3);
+    let message = make_small(77);
+
+    let cases = [
+        (by_pid, AltactSigFlags::EMPTY, by_pid.to_eterm()),
+        (by_name, AltactSigFlags::NAME, make_atom(name)),
+        (
+            by_alias,
+            AltactSigFlags::ALIAS,
+            alias.to_eterm(&mut heap).expect("materialize the reference"),
+        ),
+    ];
+    for (pid, flags, to) in cases {
+        let delivery = Delivery::AltactSigSend {
+            flags,
+            from,
+            to,
+            token: None,
+            message,
+        };
+        assert_eq!(
+            route(&mut fixture.table, node, &delivery),
+            DeliveryOutcome::Delivered,
+            "{flags:?} must route the plain message form"
+        );
+        assert_eq!(mailbox(&fixture.table, pid), vec![(message, from)]);
+    }
+}
+
+/// A `PRIO` signal needs a priority queue this mailbox has no seam for, and an `EXIT`
+/// signal is an (untrappable) exit reason — neither may be delivered as an ordinary
+/// message, which would silently reorder the one and re-shape the other.
+#[test]
+fn an_altact_sig_priority_or_exit_signal_is_unsupported() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let from = make_small(3);
+    let message = make_small(77);
+
+    let mut prio_and_exit = AltactSigFlags::PRIO;
+    prio_and_exit.insert(AltactSigFlags::EXIT);
+    for flags in [AltactSigFlags::PRIO, AltactSigFlags::EXIT, prio_and_exit] {
+        let delivery = Delivery::AltactSigSend {
+            flags,
+            from,
+            to: pid.to_eterm(),
+            token: None,
+            message,
+        };
+        assert_eq!(
+            route(&mut fixture.table, node, &delivery),
+            DeliveryOutcome::Unsupported,
+            "{flags:?} has no correct local seam"
+        );
+    }
+    assert!(mailbox(&fixture.table, pid).is_empty());
+}
+
+// --- the escalation list ----------------------------------------------------
+
+/// **One row per unrouted family**: every family whose local counterpart
+/// `beam_process` cannot install is the honest `Unsupported` — never a substituted
+/// message, never a dropped signal. This pins the escalation list so a future change
+/// must flip a row on purpose rather than by accident.
+#[test]
+fn every_unrouted_family_is_the_honest_unsupported() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let sender = make_small(1);
+    let target = pid.to_eterm();
+    let aux = make_small(2);
+    let reason = make_small(3);
+
+    let rows: [(Dop, Delivery); 15] = [
+        // `DOP_LINK`: needs a record-only `record_remote_link` (the table's only
+        // entry point would echo a `DOP_LINK` the C never sends back).
+        (Dop::Link, Delivery::Link {
+            from: sender,
+            to: target,
+        }),
+        // The remote-sender exit family: `ExitSignal` carries a **local** sender pid.
+        (Dop::Exit, Delivery::Exit {
+            from: sender,
+            to: target,
+            reason,
+            token: None,
+        }),
+        (Dop::Exit2, Delivery::Exit2 {
+            from: sender,
+            to: target,
+            reason,
+            token: None,
+        }),
+        (Dop::PayloadExit, Delivery::PayloadExit {
+            from: sender,
+            to: target,
+            payload: reason,
+            token: None,
+        }),
+        (Dop::PayloadExit2, Delivery::PayloadExit2 {
+            from: sender,
+            to: target,
+            payload: reason,
+            token: None,
+        }),
+        // The OTP-26+ unlink-id handshake: an inbound `DOP_UNLINK_ID` must be answered
+        // with its `_ACK`, which the local-initiated `unlink_term` never does.
+        (Dop::UnlinkId, Delivery::UnlinkId {
+            id: aux,
+            from: sender,
+            to: target,
+        }),
+        (Dop::UnlinkIdAck, Delivery::UnlinkIdAck {
+            id: aux,
+            from: sender,
+            to: target,
+        }),
+        // A remote watcher: a monitor's origin side is a local pid here.
+        (Dop::MonitorP, Delivery::Monitor {
+            watcher: sender,
+            watched: target,
+            reference: aux,
+        }),
+        (Dop::DemonitorP, Delivery::Demonitor {
+            watcher: sender,
+            watched: target,
+            reference: aux,
+        }),
+        // A monitor DOWN from a remote target: firing the local watcher's outgoing
+        // record is a local-death path here.
+        (Dop::MonitorPExit, Delivery::MonitorExit {
+            watched: sender,
+            watcher: target,
+            reference: aux,
+            reason,
+        }),
+        (Dop::PayloadMonitorPExit, Delivery::PayloadMonitorExit {
+            watched: sender,
+            watcher: target,
+            reference: aux,
+            payload: reason,
+        }),
+        // `DOP_GROUP_LEADER`: the group leader is only settable locally today.
+        (Dop::GroupLeader, Delivery::GroupLeader {
+            from: sender,
+            to: target,
+        }),
+        // The distributed-spawn family: a CLI process serves no spawn requests and
+        // holds no spawn reservations.
+        (Dop::SpawnRequest, Delivery::SpawnRequest {
+            reference: aux,
+            from: sender,
+            group_leader: aux,
+            mfa: aux,
+            opts: aux,
+            args: aux,
+            token: None,
+        }),
+        (Dop::SpawnReply, Delivery::SpawnReply {
+            reference: aux,
+            to: target,
+            flags: DistSpawnFlags::EMPTY,
+            result: aux,
+            token: None,
+        }),
+        // The one `DOP_*` recognised on the wire but refused by the C outright — it
+        // kills the connection rather than classifying it (`dist.c:2277-2282`).
+        (Dop::Unlink, Delivery::Other(Dop::Unlink)),
+    ];
+
+    for (dop, delivery) in rows {
+        assert_eq!(
+            delivery.dop(),
+            dop,
+            "the row's opcode must match the family it stands for"
+        );
+        assert_eq!(
+            route(&mut fixture.table, node, &delivery),
+            DeliveryOutcome::Unsupported,
+            "{dop:?} has no correct local seam and must say so: {delivery:?}"
+        );
+    }
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "no unrouted family may have delivered anything"
     );
 }
