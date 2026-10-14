@@ -423,7 +423,8 @@ impl Runtime {
     /// This is a legitimate collection site: the caller has just published the parked
     /// machine's whole live root set into `pid`
     /// ([`publish_parked_roots`](crate::runner)), and the machine's float-register file is
-    /// *provably* dead — the post-slice scan pins any pid whose `Machine::fr` holds a term,
+    /// *provably* dead — the post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark)
+    /// check pins any pid whose `Machine::fr` holds a term,
     /// so a pid that is still [`gc_process_enabled`](Runtime::gc_process_enabled) cannot be
     /// carrying one. The collector therefore relocates exactly what is live, against the
     /// process's own root set.

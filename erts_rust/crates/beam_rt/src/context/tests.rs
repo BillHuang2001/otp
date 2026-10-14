@@ -3912,6 +3912,89 @@ fn a_admission_point_roots_every_x_register_and_the_whole_fr_file() {
     assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
 }
 
+/// **`fr_count` is an exact region length, and a region mismatch still halts the collection.**
+///
+/// The runner's park arm bounds the published FR prefix by `Machine::fr_mark()` (the live
+/// leading slots) and the resume replays that same count, so
+/// [`super::gc::publish_roots_full`] / [`super::gc::scatter_roots_full`] take a **count**
+/// rather than a flag. Three properties are load-bearing, and this case drives the helpers
+/// directly to pin all three without a scheduler:
+///
+/// * a publish of `fr_count` words puts exactly the stack followed by those leading FR words
+///   onto the process stack — the caller's FR view is the machine's whole 1024-slot file, so
+///   `fr_count` (here `2` of a four-word view) is what bounds the region, never the slice
+///   length;
+/// * the matching scatter writes **only** the leading `fr_count` FR slots back and leaves the
+///   slots above it untouched (a machine whose mark proved them `NIL` must not have them
+///   overwritten by the relocated stack's tail);
+/// * a relocated region whose length disagrees with `stack + fr_count` is reported as `false`
+///   — the caller's "halt this process's collection" — rather than a mis-sized write back.
+#[test]
+fn the_fr_count_bounds_the_published_region_and_a_mismatch_still_halts() {
+    let mut table =
+        ProcessTable::new(beam_process::SignalAtoms::from_table(&mut AtomTable::new()));
+    let pid = table.spawn_default().expect("spawn a process");
+
+    // A four-slot FR view with two live leading slots.
+    let mut x = [make_small(1), make_small(2), NIL, NIL];
+    let mut stack = [make_small(3), make_small(4)];
+    let mut fr = [make_small(5), make_small(6), NIL, NIL];
+
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        assert!(
+            super::gc::publish_roots_full(
+                process,
+                &RootSet::new(&mut x, &mut stack, &mut fr, 1),
+                2
+            ),
+            "a publish with an in-range count reports the region it wrote"
+        );
+        assert_eq!(
+            process.registers().stack().as_slice(),
+            &[make_small(3), make_small(4), make_small(5), make_small(6)][..],
+            "the published region is the whole stack followed by exactly `fr_count` FR words"
+        );
+    }
+
+    // The scatter is the exact inverse for the same count: the published region splits back
+    // into the stack and the two **leading** FR slots.
+    {
+        let process = table.get(pid).expect("the process is live");
+        let mut back = [NIL, NIL];
+        let mut out_fr = [make_small(99), make_small(99), make_small(99), make_small(99)];
+        assert!(
+            super::gc::scatter_roots_full(
+                process,
+                &mut RootSet::new(&mut x, &mut back, &mut out_fr, 1),
+                2
+            ),
+            "the scatter accepts the region the matching publish wrote"
+        );
+        assert_eq!(
+            out_fr,
+            [make_small(5), make_small(6), make_small(99), make_small(99)],
+            "only the leading `fr_count` FR slots are written back"
+        );
+    }
+
+    // A relocated region one word longer than `stack + fr_count` (what a resume passing a count
+    // the park did not use would see) must be refused, never written through.
+    {
+        let process = table.get_mut(pid).expect("the process is live");
+        process.registers_mut().stack_mut().push(make_small(7));
+        let mut back = [NIL, NIL];
+        assert!(
+            !super::gc::scatter_roots_full(
+                process,
+                &mut RootSet::new(&mut x, &mut back, &mut fr, 1),
+                2
+            ),
+            "a relocated stack longer than stack + fr_count halts the collection"
+        );
+    }
+}
+
 /// **The same guard for the collecting allocation seam.**
 ///
 /// [`ExecutionContext::alloc_words_rooted`] is the engine's term-building admission point:

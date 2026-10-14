@@ -130,20 +130,24 @@ pub(super) struct ProcessEngine {
     /// `wait` with no timeout — including the `after infinity` the compiler emits as a plain
     /// `wait` — leaves it `None`, so the process parks indefinitely.
     pub(super) parked_timeout: Option<TimerHandle>,
-    /// Whether the machine's **float-register (FR) file** was published into the process's
-    /// Erlang stack at the last park, so the resume scatters exactly that region back.
+    /// How many leading slots of the machine's **float-register (FR) file** were published
+    /// into the process's Erlang stack at the last park, so the resume scatters exactly that
+    /// region back.
     ///
-    /// The runner computes the FR's liveness once per slice (the post-slice scan that also
-    /// pins a live-FR pid) and `publish_parked_roots` appends the 1024 FR slots only when it
-    /// is live. A process whose FR is all `NIL` needs
-    /// no FR roots at all, so skipping the append is both sound and cheap — but the
-    /// **resume** must make the same choice, because
+    /// The runner derives the count once per slice from the engine's
+    /// [`Machine::fr_mark`](beam_engine::Machine::fr_mark) — the exact live FR prefix (the same
+    /// value that pins a process whose FR is live) — and `publish_parked_roots` appends
+    /// exactly those leading slots. A process that touched no float has `fr_mark() == 0`, so
+    /// no FR word is appended at all; a process whose FR is live publishes **only** its live
+    /// prefix instead of all 1024 slots.
+    ///
+    /// The **resume** must pass the same count, because
     /// [`scatter_roots_full`](crate::context::gc::scatter_roots_full) rejects a stack whose
     /// length does not match what was published (and a `false` there halts the process's
-    /// collection). The flag is written by the park arms and read by the resume; it is
-    /// `false` on a fresh engine (a freshly reset machine's FR is all `NIL`, and such a
-    /// process never parks before its first slice).
-    pub(super) fr_published: bool,
+    /// collection). The count is written by the park arms and read by the resume; it is `0` on
+    /// a fresh engine (a freshly reset machine's FR is entirely `NIL`, so such a process never
+    /// parks before its first slice).
+    pub(super) fr_published: usize,
     /// The execution tier this process is running on, chosen at its **first** entry and
     /// remembered for the rest of its life.
     ///
@@ -209,9 +213,9 @@ impl RunnerState {
                 args,
                 parked: None,
                 parked_timeout: None,
-                // A freshly reset machine's FR file is all `NIL`, so its first park (if any)
-                // takes the dead-FR path; the park arm overwrites this.
-                fr_published: false,
+                // A freshly reset machine's FR file is all `NIL` (`fr_mark() == 0`), so its
+                // first park (if any) publishes no FR word; the park arm overwrites this.
+                fr_published: 0,
                 // Only a placeholder: the process's first entry selects the real tier and
                 // writes it here (see the field docs).
                 tier: Tier::Interpreter,
