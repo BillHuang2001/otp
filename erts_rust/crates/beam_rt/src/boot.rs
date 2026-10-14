@@ -89,7 +89,7 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 /// `system_info/1` atom vocabulary ([`crate::info::INFO_ATOMS`]) and the
 /// `beam_process` signal names, so this list is deliberately not exhaustive on its own.
 ///
-/// Five groups:
+/// Six groups:
 ///
 /// * the atoms `system_info/1` can materialize — the `os_type` pair of both platforms
 ///   and the boolean atoms (`unix`, `linux`, `win32`, `nt`, `true`, `false`);
@@ -112,7 +112,11 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 ///   [`crate::context`] installs so `term_to_binary/1` can encode an internal
 ///   pid/port id) and the `bm`/`ac` compiled-pattern tags of `beam_bifs::binary`.
 ///   Real ERTS interns these up front; a raise, a catch and a printer can therefore
-///   name them even when the raising module never wrote the name.
+///   name them even when the raising module never wrote the name;
+/// * the `get_module_info/1,2` item vocabulary, the `+sbt` scheduler bind-type names
+///   (`spread`, `thread_no_node_processor_spread`, …) and the timer tag `timeout` —
+///   every atom-valued answer of [`crate::info`] resolves **by name** through this
+///   table, so the whole emitted vocabulary must be present.
 ///
 /// Everything after the first three groups is **appended last** on purpose: every index
 /// assigned before it must stay stable (module code and the positional-atom tests depend
@@ -215,6 +219,21 @@ pub const CORE_ATOMS: &[&str] = &[
     // — the shared table is borrowed immutably for the whole BIF call — so the name must
     // be seeded. Appended after every existing group, as the append-only rule requires.
     "timeout",
+    // The `+sbt` scheduler bind-type vocabulary: the atoms
+    // `erlang:system_info(scheduler_bind_type)` reports (`erl_cpu_topology.c:623-647`,
+    // [`crate::info::schedulers`]). That key's value is an [`InfoValue::Atom`] resolved
+    // **by name** through this table, so a `+sbt` spelling whose atom is absent fails
+    // materialization with `TermNotFound` instead of answering. `unbound` (the `u`
+    // spelling and the no-`+sbt` default) is already seeded through
+    // [`crate::info::INFO_ATOMS`]; the seven below are the remaining spellings.
+    // Appended last, like every group after the first three.
+    "spread",
+    "processor_spread",
+    "thread_spread",
+    "thread_no_node_processor_spread",
+    "no_node_processor_spread",
+    "no_node_thread_spread",
+    "no_spread",
 ];
 
 /// The preloaded-module registry skeleton (contract A.7).
@@ -486,6 +505,16 @@ mod tests {
             "md5",
             "module",
             "timeout",
+            // The `+sbt` scheduler bind-type vocabulary, appended after the timer tag
+            // (see `CORE_ATOMS`). `unbound` is the no-`+sbt` default and is seeded via
+            // `INFO_ATOMS`, so the group below holds the seven `+sbt` spellings.
+            "spread",
+            "processor_spread",
+            "thread_spread",
+            "thread_no_node_processor_spread",
+            "no_node_processor_spread",
+            "no_node_thread_spread",
+            "no_spread",
         ];
         let mut atoms = AtomTable::new();
         seed_core_atoms(&mut atoms);
