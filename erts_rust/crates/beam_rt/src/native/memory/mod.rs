@@ -670,10 +670,24 @@ impl RuntimeContext<'_> {
         let Some(engines) = self.engines() else {
             return Ok(None);
         };
-        let Some((module, machine)) = engines.engine_at(pid) else {
+        // `position_engine_at` (not `engine_at`) so a **fun-bodied** process whose local
+        // target has been resolved answers too: its entry lambda's module names its
+        // position exactly as an export entry's module names that one (see the method's
+        // docs for the oracle evidence).
+        let Some((module, machine, applied)) = engines.position_engine_at(pid) else {
             return Ok(None);
         };
         match name {
+            // A **fun-bodied** process's `$initial_call` is `erlang:apply/2` — ERTS
+            // spawned it by *applying* the fun (oracle: `process_info(P, initial_call)`
+            // of `spawn(fun() -> … end)` ⇒ `{initial_call,{erlang,apply,2}}`), so the
+            // entry lambda's own MFA would be a wrong answer. The atoms are interned by
+            // name because no loaded module owns this pair.
+            "initial_call" if applied => {
+                let module = self.atom("erlang")?;
+                let function = self.atom("apply")?;
+                terms::make_tuple(self, &[module, function, make_small(2)]).map(Some)
+            }
             "current_function" => machine.current_function(module, self),
             "initial_call" => machine.initial_call(module, self),
             "current_location" => machine.current_location(module, self),
@@ -707,7 +721,7 @@ impl RuntimeContext<'_> {
         let Some(engines) = self.engines() else {
             return Ok(None);
         };
-        let Some((_module, machine)) = engines.engine_at(pid) else {
+        let Some((_module, machine, _applied)) = engines.position_engine_at(pid) else {
             return Ok(None);
         };
         Ok(Some(make_small(machine.catch_frame_depth() as i64)))

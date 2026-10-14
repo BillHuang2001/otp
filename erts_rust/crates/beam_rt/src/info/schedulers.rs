@@ -93,7 +93,7 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
             Some(Ok(InfoValue::Int(dirty_cpu_schedulers_online(rt))))
         }
         "dirty_io_schedulers" => Some(Ok(InfoValue::Int(dirty_io_schedulers(rt)))),
-        "scheduler_bind_type" => Some(Ok(InfoValue::Atom("unbound"))),
+        "scheduler_bind_type" => Some(Ok(InfoValue::Atom(scheduler_bind_type(rt)))),
         "scheduler_bindings" => Some(Ok(scheduler_bindings(rt))),
         "multi_scheduling" => Some(Ok(InfoValue::Atom(if schedulers_count(rt) > 1 {
             "enabled"
@@ -244,15 +244,43 @@ const DEFAULT_DIRTY_IO_SCHEDULERS: i64 = 10;
 /// oracle's last-one-wins order. A malformed or truncated entry keeps the default —
 /// never a panic.
 fn thread_pool_size(rt: &Runtime) -> i64 {
-    let mut size = DEFAULT_THREAD_POOL_SIZE;
-    for pair in rt.config().emulator.extra_emulator_flags.chunks_exact(2) {
-        if pair[0] == "+A" {
-            if let Ok(count) = pair[1].parse::<u32>() {
-                size = i64::from(count.max(1));
-            }
-        }
+    rt.config()
+        .preserved_emulator_flag("+A")
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|count| i64::from(count.max(1)))
+        .unwrap_or(DEFAULT_THREAD_POOL_SIZE)
+}
+
+/// The `+sbt` bind-type spelling (see [`SCHEDULER_BIND_TYPES`](crate::cli::flags::SCHEDULER_BIND_TYPES))
+/// mapped to the atom `erlang:system_info(scheduler_bind_type)` reports
+/// (`erts_cpu_topology_bind_type`, `erl_cpu_topology.c:623-647`), last occurrence winning.
+///
+/// The C's map, and its reason: `ERTS_CPU_BIND_DEFAULT_BIND` is
+/// `ERTS_CPU_BIND_THREAD_NO_NODE_PROCESSOR_SPREAD` (`erl_cpu_topology.c:82-83`), so the
+/// `db` (and `tnnps`) spelling reports `thread_no_node_processor_spread`, and with no
+/// `+sbt` at all the C reports `unbound` (`ERTS_CPU_BIND_UNBOUND`).
+///
+/// Verified against the oracle (OTP 29.1.1 / erts-17.1), measured with
+/// `erl +sbt <type> -noshell -eval 'io:format("~p~n",[erlang:system_info(scheduler_bind_type)]),halt().'`:
+///
+/// ```text
+/// u → unbound      db → thread_no_node_processor_spread    s → spread
+/// ps → processor_spread    ts → thread_spread    tnnps → thread_no_node_processor_spread
+/// nnps → no_node_processor_spread    nnts → no_node_thread_spread    ns → no_spread
+/// (no +sbt) → unbound
+/// ```
+fn scheduler_bind_type(rt: &Runtime) -> &'static str {
+    match rt.config().preserved_emulator_flag("+sbt") {
+        Some("db") | Some("tnnps") => "thread_no_node_processor_spread",
+        Some("s") => "spread",
+        Some("ps") => "processor_spread",
+        Some("ts") => "thread_spread",
+        Some("nnps") => "no_node_processor_spread",
+        Some("nnts") => "no_node_thread_spread",
+        Some("ns") => "no_spread",
+        // `u`, an absent `+sbt`, or a preserved value the CLI would never emit.
+        _ => "unbound",
     }
-    size
 }
 
 /// `+SDcpu N`, else the emulator default (the normal scheduler total) — this runtime

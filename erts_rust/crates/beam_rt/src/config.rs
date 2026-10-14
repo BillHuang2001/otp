@@ -707,6 +707,44 @@ impl RuntimeConfig {
     pub fn is_version(&self) -> bool {
         self.action == Version
     }
+
+    /// The **last** value the CLI preserved for the emulator switch `switch`, if any.
+    ///
+    /// Every writer of
+    /// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags)
+    /// (`crate::cli`'s `preserve_emulator_flag`) pushes exactly two tokens — the switch
+    /// followed by its value — so the list is a flat `(switch, value)` sequence and
+    /// stepping by two reads a switch at an even offset with its value at the odd one.
+    ///
+    /// The **last** occurrence wins: the C's `argv` loop overwrites its variable as it
+    /// walks, so a repeated `+A`/`+t`/`+e`/`+sbt` takes the final value (verified against
+    /// OTP 29.1.1 / erts-17.1 for `+A 2 +A 4`, which reports the async pool as `4`).
+    ///
+    /// A truncated pair (the value token missing) contributes nothing — never a panic.
+    /// Use [`preserved_emulator_flags`](Self::preserved_emulator_flags) when the switch's
+    /// semantics is a *union* over its occurrences rather than last-one-wins.
+    pub fn preserved_emulator_flag(&self, switch: &str) -> Option<&str> {
+        self.emulator
+            .extra_emulator_flags
+            .chunks_exact(2)
+            .filter(|pair| pair[0] == switch)
+            .next_back()
+            .map(|pair| pair[1].as_str())
+    }
+
+    /// Every value the CLI preserved for the emulator switch `switch`, in command-line
+    /// order (see [`preserved_emulator_flag`](Self::preserved_emulator_flag) for the
+    /// channel's `(switch, value)` shape).
+    pub fn preserved_emulator_flags<'a>(
+        &'a self,
+        switch: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.emulator
+            .extra_emulator_flags
+            .chunks_exact(2)
+            .filter(move |pair| pair[0] == switch)
+            .map(|pair| pair[1].as_str())
+    }
 }
 
 #[cfg(test)]
