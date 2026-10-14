@@ -53,8 +53,12 @@
 //! exceptional path — never both). `try_case` blanks its frame slot, moves the
 //! class atom from `x(3)` into `x(0)` and requires the `THE_NON_VALUE` marker in
 //! `x(0)`; `try_end` just blonks its slot; `catch_end` leaves a normal result
-//! untouched but folds a landed exception into the caught term — the thrown value
-//! for class `throw`, `{'EXIT',Reason}` otherwise.
+//! untouched but folds a landed exception into the caught term exactly as C does
+//! (`emu/instrs.tab:1188-1211`): the thrown value for class `throw`,
+//! `{'EXIT',Reason}` for class `exit`, and `{'EXIT',{Reason,Stacktrace}}` for class
+//! `error` — the last being C's `add_stacktrace` pair
+//! (`beam_common.c:730-735`), whose stacktrace element is the **cooked** symbolic
+//! trace of this same exception.
 //!
 //! The **class atom** (`error`/`exit`/`throw`) is installed from the running
 //! module's atom table before a raise ([`install_class_atom`]) so a landing can
@@ -65,15 +69,15 @@
 //! **Milestone-1 limits (all documented, never a wrong result):**
 //! - No raw `StackTrace` object is **landed** as `x(2)` (the engine keeps no such
 //!   object — C's raw trace is an opaque array of saved code pointers, `c_p->ftrace`),
-//!   so a landed exception carries `x(2) = NIL`. A caught `try ... catch C:R:S -> S`
-//!   nevertheless cooks `S` from the machine's **raise-time snapshot** — the frames
-//!   the raise unwound out of, the raising function first then every live caller
-//!   innermost-first (see [`Instr::BuildStacktrace`] below). The oracle's own cooked
-//!   `S` additionally holds host `init:*`/`erl_eval` frames that live *outside* this
-//!   engine's run, so the engine's list is always a strictly-**shorter prefix** of
-//!   the oracle's — the engine's frames first, never a different value. `catch_end`
-//!   is unaffected: it builds `{'EXIT',Reason}` from `x(1)` with no stacktrace
-//!   element (C's `add_stacktrace`), a shorter but otherwise identical reason term.
+//!   so a landed exception carries `x(2) = NIL`. Both stacktrace-cooking paths — a
+//!   caught `try ... catch C:R:S -> S` ([`Instr::BuildStacktrace`]) and the
+//!   `catch_end` fold of a class-`error` exception ([`Instr::CatchEnd`]) —
+//!   nevertheless cook the trace from the machine's **raise-time snapshot**: the
+//!   frames the raise unwound out of, the raising function first then every live
+//!   caller innermost-first. The oracle's own cooked trace additionally holds host
+//!   `init:*`/`erl_eval` frames that live *outside* this engine's run, so the
+//!   engine's list is always a strictly-**shorter prefix** of the oracle's — the
+//!   engine's frames first, never a different value.
 //! - `catch_end` cannot build `{'EXIT',V}` in a module whose atom table lacks
 //!   `'EXIT'` (the loader exposes only the module's atoms); it returns a typed
 //!   `unsupported` rather than substituting a wrong atom.
@@ -104,7 +108,7 @@ use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::{CatchFrame, Machine};
 use crate::operand::{read_operand, write_operand};
-use crate::terms;
+use crate::terms::{self, Sink};
 use crate::Step;
 
 use raise::{classify_class, install_class_atom, raise_error_atom, raise_error_tuple};
@@ -202,9 +206,11 @@ pub(crate) fn exec(
             Ok(Some(Step::Next))
         }
 
-        // `catch_end Frame` — fold the old-style `catch`: a normal result passes
-        // through unchanged; a landed exception becomes the thrown value (class
-        // `throw`) or `{'EXIT',Reason}` (classes `error`/`exit`).
+        // `catch_end Frame` — fold the old-style `catch` (`emu/instrs.tab:1175-1214`,
+        // C's exact three-way fold): a normal result passes through unchanged; a
+        // landed exception becomes the thrown value (class `throw`), `{'EXIT',Reason}`
+        // (every other class) or — for class `error` — `{'EXIT',{Reason,Stacktrace}}`,
+        // C's `add_stacktrace` (`beam_common.c:730-735`, guarded on `x(3) == am_error`).
         Instr::CatchEnd { frame } => {
             machine.pop_catch_frame_checked("catch_end: unbalanced catch frames")?;
             write_operand(machine, frame, NIL)?;
@@ -212,38 +218,85 @@ pub(crate) fn exec(
                 let class = machine
                     .x(3)
                     .ok_or_else(|| error::unsupported("catch_end: x(3) out of range"))?;
-                let reason = machine
-                    .x(1)
-                    .ok_or_else(|| error::unsupported("catch_end: x(1) out of range"))?;
                 let throw_atom = module.atom_table.lookup("throw").map(make_atom);
                 if throw_atom == Some(class) {
                     // Class `throw`: the caught value is the thrown term itself.
+                    let reason = machine
+                        .x(1)
+                        .ok_or_else(|| error::unsupported("catch_end: x(1) out of range"))?;
                     machine.set_x(0, reason)?;
                 } else {
-                    // Classes `error`/`exit` ⇒ `{'EXIT',Reason}`. M1 appends no
-                    // stacktrace (C's `add_stacktrace`).
+                    // Classes `error`/`exit` ⇒ `{'EXIT',Reason}`.
                     let exit_atom = module.atom_table.lookup("EXIT").ok_or_else(|| {
                         error::unsupported("catch_end: module atom table lacks the 'EXIT' atom")
                     })?;
                     let exit_term = make_atom(exit_atom);
-                    // Reserve → read → write: the reason is re-read from the machine
-                    // root `x(1)` *inside* the reader closure, so a moving collector
-                    // running under the one rooted reservation cannot leave this build
-                    // holding the stale copy read above.
-                    let tuple = terms::make_tuple_rooted(
-                        machine,
-                        ctx,
-                        RootSet::ALL_LIVE,
-                        2,
-                        0,
-                        |m, _slack| {
-                            let reason = m.x(1).ok_or_else(|| {
-                                error::unsupported("catch_end: x(1) out of range")
-                            })?;
-                            Ok(vec![exit_term, reason])
-                        },
-                    )?;
-                    machine.set_x(0, tuple)?;
+                    let error_atom = module.atom_table.lookup("error").map(make_atom);
+                    let caught = if error_atom == Some(class) {
+                        // Class `error` ⇒ the reason is `{Reason,Stacktrace}`
+                        // (`add_stacktrace`). The stacktrace is the **cooked**
+                        // symbolic trace of this exception: C's `build_stacktrace`
+                        // resolves the raise's raw trace (the landed `x(2)`, `NIL`
+                        // here — the engine keeps no raw `StackTrace` object), and the
+                        // raise already rebuilt `Machine::raise_snapshot` — the
+                        // pre-unwind frame chain, the raising frame first then every
+                        // live caller innermost-first — before it unwound, so the
+                        // builder cooks from that snapshot exactly as the compiled
+                        // `build_stacktrace` opcode does.
+                        //
+                        // Publish the cooked trace in `x(0)` — the result register
+                        // this opcode owns (the marker check above already consumed
+                        // it) — so the ONE rooted reservation below sees it as a live
+                        // root and relocates it in place if it collects. That
+                        // reservation carries BOTH tuples: the outer
+                        // `{'EXIT',Inner}` and the inner `{Reason,Trace}`, carved from
+                        // its spare `Sink` tail, so no second (collecting) allocation
+                        // can strand a node written by the first.
+                        let cooked =
+                            symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?;
+                        machine.set_x(0, cooked)?;
+                        // The reservation's spare tail (3 words: the inner pair's
+                        // `arityval` header plus its 2 elements) is the inner
+                        // `{Reason,Trace}`, carved through the `Sink` writer.
+                        terms::make_tuple_rooted(
+                            machine,
+                            ctx,
+                            RootSet::ALL_LIVE,
+                            2,
+                            3,
+                            |m, slack| {
+                                let reason = m.x(1).ok_or_else(|| {
+                                    error::unsupported("catch_end: x(1) out of range")
+                                })?;
+                                let trace = m.x(0).ok_or_else(|| {
+                                    error::unsupported("catch_end: x(0) out of range")
+                                })?;
+                                let pair = slack.tuple(&[reason, trace])?;
+                                Ok(vec![exit_term, pair])
+                            },
+                        )?
+                    } else {
+                        // Classes `exit` (and any other non-`throw`, non-`error`
+                        // class) ⇒ the bare `{'EXIT',Reason}`. Reserve → read →
+                        // write: the reason is re-read from the machine root `x(1)`
+                        // *inside* the reader closure, so a moving collector running
+                        // under the one rooted reservation cannot leave this build
+                        // holding a stale copy.
+                        terms::make_tuple_rooted(
+                            machine,
+                            ctx,
+                            RootSet::ALL_LIVE,
+                            2,
+                            0,
+                            |m, _slack| {
+                                let reason = m.x(1).ok_or_else(|| {
+                                    error::unsupported("catch_end: x(1) out of range")
+                                })?;
+                                Ok(vec![exit_term, reason])
+                            },
+                        )?
+                    };
+                    machine.set_x(0, caught)?;
                 }
             }
             Ok(Some(Step::Next))

@@ -70,6 +70,14 @@ fn module() -> Module {
     // interning table leaves every existing lookup (the module's own atoms and the
     // class/tag atoms the family installs) unchanged.
     module.atom_table.intern("no");
+    // A real runtime keeps the well-known exception atoms — `file`/`line` included
+    // (`../../erts/emulator/beam/beam_common.c:382-406`) — globally interned; the
+    // bare loader interns only what the module's own atom chunk names. Seed them so
+    // the `catch_end` fold's cooked stacktrace can carry its source location — the
+    // same policy the `tests/support` host applies to every module it loads
+    // (`SEED_ATOMS`).
+    module.atom_table.intern("file");
+    module.atom_table.intern("line");
     module
 }
 
@@ -256,22 +264,34 @@ fn oldcatch_escapes_the_raw_caught_value() {
         atom_term(&module, "one")
     );
 
-    // The raw caught value escapes to the caller. Oracle:
-    // `{'EXIT',{{case_clause,2},Stacktrace}}`. M1 captures no stacktrace, so the
-    // engine's reason is the shorter `{'EXIT',{case_clause,2}}` — the documented
-    // `catch_end` limit (C's `add_stacktrace` is skipped).
+    // The raw caught value escapes to the caller as C's `{'EXIT',{Reason,Stacktrace}}`
+    // (class `error`, `add_stacktrace`):
+    //   $ erl -noshell -pz <fixtures> -eval 'io:format("~p~n",[exceptions:oldcatch(2)]), halt().'
+    //   {'EXIT',{{case_clause,2},
+    //            [{exceptions,oldcatch,1,[{file,"exceptions.erl"},{line,29}]}
+    //             | <host erl_eval/init frames>]}}
+    // The raise rebuilt the machine's pre-unwind frame chain
+    // (`Machine::raise_snapshot`) and `catch_end` cooks it, so the engine's
+    // stacktrace is the oracle's own **leading** frames — the raising `oldcatch/1`
+    // — never `[]`; the trailing host frames live outside this run.
     let actual = run(&module, "oldcatch", &[make_small(2)], &mut ctx)
         .0
         .expect("oldcatch(2) yields the EXIT tuple");
-    let inner = terms::make_tuple(
+    let reason = terms::make_tuple(
         &mut ctx,
         &[atom_term(&module, "case_clause"), make_small(2)],
     )
     .unwrap();
-    let expected = terms::make_tuple(&mut ctx, &[atom_term(&module, "EXIT"), inner]).unwrap();
+    let location = location(&mut ctx, &module, "exceptions.erl", 29);
+    let item = frame(&mut ctx, &module, "oldcatch", 1, location);
+    let frames = terms::make_list(&mut ctx, &[item]).unwrap();
+    let pair = terms::make_tuple(&mut ctx, &[reason, frames]).unwrap();
+    let expected = terms::make_tuple(&mut ctx, &[atom_term(&module, "EXIT"), pair]).unwrap();
     assert!(
         cmp(actual, expected, &module.atom_table).is_eq(),
-        "oldcatch(2) must be {{'EXIT',{{case_clause,2}}}} (M1: no stacktrace)"
+        "oldcatch(2) must be 'EXIT' paired with {{Reason,Stacktrace}}, Reason = \
+         {{case_clause,2}} and Stacktrace = the oracle's leading frames: the raising \
+         exceptions:oldcatch/1 at exceptions.erl:29"
     );
 }
 
@@ -993,24 +1013,41 @@ fn the_caught_class_atom_is_the_error_class_on_a_real_module() {
 
 #[test]
 fn old_style_catch_builds_the_exit_tuple_without_a_stacktrace() {
-    // `oldcatch_bm(X) -> catch bm(X).`
-    // ORACLE: `excpaths:oldcatch_bm(a) = {'EXIT',{{badmatch,a},Stacktrace}}`.
-    // M1 captures no stacktrace, so `catch_end` builds the shorter
-    // `{'EXIT',{badmatch,a}}` (the documented `catch_end` limit — C's
-    // `add_stacktrace` is skipped); the REASON itself is oracle-exact.
+    // `oldcatch_bm(X) -> catch bm(X).` — a class-`error` raise (the `bm/1` binary
+    // match fails), so the caught term is C's `{'EXIT',{Reason,Stacktrace}}` pair
+    // (`add_stacktrace`), not the 2-element `{'EXIT',Reason}`:
+    //   $ erl -noshell -pz <fixtures> -eval 'io:format("~p~n",[excpaths:oldcatch_bm(a)]), halt().'
+    //   {'EXIT',{{badmatch,a},
+    //            [{excpaths,bm,1,[{file,"excpaths.erl"},{line,54}]},
+    //             {excpaths,oldcatch_bm,1,[{file,"excpaths.erl"},{line,68}]}
+    //             | <host erl_eval/init frames>]}}
+    // The raise rebuilt the machine's pre-unwind frame chain and `catch_end` cooks
+    // it, so the engine's stacktrace is the oracle's leading frames — the raising
+    // `bm/1` first, then its live caller `oldcatch_bm/1` — and the REASON is
+    // oracle-exact; the trailing host frames live outside this run.
     let mut host = excpaths_host();
     let a = host.intern("a");
     let got = host
         .call("excpaths", "oldcatch_bm", &[a])
         .expect("oldcatch_bm(a) must yield the EXIT tuple");
+    let module = host.load("excpaths").expect("excpaths is registered");
 
     let badmatch = host.intern("badmatch");
     let exit = host.intern("EXIT");
-    let inner = terms::make_tuple(&mut host, &[badmatch, a]).unwrap();
-    let expected = terms::make_tuple(&mut host, &[exit, inner]).unwrap();
+    let reason = terms::make_tuple(&mut host, &[badmatch, a]).unwrap();
+    let bm_location = location(&mut host, &module, "excpaths.erl", 54);
+    let bm_item = frame(&mut host, &module, "bm", 1, bm_location);
+    let caller_location = location(&mut host, &module, "excpaths.erl", 68);
+    let caller_item = frame(&mut host, &module, "oldcatch_bm", 1, caller_location);
+    let frames = terms::make_list(&mut host, &[bm_item, caller_item]).unwrap();
+    let pair = terms::make_tuple(&mut host, &[reason, frames]).unwrap();
+    let expected = terms::make_tuple(&mut host, &[exit, pair]).unwrap();
     assert!(
         cmp(got, expected, host.atom_table()).is_eq(),
-        "oldcatch_bm(a) must be {{'EXIT',{{badmatch,a}}}} (M1: no stacktrace)"
+        "oldcatch_bm(a) must be 'EXIT' paired with {{Reason,Stacktrace}}, Reason = \
+         {{badmatch,a}} and Stacktrace = the oracle's leading frames: the raising \
+         excpaths:bm/1 at excpaths.erl:54, then its caller excpaths:oldcatch_bm/1 at \
+         excpaths.erl:68"
     );
 }
 
@@ -1289,4 +1326,198 @@ fn the_caught_stacktrace_names_the_raising_function_and_its_live_callers() {
         oracle_run2,
         "run2/0's cooked S must equal the oracle's leading frames"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The old-style `catch` fold: all three exception classes over the committed
+// `catchclasses.beam` fixture
+// ---------------------------------------------------------------------------
+
+/// The committed oracle fixture (produced by `erlc catchclasses.erl`).
+const CATCHCLASSES_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/catchclasses.beam"
+);
+
+/// A [`ModuleHost`] with `catchclasses` registered (the shared-atom host seeds the
+/// well-known atoms — `badmatch`/`file`/`line` included — on load).
+fn catchclasses_host() -> ModuleHost {
+    let mut host = ModuleHost::new(".");
+    host.register("catchclasses", CATCHCLASSES_BEAM);
+    host
+}
+
+/// The `catchclasses` frames the system `erl` cooks for `errored/0` and `nested/0`,
+/// rendered in [`render_frames`]'s flat form; `None` when no runnable `erl` is on
+/// `PATH` (the caller skips loudly). A spawned `erl` that exits non-zero is a
+/// **harness** failure, not "no oracle" — it panics with the captured stderr.
+fn oracle_catchclasses_frames() -> Option<(String, String)> {
+    let eval = concat!(
+        "Pick = fun(L) -> [X || {catchclasses,_,_,_} = X <- L] end, ",
+        "Show = fun(L) -> lists:flatten(lists:join(\";\", ",
+        "[io_lib:format(\"~s|~s|~w|~s|~w\", [M, atom_to_list(FN), A, ",
+        "proplists:get_value(file, Loc), proplists:get_value(line, Loc)]) ",
+        "|| {M,FN,A,Loc} <- Pick(L)])) end, ",
+        "{'EXIT',{_,TE}} = catchclasses:errored(), ",
+        "{'EXIT',{_,TN}} = catchclasses:nested(), ",
+        "io:format(\"~s~n~s~n\", [Show(TE), Show(TN)]), halt()."
+    );
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let output = Command::new("erl")
+        .args(["-noshell", "-pz", fixtures, "-eval", eval])
+        .output()
+        .ok()?;
+    assert!(
+        output.status.success(),
+        "the system `erl` exited {} for `{eval}`\n  stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let errored = lines.next().unwrap_or_default().to_string();
+    let nested = lines.next().unwrap_or_default().to_string();
+    Some((errored, nested))
+}
+
+#[test]
+fn the_old_style_catch_folds_each_exception_class_like_the_oracle() {
+    // `catch Expr` compiles to `catch` … `catch_end`, and C's `catch_end`
+    // (`emu/instrs.tab:1188-1211`) folds a landed exception three ways: the thrown
+    // term BARE for class `throw`, `{'EXIT',Reason}` for class `exit`, and
+    // `{'EXIT',{Reason,Stacktrace}}` for class `error` — the last being C's
+    // `add_stacktrace` (`beam_common.c:730-735`). Fresh oracle:
+    //   $ erl -noshell -pz <fixtures> -eval 'io:format("~p~n", [catchclasses:thrown()]), …'
+    //   plain   = ok
+    //   thrown  = ball                        -- the thrown value, bare
+    //   exited  = {'EXIT',bye}                -- no stacktrace element
+    //   errored = {'EXIT',{{badmatch,b},
+    //                [{catchclasses,errored,0,[{file,"catchclasses.erl"},{line,29}]}
+    //                 | <host erl_eval frames>]}}
+    //   nested  = {'EXIT',{{badmatch,b},
+    //                [{catchclasses,deeper,0,[{file,"catchclasses.erl"},{line,31}]},
+    //                 {catchclasses,nested,0,[{file,"catchclasses.erl"},{line,30}]}
+    //                 | <host erl_eval frames>]}}
+    // The raise rebuilt the machine's pre-unwind frame chain
+    // (`Machine::raise_snapshot`) and `catch_end` cooks it, so the engine's
+    // stacktrace is the oracle's own **leading** frames — the raising function
+    // first, then its live callers innermost-first — never `[]`; the trailing host
+    // `erl_eval`/`init` frames live outside this run and are never fabricated.
+    let mut host = catchclasses_host();
+
+    assert_eq!(
+        host.call("catchclasses", "plain", &[])
+            .expect("plain/0 must yield its value"),
+        host.intern("ok"),
+        "no exception: the value passes through the `catch` unchanged"
+    );
+
+    assert_eq!(
+        host.call("catchclasses", "thrown", &[])
+            .expect("thrown/0 must yield the thrown term"),
+        host.intern("ball"),
+        "class `throw` yields the thrown term BARE (C's `x(0) = x(1)`)"
+    );
+
+    let exited = host
+        .call("catchclasses", "exited", &[])
+        .expect("exited/0 must yield the EXIT tuple");
+    assert_eq!(
+        terms::tuple_arity(exited).ok(),
+        Some(2),
+        "class `exit` yields the bare 2-tuple {{'EXIT',Reason}}, never a \
+         {{'EXIT',{{Reason,Stacktrace}}}} pair: {exited:?}"
+    );
+    assert_eq!(
+        atom_name_at(&host, terms::tuple_element(exited, 0).expect("the tag")),
+        "EXIT",
+        "class `exit`'s caught term is tagged 'EXIT'"
+    );
+    assert_eq!(
+        terms::tuple_element(exited, 1).expect("the reason"),
+        host.intern("bye"),
+        "class `exit` carries its reason with NO stacktrace element"
+    );
+
+    // Class `error`: the caught term pairs the reason with the cooked stacktrace
+    // (`add_stacktrace`), which the engine derives from the pre-unwind snapshot.
+    let cases: Vec<(&str, Vec<(&str, i64)>)> = vec![
+        ("errored", vec![("errored", 29)]),
+        ("nested", vec![("deeper", 31), ("nested", 30)]),
+    ];
+    let mut engine_frames: Vec<String> = Vec::new();
+    for (function, expected) in &cases {
+        let caught = host
+            .call("catchclasses", function, &[])
+            .unwrap_or_else(|err| panic!("{function}/0 must yield its caught term: {err:?}"));
+        assert_eq!(
+            terms::tuple_arity(caught).ok(),
+            Some(2),
+            "{function}/0 must yield the 2-tuple {{'EXIT',Inner}}: {caught:?}"
+        );
+        assert_eq!(
+            atom_name_at(&host, terms::tuple_element(caught, 0).expect("the tag")),
+            "EXIT",
+            "{function}/0's caught term must be tagged 'EXIT'"
+        );
+        let inner = terms::tuple_element(caught, 1).expect("the inner term");
+        assert_eq!(
+            terms::tuple_arity(inner).ok(),
+            Some(2),
+            "class `error` must pair its reason with a stacktrace: {inner:?}"
+        );
+        let reason = terms::tuple_element(inner, 0).expect("the reason");
+        assert_eq!(
+            (
+                atom_name_at(&host, terms::tuple_element(reason, 0).expect("the reason tag")),
+                terms::tuple_element(reason, 1).expect("the reason value"),
+            ),
+            ("badmatch".to_string(), host.intern("b")),
+            "class `error`'s reason must be the oracle's {{badmatch,b}}"
+        );
+        let trace = terms::tuple_element(inner, 1).expect("the stacktrace");
+        let frames: Vec<_> = terms::list_elements(trace)
+            .expect("the stacktrace is a proper list")
+            .iter()
+            .map(|&item| frame_fields(&host, item))
+            .collect();
+        let want: Vec<_> = expected
+            .iter()
+            .map(|(name, line)| {
+                (
+                    "catchclasses".to_string(),
+                    (*name).to_string(),
+                    0,
+                    "catchclasses.erl".to_string(),
+                    *line,
+                )
+            })
+            .collect();
+        assert_eq!(
+            frames, want,
+            "{function}/0's stacktrace must be the oracle's leading frames — the \
+             raising function first, then its live callers innermost-first"
+        );
+        engine_frames.push(render_frames(&frames));
+    }
+
+    // Oracle cross-check: re-derive the same frames from the system `erl` (skip
+    // loudly when it is absent). The oracle prints ALL of its own frames flat, while
+    // the engine's list is a strictly-shorter prefix (the host `erl_eval` frames
+    // live outside this run), so the prefix relation is asserted at a frame
+    // boundary — a drift in any engine field fails here too.
+    let Some((oracle_errored, oracle_nested)) = oracle_catchclasses_frames() else {
+        eprintln!(
+            "SKIP exceptions::the_old_style_catch_folds_each_exception_class_like_the_oracle \
+             oracle half: no `erl` oracle on PATH"
+        );
+        return;
+    };
+    for (engine, oracle) in engine_frames.iter().zip([oracle_errored, oracle_nested]) {
+        assert!(
+            &oracle == engine || oracle.starts_with(&format!("{engine};")),
+            "the engine's cooked stacktrace `{engine}` must be the oracle's leading \
+             frames `{oracle}`"
+        );
+    }
 }

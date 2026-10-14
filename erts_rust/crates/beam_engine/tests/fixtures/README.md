@@ -420,6 +420,15 @@ A real `try … catch C:R:S -> S` whose `S` is the derived stacktrace (the raise
 |---|---|---|
 | `run/0` | `try erlang:error(badarg) catch C:R:S -> S end.` (inline raise) | the raising frame is the catching frame |
 | `run2/0` | a non-tail call into `raise_badarg/0` under the same `try` | the raising frame first, then the live caller |
+## `catchclasses.beam` (`catchclasses.erl`) — `tests/exceptions.rs`
+The old-style `catch` fold, one export per exception class (the `catch_end` three-way fold: C `emu/instrs.tab:1188-1211` plus `beam_common.c:730-735`).
+| export | Erlang | what it pins |
+|---|---|---|
+| `plain/0` | `catch ok.` | no exception: the value passes through unchanged |
+| `thrown/0` | `catch erlang:raise(throw, ball, []).` | class `throw` ⇒ the thrown value **bare** |
+| `exited/0` | `catch erlang:raise(exit, bye, []).` | class `exit` ⇒ the bare `{'EXIT',bye}`, **no** stacktrace element |
+| `errored/0` | `catch (a = b).` | class `error` ⇒ `{'EXIT',{{badmatch,b},Stacktrace}}` (C's `add_stacktrace`) |
+| `nested/0` | a non-tail call into `deeper/0` under the same `catch` | the raising frame first, then the live caller |
 ## `raise_frames.beam` (`raise_frames.erl`) — `tests/raise_stacktrace.rs`
 The uncaught-raise frames: `outer/1` makes a **non-tail** `call` into `boom/1` (which raises `error:badarg`), so the uncaught `Raise.stacktrace` names `boom/1` then `outer/1`.
 ## `xmod_caller.beam` (`xmod_caller.erl`) / `xmod_callee.beam` (`xmod_callee.erl`) — `tests/raise_stacktrace.rs`
