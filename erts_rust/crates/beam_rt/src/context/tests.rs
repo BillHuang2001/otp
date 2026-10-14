@@ -3486,6 +3486,147 @@ fn the_call_seam_is_idempotent_for_a_cached_observer_callee() {
 }
 
 // ---------------------------------------------------------------------------------------
+// The cross-module call seam vs a BUILT-IN NIF library (contract A.7's `prim_*` family)
+// ---------------------------------------------------------------------------------------
+
+/// The non-built-in control for the exemption: the **same** `erlang:load_nif/2` import the
+/// built-in library carries, under a name no static NIF table resolves — so the module-wide
+/// refusal must still stand for it.
+const SEAM_NOT_BUILTIN_SRC: &str = "-module(not_builtin_nif).
+-export([init/1]).
+init(Path) -> erlang:load_nif(Path, #{}).
+";
+
+/// **A built-in NIF library is entered in-machine even though it imports `erlang:load_nif/2`.**
+///
+/// `prim_tty` is ERTS's *statically linked* NIF library: `erlang:load_nif/2` resolves it from
+/// ERTS's static NIF table (`is_static_nif_module`, `erts/emulator/beam/erl_nif.c`) instead of
+/// `dlopen`ing a shared object, so this runtime's `NifLoader::load_nif` answers the oracle's
+/// `ok` without a `dlopen` and **without registering an owning module** — no
+/// `current_module`-dependent identity exists for the module-wide guard to protect. Keeping the
+/// refusal would buy nothing and would route the library's Erlang wrappers (`load/0`, `init/1`,
+/// `writer/1`, `reader/1`, …) onto the synchronous non-pumping `call_bif` path, where `init/1`'s
+/// blocking `receive` folds into the typed `blocked()` gap — the A.9 boot blocker: the
+/// `standard_error` `supervisor_bridge` child dies on it.
+///
+/// Both directions are pinned so the exemption cannot silently widen:
+///
+/// * the **real system** `prim_tty` resolves to its own `init/1` export label — and its loaded
+///   IR is asserted to really carry the guard-arming `erlang:load_nif/2` import, so the case
+///   proves the *exemption* rather than a vanished import;
+/// * a **non-built-in** module with the identical import stays `Ok(None)`, keeping the
+///   synchronous route that sets `current_module` correctly (its `load_nif` really does register
+///   a library under the module identity).
+///
+/// The built-in half needs a system Erlang installation (a bare container skips loudly); the
+/// control half needs `erlc` to compile its fixture.
+#[test]
+fn the_call_seam_enters_a_built_in_nif_library_in_machine() {
+    let mut rt = runtime();
+
+    // The real system module is the A.9 boot blocker's own callee. A bare container without an
+    // OTP installation skips **loudly**; once the system code path resolves, the module must be
+    // there — so a seam regression below still fails rather than skips.
+    if let Err(error) = rt.code_server.add_system_paths() {
+        skip_builtin_case(
+            "the_call_seam_enters_a_built_in_nif_library_in_machine",
+            &format!("no system code path ({error})"),
+        );
+        return;
+    }
+    assert!(
+        rt.find_module_file("prim_tty").is_some(),
+        "the system code path resolved but carries no `prim_tty.beam`"
+    );
+    // `RuntimeContext` owns a sink handle (and a destructor), so its borrow of the runtime ends
+    // with this block — the control half below re-borrows the same runtime.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        for consultation in 1..=2 {
+            assert!(
+                ctx.resolve_external_call("prim_tty", "init", 1)
+                    .expect("the seam reports a routing, never an error")
+                    .is_some(),
+                "consultation {consultation}: a built-in NIF library's Erlang wrapper is entered \
+                 in-machine — its `erlang:load_nif/2` registers nothing, so its call site cannot \
+                 be read"
+            );
+        }
+        let (module, label) = ctx
+            .resolve_external_call("prim_tty", "init", 1)
+            .expect("the seam reports a routing, never an error")
+            .expect("the built-in library is admitted");
+
+        // The exemption is what admitted it: the guard's own verdict on this very module is
+        // `LoadNif`, i.e. a refusal of **every** function — read straight off the loaded IR, so
+        // the case cannot pass because the import went missing.
+        assert_eq!(
+            call_site_reading_imports(&module),
+            CallSiteReadingImports::LoadNif,
+            "the real `prim_tty` imports `erlang:load_nif/2`, which the guard refuses module-wide"
+        );
+        let init = module
+            .atom_table
+            .lookup("init")
+            .expect("`init` is interned in the module's own table");
+        assert!(
+            callee_observes_its_call_site(&module, init, 1),
+            "the guard itself refuses `prim_tty:init/1` — only the built-in exemption admits it"
+        );
+        // The seam hands back the code server's own handle and the callee's own export label.
+        let cached = ctx
+            .runtime
+            .code_server()
+            .module_handle("prim_tty")
+            .expect("the seam's on-demand load cached the system module");
+        assert!(
+            Arc::ptr_eq(&module, &cached),
+            "the seam hands back the code server's own handle (the engine dedups contexts on it)"
+        );
+        assert_eq!(
+            Some(label),
+            module.export(init, 1),
+            "the resolved label is `prim_tty:init/1`'s own export entry"
+        );
+    }
+
+    // The control direction: the identical import under a name no static NIF table resolves
+    // keeps the module-wide refusal.
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "built-in NIF library exemption",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "builtin_nif_exemption",
+        &[("not_builtin_nif", SEAM_NOT_BUILTIN_SRC)],
+    );
+    rt.add_code_path(dir.path());
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        ctx.resolve_external_call("not_builtin_nif", "init", 1)
+            .expect("the seam reports a routing, never an error")
+            .is_none(),
+        "a non-built-in module importing `erlang:load_nif/2` keeps the module-wide refusal: \
+         its `load_nif` registers a library under the module identity, which an in-machine \
+         callee would run under the caller's"
+    );
+    let control = ctx
+        .runtime
+        .code_server()
+        .module_handle("not_builtin_nif")
+        .expect("the seam's on-demand load cached the control fixture");
+    assert_eq!(
+        call_site_reading_imports(&control),
+        CallSiteReadingImports::LoadNif,
+        "the control carries the very same guarded import as the built-in library"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // The in-machine fun-apply seam (`resolve_local_fun`) and its external-fun arm
 // ---------------------------------------------------------------------------------------
 

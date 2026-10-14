@@ -1366,22 +1366,14 @@ fn resolve_config_file(value: &str) -> PathBuf {
         None => PathBuf::from(base),
     }
 }
-/// The `-boot FILE` argument of the merged command line, or `None` when none was given.///
-/// The value is read from the recorded init arguments rather than a field of its own
-/// because that is exactly where `init` reads it: `bootfile/2` resolves `get_flag(boot,
-/// Flags, Root ++ "/bin/start")` (`erts/preloaded/src/init.erl:1257-1258`), and the `boot`
-/// flag *is* the init argument `init:get_argument(boot)` reports (contract A.6). The
-/// **first** occurrence wins (`lists:keyfind/3`, `init.erl:1763`), so `-boot a -boot b`
-/// boots `a`.
+/// The `-boot FILE` argument of the merged command line, or `None` when none was given.
 ///
-/// A `-boot` with no operand never reaches this function: [`parse`] rejects it as a usage
-/// error, so a value is always present when there is an occurrence.
+/// A thin forwarder over [`RuntimeConfig::boot_script`], which owns the semantics (the
+/// `init:get_argument(boot)` provenance, first-occurrence-wins, and the "no operand is a
+/// usage error" rule).
 fn boot_file_argument(config: &RuntimeConfig) -> Option<&str> {
-    let occurrences = config.init_args.get("boot")?;
-    let values = occurrences.first()?;
-    values.first().map(String::as_str)
+    config.boot_script()
 }
-
 /// The Erlang root (`<Root>`) a `-boot` argument is resolved against: the directory above
 /// `<lib>` ([`Runtime::code_server`]'s `lib_root`) — the same convention the boot script's
 /// own `$ROOT` expansion uses (see [`crate::boot::bootscript`]). `None` until the system

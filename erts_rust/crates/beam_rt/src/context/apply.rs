@@ -267,7 +267,12 @@ impl RuntimeContext<'_> {
 /// import entry to scan and is therefore not covered — the documented residual.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum CallSiteReadingImports {
-    /// The module imports `erlang:load_nif/2`: refuse **every** function of the module.
+    /// The module imports `erlang:load_nif/2`: refuse **every** function of the module. The
+    /// cross-module seam ([`ExecutionContext::resolve_external_call`]) exempts a **built-in NIF
+    /// library** (contract A.7's `prim_*` family, [`crate::native::prim_tty::is_builtin_library`])
+    /// from this verdict: a statically linked library is resolved from ERTS's static NIF table,
+    /// so its `load_nif` registers nothing and has no `current_module`-dependent identity to
+    /// protect — the predicate here stays name-agnostic, the caller applies the exemption.
     LoadNif,
     /// The module imports a fun-image BIF (and not `load_nif`): refuse only a function whose
     /// **own** lowered body carries the call.
@@ -315,7 +320,12 @@ pub(super) fn call_site_reading_imports(module: &Module) -> CallSiteReadingImpor
 /// * **`erlang:load_nif/2` ⇒ module-wide.** Its answer depends on
 ///   [`RuntimeContext::current_module`] (the module the NIF library is registered under), and a
 ///   *local* call inside the module reaches it without ever re-consulting the seam — so
-///   refusing one function would not be sound. Every function of an importing module is refused.
+///   refusing one function would not be sound. Every function of an importing module is refused
+///   — **except** for a **built-in NIF library** (contract A.7's `prim_*` family), which
+///   [`ExecutionContext::resolve_external_call`] exempts from this module-wide verdict: a
+///   statically linked library (`is_static_nif_module`) is resolved from ERTS's static NIF
+///   table, so nothing is registered and there is no identity to protect. This predicate is
+///   deliberately name-agnostic; the exemption lives at the call site.
 /// * **`erlang:term_to_binary/1,2` / `erlang:external_size/1,2` ⇒ per-function.** The verdict is
 ///   the callee **function's own** lowered body: it is refused only when one of its instructions
 ///   carries an `ImportRef` resolving to one of those imports ([`function_calls_a_fun_image_bif`]).

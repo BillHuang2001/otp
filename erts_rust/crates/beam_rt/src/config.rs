@@ -708,6 +708,26 @@ impl RuntimeConfig {
         self.action == Version
     }
 
+    /// The `-boot FILE` argument of the merged command line, or `None` when the runtime was
+    /// not asked to run a boot script.
+    ///
+    /// The value is read from the recorded init arguments rather than from a field of its own
+    /// because that is exactly where `init` reads it: `bootfile/2` resolves `get_flag(boot,
+    /// Flags, Root ++ "/bin/start")` (`erts/preloaded/src/init.erl:1257-1258`), and the `boot`
+    /// flag *is* the init argument `init:get_argument(boot)` reports (contract A.6). The
+    /// **first** occurrence wins (`lists:keyfind/3`, `init.erl:1763`), so `-boot a -boot b`
+    /// boots `a`. A `-boot` with no operand never reaches the parsed config: [`crate::cli`]
+    /// rejects it as a usage error, so a value is always present when there is an occurrence.
+    ///
+    /// This predicate is what separates the **boot-script route** from every other one: the
+    /// bare `-noshell` boot, `-eval`, `-s`, `-run`, `-version` and the `.beam` runner all
+    /// leave it `None`. [`Runtime::new`](crate::runtime::Runtime::new) consults it before the
+    /// runtime claims a name the booted system owns — the native `file_server_2` service.
+    pub fn boot_script(&self) -> Option<&str> {
+        let occurrences = self.init_args.get("boot")?;
+        let values = occurrences.first()?;
+        values.first().map(String::as_str)
+    }
     /// The **last** value the CLI preserved for the emulator switch `switch`, if any.
     ///
     /// Every writer of

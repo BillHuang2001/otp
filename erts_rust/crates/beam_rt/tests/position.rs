@@ -22,14 +22,20 @@
 //!
 //! `erlang:process_info/2`'s four execution-position items — `current_function`,
 //! `initial_call`, `current_location` and `current_stacktrace` — describe *where a
-//! process is*. They are read from a process's saved instruction pointer, which means
-//! they can only be answered for a process this runtime has an engine for, and only from
-//! a second process: a scheduler pass takes the *running* process's machine out of the
-//! runner state, so a process asking about **itself** is the honest capability gap.
+//! process is*. From outside they are read from a process's saved instruction pointer, so
 //! [`beam_engine`]'s `Machine::current_*` accessors and `beam_rt`'s `src/native/memory`
-//! item classification have their own unit tests; this test pins the whole path end to end:
-//! a real `.beam` is spawned as a process, it parks in a `receive`, a **second** process
-//! probes it, and the returned term is compared line for line against the live system `erl`
+//! item classification answer them for a process this runtime has an engine for, probed by
+//! a **second** process. A process asking about **itself** is the harder shape: a scheduler
+//! pass takes the *running* process's machine out of the runner state for the whole slice,
+//! so the runtime state alone cannot name it — the engine therefore hands that live
+//! `beam_engine::Machine` to the **in-machine BIF door** ([`beam_rt::context::position`])
+//! while a BIF runs, and the caller's own position is read from there. That door is open
+//! only on the compiled-code path (a `Machine` dispatch); a library caller reaching
+//! `ExecutionContext::call_bif` without one still gets the honest capability gap.
+//! This test pins the whole path end to end on **both** shapes: a real `.beam` is spawned as
+//! a process, it parks in a `receive`, a **second** process probes it; and a `recv.erl`
+//! function queries its **own** position from inside a scheduled process and reports the
+//! answer back. Both answers are compared line for line against the live system `erl`
 //! oracle.
 //!
 //! Oracle ground truth (system `erl`, OTP 29 / `erts-17.1`; `recv.erl` compiled with the
@@ -49,6 +55,19 @@
 //!  {current_stacktrace,[{recv,wait,0,[{file,"recv.erl"},{line,12}]}]}]
 //! ```
 //!
+//! The self-query oracle uses the same fixture: `recv:main/0` is `probe_b(self())`, run
+//! inside the scheduled [`pos_self`] fixture's `go/1` (see [`ORACLE_SELF_PROBE`]).
+//!
+//! ## Honest divergences of the self-query (recorded, not papered over)
+//!
+//! * `initial_call` from the machine is the process's **entry MFA**. The oracle reports
+//!   `{erlang,apply,2}` for some spawn shapes (a fun-valued spawn, a start instruction);
+//!   the scheduled-export shape this test uses has the oracle report the entry MFA too, so
+//!   the two agree there, but the shapes do not cover every oracle answer.
+//! * A **nested** fun-applied run started inside the published window reads the **outer**
+//!   machine's position for that pid: the slot is runtime-wide, not per-`RuntimeContext`,
+//!   so a machine the nested run replaces is what answers.
+//!
 //! The fixture (`tests/fixtures/recv.erl`) is compiled **at test time** with the system
 //! `erlc`, so nothing path-dependent is committed; a missing `erl`/`erlc` is a **loud**
 //! skip, never a silent pass. The scratch directory never contains a `lists.beam`, so it
@@ -61,8 +80,17 @@ use beam_engine::terms;
 use beam_rt::Runtime;
 use beam_term::{signed_value, Eterm};
 
-/// The committed fixture source (compiled at test time — never committed as a `.beam`).
+/// The committed fixture sources (compiled at test time — never committed as `.beam`s).
 const RECV_ERL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/recv.erl");
+const POS_SELF_ERL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/pos_self.erl"
+);
+
+/// Every fixture source a case may need: its name in the scratch directory and its path
+/// under `tests/fixtures/`.
+const FIXTURE_SOURCES: [(&str, &str); 2] =
+    [("recv.erl", RECV_ERL), ("pos_self.erl", POS_SELF_ERL)];
 
 /// The four items, in the order `probe_b/1` requests them.
 const ITEMS: [&str; 4] = [
@@ -138,12 +166,18 @@ fn skip_loudly(why: &str) {
 
 /// A compiled fixture in its own scratch directory (removed on drop).
 struct Fixture {
-    /// The scratch directory holding `recv.erl` and `recv.beam`.
+    /// The scratch directory holding the compiled `*.erl`/`*.beam` sources.
     dir: PathBuf,
     /// The compiled `recv.beam`.
     beam: PathBuf,
 }
 
+impl Fixture {
+    /// `module`'s compiled `.beam` in the scratch directory.
+    fn beam_of(&self, module: &str) -> PathBuf {
+        self.dir.join(format!("{module}.beam"))
+    }
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         // Best effort, but never silent: a leftover scratch dir must not fail the test,
@@ -157,14 +191,14 @@ impl Drop for Fixture {
     }
 }
 
-/// Compiles the committed `recv.erl` into a scratch directory, or `None` when the system
-/// toolchain is unavailable (the caller then returns early — **loudly**).
+/// Compiles the committed fixture sources into a scratch directory, or `None` when the
+/// system toolchain is unavailable (the caller then returns early — **loudly**).
 ///
-/// The source is copied to `<scratch>/recv.erl` and compiled with `erlc` run **with the
-/// scratch directory as cwd** and the bare argument `recv.erl`, so the file name recorded
-/// in the `.beam`'s `Line` chunk is exactly `"recv.erl"` — which is what the oracle reports
-/// in `current_location`/`current_stacktrace` (an absolute or repo-relative argument would
-/// record *that* string instead and the two would disagree).
+/// Each source is copied to `<scratch>/<name>` and every one is compiled in a single
+/// `erlc` run **with the scratch directory as cwd** and the bare file names as arguments,
+/// so the file name recorded in each `.beam`'s `Line` chunk is exactly `<name>` — which is
+/// what the oracle reports in `current_location`/`current_stacktrace` (an absolute or
+/// repo-relative argument would record *that* string instead and the two would disagree).
 fn build_fixture(label: &str) -> Option<(Fixture, PathBuf, PathBuf)> {
     let Some(oracle) = resolve_oracle() else {
         skip_loudly(&format!("position/{label}: no `erl` on $PATH"));
@@ -177,24 +211,31 @@ fn build_fixture(label: &str) -> Option<(Fixture, PathBuf, PathBuf)> {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("beam_rt_position_{label}_{}_{n}", std::process::id()));
-    let source = match std::fs::read(RECV_ERL) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            skip_loudly(&format!("position/{label}: cannot read {RECV_ERL}: {error}"));
+    let mut names = Vec::new();
+    for (name, path) in FIXTURE_SOURCES {
+        let source = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                skip_loudly(&format!("position/{label}: cannot read {path}: {error}"));
+                return None;
+            }
+        };
+        if let Err(error) =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(name), &source))
+        {
+            skip_loudly(&format!(
+                "position/{label}: cannot prepare {}/{}: {error}",
+                dir.display(),
+                name
+            ));
             return None;
         }
-    };
-    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| {
-        std::fs::write(dir.join("recv.erl"), &source)
-    }) {
-        skip_loudly(&format!("position/{label}: cannot prepare {}: {error}", dir.display()));
-        return None;
+        names.push(name);
     }
-    // cwd = the scratch dir, bare `recv.erl`: the recorded source name is `recv.erl`.
-    let output = match Command::new(&erlc)
-        .arg("-o")
-        .arg(&dir)
-        .arg("recv.erl")
+    // cwd = the scratch dir, bare file names: the recorded source names are the bare names.
+    let mut command = Command::new(&erlc);
+    command.arg("-o").arg(&dir).args(&names);
+    let output = match command
         .current_dir(&dir)
         .stdin(Stdio::null())
         .output()
@@ -243,15 +284,40 @@ io:format(\"~s ~s ~w ~s ~w~n\", [M3,F3,A3,File,Line]),
 io:format(\"~w ~s ~s ~w ~s ~w~n\", [length(ST),M4,F4,A4,File4,Line4]),
 halt(0).";
 
-/// Runs `ORACLE_PROBE` under the oracle with `code_dir` on the code path and returns its
-/// stdout, one non-empty trimmed line at a time.
-fn oracle_lines(oracle: &Path, code_dir: &Path) -> Vec<String> {
+/// The same four **canonical scalar lines** for `recv:main/0`'s **self** query.
+///
+/// `recv:main/0` (`probe_b(self())`) is run inside a *scheduled* process — the
+/// [`pos_self`] fixture's `go/1`, whose entry MFA both runtimes report as
+/// `initial_call` — and its answer is reported back through ordinary message passing
+/// (a spawned export process's return value is unobservable). The parent receives the
+/// already-ordered four-item list and prints the same four uniform scalar lines
+/// [`ORACLE_PROBE`] does, so the two probes are compared byte for byte.
+const ORACLE_SELF_PROBE: &str = "\
+Self = self(),
+_ = spawn(pos_self, go, [Self]),
+R = receive {result, X} -> X end,
+[{current_function,{M1,F1,A1}},
+ {initial_call,{M2,F2,A2}},
+ {current_location,{M3,F3,A3,Loc}},
+ {current_stacktrace,ST}] = R,
+[{file,File},{line,Line}] = Loc,
+[{M4,F4,A4,Loc4}|_] = ST,
+[{file,File4},{line,Line4}] = Loc4,
+io:format(\"~s ~s ~w~n\", [M1,F1,A1]),
+io:format(\"~s ~s ~w~n\", [M2,F2,A2]),
+io:format(\"~s ~s ~w ~s ~w~n\", [M3,F3,A3,File,Line]),
+io:format(\"~w ~s ~s ~w ~s ~w~n\", [length(ST),M4,F4,A4,File4,Line4]),
+halt(0).";
+
+/// Runs `probe` under the oracle with `code_dir` on the code path and returns its native
+/// `io:format` stdout, one non-empty trimmed line at a time.
+fn oracle_lines(oracle: &Path, code_dir: &Path, probe: &str) -> Vec<String> {
     let output = Command::new(oracle)
         .arg("-noshell")
         .arg("-pa")
         .arg(code_dir)
         .arg("-eval")
-        .arg(ORACLE_PROBE)
+        .arg(probe)
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|error| panic!("failed to spawn the oracle '{}': {error}", oracle.display()));
@@ -426,10 +492,93 @@ fn a_parked_process_reports_the_oracles_execution_position() {
     let result = rt.process_result(probe).expect("the probe returned");
 
     // The live oracle answer for the same fixture, line for line.
-    let expected = oracle_lines(&oracle, &fixture.dir);
+    let expected = oracle_lines(&oracle, &fixture.dir, ORACLE_PROBE);
     assert_eq!(
         canonical(&rt, result),
         expected,
         "the runtime's execution-position items must match the live oracle"
+    );
+}
+
+/// The **executing process's own** execution-position items are answered for real when the
+/// query comes from **compiled code** — the in-machine BIF door
+/// ([`crate::context::position`]) — and agree with the live system `erl` oracle line for
+/// line.
+///
+/// `recv:main/0` is `probe_b(self())`: it asks `erlang:process_info/1,2` for
+/// `current_function`/`initial_call`/`current_location`/`current_stacktrace` **of the
+/// process running it**. The scheduler takes that process's engine out of the runner state
+/// for the whole slice, so before the door existed the answer was the uncatchable typed gap
+/// `unsupported: process_info: current_stacktrace` — `gen_server`'s `?STACKTRACE()`. Here
+/// the query runs inside the *scheduled* fixture process `pos_self:go/1` (whose entry MFA is
+/// the process's `initial_call`, in both runtimes) and its answer is reported back through
+/// message passing, because a spawned export process's return value is unobservable.
+///
+/// The answer is `{recv,probe_b,1}` for `current_function`, `{pos_self,go,1}` for
+/// `initial_call`, `{recv,probe_b,1,[{file,"recv.erl"},{line,18}]}` for `current_location`
+/// and, for `current_stacktrace`, two frames whose head is
+/// `{recv,probe_b,1,[{file,"recv.erl"},{line,18}]}` and whose second is the caller
+/// `{pos_self,go,1,[{file,"pos_self.erl"},{line,24}]}` (the `recv:main/0` frame is elided by
+/// its tail call into `probe_b/1`, exactly as the oracle elides it; the comparison is over
+/// the frame count and the head frame, see [`canonical`]).
+#[test]
+fn a_self_query_in_compiled_code_answers_the_oracles_execution_position() {
+    let Some((fixture, oracle, _erlc)) = build_fixture("self") else {
+        return;
+    };
+
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.load_module(&fixture.beam).expect("recv.beam loads");
+    let pos_self = fixture.beam_of("pos_self");
+    rt.load_module(&pos_self).expect("pos_self.beam loads");
+
+    // The runner is the *scheduled* fixture process that performs the self query; the sink
+    // is its parent, which receives the report and returns it so the test can read it back.
+    let sink = rt
+        .spawn_process("pos_self", "sink", vec![])
+        .expect("spawn pos_self:sink/0");
+    let runner = rt
+        .spawn_process("pos_self", "go", vec![sink.to_eterm()])
+        .expect("spawn pos_self:go/1");
+    let result = run_until_returned(&mut rt, sink, runner);
+
+    // The live oracle answer for the same fixture, line for line.
+    let expected = oracle_lines(&oracle, &fixture.dir, ORACLE_SELF_PROBE);
+    assert_eq!(
+        canonical(&rt, result),
+        expected,
+        "the runtime's own execution-position items must match the live oracle"
+    );
+}
+
+/// Drives the scheduler in bounded passes until `sink` returns, and answers its result.
+///
+/// The runner parks in no `receive` (it sends immediately), but the sink parks on an empty
+/// mailbox first, so the runner's report wakes it through `beam_process`'s resume-on-send —
+/// which may take a second pass. The bound makes a delivery that never arrives a loud
+/// failure rather than a hang, and `runner`'s exit reason is reported when the runner died
+/// before sending (the self query raising the typed capability gap is exactly what a
+/// regression to the pre-door path looks like).
+fn run_until_returned(
+    rt: &mut Runtime,
+    sink: beam_process::ProcessId,
+    runner: beam_process::ProcessId,
+) -> Eterm {
+    for _ in 0..64 {
+        rt.run_scheduler().expect("the scheduler pass");
+        if let Some(result) = rt.process_result(sink) {
+            return result;
+        }
+        if let Some(reason) = rt.process_exit(runner) {
+            panic!(
+                "the self-query runner exited before reporting: {reason:?} \
+                 (the execution-position items must be answerable for the executing process)"
+            );
+        }
+    }
+    panic!(
+        "the receiver never returned: its report was not delivered within 64 passes; \
+         state = {:?}",
+        rt.processes().get(sink).map(|process| process.state())
     );
 }

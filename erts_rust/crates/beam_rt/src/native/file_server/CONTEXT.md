@@ -1,24 +1,30 @@
 # `beam_rt/src/native/file_server/` — the native `file_server_2` service (contract A.9)
 ## Intent
-The runtime-native **file service** that would complete the real boot chain. `lib/kernel/src/file.erl`
+The runtime-native **file service** answering the OTP file protocol. `lib/kernel/src/file.erl`
 routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`,
 and the file service is first *reached* at the `{apply,{c,erlangrc,[]}}` directive of
 `bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
-`FileServices` supplies the missing registered service. It is **not** a BIF: it is a process plus a
-scheduler-pass step. Without it that call would die with the oracle-shaped
-`{noproc,{gen_server,call,[file_server_2,…]}}` and the boot would stop there.
+`FileServices` supplies that service. It is **not** a BIF: it is a process plus a
+scheduler-pass step. On the **boot-script route** (`-boot FILE`) it is spawned **unregistered** — the
+booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name; on every other route it
+is the registered `file_server_2`.
 `file_server.rs` (this node's parent) owns the service; `setopts.rs`, `file_info.rs`, `get_until.rs`
 and `get_line.rs` are its child modules; `tests.rs` is its colocated unit suite.
 ## API Surface
 ### The process model (never enqueued) — `../file_server.rs`
-`FileServices::start(&mut ProcessTable, &mut AtomTable, HeapPolicy)` is called from `Runtime::new`
-next to the `init` registration and runs **one** process, born `ProcessState::Runnable`, `insert`ed
-into the table and registered under the atom `file_server_2`, but **never enqueued** and given no
-engine — the pattern the runtime's own `init`/`self_pid` process already uses. Because
-`Process::wake` only wakes a `Waiting`/`Suspended` process, a message delivered into the service's
-mailbox never puts it on a run queue, so the runner never sees it and
-`error::unknown_process_entry` is unreachable. `whereis(file_server_2)`, `monitor(process, Name)`
-and a send all resolve it (`server()`/`is_running()` accessors). A successful `{open,…}` spawns a
+`Runtime::new`, next to the `init` registration, consults
+`RuntimeConfig::boot_script()` and spawns **one** process either way — born `ProcessState::Runnable`,
+`insert`ed into the table, **never enqueued** and given no engine, the pattern the runtime's own
+`init`/`self_pid` process already uses. On the **boot-script route** (`-boot FILE`) it calls
+`FileServices::start_unclaimed(&mut ProcessTable, HeapPolicy)`, which registers **nothing**: the booted
+`kernel_sup` starts OTP's own `file_server_2` child (`{file_server, start_link, []}`), and an
+**initial** child start that finds the name taken aborts that supervisor (`kernel` is `permanent`), so
+the native service is left unregistered and idle. On every other route
+`FileServices::start(&mut ProcessTable, &mut AtomTable, HeapPolicy)` registers it under the atom
+`file_server_2`. `whereis(file_server_2)`, `monitor(process, Name)` and a send therefore resolve it
+only off the boot-script route (`server()`/`is_running()` accessors). Because `Process::wake` only
+wakes a `Waiting`/`Suspended` process, a message delivered into the service's mailbox never puts it on
+a run queue, so the runner never sees it and `error::unknown_process_entry` is unreachable. A successful `{open,…}` spawns a
 **second** `Runnable`, never-enqueued process — the **io-device** — under the same heap policy, and
 keys it in `FileServices::devices` as a `Device`: the open `std::fs::File` plus the **mutable**
 `binary`/`list` read mode and the `unicode`/`latin1` stream encoding

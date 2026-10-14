@@ -298,6 +298,18 @@ pub struct Runtime {
     /// Written **only** by the root-action entries ([`Runtime::eval`]/[`Runtime::run_named`])
     /// and restored on every exit path, so it is never a stale frame.
     pub(crate) executing: Option<executing::ExecutingFrame>,
+    /// The executing process's **execution position**, published by the in-machine BIF door
+    /// for exactly one nested `erlang:process_info/1,2` call (see
+    /// [`crate::context::position`]).
+    ///
+    /// The scheduler takes the executing process's machine **out** of
+    /// [`Runtime::runner_state`] for the whole slice, so the caller's own position has no
+    /// other source; `beam_engine`'s in-machine BIF door hands that live machine to
+    /// [`crate::context::RuntimeContext`], which reads the five machine-sourced item values
+    /// here. Non-`None` only between the door's publication and the return of the one nested
+    /// `call_bif` it wraps — a straight-line assign/clear with no `?` between them — so it is
+    /// never a stale record, and only a read for the **published pid** ever consults it.
+    pub(crate) in_machine: Option<crate::context::InMachinePosition>,
     /// The node-global **cumulative reduction count** — the `Total` behind
     /// `erlang:statistics(reductions)`/`(exact_reductions)`.
     ///
@@ -640,14 +652,28 @@ impl Runtime {
             .register(init_name, self_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
         // The native **`file_server_2` service** (contract A.9): a `Runnable`, never-enqueued
-        // process that answers the OTP file protocol, so the real `bootstrap/bin/start.boot`'s
-        // final `{apply,{c,erlangrc,[]}}` directive completes instead of dying with
-        // `{noproc,{gen_server,call,[file_server_2,…]}}` (see `src/native/file_server.rs`).
-        let file_services = crate::native::file_server::FileServices::start(
-            &mut processes,
-            code_server.atoms_mut(),
-            config.heap.policy().clone(),
-        )?;
+        // process that answers the OTP file protocol, so a caller like `c:erlangrc/0` finds the
+        // service instead of dying with `{noproc,{gen_server,call,[file_server_2,…]}}` (see
+        // `src/native/file_server.rs`).
+        //
+        // The **boot-script route** (`-boot FILE`) is the exception, because there the booted
+        // system owns the name: `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
+        // `file_server_2` child (`{file_server, start_link, []}`), and an **initial** child
+        // start that finds the name already taken aborts that supervisor — `kernel` is
+        // `permanent`, so the node tears down. The native service must therefore leave the name
+        // free and let the booted application serve it.
+        let file_services = if config.boot_script().is_some() {
+            crate::native::file_server::FileServices::start_unclaimed(
+                &mut processes,
+                config.heap.policy().clone(),
+            )?
+        } else {
+            crate::native::file_server::FileServices::start(
+                &mut processes,
+                code_server.atoms_mut(),
+                config.heap.policy().clone(),
+            )?
+        };
         // A zero-word heap can hold nothing, so the configured size is floored — and a
         // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
         let heap_words = term_heap_words(&config);
@@ -737,6 +763,7 @@ impl Runtime {
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
             executing: None,
+            in_machine: None,
             reductions: 0,
             reductions_anchor: Cell::new(0),
             exact_reductions_anchor: Cell::new(0),
@@ -2571,6 +2598,56 @@ mod tests {
             rt.system_info_value("process_count").expect("count"),
             InfoValue::Int(2)
         );
+    }
+
+    #[test]
+    fn a_boot_script_runtime_spawns_the_native_service_unregistered() {
+        // The `-boot FILE` route is the one the native `file_server_2` must NOT claim: the
+        // booted `kernel_sup` starts OTP's own `{file_server, start_link, []}` child, and an
+        // **initial** child start that finds the name taken aborts that `permanent` supervisor
+        // (see `src/native/file_server.rs`). `Runtime::new` therefore gates the registration on
+        // `RuntimeConfig::boot_script()` and spawns the service **unclaimed** here.
+        let argv: Vec<String> = ["-noshell", "-boot", "bootstrap/bin/start"]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
+        let config = match crate::cli::parse(&argv) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+                return;
+            }
+        };
+        assert_eq!(config.boot_script(), Some("bootstrap/bin/start"));
+        let booted = match Runtime::new(config) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("SKIP: no system Erlang install ({error})");
+                return;
+            }
+        };
+        // The service process is still spawned — the count is the same as on the default route
+        // — and `init` is still registered; only the `file_server_2` name stays free.
+        assert_eq!(booted.processes().len(), 2);
+        assert_eq!(
+            booted.system_info_value("process_count").expect("count"),
+            InfoValue::Int(2)
+        );
+        let init = booted.atoms().lookup("init").expect("`init` is a core atom");
+        assert!(booted.processes().whereis(init).is_some());
+        if let Some(atom) = booted.atoms().lookup("file_server_2") {
+            assert!(
+                booted.processes().whereis(atom).is_none(),
+                "the boot-script route must leave `file_server_2` for the booted system"
+            );
+        }
+        // The non-boot config keeps it registered, so the two routes really do differ.
+        let plain = runtime();
+        let atom = plain
+            .atoms()
+            .lookup("file_server_2")
+            .expect("`file_server_2` is registered on the default route");
+        assert!(plain.processes().whereis(atom).is_some());
     }
 
     #[test]

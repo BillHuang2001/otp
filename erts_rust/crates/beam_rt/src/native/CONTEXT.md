@@ -272,16 +272,27 @@ the essentials:
   `current_stacktrace`) and `catchlevel` are read from the process's saved instruction pointer
   through the engine's read-only accessors (`beam_engine::Machine::current_function`/`initial_call`/
   `current_location`/`current_stacktrace`/`catch_frame_depth`, builders shared with the exception
-  family's `build_stacktrace`), reached by `RuntimeContext::position_value`/`catchlevel_value` via
-  `RunnerState::engine_at(pid)`. They are answerable only **conditionally**: the pid must be in the
-  process table (`RuntimeContext::process_table` — the **pass** table inside a scheduler slice,
-  which has *moved* it out of the runtime, else the runtime's own) **and** have a readable
-  engine/entry — a **fun-bodied** process has no module to name `M`/`F` from, the **caller's own**
-  process has its `Machine` moved out while it runs, and a never-scheduled pid has none. Those
-  report `Ok(None)` — the item is **omitted** by `/1` and is the typed `unsupported` gap by `/2`.
+  family's `build_stacktrace`). `RuntimeContext::position_value`/`catchlevel_value` try three
+  sources in order: the runtime's **root execution frame** (`../src/runtime/executing.rs`, for the
+  runtime's own `-eval`/`-s`/`-run` process), the **in-machine BIF door**'s published slot
+  (`../src/context/position.rs`, for the **executing** process's own query from compiled code — the
+  scheduler moves that process's `Machine` out of the runner state for the whole slice, so no other
+  source can name it), then `RunnerState::position_engine_at(pid)`. They are answerable only
+  **conditionally**: the pid must be in the process table (`RuntimeContext::process_table` — the
+  **pass** table inside a scheduler slice, which has *moved* it out of the runtime, else the
+  runtime's own) **and** have a readable position from one of those three sources — a **fun-bodied**
+  process with no resolved local target has no module to name `M`/`F` from, a never-scheduled pid
+  has none, and a **direct/no-machine** caller (one that reached `call_bif` without a `Machine`, so
+  no door is open and no root frame exists) has none. Those report `Ok(None)` — the item is
+  **omitted** by `/1` and is the typed `unsupported` gap by `/2`.
+  Honest residuals of the door: its `initial_call` is the process's **entry MFA**, where the oracle
+  answers `{erlang,apply,2}` for some spawn shapes; and the published slot is runtime-wide, so a
+  **nested** fun-applied run inside the window reads the **outer** machine's position for that pid.
   End-to-end proof: `../tests/position.rs` — `recv:wait/0` parks in a `receive` (fixture
-  `../tests/fixtures/recv.erl`, clause head on line 12), a second process (`recv:probe_b/1`) probes
-  it, and the term is compared line-for-line with the live system `erl` oracle.
+  `../tests/fixtures/recv.erl`, clause head on line 12) and a second process (`recv:probe_b/1`)
+  probes it; `recv:main/0` (= `probe_b(self())`) runs inside the scheduled `pos_self:go/1` and
+  reports its **own** position back through message passing. Both answers are compared line-for-line
+  with the live system `erl` oracle.
 * **Honest typed `unsupported` items** (valid oracle names, gap reason names the missing
   accessor/hook): `backtrace` (no raw/binary stack-dump accessor — only the cooked stacktrace),
   `magic_ref` (the NIF resource API is unbound, so no resource is bound into a process),
@@ -504,10 +515,14 @@ than once per load; and a loaded driver's monitor subscription is not delivered 
 `beam_bifs`).
 
 ### `file_server_2` — the native file service (contract A.9)
-`file_server.rs` + `file_server/` own the runtime-native **file service**: the registered
-`file_server_2` process (never enqueued, drained by the scheduler-pass step), its per-`open` native
+`file_server.rs` + `file_server/` own the runtime-native **file service**: the `file_server_2`
+service process (never enqueued, drained by the scheduler-pass step), its per-`open` native
 io-devices, the `gen_server`/`file`/`io` request/reply wire, and the `{get_until,…}`/`{get_line,…}`
-readers. The served `file_server` requests are `open/2` (any mode, incl. write/append),
+readers. `Runtime::new` consults `RuntimeConfig::boot_script()`: on the **boot-script route**
+(`-boot FILE`) it spawns the service **unregistered** (`FileServices::start_unclaimed`) — that route's
+booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name — and on every other route
+it registers the service under the atom `file_server_2` (`FileServices::start`). The served `file_server`
+requests are `open/2` (any mode, incl. write/append),
 `read_file/1`, `write_file/2`, `delete/1`, `make_dir/1`, `del_dir/1`, `read_link/1`, `altname/1`,
 `rename/2`, `make_link/2`, `make_symlink/2`, `get_cwd/0,1`, `list_dir/1`, and
 `read_file_info/1,2`/`read_link_info/1,2` (the whole 14-tuple `#file_info{}`, its `access` slot from

@@ -223,11 +223,40 @@ impl FileServices {
         atoms: &mut beam_term::AtomTable,
         policy: HeapPolicy,
     ) -> Result<FileServices> {
-        let server = processes.spawn(policy.clone())?;
+        let services = FileServices::spawn(processes, policy)?;
         let name = atoms.intern("file_server_2");
         processes
-            .register(name, server)
+            .register(name, services.server)
             .map_err(|_| error::message("boot: the `file_server_2` name is already registered"))?;
+        Ok(services)
+    }
+
+    /// Spawns the `file_server_2` service process **without claiming the name**.
+    ///
+    /// This is the route for a runtime driving a **real boot script** (`-boot FILE`), where the
+    /// booted system owns the name. `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
+    /// `file_server_2` child (`{file_server, start_link, []}`, `kernel.erl`), and an **initial**
+    /// child start that finds the name taken aborts the whole supervisor:
+    /// `supervisor:start_children/2` turns the `{error,{already_started,Pid}}` that `gen:start`
+    /// answers into `{abort,{failed_to_start_child,Id,Reason}}` — the `already_started`
+    /// tolerance exists only for a *later* dynamic `start_child` — and `kernel` is `permanent`,
+    /// so the node tears down. On this route OTP's real child serves every `file_server_2`
+    /// request, and the spawned service is left unregistered and idle. A boot script that
+    /// starts no `file_server_2` of its own therefore has none: the script is authoritative.
+    ///
+    /// # Errors
+    ///
+    /// The process table's allocation diagnostics.
+    pub(crate) fn start_unclaimed(
+        processes: &mut ProcessTable,
+        policy: HeapPolicy,
+    ) -> Result<FileServices> {
+        FileServices::spawn(processes, policy)
+    }
+
+    /// Spawns the (`Runnable`, never-enqueued) service process, claiming nothing.
+    fn spawn(processes: &mut ProcessTable, policy: HeapPolicy) -> Result<FileServices> {
+        let server = processes.spawn(policy.clone())?;
         Ok(FileServices {
             server,
             policy,
@@ -235,7 +264,6 @@ impl FileServices {
             retired: HashSet::new(),
         })
     }
-
     /// The registered `file_server_2` pid.
     pub(crate) const fn server(&self) -> ProcessId {
         self.server

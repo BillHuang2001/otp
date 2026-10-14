@@ -64,7 +64,23 @@ figures are in `PERF.md`).
   two `ensure_heap` doors stay charged as the only charge a native compiled block reaches. As the
   scheduled path's outermost `ExecutionContext` it forwards every engine seam it does not itself
   implement — `send_message_with_off_heap` in particular, whose trait default would otherwise drop
-  the sender machine's off-heap handles and make an engine-built off-heap send a `badarg`.
+  the sender machine's off-heap handles and make an engine-built off-heap send a `badarg`. Three of
+  those forwards are **load-bearing** rather than merely faithful: `wants_bif_in_machine`/
+  `call_bif_in_machine` carry the engine's in-machine execution-position door
+  ([`../context/CONTEXT.md`](../context/CONTEXT.md), `src/context/position.rs`) onto the scheduled
+  path. The slice's machine runs on *this* wrapper, so the engine's once-per-run latch reads the
+  probe **here**: without the `wants_bif_in_machine` forward it would see the trait default (`false`),
+  never take the door, and a **scheduled** process could not answer its own
+  `erlang:process_info(self(), current_stacktrace)` (`gen_server:handle_common_reply/5`'s
+  `?STACKTRACE()`); `call_bif_in_machine` is forwarded for the same reason, since it is the method
+  the door dispatches through. `resolve_local_call` is load-bearing for the same reason: the engine's
+  `Call`/`CallOnly`/`CallLast` arms — and the native baseline tier's `jit_local_call` probe — consult
+  *this* wrapper, so without the forward they would see the trait default (`Ok(false)`), always
+  decline, and jump a same-module local `call` straight into a non-exported callee's own body instead
+  of letting the host that serves it dispatch it through `call_bif`
+  (`RuntimeContext::resolve_local_call` → `crate::native::prim_tty::serves_local_call` for a built-in
+  NIF library's stub). Every other method of the seam is forwarded unchanged, so the redirect into
+  `inner` is purely mechanical.
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
   `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
@@ -263,7 +279,12 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
   `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
   off-heap families).
 * `budget.rs` → the reduction budget + the charging wrapper context (`wants_reduce`/`reduce`: one
-  charge per interpreted instruction, plus the two `ensure_heap` doors a native block alone reaches).
+  charge per interpreted instruction, plus the two `ensure_heap` doors a native block alone reaches),
+  forwarding `resolve_external_call`/`resolve_local_fun`/`resolve_local_call` (the engine consults the
+  wrapper, never the inner context, from its `call_ext*`, `call_fun`/`call_fun2` and
+  `Call`/`CallOnly`/`CallLast` arms and the native baseline tier's `jit_local_call` probe) and the
+  in-machine door pair `wants_bif_in_machine`/`call_bif_in_machine` to the inner `RuntimeContext`
+  (`src/context/position.rs`).
 * `tier.rs` → the tier mode + its `BEAM_RT_TIER` semantics (`mode_from_value`), the environment default
   and the selection (`select_entry_tier`).
 * `reason.rs` / `perf.rs` → the exit-reason translation / the `+JPperf` code map.
