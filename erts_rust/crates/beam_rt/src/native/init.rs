@@ -661,6 +661,45 @@ mod tests {
         }
     }
 
+    /// A runtime configured **exactly as the CLI configures a `-boot FILE` invocation**, so
+    /// [`Runtime::new`] takes the **boot-script route**: the native `file_server_2` service is
+    /// spawned **unclaimed** and the booted `kernel_sup`'s own `file_server` child owns the
+    /// name. Returns `None` (the caller then skips **loudly**) when no system Erlang install is
+    /// available.
+    ///
+    /// The route is part of the measurement, mirroring [`crate::boot::bootscript`]'s own
+    /// `-boot` system runtime: on the **default** route [`Runtime::new`] *registers* the native
+    /// service, so the initial `{file_server, start_link, []}` child start of the booted
+    /// `kernel_sup` finds the name taken, aborts the supervisor
+    /// (`{failed_to_start_child,file_server_2,{already_started,…}}`) and — `kernel` being
+    /// `permanent` — tears the node down before the script ends.
+    fn boot_script_runtime(script_path: &str) -> Option<Runtime> {
+        let argv: Vec<String> = ["-noshell", "-boot", script_path]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
+        let config = match crate::cli::parse(&argv) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+                return None;
+            }
+        };
+        let mut runtime = match Runtime::new(config) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("SKIP: no system Erlang install ({error})");
+                return None;
+            }
+        };
+        match runtime.code_server.add_system_paths() {
+            Ok(()) => Some(runtime),
+            Err(error) => {
+                eprintln!("SKIP: no system code path ({error})");
+                None
+            }
+        }
+    }
     #[test]
     fn get_arguments_prepends_the_automatic_flags_in_order() {
         // Oracle-verified (`erl -noshell -eval
@@ -897,11 +936,13 @@ mod tests {
         );
         let expected = crate::boot::bootscript::read(std::path::Path::new(script_path))
             .expect("the committed start.boot");
-        let Some(mut runtime) = system_runtime() else {
+        let Some(mut runtime) = boot_script_runtime(script_path) else {
             return;
         };
         runtime.boot().expect("boot");
-        let _ = runtime.boot_from_script_reporting(script_path);
+        runtime
+            .boot_from_script_reporting(script_path)
+            .expect("the committed start.boot boots to completion");
         let answer = call(&mut runtime, "init", "script_id", &[]).expect("script_id/0");
         assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2);
         assert_eq!(
