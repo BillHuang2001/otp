@@ -49,7 +49,7 @@ The floor serves the BIFs that are really *runtime* operations — the process/p
 | `-eval Expr` | evaluate a general Erlang expression and print **nothing**; one trailing `.` is tolerated and stripped |
 | `-s Mod Func [Args…]` | apply `Mod:Func(a, b, …)` (arguments are **atoms**); result **discarded** |
 | `-run Mod Func [Args…]` | as `-s`, but arguments are plain **strings** (char lists) |
-| `-pa Dir` / `-pz Dir` | add `Dir` to the code path (before / after `-pz` dirs) |
+| `-pa Dir` / `-pz Dir` | add `Dir` to the code path: `-pa` **heads** it (the group in reverse command-line order), `-pz` **tails** it (behind the system `ebin` directories). Applied on **every** route — the bare `-boot` action included — before anything runs |
 | `+S N[:N]` | normal scheduler count → `emulator.schedulers` (first number) |
 | `-smp enable\|disable\|auto` | scheduler model, recorded as an init argument (M1 runs single-threaded) |
 | `+A N` / `+P N` | async-thread pool size → `emulator.extra_emulator_flags` verbatim; max process count → `emulator.max_processes` |
