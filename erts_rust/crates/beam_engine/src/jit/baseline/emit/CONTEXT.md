@@ -279,3 +279,16 @@ per-function `Summary` as a superset; the eager pass reuses the **containing IR 
 discards its touches, so the whole-module `Summary` is provably untouched. Both add
 `sub_blocks_capacity_estimate` (`BLOCK_BYTES + INSTRUCTION_BYTES` per instruction of each sub-block range)
 to the buffer size, so the extra code cannot under-allocate the `CodeBuffer`.
+
+**Measured cost of the duplication (the pass is O(n²) in a pathological shape).** There is no range
+dedup: n `stores_continuation` instructions inside one IR block, none a block start, each with
+`p < b.end`, emit ~n²/2 instructions. The synthetic `baseline/tests.rs::measure_declined_call_ext`
+module is exactly that shape (256 unrolled non-tail `CallExt` in a single block, `~33k` instructions
+emitted) and it runs ~96–133 ns/call_ext on the lazy cache/outcome baseline path vs ~20–30 ns/call_ext
+on the interpreter — whereas the eager pre-compiled `jit_bench call_ext/0` (a small *loop* body with few
+continuations) is ~1.6× **faster** than the interpreter. The same instruction reads with opposite sign
+purely because the body shape differs, so quote either only alongside the shape. Real OTP modules stay
+bounded: a whole-OTP `beam_disasm` census of extra instructions attributable to sub-blocks gives
+`gb_trees` 1.010×, `ordsets` 1.005×, `base64` 1.011×, `lists` 1.047×, `queue` 1.164×, `string` 1.222×,
+`calendar` 1.627×. A sub-block whose range would contain another continuation address could be skipped
+(the nested call's own sub-block covers that tail), bounding the growth — correctness-first for now.
