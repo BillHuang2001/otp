@@ -57,7 +57,9 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   its **second half at the `drive` boundary** for a raise that surfaced inside a cross-module callee (`drive.rs`).
   `Machine::take_raise_function_clause_args()` is the consuming half of the live latch: the two cooked-trace
   builders call it **exactly once** each, and the loop in `symbolic_stacktrace` hands the list to the first
-  frame's `A` slot (every outer frame keeps its declared arity).
+  frame's `A` slot (every outer frame keeps its declared arity). `Machine::take_raise_supplied_trace()` is the
+  consuming half of the supplied-trace latch: `symbolic_stacktrace` renders those frames **instead of** the
+  snapshot heuristic when it is armed, and an absent/empty supplied trace leaves every path byte-identical.
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
