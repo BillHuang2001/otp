@@ -213,7 +213,6 @@ mod tests;
 pub(crate) use emit::compile_module;
 pub use code::CompiledModule;
 pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, WAIT_BIT};
-pub(crate) use receive::jit_receive;
 pub(crate) use runtime::{jit_ext_call, jit_set_position, jit_step_one, JitRuntime};
 
 use runtime::NativeBlock;
