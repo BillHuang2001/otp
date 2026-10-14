@@ -257,9 +257,10 @@ the differential corpus is byte-identical); a live-peer loop past the handshake 
 Unimplemented: `erlang:system_info/2`, `read_timer/1,2`, and the roster keys this bridge does not serve
 (`delete_module/1`/`purge_module/2`, `port_get_data/1`/`port_set_data/2`, `term_to_iovec/1,2`,
 `erlang:is_builtin/3`, `bump_reductions/1`, `loaded/0`, …); each is the typed `unsupported` gap.
-`timer:apply_after/4` is a further consumer, blocked by the A.9 directive-19 boot stop (it needs the real
-`kernel_sup`/`timer_server` supervision tree) — raw oracle-vs-runtime evidence in *Cross-node handoff
-detail* below.
+`timer:apply_after/4` is a further consumer: the oracle prints `false`, exit 0, while `beam_rt`'s `-eval`
+prints nothing and exits 1 — the `-eval` route runs no boot script, so `kernel_sup`/`timer_server` do not
+exist and `supervisor:start_child(kernel_sup, …)` raises an uncaught `{noproc,…}` (a stop-independent
+failure, not the A.9 directive-19 stop) — raw evidence in *Cross-node handoff detail* below.
 
 ## Memory and statistics
 `erlang:memory/0,1` (the `MemoryHook` seam) is adopted: `RuntimeMemory` (`src/context/memory_hook.rs`)
@@ -389,8 +390,8 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; a cross-crate blocker owned by
-  `erts_rust/crates/beam_engine` and `erts_rust/crates/beam_rt`.** `Runtime::boot_from_script` runs the
+* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; the two remaining blockers are owned by
+  `erts_rust/crates/beam_loader` and `erts_rust/crates/beam_engine`.** `Runtime::boot_from_script` runs the
   real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 directives**) past index 18
   (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, whose `apply` **returns
   `Ok`** — but the kernel application does **not** stay up) and stops at index **19**
@@ -407,16 +408,29 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   The in-crate `BootStop` reports `index = 19`. `-boot FILE` drives the walk (`src/cli.rs::drive`), a
   plain start keeps the preloaded-only floor, directive 13 leaves a live `logger_server` registered as
   `logger`, and the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
-  **The two current causes.** (i) The kernel application's supervision tree aborts because its
-  `standard_error` `supervisor_bridge` child raises `error:badarg` inside `gen_server:init_it/6`
-  (`gen_server.erl:2272`), so `kernel_sup` reports `start_error` and the `permanent` kernel application
-  tears itself down. (ii) The `application_controller` process dies on the uncatchable capability gap
-  `unsupported: process_info: current_stacktrace`, raised from `gen_server:handle_common_reply/5`'s
-  `?STACKTRACE()` macro: `src/native/memory/mod.rs`'s `position_value` answers it as a typed gap because
-  a **scheduler pass** takes the executing process's machine out of `RunnerState.engines` for the whole
-  slice, so the running process's own stack trace is unreadable from a BIF. Directive 19's
-  `{load_application,stdlib}` `gen_server:call` then finds no `application_controller` and raises the
-  `{noproc,…}` above, which `apply_boot_call` reports as the directive's typed error.
+  **The two current causes — both out of node.** (i) **B2 — the per-module atom-table prefix-snapshot
+  gap** (`erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine`): `beam_loader::Module.atom_table`
+  is an owned load-time prefix clone with no global fallback, so a token interned *after* the reader
+  module loaded resolves to `None` and the engine raises `badarg` (`gen_server:init_it/6`,
+  `gen_server.erl:2272`). On the plain route this kills the kernel application's `standard_error`
+  `supervisor_bridge` child, so `kernel_sup` reports `start_error` and the `permanent` kernel application
+  tears itself down; on a route where a `-pa <shim>` (a stale `gen.beam` seeding `supervisor_bridge`) lets
+  that child get further, the same gap kills `inet_db`, then `global_name_server`.
+  (ii) **B3' — the native baseline-JIT tier enters a non-tail same-module local `call` without consulting
+  the local-call seam** (`erts_rust/crates/beam_engine`, `src/jit/baseline`), so `prim_tty:tty_create/1`'s
+  `erlang:nif_error/1` stub body runs and raises `undef`; it is what kills `standard_error` on the shimmed
+  route. Directive 19's `{load_application,stdlib}` `gen_server:call` then finds no `application_controller`
+  and raises the `{noproc,…}` above, which `apply_boot_call` reports as the directive's typed error.
+  **Raw figures.** Plain route: **stdout 80 lines / 3055 bytes** — the first report carries
+  `initial call: supervisor_bridge:standard_error/1` and `in function gen_server:init_it/6 (gen_server.erl:2272)`,
+  offender `{id,standard_error}`, **2** `=CRASH REPORT====` blocks, **1** `=SUPERVISOR REPORT====` and **1**
+  `=INFO REPORT====` block
+  (`application: kernel exited: {{shutdown,{failed_to_start_child,standard_error,{badarg,…}}} …, type: permanent}`).
+  Shimmed route (`-pa <shim>` with the stale `gen.beam`): **stdout 132 lines / 4850 bytes** — the first
+  report is
+  `=SUPERVISOR REPORT==== supervisor: {local,standard_error_sup} errorContext: child_terminated reason: undef offender: [{pid,<0.10.0>},{mod,standard_error}]`,
+  and the walk advances past `file_server_2` to `{id,inet_db}` (`{mfargs,{inet_db,start_link,[]}}`) — no
+  `already_started`.
   **An external fun resolves in-machine (why index 18's `apply` returns `Ok`):**
   `RuntimeContext::resolve_local_fun` (`src/context/execution.rs`) resolves an EXTERNAL fun
   (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through the
@@ -425,11 +439,17 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   (which nested a fresh `Machine` under `may_pump_scheduler() == false` → `src/context/pump.rs` refuses
   → the uncatchable `blocked()`). Pinned by
   `src/context/tests.rs::{an_external_fun_whose_callee_blocks_resumes_on_a_scheduled_slice, resolve_local_fun_declines_the_fun_kinds_it_cannot_claim}`.
-  **A consumer of that stop — `timer:apply_after/4`.** Raw evidence, both at HEAD: this runtime
-  `erts_rust/target/debug/beam_rt -noshell -eval 'io:format("~p~n",[is_reference(timer:apply_after(50,erlang,self,[]))]),halt(0).'`
-  → exit **1**, stderr `beam_rt: exit <structured reason>`; the oracle prints `false`, exit 0. It is
-  blocked by the **SAME** directive-19 stop: `timer:apply_after/4` needs the real
-  `kernel_sup`/`timer_server` supervision tree, which this boot never brings up.
+  **`timer:apply_after/4` — a stop-independent failure.** The oracle
+  (`erl -noshell -eval 'io:format("~p~n",[is_reference(timer:apply_after(50,erlang,self,[]))]),halt(0).'`)
+  prints `false`, exit 0; under `beam_rt` the same `-eval` prints **nothing** and exits **1** with stderr
+  `beam_rt: exit <structured reason>` (34 bytes) — the **`-eval` route runs no boot script**, so
+  `kernel_sup`/`timer_server` do not exist and `timer:apply_after/4` →
+  `supervisor:start_child(kernel_sup, …)` raises an **uncaught**
+  `{noproc,{gen_server,call,[kernel_sup,{start_child,…},infinity]}}`. This is **independent** of the boot
+  blockers above. The `<structured reason>` is an **incidental rendering gap**: `src/cli.rs`'s
+  `Action::Eval` arm does not pass its error through `reported_reason` (only `Boot`/`Run`/`RunFile` do —
+  `src/cli.rs` ~:1213, ~:1500), so a structured raise reason renders as the literal placeholder instead of
+  the real term.
   The **8** currently-failing crate tests fail ONLY because each asserts FULL 22-directive completion (a
   correct contract that must be kept): `--lib boot::` (3:
   `the_real_start_boot_executes_every_directive_to_progress_started`,
@@ -488,72 +508,33 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   slot (it prints the argument LIST) where this engine prints the integer arity — the separate,
   already-documented `function_clause` `A`-slot divergence (Int vs ArgList).
   Owner: `erts_rust/crates/beam_engine`.
-* **`beam_engine` — the `process_info(self(), current_stacktrace)` reachability seam.** `position_value`
-  (`erts_rust/crates/beam_rt/src/native/memory/mod.rs`) reads the machine through
-  `RunnerState::position_engine_at`, but a scheduler pass takes the executing process's engine **out** of
-  that map for the whole slice (`erts_rust/crates/beam_rt/src/runner/run.rs:284`), so during a BIF the
-  running process has no reachable `&Machine` and the item becomes the uncatchable
-  `unsupported: process_info: current_stacktrace` typed gap. No `ExecutionContext` method exposes the
-  executing `Machine`, and a raw-pointer publish is impossible in this crate (`#![deny(unsafe_code)]`), so
-  closing it needs an additive, defaulted `beam_engine` `ExecutionContext` seam.
-  Owner: `erts_rust/crates/beam_engine` (the seam), `erts_rust/crates/beam_rt` (the consumer).
-* **`beam_engine` — the boot-chain failure is tier-independent.** `BEAM_RT_TIER=interpreter beam_rt
-  -noshell -boot bootstrap/bin/start` → exit 1 with the same 80 stdout lines, so the directive-19 stop is
-  not a baseline-JIT codegen defect.
-* **Open observation — the crash report's `initial call: supervisor_bridge:standard_error/1` does not match
-  the expected `{gen_server,init_it,6}`.** Worth a future check of the floor's initial-call / entry-module
-  answer.
-* **The `standard_error` `supervisor_bridge` child's `error:badarg` — NOT an engine entry failure; the
-  pinned "the callee's body never runs" claim is falsified, and the terminal blocker on the crash path
-  is the floor's uncatchable `unsupported: process_info: current_stacktrace` gap.**
-  The failing process is pid `<0.9.0>` (`ProcessId { number: 9, serial: 0 }`, entry module
-  `proc_lib`). `BEAM_RT_BOOT_TRACE=1` attributes every seam-decline/BIF line to its pid, so its whole
-  BIF sequence is visible: `erlang:put/2` ×2 (`proc_lib:init_p`'s `'$ancestors'` /
-  `'$initial_call'`), the `erlang:apply/3` that enters `gen:init_it/7`, `erlang:register/2`
-  (`gen:register_name/1` → `register(standard_error_sup, self())`), `lists:keyfind/3`
-  (`gen:hibernate_after/1`), `erlang:make_ref/0` + `erlang:make_fun/3` ×4 (the `#server_data{}`
-  record's `tag = make_ref()` default plus its four `fun Mod:handle_*/…` fields), `lists:keyfind/3`
-  (`gen:debug_options/2`), then `erlang:unregister/1` and
-  `erlang:raise/3 ["'error'", "'badarg'", <list>]` — i.e. `gen_server.erl:2270-2272`, the
-  `{'EXIT', Class, Reason, Stacktrace}` clause (`gen:unregister_name(Name0)` then
-  `erlang:raise(Class, Reason, Stacktrace)`).
-  **The callee's body DOES run.** With an instrumented `-pa` `gen_server.beam` (probes via
-  `erlang:display/1`), the boot prints **173** stdout lines (vs 80) and pid 9's trace continues *past*
-  the `Mod:init(Args)` call: the BIFs of `supervisor_bridge:init/1`'s own body —
-  `erlang:process_flag/2` (`trap_exit`), the `spawn/1` + `link/1` + `persistent_term:put/2` of its
-  `report_progress`-style start (supervisor_bridge.erl:182/187) — all execute, and pid 9 then parks in
-  `gen_server:loop/5 +23 { target: Label(190), time: Y(0) } (blocked (no message), entry=Some("proc_lib"))`.
-  So the compiler's `apply` at `gen_server:init_it/2` (label 172/173:
-  `{move,{atom,init},{x,2}} / {swap,{x,0},{x,1}} / {apply,1}`) enters the callee normally. **Verdict
-  (a) as stated — "the engine raises `badarg` between module+function resolved and the first callee
-  instruction" — is refuted**; the engine's `call_ext`/`resolve_external_call` path is not implicated
-  (the boot trace contains **zero** `supervisor_bridge` occurrences, because a variable-module call is
-  compiled to `apply`, not `call_ext`), and `-pa` IS honoured on the `-boot` route (pinned by
-  `tests/boot_code_path.rs`).
-  **The terminal blocker on that process's crash path is a floor capability gap, not a load/host-seam
-  answer**: pid 9 later dies inside `gen_server:decode_msg/6 +47` on
-  `erlang:process_info/2 [<pid>, 'current_stacktrace']`, answered by `src/native/memory/mod.rs`'s
-  `position_value` with the uncatchable `unsupported: process_info: current_stacktrace (this runtime
-  holds no engine for that process: it is the caller, a fun-bodied process or an unscheduled pid)`
-  (`stacktrace: StackTrace { frames: [] }`, `live_reason: None`) — the machine is removed from
-  `RunnerState.engines` for the whole slice (`src/runner/run.rs:284`), so the caller's own stacktrace
-  is unreachable. This is the same gap that already kills `application_controller` on directive 19
-  (`gen_server:handle_common_reply/5`'s `?STACKTRACE()`). It is `beam_rt`-owned floor code but closing
-  it needs the **additive, defaulted `beam_engine` `ExecutionContext` seam** that exposes the executing
-  machine's stack, so it is a cross-crate handoff (see the `beam_engine` handoff bullet below), not a
-  pure in-node fix.
-  It is not the execution tier (`BEAM_RT_TIER=interpreter` reproduces the pinned end state
-  identically).
-  **Still open / unreconciled:** the *uninstrumented* run's crash report names
-  `error:bad argument in function gen_server:init_it/6 (gen_server.erl:2272)` with stacktrace
-  `[{gen_server,init_it,2,[{line,2281}]},{gen_server,init_it,6,[{line,2240}]}]`, and the third
-  `erlang:raise/3` argument renders as an on-heap term (`Eterm(136173495972217)`, not an atom) that has
-  not been decoded — so the exact reason the *uninstrumented* `init_it/2` catch fired is not yet
-  attributed. The two observations (body runs vs. `init_it/2` catch) are not yet reconciled; a
-  `-pa` `supervisor_bridge` whose `init/1` first statement is a displayed marker is the next decisive
-  probe.
-  `grep -c` of a raw `BEAM_RT_BOOT_TRACE=1` run: ~21 800 trace lines (and ~1.7 MB of seam-decline
-  text); the crasher's own window is the 10 BIFs above plus the `decode_msg/6` `process_info/2` raise.
+* **`beam_engine`/`beam_rt` — the in-machine execution-position door serves the executing process's own
+  position.** A scheduler pass takes the executing process's engine **out** of `RunnerState` for the whole
+  slice (`erts_rust/crates/beam_rt/src/runner/run.rs`), so the runner-state view cannot see the caller's
+  own machine. `beam_engine`'s defaulted `ExecutionContext::wants_bif_in_machine`/`call_bif_in_machine`
+  seam hands the host the **live `&Machine`** and the run's entry module on every BIF dispatch, and
+  `src/context/position.rs` is the opt-in, so `erlang:process_info(self(), current_stacktrace)` (and the
+  other execution-position items) is answered from the machine's own frames. A non-self query, a nested
+  query while an outer door call is in flight, or a process with no such position still falls through to
+  `RunnerState` (a typed gap where no machine is reachable).
+  Owner: `erts_rust/crates/beam_rt` (`src/context/position.rs` + `src/native/memory/`); the seam lives in
+  `erts_rust/crates/beam_engine`.
+* **The boot-chain crashes attribute to B2 and B3', not to a `process_info` capability gap.** On the
+  plain route the fatal step is the kernel application's `standard_error` `supervisor_bridge` child
+  raising `badarg` inside `gen_server:init_it/6` (`gen_server.erl:2270-2272`, the
+  `{'EXIT', Class, Reason, Stacktrace}` clause: `gen:unregister_name(Name0)` then
+  `erlang:raise(Class, Reason, Stacktrace)`) — **B2**, the per-module atom-table prefix snapshot
+  (`beam_loader::Module.atom_table` is an owned load-time prefix clone with no global fallback, so a token
+  interned after the reading module loaded resolves to `None`). The report's `initial call:
+  supervisor_bridge:standard_error/1` is the child's own behaviour entry and agrees with the oracle, so it
+  is not a divergence. B2 is tier-independent (`BEAM_RT_TIER=interpreter` reproduces the same 80 stdout
+  lines), so the plain route's stop is not a JIT defect. On the shimmed route (`-pa <shim>` seeding
+  `supervisor_bridge` with a stale `gen.beam`) the child gets further and then dies with `reason: undef`
+  from `prim_tty:tty_create/1`'s `erlang:nif_error(undef)` stub — **B3'**, the native baseline-JIT tier
+  running a non-tail same-module local `call` without consulting the local-call seam (the interpreter
+  tier consults the seam and reaches the library's NIF). The in-machine execution-position door
+  (`src/context/position.rs`) already serves `process_info(self(), current_stacktrace)`, so it is no
+  longer a boot blocker. No boot failure here is a wrong result.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs
   **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp`
@@ -829,7 +810,7 @@ A by-owner index of the long forms in `## Cross-node handoff detail` above; the 
 * **A.7/A.9 boot (index 19 stop)** → the bullet above + [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
 * **A.9 E0 (in-process `compile:file`)** → `tests/compile_file.rs`; mover: [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).
 * **`beam_bifs` — the `io:format/2` `~p`/`~w` fun-printing `badarg`** → the bullet above (`beam_bifs/src/io.rs`).
-* **`beam_engine` — the boot-chain stacktrace defects and the `current_stacktrace` seam** → `catch Expr`'s dropped stacktrace, the duplicated top frame, the dropped entry-module frame and the `process_info(self(), current_stacktrace)` reachability seam (bullets above).
+* **`beam_engine` — the boot-chain stacktrace defects** → `catch Expr`'s dropped stacktrace, the duplicated top frame and the dropped entry-module frame (bullets above).
 * **The native `file_server_2` service** → [`src/native/CONTEXT.md`](src/native/CONTEXT.md) + [`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md).
 * **`beam_process` / `beam_message`** → the wake-list drain + `!Send`-friendly `SchedulerPool` (bullet above).
 * **`beam_engine`** → the `MinimalContext` arena accessor (bullet above).

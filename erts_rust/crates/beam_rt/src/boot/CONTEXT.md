@@ -126,25 +126,38 @@ blocks are logged to stdout), **19**
 `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}` (the **stop**),
 **20** `{apply,{c,erlangrc,[]}}`, **21** `{progress,started}`.
 Directives 0–18 run and the three `{kernelProcess, …}` startups (12–14) succeed.
-The stop has two causes.
-The kernel application's supervision tree aborts because its `standard_error` `supervisor_bridge` child
-raises `error:badarg` inside `gen_server:init_it/6` (`gen_server.erl:2272`); and `application_controller`
-dies on the uncatchable capability gap `unsupported: process_info: current_stacktrace`, raised from
-`gen_server:handle_common_reply/5`'s `?STACKTRACE()` macro.
+The stop has two causes, both out of node.
+**B2 — the per-module atom-table prefix snapshot** (`erts_rust/crates/beam_loader` +
+`erts_rust/crates/beam_engine`): `beam_loader::Module.atom_table` is an owned load-time prefix clone with
+no global fallback, so a token interned *after* the reader module loaded resolves to `None` and the engine
+raises `badarg` (`gen_server:init_it/6`, `gen_server.erl:2272`). On the plain route this kills the kernel
+application's `standard_error` `supervisor_bridge` child, so `kernel_sup` reports `start_error` and the
+`permanent` kernel application tears itself down. **B3' — the native baseline-JIT tier enters a non-tail
+same-module local `call` without consulting the local-call seam** (`erts_rust/crates/beam_engine`,
+`src/jit/baseline`), so `prim_tty:tty_create/1`'s `erlang:nif_error/1` stub body runs and raises `undef`;
+it is what kills `standard_error` on the shimmed route.
 Directive 19's `application:load1/2` call then reaches no `application_controller`, so it raises
 `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`.
+**Raw figures.** Plain route: **stdout 80 lines / 3055 bytes** — the first report carries
+`initial call: supervisor_bridge:standard_error/1` and `in function gen_server:init_it/6 (gen_server.erl:2272)`,
+offender `{id,standard_error}`, **2** `=CRASH REPORT====` blocks. Shimmed route (`-pa <shim>` with a stale
+`gen.beam` seeding `supervisor_bridge`): **stdout 132 lines / 4850 bytes** — the first report is
+`=SUPERVISOR REPORT==== supervisor: {local,standard_error_sup} errorContext: child_terminated reason: undef offender: [{pid,<0.10.0>},{mod,standard_error}]`,
+and the walk advances past `file_server_2` to `{id,inet_db}` (`{mfargs,{inet_db,start_link,[]}}`) — no
+`already_started`.
 The full chain is in *Remaining gaps* item 1 below, together with the tests that assert the full
 22-directive completion and currently fail.
 The `BEAM_RT_BOOT_TRACE` trace (`src/debug_trace.rs`) confirms the ordering: directive 18's
 `apply application:start_boot /2` returns `Ok(Wait …)`, the drive runs the kernel application's start,
-the `application_controller` raises `unsupported: process_info: current_stacktrace` at
-`gen_server:handle_common_reply /5` and leaves the process table, and directive 19's `apply` of the same
-MFA returns `Err` with the `{noproc, …}` reason.
+the `standard_error` child raises `badarg`/`undef`, and directive 19's `apply` of the same MFA returns
+`Err` with the `{noproc, …}` reason.
 - **Instructions 20–21 are not reached, but both CAN run.** `c:erlangrc/0`'s file consult is
   `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
-  (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt` registers a runtime-native
-  `file_server_2` at construction ([`../native/file_server.rs`](../native/CONTEXT.md)), which answers
-  the missing `$HOME/.erlang` with `{error,enoent}`; `c:erlangrc/0` **returns** that `{error,enoent}`
+  (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt`'s runtime-native
+  `file_server_2` service ([`../native/file_server.rs`](../native/CONTEXT.md)) answers the missing
+  `$HOME/.erlang` with `{error,enoent}` — registered under that name on every route **except** the
+  boot-script one, where `Runtime::new` leaves it unregistered so the booted `kernel_sup`'s own
+  `file_server_2` child owns the name. `c:erlangrc/0` **returns** that `{error,enoent}`
   without raising (verified: `beam_rt -eval 'c:erlangrc()'` → `{error,enoent}`, the oracle's own answer)
   and the executor discards a directive's value, so a synthetic two-directive boot
   `[{apply,{c,erlangrc,[]}},{progress,started}]` runs to **exit 0** — instructions 20 and 21 already
@@ -215,8 +228,9 @@ MFA returns `Err` with the `{noproc, …}` reason.
   `application_master:start_link/2` (`proc_lib:start_link`) handshake completes, so the directive's
   `apply` **returns `Ok`** — but the kernel application does **not** stay up: during that directive's
   scheduler drive its `standard_error` `supervisor_bridge` child raises `error:badarg` inside
-  `gen_server:init_it/6` (`gen_server.erl:2272`), `kernel_sup` reports `start_error`, and the
-  `permanent` kernel application tears itself down. The seam that lets the application master's
+  `gen_server:init_it/6` (`gen_server.erl:2272`) — the per-module atom-table prefix snapshot (*B2*
+  above; on the shimmed route the `undef` from `prim_tty:tty_create/1`, *B3'*) — `kernel_sup` reports
+  `start_error`, and the `permanent` kernel application tears itself down. The seam that lets the application master's
   callback fun be entered is `RuntimeContext::resolve_local_fun` (`../context/execution.rs`): it
   resolves an **external** fun (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through
   the `external_fun_target`/`external_fun_name` helpers (`../context/apply.rs`), so the engine enters
@@ -226,11 +240,10 @@ MFA returns `Err` with the `{noproc, …}` reason.
 - **Directive 19's stdlib start is the stop.** `application:start_boot/2` reaches
   `application_controller:start_boot_application/2`, whose
   `gen_server:call(application_controller, {load_application,stdlib}, infinity)` finds **no**
-  `application_controller` — that server has already died on the uncatchable capability gap
-  `unsupported: process_info: current_stacktrace`, raised from `gen_server:handle_common_reply/5`'s
-  `?STACKTRACE()` macro and served by `../native/memory/mod.rs`'s `position_value` as a typed gap
-  (a scheduler pass takes the executing process's machine out of `RunnerState.engines` for the whole
-  slice) — so the call raises
+  `application_controller` — the kernel application is `permanent`, so the `standard_error` child crash
+  (the per-module atom-table prefix snapshot, *B2* above; on the shimmed route `prim_tty:tty_create/1`'s
+  `undef` stub, *B3'*) tore the whole kernel supervision tree, and the controller with it, down — so the
+  call raises
   `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`, which
   `apply_boot_call` reports as the directive's typed error; the walk stops at index 19. The detail is
   in [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
@@ -268,23 +281,24 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **The kernel application's start fails and the boot stops at directive 19 — a cross-crate blocker
-   owned by `erts_rust/crates/beam_engine` and `erts_rust/crates/beam_rt`.** Directive 19 is
+1. **The kernel application's start fails and the boot stops at directive 19 — two cross-crate blockers
+   owned by `erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine` (B2) and
+   `erts_rust/crates/beam_engine` (B3').** Directive 19 is
    `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`; `application:start_boot/2`
    reaches `application_controller:start_boot_application/2`, whose
    `gen_server:call(application_controller, {load_application,stdlib}, infinity)` finds **no**
    `application_controller`, and so raises
    `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`. The two
-   causes are: (i) the kernel application's supervision tree aborts because its `standard_error`
-   `supervisor_bridge` child raises `error:badarg` inside `gen_server:init_it/6` (`gen_server.erl:2272`),
-   so the `permanent` kernel application tears itself down and directive 19's `{load_application,stdlib}`
-   call reaches no controller; and (ii) the `application_controller` process dies on the uncatchable
-   capability gap `unsupported: process_info: current_stacktrace`, raised from
-   `gen_server:handle_common_reply/5`'s `?STACKTRACE()` macro — `../native/memory/mod.rs`'s
-   `position_value` answers it as a typed gap because a scheduler pass takes the executing process's
-   machine out of `RunnerState.engines` for the whole slice. The final `{progress,started}` (index 21) is
-   therefore **not** reached. The per-link analysis, the minimal repros and the owning crate are in
-   [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
+   causes are: (i) **B2** — `beam_loader::Module.atom_table` is an owned load-time prefix clone with no
+   global fallback, so a token interned *after* the reader module loaded resolves to `None` and the
+   engine raises `badarg` in `gen_server:init_it/6` (`gen_server.erl:2272`); on the plain route that is
+   the kernel application's `standard_error` `supervisor_bridge` child, so the `permanent` kernel
+   application tears itself down and directive 19's `{load_application,stdlib}` call reaches no
+   controller. (ii) **B3'** — the native baseline-JIT tier enters a non-tail same-module local `call`
+   without consulting the local-call seam, so `prim_tty:tty_create/1`'s `erlang:nif_error/1` stub body
+   runs and raises `undef`; on the shimmed route that is what kills `standard_error`. The final
+   `{progress,started}` (index 21) is therefore **not** reached. The per-link analysis, the minimal repros
+   and the owning crates are in [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
    The tests that assert the full 22-directive completion and currently **fail** (they must keep
    asserting it — never weakened): `bootscript.rs::tests::{the_real_start_boot_executes_every_directive_to_progress_started, the_real_start_boot_completes_through_execute_reporting, the_real_boot_registers_a_live_logger_process}`, `../tests/boot.rs::{the_real_start_boot_runs_to_completion, the_cli_runs_the_real_boot_script_to_completion, the_boot_chains_kernel_processes_survive_their_directive_processes, the_cli_boot_registers_a_live_logger_process}` and `../tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`.
 2. **`beam_engine`/`beam_process` — a scheduled `compile:file/2` runs to completion and agrees with the oracle.** The incremental io-device read (`file:read/2`, `file:read_line/1`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`) completes from a **scheduled** process and agrees with the oracle (`../tests/scheduled_io_device.rs`, `../tests/io_scan.rs`), as does a `receive … after T` timeout reached through a nested run.
@@ -433,8 +447,13 @@ final `{apply,{c,erlangrc,[]}}` directive (index 20) would need — **not** the 
 service is a `beam_process::Process` born `Runnable` and never enqueued (the `init`/`self_pid`
 precedent), so the runner never executes it and `ProcessEntry` needs no new variant;
 `Runtime::service_file_requests` drains its mailbox as an additive `scheduler_pass` step and delivers
-the replies, which is what would let `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete. The
-request/reply surface, the errno mapping, the io-device and the remaining gaps live in
+the replies, which is what would let `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete.
+**It is registered under `file_server_2` on every route except the boot-script one.** `Runtime::new`
+consults `RuntimeConfig::boot_script()` and, when the runtime is driving a real `-boot FILE` boot,
+spawns the service **unregistered** (`FileServices::start_unclaimed`) so that the booted `kernel_sup`'s
+own `file_server_2` child owns the name — an initial child start that finds the name already taken
+aborts that supervisor, and `kernel` is `permanent`. The request/reply surface, the errno mapping, the
+io-device and the remaining gaps live in
 [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
 - **The native service is used instead of the real `file_server`.** The real Erlang
   `file_server`/`file_io_server` needs the wider `prim_file` NIF surface this runtime does not serve;

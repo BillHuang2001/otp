@@ -515,10 +515,14 @@ than once per load; and a loaded driver's monitor subscription is not delivered 
 `beam_bifs`).
 
 ### `file_server_2` — the native file service (contract A.9)
-`file_server.rs` + `file_server/` own the runtime-native **file service**: the registered
-`file_server_2` process (never enqueued, drained by the scheduler-pass step), its per-`open` native
+`file_server.rs` + `file_server/` own the runtime-native **file service**: the `file_server_2`
+service process (never enqueued, drained by the scheduler-pass step), its per-`open` native
 io-devices, the `gen_server`/`file`/`io` request/reply wire, and the `{get_until,…}`/`{get_line,…}`
-readers. The served `file_server` requests are `open/2` (any mode, incl. write/append),
+readers. `Runtime::new` consults `RuntimeConfig::boot_script()`: on the **boot-script route**
+(`-boot FILE`) it spawns the service **unregistered** (`FileServices::start_unclaimed`) — that route's
+booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name — and on every other route
+it registers the service under the atom `file_server_2` (`FileServices::start`). The served `file_server`
+requests are `open/2` (any mode, incl. write/append),
 `read_file/1`, `write_file/2`, `delete/1`, `make_dir/1`, `del_dir/1`, `read_link/1`, `altname/1`,
 `rename/2`, `make_link/2`, `make_symlink/2`, `get_cwd/0,1`, `list_dir/1`, and
 `read_file_info/1,2`/`read_link_info/1,2` (the whole 14-tuple `#file_info{}`, its `access` slot from
