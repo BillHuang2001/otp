@@ -109,7 +109,7 @@ mod term_ops;
 mod time;
 mod type_test;
 mod unicode;
-
+mod zlib;
 pub use crate::context::{
     AtomInterner, BifContext, BytesSink, DictHook, FunCaller, LocalFunIdentity, LocalNode,
     MemoryHook, ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PersistentTerm,

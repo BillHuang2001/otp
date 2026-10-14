@@ -119,7 +119,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use beam_common::{BeamError, Result};
 use beam_term::{atom_val, signed_value, Eterm};
 
-use crate::access::{is_atom, is_big, is_small};
+use crate::access::{is_atom, is_big, is_integer, is_small};
 use crate::arith;
 use crate::context::BifContext;
 use crate::error::badarg;
@@ -153,6 +153,42 @@ enum TimeUnit {
     PerSecondBig(Vec<u64>),
 }
 
+/// A time unit's arithmetic image: the **units per second** ratio
+/// `erlang:convert_time_unit/3` computes with (`FU` and `TU` in
+/// `../../erts/preloaded/src/erlang.erl:5340-5371`).
+///
+/// [`TimeUnit`] is the same decision in the shape the `/1` clocks need — one unit at
+/// a time; this is the pair form `/3` needs, split the same way: every accepted atom
+/// and any positive small integer is a ratio `i128` holds, while a caller-supplied
+/// bignum unit is its limb magnitude.
+///
+/// `Small`/`Big` never name the same ratio, so the derived `Eq` is the oracle's
+/// `FU =:= TU`: every `Small` value comes from a small integer (at most `2^59 - 1`)
+/// or from one of the four named atoms, and a bignum unit is by definition not a
+/// small integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnitRatio {
+    /// Units per second, for every accepted atom and a positive small integer.
+    Small(i128),
+    /// A positive-bignum unit: its little-endian `u64` magnitude, units per second.
+    Big(Vec<u64>),
+}
+
+impl TimeUnit {
+    /// The units-per-second ratio this unit names.
+    fn ratio(&self) -> UnitRatio {
+        match self {
+            TimeUnit::PerSecondBig(magnitude) => UnitRatio::Big(magnitude.clone()),
+            TimeUnit::Native | TimeUnit::PerfCounter | TimeUnit::Nanosecond => {
+                UnitRatio::Small(1_000_000_000)
+            }
+            TimeUnit::Microsecond => UnitRatio::Small(1_000_000),
+            TimeUnit::Millisecond => UnitRatio::Small(1_000),
+            TimeUnit::Second => UnitRatio::Small(1),
+            TimeUnit::PerSecond(per_second) => UnitRatio::Small(i128::from(*per_second)),
+        }
+    }
+}
 /// The unit named by `term` — exactly the set `time_unit_conversion` accepts
 /// (`erl_time_sup.c:2277-2341`): the atoms
 /// `native`/`perf_counter`/`second`/`seconds`/`millisecond`/`milli_seconds`/
@@ -279,6 +315,105 @@ fn big_conversion(ctx: &mut BifContext<'_>, native: i64, per_second: &[u64]) -> 
     operators.call("erlang", "div", 2, ctx, &[numerator, divisor])
 }
 
+/// The `(TU * Time [- (FU - 1)]) div FU` conversion of `erlang.erl:5372-5379`, in
+/// machine arithmetic when every operand fits.
+///
+/// `TU` is a positive small integer (at most `2^59 - 1` units/s) and `Time` a small
+/// integer, so their product is at most about `2^118` — `i128` holds it with four bits
+/// to spare, and the `- (FU - 1)` adjustment cannot push it out either. The division
+/// is Rust's truncating `/` — Erlang's `div` — and the adjustment turns its truncation
+/// into the floor for a negative `Time`.
+///
+/// Anything that does **not** fit — a bignum unit ratio, a bignum `Time`, or both —
+/// goes to [`big_ratio_conversion`], whose result is exact.
+fn convert_ratio_pair(
+    ctx: &mut BifContext<'_>,
+    time: Eterm,
+    from: &UnitRatio,
+    to: &UnitRatio,
+) -> Result<Eterm> {
+    if let (UnitRatio::Small(fu), UnitRatio::Small(tu)) = (from, to) {
+        if is_small(time) {
+            let value = i128::from(signed_value(time));
+            let scaled = tu * value;
+            let numerator = if value < 0 {
+                scaled - (fu - 1)
+            } else {
+                scaled
+            };
+            return int_from_i128(ctx, numerator / fu);
+        }
+    }
+    big_ratio_conversion(ctx, time, from, to)
+}
+
+/// The `TU * Time [ - (FU - 1) ] div FU` pair conversion in arbitrary precision —/// `/3`'s shape, for a bignum unit ratio, a bignum `Time`, or both.
+///
+/// [`big_conversion`] is the `native * per_second div 1_000_000_000` shape the `/1`
+/// clocks need; this is the two-unit shape `erlang:convert_time_unit/3` computes.
+/// Both run the crate's one arbitrary-precision multiply/divide implementation
+/// ([`arith_operators`] → [`crate::arith`]) — no bignum math is duplicated here.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a product past `BIG_ARITY_MAX` limbs: the oracle's own
+/// body runs inside `try ... catch _:_ -> badarg`, so the `system_limit` its
+/// arithmetic raises surfaces as `badarg` ([`trap_arith_class`]).
+fn big_ratio_conversion(
+    ctx: &mut BifContext<'_>,
+    time: Eterm,
+    from: &UnitRatio,
+    to: &UnitRatio,
+) -> Result<Eterm> {
+    big_ratio_chain(ctx, time, from, to).map_err(trap_arith_class)
+}
+
+/// The `TU * Time div FU` chain of `erlang.erl:5376-5379`, with the `- (FU - 1)`
+/// adjustment that turns `div`'s truncation into a floor for a negative `Time`.
+fn big_ratio_chain(
+    ctx: &mut BifContext<'_>,
+    time: Eterm,
+    from: &UnitRatio,
+    to: &UnitRatio,
+) -> Result<Eterm> {
+    let operators = arith_operators();
+    let fu = ratio_term(ctx, from)?;
+    let tu = ratio_term(ctx, to)?;
+    let product = operators.call("erlang", "*", 2, ctx, &[tu, time])?;
+    let numerator = if integer_is_negative(time)? {
+        let one = arith::int_from_i64(ctx, 1)?;
+        let adjust = operators.call("erlang", "-", 2, ctx, &[fu, one])?;
+        operators.call("erlang", "-", 2, ctx, &[product, adjust])?
+    } else {
+        product
+    };
+    operators.call("erlang", "div", 2, ctx, &[numerator, fu])
+}
+
+/// The integer term for a unit ratio — the shared small-int-or-heap-bignum
+/// promotion convention ([`int_from_i128`], `arith::int_from_mag`).
+fn ratio_term(ctx: &mut BifContext<'_>, ratio: &UnitRatio) -> Result<Eterm> {
+    match ratio {
+        UnitRatio::Small(per_second) => int_from_i128(ctx, *per_second),
+        UnitRatio::Big(magnitude) => arith::int_from_mag(ctx, false, magnitude),
+    }
+}
+
+/// Whether an **integer** term is negative — the `Time < 0` arm of
+/// `erlang.erl:5376`. The caller has already rejected a non-integer `Time`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] if `term` is neither a small integer nor a readable bignum
+/// (unreachable from [`convert_ratio_pair`], which reaches here only for an integer).
+fn integer_is_negative(term: Eterm) -> Result<bool> {
+    if is_small(term) {
+        return Ok(signed_value(term) < 0);
+    }
+    let (negative, _) = beam_codec::term::big_parts(term).map_err(|_| badarg())?;
+    Ok(negative)
+}
+
 /// The crate's registered `erlang` arithmetic operators, for the
 /// arbitrary-precision conversion a bignum time unit needs
 /// ([`convert_unit_big`]).
@@ -288,8 +423,7 @@ fn big_conversion(ctx: &mut BifContext<'_>, native: i64, per_second: &[u64]) -> 
 /// Knuth-D divide stay the crate's single implementation. The registry (rather
 /// than [`crate::arith`]'s private helpers) is the arithmetic entry point a
 /// [`BifContext`] can be handed to, exactly as the runtime dispatches them.
-fn arith_operators() -> &'static BifRegistry {
-    static OPERATORS: OnceLock<BifRegistry> = OnceLock::new();
+fn arith_operators() -> &'static BifRegistry {    static OPERATORS: OnceLock<BifRegistry> = OnceLock::new();
     OPERATORS.get_or_init(|| {
         let mut operators = BifRegistry::new();
         arith::register(&mut operators);
@@ -404,8 +538,47 @@ fn timestamp_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
     ctx.tuple(&[mega, sec, micro])
 }
 
-/// The process-global unique-integer counter: `fetch_add(1)`, so a call yields a
-/// value no other call yields.
+/// `erlang:convert_time_unit(Time, FromUnit, ToUnit)` — `Time` expressed from
+/// `FromUnit` in `ToUnit`.
+///
+/// Not a `bif.tab` entry: the oracle implements it as **Erlang code**
+/// (`../../erts/preloaded/src/erlang.erl:5338-5384`), which resolves each unit to its
+/// units-per-second ratio and computes `TU * Time div FU` (with the `- (FU - 1)`
+/// adjustment below for a negative `Time`). It is therefore registered here as a
+/// stdlib fast path, exactly like the sibling `erlang:memory/0,1`. Its
+/// `native`/`perf_counter` ratios come from `erts_internal:time_unit()`/
+/// `perf_counter_unit()` — both `1_000_000_000` on this host, i.e. exactly the native
+/// unit this module is fixed to ([`TimeUnit`]).
+///
+/// The two-unit identity arm (`FU =:= TU` **and** an integer `Time`) returns `Time`
+/// **unchanged**, a bignum `Time` included; every other shape is the conversion
+/// above. The whole body runs inside `try ... catch _:_ -> error_with_info(badarg, …)`
+/// (`erlang.erl:5381-5383`), so each failure below is `badarg` in the oracle and here.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for an unknown unit atom, a zero or negative unit, a unit
+/// that is neither an atom nor a positive integer, a `Time` that is not an integer
+/// (the oracle's `TU * Time` on a non-integer raises `badarith`, which its own catch
+/// folds to `badarg`), and an arithmetic product past the bignum cap
+/// ([`trap_arith_class`]).
+fn convert_time_unit_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let time = args[0];
+    let from = time_unit(ctx, args[1])?.ratio();
+    let to = time_unit(ctx, args[2])?.ratio();
+
+    // `case (FU =:= TU) andalso erlang:is_integer(Time) of true -> Time; ...`, and its
+    // `false` arm's `TU * Time ... div FU`, which raises on any non-integer `Time`.
+    if !is_integer(time) {
+        return Err(badarg());
+    }
+    if from == to {
+        return Ok(time);
+    }
+    convert_ratio_pair(ctx, time, &from, &to)
+}
+
+/// The process-global unique-integer counter: `fetch_add(1)`, so a call yields a/// value no other call yields.
 static UNIQUE_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 /// The next unique integer; `positive` maps the raw `0, 1, 2, ...` to
@@ -456,13 +629,13 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "system_time", 1, system_time_1);
     reg.register("erlang", "time_offset", 0, time_offset_0);
     reg.register("erlang", "time_offset", 1, time_offset_1);
+    reg.register("erlang", "convert_time_unit", 3, convert_time_unit_3);
     reg.register("erlang", "unique_integer", 0, unique_integer_0);
     reg.register("erlang", "unique_integer", 1, unique_integer_1);
     reg.register("erlang", "timestamp", 0, timestamp_0);
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(test)]mod tests {
     use super::*;
 
     use std::collections::HashSet;
@@ -1172,9 +1345,204 @@ mod tests {
         ));
     }
 
+    /// The bignum `±(1 bsl bits)`, built with the crate's own promotion helper.
+    fn bignum_term(ctx: &mut BifContext<'_>, negative: bool, bits: usize) -> Eterm {
+        let mut limbs = vec![0u64; bits / 64 + 1];
+        limbs[bits / 64] = 1u64 << (bits % 64);
+        arith::int_from_mag(ctx, negative, &limbs).expect("a bignum")
+    }
+
+    /// Calls `erlang:convert_time_unit/3`.
+    fn convert(ctx: &mut BifContext<'_>, time: Eterm, from: Eterm, to: Eterm) -> Result<Eterm> {
+        convert_time_unit_3(ctx, &[time, from, to])
+    }
+
+    /// A `convert_time_unit/3` unit argument: a seeded atom, or a caller-supplied
+    /// integer ratio (units per second).
+    enum Unit<'a> {
+        Atom(&'a str),
+        Int(i64),
+    }
+
+    /// The oracle goldens of `erlang:convert_time_unit/3` whose result fits a small
+    /// integer, every one probed against OTP 29.1.1 / erts-17.1.
     #[test]
-    fn register_installs_the_erlang_time_bifs() {
-        let mut reg = BifRegistry::new();
+    fn convert_time_unit_3_matches_the_oracle_small_int_goldens() {
+        use Unit::{Atom, Int};
+
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        // `(Time, FromUnit, ToUnit) => oracle result`. The unit spellings cover each
+        // modern atom and its deprecated alias, the `FU =:= TU` identity (including a
+        // distinct spelling of the same ratio), a caller-supplied integer ratio, and
+        // the two native aliases (both `1e9`/s here).
+        let cases: &[(i64, Unit, Unit, i64)] = &[
+            (1000, Atom("second"), Atom("microsecond"), 1_000_000_000),
+            (1000, Atom("nanosecond"), Atom("microsecond"), 1),
+            (5, Atom("second"), Atom("seconds"), 5),
+            (1_500_000_000, Atom("nanosecond"), Int(1_000_000_000), 1_500_000_000),
+            (-1, Atom("second"), Atom("millisecond"), -1_000),
+            (-1500, Atom("millisecond"), Atom("second"), -2),
+            (-3, Atom("millisecond"), Int(2), -1),
+            (-4, Atom("millisecond"), Int(2), -1),
+            (-1, Atom("nanosecond"), Atom("second"), -1),
+            (-1_000_000_001, Atom("nanosecond"), Atom("second"), -2),
+            (-1, Atom("second"), Atom("nanosecond"), -1_000_000_000),
+            (1, Atom("seconds"), Atom("second"), 1),
+            (1, Atom("milli_seconds"), Atom("millisecond"), 1),
+            (1, Atom("micro_seconds"), Atom("microsecond"), 1),
+            (1, Atom("nano_seconds"), Atom("nanosecond"), 1),
+            (1, Atom("native"), Atom("second"), 0),
+            (1, Atom("perf_counter"), Atom("nanosecond"), 1),
+            (1, Int(1000), Atom("millisecond"), 1),
+            (1, Atom("native"), Int(1_000_000_000), 1),
+            (1, Int(1000), Int(1000), 1),
+            (1_000_000, Atom("microsecond"), Atom("native"), 1_000_000_000),
+        ];
+
+        for &(time, ref from, ref to, expected) in cases {
+            let from = match from {
+                Atom(name) => ctx.atom(name).expect("seeded"),
+                Int(value) => ctx.int(*value).expect("fits"),
+            };
+            let to = match to {
+                Atom(name) => ctx.atom(name).expect("seeded"),
+                Int(value) => ctx.int(*value).expect("fits"),
+            };
+            let time = ctx.int(time).expect("fits");
+            let got = convert(&mut ctx, time, from, to)
+                .unwrap_or_else(|err| panic!("convert_time_unit({time:?},{from:?},{to:?}) => {err:?}"));
+            assert_eq!(
+                as_int(got),
+                expected,
+                "convert_time_unit({time:?}, {from:?}, {to:?})"
+            );
+        }
+    }    /// The same BIF for values or ratios past the 60-bit small range: the oracle
+    /// returns the exact bignum (or the identity `Time`), never a truncated one.
+    #[test]
+    fn convert_time_unit_3_promotes_to_bignums_exactly_like_the_oracle() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        let second = ctx.atom("second").expect("seeded");
+        let nanosecond = ctx.atom("nanosecond").expect("seeded");
+        let unit_200 = bignum_term(&mut ctx, false, 200);
+        let negative_70 = bignum_term(&mut ctx, true, 70);
+        let big_time = bignum_term(&mut ctx, false, 100);
+        let huge = bignum_term(&mut ctx, false, 70); // 2^70, the 1e21-second reading below
+
+        // (Time, From, To) => oracle decimal.
+        let cases: &[(Eterm, Eterm, Eterm, &str)] = &[
+            // `convert_time_unit(1 bsl 200, second, nanosecond)`.
+            (
+                unit_200,
+                second,
+                nanosecond,
+                "1606938044258990275541962092341162602522202993782792835301376000000000",
+            ),
+            // `convert_time_unit(1 bsl 200, nanosecond, second)` (floor).
+            (
+                unit_200,
+                nanosecond,
+                second,
+                "1606938044258990275541962092341162602522202993782792",
+            ),
+            // `convert_time_unit(-2^70, second, nanosecond)`.
+            (
+                negative_70,
+                second,
+                nanosecond,
+                "-1180591620717411303424000000000",
+            ),
+            // `convert_time_unit(-2^70, nanosecond, second)` (floor).
+            (negative_70, nanosecond, second, "-1180591620718"),            // `convert_time_unit(2^100, second, seconds)` — the identity arm, which
+            // returns `Time` itself.
+            (big_time, second, second, "1267650600228229401496703205376"),
+            // A bignum ratio past `i128`'s resolution of the product: `1 * 2^200 / 2^200`.
+            (ctx.int(1).expect("fits"), unit_200, second, "0"),
+        ];
+
+        for &(time, from, to, expected) in cases {
+            let got = convert(&mut ctx, time, from, to)
+                .unwrap_or_else(|err| panic!("convert_time_unit(...) => {err:?}"));
+            assert_eq!(decimal(got), expected);
+        }
+
+        // `2^70 seconds` in nanoseconds: a bignum `Time` scaled by a bignum ratio, so
+        // both operand shapes of the arbitrary-precision chain are exercised.
+        let huge_ns = convert(&mut ctx, huge, second, second).expect("the identity arm");
+        assert_eq!(huge_ns, huge, "the identity arm returns the very same term");
+        let scaled = convert(&mut ctx, huge, second, nanosecond).expect("a bignum Time");
+        assert_eq!(decimal(scaled), "1180591620717411303424000000000");
+    }
+
+    /// A `Time` that is not an integer can never convert: the oracle's `TU * Time`
+    /// raises `badarith` inside the body's own `try`, whose catch folds it to `badarg`
+    /// — including when `FU =:= TU` (that arm needs `is_integer(Time)`).
+    #[test]
+    fn convert_time_unit_3_rejects_a_non_integer_time_as_badarg() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        let second = ctx.atom("second").expect("seeded");
+        let millisecond = ctx.atom("millisecond").expect("seeded");
+        let float = ctx.make_float(1.5).expect("fits");
+        let atom = ctx.atom("bogus").expect("seeded");
+
+        for (time, from, to) in [
+            (float, second, second),
+            (float, second, millisecond),
+            (atom, second, millisecond),
+        ] {
+            assert!(
+                matches!(convert(&mut ctx, time, from, to), Err(BeamError::BadArg)),
+                "a non-integer Time must be badarg"
+            );
+        }
+    }
+
+    /// Every failing unit argument the oracle reports as `badarg`: an unknown atom, a
+    /// zero or negative unit, and a unit that is neither an atom nor an integer.
+    #[test]
+    fn convert_time_unit_3_rejects_bad_units_as_badarg() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        let second = ctx.atom("second").expect("seeded");
+        let fortnight = ctx.atom("fortnight").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+        let zero = ctx.int(0).expect("fits");
+        let negative = ctx.int(-5).expect("fits");
+
+        // (Time, From, To) — the failing argument in either unit position.
+        for (from, to) in [
+            (fortnight, second),
+            (second, fortnight),
+            (zero, second),
+            (second, zero),
+            (negative, second),
+            (one, negative),
+        ] {
+            assert!(
+                matches!(convert(&mut ctx, one, from, to), Err(BeamError::BadArg)),
+                "convert_time_unit(1, {from:?}, {to:?}) must be badarg"
+            );
+        }
+
+        // A non-atom, non-integer unit: a list in either position.
+        let list = ctx.list(&[one]).expect("fits");
+        assert!(matches!(convert(&mut ctx, one, list, second), Err(BeamError::BadArg)));
+        assert!(matches!(convert(&mut ctx, one, second, list), Err(BeamError::BadArg)));
+    }
+
+    #[test]
+    fn register_installs_the_erlang_time_bifs() {        let mut reg = BifRegistry::new();
         register(&mut reg);
 
         for (name, arity) in [
@@ -1184,6 +1552,7 @@ mod tests {
             ("system_time", 1),
             ("time_offset", 0),
             ("time_offset", 1),
+            ("convert_time_unit", 3),
             ("unique_integer", 0),
             ("unique_integer", 1),
             ("timestamp", 0),
@@ -1193,6 +1562,5 @@ mod tests {
                 "missing erlang:{name}/{arity}"
             );
         }
-        assert_eq!(reg.len(), 9);
-    }
-}
+        assert_eq!(reg.len(), 10);
+    }}

@@ -356,7 +356,7 @@ fn selected_compression_level(atoms: &AtomTable, options: Eterm) -> u8 {
 /// `install_bifs` (`emu/beam_emu.c:640-673`) assigns a `bif_number` to every
 /// `bif.tab` declaration. The predicate is therefore **membership in the declared
 /// `bif.tab` table**, plus the two hardcoded instruction-implemented functions
-/// below. The registry cannot answer it: this crate's 640 keys include the 84
+/// below. The registry cannot answer it: this crate's 643 keys include the 87
 /// non-table stdlib fast paths (`lists:map/2`, `io_lib:format/2`,
 /// `unicode:characters_to_binary/1`, `erlang:memory/0,1`, …) whose oracle answer
 /// is `false`.
@@ -935,7 +935,7 @@ mod tests {
         let registered = default_registry();
         let census = crate::bif_tab::census(&tab, &registered);
         assert_eq!(census.implemented_count(), 556);
-        assert_eq!(census.fast_path_count(), 84);
+        assert_eq!(census.fast_path_count(), 87);
 
         // Seed every name the sweep touches, so `ctx.atom` never needs an interner.
         let mut names: Vec<&str> = vec!["true", "false"];
@@ -950,9 +950,9 @@ mod tests {
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
 
         // Every declared key is `true` (the C gives every `bif.tab` line a
-        // `bif_number`), and every stdlib fast path — the 84 registry keys that
+        // `bif_number`), and every stdlib fast path — the 87 registry keys that
         // are NOT in the table — is `false`. A registry-membership implementation
-        // would answer `true` for all 84.
+        // would answer `true` for all 87.
         for entry in &census.implemented {
             let args = [
                 atom(&ctx, &entry.module),
