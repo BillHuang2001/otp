@@ -1500,15 +1500,18 @@ mod tests {
 
     #[test]
     fn code_path_switches_order_pa_before_pz() {
+        // `-pa` is the **head** of the code path and `-pz` the **tail**, so the two groups
+        // are kept apart (the ordering itself is applied by `CodeServer`):
+        //   `erl -noshell -pa a1 a2 -pz z1 z2 -eval 'io:format("~p~n",[lists:reverse(code:get_path())]),halt().'`
+        //   → the head is `["a2","a1", …]` (each `-pa` prepended in turn) and the tail is
+        //     `["z2","z1", ".", <system ebins>]` — i.e. `-pz` lands *after* `"."`.
+        // The parser therefore records `-pa` in `code_paths` and `-pz` in `pz_paths`.
         let config = parsed(&["-pa", "/a", "-pz", "/b", "-pa", "/c"]);
         assert_eq!(
             config.code_paths,
-            vec![
-                PathBuf::from("/a"),
-                PathBuf::from("/c"),
-                PathBuf::from("/b")
-            ]
+            vec![PathBuf::from("/a"), PathBuf::from("/c")]
         );
+        assert_eq!(config.pz_paths, vec![PathBuf::from("/b")]);
         assert!(parse_args(&["-pa"]).is_err());
         assert!(parse_args(&["-pz"]).is_err());
         // Every `-pa` occurrence is recorded, in command-line order.

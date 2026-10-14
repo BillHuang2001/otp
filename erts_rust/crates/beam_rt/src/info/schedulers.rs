@@ -358,16 +358,36 @@ mod tests {
                 InfoValue::Int(count)
             ])
         );
-        // No dirty pool is configured by default, so `all_schedulers_state` carries only
-        // the `normal` row (the C omits a pool whose total is 0) — and it is *first*.
+        // No `+SDcpu`/`+SDio` is configured, so the dirty pools fall back to the emulator
+        // defaults, and the C emits **all three** rows (`erl_bif_info.c:3284-3329`), in the
+        // order `normal`, `dirty_cpu`, `dirty_io`:
+        //   `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(all_schedulers_state)]),halt().'`
+        //   → `[{normal,<total>,<online>,<online>},{dirty_cpu,<total>,<online>,<online>},
+        //       {dirty_io,10,10,10}]` on this host (`dirty_cpu` follows the normal total, the
+        //   `dirty_io` default is `10`; `erl_init.c` `dirty_io_scheds = 10`).
+        let dirty_cpu = dirty_cpu_schedulers(&rt);
         assert_eq!(
             try_value("all_schedulers_state", &rt).unwrap().unwrap(),
-            InfoValue::List(vec![InfoValue::Tupled(vec![
-                InfoValue::Atom("normal"),
-                InfoValue::Int(count),
-                InfoValue::Int(count),
-                InfoValue::Int(count),
-            ])])
+            InfoValue::List(vec![
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("normal"),
+                    InfoValue::Int(count),
+                    InfoValue::Int(count),
+                    InfoValue::Int(count),
+                ]),
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("dirty_cpu"),
+                    InfoValue::Int(dirty_cpu),
+                    InfoValue::Int(count),
+                    InfoValue::Int(count),
+                ]),
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("dirty_io"),
+                    InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                    InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                    InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                ]),
+            ])
         );
         assert!(try_value("nonsense", &rt).is_none());
     }
@@ -392,13 +412,21 @@ mod tests {
                 InfoValue::Int(2)
             ])
         );
+        // The row tuple is `{Tag, Total, Online, Active}` (`erl_bif_info.c:3305-3320`), so a
+        // `dirty_cpu` pool sized `4` on a runtime with `2` online schedulers reports
+        // `{dirty_cpu,4,2,2}` — its *online*/*active* halves are the online scheduler count,
+        // exactly as the oracle's `+S 2 +SDcpu 4` row `{dirty_cpu,2,2,2}` shows (the C clamps
+        // `+SDcpu 4` to the normal total at `erl_init.c:1197`, which is why the oracle's total
+        // reads `2` there).
+        //   `erl -noshell +S 2 +SDcpu 4 +SDio 2 -eval 'io:format("~p~n",[erlang:system_info(all_schedulers_state)]),halt().'`
+        //   → `[{normal,2,2,2},{dirty_cpu,2,2,2},{dirty_io,2,2,2}]`
         assert_eq!(
             rows[1],
             InfoValue::Tupled(vec![
                 InfoValue::Atom("dirty_cpu"),
                 InfoValue::Int(4),
-                InfoValue::Int(4),
-                InfoValue::Int(4)
+                InfoValue::Int(2),
+                InfoValue::Int(2)
             ])
         );
         assert_eq!(
@@ -411,14 +439,28 @@ mod tests {
             ])
         );
 
-        // A configured pool of zero is still "no pool" — the C omits it.
+        // A configured pool of `0` is not reachable through the CLI — the oracle rejects
+        // `+SDio 0` outright (`bad number of dirty I/O schedulers 0`, `erl_init.c:1089-1097`,
+        // the valid range is `[1-…]`) and the emulator default is `10` — so a zero here means
+        // "no explicit pool": the `dirty_io` row falls back to the emulator default, which is
+        // never `0`, and the row stays in the list.
         let mut config = crate::config::RuntimeConfig::default().with_schedulers(1);
         config.emulator.dirty_io_schedulers = Some(0);
         let rt = Runtime::new(config).expect("a runtime with an empty +SDio");
         let InfoValue::List(rows) = try_value("all_schedulers_state", &rt).unwrap().unwrap() else {
             panic!("all_schedulers_state must be a list");
         };
-        assert_eq!(rows.len(), 1, "a zero-total pool is omitted");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[2],
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("dirty_io"),
+                InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+            ]),
+            "a zero dirty-io pool falls back to the emulator default of 10"
+        );
     }
 
     #[test]
@@ -476,17 +518,25 @@ mod tests {
         );
     }
     #[test]
-    fn dirty_schedulers_default_to_zero_and_follow_the_flags() {
+    fn dirty_schedulers_follow_the_flags_and_the_emulator_defaults() {
+        // No `+SDcpu`/`+SDio` is configured, so the emulator defaults apply:
+        //   `erl -noshell -eval 'io:format("~p ~p~n",[erlang:system_info(dirty_cpu_schedulers),erlang:system_info(dirty_io_schedulers)]),halt().'`
+        //   → on this host `<normal total> 10` (the C's `dirty_io_scheds = 10`,
+        //     `erl_init.c:869-871`; here `available_parallelism()` is the normal total, so
+        //     `dirty_cpu_schedulers` is that count, not `0`).
         let rt = runtime();
         assert_eq!(
             try_value("dirty_cpu_schedulers", &rt).unwrap().unwrap(),
-            InfoValue::Int(0)
+            InfoValue::Int(schedulers_count(&rt)),
+            "with no +SDcpu the dirty CPU pool follows the normal scheduler total"
         );
         assert_eq!(
             try_value("dirty_io_schedulers", &rt).unwrap().unwrap(),
-            InfoValue::Int(0)
+            InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS)
         );
+        assert_eq!(DEFAULT_DIRTY_IO_SCHEDULERS, 10);
 
+        // An explicit `+SDcpu`/`+SDio` pool is reported verbatim.
         let mut config = crate::config::RuntimeConfig::default();
         config.emulator.dirty_cpu_schedulers = Some(4);
         config.emulator.dirty_io_schedulers = Some(2);
