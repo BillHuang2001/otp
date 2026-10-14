@@ -74,16 +74,23 @@ assume a different layout.**
   falls back to `a.raw()` (documented, panic-free).
 - Note: generating the standard `am_*`-equivalent `Atom` constants from the full `atom.names` is a
   codegen/boot step (routed to `beam_rt`); this crate owns only the mechanism + parser.
-- **Backing store & cost profile** (`src/atom.rs:69-73`). `AtomTable` is the plain struct
-  `{ names: Vec<String>, index: HashMap<String, Atom> }`, `#[derive(Clone)]`. `name(Atom)` is
-  `O(1)` (`names.get(idx)`, `atom.rs:106`); `intern` is one `HashMap` lookup that allocates
-  **nothing** for an already-interned name and **two** `String`s (one appended to `names`, one as
-  the `index` key) only for a new one (`atom.rs:85-98`). `clone()` is a **deep copy of every
-  entry** — one `String` heap allocation for each `names` element *and* each `index` key, plus
-  rehashing the whole map — i.e. `O(N)` allocations; callers must never clone a populated table on
-  a hot path (`binary_to_term/1` clones the whole runtime table per call at
-  `../../beam_bifs/src/binconv.rs:1099`; every module load clones it at
-  `../../beam_rt/src/codeserver.rs:428`), so an `N`-atom runtime pays `O(N)` per decode.
+- **O(1) append-only witness** — what a memoized *image* of the table is validated against (see
+  [`## Atom-table snapshots`](#atom-table-snapshots--the-o1-append-only-memo-witness) for the contract
+  and the adoption recipe): `pub fn generation(&self) -> u64` (bumped by exactly one per **newly**
+  interned name), `pub fn snapshot(&self) -> AtomSnapshot` (an opaque `Copy` token carrying table
+  identity + generation + length) and `pub fn appended_since(&self, snapshot: AtomSnapshot) -> bool`
+  (O(1), allocation-free; `true` **only** when `self` is the same instance as the snapshotting table
+  and every mutation since was a pure append). `AtomSnapshot` exposes `len()`/`is_empty()`/
+  `generation()`.
+- **Backing store & cost profile.** `AtomTable` is
+  `{ names: Vec<String>, index: HashMap<String, Atom>, instance: u64, generation: u64 }` — the two
+  extra scalars exist only for the witness above; the struct derives `Debug` and hand-writes
+  `Default`/`Clone`, because a clone deep-copies every entry **and mints a fresh `instance`**. `name(Atom)`
+  is `O(1)`; `intern` is one `HashMap` lookup that allocates **nothing** for an already-interned name
+  (and does not bump the generation) and **two** `String`s for a new one. `clone()` is a **deep copy of
+  every entry** — one `String` heap allocation for each `names` element *and* each `index` key, plus
+  rehashing the whole map — i.e. `O(N)` allocations; never clone a populated table on a hot path, or an
+  `N`-atom runtime pays `O(N)` per decode (the reason the witness exists).
 
 ### `list.rs` — cons cells (`[CAR,CDR]`, header-less, `TAG_PRIMARY_LIST`)
 - `make_list(*const Eterm) -> Eterm`; `list_val(Eterm) -> *mut Eterm`; `ptr_val(Eterm) -> *mut Eterm`
