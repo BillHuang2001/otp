@@ -81,6 +81,16 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
   operand outside the interpreter's range, a module with neither `true` nor `false` interned for
   `is_boolean`, an out-of-bound register, or a bignum/float/literal operand -> `None` (the helper
   then reproduces the interpreter's exact result).
+- **`test` comparison helper** (`test.rs::emit_test_helper`): a comparison `Test` the word/header
+  subset declines — the six comparison kinds at two operands with a resolvable non-`NO_FAIL` fail label,
+  whatever the operands (a `Y` slot, a float register, a literal-area term, boxed-vs-boxed) — is emitted
+  as an `emit_helper_call` to the `jit_test` helper (so the cached x-registers spill first), then
+  `cmp rax, TEST_TRUE / je success`, `cmp rax, TEST_FALSE / je failed`, else `jmp done` (the helper's
+  `ERROR` word / decline, decoded by the driver). `success` refills, emits the gated `emit_refresh_y`
+  when `refresh_y_after(pc)`, and falls through to the next instruction; `failed` is `linker.emit_exit`
+  to the resolved fail label, so a compiled fail block is jumped to **directly** (its own frame teardown
+  replaces this block's) and any other target returns its `(func, pc)` word to the driver. Any shape it
+  does not own emits **zero** bytes, so the caller's fallback is exactly the per-instruction `jit_step_one`.
 - **`select_val`** (`select.rs`): `NO_FAIL` -> `None`; unresolved label -> `None`; scrutinee must be
   `test_src`; **every** alternative must be an immediate `constant_word`.
 - **`select_tuple_arity`** (`aggregate.rs`): `NO_FAIL`/unresolved label -> `None`; scrutinee must be an
@@ -222,7 +232,8 @@ entry (the driver's bound is `machine.x.len() > bound`).
 - `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`, `small_word`.
 - `r#move.rs` -> `try_inline_move`, `try_inline_swap` (`Move` over in-bound x-registers or an addressable `Y` slot on either side, behind the frame-window guard; `Swap` needs two in-bound x-registers).
 - `test.rs` -> `TestSrc`/`TestPred`/`Guard`/`TestPlan`, `test_plan`, `test_src`, `compare_shape`,
-  `arith_guard`, `order_guard`, `load_test_src`, `try_inline_test` (also `TEST_A`/`TEST_T` reused by `select.rs`).
+  `arith_guard`, `order_guard`, `load_test_src`, `try_inline_test` (incl. its `emit_test_helper`
+  comparison fallback), `emit_test_helper` (also `TEST_A`/`TEST_T` reused by `select.rs`).
 - `select.rs` -> `SelectPlan`, `select_val_plan`, `try_inline_select_val`.
 - `arith.rs` -> `SmallArith`, `fast_arith`, `FastArith`/`FastDest`/`FastSource`, `uses_y`, `import_names`,
   `try_inline_gc_bif`, `emit_y_load`/`emit_y_store` (+ the small-int constants).

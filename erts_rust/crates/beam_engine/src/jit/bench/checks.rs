@@ -20,10 +20,11 @@
 
 //! Per-workload result checks.
 //!
-//! Each workload in [`super::workloads`] pins the value its body is *supposed* to
-//! compute. The check is what makes "the tiers agree" meaningful: two tiers agreeing on
-//! a **wrong** answer still fails here, so a workload can never degenerate into a
-//! tautology that only compares a value against itself.
+//! Each workload in [`super::workloads`], [`super::inlined`] and [`super::send_recv`]
+//! pins the value its body is *supposed* to compute. The check is what makes "the
+//! tiers agree" meaningful: two tiers agreeing on a **wrong** answer still fails here,
+//! so a workload can never degenerate into a tautology that only compares a value
+//! against itself.
 //!
 //! A check receives the [`Workload`] as well as the result, because a couple of them
 //! need the workload's own atom table: a comparison never fabricates a boolean, it
@@ -33,6 +34,7 @@
 use beam_term::{is_small, make_atom, signed_value, Eterm};
 
 use super::inlined::{AGGR_RESULT, FIB_RESULT, KERNEL_RESULT, WIDE_RESULT};
+use super::send_recv::SEND_RECV_ROUNDS;
 use super::workloads::{
     Workload, BUILD_ROUNDS, CALL_EXT_INCREMENT, CALL_EXT_ROUNDS, CROSS_STEPS, MAP_ROUNDS,
     SELECT_ROUNDS, SUM_LENGTH, WALK_LENGTH,
@@ -136,4 +138,15 @@ pub(crate) fn verify_call_ext(
     result: Eterm,
 ) -> std::result::Result<(), String> {
     expect_small(result, CALL_EXT_ROUNDS * CALL_EXT_INCREMENT)
+}
+
+/// `send_recv/2` must return the triangular number
+/// `SEND_RECV_ROUNDS * (SEND_RECV_ROUNDS + 1) / 2` — every `send` + `receive`
+/// round-trip folds its own payload (the counter `N`) into the accumulator, so a loop
+/// that skipped, repeated or corrupted a round-trip cannot produce it.
+pub(crate) fn verify_send_recv(
+    _workload: &Workload,
+    result: Eterm,
+) -> std::result::Result<(), String> {
+    expect_small(result, (SEND_RECV_ROUNDS * (SEND_RECV_ROUNDS + 1) / 2) as i64)
 }
