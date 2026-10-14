@@ -483,4 +483,29 @@ fn list_to_integer_reads_each_element_as_a_byte() {
     let list = fx.int_list(&all_bytes);
     let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
     assert_eq!(small(got), 100_000_000_000_000_000, "18 byte-only digits");
+
+    // The same rule with a sign and with leading zeros (which the scan skips
+    // before it counts). Oracle:
+    //   [-1,304] ++ lists:duplicate(16,$0) => ERROR error:badarg       (18 digits)
+    //   [-1]     ++ lists:duplicate(17,$0) => -100000000000000000
+    //   [0,1,304] ++ lists:duplicate(15,$0) => 10000000000000000      (17 digits)
+    let signed_big: Vec<i64> = [45i64, 49, 304].into_iter().chain(zeros(16)).collect();
+    let list = fx.int_list(&signed_big);
+    assert!(
+        matches!(fx.call("list_to_integer", &[list]), Err(BeamError::BadArg)),
+        "signed 18 digits with a 304"
+    );
+    let signed: Vec<i64> = [45i64, 49].into_iter().chain(zeros(17)).collect();
+    let list = fx.int_list(&signed);
+    let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
+    assert_eq!(small(got), -100_000_000_000_000_000, "signed 18 byte-only digits");
+
+    let leading_zero: Vec<i64> = [48i64, 49, 304].into_iter().chain(zeros(15)).collect();
+    let list = fx.int_list(&leading_zero);
+    let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
+    assert_eq!(
+        small(got),
+        10_000_000_000_000_000,
+        "leading zero leaves a 304 on the short side of the run"
+    );
 }
