@@ -835,6 +835,7 @@ mod tests {
     use beam_alloc::Heap;
     use beam_common::BeamError;
     use beam_process::ProcessId;
+    use beam_term::fun::FunPid;
     use beam_term::{make_small, AtomTable};
 
     /// The test `AtomInterner` — a `RefCell`-wrapped table, the shape a runtime
@@ -857,6 +858,7 @@ mod tests {
             "arity",
             "env",
             "refc",
+            "pid",
             "new_index",
             "new_uniq",
             "index",
@@ -865,6 +867,8 @@ mod tests {
             "name",
             "lists",
             "reverse",
+            "fiprobe",
+            "nonode@nohost",
             "foo",
         ]);
         atoms
@@ -1004,5 +1008,268 @@ mod tests {
         ));
         assert_eq!(item_of(&ctx, type_item), Item::Type);
         assert_eq!(item_of(&ctx, foo), Item::Other);
+    }
+
+    // -----------------------------------------------------------------------
+    // fun_info/1 (the whole-list form) and the seam-backed identity items
+    // -----------------------------------------------------------------------
+
+    /// A `LocalFunIdentity` stub: always answers the wrapped identity (or `None`,
+    /// the "the defining module is not loaded here" case). The real seam scans the
+    /// runtime's loaded modules; the cases below only need a faithful answer.
+    struct StubIdentity(Option<beam_codec::FunIdentity>);
+
+    impl crate::context::LocalFunIdentity for StubIdentity {
+        fn local_fun_identity(&mut self, _term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
+            Ok(self.0)
+        }
+    }
+
+    /// Asserts the call raised the crate's typed `unsupported_bif` gap — a `Raise`
+    /// whose reason atom is `unsupported_bif` (`BeamError` has no dedicated
+    /// variant), never a wrong value and never another failure.
+    fn assert_unsupported(result: Result<Eterm>, what: &str) {
+        match result {
+            Err(ref err) if err.as_atom() == Some("unsupported_bif") => {}
+            other => panic!("{what}: expected unsupported_bif, got {other:?}"),
+        }
+    }
+
+    /// The elements of the proper list `list` (its pairs, for a `fun_info/1` result).
+    fn list_elements(mut list: Eterm) -> Vec<Eterm> {
+        let mut out = Vec::new();
+        while list != NIL {
+            out.push(access::car(list));
+            list = access::cdr(list);
+        }
+        out
+    }
+
+    /// The `(key name, value)` pairs of a `fun_info/1` result, key names resolved
+    /// from `atoms` (the walk's ten key atoms live in the context's table, not in
+    /// the interner).
+    fn walk_pairs(atoms: &AtomTable, list: Eterm) -> Vec<(String, Eterm)> {
+        list_elements(list)
+            .into_iter()
+            .map(|pair| {
+                let key = access::tuple_element(pair, 0);
+                let value = access::tuple_element(pair, 1);
+                let name = atoms
+                    .name(atom_val(key))
+                    .unwrap_or_else(|| panic!("the key {key:?} names no atom"))
+                    .to_string();
+                (name, value)
+            })
+            .collect()
+    }
+
+    /// A `beam_codec::FunIdentity` with `fiprobe`/`nonode@nohost` resolved from
+    /// `atoms` and a this-node creator — the shape a runtime seam would answer for a
+    /// `make_fun3` closure of a loaded module.
+    fn stub_identity(atoms: &AtomTable, md5: [u8; 16], old_index: u32, old_uniq: u32) -> beam_codec::FunIdentity {
+        beam_codec::FunIdentity {
+            module: atoms.lookup("fiprobe").expect("seeded module"),
+            uniq: md5,
+            old_index,
+            old_uniq,
+            creator: FunPid {
+                node: atoms.lookup("nonode@nohost").expect("seeded node"),
+                number: 0,
+                serial: 0,
+                creation: 0,
+            },
+        }
+    }
+
+    /// `fun_info/1` of an **external** fun is exactly the oracle's five-item list
+    /// `[{module,lists},{name,reverse},{arity,2},{env,[]},{type,external}]`: the
+    /// ten-key walk drops every `{Key,undefined}` pair (`pid`/`new_index`/
+    /// `new_uniq`/`index`/`uniq` here) and keeps the order of what remains.
+    #[test]
+    fn fun_info_1_external_is_the_five_item_oracle_list() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_atom_interner(&mut interner);
+        let fun = external_fun(&mut ctx, 2);
+
+        let list = fun_info_1(&mut ctx, &[fun]).expect("fun_info/1");
+        let pairs = walk_pairs(&atoms, list);
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["module", "name", "arity", "env", "type"]);
+        assert_eq!(atoms.name(atom_val(pairs[0].1)).as_deref(), Some("lists"));
+        assert_eq!(atoms.name(atom_val(pairs[1].1)).as_deref(), Some("reverse"));
+        assert_eq!(beam_term::signed_value(pairs[2].1), 2);
+        assert_eq!(pairs[3].1, NIL);
+        // `type`'s value is *produced*, so it comes from the interner's table.
+        assert_eq!(
+            interned_name(&interner, pairs[4].1).as_deref(),
+            Some("external")
+        );
+    }
+
+    /// `/1` and `/2` cannot disagree: every pair in the `/1` list equals the `/2`
+    /// result for that key (both derive their value from the one `item_value`).
+    #[test]
+    fn fun_info_1_and_fun_info_2_agree_for_an_external_fun() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_atom_interner(&mut interner);
+        let fun = external_fun(&mut ctx, 1);
+
+        let list = fun_info_1(&mut ctx, &[fun]).expect("fun_info/1");
+        for pair in list_elements(list) {
+            let key = access::tuple_element(pair, 0);
+            let name = atoms.name(atom_val(key)).expect("a key atom").to_string();
+            let two = fun_info_2(&mut ctx, &[fun, key]).expect(&name);
+            assert_eq!(access::tuple_element(two, 0), key, "{name}: item element");
+            assert_eq!(
+                access::tuple_element(two, 1),
+                access::tuple_element(pair, 1),
+                "{name}: value"
+            );
+        }
+    }
+
+    /// A non-fun is `error:badarg` before any key/item is examined, for both forms
+    /// (`erlang.erl`'s `is_function` guard and the C's own fun check).
+    #[test]
+    fn fun_info_1_and_2_badarg_a_non_fun() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let item = ctx.atom("type").expect("seeded item");
+        for non_fun in [make_small(42), NIL] {
+            assert!(matches!(
+                fun_info_1(&mut ctx, &[non_fun]),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(
+                fun_info_2(&mut ctx, &[non_fun, item]),
+                Err(BeamError::BadArg)
+            ));
+        }
+    }
+
+    /// `fun_info(F, pid)` of an **external** fun: `{pid,undefined}` — the C's
+    /// `is_local_fun(funp) ? funp->creator : am_undefined` takes the `undefined`
+    /// arm.
+    #[test]
+    fn fun_info_pid_item_external_is_undefined() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_atom_interner(&mut interner);
+        let fun = external_fun(&mut ctx, 1);
+
+        let item = ctx.atom("pid").expect("seeded item");
+        let info = fun_info_2(&mut ctx, &[fun, item]).expect("external pid");
+        assert_eq!(
+            interned_name(&interner, access::tuple_element(info, 1)).as_deref(),
+            Some("undefined")
+        );
+    }
+
+    /// `fun_info(F, pid)` of a `make_fun3` closure: the seam's creator resolves to
+    /// this node's own pid, i.e. the internal immediate `<0.0.0>`
+    /// (`erts_init_process_id`), never the external `[header,node,…]` block.
+    #[test]
+    fn fun_info_pid_item_local_uses_the_seam_creator() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let identity = stub_identity(&atoms, [0u8; 16], 0, 0);
+        let mut stub = StubIdentity(Some(identity));
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut stub);
+        let (_storage, fun) = local_fun(1, 85002344, 1);
+
+        let item = ctx.atom("pid").expect("seeded item");
+        let info = fun_info_2(&mut ctx, &[fun, item]).expect("local pid");
+        assert_eq!(
+            access::tuple_element(info, 1),
+            ProcessId::new(0, 0).to_eterm()
+        );
+    }
+
+    /// Without a seam the `pid` item of a `make_fun3` closure is the typed gap — the
+    /// term carries no creator and no loaded module can attribute it.
+    #[test]
+    fn fun_info_pid_item_local_without_a_seam_is_the_typed_gap() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let (_storage, fun) = local_fun(1, 85002344, 1);
+
+        let item = ctx.atom("pid").expect("seeded item");
+        assert_unsupported(fun_info_2(&mut ctx, &[fun, item]), "fun_info(Local, pid)");
+    }
+
+    /// The seam-backed `fun_info/2` items of a `make_fun3` fun: `module` from the
+    /// identity, `new_uniq` the 16-byte module MD5 as a binary, `index` the
+    /// `old_index`, `uniq` the `old_uniq` — and `new_index` straight from the term's
+    /// own descriptor word.
+    #[test]
+    fn fun_info_local_identity_items_come_from_the_seam() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let md5: [u8; 16] = [
+            144, 244, 119, 221, 232, 238, 161, 253, 84, 16, 58, 236, 101, 200, 54, 54,
+        ];
+        let identity = stub_identity(&atoms, md5, 3, 85002344);
+        let mut stub = StubIdentity(Some(identity));
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut stub);
+        let (_storage, fun) = local_fun(1, 0xDEAD_BEEF, 7);
+
+        let item = ctx.atom("module").expect("seeded");
+        let info = fun_info_2(&mut ctx, &[fun, item]).expect("module");
+        assert_eq!(
+            atoms.name(atom_val(access::tuple_element(info, 1))).as_deref(),
+            Some("fiprobe")
+        );
+
+        let item = ctx.atom("new_uniq").expect("seeded");
+        let info = fun_info_2(&mut ctx, &[fun, item]).expect("new_uniq");
+        let (bytes, offset_bits, size_bits) =
+            beam_codec::term::bitstring_bytes(access::tuple_element(info, 1)).expect("a binary");
+        assert_eq!((offset_bits, size_bits), (0, 128));
+        assert_eq!(bytes, &md5[..]);
+
+        let item = ctx.atom("index").expect("seeded");
+        let info = fun_info_2(&mut ctx, &[fun, item]).expect("index");
+        assert_eq!(beam_term::signed_value(access::tuple_element(info, 1)), 3);
+
+        let item = ctx.atom("uniq").expect("seeded");
+        let info = fun_info_2(&mut ctx, &[fun, item]).expect("uniq");
+        assert_eq!(
+            beam_term::signed_value(access::tuple_element(info, 1)),
+            85002344
+        );
+
+        // `new_index` is the term's own descriptor word (7 here) — no seam needed.
+        let item = ctx.atom("new_index").expect("seeded");
+        let info = fun_info_2(&mut ctx, &[fun, item]).expect("new_index");
+        assert_eq!(beam_term::signed_value(access::tuple_element(info, 1)), 7);
+    }
+
+    /// `fun_info/1` of a `make_fun3` fun is the typed gap **even with** a seam
+    /// identity: the walk reaches `name`, whose lambda name lives in the loaded
+    /// module's fun table, so the whole-list form raises rather than silently
+    /// dropping the pair (which would be a wrong, short list).
+    #[test]
+    fn fun_info_1_of_a_local_fun_is_the_typed_gap_even_with_an_identity() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let identity = stub_identity(&atoms, [0u8; 16], 0, 0);
+        let mut stub = StubIdentity(Some(identity));
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut stub);
+        let (_storage, fun) = local_fun(1, 0x1234, 1);
+
+        assert_unsupported(fun_info_1(&mut ctx, &[fun]), "fun_info/1 of a Local fun");
     }
 }
