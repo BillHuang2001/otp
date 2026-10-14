@@ -574,12 +574,16 @@ fn the_cli_runs_the_real_boot_script_to_completion() {
         eprintln!("SKIP: {} is absent", boot.display());
         return;
     }
-    // The real `start.boot` now boots to completion: its three `kernelProcess` directives
-    // really run, and its final `{apply,{c,erlangrc,[]}}` directive reaches the **native
-    // `file_server_2` service** the runtime registers at construction. That service answers
-    // `{open,"$HOME/.erlang",[read]}` with `{error,enoent}` (no `$HOME/.erlang` here), which
-    // `c:erlangrc/0` treats as success, so the chain reaches `{progress,started}` and the CLI
-    // exits 0, never a panic, a hang or a silently-wrong success.
+    // The real `start.boot` must boot to completion: its three `kernelProcess` directives
+    // really run, and its final `{apply,{c,erlangrc,[]}}` directive reaches a `file_server_2`
+    // service (on this route the booted `kernel_sup`'s own child — the native service is
+    // spawned **unregistered** here) that answers `{open,"$HOME/.erlang",[read]}` with
+    // `{error,enoent}` (no `$HOME/.erlang` here), which `c:erlangrc/0` treats as success, so the
+    // chain must reach `{progress,started}` and the CLI must exit 0, never a panic, a hang or a
+    // silently-wrong success.
+    //
+    // The assertion is currently **red**: the script stops at directive 19 of 22 and the CLI
+    // exits 1 (see `M1_GAPS.md` *A.7/A.9 boot*).
     //
     // The switch names the boot file **without** its `.boot` suffix — `init` appends it
     // (`erts/preloaded/src/init.erl:1268`).

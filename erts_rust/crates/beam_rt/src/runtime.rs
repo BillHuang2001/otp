@@ -2601,6 +2601,56 @@ mod tests {
     }
 
     #[test]
+    fn a_boot_script_runtime_spawns_the_native_service_unregistered() {
+        // The `-boot FILE` route is the one the native `file_server_2` must NOT claim: the
+        // booted `kernel_sup` starts OTP's own `{file_server, start_link, []}` child, and an
+        // **initial** child start that finds the name taken aborts that `permanent` supervisor
+        // (see `src/native/file_server.rs`). `Runtime::new` therefore gates the registration on
+        // `RuntimeConfig::boot_script()` and spawns the service **unclaimed** here.
+        let argv: Vec<String> = ["-noshell", "-boot", "bootstrap/bin/start"]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
+        let config = match crate::cli::parse(&argv) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+                return;
+            }
+        };
+        assert_eq!(config.boot_script(), Some("bootstrap/bin/start"));
+        let booted = match Runtime::new(config) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("SKIP: no system Erlang install ({error})");
+                return;
+            }
+        };
+        // The service process is still spawned — the count is the same as on the default route
+        // — and `init` is still registered; only the `file_server_2` name stays free.
+        assert_eq!(booted.processes().len(), 2);
+        assert_eq!(
+            booted.system_info_value("process_count").expect("count"),
+            InfoValue::Int(2)
+        );
+        let init = booted.atoms().lookup("init").expect("`init` is a core atom");
+        assert!(booted.processes().whereis(init).is_some());
+        if let Some(atom) = booted.atoms().lookup("file_server_2") {
+            assert!(
+                booted.processes().whereis(atom).is_none(),
+                "the boot-script route must leave `file_server_2` for the booted system"
+            );
+        }
+        // The non-boot config keeps it registered, so the two routes really do differ.
+        let plain = runtime();
+        let atom = plain
+            .atoms()
+            .lookup("file_server_2")
+            .expect("`file_server_2` is registered on the default route");
+        assert!(plain.processes().whereis(atom).is_some());
+    }
+
+    #[test]
     fn an_oversized_return_value_becomes_the_documented_system_limit() {
         // A runtime whose term-construction heaps are at the floor, so a value larger than the
         // heap is cheap to build. `stabilize_term` copies a process's return value onto the
