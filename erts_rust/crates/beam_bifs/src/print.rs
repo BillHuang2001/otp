@@ -2040,17 +2040,47 @@ mod tests {
         });
     }
 
+    /// An **external** pid/ref is the typed [`unsupported_bif`] capability gap, not a
+    /// malformed argument: the oracle renders its channel number through
+    /// `atom_val(x->sysname)` — the *running* VM's node-atom index, runtime state the
+    /// frozen external-identifier term does not carry (see [`render_chunk`]). A **fun**
+    /// stays `BadArg`: its leaf is `erlang:fun_to_list/1`, and a runtime-made `Local`
+    /// (`make_fun3`) fun's inlined descriptor carries no module/name to render.
     #[test]
-    fn unsupported_terms_are_badarg() {
+    fn external_identifiers_are_a_typed_gap_and_funs_stay_badarg() {
         with_ctx(|ctx| {
-            // An external pid is outside the M1 printable set.
+            // An external pid and an external ref are both the typed capability gap.
             let node = ctx.atom("hi").expect("seeded");
-            let external = beam_codec::term::make_external_pid(ctx.heap(), node, 1, 2, 3)
-                .expect("fits");
+            let external_pid =
+                beam_codec::term::make_external_pid(ctx.heap(), node, 1, 2, 3).expect("fits");
             assert!(matches!(
-                format_term(ctx, external, false),
+                format_term(ctx, external_pid, false),
+                Err(beam_common::BeamError::Raise(ref r))
+                    if r.reason.as_atom() == Some("unsupported_bif")
+            ));
+            let external_ref =
+                beam_codec::term::make_external_ref(ctx.heap(), node, &[5], 0).expect("fits");
+            assert!(matches!(
+                format_term(ctx, external_ref, false),
+                Err(beam_common::BeamError::Raise(ref r))
+                    if r.reason.as_atom() == Some("unsupported_bif")
+            ));
+
+            // A fun stays `BadArg` — the documented structural gap: this `Local`
+            // (`make_fun3`) block's `[header, uniq, index]` descriptor has no
+            // module/name for `fun_to_list/1` to render.
+            let words: Box<[Eterm]> = vec![
+                Eterm::from_raw(beam_term::FUN_SUBTAG | (2usize << 8)),
+                Eterm::from_raw(0), // uniq
+                Eterm::from_raw(0), // index
+            ]
+            .into_boxed_slice();
+            let fun = beam_term::make_boxed(words.as_ptr());
+            assert!(matches!(
+                format_term(ctx, fun, false),
                 Err(beam_common::BeamError::BadArg)
             ));
+
             // Sanity: the atom itself still renders.
             assert_eq!(show(ctx, node, false), "hi");
         });
