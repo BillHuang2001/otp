@@ -866,6 +866,31 @@ closable the same way and the floor already serves all three, so none of them st
 `the_effective_gap_set_never_shadows_the_registry`, and `native.rs`'s
 `every_floor_module_is_a_real_try_native_arm`.
 
+### The Erlang-level distribution supervisor (`erl_distribution:start_link/0,1`)
+`kernel_sup`'s distribution child is `{erl_distribution, start_link, []}` (`kernel.erl:262-268`), and
+`start_link/1` is the same entry `erl_distribution:start/1` invokes from `net_kernel:start/1`. Both
+start a supervisor whose children are the **Erlang socket stack** (`net_kernel:protocol_childspecs/0`,
+`erl_epmd`, `auth`, `net_kernel`). This runtime has no `prim_inet`/`inet_tcp` driver, so that stack
+cannot run — its distribution is the native `crate::dist::DistNode` the CLI binds and publishes to
+`epmd` itself. Answering both keys with the atom **`ignore`** is exactly how `erl_distribution`
+expresses "nothing to start": its own `do_start_link/1` falls through to `do_start_link([]) -> ignore`
+when no `-sname`/`-name` argument is present, which is what the supervisor sees on the plain route.
+Without it, a `-sname`/`-name` route started `net_sup`, whose `net_kernel:start_link/1` parked in
+`proc_lib:sync_start/2` and folded into the typed `blocked()` gap — and because `kernel` is
+`permanent`, the node was torn down. Both keys are in `floor_keys("erl_distribution")`, so the
+namespace is key-granular (`init/1`, `start/1`, `stop/0` stay ordinary `.beam` bodies);
+`floor_shadows` refusing in-machine entry is what routes the supervisor's
+`apply(erl_distribution, start_link, [])` onto `call_bif` → `try_native` (verified with
+`BEAM_RT_BOOT_TRACE=1`: `seam decline … erl_distribution:start_link/0: floor_shadows` then the
+`call_bif` ENTER line).
+
+**The honest registered-name divergence** (measured side by side, OTP 29.1.1 as the oracle): on a
+`-sname` node the oracle has live pids for `net_sup`, `net_kernel` and `auth`; here all three stay
+`undefined` because the Erlang socket stack they belong to does not exist. Everything else agrees:
+`node()` (`foo@<host>`), `is_alive()` (`true`), and `whereis(kernel_sup)` / `whereis(application_controller)`
+/ `whereis(logger)` are live pids on both; `whereis(timer_server)` is `undefined` on both (OTP starts
+it lazily through `kernel_sup`). `whereis(net_sup)` was `undefined` here before the default boot too.
+
 ### Recorded gaps and fabricated values
 - **`read_file_info/1,2`, `read_link_info/1,2` and `read_handle_info/1,2` ARE served** (a real
   14-tuple `#file_info{}`, `access` from two real `access(2)` probes via `beam_io::path_access` for
