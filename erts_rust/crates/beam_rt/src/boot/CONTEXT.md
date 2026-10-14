@@ -134,12 +134,16 @@ The `BEAM_RT_BOOT_TRACE` trace (`src/debug_trace.rs`) confirms the ordering: `ap
 kernel-exited report, then directive 18's resume returns `Ok`, then directive 19's `apply` enters and
 immediately returns `Err` (the `application_controller` is already gone, so its `gen_server:call` raises
 `noproc` with no `Wait` at all).
-- **Instructions 20–21 are not reached.** `c:erlangrc/0`'s file consult is
+- **Instructions 20–21 are not reached, but both CAN run.** `c:erlangrc/0`'s file consult is
   `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
   (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt` registers a runtime-native
   `file_server_2` at construction ([`../native/file_server.rs`](../native/CONTEXT.md)), which answers
-  the missing `$HOME/.erlang` with `{error,enoent}` — a value `c:erlangrc/0` treats as success — but the
-  directive-19 stop happens first, so instruction 20 does not run.
+  the missing `$HOME/.erlang` with `{error,enoent}`; `c:erlangrc/0` **returns** that `{error,enoent}`
+  without raising (verified: `beam_rt -eval 'c:erlangrc()'` → `{error,enoent}`, the oracle's own answer)
+  and the executor discards a directive's value, so a synthetic two-directive boot
+  `[{apply,{c,erlangrc,[]}},{progress,started}]` runs to **exit 0** — instructions 20 and 21 already
+  work in isolation. They are simply never reached in the real chain because the directive-19 stop
+  happens first.
 - **The CLI and the in-crate executor stop in the same place — exit 1.** The CLI
   (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **1**, as does the
   `run` action, with empty stdout and, on stderr, an `=INFO REPORT==== …` line
