@@ -323,6 +323,24 @@ pub struct Machine {
     /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
     /// test) cannot leak a stale value from an earlier run.
     pub(crate) reduce_on: bool,
+    /// The **per-run in-machine BIF-dispatch gate**: the cached answer of
+    /// [`ExecutionContext::wants_bif_in_machine`](crate::context::ExecutionContext::wants_bif_in_machine)
+    /// for the run currently executing.
+    ///
+    /// When it is `true` the engine routes every BIF dispatch through
+    /// [`ExecutionContext::call_bif_in_machine`](crate::context::ExecutionContext::call_bif_in_machine)
+    /// (handing the host the live `&Machine` and the run's entry module) instead of
+    /// [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif);
+    /// when it is the default `false` the plain `call_bif` path is taken
+    /// **byte-identically** and a dispatch pays a single `bool` load instead of an
+    /// extra vtable crossing.
+    ///
+    /// Latched at a run/resume entry exactly like [`Machine::trace_on`]/
+    /// [`Machine::reduce_on`], and [`Machine::reset`](crate::machine::Machine::reset)
+    /// leaves it `false`, so a run that never latches it (e.g. a direct
+    /// `Machine::step_instruction` call in a test) cannot leak a stale value from an
+    /// earlier run.
+    pub(crate) bif_in_machine_on: bool,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -413,6 +431,7 @@ impl Machine {
             args_scratch: Vec::new(),
             trace_on: false,
             reduce_on: false,
+            bif_in_machine_on: false,
             current_code: None,
             entry_call: None,
             reductions: 0,

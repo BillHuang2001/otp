@@ -144,9 +144,45 @@ impl Machine {
     /// driver ([`Machine::drive`], which knows the true entry module) attaches the
     /// fuller frame set — naming the callee's module for a context-`0` caller would
     /// be a wrong result.
+    ///
+    /// This is the **single-module shorthand** for
+    /// [`Machine::step_instruction_with_entry`] (the active module IS the entry
+    /// module): the crate's own drivers — the interpreter's
+    /// [`Machine::drive`](crate::machine::Machine) and the native tiers — call the
+    /// entry-aware variant so a cross-module callee is named against the run's true
+    /// entry module, and this shorthand remains for the callers that operate in the
+    /// run's **entry** context (`0`), where the two modules are the same.
+    #[allow(dead_code)] // consumed by the crate's `#[cfg(test)]` callers
     #[inline]
     pub(crate) fn step_instruction(
         &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> StepResult {
+        self.step_instruction_with_entry(module, module, labels, func, pc, ctx)
+    }
+
+    /// [`Machine::step_instruction`] with the run's **entry module** handed in
+    /// separately from the **active** module.
+    ///
+    /// The two differ only while a cross-module callee (a non-zero module context)
+    /// is executing: `active_module` is the callee the `(func, pc)` index, while
+    /// `entry_module` is the module the run was entered at (module context `0`,
+    /// which a [`Machine`](crate::Machine) borrows rather than owns). The entry
+    /// module is what the in-machine BIF-dispatch door
+    /// ([`ExecutionContext::call_bif_in_machine`](crate::context::ExecutionContext::call_bif_in_machine))
+    /// hands the host, and what the raise funnel's context-`0` half names frames
+    /// against — so both must travel to the BIF arms and the instruction families.
+    ///
+    /// The per-instruction semantics are unchanged: this is the same execution with
+    /// one extra read-only module reference threaded through.
+    #[inline]
+    pub(crate) fn step_instruction_with_entry(
+        &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         func: u32,
@@ -162,7 +198,7 @@ impl Machine {
         // blocking `wait` is interpreted, never inlined); a natively-executed JIT
         // block does not update it (see the field docs).
         self.current_code = Some((func, pc));
-        let result = self.step_instruction_inner(module, labels, func, pc, ctx);
+        let result = self.step_instruction_inner(entry_module, module, labels, func, pc, ctx);
         // The uniform raise funnel (see this method's docs). In context `0` the
         // active module is the entry module, so `Some(module)` is exactly the
         // `entry_module` `Machine::raise_stacktrace` needs; in a callee context the
@@ -180,6 +216,7 @@ impl Machine {
     #[inline]
     fn step_instruction_inner(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         func: u32,
@@ -295,14 +332,14 @@ impl Machine {
                 dst,
                 ..
             } => self
-                .exec_bif(module, labels, *bif, args, *fail, dst, ctx)
+                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, ctx)
                 .map_err(Box::new),
             Instr::Bif0 { bif, dst } => {
                 // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
                 // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
                 // is no fail label, so any error is a raise; C routes the call
                 // through `call_light_bif`, whose error path is catch-aware.
-                self.exec_bif(module, labels, *bif, &[], NO_FAIL, dst, ctx)
+                self.exec_bif(entry_module, module, labels, *bif, &[], NO_FAIL, dst, ctx)
                     .map_err(Box::new)
             }
             // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
@@ -316,7 +353,7 @@ impl Machine {
                 dst,
                 ..
             } => self
-                .exec_bif(module, labels, *bif, args, *fail, dst, ctx)
+                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, ctx)
                 .map_err(Box::new),
             Instr::Call { target, arity } => {
                 let (callee, callee_pc) = resolve(labels, *target)?;
@@ -327,6 +364,7 @@ impl Machine {
                 // return address for a callee that does not run — exactly like the
                 // synchronous half of the `call_ext` arm.
                 if let Some(step) = self.local_call_seam(
+                    entry_module,
                     module,
                     callee,
                     *arity,
@@ -372,6 +410,7 @@ impl Machine {
                 // order `ImportFrame::Last` applies on the `call_ext_last` route), so
                 // the seam is asked before anything is popped.
                 if let Some(step) = self.local_call_seam(
+                    entry_module,
                     module,
                     callee,
                     *arity,
@@ -400,6 +439,7 @@ impl Machine {
                 // frame's existing continuation is followed), exactly like its
                 // `call_ext_only` twin.
                 if let Some(step) = self.local_call_seam(
+                    entry_module,
                     module,
                     callee,
                     *arity,
@@ -430,6 +470,7 @@ impl Machine {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
                 self.call_ext_dispatch(
+                    entry_module,
                     module,
                     labels,
                     *target,
@@ -449,6 +490,7 @@ impl Machine {
                 // the callee's `return` follows the frame's *existing* continuation
                 // (exactly like the local `Instr::CallOnly`).
                 self.call_ext_dispatch(
+                    entry_module,
                     module,
                     labels,
                     *target,
@@ -499,6 +541,7 @@ impl Machine {
                 // applies), so a raise leaves the live frame untouched and a success
                 // pops it exactly once.
                 self.call_ext_dispatch(
+                    entry_module,
                     module,
                     labels,
                     *target,
@@ -568,7 +611,7 @@ impl Machine {
             // this seam existed; a family that later implements an opcode returns
             // a [`Step`] telling the driver where to continue. Never a panic and
             // never a wrong result.
-            other => families::dispatch(self, module, labels, other, func, pc, ctx)
+            other => families::dispatch(self, entry_module, module, labels, other, func, pc, ctx)
                 .map_err(Box::new),
         }
     }
@@ -728,6 +771,7 @@ impl Machine {
     /// applies its own `CallExt*` frame discipline.
     fn resolve_call_ext_apply(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         target: ImportRef,
@@ -801,7 +845,7 @@ impl Machine {
         // `x(N)` and the function is `x(N+1)`, with the arguments in `x(0..N)`.
         self.set_x(count, module_term)?;
         self.set_x(count + 1, function_term)?;
-        Ok(Some(apply_target(self, module, count, ctx)?))
+        Ok(Some(apply_target(self, entry_module, module, count, ctx)?))
     }
 
     /// The `call_ext*`-encoded `erlang:send/2` / `erlang:'!'/2` seam.
@@ -928,6 +972,7 @@ impl Machine {
     /// frame when there is one.
     pub(crate) fn call_ext_dispatch(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         target: ImportRef,
@@ -939,7 +984,7 @@ impl Machine {
         seam: Option<Option<(u32, u32, u32)>>,
     ) -> StepResult {
         let apply_target =
-            if let Some(t) = self.resolve_call_ext_apply(module, labels, target, ctx)? {
+            if let Some(t) = self.resolve_call_ext_apply(entry_module, module, labels, target, ctx)? {
                 t
             } else if let Some(t) = self.resolve_call_ext_send(module, labels, target, ctx)? {
                 t
@@ -954,7 +999,7 @@ impl Machine {
                         func: target_func,
                         pc: target_pc,
                     },
-                    None => match self.call_import(module, labels, target, arity, ctx) {
+                    None => match self.call_import(entry_module, module, labels, target, arity, ctx) {
                         Ok(value) => ApplyTarget::Called(value),
                         Err(e) => {
                             // An import the host cannot resolve raises `undef`, and the
@@ -1008,6 +1053,7 @@ impl Machine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn local_call_seam(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         callee: u32,
         nregs: u32,
@@ -1025,7 +1071,14 @@ impl Machine {
         {
             return Ok(None);
         }
-        let value = match self.call_bif_named(module_name, function_name, arity, nregs, ctx) {
+        let value = match self.call_bif_named(
+            entry_module,
+            module_name,
+            function_name,
+            arity,
+            nregs,
+            ctx,
+        ) {
             Ok(value) => value,
             Err(e) => return self.raise_bif_error(module, e).map_err(Box::new).map(Some),
         };

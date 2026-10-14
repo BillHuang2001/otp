@@ -896,6 +896,11 @@ fn drive(
         machine: machine_ptr,
         x_regs,
         module: state.module,
+        // The run's entry module is fixed for the whole loop (a context switch only
+        // rebinds `module`/`labels`), so a helper can name a context-`0` frame against
+        // it — for the in-machine BIF-dispatch door, the raise funnel's context-`0`
+        // half, and the receive family's dispatch.
+        entry_module: module as *const Module,
         labels: state.labels,
         ctx: ctx_ptr,
         error: None,
@@ -1006,7 +1011,14 @@ fn drive(
         // the loop (the entry module is the caller's, a callee's is held by the machine
         // and by `state`).
         let step = unsafe {
-            (*machine_ptr).step_instruction(&*state.module, &*state.labels, func, pc, &mut *ctx_ptr)
+            (*machine_ptr).step_instruction_with_entry(
+                module,
+                &*state.module,
+                &*state.labels,
+                func,
+                pc,
+                &mut *ctx_ptr,
+            )
         };
         // The uniform raise funnel's second half, exactly as `Machine::drive` runs it:
         // `step_instruction` attached the frames itself when the raise happened in the

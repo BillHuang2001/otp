@@ -102,6 +102,8 @@ use beam_common::Result;
 use beam_loader::{Label, Module};
 use beam_term::Eterm;
 
+use crate::machine::Machine;
+
 /// The mailbox/message-receive seam: the receive opcode family's host interface.
 ///
 /// One method per receive opcode group; `beam_engine` drives them at instruction
@@ -309,7 +311,74 @@ pub trait ExecutionContext {
         args: &[Eterm],
     ) -> Result<Eterm>;
 
-    /// Ensure `heap_need` heap words are available (for `test_heap`/
+    /// The probe for the **in-machine** BIF-dispatch door
+    /// ([`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)).
+    ///
+    /// A host that returns `true` receives the *currently executing* [`Machine`]
+    /// and the run's **entry module** alongside every BIF dispatch, so a BIF
+    /// implementation can read the running process's execution state from *inside*
+    /// the call — the shape `erlang:process_info(self(), current_stacktrace)`
+    /// needs when it is reached through `gen_server:handle_common_reply/5`'s
+    /// `?STACKTRACE()`. The machine and the context are distinct objects at the
+    /// dispatch site, so this is the only way a `&mut self` context method can be
+    /// handed a `&Machine`.
+    ///
+    /// **Contract.** A host that returns `true` **must** also override
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine): the engine
+    /// then calls **only** that method, never [`call_bif`](ExecutionContext::call_bif).
+    ///
+    /// The answer is latched **once per run** by
+    /// [`Machine::drive`](crate::machine::Machine::drive), exactly like
+    /// [`wants_reduce`](ExecutionContext::wants_reduce), so a host that leaves the
+    /// default `false` keeps the plain `call_bif` path **byte-identical** and pays a
+    /// single `bool` load per dispatch instead of an extra vtable crossing.
+    fn wants_bif_in_machine(&self) -> bool {
+        false
+    }
+
+    /// The **entry-aware BIF-dispatch door**: the same dispatch as
+    /// [`call_bif`](ExecutionContext::call_bif), with the currently executing
+    /// [`Machine`] and the run's **entry module** handed in.
+    ///
+    /// The engine takes this door only when
+    /// [`wants_bif_in_machine`](ExecutionContext::wants_bif_in_machine) answered
+    /// `true` for the run (so a host that does not opt in never sees this method
+    /// called). `module`/`function`/`arity`/`args` are exactly
+    /// [`call_bif`](ExecutionContext::call_bif)'s; `machine` is the process state
+    /// the BIF is dispatching inside and `entry_module` is the module the run was
+    /// entered at.
+    ///
+    /// `entry_module` is the module [`Machine::drive`](crate::machine::Machine::drive)
+    /// was entered with — the module the **context-0** frames belong to. A
+    /// [`Machine`] borrows context `0` rather than owning it (see
+    /// [`Machine::current_module`](crate::machine::Machine::current_module)), so the
+    /// entry module cannot be recovered from `&Machine` and is threaded here
+    /// instead. It is what the machine's execution-position accessors expect for a
+    /// context-0 frame:
+    ///
+    /// * [`Machine::current_stacktrace`](crate::machine::Machine::current_stacktrace)
+    /// * [`Machine::current_function`](crate::machine::Machine::current_function)
+    /// * [`Machine::current_location`](crate::machine::Machine::current_location)
+    /// * [`Machine::initial_call`](crate::machine::Machine::initial_call)
+    ///
+    /// so a host calls, e.g.,
+    /// `machine.current_stacktrace(entry_module, self)`.
+    ///
+    /// The default body discards the two extra arguments and forwards to
+    /// [`call_bif`](ExecutionContext::call_bif), so **every existing implementor
+    /// compiles and behaves byte-identically**.
+    fn call_bif_in_machine(
+        &mut self,
+        machine: &Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let _ = (machine, entry_module);
+        self.call_bif(module, function, arity, args)
+    }    /// Ensure `heap_need` heap words are available (for `test_heap`/
     /// `allocate_heap`).
     ///
     /// The live root set is `x_regs[0..live)` plus the whole `stack`. A real context

@@ -1024,6 +1024,7 @@ fn call_ext_dispatch_seam_none_and_some_none_agree() {
     let resolved_here = Machine::new()
         .call_ext_dispatch(
             &module,
+            &module,
             &labels,
             ImportRef(0),
             1,
@@ -1037,6 +1038,7 @@ fn call_ext_dispatch_seam_none_and_some_none_agree() {
     // Reported by the host as declined: the same route, without re-asking.
     let host_declined = Machine::new()
         .call_ext_dispatch(
+            &module,
             &module,
             &labels,
             ImportRef(0),
@@ -1065,6 +1067,7 @@ fn call_ext_dispatch_honors_the_hosts_seam_answer_verbatim() {
 
     let step = Machine::new()
         .call_ext_dispatch(
+            &module,
             &module,
             &labels,
             ImportRef(0),

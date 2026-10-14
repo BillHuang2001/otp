@@ -450,7 +450,7 @@ fn apply_badarg_lands_in_a_live_catch_frame() {
 
     let instr = Instr::Apply { arity: 2 };
     let labels = LabelMap::new();
-    let step = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
+    let step = exec(&mut machine, &module, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
     assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
 
     // The C landing convention (beam_common.c:535-544): x0 = THE_NON_VALUE,
@@ -486,7 +486,7 @@ fn apply_last_badarg_lands_in_a_live_catch_frame() {
         deallocate: 0,
     };
     let labels = LabelMap::new();
-    let step = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
+    let step = exec(&mut machine, &module, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
     assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
     assert_eq!(machine.x(1), Some(make_atom(badarg)));
     assert_eq!(machine.frame_depth(), 1, "the `apply_last` frame is popped");
@@ -511,7 +511,7 @@ fn apply_badarg_without_a_catch_frame_is_the_typed_error() {
 
     let instr = Instr::Apply { arity: 2 };
     let labels = LabelMap::new();
-    let err = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx)
+    let err = exec(&mut machine, &module, &module, &labels, &instr, 0, 0, &mut ctx)
         .expect_err("a non-atom module must fail");
     assert!(matches!(err, BeamError::BadArg));
     assert_eq!(machine.catch_frame_depth(), 0);
@@ -535,7 +535,7 @@ fn apply_badarg_without_the_badarg_atom_falls_back_to_the_typed_error() {
 
     let instr = Instr::Apply { arity: 2 };
     let labels = LabelMap::new();
-    let err = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx)
+    let err = exec(&mut machine, &module, &module, &labels, &instr, 0, 0, &mut ctx)
         .expect_err("no `badarg` atom must fall back to the typed error");
     assert!(matches!(err, BeamError::BadArg));
     // The raise never started: the catch frame is untouched and nothing pending.
@@ -657,7 +657,7 @@ fn apply_last_reports_a_context_switch_when_the_continuation_is_in_another_modul
     };
     let labels = LabelMap::new();
     let step =
-        exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).expect("apply_last runs");
+        exec(&mut machine, &module, &module, &labels, &instr, 0, 0, &mut ctx).expect("apply_last runs");
     assert_eq!(
         step,
         Some(Step::Enter {
@@ -728,6 +728,7 @@ fn non_fun_variants_return_none() {
     let labels = LabelMap::new();
     let outcome = exec(
         &mut machine,
+        &module,
         &module,
         &labels,
         &Instr::Return,
@@ -894,6 +895,7 @@ fn apply_enters_a_resolved_callee_in_the_same_machine() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &labels,
         &Instr::Apply { arity: 2 },
         5,
@@ -985,6 +987,7 @@ fn apply_without_the_seam_keeps_the_synchronous_bif_path() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &labels,
         &Instr::Apply { arity: 2 },
         5,
@@ -1050,6 +1053,7 @@ fn apply_last_pops_its_frame_then_enters_a_resolved_callee() {
     let labels = LabelMap::new();
     let step = exec(
         &mut machine,
+        &module,
         &module,
         &labels,
         &Instr::ApplyLast {
@@ -1148,6 +1152,7 @@ fn call_fun_enters_a_resolved_local_closure_in_the_same_machine() {
     let labels = LabelMap::new();
     let step = exec(
         &mut machine,
+        &module,
         &module,
         &labels,
         &Instr::CallFun { arity: 1 },
@@ -1249,6 +1254,7 @@ fn call_fun2_enters_a_resolved_local_closure_via_its_operand() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &labels,
         &Instr::CallFun2 {
             tag: beam_loader::Operand::Atom(unspec),
@@ -1314,6 +1320,7 @@ fn a_resolve_local_fun_error_lands_in_a_live_catch_frame() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &LabelMap::new(),
         &Instr::CallFun { arity: 1 },
         0,
@@ -1358,6 +1365,7 @@ fn a_resolve_local_fun_error_without_a_catch_frame_is_the_typed_error() {
 
     let err = exec(
         &mut machine,
+        &module,
         &module,
         &LabelMap::new(),
         &Instr::CallFun { arity: 1 },
@@ -1404,6 +1412,7 @@ fn an_unsupported_capability_gap_from_the_seam_stays_uncatchable() {
 
     let err = exec(
         &mut machine,
+        &module,
         &module,
         &LabelMap::new(),
         &Instr::CallFun { arity: 1 },

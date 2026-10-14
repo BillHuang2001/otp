@@ -80,6 +80,9 @@ pub(crate) extern "C" fn jit_receive(rt: *mut JitRuntime<'_>, func: u32, pc: u32
         // SAFETY: `runtime.module` points at the module the driver is running, which
         // outlives the loop.
         let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.entry_module` points at the run's entry module, which the
+        // driver holds alive for the whole loop.
+        let entry_module = unsafe { &*runtime.entry_module };
         // SAFETY: `runtime.labels` points at the driver's `labels` local, which outlives
         // the loop.
         let labels = unsafe { &*runtime.labels };
@@ -108,7 +111,7 @@ pub(crate) extern "C" fn jit_receive(rt: *mut JitRuntime<'_>, func: u32, pc: u32
         // The receive family's own body (the entry the interpreter's `other` arm
         // reaches), so the mailbox seam calls, the operand reads/writes and the
         // `send` error landing are the family's, unchanged.
-        let step = crate::families::dispatch(machine, module, labels, instr, func, pc, ctx)
+        let step = crate::families::dispatch(machine, entry_module, module, labels, instr, func, pc, ctx)
             .map_err(Box::new);
         // The uniform raise funnel's context-`0` half, exactly as
         // `Machine::step_instruction` runs it: in context `0` the active module IS the

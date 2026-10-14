@@ -73,6 +73,7 @@ impl Machine {
     /// i.e. for every `bif0`) or branches to `fail`.
     pub(super) fn exec_bif(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         bif: ImportRef,
@@ -90,11 +91,19 @@ impl Machine {
             for (slot, arg) in buf.iter_mut().zip(args) {
                 *slot = read_operand(self, ctx, arg)?;
             }
-            ctx.call_bif(module_name, function_name, arity, &buf[..args.len()])
+            self.dispatch_bif_call(
+                entry_module,
+                module_name,
+                function_name,
+                arity,
+                &buf[..args.len()],
+                ctx,
+            )
         } else {
             // `?` propagates a *marshalling* error (a bad operand) as the typed error
             // the instruction already returned — never as a guard failure or a raise.
             self.dispatch_wide(
+                entry_module,
                 module_name,
                 function_name,
                 arity,
@@ -139,6 +148,7 @@ impl Machine {
     /// [`Result`] is the BIF's own outcome.
     fn dispatch_wide(
         &mut self,
+        entry_module: &Module,
         module: &str,
         function: &str,
         arity: u32,
@@ -151,7 +161,7 @@ impl Machine {
         scratch.reserve(len);
         let marshalled = fill(self, &mut *ctx, &mut scratch);
         let outcome = match marshalled {
-            Ok(()) => Ok(ctx.call_bif(module, function, arity, &scratch)),
+            Ok(()) => Ok(self.dispatch_bif_call(entry_module, module, function, arity, &scratch, ctx)),
             Err(e) => Err(e),
         };
         // Give the (now empty) buffer back so the next wide call reuses it.
@@ -173,6 +183,7 @@ impl Machine {
     /// exactly as before this seam.
     pub(super) fn call_import(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         target: ImportRef,
@@ -180,7 +191,14 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
         let (module_name, function_name, bif_arity) = labels.import_target(module, target)?;
-        self.call_bif_named(module_name, function_name, bif_arity, arity, ctx)
+        self.call_bif_named(
+            entry_module,
+            module_name,
+            function_name,
+            bif_arity,
+            arity,
+            ctx,
+        )
     }
 
     /// Marshal the register arguments `x(0..nregs)` and dispatch
@@ -206,6 +224,7 @@ impl Machine {
     /// `Err`, exactly as the call sites expect.
     pub(crate) fn call_bif_named(
         &mut self,
+        entry_module: &Module,
         module_name: &str,
         function_name: &str,
         bif_arity: u32,
@@ -219,16 +238,19 @@ impl Machine {
                     .x(i as u32)
                     .ok_or_else(|| error::bad_register(i as u32))?;
             }
-            ctx.call_bif(
+            self.dispatch_bif_call(
+                entry_module,
                 module_name,
                 function_name,
                 bif_arity,
                 &buf[..nregs as usize],
+                ctx,
             )
         } else {
             // A marshalling error and a BIF failure are the same `Err` to this
             // function's callers (both are raised), so the two are flattened.
             self.dispatch_wide(
+                entry_module,
                 module_name,
                 function_name,
                 bif_arity,
@@ -242,6 +264,43 @@ impl Machine {
                 },
             )
             .and_then(|result| result)
+        }
+    }
+
+    /// Dispatch a BIF through the host, taking the **in-machine** door when the
+    /// host asked for it ([`ExecutionContext::wants_bif_in_machine`](crate::context::ExecutionContext::wants_bif_in_machine),
+    /// latched into [`Machine::bif_in_machine_on`](crate::machine::Machine) once per
+    /// run by [`Machine::drive`](crate::machine::Machine::drive)).
+    ///
+    /// This is the **single** BIF-dispatch funnel the engine's marshalling helpers
+    /// call, so the two doors can never drift:
+    ///
+    /// * gate **off** (the default, every existing host): the plain
+    ///   [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif)
+    ///   with the same arguments — byte-identical to the pre-seam engine, one `bool`
+    ///   load and no extra vtable crossing;
+    /// * gate **on**: [`ExecutionContext::call_bif_in_machine`](crate::context::ExecutionContext::call_bif_in_machine)
+    ///   with `self` (the live machine) and `entry_module` (the run's entry module,
+    ///   which the host needs to name a context-`0` frame) handed in alongside the
+    ///   same `module`/`function`/`arity`/`args`.
+    ///
+    /// `entry_module` is the module the run was entered at — the same one
+    /// [`Machine::drive`](crate::machine::Machine::drive) threads down from its own
+    /// entry module argument. It is unused when the gate is off.
+    #[inline]
+    pub(crate) fn dispatch_bif_call(
+        &self,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Eterm> {
+        if self.bif_in_machine_on {
+            ctx.call_bif_in_machine(self, entry_module, module, function, arity, args)
+        } else {
+            ctx.call_bif(module, function, arity, args)
         }
     }
 
