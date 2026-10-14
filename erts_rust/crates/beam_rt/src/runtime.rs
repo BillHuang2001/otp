@@ -2683,8 +2683,8 @@ mod tests {
         //   1. the **root process**, registered as `init` (`erlang:whereis(init)` answers it —
         //      the oracle answers `<0.0.0>`), which every action runs as; and
         //   2. the native **`file_server_2` service** (contract A.9), a `Runnable`,
-        //      never-enqueued process that answers the OTP file protocol the boot script needs
-        //      (`src/native/file_server.rs`).
+        //      never-enqueued process that answers the OTP file protocol on the routes where it
+        //      owns the name (`src/native/file_server.rs`).
         assert_eq!(rt.processes().len(), 2);
         for name in ["init", "file_server_2"] {
             let atom = rt

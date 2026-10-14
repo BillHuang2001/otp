@@ -1212,7 +1212,7 @@ mod tests {
     fn the_real_start_boot_completes_through_execute_reporting() {
         // The **whole** script in one pass: `execute_reporting` returns `Ok(())` — all 22
         // directives run, including the final `{apply,{c,erlangrc,[]}}` at instruction 20
-        // (which needs the native `file_server_2` service) and the closing
+        // (answered by the booted `kernel_sup`'s own `file_server` child) and the closing
         // `{progress,started}` — so there is no `BootStop` to report on this path.
         //
         // The three kernel processes must survive their short-lived directive processes'

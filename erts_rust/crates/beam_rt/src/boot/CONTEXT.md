@@ -388,20 +388,12 @@ normal installation pays **no** `erl` start-up (measured on this host: `run …s
   default.
 
 ## Notes for Agents — the `file_server_2` service
-The runtime-native **`file_server_2` service** (`../native/file_server.rs`) is what the boot chain's
-final `{apply,{c,erlangrc,[]}}` directive (index 20) reaches — **not** the real
-`file_server`/`file_io_server` Erlang. The
-service is a `beam_process::Process` born `Runnable` and never enqueued (the `init`/`self_pid`
-precedent), so the runner never executes it and `ProcessEntry` needs no new variant;
-`Runtime::service_file_requests` drains its mailbox as an additive `scheduler_pass` step and delivers
-the replies, which is what lets `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete.
-**It is registered under `file_server_2` on every route except the boot-script one.** `Runtime::new`
-consults `RuntimeConfig::boot_script()` and, when the runtime is driving a real `-boot FILE` boot,
-spawns the service **unregistered** (`FileServices::start_unclaimed`) so that the booted `kernel_sup`'s
-own `file_server_2` child owns the name — an initial child start that finds the name already taken
-aborts that supervisor, and `kernel` is `permanent`. The request/reply surface, the errno mapping, the
-io-device and the remaining gaps live in
-[`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
+The runtime-native **`file_server_2` service** (`../native/file_server.rs`) supplies the service under that name on every route **except** the boot-script one.
+The service is a `beam_process::Process` born `Runnable` and never enqueued (the `init`/`self_pid` precedent), so the runner never executes it and `ProcessEntry` needs no new variant.
+`Runtime::service_file_requests` drains its mailbox as an additive `scheduler_pass` step and delivers the replies, which is what lets a `gen_server:call(file_server_2, …)` to the native service complete.
+**It is registered under `file_server_2` on every route except the boot-script one.** `Runtime::new` consults `RuntimeConfig::boot_script()` and, when the runtime is driving a real `-boot FILE` boot, spawns the service **unregistered** (`FileServices::start_unclaimed`) so that the booted `kernel_sup`'s own `file_server_2` child owns the name — an initial child start that finds the name already taken aborts that supervisor, and `kernel` is `permanent`.
+On the boot-script route the boot chain's final `{apply,{c,erlangrc,[]}}` directive (index 20) is answered by that booted child — OTP's own `file_server`/`file_io_server` Erlang — not by the native service; `c:erlangrc/0`'s `gen_server:call` at instruction 20 completes through it.
+The request/reply surface, the errno mapping, the io-device and the remaining gaps live in [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
 - **The native service is used instead of the real `file_server`.** The real Erlang
   `file_server`/`file_io_server` needs the wider `prim_file` NIF surface this runtime does not serve;
   the native `std::fs`-backed service answers the requests it can honour faithfully and returns the
@@ -422,5 +414,5 @@ io-device and the remaining gaps live in
 - `../cli.rs` → the `Action::Boot` arm (`-boot FILE`) that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
-- `../native/file_server.rs` → the native `file_server_2` service the script's final `{apply,{c,erlangrc,[]}}` reaches (not owned here; see `../native/CONTEXT.md`)
+- `../native/file_server.rs` → the native `file_server_2` service, registered under that name on every route except the boot-script one (not owned here; see `../native/CONTEXT.md`)
 - `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the boot's `{apply, …}` chains are entered through; read-only from this node)

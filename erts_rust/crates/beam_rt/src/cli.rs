@@ -1288,7 +1288,8 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
 /// The real `start.boot` runs to completion: all 22 directives execute and the script ends at
 /// the final `{progress,started}` (index 21), so the CLI exits 0 with empty stdout and stderr.
 /// The tail directives are served in-node — `{apply,{c,erlangrc,[]}}` (index 20) issues a
-/// `{open, …}` of `$HOME/.erlang` that the native `file_server_2` service answers. Per-directive
+/// `{open, …}` of `$HOME/.erlang` that the booted `kernel_sup`'s own `file_server_2` child
+/// answers (on this route the native service is spawned **unregistered**). Per-directive
 /// detail is in [`crate::boot`].
 fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {    runtime.boot()?;
     let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;

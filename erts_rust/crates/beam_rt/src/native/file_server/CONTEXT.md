@@ -1,13 +1,10 @@
 # `beam_rt/src/native/file_server/` — the native `file_server_2` service (contract A.9)
 ## Intent
-The runtime-native **file service** answering the OTP file protocol. `lib/kernel/src/file.erl`
-routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`,
-and the file service is *reached* at the final `{apply,{c,erlangrc,[]}}` directive of
-`bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
-`FileServices` supplies that service. It is **not** a BIF: it is a process plus a
-scheduler-pass step. On the **boot-script route** (`-boot FILE`) it is spawned **unregistered** — the
-booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name; on every other route it
-is the registered `file_server_2`.
+The runtime-native **file service** answering the OTP file protocol.
+`lib/kernel/src/file.erl` routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`.
+`FileServices` supplies that service: it is **not** a BIF, but a process plus a scheduler-pass step.
+It is the registered `file_server_2` on every route **except** the **boot-script route** (`-boot FILE`), where it is spawned **unregistered** because the booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name.
+On the boot-script route that booted child answers every request — including the final `{apply,{c,erlangrc,[]}}` directive of `bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
 `file_server.rs` (this node's parent) owns the service; `setopts.rs`, `file_info.rs`, `get_until.rs`
 and `get_line.rs` are its child modules; `tests.rs` is its colocated unit suite.
 ## API Surface

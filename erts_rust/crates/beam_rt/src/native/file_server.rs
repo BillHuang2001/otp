@@ -23,9 +23,11 @@
 //! The last directive of the real `bootstrap/bin/start.boot` that does real work is
 //! `{apply,{c,erlangrc,[]}}`, and `c:erlangrc/0` (`lib/stdlib/src/c.erl:1049-1083`) reaches
 //! the file system through `file:path_eval/2` → `file:open/2` →
-//! `gen_server:call(file_server_2, {open,Name,ModeList}, infinity)`. The service process
-//! registered under that name is what makes this directive succeed, so the boot script runs
-//! to completion (its final directive is `{progress,started}`). Without that service the call
+//! `gen_server:call(file_server_2, {open,Name,ModeList}, infinity)`. Whichever process owns
+//! the `file_server_2` name answers it: on a **boot-script** run that is the booted
+//! `kernel_sup`'s own `file_server` child (this module's service is then spawned **unclaimed**,
+//! see `FileServices::start_unclaimed`), and on every other route this module's service is
+//! the one registered under the name. With no service registered under that name the call
 //! would die with the oracle-shaped
 //! `{noproc,{gen_server,call,[file_server_2,…]}}` and the boot would stop there.
 //!
@@ -299,7 +301,7 @@ impl Runtime {
     /// `Runnable` and therefore is **not** moved onto the run queue by the delivery; the
     /// caller resumes through the engine's blocking-aware entry (`RunOutcome::Wait` →
     /// `Machine::resume_outcome`), not through a scheduler slice. Counting the reply into
-    /// the pass's `delivered` total is what tells the boot's drive that its blocked call
+    /// the pass's `delivered` total is what tells a bounded drive that its blocked call
     /// can make progress — a serviced-only pass must never look like "nothing happened".
     ///
     /// # Errors

@@ -22,11 +22,11 @@
 //!
 //! `lib/kernel/src/file.erl` routes every non-`raw` file operation through
 //! `gen_server:call(file_server_2, Request, infinity)` (`file.erl`'s `check_and_call/2` and
-//! `call/2`), and `c:erlangrc/0` — the last directive of the real
-//! `bootstrap/bin/start.boot` — is the first such caller. `beam_rt`'s
-//! [`FileServices`](../../src/native/file_server.rs) supplies the missing service process,
-//! so these tests drive the real `file:*` client code over **real temporary files and
-//! directories** and cross-check every answer against the live `erl`.
+//! `call/2`). `beam_rt`'s [`FileServices`](../../src/native/file_server.rs) supplies the
+//! service process that owns the `file_server_2` name on every route except a `-boot FILE`
+//! boot (there the booted `kernel_sup`'s own `file_server` child owns it), so these tests
+//! drive the real `file:*` client code over **real temporary files and directories** and
+//! cross-check every answer against the live `erl`.
 //!
 //! Two shapes are pinned:
 //!

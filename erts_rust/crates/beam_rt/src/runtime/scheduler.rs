@@ -590,11 +590,11 @@ impl Runtime {
             // The **native-service half**: drain the `file_server_2` service's and its
             // io-devices' mailboxes and deliver each reply into the requesting process's
             // mailbox (contract A.9, `src/native/file_server.rs`). A reply is what lets a
-            // caller blocked in `gen_server:call`'s `receive` make progress — the boot's
-            // `{apply,{c,erlangrc,[]}}` directive — so it is counted into `delivered`; the
-            // requesting process is normally the runtime's own `Runnable` `self_pid`, which
-            // the delivery therefore does **not** enqueue, and which resumes through the
-            // engine's blocking-aware entry rather than a scheduler slice.
+            // caller blocked in `gen_server:call`'s `receive` make progress — a `file:*`/`io:*`
+            // call on a route where the native service owns the name — so it is counted into
+            // `delivered`; the requesting process is normally the runtime's own `Runnable`
+            // `self_pid`, which the delivery therefore does **not** enqueue, and which resumes
+            // through the engine's blocking-aware entry rather than a scheduler slice.
             match self.service_file_requests(&mut table) {
                 Err(err) => break Err(err),
                 Ok(0) => {}
