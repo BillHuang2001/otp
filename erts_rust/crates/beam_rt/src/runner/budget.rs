@@ -67,7 +67,7 @@ use beam_common::Result;
 use beam_engine::context::RootSet;
 use beam_engine::{ExecutionContext, Machine};
 use beam_loader::{Label, Module};
-use beam_term::Eterm;
+use beam_term::{Atom, Eterm};
 
 use crate::context::RuntimeContext;
 
@@ -280,7 +280,21 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::resolve_local_call(self.inner, module, function, arity)
     }
 
-    /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine resolves a runtime atom value
+    /// (a variable `M`/`F` in `apply(M,F,A)` / `M:F(...)`) here: without the forward the trait
+    /// default would index only the running module's load-time snapshot, so a module loaded
+    /// early could not name an atom interned later. That is exactly the A.9 boot shape —
+    /// `gen_server:init_it/6` evaluates `{ok, Mod:init(Args)}` with a `Mod` interned after
+    /// `gen_server` was loaded — so forwarding reaches
+    /// [`RuntimeContext`]'s own override (the runtime's live shared namespace) and the resolution
+    /// succeeds instead of raising `badarg`.
+    fn atom_name(&self, module: &Module, atom: Atom) -> Option<String> {
+        ExecutionContext::atom_name(self.inner, module, atom)
+    }    /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
     /// for that one admission point first.
     ///
     /// This wrapper's [`ensure_heap`](ExecutionContext::ensure_heap) is reached by the

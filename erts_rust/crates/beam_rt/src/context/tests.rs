@@ -69,6 +69,47 @@ fn a_bif_builds_an_atom_from_the_shared_table() {
     );
 }
 
+/// **The `atom_name` seam resolves through the runtime's LIVE namespace, not the running
+/// module's load-time snapshot** — the engine-side half of the A.9 boot blocker.
+///
+/// [`Module::atom_name`](beam_loader::Module::atom_name) indexes only the module's **owned
+/// load-time prefix clone** of the shared table (`CodeServer::load_bytes` hands
+/// `lower::build_module` an `atoms().clone()`), so a module loaded *before* a name was interned
+/// cannot name that atom — its id lies beyond the snapshot. The engine resolves a runtime atom
+/// value (the `Mod` in `Mod:init(Args)` / `apply(M,F,A)`) through
+/// [`ExecutionContext::atom_name`], and on the boot path `gen_server:init_it/6` names
+/// `supervisor_bridge` — interned by a later boot-script directive — so the trait default
+/// answered `None` and the call raised `badarg`.
+///
+/// This case interns a fresh name **after** loading a fixture and asserts both halves: the
+/// module's own table still cannot name it (the premise), while the context's seam does (the
+/// override). Removing the override makes the second assertion fail.
+#[test]
+fn the_atom_name_seam_names_an_atom_interned_after_the_module_loaded() {
+    let mut rt = runtime();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the fixture loads into the code server");
+    let module = rt
+        .code_server()
+        .module_handle("gc_floats")
+        .expect("the fixture is cached under its own name");
+
+    // Interned through the shared table, so its id is exactly one past the module's snapshot.
+    let name = "an_atom_interned_after_gc_floats_loaded";
+    let atom = rt.code_server_atoms_mut().intern(name);
+    assert!(
+        module.atom_name(atom).is_none(),
+        "the name is beyond the module's load-time snapshot (the premise of the boot blocker)"
+    );
+
+    let ctx = RuntimeContext::new(&mut rt);
+    assert_eq!(
+        ExecutionContext::atom_name(&ctx, &module, atom).as_deref(),
+        Some(name),
+        "the seam resolves the runtime atom through the live shared namespace"
+    );
+}
+
 #[test]
 fn the_pending_interner_predicts_append_only_indices_and_dedups() {
     let mut interner = PendingInterner::new(10);
