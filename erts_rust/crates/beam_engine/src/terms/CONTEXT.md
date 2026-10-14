@@ -69,8 +69,11 @@ is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
 - **`reserve_slack(machine, ctx, n) -> Slack`** — reserve `n` words rooted and wrap the
   **whole** region in a `Slack`; the entry point for a multi-node build (below).
 - **`Sink`** (`sink.rs`) — the node-shape abstraction a shape writer carves from:
-  `tuple(&[Eterm])` (arityval + elements) and `list(&[Eterm])` (contiguous `[CAR,CDR]` cells,
-  empty ⇒ `NIL`). Two implementations, **one** definition per node shape:
+  `tuple(&[Eterm])` (arityval + elements), `list(&[Eterm])` (contiguous `[CAR,CDR]` cells,
+  empty ⇒ `NIL`) and `cons(car, cdr)` (a single `[CAR|CDR]` cell — the one-node **prepend**
+  primitive, for a writer whose graph is not a single proper list, e.g. a synthesized
+  callee head item consed in front of a carved frame list). Two implementations, **one**
+  definition per node shape:
   - `impl Sink for Slack` — the **rooted** sink: every node is carved out of the one
     reservation via the bump cursor (`Slack::alloc_words`). Nothing touches the context heap,
     so nothing can collect between nodes and the nodes already written (whose pointers are not
@@ -115,7 +118,7 @@ is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
 - `slack.rs` → the rooted reserve seam, `Slack` (bump cursor, `alloc_words`, `integer`),
   `reserve`, `reserve_slack`; the reserve→read→write contract in the module docs.
 - `sink.rs` → the `Sink` trait, `impl Sink for Slack` (rooted carve), `ContextSink` (unrooted),
-  and the shared `write_tuple_at`/`write_list_at` node writers.
+  and the shared `write_tuple_at`/`write_list_at`/`write_cons_at` node writers.
 - `construct.rs` → the classic tuple/cons/list/`badmatch_reason`/heap-binary builders **and**
   their `*_rooted` twins.
 - `number.rs` → the classic `make_float`/`make_integer` **and** the `*_rooted` twins, plus

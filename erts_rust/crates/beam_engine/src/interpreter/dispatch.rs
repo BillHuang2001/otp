@@ -35,6 +35,7 @@ use beam_term::{
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::families;
+use crate::families::exceptions::callee;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
 use crate::machine::{Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
@@ -907,7 +908,21 @@ impl Machine {
                     },
                     None => match self.call_import(module, labels, target, arity, ctx) {
                         Ok(value) => ApplyTarget::Called(value),
-                        Err(e) => return self.raise_bif_error(module, e).map_err(Box::new),
+                        Err(e) => {
+                            // An import the host cannot resolve raises `undef`, and the
+                            // oracle's cooked trace then names the **callee** with its
+                            // argument list as the innermost item (C's
+                            // `erts_build_mfa_item` with the exception's saved args —
+                            // see [`callee`]). The import table names the callee and the
+                            // instruction's own `arity` operands hold its arguments, so
+                            // the item is synthesized here (a no-op for any other error
+                            // shape, or when the raise cannot land).
+                            let head =
+                                callee::import_callee_head_item(self, ctx, module, target, arity, &e)?;
+                            return self
+                                .raise_bif_error_with_head(module, e, head)
+                                .map_err(Box::new);
+                        }
                     },
                 }
             };
