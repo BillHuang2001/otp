@@ -1,12 +1,12 @@
 # `beam_engine` JIT measurement harnesses (`src/jit/bench/`)
 
 ## Intent
-The in-crate measurement harness for the execution tiers, over **twelve** workloads split by lowering
-story. It is a `pub mod` (not `#[cfg(test)]`) because the `#[test]` entry points live in the
+The in-crate measurement harness for the execution tiers, over **thirteen** workloads split by
+lowering story. It is a `pub mod` (not `#[cfg(test)]`) because the `#[test]` entry points live in the
 integration test `tests/jit_bench.rs`, which cannot see a `#[cfg(test)]` lib module; the library only
 exposes two plain functions and the harness itself is never on the engine's execution path.
 
-Twelve workloads, split by how the baseline tier lowers them:
+Thirteen workloads, split by how the baseline tier lowers them:
 
 * **Deopted** (every instruction is a `jit_step_one` helper round-trip on a native tier) — in
   `workloads.rs`: **`build/0`** (`put_tuple2`/`put_list` term building), **`map/2`**
@@ -51,6 +51,28 @@ Twelve workloads, split by how the baseline tier lowers them:
   measurement is the `call_ext` **seam**, not the arithmetic. The loop `allocate`s its own frame first
   and `deallocate`s it before the final `return` — a `run_export` body's bottom frame is the `Halt`
   frame, so the frame discipline is load-bearing.
+* **Message passing** — in `send_recv.rs`: **`send_recv/2`**, a tail-recursive loop that `send`s
+  `{Self, N}` to itself and `receive`s it straight back through the `Mailbox` seam, folding the
+  payload into an accumulator. It is the in-process counterpart of the runtime-level two-process
+  `send_recv` copy loop whose default-tier 2.15×–3.31× regression is recorded in
+  `../../../../../../tools/bench/RESULTS.md` §8 item 2. The module is the compiled lowering of
+  `send_recv(0, Acc) -> Acc; send_recv(N, Acc) -> Self ! {Self, N}, receive {Self, T} ->
+  send_recv(N - 1, Acc + T) end` — the same instruction sequence the installed `erlc` emits, with
+  `self/0` replaced by a small-int constant in `Y(0)` (one `MinimalContext` process has no `self/0`
+  BIF). Per round, **eight** instructions deopt to `jit_step_one` (the `allocate_heap` frame push,
+  the `put_tuple2` message build, `send`, `loop_rec`, `remove_message`, the two `Y`-operand
+  `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`), while the rest of the body is
+  inlined (the entry clause `is_eq_exact`, the four `move`s, the `is_tuple`/`test_arity` header
+  tests, the two `get_tuple_element`s, `swap`, `call_last`). The mailbox is `LoopbackMailbox`, a
+  one-process FIFO whose `send_message` enqueues the message the very next `receive` scans, so the
+  `wait` arm is present in the shape but never reached; its scan position is a **saturating**
+  cursor with `beam_message::Queue`'s `QueueCursor` semantics, and the `recv_marker_*` opcodes are
+  served over the same cursor (`workloads.rs`'s `Workload::with_mailbox`/`install_mailbox` are the
+  seam's host half). Unlike every other workload it is **not** deopt-only: the inlined
+  body work outweighs the eight deopts, so the tier is net *faster* here (see the measurement
+  below) — the runtime-level regression is therefore a runtime-glue effect (the second process,
+  the blocking `receive`/resume cycle, the scheduler, the ETF cop), **not** an engine-tier effect
+  on this compiled shape.
 
 ## API Surface (crate-visible; `crate::jit::bench::…`)
 - `support` (`pub(crate) mod`) — the scaffolding shared with the sibling Cranelift harness
@@ -59,13 +81,14 @@ Twelve workloads, split by how the baseline tier lowers them:
   (`new`/`with_plus`/`import`/`add`/`finish`/`intern`), `Samples` (feature-gated on `jit-cranelift`;
   `min`/`median`) and the report primitives `ns_per_op`/`ops_per_sec`.
 - `workloads` — the `Workload` type (module + exported `function/arity` + argument source + a value
-  check pinning the intended result + an optional `CrossCall`), the five `workloads.rs` builders
-  (four deopted plus `sum/1`),
+  check pinning the intended result + an optional `CrossCall` + an optional mailbox factory), the
+  five `workloads.rs` builders (four deopted plus `sum/1`),
   the cross-module pair, their round constants
   (`BUILD_ROUNDS`/`MAP_ROUNDS`/`SELECT_ROUNDS`/`WALK_LENGTH`/`SUM_LENGTH`/`CROSS_STEPS`,
   `CALL_EXT_ROUNDS`/`CALL_EXT_INCREMENT`, `TIMED_RUNS`/`AGREEMENT_RUNS`) and the in-context argument
-  builders (`map_args`/`walk_args`/`sum_args`); `workloads()` returns all twelve (the seven here plus
-  `inlined::inlined_workloads()`), and `sum_workload()`'s `Y`-operand/`Y`-destination `gc_bif` is
+  builders (`map_args`/`walk_args`/`sum_args`); `workloads()` returns all thirteen (the seven here
+  plus `inlined::inlined_workloads()` plus `send_recv::send_recv_workload()`), and
+  `sum_workload()`'s `Y`-operand/`Y`-destination `gc_bif` is
   pinned by a `#[cfg(test)]` shape guard
   (`tests::the_sum_workload_keeps_its_y_slot_operand_and_destination`), so the workload cannot quietly
   stop exercising the `Y` operand/destination shape the inlined frame-window path handles — as is
@@ -77,29 +100,55 @@ Twelve workloads, split by how the baseline tier lowers them:
   caller resolves and the callee's export **entry** label; `Workload::with_cross` attaches it and
   `Workload::install_cross(ctx)` installs the `ExternalResolver` answering **both** ping-pong
   directions (the callee handle, and a handle to the workload's own module for the return hop),
-  leaving every other import on the synchronous `call_bif` path.
+  leaving every other import on the synchronous `call_bif` path. `Workload::with_mailbox` attaches a
+  `fn() -> Box<dyn Mailbox>` factory and `Workload::install_mailbox(ctx)` calls it once per
+  measurement and hands the result to `MinimalContext::set_mailbox`, so every run starts from an
+  empty mailbox; a workload without one keeps the receive seam's typed `unsupported` default.
 - `inlined` — the five tier-inlined workload builders and their pinned result constants
   (`FIB_RESULT`/`KERNEL_RESULT`/`WIDE_RESULT`/`AGGR_RESULT`, `pub(super)` for `checks`).
-- `checks` — the twelve per-workload result checks (`verify_build`/`verify_map`/`verify_select`/
+- `send_recv` — the `send_recv/2` message-passing loopback builder, its `SEND_RECV_ROUNDS`
+  parameter, and the host half of the receive seam: `new_mailbox() -> Box<dyn Mailbox>` and
+  `LoopbackMailbox`, a one-process FIFO over a `VecDeque<Eterm>` with a saturating `cursor`
+  (`send_message` enqueues, `receive_next` reads at the cursor, `receive_skip` advances with
+  saturation, `receive_remove` unlinks at the cursor and repositions at the first message,
+  `receive_reset` repositions at the first message) plus the `recv_marker_*` group served over the
+  same cursor (`reserved` marker→position, `bound` reference→marker; an unknown marker/reference is
+  a typed `unsupported`, never a silent no-op). Its two `#[cfg(test)]` guards are
+  `tests::the_send_recv_workload_keeps_its_send_and_receive_shape` (the `send`/`loop_rec`/
+  `loop_rec_end`/`wait`/`remove_message`/`put_tuple2`/bound-match counts) and
+  `tests::the_loopback_mailbox_completes_the_send_receive_loop` (the mailbox round-trips the whole
+  64-step loop without ever suspending and returns the triangular sum).
+- `checks` — the thirteen per-workload result checks (`verify_build`/`verify_map`/`verify_select`/
   `verify_walk`/`verify_sum`/`verify_fib`/`verify_kernel`/`verify_wide`/`verify_aggr`/`verify_cmp`/
-  `verify_cross`/`verify_call_ext`), each `fn(&Workload, Eterm) -> Result<(), String>`.
+  `verify_cross`/`verify_call_ext`/`verify_send_recv`), each
+  `fn(&Workload, Eterm) -> Result<(), String>`.
   `verify_cross` pins the exported result to `CROSS_STEPS`, which a loop that ran a different number
   of transfers cannot produce; `verify_sum` pins the triangular sum
   `SUM_LENGTH * (SUM_LENGTH + 1) / 2`; `verify_call_ext` pins
   `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT`, which a loop that skipped, repeated or reordered a declined
-  `call_ext` cannot produce.
+  `call_ext` cannot produce; `verify_send_recv` pins the triangular sum
+  `SEND_RECV_ROUNDS * (SEND_RECV_ROUNDS + 1) / 2`, which a loop that skipped, repeated or corrupted a
+  `send` + `receive` round-trip cannot produce.
 - `mod.rs` — the tier seam (`Runner`), the timing loop (`Measurement`) and the reporting
   (`report`/`bench_workload`), plus the two public entry points `assert_tier_agreement()` (fast, the
   agreement half) and `run_measurement_table()` (the `#[ignore]`d timing table). `Measurement::run`
-  installs the workload's cross-module resolver (when it has one) right after the BIF hook.
+  installs the workload's cross-module resolver (when it has one) and its mailbox (when it has one)
+  right after the BIF hook.
 
 ## Constraints
 - Wired by `pub mod bench;` in `../mod.rs`; the crate-public surface is the two entry functions only
   (the internal `mod`s stay `pub(crate)`/`pub(super)`).
-- Uses only the crate's own seams (`JitBackend`, `Machine::run_export`, `MinimalContext`); a native
-  tier is compiled **once** per measurement (outside the timed loop) and only `run_compiled` is timed.
+- Uses only the crate's own seams (`JitBackend`, `Machine::run_export`, `MinimalContext`,
+  `context::Mailbox`); a native tier is compiled **once** per measurement (outside the timed loop)
+  and only `run_compiled` is timed.
   `cross/2` needs no pre-compiled callee: the tier's own per-thread code cache compiles it on first
   sight, through the driver's cross-module transfer.
+- The mailbox is the harness's **only** receive-seam host. `send_recv/2` drives a non-blocking
+  loopback (the `send` delivers the message the very next `loop_rec` reads), so its `wait` arm is
+  never taken and the harness's non-blocking `run_export` never sees a suspend. That is deliberate:
+  `MinimalContext` runs **one** process with no scheduler, so a genuinely blocking receive is not
+  expressible here — the runtime-level blocking shape is measured by the external driver
+  (`../../../../../../tools/bench/`), not by this table.
 - `support` is the **single** home for the scaffolding both in-crate harnesses share; do not re-add a
   private copy in either harness.
 - Measurement strategy is **not** shared: this module's fixed-order tier table and the ABBA paired
@@ -117,58 +166,78 @@ Twelve workloads, split by how the baseline tier lowers them:
   the untouched **interpreter** column move ~17 %), so quote a **min over ≥3 runs** and compare only
   figures from the same run set.
 
-## Measured: `sum/1` — the `Y`-slot `'+'` path is native (min of 4 timed runs)
+## Measured: `sum/1` — the `Y`-slot `'+'` path is native (min of 3 timed runs)
 `sum/1` is the harness's **partially inlined** workload: the small-int `'+'/2` `gc_bif` names a `Y`
 operand (the head survives in `Y(0)` across the non-tail recursive call) and writes a `Y` destination
 (`{y,1}`), and the tier inlines both behind its per-block published frame window, as it does the
 `Move` guarding the recursion. `sum/1` is therefore **not** a deopt-dominated twin of `walk/2`: min of
-4 timed runs is interpreter **4004.1 ns/op** vs baseline-jit **2392.3 ns/op**, i.e. baseline ≈
-**1.67×** the interpreter. The per-level deopts that remain are the `Allocate{2}` frame push and the
+3 timed runs is interpreter **4718.7 ns/op** vs baseline-jit **2675.8 ns/op**, i.e. baseline ≈
+**1.76×** the interpreter. The per-level deopts that remain are the `Allocate{2}` frame push and the
 **non-tail** local `Call`; the call's continuation `pc + 1` — which `beam_loader` does not cut a block
 at — has its own native **continuation sub-block**, so the driver re-enters natively at the post-call
 continuation instead of stepping the block tail one interpreter instruction at a time. Both tiers pin
 the exact triangular sum (`SUM_LENGTH * (SUM_LENGTH + 1) / 2` = 2080).
 
-Full min-of-4 table (min per column), `ns/op` (interpreter → baseline-jit), from
+Full min-of-3 table (min per column), `ns/op` (interpreter → baseline-jit), from
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench -- --ignored --nocapture`
-(`/proc/loadavg` `0.85 5.15 5.68` before run 1, `2.17 5.24 5.70` before runs 2–4):
-`build/0` 8215.4 → 7269.7 (1.13×) · `map/2` 9108.4 → 8339.3 (1.09×) ·
-`select/1` 1971.2 → 1272.1 (1.55×) · `walk/2` 2142.9 → 419.7 (5.11×) ·
-**`sum/1` 4004.1 → 2392.3 (1.67×)** · `slice:fib/1` 1278.8 → 423.6 (3.02×) ·
-`kernel/2` 3168.1 → 546.0 (5.80×) · `wide/2` 4270.0 → 553.5 (7.71×) ·
-`aggr/2` 7422.3 → 2188.7 (3.39×) · `cmp/2` 6824.0 → 1465.2 (4.66×) ·
-`cross/2` 6852.5 → 6731.2 (1.02×) · `call_ext/0` 8522.2 → 5280.8 (1.61×). Every workload is faster on
-the baseline tier in this run set, `cross/2` only marginally (at parity); quote only ratios from **one**
+(`/proc/loadavg` `23.12 19.00 11.23` before runs 1–2, `21.59 18.75 11.19` before run 3):
+`build/0` 7222.4 → 7154.9 (1.01×) · `map/2` 10205.5 → 8979.8 (1.14×) ·
+`select/1` 2210.1 → 1363.6 (1.62×) · `walk/2` 2388.7 → 432.5 (5.52×) ·
+**`sum/1` 4718.7 → 2675.8 (1.76×)** · `slice:fib/1` 1493.9 → 447.2 (3.34×) ·
+`kernel/2` 4423.5 → 552.6 (8.00×) · `wide/2` 5549.9 → 573.7 (9.67×) ·
+`aggr/2` 8447.2 → 2228.0 (3.79×) · `cmp/2` 9062.4 → 1483.9 (6.11×) ·
+`cross/2` 7465.3 → 6695.5 (1.11×) · `call_ext/0` 9443.9 → 6025.3 (1.57×) ·
+**`send_recv/2` 13337.7 → 9268.9 (1.44×)**. Every workload is faster on
+the baseline tier in this run set, `build/0` and `cross/2` only marginally; quote only ratios from **one**
 run set — never a bare absolute.
 
-## Measured: `cross/2` (min of 4 timed runs, shared sandbox)
-`cross/2`'s baseline figure sits at **parity** with the interpreter: min-of-4 is interpreter
-**6852.5 ns/op** vs baseline-jit **6731.2 ns/op**, i.e. ≈ **1.02×**. A `call_ext_last` is not inlined,
+## Measured: `cross/2` (min of 3 timed runs, shared sandbox)
+`cross/2`'s baseline figure sits just above the interpreter's: min-of-3 is interpreter
+**7465.3 ns/op** vs baseline-jit **6695.5 ns/op**, i.e. ≈ **1.11×**. A `call_ext_last` is not inlined,
 so every hop pays the caller block's per-instruction deopt (spill every cached x-register + an
 interpreter step, which itself calls `resolve_external_call`) **plus** a full driver-visible exit —
 `switch_into` (`Machine::switch_context` + the callee's literal rebind + callee-block resolution) —
 and a fresh entry into the callee's compiled block, bypassing the block linker entirely (on the
-interpreter a `Step::Enter` is just a `Goto`); the columns meet because the callee block body itself
-still runs natively. Because the pair is a ping-pong, the tier's pre-compiled caller artifact is used
+interpreter a `Step::Enter` is just a `Goto`); the columns nearly meet because the callee block body
+itself still runs natively. Because the pair is a ping-pong, the tier's pre-compiled caller artifact is used
 for the very first hop only, so this workload measures the **un-amortised** cross-module transfer by
 construction.
 
-## Measured: `call_ext/0` (min of 4 timed runs, shared sandbox)
-`call_ext/0`'s baseline figure is **above** the interpreter's: min-of-4 is interpreter **8522.2 ns/op**
-vs baseline-jit **5280.8 ns/op**, i.e. baseline ≈ **1.61×** the interpreter (range 1.61×–1.70× across
-the four runs). That is the expected shape for the decline path: the `call_ext` instruction itself is
+## Measured: `call_ext/0` (min of 3 timed runs, shared sandbox)
+`call_ext/0`'s baseline figure is **above** the interpreter's: min-of-3 is interpreter **9443.9 ns/op**
+vs baseline-jit **6025.3 ns/op**, i.e. baseline ≈ **1.57×** the interpreter. That is the expected shape
+for the decline path: the `call_ext` instruction itself is
 lowered **natively** through `jit_ext_call` (so the tier pays one helper call, not a full
 decode + dispatch interpreter step) and the rest of the loop — the two `move`s and the `test is_ge` —
 is inlined, so the interpreter is the slower tier. The figure still isolates the decline cost the
-helper exposes: 256 declined calls per run at ≈ **20.6 ns/call** on the baseline (≈ **33.3 ns/call** on
+helper exposes: 256 declined calls per run at ≈ **23.5 ns/call** on the baseline (≈ **36.9 ns/call** on
 the interpreter), against a loop whose non-call work is two register moves and one compare per
 iteration. Quote it as the **ratio within one run set**, never as a bare absolute — the sandbox is
 shared and heavily loaded.
 
+## Measured: `send_recv/2` (min of 3 timed runs, shared sandbox)
+`send_recv/2` is the message-passing workload, and its figure is the **honest counterpoint** to the
+runtime-level regression: in this in-process, non-blocking loopback the baseline tier is **faster**,
+min-of-3 interpreter **13337.7 ns/op** vs baseline-jit **9268.9 ns/op** (≈ **1.44×**, i.e. ≈ **208.4
+ns** vs ≈ **144.8 ns** per `send` + `receive` round-trip over 64 rounds). The per-round instruction mix
+is **eight** deopts (`allocate_heap`, `put_tuple2`, `send`, `loop_rec`, `remove_message`, the two
+`Y`-operand `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`) against an inlined remainder
+(the entry clause `is_eq_exact`, four `move`s, `is_tuple`/`test_arity`, two `get_tuple_element`s,
+`swap`, `call_last`), and here the inlined work outweighs the deopt overhead — so the shape does
+**not** reproduce the runtime-level 2.15×–3.31× default-tier deficit on the two-process `send_recv`
+loop (`../../../../../../tools/bench/RESULTS.md` §8 item 2). The two figures are not in conflict: this
+harness runs **one** process on a `MinimalContext` whose mailbox delivers synchronously, so the
+receive never blocks, there is no second process, no scheduler resume and no ETF cop in the loop —
+exactly the runtime glue the external driver measures and this table cannot. The reading is therefore
+that the runtime regression is a **runtime-glue** effect, not an engine-tier lowering effect on this
+compiled shape.
+
 ## Routing Table
 - `support.rs` → the shared scaffolding (see API Surface); `workloads.rs` → the four deopted workloads
   (`build/0`, `map/2`, `select/1`, `walk/2`), the partially-inlined `sum/1`, the cross-module `cross/2`
-  pair **and** the declined-`call_ext` `call_ext/0`; `inlined.rs` → the five tier-inlined workloads;
+  pair, the declined-`call_ext` `call_ext/0` **and** the `Workload` type + `with_cross`/`install_cross`
+  + `with_mailbox`/`install_mailbox`; `inlined.rs` → the five tier-inlined workloads;
+  `send_recv.rs` → the `send_recv/2` message-passing loopback + its `LoopbackMailbox`;
   `checks.rs` → the result checks; `mod.rs` → the tier-table harness.
 - `../../cranelift/bench.rs` → the sibling order-balanced baseline-vs-Cranelift harness, which
   consumes `support` through `crate::jit::bench::support`.

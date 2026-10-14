@@ -48,7 +48,7 @@ use beam_loader::{
 };
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
-use crate::context::{BifHook, MinimalContext};
+use crate::context::{BifHook, Mailbox, MinimalContext};
 use crate::terms;
 
 use super::checks::{
@@ -160,6 +160,10 @@ pub(super) struct Workload {
     verify: fn(&Workload, Eterm) -> std::result::Result<(), String>,
     /// The cross-module call pair this workload drives, if any (see [`CrossCall`]).
     cross: Option<CrossCall>,
+    /// The mailbox factory a workload whose body `send`s and `receive`s needs, if any
+    /// (see [`Mailbox`]). A factory rather than an instance because the harness calls it
+    /// once per measurement, so every run starts from an empty mailbox.
+    mailbox: Option<fn() -> Box<dyn Mailbox>>,
 }
 
 /// The two-module cross-module tail-call pair a [`Workload`] may carry.
@@ -207,6 +211,7 @@ impl Workload {
             args,
             verify,
             cross: None,
+            mailbox: None,
         }
     }
 
@@ -216,6 +221,16 @@ impl Workload {
     /// through [`Workload::new`] unchanged.
     pub(super) fn with_cross(mut self, cross: CrossCall) -> Workload {
         self.cross = Some(cross);
+        self
+    }
+
+    /// Attach the mailbox factory this workload's `send`/`receive` body needs.
+    ///
+    /// A separate builder, like [`Workload::with_cross`], so the workloads that never
+    /// `send` or `receive` keep building through [`Workload::new`] unchanged and keep
+    /// the receive seam's typed `unsupported` default.
+    pub(super) fn with_mailbox(mut self, make: fn() -> Box<dyn Mailbox>) -> Workload {
+        self.mailbox = Some(make);
         self
     }
     /// The call arguments for a run, obtained **in the run's own context**.
@@ -306,11 +321,25 @@ impl Workload {
             Ok(None)
         }));
     }
+
+    /// Install this workload's mailbox, if it has one.
+    ///
+    /// The mailbox is the host half of the receive seam ([`Mailbox`]): a workload whose
+    /// body `send`s and `receive`s installs a factory here and the harness calls it once
+    /// per measurement, so every run starts from an empty mailbox. A workload without one
+    /// installs nothing, so its context keeps the seam's typed `unsupported` default.
+    pub(super) fn install_mailbox(&self, ctx: &mut MinimalContext) {
+        if let Some(make) = self.mailbox {
+            ctx.set_mailbox(make());
+        }
+    }
 }
 /// Every workload the tier table measures: the shapes the baseline tier **deopts**
 /// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]/[`sum_workload`])
 /// followed by the shapes it **inlines** (`super::inlined`), the cross-module transfer
-/// ([`cross_workload`]) and the declined `call_ext` seam ([`call_ext_workload`]).
+/// ([`cross_workload`]), the declined `call_ext` seam ([`call_ext_workload`]) and the
+/// `send` + `receive` message-passing loopback
+/// ([`super::send_recv::send_recv_workload`]).
 pub(super) fn workloads() -> Vec<Workload> {
     let mut all = vec![
         build_workload(),
@@ -322,6 +351,7 @@ pub(super) fn workloads() -> Vec<Workload> {
     all.extend(super::inlined::inlined_workloads());
     all.push(cross_workload());
     all.push(call_ext_workload());
+    all.push(super::send_recv::send_recv_workload());
     all
 }
 /// `build/0` — [`BUILD_ROUNDS`] `put_tuple2` + `put_list` pairs, then `return`.
@@ -377,6 +407,7 @@ fn build_workload() -> Workload {
         args: Args::Fixed(Vec::new()),
         verify: verify_build,
         cross: None,
+        mailbox: None,
     }
 }
 
@@ -455,6 +486,7 @@ fn map_workload() -> Workload {
         args: Args::InContext(map_args),
         verify: verify_map,
         cross: None,
+        mailbox: None,
     }
 }
 
@@ -530,6 +562,7 @@ fn select_workload() -> Workload {
         args: Args::Fixed(vec![make_small(0)]),
         verify: verify_select,
         cross: None,
+        mailbox: None,
     }
 }
 
@@ -604,6 +637,7 @@ fn walk_workload() -> Workload {
         args: Args::InContext(walk_args),
         verify: verify_walk,
         cross: None,
+        mailbox: None,
     }
 }
 
@@ -706,6 +740,7 @@ fn sum_workload() -> Workload {
         args: Args::InContext(sum_args),
         verify: verify_sum,
         cross: None,
+        mailbox: None,
     }
 }
 

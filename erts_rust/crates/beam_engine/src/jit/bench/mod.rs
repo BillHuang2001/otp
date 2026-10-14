@@ -22,15 +22,15 @@
 //! measured workload.
 //!
 //! This module is the single home for the JIT benchmark: the tier seam, the timing
-//! loop, the reporting (here), the workload programs ([`workloads`], [`inlined`]), the
-//! per-workload result checks ([`checks`]) and the shared scaffolding ([`support`],
-//! which the sibling Cranelift ABBA harness also consumes). The `#[test]` entry points
-//! live in the integration test `tests/jit_bench.rs`, which calls
-//! [`assert_tier_agreement`] (fast, in the ordinary suite) and
+//! loop, the reporting (here), the workload programs ([`workloads`], [`inlined`],
+//! [`send_recv`]), the per-workload result checks ([`checks`]) and the shared
+//! scaffolding ([`support`], which the sibling Cranelift ABBA harness also consumes).
+//! The `#[test]` entry points live in the integration test `tests/jit_bench.rs`, which
+//! calls [`assert_tier_agreement`] (fast, in the ordinary suite) and
 //! [`run_measurement_table`] (the `#[ignore]`d table). Keeping the harness here is what
 //! stops the unit-test and integration-test halves from growing a copy each.
 //!
-//! Twelve workloads, split by lowering story:
+//! Thirteen workloads, split by lowering story:
 //!
 //! * The shapes the baseline tier **deopts** (every instruction is a `jit_step_one`
 //!   helper round-trip on a native tier) — **`build/0`** (`put_tuple2`/`put_list`),
@@ -57,6 +57,15 @@
 //!   `jit_step_ext` with that already-computed answer, so `call_ext_dispatch` never
 //!   re-asks the seam (it did, before that helper existed). Its per-instruction pin is
 //!   `src/jit/baseline/tests.rs::the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count`.
+//! * **`send_recv/2`** ([`send_recv`]) — the message-passing shape: a tail-recursive
+//!   loop that `send`s `{Self, N}` to itself and `receive`s it back through the
+//!   [`Mailbox`](crate::context::Mailbox) seam. This is the in-process counterpart of
+//!   the runtime-level `send_recv` regression recorded in
+//!   `../../../../../../tools/bench/RESULTS.md` §8 item 2, where the **default** baseline
+//!   tier was 2.15×–3.31× **dearer** than the interpreter: the `send`, the
+//!   `loop_rec`/`remove_message`/`loop_rec_end`/`wait` family and the Y-operand
+//!   `gc_bif`s all deopt, so the workload exposes the tier's message-passing cost the
+//!   way the external driver cannot from a single `MinimalContext`.
 //!
 //! # Method
 //!
@@ -65,7 +74,9 @@
 //! [`MinimalContext`] + a [`JitBackend`]. `cross/2` additionally installs a
 //! cross-module-call resolver
 //! ([`Workload::install_cross`](workloads::Workload::install_cross)) and drives a
-//! second module through it. A native tier **compiles once** outside the
+//! second module through it; `send_recv/2` installs a mailbox
+//! ([`Workload::install_mailbox`](workloads::Workload::install_mailbox)) so one process
+//! can `send` to and `receive` from itself. A native tier **compiles once** outside the
 //! timed loop ([`JitBackend::compile`]) and the loop only ever calls
 //! [`JitBackend::run_compiled`]; one warm-up run precedes the timed runs, and the same
 //! [`Machine`] is reused across them (`run_*` resets it). `ns/op` is the **mean** over
@@ -92,8 +103,10 @@
 //! [`support`] owns the scaffolding the harnesses share (the synthetic [`Module`]
 //! builder, the arithmetic BIF hook and the ns/op report primitives); [`workloads`]
 //! owns the workload type, the deopted programs and the cross-module ping-pong,
-//! [`inlined`] the tier-inlined ones; [`checks`] owns the per-workload result checks;
-//! this file owns the tier seam, the timing loop and the reporting.
+//! [`inlined`] the tier-inlined ones, [`send_recv`] the `send` + `receive` loopback
+//! (and the loopback [`Mailbox`](crate::context::Mailbox) it needs); [`checks`] owns
+//! the per-workload result checks; this file owns the tier seam, the timing loop and
+//! the reporting.
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
@@ -112,6 +125,7 @@ mod checks;
 /// The scaffolding shared with the sibling Cranelift bench (`crate::jit::cranelift::bench`).
 pub(crate) mod support;
 mod inlined;
+mod send_recv;
 mod workloads;
 
 use support::{ns_per_op, ops_per_sec};
@@ -232,6 +246,7 @@ impl Measurement {
         let mut machine = Machine::new();
         let mut context = MinimalContext::with_bif_hook(workload.bif_hook());
         workload.install_cross(&mut context);
+        workload.install_mailbox(&mut context);
         let args = workload
             .arguments(&mut context)
             .expect("the workload's arguments must build");
