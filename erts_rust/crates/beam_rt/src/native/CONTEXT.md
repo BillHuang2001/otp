@@ -45,7 +45,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 |---|---|
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
-| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0` |
+| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
 | `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` |
@@ -85,7 +85,14 @@ clear-system teardown is approximated by the re-boot; the real `boot/1` never re
 init's receive loop) whereas this one returns after booting.
 
 **`code`** (`code.rs`). All entries read the code server's own path/load state.
-`code:load_file/1` really loads (`{module,M}` from `CodeServer::load`) with the oracle's
+`code:where_is_file/1` is the code server's own **non-module** search (`code_server.erl:1469-1486`),
+the one `application_controller:make_appl/1` uses to locate an application resource such as
+`kernel.app`. The code path is walked in order, each candidate is `filename:append(Dir, File)` — the
+literal `Dir ++ "/" ++ File`, never normalized and never treated as absolute — and the first candidate
+that **exists** (any file type, not only a regular file or a `.beam`) answers the full path as a
+string; an exhausted path answers the atom `non_existing`.
+`code.erl:1807` guards `is_list(File)`: a non-list leaves the wrapper with no matching clause and
+raises the bare-atom `function_clause`, the same class `priv_dir/1` reports.`code:load_file/1` really loads (`{module,M}` from `CodeServer::load`) with the oracle's
 `{error,sticky_directory|nofile|badfile}` vocabulary. `code:get_mode/0` reads the code server's
 `interactive`/`embedded` mode from the `-mode` init argument (`code.erl:1741-1765`).
 `code:priv_dir/1` is `lib_dir(App, priv)` — the application directory **joined** with `priv`, never

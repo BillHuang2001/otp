@@ -242,6 +242,11 @@ impl RuntimeContext<'_> {
             ("code", "get_mode", 0) => Some(self.code_get_mode()),
             ("code", "lib_dir", 2) => Some(self.code_lib_dir_2(args)),
             ("code", "priv_dir", 1) => Some(self.code_priv_dir_1(args)),
+            // `where_is_file/1` is the code-server search `application_controller`
+            // uses to locate an application resource such as `kernel.app`; it is
+            // path-based and needs no loaded module, so the floor serves it (see
+            // [`code`](crate::native::code)).
+            ("code", "where_is_file", 1) => Some(self.code_where_is_file(args)),
             ("application", "get_env", 1) => Some(self.application_get_env_1()),
             ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
             ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
