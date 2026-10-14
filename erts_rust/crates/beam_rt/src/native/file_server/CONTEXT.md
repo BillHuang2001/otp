@@ -2,7 +2,7 @@
 ## Intent
 The runtime-native **file service** answering the OTP file protocol. `lib/kernel/src/file.erl`
 routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`,
-and the file service is first *reached* at the `{apply,{c,erlangrc,[]}}` directive of
+and the file service is *reached* at the final `{apply,{c,erlangrc,[]}}` directive of
 `bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
 `FileServices` supplies that service. It is **not** a BIF: it is a process plus a
 scheduler-pass step. On the **boot-script route** (`-boot FILE`) it is spawned **unregistered** — the

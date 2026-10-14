@@ -67,8 +67,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 **`init`** (`init.rs`). `init:get_argument/1` serves the four **automatic** flags — `root` (the
 code root dir), `home` (`$HOME`), `progname` (`$PROGNAME` else the compile-time `"erl"`, the C rule
 `erlexec.c:1702-1705`) and `bindir` (`<root>/erts-<vsn>/bin`) — so it is *not* the boot determinant
-it once was: the real boot script stops at the same directive **19** (the stdlib-application start)
-under the CLI-equivalent configuration and under a `RuntimeConfig`-default runtime alike. `init:get_arguments/0` **prepends**
+it once was: the real boot script boots all 22 directives to completion under the CLI-equivalent configuration and under a `RuntimeConfig`-default runtime alike. `init:get_arguments/0` **prepends**
 those four entries (`root`, `bindir`, `progname`, `home`, each `{Flag,[[Value]]}`, an unavailable
 value omitting its entry — the oracle's own shape) before the command-line flags (boot-chain
 consequence: [`../boot/CONTEXT.md`](../boot/CONTEXT.md)). `init:script_id/0` is the **loaded** boot
@@ -195,7 +194,9 @@ models no ACTIVE flag, so "hibernate" is modelled as **continue** — the caller
 `receive` does the blocking, so the observable behaviour matches. The only OTP callers of
 `erlang:hibernate/0` (`lib/stdlib/src/gen_server.erl:2340`, `gen_statem.erl:3587`) both enter a
 `receive` immediately afterwards and use no return value, so no observable result depends on the
-heap shrink. Unit test in `process.rs` (`hibernate_continues_and_answers_true`).`spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the
+heap shrink. Unit test in `process.rs` (`hibernate_continues_and_answers_true`).
+
+**`spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the
 child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the
 policy-aware `Runtime::spawn_*_with_policy`.
 

@@ -34,20 +34,16 @@
 //!    the preloaded names come first, in `erlang:pre_loaded/0`'s order
 //!    ([`code_which_is_loaded_and_all_loaded_put_preloaded_first`]);
 //! 3. `erlang:pre_loaded/0` equals the **live oracle's** answer ([`pre_loaded_matches_the_live_oracle`]);
-//! 4. the real committed `bootstrap/bin/start.boot` executes directives 0–18 and **stops at
-//!    directive index 19 of 22**
-//!    (`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`) — the kernel
-//!    application's `global_name_server` child crash (a `{monitor_nodes,…}` tuple `process_flag`
-//!    refused outside this node) tears down the `permanent` kernel application, so directive 19's
-//!    `{load_application,stdlib}` call finds no `application_controller`
+//! 4. the real committed `bootstrap/bin/start.boot` executes **all 22** of its directives to
+//!    completion, ending at the final `{progress,started}` (directive index 21)
 //!    ([`the_real_start_boot_runs_to_completion`]);
 //! 5. a synthetic boot script — compiled at test time with the system toolchain — executes
 //!    end to end and its `{apply, …}` step's side effect is observable
 //!    ([`a_synthetic_boot_script_executes_end_to_end`]);
 //! 6. the **CLI** really drives that executor for `-boot FILE` (contract A.7/A.9): a
 //!    synthetic script's `{apply, …}` reaches stdout through the executable
-//!    ([`the_cli_drives_the_boot_script_of_a_boot_flag`]), the real `start.boot` stops at
-//!    directive 19 and the CLI exits 1
+//!    ([`the_cli_drives_the_boot_script_of_a_boot_flag`]), the real `start.boot` boots all 22
+//!    directives to completion and the CLI exits 0 with empty stdout and stderr
 //!    ([`the_cli_runs_the_real_boot_script_to_completion`]), and a boot with
 //!    **no** `-boot` keeps the preloaded-only drive
 //!    ([`a_boot_without_the_boot_flag_keeps_the_preloaded_only_drive`]);
@@ -582,8 +578,8 @@ fn the_cli_runs_the_real_boot_script_to_completion() {
     // chain must reach `{progress,started}` and the CLI must exit 0, never a panic, a hang or a
     // silently-wrong success.
     //
-    // The assertion is currently **red**: the script stops at directive 19 of 22 and the CLI
-    // exits 1 (see `M1_GAPS.md` *A.7/A.9 boot*).
+    // This pins the completion: the script runs all 22 directives and the CLI exits 0 with
+    // empty stdout/stderr (see `M1_GAPS.md` *A.7/A.9 boot*).
     //
     // The switch names the boot file **without** its `.boot` suffix — `init` appends it
     // (`erts/preloaded/src/init.erl:1268`).

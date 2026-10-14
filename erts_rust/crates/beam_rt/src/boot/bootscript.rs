@@ -58,11 +58,10 @@
 //! [`execute`] walks the instructions in order and returns the first error it meets —
 //! loading a module that is not on the code path, spawning a process whose function is not
 //! exported, or applying an MFA the runtime cannot run. This is the honest behaviour: the
-//! real `start.boot` loads every `primLoad` batch and runs all three `kernelProcess`
-//! directives, but the walk still stops at the first directive that needs machinery this
-//! runtime does not have — currently 0-based index 19, the stdlib
-//! `{apply,{application,start_boot,[…]}}` (see `src/boot/CONTEXT.md`) — with its typed error
-//! rather than skipping it, so its final `{progress,started}` is not reached.
+//! real `start.boot` loads every `primLoad` batch, runs all three `kernelProcess`
+//! directives and completes all 22 of them to its final `{progress,started}`, and a script
+//! that needs machinery this runtime does not have would stop at the first such directive
+//! with its typed error rather than skipping it (see `src/boot/CONTEXT.md`).
 //!
 //! # The directives that run processes advance the scheduler
 //!
@@ -1154,10 +1153,10 @@ mod tests {
     #[test]
     fn a_synthetic_unbootable_directive_reports_a_boot_stop() {
         // The `BootStop`/`execute_reporting` reporting machinery, pinned on a synthetic script
-        // so the report's position and shape are deterministic (the real `start.boot` stops at
-        // 0-based index 19 — see `CONTEXT.md`). The second instruction applies a
-        // non-existent module, so the walk stops at 0-based index 2 with the script's
-        // instruction count, the failing directive and a typed error — never a panic.
+        // so the report's position and shape are deterministic (the real `start.boot` now
+        // completes, so it has no `BootStop` to report — see `CONTEXT.md`). The second
+        // instruction applies a non-existent module, so the walk stops at 0-based index 2 with
+        // the script's instruction count, the failing directive and a typed error — never a panic.
         let Some(mut runtime) = system_runtime() else {
             return;
         };

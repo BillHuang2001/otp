@@ -1285,14 +1285,11 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
 /// directive the runtime cannot execute all return their typed [`BeamError`] — which [`run`]
 /// reports as `beam_rt: <error>` with exit code 1 — never a panic, a hang or a wrong result.
 ///
-/// The real `start.boot` does **not** run to completion: it stops at the 0-based directive
-/// index **19** of 22, `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`,
-/// because the stdlib start's own `application_controller` is already gone — the CLI reports
-/// `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`
-/// with exit code 1. The final `{progress,started}` (index 21) is therefore not reached, and
-/// neither is the `{apply,{c,erlangrc,[]}}` directive (index 20) whose `{open, …}` of
-/// `$HOME/.erlang` the native `file_server_2` service answers. Per-directive detail is in
-/// [`crate::boot`].
+/// The real `start.boot` runs to completion: all 22 directives execute and the script ends at
+/// the final `{progress,started}` (index 21), so the CLI exits 0 with empty stdout and stderr.
+/// The tail directives are served in-node — `{apply,{c,erlangrc,[]}}` (index 20) issues a
+/// `{open, …}` of `$HOME/.erlang` that the native `file_server_2` service answers. Per-directive
+/// detail is in [`crate::boot`].
 fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {    runtime.boot()?;
     let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;
     runtime.boot_from_script(&path).map(|_| ())
