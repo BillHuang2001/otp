@@ -143,6 +143,35 @@ impl RuntimeContext<'_> {
         terms::make_tuple(self, &[ok, values])
     }
 
+    /// `init:code_path_choice/0`: the code server's path-resolution mode, `strict` or
+    /// `relaxed` (`init.erl:1875-1884`).
+    ///
+    /// The oracle's `init` process answers it from the `-code_path_choice` flag with
+    /// `strict` for a `"strict"` value, `relaxed` for a `"relaxed"` value and `strict` for
+    /// anything else — an absent flag, or a malformed one. The runtime reproduces that rule
+    /// from its **own** recorded [`RuntimeConfig::init_args`](crate::config::InitArgs), so an
+    /// unmodeled `-code_path_choice relaxed` on the command line is honoured rather than
+    /// assumed absent.
+    ///
+    /// It is served here — and not entered as the `init.erl` body — because that body reads
+    /// the same flag through a **local** `get_argument/1` call, and `init.erl`'s
+    /// `get_argument/1` is the message-based `request/1` form: entering it in-machine reaches
+    /// a `receive` no process answers (this runtime runs no `init` request loop), which
+    /// deadlocks `code_server:init/3`. `code_path_choice/0` is not a floor key otherwise, so
+    /// the call-site seam cannot refuse it — the floor must own the key.
+    pub(super) fn code_path_choice(&mut self) -> Result<Eterm> {
+        let relaxed = self
+            .runtime
+            .init_args()
+            .get("code_path_choice")
+            .is_some_and(|occurrences| {
+                matches!(
+                    occurrences.as_slice(),
+                    [values] if values.len() == 1 && values[0] == "relaxed"
+                )
+            });
+        self.atom(if relaxed { "relaxed" } else { "strict" })
+    }
     /// `init:get_plain_arguments/0`: the arguments the emulator did not model, each as a
     /// string (contract A.6).
     ///

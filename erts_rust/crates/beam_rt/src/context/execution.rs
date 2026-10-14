@@ -65,9 +65,18 @@ impl ExecutionContext for RuntimeContext<'_> {
         let result = match self.call_bif_routed(module, function, arity, args) {
             Ok(result) => result,
             Err(error) => {
-                crate::debug_trace::trace(format_args!(
-                    "call_bif {module}:{function}/{arity} -> {error:?}"
-                ));
+                if crate::debug_trace::enabled() {
+                    let rendered: Vec<String> = args
+                        .iter()
+                        .map(|arg| match self.atom_name(*arg) {
+                            Some(name) => format!("'{name}'"),
+                            None => format!("{arg:?}"),
+                        })
+                        .collect();
+                    crate::debug_trace::trace(format_args!(
+                        "call_bif {module}:{function}/{arity} {rendered:?} -> {error:?}"
+                    ));
+                }
                 return Err(error);
             }
         };

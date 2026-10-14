@@ -232,6 +232,7 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("get_status", 0),
             ("script_id", 0),
             ("fetch_loaded", 0),
+            ("code_path_choice", 0),
         ]),
         "code" => Some(&[
             ("get_path", 0),
@@ -293,6 +294,7 @@ impl RuntimeContext<'_> {
             ("init", "get_status", 0) => Some(self.get_status()),
             ("init", "script_id", 0) => Some(self.script_id_0()),
             ("init", "fetch_loaded", 0) => Some(self.fetch_loaded()),
+            ("init", "code_path_choice", 0) => Some(self.code_path_choice()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
             // The port surface the `PortHook` seam cannot express: `port_command/2,3` (the
             // port's *input* direction) and `port_control/3` (the driver's `control` callback) —

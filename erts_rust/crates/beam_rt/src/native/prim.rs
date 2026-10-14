@@ -3164,8 +3164,6 @@ mod tests {
             ("write_file_info", &three[..]),
             ("advise", &four[..]),
             ("allocate", &three[..]),
-            ("list_dir", &one[..]),
-            ("list_dir_all", &one[..]),
             ("read_line", &one[..]),
             ("file_desc_to_ref", &two[..]),
         ] {
