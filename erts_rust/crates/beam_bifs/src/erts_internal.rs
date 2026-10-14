@@ -51,31 +51,54 @@
 //! Whether two equal-looking terms share a word is the *term/literal
 //! representation's* business (the loader owns literal dedup), never this BIF's.
 //!
-//! # `erts_debug:flat_size/1` is representation-dependent
+//! # `erts_debug:flat_size/1` overrides the three divergent representations
 //!
 //! `beam_debug.c:70-83` is `size_object(term)` promoted to a bignum past the
 //! small-int range; the algorithm
 //! ([`beam_term::size::size_object`], the port of `copy.c:88-263`) is shared, but
 //! the *number* depends on the physical representation of the argument. Three node
-//! kinds differ between this runtime and the C, so a term graph containing any of
-//! them has **no** comparable oracle value and `flat_size/1` reports the typed
-//! [`crate::error::unsupported_bif`] instead of a number that would be wrong:
+//! kinds are laid out differently here than in the C, so their **own** word count is
+//! *overridden* by [`c_size_correction`] with the C's, which is why `flat_size/1`
+//! answers a number for them instead of the typed
+//! [`crate::error::unsupported_bif`]:
 //!
 //! 1. **an internal reference** — the M1 `access::make_ref_thing` block is 4 words
-//!    (`[header, node, serial, id]`) where C's `ERL_REF_SIZE` is 3;
+//!    (`[header, node, serial, id]`) where C's `ERTS_REF_THING_SIZE` is 3 (a
+//!    reference is counted by `size_object_x`'s `default` arm as
+//!    `thing_arityval(hdr) + 1`). Oracle-pinned: `erts_debug:flat_size(make_ref())`
+//!    ⇒ `3`;
 //! 2. **any fun** — [`beam_term::fun`] inlines the descriptor, so the block is
-//!    `1 + desc_words(kind) + num_free` where C's is `ERL_FUN_SIZE + num_free` = 2;
-//! 3. **a bitstring longer than C's on-heap limit** (`bit_len > 512`, i.e. > 64
-//!    bytes) — this runtime may keep a long binary in an on-heap `ErlHeapBits`
-//!    (which counts `2 + ceil(bits/64)`) where C switches to the 8-word
-//!    `[BinRef][ErlSubBits]` pair.
+//!    `1 + desc_words(kind) + num_free` where C's is `ERL_FUN_SIZE + num_free` =
+//!    `2 + num_free` (`erl_fun.h:97-99`: this OTP's `ErlFunThing` is
+//!    `thing_word` + the `entry` union, with the environment a C99 flexible array,
+//!    and the C fun header's arity field carries `ERL_FUN_SIZE - 1`,
+//!    `erl_term.h:312`). The C also walks the environment as a child, exactly as
+//!    [`beam_term::size::size_object`] does. Oracle-pinned from one compiled module
+//!    (`-module(fsz_oracle)`): `fun() -> 1 end` ⇒ `2`, `fun() -> X end` ⇒ `3`,
+//!    `fun() -> A + B end` ⇒ `4`, `fun f1/1` (an `EXPORT_EXT` fun) ⇒ `2`, and a
+//!    closure capturing `lists:seq(1,25)` ⇒ `53` (= `2 + 1 + 50`: the 2-word
+//!    header, `num_free` = 1, then the 25-element list). A `NEW_FUN_EXT` fun
+//!    re-decoded by `binary_to_term(term_to_binary(Fun))` reports the *same*
+//!    numbers, so the 10-word `Imported` descriptor is likewise uncounted;
+//! 3. **an on-heap bitstring above C's on-heap limit** (`bits >
+//!    ERL_ONHEAP_BITS_LIMIT` = 512, `erl_bits.h:168`) — this runtime may keep such a
+//!    term in an on-heap `ErlHeapBits` (which counts `2 + ceil(bits/64)`) where C
+//!    stores the 8-word `[BinRef][ErlSubBits]` pair. An **off-heap** bitstring needs
+//!    no override: [`beam_term::size`]'s `SUB_BITS_SUBTAG` arms are the C's own
+//!    (`copy.c:219-242`), so the 8-word refc pair counts `8` on both sides. Oracle
+//!    pins (a compiled module, so the literal is not an `erl_eval` sub-binary —
+//!    see `tests/erts_internal.rs`): `binary:copy(<<0>>,64)` ⇒ `10`,
+//!    `binary:copy(<<0>>,65)`/`<<0:520>>`/a 100-byte binary ⇒ `8`. Together the two
+//!    arms mean the C flat size of *any* bitstring is a pure function of its bit
+//!    length: `2 + ceil(bits/64)` up to 512 bits, `8` above.
 //!
-//! An external pid/port/ref (whose `node` slot is likewise inlined by this runtime)
-//! and any boxed subtag this module does not positively recognize as
-//! representation-identical are treated the same way: conservatively divergent,
-//! never guessed. Everything else — immediates, cons cells, tuples and native
-//! records, floats, bignums, flat maps, **hash maps** (their HAMT node interiors are
-//! the ERTS layout, `copy.c:192-214`, which
+//! An external pid/port/ref (whose `node` slot is likewise inlined by this runtime,
+//! and whose C count is the `default` arm's `thing_arityval(hdr) + 1`) and any boxed
+//! subtag this module does not positively recognize as representation-identical
+//! keep the typed gap: their C word count cannot be honestly derived here, so the
+//! number is never guessed. Everything else — immediates, cons cells, tuples and
+//! native records, floats, bignums, flat maps, **hash maps** (their HAMT node
+//! interiors are the ERTS layout, `copy.c:192-214`, which
 //! [`beam_term::layout`](beam_term) sizes exactly), on-heap bitstrings up to 512
 //! bits and the 8-word refc pair itself — is counted exactly as the C does, because
 //! it is the same algorithm over the same frozen layouts (note
@@ -112,7 +135,8 @@
 //!   shared-term walk, the emulator's internal state and the BEAM code loader).
 //! * Typed gaps *inside* a registered BIF (each returns
 //!   [`crate::error::unsupported_bif`], never a wrong value):
-//!   `flat_size/1` for the divergent representations above.
+//!   `flat_size/1` for an external pid/port/ref or any boxed subtag
+//!   [`c_size_correction`] does not positively recognize (see above).
 //!   `term_type/1` distinguishes the on-heap (`heap_binary`) from the off-heap
 //!   (`sub_binary`) bitstring by the layout rule itself; the C `refc_binary` name is
 //!   unreachable because a bare `BinRef` header is not `is_bitstring`, so such a term
@@ -227,21 +251,51 @@ fn same_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.boolean(args[0] == args[1])
 }
 
-/// Whether the term graph rooted at `term` contains a node whose word count under
-/// **this** runtime's representation cannot be compared with the C's `size_object`
-/// (see the module docs). Conservative: an unrecognized boxed subtag counts as
-/// divergent.
-fn has_representation_divergence(term: Eterm) -> bool {
+/// `ERL_FUN_SIZE` (`erl_fun.h:97-99`): the words of a C `ErlFunThing`'s fixed
+/// prefix — `thing_word` plus the `entry` union — the environment being a C99
+/// flexible array that `size_object_x` adds `fun_num_free(funp)` words for
+/// (`copy.c:150-152`). The C fun header's arity field carries `ERL_FUN_SIZE - 1`
+/// (`erl_term.h:312`), which is why the C asserts
+/// `ERL_FUN_SIZE == 1 + thing_arityval(hdr)`.
+const C_FUN_WORDS: i64 = 2;
+
+/// `ERTS_REF_THING_SIZE`: the words of a C reference thing. A reference is sized
+/// by `size_object_x`'s `default` arm as `thing_arityval(hdr) + 1` (`copy.c:254`),
+/// i.e. its own header-blessed word count — 3 for the C block, where this runtime's
+/// M1 ref thing (`access::make_ref_thing`) is 4 words.
+const C_REF_WORDS: i64 = 3;
+
+/// `beam_term::size::size_object` as an `i64`, or `None` when the count cannot be
+/// represented (a graph larger than `i64::MAX` words, which no real heap holds).
+fn size_object_i64(term: Eterm) -> Option<i64> {
+    i64::try_from(beam_term::size::size_object(term)).ok()
+}
+
+/// The correction to add to [`beam_term::size::size_object`]'s count so the result
+/// is the C `size_object_x` word count — the sum, over every node of the term graph
+/// rooted at `term`, of `C_own_words - runtime_own_words` for the three divergent
+/// kinds (module docs), or `None` when the graph contains a node whose C word count
+/// cannot be honestly derived.
+///
+/// The walk enumerates the same nodes and the same children as
+/// [`beam_term::size::size_object`]; what it sums is confined to a node's **own**
+/// words, because a divergent node's *children* are counted by `size_object` exactly
+/// as the C counts them (a fun's environment, `copy.c:150-160`). It descends into
+/// them only to find nested divergences — `[make_ref(), Fun]` is 4 cons words + 3
+/// (the ref) + the fun's own words, so a nested ref must correct the total too.
+/// Conservative: an unrecognized boxed subtag answers `None`.
+fn c_size_correction(term: Eterm) -> Option<i64> {
     // A generous node budget: terms are acyclic, so this only bounds pathological
-    // graphs, and exceeding it is reported as a divergence (a typed gap) rather than
-    // a partial answer.
+    // graphs, and exceeding it is reported as a typed gap rather than a partial
+    // answer.
     const MAX_NODES: usize = 1 << 20;
     let mut work: Vec<Eterm> = vec![term];
+    let mut correction: i64 = 0;
     let mut visited = 0usize;
     while let Some(current) = work.pop() {
         visited += 1;
         if visited > MAX_NODES {
-            return true;
+            return None;
         }
         // Immediates: identical word count (zero) in both representations.
         if access::is_small(current)
@@ -260,22 +314,44 @@ fn has_representation_divergence(term: Eterm) -> bool {
         if access::is_float(current) || access::is_big(current) {
             continue;
         }
-        // The three documented divergences, plus the unverifiable external terms.
-        if access::is_internal_ref(current)
-            || access::is_function(current)
-            || access::is_external_pid(current)
+        // Divergence 1: the M1 ref thing is 4 words, C's `ERTS_REF_THING_SIZE` is 3.
+        // A ref exposes no child, so its own size *is* `size_object`'s whole count.
+        if access::is_internal_ref(current) {
+            correction += C_REF_WORDS - size_object_i64(current)?;
+            continue;
+        }
+        // Divergence 2: the inlined descriptor. Only the block's own words differ —
+        // the environment is `size_object`'s child either way (`copy.c:150-160`), and
+        // the `Imported` descriptor's 10 words are the C's out-of-line `ErlFunEntry`
+        // (never part of the C block), so the same formula covers all three kinds.
+        if access::is_function(current) {
+            let num_free = i64::try_from(beam_codec::term::fun_num_free_term(current).ok()?).ok()?;
+            let runtime_words =
+                i64::try_from(beam_term::fun::fun_block_words(current).ok()?).ok()?;
+            correction += (C_FUN_WORDS + num_free) - runtime_words;
+            work.extend_from_slice(beam_codec::term::fun_env(current).ok()?);
+            continue;
+        }
+        // Unverifiable external terms: the C count is `thing_arityval(hdr) + 1` over
+        // a block whose `node` slot this runtime inlines, so no honest number exists.
+        if access::is_external_pid(current)
             || access::is_external_port(current)
             || access::is_external_ref(current)
         {
-            return true;
+            return None;
         }
         if access::is_bitstring(current) {
-            match access::bitstring_bit_size(current) {
-                Ok(bits) if bits <= 512 => continue,
-                // A long bitstring: this runtime may hold it on the heap where C uses
-                // the 8-word refc pair (and a corrupt size has no oracle value either).
-                _ => return true,
+            let (base, _offset_bits, bits) = beam_codec::term::bitstring_parts(current).ok()?;
+            if base == unsafe_base_of(current) && bits > beam_term::refc::ERL_ONHEAP_BITS_LIMIT {
+                // An on-heap `ErlHeapBits` above C's 512-bit limit: the C holds the
+                // 8-word `[BinRef][ErlSubBits]` pair instead. An *off-heap* term needs
+                // no correction — `size_object`'s `SUB_BITS_SUBTAG` arms are the C's
+                // own (`copy.c:219-242`) — and an on-heap term at or below the limit
+                // counts `2 + ceil(bits/64)` on both sides.
+                correction +=
+                    beam_term::refc::ERL_REFC_BITS_SIZE as i64 - size_object_i64(current)?;
             }
+            continue;
         }
         if access::is_tuple(current) {
             for i in 0..access::tuple_size(current) {
@@ -289,7 +365,7 @@ fn has_representation_divergence(term: Eterm) -> bool {
                     work.extend_from_slice(values);
                     continue;
                 }
-                Err(_) => return true,
+                Err(_) => return None,
             }
         }
         if access::is_map(current) {
@@ -304,24 +380,32 @@ fn has_representation_divergence(term: Eterm) -> bool {
                     }
                     continue;
                 }
-                Err(_) => return true,
+                Err(_) => return None,
             }
         }
-        // Any subtag not positively recognized above: its word count is not
+        // Any subtag not positively recognized above: its C word count is not
         // verifiable through the safe API.
-        return true;
+        return None;
     }
-    false
+    Some(correction)
 }
 
 /// `erts_debug:flat_size/1` — `size_object/1` promoted past the small-int range
-/// (`beam_debug.c:70-83`), with a typed gap for the divergent representations.
+/// (`beam_debug.c:70-83`), with [`c_size_correction`] applied on top so the three
+/// divergent representations (module docs) are counted exactly as the C counts
+/// them. A node whose C word count cannot be honestly derived keeps the typed gap.
 fn flat_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    if has_representation_divergence(args[0]) {
-        return Err(unsupported_bif());
-    }
-    let size = beam_term::size::size_object(args[0]);
-    let size = i64::try_from(size).map_err(|_| BeamError::SystemLimit)?;
+    let term = args[0];
+    let correction = c_size_correction(term).ok_or_else(unsupported_bif)?;
+    let size = size_object_i64(term).ok_or(BeamError::SystemLimit)?;
+    // A term graph's C flat size is never negative; the correction is a sum of
+    // per-node differences on terms whose own words are >= the C's, so this guard is
+    // unreachable for a real term — and a negative count would be a fabricated
+    // answer, so it is a typed gap rather than a number.
+    let size = size
+        .checked_add(correction)
+        .filter(|size| *size >= 0)
+        .ok_or_else(unsupported_bif)?;
     arith::int_from_i64(ctx, size)
 }
 
@@ -1168,9 +1252,20 @@ mod tests {
             assert_eq!(flat_size_1(ctx, &[t]).unwrap(), make_small(4));
             let empty = access::make_flatmap(ctx.heap(), &[]).unwrap();
             assert_eq!(flat_size_1(ctx, &[empty]).unwrap(), make_small(3));
-            // A fun is a typed gap (its inlined descriptor diverges from C's).
+            // A reference is counted as the C's 3-word `ERTS_REF_THING_SIZE`, not as
+            // this runtime's 4-word M1 block.
             let ref_thing = access::make_ref_thing(ctx.heap(), 1).unwrap();
-            assert!(matches!(flat_size_1(ctx, &[ref_thing]), Err(BeamError::Raise(_))));
+            assert_eq!(flat_size_1(ctx, &[ref_thing]).unwrap(), make_small(3));
+            // An external pid keeps the typed gap: its C count is the `default` arm's
+            // `thing_arityval(hdr) + 1` over a block whose `node` slot this runtime
+            // inlines, so no honest number exists.
+            let node = ctx.atom("a").expect("seeded");
+            let external = beam_codec::term::make_external_pid(ctx.heap(), node, 1, 0, 0)
+                .expect("the external pid block fits");
+            assert!(matches!(
+                flat_size_1(ctx, &[external]),
+                Err(BeamError::Raise(_))
+            ));
         });
     }
 }
