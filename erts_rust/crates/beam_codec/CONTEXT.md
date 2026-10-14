@@ -3,7 +3,7 @@
 Owns the **External Term Format**: `term_to_binary`/`binary_to_term` encode+decode, the distribution payload/control-term format and the ETS wire format — the in-memory half of contract **A.5** (workspace `../CONTEXT.md` §1, Part I §A.5; Stage 0 of Part II §H).
 Dependents: `beam_dist` (handshake/control/payload terms), `beam_message` (terms across the copy boundary), `beam_ets` (`DFLAG_ETS_COMPRESSED` term blobs), `beam_rt` (`term_to_binary/1`, `binary_to_term/1`).
 Decoding is **allocation-aware**: terms go into a caller-supplied `beam_alloc::Heap` and atoms resolve through a caller-supplied `beam_term::AtomTable`, so *one* path serves distribution, ETS and `term_to_binary`.
-Three **optional host seams** keep it wire-compatible without owning runtime state — `AtomCacheWriter` (atom-cache write hook), `OffHeapBinaries` (§Off-heap binaries) and `Decoder::with_local_node`/`with_local_node_hash` (§Local node identity) — inert when nothing is installed.
+Three **optional host seams** keep it wire-compatible without owning runtime state — `AtomCacheWriter`, `OffHeapBinaries` (§Off-heap binaries) and `Decoder::with_local_node`/`with_local_node_hash` (§Local node identity) — inert when nothing is installed.
 Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`/`erts_decode_ext`, `enc_term`/`dec_term`) plus `external.h` (tags), `erl_term.h`/`erl_map.h` (layouts) and `../../erts/doc/guides/erl_ext_dist.md`; every tag value and encoding is **wire-frozen** — read the C, never modify it.
 ## Status
 **Implemented.** Every module (list in §API Surface) carries real bodies, incl. `decode/local_node.rs` and the `term` forwarding layer (over `beam_term::{thing,fun,bitstring,refc,record,hashing}`).
