@@ -226,15 +226,41 @@ fn stores_continuation(instr: &Instr) -> bool {
     )
 }
 
+/// The exclusive end of the sub-block that begins at continuation address `start`:
+/// the containing IR block's end, **capped at the next continuation address**.
+///
+/// `block` is the IR block that strictly contains `start` (`block.start < start <
+/// block.end`, `start < code.len()`). The cap is the smallest continuation address
+/// `p = pc + 1 > start` of a later [`stores_continuation`] call in the **same
+/// function**: the instruction at `p - 1` is that next frame-preserving call, which
+/// always transfers control out of the block (a deopt / `ENTER`, or a `call_bif`
+/// continue the shared `done` epilogue turns into an `encode_target(func, p)` word),
+/// and `p` is itself a continuation address that gets its own sub-block entry. Lowering
+/// only `[start, p)` therefore keeps every instruction reachable at a native entry
+/// while making the emitted ranges **disjoint** — the total lowered sub-block length is
+/// O(code.len()), not the O(n²) of overlapping tails for `n` calls in one straight-line
+/// block. When no later call exists the cap is inert and the range runs to the block's
+/// end.
+fn sub_block_end(code: &[Instr], block: &Block, start: usize) -> usize {
+    let block_end = block.end.min(code.len());
+    (start..code.len())
+        .find(|&pc| stores_continuation(&code[pc]))
+        .map_or(block_end, |pc| block_end.min(pc + 1))
+}
+
 /// The extra byte budget the continuation **sub-blocks** of `code` need (see
 /// [`emit_sub_blocks`]); the [`function_capacity_estimate`] of the IR blocks does not
 /// cover them.
 ///
-/// For every continuation address that gets a sub-block covering `[p, b.end)` this
-/// budgets a full block ([`BLOCK_BYTES`]) plus one [`INSTRUCTION_BYTES`] per instruction
-/// of that range — the same per-instruction bound [`function_capacity_estimate`] uses.
-/// Two calls sharing a sub-block range are budgeted twice (a harmless over-estimate):
-/// under-estimating would turn a large function into a `SystemLimit` compile error.
+/// For every continuation address that gets a sub-block covering `[p, end)` — where
+/// `end` is [`sub_block_end`], so the ranges are the **disjoint** ones the emitter
+/// lowers — this budgets a full block ([`BLOCK_BYTES`]) plus one [`INSTRUCTION_BYTES`]
+/// per instruction of that range, the same per-instruction bound
+/// [`function_capacity_estimate`] uses. Because the ranges are disjoint and all lie
+/// within `[0, code.len())`, their total instruction count is at most `code.len()`, so
+/// the estimate stays linear in the function size. It is deliberately loose on the
+/// per-range constants: under-estimating would turn a large function into a
+/// `SystemLimit` compile error.
 fn sub_blocks_capacity_estimate(code: &[Instr], blocks: &[Block]) -> usize {
     let mut total = 0usize;
     for (pc, instr) in code.iter().enumerate() {
@@ -246,7 +272,7 @@ fn sub_blocks_capacity_estimate(code: &[Instr], blocks: &[Block]) -> usize {
             continue;
         }
         if let Some(block) = blocks.iter().find(|b| b.start < start && start < b.end) {
-            let end = block.end.min(code.len());
+            let end = sub_block_end(code, block, start);
             if start < end {
                 total += BLOCK_BYTES + INSTRUCTION_BYTES * (end - start);
             }
@@ -266,12 +292,15 @@ fn sub_blocks_capacity_estimate(code: &[Instr], blocks: &[Block]) -> usize {
 /// same [`emit_block`] an IR block uses, so every shape rule, guard and deopt is
 /// identical) gives the driver a native entry there instead.
 ///
-/// Each such `p` is lowered independently, against the **IR block** that strictly
-/// contains it: a second call nested inside an earlier sub-block's range therefore gets
-/// its own sub-block too (the code is duplicated — acceptable, and correctness first).
-/// An address that is already a compiled block start (the call is the last instruction of
-/// its block), and one at or past the end of the function, need no sub-block and are
-/// skipped.
+/// Each such `p` is lowered against the **IR block** that strictly contains it, and
+/// its range is capped at the **next continuation address** ([`sub_block_end`]), so the
+/// emitted sub-block ranges are **disjoint** and the total lowered length stays O(n).
+/// The last instruction of a range is the next frame-preserving call, which always
+/// transfers control out of the block, and that call's own continuation address has its
+/// own sub-block entry — so no instruction loses its native entry (the driver resumes
+/// natively at the next sub-block). An address that is already a compiled block start
+/// (the call is the last instruction of its block), and one at or past the end of the
+/// function, need no sub-block and are skipped.
 ///
 /// A sub-block is reached only from the driver (nothing jumps to a continuation address),
 /// so it reserves no entry label in `block_labels` and adds no entry to the driver's block
@@ -306,7 +335,7 @@ fn emit_sub_blocks(
         let Some(block) = blocks.iter().find(|b| b.start < start && start < b.end) else {
             continue;
         };
-        let end = block.end.min(code.len());
+        let end = sub_block_end(code, block, start);
         if start >= end {
             continue;
         }
@@ -372,10 +401,11 @@ fn emit_sub_blocks(
 ///
 /// Everything else matches the lazy pass: a `start` at or past the end of the function, one
 /// that is already a compiled block start (`block_labels`), or one no IR block strictly
-/// contains, is skipped; a second call nested inside an earlier sub-block's range gets its
-/// own sub-block. Like the lazy version a sub-block reserves no entry label and adds no
-/// `entries` slot, so `block_count`/`code_map`/`code_address_range` keep describing IR
-/// blocks only.
+/// contains, is skipped; each sub-block's range is capped at the next continuation address
+/// ([`sub_block_end`]), so — exactly like the lazy pass — the emitted ranges are disjoint and
+/// the total lowered length stays O(n). Like the lazy version a sub-block reserves no entry
+/// label and adds no `entries` slot, so `block_count`/`code_map`/`code_address_range` keep
+/// describing IR blocks only.
 #[allow(clippy::too_many_arguments)]
 fn emit_shared_sub_blocks(
     buffer: &mut CodeBuffer,
@@ -403,7 +433,7 @@ fn emit_shared_sub_blocks(
         let Some(block) = blocks.iter().find(|b| b.start < start && start < b.end) else {
             continue;
         };
-        let end = block.end.min(code.len());
+        let end = sub_block_end(code, block, start);
         if start >= end {
             continue;
         }
@@ -615,3 +645,247 @@ const LIST_PATH_BYTES: usize = 128;
 /// [`emit_step_and_continue`](super::emit_step_and_continue) fallback the guard may still branch to, which the
 /// per-instruction [`INSTRUCTION_BYTES`] already budgets.
 const TUPLE_PATH_BYTES: usize = 160;
+
+#[cfg(test)]
+mod tests {
+    //! The continuation-sub-block pass's **range cut** is the one structural property
+    //! this file adds that a caller can observe in the emitted bytes: the sub-block
+    //! ranges must be **disjoint** (linear total code) rather than the overlapping
+    //! `[p, block.end)` tails (quadratic total code) they used to be. These tests pin
+    //! the scaling on **both** layouts and pin that the disjoint sub-blocks still run
+    //! the whole body — the truncated tail of a frame-preserving call is reached
+    //! through the **next** continuation address's own sub-block entry, which the
+    //! cross-module run below exercises at every call.
+
+    use super::*;
+    use crate::jit::Tier;
+    use crate::machine::{Machine, RunOutcome};
+    use crate::MinimalContext;
+    use beam_loader::{Export, Function, Import, ImportRef, Label, NO_FAIL, Operand};
+    use beam_term::{make_small, Atom};
+
+    /// Build a one-function module named `name` whose export `function/arity` has a
+    /// **single straight-line body block**: `Label(1)` · `Label(2)` · `body…` ·
+    /// `Return`. `Label(1)` and `Label(2)` are the only labels, so `Label(1)` is a
+    /// one-instruction block `[0, 1)` and everything from `Label(2)` to the `Return`
+    /// is one IR block `[1, code.len())` — the shape in which every frame-preserving
+    /// call after the first leaves a continuation address **strictly inside** the
+    /// block.
+    fn body_module(
+        name: &str,
+        function: &str,
+        arity: u32,
+        imports: &[(&str, &str, u32)],
+        body: Vec<Instr>,
+    ) -> (Module, Atom) {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern(name);
+        for (import_module, import_function, import_arity) in imports {
+            let module_atom = module.atom_table.intern(import_module);
+            let function_atom = module.atom_table.intern(import_function);
+            module.imports.push(Import {
+                module: module_atom,
+                function: function_atom,
+                arity: *import_arity,
+            });
+        }
+
+        let mut code = vec![Instr::Label(Label(1)), Instr::Label(Label(2))];
+        code.extend(body);
+        code.push(Instr::Return);
+        let code_len = code.len();
+        let blocks = vec![
+            Block {
+                label: Label(1),
+                start: 0,
+                end: 1,
+            },
+            // The single body block: every frame-preserving call lives inside it.
+            Block {
+                label: Label(2),
+                start: 1,
+                end: code_len,
+            },
+        ];
+        let labels = BTreeMap::from([(Label(1), 0), (Label(2), 1)]);
+
+        let name_atom = module.atom_table.intern(function);
+        module.functions.push(Function {
+            func_label: Label(1),
+            entry_label: Label(2),
+            module: module.name,
+            name: name_atom,
+            arity,
+            code,
+            blocks,
+            labels,
+        });
+        module.exports.push(Export {
+            function: name_atom,
+            arity,
+            label: Label(2),
+        });
+        (module, name_atom)
+    }
+
+    /// A module `f/0` whose body block is `rounds` consecutive **non-tail `call_ext`s**
+    /// to `erlang:'+'/2`: `x(0)` accumulates (starting at `0`), `x(1)` is the constant
+    /// `1`. This is the call-dense straight-line shape — the maximum number of
+    /// continuation addresses one IR block can hold — so it is the worst case for the
+    /// sub-block pass.
+    fn call_dense_module(rounds: usize) -> Module {
+        let mut body = vec![
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Integer(1),
+                dst: Operand::X(1),
+            },
+        ];
+        for _ in 0..rounds {
+            body.push(Instr::CallExt {
+                arity: 2,
+                target: ImportRef(0),
+            });
+        }
+        body_module("call_dense", "f", 0, &[("erlang", "+", 2)], body).0
+    }
+
+    /// The emitted byte total of the **eager** (whole-module) artifact for a body of
+    /// `rounds` frame-preserving calls.
+    fn eager_code_len(rounds: usize) -> usize {
+        compile_module(&call_dense_module(rounds))
+            .expect("the call-dense module compiles")
+            .code_len()
+    }
+
+    /// The emitted byte total of the **lazy** (per-function) artifact for the same shape.
+    fn lazy_code_len(rounds: usize) -> usize {
+        let module = call_dense_module(rounds);
+        let labels = interpreter::build_label_map(&module);
+        compile_function(&module, &labels, 0)
+            .expect("the call-dense module compiles")
+            .buffer
+            .len()
+    }
+
+    /// The continuation sub-blocks must lower **disjoint** ranges, so the emitted code
+    /// grows **linearly** with the number of frame-preserving calls, not quadratically.
+    ///
+    /// Before the range cut each of the `n` continuation addresses got a sub-block
+    /// covering `[p, block.end)`, so the block tail was re-emitted once per call —
+    /// `~n²/2` instructions, ~16× the code at `4n` calls versus `n`. With each range
+    /// capped at the next continuation address the ranges tile the block and the total
+    /// is O(n), ~4× at `4n` versus `n`. Both layouts are pinned.
+    #[test]
+    fn the_continuation_sub_blocks_scale_linearly_not_quadratically() {
+        let dense = 64usize;
+        for (layout, len) in [
+            ("eager", eager_code_len as fn(usize) -> usize),
+            ("lazy", lazy_code_len as fn(usize) -> usize),
+        ] {
+            let small = len(dense);
+            let large = len(4 * dense);
+            let ratio = large as f64 / small as f64;
+            assert!(
+                small > 0 && ratio < 6.0,
+                "{layout}: {} calls cost {large} bytes vs {small} at {dense} — {ratio:.2}× \
+                 (disjoint ranges are ~4×, overlapping tails ~16×), so the continuation \
+                 sub-blocks are still O(n²)",
+                4 * dense,
+            );
+            // The per-step increment must not grow as the body grows: a quadratic term
+            // would roughly double it each time the call count doubles.
+            let first = len(2 * dense) - len(dense);
+            let second = len(4 * dense) - len(2 * dense);
+            assert!(
+                second < 3 * first,
+                "{layout}: the +{dense}-call increment grew from {first} to {second} bytes \
+                 (a linear emitter keeps it roughly constant; a quadratic one doubles it)",
+            );
+        }
+    }
+
+    /// `f/0`'s body block is `rounds` consecutive non-tail `call_ext`s into
+    /// `callee:inc/1`.
+    ///
+    /// The body opens with `allocate 0` and closes with `deallocate 0` before the
+    /// `return`: a frame-preserving call writes its continuation into the **live**
+    /// frame's continuation slot, so a body that made non-tail calls without owning a
+    /// frame would leave its own `return` reading the last call's continuation (an
+    /// infinite loop). The `deallocate` restores the bottom frame's `Halt`.
+    fn caller_module(rounds: usize) -> (Module, Atom) {
+        let mut body = vec![
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+        ];
+        for _ in 0..rounds {
+            body.push(Instr::CallExt {
+                arity: 1,
+                target: ImportRef(0),
+            });
+        }
+        body.push(Instr::Deallocate(0));
+        body_module("caller", "f", 0, &[("callee", "inc", 1)], body)
+    }
+
+    /// `callee:inc/1` — `x(0) := x(0) + 1`.
+    fn callee_module() -> (Module, Atom) {
+        let body = vec![Instr::Bif {
+            arity: 2,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            args: vec![Operand::X(0), Operand::Integer(1)],
+            dst: Operand::X(0),
+        }];
+        body_module("callee", "inc", 1, &[("erlang", "+", 2)], body)
+    }
+
+    /// The disjoint sub-blocks must still execute **every** call: a host that resolves
+    /// the `call_ext` into the same machine (`Step::Enter`) makes the driver re-enter
+    /// at each call's continuation address, which is exactly a truncated sub-block's
+    /// entry. `rounds` calls that each add one must therefore accumulate to `rounds`,
+    /// on both tiers — a cut that dropped the tail of a call before its effect could
+    /// not produce this value.
+    #[test]
+    fn the_disjoint_sub_blocks_still_run_every_call_ext() {
+        const ROUNDS: usize = 8;
+        let (caller, name) = caller_module(ROUNDS);
+        let (callee, _) = callee_module();
+        let callee = std::sync::Arc::new(callee);
+
+        for tier in [Tier::Interpreter, Tier::BaselineJit] {
+            let mut ctx = MinimalContext::new();
+            // The reference `erlang:'+'/2` the callee's `Bif` reaches synchronously.
+            ctx.set_bif_hook(crate::jit::bench::support::arith_hook(None, None));
+            let target = std::sync::Arc::clone(&callee);
+            ctx.set_external_resolver(Box::new(move |module, function, arity| {
+                if module == "callee" && function == "inc" && arity == 1 {
+                    // The callee's entry label (the label after its `func_info`).
+                    Ok(Some((std::sync::Arc::clone(&target), Label(2))))
+                } else {
+                    Ok(None)
+                }
+            }));
+
+            let mut machine = Machine::new();
+            let outcome = machine
+                .run_export_outcome_with_tier(&caller, name, 0, &[], &mut ctx, tier)
+                .unwrap_or_else(|err| panic!("{tier:?}: the cross-module run returns: {err:?}"));
+            assert_eq!(
+                outcome,
+                RunOutcome::Returned(make_small(ROUNDS as i64)),
+                "{tier:?}: {ROUNDS} resolved `callee:inc/1` calls accumulate to {ROUNDS} \
+                 — a truncated sub-block that skipped a call before its effect could not"
+            );
+        }
+    }
+}
