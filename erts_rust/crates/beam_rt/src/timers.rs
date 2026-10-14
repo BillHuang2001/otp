@@ -104,6 +104,61 @@ pub(crate) fn timer_delay(term: Eterm) -> beam_common::Result<Duration> {
     Ok(delay)
 }
 
+/// `ERTS_MONOTONIC_TO_MSEC(ERTS_MONOTONIC_BEGIN)` — the lowest absolute Erlang monotonic
+/// time an `{abs, true}` argument may name, in milliseconds (`erl_time.h:235-239,256`).
+const ERTS_MONOTONIC_BEGIN_MSEC: i64 = 1;
+/// `ERTS_MONOTONIC_TO_MSEC(ERTS_MONOTONIC_END)` — the highest one (`erl_time.h:235-239,256`).
+const ERTS_MONOTONIC_END_MSEC: i64 = 9_223_372_036;
+/// `ERTS_MONOTONIC_OFFSET_MSEC` — the external-to-internal conversion the C applies to an
+/// absolute time (`ERTS_MONOTONIC_TIME_START_EXTERNAL - ERTS_MONOTONIC_BEGIN`, in ms;
+/// `erl_time.h:331-338`).
+const ERTS_MONOTONIC_OFFSET_MSEC: i64 = -576_460_753;
+/// The delay of an **absolute** timer BIF: an `{abs, true}` time argument is an Erlang
+/// monotonic time in milliseconds, so the delay is what is left of it.
+///
+/// This reproduces the C's absolute arm (`parse_timeout_pos`,
+/// `erts/emulator/beam/erl_hl_timer.c:2517-2529`) against the ERTS monotonic-time interface
+/// constants (`erl_time.h:235-338`): the argument is converted into ERTS's **internal**
+/// millisecond base and checked against the representable window, and the remaining time is
+/// its distance from `now_nanos` — the runtime's own monotonic clock, read from the
+/// registered `erlang:monotonic_time/0` by the [`RuntimeHooks`] spawner so that it is the
+/// **same** clock the caller's own value came from (`timer:system_time/0` is
+/// `erlang:monotonic_time(microsecond)` rounded up).
+///
+/// The conversion offsets cancel in the subtraction, so the remaining time reduces to
+/// `t - now_millis`; the window check is the base-sensitive half, and it is what makes an
+/// out-of-range absolute time the oracle's `badarg` instead of a wrong deadline.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-integer argument, one outside the representable absolute
+/// window, or one whose deadline would overflow the runtime's monotonic clock — the
+/// oracle's `badarg` in each case.
+///
+/// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
+pub(crate) fn timer_absolute_delay(term: Eterm, now_nanos: i64) -> beam_common::Result<Duration> {
+    if !is_small(term) {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    let absolute = signed_value(term);
+    let internal = absolute
+        .checked_add(ERTS_MONOTONIC_OFFSET_MSEC)
+        .ok_or(beam_common::BeamError::BadArg)?;
+    if !(ERTS_MONOTONIC_BEGIN_MSEC..=ERTS_MONOTONIC_END_MSEC).contains(&internal) {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    let remaining = absolute.saturating_sub(now_nanos.div_euclid(1_000_000));
+    if remaining <= 0 {
+        // A time that has already passed fires at the next scheduler pass, exactly as the
+        // C's wheel behaves with a deadline in the past.
+        return Ok(Duration::ZERO);
+    }
+    let delay = Duration::from_millis(u64::try_from(remaining).unwrap_or(u64::MAX));
+    if Instant::now().checked_add(delay).is_none() {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    Ok(delay)
+}
 /// The destination of a timer: a pid (pinned now) or a registered name (resolved when the
 /// timer fires).
 ///
