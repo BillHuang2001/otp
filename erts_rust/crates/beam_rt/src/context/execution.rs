@@ -55,6 +55,29 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// 3. Otherwise an external module call: the module is loaded on demand from the
     ///    code path and run with `self` as the context. `erlang` is the BIF namespace,
     ///    never a loadable module, so an unknown `erlang:*` call is a typed diagnostic.
+    /// The **local**-call half of the host seam: `Ok(true)` when this host serves
+    /// `(module, function, arity)` itself, so the engine marshals `x(0..arity)` through
+    /// [`Self::call_bif`] under the arm's own frame discipline.
+    ///
+    /// The only local keys the runtime serves are the `prim_tty` NIF library's **non-exported**
+    /// stubs (`tty_create/1`, `tty_init/2`, `setlocale/1`, `tty_select/2`,
+    /// `tty_window_size/1`, `tty_encoding/1`, `write_nif/2`, `read_nif/3`, `isprint/1`,
+    /// `wcwidth/1`, `setupterm_nif/0`, `tiget*_nif/1`, `tinfo_nif/0`, `tputs_nif/2` — the
+    /// compiler emits a LOCAL `call`/`call_only` for each, so `call_ext`/`floor_shadows`
+    /// never sees them). ERTS serves that library from its static NIF table; the Rust
+    /// counterpart is [`crate::native::prim_tty`], and the dispatch lands on the SAME
+    /// `try_native` arm the exported stubs use, so there is one implementation.
+    ///
+    /// This is consulted for **every** local call in **every** module, so it must answer
+    /// `Ok(false)` for everything else — [`crate::native::prim_tty::serves_local_call`]
+    /// (a `prim_tty` module check plus a `NIF_KEYS` membership test) does.
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        Ok(crate::native::prim_tty::serves_local_call(
+            module, function, arity,
+        ))
+    }
+
+    /// The host's own call into a callee, under the arm's frame discipline.
     fn call_bif(
         &mut self,
         module: &str,

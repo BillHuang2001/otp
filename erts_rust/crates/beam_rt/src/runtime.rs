@@ -502,6 +502,14 @@ pub struct Runtime {
     /// live in one thread — a process-global table would let their handles collide. See
     /// [`crate::native::prim_file`].
     open_files: HashMap<u64, std::fs::File>,
+    /// The live `prim_tty` handles (contract A.7) — each entry maps the reference id minted
+    /// by `tty_create/1` (`src/native/prim_tty.rs`) to the output file descriptor it names.
+    ///
+    /// The handle is the oracle's opaque NIF resource (`#Ref<…>`-shaped and unobservable); a
+    /// term whose id is not in this table is the C's `enif_get_resource` failure (`badarg`).
+    /// Owned by the `Runtime` (not a `thread_local!`) because several runtimes can live in one
+    /// thread.
+    prim_tty_handles: HashMap<u64, i32>,
     /// The **native `file_server_2` service** and its live io-devices (contract A.9) — see
     /// [`crate::native::file_server`].
     ///
@@ -754,6 +762,7 @@ impl Runtime {
             inbound_delivery: true,
             perf_map,
             open_files: HashMap::new(),
+            prim_tty_handles: HashMap::new(),
             file_services,
             boot_script_id: None,
             boot_script_path: None,
@@ -1033,6 +1042,15 @@ impl Runtime {
     /// [`crate::native::prim_file`] is the module that mutates it.
     pub(crate) fn open_files_mut(&mut self) -> &mut HashMap<u64, std::fs::File> {
         &mut self.open_files
+    }
+    /// The live `prim_tty` handle table (contract A.7), keyed by the reference id the handle
+    /// term carries.
+    ///
+    /// Both halves of the `prim_tty` floor go through here: `tty_create/1` inserts the minted
+    /// handle's `ofd`, and every other stub looks it up (a miss is `badarg`). See the field's
+    /// own docs and [`crate::native::prim_tty`].
+    pub(crate) fn prim_tty_handles_mut(&mut self) -> &mut HashMap<u64, i32> {
+        &mut self.prim_tty_handles
     }
 
     /// Takes a heap for one BIF call out of the pool.

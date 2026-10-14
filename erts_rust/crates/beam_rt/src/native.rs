@@ -103,6 +103,7 @@ mod node;
 pub(crate) mod port;
 mod prim;
 mod prim_file;
+pub(crate) mod prim_tty;
 mod process;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -127,7 +128,7 @@ use crate::format;
 /// written next to the `try_native` match arms it mirrors, and
 /// [`tests::every_floor_module_is_a_real_try_native_arm`] pins it against that source so it
 /// cannot silently drift out of the host's dispatch.
-pub(crate) const FLOOR_MODULES: [&str; 12] = [
+pub(crate) const FLOOR_MODULES: [&str; 13] = [
     "application",
     "code",
     "erl_ddll",
@@ -140,6 +141,7 @@ pub(crate) const FLOOR_MODULES: [&str; 12] = [
     "net_kernel",
     "os",
     "prim_file",
+    "prim_tty",
 ];
 
 /// Whether [`RuntimeContext::resolve_external_call`] must refuse to enter
@@ -197,6 +199,11 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
         // (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an
         // ordinary body in `lib/stdlib/src/io.erl`.
         "io" => Some(&[("put_chars", 1), ("put_chars", 2)]),
+        // `prim_tty` is a NIF library served whole from the floor: its `NIF_KEYS` list is
+        // exactly the `-nifs` surface of `lib/kernel/src/prim_tty.erl`, so the stubs are
+        // refused (→ `call_bif` → `try_native`) while the module's Erlang wrappers are
+        // ordinary `.beam` bodies.
+        "prim_tty" => Some(&prim_tty::NIF_KEYS),
         // `application` is partly `lib/kernel/src/application.erl` bodies (`set_env/3,4`,
         // `load/1`, `start_boot/2`, `unset_env/2,3`, …), each a thin wrapper that delegates
         // to `application_controller` — the mirror of the `io` case.
@@ -458,6 +465,13 @@ impl RuntimeContext<'_> {
             // is never entered in-machine. One arm; the per-function dispatch lives in
             // [`loader`], which answers `None` for the archive half of the API.
             ("erl_prim_loader", _, _) => self.loader_call(function, arity, args),
+            // The `prim_tty` NIF library's stubs (contract A.7). ERTS serves them from its
+            // static NIF table, so `erlang:load_nif("prim_tty", …)` never `dlopen`s a shared
+            // object; [`prim_tty`] is the Rust counterpart, and its `NIF_KEYS` is the key
+            // list [`floor_shadows`] refuses — so exactly the NIF stubs reach this arm and
+            // every unlisted Erlang wrapper (`load/0`, `init/1`, `writer/1`, …) stays
+            // enterable in-machine, protecting its `receive`s.
+            ("prim_tty", _, _) => self.prim_tty_call(function, arity, args),
             _ => None,
         }
     }
