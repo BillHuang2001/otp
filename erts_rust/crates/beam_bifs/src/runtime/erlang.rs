@@ -935,7 +935,7 @@ mod tests {
         let registered = default_registry();
         let census = crate::bif_tab::census(&tab, &registered);
         assert_eq!(census.implemented_count(), 556);
-        assert_eq!(census.fast_path_count(), 89);
+        assert_eq!(census.fast_path_count(), 91);
 
         // Seed every name the sweep touches, so `ctx.atom` never needs an interner.
         let mut names: Vec<&str> = vec!["true", "false"];

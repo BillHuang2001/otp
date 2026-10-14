@@ -15,11 +15,11 @@ Ground truth (read-only): `../../erts/emulator/beam/` (files in the Routing Tabl
 
 ## Roster census (authoritative; code-derived, pinned by `tests/roster_audit.rs`)
 `bif.tab` declares **556** entries (`bif` 476, `ubif` 73, `hbif` 7); **0 are missing**. `default_registry()` =
-`BifRegistry::with_core_bifs()` = **645 keys** = **556 declared + 89 stdlib fast paths** (exports `bif.tab` does
+`BifRegistry::with_core_bifs()` = **647 keys** = **556 declared + 91 stdlib fast paths** (exports `bif.tab` does
 not declare: `lists` +40 over its 5 declared keys — 18 of them fun-taking — `maps` +12 over its 12, 8 `ets:*`,
 `io`/`io_lib`, `unicode`, `binary:referenced_byte_size/1`, the OTP-30 `pid_to_binary`/`ref_to_binary`/
-`port_to_binary`, `erlang:memory/0,1`, `erlang:convert_time_unit/3`, the four `zlib:compress/1`/`uncompress/1`/
-`zip/1`/`unzip/1`). Re-derive
+`port_to_binary`, `erlang:memory/0,1`, `erlang:convert_time_unit/3`, the six `zlib` fast paths — `compress/1`/
+`uncompress/1`/`zip/1`/`unzip/1`/`gzip/1`/`gunzip/1`). Re-derive
 any split from the registry, never from this prose.
 **Declared ≠ registered ≠ adopted.** Of the 556, **346 are unconditional in-crate** and **210 are seam-backed**
 (they route through one of the fifteen optional `BifContext` hooks and answer the typed `unsupported_bif` until a
@@ -173,28 +173,42 @@ unit), every other atom is its units-per-second ratio (`UnitRatio::Small`), and 
 `try … catch _:_ -> error_with_info(badarg, …)`, so **every** failure (an unknown unit atom, a zero/negative unit, a
 non-atom non-integer unit, a non-integer `Time`, a product past the bignum cap — `trap_arith_class`) is `badarg`.
 
-### `zlib` (`src/zlib.rs`, `src/deflate.rs`) — the four self-contained fast paths
+### `zlib` (`src/zlib.rs`, `src/deflate.rs`) — the six self-contained fast paths
 `zlib` is **preloaded**: `../../erts/preloaded/src/zlib.erl` is real Erlang, and its stream interface
 (`open/0`→`deflateInit/2`→`deflate/3`→…→`close/1`) is `erlang:nif_error(undef)` stubs for the statically linked
-zlib NIF (`../../erts/emulator/beam/erl_zlib.c`) this runtime does not carry, so four self-contained functions are
-registered instead — none is a `bif.tab` entry (the table declares the NIF stubs). All four take **iodata**
+zlib NIF (`../../erts/emulator/beam/erl_zlib.c`) this runtime does not carry, so six self-contained functions are
+registered instead — none is a `bif.tab` entry (the table declares the NIF stubs). All six take **iodata**
 (`binary::iodata_bytes`: a bare integer, an atom, an element outside `0..=255` and a non-byte-aligned bitstring are
 all `badarg`).
 - `compress/1` emits one RFC 1950 stream (2-byte header + deflate + Adler-32) at `DEFAULT_COMPRESSION_LEVEL` = 6 over
   `beam_codec::compress` (the existing `flate2`/`rust_backend` codec — **no new dependency edge**); `uncompress/1`
   requires at least `MIN_UNCOMPRESS_LENGTH` = 8 bytes, and **every** other failure is `data_error`, never `badarg`
-  (the length arm is raised *inside* `zlib.erl`'s `try` body, so that body's own `catch _:_ -> badarg` does not cover it).
+  (the length arm is raised *inside* `zlib.erl`'s `try` body, so that body's own `catch _:_ -> badarg` does not cover
+  it). It inflates through `beam_codec::compress::decompress_bounded(data, expansion_limit(len))` with the DEFLATE
+  format's own `MAX_DEFLATE_EXPANSION` = 1032:1 bound — **no artificial size ceiling**, so any payload the oracle
+  inflates inflates here too.
 - `zip/1`/`unzip/1` are the **raw DEFLATE (RFC 1951)** pair — *not* gzip: `zlib.erl` opens them with `-MAX_WBITS`.
   `zip/1` strips the 2-byte header and 4-byte Adler-32 off a `beam_codec::compress` stream (the framing and the
   FDICT bit are asserted before the slice is taken); `unzip/1` is the self-contained safe-Rust RFC 1951 decoder in
   `src/deflate.rs` (stored/fixed/dynamic blocks, the code-length repeat codes 16/17/18, the 32 KiB window), because
   `beam_codec`'s inflater is RFC 1950-only *and* verifies the Adler-32, so a raw stream cannot be re-wrapped.
   Argument errors are `badarg`; a stream the inflater cannot finish (empty, truncated, bad tables, reserved block) is
-  the bare-atom `error:data_error`; bytes after the final block are ignored, exactly like the oracle.
+  the bare-atom `error:data_error`; bytes after the final block are ignored, exactly like the oracle. `unzip/1` is
+  the one function that still carries the `MAX_UNCOMPRESSED` (32 MiB) ceiling.
+- `gzip/1`/`gunzip/1` are **RFC 1952 members**: a fixed 10-byte header (`1f 8b 08 00` = ID1/ID2, CM=8, FLG=0,
+  MTIME=0, XFL=0, OS=3) + a raw DEFLATE payload + the LE CRC-32 of the *original* data + the LE ISIZE
+  (length mod 2^32). `gzip/1` reuses `beam_codec::compress` and strips it exactly as `zip/1` does; `gunzip/1` checks
+  the fixed header, rejects the reserved `FLG` bits (`0xe0`), skips/validates `FEXTRA`/`FNAME`/`FCOMMENT` and
+  **verifies** `FHCRC` (the low 16 bits of `crc32_step(0, header)`), inflates, verifies both trailers, then **loops**
+  so concatenated members concatenate (the oracle's inflater resets per member, and the gzip wrap means no
+  zlib-framed stream is accepted). The CRC-32 is `checksum.rs`'s `crc32_step` — the single home, widened to
+  `pub(crate)` rather than copied. Every malformed input is the bare-atom `error:data_error` (`<<>>`, a bad
+  ID1/ID2/CM, a reserved `FLG` bit, a corrupted CRC-32/ISIZE, trailing junk, a lone magic byte, a bare trailing
+  header, a stream truncated in the header or the trailer); `badarg` only for non-iodata, and zero members ⇒
+  `data_error`.
 The deflate payload is miniz_oxide's, so byte identity with the oracle's stream is **not** promised (the framing,
-interop and the round trip are). Typed limits: a decompressed payload above `beam_codec::compress::MAX_UNCOMPRESSED`
-(32 MiB) is `data_error` where the oracle inflates, and `gzip/1`/`gunzip/1` (RFC 1952) plus the whole stream API
-stay `undef`. No `unsafe`.
+interop and the round trip are). Typed limit: `unzip/1`'s ceiling above; the stream API
+(`open`/`deflate`/`inflate`/`close`, `*_init`/`*_reset`) stays `undef`. No `unsafe`.
 
 ### The auxiliary BIF modules
 - `checksum.rs` (10): CRC-32/Adler-32 (+ the `*_combine/3` forms) and `md5/1` plus the streaming
@@ -367,8 +381,10 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
   suite result lines / 1620 tests** (all green): the lib suite (816), 80 integration files (804), and two empty
   harnesses. Re-derive the split from the per-suite `test result` lines, not from a hand-maintained table.
 - **Pins.** `tests/roster_audit.rs` is the roster pin (see the census section). `tests/bif_tab.rs` pins the parsed
-  `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 89`,
-  `REGISTRY_SIZE = 645`) — it reads the registry, never altering dispatch. `tests/registry_hot_path.rs` is a
+  `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 91`,
+  `REGISTRY_SIZE = 647`) — it reads the registry, never altering dispatch. `src/runtime/erlang.rs`'s
+  `is_builtin_sweeps_the_declared_table_and_the_whole_fast_path_set` pins the same two figures in-crate.
+  `tests/registry_hot_path.rs` is a
   per-thread-armed counting `#[global_allocator]` proving `lookup`/`contains`/hit-`call` allocate **0** bytes, plus a
   median/p99 ns/call print with a loose regression tripwire; `tests/decode_hot_path.rs` is the same
   allocation-counting technique applied to `binary_to_term/1`, pinning that its steady-state cost does not scale with
@@ -383,8 +399,7 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
   limiting `{chars_limit,N}` rendering and the `~ts` matrix against committed goldens **plus** a fail-loud live-oracle
   cross-check; `tests/phash.rs`, `tests/checksum.rs` (incl. the MD5 `pad` KAT boundary), `tests/packet*.rs` and
   `tests/zlib.rs` (the raw-DEFLATE pairs, incl. a level/size sweep that crosses all three block types and a
-  `zlib:zip/1` cross-check against the live oracle) do the same. Most other "matches the oracle" tests are pinned-golden self-checks. Integration files that shell out to `erl`
-  are **fail-loud** (they panic when `erl` is absent or errors, instead of passing vacuously). **Still missing:** a
+  `zlib:zip/1` cross-check against the live oracle) do the same. Most other "matches the oracle" tests are pinned-golden self-checks. **Still missing:** a
   dedicated `math` domain-error-matrix file (differential evidence for `math` (32 probes), `checksum` (34),
   `match_spec_test/3` (9), `calendar`/`os_bif` (21) was gathered during development but is not yet committed).
 - **Committed micro-benchmarks** (`--release`; read the printed ratios, absolute latencies are meaningless on the
@@ -606,7 +621,7 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 
 ## Routing Table
 - `src/lib.rs` -> crate docs, module wiring, root re-exports, `prelude`, `#![deny(unsafe_code)]`
-- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (645 keys, `runtime` last), `default_registry`
+- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (647 keys, `runtime` last), `default_registry`
 - `src/hook_sets.rs` -> the thirteen hook-gate sets (244 keys; 240 deduped) + the `needs_*` predicates
 - `src/runtime/` (**`./src/runtime/CONTEXT.md`**) -> the 209 runtime-coupled BIFs (incl. the 8 real `re` keys)
 - `src/re/` (**`./src/re/CONTEXT.md`**) -> the self-contained regex engine serving the 8 `re:*` BIFs
@@ -630,8 +645,8 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - `src/string.rs` / `src/unicode.rs` / `src/unicode/` (**`./src/unicode/CONTEXT.md`**, sub-node `grapheme/`) /
   `src/time.rs` -> `string:list_to_float/1`; the `unicode` conversions (UTF-16/32 codecs, the grapheme-cluster port);
   `time` — `monotonic_time`/`system_time`/`time_offset`/`unique_integer`/`timestamp` **and** the `erlang:convert_time_unit/3` fast path
-- `src/zlib.rs` / `src/deflate.rs` -> the four `zlib` fast paths (`compress/1`/`uncompress/1` over
-  `beam_codec::compress`, RFC 1950) and the raw DEFLATE `zip/1`/`unzip/1` pair over the self-contained RFC 1951 decoder
+- `src/zlib.rs` / `src/deflate.rs` -> the six `zlib` fast paths: `compress/1`/`uncompress/1` (RFC 1950 over
+  `beam_codec::compress`) and the `zip/1`/`unzip/1` + `gzip/1`/`gunzip/1` pairs over the self-contained RFC 1951 decoder
 - `src/proc.rs` / `src/dict.rs` / `src/port.rs` -> `self`/`send`/`!`/`send/3` (the `SendHook` family); the
   `DictHook` BIFs; the `PortHook` BIFs
 - `src/ets.rs` / `src/ets/` (**`./src/ets/CONTEXT.md`**) -> the `ets:*` bridge (59 keys) + `arith_hook.rs` (`PrecisionArith`)
