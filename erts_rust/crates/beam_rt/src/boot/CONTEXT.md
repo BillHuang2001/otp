@@ -119,14 +119,21 @@ The tail's 0-based indices: **12** `{kernelProcess,heart,{heart,start,[]}}`,
 `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`, **15**
 `{progress,init_kernel_started}`, **16** `{apply,{application,load,[{application,stdlib,Props}]}}`,
 **17** `{progress,applications_loaded}`, **18**
-`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}` (runs to completion — the
-kernel application starts and stays up), **19**
+`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}` (its `apply` **returns `Ok`**,
+but the kernel application **crashes** during that directive's scheduler drive — `kernel:start/2` raises,
+the `permanent` app tears down, and `=INFO REPORT … application: kernel exited …` is logged to stdout; the
+app never stays up), **19**
 `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}` (the **stop**),
 **20** `{apply,{c,erlangrc,[]}}`, **21** `{progress,started}`.
-Directives 0–18 run; the three `{kernelProcess, …}` startups (12–14) succeed and the kernel
-application's start (18) completes; the stop is a **cross-crate blocker in the stdlib start (19)**,
-owned by `erts_rust/crates/beam_engine` — the full chain is in *Remaining gaps* item 1 below, together
-with the tests that assert the full 22-directive completion and currently fail.
+Directives 0–18 run; the three `{kernelProcess, …}` startups (12–14) succeed and directive 18's `apply`
+returns `Ok` while the kernel application it started dies; the stop is a **cross-crate blocker in the
+stdlib start (19)**, owned by `erts_rust/crates/beam_engine` — the full chain is in *Remaining gaps* item
+1 below, together with the tests that assert the full 22-directive completion and currently fail.
+The `BEAM_RT_BOOT_TRACE` trace (`src/debug_trace.rs`) confirms the ordering: `apply application:start_boot
+/2 -> Ok(Wait …)` for directive 18, then (during its drive) `process … raised: proc_lib:exit_p/3` and the
+kernel-exited report, then directive 18's resume returns `Ok`, then directive 19's `apply` enters and
+immediately returns `Err` (the `application_controller` is already gone, so its `gen_server:call` raises
+`noproc` with no `Wait` at all).
 - **Instructions 20–21 are not reached.** `c:erlangrc/0`'s file consult is
   `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
   (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt` registers a runtime-native
