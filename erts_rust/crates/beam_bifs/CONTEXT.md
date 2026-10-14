@@ -43,7 +43,7 @@ Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifCo
 (validation tooling, not a runtime seam).
 - **`registry.rs`** — `BifFn = fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>`; `BifRegistry` (nested
   `module → function → [(arity, BifFn)]` maps, so `lookup`/`contains` are allocation-free; `new`/`is_empty`/`len`/
-  `names`/`entries`); `with_core_bifs()` (the 646-key roster) = `default_registry()`; `register(...) -> Option<BifFn>`
+  `names`/`entries`); `with_core_bifs()` (the 648-key roster) = `default_registry()`; `register(...) -> Option<BifFn>`
   (replaces on repeat); `call(...)` (unknown key ⇒ `error::undefined_bif`; wrong arg count ⇒ `BadArity`). Operator
   BIFs keep their *quoted* `bif.tab` names (`"+"`, `"=<"`, `"=:="`, `"!"`, `"++"`, `"not"`, …). `with_core_bifs`
   calls each module's `pub(crate) fn register` in a fixed order (`ets` wiring
@@ -190,25 +190,17 @@ all `badarg`).
 - `zip/1`/`unzip/1` are the **raw DEFLATE (RFC 1951)** pair — *not* gzip: `zlib.erl` opens them with `-MAX_WBITS`.
   `zip/1` strips the 2-byte header and 4-byte Adler-32 off a `beam_codec::compress` stream (the framing and the
   FDICT bit are asserted before the slice is taken); `unzip/1` is the self-contained safe-Rust RFC 1951 decoder in
-  `src/deflate.rs` (stored/fixed/dynamic blocks, the code-length repeat codes 16/17/18, the 32 KiB window), because
-  `beam_codec`'s inflater is RFC 1950-only *and* verifies the Adler-32, so a raw stream cannot be re-wrapped.
-  Argument errors are `badarg`; a stream the inflater cannot finish (empty, truncated, bad tables, reserved block) is
-  the bare-atom `error:data_error`; bytes after the final block are ignored, exactly like the oracle. `unzip/1` is
-  the one function that still carries the `MAX_UNCOMPRESSED` (32 MiB) ceiling.
-- `gzip/1`/`gunzip/1` are **RFC 1952 members**: a fixed 10-byte header (`1f 8b 08 00` = ID1/ID2, CM=8, FLG=0,
-  MTIME=0, XFL=0, OS=3) + a raw DEFLATE payload + the LE CRC-32 of the *original* data + the LE ISIZE
-  (length mod 2^32). `gzip/1` reuses `beam_codec::compress` and strips it exactly as `zip/1` does; `gunzip/1` checks
-  the fixed header, rejects the reserved `FLG` bits (`0xe0`), skips/validates `FEXTRA`/`FNAME`/`FCOMMENT` and
-  **verifies** `FHCRC` (the low 16 bits of `crc32_step(0, header)`), inflates, verifies both trailers, then **loops**
-  so concatenated members concatenate (the oracle's inflater resets per member, and the gzip wrap means no
-  zlib-framed stream is accepted). The CRC-32 is `checksum.rs`'s `crc32_step` — the single home, widened to
-  `pub(crate)` rather than copied. Every malformed input is the bare-atom `error:data_error` (`<<>>`, a bad
-  ID1/ID2/CM, a reserved `FLG` bit, a corrupted CRC-32/ISIZE, trailing junk, a lone magic byte, a bare trailing
-  header, a stream truncated in the header or the trailer); `badarg` only for non-iodata, and zero members ⇒
-  `data_error`.
+  `src/deflate.rs`, because `beam_codec`'s inflater is RFC 1950-only *and* verifies the Adler-32. `gzip/1`/`gunzip/1`
+  are the **RFC 1952** pair: a fixed 10-byte header (`1f 8b 08 00` = ID1/ID2, CM=8, FLG=0, MTIME=0, XFL=0, OS=3) +
+  the raw DEFLATE payload + the LE CRC-32 of the *original* data + the LE ISIZE (length mod 2^32); `gunzip/1`
+  validates the header (reserved `FLG` bits, `FEXTRA`/`FNAME`/`FCOMMENT`, `FHCRC`), verifies both trailers, and
+  **loops** so concatenated members concatenate. Every malformed input is the bare-atom `error:data_error` (`<<>>`, a
+  bad magic/CM, a reserved `FLG` bit, a corrupted CRC-32/ISIZE, trailing junk, truncation); `badarg` only for
+  non-iodata. `unzip/1` is the one function that still carries the `MAX_UNCOMPRESSED` (32 MiB) ceiling. The CRC-32
+  is `checksum.rs`'s `crc32_step` (widened to `pub(crate)`, not copied).
 The deflate payload is miniz_oxide's, so byte identity with the oracle's stream is **not** promised (the framing,
-interop and the round trip are). Typed limit: `unzip/1`'s ceiling above; the stream API
-(`open`/`deflate`/`inflate`/`close`, `*_init`/`*_reset`) stays `undef`. No `unsafe`.
+interop and the round trip are). The stream API (`open`/`deflate`/`inflate`/`close`, `*_init`/`*_reset`) stays
+`undef`. No `unsafe`.
 
 ### The auxiliary BIF modules
 - `checksum.rs` (10): CRC-32/Adler-32 (+ the `*_combine/3` forms) and `md5/1` plus the streaming
@@ -259,10 +251,9 @@ short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
   image, so a novel atom's index equals the `AtomInterner` prediction (`base = shared.len()`); any other table shape
   (moved/shorter, or a scratch left ahead by a failed/`safe` decode) forces a rebuild. `BifContext::atom_and_heap` is
   the one borrow-split route, so **no BIF clones the whole `AtomTable` per call** — `tests/decode_hot_path.rs` pins the
-  steady-state per-call allocation count as table-size-**independent** (9 allocations / 602 bytes for a 114-byte image,
-  identical at 137 and 4105 atoms; the plain `AtomTable::clone()` counterfactual is 276 → 8212, and clone+decode
-  284 → 8220). Measured (`examples/etf_bench.rs`, atoms=3009, 20k iters): a clone-per-call decode is 130.3 µs/op
-  against the memoized **5.45 µs/op (23.9×)**, of which ~5.85 µs is that verification.
+  steady-state per-call allocation count as table-size-**independent** (9 allocations / 602 bytes, identical at 137
+  and 4105 atoms). Measured (`examples/etf_bench.rs`): a clone-per-call decode is 130.3 µs/op against the memoized
+  **5.45 µs/op (23.9×)**.
 - **Options.** `compressed`/`{compressed,0..=9}` really deflate a version-less body and wrap it `[131][80][len][zlib]`
   **only** when the stream fits the C's `body_len - 5` budget (bare atom = level 6); `{minor_version,0|1|2}` selects
   the tag set byte-identically; `iovec`/`fragment` are `badarg`. `[deterministic]` is **fully honoured** (threaded as
@@ -381,8 +372,8 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` with a `BytesSink`/`NullSink` capture.
 - `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **84
-  suite result lines / 1630 tests** (all green): the lib suite (824), 81 integration files (806) and two empty
-  harnesses. Re-derive the split from the per-suite `test result` lines, not from a hand-maintained table.
+  suite result lines / 1640 tests** (all green; lib suite 830). Re-derive the split from the per-suite `test
+  result` lines, not from a hand-maintained table.
 - **Pins.** `tests/roster_audit.rs` is the roster pin (see the census section). `tests/bif_tab.rs` pins the parsed
   `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 92`,
   `REGISTRY_SIZE = 648`) — it reads the registry, never altering dispatch. `src/runtime/erlang.rs`'s
@@ -402,8 +393,7 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
   limiting `{chars_limit,N}` rendering and the `~ts` matrix against committed goldens **plus** a fail-loud live-oracle
   cross-check; `tests/phash.rs`, `tests/checksum.rs` (incl. the MD5 `pad` KAT boundary), `tests/packet*.rs` and
   `tests/zlib.rs` (the raw-DEFLATE pairs, incl. a level/size sweep that crosses all three block types and a
-  `zlib:zip/1` cross-check against the live oracle) do the same. Most other "matches the oracle" tests are pinned-golden self-checks; integration files that shell out to `erl`
-  are **fail-loud** (they panic when `erl` is absent or errors). **Still missing:** a committed differential case for
+  `zlib:zip/1` cross-check against the live oracle) do the same. **Still missing:** a committed differential case for
   the `math` domain-error matrix (development-only evidence exists for `math` 32 probes, `checksum` 34,
   `match_spec_test/3` 9, `calendar`/`os_bif` 21).
 - **Committed micro-benchmarks** (`--release`; read the printed ratios, absolute latencies are meaningless on the
@@ -532,16 +522,12 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   twice (`contains`, then `call`→`lookup`) but allocates nothing.
 - **Arithmetic widens even small ints to a heap `Big`:** `erlang:'-'/2` of two small ints does ~4 small `Vec`
   allocations (a `Big::from_i64` per operand, then `sub`/`add`/`neg`) with no checked-`i64` fast path.
-- **Cross-node:** the shared `AtomTable` copy-on-write clone belongs to `beam_rt`
-  (`CodeServer::atoms_mut` = `Rc::make_mut(&mut self.atoms)`, `beam_rt/src/codeserver.rs:240`); only a call that
-  actually **interns** a name pays the deep clone, which is why the all-known-atom `binary_to_term` hot path pays
-  nothing (`tests/decode_hot_path.rs`).
-- **`prefix_matches` is O(table), and cannot be made O(1) from here:** validating the memoized decode image against
-  the live table needs a cheap *identity* for that table, and `beam_term::AtomTable` exposes none (see Handoffs).
+- **The `AtomTable` deep clone is copy-on-write** (`beam_rt`'s `CodeServer::atoms_mut`, `codeserver.rs:240`): only a
+  call that actually **interns** pays it, and `prefix_matches`'s O(table) revalidation cannot be made O(1) without a
+  table *identity* signal (see Handoffs).
 ## A.9 blockers (self-hosted build: booting kernel, running lib/compiler)
-The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `ets:new/2` option matrix, so
-`application_controller`'s `ets:new(ac_tab, …)` and name-resolved `ets:insert/lookup` work). There is **no
-self-hosted build** yet, and the `ets:foldl/3`/`foldr/3` blocker is in Handoffs.
+The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `ets:new/2` option matrix). There is
+**no self-hosted build**; the remaining blockers are in Handoffs.
 
 ## Handoffs (sibling nodes)
 ### Required from `beam_rt` (exact locations)
