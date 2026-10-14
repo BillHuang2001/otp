@@ -4654,6 +4654,150 @@ fn the_entry_lookup_does_not_rehash_the_module_ir_once_the_memo_is_warmed() {
     );
 }
 
+/// One timed pass of the two-process copy-bound shape: a warmup run, then the measured
+/// run, reported as ns/op plus the number of `module_fingerprint` calls the **measured**
+/// pass made.
+///
+/// The two halves are deliberately kept apart: the hash count is deterministic and is
+/// what the probe asserts on, while the ns/op figure is only meaningful next to
+/// `/proc/loadavg` (this host is shared).
+struct ProbeTiming {
+    /// Nanoseconds per op over [`PROBE_MEASURE_OPS`] ops.
+    ns_per_op: f64,
+    /// Module-IR hashes the measured pass paid.
+    fingerprints: u64,
+}
+
+/// Time one pass of the two-process copy-bound shape on `tier` (see [`ProbeTiming`]),
+/// asserting the pass's result and that both inboxes were drained.
+fn time_probe_shape(
+    bench: &Module,
+    bench_atom: Atom,
+    worker: &Module,
+    worker_atom: Atom,
+    tier: Tier,
+) -> ProbeTiming {
+    // The warmup populates the per-thread compiled-block cache, so the timed pass
+    // measures steady state rather than first-entry compilation.
+    let _ = drive_probe(
+        bench,
+        bench_atom,
+        worker,
+        worker_atom,
+        PROBE_WARMUP_OPS,
+        tier,
+    )
+    .expect("the warmup pass completes");
+    let before = crate::jit::cache::fingerprint_calls();
+    let start = std::time::Instant::now();
+    let (value, _reductions, leftovers) = drive_probe(
+        bench,
+        bench_atom,
+        worker,
+        worker_atom,
+        PROBE_MEASURE_OPS,
+        tier,
+    )
+    .expect("the timed pass completes");
+    let elapsed = start.elapsed();
+    assert_eq!(
+        value,
+        make_small(PROBE_MEASURE_OPS as i64),
+        "{tier:?}: bench/3 must return the iteration count"
+    );
+    assert_eq!(
+        leftovers,
+        (0, 0),
+        "{tier:?}: every message must be consumed by both processes"
+    );
+    ProbeTiming {
+        ns_per_op: elapsed.as_nanos() as f64 / PROBE_MEASURE_OPS as f64,
+        fingerprints: crate::jit::cache::fingerprint_calls() - before,
+    }
+}
+
+/// **The entry-priming measurement**: how much of the baseline tier's per-slice
+/// overhead on the two-process copy-bound shape is the **entry module's IR re-hash**,
+/// and what [`cache::remember_module`](crate::jit::cache::remember_module) buys.
+///
+/// Both tiers are timed twice on the same workload — **unprimed** (the resolution memo
+/// cold, so every slice entry/resume re-derives the entry module's content key from a
+/// full hash of its decoded IR) and **primed** (`remember_module` called once per module
+/// the host enters) — and the `module_fingerprint` count of each measured pass is
+/// reported alongside its ns/op.
+///
+/// The counters are the signal and are asserted; the ns/op figures and their ratio are
+/// printed only (the host is shared — see `/proc/loadavg`), exactly as the copy-bound
+/// probe above does.
+#[test]
+fn the_entry_module_priming_is_measured_on_both_tiers() {
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+    let bench = std::sync::Arc::new(bench);
+    let worker = std::sync::Arc::new(worker);
+
+    println!("=== srbench entry-priming probe: ns/op unprimed vs primed ===");
+    println!("loadavg (start): {}", probe_loadavg());
+
+    // Unprimed first: nothing may warm the memo before the cold passes.
+    let interpreter_unprimed =
+        time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::Interpreter);
+    let baseline_unprimed =
+        time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::BaselineJit);
+    assert_eq!(
+        interpreter_unprimed.fingerprints, 0,
+        "the interpreter tier never resolves a module through the JIT cache"
+    );
+    assert!(
+        baseline_unprimed.fingerprints >= 2 * u64::from(PROBE_MEASURE_OPS),
+        "an unprimed baseline slice must re-hash the entry module's IR (one hash per \
+         slice entry/resume); saw only {} hashes over {} ops",
+        baseline_unprimed.fingerprints,
+        PROBE_MEASURE_OPS,
+    );
+
+    // Primed: one call per module the host actually enters — `bench/3` on the driver
+    // machine, `worker/1` on the worker machine.
+    crate::jit::cache::remember_module(&bench);
+    crate::jit::cache::remember_module(&worker);
+    let interpreter_primed =
+        time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::Interpreter);
+    let baseline_primed =
+        time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::BaselineJit);
+    assert_eq!(
+        baseline_primed.fingerprints, 0,
+        "a primed entry module must be resolved without re-hashing its IR"
+    );
+    assert_eq!(
+        interpreter_primed.fingerprints, 0,
+        "the interpreter tier never resolves a module through the JIT cache"
+    );
+
+    for (name, timing) in [
+        ("interpreter", &interpreter_unprimed),
+        ("baseline-jit", &baseline_unprimed),
+    ] {
+        println!(
+            "{name:>12} tier UNPRIMED: {:>10.2} ns/op ({:>6} IR hashes / {} ops)",
+            timing.ns_per_op, timing.fingerprints, PROBE_MEASURE_OPS,
+        );
+    }
+    for (name, timing) in [
+        ("interpreter", &interpreter_primed),
+        ("baseline-jit", &baseline_primed),
+    ] {
+        println!(
+            "{name:>12} tier PRIMED:   {:>10.2} ns/op ({:>6} IR hashes / {} ops)",
+            timing.ns_per_op, timing.fingerprints, PROBE_MEASURE_OPS,
+        );
+    }
+    println!(
+        "baseline/interpreter ns-per-op ratio: UNPRIMED {:.2}x, PRIMED {:.2}x",
+        baseline_unprimed.ns_per_op / interpreter_unprimed.ns_per_op,
+        baseline_primed.ns_per_op / interpreter_primed.ns_per_op,
+    );
+    println!("loadavg (end): {}", probe_loadavg());
+}
+
 /// **The receive/Send zero-deopt pin**: the `send` + receive-control family must be
 /// lowered as native code, not paid as a per-instruction `jit_step_one` deopt.
 ///
