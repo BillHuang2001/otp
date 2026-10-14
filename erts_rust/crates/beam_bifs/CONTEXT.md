@@ -291,8 +291,10 @@ short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
   on the flat path** (the C `control_limited($W,…)` is a flat depth renderer). Floats render through the same
   `format_short` port (`fwrite_g/1` *is* `float_to_list(F,[short])`), atoms by `io_lib:write_atom_as_latin1/1`,
   non-byte-aligned bitstrings as the leading bytes then `Value:K`, binaries by `write_binary/3`'s depth rule; depth
-  semantics reproduce `io_lib:write1/4`. Internal pids/ports/refs render; an **external** one is the typed gap and a
-  **fun** is `badarg`.
+  semantics reproduce `io_lib:write1/4`. Internal pids/ports/refs render; an **external** one is the typed gap; a
+  **fun** renders its `erlang:fun_to_list/1` text (`src/fun_info.rs::fun_text_str`, shared with that BIF) —
+  `fun Module:Function/Arity` for an `EXPORT_EXT` fun, `#Fun<Module.OldIndex.OldUniq>` for a `NEW_FUN_EXT` fun —
+  and only a `make_fun3` (`FunKind::Local`) fun is the typed `unsupported_bif` gap.
 - **The per-element container walks are iterative in both paths** (`render_tail_chunk`/`render_tuple_rest_chunk`/
   `render_map_body_chunk`, and the pretty port's `list1`/`tuple1`/`map1`/`pp_tail`/`pp_pairs_tail`) — one native stack
   frame per *container*, not per element, so a 20k-element list/tuple/map renders instead of aborting, with
@@ -364,8 +366,8 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
 ## Test Strategy
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` with a `BytesSink`/`NullSink` capture.
-- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **82
-  suite result lines / 1613 tests** (all green): the lib suite (816), 79 integration files (797), and two empty
+- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **83
+  suite result lines / 1618 tests** (all green): the lib suite (816), 80 integration files (802), and two empty
   harnesses. Re-derive the split from the per-suite `test result` lines, not from a hand-maintained table.
 - **Pins.** `tests/roster_audit.rs` is the roster pin (see the census section). `tests/bif_tab.rs` pins the parsed
   `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 89`,
@@ -403,9 +405,12 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
 - **`erlang:display/1` writes a printable latin-1 char ≥ `16#80` as UTF-8, not the oracle's raw code unit** (≤ `16#7F`
   is byte-identical; `io:format("~p",…)`/`display_string/2` are unaffected). Closing it needs a byte-oriented
   `OutputSink` (`src/context.rs` + `beam_rt`), not a local fix.
-- **`~w`/`~p` of a fun is `badarg`** (the oracle renders `#Fun<…>`): a `Local` (`make_fun3`) fun carries no module/name
-  in the frozen descriptor, so any in-crate value could mismatch. An internal **port** renders (`#Port<0.N>`); an
-  external pid/port/ref is the typed gap below.
+- **A `FunKind::Local` (`make_fun3`) fun is the typed `unsupported_bif` gap** in the printer (and in
+  `erlang:fun_to_list/1`, which it shares): its frozen descriptor is only `(uniq, index)`, so the
+  module/name a `#Fun<…>` needs is not in the term and any text would be a silently-wrong result. An
+  `EXPORT_EXT` fun renders `fun Module:Function/Arity` and a `NEW_FUN_EXT` fun renders
+  `#Fun<Module.OldIndex.OldUniq>` — byte-faithfully, at any nesting depth. An internal **port** renders
+  (`#Port<0.N>`); an external pid/port/ref is the typed gap below.
 - **A non-small-integer `{chars_limit,N}` is rejected up front**, whereas the oracle only fails when arithmetic
   *reaches* the value (`io_lib:format("hello",[],[{chars_limit,4.0}])` ⇒ `"hello"` there, `badarg` here). In-range
   small-integer limits are byte-identical.
