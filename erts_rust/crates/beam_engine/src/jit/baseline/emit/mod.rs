@@ -44,7 +44,7 @@
 //! [`RUNTIME_XREGS_DISP`]) — the same slot the exit spill writes — so a block that
 //! touches more registers than the cache budget still runs natively instead of
 //! deopting. The residents are the block's *most-used* registers, chosen by
-//! [`allocate_registers`] from the native touch counts of the block's inlinable
+//! [`allocate_registers`] from the live intervals of the block's inlinable
 //! instructions, so the registers with the longest live ranges are the ones kept in
 //! machine registers; the direct `machine.x` accesses are the fill/spill for the
 //! rest. That is safe precisely because the cache membership is fixed for the

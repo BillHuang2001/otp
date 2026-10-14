@@ -382,7 +382,7 @@ impl CompiledModule {
     /// Every x-register any compiled block holds in a machine register (sorted
     /// ascending, deduped across blocks).
     ///
-    /// The allocator is usage-weighted ([`allocate_registers`](super::emit)), so this is
+    /// The allocator ranks by live-interval length ([`allocate_registers`](super::emit)), so this is
     /// the set of the most-used registers rather than the first-appearing ones; a
     /// register **not** in it is addressed directly in `machine.x`.
     pub fn cached_registers(&self) -> Vec<u32> {

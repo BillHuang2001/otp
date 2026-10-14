@@ -16,7 +16,7 @@ and its test-only site classification live in one ~180-line file. Owned by `./er
   - `slot(x)`, `is_written(x)`, `spill_slots()` (only the written `(x, Reg)` pairs), `refresh_y_after(pc)`.
 - `spill(buffer, allocation, site)` -- stores **only** `allocation.spill_slots()` (the written set) via
   `mov [rbx + x_offset(x)], reg`. `rbx` holds the `machine.x` base.
-- `fill(buffer, allocation, site)` -- loads **every** `allocation.slots` entry via `mov reg, [rbx + x_offset(x)]`.
+- `fill(buffer, allocation, site, pc)` -- loads exactly `allocation.fill_slots(pc)` via `mov reg, [rbx + x_offset(x)]` (the whole cache at `FillSite::Prologue`, the continuation's live set elsewhere).
 - `SpillSite { Helper, Exit }` / `FillSite { Helper, Prologue }` -- test-only classification of a call
   site for `counters.rs`; the parameter is unused outside `#[cfg(test)]` (zero cost in production).
   `FillSite::Prologue` is `#[cfg(test)]`-gated (only the prologue counter names it; the production

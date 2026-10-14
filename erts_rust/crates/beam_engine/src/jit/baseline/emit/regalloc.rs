@@ -223,7 +223,7 @@ fn allocate_registers_with_labels(
     // engine publishes the frame's Y window (see [`super::super::runtime`]) only in the
     // prologue of a block that touches Y, and refreshes it after an in-block deopt whose
     // helper may have moved `machine.stack` — this is the compile-time gate for both.
-    // A `Y` slot is **not** an x-register, so it is never charged to the touch counts
+    // A `Y` slot is **not** an x-register, so it is never charged to the live intervals
     // above (it must not enter `highest_native_register`).
     allocation.y_last = code[start..end]
         .iter()

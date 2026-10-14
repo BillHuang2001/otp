@@ -193,18 +193,28 @@ block map, so the driver compiles the target's function on entry — or takes on
   the block's written set, so that spill stores it).
 
 ## Register picker (`regalloc.rs::allocate_registers`)
-Usage-weighted, not liveness-based: `cacheable_touches` charges one *native touch* per x-register operand
-**of each instruction the tier would actually inline** (it mirrors each lowering's own shape test, so
-regalloc and `emit_block` agree). Counts are ranked by descending touch count, ties by ascending register
-index, and the top `CACHE_REGISTERS.len()` = 5 are kept (`r12`,`r13`,`r14`,`r15`,`rbp`). Physical
-assignment is by **first-appearance order** of the selected registers (deterministic), not by rank. An
-out-of-bound register is never counted. Every non-selected register is read/written directly in `machine.x`.
+Liveness-based, by **live interval**. `cacheable_touches` reports the x-register operands **of each
+instruction the tier would actually inline** (it mirrors each lowering's own shape test, so regalloc and
+`emit_block` agree); `cacheable_writes` reports the same instructions' destination registers. A candidate
+register's live interval is `[first touch, last touch]` over the block's instruction indices, its touches
+being the union of the two sets (so a register an instruction only *writes* is live there too).
+The `[first, last]` span is deliberately the *same* predicate `emit/liveness.rs::fill_sets` derives its
+live set from, so the selector and the emitter share one definition of liveness.
+Selection is a greedy linear scan over those intervals: **primary key** = interval length `last - first + 1`,
+**descending**; **tie-break** = **ascending register index**; the top `CACHE_REGISTERS.len()` = 5 are kept
+(`r12`,`r13`,`r14`,`r15`,`rbp`). Physical assignment is by **first-appearance order** of the selected
+registers (deterministic), not by rank. An out-of-bound register (`>= MAX_REGISTER`) is never a candidate.
+Every non-selected register is read/written directly in `machine.x`, which is exactly the traffic an in-block
+eviction would produce — but membership stays **fixed for the whole block** (the correctness contract).
+Under `#[cfg(test)]` the scan also records live-range statistics on `Allocation`
+(`live_candidates` / `live_total` / `live_max`), which `counters::record_block` folds into the per-run
+structural counters; they hold no production state.
 
 `allocate_registers` also derives `Allocation::y_last` — the highest pc of the block whose instruction
 accesses a Y slot (`arith::uses_y`), or `None` — which is the compile-time gate for the emitter's
-prologue publish and its post-helper refresh. A `Y` slot is **not** an x-register, so it is never charged
-to the touch counts above and never raises `highest_native_register`: a stack slot must not refuse native
-entry (the driver's bound is `machine.x.len() > bound`).
+prologue publish and its post-helper refresh. A `Y` slot is **not** an x-register, so it is neither a
+candidate nor charged to any live interval, and it never raises `highest_native_register`: a stack slot
+must not refuse native entry (the driver's bound is `machine.x.len() > bound`).
 
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder; nothing here
@@ -248,7 +258,7 @@ entry (the driver's bound is `machine.x.len() > bound`).
   `FAST_PATH_BYTES`/`COMPARE_PATH_BYTES`/`LIST_PATH_BYTES`/`TUPLE_PATH_BYTES`) with their estimates
   `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate`.
 - `regalloc.rs` -> `allocate_registers` (incl. the `y_last` and `written` derivations) + `cacheable_touches`
-  (the touch counts) + `cacheable_writes` (the block's written x-registers, mirroring each lowering's shape
+  (the per-instruction native touches) + `cacheable_writes` (the block's written x-registers, mirroring each lowering's shape
   test but returning destinations; the shape types expose a `writes()` accessor).
 - `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`, `small_word`.
 - `r#move.rs` -> `try_inline_move`, `try_inline_swap` (`Move` over in-bound x-registers or an addressable `Y` slot on either side, behind the frame-window guard; `Swap` needs two in-bound x-registers).
