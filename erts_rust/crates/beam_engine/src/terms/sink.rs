@@ -39,8 +39,8 @@
 //!   accessors, whose `&self` receiver cannot lend the machine's `&mut` root slices
 //!   ([`crate::machine::location`]).
 //!
-//! Both share the same low-level writers ([`write_tuple_at`], [`write_list_at`]), so
-//! the word layout of a tuple/list node is defined once.
+//! Both share the same low-level writers ([`write_tuple_at`], [`write_list_at`],
+//! [`write_cons_at`]), so the word layout of a tuple/list/cons node is defined once.
 
 use beam_common::Result;
 use beam_term::{make_arityval, make_tuple, Eterm, NIL};
@@ -50,10 +50,10 @@ use crate::context::ExecutionContext;
 
 /// A sink a term-shape writer carves its nodes out of.
 ///
-/// The trait is deliberately tiny: every node a shape writer builds is either a
-/// tuple or a proper list, and both are expressed with the two methods below. The
-/// implementation chooses *where* the words come from (one rooted reservation carved
-/// node-by-node, or one `alloc_words` per node) and nothing else.
+/// The trait is deliberately tiny: every node a shape writer builds is a tuple, a
+/// proper list or a single cons cell, and all three are expressed with the methods
+/// below. The implementation chooses *where* the words come from (one rooted
+/// reservation carved node-by-node, or one `alloc_words` per node) and nothing else.
 pub trait Sink {
     /// Build the tuple `{Elem, …}` out of `elems`, carving the `1 + elems.len()`-word
     /// block (`arityval` header + elements) from the sink.
@@ -64,6 +64,15 @@ pub trait Sink {
     /// front-to-back with the final `CDR` being [`NIL`]. The empty list is [`NIL`] and
     /// carves nothing.
     fn list(&mut self, elems: &[Eterm]) -> Result<Eterm>;
+
+    /// Build the single cons cell `[Car | Cdr]` (`2` words) carved from the sink.
+    ///
+    /// The one-node **prepend** primitive: a shape writer that cannot express its
+    /// whole graph as a proper list (a synthesized head item consed in front of a
+    /// carved list) builds the cell with this, exactly once, so the carve order and
+    /// the size computation cannot diverge. `Cdr` may be any term — an improper tail
+    /// is representable.
+    fn cons(&mut self, car: Eterm, cdr: Eterm) -> Result<Eterm>;
 }
 
 /// The **rooted** sink: the slack of one whole-region rooted reservation
@@ -84,6 +93,13 @@ impl Sink for Slack {
         // SAFETY: `alloc_words` returned `2 * elems.len()` exclusively-owned, writable
         // words inside this slack's reserved region, which nothing else writes.
         Ok(unsafe { write_list_at(hp, elems) })
+    }
+
+    fn cons(&mut self, car: Eterm, cdr: Eterm) -> Result<Eterm> {
+        let hp = self.alloc_words(2)?;
+        // SAFETY: `alloc_words` returned 2 exclusively-owned, writable words inside
+        // this slack's reserved region, which nothing else writes.
+        Ok(unsafe { write_cons_at(hp, car, cdr) })
     }
 }
 
@@ -129,6 +145,14 @@ impl Sink for ContextSink<'_> {
         // does, and `alloc_words` never collects.
         Ok(unsafe { write_list_at(hp, elems) })
     }
+
+    fn cons(&mut self, car: Eterm, cdr: Eterm) -> Result<Eterm> {
+        let hp = self.ctx.alloc_words(2)?;
+        // SAFETY: `alloc_words` returned 2 words valid until the next collecting
+        // allocation; the write below is the very next thing this sink does, and
+        // `alloc_words` never collects.
+        Ok(unsafe { write_cons_at(hp, car, cdr) })
+    }
 }
 
 /// Write the tuple `{elems…}` into `1 + elems.len()` words at `hp`.
@@ -172,6 +196,23 @@ pub(crate) unsafe fn write_list_at(hp: *mut Eterm, elems: &[Eterm]) -> Eterm {
                 beam_term::make_list(hp.add(2 * (i + 1)))
             };
         }
+    }
+    beam_term::make_list(hp)
+}
+
+/// Write the cons cell `[car | cdr]` into `2` words at `hp`.
+///
+/// # Safety
+///
+/// `hp` must point at `2` exclusively-owned, writable words that nothing else writes
+/// and that stay put for as long as the returned term is live.
+pub(crate) unsafe fn write_cons_at(hp: *mut Eterm, car: Eterm, cdr: Eterm) -> Eterm {
+    // SAFETY: the caller guarantees 2 exclusive words at `hp`; word 0 receives the
+    // `CAR` and word 1 the `CDR`, which is exactly the header-less 2-word cons cell
+    // tagged by `make_list`.
+    unsafe {
+        *hp = car;
+        *hp.add(1) = cdr;
     }
     beam_term::make_list(hp)
 }

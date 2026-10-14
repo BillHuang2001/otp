@@ -324,6 +324,12 @@ impl Machine {
         // deliberately does **not** reset, so a raise that suspended the process
         // keeps its snapshot until the process resumes and raises again.
         self.raise_snapshot.clear();
+        // The synthesized-callee-head latches belong to the raise in flight too: a
+        // fresh run begins with no raise, so neither the one-shot latch nor the
+        // live-raise state may survive into it (a stale `true` would make the first
+        // cooked trace of the new run prepend an item no raise published).
+        self.pending_callee_head = false;
+        self.raise_head_item = false;
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).

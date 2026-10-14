@@ -149,6 +149,22 @@ impl Machine {
         self.pending_exception.map(|(class, _)| class)
     }
 
+    /// Consume the **live raise**'s synthesized-callee-head latch
+    /// ([`Machine::raise_head_item`]).
+    ///
+    /// `true` means the exception currently in flight was raised by a call site
+    /// that knew its unresolvable callee and published that callee's
+    /// `{Module,Function,ArgList,[]}` item as the raise's raw trace — so the cooked
+    /// stacktrace must cons that item in front of its frames (C's innermost
+    /// `build_stacktrace` item, `../../erts/emulator/beam/beam_common.c:1204-1292`).
+    ///
+    /// Taking it consumes it: the flag describes exactly **one** cooking. `false`
+    /// for a raise that carried no such item and for a machine with no raise in
+    /// flight.
+    pub(crate) fn take_raise_head_item(&mut self) -> bool {
+        std::mem::take(&mut self.raise_head_item)
+    }
+
     /// Push a catch frame (the `try`/`catch` handler target).
     ///
     /// The frame's module context is stamped from the context executing right now
@@ -286,6 +302,12 @@ impl Machine {
         reason: Eterm,
         trace: Eterm,
     ) -> Result<Step> {
+        // Consume the one-shot synthesized-callee-head latch **first**, before
+        // anything else, so no raise can ever inherit a stale head: the head is
+        // carried by `trace` itself (the raise's raw-trace word), and this flag only
+        // records that the cooked trace must prepend it. A raise raised by a site
+        // that published no head clears the state to `false`.
+        self.raise_head_item = std::mem::take(&mut self.pending_callee_head);
         self.pending_exception = Some((class, reason));
         // Rebuild the **pre-unwind** raise snapshot before anything is unwound: the
         // handler's `build_stacktrace` (and the uncaught funnel) must be able to name

@@ -44,12 +44,13 @@
 use std::sync::Arc;
 
 use beam_common::Result;
-use beam_loader::{Atom, Instr, LineEntry, Module};
+use beam_loader::{Atom, Instr, LineEntry, Module, Operand};
 use beam_term::{make_atom, make_small, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::machine::Machine;
+use crate::operand::read_operand;
 use crate::terms;
 use crate::terms::{ContextSink, Sink};
 
@@ -104,10 +105,14 @@ use crate::terms::{ContextSink, Sink};
 ///    `run_export`/`run_label` entry, so a caller *outside* the run — the host's
 ///    own chain, the oracle's trailing `erl_eval`/`init` entries — has no frame
 ///    here and is absent from the result.
-/// 2. **The innermost item carries the arity, never an argument list.** C uses the
+/// 2. **The snapshot's items carry the arity, never an argument list.** C uses the
 ///    exception's saved arguments where the raw trace holds them (`args` in
 ///    `erts_build_mfa_item`); the snapshot keeps no such list, so the arity — C's
-///    own fallback for a frame without saved args — is always emitted.
+///    own fallback for a frame without saved args — is always emitted. The one
+///    exception is the synthesized **callee head item** an unresolvable
+///    `call_ext*`/`apply` target publishes (`head` below, [`super::callee`]), which
+///    is consed in front of the frame list and *does* carry the callee's real
+///    argument list — exactly C's innermost item for an `undef`.
 /// 3. **No `error_info` entries.** C's innermost item extends its `Location` with
 ///    the raw trace's extra info (`get_error_info_from_exc`); the engine has none.
 ///
@@ -129,10 +134,22 @@ use crate::terms::{ContextSink, Sink};
 /// The whole `[Item]` graph is sized from metadata, reserved in **one** rooted
 /// allocation ([`crate::terms::reserve_slack`]) and carved from it, so a moving
 /// collector cannot interleave a collection between the nodes.
+///
+/// **A synthesized head item.** When `head` is set, the raise being cooked was
+/// raised by a call site that knew its unresolvable callee and published that
+/// callee's `{Module,Function,ArgList,[]}` item as the raise's raw trace (see
+/// [`super::callee`]). That item is one **more** node than the snapshot's frames —
+/// and it is not a heap term held in a Rust local: it is the raise's own raw-trace
+/// word, published in the register `head_operand` names, so it is re-read **after**
+/// the one reservation (through the very operand `build_stacktrace` read it from)
+/// and consed in front of the carved frames. The list is then never empty: an empty
+/// frame chain with a live head cooks to the **one-element** list `[Item]`.
 pub(crate) fn symbolic_stacktrace(
     machine: &mut Machine,
     module: &Module,
     ctx: &mut dyn ExecutionContext,
+    head_operand: &Operand,
+    head: bool,
 ) -> Result<Eterm> {
     // The **raise-time** frame chain: the raising frame first, then every caller
     // innermost-first, exactly as it was captured *before* the raise unwound the
@@ -175,16 +192,28 @@ pub(crate) fn symbolic_stacktrace(
     }
     // `2` words per list cell plus every item's own nodes — sized **before** the
     // reservation, because a collection under it relocates the machine's roots and
-    // the shape metadata is the only thing that survives it.
-    let total = 2 * shapes.len() + shapes.iter().map(ItemShape::words).sum::<usize>();
+    // the shape metadata is the only thing that survives it. A synthesized callee
+    // head item adds exactly one cons cell (`2` words) in front of the frame list.
+    let total =
+        2 * shapes.len() + shapes.iter().map(ItemShape::words).sum::<usize>() + if head { 2 } else { 0 };
     let mut sink = terms::reserve_slack(machine, ctx, total)?;
     let mut items = Vec::with_capacity(shapes.len());
     for shape in &shapes {
         // Child nodes before the parent, in the order `ItemShape::words` counts.
         items.push(write_item(&mut sink, shape)?);
     }
-    // An empty (or wholly skipped) snapshot is the honest empty list.
-    sink.list(&items)
+    // An empty (or wholly skipped) snapshot is the honest empty list — unless the
+    // raise published a callee head item, which is always the FIRST item.
+    let cooked = sink.list(&items)?;
+    if head {
+        // Post-collection read of the head word (the operand is the register the
+        // calling `build_stacktrace` read the raw trace from — a pure register load,
+        // so no allocation can intervene between the carve of `cooked` and this
+        // cons), then the one cons cell that prepends it.
+        let item = read_operand(machine, ctx, head_operand)?;
+        return sink.cons(item, cooked);
+    }
+    Ok(cooked)
 }
 
 /// Which [`Module`] a snapshot frame's `(func, pc)` pair belongs to, resolved

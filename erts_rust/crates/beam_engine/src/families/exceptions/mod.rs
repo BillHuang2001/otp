@@ -111,6 +111,7 @@ use raise::{classify_class, install_class_atom, raise_error_atom, raise_error_tu
 use stacktrace::symbolic_stacktrace;
 
 mod raise;
+pub(crate) mod callee;
 pub(crate) mod stacktrace;
 
 #[cfg(test)]
@@ -269,10 +270,18 @@ pub(crate) fn exec(
             // `get_trace_from_exc(NIL) == NULL` answer; a non-NIL raw is cooked as
             // before.
             let has_snapshot = !machine.raise_snapshot().is_empty();
-            let cooked = if is_nil(raw) && !has_snapshot {
+            // An `undef` raised by an unresolvable `call_ext*`/`apply` target carries
+            // a synthesized **callee head item** as its raw trace (see
+            // [`callee`]): C's innermost `build_stacktrace` item, the callee named
+            // with its **argument list**. Consume the latch here — it describes
+            // exactly this one cooking — and hand it (with the operand the head word
+            // must be re-read through, never a pre-computed term that could have
+            // moved) to the trace builder.
+            let head = machine.take_raise_head_item();
+            let cooked = if is_nil(raw) && !has_snapshot && !head {
                 NIL
             } else {
-                symbolic_stacktrace(machine, module, ctx)?
+                symbolic_stacktrace(machine, module, ctx, &Operand::X(0), head)?
             };
             machine.set_x(0, cooked)?;
             Ok(Some(Step::Next))

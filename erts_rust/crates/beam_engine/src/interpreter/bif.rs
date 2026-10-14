@@ -257,6 +257,43 @@ impl Machine {
     /// which carries no fail label either), so the landing convention stays defined
     /// in exactly one place.
     pub(crate) fn raise_bif_error(&mut self, module: &Module, error: BeamError) -> Result<Step> {
+        self.raise_error(module, error, None)
+    }
+
+    /// [`Machine::raise_bif_error`] with a synthesized **callee head item**.
+    ///
+    /// `head` is the `{CalleeModule, CalleeFunction, ArgList, []}` item a failing
+    /// `call_ext*`/`apply` site built for an unresolvable target (see
+    /// [`crate::families::exceptions::callee`]); it is raised as the exception's own
+    /// **raw trace** (C's saved trace object, which is what `build_stacktrace`
+    /// resolves) and the one-shot `pending_callee_head` latch is armed **immediately
+    /// before** the `throw_with_trace` that actually lands the raise — never at the
+    /// call site, because a raise with **no live catch frame** propagates as a bare
+    /// `Err` without ever reaching `throw_with_trace` (the head is then discarded and
+    /// the latch must stay clear for the next, unrelated raise).
+    ///
+    /// `None` is byte-identical to [`Machine::raise_bif_error`].
+    pub(crate) fn raise_bif_error_with_head(
+        &mut self,
+        module: &Module,
+        error: BeamError,
+        head: Option<Eterm>,
+    ) -> Result<Step> {
+        self.raise_error(module, error, head)
+    }
+
+    /// The shared body of [`Machine::raise_bif_error`]/
+    /// [`Machine::raise_bif_error_with_head`] (see the former for the full contract).
+    fn raise_error(
+        &mut self,
+        module: &Module,
+        error: BeamError,
+        head: Option<Eterm>,
+    ) -> Result<Step> {
+        // A `None` head leaves every path byte-identical to the pre-head funnel: the
+        // raw trace stays `NIL` and the latch is never armed.
+        let has_head = head.is_some();
+        let trace = head.unwrap_or(NIL);
         // A raise whose reason is a compound term lands (or propagates) with the
         // term, mirroring C's `handle_error` → `next_catch` for every reason shape.
         if let BeamError::Raise(raise) = &error {
@@ -269,11 +306,12 @@ impl Machine {
                 if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
                     self.set_class_atom(class, make_atom(class_atom));
                 }
-                return self.throw_with_trace(class, reason, NIL);
+                return self.throw_with_trace_headed(class, reason, trace, has_head);
             }
         }
         // No live catch frame: the error propagates unchanged, carrying whatever
-        // class/reason (and live reason term) it already has.
+        // class/reason (and live reason term) it already has. The head is dropped
+        // with it — no `throw_with_trace` runs, so the latch stays clear.
         if self.catch_frame_depth() == 0 {
             return Err(error);
         }
@@ -301,6 +339,23 @@ impl Machine {
         if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
             self.set_class_atom(class, make_atom(class_atom));
         }
-        self.throw_with_trace(class, make_atom(atom), NIL)
+        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head)
+    }
+
+    /// [`Machine::throw_with_trace`] that first arms the one-shot
+    /// `pending_callee_head` latch when `has_head`, so the raise being landed is
+    /// marked as carrying a synthesized callee head item (which lives in `trace`).
+    #[inline]
+    fn throw_with_trace_headed(
+        &mut self,
+        class: ExceptionClass,
+        reason: Eterm,
+        trace: Eterm,
+        has_head: bool,
+    ) -> Result<Step> {
+        if has_head {
+            self.pending_callee_head = true;
+        }
+        self.throw_with_trace(class, reason, trace)
     }
 }

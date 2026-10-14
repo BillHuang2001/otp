@@ -224,6 +224,32 @@ pub struct Machine {
     /// starting) but **not** by a resume ([`Machine::resume_outcome`]), which must
     /// preserve it along with the machine's other suspended state.
     pub(crate) raise_snapshot: Vec<(u32, u32, u32)>,
+    /// A **one-shot latch**: `true` means "the next raise that actually lands was
+    /// raised by a call site that knows its unresolvable callee and has published
+    /// that callee's `{Module,Function,ArgList,[]}` item as the raise's raw trace".
+    ///
+    /// Set by the failure sites that synthesize such an item (a `call_ext*` import
+    /// or an `apply(M,F,A)` target the host cannot resolve — see
+    /// [`crate::families::exceptions::callee`]) **immediately before** the
+    /// `throw_with_trace` that lands the raise, and consumed by that call (see
+    /// [`Machine::raise_head_item`]). It is a separate latch from the live-raise
+    /// state so a propelling `Err` path — a raise with no live catch frame, which
+    /// never reaches `throw_with_trace` — cannot leave a stale head for a later,
+    /// unrelated raise to inherit.
+    pub(crate) pending_callee_head: bool,
+    /// The **live raise** state behind [`Machine::pending_callee_head`]: `true`
+    /// while the raise currently in flight was raised with a synthesized
+    /// `{Module,Function,ArgList,[]}` head item as its raw trace.
+    ///
+    /// [`Machine::throw_with_trace`] sets it (as its first act, from the one-shot
+    /// latch), `build_stacktrace` consumes it (the cooked trace prepends the head
+    /// item — see [`crate::families::exceptions::stacktrace`]) and so a raise can
+    /// never inherit a stale head from an earlier one. Both flags are metadata
+    /// (`bool`) only: the head item itself is the raise's raw-trace **word**,
+    /// published in `x(2)`/`x(0)`, never a machine-held heap term — which is what
+    /// keeps it inside the frozen root set ([`crate::context::RootSet`]) across the
+    /// rooted reservation the cooked trace takes.
+    pub(crate) raise_head_item: bool,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -381,6 +407,8 @@ impl Machine {
             contexts: Contexts::new(),
             context: 0,
             raise_snapshot: Vec::new(),
+            pending_callee_head: false,
+            raise_head_item: false,
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,

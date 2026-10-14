@@ -109,6 +109,7 @@ use beam_term::{atom_val, is_atom, make_atom, Eterm};
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
+use crate::families::exceptions::callee;
 use crate::machine::{Continuation, Machine};
 use crate::operand::{
     operand_slack_words, read_operand, read_operands_slack, write_operand,
@@ -461,9 +462,22 @@ pub(crate) fn apply_target(
     // [`ApplyTarget`]). Engine-diagnostic `Err`s from *outside* the host BIF call
     // (an out-of-range register, the resolver / label resolution above) keep their
     // `?` and are never wrapped — only the host's own BIF outcome is.
+    //
+    // An unresolvable target raises `error:undef`, and the oracle's cooked trace
+    // then names the **callee** with its argument list as the innermost item (C's
+    // `erts_build_mfa_item` with the exception's saved args — see
+    // [`callee`]). This site knows the callee (the two atoms checked above, both
+    // immediate terms that cannot move) and its arguments are the instruction's own
+    // `x(0..arity)` registers, so the item is synthesized here: a no-op for any
+    // other error shape and when the raise cannot land.
     match ctx.call_bif(module_name, function_name, arity, &args) {
         Ok(value) => Ok(ApplyTarget::Called(value)),
-        Err(e) => Ok(ApplyTarget::Raised(machine.raise_bif_error(module, e)?)),
+        Err(e) => {
+            let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;
+            Ok(ApplyTarget::Raised(
+                machine.raise_bif_error_with_head(module, e, head)?,
+            ))
+        }
     }
 }
 
