@@ -291,9 +291,14 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   link/exit/unlink/monitor/demonitor/monitor-down/group-leader families through `beam_process`'s
   route-free receipt primitives, with the distributed-spawn family and `Delivery::Other(_)` still
   typed `Unsupported`; `DEFAULT_HEAP_WORDS = 1<<24`, with
-  heap exhaustion translated to `error:system_limit`. The registered-BIF dispatch hot path is
-  allocation-free (the shared `AtomTable` is only committed when a call actually interns a name);
-  dispatch/throughput figures and their measurement caveats live in `../tools/bench/RESULTS.md`.
+  heap exhaustion translated to `error:system_limit`; the parked root set publishes only the live
+  float-register prefix (`Machine::fr_mark()`), the pooled BIF heap is rewound to each call's own mark
+  (`Heap::reset_to(mark)`), and `process_info(P, binary)` is served from the target's own
+  off-heap-binary roster (pid-less `Runtime::eval_off_heap` payloads stay unattributed). The
+  registered-BIF dispatch hot path is allocation-free (the shared `AtomTable` is only committed when a
+  call actually interns a name; the `term_to_binary` fun-identity bridge reuses the code server's
+  generation-cached module snapshot); dispatch/throughput figures and their measurement caveats live
+  in `../tools/bench/RESULTS.md`.
 - **Dependency edges beyond the scaffold:** `beam_message → beam_gc`, `beam_dist → beam_alloc`,
   **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
   `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
