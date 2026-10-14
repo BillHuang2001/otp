@@ -52,7 +52,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; `hibernate/0` (the OTP-30 instruction, modelled as **continue**); the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
-| `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` |
+| `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`, `erl_distribution:start_link/0,1` (the last answered `ignore` — see *The Erlang-level distribution supervisor*) |
 | `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs` and the end-to-end `memory/binary_e2e.rs` oracle case) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` |
 | `port.rs` | `erlang:port_command/2,3`, `erlang:port_control/3` (the driver's `control` callback, with the oracle's list-vs-binary reply rule) and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
