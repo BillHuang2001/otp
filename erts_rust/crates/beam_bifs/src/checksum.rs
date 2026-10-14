@@ -227,7 +227,11 @@ const fn crc32_table() -> [u32; 256] {
 
 /// zlib's `crc32(prev, data)` (`crc32_z`): the CRC-32 of `data` continuing from the
 /// CRC-32 `prev` of the preceding bytes. A zero-length `data` is the identity.
-fn crc32_step(prev: u32, data: &[u8]) -> u32 {
+///
+/// `pub(crate)` because `crate::zlib`'s RFC 1952 (gzip) member framing needs the very
+/// same primitive for its header CRC-16 and its per-member CRC-32 trailer — the one
+/// shared home for the checksum, never a second copy.
+pub(crate) fn crc32_step(prev: u32, data: &[u8]) -> u32 {
     let mut crc = prev ^ 0xFFFF_FFFF;
     for &byte in data {
         crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize];
