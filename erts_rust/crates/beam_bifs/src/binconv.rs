@@ -77,7 +77,8 @@
 //!   `compressed` (zlib level 6, the oracle's `Z_DEFAULT_COMPRESSION`),
 //!   `{compressed, 0..=9}`, `{minor_version, 0|1|2}` (`3`, `-1` and a non-small
 //!   version are `badarg`) and the bare `deterministic`/`local` atoms (see the
-//!   option section below — both are accepted, but each is only partly honoured).
+//!   option section below — `deterministic` is honoured in full, `local` is the one
+//!   typed gap).
 //!   `binary_to_term/1` ignores trailing bytes; `binary_to_term/2` takes `safe` and
 //!   `used` (`binary_to_term(<<131,97,17>>, [used])` is `{17, 3}` — the count
 //!   includes the `131` version byte; for a top-level `COMPRESSED` image it stops at
@@ -109,17 +110,13 @@
 //! * **`deterministic`.** Selects `DFLAG_DETERMINISTIC`, which re-sorts every map's
 //!   keys into full Erlang term order — **atoms by name**, not by atom index
 //!   (`map_key_compare` = `erts_cmp`, `external.c:3217-3227`, applied at
-//!   `:3433-3470`/`:3757-3804`). `beam_codec`'s encoder has no deterministic mode (its
-//!   map arms emit the stored order), so the option is honoured only when no
-//!   re-sorting is needed: a term whose maps are already in that order (and which
-//!   holds no fun/native record, whose interior this crate cannot inspect — see
-//!   [`deterministic_order_is_unchanged`]) encodes byte-exactly, and anything else
-//!   reports the typed `unsupported_bif` — never a wrongly ordered image. Oracle-
-//!   pinned: `term_to_binary(#{a=>1,b=>2},[deterministic])` is
-//!   `<<131,116,0,0,0,2,119,1,97,97,1,119,1,98,97,2>>` (name order) while the plain
-//!   image of the same map is index-ordered. Closing the gap needs
-//!   `beam_codec::Encoder::with_deterministic()` (sibling crate — see the code
-//!   comment in [`encode_image`]).
+//!   `:3433-3470`/`:3757-3804`). The flag is installed on the encoder
+//!   ([`Encoder::with_deterministic`]), so it applies to **both** a ≤ 32-pair flat map
+//!   (whose ERTS storage order is `erts_cmp_flatmap_keys`/index order) and a > 32-pair
+//!   HAMT (whose storage order is hash order) — including a map nested in a
+//!   tuple/list. Oracle-pinned: `term_to_binary(#{b=>1,a=>2,c=>3},[deterministic])`
+//!   is `<<131,116,0,0,0,3,119,1,97,97,2,119,1,98,97,1,119,1,99,97,3>>` (name order)
+//!   while the plain image of the same map is index-ordered.
 //! * **`local`.** Selects `DFLAG_LOCAL_EXT`, which wraps the image in
 //!   `[131][LOCAL_EXT:121][4-byte node hash]` (`external.c:3305-3317`) and replaces
 //!   an internal pid/port/ref's node atom with `NIL_EXT`. `beam_codec` can write the
@@ -147,12 +144,10 @@
 //!   registering it would *invent* a BIF arity the oracle answers with `undef`.
 //!   Following the same rule as `io:format`'s `~d` (see [`crate::io`]), the
 //!   oracle wins over the illustrative list: only `/1` and `/2` are registered.
-//! * **`local` is always, and `deterministic` is partly, a typed gap.** `[local]`
-//!   reports `unsupported_bif` because the `LOCAL_EXT` payload is the node-local hash
-//!   (`beam_rt`/`beam_dist` runtime state with no seam — see the option section
-//!   above); `[deterministic]` is byte-exact when the term's maps are already in
-//!   atom-name order and reports `unsupported_bif` for any term whose maps would need
-//!   re-sorting. Neither ever returns a wrong image.
+//! * **`local` is a typed gap.** `[local]` reports `unsupported_bif` because the
+//!   `LOCAL_EXT` payload is the node-local hash (`beam_rt`/`beam_dist` runtime state
+//!   with no seam — see the option section above). `[deterministic]` is **fully**
+//!   honoured. Neither ever returns a wrong image.
 //! * **Internal pid/port/ref ids need a resolvable local node, in both
 //!   directions.** `self()` and an internal port are 60-bit `Eterm` immediates
 //!   carrying no node identity, so `term_to_binary` writes them as the oracle's
@@ -825,94 +820,27 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
     // (`external.c:136-200`), patches the `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE]`
     // prologue (`:3305-3317`, `:4046-4109`) and — for an internal pid/port/ref —
     // replaces the node atom with `NIL_EXT` (`:5589`). `beam_codec` can write that
-    // wrapper (`Encoder::finish_local(hash)`), so the **only** missing piece is the
-    // hash value itself: it is runtime/node state that changes on every VM start, so
-    // it belongs to `beam_rt`/`beam_dist`, not to this crate, and there is no seam to
-    // obtain it. A typed gap is therefore the honest answer — fabricating four bytes
-    // would produce an image the oracle (and every other node) rejects.
+    // wrapper (`Encoder::finish_local(hash)`) and the internal-node marker
+    // (`Encoder::with_local_ext`), so the **only** missing piece is the hash value
+    // itself: it is runtime/node state that changes on every VM start, so it belongs to
+    // `beam_rt`/`beam_dist`, not to this crate, and there is no seam to obtain it.
+    // Oracle-checked: two `erl` runs of
+    // `term_to_binary(self(), [local])` differ in exactly those four bytes
+    // (`<<131,121,1,194,117,38,…>>` vs `<<131,121,6,240,188,32,…>>`) — see
+    // `tests/term_to_binary_options.rs`. A typed gap is therefore the honest answer —
+    // fabricating four bytes would produce an image the oracle (and every other node)
+    // rejects.
     if options.local {
         return Err(unsupported_bif());
     }
-    // `deterministic` (`DFLAG_DETERMINISTIC`) re-sorts every map's keys into full
-    // Erlang term order (`CMP_TERM` = `erts_cmp(_, _, 1, 0)`, `map_key_compare`,
-    // `external.c:3217-3227`, applied at `:3433-3470`/`:3757-3804`) — in particular
-    // atoms by **name**, where ERTS stores a flat map in `erts_cmp_flatmap_keys`
-    // (index) order. The codec's encoder has no deterministic mode: its map arms emit
-    // the flat map in stored order and the HAMT in reversed slot order
-    // (`encode_map`/`encode_hashmap_pairs`). When the stored order already *is* the
-    // deterministic order the plain encoder is byte-exact and the option is a no-op —
-    // verified here by [`deterministic_order_is_unchanged`], which walks the term
-    // conservatively and answers `false` (⇒ typed gap) for any map that would need
-    // re-sorting and for any subtree whose maps it cannot inspect.
-    //
-    // Closing the remaining gap fully is a `beam_codec` change (reported, not made
-    // here): the encoder needs a `with_deterministic()` mode that re-sorts each map's
-    // pairs by `beam_term::compare::cmp` before emitting them.
-    if options.deterministic && !deterministic_order_is_unchanged(term, ctx.atoms()) {
-        return Err(unsupported_bif());
-    }
+    // `deterministic` is threaded into the encoder itself (`DFLAG_DETERMINISTIC`
+    // re-sorts every map's pairs into full Erlang term order, `external.c:3757-3764`
+    // and `:3783-3807`), so an image that needs a re-sort is produced faithfully
+    // rather than refused (see [`encode_body`]).
     match options.compression {
         None => plain_image_of(ctx, term, options),
         Some(level) => compressed_image(&encode_body(ctx, term, options)?, level),
     }
-}
-
-/// Whether `term`'s map keys are already in the order `[deterministic]` requires, so
-/// the plain encoder reproduces the option's image byte-for-byte.
-///
-/// `[deterministic]` sorts each map's pairs by full Erlang term order (`CMP_TERM`,
-/// `erts_cmp(a, b, 1, 0)`) — atoms by **name**, not by index — whereas ERTS stores a
-/// flat map in `erts_cmp_flatmap_keys` order (atoms by index) and a HAMT in hash order.
-/// A map therefore needs re-sorting whenever its stored pair order differs from the
-/// `cmp` order ([`beam_term::map::map_pairs`] returns exactly that order).
-///
-/// The walk is deliberately **conservative**: it descends tuples, lists (proper and
-/// improper), and both map kinds, but a native record or a fun — whose fields/*
-/// closure environment can hold a map this module cannot read without `unsafe` — makes
-/// it answer `false` (a typed gap) rather than risk `true` for a subtree that does
-/// contain a map. A leaf term is trivially unchanged.
-fn deterministic_order_is_unchanged(term: Eterm, atoms: &AtomTable) -> bool {
-    if access::is_map(term) {
-        // The stored order (flat map: `erts_cmp_flatmap_keys`; HAMT: slot walk) vs the
-        // deterministic (`cmp`) order. `map_pairs` returns the latter.
-        let Ok(stored) = access::map_pairs_storage_order(term) else {
-            return false;
-        };
-        let Ok(ordered) = beam_term::map::map_pairs(term, atoms) else {
-            return false;
-        };
-        if stored.len() != ordered.len() {
-            return false;
-        }
-        let same_order = stored.iter().zip(ordered.iter()).all(|(s, o)| {
-            beam_term::compare::cmp(s.0, o.0, atoms).is_eq()
-                && beam_term::compare::cmp(s.1, o.1, atoms).is_eq()
-        });
-        if !same_order {
-            return false;
-        }
-        return stored
-            .iter()
-            .all(|(k, v)| deterministic_order_is_unchanged(*k, atoms) && deterministic_order_is_unchanged(*v, atoms));
-    }
-    if access::is_tuple(term) {
-        return (0..access::tuple_size(term))
-            .all(|index| deterministic_order_is_unchanged(access::tuple_element(term, index), atoms));
-    }
-    if access::is_list(term) {
-        // A cons (`is_list` covers only the non-NIL cons); follow the chain and inspect
-        // the tail too, so an improper list's final element is walked as well.
-        let mut cursor = term;
-        while access::is_list(cursor) {
-            if !deterministic_order_is_unchanged(access::car(cursor), atoms) {
-                return false;
-            }
-            cursor = access::cdr(cursor);
-        }
-        return deterministic_order_is_unchanged(cursor, atoms);
-    }
-    // A fun's environment and a native record's fields are opaque here — see above.
-    !(access::is_function(term) || access::is_record(term))
 }
 
 /// The **uncompressed** external image of `term` under `options`: the version byte
@@ -965,6 +893,13 @@ pub(crate) fn plain_image_of(
 /// leaves the term unencodable (see [`BifContext::local_node`] and
 /// [`BifContext::local_fun_identity`]).
 ///
+/// `options.deterministic` is threaded through as
+/// [`Encoder::with_deterministic`], so a map's pairs are emitted in full Erlang term
+/// order on the key — the `DFLAG_DETERMINISTIC` behaviour for **both** a ≤ 32-pair flat
+/// map and a > 32-pair HAMT (`external.c:3757-3764`, `:3783-3807`). The flag changes
+/// neither the tag set nor the encoded length, so the `erlang:external_size/2` probe
+/// that also runs through here stays correct.
+///
 /// # Errors
 ///
 /// The encoder's errors: `unsupported_external_term` for a tag the codec cannot write
@@ -989,6 +924,9 @@ pub(crate) fn encode_body(
         _ => MinorVersion::V2,
     };
     let mut encoder = Encoder::new_body(ctx.atoms()).with_minor_version(minor_version);
+    if options.deterministic {
+        encoder = encoder.with_deterministic();
+    }
     if let Some((node, creation)) = local {
         encoder = encoder.with_local_node(node, creation);
     }
@@ -1288,6 +1226,12 @@ mod tests {
         "local",
         "iovec",
         "fragment",
+        // Two atoms whose **atom-index** order (`zz` before `aa`, the order they are
+        // seeded here) is the reverse of their **name** order — the only way to make a
+        // flat map's stored `erts_cmp_flatmap_keys` order differ from the
+        // `[deterministic]` (`cmp`) order, i.e. to exercise the re-sort.
+        "zz",
+        "aa",
     ];
 
     /// `self()` — `NEW_PID_EXT` on `nonode@nohost`, id 10, serial/creation 0 (the
@@ -2535,11 +2479,15 @@ mod tests {
             let list = ctx
                 .list(&[ctx.int(1).expect("fits"), ctx.int(2).expect("fits")])
                 .expect("fits");
-            // The oracle returns `<<131,121,Hash:4/binary,Body/binary>>` (LOCAL_EXT,
-            // tag 121); the 4-byte payload is `local_node_hash` — runtime/node state this
-            // crate has no seam for — so the option is the typed `unsupported_bif`, never
-            // a fabricated hash:
-            // erl ... 'term_to_binary([1,2],[local])'  % <<131,121,_,_,_,_,107,0,2,1,2>>
+            // The oracle returns `<<131,121,Hash:4/binary,Body/binary>>`: a `LOCAL_EXT`
+            // (121) wrapper whose 4-byte payload is `local_node_hash` — a Bob-Jenkins
+            // block hash seeded from the node's hostname/pid/time-offset and the VM's
+            // monotonic clock (`external.c:136-200`). It is runtime state this crate has
+            // no seam for, and it changes on every VM start, so the option is the typed
+            // `unsupported_bif`, never a fabricated hash:
+            //   erl ... 'term_to_binary([1,2],[local])'          % <<131,121,_,_,_,_,107,0,2,1,2>>
+            //   erl ... 'term_to_binary(self(),[local])'         % 3rd..6th byte differ per run
+            // (see `tests/term_to_binary_options.rs`, which pins the two-run difference).
             let local = atom_option(ctx, "local");
             let err = term_to_binary_2(ctx, &[list, local]).unwrap_err();
             assert!(
@@ -2552,92 +2500,126 @@ mod tests {
             let both = atom_options(ctx, "local", "compressed");
             let err = term_to_binary_2(ctx, &[list, both]).unwrap_err();
             assert!(is_unsupported_bif(&err), "local + compressed, got {err:?}");
+
+            // `local` is refused for a term holding an internal pid too — the id itself
+            // is encodable (through the `LocalNode` fallback), so the gap is the wrapper
+            // and nothing else.
+            let pid = ctx.self_pid().to_eterm();
+            let local = atom_option(ctx, "local");
+            let err = term_to_binary_2(ctx, &[pid, local]).unwrap_err();
+            assert!(is_unsupported_bif(&err), "local + pid, got {err:?}");
         });
     }
+    /// The oracle's `[deterministic]` image of `#{zz=>1,aa=>2}` — atoms sorted by
+    /// **name** (`erl -noshell -eval 'io:format("~p~n",[term_to_binary(#{zz=>1,aa=>2},
+    /// [deterministic])]),halt().'`), *not* the plain image, whose flat-map storage
+    /// order is atom-index order (`aa` before `zz` here).
+    const DETERMINISTIC_MAP_ZZ_AA: &[u8] = &[
+        131, 116, 0, 0, 0, 2, 119, 2, 97, 97, 97, 2, 119, 2, 122, 122, 97, 1,
+    ];
 
-    /// The oracle's `[deterministic]` image of `#{a=>1,b=>2}` — atoms sorted by **name**
-    /// (`erl -noshell -eval 'io:format("~p~n",[term_to_binary(#{a=>1,b=>2},
-    /// [deterministic])]),halt().'`), *not* the plain image, which is index-ordered.
-    const DETERMINISTIC_MAP_AB: &[u8] = &[
-        131, 116, 0, 0, 0, 2, 119, 1, 97, 97, 1, 119, 1, 98, 97, 2,
+    /// The oracle's plain (index-ordered) image of the same map — the control that
+    /// proves `[deterministic]` really re-ordered it.
+    const PLAIN_MAP_ZZ_AA: &[u8] = &[
+        131, 116, 0, 0, 0, 2, 119, 2, 122, 122, 97, 1, 119, 2, 97, 97, 97, 2,
     ];
 
     #[test]
-    fn term_to_binary_deterministic_is_byte_exact_when_no_resort_is_needed() {
+    fn term_to_binary_deterministic_sorts_a_flat_map_by_full_term_order() {
         with_ctx(|ctx| {
-            let a = ctx.atom("a").expect("seeded");
-            let b = ctx.atom("b").expect("seeded");
+            let zz = ctx.atom("zz").expect("seeded");
+            let aa = ctx.atom("aa").expect("seeded");
             let one = ctx.int(1).expect("fits");
             let two = ctx.int(2).expect("fits");
 
-            // `NAMES` seeds `a` before `b`, so the stored order of this flat map already
-            // *is* the deterministic (atom-name) order — the plain encoder emits it and
-            // the image is byte-exact. The premise: `map_pairs`' `cmp` order agrees with
-            // the storage order.
-            assert!(deterministic_order_is_unchanged(
-                access::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits"),
-                ctx.atoms()
-            ));
+            // `zz` is seeded before `aa`, so the flat map's `erts_cmp_flatmap_keys`
+            // (atom-index) storage order is `[zz, aa]` — the reverse of the
+            // `[deterministic]` (`cmp`, atom-**name**) order `[aa, zz]`.
+            let map = access::make_map(ctx.heap(), &[(zz, one), (aa, two)]).expect("fits");
+            assert!(access::is_flatmap(map), "2 distinct keys ⇒ a flat map");
+            assert_eq!(
+                text(term_to_binary_1(ctx, &[map]).unwrap()),
+                PLAIN_MAP_ZZ_AA.to_vec(),
+                "the plain image keeps the index (storage) order"
+            );
 
-            let map = access::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
             let det = atom_option(ctx, "deterministic");
             assert_eq!(
                 text(term_to_binary_2(ctx, &[map, det]).unwrap()),
-                DETERMINISTIC_MAP_AB.to_vec()
+                DETERMINISTIC_MAP_ZZ_AA.to_vec(),
+                "[deterministic] re-sorts the flat map into atom-name order"
             );
 
-            // The same map with no option is the very same image (its stored order is
-            // already the name order), and a *nested* map is walked too:
-            // erl ... 'term_to_binary({1,#{a=>1,b=>2}},[deterministic])'
-            //   % <<131,104,2,97,1,116,0,0,0,2,119,1,97,97,1,119,1,98,97,2>>
-            let map = access::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
-            assert_eq!(
-                text(term_to_binary_1(ctx, &[map]).unwrap()),
-                DETERMINISTIC_MAP_AB.to_vec()
-            );
+            // A map nested inside a container is re-sorted too (the flag lives on the
+            // encoder, so every map it reaches is affected):
+            // erl ... 'term_to_binary({1,#{zz=>1,aa=>2}},[deterministic])'
+            let map = access::make_map(ctx.heap(), &[(zz, one), (aa, two)]).expect("fits");
             let nested = ctx.tuple(&[one, map]).expect("fits");
             let det = atom_option(ctx, "deterministic");
-            let image = text(term_to_binary_2(ctx, &[nested, det]).unwrap());
             let mut expected = vec![131u8, 104, 2, 97, 1];
-            expected.extend_from_slice(&DETERMINISTIC_MAP_AB[1..]);
-            assert_eq!(image, expected);
+            expected.extend_from_slice(&DETERMINISTIC_MAP_ZZ_AA[1..]);
+            assert_eq!(text(term_to_binary_2(ctx, &[nested, det]).unwrap()), expected);
+
+            // `[deterministic,deterministic]` is the same flag twice, so it is the same
+            // image (`parse_t2b_opts` sets it, it does not toggle).
+            let map = access::make_map(ctx.heap(), &[(zz, one), (aa, two)]).expect("fits");
+            let det2 = atom_options(ctx, "deterministic", "deterministic");
+            assert_eq!(
+                text(term_to_binary_2(ctx, &[map, det2]).unwrap()),
+                DETERMINISTIC_MAP_ZZ_AA.to_vec()
+            );
         });
     }
+
+    /// The oracle's `[deterministic]` image of the 40-pair integer-keyed HAMT
+    /// `maps:from_list([{N, N*10} || N <- lists:seq(1,40)])` — every pair in ascending
+    /// key order (`erl -noshell -eval 'M = maps:from_list([{N, N*10} || N <-
+    /// lists:seq(1,40)]), io:format("~p~n",[term_to_binary(M,[deterministic])]),
+    /// halt().'`). The values' small/`INTEGER_EXT` split (`10`..`250` one byte, `260`…
+    /// four) is the oracle's own integer tagging.
+    const DETERMINISTIC_HAMT_40: &[u8] = &[
+        131, 116, 0, 0, 0, 40, //
+        97, 1, 97, 10, 97, 2, 97, 20, 97, 3, 97, 30, 97, 4, 97, 40, 97, 5, 97, 50, 97, 6, 97, 60,
+        97, 7, 97, 70, 97, 8, 97, 80, 97, 9, 97, 90, 97, 10, 97, 100, 97, 11, 97, 110, 97, 12, 97,
+        120, 97, 13, 97, 130, 97, 14, 97, 140, 97, 15, 97, 150, 97, 16, 97, 160, 97, 17, 97, 170,
+        97, 18, 97, 180, 97, 19, 97, 190, 97, 20, 97, 200, 97, 21, 97, 210, 97, 22, 97, 220, 97, 23,
+        97, 230, 97, 24, 97, 240, 97, 25, 97, 250, //
+        97, 26, 98, 0, 0, 1, 4, 97, 27, 98, 0, 0, 1, 14, 97, 28, 98, 0, 0, 1, 24, 97, 29, 98, 0, 0,
+        1, 34, 97, 30, 98, 0, 0, 1, 44, 97, 31, 98, 0, 0, 1, 54, 97, 32, 98, 0, 0, 1, 64, 97, 33, 98,
+        0, 0, 1, 74, 97, 34, 98, 0, 0, 1, 84, 97, 35, 98, 0, 0, 1, 94, 97, 36, 98, 0, 0, 1, 104, 97,
+        37, 98, 0, 0, 1, 114, 97, 38, 98, 0, 0, 1, 124, 97, 39, 98, 0, 0, 1, 134, 97, 40, 98, 0, 0, 1,
+        144,
+    ];
 
     #[test]
-    fn term_to_binary_deterministic_reports_a_typed_gap_when_a_map_must_be_resorted() {
+    fn term_to_binary_deterministic_sorts_a_hash_map_by_full_term_order() {
         with_ctx(|ctx| {
-            let a = ctx.atom("a").expect("seeded");
-            let b = ctx.atom("b").expect("seeded");
-            let one = ctx.int(1).expect("fits");
-            let two = ctx.int(2).expect("fits");
+            // 40 distinct keys is past `MAP_SMALL_MAP_LIMIT`, so `write_map` builds a
+            // HAMT whose stored order is the hash-slot walk — a different order from the
+            // ascending integer key order `[deterministic]` requires.
+            let pairs: Vec<(Eterm, Eterm)> = (1i64..=40)
+                .map(|n| {
+                    (
+                        ctx.int(n).expect("fits"),
+                        ctx.int(n * 10).expect("fits"),
+                    )
+                })
+                .collect();
+            let map = access::make_map(ctx.heap(), &pairs).expect("fits");
+            assert!(!access::is_flatmap(map), "40 distinct keys ⇒ a HAMT");
 
-            // Storage order `[b, a]` vs the deterministic (`cmp`) order `[a, b]`: this map
-            // needs the re-sort `beam_codec`'s encoder cannot do, so the option reports
-            // the typed gap — never the wrongly ordered (plain) image.
-            let reversed = access::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
-            assert!(!deterministic_order_is_unchanged(reversed, ctx.atoms()));
+            let plain = text(term_to_binary_1(ctx, &[map]).unwrap());
             let det = atom_option(ctx, "deterministic");
-            let err = term_to_binary_2(ctx, &[reversed, det]).unwrap_err();
-            assert!(
-                is_unsupported_bif(&err),
-                "expected the typed unsupported_bif gap, got {err:?}"
+            let sorted = text(term_to_binary_2(ctx, &[map, det]).unwrap());
+
+            assert_eq!(sorted, DETERMINISTIC_HAMT_40.to_vec(), "the sorted HAMT image");
+            assert_ne!(
+                plain, sorted,
+                "the HAMT's hash-slot order differs from the ascending key order"
             );
-
-            // A map nested inside a container is found by the walk as well.
-            let reversed = access::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
-            let nested = ctx.tuple(&[reversed]).expect("fits");
-            let det = atom_option(ctx, "deterministic");
-            let err = term_to_binary_2(ctx, &[nested, det]).unwrap_err();
-            assert!(is_unsupported_bif(&err), "a nested map, got {err:?}");
-
-            // Both reads are still *encodable* without the option (the plain image keeps
-            // the stored order), so the gap is the re-sort and nothing else.
-            let reversed = access::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
-            assert!(term_to_binary_1(ctx, &[reversed]).is_ok());
+            assert_eq!(sorted.len(), plain.len(), "the re-sort changes order, not length");
         });
     }
-
     // -- binary_to_term ---------------------------------------------------
 
     /// `binary_to_term/2`'s `[used]` count for a top-level `COMPRESSED` image: the

@@ -244,15 +244,14 @@ short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
   the one borrow-split route, so **no BIF clones the whole `AtomTable` per call** — `tests/decode_hot_path.rs` pins the
   steady-state per-call allocation count as table-size-**independent** (9 allocations / 602 bytes for a 114-byte image,
   identical at 137 and 4105 atoms; the plain `AtomTable::clone()` counterfactual is 276 → 8212, and clone+decode
-  284 → 8220). `prefix_matches` is the
-  remaining O(table) cost and is deliberately a *correct* revalidation, not a clone (no table identity signal exists to
-  make it O(1)). Measured (`examples/etf_bench.rs`, atoms=3009, 20k iters): a clone-per-call decode is 130.3 µs/op
+  284 → 8220). Measured (`examples/etf_bench.rs`, atoms=3009, 20k iters): a clone-per-call decode is 130.3 µs/op
   against the memoized **5.45 µs/op (23.9×)**, of which ~5.85 µs is that verification.
 - **Options.** `compressed`/`{compressed,0..=9}` really deflate a version-less body and wrap it `[131][80][len][zlib]`
   **only** when the stream fits the C's `body_len - 5` budget (bare atom = level 6); `{minor_version,0|1|2}` selects
-  the tag set byte-identically; `iovec`/`fragment` are `badarg`. `local`/`deterministic` are **parsed but mostly a
-  typed gap** (`local` needs the node's `LOCAL_EXT` hash — no seam; `deterministic` is a no-op when the stored order
-  already *is* deterministic). `binary_to_term/2` takes `safe`/`used` (the count includes the `131` byte); on a
+  the tag set byte-identically; `iovec`/`fragment` are `badarg`. `[deterministic]` is **fully honoured** (threaded as
+  `Encoder::with_deterministic`, so every flat/HAMT/nested map is re-sorted into full term order); `local` stays the one
+  typed gap (its `LOCAL_EXT` payload is the per-VM `local_node_hash` — no seam). `[deterministic,local]`/unknown ⇒
+  `badarg`; `/3` does not exist (oracle `undef`). `binary_to_term/2` takes `safe`/`used` (the count includes the `131` byte); on a
   top-level `COMPRESSED` image `[used]` is the compressed image's own length (trailing bytes ignored *and* uncounted).
 - **The local-node identity is installed on BOTH directions** (`LocalNode`; `(nonode@nohost, 0)` fallback): encoding
   yields a byte-exact `NEW_PID_EXT`/`V4_PORT_EXT`/`NEWER_REFERENCE_EXT`, and decoding demotes such a wire id to the
@@ -365,7 +364,7 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` with a `BytesSink`/`NullSink` capture.
 - `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **82
-  suite result lines / 1613 tests** (all green): the lib suite (816), 79 integration files (797), and two empty
+  suite result lines / 1620 tests** (all green): the lib suite (816), 80 integration files (804), and two empty
   harnesses. Re-derive the split from the per-suite `test result` lines, not from a hand-maintained table.
 - **Pins.** `tests/roster_audit.rs` is the roster pin (see the census section). `tests/bif_tab.rs` pins the parsed
   `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 89`,
@@ -422,7 +421,7 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   The oracle's channel is `atom_val(x->sysname)` — the node-name atom's index in the **running VM's** atom table,
   state the frozen term does not carry (one `V4_PORT_EXT` image printed `#Port<10643.7>` then `#Port<10639.7>`). Needs a
   node-identity seam **and** a node-atom → dist-channel provider (both `beam_rt`, a new edge — Handoffs).
-- **`term_to_binary/2`'s `local`/`deterministic`** answer the typed gap when they would change the image.
+- **`term_to_binary/2`'s `local`** answers the typed gap (the `LOCAL_EXT` hash is per-VM state, no seam); `deterministic` is closed (byte-exact).
 - **Fun identity:** `fun_info/2`'s `name` and `fun_info_mfa/1`'s function element need the module's fun table (no
   seam provides it; the oracle returns the real lambda name for a *loaded* module, `[]` otherwise). A `FunKind::Local`
   fun's descriptor is only `(uniq:u64, index:u32)`, so **none** of its six identity items is derivable (a
@@ -594,9 +593,9 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
   with `error::unsupported_tag`, while the oracle accepts any term and delivers
   `{{a,b}, Ref, process, P, Reason}`. Closing needs `beam_process` to hold a deep-copied tag (a table-owned/
   `TermStore` copy, like `Table::install_heir`) instead of a raw heap `Eterm`.
-- **`beam_codec` — a `with_deterministic()` encoder mode** would close `term_to_binary/2`'s `deterministic` gap.
-  (`encode_fun_external` already emits an `EXPORT_EXT`'s **true** arity via `fun_true_arity_term`, so no
-  >255-truncation remains.) `beam_codec`'s local-node decode demotion is landed, so its only remaining gap is the
+- **`beam_codec` — `with_deterministic()` is wired** by `binconv::encode_body`; `encode_fun_external` already emits an
+  `EXPORT_EXT`'s **true** arity (`fun_true_arity_term`), so no >255-truncation. **Still owed:** a `local_node_hash` seam
+  so `beam_rt` can close `[local]` (and `external_size/2`'s inherited gap). Its only other remaining gap is the
   reference-`id` representability one.
 - **Differential cases this node's coverage should be pinned by** (corpus owner: `../../tools/differential/`):
   records; wire (self-pid/internal-port `term_to_binary`, `export_ext_encode`); phash/phash2 edge values;
@@ -640,8 +639,9 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - `src/io.rs` / `src/io_ts.rs` / `src/print.rs` -> the `io`/`io_lib` format engine (the `{chars_limit,N}` limited
   paths, the unicode `~ts` arm); the `~w`/`~p`/`~W`/`~P` leaf renderer with `~k`/`~K`
 - `src/print/pretty.rs` / `src/print/pretty/cind.rs` -> the `io_lib_pretty` port; the `cind/7` family
-- `tests/` -> 79 integration files / 797 tests (lib suite 816); the roster pin is `tests/roster_audit.rs`, and
-  `tests/{registry_hot_path,decode_hot_path}.rs` are the allocation-count pins
+- `tests/` -> 80 integration files / 804 tests (lib suite 816); the roster pin is `tests/roster_audit.rs`,
+  `tests/{registry_hot_path,decode_hot_path}.rs` are the allocation-count pins, and `tests/term_to_binary_options.rs`
+  is the fail-loud oracle suite for `term_to_binary/2`'s `[deterministic]`/`[local]` write-side options
 - `HANDOFF_batch52.md` -> the batch-52 cross-crate gap report (owner/repro/fix-shape per finding)
 - siblings `../beam_engine`/`../beam_process`/`../beam_ets`/`../beam_codec`/`../beam_term`/`../beam_loader`/`../beam_io`
   -> the `call_bif` seam, `ProcessId`/`PortId`/`PortTable`, the `Table`/match-spec engine, the ETF codec, the frozen
