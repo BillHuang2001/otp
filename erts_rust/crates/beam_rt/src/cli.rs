@@ -468,10 +468,11 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         }
     }
     let code_paths = builder.code_paths();
+    let pz_paths = builder.pz_paths();
     Ok(RuntimeConfig {
         emulator: builder.emulator,
         code_paths,
-        pz_paths: builder.pz_paths(),
+        pz_paths,
         heap_words: DEFAULT_HEAP_WORDS,
         online_schedulers: builder.online_schedulers,
         heap: builder.heap,
@@ -754,6 +755,7 @@ fn parse_schedulers(value: &str) -> Result<(Option<u32>, Option<u32>)> {
             Some(online)
         }
         Some(_) => return Err(error::bad_switch_value("+S", value)),
+        None => None,
     };
     Ok((schedulers, online))
 }

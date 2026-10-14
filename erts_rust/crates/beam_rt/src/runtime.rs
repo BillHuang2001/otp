@@ -576,9 +576,7 @@ impl Runtime {
         // The configured `-pa`/`-pz` directories are *boot-time default* code-path entries: a
         // later `init:restart/0` resets the code path to exactly them plus the system `ebin`
         // directories (see [`Runtime::restart`] and [`CodeServer::reset_paths_to_defaults`]).
-        for dir in &config.code_paths {
-            code_server.add_default_path(dir.clone());
-        }
+        code_server.set_configured_paths(&config.code_paths, &config.pz_paths);
         let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
         // The host **collection gate** (`context/gc_walk.rs::RuntimeCollectionGate`): the

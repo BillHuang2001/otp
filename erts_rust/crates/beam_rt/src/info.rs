@@ -633,6 +633,26 @@ pub(crate) fn schedulers_count(rt: &Runtime) -> i64 {
     }
 }
 
+/// The number of **online** normal schedulers, as the oracle reports it.
+///
+/// `+S Total:Online` names both halves: the total is [`schedulers_count`] and this is the
+/// online count the emulator puts on line, which the oracle reports as
+/// `schedulers_online`, the second/third fields of `schedulers_state` and the
+/// `schedulers_active` row.
+///
+/// Without an explicit `:Online` half the oracle does **not** put every configured
+/// scheduler online: `erl_init.c:1141` sets `onln = tot < schdlrs_onln ? tot :
+/// schdlrs_onln`, i.e. `min(total, <default online>)`. So `erl +S 16` reports 16
+/// schedulers but only 14 online on a 16-CPU host (verified against OTP 29.1.1 /
+/// erts-17.1), and `+S 4` reports 4 online because `4 < 14`. Reproducing that rule
+/// keeps the count self-consistent with [`schedulers_count`] on any host.
+pub(crate) fn schedulers_online_count(rt: &Runtime) -> i64 {
+    match rt.config().online_schedulers {
+        Some(online) if online > 0 => i64::from(online),
+        _ => schedulers_count(rt).min(logical_processors()),
+    }
+}
+
 /// The number of **live ports** — the value the oracle's `port_count` reports.
 ///
 /// The runtime's own [`PortRegistry`](crate::port::PortRegistry) is the single source of

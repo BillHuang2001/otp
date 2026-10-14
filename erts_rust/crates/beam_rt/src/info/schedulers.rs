@@ -67,7 +67,7 @@
 
 use beam_common::Result;
 
-use super::{logical_processors, schedulers_count, InfoValue};
+use super::{logical_processors, schedulers_count, schedulers_online_count, InfoValue};
 use crate::runtime::Runtime;
 
 /// The `system_info/1` value of a `schedulers`-family key, or `None` when `key` is not
@@ -78,18 +78,19 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
             Some(Ok(InfoValue::Int(logical_processors())))
         }
         "schedulers" => Some(Ok(InfoValue::Int(schedulers_count(rt)))),
-        // Every scheduler this runtime has is online: there is no online/offline model
-        // (the oracle may report fewer online than configured under load, so
-        // `schedulers_online == schedulers` is the honest answer for this model).
-        "schedulers_online" => Some(Ok(InfoValue::Int(schedulers_count(rt)))),
+        // `+S Total:Online` puts `Online` schedulers on line; without it the oracle's
+        // default online count is `min(total, <processors>)` (see
+        // [`logical_processors`](super::logical_processors) and the online resolver).
+        "schedulers_online" => Some(Ok(InfoValue::Int(schedulers_online_count(rt)))),
         // The *calling* scheduler's id, `erlang:system_info(scheduler_id)`. This runtime
         // has exactly one scheduler and the oracle's ids are 1-based, so the calling
         // scheduler's id here is always `1`. (The oracle's own value is therefore
         // volatile — it is whichever scheduler happens to run the call, e.g. `7` on this
         // 16-scheduler host — and must **not** be copied: `1` is this runtime's real id.)
         "scheduler_id" => Some(Ok(InfoValue::Int(1))),
-        "dirty_cpu_schedulers" | "dirty_cpu_schedulers_online" => {
-            Some(Ok(InfoValue::Int(dirty_cpu_schedulers(rt))))
+        "dirty_cpu_schedulers" => Some(Ok(InfoValue::Int(dirty_cpu_schedulers(rt)))),
+        "dirty_cpu_schedulers_online" => {
+            Some(Ok(InfoValue::Int(dirty_cpu_schedulers_online(rt))))
         }
         "dirty_io_schedulers" => Some(Ok(InfoValue::Int(dirty_io_schedulers(rt)))),
         "scheduler_bind_type" => Some(Ok(InfoValue::Atom("unbound"))),
@@ -107,9 +108,10 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         // ERTS interface constant (`beam_common::CONTEXT_REDS`) reported as `4000` always.
         "context_reductions" => Some(Ok(InfoValue::Int(beam_common::CONTEXT_REDS as i64))),
         // The scheduler *state* keys, all from this runtime's own scheduler model.
-        "schedulers_total" | "schedulers_active" | "run_queues" => {
-            Some(Ok(InfoValue::Int(schedulers_count(rt))))
-        }
+        "schedulers_total" | "run_queues" => Some(Ok(InfoValue::Int(schedulers_count(rt)))),
+        // `schedulers_active` is the number of schedulers online (and running): the oracle
+        // reported `active = online = 2` for `+S 4:2`.
+        "schedulers_active" => Some(Ok(InfoValue::Int(schedulers_online_count(rt)))),
         "schedulers_state" => Some(Ok(schedulers_state(rt))),
         "all_schedulers_state" => Some(Ok(all_schedulers_state(rt))),
         // `erts_get_logical_processors(…, &no)`: the processor quota available to the
@@ -124,15 +126,16 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
 
 /// `system_info(schedulers_state)` — `{Total, Online, Active}` (`erl_bif_info.c:3262-3272`).
 ///
-/// All three are this runtime's one scheduler count: it has no online/offline model and
-/// no paused scheduler, so every scheduler it reports is both online and active — the
-/// same rule [`schedulers_online`](try_value) already follows.
+/// The total is the configured scheduler count and online/active are the online count
+/// (this runtime pauses no scheduler, so every online scheduler is active). The oracle
+/// answered `{4,2,2}` for `+S 4:2`.
 fn schedulers_state(rt: &Runtime) -> InfoValue {
-    let count = schedulers_count(rt);
+    let total = schedulers_count(rt);
+    let online = schedulers_online_count(rt);
     InfoValue::Tupled(vec![
-        InfoValue::Int(count),
-        InfoValue::Int(count),
-        InfoValue::Int(count),
+        InfoValue::Int(total),
+        InfoValue::Int(online),
+        InfoValue::Int(online),
     ])
 }
 
@@ -140,27 +143,34 @@ fn schedulers_state(rt: &Runtime) -> InfoValue {
 /// (`erl_bif_info.c:3284-3329`).
 ///
 /// The C builds the list as `normal`, then `dirty_cpu`, then `dirty_io`, **omitting** a
-/// dirty pool whose total is `0`; this runtime has no dirty pool unless `+SDcpu`/`+SDio`
-/// configured one, so a default runtime answers the single `normal` row. The `dirty_io`
+/// dirty pool whose total is `0`. This runtime's dirty pools use the emulator defaults
+/// when `+SDcpu`/`+SDio` did not configure one: `dirty_cpu` follows the normal total
+/// (with the online half online) and `dirty_io` is `10`. The oracle answered
+/// `[{normal,4,2,2},{dirty_cpu,4,2,2},{dirty_io,10,10,10}]` for `+S 4:2`; the `dirty_io`
 /// row reports the io pool's total twice (the C's `TUPLE4(am_dirty_io, total, total,
 /// active)`), unlike the `normal`/`dirty_cpu` rows' total/online/active.
 fn all_schedulers_state(rt: &Runtime) -> InfoValue {
-    let count = schedulers_count(rt);
+    let total = schedulers_count(rt);
+    let online = schedulers_online_count(rt);
     let mut rows = vec![InfoValue::Tupled(vec![
         InfoValue::Atom("normal"),
-        InfoValue::Int(count),
-        InfoValue::Int(count),
-        InfoValue::Int(count),
+        InfoValue::Int(total),
+        InfoValue::Int(online),
+        InfoValue::Int(online),
     ])];
-    if let Some(dirty_cpu) = configured_pool(rt.config().emulator.dirty_cpu_schedulers) {
+    let dirty_cpu = configured_pool(rt.config().emulator.dirty_cpu_schedulers)
+        .unwrap_or(total);
+    if dirty_cpu > 0 {
         rows.push(InfoValue::Tupled(vec![
             InfoValue::Atom("dirty_cpu"),
             InfoValue::Int(dirty_cpu),
-            InfoValue::Int(dirty_cpu),
-            InfoValue::Int(dirty_cpu),
+            InfoValue::Int(online),
+            InfoValue::Int(online),
         ]));
     }
-    if let Some(dirty_io) = configured_pool(rt.config().emulator.dirty_io_schedulers) {
+    let dirty_io = configured_pool(rt.config().emulator.dirty_io_schedulers)
+        .unwrap_or(DEFAULT_DIRTY_IO_SCHEDULERS);
+    if dirty_io > 0 {
         rows.push(InfoValue::Tupled(vec![
             InfoValue::Atom("dirty_io"),
             InfoValue::Int(dirty_io),
@@ -212,6 +222,11 @@ fn scheduling_statistics() -> InfoValue {
 /// thread. The oracle's default when no `+A` is given.
 const DEFAULT_THREAD_POOL_SIZE: i64 = 1;
 
+/// The emulator's default dirty-IO scheduler pool size (`erl_init.c`: `dirty_io_scheds
+/// = 10`), reported by `dirty_io_schedulers` and the `dirty_io` row of
+/// `all_schedulers_state` when `+SDio` did not configure one.
+const DEFAULT_DIRTY_IO_SCHEDULERS: i64 = 10;
+
 /// `erlang:system_info(thread_pool_size)` — the async-thread-pool size the emulator was
 /// started with.
 ///
@@ -240,14 +255,24 @@ fn thread_pool_size(rt: &Runtime) -> i64 {
     size
 }
 
-/// `+SDcpu N`, else `0` — this runtime has no dirty CPU scheduler pool.
+/// `+SDcpu N`, else the emulator default (the normal scheduler total) — this runtime
+/// models no separate dirty CPU pool, so it reports the default ERTS pool size.
 fn dirty_cpu_schedulers(rt: &Runtime) -> i64 {
-    configured_pool(rt.config().emulator.dirty_cpu_schedulers).unwrap_or(0)
+    configured_pool(rt.config().emulator.dirty_cpu_schedulers)
+        .unwrap_or_else(|| schedulers_count(rt))
 }
 
-/// `+SDio N`, else `0` — this runtime has no dirty IO scheduler pool.
+/// The online half of the dirty CPU pool: `+SDcpu N:N`'s second number, else the normal
+/// online count (the oracle's `dirty_cpu_schedulers_online` follows the normal online
+/// count when no dirty pool is configured).
+fn dirty_cpu_schedulers_online(rt: &Runtime) -> i64 {
+    schedulers_online_count(rt)
+}
+
+/// `+SDio N`, else the emulator default of `10` — this runtime models no dirty IO pool.
 fn dirty_io_schedulers(rt: &Runtime) -> i64 {
-    configured_pool(rt.config().emulator.dirty_io_schedulers).unwrap_or(0)
+    configured_pool(rt.config().emulator.dirty_io_schedulers)
+        .unwrap_or(DEFAULT_DIRTY_IO_SCHEDULERS)
 }
 
 /// `{unbound, unbound, …}`, one `unbound` atom per configured (normal) scheduler —
