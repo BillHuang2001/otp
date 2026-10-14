@@ -273,6 +273,7 @@ impl RuntimeContext<'_> {
             ("init", "boot", 1) => Some(self.boot_1(args)),
             ("init", "get_status", 0) => Some(self.get_status()),
             ("init", "script_id", 0) => Some(self.script_id_0()),
+            ("init", "fetch_loaded", 0) => Some(self.fetch_loaded()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
             // The port surface the `PortHook` seam cannot express: `port_command/2,3` (the
             // port's *input* direction) and `port_control/3` (the driver's `control` callback) —

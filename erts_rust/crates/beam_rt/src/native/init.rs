@@ -386,6 +386,40 @@ impl RuntimeContext<'_> {
         let vsn = self.charlist(&vsn)?;
         terms::make_tuple(self, &[name, vsn])
     }
+
+    /// `init:fetch_loaded/0`: `[{Module, File}]` for the modules the **boot script** loaded
+    /// and handed over to the code server (contract A.7).
+    ///
+    /// The oracle's `init` process answers this from the `loaded` list it accumulates while
+    /// running the script's `{primLoad, …}` batches and `{ensure_loaded, Module}` requests,
+    /// then clears it (`init.erl:456-458,720-722`) — `code_server:init/3` is its only
+    /// consumer (`lib/kernel/src/code_server.erl:100`), which seeds `?moddb` from it. This
+    /// runtime has no live `init` process (the floor *is* the module — see the module docs),
+    /// so the answer is the boot script's own loading record: every module in the code
+    /// server's cache **except** the 22 preloaded ones, which the oracle keeps in
+    /// `erlang:pre_loaded/0` rather than in `Loaded`, paired with the file it was loaded
+    /// from. A cached module with no recorded source file is not part of that load set and
+    /// is omitted — never paired with a fabricated path.
+    pub(super) fn fetch_loaded(&mut self) -> Result<Eterm> {
+        let mut entries = Vec::new();
+        for name in self.runtime.loaded_modules() {
+            if self.runtime.is_preloaded_loaded(&name) {
+                continue;
+            }
+            let Some(path) = self
+                .runtime
+                .code_server
+                .loaded_path(&name)
+                .map(|path| path.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let module = self.atom(&name)?;
+            let file = self.charlist(&path)?;
+            entries.push(terms::make_tuple(self, &[module, file])?);
+        }
+        terms::make_list(self, &entries)
+    }
 }
 
 /// The name of the program that started this runtime — the value of
