@@ -374,6 +374,10 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
     let ctx = unsafe { &mut *runtime.ctx };
 
     let step = machine.step_instruction(module, labels, func, pc, ctx);
+    // Structural counter: attribute this per-instruction deopt to the opcode at
+    // `(func, pc)` in the active module.
+    #[cfg(test)]
+    super::counters::record_step_one(module, func, pc);
     fold_step(runtime, step, func, pc)
 }
 
@@ -435,6 +439,10 @@ fn jit_step_ext(
         // `Machine::current_code` keeps the granularity this instruction had before the
         // duplicate resolution was removed.
         machine.set_current_code(func, pc);
+        // Structural counter: attribute this `call_ext*` deopt to the opcode at
+        // `(func, pc)` in the active module.
+        #[cfg(test)]
+        super::counters::record_step_ext(module, func, pc);
 
         // The instruction's own operand shape selects the frame discipline, exactly as
         // the interpreter's three `call_ext*` arms do (`ImportFrame::Call`/`Only`/
@@ -593,6 +601,9 @@ pub(crate) extern "C" fn jit_ext_call(
     };
     match resolved {
         Some(Some((context, callee, callee_pc))) => {
+            // Structural counter: the `call_ext*` resolved a callee for this machine.
+            #[cfg(test)]
+            super::counters::record_ext_resolved();
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the
             // driver owns; the `&mut` derived from it above is dead by now, so this
             // store does not alias it. The driver takes the slot when it decodes the
@@ -604,10 +615,18 @@ pub(crate) extern "C" fn jit_ext_call(
         // dispatching seam so the instruction runs with the interpreter's own
         // `call_ext*` semantics — special cases and frame discipline included — while
         // the host's seam is consulted only once.
-        Some(None) => jit_step_ext(rt, func, pc, Some(None)),
+        Some(None) => {
+            #[cfg(test)]
+            super::counters::record_ext_declined();
+            jit_step_ext(rt, func, pc, Some(None))
+        }
         // Resolution never reached the host's decline, so the instruction is the
         // interpreter's to execute (all of it, exactly once).
-        None => jit_step_one(rt, func, pc),
+        None => {
+            #[cfg(test)]
+            super::counters::record_ext_fallback();
+            jit_step_one(rt, func, pc)
+        }
     }
 }
 
@@ -698,6 +717,9 @@ fn resolve_ext_entry(
 /// register file, so it is safe to call with the block's cached x-registers live in
 /// the callee-saved registers; it clobbers only the caller-saved ones.
 pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc: u32) {
+    // Structural counter: one Y-free block prologue.
+    #[cfg(test)]
+    super::counters::record_set_position();
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; `runtime.machine`
     // points at the driver's live `Machine`, and no other `&mut Machine` exists while
@@ -729,6 +751,9 @@ pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc
 /// Infallible, and it clobbers only caller-saved registers, so it is emitted before the
 /// prologue loads the cached x-registers (exactly like [`jit_set_position`]).
 pub(crate) extern "C" fn jit_publish_y(rt: *mut JitRuntime<'_>, func: u32, pc: u32) {
+    // Structural counter: one block prologue whose body accesses a `Y` slot.
+    #[cfg(test)]
+    super::counters::record_publish_y();
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; `runtime.machine`
     // points at the driver's live `Machine`, and no other `&mut Machine` exists while
@@ -754,6 +779,9 @@ pub(crate) extern "C" fn jit_publish_y(rt: *mut JitRuntime<'_>, func: u32, pc: u
 /// slot the call is not emitted at all, and when the block leaves to the driver the
 /// next block's prologue publishes instead (so a driver round-trip never refreshes).
 pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
+    // Structural counter: the gated in-block Y-window re-publish.
+    #[cfg(test)]
+    super::counters::record_refresh_y();
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call (the driver is
     // blocked in the block call that reached us).
