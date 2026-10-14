@@ -935,7 +935,7 @@ mod tests {
         let registered = default_registry();
         let census = crate::bif_tab::census(&tab, &registered);
         assert_eq!(census.implemented_count(), 556);
-        assert_eq!(census.fast_path_count(), 91);
+        assert_eq!(census.fast_path_count(), 92);
 
         // Seed every name the sweep touches, so `ctx.atom` never needs an interner.
         let mut names: Vec<&str> = vec!["true", "false"];
@@ -950,9 +950,9 @@ mod tests {
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
 
         // Every declared key is `true` (the C gives every `bif.tab` line a
-        // `bif_number`), and every stdlib fast path — the 89 registry keys that
+        // `bif_number`), and every stdlib fast path — the 90 registry keys that
         // are NOT in the table — is `false`. A registry-membership implementation
-        // would answer `true` for all 89.
+        // would answer `true` for all 90.
         for entry in &census.implemented {
             let args = [
                 atom(&ctx, &entry.module),

@@ -75,12 +75,17 @@
 //!   fun table, so it (and fun_info_mfa/1) stay an honest typed gap here.
 //! ```
 //!
-//! The `make_fun3` local-fun identity items are an **honest typed gap** in this
-//! runtime (the inlined descriptor carries no module/MD5/`old_index`) — see
-//! `src/fun_info.rs`'s module docs — so they are asserted as
-//! `error:unsupported_bif` here, never as a fabricated value. An `Imported`
-//! (`NEW_FUN_EXT`) fun is **not** a gap for `module`/`new_index`/`new_uniq`/
-//! `index`/`uniq`/`fun_to_list`: its descriptor carries the whole wire signature.
+//! A `make_fun3` (`FunKind::Local`) fun's identity items need the
+//! `LocalFunIdentity` seam: with **no** hook installed (the case for every case
+//! below that does not build a stub) `module`/`new_uniq`/`index`/`uniq`/`pid` are
+//! the typed `error:unsupported_bif` gap, while `new_index` is read straight from
+//! the term's own descriptor word (see `src/fun_info.rs`'s module docs) — never a
+//! fabricated value. `name` stays the typed gap for **every** non-external kind
+//! (its lambda name lives in the loaded module's fun table, which no seam carries),
+//! so `fun_info/1` of a Local fun raises the typed gap rather than returning a
+//! short list. An `Imported` (`NEW_FUN_EXT`) fun is **not** a gap for
+//! `module`/`new_index`/`new_uniq`/`index`/`uniq`/`pid`/`fun_to_list`: its
+//! descriptor carries the whole wire signature.
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry};
@@ -107,6 +112,7 @@ fn seeded_atoms() -> AtomTable {
         "type",
         "module",
         "function",
+        "pid",
         "new_index",
         "new_uniq",
         "index",
@@ -353,23 +359,34 @@ fn fun_info_2_local_kind_independent_items_match_the_oracle() {
 }
 
 #[test]
-fn fun_info_2_local_identity_items_are_the_documented_typed_gap() {
+fn fun_info_2_local_identity_items_without_a_seam_are_the_typed_gap() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
     let mut ctx = make_ctx(&mut heap, &atoms);
     let (_storage, fun) = local_fun(1, 85002344, 1, &[]);
 
-    // The oracle answers `{module,fiprobe}`, `{name,'-mk/1-fun-0-'}`,
-    // `{new_index,1}`, `{new_uniq,<<…>>}`, `{index,1}` and `{uniq,85002344}`; the
-    // M1 inlined descriptor carries none of those `ErlFunEntry` fields, so the
-    // honest answer is a typed gap — never a fabricated module/MD5/index.
-    for item in ["module", "name", "new_index", "new_uniq", "index", "uniq"] {
+    // With **no** `LocalFunIdentity` hook installed, the identity items the seam
+    // covers are the typed gap (`module`, `new_uniq`, `index`, `uniq`, `pid`);
+    // `name` is the typed gap for every non-external kind. The oracle would answer
+    // `{module,fiprobe}`/`{new_uniq,<<…>>}`/`{index,1}`/`{uniq,85002344}`/
+    // `{pid,<0.0.0>}`/`{name,'-mk/1-fun-0-'}`, but the inlined descriptor and the
+    // absent hook carry none of those `ErlFunEntry` fields — so the honest answer
+    // is a typed gap, never a fabricated module/MD5/index.
+    for item in ["module", "name", "new_uniq", "index", "uniq", "pid"] {
         assert_unsupported_bif(
             fun_info(&reg, &mut ctx, fun, item),
             &format!("fun_info(LocalFun, {item})"),
         );
     }
+
+    // `new_index` needs **no** seam: the term's own descriptor word 2 *is* the
+    // lambda table's `index` field, so it is answered even without a hook. The
+    // fixture is `local_fun(1, 85002344, 1, &[])`, whose index word is 1 (oracle
+    // `fiprobe:mk/1` reports `{new_index,1}`).
+    let info = fun_info(&reg, &mut ctx, fun, "new_index").expect("new_index");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "new_index");
+    assert_eq!(signed_value(value), 1);
 }
 
 #[test]
@@ -943,6 +960,7 @@ fn make_fun_3_badargs() {
 fn the_fun_info_bifs_are_registered() {
     let reg = default_registry();
     for (name, arity) in [
+        ("fun_info", 1),
         ("fun_info", 2),
         ("fun_info_mfa", 1),
         ("fun_to_list", 1),
@@ -953,11 +971,13 @@ fn the_fun_info_bifs_are_registered() {
             "missing erlang:{name}/{arity}"
         );
     }
-    // `bif.tab` declares no `fun_info/1`; the C's `fun_info_2` with a non-item
-    // second argument is `badarg`, so `fun_info/1` must stay unregistered.
-    assert!(!reg.contains("erlang", "fun_info", 1));
+    // `bif.tab` declares only `fun_info/2` (the oracle implements `/1` in Erlang,
+    // `erlang.erl`'s `fun_info/1` + `fun_info_1/3`), so `fun_info/1` is registered
+    // here as a stdlib fast path.
+    assert!(reg.contains("erlang", "fun_info", 1));
 
     let core = BifRegistry::with_core_bifs();
+    assert!(core.contains("erlang", "fun_info", 1));
     assert!(core.contains("erlang", "fun_info", 2));
     assert!(core.contains("erlang", "make_fun", 3));
 }
