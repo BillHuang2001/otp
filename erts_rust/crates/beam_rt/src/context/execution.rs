@@ -154,7 +154,12 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   ([`callee_observes_its_call_site`]) → `Ok(None)`,
     ///   whether it was already cached or loaded on demand by this very call — the guard is
     ///   applied to both paths, so the answer never depends on *when* the module was cached
-    ///   (the seam is idempotent, see the note at the guard);
+    ///   (the seam is idempotent, see the note at the guard). A **built-in NIF library**
+    ///   (contract A.7, [`crate::native::prim_tty::is_builtin_library`]) is the one exemption
+    ///   from that guard, and only from its module-wide `load_nif` half: such a library has no
+    ///   `current_module`-dependent identity to protect, so refusing it would only fold its
+    ///   blocking `receive` into the typed `blocked()` gap (the note at the guard carries the
+    ///   rationale);
     /// * a function atom or export the callee does not have → `Ok(None)`, so the synchronous
     ///   path reports the oracle's `undef` byte for byte.
     ///
@@ -312,7 +317,36 @@ impl ExecutionContext for RuntimeContext<'_> {
             }
             return Ok(None);
         };
-        if callee_observes_its_call_site(&callee, function_atom, arity) {
+        // A **built-in NIF library** is exempt from that guard (see below), so the module-wide
+        // `LoadNif` refusal is skipped for it and only then is the callee's own call-site read
+        // consulted.
+        //
+        // `prim_tty` is ERTS's statically linked NIF library: `erlang:load_nif/2` resolves it
+        // from ERTS's **static NIF table** (`is_static_nif_module`,
+        // `erts/emulator/beam/erl_nif.c`) instead of `dlopen`ing a shared object, and this
+        // runtime's counterpart ([`crate::context::bridges`]'s `NifLoader::load_nif`) answers
+        // the oracle's `ok` without a `dlopen` and **without registering an owning module**.
+        // The identity `load_nif`'s `current_module` argument carries — the module a NIF
+        // library is registered under, which the loader validates the library's own
+        // `ErlNifEntry.name` against, and the `bad_lib` a stale identity would produce — is
+        // therefore *impossible* for such a library: there is no library to register and no
+        // name to validate. Keeping the refusal would buy no correctness at all and would only
+        // route the library's **Erlang wrappers** onto the synchronous non-pumping
+        // [`Self::call_bif`] path, where a blocking `receive` folds into the typed `blocked()`
+        // gap (exit 3) — the A.9 boot blocker: `supervisor_bridge:standard_error/1` raises
+        // `badarg` and dies because `prim_tty:init/1` waits for the reader process it just
+        // spawned. Contract A.7's `prim_*` family is served from the floor
+        // ([`crate::native::prim_tty`]), which is what makes the library built-in in the first
+        // place; [`crate::native::prim_tty::is_builtin_library`] is that ONE source of truth.
+        //
+        // The exemption is by **library name** (exactly as ERTS's own resolution is), so it is
+        // a pure function of the callee module name — the seam stays idempotent — and it widens
+        // nothing else: a non-built-in module importing `erlang:load_nif/2` keeps the
+        // module-wide refusal, since its `load_nif` really does register a library under the
+        // module identity.
+        if !crate::native::prim_tty::is_builtin_library(module)
+            && callee_observes_its_call_site(&callee, function_atom, arity)
+        {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
                     "seam decline [{trace_pid:?}] {module}:{function}/{arity}: observes its call site"
