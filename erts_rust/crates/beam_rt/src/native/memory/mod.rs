@@ -1006,12 +1006,21 @@ impl RuntimeContext<'_> {
         let process = table.get(pid)?;
         // The oracle's `process_info(Pid, _)` answers the bare atom `undefined` — for **any**
         // item — once the pid names a dead process; it does not keep a terminated PCB around
-        // long enough to answer `{status, exiting}`. This runtime's table may still hold a
-        // `Terminated` entry while its death is being propagated (the crash reporter runs
-        // before the reaper), and `Process::status` reports exactly that state as `None`, so
-        // treat it as absent here too. Without this the crash-report path's
-        // `process_info(Pid, current_function)` on a just-dead neighbour would raise the
-        // uncatchable `unsupported` capability gap instead of the oracle's `undefined`.
+        // long enough to answer `{status, exiting}`: by the time a neighbour's crash report
+        // (or `monitor`/link sweep) observes the pid, the PCB is gone and every item is
+        // `undefined`. This runtime's table still holds the entry for the whole
+        // `Exiting`/`Terminated` window (the crash reporter runs *before* the reaper), so
+        // treat that window as absent here too. Without this
+        // `process_info(Pid, current_function)` on a just-dead neighbour raised the
+        // **uncatchable** `unsupported` capability gap — which `proc_lib:get_process_info/2`'s
+        // `try … catch _:_ -> undefined` cannot catch — and killed the crash reporter instead
+        // of letting it report the neighbour.
+        match process.state() {
+            beam_process::ProcessState::Exiting | beam_process::ProcessState::Terminated => {
+                return None
+            }
+            _ => {}
+        }
         process.status()?;
         let atoms = self.runtime.code_server.atoms();
         let registered_name = table
