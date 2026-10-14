@@ -1070,4 +1070,6 @@ enum ParsedOption {
 }
 
 #[cfg(test)]
+mod binary_e2e;
+#[cfg(test)]
 mod tests;

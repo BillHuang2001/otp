@@ -49,7 +49,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
 | `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` |
-| `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs`) |
+| `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs` and the end-to-end `memory/binary_e2e.rs` oracle case) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` |
 | `port.rs` | `erlang:port_command/2,3`, `erlang:port_control/3` (the driver's `control` callback, with the oracle's list-vs-binary reply rule) and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
@@ -223,7 +223,7 @@ schedulable moment**: the child is only a run-queue entry (or a pass `PendingSpa
 returns and the runtime is single-threaded, so a child that exits immediately still delivers its
 `{'DOWN', …, normal}`. Proven by `../tests/spawn_monitor.rs`.
 
-### `erlang:process_info/1,2` (contract A.8) — `memory/mod.rs` (+ `memory/tests.rs`)
+### `erlang:process_info/1,2` (contract A.8) — `memory/mod.rs` (+ `memory/tests.rs`, `memory/binary_e2e.rs`)
 A **runtime** operation: the answer is read out of this runtime's own `beam_process` table
 (`Process::state/mailbox/links/monitors/monitored_by/dict/registers/collector/off_heap`), served
 before the registry. `memory/mod.rs`'s rustdoc carries the full per-item table and oracle probes;
@@ -502,7 +502,10 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   *served surface* is pinned, not an internal function. Fixtures live once in `test_support.rs`.
 - `memory/tests.rs` pins the `process_info` reply shapes, the failure modes, the `unsupported` set,
   and the oracle `registered_name` wrapping rules (the root pid is registered as `init`, so a test
-  can `unregister` it to reach the live-unregistered case).
+  can `unregister` it to reach the live-unregistered case). `memory/binary_e2e.rs` adds the
+  **end-to-end** case: the `binary` item of a real, test-time-compiled `.beam` spawned through the
+  scheduler and parked holding an off-heap refc binary, compared structurally against the live oracle
+  running the same fixture.
 - **Oracle values** are quoted in each test's doc comment and were re-verified against the system
   `erl` (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1). Where the runtime answers a typed
   capability gap the oracle answers a value, the test pins the `unsupported` outcome with a
@@ -512,18 +515,25 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   `file_server/`'s suites are described in [`file_server/CONTEXT.md`](file_server/CONTEXT.md).
 - Test fixtures that need a real `.beam` or the system Erlang skip **loudly**
   (`system_runtime()` / the file-local `lists_beam()`); the arithmetic/`term_type` suites need none.
-- **The ONLY external toolchain ever spawned in this node is `erl`** — no `erlc`/`escript`/`cc`/
-  `gcc`/`clang` invocation exists anywhere under `src/native/`. Every live-oracle comparison compares
+- **The only external toolchains ever spawned in this node are `erl` and `erlc`** — no
+  `escript`/`cc`/`gcc`/`clang` invocation exists anywhere under `src/native/`. `erlc` appears in
+  exactly one place, `memory/binary_e2e.rs`, which compiles its end-to-end fixture at test time (no
+  path-dependent artifact is committed). Every live-oracle comparison compares
   the oracle's **stdout** (`~p`/`~w`/`~s` rendering) or its exit status; none compares `term_to_binary`
   bytes.
 - **Suites that spawn the live `erl` oracle in-process** (skip **loudly** when absent). Each spawn
   site, its resolution and its bound:
-  * `memory/tests.rs:677` (`oracle_pi_1_keys`, used by `the_implemented_item_order_is_a_subsequence_of_the_oracles`)
-    and `:923` (`oracle_eval`, used by `the_oracle_reports_zero_catchlevel_outside_a_try_and_a_depth_inside_one`,
+  * `memory/tests.rs:676` (`oracle_pi_1_keys`, used by `the_implemented_item_order_is_a_subsequence_of_the_oracles`)
+    and `:1028` (`oracle_eval`, used by `the_oracle_reports_zero_catchlevel_outside_a_try_and_a_depth_inside_one`,
     `the_oracle_backs_the_remaining_gaps_values`, `the_oracle_lists_a_processes_off_heap_binaries`)
     — resolve via a **bare `$PATH` lookup only** (they do NOT honor `$ERTS_ORACLE`); `oracle_pi_1_keys`
     is **unbounded**, `oracle_eval` is bounded by `ORACLE_TIMEOUT = 30s`; the probes print inline
     `eprintln!("SKIPPING …")` (no banner).
+  * `memory/binary_e2e.rs:177` (`oracle_eval_pa`, used by
+    `the_binary_item_matches_the_live_oracle_for_an_off_heap_payload`) — a bare `$PATH` lookup, and
+    the only probe that also passes `-pa <scratch dir>` (its fixture is spawned by `spawn/3`), bounded
+    30 s / 10 ms poll; its fixture half compiles with `erlc` first and skips loudly without it
+    (`build_fixture`, `binary_e2e.rs:126`).
   * `code.rs:931` (`oracle_probe` over `oracle_erl()`, used by `code_priv_dir_agrees_with_the_oracle`)
     — `$ERTS_ORACLE` else `$PATH`, `.output()`, **unbounded**, argv `-noshell -eval … -s init stop`;
     loud skip via `skip_oracle_loudly()` (`code.rs:943`, no arg); gated first by `system_runtime()`.
@@ -561,7 +571,8 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
 - `../native.rs` → the dispatch table (`try_native`, `FLOOR_MODULES`) + the `erlang`-core,
   `io:put_chars`, `seq_trace*` and `trace*` arms and the shared helpers (read for the served set;
   edit there to add an arm)
-- `memory/` → `erlang:process_info/1,2` + `memory/tests.rs`
+- `memory/` → `erlang:process_info/1,2` + `memory/tests.rs` + `memory/binary_e2e.rs` (the
+  end-to-end `binary`-item case against the live oracle over a test-time-compiled `.beam`)
 - `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`): `term_type/1`,
   `get_dflags/0`, `beamfile_chunk/2`, `beamfile_module_md5/1`, `map_to_tuple_keys/1`,
   `binary_to_integer/2`, `list_to_integer/2`, `time_unit/0`, `perf_counter_unit/0`,
