@@ -8,6 +8,82 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-14 — Milestone 11: load-time-digest JIT cache identity, in-block `send`/`receive`, a block register allocator, the dirty-heap send fast path, and two `term_to_binary` encoder modes
+Scope: a performance milestone driven by the M10 bottleneck list, plus the honest correction of a
+long-standing boot claim. The headline **algorithmic/data-structure** changes are (a) the JIT code cache
+keyed by the module's **load-time MD5 digest** instead of a per-entry whole-IR hash (removing a
+per-park/per-resume fingerprint cost), (b) the baseline JIT's **live-interval block register allocator**
+with partial spill/fill, (c) the `beam_message` send fast path relaxed from "clean destination heap" to
+"empty destination off-heap table" so the single-traversal copy fires on the real (dirty) receiver heap,
+and (d) the `beam_codec` **`[deterministic]` / `[local]`** encoder modes. Also corrected: the
+`start.boot` chain does **not** complete (stops at directive 19 of 22) — a long-standing engine gap that
+the closed `call_ext` seam newly exposed.
+- **Ratios/tier discipline:** the default baseline-JIT tier was **2.15×–3.31× dearer than the Rust
+  interpreter tier** on `send_recv`; it is now **0.97×–1.03× (parity)**. Measured M11 rust-vs-system rows:
+  startup **0.135×** (7.4× faster), `list_walk` **19.00×**, `copy_bound` **10.28×–30.71×**, `gc_bound
+  churn` **30.10×**, `foreign` **60.2×–367.1×** (see below). All Rust-vs-Rust tier rows are labelled
+  separately from the system-ERTS rows in `erts_rust/tools/bench/RESULTS.md`.
+- **Area:** `erts_rust/crates/beam_engine` (`src/jit/cache/mod.rs`, `src/jit/baseline/…`)
+- **Change (data structure):** the code cache's `ModuleKey` became a two-variant private enum —
+  `Digest([u8;16])` (the module's **load-time MD5 checksum**) for a real `.beam`, else
+  `Content { name, fingerprint }` over the whole-IR hash for a synthetic all-zero-checksum module. The
+  bare-`&Module` entry path used to fall through to a whole-IR `Debug`-render hash **once per `receive`
+  park and per resume**; that is now O(1) copy. Second algorithmic change: the baseline JIT now lowers
+  `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage` **in-block** (new
+  `jit/baseline/receive.rs`) and the six comparison `Test`s at two operands with a resolvable non-`NO_FAIL`
+  fail label via a boolean helper (`jit/baseline/test_helper.rs`, interpreter-identical by construction
+  through `beam_term`'s `cmp`/`cmp_arith`). Third: a **live-interval block register allocator**
+  (`emit/regalloc.rs` + `emit/regs.rs` + `emit/liveness.rs`) caches the block's top 5 x-registers chosen
+  by **descending live-interval length** (deterministic tie-break on register index) with **partial spill**
+  (only the statically-known written subset) and **partial fill** (a block-local backwards liveness walk);
+  spill stores 91→59, fill loads 75→61. Fourth: continuation sub-blocks are now range-capped at the next
+  continuation address, making emitted code **O(range) instead of O(n²)** (256 `call_ext` ⇒ 3.92 MB → 95 KB).
+- **Area:** `erts_rust/crates/beam_rt` (`src/context/{calls,dispatch}.rs`, `src/nif.rs`, `src/cli.rs`)
+- **Change:** a registered BIF's dispatch prologue no longer re-runs `BifRegistry::call`→`lookup` on every
+  call even on a `DispatchMemo` hit (it invokes the memoized `BifFn` directly; `BifRegistry::lookup`
+  stays the single source of truth), `dispatch_slot` hashes the key bytes with FNV-1a + an avalanche
+  multiply instead of only *name lengths* (`ets:insert/2` and `ets:lookup/2` collided by construction, so
+  an ETS loop was a permanent memo miss), and `try_call_nif` short-circuits an empty NIF registry.
+  Measured (release, same-window interleaved A/B): immediate-returning rows −25–31 %, ETS rows −8–16 %.
+  The BIF-result **copy-out** went from up to three graph traversals to one: the growth hint now comes
+  from the copier's own refusal (`copy_shortfall_words`), one `OffHeapTable`/`CopyContext` is shared
+  across both attempts, and the retry is gated on `beam_message::is_message_heap_exhaustion`.
+- **Area:** `erts_rust/crates/beam_rt` (`src/cli.rs`, `src/cli/flags.rs`, `src/info/schedulers.rs`)
+- **Change:** `-pz` is placed at the **tail** of the code path (after `"."`), so it can no longer shadow
+  system modules (previously `-pa` and `-pz` were merged into one list); the `+S Total:Online` online
+  count is parsed and served (`erlang:system_info(schedulers_online)` → `2` for `+S 4:2`); non-existent
+  `-pa`/`-pz` dirs are filtered from `code:get_path/0` and the multi-value form `-pa a b` is accepted;
+  `+t N`/`+e N`/`+B i`/`+sbt db` now parse and take effect.
+- **Area:** `erts_rust/crates/beam_message` (`src/copy.rs`), `erts_rust/crates/beam_process`
+  (`src/ptab.rs`, `src/scheduler.rs`)
+- **Change:** the copy fast path's eligibility test changed from `to.used() == 0 &&
+  off_heap.is_fully_empty()` to `off_heap.is_fully_empty()`. The `to.used() == 0` half was wrong for a
+  send into the receiver's long-lived young heap (dirty after the first message), so every real send paid
+  a full `preflight_words` sizing walk **plus** the write walk; the empty off-heap table — not the heap's
+  `used` — is the true precondition for `OffHeapTable::rollback()` soundness, and the old `to.reset()` in
+  the failure branch is **unsound** once the heap can be dirty (it would discard live words) and was
+  removed. Measured: send_recv payload copy 693–740 → 364–492 ns/op; the isolated preflight share was
+  35–40 %. In `beam_process`: a quiet/unknown-pid `service_signals` fast path (9.9 → 1.1 ns/op, paid by
+  every slice of every process) and a reusable wake-list scratch (`ProcessTable::drain_woken_into`).
+- **Area:** `erts_rust/crates/beam_codec` (`src/encode/{mod,map}.rs`, `src/decode/…`), `erts_rust/crates/beam_bifs`
+  (`src/zlib.rs`, new `src/deflate.rs`), `erts_rust/crates/beam_ets` (`src/table/mod.rs`)
+- **Change:** the encoder gained two additive, default-off modes matching the C: `with_deterministic()`
+  (map keys sorted by **full term order**, `CMP_TERM`, for both flat maps and HAMTs — new `encode/map.rs`)
+  and `with_local_ext()` (the `NIL_EXT` internal-node marker + `creation = 0` for an internal pid/port/ref,
+  with the matching persistent `Decoder::internal_node` demotion mode). `beam_bifs` now serves
+  `zlib:zip/1`/`unzip/1` — which are **raw DEFLATE (RFC 1951)**, not gzip — over a new self-contained
+  no-`unsafe` inflater (`src/deflate.rs`) plus the already-present RFC-1950 `beam_codec::compress`.
+  `beam_ets` gained `Table::release_empty_interior`, so a table emptied one object at a time returns its
+  interior index capacity (matching the oracle's `ets:info(T, memory)` floor) exactly as
+  `delete_all_objects` already did.
+- **Area:** `erts_rust/tools/differential` (corpus A.6/A.8), `erts_rust/tools/bench`
+- **Change:** the corpus grew **2497 → 2580** (A.6 73 → 106, A.8 88 → 141; every new case verified
+  `[AGREE]` per-case) and the new `CASE_DRAFTS.md` records a ready-to-add recipe per outstanding gap. The
+  bench driver added a 4th `copy_bound` case `send_recv_plain` (a delivery-only two-process round trip, so
+  the ETF leg can be attributed as `send_recv − send_recv_plain`). `RESULTS.md` no longer claims boot
+  completion, records the M11 archive (`results/m11-*`) and marks the M10 `send_recv` tier regression
+  CLOSED and the M10 ETS-adopt lead REFUTED.
+
 ## 2026-10-14 — Milestone 10: the ETF atom-table clone removed, BIF-result copy-out + bounded churn RSS, Y-slot JIT arithmetic + continuation sub-blocks, a family-aware exit policy, and the M9 ratio correction
 Scope: a performance-and-correctness milestone driven by the M9 benchmark bottleneck list. The headline
 **algorithmic/data-structure** changes are (a) the ETF decode **scratch image** that removes the
