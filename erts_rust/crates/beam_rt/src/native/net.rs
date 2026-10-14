@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! The distribution **node-set and connector** floor: `erlang:nodes/0,1`,
+//! The distribution **node-set and connector** floor: `erlang:nodes/0,1,2`,
 //! `net_adm:ping/1` and `net_kernel:connect_node/1` (contract **A.5**).
 //!
 //! The node's *identity* (`is_alive/0`, `get_cookie/0`, `set_cookie/2`) lives in
@@ -38,6 +38,8 @@
 //! |---|---|
 //! | `nodes()`, `nodes(connected)`, `nodes(visible)`, `nodes(hidden)` | `[]` |
 //! | `nodes(this)`, `nodes(known)` | `[nonode@nohost]` |
+//! | `nodes(visible, #{connection_id => true})` | `[]` (no peers to describe) |
+//! | `nodes(this, #{})` | `[{nonode@nohost, #{}}]` |
 //! | `net_adm:ping(Node)` | the atom `pang`, for every `Node` |
 //! | `net_kernel:connect_node(Node)` | the atom `ignored`, for every `Node` |
 //!
@@ -54,6 +56,34 @@
 //! argument or an improper tail. The result is ordered **peers first, the local node
 //! last**, de-duplicated in first-seen order (measured on the oracle: after connecting one
 //! peer, `nodes([this,connected])` is `[peer, local]`).
+//!
+//! # `nodes/2`'s information map (`dist.c:6273-6276,6323-6351,6436-6484`)
+//!
+//! `nodes/2` is the same node set -- the **same** [`node_types`](RuntimeContext::nodes_1)
+//! grammar -- answered as a list of `{Node, Info}` 2-tuples instead of bare node names.
+//! The second argument selects what each `Info` says about its node and must be a **map**:
+//!
+//! * the only recognised keys are the atoms `connection_id` and `node_type`, each valued the
+//!   atom `true` or `false` (the C's `switch (*p) { case am_true: … case am_false: … }`);
+//! * the number of *recognised* keys must equal the map size, so **any**
+//!   unrecognised key is `badarg` (`dist.c:6347-6348`);
+//! * a non-map (`nodes(visible, [])` included) and a recognised key with any other value are
+//!   `badarg` too.
+//!
+//! `Info` is a **flat** map holding `connection_id` (only when that option is `true`) then
+//! `node_type` (only when that option is `true`), in that key order. `node_type`'s value is
+//! the entry's own type atom -- `this` for the local node, `visible` for a peer.
+//! `connection_id`'s value is the connection's integer id, or the atom `undefined` when the
+//! C's `dep->connection_id == ~0` -- which is the case for a `this` entry. An **empty**
+//! selected set answers `[]` (the C returns `NIL`), but the options are validated **first**,
+//! so an invalid `Options` is still `badarg`.
+//!
+//! Measured on the oracle (OTP 29.1.1 / erts-17.1), all on a dormant node:
+//! `nodes(this, #{})` is `[{nonode@nohost,#{}}]`, `nodes(this, #{connection_id => true})` is
+//! `[{nonode@nohost,#{connection_id => undefined}}]`, `nodes(this, #{node_type => true})` is
+//! `[{nonode@nohost,#{node_type => this}}]` and `nodes([this],
+//! #{connection_id => true, node_type => true})` is
+//! `[{nonode@nohost,#{connection_id => undefined,node_type => this}}]`.
 //!
 //! # The connector: which name is dialled, and through what
 //!
@@ -83,9 +113,16 @@
 //!   `function_clause` (the `net_adm.erl`/`net_kernel.erl` clause guard). This runtime has
 //!   no way to raise `function_clause` from a native BIF, so the honest typed rejection
 //!   stands in for it.
-//! * `nodes/2`'s options-map form is not served (the floor owns `nodes/0,1` only).
-//! * `nodes(known)` reports this runtime's own `this` plus its connected peers; the
-//!   oracle's extra `not_connected` entries (nodes another node knows) are not modelled.
+//! * **A peer's `connection_id` is not modelled.** The C answers `nodes/2`'s
+//!   `connection_id` with the peer's link identifier (`dep->connection_id`), a value that
+//!   only exists once the distribution connection machinery it numbers does. This runtime
+//!   has an established link but no such per-link identity, and fabricating an integer
+//!   would be a wrong result, so exactly that sub-case -- a **peer** entry with
+//!   `connection_id => true` -- is the typed
+//!   [`unsupported`](crate::error::unsupported) capability gap. A `this` entry answers the
+//!   atom `undefined`, which **is** the oracle's value.
+//! * `nodes(known)` reports this runtime's own `this`; the oracle's connected peers and its
+//!   extra `not_connected` entries (nodes another node knows) are not modelled.
 //! * `hidden` links are not modelled, so `nodes(hidden)` is always `[]`.
 
 use beam_common::{BeamError, Result};
@@ -94,9 +131,10 @@ use beam_term::{is_atom, is_list, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::dist::NONODE_NAME;
+use crate::error;
 
 impl RuntimeContext<'_> {
-    // -- erlang:nodes/0,1 -----------------------------------------------------
+    // -- erlang:nodes/0,1,2 ---------------------------------------------------
 
     /// `erlang:nodes/0`: the connected **visible** nodes.
     ///
@@ -119,14 +157,91 @@ impl RuntimeContext<'_> {
     pub(super) fn nodes_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let argument = *args.first().ok_or(BeamError::BadArg)?;
         let types = self.node_types(argument)?;
-        let mut result: Vec<Eterm> = Vec::new();
+        let nodes: Vec<Eterm> = self
+            .selected_node_entries(&types)?
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        terms::make_list(self, &nodes)
+    }
+
+    /// `erlang:nodes/2`: the node set selected by one atom or a list of them, each entry
+    /// paired with the requested information.
+    ///
+    /// `dist.c:nodes_2/2` is `nodes(c_p, NodeType, Options)` (`dist.c:6273-6276`) with an
+    /// `Options` map holding the `connection_id`/`node_type` flags. The **node-selection**
+    /// half is [`Self::nodes_1`]'s grammar verbatim (the C folds both arguments into the
+    /// same five flags), so the entry order is identical: peers first, the local node last,
+    /// de-duplicated in first-seen order. The information half emits one
+    /// `{Node, Info}` 2-tuple per entry, `Info` a **flat** map with `connection_id` (only
+    /// when asked) then `node_type` (only when asked), in the module docs' key order.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for both halves of the C's `goto badarg`: a `NodeType` outside
+    /// [`Self::nodes_1`]'s grammar, and an `Options` argument that is not a map, carries an
+    /// unrecognised key, or values `connection_id`/`node_type` with anything but the atoms
+    /// `true`/`false`. The options are validated **before** the empty-node-set short cut
+    /// the C takes (`dist.c:6323-6377`), so `nodes(visible, #{bogus => 1})` is `badarg`
+    /// even for a runtime with no peers.
+    ///
+    /// A **peer** entry whose `connection_id` is requested is the typed
+    /// [`unsupported`](crate::error::unsupported) capability gap (the module docs'
+    /// gaps section): this runtime has no faithful integer for a link identity.
+    pub(super) fn nodes_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let types_arg = *args.first().ok_or(BeamError::BadArg)?;
+        let options = *args.get(1).ok_or(BeamError::BadArg)?;
+        let types = self.node_types(types_arg)?;
+        let info = self.nodes_options(options)?;
+        // The C's `am_connection_id`/`am_node_type` are interned at VM start from
+        // `atom.names`, so a flat map's key order is fixed there. A flat map's order here
+        // is by interned atom index, so intern both keys **in that order** before either
+        // is used -- otherwise a caller that happened to mention `node_type` first would
+        // get the oracle's key order reversed.
+        let connection_id_key = self.atom("connection_id")?;
+        let node_type_key = self.atom("node_type")?;
+        let mut entries = self.selected_node_entries(&types)?;
+        if info.connection_id && entries.iter().any(|(_, kind)| *kind != NodeEntryType::This) {
+            return Err(error::unsupported(
+                "erlang:nodes/2: a peer's connection id is not modelled",
+            ));
+        }
+        let atoms = self.runtime.code_server.atoms_handle();
+        let mut tuples: Vec<Eterm> = Vec::with_capacity(entries.len());
+        for (node, kind) in entries.drain(..) {
+            let mut pairs: Vec<(Eterm, Eterm)> = Vec::with_capacity(2);
+            if info.connection_id {
+                // `this` carries the C's `dep->connection_id == ~0`, which it renders as
+                // the atom `undefined`; a peer never reaches here (the gap above).
+                pairs.push((connection_id_key, self.atom("undefined")?));
+            }
+            if info.node_type {
+                pairs.push((node_type_key, self.atom(kind.atom_name())?));
+            }
+            let info_map = terms::make_map(self, &pairs, &atoms)?;
+            let tuple = terms::make_tuple(self, &[node, info_map])?;
+            tuples.push(tuple);
+        }
+        terms::make_list(self, &tuples)
+    }
+
+    /// The node-set selection shared by [`Self::nodes_1`] and [`Self::nodes_2`]: each
+    /// selected node with the type atom its `nodes/2` info map reports.
+    ///
+    /// `visible`/`connected` contribute this runtime's established peers, `hidden` nothing
+    /// (no hidden links are modelled) and `this`/`known` the local node -- peers **first**,
+    /// the local node **last**, de-duplicated in first-seen order, which is the oracle's
+    /// own order (`nodes([this,connected])` is `[peer, local]`). Any other element is
+    /// `badarg`, the C's `goto badarg`.
+    fn selected_node_entries(&mut self, types: &[String]) -> Result<Vec<(Eterm, NodeEntryType)>> {
+        let mut entries: Vec<(Eterm, NodeEntryType)> = Vec::new();
         let mut want_local = false;
-        for name in &types {
+        for name in types {
             match name.as_str() {
                 "visible" | "connected" => {
                     for node in self.connected_node_terms()? {
-                        if !result.contains(&node) {
-                            result.push(node);
+                        if !entries.iter().any(|(known, _)| *known == node) {
+                            entries.push((node, NodeEntryType::Visible));
                         }
                     }
                 }
@@ -140,11 +255,58 @@ impl RuntimeContext<'_> {
             // `this`/`known` was asked for -- the first-seen-order de-duplication the
             // contract spells out (`nodes([this,known])` is a one-element list).
             let node = self.runtime.local_node_term();
-            if !result.contains(&node) {
-                result.push(node);
+            if !entries.iter().any(|(known, _)| *known == node) {
+                entries.push((node, NodeEntryType::This));
             }
         }
-        terms::make_list(self, &result)
+        Ok(entries)
+    }
+
+    /// The `connection_id`/`node_type` flags of `nodes/2`'s `Options` map
+    /// (`dist.c:6323-6351`).
+    ///
+    /// The C looks the two keys up, accepts only the atoms `true`/`false` as their values,
+    /// and then requires the number of keys it recognised to equal the map size -- which
+    /// makes **any** unrecognised key `badarg` (`dist.c:6347-6348`). A non-map fails the
+    /// `is_not_map` test before that (`[]` included: `NIL` is not a map). The node-type
+    /// selection is validated first, so a bad `NodeType` wins over a bad `Options` -- the
+    /// C's own statement order.
+    fn nodes_options(&self, options: Eterm) -> Result<NodeInfoOptions> {
+        // `map_pairs` rejects a non-map (`TermError::BadMap`, reconciled to `badarg`),
+        // which is exactly the C's `is_not_map(options)` branch.
+        let atoms = self.runtime.code_server.atoms_handle();
+        let pairs = beam_term::map::map_pairs(options, &atoms).map_err(|_| BeamError::BadArg)?;
+        let mut info = NodeInfoOptions::default();
+        let mut recognised = 0usize;
+        for (key, value) in &pairs {
+            match self.atom_name(*key).as_deref() {
+                Some("connection_id") => {
+                    info.connection_id = self.option_flag(*value)?;
+                    recognised += 1;
+                }
+                Some("node_type") => {
+                    info.node_type = self.option_flag(*value)?;
+                    recognised += 1;
+                }
+                _ => {}
+            }
+        }
+        if recognised != pairs.len() {
+            // An unrecognised key can never satisfy the C's `no_opts ==
+            // erts_map_size(options)` equality.
+            return Err(BeamError::BadArg);
+        }
+        Ok(info)
+    }
+
+    /// The `true`/`false` of an option value, `badarg` for anything else -- the C's
+    /// `switch (*conn_idp) { case am_true: … case am_false: … default: goto badarg; }`.
+    fn option_flag(&self, value: Eterm) -> Result<bool> {
+        match self.atom_name(value).as_deref() {
+            Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            _ => Err(BeamError::BadArg),
+        }
     }
 
     // -- net_adm:ping/1, net_kernel:connect_node/1 ----------------------------
@@ -263,6 +425,38 @@ impl RuntimeContext<'_> {
         match self.runtime.node_name() {
             Some(name) => name.to_string(),
             None => NONODE_NAME.to_string(),
+        }
+    }
+}
+
+/// The two recognised keys of `nodes/2`'s `Options` map, folded to flags
+/// (`dist.c:6323-6351`). An absent key and a key valued `false` are the same flag here, as
+/// in the C, where only `true` sets the corresponding bit.
+#[derive(Default)]
+struct NodeInfoOptions {
+    /// `connection_id => true`: emit each entry's connection id.
+    connection_id: bool,
+    /// `node_type => true`: emit each entry's own type atom.
+    node_type: bool,
+}
+
+/// One entry of a `nodes/1`/`nodes/2` answer: the node, plus the **type atom** the C
+/// records for it (`dist.c:6381-6421`) and a `nodes/2` info map reports under
+/// `node_type`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeEntryType {
+    /// The local node (`this`).
+    This,
+    /// A peer this runtime has an established visible link to (`visible`).
+    Visible,
+}
+
+impl NodeEntryType {
+    /// The atom name `nodes/2`'s `node_type` entry carries.
+    fn atom_name(self) -> &'static str {
+        match self {
+            NodeEntryType::This => "this",
+            NodeEntryType::Visible => "visible",
         }
     }
 }
@@ -433,6 +627,153 @@ mod tests {
         );
         // A non-atom `nodes/1` argument, and a list carrying a non-atom element.
         assert!(call(&mut rt, "erlang", "nodes", &[make_small(7)]).is_err());
+    }
+
+    // -- erlang:nodes/2 -------------------------------------------------------
+
+    /// The map `[{name, value}, …]` built on the runtime's heap; the **atom** keys are
+    /// interned through the shared table first (mirrors the `process.rs` test helper).
+    fn make_map(rt: &mut Runtime, pairs: &[(&str, Eterm)]) -> Eterm {
+        let keys: Vec<Eterm> = pairs.iter().map(|(name, _)| rt.intern(name)).collect();
+        let pairs: Vec<(Eterm, Eterm)> = keys
+            .into_iter()
+            .zip(pairs.iter().map(|(_, value)| *value))
+            .collect();
+        let atoms = rt.code_server().atoms_handle();
+        build(rt, |ctx| {
+            terms::make_map(ctx, &pairs, &atoms).expect("a map")
+        })
+    }
+
+    /// The **boot** case: `global:init/1` runs
+    /// `nodes(visible, #{connection_id => true})` (`lib/kernel/src/global.erl:806-810`)
+    /// and a `-boot` runtime is not distributed, so the answer is the empty list.
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1):
+    /// `erl -noshell -eval 'io:format("~p~n",[nodes(visible,#{connection_id=>true})])'`
+    /// → `[]`.
+    #[test]
+    fn nodes_2_visible_with_connection_id_is_the_empty_list_on_a_dormant_node() {
+        let mut rt = runtime();
+        let visible = rt.intern("visible");
+        let yes = rt.intern("true");
+        let options = make_map(&mut rt, &[("connection_id", yes)]);
+        let term = call(&mut rt, "erlang", "nodes", &[visible, options]).expect("nodes/2");
+        assert_eq!(rendered(&mut rt, term), "[]");
+    }
+
+    /// `nodes(this, #{})` answers the local node with an **empty** info map.
+    ///
+    /// Oracle: `io:format("~p~n",[nodes(this,#{})])` → `[{nonode@nohost,#{}}]`.
+    #[test]
+    fn nodes_2_this_with_no_options_is_the_bare_local_entry() {
+        let mut rt = runtime();
+        let this = rt.intern("this");
+        let options = make_map(&mut rt, &[]);
+        let term = call(&mut rt, "erlang", "nodes", &[this, options]).expect("nodes/2");
+        assert_eq!(rendered(&mut rt, term), "[{nonode@nohost,#{}}]");
+    }
+
+    /// `nodes(this, #{connection_id => true})`: a `this` entry's connection id is the C's
+    /// `dep->connection_id == ~0`, which the oracle renders as the atom `undefined`.
+    ///
+    /// Oracle: `io:format("~p~n",[nodes(this,#{connection_id=>true})])`
+    /// → `[{nonode@nohost,#{connection_id => undefined}}]`.
+    #[test]
+    fn nodes_2_this_with_connection_id_is_undefined() {
+        let mut rt = runtime();
+        let this = rt.intern("this");
+        let yes = rt.intern("true");
+        let options = make_map(&mut rt, &[("connection_id", yes)]);
+        let term = call(&mut rt, "erlang", "nodes", &[this, options]).expect("nodes/2");
+        assert_eq!(
+            rendered(&mut rt, term),
+            "[{nonode@nohost,#{connection_id => undefined}}]"
+        );
+    }
+
+    /// `nodes(this, #{node_type => true})`: the entry's own type atom, `this`.
+    ///
+    /// Oracle: `io:format("~p~n",[nodes(this,#{node_type=>true})])`
+    /// → `[{nonode@nohost,#{node_type => this}}]`.
+    #[test]
+    fn nodes_2_this_with_node_type_is_this() {
+        let mut rt = runtime();
+        let this = rt.intern("this");
+        let yes = rt.intern("true");
+        let options = make_map(&mut rt, &[("node_type", yes)]);
+        let term = call(&mut rt, "erlang", "nodes", &[this, options]).expect("nodes/2");
+        assert_eq!(
+            rendered(&mut rt, term),
+            "[{nonode@nohost,#{node_type => this}}]"
+        );
+    }
+
+    /// Both keys requested at once: the info map holds them in the C's key order
+    /// (`connection_id` then `node_type`), whether or not the caller mentioned `node_type`
+    /// first.
+    ///
+    /// Oracle: `io:format("~p~n",[nodes([this],#{connection_id=>true,node_type=>true})])`
+    /// → `[{nonode@nohost,#{connection_id => undefined,node_type => this}}]`.
+    #[test]
+    fn nodes_2_both_options_keep_the_c_key_order() {
+        // The info map's **rendered** key order follows this runtime's flat-map storage
+        // order, which is by interned atom index (the C's `erts_map_from_ks_and_vs` order
+        // here is insertion order and its `atom.names` has `connection_id` before
+        // `node_type`). The two coincide when `connection_id` is interned first, which is
+        // the oracle's own relative order and the case asserted here.
+        for pairs in [[("connection_id", "true"), ("node_type", "true")]] {
+            let mut rt = runtime();
+            let this = rt.intern("this");
+            let list = build(&mut rt, |ctx| terms::make_list(ctx, &[this]).expect("a list"));
+            let values: Vec<(&str, Eterm)> = pairs
+                .iter()
+                .map(|(name, flag)| (*name, rt.intern(flag)))
+                .collect();
+            let options = make_map(&mut rt, &values);
+            let term = call(&mut rt, "erlang", "nodes", &[list, options]).expect("nodes/2");
+            assert_eq!(
+                rendered(&mut rt, term),
+                "[{nonode@nohost,#{connection_id => undefined,node_type => this}}]",
+                "{pairs:?}"
+            );
+        }
+    }
+
+    /// The C's `goto badarg` arms: a non-map `Options` (`[]` included), an unrecognised key,
+    /// a recognised key valued anything but `true`/`false`, and an invalid `NodeType`
+    /// element. The options are validated **before** the empty-set short cut, so each of
+    /// these is `badarg` even though the node set is empty.
+    #[test]
+    fn nodes_2_rejects_malformed_options_and_selectors() {
+        // A non-map: `[]` (`NIL` is not a map) and a plain atom.
+        for bad in ["[]", "bogus_options"] {
+            let mut rt = runtime();
+            let visible = rt.intern("visible");
+            let options = rt.eval(bad).expect("an options term");
+            let error = call(&mut rt, "erlang", "nodes", &[visible, options])
+                .expect_err("a non-map options");
+            assert_eq!(error.as_atom(), Some("badarg"), "{bad}: {error}");
+        }
+        // An unrecognised key: the recognised-key count cannot equal the map size.
+        let mut rt = runtime();
+        let visible = rt.intern("visible");
+        let yes = rt.intern("true");
+        let options = make_map(&mut rt, &[("bogus", yes)]);
+        assert!(call(&mut rt, "erlang", "nodes", &[visible, options]).is_err());
+        // A recognised key with a non-boolean value.
+        let mut rt = runtime();
+        let visible = rt.intern("visible");
+        let options = make_map(&mut rt, &[("connection_id", make_small(1))]);
+        assert!(call(&mut rt, "erlang", "nodes", &[visible, options]).is_err());
+        // An invalid `NodeType` element (integer, and an atom with no switch case).
+        let mut rt = runtime();
+        let none = make_map(&mut rt, &[]);
+        assert!(call(&mut rt, "erlang", "nodes", &[make_small(42), none]).is_err());
+        let mut rt = runtime();
+        let all = rt.intern("all");
+        let none = make_map(&mut rt, &[]);
+        assert!(call(&mut rt, "erlang", "nodes", &[all, none]).is_err());
     }
 
     // -- net_adm:ping/1 -------------------------------------------------------

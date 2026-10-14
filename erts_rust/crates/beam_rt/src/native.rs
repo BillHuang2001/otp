@@ -42,7 +42,7 @@
 //! | `init:restart/0` | reboots the node **in place** (resets the code path to its boot default, re-runs the boot sequence and the loaded boot script) and answers `ok` (`init.erl:492-518,937-954`) |
 //! | `init:boot/1` | the boot **entry point**: parses the `-boot <Script>` flag out of the byte-list argument, resolves it exactly as the CLI's `-boot FILE` does and executes the script (`init.erl:585-597`) |
 //! | `erlang:is_alive/0`, `erlang:get_cookie/0`, `erlang:set_cookie/2` | read/replace this node's own identity (the name, the cookie) and its liveness — the distribution state no BIF module can reach (contract A.5, `src/native/node.rs`) |
-//! | `erlang:nodes/0,1` | read this runtime's own **link table** (the established outbound distribution links), not a registry value (contract A.5, `src/native/net.rs`) |
+//! | `erlang:nodes/0,1,2` | read this runtime's own **link table** (the established outbound distribution links), not a registry value (contract A.5, `src/native/net.rs`) |
 //! | `net_adm:ping/1`, `net_kernel:connect_node/1` | **drive** that link table: the outbound `epmd` lookup + `'N'` client handshake (`Runtime::dist_connect`) is host socket work (contract A.5, `src/native/net.rs`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:get_object_code/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) — and, for `get_object_code/1`, its `.beam` bytes |
@@ -86,7 +86,7 @@
 //! `erlang:*` process/registry/reference entries in [`process`], the `application:*`
 //! entries in [`application`], the `prim_file:*` primitives in [`prim`], the `erl_ddll:*`
 //! loaded-driver-list entries in [`ddll`], the distribution **identity** in [`node`] and the
-//! distribution **node set + connector** (`erlang:nodes/0,1`, `net_adm:ping/1`,
+//! distribution **node set + connector** (`erlang:nodes/0,1,2`, `net_adm:ping/1`,
 //! `net_kernel:connect_node/1`) in [`net`]. The submodules
 //! reach the shared helpers through `super` (they are `pub(super)`).
 
@@ -425,6 +425,7 @@ impl RuntimeContext<'_> {
             ("erlang", "set_cookie", 2) => Some(self.set_cookie_2(args)),
             ("erlang", "nodes", 0) => Some(self.nodes_0()),
             ("erlang", "nodes", 1) => Some(self.nodes_1(args)),
+            ("erlang", "nodes", 2) => Some(self.nodes_2(args)),
             ("net_adm", "ping", 1) => Some(self.net_adm_ping_1(args)),
             ("net_kernel", "connect_node", 1) => Some(self.net_kernel_connect_node_1(args)),
             // Sequential tracing (contract A.8, item 2) — exactly the four BIFs
