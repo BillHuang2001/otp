@@ -23,8 +23,9 @@
 //! Split by responsibility across submodules: [`handlers`] (the `try`/`catch`
 //! frame push, the handler opcodes and `catch_end`), [`raising`] (the raising
 //! opcodes, the re-raise opcode and `raw_raise`), [`stacktrace`]
-//! (`build_stacktrace`) and [`end_to_end`] (whole synthetic sequences). The
-//! shared fixture scaffolding lives here.
+//! (`build_stacktrace`), [`function_clause`] (the failed clause's argument list in
+//! the cooked `function_clause` item's `A` slot) and [`end_to_end`] (whole
+//! synthetic sequences). The shared fixture scaffolding lives here.
 
 use super::*;
 use crate::context::MinimalContext;
@@ -140,6 +141,7 @@ fn assert_reason_tuple(
 mod callee;
 mod cross_module;
 mod end_to_end;
+mod function_clause;
 mod handlers;
 mod oracle;
 mod raising;

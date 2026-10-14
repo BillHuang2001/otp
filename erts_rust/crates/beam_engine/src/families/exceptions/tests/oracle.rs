@@ -174,20 +174,33 @@ fn undef_host() -> MinimalContext {
 /// non-zero is a harness failure (the source is valid Erlang) and panics with its
 /// stderr.
 fn compile_fixture(tag: &str) -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("beam_engine_exceptions_callee_oracle_{tag}"));
+    compile_module(tag, "p3", FIXTURE_SRC)
+}
+
+/// Compile `source` into `{module_name}.erl` under a per-`tag` temp dir and return
+/// that dir — the general form of [`compile_fixture`], shared with the sibling
+/// oracle-backed suites under `super::`.
+///
+/// The `tag` keeps tests running in parallel from sharing a scratch directory.
+/// `None` means `erlc` could not be **spawned** (the caller skips loudly); an
+/// `erlc` that *ran* and exited non-zero is a harness failure (the source is valid
+/// Erlang) and panics with its stderr.
+pub(super) fn compile_module(tag: &str, module_name: &str, source: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("beam_engine_exceptions_oracle_{tag}"));
     std::fs::create_dir_all(&dir)
         .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
-    std::fs::write(dir.join("p3.erl"), FIXTURE_SRC)
-        .unwrap_or_else(|error| panic!("write p3.erl: {error}"));
+    let file = format!("{module_name}.erl");
+    std::fs::write(dir.join(&file), source)
+        .unwrap_or_else(|error| panic!("write {file}: {error}"));
     let output = Command::new("erlc")
         .arg("+deterministic")
-        .arg("p3.erl")
+        .arg(&file)
         .current_dir(&dir)
         .output()
         .ok()?;
     assert!(
         output.status.success(),
-        "the system `erlc` exited {} compiling p3.erl\n  stderr: {}",
+        "the system `erlc` exited {} compiling {file}\n  stderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
@@ -196,13 +209,26 @@ fn compile_fixture(tag: &str) -> Option<PathBuf> {
 
 /// Load `p3.beam` from `dir` through [`beam_loader::load_file`] and intern the
 /// [`SEED_ATOMS`] the runtime holds globally.
+fn load_fixture(dir: &Path) -> Module {
+    load_module(dir, "p3", &[])
+}
+
+/// Load `{module_name}.beam` from `dir` through [`beam_loader::load_file`] and
+/// intern the [`SEED_ATOMS`] the runtime holds globally (plus `extra_seed`) — the
+/// general form of [`load_fixture`], shared with the sibling oracle-backed suites
+/// under `super::`.
+///
+/// A real runtime keeps the [`SEED_ATOMS`] interned for *every* module whether or
+/// not the module's source mentions them, and the real OTP compiler does not emit
+/// them into a module's atom chunk; a fixture whose code path needs a further
+/// globally interned atom (`function_clause`, …) names it in `extra_seed`.
 ///
 /// Interning only ever **appends**, so every atom index the loader assigned (and
 /// every literal term built from it) stays valid.
-fn load_fixture(dir: &Path) -> Module {
-    let beam = dir.join("p3.beam");
+pub(super) fn load_module(dir: &Path, module_name: &str, extra_seed: &[&str]) -> Module {
+    let beam = dir.join(format!("{module_name}.beam"));
     let mut module = load_file(&beam).unwrap_or_else(|error| panic!("load {}: {error:?}", beam.display()));
-    for &name in SEED_ATOMS {
+    for &name in SEED_ATOMS.iter().chain(extra_seed) {
         module.atom_table.intern(name);
     }
     module
@@ -215,11 +241,11 @@ fn load_fixture(dir: &Path) -> Module {
 /// The system oracle's answer for one fixture call: the `Class|Reason` line and
 /// one `M|F|Third|Location` line per cooked stacktrace item, exactly as `~p`
 /// prints them.
-struct OracleTrace {
+pub(super) struct OracleTrace {
     /// `~p` of the class and of the reason, joined by `|`.
-    head: String,
+    pub(super) head: String,
     /// One line per cooked item, the raising frame first.
-    items: Vec<String>,
+    pub(super) items: Vec<String>,
 }
 
 /// Ask the system `erl` for `call`'s `{Class,Reason,S}` triple, printing the
@@ -228,7 +254,7 @@ struct OracleTrace {
 /// `-pz`, never `-pa`: appending keeps the real stdlib ahead of the fixture
 /// module. `None` when no runnable `erl` is on `PATH`; a spawned `erl` that exits
 /// non-zero is a harness failure and panics with its stderr.
-fn oracle_trace(dir: &Path, call: &str) -> Option<OracleTrace> {
+pub(super) fn oracle_trace(dir: &Path, call: &str) -> Option<OracleTrace> {
     let probe = format!(
         "{{C,R,S}} = {call}, \
          io:format(\"~p|~p~n\",[C,R]), \
@@ -259,7 +285,7 @@ fn oracle_trace(dir: &Path, call: &str) -> Option<OracleTrace> {
 /// Assert the engine's answer for `what` agrees with the oracle: the same
 /// class/reason, a **non-empty** cooked trace, and the oracle's first items
 /// (the engine cooks a strictly shorter prefix — see the module docs).
-fn assert_matches_the_oracle(what: &str, head: &str, items: &[String], oracle: &OracleTrace) {
+pub(super) fn assert_matches_the_oracle(what: &str, head: &str, items: &[String], oracle: &OracleTrace) {
     assert_eq!(
         head, oracle.head,
         "{what}: the engine's class/reason disagrees with the oracle"
@@ -289,7 +315,7 @@ fn assert_matches_the_oracle(what: &str, head: &str, items: &[String], oracle: &
 
 /// The name of the atom `term` as the oracle prints it (an atom never needs
 /// quoting in these fixtures).
-fn render_atom(term: Eterm, module: &Module) -> String {
+pub(super) fn render_atom(term: Eterm, module: &Module) -> String {
     assert!(is_atom(term), "expected an atom, got {term:?}");
     module
         .atom_name(atom_val(term))
@@ -300,7 +326,7 @@ fn render_atom(term: Eterm, module: &Module) -> String {
 /// Render `term` the way the oracle probe's `~p` does, restricted to the shapes
 /// these fixtures build: an atom, a small integer, a proper list of those, or a
 /// tuple of those (a `{case_clause,X}`-style reason).
-fn render_flat(term: Eterm, module: &Module) -> String {
+pub(super) fn render_flat(term: Eterm, module: &Module) -> String {
     if is_atom(term) {
         return render_atom(term, module);
     }
@@ -330,7 +356,7 @@ fn render_flat(term: Eterm, module: &Module) -> String {
 ///
 /// Special-cased (never [`render_flat`]) because the file name is a **char list**
 /// the oracle prints as a string.
-fn render_location(term: Eterm) -> String {
+pub(super) fn render_location(term: Eterm) -> String {
     if is_nil(term) {
         return "[]".to_string();
     }
@@ -349,7 +375,7 @@ fn render_location(term: Eterm) -> String {
 
 /// Render one cooked stacktrace item the way the oracle probe prints its four
 /// fields.
-fn render_item(item: Eterm, module: &Module) -> String {
+pub(super) fn render_item(item: Eterm, module: &Module) -> String {
     let name = render_atom(crate::terms::tuple_element(item, 0).expect("the item's module"), module);
     let function = render_atom(
         crate::terms::tuple_element(item, 1).expect("the item's function"),
@@ -368,7 +394,7 @@ fn render_item(item: Eterm, module: &Module) -> String {
 
 /// Run `module:name/arity(args)` on `tier`, assert it returned the compiler's
 /// `{Class,Reason,Cooked}` triple, and hand the three terms back.
-fn run_fixture(
+pub(super) fn run_fixture(
     module: &Module,
     ctx: &mut MinimalContext,
     name: Atom,
@@ -392,7 +418,7 @@ fn run_fixture(
 
 /// The engine's `Class|Reason` line and cooked items, rendered exactly like
 /// [`oracle_trace`]'s.
-fn engine_trace(class: Eterm, reason: Eterm, cooked: Eterm, module: &Module) -> (String, Vec<String>) {
+pub(super) fn engine_trace(class: Eterm, reason: Eterm, cooked: Eterm, module: &Module) -> (String, Vec<String>) {
     let head = format!("{}|{}", render_flat(class, module), render_flat(reason, module));
     let items = crate::terms::list_elements(cooked)
         .expect("the cooked stacktrace is a proper list")
@@ -403,7 +429,7 @@ fn engine_trace(class: Eterm, reason: Eterm, cooked: Eterm, module: &Module) -> 
 }
 
 /// The atom `module` names, or a harness panic.
-fn atom(module: &Module, name: &str) -> Atom {
+pub(super) fn atom(module: &Module, name: &str) -> Atom {
     module
         .atom_table
         .lookup(name)

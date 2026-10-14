@@ -25,7 +25,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   only the slots an FR write actually touched (exact after the ordinary interpret seams; a native JIT block
   or a caller that took a raw `fr_mut`/`with_roots` slice sets the crate-internal `regs_escaped` flag and may
   understate it — the caller must account for that itself); `Machine::reset` clears the raise snapshot
-  alongside the module contexts (both belong to the run that is starting).
+  alongside the module contexts (both belong to the run that is starting) **and clears both failed-clause
+  latches** (`pending_function_clause_args`/`raise_function_clause_args`).
+- `mod.rs` — the two failed-clause latches: `pending_function_clause_args: Option<Eterm>` (one-shot — armed by
+  the raise site, consumed by the `throw_with_trace` that lands it, so a propelling `Err` cannot leave a stale
+  list for a later trace) and `raise_function_clause_args: Option<Eterm>` (the **live raise** state, set on
+  every `throw_with_trace` and consumed exactly once by the two cooked-trace builders). Both are machine-held
+  heap terms outside the frozen root set, rooted by a collecting host the way the pending exception is.
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
   caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).
@@ -33,12 +39,19 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   and the **uniform raise funnel**: `throw_with_trace` first REBUILDS `raise_snapshot` (the raising frame
   from `current_code`/`current_context`, then every live caller from `resumption_contexts`) — **before** any
   unwind and before the early no-live-frame `Err(BeamError::Raise)` return, so the pre-unwind chain
-  survives for the handler. `raise_stacktrace(entry_module: Option<&Module>, func, pc)` derives the symbolic `StackTrace` (raising function,
-  then every live caller innermost first) and `with_uncaught_frames` attaches it to an uncaught `BeamError::Raise`
-  (leaving a non-raise error, an already-framed raise and an **engine diagnostic** — a reason atom prefixed
-  `unsupported_opcode: `, the `error::unsupported` sentinel — untouched). The funnel's first half runs at the
-  `step_instruction` boundary (`../interpreter/dispatch.rs`), its **second half at the `drive` boundary** for a raise
-  that surfaced inside a cross-module callee (`drive.rs`).
+  survives for the handler. It also promotes the failed-clause argument list: it takes the one-shot
+  `Machine::pending_function_clause_args` and stores it as the live `Machine::raise_function_clause_args`
+  (a raise that carries no such list clears it, so no later trace can inherit a stale one).
+  `raise_stacktrace(entry_module: Option<&Module>, func, pc, first_frame_args: Option<Eterm>) -> StackTrace`
+  derives the symbolic `StackTrace` (raising function, then every live caller innermost first), giving
+  `first_frame_args` to the **raising** frame only; `Machine::with_uncaught_frames(&mut self, err, entry_module, func, pc)`
+  attaches it to an uncaught `BeamError::Raise` (leaving a non-raise error, an already-framed raise and an
+  **engine diagnostic** — a reason atom prefixed `unsupported_opcode: `, the `error::unsupported` sentinel —
+  untouched). The funnel's first half runs at the `step_instruction` boundary (`../interpreter/dispatch.rs`),
+  its **second half at the `drive` boundary** for a raise that surfaced inside a cross-module callee (`drive.rs`).
+  `Machine::take_raise_function_clause_args()` is the consuming half of the live latch: the two cooked-trace
+  builders call it **exactly once** each, and the loop in `symbolic_stacktrace` hands the list to the first
+  frame's `A` slot (every outer frame keeps its declared arity).
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
