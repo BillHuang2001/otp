@@ -222,6 +222,33 @@ stay `undef`. No `unsafe`.
   `{ok,Result,Flags,Errors}`/`{error,Errors}`) and `erlang:decode_packet/3` — `mod.rs` owns the argument validation,
   the 15-type switch, dispatch and rendering, with one family module each (`framing`/`tls`/`http`), so **no valid
   packet type is a typed gap**. `./src/packet/CONTEXT.md`.
+### `erlang:raise/3`'s stacktrace forwarding (`convert.rs`)
+`raise(Class, Reason, Stacktrace)` **decodes** its valid 3rd argument into the returned raise's
+`beam_common::StackTrace` (`decode_stacktrace`/`decode_stacktrace_frame`/`decode_location`, next to the
+`is_stacktrace` validity predicate the returned-`badarg` gate uses). The engine renders a non-empty supplied
+trace **verbatim** in place of its own raise-snapshot trace (`beam_engine`'s supplied-frame latch), so the two
+halves together reproduce the oracle's `build_stacktrace` — a caller-supplied trace comes back unchanged. The
+decode mapping:
+- `{Module, Function, Arity[, Location]}` → `StackFrame { module, function, arity, location }`; `Module`/
+  `Function` are atoms read from the shared table by **name**; the 3rd element is the `arity: u8` **only when it
+  is an integer in `0..=255`**; an absent 4th element or `[]` is `location: None` (the `NIL` the engine renders,
+  i.e. the same `[]` term the oracle normalizes `{M,F,A}` to).
+- `Location` is exactly `[{file, FileNameCharList}, {line, N}]` — those two pairs in that order; `FileName` is a
+  **char list** of Unicode scalar values (never an atom) and `N` an integer in `0..=u32::MAX`.
+- `[]` (an empty 3rd argument) decodes to the **empty** `StackTrace`, so the engine's latch stays unarmed and
+  `raise(_, _, [])` keeps its derived stacktrace.
+- The reason handling is orthogonal and unchanged: an atom reason keeps its exact `ExitReason` with no live slot,
+  a non-atom one is `ExitReason::Structured` carrying the term itself in the `Raise::live_reason` slot; **both**
+  additionally carry the decoded frames.
+**Never fabricated.** A trace element the oracle echoes verbatim but a `StackFrame` cannot express is the typed
+`unsupported_bif` **raise** — never the returned `badarg` (the argument is valid, so it is a capability gap) and
+never a truncated/invented frame. The gap covers: an `erl_eval`-style `{Fun,Args}` / `{Fun,Args,Location}` **call
+frame** (no module/function), a 3rd element that is an argument list or any other non-`0..=255` value (`-1`,
+`256`, `1.0`), a `Module`/`Function` the atom table cannot name, and a location that is not exactly the shape
+above (an atom/other file name, a missing or extra pair, reversed order, a non-integer or out-of-`u32`-range
+`line`, a char list element that is not a Unicode scalar value). The returned-`badarg` cases are untouched: a bad
+class, and a non-list/improper/non-frame trace (`[42]`, `[{1,2}]`, `[{}]`, `42`, `[{m,f,1}|x]`) or a location that
+is not a list.
 ### The port BIFs (`port.rs`) and the `PortHook` seam
 A port is OS process + driver + port-table slot (Stage-5 machinery, never a BIF), so every port *operation* routes
 through the optional `PortHook` — `unsupported_bif` with none. `port_close/1` returns `true` (never `ok`);
