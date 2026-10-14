@@ -5028,6 +5028,162 @@ fn the_two_process_copy_bound_shape_is_measured_on_both_tiers() {
     println!("loadavg (end): {}", probe_loadavg());
 }
 
+/// The committed `erlc` fixtures whose bodies exercise `Y` slots — the offline "real
+/// shape" corpus for the `Y`-traffic measurement below (no oracle, no timing).
+const Y_TRAFFIC_FIXTURES: [&str; 27] = [
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/applyrecv.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bignum.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bitstrings.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsbig.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bscreate.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsfailseg.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsmatch.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bssmall.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsstring.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/catchtrace.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/exceptions.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/excpaths.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/floats.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/funs.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lists.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mapfx.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/raise_frames.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/records.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/recv.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/stacktrace.beam"),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlib_exports_harness.beam"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlib_more_harness.beam"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlib_text_harness.beam"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlists_harness.beam"
+    ),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tailcall.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tuples.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/xmod_callee.beam"),
+];
+
+/// **The `Y`-window traffic baseline**: how much frame-window-guarded `Y`-slot traffic the
+/// committed `erlc` fixtures emit, and how little of it a per-block single-slot `Y`-value
+/// cache could at most save.
+///
+/// Every counted quantity is **structural** — emitted while the blocks are compiled — so
+/// the numbers are reproducible from the committed fixtures alone (no oracle, no timing,
+/// no host-load sensitivity):
+///
+/// * `y_loads`/`y_stores` — the emitted guarded `Y` accesses (each is a frame-window guard
+///   plus one load/store word) and `y_bytes`, the emitted size of all of them;
+/// * `y_blocks` — the emitted blocks whose body touches a `Y` slot at all;
+/// * `y_invalidations` — the in-block helper calls after which a **later** instruction of
+///   the same block still touches `Y` (each is a re-publish site a `Y`-value cache would
+///   also have to re-validate and reload through);
+/// * `y_slot_repeats` — `Y` accesses that re-touch a slot **already accessed earlier in
+///   the same block**. A per-block cache cannot forward across a block exit (the exit
+///   teardown destroys the cache registers) and cannot survive an in-block helper, so this
+///   is the **upper bound** on what such a cache could ever save.
+///
+/// The test asserts the counters are live and internally consistent and *prints* the
+/// totals; it deliberately asserts **no** traffic threshold, so it passes identically
+/// whether or not a `Y`-value cache exists (the printed numbers are the evidence).
+#[test]
+fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
+    // (1) The instrument itself, on a synthetic shape with *known* `Y` traffic:
+    // `y_slot_move_code` stores `Y(0)`, loads `Y(0)`, stores `Y(1)`, loads `Y(1)` — two
+    // loads, two stores, and two same-block slot reuses. Pinning these exact counts here
+    // is what makes the fixture totals below evidence rather than an unexplained number.
+    crate::jit::cache::clear_baseline_cache();
+    counters::reset();
+    counters::set_enabled(true);
+    let probe_module = build_module(
+        "y_traffic_probe",
+        &[],
+        vec![("f", 0, y_slot_move_code())],
+        &[("f", 0, Label(2))],
+    );
+    let probe_labels = crate::interpreter::build_label_map(&probe_module);
+    compile_function(&probe_module, &probe_labels, 0).expect("y_traffic_probe/f-0 compiles");
+    counters::set_enabled(false);
+    let probe = counters::snapshot();
+    assert_eq!(
+        (probe.y_loads, probe.y_stores, probe.y_slot_repeats),
+        (2, 2, 2),
+        "the Y-traffic instrument must see the synthetic shape's known traffic"
+    );
+    assert!(probe.y_blocks >= 1, "the synthetic block touches a Y slot");
+    assert!(probe.y_bytes > 0, "a guarded Y access emits bytes");
+
+    // (2) The committed fixture corpus, counted from zero.
+    counters::reset();
+    counters::set_enabled(true);
+
+    let mut functions = 0u64;
+    let mut skipped = 0u64;
+    for path in Y_TRAFFIC_FIXTURES {
+        let module =
+            beam_loader::load_file(path).unwrap_or_else(|error| panic!("load {path}: {error:?}"));
+        let labels = crate::interpreter::build_label_map(&module);
+        for func in 0..module.functions.len() as u32 {
+            match compile_function(&module, &labels, func) {
+                Ok(_) => functions += 1,
+                Err(_) => skipped += 1,
+            }
+        }
+    }
+
+    counters::set_enabled(false);
+    let snap = counters::snapshot();
+    let accesses = snap.y_loads + snap.y_stores;
+
+    println!(
+        "=== Y-window traffic over {} committed fixtures ===",
+        Y_TRAFFIC_FIXTURES.len()
+    );
+    println!(
+        "  compiled functions={functions} skipped={skipped} | blocks={} ir_instrs={} emitted_bytes={}",
+        snap.blocks, snap.block_ir_instructions, snap.block_emitted_bytes,
+    );
+    println!(
+        "  Y: loads={} stores={} (accesses={}) bytes={} blocks={} invalidations={} slot_repeats={}",
+        snap.y_loads,
+        snap.y_stores,
+        accesses,
+        snap.y_bytes,
+        snap.y_blocks,
+        snap.y_invalidations,
+        snap.y_slot_repeats,
+    );
+    println!(
+        "  Y accesses per 1000 IR instructions: {:.1}",
+        accesses as f64 * 1000.0 / snap.block_ir_instructions.max(1) as f64,
+    );
+
+    assert!(
+        functions > 0,
+        "the fixture corpus must compile at least one function"
+    );
+    assert!(
+        snap.y_blocks > 0,
+        "the corpus must emit at least one Y-touching block"
+    );
+    assert!(snap.y_loads > 0, "the corpus must emit guarded Y loads");
+    assert!(snap.y_stores > 0, "the corpus must emit guarded Y stores");
+    assert!(snap.y_bytes > 0, "a guarded Y access emits bytes");
+    assert!(
+        snap.y_slot_repeats <= accesses,
+        "a reuse is one of the accesses: {} > {accesses}",
+        snap.y_slot_repeats,
+    );
+}
+
 /// **The entry-lookup pin**: the baseline tier's per-slice artifact lookup must not
 /// re-hash the module's decoded IR.
 ///

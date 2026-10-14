@@ -383,8 +383,9 @@ impl CompiledModule {
     /// ascending, deduped across blocks).
     ///
     /// The allocator ranks by live-interval length ([`allocate_registers`](super::emit)), so this is
-    /// the set of the most-used registers rather than the first-appearing ones; a
-    /// register **not** in it is addressed directly in `machine.x`.
+    /// the set of the registers with the longest live intervals rather than the
+    /// first-appearing ones; a register **not** in it is addressed directly in
+    /// `machine.x`.
     pub fn cached_registers(&self) -> Vec<u32> {
         match &self.layout {
             Layout::Eager(eager) => eager.summary.cached_registers.clone(),

@@ -345,7 +345,7 @@ enum FastSource {
 /// x-register, an addressable Y slot nor a small constant.
 ///
 /// A non-cached x-register is a `machine.x` read, not a deopt: the register
-/// allocator's four-register budget decides only *where* the value is read from,
+/// allocator's cache budget decides only *where* the value is read from,
 /// never whether the instruction can be lowered. A Y slot is likewise read natively,
 /// behind the run-time frame-window guard.
 fn fast_source(operand: &Operand, allocation: &Allocation) -> Option<FastSource> {

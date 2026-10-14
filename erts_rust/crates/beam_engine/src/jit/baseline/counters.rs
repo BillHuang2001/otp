@@ -41,6 +41,13 @@
 //!   (every block-ABI word the driver had to decode, classified).
 //! * **Prologue position/publish calls** — [`record_set_position`] /
 //!   [`record_publish_y`] / [`record_refresh_y`] from the three prologue helpers.
+//! * **`Y`-window traffic** — [`record_y_access`] (every emitted guarded `Y`-slot read
+//!   or write, with its emitted byte length) and [`record_y_invalidation`] (every
+//!   in-block helper call after which a later instruction of the same block still
+//!   accesses a `Y` slot — the site that must re-publish the window), plus, from
+//!   [`record_block`], the `Y`-touching block count and the same-block **slot-reuse**
+//!   count ([`Counters::y_slot_repeats`]) a single-slot `Y`-value cache could at most
+//!   save.
 //! * **`call_ext*` resolution outcomes** — [`record_ext_resolved`] (native transfer)
 //!   / [`record_ext_declined`] (the host's `Ok(None)`, the once-only seam) /
 //!   [`record_ext_fallback`] (the whole instruction re-run through `jit_step_one`).
@@ -99,6 +106,12 @@ thread_local! {
     /// [`PENDING_SPILLS`], for the **full-cache** reload count the previous `fill` model
     /// would have emitted. Drained by [`record_block`].
     static PENDING_FILLS: RefCell<Vec<FillSite>> = const { RefCell::new(Vec::new()) };
+    /// The `Y` slots already accessed in the block currently being emitted — the
+    /// same-block reuse detector behind [`Counters::y_slot_repeats`]. Drained by
+    /// [`record_block`], because a block's `Y` accesses all precede its own
+    /// `record_block` (a block that fails to compile simply leaks its slots into the
+    /// next block's set, which only ever *over*-counts reuses in a diagnostic).
+    static Y_SLOTS_SEEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A snapshot of the baseline tier's structural counters.
@@ -133,6 +146,32 @@ pub(crate) struct Counters {
     pub(crate) publish_y: u64,
     /// `jit_refresh_y` calls (the gated in-block Y-window re-publish).
     pub(crate) refresh_y: u64,
+    /// Emitted **guarded Y-slot reads** ([`super::emit::emit_guarded_y_load`]): one
+    /// frame-window guard plus one load, per inlined `Y` source.
+    pub(crate) y_loads: u64,
+    /// Emitted **guarded Y-slot writes** ([`super::emit::emit_guarded_y_store`]): one
+    /// frame-window guard plus one store, per inlined `Y` destination.
+    pub(crate) y_stores: u64,
+    /// The emitted bytes those guarded Y accesses occupy (the guard plus its access
+    /// word), summed over the whole compilation — the traffic a Y-value cache would have
+    /// to reduce.
+    pub(crate) y_bytes: u64,
+    /// Emitted blocks whose body accesses a `Y` slot
+    /// ([`Allocation::y_last`](super::emit::Allocation::y_last)): the blocks a per-block
+    /// Y-value cache would have to publish (guard + load) the slot in.
+    pub(crate) y_blocks: u64,
+    /// Emitted Y-window **refresh** sites: the in-block helper calls after which a later
+    /// instruction of the *same* block still accesses a `Y` slot
+    /// ([`Allocation::refresh_y_after`](super::emit::Allocation::refresh_y_after)). The
+    /// static twin of the runtime [`refresh_y`](Counters::refresh_y) count, and the number
+    /// of times a Y-value cache would have to invalidate + reload.
+    pub(crate) y_invalidations: u64,
+    /// Emitted `Y`-slot accesses that re-touch a slot **already accessed earlier in the
+    /// same block** — the upper bound on what a per-block single-slot `Y`-value cache
+    /// could save: such a cache cannot forward across a block exit (the exit teardown
+    /// destroys the cache registers) and cannot survive an in-block helper, so only
+    /// intra-block reuse of one slot is exploitable.
+    pub(crate) y_slot_repeats: u64,
     /// The per-opcode deopt attribution: variant name -> count.
     pub(crate) deopts_by_variant: BTreeMap<String, u64>,
     /// The driver round-trips by the word class they returned (`HALT`/`ERROR`/
@@ -202,6 +241,7 @@ pub(crate) fn reset() {
     COUNTERS.with(|c| *c.borrow_mut() = Counters::default());
     PENDING_SPILLS.with(|p| p.borrow_mut().clear());
     PENDING_FILLS.with(|p| p.borrow_mut().clear());
+    Y_SLOTS_SEEN.with(|s| s.borrow_mut().clear());
 }
 
 /// This thread's counters, cloned.
@@ -317,6 +357,44 @@ pub(crate) fn record_refresh_y() {
     with(|c| c.refresh_y += 1);
 }
 
+/// One emitted guarded Y-slot access: `load` distinguishes a read
+/// ([`emit_guarded_y_load`](super::emit::emit_guarded_y_load)) from a write
+/// ([`emit_guarded_y_store`](super::emit::emit_guarded_y_store)), `slot` is the access's
+/// frame-relative `Y` index (the same-block reuse detector for
+/// [`Counters::y_slot_repeats`]), and `bytes` the emitted length of its frame-window
+/// guard plus its access word.
+pub(crate) fn record_y_access(load: bool, slot: u32, bytes: u64) {
+    if !ENABLED.with(Cell::get) {
+        return;
+    }
+    let repeat = Y_SLOTS_SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if seen.contains(&slot) {
+            true
+        } else {
+            seen.push(slot);
+            false
+        }
+    });
+    COUNTERS.with(|c| {
+        let c = &mut *c.borrow_mut();
+        if load {
+            c.y_loads += 1;
+        } else {
+            c.y_stores += 1;
+        }
+        c.y_bytes += bytes;
+        if repeat {
+            c.y_slot_repeats += 1;
+        }
+    });
+}
+
+/// One emitted Y-window refresh site (see [`Counters::y_invalidations`]).
+pub(crate) fn record_y_invalidation() {
+    with(|c| c.y_invalidations += 1);
+}
+
 /// One `spill` call: `written_len` cached x-registers are stored back into
 /// `machine.x`, at `site`.
 ///
@@ -369,7 +447,9 @@ pub(crate) fn record_fill(site: FillSite, n: u64) {
 /// It also folds in the allocation's **live-range statistics**
 /// ([`Allocation::live_candidates`]/[`live_total`](Allocation::live_total)/
 /// [`live_max`](Allocation::live_max)), the allocator's own view of how much liveness the
-/// selection covers.
+/// selection covers, counts the block as `Y`-touching when its body accesses a `Y` slot,
+/// and drains the block's `Y`-slot set ([`Y_SLOTS_SEEN`]) so the next block's
+/// [`record_y_access`] reuse detection starts fresh.
 pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
     if !ENABLED.with(Cell::get) {
         return;
@@ -378,11 +458,15 @@ pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
     let written_slots = allocation.written.len() as u64;
     let pending = PENDING_SPILLS.with(|p| std::mem::take(&mut *p.borrow_mut()));
     let pending_fills = PENDING_FILLS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    Y_SLOTS_SEEN.with(|s| s.borrow_mut().clear());
     COUNTERS.with(|c| {
         let c = &mut *c.borrow_mut();
         c.blocks += 1;
         c.block_ir_instructions += ir_len;
         c.block_emitted_bytes += bytes;
+        if allocation.y_last.is_some() {
+            c.y_blocks += 1;
+        }
         c.block_cache_slots += cache_slots;
         c.block_written_slots += written_slots;
         c.block_live_candidates += u64::from(allocation.live_candidates);

@@ -43,12 +43,13 @@
 //! (`[rbx + x*8]`, `rbx` = the array base the prologue loads from
 //! [`RUNTIME_XREGS_DISP`]) — the same slot the exit spill writes — so a block that
 //! touches more registers than the cache budget still runs natively instead of
-//! deopting. The residents are the block's *most-used* registers, chosen by
-//! [`allocate_registers`] from the live intervals of the block's inlinable
-//! instructions, so the registers with the longest live ranges are the ones kept in
-//! machine registers; the direct `machine.x` accesses are the fill/spill for the
-//! rest. That is safe precisely because the cache membership is fixed for the
-//! whole block ([`Allocation`]): an x-register is either *always* held in its
+//! deopting. The residents are the registers with the **longest live intervals**,
+//! chosen by [`allocate_registers`] from the native touches of the block's inlinable
+//! instructions, so the registers that stay live across the most instruction
+//! boundaries are the ones kept in machine registers; the direct `machine.x`
+//! accesses are the fill/spill for the rest. That is safe precisely because the cache
+//! membership is fixed for the whole block ([`Allocation`]): an x-register is either
+//! *always* held in its
 //! machine register (and written back at every block exit) or *never* cached, so
 //! the two representations can never disagree. The highest x-register index a block
 //! touches natively — cached or direct — is recorded per function (in the function's
@@ -981,6 +982,8 @@ fn emit_continue_check(
     // *continue* arm only — a helper that leaves the block to the driver pays nothing
     // (the next block's prologue publishes).
     if allocation.refresh_y_after(pc) {
+        #[cfg(test)]
+        super::counters::record_y_invalidation();
         emit_refresh_y(buffer)?;
     }
     Ok(())

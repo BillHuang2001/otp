@@ -184,8 +184,13 @@ pub(super) fn emit_guarded_y_load(
     k: u32,
     fallback: CodeLabel,
 ) -> Result<()> {
+    #[cfg(test)]
+    let before = buffer.len();
     emit_guarded_y_address(buffer, value, end, k, fallback)?;
-    buffer.mov_rm(value, value, 0)
+    buffer.mov_rm(value, value, 0)?;
+    #[cfg(test)]
+    super::super::counters::record_y_access(true, k, (buffer.len() - before) as u64);
+    Ok(())
 }
 
 /// Emit a **guarded** store of `value` into Y slot `k`, jumping to `fallback` when the
@@ -202,6 +207,11 @@ pub(super) fn emit_guarded_y_store(
     k: u32,
     fallback: CodeLabel,
 ) -> Result<()> {
+    #[cfg(test)]
+    let before = buffer.len();
     emit_guarded_y_address(buffer, addr, end, k, fallback)?;
-    buffer.mov_mr(addr, 0, value)
+    buffer.mov_mr(addr, 0, value)?;
+    #[cfg(test)]
+    super::super::counters::record_y_access(false, k, (buffer.len() - before) as u64);
+    Ok(())
 }

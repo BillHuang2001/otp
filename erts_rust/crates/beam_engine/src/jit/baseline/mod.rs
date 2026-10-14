@@ -90,11 +90,12 @@
 //! deopting. That is exact because the cache membership is fixed for the whole
 //! block: an x-register is either always in its machine register (and written back
 //! at every block exit) or never, so the two representations cannot disagree. The
-//! allocation is computed by [`allocate_registers`] from the block's **native touch
-//! counts** — the registers its inlinable instructions would reference, weighted by
-//! how often they appear and ties broken by ascending index — so the most-used
-//! (longest-live-range) registers become resident; the direct `machine.x` accesses
-//! are the fill/spill for the rest. The highest x-register index any block of a
+//! allocation is computed by [`allocate_registers`] from the block's **native
+//! touches** — the registers its inlinable instructions would reference, ranked by
+//! the length of their live interval `[first touch, last touch]` and ties broken by
+//! ascending index — so the registers with the longest live intervals become
+//! resident; the direct `machine.x` accesses are the fill/spill for the rest. The
+//! highest x-register index any block of a
 //! function touches natively is recorded **per function** on the artifact, so the
 //! driver can refuse native entry to a register file that does not cover the function
 //! it is about to enter.

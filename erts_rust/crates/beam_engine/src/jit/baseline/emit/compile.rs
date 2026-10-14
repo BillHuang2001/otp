@@ -393,7 +393,7 @@ fn emit_sub_blocks(
 ///   either held resident, or read/written directly in `machine.x`), and — because the
 ///   whole-module [`Summary`] was built from exactly this allocation when the IR block was
 ///   emitted — reusing it leaves `cached_registers`/`highest_*` unchanged. A sub-range's own
-///   usage-weighted allocation is *not* necessarily a subset of the block's, so calling
+///   live-interval allocation is *not* necessarily a subset of the block's, so calling
 ///   [`allocate_registers`] on `[start, end)` could widen the summary.
 /// * **No summary fold** — [`emit_block`]'s register touches during this pass go to a
 ///   throwaway sink, so the eager whole-module [`Summary`] is provably untouched (it is
