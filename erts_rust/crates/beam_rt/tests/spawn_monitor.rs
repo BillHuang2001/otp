@@ -269,7 +269,11 @@ fn run_fixture(fixture: &Fixture, function: &str) -> Run {
         .unwrap_or_else(|| panic!("the fixture path is not UTF-8: {}", fixture.beam.display()));
     run_bounded(
         Path::new(env!("CARGO_BIN_EXE_beam_rt")),
-        &["run", beam, &format!("{MODULE}:{function}/0")],
+        // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
+        // invocation (the oracle's `erl` does the same), so suppress it to keep stdout
+        // byte-identical to the oracle probe's — and so a capability gap still prints
+        // *nothing* on stdout.
+        &["-noshell", "run", beam, &format!("{MODULE}:{function}/0")],
     )
 }
 

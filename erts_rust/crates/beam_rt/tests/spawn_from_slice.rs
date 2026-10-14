@@ -264,7 +264,13 @@ fn spawning_from_a_scheduler_slice_reaches_the_children() {
 
     for (label, function, expected) in FLOWS {
         let spec = format!("{MODULE}:{function}/0");
-        let ours = run_bounded(Path::new(env!("CARGO_BIN_EXE_beam_rt")), &["run", beam, &spec]);
+        let ours = run_bounded(
+            Path::new(env!("CARGO_BIN_EXE_beam_rt")),
+            // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
+            // invocation (the oracle's `erl` does the same), so suppress it to keep stdout
+            // byte-identical to the oracle probe's.
+            &["-noshell", "run", beam, &spec],
+        );
         assert_eq!(
             ours.code, 0,
             "{label}: `beam_rt run {beam} {spec}` exited {}: {}",

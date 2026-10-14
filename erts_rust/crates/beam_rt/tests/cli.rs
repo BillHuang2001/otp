@@ -30,6 +30,16 @@
 //! `0` success, `1` a genuine runtime error, `2` a usage error (with `Usage:`) and
 //! `3` an unsupported capability gap (one `beam_rt: unsupported: …` line, no usage text).
 //! `-eval`/`-s`/`-run`/`run` must be **silent on stderr** on success.
+//!
+//! # Why a stdout-asserting invocation passes `-noshell`
+//!
+//! Every CLI action except `-version` drives the default boot script, so a booted kernel
+//! prints the OTP banner (`Erlang/OTP 30 [erts-17.1] [source] [64-bit]`) to **stdout** on
+//! any invocation **without** `-noshell` — byte-faithful to the oracle, which also prints
+//! the banner without `-noshell` and is silent with it
+//! (`erl -noshell -eval 'io:format("x~n"), halt(0).'` → `x\n`; the same without `-noshell`
+//! prepends the banner). A test that asserts an **exact** stdout therefore invokes the
+//! binary with `-noshell`, exactly as the oracle side of every cross-check does.
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -65,7 +75,7 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn run_add_prints_five() {
-    let output = beam_rt(&["run", SLICE_BEAM, "slice:add/2", "2", "3"]);
+    let output = beam_rt(&["-noshell", "run", SLICE_BEAM, "slice:add/2", "2", "3"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "5\n");
     assert!(output.stderr.is_empty(), "stderr: {}", stderr(&output));
@@ -73,14 +83,14 @@ fn run_add_prints_five() {
 
 #[test]
 fn run_fib_prints_fifty_five() {
-    let output = beam_rt(&["run", SLICE_BEAM, "slice:fib/1", "10"]);
+    let output = beam_rt(&["-noshell", "run", SLICE_BEAM, "slice:fib/1", "10"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "55\n");
 }
 
 #[test]
 fn run_accepts_a_negative_integer_argument() {
-    let output = beam_rt(&["run", SLICE_BEAM, "slice:add/2", "2", "-3"]);
+    let output = beam_rt(&["-noshell", "run", SLICE_BEAM, "slice:add/2", "2", "-3"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "-1\n");
 }
@@ -89,11 +99,11 @@ fn run_accepts_a_negative_integer_argument() {
 fn run_accepts_atom_and_list_arguments() {
     // `slice:pick(a)` is 1 and the catch-all clause is 2 — the atom grammar is the
     // only way to reach either.
-    let output = beam_rt(&["run", SLICE_BEAM, "slice:pick/1", "a"]);
+    let output = beam_rt(&["-noshell", "run", SLICE_BEAM, "slice:pick/1", "a"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "1\n");
 
-    let output = beam_rt(&["run", SLICE_BEAM, "slice:pick/1", "[a]"]);
+    let output = beam_rt(&["-noshell", "run", SLICE_BEAM, "slice:pick/1", "[a]"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "2\n");
 }
@@ -112,8 +122,9 @@ fn version_prints_the_banner() {
 
 #[test]
 fn eval_is_silent() {
-    // Real `erl -eval '2+3'` prints nothing and exits 0.
-    let output = beam_rt(&["-eval", "2+3"]);
+    // Real `erl -eval '2+3'` prints nothing and exits 0. (`-noshell` keeps the booted
+    // kernel's OTP banner off stdout, exactly as the oracle does.)
+    let output = beam_rt(&["-noshell", "-eval", "2+3"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(output.stdout.is_empty(), "stdout: {}", stdout(&output));
     assert!(output.stderr.is_empty(), "stderr: {}", stderr(&output));
@@ -217,7 +228,7 @@ fn the_s_action_applies_with_atom_arguments_and_discards_the_result() {
         .to_str()
         .expect("the path is UTF-8")
         .to_string();
-    let output = beam_rt(&["-pa", &fixtures, "-s", "slice", "pick", "a"]);
+    let output = beam_rt(&["-noshell", "-pa", &fixtures, "-s", "slice", "pick", "a"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).is_empty(), "the result is discarded");
     assert!(output.stderr.is_empty(), "{}", stderr(&output));
@@ -242,6 +253,7 @@ fn the_code_path_is_searched_for_the_module() {
 #[test]
 fn run_prints_the_real_reason_of_a_structured_raise() {
     let output = beam_rt(&[
+        "-noshell",
         "run",
         RAISE_STRUCTURED_BEAM,
         "raise_structured:badkey/0",
