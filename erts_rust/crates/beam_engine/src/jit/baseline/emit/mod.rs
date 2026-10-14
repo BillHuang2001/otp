@@ -123,6 +123,7 @@ mod link;
 mod r#move;
 mod operands;
 mod regalloc;
+mod regs;
 mod select;
 mod test;
 
@@ -138,6 +139,12 @@ use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
 use select::try_inline_select_val;
 use test::try_inline_test;
+
+// The register cache — the `Allocation` and its spill/fill traffic — lives in the
+// `regs` submodule; re-exported here so `emit::Allocation`, `emit::spill`,
+// `emit::fill` and the item paths the other emitter submodules name stay unchanged.
+pub(crate) use regs::{Allocation, FillSite, SpillSite};
+use regs::{fill, spill};
 
 // The names this module's own unit tests (`baseline/tests.rs` glob-imports `emit`)
 // reach as `emit::NAME`, re-exported here so that splitting the emitter into
@@ -214,54 +221,6 @@ pub(super) fn touch(highest: &mut Option<u32>, x: u32) {
     });
 }
 
-/// A block's register allocation: the `(x-register index, machine register)` pairs
-/// the prologue loads and the epilogue spills.
-#[derive(Default)]
-pub(crate) struct Allocation {
-    /// The slots, in assignment order (`src` before `dst` within a `move`).
-    pub(crate) slots: Vec<(u32, Reg)>,
-    /// The **highest pc of the block whose instruction accesses a Y slot**, or `None`
-    /// when no instruction of the block does.
-    ///
-    /// The emitter's two Y-window decisions both read it, and both are compile-time
-    /// (so a Y-free block pays nothing at run time):
-    ///
-    /// * the **prologue** publishes the current frame's Y window iff `y_last.is_some()`
-    ///   (a block that may read `JitRuntime::y_base`/`y_end`);
-    /// * the **post-deopt refresh** ([`Allocation::refresh_y_after`]) is emitted only
-    ///   when a still-later instruction accesses a Y slot.
-    ///
-    /// Only the arithmetic fast path reads the window (see the Y-operand contract in
-    /// [`arith`]): an instruction "accesses a Y slot" exactly when [`arith::uses_y`]
-    /// says so. A `move`/`get_list`/… with a Y operand is *not* a window access — it
-    /// deopts to the interpreter, which reads `machine.stack` itself.
-    pub(crate) y_last: Option<u32>,
-}
-
-impl Allocation {
-    /// The machine register holding x-register `x`, if it is cached.
-    pub(crate) fn slot(&self, x: u32) -> Option<Reg> {
-        self.slots
-            .iter()
-            .find(|(n, _)| *n == x)
-            .map(|(_, reg)| *reg)
-    }
-
-    /// Whether a helper call made at `pc` — whose `Step::Next` continues the block
-    /// in-block at `pc + 1` — must be followed by a Y-window refresh.
-    ///
-    /// True only when a later instruction of the block still accesses a Y slot: the
-    /// helper ran one instruction in the interpreter, which may have pushed a frame,
-    /// `trim`med one, or **reallocated** `machine.stack`, so the window the block
-    /// published in its prologue may be stale. When no later instruction accesses a Y
-    /// slot the refresh is not emitted at all — and when the helper leaves the block to
-    /// the driver, the next block's prologue publishes instead, so no driver
-    /// round-trip ever refreshes.
-    pub(crate) fn refresh_y_after(&self, pc: u32) -> bool {
-        matches!(self.y_last, Some(last) if last > pc)
-    }
-}
-
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
 ///
 /// `highest_touched` accumulates the highest x-register index the emitted code
@@ -281,6 +240,8 @@ fn emit_block(
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
     // --- prologue -----------------------------------------------------------
+    #[cfg(test)]
+    let block_start_bytes = buffer.len();
     for reg in SAVED_REGISTERS {
         buffer.push_r(reg)?;
     }
@@ -315,6 +276,9 @@ fn emit_block(
         touch(highest_touched, *x);
         buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
     }
+    // Structural counter: the prologue loaded the whole cache.
+    #[cfg(test)]
+    super::counters::record_fill(FillSite::Prologue, allocation.slots.len() as u64);
 
     let done: CodeLabel = buffer.label();
     // The direct block-to-block linker: a taken branch to a compiled successor's
@@ -760,7 +724,16 @@ fn emit_block(
     // frame — the exact inverse of the prologue.
     buffer.bind(done)?;
     emit_frame_teardown(buffer)?;
-    buffer.ret()
+    buffer.ret()?;
+    // Structural counter: this block's IR size, cache size, write set (the spill's
+    // store count on every exit) and emitted native byte length.
+    #[cfg(test)]
+    super::counters::record_block(
+        (end - start) as u64,
+        allocation,
+        (buffer.len() - block_start_bytes) as u64,
+    );
+    Ok(())
 }
 
 /// Emit the prologue's position store: call `jit_set_position(rt, func, pc)` so the
@@ -849,7 +822,7 @@ fn emit_helper_call(
     helper: *const (),
     args: &[i64],
 ) -> Result<()> {
-    spill(buffer, allocation)?;
+    spill(buffer, allocation, SpillSite::Helper)?;
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     // The `rsi`/`rdx`/`rcx`/`r8`/`r9` argument registers, in ABI order.
     const ARG_REGISTERS: [Reg; 5] = [Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
@@ -987,7 +960,7 @@ fn emit_continue_check(
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)?;
-    fill(buffer, allocation)?;
+    fill(buffer, allocation, FillSite::Helper)?;
     // Continuing in-block past the helper: the instruction it ran may have pushed or
     // popped a frame (moving the Y window) or reallocated `machine.stack` (freeing the
     // published one), so re-publish the window before the next instruction when a later
@@ -1001,25 +974,9 @@ fn emit_continue_check(
     Ok(())
 }
 
-/// Write every cached x-register back into `machine.x` (`rbx` holds the base).
-pub(super) fn spill(buffer: &mut CodeBuffer, allocation: &Allocation) -> Result<()> {
-    for (x, reg) in &allocation.slots {
-        buffer.mov_mr(Reg::Rbx, x_offset(*x), *reg)?;
-    }
-    Ok(())
-}
-
-/// Load every cached x-register out of `machine.x` (`rbx` holds the base).
+/// Write the block's **written** cached x-registers back into `machine.x`.
 ///
-/// The mandatory counterpart of [`spill`] after a helper call: the helper ran the
-/// interpreter on `machine.x`, so the block's cached values are stale — every one of
-/// them may have been changed (an instruction can write any x-register). Reloading
-/// **all** of them is the liveness model's conservative form: no per-register
-/// liveness is needed, and a register that was not actually touched is reloaded with
-/// the value it already holds.
-fn fill(buffer: &mut CodeBuffer, allocation: &Allocation) -> Result<()> {
-    for (x, reg) in &allocation.slots {
-        buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
-    }
-    Ok(())
-}
+/// See [`super::regs`]: the store set is [`Allocation::written`], the cache registers
+/// the block's inline lowerings may write. A cached register outside that set still
+/// holds exactly its `machine.x` value, so a store of it would be a no-op.
+fn _spill_doc_anchor() {}
