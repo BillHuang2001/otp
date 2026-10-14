@@ -4653,3 +4653,70 @@ fn the_entry_lookup_does_not_rehash_the_module_ir_once_the_memo_is_warmed() {
         "a warmed entry module must be resolved without re-hashing its IR"
     );
 }
+
+/// **The receive/Send zero-deopt pin**: the `send` + receive-control family must be
+/// lowered as native code, not paid as a per-instruction `jit_step_one` deopt.
+///
+/// The two-process copy-bound probe exercises exactly this family (`send`, `loop_rec`,
+/// `loop_rec_end`, `wait_timeout`, `timeout`, `remove_message`) through the real mailbox
+/// seam, so a recording pass over it names the tier's deopts by opcode. With the family
+/// emitted through the `jit_receive` helper (`super::receive`) none of its opcodes may
+/// appear among the deopts, and the parser/ext-helper counter must stay zero — the tier
+/// is named explicitly (`Tier::BaselineJit`).
+///
+/// The total deopt count is pinned too: the family accounted for the majority of the
+/// pre-lowering deopts (642 of 1734 per 64 ops — `LoopRec` 257, `RemoveMessage` 128,
+/// `Send` 128, `Wait` 65, `WaitTimeout` 64), so the count must fall by at least that
+/// much. The remaining deopts are the structural/metadata opcodes (`PutTuple2`,
+/// `TestHeap`, `Allocate`, `InitYregs`, `Bif`, `GetTupleElement`, `Test`, `Call`) that
+/// are still the documented per-instruction deopt.
+#[test]
+fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+
+    counters::reset();
+    counters::set_enabled(true);
+    let (value, _, leftovers) = drive_probe(
+        &bench,
+        bench_atom,
+        &worker,
+        worker_atom,
+        PROBE_COUNT_OPS,
+        Tier::BaselineJit,
+    )
+    .expect("the counting pass completes");
+    counters::set_enabled(false);
+    let snapshot = counters::snapshot();
+
+    assert_eq!(value, make_small(PROBE_COUNT_OPS as i64));
+    assert_eq!(leftovers, (0, 0), "every message must be consumed");
+    assert_eq!(
+        snapshot.step_ext, 0,
+        "the probe's modules make no `call_ext*` call"
+    );
+    for opcode in [
+        "Send",
+        "LoopRec",
+        "LoopRecEnd",
+        "Wait",
+        "WaitTimeout",
+        "Timeout",
+        "RemoveMessage",
+    ] {
+        assert!(
+            !snapshot.deopts_by_variant.contains_key(opcode),
+            "`{opcode}` must be lowered natively, but it deopted {} time(s); \
+             deopts by variant: {:?}",
+            snapshot.deopts_by_variant.get(opcode).copied().unwrap_or(0),
+            snapshot.deopts_by_variant,
+        );
+    }
+    assert!(
+        snapshot.step_one <= 1100,
+        "the receive/Send family accounted for 642 of the 1734 pre-lowering deopts, so the \
+         total must have fallen below 1100; saw {} ({:?})",
+        snapshot.step_one,
+        snapshot.deopts_by_variant,
+    );
+    print_probe_counters(Tier::BaselineJit.name(), &snapshot);
+}

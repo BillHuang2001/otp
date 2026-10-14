@@ -110,6 +110,7 @@ use super::runtime::{
     encode_target, ExtCallHelper, PositionHelper, RefreshHelper, StepHelper, EXT_CALL,
     EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
 };
+use super::receive::jit_receive;
 use super::{jit_ext_call, jit_set_position, jit_step_one};
 use super::runtime::{jit_publish_y, jit_refresh_y};
 
@@ -723,6 +724,23 @@ fn emit_block(
                 }
                 emit_step_and_continue(buffer, done, allocation, func, pc)?;
             }
+            // The `send` / receive-control family — the copy-bound message-passing
+            // path (`send`, `loop_rec`, `loop_rec_end`, `wait`, `wait_timeout`,
+            // `timeout`, `remove_message`). Left to the `_` arm each of these paid a
+            // whole interpreter step per mailbox operation, which is the dominant
+            // deopt class of a `send`/`receive` loop. They run through the
+            // `jit_receive` helper instead, which is the receive family's own body
+            // plus the interpreter step's position store and raise funnel (see
+            // [`super::receive`]): a `send`/`loop_rec`/`timeout`/`remove_message`
+            // continues in-block, a `loop_rec` fail-label branch and a suspending
+            // `wait`/`wait_timeout` leave with that word for the driver.
+            Instr::Send
+            | Instr::LoopRec { .. }
+            | Instr::LoopRecEnd { .. }
+            | Instr::Wait { .. }
+            | Instr::WaitTimeout { .. }
+            | Instr::Timeout
+            | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
             // Everything else: one interpreter step, then continue at `pc + 1`.
             _ => emit_step_and_continue(buffer, done, allocation, func, pc)?,
         }
@@ -914,6 +932,39 @@ fn emit_ext_call(
             i64::from(kind),
             i64::from(deallocate),
         ],
+    )?;
+    emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// Emit the native arm for one `send`/receive-control instruction: the `jit_receive`
+/// helper followed by the same continuation check a deopt uses.
+///
+/// The helper has [`StepHelper`]'s exact signature (`rt`, the instruction's
+/// `(func, pc)`), so it reuses [`emit_helper_call`] + [`emit_continue_check`] — the
+/// spill-then-call contract and the refill after the call included:
+///
+/// * `encode_target(func, pc + 1)` — the instruction advanced by exactly one (`send`,
+///   a `loop_rec` that produced a candidate, `timeout`, `remove_message`, and a
+///   `wait_timeout` whose time operand is the small integer `0`), so the block
+///   continues in-block;
+/// * anything else — a `loop_rec` fail-label `Goto`, the [`encode_wait`] word of a
+///   suspending `wait`/`wait_timeout`, an `ERROR` word — leaves the block with the
+///   word in `rax`, which the driver decodes exactly as it decodes a deopt's.
+///
+/// [`encode_wait`]: crate::jit::baseline::encode_wait
+fn emit_receive(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+) -> Result<()> {
+    let helper: StepHelper = jit_receive;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[i64::from(func), i64::from(pc)],
     )?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }

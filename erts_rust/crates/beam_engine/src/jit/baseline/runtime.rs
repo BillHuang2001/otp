@@ -298,7 +298,7 @@ pub(crate) const RUNTIME_YEND_DISP: i32 = RUNTIME_YBASE_DISP + mem::size_of::<*c
 ///
 /// `func`/`pc` are the address of the instruction the helper ran; they are used only
 /// for [`Step::Next`], which advances to `pc + 1`.
-fn fold_step(
+pub(crate) fn fold_step(
     runtime: &mut JitRuntime<'_>,
     step: std::result::Result<Step, Box<BeamError>>,
     func: u32,
