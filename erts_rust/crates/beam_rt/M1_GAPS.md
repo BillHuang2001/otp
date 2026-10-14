@@ -248,6 +248,14 @@ local mailboxes through `LocalDeliverySink`, gated by `Runtime::allow_inbound_de
 the differential corpus is byte-identical); a live-peer loop past the handshake needs the
 `FragmentAssembler` receive-buffer coupling.
 
+**The Erlang-level distribution subtree is not run** on a `-sname`/`-name` node: the native floor
+answers `erl_distribution:start_link/0,1` with `ignore` (this runtime's distribution is the native
+`DistNode` the CLI binds and publishes to `epmd`), so `kernel_sup` skips `net_sup`. Measured on a
+`-sname` node: `whereis(net_sup)`/`whereis(net_kernel)`/`whereis(auth)` are `undefined` here vs pids on
+the oracle, while `whereis(kernel_sup)`/`whereis(application_controller)`/`whereis(logger)` are pids on
+both, `whereis(timer_server)` is `undefined` on both, and `node()`/`is_alive()` agree. Mechanism:
+[`src/native/CONTEXT.md`](src/native/CONTEXT.md) *The Erlang-level distribution supervisor*.
+
 ## Timers
 `send_after/3` answers a `#Ref<>`; `cancel_timer(Pending)` the remaining ms,
 `cancel_timer(Fired|Cancelled|unknown-ref)` `false`, `cancel_timer(non-ref)`/a bad time or destination
@@ -434,10 +442,12 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   (which nested a fresh `Machine` under `may_pump_scheduler() == false` → `src/context/pump.rs` refuses
   → the uncatchable `blocked()`). Pinned by
   `src/context/tests.rs::{an_external_fun_whose_callee_blocks_resumes_on_a_scheduled_slice, resolve_local_fun_declines_the_fun_kinds_it_cannot_claim}`.
-  **The `-eval` action renders a structured raise reason as the placeholder.** `src/cli.rs`'s
-  `Action::Eval` arm does not pass its error through `reported_reason` (only `Boot`/`Run`/`RunFile` do),
-  so a structured raise reason out of a `-eval` expression renders as `BeamError`'s literal
-  `<structured reason>` instead of the real term.
+  **An uncaught raise out of the boot chain renders as the `Display` placeholder.** `src/cli.rs`'s
+  `Action::Boot` arm is the only one that routes the boot-chain result through `reported_reason`, so on
+  the `-eval`/`-s`/`-run`/`run` routes a structured raise reason leaving the boot chain renders as
+  `beam_rt: exit <structured reason>` instead of the real term. The `-eval` action's own raise is
+  unwrapped too; only the `run` route's own `run_scheduled` raise is rendered (`run_file`), and
+  `tests/cli.rs` covers only that action's own raise.
 * **`beam_bifs` — the registered `io:format/2` `~p`/`~w` printer raises `badarg` on any term carrying a
   fun.** The registered `io:format/2` implementation is `erts_rust/crates/beam_bifs/src/io.rs`, driven by
   `src/format.rs`, and a fun is not renderable there. Raw evidence, the same command on both runtimes:

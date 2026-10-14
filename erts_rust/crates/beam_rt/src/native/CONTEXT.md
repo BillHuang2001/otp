@@ -889,7 +889,7 @@ namespace is key-granular (`init/1`, `start/1`, `stop/0` stay ordinary `.beam` b
 `undefined` because the Erlang socket stack they belong to does not exist. Everything else agrees:
 `node()` (`foo@<host>`), `is_alive()` (`true`), and `whereis(kernel_sup)` / `whereis(application_controller)`
 / `whereis(logger)` are live pids on both; `whereis(timer_server)` is `undefined` on both (OTP starts
-it lazily through `kernel_sup`). `whereis(net_sup)` was `undefined` here before the default boot too.
+it lazily through `kernel_sup`).
 
 ### Recorded gaps and fabricated values
 - **`read_file_info/1,2`, `read_link_info/1,2` and `read_handle_info/1,2` ARE served** (a real

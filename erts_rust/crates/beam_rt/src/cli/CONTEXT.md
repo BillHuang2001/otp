@@ -68,6 +68,8 @@ The command line's `-pa`/`-pz` switches are already in force when the script sta
 That is the same effective order `init`'s `make_path/4` builds (`Pa ++ ScriptPath ++ Pz`, `erts/preloaded/src/init.erl:1418`), so the two runtimes resolve a boot-script module from the added directory alike; `../../tests/boot_code_path.rs` pins it oracle-cross-checked (and pins that the same directory is honoured on the ordinary `-eval` route).
 The resolved script runs **all 22** of its directives to completion — the repo's `bootstrap/bin/start.boot` and the installation's own boot script (`start` resolves to `<Root>/bin/start.boot`) alike — ending at the final `{progress,started}` (directive index 21), so `-boot bootstrap/bin/start` exits **0** with empty stdout and stderr.
 Directive 20's `{apply,{c,erlangrc,[]}}` issues a `{open, …}` of `$HOME/.erlang` that the booted `kernel_sup`'s own `file_server_2` child answers; on every driving route `Runtime::new` consults `RuntimeConfig::drives_a_boot_script()` and spawns the native service **unregistered**, so the booted `kernel_sup` owns `file_server_2`.
+The booted kernel's `user`/`user_drv` prints the OTP slogan (`Erlang/OTP 30 [erts-17.1] [source] [64-bit]`) to **stdout** whenever `-noshell` is absent, so a non-`-noshell` action's stdout carries that line ahead of its own output — exactly as the oracle behaves (`erl -eval 'io:format("hi~n")'` prints the slogan plus an `Eshell` prompt; `erl -noshell -eval …` prints just `hi`).
+A probe or test asserting byte-exact stdout must therefore pass `-noshell`; `-version` is exempt because it prints its own banner and never boots.
 Per-directive detail is in `../boot/CONTEXT.md`.
 
 ## `ERL_*FLAGS` — the environment merge
