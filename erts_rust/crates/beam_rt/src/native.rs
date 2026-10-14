@@ -96,6 +96,7 @@ mod erts_internal;
 pub(crate) mod file_server;
 mod group_leader;
 mod init;
+mod loader;
 pub(crate) mod memory;
 mod net;
 mod node;
@@ -126,10 +127,11 @@ use crate::format;
 /// written next to the `try_native` match arms it mirrors, and
 /// [`tests::every_floor_module_is_a_real_try_native_arm`] pins it against that source so it
 /// cannot silently drift out of the host's dispatch.
-pub(crate) const FLOOR_MODULES: [&str; 11] = [
+pub(crate) const FLOOR_MODULES: [&str; 12] = [
     "application",
     "code",
     "erl_ddll",
+    "erl_prim_loader",
     "erlang",
     "erts_internal",
     "init",
@@ -214,6 +216,23 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
         // `code` is the same shape: the floor answers the *queries* below and the
         // `lib/kernel/src/code.erl` bodies (`start_link/0`, `add_path/1`, `stick_dir/1`, …)
         // delegate to the code server.
+        // `init` is the same shape as `io`/`application`/`code`: the floor answers the
+        // queries below and every other `init:*` is a `lib/kernel/src/init.erl` body
+        // (`code_path_choice/0`, …). Refusing it wholesale routed `code_server`'s
+        // `init:code_path_choice/0` onto the synchronous non-pumping `call_bif` path, where
+        // the body's own `init ! Request` + `receive` folded into the typed `blocked()` gap.
+        "init" => Some(&[
+            ("get_argument", 1),
+            ("get_plain_arguments", 0),
+            ("get_arguments", 0),
+            ("stop", 0),
+            ("stop", 1),
+            ("restart", 0),
+            ("boot", 1),
+            ("get_status", 0),
+            ("script_id", 0),
+            ("fetch_loaded", 0),
+        ]),
         "code" => Some(&[
             ("get_path", 0),
             ("all_loaded", 0),
@@ -432,6 +451,11 @@ impl RuntimeContext<'_> {
             // lives in [`ddll`], which answers `None` for `monitor/2`/`demonitor/1`/
             // `format_error/1` so `beam_bifs`'s real implementations stay reachable.
             ("erl_ddll", _, _) => self.ddll_call(function, arity, args),
+            // The `erl_prim_loader` loader view of the file system (contract A.7) —
+            // [`loader`] — a `FLOOR_MODULES` entry so its preloaded `.beam` client half
+            // is never entered in-machine. One arm; the per-function dispatch lives in
+            // [`loader`], which answers `None` for the archive half of the API.
+            ("erl_prim_loader", _, _) => self.loader_call(function, arity, args),
             _ => None,
         }
     }
@@ -1101,13 +1125,27 @@ mod tests {
                  `floor_shadows` must let it be entered in-machine"
             );
         }
-        // The other ten namespaces stay refused wholesale.
+        // A namespace whose floor arms name single keys stays **key-granular**: every
+        // listed key is refused and an unlisted one is entered in-machine. Every other
+        // namespace stays refused wholesale.
         for module in FLOOR_MODULES {
-            if module != "io" {
-                assert!(
+            match floor_keys(module) {
+                Some(keys) => {
+                    for (function, arity) in keys {
+                        assert!(
+                            floor_shadows(module, function, *arity),
+                            "the floor owns `{module}:{function}/{arity}`"
+                        );
+                    }
+                    assert!(
+                        !floor_shadows(module, "anything", 9),
+                        "`{module}` is key-granular: an unlisted key must be entered in-machine"
+                    );
+                }
+                None => assert!(
                     floor_shadows(module, "anything", 9),
                     "`{module}` is a floor namespace: every key must be refused"
-                );
+                ),
             }
         }
     }
