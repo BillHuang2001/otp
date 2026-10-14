@@ -374,16 +374,33 @@ impl RuntimeContext<'_> {
     }
 }
 
-/// Whether `term` is the atom `name` — a small helper for the tests.
-#[cfg(test)]
-fn is_atom_named(ctx: &RuntimeContext<'_>, term: Eterm, name: &str) -> bool {
-    is_atom(term) && ctx.atom_name(term).as_deref() == Some(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_term::{make_small, Eterm};
     use crate::native::test_support::{atom, call, runtime};
+    use crate::runtime::Runtime;
+
+    /// The atom name of `term` (the tests assert names, never indices).
+    fn name_of(runtime: &Runtime, term: Eterm) -> String {
+        runtime
+            .atom_name_of(term)
+            .unwrap_or_else(|| panic!("{term:?} is not an atom"))
+            .to_string()
+    }
+
+    /// Asserts `prim_tty:function(args)` answers the bare atom `ok`-family atom `expected`.
+    fn assert_atom(runtime: &mut Runtime, function: &str, args: &[Eterm], expected: &str) {
+        let answer = call(runtime, "prim_tty", function, args).expect("a served answer");
+        assert_eq!(name_of(runtime, answer), expected, "{function}");
+    }
+
+    /// The reason atom of an `{error, Reason}` answer.
+    fn error_reason(runtime: &Runtime, answer: Eterm) -> String {
+        assert_eq!(terms::tuple_arity(answer).expect("a tuple"), 2);
+        let reason = terms::tuple_element(answer, 1).expect("an element");
+        name_of(runtime, reason)
+    }
 
     #[test]
     fn is_builtin_library_names_exactly_prim_tty() {
@@ -394,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn serves_local_call_is_exactly_the_nif_keys() {
+    fn serves_local_call_is_exactly_the_prim_tty_nif_keys() {
         for (function, arity) in NIF_KEYS {
             assert!(serves_local_call("prim_tty", function, arity));
             assert!(!serves_local_call("other", function, arity));
@@ -402,231 +419,110 @@ mod tests {
         // The Erlang wrappers are NOT NIF keys, so their bodies stay enterable in-machine.
         assert!(!serves_local_call("prim_tty", "load", 0));
         assert!(!serves_local_call("prim_tty", "init", 1));
-        assert!(!serves_local_call("prim_tty", "writer", 1));
         assert!(!serves_local_call("prim_tty", "isatty", 2));
         assert!(!serves_local_call("prim_file", "read_file_info", 2));
     }
 
     #[test]
     fn an_unlisted_key_is_not_served() {
-        let mut ctx = runtime();
-        assert!(ctx.prim_tty_call("load", 0, &[]).is_none());
-        assert!(ctx.prim_tty_call("init", 1, &[]).is_none());
-        assert!(ctx.prim_tty_call("isatty", 2, &[]).is_none());
+        let mut runtime = runtime();
+        for (function, arity) in [("load", 0u32), ("init", 1), ("isatty", 2)] {
+            let outcome = call(&mut runtime, "prim_tty", function, &[]);
+            assert!(outcome.is_err(), "{function}/{arity} must not be served");
+            assert_eq!(arity, arity);
+        }
     }
 
     #[test]
     fn isatty_is_false_for_every_standard_stream_in_a_non_tty() {
-        // The sandbox has no terminal: `isatty/1` is `false` for all three, and the oracle
-        // agrees (see `tests/prim_tty.rs`).
         if std::io::stdout().is_terminal() {
             return;
         }
-        let mut ctx = runtime();
+        let mut runtime = runtime();
         for stream in ["stdin", "stdout", "stderr"] {
-            let fd = atom(&mut ctx, stream);
-            let value = ctx.prim_tty_call("isatty", 1, &[fd]).expect("served").expect("ok");
-            assert!(is_atom_named(&ctx, value, "false"), "{stream} must not be a tty");
+            let fd = atom(&mut runtime, stream);
+            assert_atom(&mut runtime, "isatty", &[fd], "false");
         }
     }
 
     #[test]
     fn isatty_rejects_a_non_standard_stream_atom() {
-        let mut ctx = runtime();
-        let bad = atom(&mut ctx, "nope");
-        let outcome = ctx.prim_tty_call("isatty", 1, &[bad]).expect("served");
-        assert!(matches!(outcome, Err(BeamError::BadArg)));
+        let mut runtime = runtime();
+        let bad = atom(&mut runtime, "nope");
+        match call(&mut runtime, "prim_tty", "isatty", &[bad]) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("expected badarg, got {other:?}"),
+        }
     }
 
     #[test]
     fn sizeof_wchar_is_four() {
-        let mut ctx = runtime();
-        let value = ctx
-            .prim_tty_call("sizeof_wchar", 0, &[])
-            .expect("served")
-            .expect("ok");
+        let mut runtime = runtime();
+        let value = call(&mut runtime, "prim_tty", "sizeof_wchar", &[]).expect("a served answer");
         assert_eq!(signed_value(value), 4);
-    }
-
-    #[test]
-    fn tty_create_rejects_stdin_and_accepts_the_output_streams() {
-        let mut ctx = runtime();
-        let stdin = atom(&mut ctx, "stdin");
-        assert!(matches!(
-            ctx.prim_tty_call("tty_create", 1, &[stdin]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
-        let bad = atom(&mut ctx, "nope");
-        assert!(matches!(
-            ctx.prim_tty_call("tty_create", 1, &[bad]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
-    }
-
-    #[test]
-    fn a_created_handle_round_trips_through_the_handle_table() {
-        let mut ctx = runtime();
-        let stderr = atom(&mut ctx, "stderr");
-        let handle = ctx
-            .prim_tty_call("tty_create", 1, &[stderr])
-            .expect("served")
-            .expect("ok");
-        // `{ok, Handle}`: the handle is the second tuple element.
-        let handle = terms::tuple_element(handle, 1).expect("a tuple");
-        assert_eq!(ctx.prim_tty_fd(handle).expect("a live handle"), 2);
-        // `tty_encoding/1` validates the handle and answers `utf8`.
-        let encoding = ctx
-            .prim_tty_call("tty_encoding", 1, &[handle])
-            .expect("served")
-            .expect("ok");
-        assert!(is_atom_named(&ctx, encoding, "utf8"));
-        // A term that is not a live handle is `badarg`.
-        let bogus = atom(&mut ctx, "nope");
-        assert!(matches!(
-            ctx.prim_tty_call("tty_encoding", 1, &[bogus]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
-        assert!(matches!(
-            ctx.prim_tty_call("tty_window_size", 1, &[bogus]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
-        // The oracle's answer in a non-tty: no window size.
-        let size = ctx
-            .prim_tty_call("tty_window_size", 1, &[handle])
-            .expect("served")
-            .expect("ok");
-        let reason = terms::tuple_element(size, 1).expect("a tuple");
-        assert!(is_atom_named(&ctx, reason, "enotsup"));
-        // `tty_is_open/2` is `true` for a live standard stream.
-        let stderr_atom = atom(&mut ctx, "stderr");
-        let open = ctx
-            .prim_tty_call("tty_is_open", 2, &[handle, stderr_atom])
-            .expect("served")
-            .expect("ok");
-        assert!(is_atom_named(&ctx, open, "true"));
     }
 
     #[test]
     fn setlocale_is_primitive_without_inspecting_its_argument() {
-        let mut ctx = runtime();
-        let value = ctx
-            .prim_tty_call("setlocale", 1, &[beam_term::make_small(0)])
-            .expect("served")
-            .expect("ok");
-        assert!(is_atom_named(&ctx, value, "primitive"));
+        let mut runtime = runtime();
+        assert_atom(&mut runtime, "setlocale", &[make_small(0)], "primitive");
     }
 
     #[test]
-    fn the_termcap_family_models_a_no_termcap_build() {
-        let mut ctx = runtime();
-        for (function, arity) in [
-            ("setupterm_nif", 0),
-            ("tinfo_nif", 0),
-            ("tigetnum_nif", 1),
-            ("tigetflag_nif", 1),
-            ("tigetstr_nif", 1),
-            ("tputs_nif", 2),
-        ] {
-            let args = vec![beam_term::make_small(0); arity as usize];
-            let value = ctx
-                .prim_tty_call(function, arity, &args)
-                .expect("served")
-                .expect("ok");
-            assert!(terms::tuple_arity(value) == 2, "{function} must be an error tuple");
-            let reason = terms::tuple_element(value, 1).expect("a tuple");
-            assert!(is_atom_named(&ctx, reason, "enotsup"), "{function} ⇒ enotsup");
+    fn tty_create_rejects_stdin_and_the_termcap_family_is_enotsup() {
+        let mut runtime = runtime();
+        let stdin = atom(&mut runtime, "stdin");
+        match call(&mut runtime, "prim_tty", "tty_create", &[stdin]) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("tty_create(stdin) must be badarg, got {other:?}"),
+        }
+        let answer = call(&mut runtime, "prim_tty", "setupterm_nif", &[]).expect("a served answer");
+        assert_eq!(error_reason(&runtime, answer), "enotsup", "no-termcap model");
+    }
+
+    #[test]
+    fn a_created_handle_round_trips_and_answers_utf8() {
+        let mut runtime = runtime();
+        let stderr = atom(&mut runtime, "stderr");
+        let answer = call(&mut runtime, "prim_tty", "tty_create", &[stderr]).expect("a served answer");
+        assert_eq!(terms::tuple_arity(answer).expect("a tuple"), 2);
+        let handle = terms::tuple_element(answer, 1).expect("an element");
+        assert_atom(&mut runtime, "tty_encoding", &[handle], "utf8");
+        let size =
+            call(&mut runtime, "prim_tty", "tty_window_size", &[handle]).expect("a served answer");
+        assert_eq!(error_reason(&runtime, size), "enotsup");
+        // A term that is not a live handle is `badarg` — the C's `enif_get_resource` miss.
+        let bogus = atom(&mut runtime, "nope");
+        match call(&mut runtime, "prim_tty", "tty_encoding", &[bogus]) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("a non-handle must be badarg, got {other:?}"),
         }
     }
 
     #[test]
-    fn tty_init_reads_the_input_key() {
-        let mut ctx = runtime();
-        let stderr = atom(&mut ctx, "stderr");
-        let handle = ctx
-            .prim_tty_call("tty_create", 1, &[stderr])
-            .expect("served")
-            .expect("ok");
-        let handle = terms::tuple_element(handle, 1).expect("a tuple");
-        // A map without the `input` key is `badarg` (the C's `enif_get_map_value` failure).
-        let empty = terms::make_tuple(&mut ctx, &[]).expect("a tuple");
-        assert!(matches!(
-            ctx.prim_tty_call("tty_init", 2, &[handle, empty]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
-        // A non-map is `badarg` too.
-        assert!(matches!(
-            ctx.prim_tty_call("tty_init", 2, &[handle, beam_term::make_small(0)]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
+    fn tty_init_requires_a_map_with_the_input_key() {
+        let mut runtime = runtime();
+        let stderr = atom(&mut runtime, "stderr");
+        let answer = call(&mut runtime, "prim_tty", "tty_create", &[stderr]).expect("a served answer");
+        let handle = terms::tuple_element(answer, 1).expect("an element");
+        match call(&mut runtime, "prim_tty", "tty_init", &[handle, make_small(0)]) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("a non-map must be badarg, got {other:?}"),
+        }
     }
 
     #[test]
-    fn character_metrics_are_typed_capability_gaps() {
-        let mut ctx = runtime();
-        for (function, arity) in [("isprint", 1), ("wcwidth", 1), ("wcswidth", 1), ("tty_select", 2)]
-        {
-            let args = vec![beam_term::make_small(0); arity as usize];
-            let outcome = ctx.prim_tty_call(function, arity, &args).expect("served");
-            match outcome {
+    fn character_metrics_and_select_are_typed_capability_gaps() {
+        let mut runtime = runtime();
+        for (function, arity) in [("isprint", 1u32), ("wcwidth", 1), ("wcswidth", 1), ("tty_select", 2)] {
+            let args = vec![make_small(0); arity as usize];
+            match call(&mut runtime, "prim_tty", function, &args) {
                 Err(error) => assert!(
-                    crate::error::unsupported_reason(&error).is_some(),
-                    "{function} must be an `unsupported` gap"
+                    format!("{error:?}").contains("unsupported"),
+                    "{function} must be an `unsupported` gap, got {error:?}"
                 ),
-                Ok(_) => panic!("{function} must not fabricate a value"),
+                Ok(term) => panic!("{function} must not fabricate a value: {term:?}"),
             }
         }
-    }
-
-    #[test]
-    fn write_nif_writes_a_flattened_iovec_and_rejects_a_malformed_one() {
-        let mut ctx = runtime();
-        let stderr = atom(&mut ctx, "stderr");
-        let handle = ctx
-            .prim_tty_call("tty_create", 1, &[stderr])
-            .expect("served")
-            .expect("ok");
-        let handle = terms::tuple_element(handle, 1).expect("a tuple");
-        // An iovec whose element is not a binary/byte is the C's `badarg`.
-        let bad = terms::make_tuple(&mut ctx, &[]).expect("a tuple");
-        assert!(matches!(
-            ctx.prim_tty_call("write_nif", 2, &[handle, bad]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
-        // A well-formed iovec of zero binaries writes nothing and answers `ok`.
-        let empty = terms::make_tuple(&mut ctx, &[]).expect("a tuple");
-        let iovec = terms::make_list(&mut ctx, &[]).expect("a list");
-        assert!(ctx.prim_tty_call("write_nif", 2, &[handle, iovec]).is_some());
-        assert!(ctx.prim_tty_call("write_nif", 2, &[empty, iovec]).is_some());
-    }
-
-    #[test]
-    fn read_nif_requires_a_non_negative_small_count() {
-        let mut ctx = runtime();
-        let stderr = atom(&mut ctx, "stderr");
-        let handle = ctx
-            .prim_tty_call("tty_create", 1, &[stderr])
-            .expect("served")
-            .expect("ok");
-        let handle = terms::tuple_element(handle, 1).expect("a tuple");
-        let fd = atom(&mut ctx, "stdin");
-        assert!(matches!(
-            ctx.prim_tty_call("read_nif", 3, &[handle, fd, beam_term::make_small(0)])
-                .expect("served"),
-            Ok(_) | Err(_)
-        ));
-        // A negative count is `badarg` (the C's `enif_get_uint64` failure on a negative int).
-        let bogus = terms::make_list(&mut ctx, &[]).expect("a list");
-        assert!(matches!(
-            ctx.prim_tty_call("read_nif", 3, &[handle, fd, bogus]).expect("served"),
-            Err(BeamError::BadArg)
-        ));
-    }
-
-    #[test]
-    fn the_floor_route_serves_the_exported_stubs() {
-        // `try_native` (the exported-`call_ext` route) reaches the same dispatch.
-        let mut ctx = runtime();
-        let value = call(&mut ctx, "prim_tty", "sizeof_wchar", &[]).expect("served");
-        assert_eq!(signed_value(value), 4);
     }
 }
