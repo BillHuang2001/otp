@@ -671,119 +671,59 @@ runtime that wants novel atoms to be free too should hold a single stable instan
   integral-`f64`→bignum conversion (`double_to_big`) is a private single definition there.
 
 ## Test Strategy
-- Per-module `#[cfg(test)] mod tests` unit tests.
-- `tests/layout.rs` — **pins the exact raw bit patterns** against `erl_term.h` (e.g. `make_small(0)
-  == 0xF`, `make_atom(0) == 0xB`, `NIL == 0x3B`, `make_arityval(1) == 0x40`, order-`List` cons tag
-  `0x1`), plus boundary sweeps: small-int min/max/±1/0, `arityval` at `MAX_ARITYVAL`, literal-bit
-  masking via `boxed_val`/`list_val`. Prefer property-style loops over boundary ranges.
-- `tests/abi.rs` — `size_of::<Eterm>() == size_of::<usize>()`, `align_of` equal, `Eterm: Copy`, and a
-  `repr(transparent)` assertion (round-trip `Eterm`) — the NIF-ABI guarantee.
-- `tests/atom_witness.rs` — the O(1) witness evidence, three properties in order: a per-thread-armed
-  counting `#[global_allocator]` proves `snapshot`/`appended_since` allocate **nothing** (deterministic,
-  host-load independent); a **length-independence** timing bound (4 vs 200 000 atoms, wide margin) is the
-  tripwire for an accidental O(table) scan — the `prefix_matches` shape the API replaces; and the
-  soundness cases (a clone that diverges, a clone that does not, an independently built table with
-  identical names, a shrunken table) run at 50 000 atoms. `examples/atom_witness.rs` prints the ns/op
-  table (`snapshot` / `generation` / `appended_since` hit+miss vs `AtomTable::clone`) with
-  `/proc/loadavg`.
-- `tests/non_term.rs` — the crate-wide **non-term policy** suite: a word that is not a term (the ABI's
-  `THE_NON_VALUE`, a bare `HEADER`-tagged word) must never crash or be dereferenced by any safe public
-  entry point — each returns a typed error or a defined ordering (the Constraints' "a word that is not
-  a term is never dereferenced" rule). Public API only; skips nothing.
-- Behavioural tests: atom interning/lookup/name round-trip + `atom.names` parser on an embedded
-  snippet (order + `CName='printname'` + quoted names), heap cons/tuple construction + car/cdr +
-  exhaustion, literal-graph tagging walk (`set_literal_tag` on a nested tuple/list).
-- `src/hashing/` carries its own in-module `#[cfg(test)]` suite (the structural-hash suite + the
-  `make_hash2`/`make_hash` oracle-vector suites + `common`'s `block_hash` pin).
-- `tests/compare_terms.rs` — the term-ordering suite (relocated out of `src/compare.rs` to keep that
-  file under the size guideline; public-API only): ordering across every class pair (number < atom <
-  ref < port < pid < tuple < record < map < nil < list < binary), atom name ordering, tuple/list
-  elementwise + size tie-break, numeric int/float ordering. Prefer property-style boundary loops.
-- `tests/compare_external.rs` — the external-thing / record comparison suite: a copy is `=:=` its
-  original for external pid/port/ref and native records; the field-order rules (pid `serial → number →
-  node`, port `node → number`, ref node-then-ids, record `module → name → is_exported → keys →
-  values`); antisymmetry; malformed-record no-panic; plus a **live-`erl` oracle cross-check** that
-  decodes hand-written ETF (`NEW_PID_EXT`/`V4_PORT_EXT`/`NEWER_REFERENCE_EXT`) with `binary_to_term/1`
-  and builds records with `records:create/4` (23 pairs / 69 boolean answers). Skips loudly when `erl`
-  is absent.
-- `tests/size_bounded.rs` — the bounded-sizing suite: a genuine cyclic cons (`L = [1|L]`), cycles
-  through cons/tuple/local-fun/HAMT head-bitmap nodes, a cycle behind a long prefix (cyclic beats
-  over-limit), budget inclusivity, non-terms (`THE_NON_VALUE`, `HEADER_FLONUM`, forged HEADER-tagged
-  words) ⇒ `Ok(0)`, a 100 000-element list (no stack overflow), flat and 33-key HAMT maps sized
-  exactly, and shared-subterm per-occurrence counting.
-- `src/layout.rs` carries its own `#[cfg(test)]` suite: `object_words` for every boxed shape (incl.
-  the three `ErlSubBits` cases) and the sizing/copy child-slot enumeration per shape, plus a
-  `sum(object_words over the graph) == size_object` cross-check demanding the two halves agree.
-- `src/compare/numbers.rs` carries its own `#[cfg(test)]` suite for the exact mixed numeric compare:
-  the `2^53` asymmetry both orders, the lossless boundary, bignum↔float both signs and by arity, the
-  exact-`double_to_big` path, NaN/±inf, and an antisymmetry sweep.
-- `src/thing.rs` carries its own `#[cfg(test)]` suite pinning each block's raw words against the
-  legacy headers (float `[HEADER_FLONUM, bits]`; bignum header arity `n`, the digit count, + LS-first
-  `u64` digits and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
-  the 3-word empty block; the external pid/port/ref head + data words), plus write→read round-trips
-  and boundaries (min/max `MAX_REF_IDS`, single-digit bignum, empty flatmap, negative bignum).
-- `src/bitstring.rs` carries its own suite: `bit_count_to_bytes`/`heap_bits_size_words` boundary
-  values (0/1/8/9/64/65/512/513 …), the `ErlHeapBits` header/word pin, non-byte-aligned sizes
-  `1..=64` round-tripped bit-by-bit (MSB-first, trailing bits zeroed), the too-short byte count
-  (`TermError::BadBitstring`), the `ErlSubBits` word pin + flag masking, and the float readers.
-- `src/refc.rs` carries its own suite: the size/limit constants + `HEADER_BIN_REF`/`HEADER_SUB_BITS`
-  raw words (`0xA8`/`0x124`), the `BinRef` word pin, the pinned 8-word combined pair
-  (`[BinRef][ErlSubBits]`, root at `hp + 3`), windowed `refc_offset`/`refc_size`/`refc_bytes`, and
-  `is_refc_binary` rejecting on-heap bitstrings, non-bin-ref sub-bitstrings, immediates and tuples.
-- `src/record.rs` carries its own suite pinning the raw record words (instance header `make_record_header(n+1)`,
-  definition `[0] == make_arityval(5+n)`, the module/name/is_exported words, keys sorted by `atom_val`,
-  values in sorted order) and the `field_order` index math (a declaration-order ≠ atom-order case,
-  `n == 0` empty record, `n` 1..3), plus every reader round-trip, `record_get` hit/miss,
-  `record_is_native`, duplicate/non-atom-key rejection and rejection of a tuple/immediate/map/definition.
-- `src/number.rs` carries its own suite for `big_to_f64`/`number_as_f64`: exact values with hand-computed
-  doubles (`2^60`, `2^64`, `2^100`, `-(2^70)`), the mantissa boundary and ties-to-even (`2^53+1 → 2^53`,
-  `2^53+3 → 2^53+4`), a case where the removed digit-by-digit accumulator was one ULP out, and the
-  `bitlen` 1024/1025 finite/overflow boundaries (cross-checked against the system `erl` `float/1`).
-- `tests/oracle.rs` — the crate-local **oracle cross-check**: spawns the system `erl`
-  (`-noshell -eval`, text protocol — no ETF re-implementation, since dev-depending on `beam_codec`
-  would cycle) and checks that `beam_term`'s map/bitstring *observables* agree with the real
-  runtime: `map_size`/`map_get`/`map_pairs` vs `maps:size`/`maps:get`/`lists:sort(maps:keys/1)`
-  across the flat/hash boundary (31/32/33/40/100 keys) and for atom-keyed maps, and
-  `bitstring_parts`/`bit_at` vs `bit_size`/per-bit/byte views for `<<1:3>>`-style bitstrings and
-  binaries, and bignum *observables* (`eq`/`cmp`/`cmp_arith`/`size_object` on multi-limb
-  `write_big` terms) vs the oracle's `=:=`/`<`/`>` and `erts_debug:flat_size/1` across the 2- and
-  3-limb boundary, and the flat-map **stored key order** (`cmp_flatmap_keys` /
-  `map_pairs_storage_order`: binary keys byte-lexicographically, atom keys by atom-table *index*)
-  vs the oracle's `maps:to_list/1`. Skips loudly (never fails) when `erl` is absent/does not answer.
-- `tests/number_oracle.rs` — the crate-local live-`erl` cross-check of `number::big_to_f64`/
-  `number_as_f64`: it materializes a large corpus of bignums (`write_big` limbs) both as `beam_term`
-  terms and as Erlang integer literals, has the oracle convert each with `float/1`, and compares the
-  resulting IEEE-754 bit patterns (text protocol: raw 64-bit bits, or the atom `overflow` when
-  `float/1` refuses). Corpus = a systematic bit-length sweep `1..=1100` (top-bit / all-ones /
-  pseudo-random, both signs) + randomised multi-limb values + curated rounding-boundary vectors;
-  `ERL_TIMEOUT = 60s`; skips loudly when `erl` is absent. The bignum *observables* (equality/order/
-  `flat_size`) are cross-checked separately in `tests/oracle.rs`.
-- `tests/compare_oracle.rs` — the live-`erl` cross-check of `cmp_arith`/`eq`: the same terms are
-  materialized in Rust and as Erlang literals, and the Rust ordering agrees with `==`/`=:=`/`<`/`>`
-  over a corpus spanning the `>2^53` asymmetry, small/bignum × float (both orders) and the special
-  values. Skips loudly when `erl` is absent.
-- `tests/map_hash.rs` — the crate-local oracle cross-check for the **HAMT pair-storage order**:
-  it pins two verified literal vectors (60 small-int keys `#{K => K*2}`; 40 binary keys
-  `#{<<N>> => N}`) as expected lists, and compares `map_pairs_storage_order` against
-  `maps:to_list/1` under the system `erl` for 33/40/50/64/100-key maps mixing small-integer,
-  binary and atom keys (atom keys are index-parity-safe because the `AtomTable` is seeded from the
-  runtime's own `atom.names`, the source ERTS initializes its atom table from), plus a flat-map
-  observation. Skips loudly when `erl` is absent.
-- `tests/internal_ref.rs` — the **M1 internal-reference layout** suite (public API only): the four words
-  `write_internal_ref` emits are pinned literally against
-  `[make_header(3, REF_SUBTAG), make_small(0), make_small(0), make_small(id)]` (plus the raw `0xD0`
-  header), so a drift in this crate — or in the byte-identical `beam_process`/`beam_bifs`/`beam_rt`
-  producers it must match — is caught here rather than by a cross-crate dependency (this crate is a
-  dependency sink and must not gain one); the writer→accessor round-trip over the id range (0 … 255 …
-  `MAX_SMALL`); the typed errors (an id that does not fit a small `⇒ SmallIntOutOfRange`; the accessor on
-  a non-term / an immediate / a tuple / a **C-layout arity-2 block** / a non-small id word `⇒ BadRef`);
-  that the block sizes as the frozen four words (`size_object`); and the ordering contract — two
-  references with the same id are `=:=` (`Ref =:= binary_to_term(term_to_binary(Ref))`) while
-  different ids are ordered, never equal.
-- Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
-  compatibility gate); `tests/oracle.rs` is the crate-local map/bitstring/bignum smoke slice and
-  `tests/map_hash.rs` the map-storage-order slice.
-- Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
+- Per-module `#[cfg(test)] mod tests` unit tests. Every `src/*.rs` suite pins that thing's **raw words**
+  (the bitstring/refc/thing/record/map/fun/number layouts described under API Surface, incl. the literal
+  constants `HEADER_BIN_REF = 0xA8` / `HEADER_SUB_BITS = 0x124`, the 8-word `[BinRef][ErlSubBits]` pair
+  rooted at `hp + 3`, and the `MAX_REF_IDS` / single-digit / empty-flatmap / negative-bignum boundaries),
+  plus write→read round-trips and the typed rejections. `src/layout.rs` adds a
+  `sum(object_words over the graph) == size_object` cross-check demanding the two halves agree;
+  `src/compare/numbers.rs` covers the exact mixed numeric compare (both `2^53` orders, the lossless
+  boundary, bignum↔float by sign and arity, `double_to_big`, NaN/±inf, antisymmetry); `src/number.rs`
+  pins hand-computed doubles (`2^60`, `2^64`, `2^100`, `-(2^70)`), ties-to-even, and the `bitlen`
+  1024/1025 finite/overflow boundary; `src/hashing/` carries the structural-hash suite + the
+  `make_hash2`/`make_hash` oracle vector suites + `common`'s `block_hash` pin.
+- Bit-pattern / ABI / policy pins: `tests/layout.rs` (exact raw patterns vs `erl_term.h` — `make_small(0)
+  == 0xF`, `make_atom(0) == 0xB`, `NIL == 0x3B`, `make_arityval(1) == 0x40`, cons tag `0x1` — plus boundary
+  sweeps over small-int min/max/±1/0, `arityval` at `MAX_ARITYVAL` and literal-bit masking);
+  `tests/abi.rs` (`size_of`/`align_of` equal to `usize`, `Eterm: Copy`, `repr(transparent)`);
+  `tests/non_term.rs` (the crate-wide **non-term policy**: a word that is not a term must never crash or be
+  dereferenced by any safe entry point — each returns a typed error or a defined ordering; public API only,
+  skips nothing); `tests/atom_witness.rs` (the O(1) witness: a per-thread-armed counting `#[global_allocator]`
+  proves `snapshot`/`appended_since` allocate **nothing** — deterministic, host-load independent; a
+  length-independence timing bound, 4 vs 200 000 atoms, is the tripwire for an accidental O(table) scan; the
+  clone-divergence / non-diverging-clone / independently-built-identical-table / shrunken-table soundness
+  cases run at 50 000 atoms). Behavioural tests cover atom interning/lookup + the `atom.names` parser on an
+  embedded snippet, heap cons/tuple construction + car/cdr + exhaustion, and the literal-tagging walk.
+- `tests/compare_terms.rs` / `tests/compare_external.rs` — term ordering across every class pair
+  (number < atom < ref < port < pid < tuple < record < map < nil < list < binary) and the external-thing /
+  record arms (a copy is `=:=` its original; pid `serial → number → node`, port `node → number`, ref
+  node-then-ids, record `module → name → is_exported → keys → values`; antisymmetry; malformed-record
+  no-panic), the latter with a live-`erl` cross-check (23 pairs / 69 boolean answers).
+- `tests/size_bounded.rs` — cycles through cons/tuple/local-fun/HAMT head-bitmap nodes and behind a long
+  prefix (cyclic beats over-limit), budget inclusivity, non-terms ⇒ `Ok(0)`, a 100 000-element list (no
+  stack overflow), exact flat/HAMT map sizes, and per-occurrence counting of a shared subterm.
+- `tests/internal_ref.rs` — the **M1 internal-reference layout** pinned **literally**
+  (`[make_header(3, REF_SUBTAG), make_small(0), make_small(0), make_small(id)]`, raw header `0xD0`), so a
+  drift in this crate *or* in the byte-identical `beam_process`/`beam_bifs`/`beam_rt` producers is caught
+  here rather than by a cross-crate dependency (this crate is a dependency sink and must not gain one);
+  plus the writer→accessor round-trip over id 0…255…`MAX_SMALL`, the typed errors (`SmallIntOutOfRange`; a
+  `BadRef` accessor on a non-term / immediate / tuple / **C-layout arity-2 block** / non-small id word), the
+  frozen 4-word size, and `=:=`/ordering of equal-id vs different-id references.
+- Live-`erl` oracle cross-checks — all **skip loudly, never fail**, when `erl` is absent, and use a text
+  protocol because a dev-dependency on `beam_codec` would cycle: `tests/oracle.rs` (map
+  `size`/`get`/`pairs` vs `maps:size`/`maps:get`/`lists:sort(maps:keys/1)` across the flat/hash boundary
+  31/32/33/40/100 keys and for atom keys; `bitstring_parts`/`bit_at` vs `bit_size`/per-bit/byte views;
+  bignum `eq`/`cmp`/`cmp_arith`/`size_object` vs `=:=`/`<`/`>`/`erts_debug:flat_size/1` across the 2-/3-limb
+  boundary; flat-map stored key order vs `maps:to_list/1`); `tests/map_hash.rs` (the HAMT pair-storage order:
+  two offline-pinned literal vectors — 60 small-int keys `#{K => K*2}`, 40 binary keys `#{<<N>> => N}` —
+  plus 33/40/50/64/100-key maps mixing small-int/binary/atom keys; atom keys are index-parity-safe because
+  the table is seeded from `atom.names`); `tests/number_oracle.rs` (`big_to_f64` vs `float/1` compared as
+  IEEE-754 bits, or the atom `overflow`, over a bit-length sweep `1..=1100` + randomised limbs + curated
+  rounding boundaries; `ERL_TIMEOUT = 60s`); `tests/compare_oracle.rs` (`cmp_arith`/`eq` vs `==`/`=:=`/`<`/`>`
+  across the `>2^53` asymmetry, small/bignum × float both orders, and the special values). The bignum
+  observables are cross-checked in `tests/oracle.rs`.
+- Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the compatibility
+  gate). Iteration (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
   `../../scripts/cargo.sh build -p beam_term`. Never `cd`.
 
 ## Routing Table
