@@ -25,13 +25,18 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   only the slots an FR write actually touched (exact after the ordinary interpret seams; a native JIT block
   or a caller that took a raw `fr_mut`/`with_roots` slice sets the crate-internal `regs_escaped` flag and may
   understate it — the caller must account for that itself); `Machine::reset` clears the raise snapshot
-  alongside the module contexts (both belong to the run that is starting) **and clears both failed-clause
-  latches** (`pending_function_clause_args`/`raise_function_clause_args`).
-- `mod.rs` — the two failed-clause latches: `pending_function_clause_args: Option<Eterm>` (one-shot — armed by
-  the raise site, consumed by the `throw_with_trace` that lands it, so a propelling `Err` cannot leave a stale
-  list for a later trace) and `raise_function_clause_args: Option<Eterm>` (the **live raise** state, set on
-  every `throw_with_trace` and consumed exactly once by the two cooked-trace builders). Both are machine-held
-  heap terms outside the frozen root set, rooted by a collecting host the way the pending exception is.
+  alongside the module contexts (both belong to the run that is starting) **and clears all four raise
+  latches** (`pending_function_clause_args`/`raise_function_clause_args`/`pending_supplied_trace`/
+  `raise_supplied_trace`).
+- `mod.rs` — the four raise latches, all machine-held values outside the frozen root set (a collecting host
+  roots the heap-term ones the way it roots the pending exception). The failed-clause pair:
+  `pending_function_clause_args: Option<Eterm>` (one-shot — armed by the raise site, consumed by the
+  `throw_with_trace` that lands it, so a propelling `Err` cannot leave a stale list for a later trace) and
+  `raise_function_clause_args: Option<Eterm>` (the **live raise** state, set on every `throw_with_trace` and
+  consumed exactly once by the two cooked-trace builders). The explicitly-supplied-trace pair:
+  `pending_supplied_trace: Option<StackTrace>` (one-shot, armed only when an incoming `BeamError::Raise`
+  carries **non-empty** symbolic frames — the `erlang:raise/3` trace-list shape) and
+  `raise_supplied_trace: Option<StackTrace>` (the live state for the raise being landed).
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
   caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).
