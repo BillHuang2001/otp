@@ -135,18 +135,25 @@
 //!   `Channel`/`Node`/`Serial` always `0` in Milestone-1 (the frozen
 //!   `[header, node, serial, id]` thing of [`crate::access::make_ref_thing`]), so
 //!   only `Id` varies. The oracle's numbers are the same shape.
-//! * External pids/ports/refs, funs and records are outside the Milestone-1 term
-//!   set and are rejected with `BeamError::BadArg` rather than guessed — never a
-//!   *silently wrong* result.
+//! * **Internal ports** render as `#Port<0.N>` (see [`format_port`]), the oracle's
+//!   `#Port<Channel.Num>` with the local node's channel `0`. An **external** port —
+//!   and an external pid/ref, a fun or a record — is outside the Milestone-1
+//!   printable set: the first three carry a *node* whose dist channel/identity no
+//!   byte-faithful text can be derived from, and a fun's module/name is not in a
+//!   `make_fun3` descriptor. Each is rejected with a typed error (an external port
+//!   with `BeamError::UnsupportedBif`, the rest with `BeamError::BadArg`) rather
+//!   than guessed — never a *silently wrong* result.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
-use beam_term::{atom_val, pid_number, pid_serial, signed_value, AtomTable, Eterm};
+use beam_term::{
+    atom_val, pid_number, pid_serial, port_number, signed_value, AtomTable, Eterm,
+};
 
 use crate::access::{
     bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
-    is_float, is_function, is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small,
-    is_tuple, ref_thing_id, tuple_element, tuple_size,
+    is_float, is_function, is_internal_pid, is_internal_port, is_internal_ref, is_list, is_map,
+    is_nil, is_port, is_small, is_tuple, ref_thing_id, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -186,12 +193,14 @@ pub(crate) enum MapOrder {
 ///   order, the `undefined` order);
 /// * [`MapOrder::Ordered`] — ascending **term** order (`map_pairs`);
 /// * [`MapOrder::Reversed`] — descending term order (`map_pairs` reversed);
-/// * [`MapOrder::Explicit`] — a `~K` order term: the atoms `ordered`/`reversed`/
-///   `undefined` select as above, a **2-arity fun** is the typed
-///   [`unsupported_bif`] (the printer has no `FunCaller` seam to invoke it, and a
-///   fabricated order would be a wrong result), and anything else (any other
-///   atom, a non-atom, or a fun of another arity) is `badarg`, as the oracle's
-///   `maps:iterator/2` argument check.
+/// * [`MapOrder::Explicit`] — a `~K` order term: the atoms `ordered`/`reversed`
+///   select as above, **any other atom** (`undefined`, but also `{}`, `bogus`, …)
+///   selects [`MapOrder::Storage`] because the oracle's `maps:iterator/2` ignores
+///   every atom other than those two and falls back to the default iterator, a
+///   **2-arity fun** is the typed [`unsupported_bif`] (the printer has no
+///   `FunCaller` seam to invoke it, and a fabricated order would be a wrong
+///   result), and a non-atom order term (or a fun of another arity) is `badarg`,
+///   as the oracle's `maps:iterator/2` argument check.
 ///
 /// # Errors
 ///
@@ -226,8 +235,13 @@ pub(crate) fn resolve_map_pairs(
             let resolved = match atoms.name(atom_val(order_term)).ok_or_else(badarg)? {
                 "ordered" => MapOrder::Ordered,
                 "reversed" => MapOrder::Reversed,
-                "undefined" => MapOrder::Storage,
-                _ => return Err(badarg()),
+                // `maps:iterator/2` ignores the *value* of any other order atom and
+                // falls back to the default iterator — `maps:iterator(M, undefined)`
+                // is `maps:iterator(M, fun(A,B) -> A =< B end)` — i.e. the storage
+                // order this crate's `MapOrder::Storage` renders. So `undefined`,
+                // `{}`, `bogus` and every other atom select the default, exactly as
+                // the oracle does; only a non-atom order term is `badarg`.
+                _ => MapOrder::Storage,
             };
             resolve_map_pairs(term, resolved, atoms)
         }
@@ -579,9 +593,52 @@ fn render_chunk(
     if is_internal_ref(term) {
         return Ok(Chunk::text(&format_ref(term)?));
     }
+    if is_port(term) {
+        return Ok(Chunk::text(&format_port(term)?));
+    }
+    // A **fun** cannot be rendered byte-faithfully here. The oracle's leaf is
+    // `erlang:fun_to_list/1` (`io_lib:write1/4` → `fun_to_list`, and `io_lib_pretty`
+    // has no fun clause at all), which prints `#Fun<M.F.A>`/`#Fun<M.N.A>` from the
+    // fun's module/name/arity — data a runtime-made `Local` (`make_fun3`) fun's
+    // inlined descriptor does not carry (see `beam_term::fun`), so the printer would
+    // have to fabricate it. It stays the typed `badarg` below (documented in the
+    // module docs), never a guessed `#Fun<…>`.
     Err(badarg())
 }
-/// Renders a list (`[e1,e2]` / `[e1|tail]`), the caller having already handled
+/// The channel number of the local node — the `%T` renderer's `port_channel_no` /
+/// `pid_channel_no` (`../../erts/emulator/beam/erl_printf_term.c:508-530`), which is
+/// `0` for the `nonode@nohost` node Milestone-1 always is. The same constant
+/// `src/port.rs`'s `port_to_list/1` and `src/term_conv.rs`'s `port_text` use for
+/// `#Port<0.Num>` / `<0.Num.Ser>`.
+const LOCAL_CHANNEL_NO: u64 = 0;
+
+/// The `%T` text of a port — `#Port<channel.number>`
+/// (`../../erts/emulator/beam/erl_printf_term.c:521-530`, the leaf
+/// `erlang:port_to_list/1` renders and `io_lib:write1/4` / `io_lib_pretty`'s
+/// `print_length/7` both splice in).
+///
+/// * An **internal** port renders `#Port<0.N>` — the local node's channel number
+///   (0) and the port-table number — byte-identical to the crate's
+///   [`crate::port`]`::port_to_list/1` (`src/port.rs`) and to the oracle, where
+///   `io_lib:format("~p", [hd(erlang:ports())])` is `"#Port<0.0>"`.
+/// * An **external** port is the typed [`unsupported_bif`]: its channel number is
+///   its *node*'s dist channel, runtime state the frozen
+///   `[header, node, next, id]` external-port term does not carry, and the oracle
+///   assigns it per run (decoding the same `PORT_EXT` image naming `a@b` printed
+///   `#Port<10592.7>` in one run and `#Port<10595.7>` in the next). No faithful text
+///   exists, and a guessed channel — e.g. the local `0` — would be a **silently
+///   wrong** result, which this printer never emits.
+///
+/// # Errors
+///
+/// [`BeamError::UnsupportedBif`](beam_common::BeamError) for an external port (see
+/// above); a term that is not a port at all never reaches this function.
+fn format_port(term: Eterm) -> Result<String> {
+    if is_internal_port(term) {
+        return Ok(format!("#Port<{LOCAL_CHANNEL_NO}.{}>", port_number(term)));
+    }
+    Err(unsupported_bif())
+}/// Renders a list (`[e1,e2]` / `[e1|tail]`), the caller having already handled
 /// depth `0`/`1` and the `~p` printable-string rule (`io_lib:write1/4`).
 fn render_list_chunk(
     atoms: &AtomTable,
