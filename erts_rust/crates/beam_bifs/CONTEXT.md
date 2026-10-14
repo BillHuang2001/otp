@@ -644,7 +644,7 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - `src/io.rs` / `src/io_ts.rs` / `src/print.rs` -> the `io`/`io_lib` format engine (the `{chars_limit,N}` limited
   paths, the unicode `~ts` arm); the `~w`/`~p`/`~W`/`~P` leaf renderer with `~k`/`~K`
 - `src/print/pretty.rs` / `src/print/pretty/cind.rs` -> the `io_lib_pretty` port; the `cind/7` family
-- `tests/` -> 81 integration files / 806 tests (lib suite 824); the roster pin is `tests/roster_audit.rs`,
+- `tests/` -> 81 integration files / 810 tests (lib suite 830); the roster pin is `tests/roster_audit.rs`,
   `tests/{registry_hot_path,decode_hot_path}.rs` are the allocation-count pins, `tests/term_to_binary_options.rs`
   and `tests/fun_info_whole_list.rs` are the fail-loud oracle suites for `term_to_binary/2`'s write-side options
   and for `fun_info/1`'s whole list + the seam-backed local-fun items, and `tests/fun_info.rs` is the pinned-golden
