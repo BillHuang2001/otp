@@ -222,14 +222,15 @@ const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "thread_progress",
 ];
 
-/// Keys whose value is **this runtime's own process**, so neither value nor kind is
-/// comparable: the oracle answers the pid of the process *it* has registered (a different
-/// process of a different emulator), while this runtime answers the pid of the process it
-/// has registered — or the atom `undefined` when it has none (the preloaded-only
-/// `-eval`/`run` path; the oracle produces the same alternative shape after
-/// `erlang:system_flag(system_logger, undefined)`). The test therefore only pins that the
-/// oracle accepts the key and that our answer is a pid or the honest `undefined` — never a
-/// fabricated pid and never a wrong shape.
+/// Keys whose value is **this runtime's own state**, so neither value nor kind is
+/// comparable: the oracle answers the pid of the `logger_proxy` process registered in *its*
+/// node (a different process of a different emulator), while this runtime answers the value
+/// of its own `system_logger` flag — the atom `logger` until something runs
+/// `erlang:system_flag(system_logger, _)` (the C's initial value, `erl_trace.c:339`), then
+/// the pid `logger_proxy:init/1` stores (`lib/kernel/src/logger_proxy.erl:117`), then the
+/// atom `undefined` (`:147`). The test therefore only pins that the oracle accepts the key
+/// and that our answer has one of those three shapes — never a fabricated pid and never a
+/// wrong shape.
 const ORACLE_OWN_PID_KEYS: &[&str] = &["system_logger"];
 
 /// Keys the oracle raises `error:badarg` for — this runtime must not invent an answer.
@@ -806,9 +807,10 @@ fn the_oracle_shapes_and_values_match() {
         );
     }
 
-    // -- keys whose value is this runtime's own process ----------------------------
-    // The oracle answers *its* process; we answer ours (a pid) or the honest `undefined`
-    // when no boot script has registered one. Never a fabricated pid.
+    // -- keys whose value is this runtime's own state ------------------------------
+    // The oracle answers the pid of *its* logger proxy; we answer the value of our own
+    // `system_logger` flag — the C's initial atom `logger` (`erl_trace.c:339`) until
+    // `erlang:system_flag(system_logger, _)` sets a pid or `undefined`. Never a fabricated pid.
     for key in ORACLE_OWN_PID_KEYS {
         let oracle = answers
             .get(*key)
@@ -820,9 +822,9 @@ fn the_oracle_shapes_and_values_match() {
         let value =
             system_info_value(key, &rt).unwrap_or_else(|error| panic!("system_info({key}): {error}"));
         match &value {
-            InfoValue::Pid(_) | InfoValue::Atom("undefined") => {}
+            InfoValue::Pid(_) | InfoValue::Atom("undefined") | InfoValue::Atom("logger") => {}
             other => panic!(
-                "system_info({key}) must be a pid or the honest `undefined`, got {other:?}"
+                "system_info({key}) must be the `system_logger` flag (a pid, `logger` or `undefined`), got {other:?}"
             ),
         }
     }

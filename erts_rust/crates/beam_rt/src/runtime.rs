@@ -969,16 +969,19 @@ impl Runtime {
     }
 
     /// The runtime's **sequential-tracing** state (contract A.8) — the per-process trace
-    /// tokens, the serial clock and the system tracer (see [`crate::seq_trace`]).
+    /// tokens, the serial clock, the system tracer and the `system_logger` flag (see
+    /// [`crate::seq_trace`]).
     ///
-    /// Read-only, for the introspection surface: `erlang:seq_trace_info/1` and
-    /// `process_info(Pid, sequential_trace_token)` both answer from it.
+    /// Read-only, for the introspection surface: `erlang:seq_trace_info/1`,
+    /// `process_info(Pid, sequential_trace_token)` and `erlang:system_info(system_logger)`
+    /// all answer from it.
     pub(crate) fn seq_trace(&self) -> &SeqTrace {
         &self.seq_trace
     }
 
     /// The mutable sequential-tracing state — what `erlang:seq_trace/2`,
-    /// `erlang:seq_trace_print/1,2` and `erlang:system_flag(reset_seq_trace, _)` mutate.
+    /// `erlang:seq_trace_print/1,2` and `erlang:system_flag(reset_seq_trace | system_logger,
+    /// _)` mutate.
     pub(crate) fn seq_trace_mut(&mut self) -> &mut SeqTrace {
         &mut self.seq_trace
     }

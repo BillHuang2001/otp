@@ -34,6 +34,10 @@
 //!   the token being cleared exactly as the C's `p->seq_trace_lastcnt` does;
 //! * **the flag bitmask** — [`FLAGS`]/[`flag_bit`]/[`decode_flags`]/[`encode_flags`] mirror
 //!   `seq_trace.erl`'s `?SEQ_TRACE_*` constants and its `decode_flags/1`;
+//! * **the system logger** — [`SystemLogger`], the node-global `system_logger` flag the C
+//!   keeps beside the sequential-tracer state: exchanged by
+//!   `erlang:system_flag(system_logger, _)` (`bif.c:5345-5348`) and reported by
+//!   `erlang:system_info(system_logger)` (`erl_bif_info.c:3560-3561`);
 //! * **the output** — [`RuntimeContext::seq_trace_message`] builds the documented
 //!   `{seq_trace, Label, {print, Serial, From, _, Info}}` message a system tracer receives,
 //!   and [`RuntimeContext::seq_trace_send_message`] its `{send, …}` sibling (the event the
@@ -48,8 +52,9 @@
 //!
 //! All four BIFs `erts/emulator/beam/bif.tab:220-223` declares — `erlang:seq_trace/2`,
 //! `erlang:seq_trace_info/1`, `erlang:seq_trace_print/1` and `erlang:seq_trace_print/2` — plus
-//! the `reset_seq_trace` arm of `erlang:system_flag/2`, which is the call the kernel module's
-//! `seq_trace:reset_trace/0` makes. With the kernel module (whose `set_token/1,2`,
+//! the `reset_seq_trace` and `system_logger` arms of `erlang:system_flag/2`, which are the
+//! calls the kernel module's `seq_trace:reset_trace/0` and `logger_proxy:init/1`
+//! (`lib/kernel/src/logger_proxy.erl:117`) make. With the kernel module (whose `set_token/1,2`,
 //! `get_token/0,1`, `print/1,2` and `reset_trace/0` are plain Erlang this runtime executes)
 //! that covers the whole documented token API, and `process_info(Pid,
 //! sequential_trace_token)` answers the item `seq_trace:get_token/0` is written on.
@@ -205,6 +210,30 @@ struct ProcessTrace {
     lastcnt: u32,
 }
 
+/// The node-global **system logger** — the C's `system_logger` (`erl_trace.c:2479-2491`):
+/// the process the emulator hands logger messages to (`erts_queue_error_logger_message`,
+/// `erl_trace.c:2493-2497`) and the value `erlang:system_info(system_logger)` reports
+/// (`erl_bif_info.c:3560-3561`).
+///
+/// `erl_trace.c:339` initialises the C's atomic to the atom `logger`, and
+/// `erts_set_system_logger` (`erl_trace.c:2485-2491`) accepts exactly three values: the atom
+/// `logger`, the atom `undefined` and an internal pid — anything else is the C's
+/// `THE_NON_VALUE`, which `bif.c:5345-5348` turns into `badarg`. The pid is accepted on
+/// `is_internal_pid` alone (no liveness predicate), so a dead pid is stored just as the C
+/// stores it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SystemLogger {
+    /// The C's initial value, `am_logger` (`erl_trace.c:339`): the atom `logger`.
+    #[default]
+    Logger,
+    /// The atom `undefined` — no system logger, what `logger_proxy` sets as it shuts down
+    /// (`lib/kernel/src/logger_proxy.erl:147`).
+    Undefined,
+    /// An internal pid, as `logger_proxy`'s start-up sets it
+    /// (`erlang:system_flag(system_logger, self())`, `lib/kernel/src/logger_proxy.erl:117`).
+    Pid(ProcessId),
+}
+
 /// This runtime's sequential-trace state (the whole of it, and the type the
 /// [`Runtime`](crate::Runtime) owns).
 ///
@@ -227,6 +256,11 @@ pub struct SeqTrace {
     /// implemented — so a built event message is dropped, which is what the oracle does with
     /// no tracer configured (see the module docs). The field is the seam that flag will use.
     tracer: Option<ProcessId>,
+    /// The node-global **system logger** ([`SystemLogger`]) — the C's `system_logger`
+    /// atomic. Initialised to the C's `am_logger` (`erl_trace.c:339`) and deliberately left
+    /// out of [`SeqTrace::reset`], which is the C's `reset_seq_trace` (it clears the tokens
+    /// and the clock, not the logger).
+    system_logger: SystemLogger,
 }
 
 impl SeqTrace {
@@ -364,6 +398,18 @@ impl SeqTrace {
         std::mem::replace(&mut self.tracer, tracer)
     }
 
+    /// The node-global **system logger** ([`SystemLogger`]) — the C's `system_logger`
+    /// atomic, and the value `erlang:system_info(system_logger)` reports.
+    pub fn system_logger(&self) -> SystemLogger {
+        self.system_logger
+    }
+
+    /// Sets the system logger, returning the **previous** value — the
+    /// `erlang:system_flag(system_logger, Logger)` answer, and the C's
+    /// `erts_set_system_logger` exchange (`erl_trace.c:2485-2491`).
+    pub fn set_system_logger(&mut self, logger: SystemLogger) -> SystemLogger {
+        std::mem::replace(&mut self.system_logger, logger)
+    }
     /// `erlang:system_flag(reset_seq_trace, _)` (`bif.c:5198-5223`): every process's token is
     /// cleared and both counters are zeroed, which is what stops all ongoing sequential
     /// tracing on the node. The system tracer is deliberately left alone (the C does not
@@ -527,15 +573,23 @@ impl RuntimeContext<'_> {
         self.atom("true")
     }
 
-    /// `erlang:system_flag(Flag, Value)` — **only** the `reset_seq_trace` arm of the C's
-    /// `system_flag_2` (`bif.c:5198-5223`), which is the call `seq_trace:reset_trace/0` makes.
+    /// `erlang:system_flag(Flag, Value)` — the `reset_seq_trace` arm of the C's
+    /// `system_flag_2` (`bif.c:5198-5223`), which is the call `seq_trace:reset_trace/0`
+    /// makes, and the `system_logger` arm (`bif.c:5345-5348` →
+    /// `erts_set_system_logger`, `erl_trace.c:2485-2491`), which is the call
+    /// `logger_proxy:init/1` makes (`lib/kernel/src/logger_proxy.erl:117`).
     ///
     /// `reset_seq_trace` clears every process's token and zeroes both counters and answers
-    /// `true` (the C ignores the second argument, so any value is accepted). A `Flag` that is
-    /// not an atom is `badarg`; **every** other atom is the honest typed capability gap —
-    /// `system_flag/2`'s other flags (scheduling, `sequential_tracer`, distribution, …) are
-    /// runtime capabilities this stage does not have, and claiming `badarg` for one would be a
-    /// lie about a real OTP flag.
+    /// `true` (the C ignores the second argument, so any value is accepted).
+    ///
+    /// `system_logger` accepts exactly the C's three values — the atom `logger`, the atom
+    /// `undefined`, and an internal pid — and answers the **previous** value (the atom
+    /// `logger`/`undefined`, or the pid). Anything else is the C's `THE_NON_VALUE`,
+    /// i.e. `badarg` (so `42` and `{a}` are `badarg`, exactly as the oracle answers).
+    /// A `Flag` that is not an atom is `badarg`; **every** other atom is the honest typed
+    /// capability gap — `system_flag/2`'s other flags (scheduling, `sequential_tracer`,
+    /// distribution, …) are runtime capabilities this stage does not have, and claiming
+    /// `badarg` for one would be a lie about a real OTP flag.
     pub(crate) fn system_flag_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let flag = *args.first().ok_or(BeamError::BadArg)?;
         let Some(name) = self.atom_name(flag) else {
@@ -545,11 +599,42 @@ impl RuntimeContext<'_> {
             self.runtime.seq_trace_mut().reset();
             return self.atom("true");
         }
+        if name == "system_logger" {
+            let value = *args.get(1).ok_or(BeamError::BadArg)?;
+            let logger = self.decode_system_logger(value)?;
+            let previous = self.runtime.seq_trace_mut().set_system_logger(logger);
+            return self.encode_system_logger(previous);
+        }
         Err(crate::error::unsupported(&format!(
-            "erlang:system_flag({name}, _) (only `reset_seq_trace` is implemented)"
+            "erlang:system_flag({name}, _) (only `reset_seq_trace` and `system_logger` are implemented)"
         )))
     }
 
+    /// Decodes `erlang:system_flag(system_logger, Value)`'s argument the way the C's
+    /// `erts_set_system_logger` (`erl_trace.c:2485-2491`) does: the atom `logger`, the atom
+    /// `undefined`, or an internal pid. Every other term is the C's `THE_NON_VALUE`, i.e.
+    /// [`BeamError::BadArg`]. Liveness is deliberately **not** checked — the C tests
+    /// `is_internal_pid` alone, so a pid that is no longer alive is still accepted.
+    fn decode_system_logger(&mut self, value: Eterm) -> Result<SystemLogger> {
+        match self.atom_name(value).as_deref() {
+            Some("logger") => Ok(SystemLogger::Logger),
+            Some("undefined") => Ok(SystemLogger::Undefined),
+            _ => ProcessId::from_eterm(value)
+                .map(SystemLogger::Pid)
+                .map_err(|_| BeamError::BadArg),
+        }
+    }
+
+    /// The term `erlang:system_flag(system_logger, _)` answers for `logger` — the previous
+    /// value — and the term `erlang:system_info(system_logger)` reports: the atom
+    /// `logger`/`undefined`, or the pid.
+    fn encode_system_logger(&mut self, logger: SystemLogger) -> Result<Eterm> {
+        match logger {
+            SystemLogger::Logger => self.atom("logger"),
+            SystemLogger::Undefined => self.atom("undefined"),
+            SystemLogger::Pid(pid) => Ok(pid.to_eterm()),
+        }
+    }
     /// The `{Flags, Label, Serial, From, Lastcnt}` tuple of `token` — the shape
     /// `erlang:seq_trace/2` answers for the `sequential_trace_token` component, and the value
     /// `process_info(Pid, sequential_trace_token)` reports (`erl_bif_info.c:2162-2166` copies
@@ -842,5 +927,107 @@ mod tests {
         assert_eq!(state.tracer(), Some(pid(3)));
         assert_eq!(state.set_tracer(None), Some(pid(3)));
         assert_eq!(state.tracer(), None);
+    }
+
+    #[test]
+    fn the_system_logger_is_the_one_node_global_slot() {
+        let mut state = SeqTrace::new();
+        // The C initialises the atomic to `am_logger` (`erl_trace.c:339`).
+        assert_eq!(state.system_logger(), SystemLogger::Logger);
+        // The exchange reports the previous value, like `erts_atomic_xchg_nob`.
+        assert_eq!(
+            state.set_system_logger(SystemLogger::Pid(pid(4))),
+            SystemLogger::Logger
+        );
+        assert_eq!(state.system_logger(), SystemLogger::Pid(pid(4)));
+        assert_eq!(
+            state.set_system_logger(SystemLogger::Undefined),
+            SystemLogger::Pid(pid(4))
+        );
+        // `reset_seq_trace` leaves the logger alone (the C does not touch it either).
+        state.reset();
+        assert_eq!(state.system_logger(), SystemLogger::Undefined);
+    }
+
+    #[test]
+    fn system_flag_system_logger_takes_the_c_three_values_and_answers_the_previous_one() {
+        let mut rt = crate::native::test_support::runtime();
+        let system_logger = crate::native::test_support::atom(&mut rt, "system_logger");
+        let logger = crate::native::test_support::atom(&mut rt, "logger");
+        let undefined = crate::native::test_support::atom(&mut rt, "undefined");
+        let caller = rt.self_pid();
+        let caller_term = caller.to_eterm();
+
+        // `erlang:system_flag(system_logger, Value)` through the floor's own dispatch.
+        fn flag(rt: &mut crate::runtime::Runtime, flag: Eterm, value: Eterm) -> Result<Eterm> {
+            crate::native::test_support::call(rt, "erlang", "system_flag", &[flag, value])
+        }
+
+        // `logger_proxy:init/1`'s `erlang:system_flag(system_logger, self())`
+        // (`lib/kernel/src/logger_proxy.erl:117`): the C's initial `logger` is reported and the
+        // pid is stored.
+        assert_eq!(
+            flag(&mut rt, system_logger, caller_term).expect("flag/2"),
+            logger
+        );
+        assert_eq!(rt.seq_trace().system_logger(), SystemLogger::Pid(caller));
+        // Setting a value is idempotent: the second call answers the pid it just stored.
+        assert_eq!(
+            flag(&mut rt, system_logger, caller_term).expect("flag/2"),
+            caller_term
+        );
+        // `logger_proxy.erl:147`'s `undefined` answers the previous pid...
+        assert_eq!(
+            flag(&mut rt, system_logger, undefined).expect("flag/2"),
+            caller_term
+        );
+        assert_eq!(rt.seq_trace().system_logger(), SystemLogger::Undefined);
+        // ... and setting it again answers `undefined`.
+        assert_eq!(
+            flag(&mut rt, system_logger, undefined).expect("flag/2"),
+            undefined
+        );
+        // The atom `logger` is accepted too (`erts_set_system_logger`'s first alternative) and
+        // answers the previous value.
+        assert_eq!(
+            flag(&mut rt, system_logger, logger).expect("flag/2"),
+            undefined
+        );
+        assert_eq!(rt.seq_trace().system_logger(), SystemLogger::Logger);
+
+        // Anything else is the C's `THE_NON_VALUE` → `badarg` (`erl_trace.c:2488-2489`), and the
+        // state is left untouched. The oracle's own probes: `42` and `{a}`.
+        assert!(matches!(
+            flag(&mut rt, system_logger, make_small(42)),
+            Err(BeamError::BadArg)
+        ));
+        let tuple = {
+            let tag = crate::native::test_support::atom(&mut rt, "a");
+            let mut sink = beam_bifs::NullSink;
+            let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
+            beam_engine::terms::make_tuple(&mut context, &[tag]).expect("a {a}")
+        };
+        assert!(matches!(
+            flag(&mut rt, system_logger, tuple),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            flag(&mut rt, system_logger, NIL),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(rt.seq_trace().system_logger(), SystemLogger::Logger);
+
+        // A `Flag` that is not an atom is `badarg`; **another atom** stays the honest typed
+        // capability gap (never a fabricated `badarg` for a real OTP flag).
+        assert!(matches!(
+            flag(&mut rt, make_small(1), caller_term),
+            Err(BeamError::BadArg)
+        ));
+        let scheduling = crate::native::test_support::atom(&mut rt, "scheduling");
+        let gap = flag(&mut rt, scheduling, caller_term).expect_err("a capability gap");
+        assert!(
+            crate::error::unsupported_reason(&gap).is_some(),
+            "a real flag is the typed capability gap, got {gap:?}"
+        );
     }
 }
