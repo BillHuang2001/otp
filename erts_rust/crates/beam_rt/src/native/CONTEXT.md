@@ -29,8 +29,9 @@ on-demand external-module load**. A key in the `erlang` namespace that none of t
 classified as the capability gap (`unsupported: …`, CLI exit 3) or the bare `error:undef`
 (`../error.rs`).
 
-`FLOOR_MODULES: [&str; 11]` (`native.rs:129`) = `application`, `code`, `erl_ddll`, `erlang`,
-`erts_internal`, `init`, `io`, `net_adm`, `net_kernel`, `os`, `prim_file`. Every one is a module the code server can **also**
+`FLOOR_MODULES: [&str; 13]` (`native.rs:131`) = `application`, `code`, `erl_ddll`,
+`erl_prim_loader`, `erlang`, `erts_internal`, `init`, `io`, `net_adm`, `net_kernel`, `os`, `prim_file`,
+`prim_tty`. Every one is a module the code server can **also**
 load as a `.beam`, so it gates `RuntimeContext::resolve_external_call`, which must answer `Ok(None)`
 for all of them — entering the body would run it *instead of* the host implementation. It does **not**
 gate `call_bif`'s dispatch: a `beam_bifs` registry key in a floor namespace the floor has no arm
@@ -57,6 +58,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3`/`trace_pattern/2,3` call them) + their pattern/target helpers, over `crate::trace` (no colocated tests — `../tests/trace*.rs`) |
 | `prim.rs` | the **path** half of the `prim_file` floor (`prim_file_call`) + the path contract, the `errno`→atom table and their unit tests |
 | `prim_file.rs` | the **whole-file-descriptor** half of the `prim_file` floor + its unit tests |
+| `prim_tty.rs` | the built-in `prim_tty` NIF-library floor: `is_builtin_library` (the resolution half) + `NIF_KEYS`/`prim_tty_call` (the whole `prim_tty.erl` `-nifs` surface, both the exported and the local route) + its unit tests |
 | `ddll.rs` | the `erl_ddll:*` loaded-driver list (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `info/2`) over `crate::port::driver`'s **one** name-keyed registry — the list `open_port({spawn_driver, Name})` resolves against; `monitor/2`/`demonitor/1`/`format_error/1` deliberately fall through to `beam_bifs` |
 | `file_server.rs` (+ `file_server/`) | the native **`file_server_2` service** (contract A.9) — see [`file_server/CONTEXT.md`](file_server/CONTEXT.md) |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
@@ -426,6 +428,46 @@ unclaimed** because the oracle answers the same: `copy/2`, `write_file/3`, `dela
 (unexported ⇒ `error:undef`), `sendfile/8` (`{error,enotsup}`/`badarg`), and
 `internal_get_nif_resource/1` (no NIF-resource model). `copy/3` works (pure Erlang).
 
+### `prim_tty:*` (contract A.7) — the built-in NIF library — `prim_tty.rs`
+ERTS serves `prim_tty` from its **static NIF table** (`erts/emulator/nifs/common/prim_tty_nif.c`,
+resolved by `is_static_nif_module`, `erts/emulator/beam/erl_nif.c`), so
+`erlang:load_nif("prim_tty", …)` never `dlopen`s a shared object. This runtime mirrors that:
+`prim_tty.rs::is_builtin_library` is the ONE resolution source `crate::context::NifBridge`'s
+`NifLoader::load_nif` consults **before** touching the filesystem (`../context/bridges.rs`), so
+`prim_tty:load/0` answers `ok` here exactly as it does on the oracle and nothing is inserted into the NIF
+registry (`NifRegistry::is_loaded("prim_tty")` stays `false`, so the module's Erlang wrappers stay
+enterable in-machine).
+
+**Routing — two routes, one implementation.** `prim_tty.rs::NIF_KEYS` (20 keys) is the whole `-nifs`
+surface of `lib/kernel/src/prim_tty.erl`. The **exported** stubs (`isatty/1`, `write_nif/2`,
+`read_nif/3`, … — reached by `call_ext`) travel `floor_keys("prim_tty")` → `call_bif` → `try_native` →
+`RuntimeContext::prim_tty_call`; the **non-exported LOCAL stubs** (`tty_create/1`, `tty_init/2`, … — the
+compiler emits a LOCAL `call`/`call_only` for each) reach the SAME implementation through
+`ExecutionContext::resolve_local_call` (`../context/execution.rs`, delegating to
+`prim_tty::serves_local_call`), so there is one implementation and no drift.
+
+**Served faithfully:** `isatty/1` (a real `IsTerminal` probe of the std stream), `tty_create/1` (an
+opaque round-trippable `#Ref<…>` handle recorded in `Runtime::prim_tty_handles`; `stdin`, a non-std atom
+and an unknown handle are `badarg`), `tty_init/2` (a non-terminal ofd answers the C's `{error,enotsup}`
+for a `raw` request and `ok` otherwise), `tty_encoding/1` → `utf8`, `setlocale/1` → `primitive`,
+`sizeof_wchar/0` → `4`, `tty_window_size/1` and `tty_is_open/2` (a `/proc/self/fd/N` liveness probe on
+Linux, an honest `true` elsewhere), `write_nif/2` and `read_nif/3` (real stdout/stderr writes and a
+bounded, 1024-byte-capped stdin read), and the no-`HAVE_TERMCAP` family `setupterm_nif/0`, `tinfo_nif/0`,
+`tigetnum_nif/1`, `tigetflag_nif/1`, `tigetstr_nif/1`, `tputs_nif/2` → `{error,enotsup}`.
+
+**Typed capability gaps** (never a fabricated value): `isprint/1`, `wcwidth/1`, `wcswidth/1` (libc's
+locale/Unicode width tables have no faithful safe-std equivalent — `libc::wcwidth` is `unsafe` and this
+crate is `#![deny(unsafe_code)]`); `tty_select/2` (arming an async `enif_select` read is not modelled);
+the **terminal-present** arm of `tty_window_size/1` (`TIOCGWINSZ` is unavailable in safe std) and the
+**raw-mode** arm of `tty_init/2` (no safe-std termios interface).
+
+**Fidelity deviation, recorded honestly — not oracle parity.** The system oracle is built **with**
+termcap, so its `prim_tty:tinfo()` returns a full terminfo map, `tigetnum($k)` → `-1`, `tigetflag` →
+`false`, `tigetstr` → `{'EXIT',{badarg,…}}` and `tputs` → `{ok,<<"clear">>}`. This runtime deliberately
+answers the C's no-`HAVE_TERMCAP` arm (`{error,enotsup}`, which the C returns *before* inspecting any
+argument) for that whole family: ncurses terminfo state is not reproducible from safe Rust, and the arm
+is non-raising, which `prim_tty:init/1`'s `setupterm() =:= ok` check requires.
+
 ### `erl_ddll:*` — one loaded-driver list (contract A.4) — `ddll.rs`
 `RuntimeContext::ddll_call(function, arity, args) -> Option<Result<Eterm>>`. `beam_bifs` registers six
 `erl_ddll` keys over its **own** loaded-driver registry, which this crate's port machinery never reads;
@@ -596,6 +638,10 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   (incl. a `directory`-mode `O_DIRECTORY` open), `read/2`, `write/2`, `close/1`, `position/2`,
   `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
   `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`
+- `prim_tty.rs` → the built-in `prim_tty` NIF library: `is_builtin_library` (the `NifLoader::load_nif`
+  resolution half) + the `NIF_KEYS`/`prim_tty_call` stubs both routes converge on (exported via
+  `floor_keys("prim_tty")`, local via `../context/execution.rs::resolve_local_call`) + its unit tests;
+  the oracle-cross-checked integration suite is `../../tests/prim_tty.rs`
 - `ddll.rs` → the `erl_ddll:*` loaded-driver list (`loaded_drivers/0`, `try_load/3`, `try_unload/2`,
   `info/2`) over `../port/driver.rs`'s one name-keyed registry + its unit tests
 - `file_server.rs` (+ `file_server/`) → the native `file_server_2` service, its io-devices, the
