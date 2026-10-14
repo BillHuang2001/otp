@@ -386,20 +386,28 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
 
 ## Cross-node handoff detail
-* **The differential gate.** **No case disagrees** (`mismatch=0`), and every `unsupported` is an honest
-  capability gap recorded in `tools/differential/known-gaps.txt`, never a `mismatch`:
-  `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — `erl_eval` internals,
-  structurally unclosable) and `boot_extra/init_script_id_names_the_running_otp_release` (the `-eval`/`run`
-  path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
+* **The differential gate.** Every recorded non-agreeing case is an honest capability gap in
+  `tools/differential/known-gaps.txt`, never a `mismatch`. The one structurally unclosable gap is
+  `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — `erl_eval` internals).
+  `boot_extra/init_script_id_names_the_running_otp_release` is a **live divergence**: the route now
+  answers (no longer `unsupported`), but `init:script_id()` returns the resolved installation script's
+  header (`{"Erlang/OTP","29"}` on this host) while `erlang:system_info(otp_release)` returns this
+  runtime's target release (`"30"`), so its `=:=` assertion is `false` here and `true` on the oracle —
+  the oracle's own loaded script and its release agree, this runtime's do not. Both A.9 `selfhost/*`
+  cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — the real `bootstrap/bin/start.boot` executes all 22 directives to completion;
-  the tail's blockers are served in-node.** `Runtime::boot_from_script` runs the real script (OTP 30 /
-  erts-17.1, **22 directives**) to completion, ending at the final `{progress,started}` (0-based
-  directive index 21 of 22); the in-crate `BootStop` is `None` (`execute` returns `Ok`). The CLI
+* **A.7/A.9 boot — the boot script executes all 22 directives to completion;
+  the tail's blockers are served in-node.** `Runtime::boot_from_script` runs the resolved script to
+  completion, ending at the final `{progress,started}` (0-based directive index 21 of 22); the in-crate
+  `BootStop` is `None` (`execute` returns `Ok`). The CLI
   `-boot bootstrap/bin/start` and the `run` action exit **0** with **empty stdout and empty stderr**
-  (0 bytes each). `-boot FILE` drives the walk (`src/cli.rs::drive`), a plain start keeps the
-  preloaded-only floor, directive 13 leaves a live `logger_server` registered as `logger`, and the
+  (0 bytes each). Every CLI action but `-version` drives the walk
+  (`src/cli.rs::{boot_script_to_drive, boot_then}`: the `-boot FILE` value when given, else the literal
+  default `start` → `<Root>/bin/start.boot`), so a plain `-eval`/`-s`/`-run`/`run`/bare-`-noshell` route
+  runs against a really booted node — measured there: `whereis(kernel_sup)`, `whereis(application_controller)`
+  and `whereis(logger)` are live PIDs, `whereis(timer_server)` is `undefined`. Directive 13 leaves a live
+  `logger_server` registered as `logger`, and the
   differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
   **The tail's blockers are served in-node — the native floor (`RuntimeContext::try_native`) or
   runtime state — with everything else falling through to the registry unchanged:**
@@ -426,17 +434,10 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   (which nested a fresh `Machine` under `may_pump_scheduler() == false` → `src/context/pump.rs` refuses
   → the uncatchable `blocked()`). Pinned by
   `src/context/tests.rs::{an_external_fun_whose_callee_blocks_resumes_on_a_scheduled_slice, resolve_local_fun_declines_the_fun_kinds_it_cannot_claim}`.
-  **`timer:apply_after/4` — a stop-independent failure.** The oracle
-  (`erl -noshell -eval 'io:format("~p~n",[is_reference(timer:apply_after(50,erlang,self,[]))]),halt(0).'`)
-  prints `false`, exit 0; under `beam_rt` the same `-eval` prints **nothing** and exits **1** with stderr
-  `beam_rt: exit <structured reason>` (34 bytes) — the **`-eval` route runs no boot script**, so
-  `kernel_sup`/`timer_server` do not exist and `timer:apply_after/4` →
-  `supervisor:start_child(kernel_sup, …)` raises an **uncaught**
-  `{noproc,{gen_server,call,[kernel_sup,{start_child,…},infinity]}}`. This is **independent** of the
-  boot path. The `<structured reason>` is an **incidental rendering gap**: `src/cli.rs`'s
-  `Action::Eval` arm does not pass its error through `reported_reason` (only `Boot`/`Run`/`RunFile` do —
-  `src/cli.rs` ~:1213, ~:1500), so a structured raise reason renders as the literal placeholder instead of
-  the real term.
+  **The `-eval` action renders a structured raise reason as the placeholder.** `src/cli.rs`'s
+  `Action::Eval` arm does not pass its error through `reported_reason` (only `Boot`/`Run`/`RunFile` do),
+  so a structured raise reason out of a `-eval` expression renders as `BeamError`'s literal
+  `<structured reason>` instead of the real term.
 * **`beam_bifs` — the registered `io:format/2` `~p`/`~w` printer raises `badarg` on any term carrying a
   fun.** The registered `io:format/2` implementation is `erts_rust/crates/beam_bifs/src/io.rs`, driven by
   `src/format.rs`, and a fun is not renderable there. Raw evidence, the same command on both runtimes:
@@ -619,24 +620,18 @@ a `{encoding,unicode}` device, which counts **bytes** where the oracle counts **
 ([`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md)).
 
 ### Confirmed failing — root cause and repro
-1. **`logger` / `error_logger` cannot emit a report on a plain runtime.** `logger:warning/1`,`notice/1`,
-   `error/1` and `error_logger:info_msg/1,2`,`error_msg/2` raise `badarg`. Root cause: a plain
-   `run`/`-eval` invocation loads only the preloaded modules — it does not run the boot script, so no
-   `logger` process exists (the boot-script path *does* register one) and the `logger` ETS config table
-   never exists: `ets:whereis(logger)` is `undefined` (oracle: a `#Ref{}`), `logger_config:allow(Level)`
-   defaults the primary level to `notice` and admits a `notice`+ event, then
-   `logger_backend`→`logger_config:get(Tid=undefined, primary)` → `ets:lookup(undefined, primary)` →
-   `badarg` (`etsl:lookup_undefined/0` = `{error,badarg}` in **both** runtimes), so `logger:info/1,2`
-   returns `ok` **only because it is filtered** below the default `notice` level. The residual is the
-   missing native logger ETS floor: `lg:warn/0` → `{'EXIT',badarg}`, `lg:info/0` → `ok`,
-   `lg:elog_info/0` → `{'EXIT',badarg}`.
-2. **`application:start/1,2`, `application:stop/1`, `application:ensure_all_started/1` fail.**
-   On a plain runtime no `application_controller` process exists (it is spawned only on the `-boot`
-   path): `{'EXIT',{noproc,{gen_server,call,[application_controller,{load_application,sasl},infinity]}}}`
-   (scheduled) / `exit <structured reason>` (`-eval`); the oracle answers `ok`/`{ok,[syntax_tools]}`/
-   `{error,{not_started,sasl}}`. The native floor answers only the read-only queries (items in "Works
-   today"); no application's `start/2` runs and no supervision tree becomes live. Repro:
-   `ap:start_sasl/0`, `ap:start_syntax/0`, `ap:ensure_syntax/0`.
+1. **`logger`/`error_logger` reports are emitted but reach no native logger sink.** A booted runtime has
+   a live `logger` process and the `logger` ETS config table exists (`ets:whereis(logger)` is a `#Ref{}`),
+   so `logger:info/1,2`, `warning/1`, `error/1` and `error_logger:info_msg/1,2`, `error_msg/2` all answer
+   `ok`. The residual is that the `lg:*` test helpers still depend on a native logger ETS floor this
+   runtime does not provide.
+2. **`application:start/1,2`, `application:stop/1`, `application:ensure_all_started/1` reach a live
+   controller but only the boot script's own applications are startable.** `application_controller` is a
+   live PID on every CLI route now, so a request is answered rather than failing `noproc`; a start for an
+   application the resolved boot script did not load still fails (measured: `ensure_all_started(crypto)`
+   → `{error,{crypto,{"no such file or directory","crypto.app"}}}` on this host). The native floor answers
+   only the read-only queries (items in "Works today"). Repro: `ap:start_sasl/0`, `ap:start_syntax/0`,
+   `ap:ensure_syntax/0`.
 
 ### The `-eval` vs scheduled asymmetry
 The `-eval` root process **pumps** the scheduler and can suspend a blocking call; a **scheduled**
