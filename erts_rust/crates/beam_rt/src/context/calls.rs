@@ -652,15 +652,24 @@ impl<'a> RuntimeContext<'a> {
         // keeping the BIF's/NIF's atom terms (and every printer/comparison that resolves them)
         // consistent.
         //
-        // The emptiness guard is load-bearing for performance, not semantics: an empty commit
-        // is a no-op, but `atoms_mut()` goes through `Rc::make_mut`, and the port-registry /
-        // persistent-term / NIF handles plus this call's own `atoms` binding keep the shared
-        // table's strong count at 2 or more -- so touching it would deep-clone the whole
-        // `AtomTable` on *every* registered BIF call. Only a call that actually interns a name
-        // (`binary_to_term`/`list_to_atom`/`binary_to_atom`/`load_nif`, all rare) pays the
-        // commit, and then it still lands the names at their predicted indices.
+        // Two handles are dropped first, and they are exactly why the commit is cheap: the
+        // table is shared through an `Rc`, so its strong count decides whether a write appends
+        // in place or deep-clones it. This call's own `atoms` binding and the `RuntimeMemory`
+        // snapshot built for `erlang:memory/0,1` (which stores `Rc::clone(&atoms)`) are two
+        // such owners -- the BIF context, the port/persistent-term/NIF bridges built inside the
+        // block above have already been dropped with it. Neither handle is read after the call
+        // (the result is a term, and the rewind above touches only the heap), so dropping them
+        // hands the commit the append-only fast path: `CodeServer::intern_pending` takes
+        // `Rc::get_mut` and appends, instead of `Rc::make_mut` cloning the whole `AtomTable`
+        // (thousands of atoms) on every interning call.
+        //
+        // The emptiness guard stays load-bearing for the same reason it always was: a call that
+        // interned nothing must not borrow the table at all, so `binary_to_term`/`list_to_atom`
+        // -- or, far more often, every arithmetic/immediate BIF -- keeps its no-copy fast path.
+        drop(atoms);
+        drop(memory);
         if !pending.is_empty() {
-            pending.commit(self.runtime.code_server.atoms_mut());
+            self.runtime.code_server.intern_pending(&pending);
         }
         // Rewind to this call's mark and give the heap back to the pool. Every word this call
         // handed out of the pooled heap is now either unreachable (the BIF's intermediate terms)
@@ -859,15 +868,23 @@ impl<'a> RuntimeContext<'a> {
         };
         // Consuming the host releases its borrow of `services`, and dropping `services` releases
         // the runtime field borrows before the heap/interner work below reuses `self.runtime`.
+        // The host also owned the call's *second* table handle (`Rc::clone(&atoms)`), so
+        // consuming it leaves this call's own `atoms` binding as the only transient owner --
+        // dropped explicitly below, before the commit.
         let heap = host.into_heap();
         drop(services);
         self.runtime.put_bif_heap(heap);
-        // Same load-bearing emptiness guard as `call_registered`: `atoms_mut()` is
-        // `Rc::make_mut`, and the live host/NIF-registry handles keep the shared table's
-        // strong count above 1, so an unconditional commit would deep-clone the whole
-        // `AtomTable` on every NIF call. Only commit when the NIF actually interned a name.
+        // Same load-bearing emptiness guard as `call_registered`, and the same reason to drop the
+        // transient handle *before* committing: the table is an `Rc`, so a write from a shared
+        // table deep-clones it. `atoms` is not read after this point (the outcome below is a term
+        // built on the heap), so dropping it lets `CodeServer::intern_pending` take its
+        // `Rc::get_mut` append-only fast path; a genuinely outstanding handle (a loaded NIF
+        // library's stored host -- a *different* host from this per-call one -- or an open driver
+        // port) still falls back to the correct copy-on-write, merely unoptimized. Only a NIF that
+        // actually interned a name reaches any of this.
+        drop(atoms);
         if !interner.is_empty() {
-            interner.commit(self.runtime.code_server.atoms_mut());
+            self.runtime.code_server.intern_pending(&interner);
         }
         match outcome {
             // A NIF must hand back a **term** (or record an exception, which `NifLibrary::call`
