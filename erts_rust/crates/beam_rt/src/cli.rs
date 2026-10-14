@@ -42,7 +42,7 @@
 //! | `-name N` / `-sname N` | distribution node name |
 //! | `-setcookie C` | distribution cookie (recorded as an init argument; sets `emulator.cookie`) |
 //! | `-config F` | config file, recorded as the init argument `config` **and** resolved/read-checked by every booting action (a missing file is a runtime error, exit 1) |
-//! | `-boot F` | boot script: recorded as the init argument `boot` **and** executed by the A.7 boot-script executor (the `Boot` action) |
+//! | `-boot F` | boot script: recorded as the init argument `boot` **and** executed by the A.7 boot-script executor **before** the action's own instruction (every action but `-version`; the default script is `start`) |
 //! | `-emu_flavor F` | emulator flavor: `emu` ⇒ interpreter, `jit`/`smp` ⇒ JIT (recorded) |
 //! | `+Q N` | maximum number of ports (`legacy`, or `1024..=134217727`) |
 //! | `+K true\|false` | kernel-poll switch |
@@ -519,6 +519,10 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         max_ports: builder.max_ports,
         init_args: builder.init_args,
         perf_map: builder.perf_map,
+        // The CLI resolves the script it drives in `drive`, once the whole command line
+        // (and therefore the action) is known — `-version` is the one action that boots
+        // none, and a bare `-noshell` is the one that boots the default.
+        resolved_boot_script: None,
         action: builder.action,
         // The environment family is read only by `parse_with_env`; the pure `parse` sees
         // an empty one (it must never read the process environment).
@@ -1176,6 +1180,14 @@ fn report_unsupported(reason: &str) -> i32 {
 
 /// Dispatches the parsed action against a fresh runtime.
 ///
+/// `init`'s own order is reproduced here: `do_boot/3` resolves the boot file and runs it
+/// (`eval_script/2`) **before** the start instruction, and it does so on every invocation
+/// that reaches the boot (`erts/preloaded/src/init.erl:1197-1225`). So `-eval`, `-s`,
+/// `-run`, `run` and the bare `-noshell` all run against a node whose
+/// `kernel`/`stdlib`/`application_controller`/`logger` are really up — exactly as the
+/// oracle's do. `-version` is the one action that never boots: it prints the banner, builds
+/// no runtime and exits.
+///
 /// The runtime the action built is handed back through `snapshot` — [`run`] needs it to
 /// write a crash dump when the action fails abnormally. `Action::Version` builds none
 /// (there is nothing to snapshot), and neither does a runtime that could not even be
@@ -1190,27 +1202,27 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
     if !matches!(action, Action::Version) {
         check_config_file(&config)?;
     }
-    match action {        Action::Version => {
+    // The **one** resolution of "does this invocation boot a script, and which": the
+    // explicit `-boot FILE` value when one was given, else `init`'s literal default `start`.
+    // Recording it on the configuration is what lets [`Runtime::new`] decide the native
+    // `file_server_2` registration from the very value the drive below consumes
+    // (`RuntimeConfig::drives_a_boot_script`), so the two can never disagree.
+    let boot_script = boot_script_to_drive(&config);
+    let config = config.with_resolved_boot_script(boot_script.clone());
+    match action {
+        Action::Version => {
             println!("{}", boot::boot_banner());
             Ok(())
         }
         Action::Boot => {
-            // `-boot FILE` is the boot **action**'s script: a bare `beam_rt -boot F` really
-            // executes F (contract A.7/A.9) instead of only loading the preloaded set. The
-            // value comes from the recorded init arguments, exactly as `init` reads its own
-            // `boot` flag, so it must be copied out before `config` moves into the runtime.
-            let boot_file = boot_file_argument(&config).map(str::to_string);
             let mut runtime = Runtime::new(config)?;
-            let result = match &boot_file {
-                Some(value) => run_boot_script(&mut runtime, value),
-                None => runtime.boot(),
-            };
-            // The boot chain's failure is often a **structured** raise reason (the applied
-            // directive's own term), which `BeamError`'s `Display` can only render as the
-            // placeholder `<structured reason>`. Recover the live term and render it through
-            // the runtime's one printer, exactly as the `run` action does — so the reported
-            // diagnostic names the directive's real reason instead of a placeholder.
-            let result = result.map_err(|error| reported_reason(&mut runtime, error));
+            let result = boot_then(&mut runtime, boot_script.as_deref(), |_| Ok(()))
+                // The boot chain's failure is often a **structured** raise reason (the applied
+                // directive's own term), which `BeamError`'s `Display` can only render as the
+                // placeholder `<structured reason>`. Recover the live term and render it through
+                // the runtime's one printer, exactly as the `run` action does — so the reported
+                // diagnostic names the directive's real reason instead of a placeholder.
+                .map_err(|error| reported_reason(&mut runtime, error));
             *snapshot = Some(runtime);
             result
         }
@@ -1218,10 +1230,9 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             let mut runtime = Runtime::new(config)?;
             // Real `erl -eval '2+3'` prints nothing and exits 0: the expression is
             // evaluated for its effect only (`halt`, a start script, …).
-            let result = match runtime.boot() {
-                Ok(()) => runtime.eval(&expr).map(|_| ()),
-                Err(error) => Err(error),
-            };
+            let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
+                runtime.eval(&expr).map(|_| ())
+            });
             *snapshot = Some(runtime);
             result
         }
@@ -1231,11 +1242,13 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             args,
         } => {
             let mut runtime = Runtime::new(config)?;
-            let mut terms = Vec::with_capacity(args.len());
-            for name in &args {
-                terms.push(runtime.intern(name));
-            }
-            let result = apply(&mut runtime, &module, &function, &terms);
+            let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
+                let mut terms = Vec::with_capacity(args.len());
+                for name in &args {
+                    terms.push(runtime.intern(name));
+                }
+                apply(runtime, &module, &function, &terms)
+            });
             *snapshot = Some(runtime);
             result
         }
@@ -1245,11 +1258,11 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             args,
         } => {
             let mut runtime = Runtime::new(config)?;
-            let parsed: Vec<ArgTerm> = args.into_iter().map(ArgTerm::Str).collect();
-            let result = match runtime.materialize_args(&parsed) {
-                Ok(terms) => apply(&mut runtime, &module, &function, &terms),
-                Err(error) => Err(error),
-            };
+            let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
+                let parsed: Vec<ArgTerm> = args.into_iter().map(ArgTerm::Str).collect();
+                let terms = runtime.materialize_args(&parsed)?;
+                apply(runtime, &module, &function, &terms)
+            });
             *snapshot = Some(runtime);
             result
         }
@@ -1261,20 +1274,63 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             args,
         } => {
             let mut runtime = Runtime::new(config)?;
-            let result = run_file(&mut runtime, &file, &module, &function, arity, &args);
+            let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
+                run_file(runtime, &file, &module, &function, arity, &args)
+            });
             *snapshot = Some(runtime);
             result
         }
     }
 }
 
-/// The `-boot FILE` drive: resolve `value` the way `init` resolves its `boot` flag and
-/// execute the resulting script (contracts A.7/A.9).
+/// The literal boot script `init` falls back to when the command line names none
+/// (`bootfile/2`: `get_flag(boot, Flags, Root ++ "/bin/start")`,
+/// `erts/preloaded/src/init.erl:1257-1258`).
+const DEFAULT_BOOT_SCRIPT: &str = "start";
+
+/// The boot script this invocation drives, or `None` when it drives none.
 ///
-/// The **boot action** is the one invocation whose whole job is to boot, so it is the one
-/// that drives the script; a start instruction (`-eval`/`-s`/`-run`/`run`) keeps the
-/// preloaded-only floor, because a start instruction runs code, not the boot script that
-/// would start it.
+/// `init` resolves the boot file **first** and runs it before the start instruction, on
+/// every invocation that reaches the boot (`do_boot/3`, `erts/preloaded/src/init.erl:1197-1225`):
+/// the explicit `-boot FILE` value when one was given, else [`DEFAULT_BOOT_SCRIPT`].
+/// `-version` is the one action that never reaches the boot — [`run`] prints the banner and
+/// exits without building a runtime — so it resolves no script.
+fn boot_script_to_drive(config: &RuntimeConfig) -> Option<String> {
+    if config.is_version() {
+        return None;
+    }
+    Some(
+        boot_file_argument(config)
+            .unwrap_or(DEFAULT_BOOT_SCRIPT)
+            .to_string(),
+    )
+}
+
+/// The `init` order for every action that boots: drive the boot script `script`, then hand
+/// control to `instruction` — the action's own start instruction.
+///
+/// A `None` script is the preloaded-only floor ([`Runtime::boot`]), the state of a
+/// [`RuntimeConfig`] that names no script at all; every action that builds a runtime
+/// resolves one ([`boot_script_to_drive`]).
+///
+/// Nothing is swallowed: a file on neither of `init`'s candidates, a malformed script and a
+/// directive the runtime cannot execute all return their typed [`BeamError`] — which [`run`]
+/// reports as `beam_rt: <error>` with exit code 1 — never a panic, a hang or a wrong result.
+/// The instruction does not run at all when the boot fails, exactly as the oracle's
+/// `start_em/1` is never reached.
+fn boot_then<F>(runtime: &mut Runtime, script: Option<&str>, instruction: F) -> Result<()>
+where
+    F: FnOnce(&mut Runtime) -> Result<()>,
+{
+    match script {
+        Some(value) => run_boot_script(runtime, value)?,
+        None => runtime.boot()?,
+    }
+    instruction(runtime)
+}
+
+/// The boot-script drive: resolve `value` the way `init` resolves its `boot` flag and
+/// execute the resulting script (contracts A.7/A.9).
 ///
 /// The runtime boots first: [`Runtime::boot`] is what puts the preloaded set *and* the
 /// system code path in place, and the code path is what resolves `$ROOT` — in `value`

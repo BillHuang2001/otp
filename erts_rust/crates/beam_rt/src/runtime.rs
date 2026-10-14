@@ -688,13 +688,17 @@ impl Runtime {
         // service instead of dying with `{noproc,{gen_server,call,[file_server_2,…]}}` (see
         // `src/native/file_server.rs`).
         //
-        // The **boot-script route** (`-boot FILE`) is the exception, because there the booted
-        // system owns the name: `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
+        // The **boot-script route** is the exception, because there the booted system owns
+        // the name: `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
         // `file_server_2` child (`{file_server, start_link, []}`), and an **initial** child
         // start that finds the name already taken aborts that supervisor — `kernel` is
         // `permanent`, so the node tears down. The native service must therefore leave the name
-        // free and let the booted application serve it.
-        let file_services = if config.boot_script().is_some() {
+        // free and let the booted application serve it. [`RuntimeConfig::drives_a_boot_script`]
+        // is that one predicate: it covers both the CLI's resolved script (the explicit
+        // `-boot FILE` value or `init`'s default, on every action but `-version`) and a
+        // `-boot` init argument a host handed straight to this constructor, while a config
+        // that names no script keeps the name.
+        let file_services = if config.drives_a_boot_script() {
             crate::native::file_server::FileServices::start_unclaimed(
                 &mut processes,
                 config.heap.policy().clone(),
