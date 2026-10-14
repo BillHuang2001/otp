@@ -28,7 +28,7 @@
 //! process-to-process send) — had no cross-runtime measurement at all. This workload
 //! supplies it.
 //!
-//! # The three cases (all in one embedded module)
+//! # The four cases (all in one embedded module)
 //!
 //! Each case performs the copy round-trip of the **same structured payload**, verifies the
 //! result with an Erlang bound-variable pattern (a real equality test that raises on a
@@ -43,6 +43,13 @@
 //! * `send_recv` — a term is sent to a second process, round-tripped through
 //!   `term_to_binary/1` there, and sent back: **both directions** of the process copy
 //!   boundary. An `after` guard turns a missing reply into a loud failure, never a hang.
+//! * `send_recv_plain` — the **same two-process delivery shape as `send_recv` with *no*
+//!   ETF codec call in the receiver**: the worker replies the payload *directly*
+//!   (`From ! {self(), T}`). This isolates pure two-way process copy/delivery from the
+//!   codec, so `send_recv − send_recv_plain` attributes the ETF component *inside* the
+//!   two-process path (it mirrors the `beam_process`/`beam_message` delivery shape the
+//!   sibling crates asked for). Identical bound-variable validation and identical
+//!   `after`-guard: a missing reply is a loud `exit(message_timeout)`, never a hang.
 //!
 //! The payload is *generated from this crate's constants* (see [`module_source`]), so the
 //! Rust and Erlang sides cannot drift.
@@ -110,6 +117,11 @@ const ETS: &str = "ets_copy";
 
 /// The two-process `send`/`receive` case's exported function.
 const SR: &str = "send_recv";
+
+/// The two-process `send`/`receive` **delivery-only** case's exported function (no ETF
+/// codec in the receiver: the isolation case that attributes the codec component of
+/// [`SR`]).
+const SR_PLAIN: &str = "send_recv_plain";
 
 /// The exported functions' shared arity (the loop count).
 const ARITY: u32 = 1;
@@ -191,6 +203,12 @@ static CASES: &[Case] = &[
         n_rust: 2_000,
         n_sys: 500_000,
     },
+    Case {
+        name: "send_recv_plain",
+        function: SR_PLAIN,
+        n_rust: 2_000,
+        n_sys: 1_000_000,
+    },
 ];
 
 /// The `copy_bound` workload.
@@ -217,7 +235,7 @@ fn module_source() -> String {
     format!(
         "\
 -module({MODULE}).
--export([{ETF}/{ARITY}, {ETS}/{ARITY}, {SR}/{ARITY}]).
+-export([{ETF}/{ARITY}, {ETS}/{ARITY}, {SR}/{ARITY}, {SR_PLAIN}/{ARITY}]).
 
 %% The one structured payload every case copies: a map holding a {PAYLOAD_LIST_LEN}-element
 %% list, a tuple (an atom + a binary + a float), a {PAYLOAD_BIN_BYTES}-byte binary, a
@@ -286,6 +304,38 @@ worker() ->
         {{From, T}} ->
             From ! {{self(), binary_to_term(term_to_binary(T))}},
             worker();
+        stop ->
+            ok
+    end.
+
+%% The delivery-only two-process case: identical shape to {SR}/1, but the worker replies
+%% the payload DIRECTLY (no term_to_binary/binary_to_term), so the case measures pure
+%% two-way process copy/delivery. Subtracting it from {SR} attributes the ETF codec
+%% component inside the two-process path. The same `after` guard applies.
+{SR_PLAIN}(N) ->
+    Worker = spawn(fun() -> worker_plain() end),
+    Result = {SR_PLAIN}(N, Worker, 0),
+    Worker ! stop,
+    Result.
+
+{SR_PLAIN}(0, _Worker, Acc) -> Acc;
+{SR_PLAIN}(N, Worker, Acc) ->
+    T = payload(),
+    Worker ! {{self(), T}},
+    receive
+        {{Worker, T2}} ->
+            case T2 of
+                T -> {SR_PLAIN}(N - 1, Worker, Acc + {PER_OP})
+            end
+    after {RECV_TIMEOUT_MS} ->
+        exit(message_timeout)
+    end.
+
+worker_plain() ->
+    receive
+        {{From, T}} ->
+            From ! {{self(), T}},
+            worker_plain();
         stop ->
             ok
     end.
@@ -736,7 +786,7 @@ mod tests {
 
     #[test]
     fn every_case_declares_a_calibrated_n() {
-        assert_eq!(CASES.len(), 3, "etf + ets + send/receive");
+        assert_eq!(CASES.len(), 4, "etf + ets + send/receive + delivery-only send/receive");
         for case in CASES {
             assert!(!case.name.is_empty(), "a case has no name");
             assert!(!case.function.is_empty(), "{} has no function", case.name);
@@ -785,6 +835,37 @@ mod tests {
     }
 
     #[test]
+    fn the_delivery_only_case_mirrors_send_recv_without_the_codec() {
+        // `send_recv_plain` is the isolation case that attributes the ETF codec component
+        // of `send_recv` *inside* the two-process path. It must mirror `send_recv`'s
+        // bound-variable validation and its `after` timeout guard exactly, and its worker
+        // must reply directly (no codec call in the receiver).
+        let src = module_source();
+        let plain = src
+            .split(&format!("{SR_PLAIN}(N) ->"))
+            .nth(1)
+            .expect("the delivery-only case is generated");
+        assert!(plain.contains("Worker ! {self(), T},"));
+        assert!(plain.contains("case T2 of"));
+        assert!(plain.contains(&format!("{SR_PLAIN}(0, _Worker, Acc) -> Acc;")));
+        assert!(plain.contains(&format!(r"after {RECV_TIMEOUT_MS} ->")));
+        assert!(plain.contains("exit(message_timeout)"));
+        assert!(
+            !plain.contains("term_to_binary"),
+            "the delivery-only case must perform no ETF codec call"
+        );
+        // It is a sibling of `send_recv` in the fixed table, with a calibrated loop count
+        // for each runtime.
+        let case = CASES
+            .iter()
+            .find(|c| c.name == "send_recv_plain")
+            .expect("the delivery-only case is in the fixed table");
+        assert_eq!(case.function, SR_PLAIN);
+        assert!(case.n_for(RuntimeKind::Rust) > 0);
+        assert!(case.n_for(RuntimeKind::Sys) > case.n_for(RuntimeKind::Rust));
+    }
+
+    #[test]
     fn ns_per_op_cancels_startup_and_rejects_unusable_samples() {
         // 100 ms at N=1000 ops, 10 ms at 0 ⇒ 90 ms of copying over 1000 ops ⇒ 90 µs/op.
         assert_eq!(ns_per_op(&[100.0], &[10.0], 1_000), Some(90_000.0));
@@ -814,7 +895,7 @@ mod tests {
         let src = module_source();
         assert!(src.starts_with(&format!("-module({MODULE}).")), "{src}");
         assert!(src.contains(&format!(
-            "-export([{ETF}/{ARITY}, {ETS}/{ARITY}, {SR}/{ARITY}])."
+            "-export([{ETF}/{ARITY}, {ETS}/{ARITY}, {SR}/{ARITY}, {SR_PLAIN}/{ARITY}])."
         )));
         // The payload is generated from the crate constants.
         assert!(src.contains("10,11,12"), "the binary bytes come from the constant");
@@ -827,12 +908,18 @@ mod tests {
         assert!(src.contains(&format!("{ETF}(0, Acc) -> Acc;")));
         assert!(src.contains(&format!("{ETS}(0, _Tab, Acc) -> Acc;")));
         assert!(src.contains(&format!("{SR}(0, _Worker, Acc) -> Acc;")));
+        assert!(src.contains(&format!("{SR_PLAIN}(0, _Worker, Acc) -> Acc;")));
+        // The delivery-only worker replies the payload directly, with no codec call in the
+        // receiver; the codec round-trip stays confined to the `send_recv` worker.
+        assert!(src.contains("From ! {self(), T},"));
+        assert!(src.contains("From ! {self(), binary_to_term(term_to_binary(T))},"));
     }
 
     #[test]
     fn the_module_source_uses_only_supported_constructs() {
-        // The three copies are exactly the constructs `beam_rt` supports today: the ETF
-        // codec, ETS insert/lookup, and two-process send/receive.
+        // The four copies are exactly the constructs `beam_rt` supports today: the ETF
+        // codec, ETS insert/lookup, and two-process send/receive (with and without the
+        // codec in the receiver).
         let src = module_source();
         for needle in [
             "term_to_binary(",
