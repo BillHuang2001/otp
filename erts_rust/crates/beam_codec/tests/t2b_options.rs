@@ -18,7 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! The `term_to_binary/2` **`deterministic`** option (`DFLAG_DETERMINISTIC`).
+//! The `term_to_binary/2` **`deterministic`** option (`DFLAG_DETERMINISTIC`) and the
+//! **`local`** option (`DFLAG_LOCAL_EXT`).
 //!
 //! With `[deterministic]`, the C encoder collects a map's `(key, value)` pairs into an
 //! array, sorts them by the key in **full Erlang term order** (`map_key_compare` =
@@ -27,6 +28,15 @@
 //! and for a > 32-pair **hash** map / HAMT (`external.c:3783-3807`) alike. The
 //! `beam_codec` half of that is [`beam_codec::Encoder::with_deterministic`] /
 //! [`beam_codec::Encoder::set_deterministic`].
+//!
+//! With `[local]` (`parse_t2b_opts`, `external.c:1500-1501`/`:1547-1549`) the C adds
+//! the `LOCAL_EXT` (`121`) wrapper and writes an **internal** pid/port/reference with
+//! the `NIL_EXT` (106) internal-node marker and `creation = 0` instead of a sysname
+//! atom (`enc_internal_pid` `external.c:2966-2991`, the internal reference
+//! `:3645-3661`, `enc_internal_port` `:3686-3699`). The `beam_codec` half is
+//! [`beam_codec::Encoder::with_local_ext`] / [`beam_codec::Encoder::set_local_ext`]
+//! (the `LOCAL_EXT` wrapper + its caller-supplied node hash stay
+//! [`beam_codec::encode_term_local`], unchanged).
 //!
 //! This file is the live differential pin. A **single** `erl` invocation (VM boot is
 //! ~120 ms, so every case is batched) yields the oracle images; our encoder's
@@ -44,10 +54,12 @@ use std::process::{Command, Stdio};
 
 use beam_alloc::Heap;
 
-use beam_codec::term::{make_flatmap, make_map};
-use beam_codec::{Encoder, MAP_EXT, VERSION_MAGIC};
+use beam_codec::term::{make_flatmap, make_map, tuple_arity};
+use beam_codec::{Decoder, Encoder, MAP_EXT, VERSION_MAGIC};
 
-use beam_term::prelude::{make_atom, make_small, AtomTable, Eterm};
+use beam_term::prelude::{
+    is_internal_pid, is_internal_port, make_atom, make_small, AtomTable, Eterm,
+};
 // ---------------------------------------------------------------------------
 // Oracle resolution and process plumbing (mirrors tests/map_key_order.rs)
 // ---------------------------------------------------------------------------
@@ -367,5 +379,155 @@ fn the_oracle_accepts_our_deterministic_images() {
         out.trim(),
         "[3,3,40]",
         "the oracle must decode our deterministic images to 3-, 3- and 40-pair maps"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The `[local]` option (`DFLAG_LOCAL_EXT`) — the internal-node marker form
+// ---------------------------------------------------------------------------
+
+/// The **inner** term of a `[local]` image: `[VERSION_MAGIC][LOCAL_EXT][hash:4][…]`, so
+/// the wrapped term starts at offset 6 (1 version byte + the `121` tag + 4 hash bytes).
+/// Those 5 prefix bytes are exactly what our encoder cannot reproduce here: the hash is
+/// a per-VM-start value the caller supplies (`external.c:136-199`), so only the inner
+/// term is byte-comparable.
+fn local_inner(image: &[u8]) -> &[u8] {
+    assert_eq!(image[0], VERSION_MAGIC, "a `term_to_binary` image starts with 131");
+    assert_eq!(image[1], beam_codec::LOCAL_EXT, "the `[local]` wrapper tag");
+    &image[6..]
+}
+
+/// The live `[local]` pin: the oracle's `term_to_binary(X, [local])` images carry the
+/// `NIL_EXT` (106) internal-node marker with `creation = 0`, decoding them demotes an
+/// internal pid/port to the **internal** form, and re-encoding with
+/// `Encoder::with_local_ext` reproduces the oracle's term bytes **byte-for-byte**.
+#[test]
+fn local_option_images_carry_the_internal_node_marker_and_re_encode_byte_exactly() {
+    let Some(oracle) =
+        oracle_or_skip("local_option_images_carry_the_internal_node_marker_and_re_encode_byte_exactly")
+    else {
+        return;
+    };
+
+    // Batched: one VM boot yields every `[local]` image this test needs.
+    let images = parse_binary_list(&run_erl(
+        &oracle,
+        "io:format(\"~w~n\", [ [ \
+            term_to_binary(self(), [local]) \
+          , term_to_binary(hd(erlang:ports()), [local]) \
+          , term_to_binary(make_ref(), [local]) \
+          , term_to_binary({ok,17}, [local]) \
+          ] ])",
+    ));
+    assert_eq!(images.len(), 4, "one oracle image per requested case");
+    let (pid_image, port_image, ref_image, tuple_image) =
+        (&images[0], &images[1], &images[2], &images[3]);
+
+    // (a) `self()`: `NEW_PID_EXT` (88), node field `106` (NIL_EXT), creation 0.
+    let body = local_inner(pid_image);
+    assert_eq!(body[0], 88, "(a) NEW_PID_EXT");
+    assert_eq!(body[1], 106, "(a) the NIL_EXT internal-node marker");
+    assert_eq!(body.len(), 14, "(a) tag + marker + number + serial + creation");
+    assert_eq!(&body[10..14], &[0, 0, 0, 0], "(a) creation = 0");
+
+    // (b) a port: `V4_PORT_EXT` (120), node field `106`, creation 0.
+    let body = local_inner(port_image);
+    assert_eq!(body[0], 120, "(b) V4_PORT_EXT");
+    assert_eq!(body[1], 106, "(b) the NIL_EXT internal-node marker");
+    assert_eq!(body.len(), 14, "(b) tag + marker + number + creation");
+    assert_eq!(&body[10..14], &[0, 0, 0, 0], "(b) creation = 0");
+
+    // (c) `make_ref()`: `NEWER_REFERENCE_EXT` (90), len 3, node field `106`,
+    //     creation 0, then the three numbers.
+    let body = local_inner(ref_image);
+    assert_eq!(&body[0..3], &[90, 0, 3], "(c) 90 with len = 3");
+    assert_eq!(body[3], 106, "(c) the NIL_EXT internal-node marker");
+    assert_eq!(&body[4..8], &[0, 0, 0, 0], "(c) creation = 0");
+    assert_eq!(body.len(), 20, "(c) tag + len + marker + creation + 3 numbers");
+
+    // The pid: decoding the oracle image demotes to the **internal** form (the marker
+    // counts as *this* node), and re-encoding that decoded term with `with_local_ext`
+    // reproduces the oracle's identifier bytes exactly — the key fidelity assertion.
+    {
+        let mut heap = heap(256);
+        let mut atoms = AtomTable::new();
+        let term = Decoder::new(pid_image)
+            .unwrap()
+            .decode(&mut heap, &mut atoms)
+            .unwrap();
+        assert!(is_internal_pid(term), "(a) the marker demotes to an internal pid");
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(term).unwrap();
+        assert_eq!(encoder.finish(), local_inner(pid_image), "(a) pid re-encode");
+    }
+
+    // The port: same demotion + byte-exact re-encode.
+    {
+        let mut heap = heap(256);
+        let mut atoms = AtomTable::new();
+        let term = Decoder::new(port_image)
+            .unwrap()
+            .decode(&mut heap, &mut atoms)
+            .unwrap();
+        assert!(is_internal_port(term), "(b) the marker demotes to an internal port");
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(term).unwrap();
+        assert_eq!(encoder.finish(), local_inner(port_image), "(b) port re-encode");
+    }
+
+    // `make_ref()`: the oracle id spans all three number slots and exceeds this
+    // runtime's 60-bit internal-reference id slot (`ref_wire::representable_ref_id`
+    // declines it), and the marker names no sysname — so there is no faithful internal
+    // *or* external form. The honest answer is a **typed error**, asserted here rather
+    // than a byte-exact re-encode (which is impossible without a truncated id or a
+    // `[]` node sentinel).
+    {
+        let mut heap = heap(64);
+        let mut atoms = AtomTable::new();
+        let err = Decoder::new(ref_image)
+            .unwrap()
+            .decode(&mut heap, &mut atoms)
+            .unwrap_err();
+        assert!(
+            beam_codec::is_unsupported(&err),
+            "(c) a non-representable `[local]` reference is a typed unsupported error, got {err:?}"
+        );
+    }
+
+    // A `[local]`-wrapped **non-identifier** term is unaffected: the wrapper is consumed
+    // and the inner term decoded, exactly as before.
+    {
+        let mut heap = heap(64);
+        let mut atoms = AtomTable::new();
+        let term = Decoder::new(tuple_image)
+            .unwrap()
+            .decode(&mut heap, &mut atoms)
+            .unwrap();
+        assert_eq!(tuple_arity(term).unwrap(), 2);
+        let mut encoder = Encoder::new(&atoms);
+        encoder.encode(term).unwrap();
+        let mut expected = vec![VERSION_MAGIC];
+        expected.extend_from_slice(local_inner(tuple_image));
+        assert_eq!(encoder.finish(), expected, "the inner term, re-encoded");
+    }
+
+    // In the VM that produced the images, the oracle's own `binary_to_term` +
+    // re-encode is a fixed point and the decoded pid *is* `self()` — so the marker form
+    // is genuinely decodable by ERTS, not merely produced by it. (A second, batched
+    // invocation: the fixed point holds only within one VM start, since the `LOCAL_EXT`
+    // hash is seeded per start.)
+    let out = run_erl(
+        &oracle,
+        "BP = term_to_binary(self(), [local]), \
+         BR = term_to_binary(hd(erlang:ports()), [local]), \
+         io:format(\"~p\", [ { binary_to_term(BP) =:= self(), \
+                              term_to_binary(binary_to_term(BP), [local]) =:= BP, \
+                              is_port(binary_to_term(BR)), \
+                              term_to_binary(binary_to_term(BR), [local]) =:= BR } ])",
+    );
+    assert_eq!(
+        out.trim(),
+        "{true,true,true,true}",
+        "the oracle must round-trip its own `[local]` marker images"
     );
 }

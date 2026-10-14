@@ -28,7 +28,8 @@
     use beam_alloc::Heap;
     use beam_common::{BeamError, Result};
     use beam_term::prelude::{
-        make_atom, make_internal_pid, make_pid_data, make_small, Atom, NIL,
+        make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data,
+        make_small, Atom, NIL,
     };
 
     use super::*;
@@ -729,6 +730,120 @@
             .encode(r)
             .expect_err("an internal ref without a local node is unsupported");
         assert!(is_unsupported(&err));
+    }
+
+    // -----------------------------------------------------------------------
+    // `[local]` / `DFLAG_LOCAL_EXT` — the internal-node marker form
+    // -----------------------------------------------------------------------
+
+    /// `Encoder::with_local_ext` writes the `NIL_EXT` (106) internal-node marker and
+    /// `creation = 0` for an internal pid/port/reference instead of a sysname atom
+    /// (`external.c:2966-2991` / `:3645-3661` / `:3686-3699`), and needs **no**
+    /// `with_local_node` identity — no sysname is written at all
+    /// (`INTERNAL_LOCAL_SYSNAME` = `NIL`, `external.c:2965`).
+    #[test]
+    fn local_ext_writes_the_internal_node_marker() {
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(1 << 12);
+
+        // `make_pid_data(serial, number)` ⇒ serial 0, process number 10.
+        let pid = make_internal_pid(make_pid_data(0, 10));
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(pid).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                88, 106, // NEW_PID_EXT + NIL_EXT marker
+                0, 0, 0, 10, // number
+                0, 0, 0, 0, // serial
+                0, 0, 0, 0, // creation = 0
+            ]
+        );
+
+        // A port ⇒ `V4_PORT_EXT` with the 64-bit id and creation 0.
+        let port = make_internal_port(make_port_data(0x1234));
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(port).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                120, 106, // V4_PORT_EXT + NIL_EXT marker
+                0, 0, 0, 0, 0, 0, 0x12, 0x34, // number
+                0, 0, 0, 0, // creation = 0
+            ]
+        );
+
+        // An internal reference ⇒ `NEWER_REFERENCE_EXT`, len 3, marker, creation 0 and
+        // the three numbers `ref_wire` packs the id into (never re-derived here).
+        let id: u64 = 1 << 45;
+        assert_eq!(crate::ref_wire::ref_id_to_numbers(id), [0, 0, 1 << 13]);
+        let r = make_internal_ref(&mut heap, id).unwrap();
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(r).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                90, 0, 3, // NEWER_REFERENCE_EXT, len = 3
+                106, // NIL_EXT marker
+                0, 0, 0, 0, // creation = 0
+                0, 0, 0, 0, // n0
+                0, 0, 0, 0, // n1
+                0, 0, 0x20, 0, // n2 = 8192
+            ]
+        );
+
+        // The version-carrying form is the same body behind `VERSION_MAGIC`.
+        let mut encoder = Encoder::new(&atoms).with_local_ext();
+        encoder.encode(pid).unwrap();
+        let image = encoder.finish();
+        assert_eq!(image[0], 131);
+        assert_eq!(
+            &image[1..],
+            &[88u8, 106, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0][..]
+        );
+
+        // With the flag clear an internal id still has no wire image: `set_local_ext`
+        // restores the pre-seam behaviour exactly.
+        let mut off = Encoder::new_body(&atoms);
+        off.set_local_ext(true);
+        off.set_local_ext(false);
+        assert!(is_unsupported(&off.encode(pid).unwrap_err()));
+
+        // The marker *wins* over an installed identity (the sysname is not written).
+        let sysname = atoms.intern("nonode@nohost");
+        let mut both = Encoder::new_body(&atoms)
+            .with_local_node(sysname, 7)
+            .with_local_ext();
+        both.encode(pid).unwrap();
+        assert_eq!(
+            both.finish(),
+            vec![88, 106, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    /// `[local]` changes only an **internal** id: an external id keeps its own node
+    /// atom and creation (`enc_external_pid`, `external.c:3000-3016`), byte-for-byte.
+    #[test]
+    fn local_ext_leaves_external_ids_untouched() {
+        let mut atoms = AtomTable::new();
+        let node = make_atom(atoms.intern("nonode@nohost"));
+        let mut heap = new_heap(1 << 12);
+
+        let terms = [
+            make_external_pid(&mut heap, node, 7, 8, 9).unwrap(),
+            make_external_port(&mut heap, node, 0x1234, 5).unwrap(),
+            make_external_ref(&mut heap, node, &[1, 2, 3], 4).unwrap(),
+        ];
+        for term in terms {
+            let plain = encode_term_body(term, &atoms).unwrap();
+            let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+            encoder.encode(term).unwrap();
+            assert_eq!(
+                encoder.finish(),
+                plain,
+                "an external id must be untouched by `[local]`"
+            );
+        }
     }
 
     #[test]

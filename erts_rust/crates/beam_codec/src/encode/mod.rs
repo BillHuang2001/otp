@@ -68,6 +68,17 @@ const SMALL_BIG_BYTE_MAX: usize = 255;
 /// The OTP atom-name length limit, in **characters** (not bytes).
 const ATOM_CHAR_MAX: usize = 255;
 
+/// The node field of an **internal** identifier's wire image (see
+/// [`Encoder::with_local_ext`] / [`Encoder::with_local_node`]).
+#[derive(Clone, Copy)]
+enum IdNode {
+    /// The `[local]` / ETS-compressed form: the `NIL_EXT` (106) internal-node marker
+    /// (`INTERNAL_LOCAL_SYSNAME` = `NIL`, `external.c:2965`) and `creation = 0`.
+    Marker,
+    /// The plain form: the local node's `sysname` atom and its `creation`.
+    Local(Atom, u32),
+}
+
 /// Which atom tag the encoder emits.
 ///
 /// Atoms are interned, never compared by name: the encoder renders each name
@@ -213,6 +224,13 @@ pub struct Encoder<'a> {
     /// rather than in the map's stored order (see [`Encoder::set_deterministic`]).
     /// `false` — the default — reproduces today's bytes exactly.
     deterministic: bool,
+    /// The `term_to_binary/2` `local` option (`DFLAG_LOCAL_EXT`): when set, an
+    /// **internal** pid/port/reference writes the `NIL_EXT` (106) internal-node
+    /// marker with `creation = 0` instead of a sysname atom
+    /// (`ERTS_DIST_EXT_INTERNAL_NC`, `external.c:2978`/`:3651`/`:3686`). `false` —
+    /// the default — reproduces today's bytes exactly (see
+    /// [`Encoder::with_local_ext`]).
+    local_ext: bool,
 }
 impl<'a> Encoder<'a> {
     /// Creates an encoder whose output begins with the version byte `131`.
@@ -236,6 +254,7 @@ impl<'a> Encoder<'a> {
             local_node: None,
             fun_identity: None,
             deterministic: false,
+            local_ext: false,
         }
     }
     /// Selects the atom tag family; defaults to [`AtomEncoding::Utf8`].
@@ -328,10 +347,70 @@ impl<'a> Encoder<'a> {
     /// The local node identity (`sysname` atom + `creation`) used to encode
     /// internal pid/port immediates as `NEW_PID_EXT`/`V4_PORT_EXT`. Without it an
     /// internal id has no wire image (the sysname/creation are node identity,
-    /// owned by the runtime), so it reports `unsupported`.
+    /// owned by the runtime), so it reports `unsupported` — unless the `[local]`
+    /// form is selected with [`Encoder::with_local_ext`], which needs no identity.
     pub fn with_local_node(mut self, node: Atom, creation: u32) -> Self {
         self.local_node = Some((node, creation));
         self
+    }
+
+    /// Selects the `term_to_binary/2` `local` option (`DFLAG_LOCAL_EXT`,
+    /// `parse_t2b_opts` `external.c:1500-1501`/`:1547-1549`).
+    ///
+    /// With it set, an **internal** pid/port/reference — a term that carries no node
+    /// identity of its own — is written with the `NIL_EXT` (106) internal-node marker
+    /// and `creation = 0` instead of a sysname atom: the C's
+    /// `DFLAG_ETS_COMPRESSED|DFLAG_LOCAL_EXT` branches in `enc_internal_pid`
+    /// (`external.c:2966-2991`), the internal reference (`:3645-3661`) and
+    /// `enc_internal_port` (`:3686-3699`). Since no sysname is written this form needs
+    /// **no** [`Encoder::with_local_node`] identity — the marker *is* the node field
+    /// (`INTERNAL_LOCAL_SYSNAME` = `NIL`, `external.c:2965`).
+    ///
+    /// It is the send-side counterpart of the `LOCAL_EXT` (`121`) wrapper
+    /// [`Encoder::finish_local`]/[`crate::encode_term_local`] add; that wrapper (and
+    /// its caller-supplied node hash) is unchanged and independent of this flag. An
+    /// **external** id is untouched — its own node atom is written
+    /// (`enc_external_pid` `external.c:3000-3016`) — and with the flag clear every
+    /// byte, including the `unsupported` result for an internal id with no configured
+    /// local node, is unchanged.
+    pub fn with_local_ext(mut self) -> Encoder<'a> {
+        self.local_ext = true;
+        self
+    }
+
+    /// Setter form of [`Encoder::with_local_ext`].
+    pub fn set_local_ext(&mut self, on: bool) {
+        self.local_ext = on;
+    }
+
+    /// The node field to write for an **internal** identifier (see
+    /// [`Encoder::with_local_ext`] and [`Encoder::with_local_node`]).
+    ///
+    /// The `[local]` marker wins when that flag is set — the sysname is then not
+    /// written at all, so no node identity is needed. Otherwise the installed local
+    /// node identity is used, and `None` means an internal id has no wire image.
+    fn internal_id_node(&self) -> Option<IdNode> {
+        if self.local_ext {
+            return Some(IdNode::Marker);
+        }
+        self.local_node
+            .map(|(atom, creation)| IdNode::Local(atom, creation))
+    }
+
+    /// Writes an internal identifier's node field and returns the `creation` word to
+    /// follow it: `0` for the `[local]` marker (`enc_internal_pid`,
+    /// `external.c:2978-2981`), the identity's own value otherwise.
+    fn write_id_node(&mut self, node: IdNode) -> Result<u32> {
+        match node {
+            IdNode::Marker => {
+                self.buf.u8(NIL_EXT);
+                Ok(0)
+            }
+            IdNode::Local(atom, creation) => {
+                self.encode(make_atom(atom))?;
+                Ok(creation)
+            }
+        }
     }
 
     /// Supplies the module identity needed to encode a
@@ -425,22 +504,18 @@ impl<'a> Encoder<'a> {
         }
         // Internal pids/ports are 60-bit `Eterm` immediates (not boxed external id
         // things) and an internal reference is the M1 `[header, node, serial, id]`
-        // block — none of them carry a node identity of their own, so the local
-        // node's sysname/creation — owned by the runtime — must be supplied via
-        // [`Encoder::with_local_node`].
-        if let Some((local_node, creation)) = self.local_node {
+        // block — none of them carry a node identity of their own, so the node field
+        // is either the `[local]` internal-node marker (which carries no identity at
+        // all) or the local node's sysname/creation, owned by the runtime and
+        // supplied via [`Encoder::with_local_node`].
+        if let Some(node) = self.internal_id_node() {
             // Reading the id-tag bits of any `Eterm` is a safe, frozen-layout
             // (`beam_term`) operation — no `unsafe` needed (the crate denies it).
             if is_internal_pid(term) {
-                return self.encode_internal_pid(
-                    local_node,
-                    pid_number(term),
-                    pid_serial(term),
-                    creation,
-                );
+                return self.encode_internal_pid(node, pid_number(term), pid_serial(term));
             }
             if is_internal_port(term) {
-                return self.encode_internal_port(local_node, port_number(term), creation);
+                return self.encode_internal_port(node, port_number(term));
             }
             // An internal reference: `crate::term::internal_ref_id` is the safe
             // frozen-layout probe (`beam_term`'s `is_internal_ref` is `unsafe`, and the
@@ -449,7 +524,7 @@ impl<'a> Encoder<'a> {
             // C-layout `ErtsORefThing` block included, whose id word does not exist —
             // so it doubles as the predicate rather than risking a wrong id.
             if let Ok(id) = crate::term::internal_ref_id(term) {
-                return self.encode_internal_ref(local_node, id, creation);
+                return self.encode_internal_ref(node, id);
             }
         }
         // Anything else is not a term the encoder can represent: report it explicitly
@@ -782,17 +857,14 @@ impl<'a> Encoder<'a> {
     }
 
     /// Encodes an internal pid as `NEW_PID_EXT`: `[node][number:u32 BE][serial:u32 BE][creation:u32 BE]`.
-    fn encode_internal_pid(
-        &mut self,
-        node: Atom,
-        number: u64,
-        serial: u64,
-        creation: u32,
-    ) -> Result<()> {
+    ///
+    /// `node` is the `[local]` internal-node marker (then `creation` is `0`) or the
+    /// installed local node identity (see [`Encoder::with_local_ext`]).
+    fn encode_internal_pid(&mut self, node: IdNode, number: u64, serial: u64) -> Result<()> {
         let number = u32::try_from(number).map_err(|_| error::system_limit())?;
         let serial = u32::try_from(serial).map_err(|_| error::system_limit())?;
         self.buf.u8(NEW_PID_EXT);
-        self.encode(make_atom(node))?;
+        let creation = self.write_id_node(node)?;
         self.buf.u32be(number);
         self.buf.u32be(serial);
         self.buf.u32be(creation);
@@ -801,16 +873,16 @@ impl<'a> Encoder<'a> {
 
     /// Encodes an internal port as `V4_PORT_EXT`: `[node][number:u64 BE][creation:u32 BE]`
     /// (the C encoder always emits the v4 form for a port).
-    fn encode_internal_port(&mut self, node: Atom, number: u64, creation: u32) -> Result<()> {
+    fn encode_internal_port(&mut self, node: IdNode, number: u64) -> Result<()> {
         self.buf.u8(V4_PORT_EXT);
-        self.encode(make_atom(node))?;
+        let creation = self.write_id_node(node)?;
         self.buf.u64be(number);
         self.buf.u32be(creation);
         Ok(())
     }
 
     /// Encodes an internal reference as `NEWER_REFERENCE_EXT` (tag 90):
-    /// `[90][len = 3: u16 BE][node atom][creation: u32 BE][n0,n1,n2: 3 × u32 BE]`.
+    /// `[90][len = 3: u16 BE][node][creation: u32 BE][n0,n1,n2: 3 × u32 BE]`.
     ///
     /// The M1 internal-reference thing carries its whole identity as one 60-bit `id`
     /// in a single word, while the wire carries the C's three 32-bit numbers;
@@ -819,13 +891,25 @@ impl<'a> Encoder<'a> {
     /// it keeps `numbers[0]` below `MAX_REFERENCE` so the emitted local reference is
     /// oracle-valid.
     ///
-    /// Delegating to [`Encoder::encode_ref`] keeps the `NEWER_REFERENCE_EXT` byte
-    /// layout in one place — the tag, the count, the node atom and the creation word
-    /// are written exactly as for an external reference, with the count fixed at the
-    /// three numbers [`crate::ref_wire::ref_id_to_numbers`] returns.
-    fn encode_internal_ref(&mut self, node: Atom, id: u64, creation: u32) -> Result<()> {
+    /// With the caller-supplied local node identity the layout is exactly
+    /// [`Encoder::encode_ref`]'s; under the `[local]` marker the node **atom** is
+    /// replaced by the `NIL_EXT` marker byte and the creation forced to `0`
+    /// (`external.c:3645-3661`), so the two forms differ only in that field.
+    fn encode_internal_ref(&mut self, node: IdNode, id: u64) -> Result<()> {
         let numbers = crate::ref_wire::ref_id_to_numbers(id);
-        self.encode_ref(make_atom(node), &numbers, creation)
+        match node {
+            IdNode::Local(atom, creation) => self.encode_ref(make_atom(atom), &numbers, creation),
+            IdNode::Marker => {
+                self.buf.u8(NEWER_REFERENCE_EXT);
+                self.buf.u16be(numbers.len() as u16);
+                let creation = self.write_id_node(node)?;
+                self.buf.u32be(creation);
+                for number in numbers {
+                    self.buf.u32be(number);
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Encodes an external reference as `NEWER_REFERENCE_EXT` (the modern form).

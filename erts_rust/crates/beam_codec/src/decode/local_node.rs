@@ -84,7 +84,7 @@
 //! `decode_creator_pid` to do the same.
 
 use beam_common::Result;
-use beam_term::prelude::{atom_val, is_atom};
+use beam_term::prelude::{atom_val, is_atom, is_nil};
 use beam_term::{Atom, Eterm};
 
 use crate::error::bad_arg;
@@ -141,18 +141,36 @@ impl<'a> Decoder<'a> {
     /// Whether an identifier's node/creation identify the local node
     /// (`dec_is_this_node`, `external.c:3123-3129`).
     ///
-    /// `false` whenever no identity is installed, so every caller of this predicate
-    /// is inert without [`Decoder::with_local_node`]. The C also treats the
-    /// internal `NIL` sysname (`INTERNAL_LOCAL_SYSNAME`, set by `LOCAL_EXT`) as
-    /// "this node"; this codec does not model that internal node form, so only the
-    /// sysname/creation comparison is reproduced.
+    /// Two ways to match, exactly as the C:
+    ///
+    /// * the `[local]` internal-node marker (`INTERNAL_LOCAL_SYSNAME` = `NIL`,
+    ///   written only under `ERTS_DIST_EXT_INTERNAL_NC`) matches **unconditionally** —
+    ///   no sysname/creation comparison and no installed identity. `node` can only be
+    ///   that marker inside [`Decoder::internal_node`] mode (an ordinary node field
+    ///   must decode to an atom), so nothing changes without a `LOCAL_EXT` wrapper.
+    /// * otherwise the installed local node identity ([`Decoder::with_local_node`])
+    ///   must match both the sysname atom and the creation.
+    ///
+    /// `false` whenever neither applies, so every caller of this predicate is inert
+    /// without a `LOCAL_EXT` wrapper or an installed identity.
     pub(super) fn is_local_node(&self, node: Eterm, creation: u32) -> bool {
+        if self.is_internal_node_marker(node) {
+            return true;
+        }
         match self.local_node {
             Some((local, local_creation)) => {
                 is_atom(node) && atom_val(node) == local && creation == local_creation
             }
             None => false,
         }
+    }
+
+    /// Whether `node` is the `[local]`/ETS **internal-node marker**
+    /// (`INTERNAL_LOCAL_SYSNAME` = `NIL`, `external.c:2965`) — only ever possible
+    /// inside [`Decoder::internal_node`] mode, i.e. after a `LOCAL_EXT` (`121`)
+    /// wrapper (`dec_sysname`, `external.c:3114-3122`).
+    pub(super) fn is_internal_node_marker(&self, node: Eterm) -> bool {
+        self.internal_node && is_nil(node)
     }
 
     /// D2: rejects a `NEWER_REFERENCE_EXT` first number at or past

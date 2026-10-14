@@ -28,7 +28,10 @@
     use super::*;
     use beam_alloc::Heap;
     use beam_common::BeamError;
-    use beam_term::prelude::{atom_val, is_list, is_nil, is_small, signed_value};
+    use beam_term::prelude::{
+        atom_val, is_internal_pid, is_internal_port, is_list, is_nil, is_small, pid_number,
+        pid_serial, port_number, signed_value,
+    };
 
     use crate::term::{
         big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
@@ -778,6 +781,105 @@
             let err = decoder.decode(&mut heap, &mut atoms).unwrap_err();
             assert!(matches!(err, BeamError::BadArg), "got {err:?} for {body:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `[local]` internal-node marker (`NIL_EXT`, 106) in an identifier's node field
+    // -----------------------------------------------------------------------
+
+    /// The `[local]` **internal-node marker**: `LOCAL_EXT` sets
+    /// `ERTS_DIST_EXT_INTERNAL_NC` (`external.c:5250-5254`), `dec_sysname` then accepts
+    /// a `NIL_EXT` node field (`external.c:3114-3122`) and `dec_is_this_node` returns
+    /// true for it unconditionally (`external.c:3123-3129`) — with no installed local
+    /// node — so the identifier demotes to the **internal** form.
+    #[test]
+    fn local_ext_marker_node_demotes_an_internal_pid_and_port() {
+        // `term_to_binary(self(), [local])` shape:
+        // `[131][121 LOCAL_EXT][hash:4][88 NEW_PID_EXT][106][num:4][ser:4][cre:4]`.
+        let mut pid_image = vec![131u8, 121, 0xDE, 0xAD, 0xBE, 0xEF, 88, 106];
+        pid_image.extend_from_slice(&10u32.to_be_bytes()); // number
+        pid_image.extend_from_slice(&0u32.to_be_bytes()); // serial
+        pid_image.extend_from_slice(&0u32.to_be_bytes()); // creation
+        let (_h, _a, term) = decode(&pid_image);
+        assert!(is_internal_pid(term), "the marker demotes to an internal pid");
+        assert_eq!(pid_number(term), 10);
+        assert_eq!(pid_serial(term), 0);
+
+        // `term_to_binary(hd(erlang:ports()), [local])` shape:
+        // `[131][121][hash:4][120 V4_PORT_EXT][106][num:8][cre:4]`.
+        let mut port_image = vec![131u8, 121, 1, 2, 3, 4, 120, 106];
+        port_image.extend_from_slice(&0x1234u64.to_be_bytes());
+        port_image.extend_from_slice(&0u32.to_be_bytes());
+        let (_h, _a, term) = decode(&port_image);
+        assert!(is_internal_port(term), "the marker demotes to an internal port");
+        assert_eq!(port_number(term), 0x1234);
+    }
+
+    /// A `[local]`-marked reference whose id **fits** the internal form's 60-bit slot
+    /// demotes; one that does not (an oracle `make_ref()`, whose id spans all three
+    /// number slots) has neither a faithful internal nor a faithful external form —
+    /// the marker names no sysname — so it is a typed error, never a term carrying the
+    /// `[]` sentinel as its node.
+    #[test]
+    fn local_ext_marker_reference_demotion_is_representability_gated() {
+        // `NEWER_REFERENCE_EXT`: `[90][len = 3][106][creation:4 = 0]` then the numbers
+        // `[42, 0, 0]` — id 42, well inside the internal slot.
+        let mut small = vec![131u8, 121, 0, 0, 0, 0, 90, 0, 3, 106];
+        small.extend_from_slice(&0u32.to_be_bytes());
+        small.extend_from_slice(&42u32.to_be_bytes());
+        small.extend_from_slice(&0u32.to_be_bytes());
+        small.extend_from_slice(&0u32.to_be_bytes());
+        let mut heap = Heap::new(64).unwrap();
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&small, &mut heap, &mut atoms).unwrap();
+        assert_eq!(crate::term::internal_ref_id(term).unwrap(), 42);
+
+        // The oracle's own `term_to_binary(make_ref(), [local])` image (captured from
+        // OTP 29.1.1): `90,0,3,106,0,0,0,0` then the numbers `[6585, 0x0F9C0001,
+        // 0x95BBF08A]`, whose packed id exceeds the 60-bit internal slot.
+        let oracle_ref: [u8; 26] = [
+            131, 121, 86, 20, 224, 167, 90, 0, 3, 106, 0, 0, 0, 0, 0, 0, 25, 185, 15, 156, 0, 1,
+            149, 187, 240, 138,
+        ];
+        let mut heap = Heap::new(64).unwrap();
+        let mut atoms = AtomTable::new();
+        let err = decode_term(&oracle_ref, &mut heap, &mut atoms).unwrap_err();
+        assert!(crate::error::is_unsupported(&err), "got {err:?}");
+    }
+
+    /// Marker mode changes only which node **field encoding** is accepted: a
+    /// `[local]`-marked identifier whose node field is a *real* sysname atom neither
+    /// the marker nor an installed local node keeps the faithful **external** form
+    /// (`dec_get_node`, `external.c:3131-3135`), exactly as the C does.
+    #[test]
+    fn local_ext_marker_mode_keeps_a_real_sysname_node_external() {
+        let mut image = vec![131u8, 121, 0, 0, 0, 0, 88];
+        image.extend_from_slice(&NODE_N1[..]); // a real node atom, not the marker
+        image.extend_from_slice(&3u32.to_be_bytes()); // number
+        image.extend_from_slice(&4u32.to_be_bytes()); // serial
+        image.extend_from_slice(&5u32.to_be_bytes()); // creation
+        let (_h, atoms, term) = decode(&image);
+        assert!(!is_internal_pid(term));
+        let (node, number, serial, creation) = external_pid_parts(term).unwrap();
+        assert_eq!(atoms.name(atom_val(node)), Some("n1"));
+        assert_eq!((number, serial, creation), (3, 4, 5));
+    }
+
+    /// A truncated `[local]`-marked identifier is a typed `BadArg` at every prefix,
+    /// never a panic; and the marker is refused *outside* marker mode, since the C
+    /// gates `dec_sysname`'s `NIL_EXT` acceptance on `ERTS_DIST_EXT_INTERNAL_NC`
+    /// (`external.c:3114`).
+    #[test]
+    fn local_ext_marker_truncation_is_bad_arg() {
+        let full = [
+            131u8, 121, 0, 0, 0, 0, 88, 106, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        for len in 0..full.len() {
+            assert_bad_arg(&full[..len]);
+        }
+
+        // The same pid with no `LOCAL_EXT` wrapper in front of it.
+        assert_bad_arg(&[131, 88, 106, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
     // -----------------------------------------------------------------------
     // `COMPRESSED` (`80`) — the top-level zlib wrapper
