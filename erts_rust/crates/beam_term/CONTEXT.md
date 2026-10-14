@@ -790,7 +790,7 @@ runtime that wants novel atoms to be free too should hold a single stable instan
 - `src/tag.rs` → raw tag constants/masks/shifts, `PrimaryTag`/`BoxedTag`, `primary_tag`, `is_header`
 - `src/eterm.rs` → the `Eterm` word newtype (`raw`/`from_raw`), ABI contract
 - `src/immediate.rs` → small ints, atom immediates, NIL, catch, pid/port immediates
-- `src/atom.rs` → `Atom` index type, `AtomTable` (interning, `atom.names` seeding/parser, `hvalue` = the C `slot.bucket.hvalue` hashpjw used by `make_hash`/`make_hash2`)
+- `src/atom.rs` → `Atom` index type, `AtomTable` (interning, `atom.names` seeding/parser, `hvalue` = the C `slot.bucket.hvalue` hashpjw used by `make_hash`/`make_hash2`, and the **O(1) append-only witness** `generation`/`snapshot`/`AtomSnapshot`/`appended_since`)
 - `src/list.rs` → cons-cell construction/access (`make_list`, `car`, `cdr`, `is_list`)
 - `src/boxed.rs` → boxed pointers, header words, arityval, boxed sub-type predicates, map headers,
   **the M1 internal-reference thing** (`write_internal_ref`/`internal_ref_id`/`INTERNAL_REF_*`) and the
