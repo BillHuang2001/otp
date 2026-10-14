@@ -140,7 +140,7 @@
 
 use beam_common::Result;
 use beam_term::fun::FunKind;
-use beam_term::{atom_val, Eterm, NIL};
+use beam_term::{atom_val, AtomTable, Eterm, NIL};
 
 use crate::access;
 use crate::context::BifContext;
@@ -256,7 +256,7 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // (absent from its descriptor) — the documented typed gap.
         Item::Module => match kind {
             FunKind::External | FunKind::Imported => {
-                let name = atom_term_name(ctx, fun_module(fun)?)?;
+                let name = atom_term_name(ctx.atoms(), fun_module(fun)?)?;
                 ctx.atom(&name)?
             }
             FunKind::Local => return Err(error::unsupported_bif()),
@@ -266,7 +266,7 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // descriptor cannot supply (an unloaded fun even yields `[]`).
         Item::Name => match kind {
             FunKind::External => {
-                let name = atom_term_name(ctx, fun_function(fun)?)?;
+                let name = atom_term_name(ctx.atoms(), fun_function(fun)?)?;
                 ctx.atom(&name)?
             }
             FunKind::Local | FunKind::Imported => return Err(error::unsupported_bif()),
@@ -353,8 +353,8 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if beam_codec::term::fun_kind_term(fun)? != FunKind::External {
         return Err(error::unsupported_bif());
     }
-    let module = atom_term_name(ctx, fun_module(fun)?)?;
-    let function = atom_term_name(ctx, fun_function(fun)?)?;
+    let module = atom_term_name(ctx.atoms(), fun_module(fun)?)?;
+    let function = atom_term_name(ctx.atoms(), fun_function(fun)?)?;
     let module = ctx.atom(&module)?;
     let function = ctx.atom(&function)?;
     // As for `fun_info/2`'s `arity`: the header's 8-bit field, not the true arity
@@ -386,39 +386,68 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// A non-fun is `badarg`; a `FunKind::Local` (`make_fun3`) fun would need the same
 /// triple from an `ErlFunEntry` its opaque descriptor does not have — the
 /// documented typed gap.
+///
+/// The text itself is [`fun_text_str`]'s, which the printer shares.
 fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     if !access::is_function(fun) {
         return Err(error::badarg());
     }
-    let text = match beam_codec::term::fun_kind_term(fun)? {
+    let text = fun_text_str(fun, ctx.atoms())?;
+    text_list(ctx, &text)
+}
+
+/// The `%T` text of a fun term — `erlang:fun_to_list/1`'s rendering, the leaf both
+/// `io_lib:write1/4` (for `~w`/`~p`) and `io_lib_pretty` splice in.
+///
+/// * [`FunKind::External`] (an `EXPORT_EXT`) — `"fun Module:Function/Arity"`, with
+///   the C `print_atom_name` quoting ([`quoted_atom`]) and the **true** arity
+///   (`ep->info.mfa.arity`, descriptor word 3), *not* the header's 8-bit field: an
+///   external fun with true arity 256 renders `fun lists:reverse/256` while
+///   `erlang:fun_info(F, arity)` reports `0` — the oracle-verified split.
+/// * [`FunKind::Imported`] (a `NEW_FUN_EXT`) — the printer's **local-fun** arm
+///   (`erl_printf_term.c:676-694`): `"#Fun<Module.OldIndex.OldUniq>"`, with the raw
+///   module atom name (no `print_atom_name` quoting) and the stubbed entry's signed
+///   `old_index`/`old_uniq` — all three carried by its descriptor.
+/// * [`FunKind::Local`] (a `make_fun3` closure) — the typed [`error::unsupported_bif`]
+///   capability gap: its inlined descriptor is only `(uniq, index)`, so none of the
+///   three fields exists in the term and a fabricated `#Fun<…>` would be a silently
+///   wrong result.
+///
+/// A non-fun is `badarg`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError) for a non-fun,
+/// [`BeamError::TermNotFound`](beam_common::BeamError) when a fun's module/function
+/// atom index is not in `atoms`, and
+/// [`BeamError::UnsupportedBif`](beam_common::BeamError) for a `Local` fun.
+pub(crate) fn fun_text_str(fun: Eterm, atoms: &AtomTable) -> Result<String> {
+    match beam_codec::term::fun_kind_term(fun)? {
         FunKind::External => {
-            let module = atom_term_name(ctx, fun_module(fun)?)?;
-            let function = atom_term_name(ctx, fun_function(fun)?)?;
+            let module = atom_term_name(atoms, fun_module(fun)?)?;
+            let function = atom_term_name(atoms, fun_function(fun)?)?;
             // The `FUN_DEF` printer uses the **true** arity (`ep->info.mfa.arity`,
-            // `erl_printf_term.c:721-723`), *not* the header's 8-bit field: an
-            // `EXPORT_EXT` fun with true arity 256 renders `fun lists:reverse/256`
-            // while `erlang:fun_info(F, arity)` reports `0` — the oracle-verified
-            // split.
+            // `erl_printf_term.c:721-723`), *not* the header's 8-bit field (see the
+            // docs above).
             let arity = access::fun_true_arity(fun)?;
-            format!(
+            Ok(format!(
                 "fun {}:{}/{}",
                 quoted_atom(&module),
                 quoted_atom(&function),
                 arity
-            )
+            ))
         }
         FunKind::Imported => {
-            let module = atom_term_name(ctx, fun_module(fun)?)?;
+            let module = atom_term_name(atoms, fun_module(fun)?)?;
             // `fe->old_index` / `fe->old_uniq` are `int` fields (erl_fun.h:31-59)
             // printed through `PRINT_SWORD(...,'d', ...)` — sign-extended.
             let old_index = beam_codec::term::fun_old_index(fun)? as i32;
             let old_uniq = beam_codec::term::fun_old_uniq(fun)? as i32;
-            format!("#Fun<{module}.{old_index}.{old_uniq}>")
+            Ok(format!("#Fun<{module}.{old_index}.{old_uniq}>"))
         }
-        FunKind::Local => return Err(error::unsupported_bif()),
-    };
-    text_list(ctx, &text)
+        FunKind::Local => Err(error::unsupported_bif()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -465,9 +494,9 @@ fn fun_function(fun: Eterm) -> Result<beam_term::Atom> {
 }
 
 /// The interned name of `atom`, or `BeamError::TermNotFound` when the atom index
-/// is not in the context's table (the same error [`BifContext::atom`] yields).
-fn atom_term_name(ctx: &BifContext<'_>, atom: beam_term::Atom) -> Result<String> {
-    match ctx.atoms().name(atom) {
+/// is not in `atoms` (the same error [`BifContext::atom`] yields).
+fn atom_term_name(atoms: &AtomTable, atom: beam_term::Atom) -> Result<String> {
+    match atoms.name(atom) {
         Some(name) => Ok(name.to_string()),
         None => Err(beam_common::BeamError::TermNotFound),
     }
