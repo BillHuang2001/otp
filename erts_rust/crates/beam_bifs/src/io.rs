@@ -21,8 +21,21 @@
 //! `io:format/1,2`, `io_lib:format/2,3` and the shared format-directive engine.
 //!
 //! Implements the Milestone-1 `io`/`io_lib` subset (compatibility contract Part I
-//! §A.7). `Format` is a flat proper list of byte-sized small integers (`io_lib`
-//! also accepts the same shape — the loader hands us bytes), `Args` a proper list.
+//! §A.7). `Format` is an **atom** (its name is the text), a **binary** (its bytes),
+//! or a proper list — `io_lib_format:scan/2`'s three input shapes; `Args` is a
+//! proper list.
+//!
+//! A **list** format is scanned exactly as `io_lib_format:collect/2` does: an
+//! element that is the integer `~` (126) starts a control sequence, a byte-sized
+//! small integer is a literal character, and every other element — a nested list, a
+//! binary, an integer above 255 — is kept **verbatim** as one output element and is
+//! never scanned for a directive (so `io:format([<<"x">>, "~n"], [])` writes `x~n`,
+//! not `x` and a newline). An atom's name and a binary's raw bytes are ordinary
+//! characters, so a directive *inside* them is honoured (`io_lib:format('a~nb', [])`
+//! ⇒ `[97,10,98]`). A non-atom/non-binary/non-list format (an integer, a float, a
+//! tuple, a non-byte-aligned bitstring), an improper list, and a top-level element
+//! an `io_lib_format` clause cannot match (an atom, a float, a tuple) are the
+//! oracle's `badarg`.
 //!
 //! * `io:format/1,2` write the rendered text to the context's [`OutputSink`]
 //!   ([`crate::context::BifContext::write_output`]) and return the atom `ok`.
@@ -219,8 +232,8 @@ use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    car, cdr, float_value, is_atom, is_big, is_float, is_list, is_nil, is_small, is_tuple,
-    tuple_element, tuple_size,
+    car, cdr, float_value, is_atom, is_big, is_float, is_integer, is_list, is_nil, is_small,
+    is_tuple, tuple_element, tuple_size,
 };
 use crate::arith::int_from_mag;
 use crate::bits;
@@ -395,34 +408,171 @@ fn render_format_of(
     args: Option<Eterm>,
     chars_limit: i64,
 ) -> Result<Vec<Chunk>> {
-    let bytes = format_bytes(format)?;
+    let items = format_items(ctx, format)?;
     let arg_terms = match args {
         Some(term) => proper_list(term).ok_or_else(badarg)?,
         None => Vec::new(),
     };
     let mut chunks = Vec::new();
-    render_format(ctx, &bytes, &arg_terms, &mut chunks, chars_limit)?;
+    render_format(ctx, &items, &arg_terms, &mut chunks, chars_limit)?;
     Ok(chunks)
 }
 
-/// Decodes the format term: a flat proper list of byte-sized small integers.
-fn format_bytes(format: Eterm) -> Result<Vec<u8>> {
-    let elems = proper_list(format).ok_or_else(badarg)?;
-    let mut bytes = Vec::with_capacity(elems.len());
-    for elem in elems {
-        if !is_small(elem) {
-            return Err(badarg());
-        }
-        let value = signed_value(elem);
-        if !(0..=255).contains(&value) {
-            return Err(badarg());
-        }
-        bytes.push(value as u8);
-    }
-    Ok(bytes)
+/// One element of a scanned `io:format()` **format** argument
+/// (`io_lib_format:scan/2`'s `collect/2`).
+#[derive(Clone)]
+enum FmtElem {
+    /// A character element: a literal, or the character that follows a `~`.
+    Ch(u8),
+    /// An element the format carries **verbatim** — `collect/2`'s catch-all
+    /// clause: a nested list or a binary, or an integer outside the byte range.
+    /// It is emitted as one element and is never scanned for a directive.
+    Lit(Chunk),
 }
 
-/// The control-sequence prefix shared by every directive
+/// Scans the format argument (`io_lib_format:scan/2`):
+///
+/// ```text
+/// scan(Format, Args) when is_atom(Format)   -> scan(atom_to_list(Format), Args);
+/// scan(Format, Args) when is_binary(Format) -> scan(binary_to_list(Format), Args);
+/// scan(Format, Args)                        -> collect(Format, Args).
+/// ```
+///
+/// An atom's name and a binary's raw bytes become ordinary character elements (so
+/// a directive inside an atom or a binary *is* honoured), while a **list**
+/// contributes one element per cons cell: an integer is a character (or, outside
+/// the byte range, a verbatim integer element) and a nested list or a binary is
+/// kept verbatim ([`literal_chunk`]) and is **not** scanned for directives — so
+/// `io:format([<<"x">>, "~n"], [])` writes `x~n`, not `x` and a newline.
+///
+/// # Errors
+///
+/// `badarg` — the oracle's `scan_format/2` catch — for a format that is neither
+/// an atom, a binary nor a proper list (an integer, a tuple, a float, an improper
+/// list, a non-byte-aligned bitstring), and for a top-level element `count_small/1`
+/// has no clause for (an atom, a float, a tuple, a non-byte-aligned bitstring).
+fn format_items(ctx: &BifContext<'_>, format: Eterm) -> Result<Vec<FmtElem>> {
+    if is_atom(format) {
+        let name = ctx.atoms().name(atom_val(format)).ok_or_else(badarg)?;
+        return Ok(name.chars().map(char_elem).collect());
+    }
+    if bits::is_bitstring(format) {
+        // `binary_to_list/1` — each raw byte is a format character.
+        if !bits::is_binary(format) {
+            return Err(badarg());
+        }
+        return Ok(bits::bytes(format)?.into_iter().map(FmtElem::Ch).collect());
+    }
+    let mut items = Vec::new();
+    let mut cursor = format;
+    loop {
+        if is_nil(cursor) {
+            return Ok(items);
+        }
+        if !is_list(cursor) {
+            // Neither `[]` nor a cons: the bare non-list format, or an improper
+            // tail — `collect/2` has no clause for it.
+            return Err(badarg());
+        }
+        items.push(element_item(car(cursor))?);
+        cursor = cdr(cursor);
+    }
+}
+
+/// One code point of an atom's name: a character element when it fits a byte, else
+/// a verbatim integer element (`Chunk::Char` keeps the code point exactly).
+fn char_elem(c: char) -> FmtElem {
+    if (c as u32) <= 0xFF {
+        FmtElem::Ch(c as u8)
+    } else {
+        FmtElem::Lit(Chunk::Char(c))
+    }
+}
+
+/// One element of a format **list** (`collect/2`'s `[C|Fmt] -> [C|collect(Fmt,
+/// Args)]` clause). An integer is a character (or a verbatim integer outside the
+/// byte range), a nested list or a binary is kept verbatim, and anything else has
+/// no clause in `count_small/1` — the observable `badarg`.
+fn element_item(term: Eterm) -> Result<FmtElem> {
+    if let Some(byte) = byte_char(term) {
+        // `byte_char` is exactly the oracle's `0 =< C =< 255` guard, so the code
+        // point fits a byte.
+        return Ok(FmtElem::Ch(byte as u8));
+    }
+    if is_integer(term) {
+        return Ok(FmtElem::Lit(Chunk::Int(term)));
+    }
+    if bits::is_bitstring(term) || is_list(term) || is_nil(term) {
+        return Ok(FmtElem::Lit(literal_chunk(term)?));
+    }
+    Err(badarg())
+}
+
+/// `collect/2`'s verbatim element materialized as a `Chunk` that renders back to
+/// the **same** term: a nested list keeps its nesting, a byte-aligned binary stays
+/// a binary, and any integer element is kept verbatim.
+fn literal_chunk(term: Eterm) -> Result<Chunk> {
+    if bits::is_bitstring(term) {
+        if !bits::is_binary(term) {
+            return Err(badarg());
+        }
+        return Ok(Chunk::Bin(bits::bytes(term)?));
+    }
+    let mut items = Vec::new();
+    let mut cursor = term;
+    loop {
+        if is_nil(cursor) {
+            return Ok(Chunk::List(items));
+        }
+        if !is_list(cursor) {
+            return Err(badarg());
+        }
+        let head = car(cursor);
+        items.push(if let Some(byte) = byte_char(head) {
+            Chunk::Char(byte)
+        } else if is_integer(head) {
+            Chunk::Int(head)
+        } else if bits::is_bitstring(head) || is_list(head) || is_nil(head) {
+            literal_chunk(head)?
+        } else {
+            return Err(badarg());
+        });
+        cursor = cdr(cursor);
+    }
+}
+
+/// The byte at `i` when it is a scan-able character element — `None` for a
+/// verbatim element (or the end of the format), through which no directive prefix
+/// can continue.
+fn elem_byte(items: &[FmtElem], i: usize) -> Option<u8> {
+    match items.get(i) {
+        Some(FmtElem::Ch(byte)) => Some(*byte),
+        _ => None,
+    }
+}
+
+/// `io_lib_format:count_small/1` over **one** verbatim element (`FmtElem::Lit`).
+///
+/// The oracle dispatches on the element's *shape*: a top-level **binary** element is
+/// measured by `string:length/1` — grapheme clusters, and the structured
+/// `{badarg, Bin}` raise for a binary that is not valid UTF-8 — while a list (or an
+/// integer) element is measured by `io_lib:chars_length/1`
+/// (`try iolist_size(S) catch _:_ -> string:length(S) end`, so a binary nested
+/// *inside* a list element is safe). The binary arm's raise is observable even with
+/// no `chars_limit` at all — `io_lib:format([<<255>>], [])` ⇒ `error:{badarg,
+/// <<255>>}` — because `io_lib_format:build/2` runs `count_small/1` on every format
+/// list, so **both** rendering paths call this.
+fn literal_other(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<i64> {
+    if let Chunk::Bin(bytes) = chunk {
+        let term = bits::make_binary(ctx.heap(), bytes)?;
+        let count = crate::unicode::grapheme::grapheme_count(ctx, term)?;
+        if !is_small(count) {
+            return Err(badarg());
+        }
+        return Ok(signed_value(count));
+    }
+    i64::try_from(chars_length_chunk(ctx, chunk)?).map_err(|_| badarg())
+}/// The control-sequence prefix shared by every directive
 /// (`io_lib_format:collect_cseq/2`).
 ///
 /// `pub(crate)` because the `~ts`-under-`{chars_limit, N}` arm
@@ -461,10 +611,11 @@ impl Spec {
     }
 }
 
-/// Renders `bytes` against `args` into `out` — the oracle's
+/// Renders the scanned format `items` against `args` into `out` — the oracle's
 /// `io_lib_format:build_small/2` + `build_limited/5`.
 ///
 /// * a literal format character becomes **one element**;
+/// * a verbatim element ([`FmtElem::Lit`]) becomes **one element**, kept exactly;
 /// * a *small* control (`io_lib_format:control_small/7`: `~s` of an **atom**,
 ///   `~e`/`~f`/`~g`, `~b`/`~B`, `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) has its result
 ///   spliced **flat**, one character per element (`lists:flatten(S)`);
@@ -480,22 +631,22 @@ impl Spec {
 /// limited build ([`render_format_limited`]).
 fn render_format(
     ctx: &mut BifContext<'_>,
-    bytes: &[u8],
+    items: &[FmtElem],
     args: &[Eterm],
     out: &mut Vec<Chunk>,
     chars_limit: i64,
 ) -> Result<()> {
     if chars_limit < 0 {
-        return render_format_unlimited(ctx, bytes, args, out);
+        return render_format_unlimited(ctx, items, args, out);
     }
-    render_format_limited(ctx, bytes, args, out, chars_limit)
+    render_format_limited(ctx, items, args, out, chars_limit)
 }
 
 /// The unlimited rendering — the single pass
 /// `io_lib_format:build_small/2` runs when `CharsLimit < 0`.
 fn render_format_unlimited(
     ctx: &mut BifContext<'_>,
-    bytes: &[u8],
+    items: &[FmtElem],
     args: &[Eterm],
     out: &mut Vec<Chunk>,
 ) -> Result<()> {
@@ -507,16 +658,28 @@ fn render_format_unlimited(
     // `~p`/`~P` use `I + 1` as their initial column when no precision is given.
     let mut column = 0i64;
 
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if byte != b'~' {
-            out.push(Chunk::Char(byte as char));
-            column = indent_char(byte as char, column);
-            i += 1;
-            continue;
+    while i < items.len() {
+        match &items[i] {
+            // `build_limited/5`'s generic clause: a verbatim element is emitted as
+            // its own element and advances the running column by one. Its
+            // `count_small/1` measurement runs regardless (it can raise).
+            FmtElem::Lit(chunk) => {
+                let _ = literal_other(ctx, chunk)?;
+                column += 1;
+                out.push(chunk.clone());
+                i += 1;
+                continue;
+            }
+            FmtElem::Ch(byte) if *byte != b'~' => {
+                out.push(Chunk::Char(*byte as char));
+                column = indent_char(*byte as char, column);
+                i += 1;
+                continue;
+            }
+            FmtElem::Ch(_) => {}
         }
         i += 1;
-        let (spec, ctrl) = parse_cseq(bytes, &mut i, args, &mut next_arg)?;
+        let (spec, ctrl) = parse_cseq(items, &mut i, args, &mut next_arg)?;
         let piece = dispatch(ctx, ctrl, &spec, args, &mut next_arg, column)?;
         column = indentation_of(&piece.chunk, column);
         if piece.small {
@@ -537,6 +700,9 @@ enum BuildItem {
     /// A literal format character, or a *small* control's characters
     /// (`lists:flatten/1`-ed, so they count one character each toward `Other`).
     Flat(Chunk),
+    /// A **verbatim** element the format carried (`collect/2`'s catch-all clause):
+    /// emitted as its own element, never spliced.
+    Lit(Chunk),
     /// A "big" control, kept as its captured directive state for pass 2
     /// (`io_lib_format:build_limited/5`).
     Big(BigControl),
@@ -569,31 +735,41 @@ struct BigControl {
 /// [`Chunk::flat_len`] (`io_lib:chars_length/1`) back against the budget.
 fn render_format_limited(
     ctx: &mut BifContext<'_>,
-    bytes: &[u8],
+    items: &[FmtElem],
     args: &[Eterm],
     out: &mut Vec<Chunk>,
     chars_limit: i64,
 ) -> Result<()> {
     // ---- pass 1: build_small/2 (with the big controls captured) --------------
-    let mut items: Vec<BuildItem> = Vec::new();
+    let mut build: Vec<BuildItem> = Vec::new();
     let mut i = 0usize;
     let mut next_arg = 0usize;
     let mut column = 0i64;
 
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if byte != b'~' {
-            items.push(BuildItem::Flat(Chunk::Char(byte as char)));
-            column = indent_char(byte as char, column);
-            i += 1;
-            continue;
+    while i < items.len() {
+        match &items[i] {
+            // `build_small/2`'s catch-all clause: a verbatim element is kept as
+            // **one** element of `Res1`.
+            FmtElem::Lit(chunk) => {
+                column += 1;
+                build.push(BuildItem::Lit(chunk.clone()));
+                i += 1;
+                continue;
+            }
+            FmtElem::Ch(byte) if *byte != b'~' => {
+                build.push(BuildItem::Flat(Chunk::Char(*byte as char)));
+                column = indent_char(*byte as char, column);
+                i += 1;
+                continue;
+            }
+            FmtElem::Ch(_) => {}
         }
         i += 1;
-        let (spec, ctrl) = parse_cseq(bytes, &mut i, args, &mut next_arg)?;
+        let (spec, ctrl) = parse_cseq(items, &mut i, args, &mut next_arg)?;
         match ctrl {
             b'w' | b'p' => {
                 let term = take(args, &mut next_arg)?;
-                items.push(BuildItem::Big(BigControl {
+                build.push(BuildItem::Big(BigControl {
                     ctrl,
                     spec,
                     term,
@@ -603,7 +779,7 @@ fn render_format_limited(
             b'W' | b'P' => {
                 let term = take(args, &mut next_arg)?;
                 let depth = take_depth(args, &mut next_arg)?;
-                items.push(BuildItem::Big(BigControl {
+                build.push(BuildItem::Big(BigControl {
                     ctrl,
                     spec,
                     term,
@@ -619,9 +795,9 @@ fn render_format_limited(
                 if is_atom(term) {
                     let piece = string_piece(ctx, term, &spec)?;
                     column = indentation_of(&piece.chunk, column);
-                    items.push(BuildItem::Flat(piece.chunk));
+                    build.push(BuildItem::Flat(piece.chunk));
                 } else {
-                    items.push(BuildItem::Big(BigControl {
+                    build.push(BuildItem::Big(BigControl {
                         ctrl,
                         spec,
                         term,
@@ -639,7 +815,7 @@ fn render_format_limited(
                     return Err(unsupported_bif());
                 }
                 column = indentation_of(&piece.chunk, column);
-                items.push(BuildItem::Flat(piece.chunk));
+                build.push(BuildItem::Flat(piece.chunk));
             }
         }
     }
@@ -651,9 +827,12 @@ fn render_format_limited(
     let mut num_of_ps = 0i64;
     let mut num_of_ws = 0i64;
     let mut other = 0i64;
-    for item in &items {
+    for item in &build {
         match item {
+            // `count_small/1`: a spliced character, and a verbatim list/binary/
+            // integer element alike, contribute their length to `Other`.
             BuildItem::Flat(chunk) => other += chunk.flat_len() as i64,
+            BuildItem::Lit(chunk) => other += literal_other(ctx, chunk)?,
             BuildItem::Big(big) => match big.ctrl {
                 b'p' | b'P' => num_of_ps += 1,
                 b'w' | b'W' | b's' => num_of_ws += 1,
@@ -664,9 +843,11 @@ fn render_format_limited(
     let count0 = num_of_ps + num_of_ws;
     if count0 == 0 {
         // `build/2` returns `Res1` unchanged when `P + S + W =:= 0`.
-        for item in items {
-            if let BuildItem::Flat(chunk) = item {
-                splice_flat(out, chunk);
+        for item in build {
+            match item {
+                BuildItem::Flat(chunk) => splice_flat(out, chunk),
+                BuildItem::Lit(chunk) => out.push(chunk),
+                BuildItem::Big(_) => {}
             }
         }
         return Ok(());
@@ -676,11 +857,17 @@ fn render_format_limited(
     let mut count = count0;
     let mut max_len = tsub(chars_limit, other);
     let mut column = 0i64;
-    for item in items {
+    for item in build {
         match item {
             BuildItem::Flat(chunk) => {
                 column = indentation_of(&chunk, column);
                 splice_flat(out, chunk);
+            }
+            BuildItem::Lit(chunk) => {
+                // `build_limited/5`'s generic `[C|Cs]` clause: one element, one
+                // column — the element is never spliced and never measured.
+                column += 1;
+                out.push(chunk);
             }
             BuildItem::Big(big) => {
                 let budget = if max_len < 0 { -1 } else { max_len / count };
@@ -849,7 +1036,10 @@ fn iolist_to_chars_limited(
 /// the observable `badarg`.
 fn iolist_to_chars(term: Eterm) -> Result<Vec<Chunk>> {
     if bits::is_bitstring(term) {
-        return Ok(vec![Chunk::List(binary_chars(term)?)]);
+        // `iolist_to_chars(B) when is_binary(B) -> binary_to_list(B)` — the **flat**
+        // byte list. Only the `[I|Cs] -> [iolist_to_chars(I) | …]` clause wraps a
+        // binary (as an *element*), which the caller does.
+        return binary_chars(term);
     }
     if is_list(term) {
         let head = car(term);
@@ -1188,8 +1378,13 @@ fn int_element_term(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Eterm> {
 
 /// Parses one `~…` control sequence prefix, returning the [`Spec`] and the control
 /// character; `*` forms consume their argument from `args`.
+///
+/// The prefix is read through [`elem_byte`], so a **verbatim** format element in a
+/// prefix position ([`FmtElem::Lit`]) ends the scan: no `io_lib_format` clause can
+/// match it, and the control character clause `collect_cc/2` then has no clause
+/// either — the observable `badarg`.
 fn parse_cseq(
-    bytes: &[u8],
+    items: &[FmtElem],
     i: &mut usize,
     args: &[Eterm],
     next_arg: &mut usize,
@@ -1197,11 +1392,11 @@ fn parse_cseq(
     let mut spec = Spec::plain();
 
     // 1. field width: optional `-`, then digits or `*`.
-    let negated = bytes.get(*i) == Some(&b'-');
+    let negated = elem_byte(items, *i) == Some(b'-');
     if negated {
         *i += 1;
     }
-    let fv = field_value(bytes, i, args, next_arg)?;
+    let fv = field_value(items, i, args, next_arg)?;
     spec.width = match fv {
         None => {
             if negated {
@@ -1222,9 +1417,9 @@ fn parse_cseq(
     };
 
     // 2. precision: optional `.`, then digits or `*`.
-    if bytes.get(*i) == Some(&b'.') {
+    if elem_byte(items, *i) == Some(b'.') {
         *i += 1;
-        if let Some(p) = field_value(bytes, i, args, next_arg)? {
+        if let Some(p) = field_value(items, i, args, next_arg)? {
             if p < 0 {
                 return Err(badarg());
             }
@@ -1233,9 +1428,9 @@ fn parse_cseq(
     }
 
     // 3. pad character: optional `.`, then `*` (from an argument) or one byte.
-    if bytes.get(*i) == Some(&b'.') {
+    if elem_byte(items, *i) == Some(b'.') {
         *i += 1;
-        if bytes.get(*i) == Some(&b'*') {
+        if elem_byte(items, *i) == Some(b'*') {
             *i += 1;
             let arg = take(args, next_arg)?;
             if !is_small(arg) {
@@ -1246,7 +1441,7 @@ fn parse_cseq(
                 return Err(badarg());
             }
             spec.pad = value as u8;
-        } else if let Some(&pad) = bytes.get(*i) {
+        } else if let Some(pad) = elem_byte(items, *i) {
             spec.pad = pad;
             *i += 1;
         } else {
@@ -1256,7 +1451,7 @@ fn parse_cseq(
 
     // 4. modifiers.
     loop {
-        match bytes.get(*i) {
+        match elem_byte(items, *i) {
             Some(b't') => {
                 spec.unicode = true;
                 *i += 1;
@@ -1284,7 +1479,7 @@ fn parse_cseq(
     }
 
     // 5. the control character.
-    let ctrl = *bytes.get(*i).ok_or_else(badarg)?;
+    let ctrl = elem_byte(items, *i).ok_or_else(badarg)?;
     *i += 1;
     Ok((spec, ctrl))
 }
@@ -1292,12 +1487,12 @@ fn parse_cseq(
 /// `io_lib_format:field_value/2`: a decimal run, or `*` (taking an integer
 /// argument), or absent.
 fn field_value(
-    bytes: &[u8],
+    items: &[FmtElem],
     i: &mut usize,
     args: &[Eterm],
     next_arg: &mut usize,
 ) -> Result<Option<i64>> {
-    if bytes.get(*i) == Some(&b'*') {
+    if elem_byte(items, *i) == Some(b'*') {
         *i += 1;
         let arg = take(args, next_arg)?;
         if !is_small(arg) {
@@ -1307,7 +1502,7 @@ fn field_value(
     }
     let start = *i;
     let mut value: i64 = 0;
-    while let Some(&byte) = bytes.get(*i) {
+    while let Some(byte) = elem_byte(items, *i) {
         if !byte.is_ascii_digit() {
             break;
         }
@@ -1633,21 +1828,24 @@ fn flat_trunc_chunk(ctx: &mut BifContext<'_>, s: &Chunk, n: usize) -> Result<Chu
 fn string_arg(ctx: &BifContext<'_>, arg: Eterm, unicode: bool) -> Result<(Chunk, bool)> {
     if is_atom(arg) {
         let name = ctx.atoms().name(atom_val(arg)).ok_or_else(badarg)?;
+        // The `latin1` arm is `iolist_to_chars(atom_to_list(A))`, whose byte-range
+        // guard rejects an atom whose name carries a code point above 255
+        // (`io_lib:format("~s", ['€'])` ⇒ `error:badarg`); the `unicode` arm is
+        // `string(atom_to_list(A), …)`, which accepts it.
+        if !unicode && name.chars().any(|c| (c as u32) > 0xFF) {
+            return Err(badarg());
+        }
         return Ok((Chunk::text(name), true));
     }
     if unicode {
         return Ok((cdata_chunk(arg)?, false));
     }
-    if bits::is_bitstring(arg) {
-        if !bits::is_binary(arg) {
-            // A non-byte-aligned bitstring has no byte string rendering in M1.
-            return Err(badarg());
-        }
-        let text: String = bits::bytes(arg)?.iter().map(|&b| b as char).collect();
-        return Ok((Chunk::text(&text), false));
-    }
-    let elems = proper_list(arg).ok_or_else(badarg)?;
-    Ok((Chunk::text(&byte_string(&elems)?), false))
+    // The `latin1` arm is `io_lib_format:iolist_to_chars/1`: a **nested** iolist
+    // keeps its own nesting (a binary element becomes its own sub-list, a nested
+    // list recurses), a byte-sized small integer is one character, and everything
+    // else — a byte above 255, a float, an atom, a tuple, an improper tail, a
+    // non-byte-aligned bitstring — is the oracle's `function_clause`.
+    Ok((Chunk::List(iolist_to_chars(arg)?), false))
 }
 
 /// `io_lib_format:cdata_to_chars/1` — the **plain** (unlimited) unicode rendering
@@ -1808,22 +2006,6 @@ fn decode_utf8_strict(bytes: &[u8]) -> Option<Vec<char>> {
         i += len;
     }
     Some(out)
-}
-
-/// Renders a proper list of byte-sized small integers as its latin1 string.
-fn byte_string(elems: &[Eterm]) -> Result<String> {
-    let mut out = String::with_capacity(elems.len());
-    for &elem in elems {
-        if !is_small(elem) {
-            return Err(badarg());
-        }
-        let value = signed_value(elem);
-        if !(0..=255).contains(&value) {
-            return Err(badarg());
-        }
-        out.push(value as u8 as char);
-    }
-    Ok(out)
 }
 
 /// `io_lib_format:print/…` for `~p`/`~P`: the printable rendering, re-flowed the
