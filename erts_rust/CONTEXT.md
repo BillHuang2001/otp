@@ -132,7 +132,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=2163 agree=2161 mismatch=0 unsupported=2
+- **Compatibility gate (`tools/differential`):** `summary: total=2497 agree=2495 mismatch=0 unsupported=2
   skipped=0 allowed=2` → `gate.sh` exits 0 (verified in both the default and the `BEAM_RT_TIER=interpreter` tier). `gate.sh` is authoritative — re-run it for the live
   per-contract split. **No case disagrees**; the two recorded capability gaps (the `known-gaps.txt`
   ratchet allowlist) are `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's
@@ -140,10 +140,11 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `boot_extra/init_script_id_names_the_running_otp_release` (A.9 — `init:script_id/0` on a `-eval`/`run`
   path that loads no boot script). The two A.9 `selfhost/*` in-process-compile cases now **agree**.
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 640
-  keys = 556 declared + 84 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1` + the OTP-30
-  `pid_to_binary`/`ref_to_binary`/`port_to_binary`) through defaulted
-  host seams (`RuntimeHooks::call`, `MemoryHook::memory`, …). Registered-but-unadopted BIFs return a
-  typed `unsupported` until a host hook is installed.
+  keys = 556 declared + 84 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
+  `MemoryHook::memory`, …): **346 are served in-crate** and **210 are seam-backed** (a typed
+  `unsupported` until a host installs the hook); the seam union is 240 keys, 30 of them undeclared table
+  members. The census is re-derived from code and **pinned by `beam_bifs/tests/roster_audit.rs`**, so it
+  cannot drift again.
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
   in `tools/bench/results/`) — read it there rather than duplicating numbers. Headlines since M1: the
   registered-BIF dispatch hot path fell from ~10.6 µs to ~116 ns/call and the registry lookup is now
@@ -151,7 +152,11 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `foreign` hot loop to **0.71×–0.84×** *of the Rust interpreter tier* and `gc_bound/churn` to
   **0.49×** — those are Rust-vs-Rust *tier-effect* ratios, NOT a system-ERTS comparison: against the
   system ERTS the same loops remained **46.2×–74.2×** and **42.2×** dearer at M9. The registered-BIF
-  hot path is now ~79–96 ns/call. M10 then cut the ETF round trip **22.7×** (see `CHANGE.md`).
+  hot path is now ~79–96 ns/call. M10 (see `CHANGE.md`) then cut
+  `etf_roundtrip` by **87.3 %** (to 15.09× the oracle), `list_walk` by **70.2 %** (22.1×), `send_recv` by
+  **52.1 %** (54.7×) and the churn loop's peak RSS by **60.3 %**, while startup stays **0.136×** (7.4×
+  faster) and VM memory **44.98×** lower than the oracle; the current figures, the two-sided ratio
+  labelling and the fresh ranked bottleneck list are in `tools/bench/RESULTS.md` (m10).
 - **Contract A.9 (build/bootstrapping) — boot-to-completion achieved; no self-hosted build.** `beam_rt`
   loads the 22 preloaded modules on startup, and its boot-script executor drives the real
   `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to completion** — all 22 directives

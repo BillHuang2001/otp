@@ -75,6 +75,50 @@ and the `BEAM_RT_TIER=interpreter` tier.
   reason recorded), which enabled the `plb` target (`dotnet` 9.0.318); `emqx` stays an honest mechanical
   skip (its checkout pins OTP 28.5.0.7-2 while the host has 29.1.1).
 
+### Milestone 10 addendum (batch 51)
+- **Area:** `erts_rust/crates/beam_rt` (`src/dist.rs` split → `src/dist/inbound.rs`),
+  `erts_rust/crates/beam_process` (`src/remote.rs` — new)
+- **Change (data structure):** every remaining **inbound** distribution family is now routed through
+  `beam_process`'s route-free receipt APIs. The parked remote-monitor pair needed a real structural fix:
+  a monitor installed from a peer carries a **peer-minted/external** reference that the local process
+  table has never allocated, so a new **`RemoteRef`** decomposes an external reference into
+  `(node atom, creation, ids)` and **`RemoteWatcherRef::{Local(MonitorRef), Remote(RemoteRef)}`** lets
+  `monitor_from_remote_ref`/`demonitor_from_remote_ref` key a watcher that has no local `MonitorRef`.
+  A new `beam_rt/src/dist/inbound.rs` (865 lines) receives the split from `src/dist.rs` (1622 → 796).
+- **Area:** `erts_rust/crates/beam_rt` (`src/native/memory/`), `erts_rust/crates/beam_alloc`,
+  `erts_rust/crates/beam_engine`
+- **Change:** `process_info(P, binary)` is now **truthful** — a registration seam in
+  `src/runner/run.rs` exposes the whole `Machine::refc_binaries()` view (idempotent by `data_ptr`,
+  pruned by `beam_process`'s reachability sweep), served in the oracle's `{Ptr, Size, Refc}` order.
+  `beam_alloc::Heap::reset_to(&mut self, used: usize)` is a new additive primitive next to `reset()`
+  (an over-large `used` is a typed `BadArg` and leaves the heap unchanged), adopted by the BIF-result
+  copy-out. `Machine::fr_mark()` exposes a minimal float-register high-water mark so the park/slice
+  publication can publish only the touched file.
+- **Area:** `erts_rust/crates/beam_rt` (`src/codeserver.rs`)
+- **Change:** the fun-identity snapshot used by `term_to_binary/1,2` is now **cached behind
+  `loaded_generation`** (bumped only in `load_path`) instead of being rebuilt on every call — the
+  `beam_rt`-side follow-up to the batch-50 `beam_bifs` ETF fix.
+- **Area:** `erts_rust/crates/beam_bifs` (`tests/roster_audit.rs` — new, `src/stdlib/`)
+- **Change (correctness + roster):** an authoritative BIF census is now **pinned by a test** — 556
+  declared (476/73/7), the registry's 640 keys = 556 declared + 84 stdlib fast paths, **346 in-crate /
+  210 seam-backed**, seam union 240 with 30 undeclared members. The audit immediately caught
+  `ets:foldl/3`/`foldr/3` missing from `FUN_CALLER_BIFS` (22 → 24) and ~16 real defects, the largest
+  being `lists:sort/2`'s comparator (a crate-local merge mapped both-directions-false to `Equal`,
+  silently mis-sorting) now replaced with a faithful `lists.erl` port (`fsplit_1`/`fsplit_2`/`fmerge`/
+  `rfmerge`). `beam_bifs/CONTEXT.md` was over the ~64 KB read limit (105 953 B) and was pruned to
+  65 212 B — the mechanism by which this rosters' detail had read stale.
+- **Area:** `erts_rust/crates/beam_ets` (`src/view/read.rs`, `src/ordered_interior/`)
+- **Change:** the K-ary B+-tree `ordered_set` interior (already shipped at Milestone 3) was
+  measurably confirmed and reconciled; two runtime `expect` panics in the read view became typed
+  `unsupported`, and a new **randomised differential** (`tests/ets_ordered_oracle.rs`, 1800 steps ×
+  3 seeds, `#[ignore]`d) reports **zero divergence** against live ERTS.
+- **Area:** `erts_rust/tools/differential` (`src/runtime.rs`, corpus)
+- **Change:** the binary now **builds `dist_probe` on demand** (`ensure_helper()`, cached behind a
+  `OnceLock`, suppressed by `DIFFERENTIAL_NO_BUILD`), which removed the last 4 `dist/live_*` skips and
+  grew the corpus **2163 → 2497** (all agreeing). The gate line is now
+  **`total=2497 agree=2495 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0, identical on both
+  tiers; 7 stale `divergences.md` entries were purged and the two allowlisted gaps are unchanged.
+
 ## 2026-10-14 — Milestone 9: inbound distribution + the connector, off-heap reachability reclamation, the mature-generation room policy, a `gc` corpus group, the distribution probe helper
 Scope: a capability-and-evidence milestone. The headline changes are **two-way live distribution**
 (inbound delivery routing plus a real connector), **reachability-based off-heap reclamation**, and a
