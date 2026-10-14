@@ -160,5 +160,64 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the remaining Range / input-family branches -------------------------------------
+        Case {
+            id: "phash2/range_256_and_1000",
+            description: "phash2/2 with a 256/1000 Range over an int, an atom and a list",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{erlang:phash2(1, 256), erlang:phash2(hello, 256), \
+                       erlang:phash2([1,2,3], 1000)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {234,47,188}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "phash2/range_two_and_three",
+            description: "phash2/2 with the smallest usable Ranges (2 and 3) over a binary and a tuple",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{erlang:phash2(<<1,2,3>>, 2), erlang:phash2({a,b,c}, 3)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {1,1}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "phash2/binary_exactly_12_bytes_block_hash",
+            description: "phash2/2 of a binary exactly at the 12-byte block-hash threshold",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:phash2(binary:copy(<<1>>, 12), 1000000)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 224998"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "phash2/bignum_positive_and_negative",
+            description: "phash2/1 of a 30-digit bignum and its negation (the arbitrary-precision path)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{erlang:phash2(123456789012345678901234567890), \
+                       erlang:phash2(-123456789012345678901234567890)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {132143600,33199935}"),
+                exit_code: 0,
+            },
+        },
     ]
 }

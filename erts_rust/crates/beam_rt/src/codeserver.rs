@@ -65,6 +65,9 @@
 //! [`CodeServer::add_system_paths`] reports an honest error rather than quietly running
 //! without a standard library.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -97,6 +100,28 @@ pub struct CodeServer {
     /// The `.beam` file each cached module was loaded from (see
     /// [`CodeServer::loaded_path`]); absent for a module supplied in memory.
     module_paths: HashMap<String, PathBuf>,
+    /// A **generation** for the loaded-module set, bumped every time the module cache above
+    /// changes — the invalidation trigger for the cached fun-resolution snapshot
+    /// ([`CodeServer::fun_module_snapshot`]).
+    ///
+    /// [`CodeServer::load_path`] is the **only** mutation point of that cache (this runtime
+    /// never unloads code), so it is the only place that bumps this; a future unload — or any
+    /// other change to a loaded module's IR, which is what carries its `FunT` fun-table
+    /// identity — must bump it there too, or the snapshot goes stale.
+    loaded_generation: u64,
+    /// The **cached** fun-resolution snapshot ([`CodeServer::fun_module_snapshot`]), stamped
+    /// with the [`loaded_generation`](CodeServer::loaded_generation) it was built at.
+    ///
+    /// It exists so the per-call `term_to_binary/1,2` hook does not re-walk the module cache
+    /// (an `Arc` clone plus a `PathBuf` per loaded module) on every call: the walk happens
+    /// once per loaded-module generation, and every bridge built in between shares the one
+    /// snapshot through an [`Rc`].
+    fun_modules: RefCell<Option<(u64, Rc<Vec<(Arc<Module>, PathBuf)>>)>>,
+    /// A test-only count of how many times [`CodeServer::fun_module_snapshot`] really
+    /// **rebuilt** the snapshot — the deterministic proof that a per-call bridge reuses it
+    /// (see `../context/fun_identity.rs`'s tests).
+    #[cfg(test)]
+    fun_snapshot_rebuilds: Cell<u64>,
     /// The code path: `-pa` dirs, then `-pz` dirs, then the system `ebin` dirs.
     paths: Vec<PathBuf>,
     /// The **boot-time default** code path: the `-pa`/`-pz` directories the runtime was
@@ -118,6 +143,10 @@ impl CodeServer {
             atoms: Rc::new(AtomTable::new()),
             modules: HashMap::new(),
             module_paths: HashMap::new(),
+            loaded_generation: 0,
+            fun_modules: RefCell::new(None),
+            #[cfg(test)]
+            fun_snapshot_rebuilds: Cell::new(0),
             paths: Vec::new(),
             default_paths: Vec::new(),
         }
@@ -351,6 +380,66 @@ impl CodeServer {
         self.modules.values()
     }
 
+    /// The **cached** fun-resolution snapshot: every loaded module that has a `.beam` path,
+    /// as `(loaded IR, its `.beam` file)`, in the name-sorted order
+    /// [`CodeServer::loaded`] yields.
+    ///
+    /// It is the input the `NEW_FUN_EXT` identity of a compiled module's local (`make_fun3`)
+    /// fun is derived from ([`crate::context::fun_identity`]): the `Module` carries the
+    /// `FunT` table that names the fun's `old_index`/`old_uniq`, and the path is where the
+    /// module's 16-byte checksum is lazily read from.
+    ///
+    /// # Why it is cached
+    ///
+    /// `term_to_binary/1,2` (and `external_size/1,2`) consults that hook on **every** call,
+    /// while building the snapshot is a full walk of the module cache — [`loaded`]'s sorted
+    /// `Vec<String>` plus an `Arc` clone and a `PathBuf` per module, ~23 modules after a
+    /// boot. The snapshot is therefore built **once per loaded-module generation**: an
+    /// unchanged module set hands every caller the *same* [`Rc`], and only
+    /// [`CodeServer::load_path`]'s bump of [`loaded_generation`](CodeServer::loaded_generation)
+    /// invalidates it, so a mid-run load is always visible to the next call.
+    ///
+    /// A module with no known `.beam` path (one supplied in memory) is skipped: its checksum
+    /// cannot be derived, so it could never contribute a faithful identity.
+    pub(crate) fn fun_module_snapshot(&self) -> Rc<Vec<(Arc<Module>, PathBuf)>> {
+        let generation = self.loaded_generation;
+        // A hit hands back the shared snapshot: no walk, no `Vec`, no `Arc`/`PathBuf` clone
+        // beyond the handle itself.
+        if let Ok(cache) = self.fun_modules.try_borrow() {
+            if let Some((cached, snapshot)) = cache.as_ref() {
+                if *cached == generation {
+                    return Rc::clone(snapshot);
+                }
+            }
+        }
+        let modules: Vec<(Arc<Module>, PathBuf)> = self
+            .loaded()
+            .into_iter()
+            .filter_map(|name| {
+                let handle = self.module_handle(&name)?;
+                let path = self.loaded_path(&name).map(PathBuf::from)?;
+                Some((handle, path))
+            })
+            .collect();
+        let snapshot = Rc::new(modules);
+        #[cfg(test)]
+        self.fun_snapshot_rebuilds
+            .set(self.fun_snapshot_rebuilds.get() + 1);
+        // `&self` here rules out `load_path`'s `&mut self`, so no borrow of the cell can be
+        // live: the `try_borrow_mut` is belt-and-braces, and an (impossible) failure only
+        // skips the caching — the next call rebuilds, nothing panics, no answer is wrong.
+        if let Ok(mut cache) = self.fun_modules.try_borrow_mut() {
+            *cache = Some((generation, Rc::clone(&snapshot)));
+        }
+        snapshot
+    }
+
+    /// How many times the cached fun-resolution snapshot was really rebuilt (test-only).
+    #[cfg(test)]
+    pub(crate) fn fun_snapshot_rebuilds(&self) -> u64 {
+        self.fun_snapshot_rebuilds.get()
+    }
+
     /// Loads `name` (memoized): the cached module, or `<name>.beam` from the code path.
     ///
     /// # Errors
@@ -390,6 +479,9 @@ impl CodeServer {
         let module = Arc::new(module);
         self.modules.insert(name.clone(), module.clone());
         self.module_paths.insert(name, path.to_path_buf());
+        // The loaded-module set changed — a new module, or a reload that replaced one — so the
+        // cached fun-resolution snapshot is invalidated (see `fun_module_snapshot`).
+        self.loaded_generation += 1;
         Ok(module)
     }
 

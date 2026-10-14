@@ -29,9 +29,9 @@
 //! # The items under test
 //!
 //! `status`, `registered_name`, `messages`, `message_queue_len`, `links`, `monitors`,
-//! `monitored_by`, `trap_exit` and `priority`. Each is answered from this runtime's own
-//! process table ([`beam_process::Process`]) — never fabricated, and a pid that names no live
-//! process is the atom `undefined` (see the module docs of `src/native/memory`).
+//! `monitored_by`, `trap_exit`, `priority` and `binary`. Each is answered from this runtime's
+//! own process table ([`beam_process::Process`]) — never fabricated, and a pid that names no
+//! live process is the atom `undefined` (see the module docs of `src/native/memory`).
 //!
 //! # Oracle ground truth (system `erl`, OTP 29.1.1 / `erts-17.1`)
 //!
@@ -115,6 +115,23 @@ halt(0).";
 
 /// The recorded oracle answer for [`MONITORS_PROBE`].
 const ORACLE_MONITORS_LINE: &str = "[{process,true}]|[true]";
+
+/// `spawn(mailbox, wait, [])` + a short sleep, then the `binary` roster's structural class: the
+/// `Shape` (`[]` for the empty roster, else `nonempty`) and `Well` (every entry a 3-tuple of
+/// integers — vacuously true when there are none).
+const BINARY_PROBE: &str = "\
+P = spawn(mailbox, wait, []), \
+timer:sleep(50), \
+L = element(2, process_info(P, binary)), \
+Shape = case L of [] -> \"[]\"; [_|_] -> \"nonempty\" end, \
+Well = lists:all(fun(E) -> is_tuple(E) andalso tuple_size(E) =:= 3 andalso \
+lists:all(fun(X) -> is_integer(X) end, tuple_to_list(E)) end, L), \
+io:format(\"~s|~p~n\", [Shape, Well]), \
+halt(0).";
+
+/// The recorded oracle answer for [`BINARY_PROBE`]: the parked `mailbox:wait/0` holds no
+/// off-heap refc binary, so its `binary` roster is the empty list.
+const ORACLE_BINARY_LINE: &str = "[]|true";
 
 // ---------------------------------------------------------------------------------------
 // Runtime plumbing
@@ -251,6 +268,45 @@ fn canonical_watchers(value: Eterm, watcher: Eterm) -> String {
         .map(|pid| (*pid == watcher).to_string())
         .collect();
     format!("[{}]", parts.join(","))
+}
+
+/// The `binary` roster's structural class as one `"<Shape>|<Well>"` string — the same rendering
+/// [`BINARY_PROBE`] prints. `Shape` is `"[]"` for the empty roster, else `"nonempty"`; `Well` is
+/// `true` when every entry is a 3-tuple whose fields are integers. A roster that is not a list or
+/// an entry that is not a 3-tuple fails loudly, so a malformed answer never compares as a made-up
+/// string.
+///
+/// `Ptr` is an implementation payload address and `Refc` its refcount, so neither is comparable
+/// across runtimes; the cross-check is the shape/emptiness class, never the `Ptr`/`Refc` values
+/// (nor the exact entry count, which an implementation may inflate with off-heap intermediates).
+fn binary_shape(rt: &mut Runtime, roster: Eterm) -> String {
+    let entries = terms::list_elements(roster).expect("the binary roster is a list");
+    let shape = if entries.is_empty() { "[]" } else { "nonempty" };
+    let mut well = true;
+    for entry in &entries {
+        assert_eq!(
+            terms::tuple_arity(*entry).expect("a roster entry"),
+            3,
+            "every binary roster entry is a {{Ptr, Size, Refc}} 3-tuple"
+        );
+        for index in 0..3 {
+            let field = terms::tuple_element(*entry, index).expect("an entry field");
+            well &= is_integer(rt, field);
+        }
+    }
+    format!("{shape}|{well}")
+}
+
+/// Is `term` an integer *by the runtime's own `erlang:is_integer/1`*? The check goes through the
+/// BIF rather than `beam_term`'s small-int accessors on purpose: a payload pointer exceeds the
+/// 60-bit small range and materializes as an exact **bignum**, which must still answer `true` (a
+/// small-int predicate would wrongly reject it).
+fn is_integer(rt: &mut Runtime, term: Eterm) -> bool {
+    let answer = with_context(rt, |ctx| {
+        ctx.call_bif("erlang", "is_integer", 1, &[term])
+    })
+    .expect("erlang:is_integer/1");
+    rt.atom_name_of(answer) == Some("true")
 }
 
 // ---------------------------------------------------------------------------------------
@@ -409,5 +465,37 @@ fn monitors_and_monitored_by_match_the_live_oracle() {
         ),
         expected,
         "the two monitor families must match the live oracle"
+    );
+}
+
+/// The `binary` item matches the live oracle for the **same** fixture. A parked, unregistered
+/// `mailbox:wait/0` holds no off-heap refc binary, so both runtimes answer the empty roster `[]`
+/// — never `undefined`/`badarg` and never a fabricated entry.
+#[test]
+fn the_binary_item_matches_the_live_oracle_for_a_parked_process() {
+    let Some(oracle) = support::require_oracle("process_info_items") else {
+        return;
+    };
+    let Some(scratch) = scratch_with_mailbox() else {
+        return;
+    };
+    let Some(expected) =
+        support::oracle_eval(&oracle, Some(scratch.dir.as_path()), BINARY_PROBE)
+    else {
+        eprintln!("SKIP the live-oracle comparison: the erl probe could not answer");
+        return;
+    };
+    assert_eq!(
+        expected, ORACLE_BINARY_LINE,
+        "the recorded oracle answer for the `binary` item on a parked mailbox:wait/0"
+    );
+
+    let (mut rt, parked) = parked_runtime();
+    let (key, roster) = pair(info(&mut rt, parked, "binary").expect("process_info/2 binary"));
+    assert_eq!(rt.atom_name_of(key), Some("binary"));
+    assert_eq!(
+        binary_shape(&mut rt, roster),
+        expected,
+        "the binary roster's structural class must match the live oracle"
     );
 }

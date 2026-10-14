@@ -41,7 +41,7 @@ use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, TableRegistry};
 use beam_common::BeamError;
 use beam_process::ProcessId;
-use beam_term::{atom_val, signed_value, AtomTable, Eterm};
+use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use std::process::Command;
 
@@ -103,6 +103,14 @@ fn seeded_atoms() -> AtomTable {
         "not_an_option",
         // The value the `{keypos, atom}` rejection probe uses.
         "atom",
+        // The `ets:info/2`-only item names (`fixed`/`safe_fixed*`/`binary`/`stats`
+        // are **not** part of the `info/1` field list). Appended last so no earlier
+        // index moves.
+        "fixed",
+        "safe_fixed",
+        "safe_fixed_monotonic_time",
+        "binary",
+        "stats",
     ]);
     atoms
 }
@@ -1262,5 +1270,162 @@ fn the_distributed_name_node_form_is_not_a_table_argument() {
             .call("ets", "lookup", 2, &mut ctx, &[form, key])
             .expect_err("lookup in {Name,Node}");
         assert!(is_badarg(&err), "lookup({{t,_}},..): {err:?}");
+    }
+}
+
+// ------------------------------------------- info/2-only items (fixed &c.)
+
+/// Whether `err` is the crate's typed `unsupported_bif` capability gap (as
+/// opposed to `badarg` or a fabricated value).
+fn is_unsupported(err: &BeamError) -> bool {
+    err.as_atom() == Some("unsupported_bif")
+}
+
+/// `ets:insert(Tab, {k, Value})`.
+fn insert_k(bifs: &BifRegistry, ctx: &mut BifContext<'_>, handle: Eterm, value: Eterm) {
+    let k = ctx.atom("k").expect("seeded");
+    let obj = ctx.tuple(&[k, value]).expect("fits");
+    bifs.call("ets", "insert", 2, ctx, &[handle, obj])
+        .expect("ets:insert");
+}
+
+/// The oracle (OTP 29.1.1 / erts-17.1) — the `ets:info/2` items that are **not**
+/// part of the `info/1` field list, on ordinary tables:
+/// ```text
+/// 1> T = ets:new(t,[set]), ets:insert(T,{k,1}),
+///    {ets:info(T,fixed), ets:info(T,safe_fixed),
+///     ets:info(T,safe_fixed_monotonic_time), ets:info(T,binary)}.
+/// {false,false,false,[]}
+/// 2> [ets:info(ets:new(t,[K]), fixed) || K <- [ordered_set,bag,duplicate_bag]].
+/// [false,false,false]
+/// 3> ets:safe_fixtable(T,true), {ets:info(T,fixed), ets:info(T,safe_fixed)}.
+/// {true,{{1791,937876,815408},[{<0.10.0>,1}]}}
+/// 4> ets:safe_fixtable(T,false), {ets:info(T,fixed), ets:info(T,safe_fixed)}.
+/// {false,false}
+/// 5> ets:info(T, binary).                % a table holding a binary
+/// [{102480071128512,1000,2}]              % a host address + an ERTS refcount
+/// 6> ets:info(T, stats).                 ets:info(T, bogus).
+/// {256,0.0,0.0,0.0,0,0,0,1}               ** exception error: bad argument
+/// ```
+///
+/// `{fixed, true}` is **not** a creation option in this oracle
+/// (`ets:new(t,[set,{fixed,true}])` ⇒ `badarg`), so `fixed` is purely "is the table
+/// fixed by any process now" (`IS_FIXED(tb)`, `erl_db_util.h:386`) and
+/// `ets:safe_fixtable/2` is the only way to make it `true`.
+///
+/// The three values this crate cannot represent are the **typed gap**, never a
+/// fabrication: `safe_fixed*` on a *fixed* table (`{FixationTime, [{Pid,
+/// RefCount}]}` — the model keeps a single boolean, not a fixation timestamp and
+/// per-process reference counts), `binary` on a table that really holds a binary
+/// (host addresses and ERTS refcounts), and `stats` outright (the interiors'
+/// chain/catree statistics). An unknown item atom stays `badarg`, and none of the
+/// five items appears in `ets:info/1` — whose 15-field order is unchanged.
+#[test]
+fn info_serves_the_fixed_and_binary_items_and_gaps_stats() {
+    let bifs = default_registry();
+    let (mut heap, atoms, mut tables) = parts();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+
+    let one = ctx.int(1).expect("fits");
+    let tf = ctx.atom("true").expect("seeded");
+    let ff = ctx.atom("false").expect("seeded");
+    let set = bare(&mut ctx, "set");
+    let ordered_set = bare(&mut ctx, "ordered_set");
+    let bag = bare(&mut ctx, "bag");
+    let duplicate_bag = bare(&mut ctx, "duplicate_bag");
+
+    // Every kind, populated by an integer-valued object: `fixed`, `safe_fixed`
+    // and `safe_fixed_monotonic_time` are `false` and `binary` is `[]`.
+    for (label, kind) in [
+        ("set", set),
+        ("ordered_set", ordered_set),
+        ("bag", bag),
+        ("duplicate_bag", duplicate_bag),
+    ] {
+        let handle = ets_new_ok(&bifs, &mut ctx, "t", &[kind]);
+        insert_k(&bifs, &mut ctx, handle, one);
+
+        assert!(!info_bool(&bifs, &mut ctx, handle, "fixed"), "{label}: fixed");
+        assert!(
+            !info_bool(&bifs, &mut ctx, handle, "safe_fixed"),
+            "{label}: safe_fixed"
+        );
+        assert!(
+            !info_bool(&bifs, &mut ctx, handle, "safe_fixed_monotonic_time"),
+            "{label}: safe_fixed_monotonic_time"
+        );
+        let binary = ets_info2(&bifs, &mut ctx, handle, "binary").expect("info/2 binary");
+        assert_eq!(binary, NIL, "{label}: binary is []");
+
+        // `stats` needs the interiors' hash-chain/catree statistics (the oracle's
+        // eight- or three-element tuple), which `beam_ets` does not expose — the
+        // typed gap, never a fabricated count.
+        let err = ets_info2(&bifs, &mut ctx, handle, "stats").expect_err("stats gap");
+        assert!(is_unsupported(&err), "{label}: stats: {err:?}");
+    }
+
+    // A fixed table: `fixed` turns `true`; `safe_fixed*`'s fixation tuples need
+    // state the model does not keep, so they stay the typed gap while fixed.
+    let fixed_handle = ets_new_ok(&bifs, &mut ctx, "t", &[set]);
+    insert_k(&bifs, &mut ctx, fixed_handle, one);
+    bifs.call("ets", "safe_fixtable", 2, &mut ctx, &[fixed_handle, tf])
+        .expect("safe_fixtable(T,true)");
+    assert!(
+        info_bool(&bifs, &mut ctx, fixed_handle, "fixed"),
+        "fixed after safe_fixtable(T,true)"
+    );
+    for item in ["safe_fixed", "safe_fixed_monotonic_time"] {
+        let err = ets_info2(&bifs, &mut ctx, fixed_handle, item).expect_err("fixed gap");
+        assert!(is_unsupported(&err), "fixed {item}: {err:?}");
+    }
+    bifs.call("ets", "safe_fixtable", 2, &mut ctx, &[fixed_handle, ff])
+        .expect("safe_fixtable(T,false)");
+    assert!(
+        !info_bool(&bifs, &mut ctx, fixed_handle, "fixed"),
+        "unfixed again"
+    );
+    assert!(
+        !info_bool(&bifs, &mut ctx, fixed_handle, "safe_fixed"),
+        "unfixed safe_fixed"
+    );
+
+    // A table that really holds a binary is the typed gap — the oracle reports
+    // `{BinaryId, Size, RefCount}`, a host address and ERTS's own refcount. The
+    // binary is nested (a list element inside the object's tuple) to exercise the
+    // walk.
+    let bin_handle = ets_new_ok(&bifs, &mut ctx, "t", &[set]);
+    let byte = ctx.int(7).expect("fits");
+    let bytes = ctx.list(&[byte]).expect("fits");
+    let bin = bifs
+        .call("erlang", "list_to_binary", 1, &mut ctx, &[bytes])
+        .expect("list_to_binary");
+    let nested = ctx.list(&[byte, bin]).expect("fits");
+    insert_k(&bifs, &mut ctx, bin_handle, nested);
+    let err = ets_info2(&bifs, &mut ctx, bin_handle, "binary").expect_err("binary gap");
+    assert!(is_unsupported(&err), "binary with content: {err:?}");
+
+    // An unknown item atom is still `badarg` on a live table, and none of the five
+    // item atoms appears in `ets:info/1` (the oracle's 15-field list is unchanged).
+    let err = ets_info2(&bifs, &mut ctx, bin_handle, "not_an_option").expect_err("unknown item");
+    assert!(is_badarg(&err), "unknown item: {err:?}");
+
+    let proplist = ets_info1(&bifs, &mut ctx, bin_handle).expect("ets:info/1");
+    assert_eq!(length(&bifs, &mut ctx, proplist), 15, "info/1 field count");
+    for item in [
+        "fixed",
+        "safe_fixed",
+        "safe_fixed_monotonic_time",
+        "binary",
+        "stats",
+    ] {
+        let key = ctx.atom(item).expect("seeded");
+        let found = bifs
+            .call("lists", "keyfind", 3, &mut ctx, &[key, one, proplist])
+            .expect("lists:keyfind");
+        assert!(
+            is_false(ctx.atoms(), found),
+            "ets:info/1 must not list {item}"
+        );
     }
 }

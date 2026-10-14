@@ -76,10 +76,16 @@
 //! same substitution `src/port.rs` documents for `#Port<0.Num>` and
 //! `src/print.rs`'s `format_term` for `<0.Num.Ser>`/`#Ref<0.0.0.N>`.
 //!
-//! An **external** pid/port/ref is `badarg`: its node is a frozen external term no
-//! byte-exact text can be derived from, exactly as `crate::print`'s `format_term`
-//! treats it. `list_to_ref/1` accepts only the exact `#Ref<0.0.0.N>` shape this
-//! runtime's own ref thing can hold (see [`parse_ref_text`]).
+//! An **external** pid/port/ref is refused with the typed capability gap
+//! `error:unsupported_bif` — deliberately, *not* `badarg`, because the argument is
+//! perfectly valid: its channel number is the index the node-name atom happens to
+//! hold in the *running* VM's atom table, which the frozen external term does not
+//! carry and no function of the term can recover (the verbatim oracle record, the
+//! "local node prints `0`" branch and the seam a faithful rendering would need are
+//! all on [`external_channel_gap`]). Only a *wrong argument type* — a term that is
+//! not a pid/port/ref at all — is `badarg`. `list_to_ref/1` accepts only
+//! the exact `#Ref<0.0.0.N>` shape this runtime's own ref thing can hold (see
+//! [`parse_ref_text`]).
 //!
 //! # `erlang:external_size/1,2`
 //!
@@ -100,7 +106,7 @@
 //! encode — an internal pid with no resolvable local node, a local fun with no
 //! identity — stays the codec's typed `unsupported_external_term`, never a number.
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_codec::term as codec_term;
 use beam_process::{PortId, ProcessId, MAX_PROCESS_NUMBER, MAX_PROCESS_SERIAL};
 use beam_term::prelude::signed_value;
@@ -600,68 +606,181 @@ const REF_TEXT_MAX: usize = 71;
 /// are `badarg`.
 const MAX_REFERENCE: u64 = 1 << 18;
 
-/// The `%T` text of an internal pid as raw bytes — `<channel.number.serial>`
+/// The refusal for the textual conversions' one unreachable case: a pid/port/ref
+/// naming **another** node.
+///
+/// [`pid_text_str`], [`port_text_str`] and [`ref_text_str`] all reject an external
+/// identifier, and the rejection is deliberate: `access::is_pid`/`is_port`/
+/// `is_reference` accept the external forms and the oracle *does* render them, so
+/// this is the documented capability gap — never a fabricated channel number.
+///
+/// The refusal is the crate's typed capability gap
+/// [`BeamError::Raise`](beam_common::BeamError::Raise) with the atom reason
+/// `unsupported_bif` (`error:unsupported_bif`), **not**
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg): the *argument* is a
+/// perfectly valid external pid/port/ref, and `badarg` would falsely claim it was
+/// malformed. Only a *wrong argument type* (a term that is not a pid/port/ref at
+/// all) is `badarg` — that check stays with the callers. The sibling leaf renderer
+/// `crate::print` reaches the same conclusion for the identical situation (an
+/// external pid/port/ref is a typed gap there too).
+///
+/// # Why the text is not derivable from the term
+///
+/// The `%T` renderer prints the identifier's **channel number**
+/// (`erl_printf_term.c:500`, `:512`, `:525`), and for a *foreign* node the C defines
+/// that as `atom_val(x->sysname)` (`dist_entry_channel_no`,
+/// `erl_node_container_utils.h:103-116`): `(x) == erts_this_dist_entry ?
+/// ERST_INTERNAL_CHANNEL_NO (= 0) : atom_val((x)->sysname)`. That is the index the
+/// node-name atom happens to hold **in the running VM's atom table** — pure runtime
+/// state. The frozen external-identifier term cannot carry it: the Milestone-1
+/// substitution in `beam_term::thing::write_external_{pid,port,ref}` stores the node
+/// name as an atom *term* (plus the creation) where the C stores a `dist_entry`
+/// pointer, and this crate's `AtomTable` index is a third, unrelated number.
+///
+/// # Oracle record (OTP 29.1.1 / erts-17.1) — verbatim
+///
+/// One and the same wire pid printed by two runs that differ only in how many atoms
+/// were interned before the decode. The channel is *exactly* the index `foo@bar`
+/// received when the decode interned it:
+///
+/// ```text
+/// $ erl -noshell -eval 'W = <<131,88,119,7,"foo@bar",0,0,0,10,0,0,0,0,0,0,0,0>>,
+///     _ = [list_to_atom("zzzz" ++ integer_to_list(I)) || I <- lists:seq(1,0)],
+///     io:format("atoms=~p channel=~s~n",[erlang:system_info(atom_count),
+///                                        erlang:pid_to_list(binary_to_term(W))]),
+///     halt().'
+/// atoms=10638 channel=<10638.10.0>
+/// $ ...the same, only lists:seq(1,100)...  (100 extra atoms interned first)
+/// atoms=10738 channel=<10738.10.0>
+/// ```
+///
+/// Two different foreign names decoded in one run print consecutive channels, in
+/// decode order:
+///
+/// ```text
+/// $ erl -noshell -eval 'W = fun(N) -> binary_to_term(
+///     <<131,88,119,7,N/binary,0,0,0,1,0,0,0,0,0,0,0,0>>) end,
+///     io:format("~s ~s~n",[erlang:pid_to_list(W(<<"foo@bar">>)),
+///                          erlang:pid_to_list(W(<<"baz@qux">>))]), halt().'
+/// <10636.1.0> <10637.1.0>
+/// ```
+///
+/// All three identifier kinds for the foreign node `foo@barbazqux` (13 characters,
+/// so a `nonode@nohost` image can be patched in place with `binary:replace/3`); the
+/// channel is that name's atom index in the run:
+///
+/// ```text
+/// node(P) == foo@barbazqux
+/// erlang:pid_to_list(P)  == <10640.10.0>
+/// erlang:ref_to_list(R)  == #Ref<10640.210497935.1828192262.122813>
+/// erlang:port_to_list(P) == #Port<10640.7>
+/// ```
+///
+/// The **local** node is the one branch the C resolves statically (the comparison is
+/// by node name; the creation does not enter the printed channel) and it prints
+/// channel `0` — the substitution the three functions below already make for the
+/// internal forms:
+///
+/// ```text
+/// binary_to_term(<<131,88,119,13,"nonode@nohost",0,0,0,1,0,0,0,7,0,0,0,0>>)
+///   => <0.1.7>,  erlang:pid_to_list(…) == <0.1.7>
+/// binary_to_term(<<131,120,119,13,"nonode@nohost",0,0,0,0,0,0,0,0,0,0,0,0>>)
+///   => #Port<0.0>
+/// ```
+///
+/// # What a faithful rendering would need
+///
+/// A **node-identity seam** this crate does not have: the runtime's own node name
+/// (so an external identifier naming *this* node takes the channel-`0` branch) *and*
+/// a node-atom -> dist-channel provider (the running VM's `atom_val`/dist-entry
+/// registry) for every other node. A number taken from this crate's own `AtomTable`
+/// would be a *silently wrong* result — the same conclusion `crate::print`'s module
+/// docs reach for `~p`/`~w`. Both pieces are `beam_rt`-level state; adding either is
+/// a new dependency edge and is reported upward rather than guessed here.
+fn external_channel_gap() -> BeamError {
+    unsupported_bif()
+}
+
+/// The `%T` text of an internal pid — `<channel.number.serial>`
 /// (`erl_printf_term.c:508-519`): the channel is the local node's, then the
-/// process-table number, then the serial. The same shape `crate::print`'s
-/// `format_term` renders (`src/print.rs:328-333`).
+/// process-table number, then the serial.
+///
+/// This is the **one** home of that text: `crate::print`'s leaf renderer splices it
+/// in for an internal pid (the oracle's `io_lib:write1/4` calls the same
+/// `erlang:pid_to_list/1`) instead of re-deriving the shape.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a pid
-/// (`erlang:pid_to_list(5)` ⇒ `badarg`). An **external** pid is likewise `badarg`:
-/// its node is a frozen external term no byte-exact text can be derived from, the
-/// same treatment `crate::print`'s `format_term` gives it.
-fn pid_text(term: Eterm) -> Result<Vec<u8>> {
+/// (`erlang:pid_to_list(5)` ⇒ `badarg`). An **external** pid is a different case:
+/// the argument is valid, but its channel number is not derivable from the term, so
+/// it is the typed capability gap `error:unsupported_bif` (see
+/// [`external_channel_gap`]).
+pub(crate) fn pid_text_str(term: Eterm) -> Result<String> {
     if !access::is_pid(term) {
         return Err(badarg());
     }
-    // `ProcessId::from_eterm` is the crate's pid decode; it is `badarg` for an
-    // external pid (the internal-only immediate).
+    // Stated before the decode, which would reject it anyway (`ProcessId::from_eterm`
+    // is the internal-only immediate): the *reason* is the channel number, see
+    // [`external_channel_gap`].
+    if access::is_external_pid(term) {
+        return Err(external_channel_gap());
+    }
+    // `ProcessId::from_eterm` is the crate's pid decode.
     let pid = ProcessId::from_eterm(term)?;
     Ok(format!(
         "<{}.{}.{}>",
         LOCAL_NODE_NUMBER,
         pid.number(),
         pid.serial()
-    )
-    .into_bytes())
+    ))
 }
 
-/// The `%T` text of an internal port as raw bytes — `#Port<channel.number>`
+/// The `%T` text of an internal port — `#Port<channel.number>`
 /// (`erl_printf_term.c:521-530`), the shape `src/port.rs`'s `port_to_list/1`
-/// builds as a charlist.
+/// builds as a charlist and `crate::print`'s leaf renderer splices in.
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a port,
-/// or is an external one.
-fn port_text(term: Eterm) -> Result<Vec<u8>> {
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a port.
+/// An **external** port is a different case: the argument is valid, but its channel
+/// number is not derivable from the term, so it is the typed capability gap
+/// `error:unsupported_bif` (see [`external_channel_gap`]).
+pub(crate) fn port_text_str(term: Eterm) -> Result<String> {
     if !access::is_port(term) {
         return Err(badarg());
     }
+    if access::is_external_port(term) {
+        return Err(external_channel_gap());
+    }
     let port = PortId::from_eterm(term)?;
-    Ok(format!("#Port<{}.{}>", LOCAL_NODE_NUMBER, port.number()).into_bytes())
+    Ok(format!("#Port<{}.{}>", LOCAL_NODE_NUMBER, port.number()))
 }
 
-/// The `%T` text of an internal reference as raw bytes — `#Ref<channel.n2.n1.n0>`
+/// The `%T` text of an internal reference — `#Ref<channel.n2.n1.n0>`
 /// (`erl_printf_term.c:493-507`; the ref numbers print most significant first).
 ///
 /// The Milestone-1 ref thing is `[header, node, serial, id]`
 /// (`access::make_ref_thing`, this crate's only producer of an internal ref), so it
 /// carries **one** id word; the rendered text is the `#Ref<0.0.0.N>` shape
-/// `src/print.rs`'s `format_ref` already emits.
+/// `crate::print`'s leaf renderer splices in.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a
-/// reference (`erlang:ref_to_list(5)` ⇒ `badarg`), or is an external one (its node
-/// is a frozen external term).
-fn ref_text(term: Eterm) -> Result<Vec<u8>> {
+/// reference (`erlang:ref_to_list(5)` ⇒ `badarg`). An **external** reference is a
+/// different case: the argument is valid, but its channel number is not derivable
+/// from the term, so it is the typed capability gap `error:unsupported_bif` (see
+/// [`external_channel_gap`]).
+pub(crate) fn ref_text_str(term: Eterm) -> Result<String> {
     if !access::is_reference(term) {
         return Err(badarg());
     }
+    if access::is_external_ref(term) {
+        return Err(external_channel_gap());
+    }
     let id = access::ref_thing_id(term)?;
-    Ok(format!("#Ref<{}.0.0.{}>", LOCAL_NODE_NUMBER, id).into_bytes())
+    Ok(format!("#Ref<{}.0.0.{}>", LOCAL_NODE_NUMBER, id))
 }
 
 /// Collects `term` into the bytes of a proper list of byte-sized small integers —
@@ -795,10 +914,12 @@ fn parse_ref_text(bytes: &[u8]) -> Result<u64> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text`].
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-pid, or the
+/// typed capability gap `error:unsupported_bif` for an **external** pid — both per
+/// [`pid_text_str`].
 fn pid_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = pid_text(args[0])?;
-    bytes_to_string(ctx, &text)
+    let text = pid_text_str(args[0])?;
+    bytes_to_string(ctx, text.as_bytes())
 }
 
 /// `pid_to_binary(Pid)` (`bif.c:4879`) — the *same* `%T` bytes as
@@ -807,12 +928,13 @@ fn pid_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text`], or
-/// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when the heap cannot fit the
-/// binary.
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-pid or the typed
+/// capability gap `error:unsupported_bif` for an **external** pid (both per
+/// [`pid_text_str`]), or [`BeamError::Alloc`](beam_common::BeamError::Alloc) when the
+/// heap cannot fit the binary.
 fn pid_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = pid_text(args[0])?;
-    bits::make_binary(ctx.heap(), &text)
+    let text = pid_text_str(args[0])?;
+    bits::make_binary(ctx.heap(), text.as_bytes())
 }
 
 /// `list_to_pid(PidString)` (`bif.c:4532`) — the internal pid the text names.
@@ -840,10 +962,12 @@ fn list_to_pid_1(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text`].
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-reference, or the
+/// typed capability gap `error:unsupported_bif` for an **external** reference — both
+/// per [`ref_text_str`].
 fn ref_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = ref_text(args[0])?;
-    bytes_to_string(ctx, &text)
+    let text = ref_text_str(args[0])?;
+    bytes_to_string(ctx, text.as_bytes())
 }
 
 /// `ref_to_binary(Ref)` (`bif.c:4893`) — the same `%T` bytes as [`ref_to_list_1`],
@@ -851,11 +975,12 @@ fn ref_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text`], or
-/// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-reference or the
+/// typed capability gap `error:unsupported_bif` for an **external** reference (both
+/// per [`ref_text_str`]), or [`BeamError::Alloc`](beam_common::BeamError::Alloc).
 fn ref_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = ref_text(args[0])?;
-    bits::make_binary(ctx.heap(), &text)
+    let text = ref_text_str(args[0])?;
+    bits::make_binary(ctx.heap(), text.as_bytes())
 }
 
 /// `port_to_binary(Port)` (`bif.c:4886`) — the port's `#Port<channel.number>` text as
@@ -863,11 +988,12 @@ fn ref_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`port_text`], or
-/// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-port or the typed
+/// capability gap `error:unsupported_bif` for an **external** port (both per
+/// [`port_text_str`]), or [`BeamError::Alloc`](beam_common::BeamError::Alloc).
 fn port_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = port_text(args[0])?;
-    bits::make_binary(ctx.heap(), &text)
+    let text = port_text_str(args[0])?;
+    bits::make_binary(ctx.heap(), text.as_bytes())
 }
 
 /// `list_to_ref(RefString)` (`bif.c:4712`) — the internal reference the text names.

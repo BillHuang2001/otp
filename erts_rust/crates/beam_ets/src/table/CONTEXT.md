@@ -32,7 +32,9 @@ API and its honest limits.
 - `element.rs` — `Table::update_counter(+_with)`/`update_element` and `relocate_rebuilt_object`.
 - `update.rs` — counter/element operand machinery (incl. an exact small/bignum add).
 - `interior.rs` — the private `pub(crate) trait Interior` + `build_interior`.
-- `view/{mod,read,write,term,iter}.rs` — the guard-scoped views (see `view/CONTEXT.md`).
+- `view/{mod,read,write,term,iter}.rs` — the guard-scoped views (see `view/CONTEXT.md`); `term.rs`
+  declares `TableTerm<'g>` and `HeirView<'g>`, the latter being the tagged heir view
+  `TableWrite::heir` returns.
 
 ## Concurrency (verified)
 `SharedTable`'s lock is a **real** mutual-exclusion lock: a `write` guard spans a whole
@@ -53,15 +55,14 @@ advisory only (throughput, never results) — see the crate `CONTEXT.md`.
   `select_all`; each has a `// SAFETY:` rationale.
 
 ## Known Issues (honest limits found by the Layer-1 honesty audit)
-- **`TableWrite::as_requester` is an escape hatch** (`view/write.rs:147`): it returns
-  `TableAccess<'_>`, whose reads (`access.rs:206,310,334,…`) return bare `Eterm`s aliasing table
-  storage that a caller can return out of a `with_write` closure — the exact wrong-result hazard
-  the views exist to prevent. Documented there as a "residual hazard"; it makes the "view is
-  airtight" framing false (the accurate claim is "only `SharedTable`'s tagged reads are airtight").
-- **`TableWrite::heir` leaks a bare aliasing term** (`view/write.rs:98`): it returns `Option<Heir>`
-  whose public `data: Option<Eterm>` (`ownership.rs:135`) may be a table-owned copy (the
-  `install_heir`/creation-time path), so a bare `Eterm` escapes the guard; `replace_heir`
-  (`ownership.rs:218`) later frees those words. Not flagged in the `heir()` doc.
+- **`TableWrite::as_requester` is the crate's raw access-enforcement seam** (`view/write.rs:168`):
+  it is deliberately **not** lifetime-tagged, because it exists only so that an access-checked
+  operation is reachable from a shared-table view at all (the tagged `TableRead` is owner-level,
+  with no `requester` concept). Its **read** results (`access.rs`) are bare `Eterm`s aliasing table
+  storage **by design**, so a caller can return one out of a `with_write` closure; a caller that
+  needs a read it keeps must use the tagged `TableRead`/`TableTerm` + `copy_into` instead. The
+  accurate framing is therefore "only `SharedTable`'s tagged reads are airtight". Pinned as the
+  residual hazard by `as_requester_reads_are_a_documented_residual_hazard`.
 - **`do_update_counter` can early-return mid-loop** (`element.rs:230-249`): `interior.update_counter(..)?`
   inside the op loop propagates a failure (reachable only on scratch-heap exhaustion, since every
   op is pre-validated) **before** `relocate_rebuilt_object` runs, leaving the interior holding a
@@ -69,11 +70,8 @@ advisory only (throughput, never results) — see the crate `CONTEXT.md`.
 - **`compile_fail` doctests are bare** (no `E0xxx` codes): `view/term.rs:47`, `view/iter.rs:255,283,372`,
   `shared.rs:59`. Verified non-vacuous today (their imports resolve), but a future API rename could
   silently make them vacuous.
-- `read.rs`'s `expect("scratch ensured above")` (`view/read.rs:342,364`) is a panic-on-invariant on
-  a runtime path; `is_heap_exhaustion` (`view/mod.rs:97`) retries any `Alloc(Heap)` error, not
-  provably only scratch exhaustion. Both bounded and non-swallowing.
-- Untested public API: `TableRead::member` (`view/read.rs:163`), `TableTerm::is_bitstring`
-  (`view/term.rs:149`).
+- `is_heap_exhaustion` (`view/mod.rs:97`) retries on any `Alloc(Heap)` error, not provably only
+  scratch-heap exhaustion; the retry is bounded by `SCRATCH_MAX_WORDS` and never swallows the error.
 
 ## Notes for Agents
 - The owner-death transition, heir semantics and `give_away`/`setopts` are **real** oracle-matched

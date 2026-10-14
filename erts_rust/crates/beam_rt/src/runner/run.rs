@@ -80,12 +80,12 @@ impl<'a> RuntimeRunner<'a> {
 /// exempt — and the resume's re-sync rely on.
 ///
 /// The machine's **whole** root set is published — every x register, the whole Erlang stack,
-/// and the FR file **when it is live** ([`gc::publish_roots_full`](crate::context::gc::publish_roots_full),
-/// gated by `publish_fr`). [`RootSet::ALL_LIVE`] is the conservative choice for the x file: the
-/// parked machine's live count is not exposed, over-approximating a copying collector's root
-/// set is always *safe* (it can only keep a term alive, never free a live one), and the FR file
-/// holds `Eterm` term slots at Milestone 1 so a **live** float register is a root like any
-/// other.
+/// and the machine's **live leading float-register (FR) prefix**
+/// ([`gc::publish_roots_full`](crate::context::gc::publish_roots_full), bounded by
+/// `fr_count`). [`RootSet::ALL_LIVE`] is the conservative choice for the x file: the parked
+/// machine's live count is not exposed, over-approximating a copying collector's root set is
+/// always *safe* (it can only keep a term alive, never free a live one), and the FR file holds
+/// `Eterm` term slots at Milestone 1 so a **live** float register is a root like any other.
 ///
 /// # The pending-exception reason is an extra root
 ///
@@ -101,27 +101,47 @@ impl<'a> RuntimeRunner<'a> {
 ///
 /// A `pid` with no process in `table` has nothing to publish into; the machine is left as it is.
 ///
-/// # `publish_fr` — the dead-FR fast path
+/// # `fr_count` — the live-FR prefix, never the whole file
 ///
-/// The FR file is 1024 words and the overwhelming majority of parks leave it entirely `NIL`
-/// (the process never touched a float); appending 1024 `NIL` immediates to the process stack
-/// roots nothing, yet costs a 1024-word copy on every park and a 1024-word relocation on every
-/// collection that follows it. The caller therefore passes `publish_fr` — the `fr_is_live` it
-/// already computed from the post-slice scan (the same scan that pins a live-FR pid) — so the
-/// FR rides the stack only when it is live. The choice is remembered on the engine
-/// (`ProcessEngine::fr_published`) and replayed to [`resume_from_process_roots`], so the resume
-/// scatters exactly the region this park published.
+/// `fr_count` is the number of **leading** FR slots to publish with the stack (the caller
+/// passes [`Machine::fr_mark`](beam_engine::Machine::fr_mark)); it is clamped to the file
+/// length inside the helper, and `0` publishes none. The FR file is 1024 words and the
+/// overwhelming majority of parks leave it entirely `NIL` (the process never touched a float):
+/// appending 1024 `NIL` immediates to the process stack roots nothing, yet costs a 1024-word
+/// copy on every park and a 1024-word relocation on every collection that follows it. The
+/// count is remembered on the engine (`ProcessEngine::fr_published`) and replayed to
+/// [`resume_from_process_roots`], so the resume scatters exactly the region this park
+/// published.
 ///
-/// This is sound because an all-`NIL` FR can carry no live term: the collector gathers the
-/// process's stack as roots, so appending `NIL` words changes nothing about which terms
-/// survive. (And any process whose FR *is* live is pinned by
-/// [`Runtime::pin_process`](crate::runtime::Runtime) and never collected — see the note at the
-/// post-slice scan in [`RuntimeRunner::run`].)
+/// # Why bounding the published region by `fr_mark` is sound
+///
+/// `fr_mark` advances **only** through [`Machine::set_fr`], and after a slice every FR write
+/// went through that seam: the interpreter writes an FR operand exclusively through
+/// `Operand::FloatReg`'s `Machine::set_fr`, and the **baseline JIT tier never writes the FR
+/// file at all** — its emitter refuses an FR destination (such an instruction deopts to the
+/// interpreter, which routes through `set_fr`), generated code holds only the x-register base
+/// (`JitRuntime::x_regs`), and the native driver's sole register-file action is
+/// `Machine::mark_regs_escaped()` (which suppresses the *reset* refill, never advances the
+/// marks). So `fr_mark` is an EXACT upper bound of the live FR prefix: every slot at or above
+/// it is `NIL`.
+///
+/// Being an upper bound is all the soundness needs — and it can only err by OVER-pinning: a
+/// slot written and then left `NIL` still raises the mark, and publishing a `NIL` word keeps a
+/// term alive that would have died anyway. A `NIL` immediate can never be freed into
+/// something live, so publishing `0..fr_mark` can never LOSE a live FR term. The
+/// raw-slice writers ([`Machine::fr_mut`]/[`Machine::x_mut`]/[`Machine::with_roots`]) do not
+/// advance the mark, but the only one reached in this window is this function's own
+/// hand-off, whose scatter relocates the FR slots **in place** (indices preserved, `NIL` left
+/// `NIL`), so a collection can never create a non-`NIL` slot beyond `fr_mark` either.
+///
+/// (And any process whose FR *is* live — `fr_mark() > 0` — is pinned by
+/// [`Runtime::pin_process`](crate::runtime::Runtime) and never collected; see the note at the
+/// post-slice `fr_mark` check in [`RuntimeRunner::run`].)
 pub(super) fn publish_parked_roots(
     table: &mut ProcessTable,
     pid: ProcessId,
     machine: &mut Machine,
-    publish_fr: bool,
+    fr_count: usize,
 ) {
     // Read the reason **before** the root-set borrow: `with_roots` takes `machine` mutably for
     // the duration of the closure, so `pending_exception()` cannot be reached inside it.
@@ -130,7 +150,7 @@ pub(super) fn publish_parked_roots(
         return;
     };
     machine.with_roots(RootSet::ALL_LIVE, |roots| {
-        gc::publish_roots_full(process, &roots, publish_fr)
+        gc::publish_roots_full(process, &roots, fr_count)
     });
     // The extra-root set is exactly the live pending-exception reason: cleared first so a machine
     // with none (or one whose exception was handled) never leaves a stale root behind.
@@ -152,17 +172,17 @@ pub(super) fn publish_parked_roots(
 /// consuming the process's extra roots) and halts the process's collection if their slices no
 /// longer match (see [`RuntimeContext::resync_parked_roots`]).
 ///
-/// `publish_fr` is the value the matching park published the FR file with (the engine's
-/// `ProcessEngine::fr_published`); the resume must pass **the same** value so the relocated
+/// `fr_count` is the count the matching park published the FR prefix with (the engine's
+/// `ProcessEngine::fr_published`); the resume must pass **the same** count so the relocated
 /// stack region is split back into `roots.stack`/`roots.fr` exactly as it was appended (a
 /// mismatch halts the process's collection rather than writing a mis-sized block back).
 pub(super) fn resume_from_process_roots(
     ctx: &mut RuntimeContext<'_>,
     pid: ProcessId,
     machine: &mut Machine,
-    publish_fr: bool,
+    fr_count: usize,
 ) {
-    ctx.resync_parked_roots(pid, machine, publish_fr);
+    ctx.resync_parked_roots(pid, machine, fr_count);
 }
 
 impl ProcessRunner for RuntimeRunner<'_> {
@@ -328,11 +348,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // the machine from the process's authoritative root set before running it (see
             // `resume_from_process_roots`).
             if engine.parked.is_some() {
-                // The FR file is scattered back only if the park that suspended this machine
-                // published it (`ProcessEngine::fr_published`), so the relocated stack region
-                // is split exactly as the park appended it.
-                let fr_published = engine.fr_published;
-                resume_from_process_roots(&mut ctx, pid, &mut engine.machine, fr_published);
+                // The FR prefix is scattered back only as far as the park published it
+                // (`ProcessEngine::fr_published`), so the relocated stack region is split
+                // exactly as the park appended it.
+                let fr_count = engine.fr_published;
+                resume_from_process_roots(&mut ctx, pid, &mut engine.machine, fr_count);
                 // The parked window is over: clear the park arm's relocation exemption so
                 // the running slice below can collect this process normally. (A process
                 // resumed from a pre-emption was never marked; clearing is a no-op there.)
@@ -461,31 +481,50 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // `Machine::fr` from the admission point, so pinning is the only safe reaction (see
         // `runtime::gc`).
         //
-        // The scan runs **once** per slice and its answer (`fr_is_live`) is reused for both
-        // reactions below: the pin, and the park's decision to publish the FR file into the
-        // process stack (`publish_parked_roots`'s `publish_fr`). The two are two halves of one
-        // fact — a process with a live FR is pinned *and* must have that FR relocated — so they
-        // are derived from one scan, never scanned twice.
+        // The live prefix is read **once** per slice and its count (`fr_count`) is reused for
+        // both reactions below: the pin, and the park's decision how much of the FR file to
+        // publish into the process stack (`publish_parked_roots`). The two are two halves of
+        // one fact — a process with a live FR is pinned *and* must have that FR relocated — so
+        // they are derived from one read, never read twice.
         //
-        // # Why the park's FR skip is sound against every collection site
+        // # Why `fr_mark` is the right — and exact — bound
         //
-        // A process whose FR is all `NIL` carries no live FR term, so omitting the 1024 FR
-        // words from its published root set cannot lose a term. Every site that can move a
-        // process heap collects a process for which that fact holds:
+        // [`Machine::fr_mark`] is one past the highest FR slot a [`Machine::set_fr`] has
+        // written since the machine's last reset, so it bounds the live FR prefix: every slot
+        // at or above it is `NIL`. It is **exact** after a slice because every FR write in this
+        // engine goes through `set_fr`: the interpreter writes an FR operand only through
+        // `Operand::FloatReg`, and the **baseline JIT tier never writes the FR file** — its
+        // emitter refuses an FR destination (such an instruction deopts to the interpreter,
+        // which then routes through `set_fr`), generated code holds only the x-register base
+        // (`JitRuntime::x_regs`), and the native driver's only register-file action is
+        // `Machine::mark_regs_escaped()`, which suppresses the *reset* refill rather than
+        // advancing the marks.
+        //
+        // Bounding by an upper bound is the safe direction even where it is not exact: it can
+        // only OVER-pin (a slot written and then left `NIL` still raises the mark, and
+        // publishing a `NIL` immediate keeps a term alive that would have died anyway — it can
+        // never free one), so publishing `0..fr_mark` can never lose a live FR term. And a
+        // collection scatter cannot create a non-`NIL` slot beyond `fr_mark`: the hand-off
+        // relocates the FR region IN PLACE (indices preserved, `NIL` left `NIL`).
+        //
+        // # Why a *bounded* FR publication is sound against every collection site
+        //
+        // A process whose FR prefix is empty (`fr_mark() == 0`) carries no live FR term at all,
+        // so omitting the FR words from its published root set cannot lose a term. Every site
+        // that can move a process heap collects a process for which that fact holds:
         //   * the two full-root **in-slice** doors (`context::gc::{ensure_heap_full,
-        //     alloc_words_rooted}`) publish the FR unconditionally (they pass `true`), and the
-        //     narrow door (`ensure_heap`) already ignores the FR entirely — it is gated by the
-        //     caller-module float guard, and a non-float module's process that still holds a
-        //     live FR (a callee's leftover) is pinned by this very scan;
+        //     alloc_words_rooted}`) publish the **whole** FR file (they pass its length), and
+        //     the narrow door (`ensure_heap`) already ignores the FR entirely — it is gated by
+        //     the caller-module float guard, and a non-float module's process that still holds
+        //     a live FR (a callee's leftover) is pinned by this very check;
         //   * `Runtime::serve_gc_request` and `Process::deliver`'s growth cascade can collect a
         //     process the pin does not cover, but such a process's FR is all `NIL` — it was
-        //     measured dead by the scan at the end of its last slice (the FR can only be
-        //     written while the process runs), and a live one would have been pinned. Appending
-        //     `NIL` immediates to that root set is a no-op, so the collection outcome is
-        //     identical whether or not the FR words are published.
-        let fr_is_live = (0..beam_engine::machine::MAX_FLOAT_REGISTER)
-            .any(|index| engine.machine.get_fr(index).is_some_and(|fr| fr != beam_term::NIL));
-        if fr_is_live {
+        //     measured dead by this check at the end of its last slice (the FR can only be
+        //     written while the process runs), and a live one would have been pinned. An absent
+        //     or `NIL` FR word in that root set is a no-op, so the collection outcome is
+        //     identical whether or not those words are published.
+        let fr_count = engine.machine.fr_mark() as usize;
+        if fr_count > 0 {
             self.runtime.pin_process(pid);
         }
         // The `+JPperf` map (contract A.8) must describe the **real** native code this runtime
@@ -494,6 +533,55 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // per slice. Diagnostic only: `record_baseline_code` records, never propagates.
         if let Some(module) = first_entry_export.as_deref() {
             record_baseline_code(self.runtime, module);
+        }
+
+        // Register the off-heap refc binaries this machine built onto the **running process's**
+        // own off-heap table, so `erlang:process_info(Pid, binary)` has a roster to report.
+        //
+        // The real *holders* of those payloads are this machine's never-cleared reservoir
+        // (`Machine::refc_binaries`, appended by `Machine::alloc_refc_binary` whenever compiled
+        // bitstring code materializes a result above the on-heap limit and never emptied by
+        // `Machine::reset`), while the roster `process_info` reads back is
+        // `beam_process::Process`'s own table — the thing
+        // `Process::off_heap_binaries`/`off_heap_binary_count` enumerate — which is empty until
+        // something **registers** them, and nothing else in production does. This seam is what
+        // makes a running process come to *own* what its engine built.
+        //
+        // # Why this can never under-report
+        //
+        // The seam sits on the common path below the slice and above the outcome dispatch, so
+        // it runs on **every** slice outcome — a pre-emption (`Yield`), a `receive` park
+        // (`Wait`), a `Returned` and an `Err` alike (the last two belong to a process that is
+        // about to terminate, so their registration is merely harmless). A process's roster is
+        // therefore a superset of every payload its machine had built when any of its slices
+        // ended. The one window it does not cover is a `process_info(self(), binary)` issued
+        // from **inside** the running slice itself, before that slice reaches this point: the
+        // roster such a process reads back about itself can omit a binary the same slice has
+        // just built. That is safe rather than a lost term — the `Machine::refc_binaries`
+        // reservoir (of which this registration is only a mirror) is what keeps the payload
+        // alive, so a registration that has not happened yet can never *dangle* a payload; the
+        // worst it can do is omit an entry from a roster the process reads back about itself.
+        //
+        // # Why over-reporting is the safe and faithful direction
+        //
+        // Because the reservoir is never cleared, re-registering the whole of it on every slice
+        // re-lists a payload that `Process::sweep_off_heap_binaries_reachable` pruned at an
+        // earlier rooted collection. That costs nothing: `register_off_heap_binary` is
+        // dedup-by-`data_ptr` and idempotent (re-registering an existing slot drops the surplus
+        // handle), so repeats are cheap and slot-stable. And the over-report itself **mirrors
+        // the oracle**, which likewise lists a dropped binary until a GC collects it — so
+        // listing a payload the never-cleared reservoir still owns is both the safe and the
+        // faithful direction, never a fabricated entry.
+        //
+        // # Why `Runtime::eval_off_heap` is deliberately NOT registered here
+        //
+        // That store is the **pid-less** home of the `-eval` root process's escaping payloads,
+        // not this machine's work. Attributing it to this process would fabricate a roster entry
+        // for a payload the process never built, so it stays out of this seam entirely.
+        if let Some(process) = table.get_mut(pid) {
+            for payload in engine.machine.refc_binaries() {
+                process.register_off_heap_binary(payload.clone());
+            }
         }
 
         // Pre-emption: the budget ran out at a charging point of this slicing machine
@@ -525,14 +613,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
             engine.parked_timeout = None;
             // Publish the machine's roots before the engine is parked: a collection driven
             // while this process sits in `RunnerState.engines` must be able to relocate the
-            // heap against the machine's live terms (see `publish_parked_roots`). The FR file
-            // is published only when the scan above found it live; the same choice is stored on
-            // the engine so the resume scatters exactly this region back.
-            engine.fr_published = fr_is_live;
-            publish_parked_roots(table, pid, &mut engine.machine, fr_is_live);
+            // heap against the machine's live terms (see `publish_parked_roots`). The FR prefix
+            // is published exactly as far as `fr_mark` measured it live; the same count is
+            // stored on the engine so the resume scatters exactly this region back.
+            engine.fr_published = fr_count;
+            publish_parked_roots(table, pid, &mut engine.machine, fr_count);
             // A `garbage_collect` request (see `Runtime::request_gc`) that no heap-admission
             // point served is honoured **here**: the roots are just published and the
-            // machine's float-register file is provably dead (the scan above pinned the pid
+            // machine's float-register file is provably dead (the check above pinned the pid
             // otherwise), so this is a legitimate collection site.
             self.runtime.serve_gc_request(table, pid);
             self.state.engines.insert(pid, engine);
@@ -626,11 +714,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // Publish the machine's roots before the engine is parked. The parked process
                 // is relocation-exempt (set above), so the parked window itself is not
                 // collected over; the publication is what the `Yield` window (never exempt)
-                // and the resume's re-sync rely on (see `publish_parked_roots`). The FR file is
-                // published only when the scan above found it live, and the same choice is
-                // stored on the engine for the resume to replay.
-                engine.fr_published = fr_is_live;
-                publish_parked_roots(table, pid, &mut engine.machine, fr_is_live);
+                // and the resume's re-sync rely on (see `publish_parked_roots`). The FR prefix
+                // is published exactly as far as `fr_mark` measured it live, and the same
+                // count is stored on the engine for the resume to replay.
+                engine.fr_published = fr_count;
+                publish_parked_roots(table, pid, &mut engine.machine, fr_count);
                 // A pending `garbage_collect` request (see `Runtime::request_gc`) is **not**
                 // served here: the exemption set above declines it — `serve_gc_request`
                 // consults `Process::is_relocation_exempt` before committing to a collection —

@@ -92,6 +92,18 @@
 //!
 //! (The family's `driver_create_port` observable has no case for the blocking reason above.)
 //!
+//! # The widened port-lifecycle observables
+//!
+//! Six further selectors (`10`-`15`) stay on the **echo fixture** ([`HOST_DRIVER_C`]) and widen
+//! what the port itself reports, with every answer a yes/no question the module computes in
+//! Erlang: two sequential `port_command/2` payloads each echoed back in order (`10`), the
+//! `erlang:ports/0` membership that appears on open and disappears after `port_close/1` (`11`),
+//! `port_info(P, connected)` naming the opening process (`12`), `port_command/3` with
+//! `[nosuspend]` (`13`), a three-command sequence whose echoes come back in the same order
+//! (`14`), and the fresh port's `{input, 0}`/`{output, 0}` counters (`15`). They need no new C
+//! slot — the driver's `output` callback is the only observable channel — so they are pure
+//! port-lifecycle coverage over the same `.so`.
+//!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
 //! A C-compiled fixture needs a C compiler *and* the host `erl_driver.h`; when either is
@@ -152,8 +164,35 @@ classify(N) ->
         %% means the runtime answered the slot the way the oracle does; anything else is the
         %% documented capability gap.
         8 -> registry_answer(open(Dir, ""), <<"lock">>, unsupported_driver_lock_driver);
-        9 -> registry_answer(open(Dir, ""), <<"entry">>, unsupported_add_remove_driver_entry)
+        9 -> registry_answer(open(Dir, ""), <<"entry">>, unsupported_add_remove_driver_entry);
+        %% `10`-`15` widen the *port-lifecycle* observables over the same echo driver: the
+        %% driver's `output` callback carries the `port_command/2` payload back, so every answer
+        %% is a yes/no question about the port rather than about the ABI.
+        10 -> P = open(Dir, ""),
+              yn(echo(P, <<"ab">>) =:= <<"ab">> andalso echo(P, <<"cd">>) =:= <<"cd">>);
+        11 -> P = open(Dir, ""),
+              Before = lists:member(P, erlang:ports()),
+              true = erlang:port_close(P),
+              After = lists:member(P, erlang:ports()),
+              yn(Before andalso not After);
+        12 -> P = open(Dir, ""),
+              yn(erlang:port_info(P, connected) =:= {connected, self()});
+        13 -> P = open(Dir, ""),
+              true = erlang:port_command(P, <<"sus">>, [nosuspend]),
+              receive {P, {data, Nosuspend}} -> yn(Nosuspend =:= <<"sus">>)
+              after 2000 -> 0 end;
+        14 -> P = open(Dir, ""),
+              yn([echo(P, <<Ch>>) || Ch <- "xyz"] =:= [<<"x">>, <<"y">>, <<"z">>]);
+        15 -> P = open(Dir, ""),
+              yn(erlang:port_info(P, input) =:= {input, 0}
+                 andalso erlang:port_info(P, output) =:= {output, 0})
     end.
+
+%% Send one payload through the driver and answer the bytes it echoed back (`timeout` when the
+%% driver answered nothing within the module's own 2 s bound, so a case can never hang).
+echo(P, Bin) ->
+    true = erlang:port_command(P, Bin),
+    receive {P, {data, Bytes}} -> Bytes after 2000 -> timeout end.
 
 %% Send the fixture's command and classify the one-byte answer it echoes back.
 registry_answer(P, Command, Gap) ->
@@ -532,6 +571,43 @@ pub(crate) fn group() -> Vec<Case> {
             &[9],
             ENTRY_DRIVER,
         ),
+        // --- the port-lifecycle observables widened over the same echo driver ----------------
+        case(
+            "driver_c/driver_output_delivers_two_sequential_commands_in_order",
+            "two port_command/2 payloads are each echoed back by the driver, in order",
+            &[10],
+            HOST_DRIVER,
+        ),
+        case(
+            "driver_c/ports_membership_follows_port_close",
+            "erlang:ports/0 lists an open driver port and drops it once port_close/1 stops the driver",
+            &[11],
+            HOST_DRIVER,
+        ),
+        case(
+            "driver_c/port_info_connected_is_the_opening_process",
+            "port_info(P, connected) names the process that opened the driver port",
+            &[12],
+            HOST_DRIVER,
+        ),
+        case(
+            "driver_c/port_command3_nosuspend_reaches_the_driver_output_callback",
+            "port_command/3 with the nosuspend option hands the bytes to the driver's output callback",
+            &[13],
+            HOST_DRIVER,
+        ),
+        case(
+            "driver_c/driver_output_preserves_a_command_sequence",
+            "a sequence of port_command/2 payloads is echoed back as the same sequence",
+            &[14],
+            HOST_DRIVER,
+        ),
+        case(
+            "driver_c/port_info2_input_and_output_start_at_zero",
+            "a freshly opened driver port reports {input, 0} and {output, 0}",
+            &[15],
+            HOST_DRIVER,
+        ),
     ]
 }
 #[cfg(test)]
@@ -541,7 +617,7 @@ mod tests {
     //! C fixture, and its golden is an integer. The three registry-family selectors (`7`, `8`,
     //! `9`) each carry their **own** C source, so a case's temp dir holds exactly one `.so`.
 
-    use super::{group, CaseKind, Contract, NifFixture};
+    use super::{group, CaseKind, Contract, NifFixture, HOST_DRIVER_C};
     use std::collections::HashSet;
 
     #[test]
@@ -573,12 +649,18 @@ mod tests {
             assert_eq!(name, "host_driver", "case {}: the driver name is fixed", case.id);
             // The registry-family cases must not share a C source: each gets its own `.so` so a
             // case's temp dir holds exactly one library.
-            if run.args[0] >= 7 {
+            if (7..=9).contains(&run.args[0]) {
                 assert!(
                     sources.insert(c_source),
                     "case {}: selector {} reuses another case's C source",
                     case.id,
                     run.args[0]
+                );
+            } else {
+                assert_eq!(
+                    c_source, HOST_DRIVER_C,
+                    "case {}: every port-lifecycle selector drives the echo fixture",
+                    case.id
                 );
             }
             assert!(
@@ -600,7 +682,7 @@ mod tests {
             group().len(),
             "every selector is distinct"
         );
-        assert_eq!(selectors.len(), 9, "the group covers nine distinct selectors");
+        assert_eq!(selectors.len(), 15, "the group covers fifteen distinct selectors");
         assert_eq!(sources.len(), 3, "the three registry selectors carry three C sources");
     }
 }

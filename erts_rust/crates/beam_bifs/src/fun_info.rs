@@ -54,29 +54,48 @@
 //!                       refc=>1 env=>[7] function => badarg
 //! ```
 //!
+//! # `FunKind::Imported` (`NEW_FUN_EXT`) — the described fun
+//!
+//! The C decoder builds a `NEW_FUN_EXT` into a **local** fun
+//! (`MAKE_FUN_HEADER(arity, num_free, 0)`, `external.c:5127`) whose out-of-line
+//! `ErlFunEntry` is stubbed from the wire fields by
+//! `erts_fun_entry_get_or_make_stub` (`external.c:5162`) — so the oracle reports
+//! `{type,local}` / `{refc,1}` for it, and every identity item is read from that
+//! stub (`erl_bif_info.c:3956-3980`). This tree **inlines** those `ErlFunEntry`
+//! fields into the term descriptor (`beam_term::fun`, the frozen layout owner), and
+//! for `FunKind::Imported` the descriptor carries **the whole wire signature**:
+//! `module`, the 16-byte MD5 `uniq`, `index`, `old_index` and `old_uniq`
+//! (`beam_term::fun::FUN_DESC_WORDS_IMPORTED`). Those five identity items are
+//! therefore answered exactly:
+//!
+//! ```text
+//! fun_info(F, module)    => the wire module atom
+//! fun_info(F, new_index) => the wire `index`     (`fe->index`)
+//! fun_info(F, new_uniq)  => the wire 16-byte MD5 (`fe->uniq`)
+//! fun_info(F, index)     => the wire `old_index` (`fe->old_index`)
+//! fun_info(F, uniq)      => the wire `old_uniq`  (`fe->old_uniq`)
+//! fun_to_list(F)         => "#Fun<Module.OldIndex.OldUniq>"
+//! ```
+//!
+//! `index`/`old_index`/`old_uniq` are `int` fields in C (`erl_fun.h:31-59`) and are
+//! read back sign-extended, so a wire value above `2^31 - 1` renders negative
+//! (oracle-verified: a wire `old_uniq` of `0xFFFFFFFF` ⇒ `{uniq,-1}` and
+//! `"#Fun<Mod.OldIndex.-1>"`).
+//!
 //! # Honest gaps (never a fabricated value)
 //!
-//! The rewrite **inlines** the C `ErlFunThing.entry` pointer into the term
-//! descriptor (`beam_term::fun`, the frozen layout owner; see also
-//! `beam_engine::terms::fun`), so a `FunKind::Local` (`make_fun3`) fun carries an
-//! opaque `(uniq:u64, index:u32)` pair and **no** module atom, no 16-byte MD5, no
-//! `old_index` — i.e. no `ErlFunEntry` fields that the oracle's `module`, `name`,
-//! `new_index`, `new_uniq`, `index` and `uniq` items are read from
-//! (`erl_bif_info.c:3956-3980,4007-4011`). Those six items therefore return the
-//! typed [`crate::error::unsupported_bif`] for a `Local` (or `Imported`) fun
-//! rather than inventing a module/MD5/index. The same gap applies to
-//! `fun_info_mfa/1` and `fun_to_list/1` of a local fun, both of which need the
-//! resolved MFA (`#Fun<Module.OldIndex.OldUniq>`, `erl_printf_term.c:680-694`).
+//! Two things stay out of reach and are the typed
+//! [`crate::error::unsupported_bif`] rather than a guess:
 //!
-//! `FunKind::Imported` is the M1 shape of a `NEW_FUN_EXT`-decoded fun. The C
-//! decoder builds it as a **local** fun (`MAKE_FUN_HEADER(arity, num_free, 0)`,
-//! `external.c:5127`) whose entry is stubbed by
-//! `erts_fun_entry_get_or_make_stub` (`external.c:5162`), so the oracle reports
-//! `{type,local}` / `{refc,1}` for it; this module reproduces exactly that for the
-//! kind-independent items (`type`, `arity`, `env`, `refc`) and keeps the six
-//! identity items as the honest typed gap (the descriptor cannot express the
-//! oracle's loaded-vs-unloaded MFA resolution, nor the module's checksum-derived
-//! `new_uniq` for the *bare* `Exported`/loaded distinction).
+//! * **`name`** — and therefore `fun_info_mfa/1`'s *function* element — needs the
+//!   **loaded module's** fun table (`erts_get_fun_mfa`, `erl_bif_info.c:3944-3947`),
+//!   a resolution the term descriptor deliberately does not (and must not)
+//!   reference.
+//! * **Every identity item of a `FunKind::Local` (`make_fun3`) fun** — its inlined
+//!   descriptor is only the opaque `(uniq:u64, index:u32)` pair: no module atom, no
+//!   16-byte MD5, no `old_index`, no `old_uniq`. `fun_info_mfa/1` and
+//!   `fun_to_list/1` of a `Local` fun are the same gap (both need the resolved MFA,
+//!   `#Fun<Module.OldIndex.OldUniq>`, `erl_printf_term.c:680-694`).
 //!
 //! # Produced atoms are interned on demand
 //!
@@ -120,6 +139,7 @@
 //! constructor).
 
 use beam_common::Result;
+use beam_term::fun::FunKind;
 use beam_term::{atom_val, Eterm, NIL};
 
 use crate::access;
@@ -146,7 +166,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 ///
 /// A non-fun first argument, a non-atom second argument, or an item atom outside
 /// the supported set is `badarg`; every value is oracle-pinned (see the module
-/// docs), with the six local/imported identity items as the documented typed gap.
+/// docs). An `Imported` (`NEW_FUN_EXT`) fun answers its five identity items from
+/// the inlined wire descriptor; a `Local` (`make_fun3`) fun keeps them as the
+/// documented typed gap, and `name` is a gap for both.
 fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     // C checks the fun first, so `fun_info(42, [type])` is `badarg` too.
@@ -164,15 +186,19 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // ([`BifContext::intern_atom`]).
     let item = item_of(ctx, what);
 
-    let external = beam_codec::term::fun_kind_term(fun)? == beam_codec::term::FunKind::External;
+    let kind = beam_codec::term::fun_kind_term(fun)?;
 
     let value = match item {
-        // `am_type`: local (incl. a decoded `NEW_FUN_EXT`) vs external. The two
-        // value atoms are produced here, so they are interned on demand — neither
-        // `external` nor `local` is guaranteed to be in the runtime's table, and the
-        // lookup-only `BifContext::atom` would abort the whole process with an
-        // uncatchable `TermNotFound`.
-        Item::Type => ctx.intern_atom(if external { "external" } else { "local" })?,
+        // `am_type`: the C's `is_local_fun(funp) ? am_local : am_external`. A
+        // decoded `NEW_FUN_EXT` is built as a local fun there, so an `Imported` fun
+        // reports `local` here too. The two value atoms are produced here, so they
+        // are interned on demand — neither `external` nor `local` is guaranteed to
+        // be in the runtime's table, and the lookup-only `BifContext::atom` would
+        // abort the whole process with an uncatchable `TermNotFound`.
+        Item::Type => ctx.intern_atom(match kind {
+            FunKind::External => "external",
+            FunKind::Local | FunKind::Imported => "local",
+        })?,
         // `am_arity`: the *closure* arity (total lambda arity minus the captures).
         // The C reads `fun_arity(funp)` — the **header's 8-bit field**, so an
         // `EXPORT_EXT` fun with true arity 256 reports `0` and true arity 300
@@ -186,43 +212,65 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             ctx.list(&owned)?
         }
         // `am_refc`: always 1 for a local/imported fun, `undefined` for external.
-        Item::Refc => {
-            if external {
-                ctx.intern_atom("undefined")?
-            } else {
-                ctx.int(1)?
+        Item::Refc => match kind {
+            FunKind::External => ctx.intern_atom("undefined")?,
+            FunKind::Local | FunKind::Imported => ctx.int(1)?,
+        },
+        // `am_new_index` / `am_new_uniq`: `undefined` for an external fun; the
+        // stubbed `ErlFunEntry`'s `index` / 16-byte `uniq` for a local one. An
+        // `Imported` fun's descriptor carries the wire `index` and MD5, so both are
+        // answered exactly (`make_small(fe->index)` / `erts_new_binary_from_data(p,
+        // 16, fe->uniq)`, `erl_bif_info.c:3961-3968`). A `Local` (`make_fun3`) fun
+        // has neither field — the documented typed gap. `fe->index` is an `int`, so
+        // the value is sign-extended (a wire `index` above `2^31 - 1` is negative).
+        Item::NewIndex => match kind {
+            FunKind::External => ctx.intern_atom("undefined")?,
+            FunKind::Imported => ctx.int(beam_codec::term::fun_index(fun)? as i32 as i64)?,
+            FunKind::Local => return Err(error::unsupported_bif()),
+        },
+        Item::NewUniq => match kind {
+            FunKind::External => ctx.intern_atom("undefined")?,
+            FunKind::Imported => {
+                let uniq = beam_codec::term::fun_uniq_bytes(fun)?;
+                beam_codec::term::make_binary(ctx.heap(), &uniq)?
             }
-        }
-        // `am_undefined` items: the C reports `undefined` for every fun that is
-        // not local. A local/imported fun needs `ErlFunEntry` fields the frozen
-        // descriptor does not carry — the documented typed gap.
-        Item::Undefined => {
-            if external {
-                ctx.intern_atom("undefined")?
-            } else {
-                return Err(error::unsupported_bif());
-            }
-        }
-        // `am_module`: the export's module atom for an external fun; a local fun
-        // would need `ErlFunEntry.module` (absent from the descriptor).
-        Item::Module => {
-            if external {
+            FunKind::Local => return Err(error::unsupported_bif()),
+        },
+        // `am_index` / `am_uniq`: the stubbed `ErlFunEntry`'s `old_index` /
+        // `old_uniq` (`make_small(fe->old_index)` / `make_small(fe->old_uniq)`,
+        // `erl_bif_info.c:3969-3980`) — both wire fields of an `Imported` fun and
+        // both `int` in C, hence sign-extended here as well.
+        Item::Index => match kind {
+            FunKind::External => ctx.intern_atom("undefined")?,
+            FunKind::Imported => ctx.int(beam_codec::term::fun_old_index(fun)? as i32 as i64)?,
+            FunKind::Local => return Err(error::unsupported_bif()),
+        },
+        Item::Uniq => match kind {
+            FunKind::External => ctx.intern_atom("undefined")?,
+            FunKind::Imported => ctx.int(beam_codec::term::fun_old_uniq(fun)? as i32 as i64)?,
+            FunKind::Local => return Err(error::unsupported_bif()),
+        },
+        // `am_module`: the export's module atom for an external fun; for a local
+        // fun the C falls back to the stubbed `fe->module`, which an `Imported`
+        // fun's descriptor carries. A `make_fun3` fun would need `ErlFunEntry.module`
+        // (absent from its descriptor) — the documented typed gap.
+        Item::Module => match kind {
+            FunKind::External | FunKind::Imported => {
                 let name = atom_term_name(ctx, fun_module(fun)?)?;
                 ctx.atom(&name)?
-            } else {
-                return Err(error::unsupported_bif());
             }
-        }
-        // `am_name`: the export's function atom for an external fun; a local fun
-        // needs the resolved MFA (`erts_get_fun_mfa`).
-        Item::Name => {
-            if external {
+            FunKind::Local => return Err(error::unsupported_bif()),
+        },
+        // `am_name`: the export's function atom for an external fun; for a local
+        // fun it is `mfa->function` — the *loaded module's* fun table, which the
+        // descriptor cannot supply (an unloaded fun even yields `[]`).
+        Item::Name => match kind {
+            FunKind::External => {
                 let name = atom_term_name(ctx, fun_function(fun)?)?;
                 ctx.atom(&name)?
-            } else {
-                return Err(error::unsupported_bif());
             }
-        }
+            FunKind::Local | FunKind::Imported => return Err(error::unsupported_bif()),
+        },
         // Every other item atom (`function`, `md5`, `nargs`, …) is `badarg`.
         Item::Other => return Err(error::badarg()),
     };
@@ -247,9 +295,18 @@ enum Item {
     Env,
     /// `refc` — `1` for a local/imported fun, `undefined` for an external one.
     Refc,
-    /// `new_index`/`new_uniq`/`index`/`uniq` — `undefined` for an external fun, the
-    /// documented typed gap for a local/imported one.
-    Undefined,
+    /// `new_index` — `undefined` for an external fun; the stubbed entry's `index`
+    /// for an `Imported` one; the documented typed gap for a `Local` one.
+    NewIndex,
+    /// `new_uniq` — `undefined` for an external fun; the stubbed entry's 16-byte
+    /// MD5 as a binary for an `Imported` one; the typed gap for a `Local` one.
+    NewUniq,
+    /// `index` — `undefined` for an external fun; the stubbed entry's `old_index`
+    /// for an `Imported` one; the typed gap for a `Local` one.
+    Index,
+    /// `uniq` — `undefined` for an external fun; the stubbed entry's `old_uniq`
+    /// for an `Imported` one; the typed gap for a `Local` one.
+    Uniq,
     /// `module`.
     Module,
     /// `name`.
@@ -269,7 +326,10 @@ fn item_of(ctx: &BifContext<'_>, what: Eterm) -> Item {
         Some("arity") => Item::Arity,
         Some("env") => Item::Env,
         Some("refc") => Item::Refc,
-        Some("new_index" | "new_uniq" | "index" | "uniq") => Item::Undefined,
+        Some("new_index") => Item::NewIndex,
+        Some("new_uniq") => Item::NewUniq,
+        Some("index") => Item::Index,
+        Some("uniq") => Item::Uniq,
         Some("module") => Item::Module,
         Some("name") => Item::Name,
         _ => Item::Other,
@@ -282,14 +342,15 @@ fn item_of(ctx: &BifContext<'_>, what: Eterm) -> Item {
 /// `erlang:fun_info_mfa/1` (`erl_bif_info.c:4020`).
 ///
 /// `{Module, Function, Arity}` for an external fun; a non-fun is `badarg`. A
-/// local/imported fun needs the resolved MFA (module + lambda name) the inlined
-/// descriptor cannot supply — the documented typed gap.
+/// local/imported fun needs the resolved MFA's *function* atom — the loaded
+/// module's fun table (`erts_get_fun_mfa`) — which the inlined descriptor does not
+/// carry, so both remain the documented typed gap.
 fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     if !access::is_function(fun) {
         return Err(error::badarg());
     }
-    if beam_codec::term::fun_kind_term(fun)? != beam_codec::term::FunKind::External {
+    if beam_codec::term::fun_kind_term(fun)? != FunKind::External {
         return Err(error::unsupported_bif());
     }
     let module = atom_term_name(ctx, fun_module(fun)?)?;
@@ -316,29 +377,47 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `Arity` is the **true** arity (`ep->info.mfa.arity`, descriptor word 3 for an
 /// external fun) — so this reader differs from `fun_info/2`'s `arity` item and
 /// `fun_info_mfa/1` for an arity above 255 (module docs).
-/// A non-fun is `badarg`; a local/imported fun would need the `#Fun<M.OldIndex.
-/// OldUniq>` triple from its `ErlFunEntry` — the documented typed gap.
+///
+/// An `Imported` (`NEW_FUN_EXT`) fun takes the printer's **local-fun** arm
+/// (`erl_printf_term.c:676-694`): `"#Fun<Module.OldIndex.OldUniq>"`, with the raw
+/// module atom name (no `print_atom_name` quoting) and the stubbed entry's signed
+/// `old_index`/`old_uniq` — all three carried by its descriptor.
+///
+/// A non-fun is `badarg`; a `FunKind::Local` (`make_fun3`) fun would need the same
+/// triple from an `ErlFunEntry` its opaque descriptor does not have — the
+/// documented typed gap.
 fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     if !access::is_function(fun) {
         return Err(error::badarg());
     }
-    if beam_codec::term::fun_kind_term(fun)? != beam_codec::term::FunKind::External {
-        return Err(error::unsupported_bif());
-    }
-    let module = atom_term_name(ctx, fun_module(fun)?)?;
-    let function = atom_term_name(ctx, fun_function(fun)?)?;
-    // The `FUN_DEF` printer uses the **true** arity (`ep->info.mfa.arity`,
-    // `erl_printf_term.c:721-723`), *not* the header's 8-bit field: an
-    // `EXPORT_EXT` fun with true arity 256 renders `fun lists:reverse/256` while
-    // `erlang:fun_info(F, arity)` reports `0` — the oracle-verified split.
-    let arity = access::fun_true_arity(fun)?;
-    let text = format!(
-        "fun {}:{}/{}",
-        quoted_atom(&module),
-        quoted_atom(&function),
-        arity
-    );
+    let text = match beam_codec::term::fun_kind_term(fun)? {
+        FunKind::External => {
+            let module = atom_term_name(ctx, fun_module(fun)?)?;
+            let function = atom_term_name(ctx, fun_function(fun)?)?;
+            // The `FUN_DEF` printer uses the **true** arity (`ep->info.mfa.arity`,
+            // `erl_printf_term.c:721-723`), *not* the header's 8-bit field: an
+            // `EXPORT_EXT` fun with true arity 256 renders `fun lists:reverse/256`
+            // while `erlang:fun_info(F, arity)` reports `0` — the oracle-verified
+            // split.
+            let arity = access::fun_true_arity(fun)?;
+            format!(
+                "fun {}:{}/{}",
+                quoted_atom(&module),
+                quoted_atom(&function),
+                arity
+            )
+        }
+        FunKind::Imported => {
+            let module = atom_term_name(ctx, fun_module(fun)?)?;
+            // `fe->old_index` / `fe->old_uniq` are `int` fields (erl_fun.h:31-59)
+            // printed through `PRINT_SWORD(...,'d', ...)` — sign-extended.
+            let old_index = beam_codec::term::fun_old_index(fun)? as i32;
+            let old_uniq = beam_codec::term::fun_old_uniq(fun)? as i32;
+            format!("#Fun<{module}.{old_index}.{old_uniq}>")
+        }
+        FunKind::Local => return Err(error::unsupported_bif()),
+    };
     text_list(ctx, &text)
 }
 

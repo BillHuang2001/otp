@@ -186,8 +186,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   - `TableWrite<'g>` — metadata, mutations over caller-owned inputs (`insert`, `insert_new`,
     `insert_list`, `delete`, `delete_object`, `delete_all_objects`, `update_counter`,
     `update_counter_with`, `update_element`, `select_delete`, `match_delete`, `select_replace`,
-    `set_fixation`, `set_owner`, `set_heir`, `set_access`, `setopts`, `give_away`), `heir()`, `take ->
-    Vec<TableTerm<'_>>`, and `as_requester`.
+    `set_fixation`, `set_owner`, `set_heir`, `set_access`, `setopts`, `give_away`),
+    `heir() -> Option<HeirView<'_>>`, `take -> Vec<TableTerm<'_>>`, and `as_requester` (the re-scoped
+    raw access-enforcement seam — its reads are bare aliasing `Eterm`s by design, see `view/CONTEXT.md`).
+  - `pub struct HeirView<'g>` (`view/term.rs`, re-exported at the crate root) — the guard-scoped heir:
+    `owner() -> OwnerId` (owned) and `data() -> Option<TableTerm<'g>>` (the table-owned gift term tagged
+    to the view's borrow), so a caller cannot read the heir's gift data past the guard.
   - **View-borrowed traversal** (`view/iter.rs`) — `TableRead::{iter_keys, iter_keys_rev, iter_objects,
     iter_objects_rev}` (each yields `TableTerm<'a>` bound to the view borrow via `ets:first|next` /
     `last|prev`; the `*_objects` forms expand the multi kinds per object), `TableRead::{foldl, foldr}`
@@ -423,11 +427,16 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `ERTS_ALC_T_DB_HEIR_DATA`/`free_heir_data` pair. Storing the caller's term verbatim (the old
   behaviour) would have dangled once the installing process's heap died.
 - **`ordered_set` defaults to a K-ary B+-tree** (`ORDER = 32`, `MIN_OCCUPANCY = 16`) with an
-  arena-backed, non-relocating `NodeStore` (`NodeId` + free list), O(log n) insert/lookup/delete and a
-  leaf chain; keys compare by `cmp_arith`. The sorted-`Vec` interior is retained as a selectable
-  comparison index (`OrderedInterior::Sorted`) — measured: at n = 1e5 the sorted `Vec` is 3.9–6.3×
-  slower inserting and 3.1–34.6× slower deleting (O(n) tail shift) against parity on lookup, ~0.1–0.45×
-  on ordered iteration and 0.73× on memory, so it can never be the default for a table whose defining
+  arena-backed, non-relocating `NodeStore` (`NodeId` + free list), a leaf chain and `O(log n)` point
+  lookup (`find`/`first`/`last`/`next`/`prev`); keys compare by `cmp_arith`. Insert is `O(log n)` node
+  visits amortized (a split costs one `subtree_max_key` descent, and splits are amortized `O(1)` per
+  insert — worst case `O(log² n)` on a cascading root split); delete is `O(log² n)` node visits (each
+  unwind level re-derives the settled child's maximum) but only `O(log n)` term comparisons — see
+  `src/ordered_interior/CONTEXT.md`. The sorted-`Vec` interior is retained as a selectable comparison
+  index (`OrderedInterior::Sorted`) — measured (5-pass minima): at n = 1e5 the sorted `Vec` is 9.6–36.0×
+  slower inserting and 10.3–29.8× slower deleting (its `O(n)` tail shift), 0.27–0.33× on ordered
+  iteration (a pure memmove walk) and 0.55–0.73× the B+-tree's index bytes/entry (the sorted `Vec` packs
+  tighter), at parity-ish on lookup — so it can never be the default for a table whose defining
   operations are insert/lookup/delete. `src/interior_bench.rs` reproduces the numbers; the interior
   shape is unpinned. (Structural change → `../../CHANGE.md`.)
 - **`set` defaults to CHAMP; `bag`/`duplicate_bag` stay chained.** Measurement-driven:
@@ -638,28 +647,38 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   **required by default** — a genuinely absent
   `erl` FAILS the cross-check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud
   skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
+- **Randomised `ordered_set` differential** (`tests/ets_ordered_oracle.rs`, `#[ignore]`d by default):
+  a 73-term mixed-type key pool (ints incl. `0`/negatives, the collapsing pairs `1`/`1.0` and `2`/`2.0`,
+  distinct floats, atoms, binaries, tuples, lists) driven by a SplitMix64-finalised LCG through 40 op
+  slots (insert/insert_new/lookup/member/delete/delete_object/delete_all_objects/take + `first`/`last`/
+  `next`/`prev`/`select`/`select_count`/`match_object`/`select_reverse`/`foldl`), rendering every observed
+  key as its pool index and comparing `{size, in-order tab2list, op result}` after every step against the
+  live oracle — **1800 steps / 3 seeds agree, no divergence**. Run it with `--ignored`; it exercises the
+  split/merge churn (max ~48–54 live keys, past `ORDER = 32`) the fixed battery cannot.
 - **`tests/ets_continuation.rs` / `tests/ets_continuation_direction.rs` cross-check the continuation
   cursor against the live oracle, including a mutation between chunks**: an `ordered_set` resume
   survives a delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not
   shift the next chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
-  is green — **28 test binaries, 595 passed / 0 failed** (including the 8 doctests — 5 of them
-  `compile_fail`); with the oracle required, the battery emits and compares all **191** cases
+  is green — **29 test binaries, 600 passed / 0 failed, 1 ignored** (the ignored one is the randomised
+  `ordered_set` trace, run with `--ignored`; doctests: 10 passed, 6 of them `compile_fail`); with the
+  oracle required, the battery emits and compares all **191** cases
   (`[differential] oracle: … — 191 cases emitted` / `— comparing 191 cases against beam_ets`).
   Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test
   --manifest-path erts_rust/Cargo.toml -p beam_ets --test differential`.
 
 ## Known Issues (honest gaps — not full parity)
 - **The raw `Table`/`TableAccess` read family still returns bare `Eterm`s that alias table storage** —
-  the same hazard class the shared handle now closes at compile time. A caller can hold such a term past
-  its borrow (or past `take`, or past the table itself) and then observe words reclaimed and reused by
-  a later same-size insert. The tagged `TableRead`/`TableWrite` views close this for terms, **with two
-  exceptions**: `TableWrite::as_requester` (a documented residual hazard re-exposing the raw
-  `TableAccess` bare-`Eterm` reads) and `TableWrite::heir`, whose `Copy` `Heir.data: Option<Eterm>` is a
-  table-owned gift-data copy that a later `set_heir`/`replace_heir` frees and recycles, so the term
-  escapes the guard's lifetime. The raw API fix is a cross-crate decision (hosts consume it) —
-  `ETS_SURFACE.md` §7.6 names every method that should move behind the tagged-term discipline or a
-  scoped `Table::view(&self)` handle.
+  the same hazard class the shared handle closes at compile time. A caller can hold such a term past its
+  borrow (or past `take`, or past the table itself) and then observe words reclaimed and reused by a
+  later same-size insert. The tagged `TableRead`/`TableWrite` views close this for terms, with one
+  remaining exception: `TableWrite::as_requester`, the crate's re-scoped raw access-enforcement seam
+  (the tagged `TableRead` is owner-level and carries no `requester` concept), whose READ results are bare
+  aliasing `Eterm`s **by design** — pinned by a test that proves the escape-and-recycle
+  (`view/tests.rs::as_requester_reads_are_a_documented_residual_hazard`). The `TableWrite::heir` gap is
+  closed (`heir() -> Option<HeirView<'_>>`, the gift data tagged to the view borrow). The raw API fix is
+  a cross-crate decision (hosts consume it) — `ETS_SURFACE.md` §7.6 names every method that should move
+  behind the tagged-term discipline or a scoped `Table::view(&self)` handle.
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no fine-grained locking; the only synchronisation is `SharedTable`'s coarse `Arc<RwLock>`.
   The `{write_concurrency, auto}` and `{debug_hash_fixed_number_of_locks, N}` modes **are** representable
@@ -861,6 +880,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
 - `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/concurrency/slot/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups)
+- `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace vs the live oracle (`#[ignore]`d; run with `--ignored`)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
 

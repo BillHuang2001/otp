@@ -51,6 +51,7 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 - `ets_shared.rs` → `Send`/`Sync`, the `SharedTable` lock, no-lost-update concurrency, guard-scoped read aliasing note
 - `ets_concurrency.rs` → lock independence, serial equivalence, no-lost-update check-then-act, live-oracle winner count
 - `differential.rs` + `differential/` → the differential battery (embedded table + live oracle); `battery/` and `erl_program.rs`
+- `ets_ordered_oracle.rs` → the **randomised** `ordered_set` differential trace vs the live oracle: a 73-entry mixed-type key pool (ints incl. `0`/negatives, the arith-collapsing `1`/`1.0` and `2`/`2.0`, floats, atoms, binaries, tuples, lists) rendered as **pool indices** on both sides, 40 op slots (24 insert + `insert_new`/`delete`/`delete_object`/`take`/`delete_all_objects`/`lookup`/`member`/`first`/`last`/`next`/`prev`/`select`/`select_count`/`match_object`/`select_reverse`/`foldl`), 3 seeds × 600 steps, compared line-by-line (`S=`/`T=` in interior order, never sorted/`R=`) after every step; `#[ignore]`d, the escript writes its trace to a file (`argv[1]`) because `run_bounded`'s pipes would deadlock on a trace this size
 - `common/mod.rs` → shared term/table helpers; `common/oracle.rs` → the crate's single oracle gate (required by default) + the live-`erl` plumbing (`find_in_path`/`is_executable`/`resolve_escript`/`run_escript`/`run_bounded`/`required`/`skip`)
 
 ## Notes for Agents

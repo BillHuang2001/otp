@@ -24,7 +24,7 @@
 //! Milestone-1 term set the way `io_lib:write/…` and the `~p` pretty printer do,
 //! and pins every case against the OTP oracle (erts-17.1): small integers, atoms
 //! (bare vs quoted), `NIL`, floats, proper/improper lists, tuples, maps, binaries,
-//! bignums, internal pids and internal refs.
+//! bignums, internal pids, internal ports and internal refs.
 //!
 //! This module owns the **leaf renderer** ([`term_chunk`]/[`render_chunk`], the
 //! `io_lib:write1/4` tree) and the shared `io_lib_format` chunk helpers; the
@@ -135,18 +135,34 @@
 //!   `Channel`/`Node`/`Serial` always `0` in Milestone-1 (the frozen
 //!   `[header, node, serial, id]` thing of [`crate::access::make_ref_thing`]), so
 //!   only `Id` varies. The oracle's numbers are the same shape.
-//! * External pids/ports/refs, funs and records are outside the Milestone-1 term
-//!   set and are rejected with `BeamError::BadArg` rather than guessed — never a
-//!   *silently wrong* result.
+//! * **Internal ports** render as `#Port<0.N>` (see [`format_port`]), the oracle's
+//!   `#Port<Channel.Num>` with the local node's channel `0`.
+//! * **External identifiers** (a pid, port or ref naming another node), a **fun** and
+//!   a **native record** are outside the Milestone-1 printable set. The oracle renders
+//!   all of them, but for an external identifier the rendered channel number is
+//!   `atom_val(x->sysname)` — the node-name atom's index in the **running VM's** atom
+//!   table, runtime state the frozen external-identifier term does not carry (measured:
+//!   the same wire image printed `#Port<10643.7>` and `#Port<10639.7>` in two runs), so
+//!   no byte-faithful text exists; a fun's module/name is likewise not in a `make_fun3`
+//!   descriptor. Each is rejected with a typed error — the external identifiers with
+//!   `BeamError::UnsupportedBif` (a capability gap), a fun and a native record with
+//!   `BeamError::BadArg` — rather than guessed. A native record's *single-line* form
+//!   (`#rec:r{a = 1,b = 2}`) is derivable from [`beam_term::record`], but the printer
+//!   cannot emit it as a leaf: `~p`/`~P` route a record through the same
+//!   [`render_chunk`] and would then print the flat form where the oracle's
+//!   `io_lib_pretty` **re-flows** a long record (`pp_record`/`rec_indent` in
+//!   `lib/stdlib/src/io_lib_pretty.erl:249-376`), a *silently wrong* result — so the
+//!   whole class stays a typed gap until that template is ported.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
-use beam_term::{atom_val, pid_number, pid_serial, signed_value, AtomTable, Eterm};
+use beam_term::{atom_val, signed_value, AtomTable, Eterm};
 
 use crate::access::{
     bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
-    is_float, is_function, is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small,
-    is_tuple, ref_thing_id, tuple_element, tuple_size,
+    is_external_pid, is_external_ref, is_float, is_function, is_internal_pid, is_internal_port,
+    is_internal_ref, is_list, is_map, is_nil, is_port, is_small, is_tuple, tuple_element,
+    tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -187,11 +203,11 @@ pub(crate) enum MapOrder {
 /// * [`MapOrder::Ordered`] — ascending **term** order (`map_pairs`);
 /// * [`MapOrder::Reversed`] — descending term order (`map_pairs` reversed);
 /// * [`MapOrder::Explicit`] — a `~K` order term: the atoms `ordered`/`reversed`/
-///   `undefined` select as above, a **2-arity fun** is the typed
-///   [`unsupported_bif`] (the printer has no `FunCaller` seam to invoke it, and a
-///   fabricated order would be a wrong result), and anything else (any other
-///   atom, a non-atom, or a fun of another arity) is `badarg`, as the oracle's
-///   `maps:iterator/2` argument check.
+///   `undefined` select as above (`undefined` is the default iterator, which walks
+///   the stored order), a **2-arity fun** is the typed [`unsupported_bif`] (the
+///   printer has no `FunCaller` seam to invoke it, and a fabricated order would be a
+///   wrong result), and anything else (any other atom, a non-atom, or a fun of another
+///   arity) is `badarg`, as the oracle's `maps:iterator/2` argument check.
 ///
 /// # Errors
 ///
@@ -226,6 +242,14 @@ pub(crate) fn resolve_map_pairs(
             let resolved = match atoms.name(atom_val(order_term)).ok_or_else(badarg)? {
                 "ordered" => MapOrder::Ordered,
                 "reversed" => MapOrder::Reversed,
+                // `maps:iterator(Map, undefined)` is `maps:iterator(Map, fun(A,B) ->
+                // A =< B end)` — the default iterator, whose `maps:next/1` walk visits
+                // the map's *stored* pair order, exactly `MapOrder::Storage`. Verified
+                // against the oracle: `~Kp undefined` / `~Kw undefined` are byte-equal
+                // to the default `~p`/`~w` text for both a flat (≤32-key) and a HAMT
+                // (>32-key) map. Any other atom is `badarg`, as `maps:iterator/2`
+                // raises for an unrecognised order term (`~Kp bogus`, `~Kp {x}` and
+                // `~Kp 5` are all `error:badarg`).
                 "undefined" => MapOrder::Storage,
                 _ => return Err(badarg()),
             };
@@ -570,18 +594,60 @@ fn render_chunk(
         return render_map_chunk(atoms, term, printable, depth, order);
     }
     if is_internal_pid(term) {
-        return Ok(Chunk::text(&format!(
-            "<0.{}.{}>",
-            pid_number(term),
-            pid_serial(term)
-        )));
+        // The `%T` text `erlang:pid_to_list/1` renders (the oracle's `write1/4`
+        // calls exactly that), from its one home in `crate::term_conv`.
+        return Ok(Chunk::text(&crate::term_conv::pid_text_str(term)?));
     }
     if is_internal_ref(term) {
         return Ok(Chunk::text(&format_ref(term)?));
     }
+    if is_port(term) {
+        return Ok(Chunk::text(&format_port(term)?));
+    }
+    // An **external** pid/ref is a typed gap, exactly like an external port (see
+    // [`format_port`]): the oracle renders it through `pid_channel_no` /
+    // `ref_channel_no`, which for a foreign node is `external_channel_no(x)` =
+    // `dist_entry_channel_no(external_dist_entry(x))` = `atom_val(x->sysname)` — the
+    // index of the node-name atom in the **running VM's** atom table
+    // (`erl_node_container_utils.h:109-116`). That index is runtime state the frozen
+    // external-identifier term does not carry (measured: the same `V4_PORT_EXT` image
+    // naming `a@b` printed `#Port<10643.7>` and `#Port<10639.7>` in two runs), so a
+    // fabricated channel would be a *silently wrong* result.
+    if is_external_pid(term) || is_external_ref(term) {
+        return Err(unsupported_bif());
+    }
+    // A **fun** cannot be rendered byte-faithfully here. The oracle's leaf is
+    // `erlang:fun_to_list/1` (`io_lib:write1/4` → `fun_to_list`, and `io_lib_pretty`
+    // has no fun clause at all), which prints `#Fun<M.F.A>`/`#Fun<M.N.A>` from the
+    // fun's module/name/arity — data a runtime-made `Local` (`make_fun3`) fun's
+    // inlined descriptor does not carry (see `beam_term::fun`), so the printer would
+    // have to fabricate it. It stays the typed `badarg` below (documented in the
+    // module docs), never a guessed `#Fun<…>`.
     Err(badarg())
 }
-/// Renders a list (`[e1,e2]` / `[e1|tail]`), the caller having already handled
+
+/// The `%T` text of an internal port — `#Port<channel.number>`
+/// (`../../erts/emulator/beam/erl_printf_term.c:521-530`, the leaf
+/// `erlang:port_to_list/1` renders and `io_lib:write1/4` / `io_lib_pretty`'s
+/// `print_length/7` both splice in), from its one home in `crate::term_conv`'s
+/// [`port_text_str`](crate::term_conv::port_text_str). An **internal** port renders
+/// `#Port<0.N>` — the local node's channel number and the port-table number —
+/// byte-identical to the oracle, where `io_lib:format("~p", [hd(erlang:ports())])`
+/// is `"#Port<0.0>"`.
+///
+/// An **external** port is the typed [`unsupported_bif`]; see the external
+/// pid/ref comment in [`render_chunk`] for why no faithful channel exists.
+///
+/// # Errors
+///
+/// [`BeamError::UnsupportedBif`](beam_common::BeamError) for an external port (see
+/// above); a term that is not a port at all never reaches this function.
+fn format_port(term: Eterm) -> Result<String> {
+    if is_internal_port(term) {
+        return crate::term_conv::port_text_str(term);
+    }
+    Err(unsupported_bif())
+}/// Renders a list (`[e1,e2]` / `[e1|tail]`), the caller having already handled
 /// depth `0`/`1` and the `~p` printable-string rule (`io_lib:write1/4`).
 fn render_list_chunk(
     atoms: &AtomTable,
@@ -1240,11 +1306,12 @@ fn format_float(value: f64) -> Result<String> {
     crate::numeric::format_short(value)
 }
 
-/// Renders an internal ref as `#Ref<0.0.0.Id>` (Milestone-1 refs carry no channel,
-/// node or serial — see the module docs).
+/// Renders an internal ref as `#Ref<0.0.0.Id>` — the `%T` text
+/// `erlang:ref_to_list/1` renders, from its one home in
+/// [`crate::term_conv::ref_text_str`] (Milestone-1 refs carry no channel, node or
+/// serial — see the module docs).
 fn format_ref(term: Eterm) -> Result<String> {
-    let id = ref_thing_id(term)?;
-    Ok(format!("#Ref<0.0.0.{id}>"))
+    crate::term_conv::ref_text_str(term)
 }
 
 #[cfg(test)]
@@ -1973,17 +2040,47 @@ mod tests {
         });
     }
 
+    /// An **external** pid/ref is the typed [`unsupported_bif`] capability gap, not a
+    /// malformed argument: the oracle renders its channel number through
+    /// `atom_val(x->sysname)` — the *running* VM's node-atom index, runtime state the
+    /// frozen external-identifier term does not carry (see [`render_chunk`]). A **fun**
+    /// stays `BadArg`: its leaf is `erlang:fun_to_list/1`, and a runtime-made `Local`
+    /// (`make_fun3`) fun's inlined descriptor carries no module/name to render.
     #[test]
-    fn unsupported_terms_are_badarg() {
+    fn external_identifiers_are_a_typed_gap_and_funs_stay_badarg() {
         with_ctx(|ctx| {
-            // An external pid is outside the M1 printable set.
+            // An external pid and an external ref are both the typed capability gap.
             let node = ctx.atom("hi").expect("seeded");
-            let external = beam_codec::term::make_external_pid(ctx.heap(), node, 1, 2, 3)
-                .expect("fits");
+            let external_pid =
+                beam_codec::term::make_external_pid(ctx.heap(), node, 1, 2, 3).expect("fits");
             assert!(matches!(
-                format_term(ctx, external, false),
+                format_term(ctx, external_pid, false),
+                Err(beam_common::BeamError::Raise(ref r))
+                    if r.reason.as_atom() == Some("unsupported_bif")
+            ));
+            let external_ref =
+                beam_codec::term::make_external_ref(ctx.heap(), node, &[5], 0).expect("fits");
+            assert!(matches!(
+                format_term(ctx, external_ref, false),
+                Err(beam_common::BeamError::Raise(ref r))
+                    if r.reason.as_atom() == Some("unsupported_bif")
+            ));
+
+            // A fun stays `BadArg` — the documented structural gap: this `Local`
+            // (`make_fun3`) block's `[header, uniq, index]` descriptor has no
+            // module/name for `fun_to_list/1` to render.
+            let words: Box<[Eterm]> = vec![
+                Eterm::from_raw(beam_term::FUN_SUBTAG | (2usize << 8)),
+                Eterm::from_raw(0), // uniq
+                Eterm::from_raw(0), // index
+            ]
+            .into_boxed_slice();
+            let fun = beam_term::make_boxed(words.as_ptr());
+            assert!(matches!(
+                format_term(ctx, fun, false),
                 Err(beam_common::BeamError::BadArg)
             ));
+
             // Sanity: the atom itself still renders.
             assert_eq!(show(ctx, node, false), "hi");
         });

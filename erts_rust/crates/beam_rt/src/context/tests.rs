@@ -3912,6 +3912,89 @@ fn a_admission_point_roots_every_x_register_and_the_whole_fr_file() {
     assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
 }
 
+/// **`fr_count` is an exact region length, and a region mismatch still halts the collection.**
+///
+/// The runner's park arm bounds the published FR prefix by `Machine::fr_mark()` (the live
+/// leading slots) and the resume replays that same count, so
+/// [`super::gc::publish_roots_full`] / [`super::gc::scatter_roots_full`] take a **count**
+/// rather than a flag. Three properties are load-bearing, and this case drives the helpers
+/// directly to pin all three without a scheduler:
+///
+/// * a publish of `fr_count` words puts exactly the stack followed by those leading FR words
+///   onto the process stack — the caller's FR view is the machine's whole 1024-slot file, so
+///   `fr_count` (here `2` of a four-word view) is what bounds the region, never the slice
+///   length;
+/// * the matching scatter writes **only** the leading `fr_count` FR slots back and leaves the
+///   slots above it untouched (a machine whose mark proved them `NIL` must not have them
+///   overwritten by the relocated stack's tail);
+/// * a relocated region whose length disagrees with `stack + fr_count` is reported as `false`
+///   — the caller's "halt this process's collection" — rather than a mis-sized write back.
+#[test]
+fn the_fr_count_bounds_the_published_region_and_a_mismatch_still_halts() {
+    let mut table =
+        ProcessTable::new(beam_process::SignalAtoms::from_table(&mut AtomTable::new()));
+    let pid = table.spawn_default().expect("spawn a process");
+
+    // A four-slot FR view with two live leading slots.
+    let mut x = [make_small(1), make_small(2), NIL, NIL];
+    let mut stack = [make_small(3), make_small(4)];
+    let mut fr = [make_small(5), make_small(6), NIL, NIL];
+
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        assert!(
+            super::gc::publish_roots_full(
+                process,
+                &RootSet::new(&mut x, &mut stack, &mut fr, 1),
+                2
+            ),
+            "a publish with an in-range count reports the region it wrote"
+        );
+        assert_eq!(
+            process.registers().stack().as_slice(),
+            &[make_small(3), make_small(4), make_small(5), make_small(6)][..],
+            "the published region is the whole stack followed by exactly `fr_count` FR words"
+        );
+    }
+
+    // The scatter is the exact inverse for the same count: the published region splits back
+    // into the stack and the two **leading** FR slots.
+    {
+        let process = table.get(pid).expect("the process is live");
+        let mut back = [NIL, NIL];
+        let mut out_fr = [make_small(99), make_small(99), make_small(99), make_small(99)];
+        assert!(
+            super::gc::scatter_roots_full(
+                process,
+                &mut RootSet::new(&mut x, &mut back, &mut out_fr, 1),
+                2
+            ),
+            "the scatter accepts the region the matching publish wrote"
+        );
+        assert_eq!(
+            out_fr,
+            [make_small(5), make_small(6), make_small(99), make_small(99)],
+            "only the leading `fr_count` FR slots are written back"
+        );
+    }
+
+    // A relocated region one word longer than `stack + fr_count` (what a resume passing a count
+    // the park did not use would see) must be refused, never written through.
+    {
+        let process = table.get_mut(pid).expect("the process is live");
+        process.registers_mut().stack_mut().push(make_small(7));
+        let mut back = [NIL, NIL];
+        assert!(
+            !super::gc::scatter_roots_full(
+                process,
+                &mut RootSet::new(&mut x, &mut back, &mut fr, 1),
+                2
+            ),
+            "a relocated stack longer than stack + fr_count halts the collection"
+        );
+    }
+}
+
 /// **The same guard for the collecting allocation seam.**
 ///
 /// [`ExecutionContext::alloc_words_rooted`] is the engine's term-building admission point:
@@ -5039,6 +5122,145 @@ fn an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool() {
     assert_eq!(
         terms::cons_head(keys).expect("the cons cell is still readable"),
         make_small(7)
+    );
+}
+
+/// **A PARTIALLY-USED pool is rewound to the CALLER's mark, not to the heap's base.**
+///
+/// The pool is shared, so a heap can reach a call already holding words another caller still
+/// owns: the native floor's reference minting, trace and the ETS-owner sweep all pop a heap and
+/// put it back **without** resetting it. The call therefore reads `mark = heap.used()` before it
+/// runs and gives back exactly `[mark..used)`.
+///
+/// The case pins that with a retained `{1,2}` another caller built on the pool (3 words) and a
+/// `list_to_tuple/1` call (which builds a 4-word tuple there):
+///
+/// * the pool's offset afterwards is that caller's `mark` — not `mark + 4` (the pre-fix behaviour:
+///   the heap arrived dirty, so the call refused to rewind at all and the bump pointer marched
+///   toward the pool's capacity) and not `0` (a rewind to the base, which would recycle the
+///   words another caller owns);
+/// * the words below the mark are intact — the retained tuple still reads back `{1,2}`;
+/// * the copy-out is unaffected: the result is the *moved* container on the process's own
+///   scanned young heap.
+#[test]
+fn a_partially_used_pool_is_rewound_to_the_callers_mark() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    // A term a previous caller owns, built on the pooled BIF heap and left there: a `{1,2}` tuple
+    // costs a one-word header plus two element words, so the heap reaches this call at
+    // `used() == 3`. The heap stays in the pool (index 0 is never popped by this rig), so the term
+    // is exactly the "live word below the mark" the rewind must keep.
+    let retained = rt
+        .bif_heaps
+        .first_mut()
+        .expect("the runtime always owns its pooled BIF heap")
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("the pooled BIF heap builds the retained tuple");
+    let mark = rt.bif_heaps.first().expect("the pool owns a heap").used();
+    assert_eq!(mark, 3, "a `{{1,2}}` tuple is a header word plus two element words");
+
+    let list = young_int_list(&mut table, pid, &[4, 5, 6]);
+    let tuple = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.call_bif("erlang", "list_to_tuple", 1, &[list])
+            .expect("list_to_tuple([4,5,6])")
+    };
+
+    assert_eq!(
+        terms::tuple_arity(tuple).expect("the result is a tuple"),
+        3,
+        "the BIF really built a container"
+    );
+    // The copy-out is unaffected by the (previously disqualifying) dirty pool: the result really
+    // left the pool for the process's scanned young nursery.
+    let process = table.get(pid).expect("the process");
+    assert!(
+        process.collector().young_contains(beam_term::list::ptr_val(tuple) as *const Eterm),
+        "the result's pointer is inside the process's young nursery"
+    );
+
+    assert_eq!(rt.bif_heaps.len(), 1, "the one pooled heap came back");
+    assert_eq!(
+        rt.bif_heaps[0].used(),
+        mark,
+        "the pool must be rewound to the CALLER's mark: this call's own words `[mark..used)` are \
+         freed, the words another caller owns below `mark` are kept"
+    );
+    // The retained words are untouched: the term the previous caller owns still reads back.
+    assert_eq!(
+        terms::tuple_arity(retained).expect("the retained tuple is still readable"),
+        2,
+        "the words below the mark must survive the rewind"
+    );
+    assert_eq!(
+        terms::tuple_element(retained, 0).expect("in range"),
+        make_small(1)
+    );
+    assert_eq!(
+        terms::tuple_element(retained, 1).expect("in range"),
+        make_small(2)
+    );
+}
+
+/// **The escaping-arm guard is independent of the mark: a DIRTY pool is not rewound either.**
+///
+/// The seven-arm `safe_to_rewind` gate exists because six of the `DispatchHooks` arms let a term
+/// the BIF built on `ctx.heap()` escape into state that outlives the call, which a
+/// `reset_to(mark)` would recycle just as a `reset()` would. The case drives the `dict` arm
+/// (`erlang:get_keys/1` builds its key list on the pool) over a pool that is **partially used**
+/// — a retained `{1,2}` below the mark — and asserts the offset stays **above** the mark.
+#[test]
+fn an_escaping_arm_does_not_rewind_a_partially_used_pool() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let retained = rt
+        .bif_heaps
+        .first_mut()
+        .expect("the runtime always owns its pooled BIF heap")
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("the pooled BIF heap builds the retained tuple");
+    let mark = rt.bif_heaps.first().expect("the pool owns a heap").used();
+    assert_eq!(mark, 3, "a `{{1,2}}` tuple is a header word plus two element words");
+
+    // The process dictionary holds one pair, so `get_keys/1` really builds a one-element list.
+    table
+        .get_mut(pid)
+        .expect("the process")
+        .dict_mut()
+        .put(make_small(7), make_small(11));
+
+    let keys = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.call_bif("erlang", "get_keys", 1, &[make_small(11)])
+            .expect("get_keys(11)")
+    };
+
+    // The result is the key list `[7]` — a cons cell built on the pooled BIF heap.
+    assert!(
+        beam_term::list::is_list(keys),
+        "get_keys/1 builds a list on `ctx.heap()`"
+    );
+    let process = table.get(pid).expect("the process");
+    assert!(
+        super::gc::root_is_unscanned(process, keys),
+        "the `dict` arm is an escaping seam, so the result must NOT have been moved"
+    );
+    assert!(
+        rt.bif_heaps.first().expect("the pool owns a heap").used() > mark,
+        "the escaping arm must NOT rewind — not even to the caller's mark"
+    );
+    // Both the escaped term and the retained words are still valid.
+    assert_eq!(terms::cons_head(keys).expect("the cons cell"), make_small(7));
+    assert_eq!(
+        terms::cons_tail(keys).expect("a cons cell"),
+        NIL,
+        "the key list is exactly `[7]`"
+    );
+    assert_eq!(
+        terms::tuple_arity(retained).expect("the retained tuple is still readable"),
+        2
+    );
+    assert_eq!(
+        terms::tuple_element(retained, 0).expect("in range"),
+        make_small(1)
     );
 }
 

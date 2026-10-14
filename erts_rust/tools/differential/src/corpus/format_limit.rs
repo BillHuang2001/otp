@@ -291,6 +291,63 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- widened: the N = 3 floor, a charlist subject, `~s`, and a wider field --------
+        Case {
+            id: "format/ts_chars_limit_three_is_dots",
+            description: "~ts under {chars_limit, 3} keeps max(0, 3-3) = 0 graphemes, so \"hello\" is just the dots",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~ts\",[<<\"hello\">>],[{chars_limit,3}]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [46,46,46]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "format/ts_charlist_chars_limit_partial",
+            description: "a *charlist* subject is elided by the same rule: \"abcdefghij\" at {chars_limit, 8} keeps five then dots",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~ts\",[\"abcdefghij\"],[{chars_limit,8}]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [97,98,99,100,101,46,46,46]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "format/s_control_chars_limit",
+            description: "the bytes-oriented ~s control is elided by the same chars_limit rule",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~s\",[<<\"hello\">>],[{chars_limit,4}]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [104,46,46,46]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "format/ts_field_width_five_with_chars_limit",
+            description: "a ~5ts field wider than the subject prints the whole 5-char subject with no dots",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~5ts\",[<<\"hello\">>],[{chars_limit,10}]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [104,101,108,108,111]"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -301,7 +358,7 @@ mod tests {
     use std::collections::HashSet;
 
     /// Every case id in this group, in declaration order.
-    const IDS: [&str; 17] = [
+    const IDS: [&str; 21] = [
         "format/ts_binary_unlimited",
         "format/ts_charlist_unlimited",
         "format/ts_chars_limit_zero",
@@ -319,6 +376,10 @@ mod tests {
         "format/ts_mixed_ts_s_args",
         "format/ts_mixed_with_chars_limit",
         "format/chars_limit_non_ts_control",
+        "format/ts_chars_limit_three_is_dots",
+        "format/ts_charlist_chars_limit_partial",
+        "format/s_control_chars_limit",
+        "format/ts_field_width_five_with_chars_limit",
     ];
 
     fn case(id: &str) -> crate::corpus::Case {
@@ -336,7 +397,7 @@ mod tests {
     fn the_group_is_compact_and_every_case_is_an_otp_apps_value_probe() {
         let cases = group();
         assert_eq!(cases.len(), IDS.len(), "a case count change is deliberate");
-        assert!(cases.len() <= 20, "keep this group compact");
+        assert!(cases.len() <= 24, "keep this group compact");
         let mut seen = HashSet::new();
         for id in IDS {
             assert!(seen.insert(id), "duplicate id {id}");

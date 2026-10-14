@@ -78,7 +78,7 @@ mod term;
 mod write;
 
 pub use read::TableRead;
-pub use term::TableTerm;
+pub use term::{HeirView, TableTerm};
 pub use write::TableWrite;
 
 use beam_common::{AllocKind, BeamError};

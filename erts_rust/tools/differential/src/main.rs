@@ -23,13 +23,24 @@
 //! Everything of substance lives in the library — this is only the shell that turns a
 //! [`Command`](differential::cli::Command) into output plus a process exit code
 //! (`0` agreed, `1` mismatch, `2` usage/env/IO error).
+//!
+//! This shell adds exactly one thing the library must not do: before a command whose cases
+//! need the external **live-distribution helper** (`dist_probe`, the Rust side of the four
+//! `dist/live_*` command cases) runs, it makes that helper available by building it on demand
+//! **once** ([`differential::runtime::ensure_helper`]). Without it the cases would report a
+//! loud `skipped` in a tree where only `beam_rt` and `differential` were built. The build is a
+//! last resort — a resolvable `$BEAM_DIST_PROBE` or a built workspace artifact always wins —
+//! and `$DIFFERENTIAL_NO_BUILD` (any non-empty value) switches it off. A failed build is never
+//! fatal: the affected cases stay a loud `skipped` naming cargo's diagnosis.
 
 use std::path::PathBuf;
 
 use differential::cli::{self, Command};
+use differential::corpus::{self, CaseKind, CommandProgram};
 use differential::error::{Error, Result};
 use differential::report::{self, ListReport, RunReport};
-use differential::{allowlist::Allowlist, corpus, harness, ratchet};
+use differential::runtime::{self, HelperStatus};
+use differential::{allowlist::Allowlist, harness, ratchet};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -55,6 +66,7 @@ fn report_error(error: &Error) -> i32 {
 }
 
 fn dispatch(command: Command) -> Result<i32> {
+    ensure_helper(&command)?;
     match command {
         Command::Help { topic } => {
             print!("{}", cli::usage(topic.as_deref()));
@@ -127,6 +139,64 @@ fn dispatch(command: Command) -> Result<i32> {
     }
 }
 
+/// Make the live-distribution helper (`dist_probe`) available when the command can need it.
+///
+/// [`needs_helper`] decides whether the command can spawn the helper at all — only the four
+/// `dist/live_*` command cases do — because the on-demand build ([`runtime::ensure_helper`])
+/// must stay a last resort: a `run` of any other case, a `compare`, a `list` or a `help` never
+/// touches the build system, and a **usage** error (an unknown case id) never becomes a slow
+/// build either.
+///
+/// A helper that had to be built is announced on stderr, and one that could not be obtained
+/// (a failed build, or the `$DIFFERENTIAL_NO_BUILD` opt-out) is announced loudly here as well
+/// as in the affected cases' own `skipped` reason — a skip is never silent. Neither outcome is
+/// a tool error: the run continues and reports the cases honestly.
+fn ensure_helper(command: &Command) -> Result<()> {
+    if !needs_helper(command) {
+        return Ok(());
+    }
+    match runtime::ensure_helper()? {
+        HelperStatus::Available {
+            spec,
+            built_on_demand: true,
+        } => eprintln!(
+            "differential: built the distribution helper on demand: {}",
+            spec.program.display()
+        ),
+        HelperStatus::Available {
+            built_on_demand: false,
+            ..
+        } => {}
+        HelperStatus::Unavailable(reason) => {
+            eprintln!("differential: the distribution helper is unavailable: {reason}");
+        }
+    }
+    Ok(())
+}
+
+/// Whether `command` can spawn the external `dist_probe` helper.
+///
+/// The helper is the Rust side of the `dist/live_*` [`CaseKind::Command`] cases (contract A.5),
+/// so only a `run` of such a case or a `suite` over a corpus containing one can need it. A
+/// `run` whose case id is unknown is a usage error and is deliberately *not* a trigger.
+fn needs_helper(command: &Command) -> bool {
+    match command {
+        Command::Run { case_id, .. } => corpus::find_case(case_id).is_some_and(case_needs_helper),
+        Command::Suite { .. } => corpus::cases().iter().any(case_needs_helper),
+        Command::Compare { .. } | Command::List { .. } | Command::Help { .. } => false,
+    }
+}
+
+/// Whether either side of a command case is the `dist_probe` helper.
+fn case_needs_helper(case: &corpus::Case) -> bool {
+    match &case.kind {
+        CaseKind::Command(run) => [run.oracle.program, run.rust.program]
+            .into_iter()
+            .any(|program| matches!(program, CommandProgram::Helper)),
+        _ => false,
+    }
+}
+
 /// Write the report and print it (`--json` or human text).
 ///
 /// The report file is always written — `<dir>/report.json` with `--out <dir>`, and the
@@ -171,4 +241,73 @@ fn emit_list(list: &ListReport, json: bool, out: Option<PathBuf>) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_helper;
+    use differential::cli::Command;
+
+    /// A `run` command for `case_id` (the only field the helper decision reads is the id).
+    fn run(case_id: &str) -> Command {
+        Command::Run {
+            case_id: case_id.to_string(),
+            json: false,
+            out: None,
+        }
+    }
+
+    fn suite() -> Command {
+        Command::Suite {
+            strict: false,
+            allowlist: None,
+            gaps: None,
+            json: false,
+            out: None,
+        }
+    }
+
+    /// The on-demand build is triggered **only** by a command that can spawn the helper: the
+    /// four `dist/live_*` command cases, or a `suite` over the corpus that contains them. An
+    /// expression case, a `compare`, a `list`, a `help` and an unknown id never touch the build
+    /// system (an unknown id must stay a fast, pure usage error).
+    #[test]
+    fn only_helper_backed_commands_can_trigger_the_on_demand_build() {
+        for case_id in [
+            "dist/live_handshake_ping",
+            "dist/live_node_visibility",
+            "dist/live_term_delivery",
+            "dist/live_utf8_atom_round_trip",
+        ] {
+            assert!(needs_helper(&run(case_id)), "`{case_id}` spawns the helper");
+        }
+
+        assert!(
+            !needs_helper(&run("etf/term_to_binary_tuple")),
+            "an expression case never needs the helper"
+        );
+        assert!(
+            !needs_helper(&run("no/such-case")),
+            "an unknown case id stays a pure usage error"
+        );
+        assert!(
+            needs_helper(&suite()),
+            "the live-distribution cases are part of the corpus"
+        );
+        assert!(!needs_helper(&Command::List {
+            by_contract: false,
+            json: false,
+            out: None,
+        }));
+        assert!(!needs_helper(&Command::Help { topic: None }));
+        assert!(!needs_helper(&Command::Help {
+            topic: Some("suite".to_string()),
+        }));
+        assert!(!needs_helper(&Command::Compare {
+            expr: "1 + 1".to_string(),
+            pa: Vec::new(),
+            json: false,
+            out: None,
+        }));
+    }
 }

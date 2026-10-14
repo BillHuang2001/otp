@@ -71,26 +71,26 @@ every link, so it has no peer to compare a `From` against.
 names need not be this runtime's node identity, so a per-link check there would judge a message against a
 *foreign* identity. It is the semantic view, not a wire drive.
 
-**`LocalDeliverySink` routes four families; every other family is the honest `DeliveryOutcome::Unsupported`**,
-with the missing `beam_process` API named at its arm (`../dist.rs`'s `LocalDeliverySink::deliver`).
-`beam_process` currently exposes only **outbound** relationship entry points (`ProcessTable::link_term`/
-`unlink_term`/`monitor_term_with_options`/`demonitor`/`send_exit_term`, each routing a `DistSignal`
-through the installed `DistSignalRouter`, which is OUTBOUND only); an **inbound** relationship needs the
-record-and-echo-nothing counterpart, which does not exist yet:
+**`LocalDeliverySink` routes the message families plus the route-free receipt families; the rest is the
+honest `DeliveryOutcome::Unsupported`**, with the still-missing API named at its arm (`../dist.rs`'s
+`LocalDeliverySink::deliver`). `beam_process` exposes the **outbound** relationship entry points
+(`ProcessTable::link_term`/`unlink_term`/`monitor_term_with_options`/`demonitor`/`send_exit_term`, each
+routing a `DistSignal` through the installed `DistSignalRouter`) **and** the **route-free receipt**
+counterparts, which install/drop the local record and then follow the C's `break; /* Done */` (`dist.c:2258`)
+without echoing the opcode it received:
 
-| Inbound family (C arm) | Missing `beam_process` API |
+| Inbound family (C arm) | Receipt API used (or the still-missing API) |
 |---|---|
-| `Link` (`DOP_LINK`, `dist.c:2224-2275`) | `record_remote_link(to: ProcessId, remote: RemotePid)` — record the link **without** routing an outbound `DistSignal::Link` (the C never echoes one; `link_term` does) |
-| `Exit`/`Exit2`/`PayloadExit`/`PayloadExit2` (`dist.c:2760`/`:2824`) | `apply_remote_exit_signal(to: ProcessId, from: RemotePid, reason: Eterm, untrappable: bool)` — `ExitSignal::from` is a local `ProcessId`, so a remote sender cannot be spelled |
-| `UnlinkId`/`UnlinkIdAck` (OTP-26+ handshake, `dist.c:2284`/`:2315`) | `unlink_from_remote(..)`/`unlink_ack_from_remote(..)` — an inbound `DOP_UNLINK_ID` answers `DOP_UNLINK_ID_ACK`, an inbound `_ACK` answers nothing; neither may route a plain `DOP_UNLINK_ID` (`unlink_term` does) |
-| `Monitor`/`Demonitor` (`DOP_MONITOR_P`/`DOP_DEMONITOR_P`, `dist.c:2341`/`:2415`) | `monitor_from_remote(..)`/`demonitor_from_remote(..)` + a `RemoteWatcher` record (the monitor record's watcher origin is a local `ProcessId` today) |
-| `MonitorExit`/`PayloadMonitorExit` (`dist.c:2700-2714`) | `remote_monitor_down(watcher: ProcessId, watched: RemotePid, reference, reason)` — the message builder is already public (`beam_process::signal::build_down_message_remote`) |
-| `GroupLeader` (`DOP_GROUP_LEADER`, `dist.c:2889`) | `set_group_leader(to: ProcessId, from: RemotePid)` |
-| `SpawnRequest`/`SpawnReply` (`dist.c:2902-3093`) | none — a `beam_rt` CLI process serves no spawn requests and holds no spawn reservations |
-| `Other(Dop::Unlink)` | none — `DOP_UNLINK` is not a v6 opcode; the C's `invalid_message` arm kills the connection (`dist.c:2277-2282`), which the link driver owns, so the sink reports "recognised, not routed" |
+| `Link` (`DOP_LINK`, `dist.c:2224-2275`) | **routed** — `record_remote_link(to: ProcessId, remote: RemotePid)` (record-only; the C never echoes one) |
+| `Exit`/`Exit2`/`PayloadExit`/`PayloadExit2` (`dist.c:2760`/`:2824`) | **routed** — `apply_remote_exit_signal(to, from: RemotePid, reason, untrappable)` (`untrappable = true` for the `Exit2`/`PayloadExit2` family) |
+| `UnlinkId`/`UnlinkIdAck` (OTP-26+ handshake, `dist.c:2284`/`:2315`) | **partially routed** — `unlink_from_remote(..)`/`unlink_ack_from_remote(..)`; an inbound `DOP_UNLINK_ID` with `id != 0` owes a `DOP_UNLINK_ID_ACK` this sink has **no reply channel** to emit, so the link record is dropped and the wire half is reported the typed `Unsupported` (`id == 0` owes no ack and is `Delivered`) |
+| `Monitor`/`Demonitor` (`DOP_MONITOR_P`/`DOP_DEMONITOR_P`, `dist.c:2341`/`:2415`) | **routed** — `monitor_from_remote_ref(watched, watcher, reference: RemoteRef, kind)` records the incoming watcher and `demonitor_from_remote_ref(watched, reference: RemoteRef)` removes exactly that record, both keyed by the **whole** peer-minted wire reference (`RemoteWatcherRef::Remote(RemoteRef)`, all-immediate, so two peer-minted references never collapse) |
+| `MonitorExit`/`PayloadMonitorExit` (`dist.c:2700-2714`) | **routed** for a DOWN whose reference *this* node minted (the wire image inverts to the recorded `MonitorRef`) — `remote_monitor_down(watcher, watched: RemotePid, reference, reason)`; a name-targeted DOWN or a foreign reference stays `Unsupported` |
+| `GroupLeader` (`DOP_GROUP_LEADER`, `dist.c:2889`) | **routed** — `set_group_leader_from_remote(to, from: RemotePid)` |
+| `SpawnRequest`/`SpawnReply` (`dist.c:2902-3093`) | **still a typed gap** — needs a `beam_process` spawn-responder/reservation API (a `DOP_SPAWN_REPLY` sender + the reservation bookkeeping); a `beam_rt` CLI process serves no spawn requests and holds no reservations |
+| `Other(Dop::Unlink)` | **still a typed gap** — `DOP_UNLINK` is not a v6 opcode; the C's `invalid_message` arm kills the connection (`dist.c:2277-2282`), which the link driver owns, so the sink reports "recognised, not routed" |
 
-Routing any of these is a separate workstream (each needs the `beam_process` API above); this node only
-records the honest gap. Evidence for the validated path: `../../tests/dist_delivery.rs`'s
+Evidence for the validated path: `../../tests/dist_delivery.rs`'s
 "(6b) Every inbound delivery is validated against **its own link**" — a forged `DOP_REG_SEND` (`From` a
 non-pid) and a `DOP_LINK` whose `From` names a third node are each refused, reach no mailbox and retire
 their link with a recorded `last_link_error`, while a well-formed message on the same link still delivers.

@@ -719,9 +719,10 @@
         assert_eq!(t.tree.height(), 2, "the 65 keys need two levels");
         t.tree.check_invariants(&atoms);
 
-        // Emptying the first leaf down to its minimum makes the *next* delete merge
-        // it with its right sibling: three leaves are left, the first holding 30
-        // entries (a spare) — so the leaf after it can borrow from the left.
+        // Deleting 15 takes the first leaf below `MIN_OCCUPANCY`, so that same
+        // delete merges it with its right sibling: three leaves are left, the first
+        // holding 31 entries (15 + 16, a spare) — so the leaf after it can borrow
+        // from the left.
         t.delete(make_small(15), &atoms).unwrap();
         t.tree.check_invariants(&atoms);
 

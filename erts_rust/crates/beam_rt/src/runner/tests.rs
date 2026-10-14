@@ -873,6 +873,89 @@ run() ->
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **A running process comes to OWN the off-heap refc binaries its engine built.**
+///
+/// `erlang:process_info(Pid, binary)` reads its roster from `beam_process::Process`'s off-heap
+/// table, whose only in-production producer is [`RuntimeRunner`]'s per-slice registration seam:
+/// a payload built by compiled bitstring code is held by the machine's `Machine::refc_binaries`
+/// reservoir, and the runner copies the whole reservoir onto the process's table at the end of
+/// every slice. This pins **both** halves for a process parked at a `receive` **after** building
+/// a runtime-sized (off-heap, above the 64-byte on-heap limit) binary: the machine's reservoir is
+/// non-empty *and* the process's own roster is non-empty.
+///
+/// The fixture is deliberately a real compile of `<<0:N/unit:8>>` with a **variable** size, so
+/// the compiler lowers it to `bs_create_bin` (unit 8 → `N` **bytes**, not `N` bits) →
+/// [`make_binary`](beam_engine) → `alloc_refc_binary`, which is exactly the production route. The
+/// reservoir assertion above the roster assertion is load-bearing: it fails loudly if the fixture
+/// ever stops building off-heap, so the roster assertion can never be satisfied vacuously.
+#[test]
+fn a_process_building_an_off_heap_binary_comes_to_own_it() {
+    let source = "\
+-module(ohb).
+-export([build_and_park/1]).
+build_and_park(N) ->
+    Bin = <<0:N/unit:8>>,
+    receive X -> {Bin, X} end.
+";
+    let Some(dir) = compile_modules("offheap_bin", &[("ohb", source)]) else {
+        eprintln!("SKIP: no system `erlc` on PATH -- the off-heap binary ownership test is skipped");
+        return;
+    };
+
+    let mut rt = runtime();
+    rt.add_code_path(&dir);
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module =
+        Arc::new(beam_loader::load_file(dir.join("ohb.beam")).expect("load the compiled module"));
+    let build = module
+        .atom_table
+        .lookup("build_and_park")
+        .expect("build_and_park/1 is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function: build,
+            arity: 1,
+        },
+        // 256 bytes > `ERL_ONHEAP_BINARY_LIMIT` (64), so the result is an off-heap refc binary.
+        vec![make_small(256)],
+    );
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Wait,
+        "the bare `receive` parks the process after it builds the binary"
+    );
+
+    // The fixture really builds off-heap: the machine's never-cleared reservoir holds the payload.
+    let engine = state.engines.get(&pid).expect("the parked engine");
+    assert!(
+        !engine.machine.refc_binaries().is_empty(),
+        "the fixture must build its binary off-heap (a runtime-sized `<<0:N/unit:8>>`, N = 256)"
+    );
+
+    // ...and the per-slice registration seam made the *process* come to own it.
+    assert!(
+        table
+            .get(pid)
+            .expect("the parked process")
+            .off_heap_binary_count()
+            >= 1,
+        "the runner registers the machine's reservoir onto the process's own off-heap table"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **The A.9 E0 shape, end to end.** A **scheduled** process calls a **float-using** module
 /// across a module boundary; that callee blocks in a `receive`, so the process must suspend and
 /// be resumed by the message — and its return value is the float the callee computed.
@@ -1740,7 +1823,7 @@ fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
     let mut machine = machine_with_pending_reason(reason);
 
     // Publish the parked machine's roots: the reason rides the process's extra roots.
-    publish_parked_roots(&mut table, pid, &mut machine, false);
+    publish_parked_roots(&mut table, pid, &mut machine, 0);
     let extra = table.get(pid).expect("the process").registers().extra_roots();
     assert_eq!(
         extra.len(),
@@ -1790,7 +1873,7 @@ fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
     // Resume: the machine reads the relocated reason back, and the extra roots are consumed.
     {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        ctx.resync_parked_roots(pid, &mut machine, false);
+        ctx.resync_parked_roots(pid, &mut machine, 0);
     }
     assert_eq!(
         machine.pending_exception(),
@@ -1814,7 +1897,7 @@ fn publishing_a_machine_without_a_pending_exception_leaves_no_extra_root() {
     let mut machine = Machine::new();
     assert_eq!(machine.pending_exception(), None, "a fresh machine has no raise");
 
-    publish_parked_roots(&mut table, pid, &mut machine, false);
+    publish_parked_roots(&mut table, pid, &mut machine, 0);
     assert!(
         table.get(pid).expect("the process").registers().extra_roots().is_empty(),
         "a machine with no pending exception publishes no extra root"
@@ -1839,7 +1922,7 @@ fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extr
     };
     let mut machine = machine_with_pending_reason(reason);
 
-    publish_parked_roots(&mut table, pid, &mut machine, false);
+    publish_parked_roots(&mut table, pid, &mut machine, 0);
     assert_eq!(
         table.get(pid).expect("the process").registers().extra_roots(),
         &[reason][..],
@@ -1850,7 +1933,7 @@ fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extr
     machine.reset();
     assert_eq!(machine.pending_exception(), None, "the raise is gone after a reset");
 
-    publish_parked_roots(&mut table, pid, &mut machine, false);
+    publish_parked_roots(&mut table, pid, &mut machine, 0);
     assert!(
         table.get(pid).expect("the process").registers().extra_roots().is_empty(),
         "the stale extra root is cleared, never left as a leftover/NIL placeholder"
@@ -1975,19 +2058,20 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
     );
 }
 
-/// **A park of a float-free process does NOT publish the 1024-slot FR file.**
+/// **A park of a float-free process does NOT publish any FR word.**
 ///
-/// `publish_roots_full` *can* publish the machine's whole float-register file by appending its
-/// [`MAX_FLOAT_REGISTER`](beam_engine::machine::MAX_FLOAT_REGISTER) `Eterm` slots to the
-/// process's Erlang stack — real cost on every park and every collection that follows it. For a
-/// process whose FR is entirely `NIL` (the overwhelming majority: it never touched a float)
-/// those words are immediates that can root nothing, so the runner skips them: the post-slice
-/// scan computes the FR's liveness **once** and the park publishes the FR only when it is live.
+/// `publish_roots_full` *can* publish the machine's float-register file by appending its
+/// `Eterm` slots to the process's Erlang stack — real cost on every park and every collection
+/// that follows it. The runner bounds that to the machine's **live leading prefix**, read once
+/// per slice from `Machine::fr_mark()`. For a process whose FR is entirely `NIL` (the
+/// overwhelming majority: it never touched a float) `fr_mark() == 0`, so the park appends no FR
+/// word at all and the same count pins nothing.
 ///
 /// `recv_after.beam`'s `wait_forever/0` is `receive X -> X after infinity end` — no local
 /// variables, so its Erlang stack is shorter than the FR file — and it leaves no float register
 /// set. The parked process's published stack must therefore be exactly the machine's own stack,
-/// never that plus the FR file.
+/// never that plus the FR file: the whole 1024-slot file is `NIL`, and the published region is
+/// bounded by `fr_mark() == 0`.
 #[test]
 fn a_float_free_park_does_not_publish_the_fr_file() {
     let mut rt = runtime();
@@ -2017,12 +2101,12 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
     };
     assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
 
-    let machine_stack_len = state
-        .engines
-        .get_mut(&pid)
-        .expect("the parked engine")
-        .machine
-        .with_roots(RootSet::ALL_LIVE, |roots| roots.stack.len());
+    let (machine_stack_len, fr_mark) = {
+        let engine = state.engines.get_mut(&pid).expect("the parked engine");
+        let stack_len = engine.machine.with_roots(RootSet::ALL_LIVE, |roots| roots.stack.len());
+        (stack_len, engine.machine.fr_mark())
+    };
+    assert_eq!(fr_mark, 0, "the float-free fixture leaves no live FR slot");
     assert!(
         machine_stack_len < beam_engine::machine::MAX_FLOAT_REGISTER as usize,
         "the fixture's `wait_forever/0` has no Y slots, so its stack is shorter than the FR file \
@@ -2036,28 +2120,40 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
         .len();
     assert_eq!(
         published, machine_stack_len,
-        "a float-free park publishes only the machine's Erlang stack, never the 1024-slot FR file"
+        "a float-free park publishes only the machine's Erlang stack, never any FR word"
+    );
+    assert_eq!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .fr_published,
+        0,
+        "the park published a zero-length FR prefix and recorded that count for the resume"
     );
     assert_eq!(
         rt.gc_stats().pinned,
         0,
-        "a process whose FR is all NIL is not pinned"
+        "a process whose FR prefix is empty is not pinned"
     );
 }
 
-/// **A park whose FR *is* live still publishes the whole FR file and pins the process.**
+/// **A park whose FR *is* live publishes exactly the live prefix (`fr_mark`) and pins the
+/// process.**
 ///
-/// The dead-FR fast path must not weaken the live case: a process whose FR holds a term is
-/// pinned (its FR can point into the heap, so its heap must never move) **and** its FR slots
-/// must ride the process stack so a collection that does run — a `Yield`-window one, or a
-/// delivery-driven one, neither gated by the pin — relocates them rather than leaving them on
-/// the abandoned from-space.
+/// The bounded-FR path must not weaken the live case: a process whose FR holds a term is
+/// pinned (its FR can point into the heap, so its heap must never move) **and** its live FR
+/// prefix must ride the process stack so a collection that does run — a `Yield`-window one, or
+/// a delivery-driven one, neither gated by the pin — relocates it rather than leaving it on the
+/// abandoned from-space.
 ///
-/// A parked machine is not reset on resume, so an FR slot written while the process is parked
-/// survives into the next slice: setting it stands in for a float computation that left a
-/// register set (the exact residue the post-slice scan exists to catch), and the *second* park
-/// then observes a live FR. This pins both halves of the design — the published FR length and
-/// `ProcessEngine::fr_published`'s record of it — without needing compiled float code.
+/// A parked machine is not reset on resume, so an FR slot written through the engine's own
+/// `Machine::set_fr` seam while the process is parked survives into the next slice and raises
+/// the mark: setting slot 0 stands in for a float computation that left a register set (the
+/// exact residue the post-slice `fr_mark` check exists to catch), and the *second* park then
+/// observes one live FR slot. This pins both halves of the design — the published FR length is
+/// the **one**-word live prefix, not the 1024-slot file, and `ProcessEngine::fr_published`
+/// records that same count for the resume — without needing compiled float code.
 #[test]
 fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
     let mut rt = runtime();
@@ -2079,7 +2175,7 @@ fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
         Vec::new(),
     );
 
-    // Slice 1: park with a dead FR — no FR published, and the process is NOT pinned.
+    // Slice 1: park with a dead FR — no FR word published, and the process is NOT pinned.
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
         runner
@@ -2087,18 +2183,20 @@ fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
             .expect("the first slice runs")
     };
     assert_eq!(outcome, ProcOutcome::Wait);
-    assert_eq!(rt.gc_stats().pinned, 0, "a dead FR does not pin");
+    assert_eq!(rt.gc_stats().pinned, 0, "an empty FR prefix does not pin");
 
-    // Make the FR live while the machine is parked (a resume does not reset the machine).
-    let fr_len = beam_engine::machine::MAX_FLOAT_REGISTER as usize;
+    // Make FR slot 0 live while the machine is parked (a resume does not reset the machine).
+    // `set_fr` is the seam the interpreter itself uses, so it raises the mark to 1 — the count
+    // the park below must publish and record.
     state
         .engines
         .get_mut(&pid)
         .expect("the parked engine")
         .machine
-        .fr_mut()[0] = make_small(42);
+        .set_fr(0, make_small(42))
+        .expect("slot 0 is in the FR file");
 
-    // Slice 2: resuming with an empty mailbox parks again — now with a live FR.
+    // Slice 2: resuming with an empty mailbox parks again — now with one live FR slot.
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
         runner
@@ -2112,12 +2210,12 @@ fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
         1,
         "a live FR pins the process, so its heap is never moved again"
     );
-    let machine_stack_len = state
-        .engines
-        .get_mut(&pid)
-        .expect("the parked engine")
-        .machine
-        .with_roots(RootSet::ALL_LIVE, |roots| roots.stack.len());
+    let (machine_stack_len, fr_mark) = {
+        let engine = state.engines.get_mut(&pid).expect("the parked engine");
+        let stack_len = engine.machine.with_roots(RootSet::ALL_LIVE, |roots| roots.stack.len());
+        (stack_len, engine.machine.fr_mark())
+    };
+    assert_eq!(fr_mark, 1, "one FR slot is live, so the mark is one word");
     let published = table
         .get(pid)
         .expect("the parked process")
@@ -2126,16 +2224,132 @@ fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
         .len();
     assert_eq!(
         published,
-        machine_stack_len + fr_len,
-        "a live-FR park publishes the machine's stack plus the whole FR file"
+        machine_stack_len + 1,
+        "a live-FR park publishes the machine's stack plus exactly the live FR prefix \
+         (fr_mark = {fr_mark}), never the whole 1024-slot file"
     );
-    assert!(
+    assert_eq!(
         state
             .engines
             .get(&pid)
             .expect("the parked engine")
             .fr_published,
-        "the engine records the FR decision, so the resume scatters exactly the region the park \
-         published"
+        fr_mark as usize,
+        "the engine records the published prefix length, so the resume scatters exactly the region \
+         the park published"
     );
+}
+
+/// **The published FR prefix round-trips through a park → moving collection → resume.**
+///
+/// The bounded publication must still relocate a live FR term: the FR word sits at the **end**
+/// of the process's published stack region, so a collection relocates it with the rest of the
+/// roots and the resume must split the same region back into the machine's FR slots. The proof
+/// is by address — the FR slot holds a `{7,8}` tuple built on the process's own young heap, so a
+/// scatter that lost the FR word would leave the machine's slot on a dead from-space word (a
+/// **wrong** term, not merely a stale one).
+///
+/// The park publishes one FR word (`fr_mark() == 1`), the collection moves the tuple, and the
+/// resume scatters the relocated word back into FR slot 0.
+#[test]
+fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // Slice 1 parks the receive with a dead FR.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait);
+
+    // A `{7,8}` tuple on the PROCESS's own young heap, published as FR slot 0 through the
+    // engine's `set_fr` seam (which raises `fr_mark` to 1).
+    let original = {
+        let process = table.get_mut(pid).expect("the parked process");
+        let tuple = process
+            .heap_mut()
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("the young heap builds {7,8}");
+        state
+            .engines
+            .get_mut(&pid)
+            .expect("the parked engine")
+            .machine
+            .set_fr(0, tuple)
+            .expect("slot 0 is in the FR file");
+        tuple
+    };
+
+    // Slice 2: resume (scattering slice 1's empty prefix), then park again — this time with the
+    // one live FR word published onto the process stack.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks again");
+    assert_eq!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .fr_published,
+        1,
+        "the park published the one live FR slot"
+    );
+
+    // A genuine MOVING collection over the parked process: it gathers the process's stack
+    // (which holds the published FR word at its end) and scatters the relocated words back.
+    //
+    // The `Wait` park arm left the process relocation-exempt for its parked window, and
+    // `Process::collect` refuses an exempt process with the typed `relocation_exempt` raise — so
+    // clear it first. That is exactly the `Yield` (pre-emption) window's situation: a pre-empted
+    // process is *not* exempt, so its published FR prefix is the only thing that keeps a live
+    // FR term across a collection taken while it sits in `RunnerState.engines`.
+    table
+        .set_relocation_exempt(pid, false)
+        .expect("the pid has a process");
+    table
+        .get_mut(pid)
+        .expect("the process is in the table")
+        .collect()
+        .expect("the collection runs");
+
+    // Resume: the machine re-syncs from the process's authoritative root set, so FR slot 0 must
+    // come back holding the RELOCATED tuple.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the third slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the receive parks yet again");
+    let resumed = state
+        .engines
+        .get(&pid)
+        .expect("the parked engine")
+        .machine
+        .get_fr(0)
+        .expect("slot 0 is in the FR file");
+    assert_tuple_relocated(resumed, original, [7, 8], "the published FR slot");
 }

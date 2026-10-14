@@ -46,20 +46,28 @@
 //! `map_next/3`, `map_to_tuple_keys/1` and `map_hashmap_children/1` **do** raise
 //! (`badarg`, or the structured `{badmap, Term}`), so those assert on `Err(..)`.
 //!
-//! # Representation-dependent goldens
+//! # Representation-dependent `term_type` goldens
 //!
-//! `erts_debug:flat_size/1` and `erts_internal:term_type/1` report the argument's
-//! *physical* representation, so their values are only comparable where this runtime
-//! and the C build the same block. This runtime materializes small binaries as
-//! on-heap `ErlHeapBits`, exactly as the oracle does for a **dynamically built**
-//! binary (e.g. `list_to_binary/1`); a *compiled literal* binary in the oracle
-//! instead becomes the 8-word off-heap `[BinRef][ErlSubBits]` pair, so it reports
-//! `flat_size` 8 and `term_type` `sub_binary` there. The goldens below are the
-//! on-heap ones (`flat_size` `<<>>`→2, `<<1,2,3>>`→3 and `term_type`→`heap_binary`),
-//! which is what `main`'s representation produces; the oracle cross-check only uses
-//! *dynamically built* binaries so the comparison stays apples-to-apples.
+//! `erts_internal:term_type/1` reports the argument's *physical* tag, so its values
+//! are only comparable where this runtime and the C build the same block. This
+//! runtime materializes every bitstring it builds as an on-heap `ErlHeapBits`, and
+//! so does the oracle for one up to 512 bits — a **dynamically built** binary (e.g.
+//! `list_to_binary/1`) and a compiled literal alike (both `heap_binary`); the oracle
+//! only switches to the 8-word off-heap `[BinRef][ErlSubBits]` pair *above* 512 bits
+//! (verified on erts-17.1: `<<0:512>>` ⇒ `heap_binary`, `<<0:520>>` ⇒ `sub_binary`).
+//! The `term_type` goldens below are therefore the on-heap ones (`heap_binary`), which
+//! is what `main`'s representation produces; the oracle cross-check compares
+//! `term_type` only for the ≤ 512-bit binaries so it stays apples-to-apples.
+//!
+//! `erts_debug:flat_size/1` is **not** representation-dependent for a bitstring after
+//! the C-count override in `src/erts_internal.rs`: the count is a pure function of the
+//! bit length on both sides (`2 + ceil(bits/64)` up to 512 bits, `8` above), so its
+//! oracle cross-check covers dynamically built binaries and compiled literals alike
+//! (see [`flat_size_agrees_with_the_compiled_module_oracle`]).
 
-use beam_alloc::Heap;
+use std::collections::HashMap;
+
+use beam_alloc::{Heap, RefcBinary};
 use beam_bifs::{default_registry, BifContext, BifRegistry};
 use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
 use beam_process::{PortId, ProcessId, RefAllocator};
@@ -179,24 +187,61 @@ fn internal_ref(heap: &mut Heap) -> Eterm {
         .expect("the ref thing fits")
 }
 
-/// A `FunKind::Local` (`make_fun3`-shaped) fun term with an empty environment.
+/// A `FunKind::Local` (`make_fun3`-shaped) fun term with the environment `env`.
 ///
 /// `beam_codec::term::make_fun_local` is `#[cfg(test)]`-gated *inside* `beam_codec`
 /// (unreachable from an integration test) and the production builder lives in
 /// `beam_engine::terms`, which is not a dependency of this crate — so this helper
 /// calls the frozen heap-agnostic writer itself. That writer is `unsafe` (it writes
 /// raw heap words), which is why this is the file's only `unsafe` use.
-fn local_fun(heap: &mut Heap, arity: usize, uniq: u64, index: u32) -> Eterm {
-    let words = beam_codec::term::fun_words(beam_codec::term::FunKind::Local, 0);
+fn local_fun(heap: &mut Heap, arity: usize, uniq: u64, index: u32, env: &[Eterm]) -> Eterm {
+    let words = beam_codec::term::fun_words(beam_codec::term::FunKind::Local, env.len());
     // SAFETY: `alloc_words` returns `words` exclusively-owned, writable words, and
-    // `words` is exactly `fun_words(FunKind::Local, 0)` — the block size
+    // `words` is exactly `fun_words(FunKind::Local, env.len())` — the block size
     // `write_fun_local` writes.
     let hp = unsafe { heap.alloc_words(words) }.expect("the fun block fits the test heap");
-    // SAFETY: `hp` owns exactly `fun_words(Local, 0)` words and the empty environment
+    // SAFETY: `hp` owns exactly `fun_words(Local, env.len())` words and the environment
     // satisfies `num_free == env.len()`; the block stays live on `heap` for the
     // returned term.
-    unsafe { beam_term::fun::write_fun_local(hp, arity, uniq, index, &[]) }
+    unsafe { beam_term::fun::write_fun_local(hp, arity, uniq, index, env) }
         .expect("writes the local fun")
+}
+
+/// The **off-heap** refc binary over `bytes` whose bit window is
+/// `offset_bits..offset_bits + size_bits` — the `[BinRef][ErlSubBits]` pair the
+/// engine's `bs_create_bin` builds for any payload above `ERL_ONHEAP_BINARY_LIMIT`.
+///
+/// The `RefcBinary` handle is pushed onto `payloads`, which the caller keeps alive
+/// for as long as the term is used: the handle is the payload's ownership record
+/// (see `beam_codec::OffHeapBinaries`'s contract).
+fn refc_binary(
+    heap: &mut Heap,
+    payloads: &mut Vec<RefcBinary>,
+    bytes: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+) -> Eterm {
+    let payload = RefcBinary::new(bytes).expect("the off-heap payload allocates");
+    let base = payload.data_ptr();
+    // Moving the handle into `payloads` does not move the payload it points at (that
+    // is off-heap), so `base` stays valid for the term's whole lifetime.
+    payloads.push(payload);
+    // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
+    // writable words — exactly the pair `write_refc_binary` fully writes; `base` is
+    // the first byte of the (now fixture-owned) payload's live, word-aligned data area
+    // and covers bits `offset_bits..offset_bits + size_bits`.
+    let hp = unsafe { heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
+        .expect("the 8-word pair fits the test heap");
+    unsafe {
+        beam_term::refc::write_refc_binary(
+            hp,
+            base.cast::<Eterm>(),
+            core::ptr::null_mut(),
+            base,
+            offset_bits,
+            size_bits,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,35 +463,403 @@ fn flat_size_of_bitstrings_matches_the_on_heap_layout() {
     });
 }
 
+/// The three divergent node kinds are counted exactly as the C counts them, so
+/// `flat_size/1` answers a number for them instead of the typed gap:
+///
+/// * a reference is the C's 3-word `ERTS_REF_THING_SIZE` (this runtime's M1 ref
+///   thing is 4 words);
+/// * a fun is `2 + num_free` — the C `ERL_FUN_SIZE` (`erl_fun.h:97-99`) plus the
+///   environment, whose members are `size_object`'s children on both sides;
+/// * a bitstring's flat size follows the C's on-heap limit *whatever*
+///   representation this runtime chose: `2 + ceil(bits/64)` up to 512 bits, the
+///   8-word `[BinRef][ErlSubBits]` pair above it (an off-heap refc term already
+///   counts 8 through `size_object`).
+///
+/// Every golden is the value the compiled-module oracle prints;
+/// [`flat_size_agrees_with_the_compiled_module_oracle`] re-derives them all live.
 #[test]
-fn flat_size_reports_a_typed_gap_for_divergent_representations() {
+fn flat_size_counts_the_divergent_representations_like_the_c() {
     with_ctx(|reg, ctx| {
-        // A fun: this runtime inlines the descriptor, so the block is
-        // `1 + desc_words(kind) + num_free` where the C's `ERL_FUN_SIZE + num_free`
-        // is 2 + num_free — no comparable oracle value exists.
-        let fun = local_fun(ctx.heap(), 0, 1, 2);
-        assert_unsupported(
-            reg.call("erts_debug", "flat_size", 1, ctx, &[fun]),
-            "flat_size/1 of a fun",
-        );
+        let seven = make_small(7);
+        let eight = make_small(8);
+        let ints25: Vec<Eterm> = (1..=25).map(make_small).collect();
+        let captured_list = ctx.list(&ints25).expect("the 25-element list fits");
+        let module = ctx.atoms().lookup("erlang").expect("seeded");
+        let function = ctx.atoms().lookup("map").expect("seeded");
+        let creator = beam_codec::term::FunPid {
+            node: module,
+            number: 1,
+            serial: 0,
+            creation: 0,
+        };
 
-        // A bitstring above C's on-heap limit (512 bits): this runtime may hold it
-        // in an on-heap `ErlHeapBits` (11 words for 520 bits) where C switches to
-        // the 8-word `[BinRef][ErlSubBits]` pair.
-        let long = beam_codec::term::make_bitstring(ctx.heap(), &[0u8; 65], 520)
-            .expect("the 520-bit block fits");
-        assert_unsupported(
-            reg.call("erts_debug", "flat_size", 1, ctx, &[long]),
-            "flat_size/1 of a 520-bit bitstring",
-        );
-
-        // An internal reference: the M1 ref thing is 4 words where C's
-        // `ERL_REF_SIZE` is 3.
         let reference = internal_ref(ctx.heap());
+        let no_free = local_fun(ctx.heap(), 0, 1, 2, &[]);
+        let one_free = local_fun(ctx.heap(), 0, 1, 2, &[seven]);
+        let two_free = local_fun(ctx.heap(), 0, 1, 2, &[seven, eight]);
+        let capturing = local_fun(ctx.heap(), 0, 1, 2, &[captured_list]);
+        let capturing_ref = local_fun(ctx.heap(), 0, 1, 2, &[reference]);
+        let external = beam_codec::term::make_fun_external(ctx.heap(), 1, module, function)
+            .expect("the EXPORT_EXT block fits");
+        let imported0 = beam_codec::term::make_fun_imported(
+            ctx.heap(), 1, module, &[7u8; 16], 3, 4, 5, creator, &[],
+        )
+        .expect("the NEW_FUN_EXT block fits");
+        let imported1 = beam_codec::term::make_fun_imported(
+            ctx.heap(),
+            1,
+            module,
+            &[7u8; 16],
+            3,
+            4,
+            5,
+            creator,
+            &[seven],
+        )
+        .expect("the NEW_FUN_EXT block fits");
+
+        let heap_512 = binary(ctx, &[0u8; 64]);
+        let heap_520 = beam_codec::term::make_bitstring(ctx.heap(), &[0u8; 65], 520)
+            .expect("the 520-bit block fits");
+        let heap_3bit = beam_codec::term::make_bitstring(ctx.heap(), &[0b0010_0000], 3)
+            .expect("the 3-bit block fits");
+        let mut payloads: Vec<RefcBinary> = Vec::new();
+        // An off-heap refc binary — the representation the C also uses above 512 bits,
+        // here built directly so the *off-heap* half of the ordering is covered.
+        let off_heap_100 = refc_binary(ctx.heap(), &mut payloads, &[0u8; 200], 0, 800);
+
+        let one_ref_tuple = ctx.tuple(&[make_small(1), reference]).expect("fits");
+        let nested = ctx.list(&[one_ref_tuple, no_free]).expect("fits");
+        let nested_fun_ref = ctx.list(&[reference, no_free]).expect("fits");
+        let flat_map = ab_map(ctx);
+        let pairs: Vec<(Eterm, Eterm)> = (1..=33).map(|n| (make_small(n), make_small(n * 10))).collect();
+        // `make_map` needs the atom table at the same time as the heap, which a
+        // `BifContext` cannot lend twice, so the map is built over a snapshot of it
+        // (only atom *keys* consult the table, and these keys are integers).
+        let atoms = ctx.atoms().clone();
+        let hamt = beam_codec::term::make_map(ctx.heap(), &pairs, &atoms).expect("the 33-key map fits");
+
+        let cases: Vec<(&str, Eterm, i64)> = vec![
+            ("a reference", reference, 3),
+            ("a fun with no free variables", no_free, 2),
+            ("a fun capturing one variable", one_free, 3),
+            ("a fun capturing two variables", two_free, 4),
+            ("a closure capturing a 25-element list", capturing, 53),
+            ("a fun capturing a reference", capturing_ref, 6),
+            ("an EXPORT_EXT fun", external, 2),
+            ("a NEW_FUN_EXT fun with no free variables", imported0, 2),
+            ("a NEW_FUN_EXT fun capturing one variable", imported1, 3),
+            ("an on-heap 512-bit (64-byte) binary", heap_512, 10),
+            ("an on-heap 520-bit bitstring", heap_520, 8),
+            ("an on-heap 3-bit bitstring", heap_3bit, 3),
+            ("an off-heap refc binary (100 bytes)", off_heap_100, 8),
+            ("[{1,Ref},Fun] (nested divergences)", nested, 12),
+            ("[Ref,Fun] (nested divergences)", nested_fun_ref, 9),
+            ("#{a=>1,b=>2}", flat_map, 8),
+            ("a 33-key HAMT map", hamt, 123),
+            ("an atom", ctx.atom("a").expect("seeded"), 0),
+            ("a small int", make_small(1), 0),
+        ];
+        for (what, term, expected) in cases {
+            let got = call(reg, ctx, "erts_debug", "flat_size", 1, &[term]);
+            assert_eq!(got, make_small(expected), "flat_size/1 of {what}");
+        }
+    });
+}
+
+/// Only the shapes whose C word count cannot be honestly derived keep the typed gap:
+/// an external pid/port/ref, whose `node` slot this runtime inlines into a block
+/// whose C size is the header's own arity, and any subtag the walk does not
+/// positively recognize. Never a fabricated number.
+#[test]
+fn flat_size_keeps_the_typed_gap_for_unverifiable_shapes() {
+    with_ctx(|reg, ctx| {
+        let node = ctx.atom("a").expect("seeded");
+        let external_pid = beam_codec::term::make_external_pid(ctx.heap(), node, 1, 0, 0)
+            .expect("the external pid block fits");
         assert_unsupported(
-            reg.call("erts_debug", "flat_size", 1, ctx, &[reference]),
-            "flat_size/1 of an internal reference",
+            reg.call("erts_debug", "flat_size", 1, ctx, &[external_pid]),
+            "flat_size/1 of an external pid",
         );
+        // ... and the very same reference counted inside a container is *not* a gap.
+        let list = ctx.list(&[external_pid, make_small(1)]).expect("fits");
+        assert_unsupported(
+            reg.call("erts_debug", "flat_size", 1, ctx, &[list]),
+            "flat_size/1 of a list holding an external pid",
+        );
+    });
+}
+
+/// The compiled-module oracle fixture for `erts_debug:flat_size/1` (see
+/// [`flat_size_agrees_with_the_compiled_module_oracle`] for why it must be
+/// *compiled* rather than an `-eval` expression).
+const ORACLE_MODULE: &str = r#"
+-module(fsz_oracle).
+-export([go/0]).
+f0() -> fun() -> 1 end.
+f1(X) -> fun() -> X end.
+f2(A, B) -> fun() -> A + B end.
+cap(N) -> L = lists:seq(1, N), fun() -> L end.
+cap_ref(R) -> fun() -> R end.
+emit(K, V) -> io:format("~s=~p~n", [K, erts_debug:flat_size(V)]).
+go() ->
+    F0 = f0(), F1 = f1(7), F2 = f2(7, 8),
+    R = make_ref(),
+    Cases = [
+        {"ref", R},
+        {"fun_nofree", F0},
+        {"fun_1free", F1},
+        {"fun_2free", F2},
+        {"fun_capture_25", cap(25)},
+        {"fun_capture_ref", cap_ref(R)},
+        {"fun_export", fun f1/1},
+        {"newfun_0", binary_to_term(term_to_binary(F0))},
+        {"newfun_1", binary_to_term(term_to_binary(F1))},
+        {"list", [1,2,3]},
+        {"tuple", {1,2,3}},
+        {"nested", [{1, R}, F0]},
+        {"nested_fun_ref", [R, F0]},
+        {"map_flat", #{a => 1, b => 2}},
+        {"map_hamt", maps:from_list([{N, N*10} || N <- lists:seq(1,33)])},
+        {"atom", abc},
+        {"small", 1},
+        {"bignum", 1 bsl 100},
+        {"bin_empty", list_to_binary([])},
+        {"bin_63", binary:copy(<<0>>, 63)},
+        {"bin_64", binary:copy(<<0>>, 64)},
+        {"bin_65", binary:copy(<<0>>, 65)},
+        {"bin_100", binary:copy(<<0>>, 100)},
+        {"bin_lit_empty", <<>>},
+        {"bin_lit_3bit", <<1:3>>},
+        {"bin_lit_64", <<0:64>>},
+        {"bin_lit_512", <<0:512>>},
+        {"bin_lit_520", <<0:520>>},
+        {"bin_lit_800", <<0:800>>},
+        {"bin_part_100_of_200", binary:part(binary:copy(<<0>>, 200), 0, 100)},
+        {"bit_nonbyte_519", <<1:1, 0:518>>},
+        {"bit_nonbyte_7", <<1:7>>}
+    ],
+    [emit(K, V) || {K, V} <- Cases],
+    ok.
+"#;
+
+/// Compiles [`ORACLE_MODULE`] with the system `erlc`, runs it with the system `erl`
+/// and returns its `key=value` lines. `None` when the toolchain cannot be spawned
+/// (the caller then skips loudly); a toolchain that *is* present but fails panics,
+/// so the check can never pass vacuously.
+fn compiled_module_oracle() -> Option<HashMap<String, i64>> {
+    let dir = std::env::temp_dir().join("erts_internal_flat_size_oracle");
+    std::fs::create_dir_all(&dir).ok()?;
+    let source = dir.join("fsz_oracle.erl");
+    std::fs::write(&source, ORACLE_MODULE).ok()?;
+    let compiled = std::process::Command::new("erlc")
+        .arg("-o")
+        .arg(&dir)
+        .arg(&source)
+        .output()
+        .ok()?;
+    assert!(
+        compiled.status.success(),
+        "erlc could not compile the oracle fixture:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let code = "fsz_oracle:go(), halt(0).";
+    let run = std::process::Command::new("erl")
+        .arg("-noshell")
+        .arg("-pa")
+        .arg(&dir)
+        .arg("-eval")
+        .arg(code)
+        .output()
+        .ok()?;
+    assert!(
+        run.status.success(),
+        "the oracle fixture failed to run:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let mut values = HashMap::new();
+    for line in String::from_utf8_lossy(&run.stdout).lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match value.trim().parse::<i64>() {
+                Ok(n) => {
+                    values.insert(key.to_string(), n);
+                }
+                Err(err) => panic!("the oracle printed a non-integer `{line}`: {err}"),
+            }
+        }
+    }
+    Some(values)
+}
+
+/// `erts_debug:flat_size/1` against the live **compiled-module** oracle.
+///
+/// `erl -noshell -eval` cannot answer the divergent cases: an `-eval` expression is
+/// run by `erl_eval`, whose bit syntax materializes *every* literal bitstring as a
+/// `sub_binary` of an `erl_eval` literal (verified on erts-17.1:
+/// `erts_internal:term_type(<<>>)` reports `sub_binary` and `flat_size(<<>>)` `8`,
+/// where a compiled module reports `heap_binary` and `2`, and
+/// `flat_size(<<1:3>>)` `8` versus `3`), and whose `fun(X) -> X end` is an
+/// `erl_eval` closure carrying erl_eval's own `Info` environment instead of a
+/// module closure (27 words, not 2). A compiled module is therefore the only
+/// faithful oracle for this BIF; the table below pairs each fixture case with the
+/// same term built here. Skips loudly when `erlc`/`erl` are unavailable.
+#[test]
+fn flat_size_agrees_with_the_compiled_module_oracle() {
+    let Some(oracle) = compiled_module_oracle() else {
+        eprintln!(
+            "SKIP: the system `erlc`/`erl` oracle is unavailable or does not run; \
+             the flat_size/1 compiled-module cross-check is skipped"
+        );
+        return;
+    };
+
+    with_ctx(|reg, ctx| {
+        let seven = make_small(7);
+        let eight = make_small(8);
+        let ints25: Vec<Eterm> = (1..=25).map(make_small).collect();
+        let captured_list = ctx.list(&ints25).expect("the 25-element list fits");
+        let module = ctx.atoms().lookup("erlang").expect("seeded");
+        let function = ctx.atoms().lookup("map").expect("seeded");
+        let creator = beam_codec::term::FunPid {
+            node: module,
+            number: 1,
+            serial: 0,
+            creation: 0,
+        };
+
+        let reference = internal_ref(ctx.heap());
+        let no_free = local_fun(ctx.heap(), 0, 1, 2, &[]);
+        let one_free = local_fun(ctx.heap(), 0, 1, 2, &[seven]);
+        let two_free = local_fun(ctx.heap(), 0, 1, 2, &[seven, eight]);
+        let capturing = local_fun(ctx.heap(), 0, 1, 2, &[captured_list]);
+        let capturing_ref = local_fun(ctx.heap(), 0, 1, 2, &[reference]);
+        let external = beam_codec::term::make_fun_external(ctx.heap(), 1, module, function)
+            .expect("the EXPORT_EXT block fits");
+        let imported0 = beam_codec::term::make_fun_imported(
+            ctx.heap(), 1, module, &[7u8; 16], 3, 4, 5, creator, &[],
+        )
+        .expect("the NEW_FUN_EXT block fits");
+        let imported1 = beam_codec::term::make_fun_imported(
+            ctx.heap(),
+            1,
+            module,
+            &[7u8; 16],
+            3,
+            4,
+            5,
+            creator,
+            &[seven],
+        )
+        .expect("the NEW_FUN_EXT block fits");
+
+        let list = ctx
+            .list(&[make_small(1), make_small(2), make_small(3)])
+            .expect("fits");
+        let tuple = ctx
+            .tuple(&[make_small(1), make_small(2), make_small(3)])
+            .expect("fits");
+        let one_ref_tuple = ctx.tuple(&[make_small(1), reference]).expect("fits");
+        let nested = ctx.list(&[one_ref_tuple, no_free]).expect("fits");
+        let nested_fun_ref = ctx.list(&[reference, no_free]).expect("fits");
+        let flat_map = ab_map(ctx);
+        let pairs: Vec<(Eterm, Eterm)> = (1..=33)
+            .map(|n| (make_small(n), make_small(n * 10)))
+            .collect();
+        // As in `flat_size_counts_the_divergent_representations_like_the_c`: the atom
+        // table is taken as a snapshot because a `BifContext` cannot lend the heap and
+        // the table at once.
+        let atoms = ctx.atoms().clone();
+        let hamt = beam_codec::term::make_map(ctx.heap(), &pairs, &atoms).expect("the 33-key map fits");
+        let atom = ctx.atom("a").expect("seeded");
+        let big = beam_codec::term::make_big(
+            ctx.heap(),
+            false,
+            &[0x1234_5678_9abc_def0, 1],
+        )
+        .expect("the bignum fits");
+
+        // The fixture's literals are on-heap blocks here (`make_bitstring`), which is
+        // what this runtime builds for any bitstring it is handed; above 512 bits the
+        // *count* is the C's refc-pair 8 regardless of which side holds it.
+        let mut payloads: Vec<RefcBinary> = Vec::new();
+        let cases: Vec<(&str, Eterm)> = vec![
+            ("ref", reference),
+            ("fun_nofree", no_free),
+            ("fun_1free", one_free),
+            ("fun_2free", two_free),
+            ("fun_capture_25", capturing),
+            ("fun_capture_ref", capturing_ref),
+            ("fun_export", external),
+            ("newfun_0", imported0),
+            ("newfun_1", imported1),
+            ("list", list),
+            ("tuple", tuple),
+            ("nested", nested),
+            ("nested_fun_ref", nested_fun_ref),
+            ("map_flat", flat_map),
+            ("map_hamt", hamt),
+            ("atom", atom),
+            ("small", make_small(1)),
+            ("bignum", big),
+            ("bin_empty", binary(ctx, b"")),
+            ("bin_63", binary(ctx, &[0u8; 63])),
+            ("bin_64", binary(ctx, &[0u8; 64])),
+            ("bin_65", binary(ctx, &[0u8; 65])),
+            ("bin_100", binary(ctx, &[0u8; 100])),
+            ("bin_lit_empty", binary(ctx, b"")),
+            (
+                "bin_lit_3bit",
+                beam_codec::term::make_bitstring(ctx.heap(), &[0b0010_0000], 3)
+                    .expect("the 3-bit block fits"),
+            ),
+            (
+                "bin_lit_64",
+                beam_codec::term::make_bitstring(ctx.heap(), &[0u8; 8], 64)
+                    .expect("the 64-bit block fits"),
+            ),
+            ("bin_lit_512", binary(ctx, &[0u8; 64])),
+            (
+                "bin_lit_520",
+                beam_codec::term::make_bitstring(ctx.heap(), &[0u8; 65], 520)
+                    .expect("the 520-bit block fits"),
+            ),
+            (
+                "bin_lit_800",
+                beam_codec::term::make_bitstring(ctx.heap(), &[0u8; 100], 800)
+                    .expect("the 800-bit block fits"),
+            ),
+            (
+                "bin_part_100_of_200",
+                refc_binary(ctx.heap(), &mut payloads, &[0u8; 200], 0, 800),
+            ),
+            (
+                "bit_nonbyte_519",
+                beam_codec::term::make_bitstring(ctx.heap(), &[0x80; 65], 519)
+                    .expect("the 519-bit block fits"),
+            ),
+            (
+                "bit_nonbyte_7",
+                beam_codec::term::make_bitstring(ctx.heap(), &[0b1111_1110], 7)
+                    .expect("the 7-bit block fits"),
+            ),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            oracle.len(),
+            "the fixture and the Rust table must cover exactly the same cases",
+        );
+        for (key, term) in cases {
+            let expected = oracle
+                .get(key)
+                .unwrap_or_else(|| panic!("the oracle fixture printed no `{key}` line"));
+            let got = call(reg, ctx, "erts_debug", "flat_size", 1, &[term]);
+            assert_eq!(
+                signed_value(got),
+                *expected,
+                "flat_size/1 of the oracle case `{key}`"
+            );
+        }
     });
 }
 
@@ -497,7 +910,7 @@ fn term_type_names_every_representation() {
             ("heap_binary", binary(ctx, b"")),
             ("pid", ProcessId::new(1, 0).to_eterm()),
             ("reference", internal_ref(ctx.heap())),
-            ("fun", local_fun(ctx.heap(), 0, 1, 2)),
+            ("fun", local_fun(ctx.heap(), 0, 1, 2, &[])),
             (
                 "export",
                 beam_codec::term::make_fun_external(ctx.heap(), 2, module, function)

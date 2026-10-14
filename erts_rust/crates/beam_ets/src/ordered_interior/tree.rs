@@ -46,13 +46,32 @@
 //!
 //! # Complexity
 //!
-//! `find`/`insert`/`delete`/`next`/`prev`/`first`/`last` are `O(log n)` node
-//! visits with `O(K)` work per node (`Vec::insert`/`remove` inside a `K`-sized
-//! node); ordered iteration is `O(n)` overall. Splits always split a node in half
-//! *after* it exceeds [`ORDER`], and a delete that under-fills a node borrows from
-//! a sibling with a spare entry or merges (the two occupancies then sum to at most
-//! `ORDER`), so every node stays within `[MIN_OCCUPANCY, ORDER]` and the height
-//! only changes at the root.
+//! Every operation is `O(log n)` node visits with `O(K)` work per node
+//! (`Vec::insert`/`remove` inside a `K`-sized node), and `O(log n)` term
+//! comparisons overall (`O(log ORDER)` of them per node, from `child_index`'s and
+//! `search_entries`' binary searches), except for two documented exceptions:
+//!
+//! * `find`/`first`/`last`/`next`/`prev` — `O(log n)` node visits: one descent,
+//!   plus for `next`/`prev` at most one extra descent to the neighbouring subtree's
+//!   leftmost/rightmost leaf (`next_subtree_key`).
+//! * `insert` — `O(log n)` node visits **amortized**. The unwind carries the new
+//!   subtree maximum up in `InsertStep`, so an insert that does not split a node
+//!   never descends again. A split does re-derive one separator with a
+//!   [`NodeStore::subtree_max_key`] descent (`O(log n)` node visits, but *no* term
+//!   comparisons — it is a pointer chase to a rightmost leaf), and splits are
+//!   amortized `O(1)` per insert (one per `ORDER / 2` inserts), so an insert is
+//!   worst-case `O(log^2 n)` only when a split cascades up every level.
+//! * `delete` — `O(log^2 n)` node visits (unconditional): the unwind re-derives the
+//!   settled child's maximum with a [`NodeStore::subtree_max_key`] descent at *every*
+//!   level rather than carrying it up, so the tree depth is paid once per level.
+//!   Those re-derivations are pointer chases, so the *comparison* count is still
+//!   `O(log n)`.
+//!
+//! Ordered iteration is `O(n)` overall (a walk of the leaf chain). Splits always
+//! split a node in half *after* it exceeds [`ORDER`], and a delete that under-fills
+//! a node borrows from a sibling with a spare entry or merges (the two occupancies
+//! then sum to at most `ORDER`), so every node stays within
+//! `[MIN_OCCUPANCY, ORDER]` and the height only changes at the root.
 //!
 //! Term order is never re-implemented: every **key** comparison goes through the
 //! arithmetic key order `beam_term::compare::cmp_arith`, so `1` and `1.0` are the

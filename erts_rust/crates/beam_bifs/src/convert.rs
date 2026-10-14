@@ -41,7 +41,10 @@
 //!   `"11111111"`, `(-255, 36)` ⇒ `"-73"`, `(0, 10)` ⇒ `"0"`; a base outside
 //!   `2..=36` or a non-integer argument ⇒ `badarg`.
 //! * `list_to_integer("+123")` ⇒ `123`, `("ff", 16)` ⇒ `255`, `("ZZ", 36)` ⇒
-//!   `1295`; `""`, `" 12"`, `"12.0"`, `"-"`, `"2"` base 2 ⇒ `badarg`.
+//!   `1295`; `""`, `" 12"`, `"12.0"`, `"-"`, `"2"` base 2 ⇒ `badarg`. Each element
+//!   is read as its **byte** (`big.c:4298,4331` narrows `unsigned_val` to the C
+//!   `byte`), never required to *be* a byte: `[49,304]` spells `"10"` ⇒ `10`,
+//!   `[304]` spells `"0"` ⇒ `0` and `[-207]` spells `"1"` ⇒ `1`.
 //! * `float_to_list(1.5)` ⇒ `"1.50000000000000000000e+00"` (the default is
 //!   `{scientific, SYS_DEFAULT_FLOAT_DECIMALS = 20}`); `{decimals, 2}` ⇒
 //!   `"1.50"`; `{decimals, 0}` ⇒ `"2"` for `1.5` and `"3"` for `2.5` (the fixed
@@ -81,30 +84,23 @@
 //! * **The rendering buffer bound is the oracle's.** `float_to_list/2` is
 //!   `badarg` for a rendering longer than the C's 255 characters *plus* its
 //!   terminating NUL — unreachable for the `short` form (24 characters at most)
-//!   and reachable only for an extreme `{decimals, N}`.//! * **`raise/3` carries atom reasons only.** `beam_common::ExitReason` encodes
-//!   an atom reason (named or `Atom(name)`) but no reason *term* (see
-//!   [`crate::reason`]); a non-atom reason is therefore reported as `badarg`
-//!   rather than raised. (erts-17.1 raises the term; the same representational
-//!   gap is why `reason_term_from_exit_reason(Structured)` is `badarg`.)
+//!   and reachable only for an extreme `{decimals, N}`.
 //! * **`list_to_atom` interprets its elements as Unicode code points** and needs
 //!   an installed [`AtomInterner`](crate::context::AtomInterner); without one an
 //!   unknown name reports
 //!   [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound).
-//! * **`list_to_integer` requires byte-sized elements** (`0..=255`); erts
-//!   truncates each element to a byte, so `list_to_integer([304])` is `0` there
-//!   and `badarg` here.
 
 use core::cmp::Ordering;
 
 use beam_codec::term as codec_term;
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_term::compare::cmp_arith;
-use beam_term::{atom_val, make_atom, signed_value, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, is_byte, make_atom, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
 use crate::context::BifContext;
-use crate::error::{badarg, raise_error, raise_exit, raise_throw, system_limit};
+use crate::error::{badarg, raise_error, raise_exit, raise_term, raise_throw, system_limit};
 use crate::numeric::{
     base_arg, format_scientific, integer_digits, parse_float, parse_float_options, parse_integer,
     render_float, small_arg, DEFAULT_FLOAT_DECIMALS,
@@ -176,20 +172,87 @@ fn list_to_integer_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> 
     list_to_integer(ctx, args[0], base)
 }
 
-/// `list_to_integer/1,2`: a proper list of byte-sized integers, parsed whole.
+/// `byte c = unsigned_val(CAR(list))` (`big.c:4298,4331`): the element as the C
+/// `byte` variable it is read into — the low eight bits of the two's-complement
+/// 60-bit value, so an element outside `0..=255` (or a negative one) wraps.
+fn element_byte(elem: Eterm) -> u8 {
+    (signed_value(elem) as u64 & 0xFF) as u8
+}
+
+/// `digits_per_small(base)` (`big.c:4112-4127`): how many base-`base` digits fit a
+/// small integer — the largest `n` with `base^n <= 2^59` (`SMALL_BITS - 1`, the
+/// 59 magnitude bits the sign bit leaves). This *derives* the 64-bit row of the
+/// C's `digits_per_small_lookup`; the tests below pin it against the published
+/// table.
+fn digits_per_small(base: u32) -> usize {
+    const SMALL_MAGNITUDE: u128 = 1 << 59;
+    let mut count = 0;
+    let mut power = 1u128;
+    while power * u128::from(base) <= SMALL_MAGNITUDE {
+        power *= u128::from(base);
+        count += 1;
+    }
+    count
+}
+
+/// How many digits `erts_internal:list_to_integer/2` reads as significant: it
+/// consumes the optional sign and the leading zeros first (`big.c:4285-4313`), so
+/// `"007"` counts as one digit.
+fn significant_digits(bytes: &[u8]) -> usize {
+    let digits = match bytes.first() {
+        Some(b'-' | b'+') => &bytes[1..],
+        _ => bytes,
+    };
+    let zeros = digits.iter().take_while(|&&byte| byte == b'0').count();
+    digits.len() - zeros
+}
+
+/// `list_to_integer/1,2` — the `erlang.erl` wrapper (`erlang.erl:4117-4137`,
+/// `4171-4190`) over `erts_internal:list_to_integer/2` (`big.c:4258-4355`).
+///
+/// Each element is read as its **byte** (see [`element_byte`]), never required to
+/// *be* a byte: `[49,304]` spells `"10"` and is `10`, `[304]` spells `"0"` and is
+/// `0`, `[-207]` spells `"1"` and is `1`.
+///
+/// The wrapper accepts only the internal BIF's `{Int, []}` shape — `no_integer`,
+/// `not_a_list` and every `{Int, Rest}` with a non-empty rest are `error:badarg`,
+/// which is what a non-small element, an improper list, a bad digit or trailing
+/// garbage all produce. The one shape that re-reads the **whole** list is `big`:
+/// the internal BIF stops after [`digits_per_small`]`+ 1` digits and the wrapper
+/// then goes through `erlang:list_to_binary/1`, which refuses every element
+/// outside `0..=255`. Pinned live (erts-17.1):
+///
+/// ```text
+/// list_to_integer([49,304])                        ⇒ 10
+/// list_to_integer([304])                           ⇒ 0
+/// list_to_integer([-207])                          ⇒ 1
+/// list_to_integer([304] ++ lists:duplicate(17,$0))    ⇒ 0
+/// list_to_integer([49,304] ++ lists:duplicate(16,$0))  ⇒ ERROR badarg  (18 digits)
+/// list_to_integer([49,304] ++ lists:duplicate(15,$0))  ⇒ 10000000000000000
+/// ```
 fn list_to_integer(ctx: &mut BifContext<'_>, list: Eterm, base: u32) -> Result<Eterm> {
     let elems = proper_list(list).ok_or_else(badarg)?;
-    let mut text = String::with_capacity(elems.len());
-    for elem in elems {
-        if !access::is_small(elem) {
+    let mut bytes = Vec::with_capacity(elems.len());
+    for elem in &elems {
+        // The scan breaks on `is_not_small` and leaves it behind, so a non-small
+        // element is always a non-empty rest ⇒ `error:badarg`.
+        if !access::is_small(*elem) {
             return Err(badarg());
         }
-        // erts narrows each element to a `byte`; Milestone-1 requires a byte
-        // outright (see the module docs).
-        let byte = u8::try_from(signed_value(elem)).map_err(|_| badarg())?;
-        text.push(char::from(byte));
+        bytes.push(element_byte(*elem));
     }
+    let text: String = bytes.iter().map(|&byte| char::from(byte)).collect();
     let (negative, magnitude) = parse_integer(&text, base)?;
+    // The `big` arm: a digit run longer than a small integer holds makes the
+    // wrapper re-read the whole list as a byte string, so an element the
+    // truncating scan would have accepted (a `304` standing for `$0`) is fatal.
+    if significant_digits(&bytes) > digits_per_small(base)
+        && elems
+            .iter()
+            .any(|elem| !(0..=255).contains(&signed_value(*elem)))
+    {
+        return Err(badarg());
+    }
     arith::int_from_mag(ctx, negative, &magnitude)
 }
 
@@ -221,17 +284,36 @@ fn float_to_list_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // list_to_float/1
 // ---------------------------------------------------------------------------
 
-/// `list_to_float(String)`.
+/// `list_to_float(String)` — `intlist_to_buf` (`utils.c:2827-2849`) copies the
+/// list into a NUL-terminated `char` buffer handed to `sys_chars_to_double`.
+///
+/// Two C details decide the accept/reject set, and they differ from
+/// [`list_to_integer`]'s scan on purpose:
+///
+/// * Every element must **be** a byte, i.e. `is_byte` (`utils.c:2840`): the
+///   `byte c = unsigned_val(CAR(list))` store is guarded by `!is_byte` first, so
+///   an element outside `0..=255` (or a negative one) is `error:badarg`. Unlike
+///   `list_to_integer`, this reader must **not** truncate through
+///   [`element_byte`]: `list_to_float([49,46,304])` is `badarg`, never `1.0`.
+/// * The buffer is a C string, so an embedded NUL element terminates the text —
+///   while the elements *after* it are still byte-checked (`intlist_to_buf` walks
+///   the whole list before `sys_chars_to_double` ever sees it).
 fn list_to_float_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let elems = proper_list(args[0]).ok_or_else(badarg)?;
-    let mut text = String::with_capacity(elems.len());
-    for elem in elems {
-        if !access::is_small(elem) {
+    let mut bytes = Vec::with_capacity(elems.len());
+    for elem in &elems {
+        if !is_byte(*elem) {
             return Err(badarg());
         }
-        let byte = u8::try_from(signed_value(elem)).map_err(|_| badarg())?;
-        text.push(char::from(byte));
+        // `is_byte` proves the value is in `0..=255`, so the cast is exact.
+        bytes.push(signed_value(*elem) as u8);
     }
+    // The embedded-NUL truncation: `list_to_float([49,46,53,0,50])` ⇒ `1.5`.
+    let text: String = bytes
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| char::from(byte))
+        .collect();
     let value = parse_float(&text)?;
     ctx.make_float(value)
 }
@@ -475,21 +557,18 @@ fn append_element_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // raise/3, node/0 and node/1
 // ---------------------------------------------------------------------------
 
-/// The exception class of `raise/3`'s first argument, which must be the atom
-/// `error`, `exit` or `throw`.
-///
-/// # Errors
-///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for anything else.
-fn exception_class(atoms: &AtomTable, class: Eterm) -> Result<ExceptionClass> {
+/// The exception class of `raise/3`'s first argument, which the C matches by
+/// identity against `am_error`/`am_exit`/`am_throw` (`bif.c:1563-1572`); `None`
+/// for every other term.
+fn exception_class(atoms: &AtomTable, class: Eterm) -> Option<ExceptionClass> {
     if !access::is_atom(class) {
-        return Err(badarg());
+        return None;
     }
     match atoms.name(atom_val(class)) {
-        Some("error") => Ok(ExceptionClass::Error),
-        Some("exit") => Ok(ExceptionClass::Exit),
-        Some("throw") => Ok(ExceptionClass::Throw),
-        _ => Err(badarg()),
+        Some("error") => Some(ExceptionClass::Error),
+        Some("exit") => Some(ExceptionClass::Exit),
+        Some("throw") => Some(ExceptionClass::Throw),
+        _ => None,
     }
 }
 
@@ -531,19 +610,43 @@ fn is_stacktrace(stacktrace: Eterm) -> bool {
     }
 }
 
-/// `raise(Class, Reason, Stacktrace)`.
+/// `raise(Class, Reason, Stacktrace)` (`raise_3`, `bif.c:1549-1696`).
 ///
-/// The class must be `error`/`exit`/`throw` and the stacktrace must be a proper
-/// list of valid frames (`raise(error, foo, [notatuple])` is `badarg` in the
-/// oracle too). The reason is mapped through [`exit_reason_from_term`], which
-/// carries atom reasons; a non-atom reason is `badarg` (see the module docs).
+/// The reason can be **any term**: an atom reason keeps its exact
+/// [`ExitReason`] (with no live slot), and a non-atom one is raised as
+/// [`ExitReason::Structured`] carrying the argument term itself in the
+/// [`Raise::live_reason`](beam_common::Raise::live_reason) slot (see
+/// [`crate::reason`]). Pinned live (erts-17.1):
+/// `raise(error, {a,b}, [])` ⇒ `error:{a,b}`, `raise(exit, {shutdown,x}, [])` ⇒
+/// `exit:{shutdown,x}`, `raise(throw, {a}, [])` ⇒ `throw:{a}`, and
+/// `raise(error, foo, [])` ⇒ `error:foo`.
+///
+/// Unlike every other BIF here, an invalid argument shape is **returned**, not
+/// raised: `bif.c` ends each failure path in `return am_badarg` and `erlang.erl`
+/// documents it ("it has no return value unless the arguments are invalid, in
+/// which case the function returns the error reason `badarg`"). Pinned live:
+///
+/// ```text
+/// try erlang:raise(foo, foo, [])     catch C:R -> {C,R} end  ⇒ badarg  (*returned*)
+/// try erlang:raise(1, foo, [])       catch C:R -> {C,R} end  ⇒ badarg  (*returned*)
+/// try erlang:raise(error, foo, [42]) catch C:R -> {C,R} end  ⇒ badarg  (*returned*)
+/// try erlang:raise(error, foo, x)    catch C:R -> {C,R} end  ⇒ badarg  (*returned*)
+/// ```
 fn raise_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let class = exception_class(ctx.atoms(), args[0])?;
+    // The class is resolved first (`bif.c:1563-1572`), then the stacktrace shape
+    // (`bif.c:1580-1624`); either failure is the returned `badarg` atom. The class
+    // atom is resolved through `intern_atom`, so the runtime's `AtomInterner`
+    // supplies it for a module whose table does not carry it.
+    let Some(class) = exception_class(ctx.atoms(), args[0]) else {
+        return ctx.intern_atom("badarg");
+    };
     if !is_stacktrace(args[2]) {
-        return Err(badarg());
+        return ctx.intern_atom("badarg");
     }
     if !access::is_atom(args[1]) {
-        return Err(badarg());
+        // `c_p->fvalue = value` (`bif.c:1564-1571`): a non-atom reason is the
+        // argument term itself, whatever the class.
+        return Err(raise_term(class, args[1]));
     }
     let reason = exit_reason_from_term(args[1], ctx.atoms());
     Err(match class {
@@ -703,7 +806,9 @@ mod tests {
     }
 
     /// The names the tests build terms from; `nonode@nohost`, `error`, `exit`
-    /// and `throw` are the ones the BIFs look up themselves, and
+    /// and `throw` are the ones the BIFs look up themselves, `badarg` is the atom
+    /// `raise/3` returns for a bad argument shape, `normal` a well-known
+    /// [`beam_common::ExitReason`], and
     /// `decimals`/`scientific`/`compact`/`short` are the `float_to_list`
     /// option tags.
     fn atoms() -> AtomTable {
@@ -721,6 +826,8 @@ mod tests {
             "error",
             "exit",
             "throw",
+            "badarg",
+            "normal",
             "decimals",
             "scientific",
             "compact",
@@ -860,10 +967,82 @@ mod tests {
             let big = ctx
                 .list(&[ctx.int(49).expect("fits"), ctx.int(304).expect("fits")])
                 .expect("fits");
+            // `304` is read as its byte `$0`: "10" ⇒ 10 (the oracle truncates, it
+            // does not require `0..=255`).
+            assert_eq!(
+                int_of(list_to_integer_1(ctx, &[big]).expect("parses")),
+                10
+            );
+            // Every element is narrowed to its low byte, a negative one included.
+            for (elements, expected) in [
+                (vec![304i64], 0i64),
+                (vec![305], 1),
+                (vec![-207], 1),
+                (vec![48, 49, 304], 10),
+                (vec![304, 49], 1),
+                (vec![304, 48, 48], 0),
+                (vec![256 + 49, 256 + 50], 12),
+                (vec![48], 0),
+                (vec![48, 48], 0),
+            ] {
+                let mut terms = Vec::new();
+                for value in &elements {
+                    terms.push(ctx.int(*value).expect("fits"));
+                }
+                let list = ctx.list(&terms).expect("fits");
+                assert_eq!(
+                    int_of(list_to_integer_1(ctx, &[list]).expect("parses")),
+                    expected,
+                    "list_to_integer({elements:?})"
+                );
+            }
+            // A byte whose low eight bits are not a digit for the base is
+            // `badarg` (`[-1]` reads `255`), as is a doubled sign.
+            for elements in [vec![-1i64], vec![-48], vec![43, 45, 49]] {
+                let mut terms = Vec::new();
+                for value in &elements {
+                    terms.push(ctx.int(*value).expect("fits"));
+                }
+                let list = ctx.list(&terms).expect("fits");
+                assert!(
+                    matches!(list_to_integer_1(ctx, &[list]), Err(BeamError::BadArg)),
+                    "list_to_integer({elements:?})"
+                );
+            }
+            let maybe_float = ctx.make_float(1.0).expect("fits");
+            let with_float = ctx
+                .list(&[ctx.int(49).expect("fits"), maybe_float])
+                .expect("fits");
             assert!(matches!(
-                list_to_integer_1(ctx, &[big]),
+                list_to_integer_1(ctx, &[with_float]),
                 Err(BeamError::BadArg)
             ));
+            let bignum =
+                beam_codec::term::make_big(ctx.heap(), false, &[1, 0]).expect("a bignum");
+            let with_bignum = ctx.list(&[ctx.int(49).expect("fits"), bignum]).expect("fits");
+            assert!(matches!(
+                list_to_integer_1(ctx, &[with_bignum]),
+                Err(BeamError::BadArg)
+            ));
+            // The `big` arm of the `erlang.erl` wrapper re-reads the whole list
+            // through `list_to_binary/1` (0..=255 only) once the digit run passes
+            // `digits_per_small(10) = 17`.
+            let eighteen = 18;
+            let with_tail: Vec<Eterm> = (0..eighteen)
+                .map(|i| ctx.int(if i == 0 { 49 } else { 48 }).expect("fits"))
+                .collect();
+            let all_digits = ctx.list(&with_tail).expect("fits");
+            assert_eq!(
+                int_of(list_to_integer_1(ctx, &[all_digits]).expect("parses")),
+                100_000_000_000_000_000
+            );
+            let mut wide = with_tail.clone();
+            wide[1] = ctx.int(304).expect("fits");
+            let wide = ctx.list(&wide).expect("fits");
+            assert!(
+                matches!(list_to_integer_1(ctx, &[wide]), Err(BeamError::BadArg)),
+                "18 digits with a 304 element"
+            );
             // A value past the small range is the exact bignum the oracle builds.
             let huge = bytes(ctx, "99999999999999999999999999");
             let term = list_to_integer_1(ctx, &[huge]).expect("promotes");
@@ -875,6 +1054,34 @@ mod tests {
                 "99999999999999999999999999"
             );
         });
+    }
+
+    /// `digits_per_small/1` is the 64-bit `digits_per_small_lookup` row of
+    /// `big.c:4120-4123` (bases 2..=36) — the derivation is pinned against the C's
+    /// published table.
+    #[test]
+    fn digits_per_small_matches_the_c_lookup_table() {
+        const C_TABLE: [usize; 35] = [
+            59, 37, 29, 25, 22, 21, 19, 18, 17, 17, 16, 15, 15, 15, 14, 14, 14, 13, 13, 13, 13, 13,
+            12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11,
+        ];
+        for base in 2..=36u32 {
+            assert_eq!(
+                digits_per_small(base),
+                C_TABLE[base as usize - 2],
+                "digits_per_small({base})"
+            );
+            // The definition itself: `base^n` fits a small, `base^(n+1)` does not.
+            let n = digits_per_small(base) as u32;
+            assert!(u128::from(base).pow(n) <= 1 << 59);
+            assert!(u128::from(base).pow(n + 1) > 1 << 59);
+        }
+        // `0x0007` counts one significant digit; the sign and the zeros do not.
+        assert_eq!(significant_digits(b"007"), 1);
+        assert_eq!(significant_digits(b"-007"), 1);
+        assert_eq!(significant_digits(b"+0"), 0);
+        assert_eq!(significant_digits(b"0"), 0);
+        assert_eq!(significant_digits(b"1000"), 4);
     }
 
     // -- float_to_list / list_to_float ------------------------------------
@@ -1489,32 +1696,120 @@ mod tests {
                 Err(BeamError::Raise(_))
             ));
 
-            // A non-atom class, a non-atom reason and malformed stacktraces.
+            // A bad class or a malformed stacktrace is the *returned* atom
+            // `badarg` (`bif.c:1694-1695`), never a raise.
+            let badarg = ctx.atom("badarg").expect("seeded");
             let one = ctx.int(1).expect("fits");
-            assert!(matches!(
-                raise_3(ctx, &[one, reason, empty]),
-                Err(BeamError::BadArg)
-            ));
             let bad_class = ctx.atom("a").expect("seeded");
-            assert!(matches!(
-                raise_3(ctx, &[bad_class, reason, empty]),
-                Err(BeamError::BadArg)
-            ));
-            // Milestone-1 carries atom reasons only (see the module docs).
-            let structured = ctx.tuple(&[reason]).expect("fits");
-            assert!(matches!(
-                raise_3(ctx, &[error, structured, empty]),
-                Err(BeamError::BadArg)
-            ));
+            for args in [
+                [one, reason, empty],
+                [bad_class, reason, empty],
+                [bad_class, one, empty],
+            ] {
+                assert_eq!(
+                    raise_3(ctx, &args).expect("the badarg atom is returned"),
+                    badarg,
+                    "raise/3 {args:?}"
+                );
+            }
             // The stacktrace must be a proper list of valid frames.
             let two_tuple = ctx.tuple(&[one, one]).expect("fits");
             let nested = ctx.list(&[two_tuple]).expect("fits");
             let improper_trace = ctx.cons(frame, reason).expect("fits");
             for bad in [one, ctx.list(&[one]).expect("fits"), nested, improper_trace] {
-                assert!(
-                    matches!(raise_3(ctx, &[error, reason, bad]), Err(BeamError::BadArg)),
+                assert_eq!(
+                    raise_3(ctx, &[error, reason, bad]).expect("the badarg atom is returned"),
+                    badarg,
                     "stacktrace {bad:?}"
                 );
+            }
+            // ... and the returned atom must not be fabricated: without the name
+            // (or an interner) the failure is the typed `TermNotFound`.
+            let mut heap = Heap::new(64).expect("test heap");
+            let mut bare = AtomTable::new();
+            bare.seed(["error", "foo"]);
+            let mut ctx = BifContext::new(&mut heap, &bare, ProcessId::new(1, 0));
+            let error = ctx.atom("error").expect("seeded");
+            let foo = ctx.atom("foo").expect("seeded");
+            let empty = ctx.list(&[]).expect("fits");
+            let nope = ctx.atom("nope");
+            assert!(matches!(nope, Err(BeamError::TermNotFound)));
+            let bad_class = ctx.int(1).expect("fits");
+            assert!(matches!(
+                raise_3(&mut ctx, &[bad_class, foo, empty]),
+                Err(BeamError::TermNotFound)
+            ));
+            assert!(matches!(
+                raise_3(&mut ctx, &[error, foo, bad_class]),
+                Err(BeamError::TermNotFound)
+            ));
+        });
+    }
+
+    /// A non-atom reason is the reason **term** itself, in every class — the
+    /// live-reason slot of [`beam_common::Raise`] (`bif.c:1564-1571` stores
+    /// `fvalue = value`, whatever it is).
+    #[test]
+    fn raise_carries_a_non_atom_reason_term() {
+        with_ctx(|ctx| {
+            let empty = ctx.list(&[]).expect("fits");
+            let error = ctx.atom("error").expect("seeded");
+            let exit = ctx.atom("exit").expect("seeded");
+            let throw = ctx.atom("throw").expect("seeded");
+            let a = ctx.atom("a").expect("seeded");
+            let reason = ctx.tuple(&[a]).expect("fits");
+            for (class, expected) in [
+                (error, ExceptionClass::Error),
+                (exit, ExceptionClass::Exit),
+                (throw, ExceptionClass::Throw),
+            ] {
+                match raise_3(ctx, &[class, reason, empty]) {
+                    Err(BeamError::Raise(raise)) => {
+                        assert_eq!(raise.class, expected);
+                        assert_eq!(raise.reason, beam_common::ExitReason::Structured);
+                        assert_eq!(raise.reason.as_atom(), None);
+                        let live = *raise
+                            .live_reason()
+                            .expect("the reason term is attached")
+                            .downcast_ref::<Eterm>()
+                            .expect("the payload is the live reason term");
+                        assert_eq!(live, reason);
+                    }
+                    other => panic!("expected a raise, got {other:?}"),
+                }
+            }
+            // An integer reason survives too; the atom path keeps `Atom(..)` and
+            // carries no live slot.
+            let seven = ctx.int(7).expect("fits");
+            match raise_3(ctx, &[exit, seven, empty]) {
+                Err(BeamError::Raise(raise)) => {
+                    assert_eq!(raise.class, ExceptionClass::Exit);
+                    assert_eq!(raise.reason, beam_common::ExitReason::Structured);
+                    assert_eq!(
+                        raise
+                            .live_reason()
+                            .and_then(|live| live.downcast_ref::<Eterm>().copied()),
+                        Some(seven)
+                    );
+                }
+                other => panic!("expected a raise, got {other:?}"),
+            }
+            let foo = ctx.atom("foo").expect("seeded");
+            match raise_3(ctx, &[error, foo, empty]) {
+                Err(BeamError::Raise(raise)) => {
+                    assert_eq!(raise.reason, beam_common::ExitReason::atom("foo"));
+                    assert!(raise.live_reason().is_none(), "an atom reason has no term");
+                }
+                other => panic!("expected a raise, got {other:?}"),
+            }
+            // The well-known atoms keep their dedicated variants.
+            let normal = ctx.intern_atom("normal").expect("interned");
+            match raise_3(ctx, &[exit, normal, empty]) {
+                Err(BeamError::Raise(raise)) => {
+                    assert_eq!(raise.reason, beam_common::ExitReason::Normal);
+                    assert!(raise.live_reason().is_none());
+                }
+                other => panic!("expected a raise, got {other:?}"),
             }
         });
     }

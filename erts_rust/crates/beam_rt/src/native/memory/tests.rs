@@ -492,7 +492,6 @@ fn every_unsupported_item_raises_the_typed_capability_gap() {
         "async_dist",
         "priority_messages",
         "garbage_collection_info",
-        "binary",
     ] {
         let error = info(&mut runtime, pid, name).expect_err("must be a capability gap");
         assert!(
@@ -881,6 +880,113 @@ fn catchlevel_is_the_gap_for_a_fun_bodied_process() {
     assert!(reason.contains("catchlevel"), "{reason}");
 }
 
+// -- the `binary` item ----------------------------------------------------
+
+/// A process holding no off-heap refc binary reports the empty list `[]` — the oracle's own
+/// answer, and the honest value for this runtime's root process (nothing registers an off-heap
+/// payload for it).
+#[test]
+fn the_binary_item_is_the_empty_list_for_a_process_with_no_off_heap_binaries() {
+    let mut runtime = runtime();
+    let pid = root_pid(&mut runtime);
+    let (key, value) = pair(info(&mut runtime, pid, "binary").expect("process_info/2 binary"));
+    assert_eq!(runtime.atom_name_of(key), Some("binary"));
+    assert_eq!(value, NIL, "a process with no off-heap binary reports []");
+}
+
+/// The `binary` roster is the process's **owned off-heap refc binaries** as `[{Ptr, Size,
+/// Refc}, …]`, in slot order: one 3-tuple per payload, `Size` the payload's byte length and
+/// `Refc` its total reference count. Every element is a non-negative integer (the payload
+/// pointer materializes as an exact integer, never a truncated one).
+#[test]
+fn the_binary_item_lists_the_registered_off_heap_payloads() {
+    let mut runtime = runtime();
+    let pid_term = root_pid(&mut runtime);
+    let pid = ProcessId::from_eterm(pid_term).expect("a pid");
+    let sizes = [100usize, 300];
+    let expected: Vec<(i64, i64, i64)> = {
+        let process = runtime
+            .processes
+            .get_mut(pid)
+            .expect("the root process is live");
+        for size in sizes {
+            process.register_off_heap_binary(
+                beam_alloc::RefcBinary::new(&vec![0x5Au8; size]).expect("a refc binary"),
+            );
+        }
+        process
+            .off_heap_binaries()
+            .map(|binary| {
+                (
+                    binary.data_ptr() as usize as i64,
+                    binary.len() as i64,
+                    binary.refcount() as i64,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(expected.len(), sizes.len(), "one entry per registered payload");
+
+    let (key, value) = pair(info(&mut runtime, pid_term, "binary").expect("process_info/2 binary"));
+    assert_eq!(runtime.atom_name_of(key), Some("binary"));
+    let entries = terms::list_elements(value).expect("a list");
+    assert_eq!(entries.len(), expected.len(), "one tuple per owned payload");
+    for (entry, (ptr, size, refcount)) in entries.iter().zip(&expected) {
+        assert_eq!(terms::tuple_arity(*entry).expect("a tuple"), 3, "a 3-tuple");
+        let fields: Vec<i64> = (0..3)
+            .map(|index| {
+                signed_value(terms::tuple_element(*entry, index).expect("a tuple field"))
+            })
+            .collect();
+        assert_eq!(fields, vec![*ptr, *size, *refcount]);
+        assert!(fields[0] > 0, "the pointer is a positive integer: {fields:?}");
+        assert!(fields[1] > 0, "the size is the payload's byte length: {fields:?}");
+        assert!(fields[2] >= 1, "the refcount is at least 1: {fields:?}");
+    }
+    // The roster is in slot order, so the byte lengths come back in registration order.
+    let listed: Vec<i64> = entries
+        .iter()
+        .map(|entry| signed_value(terms::tuple_element(*entry, 1).expect("size")))
+        .collect();
+    assert_eq!(listed, vec![100, 300]);
+}
+
+/// The roster follows the slot-stable release semantics: declaring an owned payload dead and
+/// draining that declaration drops exactly that entry, and a second sweep releases nothing
+/// further (a released slot is never reused).
+#[test]
+fn the_binary_item_drops_a_payload_once_its_death_is_swept() {
+    let mut runtime = runtime();
+    let pid_term = root_pid(&mut runtime);
+    let pid = ProcessId::from_eterm(pid_term).expect("a pid");
+    let (count, released) = {
+        let process = runtime
+            .processes
+            .get_mut(pid)
+            .expect("the root process is live");
+        for size in [64usize, 128, 256] {
+            process.register_off_heap_binary(
+                beam_alloc::RefcBinary::new(&vec![0x11u8; size]).expect("a refc binary"),
+            );
+        }
+        let before = process.off_heap_binary_count();
+        assert!(process.declare_off_heap_binary_dead(1), "slot 1 is live");
+        (before, process.sweep_off_heap_binaries())
+    };
+    assert_eq!(count, 3);
+    assert_eq!(released, 1, "exactly the declared-dead payload is released");
+
+    let (_, value) = pair(info(&mut runtime, pid_term, "binary").expect("process_info/2 binary"));
+    let entries = terms::list_elements(value).expect("a list");
+    assert_eq!(entries.len(), count - 1, "the released slot is gone");
+    // The survivors are the two payloads that were never declared dead.
+    let listed: Vec<i64> = entries
+        .iter()
+        .map(|entry| signed_value(terms::tuple_element(*entry, 1).expect("size")))
+        .collect();
+    assert_eq!(listed, vec![64, 256]);
+}
+
 // -- the remaining gaps ---------------------------------------------------
 
 /// Every remaining gap names **what is missing** — the accessor/hook a future implementation
@@ -897,7 +1003,6 @@ fn every_remaining_gap_names_its_missing_accessor() {
         ("async_dist", "async_dist flag"),
         ("priority_messages", "priority_messages flag"),
         ("garbage_collection_info", "per-generation"),
-        ("binary", "off-heap refc binaries"),
     ] {
         let error = info(&mut runtime, pid, name).expect_err("must be a capability gap");
         let reason = crate::error::unsupported_reason(&error)
@@ -994,11 +1099,15 @@ fn the_oracle_reports_zero_catchlevel_outside_a_try_and_a_depth_inside_one() {
     );
 }
 
-/// The **oracle values** of the eight items this runtime still cannot answer, so the gaps are
+/// The **oracle values** of the remaining items this runtime cannot yet answer, so the gaps are
 /// grounded in the real reference runtime rather than in a guess (OTP 29.1.1 / erts-17.1):
-/// `magic_ref`/`binary` are `[]`, `label` is `undefined`, `async_dist`/`priority_messages` are
-/// `false`, `parent`/`backtrace` exist (a pid / a binary), and `garbage_collection_info` is
-/// the 11-key per-generation proplist whose block detail this collector does not measure.
+/// `magic_ref` is `[]`, `label` is `undefined`, `async_dist`/`priority_messages` are `false`,
+/// `parent`/`backtrace` exist (a pid / a binary), and `garbage_collection_info` is the 11-key
+/// per-generation proplist whose block detail this collector does not measure.
+///
+/// The probe also pins the `binary` item's *idle* value: a process holding no off-heap refc
+/// binary answers the empty list `[]` — the shape this runtime now emits (see
+/// [`the_oracle_lists_a_processes_off_heap_binaries`] for the non-empty case).
 #[test]
 fn the_oracle_backs_the_remaining_gaps_values() {
     let Some(line) = oracle_eval(
@@ -1025,25 +1134,44 @@ fn the_oracle_backs_the_remaining_gaps_values() {
     );
 }
 
-/// `{binary, []}` would be a **lie** for a reachable state: the oracle lists a process's
-/// off-heap refc binaries as `[{Ptr, Size, Refc}, …]`, so a process holding a large binary
-/// reports a non-empty roster (measured `true` on OTP 29.1.1 / erts-17.1).
+/// The oracle's `binary` value is a **non-empty** list of `{Ptr, Size, Refc}` 3-tuples for a
+/// process that really holds an off-heap refc binary — a `{binary, []}` would be a lie for that
+/// reachable state. The roster is the process's off-heap binary **table**, pruned lazily at GC
+/// rather than on drop, so it survives the handle going unreferenced (measured `true` on
+/// OTP 29.1.1 / erts-17.1).
 ///
-/// This is why the item stays a gap here: the engine does hold such binaries
-/// (`Machine::refc_binaries`), but no process registers them in its off-heap table, so this
-/// floor could not enumerate them.
+/// The comparison is **structural** — a non-empty list whose every element is a 3-tuple of
+/// non-negative integers — never by `Ptr`/`Refc` value (this runtime's addresses and refcounts
+/// are its own) nor by exact count (`binary:copy/2` may leave extra off-heap intermediates).
 #[test]
 fn the_oracle_lists_a_processes_off_heap_binaries() {
     let Some(line) = oracle_eval(
-        "P = spawn(fun() -> B = binary:copy(<<1,2,3>>,100), W = <<B/binary,7>>, \
-         receive stop -> {B,W} end end), timer:sleep(100), \
-         io:format(\"~p~n\", [element(2, process_info(P, binary)) =/= []]), halt().",
+        "P = spawn(fun() -> _ = binary:copy(<<1,2,3>>,100), receive stop -> ok end end), \
+         timer:sleep(100), L = element(2, process_info(P, binary)), \
+         io:format(\"~p~n\", [L =/= [] andalso lists:all(fun(E) -> is_tuple(E) andalso \
+         tuple_size(E) =:= 3 andalso lists:all(fun(X) -> is_integer(X) andalso X >= 0 end, \
+         tuple_to_list(E)) end, L)]), halt().",
     ) else {
         eprintln!("SKIPPING the `binary` oracle test: the system `erl` is unavailable");
         return;
     };
     assert_eq!(
         line, "true",
-        "a process holding a large binary lists it in `binary`: {line}"
+        "a process holding a large binary lists a non-empty 3-tuple roster: {line}"
     );
+}
+
+/// The oracle's `binary` value is the **empty list** for a process that holds no off-heap refc
+/// binary — the shape this runtime emits for such a process (measured `[]` on OTP 29.1.1 /
+/// erts-17.1).
+#[test]
+fn the_oracle_reports_the_empty_list_for_a_process_with_no_off_heap_binary() {
+    let Some(line) = oracle_eval(
+        "P = spawn(fun() -> receive stop -> ok end end), timer:sleep(50), \
+         io:format(\"~p~n\", [element(2, process_info(P, binary))]), halt().",
+    ) else {
+        eprintln!("SKIPPING the `binary` oracle test: the system `erl` is unavailable");
+        return;
+    };
+    assert_eq!(line, "[]", "an idle process holds no off-heap binary: {line}");
 }

@@ -188,6 +188,36 @@ pub(crate) fn group() -> Vec<Case> {
              ets:delete(T1), ets:delete(T2), ets:delete(T3), Res end",
             "ok {private,protected,public}",
         ),
+        case(
+            "ets_access/default_protection_is_protected",
+            "a table created without an explicit mode defaults to protected",
+            "begin T = ets:new(ets_acc_def, []), Res = ets:info(T, protection), \
+             ets:delete(T), Res end",
+            "ok protected",
+        ),
+        // --- a non-owner writer's own write, read back by the writer --------------------
+        case(
+            "ets_access/non_owner_writes_then_reads_public_table",
+            "a non-owner's ets:insert/2 of a public table is visible to that same non-owner",
+            "begin T = ets:new(ets_acc_nw2, [public]), \
+             H = spawn(fun() -> receive {go, From} -> \
+                 ets:insert(T, {k, 2}), From ! {res, ets:lookup(T, k)} end end), \
+             H ! {go, self()}, \
+             X = receive {res, Z} -> Z after 2000 -> timeout end, \
+             ets:delete(T), X end",
+            "ok [{k,2}]",
+        ),
+        case(
+            "ets_access/non_owner_member_of_public_table",
+            "a non-owner's ets:member/2 of a public table sees the owner's key",
+            "begin T = ets:new(ets_acc_mem, [public]), ets:insert(T, {k, 1}), \
+             H = spawn(fun() -> receive {go, From} -> \
+                 From ! {res, ets:member(T, k)} end end), \
+             H ! {go, self()}, \
+             X = receive {res, Z} -> Z after 2000 -> timeout end, \
+             ets:delete(T), X end",
+            "ok true",
+        ),
     ]
 }
 
@@ -204,6 +234,7 @@ mod tests {
         "ets_access/owner_writes_protected_table",
         "ets_access/owner_writes_public_table",
         "ets_access/protection_reflects_the_creation_option",
+        "ets_access/default_protection_is_protected",
     ];
 
     /// The cells probed from a spawned non-owner process.
@@ -211,6 +242,8 @@ mod tests {
         "ets_access/non_owner_reads_public_table",
         "ets_access/non_owner_reads_protected_table",
         "ets_access/non_owner_writes_public_table",
+        "ets_access/non_owner_writes_then_reads_public_table",
+        "ets_access/non_owner_member_of_public_table",
         "ets_access/non_owner_info_size_is_integer",
         "ets_access/non_owner_info_is_a_proplist",
     ];

@@ -770,6 +770,241 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the wider `-`-switch / `+`-flag surface ---------------------------------------
+        // Beyond the `-pa`/`-pz` multiplicity cases above, the A.6 *recording* surface has
+        // several more occurrence and application-env shapes: the `-eval` Start instruction
+        // (consumed before `init`, so `init:get_argument(eval)` is the bare atom `error`), a
+        // lone `-pz`, the `-mode` switch, an `-app key value` application-env flag
+        // (`-kernel K V`), a recognized switch given twice, the `-M…` allocator form, the
+        // `+S`/`+A` emulator flags observed through `system_info/1` (and their absence from
+        // `init`). Every golden is the live oracle's output (OTP 29.1.1 / erts-17.1), verified
+        // with `differential run <id>`.
+        Case {
+            id: "flags/eval_instruction_is_not_an_init_argument",
+            description: "the -eval Start instruction is consumed before init and is not recorded",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // The harness itself always passes `-eval <probe>`, so this case needs no extra
+                // argv: the already-present Start instruction is the observation.
+                expr: "init:get_argument(eval)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/pz_alone_is_recorded",
+            description: "a lone -pz code-path switch is recorded verbatim like -pa",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pz)",
+                extra_argv: &["-pz", "/z"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[47,122]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/mode_flag_is_recorded",
+            description: "the -mode start-up switch is recorded verbatim for init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(mode)",
+                extra_argv: &["-mode", "embedded"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[101,109,98,101,100,100,101,100]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/kernel_application_env_flag_is_recorded",
+            description: "an `-kernel key value` application-env flag is recorded with both values",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(kernel)",
+                extra_argv: &["-kernel", "my_key", "my_val"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[109,121,95,107,101,121],[109,121,95,118,97,108]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/setcookie_twice_is_two_occurrences",
+            description: "a recognized -setcookie switch given twice is two separate occurrences",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(setcookie)",
+                extra_argv: &["-setcookie", "aaa", "-setcookie", "bbb"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,97,97]],[[98,98,98]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/allocator_flag_is_recorded_as_init_argument",
+            description: "an -M<NAME> allocator switch is recorded under its own NAME",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('Mfoo')",
+                extra_argv: &["-Mfoo", "1"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[49]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_a_is_not_an_init_argument",
+            description: "a +A emulator flag is consumed by the emulator and not recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('A')",
+                extra_argv: &["+A", "5"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_s_is_not_an_init_argument",
+            description: "a +S emulator flag is consumed by the emulator and not recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('S')",
+                extra_argv: &["+S", "3"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_s_sets_scheduler_count",
+            description: "the +S emulator flag changes the observable normal-scheduler count",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(schedulers)",
+                extra_argv: &["+S", "3"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 3"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_a_sets_thread_pool_size",
+            description: "the +A emulator flag changes the observable async-thread pool size",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(thread_pool_size)",
+                extra_argv: &["+A", "5"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 5"),
+                exit_code: 0,
+            },
+        },
+        // --- the wider `ERL_*FLAGS` merge surface ------------------------------------------
+        // The merge is `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS]
+        // [ERL_ZFLAGS]`; the cases below widen the already-pinned shape set to a valueless
+        // token, several values for one occurrence, a single-quoted token, `ERL_ZFLAGS` as
+        // the only source, and the two ends of the chain naming the same switch (which is
+        // what makes the "later source wins" order observable as *two* occurrences).
+        Case {
+            id: "flags/env_erl_aflags_bare_flag_is_valueless",
+            description: "an ERL_AFLAGS token with no following value is one valueless occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_bare_env)",
+                extra_argv: &[],
+                env: &[("ERL_AFLAGS", "-differential_bare_env")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_flags_multiple_values_one_occurrence",
+            description: "one ERL_FLAGS occurrence collects every following value token",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_multi_env)",
+                extra_argv: &[],
+                env: &[("ERL_FLAGS", "-differential_multi_env one two")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[111,110,101],[116,119,111]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_zflags_alone_is_merged",
+            description: "ERL_ZFLAGS is the last merge source and is applied on its own",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_zflag)",
+                extra_argv: &[],
+                env: &[("ERL_ZFLAGS", "-differential_zflag zval")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[122,118,97,108]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_flags_tokenizes_a_single_quoted_value",
+            description: "a single-quoted ERL_FLAGS token is one value with the quotes stripped",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_multi_env)",
+                extra_argv: &[],
+                env: &[("ERL_FLAGS", "-differential_multi_env 'a b'")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,32,98]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_flags_precedes_erl_aflags_for_the_same_switch",
+            description: "at one switch the merge renders the ERL_AFLAGS then the ERL_FLAGS occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_ovr)",
+                extra_argv: &[],
+                env: &[
+                    ("ERL_AFLAGS", "-differential_ovr aflag"),
+                    ("ERL_FLAGS", "-differential_ovr fflag"),
+                ],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,102,108,97,103]],[[102,102,108,97,103]]]}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1024,5 +1259,152 @@ mod tests {
                 .stdout,
             Some("ok {ok,[[],[]]}")
         );
+    }
+
+    /// The widened switch surface (the wider `-`-switch / `+`-flag and `ERL_*FLAGS` blocks):
+    /// each new case pins the live oracle's answer for its own argv/environment, so the
+    /// occurred/valueless/multi-value forms and the emulator-flag observables stay pinned
+    /// individually rather than through the umbrella shape assertion above.
+    #[test]
+    fn the_widened_switch_surface_pins_the_oracle_recording() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+
+        // The recording family: `init:get_argument/1` occurrences. The `-eval` Start
+        // instruction and the `+A`/`+S` emulator flags are *not* recorded (the bare atom
+        // `error`), while every `-`-switch is -- including an application-env flag.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/eval_instruction_is_not_an_init_argument",
+                &[][..],
+                "init:get_argument(eval)",
+                "ok error",
+            ),
+            (
+                "flags/pz_alone_is_recorded",
+                &["-pz", "/z"][..],
+                "init:get_argument(pz)",
+                "ok {ok,[[[47,122]]]}",
+            ),
+            (
+                "flags/mode_flag_is_recorded",
+                &["-mode", "embedded"][..],
+                "init:get_argument(mode)",
+                "ok {ok,[[[101,109,98,101,100,100,101,100]]]}",
+            ),
+            (
+                "flags/kernel_application_env_flag_is_recorded",
+                &["-kernel", "my_key", "my_val"][..],
+                "init:get_argument(kernel)",
+                "ok {ok,[[[109,121,95,107,101,121],[109,121,95,118,97,108]]]}",
+            ),
+            (
+                "flags/setcookie_twice_is_two_occurrences",
+                &["-setcookie", "aaa", "-setcookie", "bbb"][..],
+                "init:get_argument(setcookie)",
+                "ok {ok,[[[97,97,97]],[[98,98,98]]]}",
+            ),
+            (
+                "flags/allocator_flag_is_recorded_as_init_argument",
+                &["-Mfoo", "1"][..],
+                "init:get_argument('Mfoo')",
+                "ok {ok,[[[49]]]}",
+            ),
+            (
+                "flags/plus_a_is_not_an_init_argument",
+                &["+A", "5"][..],
+                "init:get_argument('A')",
+                "ok error",
+            ),
+            (
+                "flags/plus_s_is_not_an_init_argument",
+                &["+S", "3"][..],
+                "init:get_argument('S')",
+                "ok error",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the recorded argv");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(
+                case.env().is_empty(),
+                "case {id}: a command-line switch is not an env case"
+            );
+        }
+
+        // The `+S`/`+A` emulator flags are observable through the *other* half of A.6.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/plus_s_sets_scheduler_count",
+                &["+S", "3"][..],
+                "erlang:system_info(schedulers)",
+                "ok 3",
+            ),
+            (
+                "flags/plus_a_sets_thread_pool_size",
+                &["+A", "5"][..],
+                "erlang:system_info(thread_pool_size)",
+                "ok 5",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli, Contract::Introspection], "{id}");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the emulator flag");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(case.env().is_empty(), "case {id}: a +-flag is not an env case");
+        }
+
+        // The widened `ERL_*FLAGS` merge: a valueless token, several values in one
+        // occurrence, a single-quoted token, `ERL_ZFLAGS` on its own, and the two ends of
+        // the chain naming the same switch (two occurrences, A before F).
+        for (id, expr, env, golden) in [
+            (
+                "flags/env_erl_aflags_bare_flag_is_valueless",
+                "init:get_argument(differential_bare_env)",
+                &[("ERL_AFLAGS", "-differential_bare_env")][..],
+                "ok {ok,[[]]}",
+            ),
+            (
+                "flags/env_erl_flags_multiple_values_one_occurrence",
+                "init:get_argument(differential_multi_env)",
+                &[("ERL_FLAGS", "-differential_multi_env one two")][..],
+                "ok {ok,[[[111,110,101],[116,119,111]]]}",
+            ),
+            (
+                "flags/env_erl_zflags_alone_is_merged",
+                "init:get_argument(differential_zflag)",
+                &[("ERL_ZFLAGS", "-differential_zflag zval")][..],
+                "ok {ok,[[[122,118,97,108]]]}",
+            ),
+            (
+                "flags/env_erl_flags_tokenizes_a_single_quoted_value",
+                "init:get_argument(differential_multi_env)",
+                &[("ERL_FLAGS", "-differential_multi_env 'a b'")][..],
+                "ok {ok,[[[97,32,98]]]}",
+            ),
+            (
+                "flags/env_erl_flags_precedes_erl_aflags_for_the_same_switch",
+                "init:get_argument(differential_ovr)",
+                &[
+                    ("ERL_AFLAGS", "-differential_ovr aflag"),
+                    ("ERL_FLAGS", "-differential_ovr fflag"),
+                ][..],
+                "ok {ok,[[[97,102,108,97,103]],[[102,102,108,97,103]]]}",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.env(), env, "case {id}: the merged environment");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(
+                case.extra_argv().is_empty(),
+                "case {id}: the switch reaches the argv through the environment only"
+            );
+            assert!(
+                matches!(case.kind, CaseKind::EvalEnv { .. }),
+                "case {id}: an environment case is an EvalEnv"
+            );
+        }
     }
 }

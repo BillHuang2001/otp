@@ -50,6 +50,13 @@ figures are in `PERF.md`).
   off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
   (the exit path) — whether the process **built** it or **received** it.
+  The same `engine.machine.refc_binaries()` reservoir is also copied onto the **running process's**
+  own off-heap table once per slice, on every slice outcome (`Process::register_off_heap_binary`, no
+  matter whether the slice pre-empted, parked, returned or raised), so a process that has built a
+  payload above the on-heap limit comes to *own* it for `erlang:process_info(Pid, binary)`; the
+  registration is dedup-by-`data_ptr`/idempotent, so re-listing the never-cleared reservoir each slice
+  is cheap and its over-report (a payload an earlier reachability sweep pruned) mirrors the oracle,
+  while `Runtime::eval_off_heap` is deliberately left out as the pid-less `-eval` store.
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetContext`
   declares its own `wants_reduce() == true` (the engine lets a host answer `false` only when its
   `reduce` is provably the no-op default) and implements `reduce` to charge the probe once per
@@ -125,26 +132,29 @@ the process's own root set. A collection driven while the process is parked — 
 cascade (`beam_process`) is **not** gated by `Runtime::gc_process_enabled` — relocates the process's heap
 against its own `regs`, so a parked machine that had not published its roots would be collected against a
 partial root set and left with a stale word in its `x`.
-[`run`] therefore calls `publish_parked_roots(table, pid, machine, publish_fr)` at **both** park arms —
+[`run`] therefore calls `publish_parked_roots(table, pid, machine, fr_count)` at **both** park arms —
 the pre-emption/`Yield` arm and the `Ok(EngineRunOutcome::Wait)` arm — right before `engines.insert`, and
-`resume_from_process_roots(ctx, pid, machine, publish_fr)` after `ctx.enter_module(module)` when
+`resume_from_process_roots(ctx, pid, machine, fr_count)` after `ctx.enter_module(module)` when
 `engine.parked.is_some()`.
 Both delegate to the **one** shared implementation in [`context::gc`](../context/CONTEXT.md)
-(`publish_roots_full`/`scatter_roots_full`, the `publish_fr` parameter selecting the FR words), which the
-in-slice heap-admission points (`ensure_heap_full`/`alloc_words_rooted`) also use — those always pass
-`publish_fr = true` — so the park/resume and the admission points can never drift:
+(`publish_roots_full`/`scatter_roots_full`, the `fr_count` parameter bounding how many leading FR words
+are published), which the in-slice heap-admission points (`ensure_heap_full`/`alloc_words_rooted`) also
+use — those always pass `roots.fr.len()`, the **whole** file — so the park/resume and the admission
+points can never drift:
 * `publish_parked_roots` hands the machine's roots over with `RootSet::ALL_LIVE` — the conservative
   (always-safe) choice, since a parked machine's live count is not exposed and over-approximating a
   copying collector's root set can only keep a term alive, never free a live one.
-* **The 1024-slot FR file is published only when it is live.** The runner computes `fr_is_live` **once**
-  from the post-slice scan (any FR slot `!= NIL`) and reuses it for both the `pin_process` and the
-  `publish_parked_roots(.., fr_is_live)` call in the same slice; `fr_is_live == true` also pins the
-  process, so a live FR is always published (a `Yield`-parked process is never exempt, and a
-  delivery-driven collection is not gated by `gc_process_enabled`, so a live FR must still relocate).
-  An all-`NIL` FR roots nothing (NIL immediates keep no term alive), and every collection site only ever
-  moves a process whose FR was measured dead at the end of its last slice, so a float-free park skips the
-  1024 words instead of scattering them onto `process.regs`. The choice is stored on
-  `ProcessEngine::fr_published` at the park and replayed at the resume, so `scatter_roots_full` never
+* **The FR file is published only up to its live leading prefix `fr_mark()`.** The runner reads the
+  count **once** per slice (`Machine::fr_mark()`, the engine's exclusive high-water mark of FR writes
+  since the machine's last reset) and reuses it for both the `pin_process` and the
+  `publish_parked_roots(.., fr_count)` call in the same slice; `fr_mark() > 0` also pins the process, so
+  a live FR is always published (a `Yield`-parked process is never exempt, and a delivery-driven
+  collection is not gated by `gc_process_enabled`, so a live FR must still relocate). `fr_mark` is an
+  exact upper bound after a slice — every FR write goes through `Machine::set_fr`, and the baseline JIT
+  tier refuses an FR destination (deopting to the interpreter) — and a bound can only err by
+  over-pinning: a slot at or above it is `NIL`, and a `NIL` word roots nothing, so a float-free park
+  publishes **no** FR word instead of the 1024 slots `process.regs` used to carry. The count is stored
+  on `ProcessEngine::fr_published` at the park and replayed at the resume, so `scatter_roots_full` never
   sees a length mismatch (which would halt the process's collection).
 * `publish_parked_roots` **also** publishes the parked machine's live pending-exception reason
   (`Machine::pending_exception`) — the one term a parked machine holds that the closed `RootSet`
@@ -153,14 +163,14 @@ in-slice heap-admission points (`ensure_heap_full`/`alloc_words_rooted`) also us
   `beam_process`'s `gather_roots`/`scatter_roots` relocate in place). With **no** live pending
   exception the extra-root set is left **empty** (cleared, never a NIL/placeholder), so a stale root
   can never keep an otherwise-dead term alive.
-* `resume_from_process_roots(ctx, pid, machine, publish_fr)` is the context's
-  `RuntimeContext::resync_parked_roots`, called with the **same** `publish_fr` the matching park used
-  (`engine.fr_published`): it copies the process's authoritative root set back into the machine (the FR
-  words only when `publish_fr`), reads the (already-relocated) extra-root
+* `resume_from_process_roots(ctx, pid, machine, fr_count)` is the context's
+  `RuntimeContext::resync_parked_roots`, called with the **same** `fr_count` the matching park used
+  (`engine.fr_published`): it copies the process's authoritative root set back into the machine (the
+  leading FR words only up to `fr_count`), reads the (already-relocated) extra-root
   reason out and writes it into `Machine::pending_exception_mut()`, **clears** the process's extra
   roots (the machine owns the relocated term now), and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
-* The **`Wait` park arm** additionally marks the process **relocation-exempt** for the whole parked window (`ProcessTable::set_relocation_exempt(pid, true)`), and the resume clears it, so a delivery- or signal-driven collection of a waiting (or just-woken, not-yet-resumed) process is declined and the delivery takes the ordinary heap-fragment fallback; the **`Yield`** (pre-emption) arm is *not* exempt. This is **additional** to the installed host collection gate (`../context/gc_walk.rs`'s `RuntimeCollectionGate`, installed on the runtime's table by `Runtime::new`): the gate declines only when an unscanned container is reachable from the receiver's **gathered** roots, while the exemption refuses *any* relocation for the parked window — covering a live term the host holds outside that gathered set, which the walk cannot see. Both park arms call `Runtime::serve_gc_request` (the `erlang:garbage_collect/0,1` request, see the crate node): the `Yield` arm serves it (its roots are just published and its FR file is provably dead), the `Wait` arm's request is declined by the exemption.
+* The **`Wait` park arm** additionally marks the process **relocation-exempt** for the whole parked window (`ProcessTable::set_relocation_exempt(pid, true)`), and the resume clears it, so a delivery- or signal-driven collection of a waiting (or just-woken, not-yet-resumed) process is declined and the delivery takes the ordinary heap-fragment fallback; the **`Yield`** (pre-emption) arm is *not* exempt. This is **additional** to the installed host collection gate (`../context/gc_walk.rs`'s `RuntimeCollectionGate`, installed on the runtime's table by `Runtime::new`): the gate declines only when an unscanned container is reachable from the receiver's **gathered** roots, while the exemption refuses *any* relocation for the parked window — covering a live term the host holds outside that gathered set, which the walk cannot see. Both park arms call `Runtime::serve_gc_request` (the `erlang:garbage_collect/0,1` request, see the crate node): the `Yield` arm serves it (its roots are just published and its FR prefix is provably empty, `fr_mark() == 0`), the `Wait` arm's request is declined by the exemption.
 The runner's raise arm likewise copies the recorded exit reason through
 `Runtime::try_stabilize_escaped_with` — with the copy's `SourcePayloads` built by
 `Runtime::source_payloads` (the **same machine's** `refc_binaries()` unioned with the whole off-heap
@@ -244,10 +254,11 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
-* `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`) + `RunnerState` (the
-  `jit_mode` field and the `jit_mode()` accessor).
+* `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier` and the park's published
+  FR-prefix count `fr_published`) + `RunnerState` (the `jit_mode` field and the `jit_mode()` accessor).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
-  parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
+  parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`, whose `fr_count`
+  argument is the live prefix `Machine::fr_mark()` — the value that also pins the process), the
   return-value / exit-reason stabilization (whose `SourcePayloads` come from
   `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
   off-heap families).

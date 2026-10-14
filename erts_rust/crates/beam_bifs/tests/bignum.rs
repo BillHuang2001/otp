@@ -71,6 +71,17 @@ impl Fixture {
         beam_codec::term::make_float(&mut self.heap, value).expect("test float")
     }
 
+    /// Builds the list term for `elements` on the fixture's heap.
+    fn list(&mut self, elements: &[Eterm]) -> Eterm {
+        let mut ctx = BifContext::new(&mut self.heap, &self.atoms, ProcessId::new(1, 0));
+        ctx.list(elements).expect("fits")
+    }
+
+    /// Builds the list term for a sequence of small integers.
+    fn int_list(&mut self, values: &[i64]) -> Eterm {
+        let elements: Vec<Eterm> = values.iter().map(|&v| beam_term::make_small(v)).collect();
+        self.list(&elements)
+    }
     /// The boolean value of a `true`/`false` atom term.
     fn boolean(&self, term: Eterm) -> bool {
         match self.atoms.name(atom_val(term)) {
@@ -363,4 +374,239 @@ fn bad_operands_stay_badarg_family_errors() {
     let truth = fx.call("=:=", &[two_to_70, two_to_70]).expect("erlang:'=:='/2");
     assert!(matches!(fx.call("+", &[truth, ok]), Err(BeamError::BadArith)));
     assert!(matches!(fx.call("abs", &[truth]), Err(BeamError::BadArg)));
+}
+
+/// `erlang:list_to_integer/1,2` reads each list element **as the C `byte`**
+/// (`big.c:4298,4331` narrows `unsigned_val(CAR(list))` into a `byte`), so an
+/// element outside `0..=255` (or a negative one) **truncates** to the low eight
+/// bits instead of being `badarg`.
+///
+/// The one exception is the `erlang.erl` wrapper's `big` arm: once the
+/// significant digit run passes `digits_per_small(10) = 17` the wrapper re-reads
+/// the whole list through `erlang:list_to_binary/1`, which accepts bytes only, so
+/// a `304` the truncating scan had accepted there becomes fatal.
+///
+/// Every expectation is pinned against the OTP 29 oracle (`erl -noshell -eval`,
+/// erts-17.1): `try F() of X -> {returned,X} catch C:R -> {raised,C,R} end`.
+#[test]
+fn list_to_integer_reads_each_element_as_a_byte() {
+    let mut fx = Fixture::new();
+
+    // The truncated spellings (`304 band 255 = 48 = $0`, `-207 band 255 = 49 = $1`).
+    // Oracle: list_to_integer([49,304]) => 10, ([304]) => 0, ([305]) => 1,
+    // ([-207]) => 1, ([48,49,304]) => 10, ([304,49]) => 1, ([304,304,304]) => 0,
+    // ([305,306]) => 12, ([45,49]) => -1, ([43,49]) => 1.
+    for (values, expected) in [
+        (vec![49i64, 304], 10i64),
+        (vec![304], 0),
+        (vec![305], 1),
+        (vec![-207], 1),
+        (vec![48, 49, 304], 10),
+        (vec![304, 49], 1),
+        (vec![304, 304, 304], 0),
+        (vec![305, 306], 12),
+        (vec![45, 49], -1),
+        (vec![43, 49], 1),
+    ] {
+        let list = fx.int_list(&values);
+        let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
+        assert_eq!(small(got), expected, "list_to_integer({values:?})");
+    }
+    // `/2` truncates identically: `[304]` read in base 16 spells `"0"` => 0.
+    let list = fx.int_list(&[304]);
+    let got = fx
+        .call("list_to_integer", &[list, beam_term::make_small(16)])
+        .expect("list_to_integer/2");
+    assert_eq!(small(got), 0, "list_to_integer([304], 16)");
+
+    // A truncated byte that is not a digit for the base is `badarg`, as is a bare
+    // sign or the empty list. Oracle: [-1] reads 255, [-48] reads 208, and
+    // "+-1", "-" and "" are all error:badarg.
+    for values in [vec![-1i64], vec![-48], vec![43, 45, 49], vec![45], vec![]] {
+        let list = fx.int_list(&values);
+        assert!(
+            matches!(fx.call("list_to_integer", &[list]), Err(BeamError::BadArg)),
+            "list_to_integer({values:?})"
+        );
+    }
+    // An out-of-range base is `badarg` (1, 37 and a float 10.0).
+    let digits = fx.int_list(&[49, 48]);
+    for base in [
+        beam_term::make_small(1),
+        beam_term::make_small(37),
+        fx.float(10.0),
+    ] {
+        assert!(
+            matches!(fx.call("list_to_integer", &[digits, base]), Err(BeamError::BadArg)),
+            "base {base:?}"
+        );
+    }
+
+    // A non-integer element is `badarg` — the internal scan leaves a non-empty
+    // rest, which the wrapper rejects. Oracle: [49,foo], [49,1.0] and [1 bsl 100]
+    // are all error:badarg. A non-list argument is `badarg` too.
+    let foo = beam_term::make_atom(fx.atoms.intern("foo"));
+    let float = fx.float(1.0);
+    let bignum = fx.bignum(false, &[1, 0]);
+    for element in [foo, float, bignum] {
+        let list = fx.list(&[beam_term::make_small(49), element]);
+        assert!(
+            matches!(fx.call("list_to_integer", &[list]), Err(BeamError::BadArg)),
+            "list_to_integer([49, {element:?}])"
+        );
+    }
+    assert!(matches!(
+        fx.call("list_to_integer", &[beam_term::make_small(49)]),
+        Err(BeamError::BadArg)
+    ));
+
+    // The `big` arm re-reads the whole list as a byte string past
+    // `digits_per_small(10) = 17` significant digits, so a `304` is then fatal —
+    // but 18 all-byte digits still parse. Oracle:
+    //   [49,304] ++ lists:duplicate(15,$0) => 10000000000000000
+    //   [49,304] ++ lists:duplicate(16,$0) => ERROR error:badarg
+    //   [49]     ++ lists:duplicate(17,$0) => 100000000000000000
+    let zeros = |n: usize| std::iter::repeat(48i64).take(n);
+    let seventeen: Vec<i64> = [49i64, 304].into_iter().chain(zeros(15)).collect();
+    let list = fx.int_list(&seventeen);
+    let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
+    assert_eq!(small(got), 10_000_000_000_000_000, "17 digits with a 304");
+
+    let eighteen: Vec<i64> = [49i64, 304].into_iter().chain(zeros(16)).collect();
+    let list = fx.int_list(&eighteen);
+    assert!(
+        matches!(fx.call("list_to_integer", &[list]), Err(BeamError::BadArg)),
+        "18 digits with a 304 element"
+    );
+
+    let all_bytes: Vec<i64> = std::iter::once(49i64).chain(zeros(17)).collect();
+    let list = fx.int_list(&all_bytes);
+    let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
+    assert_eq!(small(got), 100_000_000_000_000_000, "18 byte-only digits");
+
+    // The same rule with a sign and with leading zeros (which the scan skips
+    // before it counts). Oracle:
+    //   [-1,304] ++ lists:duplicate(16,$0) => ERROR error:badarg       (18 digits)
+    //   [-1]     ++ lists:duplicate(17,$0) => -100000000000000000
+    //   [0,1,304] ++ lists:duplicate(15,$0) => 10000000000000000      (17 digits)
+    let signed_big: Vec<i64> = [45i64, 49, 304].into_iter().chain(zeros(16)).collect();
+    let list = fx.int_list(&signed_big);
+    assert!(
+        matches!(fx.call("list_to_integer", &[list]), Err(BeamError::BadArg)),
+        "signed 18 digits with a 304"
+    );
+    let signed: Vec<i64> = [45i64, 49].into_iter().chain(zeros(17)).collect();
+    let list = fx.int_list(&signed);
+    let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
+    assert_eq!(small(got), -100_000_000_000_000_000, "signed 18 byte-only digits");
+
+    let leading_zero: Vec<i64> = [48i64, 49, 304].into_iter().chain(zeros(15)).collect();
+    let list = fx.int_list(&leading_zero);
+    let got = fx.call("list_to_integer", &[list]).expect("list_to_integer/1");
+    assert_eq!(
+        small(got),
+        10_000_000_000_000_000,
+        "leading zero leaves a 304 on the short side of the run"
+    );
+}
+
+/// `erlang:list_to_float/1` copies the list into a NUL-terminated `char` buffer
+/// through `intlist_to_buf` (`utils.c:2827-2849`), so — unlike
+/// `list_to_integer/1,2` above — every element must **be** a byte: the
+/// `byte c = unsigned_val(CAR(list))` store is guarded by `!is_byte`
+/// (`utils.c:2840`), so an element outside `0..=255` (or a negative one) is
+/// `error:badarg` and is never truncated through `element_byte`
+/// (`[49,46,304]` would otherwise spell `"1.0"`). The buffer is a C string, so a
+/// `0` element terminates the text — but the elements behind it are still
+/// byte-checked, because `intlist_to_buf` walks the whole list before
+/// `sys_chars_to_double` ever sees the buffer.
+///
+/// Every expectation is pinned against the OTP 29 oracle (`erl -noshell -eval`,
+/// erts-17.1): `try F() of X -> {returned,X} catch C:R -> {raised,C,R} end`.
+#[test]
+fn list_to_float_requires_byte_elements() {
+    let mut fx = Fixture::new();
+
+    // The byte-only spellings parse. Oracle: list_to_float([49,46,53]) => 1.5,
+    // ([45,49,46,53]) => -1.5, ([43,49,46,53]) => 1.5.
+    for (values, expected) in [
+        (vec![49i64, 46, 53], 1.5f64),
+        (vec![45, 49, 46, 53], -1.5),
+        (vec![43, 49, 46, 53], 1.5),
+    ] {
+        let list = fx.int_list(&values);
+        let got = fx.call("list_to_float", &[list]).expect("list_to_float/1");
+        assert_eq!(float(got), expected, "list_to_float({values:?})");
+    }
+
+    // An element outside `0..=255` is `badarg`, never a truncated spelling.
+    // Oracle: [49,46,304], [49,46,48,304], [304], [49,46,53,307],
+    // [49,1000000000000], [-1,46,53] and [49,46,-1] are all error:badarg.
+    for values in [
+        vec![49i64, 46, 304],
+        vec![49, 46, 48, 304],
+        vec![304],
+        vec![49, 46, 53, 307],
+        vec![49, 1_000_000_000_000],
+        vec![-1, 46, 53],
+        vec![49, 46, -1],
+    ] {
+        let list = fx.int_list(&values);
+        assert!(
+            matches!(fx.call("list_to_float", &[list]), Err(BeamError::BadArg)),
+            "list_to_float({values:?})"
+        );
+    }
+
+    // The C string ends at the first `0` element. Oracle: [49,46,53,0] => 1.5,
+    // ([49,46,53,0,50]) => 1.5, ([49,46,53,0,49,46,53]) => 1.5,
+    // ([49,46,53,0,0]) => 1.5.
+    for values in [
+        vec![49i64, 46, 53, 0],
+        vec![49, 46, 53, 0, 50],
+        vec![49, 46, 53, 0, 49, 46, 53],
+        vec![49, 46, 53, 0, 0],
+    ] {
+        let list = fx.int_list(&values);
+        let got = fx.call("list_to_float", &[list]).expect("list_to_float/1");
+        assert_eq!(float(got), 1.5, "list_to_float({values:?})");
+    }
+
+    // ... and the text before the `0` must itself be a float. Oracle: [0],
+    // ([0,49,46,53]), ([48,0,46,53], whose text is the sign-less "0") and ([])
+    // are all error:badarg — but an element BEHIND the `0` is still byte-checked:
+    // [49,46,53,0,300] => error:badarg.
+    for values in [
+        vec![0i64],
+        vec![0, 49, 46, 53],
+        vec![48, 0, 46, 53],
+        vec![],
+        vec![49, 46, 53, 0, 300],
+    ] {
+        let list = fx.int_list(&values);
+        assert!(
+            matches!(fx.call("list_to_float", &[list]), Err(BeamError::BadArg)),
+            "list_to_float({values:?})"
+        );
+    }
+
+    // A non-byte element of another type is `badarg` too. Oracle: [49,53.0],
+    // [49,18446744073709551617], [49,foo] and the non-list 1.5 are all
+    // error:badarg.
+    let three = beam_term::make_small(49);
+    let float_element = fx.float(53.0);
+    let bignum_element = fx.bignum(false, &[1, 1]);
+    let foo = beam_term::make_atom(fx.atoms.intern("foo"));
+    for element in [float_element, bignum_element, foo] {
+        let list = fx.list(&[three, element]);
+        assert!(
+            matches!(fx.call("list_to_float", &[list]), Err(BeamError::BadArg)),
+            "list_to_float([49, {element:?}])"
+        );
+    }
+    let non_list = fx.float(1.5);
+    assert!(matches!(
+        fx.call("list_to_float", &[non_list]),
+        Err(BeamError::BadArg)
+    ));
 }

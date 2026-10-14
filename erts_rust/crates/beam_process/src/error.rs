@@ -60,6 +60,14 @@ pub(crate) fn bad_pid() -> BeamError {
     BeamError::BadArg
 }
 
+/// The error for a term of the wrong shape when the expected kind is *not* a pid/port: a
+/// non-external-reference passed where a decomposed external reference is required (or one whose
+/// self-describing id count does not fit its block). Same `badarg` an out-of-range/ill-typed
+/// argument raises, kept as its own spelling so the call site reads what it actually rejected.
+pub(crate) fn bad_arg() -> BeamError {
+    BeamError::BadArg
+}
+
 /// The error for a local name that is already registered (`badarg`).
 pub(crate) fn name_taken() -> BeamError {
     BeamError::BadArg

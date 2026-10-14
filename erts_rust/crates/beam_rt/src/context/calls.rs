@@ -134,16 +134,19 @@ impl<'a> RuntimeContext<'a> {
         let tables_handle = Rc::clone(&self.runtime.tables);
         let ports_handle = Rc::clone(&self.runtime.ports);
         let mut heap = self.runtime.take_bif_heap()?;
-        // Whether the pooled heap came to this call **clean**. The pool is shared: a heap is
-        // popped here and pushed back by every other caller too (the native floor's
+        // The offset at which **this** call starts on the pooled heap — the boundary between the
+        // words another caller owns and the words this call hands out. The pool is shared: a heap
+        // is popped here and pushed back by every other caller too (the native floor's
         // `mint_reference`/`reference_term`, trace, the ETS owner sweep), and those put it back
         // **without** resetting it — the heap a reference or a spawned pid was just built on is
-        // still holding that live term when this call receives it. A rewind to the base would
-        // recycle those words and hand a later caller the *same* address for a different term
-        // (the `assert_ne!` in `native::process::tests::alias_…` is exactly that), so the
-        // copy-out/rewind below is applied **only** when no other caller owns a word of it.
-        // See [`Self::call_registered`]'s copy-out rule.
-        let pool_clean = heap.used() == 0;
+        // still holding that live term when this call receives it. A rewind to the heap's base
+        // would recycle those words and hand a later caller the *same* address for a different
+        // term (the `assert_ne!` in `native::process::tests::alias_…` is exactly that), so the
+        // tail rewinds to `mark` — [`Heap::reset_to`](beam_alloc::Heap::reset_to) — which frees
+        // exactly `[mark..used)` (this call's own words) and keeps every word below it that
+        // another owner still holds. `mark == 0` (a heap taken clean) makes that the plain
+        // `reset()` it used to be. See [`Self::call_registered`]'s copy-out rule.
+        let mark = heap.used();
         // `self_pid` is the pid this context runs as: `erlang:self/0` reports it, and a
         // `receive` in a fun a BIF applies resolves its mailbox against it.
         let self_pid = self.mailbox_pid;
@@ -199,10 +202,12 @@ impl<'a> RuntimeContext<'a> {
         // the same image) of a compiled module's `make_fun3` closure needs the `NEW_FUN_EXT`
         // fields the term does not carry (module atom, module MD5, `old_index`/`old_uniq`,
         // creator pid), which only the *loaded module* knows. Like `local_node` this hook
-        // needs **no** runtime borrow — it snapshots every loaded module's `Arc<Module>` and
-        // `.beam` path (caller module first) plus the node atom — but building that snapshot
-        // is not free (an `Arc` clone plus a `PathBuf` per loaded module), so it is built
-        // **only** for the four BIFs that consult this seam (see [`Self::uses_fun_identity`]).
+        // needs **no** runtime borrow: it shares the code server's **cached** loaded-module
+        // snapshot (`CodeServer::fun_module_snapshot`, rebuilt only when the loaded-module
+        // set changes) and scans it caller-first, so a call costs one `Rc` clone and one name
+        // lookup rather than a walk of the module cache. It is still built **only** for the
+        // four BIFs that consult this seam (see [`Self::uses_fun_identity`]); every other
+        // registered call pays nothing at all.
         // For every other registered call it stays `None` and no hook is installed —
         // indistinguishable from the hook itself, because no other BIF ever calls
         // `local_fun_identity`. The `-eval` evaluator's own closures match no loaded module's
@@ -599,8 +604,8 @@ impl<'a> RuntimeContext<'a> {
         // ([`super::gc::root_is_unscanned`]) declines every collection while it is live in an x
         // register — and a churn loop that keeps such a result alive then grows peak memory with
         // its iteration count. Move it onto the running process's own young heap (a scanned
-        // region) and rewind the pool, so the result is collectable and the heap returns to its
-        // base.
+        // region) and rewind the pool **to this call's `mark`**, so the result is collectable and
+        // the words this call handed out are given back.
         //
         // The rewind happens only when the move is both **safe** and **complete**:
         //
@@ -613,12 +618,14 @@ impl<'a> RuntimeContext<'a> {
         //   copy keeps the arithmetic/immediate hot path free (dispatch cost is measured —
         //   see `TRACE_AND_PERF.md`);
         // * a move that **succeeded** — no scheduled process, a nursery that cannot be grown, or
-        //   a graph the copier refuses all leave the result where it is;
-        // * a **clean** pooled heap — `heap` must not have been handed over with a live word below
-        //   this call's own base (see `pool_clean` above): rewinding then would recycle a term
-        //   another caller is still holding.
+        //   a graph the copier refuses all leave the result where it is.
+        //
+        // A **partially used** pool is no obstacle: `mark` was taken before the call, so
+        // `reset_to(mark)` frees exactly this call's words `[mark..used)` and leaves the ones a
+        // previous caller still owns below `mark` untouched (see `mark` above). For a heap taken
+        // clean (`mark == 0`) that is byte for byte the `reset()` it replaces.
         let mut rewind = false;
-        if safe_to_rewind && pool_clean {
+        if safe_to_rewind {
             if let Ok(term) = result {
                 if !Self::result_is_foreign_container(term) {
                     // Nothing reachable lives on this heap, so no byte of it was handed out for
@@ -645,14 +652,25 @@ impl<'a> RuntimeContext<'a> {
         if !pending.is_empty() {
             pending.commit(self.runtime.code_server.atoms_mut());
         }
-        if rewind {
-            // Every word this call handed out of the pooled heap is now either unreachable (the
-            // BIF's intermediate terms) or has a scanned copy in the process's young heap, so the
-            // bump pointer can safely return to the heap's base. The pooled heap then serves the
-            // next call from word 0 instead of marching toward the pool's capacity.
-            heap.reset();
-        }
+        // Rewind to this call's mark and give the heap back to the pool. Every word this call
+        // handed out of the pooled heap is now either unreachable (the BIF's intermediate terms)
+        // or has a scanned copy in the process's young heap, so the bump pointer can safely
+        // return to `mark` — the words below it belong to another caller and stay owned. The
+        // pooled heap then serves the next call from `mark` instead of marching toward the pool's
+        // capacity.
+        //
+        // `reset_to` is fallible, but the error arm is unreachable: `mark` was read from **this**
+        // heap at the top of this call, the heap is a local held for the call's whole body, and
+        // its offset only ever grows in between (`used` advances on every allocation and nothing
+        // the call can reach truncates a heap — `Heap` exposes no rewind to the BIF/NIF/native
+        // seams, and a nested call takes a *different* heap from the pool), so `mark <=
+        // heap.used()` always holds. It is handled anyway, typed and with no `unwrap`: a refusal
+        // leaves the heap untouched (its own contract), so the honest answer is to surface it —
+        // that is a `BeamError::BadArg` out of the same `Result` this call already returns, never
+        // a recycled live word and never a silently mis-sized pool.
+        let rewound = if rewind { heap.reset_to(mark) } else { Ok(()) };
         self.runtime.put_bif_heap(heap);
+        rewound?;
         // A registered BIF that ran its heap dry is the emulator's documented hard limit,
         // not a host-level allocation abort (see `error::enforce_term_heap_limit`).
         result.map_err(error::enforce_term_heap_limit)

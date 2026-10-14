@@ -35,7 +35,9 @@
 //!   catch;
 //! * pin the **shape** of the `erlang:process_info/2` fields the collector owns
 //!   (`memory`'s integer, `garbage_collection`'s documented key set) — never their values;
-//! * pin the `erlang:garbage_collect/1` and `/0` return value (`true`) — contract A.7.
+//! * pin the return value (`true`) of every `erlang:garbage_collect` arity — `/0`, `/1` and the
+//!   `/2` option form (`[]`, `{type, minor}`, `{type, major}`) — and the `/2` form's
+//!   `error:badarg` refusal of an unknown `type` — contract A.7.
 //!
 //! Every golden is the oracle's **single-line** stdout under the default [`Probe::TermToBinary`]
 //! (the canonical term image, so an atom-keyed map's `~w` key order cannot leak into a golden).
@@ -49,8 +51,8 @@
 //! `process_info(self(), memory)` **byte total**, the `garbage_collection` **counters/limits**
 //! (`minor_gcs`, `min_heap_size`, `fullsweep_after`, …) and the `max_heap_size` **map image**
 //! (its atom keys encode in a different order in the Rust runtime — a genuine divergence, not
-//! a gap) are internal per-runtime quantities, and `erlang:garbage_collect/2` is an honest
-//! Rust capability gap (exit `3`) that must not enter the corpus until it agrees.
+//! a gap) are internal per-runtime quantities, and `erlang:process_info/2`'s `binary` item is
+//! an honest Rust capability gap (exit `3`) that must not enter the corpus until it agrees.
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
 /// The embedded module compiled for the module-run cases.
@@ -137,6 +139,31 @@ fn bifs(
         golden: Golden {
             stdout: Some(golden),
             exit_code: 0,
+        },
+    }
+}
+
+/// One **A.7** case whose wrapped expression *raises*: the probe prints its
+/// `exception <class> <reason>` line and exits `1`, so the golden carries that line and the
+/// non-zero exit code.
+fn bifs_raising(
+    id: &'static str,
+    description: &'static str,
+    expr: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::OtpApps],
+        kind: CaseKind::Eval {
+            expr,
+            extra_argv: &[],
+            probe: Probe::TermToBinary,
+        },
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 1,
         },
     }
 }
@@ -368,6 +395,46 @@ pub(crate) fn group() -> Vec<Case> {
              element(2, erlang:process_info(self(), garbage_collection)))))",
             "ok <<131,119,4,116,114,117,101>>",
         ),
+        // --- A.7: the two-argument erlang:garbage_collect/2 option form ---------------------
+        bifs(
+            "gc/garbage_collect_2_empty_options_returns_true",
+            "erlang:garbage_collect/2 with an empty option list returns true",
+            "erlang:garbage_collect(self(), [])",
+            "ok <<131,119,4,116,114,117,101>>",
+        ),
+        bifs(
+            "gc/garbage_collect_2_minor_returns_true",
+            "erlang:garbage_collect/2 with a `{type, minor}` option returns true",
+            "erlang:garbage_collect(self(), [{type, minor}])",
+            "ok <<131,119,4,116,114,117,101>>",
+        ),
+        bifs(
+            "gc/garbage_collect_2_major_returns_true",
+            "erlang:garbage_collect/2 with a `{type, major}` option returns true",
+            "erlang:garbage_collect(self(), [{type, major}])",
+            "ok <<131,119,4,116,114,117,101>>",
+        ),
+        bifs_raising(
+            "gc/garbage_collect_2_unknown_type_is_badarg",
+            "erlang:garbage_collect/2 with an unknown `type` raises error:badarg",
+            "erlang:garbage_collect(self(), [{type, bad}])",
+            "exception error badarg",
+        ),
+        // --- A.1: the /2 option form is value-transparent ----------------------------------
+        semantics(
+            "gc/garbage_collect_2_major_list_sum_survives_collection",
+            "a 10 000-element list's sum is unchanged across a forced major collection",
+            "begin L = lists:seq(1, 10000), true = erlang:garbage_collect(self(), [{type, major}]), \
+             lists:sum(L) end",
+            "ok <<131,98,2,251,4,8>>",
+        ),
+        semantics(
+            "gc/garbage_collect_2_minor_binary_size_survives_collection",
+            "an off-heap refc binary keeps its byte size across a forced minor collection",
+            "begin B = list_to_binary(lists:seq(1, 200)), true = erlang:garbage_collect(self(), \
+             [{type, minor}]), byte_size(B) end",
+            "ok <<131,97,200>>",
+        ),
         // --- compiled bytecode through the `run` action (the engine-driven path) ------------
         module_case(
             "gc/module_churn_alloc_discard",
@@ -464,6 +531,21 @@ mod tests {
         "gc/module_big_sum",
     ];
 
+    /// The A.7 `erlang:garbage_collect/2` option-form cases. Kept in their own list because
+    /// one of them asserts a raise (exit `1`), unlike [`BIF_CASES`].
+    const GC2_CASES: &[&str] = &[
+        "gc/garbage_collect_2_empty_options_returns_true",
+        "gc/garbage_collect_2_minor_returns_true",
+        "gc/garbage_collect_2_major_returns_true",
+        "gc/garbage_collect_2_unknown_type_is_badarg",
+    ];
+
+    /// The A.1 post-collection value cases that drive the collection through the `/2` form.
+    const GC2_VALUE_CASES: &[&str] = &[
+        "gc/garbage_collect_2_major_list_sum_survives_collection",
+        "gc/garbage_collect_2_minor_binary_size_survives_collection",
+    ];
+
     fn case<'a>(cases: &'a [Case], id: &str) -> &'a Case {
         cases
             .iter()
@@ -475,7 +557,12 @@ mod tests {
     fn the_group_is_exactly_the_declared_cases() {
         assert_eq!(
             group().len(),
-            VALUE_CASES.len() + STRESS_CASES.len() + BIF_CASES.len() + MODULE_CASES.len()
+            VALUE_CASES.len()
+                + STRESS_CASES.len()
+                + BIF_CASES.len()
+                + GC2_CASES.len()
+                + GC2_VALUE_CASES.len()
+                + MODULE_CASES.len()
         );
         // Every id is `gc/<name>`.
         for case in group() {
@@ -609,6 +696,58 @@ mod tests {
             .expect("every case asserts stdout")
     }
 
+    #[test]
+    fn the_garbage_collect_2_cases_pin_the_two_argument_option_form() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in GC2_CASES {
+            let case = case(cases, id);
+            assert!(
+                matches!(
+                    case.kind,
+                    CaseKind::Eval {
+                        probe: Probe::TermToBinary,
+                        ..
+                    }
+                ),
+                "case {id} must be an Eval case with the canonical term_to_binary probe"
+            );
+            assert!(case.extra_argv().is_empty(), "case {id} takes no extra argv");
+            assert!(case.env().is_empty(), "case {id} sets no environment");
+            assert_eq!(case.contracts, &[Contract::OtpApps], "case {id}");
+            let expr = case.expr().expect("an Eval case has an expr");
+            assert!(
+                expr.starts_with("erlang:garbage_collect(self(), "),
+                "case {id} must drive the two-argument form: {expr:?}"
+            );
+        }
+        // The three valid option forms return `true` and exit cleanly.
+        for id in [
+            "gc/garbage_collect_2_empty_options_returns_true",
+            "gc/garbage_collect_2_minor_returns_true",
+            "gc/garbage_collect_2_major_returns_true",
+        ] {
+            let case = case(cases, id);
+            assert_eq!(find_golden(cases, id), "ok <<131,119,4,116,114,117,101>>", "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
+        }
+        // An unknown `type` is a raised `error:badarg`, i.e. an `exception` line and exit 1.
+        let badarg = case(cases, "gc/garbage_collect_2_unknown_type_is_badarg");
+        assert_eq!(badarg.golden.stdout, Some("exception error badarg"));
+        assert_eq!(badarg.golden.exit_code, 1, "the raised badarg exits 1");
+
+        // The `/2` value cases evidence A.1 and must actually force the collection through it.
+        for id in GC2_VALUE_CASES {
+            let case = case(cases, id);
+            assert_eq!(case.contracts, &[Contract::LanguageSemantics], "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
+            let expr = case.expr().expect("an Eval case has an expr");
+            assert!(
+                expr.contains("erlang:garbage_collect(self(), [{type,"),
+                "case {id} must force a collection through the /2 form: {expr:?}"
+            );
+        }
+    }
     #[test]
     fn the_module_cases_are_integer_returning_run_cases_over_one_module() {
         let cases = group();

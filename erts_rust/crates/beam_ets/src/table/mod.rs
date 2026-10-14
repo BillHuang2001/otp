@@ -62,7 +62,7 @@ pub use lifecycle::OwnerDeath;
 pub use ownership::{Heir, SetOpt};
 pub use rename::RenameOutcome;
 pub use shared::SharedTable;
-pub use view::{TableRead, TableTerm, TableWrite};
+pub use view::{HeirView, TableRead, TableTerm, TableWrite};
 pub(crate) use interior::Interior;
 use interior::build_interior;
 pub(crate) use update::{add_counters, counter_slot, replace_elements};

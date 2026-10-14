@@ -33,9 +33,12 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
 - **Separators are always re-materialised from the rightmost live leaf** via
   `NodeStore::subtree_max_key`, never read back from `branch.keys` to construct one: an `ets:insert`
   upsert replaces the object a stored separator aliased and the caller reclaims that object's storage
-  right after. Every mutation re-derives the separator of the child it descended into at every level
-  (`tree.rs` `insert_rec`/`delete_rec`), plus after a split (`split_overfull`/`split_root`/
-  `adopt_split`) and on a left borrow. `child_index` is the only production reader of `branch.keys`.
+  right after. `delete_rec` re-derives the settled child's separator from the surviving leaf at every
+  level of the unwind; `insert_rec` instead propagates the new subtree maximum up in its `InsertStep`
+  return value (so an ordinary insert re-derives nothing) and re-materialises a separator only where
+  the change actually moves it — on a split (`split_overfull`/`split_root`/`adopt_split`) or when the
+  descended-into subtree is the last child. `child_index` is the only production reader of
+  `branch.keys`.
 - `child_index` **binary-searches** the strictly-ascending separators (a hand-rolled lower bound: the
   first separator `>= key`, clamped to the last child) — the tree's hottest helper.
 - Split at `ORDER+1`, cut at `ORDER/2` (16/17); rebalance borrows from a sibling with `> MIN`
@@ -43,6 +46,25 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
   changes only at the root, which collapses when it drops to a single child.
 - A same-`cmp_arith`-key insert replaces **both** the object and the stored key term (the oracle's
   key-follows-object rule; probed against OTP 29).
+
+## Complexity (as implemented)
+Per-operation node visits, `O(K)` work per node (`Vec::insert`/`remove` in a `K`-sized node) and
+`O(log n)` term comparisons overall (`O(log ORDER)` per node, from the two binary searches):
+- `find`, `first`, `last`, `next`, `prev` — `O(log n)`: one descent, plus for `next`/`prev` at most one
+  extra descent to the neighbouring subtree's leftmost/rightmost leaf (`next_subtree_key`).
+- `insert` — `O(log n)` **amortized**. The `InsertStep` mechanism carries the new subtree maximum up,
+  so only a split pays a `subtree_max_key` descent (a comparison-free pointer chase to a rightmost
+  leaf), and splits are amortized `O(1)` per insert (one per `ORDER/2` inserts). A split cascading up
+  every level makes a single insert worst-case `O(log^2 n)`.
+- `delete` — `O(log^2 n)` node visits, unconditionally: the unwind re-derives the settled child's
+  maximum with a `subtree_max_key` descent at *every* level instead of carrying it up, so the tree
+  depth is paid once per level. Those re-derivations are pointer chases (no term comparisons), so the
+  comparison count stays `O(log n)`. Correctness-driven, not a bug: the maximum must alias a *live*
+  table-owned term, which is why the term is re-materialised rather than propagated blindly.
+- Ordered iteration is `O(n)` (a walk of the leaf chain).
+
+The selectable sorted `Vec` (`sorted.rs`) is `O(log n)` lookup and `O(n)` insert/delete — that is
+exactly why the B+-tree is the default (see `../interior_bench.rs`'s `ordered_interior_microbenchmark`).
 
 ## Constraints
 - Every key comparison goes through `beam_term::compare::cmp_arith`; no `unsafe` in this directory.
@@ -69,17 +91,25 @@ observable traces. End-to-end `ordered_set` behaviour is oracle-differential-tes
 `../tests/differential/` (navigation, 10 001-key, matchspec, ...). No `#[ignore]`; no self-comparison
 tautologies.
 
+`../interior_bench.rs::ordered_interior_microbenchmark` is the reproducible B+-tree-vs-sorted-`Vec`
+comparison (it asserts every measurement, so a wrong-but-fast index fails the run):
+```text
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets \
+    --lib ordered_interior_microbenchmark -- --nocapture
+```
+Use `BEAM_ETS_BENCH_SIZES=1000,100000 BEAM_ETS_BENCH_REPEATS=5` for stable figures (each cell is the
+per-metric **minimum** over the passes) and `BEAM_ETS_BENCH_INDEX=bplus|sorted` to run one interior.
+Absolute ns are meaningless on a shared host — read the printed `sorted/tree` ratio column. On such a
+run the B+-tree wins exactly where a `Vec`'s tail shift bites: at n = 1e5 the sorted `Vec` is
+9.6–36.0× slower inserting and 10.3–29.8× slower deleting, while it stays ahead on the
+comparison-light work — 0.27–0.33× the iteration time and 0.63–1.18× / 0.90–1.56× on hit/miss
+lookup — and its index footprint is the smaller one (16.4–21.0 vs 28.7–29.6 bytes/entry, the price of
+the internal nodes that buy the `O(log n)` mutation).
+
 ## Known Issues / Notes
-- **`insert`/`delete` are `O(log^2 n)`, not `O(log n)`** as the module docs claim: the separator
-  re-derivation descends to a subtree's rightmost leaf (`subtree_max_key`) at every level of both
-  `insert_rec` and `delete_rec`. `find`/`next`/`prev`/`first`/`last` are genuinely `O(log n)`.
-  Correctness-driven, not a bug — the `O(log n)` wording is the overstatement.
 - `next_from`/`prev_from` with `inclusive = true` has no production consumer yet: only `Tree::next`/
   `prev` call them (`inclusive = false`). It is the range API a later `ets:select`/`ets:next`-style
   scan wires up (documented in `mod.rs`).
-- The `borrowing_from_the_left_sibling_keeps_the_separator_exact` test comment (`tests.rs`)
-  says the merged first leaf holds "30 entries"; the arithmetic gives 31 (15 + 16), and the merge
-  happens inside the delete of 15, not a subsequent one. The scenario itself is correct; cosmetic.
 
 ## Routing Table
 - `mod.rs` → `OrderedSetInterior` (B+-tree facade + `Interior` impl); declares `mod tests;` → `tests.rs` (the crate's biggest test module)

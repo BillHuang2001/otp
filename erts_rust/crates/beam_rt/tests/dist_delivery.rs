@@ -40,26 +40,36 @@
 //!
 //! The `(7)` group goes one level lower: synthetic [`Delivery`] values are driven
 //! straight into the public [`LocalDeliverySink`] over a **standalone**
-//! [`ProcessTable`], pinning the routing table one family at a time (each routed
-//! family by its delivered effect, each unrouted family by its honest
-//! `Unsupported`).
+//! [`ProcessTable`], pinning the routing table one family at a time — each routed
+//! family by its delivered effect (the ordinary message families by a mailbox
+//! delivery, the link/exit/unlink/monitor/demonitor/monitor-down/group-leader signal
+//! families by the **route-free receipt** state they install) and each still-unrouted
+//! family by its honest `Unsupported`. A receipt family installs (or drops) its local
+//! record and echoes nothing, so a recording [`DistSignalRouter`] proves the whole set
+//! leaves the wire untouched.
 //!
 //! Small integers are used as the payload wherever the exact term matters: unlike
 //! atoms (whose raw encoding is table-local), a small integer is its own immediate
 //! value, so a term compares `==` across heaps.
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
-use beam_codec::term::make_external_pid;
+use beam_codec::term::{make_external_pid, make_external_ref};
+use beam_common::Result as BeamResult;
 use beam_dist::flags::Dop;
 use beam_dist::{
     AltactSigFlags, ConnectionDriver, Delivery, DeliveryOutcome, DistSpawnFlags, DriverState,
     InboundSink, StepOutcome,
 };
-use beam_process::{ProcessId, ProcessTable, SignalAtoms, UnaliasMode};
+use beam_process::{
+    DistSignal, DistSignalRouter, MonitorKind, PidTarget, ProcessId, ProcessTable, RemotePid,
+    RemoteRef, RemoteWatcher, RemoteWatcherRef, SignalAtoms, UnaliasMode,
+};
 use beam_rt::dist::LocalDeliverySink;
 use beam_rt::{Runtime, RuntimeConfig};
 use beam_term::prelude::{eq, is_immediate, make_atom, make_small, size_object, Atom, Eterm};
@@ -323,21 +333,38 @@ fn a_pid_on_another_node_is_no_such_process_and_never_mis_delivered() {
 }
 
 // ---------------------------------------------------------------------------
-// (4) The unrouted families are the honest `Unsupported`, never a substituted send
+// (4) The wire-borne shapes that are not delivered — and the wired receipt families
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_alias_send_is_unsupported_not_a_wrong_delivery() {
+fn an_alias_send_to_a_wire_borne_reference_is_unsupported_not_a_wrong_delivery() {
     let mut rt = node_runtime("alias");
     let (mut client, mut server) = establish();
     let mut heap = Heap::new(HEAP_WORDS).expect("heap");
 
     // `DOP_ALIAS_SEND`'s `To` must be a **reference** (`dist.c:2577`
-    // `is_not_ref(to)` ⇒ `invalid_message`); a small integer is outside the
-    // opcode's wire contract, so the sink must refuse it rather than deliver to
-    // whichever pid the *number* happens to name. (A genuinely unowned reference is
-    // `Dropped` — see the routing-logic cases below.)
-    let to = make_small(7);
+    // `is_not_ref(to)` ⇒ `invalid_message`), so a well-formed wire message carries a
+    // reference thing. A wire reference is always the **external**
+    // (`NEWER_REFERENCE_EXT`) form: the control-message decoder installs no local-node
+    // identity, so the codec's local-node demotion never runs and the sink sees an
+    // external reference — never a readable local alias key.
+    //
+    // The sink therefore reports the typed **`Unsupported`** for this wire half (the
+    // recorded `beam_dist` handoff in `src/dist.rs`: the external form is not an alias
+    // key here), and emphatically *not* a delivery to whichever process the raw id
+    // happens to name. The C's silent-drop half of the rule
+    // (`erl_proc_sig_queue.c:6036-6046`: *"Not an alias … drop message"*) is pinned
+    // where it IS reachable — for a **local** reference — by the sink-level case
+    // `an_unowned_reference_is_dropped_and_a_non_ref_target_is_unsupported`.
+    let name = rt
+        .dist_node()
+        .expect("a configured node")
+        .node_name()
+        .to_string();
+    let creation = rt.dist_node().expect("a configured node").creation();
+    let node_atom = rt.intern(&name);
+    let to = make_external_ref(&mut heap, node_atom, &[0u32, 0u32, 1u32], creation)
+        .expect("materialize the external reference");
     let from = make_small(1);
     let message = make_small(2);
     client
@@ -356,49 +383,95 @@ fn an_alias_send_is_unsupported_not_a_wrong_delivery() {
     assert_eq!(
         dispatched[0].outcome,
         DeliveryOutcome::Unsupported,
-        "an alias send has no correct local seam: {:?}",
+        "a wire reference is the external form, which is not an alias key: \
+         the honest outcome is `Unsupported`, never a delivery or a wrong drop: {:?}",
         dispatched[0].delivery
     );
     assert_eq!(only_message(&rt, rt.self_pid()), None);
 }
-
 #[test]
-fn the_signal_families_are_unsupported_without_a_correct_local_seam() {
+fn the_routed_link_and_exit_families_are_applied_through_the_wire() {
     let mut rt = node_runtime("signal");
     let (mut client, mut server) = establish();
     let mut heap = Heap::new(HEAP_WORDS).expect("heap");
 
-    let from = make_small(1);
-    let to = make_small(2);
-    let reason = make_small(3);
+    let pid = rt.self_pid();
+    // A local `to` as it arrives on the wire: an external pid whose node/creation are
+    // this node's (`DOP_LINK`'s `To` may be either form).
+    let to = own_pid_term(&mut rt, &mut heap);
+    // A well-formed `From`: an external pid of **this link's peer**, whose node and
+    // creation are exactly what the `'N'` handshake advertised.
+    let peer_node = rt.intern(PEER_NODE_NAME);
+    let peer_pid = make_external_pid(&mut heap, peer_node, 3, 0, CLIENT_CREATION)
+        .expect("the peer's external pid");
+    let peer = RemotePid::from_eterm(peer_pid).expect("decompose the peer pid");
+    // `DOP_EXIT` addresses a **local** pid (`is_not_internal_pid(to)`,
+    // `dist.c:2793-2797`). A real ERTS peer puts this node's **external** pid on the
+    // wire and the receiving C decoder demotes it to an internal one; the harness
+    // decoder installs no local-node identity, so the external form is what the sink
+    // sees — and it resolves by node + creation + slot exactly like the internal form
+    // (`LocalDeliverySink::resolve`).
+    let local = own_pid_term(&mut rt, &mut heap);
 
-    // Link, exit and the monitor family all address *local* parties in
-    // `beam_process`'s own structures, which accept only local peers — there is no
-    // seam to install a remote counterpart, so each is an honest `Unsupported`.
-    let cases: [(Dop, &[Eterm]); 3] = [
-        (Dop::Link, &[from, to]),
-        (Dop::Exit, &[from, to, reason]),
-        (Dop::MonitorP, &[from, to, reason]),
-    ];
-    for (dop, terms) in cases {
-        client
-            .send_control(dop, terms, rt.code_server_atoms_mut())
-            .expect("queue control");
-        relay(&mut client, &mut server);
-        let dispatched = rt
-            .dispatch_inbound(&mut heap, &mut server)
-            .expect("dispatch");
-        assert_eq!(dispatched.len(), 1);
-        assert_eq!(
-            dispatched[0].outcome,
-            DeliveryOutcome::Unsupported,
-            "{dop:?} has no correct local seam: {:?}",
-            dispatched[0].delivery
-        );
-    }
-    assert_eq!(only_message(&rt, rt.self_pid()), None);
+    // 1. `DOP_LINK`: the remote `from` is now linked to the local `to`, recorded
+    // **without** echoing a `DOP_LINK` back (the C's `break; /* Done */`, `dist.c:2258`).
+    client
+        .send_control(Dop::Link, &[peer_pid, to], rt.code_server_atoms_mut())
+        .expect("queue the link");
+    relay(&mut client, &mut server);
+    let dispatched = rt
+        .dispatch_inbound(&mut heap, &mut server)
+        .expect("dispatch the link");
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(
+        dispatched[0].outcome,
+        DeliveryOutcome::Delivered,
+        "a link is routed, not refused: {:?}",
+        dispatched[0].delivery
+    );
+    assert_eq!(
+        rt.processes().remote_links(pid),
+        [peer].as_slice(),
+        "the accepted link records the remote partner against the local process"
+    );
+
+    // 2. `DOP_EXIT` from that recorded link: the local link-exit family removes the
+    // record first and then applies the exit policy. Reason `normal` to a
+    // non-trapping receiver is *ignored* — the signal is applied, never enqueued as a
+    // message, and the recorded link is gone.
+    let normal = rt.intern("normal");
+    client
+        .send_control(
+            Dop::Exit,
+            &[peer_pid, local, normal],
+            rt.code_server_atoms_mut(),
+        )
+        .expect("queue the exit");
+    relay(&mut client, &mut server);
+    let dispatched = rt
+        .dispatch_inbound(&mut heap, &mut server)
+        .expect("dispatch the exit");
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(
+        dispatched[0].outcome,
+        DeliveryOutcome::Delivered,
+        "an exit signal is applied locally: {:?}",
+        dispatched[0].delivery
+    );
+    assert!(
+        rt.processes().remote_links(pid).is_empty(),
+        "a link exit removes the recorded remote link"
+    );
+    assert_eq!(
+        only_message(&rt, pid),
+        None,
+        "an exit signal is applied, never delivered as an ordinary message"
+    );
+    assert!(
+        rt.processes().contains(pid),
+        "a `normal` link exit to a non-trapping receiver must not terminate it"
+    );
 }
-
 // ---------------------------------------------------------------------------
 // (5) The scheduler-pass gate: routing is ON by default and can be switched off
 // ---------------------------------------------------------------------------
@@ -767,10 +840,11 @@ fn a_forged_inbound_link_from_a_third_node_retires_its_link() {
     let third_pid = make_external_pid(&mut heap, other_node, 3, 0, CLIENT_CREATION)
         .expect("a third node's pid");
 
-    // 1. `From` names this link's **peer** ⇒ well-formed. The link family itself has no
-    // local seam (the sink answers `Unsupported`), so the observable is that the link
-    // survives: the message queued *behind* the `DOP_LINK` is delivered, and the driver
-    // drains in arrival order, so the link was accepted before that delivery happened.
+    // 1. `From` names this link's **peer** ⇒ well-formed. The accepted `DOP_LINK`
+    // **records** the remote link (route-free, echoing nothing), so the observable is
+    // that the link survives: the message queued *behind* the `DOP_LINK` is delivered,
+    // and the driver drains in arrival order, so the link was accepted before that
+    // delivery happened.
     let accepted = make_small(1010);
     client
         .send_control(Dop::Link, &[peer_pid, to], &atoms)
@@ -913,6 +987,18 @@ fn external_pid_term(
 ) -> Eterm {
     make_external_pid(heap, node, number as u32, serial as u32, creation)
         .expect("materialize the external pid thing")
+}
+
+/// An external pid on the fixture's [`FOREIGN_NODE_NAME`] node — a remote peer that is
+/// never a process of this fixture's table.
+fn foreign_pid(fixture: &Fixture, heap: &mut Heap, number: u64) -> Eterm {
+    external_pid_term(
+        heap,
+        make_atom(fixture.foreign_node),
+        number,
+        0,
+        CLIENT_CREATION,
+    )
 }
 
 /// Routes `delivery` through a `LocalDeliverySink` over `table` for the node named by
@@ -1380,12 +1466,577 @@ fn an_altact_sig_priority_or_exit_signal_is_unsupported() {
     assert!(mailbox(&fixture.table, pid).is_empty());
 }
 
+// --- the routed signal families (route-free receipt) ------------------------
+//
+// The inbound signal families below do **not** go through a *locally initiated*
+// `beam_process` entry point (`link_term`/`unlink_term`/`monitor_term`/`demonitor`/
+// `send_exit_term`), each of which would route a `DOP_*` the C's receipt arm never
+// sends. Instead they install (or drop) their local record through a **route-free
+// receipt** primitive and echo nothing — the C's `break; /* Done */` (`dist.c:2258`).
+
+/// An inbound `DOP_LINK` **records** the remote partner against the local process
+/// (`dist.c:2224`), echoing no `DOP_LINK` back and delivering no message.
+#[test]
+fn an_inbound_link_records_a_remote_link() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let from = foreign_pid(&fixture, &mut heap, 3);
+    let remote = RemotePid::from_eterm(from).expect("decompose the remote pid");
+
+    let delivery = Delivery::Link {
+        from,
+        to: pid.to_eterm(),
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Delivered,
+        "an inbound link is accepted"
+    );
+    assert_eq!(
+        fixture.table.remote_links(pid),
+        [remote].as_slice(),
+        "the accepted link records the remote partner against the local process"
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "a link installs a relationship; it delivers no message"
+    );
+}
+
+/// An exit signal is **applied** to the local process and never enqueued as an
+/// ordinary message. The link-exit family (`DOP_EXIT`) ignores an exit with no
+/// recorded link; the untrappable `erlang:exit/2` family (`DOP_EXIT2`) consults no
+/// link and terminates a non-trapping target.
+#[test]
+fn an_inbound_exit_signal_is_applied_not_delivered_as_a_message() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let from = foreign_pid(&fixture, &mut heap, 3);
+
+    // A link exit with **no** matching recorded link is ignored outright
+    // (`erl_proc_sig_queue.c:4674-4680`) — never enqueued, never fatal.
+    let unmatched = Delivery::Exit {
+        from,
+        to: pid.to_eterm(),
+        reason: make_small(7),
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &unmatched),
+        DeliveryOutcome::Delivered,
+        "an unmatched link exit is applied (as a no-op), not refused"
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "an exit signal must never become an ordinary message"
+    );
+    assert!(
+        fixture.table.contains(pid),
+        "an unmatched link exit is ignored, not fatal"
+    );
+
+    // The untrappable family consults no link: it is applied to the target, and a
+    // non-trapping one really terminates — still without a message.
+    let victim = fixture.spawn();
+    let explicit = Delivery::Exit2 {
+        from,
+        to: victim.to_eterm(),
+        reason: make_small(7),
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &explicit),
+        DeliveryOutcome::Delivered,
+        "the untrappable family is applied, not refused"
+    );
+    assert!(
+        !fixture.table.contains(victim),
+        "an untrappable non-normal exit terminates a non-trapping target"
+    );
+}
+
+/// An out-of-contract signal is refused rather than substituted: a `From` that is not
+/// a remote pid is `Unsupported`, and a `To` on another node is never resolved by its
+/// slot number alone (`NoSuchProcess`).
+#[test]
+fn an_out_of_contract_signal_is_unsupported_not_substituted() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+
+    let non_remote = Delivery::Exit {
+        from: make_small(1),
+        to: pid.to_eterm(),
+        reason: make_small(3),
+        token: None,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &non_remote),
+        DeliveryOutcome::Unsupported,
+        "a `From` that is not a remote pid is outside the signal opcodes' contract"
+    );
+
+    let from = foreign_pid(&fixture, &mut heap, 3);
+    let elsewhere = foreign_pid(&fixture, &mut heap, 9);
+    let foreign_target = Delivery::Link {
+        from,
+        to: elsewhere,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &foreign_target),
+        DeliveryOutcome::NoSuchProcess,
+        "a `To` on another node is not a process of this runtime"
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "a refused signal must not reach any mailbox"
+    );
+}
+
+/// The OTP-26+ unlink-id handshake: `id == 0` owes no ack and is `Delivered` (the link
+/// record is dropped); `id != 0` drops the record too but owes a `DOP_UNLINK_ID_ACK` the
+/// sink cannot emit, so it reports the wire half `Unsupported`; the `_ACK` form consumes
+/// an ack and is `Delivered`.
+#[test]
+fn an_inbound_unlink_id_without_an_ack_is_delivered_and_one_owing_an_ack_is_unsupported() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let from = foreign_pid(&fixture, &mut heap, 3);
+    let link = Delivery::Link {
+        from,
+        to: pid.to_eterm(),
+    };
+
+    // `Id == 0`: the C's `reply_dist_unlink_ack` sends nothing (`erl_proc_sig_queue.c:2753-2760`),
+    // so the unlink completes locally and is `Delivered`; the record is dropped.
+    assert_eq!(
+        route(&mut fixture.table, node, &link),
+        DeliveryOutcome::Delivered
+    );
+    let no_ack = Delivery::UnlinkId {
+        id: make_small(0),
+        from,
+        to: pid.to_eterm(),
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &no_ack),
+        DeliveryOutcome::Delivered,
+        "an unlink that owes no ack completes locally"
+    );
+    assert!(
+        fixture.table.remote_links(pid).is_empty(),
+        "the `id == 0` unlink drops the recorded link"
+    );
+
+    // `Id != 0`: the record is still dropped, but the owed ack has no channel.
+    assert_eq!(
+        route(&mut fixture.table, node, &link),
+        DeliveryOutcome::Delivered
+    );
+    let owing_ack = Delivery::UnlinkId {
+        id: make_small(9),
+        from,
+        to: pid.to_eterm(),
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &owing_ack),
+        DeliveryOutcome::Unsupported,
+        "the owed DOP_UNLINK_ID_ACK is the wire half this sink cannot emit"
+    );
+    assert!(
+        fixture.table.remote_links(pid).is_empty(),
+        "the link record is dropped even when the owed ack is unemittable"
+    );
+
+    // The `_ACK` form consumes an ack: it owes no reply and is `Delivered` for a live
+    // local `to`.
+    let ack = Delivery::UnlinkIdAck {
+        id: make_small(9),
+        from,
+        to: pid.to_eterm(),
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &ack),
+        DeliveryOutcome::Delivered,
+        "consuming an ack owes nothing back"
+    );
+    assert!(mailbox(&fixture.table, pid).is_empty());
+}
+
+/// A `DOP_MONITOR_P_EXIT` fires exactly when its reference is one **this** node minted for
+/// an outgoing remote monitor (the peer echoes that reference image back verbatim); a DOWN
+/// for any other reference is the C's silent drop.
+#[test]
+fn a_monitor_down_for_our_own_outgoing_reference_fires_or_is_dropped() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let watched = foreign_pid(&fixture, &mut heap, 3);
+
+    // An outgoing remote monitor this node initiated: the reference is what the peer
+    // echoes back in the `DOP_MONITOR_P_EXIT` it sends when the target dies.
+    let monitor = fixture
+        .table
+        .monitor_term(pid, watched, MonitorKind::Process)
+        .expect("record the outgoing remote monitor");
+    let id = monitor.id();
+
+    // The wire image of **our own** reference, exactly as `dist_client` packs it onto
+    // the outgoing `DOP_MONITOR_P`: `{our_node, our_creation, [0, id >> 32, id]}`.
+    let echoed = make_external_ref(
+        &mut heap,
+        make_atom(node),
+        &[0u32, (id >> 32) as u32, id as u32],
+        NODE_CREATION,
+    )
+    .expect("the echoed reference image");
+    let reason = make_small(7);
+    let down = Delivery::MonitorExit {
+        watched,
+        watcher: pid.to_eterm(),
+        reference: echoed,
+        reason,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &down),
+        DeliveryOutcome::Delivered,
+        "a DOWN for our own outgoing record fires"
+    );
+    assert_eq!(
+        mailbox(&fixture.table, pid).len(),
+        1,
+        "the DOWN is delivered into the watcher's mailbox"
+    );
+
+    // The delivered message is the oracle's `{'DOWN', Ref, process, RemotePid, Reason}`.
+    let delivered = mailbox(&fixture.table, pid);
+    let down_atom = make_atom(fixture.atoms.intern("DOWN"));
+    let process_atom = make_atom(fixture.atoms.intern("process"));
+    let mut scratch = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let expected_reference = monitor.to_eterm(&mut scratch).expect("the DOWN's reference");
+    let expected_target = foreign_pid(&fixture, &mut scratch, 3);
+    let expected = scratch
+        .tuple(&[down_atom, expected_reference, process_atom, expected_target, reason])
+        .expect("build the expected DOWN");
+    assert!(
+        eq(delivered[0].0, expected, &fixture.atoms),
+        "the DOWN is `{{'DOWN', Ref, process, RemotePid, Reason}}`"
+    );
+
+    // A reference this node never minted as a monitor matches no record: the C resolves
+    // the DOWN through the watcher's monitor tree and **drops** a miss.
+    let stray = make_external_ref(
+        &mut heap,
+        make_atom(node),
+        &[0u32, 0u32, id.wrapping_add(1000) as u32],
+        NODE_CREATION,
+    )
+    .expect("a reference with no matching record");
+    let unmatched = Delivery::MonitorExit {
+        watched,
+        watcher: pid.to_eterm(),
+        reference: stray,
+        reason,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &unmatched),
+        DeliveryOutcome::Dropped,
+        "a DOWN matching no outgoing record is silently dropped"
+    );
+    assert_eq!(
+        mailbox(&fixture.table, pid).len(),
+        1,
+        "a dropped DOWN adds no second message"
+    );
+}
+
+/// A remote watcher's own monitor is **routed**: the peer-minted wire reference is decomposed into
+/// a [`RemoteRef`] and the [`RemoteWatcher`] record is keyed by its whole identity — so two
+/// distinct peer references of one local process coexist (no lossy `u64` collapse) and each
+/// demonitor cancels exactly its own. The C's inbound arms install/remove the local record and
+/// answer nothing (`dist.c:2341`/`:2415`).
+#[test]
+fn an_inbound_monitor_and_demonitor_install_and_remove_a_remote_watcher() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let watcher = foreign_pid(&fixture, &mut heap, 3);
+    let watcher_pid = RemotePid::from_eterm(watcher).expect("decompose the watcher pid");
+
+    let reference =
+        make_external_ref(&mut heap, make_atom(fixture.foreign_node), &[1, 2, 3], CLIENT_CREATION)
+            .expect("a peer-minted reference");
+    let expected_ref = RemoteRef::from_eterm(reference).expect("decompose the reference");
+
+    let monitor = Delivery::Monitor {
+        watcher,
+        watched: pid.to_eterm(),
+        reference,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &monitor),
+        DeliveryOutcome::Delivered,
+        "a peer monitor of a live local process is recorded"
+    );
+    assert_eq!(
+        fixture.table.remote_watchers(pid),
+        &[RemoteWatcher {
+            reference: RemoteWatcherRef::Remote(expected_ref),
+            watcher: watcher_pid,
+            kind: MonitorKind::Process,
+        }],
+        "the record is keyed by the whole peer-minted reference"
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "installing a remote watcher delivers no message"
+    );
+
+    // A second monitor with a **different** peer reference coexists — no collapse.
+    let second =
+        make_external_ref(&mut heap, make_atom(fixture.foreign_node), &[1, 2, 4], CLIENT_CREATION)
+            .expect("a second peer reference");
+    let second_ref = RemoteRef::from_eterm(second).expect("decompose the second reference");
+    let second_monitor = Delivery::Monitor {
+        watcher,
+        watched: pid.to_eterm(),
+        reference: second,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &second_monitor),
+        DeliveryOutcome::Delivered
+    );
+    assert_eq!(
+        fixture.table.remote_watchers(pid).len(),
+        2,
+        "both peer references coexist"
+    );
+
+    // The demonitor for the first removes exactly that one.
+    let demonitor = Delivery::Demonitor {
+        watcher,
+        watched: pid.to_eterm(),
+        reference,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &demonitor),
+        DeliveryOutcome::Delivered,
+        "the matching demonitor removes its record"
+    );
+    assert_eq!(
+        fixture.table.remote_watchers(pid),
+        &[RemoteWatcher {
+            reference: RemoteWatcherRef::Remote(second_ref),
+            watcher: watcher_pid,
+            kind: MonitorKind::Process,
+        }],
+        "only the demonitored reference goes"
+    );
+
+    // A name-targeted monitor resolves through the table's name registry.
+    let name = fixture.atoms.intern("delivery-monitor-name");
+    fixture.table.register(name, pid).expect("register the name");
+    let by_name = Delivery::Monitor {
+        watcher,
+        watched: make_atom(name),
+        reference: make_external_ref(
+            &mut heap,
+            make_atom(fixture.foreign_node),
+            &[9, 9, 9],
+            CLIENT_CREATION,
+        )
+        .expect("a name-targeted peer reference"),
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &by_name),
+        DeliveryOutcome::Delivered,
+        "a registered name is a valid DOP_MONITOR_P target"
+    );
+    assert_eq!(fixture.table.remote_watchers(pid).len(), 2);
+
+    // An unregistered name is the honest NoSuchProcess (the C replies noproc).
+    let unregistered = Delivery::Monitor {
+        watcher,
+        watched: make_atom(fixture.atoms.intern("nobody-holds-me")),
+        reference,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &unregistered),
+        DeliveryOutcome::NoSuchProcess
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "no monitor-family delivery may have enqueued a message"
+    );
+}
+
+/// An inbound `DOP_GROUP_LEADER` installs the remote `from` as the local `to`'s group
+/// leader — readable back through [`ProcessTable::group_leader`] — and routes nothing.
+#[test]
+fn an_inbound_group_leader_sets_the_leader() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let leader = foreign_pid(&fixture, &mut heap, 3);
+    let remote = RemotePid::from_eterm(leader).expect("decompose the leader pid");
+
+    let delivery = Delivery::GroupLeader {
+        from: leader,
+        to: pid.to_eterm(),
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &delivery),
+        DeliveryOutcome::Delivered
+    );
+    assert_eq!(
+        fixture.table.group_leader(pid),
+        Some(PidTarget::Remote(remote)),
+        "the remote sender becomes the local process's group leader"
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "installing a group leader delivers no message"
+    );
+}
+
+/// A distribution seam that records every routed signal instead of touching a socket.
+///
+/// The log is shared through an `Rc<RefCell<_>>` because the seam lives behind a
+/// `Box<dyn DistSignalRouter>` inside the table and is not downcastable — the test keeps
+/// its own handle to inspect what was routed (and, crucially, to prove **nothing** was).
+struct RecordingRouter {
+    signals: Rc<RefCell<Vec<DistSignal>>>,
+}
+
+impl DistSignalRouter for RecordingRouter {
+    fn route(&mut self, signal: DistSignal) -> BeamResult<()> {
+        self.signals.borrow_mut().push(signal);
+        Ok(())
+    }
+}
+
+/// **The route-free proof.** Every family the sink now routes is driven in turn with a
+/// recording distribution seam installed: an inbound receipt installs/drops its local
+/// record and must never echo a `DOP_*` back on the wire (the C's `break; /* Done */`),
+/// so the recorded signal vector must stay **empty**.
+#[test]
+fn every_routed_inbound_family_routes_nothing_outbound() {
+    let mut fixture = Fixture::new();
+    let node = fixture.local_node;
+    let pid = fixture.pid;
+    let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
+    let peer = foreign_pid(&fixture, &mut heap, 3);
+    let normal = make_atom(fixture.atoms.intern("normal"));
+
+    // The outgoing remote monitor the DOWN resolves — set up **before** the recorder is
+    // installed, because establishing it IS a locally initiated signal that must
+    // legitimately route (the receipt families below must not).
+    let monitor = fixture
+        .table
+        .monitor_term(pid, peer, MonitorKind::Process)
+        .expect("record the outgoing remote monitor");
+    let id = monitor.id();
+    let echoed = make_external_ref(
+        &mut heap,
+        make_atom(node),
+        &[0u32, (id >> 32) as u32, id as u32],
+        NODE_CREATION,
+    )
+    .expect("the echoed reference image");
+
+    let log = Rc::new(RefCell::new(Vec::new()));
+    fixture.table.set_dist_router(Box::new(RecordingRouter {
+        signals: Rc::clone(&log),
+    }));
+
+    let directed = pid.to_eterm();
+    // A peer-minted reference for the monitor family: recording it must route nothing.
+    let peer_ref =
+        make_external_ref(&mut heap, make_atom(fixture.foreign_node), &[5, 6, 7], CLIENT_CREATION)
+            .expect("a peer-minted reference");
+    let families = [
+        Delivery::Link {
+            from: peer,
+            to: directed,
+        },
+        Delivery::Exit {
+            from: peer,
+            to: directed,
+            reason: normal,
+            token: None,
+        },
+        Delivery::Link {
+            from: peer,
+            to: directed,
+        },
+        Delivery::UnlinkId {
+            id: make_small(0),
+            from: peer,
+            to: directed,
+        },
+        Delivery::UnlinkIdAck {
+            id: make_small(9),
+            from: peer,
+            to: directed,
+        },
+        Delivery::Exit2 {
+            from: peer,
+            to: directed,
+            reason: normal,
+            token: None,
+        },
+        Delivery::Monitor {
+            watcher: peer,
+            watched: directed,
+            reference: peer_ref,
+        },
+        Delivery::Demonitor {
+            watcher: peer,
+            watched: directed,
+            reference: peer_ref,
+        },
+        Delivery::MonitorExit {
+            watched: peer,
+            watcher: directed,
+            reference: echoed,
+            reason: make_small(7),
+        },
+        Delivery::GroupLeader {
+            from: peer,
+            to: directed,
+        },
+    ];
+    for delivery in &families {
+        assert_eq!(
+            route(&mut fixture.table, node, delivery),
+            DeliveryOutcome::Delivered,
+            "every routed family really was applied: {delivery:?}"
+        );
+    }
+    assert!(
+        log.borrow().is_empty(),
+        "a route-free receipt must never echo a `DOP_*`: {:?}",
+        log.borrow()
+    );
+}
+
 // --- the escalation list ----------------------------------------------------
 
-/// **One row per unrouted family**: every family whose local counterpart
-/// `beam_process` cannot install is the honest `Unsupported` — never a substituted
-/// message, never a dropped signal. This pins the escalation list so a future change
-/// must flip a row on purpose rather than by accident.
+/// **One row per remaining unrouted family**: after the link/exit/unlink/monitor/demonitor/
+/// monitor-down/group-leader receipt families were routed, the families `beam_process` still has
+/// no route-free counterpart for are the honest `Unsupported` — never a substituted message,
+/// never a dropped signal. This pins the escalation list so a future change must flip a row on
+/// purpose rather than by accident.
 #[test]
 fn every_unrouted_family_is_the_honest_unsupported() {
     let mut fixture = Fixture::new();
@@ -1394,82 +2045,8 @@ fn every_unrouted_family_is_the_honest_unsupported() {
     let sender = make_small(1);
     let target = pid.to_eterm();
     let aux = make_small(2);
-    let reason = make_small(3);
 
-    let rows: [(Dop, Delivery); 15] = [
-        // `DOP_LINK`: needs a record-only `record_remote_link` (the table's only
-        // entry point would echo a `DOP_LINK` the C never sends back).
-        (Dop::Link, Delivery::Link {
-            from: sender,
-            to: target,
-        }),
-        // The remote-sender exit family: `ExitSignal` carries a **local** sender pid.
-        (Dop::Exit, Delivery::Exit {
-            from: sender,
-            to: target,
-            reason,
-            token: None,
-        }),
-        (Dop::Exit2, Delivery::Exit2 {
-            from: sender,
-            to: target,
-            reason,
-            token: None,
-        }),
-        (Dop::PayloadExit, Delivery::PayloadExit {
-            from: sender,
-            to: target,
-            payload: reason,
-            token: None,
-        }),
-        (Dop::PayloadExit2, Delivery::PayloadExit2 {
-            from: sender,
-            to: target,
-            payload: reason,
-            token: None,
-        }),
-        // The OTP-26+ unlink-id handshake: an inbound `DOP_UNLINK_ID` must be answered
-        // with its `_ACK`, which the local-initiated `unlink_term` never does.
-        (Dop::UnlinkId, Delivery::UnlinkId {
-            id: aux,
-            from: sender,
-            to: target,
-        }),
-        (Dop::UnlinkIdAck, Delivery::UnlinkIdAck {
-            id: aux,
-            from: sender,
-            to: target,
-        }),
-        // A remote watcher: a monitor's origin side is a local pid here.
-        (Dop::MonitorP, Delivery::Monitor {
-            watcher: sender,
-            watched: target,
-            reference: aux,
-        }),
-        (Dop::DemonitorP, Delivery::Demonitor {
-            watcher: sender,
-            watched: target,
-            reference: aux,
-        }),
-        // A monitor DOWN from a remote target: firing the local watcher's outgoing
-        // record is a local-death path here.
-        (Dop::MonitorPExit, Delivery::MonitorExit {
-            watched: sender,
-            watcher: target,
-            reference: aux,
-            reason,
-        }),
-        (Dop::PayloadMonitorPExit, Delivery::PayloadMonitorExit {
-            watched: sender,
-            watcher: target,
-            reference: aux,
-            payload: reason,
-        }),
-        // `DOP_GROUP_LEADER`: the group leader is only settable locally today.
-        (Dop::GroupLeader, Delivery::GroupLeader {
-            from: sender,
-            to: target,
-        }),
+    let rows: [(Dop, Delivery); 3] = [
         // The distributed-spawn family: a CLI process serves no spawn requests and
         // holds no spawn reservations.
         (Dop::SpawnRequest, Delivery::SpawnRequest {

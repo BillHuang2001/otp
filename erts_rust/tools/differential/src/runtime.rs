@@ -35,6 +35,14 @@
 //!   and the case is *skipped*. It is resolved by [`resolve_helper`]/[`resolve_helper_from`]
 //!   and reported with [`RuntimeId::Rust`].
 //!
+//! Resolution is a pure lookup and never mutates anything; the **binary** additionally makes
+//! the live two-node loopback cases runnable in a tree where only `beam_rt` and `differential`
+//! were built: [`ensure_helper`] resolves the helper and, when nothing was found, builds the
+//! `beam_dist` package **once** (through the committed `scripts/cargo.sh` wrapper) and
+//! re-resolves. Setting `$DIFFERENTIAL_NO_BUILD` (to any non-empty value) switches that build
+//! off — the cases then stay a loud *skipped* naming the reason, exactly as before. A failed
+//! build is never fatal either: it keeps the loud *skipped* and carries cargo's diagnosis.
+//!
 //! The workspace default searches `release` **before** `debug` on purpose: it is what the
 //! real CLI and the CI `gate.sh` want, so the fastest artifact present is measured. That
 //! order is *wrong* under `cargo test`, where only the `debug` artifacts are (re)built — a
@@ -54,9 +62,10 @@
 //! and, for a module-run case, the flag's *application* to the code path — is what is
 //! compared.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
 
@@ -331,10 +340,231 @@ pub fn resolve_helper_from(
 
 /// The reason recorded for the Rust side of a command case when no `dist_probe` helper could
 /// be found.
+///
+/// When the binary's on-demand build ([`ensure_helper`]) ran, the reason also carries *why*
+/// it did not produce a helper — either cargo's diagnosis or the `$DIFFERENTIAL_NO_BUILD`
+/// opt-out — so a skip is always self-explaining and never silent.
 pub fn helper_unsupported_reason() -> String {
-    "no distribution helper found: $BEAM_DIST_PROBE is unset and no built dist_probe exists \
-     under the workspace target/{release,debug} directory"
-        .to_string()
+    let mut reason =
+        "no distribution helper found: $BEAM_DIST_PROBE is unset and no built dist_probe exists \
+         under the workspace target/{release,debug} directory"
+            .to_string();
+    if no_build_requested(std::env::var_os(NO_BUILD_ENV).as_deref()) {
+        reason.push_str(&format!(
+            " (the on-demand build is disabled by ${NO_BUILD_ENV})"
+        ));
+    } else if let Some(HelperBuild::Failed(detail)) = helper_build_outcome() {
+        reason.push_str(&format!(" (the on-demand build failed: {detail})"));
+    }
+    reason
+}
+
+/// The environment variable that switches the **on-demand helper build** off.
+///
+/// Set it (to any non-empty value) in a tree that must never invoke the build system: the
+/// live-distribution command cases then report the loud `skipped` documented on
+/// [`helper_unsupported_reason`] instead of building `dist_probe`.
+pub const NO_BUILD_ENV: &str = "DIFFERENTIAL_NO_BUILD";
+
+/// The workspace package that produces the `dist_probe` helper binary.
+const HELPER_PACKAGE: &str = "beam_dist";
+
+/// How much of a failed build's `stderr` is kept in the skip reason (cargo's diagnosis is at
+/// the end of its output, so the **tail** is kept).
+const BUILD_DETAIL_MAX: usize = 2000;
+
+/// What [`ensure_helper`] found — or, when nothing was resolvable, built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperStatus {
+    /// A `dist_probe` helper is available.
+    Available {
+        /// The resolved helper (the Rust side of the live loopback cases).
+        spec: RuntimeSpec,
+        /// `true` when this process had to run the one-shot on-demand build to obtain it,
+        /// `false` when it was already resolvable.
+        built_on_demand: bool,
+    },
+    /// No helper could be obtained; `reason` is the loud skip reason to report — never a
+    /// fabricated pass and never agreement.
+    Unavailable(String),
+}
+
+/// Resolve the distribution helper, building it **once** on demand when it is missing.
+///
+/// This is the *binary's* entry point (`run`/`suite` of a case that needs the helper); the
+/// library's [`resolve_helper`] stays a pure lookup, which is what the integration tests rely
+/// on (they inject `$BEAM_DIST_PROBE`).
+///
+/// Policy, in order:
+///
+/// 1. a resolvable helper ([`resolve_helper`]) always wins — the environment override and the
+///    workspace `target/{release,debug}` artifacts are never overridden by a build;
+/// 2. otherwise, if `$DIFFERENTIAL_NO_BUILD` is set to a non-empty value, nothing is built and
+///    the result is [`HelperStatus::Unavailable`] (a loud *skipped*);
+/// 3. otherwise `scripts/cargo.sh build --manifest-path <workspace>/Cargo.toml -p beam_dist`
+///    runs **at most once per process** (the outcome is cached in a [`OnceLock`]), with its
+///    stdin closed and its output captured, and the helper is re-resolved afterwards.
+///
+/// The build is *not* an error path: a failed build — for any reason, including a broken build
+/// environment — yields [`HelperStatus::Unavailable`] carrying cargo's diagnosis, so the
+/// affected cases stay a loud *skipped*. Nothing here can turn a missing helper into agreement.
+pub fn ensure_helper() -> Result<HelperStatus> {
+    let resolved = resolve_helper()?;
+    let no_build = std::env::var_os(NO_BUILD_ENV);
+    match helper_plan(resolved.is_some(), no_build.as_deref()) {
+        HelperPlan::UseResolved => Ok(HelperStatus::Available {
+            spec: resolved.expect("`helper_plan` reports `UseResolved` only for a resolved helper"),
+            built_on_demand: false,
+        }),
+        HelperPlan::BuildDisabled => Ok(HelperStatus::Unavailable(helper_unsupported_reason())),
+        HelperPlan::Build => match helper_build_slot()
+            .get_or_init(|| run_helper_build(Path::new(env!("CARGO_MANIFEST_DIR"))))
+        {
+            HelperBuild::Failed(_) => Ok(HelperStatus::Unavailable(helper_unsupported_reason())),
+            HelperBuild::Built => match resolve_helper()? {
+                Some(spec) => Ok(HelperStatus::Available {
+                    spec,
+                    built_on_demand: true,
+                }),
+                None => Ok(HelperStatus::Unavailable(format!(
+                    "{} (the on-demand `cargo build -p {HELPER_PACKAGE}` succeeded but produced no \
+                     dist_probe artifact under the workspace target directory — is \
+                     $CARGO_TARGET_DIR redirected?)",
+                    helper_unsupported_reason()
+                ))),
+            },
+        },
+    }
+}
+
+/// What to do about the helper before the corpus runs (the pure core of [`ensure_helper`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperPlan {
+    /// A helper is already resolvable — use it and never build.
+    UseResolved,
+    /// No helper and `$DIFFERENTIAL_NO_BUILD` forbids building — skip loudly.
+    BuildDisabled,
+    /// No helper and building is allowed — build it (at most once per process).
+    Build,
+}
+
+/// Decide whether a resolved helper is used, the build is refused, or the helper is built.
+///
+/// * `helper_resolved` — whether [`resolve_helper`] found a helper;
+/// * `no_build` — the value of `$DIFFERENTIAL_NO_BUILD`, if set.
+///
+/// A resolved helper always wins (the build is a *last resort*, never a way to replace what the
+/// environment or the workspace already provides), and the opt-out is honoured only when there
+/// is nothing to use anyway.
+fn helper_plan(helper_resolved: bool, no_build: Option<&OsStr>) -> HelperPlan {
+    if helper_resolved {
+        HelperPlan::UseResolved
+    } else if no_build_requested(no_build) {
+        HelperPlan::BuildDisabled
+    } else {
+        HelperPlan::Build
+    }
+}
+
+/// Whether `$DIFFERENTIAL_NO_BUILD` forbids the on-demand build (`set and non-empty`).
+fn no_build_requested(no_build: Option<&OsStr>) -> bool {
+    no_build.is_some_and(|value| !value.is_empty())
+}
+
+/// The one-shot outcome of the on-demand helper build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelperBuild {
+    /// `cargo build -p beam_dist` succeeded (the artifact is re-resolved by the caller).
+    Built,
+    /// It failed — the message is cargo's diagnosis, kept for the skip reason.
+    Failed(String),
+}
+
+/// The process-wide slot holding the on-demand build's outcome.
+fn helper_build_slot() -> &'static OnceLock<HelperBuild> {
+    static BUILD: OnceLock<HelperBuild> = OnceLock::new();
+    &BUILD
+}
+
+/// The cached build outcome **without** triggering a build (`None` = never attempted).
+fn helper_build_outcome() -> Option<&'static HelperBuild> {
+    helper_build_slot().get()
+}
+
+/// Build the `dist_probe` helper through the committed workspace cargo wrapper.
+///
+/// `manifest_dir` is this crate's directory (`$CARGO_MANIFEST_DIR`), so the workspace root and
+/// the wrapper are derived, never baked in. The child runs with its stdin closed and its output
+/// captured: nothing is streamed into the harness's own stdout/stderr, and the caller decides
+/// what to report.
+fn run_helper_build(manifest_dir: &Path) -> HelperBuild {
+    let Some(workspace) = workspace_root(manifest_dir) else {
+        return HelperBuild::Failed(format!(
+            "cannot derive the erts_rust workspace root from CARGO_MANIFEST_DIR='{}'",
+            manifest_dir.display()
+        ));
+    };
+    let wrapper = workspace.join("scripts").join("cargo.sh");
+    if !wrapper.is_file() {
+        return HelperBuild::Failed(format!(
+            "the workspace cargo wrapper '{}' does not exist",
+            wrapper.display()
+        ));
+    }
+    let manifest = workspace.join("Cargo.toml");
+    let mut cmd = Command::new(&wrapper);
+    cmd.arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .arg("-p")
+        .arg(HELPER_PACKAGE)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match output_with_retry(&mut cmd) {
+        Ok(output) if output.status.success() => HelperBuild::Built,
+        Ok(output) => HelperBuild::Failed(build_failure_detail(&output)),
+        Err(err) => HelperBuild::Failed(format!("failed to run '{}': {err}", wrapper.display())),
+    }
+}
+
+/// The workspace root (`…/erts_rust`) this crate lives in — the same derivation
+/// [`resolve_helper_from`] uses for `target/`.
+fn workspace_root(manifest_dir: &Path) -> Option<&Path> {
+    manifest_dir.parent().and_then(Path::parent)
+}
+
+/// A bounded, human-readable summary of a failed build: the exit status plus the tail of the
+/// build's `stderr` (cargo's diagnosis), so the skip reason stays readable in a report.
+fn build_failure_detail(output: &std::process::Output) -> String {
+    let status = output
+        .status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return format!("`cargo build -p {HELPER_PACKAGE}` exited {status} with no stderr");
+    }
+    format!(
+        "`cargo build -p {HELPER_PACKAGE}` exited {status}: {}",
+        tail(stderr, BUILD_DETAIL_MAX)
+    )
+}
+
+/// The last `max` bytes of `text`, cut on a char boundary (keeping the tail, where cargo puts
+/// its diagnosis).
+fn tail(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// Build the argv for an evaluation: `["-noshell", <extra…>, "-eval", <expr>]`.
@@ -555,7 +785,7 @@ mod tests {
         RuntimeSource, RuntimeSpec,
     };
     use crate::error::Error;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -812,6 +1042,107 @@ mod tests {
         let reason = super::helper_unsupported_reason();
         assert!(reason.contains("$BEAM_DIST_PROBE"), "{reason}");
         assert!(reason.contains("dist_probe"), "{reason}");
+    }
+
+    /// The build policy: a resolved helper always wins, the build is a last resort, and
+    /// `$DIFFERENTIAL_NO_BUILD` (set and non-empty) refuses it.
+    ///
+    /// These are the decisions [`super::ensure_helper`] makes; the build itself is never
+    /// exercised here (a unit test must not invoke cargo).
+    #[test]
+    fn a_resolved_helper_is_never_replaced_by_an_on_demand_build() {
+        use super::{helper_plan, HelperPlan};
+        let opt_out = OsString::from("1");
+        assert_eq!(helper_plan(true, None), HelperPlan::UseResolved);
+        assert_eq!(
+            helper_plan(true, Some(opt_out.as_os_str())),
+            HelperPlan::UseResolved,
+            "the opt-out is irrelevant when a helper is already resolvable"
+        );
+    }
+
+    #[test]
+    fn the_on_demand_build_runs_only_without_a_helper_and_without_the_opt_out() {
+        use super::{helper_plan, no_build_requested, HelperPlan};
+        assert_eq!(
+            helper_plan(false, None),
+            HelperPlan::Build,
+            "no helper and no opt-out ⇒ build it (once)"
+        );
+        assert_eq!(
+            helper_plan(false, Some(OsStr::new(""))),
+            HelperPlan::Build,
+            "an empty $DIFFERENTIAL_NO_BUILD is 'not set'"
+        );
+        assert_eq!(
+            helper_plan(false, Some(OsStr::new("1"))),
+            HelperPlan::BuildDisabled
+        );
+        assert_eq!(
+            helper_plan(false, Some(OsStr::new("yes-anything"))),
+            HelperPlan::BuildDisabled,
+            "any non-empty value switches the build off"
+        );
+
+        assert!(!no_build_requested(None));
+        assert!(!no_build_requested(Some(OsStr::new(""))));
+        assert!(no_build_requested(Some(OsStr::new(" "))));
+        assert!(no_build_requested(Some(OsStr::new("0"))));
+    }
+
+    /// A multi-byte character straddling the cut is dropped whole, never split — the tail is
+    /// always a valid `&str`.
+    #[test]
+    fn tail_keeps_the_end_of_the_text_on_a_char_boundary() {
+        use super::tail;
+        assert_eq!(tail("abc", 8), "abc", "short text is returned unchanged");
+        assert_eq!(tail("abcdef", 3), "def");
+        let umlauts = "äöü"; // two bytes per character
+        assert_eq!(tail(umlauts, 5), "öü");
+        assert_eq!(tail(umlauts, 3), "ü");
+    }
+
+    /// A failed build must be reported with cargo's own diagnosis (the **tail** of its stderr,
+    /// where the diagnosis sits) and with a bounded reason: loud, never silent, never huge.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_build_is_reported_with_the_bounded_tail_of_cargos_diagnosis() {
+        use super::{build_failure_detail, BUILD_DETAIL_MAX};
+        use std::os::unix::process::ExitStatusExt;
+
+        let stderr = format!("{}\ndiagnosis: missing dependency\n", "x".repeat(4000));
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(101 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.clone().into_bytes(),
+        };
+        let detail = build_failure_detail(&output);
+        assert!(
+            detail.starts_with("`cargo build -p beam_dist` exited 101: "),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with("diagnosis: missing dependency"),
+            "the tail (where cargo puts the diagnosis) is kept: {detail}"
+        );
+        assert!(
+            detail.len() < stderr.len(),
+            "the reason is bounded: {} bytes for a {}-byte stderr",
+            detail.len(),
+            stderr.len()
+        );
+        assert!(BUILD_DETAIL_MAX < stderr.len());
+
+        let silent = std::process::Output {
+            status: std::process::ExitStatus::from_raw(3 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            build_failure_detail(&silent),
+            "`cargo build -p beam_dist` exited 3 with no stderr",
+            "a silent failure is still explicit about the exit status"
+        );
     }
 
     #[test]

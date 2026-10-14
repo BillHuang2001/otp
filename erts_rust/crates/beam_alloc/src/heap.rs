@@ -38,7 +38,7 @@ use core::alloc::Layout;
 use core::mem::size_of;
 use core::ptr::NonNull;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::prelude::Eterm;
 
 use crate::allocator::{AllocRef, MIN_ALIGN};
@@ -94,9 +94,45 @@ impl Heap {
     }
 
     /// Rewinds the bump pointer. This invalidates **all** previously handed-out
-    /// pointers (the GC calls it only after copying live terms out).
+    /// pointers (the GC calls it only after copying live terms out). Equivalent to
+    /// [`reset_to(0)`](Heap::reset_to).
     pub fn reset(&mut self) {
         self.used = 0;
+    }
+
+    /// Rewinds the bump pointer to the position it had when exactly `used` words had
+    /// been handed out: those first `used` words stay owned, everything after them is
+    /// freed. This is the exact inverse of allocating `used` words — `used` counts
+    /// **term words** ([`used`](Heap::used)'s unit), not bytes and not a pointer — so
+    /// `reset_to(0)` is exactly [`reset`](Heap::reset).
+    ///
+    /// [`reset`](Heap::reset) can only empty a heap; `reset_to` also lets a caller that
+    /// took a **mark** (`heap.used()`) before some per-call work give back precisely
+    /// the words that call handed out. That matters for a *pooled* heap: it may reach
+    /// the caller already holding words another caller still owns, which a rewind to
+    /// the base would recycle (see the crate `CONTEXT.md`).
+    ///
+    /// A pointer handed out at or after `hp()`-at-`used` is invalidated; pointers into
+    /// the first `used` words stay valid (the block is never reallocated) and their
+    /// contents are **not** touched — the freed region is not wiped, only reused.
+    /// [`peak_used`](Heap::peak_used) is a property of the live-word history rather
+    /// than of the current offset, so it is preserved exactly as `reset` preserves it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when `used` exceeds the current [`used`](Heap::used) offset.
+    /// Rewinding *forward* would claim words the heap never handed out: they are
+    /// uninitialised and may not even be this caller's to own, so the offset is
+    /// **never** silently clamped. On that error the heap is left completely unchanged
+    /// (the same refusal-without-side-effects rule
+    /// [`ReservedHeap::relocate`](crate::reserved_heap::ReservedHeap::relocate) applies
+    /// to a reservation smaller than its live words).
+    pub fn reset_to(&mut self, used: usize) -> Result<()> {
+        if used > self.used {
+            return Err(BeamError::BadArg);
+        }
+        self.used = used;
+        Ok(())
     }
 
     /// The current allocation pointer (`hp`).
@@ -548,6 +584,170 @@ mod tests {
             assert_eq!(*p.add(1), make_small(22));
         }
         assert_eq!(heap.peak_used(), 3);
+    }
+
+    #[test]
+    fn reset_to_zero_is_exactly_reset() {
+        // Two heaps in the same state, one rewound with `reset()` and one with
+        // `reset_to(0)`: they must be indistinguishable afterwards.
+        let (_a, mut to_zero) = new_heap(8);
+        let (_b, mut emptied) = new_heap(8);
+        let hp_base = to_zero.hp();
+
+        for heap in [&mut to_zero, &mut emptied] {
+            // SAFETY: 5 of 8 words, each written before it is read.
+            let p = unsafe { heap.alloc_words(5) }.expect("5 of 8 words fit");
+            // SAFETY: `p` is the base of those 5 exclusively-owned words.
+            unsafe {
+                for i in 0..5 {
+                    *p.add(i) = make_small(i as i64);
+                }
+            }
+            assert_eq!(heap.used(), 5);
+        }
+
+        emptied.reset();
+        to_zero.reset_to(0).expect("0 never exceeds the used offset");
+
+        assert_eq!(to_zero.used(), emptied.used());
+        assert_eq!(to_zero.used(), 0);
+        assert_eq!(to_zero.capacity(), emptied.capacity());
+        assert_eq!(to_zero.available(), 8);
+        assert_eq!(to_zero.available(), emptied.available());
+        assert_eq!(to_zero.hp(), hp_base);
+        assert_eq!(hp_span(&to_zero), hp_span(&emptied));
+        assert_eq!(hp_span(&to_zero), 8 * WORD);
+        assert_eq!(to_zero.peak_used(), 5, "the high-water mark survives");
+        assert_eq!(to_zero.peak_used(), emptied.peak_used());
+
+        // And the same words are handed out again, exactly as after `reset()`.
+        // SAFETY: 5 of 8 words; the block is never reallocated or wiped.
+        unsafe {
+            let p = to_zero.alloc_words(5).expect("5 of 8 words fit");
+            assert_eq!(p, hp_base);
+            assert_eq!(signed_value(*p), 0);
+            assert_eq!(signed_value(*p.add(4)), 4);
+        }
+        assert_eq!(to_zero.used(), 5);
+    }
+
+    #[test]
+    fn reset_to_a_mark_keeps_the_live_prefix_and_reuses_the_freed_words() {
+        let (_alloc, mut heap) = new_heap(8);
+
+        // The live prefix: the first two words.
+        // SAFETY: 3 of 8 words, all written in the next statement.
+        let p = unsafe { heap.alloc_words(3) }.expect("3 of 8 words fit");
+        // SAFETY: `p` is the base of those 3 exclusively-owned words.
+        unsafe {
+            *p = make_small(11);
+            *p.add(1) = make_small(22);
+            *p.add(2) = make_small(33);
+        }
+        let mark = heap.used() - 1;
+        assert_eq!(mark, 2, "the mark keeps the first two words");
+
+        // A per-call tail beyond the mark: the third word plus one more.
+        // SAFETY: 1 of the 5 remaining words.
+        unsafe { heap.alloc_words(1) }.expect("1 of 5 remaining words fits");
+        assert_eq!(heap.used(), 4);
+        assert_eq!(heap.peak_used(), 4);
+
+        heap.reset_to(mark).expect("a mark never exceeds the used offset");
+
+        assert_eq!(heap.used(), 2, "the live prefix is still owned");
+        assert_eq!(heap.available(), 6);
+        assert_eq!(hp_span(&heap), 6 * WORD);
+        assert_eq!(heap.hp() as usize - p as usize, 2 * WORD);
+        assert_eq!(heap.peak_used(), 4, "a rewind never lowers the peak");
+
+        // The live prefix reads back untouched; the freed region is not wiped either,
+        // it is only made available again (`reset_to` frees, it does not clear).
+        // SAFETY: `p` reads back words initialised above, all still inside the block.
+        unsafe {
+            assert_eq!(signed_value(*p), 11);
+            assert_eq!(signed_value(*p.add(1)), 22);
+            assert_eq!(signed_value(*p.add(2)), 33, "the freed region is reused, not cleared");
+        }
+
+        // A subsequent allocation starts exactly where the rewind cut the heap off.
+        // SAFETY: 2 of the 6 available words.
+        let reused = unsafe { heap.alloc_words(2) }.expect("2 of 6 words fit");
+        // SAFETY: `p.add(2)` is the first word after the live prefix.
+        unsafe { assert_eq!(reused, p.add(2)) };
+        assert_eq!(heap.used(), 4, "the rewind + realloc lands on the old offset");
+        assert_eq!(heap.peak_used(), 4);
+    }
+
+    #[test]
+    fn reset_to_the_current_offset_is_a_no_op_and_the_boundaries_hold() {
+        let (_alloc, mut heap) = new_heap(4);
+        let hp_base = heap.hp();
+
+        // Rewinding an empty heap to the current offset (and to 0) changes nothing.
+        heap.reset_to(0).expect("0 is a legal mark");
+        heap.reset_to(heap.used()).expect("0 is a legal mark");
+        assert_eq!(heap.used(), 0);
+        assert_eq!(heap.available(), 4);
+        assert_eq!(heap.hp(), hp_base);
+        assert_eq!(heap.peak_used(), 0);
+
+        // A full heap rewinds to its own current offset: a no-op...
+        // SAFETY: exactly the 4 words of capacity.
+        unsafe { heap.alloc_words(4) }.expect("4 of 4 words fit");
+        assert_eq!(heap.hp(), heap.hend());
+        heap.reset_to(heap.used()).expect("the current offset is legal");
+        assert_eq!(heap.used(), 4);
+        assert_eq!(heap.available(), 0);
+        assert_eq!(heap.hp(), heap.hend());
+
+        // ...and exactly the tail is released, never more.
+        heap.reset_to(1).expect("a mid mark on a full heap is legal");
+        assert_eq!(heap.used(), 1);
+        assert_eq!(heap.available(), 3);
+        assert_eq!(hp_span(&heap), 3 * WORD);
+        assert_eq!(heap.peak_used(), 4, "the peak is history, not the offset");
+
+        // The boundary is inclusive: 1 is legal, 2 is not (only one word is owned).
+        heap.reset_to(1).expect("the exact current offset is legal");
+        assert!(matches!(heap.reset_to(2), Err(BeamError::BadArg)));
+    }
+
+    #[test]
+    fn reset_to_beyond_the_used_offset_is_a_typed_failure_that_changes_nothing() {
+        let (_alloc, mut heap) = new_heap(8);
+        // SAFETY: 2 of 8 words, written in the next statement.
+        let p = unsafe { heap.alloc_words(2) }.expect("2 of 8 words fit");
+        // SAFETY: `p` is the base of those 2 exclusively-owned words.
+        unsafe {
+            *p = make_small(7);
+            *p.add(1) = make_small(8);
+        }
+        let hp_before = heap.hp();
+        let peak_before = heap.peak_used();
+
+        // One word past the offset, the whole capacity, and an unrepresentable count are
+        // all refused identically: a rewind can never move the offset *forward*.
+        for bad in [heap.used() + 1, heap.capacity(), heap.capacity() + 1, usize::MAX] {
+            assert!(
+                matches!(heap.reset_to(bad), Err(BeamError::BadArg)),
+                "rewinding forward to {bad} must be a typed badarg"
+            );
+            assert_eq!(heap.used(), 2, "a refused rewind frees nothing");
+            assert_eq!(heap.hp(), hp_before, "and it leaves the bump pointer alone");
+            assert_eq!(heap.available(), 6);
+            assert_eq!(heap.peak_used(), peak_before);
+        }
+
+        // Nothing was half-applied: the live words are still live and the heap still
+        // accepts a legal mark.
+        // SAFETY: `p`'s two words were initialised above and were never freed.
+        unsafe {
+            assert_eq!(signed_value(*p), 7);
+            assert_eq!(signed_value(*p.add(1)), 8);
+        }
+        heap.reset_to(1).expect("a legal mark is still accepted");
+        assert_eq!(heap.used(), 1);
     }
 
     #[test]

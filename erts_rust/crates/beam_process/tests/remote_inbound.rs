@@ -46,8 +46,9 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_process::prelude::*;
 use beam_term::prelude::{
-    boxed_val, external_pid_size_words, is_external_pid, make_atom, make_small, signed_value,
-    tuple_element, tuple_size, write_external_pid, AtomTable, Eterm,
+    boxed_val, external_pid_size_words, external_ref_size_words, is_external_pid, is_external_ref,
+    make_atom, make_header, make_small, signed_value, tuple_element, tuple_size, write_external_pid,
+    write_external_ref, AtomTable, Eterm, EXTERNAL_REF_SUBTAG,
 };
 
 /// A distribution seam that records every routed signal instead of touching a socket.
@@ -113,6 +114,21 @@ fn remote_pid(heap: &mut Heap, node: Eterm, number: u32, serial: u32, creation: 
     // SAFETY: `p` addresses the four words just handed out and `write_external_pid` writes all
     // of them before the pointer escapes; `node` is a live atom term.
     unsafe { write_external_pid(p, node, number, serial, creation) }
+}
+
+/// Builds an external reference term on `heap` (the frozen
+/// `[header, node, creation, data.ui32]` thing) — the shape a peer's `DOP_MONITOR_P` `Ref`
+/// arrives as.
+fn remote_ref(heap: &mut Heap, node: Eterm, ids: &[u32], creation: u32) -> Eterm {
+    // SAFETY: `heap` hands out `external_ref_size_words(ids.len())` exclusively-owned, writable
+    // words (and `ids.len() <= MAX_REF_IDS` at every call site here).
+    let p = unsafe {
+        heap.alloc_words(external_ref_size_words(ids.len()))
+            .expect("the heap has room")
+    };
+    // SAFETY: `p` addresses those words and `write_external_ref` writes all of them before the
+    // pointer escapes; `node` is a live atom term.
+    unsafe { write_external_ref(p, node, ids, creation) }
 }
 
 /// The payload of `pid`'s single queued message (panics unless exactly one is queued).
@@ -572,7 +588,7 @@ fn monitor_from_remote_records_and_demonitor_removes() {
     assert_eq!(
         table.remote_watchers(watched),
         &[RemoteWatcher {
-            reference,
+            reference: RemoteWatcherRef::Local(reference),
             watcher: rpid,
             kind: MonitorKind::Process,
         }]
@@ -610,10 +626,10 @@ fn monitor_from_remote_records_and_demonitor_removes() {
         .demonitor_from_remote(watched, reference)
         .expect("watched is live");
     assert_eq!(table.remote_watchers(watched).len(), 1);
-    assert!(matches!(
+    assert_eq!(
         table.remote_watchers(watched)[0].reference,
-        r if r == second
-    ));
+        RemoteWatcherRef::Local(second)
+    );
     assert!(log.borrow().is_empty(), "an inbound DOP_DEMONITOR_P is never echoed");
 
     // Removing an absent reference is a no-op; removing the last one empties the entry.
@@ -676,7 +692,7 @@ fn demonitor_from_remote_removes_only_its_reference_on_that_process() {
     assert_eq!(
         table.remote_watchers(watched),
         &[RemoteWatcher {
-            reference: r2,
+            reference: RemoteWatcherRef::Local(r2),
             watcher: second,
             kind: MonitorKind::Process,
         }],
@@ -697,7 +713,7 @@ fn demonitor_from_remote_removes_only_its_reference_on_that_process() {
     assert_eq!(
         table.remote_watchers(watched),
         &[RemoteWatcher {
-            reference: r2,
+            reference: RemoteWatcherRef::Local(r2),
             watcher: second,
             kind: MonitorKind::Process,
         }],
@@ -742,7 +758,7 @@ fn an_incoming_watcher_record_is_dropped_by_death_and_by_demonitor() {
     assert_eq!(
         table.remote_watchers(dying),
         &[RemoteWatcher {
-            reference,
+            reference: RemoteWatcherRef::Local(reference),
             watcher,
             kind: MonitorKind::Port,
         }],
@@ -795,7 +811,198 @@ fn remote_monitor_apis_of_an_unknown_process_are_term_not_found() {
     assert!(log.borrow().is_empty());
 }
 
-// --- DOP_MONITOR_P_EXIT / DOP_PAYLOAD_MONITOR_P_EXIT ------------------------
+// --- DOP_MONITOR_P / DOP_DEMONITOR_P (a peer-minted wire reference) ----------
+
+#[test]
+fn monitor_from_remote_ref_records_and_demonitor_from_remote_ref_removes() {
+    // The wire shape: the **peer** mints the reference, so a `DOP_MONITOR_P`'s `Ref` is a full
+    // external reference. It is stored faithfully as a decomposed `RemoteRef` — no lossy `u64`
+    // pack — and the matching `DOP_DEMONITOR_P` cancels exactly that record.
+    let (mut table, _names, node, log) = fixture();
+    let mut heap = Heap::new(64).expect("test heap");
+    let watched = table.spawn_default().expect("watched");
+    let other = table.spawn_default().expect("other");
+    let watcher = RemotePid::from_eterm(remote_pid(&mut heap, node, 51, 52, 53)).expect("ext");
+    let reference = RemoteRef::from_eterm(remote_ref(&mut heap, node, &[1, 2, 3], 0x1234))
+        .expect("a peer-minted reference");
+
+    table
+        .monitor_from_remote_ref(watched, watcher, reference, MonitorKind::Process)
+        .expect("watched is live");
+    assert_eq!(
+        table.remote_watchers(watched),
+        &[RemoteWatcher {
+            reference: RemoteWatcherRef::Remote(reference),
+            watcher,
+            kind: MonitorKind::Process,
+        }]
+    );
+    assert!(
+        table.get(watched).expect("watched").monitored_by().is_empty(),
+        "an incoming remote watcher never enters the local MonitoredBy set"
+    );
+    assert!(
+        log.borrow().is_empty(),
+        "an inbound DOP_MONITOR_P is never echoed (`dist.c:2378`)"
+    );
+
+    // The same peer reference recorded for a **different** local process is independent.
+    table
+        .monitor_from_remote_ref(other, watcher, reference, MonitorKind::Process)
+        .expect("other is live");
+
+    table
+        .demonitor_from_remote_ref(watched, reference)
+        .expect("watched is live");
+    assert!(
+        table.remote_watchers(watched).is_empty(),
+        "the matching peer record goes"
+    );
+    assert_eq!(
+        table.remote_watchers(other).len(),
+        1,
+        "another local process's identical peer reference is untouched"
+    );
+    assert_eq!(table.remote_watchers(other)[0].watcher, watcher);
+
+    // Removing an already-gone reference is an `Ok` no-op and resurrects nothing.
+    table
+        .demonitor_from_remote_ref(watched, reference)
+        .expect("watched is live");
+    assert!(table.remote_watchers(watched).is_empty());
+    assert!(matches!(
+        table.demonitor_from_remote_ref(ProcessId::new(203, 0), reference),
+        Err(BeamError::TermNotFound)
+    ));
+    assert!(
+        log.borrow().is_empty(),
+        "an inbound DOP_DEMONITOR_P is never echoed"
+    );
+}
+
+#[test]
+fn two_distinct_peer_references_on_one_process_never_collapse() {
+    // Under a lossy `u64` pack two distinct peer references of one local process could collapse
+    // into a single `RemoteWatcher` — a replaced watcher, or a `demonitor` cancelling the wrong
+    // monitor. The decomposed `RemoteRef` key makes that impossible: both coexist and each
+    // demonitor removes only its own.
+    let (mut table, _names, node, log) = fixture();
+    let mut heap = Heap::new(64).expect("test heap");
+    let watched = table.spawn_default().expect("watched");
+    let first_watcher = RemotePid::from_eterm(remote_pid(&mut heap, node, 61, 62, 63)).expect("ext");
+    let second_watcher =
+        RemotePid::from_eterm(remote_pid(&mut heap, node, 71, 72, 73)).expect("ext");
+
+    // The two references carry the same id words but a **different node creation**: both would
+    // fold together under a pack that ignores the creation.
+    let ref_a = RemoteRef::from_eterm(remote_ref(&mut heap, node, &[0, 0, 7], 0xAAAA)).expect("a");
+    let ref_b = RemoteRef::from_eterm(remote_ref(&mut heap, node, &[0, 0, 7], 0xBBBB)).expect("b");
+    assert_ne!(ref_a, ref_b, "distinct peer references");
+
+    table
+        .monitor_from_remote_ref(watched, first_watcher, ref_a, MonitorKind::Process)
+        .expect("watched is live");
+    table
+        .monitor_from_remote_ref(watched, second_watcher, ref_b, MonitorKind::Process)
+        .expect("watched is live");
+    assert_eq!(
+        table.remote_watchers(watched).len(),
+        2,
+        "both peer monitors are recorded"
+    );
+
+    table
+        .demonitor_from_remote_ref(watched, ref_a)
+        .expect("watched is live");
+    assert_eq!(
+        table.remote_watchers(watched),
+        &[RemoteWatcher {
+            reference: RemoteWatcherRef::Remote(ref_b),
+            watcher: second_watcher,
+            kind: MonitorKind::Process,
+        }],
+        "only the demonitored peer reference goes"
+    );
+
+    table
+        .demonitor_from_remote_ref(watched, ref_b)
+        .expect("watched is live");
+    assert!(table.remote_watchers(watched).is_empty());
+    assert!(log.borrow().is_empty());
+}
+
+#[test]
+fn a_remote_ref_round_trips_through_eterm() {
+    let (_table, _names, node, _log) = fixture();
+    let mut heap = Heap::new(64).expect("test heap");
+
+    // `NEWER_REFERENCE_EXT` on a 64-bit node: three id words.
+    let term = remote_ref(
+        &mut heap,
+        node,
+        &[0xDEAD_BEEF, 0xFEED_FACE, 0x0BAD_F00D],
+        0x5A5A_5A5A,
+    );
+    // SAFETY: `term` is the live external reference thing `remote_ref` just wrote.
+    assert!(unsafe { is_external_ref(term) });
+    let reference = RemoteRef::from_eterm(term).expect("an external reference");
+    assert_eq!(reference.node(), node);
+    assert_eq!(reference.ids(), &[0xDEAD_BEEF, 0xFEED_FACE, 0x0BAD_F00D]);
+    assert_eq!(reference.creation(), 0x5A5A_5A5A);
+
+    // The exact inverse: the decomposed parts materialise an equal reference on another heap.
+    let mut other_heap = Heap::new(64).expect("test heap");
+    let again = reference.to_eterm(&mut other_heap).expect("the ref fits");
+    assert_eq!(RemoteRef::from_eterm(again).expect("round-trips"), reference);
+
+    // A zero-id reference is representable (`external_ref_size_words(0) == 4`).
+    let zero = RemoteRef::from_eterm(remote_ref(&mut heap, node, &[], 7)).expect("zero ids");
+    assert!(zero.ids().is_empty());
+    assert_eq!(zero.creation(), 7);
+    assert_eq!(
+        RemoteRef::from_eterm(zero.to_eterm(&mut other_heap).expect("fits"))
+            .expect("round-trips"),
+        zero
+    );
+}
+
+#[test]
+fn remote_ref_from_eterm_rejects_a_non_reference() {
+    let (_table, _names, node, _log) = fixture();
+    let mut heap = Heap::new(64).expect("test heap");
+
+    // An immediate is not a reference.
+    assert!(matches!(
+        RemoteRef::from_eterm(make_small(1)),
+        Err(BeamError::BadArg)
+    ));
+    // Neither is an atom ...
+    assert!(matches!(
+        RemoteRef::from_eterm(node),
+        Err(BeamError::BadArg)
+    ));
+    // ... nor an external **pid** (`is_external_ref` checks the subtag, not just "boxed thing").
+    let pid = remote_pid(&mut heap, node, 1, 2, 3);
+    assert!(matches!(
+        RemoteRef::from_eterm(pid),
+        Err(BeamError::BadArg)
+    ));
+
+    // A block whose data section cannot even hold the count word is corrupt: refused rather
+    // than read a word the block does not have (`arity 2` ⇒ `[header, node, creation]`).
+    let p = unsafe { heap.alloc_words(3).expect("the heap has room") };
+    // SAFETY: `p` addresses the three words just handed out; every one is written here.
+    let corrupt = unsafe {
+        *p = make_header(2, EXTERNAL_REF_SUBTAG);
+        *p.add(1) = node;
+        *p.add(2) = make_small(0);
+        beam_term::prelude::make_boxed(p as *const Eterm)
+    };
+    assert!(matches!(
+        RemoteRef::from_eterm(corrupt),
+        Err(BeamError::BadArg)
+    ));
+}
 
 #[test]
 fn remote_monitor_down_delivers_the_down_and_drops_the_outgoing_record_without_routing() {

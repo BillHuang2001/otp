@@ -213,6 +213,48 @@ pub(crate) fn group() -> Vec<Case> {
             "element(1, catch process_flag(priority, bogus))",
             "ok 'EXIT'",
         ),
+        // --- widened: the DOWN message's reference/pid identity --------------------------
+        case(
+            "proc_control/down_message_carries_the_monitor_ref",
+            "a monitored process killed with exit/2 delivers the monitor's own ref and pid",
+            "begin P = spawn(fun() -> receive stop -> ok end end), \
+             M = monitor(process, P), exit(P, kill), \
+             receive {DOWN, Ref, process, Q, killed} -> {Ref =:= M, Q =:= P} \
+             after 2000 -> timeout end end",
+            "ok {true,true}",
+        ),
+        // --- widened: link/unlink, save_calls and the aliveness predicate -----------------
+        case(
+            "proc_control/link_returns_true",
+            "erlang:link/1 returns true for a freshly spawned process",
+            "begin link(spawn(fun() -> receive stop -> ok end end)), ok end",
+            "ok ok",
+        ),
+        case(
+            "proc_control/process_flag_save_calls_returns_ok",
+            "process_flag(save_calls, N) is accepted and returns ok",
+            "begin process_flag(save_calls, 100), ok end",
+            "ok ok",
+        ),
+        case(
+            "proc_control/is_process_alive_spawned_process",
+            "erlang:is_process_alive/1 is true for a spawned, blocked process",
+            "begin P = spawn(fun() -> receive stop -> ok end end), is_process_alive(P) end",
+            "ok true",
+        ),
+        // --- widened: registration and the priority projection ----------------------------
+        case(
+            "proc_control/register_then_whereis_is_pid",
+            "register/2 then whereis/1 resolves the name to a pid",
+            "begin register(proc_ctl_where, self()), is_pid(whereis(proc_ctl_where)) end",
+            "ok true",
+        ),
+        case(
+            "proc_control/process_info_priority_is_normal",
+            "process_info(self(), priority) reports the normal run-queue priority",
+            "element(2, process_info(self(), priority))",
+            "ok normal",
+        ),
     ]
 }
 
@@ -227,6 +269,7 @@ mod tests {
         "proc_control/monitor_of_finished_process_is_reference",
         "proc_control/down_message_on_killed_process",
         "proc_control/down_message_on_exit_kill",
+        "proc_control/down_message_carries_the_monitor_ref",
     ];
 
     /// The `exit/1,2` cases.
@@ -246,6 +289,7 @@ mod tests {
         "proc_control/register_then_whereis_is_self",
         "proc_control/unregister_then_whereis_is_undefined",
         "proc_control/register_duplicate_name_is_badarg",
+        "proc_control/register_then_whereis_is_pid",
     ];
 
     /// The run-queue priority cases.
@@ -253,6 +297,14 @@ mod tests {
         "proc_control/priority_high_then_max",
         "proc_control/priority_walks_all_four_levels",
         "proc_control/priority_bogus_is_badarg",
+        "proc_control/process_info_priority_is_normal",
+    ];
+
+    /// The link/unlink and process-flag cases.
+    const LINK_AND_FLAG_CASES: &[&str] = &[
+        "proc_control/link_returns_true",
+        "proc_control/process_flag_save_calls_returns_ok",
+        "proc_control/is_process_alive_spawned_process",
     ];
 
     fn case<'a>(cases: &'a [Case], id: &str) -> &'a Case {
@@ -271,6 +323,7 @@ mod tests {
             .chain(EXIT_CASES)
             .chain(REGISTRATION_CASES)
             .chain(PRIORITY_CASES)
+            .chain(LINK_AND_FLAG_CASES)
         {
             let case = case(cases, id);
             assert_eq!(case.contracts, &[Contract::OtpApps], "case {id}");
@@ -287,6 +340,7 @@ mod tests {
                 + EXIT_CASES.len()
                 + REGISTRATION_CASES.len()
                 + PRIORITY_CASES.len()
+                + LINK_AND_FLAG_CASES.len()
         );
     }
 

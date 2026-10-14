@@ -443,17 +443,35 @@ impl<'a> Machine<'a> {
             // `PCRE2_FIRSTLINE`: the match must start at or before the first
             // newline of the subject.
             let mut m = search_offset;
-            while m < len && !self.nl.is_newline_char(self.codes[m]) {
+            while m < len && !self.nl.is_newline_at(self.codes, m) {
                 m += 1;
             }
             m
         } else {
             len
         };
-        for attempt_start in search_offset..=scan_max {
+        // PCRE2's bump-along scan (`pcre2_match.c:8696-8731`): one code unit per
+        // step, plus a `\r\n` skip under a CRLF-like convention when the pattern
+        // cannot itself name CR or LF (`PCRE2_HASCRORLF` unset).
+        let crlf_skip = self.nl.skip_crlf_pair_on_bump(self.program.flags.has_cr_or_lf);
+        let mut attempt_start = search_offset;
+        while attempt_start <= scan_max {
             match self.attempt(attempt_start) {
                 Attempt::Failed => {}
                 found => return found,
+            }
+            attempt_start = match attempt_start.checked_add(1) {
+                Some(next) => next,
+                None => break,
+            };
+            if attempt_start > scan_max {
+                break;
+            }
+            if crlf_skip
+                && self.codes.get(attempt_start - 1) == Some(&13)
+                && self.codes.get(attempt_start) == Some(&10)
+            {
+                attempt_start += 1;
             }
         }
         Attempt::Failed
@@ -507,14 +525,14 @@ impl<'a> Machine<'a> {
             }
             Inst::Any { dotall } => {
                 let hit = match self.codes.get(self.pos) {
-                    Some(&ch) => dotall || !self.nl.is_newline_char(ch),
+                    Some(_) => dotall || !self.nl.is_newline_at(self.codes, self.pos),
                     None => false,
                 };
                 self.advance_if(hit)
             }
             Inst::AnyButNewline => {
                 let hit = match self.codes.get(self.pos) {
-                    Some(&ch) => !self.nl.is_newline_char(ch),
+                    Some(_) => !self.nl.is_newline_at(self.codes, self.pos),
                     None => false,
                 };
                 self.advance_if(hit)
