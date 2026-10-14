@@ -666,6 +666,21 @@ the async-completion shape for a **live, blocked** target is pinned only on the 
 (`tests/garbage_collect.rs`). Owner: `src/eval/mod.rs`'s `receive` — the `after T` deadline must
 actually be waited out (or a spawned `-eval` child otherwise kept alive).
 
+**The `-eval` route carries an `erlang:raise/3` stacktrace but never delivers it to a `catch`.** The call
+falls through to the registered `beam_bifs::convert::raise_3` BIF, so the class and the trace **are**
+validated (a bad shape is the returned `badarg`) and the trace **is** decoded onto the raise
+(`Raise::stacktrace`, pinned by
+`src/eval/mod.rs::raise_is_served_by_the_registry_bif_carrying_the_decoded_stacktrace`). What is missing
+is observation: the evaluator's `catch_clauses` (`src/eval/mod.rs`) matches a clause's third pattern
+against `NIL`, so `try erlang:raise(error,R,[{m,f,0}]) catch C:R:S -> … end` binds `S` to `[]` and
+`catch erlang:raise(error,R,[{m,f,0}])` renders `{'EXIT',R}` — the oracle binds `[{m,f,0,[]}]` and renders
+`{'EXIT',{R,[{m,f,0,[]}]}}`. Closing it needs a `StackTrace → Eterm` encoder this crate does not have:
+`beam_engine`'s own is `carve_supplied_frames`
+(`beam_engine/src/families/exceptions/stacktrace.rs`, `pub(crate)`), so it needs a public `beam_engine`
+API (a duplicated encoder would break the no-duplication contract). The engine's **compiled**
+`try … catch C:R:S` does bind the right `S` (`Instr::BuildStacktrace`), so this is `-eval`-specific.
+Owner: `src/eval/mod.rs`'s `catch_clauses` + a `beam_engine` API.
+
 ## GC-relocation hazards (what a MOVING engine heap would invalidate)
 The engine's `alloc_words` seam prefers the running process's own **young heap** (a capacity refusal
 is met by a no-relocation `Process::grow_nursery` and one retry) and falls back to the
