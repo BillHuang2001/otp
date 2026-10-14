@@ -18,8 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! The distribution **node-set and connector** floor: `erlang:nodes/0,1,2`,
-//! `net_adm:ping/1` and `net_kernel:connect_node/1` (contract **A.5**).
+//! The distribution **node-set, connector and Erlang-supervisor** floor:
+//! `erlang:nodes/0,1,2`, `net_adm:ping/1`, `net_kernel:connect_node/1` and
+//! `erl_distribution:start_link/0,1` (contract **A.5**).
 //!
 //! The node's *identity* (`is_alive/0`, `get_cookie/0`, `set_cookie/2`) lives in
 //! [`super::node`]; this module owns the calls that read or drive the runtime's own
@@ -27,6 +28,13 @@
 //! no `beam_bifs` module can reach, exactly like the process/registry queries in
 //! [`super::process`]. They are therefore served from the runtime-native floor, consulted
 //! **before** the `beam_bifs` registry.
+//!
+//! `erl_distribution:start_link/0,1` is the odd one out: it is the Erlang-level distribution
+//! **supervisor** `kernel_sup` starts as its `net_sup` child, and the floor answers it
+//! `ignore` because this runtime's distribution is the *native* [`crate::dist::DistNode`],
+//! not the `inet_tcp`/`prim_inet` stack that supervisor would run. Both keys are enumerated
+//! in the parent's `floor_keys` list, so the rest of `erl_distribution` stays an ordinary
+//! `.beam` body.
 //!
 //! # What the answers are on a non-distributed node (`nonode@nohost`)
 //!
@@ -366,6 +374,39 @@ impl RuntimeContext<'_> {
             Ok(()) => self.atom("true"),
             Err(_) => self.atom("false"),
         }
+    }
+
+    // -- erl_distribution:start_link/0,1 --------------------------------------
+
+    /// `erl_distribution:start_link/0,1`: the atom **`ignore`**.
+    ///
+    /// `kernel_sup`'s distribution child is `{erl_distribution, start_link, []}`
+    /// (`lib/kernel/src/kernel.erl:262-268`), and `start_link/1` is the same entry
+    /// `erl_distribution:start/1` invokes from `net_kernel:start/1`. Both start a supervisor
+    /// — `supervisor:start_link({local, net_sup}, erl_distribution, [Opts])` — whose children
+    /// are the **Erlang socket stack**: `net_kernel:protocol_childspecs/0`, `erl_epmd`,
+    /// `auth`, `net_kernel` (`erl_distribution.erl:64-100`). This runtime has no
+    /// `prim_inet`/`inet_tcp` driver and therefore no Erlang-level socket stack; its
+    /// distribution is the native [`crate::dist::DistNode`] the CLI already bound and
+    /// published to `epmd` (contract A.5), so the *Erlang* supervisor has nothing to start.
+    ///
+    /// `ignore` is exactly how `erl_distribution` expresses "nothing to start": its own
+    /// `do_start_link([{sname,_},{name,_}])` walks the two flags and, when neither was given,
+    /// falls through to `do_start_link([]) -> ignore` (`erl_distribution.erl:107-138`) — the
+    /// value the supervisor already sees on the **plain** (no `-sname`/`-name`) route, which
+    /// boots to completion. Answering it for the `-sname`/`-name` routes too makes `kernel_sup`
+    /// treat `net_sup` as an absent child (the supervisor's own `ignore` contract), so the
+    /// `kernel` application starts exactly as it does without a node name.
+    ///
+    /// # The honest divergence
+    ///
+    /// On the oracle's `-sname` node this call really starts `net_sup`, `net_kernel` and
+    /// `auth`; here those registered names stay `undefined` because the Erlang socket stack
+    /// they would run does not exist. It is a native-floor substitution, not a wrong result:
+    /// the runtime's own distribution is what `erlang:nodes/0`, `net_adm:ping/1` and
+    /// `net_kernel:connect_node/1` already read and drive. See the module docs.
+    pub(super) fn erl_distribution_start_link(&mut self) -> Result<Eterm> {
+        self.atom("ignore")
     }
 
     // -- helpers --------------------------------------------------------------
@@ -826,6 +867,55 @@ mod tests {
             call(&mut rt, "net_kernel", "connect_node", &[text]).expect_err("a non-atom peer");
         assert_eq!(error.as_atom(), Some("badarg"), "{error}");
         assert!(call(&mut rt, "net_kernel", "connect_node", &[make_small(1)]).is_err());
+    }
+
+    // -- erl_distribution:start_link/0,1 --------------------------------------
+
+    /// Both `start_link` arities answer the atom `ignore`, whatever their argument: this
+    /// runtime's distribution is the native `DistNode`, so the Erlang supervisor
+    /// `erl_distribution` would start has nothing to run. The argument of `/1` is the
+    /// `#{name => …, name_domain => …, clean_halt => …, supervisor => net_sup}` map
+    /// `erl_distribution:do_start_link/1` builds; the floor ignores it.
+    ///
+    /// Oracle (`erl_distribution.erl:107-138`): the module's own `start_link/0` reaches
+    /// `do_start_link([{sname,shortnames},{name,longnames}])`, and with no `-sname`/`-name`
+    /// argument both lookups miss, so it falls through to `ignore` — the value the
+    /// supervisor sees on the plain CLI route (which boots to completion).
+    #[test]
+    fn erl_distribution_start_link_is_ignore() {
+        let mut rt = runtime();
+        let term = call(&mut rt, "erl_distribution", "start_link", &[]).expect("start_link/0");
+        assert_eq!(rendered(&mut rt, term), "ignore");
+
+        let mut rt = runtime();
+        let name = rt.intern("foo");
+        let net_sup = rt.intern("net_sup");
+        let options = make_map(
+            &mut rt,
+            &[("name", name), ("supervisor", net_sup)],
+        );
+        let term =
+            call(&mut rt, "erl_distribution", "start_link", &[options]).expect("start_link/1");
+        assert_eq!(rendered(&mut rt, term), "ignore");
+    }
+
+    /// The `erl_distribution` namespace is **key-granular**: the floor owns exactly
+    /// `start_link/0,1`, so the module's other bodies (`init/1`, `start/1`, `stop/0`) stay
+    /// enterable in-machine.
+    #[test]
+    fn only_erl_distribution_start_link_is_a_floor_key() {
+        for arity in [0u32, 1] {
+            assert!(
+                crate::native::floor_shadows("erl_distribution", "start_link", arity),
+                "the floor owns `erl_distribution:start_link/{arity}`"
+            );
+        }
+        for (function, arity) in [("init", 1u32), ("start", 1), ("stop", 0)] {
+            assert!(
+                !crate::native::floor_shadows("erl_distribution", function, arity),
+                "`erl_distribution:{function}/{arity}` is an ordinary `.beam` body"
+            );
+        }
     }
 
     // -- the name helpers -----------------------------------------------------

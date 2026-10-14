@@ -45,6 +45,7 @@
 //! | `erlang:is_alive/0`, `erlang:get_cookie/0`, `erlang:set_cookie/2` | read/replace this node's own identity (the name, the cookie) and its liveness — the distribution state no BIF module can reach (contract A.5, `src/native/node.rs`) |
 //! | `erlang:nodes/0,1,2` | read this runtime's own **link table** (the established outbound distribution links), not a registry value (contract A.5, `src/native/net.rs`) |
 //! | `net_adm:ping/1`, `net_kernel:connect_node/1` | **drive** that link table: the outbound `epmd` lookup + `'N'` client handshake (`Runtime::dist_connect`) is host socket work (contract A.5, `src/native/net.rs`) |
+//! | `erl_distribution:start_link/0,1` | the Erlang-level distribution **supervisor** `kernel_sup` starts as its `net_sup` child: answered `ignore` because this runtime's distribution is the native [`beam_dist`](crate::dist)/`DistNode`, not the `inet_tcp`/`prim_inet` stack that supervisor would run (contract A.5, `src/native/net.rs`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:get_object_code/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) — and, for `get_object_code/1`, its `.beam` bytes |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
@@ -88,7 +89,7 @@
 //! entries in [`application`], the `prim_file:*` primitives in [`prim`], the `erl_ddll:*`
 //! loaded-driver-list entries in [`ddll`], the distribution **identity** in [`node`] and the
 //! distribution **node set + connector** (`erlang:nodes/0,1,2`, `net_adm:ping/1`,
-//! `net_kernel:connect_node/1`) in [`net`]. The submodules
+//! `net_kernel:connect_node/1`, `erl_distribution:start_link/0,1`) in [`net`]. The submodules
 //! reach the shared helpers through `super` (they are `pub(super)`).
 
 mod application;
@@ -124,16 +125,22 @@ use crate::format;
 ///
 /// Every one of them is a module the code server can *also* load as a `.beam` (`erlang`,
 /// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`, `erl_ddll`,
-/// `net_adm`, `net_kernel`), so the cross-module-call seam
+/// `net_adm`, `net_kernel`, `erl_distribution`), so the cross-module-call seam
 /// ([`RuntimeContext::resolve_external_call`]) must answer `Ok(None)` for all of them:
 /// entering the module body would run it *instead of* the host implementation. The list is
 /// written next to the `try_native` match arms it mirrors, and
 /// [`tests::every_floor_module_is_a_real_try_native_arm`] pins it against that source so it
 /// cannot silently drift out of the host's dispatch.
-pub(crate) const FLOOR_MODULES: [&str; 13] = [
+///
+/// Membership here only means "a namespace `try_native` serves"; whether the *whole*
+/// namespace is refused or only [`floor_keys`]' enumerated keys is decided there. The
+/// `erl_distribution` entry is key-granular (the floor serves exactly `start_link/0,1`), so
+/// the rest of the module stays enterable — see [`floor_keys`].
+pub(crate) const FLOOR_MODULES: [&str; 14] = [
     "application",
     "code",
     "erl_ddll",
+    "erl_distribution",
     "erl_prim_loader",
     "erlang",
     "erts_internal",
@@ -150,10 +157,13 @@ pub(crate) const FLOOR_MODULES: [&str; 13] = [
 /// `(module, function, arity)` **in-machine** because the runtime-native floor owns that
 /// EXACT key.
 ///
-/// The module-level rule ([`FLOOR_MODULES`]) is right for ten of the eleven namespaces:
-/// practically every name in them is either a floor arm or a `beam_bifs` registry BIF, so
-/// entering the module body would run it *instead of* the host implementation — a wrong
-/// result. `io` is the exception. The floor serves only `io:put_chars/1,2` for that
+/// The module-level rule ([`FLOOR_MODULES`]) is right for a namespace whose every name is
+/// either a floor arm or a `beam_bifs` registry BIF: entering the module body would run it
+/// *instead of* the host implementation — a wrong result. A namespace with an enumerated
+/// [`floor_keys`] list is instead **key-granular**: only those keys are refused and every
+/// other name is an ordinary `.beam` body.
+///
+/// `io` is the sharpest case. The floor serves only `io:put_chars/1,2` for that
 /// namespace ([`try_native`]'s `("io", "put_chars", 1 | 2)` arms); every *other* `io:*`
 /// (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an ordinary
 /// body in `lib/stdlib/src/io.erl`, and **refusing** it here routes it onto the synchronous
@@ -261,6 +271,19 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("priv_dir", 1),
             ("where_is_file", 1),
         ]),
+        // The Erlang-level distribution supervisor entry. `kernel_sup`'s `net_sup` child is
+        // `{erl_distribution, start_link, []}` (`lib/kernel/src/kernel.erl:264`) and
+        // `start_link/1` is the same entry `erl_distribution:start/1` invokes from
+        // `net_kernel:start/1`; both start a supervisor whose children are the Erlang socket
+        // stack (`protocol_childspecs`, `erl_epmd`, `auth`, `net_kernel`) this runtime has no
+        // `prim_inet` driver for — its distribution is the native `beam_dist`/`DistNode` the
+        // CLI already bound. So the floor owns exactly those two keys and answers the atom
+        // `ignore` (nothing to start), which is the same value the oracle's own
+        // `erl_distribution:start_link/0` returns when no `-sname`/`-name` argument is
+        // present. Every *other* `erl_distribution:*` (`init/1`, `start/1`, `stop/0`) stays an
+        // ordinary `lib/kernel/src/erl_distribution.erl` body, so the namespace is
+        // key-granular. See [`crate::native::net`].
+        "erl_distribution" => Some(&[("start_link", 0), ("start_link", 1)]),
         _ => None,
     }
 }
@@ -440,6 +463,14 @@ impl RuntimeContext<'_> {
             ("erlang", "nodes", 2) => Some(self.nodes_2(args)),
             ("net_adm", "ping", 1) => Some(self.net_adm_ping_1(args)),
             ("net_kernel", "connect_node", 1) => Some(self.net_kernel_connect_node_1(args)),
+            // The Erlang-level distribution supervisor entry that `kernel_sup` starts as its
+            // `net_sup` child (`kernel.erl:264`). This runtime's distribution is the native
+            // `beam_dist`/`DistNode` (the CLI binds and publishes it itself), so the Erlang
+            // socket stack `erl_distribution:init/1` would supervise has nothing to start;
+            // the floor answers the atom `ignore` — the same value the oracle's own
+            // `erl_distribution:start_link/0` returns when no `-sname`/`-name` argument is
+            // present — and `kernel_sup` skips the child. See [`net`].
+            ("erl_distribution", "start_link", 0 | 1) => Some(self.erl_distribution_start_link()),
             // Sequential tracing (contract A.8, item 2) — exactly the four BIFs
             // `bif.tab:220-223` declares, served by [`crate::seq_trace`], which also owns the
             // token model and the `system_logger` flag. `system_flag/2` is claimed for the
