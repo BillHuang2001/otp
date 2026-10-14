@@ -372,6 +372,66 @@ fn structured_raise_reasons_and_map_key_order_match_the_oracle() {
         assert_eq!(exit, *expected_exit, "{expr}: exit (stderr {stderr:?})");
     }
 }
+/// `erlang:raise/3` at the CLI boundary: the evaluator does **not** serve it, so the
+/// registered `beam_bifs` BIF validates the class *and* the stacktrace argument.
+///
+/// The distinction that makes it observable is returned-value vs raise: the C ends every
+/// invalid-shape path in `return am_badarg`, so an invalid class (`foo`, `1`) or an invalid
+/// stacktrace (`42`, `x`, `{}`) is the atom `badarg` **returned** by the call — the
+/// corpus probe's `of V` branch prints `ok badarg` and exits `0` — while a valid call
+/// raises. Serving `raise/3` locally used to *raise* `badarg` (a caught
+/// `exception error badarg`, exit 1) and to drop the stacktrace.
+///
+/// Every golden is the system oracle's own line (`erl -noshell`, OTP 29 / erts-17.1),
+/// captured through the **same** probe wrapper and argv the corpus builds:
+///
+/// ```text
+/// try (erlang:raise(error, foo, [42])) of V -> io:format("ok ~w~n",[V]), halt(0)
+///   catch C:R -> io:format("exception ~w ~w~n",[C,R]), halt(1) end
+///   ⇒ ok badarg            (exit 0)   — the BIF *returns* badarg
+/// try (erlang:raise(error, foo, [{bar,baz,0}])) … ⇒ exception error foo (exit 1)
+/// ```
+#[test]
+fn raise_3_matches_the_oracle_at_the_cli_boundary() {
+    let cases: &[(&str, &str, i32)] = &[
+        // A valid trace: `class:reason` is raised (the frames are echoed, not printed).
+        (
+            "erlang:raise(error, foo, [{bar,baz,0}])",
+            "exception error foo",
+            1,
+        ),
+        ("erlang:raise(error, foo, [])", "exception error foo", 1),
+        ("erlang:raise(error, {a,b}, [])", "exception error {a,b}", 1),
+        (
+            "erlang:raise(exit, {shutdown,1}, [])",
+            "exception exit {shutdown,1}",
+            1,
+        ),
+        ("erlang:raise(throw, x, [])", "exception throw x", 1),
+        (
+            "erlang:raise(error, foo, [{m,f,1},{n,g,2}])",
+            "exception error foo",
+            1,
+        ),
+        // An invalid class or stacktrace shape is the *returned* atom `badarg`.
+        ("erlang:raise(foo, foo, [])", "ok badarg", 0),
+        ("erlang:raise(1, foo, [])", "ok badarg", 0),
+        ("erlang:raise(error, foo, [42])", "ok badarg", 0),
+        ("erlang:raise(error, foo, x)", "ok badarg", 0),
+        ("erlang:raise(error, foo, [{}])", "ok badarg", 0),
+        ("erlang:raise(error, foo, [{m,f}])", "ok badarg", 0),
+    ];
+    for (expr, expected, expected_exit) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, *expected_exit, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+    }
+}
 
 /// The two `semantics/*` corpus probes this suite pins — a binary comprehension and
 /// `bit_size/1` of a **non-byte-aligned** bitstring — AGREE with the oracle. Pinned here —

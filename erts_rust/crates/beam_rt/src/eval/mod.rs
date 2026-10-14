@@ -881,8 +881,16 @@ impl Evaluator<'_, '_> {
         let arity = args.len() as u32;
         // The raise helpers carry the *live* reason term; the atom-only
         // `ExitReason` model would lose a structured reason, so they are served
-        // here (the semantics are exactly `erlang:error/1,2`, `exit/1`,
-        // `throw/1`, `raise/3`).
+        // here (the semantics are exactly `erlang:error/1,2`, `exit/1` and
+        // `throw/1`).
+        //
+        // `erlang:raise/3` is deliberately **not** served here: it must validate its
+        // class *and* its stacktrace argument and forward the decoded trace, which is
+        // exactly what the registered BIF does — so it falls through to
+        // [`Self::call`] → `RuntimeContext::call_bif` → `beam_bifs::convert::raise_3`
+        // (the oracle-pinned implementation) and reaches `Flow::Raise` through
+        // [`Self::flow_from_error`], carrying both the live reason term and the
+        // decoded stacktrace.
         if module == "erlang" {
             match (function, arity) {
                 ("error", 1) | ("error", 2) => {
@@ -906,7 +914,6 @@ impl Evaluator<'_, '_> {
                         origin: None,
                     })
                 }
-                ("raise", 3) => return self.raise_3(&args),
                 ("nif_error", 1) | ("nif_error", 2) => {
                     // `erlang:nif_error/1,2` raises `error` with its **first argument**
                     // as the reason (the second is crash-report metadata, per
@@ -927,21 +934,6 @@ impl Evaluator<'_, '_> {
             }
         }
         self.call(module, function, &args)
-    }
-
-    /// `erlang:raise(Class, Reason, Stacktrace)`.
-    fn raise_3(&mut self, args: &[Eterm]) -> EResult<Eterm> {
-        let class = match self.atom_name(args[0]).as_deref() {
-            Some("error") => ExceptionClass::Error,
-            Some("exit") => ExceptionClass::Exit,
-            Some("throw") => ExceptionClass::Throw,
-            _ => return Err(self.raise(ExceptionClass::Error, "badarg")),
-        };
-        Err(Flow::Raise {
-            class,
-            reason: args[1],
-            origin: None,
-        })
     }
 
     /// `erlang:apply(Fun, Args)`.
@@ -2517,6 +2509,79 @@ mod tests {
         assert_eq!(printed.trim_end(), "{nif_not_loaded,m,f,0}");
     }
 
+    /// `erlang:raise/3` is **not** served by the evaluator: it falls through to the
+    /// registered `beam_bifs::convert::raise_3` BIF, so its class and its stacktrace
+    /// argument are validated exactly as the oracle validates them and the **decoded
+    /// trace rides the raise**.
+    ///
+    /// The invalid shapes are the *returned* atom `badarg` (the C's
+    /// `BIF_RET(am_badarg)`) — a **value**, not a raise — so `try erlang:raise(foo, foo,
+    /// []) catch C:R -> {C,R} end` never runs its catch. Every expectation is the system
+    /// oracle's (`erl -noshell -eval …`, OTP 29 / erts-17.1), captured through the
+    /// corpus's own probe wrapper in `../../tests/eval.rs`.
+    #[test]
+    fn raise_is_served_by_the_registry_bif_carrying_the_decoded_stacktrace() {
+        // An invalid class (`foo`, `1`) or an invalid stacktrace shape (`42`, `x`, `{}`)
+        // is returned, never raised: the call evaluates to the atom `badarg`.
+        atom("erlang:raise(foo, foo, [])", "badarg");
+        atom("erlang:raise(1, foo, [])", "badarg");
+        atom("erlang:raise(error, foo, [42])", "badarg");
+        atom("erlang:raise(error, foo, x)", "badarg");
+        atom("erlang:raise(error, foo, [{}])", "badarg");
+
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+
+        // A valid call raises, and the raise **carries the decoded trace** — the frames
+        // the oracle echoes (`{m,f,1}` ⇒ `m:f/1`; the `Location` form keeps its
+        // `file`/`line`). The raise must survive `flow_from_error` → `finish` unchanged.
+        let error = eval(&mut ctx, "erlang:raise(error, foo, [{m,f,1}])")
+            .expect_err("a valid raise propagates out of the evaluation");
+        let BeamError::Raise(raise) = &error else {
+            panic!("expected a raise, got {error:?}");
+        };
+        assert_eq!(raise.class, ExceptionClass::Error);
+        assert_eq!(raise.reason.as_atom(), Some("foo"));
+        assert_eq!(
+            raise.stacktrace.to_string(),
+            "m:f/1",
+            "the decoded stacktrace must ride the returned raise"
+        );
+
+        let error = eval(
+            &mut ctx,
+            r#"erlang:raise(exit, {shutdown,1}, [{lists,map,2,[{file,"lists.erl"},{line,1234}]}])"#,
+        )
+        .expect_err("a valid raise propagates out of the evaluation");
+        let BeamError::Raise(raise) = &error else {
+            panic!("expected a raise, got {error:?}");
+        };
+        assert_eq!(raise.class, ExceptionClass::Exit);
+        assert_eq!(
+            raise.stacktrace.to_string(),
+            "lists:map/2 (lists.erl:1234)"
+        );
+        // A non-atom reason is the live argument term (the raise carries no atom to
+        // shadow it): `{shutdown,1}` must come back exactly.
+        let reason = error::live_reason_term(&error).expect("the reason term is live");
+        let printed = ctx
+            .runtime
+            .format_term(reason, None)
+            .expect("~p renders it");
+        assert_eq!(printed.trim_end(), "{shutdown,1}");
+
+        // The empty list is a **valid** trace: it decodes to the empty stacktrace, so
+        // `raise/3` keeps its class and reason and derives nothing.
+        let error = eval(&mut ctx, "erlang:raise(throw, x, [])")
+            .expect_err("a valid raise propagates out of the evaluation");
+        let BeamError::Raise(raise) = &error else {
+            panic!("expected a raise, got {error:?}");
+        };
+        assert_eq!(raise.class, ExceptionClass::Throw);
+        assert_eq!(raise.reason.as_atom(), Some("x"));
+        assert!(raise.stacktrace.is_empty(), "`[]` decodes to an empty trace");
+    }
     #[test]
     fn malformed_expressions_are_capability_gaps() {
         for expr in ["1 +", "(", "case"] {
