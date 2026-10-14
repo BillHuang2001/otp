@@ -48,7 +48,9 @@ use beam_codec::error::is_unsupported;
 use beam_codec::term as codec_term;
 use beam_common::BeamError;
 use beam_process::{PortId, ProcessId};
-use beam_term::{atom_val, compare::eq, is_small, signed_value, AtomTable, Eterm, NIL};
+use beam_term::{
+    atom_val, compare::eq, is_small, make_atom, signed_value, AtomTable, Eterm, NIL,
+};
 
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
@@ -1393,6 +1395,231 @@ fn the_conversion_goldens_match_the_live_oracle() {
             "badarg\n",
         ),
         "the live oracle disagrees with this test file's conversion goldens"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// external (remote-node) identifiers
+//
+// A pid/port/ref naming **another** node is refused by all three `*_to_list/1`
+// forms (and by the OTP-30 `*_to_binary/1` forms). That is a capability gap, not
+// an argument error: the oracle *does* render the identifier, but its channel
+// number is the node-name atom's index in the *running* VM's atom table — runtime
+// state the frozen external-identifier term does not carry. The full evidence and
+// the seam a faithful rendering would need are in `src/term_conv.rs`'s
+// `external_channel_gap`; the sibling `tests/print_port.rs` reaches the same
+// conclusion for `~p`/`~w`.
+// ---------------------------------------------------------------------------
+
+/// The atom table the external-identifier tests build from: the printable/binary
+/// fixtures plus the two node names — the Milestone-1 local node and a foreign one.
+fn node_atoms() -> AtomTable {
+    let mut atoms = seeded_atoms();
+    atoms.seed(["nonode@nohost", "foo@barbazqux"]);
+    atoms
+}
+
+/// The atom term naming the node `name`.
+fn node_term(atoms: &AtomTable, name: &str) -> Eterm {
+    make_atom(atoms.lookup(name).expect("the node name is seeded"))
+}
+
+#[test]
+fn an_external_pid_is_refused_and_the_internal_form_is_unchanged() {
+    // ORACLE (OTP 29.1.1 / erts-17.1) — the oracle renders a foreign node, with the
+    // channel set to that name's atom index in the running VM:
+    //   node(P) == foo@barbazqux
+    //   erlang:pid_to_list(P)  => "<10640.10.0>"
+    //   erlang:ref_to_list(R)  => "#Ref<10640.210497935.1828192262.122813>"
+    //   erlang:port_to_list(P) => "#Port<10640.7>"
+    // and the *same* wire pid prints "<10638.10.0>" in a run whose atom table is
+    // 100 atoms smaller — so no function of the term can produce the text. For an
+    // external pid naming the **local** node the channel is `0`, and that branch is
+    // static: `binary_to_term(<<131,88,119,13,"nonode@nohost",0,0,0,1,0,0,0,7,
+    // 0,0,0,0>>)` => `<0.1.7>`, `erlang:pid_to_list(…)` => `"<0.1.7>"`.
+    //
+    // This runtime has no node-identity/channel seam, so both branches stay the
+    // documented refusal rather than a fabricated channel.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = node_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+    let local = node_term(&atoms, "nonode@nohost");
+    let foreign = node_term(&atoms, "foo@barbazqux");
+
+    for node in [local, foreign] {
+        let pid = codec_term::make_external_pid(ctx.heap(), node, 7, 1, 0)
+            .expect("the external pid fits");
+        // It really is the external form (the internal decode would refuse it too).
+        assert_eq!(
+            codec_term::external_pid_parts(pid).expect("an external pid").1,
+            7
+        );
+        for name in ["pid_to_list", "pid_to_binary"] {
+            assert!(
+                matches!(
+                    call(&reg, &mut ctx, "erlang", name, 1, &[pid]),
+                    Err(BeamError::BadArg)
+                ),
+                "erlang:{name}/1 of an external pid must stay the documented refusal"
+            );
+        }
+    }
+
+    // The internal forms are untouched by the new external check — the oracle's own
+    // `<0.123.7>` / `<0.10.0>` goldens.
+    let internal = ProcessId::new(123, 7).to_eterm();
+    let text = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[internal]).expect("a pid");
+    assert_eq!(text_bytes(text), b"<0.123.7>");
+    let main = ProcessId::new(10, 0).to_eterm();
+    let text = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[main]).expect("a pid");
+    assert_eq!(text_bytes(text), b"<0.10.0>");
+}
+
+#[test]
+fn an_external_port_is_refused_and_the_internal_form_is_unchanged() {
+    // ORACLE: `erlang:port_to_list(P)` of an external port naming `foo@barbazqux`
+    // => `"#Port<10640.7>"` (the local node: `"#Port<0.0>"` — a
+    // `V4_PORT_EXT` image naming `nonode@nohost` decodes to an external port and
+    // prints channel `0`); `port_to_binary/1` is the same bytes (OTP-30 only).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = node_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+    let local = node_term(&atoms, "nonode@nohost");
+    let foreign = node_term(&atoms, "foo@barbazqux");
+
+    for node in [local, foreign] {
+        let port = codec_term::make_external_port(ctx.heap(), node, 7, 0)
+            .expect("the external port fits");
+        assert_eq!(
+            codec_term::external_port_parts(port)
+                .expect("an external port")
+                .1,
+            7
+        );
+        for name in ["port_to_list", "port_to_binary"] {
+            assert!(
+                matches!(
+                    call(&reg, &mut ctx, "erlang", name, 1, &[port]),
+                    Err(BeamError::BadArg)
+                ),
+                "erlang:{name}/1 of an external port must stay the documented refusal"
+            );
+        }
+    }
+
+    // The internal `#Port<0.N>` text is unchanged (oracle `"#Port<0.3>"`).
+    let internal = PortId::new(3).to_eterm();
+    let text = call(&reg, &mut ctx, "erlang", "port_to_list", 1, &[internal]).expect("a port");
+    assert_eq!(text_bytes(text), b"#Port<0.3>");
+}
+
+#[test]
+fn an_external_ref_is_refused_and_the_internal_form_is_unchanged() {
+    // ORACLE: `erlang:ref_to_list(R)` of an external reference naming
+    // `foo@barbazqux` => `"#Ref<10640.210497935.1828192262.122813>"` (the numbers are
+    // the image's own ids, most significant first); for one naming `nonode@nohost`
+    // the same image prints channel `0`. `ref_to_binary/1` is the same bytes
+    // (OTP-30 only).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = node_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+    let local = node_term(&atoms, "nonode@nohost");
+    let foreign = node_term(&atoms, "foo@barbazqux");
+    let ids = [0x0C8B_5C1F_u32, 0x6CF6_4C68, 0x01DC_FCC0];
+
+    for node in [local, foreign] {
+        let reference =
+            codec_term::make_external_ref(ctx.heap(), node, &ids, 0).expect("the ref fits");
+        assert_eq!(
+            codec_term::external_ref_parts(reference)
+                .expect("an external ref")
+                .1,
+            &ids[..]
+        );
+        for name in ["ref_to_list", "ref_to_binary"] {
+            assert!(
+                matches!(
+                    call(&reg, &mut ctx, "erlang", name, 1, &[reference]),
+                    Err(BeamError::BadArg)
+                ),
+                "erlang:{name}/1 of an external reference must stay the documented refusal"
+            );
+        }
+    }
+
+    // The internal `#Ref<0.0.0.N>` text is unchanged (oracle `"#Ref<0.0.0.7>"`).
+    let text = chars(&mut ctx, "#Ref<0.0.0.7>");
+    let internal =
+        call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[text]).expect("a ref text");
+    let rendered = call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[internal]).expect("a ref");
+    assert_eq!(text_bytes(rendered), b"#Ref<0.0.0.7>");
+}
+
+/// The `(atom_count, channel)` pair of one probe line of
+/// [`the_live_oracle_prints_a_foreign_channel_from_the_running_atom_table`]
+/// (`"10638 <10638.10.0>\n"`). Fails loudly on an unexpected shape.
+fn probe_channel(out: &str) -> (u64, u64) {
+    let mut fields = out.split_whitespace();
+    let atoms = fields
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected oracle probe output: {out:?}"));
+    let channel = fields
+        .next()
+        .and_then(|v| v.strip_prefix('<'))
+        .and_then(|v| v.split('.').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected oracle probe output: {out:?}"));
+    (atoms, channel)
+}
+
+/// The oracle prints a **foreign** identifier's channel as the index the node-name
+/// atom holds in the running VM's atom table, so one and the same wire image prints
+/// differently in two runs that differ only in how many atoms were interned before
+/// the decode. That is why the exact text is unreachable from the term, and this
+/// test re-runs the two probes live against the system `erl` (skipping loudly when
+/// it is absent).
+#[test]
+fn the_live_oracle_prints_a_foreign_channel_from_the_running_atom_table() {
+    // Measured (OTP 29.1.1 / erts-17.1), one statement per probe, identical except
+    // for the number of extra atoms interned before `binary_to_term/1`:
+    //   erl -noshell -eval 'W = <<131,88,119,7,"foo@bar",0,0,0,10,0,0,0,0,0,0,0,0>>,
+    //       _ = [list_to_atom("zzzz" ++ integer_to_list(I)) || I <- lists:seq(1,0)],
+    //       io:format("~p ~s~n",[erlang:system_info(atom_count),
+    //                              erlang:pid_to_list(binary_to_term(W))]), halt().'
+    //   => 10638 <10638.10.0>
+    //   ... the same with lists:seq(1,100) ...
+    //   => 10738 <10738.10.0>
+    let probe = |extra: u32| {
+        format!(
+            "W = <<131,88,119,7,\"foo@bar\",0,0,0,10,0,0,0,0,0,0,0,0>>, \
+             _ = [list_to_atom(\"zzzz\" ++ integer_to_list(I)) || I <- lists:seq(1,{extra})], \
+             io:format(\"~p ~s~n\",[erlang:system_info(atom_count), \
+                                    erlang:pid_to_list(binary_to_term(W))]), halt()."
+        )
+    };
+    let Some(none) = oracle_eval(&probe(0)) else {
+        return;
+    };
+    let Some(hundred) = oracle_eval(&probe(100)) else {
+        return;
+    };
+    let (atoms_0, channel_0) = probe_channel(&none);
+    let (atoms_100, channel_100) = probe_channel(&hundred);
+    assert_ne!(
+        channel_0, 0,
+        "a foreign node never takes the local node's channel 0"
+    );
+    assert_eq!(
+        channel_100 - channel_0,
+        100,
+        "the channel is the node-name atom's index in the running VM: 100 extra \
+         atoms interned before the decode shift it by exactly 100 \
+         (probe 1: {atoms_0} atoms, channel {channel_0}; \
+          probe 2: {atoms_100} atoms, channel {channel_100})"
     );
 }
 
