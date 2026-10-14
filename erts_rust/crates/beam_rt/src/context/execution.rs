@@ -62,7 +62,15 @@ impl ExecutionContext for RuntimeContext<'_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        let result = self.call_bif_routed(module, function, arity, args)?;
+        let result = match self.call_bif_routed(module, function, arity, args) {
+            Ok(result) => result,
+            Err(error) => {
+                crate::debug_trace::trace(format_args!(
+                    "call_bif {module}:{function}/{arity} -> {error:?}"
+                ));
+                return Err(error);
+            }
+        };
         self.open_gate_for_foreign_result(result);
         Ok(result)
     }

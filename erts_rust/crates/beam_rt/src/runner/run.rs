@@ -734,8 +734,33 @@ impl ProcessRunner for RuntimeRunner<'_> {
             Err(error) => {
                 let reason = exit_reason(self.runtime, &error);
                 if crate::debug_trace::enabled() {
+                    let entry = engine
+                        .entry
+                        .entry_module()
+                        .and_then(|m| m.atom_table.name(m.name).map(str::to_owned));
+                    let located = engine.machine.current_module().map(|m| {
+                        let (func, pc) = engine.machine.current_code().unwrap_or((0, 0));
+                        let fname = m
+                            .functions
+                            .get(func as usize)
+                            .and_then(|f| m.atom_table.name(f.name).map(str::to_owned));
+                        let arity = m.functions.get(func as usize).map(|f| f.arity);
+                        let instr = m
+                            .functions
+                            .get(func as usize)
+                            .and_then(|f| f.code.get(pc as usize))
+                            .map(|i| format!("{i:?}"))
+                            .unwrap_or_default();
+                        let instr = instr.chars().take(160).collect::<String>();
+                        format!(
+                            "{}:{} /{} +{pc} instr={instr}",
+                            m.atom_table.name(m.name).unwrap_or("?"),
+                            fname.unwrap_or_else(|| "?".into()),
+                            arity.unwrap_or(0)
+                        )
+                    });
                     crate::debug_trace::trace(format_args!(
-                        "process {pid:?} raised: {error:?}"
+                        "process {pid:?} raised: {error:?} entry={entry:?} at={located:?}"
                     ));
                 }
                 // The reason may be a term the failing process built on **its own** heap,

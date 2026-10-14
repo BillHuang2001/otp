@@ -176,10 +176,64 @@ pub(crate) const FLOOR_MODULES: [&str; 11] = [
 /// [`RuntimeContext::call_bif`]: crate::context::RuntimeContext
 /// [`RuntimeContext::for_process`]: crate::context::RuntimeContext
 pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
-    if module == "io" {
-        return matches!((function, arity), ("put_chars", 1 | 2));
+    if let Some(keys) = floor_keys(module) {
+        return keys.contains(&(function, arity));
     }
     FLOOR_MODULES.contains(&module)
+}
+
+/// The **explicitly enumerated** keys of a floor namespace — the ones whose `try_native` arms
+/// name a single function and arity each, so the host owns exactly those keys and every other
+/// name in the namespace is a `.beam` body.
+///
+/// `None` for a namespace [`try_native`] serves through a **wildcard** arm
+/// (`erts_internal`, `prim_file`, `erl_ddll`) or for one whose arms are too numerous to
+/// mirror here (`erlang`); those keep the module-wide exclusion.
+fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
+    match module {
+        // The floor serves only `io:put_chars/1,2` for this namespace; every *other* `io:*`
+        // (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an
+        // ordinary body in `lib/stdlib/src/io.erl`.
+        "io" => Some(&[("put_chars", 1), ("put_chars", 2)]),
+        // `application` is partly `lib/kernel/src/application.erl` bodies (`set_env/3,4`,
+        // `load/1`, `start_boot/2`, `unset_env/2,3`, …), each a thin wrapper that delegates
+        // to `application_controller` — the mirror of the `io` case.
+        "application" => Some(&[
+            ("get_env", 1),
+            ("get_env", 2),
+            ("get_env", 3),
+            ("get_all_env", 1),
+            ("get_key", 1),
+            ("get_key", 2),
+            ("get_application", 0),
+            ("get_application", 1),
+            ("get_all_key", 1),
+            ("loaded_applications", 0),
+            ("which_applications", 0),
+        ]),
+        // `code` is the same shape: the floor answers the *queries* below and the
+        // `lib/kernel/src/code.erl` bodies (`start_link/0`, `add_path/1`, `stick_dir/1`, …)
+        // delegate to the code server.
+        "code" => Some(&[
+            ("get_path", 0),
+            ("all_loaded", 0),
+            ("which", 1),
+            ("get_object_code", 1),
+            ("is_loaded", 1),
+            ("is_sticky", 1),
+            ("is_sticky", 2),
+            ("ensure_loaded", 1),
+            ("load_file", 1),
+            ("lib_dir", 0),
+            ("lib_dir", 1),
+            ("lib_dir", 2),
+            ("root_dir", 0),
+            ("get_mode", 0),
+            ("priv_dir", 1),
+            ("where_is_file", 1),
+        ]),
+        _ => None,
+    }
 }
 
 impl RuntimeContext<'_> {
