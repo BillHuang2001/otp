@@ -176,6 +176,13 @@ fn list_to_port(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The `erlang:port_to_list/1` BIF: renders `#Port<0.Num>` for an internal port —
 /// the shared `%T` text of
 /// [`crate::term_conv::port_text_str`](crate::term_conv::port_text_str).
+///
+/// # Errors
+///
+/// A non-port is `badarg`; an **external** port is the typed capability gap
+/// `error:unsupported_bif` (its channel number is not derivable from the term) —
+/// both per
+/// [`port_text_str`](crate::term_conv::port_text_str).
 fn port_to_list(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let text = crate::term_conv::port_text_str(args[0])?;
     let mut elems = Vec::with_capacity(text.len());

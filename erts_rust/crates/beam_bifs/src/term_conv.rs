@@ -76,12 +76,14 @@
 //! same substitution `src/port.rs` documents for `#Port<0.Num>` and
 //! `src/print.rs`'s `format_term` for `<0.Num.Ser>`/`#Ref<0.0.0.N>`.
 //!
-//! An **external** pid/port/ref is refused (`badarg`) — deliberately, not because
-//! the argument is malformed: its channel number is the index the node-name atom
-//! happens to hold in the *running* VM's atom table, which the frozen external term
-//! does not carry and no function of the term can recover (the verbatim oracle
-//! record, the "local node prints `0`" branch and the seam a faithful rendering
-//! would need are all on [`external_channel_gap`]). `list_to_ref/1` accepts only
+//! An **external** pid/port/ref is refused with the typed capability gap
+//! `error:unsupported_bif` — deliberately, *not* `badarg`, because the argument is
+//! perfectly valid: its channel number is the index the node-name atom happens to
+//! hold in the *running* VM's atom table, which the frozen external term does not
+//! carry and no function of the term can recover (the verbatim oracle record, the
+//! "local node prints `0`" branch and the seam a faithful rendering would need are
+//! all on [`external_channel_gap`]). Only a *wrong argument type* — a term that is
+//! not a pid/port/ref at all — is `badarg`. `list_to_ref/1` accepts only
 //! the exact `#Ref<0.0.0.N>` shape this runtime's own ref thing can hold (see
 //! [`parse_ref_text`]).
 //!
@@ -612,6 +614,16 @@ const MAX_REFERENCE: u64 = 1 << 18;
 /// `is_reference` accept the external forms and the oracle *does* render them, so
 /// this is the documented capability gap — never a fabricated channel number.
 ///
+/// The refusal is the crate's typed capability gap
+/// [`BeamError::Raise`](beam_common::BeamError::Raise) with the atom reason
+/// `unsupported_bif` (`error:unsupported_bif`), **not**
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg): the *argument* is a
+/// perfectly valid external pid/port/ref, and `badarg` would falsely claim it was
+/// malformed. Only a *wrong argument type* (a term that is not a pid/port/ref at
+/// all) is `badarg` — that check stays with the callers. The sibling leaf renderer
+/// `crate::print` reaches the same conclusion for the identical situation (an
+/// external pid/port/ref is a typed gap there too).
+///
 /// # Why the text is not derivable from the term
 ///
 /// The `%T` renderer prints the identifier's **channel number**
@@ -686,7 +698,7 @@ const MAX_REFERENCE: u64 = 1 << 18;
 /// docs reach for `~p`/`~w`. Both pieces are `beam_rt`-level state; adding either is
 /// a new dependency edge and is reported upward rather than guessed here.
 fn external_channel_gap() -> BeamError {
-    badarg()
+    unsupported_bif()
 }
 
 /// The `%T` text of an internal pid — `<channel.number.serial>`
@@ -700,8 +712,9 @@ fn external_channel_gap() -> BeamError {
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a pid
-/// (`erlang:pid_to_list(5)` ⇒ `badarg`). An **external** pid is likewise `badarg`:
-/// its channel number is not derivable from the term (see
+/// (`erlang:pid_to_list(5)` ⇒ `badarg`). An **external** pid is a different case:
+/// the argument is valid, but its channel number is not derivable from the term, so
+/// it is the typed capability gap `error:unsupported_bif` (see
 /// [`external_channel_gap`]).
 pub(crate) fn pid_text_str(term: Eterm) -> Result<String> {
     if !access::is_pid(term) {
@@ -729,8 +742,10 @@ pub(crate) fn pid_text_str(term: Eterm) -> Result<String> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a port,
-/// or is an external one (see [`external_channel_gap`]).
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a port.
+/// An **external** port is a different case: the argument is valid, but its channel
+/// number is not derivable from the term, so it is the typed capability gap
+/// `error:unsupported_bif` (see [`external_channel_gap`]).
 pub(crate) fn port_text_str(term: Eterm) -> Result<String> {
     if !access::is_port(term) {
         return Err(badarg());
@@ -753,8 +768,9 @@ pub(crate) fn port_text_str(term: Eterm) -> Result<String> {
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a
-/// reference (`erlang:ref_to_list(5)` ⇒ `badarg`), or is an external one (its
-/// channel number is not derivable from the term — see
+/// reference (`erlang:ref_to_list(5)` ⇒ `badarg`). An **external** reference is a
+/// different case: the argument is valid, but its channel number is not derivable
+/// from the term, so it is the typed capability gap `error:unsupported_bif` (see
 /// [`external_channel_gap`]).
 pub(crate) fn ref_text_str(term: Eterm) -> Result<String> {
     if !access::is_reference(term) {
@@ -898,7 +914,9 @@ fn parse_ref_text(bytes: &[u8]) -> Result<u64> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text_str`].
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-pid, or the
+/// typed capability gap `error:unsupported_bif` for an **external** pid — both per
+/// [`pid_text_str`].
 fn pid_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let text = pid_text_str(args[0])?;
     bytes_to_string(ctx, text.as_bytes())
@@ -910,9 +928,10 @@ fn pid_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text_str`], or
-/// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when the heap cannot fit the
-/// binary.
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-pid or the typed
+/// capability gap `error:unsupported_bif` for an **external** pid (both per
+/// [`pid_text_str`]), or [`BeamError::Alloc`](beam_common::BeamError::Alloc) when the
+/// heap cannot fit the binary.
 fn pid_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let text = pid_text_str(args[0])?;
     bits::make_binary(ctx.heap(), text.as_bytes())
@@ -943,7 +962,9 @@ fn list_to_pid_1(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text_str`].
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-reference, or the
+/// typed capability gap `error:unsupported_bif` for an **external** reference — both
+/// per [`ref_text_str`].
 fn ref_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let text = ref_text_str(args[0])?;
     bytes_to_string(ctx, text.as_bytes())
@@ -954,8 +975,9 @@ fn ref_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text_str`], or
-/// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-reference or the
+/// typed capability gap `error:unsupported_bif` for an **external** reference (both
+/// per [`ref_text_str`]), or [`BeamError::Alloc`](beam_common::BeamError::Alloc).
 fn ref_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let text = ref_text_str(args[0])?;
     bits::make_binary(ctx.heap(), text.as_bytes())
@@ -966,8 +988,9 @@ fn ref_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`port_text_str`], or
-/// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-port or the typed
+/// capability gap `error:unsupported_bif` for an **external** port (both per
+/// [`port_text_str`]), or [`BeamError::Alloc`](beam_common::BeamError::Alloc).
 fn port_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let text = port_text_str(args[0])?;
     bits::make_binary(ctx.heap(), text.as_bytes())
