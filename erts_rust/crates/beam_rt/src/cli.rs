@@ -164,8 +164,9 @@ Switches:
   -name N, -sname N         distribution node name
   -setcookie C              distribution cookie
   -config FILE              configuration file (recorded as init:get_argument(config))
-  -boot FILE                boot script: executed by the boot action (a bare invocation);
-                            also recorded as init:get_argument(boot)
+  -boot FILE                boot script: executed before the action's own instruction (every
+                            action but -version; the default script is \"start\"); also
+                            recorded as init:get_argument(boot)
   -emu_flavor emu|jit|smp   emulator flavor
   any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1);
                             a +FLAG is an emulator flag and is not an init argument
@@ -1185,7 +1186,9 @@ fn report_unsupported(reason: &str) -> i32 {
 /// that reaches the boot (`erts/preloaded/src/init.erl:1197-1225`). So `-eval`, `-s`,
 /// `-run`, `run` and the bare `-noshell` all run against a node whose
 /// `kernel`/`stdlib`/`application_controller`/`logger` are really up — exactly as the
-/// oracle's do. `-version` is the one action that never boots: it prints the banner, builds
+/// oracle's do. The script driven is the explicit `-boot FILE` value when one was given,
+/// else `init`'s literal default `start` ([`boot_script_to_drive`], the invocation's one
+/// resolution). `-version` is the one action that never boots: it prints the banner, builds
 /// no runtime and exits.
 ///
 /// The runtime the action built is handed back through `snapshot` — [`run`] needs it to
@@ -1332,6 +1335,10 @@ where
 /// The boot-script drive: resolve `value` the way `init` resolves its `boot` flag and
 /// execute the resulting script (contracts A.7/A.9).
 ///
+/// Every action but `-version` routes here: with the explicit `-boot FILE` value when one was
+/// given, else with `init`'s literal default [`DEFAULT_BOOT_SCRIPT`] (both resolved once by
+/// [`boot_script_to_drive`]).
+///
 /// The runtime boots first: [`Runtime::boot`] is what puts the preloaded set *and* the
 /// system code path in place, and the code path is what resolves `$ROOT` — in `value`
 /// itself and in the script's own `{path, …}` directives. It is idempotent, and
@@ -1345,8 +1352,9 @@ where
 /// the final `{progress,started}` (index 21), so the CLI exits 0 with empty stdout and stderr.
 /// The tail directives are served in-node — `{apply,{c,erlangrc,[]}}` (index 20) issues a
 /// `{open, …}` of `$HOME/.erlang` that the booted `kernel_sup`'s own `file_server_2` child
-/// answers (on this route the native service is spawned **unregistered**). Per-directive
-/// detail is in [`crate::boot`].
+/// answers (on every route that drives a script the runtime's native service is spawned
+/// **unregistered**, so the booted child keeps the name — see
+/// [`RuntimeConfig::drives_a_boot_script`]). Per-directive detail is in [`crate::boot`].
 fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {    runtime.boot()?;
     let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;
     runtime.boot_from_script(&path).map(|_| ())
@@ -2448,11 +2456,13 @@ mod tests {
     }
 
     /// The `-boot FILE` wiring: the switch stays the `boot` **init argument** the oracle
-    /// reports *and* becomes the script value the boot drive resolves. The boot action is
-    /// the only action that carries it (a start instruction keeps the preloaded-only
-    /// floor), so the extraction is pinned per action.
+    /// reports *and* is the value [`boot_file_argument`] reads. The **flag** is
+    /// action-independent — the CLI drives a boot script on every action but `-version`, so
+    /// what differs per action is not whether `-boot` is consulted but which script is driven
+    /// (`init`'s default `start` when the flag is absent) — so the extraction is pinned per
+    /// action.
     #[test]
-    fn boot_switch_is_recorded_and_selected_for_the_boot_action() {
+    fn the_boot_switch_is_recorded_and_is_action_independent() {
         let config = parsed(&["-noshell", "-boot", "start"]);
         assert_eq!(config.action, Action::Boot);
         assert_eq!(
@@ -2465,11 +2475,13 @@ mod tests {
         let config = parsed(&["-boot", "first", "-boot", "second"]);
         assert_eq!(boot_file_argument(&config), Some("first"));
 
-        // No `-boot`: the boot action keeps its preloaded-only drive.
+        // No `-boot`: the argument itself is absent, so the CLI falls back to `init`'s own
+        // default `start` (`boot_script_to_drive`) — nothing is synthesized into the argument.
         assert_eq!(boot_file_argument(&parsed(&["-noshell"])), None);
         assert_eq!(boot_file_argument(&parsed(&[])), None);
-        // The **flag** is action-independent, but only the boot action drives it: a start
-        // instruction keeps the preloaded-only floor (it runs code, not the boot script).
+        // The **flag** is action-independent: it is not "the boot action" that selects it —
+        // the CLI's one boot-script resolution reads it on every action but `-version`, so a
+        // start instruction drives the script it names just as the boot action does.
         let config = parsed(&["-boot", "x", "-eval", "2+3"]);
         assert_eq!(boot_file_argument(&config), Some("x"));
         assert_eq!(config.action, Action::Eval("2+3".to_string()));

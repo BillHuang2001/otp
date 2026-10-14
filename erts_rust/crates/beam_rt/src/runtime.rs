@@ -688,16 +688,16 @@ impl Runtime {
         // service instead of dying with `{noproc,{gen_server,call,[file_server_2,…]}}` (see
         // `src/native/file_server.rs`).
         //
-        // The **boot-script route** is the exception, because there the booted system owns
-        // the name: `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
-        // `file_server_2` child (`{file_server, start_link, []}`), and an **initial** child
-        // start that finds the name already taken aborts that supervisor — `kernel` is
-        // `permanent`, so the node tears down. The native service must therefore leave the name
-        // free and let the booted application serve it. [`RuntimeConfig::drives_a_boot_script`]
-        // is that one predicate: it covers both the CLI's resolved script (the explicit
-        // `-boot FILE` value or `init`'s default, on every action but `-version`) and a
-        // `-boot` init argument a host handed straight to this constructor, while a config
-        // that names no script keeps the name.
+        // The **boot-script route** — every CLI action but `-version`, which resolves the
+        // explicit `-boot FILE` value or `init`'s default `start` — is the exception, because
+        // there the booted system owns the name: `bootstrap/bin/start.boot`'s `kernel_sup`
+        // starts OTP's own `file_server_2` child (`{file_server, start_link, []}`), and an
+        // **initial** child start that finds the name already taken aborts that supervisor —
+        // `kernel` is `permanent`, so the node tears down. The native service must therefore
+        // leave the name free and let the booted application serve it.
+        // [`RuntimeConfig::drives_a_boot_script`] is that one predicate: it covers both the
+        // CLI's resolved script and a `-boot` init argument a host handed straight to this
+        // constructor, while a config that names no script keeps the name.
         let file_services = if config.drives_a_boot_script() {
             crate::native::file_server::FileServices::start_unclaimed(
                 &mut processes,
@@ -1745,8 +1745,10 @@ impl Runtime {
     /// [`Runtime::restart`]'s re-run (and the file whose header `init:script_id/0` reports).
     ///
     /// `None` until a script has been read through [`Runtime::boot_from_script`] /
-    /// [`Runtime::boot_from_script_reporting`] — in particular on the plain `-eval`/`run`
-    /// path, which boots the preloaded set only.
+    /// [`Runtime::boot_from_script_reporting`] — i.e. on a runtime that only ran
+    /// [`Runtime::boot`] (a host-built [`Runtime::with_defaults`], say). Every CLI action that
+    /// builds a runtime loads one: the CLI resolves the explicit `-boot FILE` value or `init`'s
+    /// default `start` for every action but `-version` (see [`RuntimeConfig::drives_a_boot_script`]).
     pub fn boot_script_path(&self) -> Option<&Path> {
         self.boot_script_path.as_deref()
     }
@@ -2708,11 +2710,11 @@ mod tests {
 
     #[test]
     fn a_boot_script_runtime_spawns_the_native_service_unregistered() {
-        // The `-boot FILE` route is the one the native `file_server_2` must NOT claim: the
-        // booted `kernel_sup` starts OTP's own `{file_server, start_link, []}` child, and an
+        // A route that drives a boot script is one the native `file_server_2` must NOT claim:
+        // the booted `kernel_sup` starts OTP's own `{file_server, start_link, []}` child, and an
         // **initial** child start that finds the name taken aborts that `permanent` supervisor
         // (see `src/native/file_server.rs`). `Runtime::new` therefore gates the registration on
-        // `RuntimeConfig::boot_script()` and spawns the service **unclaimed** here.
+        // `RuntimeConfig::drives_a_boot_script()` and spawns the service **unclaimed** here.
         let argv: Vec<String> = ["-noshell", "-boot", "bootstrap/bin/start"]
             .iter()
             .map(|argument| (*argument).to_string())
@@ -2732,8 +2734,8 @@ mod tests {
                 return;
             }
         };
-        // The service process is still spawned — the count is the same as on the default route
-        // — and `init` is still registered; only the `file_server_2` name stays free.
+        // The service process is still spawned — the count is the same as on a route that
+        // drives none — and `init` is still registered; only the `file_server_2` name stays free.
         assert_eq!(booted.processes().len(), 2);
         assert_eq!(
             booted.system_info_value("process_count").expect("count"),
@@ -2747,7 +2749,8 @@ mod tests {
                 "the boot-script route must leave `file_server_2` for the booted system"
             );
         }
-        // The non-boot config keeps it registered, so the two routes really do differ.
+        // A host-built runtime that names no script (`Runtime::with_defaults`: no resolved
+        // script, no `-boot` argument) keeps it registered, so the two routes really do differ.
         let plain = runtime();
         let atom = plain
             .atoms()

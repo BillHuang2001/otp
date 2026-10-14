@@ -40,13 +40,14 @@
 //! 5. a synthetic boot script — compiled at test time with the system toolchain — executes
 //!    end to end and its `{apply, …}` step's side effect is observable
 //!    ([`a_synthetic_boot_script_executes_end_to_end`]);
-//! 6. the **CLI** really drives that executor for `-boot FILE` (contract A.7/A.9): a
+//! 6. the **CLI** really drives that executor (contract A.7/A.9) — on every action but
+//!    `-version`, with the explicit `-boot FILE` value or `init`'s default `start`: a
 //!    synthetic script's `{apply, …}` reaches stdout through the executable
 //!    ([`the_cli_drives_the_boot_script_of_a_boot_flag`]), the real `start.boot` boots all 22
 //!    directives to completion and the CLI exits 0 with empty stdout and stderr
 //!    ([`the_cli_runs_the_real_boot_script_to_completion`]), and a boot with
-//!    **no** `-boot` keeps the preloaded-only drive
-//!    ([`a_boot_without_the_boot_flag_keeps_the_preloaded_only_drive`]);
+//!    **no** `-boot` drives the **default `start` script** all the same
+//!    ([`a_boot_without_the_boot_flag_drives_the_default_start_script`]);
 //! 7. the real boot leaves a live `logger_server` registered as `logger` — instruction 13's
 //!    `{kernelProcess,logger,{logger_server,start_link,[]}}` really starts the child, so
 //!    `is_pid(erlang:whereis(logger))` is `true`
@@ -308,12 +309,14 @@ fn the_real_start_boot_runs_to_completion() {
     // The real `start.boot` now runs to completion: `boot_from_script` walks every directive
     // in order — loading each `primLoad` batch, running all three `kernelProcess` directives
     // (whose servers really register) and then `{apply,{c,erlangrc,[]}}`, whose file consult
-    // reaches `file_server_2`. On **this** route the name is the booted `kernel_sup`'s own
+    // reaches `file_server_2`. On a route that drives a boot script — this `-boot FILE` one,
+    // and every other CLI action but `-version` — the name is the booted `kernel_sup`'s own
     // `file_server_2` child (`lib/kernel/src/kernel.erl` starts `{file_server, start_link, []}`,
     // which registers the name — `file_server.erl:266-269`), because `Runtime::new` spawns the
-    // runtime's **native** service *unclaimed* whenever a `-boot FILE` argument is configured
-    // (`src/runtime.rs`; `RuntimeConfig::boot_script`); on every other route that native service
-    // is the one registered under the name. The consult of `{open,"$HOME/.erlang",[read]}`
+    // runtime's **native** service *unclaimed* whenever
+    // `RuntimeConfig::drives_a_boot_script()` holds (`src/runtime.rs`); only a runtime that
+    // drives no script at all registers that native service under the name. The consult of
+    // `{open,"$HOME/.erlang",[read]}`
     // fails with `{error,enoent}` (this environment has no `$HOME/.erlang`), which
     // `c:erlangrc/0` treats as success, so the executor reaches the final `{progress,started}`
     // directive. It cannot panic or hang — `execute` drives the engine directly (never
@@ -523,8 +526,9 @@ fn a_synthetic_boot_script_executes_end_to_end() {
 // 6. The CLI really drives the boot-script executor (`-boot FILE`)
 // ---------------------------------------------------------------------------
 
-/// Spawns `beam_rt` for a **boot** action (the boot script is only driven when no start
-/// instruction follows), with the crash dump disabled so a failing boot does not litter the
+/// Spawns `beam_rt` for a **boot** action (a bare `-noshell`: the preloaded set, then the
+/// boot script the CLI resolved — the named `-boot FILE` or, when none was given, `init`'s
+/// default `start`), with the crash dump disabled so a failing boot does not litter the
 /// working directory.
 fn beam_rt_boot(args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_beam_rt"));
@@ -778,14 +782,35 @@ fn the_cli_boot_registers_a_live_logger_process() {
 }
 
 #[test]
-fn a_boot_without_the_boot_flag_keeps_the_preloaded_only_drive() {
+fn a_boot_without_the_boot_flag_drives_the_default_start_script() {
     if booted_runtime().is_none() {
         return;
     }
-    // No `-boot`: the boot action loads the 22 preloaded modules and drives no boot script —
-    // no output, exit 0.
+    // No `-boot`: the CLI resolves `init`'s own default `start` (`bootfile/2`,
+    // `erts/preloaded/src/init.erl:1257-1258`) and drives the installed
+    // `<Root>/bin/start.boot`, so the boot action loads the 22 preloaded modules **and** runs
+    // all 22 directives to `{progress,started}`. The drive itself prints nothing — no banner
+    // (the shell is head-less) and no directive output — so the run stays silent: exit 0 with
+    // empty stdout and stderr.
     let output = beam_rt_boot(&["-noshell"]);
     assert_eq!(output.status.code(), Some(0), "stderr {:?}", stderr(&output));
     assert!(output.stdout.is_empty(), "stdout {:?}", stdout(&output));
     assert!(output.stderr.is_empty(), "stderr {:?}", stderr(&output));
+
+    // … and the node really is booted on this route, which is what the default script buys:
+    // its instruction 13 (`{kernelProcess,logger,{logger_server,start_link,[]}}`) leaves a live
+    // process registered as `logger`, exactly as the oracle's does — a preloaded-only runtime
+    // answers `false` here.
+    let probe = beam_rt_boot(&[
+        "-noshell",
+        "-eval",
+        "io:format(\"lg=~p~n\",[is_pid(erlang:whereis(logger))])",
+    ]);
+    assert_eq!(probe.status.code(), Some(0), "probe stderr {:?}", stderr(&probe));
+    assert_eq!(
+        stdout(&probe),
+        "lg=true\n",
+        "the default `start` script must leave a live `logger` (stderr {:?})",
+        stderr(&probe)
+    );
 }

@@ -24,10 +24,12 @@
 //! `{apply,{c,erlangrc,[]}}`, and `c:erlangrc/0` (`lib/stdlib/src/c.erl:1049-1083`) reaches
 //! the file system through `file:path_eval/2` → `file:open/2` →
 //! `gen_server:call(file_server_2, {open,Name,ModeList}, infinity)`. Whichever process owns
-//! the `file_server_2` name answers it: on a **boot-script** run that is the booted
-//! `kernel_sup`'s own `file_server` child (this module's service is then spawned **unclaimed**,
-//! see `FileServices::start_unclaimed`), and on every other route this module's service is
-//! the one registered under the name. With no service registered under that name the call
+//! the `file_server_2` name answers it: on a route that drives a boot script — every CLI
+//! action but `-version`, because the CLI resolves `init`'s default `start` when no `-boot`
+//! flag was given — that is the booted `kernel_sup`'s own `file_server` child (this module's
+//! service is then spawned **unclaimed**, see `FileServices::start_unclaimed`), and only a
+//! runtime that drives no script at all (a host-built [`Runtime::with_defaults`]) registers
+//! this module's service under the name. With no service registered under that name the call
 //! would die with the oracle-shaped
 //! `{noproc,{gen_server,call,[file_server_2,…]}}` and the boot would stop there.
 //!
@@ -235,7 +237,8 @@ impl FileServices {
 
     /// Spawns the `file_server_2` service process **without claiming the name**.
     ///
-    /// This is the route for a runtime driving a **real boot script** (`-boot FILE`), where the
+    /// This is the route for a runtime driving a **boot script** — the explicit `-boot FILE`
+    /// value, or the CLI's resolved default `start`: every action but `-version` — where the
     /// booted system owns the name. `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
     /// `file_server_2` child (`{file_server, start_link, []}`, `kernel.erl`), and an **initial**
     /// child start that finds the name taken aborts the whole supervisor:

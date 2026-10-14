@@ -735,7 +735,11 @@ impl RuntimeConfig {
     /// This is the **name the user typed**, never `init`'s default — see
     /// [`resolved_boot_script`](Self::resolved_boot_script) and
     /// [`boot_script_to_run`](Self::boot_script_to_run) for the script the runtime actually
-    /// drives.
+    /// drives. Overloading this accessor with `init`'s default would be wrong: the `boot` flag
+    /// *is* the init argument (contract A.6), and the oracle answers
+    /// `init:get_argument(boot)` with `error` (a bare atom) when the user gave no `-boot`, so a
+    /// synthesized default here would fabricate an argument the invocation never carried.
+    /// The resolved script lives in its own field for exactly that reason.
     pub fn boot_script(&self) -> Option<&str> {
         let occurrences = self.init_args.get("boot")?;
         let values = occurrences.first()?;
