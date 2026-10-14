@@ -18,12 +18,12 @@
 //
 // %CopyrightEnd%
 
-//! The **delivery** half of `prim_tty:tty_select/2` — the read-select the `prim_tty` reader arms
+//! The **delivery** half of `prim_tty:tty_select/2` — the read-select a `prim_tty` reader arms
 //! before it announces itself.
 //!
 //! [`super::PortRegistry`] owns the runtime's one poller, so this module — a child of the port
 //! layer, exactly like [`super::watch`] — is where a registered descriptor's readiness enters the
-//! runtime. The *answer surface* (`tty_select/2`'s resource check + its `ok`) stays in
+//! runtime. The *answer surface* (`tty_select/2`'s resource check and its `ok`) stays in
 //! [`crate::native::prim_tty`], which owns the caller's arguments.
 //!
 //! # The C ground truth (`erts/emulator/nifs/common/prim_tty_nif.c`)
@@ -47,7 +47,7 @@
 //!   argument, so `enif_select_x` uses the env's own process (`env->proc->common.id`), and with no
 //!   `ERL_NIF_SELECT_CUSTOM_MSG` the message is the 4-tuple `{select, Resource, Ref, EventAtom}`
 //!   built by `prepare_select_msg` (`erl_check_io.c:731-761`) with `ready_input` as the event
-//!   atom. `send_select_msg` (`:836-858`) queues it with `am_system` as the sender.
+//!   atom; `send_select_msg` (`:836-858`) queues it with `am_system` as the sender.
 //! * **`enif_select`'s return value is discarded** — the NIF answers `ok` whether or not the
 //!   registration was accepted, so a refused arming is *not* a raise.
 //!
@@ -55,7 +55,7 @@
 //!
 //! ERTS clears the interest as it queues the message: `erts_poll_wait`'s `ERTS_EV_TYPE_NIF` arm
 //! sets `state->driver.nif->in.pid = NIL` and `state->events &= ~revents`
-//! (`erl_check_io.c:2135-2151`), so the descriptor is polled for readability exactly once per
+//! (`erl_check_io.c:2135-2151`), so the descriptor is polled for readiness exactly once per
 //! `enif_select` call. This module reproduces that literally: [`TtyWatch::take_ready`]
 //! **de-registers** the key as it reports it. `prim_tty:reader/1`
 //! (`lib/kernel/src/prim_tty.erl:440-452`) calls `tty_select/2` **once** for its whole lifetime, so
@@ -74,7 +74,7 @@ use std::collections::HashMap;
 use std::os::fd::RawFd;
 
 use beam_common::Result;
-use beam_io::{Event, Interest, Poller, Token};
+use beam_io::{Interest, Poller, Token};
 use beam_process::ProcessId;
 use beam_term::Eterm;
 
@@ -89,8 +89,7 @@ pub(crate) const TTY_IFD: RawFd = 0;
 ///
 /// It must sit below [`super::watch::SIGNAL_KEY`] (`u64::MAX - 1`) and the poller's own
 /// [`beam_io::WAKER_KEY`] (`u64::MAX`), and the whole reservation must stay above the port-number
-/// space (`beam_process::PortTable::alloc` only hands out numbers below `1 << 60`) — which
-/// [`TTY_KEY_FLOOR`] pins.
+/// space (the port table only hands out numbers below `1 << 60`) — which [`TTY_KEY_FLOOR`] pins.
 const TTY_KEY_TOP: u64 = u64::MAX - 2;
 
 /// The lowest key the reservation may use. A registry that somehow ran through this many
@@ -157,10 +156,10 @@ impl TtyWatch {
     ///
     /// # Errors
     ///
-    /// The poller's own registration failure (`BeamError::Io` when the OS refuses the descriptor —
-    /// fd 0 closed, say) or the typed `system_limit` when the key reservation is exhausted. The C
-    /// **discards** `enif_select`'s answer, so the caller of `tty_select/2` must map a failure to
-    /// "nothing armed" and still answer `ok` (see [`crate::native::prim_tty`]).
+    /// The poller's own registration failure (the OS refuses the descriptor — fd 0 closed, say) or
+    /// the typed `system_limit` when the key reservation is exhausted. The C **discards**
+    /// `enif_select`'s answer, so the caller of `tty_select/2` maps a failure to "nothing armed"
+    /// and still answers `ok` (see [`crate::native::prim_tty`]).
     pub(crate) fn arm(
         &mut self,
         poller: &mut Poller,
@@ -189,21 +188,23 @@ impl TtyWatch {
         Ok(())
     }
 
-    /// The registrations `events` reports ready, **disarming** each — the C's one-shot delivery
-    /// (`erl_check_io.c:2135-2151` clears the interest as the message is queued).
+    /// The registrations whose poller keys are in `keys`, **disarming** each — the C's one-shot
+    /// delivery (`erl_check_io.c:2135-2151` clears the interest as the message is queued).
+    ///
+    /// A key this watch does not own is skipped: a poll round's batch also carries live ports' and
+    /// the signal self-pipe's events.
     ///
     /// # Errors
     ///
-    /// The poller's own de-registration failure. A key this watch does not own is skipped: the
-    /// batch also carries live ports' and the signal self-pipe's events.
+    /// The poller's own de-registration failure.
     pub(crate) fn take_ready(
         &mut self,
         poller: &mut Poller,
-        events: &[Event],
+        keys: &[u64],
     ) -> Result<Vec<(ProcessId, Eterm, Eterm)>> {
         let mut delivered = Vec::new();
-        for event in events {
-            let Some(registration) = self.registrations.remove(&event.key()) else {
+        for key in keys {
+            let Some(registration) = self.registrations.remove(key) else {
                 continue;
             };
             poller.deregister(registration.fd, registration.token)?;
@@ -278,19 +279,15 @@ mod tests {
         assert!(watch.owns(TTY_KEY_TOP), "the first key is the top of the range");
         // The reservation stays outside the port-number space and below the signal sentinel.
         assert!(TTY_KEY_TOP < super::super::watch::SIGNAL_KEY);
-        assert!(TTY_KEY_FLOOR > super::super::watch::SIGNAL_KEY - u64::MAX / 2);
+        assert!(TTY_KEY_FLOOR > 1 << 59, "keys never wrap into the port-number space");
     }
 
     #[test]
-    fn a_readiness_event_is_delivered_exactly_once() {
+    fn a_readiness_report_is_delivered_exactly_once() {
         let (mut poller, mut watch, owner, handle, reference) = armed();
-        // `take_ready` is keyed by the poller key, so the event only has to carry one.
-        let events = vec![Event::new(
-            Token(0),
-            TTY_KEY_TOP,
-            beam_io::Ready::default(),
-        )];
-        let delivered = watch.take_ready(&mut poller, &events).expect("a delivery");
+        let delivered = watch
+            .take_ready(&mut poller, &[TTY_KEY_TOP])
+            .expect("a delivery");
         assert_eq!(delivered.len(), 1);
         let (delivered_owner, delivered_handle, delivered_reference) = delivered[0];
         assert_eq!(delivered_owner, owner);
@@ -298,15 +295,17 @@ mod tests {
         assert_eq!(delivered_reference, reference);
         // One-shot: the interest is disarmed, so a second round reports nothing.
         assert!(!watch.is_armed());
-        assert!(watch.take_ready(&mut poller, &events).expect("nothing").is_empty());
+        assert!(watch
+            .take_ready(&mut poller, &[TTY_KEY_TOP])
+            .expect("nothing armed")
+            .is_empty());
     }
 
     #[test]
-    fn an_event_for_a_key_the_watch_does_not_own_is_ignored() {
+    fn a_key_the_watch_does_not_own_is_ignored() {
         let (mut poller, mut watch, ..) = armed();
-        let events = vec![Event::new(Token(1), 42, beam_io::Ready::default())];
         assert!(watch
-            .take_ready(&mut poller, &events)
+            .take_ready(&mut poller, &[42])
             .expect("a foreign key is skipped")
             .is_empty());
         assert!(watch.is_armed(), "the armed registration is untouched");
@@ -321,8 +320,7 @@ mod tests {
             .expect("a prune");
         assert!(!watch.is_armed(), "{owner:?} is gone, so the select is disarmed");
 
-        let (_poller, mut watch, owner, ..) = armed();
-        let mut poller = Poller::new().expect("a poller");
+        let (mut poller, mut watch, owner, ..) = armed();
         let mut live = HashSet::new();
         live.insert(owner);
         watch
