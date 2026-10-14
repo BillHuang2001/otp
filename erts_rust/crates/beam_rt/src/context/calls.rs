@@ -1042,3 +1042,125 @@ fn invoke_registered(
     }
     bif(context, args)
 }
+#[cfg(test)]
+mod tests {
+    //! Units for the copy-out's **retry policy** (see
+    //! [`RuntimeContext::move_result_into_process_heap`]): the growth hint recovered from the
+    //! copier's own refusal, and the gate that keeps a *permanent* refusal from growing the
+    //! destination at all. The copy itself is exercised end to end by `tests/perf_call.rs`
+    //! (path B copies a container result on every iteration) and the `src/context/tests.rs`
+    //! registered-BIF suites.
+
+    use beam_common::{AllocFailure, AllocKind};
+    use beam_process::SignalAtoms;
+    use beam_term::make_small;
+    use beam_term::prelude::make_header;
+    use super::*;
+
+    /// The number of `Eterm`s a byte figure converts back to.
+    const WORD: usize = core::mem::size_of::<Eterm>();
+
+    /// A `runtime` + a caller-owned `ProcessTable` holding one default process, plus the pid —
+    /// the `for_process` shape, i.e. the one where the copy-out (and its retry) is ON.
+    fn process_table(rt: &mut crate::runtime::Runtime) -> (ProcessTable, beam_process::ProcessId) {
+        let signals = SignalAtoms::from_table(rt.code_server_atoms_mut());
+        let mut table = ProcessTable::new(signals);
+        let pid = table.spawn_default().expect("a default process");
+        (table, pid)
+    }
+
+    #[test]
+    fn the_growth_hint_is_the_copiers_own_shortfall_in_words() {
+        // `beam_message`'s exhaustion error carries `words * size_of::<Eterm>()` in
+        // `AllocFailure::requested` (its documented contract), so dividing recovers exactly the
+        // flat word count the refused copy wanted — with no second traversal of the graph.
+        let exhaustion = BeamError::Alloc(AllocFailure::new(AllocKind::Message, 37 * WORD));
+        assert_eq!(
+            copy_shortfall_words(&exhaustion),
+            37,
+            "the copier's own word count is recovered verbatim"
+        );
+        // A refusal of any other class reports no room request: the conservative `0` (the
+        // caller's `max(256)` floor turns it into a legal growth hint).
+        assert_eq!(copy_shortfall_words(&BeamError::BadArg), 0);
+        assert_eq!(copy_shortfall_words(&BeamError::BadArity), 0);
+        assert_eq!(
+            copy_shortfall_words(&BeamError::Alloc(AllocFailure::new(AllocKind::Heap, 9 * WORD))),
+            9,
+            "any `Alloc` refusal carries its own requested byte count"
+        );
+    }
+
+    #[test]
+    fn a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing() {
+        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+            .expect("the default runtime");
+        let (mut table, pid) = process_table(&mut rt);
+        let spaces_before = table
+            .get(pid)
+            .expect("the spawned process")
+            .collector()
+            .young_space_count();
+        let used_before = table.get(pid).expect("the spawned process").heap().used();
+        let copy = {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            // A bare header word is not a standing term at all (`make_header(0, 0)` is the C
+            // ABI's `THE_NON_VALUE`): `copy_struct` answers the copier's typed malformed-graph
+            // `badarg` — `BeamError::BadArg`, **not** a message-heap exhaustion. Growing the
+            // destination cannot make it succeed, so the retry must not run: no space is
+            // retired, no word is written, and the caller gets `None` (so `call_registered`
+            // leaves both the result and the pooled BIF heap exactly as they were).
+            ctx.move_result_into_process_heap(make_header(0, 0))
+        };
+        assert!(
+            copy.is_none(),
+            "a malformed graph cannot be re-homed; the caller must leave the result untouched"
+        );
+        let process = table.get(pid).expect("the spawned process");
+        assert_eq!(
+            process.collector().young_space_count(),
+            spaces_before,
+            "a permanent refusal must not retire a nursery space (the item-4 growth is per-call)"
+        );
+        assert_eq!(
+            process.heap().used(),
+            used_before,
+            "a refused copy writes no destination word"
+        );
+    }
+
+    #[test]
+    fn an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies() {
+        // The positive control for the gate above: a **valid** container the nursery cannot hold
+        // still grows the destination by the copier's own word count and is copied on the retry.
+        // `lists:seq/2`'s 4000-odd-word result does not fit the default 233-word nursery.
+        use beam_engine::ExecutionContext;
+
+        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+            .expect("the default runtime");
+        let (mut table, pid) = process_table(&mut rt);
+        let spaces_before = table
+            .get(pid)
+            .expect("the spawned process")
+            .collector()
+            .young_space_count();
+        let copied = {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.call_bif("lists", "seq", 2, &[make_small(1), make_small(2000)])
+                .expect("lists:seq(1, 2000)")
+        };
+        assert!(
+            beam_term::prelude::is_list(copied) && !beam_term::literal::is_literal(copied),
+            "the result is a real list built on the process's own heap"
+        );
+        assert!(
+            table
+                .get(pid)
+                .expect("the spawned process")
+                .collector()
+                .young_space_count()
+                > spaces_before,
+            "an exhaustion refusal grows the destination (the retry then fits)"
+        );
+    }
+}
