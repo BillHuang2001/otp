@@ -842,6 +842,29 @@ fn collect_byte_unit(root: Eterm) -> Result<Vec<u8>> {
     Ok(buf.bytes)
 }
 
+/// Flattens an **iodata** argument into the bytes it denotes, without building a term.
+///
+/// The accepted set is exactly `erlang:iolist_to_iovec/1`'s, whose `check_io_list` is
+/// the same one `iolist_to_binary/1` runs (`erl_iolist.c`): a byte-aligned bitstring,
+/// or a (possibly improper, bitstring-tailed) list of bytes, byte-aligned bitstrings
+/// and nested lists; anything else is `badarg`. The top level may be either shape —
+/// unlike [`collect_byte_unit`], which serves the list-only `list_to_bin/1`.
+///
+/// This is the byte view the `zlib:*` BIFs hand to the zlib codec
+/// (`crate::zlib`): their NIFs take their input through `erlang:iolist_to_iovec/1`,
+/// so they accept the same arguments with the same `badarg` cases.
+pub(crate) fn iodata_bytes(root: Eterm) -> Result<Vec<u8>> {
+    // The top level must be a list, `[]` or a (byte-aligned) bitstring — exactly
+    // `iolist_to_iovec_1`'s first two clauses, so a bare integer is `badarg`
+    // (`zlib:compress(42)` ⇒ `badarg`).
+    if !access::is_nil(root) && !access::is_list(root) && !bits::is_bitstring(root) {
+        return Err(badarg());
+    }
+    let mut buf = BitBuf::new();
+    collect_iolist_units(root, Unit::Byte, &mut buf)?;
+    Ok(buf.bytes)
+}
+
 /// `iolist_to_binary(IoListOrBinary)` (`erl_iolist.c:916`).
 ///
 /// Unlike `erlang:list_to_binary/1`, a **bare** byte-aligned binary is a valid

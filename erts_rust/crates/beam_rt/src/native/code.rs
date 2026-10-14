@@ -552,6 +552,69 @@ impl RuntimeContext<'_> {
         }
     }
 
+    /// `code:where_is_file(File)`: the full path of `File` on the code path as a string, or
+    /// the atom `non_existing` when no code-path directory holds it.
+    ///
+    /// `File` is a file of **arbitrary type** — not a module — so the search is the code
+    /// server's own (`code_server.erl:1469-1486`): the code path is walked in order, the
+    /// candidate is `filename:append(Dir, File)`, and the first candidate for which
+    /// `erl_prim_loader:read_file_info/1` answers `{ok,_}` wins. Existence of **any** file type
+    /// counts (a directory or a device node is found just as a regular file is), which is why
+    /// the probe here is a plain existence test rather than the `.beam`-only
+    /// [`Self::path_file`].
+    ///
+    /// `filename:append/2` is the literal `Dir ++ "/" ++ File` (`filename.erl:733-741`): it
+    /// never normalizes separators and never drops a trailing one, so a candidate is built by
+    /// concatenation and not by a path join. Two consequences the oracle cross-check pins: an
+    /// empty `File` answers the first code-path directory with a trailing separator
+    /// (`code:where_is_file("")` ⇒ `"…/<first dir>/"`), and a name carrying a directory
+    /// component (`"ebin/kernel.app"`) is searched as a subpath, which no code-path directory
+    /// holds ⇒ `non_existing`.
+    ///
+    /// This is the entry `application_controller:make_appl/1` uses to locate `kernel.app`
+    /// (`application_controller.erl:1516-1530`), so serving it here is what lets the real
+    /// `start.boot` reach its final directive.
+    ///
+    /// The system library directories are resolved first on a **best-effort** basis, exactly
+    /// as [`Self::code_get_path`] does, so an unresolved system path leaves the configured
+    /// `-pa`/`-pz` entries to be searched rather than failing the call.
+    ///
+    /// `code.erl:1807` guards `is_list(File)`: any other term leaves the wrapper with no
+    /// matching clause, so it raises the bare-atom `function_clause` — the same class
+    /// [`Self::code_priv_dir_1`] reports. A list that is *not* a proper char list names no
+    /// file and is `non_existing` (the oracle's code server crashes on the same input, a
+    /// process death this single-process floor has no counterpart for).
+    ///
+    /// Oracle-verified (OTP 29.1.1 / erts-17.1): `code:where_is_file("kernel.app")` ⇒
+    /// `"…/kernel-11.0.4/ebin/kernel.app"`, `code:where_is_file("no_such_xyz.app")` and
+    /// `code:where_is_file("stdlib.beam")` ⇒ `non_existing`, `code:where_is_file("")` ⇒
+    /// `"…/<first code-path dir>/"`, and `code:where_is_file(42)` ⇒ a `function_clause` raise.
+    pub(super) fn code_where_is_file(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let file = *args.first().ok_or(BeamError::BadArg)?;
+        // The `code.erl:1807` `is_list(File)` guard, with `is_nil` covering the empty list.
+        if !is_list(file) && !is_nil(file) {
+            return Err(super::prim::function_clause());
+        }
+        let Some(name) = self.charlist_string(file) else {
+            return self.atom("non_existing");
+        };
+        let _ = self.runtime.code_server.add_system_paths();
+        // The code path in search order (`code_server.erl:1469-1479`): the first existing
+        // candidate wins.
+        let mut found: Option<String> = None;
+        for dir in self.runtime.code_server.paths() {
+            let candidate = format!("{}/{}", dir.display(), name);
+            if Path::new(&candidate).exists() {
+                found = Some(candidate);
+                break;
+            }
+        }
+        match found {
+            Some(path) => self.charlist(&path),
+            None => self.atom("non_existing"),
+        }
+    }
+
     /// The Erlang string `term` as a Rust `String`.
     ///
     /// `None` unless `term` is a **proper** list of Unicode scalar code points — the only
@@ -1014,6 +1077,116 @@ mod tests {
         assert_eq!(shape, "error:function_clause", "the oracle's own raise shape");
         let error = call(&mut runtime, "code", "priv_dir", &[make_small(42)])
             .expect_err("code:priv_dir(42) raises");
+        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
+    }
+
+    // -- where_is_file/1 ------------------------------------------------------
+
+    #[test]
+    fn code_where_is_file_finds_the_app_file_and_reports_a_missing_one() {
+        // `code:where_is_file/1` is the code-server search (`code_server.erl:1469-1486`): the
+        // code path in order, the candidate `filename:append(Dir, File)`, the first one that
+        // exists. `kernel.app` lives in the kernel application's `ebin`, so the answer is
+        // exactly `code:lib_dir(kernel) ++ "/ebin/kernel.app"`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let kernel = atom(&mut runtime, "kernel");
+        let app_dir =
+            string_of(call(&mut runtime, "code", "lib_dir", &[kernel]).expect("lib_dir"));
+        let query = chars(&mut runtime, "kernel.app");
+        let answer =
+            call(&mut runtime, "code", "where_is_file", &[query]).expect("where_is_file/1");
+        assert!(beam_term::is_list(answer), "a found file answers a string");
+        assert_eq!(string_of(answer), format!("{app_dir}/ebin/kernel.app"));
+
+        // A name no code-path directory holds is the atom `non_existing` — both a genuinely
+        // missing `.app` and an existing application's name that is not a file at all
+        // (`stdlib.beam`).
+        for missing in ["no_such_xyz.app", "stdlib.beam"] {
+            let query = chars(&mut runtime, missing);
+            let answer =
+                call(&mut runtime, "code", "where_is_file", &[query]).expect("where_is_file/1");
+            assert_eq!(
+                runtime.atom_name_of(answer),
+                Some("non_existing"),
+                "code:where_is_file({missing:?})"
+            );
+        }
+
+        // A name carrying a directory component is searched as a subpath
+        // (`filename:append/2` never treats it as absolute and never normalizes it), so it is
+        // `non_existing` as well.
+        let query = chars(&mut runtime, "ebin/kernel.app");
+        let answer =
+            call(&mut runtime, "code", "where_is_file", &[query]).expect("where_is_file/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("non_existing"));
+
+        // An empty name (`[]` is the empty string) answers the first code-path directory with
+        // a trailing separator: `filename:append(".", "")` ⇒ `"./"`.
+        let first = runtime
+            .code_server
+            .paths()
+            .first()
+            .map(|dir| dir.display().to_string())
+            .expect("the system code path resolved");
+        for empty in [beam_term::NIL, chars(&mut runtime, "")] {
+            let answer =
+                call(&mut runtime, "code", "where_is_file", &[empty]).expect("where_is_file/1");
+            assert_eq!(string_of(answer), format!("{first}/"));
+        }
+
+        // `code.erl:1807` guards `is_list(File)`: an atom or an integer leaves the wrapper
+        // with no matching clause, so the call raises the bare-atom `function_clause`.
+        for bad in [make_small(42), atom(&mut runtime, "some_atom")] {
+            let error =
+                call(&mut runtime, "code", "where_is_file", &[bad]).expect_err("no clause");
+            assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
+            assert!(
+                crate::error::unsupported_reason(&error).is_none(),
+                "a function_clause raise is a genuine error, not a capability gap: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_where_is_file_agrees_with_the_oracle() {
+        // The live-oracle cross-check of the search itself: a found application resource, a
+        // missing name and the non-list raise, compared against the system `erl`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let Some(found) = oracle_probe("io:format(\"~s\",[code:where_is_file(\"kernel.app\")])")
+        else {
+            skip_oracle_loudly();
+            return;
+        };
+        let query = chars(&mut runtime, "kernel.app");
+        let ours =
+            call(&mut runtime, "code", "where_is_file", &[query]).expect("where_is_file/1");
+        assert_eq!(string_of(ours), found, "code:where_is_file(\"kernel.app\")");
+
+        let Some(missing) =
+            oracle_probe("io:format(\"~p\",[code:where_is_file(\"no_such_xyz.app\")])")
+        else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(missing, "non_existing", "the oracle's own answer");
+        let query = chars(&mut runtime, "no_such_xyz.app");
+        let ours =
+            call(&mut runtime, "code", "where_is_file", &[query]).expect("where_is_file/1");
+        assert_eq!(runtime.atom_name_of(ours), Some("non_existing"));
+
+        let Some(shape) = oracle_probe(
+            "try code:where_is_file(42) catch Class:Reason -> io:format(\"~p:~p\",[Class,Reason]) end",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(shape, "error:function_clause", "the oracle's own raise shape");
+        let error = call(&mut runtime, "code", "where_is_file", &[make_small(42)])
+            .expect_err("code:where_is_file(42) raises");
         assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
     }
 

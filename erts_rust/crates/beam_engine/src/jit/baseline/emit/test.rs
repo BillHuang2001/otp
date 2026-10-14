@@ -37,7 +37,9 @@ use crate::machine::MAX_REGISTER;
 use super::arith::{FAST_C, SMALL_MASK};
 use super::link::Linker;
 use super::operands::{small_word, x_offset, x_register};
-use super::{emit_step_and_continue, touch, Allocation};
+use super::{emit_helper_call, emit_refresh_y, emit_step_and_continue, fill, touch, Allocation};
+use crate::jit::baseline::runtime::StepHelper;
+use crate::jit::baseline::test_helper::{jit_test, TEST_FALSE, TEST_TRUE};
 
 // ---------------------------------------------------------------------------
 // The `test` subset
@@ -776,7 +778,12 @@ pub(super) fn try_inline_test(
         return Ok(false);
     };
     let Some(plan) = test_plan(module, *kind, *fail, args, labels) else {
-        return Ok(false);
+        // Not one of the word/header shapes the inline subset can decide: a
+        // comparison `test` (a `Y`/float/literal operand, a boxed-vs-boxed compare) is
+        // lowered through the `jit_test` helper instead; anything else — a `NO_FAIL`
+        // form, an unresolved fail label, a type test — keeps today's per-instruction
+        // deopt.
+        return emit_test_helper(buffer, labels, linker, instr, allocation, done, func, pc);
     };
 
     let after: CodeLabel = buffer.label();
@@ -875,6 +882,121 @@ pub(super) fn try_inline_test(
         buffer.bind(deopt)?;
         emit_step_and_continue(buffer, done, allocation, func, pc)?;
     }
+    buffer.bind(after)?;
+    Ok(true)
+}
+
+/// Lower a **comparison** `test` the inline word/header subset refuses — one operand a
+/// `Y` slot, a float register or a literal-area term, or both operands boxed — through
+/// the [`jit_test`] helper, branching to the instruction's fail label **in-block**.
+///
+/// Returns `false` **without having emitted a byte** for any shape the helper does not
+/// own (`NO_FAIL`, an unresolved fail label, a non-comparison kind, an operand count
+/// other than two), so the caller falls back to exactly today's `jit_step_one`.
+///
+/// # Why the helper
+///
+/// The exactness rules of a comparison forbid the pointer compare the inline subset is
+/// built from: an immediate is never equal to a boxed term, and two structurally equal
+/// boxed terms may live at different addresses. The helper therefore evaluates the
+/// instruction with `beam_term`'s own comparison (`jit_test`), which is the
+/// interpreter's evaluation **by construction** — while the emitted code avoids the
+/// interpreter's generic dispatch, the `Step` fold and the driver's block-entry round
+/// trip. The helper's own read of the operands goes through the shared `read_operand`,
+/// which can allocate, so the continue arm refills the cached x-registers.
+///
+/// # The emitted shape
+///
+/// ```text
+///   call jit_test(rt, func, pc)          ; rax = TEST_TRUE | TEST_FALSE | anything else
+///   cmp rax, TEST_TRUE
+///   je  success
+///   cmp rax, TEST_FALSE
+///   je  failed
+///   jmp done                             ; ERROR / a decline word: the driver decodes it
+/// success:
+///   fill                                 ; the helper ran `read_operand` on `machine.x`
+///   <gated jit_refresh_y>                ; only when a later in-block instruction uses Y
+///   jmp after
+/// failed:
+///   <linker.emit_exit to (fail_func, fail_pc)>
+/// after:
+/// ```
+///
+/// The `failed` exit is the linker's: a fail label the compilation emitted as a block is
+/// jumped to **directly** (its own frame teardown replaces this block's), and any other
+/// resolved target returns its `(func, pc)` word to the driver exactly as a deopt does.
+/// A word that is neither boolean is left in `rax` for the driver, which decodes it
+/// exactly as it decodes any other block return — the cached x-registers were already
+/// spilled by `emit_helper_call`.
+fn emit_test_helper(
+    buffer: &mut CodeBuffer,
+    labels: &LabelMap,
+    linker: &Linker<'_>,
+    instr: &Instr,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+) -> Result<bool> {
+    let Instr::Test { kind, fail, args } = instr else {
+        return Ok(false);
+    };
+    // The helper owns exactly the six comparison kinds (see `jit_test`).
+    if !matches!(
+        kind,
+        TestKind::IsEqExact
+            | TestKind::IsNeExact
+            | TestKind::IsEq
+            | TestKind::IsNe
+            | TestKind::IsLt
+            | TestKind::IsGe
+    ) || args.len() != 2
+        || *fail == NO_FAIL
+    {
+        return Ok(false);
+    }
+    // The in-block fail branch needs the resolved target at compile time; an unresolved
+    // label keeps the interpreter's exact diagnostic.
+    let Ok((fail_func, fail_pc)) = labels.resolve(*fail) else {
+        return Ok(false);
+    };
+
+    let after: CodeLabel = buffer.label();
+    let success: CodeLabel = buffer.label();
+    let failed: CodeLabel = buffer.label();
+
+    let helper: StepHelper = jit_test;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[i64::from(func), i64::from(pc)],
+    )?;
+
+    buffer.mov_ri(Reg::R11, TEST_TRUE)?;
+    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+    buffer.jcc(Cond::E, success)?;
+    buffer.mov_ri(Reg::R11, TEST_FALSE)?;
+    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+    buffer.jcc(Cond::E, failed)?;
+    buffer.jmp(done)?;
+
+    buffer.bind(success)?;
+    // The helper ran the shared `read_operand`, which may allocate (a non-small
+    // `Integer`/`Character` materializes an exact bignum), so the cached x-registers are
+    // stale and must be refilled. The Y window is re-published on the **continue** arm
+    // under the same compile-time gate `emit_continue_check` uses — a block whose later
+    // instructions still access a `Y` slot pays the refresh, a `Y`-free block nothing.
+    fill(buffer, allocation)?;
+    if allocation.refresh_y_after(pc) {
+        emit_refresh_y(buffer)?;
+    }
+    buffer.jmp(after)?;
+
+    buffer.bind(failed)?;
+    linker.emit_exit(buffer, allocation, done, fail_func, fail_pc)?;
+
     buffer.bind(after)?;
     Ok(true)
 }

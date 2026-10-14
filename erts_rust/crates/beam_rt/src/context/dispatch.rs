@@ -22,9 +22,11 @@
 //!
 //! A registered BIF call pays a *prologue* before the implementation runs: one
 //! [`BifRegistry`](beam_bifs::BifRegistry) lookup plus one evaluation of each hook predicate
-//! over `beam_bifs`' `&'static` rosters. [`DispatchMemo`] caches that prologue's answer per
-//! `(module, function, arity)` on the context, and [`DispatchHooks`] carries the per-key
-//! roster so `call_registered` selects its arm from one value.
+//! over `beam_bifs`' `&'static` rosters. [`DispatchMemo`] caches that prologue's answer — the
+//! **resolved** implementation *and* the roster — per `(module, function, arity)` on the
+//! context, and [`DispatchHooks`] carries the per-key roster so `call_registered` selects its
+//! arm from one value and then invokes the memoized implementation directly (no second
+//! registry lookup).
 
 use beam_bifs::BifFn;
 use beam_engine::terms;
@@ -41,21 +43,44 @@ pub(super) const DISPATCH_MEMO_SLOTS: usize = 8;
 
 /// The slot `(module, function, arity)` is memoized in.
 ///
-/// Deliberately trivial (three length/multiplier mixes and a mask): it only has to spread the
-/// handful of distinct keys a real call site dispatches, and it must cost far less than the
-/// memo lookup it indexes.
+/// A **byte-level** fold of the key (FNV-1a over `module`, a `0xFF` separator, `function`, then
+/// the arity) masked to the slot count — one multiply per name byte, still far cheaper than the
+/// memo lookup it indexes. Hashing the **lengths** alone is not enough: any two same-length keys
+/// collide **by construction** (the initial `module.len()`/`function.len()` mix), so the natural
+/// loop `ets:insert/2` · `ets:lookup/2` — which then costs the whole miss prologue (a registry
+/// lookup, the ten `needs_*` `binary_search`es and two `String` allocations) on **every**
+/// iteration — is a permanent miss. A collision only ever costs work (a miss recomputes; it can
+/// never change an answer), so spreading same-length keys is behaviour-preserving.
 pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
-    (module.len().wrapping_mul(7)
-        ^ function.len().wrapping_mul(13)
-        ^ (arity as usize).wrapping_mul(29))
-        & (DISPATCH_MEMO_SLOTS - 1)
+    // The 64-bit FNV-1a offset basis and prime.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    // The `0xFF` separator keeps `("ab","c")` from folding like `("a","bc")`.
+    let mut hash = OFFSET;
+    for byte in module
+        .bytes()
+        .chain(core::iter::once(0xFF))
+        .chain(function.bytes())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+    }
+    hash = (hash ^ u64::from(arity)).wrapping_mul(PRIME);
+    // A fixed avalanche multiplier applied after the fold, then the **high** bits (the ones the
+    // multiply mixes into). `MIX` is a chosen constant, not a derivation: the memo has only
+    // `DISPATCH_MEMO_SLOTS` slots, so with more hot keys than slots *some* pair must share one,
+    // and this is the choice that keeps the crate's measured hot key set — `lists:reverse/1`,
+    // `erlang:length/1`, the `ets:insert/2` · `ets:lookup/2` pair and the `erlang` arithmetic
+    // rows — on distinct slots (the `perf_call` harness rows report them). A collision costs a
+    // recomputed prologue and never a different answer.
+    const MIX: u64 = 0xa5d2_b6a8_e9c1_9f9f;
+    (hash.wrapping_mul(MIX) >> (64 - DISPATCH_MEMO_SLOTS.trailing_zeros() as u64)) as usize
 }
 
 /// The `beam_bifs` hook roster one `(module, function, arity)` key needs.
 ///
 /// One field per `uses_*` predicate — i.e. per mutually-exclusive bridge arm plus the two
 /// build gates (`fun_identity`, `memory_hook`) — so [`RuntimeContext::call_registered`] can
-/// select its arm from one value instead of running thirteen `binary_search`es over
+/// select its arm from one value instead of running ten `binary_search`es over
 /// [`beam_bifs`]' `&'static` rosters (each of which is a chain of `bcmp` calls across a crate
 /// boundary, and together the dominant cost of the dispatch prologue).
 ///
@@ -124,14 +149,22 @@ impl DispatchHooks {
 #[derive(Clone, Copy)]
 pub(super) struct DispatchAnswer {
     /// The `beam_bifs` implementation registered for the key, if any. `Some` is exactly
-    /// [`BifRegistry::contains`](beam_bifs::BifRegistry::contains) being `true`, so
-    /// [`RuntimeContext::call_bif`] uses it in place of the registry lookup.
+    /// [`BifRegistry::contains`](beam_bifs::BifRegistry::contains) being `true`
+    /// ([`BifRegistry::lookup`](beam_bifs::BifRegistry::lookup) is the **single** source of truth
+    /// for "is this key registered", and it is what produced this field), and
+    /// [`RuntimeContext::call_bif`] therefore passes the resolved [`BifFn`] straight to
+    /// [`RuntimeContext::call_registered`], which invokes it directly instead of re-running the
+    /// registry lookup — rather than using the registry's `call`.
     pub(super) bif: Option<BifFn>,
     /// The [`beam_bifs`] hook roster the key needs.
     pub(super) hooks: DispatchHooks,
 }
 
 /// The per-context memo of [`RuntimeContext::dispatch`] answers.
+///
+/// The memoized answer is the **whole** prologue result — the resolved [`BifFn`] *and* the hook
+/// roster — so a hit skips both halves: the registry lookup and the ten `needs_*`
+/// `binary_search`es.
 ///
 /// # Why a cached answer can never go stale (the soundness argument)
 ///
@@ -190,10 +223,11 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A miss computes the answer — one registry `lookup` plus one evaluation of each
     /// `uses_*` predicate, the dispatch prologue's dominant cost — and memoizes it; a slot
-    /// collision overwrites, and the evicted key recomputes on its next call. See
-    /// [`DispatchMemo`] for why a cached answer can never go stale, and note that the answer
-    /// deliberately says nothing about the **NIF registry**, which `call_bif` still consults
-    /// first on every call.
+    /// collision overwrites, and the evicted key recomputes on its next call.
+    /// [`Self::call_registered`] then invokes the memoized [`BifFn`] **directly**, so a hit costs
+    /// no registry lookup at all. See [`DispatchMemo`] for why a cached answer can never go
+    /// stale, and note that the answer deliberately says nothing about the **NIF registry**,
+    /// which `call_bif` still consults first on every call.
     pub(super) fn dispatch(&mut self, module: &str, function: &str, arity: u32) -> DispatchAnswer {
         let slot = dispatch_slot(module, function, arity);
         if let Some(entry) = &self.dispatch_memo.slots[slot] {

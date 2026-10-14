@@ -363,9 +363,13 @@ fn a_refc_binary_with_no_owning_handle_is_flattened() {
 }
 
 /// The flatten fallback is **sized** as the flattened block, not as the 8-word pair: a refc binary
-/// with no held handle takes the preflight path against `heap_bits_size_words(size)`, so a dirty
-/// destination with exactly that head-room accepts the copy and one word less refuses it **before
-/// writing a word** — the no-partial-write contract the context-aware sizing exists to preserve.
+/// with no held handle is copied at `heap_bits_size_words(size)`, so a destination with exactly that
+/// much head-room accepts the copy and one word less refuses it **before writing a word** — the
+/// no-partial-write contract the context-aware sizing exists to preserve.
+///
+/// Both destinations below are DIRTY (one/two words pre-charged) with an EMPTY off-heap table, so
+/// both take the single-pass fast path; the refusal case is then re-derived by the preflight path,
+/// whose `refc_binary_words` supplies the context-aware flattened size.
 #[test]
 fn a_flattened_refc_binary_is_preflighted_at_the_flattened_size() {
     let bytes = payload();
@@ -380,8 +384,8 @@ fn a_flattened_refc_binary_is_preflighted_at_the_flattened_size() {
     let original = unsafe { refc_binary_term(&mut src, data_ptr, bytes.len()) };
     let src_off = OffHeapTable::new();
 
-    // A DIRTY destination (one word already handed out) takes the preflight path; exactly `total`
-    // words of head-room left must admit the flattened window.
+    // A DIRTY destination (one word already handed out, empty off-heap table, so the single-pass
+    // fast path): exactly `total` words of head-room left must admit the flattened window.
     let mut dst = Heap::new(total + 1).expect("destination heap");
     // SAFETY: the heap owns the word.
     unsafe { dst.alloc_words(1).expect("the pre-charge fits") };
@@ -389,13 +393,15 @@ fn a_flattened_refc_binary_is_preflighted_at_the_flattened_size() {
     let copy = {
         let mut ctx = CopyContext::new(&src_off, &mut dst_off);
         copy_struct(original, &mut dst, &mut ctx)
-            .expect("the ctx-aware preflight admits the flattened window")
+            .expect("the ctx-aware sizing admits the flattened window")
     };
     assert_eq!(dst.used(), 1 + total);
     // SAFETY: `copy` is a live on-heap bitstring covering the whole window.
     assert_eq!(unsafe { bitstring_parts(copy) }.2, bits);
 
-    // One word short: the whole copy is refused as a message-heap exhaustion, writing nothing.
+    // One word short: the whole copy is refused as a message-heap exhaustion, writing nothing — and
+    // the two words the destination already held are left exactly where they were (the abandoned
+    // single-pass attempt never advanced the heap, so nothing is rewound or discarded).
     let mut short = Heap::new(total + 1).expect("destination heap");
     // SAFETY: the heap owns both words.
     unsafe { short.alloc_words(2).expect("the pre-charge fits") };

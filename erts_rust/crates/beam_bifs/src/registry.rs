@@ -123,6 +123,7 @@ impl BifRegistry {
         crate::binconv::register(&mut reg);
         crate::unicode::register(&mut reg);
         crate::time::register(&mut reg);
+        crate::zlib::register(&mut reg);
         crate::proc::register(&mut reg);
         crate::dict::register(&mut reg);
         crate::reason::register(&mut reg);

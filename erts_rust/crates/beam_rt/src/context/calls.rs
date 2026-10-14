@@ -62,8 +62,8 @@
 use std::rc::Rc;
 
 use beam_abi::nif::loader::NifCallError;
-use beam_bifs::BifContext;
-use beam_common::Result;
+use beam_bifs::{BifContext, BifFn};
+use beam_common::{BeamError, Result};
 use beam_process::ProcessTable;
 use beam_term::Eterm;
 
@@ -119,8 +119,19 @@ impl<'a> RuntimeContext<'a> {
     /// **instead of** the fun-caller bridge. No dict BIF applies a fun argument, so nothing
     /// is lost (see [`DictBridge`]).
 
+    /// # The implementation is already resolved
+    ///
+    /// `bif` is the [`BifFn`] the per-context dispatch memo resolved
+    /// ([`Self::dispatch`] → `BifRegistry::lookup`), so this method invokes it **directly**
+    /// through [`invoke_registered`] instead of re-entering `BifRegistry::call` — which would
+    /// re-hash the two names on every call, the dominant cost of the prologue. The registry
+    /// lookup stays the **single** source of truth for "is this key registered": it ran once to
+    /// produce `bif`, and [`Self::call_bif_routed`] only reaches this method when it answered
+    /// `Some`.
+
     pub(super) fn call_registered(
         &mut self,
+        bif: BifFn,
         module: &str,
         function: &str,
         arity: u32,
@@ -129,7 +140,6 @@ impl<'a> RuntimeContext<'a> {
     ) -> Result<Eterm> {
         // Cheap handles that do NOT borrow the runtime: the runtime stays free for the
         // fun-caller bridge.
-        let registry = Rc::clone(&self.runtime.registry);
         let atoms = self.runtime.code_server.atoms_handle();
         let tables_handle = Rc::clone(&self.runtime.tables);
         let ports_handle = Rc::clone(&self.runtime.ports);
@@ -339,7 +349,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_process_hook {
                 // The eleven process/name/global-state BIFs: the bridge borrows the process
                 // table (the caller-supplied pass table when there is one, else the
@@ -370,7 +380,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_nif_loader {
                 // `erlang:load_nif/2`: the NIF bridge needs `&mut Runtime` (to store the loaded
                 // library in the runtime's NIF registry), so it is the only runtime borrow in
@@ -401,7 +411,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_record_source {
                 // `records:get_definition/2` answers from the *loaded module's* `Recs` chunk,
                 // which lives in the code server's module map — a `&CodeServer` borrow, so it
@@ -427,7 +437,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_send_hook {
                 // `erlang:send/2`/`erlang:'!'/2` (`SendBridge`): the delivery bridge borrows the
                 // whole `Runtime` (it delegates to the existing `RuntimeContext::send_message`
@@ -460,7 +470,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_module_info {
                 // `erlang:get_module_info/1,2`: answers from the loaded module's IR — a
                 // `&CodeServer` borrow, its own mutually exclusive arm. It applies no fun
@@ -485,7 +495,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_persistent_term {
                 // The seven `persistent_term:*` BIFs: a cheap `Rc` clone of the
                 // node-global store, plus a clone of the shared atom-table handle so the
@@ -534,7 +544,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_runtime_hooks {
                 // The runtime-coupled BIF families (`RuntimeHooksBridge`): the timer heap and
                 // reference space (`&mut Runtime`) plus the caller's process table
@@ -565,7 +575,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else {
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
@@ -596,7 +606,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             }
         };
         // The result is still on the pooled BIF heap. Left there it is a container in a region
@@ -737,24 +747,37 @@ impl<'a> RuntimeContext<'a> {
         // for byte (the result stays on the pooled heap, which is then not rewound).
         let table = mailbox_table.as_deref_mut()?;
         let process = table.get_mut(pid)?;
-        let copied = {
-            let src = beam_message::OffHeapTable::new();
-            let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
-            beam_message::copy_struct(term, process.heap_mut(), &mut ctx)
-        };
-        if let Ok(copied) = copied {
-            return Some(copied);
-        }
-        // The nursery could not serve the copy: GROW (retiring the old space, moving nothing) and
-        // retry once. `size_object` is the graph's flat word count and the floor of 256 keeps a
-        // small result from landing exactly on the current space's edge.
-        let hint = beam_term::size::size_object(term).max(256);
-        process.grow_nursery(hint).ok()?;
-        // A fresh `CopyContext` over the (now current) grown space, whose bump pointer is at its
-        // base. Nothing the first attempt wrote needs unwinding: a non-clean destination takes
-        // `copy_struct`'s preflight path, which refuses **before** writing any destination word.
+        // **One** source table and **one** `CopyContext`, shared by the (at most two) attempts
+        // below. Neither construction allocates, and a refused attempt leaves both the
+        // destination heap and the off-heap table exactly as they were — the copier's optimistic
+        // single-pass attempt rolls its own off-heap pushes back before the preflight path
+        // re-derives the outcome, and the preflight path refuses *before* writing a destination
+        // word — so a retry needs no fresh pair.
         let src = beam_message::OffHeapTable::new();
         let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
+        let needed = match beam_message::copy_struct(term, process.heap_mut(), &mut ctx) {
+            Ok(copied) => return Some(copied),
+            Err(error) if !beam_message::is_message_heap_exhaustion(&error) => {
+                // A refusal that is **not** the destination running out of room — above all the
+                // copier's malformed-graph `badarg` — is permanent: growing the destination
+                // cannot fix it, so a retry would re-walk the whole graph, grow a whole space for
+                // nothing and fail again with the very same reason. Leave both the result and the
+                // pool exactly as they were.
+                return None;
+            }
+            // The destination could not hold the graph. The copier's **own** preflight has
+            // already counted the flat words it wanted and reports that count back in the
+            // exhaustion error (`AllocFailure::requested`, the `beam_message::error` contract's
+            // `words * size_of::<Eterm>()`), so the growth hint costs no second traversal of the
+            // graph: `beam_term::size_object(term)` — the obvious alternative — walks it all over
+            // again *and* builds a `HashSet` plus a `Vec` on the way.
+            Err(error) => copy_shortfall_words(&error),
+        };
+        // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
+        // and moves no live term, so the copy can simply be re-attempted from the fresh space's
+        // base — `needed` is the copier's exact flat word count, so the retry fits. The floor of
+        // 256 keeps a small result from landing exactly on the new space's edge.
+        process.grow_nursery(needed.max(256)).ok()?;
         beam_message::copy_struct(term, process.heap_mut(), &mut ctx).ok()
     }
 
@@ -788,8 +811,14 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Option<Eterm>> {
-        if !self.runtime.nifs.borrow().lookup(module, function, arity) {
-            return Ok(None);
+        {
+            // The registry is normally **empty** — only `load_nif/2` ever fills it — so
+            // `is_empty()` (a length compare) short-circuits *before* the `HashMap` SipHash of
+            // the module name that `lookup` pays on this fast path.
+            let nifs = self.runtime.nifs.borrow();
+            if nifs.is_empty() || !nifs.lookup(module, function, arity) {
+                return Ok(None);
+            }
         }
         let atoms = self.runtime.code_server.atoms_handle();
         let mut interner = PendingInterner::new(atoms.len());
@@ -881,7 +910,10 @@ impl RuntimeContext<'_> {
             return result.map_err(error::enforce_term_heap_limit);
         }
         let dispatch = self.dispatch(module, function, arity);
-        if dispatch.bif.is_some() {
+        // `Some` is exactly "the registry has this key" — the memo resolved it through
+        // `BifRegistry::lookup`, which stays the single source of truth — and the resolved
+        // `BifFn` is what `call_registered` invokes (no second registry lookup).
+        if let Some(bif) = dispatch.bif {
             // A table-creating `ets:new/2` is observed here so the runtime's owner index can
             // release the table when its creator dies (see `crate::runtime::ets_owner`). Only
             // a `named_table` is reachable through the registry's *public* surface, so only it
@@ -895,7 +927,8 @@ impl RuntimeContext<'_> {
                     .filter(|term| beam_term::is_atom(*term))
                     .map(beam_term::atom_val);
                 let before = name.and_then(|atom| self.runtime.tables.borrow().lookup_name(atom));
-                let result = self.call_registered(module, function, arity, args, dispatch.hooks);
+                let result =
+                    self.call_registered(bif, module, function, arity, args, dispatch.hooks);
                 if let (Some(atom), Ok(_)) = (name, &result) {
                     let after = self.runtime.tables.borrow().lookup_name(atom);
                     if let Some(handle) = after.filter(|handle| Some(*handle) != before) {
@@ -907,7 +940,7 @@ impl RuntimeContext<'_> {
                 }
                 return result;
             }
-            return self.call_registered(module, function, arity, args, dispatch.hooks);
+            return self.call_registered(bif, module, function, arity, args, dispatch.hooks);
         }
         if module == "erlang" {
             // The **effective** gap set: the curated list intersected with what the live
@@ -961,5 +994,173 @@ impl RuntimeContext<'_> {
         if foreign {
             self.runtime.note_foreign_reachable(pid);
         }
+    }
+}
+
+/// The flat word count a refused copy reported it could not fit.
+///
+/// [`beam_message`]'s **message-heap exhaustion** ([`beam_message::is_message_heap_exhaustion`])
+/// carries the copier's own preflight shortfall: `AllocFailure::requested` is the flat term-word
+/// count the copy wanted, in bytes (the `beam_message::error` module's documented
+/// `words * size_of::<Eterm>()`), so recovering it here is free.
+///
+/// [`beam_term::size_object`], the obvious alternative, is a **second full traversal** of a graph
+/// the copier has just walked — and one that additionally builds a `HashSet` and a `Vec` to defend
+/// against a forged cycle. Paying for it on every refused copy is what this helper removes.
+///
+/// A refusal of any other class reports no room request at all; the returned `0` is the
+/// conservative answer, because the caller's floor raises it to a legal growth hint.
+fn copy_shortfall_words(error: &BeamError) -> usize {
+    match error {
+        BeamError::Alloc(failure) => failure.requested / core::mem::size_of::<Eterm>(),
+        // Unreachable from [`RuntimeContext::move_result_into_process_heap`], which only reaches
+        // this for `is_message_heap_exhaustion` (which implies the `Alloc` variant).
+        _ => 0,
+    }
+}
+
+/// Invokes a `beam_bifs` implementation the dispatch memo already **resolved**.
+///
+/// This is [`BifRegistry::call`](beam_bifs::BifRegistry::call) minus the registry lookup. The
+/// memo holds the [`BifFn`] `BifRegistry::lookup` returned — the registry's own answer to "is this
+/// key registered", so it can never become a second, drifting registry — and re-running that
+/// lookup here would only re-hash the two names, which is the dominant cost of the dispatch
+/// prologue ([`super::dispatch`]) and exactly what memoizing the implementation is for.
+///
+/// What is invoked and what it returns are **unchanged**: the arity check `BifRegistry::call`
+/// performs is reproduced byte for byte (`args.len() != arity` is the same `error:badarity`
+/// [`BeamError::BadArity`] the registry raises), and the implementation is called with the same
+/// context and the same argument slice. Only the lookup in front of it is gone.
+fn invoke_registered(
+    bif: BifFn,
+    arity: u32,
+    context: &mut BifContext<'_>,
+    args: &[Eterm],
+) -> Result<Eterm> {
+    if args.len() != arity as usize {
+        return Err(BeamError::BadArity);
+    }
+    bif(context, args)
+}
+#[cfg(test)]
+mod tests {
+    //! Units for the copy-out's **retry policy** (see
+    //! [`RuntimeContext::move_result_into_process_heap`]): the growth hint recovered from the
+    //! copier's own refusal, and the gate that keeps a *permanent* refusal from growing the
+    //! destination at all. The copy itself is exercised end to end by `tests/perf_call.rs`
+    //! (path B copies a container result on every iteration) and the `src/context/tests.rs`
+    //! registered-BIF suites.
+
+    use beam_common::{AllocFailure, AllocKind};
+    use beam_process::SignalAtoms;
+    use beam_term::make_small;
+    use beam_term::prelude::make_header;
+    use super::*;
+
+    /// The number of `Eterm`s a byte figure converts back to.
+    const WORD: usize = core::mem::size_of::<Eterm>();
+
+    /// A `runtime` + a caller-owned `ProcessTable` holding one default process, plus the pid —
+    /// the `for_process` shape, i.e. the one where the copy-out (and its retry) is ON.
+    fn process_table(rt: &mut crate::runtime::Runtime) -> (ProcessTable, beam_process::ProcessId) {
+        let signals = SignalAtoms::from_table(rt.code_server_atoms_mut());
+        let mut table = ProcessTable::new(signals);
+        let pid = table.spawn_default().expect("a default process");
+        (table, pid)
+    }
+
+    #[test]
+    fn the_growth_hint_is_the_copiers_own_shortfall_in_words() {
+        // `beam_message`'s exhaustion error carries `words * size_of::<Eterm>()` in
+        // `AllocFailure::requested` (its documented contract), so dividing recovers exactly the
+        // flat word count the refused copy wanted — with no second traversal of the graph.
+        let exhaustion = BeamError::Alloc(AllocFailure::new(AllocKind::Message, 37 * WORD));
+        assert_eq!(
+            copy_shortfall_words(&exhaustion),
+            37,
+            "the copier's own word count is recovered verbatim"
+        );
+        // A refusal of any other class reports no room request: the conservative `0` (the
+        // caller's `max(256)` floor turns it into a legal growth hint).
+        assert_eq!(copy_shortfall_words(&BeamError::BadArg), 0);
+        assert_eq!(copy_shortfall_words(&BeamError::BadArity), 0);
+        assert_eq!(
+            copy_shortfall_words(&BeamError::Alloc(AllocFailure::new(AllocKind::Heap, 9 * WORD))),
+            9,
+            "any `Alloc` refusal carries its own requested byte count"
+        );
+    }
+
+    #[test]
+    fn a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing() {
+        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+            .expect("the default runtime");
+        let (mut table, pid) = process_table(&mut rt);
+        let spaces_before = table
+            .get(pid)
+            .expect("the spawned process")
+            .collector()
+            .young_space_count();
+        let used_before = table.get(pid).expect("the spawned process").heap().used();
+        let copy = {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            // A bare header word is not a standing term at all (`make_header(0, 0)` is the C
+            // ABI's `THE_NON_VALUE`): `copy_struct` answers the copier's typed malformed-graph
+            // `badarg` — `BeamError::BadArg`, **not** a message-heap exhaustion. Growing the
+            // destination cannot make it succeed, so the retry must not run: no space is
+            // retired, no word is written, and the caller gets `None` (so `call_registered`
+            // leaves both the result and the pooled BIF heap exactly as they were).
+            ctx.move_result_into_process_heap(make_header(0, 0))
+        };
+        assert!(
+            copy.is_none(),
+            "a malformed graph cannot be re-homed; the caller must leave the result untouched"
+        );
+        let process = table.get(pid).expect("the spawned process");
+        assert_eq!(
+            process.collector().young_space_count(),
+            spaces_before,
+            "a permanent refusal must not retire a nursery space (the item-4 growth is per-call)"
+        );
+        assert_eq!(
+            process.heap().used(),
+            used_before,
+            "a refused copy writes no destination word"
+        );
+    }
+
+    #[test]
+    fn an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies() {
+        // The positive control for the gate above: a **valid** container the nursery cannot hold
+        // still grows the destination by the copier's own word count and is copied on the retry.
+        // `lists:seq/2`'s 4000-odd-word result does not fit the default 233-word nursery.
+        use beam_engine::ExecutionContext;
+
+        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+            .expect("the default runtime");
+        let (mut table, pid) = process_table(&mut rt);
+        let spaces_before = table
+            .get(pid)
+            .expect("the spawned process")
+            .collector()
+            .young_space_count();
+        let copied = {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.call_bif("lists", "seq", 2, &[make_small(1), make_small(2000)])
+                .expect("lists:seq(1, 2000)")
+        };
+        assert!(
+            beam_term::prelude::is_list(copied) && !beam_term::literal::is_literal(copied),
+            "the result is a real list built on the process's own heap"
+        );
+        assert!(
+            table
+                .get(pid)
+                .expect("the spawned process")
+                .collector()
+                .young_space_count()
+                > spaces_before,
+            "an exhaustion refusal grows the destination (the retry then fits)"
+        );
     }
 }

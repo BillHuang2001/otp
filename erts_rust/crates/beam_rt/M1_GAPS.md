@@ -321,12 +321,21 @@ loop that keeps such a result alive grows peak memory with its iteration count. 
 (`Process::heap_mut()`, the very space the engine's allocation seams bump and the collector **scans**)
 and then rewinds the pool to the offset it read before the call (below), so the result is kept alive by
 the root set the engine already publishes (it lands in `x(0)` on return) and is relocated by a later
-collection, while the pool serves the next call from that offset. The copy is `beam_message::copy_struct` with an **empty** source
-`OffHeapTable`; a full nursery is met by `Process::grow_nursery` (the **no-relocation** seam — inside a
-BIF call the machine's live x registers and stack are **not** published, so a collecting
-`Process::ensure_capacity` would free live terms) and **one** retry, the second attempt running on a
-fresh `CopyContext` (a refused first attempt takes `copy_struct`'s preflight path, which writes no
-destination word). The empty source table is load-bearing: with no payload owner the copier
+collection, while the pool serves the next call from that offset.
+The copy is `beam_message::copy_struct` with an **empty** source `OffHeapTable`; a full nursery is met by
+`Process::grow_nursery(hint)` (the **no-relocation** seam — inside a BIF call the machine's live x
+registers and stack are **not** published, so a collecting `Process::ensure_capacity` would free live
+terms) and **one** retry, the growth hint being the copier's **own** preflight count reported back in the
+refusal (`AllocFailure::requested / size_of::<Eterm>()`, so the growth costs no second graph walk —
+`beam_term::size_object` would walk the graph again and build a `HashSet` plus a `Vec`).
+One `OffHeapTable`/`CopyContext` pair is shared by both attempts: a refused attempt rolls its own
+off-heap pushes back and takes the preflight path, which writes no destination word.
+The retry is reached **only** for `beam_message::is_message_heap_exhaustion`; every other refusal a legal
+BIF result can produce (the malformed-graph `badarg`, an `AllocKind::Heap`/`LiveObject` failure from a
+nested push, a raised reason) is permanent for this destination, so the move answers `None` without
+growing a space — pinned by `src/context/calls.rs::tests::a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing`
+and its positive control `an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies`.
+The empty source table is load-bearing: with no payload owner the copier
 **flattens** a refc binary's window into a self-contained on-heap bitstring (byte-faithful, nothing
 registered in the destination table, no refcount lost), and an off-heap **MSO** reference with no owner
 is the copier's typed `bad_term`, so the move answers `None` — the pool is then not rewound and the
@@ -363,6 +372,34 @@ to the pointer-stable arena. Pinned by `src/context/tests.rs`'s
 `a_partially_used_pool_is_rewound_to_the_callers_mark` and
 `an_escaping_arm_does_not_rewind_a_partially_used_pool`.
 
+### `ets_copy` peak RSS — the copy-out's retained young space, not the ETS adopt path
+`copy_bound/ets_copy`'s peak RSS is **still linear in N** (94.68 MiB at N = 100 000, ≈790 B ≈ 99 words
+per iteration), and it is a structural limit of the BIF-result copy-out above, **not** the ETS adopt path.
+The recorded `tools/bench/RESULTS.md` §8 item-5 lead (the ETS adopt path / the rewind guard) is
+**refuted**: `safe_to_rewind` is already `true` for `ets:*` and the pooled heap is already rewound.
+**It tracks BIF calls, not floats and not ETS table state** — a float-free ETS loop of the same shape
+grows identically, while a float-carrying churn loop with no ETS is flat.
+**Mechanism.** Almost all of the loop's heap traffic is the BIF-result copy-out, which by design cannot
+collect (the machine's live x registers / Erlang stack are not published at a BIF call, so a collection
+there would free live terms); a full nursery is met by `Process::grow_nursery(hint)`
+(`src/context/calls.rs::move_result_into_process_heap`) and a **retired young space is retained**, so the
+retained capacity accumulates linearly.
+The loop never reaches a real collection either: `ensure_heap_full` returns at
+`!process.should_collect(heap_need)` (`src/context/gc.rs` → `beam_gc`'s
+`nursery.current().available_words() < need_words`) because the loop's own `test_heap` prefixes are tiny
+(a 233-word default nursery, `beam_gc/src/policy.rs`), and `alloc_words_rooted` is never entered (the BIF,
+not the engine, builds the result).
+**The caller-module float guard is not the mover**: relaxing it at the two FR-publishing GC doors changes
+nothing here (94.68 → 95.02 MiB at N = 100 000, still linear in N) and contradicts the pinned
+float-collection contract (`tests/gc_collect.rs`).
+Closing it needs either a **`beam_process`** seam that can shrink/reuse a retired young space
+(`Process::grow_nursery` retains it) or a **`beam_engine`/runner** seam that publishes the driving
+machine's roots at the BIF call so the copy-out can collect — both sibling-crate changes, not reachable
+from `src/context/calls.rs`; the `beam_message` clean-destination ceiling in the cross-node section below
+is the same lever.
+Figures, bisection and the discarded negative results: [`PERF.md`](PERF.md) *COPY-OUT-CUT* →
+*`ets_copy` peak RSS …*.
+
 ## Heap switches
 `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → 1598),
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
@@ -375,13 +412,19 @@ to the pointer-stable arena. Pinned by `src/context/tests.rs`'s
   path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — COMPLETES.** `Runtime::boot_from_script` runs the real `bootstrap/bin/start.boot`
-  (OTP 30 / erts-17.1, **22 instructions**) to `{progress,started}` (the CLI `-boot` action exits `0`),
-  so the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** with the oracle;
-  `-boot FILE` drives it (`src/cli.rs::drive`), a plain start keeps the preloaded-only floor, and the
-  boot leaves a live `logger_server` registered as `logger`. The remaining cross-node gap is
-  **`beam_bifs`** — whatever the started applications still need. Detail:
-  [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+* **A.7/A.9 boot — stops at directive 18.** `Runtime::boot_from_script` runs the real
+  `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 instructions**) until directive **18 of 22**,
+  `{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, where the kernel
+  application's start (`application_controller:start_boot_application/2` → `spawn_starter/3` →
+  `application_master:start_link/2`) never completes, the boot drive's scheduler pass runs zero
+  processes, and `src/boot/drive.rs::apply_boot_call` folds the owed `gen_server:call` reply into the
+  uncatchable `beam_engine::blocked()` (the CLI `-boot` action exits **3**); the final
+  `{progress,started}` (index 21) is not reached. The differential case
+  `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** with the oracle, `-boot FILE` drives the
+  walk (`src/cli.rs::drive`), a plain start keeps the preloaded-only floor, and directive 13 leaves a
+  live `logger_server` registered as `logger`. The remaining cross-node gap is **`beam_bifs`** —
+  whatever the start needs that the runtime does not yet run. Mechanism, the eight currently-failing
+  tests and the not-a-native-floor-miss evidence: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.**
   `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process**
@@ -474,13 +517,21 @@ to the pointer-stable arena. Pinned by `src/context/tests.rs`'s
   runtime cannot hand the process table and the port table out as disjoint borrows and therefore cannot
   route its slices through `Scheduler::run_ready_with_ports` (a cross-crate handoff, not a bug); a split
   accessor over the id table would unblock it.
-* **`beam_bifs` registry key allocation.** `BifRegistry::contains`/`lookup` build owned `(String, String)`
-  key tuples per lookup, and the dispatch path does both (`contains` in `call_bif`, then `lookup` inside
-  `BifRegistry::call`) — ~4 small `String` allocations per registered call, the largest attributable
-  dispatch residual (measured ~60-80 ns/call alongside the caller-module clone). A borrowed-key
-  `lookup(&str, &str, u32)` would remove it. This crate's `uses_*` gates delegate to
+* **`beam_message` — the copy-out's destination is never clean (the one remaining attributable copy-out
+  cost, and the `ets_copy` RSS lever).** `Process::heap_mut()` always has words in use, so
+  `beam_message::copy::is_clean_destination` (`erts_rust/crates/beam_message/src/copy.rs`: `to.used() == 0
+  && ctx.dst_off_heap().is_fully_empty()`) rejects it and the copier's allocation-free optimistic
+  `try_copy_fast` is **bypassed on every copy-out**, so each copy pays a full `preflight_words` walk before
+  a single destination word is written. Relaxing the guard for this call site would remove one of the two
+  remaining walks **and** the `ets_copy` retained-nursery growth (the `GC / heap model` subsection above);
+  it is safe here because the destination is a `Process` young heap the caller owns, and the guard's own
+  off-heap pushes are already rolled back through
+  `beam_message::off_heap::OffHeapTable::{is_fully_empty, rollback}` (both crate-private). A sibling-crate
+  change, reported not worked around.
+* **`beam_bifs` — the hook-roster drift guard.** This crate's `uses_*` gates delegate to
   `beam_bifs::hook_sets`' exported `needs_*`/`*_BIFS` tables, so a new consumer is picked up
-  automatically (no per-crate drift); `RUNTIME_HOOKS_BIFS` has 173 entries (`hook_sets.rs`'s `assert_eq!`).
+  automatically (no per-crate drift); `RUNTIME_HOOKS_BIFS` is pinned at **172** entries by
+  `hook_sets.rs`'s `assert_eq!`.
 
 ## OTP-lifecycle survey — what a scheduled process can and cannot do today
 Method: self-contained `.erl` fixtures compiled by the system `erlc` (OTP 29.1.1 / erts-17.1, the oracle)
@@ -582,7 +633,7 @@ The holder the valve was built for is `Runtime::bif_heaps`: a container a regist
 
 ## Cross-node handoffs (crate index)
 * **Differential gate** — **no case disagrees** (`mismatch=0`); the two `unsupported` cases are allowlisted capability gaps (`wire/new_fun_ext_encode`, `boot_extra/init_script_id_names_the_running_otp_release`). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
-* **A.7/A.9 boot** — completes (the real `start.boot` to `{progress,started}`, leaving a live `logger_server` registered as `logger`); the residual is whatever the started applications still need from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
+* **A.7/A.9 boot** — stops at directive **18 of 22** (the kernel-application start; the CLI `-boot` action exits **3**), leaving a live `logger_server` registered as `logger`; the residual is the kernel application's supervisor tree, i.e. whatever the start still needs from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases drive a scheduled `run` and **agree** with the oracle on both the interpreter and the baseline tier; the mover (a `beam_process` signal-driven collection of a woken monitor watcher) is declined by the host collection gate installed on the process table, with the park-window relocation exemption as its complementary mitigation (both are the A.9 E0 bullet above and *GC-relocation hazards* below).
 * **The native `file_server_2` service** — its served request surface and every typed per-request gap are tabled in [`src/native/CONTEXT.md`](src/native/CONTEXT.md); a process-**alias** reply tag is the typed `unsupported`.
 * **`beam_process` / `beam_message`** — an owning drain for the wake list and a `!Send`-friendly `SchedulerPool` for SMP adoption; the split heap+mailbox borrow exists.
@@ -592,4 +643,4 @@ The holder the valve was built for is `Runtime::bif_heaps`: a container a regist
 * **`beam_io` / `beam_abi`** — the driver-port lifecycle's remaining asks: `driver_async` needs a **safe** runner for the async `invoke`/`free` pair on `beam_abi`'s `DriverLibrary` (`ready_async` is safely callable and `beam_io`'s `Driver::drive_async` exists, but `beam_rt` never schedules the job, so `DriverHost::r#async` keeps the frozen `-1`); a safe reply-copy helper for a `control` reply the driver answered from its own memory; and a per-registration `ErlDrvEvent` identity. `erl_drv_monotonic_time`'s phase differs because `beam_abi` reads `CLOCK_MONOTONIC` from the system epoch (`erl_drv_time_offset` returns `0`).
 * **`beam_bifs` — the `ets:setopts/2` heir gift copy and the tid-ref mint** — `setopts_2` stores the gift term verbatim where `Table::install_heir` is meant, and an unnamed table's tid ref is minted locally (`runtime::ets_owner::tid_ref_thing`).
 * **`beam_io` — the port table sits behind one `RefCell`** — the `ids` port-number table shares the live ports' single `RefCell`, so the runtime cannot hand the process and port tables out as disjoint borrows and does not route its slices through `Scheduler::run_ready_with_ports`; a split accessor would unblock it.
-* **`beam_bifs` — the registry dispatch cost and the hook-set drift risk** — the per-lookup owned-`String` key tuples (`contains` + `lookup` on the dispatch path) are the largest attributable residual; a borrowed-key `lookup(&str, &str, u32)` would remove them. This crate's `uses_*` gates delegate to `beam_bifs::hook_sets`' exported `needs_*`/`*_BIFS` tables, so a new consumer is picked up automatically.
+* **`beam_message` — the copy-out's never-clean destination** — `is_clean_destination` rejects `Process::heap_mut()` on every copy-out, bypassing the allocation-free `try_copy_fast` path (one extra `preflight_words` walk per copy **and** the `ets_copy` retained-nursery growth); relaxing it for this call site is safe and it is the one remaining attributable copy-out cost. This crate's `uses_*` gates still delegate to `beam_bifs::hook_sets`' exported rosters, so a new consumer is picked up automatically.

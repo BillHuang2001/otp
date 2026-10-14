@@ -18,23 +18,26 @@
 //
 // %CopyrightEnd%
 
-//! The **single-pass fast path**: the observable contract of the clean-destination copy.
+//! The **single-pass fast path**: the observable contract of the destination whose off-heap table
+//! is empty.
 //!
-//! `copy_struct` serves a *clean* destination (`Heap::used() == 0` and an off-heap table empty in
-//! all three of its lists) with ONE traversal - the writing traversal, with no sizing walk ahead of
-//! it - and keeps the preflight-then-write path for every other destination. That split is an
-//! internal optimisation, so this file pins the properties a caller can see, and every one of them
-//! must hold for **both** paths:
+//! `copy_struct` serves a destination whose **off-heap table is empty in all three of its lists**
+//! with ONE traversal — the writing traversal, with no sizing walk ahead of it — and keeps the
+//! preflight-then-write path for every other destination. A destination **heap** that already holds
+//! words (`used() > 0`) is *not* excluded: the trial only writes into the heap's unused tail and
+//! commits once, so a failed attempt needs no heap rewind. That split is an internal optimisation,
+//! so this file pins the properties a caller can see, and every one of them must hold for **both**
+//! paths:
 //!
-//! 1. **A clean copy is a faithful copy.** For a corpus spanning a small tuple, a cons chain, a
-//!    flat map, a boxed float, an off-heap MSO container and a refc binary, a clean-destination
-//!    copy is structurally equal to the original and writes exactly `size_of_copy(term)` words -
-//!    the same result, and the same word count, as the copy of the same graph into a destination
-//!    that is deliberately **dirty** (pre-charged with one word, hence always preflighted).
+//! 1. **A fast-path copy is a faithful copy.** For a corpus spanning a small tuple, a cons chain, a
+//!    flat map, a boxed float, an off-heap MSO container and a refc binary, both a **clean**
+//!    destination and a **dirty** one (pre-charged with one word, its off-heap table still empty)
+//!    produce a copy structurally equal to the original and write exactly `size_of_copy(term)`
+//!    words — the same result, and the same word count, for both.
 //! 2. **A refusal is still a total no-op.** A clean destination one word short refuses with the
 //!    typed message-heap allocation failure and leaves `used() == peak_used() == 0`: the
 //!    optimistic attempt writes through a trial bump pointer that only commits on success, so a
-//!    refused copy has written nothing at all - not even temporarily.
+//!    refused copy has written nothing at all — not even temporarily.
 //! 3. **A refusal releases what it registered.** An attempt that refcounted off-heap objects
 //!    before running out of room gives those references back: the destination off-heap table ends
 //!    up empty and the source objects' refcounts are unchanged.
@@ -42,9 +45,12 @@
 //!    the other direction: its trial target hands out only the destination's finite free words, so
 //!    a cycle exhausts them, the attempt is abandoned and the preflight path's acyclicity check
 //!    re-derives the typed `BadArg`. The test *completing* is the "never hangs" evidence.
-//! 5. **A dirty destination is never rolled back.** A destination whose heap or off-heap table
-//!    already holds something keeps the sized path, and nothing that was already there is
-//!    disturbed - neither the heap's pre-charged word nor a pre-existing off-heap entry.
+//! 5. **A pre-charged destination is never rolled back.** Neither a **dirty heap** (words already
+//!    handed out, possibly with live contents) nor a **non-empty off-heap table** has anything of
+//!    its own destroyed by a copy — successful or refused. In particular a refused copy into a
+//!    dirty heap leaves the words that were already there live and untouched: the attempt never
+//!    advanced the heap, so there is nothing to rewind and no `Heap::reset` may run (which would
+//!    discard live words).
 //!
 //! Two documented `beam_term::compare` limitations shape the assertions: it has no structural arm
 //! for an off-heap MSO container (whose `val` is a slot index rather than a term), so that shape's
@@ -267,44 +273,76 @@ fn copy_clean(
     Ok((copy, dst, dst_off))
 }
 
+/// Builds a destination heap of `capacity` words with `precharge` words already handed out — the
+/// first of them set to the sentinel `0x1234`, returned so a caller can prove the copy did not
+/// disturb the words that were already there — plus an off-heap table holding `off_heap_entries`
+/// fresh MSO objects.
+fn staged_destination(
+    capacity: usize,
+    precharge: usize,
+    off_heap_entries: usize,
+) -> (Heap, OffHeapTable, *mut Eterm) {
+    let mut heap = Heap::new(capacity).expect("destination heap");
+    let scratch = if precharge > 0 {
+        // SAFETY: `precharge` words of this heap, reserved as scratch so `used() > 0`.
+        let scratch = unsafe { heap.alloc_words(precharge).expect("the pre-charge fits") };
+        // SAFETY: `scratch` is the first of those words.
+        unsafe { *scratch = make_small(0x1234) };
+        scratch
+    } else {
+        core::ptr::null_mut()
+    };
+    let mut off = OffHeapTable::new();
+    for i in 0..off_heap_entries {
+        assert_eq!(off.push(Mso::new(0x1234_u32 + i as u32, 8)), i);
+    }
+    (heap, off, scratch)
+}
+
 // ---------------------------------------------------------------------------
-// 1. A clean destination copies every shape like the preflighted path
+// 1. Every shape copies identically into a clean and a dirty destination heap
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_clean_destination_copies_every_shape_like_the_preflighted_path() {
+fn every_shape_copies_identically_into_a_clean_and_a_dirty_destination() {
     for (name, build, equal) in CORPUS {
         let mut src = Src::new();
         let term = build(&mut src);
         let sized = size_of_copy(term);
         assert!(sized > 0, "{name}: every corpus shape is a compound term");
 
-        // (a) The clean destination: `used() == 0` and an empty off-heap table, so this copy is
-        // the single-pass path.
+        // (a) A clean destination: `used() == 0` and an empty off-heap table, so this copy is the
+        // single-pass fast path.
         let (fast, clean, clean_off) = copy_clean(term, &src, sized + 8)
             .unwrap_or_else(|e| panic!("{name}: a clean copy must succeed, got {e:?}"));
         assert_eq!(clean.used(), sized, "{name}: the fast copy writes the sized count");
         assert_faithful(name, *equal, term, fast, &src.atoms);
 
-        // (b) The same graph into a destination pre-charged with one word: dirty, so this copy is
-        // the preflight path. Both must agree, word count included.
-        let mut dirty = Heap::new(sized + 8 + 1).expect("destination heap");
-        // SAFETY: one word of this heap, reserved as scratch so `used() > 0`.
-        unsafe { dirty.alloc_words(1).expect("the pre-charge fits") };
-        let mut dirty_off = OffHeapTable::new();
-        let slow = {
+        // (b) The same graph into a destination pre-charged with one word, so `used() > 0`. Its
+        // off-heap table is still empty, which is the single precondition of the fast path, so this
+        // copy takes the fast path too - the dirty-heap-but-empty-table case the gate admits, and
+        // the shape a real `send` always has (the receiver's long-lived young heap plus a fresh
+        // per-send staging table). Both must agree, word count included.
+        let (mut dirty, mut dirty_off, scratch) = staged_destination(sized + 8 + 1, 1, 0);
+        let still_fast = {
             let mut ctx = CopyContext::new(&src.off, &mut dirty_off);
             copy_struct(term, &mut dirty, &mut ctx)
-                .unwrap_or_else(|e| panic!("{name}: the preflighted copy must succeed, got {e:?}"))
+                .unwrap_or_else(|e| panic!("{name}: a dirty-heap copy must succeed, got {e:?}"))
         };
         assert_eq!(
             dirty.used(),
             sized + 1,
-            "{name}: the preflighted copy writes the sized count after the pre-charge"
+            "{name}: the fast copy writes the sized count after the pre-charge"
         );
-        assert_faithful(name, *equal, term, slow, &src.atoms);
+        // SAFETY: `scratch` is still inside the heap's region (the heap never reallocates).
+        assert_eq!(
+            unsafe { *scratch }.raw(),
+            make_small(0x1234).raw(),
+            "{name}: the word that was already in the destination is untouched"
+        );
+        assert_faithful(name, *equal, term, still_fast, &src.atoms);
 
-        // The two paths register the same off-heap artifacts (same count in each category).
+        // The two destinations register the same off-heap artifacts (same count in each category).
         assert_eq!(clean_off.len(), dirty_off.len(), "{name}: MSO handles");
         assert_eq!(
             clean_off.binaries().len(),
@@ -312,6 +350,78 @@ fn a_clean_destination_copies_every_shape_like_the_preflighted_path() {
             "{name}: refc binaries"
         );
         assert_eq!(clean_off.nodes().len(), dirty_off.nodes().len(), "{name}: nodes");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1b. A non-empty destination off-heap table still takes the sized path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_non_empty_destination_off_heap_table_takes_the_sized_path_and_keeps_its_entries() {
+    // Two shapes that register NO off-heap artifact of their own, so a pre-existing destination
+    // entry is the only thing in that table and cannot be confused with the copy's own.
+    for (name, build) in [
+        ("small tuple", small_tuple as fn(&mut Src) -> Eterm),
+        ("deep list (50 cons cells)", deep_list),
+    ] {
+        let mut src = Src::new();
+        let term = build(&mut src);
+        let sized = size_of_copy(term);
+
+        // (a) A destination whose off-heap table already holds an object, with room to spare: the
+        // gate is closed (`is_fully_empty` is false), so the sized path runs and the copy still
+        // succeeds. Nothing the destination already held may be disturbed.
+        let (mut dst, mut dst_off, scratch) = staged_destination(sized + 8 + 1, 1, 1);
+        let copy = {
+            let mut ctx = CopyContext::new(&src.off, &mut dst_off);
+            copy_struct(term, &mut dst, &mut ctx).expect("the sized copy succeeds")
+        };
+        assert!(compare::eq(term, copy, &src.atoms), "{name}: the sized copy is correct");
+        assert_eq!(
+            dst.used(),
+            sized + 1,
+            "{name}: the sized copy lands after the pre-charged word"
+        );
+        // SAFETY: `scratch` is still inside the heap's region (the heap never reallocates).
+        assert_eq!(
+            unsafe { *scratch }.raw(),
+            make_small(0x1234).raw(),
+            "{name}: the words that were already in the destination are untouched"
+        );
+        assert_eq!(dst_off.len(), 1, "{name}: the pre-existing off-heap entry survives");
+        assert_eq!(
+            dst_off.get(0).map(|handle| handle.refcount()),
+            Some(1),
+            "{name}: it still holds exactly its own reference"
+        );
+
+        // (b) The same destination shape, one word short of the payload: still the sized path (so no
+        // roll-back of the destination is involved at all), and the pre-existing entries are
+        // untouched.
+        let (mut short, mut short_off, _) = staged_destination(sized, 1, 1);
+        match {
+            let mut ctx = CopyContext::new(&src.off, &mut short_off);
+            copy_struct(term, &mut short, &mut ctx)
+        } {
+            Err(BeamError::Alloc(failure)) => assert_eq!(
+                failure.kind,
+                AllocKind::Message,
+                "{name}: exhaustion is attributed to the message heap"
+            ),
+            other => panic!("{name}: expected a typed allocation refusal, got {other:?}"),
+        }
+        assert_eq!(short.used(), 1, "{name}: the refusal writes no word past the pre-charge");
+        assert_eq!(
+            short_off.len(),
+            1,
+            "{name}: the pre-existing off-heap entry survives the refusal"
+        );
+        assert_eq!(
+            short_off.get(0).and_then(|handle| handle.downcast_ref::<u32>()),
+            Some(&0x1234),
+            "{name}: the pre-existing entry is the one that was pushed"
+        );
     }
 }
 
@@ -490,11 +600,11 @@ fn a_non_term_on_a_clean_destination_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. A dirty destination keeps the sized path and is never rolled back
+// 5. A dirty destination heap is neither re-preflighted nor rolled back
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_dirty_destination_still_copies_through_the_sized_path() {
+fn a_successful_copy_into_a_dirty_heap_keeps_the_words_that_were_already_there() {
     let mut src = Src::new();
     let term = deep_list(&mut src);
     let sized = size_of_copy(term);
@@ -523,13 +633,56 @@ fn a_dirty_destination_still_copies_through_the_sized_path() {
 }
 
 #[test]
+fn a_refused_copy_into_a_dirty_heap_leaves_the_live_words_intact() {
+    // The load-bearing half of the relaxed gate. A dirty destination whose off-heap table is empty
+    // takes the single-pass fast path; if the payload does not fit, the attempt is abandoned and
+    // ONLY the off-heap table is rolled back. The heap must **not** be rewound: its `used` words are
+    // live and `Heap::reset` would silently discard them (the bug the previous `to.reset()` on this
+    // path would have introduced).
+    let mut src = Src::new();
+    let term = deep_list(&mut src);
+    let sized = size_of_copy(term);
+    assert!(sized > 1, "the list needs more than one word");
+
+    // One word pre-charged, then exactly one word less than the payload needs.
+    let (mut dst, mut dst_off, scratch) = staged_destination(sized, 1, 0);
+    assert_eq!(dst.available(), sized - 1, "one word short of the payload");
+
+    match {
+        let mut ctx = CopyContext::new(&src.off, &mut dst_off);
+        copy_struct(term, &mut dst, &mut ctx)
+    } {
+        Err(BeamError::Alloc(failure)) => assert_eq!(
+            failure.kind,
+            AllocKind::Message,
+            "exhaustion is attributed to the message heap"
+        ),
+        other => panic!("expected a typed allocation refusal, got {other:?}"),
+    }
+
+    assert_eq!(dst.used(), 1, "the refused copy does not rewind the pre-charged word");
+    assert_eq!(dst.peak_used(), 1, "and never advanced the heap, not even temporarily");
+    // SAFETY: `scratch` is still inside the heap's region (the heap never reallocates).
+    assert_eq!(
+        unsafe { *scratch }.raw(),
+        make_small(0x1234).raw(),
+        "the live word the destination already held was not discarded"
+    );
+    assert!(
+        dst_off.is_empty() && dst_off.binaries().is_empty() && dst_off.nodes().is_empty(),
+        "the roll-back emptied only the destination's off-heap table"
+    );
+}
+
+#[test]
 fn a_dirty_off_heap_table_is_never_rolled_back() {
     let mut src = Src::new();
     let term = small_tuple(&mut src);
     let sized = size_of_copy(term);
 
-    // A destination whose off-heap table already holds an object: not clean, so the fast path must
-    // not run - its roll-back drains the whole table and would discard this entry.
+    // A destination whose off-heap table already holds an object: not eligible for the fast path
+    // (`is_fully_empty` is false), so the sized path runs - and its roll-back drains the whole
+    // table, which would discard this entry.
     let mut dst = Heap::new(sized - 1).expect("destination heap");
     let mut dst_off = OffHeapTable::new();
     let held = Mso::new(0x1234_u32, 8);

@@ -735,6 +735,7 @@ mod tests {
         ("binconv", crate::binconv::register),
         ("unicode", crate::unicode::register),
         ("time", crate::time::register),
+        ("zlib", crate::zlib::register),
         ("proc", crate::proc::register),
         ("dict", crate::dict::register),
         ("reason", crate::reason::register),

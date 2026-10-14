@@ -29,7 +29,7 @@
 //!
 //! The measurement uses `std::time::Instant` only (no `criterion`, no new dependency). Every test
 //! here asserts **correctness only** - a copied graph is `=:=` its original and the word count is
-//! exactly the preflighted one - and never asserts a timing threshold, so it can never fail
+//! exactly `size_of_copy(term)` - and never asserts a timing threshold, so it can never fail
 //! spuriously on a loaded machine. The printed numbers are the deliverable; the assertions are what
 //! keep the measurement honest (a fast-but-wrong copier would fail them).
 //!
@@ -45,8 +45,9 @@
 use std::time::{Duration, Instant};
 
 use beam_alloc::{Heap, RefcBinary};
+use beam_gc::Mso;
 use beam_message::off_heap::OffHeapTable;
-use beam_message::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
+use beam_message::{copy_struct, size_of_copy, CopyContext};
 use beam_term::prelude::*;
 use beam_term::compare;
 
@@ -74,52 +75,64 @@ fn write_map_term(heap: &mut Heap, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) 
 ///
 /// Returns the mean ns/iteration, so a caller can compare two variants of the same shape.
 fn measure(name: &str, term: Eterm, objects: usize, iterations: u32) -> f64 {
-    measure_into(name, term, objects, iterations, 0)
+    measure_into(name, term, objects, iterations, Path::SinglePass)
 }
 
-/// Consumes `words` (uninitialised) words of `dst`, making it a **dirty** destination.
-///
-/// One dummy word is enough to take the copier's preflight path whatever the copier's
-/// clean-destination fast path is: the word is never read or written by the copy, it only makes
-/// `used() > 0`. That is what makes the `precharge` variant of a measurement the *two-pass*
-/// reference point: the difference between it and the clean variant is the Pass-1 (preflight)
-/// share.
-fn precharge(dst: &mut Heap, words: usize) {
-    if words > 0 {
-        // SAFETY: the words are inside this heap's own region and are never read; they exist only
-        // to advance `used`.
-        unsafe { dst.alloc_words(words).expect("the precharge fits") };
+/// Which copier path a measurement drives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Path {
+    /// A destination whose off-heap table is empty: the copier's **single-pass** fast path — the
+    /// writing traversal alone, with no sizing walk in front of it. A destination *heap* that has
+    /// already handed words out does **not** disqualify a copy from this path; only the off-heap
+    /// table's emptiness decides.
+    SinglePass,
+    /// A destination whose off-heap table already holds one object: the copier's **sized** path (a
+    /// `preflight_words` traversal, then the writing one). This is the only way left to produce a
+    /// two-traversal reference point — a merely pre-charged heap is served by the fast path now.
+    Sized,
+}
+
+/// The destination off-heap table a measurement stages for `path`.
+fn staged_off_heap(path: Path) -> OffHeapTable {
+    let mut off = OffHeapTable::new();
+    if path == Path::Sized {
+        assert_eq!(off.push(Mso::new(0xC0FF_EE00_u32, 8)), 0);
     }
+    off
 }
 
-/// Times `iterations` copies of `term` into a destination pre-charged with `precharge` words,
-/// printing ns/word, ns/object, ns/iteration and the best iteration; returns the mean ns/iteration.
+/// Times `iterations` copies of `term` into a destination heap of `size_of_copy(term) + 64` words,
+/// driving the copier path `path` names, and prints ns/word, ns/object, ns/iteration and the best
+/// iteration; returns the mean ns/iteration.
 ///
-/// A `precharge` of `0` measures a **clean** destination; every other value measures a dirty one
-/// (which is forced through the preflight/sized path). The destination's head-room is `words + 64`
-/// in both cases, so the two variants are compared on equal terms.
+/// The two [`Path`] variants have identical head-room, so they are compared on equal terms. Both
+/// assert correctness (the copy is `=:=` the original and writes exactly `size_of_copy(term)`),
+/// so the comparison can never be won by doing less work.
 fn measure_into(
     name: &str,
     term: Eterm,
     objects: usize,
     iterations: u32,
-    precharge_words: usize,
+    path: Path,
 ) -> f64 {
     let words = size_of_copy(term);
     let atoms = AtomTable::new();
-    let total_words = words + precharge_words;
+    let src_off = OffHeapTable::new();
 
     // Warm up (also validates correctness before the timed loop).
-    let mut dst = Heap::new(words + 64 + precharge_words).expect("destination heap");
-    precharge(&mut dst, precharge_words);
-    let copy = copy_struct_simple(term, &mut dst).expect("the copy succeeds");
+    let mut dst = Heap::new(words + 64).expect("destination heap");
+    let copy = {
+        let mut dst_off = staged_off_heap(path);
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        copy_struct(term, &mut dst, &mut ctx).expect("the copy succeeds")
+    };
     assert!(
         compare::eq(term, copy, &atoms),
         "{name}: the measured copy must be correct"
     );
     assert_eq!(
         dst.used(),
-        total_words,
+        words,
         "{name}: the measured copy writes the sized count"
     );
 
@@ -127,9 +140,13 @@ fn measure_into(
     let mut best = Duration::MAX;
     for _ in 0..iterations {
         dst.reset();
-        precharge(&mut dst, precharge_words);
+        // Staging is outside the timed region: only the copy itself is measured.
+        let mut dst_off = staged_off_heap(path);
         let start = Instant::now();
-        let copy = copy_struct_simple(term, &mut dst).expect("the copy succeeds");
+        let copy = {
+            let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+            copy_struct(term, &mut dst, &mut ctx).expect("the copy succeeds")
+        };
         let elapsed = start.elapsed();
         total += elapsed;
         if elapsed < best {
@@ -137,7 +154,7 @@ fn measure_into(
         }
         // Keep the result observable so the copy is not optimised away, and re-check correctness.
         assert!(!is_immediate(copy));
-        assert_eq!(dst.used(), total_words);
+        assert_eq!(dst.used(), words);
     }
 
     let per_iter = total.as_nanos() as f64 / f64::from(iterations);
@@ -253,21 +270,23 @@ fn report_copy_throughput_per_size_class() {
     measure_refc("refc binary reuse (512 B)", ITERS);
 }
 
-/// Reports the **Pass-1 (preflight) share** of a small copy, the figure the single-pass fast path
+/// Reports the **Pass-1 (sizing) share** of a small copy — the figure the single-pass fast path
 /// removes.
 ///
 /// Each shape is copied into two destinations with identical head-room (`size_of_copy(term) + 64`
 /// words of free space in both cases):
 ///
-/// * **clean** - `used() == 0`, the case the copier's fast path serves with a single traversal;
-/// * **pre-charged** - one dummy word consumed first, so the destination is *dirty* and the copy
-///   goes through the preflight/sized path (one sizing walk, then the writing walk) whatever the
-///   fast path's gate is.
+/// * **`[single-pass]`** — an **empty** destination off-heap table, the case the copier's fast path
+///   serves with one traversal;
+/// * **`[sized]`** — a destination off-heap table holding one object, which closes the gate and
+///   forces the preflight/sized path (one sizing walk, then the writing walk).
 ///
-/// The difference between the two rows is therefore the cost of the extra traversal (`Pass 1`)
-/// that the fast path elides for a clean destination. Both rows assert correctness (the copy is
-/// `=:=` the original and writes exactly `size_of_copy(term)` words plus the pre-charge), so the
-/// comparison can never be won by doing less work.
+/// The difference between the two rows is therefore the cost of the extra traversal (`Pass 1`) that
+/// the fast path elides. Note that a merely **pre-charged heap** cannot produce the two-pass row any
+/// more: a dirty destination heap with an empty off-heap table is served by the fast path too (see
+/// `src/copy.rs`'s `is_fast_path_eligible`), so the reference point has to be a non-empty off-heap
+/// table. Both rows assert correctness (the copy is `=:=` the original and writes exactly
+/// `size_of_copy(term)` words), so the comparison can never be won by doing less work.
 #[test]
 fn report_the_preflight_share_of_a_small_copy() {
     const ITERS: u32 = 100_000;
@@ -279,13 +298,13 @@ fn report_the_preflight_share_of_a_small_copy() {
         ("small tuple (4 words)", small_tuple(&mut src)),
         ("flat map (8 keys)", flat_map(&mut src, &atoms)),
     ] {
-        let clean = measure_into(&format!("{name} [clean]"), term, 1, ITERS, 0);
-        let dirty = measure_into(&format!("{name} [pre-charged]"), term, 1, ITERS, 1);
+        let single = measure_into(&format!("{name} [single-pass]"), term, 1, ITERS, Path::SinglePass);
+        let sized = measure_into(&format!("{name} [sized]"), term, 1, ITERS, Path::Sized);
         println!(
-            "{name}: preflight share = {:.1} ns/iter ({:.0}% of the clean copy's {:.1} ns)",
-            dirty - clean,
-            100.0 * (dirty - clean) / clean,
-            clean
+            "{name}: preflight share = {:.1} ns/iter ({:.0}% of the single-pass copy's {:.1} ns)",
+            sized - single,
+            100.0 * (sized - single) / single,
+            single
         );
     }
 }

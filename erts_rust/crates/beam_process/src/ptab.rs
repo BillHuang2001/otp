@@ -836,30 +836,41 @@ impl ProcessTable {
         term: Eterm,
         src_off_heap: &OffHeapTable,
     ) -> Result<DeliverOutcome> {
-        let decline = self.declines_signal_collection(to);
-        let outcome = {
-            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
-                return Err(error::unknown_process());
-            };
-            if decline {
-                // The gate declines the move: refuse the relocating collection for the duration of
-                // this one delivery by marking the receiver relocation-exempt, so
-                // `Process::deliver` surfaces its raw `AllocKind::Heap`/`AllocKind::Message`
-                // refusal UNCHANGED (the caller's heap-fragment key) rather than collecting and
-                // moving the heap under the receiver's unscanned roots. The prior flag is restored
-                // unconditionally — before the `?` — so a host that exempts a process itself keeps
-                // its mark and an ordinary receiver is left exactly as it was.
-                let prior = recipient.is_relocation_exempt();
-                recipient.set_relocation_exempt(true);
-                let delivered = recipient.deliver(from, term, src_off_heap);
-                recipient.set_relocation_exempt(prior);
-                delivered?
-            } else {
-                recipient.deliver(from, term, src_off_heap)?
-            }
+        // One slot scan for the whole operation: the recipient's PCB and the collection gate live
+        // in disjoint fields (`slots` / `collection_gate`), so the gate can be asked about the very
+        // PCB this delivery is about to write to, and the wake record lands on the third disjoint
+        // field (`ready`). The unknown-pid case is the same as it was: no delivery, no gate
+        // consultation, no wake.
+        let ProcessTable {
+            slots,
+            collection_gate,
+            ready,
+            ..
+        } = self;
+        let Some(recipient) = lookup_mut(slots, to) else {
+            return Err(error::unknown_process());
+        };
+        let decline = collection_gate
+            .as_deref_mut()
+            .map_or(false, |gate| gate.declines_relocation(recipient));
+        let outcome = if decline {
+            // The gate declines the move: refuse the relocating collection for the duration of
+            // this one delivery by marking the receiver relocation-exempt, so
+            // `Process::deliver` surfaces its raw `AllocKind::Heap`/`AllocKind::Message`
+            // refusal UNCHANGED (the caller's heap-fragment key) rather than collecting and
+            // moving the heap under the receiver's unscanned roots. The prior flag is restored
+            // unconditionally — before the `?` — so a host that exempts a process itself keeps
+            // its mark and an ordinary receiver is left exactly as it was.
+            let prior = recipient.is_relocation_exempt();
+            recipient.set_relocation_exempt(true);
+            let delivered = recipient.deliver(from, term, src_off_heap);
+            recipient.set_relocation_exempt(prior);
+            delivered?
+        } else {
+            recipient.deliver(from, term, src_off_heap)?
         };
         if outcome.woke() {
-            self.ready.push(to);
+            ready.push(to);
         }
         Ok(outcome)
     }
@@ -888,6 +899,20 @@ impl ProcessTable {
     /// processes to enqueue.
     pub fn drain_woken(&mut self) -> Vec<ProcessId> {
         core::mem::take(&mut self.ready)
+    }
+
+    /// Moves the wake list into the caller's `out`, **retaining both buffers' capacity**: `out` is
+    /// cleared and the wake list is appended to it
+    /// ([`Vec::append`](Vec::append) empties `self.ready` without releasing its allocation), so
+    /// after warm-up neither the next `ready.push` nor the next drain reallocates.
+    ///
+    /// This is the form a consumer that keeps a reusable scratch buffer across slices uses
+    /// (`crate::scheduler::Scheduler` does); [`ProcessTable::drain_woken`] stays the
+    /// owns-the-result form, which hands its buffer to the caller and therefore makes the next
+    /// `ready.push` allocate again.
+    pub fn drain_woken_into(&mut self, out: &mut Vec<ProcessId>) {
+        out.clear();
+        out.append(&mut self.ready);
     }
 
     /// The pids of the blocked processes a delivery/signal has just made runnable, without
@@ -2307,12 +2332,24 @@ impl ProcessTable {
 
     /// The shared body of [`ProcessTable::service_signals`] and
     /// [`ProcessTable::service_signals_with_ports`].
+    ///
+    /// # The quiet-process fast path
+    ///
+    /// A live `pid` whose signal queue is **empty** has nothing to apply: the worklist would be
+    /// seeded with it, [`ProcessTable::drain_signals`] would pop it,
+    /// [`ProcessTable::apply_head_signal`] would find no head signal and report it as not
+    /// surviving, and the worklist would come back empty — **zero mutations**. The worklist's only
+    /// growth source is a signal *encountered while servicing* (a termination routing its
+    /// receivers through [`ProcessTable::schedule_service`]), so with nothing queued the cascade
+    /// cannot grow either. Servicing therefore returns immediately for a quiet process, which keeps
+    /// the overwhelmingly common per-schedule-in case free of the worklist's heap allocation.
+    /// An unknown `pid` takes the same path (it has no queue).
     fn service_signals_and_cascade(
         &mut self,
         ports: &mut Option<&mut PortTable>,
         pid: ProcessId,
     ) -> Result<()> {
-        if !self.contains(pid) {
+        if self.head_signal(pid).is_none() {
             return Ok(());
         }
         let mut pending = VecDeque::new();

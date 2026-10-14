@@ -81,6 +81,16 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
   operand outside the interpreter's range, a module with neither `true` nor `false` interned for
   `is_boolean`, an out-of-bound register, or a bignum/float/literal operand -> `None` (the helper
   then reproduces the interpreter's exact result).
+- **`test` comparison helper** (`test.rs::emit_test_helper`): a comparison `Test` the word/header
+  subset declines — the six comparison kinds at two operands with a resolvable non-`NO_FAIL` fail label,
+  whatever the operands (a `Y` slot, a float register, a literal-area term, boxed-vs-boxed) — is emitted
+  as an `emit_helper_call` to the `jit_test` helper (so the cached x-registers spill first), then
+  `cmp rax, TEST_TRUE / je success`, `cmp rax, TEST_FALSE / je failed`, else `jmp done` (the helper's
+  `ERROR` word / decline, decoded by the driver). `success` refills, emits the gated `emit_refresh_y`
+  when `refresh_y_after(pc)`, and falls through to the next instruction; `failed` is `linker.emit_exit`
+  to the resolved fail label, so a compiled fail block is jumped to **directly** (its own frame teardown
+  replaces this block's) and any other target returns its `(func, pc)` word to the driver. Any shape it
+  does not own emits **zero** bytes, so the caller's fallback is exactly the per-instruction `jit_step_one`.
 - **`select_val`** (`select.rs`): `NO_FAIL` -> `None`; unresolved label -> `None`; scrutinee must be
   `test_src`; **every** alternative must be an immediate `constant_word`.
 - **`select_tuple_arity`** (`aggregate.rs`): `NO_FAIL`/unresolved label -> `None`; scrutinee must be an
@@ -222,7 +232,8 @@ entry (the driver's bound is `machine.x.len() > bound`).
 - `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`, `small_word`.
 - `r#move.rs` -> `try_inline_move`, `try_inline_swap` (`Move` over in-bound x-registers or an addressable `Y` slot on either side, behind the frame-window guard; `Swap` needs two in-bound x-registers).
 - `test.rs` -> `TestSrc`/`TestPred`/`Guard`/`TestPlan`, `test_plan`, `test_src`, `compare_shape`,
-  `arith_guard`, `order_guard`, `load_test_src`, `try_inline_test` (also `TEST_A`/`TEST_T` reused by `select.rs`).
+  `arith_guard`, `order_guard`, `load_test_src`, `try_inline_test` (incl. its `emit_test_helper`
+  comparison fallback), `emit_test_helper` (also `TEST_A`/`TEST_T` reused by `select.rs`).
 - `select.rs` -> `SelectPlan`, `select_val_plan`, `try_inline_select_val`.
 - `arith.rs` -> `SmallArith`, `fast_arith`, `FastArith`/`FastDest`/`FastSource`, `uses_y`, `import_names`,
   `try_inline_gc_bif`, `emit_y_load`/`emit_y_store` (+ the small-int constants).
@@ -279,3 +290,16 @@ per-function `Summary` as a superset; the eager pass reuses the **containing IR 
 discards its touches, so the whole-module `Summary` is provably untouched. Both add
 `sub_blocks_capacity_estimate` (`BLOCK_BYTES + INSTRUCTION_BYTES` per instruction of each sub-block range)
 to the buffer size, so the extra code cannot under-allocate the `CodeBuffer`.
+
+**Measured cost of the duplication (the pass is O(n²) in a pathological shape).** There is no range
+dedup: n `stores_continuation` instructions inside one IR block, none a block start, each with
+`p < b.end`, emit ~n²/2 instructions. The synthetic `baseline/tests.rs::measure_declined_call_ext`
+module is exactly that shape (256 unrolled non-tail `CallExt` in a single block, `~33k` instructions
+emitted) and it runs ~96–133 ns/call_ext on the lazy cache/outcome baseline path vs ~20–30 ns/call_ext
+on the interpreter — whereas the eager pre-compiled `jit_bench call_ext/0` (a small *loop* body with few
+continuations) is ~1.6× **faster** than the interpreter. The same instruction reads with opposite sign
+purely because the body shape differs, so quote either only alongside the shape. Real OTP modules stay
+bounded: a whole-OTP `beam_disasm` census of extra instructions attributable to sub-blocks gives
+`gb_trees` 1.010×, `ordsets` 1.005×, `base64` 1.011×, `lists` 1.047×, `queue` 1.164×, `string` 1.222×,
+`calendar` 1.627×. A sub-block whose range would contain another continuation address could be skipped
+(the nested call's own sub-block covers that tail), bounding the growth — correctness-first for now.

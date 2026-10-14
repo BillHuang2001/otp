@@ -36,7 +36,7 @@
 //! | quantity | value | how it is derived |
 //! |---|---|---|
 //! | declared (`bif.tab`) | 556 | `bif 476 + ubif 73 + hbif 7` |
-//! | registry | 640 | 556 declared + 84 stdlib fast paths |
+//! | registry | 643 | 556 declared + 87 stdlib fast paths |
 //! | seam union | 240 | the 13 tables, deduped (`244 raw − 4 shared`) |
 //! | declared seam-backed | 210 | union members the table declares |
 //! | declared in-crate | 346 | `556 − 210`, no table lists them |
@@ -106,8 +106,8 @@ const DECLARED_UBIF: usize = 73;
 const DECLARED_HBIF: usize = 7;
 const DECLARED_TOTAL: usize = 556;
 /// The pinned census of the registry against the table.
-const REGISTRY_TOTAL: usize = 640;
-const FAST_PATHS: usize = 84;
+const REGISTRY_TOTAL: usize = 643;
+const FAST_PATHS: usize = 87;
 const MISSING_DECLARED: usize = 0;
 
 /// The seam union and the partition of the declared surface it induces.

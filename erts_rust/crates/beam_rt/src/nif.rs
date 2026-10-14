@@ -199,6 +199,17 @@ impl NifRegistry {
         self.libs.insert(module, entry);
     }
 
+    /// Whether no library has been loaded at all.
+    ///
+    /// This is the **fast predicate** for the NIF-dispatch prologue: the ordinary runtime has an
+    /// empty registry (only `erlang:load_nif/2` ever fills it), so it answers `false` to
+    /// [`lookup`](Self::lookup) for every key — and reaching that answer costs a `HashMap`
+    /// `SipHash` of the module name on **every** BIF call. An `is_empty()` test is a length
+    /// compare, so a host can skip the borrow-and-hash entirely when nothing is loaded.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.libs.is_empty()
+    }
+
     /// Whether `module`'s library exports `function/arity`.
     ///
     /// This is the NIF-dispatch predicate: `false` (a miss) is a perfect no-op, so a call to an

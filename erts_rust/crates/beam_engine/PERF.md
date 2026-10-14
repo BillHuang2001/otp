@@ -1,0 +1,54 @@
+# `beam_engine` — Execution-tier performance snapshots
+
+Current-state record of execution-tier performance investigations (the default **baseline-JIT** tier vs `BEAM_RT_TIER=interpreter`) and the fixes they produced.
+Detailed current measured figures and execution-coverage evidence live in `MEASURED.md`; this file owns the *tier-regression* narrative (what was slower than what, why, and what changed).
+**The sandbox is heavily oversubscribed**, so every figure here is wall-clock with no CPU pinning: a single sample is meaningless — read the explicitly two-sided **ratio** and the `/proc/loadavg` recorded with it, never an absolute number.
+
+## Batch 52 — item 2: baseline-JIT `send_recv` regression (CLOSED)
+
+### Symptom
+On the two-process `send_recv` copy-bound workload (`../../tools/bench`, the `copy_bound` case: `T = payload(), Worker ! {self(), T}, receive {Worker, T2} -> case T2 of T -> … end after TIMEOUT -> exit(message_timeout) end`, the worker answering `binary_to_term(term_to_binary(T))`) the DEFAULT baseline tier was **2.15×–3.31× dearer** than the interpreter tier (Rust-vs-Rust; no oracle involved).
+
+| run | default (baseline-JIT) | interpreter | ratio (default ÷ interp) |
+|---|---|---|---|
+| pre-fix, `--full` | 79 518.12 ns/op | 36 969.39 ns/op | 2.15× dearer |
+| pre-fix, `--quick` | 97 517.77 ns/op | 29 492.93 ns/op | 3.31× dearer |
+| post-fix, `--quick` | 23 219.88 ns/op | 27 165.83 ns/op | **0.855×** (default faster) |
+| post-fix, `--quick` ×2 | 23 617.33 / 23 777.75 | 28 759.25 / 22 829.74 | 0.821× / 1.041× |
+| post-fix, `--full` (10 samples) | 22 320.07 ns/op | 22 899.16 ns/op | **0.975×** |
+
+Post-fix sibling `copy_bound` cases: `etf_roundtrip` 7 520.93 vs 8 187.27 = 0.919×; `ets_copy` 3 227.04 vs 4 367.28 = 0.739×. Every post-fix run is parity-or-better, so the regression no longer reproduces (`/proc/loadavg` 2.4–14.5 across the runs).
+
+### Diagnosis (structural counters, not wall-clock)
+Test-only counters (`src/jit/baseline/counters.rs`, `#[cfg(test)]`, absent from every production build) count per-`Instr`-variant `jit_step_one`/`jit_step_ext` deopts, block entries/lookups/entered, driver round-trips by block-ABI word, and cache IR-fingerprint calls. The three hypothesized causes were **measured and are ≈0**; the real cause is elsewhere:
+- *(a) per-instruction `jit_step_one` deopt cost* — real but small: a helper-executed instruction does not end the block, but it pays a spill of the cached x-registers + call + interpreter step + refill. The `Test` class it dominated was 128 deopts in a 64-op counting pass; total `jit_step_one` 1092 → 964 (~3 % of an op).
+- *(b) block-boundary driver round trips* — **not a factor**: block entries lookups/hits/entered are 387/387/387 and round-trips `{"GOTO":257,"HALT":1,"WAIT":129}`, **identical** before and after.
+- *(c) `emit/select.rs::select_val_plan` refusing the receive match* — **wrong premise**: `case T2 of T` lowers to two `is_eq_exact` `Test`s, not a `SelectVal`. Those `Test`s *were* deopting (fixed below).
+- *lazy `CompiledModule::native_entry`/`CompiledFunction` lookup* — not a factor (O(1) `RefCell` probe + `Rc::clone`).
+- **ACTUAL ROOT CAUSE: a per-slice full-IR re-hash in `CodeCache`.** Every `run_baseline_cached*` slice entry/resume resolved the entry module through `CodeCache::compiled_handle(&Module)`; its O(1) address memo is filled only by the cross-module `Arc<Module>` route, so the bare `&Module` entry fell through to `ModuleKey::of` → `module_fingerprint` (a `Debug`-render hash of the whole decoded IR) once per slice — i.e. once per `receive` park and per resume. The interpreter tier never pays it. `fingerprint_calls()` = 1/slice pre-fix, **0** post-fix.
+
+### Fix
+- **O(1) cache identity** (`src/jit/cache/mod.rs`): `ModuleKey` is a private two-variant enum — `Digest([u8;16])` = the module's **load-time MD5** (`Module::checksum()`, `Copy`, no hash and no allocation) for a real `.beam`, else `Content { name, fingerprint }` over the whole-IR hash for a synthetic `Module::default()` (all-zero checksum). Variants hash their discriminant so they can never cross-key. This removes the per-slice re-hash with no `beam_rt` change.
+- **Native `send`/`receive` lowering** (`src/jit/baseline/receive.rs` + `emit::emit_receive`): the whole receive-control family (`Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`) runs **in-block** through `jit_receive` (the same family body the interpreter's dispatch runs) instead of a per-instruction deopt.
+- **In-block comparison-test lowering** (`src/jit/baseline/test_helper.rs` + `emit/test.rs::emit_test_helper`): the six comparison `Test`s (`is_eq_exact`/`is_ne_exact`/`is_eq`/`is_ne`/`is_lt`/`is_ge`) at two operands with a resolvable non-`NO_FAIL` fail label are lowered in-block via the boolean helper `jit_test`, interpreter-identical by construction (routed through `beam_term`'s `cmp`/`cmp_arith`; a boxed pointer is never word-compared). `TEST_TRUE` refills and continues in-block, `TEST_FALSE` branches to the resolved fail label, anything else hands the driver the block-ABI word. `NO_FAIL`, unresolved labels, non-comparison kinds and ≠2 operands keep the old `jit_step_one` path byte-identically.
+
+In-process confirmation on a real loaded `.beam` (`src/jit/cache/tests.rs::the_entry_and_resume_slice_cost_is_measured_on_both_tiers`, loadavg ≈33.95): interpreter **351.19** vs baseline-jit **101.70** ns/slice-entry = **0.29×**, with **0** IR hashes.
+
+### Pins
+- `src/jit/cache/tests.rs::a_real_loaded_beam_never_rehashes_its_ir_on_any_entry_path` — 0 fingerprints across all four `run_baseline_cached*` paths plus park/resume.
+- `src/jit/cache/tests.rs::{remember_module_priming_makes_all_four_entry_paths_rehash_free, two_loads_of_the_same_beam_share_one_digest_keyed_artifact, the_key_of_a_real_beam_is_its_load_time_digest, a_memoized_lookup_does_not_rehash_the_ir, different_content_with_the_same_name_does_not_collide}`.
+- `src/jit/baseline/tests.rs::the_two_process_copy_bound_shape_is_measured_on_both_tiers` plus its in-block comparison-test pin and the declined control, alongside the existing `the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count` (which still passes, proving the single-resolution `call_ext` design is intact).
+
+## Batch 52 — item 6: the `slice` per-process rise is a host-load artifact (NO CODE CHANGE)
+
+Claim: the `slice` system-module per-process rows rose +7–44 % vs m9 (`gb_trees_size` 18.13→25.12, `base64_encode_size` 19.44→26.68, `ordsets_from_size` 18.09→26.15, `queue_from_size` 22.40→26.00, `string_str_length` 41.29→48.12 ms), hypothesised to be the lazy per-function compile.
+
+**Verdict: not real — a measurement/load confound.**
+- The lazy per-function compile landed **2026-10-12 02:16** (`78b39e77dd`), *before* the m9 record it is compared against (2026-10-13 22:17) — m9 already contained it; m9→m10 differ only by the m10 batch, whose `jit/cache` changes *remove* per-process cost.
+- Committed interleaved A/B (N=30): default 31.86–45.45 ms (min 31.86) vs interpreter 25.51–40.48 ms (min 25.51) → **1.22–1.25×**, and the `slice` workload's own row read **1.00×**. The eager whole-module path this replaced read **405.29 ms vs 33.68 ms ≈ 12.3×**, so lazy compilation is a large *win*, not the regression.
+- In-crate eager tier table (`tests/jit_bench.rs -- --ignored`, 7 repeats, `/proc/loadavg` 8.01 throughout): the default tier is **faster on 11/12** workloads (0.127×–0.659×), parity on the deopt-dominated `build/0` (0.856×–1.157×) and the cross-module `cross/2` (0.941×–0.969×).
+- The untouched interpreter column itself drifted up to ~29 % across those 7 runs, and within the m10 archive one run set shows the pure fixture `add` *falling* −5.67 % while every system-module case rose — a code change cannot do both.
+
+**The one real, attributable engine cost behind this hypothesis is now removed:** the `CodeCache` entry-path IR re-hash (item 2's root cause above, now O(1) via the digest key). It scales with module size (~2 µs tiny, ~141 µs at 2048 instructions), i.e. up to a few hundred µs per process on a `string.beam`-sized module.
+
+**Latent hazard, not the slice rise (recorded for a future pass):** `emit_sub_blocks` / `emit_shared_sub_blocks` (`src/jit/baseline/emit/compile.rs`) emit one block `[pc+1, block.end)` per frame-preserving call with **no range dedup**, which is O(n²) for a call-dense straight-line block (a 256-`call_ext` unrolled block emits ~33k instructions; `src/jit/baseline/tests.rs::measure_declined_call_ext` shows the resulting ~3.2–4.1× cost vs the interpreter, while the small-loop `jit_bench call_ext/0` is ~1.6× *faster*). On real OTP modules the growth is bounded — a whole-OTP `beam_disasm` census of extra instructions: `gb_trees` 1.010×, `ordsets` 1.005×, `base64` 1.011×, `lists` 1.047×, `queue` 1.164×, `string` 1.222×, `calendar` 1.627× — so it is a synthetic-shape hazard only.
