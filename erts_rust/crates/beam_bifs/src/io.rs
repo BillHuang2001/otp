@@ -2539,18 +2539,51 @@ mod tests {
 
     #[test]
     fn bad_format_term_is_badarg() {
-        let mut heap = Heap::new(64).expect("test heap");
+        // The format argument is scanned as `io_lib_format:scan/2` does, so an
+        // **atom** (`io:format(aaa,[])` ⇒ `aaa`) and a **binary**
+        // (`io:format(<<"x~n">>,[])` ⇒ `x`) are now valid formats, and a list
+        // element outside the byte range is kept verbatim rather than rejected.
+        // The oracle's `error:badarg` cases are the shapes `scan/2` has no clause
+        // for: an integer, a tuple, a float, a non-byte-aligned bitstring and an
+        // improper list — plus an atom format that leaves an argument unconsumed:
+        //   erl -noshell -eval 'io:format("~p~n",[catch io:format(1,[])]),halt().'
+        //     % badarg
+        //   erl -noshell -eval 'io:format("~p~n",[catch io:format(foo,[1])]),halt().'
+        //     % badarg
+        let mut heap = Heap::new(256).expect("test heap");
         let mut atoms = AtomTable::new();
         atoms.seed(SEED);
         let mut sink = BytesSink::new();
         let mut ctx =
             BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
-        let atom = ctx.atom("abc").expect("seeded");
-        assert!(matches!(format_1(&mut ctx, &[atom]), Err(BeamError::BadArg)));
-        let bad = ctx
-            .list(&[ctx.int(1000).expect("fits")])
-            .expect("the list fits");
-        assert!(matches!(format_1(&mut ctx, &[bad]), Err(BeamError::BadArg)));
+
+        // An integer format: `io:format(1,[])` ⇒ `badarg`.
+        let one = ctx.int(1).expect("fits");
+        assert!(matches!(format_1(&mut ctx, &[one]), Err(BeamError::BadArg)));
+        // A tuple format: `io:format({},[])` ⇒ `badarg`.
+        let tuple = ctx.tuple(&[one]).expect("fits");
+        assert!(matches!(format_1(&mut ctx, &[tuple]), Err(BeamError::BadArg)));
+        // A float format: `io:format(1.0,[])` ⇒ `badarg`.
+        let float = ctx.make_float(1.0).expect("fits");
+        assert!(matches!(format_1(&mut ctx, &[float]), Err(BeamError::BadArg)));
+        // An improper format list: `io:format([1|2],[])` ⇒ `badarg`.
+        let two = ctx.int(2).expect("fits");
+        let improper = ctx.cons(one, two).expect("fits");
+        assert!(matches!(
+            format_1(&mut ctx, &[improper]),
+            Err(BeamError::BadArg)
+        ));
+        // A non-byte-aligned bitstring format: `io:format(<<1:3>>,[])` ⇒ `badarg`.
+        let bits = bits::make_bitstring(ctx.heap(), &[0b0010_0000], 3).expect("fits");
+        assert!(matches!(format_1(&mut ctx, &[bits]), Err(BeamError::BadArg)));
+        // An atom format with an unconsumed argument:
+        // `io:format(foo,[1])` ⇒ `badarg`.
+        let foo = ctx.atom("foo").expect("seeded");
+        let args = ctx.list(&[one]).expect("fits");
+        assert!(matches!(
+            format_2(&mut ctx, &[foo, args]),
+            Err(BeamError::BadArg)
+        ));
     }
 
     #[test]

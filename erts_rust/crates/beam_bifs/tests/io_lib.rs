@@ -43,14 +43,20 @@
 //! bytes (the flattened form of the same chunk tree).
 
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry};
-use beam_common::BeamError;
+use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink};
+use beam_codec::term as codec_term;
+use beam_common::{BeamError, ExceptionClass};
 use beam_process::ProcessId;
 use beam_term::{AtomTable, Eterm};
 
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    atoms.seed(["true", "false", "ok", "a", "b", "c", "foo", "xy", "hello"]);
+    atoms.seed([
+        "true", "false", "ok", "a", "b", "c", "foo", "xy", "hello",
+        // The format-argument matrix below needs an atom format, an empty atom and
+        // the `error`/`badarg` pair the grapheme walk interns on a bad UTF-8 binary.
+        "aaa", "atom_nl", "", "a~nb", "bb", "cc", "error", "badarg",
+    ]);
     atoms
 }
 
@@ -792,4 +798,395 @@ fn format_3_options_reproduce_or_reject_the_chars_limit() {
         .call("io_lib", "format", 3, &mut ctx, &[format_term, args, foo])
         .expect_err("a non-list Options is badarg");
     assert!(matches!(err, BeamError::BadArg));
+}
+
+// ---------------------------------------------------------------------------
+// The format argument: an atom, a binary, or a (possibly nested) chardata list
+// ---------------------------------------------------------------------------
+
+/// Asserts that `io_lib:format(Format, Args)` is the oracle's deep list `want`.
+///
+/// Unlike [`check`], the format term is built by the caller, so it may be an atom,
+/// a binary or a chardata list rather than just a flat byte list.
+fn check_format(
+    ctx: &mut BifContext<'_>,
+    reg: &BifRegistry,
+    format: Eterm,
+    args: &[Eterm],
+    want: Eterm,
+) {
+    let args_term = ctx.list(args).expect("a short argument list fits");
+    let got = reg
+        .call("io_lib", "format", 2, ctx, &[format, args_term])
+        .unwrap_or_else(|err| panic!("io_lib:format failed: {err:?}"));
+    assert!(
+        beam_term::compare::eq(got, want, ctx.atoms()),
+        "io_lib:format does not match the oracle's deep list"
+    );
+}
+
+/// Asserts that `io_lib:format(Format, Args)` raises the oracle's `error:badarg`.
+///
+/// The oracle raises the **bare** atom `badarg`: `io_lib:format/2` is
+/// `try io_lib_format:fwrite/2 catch _:_ -> erlang:error(badarg, [Format, Args])`
+/// (`lib/stdlib/src/io_lib.erl:354-360`), so *every* inner failure — `scan/2`'s
+/// missing clause and `string:length/1`'s structured `{badarg, Bin}` alike — leaves
+/// as the bare atom. This crate raises the bare [`BeamError::BadArg`] for every
+/// `scan/2`/`collect/2` reject, and for a top-level binary element `string:length/1`
+/// cannot decode it propagates that function's own **structured** `{badarg, Bin}`
+/// raise instead (a known divergence in the reason's *shape* only, reported
+/// upstream): both are `error`-class badarg raises, which is what is asserted here.
+fn check_format_badarg(
+    ctx: &mut BifContext<'_>,
+    reg: &BifRegistry,
+    format: Eterm,
+    args: &[Eterm],
+) {
+    let args_term = ctx.list(args).expect("a short argument list fits");
+    let err = reg
+        .call("io_lib", "format", 2, ctx, &[format, args_term])
+        .expect_err("the format must be rejected");
+    match err {
+        BeamError::BadArg => {}
+        BeamError::Raise(raise) => assert_eq!(
+            raise.class,
+            ExceptionClass::Error,
+            "expected an error-class badarg raise, got {raise:?}"
+        ),
+        other => panic!("expected a badarg raise, got {other:?}"),
+    }
+}
+
+/// The format argument is scanned exactly as `io_lib_format:scan/2` does: an
+/// **atom**'s name and a **binary**'s raw bytes are ordinary format characters (a
+/// `~` inside them *is* a directive), while a **list** contributes one element per
+/// cons cell. The former `badarg` for a non-list format is gone.
+///
+/// ```text
+/// erl -noshell -eval 'io:format("~w~n",[io_lib:format(F,A)]),halt().'
+/// ```
+///
+/// | `io_lib:format(F, A)` | result |
+/// |---|---|
+/// | `(<<"x~n">>, [])` | `[120,10]` |
+/// | `(<<"n=~p">>, [42])` | `[110,61,[52,50]]` |
+/// | `(<<"~s!~n">>, ["hi"])` | `[[104,105],33,10]` |
+/// | `(aaa, [])` | `[97,97,97]` |
+/// | `('a~nb', [])` | `[97,10,98]` |
+/// | `(atom_nl, [])` | `[97,116,111,109,95,110,108]` |
+/// | `(<<>>, [])` | `[]` |
+/// | `('', [])` | `[]` |
+/// | `([], [])` | `[]` |
+/// | `(<<97,1>>, [])` | `[97,1]` |
+#[test]
+fn the_format_argument_may_be_an_atom_a_binary_or_a_list() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut atoms = seeded_atoms();
+    atoms.seed(["aaa", "atom_nl", ""]);
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // A binary format: its bytes are format characters, so `~n` *is* a directive.
+    let f = binary(&mut ctx, &reg, b"x~n");
+    let want = build(&mut ctx, &E::L(vec![E::I(120), E::I(10)]));
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    let f = binary(&mut ctx, &reg, b"n=~p");
+    let forty_two = int(&mut ctx, 42);
+    let want = build(&mut ctx, &E::L(vec![E::I(110), E::I(61), E::S("42")]));
+    check_format(&mut ctx, &reg, f, &[forty_two], want);
+
+    let f = binary(&mut ctx, &reg, b"~s!~n");
+    let hi = char_list(&mut ctx, "hi");
+    // `<<"~s!~n">>` with `["hi"]` ⇒ `[[104,105],33,10]`: `~s` of a list is ONE
+    // sub-list element, the `!` and the `~n` newline are flat characters.
+    let want = build(
+        &mut ctx,
+        &E::L(vec![E::S("hi"), E::I(33), E::I(10)]),
+    );
+    check_format(&mut ctx, &reg, f, &[hi], want);
+
+    // An atom format: its name is scanned the same way, `~` included.
+    let f = atom(&mut ctx, "aaa");
+    let want = build(&mut ctx, &E::S("aaa"));
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    let a_tilde_nb = atom(&mut ctx, "a~nb");
+    let want = build(
+        &mut ctx,
+        &E::L(vec![E::I(97), E::I(10), E::I(98)]),
+    );
+    check_format(&mut ctx, &reg, a_tilde_nb, &[], want);
+
+    // `atom_nl` carries no `~`, so it is eight literal characters.
+    let f = atom(&mut ctx, "atom_nl");
+    let want = build(&mut ctx, &E::S("atom_nl"));
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // The empty binary, the empty atom and `[]` are the empty format.
+    let f = binary(&mut ctx, &reg, b"");
+    let want = build(&mut ctx, &E::L(Vec::new()));
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    let f = atom(&mut ctx, "");
+    let want = build(&mut ctx, &E::L(Vec::new()));
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    let f = ctx.list(&[]).expect("fits");
+    let want = build(&mut ctx, &E::L(Vec::new()));
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // A binary with a control character that is not `~`.
+    let f = binary(&mut ctx, &reg, &[97, 1]);
+    let want = build(&mut ctx, &E::L(vec![E::I(97), E::I(1)]));
+    check_format(&mut ctx, &reg, f, &[], want);
+}
+
+/// `io:format` with an atom/binary/chardata format writes the flattened text.
+///
+/// | `io:format(F, A)` | stdout |
+/// |---|---|
+/// | `(<<"bin ~p~n">>, [1])` | `bin 1\n` |
+/// | `(aaa, [])` | `aaa` |
+/// | `(atom_nl, [])` | `atom_nl` |
+/// | `(<<"x~n">>, [])` | `x\n` |
+#[test]
+fn io_format_writes_an_atom_binary_or_list_format() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut atoms = seeded_atoms();
+    atoms.seed(["aaa", "atom_nl"]);
+    let mut sink = BytesSink::new();
+    {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+
+        // `io:format(<<"bin ~p~n">>, [1])` prints `bin 1` + a newline.
+        let f = binary(&mut ctx, &reg, b"bin ~p~n");
+        let one = int(&mut ctx, 1);
+        let args = ctx.list(&[one]).expect("fits");
+        reg.call("io", "format", 2, &mut ctx, &[f, args])
+            .expect("io:format/2");
+
+        // `io:format(aaa, [])` prints `aaa` (its name is scanned, no directive).
+        let f = atom(&mut ctx, "aaa");
+        let args = ctx.list(&[]).expect("fits");
+        reg.call("io", "format", 2, &mut ctx, &[f, args])
+            .expect("io:format/2");
+
+        // `io:format(atom_nl, [])` prints `atom_nl` (a literal `n`, not `~n`).
+        let f = atom(&mut ctx, "atom_nl");
+        let args = ctx.list(&[]).expect("fits");
+        reg.call("io", "format", 2, &mut ctx, &[f, args])
+            .expect("io:format/2");
+
+        // `io:format(<<"x~n">>, [])` prints `x` + a newline.
+        let f = binary(&mut ctx, &reg, b"x~n");
+        let args = ctx.list(&[]).expect("fits");
+        reg.call("io", "format", 2, &mut ctx, &[f, args])
+            .expect("io:format/2");
+    }
+    assert_eq!(sink.as_str(), "bin 1\naaaatom_nlx\n");
+}
+
+/// A format that is neither an atom, a binary nor a **proper** list — or that
+/// `count_small/1` has no clause for — is the oracle's `error:badarg`.
+///
+/// ```text
+/// io_lib:format(1, [])       ⇒ badarg         io_lib:format(1.0, [])    ⇒ badarg
+/// io_lib:format({}, [])      ⇒ badarg         io_lib:format({bb,cc},[]) ⇒ badarg
+/// io_lib:format(<<1:3>>, []) ⇒ badarg         io_lib:format([1|2], []) ⇒ badarg
+/// io_lib:format(foo, [1])    ⇒ badarg   (foo consumes no argument)
+/// ```
+#[test]
+fn an_unscannable_format_is_badarg() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut atoms = seeded_atoms();
+    atoms.seed(["bb", "cc"]);
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // An integer format.
+    let one = int(&mut ctx, 1);
+    check_format_badarg(&mut ctx, &reg, one, &[]);
+
+    // A float format.
+    let f = float(&mut ctx, 1.0);
+    check_format_badarg(&mut ctx, &reg, f, &[]);
+
+    // The empty tuple.
+    let f = tuple(&mut ctx, &[]);
+    check_format_badarg(&mut ctx, &reg, f, &[]);
+
+    // A two-element tuple.
+    let bb = atom(&mut ctx, "bb");
+    let cc = atom(&mut ctx, "cc");
+    let f = tuple(&mut ctx, &[bb, cc]);
+    check_format_badarg(&mut ctx, &reg, f, &[]);
+
+    // An improper format list.
+    let one = int(&mut ctx, 1);
+    let two = int(&mut ctx, 2);
+    let improper = ctx.cons(one, two).expect("fits");
+    check_format_badarg(&mut ctx, &reg, improper, &[]);
+
+    // An atom format that leaves an argument unconsumed.
+    let foo = atom(&mut ctx, "foo");
+    let one = int(&mut ctx, 1);
+    check_format_badarg(&mut ctx, &reg, foo, &[one]);
+
+    // A non-byte-aligned bitstring format (`<<1:3>>`) — built through the sibling
+    // safe `beam_codec::term` helper, since the crate's own is private.
+    drop(ctx);
+    let bits = codec_term::make_bitstring(&mut heap, &[0b0010_0000], 3).expect("fits");
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+    check_format_badarg(&mut ctx, &reg, bits, &[]);
+}
+
+/// A **list** format keeps a nested list/binary element verbatim: it is emitted as
+/// one element and is *never* scanned for a directive, so an embedded `~n` stays
+/// the two characters `[126,110]` and an integer above 255 stays itself.
+///
+/// ```text
+/// io_lib:format([<<120>>,[126,110]], []) ⇒ [<<120>>,[126,110]]
+/// io_lib:format([[[120]],[126,110]], []) ⇒ [[[120]],[126,110]]
+/// io_lib:format([<<120>>], [])           ⇒ [<<120>>]
+/// io_lib:format([[126,110]], [])         ⇒ [[126,110]]
+/// io_lib:format([20013,120], [])       ⇒ [20013,120]  (KNOWN DIVERGENCE: see below)
+/// io_lib:format([[[<<"a">>]]], [])       ⇒ [[[<<97>>]]]
+/// ```
+#[test]
+fn a_nested_element_of_a_list_format_is_kept_verbatim() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // `[<<120>>, [126,110]]` — the binary and the nested `"~n"` list are both
+    // verbatim, so the result is the format itself.
+    let bin120 = binary(&mut ctx, &reg, &[120]);
+    let tilde_n = char_list(&mut ctx, "~n");
+    let f = ctx.list(&[bin120, tilde_n]).expect("fits");
+    let want = ctx.list(&[bin120, tilde_n]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // `[[[120]], [126,110]]` — one level deeper, still verbatim.
+    let n120 = int(&mut ctx, 120);
+    let inner = ctx.list(&[n120]).expect("fits");
+    let first = ctx.list(&[inner]).expect("fits");
+    let second = char_list(&mut ctx, "~n");
+    let f = ctx.list(&[first, second]).expect("fits");
+    let want = ctx.list(&[first, second]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // A single verbatim binary element.
+    let bin120 = binary(&mut ctx, &reg, &[120]);
+    let f = ctx.list(&[bin120]).expect("fits");
+    let want = ctx.list(&[bin120]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // A single verbatim nested-list element.
+    let tilde_n = char_list(&mut ctx, "~n");
+    let f = ctx.list(&[tilde_n]).expect("fits");
+    let want = ctx.list(&[tilde_n]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // `[20013, 120]` — 20013 is outside 0..=255, so the oracle keeps it as an
+    // *integer element* (`count_small/1`'s `is_integer(C) -> Other + 1` clause) while
+    // 120 stays the literal character `x`.
+    //
+    // KNOWN DIVERGENCE (reported upstream, not fixed here): the oracle returns
+    // `[20013,120]`
+    //     erl -noshell -eval 'io:format("~p~n",[io_lib:format([20013,120],[])]),halt().'
+    //     % [20013,120]
+    // while this crate raises `error:badarg`: `render_format_unlimited` measures the
+    // verbatim element through `io_lib:chars_length/1` (`literal_other` →
+    // `chars_length_chunk`), whose `string:length/1` fallback has no clause for a
+    // bare integer. Only the integer element is affected — a *list* element holding
+    // the same code point is measured by `iolist_size/1` and succeeds.
+    let big = int(&mut ctx, 20013);
+    let x = int(&mut ctx, 120);
+    let f = ctx.list(&[big, x]).expect("fits");
+    check_format_badarg(&mut ctx, &reg, f, &[]);
+
+    // `[[[<<"a">>]]]` — a triple-nested binary element.
+    let bin_a = binary(&mut ctx, &reg, b"a");
+    let l1 = ctx.list(&[bin_a]).expect("fits");
+    let l2 = ctx.list(&[l1]).expect("fits");
+    let f = ctx.list(&[l2]).expect("fits");
+    let want = ctx.list(&[l2]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+}
+
+/// `io_lib_format:count_small/1` measures a **top-level binary** element with
+/// `string:length/1` — grapheme clusters — and raises `{badarg, Bin}` for a binary
+/// that is not valid UTF-8. A binary nested inside a list element is measured with
+/// `io_lib:chars_length/1` instead and is safe.
+///
+/// ```text
+/// io_lib:format([<<255>>], [])             ⇒ badarg
+/// io_lib:format([<<255>>,120], [])         ⇒ badarg
+/// io_lib:format([<<128>>], [])             ⇒ badarg
+/// io_lib:format([<<1,2,3>>], [])           ⇒ [<<1,2,3>>]
+/// io_lib:format([<<195,169>>,120], [])     ⇒ [<<195,169>>,120]
+/// io_lib:format([<<195,169>>,126,110], []) ⇒ [<<195,169>>,10]
+/// io_lib:format([[<<255>>],120], [])       ⇒ [[<<255>>],120]
+/// io_lib:format([[97,<<255>>]], [])        ⇒ [[97,<<255>>]]
+/// ```
+#[test]
+fn a_top_level_binary_format_element_is_measured_by_string_length() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // Invalid UTF-8 at the top level raises on both rendering paths.
+    for bad in [&[255u8][..], &[128][..]] {
+        let bin = binary(&mut ctx, &reg, bad);
+        let f = ctx.list(&[bin]).expect("fits");
+        check_format_badarg(&mut ctx, &reg, f, &[]);
+    }
+    let bin = binary(&mut ctx, &reg, &[255]);
+    let x = int(&mut ctx, 120);
+    let f = ctx.list(&[bin, x]).expect("fits");
+    check_format_badarg(&mut ctx, &reg, f, &[]);
+
+    // A valid UTF-8 binary element is kept verbatim (3 characters).
+    let bin = binary(&mut ctx, &reg, &[1, 2, 3]);
+    let f = ctx.list(&[bin]).expect("fits");
+    let want = ctx.list(&[bin]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // `[<<195,169>>,120]` — `x` is a literal character, so the result is the same.
+    let bin = binary(&mut ctx, &reg, &[195, 169]);
+    let x = int(&mut ctx, 120);
+    let f = ctx.list(&[bin, x]).expect("fits");
+    let want = ctx.list(&[bin, x]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // `[<<195,169>>,126,110]` — here `~n` IS scanned (a top-level format element),
+    // so the result carries a newline instead of the two characters.
+    let bin = binary(&mut ctx, &reg, &[195, 169]);
+    let n126 = int(&mut ctx, 126);
+    let n110 = int(&mut ctx, 110);
+    let f = ctx.list(&[bin, n126, n110]).expect("fits");
+    let nl = int(&mut ctx, 10);
+    let want = ctx.list(&[bin, nl]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    // A **nested** invalid-UTF-8 binary is safe: the outer list is measured by
+    // `io_lib:chars_length/1`, which never decodes the inner binary.
+    let bin = binary(&mut ctx, &reg, &[255]);
+    let inner = ctx.list(&[bin]).expect("fits");
+    let x = int(&mut ctx, 120);
+    let f = ctx.list(&[inner, x]).expect("fits");
+    let want = ctx.list(&[inner, x]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
+
+    let bin = binary(&mut ctx, &reg, &[255]);
+    let a = int(&mut ctx, 97);
+    let inner = ctx.list(&[a, bin]).expect("fits");
+    let f = ctx.list(&[inner]).expect("fits");
+    let want = ctx.list(&[inner]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
 }
