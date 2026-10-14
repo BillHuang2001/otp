@@ -40,23 +40,27 @@
 //! `unsafe` is confined to the raw word read/write of the copy loop; every `unsafe` block carries
 //! a `// SAFETY:` rationale.
 //!
-//! # One traversal for a clean destination (the single-pass fast path)
+//! # One traversal whenever the destination's off-heap table is empty (the single-pass fast path)
 //!
 //! The copier's default shape is **two traversals**: [`preflight_words`] sizes the graph against
-//! the destination's free words, then [`shallow`] + the worklist loop write it. A destination that
-//! is **clean** — `Heap::used() == 0` and an off-heap table empty in all three of its lists — has
-//! no partially-built state to preserve, and is the shape the common case actually has (a fresh
-//! [`HeapFragment`](crate::HeapFragment) region, a fresh receiver/message heap), so for it the
-//! copier runs the writing traversal **alone**: [`try_copy_fast`] copies through a
-//! [`TrialTarget`] — a bump pointer over the destination heap's own *unwritten* words — and
-//! commits with a single `alloc_words`. A copy that turns out not to fit is abandoned and the
-//! preflight path below re-derives the same typed outcome, so nothing about the error contract
-//! (`AllocKind::Message` exhaustion, `BadArg` for a malformed/cyclic graph, send atomicity)
-//! changes. Because the trial never advances the destination's `used`/`peak`, a refused copy has
-//! provably written nothing at all — the strongest form of the crate's "no partial write on
-//! refusal" rule, and the one `tests/sizing.rs` pins. A **dirty** destination keeps the sized
-//! path: its roll-back would need a `truncate(mark)` API that [`beam_alloc::Heap`] does not
-//! expose.
+//! the destination's free words, then [`shallow`] + the worklist loop write it. A destination whose
+//! **off-heap table** holds nothing in any of its three lists (no MSO handle, no refc binary, no
+//! node reference) has no partially-built state a failed attempt could not wholly roll back, and is
+//! the shape the common case actually has (a fresh
+//! [`HeapFragment`](crate::HeapFragment) region, and — because the staging table is per-send and
+//! always fresh — every receiver heap a real `send` copies into), so for it the copier runs the
+//! writing traversal **alone**: [`try_copy_fast`] copies through a [`TrialTarget`] — a bump pointer
+//! over the destination heap's own *unwritten* words — and commits with a single `alloc_words`. A
+//! copy that turns out not to fit is abandoned and the preflight path below re-derives the same
+//! typed outcome, so nothing about the error contract (`AllocKind::Message` exhaustion, `BadArg`
+//! for a malformed/cyclic graph, send atomicity) changes. Because the trial never advances the
+//! destination's `used`/`peak`, a refused copy has provably written nothing at all — the strongest
+//! form of the crate's "no partial write on refusal" rule, and the one `tests/sizing.rs` pins.
+//!
+//! A destination heap that is merely **dirty** (`used() > 0`) is *not* excluded: the trial only ever
+//! writes into the heap's unused tail and commits once, so a failure needs no heap rewind at all.
+//! Only a **non-empty off-heap table** keeps the sized path, because rolling *that* back would
+//! discard entries that are not this copy's to release.
 //!
 //! # Cycle guard on the preflight
 //!
@@ -119,8 +123,9 @@ impl CopyTarget for Heap {
 /// destination heap (`[hp, hend)`).
 ///
 /// It hands out exactly the words the heap itself would, without touching the heap's `used` or
-/// `peak` — so an attempt that fails leaves the destination provably untouched, and one that
-/// succeeds is committed by [`try_copy_fast`] with a single `alloc_words(written)`.
+/// `peak` — so an attempt that fails leaves the destination heap's accounting provably untouched
+/// (whatever it already held stays live, and the words the trial wrote lie past `used`, invisible),
+/// and one that succeeds is committed by [`try_copy_fast`] with a single `alloc_words(written)`.
 struct TrialTarget {
     hp: *mut Eterm,
     free: usize,
@@ -694,28 +699,34 @@ pub(crate) fn shallow<A: CopyTarget>(
     }
 }
 
-/// Whether `to`/`ctx` is a **clean** destination: the heap has handed out no word (`used() == 0`)
-/// and the off-heap table holds nothing in **any** of its three lists (no MSO handle, no refc
-/// binary, no node reference).
+/// Whether a copy into `ctx`'s destination may take the **single-pass fast path**.
 ///
-/// Only such a destination is admitted to the single-pass fast path, because only it is fully
-/// roll-back-able with the available API: the heap's bump pointer is still at its base (the
-/// fast path never moves it before it succeeds, and `Heap::reset` could rewind it anyway), and
-/// the off-heap table can be emptied wholesale by
-/// [`OffHeapTable::rollback`](crate::off_heap::OffHeapTable::rollback) without discarding
-/// references that were already there. This is the shape the common case actually presents — a
-/// fresh message-fragment region, or a receiver heap a previous message left empty.
-fn is_clean_destination(to: &Heap, ctx: &CopyContext<'_>) -> bool {
-    to.used() == 0 && ctx.dst_off_heap().is_fully_empty()
+/// The one precondition is that the destination's off-heap table holds nothing in **any** of its
+/// three lists (no MSO handle, no refc binary, no node reference). That — not the heap's `used` —
+/// is what makes an abandoned attempt roll-back-able: [`OffHeapTable::rollback`](crate::off_heap::OffHeapTable::rollback)
+/// empties a table *wholesale*, so it is sound only on a table the caller knows started empty, which
+/// this gate guarantees.
+///
+/// The destination **heap's** `used` is deliberately *not* part of the gate. [`try_copy_fast`]
+/// writes through [`TrialTarget`], which hands out only `[to.hp(), to.hp() + to.available())` — the
+/// heap's *unwritten* tail — and leaves `used`/`peak` untouched until the single commit
+/// (`to.alloc_words(written)`). A failed attempt therefore committed nothing, so there is nothing to
+/// rewind: the leftover trial words lie beyond `used`, invisible to the heap and overwritten by the
+/// next allocation. That is exactly the common case — a long-lived receiver heap a previous message
+/// left non-empty (see `beam_process::Process::copy_message`, whose destination is the process's
+/// young heap) — and it is the shape the single traversal now serves.
+fn is_fast_path_eligible(ctx: &CopyContext<'_>) -> bool {
+    ctx.dst_off_heap().is_fully_empty()
 }
 
 /// The optimistic **single-pass** copy: [`shallow`] + the worklist loop with no preflight
 /// traversal, writing into a [`TrialTarget`] over the destination heap's own unwritten words and
 /// committing the heap with one `alloc_words` when the whole graph has been materialised.
 ///
-/// Returns the copied root. Every failure leaves the destination heap's `used`/`peak` at zero and
-/// exactly the off-heap references the caller must roll back (none on the success path) — the
-/// caller re-runs the sized path, which re-derives the crate's typed outcome.
+/// Returns the copied root. A failure leaves the destination heap's `used`/`peak` **exactly where
+/// they were** (the trial never advanced them, whether the destination was clean or dirty) and
+/// registers exactly the off-heap references the caller must roll back (none on the success path) —
+/// the caller re-runs the sized path, which re-derives the crate's typed outcome.
 fn try_copy_fast(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
     let mut trial = TrialTarget::over(to);
     let mut work: Vec<Fixup> = Vec::new();
@@ -750,29 +761,34 @@ fn try_copy_fast(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Resul
 /// This is the **flat** copy: a subterm occurring twice is copied twice. See
 /// [`copy_struct_shared`](crate::copy_struct_shared) for the sharing-preserving variant.
 ///
-/// A **clean** destination (see [`is_clean_destination`]) is served by a single traversal
-/// ([`try_copy_fast`]); any destination takes the preflight-then-write path. Either way a copy
-/// that does not fit is the typed [`AllocKind::Message`](beam_common::AllocKind) refusal, a
-/// malformed/cyclic graph is [`BeamError::BadArg`](beam_common::BeamError::BadArg), and a refusal
-/// writes no destination word.
+/// A **fast-path-eligible** destination (see [`is_fast_path_eligible`]) is served by a single
+/// traversal ([`try_copy_fast`]); any other destination takes the preflight-then-write path. Either
+/// way a copy that does not fit is the typed [`AllocKind::Message`](beam_common::AllocKind)
+/// refusal, a malformed/cyclic graph is [`BeamError::BadArg`](beam_common::BeamError::BadArg), and a
+/// refusal writes no destination word.
 pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
-    // The optimistic single-pass attempt: a clean destination — an empty heap *and* an empty
-    // off-heap table — has no partial state worth preserving, so its copy needs no preflight
-    // traversal. `try_copy_fast` writes through a trial bump pointer that leaves the heap's
-    // `used`/`peak` untouched, so a failed attempt is fully roll-back-able: the heap needs no
-    // rewind (nothing was handed out of it) and the three off-heap lists are drained (releasing
-    // the refcounts the attempt took).
+    // The optimistic single-pass attempt: a destination whose off-heap table is empty has no
+    // partial state worth preserving, so its copy needs no preflight traversal — whether or not the
+    // heap has already handed words out. `try_copy_fast` writes through a trial bump pointer that
+    // leaves the heap's `used`/`peak` untouched, so a failed attempt is fully roll-back-able: the
+    // heap needs **no** rewind (nothing was ever handed out of it) and the three off-heap lists are
+    // drained (releasing the refcounts the attempt took).
     //
-    // A *dirty* destination keeps the sized path below: rolling one back would need a
-    // `truncate(mark)` API that `beam_alloc::Heap` does not expose.
-    if is_clean_destination(to, ctx) {
+    // A destination whose off-heap table is *non-empty* keeps the sized path below: rolling that one
+    // back would drain its pre-existing entries, which are not this copy's to discard.
+    if is_fast_path_eligible(ctx) {
         match try_copy_fast(term, to, ctx) {
             Ok(root) => return Ok(root),
             Err(_) => {
                 // Abandon the attempt completely, then let the preflight path below re-derive the
                 // crate's typed outcome (`AllocKind::Message`, `BadArg`, …) — the optimistic path
                 // must never surface a raw `AllocKind::Heap` from its trial target.
-                to.reset();
+                //
+                // Only the off-heap table is rolled back. The trial never advanced the destination
+                // heap's `used`/`peak`, so the heap is already exactly where it was and a
+                // `to.reset()` here would be wrong for a dirty destination: it would discard the
+                // words that were live before the copy. The trial's leftover words sit past `used`,
+                // invisible to the heap and overwritten by the next allocation.
                 ctx.dst_off_heap_mut().rollback();
             }
         }
