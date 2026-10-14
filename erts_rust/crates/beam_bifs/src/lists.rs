@@ -80,16 +80,17 @@
 //!
 //! # `sort/2` and `usort/2` — the ordering fun
 //!
-//! `Fun(A, B)` is the `=<` relation, so it is probed in **both** directions: only
-//! `Fun(A,B) = true, Fun(B,A) = false` is a strict order; both-true is equivalence
-//! (the stable sort then keeps the input order, `sort(U, [{1,a},{1,b}])` ⇒
-//! `[{1,a},{1,b}]`) and so is the degenerate neither-true case (the oracle's own
-//! `sort` keeps the input order for `fun(A,B) -> A < B end`). `usort/2` then drops
-//! the *later* of each mutually-`Fun`-equivalent run, so a one-directional
-//! comparator such as `fun(A,B) -> A < B end` removes nothing. The sort itself is a
-//! local **stable merge sort** (not `slice::sort_by`): the comparator can raise, and
-//! an Erlang ordering fun is user-supplied, so a degenerate one must not panic the
-//! BIF.
+//! `Fun(A, B)` is the `=<` relation, and both functions are **faithful ports of the
+//! pure-Erlang `lists.erl` algorithms** — the `fsplit_*`/`fmerge*` family for
+//! `sort/2`, the `ufsplit_*`/`ufmerge*` family for `usort/2` — because the run
+//! structure and the tie handling are *observable* for a degenerate (non-total)
+//! comparator: `lists:sort(fun(_, _) -> false end, [1,2,3])` ⇒ `[3,2,1]` (never the
+//! input order), and ties under a strict comparator such as `fun(A, B) -> A < B end`
+//! come out in **reverse** input order. `usort/2` additionally drops the *later* of
+//! each mutually-`Fun`-equivalent run, so a one-directional comparator such as
+//! `fun(A,B) -> A < B end` removes nothing. Neither port may panic the BIF: an
+//! Erlang ordering fun is user-supplied and can raise, so every call goes through
+//! [`BifContext::call_fun`] and a raise propagates verbatim.
 //!
 //! # Which of these are real BIFs?
 //!
@@ -358,68 +359,6 @@ fn require_fun(fun: Eterm, arity: u32) -> Result<()> {
         Some(n) if n == arity => Ok(()),
         _ => Err(function_clause()),
     }
-}
-
-/// The `Fun(A, B)` ordering of two elements for `sort/2`/`usort/2`.
-///
-/// `Fun` is the `=<` relation, so it is probed both ways: `true`/`false` is a
-/// strict order, both-`true` is equivalence, and the degenerate neither-`true` case
-/// is equivalence too (which keeps the input order of elements a one-directional
-/// comparator such as `fun(A, B) -> A < B end` considers equal — the oracle's own
-/// `sort/2` does the same).
-fn fun_order(ctx: &mut BifContext<'_>, fun: Eterm, a: Eterm, b: Eterm) -> Result<Ordering> {
-    if call_predicate(ctx, fun, &[a, b])? {
-        if call_predicate(ctx, fun, &[b, a])? {
-            Ok(Ordering::Equal)
-        } else {
-            Ok(Ordering::Less)
-        }
-    } else if call_predicate(ctx, fun, &[b, a])? {
-        Ok(Ordering::Greater)
-    } else {
-        Ok(Ordering::Equal)
-    }
-}
-
-/// A **stable** bottom-up merge sort with a fallible comparator.
-///
-/// `slice::sort_by` is unusable here: the comparator calls an Erlang fun (which can
-/// raise), and `sort_by` additionally requires a total order — an Erlang ordering
-/// fun is user-supplied, so a degenerate one must never panic a BIF. Elements the
-/// comparator reports `Equal` keep their input order.
-fn merge_sort_elems(
-    elems: Vec<Eterm>,
-    mut order: impl FnMut(Eterm, Eterm) -> Result<Ordering>,
-) -> Result<Vec<Eterm>> {
-    let len = elems.len();
-    let mut source = elems;
-    let mut width = 1;
-    while width < len {
-        let mut merged = Vec::with_capacity(len);
-        let mut start = 0;
-        while start < len {
-            let middle = (start + width).min(len);
-            let end = (start + 2 * width).min(len);
-            let (mut left, mut right) = (start, middle);
-            while left < middle && right < end {
-                // `Greater` means the right run's element must come first; anything
-                // else takes the left element, which is what makes the sort stable.
-                if order(source[left], source[right])? == Ordering::Greater {
-                    merged.push(source[right]);
-                    right += 1;
-                } else {
-                    merged.push(source[left]);
-                    left += 1;
-                }
-            }
-            merged.extend_from_slice(&source[left..middle]);
-            merged.extend_from_slice(&source[right..end]);
-            start = end;
-        }
-        source = merged;
-        width *= 2;
-    }
-    Ok(source)
 }
 
 /// Walks `list` while `fun` holds, returning `(taken, rest)`.
@@ -1590,7 +1529,22 @@ fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     build_list(ctx, &zipped, NIL)
 }
 
-/// `sort(Fun, List)` — a **stable** sort in the `Fun` (`=<`) order.
+/// `sort(Fun, List)` — the oracle's **exact** `sort/2` algorithm.
+///
+/// `lists.erl` implements `sort/2` in pure Erlang as a merge sort whose runs come
+/// from the `fsplit_1`/`fsplit_1_1`/`fsplit_2` family and are merged by
+/// `fmergel`/`rfmergel`/`fmerge2_*`/`rfmerge2_*`. Both the run structure and which of
+/// two `Fun`-equivalent elements a merge keeps are *observable* for a degenerate
+/// (non-total) comparator, so this is a faithful port of that machinery
+/// ([`fsplit_1`] &c.) rather than a generic merge sort:
+///
+/// * `lists:sort(fun(_, _) -> false end, [1,2,3])` ⇒ `[3,2,1]` — the descending
+///   split, which reverses the input (the oracle *never* treats a neither-true pair
+///   as `equal`);
+/// * `lists:sort(fun(_, _) -> true end, [1,2,3])` ⇒ `[1,2,3]`;
+/// * `lists:sort(fun({K1,_},{K2,_}) -> K1 < K2 end, [{1,a},{1,b},{0,c}])` ⇒
+///   `[{0,c},{1,b},{1,a}]` — a strict comparator's *ties* come out in **reverse**
+///   input order.
 ///
 /// Only the `[]`/`[_]` clauses carry `when is_function(Fun, 2)`; the `[X, Y | T]`
 /// clause does **not**, so a wrong fun is a guard failure just for a list of fewer
@@ -1601,8 +1555,16 @@ fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     if elems.len() < 2 {
         require_fun(fun, 2)?;
+        return ctx.list(&elems);
     }
-    let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
+    // `sort(Fun, [X, Y | T])` — the first probe picks the split direction.
+    let (x, y) = (elems[0], elems[1]);
+    let rest = &elems[2..];
+    let sorted = if call_predicate(ctx, fun, &[x, y])? {
+        fsplit_1(ctx, fun, y, x, rest, Vec::new(), Vec::new(), None)?
+    } else {
+        fsplit_2(ctx, fun, y, x, rest, Vec::new(), Vec::new(), None)?
+    };
     ctx.list(&sorted)
 }
 
@@ -2008,6 +1970,385 @@ fn rufmerge2_1(
     }
 }
 
+// ---------------------------------------------------------------------------
+// lists:sort/2 — the `fsplit_1`/`fsplit_2`/`fmergel` port
+// ---------------------------------------------------------------------------
+
+/// Which direction the run collector walked in — `lists.erl`'s `asc`/`desc` order
+/// argument of `fmergel`/`rfmergel`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortOrder {
+    /// `fsplit_1` & co. (`asc`): runs ascend, and `fmergel` prefers the *first*
+    /// run's element.
+    Asc,
+    /// `fsplit_2` & co. (`desc`): runs descend, and `fmergel`'s two clauses bind
+    /// their runs the other way round.
+    Desc,
+}
+
+/// `fsplit_1/6` **and** its `fsplit_1_1/7` continuation as one loop (`stage_two` is
+/// `Some(S)` in the `fsplit_1_1` state and `None` in `fsplit_1`).
+///
+/// `R` is held reversed (`r.push(x)` is `[X | R]`), and `rs` holds the already
+/// collected runs with the newest at index 0 (`rs.insert(0, run)` is `[Run | Rs]`).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn fsplit_1(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut y: Eterm,
+    mut x: Eterm,
+    list: &[Eterm],
+    mut r: Vec<Eterm>,
+    mut rs: Vec<Vec<Eterm>>,
+    mut stage_two: Option<Eterm>,
+) -> Result<Vec<Eterm>> {
+    let mut at = 0;
+    loop {
+        if at < list.len() {
+            let z = list[at];
+            at += 1;
+            if call_predicate(ctx, fun, &[y, z])? {
+                // `fsplit_1(Z, Y, L, [X | R], Rs)` — the pair shifts: new `Y` is
+                // `Z` and new `X` is the old `Y`.
+                r.push(x);
+                x = y;
+                y = z;
+            } else if call_predicate(ctx, fun, &[x, z])? {
+                // `fsplit_1(Y, Z, L, [X | R], Rs)`.
+                r.push(x);
+                x = z;
+            } else if let Some(s) = stage_two {
+                // `fsplit_1_1/7` — a run is being closed by the pair `(S, Z)`.
+                if call_predicate(ctx, fun, &[s, z])? {
+                    // `fsplit_1(Z, S, L, [], [[Y, X | R] | Rs])`.
+                    let run = run_head_pair(&r, x, y);
+                    rs.insert(0, run);
+                    y = z;
+                    x = s;
+                    r = Vec::new();
+                    stage_two = None;
+                } else {
+                    // `fsplit_1(S, Z, L, [], [[Y, X | R] | Rs])`.
+                    let run = run_head_pair(&r, x, y);
+                    rs.insert(0, run);
+                    y = s;
+                    x = z;
+                    r = Vec::new();
+                    stage_two = None;
+                }
+            } else if r.is_empty() {
+                // `false when R == [] -> fsplit_1(Y, X, L, [Z], Rs)`.
+                r = vec![z];
+            } else {
+                // `fsplit_1_1(Y, X, L, R, Rs, Z)`.
+                stage_two = Some(z);
+            }
+        } else if let Some(s) = stage_two {
+            // `rfmergel([[S], [Y, X | R] | Rs], [], Fun, asc)`.
+            let run = run_head_pair(&r, x, y);
+            let mut runs = vec![vec![s], run];
+            runs.append(&mut rs);
+            return rfmergel(ctx, fun, runs, Vec::new(), SortOrder::Asc);
+        } else {
+            // `rfmergel([[Y, X | R] | Rs], [], Fun, asc)`.
+            let run = run_head_pair(&r, x, y);
+            let mut runs = vec![run];
+            runs.append(&mut rs);
+            return rfmergel(ctx, fun, runs, Vec::new(), SortOrder::Asc);
+        }
+    }
+}
+
+/// `fsplit_2/6` **and** its `fsplit_2_1/7` continuation as one loop — the
+/// *descending* twin of [`fsplit_1`], identical but for which `Fun` result advances
+/// the pair (`lists.erl`'s `fsplit_2` negates every `case` arm).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn fsplit_2(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut y: Eterm,
+    mut x: Eterm,
+    list: &[Eterm],
+    mut r: Vec<Eterm>,
+    mut rs: Vec<Vec<Eterm>>,
+    mut stage_two: Option<Eterm>,
+) -> Result<Vec<Eterm>> {
+    let mut at = 0;
+    loop {
+        if at < list.len() {
+            let z = list[at];
+            at += 1;
+            if !call_predicate(ctx, fun, &[y, z])? {
+                // `fsplit_2(Z, Y, L, [X | R], Rs)`.
+                r.push(x);
+                x = y;
+                y = z;
+            } else if !call_predicate(ctx, fun, &[x, z])? {
+                // `fsplit_2(Y, Z, L, [X | R], Rs)`.
+                r.push(x);
+                x = z;
+            } else if let Some(s) = stage_two {
+                // `fsplit_2_1/7`.
+                if !call_predicate(ctx, fun, &[s, z])? {
+                    // `fsplit_2(Z, S, L, [], [[Y, X | R] | Rs])`.
+                    let run = run_head_pair(&r, x, y);
+                    rs.insert(0, run);
+                    y = z;
+                    x = s;
+                    r = Vec::new();
+                    stage_two = None;
+                } else {
+                    // `fsplit_2(S, Z, L, [], [[Y, X | R] | Rs])`.
+                    let run = run_head_pair(&r, x, y);
+                    rs.insert(0, run);
+                    y = s;
+                    x = z;
+                    r = Vec::new();
+                    stage_two = None;
+                }
+            } else if r.is_empty() {
+                // `true when R == [] -> fsplit_2(Y, X, L, [Z], Rs)`.
+                r = vec![z];
+            } else {
+                // `fsplit_2_1(Y, X, L, R, Rs, Z)`.
+                stage_two = Some(z);
+            }
+        } else if let Some(s) = stage_two {
+            // `fmergel([[S], [Y, X | R] | Rs], [], Fun, desc)`.
+            let run = run_head_pair(&r, x, y);
+            let mut runs = vec![vec![s], run];
+            runs.append(&mut rs);
+            return fmergel(ctx, fun, runs, Vec::new(), SortOrder::Desc);
+        } else {
+            // `fmergel([[Y, X | R] | Rs], [], Fun, desc)`.
+            let run = run_head_pair(&r, x, y);
+            let mut runs = vec![run];
+            runs.append(&mut rs);
+            return fmergel(ctx, fun, runs, Vec::new(), SortOrder::Desc);
+        }
+    }
+}
+
+/// `fmergel/4` — consumes the run list two at a time into `acc`, then flips to
+/// [`rfmergel`] (`Asc` and `Desc` bind the two runs of a pair the other way round,
+/// which is what makes the `desc` merge keep the *second* run's element on a tie).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn fmergel(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut runs: Vec<Vec<Eterm>>,
+    mut acc: Vec<Vec<Eterm>>,
+    order: SortOrder,
+) -> Result<Vec<Eterm>> {
+    loop {
+        if runs.len() >= 2 {
+            let first = runs.remove(0);
+            let second = runs.remove(0);
+            // `fmergel([T1, [H2 | T2] | L], …, asc)` / `fmergel([[H2 | T2], T1 | L],
+            // …, desc)` — both bind `T1` (the list whose element wins a tie) and the
+            // `H2`/`T2` pair the other way round.
+            let (t1, h2_run) = match order {
+                SortOrder::Asc => (first, second),
+                SortOrder::Desc => (second, first),
+            };
+            let merged = fmerge2_1(ctx, fun, &t1, h2_run[0], &h2_run[1..])?;
+            acc.insert(0, merged);
+        } else if runs.len() == 1 {
+            let last = runs.pop().expect("one run remains");
+            if acc.is_empty() {
+                // `fmergel([L], [], _Fun, _O) -> L`.
+                return Ok(last);
+            }
+            // `fmergel([L], Acc, Fun, O) -> rfmergel([lists:reverse(L) | Acc], …)`.
+            acc.insert(0, rev_erl(&last));
+            return rfmergel(ctx, fun, acc, Vec::new(), order);
+        } else {
+            // `fmergel([], Acc, Fun, O) -> rfmergel(Acc, [], Fun, O)`.
+            return rfmergel(ctx, fun, acc, Vec::new(), order);
+        }
+    }
+}
+
+/// See [`fmergel`] — the reverse direction (there is no empty-`acc` shortcut here).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn rfmergel(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut runs: Vec<Vec<Eterm>>,
+    mut acc: Vec<Vec<Eterm>>,
+    order: SortOrder,
+) -> Result<Vec<Eterm>> {
+    loop {
+        if runs.len() >= 2 {
+            let first = runs.remove(0);
+            let second = runs.remove(0);
+            // `rfmergel([[H2 | T2], T1 | L], …, asc)` /
+            // `rfmergel([T1, [H2 | T2] | L], …, desc)`.
+            let (t1, h2_run) = match order {
+                SortOrder::Asc => (second, first),
+                SortOrder::Desc => (first, second),
+            };
+            let merged = rfmerge2_1(ctx, fun, &t1, h2_run[0], &h2_run[1..])?;
+            acc.insert(0, merged);
+        } else if runs.len() == 1 {
+            let last = runs.pop().expect("one run remains");
+            // `rfmergel([L], Acc, Fun, O) -> fmergel([lists:reverse(L) | Acc], …)`.
+            acc.insert(0, rev_erl(&last));
+            return fmergel(ctx, fun, acc, Vec::new(), order);
+        } else {
+            // `rfmergel([], Acc, Fun, O) -> fmergel(Acc, [], Fun, O)`.
+            return fmergel(ctx, fun, acc, Vec::new(), order);
+        }
+    }
+}
+
+/// `fmerge2_1/5` and `fmerge2_2/5` as one loop: `State::One(h2)` is
+/// `fmerge2_1(T1, H2, Fun, T2, M)` (the second run's head is fixed and the first
+/// run supplies the next candidate) and `State::Two(h1)` is
+/// `fmerge2_2(H1, T1, Fun, T2, M)`. Elements from the first list are prioritized:
+/// on `Fun(H1, H2) = false` the second list's head is taken.
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn fmerge2_1(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    t1: &[Eterm],
+    h2: Eterm,
+    t2: &[Eterm],
+) -> Result<Vec<Eterm>> {
+    /// Which of the two mutually tail-recursive functions we are in.
+    enum State {
+        /// `fmerge2_1(T1, H2, …)`.
+        One(Eterm),
+        /// `fmerge2_2(H1, …)`.
+        Two(Eterm),
+    }
+    let mut m: Vec<Eterm> = Vec::new();
+    let mut at1 = 0;
+    let mut at2 = 0;
+    let mut state = State::One(h2);
+    loop {
+        match state {
+            State::One(h2c) => {
+                if let Some(&h1) = t1.get(at1) {
+                    at1 += 1;
+                    if call_predicate(ctx, fun, &[h1, h2c])? {
+                        // `fmerge2_1(T1, H2, Fun, T2, [H1 | M])`.
+                        m.push(h1);
+                        state = State::One(h2c);
+                    } else {
+                        // `fmerge2_2(H1, T1, Fun, T2, [H2 | M])`.
+                        m.push(h2c);
+                        state = State::Two(h1);
+                    }
+                } else {
+                    // `fmerge2_1([], H2, _Fun, T2, M) -> lists:reverse(T2, [H2 | M])`.
+                    m.push(h2c);
+                    return Ok(rev_append_tail(&t2[at2..], &m));
+                }
+            }
+            State::Two(h1) => {
+                if let Some(&h2c) = t2.get(at2) {
+                    at2 += 1;
+                    if call_predicate(ctx, fun, &[h1, h2c])? {
+                        // `fmerge2_2(…, [H1 | M])` after `fmerge2_1(T1, H2, …)`.
+                        m.push(h1);
+                        state = State::One(h2c);
+                    } else {
+                        // `fmerge2_2(H1, T1, Fun, T2, [H2 | M])`.
+                        m.push(h2c);
+                        state = State::Two(h1);
+                    }
+                } else {
+                    // `fmerge2_2(H1, T1, _Fun, [], M) -> lists:reverse(T1, [H1 | M])`.
+                    m.push(h1);
+                    return Ok(rev_append_tail(&t1[at1..], &m));
+                }
+            }
+        }
+    }
+}
+
+/// `rfmerge2_1/5` and `rfmerge2_2/5` as one loop — the descending merge (the mirror
+/// of [`fmerge2_1`]: on `Fun(H1, H2) = true` the second list's head is taken).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn rfmerge2_1(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    t1: &[Eterm],
+    h2: Eterm,
+    t2: &[Eterm],
+) -> Result<Vec<Eterm>> {
+    /// Which of the two mutually tail-recursive functions we are in.
+    enum State {
+        /// `rfmerge2_1(T1, H2, …)`.
+        One(Eterm),
+        /// `rfmerge2_2(H1, …)`.
+        Two(Eterm),
+    }
+    let mut m: Vec<Eterm> = Vec::new();
+    let mut at1 = 0;
+    let mut at2 = 0;
+    let mut state = State::One(h2);
+    loop {
+        match state {
+            State::One(h2c) => {
+                if let Some(&h1) = t1.get(at1) {
+                    at1 += 1;
+                    if call_predicate(ctx, fun, &[h1, h2c])? {
+                        // `rfmerge2_2(H1, T1, Fun, T2, [H2 | M])`.
+                        m.push(h2c);
+                        state = State::Two(h1);
+                    } else {
+                        // `rfmerge2_1(T1, H2, Fun, T2, [H1 | M])`.
+                        m.push(h1);
+                        state = State::One(h2c);
+                    }
+                } else {
+                    // `rfmerge2_1([], H2, _Fun, T2, M) -> lists:reverse(T2, [H2 | M])`.
+                    m.push(h2c);
+                    return Ok(rev_append_tail(&t2[at2..], &m));
+                }
+            }
+            State::Two(h1) => {
+                if let Some(&h2c) = t2.get(at2) {
+                    at2 += 1;
+                    if call_predicate(ctx, fun, &[h1, h2c])? {
+                        // `rfmerge2_2(H1, T1, Fun, T2, [H2 | M])`.
+                        m.push(h2c);
+                        state = State::Two(h1);
+                    } else {
+                        // `rfmerge2_1(T1, H2, Fun, T2, [H1 | M])`.
+                        m.push(h1);
+                        state = State::One(h2c);
+                    }
+                } else {
+                    // `rfmerge2_2(H1, T1, _Fun, [], M) -> lists:reverse(T1, [H1 | M])`.
+                    m.push(h1);
+                    return Ok(rev_append_tail(&t1[at1..], &m));
+                }
+            }
+        }
+    }
+}
+
 /// `keymap(Fun, Index, TupleList)` — `Fun` applied to the `Index`th element of
 /// every tuple, the result replacing it.
 ///
@@ -2230,8 +2571,12 @@ mod tests {
     const ORDER_LT: i64 = 104;
     /// `fun(A, B) -> A > B end` — a non-total strict descending order.
     const ORDER_GT: i64 = 105;
-
-    /// The comparator sentinel `id` as a real arity-2 `EXPORT_EXT` fun term — its
+    /// `fun(A, B) -> A div 10 < B div 10 end` — a strict order over a two-digit
+    /// "key" prefix, so two *distinct* elements can compare equivalent (a tie).
+    const ORDER_KEY_LT: i64 = 106;
+    /// `fun(A, B) -> A div 10 =< B div 10 end` — the `=<` relation over the same key:
+    /// a *total* order whose ties keep the input order.
+    const ORDER_KEY_LE: i64 = 107;    /// The comparator sentinel `id` as a real arity-2 `EXPORT_EXT` fun term — its
     /// function-name atom is `Atom::from_raw(id)`, which the mock decodes.
     fn order_fun(ctx: &mut BifContext<'_>, id: i64) -> Eterm {
         beam_codec::term::make_fun_external(
@@ -2257,6 +2602,8 @@ mod tests {
                 ORDER_DESC => a >= b,
                 ORDER_LT => a < b,
                 ORDER_GT => a > b,
+                ORDER_KEY_LT => a / 10 < b / 10,
+                ORDER_KEY_LE => a / 10 <= b / 10,
                 other => panic!("unknown sentinel fun {other}"),
             };
             Ok(if result { self.truth } else { self.falsity })
@@ -2283,6 +2630,13 @@ mod tests {
         pretty(ctx, out)
     }
 
+    /// Calls `sort/2` with the sentinel comparator `id` on `list` and renders the
+    /// result with `~w`.
+    fn show_sort(ctx: &mut BifContext<'_>, id: i64, list: Eterm) -> String {
+        let fun = order_fun(ctx, id);
+        let out = sort2(ctx, &[fun, list]).expect("sort/2 should succeed");
+        pretty(ctx, out)
+    }
     /// Renders `term` with the `~w` printer, for readable assertions.
     fn pretty(ctx: &mut BifContext<'_>, term: Eterm) -> String {
         crate::print::format_term(ctx, term, false).expect("term is printable")
@@ -3156,6 +3510,227 @@ mod tests {
                 .expect("the cons fits");
             let args = vec![order_fun(ctx, ORDER_ASC), improper];
             rejects_clause!(ctx, usort2, [args[0], args[1]]);
+        });
+    }
+
+    /// `sort/2` for the two **degenerate** comparators — the case a merge that reads
+    /// "neither `Fun(A,B)` nor `Fun(B,A)`" as `Equal` gets *silently* wrong.
+    ///
+    /// Oracle (erts-17.1), every value asserted below verbatim:
+    /// `lists:sort(fun(_,_) -> false end, [1,2,3])` ⇒ `[3,2,1]` (the crate used to
+    /// answer `[1,2,3]`), `fun(_,_) -> true end` over the same list ⇒ `[1,2,3]`.
+    #[test]
+    fn sort_with_degenerate_comparators_reproduces_the_oracle() {
+        with_order_funs(|ctx| {
+            // `Fun(X, Y) = false` sends `sort/2` down the *descending* split, whose
+            // run structure reverses the input (never `[1,2,3]`).
+            let l = ints(ctx, &[1, 2, 3]);
+            assert_eq!(show_sort(ctx, ALWAYS_FALSE, l), "[3,2,1]");
+            for (items, expected) in [
+                (vec![1_i64, 2], "[2,1]"),
+                (vec![2, 1], "[1,2]"),
+                (vec![1, 2, 3, 4], "[4,3,2,1]"),
+                (vec![1, 2, 3, 4, 5], "[5,4,3,2,1]"),
+                (vec![1, 2, 3, 4, 5, 6], "[6,5,4,3,2,1]"),
+                (vec![1, 2, 3, 4, 5, 6, 7], "[7,6,5,4,3,2,1]"),
+                (vec![1, 2, 3, 4, 5, 6, 7, 8], "[8,7,6,5,4,3,2,1]"),
+            ] {
+                let l = ints(ctx, &items);
+                assert_eq!(show_sort(ctx, ALWAYS_FALSE, l), expected, "false {items:?}");
+            }
+            // `Fun(X, Y) = true` is the ascending split; it keeps the input order.
+            for (items, expected) in [
+                (vec![1_i64, 2], "[1,2]"),
+                (vec![1, 2, 3], "[1,2,3]"),
+                (vec![1, 2, 3, 4], "[1,2,3,4]"),
+                (vec![1, 2, 3, 4, 5, 6, 7, 8, 9], "[1,2,3,4,5,6,7,8,9]"),
+            ] {
+                let l = ints(ctx, &items);
+                assert_eq!(show_sort(ctx, ALWAYS_TRUE, l), expected, "true {items:?}");
+            }
+            // The `[]`/`[_]` clauses return before the fun is ever called.
+            assert_eq!(show_sort(ctx, ALWAYS_FALSE, NIL), "[]");
+            assert_eq!(show_sort(ctx, ALWAYS_TRUE, NIL), "[]");
+            let l = ints(ctx, &[7]);
+            assert_eq!(show_sort(ctx, ALWAYS_FALSE, l), "[7]");
+        });
+    }
+
+    /// A **strict** (`<`-shaped) comparator reports two distinct elements as
+    /// equivalent; the oracle then emits each tied group in *reverse* input order,
+    /// while a total (`=<`-shaped) comparator keeps them in input order.
+    ///
+    /// Oracle (erts-17.1):
+    /// ```text
+    /// lists:sort(fun({K1,_},{K2,_}) -> K1 < K2 end, [{1,a},{1,b},{0,c}])
+    ///     => [{0,c},{1,b},{1,a}]
+    /// ```
+    /// `ORDER_KEY_LT`/`ORDER_KEY_LE` are those two relations over the two-digit key
+    /// `A div 10`, so the tied elements stay distinguishable in the assertions.
+    #[test]
+    fn sort_with_a_strict_comparator_puts_ties_in_reverse_input_order() {
+        with_order_funs(|ctx| {
+            // The integer image of the tuple probe above: keys 1, 1, 0.
+            for (items, expected) in [
+                (vec![11_i64, 12, 3], "[3,12,11]"),
+                (vec![11, 11, 2], "[2,11,11]"),
+                (vec![5, 4, 3], "[3,4,5]"),
+                (vec![15, 25], "[15,25]"),
+                (vec![21, 22, 11, 12], "[12,11,22,21]"),
+                (vec![11, 12, 13, 3, 4], "[4,3,13,12,11]"),
+            ] {
+                let l = ints(ctx, &items);
+                assert_eq!(show_sort(ctx, ORDER_KEY_LT, l), expected, "key-lt {items:?}");
+            }
+            // The `=<` relation over the same key: ties keep the input order.
+            for (items, expected) in [
+                (vec![11_i64, 12, 3], "[3,11,12]"),
+                (vec![12, 11, 3], "[3,12,11]"),
+                (vec![11, 12, 13, 3, 4], "[3,4,11,12,13]"),
+                (vec![5, 4, 3], "[5,4,3]"),
+            ] {
+                let l = ints(ctx, &items);
+                assert_eq!(show_sort(ctx, ORDER_KEY_LE, l), expected, "key-le {items:?}");
+            }
+        });
+    }
+
+    /// `sort/2` with the four ordinary numeric relations, oracle-verified.
+    #[test]
+    fn sort_with_the_numeric_relations_matches_the_oracle() {
+        let cases: &[(i64, &[i64], &str)] = &[
+            (ORDER_ASC, &[1, 2, 3], "[1,2,3]"),
+            (ORDER_ASC, &[3, 1, 2, 1, 2], "[1,1,2,2,3]"),
+            (ORDER_ASC, &[5, 4, 3, 2, 1, 0], "[0,1,2,3,4,5]"),
+            (ORDER_ASC, &[1, 1, 1], "[1,1,1]"),
+            (ORDER_DESC, &[3, 1, 2, 1, 2], "[3,2,2,1,1]"),
+            (ORDER_DESC, &[5, 4, 3, 2, 1, 0], "[5,4,3,2,1,0]"),
+            (ORDER_DESC, &[1, 1, 1], "[1,1,1]"),
+            (ORDER_LT, &[5, 4, 3, 2, 1, 0], "[0,1,2,3,4,5]"),
+            (ORDER_LT, &[3, 1, 2, 1, 2], "[1,1,2,2,3]"),
+            (ORDER_LT, &[1, 1, 1], "[1,1,1]"),
+            (ORDER_GT, &[5, 4, 3, 2, 1, 0], "[5,4,3,2,1,0]"),
+            (ORDER_GT, &[3, 1, 2, 1, 2], "[3,2,2,1,1]"),
+            (ORDER_GT, &[1, 1, 1], "[1,1,1]"),
+        ];
+        with_order_funs(|ctx| {
+            for &(cmp, items, expected) in cases {
+                let l = ints(ctx, items);
+                assert_eq!(
+                    show_sort(ctx, cmp, l),
+                    expected,
+                    "sort/2 comparator {cmp} over {items:?}"
+                );
+            }
+            // The `[]`/`[_]` head clauses and the guard they carry.
+            assert_eq!(show_sort(ctx, ORDER_ASC, NIL), "[]");
+            let l = ints(ctx, &[7]);
+            assert_eq!(show_sort(ctx, ORDER_ASC, l), "[7]");
+            let non_fun = make_small(5);
+            rejects_clause!(ctx, sort2, [non_fun, NIL]);
+            rejects_clause!(ctx, sort2, [non_fun, l]);
+            // A non-proper list matches no `sort/2` clause.
+            let a = ctx.atom("a").expect("seeded");
+            let improper = ctx.cons(make_small(1), a).expect("the cons fits");
+            rejects_clause!(ctx, sort2, [order_fun(ctx, ORDER_ASC), improper]);
+        });
+    }
+
+    /// The 200-element pseudo-random input of
+    /// [`sort_matches_the_oracle_over_a_200_element_random_list`]:
+    /// `X_1 = 590`, `X_{n+1} = (X_n * 1103515245 + 12345) mod 2^31`, `X_n mod 1000`.
+    const RANDOM_INPUT: &[i64] = &[
+        590, 575, 84, 781, 474, 899, 952, 185, 886, 847, 308, 821, 866, 851, 288, 321, 366, 519, 52, 29,
+        722, 115, 72, 521, 398, 615, 964, 101, 706, 315, 152, 281, 622, 415, 740, 685, 122, 779, 104, 865,
+        566, 759, 524, 213, 834, 651, 592, 65, 54, 247, 212, 757, 146, 827, 728, 265, 262, 983, 180, 245,
+        754, 155, 816, 753, 862, 159, 676, 461, 714, 403, 96, 761, 518, 479, 44, 293, 130, 251, 688, 569,
+        118, 943, 796, 821, 562, 347, 552, 985, 302, 655, 924, 653, 98, 35, 392, 425, 838, 639, 116, 805,
+        258, 795, 296, 649, 182, 791, 396, 69, 690, 467, 912, 465, 998, 375, 780, 277, 922, 19, 400, 849,
+        46, 175, 60, 517, 498, 267, 936, 553, 550, 615, 492, 781, 650, 27, 992, 497, 118, 351, 20, 509,
+        42, 163, 336, 873, 198, 943, 348, 141, 122, 643, 104, 921, 734, 663, 900, 933, 898, 971, 480, 121,
+        710, 719, 740, 5, 82, 219, 208, 57, 950, 95, 860, 245, 306, 955, 8, 345, 342, 863, 188, 37,
+        298, 363, 824, 993, 374, 815, 668, 13, 242, 907, 88, 249, 150, 455, 300, 461, 986, 891, 296, 865,
+    ];
+    /// `lists:sort(fun(_, _) -> false end, RANDOM_INPUT)` — the *exact reverse* of it.
+    const RANDOM_FALSE: &[i64] = &[
+        865, 296, 891, 986, 461, 300, 455, 150, 249, 88, 907, 242, 13, 668, 815, 374, 993, 824, 363, 298,
+        37, 188, 863, 342, 345, 8, 955, 306, 245, 860, 95, 950, 57, 208, 219, 82, 5, 740, 719, 710,
+        121, 480, 971, 898, 933, 900, 663, 734, 921, 104, 643, 122, 141, 348, 943, 198, 873, 336, 163, 42,
+        509, 20, 351, 118, 497, 992, 27, 650, 781, 492, 615, 550, 553, 936, 267, 498, 517, 60, 175, 46,
+        849, 400, 19, 922, 277, 780, 375, 998, 465, 912, 467, 690, 69, 396, 791, 182, 649, 296, 795, 258,
+        805, 116, 639, 838, 425, 392, 35, 98, 653, 924, 655, 302, 985, 552, 347, 562, 821, 796, 943, 118,
+        569, 688, 251, 130, 293, 44, 479, 518, 761, 96, 403, 714, 461, 676, 159, 862, 753, 816, 155, 754,
+        245, 180, 983, 262, 265, 728, 827, 146, 757, 212, 247, 54, 65, 592, 651, 834, 213, 524, 759, 566,
+        865, 104, 779, 122, 685, 740, 415, 622, 281, 152, 315, 706, 101, 964, 615, 398, 521, 72, 115, 722,
+        29, 52, 519, 366, 321, 288, 851, 866, 821, 308, 847, 886, 185, 952, 899, 474, 781, 84, 575, 590,
+    ];
+    /// `lists:sort(fun(A,B) -> A =< B end, RANDOM_INPUT)`.
+    const RANDOM_ASC: &[i64] = &[
+        5, 8, 13, 19, 20, 27, 29, 35, 37, 42, 44, 46, 52, 54, 57, 60, 65, 69, 72, 82,
+        84, 88, 95, 96, 98, 101, 104, 104, 115, 116, 118, 118, 121, 122, 122, 130, 141, 146, 150, 152,
+        155, 159, 163, 175, 180, 182, 185, 188, 198, 208, 212, 213, 219, 242, 245, 245, 247, 249, 251, 258,
+        262, 265, 267, 277, 281, 288, 293, 296, 296, 298, 300, 302, 306, 308, 315, 321, 336, 342, 345, 347,
+        348, 351, 363, 366, 374, 375, 392, 396, 398, 400, 403, 415, 425, 455, 461, 461, 465, 467, 474, 479,
+        480, 492, 497, 498, 509, 517, 518, 519, 521, 524, 550, 552, 553, 562, 566, 569, 575, 590, 592, 615,
+        615, 622, 639, 643, 649, 650, 651, 653, 655, 663, 668, 676, 685, 688, 690, 706, 710, 714, 719, 722,
+        728, 734, 740, 740, 753, 754, 757, 759, 761, 779, 780, 781, 781, 791, 795, 796, 805, 815, 816, 821,
+        821, 824, 827, 834, 838, 847, 849, 851, 860, 862, 863, 865, 865, 866, 873, 886, 891, 898, 899, 900,
+        907, 912, 921, 922, 924, 933, 936, 943, 943, 950, 952, 955, 964, 971, 983, 985, 986, 992, 993, 998,
+    ];
+    /// `lists:sort(fun(A,B) -> A div 10 < B div 10 end, RANDOM_INPUT)` — 22 tied
+    /// pairs, each emitted in reverse input order.
+    const RANDOM_KEYLT: &[i64] = &[
+        8, 5, 13, 19, 20, 27, 29, 37, 35, 42, 46, 44, 57, 54, 52, 60, 69, 65, 72, 88,
+        82, 84, 95, 98, 96, 104, 104, 101, 118, 116, 118, 115, 121, 122, 122, 130, 141, 146, 150, 159,
+        155, 152, 163, 175, 188, 182, 180, 185, 198, 208, 219, 212, 213, 249, 242, 245, 245, 247, 258, 251,
+        267, 262, 265, 277, 281, 288, 296, 298, 296, 293, 300, 306, 302, 308, 315, 321, 336, 342, 345, 348,
+        347, 351, 363, 366, 374, 375, 396, 392, 398, 400, 403, 415, 425, 455, 461, 465, 467, 461, 479, 474,
+        480, 497, 492, 498, 509, 517, 518, 519, 524, 521, 550, 553, 552, 562, 569, 566, 575, 592, 590, 615,
+        615, 622, 639, 643, 649, 650, 653, 655, 651, 668, 663, 676, 688, 685, 690, 706, 719, 710, 714, 728,
+        722, 734, 740, 740, 753, 754, 757, 759, 761, 779, 781, 780, 781, 791, 795, 796, 805, 815, 816, 824,
+        821, 827, 821, 838, 834, 849, 847, 851, 865, 863, 860, 862, 865, 866, 873, 886, 891, 898, 899, 907,
+        900, 912, 921, 922, 924, 933, 936, 943, 943, 955, 950, 952, 964, 971, 986, 985, 983, 993, 992, 998,
+    ];
+
+    /// `sort/2` over a 200-element pseudo-random list, against the oracle's own
+    /// results — long enough to exercise every `fsplit_*`/`fmerge*`/`rfmerge*` state
+    /// (multiple runs per direction, several merge levels) and to catch a single
+    /// out-of-place element, which short lists can hide.
+    #[test]
+    fn sort_matches_the_oracle_over_a_200_element_random_list() {
+        with_order_funs(|ctx| {
+            let l = ints(ctx, RANDOM_INPUT);
+            for (cmp, expected) in [
+                (ALWAYS_FALSE, RANDOM_FALSE),
+                (ORDER_ASC, RANDOM_ASC),
+                (ORDER_KEY_LT, RANDOM_KEYLT),
+            ] {
+                assert_eq!(expected.len(), RANDOM_INPUT.len(), "golden length");
+                let got = show_sort(ctx, cmp, l);
+                let want = ints(ctx, expected);
+                assert_eq!(
+                    got,
+                    pretty(ctx, want),
+                    "sort/2 comparator {cmp} over the 200-element random list"
+                );
+            }
+            // `ORDER_ASC` over this list is the oracle-verified `lists:sort/1`
+            // result too, so the two must agree (and `sort/1` is unchanged).
+            let got = show_sort(ctx, ORDER_ASC, l);
+            let by_sort1 = sort(ctx, &[l]).expect("sort/1 should succeed");
+            assert_eq!(got, pretty(ctx, by_sort1));
+            // `keysort/2` regression (oracle:
+            // `lists:keysort(1, [{1,b},{1,a},{0,c}])` ⇒ `[{0,c},{1,b},{1,a}]`) — the
+            // untouched sibling sort must stay stable.
+            let a = ctx.atom("a").expect("seeded");
+            let b = ctx.atom("b").expect("seeded");
+            let c = ctx.atom("c").expect("seeded");
+            let p1 = tuple2(ctx, make_small(1), b);
+            let p2 = tuple2(ctx, make_small(1), a);
+            let p3 = tuple2(ctx, make_small(0), c);
+            let pairs = ctx.list(&[p1, p2, p3]).expect("the list fits");
+            let by_keysort = keysort(ctx, &[make_small(1), pairs]).expect("keysort/2");
+            assert_eq!(pretty(ctx, by_keysort), "[{0,c},{1,b},{1,a}]");
         });
     }
 }
