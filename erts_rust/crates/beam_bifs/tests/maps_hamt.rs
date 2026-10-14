@@ -303,6 +303,26 @@ fn assert_reason(result: Result<Eterm>, ctx: &mut BifContext<'_>, tag: &str, val
     assert_structured(result, ctx, expected);
 }
 
+/// Asserts `result` is the oracle's **bare-atom** `error:function_clause` — the reason
+/// an improper `Keys` list raises once `maps.erl`'s `is_list(Ks), is_map(Map)` guard
+/// has admitted the clause body (`with_1/2` and `lists:foldl/3` then reach their own
+/// last clause on the improper tail). The arguments live in the stacktrace, not in the
+/// reason, so no live reason term is carried.
+#[track_caller]
+fn assert_function_clause(result: Result<Eterm>) {
+    match result {
+        Err(BeamError::Raise(raise)) => {
+            assert_eq!(raise.class, beam_common::ExceptionClass::Error, "class");
+            assert_eq!(
+                raise.reason.as_atom(),
+                Some("function_clause"),
+                "the reason is the bare atom function_clause"
+            );
+        }
+        other => panic!("expected error:function_clause, got {other:?}"),
+    }
+}
+
 /// The compact `~p` rendering of a proper list of small integers (`[18,4,…]`).
 fn render_ints(term: Eterm) -> String {
     let mut out = String::from("[");
@@ -681,6 +701,158 @@ fn merge_with_and_without() {
             ctx,
             "badmap",
             c,
+        );
+    });
+}
+
+/// The **argument-classification order** of `maps:with/2` and `maps:without/2`.
+///
+/// `maps.erl`'s clause head is `is_list(Ks), is_map(Map)` and each function has a single
+/// fallback clause `error_with_info(error_type(M), [Ks, M])`, so the two arguments are
+/// classified **together** and it is the *map* argument that decides the class once
+/// either has failed the guard: a map ⇒ the plain `error:badarg`, anything else ⇒
+/// `error:{badmap, Map}`. A non-map `Map` therefore wins over **any** `Keys`, and only
+/// after both arguments pass the guard do `with_1/2` / `lists:foldl/3` fail on an
+/// **improper** `Keys` tail — with the bare `error:function_clause`.
+///
+/// Oracle-recorded (OTP 29.1.1 / erts-17.1; `M = #{1=>10,2=>20}`,
+/// `H = maps:from_list([{N,N} || N <- lists:seq(1,33)])`, each probe wrapped in
+/// `try F() catch C:R -> {C,R} end`):
+///
+/// ```text
+/// maps:with(c, 9)           => {error,{badmap,9}}
+/// maps:with(1, 9)           => {error,{badmap,9}}
+/// maps:with({a,c}, 9)       => {error,{badmap,9}}
+/// maps:with([a|b], 9)       => {error,{badmap,9}}
+/// maps:with([], 9)          => {error,{badmap,9}}
+/// maps:with([1], c)         => {error,{badmap,c}}
+/// maps:with([1], {a,c})     => {error,{badmap,{a,c}}}
+/// maps:with(c, M)           => {error,badarg}
+/// maps:with(1, M)           => {error,badarg}
+/// maps:with({a,c}, M)       => {error,badarg}
+/// maps:with([a|b], M)       => {error,function_clause}
+/// maps:with([], M)          => #{}
+/// maps:with([1,9], M)       => #{1 => 10}
+/// maps:with([1,9], H)       => #{1 => 1,9 => 9}   (keys [1,9])
+/// maps:with([34], H)        => #{}
+/// maps:without(c, 9)        => {error,{badmap,9}}
+/// maps:without(1, 9)        => {error,{badmap,9}}
+/// maps:without([a|b], 9)    => {error,{badmap,9}}
+/// maps:without([1], c)      => {error,{badmap,c}}
+/// maps:without(c, M)        => {error,badarg}
+/// maps:without({a,c}, M)    => {error,badarg}
+/// maps:without([a|b], M)    => {error,function_clause}
+/// maps:without([], M)       => #{1 => 10,2 => 20}
+/// maps:without([1], M)      => #{2 => 20}
+/// maps:without([1], H)      => 32 keys [2..=33]
+/// maps:without([1,9], H)    => 31 keys (9 dropped)
+/// ```
+#[test]
+fn with_and_without_classify_the_map_argument_before_the_keys() {
+    run(|reg, ctx| {
+        let one = int(1);
+        let nine = int(9);
+        let (a, c) = (
+            ctx.atom("a").expect("seeded"),
+            ctx.atom("c").expect("seeded"),
+        );
+        // A flat 2-pair map and its 33-key HAMT sibling (both representations).
+        let flat = map_of(reg, ctx, &[(1, 10), (2, 20)]);
+        let hamt = ident_map(reg, ctx, 33);
+
+        // A **non-map** `Map` — an atom, an integer, a tuple — raises `{badmap, Map}`
+        // whatever `Keys` is: a non-list, an improper list, a proper list or `[]`. The
+        // map wins over the keys, which are never inspected.
+        let tuple = ctx.tuple(&[a, c]).expect("a 2-tuple fits");
+        let improper = ctx.cons(a, c).expect("a cons cell fits");
+        let proper = ints_list(ctx, &[1]);
+        let empty = ctx.list(&[]).expect("fits");
+        for keys in [c, one, tuple, improper, proper, empty] {
+            assert_reason(
+                invoke(reg, ctx, "maps", "with", &[keys, nine]),
+                ctx,
+                "badmap",
+                nine,
+            );
+            assert_reason(
+                invoke(reg, ctx, "maps", "without", &[keys, nine]),
+                ctx,
+                "badmap",
+                nine,
+            );
+            assert_reason(
+                invoke(reg, ctx, "maps", "with", &[keys, c]),
+                ctx,
+                "badmap",
+                c,
+            );
+            assert_reason(
+                invoke(reg, ctx, "maps", "without", &[keys, c]),
+                ctx,
+                "badmap",
+                c,
+            );
+            assert_reason(
+                invoke(reg, ctx, "maps", "with", &[keys, tuple]),
+                ctx,
+                "badmap",
+                tuple,
+            );
+            assert_reason(
+                invoke(reg, ctx, "maps", "without", &[keys, tuple]),
+                ctx,
+                "badmap",
+                tuple,
+            );
+        }
+
+        // A **non-list** `Keys` with a map `Map` is the plain `badarg` — never a
+        // `{badmap, _}` (the map argument is fine, `error_type/1` answers `badarg`).
+        for keys in [c, one, tuple] {
+            assert!(matches!(
+                invoke(reg, ctx, "maps", "with", &[keys, flat]),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(
+                invoke(reg, ctx, "maps", "without", &[keys, flat]),
+                Err(BeamError::BadArg)
+            ));
+        }
+
+        // Both arguments pass the guard ⇒ the clause body runs, and an **improper**
+        // `Keys` tail fails there with the bare `function_clause`.
+        assert_function_clause(invoke(reg, ctx, "maps", "with", &[improper, flat]));
+        assert_function_clause(invoke(reg, ctx, "maps", "without", &[improper, flat]));
+        assert_function_clause(invoke(reg, ctx, "maps", "with", &[improper, hamt]));
+        assert_function_clause(invoke(reg, ctx, "maps", "without", &[improper, hamt]));
+
+        // Happy paths: a proper (possibly empty) `Keys` filters, and a key absent from
+        // `Map` is simply ignored.
+        let wanted = ints_list(ctx, &[1, 9]);
+        let kept = call(reg, ctx, "maps", "with", &[wanted, flat]);
+        assert_eq!(keys_of(reg, ctx, kept), vec![1]);
+        let none_kept = call(reg, ctx, "maps", "with", &[empty, flat]);
+        assert!(keys_of(reg, ctx, none_kept).is_empty());
+        let drop = ints_list(ctx, &[1]);
+        let dropped = call(reg, ctx, "maps", "without", &[drop, flat]);
+        assert_eq!(keys_of(reg, ctx, dropped), vec![2]);
+        let all_kept = call(reg, ctx, "maps", "without", &[empty, flat]);
+        assert_eq!(keys_of(reg, ctx, all_kept), vec![1, 2]);
+
+        // The same filtering over the >32-key HAMT (the result collapses to a flat map).
+        let kept_hamt = call(reg, ctx, "maps", "with", &[wanted, hamt]);
+        assert_eq!(keys_of(reg, ctx, kept_hamt), vec![1, 9]);
+        let absent = ints_list(ctx, &[34]);
+        let absent_hamt = call(reg, ctx, "maps", "with", &[absent, hamt]);
+        assert!(keys_of(reg, ctx, absent_hamt).is_empty());
+        let rest_hamt = call(reg, ctx, "maps", "without", &[drop, hamt]);
+        assert_eq!(size_of(reg, ctx, rest_hamt), 32);
+        assert_eq!(keys_of(reg, ctx, rest_hamt), (2..=33).collect::<Vec<i64>>());
+        let rest_hamt2 = call(reg, ctx, "maps", "without", &[wanted, hamt]);
+        assert_eq!(size_of(reg, ctx, rest_hamt2), 31);
+        assert_eq!(
+            keys_of(reg, ctx, rest_hamt2),
+            (2..=33).filter(|&k| k != 9).collect::<Vec<i64>>()
         );
     });
 }

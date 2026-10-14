@@ -153,13 +153,13 @@
 //! not the legacy `atom.names` order), so an *atom-keyed* flat map's order can still
 //! differ from the oracle's while the ordering *rule* above is identical.
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::prelude::signed_value;
 use beam_term::{atom_val, compare, Eterm};
 
 use crate::access;
 use crate::context::BifContext;
-use crate::error::{badarg, structured_error};
+use crate::error::{badarg, function_clause, structured_error};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -191,6 +191,34 @@ fn map_pairs(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Vec<(Eterm, Eterm)
     }
     // `term` is a live map, so the accessor cannot fail (its only error is `BadMap`).
     access::map_pairs_storage_order(term)
+}
+
+/// Erlang's `is_list/1`: a cons cell **or** `NIL`.
+///
+/// The raw [`crate::access::is_list`] mirrors erts' cons-only `is_list`, so the guard
+/// of `maps.erl`'s clause heads (`is_list(Ks)`) needs the extra `NIL` arm — Erlang's
+/// `is_list([])` is `true` while `is_list([a|b])` is `true` too (any cons cell).
+fn is_erl_list(x: Eterm) -> bool {
+    access::is_list(x) || access::is_nil(x)
+}
+
+/// The oracle's `error_type(M)` (`maps.erl:1288-1289`): a **map** argument yields the
+/// plain atom [`badarg`], anything else the structured `{badmap, M}`.
+///
+/// This is the reason `with/2`/`without/2`'s single fallback clause
+/// (`error_with_info(error_type(M), [Ks, M])`) raises once its `is_list(Ks), is_map(M)`
+/// guard has failed, so the **map** argument — and only it — decides the class there.
+///
+/// # Errors
+///
+/// Propagates a heap-allocation failure while building the `{badmap, M}` tuple; an
+/// uninternable `badmap` tag degrades to [`badarg`] inside [`structured_error`].
+fn error_type(ctx: &mut BifContext<'_>, map: Eterm) -> Result<BeamError> {
+    if access::is_map(map) {
+        Ok(badarg())
+    } else {
+        structured_error(ctx, "badmap", &[map])
+    }
 }
 
 /// Exact (`=:=`) lookup of `key` in the **map** `map` (`map` must already be a map).
@@ -527,13 +555,55 @@ fn merge_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `maps:with/2` — the entries of `Map` whose key is in `Keys`.
 ///
+/// Mirrors `maps.erl:1167-1177`: the clause head is
+/// `with(Ks, Map1) when is_list(Ks), is_map(Map1)` and the module's single fallback
+/// clause is `error_with_info(error_type(M), [Ks, M])`. The two arguments are therefore
+/// classified **together**, and once either fails that guard the *map* argument alone
+/// decides the class:
+///
+/// * a **non-map** `Map` ⇒ the structured `error:{badmap, Map}` **whatever** `Keys` is
+///   — checked before `Keys` is inspected at all;
+/// * a **non-list** `Keys` with a map `Map` ⇒ the plain atom `error:badarg`
+///   (`error_type/1`'s `is_map` arm);
+/// * `Keys` a list (cons **or** `[]`) with a map `Map` ⇒ clause 1 runs. An **improper**
+///   `Keys` tail reaches `with_1/2`'s last clause and raises the bare
+///   `error:function_clause`; a proper `Keys` filters (a key absent from `Map` is
+///   simply ignored).
+///
+/// Oracle-recorded (OTP 29.1.1 / erts-17.1; every probe wrapped in
+/// `try F() catch C:R -> {C,R} end`):
+///
+/// ```text
+/// maps:with([a], y)         => {error,{badmap,y}}
+/// maps:with(y, #{a=>1})     => {error,badarg}
+/// maps:with(1, y)           => {error,{badmap,y}}
+/// maps:with({a,b}, y)       => {error,{badmap,y}}
+/// maps:with([a|b], y)       => {error,{badmap,y}}
+/// maps:with(y, z)           => {error,{badmap,z}}
+/// maps:with(1, 2)           => {error,{badmap,2}}
+/// maps:with([a|b], 2)       => {error,{badmap,2}}
+/// maps:with([], y)          => {error,{badmap,y}}
+/// maps:with(1, #{a=>1})     => {error,badarg}
+/// maps:with({a}, #{a=>1})   => {error,badarg}
+/// maps:with([a|b], #{a=>1}) => {error,function_clause}
+/// maps:with([a,b], #{a=>1}) => #{a => 1}
+/// ```
+///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list (the oracle's atom
-/// `badarg`); the oracle's structured `error:{badmap, Map}` when `Map` is not a map.
+/// The oracle's structured `error:{badmap, Map}` (live reason term `{badmap, Map}`) for
+/// a non-map `Map`; the bare atom `error:badarg` for a non-list `Keys`; the bare atom
+/// `error:function_clause` for an improper `Keys` (both with a map `Map`).
 fn with_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let wanted = proper_list(args[0]).ok_or_else(badarg)?;
-    let pairs = map_pairs(ctx, args[1])?;
+    let (keys, map) = (args[0], args[1]);
+    if !is_erl_list(keys) || !access::is_map(map) {
+        // The clause-1 guard failed: `error_type(M)` decides (a map ⇒ `badarg`, else
+        // `{badmap, M}`). `Keys` is deliberately never inspected here.
+        return Err(error_type(ctx, map)?);
+    }
+    // The guard held, so `with_1(Ks, Map)` is entered; only an improper tail fails.
+    let wanted = proper_list(keys).ok_or_else(function_clause)?;
+    let pairs = map_pairs(ctx, map)?;
     let mut out: Vec<(Eterm, Eterm)> = Vec::new();
     for (k, v) in pairs {
         if wanted.iter().any(|&w| compare::eq(w, k, ctx.atoms())) {
@@ -545,13 +615,42 @@ fn with_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `maps:without/2` — the entries of `Map` whose key is **not** in `Keys`.
 ///
+/// Same clause structure as [`with_2`] (`maps.erl:1141-1144`), so the argument
+/// classification is identical — a non-map `Map` ⇒ `error:{badmap, Map}` first, a
+/// non-list `Keys` with a map ⇒ `error:badarg`, and an improper `Keys` with a map ⇒ the
+/// bare `error:function_clause` (`lists:foldl/3` reaches its own last clause on the
+/// improper tail).
+///
+/// Oracle-recorded (OTP 29.1.1 / erts-17.1):
+///
+/// ```text
+/// maps:without([a], y)         => {error,{badmap,y}}
+/// maps:without(y, #{a=>1})     => {error,badarg}
+/// maps:without(1, y)           => {error,{badmap,y}}
+/// maps:without({a}, y)         => {error,{badmap,y}}
+/// maps:without([a|b], y)       => {error,{badmap,y}}
+/// maps:without(y, z)           => {error,{badmap,z}}
+/// maps:without(1, 2)           => {error,{badmap,2}}
+/// maps:without([a|b], 2)       => {error,{badmap,2}}
+/// maps:without([], y)          => {error,{badmap,y}}
+/// maps:without({a}, #{a=>1})   => {error,badarg}
+/// maps:without([a|b], #{a=>1}) => {error,function_clause}
+/// maps:without([a], #{a=>1})   => #{}
+/// ```
+///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list (the oracle's atom
-/// `badarg`); the oracle's structured `error:{badmap, Map}` when `Map` is not a map.
+/// The oracle's structured `error:{badmap, Map}` (live reason term `{badmap, Map}`) for
+/// a non-map `Map`; the bare atom `error:badarg` for a non-list `Keys`; the bare atom
+/// `error:function_clause` for an improper `Keys` (both with a map `Map`).
 fn without_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let unwanted = proper_list(args[0]).ok_or_else(badarg)?;
-    let pairs = map_pairs(ctx, args[1])?;
+    let (keys, map) = (args[0], args[1]);
+    if !is_erl_list(keys) || !access::is_map(map) {
+        // As in `with_2`: the fallback clause classifies by the *map* argument only.
+        return Err(error_type(ctx, map)?);
+    }
+    let unwanted = proper_list(keys).ok_or_else(function_clause)?;
+    let pairs = map_pairs(ctx, map)?;
     let mut out: Vec<(Eterm, Eterm)> = Vec::new();
     for (k, v) in pairs {
         if !unwanted.iter().any(|&w| compare::eq(w, k, ctx.atoms())) {
