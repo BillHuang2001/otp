@@ -46,7 +46,8 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   unwind and before the early no-live-frame `Err(BeamError::Raise)` return, so the pre-unwind chain
   survives for the handler. It also promotes the failed-clause argument list: it takes the one-shot
   `Machine::pending_function_clause_args` and stores it as the live `Machine::raise_function_clause_args`
-  (a raise that carries no such list clears it, so no later trace can inherit a stale one).
+  (a raise that carries no such list clears it, so no later trace can inherit a stale one); it does the same
+  for `Machine::pending_supplied_trace` -> `Machine::raise_supplied_trace`.
   `raise_stacktrace(entry_module: Option<&Module>, func, pc, first_frame_args: Option<Eterm>) -> StackTrace`
   derives the symbolic `StackTrace` (raising function, then every live caller innermost first), giving
   `first_frame_args` to the **raising** frame only; `Machine::with_uncaught_frames(&mut self, err, entry_module, func, pc)`
