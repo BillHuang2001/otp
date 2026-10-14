@@ -23,7 +23,8 @@
 //! The baseline tier ([`beam_engine::jit::baseline`]) lowers a module's basic blocks to
 //! native x86-64. That lowering is pure, so the cache ([`beam_engine::jit::cache`])
 //! compiles a module **once** and reuses the artifact for every later run of the same
-//! module — keyed on the sound module identity `(name, IR content fingerprint)`, never on
+//! module — keyed on the sound module identity (a real `.beam`'s load-time MD5 digest;
+//! the IR content fingerprint only for a synthetic all-zero-checksum module), never on
 //! a pointer.
 //!
 //! This suite proves both halves of the contract against the committed `beam_loader` oracle
@@ -35,7 +36,7 @@
 //! * the results stay **interpreter-identical** — the cached native run equals the
 //!   reference interpreter's, on the same `MinimalContext` BIF hook `tests/slice.rs` uses;
 //! * the identity is **sound** — a module with the same name but different content gets a
-//!   different fingerprint and a distinct cache entry.
+//!   distinct identity and a distinct cache entry.
 
 use beam_common::BeamError;
 use beam_engine::jit::cache::{
@@ -154,7 +155,8 @@ fn run_with_tier_compiles_once_and_reuses_the_artifact_across_calls() {
 fn a_freshly_loaded_copy_of_the_same_content_hits_the_cache() {
     clear_baseline_cache();
     // Two independent loads: different `Module` instances (different addresses), same
-    // content — the key is the content, so the second load is a cache hit.
+    // content — the key (the load-time MD5 digest) is content-derived, so the second
+    // load is a cache hit.
     let first_module = slice_module();
     let second_module = slice_module();
     let args = [make_small(20), make_small(22)];
@@ -200,8 +202,8 @@ fn cached_native_runs_are_interpreter_identical() {
         ("fib", 1, vec![make_small(10)]),
         ("fib", 1, vec![make_small(15)]),
     ] {
-        // A fresh module each iteration: the cache must key on content, so every one of
-        // these runs still sees the right (reused) artifact.
+        // A fresh module each iteration: the cache must key on content (the load-time
+        // digest), so every one of these runs still sees the right (reused) artifact.
         let module = slice_module();
         let expected = interpret(&module, export, arity, &args);
         let got = run_on_tier(&module, export, arity, &args, Tier::BaselineJit)
@@ -281,6 +283,10 @@ fn same_name_different_content_does_not_collide() {
     let mut b = a.clone();
     // Same module name, different body: one extra instruction.
     b.functions[0].code.push(Instr::NifStart);
+    // A genuinely distinct load: the cache identity of a loaded module is its load-time
+    // MD5 digest; a hand-mutated clone shares `a`'s checksum, which no production path
+    // does (every real distinct `.beam` has a distinct MD5).
+    b.checksum = [1u8; 16];
     assert_eq!(a.atom_name(a.name), b.atom_name(b.name));
     assert_ne!(
         module_fingerprint(&a),
