@@ -67,9 +67,22 @@
 //! * `term_to_binary/2` with `{minor_version, 0|1}` reproduces the *legacy* `ATOM_EXT` (100) /
 //!   `FLOAT_EXT` (99) forms, so the `wire/minor_version_*_legacy_encode` cases `agree`.
 //!   Decoding a `compressed` (80) blob is covered by the `wire/compressed_decode_*` cases.
-//! * The `[local]` option image (`term_to_binary(Term, [local])`) is a plain `error:badarg`
-//!   under the Rust runtime, and `term_to_binary(make_ref())` is the runtime's
-//!   `unsupported: external_term` — neither is pinned.
+//! * The `[local]` option image (`term_to_binary(Term, [local])`) is **implemented in the
+//!   codec** (`beam_codec`'s `LOCAL_EXT` wrapper) but is not callable through the BIF: the
+//!   4-byte payload is the *local node hash*, which the reference runtime randomises on every
+//!   node start (three consecutive oracle starts print three different payloads for the same
+//!   `nonode@nohost` term), so **no cross-runtime byte golden exists by design** and the BIF
+//!   raises the typed `unsupported` instead. It is an honest gap, pinned as `unsupported`,
+//!   never a mismatch.
+//! * The `[deterministic]` option is byte-exact only where **no re-sorting is needed**: a map
+//!   already in canonical key order (and any non-map term) encodes identically, while a map
+//!   whose flatmap/HAMT order differs from the canonical one is the BIF's typed
+//!   `unsupported` — the codec has no deterministic mode. The canonical flatmap key order
+//!   itself is pinned by the plain encoder elsewhere in this group.
+//! * `term_to_binary(make_ref())` now *executes* on both runtimes (a `NEWER_REFERENCE_EXT`
+//!   blob of 35 bytes on each), but the reference id's mask/hash bytes are random per
+//!   creation, so the images differ; only the `byte_size/1` shape would be pinnable, and the
+//!   image is deliberately left unpinned.
 //! * `FUN_EXT` (115) is deliberately not a case: the reference decoder does not validate it
 //!   (even a truncated blob decodes to the empty atom `''`), so any golden would pin an
 //!   unspecified artifact rather than the wire semantics. The modern `NEW_FUN_EXT` (112) is

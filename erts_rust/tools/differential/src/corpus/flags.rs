@@ -1798,6 +1798,8 @@ mod tests {
                     || golden == "ok true"
                     || golden == "ok false"
                     || golden == "ok unbound"
+                    // The `+sbt` binding-mode atoms.
+                    || golden == "ok thread_no_node_processor_spread"
                     || is_int_value,
                 "case {}: unexpected golden {golden:?}",
                 case.id
