@@ -455,6 +455,12 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   state the frozen term does not carry (one `V4_PORT_EXT` image printed `#Port<10643.7>` then `#Port<10639.7>`). Needs a
   node-identity seam **and** a node-atom → dist-channel provider (both `beam_rt`, a new edge — Handoffs).
 - **`term_to_binary/2`'s `local`/`deterministic`** answer the typed gap when they would change the image.
+- **`erlang:raise/3`'s unrepresentable stacktrace elements** answer the typed gap while the argument is valid: an
+  `erl_eval`-style `{Fun,Args}`/`{Fun,Args,Location}` call frame, a 3rd element that is an argument list or any
+  other non-`0..=255` value (`-1`, `256`, `1.0`), an unnameable `Module`/`Function` atom, and a location that is
+  not exactly `[{file,CharList},{line,Integer}]` (an atom file name, a missing/extra pair, reversed order, a
+  non-integer or out-of-`u32`-range line, an out-of-range code point). The oracle echoes every such shape
+  verbatim — see the per-module contract above for the exact mapping and the untouched returned-`badarg` cases.
 - **Fun identity:** `fun_info/2`'s `name` and `fun_info_mfa/1`'s function element need the module's fun table (no
   seam provides it; the oracle returns the real lambda name for a *loaded* module, `[]` otherwise). A `FunKind::Local`
   fun's descriptor is only `(uniq:u64, index:u32)`, so **none** of its six identity items is derivable (a
