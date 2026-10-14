@@ -647,6 +647,9 @@ impl ProcessRunner for RuntimeRunner<'_> {
                     self.runtime.stabilize_term_with(value, &payloads)?
                 };
                 self.state.results.insert(pid, value);
+                if crate::debug_trace::enabled() {
+                    crate::debug_trace::trace(format_args!("process {pid:?} returned normally"));
+                }
                 Ok(RunOutcome::Exit(normal(self.runtime)))
             }
             Ok(EngineRunOutcome::Wait { func, pc }) => {
@@ -730,6 +733,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
             }
             Err(error) => {
                 let reason = exit_reason(self.runtime, &error);
+                if crate::debug_trace::enabled() {
+                    crate::debug_trace::trace(format_args!(
+                        "process {pid:?} raised: {error:?}"
+                    ));
+                }
                 // The reason may be a term the failing process built on **its own** heap,
                 // which the collector may move or drop the moment the process terminates:
                 // copy it onto the runtime's pointer-stable arena before it is recorded. A

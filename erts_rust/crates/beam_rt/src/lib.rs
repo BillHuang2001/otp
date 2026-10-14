@@ -76,6 +76,7 @@ pub mod codeserver;
 pub mod config;
 pub mod context;
 pub mod crash_dump;
+mod debug_trace;
 pub mod dist;
 pub mod dist_client;
 pub mod error;

@@ -157,6 +157,11 @@ impl ExecutionContext for RuntimeContext<'_> {
         // unit test below pins against `try_native`'s source so it can never drift out of the
         // host's dispatch.
         if crate::native::floor_shadows(module, function, arity) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: floor_shadows"
+                ));
+            }
             return Ok(None);
         }
         // A module with a loaded NIF library is **never** entered here, for two reasons.
