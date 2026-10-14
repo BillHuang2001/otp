@@ -199,6 +199,18 @@ impl FastArith<'_> {
         registers
     }
 
+    /// The x-register index the shape's native lowering **writes** — the destination
+    /// register when it is an x-register, else nothing (a `Y` destination is a stack
+    /// slot, never a cached register). The two operands are only read.
+    ///
+    /// This is the block register cache's write set ([`Allocation::written`]).
+    pub(super) fn writes(&self) -> Vec<u32> {
+        match self.dst {
+            FastDest::X(x) => vec![x],
+            FastDest::Y(_) => Vec::new(),
+        }
+    }
+
     /// Whether the lowered sequence reads the current frame's Y window.
     ///
     /// A `Y` operand or a `Y` destination is read/written through

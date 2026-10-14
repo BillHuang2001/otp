@@ -214,6 +214,14 @@ impl Comparison<'_> {
         registers.push(self.dst_x);
         registers
     }
+
+    /// The x-register index the shape's native lowering **writes** — the destination
+    /// (`true`/`false`). The two operands are only read.
+    ///
+    /// This is the block register cache's write set ([`Allocation::written`]).
+    pub(super) fn writes(&self) -> Vec<u32> {
+        vec![self.dst_x]
+    }
 }
 
 /// The shape test for `instr` (`Instr::Bif` or `Instr::GcBif`), or `None` when the

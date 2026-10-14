@@ -102,6 +102,20 @@ impl MoveShape {
         registers
     }
 
+    /// The x-register indices the shape's native lowering **writes** — the
+    /// destination register when it is an x-register, else nothing (a `Y`
+    /// destination is a stack slot, never a cached register).
+    ///
+    /// This is the block register cache's write set ([`super::Allocation::written`]):
+    /// a cached register outside it keeps exactly its `machine.x` value, so the exit
+    /// spill may skip it.
+    pub(crate) fn writes(&self) -> Vec<u32> {
+        match self.destination {
+            MoveDest::X(x) => vec![x],
+            MoveDest::Y(_) => Vec::new(),
+        }
+    }
+
     /// Whether the lowered sequence reads the current frame's Y window.
     ///
     /// A `Y` source or a `Y` destination is read/written through

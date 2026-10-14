@@ -4500,6 +4500,30 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.ext_call_resolved, counters.ext_call_declined, counters.ext_call_fallback
     );
     println!("  driver round trips by word: {:?}", counters.round_trips_by_word);
+    println!(
+        "  blocks={} ir_instrs={} bytes={} cache_slots={} written_slots={} | \
+         blocks by cache-size: {:?} | blocks by write-size: {:?}",
+        counters.blocks,
+        counters.block_ir_instructions,
+        counters.block_emitted_bytes,
+        counters.block_cache_slots,
+        counters.block_written_slots,
+        counters.blocks_by_cache_slots,
+        counters.blocks_by_written_slots,
+    );
+    println!(
+        "  spill stores: written-set={} (by site {:?}) vs full-cache={} (by site {:?}); \
+         spill calls={:?}",
+        counters.spill_stores,
+        counters.spill_stores_by_site,
+        counters.spill_stores_full,
+        counters.spill_stores_by_site_full,
+        counters.spill_calls_by_site,
+    );
+    println!(
+        "  fill registers={} (by site {:?}); fill calls={:?}",
+        counters.fill_registers, counters.fill_registers_by_site, counters.fill_calls_by_site,
+    );
     let mut rows: Vec<(&String, &u64)> = counters.deopts_by_variant.iter().collect();
     rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     println!("  deopts by variant (descending):");
@@ -4577,7 +4601,16 @@ fn the_two_process_copy_bound_shape_is_measured_on_both_tiers() {
     }
 
     // 3. Counting passes (recording ON) — one per tier, small op count.
+    //
+    // The emission-time counters (`record_block`/`record_spill`/`record_fill`) fire
+    // while a block is *compiled*, and the timed passes above have already populated
+    // the per-thread baseline cache, so a counting pass that reused those artifacts
+    // would emit no block and record nothing. Clearing the cache first forces the
+    // baseline tier's counting pass to recompile the modules it enters, so every
+    // executed block's emission is counted exactly once. (The interpreter tier does
+    // not consult the cache at all; the clear is harmless there.)
     for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        crate::jit::cache::clear_baseline_cache();
         counters::reset();
         counters::set_enabled(true);
         let (value, reductions, _) = drive_probe(

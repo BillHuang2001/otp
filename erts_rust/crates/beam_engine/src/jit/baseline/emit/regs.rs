@@ -50,7 +50,7 @@ use super::operands::x_offset;
 
 /// Which spill site a cached-register store came from (test-only bookkeeping — see
 /// [`super::super::counters`]; the parameter itself costs nothing in production).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum SpillSite {
     /// The spill before an in-block helper call ([`super::emit_helper_call`]).
     Helper,
@@ -60,11 +60,15 @@ pub(crate) enum SpillSite {
 
 /// Which fill site a cached-register load came from (test-only bookkeeping — see
 /// [`super::super::counters`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum FillSite {
     /// The post-helper refill on a continue arm ([`super::emit_continue_check`]).
     Helper,
     /// The block prologue's load of the whole cache ([`super::emit_block`]).
+    ///
+    /// Constructed only from the test-gated prologue counter — in a production build
+    /// the prologue loads the cache inline and no `fill` names this site.
+    #[cfg(test)]
     Prologue,
 }
 

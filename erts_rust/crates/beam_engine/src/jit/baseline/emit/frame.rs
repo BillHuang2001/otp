@@ -224,9 +224,11 @@ mod tests {
         emitted(&buffer)[..len].to_vec()
     }
 
-    /// `spill` of `allocation`, as emitted.
+    /// `spill` of `allocation` (its **written** cache), as emitted.
     fn spill_bytes(allocation: &Allocation) -> Vec<u8> {
-        encoded(|buffer| super::super::spill(buffer, allocation).unwrap())
+        encoded(|buffer| {
+            super::super::spill(buffer, allocation, super::super::SpillSite::Exit).unwrap()
+        })
     }
 
     /// The `movabs r11, <helper>` immediate every indirect helper call emits.

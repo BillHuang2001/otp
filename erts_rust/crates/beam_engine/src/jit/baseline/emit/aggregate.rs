@@ -117,6 +117,15 @@ impl ListShape {
         registers.extend(self.destinations.iter().map(|(_, x)| *x));
         registers
     }
+
+    /// The x-register indices the shape's native lowering **writes** — its
+    /// destinations, in emission order (CAR before CDR wherever both are written).
+    /// The source is only read.
+    ///
+    /// This is the block register cache's write set ([`super::Allocation::written`]).
+    pub(super) fn writes(&self) -> Vec<u32> {
+        self.destinations.iter().map(|(_, x)| *x).collect()
+    }
 }
 
 /// The inlinable shape of a `get_list Source Head Tail`, or `None` when the whole
@@ -456,6 +465,14 @@ impl TupleReadShape {
     pub(super) fn registers(&self) -> Vec<u32> {
         vec![self.source, self.dst]
     }
+
+    /// The x-register index the shape's native lowering **writes** — its
+    /// destination. The source tuple is only read.
+    ///
+    /// This is the block register cache's write set ([`super::Allocation::written`]).
+    pub(super) fn writes(&self) -> Vec<u32> {
+        vec![self.dst]
+    }
 }
 
 /// The inlinable shape of a `get_tuple_element Source Element Dst`, or `None` when
@@ -528,6 +545,12 @@ impl AritySwitchPlan {
     /// its only runtime operand (every alternative is an immediate).
     pub(super) fn registers(&self) -> Vec<u32> {
         vec![self.tuple]
+    }
+
+    /// An arity switch writes **no** x-register: the scrutinee is only read, every
+    /// alternative is an immediate, and every path transfers control.
+    pub(super) fn writes(&self) -> Vec<u32> {
+        Vec::new()
     }
 }
 
@@ -800,6 +823,14 @@ impl TupleWriteShape {
             registers.push(x);
         }
         registers
+    }
+
+    /// A tuple write writes **no** x-register: it stores one element word
+    /// destructively into the heap tuple (behind the header/literal guards), and the
+    /// target tuple and element value are only read. A cached register holding the
+    /// tuple keeps its `machine.x` value, so the write set is empty.
+    pub(super) fn writes(&self) -> Vec<u32> {
+        Vec::new()
     }
 }
 

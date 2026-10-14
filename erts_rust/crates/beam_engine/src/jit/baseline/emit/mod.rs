@@ -973,10 +973,3 @@ fn emit_continue_check(
     }
     Ok(())
 }
-
-/// Write the block's **written** cached x-registers back into `machine.x`.
-///
-/// See [`super::regs`]: the store set is [`Allocation::written`], the cache registers
-/// the block's inline lowerings may write. A cached register outside that set still
-/// holds exactly its `machine.x` value, so a store of it would be a no-op.
-fn _spill_doc_anchor() {}

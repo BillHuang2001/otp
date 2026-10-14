@@ -37,7 +37,7 @@ use crate::machine::MAX_REGISTER;
 use super::arith::{FAST_C, SMALL_MASK};
 use super::link::Linker;
 use super::operands::{small_word, x_offset, x_register};
-use super::{emit_helper_call, emit_refresh_y, emit_step_and_continue, fill, touch, Allocation};
+use super::{emit_helper_call, emit_refresh_y, emit_step_and_continue, fill, touch, Allocation, FillSite};
 use crate::jit::baseline::runtime::StepHelper;
 use crate::jit::baseline::test_helper::{jit_test, TEST_FALSE, TEST_TRUE};
 
@@ -988,7 +988,7 @@ fn emit_test_helper(
     // stale and must be refilled. The Y window is re-published on the **continue** arm
     // under the same compile-time gate `emit_continue_check` uses — a block whose later
     // instructions still access a `Y` slot pays the refresh, a `Y`-free block nothing.
-    fill(buffer, allocation)?;
+    fill(buffer, allocation, FillSite::Helper)?;
     if allocation.refresh_y_after(pc) {
         emit_refresh_y(buffer)?;
     }
