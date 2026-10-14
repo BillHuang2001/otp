@@ -3,7 +3,8 @@
 ## Intent
 Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 functions for the
 **baseline** execution tier. One file per responsibility: `mod.rs` owns the compiled-block shape
-(prologue/epilogue, `emit_block`'s lowering dispatch, the deopt sequence, `spill`/`fill`); `compile.rs`
+(prologue/epilogue, `emit_block`'s lowering dispatch, the deopt sequence); `regs.rs` owns the
+register cache (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`); `compile.rs`
 owns the compilation entry points — `compile_module` (the **eager** whole-module layout: one shared
 `CodeBuffer`, a whole-module block map) and `compile_function`/`emit_function` (the **lazy** layout's
 per-function unit: its own `CodeBuffer`, a map covering only that function) — plus the continuation
@@ -23,9 +24,11 @@ level up in `../mod.rs` / `../runtime.rs`; this node only *emits calls* to them.
   `machine.x`** via `[rbx + x*8]` (`rbx` = `rt->x_regs`, loaded in the prologue). A register is either
   *always* cached in its machine register or *never* cached, fixed for the whole block, so the two
   representations can never disagree.
-- **Spill is the whole liveness/root-set model.** `spill` writes every cached register back to
-  `machine.x`; `fill` reloads all of them after a helper call (no per-register liveness). Both are in
-  `mod.rs`.
+- **The register cache is written-set-spill / full-fill.** `spill` stores only the block's **written**
+  set — the cached x-registers some inline lowering of the block may write (`Allocation::written`, a
+  static superset populated by `regalloc.rs::cacheable_writes`); `fill` reloads **all** of them after a
+  helper call (no per-register liveness). See `regs.rs`'s own `CONTEXT.md` for the soundness argument.
+  The cache itself lives in `regs.rs` (`Allocation`/`spill`/`fill`); the call sites are in `mod.rs`.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
   `MOVE_SCRATCH_2`=`r10` (`mod.rs`); `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10`,
   `FAST_R`=`r11` (`arith.rs`); `TEST_A`=`rax`, `TEST_B`=`r8`, `TEST_C`=`r9`, `TEST_T`=`r10`,
@@ -160,7 +163,8 @@ block map, so the driver compiles the target's function on entry — or takes on
   may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
   (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
   re-publishes the current frame's Y window in one call — then load each cached register from `machine.x`.
-- `mod.rs::spill` / `mod.rs::fill`: store/load every `(x, reg)` in `Allocation::slots`.
+- `regs.rs::spill` / `regs.rs::fill`: `spill` stores every `(x, reg)` in `Allocation::spill_slots()`
+  (the **written** subset of `Allocation::slots`); `fill` loads every `(x, reg)` in `Allocation::slots`.
 - **Every helper call spills first.** `mod.rs::emit_helper_call` (used by `emit_step_and_continue` and
   `emit_ext_call`) calls `spill` before loading `rdi` from the `rt` slot, filling the ABI argument
   registers `rsi`/`rdx`/`rcx`/`r8`/`r9` with the caller's argument words, and `call r11`; it does **not**
@@ -174,11 +178,13 @@ block map, so the driver compiles the target's function on entry — or takes on
   have pushed/`trim`med a frame or **reallocated** `machine.stack` and so staled the prologue's window. When
   no later instruction accesses Y the call is not emitted at all, and a helper that leaves the block to the
   driver pays nothing (the next block's prologue publishes).
-- `link.rs::emit_exit` and `link.rs::emit_tail_exit` spill on **both** the linked and the deopt paths.
+- `link.rs::emit_exit` and `link.rs::emit_tail_exit` spill (the written set) on **both** the linked and
+  the deopt paths.
 - The epilogue (`mod.rs`: `done` -> `emit_frame_teardown` -> `ret`) does **not** spill: every path reaching
   it has already spilled. The inline fast paths (`move`/`arith`/`compare`/`test`/`select`/`aggregate`) do
   **not** spill themselves — a result lands in a cache register or straight in `machine.x` (the very slot
-  the exit spill writes), and the next helper call or block exit spills it.
+  the exit spill writes), and the next helper call or block exit spills it (its destination register is in
+  the block's written set, so that spill stores it).
 
 ## Register picker (`regalloc.rs::allocate_registers`)
 Usage-weighted, not liveness-based: `cacheable_touches` charges one *native touch* per x-register operand
@@ -215,12 +221,17 @@ entry (the driver's bound is `machine.x.len() > bound`).
   `.rs` (byte-exact, license scanner enforced).
 
 ## Routing Table
-- `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`/`Allocation`
-  (incl. `y_last`/`refresh_y_after`), `emit_block` (the dispatch), `emit_publish_y`/`emit_refresh_y` (the
+- `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`,
+  `emit_block` (the dispatch), `emit_publish_y`/`emit_refresh_y` (the
   Y-window prologue publish / gated post-helper refresh), `emit_helper_call`, `emit_step_and_continue`,
-  `emit_ext_call`, `emit_continue_check`, `spill`/`fill`; also re-exports `compile_module`/`compile_function`
+  `emit_ext_call`, `emit_continue_check`; re-exports `regs::{Allocation, SpillSite, FillSite}` and
+  `compile_module`/`compile_function`
   (keeping those item paths stable for `baseline/mod.rs` and `baseline/code.rs`) plus the `#[cfg(test)]`
   names `baseline/tests.rs` reaches through `emit::*`.
+- `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`y_last`, `slot`/`is_written`/
+  `spill_slots`/`refresh_y_after`), `spill` (stores only `written`), `fill` (loads the whole cache), and the
+  test-only `SpillSite`/`FillSite` classification of the two call sites (`baseline/CONTEXT.md` and this
+  file carry the contract; the sibling `CONTEXT.md` carries the soundness argument).
 - `compile.rs` -> the compilation entry points and what they share: `compile_module` (**eager**:
   whole-module block map + the merged whole-module summary that guards entry, plus `emit_shared_sub_blocks`)
   and `compile_function` (**lazy**: one function's own buffer/entries/sub_entries/summary, sharing
@@ -228,7 +239,9 @@ entry (the driver's bound is `machine.x.len() > bound`).
   `emit_shared_sub_blocks`, `emit_function`, and the code-size budgets (`BLOCK_BYTES`/`INSTRUCTION_BYTES`/
   `FAST_PATH_BYTES`/`COMPARE_PATH_BYTES`/`LIST_PATH_BYTES`/`TUPLE_PATH_BYTES`) with their estimates
   `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate`.
-- `regalloc.rs` -> `allocate_registers` (incl. the `y_last` derivation) + `cacheable_touches`.
+- `regalloc.rs` -> `allocate_registers` (incl. the `y_last` and `written` derivations) + `cacheable_touches`
+  (the touch counts) + `cacheable_writes` (the block's written x-registers, mirroring each lowering's shape
+  test but returning destinations; the shape types expose a `writes()` accessor).
 - `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`, `small_word`.
 - `r#move.rs` -> `try_inline_move`, `try_inline_swap` (`Move` over in-bound x-registers or an addressable `Y` slot on either side, behind the frame-window guard; `Swap` needs two in-bound x-registers).
 - `test.rs` -> `TestSrc`/`TestPred`/`Guard`/`TestPlan`, `test_plan`, `test_src`, `compare_shape`,
