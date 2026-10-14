@@ -4808,12 +4808,27 @@ fn the_entry_module_priming_is_measured_on_both_tiers() {
 /// appear among the deopts, and the parser/ext-helper counter must stay zero — the tier
 /// is named explicitly (`Tier::BaselineJit`).
 ///
+/// The probe's receive-match clause heads are **comparison** `test`s (`is_eq_exact`) whose
+/// operand is a `Y` slot, a literal-area term or a boxed-vs-boxed compare, and those are
+/// now lowered in-block through the `jit_test` helper (`super::test_helper`) instead of a
+/// whole interpreter step — so **no** `test` deopt may remain. The counters key a `test` by
+/// its kind (`counters::variant_name` returns `Test(<kind>)`), so the assertion below looks
+/// for a `Test(`-prefixed key — deliberately **not** `Test`: the distinct `test_heap` opcode
+/// keys as `TestHeap` and still deopts legitimately. The counts moved by exactly that one
+/// `test` class: `step_one` fell **1092 → 964**, and the pre-lowering
+/// `deopts_by_variant["Test"] = 128` (2 deopts per round × 64 rounds) is gone. The only
+/// `test` shapes the lowering deliberately declines — a **type** test (`Test(IsTuple)`, …)
+/// and a `NO_FAIL` form (which *raises*) — are not reachable from this probe;
+/// `a_declined_comparison_test_still_pays_one_jit_step_one_deopt` below is their positive
+/// control.
+///
 /// The total deopt count is pinned too: the family accounted for the majority of the
 /// pre-lowering deopts (642 of 1734 per 64 ops — `LoopRec` 257, `RemoveMessage` 128,
-/// `Send` 128, `Wait` 65, `WaitTimeout` 64), so the count must fall by at least that
-/// much. The remaining deopts are the structural/metadata opcodes (`PutTuple2`,
-/// `TestHeap`, `Allocate`, `InitYregs`, `Bif`, `GetTupleElement`, `Test`, `Call`) that
-/// are still the documented per-instruction deopt.
+/// `Send` 128, `Wait` 65, `WaitTimeout` 64) and the lowered `test` for another 128, so the
+/// total must fall below **1000** (the after-value is 964). The remaining deopts are the
+/// structural/metadata opcodes (`PutTuple2` 192, `TestHeap` 192, `Allocate` 130,
+/// `InitYregs` 130, `Bif` 128, `GetTupleElement` 128, `Call` 64 — all unchanged by the
+/// `test` lowering) that are still the documented per-instruction deopt.
 #[test]
 fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
     let (bench, bench_atom, worker, worker_atom) = probe_modules();
@@ -4855,12 +4870,287 @@ fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
             snapshot.deopts_by_variant,
         );
     }
+    // The comparison `test` is lowered through the `jit_test` helper and the variant name
+    // is keyed by its kind, i.e. `Test(<kind>)` (`counters::variant_name`), so any
+    // regression leaves a `Test(`-prefixed key. The prefix is `Test(`, NOT `Test`: the
+    // distinct `test_heap` opcode's key is `TestHeap`, which legitimately deopts (it is one
+    // of the structural opcodes listed above) and is not a `test`. Report the offending
+    // key/count and the whole map on failure.
+    let offending: Option<(&String, u64)> = snapshot
+        .deopts_by_variant
+        .iter()
+        .find(|(key, _)| key.starts_with("Test("))
+        .map(|(key, count)| (key, *count));
     assert!(
-        snapshot.step_one <= 1100,
-        "the receive/Send family accounted for 642 of the 1734 pre-lowering deopts, so the \
-         total must have fallen below 1100; saw {} ({:?})",
+        !snapshot
+            .deopts_by_variant
+            .keys()
+            .any(|k| k.starts_with("Test(")),
+        "a comparison `test` is lowered through the `jit_test` helper, so no `Test(<kind>)` \
+         deopt may remain; the offending key/count is {offending:?}; deopts by variant: {:?}",
+        snapshot.deopts_by_variant,
+    );
+    assert!(
+        snapshot.step_one <= 1000,
+        "the receive/Send family (642) plus the lowered comparison `test` (128) accounted \
+         for 770 of the 1734 pre-lowering deopts, so the total must have fallen below 1000; \
+         saw {} ({:?})",
         snapshot.step_one,
         snapshot.deopts_by_variant,
     );
     print_probe_counters(Tier::BaselineJit.name(), &snapshot);
+}
+
+/// Drive exported `name/0` on `tier` with the structural counters recording, returning the
+/// run's outcome together with the counter snapshot (recording is turned back off before
+/// returning).
+///
+/// The [`MinimalContext`] owns the heap every boxed term is built on and is dropped at the
+/// end of this call, so the caller may only inspect an outcome that is an immediate or a
+/// typed error — which is exactly what the fixtures below return (`NIL` or a raise).
+fn run_counting(
+    module: &Module,
+    name: Atom,
+    tier: Tier,
+) -> (Result<RunOutcome>, counters::Counters) {
+    counters::reset();
+    counters::set_enabled(true);
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let outcome = machine.run_export_outcome_with_tier(module, name, 0, &[], &mut ctx, tier);
+    counters::set_enabled(false);
+    (outcome, counters::snapshot())
+}
+
+/// **The declined-`test` positive control**: the zero-`Test` assertion in
+/// [`the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt`] is only
+/// meaningful if a `test` that is **not** lowered still records a `Test`-keyed deopt.
+///
+/// This proves both directions on **isolated** modules driven on `Tier::BaselineJit` with
+/// the counters on:
+///
+/// * (a) a **declined** comparison — an `is_eq_exact` with a `NO_FAIL` fail code, exactly
+///   the shape `jit_test` (and `emit_test_helper`) refuses — keeps the per-instruction
+///   `jit_step_one` deopt and records **exactly one** `deopts_by_variant["Test(IsEqExact)"]`;
+///   and
+/// * (b) the **same** instruction with a resolvable non-`NO_FAIL` fail label is lowered
+///   (in-block — here by the inline word compare, since one operand is an immediate), so it
+///   records **zero** `Test`-keyed deopts.
+///
+/// Each module is also run on `Tier::Interpreter` through [`with_both_tiers`], and the two
+/// tiers must agree ([`assert_same_outcome`]): the declined path is a deopt to the
+/// interpreter's own step, so its observable result is the interpreter's by construction.
+///
+/// NB `beam_loader::NO_FAIL` IS `Label(0)`, so a resolvable fail label must be a strictly
+/// non-zero label that exists in the built function — `Label(3)` is the fail block below.
+#[test]
+fn a_declined_comparison_test_still_pays_one_jit_step_one_deopt() {
+    // (a) The declined form: a `NO_FAIL` comparison `test` raises rather than branching, so
+    // `jit_test`/`emit_test_helper` decline it and the block keeps the deopt.
+    let (declined, declined_atom) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Test {
+            kind: TestKind::IsEqExact,
+            fail: NO_FAIL,
+            args: vec![Operand::X(0), Operand::Integer(0)],
+        },
+        Instr::Return,
+    ]);
+    let (declined_outcome, declined_counters) =
+        run_counting(&declined, declined_atom, Tier::BaselineJit);
+    assert_eq!(
+        declined_counters.deopts_by_variant.get("Test(IsEqExact)"),
+        Some(&1),
+        "a `NO_FAIL` comparison `test` is declined by `jit_test`, so it must keep exactly \
+         one per-instruction deopt; deopts by variant: {:?}",
+        declined_counters.deopts_by_variant,
+    );
+    assert_eq!(
+        declined_counters.step_one, 1,
+        "the declined `test` is the only deopt in this module; saw {} ({:?})",
+        declined_counters.step_one, declined_counters.deopts_by_variant,
+    );
+    // The declined path is the interpreter's own step, so the tiers must agree — and both
+    // raise (the `NO_FAIL` clause failure: `x(0)` is `NIL`, never `=:=` the integer `0`).
+    with_both_tiers(&declined, declined_atom, |interpreter, baseline| {
+        assert_same_outcome(
+            "declined comparison test",
+            interpreter,
+            baseline,
+            &declined.atom_table,
+        );
+        for outcome in [interpreter, baseline] {
+            outcome
+                .as_ref()
+                .expect_err("a `NO_FAIL` test raises rather than branching");
+        }
+    });
+    assert!(
+        declined_outcome.is_err(),
+        "the declined run raises too: {declined_outcome:?}"
+    );
+
+    // (b) The same instruction with a resolvable, non-zero fail label is lowered, so no
+    // `Test`-keyed deopt is recorded at all.
+    let (lowered, lowered_atom) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Test {
+            kind: TestKind::IsEqExact,
+            fail: Label(3),
+            args: vec![Operand::X(0), Operand::Integer(0)],
+        },
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::Return,
+    ]);
+    let (lowered_outcome, lowered_counters) =
+        run_counting(&lowered, lowered_atom, Tier::BaselineJit);
+    assert_eq!(
+        lowered_counters.deopts_by_variant.get("Test(IsEqExact)"),
+        None,
+        "the same `test` with a resolvable fail label is lowered, so it records no \
+         `Test`-keyed deopt; deopts by variant: {:?}",
+        lowered_counters.deopts_by_variant,
+    );
+    assert!(
+        !lowered_counters
+            .deopts_by_variant
+            .keys()
+            .any(|k| k.starts_with("Test(")),
+        "no `test` deopt may remain for a lowered comparison; deopts by variant: {:?}",
+        lowered_counters.deopts_by_variant,
+    );
+    // The test fails (`NIL` vs `0`) and takes the fail arm to `Label(3)`, which returns
+    // `x(0)` unchanged — on both tiers.
+    with_both_tiers(&lowered, lowered_atom, |interpreter, baseline| {
+        assert_same_outcome(
+            "lowered comparison test",
+            interpreter,
+            baseline,
+            &lowered.atom_table,
+        );
+        for (label, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            assert_eq!(
+                outcome.as_ref().expect("the lowered run returns"),
+                &RunOutcome::Returned(NIL),
+                "{label}: the fail arm must reach `Label(3)` and return the untouched x(0)"
+            );
+        }
+    });
+    assert_eq!(
+        lowered_outcome.expect("the lowered run returns"),
+        RunOutcome::Returned(NIL),
+        "the counted lowered run takes the fail arm like the interpreter"
+    );
+}
+
+/// A Y-slot comparison `test` shape: `f/1` copies its argument into `Y(0)` inside a 2-slot
+/// frame and then evaluates `test_kind` against the `rhs` operand. A succeeding test
+/// returns `100`; a failing one takes the fail arm to `Label(3)`, whose own block returns
+/// `200`.
+///
+/// The `Y` operand is not an x-register, so the inline word/header subset declines it and
+/// the instruction is lowered through the `jit_test` helper (`emit_test_helper`) with an
+/// **in-block** branch to `Label(3)` — the form the copy-bound probe's clause heads use. The
+/// `Y(0)` write (`move X(0) -> Y(0)`) makes this a Y-touching block, so the frame window is
+/// published/refreshed exactly as the Y-slot arith tests rely on.
+fn y_slot_comparison_test_module(name: &str, kind: TestKind, rhs: Operand) -> (Module, Atom) {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 1,
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        },
+        Instr::Test {
+            kind,
+            fail: Label(3),
+            args: vec![Operand::Y(0), rhs],
+        },
+        Instr::Move {
+            src: Operand::Integer(100),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::Move {
+            src: Operand::Integer(200),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ];
+    let module = build_module(name, &[], vec![("f", 1, code)], &[("f", 1, Label(2))]);
+    let atom = export_atom(&module, "f");
+    (module, atom)
+}
+
+/// **Tier agreement for the newly-lowered comparison-`test` operand form**: a comparison
+/// `test` whose operand is a **Y slot** — the shape a `receive`/`case` clause head against a
+/// bound variable emits — cannot be decided by the inline word/header subset (a `Y` slot is
+/// not an x-register), so it is lowered through the `jit_test` helper with an **in-block**
+/// branch to the instruction's fail label, never a `jit_step_one` round trip. This pins that
+/// the lowered path is interpreter-identical for that operand form.
+///
+/// Both arms are exercised, for both kinds and in each direction:
+/// * the **succeeding** tests (`Y(0)` versus the same value in `X(0)`, and the `is_ne_exact`
+///   against a different small int) fall through to `move 100 → x(0)`;
+/// * the **failing** tests (and the `is_ne_exact` against the equal `X(0)`) take the in-block
+///   fail exit to `Label(3)`, whose own block returns `200` — so the linked fail jump, not a
+///   driver round trip, carried the control transfer.
+///
+/// The counters stay disabled here (the default), so the test stays fast: it pins
+/// *behaviour*, while the deopt counts are pinned by the control above.
+#[test]
+fn the_lowered_comparison_test_agrees_with_the_interpreter_on_a_y_operand() {
+    // `Y(0)` holds the argument `10`; `X(0)` is that same `10` or an unrelated small int.
+    let cases = [
+        (
+            "yslot_test_eq_success",
+            TestKind::IsEqExact,
+            Operand::X(0),
+            100,
+        ),
+        (
+            "yslot_test_eq_fail",
+            TestKind::IsEqExact,
+            Operand::Integer(999),
+            200,
+        ),
+        (
+            "yslot_test_ne_success",
+            TestKind::IsNeExact,
+            Operand::Integer(999),
+            100,
+        ),
+        (
+            "yslot_test_ne_fail",
+            TestKind::IsNeExact,
+            Operand::X(0),
+            200,
+        ),
+    ];
+    for (name, kind, rhs, expect) in cases {
+        let (module, export) = y_slot_comparison_test_module(name, kind, rhs);
+        with_both_tiers_unary(&module, export, 10, |interpreter, baseline| {
+            assert_same_outcome(name, interpreter, baseline, &module.atom_table);
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline-jit", baseline)] {
+                match outcome {
+                    Ok(RunOutcome::Returned(value)) => assert_eq!(
+                        *value,
+                        make_small(expect),
+                        "{name} on the {tier} tier must return {expect}"
+                    ),
+                    other => panic!("{name} on the {tier} tier did not return: {other:?}"),
+                }
+            }
+        });
+    }
 }
