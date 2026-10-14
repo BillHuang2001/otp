@@ -424,3 +424,15 @@ A real `try … catch C:R:S -> S` whose `S` is the derived stacktrace (the raise
 The uncaught-raise frames: `outer/1` makes a **non-tail** `call` into `boom/1` (which raises `error:badarg`), so the uncaught `Raise.stacktrace` names `boom/1` then `outer/1`.
 ## `xmod_caller.beam` (`xmod_caller.erl`) / `xmod_callee.beam` (`xmod_callee.erl`) — `tests/raise_stacktrace.rs`
 An in-machine cross-module raise: `xmod_caller:run/1` makes a non-tail `call_ext` into `xmod_callee:boom/1`, which raises — the frames name the callee first, then the caller, each resolved in its own module context. Both built with the neutral-directory recipe above.
+
+## `stacktrace_frames.beam` (`stacktrace_frames.erl`) — `tests/stacktrace_frames.rs`
+
+The **cooked catch-stacktrace** shapes that pin DEFECT 2 (a reported "duplicated top stacktrace frame" that does NOT reproduce — C's `gather_stacktrace` records each continuation pointer once). Each export is a `try … catch _C:_R:S -> S end` that returns its cooked `S`; the leading `stacktrace_frames` frames are the oracle-exact ones the test asserts, the trailing `erl_eval`/`init` frames of the oracle's own `S` live outside the engine's run.
+
+| export | Erlang | oracle `S` (leading `stacktrace_frames` frames) |
+|---|---|---|
+| `t0/0` | `try f() catch _C:_R:S -> S end`; `f() -> erlang:error(boom).` | `[{stacktrace_frames,f,0,{line,4}},{stacktrace_frames,t0,0,{line,3}}]` |
+| `t2/0` | the same shape as `t0/0` with `hh/0` | `[{stacktrace_frames,hh,0,{line,7}},{stacktrace_frames,t2,0,{line,8}}]` |
+| `t3/0` | `try g2() catch _C:_R:S -> S end`; `g2() -> hh2() + 1.`; `hh2() -> erlang:error(boom).` | `[{stacktrace_frames,hh2,0,{line,11}},{stacktrace_frames,t3,0,{line,9}}]` (the tail-called `g2/0` is elided) |
+
+`t3/0`'s `g2/0` is elided because `sys_core_fold` proves `hh2/0` never returns, so `g2/0` compiles to a **tail** call into `hh2/0` (its body is `call_only {f,hh2}`); the tail call reuses the frame, so the oracle never names it. Rebuild with the neutral-directory `erlc +deterministic` recipe above.
