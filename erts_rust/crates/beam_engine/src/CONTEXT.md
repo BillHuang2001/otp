@@ -51,7 +51,11 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `context.rs` → the `ExecutionContext` / `Mailbox` seams, `RootSet`, `MinimalContext` (incl. its
-  `ContextHeap` — the pointer-stable region heap over `beam_alloc::ReservedHeap`)
+  `ContextHeap` — a pointer-stable region heap over `beam_alloc::ReservedHeap`: ~4 MiB is reserved up
+  front and **grown in place** as terms are built, so an allocation costs its payload only; on
+  reservation exhaustion a fresh, larger region starts and **every earlier region is kept alive**, so a
+  handed-out pointer stays valid and **unmoved** — `relocate` is deliberately never used. It does **not**
+  override `alloc_words_rooted`, so it stays the test/embedding heap, not a collector.)
   (`CONTEXT.md` beside it: none — see `../CONTEXT.md`)
 - `machine/` → `Machine` (registers + the `x_mut`/`fr_mut`/`stack_mut`/`with_roots`/`alloc_rooted`
   root-set hand-off, frames, catch/unwind, run entries, `RunOutcome`, module contexts, driver,
