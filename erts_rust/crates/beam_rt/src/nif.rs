@@ -122,6 +122,7 @@
 //!   terms *it* minted, so this needs a per-library `{module, name}`-keyed resource-type registry.
 //!   Default ⇒ the C's failure code `1`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -451,6 +452,84 @@ impl<'a> NifHostImpl<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The shared ETF-decode scratch
+// ---------------------------------------------------------------------------------------------
+
+// A memoized, per-thread **image** of a host's shared atom table, used as the mutable scratch
+// [`beam_codec`]'s decode entry points require (maintained by [`with_decode_scratch`] below, which
+// also carries the correctness argument).
+//
+// `beam_codec::decode_term` takes `&mut AtomTable` because it interns every atom an image carries,
+// while a host may only *borrow* the runtime's one shared table. The decode path only ever
+// **interns** — no arm of the decoder reads a name back — so a copy of the caller's table is
+// exactly the interface required: a name already present in the caller's table is returned at the
+// caller's own index, and a genuinely new one at `shared.len() + k`, which is precisely the index
+// the host's pending interner predicts (its `base` was fixed at the shared table's length when the
+// host was built) and therefore the index it assigns when the novel names are committed after the
+// decode.
+//
+// Building that copy per call is `O(table)` **allocations** — ~127 us for the ~3000-atom table of a
+// booted runtime, which is the whole cost of the decode (the term itself decodes in ~1 us). The
+// copy is therefore memoized per thread and **verified** against the live table index by index
+// ([`prefix_matches`]) before it is reused: comparing is allocation-free and far cheaper than
+// rebuilding. The image is shared by **both** of this crate's decoding hosts — [`NifHostImpl`]'s
+// `binary_to_term` (behind `enif_binary_to_term`) and
+// [`DriverPort::binary_to_term`](crate::port::driver::DriverPort) (behind `erl_drv_binary_to_term` /
+// the term-data machine's `ERL_DRV_EXT2TERM`) — so the two cannot drift.
+//
+// This is a *cache of the caller's own immutable input*, carrying no cross-call semantics; it
+// retains one table image per thread while the process lives. A memo left ahead of the live table
+// by an earlier decode (a failed one, or one whose novel names a different host's commit dropped)
+// fails the prefix check and is rebuilt, so it can never leak a name into a later decode.
+thread_local! {
+    static DECODE_SCRATCH: RefCell<Option<AtomTable>> = const { RefCell::new(None) };
+}
+
+/// Whether `memo` names the same atom as `shared` at every index `memo` holds.
+///
+/// `memo.len() > shared.len()` is `false` by definition: such a memo cannot stand in for `shared`
+/// (its novel-atom prediction would be off by the difference).
+fn prefix_matches(memo: &AtomTable, shared: &AtomTable) -> bool {
+    memo.len() <= shared.len()
+        && (0..memo.len()).all(|index| {
+            let atom = beam_term::Atom::from_raw(index as u32);
+            memo.name(atom) == shared.name(atom)
+        })
+}
+
+/// Runs `f` on an exact, index-identical image of the host's shared table `shared`, rebuilding or
+/// extending the per-thread memo as needed (see [`DECODE_SCRATCH`]).
+///
+/// `f` receives a table that names the same atom as `shared` at every index `shared` holds, and may
+/// extend it (that is what the decoder does with a novel atom); the memo is *not* required to stay an
+/// image of `shared` afterwards, so the next call revalidates. A re-entrant call — which the decode
+/// path cannot produce, since decoding never dispatches back into a host — falls back to a private
+/// copy rather than panicking.
+pub(crate) fn with_decode_scratch<R>(shared: &AtomTable, f: impl FnOnce(&mut AtomTable) -> R) -> R {
+    DECODE_SCRATCH.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return f(&mut shared.clone());
+        };
+        if !matches!(slot.as_ref(), Some(memo) if prefix_matches(memo, shared)) {
+            *slot = Some(shared.clone());
+        }
+        // `slot` is `Some` after the assignment above; the `None` arm is unreachable, and the
+        // private-copy fallback keeps this panic-free rather than asserting on it.
+        let Some(scratch) = slot.as_mut() else {
+            return f(&mut shared.clone());
+        };
+        // Extend the memo name-for-name up to the live table's length, so `f` sees a table that
+        // names the same atom as `shared` at every index `shared` holds.
+        for index in scratch.len()..shared.len() {
+            if let Some(name) = shared.name(beam_term::Atom::from_raw(index as u32)) {
+                scratch.intern(name);
+            }
+        }
+        f(scratch)
+    })
+}
+
 /// The four independent unique-integer counters (one per property combination), exactly as the C
 /// emulator keeps four sequences.
 static UNIQUE_COUNTERS: [AtomicI64; 4] = [
@@ -559,22 +638,29 @@ impl NifHost for NifHostImpl<'_> {
     /// term.
     ///
     /// A name the image introduces is not yet in the runtime's shared table (this host may only
-    /// borrow it), so the shared table is **cloned** and the decoder interns into the clone; every
-    /// name the clone appended is then recorded on the shared [`PendingInterner`] at exactly the
-    /// index the clone assigned it, for the caller to materialise once its own borrow is released.
-    /// `intern` — not `intern_atom` — is load-bearing: the interner's `base` was fixed when this host
-    /// was built, so appending mid-sequence would shift the prediction of every later name.
+    /// borrow it), so the decoder interns into the per-thread **scratch image** of the shared table
+    /// ([`with_decode_scratch`] — never a fresh `O(table)` clone per call); every name the image
+    /// appended is then recorded on the shared [`PendingInterner`] at exactly the index the image
+    /// assigned it, for the caller to materialise once its own borrow is released. `intern` — not
+    /// `intern_atom` — is load-bearing: the interner's `base` was fixed when this host was built, so
+    /// appending mid-sequence would shift the prediction of every later name.
+    ///
+    /// A failed decode commits nothing: the novel names are recorded only on the `Ok` path.
     fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
-        let mut local = (*self.atoms).clone();
-        let known = local.len();
-        let term = beam_codec::decode_term(bytes, &mut self.heap, &mut local).ok()?;
-        for index in known..local.len() {
-            let Some(name) = local.name(beam_term::Atom::from_raw(index as u32)) else {
-                continue;
-            };
-            self.interner.intern(name);
-        }
-        Some(term)
+        // Disjoint field borrows: `heap` and `interner` are distinct fields of `self`.
+        let heap = &mut self.heap;
+        let interner = &mut self.interner;
+        with_decode_scratch(&self.atoms, |scratch| {
+            let known = scratch.len();
+            let term = beam_codec::decode_term(bytes, heap, scratch).ok()?;
+            for index in known..scratch.len() {
+                let Some(name) = scratch.name(beam_term::Atom::from_raw(index as u32)) else {
+                    continue;
+                };
+                let _ = interner.intern(name);
+            }
+            Some(term)
+        })
     }
 
     /// `enif_make_existing_atom` — look `name` up in the **committed** table, never creating it.
@@ -1164,7 +1250,7 @@ mod tests {
     }
 
     /// A committed name decodes to its existing index; a new name is predicted at the index the
-    /// cloned table assigned it and materialises there once the caller commits.
+    /// scratch image assigned it and materialises there once the caller commits.
     #[test]
     fn binary_to_term_resolves_and_predicts_atoms() {
         let (mut host, atoms, interner) = host_with(&["known"]);
@@ -1175,7 +1261,7 @@ mod tests {
         assert_eq!(host.binary_to_term(existing), Some(make_atom(known)));
         assert!(interner.is_empty(), "an existing atom interns nothing");
 
-        // `fresh` — a name the table does not hold yet: predicted at the clone's first free index.
+        // `fresh` — a name the table does not hold yet: predicted at the table's first free index.
         let fresh = &[131u8, 119, 5, b'f', b'r', b'e', b's', b'h'];
         let term = host.binary_to_term(fresh).expect("decodes");
         assert_eq!(term, make_atom(Atom::from_raw(atoms.len() as u32)));
@@ -1187,6 +1273,104 @@ mod tests {
             committed.name(Atom::from_raw(atoms.len() as u32)),
             Some("fresh")
         );
+    }
+
+    // The shared `DECODE_SCRATCH` memo is a per-thread image of the host's table, revalidated index
+    // by index (`prefix_matches`) before each reuse. Its correctness rests on one property: **when
+    // the decoder writes into the memo, the memo must name the same atom as the live table at every
+    // index the live table holds.** If it ever does not — a stale image from an earlier table, a
+    // shorter table, or a memo left ahead of the table by an earlier decode — a name the decoder
+    // *interns* would be recorded at the wrong global index and the decoded term would silently
+    // refer to the wrong atom (or the interner would predict an index the term does not carry).
+    //
+    // Each case below issues several decodes inside one test function, so the memo (which is per
+    // thread) is carried across calls and every stale-image shape is exercised.
+
+    /// `foo` → `[131, 119, 3, 102, 111, 111]`.
+    const FOO_IMAGE: &[u8] = &[131u8, 119, 3, b'f', b'o', b'o'];
+    /// `{novel, <missing>}` — the decoder interns the **novel** atom `novel` (growing the memo) and
+    /// *then* fails on the missing second element, so nothing is ever committed.
+    const TRUNCATED_AFTER_NOVEL_IMAGE: &[u8] =
+        &[131u8, 104, 2, 119, 5, b'n', b'o', b'v', b'e', b'l'];
+
+    /// The name the decoded `image` resolves to under `table` (the image carries a committed atom).
+    fn decoded_name(host: &mut NifHostImpl<'_>, image: &[u8], table: &AtomTable) -> String {
+        let term = host.binary_to_term(image).expect("the image decodes");
+        table
+            .name(atom_val(term))
+            .expect("the decoded index names an atom")
+            .to_string()
+    }
+
+    /// The steady state: the same table twice reuses the memo and still resolves the name, and
+    /// nothing is interned (the name is already there).
+    #[test]
+    fn the_same_table_twice_reuses_the_memo_without_moving_the_atom() {
+        let (mut host, atoms, interner) = host_with(&["a", "foo"]);
+        let len = atoms.len();
+
+        assert_eq!(decoded_name(&mut host, FOO_IMAGE, &atoms), "foo");
+        assert_eq!(decoded_name(&mut host, FOO_IMAGE, &atoms), "foo");
+        assert!(interner.is_empty(), "an existing atom interns nothing");
+        assert_eq!(atoms.len(), len, "the shared table is untouched");
+    }
+
+    /// A memo carried from a table that puts `foo` at a different index must be **rebuilt**, never
+    /// blindly reused — a stale index would resolve the decoded atom to the wrong name.
+    #[test]
+    fn the_scratch_is_rebuilt_when_the_table_moves_a_name() {
+        // First table: `foo` @1.
+        let (mut first, first_atoms, _) = host_with(&["a", "foo"]);
+        assert_eq!(decoded_name(&mut first, FOO_IMAGE, &first_atoms), "foo");
+
+        // Second table on the same thread: `foo` @3, with `b`/`c` occupying the memo's old slot 1.
+        let mut table = AtomTable::new();
+        table.seed(["a", "b", "c", "foo"]);
+        let second_atoms = Rc::new(table);
+        let mut second = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            Rc::clone(&second_atoms),
+            PendingInterner::new(second_atoms.len()),
+            make_small(7),
+            1,
+            None,
+        );
+        assert_eq!(
+            decoded_name(&mut second, FOO_IMAGE, &second_atoms),
+            "foo",
+            "the memo was not rebuilt and the term aliased the wrong atom"
+        );
+    }
+
+    /// A memo left ahead of the live table — by a decode that interned a novel name and then failed
+    /// — must be rebuilt, or the next *novel* name would land at an index the interner never
+    /// predicts.
+    #[test]
+    fn a_memo_left_ahead_does_not_shift_a_later_novel_atom() {
+        let (mut host, atoms, interner) = host_with(&["a", "foo"]);
+
+        assert_eq!(
+            host.binary_to_term(TRUNCATED_AFTER_NOVEL_IMAGE),
+            None,
+            "the truncated tuple fails"
+        );
+        assert!(interner.is_empty(), "a failed decode commits nothing");
+        assert_eq!(atoms.len(), 2, "the shared table is untouched");
+
+        // `bar` is novel: it must land at the live table's own next index, `atoms.len()`. A memo
+        // carried over from the failure would have put it one higher.
+        let bar = &[131u8, 119, 3, b'b', b'a', b'r'];
+        let term = host.binary_to_term(bar).expect("decodes");
+        assert_eq!(
+            term,
+            make_atom(Atom::from_raw(atoms.len() as u32)),
+            "a stale memo shifted the predicted index"
+        );
+
+        // ...and the commit lands the name at exactly that index.
+        let mut committed = (*atoms).clone();
+        interner.commit(&mut committed);
+        assert_eq!(committed.name(Atom::from_raw(atoms.len() as u32)), Some("bar"));
     }
 
     /// `existing_atom` is a pure lookup: a miss interns nothing and records nothing.
