@@ -678,6 +678,14 @@ runtime that wants novel atoms to be free too should hold a single stable instan
   masking via `boxed_val`/`list_val`. Prefer property-style loops over boundary ranges.
 - `tests/abi.rs` — `size_of::<Eterm>() == size_of::<usize>()`, `align_of` equal, `Eterm: Copy`, and a
   `repr(transparent)` assertion (round-trip `Eterm`) — the NIF-ABI guarantee.
+- `tests/atom_witness.rs` — the O(1) witness evidence, three properties in order: a per-thread-armed
+  counting `#[global_allocator]` proves `snapshot`/`appended_since` allocate **nothing** (deterministic,
+  host-load independent); a **length-independence** timing bound (4 vs 200 000 atoms, wide margin) is the
+  tripwire for an accidental O(table) scan — the `prefix_matches` shape the API replaces; and the
+  soundness cases (a clone that diverges, a clone that does not, an independently built table with
+  identical names, a shrunken table) run at 50 000 atoms. `examples/atom_witness.rs` prints the ns/op
+  table (`snapshot` / `generation` / `appended_since` hit+miss vs `AtomTable::clone`) with
+  `/proc/loadavg`.
 - `tests/non_term.rs` — the crate-wide **non-term policy** suite: a word that is not a term (the ABI's
   `THE_NON_VALUE`, a bare `HEADER`-tagged word) must never crash or be dereferenced by any safe public
   entry point — each returns a typed error or a defined ordering (the Constraints' "a word that is not
