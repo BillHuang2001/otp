@@ -37,7 +37,7 @@
 //! | `scheduler_id` | int (`1` — the id of this runtime's only scheduler) |
 //! | `dirty_cpu_schedulers` / `_online` | int (`+SDcpu` or `0`) |
 //! | `dirty_io_schedulers` | int (`+SDio` or `0`) |
-//! | `scheduler_bind_type` | atom, `unbound` |
+//! | `scheduler_bind_type` | atom (`+sbt <type>`, else `unbound`) |
 //! | `scheduler_bindings` | `{unbound, unbound, …}`, one per scheduler |
 //! | `multi_scheduling` | atom, `enabled`/`disabled` |
 //! | `multi_scheduling_blockers` / `normal_multi_scheduling_blockers` | `[]` |
@@ -357,6 +357,153 @@ mod tests {
             InfoValue::List(Vec::new())
         );
         assert!(try_value("nonsense", &rt).is_none());
+    }
+
+    /// The `+sbt` spelling → atom table of [`scheduler_bind_type`] (all nine spellings the
+    /// CLI accepts, `crate::cli::flags::SCHEDULER_BIND_TYPES`), measured against the oracle
+    /// (OTP 29.1.1 / erts-17.1) with `erl +sbt <spelling> -noshell -eval
+    /// 'io:format("~p~n",[erlang:system_info(scheduler_bind_type)]),halt().'` — nine
+    /// spellings, nine exit-0 answers. The no-`+sbt` default is `unbound` too.
+    const PLUS_SBT_ANSWERS: [(&str, &str); 9] = [
+        ("u", "unbound"),
+        ("db", "thread_no_node_processor_spread"),
+        ("s", "spread"),
+        ("ps", "processor_spread"),
+        ("ts", "thread_spread"),
+        ("tnnps", "thread_no_node_processor_spread"),
+        ("nnps", "no_node_processor_spread"),
+        ("nnts", "no_node_thread_spread"),
+        ("ns", "no_spread"),
+    ];
+
+    /// Every `+sbt` spelling materializes the oracle's atom: the key's `InfoValue::Atom` is
+    /// resolved **by name** in the boot-seeded global atom table
+    /// ([`crate::boot::CORE_ATOMS`](crate::boot)), so a spelling whose atom is unseeded makes
+    /// `Runtime::system_info/1` fail with `TermNotFound` (`term not found`) instead of
+    /// answering. Both halves are asserted: the heap-free value, and the real materialized
+    /// term through the path the CLI takes.
+    #[test]
+    fn every_plus_sbt_spelling_materializes_the_oracles_atom() {
+        for (spelling, expected) in PLUS_SBT_ANSWERS {
+            let mut rt = runtime_from(&["+sbt", spelling]);
+            assert_eq!(
+                try_value("scheduler_bind_type", &rt).unwrap().unwrap(),
+                InfoValue::Atom(expected),
+                "+sbt {spelling}"
+            );
+            rt.system_info("scheduler_bind_type")
+                .unwrap_or_else(|error| {
+                    panic!("system_info(scheduler_bind_type) after `+sbt {spelling}`: {error}")
+                });
+        }
+        // No `+sbt` at all is the C's `ERTS_CPU_BIND_UNBOUND` default.
+        let mut rt = runtime();
+        assert_eq!(
+            try_value("scheduler_bind_type", &rt).unwrap().unwrap(),
+            InfoValue::Atom("unbound")
+        );
+        rt.system_info("scheduler_bind_type")
+            .expect("system_info(scheduler_bind_type) without `+sbt`");
+    }
+
+    /// The live-oracle half of the test above: for each of the nine spellings, the oracle's
+    /// own answer for `+sbt <spelling>` is what this runtime reports (value **and** the
+    /// spelling's exit status, which the oracle probe asserts through `status.success()`).
+    #[test]
+    fn every_plus_sbt_spelling_matches_the_live_oracle() {
+        let Some(oracle) = oracle_erl() else {
+            skip_oracle_loudly();
+            return;
+        };
+        for (spelling, _) in PLUS_SBT_ANSWERS {
+            let Some(answer) = oracle_scheduler_bind_type(&oracle, Some(spelling)) else {
+                skip_oracle_loudly();
+                return;
+            };
+            let rt = runtime_from(&["+sbt", spelling]);
+            let ours = try_value("scheduler_bind_type", &rt).unwrap().unwrap();
+            let InfoValue::Atom(name) = ours else {
+                panic!("scheduler_bind_type must be an atom, got {ours:?}");
+            };
+            assert_eq!(
+                name, answer,
+                "`+sbt {spelling}`: this runtime must report the oracle's own atom"
+            );
+        }
+        let Some(default) = oracle_scheduler_bind_type(&oracle, None) else {
+            skip_oracle_loudly();
+            return;
+        };
+        let rt = runtime();
+        let ours = try_value("scheduler_bind_type", &rt).unwrap().unwrap();
+        let InfoValue::Atom(name) = ours else {
+            panic!("scheduler_bind_type must be an atom, got {ours:?}");
+        };
+        assert_eq!(
+            name, default,
+            "the no-`+sbt` default must be the oracle's own atom"
+        );
+    }
+
+    /// The oracle `erl`: `$ERTS_ORACLE` when it is an executable, else `erl` on `$PATH` (the
+    /// convention `tools/differential` uses), resolved **without running** it.
+    fn oracle_erl() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = std::path::PathBuf::from(&value);
+            if is_executable(&program) {
+                return Some(program);
+            }
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("erl"))
+            .find(|candidate| is_executable(candidate))
+    }
+
+    /// Whether `candidate` is an executable regular file.
+    fn is_executable(candidate: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(candidate) {
+            Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+
+    /// The oracle's `erlang:system_info(scheduler_bind_type)` for `+sbt <spelling>` (`None`
+    /// for no `+sbt`), as the atom name, or `None` when the probe cannot complete. The probe
+    /// always `halt()`s, so it terminates on its own.
+    fn oracle_scheduler_bind_type(
+        oracle: &std::path::Path,
+        spelling: Option<&str>,
+    ) -> Option<String> {
+        let mut command = std::process::Command::new(oracle);
+        if let Some(spelling) = spelling {
+            command.args(["+sbt", spelling]);
+        }
+        let output = command
+            .args([
+                "-noshell",
+                "-eval",
+                "io:format(\"~p~n\",[erlang:system_info(scheduler_bind_type)]),halt().",
+            ])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// The loud banner for a skipped oracle comparison — a missing toolchain is never a
+    /// silent pass.
+    fn skip_oracle_loudly() {
+        eprintln!();
+        eprintln!("======= beam_rt info/schedulers.rs ORACLE CROSS-CHECK SKIPPED =======");
+        eprintln!("no `erl` on $PATH (and no executable $ERTS_ORACLE): the oracle comparison");
+        eprintln!("cannot run. Set $ERTS_ORACLE (or install Erlang/OTP) and re-run. NOT a pass.");
+        eprintln!("===============================================================");
+        eprintln!();
     }
 
     #[test]

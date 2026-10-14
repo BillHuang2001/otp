@@ -125,9 +125,8 @@ pub struct CodeServer {
     #[cfg(test)]
     fun_snapshot_rebuilds: Cell<u64>,
     /// The code path: the `-pa` dirs (reverse command-line order), the system `ebin` dirs,
-    /// then the `-pz` dirs.
-    paths: Vec<PathBuf>,
-    /// The **`-pz` tail** of the code path, in command-line order.
+    /// `"."`, then the `-pz` dirs.
+    paths: Vec<PathBuf>,    /// The **`-pz` tail** of the code path, in command-line order.
     ///
     /// The oracle's `code:get_path/0` appends the `-pz` directories **after** the system
     /// `ebin` directories (and `"."`) — `code_server.erl`'s `add_loader_path/2` ends in
@@ -177,12 +176,16 @@ impl CodeServer {
     ///   a `-pz` directory cannot shadow an installed module (`-pz <d>` never wins over
     ///   stdlib's `proplists.beam`); they are appended by
     ///   [`CodeServer::add_system_paths`];
+    /// * the **current directory** `"."` sits between the system `ebin` directories and the
+    ///   `-pz` tail, so the oracle's `code:get_path/0` ends
+    ///   `[…, <system lib ebins>, ".", <-pz dirs>]` (verified against OTP 29.1.1 /
+    ///   erts-17.1 with and without `-pa`/`-pz`); it is installed by
+    ///   [`CodeServer::add_system_paths`], which is where the group order is decided;
     /// * a directory that does not exist is filtered **out of the code path**
     ///   (`strip_path/2` over `check_path/1`) while `init:get_argument(pa|pz)` keeps it —
     ///   which is why the filtering is here and not in the parser: `erl -pa /no/such/dir …`
     ///   reports `false` for `lists:member("/no/such/dir", code:get_path())`.
-    pub fn set_configured_paths(&mut self, pa: &[PathBuf], pz: &[PathBuf]) {
-        for dir in pa.iter().rev() {
+    pub fn set_configured_paths(&mut self, pa: &[PathBuf], pz: &[PathBuf]) {        for dir in pa.iter().rev() {
             if dir.is_dir() {
                 self.add_default_path(dir.clone());
             }
@@ -267,10 +270,12 @@ impl CodeServer {
         for dir in extra_app_ebins(&base) {
             self.add_default_path(dir);
         }
+        // The **current directory** `"."`, which the oracle's code path carries between the
+        // system directories and the `-pz` tail (see [`CodeServer::set_configured_paths`]).
+        self.add_default_path(PathBuf::from("."));
         // The `-pz` tail goes **after** the system directories (the oracle's
         // `add_pa_pz/3`), so a `-pz` directory never shadows an installed module.
-        let tail = self.tail_paths.clone();
-        for dir in tail {
+        let tail = self.tail_paths.clone();        for dir in tail {
             self.add_default_path(dir);
         }
         Ok(())
@@ -1066,6 +1071,53 @@ mod tests {
             server.paths(),
             &system[..],
             "the system ebin directories are boot-time defaults"
+        );
+    }
+
+    /// The current directory is a code-path entry between the system `ebin` directories and
+    /// the `-pz` tail. Oracle (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// erl -noshell -eval 'io:format("~p~n",[code:get_path()]),halt().'
+    ///   → […, <all system app ebins>, "."]
+    /// erl -noshell -pa A -pz Z1 Z2 -eval …
+    ///   → [A, …, <all system app ebins>, ".", Z1, Z2]
+    /// ```
+    ///
+    /// The probe asserts the **structure** rather than the list contents, because this
+    /// runtime's system set is the three resolved `ebin` roots plus `compiler` where the
+    /// oracle installs every application: `-pa` at the head, only `ebin` directories before
+    /// `.`, and exactly the `-pz` directories after it.
+    #[test]
+    fn the_current_directory_sits_between_the_system_dirs_and_the_pz_tail() {
+        let Some(mut server) = system_server() else {
+            return;
+        };
+        let pa = scratch("dot-pa");
+        let pz1 = scratch("dot-pz1");
+        let pz2 = scratch("dot-pz2");
+        // `Runtime::new` order: the configured paths first, then the system directories
+        // (which is what installs `.` and appends the `-pz` tail).
+        server.set_configured_paths(std::slice::from_ref(&pa), &[pz1.clone(), pz2.clone()]);
+        server.add_system_paths().expect("the system paths");
+
+        let paths = server.paths();
+        let dot = paths
+            .iter()
+            .position(|path| path == Path::new("."))
+            .expect("`.` is a code-path entry");
+        assert_eq!(paths[0], pa, "the `-pa` directory is the head");
+        assert!(
+            paths[1..dot].iter().all(|path| is_ebin(path)),
+            "only `ebin` directories precede `.`: {:?}",
+            &paths[1..dot]
+        );
+        assert_eq!(&paths[dot + 1..], &[pz1, pz2][..], "the `-pz` tail follows `.`");
+        // The entry is boot-time default state, so a reset keeps it.
+        server.reset_paths_to_defaults();
+        assert!(
+            server.paths().iter().any(|path| path == Path::new(".")),
+            "`.` survives `reset_paths_to_defaults`"
         );
     }
     #[test]

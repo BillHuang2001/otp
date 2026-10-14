@@ -291,6 +291,18 @@ normal installation pays **no** `erl` start-up (measured on this host: `run …s
 - Additive only: `PRELOADED_MODULE_NAMES`, `CORE_ATOMS`, `seed_core_atoms` and `Runtime::preloaded()`
   keep their existing semantics/return types; `boot()` stays idempotent and returns `Result<()>`;
   `execute_reporting` is purely additive (`execute` keeps its signature).
+- **The atom seed is the materialization source for every atom-valued answer**, so `CORE_ATOMS` is
+  **append-only**: the group order fixes the atom indices, and a seeded *prefix* must resolve every
+  name it contains identically (asserted by `boot.rs`'s `core_atoms_seed_is_idempotent_and_complete`
+  + `seed_core_atoms_interns_the_exception_reason_and_class_atoms`). A name an `InfoValue::Atom` can
+  emit but the seed lacks surfaces as `term not found` (`BeamError::TermNotFound`) instead of the
+  answer, which is why each appended group exists: the C `error_atom` table
+  (`beam_common.c:382-406`), the stacktrace auxiliaries `file`/`line`, the node atom
+  `nonode@nohost`, the `bm`/`ac` pattern tags, the `get_module_info/1,2` item and `Attr`/`CInf`
+  compiler keys, the `+sbt` scheduler bind-type names `erlang:system_info(scheduler_bind_type)`
+  reports (`spread`, `processor_spread`, `thread_spread`, `thread_no_node_processor_spread`,
+  `no_node_processor_spread`, `no_node_thread_spread`, `no_spread` — `unbound`, the `u` spelling and
+  the no-`+sbt` default, is seeded through `INFO_ATOMS`), and the `RuntimeHooks` timer tag `timeout`.
 - **Drives stay bounded** — an exhausted deadline is an honest typed error, never a spin.
 - **The `DRIVE_DEADLINE` bounds the outer drive, not a nested blocking pump.** A
   `{kernelProcess, …}` burst and an `{apply, …}`'s `Wait` arm both go through

@@ -886,3 +886,223 @@ fn the_documented_oracle_divergences_are_pinned() {
         );
     }
 }
+
+// --- `-config`: a config file the boot cannot read fails the boot (A.6) ----------------------
+
+/// Spawns `program` with exactly `args` — no injected `-noshell`/`-eval`, because the
+/// `-version` exemption needs a command line whose **only** action is the version banner —
+/// after stripping every inherited `ERL_*FLAGS` variable.
+fn run_args(program: &str, args: &[&str]) -> Output {
+    let mut command = Command::new(program);
+    for name in ["ERL_AFLAGS", "ERL_FLAGS", "ERL_ZFLAGS"] {
+        command.env_remove(name);
+    }
+    command.env_remove(otp_flags_var());
+    command.args(args);
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("spawning {program} failed: {error}"))
+}
+
+/// A fresh scratch directory (created if missing) unique to `label` and this process.
+fn scratch_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "beam_rt_cli_flags_{label}_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    dir
+}
+
+/// `-config FILE` is read while the node **boots**, so a file the boot cannot read exits 1:
+/// for every action that boots, and for **every** `-config` occurrence. Oracle (OTP 29.1.1 /
+/// erts-17.1), the exact figures this test pins:
+///
+/// ```text
+/// erl -noshell -config <absent> -eval 'halt(0).'   → exit 1, no stdout
+/// erl -noshell -config <absent> -s init stop       → exit 1
+/// erl -noshell -config <absent>                    → exit 1  (the plain boot action)
+/// erl -noshell -config <existing []. config> …     → exit 0
+/// erl -version -config <absent>                    → exit 0  (the banner; no boot)
+/// ```
+///
+/// The `[].`-config **path without** its `.config` suffix is used for the accepted case, so
+/// the oracle's own extension rule (`application_controller:conf_param_to_conf/1`) is
+/// exercised too.
+#[test]
+fn a_missing_config_file_fails_the_boot_like_the_oracle() {
+    let beam = env!("CARGO_BIN_EXE_beam_rt");
+    let oracle_available = erl_available();
+    if !oracle_available {
+        println!("SKIP cli_flags: `erl` is not runnable — only the beam_rt half is pinned");
+    }
+    let Some(config) = write_temp_config() else {
+        println!("SKIP cli_flags: could not create a temporary config file");
+        return;
+    };
+    let config = config.to_str().expect("a UTF-8 temp path").to_string();
+    let absent = scratch_dir("config").join("beam_rt_absent");
+    let absent = absent.to_str().expect("a UTF-8 temp path").to_string();
+
+    // Every booting action refuses an unreadable config, with exit 1 and no stdout.
+    let failing: &[(&str, &[&str])] = &[
+        (
+            "-eval",
+            &["-noshell", "-config", &absent, "-eval", "halt(0)."],
+        ),
+        (
+            "-s",
+            &["-noshell", "-config", &absent, "-s", "init", "stop"],
+        ),
+        ("the boot action", &["-noshell", "-config", &absent]),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (action, args) in failing {
+        let rust = run_args(beam, args);
+        if rust.status.code() != Some(1) {
+            failures.push(format!(
+                "{action} with a missing config: beam_rt exited {:?} != 1 (stderr {})",
+                rust.status.code(),
+                stderr(&rust)
+            ));
+        }
+        if !rust.stdout.is_empty() {
+            failures.push(format!(
+                "{action} with a missing config: beam_rt printed {:?}",
+                stdout(&rust)
+            ));
+        }
+        if oracle_available {
+            let oracle = run_args("erl", args);
+            if oracle.status.code() != Some(1) {
+                failures.push(format!(
+                    "{action} with a missing config: the oracle exited {:?} != 1",
+                    oracle.status.code()
+                ));
+            }
+            if !oracle.stdout.is_empty() {
+                failures.push(format!(
+                    "{action} with a missing config: the oracle printed {:?}",
+                    stdout(&oracle)
+                ));
+            }
+        }
+    }
+
+    // A readable `[].` config boots both runtimes (the value is given **without** the
+    // `.config` suffix, which the resolver appends).
+    let accepted: &[&str] = &["-noshell", "-config", &config, "-eval", "halt(0)."];
+    let rust = run_args(beam, accepted);
+    if rust.status.code() != Some(0) || !rust.stdout.is_empty() {
+        failures.push(format!(
+            "a readable config: beam_rt exited {:?} printing {:?} (stderr {})",
+            rust.status.code(),
+            stdout(&rust),
+            stderr(&rust)
+        ));
+    }
+    if oracle_available {
+        let oracle = run_args("erl", accepted);
+        if oracle.status.code() != Some(0) || !oracle.stdout.is_empty() {
+            failures.push(format!(
+                "a readable config: the oracle exited {:?} printing {:?}",
+                oracle.status.code(),
+                stdout(&oracle)
+            ));
+        }
+    }
+
+    // `-version` builds no runtime, so it stays exempt in both.
+    let version: &[&str] = &["-version", "-config", &absent];
+    let rust = run_args(beam, version);
+    if rust.status.code() != Some(0) {
+        failures.push(format!(
+            "-version with a missing config: beam_rt exited {:?} != 0 (stderr {})",
+            rust.status.code(),
+            stderr(&rust)
+        ));
+    }
+    if oracle_available {
+        let oracle = run_args("erl", version);
+        if oracle.status.code() != Some(0) {
+            failures.push(format!(
+                "-version with a missing config: the oracle exited {:?} != 0",
+                oracle.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// --- `"."` on the code path -----------------------------------------------------------------
+
+/// The structural `code:get_path/0` probe: `.` must be present, the head must be non-empty
+/// and *only* `ebin` directories may precede it on a default/`-pz` path, and the number of
+/// entries **after** it is reported. A missing `.` makes the `lists:splitwith/2` match fail,
+/// so the probe answers `exception error {badmatch, …}` — a loud regression, never a silent
+/// pass.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1), the exact answers this test compares against:
+///
+/// ```text
+/// erl -noshell -eval <probe>                     → {"." ,true,true,0}
+/// erl -noshell -pz Z1 Z2 -eval <probe>           → {".",true,true,2}
+/// erl -noshell -pa A -eval <probe>               → {".",true,false,0}   (A is not an ebin dir)
+/// ```
+const GET_PATH_PROBE: &str = concat!(
+    "try (begin P = code:get_path(), ",
+    "{Before, [Dot | After]} = lists:splitwith(fun(X) -> X =/= \".\" end, P), ",
+    "{Dot, Before =/= [], ",
+    " lists:all(fun(X) -> lists:suffix(\"ebin\", X) end, Before), ",
+    " length(After)} end) ",
+    "of V -> io:format(\"~p~n\", [V]), halt(0) ",
+    "catch C:R -> io:format(\"exception ~w ~w~n\", [C, R]), halt(1) end."
+);
+
+/// The two runtimes place `.` identically: after the system `ebin` directories and before
+/// the `-pz` tail. Skips loudly without `erl`.
+#[test]
+fn the_current_directory_is_on_the_code_path_like_the_oracle() {
+    if !erl_available() {
+        println!("SKIP cli_flags: `erl` is not runnable — the oracle cross-check is skipped");
+        return;
+    }
+    let beam = env!("CARGO_BIN_EXE_beam_rt");
+    let dir = scratch_dir("path");
+    let a = dir.join("head");
+    let z1 = dir.join("tail1");
+    let z2 = dir.join("tail2");
+    for path in [&a, &z1, &z2] {
+        std::fs::create_dir_all(path).expect("a scratch code-path directory");
+    }
+    let a = a.to_str().expect("a UTF-8 temp path");
+    let z1 = z1.to_str().expect("a UTF-8 temp path");
+    let z2 = z2.to_str().expect("a UTF-8 temp path");
+
+    let cases: &[(&str, &[&str])] = &[
+        ("the default boot path", &[]),
+        ("a -pz tail", &["-pz", z1, z2]),
+        ("a -pa head", &["-pa", a]),
+        ("a -pa head and a -pz tail", &["-pa", a, "-pz", z1, z2]),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (description, args) in cases {
+        let oracle = run_probe("erl", &[], args, GET_PATH_PROBE);
+        let rust = run_probe(beam, &[], args, GET_PATH_PROBE);
+        if stdout(&oracle) != stdout(&rust) {
+            failures.push(format!(
+                "{description}: beam_rt {:?} != oracle {:?}",
+                stdout(&rust),
+                stdout(&oracle)
+            ));
+        }
+        // Sanity: the probe really saw `.` (not the `badmatch` the regression would give).
+        if !stdout(&rust).starts_with("{\".\",") {
+            failures.push(format!(
+                "{description}: unexpected probe output {:?}",
+                stdout(&rust)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
