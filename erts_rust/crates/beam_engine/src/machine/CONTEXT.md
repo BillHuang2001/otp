@@ -10,8 +10,10 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `mod.rs` — `Machine` (x-register file, float-register (FR) file of `Eterm` term slots, Erlang stack,
   call frames, exception catch frames, literal area, module-context registry, the **raise-time snapshot**
   `raise_snapshot: Vec<(u32, u32, u32)>` — the pre-unwind `(context, func, pc)` chain, the engine's
-  replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate,
-  reduction counter); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
+  replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate, reduction counter,
+  and the **in-machine BIF-dispatch gate** `bif_in_machine_on` — the cached
+  `ExecutionContext::wants_bif_in_machine` answer, latched once per run by `Machine::drive` **and** by the
+  native baseline tier's driver, read by `Machine::dispatch_bif_call`); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
   (`stack_mut`, `with_roots` handing over the whole `RootSet`, and `alloc_rooted` — the convenience
   wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
@@ -57,7 +59,10 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   non-allocating loop reaches; read back through `Machine::reductions()`/`reset_reductions()`). The charge precedes
   the body (C's `DISPATCH` order), so an `Err` from the hook pre-empts the instruction **without applying it**: the
   machine is left parked at that `(func, pc)` — recorded by `Machine::set_current_code` before the charge — and a
-  `Machine::resume_outcome` there applies it exactly once. It then re-binds the
+  `Machine::resume_outcome` there applies it exactly once. It also latches the **in-machine BIF-dispatch gate**
+  (`bif_in_machine_on`, the cached `ExecutionContext::wants_bif_in_machine` answer) so every BIF dispatch in the run
+  goes through the single `Machine::dispatch_bif_call` funnel, and threads the run's **entry module** (context `0`)
+  down to it via `step_instruction_with_entry` — the same latch the native baseline tier's driver performs. It then re-binds the
   literal area exactly on a `Step::Enter` into a different context. It also runs the raise funnel's second half
   (`Machine::with_uncaught_frames`) over a raise that surfaced inside a cross-module callee — the driver is where
   the run's true entry module is known, so those caller frames are named against the right module.

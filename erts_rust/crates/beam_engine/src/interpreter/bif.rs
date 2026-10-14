@@ -270,7 +270,9 @@ impl Machine {
     /// Dispatch a BIF through the host, taking the **in-machine** door when the
     /// host asked for it ([`ExecutionContext::wants_bif_in_machine`](crate::context::ExecutionContext::wants_bif_in_machine),
     /// latched into [`Machine::bif_in_machine_on`](crate::machine::Machine) once per
-    /// run by [`Machine::drive`](crate::machine::Machine::drive)).
+    /// run by whichever driver owns the run — [`Machine::drive`](crate::machine::Machine::drive)
+    /// for the interpreter and the native baseline tier's own driver for
+    /// [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit)).
     ///
     /// This is the **single** BIF-dispatch funnel the engine's marshalling helpers
     /// call, so the two doors can never drift:

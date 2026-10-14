@@ -336,7 +336,10 @@ pub struct Machine {
     /// extra vtable crossing.
     ///
     /// Latched at a run/resume entry exactly like [`Machine::trace_on`]/
-    /// [`Machine::reduce_on`], and [`Machine::reset`](crate::machine::Machine::reset)
+    /// [`Machine::reduce_on`] — by [`Machine::drive`](crate::machine::Machine) for the
+    /// interpreter **and** by the native baseline tier's own driver for
+    /// [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit), so the door is taken on
+    /// every tier — and [`Machine::reset`](crate::machine::Machine::reset)
     /// leaves it `false`, so a run that never latches it (e.g. a direct
     /// `Machine::step_instruction` call in a test) cannot leak a stale value from an
     /// earlier run.

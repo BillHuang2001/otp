@@ -80,6 +80,14 @@ impl Machine {
     /// single `bool` load and no event is ever built. See the `Machine::trace_on`
     /// field docs for the mid-run semantics.
     ///
+    /// And latches the **in-machine BIF-dispatch gate**
+    /// ([`Machine::bif_in_machine_on`], the cached
+    /// [`ExecutionContext::wants_bif_in_machine`] answer) so every BIF dispatch in the
+    /// run funnels through [`Machine::dispatch_bif_call`] and the host either sees the
+    /// live machine on each one or keeps the plain `call_bif` path. The native
+    /// baseline tier's own driver latches the same gate, so the door behaves
+    /// identically on both tiers.
+    ///
     /// And charges **one reduction per interpreted instruction, before the
     /// instruction's effect**: the slice's count starts at zero here and is read
     /// back through [`Machine::reductions`], while each charge is also offered to

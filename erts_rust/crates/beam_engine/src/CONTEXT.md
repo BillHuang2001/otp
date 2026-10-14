@@ -41,7 +41,20 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   **driver round-trip by design**. Because cross-module landing works, a raise inside a cross-module
   callee (`gen:call`'s `exit(noproc)` inside `gen_server:call/3`'s `catch`, say) is caught and
   unwound exactly as the oracle does; the reason a caller then sees is whatever the callee's own
-  wrapper built (a compound term, carried out in the `Raise` live-reason slot, never reshaped).- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
+  wrapper built (a compound term, carried out in the `Raise` live-reason slot, never reshaped).
+- **The in-machine BIF-dispatch door is latched by BOTH drivers.** `ExecutionContext`'s
+  `wants_bif_in_machine()` probe (default `false`) is latched once per run into `Machine::bif_in_machine_on`
+  — by `Machine::drive` (`machine/drive.rs`) **and** by the native baseline tier's own driver
+  (`jit/baseline/mod.rs`; its deopt helper reaches the same funnel via `jit_step_one` →
+  `step_instruction_with_entry`). Every BIF dispatch funnels through `Machine::dispatch_bif_call`
+  (`interpreter/bif.rs`), which takes `ctx.call_bif_in_machine(self, entry_module, …)` when the gate is set
+  and `ctx.call_bif(…)` otherwise; a host that opts in must be reached on **every** tier, so keep the two
+  drivers latching the same answer (`tests/bif_in_machine.rs` is the tier-parity gate). The run's **entry
+  module** (context `0`, the module `Machine::current_stacktrace`'s `module` parameter expects for a
+  context-0 frame) is threaded from the driver through `step_instruction_with_entry` → `exec_bif` /
+  `call_bif_named` / `dispatch_wide` / `families::dispatch` → `dispatch_bif_call`, and on the native tier
+  through `JitRuntime.entry_module` (a field generated code never reads).
+- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
   `// SAFETY:` rationale, plus the modules carrying a module-local `#![allow(unsafe_code)]` under
   the crate-wide deny (`context.rs` — the `MinimalContext` region heap is the crate's raw
   `beam_alloc::ReservedHeap` bump seam — `families/bitstrings/raw.rs`, `families/records/raw.rs`,
@@ -50,7 +63,8 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `context.rs` → the `ExecutionContext` / `Mailbox` seams, `RootSet`, `MinimalContext` (incl. its
+- `context.rs` → the `ExecutionContext` / `Mailbox` seams (`call_bif` + the defaulted in-machine twin
+  `call_bif_in_machine` behind the `wants_bif_in_machine` probe), `RootSet`, `MinimalContext` (incl. its
   `ContextHeap` — a pointer-stable region heap over `beam_alloc::ReservedHeap`: ~4 MiB is reserved up
   front and **grown in place** as terms are built, so an allocation costs its payload only; on
   reservation exhaustion a fresh, larger region starts and **every earlier region is kept alive**, so a
@@ -84,9 +98,11 @@ state each holds in a Rust local across the call:
   call, so a move in the seam would dangle both.
 - `ExecutionContext::apply_fun` (`:355`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
   here is the host's `with_relocation_exempt`, not publication.
-- `ExecutionContext::call_bif` — the marshalled arguments live in the `EMPTY_ARGS` stack array
-  (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch` (`machine/mod.rs:254`); **neither is
-  in any `RootSet`**.
+- `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments live in the
+  `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch`
+  (`machine/mod.rs:254`); **neither is in any `RootSet`**. The in-machine twin
+  (`ExecutionContext::call_bif_in_machine`, reached through the single `Machine::dispatch_bif_call`
+  funnel) carries the same arguments and the same constraint.
 
 **Verified: no admission point can intervene on the `call_fun`/`call_fun2` path with the shipped host.**
 `BudgetContext::resolve_local_fun` (`beam_rt/src/runner/budget.rs:220`) forwards **without** arming, and

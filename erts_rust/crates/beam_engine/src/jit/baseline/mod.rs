@@ -862,6 +862,15 @@ fn drive(
     // deopt path's `step_instruction` reads the plain `bool`, so this single call
     // replaces a vtable call per call/return instruction.
     machine.trace_on = false;
+    // Latch the per-run in-machine BIF-dispatch gate too (see the
+    // `Machine::bif_in_machine_on` field docs). The native tier's deopt helper reaches
+    // the same BIF-dispatch funnel the interpreter does (`jit_step_one` →
+    // `step_instruction_with_entry` → `Machine::dispatch_bif_call`), so it must latch
+    // the same answer `Machine::drive` does — otherwise a host that opts in would be
+    // handed the live machine on one tier and silently bypassed on the other. The
+    // default `false` keeps the plain `call_bif` path byte-identical. (The traced early
+    // return above delegates to `Machine::drive`, which latches the gate itself.)
+    machine.bif_in_machine_on = ctx.wants_bif_in_machine();
     // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.

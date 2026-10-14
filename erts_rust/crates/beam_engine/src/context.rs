@@ -45,7 +45,22 @@
 //! registers, the whole Erlang stack and the whole FR file) and defaulting to
 //! [`alloc_words`] with the roots discarded, so **every existing implementor
 //! compiles and behaves byte-identically**. [`crate::machine::Machine::alloc_rooted`]
-//! is where the engine's own slices are handed over.//!
+//! is where the engine's own slices are handed over.
+//!
+//! ## The in-machine BIF-dispatch door
+//!
+//! [`call_bif`] hands a host only the `module`/`function`/`arity`/`args` of a BIF,
+//! never the process it is running in — so an implementation cannot read the
+//! caller's execution state (the shape `erlang:process_info(self(),
+//! current_stacktrace)` needs). [`wants_bif_in_machine`] + [`call_bif_in_machine`]
+//! close that gap: a host that returns `true` from the probe is handed the live
+//! [`Machine`] and the run's **entry module** on every BIF dispatch. The probe is
+//! latched once per run by **both** the interpreters' driver
+//! ([`crate::machine::Machine::drive`]) and the native baseline tier's, and every
+//! BIF dispatch funnels through [`crate::machine::Machine::dispatch_bif_call`], so
+//! the door behaves identically on every execution tier. The default `false` keeps
+//! the plain [`call_bif`] path byte-identical.
+//!
 //! ## The mailbox / message-receive seam
 //!
 //! The `receive` opcode family ([`crate::families::receive`]) never looks at a
@@ -84,6 +99,9 @@
 //! [`alloc_words`]: ExecutionContext::alloc_words
 //! [`apply`]: ExecutionContext::apply
 //! [`apply_fun`]: ExecutionContext::apply_fun
+//! [`call_bif`]: ExecutionContext::call_bif
+//! [`wants_bif_in_machine`]: ExecutionContext::wants_bif_in_machine
+//! [`call_bif_in_machine`]: ExecutionContext::call_bif_in_machine
 //!
 //! # `unsafe`
 //!
@@ -327,11 +345,18 @@ pub trait ExecutionContext {
     /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine): the engine
     /// then calls **only** that method, never [`call_bif`](ExecutionContext::call_bif).
     ///
-    /// The answer is latched **once per run** by
-    /// [`Machine::drive`](crate::machine::Machine::drive), exactly like
-    /// [`wants_reduce`](ExecutionContext::wants_reduce), so a host that leaves the
-    /// default `false` keeps the plain `call_bif` path **byte-identical** and pays a
-    /// single `bool` load per dispatch instead of an extra vtable crossing.
+    /// The answer is latched **once per run** by the driver that owns the run —
+    /// [`Machine::drive`](crate::machine::Machine::drive) for the interpreter and
+    /// the native baseline tier's own driver for
+    /// [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit) — exactly like
+    /// [`wants_reduce`](ExecutionContext::wants_reduce), so the door is taken on
+    /// **both execution tiers** and a host that leaves the default `false` keeps the
+    /// plain `call_bif` path **byte-identical** and pays a single `bool` load per
+    /// dispatch instead of an extra vtable crossing.
+    ///
+    /// The seam is a **read-only** borrow of the machine and involves no `unsafe`:
+    /// the host can inspect the process state, and the engine's own state machine is
+    /// untouched by the call.
     fn wants_bif_in_machine(&self) -> bool {
         false
     }
@@ -364,6 +389,13 @@ pub trait ExecutionContext {
     /// so a host calls, e.g.,
     /// `machine.current_stacktrace(entry_module, self)`.
     ///
+    /// Is called on **both execution tiers**: the interpreter's dispatch loop and
+    /// the native baseline tier's deopt helper both reach the single BIF-dispatch
+    /// funnel ([`Machine::dispatch_bif_call`](crate::machine::Machine)), so the same
+    /// module/context is handed the live machine whichever tier it runs on. The
+    /// machine is borrowed read-only — there is no `unsafe` here, and neither the
+    /// host's call nor the engine's state machine is affected by the inspection.
+    ///
     /// The default body discards the two extra arguments and forwards to
     /// [`call_bif`](ExecutionContext::call_bif), so **every existing implementor
     /// compiles and behaves byte-identically**.
@@ -378,7 +410,9 @@ pub trait ExecutionContext {
     ) -> Result<Eterm> {
         let _ = (machine, entry_module);
         self.call_bif(module, function, arity, args)
-    }    /// Ensure `heap_need` heap words are available (for `test_heap`/
+    }
+
+    /// Ensure `heap_need` heap words are available (for `test_heap`/
     /// `allocate_heap`).
     ///
     /// The live root set is `x_regs[0..live)` plus the whole `stack`. A real context
