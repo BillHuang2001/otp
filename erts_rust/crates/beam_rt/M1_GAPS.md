@@ -252,15 +252,16 @@ the differential corpus is byte-identical); a live-peer loop past the handshake 
 `send_after/3` answers a `#Ref<>`; `cancel_timer(Pending)` the remaining ms,
 `cancel_timer(Fired|Cancelled|unknown-ref)` `false`, `cancel_timer(non-ref)`/a bad time or destination
 `badarg`. `send_after/3`/`cancel_timer/1` are **native-floor** capabilities; `send_after/4`,
-`cancel_timer/2`, `start_timer/3,4` (`{abs, false}`; `{abs, true}` is the typed gap),
+`cancel_timer/2`, `start_timer/3,4` (both the relative form and the `{abs, true}` absolute-time form,
+whose delay is computed from the registered `erlang:monotonic_time/0` against the oracle's
+`start_time`/`end_time` millisecond window),
 `function_exported/3`, `link/1`/`unlink/1` and `os:set_signal/2` come from the `RuntimeHooksBridge`.
 Unimplemented: `erlang:system_info/2`, `read_timer/1,2`, and the roster keys this bridge does not serve
 (`delete_module/1`/`purge_module/2`, `port_get_data/1`/`port_set_data/2`, `term_to_iovec/1,2`,
 `erlang:is_builtin/3`, `bump_reductions/1`, `loaded/0`, …); each is the typed `unsupported` gap.
-`timer:apply_after/4` is a further consumer: the oracle prints `false`, exit 0, while `beam_rt`'s `-eval`
-prints nothing and exits 1 — the `-eval` route runs no boot script, so `kernel_sup`/`timer_server` do not
-exist and `supervisor:start_child(kernel_sup, …)` raises an uncaught `{noproc,…}` (a stop-independent
-failure, not the boot-script path) — raw evidence in *Cross-node handoff detail* below.
+`timer:apply_after/4` schedules through the booted `timer_server` (a `kernel_sup` child started on demand
+through `timer:do_start/0`) with the `{abs, true}` timer arm, so `is_reference(timer:apply_after(50,erlang,self,[]))`
+prints `false` on both runtimes with exit 0 (the call returns `{ok,Ref}`).
 
 ## Memory and statistics
 `erlang:memory/0,1` (the `MemoryHook` seam) is adopted: `RuntimeMemory` (`src/context/memory_hook.rs`)
