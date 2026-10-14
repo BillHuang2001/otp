@@ -461,6 +461,109 @@ fn raise_bifs_set_the_class_and_public_builders_agree() {
     }
 }
 
+/// `erlang:raise/3` (`raise_3`, `bif.c:1549-1696`): a **non-atom** reason is
+/// raised as the argument term itself (carried in the opaque
+/// `Raise::live_reason` slot), while an invalid argument shape is **returned** as
+/// the atom `badarg` — never raised.
+///
+/// Every expectation below is pinned against the OTP 29 oracle (`erl -noshell
+/// -eval`, erts-17.1), which needs `try F() of X -> {returned,X} catch C:R ->
+/// {raised,C,R} end` — a bare `catch` cannot observe the *returned* atom.
+#[test]
+fn raise_three_matches_the_oracle_reason_and_badarg_shapes() {
+    let reg = default_registry();
+    let mut heap = Heap::new(512).expect("test heap");
+    let mut atoms = seeded_atoms();
+    atoms.seed(["error", "exit", "throw", "badarg", "x"]);
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let error = ctx.atom("error").expect("seeded");
+    let exit = ctx.atom("exit").expect("seeded");
+    let throw = ctx.atom("throw").expect("seeded");
+    let badarg = ctx.atom("badarg").expect("seeded");
+    let normal = ctx.atom("normal").expect("seeded");
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let x = ctx.atom("x").expect("seeded");
+    let shutdown = ctx.atom("shutdown").expect("seeded");
+    let foo = ctx.atom("foo").expect("seeded");
+    let empty = ctx.list(&[]).expect("fits");
+
+    // Oracle: raise(error,{a,b},[])         => error:{a,b}
+    //         raise(exit,{shutdown,x},[])   => exit:{shutdown,x}
+    //         raise(throw,{a},[])           => throw:{a}
+    //         raise(error,42,[])            => error:42
+    let pair = ctx.tuple(&[a, b]).expect("fits");
+    assert_structured(
+        reg.call("erlang", "raise", 3, &mut ctx, &[error, pair, empty]),
+        &ctx,
+        ExceptionClass::Error,
+        pair,
+    );
+    let shutdown_pair = ctx.tuple(&[shutdown, x]).expect("fits");
+    assert_structured(
+        reg.call("erlang", "raise", 3, &mut ctx, &[exit, shutdown_pair, empty]),
+        &ctx,
+        ExceptionClass::Exit,
+        shutdown_pair,
+    );
+    let single = ctx.tuple(&[a]).expect("fits");
+    assert_structured(
+        reg.call("erlang", "raise", 3, &mut ctx, &[throw, single, empty]),
+        &ctx,
+        ExceptionClass::Throw,
+        single,
+    );
+    assert_structured(
+        reg.call("erlang", "raise", 3, &mut ctx, &[error, make_small(42), empty]),
+        &ctx,
+        ExceptionClass::Error,
+        make_small(42),
+    );
+
+    // An **atom** reason keeps its exact `ExitReason` and carries **no** live slot:
+    // raise(error,foo,[]) => error:foo and raise(exit,normal,[]) => exit:normal.
+    assert_eq!(
+        raise_of(reg.call("erlang", "raise", 3, &mut ctx, &[error, foo, empty])),
+        (ExceptionClass::Error, ExitReason::atom("foo"))
+    );
+    assert_eq!(
+        live_reason_of(reg.call("erlang", "raise", 3, &mut ctx, &[error, foo, empty])),
+        None
+    );
+    assert_eq!(
+        raise_of(reg.call("erlang", "raise", 3, &mut ctx, &[exit, normal, empty])),
+        (ExceptionClass::Exit, ExitReason::Normal)
+    );
+    assert_eq!(
+        live_reason_of(reg.call("erlang", "raise", 3, &mut ctx, &[exit, normal, empty])),
+        None
+    );
+
+    // An unknown class atom or a non-atom class is the **returned** atom `badarg`
+    // (`bif.c:1694-1695` ends every failure path in `return am_badarg`).
+    // Oracle: raise(foo,foo,[]) => {returned,badarg}; raise(1,foo,[]) => {returned,badarg}.
+    for args in [[foo, foo, empty], [make_small(1), foo, empty]] {
+        assert_eq!(
+            reg.call("erlang", "raise", 3, &mut ctx, &args).expect("the badarg atom is returned"),
+            badarg,
+            "raise/3 {args:?}"
+        );
+    }
+    // A stacktrace that is not a proper list of valid frames is `badarg` too.
+    // Oracle: raise(error,foo,[42]) => {returned,badarg}; raise(error,foo,42) => the same.
+    // (`[]` is a valid, empty stacktrace and raises normally.)
+    let bad_frame = ctx.list(&[make_small(42)]).expect("fits");
+    for trace in [bad_frame, make_small(42)] {
+        assert_eq!(
+            reg.call("erlang", "raise", 3, &mut ctx, &[error, foo, trace])
+                .expect("the badarg atom is returned"),
+            badarg,
+            "stacktrace {trace:?}"
+        );
+    }
+}
+
 #[test]
 fn reason_mapping_round_trips() {
     let mut atoms = seeded_atoms();
