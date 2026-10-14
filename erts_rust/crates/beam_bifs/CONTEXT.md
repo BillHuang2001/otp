@@ -618,8 +618,11 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - **The `erl_ddll` registry is a *separate* table from `beam_rt`'s port driver registry**
   (`../beam_rt/src/port/driver.rs`), so a driver loaded via `erl_ddll:try_load/3` is invisible to
   `open_port({spawn_driver, Name})` and vice versa; unifying the two is the `beam_rt`-side handoff.
-- **`beam_rt`'s `-eval` path serves `erlang:raise/3` itself**, which masks the (now-fixed) reason handling on that
-  route but not from compiled callers.
+- **`beam_rt`'s `-eval` path serves `erlang:raise/3` itself** (`../beam_rt/src/eval/mod.rs`), which masks the reason
+  handling on that route but not from compiled callers; that arm also **drops the 3rd argument** — it neither
+  decodes the trace (`Raise::with_stacktrace`) nor runs the `is_stacktrace` validity check, so `-eval`'s
+  `raise(_, _, Traces)` never carries frames and never returns the `badarg` atom. Forwarding the trace from
+  `-eval` is the `beam_rt`-side handoff; the registry path (compiled callers) is complete.
 ### Requested from siblings
 - **`beam_ets` — interior statistics for `ets:info(T, stats)`.** `TableInfo` has no per-table counters
   (inserts/lookups/deletes), so `ets:info/2`'s `stats` item is the typed gap; an additive `TableInfo::stats()` (or
