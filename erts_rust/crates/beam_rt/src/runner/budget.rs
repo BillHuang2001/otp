@@ -31,12 +31,14 @@
 //!
 //! Every other [`ExecutionContext`] method — BIF/apply dispatch, the heap, the whole
 //! receive/message seam, the cross-module-call seam
-//! ([`resolve_external_call`](ExecutionContext::resolve_external_call)) **and the
+//! ([`resolve_external_call`](ExecutionContext::resolve_external_call)), the local-call seam
+//! ([`resolve_local_call`](ExecutionContext::resolve_local_call)) **and the
 //! execution-trace seam** ([`trace_enabled`](ExecutionContext::trace_enabled) /
 //! [`trace_event`](ExecutionContext::trace_event)) — is forwarded to the slice's real
 //! [`RuntimeContext`] unchanged, so a scheduled process reports `call`/`return_from`/
-//! `return_to` events exactly as the single-pass `Runtime::run_*` path does and a
-//! `call_ext*` the host can run in-machine is entered in this very slice.
+//! `return_to` events exactly as the single-pass `Runtime::run_*` path does, a
+//! `call_ext*` the host can run in-machine is entered in this very slice, and a local call the
+//! host serves as a BIF (a `prim_tty` NIF stub) is dispatched rather than jumped into.
 //!
 //! # Why charging the per-instruction hook is safe
 //!
@@ -258,6 +260,24 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         args: &[Eterm],
     ) -> Result<Option<(Arc<Module>, Label)>> {
         ExecutionContext::resolve_local_fun(self.inner, fun, args)
+    }
+
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine's three local-call arms
+    /// (`Call`/`CallOnly`/`CallLast`) and the native baseline tier's `jit_local_call` probe
+    /// consult the local-call seam here: without the forward they would see the trait default
+    /// (`Ok(false)`), always decline, and jump **in-machine** into a non-exported same-module
+    /// callee's own code — which for a built-in/static NIF library stub such as
+    /// `prim_tty:tty_create/1` (body `erlang:nif_error(undef)`) raises `undef` instead of
+    /// reaching the host that serves it. Forwarding reaches
+    /// [`RuntimeContext`]'s own override (`crate::native::prim_tty::serves_local_call`), so the
+    /// served key is dispatched through [`call_bif`](ExecutionContext::call_bif) under the arm's
+    /// frame discipline and every other key stays the unchanged in-machine jump.
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        ExecutionContext::resolve_local_call(self.inner, module, function, arity)
     }
 
     /// Charge one reduction, then serve the request by delegating — **arming the GC latch**

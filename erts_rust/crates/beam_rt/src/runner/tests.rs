@@ -37,7 +37,7 @@ use beam_process::{
 };
 use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm, NIL};
 
-use super::budget::BudgetProbe;
+use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
@@ -187,6 +187,61 @@ fn a_budget_allows_exactly_its_units_then_refuses() {
     assert!(is_preemption(&error), "{error}");
     assert!(probe.is_exhausted());
     assert_eq!(probe.used(), N, "the refusal charges nothing");
+}
+
+/// **The slice wrapper is transparent for the local-call seam.**
+///
+/// `BudgetContext` is the `ExecutionContext` a scheduled slice's machine runs on, so the
+/// engine's three local-call arms (`Call`/`CallOnly`/`CallLast`) and the native baseline tier's
+/// `jit_local_call` probe consult **it**, never the wrapped `RuntimeContext`. Without the
+/// forward the trait's default `Ok(false)` applies: every local call is declined and jumps
+/// in-machine into the callee's own code, so a built-in/static NIF library stub
+/// (`prim_tty:tty_create/1`, body `erlang:nif_error(undef)`) raises `undef` instead of reaching
+/// the host that serves it — the boot-blocking `standard_error` death.
+///
+/// The seam is driven through the wrapper and every answer is cross-checked against the bare
+/// inner context, so this pins the **forward** (a served key stays served, an unserved one
+/// stays declined) rather than a constant: dropping the forward flips the served key from
+/// `true` to the default `false` and fails the assertion.
+#[test]
+fn the_slice_wrapper_forwards_the_local_call_seam() {
+    let mut rt = runtime();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+
+    // A key the runtime really serves (a `prim_tty` NIF stub) and one it must decline.
+    let served = crate::native::prim_tty::LIBRARY;
+    let unserved = "lists";
+
+    // The bare context's own answers — the ground truth the wrapper must reproduce.
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    let inner_served =
+        beam_engine::ExecutionContext::resolve_local_call(&mut ctx, served, "tty_create", 1)
+            .expect("the seam answers");
+    let inner_unserved =
+        beam_engine::ExecutionContext::resolve_local_call(&mut ctx, unserved, "reverse", 1)
+            .expect("the seam answers");
+    assert!(inner_served, "the runtime serves prim_tty:tty_create/1");
+    assert!(!inner_unserved, "the runtime declines lists:reverse/1");
+
+    // The same two keys through the slice wrapper: identical answers.
+    let mut probe = BudgetProbe::new(1_000);
+    let mut budget_ctx = BudgetContext {
+        inner: &mut ctx,
+        probe: &mut probe,
+    };
+    assert_eq!(
+        beam_engine::ExecutionContext::resolve_local_call(&mut budget_ctx, served, "tty_create", 1)
+            .expect("the seam answers"),
+        inner_served,
+        "the wrapper must forward the served key, not fall back to the `Ok(false)` default"
+    );
+    assert_eq!(
+        beam_engine::ExecutionContext::resolve_local_call(&mut budget_ctx, unserved, "reverse", 1)
+            .expect("the seam answers"),
+        inner_unserved,
+        "the wrapper must forward the declined key"
+    );
 }
 
 /// A scheduled export runs to completion through the runner's **tier-aware** first-entry
