@@ -22,14 +22,20 @@
 //!
 //! `erlang:process_info/2`'s four execution-position items — `current_function`,
 //! `initial_call`, `current_location` and `current_stacktrace` — describe *where a
-//! process is*. They are read from a process's saved instruction pointer, which means
-//! they can only be answered for a process this runtime has an engine for, and only from
-//! a second process: a scheduler pass takes the *running* process's machine out of the
-//! runner state, so a process asking about **itself** is the honest capability gap.
+//! process is*. From outside they are read from a process's saved instruction pointer, so
 //! [`beam_engine`]'s `Machine::current_*` accessors and `beam_rt`'s `src/native/memory`
-//! item classification have their own unit tests; this test pins the whole path end to end:
-//! a real `.beam` is spawned as a process, it parks in a `receive`, a **second** process
-//! probes it, and the returned term is compared line for line against the live system `erl`
+//! item classification answer them for a process this runtime has an engine for, probed by
+//! a **second** process. A process asking about **itself** is the harder shape: a scheduler
+//! pass takes the *running* process's machine out of the runner state for the whole slice,
+//! so the runtime state alone cannot name it — the engine therefore hands that live
+//! `beam_engine::Machine` to the **in-machine BIF door** ([`beam_rt::context::position`])
+//! while a BIF runs, and the caller's own position is read from there. That door is open
+//! only on the compiled-code path (a `Machine` dispatch); a library caller reaching
+//! `ExecutionContext::call_bif` without one still gets the honest capability gap.
+//! This test pins the whole path end to end on **both** shapes: a real `.beam` is spawned as
+//! a process, it parks in a `receive`, a **second** process probes it; and a `recv.erl`
+//! function queries its **own** position from inside a scheduled process and reports the
+//! answer back. Both answers are compared line for line against the live system `erl`
 //! oracle.
 //!
 //! Oracle ground truth (system `erl`, OTP 29 / `erts-17.1`; `recv.erl` compiled with the
@@ -48,6 +54,19 @@
 //!  {current_location,{recv,wait,0,[{file,"recv.erl"},{line,12}]}},
 //!  {current_stacktrace,[{recv,wait,0,[{file,"recv.erl"},{line,12}]}]}]
 //! ```
+//!
+//! The self-query oracle uses the same fixture: `recv:main/0` is `probe_b(self())`, run
+//! inside the scheduled [`pos_self`] fixture's `go/1` (see [`ORACLE_SELF_PROBE`]).
+//!
+//! ## Honest divergences of the self-query (recorded, not papered over)
+//!
+//! * `initial_call` from the machine is the process's **entry MFA**. The oracle reports
+//!   `{erlang,apply,2}` for some spawn shapes (a fun-valued spawn, a start instruction);
+//!   the scheduled-export shape this test uses has the oracle report the entry MFA too, so
+//!   the two agree there, but the shapes do not cover every oracle answer.
+//! * A **nested** fun-applied run started inside the published window reads the **outer**
+//!   machine's position for that pid: the slot is runtime-wide, not per-`RuntimeContext`,
+//!   so a machine the nested run replaces is what answers.
 //!
 //! The fixture (`tests/fixtures/recv.erl`) is compiled **at test time** with the system
 //! `erlc`, so nothing path-dependent is committed; a missing `erl`/`erlc` is a **loud**
@@ -497,10 +516,11 @@ fn a_parked_process_reports_the_oracles_execution_position() {
 ///
 /// The answer is `{recv,probe_b,1}` for `current_function`, `{pos_self,go,1}` for
 /// `initial_call`, `{recv,probe_b,1,[{file,"recv.erl"},{line,18}]}` for `current_location`
-/// and `[{recv,probe_b,1,[{file,"recv.erl"},{line,18}]},
-/// {pos_self,go,1,[{file,"pos_self.erl"},{line,3}]}]` for `current_stacktrace` (the
-/// `recv:main/0` frame is elided by its tail call into `probe_b/1`, exactly as the oracle
-/// elides it).
+/// and, for `current_stacktrace`, two frames whose head is
+/// `{recv,probe_b,1,[{file,"recv.erl"},{line,18}]}` and whose second is the caller
+/// `{pos_self,go,1,[{file,"pos_self.erl"},{line,24}]}` (the `recv:main/0` frame is elided by
+/// its tail call into `probe_b/1`, exactly as the oracle elides it; the comparison is over
+/// the frame count and the head frame, see [`canonical`]).
 #[test]
 fn a_self_query_in_compiled_code_answers_the_oracles_execution_position() {
     let Some((fixture, oracle, _erlc)) = build_fixture("self") else {

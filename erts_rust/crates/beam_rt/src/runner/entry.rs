@@ -285,6 +285,11 @@ impl RunnerState {
     ///
     /// `None` for everything [`RunnerState::engine_at`] declines plus a fun entry whose
     /// target is still unresolved (it has not run yet, so nothing can name its module).
+    ///
+    /// The process whose machine a scheduler pass is *currently executing* is absent from
+    /// this map for the whole slice, exactly as in [`RunnerState::engine_at`]; its **own**
+    /// `erlang:process_info/1,2` query is answered instead through the in-machine BIF door
+    /// ([`crate::context::position`]), which the engine feeds the live machine.
     pub(crate) fn position_engine_at(&self, pid: ProcessId) -> Option<(&Module, &Machine, bool)> {
         let engine = self.engines.get(&pid)?;
         match &engine.entry {

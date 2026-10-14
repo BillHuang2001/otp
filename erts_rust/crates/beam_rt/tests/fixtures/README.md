@@ -127,6 +127,63 @@ erl -noshell -eval 'ok = erl_ddll:load_driver(os:getenv("TMPDIR"), "event"),
 so `ready_input`'s byte is `<<"R">>`, `timeout`'s is `<<"T">>`, and the runtime's own answer is
 asserted against exactly that pair.
 
+## Execution-position fixtures (`recv.erl` / `pos_self.erl`, never committed — compiled at test time)
+
+`tests/position.rs` (contract A.8, `erlang:process_info/1,2`'s execution-position items: the
+in-machine BIF door) drives two shapes through these sources. Both are compiled at test time by the
+system `erlc` **with the scratch directory as cwd and the bare file names as arguments**, so the
+name recorded in each `.beam`'s `Line` chunk is exactly `"recv.erl"` / `"pos_self.erl"` — which is
+what the oracle reports in `current_location`/`current_stacktrace` (an absolute or repo-relative
+argument would record *that* string instead and the two would disagree):
+
+* `recv.erl` is the **probed-process** fixture. `wait/0`'s clause head sits on **line 12** so a
+  process parked in its `receive` reports the oracle's `{line,12}`; `probe_b/1` reads the four
+  items of a parked process (`current_function`, `initial_call`, `current_location`,
+  `current_stacktrace`) in that order; `main/0` is `probe_b(self())` — the **self** query, asking
+  for the position of the process *running it* (the shape a scheduler pass cannot answer from its
+  runner state, because the executing process's machine is taken out of it for the whole slice —
+  hence the in-machine door).
+* `pos_self.erl` is the **self-query driver**: `go/1` runs `recv:main/0` inside the *scheduled*
+  process and sends `{result, R}` to the parent it is given; `sink/0` is the built runtime's parent
+  — it receives that report and returns it, so the test reads it back through
+  `beam_rt::Runtime::process_result`. (A spawned export process's return value is unobservable in
+  Erlang, so message passing is the only way to observe it; the oracle's parent is the `erl`
+  probe's own root process, which receives the same message.)
+
+Oracle values (verified against `erl -noshell`, erts-17.1 / OTP 29.1.1):
+
+```sh
+D=$(mktemp -d); cp recv.erl pos_self.erl "$D"; (cd "$D" && erlc recv.erl pos_self.erl)
+
+# a process parked in recv:wait/0, probed from a second process
+erl -noshell -pa "$D" -eval 'P = spawn(recv, wait, []), timer:sleep(50),
+    io:format("~p~n", [process_info(P, [current_function, initial_call,
+        current_location, current_stacktrace])]), halt(0).'
+# [{current_function,{recv,wait,0}},
+#  {initial_call,{recv,wait,0}},
+#  {current_location,{recv,wait,0,[{file,"recv.erl"},{line,12}]}},
+#  {current_stacktrace,[{recv,wait,0,[{file,"recv.erl"},{line,12}]}]}]
+
+# recv:main/0's **self** query, from compiled code
+erl -noshell -pa "$D" -eval 'Self = self(), _ = spawn(pos_self, go, [Self]),
+    R = receive {result, X} -> X end, io:format("~p~n", [R]), halt(0).'
+# [{current_function,{recv,probe_b,1}},
+#  {initial_call,{pos_self,go,1}},
+#  {current_location,{recv,probe_b,1,[{file,"recv.erl"},{line,18}]}},
+#  {current_stacktrace,[{recv,probe_b,1,[{file,"recv.erl"},{line,18}]},
+#                       {pos_self,go,1,[{file,"pos_self.erl"},{line,24}]}]}]
+```
+
+(The `recv:main/0` frame is elided by its tail call into `probe_b/1`, exactly as the oracle elides
+it; the test compares the frame **count** and the **head** frame of the stacktrace, not the second
+frame.)
+
+Documented divergences of the self-query, recorded in `tests/position.rs` and `M1_GAPS.md`: the
+machine's `initial_call` is the process's **entry MFA**, where the oracle answers
+`{erlang,apply,2}` for some spawn shapes (the scheduled-export shape above agrees); and a **nested**
+fun-applied run started inside the published window reads the **outer** machine's position for the
+same pid, because the published slot is runtime-wide rather than per-`RuntimeContext`.
+
 ## Regeneration
 
 `mailbox`, `sched`, `port_recv`, `raise_structured` and `function_clause_fixture` are compiled

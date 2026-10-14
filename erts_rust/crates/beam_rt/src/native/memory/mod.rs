@@ -45,11 +45,12 @@
 //! makes an unregistered `registered_name` the bare `[]`, which the multi-item loop treats as
 //! "no value": `erl_bif_info.c:1175`.) An item this runtime cannot answer is **omitted** —
 //! the very mechanism the C uses to drop an unregistered `registered_name` — so a process
-//! whose execution position this runtime cannot read (the caller itself, the `-eval` root
-//! process, which has no engine at all) omits the two engine-derived keys `pi_1_keys[]` asks
-//! for, reporting 15 items (registered) / 14 (unregistered) where the oracle reports 17/16;
-//! a process the runtime really scheduled and parked reports all 17 (see
-//! [`RuntimeContext::position_value`]).
+//! whose execution position this runtime cannot read omits the two engine-derived keys
+//! `pi_1_keys[]` asks for; only a process this runtime never gave a position (an
+//! unscheduled pid, a fun-bodied process with no resolved target) is such a process today
+//! (see [`RuntimeContext::position_value`]): the caller's own position **is** read from its
+//! live machine by the in-machine BIF door, and a process the runtime scheduled reports all
+//! 17.
 //!
 //! # The failure modes (verified against OTP 29.1.1 / erts-17.1)
 //!
@@ -114,16 +115,21 @@
 //!
 //! The **execution-position** items (`current_function`, `initial_call`, `current_location`,
 //! `current_stacktrace`) and `catchlevel` are therefore *conditionally* answerable rather
-//! than gaps: they are built by the engine's read-only [`Machine`](beam_engine::Machine) accessors out of the
-//! process's own entry module and engine, which is what [`RuntimeContext::position_value`] /
-//! [`RuntimeContext::catchlevel_value`] read through the [`engines`](RuntimeContext::engines)
-//! view of the runner state. They are served
-//! for a process this runtime scheduled and left parked — the case the oracle's values below
-//! are pinned against — and are omitted (`/1`) or the typed capability gap (`/2`) for a
-//! process with no readable position: the caller itself (a scheduler pass holds its machine
-//! while it runs, and the `-eval` root process has no machine at all), a fun-bodied process
-//! (its entry is a fun value: no module could name `M`/`F`), and any pid this runtime never
-//! scheduled.
+//! than gaps: they are built by the engine's read-only [`Machine`](beam_engine::Machine)
+//! accessors out of the process's own entry module and engine, which is what
+//! [`RuntimeContext::position_value`] / [`RuntimeContext::catchlevel_value`] read — through
+//! the [`engines`](RuntimeContext::engines) view of the runner state for *another* process,
+//! and through the **live machine** of the executing process for the caller's own
+//! `erlang:process_info/1,2` dispatched from **compiled code** (the in-machine BIF door,
+//! [`crate::context::position`]; the scheduler takes the executing process's machine *out*
+//! of the runner state for the whole slice, so no other source could name it). They are
+//! served for a process this runtime scheduled — parked (the case the oracle's values below
+//! are pinned against) or, for the caller itself, executing — and are omitted (`/1`) or the
+//! typed capability gap (`/2`) for a process with no readable position: a **fun-bodied**
+//! process whose local target is unresolved (its entry is a fun value: no module could name
+//! `M`/`F`), any pid this runtime never scheduled, and a **direct/no-machine** caller (a
+//! library or `-eval` caller that reaches `call_bif` without a `Machine`, so no door is
+//! open).
 //!
 //! ## `trace`
 //!
@@ -625,8 +631,10 @@ impl RuntimeContext<'_> {
     /// The reason names the item *and* the exact missing accessor/hook behind it (from
     /// [`UNSUPPORTED_ITEM_REASONS`]) so a gap is never a vague placeholder. `catchlevel` and
     /// the four execution-position items share the one *conditional* reason: they are served
-    /// from the process's engine, which this runtime does not hold for the caller, a
-    /// fun-bodied process or an unscheduled pid.
+    /// from the process's engine — the runner state's view, or the executing process's own
+    /// live machine through the in-machine BIF door — and this runtime holds neither for a
+    /// fun-bodied process with no resolved target, an unscheduled pid, or a direct/no-machine
+    /// caller.
     fn unsupported_item(&self, item: &Item) -> BeamError {
         match item {
             Item::Atom(name)
@@ -634,7 +642,8 @@ impl RuntimeContext<'_> {
             {
                 crate::error::unsupported(&format!(
                     "process_info: {name} (this runtime holds no engine for that process: it is \
-                     the caller, a fun-bodied process or an unscheduled pid)"
+                     a fun-bodied process with no resolved target, an unscheduled pid, or a \
+                     direct/no-machine caller)"
                 ))
             }
             Item::Atom(name) => {
@@ -652,20 +661,26 @@ impl RuntimeContext<'_> {
     /// The value of one **execution-position** item — where the process is executing.
     ///
     /// The terms come from [`Machine`](beam_engine::Machine)'s read-only accessors (`beam_engine`), the only
-    /// builders of those shapes; the module whose `M`/`F`/`A` atoms a position resolves in
-    /// is the process's **entry** module, and the engines of the current scheduler pass
-    /// (else the runtime's own) are what
+    /// builders of those shapes. Three sources answer, in this order: the runtime's **root
+    /// execution frame** for the runtime's own `-eval`/`-s`/`-run` process
+    /// ([`Self::root_frame_value`]); the **in-machine door**'s published slot for the
+    /// executing process's **own** query ([`crate::context::position`] — the scheduler takes
+    /// that machine *out* of the runner state for the whole slice, so this is the only source
+    /// that can name it); then the runner state's view, where the module whose `M`/`F`/`A`
+    /// atoms a position resolves in is the process's **entry** module and the engines of the
+    /// current scheduler pass (else the runtime's own) are what
     /// [`RunnerState::engine_at`](crate::runner::RunnerState::engine_at) is read through.
     ///
     /// `Ok(None)` — the caller's honest "cannot answer", turned into an omission by
     /// `process_info/1` and the typed capability gap by `process_info/2` — when this runtime
-    /// holds no execution position for `pid`: it is the **caller** (a scheduler pass moves
-    /// the executing process's machine out of the runner state while it runs, and the
-    /// `-eval` root process has no machine at all), a **fun-bodied** process (its entry is a
-    /// fun value, so no module could name `M`/`F` without inventing one), or a pid this
-    /// runtime never scheduled. A position the engine cannot resolve inside a module it
-    /// *does* have (a `func` index out of range) is its own typed error, propagated as-is —
-    /// never replaced by a plausible-looking term.
+    /// holds no execution position for `pid`: it is a **fun-bodied** process whose local
+    /// target is unresolved (its entry is a fun value, so no module could name `M`/`F`
+    /// without inventing one), a pid this runtime never scheduled, or a **direct/no-machine**
+    /// caller (one that reached `call_bif` without a `Machine`, so no in-machine door is
+    /// open). The caller's own position **is** answered when it is running compiled code —
+    /// the engine hands the live `Machine` to the in-machine door above. A position the
+    /// engine cannot resolve inside a module it *does* have (a `func` index out of range) is
+    /// its own typed error, propagated as-is — never replaced by a plausible-looking term.
     fn position_value(&mut self, name: &str, pid: ProcessId) -> Result<Option<Eterm>> {
         // The runtime's **own** process, when a root action drives it (`-eval`/`-s`/`-run`):
         // the oracle answers those items from that action's own driver frame, which this
@@ -812,9 +827,10 @@ impl RuntimeContext<'_> {
     ///
     /// Conditionality matches the execution-position items: `Ok(None)` — the honest "cannot
     /// answer", an omission in `process_info/1` and the typed capability gap in
-    /// `process_info/2` — when this runtime holds no engine for `pid` (the caller itself, the
-    /// `-eval` root process, a fun-bodied process, an unscheduled pid). A missing engine is
-    /// never a fabricated `0`.
+    /// `process_info/2` — when this runtime holds no engine for `pid` (a fun-bodied process
+    /// whose local target is unresolved, an unscheduled pid, or a direct/no-machine caller).
+    /// The **executing** process's own depth is read from its live machine through the
+    /// in-machine BIF door. A missing engine is never a fabricated `0`.
     ///
     /// Oracle (OTP 29.1.1 / erts-17.1): `0` for a process parked outside any `try`; `1` for
     /// one parked inside a single `try`; the caller itself reports its own live depth (a
