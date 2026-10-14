@@ -29,13 +29,16 @@ on-demand external-module load**. A key in the `erlang` namespace that none of t
 classified as the capability gap (`unsupported: …`, CLI exit 3) or the bare `error:undef`
 (`../error.rs`).
 
-`FLOOR_MODULES: [&str; 13]` (`native.rs:131`) = `application`, `code`, `erl_ddll`,
-`erl_prim_loader`, `erlang`, `erts_internal`, `init`, `io`, `net_adm`, `net_kernel`, `os`, `prim_file`,
+`FLOOR_MODULES: [&str; 14]` (`native.rs:133`) = `application`, `code`, `erl_ddll`,
+`erl_distribution`, `erl_prim_loader`, `erlang`, `erts_internal`, `init`, `io`, `net_adm`, `net_kernel`, `os`, `prim_file`,
 `prim_tty`. Every one is a module the code server can **also**
 load as a `.beam`, so it gates `RuntimeContext::resolve_external_call`, which must answer `Ok(None)`
 for all of them — entering the body would run it *instead of* the host implementation. It does **not**
 gate `call_bif`'s dispatch: a `beam_bifs` registry key in a floor namespace the floor has no arm
 for still reaches the registry (`os:env/0` is `beam_bifs`'s; the floor owns only `os:cmd/1`).
+Membership is the **namespace** set; whether a whole namespace is refused or only the keys
+`floor_keys` enumerates is decided there, so `io`/`prim_tty`/`application`/`code`/`init`/`erl_distribution`
+are key-granular.
 Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm` (⇔ the
 `try_native` arms) and by `../error.rs`'s
 `known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry` /
