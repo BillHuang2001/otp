@@ -35,7 +35,7 @@ use beam_common::Result;
 use beam_term::prelude::{atom_val, is_small, signed_value, FunPid, MAX_ARG};
 use beam_term::{AtomTable, Eterm};
 
-use crate::error::bad_arg;
+use crate::error::{bad_arg, unsupported};
 use crate::tag::Tag;
 
 use super::Decoder;
@@ -188,6 +188,13 @@ impl<'a> Decoder<'a> {
         match tag {
             Tag::Pid => {
                 let node = self.decode_node_atom(heap, atoms)?;
+                // The `[local]` internal-node marker names no sysname, and this inlined
+                // creator descriptor stores a node **atom** (`FunPid::node`) — there is
+                // no faithful value to store, so report it instead of keeping the `[]`
+                // sentinel as the node (see [`Decoder::decode_node_atom`]).
+                if self.is_internal_node_marker(node) {
+                    return Err(unsupported(Tag::NewFun));
+                }
                 let number = self.reader.u32be()?;
                 let serial = self.reader.u32be()?;
                 let creation = u32::from(self.reader.u8()?);
@@ -208,6 +215,10 @@ impl<'a> Decoder<'a> {
             }
             Tag::NewPid => {
                 let node = self.decode_node_atom(heap, atoms)?;
+                // See the `Tag::Pid` arm: the `[local]` marker has no node atom to store.
+                if self.is_internal_node_marker(node) {
+                    return Err(unsupported(Tag::NewFun));
+                }
                 let number = self.reader.u32be()?;
                 let serial = self.reader.u32be()?;
                 let creation = self.reader.u32be()?;
@@ -221,10 +232,12 @@ impl<'a> Decoder<'a> {
             }
             // A `LOCAL_EXT`-wrapped pid: `dec_term`'s `case LOCAL_EXT` consumes the
             // 4-byte node hash and re-enters with the internal-node flag
-            // (`external.c:5250-5254`), so the wrapped pid is the creator.
+            // (`external.c:5250-5254`), so the wrapped pid is the creator — and its
+            // node field may be the `NIL_EXT` internal-node marker.
             Tag::Local => {
                 let node_hash = self.reader.u32be()?;
                 self.check_local_node_hash(node_hash)?;
+                self.internal_node = true;
                 self.decode_creator_pid(heap, atoms)
             }
             _ => Err(bad_arg()),

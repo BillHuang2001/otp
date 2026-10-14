@@ -160,15 +160,15 @@ reference registry, name table and port registry) threaded into the **per-call**
 **load/unload** host lives in `Runtime::nifs` (so it cannot borrow the runtime) and is built with
 `services = None`, so every provider-backed hook stays the trait default there.
 The hooks still at the trait default each need runtime state the host cannot reach: `priv_data` (the
-library's own `void**` is kept by `beam_abi`'s loader, so the host answers null — the C's value for a
-library that set none); `consume_timeslice` (`false`: the provider holds the process table immutably and
-the hook's `bool` cannot express "unsupported"); `send` (`None` ⇒ `enif_send` answers `0` — the most
-damaging remaining gap, since it needs a mutable process table plus a copy context); `whereis_port` (no
-atom can ever name a port here — `erlang:register/2` refuses a port — so `None` is the *provable*
-answer); `monitor_process`/`demonitor_process` (monitors are keyed by a **process** watcher and a NIF
-resource has no process identity); `select` (a new poller/notification subsystem, not a wiring gap);
-`schedule_nif` (`badarg`; this runtime has no dirty schedulers and no scheduling trampoline); and
-`dynamic_resource_call` (needs a per-library `{module, name}`-keyed resource-type registry).
+library's own `void**` is kept by `beam_abi`'s loader, so the host answers the C's null); `consume_timeslice`
+(`false`: the provider holds the process table immutably and the hook's `bool` cannot express
+"unsupported"); `send` (`None` ⇒ `enif_send` answers `0` — the most damaging remaining gap, since it needs
+a mutable process table plus a copy context); `whereis_port` (no atom can ever name a port here —
+`erlang:register/2` refuses a port — so `None` is the *provable* answer);
+`monitor_process`/`demonitor_process` (monitors are keyed by a **process** watcher and a NIF resource has
+no process identity); `select` (a new poller/notification subsystem, not a wiring gap); `schedule_nif`
+(`badarg`; no dirty schedulers and no scheduling trampoline); and `dynamic_resource_call` (needs a
+per-library `{module, name}`-keyed resource-type registry).
 A second `load_nif` for a loaded module is `reload`; a NIF returning a non-term is caught by
 `try_call_nif` as a typed error, never an abort.
 
@@ -179,55 +179,50 @@ gets its five identity fields from `FunIdentityBridge`, so `term_to_binary/1` is
 (its oracle image closes over `erl_eval.erl` internals); no wrong encoding is emitted.
 
 ## Ports, drivers and the send family (A.4)
-The read path builds one `{Port, {data, Data}}` per driver read, at the width the child wrote: a
-`binary` stream delivers a `binary` up to `beam_io`'s `READ_CHUNK` (64 KiB) per `read(2)`, a `list`
-stream a char list. The child's **stderr is inherited** from the emulator by default and is never port
-data; `stderr_to_stdout` makes descriptor 2 an exact duplicate of descriptor 1, so its diagnostics
-arrive as port data interleaved in true write order. `connected` flips to `false` only at
+The read path builds one `{Port, {data, Data}}` per driver read, at the width the child wrote (`binary` →
+up to `beam_io`'s `READ_CHUNK`, 64 KiB, per `read(2)`; `list` → a char list). The child's **stderr is
+inherited** by default and is never port data; `stderr_to_stdout` makes fd 2 an exact duplicate of fd 1,
+so its diagnostics arrive as port data in true write order. `connected` flips to `false` only at
 `port_close/1`; `os:cmd/1` stays the runtime-native host spawn.
 `{spawn_driver, Name}` resolves the name against the **built-in driver table** (`tcp_inet`/`fd`/`efile`)
-before any `dlopen` exactly as the C does (`io.c:599-628`) — an unknown name is still `badarg`. A
-`{spawn_driver, Name}` port's `driver_output` **is** delivered to its owner as `{Port, {data, Data}}`,
-and a driver-emitted `erl_drv_output_term`/`erl_drv_send_term` term reaches the connected process or the
-explicit destination (the `TermQueue` drain is wired end to end). `driver_select` is real, and
-`driver_set_timer` arms for every attached port (the C substitutes a no-op `no_timeout_callback` when
-the entry declares no `timeout` slot, so `-1` only fires for an invalid port or an overflowing
-deadline). An `OUTPUT` port task always drains the port's output queue through the single write path
-(the entry's `outputv`/`output`) and *then* runs the entry's `ready_output` as the write-**readiness**
-notification, so a queued `port_command` buffer reaches the driver whether or not the driver armed a
-writable fd. The driver's `control` callback **is** routed behind `erlang:port_control/3`, and
-`ERL_DRV_USE`'s `stop_select` **fires** on the cancel/deselect handback. The **driver-private queue**
-(`driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq` — a fresh port's `sizeq` is `0`),
-`driver_pdl_create`, the port **state** flags (`get_port_flags`; `set_control_flags` stores into the
-port's own control-flags cell) and the **process-monitor family**
+before any `dlopen` exactly as the C does (`io.c:599-628`) — an unknown name is still `badarg`. A driver
+port's `driver_output` **is** delivered to its owner as `{Port, {data, Data}}`, and a driver-emitted
+`erl_drv_output_term`/`erl_drv_send_term` term reaches the connected process or the explicit destination
+(the `TermQueue` drain is wired end to end). `driver_select` is real, and `driver_set_timer` arms for
+every attached port. An `OUTPUT` port task always drains the port's output queue through the single write
+path and *then* runs the entry's `ready_output` as the write-**readiness** notification. The driver's
+`control` callback **is** routed behind `erlang:port_control/3`, and `ERL_DRV_USE`'s `stop_select`
+**fires** on the cancel/deselect handback. The **driver-private queue**
+(`driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq`), `driver_pdl_create`, the port
+**state** flags (`get_port_flags`; `set_control_flags`) and the **process-monitor family**
 (`driver_monitor_process`/`_demonitor_process`/`_get_monitored_process` over the per-port monitor tree,
-the C's `process_exit` fired per round, and `monitor_process_result`'s three-way answer from the
-published `ProcessLiveness` view) are implemented, so the host covers **27 of the 41** `DriverHost` hooks.
-The monitor residual is that the view is a **per-round snapshot**, so a callback reached **outside** a
-round (a driver's own `start` during `open_port/2`, a `control` during `port_control/3`) consults the
-previous round's snapshot, and one reached before any round answers `Ok`, never a fabricated `NotAlive`.
-Typed gaps: `driver_async` (no async pool; `Runtime` is `!Send` and the `invoke`/`free` pair is
-`unsafe`, and `async_port_key` keeps the default `-1`); a `control` reply the driver answered from
-**its own** memory (needs a safe copy helper on `beam_abi`); a NULL driver reply with
-`PORT_CONTROL_FLAG_BINARY` set (answers `<<>>` where the C answers `[]`); an OS child (`os_pid` is
-`undefined` for a driver port, and `take_exit_status` is always `Ok(None)`); a built-in
-(`spawn`/`spawn_executable`/`fd`) port's `port_control/3` answering `[]` where the oracle raises
-`badarg` (a gap owned by `beam_io`'s default `Driver::control`); and a driver arming **more than one**
-registration per direction (the typed `unsupported`).
+and `monitor_process_result`'s three-way answer from the published `ProcessLiveness` view) are
+implemented, so the host covers **27 of the 41** `DriverHost` hooks. The monitor residual is that the
+view is a **per-round snapshot**, so a callback reached **outside** a round (a driver's `start` during
+`open_port/2`, a `control` during `port_control/3`) consults the previous round's snapshot, and one
+reached before any round answers `Ok`, never a fabricated `NotAlive`.
+Typed gaps: `driver_async` (no async pool; `Runtime` is `!Send`, the `invoke`/`free` pair is `unsafe`,
+`async_port_key` keeps the default `-1`); a `control` reply the driver answered from **its own** memory
+(needs a safe copy helper on `beam_abi`); a NULL driver reply with `PORT_CONTROL_FLAG_BINARY` set
+(answers `<<>>` where the C answers `[]`); an OS child (`os_pid` is `undefined` for a driver port,
+`take_exit_status` is always `Ok(None)`); a built-in (`spawn`/`spawn_executable`/`fd`) port's
+`port_control/3` answering `[]` where the oracle raises `badarg` (owned by `beam_io`'s default
+`Driver::control`); and a driver arming **more than one** registration per direction (the typed
+`unsupported`).
 `line`/`{line, N}` framing is **adopted** (contract A.4): `open_port/2` decodes the option into
 `PortOptions::line` (bare `line` ⇒ `512`; `{line, N}` ⇒ a positive small integer, else `badarg`;
-mutually exclusive with `{packet, N}` and with `stderr_to_stdout` unless `use_stdio`), `PortRegistry::register`
-arms `beam_io`'s `set_line_mode` on the fresh port, and the port-task round's `take_line_notifications()`
-is delivered as the oracle's `{Port,{data,{eol|noeol,Data}}}` frames (`PortEvent::Line`). `StreamType::port_flags`
-reports `PORT_FLAG_BINARY`/`PORT_FLAG_LINE` independently (`[line]` ⇒ `2`, `[binary]` ⇒ `1`, `[binary,line]` ⇒ `3`).
-`erl_ddll` is **served** (contract A.4), from one loaded-driver view: the four list/load/unload/report
-keys (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `info/2`) come from the **native floor**
-(`src/native/ddll.rs`) over the **one** name-keyed loaded-driver registry `src/port/driver.rs` keeps —
-the same list `open_port({spawn_driver, Name})` resolves against — while `monitor/2`/`demonitor/1`/`format_error/1`
-fall through to `beam_bifs`'s real implementations. `loaded_drivers/0` reports this runtime's **own**
-(empty) driver set where the oracle lists its statically-linked `tcp_inet`/`udp_inet`/`ram_file_drv` — a
-by-construction own-state divergence, never fabricated. With no `erl_ddll:load_driver/*`, a `Name`
-doubles as the *search* on `open_port`: a `/`-containing name is the object path (driver name = its
+mutually exclusive with `{packet, N}` and with `stderr_to_stdout` unless `use_stdio`),
+`PortRegistry::register` arms `beam_io`'s `set_line_mode`, and the port-task round's
+`take_line_notifications()` is delivered as the oracle's `{Port,{data,{eol|noeol,Data}}}` frames.
+`StreamType::port_flags` reports `PORT_FLAG_BINARY`/`PORT_FLAG_LINE` independently (`[line]` ⇒ `2`,
+`[binary]` ⇒ `1`, `[binary,line]` ⇒ `3`).
+`erl_ddll` is **served** (A.4) from one loaded-driver view: `loaded_drivers/0`/`try_load/3`/`try_unload/2`/`info/2`
+come from the **native floor** (`src/native/ddll.rs`) over the **one** name-keyed loaded-driver registry
+`src/port/driver.rs` keeps — the same list `open_port({spawn_driver, Name})` resolves against — while
+`monitor/2`/`demonitor/1`/`format_error/1` fall through to `beam_bifs`. `loaded_drivers/0` reports this
+runtime's **own** (empty) set where the oracle lists its statically-linked
+`tcp_inet`/`udp_inet`/`ram_file_drv` (a by-construction divergence), and with no `erl_ddll:load_driver/*`
+a `Name` doubles as the search on `open_port` (a `/`-containing name is the object path, driver name = its
 file stem; else `<name>.so`).
 The send family serves `erlang:send/2` and `erlang:'!'/2` (the `SendBridge`); `erlang:send(Port, Data)`
 needs the port write path and the distributed `{Name, Node}` send is contract A.5 — both raise
@@ -279,127 +274,99 @@ accounting) are the typed `unsupported`; every other `RuntimeHooks` family is un
 ## GC / heap model
 `DEFAULT_HEAP_WORDS` is `1 << 24` (16 Mi words of lazily-mapped address space). The term-construction
 heaps (the BIF-heap pool + the `-eval` heap) are plain bump arenas sized `config.heap_words`; `+hmax N`
-is a **real** cap on that capacity (`runtime.rs::term_heap_words`). The `system_limit` translation is
+is a **real** cap on that capacity (`runtime.rs::term_heap_words`), and the `system_limit` translation is
 applied **after** the copy engine's own retry (so `deliver_message` still matches the **raw**
-`AllocKind::Message` to trigger the heap-fragment retry). This crate **does** drive `beam_gc`: a *scheduled* process allocates on its own young heap and is
-collected at `ExecutionContext::ensure_heap`/`ensure_heap_full` (sharing `collect_or_grow`; the latter is the
-full-root door `test_heap` reaches, handing over the FR file too; armed by the slice's `BudgetContext`, roots
-= `x[0..live)` plus the Erlang stack), pinned by `tests/gc_collect.rs` and reported by `Runtime::gc_stats()`; every
-other context is a no-op on the unbounded arena. The limits are honest and measured: a workload that
-allocates only through `ExecutionContext::alloc_words` (no `test_heap` admission point, as real Cowboy
-`cowboy_bstr`-style code does) always falls back to the pointer-stable arena and is never collected
-(`collections: 0`, `fallbacks` ≈ 620·N at N=10 000), `Machine`'s float-register file is not mirrored by
-this crate's root publish (so a module with a float-family instruction is never collected over), and a
-failed collection halts that process's collection rather than failing the program.
+`AllocKind::Message` to trigger the heap-fragment retry). This crate **does** drive `beam_gc`: a
+*scheduled* process allocates on its own young heap and is collected at
+`ExecutionContext::ensure_heap`/`ensure_heap_full` (sharing `collect_or_grow`; the latter is the full-root
+door `test_heap` reaches, handing over the FR file too; armed by the slice's `BudgetContext`, roots =
+`x[0..live)` plus the Erlang stack), pinned by `tests/gc_collect.rs` and reported by
+`Runtime::gc_stats()`; every other context is a no-op on the unbounded arena. The limits are honest and
+measured: a workload that allocates only through `ExecutionContext::alloc_words` (no `test_heap`
+admission point, as real Cowboy `cowboy_bstr`-style code does) always falls back to the pointer-stable
+arena and is never collected (`collections: 0`, `fallbacks` ≈ 620·N at N=10 000), `Machine`'s
+float-register file is not mirrored by this crate's root publish, and a failed collection halts that
+process's collection rather than failing the program.
 **The term-heap capacity is still the hard limit** for anything not collected: both exhaustion classes
 become `error::system_limit` via `error::enforce_term_heap_limit` — `AllocKind::Heap` (the per-process
 bump allocator) **and** `AllocKind::Message` (the copy engine's destination-heap exhaustion, classified
 by `beam_message::is_message_heap_exhaustion`) → CLI `beam_rt: system_limit`, exit 1.
 **On-demand heap growth is adopted at the engine's heap-admission point and on the `beam_process`
-message-delivery path.** `src/context/gc.rs::ensure_heap`/`ensure_heap_full` (sharing `collect_or_grow`) run the collector's on-demand **growth**
-(`Process::ensure_capacity`) whenever the process's own heap-size policy can reach the request
+message-delivery path.** `src/context/gc.rs::ensure_heap`/`ensure_heap_full` run the collector's
+`Process::ensure_capacity` **growth** whenever the process's heap-size policy can reach the request
 (`HeapPolicy::next_words(need, 0) >= need`) and a plain `Process::collect` otherwise, so a `test_heap`
-request larger than the nursery is admitted by growing it in place (`tests/heap_growth.rs`).
-A bounded `+hmax N` policy the request cannot reach is refused **before** collecting, keeping the
-fallback behaviour exactly (the collection still runs, the allocation falls back to the arena).
-`Process::deliver` grows the nursery the same way for a refused message copy; the refusal is what
-reproduces the raw `AllocKind::Message` that `deliver_message` keys its heap-fragment fallback on (an
-unbounded receiver would instead absorb the payload into its grown nursery). A **relocation-exempt**
-receiver skips the collect-and-grow retry entirely. The **registered-BIF result** is the one
-allocation that really leaves its pooled heap — see the copy-out subsection below. Allocation
-**outside** the admission point still does not grow the nursery, so exhaustion there still raises
-`error::system_limit`: BIFs (and the floor) build their *intermediate* terms on a `beam_alloc::Heap`
-(`BifContext::heap()`) caching raw `hp`, so the live set is invisible to `roots`, and the bounded heaps
-(`Runtime::bif_heaps`/`eval_heap`) are bump arenas that never move.
+request larger than the nursery is admitted by growing it in place (`tests/heap_growth.rs`); a bounded
+`+hmax N` policy the request cannot reach is refused **before** collecting (the collection still runs,
+the allocation falls back to the arena). `Process::deliver` grows the nursery the same way for a refused
+message copy; the refusal is what reproduces the raw `AllocKind::Message` that `deliver_message` keys its
+heap-fragment fallback on. A **relocation-exempt** receiver skips the retry entirely. The
+**registered-BIF result** is the one allocation that really leaves its pooled heap (the copy-out
+subsection below). Allocation **outside** the admission point still raises `error::system_limit`: BIFs
+(and the floor) build *intermediate* terms on a `beam_alloc::Heap` (`BifContext::heap()`) caching raw
+`hp`, so the live set is invisible to `roots`, and the bounded heaps
+(`Runtime::bif_heaps`/`eval_heap`) never move.
 
 ### The BIF-result copy-out — a registered BIF's container result moves onto the process's scanned heap
 A registered BIF builds its result on the runtime's pooled 16 MiB `Runtime::bif_heaps`
-(`Runtime::take_bif_heap`) — a `Target::Foreign` region the process collector does not scan — so a
-container left there is a root the unscanned-root valve declines over while it is live, and a churn
-loop that keeps such a result alive grows peak memory with its iteration count. `RuntimeContext::call_registered`
-(`src/context/calls.rs`) therefore **moves** the result onto the running process's own young heap
-(`Process::heap_mut()`, the very space the engine's allocation seams bump and the collector **scans**)
-and then rewinds the pool to the offset it read before the call (below), so the result is kept alive by
-the root set the engine already publishes (it lands in `x(0)` on return) and is relocated by a later
-collection, while the pool serves the next call from that offset.
-The copy is `beam_message::copy_struct` with an **empty** source `OffHeapTable`; a full nursery is met by
-`Process::grow_nursery(hint)` (the **no-relocation** seam — inside a BIF call the machine's live x
-registers and stack are **not** published, so a collecting `Process::ensure_capacity` would free live
-terms) and **one** retry, the growth hint being the copier's **own** preflight count reported back in the
-refusal (`AllocFailure::requested / size_of::<Eterm>()`, so the growth costs no second graph walk —
-`beam_term::size_object` would walk the graph again and build a `HashSet` plus a `Vec`).
-One `OffHeapTable`/`CopyContext` pair is shared by both attempts: a refused attempt rolls its own
-off-heap pushes back and takes the preflight path, which writes no destination word.
-The retry is reached **only** for `beam_message::is_message_heap_exhaustion`; every other refusal a legal
-BIF result can produce (the malformed-graph `badarg`, an `AllocKind::Heap`/`LiveObject` failure from a
-nested push, a raised reason) is permanent for this destination, so the move answers `None` without
-growing a space — pinned by `src/context/calls.rs::tests::a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing`
-and its positive control `an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies`.
-The empty source table is load-bearing: with no payload owner the copier
-**flattens** a refc binary's window into a self-contained on-heap bitstring (byte-faithful, nothing
-registered in the destination table, no refcount lost), and an off-heap **MSO** reference with no owner
-is the copier's typed `bad_term`, so the move answers `None` — the pool is then not rewound and the
-result is left exactly as it was, never a dangling payload. The rewind is `Heap::reset_to(mark)` at the
-offset `heap.used()` read *before* the call, so it frees only this call's own words `[mark..used)` and
-keeps whatever a previous owner still holds below `mark` (the pool is shared with the native-floor
-reference minting, trace and the ETS-owner sweep, which return a heap *unreset*). It is applied only
-when the move is **safe and complete**:
-* the **safe arm** — none of the six escaping `DispatchHooks` arms (`dict`, `process_hook`, `nif_loader`,
-  `send_hook`, `persistent_term`, `runtime_hooks`), each of which lets a term the BIF built on
-  `ctx.heap()` escape into state that outlives the call (the process dictionary, the process/port
-  registry, a NIF library's private data, a delivered message, the persistent-term store, the timer
-  heap / reference space / link set), and no **reentrant** fun-applying call (whose nested run can push
-  an argument that lives on this very heap into any of those seams);
-* an **`Ok`** result — a raise may carry a live reason term (`beam_common::Raise::live_reason`, the
-  `{badkey,K}`/`{case_clause,V}` shapes) pointing into this heap, so the **error path never rewinds**;
-* a **scheduled process** (`mailbox_table` is `Some`) — the `-eval`/nested shape has no process to move
-  onto and is left byte for byte unchanged;
-* a **container** result (`result_is_foreign_container`) — an immediate is neither boxed nor a cons and a
-  literal lives in the frozen literal area, so neither can reach a word on this heap; such a result
-  rewinds with **no** copy, keeping the arithmetic/immediate hot path free;
-* a **move that succeeded** — no scheduled process, a nursery that cannot be grown, or a graph the
-  copier refuses all leave the result where it is and the pool unrewound.
-**Residuals.** A **NIF** result is **not** copied out (a deliberate M1 residual — see the API Surface's
-NIF notes), so it stays on the pooled heap and keeps declining a collection while it is live. The
-`-eval`/no-scheduled-process shape, an escaping arm and an error result all leave their container on the
-pooled (`Target::Foreign`) heap. A **nested** cross-module run
-(`RuntimeContext::run_export`) never reaches a collection point at all, so its allocations still fall
-to the pointer-stable arena. Pinned by `src/context/tests.rs`'s
-`a_bif_container_result_is_moved_onto_the_process_heap_and_the_pool_is_rewound`,
+(`Runtime::take_bif_heap`) — `Target::Foreign`, so the process collector does not scan it — so a
+container left there is a root the unscanned-root valve declines over while live.
+`RuntimeContext::call_registered` (`src/context/calls.rs`) therefore **moves** the result onto the
+running process's own young heap (`Process::heap_mut()`, which the collector scans) and rewinds the pool
+to the offset read before the call, so the result lands in `x(0)` (the root set the engine already
+publishes) and is relocated by a later collection. The copy is `beam_message::copy_struct` with an
+**empty** source `OffHeapTable`; a full nursery is met by `Process::grow_nursery(hint)` (the
+**no-relocation** seam — inside a BIF call the machine's x registers and stack are **not** published, so a
+collecting `Process::ensure_capacity` would free live terms) and **one** retry, the hint being the
+copier's own preflight count from the refusal (`AllocFailure::requested / size_of::<Eterm>()`, so growth
+costs no second graph walk). One `OffHeapTable`/`CopyContext` pair serves both attempts, and the retry is
+reached **only** for `beam_message::is_message_heap_exhaustion`; every other refusal a legal BIF result
+can produce (the malformed-graph `badarg`, an `AllocKind::Heap`/`LiveObject` failure, a raised reason) is
+permanent, so the move answers `None` without growing a space
+(`src/context/calls.rs::tests::{a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing, an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies}`).
+The empty source table is load-bearing: with no payload owner the copier **flattens** a refc binary's
+window into a self-contained on-heap bitstring (byte-faithful, no refcount lost), and an off-heap **MSO**
+reference with no owner is the copier's typed `bad_term`, so the move answers `None` — the pool is not
+rewound and the result is left exactly as it was, never a dangling payload. The rewind is
+`Heap::reset_to(mark)` at the `heap.used()` read *before* the call, so it frees only this call's own
+words `[mark..used)` and keeps whatever a previous owner holds below `mark` (the pool is shared with the
+native-floor reference minting, trace and the ETS-owner sweep, which return a heap *unreset*). It is
+applied only when the move is **safe and complete** — no escaping `DispatchHooks` arm
+(`dict`/`process_hook`/`nif_loader`/`send_hook`/`persistent_term`/`runtime_hooks`, each letting a term
+built on `ctx.heap()` escape into state that outlives the call), no **reentrant** fun-applying call, an
+**`Ok`** result (a raise may carry a `live_reason` term pointing into this heap, so the **error path
+never rewinds**), a **scheduled process** (`mailbox_table` is `Some`; the `-eval`/nested shape has no
+process to move onto), a **container** result (`result_is_foreign_container`; an immediate is unboxed and
+a literal lives in the frozen literal area, so such a result rewinds with **no** copy), and a move that
+succeeded.
+**Residuals.** A **NIF** result is **not** copied out (a deliberate M1 residual), so it stays on the
+pooled heap and keeps declining a collection while live; the `-eval`/no-scheduled-process shape, an
+escaping arm and an error result also leave their container on the pooled (`Target::Foreign`) heap; a
+**nested** cross-module run (`RuntimeContext::run_export`) never reaches a collection point. Pinned by
+`src/context/tests.rs` (`a_bif_container_result_is_moved_onto_the_process_heap_and_the_pool_is_rewound`,
 `an_immediate_result_rewinds_the_pool_without_a_copy`,
 `an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool`,
 `a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected`,
-`a_partially_used_pool_is_rewound_to_the_callers_mark` and
-`an_escaping_arm_does_not_rewind_a_partially_used_pool`.
+`a_partially_used_pool_is_rewound_to_the_callers_mark`,
+`an_escaping_arm_does_not_rewind_a_partially_used_pool`).
 
 ### `ets_copy` peak RSS — the copy-out's retained young space, not the ETS adopt path
-`copy_bound/ets_copy`'s peak RSS is **still linear in N** (94.68 MiB at N = 100 000, ≈790 B ≈ 99 words
-per iteration), and it is a structural limit of the BIF-result copy-out above, **not** the ETS adopt path.
-The recorded `tools/bench/RESULTS.md` §8 item-5 lead (the ETS adopt path / the rewind guard) is
-**refuted**: `safe_to_rewind` is already `true` for `ets:*` and the pooled heap is already rewound.
-**It tracks BIF calls, not floats and not ETS table state** — a float-free ETS loop of the same shape
-grows identically, while a float-carrying churn loop with no ETS is flat.
-**Mechanism.** Almost all of the loop's heap traffic is the BIF-result copy-out, which by design cannot
-collect (the machine's live x registers / Erlang stack are not published at a BIF call, so a collection
-there would free live terms); a full nursery is met by `Process::grow_nursery(hint)`
-(`src/context/calls.rs::move_result_into_process_heap`) and a **retired young space is retained**, so the
-retained capacity accumulates linearly.
-The loop never reaches a real collection either: `ensure_heap_full` returns at
-`!process.should_collect(heap_need)` (`src/context/gc.rs` → `beam_gc`'s
-`nursery.current().available_words() < need_words`) because the loop's own `test_heap` prefixes are tiny
-(a 233-word default nursery, `beam_gc/src/policy.rs`), and `alloc_words_rooted` is never entered (the BIF,
-not the engine, builds the result).
-**The caller-module float guard is not the mover**: relaxing it at the two FR-publishing GC doors changes
-nothing here (94.68 → 95.02 MiB at N = 100 000, still linear in N) and contradicts the pinned
-float-collection contract (`tests/gc_collect.rs`).
-Closing it needs either a **`beam_process`** seam that can shrink/reuse a retired young space
-(`Process::grow_nursery` retains it) or a **`beam_engine`/runner** seam that publishes the driving
-machine's roots at the BIF call so the copy-out can collect — both sibling-crate changes, not reachable
-from `src/context/calls.rs`; the `beam_message` clean-destination ceiling in the cross-node section below
-is the same lever.
-Figures, bisection and the discarded negative results: [`PERF.md`](PERF.md) *COPY-OUT-CUT* →
-*`ets_copy` peak RSS …*.
-
+`copy_bound/ets_copy`'s peak RSS is **linear in N** (94.68 MiB at N = 100 000, ≈99 words per iteration)
+and is a structural limit of the BIF-result copy-out above, **not** the ETS adopt path: `safe_to_rewind`
+is already `true` for `ets:*` and the pooled heap is already rewound. It tracks BIF calls, not floats and
+not ETS table state (a float-free ETS loop of the same shape grows identically; a float-carrying churn
+loop with no ETS is flat). The loop's heap traffic is the copy-out, which by design cannot collect (the
+machine's x registers / Erlang stack are not published at a BIF call), so a full nursery is met by
+`Process::grow_nursery(hint)` (`src/context/calls.rs::move_result_into_process_heap`) and the **retired
+young space is retained**, so capacity accumulates linearly; the loop never reaches a real collection
+either — `ensure_heap_full` returns at `!process.should_collect(heap_need)` (`src/context/gc.rs`) because
+its `test_heap` prefixes are tiny (a 233-word default nursery, `beam_gc/src/policy.rs`) and
+`alloc_words_rooted` is never entered (the BIF, not the engine, builds the result). The caller-module
+float guard is **not** the mover (relaxing it at the two FR-publishing GC doors changes nothing here and
+contradicts the pinned float-collection contract, `tests/gc_collect.rs`). Closing it needs either a
+**`beam_process`** seam that can shrink/reuse a retired young space or a **`beam_engine`/runner** seam
+that publishes the driving machine's roots at the BIF call so the copy-out can collect — both sibling-crate
+changes; the `beam_message` clean-destination ceiling below is the same lever. Figures and bisection:
+[`PERF.md`](PERF.md) *COPY-OUT-CUT*.
 ## Heap switches
 `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → 1598),
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
@@ -412,111 +379,138 @@ Figures, bisection and the discarded negative results: [`PERF.md`](PERF.md) *COP
   path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — stops at directive 18.** `Runtime::boot_from_script` runs the real
-  `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 instructions**) until directive **18 of 22**,
-  `{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, where the kernel
-  application's start (`application_controller:start_boot_application/2` → `spawn_starter/3` →
-  `application_master:start_link/2`) never completes, the boot drive's scheduler pass runs zero
-  processes, and `src/boot/drive.rs::apply_boot_call` folds the owed `gen_server:call` reply into the
-  uncatchable `beam_engine::blocked()` (the CLI `-boot` action exits **3**); the final
-  `{progress,started}` (index 21) is not reached. The differential case
-  `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** with the oracle, `-boot FILE` drives the
-  walk (`src/cli.rs::drive`), a plain start keeps the preloaded-only floor, and directive 13 leaves a
-  live `logger_server` registered as `logger`. The remaining cross-node gap is **`beam_bifs`** —
-  whatever the start needs that the runtime does not yet run. Mechanism, the eight currently-failing
-  tests and the not-a-native-floor-miss evidence: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; a cross-crate blocker owned by
+  `erts_rust/crates/beam_engine` (no file in this crate owns the fix).** `Runtime::boot_from_script`
+  runs the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 directives**) past index 18
+  (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`) — the kernel application
+  starts and stays up — and stops at index **19**
+  (`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`); the final
+  `{progress,started}` (index 21) is not reached. The CLI `-boot bootstrap/bin/start` and the `run`
+  action exit **1** (not 3); stderr carries
+  `=INFO REPORT==== … application: kernel exited: {bad_return,{{kernel,start,[normal,[]]},{'EXIT',{case_clause,{error,{callback_crashed,{error,undef,[]}}}}}}} type: permanent`,
+  then `=ERROR REPORT==== … logger: callback_crashed process: logger reason: {error,undef,[]}`, then the
+  terminal `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`.
+  The in-crate `BootStop` reports `index = 19`. `-boot FILE` drives the walk (`src/cli.rs::drive`), a
+  plain start keeps the preloaded-only floor, directive 13 leaves a live `logger_server` registered as
+  `logger`, and the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
+  **An external fun resolves in-machine (the reason index 18 completes):**
+  `RuntimeContext::resolve_local_fun` (`src/context/execution.rs`) also resolves an EXTERNAL fun
+  (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through the
+  `external_fun_target`/`external_fun_name` helpers (`src/context/apply.rs`), so the engine enters e.g.
+  `gen_server`'s callback fun IN-MACHINE instead of falling back to the value-returning `apply_fun`
+  (which nested a fresh `Machine` under `may_pump_scheduler() == false` → `src/context/pump.rs` refuses
+  → the uncatchable `blocked()`). Pinned by
+  `src/context/tests.rs::{an_external_fun_whose_callee_blocks_resumes_on_a_scheduled_slice, resolve_local_fun_declines_the_fun_kinds_it_cannot_claim}`.
+  **The index-19 chain (owned by `beam_engine`):** `kernel:start/2`'s first statement
+  `logger:internal_init_logger()` → `logger:set_handler_config(simple, filters, …)` →
+  `logger_server:call_h/4` (`lib/kernel/src/logger_server.erl:541-551`), which does
+  `try apply(Module,Function,Args) catch C:R:S -> case {C,R,S} of {error,undef,[{Module,Function=changing_config,Args,_}|_]} when length(Args)=:=3 -> …; {error,undef,[{Module,Function,Args,_}|_]} -> DefRet; _ -> …{callback_crashed,…} end`.
+  `logger_simple_h` genuinely has NO `changing_config/3` (oracle:
+  `erlang:function_exported(logger_simple_h,changing_config,3)` → `false`), so OTP relies on the
+  innermost stacktrace frame carrying the **argument list**; this runtime's `undef` carries no
+  innermost `{M,F,Args,Loc}` frame, so the wrong case arm runs → `{callback_crashed,{error,undef,[]}}`
+  → `case_clause` in `kernel:start/2` → the permanent kernel application tears down → directive 19's
+  `{load_application,stdlib}` `gen_server:call` finds no `application_controller` → `{noproc,…}`.
+  Minimal repro (both verified): the same `try apply(logger_simple_h,changing_config,[a,b,c]) catch C:R:S -> …` one-liner under `erl -noshell` (oracle) and `beam_rt -noshell` (ours) gives the oracle
+  `{error,undef,[{logger_simple_h,changing_config,[a,b,c],[]},{erl_eval,do_apply,7,…},…]}` (head = the args
+  item) vs ours `{error,undef,[]}`. **Fix shape:** `beam_engine`'s `undef` raise path must carry the failed
+  callee's MFA **and the argument list** so
+  `families/exceptions/stacktrace.rs::symbolic_stacktrace` can prepend that `{M,F,Args,Loc}` item;
+  `beam_common::StackFrame` (`crates/beam_common/src/error.rs:518-541`, currently
+  `{module, function, arity, location}`) may need an optional argument-list slot; the `undef` raised on
+  this crate's callee path comes from `src/context/calls.rs` and `src/context/pump.rs`.
+  **Why the trace reads `[]` (linchpin):** `logger:filter_stacktrace/2` (`lib/kernel/src/logger.erl:1982-1987`)
+  is a **head-prefix** filter (`filter_stacktrace(Module,[{Module,_,_,_}|_]) -> []`), and our trace's head is
+  the raising `logger_server` frame itself (the callee item is the missing one), so it is wiped to `[]` — the
+  oracle's filtered trace is exactly the single callee item. The defect is therefore *only* the missing
+  innermost callee item, not a generally empty trace: the same probe with the `try` inside a **compiled**
+  module (`apply/3` and a direct `call_ext`), on both the `-eval` and the scheduled `run` routes, yields a
+  non-empty trace with the raising function's own frame (`[{p3,call_h,3,[{file,…},{line,5}]}]`).
+  **Verdict: long-standing engine gap, newly exposed — not a `beam_rt` code regression.**
+  `stacktrace.rs`'s whole history carries no args variant, so `call_h/4`'s first two arms can never have
+  matched at any commit; 2026-10-09's completion (`f8b447c2f4`, `ee14327c11`, `fdcf1d3d91`) held only because
+  the in-machine `call_ext`→`erlang:apply/3` seam was not yet closed (`proc_lib:init_p_do_apply` folded into
+  `blocked()`, so the real `logger_server` never ran), and 2026-10-11 (`58d5dc65e4`, `42c0232d40`,
+  `1d9f287c87`) closed it — directive 13 now starts a **live** `logger_server` (a genuine capability gain
+  matching the oracle), which is exactly what runs the probe.
+  The **8** currently-failing crate tests fail ONLY because each asserts FULL 22-directive completion (a
+  correct contract that must be kept): `--lib boot::` (3:
+  `the_real_start_boot_executes_every_directive_to_progress_started`,
+  `the_real_boot_registers_a_live_logger_process`,
+  `the_real_start_boot_completes_through_execute_reporting`), `--test boot` (4:
+  `the_real_start_boot_runs_to_completion`, `the_cli_runs_the_real_boot_script_to_completion`,
+  `the_boot_chains_kernel_processes_survive_their_directive_processes`,
+  `the_cli_boot_registers_a_live_logger_process`), `--test a9_native_floor` (1:
+  `script_id_is_the_loaded_boot_scripts_real_header`). Mechanism:
+  [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
-  tiers.**
-  `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process**
-  and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code`
-  chunk matches `erlc +deterministic`) — `tests/compile_file.rs`. Both corpus cases —
-  `selfhost/in_process_compile_file_no_spawn_deterministic` (that E0 shape) and
-  `selfhost/scheduled_process_compile_file_deterministic` (the default shape through `compile:file/2`'s
-  own compiler process) — drive a scheduled `run` and **agree** with the oracle on both the interpreter
-  and the baseline tier. The fun-image half of `callee_observes_its_call_site` is **per-function**
-  (`erlang:term_to_binary/1,2` / `erlang:external_size/1,2` are guarded only in the function that issues
-  the call; the necessarily module-wide `erlang:load_nif/2` is unchanged), so a `compile:*` function
-  whose own body issues no fun-image BIF is admitted in-machine and its blocking `receive` suspends
-  through the ordinary `RunOutcome::Wait` path. The corruption that once made both cases a hard
-  `mismatch` is a **GC relocation**, and its mover is pinned in
-  [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md): the monitor-DOWN branch of
-  `beam_process`'s process-termination cascade (`ProcessTable::terminate_with_ports` →
-  `terminate_and_cascade` → `terminate_into` → `enqueue_down_signal` → `copy_reason_onto` →
-  `grow_receiver_for_signal` → `Process::ensure_capacity`, all `ptab.rs`) runs a rooted collection that
-  relocates a **woken monitor watcher's** heap against a `regs` snapshot that is not its whole live root
-  set. The host **collection gate** `beam_rt` installs on the process table (`context/gc_walk.rs`'s
-  `RuntimeCollectionGate`) makes every `ptab.rs` signal site decline that collection of a
-  foreign-reachable receiver, and the runner's Wait park arm keeps the process relocation-exempt for
-  the parked (and woken-not-yet-resumed) window — the resume clears it — so the signal-driven
-  collection is declined and the delivery takes the ordinary heap-fragment fallback (the park
-  exemption is kept as the complementary mitigation for a live term the host holds **outside** the
-  receiver's gathered roots, which the gate's walk cannot see).
-* **The native `file_server_2` service** (`src/native/file_server.rs`) answers the
+  tiers.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs
+  **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp`
+  clean; the `Code` chunk matches `erlc +deterministic`) — `tests/compile_file.rs`. Both corpus cases
+  (`selfhost/in_process_compile_file_no_spawn_deterministic`, that E0 shape, and
+  `selfhost/scheduled_process_compile_file_deterministic`, the default `compile:file/2` shape through
+  its own compiler process) drive a scheduled `run` and **agree** with the oracle on both the
+  interpreter and the baseline tier. The fun-image half of `callee_observes_its_call_site` is
+  **per-function** (`erlang:term_to_binary/1,2` / `erlang:external_size/1,2` are guarded only in the
+  function that issues the call; the module-wide `erlang:load_nif/2` is unchanged), so a `compile:*`
+  function whose own body issues no fun-image BIF is admitted in-machine and its blocking `receive`
+  suspends through the ordinary `RunOutcome::Wait` path. The hazard class both cases run through — the
+  monitor-DOWN branch of `beam_process`'s termination cascade relocating a **woken** monitor watcher's
+  heap — is declined in this crate by the host collection gate plus the park exemption (the A.9 class in
+  *GC-relocation hazards* below); mechanism:
+  [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).
+* **`file_server_2` service** (`src/native/file_server.rs`) answers the
   `{'$gen_call',{Pid,Tag},Request}` / `{file_request|io_request,From,ReplyAs,Request}` wire and the
   server/io-device request surface `lib/kernel/src/file.erl` issues (`{open,…}`, `read_file`, `list_dir`,
-  `delete`, `rename`, `make_dir`, `del_dir`, `read_link`, `make_link`, `make_symlink`, `altname`,
-  `get_cwd` + `close`/`sync`/`datasync`/`truncate`/`{position,At}`/`{get_chars,…}`/`{put_chars,…}`);
-  every other command is the typed `unsupported`, and a `From` tag that is a process **alias** is the
-  typed `unsupported` too. The `{get_until,…}`/`{get_line,…}` io requests **are** served
+  `delete`, `rename`, `make_dir`, `del_dir`, `read_link`/`make_link`/`make_symlink`, `altname`, `get_cwd`,
+  `close`/`sync`/`datasync`/`truncate`/`{position,At}`/`{get_chars,…}`/`{put_chars,…}`); every other
+  command is the typed `unsupported`, and a `From` tag that is a process **alias** is the typed
+  `unsupported` too. The `{get_until,…}`/`{get_line,…}` io requests **are** served
   (`src/native/file_server/{get_until,get_line}.rs`), so `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`
   and `file:read_line/1` complete and agree with the oracle (`tests/io_scan.rs`). Wire tables + per-request
   gaps: [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
-* **`beam_process` / `beam_message` split borrow.** The split accessor exists:
-  `Process::heap_and_off_heap_mut()` (`beam_process/src/process.rs:579`) returns
-  `(&mut Heap, &mut OffHeapTable)` in one borrow, and `Process::heap_and_mailbox_mut()` returns
-  `(&mut Heap, &mut Queue)`, so the `beam_message::Fragments::move_into` call at receive borrow-checks.
-  The remaining blockers for adopting it here are an **owning drain for the wake
-  list** and a `!Send`-friendly `SchedulerPool` for SMP adoption (`Runtime` holds `Rc`/`RefCell` tables
-  and `*mut Eterm` heaps, so `beam_process`'s `unsafe impl Send` escape is unavailable here). Without
-  that drain this crate keeps composing the public fragment primitives directly and
-  `MailboxState::remove_at` retains a removed message's heap `Fragments` and its whole off-heap
-  family so a just-bound payload stays valid — the refc-binary and MSO handles (the MSO handles in
-  the envelope's own order, so their `[HEADER_BIN_REF, slot, 0]` container terms resolve against the
-  copy's rebuilt source table) and the external-thing node identities (`NodeEntry` share handles).
-  The `*_with_ports` scheduler forms exist, but this crate does not route its slices through them
-  (holding the port-registry borrow across interpreted code turns every port BIF into the typed
-  `unsupported`; `Runtime::with_port_table`), so the pass discharges the same obligations at its round
-  boundaries through the exit observer (`src/runtime/ets_owner.rs`).
+* **`beam_process` / `beam_message` split borrow.** The split accessor exists
+  (`Process::heap_and_off_heap_mut()` / `heap_and_mailbox_mut()`, `beam_process/src/process.rs:579`), so
+  the `beam_message::Fragments::move_into` call at receive borrow-checks. The blockers for adopting it
+  here are an **owning drain for the wake list** and a `!Send`-friendly `SchedulerPool` for SMP adoption
+  (`Runtime` holds `Rc`/`RefCell` tables and `*mut Eterm` heaps, so `beam_process`'s `unsafe impl Send`
+  escape is unavailable). Without that drain this crate composes the public fragment primitives directly,
+  and `MailboxState::remove_at` retains a removed message's heap `Fragments` and its whole off-heap
+  family (the refc-binary and MSO handles — the MSO handles in the envelope's own order, so their
+  `[HEADER_BIN_REF, slot, 0]` container terms resolve against the copy's rebuilt source table — and the
+  external-thing node identities) so a just-bound payload stays valid. The `*_with_ports` scheduler forms
+  exist, but this crate does not route its slices through them (holding the port-registry borrow across
+  interpreted code turns every port BIF into the typed `unsupported`), so the pass discharges those
+  obligations at its round boundaries through the exit observer (`src/runtime/ets_owner.rs`).
 * **`beam_engine`** — a `MinimalContext` **arena word/byte accessor** so `erlang:memory/0,1`'s
   `processes`/`processes_used` can be real on the `-eval`/single-pass path.
 * **`beam_bifs` / `src/context` — the node identity.** The live node atom is fed from
-  `Runtime::local_node()` and stamped on every `call_registered` arm, so `erlang:node/0` and the node atom
-  a pid image carries reflect a live `-sname`/`-name` node; the residual is the **creation** — the hook
-  still reports the fixed `0` where a live `crate::dist::DistNode::creation()` exists, so an internal
-  pid/port image on a wired node encodes creation `0`.
+  `Runtime::local_node()` and stamped on every `call_registered` arm, so `erlang:node/0` and the node
+  atom a pid image carries reflect a live `-sname`/`-name` node; the residual is the **creation** (the
+  fixed `0`, see *Placeholders*).
 * **Distribution, phase 2** — the inbound link/exit/monitor/alias `DOP_*` families need a
   `beam_process` **remote-peer** seam (plus an alias table); `DOP_SEND`/`DOP_REG_SEND` already reach
   local mailboxes, and a live-peer loop past the handshake needs the `FragmentAssembler` receive-buffer
   coupling.
-* **`beam_io` / `beam_abi` lifecycle.** The **process-monitor family is live**: a safe
-  `beam_abi::monitor_identity(mon: *const ErlDrvMonitor) -> Option<[u8; 24]>` reader exists, so
-  `driver_monitor_process`/`_demonitor_process`/`_get_monitored_process` do the C's job over the
-  per-port monitor tree and `monitor_process_result` answers from the published `ProcessLiveness` view
-  (residual: the per-round snapshot freshness above). `driver_async` still needs a `beam_abi::DriverHost`
-  seam that can fire `ready_async` (since `beam_rt` is `#![deny(unsafe_code)]`); a `control` reply the
-  driver answered from its own memory needs a safe copy helper; a per-registration `ErlDrvEvent` identity
-  is still owed. `erl_drv_monotonic_time`'s phase differs because `beam_abi/src/driver/drv/mem.rs` reads
-  `CLOCK_MONOTONIC` from the system epoch where the oracle returns the Erlang monotonic time (a
-  process-global origin shared with `beam_bifs`' `time.rs`).
-* **`beam_io` — the filesystem accessors are implemented.** `beam_io::path_access(Path)` (a `libc::access`
-  wrapper) and `process_credentials()` (effective uid/gid) exist in `beam_io/src/fs_access.rs`, and the
-  native floor consumes them (`src/native/prim.rs::path_access_bits`, `src/native/file_server/file_info.rs`,
-  `src/native/prim_file.rs`), so the `#file_info{}` **`access`** slot is served and
-  `file:read_file_info/1`/`file:read_link_info/1` on an existing path answer `read_write`, matching the
-  oracle.
-* **`beam_bifs` — the `ets:setopts/2` heir gift copy and the tid-ref mint.** The owner→handle roster
-  exists, so a dead owner's *unnamed* table is reclaimed (see the ETS section). Remaining gaps:
-  `ets:setopts/2` installs `{heir,…}` through the non-copying `beam_ets::Table::setopts` where
-  `Table::install_heir` is meant (`src/ets/adopt.rs::setopts_2`; the runtime can mitigate only the
-  `ets:new/2` path via `Runtime::own_heir_gift`), and this runtime mints an unnamed table's tid ref via
-  `runtime::ets_owner::tid_ref_thing` (a shared `beam_bifs::access::make_ref_thing` or
-  `MonitorRef::from_id(u64)` would remove that loop).
+* **`beam_io` / `beam_abi` lifecycle.** The **process-monitor family is live** (the safe
+  `beam_abi::monitor_identity(mon: *const ErlDrvMonitor) -> Option<[u8; 24]>` reader backs
+  `driver_monitor_process`/`_demonitor_process`/`_get_monitored_process` over the per-port monitor tree,
+  and `monitor_process_result` answers from the published `ProcessLiveness` view; residual: the per-round
+  snapshot freshness above). The typed asks are `driver_async` (a `beam_abi::DriverHost` seam that can
+  fire `ready_async`, since `beam_rt` is `#![deny(unsafe_code)]`), a safe copy helper for a `control`
+  reply the driver answered from its own memory, a per-registration `ErlDrvEvent` identity, and
+  `erl_drv_monotonic_time`'s phase (`beam_abi/src/driver/drv/mem.rs` reads `CLOCK_MONOTONIC` from the
+  system epoch where the oracle returns the Erlang monotonic time).
+* **`beam_io` — the filesystem accessors are implemented.** `beam_io::path_access(Path)` and
+  `process_credentials()` exist in `beam_io/src/fs_access.rs` and the native floor consumes them, so the
+  `#file_info{}` **`access`** slot is served and `file:read_file_info/1`/`file:read_link_info/1` on an
+  existing path answer `read_write`, matching the oracle.
+* **`beam_bifs` — the `ets:setopts/2` heir gift copy and the tid-ref mint.** See *ETS ownership* below.
 * **`beam_io` — the port table sits behind one `RefCell`.** `Runtime::with_port_table` is the short-borrow
   seam and the quiescence predicate reads `PortRegistry::has_nothing_to_poll`, but `beam_io::PortRegistry`
   keeps its `ids` port-number table private behind the same single `RefCell` as the live ports, so the
   runtime cannot hand the process table and the port table out as disjoint borrows and therefore cannot
-  route its slices through `Scheduler::run_ready_with_ports` (a cross-crate handoff, not a bug); a split
-  accessor over the id table would unblock it.
+  route its slices through `Scheduler::run_ready_with_ports`; a split accessor over the id table unblocks it.
 * **`beam_message` — the copy-out's destination is never clean (the one remaining attributable copy-out
   cost, and the `ets_copy` RSS lever).** `Process::heap_mut()` always has words in use, so
   `beam_message::copy::is_clean_destination` (`erts_rust/crates/beam_message/src/copy.rs`: `to.used() == 0
@@ -542,51 +536,46 @@ and `… beam_rt -noshell -pa <fix> -eval '…'` (runtime root process, which **
 Exit 0 = success, 1 = runtime error, 3 = capability gap.
 
 ### Works today (oracle-identical)
-`code:which/1`, `code:get_object_code/1` (the oracle's path-based `{Module,Binary,Filename}`, its
-bytes and byte count cross-checked against `erl`'s own `mod_to_bin/3` read), `code:load_file/1` (then `module_loaded/1` true),
-`application:get_key/1,2`,
-`application:loaded_applications/0`, `application:which_applications/0`, `error_logger:warning_map/0`
-(a `RuntimeHooks` bridge). **An OTP-behaviour child comes up and survives**: `proc_lib:start_link/3`,
-`gen_server:start_link/2,3` (unnamed and `{local,Name}`), `gen_server:start/2,3` and
-`supervisor:start_link/2` all return a live `{ok, Pid}` (`is_process_alive/1` true). A
-`spawn`/`spawn_link` child whose **entry function** itself blocks in a `receive` parks and is resumed
-(`spawn(M,F,[])` with the blocking receive at the top level of `M:F`, incl. via a cross-module call,
-`erlang:apply(M,F,[])`, or a local fun), and so does a cross-module call whose callee parks on a
-`receive` that a later **message** matches. Local fun application with free variables works while the
-closure's body can complete without a suspension; a closure that is the process *entry* is driven
-in-machine by the runner. `gen_server:cast/2` returns `ok` (it is a plain `!`). Plain `!`/`receive`,
-`erlang:monitor(process,P)` (arity 2) and `erlang:monitor(process,P,Options)` with a `{tag,T}` and/or
-`{alias,Mode}` option work. **`gen_server:call/2,3` and `gen:call/3,4` work for a finite timeout as well
-as `infinity`** — for a pid *and* a registered `{local,Name}` — because `gen:do_call/4`'s finite-timeout
-clause (`lib/stdlib/src/gen.erl:251`, `erlang:monitor(process, Process, [{alias,demonitor}])`) and the
-`erlang:send/3 [noconnect]` it uses are both served; `sys:get_state/1` and the `sys:*` requests work too
-(`sys` issues `gen:call(Name, system, Request)`, `lib/stdlib/src/sys.erl:749`). A `receive … after T`
-that must time out delivers its timeout on **every** route, including through a nested run (a
-cross-module call or a fun application). The whole-file `file` family completes from a **scheduled**
-process (`file:read_file/1`, `file:write_file/2`, `file:open/2` for read and write, `file:close/1`,
-`file:list_dir/1`, `file:get_cwd/0`, `file:consult/1`, `file:read_file_info/1`/`read_link_info/1` (an
-existing path `read_write`) and `filelib:is_file/1` — an existing path `true`, an absent one `false`);
-the incremental io-device read path agrees with the oracle on both routes — a pure `file:read/2`
-sequence, a pure `file:read_line/1` sequence and a **mixed** one (`file:read/2` after a
-`file:read_line/1`, and a bare `file:position(H,cur)`) — because the device is buffer-first:
-`reply_get_chars` consults the stashed read-ahead leftover before the OS file, and the `{position,At}`
-arm compensates for it (`cur` is answered logically; a successful seek clears the buffer). The one
-documented divergence left is `{get_chars,…}` on a `{encoding,unicode}` device, which counts **bytes**
-where the oracle counts **characters**
+`code:which/1`, `code:get_object_code/1` (the oracle's path-based `{Module,Binary,Filename}`,
+cross-checked against `erl`'s own `mod_to_bin/3` read), `code:load_file/1` (then `module_loaded/1`
+true), `application:get_key/1,2`, `application:loaded_applications/0`,
+`application:which_applications/0`, `error_logger:warning_map/0` (a `RuntimeHooks` bridge). **An
+OTP-behaviour child comes up and survives**: `proc_lib:start_link/3`, `gen_server:start_link/2,3`
+(unnamed and `{local,Name}`), `gen_server:start/2,3` and `supervisor:start_link/2` all return a live
+`{ok, Pid}` (`is_process_alive/1` true). A `spawn`/`spawn_link` child whose **entry function** itself
+blocks in a `receive` parks and is resumed (`spawn(M,F,[])` with the blocking receive at the top level
+of `M:F`, incl. via a cross-module call, `erlang:apply(M,F,[])`, or a local fun), and so does a
+cross-module call whose callee parks on a `receive` that a later **message** matches. Local fun
+application with free variables works while the closure's body can complete without a suspension; a
+closure that is the process *entry* is driven in-machine by the runner. `gen_server:cast/2` returns `ok`
+(a plain `!`). Plain `!`/`receive`, `erlang:monitor(process,P)` (arity 2) and
+`erlang:monitor(process,P,Options)` with a `{tag,T}` and/or `{alias,Mode}` option work.
+**`gen_server:call/2,3` and `gen:call/3,4` work for a finite timeout as well as `infinity`** — for a pid
+*and* a registered `{local,Name}` — because `gen:do_call/4`'s finite-timeout clause
+(`lib/stdlib/src/gen.erl:251`, `erlang:monitor(process, Process, [{alias,demonitor}])`) and the
+`erlang:send/3 [noconnect]` it uses are both served; `sys:get_state/1` and the `sys:*` requests work
+too. A `receive … after T` that must time out delivers its timeout on **every** route, including through
+a nested run.
+The whole-file `file` family completes from a **scheduled** process (`read_file/1`, `write_file/2`,
+`open/2` read/write, `close/1`, `list_dir/1`, `get_cwd/0`, `consult/1`, `read_file_info/1`/
+`read_link_info/1` — an existing path answers `read_write` — and `filelib:is_file/1`), and the incremental
+io-device read path agrees with the oracle on both routes (pure `read/2`, pure `read_line/1`, and the
+mixed order) because the device is buffer-first. The one documented divergence left is `{get_chars,…}` on
+a `{encoding,unicode}` device, which counts **bytes** where the oracle counts **characters**
 ([`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md)).
 
 ### Confirmed failing — root cause and repro
 1. **`logger` / `error_logger` cannot emit a report on a plain runtime.** `logger:warning/1`,`notice/1`,
    `error/1` and `error_logger:info_msg/1,2`,`error_msg/2` raise `badarg`. Root cause: a plain
    `run`/`-eval` invocation loads only the preloaded modules — it does not run the boot script, so no
-   `logger` process exists (the boot-script path *does* register one), the `logger` ETS config table
-   never exists, `ets:whereis(logger)` is `undefined` (oracle: a `#Ref{}`), `logger_config:allow(Level)`
+   `logger` process exists (the boot-script path *does* register one) and the `logger` ETS config table
+   never exists: `ets:whereis(logger)` is `undefined` (oracle: a `#Ref{}`), `logger_config:allow(Level)`
    defaults the primary level to `notice` and admits a `notice`+ event, then
    `logger_backend`→`logger_config:get(Tid=undefined, primary)` → `ets:lookup(undefined, primary)` →
-   `badarg` (`etsl:lookup_undefined/0` = `{error,badarg}` in **both** runtimes). `logger:info/1,2`
-   returns `ok` **only because it is filtered** below the default `notice` level (`allow(info)` = false).
-   The residual is the missing native logger ETS floor: `lg:warn/0` → `{'EXIT',badarg}`, `lg:info/0` →
-   `ok`, `lg:elog_info/0` → `{'EXIT',badarg}`.
+   `badarg` (`etsl:lookup_undefined/0` = `{error,badarg}` in **both** runtimes), so `logger:info/1,2`
+   returns `ok` **only because it is filtered** below the default `notice` level. The residual is the
+   missing native logger ETS floor: `lg:warn/0` → `{'EXIT',badarg}`, `lg:info/0` → `ok`,
+   `lg:elog_info/0` → `{'EXIT',badarg}`.
 2. **`application:start/1,2`, `application:stop/1`, `application:ensure_all_started/1` fail.**
    On a plain runtime no `application_controller` process exists (it is spawned only on the `-boot`
    path): `{'EXIT',{noproc,{gen_server,call,[application_controller,{load_application,sasl},infinity]}}}`
@@ -619,28 +608,121 @@ the async-completion shape for a **live, blocked** target is pinned only on the 
 actually be waited out (or a spawned `-eval` child otherwise kept alive).
 
 ## GC-relocation hazards (what a MOVING engine heap would invalidate)
-The engine's `alloc_words` seam prefers the running scheduled process's own **young heap** (a capacity refusal is met by a no-relocation `Process::grow_nursery` and one retry) and falls back to the pointer-stable `Runtime::arena` (`MinimalContext`, chunked but never moved); the stores below are exposed according to the roster's *at risk*/*safe* split — a raw `Eterm` pinned **outside** the GC root set is what a future **moving** heap would dangle.
-**`Process::regs` is a snapshot, not a live mirror of the running machine.** `publish_roots_full`/`scatter_roots_full` (`context/gc.rs`) copy every x register, the whole stack **and** the machine's float-register file into `process.regs` (the FR words appended after the stack words — `beam_process::Registers` has no FR container, so the append is bounded by a `fr_count`) **only** at a heap-admission point (`gc::ensure_heap_full`, which passes the whole file `roots.fr.len()`) or a park (`publish_parked_roots`, which passes the live prefix `Machine::fr_mark()` — `0` for a float-free slice — recorded on `ProcessEngine::fr_published` for the resume to replay — and additionally publishes the parked machine's live `pending_exception` reason as a `Registers::extra_roots` word); between those points `process.regs` is stale by up to one slice, so a collection rooted in that snapshot reaches the machine's x/stack/FR and nothing else — a term the in-flight call chain holds outside them (a Rust local, or a `Machine` field with no extra-root publication) is not in the root set at all. The engine's `live` count is ignored (over-approximating a copying collector's root set is always safe).
-Three collect triggers differ in exposure. The **admission-point** collection *is* the publish/collect/scatter hand-off (safe). The **delivery-driven** collection (`Process::deliver` → `ensure_capacity`, `beam_process/src/process.rs:958`, whose `run_rooted_collection` at `:1166` gathers `self.regs`) and the **signal-driven** one (`ProcessTable::terminate_with_ports` → `terminate_and_cascade` → `terminate_into` → `enqueue_down_signal` → `copy_reason_onto` → `copy_into_heap`'s exhaustion arm → `grow_receiver_for_signal` → `Process::ensure_capacity`, all `ptab.rs`) fire outside an admission, and each is refused for a receiver with unpublished roots: `Process::has_unpublished_roots()` (= `relocation_exempt || state == ProcessState::Running`, `beam_process/src/process.rs:1098`) is tested *first* by every live caller (`Process::deliver` returns the raw refusal, which `RuntimeContext::deliver_message` turns into a heap-fragment delivery; the ptab signal builders route a refused signal to `enqueue_fragment_signal`). `beam_rt`'s own delivery seam adds a **second** refusal on top of that gate: `RuntimeContext::deliver_message_with_off_heap_inner` (`src/context/mod.rs`) asks `delivery_collection_is_unsound(receiver)` — the same two-phase unscanned-root valve the admission doors consult — before handing the message to `ProcessTable::deliver` and, on `true`, runs the delivery with the **receiver** marked relocation-exempt (`with_pid_relocation_exempt`), so `deliver` takes the ordinary heap-fragment fallback instead of collecting a receiver whose roots reach a region the collector cannot scan (the **fifth** collection site). Every send routes through `RuntimeContext::deliver_message_with_off_heap` (`src/context/mod.rs:590`), which marks the **sending context's own pid** relocation-exempt for the delivery (`with_relocation_exempt`, `:616`), so a `self() ! M` whose payload does not fit takes the heap-fragment fallback (`:631`) rather than collecting the running process. A signal to the currently-running process is deferred (`apply_exit_signal` → `schedule_service` skips `ProcessState::Running`, `ptab.rs:2181`), and one to a **parked** process is declined by the park-window exemption below. A signal to a **woken-but-not-yet-resumed** (`Runnable`) receiver — the class the A.9 `selfhost/*` corruption went through, a monitor-DOWN signal's `ensure_capacity` relocating that watcher's heap against a `regs` snapshot that is not its whole live root set — is declined by the **host collection gate**: every `ptab.rs` signal site asks the host's `CollectionGate` (OR-ed with `has_unpublished_roots`) before a *collecting* `ensure_capacity`, so such a receiver takes the no-relocation `Process::grow_nursery` / heap-fragment route instead, and `beam_rt` installs `RuntimeCollectionGate` (`context/gc_walk.rs`, the same roots-incompleteness walk as the admission-point valve) on the process table in `Runtime::new`, so the gate travels with the table into every pass and is present at every signal site. The park-window exemption below is **deliberately kept beside the gate**: the gate declines only when an unscanned container is reachable from the receiver's **gathered** roots, whereas the exemption refuses *any* relocation for the parked window, so it also covers a live term the host holds **outside** that published set (the runner's own entry terms — `ProcessEngine::args`, `ProcessEntry::Fun::fun`, `LocalFunTarget::args` — and any live `Eterm` in host Rust state), which the walk cannot see. Mechanism, measurement and the residual: [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md). The **pre-emption (`Yield`) arm** is the third out-of-admission trigger and is *not* exempt: it publishes the machine's roots first (`publish_parked_roots`) and then serves `Runtime::serve_gc_request` (`runtime/gc.rs`), so a pending forced-GC request is honoured there. The **Wait** arm's own `serve_gc_request` call is declined by the exemption it has just set (the request is consumed by `take_gc_request` and dropped, exactly as any other valve-refused request), so a forced request is served by the admission points and the `Yield` arm, not by a park into `Waiting`.
-The residual exposure is a live term held **outside** `process.regs` — a Rust local, or an engine `Machine` field with no extra-root publication — which is why `relocation_exempt` exists (a `self()`, the wrapped `-eval`/nested-`Machine` scope, and the parked window of a scheduled process). A parked machine's `Machine::pending_exception: Option<(ExceptionClass, Eterm)>` is published as a `Registers::extra_roots` word at the park (`runner/run.rs::publish_parked_roots`, through the public `Machine::pending_exception()`/`_mut()` accessor) and read back into the machine on resume (`RuntimeContext::resync_parked_roots(pid, machine, fr_count)`, which also clears the extra roots); the parked window carries the park arm's exemption, so that publication is what the resume re-syncs from (and what makes the published snapshot complete for any collection that does run, e.g. a `Yield`-arm one), never a licence for a park-window collection. What remains a Rust-local outside the root set is `Raise::live_reason`'s reason term between a raise and its stabilization (`try_stabilize_escaped`, `runner/run.rs:662`) — the same class of exposure the `relocation_exempt` valve covers — and the post-slice pin scan in `runner/run.rs` guards a live **float register** (an engine FR slot), not a machine field: it reads `Machine::fr_mark()` **once** per slice, pins the pid iff it is `> 0`, and passes the **same** count as `publish_parked_roots`' `fr_count` (recorded on `ProcessEngine::fr_published` and replayed to `resume_from_process_roots`), so a park publishes exactly the live `fr_mark()` prefix — empty for a float-free slice — and never loses a live FR term.
-**A collection is DECLINED whenever a root — or a container the process's scanned graph reaches — lives in a region the collector does not scan (the unscanned-root valve).** `RuntimeContext::call_registered` (`src/context/mod.rs`) hands `beam_bifs` the runtime's **pooled** 16 MiB `Runtime::bif_heaps` (`Runtime::take_bif_heap`), and `context::gc::alloc_words`'s arena fallback hands blocks out of `Runtime::arena`; both are `Target::Foreign` to the collector (`beam_gc/src/copy.rs:334-348`: a pointer outside the `FromSet` is left as-is and **not scanned**), so a container there neither keeps alive nor updates the young words it points at. **The holder this valve was built for is `Runtime::bif_heaps` — the pool a result is left on:** a container a registered BIF built there writes the caller's heap `Eterm`s verbatim (`erlang:'++'/2`, `lists:append/2`, `lists:reverse/1`, `lists:filter/2`, `ctx.tuple(…)`), and the engine stores it into the process's reachable graph, so a nursery pointer reachable only through it would be left stale by a move. A **scheduled process's** registered-BIF **container** result leaves the pool — it is moved onto that process's scanned young heap (*The BIF-result copy-out* above) — so the pooled-heap holder is the **unrewound** paths: a **NIF result** (never copied out), an **escaping** `DispatchHooks` arm's result, the `-eval`/nested shape and an error result. The valve (`context/gc.rs::root_is_unscanned` + `src/context/gc_walk.rs`) calls a term safe iff it is an **immediate**, a **literal**, or a pointer the process's collector **scans** (any nursery space — the current one or one a `Process::grow_nursery` growth retired — or the mature space), and each of the three admission points (`ensure_heap`, `ensure_heap_full`, `alloc_words_rooted`) plus the runner's park arm (`Runtime::serve_gc_request`) **declines** (`Ok(())`) a collection whose root set reaches anything else — as does the runtime's delivery seam, which asks the same valve (`delivery_collection_is_unsound`) and takes the relocation-exempt/heap-fragment path rather than letting `beam_process::Process::deliver` collect; the unrooted `context::gc::alloc_words` keeps its arena fallback (the engine's **unrooted** metadata-only `ContextSink` path). **Coverage:** the valve spans the machine roots the caller publishes (`x`/stack/FR) **and** the process's own root-set containers (`Process::collect`'s registers, mailbox, dict, saved arguments and pending signals), and it *descends* through the scanned graph, so a foreign container reached at depth ≥ 2 — a young cons whose element is a container on the pooled BIF heap, whose element is a nursery pointer, the shape a one-level test cannot see — is found. The descent is gated on a sticky, add-only per-pid latch (`Runtime::foreign_reachable`/`note_foreign_reachable` over `GcState::foreign`), opened by every event that can put an unscanned container into the process's reachable graph: the engine's arena fallback (`Runtime::note_gc_fallback` — the only allocation source), a BIF / native-floor / NIF result built outside the process heap (`context::open_gate_for_foreign_result`), a heap-fragment delivery (`send_fragmented_message`), a spawn argument or entry fun not on the new process's own heap (`note_spawn_foreign_roots`), the escape store / `stabilize_term` (`note_escaped_store_roots`), and the valve itself on a hit. The latch is pruned at the pass boundary for a process that is gone (`Runtime::prune_gc_requests`). Verified end to end: `beam_rt run w.beam w:f9/0` renders the oracle's exact `~w` at exit 0, and `tests/gc_run.rs` passes.
-* **At risk (a raw `Eterm` outside the root set):** `Runtime::persistent_terms` (`context/persistent_term.rs`), `Runtime::trace`'s `MatchSpec::Functions`, `Runtime::seq_trace`'s `Token{label,from}`, `Runtime::eval_closures` `FunBody.env`, `Runtime::timers` `TimerAction::Deliver`; `MailboxState.markers[].reference` and `NameSpec.inline_options` still need a check. A spawn argument or entry fun (`Runtime::runner_state`'s `ProcessEngine.args`/`entry:Fun{fun}`, `Runtime::pending_spawns` `PendingSpawn.args`) and a stored escape-store term sit outside those roots too, but each opens the descent latch (`Runtime::note_spawn_foreign_roots`, `Runtime::note_escaped_store_roots`). Safe: `RunnerState.exits`/`results` (the stabilized `eval_heap` copy), `references`/`Timers.refs` keys, ETS (own arena), `RuntimeContext` (no `Eterm` field), `dist`/`port` structs, `PortMeta`.
-* **Envelope/retained payloads:** `Process::run_rooted_collection` (`../../beam_process/src/process.rs:1166-1240`) roots each queued message's `payload`, `from` and `token` and re-installs all three (`set_from`/`set_token`/`with_payload`), so a heap `from`/`token` relocates too; the envelope's `off_heap`/`binaries`/`nodes` families and the `MailboxState::remove_at` retained copies are **refcounted Rust handles** (not young-heap `Eterm` words), so a moving heap can neither move them nor dangle them, and `with_payload` carries the `Fragments` chain across. `beam_process`'s `deliver_down_message` (`ptab.rs:2265-2299`) sets `Message.from` to the target pid's `to_eterm()` (an immediate) and carries a named monitor's `{Name,Node}` in the body, so `run_rooted_collection` relocates it with the payload.
-* **The arena allocation source here:** `Runtime::alloc_words` (`runtime.rs` → `self.arena`), the fallback `RuntimeContext::alloc_words` reaches after a young-heap refusal and a `grow_nursery`, also reached by `runner/budget.rs`'s forwarded `alloc_words` and by `Runtime::materialize`/`charlist`; mailbox `Queue` payloads are copied in by `copy_struct`.
-
-### The holder: the pooled BIF heap, found by the gated descent
-The holder the valve was built for is `Runtime::bif_heaps`: a container a registered BIF built there is classified `Target::Foreign` by the collector, and the engine stores a caller-heap term *inside* it, so a nursery pointer reachable only through it would be left stale by a move. A **scheduled process's** registered-BIF **container** result leaves that pool — *The BIF-result copy-out* above moves it onto the process's scanned young heap — so this holder is reached through the **unrewound** paths (a **NIF result**, an **escaping** `DispatchHooks` arm's result, the `-eval`/nested shape, an error result), beside the `-eval` heap, the arena fallback and a message fragment. The holder therefore sits at depth ≥ 2 below a scanned root (a young list whose element is the BIF-heap container), which the always-run per-word phase cannot see — only the *descent* does. The descent is the fix, and the latch that gates it (`GcState::foreign`) is opened by the BIF-result event (`context::open_gate_for_foreign_result`) exactly when such a container enters the process's reachable graph. A `beam_bifs` fast-path BIF's Rust-local accumulator (e.g. `foldl3`'s `acc`/`cur`/`elem`) is **not** a holder: no collection can run while such a frame is live (every nested run is a separate `RuntimeContext` whose collection latch is never armed and which is `relocation_exempt` for the whole application). The pooled-heap holder and the descent that finds it are pinned by `src/context/tests.rs`'s three valve cases — `the_valve_declines_a_foreign_container_nested_in_a_scanned_container`, `the_valve_declines_a_deeply_nested_foreign_container` and `the_valve_collects_when_the_nested_graph_is_fully_scanned` — the first two of which fail with the descent forced off.
+The engine's `alloc_words` seam prefers the running process's own **young heap** (a capacity refusal
+is met by a no-relocation `Process::grow_nursery` and one retry) and falls back to the
+pointer-stable `Runtime::arena`; the roster below splits *at risk* from *safe*, since a raw `Eterm`
+pinned **outside** the GC root set is what a future **moving** heap would dangle.
+**`Process::regs` is a snapshot, not a live mirror of the running machine.**
+`publish_roots_full`/`scatter_roots_full` (`context/gc.rs`) copy every x register, the whole stack
+and the machine's float-register file into `process.regs` (the FR words appended after the stack
+words, bounded by a `fr_count` — `beam_process::Registers` has no FR container) **only** at a
+heap-admission point (`gc::ensure_heap_full`, the whole file) or a park (`publish_parked_roots`, the
+live prefix `Machine::fr_mark()`, recorded on `ProcessEngine::fr_published` for the resume, plus the
+parked machine's live `pending_exception` as an `extra_roots` word); between those points the
+snapshot is stale by up to one slice, so a collection rooted in it reaches the machine's x/stack/FR
+and nothing else — a Rust local or an un-published `Machine` field is not in the root set at all.
+The engine's `live` count is ignored (over-approximating a copying collector's root set is always
+safe).
+Three collect triggers differ in exposure. The **admission-point** collection *is* the
+publish/collect/scatter hand-off (safe). The **delivery-driven** (`Process::deliver` →
+`ensure_capacity` → `run_rooted_collection` over `self.regs`) and the **signal-driven** one
+(`ptab.rs`'s `terminate_with_ports` → … → `grow_receiver_for_signal` → `ensure_capacity`) fire
+outside an admission and are refused for a receiver with unpublished roots —
+`Process::has_unpublished_roots()` (= `relocation_exempt || state == Running`, `process.rs:1098`) is
+tested *first* by every caller, so a refused delivery becomes a heap-fragment delivery and a refused
+ptab signal goes to `enqueue_fragment_signal`. `beam_rt` adds a **second** refusal on that seam
+(`RuntimeContext::deliver_message_with_off_heap_inner` asks `delivery_collection_is_unsound`, the
+valve below, and on `true` marks the **receiver** relocation-exempt) — the **fifth** collection
+site; every send routes through `deliver_message_with_off_heap` (`src/context/mod.rs:590`), marking
+the **sender's own pid** exempt. A signal to the running process is deferred; one to a **parked**
+process is declined by the park-window exemption below; one to a **woken-but-not-yet-resumed**
+(`Runnable`) receiver — the A.9 `selfhost/*` class — is declined by the **host collection gate**
+every `ptab.rs` signal site asks (OR-ed with `has_unpublished_roots`) before a *collecting*
+`ensure_capacity`, installed as `RuntimeCollectionGate` (`context/gc_walk.rs`, the same
+roots-incompleteness walk as the admission-point valve) in `Runtime::new`. The **`Yield`** arm is
+the third out-of-admission trigger and is *not* exempt: it publishes the machine's roots and then
+serves `Runtime::serve_gc_request`; the **Wait** arm's own `serve_gc_request` is declined by the
+exemption it has just set. Mechanism:
+[`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).
+The residual exposure is a live term held **outside** `process.regs` — a Rust local, or an engine
+`Machine` field with no extra-root publication — which is why `relocation_exempt` exists (a
+`self()`, the wrapped `-eval`/nested-`Machine` scope, the parked window). A parked machine's
+`pending_exception` is published as an `extra_roots` word at the park
+(`runner/run.rs::publish_parked_roots`) and read back on resume
+(`RuntimeContext::resync_parked_roots(pid, machine, fr_count)`); the parked window carries the
+exemption, so that publication is never a licence for a park-window collection. Still outside the
+root set: `Raise::live_reason`'s reason term between a raise and its stabilization
+(`try_stabilize_escaped`, `runner/run.rs:662`). The post-slice pin scan (`runner/run.rs`) reads
+`Machine::fr_mark()` **once** per slice, pins the pid iff it is `> 0`, and passes the same count as
+`publish_parked_roots`' `fr_count`, so a park publishes exactly the live FR prefix and never loses a
+live FR term.
+**A collection is DECLINED whenever a root — or a container the process's scanned graph reaches —
+lives in a region the collector does not scan (the unscanned-root valve).**
+`RuntimeContext::call_registered` (`src/context/mod.rs`) hands `beam_bifs` the runtime's **pooled**
+16 MiB `Runtime::bif_heaps`, and `context::gc::alloc_words`'s fallback hands blocks out of
+`Runtime::arena`; both are `Target::Foreign` to the collector (`beam_gc/src/copy.rs`: a pointer
+outside the `FromSet` is left as-is and **not scanned**). The valve
+(`context/gc.rs::root_is_unscanned` + `src/context/gc_walk.rs`) calls a term safe iff it is an
+**immediate**, a **literal**, or a pointer the process's collector **scans** (any nursery space,
+incl. one a `grow_nursery` retired, or the mature space); each of the three admission points
+(`ensure_heap`, `ensure_heap_full`, `alloc_words_rooted`), the runner's park arm
+(`Runtime::serve_gc_request`) and the delivery seam (`delivery_collection_is_unsound`) **declines**
+(`Ok(())`) a collection whose root set reaches anything else, while the unrooted
+`context::gc::alloc_words` keeps its arena fallback. The valve spans the machine roots the caller
+publishes (`x`/stack/FR) **and** the process's own root-set containers (`Process::collect`'s
+registers, mailbox, dict, saved arguments and pending signals), and it *descends* through the
+scanned graph, so a foreign container reached at depth ≥ 2 is found. The descent is gated on a
+sticky, add-only per-pid latch (`Runtime::foreign_reachable`/`note_foreign_reachable` over
+`GcState::foreign`), opened by every event that can put an unscanned container into the graph — the
+engine's arena fallback (`note_gc_fallback`), a BIF / native-floor / NIF result built outside the
+process heap (`open_gate_for_foreign_result`), a heap-fragment delivery (`send_fragmented_message`),
+a spawn argument or entry fun not on the new process's own heap (`note_spawn_foreign_roots`), the
+escape store / `stabilize_term` (`note_escaped_store_roots`), and the valve itself on a hit — and
+pruned at the pass boundary for a process that is gone (`Runtime::prune_gc_requests`). **The holder
+it was built for is `Runtime::bif_heaps`:** a container a registered BIF built there
+(`erlang:'++'/2`, `lists:append/2`, `lists:reverse/1`, `lists:filter/2`, `ctx.tuple(…)`) writes the
+caller's heap `Eterm`s verbatim, and a **scheduled process's** container result leaves the pool
+(*The BIF-result copy-out* above), so the holder is reached through the **unrewound** paths (a **NIF
+result**, an **escaping** `DispatchHooks` arm's result, the `-eval`/nested shape, an error result)
+at depth ≥ 2 below a scanned root. Verified end to end: `beam_rt run w.beam w:f9/0` renders the
+oracle's exact `~w` at exit 0, and `tests/gc_run.rs` passes; the descent is pinned by
+`src/context/tests.rs::{the_valve_declines_a_foreign_container_nested_in_a_scanned_container,
+…_a_deeply_nested_foreign_container, …_collects_when_the_nested_graph_is_fully_scanned}` (the first
+two fail with the descent forced off).
+* **At risk (a raw `Eterm` outside the root set):** `Runtime::persistent_terms`
+(`context/persistent_term.rs`), `Runtime::trace`'s `MatchSpec::Functions`, `Runtime::seq_trace`'s
+`Token{label,from}`, `Runtime::eval_closures` `FunBody.env`, `Runtime::timers`
+`TimerAction::Deliver`; `MailboxState.markers[].reference` and `NameSpec.inline_options` still need
+a check. A spawn argument or entry fun (`ProcessEngine.args`/`entry:Fun{fun}`, `PendingSpawn.args`)
+and a stored escape-store term also sit outside those roots, but each opens the descent latch
+(`note_spawn_foreign_roots`, `note_escaped_store_roots`). Safe: `RunnerState.exits`/`results` (the
+stabilized `eval_heap` copy), `references`/`Timers.refs` keys, ETS (own arena), `RuntimeContext` (no
+`Eterm` field), `dist`/`port` structs, `PortMeta`.
+* **Envelope/retained payloads:** `Process::run_rooted_collection`
+(`beam_process/src/process.rs:1166-1240`) roots each queued message's `payload`, `from` and `token`
+and re-installs all three (`set_from`/`set_token`/`with_payload`), so a heap `from`/`token`
+relocates too; the envelope's `off_heap`/`binaries`/`nodes` families and the
+`MailboxState::remove_at` retained copies are **refcounted Rust handles** (not young-heap `Eterm`
+words), so a moving heap can neither move them nor dangle them, and `with_payload` carries the
+`Fragments` chain across. `beam_process`'s `deliver_down_message` sets `Message.from` to the target
+pid's `to_eterm()` (an immediate) and carries a named monitor's `{Name,Node}` in the body, so
+`run_rooted_collection` relocates it with the payload.
+* **The arena allocation source here:** `Runtime::alloc_words` (`runtime.rs` → `self.arena`), the
+fallback `RuntimeContext::alloc_words` reaches after a young-heap refusal and a `grow_nursery`, also
+reached by `runner/budget.rs`'s forwarded `alloc_words` and by `Runtime::materialize`/`charlist`;
+mailbox `Queue` payloads are copied in by `copy_struct`.
 
 ## Cross-node handoffs (crate index)
-* **Differential gate** — **no case disagrees** (`mismatch=0`); the two `unsupported` cases are allowlisted capability gaps (`wire/new_fun_ext_encode`, `boot_extra/init_script_id_names_the_running_otp_release`). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
-* **A.7/A.9 boot** — stops at directive **18 of 22** (the kernel-application start; the CLI `-boot` action exits **3**), leaving a live `logger_server` registered as `logger`; the residual is the kernel application's supervisor tree, i.e. whatever the start still needs from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
-* **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases drive a scheduled `run` and **agree** with the oracle on both the interpreter and the baseline tier; the mover (a `beam_process` signal-driven collection of a woken monitor watcher) is declined by the host collection gate installed on the process table, with the park-window relocation exemption as its complementary mitigation (both are the A.9 E0 bullet above and *GC-relocation hazards* below).
-* **The native `file_server_2` service** — its served request surface and every typed per-request gap are tabled in [`src/native/CONTEXT.md`](src/native/CONTEXT.md); a process-**alias** reply tag is the typed `unsupported`.
-* **`beam_process` / `beam_message`** — an owning drain for the wake list and a `!Send`-friendly `SchedulerPool` for SMP adoption; the split heap+mailbox borrow exists.
-* **`beam_engine`** — a `MinimalContext` arena word/byte accessor (so `erlang:memory/0,1`'s process figures are real on the single-pass path).
-* **`beam_bifs` / `src/context` — the node identity** — the live node atom is fed from `Runtime::local_node()` on every `call_registered` arm; the residual is the **creation**, still the fixed `0` (`bridges.rs` supplies no creation where a live `crate::dist::DistNode::creation()` exists).
-* **Distribution, phase 2** — the inbound link/exit/monitor/alias `DOP_*` families need a `beam_process` remote-peer seam (plus an alias table); `DOP_SEND`/`DOP_REG_SEND` already reach local mailboxes, and a live-peer loop past the handshake needs the `FragmentAssembler` receive-buffer coupling.
-* **`beam_io` / `beam_abi`** — the driver-port lifecycle's remaining asks: `driver_async` needs a **safe** runner for the async `invoke`/`free` pair on `beam_abi`'s `DriverLibrary` (`ready_async` is safely callable and `beam_io`'s `Driver::drive_async` exists, but `beam_rt` never schedules the job, so `DriverHost::r#async` keeps the frozen `-1`); a safe reply-copy helper for a `control` reply the driver answered from its own memory; and a per-registration `ErlDrvEvent` identity. `erl_drv_monotonic_time`'s phase differs because `beam_abi` reads `CLOCK_MONOTONIC` from the system epoch (`erl_drv_time_offset` returns `0`).
-* **`beam_bifs` — the `ets:setopts/2` heir gift copy and the tid-ref mint** — `setopts_2` stores the gift term verbatim where `Table::install_heir` is meant, and an unnamed table's tid ref is minted locally (`runtime::ets_owner::tid_ref_thing`).
-* **`beam_io` — the port table sits behind one `RefCell`** — the `ids` port-number table shares the live ports' single `RefCell`, so the runtime cannot hand the process and port tables out as disjoint borrows and does not route its slices through `Scheduler::run_ready_with_ports`; a split accessor would unblock it.
-* **`beam_message` — the copy-out's never-clean destination** — `is_clean_destination` rejects `Process::heap_mut()` on every copy-out, bypassing the allocation-free `try_copy_fast` path (one extra `preflight_words` walk per copy **and** the `ets_copy` retained-nursery growth); relaxing it for this call site is safe and it is the one remaining attributable copy-out cost. This crate's `uses_*` gates still delegate to `beam_bifs::hook_sets`' exported rosters, so a new consumer is picked up automatically.
+A by-owner index of the long forms in `## Cross-node handoff detail` above; the owning doc holds the full detail.
+* **Differential gate** → [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md) (re-run `gate.sh` for the live figure).
+* **A.7/A.9 boot (index 19 stop)** → the bullet above + [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
+* **A.9 E0 (in-process `compile:file`)** → `tests/compile_file.rs`; mover: [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).
+* **The native `file_server_2` service** → [`src/native/CONTEXT.md`](src/native/CONTEXT.md) + [`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md).
+* **`beam_process` / `beam_message`** → the wake-list drain + `!Send`-friendly `SchedulerPool` (bullet above).
+* **`beam_engine`** → the `MinimalContext` arena accessor (bullet above).
+* **`beam_bifs` / `src/context` — the node identity** → the creation placeholder (bullet above + *Placeholders*).
+* **Distribution, phase 2** → the `beam_process` remote-peer seam (bullet above).
+* **`beam_io` / `beam_abi`** → `driver_async`, the `control` reply copy, the `ErlDrvEvent` identity, `erl_drv_monotonic_time` (bullet above).
+* **`beam_bifs` — `ets:setopts/2` + the tid-ref mint** → *ETS ownership* above.
+* **`beam_io` — the port table's one `RefCell`** → the bullet above.
+* **`beam_message` — the copy-out's never-clean destination** → *`ets_copy` peak RSS* above; `uses_*` gates delegate to `beam_bifs::hook_sets`' exported rosters.

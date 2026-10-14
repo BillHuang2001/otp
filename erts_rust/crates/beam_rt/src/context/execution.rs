@@ -157,6 +157,11 @@ impl ExecutionContext for RuntimeContext<'_> {
         // unit test below pins against `try_native`'s source so it can never drift out of the
         // host's dispatch.
         if crate::native::floor_shadows(module, function, arity) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: floor_shadows"
+                ));
+            }
             return Ok(None);
         }
         // A module with a loaded NIF library is **never** entered here, for two reasons.
@@ -184,12 +189,22 @@ impl ExecutionContext for RuntimeContext<'_> {
         //
         // [`NifRegistry::lookup`]: crate::nif::NifRegistry
         if self.runtime.nifs.borrow().is_loaded(module) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: nif-loaded"
+                ));
+            }
             return Ok(None);
         }
         // A registered `beam_bifs` BIF (the `bif.tab` surface, including the stdlib fast
         // paths and `ets:*`) is the implementation `call_bif` serves; it is never a `.beam`
         // body here.
         if self.runtime.registry.contains(module, function, arity) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: registry key"
+                ));
+            }
             return Ok(None);
         }
         // Resolve the callee's module handle. A module that is **already cached** is used as
@@ -242,16 +257,33 @@ impl ExecutionContext for RuntimeContext<'_> {
         // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`. The guard is a
         // pure function of the (immutable) loaded IR, so it answers the same both times.
         let Some(function_atom) = callee.atom_table.lookup(function) else {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: unknown function atom"
+                ));
+            }
             return Ok(None);
         };
         if callee_observes_its_call_site(&callee, function_atom, arity) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: observes its call site"
+                ));
+            }
             return Ok(None);
         }
         // Hand back the export entry label the synchronous `run_export` would enter. An export
         // the callee does not have is the synchronous path's `undef`.
         match callee.export(function_atom, arity) {
             Some(label) => Ok(Some((callee, label))),
-            None => Ok(None),
+            None => {
+                if crate::debug_trace::enabled() {
+                    crate::debug_trace::trace(format_args!(
+                        "seam decline {module}:{function}/{arity}: not exported"
+                    ));
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -273,12 +305,28 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// hands back is the **same** `Arc<Module>` the code server caches, which the engine
     /// requires because it dedups module contexts by `Arc::ptr_eq`.
     ///
-    /// `Ok(None)` — the seam's "I cannot run this closure in your machine" — is passed through
-    /// for the two fun kinds with no local label entry, exactly the cases
-    /// [`RuntimeContext::local_fun_target`] reports `Ok(None)` for: an **external** fun
-    /// (`fun M:F/A`, the `EXPORT_EXT` encoding) and the `-eval` evaluator's own closure. They
-    /// keep the value-returning [`Self::apply_fun`] fallback, byte-identical to a host without
-    /// the seam.
+    /// # An **external** fun has an in-machine entry too
+    ///
+    /// When there is no local label, the fun is handed to
+    /// [`RuntimeContext::external_fun_target`]: an **external** fun (`fun M:F/A`, the
+    /// `EXPORT_EXT` encoding) is not a closure but its identity *is* the callee's `M:F/A`, so it
+    /// resolves to that module's export label through the cross-module-call seam's own resolver
+    /// (inheriting its refusals) and is entered in this machine exactly like a `call_ext*`
+    /// callee. C's `call_fun` does the same: it dispatches to the fun's code in the same process,
+    /// whether the fun is a closure or an export.
+    ///
+    /// This is what closes the A.9 boot blocker: `gen_server` invokes its callback as
+    /// `fun Mod:handle_call/3` (`lib/stdlib/src/gen_server.erl:2363`, applied through
+    /// `try_handle_call/…`), and the callback body waits in `proc_lib:sync_start/2`'s `receive`.
+    /// On the fallback route that suspension was a nested, non-pumping machine's typed
+    /// `blocked()` and the caller (here `application_controller`) was killed; entered in-machine
+    /// it suspends the *process* and the scheduler resumes it when the child's message arrives.
+    ///
+    /// `Ok(None)` — the seam's "I cannot run this fun in your machine" — is passed through for
+    /// every fun kind that has no in-machine entry: the `-eval` evaluator's own closure, and any
+    /// external fun the resolver refuses (a floor/registry/NIF name, a call-site-observing
+    /// callee, a non-exported name). They keep the value-returning [`Self::apply_fun`] fallback,
+    /// byte-identical to a host without the seam.
     ///
     /// The engine places the free variables itself (`x(arity..)`, C's `call_fun` order), so
     /// `local_fun_target` is consulted purely for resolution/validation — its combined
@@ -288,9 +336,10 @@ impl ExecutionContext for RuntimeContext<'_> {
         fun: Eterm,
         args: &[Eterm],
     ) -> Result<Option<(Arc<Module>, Label)>> {
-        Ok(self
-            .local_fun_target(fun, args)?
-            .map(|target| (target.module, target.label)))
+        if let Some(target) = self.local_fun_target(fun, args)? {
+            return Ok(Some((target.module, target.label)));
+        }
+        self.external_fun_target(fun, args)
     }
 
     /// Ensures `heap_need` words are available for the running code, collecting the running
@@ -368,7 +417,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   at all — its module/function/arity are its whole identity, so applying it is an
     ///   ordinary dynamic call through [`RuntimeContext::call_bif`], which is what makes
     ///   `term_to_binary(fun lists:reverse/1)` and `(fun lists:reverse/1)([1,2,3])` both
-    ///   work;
+    ///   work. (The engine's `call_fun` seam tries the in-machine
+    ///   [`Self::resolve_local_fun`] entry **first** and only reaches this method when that
+    ///   denies the fun — see [`RuntimeContext::external_fun_target`].)
     /// * a fun built by the `-eval` evaluator is applied through the evaluator's own
     ///   store (`Runtime::eval_closures`): the fun may escape into a loaded module
     ///   (`lists:map(fun(X) -> X*X end, …)`) which calls back into it, and the closure

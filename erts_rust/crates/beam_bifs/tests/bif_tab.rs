@@ -62,9 +62,9 @@ const DECLARED_HBIF: usize = 7;
 /// keys, which are real BIFs the table does not declare.
 const IMPLEMENTED_DECLARED: usize = 556;
 const MISSING_DECLARED: usize = 0;
-const FAST_PATHS: usize = 87;
+const FAST_PATHS: usize = 89;
 /// The registry size (declared-and-implemented + fast paths).
-const REGISTRY_SIZE: usize = 643;
+const REGISTRY_SIZE: usize = 645;
 
 #[test]
 fn the_committed_table_has_a_pinned_shape() {

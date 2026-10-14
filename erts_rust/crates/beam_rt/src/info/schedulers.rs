@@ -37,7 +37,7 @@
 //! | `scheduler_id` | int (`1` — the id of this runtime's only scheduler) |
 //! | `dirty_cpu_schedulers` / `_online` | int (`+SDcpu` or `0`) |
 //! | `dirty_io_schedulers` | int (`+SDio` or `0`) |
-//! | `scheduler_bind_type` | atom, `unbound` |
+//! | `scheduler_bind_type` | atom (`+sbt <type>`, else `unbound`) |
 //! | `scheduler_bindings` | `{unbound, unbound, …}`, one per scheduler |
 //! | `multi_scheduling` | atom, `enabled`/`disabled` |
 //! | `multi_scheduling_blockers` / `normal_multi_scheduling_blockers` | `[]` |
@@ -67,7 +67,7 @@
 
 use beam_common::Result;
 
-use super::{logical_processors, schedulers_count, InfoValue};
+use super::{logical_processors, schedulers_count, schedulers_online_count, InfoValue};
 use crate::runtime::Runtime;
 
 /// The `system_info/1` value of a `schedulers`-family key, or `None` when `key` is not
@@ -78,21 +78,22 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
             Some(Ok(InfoValue::Int(logical_processors())))
         }
         "schedulers" => Some(Ok(InfoValue::Int(schedulers_count(rt)))),
-        // Every scheduler this runtime has is online: there is no online/offline model
-        // (the oracle may report fewer online than configured under load, so
-        // `schedulers_online == schedulers` is the honest answer for this model).
-        "schedulers_online" => Some(Ok(InfoValue::Int(schedulers_count(rt)))),
+        // `+S Total:Online` puts `Online` schedulers on line; without it the oracle's
+        // default online count is `min(total, <processors>)` (see
+        // [`logical_processors`](super::logical_processors) and the online resolver).
+        "schedulers_online" => Some(Ok(InfoValue::Int(schedulers_online_count(rt)))),
         // The *calling* scheduler's id, `erlang:system_info(scheduler_id)`. This runtime
         // has exactly one scheduler and the oracle's ids are 1-based, so the calling
         // scheduler's id here is always `1`. (The oracle's own value is therefore
         // volatile — it is whichever scheduler happens to run the call, e.g. `7` on this
         // 16-scheduler host — and must **not** be copied: `1` is this runtime's real id.)
         "scheduler_id" => Some(Ok(InfoValue::Int(1))),
-        "dirty_cpu_schedulers" | "dirty_cpu_schedulers_online" => {
-            Some(Ok(InfoValue::Int(dirty_cpu_schedulers(rt))))
+        "dirty_cpu_schedulers" => Some(Ok(InfoValue::Int(dirty_cpu_schedulers(rt)))),
+        "dirty_cpu_schedulers_online" => {
+            Some(Ok(InfoValue::Int(dirty_cpu_schedulers_online(rt))))
         }
         "dirty_io_schedulers" => Some(Ok(InfoValue::Int(dirty_io_schedulers(rt)))),
-        "scheduler_bind_type" => Some(Ok(InfoValue::Atom("unbound"))),
+        "scheduler_bind_type" => Some(Ok(InfoValue::Atom(scheduler_bind_type(rt)))),
         "scheduler_bindings" => Some(Ok(scheduler_bindings(rt))),
         "multi_scheduling" => Some(Ok(InfoValue::Atom(if schedulers_count(rt) > 1 {
             "enabled"
@@ -107,9 +108,10 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         // ERTS interface constant (`beam_common::CONTEXT_REDS`) reported as `4000` always.
         "context_reductions" => Some(Ok(InfoValue::Int(beam_common::CONTEXT_REDS as i64))),
         // The scheduler *state* keys, all from this runtime's own scheduler model.
-        "schedulers_total" | "schedulers_active" | "run_queues" => {
-            Some(Ok(InfoValue::Int(schedulers_count(rt))))
-        }
+        "schedulers_total" | "run_queues" => Some(Ok(InfoValue::Int(schedulers_count(rt)))),
+        // `schedulers_active` is the number of schedulers online (and running): the oracle
+        // reported `active = online = 2` for `+S 4:2`.
+        "schedulers_active" => Some(Ok(InfoValue::Int(schedulers_online_count(rt)))),
         "schedulers_state" => Some(Ok(schedulers_state(rt))),
         "all_schedulers_state" => Some(Ok(all_schedulers_state(rt))),
         // `erts_get_logical_processors(…, &no)`: the processor quota available to the
@@ -124,15 +126,16 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
 
 /// `system_info(schedulers_state)` — `{Total, Online, Active}` (`erl_bif_info.c:3262-3272`).
 ///
-/// All three are this runtime's one scheduler count: it has no online/offline model and
-/// no paused scheduler, so every scheduler it reports is both online and active — the
-/// same rule [`schedulers_online`](try_value) already follows.
+/// The total is the configured scheduler count and online/active are the online count
+/// (this runtime pauses no scheduler, so every online scheduler is active). The oracle
+/// answered `{4,2,2}` for `+S 4:2`.
 fn schedulers_state(rt: &Runtime) -> InfoValue {
-    let count = schedulers_count(rt);
+    let total = schedulers_count(rt);
+    let online = schedulers_online_count(rt);
     InfoValue::Tupled(vec![
-        InfoValue::Int(count),
-        InfoValue::Int(count),
-        InfoValue::Int(count),
+        InfoValue::Int(total),
+        InfoValue::Int(online),
+        InfoValue::Int(online),
     ])
 }
 
@@ -140,27 +143,34 @@ fn schedulers_state(rt: &Runtime) -> InfoValue {
 /// (`erl_bif_info.c:3284-3329`).
 ///
 /// The C builds the list as `normal`, then `dirty_cpu`, then `dirty_io`, **omitting** a
-/// dirty pool whose total is `0`; this runtime has no dirty pool unless `+SDcpu`/`+SDio`
-/// configured one, so a default runtime answers the single `normal` row. The `dirty_io`
+/// dirty pool whose total is `0`. This runtime's dirty pools use the emulator defaults
+/// when `+SDcpu`/`+SDio` did not configure one: `dirty_cpu` follows the normal total
+/// (with the online half online) and `dirty_io` is `10`. The oracle answered
+/// `[{normal,4,2,2},{dirty_cpu,4,2,2},{dirty_io,10,10,10}]` for `+S 4:2`; the `dirty_io`
 /// row reports the io pool's total twice (the C's `TUPLE4(am_dirty_io, total, total,
 /// active)`), unlike the `normal`/`dirty_cpu` rows' total/online/active.
 fn all_schedulers_state(rt: &Runtime) -> InfoValue {
-    let count = schedulers_count(rt);
+    let total = schedulers_count(rt);
+    let online = schedulers_online_count(rt);
     let mut rows = vec![InfoValue::Tupled(vec![
         InfoValue::Atom("normal"),
-        InfoValue::Int(count),
-        InfoValue::Int(count),
-        InfoValue::Int(count),
+        InfoValue::Int(total),
+        InfoValue::Int(online),
+        InfoValue::Int(online),
     ])];
-    if let Some(dirty_cpu) = configured_pool(rt.config().emulator.dirty_cpu_schedulers) {
+    let dirty_cpu = configured_pool(rt.config().emulator.dirty_cpu_schedulers)
+        .unwrap_or(total);
+    if dirty_cpu > 0 {
         rows.push(InfoValue::Tupled(vec![
             InfoValue::Atom("dirty_cpu"),
             InfoValue::Int(dirty_cpu),
-            InfoValue::Int(dirty_cpu),
-            InfoValue::Int(dirty_cpu),
+            InfoValue::Int(online),
+            InfoValue::Int(online),
         ]));
     }
-    if let Some(dirty_io) = configured_pool(rt.config().emulator.dirty_io_schedulers) {
+    let dirty_io = configured_pool(rt.config().emulator.dirty_io_schedulers)
+        .unwrap_or(DEFAULT_DIRTY_IO_SCHEDULERS);
+    if dirty_io > 0 {
         rows.push(InfoValue::Tupled(vec![
             InfoValue::Atom("dirty_io"),
             InfoValue::Int(dirty_io),
@@ -212,6 +222,11 @@ fn scheduling_statistics() -> InfoValue {
 /// thread. The oracle's default when no `+A` is given.
 const DEFAULT_THREAD_POOL_SIZE: i64 = 1;
 
+/// The emulator's default dirty-IO scheduler pool size (`erl_init.c`: `dirty_io_scheds
+/// = 10`), reported by `dirty_io_schedulers` and the `dirty_io` row of
+/// `all_schedulers_state` when `+SDio` did not configure one.
+const DEFAULT_DIRTY_IO_SCHEDULERS: i64 = 10;
+
 /// `erlang:system_info(thread_pool_size)` — the async-thread-pool size the emulator was
 /// started with.
 ///
@@ -229,25 +244,63 @@ const DEFAULT_THREAD_POOL_SIZE: i64 = 1;
 /// oracle's last-one-wins order. A malformed or truncated entry keeps the default —
 /// never a panic.
 fn thread_pool_size(rt: &Runtime) -> i64 {
-    let mut size = DEFAULT_THREAD_POOL_SIZE;
-    for pair in rt.config().emulator.extra_emulator_flags.chunks_exact(2) {
-        if pair[0] == "+A" {
-            if let Ok(count) = pair[1].parse::<u32>() {
-                size = i64::from(count.max(1));
-            }
-        }
+    rt.config()
+        .preserved_emulator_flag("+A")
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|count| i64::from(count.max(1)))
+        .unwrap_or(DEFAULT_THREAD_POOL_SIZE)
+}
+
+/// The `+sbt` bind-type spelling (see [`SCHEDULER_BIND_TYPES`](crate::cli::flags::SCHEDULER_BIND_TYPES))
+/// mapped to the atom `erlang:system_info(scheduler_bind_type)` reports
+/// (`erts_cpu_topology_bind_type`, `erl_cpu_topology.c:623-647`), last occurrence winning.
+///
+/// The C's map, and its reason: `ERTS_CPU_BIND_DEFAULT_BIND` is
+/// `ERTS_CPU_BIND_THREAD_NO_NODE_PROCESSOR_SPREAD` (`erl_cpu_topology.c:82-83`), so the
+/// `db` (and `tnnps`) spelling reports `thread_no_node_processor_spread`, and with no
+/// `+sbt` at all the C reports `unbound` (`ERTS_CPU_BIND_UNBOUND`).
+///
+/// Verified against the oracle (OTP 29.1.1 / erts-17.1), measured with
+/// `erl +sbt <type> -noshell -eval 'io:format("~p~n",[erlang:system_info(scheduler_bind_type)]),halt().'`:
+///
+/// ```text
+/// u → unbound      db → thread_no_node_processor_spread    s → spread
+/// ps → processor_spread    ts → thread_spread    tnnps → thread_no_node_processor_spread
+/// nnps → no_node_processor_spread    nnts → no_node_thread_spread    ns → no_spread
+/// (no +sbt) → unbound
+/// ```
+fn scheduler_bind_type(rt: &Runtime) -> &'static str {
+    match rt.config().preserved_emulator_flag("+sbt") {
+        Some("db") | Some("tnnps") => "thread_no_node_processor_spread",
+        Some("s") => "spread",
+        Some("ps") => "processor_spread",
+        Some("ts") => "thread_spread",
+        Some("nnps") => "no_node_processor_spread",
+        Some("nnts") => "no_node_thread_spread",
+        Some("ns") => "no_spread",
+        // `u`, an absent `+sbt`, or a preserved value the CLI would never emit.
+        _ => "unbound",
     }
-    size
 }
 
-/// `+SDcpu N`, else `0` — this runtime has no dirty CPU scheduler pool.
+/// `+SDcpu N`, else the emulator default (the normal scheduler total) — this runtime
+/// models no separate dirty CPU pool, so it reports the default ERTS pool size.
 fn dirty_cpu_schedulers(rt: &Runtime) -> i64 {
-    configured_pool(rt.config().emulator.dirty_cpu_schedulers).unwrap_or(0)
+    configured_pool(rt.config().emulator.dirty_cpu_schedulers)
+        .unwrap_or_else(|| schedulers_count(rt))
 }
 
-/// `+SDio N`, else `0` — this runtime has no dirty IO scheduler pool.
+/// The online half of the dirty CPU pool: `+SDcpu N:N`'s second number, else the normal
+/// online count (the oracle's `dirty_cpu_schedulers_online` follows the normal online
+/// count when no dirty pool is configured).
+fn dirty_cpu_schedulers_online(rt: &Runtime) -> i64 {
+    schedulers_online_count(rt)
+}
+
+/// `+SDio N`, else the emulator default of `10` — this runtime models no dirty IO pool.
 fn dirty_io_schedulers(rt: &Runtime) -> i64 {
-    configured_pool(rt.config().emulator.dirty_io_schedulers).unwrap_or(0)
+    configured_pool(rt.config().emulator.dirty_io_schedulers)
+        .unwrap_or(DEFAULT_DIRTY_IO_SCHEDULERS)
 }
 
 /// `{unbound, unbound, …}`, one `unbound` atom per configured (normal) scheduler —
@@ -306,6 +359,153 @@ mod tests {
         assert!(try_value("nonsense", &rt).is_none());
     }
 
+    /// The `+sbt` spelling → atom table of [`scheduler_bind_type`] (all nine spellings the
+    /// CLI accepts, `crate::cli::flags::SCHEDULER_BIND_TYPES`), measured against the oracle
+    /// (OTP 29.1.1 / erts-17.1) with `erl +sbt <spelling> -noshell -eval
+    /// 'io:format("~p~n",[erlang:system_info(scheduler_bind_type)]),halt().'` — nine
+    /// spellings, nine exit-0 answers. The no-`+sbt` default is `unbound` too.
+    const PLUS_SBT_ANSWERS: [(&str, &str); 9] = [
+        ("u", "unbound"),
+        ("db", "thread_no_node_processor_spread"),
+        ("s", "spread"),
+        ("ps", "processor_spread"),
+        ("ts", "thread_spread"),
+        ("tnnps", "thread_no_node_processor_spread"),
+        ("nnps", "no_node_processor_spread"),
+        ("nnts", "no_node_thread_spread"),
+        ("ns", "no_spread"),
+    ];
+
+    /// Every `+sbt` spelling materializes the oracle's atom: the key's `InfoValue::Atom` is
+    /// resolved **by name** in the boot-seeded global atom table
+    /// ([`crate::boot::CORE_ATOMS`](crate::boot)), so a spelling whose atom is unseeded makes
+    /// `Runtime::system_info/1` fail with `TermNotFound` (`term not found`) instead of
+    /// answering. Both halves are asserted: the heap-free value, and the real materialized
+    /// term through the path the CLI takes.
+    #[test]
+    fn every_plus_sbt_spelling_materializes_the_oracles_atom() {
+        for (spelling, expected) in PLUS_SBT_ANSWERS {
+            let mut rt = runtime_from(&["+sbt", spelling]);
+            assert_eq!(
+                try_value("scheduler_bind_type", &rt).unwrap().unwrap(),
+                InfoValue::Atom(expected),
+                "+sbt {spelling}"
+            );
+            rt.system_info("scheduler_bind_type")
+                .unwrap_or_else(|error| {
+                    panic!("system_info(scheduler_bind_type) after `+sbt {spelling}`: {error}")
+                });
+        }
+        // No `+sbt` at all is the C's `ERTS_CPU_BIND_UNBOUND` default.
+        let mut rt = runtime();
+        assert_eq!(
+            try_value("scheduler_bind_type", &rt).unwrap().unwrap(),
+            InfoValue::Atom("unbound")
+        );
+        rt.system_info("scheduler_bind_type")
+            .expect("system_info(scheduler_bind_type) without `+sbt`");
+    }
+
+    /// The live-oracle half of the test above: for each of the nine spellings, the oracle's
+    /// own answer for `+sbt <spelling>` is what this runtime reports (value **and** the
+    /// spelling's exit status, which the oracle probe asserts through `status.success()`).
+    #[test]
+    fn every_plus_sbt_spelling_matches_the_live_oracle() {
+        let Some(oracle) = oracle_erl() else {
+            skip_oracle_loudly();
+            return;
+        };
+        for (spelling, _) in PLUS_SBT_ANSWERS {
+            let Some(answer) = oracle_scheduler_bind_type(&oracle, Some(spelling)) else {
+                skip_oracle_loudly();
+                return;
+            };
+            let rt = runtime_from(&["+sbt", spelling]);
+            let ours = try_value("scheduler_bind_type", &rt).unwrap().unwrap();
+            let InfoValue::Atom(name) = ours else {
+                panic!("scheduler_bind_type must be an atom, got {ours:?}");
+            };
+            assert_eq!(
+                name, answer,
+                "`+sbt {spelling}`: this runtime must report the oracle's own atom"
+            );
+        }
+        let Some(default) = oracle_scheduler_bind_type(&oracle, None) else {
+            skip_oracle_loudly();
+            return;
+        };
+        let rt = runtime();
+        let ours = try_value("scheduler_bind_type", &rt).unwrap().unwrap();
+        let InfoValue::Atom(name) = ours else {
+            panic!("scheduler_bind_type must be an atom, got {ours:?}");
+        };
+        assert_eq!(
+            name, default,
+            "the no-`+sbt` default must be the oracle's own atom"
+        );
+    }
+
+    /// The oracle `erl`: `$ERTS_ORACLE` when it is an executable, else `erl` on `$PATH` (the
+    /// convention `tools/differential` uses), resolved **without running** it.
+    fn oracle_erl() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = std::path::PathBuf::from(&value);
+            if is_executable(&program) {
+                return Some(program);
+            }
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("erl"))
+            .find(|candidate| is_executable(candidate))
+    }
+
+    /// Whether `candidate` is an executable regular file.
+    fn is_executable(candidate: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(candidate) {
+            Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+
+    /// The oracle's `erlang:system_info(scheduler_bind_type)` for `+sbt <spelling>` (`None`
+    /// for no `+sbt`), as the atom name, or `None` when the probe cannot complete. The probe
+    /// always `halt()`s, so it terminates on its own.
+    fn oracle_scheduler_bind_type(
+        oracle: &std::path::Path,
+        spelling: Option<&str>,
+    ) -> Option<String> {
+        let mut command = std::process::Command::new(oracle);
+        if let Some(spelling) = spelling {
+            command.args(["+sbt", spelling]);
+        }
+        let output = command
+            .args([
+                "-noshell",
+                "-eval",
+                "io:format(\"~p~n\",[erlang:system_info(scheduler_bind_type)]),halt().",
+            ])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// The loud banner for a skipped oracle comparison — a missing toolchain is never a
+    /// silent pass.
+    fn skip_oracle_loudly() {
+        eprintln!();
+        eprintln!("======= beam_rt info/schedulers.rs ORACLE CROSS-CHECK SKIPPED =======");
+        eprintln!("no `erl` on $PATH (and no executable $ERTS_ORACLE): the oracle comparison");
+        eprintln!("cannot run. Set $ERTS_ORACLE (or install Erlang/OTP) and re-run. NOT a pass.");
+        eprintln!("===============================================================");
+        eprintln!();
+    }
+
     #[test]
     fn the_scheduler_state_keys_describe_this_runtime_s_own_model() {
         let rt = runtime();
@@ -333,16 +533,36 @@ mod tests {
                 InfoValue::Int(count)
             ])
         );
-        // No dirty pool is configured by default, so `all_schedulers_state` carries only
-        // the `normal` row (the C omits a pool whose total is 0) — and it is *first*.
+        // No `+SDcpu`/`+SDio` is configured, so the dirty pools fall back to the emulator
+        // defaults, and the C emits **all three** rows (`erl_bif_info.c:3284-3329`), in the
+        // order `normal`, `dirty_cpu`, `dirty_io`:
+        //   `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(all_schedulers_state)]),halt().'`
+        //   → `[{normal,<total>,<online>,<online>},{dirty_cpu,<total>,<online>,<online>},
+        //       {dirty_io,10,10,10}]` on this host (`dirty_cpu` follows the normal total, the
+        //   `dirty_io` default is `10`; `erl_init.c` `dirty_io_scheds = 10`).
+        let dirty_cpu = dirty_cpu_schedulers(&rt);
         assert_eq!(
             try_value("all_schedulers_state", &rt).unwrap().unwrap(),
-            InfoValue::List(vec![InfoValue::Tupled(vec![
-                InfoValue::Atom("normal"),
-                InfoValue::Int(count),
-                InfoValue::Int(count),
-                InfoValue::Int(count),
-            ])])
+            InfoValue::List(vec![
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("normal"),
+                    InfoValue::Int(count),
+                    InfoValue::Int(count),
+                    InfoValue::Int(count),
+                ]),
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("dirty_cpu"),
+                    InfoValue::Int(dirty_cpu),
+                    InfoValue::Int(count),
+                    InfoValue::Int(count),
+                ]),
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("dirty_io"),
+                    InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                    InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                    InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                ]),
+            ])
         );
         assert!(try_value("nonsense", &rt).is_none());
     }
@@ -367,13 +587,21 @@ mod tests {
                 InfoValue::Int(2)
             ])
         );
+        // The row tuple is `{Tag, Total, Online, Active}` (`erl_bif_info.c:3305-3320`), so a
+        // `dirty_cpu` pool sized `4` on a runtime with `2` online schedulers reports
+        // `{dirty_cpu,4,2,2}` — its *online*/*active* halves are the online scheduler count,
+        // exactly as the oracle's `+S 2 +SDcpu 4` row `{dirty_cpu,2,2,2}` shows (the C clamps
+        // `+SDcpu 4` to the normal total at `erl_init.c:1197`, which is why the oracle's total
+        // reads `2` there).
+        //   `erl -noshell +S 2 +SDcpu 4 +SDio 2 -eval 'io:format("~p~n",[erlang:system_info(all_schedulers_state)]),halt().'`
+        //   → `[{normal,2,2,2},{dirty_cpu,2,2,2},{dirty_io,2,2,2}]`
         assert_eq!(
             rows[1],
             InfoValue::Tupled(vec![
                 InfoValue::Atom("dirty_cpu"),
                 InfoValue::Int(4),
-                InfoValue::Int(4),
-                InfoValue::Int(4)
+                InfoValue::Int(2),
+                InfoValue::Int(2)
             ])
         );
         assert_eq!(
@@ -386,14 +614,28 @@ mod tests {
             ])
         );
 
-        // A configured pool of zero is still "no pool" — the C omits it.
+        // A configured pool of `0` is not reachable through the CLI — the oracle rejects
+        // `+SDio 0` outright (`bad number of dirty I/O schedulers 0`, `erl_init.c:1089-1097`,
+        // the valid range is `[1-…]`) and the emulator default is `10` — so a zero here means
+        // "no explicit pool": the `dirty_io` row falls back to the emulator default, which is
+        // never `0`, and the row stays in the list.
         let mut config = crate::config::RuntimeConfig::default().with_schedulers(1);
         config.emulator.dirty_io_schedulers = Some(0);
         let rt = Runtime::new(config).expect("a runtime with an empty +SDio");
         let InfoValue::List(rows) = try_value("all_schedulers_state", &rt).unwrap().unwrap() else {
             panic!("all_schedulers_state must be a list");
         };
-        assert_eq!(rows.len(), 1, "a zero-total pool is omitted");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[2],
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("dirty_io"),
+                InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+                InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS),
+            ]),
+            "a zero dirty-io pool falls back to the emulator default of 10"
+        );
     }
 
     #[test]
@@ -451,17 +693,25 @@ mod tests {
         );
     }
     #[test]
-    fn dirty_schedulers_default_to_zero_and_follow_the_flags() {
+    fn dirty_schedulers_follow_the_flags_and_the_emulator_defaults() {
+        // No `+SDcpu`/`+SDio` is configured, so the emulator defaults apply:
+        //   `erl -noshell -eval 'io:format("~p ~p~n",[erlang:system_info(dirty_cpu_schedulers),erlang:system_info(dirty_io_schedulers)]),halt().'`
+        //   → on this host `<normal total> 10` (the C's `dirty_io_scheds = 10`,
+        //     `erl_init.c:869-871`; here `available_parallelism()` is the normal total, so
+        //     `dirty_cpu_schedulers` is that count, not `0`).
         let rt = runtime();
         assert_eq!(
             try_value("dirty_cpu_schedulers", &rt).unwrap().unwrap(),
-            InfoValue::Int(0)
+            InfoValue::Int(schedulers_count(&rt)),
+            "with no +SDcpu the dirty CPU pool follows the normal scheduler total"
         );
         assert_eq!(
             try_value("dirty_io_schedulers", &rt).unwrap().unwrap(),
-            InfoValue::Int(0)
+            InfoValue::Int(DEFAULT_DIRTY_IO_SCHEDULERS)
         );
+        assert_eq!(DEFAULT_DIRTY_IO_SCHEDULERS, 10);
 
+        // An explicit `+SDcpu`/`+SDio` pool is reported verbatim.
         let mut config = crate::config::RuntimeConfig::default();
         config.emulator.dirty_cpu_schedulers = Some(4);
         config.emulator.dirty_io_schedulers = Some(2);

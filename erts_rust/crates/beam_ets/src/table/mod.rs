@@ -569,8 +569,12 @@ impl Table {
         // `duplicate_bag` entry may hold many).
         let removed = self.interior.lookup(key, atoms);
         self.interior.delete(key, atoms)?;
+        let removed_something = !removed.is_empty();
         for object in removed {
             self.free_object(object);
+        }
+        if removed_something {
+            self.release_empty_interior();
         }
         Ok(())
     }
@@ -588,12 +592,41 @@ impl Table {
             .filter(|&stored| eq(stored, object, atoms))
             .collect();
         self.interior.delete_object(key, object, atoms)?;
+        let removed_something = !removed.is_empty();
         for stored in removed {
             self.free_object(stored);
+        }
+        if removed_something {
+            self.release_empty_interior();
         }
         Ok(())
     }
 
+    /// Release the index's own storage once the last object has left the interior,
+    /// so a table emptied one object at a time returns to **the same footprint** as
+    /// one emptied by [`delete_all_objects`](Table::delete_all_objects) — and to the
+    /// empty-table figure the oracle reports.
+    ///
+    /// Verified against the live system `erl` (OTP 29 / erts-17.1): `ets:info(T,
+    /// memory)` returns *exactly* to the empty-table figure after the key set has
+    /// been deleted (`set`/`bag`/`duplicate_bag` 306 words, `ordered_set` 140 words —
+    /// the same figures as a freshly created table), so the oracle keeps no index
+    /// storage for an empty table. The interiors' `memory` counts the index's
+    /// *capacity* (a CHAMP root's slot vectors, a chained index's bucket array, the
+    /// ordered arena's nodes), which only a rebuilt interior gives back.
+    ///
+    /// Only a removal that actually happened calls this, so a `delete` of an absent
+    /// key — a common no-op — never churns the index.
+    fn release_empty_interior(&mut self) {
+        if self.interior.size() == 0 {
+            self.interior = build_interior(
+                self.opts.kind(),
+                self.set_interior,
+                self.ordered_interior,
+                self.opts.keypos(),
+            );
+        }
+    }
     /// Replace **every** object stored under `key` with `objects`, reclaiming the
     /// replaced objects' storage.
     ///

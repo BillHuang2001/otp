@@ -28,7 +28,8 @@
     use beam_alloc::Heap;
     use beam_common::{BeamError, Result};
     use beam_term::prelude::{
-        make_atom, make_internal_pid, make_pid_data, make_small, Atom, NIL,
+        make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data,
+        make_small, Atom, NIL,
     };
 
     use super::*;
@@ -425,6 +426,127 @@
         assert_eq!(bytes[10], 0);
     }
 
+    /// The `deterministic` option (`DFLAG_DETERMINISTIC`) sorts a flat map's atom keys
+    /// in **full term order** (name order for atoms), not the stored order — the
+    /// oracle's `term_to_binary(#{b=>1,a=>2,c=>3},[deterministic])` (see
+    /// `tests/t2b_options.rs` for the live cross-check).
+    #[test]
+    fn deterministic_sorts_a_flat_map_with_atom_keys() {
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        let a = make_atom(atoms.intern("a"));
+        let b = make_atom(atoms.intern("b"));
+        let c = make_atom(atoms.intern("c"));
+        // Stored order b, a, c — a caller-built flat map keeps the caller's order.
+        let map = make_flatmap(
+            &mut heap,
+            &[(b, make_small(1)), (a, make_small(2)), (c, make_small(3))],
+        )
+        .unwrap();
+
+        // Flag OFF: the stored order is preserved verbatim (byte-for-byte today's bytes).
+        assert_eq!(
+            encode_term_body(map, &atoms).unwrap(),
+            vec![116, 0, 0, 0, 3, 119, 1, 98, 97, 1, 119, 1, 97, 97, 2, 119, 1, 99, 97, 3]
+        );
+
+        // Flag ON: keys sort into full term order (a, b, c).
+        let mut encoder = Encoder::new_body(&atoms).with_deterministic();
+        encoder.encode(map).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![116, 0, 0, 0, 3, 119, 1, 97, 97, 2, 119, 1, 98, 97, 1, 119, 1, 99, 97, 3]
+        );
+    }
+
+    /// `deterministic` sorts an integer-keyed flat map numerically (full term order),
+    /// regardless of the stored order.
+    #[test]
+    fn deterministic_sorts_an_integer_keyed_flat_map() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        // Stored order 10, 2, 3.
+        let map = make_flatmap(
+            &mut heap,
+            &[
+                (make_small(10), make_small(1)),
+                (make_small(2), make_small(2)),
+                (make_small(3), make_small(3)),
+            ],
+        )
+        .unwrap();
+
+        let default = encode_term_body(map, &atoms).unwrap();
+        assert_eq!(
+            default,
+            vec![116, 0, 0, 0, 3, 97, 10, 97, 1, 97, 2, 97, 2, 97, 3, 97, 3]
+        );
+
+        let mut encoder = Encoder::new_body(&atoms).with_deterministic();
+        encoder.encode(map).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![116, 0, 0, 0, 3, 97, 2, 97, 2, 97, 3, 97, 3, 97, 10, 97, 1]
+        );
+    }
+
+    /// `deterministic` reorders a > 32-pair **hash map** (HAMT) into ascending key
+    /// order — the C's `DFLAG_DETERMINISTIC` HAMT path (`external.c:3783-3807`).
+    #[test]
+    fn deterministic_sorts_a_hash_map_emission() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(1 << 16);
+        // 40 pairs (> MAP_SMALL_MAP_LIMIT): `make_map` builds a HAMT, whose *stored*
+        // order is node-slot order, not key order.
+        let pairs: Vec<(Eterm, Eterm)> = (1..=40i64).map(|n| (make_small(n), make_small(n))).collect();
+        let map = crate::term::make_map(&mut heap, &pairs, &atoms).unwrap();
+
+        let default = encode_term_body(map, &atoms).unwrap();
+        let mut encoder = Encoder::new_body(&atoms).with_deterministic();
+        encoder.encode(map).unwrap();
+        let sorted = encoder.finish();
+
+        assert_eq!(default[0], 116);
+        assert_eq!(sorted[0], 116);
+        assert_eq!(
+            u32::from_be_bytes([sorted[1], sorted[2], sorted[3], sorted[4]]),
+            40
+        );
+        assert_ne!(default, sorted, "deterministic must reorder a HAMT");
+
+        // Read the wire keys straight off the image (each key/value is a small):
+        // the deterministic image carries the keys in ascending order 1..40.
+        let mut keys = Vec::new();
+        let mut i = 5; // past `[MAP_EXT, count:4]`
+        for _ in 0..40 {
+            assert_eq!(sorted[i], 97, "SMALL_INTEGER_EXT key");
+            keys.push(i64::from(sorted[i + 1]));
+            i += 4;
+        }
+        assert_eq!(keys, (1..=40).collect::<Vec<_>>());
+    }
+
+    /// `set_deterministic(false)` restores the byte-identical default: the flag is
+    /// purely additive and OFF by default.
+    #[test]
+    fn set_deterministic_false_restores_the_default_bytes() {
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        let a = make_atom(atoms.intern("a"));
+        let b = make_atom(atoms.intern("b"));
+        let map = make_flatmap(&mut heap, &[(b, make_small(1)), (a, make_small(2))]).unwrap();
+
+        let default = encode_term_body(map, &atoms).unwrap();
+        let mut encoder = Encoder::new_body(&atoms);
+        encoder.set_deterministic(false);
+        encoder.encode(map).unwrap();
+        assert_eq!(encoder.finish(), default);
+        // ... and the default is the stored (b, a) order, not the sorted one.
+        assert_eq!(
+            default,
+            vec![116, 0, 0, 0, 2, 119, 1, 98, 97, 1, 119, 1, 97, 97, 2]
+        );
+    }
     #[test]
     fn external_pid_uses_new_pid_ext() {
         let mut atoms = AtomTable::new();
@@ -608,6 +730,120 @@
             .encode(r)
             .expect_err("an internal ref without a local node is unsupported");
         assert!(is_unsupported(&err));
+    }
+
+    // -----------------------------------------------------------------------
+    // `[local]` / `DFLAG_LOCAL_EXT` — the internal-node marker form
+    // -----------------------------------------------------------------------
+
+    /// `Encoder::with_local_ext` writes the `NIL_EXT` (106) internal-node marker and
+    /// `creation = 0` for an internal pid/port/reference instead of a sysname atom
+    /// (`external.c:2966-2991` / `:3645-3661` / `:3686-3699`), and needs **no**
+    /// `with_local_node` identity — no sysname is written at all
+    /// (`INTERNAL_LOCAL_SYSNAME` = `NIL`, `external.c:2965`).
+    #[test]
+    fn local_ext_writes_the_internal_node_marker() {
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(1 << 12);
+
+        // `make_pid_data(serial, number)` ⇒ serial 0, process number 10.
+        let pid = make_internal_pid(make_pid_data(0, 10));
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(pid).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                88, 106, // NEW_PID_EXT + NIL_EXT marker
+                0, 0, 0, 10, // number
+                0, 0, 0, 0, // serial
+                0, 0, 0, 0, // creation = 0
+            ]
+        );
+
+        // A port ⇒ `V4_PORT_EXT` with the 64-bit id and creation 0.
+        let port = make_internal_port(make_port_data(0x1234));
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(port).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                120, 106, // V4_PORT_EXT + NIL_EXT marker
+                0, 0, 0, 0, 0, 0, 0x12, 0x34, // number
+                0, 0, 0, 0, // creation = 0
+            ]
+        );
+
+        // An internal reference ⇒ `NEWER_REFERENCE_EXT`, len 3, marker, creation 0 and
+        // the three numbers `ref_wire` packs the id into (never re-derived here).
+        let id: u64 = 1 << 45;
+        assert_eq!(crate::ref_wire::ref_id_to_numbers(id), [0, 0, 1 << 13]);
+        let r = make_internal_ref(&mut heap, id).unwrap();
+        let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+        encoder.encode(r).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                90, 0, 3, // NEWER_REFERENCE_EXT, len = 3
+                106, // NIL_EXT marker
+                0, 0, 0, 0, // creation = 0
+                0, 0, 0, 0, // n0
+                0, 0, 0, 0, // n1
+                0, 0, 0x20, 0, // n2 = 8192
+            ]
+        );
+
+        // The version-carrying form is the same body behind `VERSION_MAGIC`.
+        let mut encoder = Encoder::new(&atoms).with_local_ext();
+        encoder.encode(pid).unwrap();
+        let image = encoder.finish();
+        assert_eq!(image[0], 131);
+        assert_eq!(
+            &image[1..],
+            &[88u8, 106, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0][..]
+        );
+
+        // With the flag clear an internal id still has no wire image: `set_local_ext`
+        // restores the pre-seam behaviour exactly.
+        let mut off = Encoder::new_body(&atoms);
+        off.set_local_ext(true);
+        off.set_local_ext(false);
+        assert!(is_unsupported(&off.encode(pid).unwrap_err()));
+
+        // The marker *wins* over an installed identity (the sysname is not written).
+        let sysname = atoms.intern("nonode@nohost");
+        let mut both = Encoder::new_body(&atoms)
+            .with_local_node(sysname, 7)
+            .with_local_ext();
+        both.encode(pid).unwrap();
+        assert_eq!(
+            both.finish(),
+            vec![88, 106, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    /// `[local]` changes only an **internal** id: an external id keeps its own node
+    /// atom and creation (`enc_external_pid`, `external.c:3000-3016`), byte-for-byte.
+    #[test]
+    fn local_ext_leaves_external_ids_untouched() {
+        let mut atoms = AtomTable::new();
+        let node = make_atom(atoms.intern("nonode@nohost"));
+        let mut heap = new_heap(1 << 12);
+
+        let terms = [
+            make_external_pid(&mut heap, node, 7, 8, 9).unwrap(),
+            make_external_port(&mut heap, node, 0x1234, 5).unwrap(),
+            make_external_ref(&mut heap, node, &[1, 2, 3], 4).unwrap(),
+        ];
+        for term in terms {
+            let plain = encode_term_body(term, &atoms).unwrap();
+            let mut encoder = Encoder::new_body(&atoms).with_local_ext();
+            encoder.encode(term).unwrap();
+            assert_eq!(
+                encoder.finish(),
+                plain,
+                "an external id must be untouched by `[local]`"
+            );
+        }
     }
 
     #[test]

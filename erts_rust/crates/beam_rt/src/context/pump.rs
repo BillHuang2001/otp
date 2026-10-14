@@ -104,7 +104,14 @@ where
                     )));
                 }
                 match step(func, pc)? {
-                    None => return Err(beam_engine::blocked()),
+                    None => {
+                        if crate::debug_trace::enabled() {
+                            crate::debug_trace::trace(format_args!(
+                                "pump_until_returned: nested run parked at {func}/{pc} with a pump that cannot advance -> blocked()"
+                            ));
+                        }
+                        return Err(beam_engine::blocked());
+                    }
                     Some(next) => outcome = next,
                 }
             }
@@ -147,7 +154,18 @@ impl<'a> RuntimeContext<'a> {
             .lookup(function)
             .ok_or_else(error::undef)?;
         if module.export(function_atom, arity).is_none() {
+            crate::debug_trace::trace(format_args!(
+                "UNDEF no-export {}:{function}/{arity}",
+                module.atom_name(module.name).unwrap_or("<unnamed>")
+            ));
             return Err(error::undef());
+        }
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "sync-run {}:{function}/{arity} (may_pump={})",
+                module.atom_name(module.name).unwrap_or("<unnamed>"),
+                self.may_pump_scheduler()
+            ));
         }
         // Everything this call executes is this module's code, so a BIF reached from it (in
         // particular `erlang:load_nif/2`, whose owning module the oracle derives from the call

@@ -41,7 +41,7 @@
 //! | `+hmaxk B` / `+hmaxel B` / `+hmaxib B` | the `+hmax` kill / error-logger / shared-binary flags (`true`\|`false`) |
 //! | `-name N` / `-sname N` | distribution node name |
 //! | `-setcookie C` | distribution cookie (recorded as an init argument; sets `emulator.cookie`) |
-//! | `-config F` | config file, recorded as the init argument `config` |
+//! | `-config F` | config file, recorded as the init argument `config` **and** resolved/read-checked by every booting action (a missing file is a runtime error, exit 1) |
 //! | `-boot F` | boot script: recorded as the init argument `boot` **and** executed by the A.7 boot-script executor (the `Boot` action) |
 //! | `-emu_flavor F` | emulator flavor: `emu` ⇒ interpreter, `jit`/`smp` ⇒ JIT (recorded) |
 //! | `+Q N` | maximum number of ports (`legacy`, or `1024..=134217727`) |
@@ -128,7 +128,7 @@ use crate::perf_map::{self, PerfMapConfig};
 use crate::runtime::Runtime;
 
 mod env;
-mod flags;
+pub(crate) mod flags;
 mod vars;
 pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
 pub use vars::{from_env, ErlEnv};
@@ -143,9 +143,11 @@ Switches:
   -eval EXPR                evaluate the documented integer subset (prints nothing)
   -s MOD FUNC [ARG...]      apply MOD:FUNC(ARG, ...) with atom arguments (result discarded)
   -run MOD FUNC [ARG...]    apply MOD:FUNC(ARG, ...) with string arguments (result discarded)
-  -pa DIR                   add DIR to the code path (searched before -pz dirs)
-  -pz DIR                   add DIR to the code path (searched after -pa dirs)
-  +S N[:N]                  number of normal schedulers
+  -pa DIR [DIR...]          add DIR(s) to the head of the code path (before the system
+                            directories; a missing dir is filtered out)
+  -pz DIR [DIR...]          add DIR(s) to the tail of the code path (after the system
+                            directories; a missing dir is filtered out)
+  +S N[:N]                  normal schedulers (total, and optionally the online count)
   -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
   +A N                      async-thread pool size (preserved verbatim)
   +P N                      maximum number of processes (legacy, or 1024..=134217727)
@@ -291,6 +293,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         emulator: EmulatorConfig::default(),
         pa: Vec::new(),
         pz: Vec::new(),
+        online_schedulers: None,
         heap: HeapOptions::new(),
         max_ports: None,
         init_args: InitArgs::new(),
@@ -320,16 +323,16 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "-pa" => {
-                let value = value_of(args, index, "-pa")?;
-                builder.record(argument, vec![value.clone()]);
-                builder.pa.push(PathBuf::from(value));
-                index += 2;
+                let (values, next) = path_values(args, index, "-pa")?;
+                builder.record(argument, values.clone());
+                builder.pa.extend(values.into_iter().map(PathBuf::from));
+                index = next;
             }
             "-pz" => {
-                let value = value_of(args, index, "-pz")?;
-                builder.record(argument, vec![value.clone()]);
-                builder.pz.push(PathBuf::from(value));
-                index += 2;
+                let (values, next) = path_values(args, index, "-pz")?;
+                builder.record(argument, values.clone());
+                builder.pz.extend(values.into_iter().map(PathBuf::from));
+                index = next;
             }
             "-name" | "-sname" => {
                 let value = value_of(args, index, argument)?;
@@ -338,10 +341,27 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "-setcookie" => {
-                let value = value_of(args, index, "-setcookie")?;
-                builder.record(argument, vec![value.clone()]);
-                builder.emulator.cookie = Some(value);
-                index += 2;
+                // `-setcookie` takes a list of values exactly like `-pa`/`-pz`: the oracle
+                // records one occurrence carrying *every* following non-switch token
+                // (`erl -setcookie a b …` ⇒ `init:get_argument(setcookie)` is
+                // `{ok,[["a","b"]]}`), and with anything but a single value it leaves the
+                // cookie unset (`erlang:get_cookie()` is `nocookie`) — verified against
+                // OTP 29.1.1 / erts-17.1.
+                let (values, next) = path_values(args, index, "-setcookie")?;
+                builder.record(argument, values.clone());
+                builder.emulator.cookie = match values.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                };
+                index = next;
+            }
+            "-env" => {
+                // `-env VAR VALUE` is consumed by the *launcher* (`erlexec`), so `init`
+                // never sees it: the oracle's `init:get_argument(env)` is the bare atom
+                // `error` — verified against OTP 29.1.1 / erts-17.1. The two values are
+                // taken blindly (the oracle consumes the following token even when it
+                // looks like a switch, e.g. `-noshell`).
+                index = parse_env_switch(args, index)?;
             }
             "-config" | "-boot" => {
                 let value = value_of(args, index, argument)?;
@@ -375,12 +395,54 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.preserve("+sbt", &value);
                 index += 2;
             }
+            // `+t N` — the atom-table size (`erl_init.c:2217-2234`); the value is
+            // validated and preserved verbatim, so `atom_limit` can follow it
+            // (`crate::info::limits`). Like every `+`-flag it is not an init argument.
+            "+t" => {
+                let value = value_of(args, index, "+t")?;
+                flags::parse_atom_table_size("+t", &value)?;
+                builder.preserve("+t", &value);
+                index += 2;
+            }
+            // `+e N` — the maximum number of ETS tables (`erl_init.c:1696-1707`); only a
+            // negative value is rejected; `ets_limit` follows the value (see
+            // `crate::info::limits`).
+            "+e" => {
+                let value = value_of(args, index, "+e")?;
+                flags::parse_ets_tables("+e", &value)?;
+                builder.preserve("+e", &value);
+                index += 2;
+            }
+            // `+B [c|d|i]` (and the in-token `+Bi`/`+Bc`/`+Bd`) — the break-handler switch
+            // (`erl_init.c:1822-1843`). It never rejects a value: an unrecognized one falls
+            // to the `+B` arm (`have_break_handler = 0`). Only `+B i` sets `ignore_break`,
+            // which `erlang:system_info(break_ignored)` reports (see `crate::info::system`).
+            // The switch and its value are preserved verbatim so that derivation can read
+            // them; a valueless `+B` preserves an empty value so the `(switch, value)` stride
+            // stays even.
+            "+B" => {
+                let value = match args.get(index + 1) {
+                    Some(candidate) if matches!(candidate.as_str(), "i" | "c" | "d") => {
+                        candidate.clone()
+                    }
+                    _ => String::new(),
+                };
+                let consumed = !value.is_empty();
+                builder.preserve("+B", &value);
+                index += if consumed { 2 } else { 1 };
+            }
+            "+Bi" | "+Bc" | "+Bd" => {
+                builder.preserve("+B", &argument[2..]);
+                index += 1;
+            }
             other if flags::is_allocator_switch(other) => {
                 index = flags::parse_allocator(&args[index], args, index)?;
             }
             "+S" => {
                 let value = value_of(args, index, "+S")?;
-                builder.emulator.schedulers = Some(parse_schedulers(&value)?);
+                let (total, online) = parse_schedulers(&value)?;
+                builder.emulator.schedulers = total;
+                builder.online_schedulers = online;
                 index += 2;
             }
             "-smp" => index = parse_smp_switch(args, index, &mut builder),
@@ -446,10 +508,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         }
     }
     let code_paths = builder.code_paths();
+    let pz_paths = builder.pz_paths();
     Ok(RuntimeConfig {
         emulator: builder.emulator,
         code_paths,
+        pz_paths,
         heap_words: DEFAULT_HEAP_WORDS,
+        online_schedulers: builder.online_schedulers,
         heap: builder.heap,
         max_ports: builder.max_ports,
         init_args: builder.init_args,
@@ -469,6 +534,8 @@ struct Builder {
     pa: Vec<PathBuf>,
     /// `-pz` directories, in order.
     pz: Vec<PathBuf>,
+    /// The explicit **online** scheduler count (`+S Total:Online`), or `None`.
+    online_schedulers: Option<u32>,
     /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) being assembled.
     heap: HeapOptions,
     /// The requested port-table size (`+Q N`; `None` for the default table or `legacy`).
@@ -483,13 +550,19 @@ struct Builder {
 }
 
 impl Builder {
-    /// The code path: `-pa` directories first, then `-pz` directories.
+    /// The `-pa` directories, in command-line order — the **head** of the code path.
+    ///
+    /// The `-pz` directories are the separate tail ([`Builder::pz_paths`]): the oracle's
+    /// `code:get_path/0` puts `-pa` in front of the system `ebin` directories and `-pz`
+    /// **after** them, so the two groups must not be merged here.
     fn code_paths(&self) -> Vec<PathBuf> {
-        let mut paths = self.pa.clone();
-        paths.extend(self.pz.iter().cloned());
-        paths
+        self.pa.clone()
     }
 
+    /// The `-pz` directories, in command-line order — the **tail** of the code path.
+    fn pz_paths(&self) -> Vec<PathBuf> {
+        self.pz.clone()
+    }
     /// Records one occurrence of `switch` (the flag name is the switch without its
     /// leading `-`/`+`) with `values`.
     fn record(&mut self, switch: &str, values: Vec<String>) {
@@ -677,20 +750,110 @@ fn parse_max_heap_size(value: &str) -> Result<usize> {
     }
 }
 
-/// Parses the `+S N[:N]` value, taking the normal-scheduler count (the first number).
+/// Parses the `+S N[:N]` value into `(total, online)`.
 ///
-/// Both components must be numbers (and there may be at most one `:`): a malformed
-/// suffix is an error rather than something silently ignored.
-fn parse_schedulers(value: &str) -> Result<u32> {
+/// Both halves are `Option`: `0` is the oracle's "use the default" spelling, so
+/// `+S 0` and `+S 0:0` select the defaults for both counts (`None`/`None`).
+///
+/// The grammar is `erl_init.c:1107-1153`:
+/// * `+S Total` — the online count is **not** the total: the C sets it to
+///   `min(Total, <default online>)` (`onln = tot < schdlrs_onln ? tot : schdlrs_onln`),
+///   which is why `erl +S 16` reports `16` schedulers but only `14` online on a
+///   16-CPU box. That resolution needs the host's processor count, so it happens where
+///   the value is answered ([`crate::info`]'s `schedulers_online`), not here.
+/// * `+S Total:Online` — the online count is explicit and must be `1..=Total`
+///   (`bad amount of schedulers online`); `+S 4:5` and `+S 4:0` are rejected, while
+///   `+S 0:2` is accepted (the total defaults to the processor count).
+/// * Anything else (`+S 1:2:3`, a non-number) is rejected.
+///
+/// A malformed value is this parser's uniform usage error (exit 2 + [`USAGE`]); the
+/// oracle prints `bad amount of schedulers <value>` and its own usage, exiting 1.
+fn parse_schedulers(value: &str) -> Result<(Option<u32>, Option<u32>)> {
     let mut parts = value.split(':');
-    let normal = parse_u32("+S", parts.next().unwrap_or(value))?;
-    if let Some(online) = parts.next() {
-        parse_u32("+S", online)?;
-    }
+    let total = parse_u32("+S", parts.next().unwrap_or(value))?;
+    let online = match parts.next() {
+        Some(online) => Some(parse_u32("+S", online)?),
+        None => None,
+    };
     if parts.next().is_some() {
         return Err(error::bad_switch_value("+S", value));
     }
-    Ok(normal)
+    // `0` selects the default of that count; an explicit total of `0` therefore means
+    // "the processor count".
+    let schedulers = (total > 0).then_some(total);
+    let online = match online {
+        // `+S 0:0` is the all-defaults spelling.
+        Some(0) if total == 0 => None,
+        Some(online) if online > 0 => {
+            let ceiling = schedulers.unwrap_or_else(|| {
+                // The default total the online count can never exceed.
+                u32::try_from(crate::info::logical_processors()).unwrap_or(u32::MAX)
+            });
+            if online > ceiling {
+                return Err(error::bad_switch_value("+S", value));
+            }
+            Some(online)
+        }
+        Some(_) => return Err(error::bad_switch_value("+S", value)),
+        None => None,
+    };
+    Ok((schedulers, online))
+}
+
+/// Collects the **list** of values of a `-pa`/`-pz`/`-setcookie` occurrence, returning
+/// them with the index of the next switch.
+///
+/// The oracle's grammar is "every following token up to the next switch is a value of
+/// this one occurrence" — verified against OTP 29.1.1 / erts-17.1: `erl -pa a b …` makes
+/// `init:get_argument(pa)` `{ok,[["a","b"]]}` (one occurrence, two values), while
+/// `-pa a -3 …` / `-pa a +S 3 …` both stop at the next switch. An occurrence with **no**
+/// value is a usage error, exactly as before.
+fn path_values(args: &[String], index: usize, switch: &str) -> Result<(Vec<String>, usize)> {
+    let (values, next) = collect_path_values(args, index + 1);
+    if values.is_empty() {
+        return Err(error::missing_value(switch));
+    }
+    Ok((values, next))
+}
+/// The tokens from `from` up to (but not including) the next switch **or** the terminal
+/// `run` action keyword, plus the index of that stopper.
+///
+/// This is the value collector for `-pa`/`-pz`/`-setcookie`. It differs from the generic
+/// [`collect_tail`] in exactly one way: it also stops at a bare `run` token. `run` is
+/// this runtime's own terminal CLI keyword (the vertical slice, see [`parse_run_file`]),
+/// so it can never be a directory/cookie *value*; treating it as one would swallow the
+/// whole action (`beam_rt -pa DIR run FILE M:F/A` would leave the `Action` at `Boot` and
+/// print nothing). Real `erl` has no `run` keyword, so this is a beam_rt-only rule and
+/// the oracle's `-pa a b` multi-value grammar is unaffected.
+fn collect_path_values(args: &[String], from: usize) -> (Vec<String>, usize) {
+    let mut values = Vec::new();
+    let mut next = from;
+    while let Some(candidate) = args.get(next) {
+        if is_switch(candidate) || candidate == "run" {
+            break;
+        }
+        values.push(candidate.clone());
+        next += 1;
+    }
+    (values, next)
+}
+
+/// Consumes a `-env VAR VALUE` pair, returning the index of the next switch.
+///
+/// `-env` is handled by the `erl` *launcher* (`erlexec`), which is why the oracle's
+/// `init:get_argument(env)` is the bare atom `error`: the pair never reaches `init` and
+/// is therefore **not** an init argument here either (verified against OTP 29.1.1 /
+/// erts-17.1). The launcher consumes the next two tokens blindly — `erl -env x -noshell`
+/// swallows `-noshell` as the value — so this does too.
+///
+/// The variable is *not* injected into this process's environment (`std::env::set_var`
+/// is `unsafe` in edition 2024 and this crate is `#![deny(unsafe_code)]`), so
+/// `os:getenv/1` does not observe it; see the crate's M1 gaps.
+fn parse_env_switch(args: &[String], index: usize) -> Result<usize> {
+    if args.len() < index + 3 {
+        return Err(error::missing_value("-env"));
+    }
+    Ok(index + 3)
 }
 
 /// Parses the `-smp` switch, returning the index of the next switch.
@@ -1019,8 +1182,15 @@ fn report_unsupported(reason: &str) -> i32 {
 /// constructed, so the slot stays empty and the dump is skipped.
 fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
     let action = config.action.clone();
-    match action {
-        Action::Version => {
+    // `-config FILE` is read while the node **boots**, before any Start instruction runs: a
+    // config file the boot cannot read is the boot failure the oracle reports with exit 1
+    // (`erl -noshell -config /nonexistent -eval 'ok'` ⇒ **1**, no stdout, no stderr —
+    // verified against OTP 29.1.1 / erts-17.1). Only `-version` builds no runtime at all, so
+    // it stays exempt (`erl -version -config /nonexistent` ⇒ **0**, the banner).
+    if !matches!(action, Action::Version) {
+        check_config_file(&config)?;
+    }
+    match action {        Action::Version => {
             println!("{}", boot::boot_banner());
             Ok(())
         }
@@ -1115,18 +1285,88 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
 /// directive the runtime cannot execute all return their typed [`BeamError`] — which [`run`]
 /// reports as `beam_rt: <error>` with exit code 1 — never a panic, a hang or a wrong result.
 ///
-/// The real `start.boot` runs to **completion**: all 22 directives execute, the last being
-/// `{progress,started}`. The `{apply,{c,erlangrc,[]}}` directive's `{open, …}` of `$HOME/.erlang`
-/// is answered `{error,enoent}` by the native `file_server_2` service whenever that file is
-/// absent, which `file:path_eval/2` treats as success; see [`crate::boot`].
-fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {
-    runtime.boot()?;
+/// The real `start.boot` does **not** run to completion: it stops at the 0-based directive
+/// index **19** of 22, `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`,
+/// because the stdlib start's own `application_controller` is already gone — the CLI reports
+/// `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`
+/// with exit code 1. The final `{progress,started}` (index 21) is therefore not reached, and
+/// neither is the `{apply,{c,erlangrc,[]}}` directive (index 20) whose `{open, …}` of
+/// `$HOME/.erlang` the native `file_server_2` service answers. Per-directive detail is in
+/// [`crate::boot`].
+fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {    runtime.boot()?;
     let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;
     runtime.boot_from_script(&path).map(|_| ())
 }
 
-/// The `-boot FILE` argument of the merged command line, or `None` when none was given.
+/// Checks the `-config FILE` init argument(s) the way the oracle's boot reads them, so a
+/// config file the node cannot read fails the boot instead of being silently ignored.
 ///
+/// # Ground truth (OTP 29.1.1 / erts-17.1)
+///
+/// `init` hands each `-config` value to the application controller, which resolves it and
+/// then `file:consult/1`s the result (`lib/kernel/src/application_controller.erl:1876-1903`,
+/// `conf_param_to_conf/1`): `filename:basename(FileName, ".config")` strips a **trailing**
+/// `.config` and the name is rebuilt as `<dir>/<base>.config`. So `-config /x/conf` and
+/// `-config /x/conf.config` both read `/x/conf.config`. A file that cannot be read throws
+/// `{error, {FName, Line, Str}}` out of the boot, which the emulator turns into exit **1**:
+///
+/// ```text
+/// erl -noshell -config /nonexistent      -eval 'ok'  → exit 1   (no stdout, no stderr)
+/// erl -noshell -config <dir>.config      -eval 'ok'  → exit 1   (a directory is not a file)
+/// erl -noshell -config <existing>.config -eval 'ok'  → exit 0
+/// erl -version -config /nonexistent                  → exit 0   (the banner; `-version` never boots)
+/// ```
+///
+/// **Every** occurrence is checked, not just the first: `-config <missing> -config <ok>` and
+/// `-config <ok> -config <missing>` both exit 1 in the oracle (verified).
+///
+/// # Scope
+///
+/// Only the file's *presence as a regular file* is decided here. A readable file whose
+/// contents are malformed (or empty — the oracle's own `sys.config` grammar wants a list of
+/// terms) is a **content** failure this runtime does not model, exactly as it does not model
+/// the config terms themselves; that residual divergence changes no working invocation (a
+/// file `[].`-style boot reads is accepted by both).
+///
+/// The error is a message-carrying `error`-class raise (`error::message`), which [`run`]
+/// reports as `beam_rt: <error>` with [`EXIT_RUNTIME`] — the same classification every other
+/// runtime failure takes. No runtime has been built at this point, so [`run`]'s crash-dump
+/// path finds an empty snapshot and writes nothing (the oracle writes no dump either).
+fn check_config_file(config: &RuntimeConfig) -> Result<()> {
+    let Some(occurrences) = config.init_args.get("config") else {
+        return Ok(());
+    };
+    for values in &occurrences {
+        for value in values.iter() {
+            let resolved = resolve_config_file(value);
+            if !resolved.is_file() {
+                return Err(error::message(format!(
+                    "cannot read config file {}",
+                    resolved.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+/// Resolves a `-config` value to the file the oracle reads: a trailing `.config` is kept,
+/// any other name gets it appended (`application_controller.erl:1877-1879`).
+///
+/// The rewrite is a **basename + join**, so `-config /a.b/conf` becomes `/a.b/conf.config`
+/// and a value already ending in `.config` is unchanged (`filename:basename(X, ".config")`
+/// strips at most one occurrence).
+fn resolve_config_file(value: &str) -> PathBuf {
+    let path = Path::new(value);
+    let base = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => format!("{}.config", name.strip_suffix(".config").unwrap_or(name)),
+        None => format!("{value}.config"),
+    };
+    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir.join(base),
+        None => PathBuf::from(base),
+    }
+}
+/// The `-boot FILE` argument of the merged command line, or `None` when none was given.///
 /// The value is read from the recorded init arguments rather than a field of its own
 /// because that is exactly where `init` reads it: `bootfile/2` resolves `get_flag(boot,
 /// Flags, Root ++ "/bin/start")` (`erts/preloaded/src/init.erl:1257-1258`), and the `boot`
@@ -1377,15 +1617,18 @@ mod tests {
 
     #[test]
     fn code_path_switches_order_pa_before_pz() {
+        // `-pa` is the **head** of the code path and `-pz` the **tail**, so the two groups
+        // are kept apart (the ordering itself is applied by `CodeServer`):
+        //   `erl -noshell -pa a1 a2 -pz z1 z2 -eval 'io:format("~p~n",[lists:reverse(code:get_path())]),halt().'`
+        //   → the head is `["a2","a1", …]` (each `-pa` prepended in turn) and the tail is
+        //     `["z2","z1", ".", <system ebins>]` — i.e. `-pz` lands *after* `"."`.
+        // The parser therefore records `-pa` in `code_paths` and `-pz` in `pz_paths`.
         let config = parsed(&["-pa", "/a", "-pz", "/b", "-pa", "/c"]);
         assert_eq!(
             config.code_paths,
-            vec![
-                PathBuf::from("/a"),
-                PathBuf::from("/c"),
-                PathBuf::from("/b")
-            ]
+            vec![PathBuf::from("/a"), PathBuf::from("/c")]
         );
+        assert_eq!(config.pz_paths, vec![PathBuf::from("/b")]);
         assert!(parse_args(&["-pa"]).is_err());
         assert!(parse_args(&["-pz"]).is_err());
         // Every `-pa` occurrence is recorded, in command-line order.
@@ -2256,6 +2499,106 @@ mod tests {
         assert_eq!(
             run(vec!["-boot".to_string(), "/nonexistent/nope".to_string()]),
             EXIT_RUNTIME
+        );
+    }
+
+    /// `-config FILE` is resolved exactly as the application controller resolves it:
+    /// `filename:basename(FileName, ".config")` strips **one** trailing `.config` and the
+    /// name is rebuilt in its own directory (`lib/kernel/src/application_controller.erl:1876-1879`).
+    #[test]
+    fn the_config_file_name_is_resolved_the_way_the_oracle_resolves_it() {
+        for (value, resolved) in [
+            ("/x/conf", "/x/conf.config"),
+            ("/x/conf.config", "/x/conf.config"),
+            ("conf", "conf.config"),
+            ("conf.config", "conf.config"),
+            // The strip is on the **basename** only, so a dotted directory survives.
+            ("/a.b/conf", "/a.b/conf.config"),
+            // At most one occurrence is stripped and re-appended.
+            ("/x/y.config.config", "/x/y.config.config"),
+        ] {
+            assert_eq!(resolve_config_file(value), PathBuf::from(resolved), "{value}");
+        }
+    }
+
+    /// The boot-time `-config` check. Oracle (OTP 29.1.1 / erts-17.1), all verified:
+    ///
+    /// ```text
+    /// erl -noshell -config /nonexistent      -eval 'ok'  → exit 1  (no stdout, no stderr)
+    /// erl -noshell -config <dir named>.config -eval 'ok' → exit 1
+    /// erl -noshell -config <missing> -config <ok> -eval  → exit 1
+    /// erl -noshell -config <ok> -config <missing> -eval  → exit 1
+    /// erl -noshell -config <existing>.config -eval 'ok'  → exit 0
+    /// ```
+    #[test]
+    fn a_config_file_that_cannot_be_read_is_refused() {
+        let scratch = ScratchDir::new("config");
+        let present = scratch.write("app.config", b"[].\n");
+
+        // No `-config` at all: nothing to check.
+        assert!(check_config_file(&parsed(&["-noshell"])).is_ok());
+
+        // Both spellings of the same file are accepted (`.config` is appended unless present).
+        let stem = present.with_extension("");
+        for value in [present.to_string_lossy(), stem.to_string_lossy()] {
+            let config = parsed(&["-config", value.as_ref()]);
+            assert!(check_config_file(&config).is_ok(), "{value}");
+        }
+
+        // A missing file is refused with a message naming the **resolved** path.
+        let absent = scratch.path.join("absent");
+        let error = check_config_file(&parsed(&["-config", absent.to_string_lossy().as_ref()]))
+            .expect_err("a missing config file is refused");
+        let text = format!("{error}");
+        assert!(text.contains("cannot read config file"), "{text}");
+        assert!(text.contains("absent.config"), "{text}");
+
+        // A directory carrying the suffix is not a file (the oracle's `file:consult`
+        // reports `eisdir` out of the boot).
+        std::fs::create_dir_all(scratch.path.join("dir.config")).expect("a directory");
+        let directory = scratch.path.join("dir");
+        assert!(
+            check_config_file(&parsed(&["-config", directory.to_string_lossy().as_ref()])).is_err(),
+            "a directory is not a readable config file"
+        );
+
+        // **Every** occurrence is checked, not just the first — the oracle refuses either
+        // order when one of the two cannot be read.
+        let present = present.to_string_lossy().into_owned();
+        let absent = absent.to_string_lossy().into_owned();
+        for (first, second) in [(&absent, &present), (&present, &absent)] {
+            let config = parsed(&["-config", first, "-config", second]);
+            assert!(
+                check_config_file(&config).is_err(),
+                "-config {first} -config {second} must be refused"
+            );
+        }
+        // … and two readable ones are accepted.
+        let config = parsed(&["-config", &present, "-config", &present]);
+        assert!(check_config_file(&config).is_ok());
+    }
+
+    /// The end-to-end classification: a `-config` the boot cannot read is a **runtime** error
+    /// (exit 1 + `beam_rt: <error>`), never a usage error (2) and never a silent success —
+    /// while `-version`, which builds no runtime at all, stays exempt (the oracle's own
+    /// `erl -version -config /nonexistent` exits 0 with the banner).
+    #[test]
+    fn a_missing_config_file_exits_1_but_version_stays_exempt() {
+        for action in [
+            vec!["-noshell", "-config", "/nonexistent/nope", "-eval", "ok"],
+            vec!["-noshell", "-config", "/nonexistent/nope"],
+            vec!["-noshell", "-config", "/nonexistent/nope", "-s", "init", "stop"],
+        ] {
+            let args: Vec<String> = action.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(run(args), EXIT_RUNTIME, "{action:?}");
+        }
+        assert_eq!(
+            run(vec![
+                "-version".to_string(),
+                "-config".to_string(),
+                "/nonexistent/nope".to_string(),
+            ]),
+            EXIT_OK
         );
     }
 }

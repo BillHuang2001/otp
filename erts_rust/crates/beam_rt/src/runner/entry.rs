@@ -251,10 +251,10 @@ impl RunnerState {
     ///
     /// * a pid this runtime never spawned an engine for (the root `-eval` process, a
     ///   foreign pid);
-    /// * a **fun-bodied** process ([`ProcessEntry::Fun`]): its entry is a fun value, and
-    ///   the position items stay the honest capability gap there (they are named from the
-    ///   module's function table, not from the lambda the engine entered), never a
-    ///   fabricated module;
+    /// * a **fun-bodied** process ([`ProcessEntry::Fun`]): nothing but the raw engine is
+    ///   reachable through this accessor, so a caller wanting the position items of one
+    ///   uses [`RunnerState::position_engine_at`] instead (it answers once the fun's local
+    ///   target has been resolved, and reports the `erlang:apply/2` `$initial_call`);
     /// * the process whose machine the caller is *currently executing*: a scheduler pass
     ///   must take that one engine **out** of this map to drive it (see the module docs),
     ///   so it is simply absent while it runs.
@@ -263,6 +263,35 @@ impl RunnerState {
         match &engine.entry {
             ProcessEntry::Export { module, .. } => Some((module, &engine.machine)),
             ProcessEntry::Fun { .. } => None,
+        }
+    }
+
+    /// `pid`'s executing module and machine for the **execution-position items**, plus
+    /// whether the process's entry was a **fun applied as a value** (`erlang:spawn/1`).
+    ///
+    /// This extends [`RunnerState::engine_at`] with the two shapes that accessor declines,
+    /// both of which the oracle *does* answer:
+    ///
+    /// * a **fun-bodied** process whose local target a first run has already resolved
+    ///   (`ProcessEntry::Fun { target: Some(..) }`): its entry lambda belongs to a real
+    ///   module, so `current_function`/`current_location`/`current_stacktrace` name it
+    ///   exactly as an export entry's position is named. Oracle (OTP 29.1.1 / erts-17.1) for
+    ///   `spawn(fun() -> receive stop -> ok end end)` parked in the receive:
+    ///   `process_info(P, current_function)` ⇒ `{current_function,{M,'-f/0-fun-0-',0}}`
+    ///   (the lambda's own name, resolved from its defining module's function table).
+    /// * the returned `applied` flag: a fun-bodied process's `$initial_call` is
+    ///   `erlang:apply/2`, not the entry lambda — ERTS spawned it by *applying* a fun
+    ///   (oracle: `process_info(P, initial_call)` ⇒ `{initial_call,{erlang,apply,2}}`).
+    ///
+    /// `None` for everything [`RunnerState::engine_at`] declines plus a fun entry whose
+    /// target is still unresolved (it has not run yet, so nothing can name its module).
+    pub(crate) fn position_engine_at(&self, pid: ProcessId) -> Option<(&Module, &Machine, bool)> {
+        let engine = self.engines.get(&pid)?;
+        match &engine.entry {
+            ProcessEntry::Export { module, .. } => Some((module, &engine.machine, false)),
+            ProcessEntry::Fun { target, .. } => target
+                .as_ref()
+                .map(|target| (&target.module as &Module, &engine.machine, true)),
         }
     }
 

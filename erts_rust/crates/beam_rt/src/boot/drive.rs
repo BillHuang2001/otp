@@ -203,6 +203,13 @@ pub(super) fn start_kernel_process(
 ) -> Result<()> {
     let directive = runtime.spawn_process(&mfa.module, &mfa.function, args)?;
     let atom = runtime.code_server_atoms_mut().intern(name);
+    if crate::debug_trace::enabled() {
+        crate::debug_trace::trace(format_args!(
+            "kernel-process {name} = {:?} directive={directive:?} (whereis now {:?})",
+            mfa.module,
+            runtime.processes().whereis(atom)
+        ));
+    }
     let burst = deadline.min(Instant::now() + KERNEL_BURST_DEADLINE);
     let mut unlinked = false;
     loop {
@@ -227,6 +234,12 @@ pub(super) fn start_kernel_process(
                     runtime.unlink_processes(directive, kernel)?;
                 }
                 unlinked = true;
+                if crate::debug_trace::enabled() {
+                    crate::debug_trace::trace(format_args!(
+                        "kernel-process {name}: registered as {kernel:?} (directive {directive:?} alive={})",
+                        runtime.processes().contains(directive)
+                    ));
+                }
             }
         }
         // The server is only *ready* once the directive's MFA has returned. A
@@ -342,6 +355,12 @@ pub(super) fn apply_boot_call(
         context.enter_module(&module);
         machine.run_export_outcome(&module, function, arity, args, &mut context)
     };
+    if crate::debug_trace::enabled() {
+        crate::debug_trace::trace(format_args!(
+            "apply {}:{} /{} -> {entered:?}",
+            mfa.module, mfa.function, arity
+        ));
+    }
     // The whole directive runs inside this closure so that **every** exit — the returned value,
     // the typed `blocked()` gap and a raise — reaches the adoption step below: `init` discards
     // an `apply` directive's value, but the function may still have stored a term that
@@ -358,6 +377,12 @@ pub(super) fn apply_boot_call(
                     // boot-spawned process that must answer it is on the run queue), then resume
                     // the same machine at the reported address.
                     let ran = drive_scheduler(runtime, deadline, APPLY_BLOCK_SLICES)?;
+                    if crate::debug_trace::enabled() {
+                        crate::debug_trace::trace(format_args!(
+                            "apply {}:{} wait at {func:?}/{pc} -> drive ran {ran}",
+                            mfa.module, mfa.function
+                        ));
+                    }
                     if ran == 0 {
                         // Nothing left that could wake the receiver: report it exactly as the
                         // engine's non-blocking entries do, rather than spinning out the deadline.

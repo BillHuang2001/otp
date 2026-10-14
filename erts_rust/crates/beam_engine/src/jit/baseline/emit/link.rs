@@ -32,9 +32,10 @@
 //! round-trip:
 //!
 //! ```text
-//!   spill             ; the cached x-registers back into `machine.x` — MANDATORY:
-//!                     ; this is the tier's whole liveness / root-set model, so a
-//!                     ; linked exit must never skip it (see [`super::spill`])
+//!   spill             ; the block's WRITTEN cached x-registers back into
+//!                     ; `machine.x` — MANDATORY: this is the tier's whole
+//!                     ; liveness / root-set model, so a linked exit must never
+//!                     ; skip it (see [`super::spill`])
 //!   mov rdi, [rsp+RUNTIME_SLOT_DISP]  ; `rt` for the successor's prologue
 //!   lea rsp, [rsp+24] ; drop the `rt` slot
 //!   pop rbx ; pop rbp ; pop r12 … pop r15   ; leave the frame, restoring the
@@ -122,7 +123,7 @@ use beam_common::Result;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::runtime::{encode_target, jit_tail_call, TailHelper};
-use super::{spill, Allocation, RUNTIME_SLOT_DISP, SAVED_REGISTERS};
+use super::{spill, Allocation, SpillSite, RUNTIME_SLOT_DISP, SAVED_REGISTERS};
 
 /// The compiled blocks a branch may jump to directly, keyed by `(func, block
 /// start)` — the same key the driver's entry table uses.
@@ -173,7 +174,7 @@ impl<'a> Linker<'a> {
     ) -> Result<()> {
         match self.entries.get(&(func, pc)) {
             Some(&target) => {
-                spill(buffer, allocation)?;
+                spill(buffer, allocation, SpillSite::Exit)?;
                 // `rt` for the successor's prologue: it stores `rdi` into *its* `rt`
                 // slot and loads `rbx` from it. `rdi` is not one of the registers the
                 // teardown pops, so the reloaded value survives the teardown and the
@@ -183,7 +184,7 @@ impl<'a> Linker<'a> {
                 buffer.jmp(target)
             }
             None => {
-                spill(buffer, allocation)?;
+                spill(buffer, allocation, SpillSite::Exit)?;
                 buffer.mov_ri(Reg::Rax, encode_target(func, pc))?;
                 buffer.jmp(done)
             }
@@ -224,7 +225,7 @@ impl<'a> Linker<'a> {
         // pop returns to a driver that owns the same root set. `jit_tail_call` reads no
         // x-register, so the spill order relative to the call is free — this one keeps
         // the exit shaped like every other exit in the tier.
-        spill(buffer, allocation)?;
+        spill(buffer, allocation, SpillSite::Exit)?;
         // `rt` (the helper's first argument), the already-resolved successor and the
         // frame size the pop must match.
         buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
@@ -301,9 +302,9 @@ mod tests {
         (site, rel)
     }
 
-    /// `spill` of `allocation`, as emitted.
+    /// `spill` of `allocation` (its **written** cache), as emitted.
     fn spill_bytes(allocation: &Allocation) -> Vec<u8> {
-        encoded(|buffer| spill(buffer, allocation).unwrap())
+        encoded(|buffer| spill(buffer, allocation, SpillSite::Exit).unwrap())
     }
 
     /// The linked exit's `mov rdi, [rsp + RUNTIME_SLOT_DISP]` — the reload that
@@ -482,11 +483,15 @@ mod tests {
     #[test]
     fn every_exit_spills_the_cached_registers_before_leaving_the_frame() {
         // The spill is the tier's liveness model: with one cached x-register (x0 in
-        // r12) the exit must store it to `[rbx + 0]` *before* the frame teardown — on
-        // the linked path too, because the successor's prologue reloads `machine.x`.
+        // r12) **written by an inline lowering**, the exit must store it to `[rbx + 0]`
+        // *before* the frame teardown — on the linked path too, because the successor's
+        // prologue reloads `machine.x`. The store set is the block's write set
+        // (`Allocation::written`), which here is the single written register.
         let allocation = Allocation {
             slots: vec![(0u32, Reg::R12)],
+            written: vec![0],
             y_last: None,
+            ..Default::default()
         };
         let store = encoded(|buffer| buffer.mov_mr(Reg::Rbx, 0, Reg::R12).unwrap());
         let spill = spill_bytes(&allocation);
@@ -557,7 +562,9 @@ mod tests {
         assert!(linker.is_compiled(0, 7) && !linker.is_compiled(0, 8));
         let allocation = Allocation {
             slots: vec![(0u32, Reg::R12)],
+            written: vec![0],
             y_last: None,
+            ..Default::default()
         };
 
         linker

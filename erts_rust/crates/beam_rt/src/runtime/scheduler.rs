@@ -509,6 +509,13 @@ impl Runtime {
         let mut table = self.take_processes();
         let mut scheduler = std::mem::replace(&mut self.scheduler, Scheduler::new());
         let mut state = std::mem::take(&mut self.runner_state);
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "pass start: resume_first={resume_first} max_slices={max_slices:?} processes={} pids={:?}",
+                table.len(),
+                table.pids().collect::<Vec<_>>()
+            ));
+        }
         // A wake produced *outside* a scheduler slice before this pass started (a `-eval`
         // send, say) must be enqueued first when the caller asked for it.
         if resume_first {
@@ -531,6 +538,22 @@ impl Runtime {
                 let mut runner = RuntimeRunner::new(self, &mut state);
                 scheduler.run_ready(&mut table, &mut runner, budget)
             };
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "round: budget={budget:?} queue_len={} result={slices:?} states={:?}",
+                    scheduler.run_queue().len(),
+                    table
+                        .pids()
+                        .map(|pid| {
+                            let queued = table
+                                .get(pid)
+                                .map(|p| p.flags().in_run_queue())
+                                .unwrap_or(false);
+                            (pid, table.get(pid).map(|p| p.state()), queued)
+                        })
+                        .collect::<Vec<_>>()
+                ));
+            }
             match slices {
                 Ok(executed) => {
                     ran += executed;

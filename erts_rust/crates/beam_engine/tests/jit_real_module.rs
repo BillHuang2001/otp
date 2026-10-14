@@ -87,7 +87,7 @@
 //! Agreement alone would also hold if the native tier only ever deopted, so
 //! [`the_block_allocator_engages_on_real_stdlib_modules`] compiles real modules with
 //! [`BaselineJit`] and asserts the artifact is non-trivial: compiled blocks, a non-empty
-//! **resident register set** and a native-register bound -- i.e. the usage-weighted
+//! **resident register set** and a native-register bound -- i.e. the live-interval
 //! allocator in `src/jit/baseline/emit/regalloc.rs` actually ran and the code really
 //! addresses x-registers.
 
@@ -620,7 +620,7 @@ impl ErrorTarget {
 // The block register allocator -- evidence it actually engaged
 // ---------------------------------------------------------------------------
 
-/// The baseline block emitter's per-block resident-register budget (the most-touched
+/// The baseline block emitter's per-block resident-register budget (the longest-lived
 /// x-registers of *one* block, held in `rbp` + `r12`..`r15`). The artifact's
 /// `cached_registers()` is the **union across every block**, so it may exceed this.
 const CACHE_BUDGET: usize = 5;
@@ -629,7 +629,7 @@ const CACHE_BUDGET: usize = 5;
 /// produces non-trivial artifacts.
 ///
 /// For each real module the artifact must have compiled blocks, a non-empty **resident
-/// register set** (the usage-weighted allocator's output, deduped across blocks), a
+/// register set** (the live-interval allocator's output, deduped across blocks), a
 /// native-register bound that covers every resident, and a non-empty code mapping. A
 /// deopt-only tier would have no native register touches at all, so the non-empty resident
 /// set is the load-bearing assertion: the allocator ran and the emitted code really

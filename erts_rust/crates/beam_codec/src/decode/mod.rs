@@ -62,7 +62,7 @@ use crate::atom_cache::AtomCache;
 use crate::error::{bad_arg, system_limit};
 use crate::off_heap::OffHeapBinaries;
 use crate::reader::Reader;
-use crate::tag::{Tag, COMPRESSED_EXT, VERSION_MAGIC};
+use crate::tag::{Tag, COMPRESSED_EXT, NIL_EXT, VERSION_MAGIC};
 
 /// The OTP atom-length ceiling, in **characters** (`erts/emulator/beam/erl_term.h`):
 /// a longer name is a `SystemLimit`, never a truncated atom.
@@ -133,6 +133,15 @@ pub struct Decoder<'a> {
     /// with [`Decoder::with_local_node_hash`]. `None` (the default) leaves the
     /// 4-byte hash consumed-but-unchecked, exactly as before.
     local_hash: Option<u32>,
+    /// The C's `ERTS_DIST_EXT_INTERNAL_NC` flag: set once a `LOCAL_EXT` (`121`)
+    /// wrapper has been seen and kept for the rest of the decode (nested terms
+    /// included — `case LOCAL_EXT` commits it to `ctx->flags`,
+    /// `external.c:5250-5254`). In this mode an identifier's node field may be the
+    /// single `NIL_EXT` (106) internal-node marker instead of an atom tag
+    /// (`dec_sysname`, `external.c:3114-3122`), which counts as the local node
+    /// unconditionally (`dec_is_this_node`, `external.c:3123-3129`). `false` — the
+    /// default — reproduces today's bytes exactly.
+    internal_node: bool,
     /// The current nesting depth of [`Decoder::decode`], bounded by
     /// [`MAX_DECODE_DEPTH`]. Incremented on entry and decremented on **every** exit
     /// path (see `decode`), so it tracks the live recursion depth, not the number of
@@ -156,6 +165,7 @@ impl<'a> Decoder<'a> {
             off_heap: None,
             local_node: None,
             local_hash: None,
+            internal_node: false,
             depth: 0,
         })
     }
@@ -168,6 +178,7 @@ impl<'a> Decoder<'a> {
             off_heap: None,
             local_node: None,
             local_hash: None,
+            internal_node: false,
             depth: 0,
         }
     }
@@ -398,14 +409,10 @@ impl<'a> Decoder<'a> {
                 // `external.c:4821-4862`): the single wire number is the id, zero-padded
                 // to `ERTS_REF_NUMBERS`. The demotion is representability-gated — an id
                 // the internal form's small-int slot cannot hold keeps the external
-                // form (see [`crate::ref_wire::representable_ref_id`]). Inert unless
-                // `Decoder::with_local_node` installed the identity (see [`local_node`]).
-                if self.is_local_node(node, creation) {
-                    if let Some(id) = crate::ref_wire::representable_ref_id(&[r0]) {
-                        return crate::term::make_internal_ref(heap, id);
-                    }
-                }
-                crate::term::make_external_ref(heap, node, &[r0], creation)
+                // form (see [`crate::ref_wire::representable_ref_id`]) — and inert
+                // unless `Decoder::with_local_node` installed the identity or a
+                // `[local]` wrapper set the internal-node mode (see [`local_node`]).
+                return self.make_reference(heap, node, &[r0], creation);
             }
             Tag::NewReference => {
                 // `[114][len:2 BE][node atom][creation:1][r0:4][ids…]`. The C reads
@@ -455,13 +462,10 @@ impl<'a> Decoder<'a> {
                 // Local-node demotion: an internal reference (see the `Tag::Reference`
                 // arm and `ref_ext_common`, `external.c:4821-4862`). The empty `len == 0`
                 // slice maps to id 0 — exactly the C's zeroed padding. Representability-gated:
-                // an id the internal form cannot hold keeps the external form.
-                if self.is_local_node(node, creation) {
-                    if let Some(id) = crate::ref_wire::representable_ref_id(&ids) {
-                        return crate::term::make_internal_ref(heap, id);
-                    }
-                }
-                crate::term::make_external_ref(heap, node, &ids, creation)
+                // an id the internal form cannot hold keeps the external form, unless the
+                // node is the `[local]` marker, which has no external fallback
+                // (see [`Decoder::make_reference`]).
+                return self.make_reference(heap, node, &ids, creation);
             }
             Tag::NewerReference => {
                 // `[90][len:2 BE][node atom][creation:4][r0:4][ids…]`
@@ -500,13 +504,10 @@ impl<'a> Decoder<'a> {
                 // `ref_ext_common` builds the internal reference from only the first
                 // `ERTS_REF_NUMBERS` numbers, zero-padding a shorter image. Gated on the
                 // packed id fitting the internal form's small-int slot, so a larger id
-                // keeps the external form instead of failing.
-                if self.is_local_node(node, creation) {
-                    if let Some(id) = crate::ref_wire::representable_ref_id(&ids) {
-                        return crate::term::make_internal_ref(heap, id);
-                    }
-                }
-                crate::term::make_external_ref(heap, node, &ids, creation)
+                // keeps the external form instead of failing — unless the node is the
+                // `[local]` marker, which has no external fallback
+                // (see [`Decoder::make_reference`]).
+                return self.make_reference(heap, node, &ids, creation);
             }
             Tag::Port => {
                 // `[PORT_EXT][node atom][id:4 BE u32][creation:1]` (`external.c:4685-4716`:
@@ -750,6 +751,12 @@ impl<'a> Decoder<'a> {
             Tag::Local => {
                 let node_hash = self.reader.u32be()?;
                 self.check_local_node_hash(node_hash)?;
+                // `flags |= ERTS_DIST_EXT_INTERNAL_NC` (`external.c:5250-5254`): from
+                // here on an identifier's node field may be the `NIL_EXT` internal-node
+                // marker (§`Decoder::internal_node`). The flag persists for the rest of
+                // the decode — nested terms included, since the arm recurses through
+                // `self.decode`.
+                self.internal_node = true;
                 return self.decode(heap, atoms);
             }
 
@@ -812,12 +819,58 @@ impl<'a> Decoder<'a> {
 
     /// Decodes a nested term and requires it to be an atom (the node field of an
     /// external identifier).
+    ///
+    /// Under the `LOCAL_EXT` internal-node mode ([`Decoder::internal_node`]) the node
+    /// field may instead be the single `NIL_EXT` (106) marker the C's `dec_sysname`
+    /// accepts (`external.c:3114-3122`) — the `[local]`/ETS internal form, whose node
+    /// is `INTERNAL_LOCAL_SYSNAME` = `NIL` (`external.c:2965`). The marker is consumed
+    /// and returned as the [`NIL`] term, which every identifier arm then treats as
+    /// *this* node through [`Decoder::is_local_node`].
     fn decode_node_atom(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+        if self.internal_node && matches!(self.reader.peek_u8(), Ok(NIL_EXT)) {
+            let _ = self.reader.u8()?; // consume the marker byte
+            return Ok(NIL);
+        }
         let node = self.decode(heap, atoms)?;
         if !is_atom(node) {
             return Err(bad_arg());
         }
         Ok(node)
+    }
+
+    /// Materializes a reference image, applying the local-node demotion (the C's
+    /// `ref_ext_common`, `external.c:4821-4862`).
+    ///
+    /// `ids` are the wire numbers in order. When the node is the local node the packed
+    /// id materializes as *this* runtime's internal reference — gated on the internal
+    /// form's 60-bit id slot being able to hold it
+    /// ([`crate::ref_wire::representable_ref_id`]). Two cases are **not** demoted:
+    ///
+    /// * a *real* local node identity ([`Decoder::with_local_node`]) whose id does not
+    ///   fit keeps the faithful **external** reference form — the image's own node atom
+    ///   names the node, so the term is faithful (see [`crate::ref_wire`]);
+    /// * the `[local]` internal-node **marker** (`self.internal_node` + [`NIL`]) names
+    ///   *no* sysname at all, so there is no faithful external form to fall back on (an
+    ///   external reference needs a node atom). Such an id is reported as
+    ///   [`crate::error::unsupported`] rather than materialized with the `[]` sentinel
+    ///   as its node — the single-word internal-reference id slot is a `beam_term`
+    ///   layout decision, out of this crate's scope.
+    fn make_reference(
+        &mut self,
+        heap: &mut Heap,
+        node: Eterm,
+        ids: &[u32],
+        creation: u32,
+    ) -> Result<Eterm> {
+        if self.is_local_node(node, creation) {
+            if let Some(id) = crate::ref_wire::representable_ref_id(ids) {
+                return crate::term::make_internal_ref(heap, id);
+            }
+            if self.is_internal_node_marker(node) {
+                return Err(crate::error::unsupported(Tag::NewerReference));
+            }
+        }
+        crate::term::make_external_ref(heap, node, ids, creation)
     }
 
     /// Reads `len` big-endian `u32` reference ids.

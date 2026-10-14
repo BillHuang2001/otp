@@ -483,4 +483,18 @@ impl<'a> RuntimeContext<'a> {
                 .to_string(),
         );
     }
+
+    /// The name of the module whose **code** is executing, or `None` when no compiled module
+    /// frame has been entered — the `-eval` evaluator's own shape.
+    ///
+    /// This is the read half of [`RuntimeContext::enter_module`], and it exists for exactly
+    /// one consumer: the `process_info/2` execution-position items
+    /// ([`crate::native::memory`]), which must know whether the innermost frame of a
+    /// `-eval`-driven process is the evaluator's own driver frame (the oracle answers
+    /// `{erl_eval,do_apply,7}` there) or a real module function reached from it (the oracle
+    /// answers that function, which this runtime cannot source — see
+    /// [`crate::runtime::executing`]).
+    pub(crate) fn executing_module(&self) -> Option<&str> {
+        self.current_module.as_deref()
+    }
 }

@@ -18,13 +18,14 @@
 //
 // %CopyrightEnd%
 
-//! `zlib:compress/1` and `zlib:uncompress/1` — the two convenience functions of the
-//! preloaded `zlib` module, served over the workspace's own RFC 1950 codec.
+//! `zlib:compress/1`, `zlib:uncompress/1`, `zlib:zip/1` and `zlib:unzip/1` — the four
+//! self-contained convenience functions of the preloaded `zlib` module, served over the
+//! workspace's own codecs.
 //!
 //! # Why they are registered here
 //!
 //! `zlib` is a **preloaded** module: `../../erts/preloaded/src/zlib.erl` is real
-//! Erlang, and `compress/1`/`uncompress/1` are written over the stream interface
+//! Erlang, and all four functions are written over the stream interface
 //! (`open/0` → `deflateInit/2` → `deflate/3` → `deflateEnd/1` → `close/1`). Every
 //! one of those is an `erlang:nif_error(undef)` stub
 //! (`zlib.erl:185-194`, `open_nif/0` …) for the statically linked zlib NIF
@@ -34,10 +35,14 @@
 //! The **capability** already exists in the workspace, though: `beam_codec::compress`
 //! is `flate2` with the `rust_backend` (miniz_oxide) in the same RFC 1950
 //! (zlib-wrapped deflate) framing `erl_zlib_compress2` produces, and `beam_codec` is
-//! already a dependency of this crate — **no new dependency edge**. `compress/1` and
-//! `uncompress/1` are therefore registered here as the two stdlib fast paths the
-//! registry also carries for `erlang:memory/0,1` (neither is a `bif.tab` entry: the
-//! table declares **NIFs**, and these two are `zlib.erl` functions).
+//! already a dependency of this crate — **no new dependency edge**. All four are
+//! therefore registered here as stdlib fast paths the registry also carries for
+//! `erlang:memory/0,1` (none is a `bif.tab` entry: the table declares **NIFs**, and
+//! these are `zlib.erl` functions). `zip/1` reuses that same encoder, and `unzip/1` is
+//! served by this crate's own raw-DEFLATE decoder, [`crate::deflate`]: the codec is
+//! RFC 1950**-only** (its `ZlibDecoder` validates the header and the Adler-32 trailer),
+//! so a header-less stream cannot be re-wrapped into it, and this crate may not add an
+//! external dependency.
 //!
 //! # `zlib:compress/1`
 //!
@@ -69,35 +74,70 @@
 //! `zlib:uncompress(<<120,156>>)` are `data_error` (the inflater), while
 //! `zlib:uncompress(42)` and `zlib:uncompress(hello)` are `badarg`.
 //!
+//! # `zlib:zip/1` and `zlib:unzip/1`
+//!
+//! The **raw** pair: `zlib.erl:727-733` calls
+//! `deflateInit(Z, default, deflated, -MAX_WBITS, 8, default)` and `zlib.erl:748` calls
+//! `inflateInit(Z, -MAX_WBITS)` — a 15-bit window with **no** zlib header and **no**
+//! Adler-32 trailer. `zlib:zip/1` is *not* gzip (gzip is the separate RFC 1952
+//! `zlib:gzip/1`, which stays `undef`).
+//!
+//! * `zip/1` takes iodata (the same `erlang:iolist_to_iovec/1` hand-off as
+//!   `compress/1`) and returns the raw DEFLATE payload: the zlib stream
+//!   `beam_codec::compress::compress` emits, stripped of its 2-byte header and 4-byte
+//!   trailer by [`raw_deflate_of`] — a **checked** strip, so a stream that is not a
+//!   header-less-deflate carrier is a typed capability gap rather than a wrong slice.
+//! * `unzip/1` takes iodata too and inflates the raw stream with
+//!   [`crate::deflate::inflate`]. **There is no length arm**: a non-iodata argument is
+//!   `error:badarg`, and everything else the inflater cannot finish — including the
+//!   empty stream — is the bare `error:data_error` ([`data_error`]).
+//! * bytes after the end of the deflate stream are **ignored**, exactly as
+//!   `uncompress/1` ignores them: `zlib:unzip(<<Zip/binary, 99, 99>>)` is the payload.
+//!
+//! The error classes and both goldens are pinned against the oracle
+//! (OTP 29.1.1 / erts-17.1): `zlib:zip(<<"hello">>)` is `<<203,72,205,201,201,7,0>>` and
+//! `zlib:zip(<<>>)` is `<<3,0>>` while `zlib:unzip(<<>>)`, `zlib:unzip(<<1,2,3>>)` and
+//! `zlib:unzip(<<1,2,3,4,5,6,7,8>>)` are `data_error`, and `zlib:unzip(42)`,
+//! `zlib:unzip(hello)`, `zlib:zip(42)` and `zlib:zip([1,2|3])` are `badarg`.
+//!
 //! # Byte identity is not promised; interoperability is
 //!
 //! The deflate payload is produced by miniz_oxide, not by zlib, so the exact bytes
 //! of a compressed stream may differ from the oracle's (the framing, the round trip
-//! and RFC 1950 conformance are what this module pins). Any conforming inflater —
-//! the oracle's included — decodes what this module emits, and this module decodes
-//! what the oracle emits (see `tests/zlib.rs`).
+//! and RFC 1950/RFC 1951 conformance are what this module pins) — for the two `zip/1`
+//! goldens above they happen to agree byte for byte. Any conforming inflater — the
+//! oracle's included — decodes what this module emits, and this module decodes what
+//! the oracle emits: `tests/zlib.rs` cross-checks against streams the system `erl`
+//! produced.
 //!
 //! # Documented limits (never a silently wrong result)
 //!
 //! * **A decompressed payload above `beam_codec::compress::MAX_UNCOMPRESSED`
-//!   (32 MiB) is `data_error`**, where the oracle would inflate it. The bound is
-//!   `beam_codec::compress::decompress`'s: it exists so a corrupt or hostile stream
-//!   can never drive an unbounded allocation, and it is the only shape of this
-//!   module's behaviour that is not the oracle's. A typed error, never a wrong value.
+//!   (32 MiB) is `data_error`** (for `zip/1`'s counterpart `uncompress/1`, and for
+//!   `unzip/1` through the decoder's output ceiling), where the oracle would inflate
+//!   it. The bound is `beam_codec::compress::decompress`'s: it exists so a corrupt or
+//!   hostile stream can never drive an unbounded allocation, and it is the only shape
+//!   of this module's behaviour that is not the oracle's. A typed error, never a wrong
+//!   value.
 //! * **The rest of the `zlib` interface is not served.** The stream API
 //!   (`open/0`, `deflate/2,3`, `inflate/2,3`, `deflateInit/1,2,6`, `gzip/1`,
-//!   `gunzip/1`, `zip/1`, `unzip/1`, …) needs a real per-stream resource with a
-//!   controlling process, so it stays `undef` (its NIF stubs), exactly as before.
-//!   Only the two self-contained functions are registered.
+//!   `gunzip/1`, …) needs a real per-stream resource with a controlling process, so it
+//!   stays `undef` (its NIF stubs), exactly as before. Only the four self-contained
+//!   functions are registered; `gzip/1`/`gunzip/1` (RFC 1952) are among the `undef`
+//!   stubs.
 
 use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_term::Eterm;
 
-use beam_codec::compress::{compress as zlib_compress, decompress as zlib_decompress};
+use beam_codec::compress::{
+    compress as zlib_compress, decompress as zlib_decompress, MAX_UNCOMPRESSED,
+};
 
 use crate::binary::iodata_bytes;
 use crate::bits;
 use crate::context::BifContext;
+use crate::deflate;
+use crate::error::unsupported_bif;
 use crate::registry::BifRegistry;
 
 /// The compression level `zlib:compress/1` uses: `deflateInit(Z, default)`
@@ -108,6 +148,19 @@ const DEFAULT_COMPRESSION_LEVEL: u8 = 6;
 /// The shortest argument `zlib:uncompress/1` will hand to the inflater
 /// (`Size >= 8`, `zlib.erl:703`); anything shorter is `data_error`.
 const MIN_UNCOMPRESS_LENGTH: usize = 8;
+
+/// What a zlib stream always carries around its payload: the 2-byte header and the
+/// 4-byte big-endian Adler-32 trailer (RFC 1950 §2.2/§2.3) — exactly the bytes
+/// `zlib:zip/1` drops.
+const ZLIB_FRAMING_LENGTH: usize = 6;
+
+/// `CM` — the compression-method nibble of a zlib header's first byte meaning
+/// "deflate" (RFC 1950 §2.2).
+const DEFLATE_METHOD: u8 = 8;
+
+/// `FDICT` — the preset-dictionary flag of a zlib header's `FLG` byte (RFC 1950 §2.2).
+/// Set would mean a 4-byte dictionary id sits between the header and the payload.
+const FDICT_BIT: u8 = 0x20;
 
 /// `zlib:compress(Data)` — `Data` (iodata) compressed into one zlib stream.
 ///
@@ -121,6 +174,70 @@ fn compress_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let bytes = iodata_bytes(args[0])?;
     let deflated = zlib_compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
     bits::make_binary(ctx.heap(), &deflated)
+}
+
+/// `zlib:zip(Data)` — `Data` (iodata) as one **raw DEFLATE** (RFC 1951) stream.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-iodata argument — the oracle's `badarg` from
+/// `erlang:iolist_to_iovec/1` — and for an internal codec failure (there is no such
+/// path: the encoder writes into a `Vec`), which the codec reports with the same
+/// class. A codable stream that is not the expected zlib framing is the typed
+/// capability gap [`unsupported_bif`] (see [`raw_deflate_of`]).
+fn zip_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let bytes = iodata_bytes(args[0])?;
+    let stream = zlib_compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
+    bits::make_binary(ctx.heap(), raw_deflate_of(&stream)?)
+}
+
+/// `zlib:unzip(Data)` — the payload of the **raw DEFLATE** stream `Data` (iodata).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-iodata argument; the `error`-class
+/// [`data_error`] for a stream [`crate::deflate::inflate`] cannot finish — the empty
+/// stream included, since (unlike `uncompress/1`) `zlib:unzip/1` has no length arm —
+/// and for a payload past `beam_codec::compress::MAX_UNCOMPRESSED`.
+fn unzip_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let bytes = iodata_bytes(args[0])?;
+    // The decoder reports every failure in the codec's own class (`BadArg`), which is
+    // exactly the class `zlib:unzip/1` reports as `data_error`; any other error class
+    // is a genuine capability gap and is passed through untouched. The consumed-byte
+    // count is not needed: everything after the deflate stream is ignored anyway.
+    let (inflated, _consumed) = match deflate::inflate(&bytes, MAX_UNCOMPRESSED) {
+        Ok(inflated) => inflated,
+        Err(BeamError::BadArg) => return Err(data_error()),
+        Err(other) => return Err(other),
+    };
+    bits::make_binary(ctx.heap(), &inflated)
+}
+
+/// The raw DEFLATE payload of the zlib stream [`zlib_compress`] produced.
+///
+/// A zlib stream is `[CMF][FLG][DEFLATE…][ADLER-32:4 BE]` (RFC 1950 §2.2/§2.3), so the
+/// payload is the slice between the 2-byte header and the 4-byte trailer — the byte
+/// string `zlib:zip/1`'s `deflateInit(…, -MAX_WBITS, …)` emits, which is why `zip/1`
+/// needs no separate encoder.
+///
+/// The strip is **checked**: the header has to be there ([`ZLIB_FRAMING_LENGTH`]), the
+/// compression method has to be deflate ([`DEFLATE_METHOD`]), the preset-dictionary bit
+/// has to be clear ([`FDICT_BIT`] — a dictionary would put a 4-byte id where the payload
+/// starts) and the header's own check value has to be right
+/// (`(CMF << 8 | FLG) % 31 == 0`, RFC 1950 §2.2). A violation means the encoder no longer
+/// produces what this function assumes, so it is reported as the typed capability gap
+/// [`unsupported_bif`] — never as an unchecked slice of the stream, which would be a
+/// silently wrong result.
+fn raw_deflate_of(stream: &[u8]) -> Result<&[u8]> {
+    if stream.len() < ZLIB_FRAMING_LENGTH {
+        return Err(unsupported_bif());
+    }
+    let (cmf, flg) = (stream[0], stream[1]);
+    let header_check = ((u32::from(cmf) << 8) | u32::from(flg)) % 31 == 0;
+    if cmf & 0x0f != DEFLATE_METHOD || flg & FDICT_BIT != 0 || !header_check {
+        return Err(unsupported_bif());
+    }
+    Ok(&stream[2..stream.len() - 4])
 }
 
 /// `zlib:uncompress(Data)` — the payload of the zlib stream `Data` (iodata).
@@ -157,10 +274,12 @@ fn data_error() -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom("data_error")))
 }
 
-/// Registers the two self-contained `zlib` functions.
+/// Registers the four self-contained `zlib` functions.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("zlib", "compress", 1, compress_1);
     reg.register("zlib", "uncompress", 1, uncompress_1);
+    reg.register("zlib", "zip", 1, zip_1);
+    reg.register("zlib", "unzip", 1, unzip_1);
 }
 
 #[cfg(test)]
@@ -387,17 +506,179 @@ mod tests {
     }
 
     #[test]
-    fn register_installs_the_two_zlib_functions_with_the_right_arity() {
+    fn register_installs_the_four_zlib_functions_with_the_right_arity() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
 
         assert!(reg.contains("zlib", "compress", 1));
         assert!(reg.contains("zlib", "uncompress", 1));
+        assert!(reg.contains("zlib", "zip", 1));
+        assert!(reg.contains("zlib", "unzip", 1));
         assert!(!reg.contains("zlib", "compress", 2));
-        assert!(!reg.contains("zlib", "zip", 1));
-        assert!(!reg.contains("zlib", "unzip", 1));
+        assert!(!reg.contains("zlib", "zip", 2));
+        assert!(!reg.contains("zlib", "unzip", 2));
         assert!(!reg.contains("zlib", "open", 0));
-        assert_eq!(reg.len(), 2);
+        // The stream API stays unserved (its NIF stubs), as does gzip (RFC 1952).
+        assert!(!reg.contains("zlib", "gzip", 1));
+        assert!(!reg.contains("zlib", "gunzip", 1));
+        assert_eq!(reg.len(), 4);
+    }
+
+    #[test]
+    fn zip_produces_the_oracle_golden_raw_deflate_streams() {
+        let mut heap = heap();
+        let atoms = atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        // `zlib:zip(<<"hello">>)` and `zlib:zip(<<>>)` under OTP 29.1.1 / erts-17.1,
+        // byte for byte (both fixed-Huffman blocks, verified live against the oracle).
+        // The zlib stream `compress/1` builds for `<<"hello">>` is
+        // `[120,156] ++ payload ++ [6,44,2,21]`, so stripping the framing (2 + 4 bytes)
+        // reproduces the oracle's raw payload exactly.
+        let hello = binary(&mut ctx, b"hello");
+        let zipped = zip_1(&mut ctx, &[hello]).expect("zip/1");
+        assert_eq!(bytes_of(zipped), vec![203, 72, 205, 201, 201, 7, 0]);
+
+        let empty = binary(&mut ctx, b"");
+        let zipped_empty = zip_1(&mut ctx, &[empty]).expect("zip/1");
+        assert_eq!(bytes_of(zipped_empty), vec![3, 0]);
+    }
+
+    #[test]
+    fn zip_and_unzip_round_trip_and_ignore_trailing_bytes() {
+        let mut heap = heap();
+        let atoms = atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        let plain = binary(&mut ctx, b"hello");
+        let zipped = zip_1(&mut ctx, &[plain]).expect("zip/1");
+        let back = unzip_1(&mut ctx, &[zipped]).expect("unzip/1");
+        assert_eq!(bytes_of(back), b"hello");
+
+        // Bytes after the end of the deflate stream are ignored (oracle-verified:
+        // `zlib:unzip(<<Zip/binary, 99, 99>>)` is the payload).
+        let mut padded = bytes_of(zipped);
+        padded.extend_from_slice(&[99, 99]);
+        let padded = binary(&mut ctx, &padded);
+        let back = unzip_1(&mut ctx, &[padded]).expect("trailing bytes are ignored");
+        assert_eq!(bytes_of(back), b"hello");
+
+        // A larger, non-constant payload exercises the whole encoder/decoder pair.
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let plain = binary(&mut ctx, &payload);
+        let zipped = zip_1(&mut ctx, &[plain]).expect("zip/1");
+        let back = unzip_1(&mut ctx, &[zipped]).expect("unzip/1");
+        assert_eq!(bytes_of(back), payload);
+    }
+
+    #[test]
+    fn unzip_reports_data_error_for_any_stream_the_inflater_cannot_finish() {
+        let mut heap = heap();
+        let atoms = atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        // Unlike `uncompress/1` there is **no** length arm: the empty stream is
+        // `data_error` too (oracle-verified).
+        for raw in [&b""[..], &[1, 2, 3][..], &[1, 2, 3, 4, 5, 6, 7, 8][..], &[0xFF, 0xFF][..]]
+        {
+            let stream = binary(&mut ctx, raw);
+            assert!(
+                matches!(unzip_1(&mut ctx, &[stream]), Err(BeamError::Raise(raise))
+                    if raise.class == beam_common::ExceptionClass::Error
+                        && raise.reason == ExitReason::atom("data_error")),
+                "unzip/1 of {raw:?} must be data_error"
+            );
+        }
+
+        // A well-formed raw stream whose trailing byte is dropped mid-block.
+        let plain = binary(&mut ctx, b"hello");
+        let zipped = zip_1(&mut ctx, &[plain]).expect("zip/1");
+        let truncated = bytes_of(zipped)[..5].to_vec();
+        let truncated = binary(&mut ctx, &truncated);
+        assert!(
+            matches!(unzip_1(&mut ctx, &[truncated]), Err(BeamError::Raise(raise))
+                if raise.reason == ExitReason::atom("data_error")),
+            "a truncated stream must be data_error"
+        );
+    }
+
+    #[test]
+    fn a_non_iodata_argument_is_badarg_on_the_raw_pair_too() {
+        let mut heap = heap();
+        let atoms = atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        let improper = {
+            let one = ctx.int(1).expect("fits");
+            let two = ctx.int(2).expect("fits");
+            let three = ctx.int(3).expect("fits");
+            let tail = ctx.cons(two, three).expect("fits");
+            ctx.cons(one, tail).expect("fits")
+        };
+        let over_long = ctx.int(256).expect("fits");
+        let non_aligned = bits::make_bitstring(ctx.heap(), &[0b1010_0000], 4).expect("fits");
+
+        for (what, bad) in [
+            ("an integer", ctx.int(42).expect("fits")),
+            ("an atom", ctx.atom("hello").expect("seeded")),
+            ("an out-of-range integer", over_long),
+            ("a non-byte-aligned bitstring", non_aligned),
+            ("an improper list", improper),
+        ] {
+            assert!(
+                matches!(zip_1(&mut ctx, &[bad]), Err(BeamError::BadArg)),
+                "zip/1 of {what} must be badarg"
+            );
+            assert!(
+                matches!(unzip_1(&mut ctx, &[bad]), Err(BeamError::BadArg)),
+                "unzip/1 of {what} must be badarg"
+            );
+        }
+
+        // A plain list of byte values *is* iodata, on both (oracle-verified:
+        // `zlib:zip([1,2,3])` is `<<99,100,98,6,0>>`).
+        let list = {
+            let a = ctx.int(1).expect("fits");
+            let b = ctx.int(2).expect("fits");
+            let c = ctx.int(3).expect("fits");
+            ctx.list(&[a, b, c]).expect("fits")
+        };
+        let zipped = zip_1(&mut ctx, &[list]).expect("an integer list is iodata");
+        assert_eq!(bytes_of(zipped), vec![99, 100, 98, 6, 0]);
+        let back = unzip_1(&mut ctx, &[zipped]).expect("unzip/1");
+        assert_eq!(bytes_of(back), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn the_raw_deflate_strip_rejects_a_stream_it_does_not_understand() {
+        // The strip is checked, so a stream that is not a header-less-deflate carrier
+        // is a typed capability gap, never a silently wrong slice of it.
+        for stream in [
+            &b""[..],
+            &[120, 156, 3, 0][..],       // too short: no room for the trailer
+            &[119, 9, 3, 0, 0, 0][..],   // CM = 7, not deflate
+            &[120, 157, 3, 0, 0, 0][..], // FLG's check value is wrong
+        ] {
+            assert!(
+                matches!(raw_deflate_of(stream), Err(BeamError::Raise(raise))
+                    if raise.reason == ExitReason::atom("unsupported_bif")),
+                "{stream:?} must be the typed capability gap"
+            );
+        }
+        // The FDICT bit (0x20) makes a preset dictionary part of the stream, so the
+        // payload does not start after the 2-byte header: `120,32` has FDICT set and a
+        // header check value that is nevertheless valid.
+        assert!(
+            matches!(raw_deflate_of(&[120, 32, 1, 2, 3, 4, 5, 6]), Err(BeamError::Raise(raise))
+                if raise.reason == ExitReason::atom("unsupported_bif")),
+            "a preset dictionary must be the typed capability gap"
+        );
+        // The real encoder's framing is accepted.
+        let stream = zlib_compress(b"hello", DEFAULT_COMPRESSION_LEVEL).expect("deflate");
+        assert_eq!(
+            raw_deflate_of(&stream).expect("the encoder's own framing"),
+            &stream[2..stream.len() - 4]
+        );
     }
 
     #[test]

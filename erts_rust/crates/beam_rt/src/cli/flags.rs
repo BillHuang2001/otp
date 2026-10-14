@@ -18,16 +18,26 @@
 //
 // %CopyrightEnd%
 
-//! The emulator switches that have **no runtime-visible effect** in this runtime.
+//! The emulator switches this runtime recognizes and **validates**, whether or not they
+//! have a runtime-visible effect.
 //!
 //! These are the `+`/`-` switches real `erl` hands to the emulator rather than to
 //! `init` (contract A.6). They are recognized, **validated** against the legacy C
 //! ground truth and preserved verbatim in
 //! [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) so that
 //! nothing is lost — but they are **not init arguments**: in the oracle *every*
-//! `+`-flag is an emulator flag, so `init:get_argument('S'|'A'|'P'|'Q'|'K'|'hms'|'sbt')`
+//! `+`-flag is an emulator flag, so `init:get_argument('S'|'A'|'P'|'Q'|'K'|'hms'|'sbt'|'t'|'e'|'B')`
 //! is the bare atom `error` (verified against OTP 29.1.1 / erts-17.1). See
 //! [`crate::cli::parse`].
+//!
+//! A preserved flag with a modelled effect is read back out of that channel by the
+//! `system_info/1` key it drives — `+A` → `thread_pool_size` (`crate::info::schedulers`),
+//! `+t` → `atom_limit` / `+e` → `ets_limit` (`crate::info::limits`), `+Bi` →
+//! `break_ignored` (`crate::info::system`) and `+sbt` → `scheduler_bind_type`
+//! (`crate::info::schedulers`) — through
+//! [`RuntimeConfig::preserved_emulator_flag`](crate::config::RuntimeConfig::preserved_emulator_flag).
+//! The remaining flags here (`+Q`/`+K`/`+M*`/…) are validated and preserved but drive
+//! nothing today.
 //!
 //! # Ground truth
 //!
@@ -37,6 +47,8 @@
 //!   `ERTS_MAX_*` = `ERTS_PTAB_MAX_SIZE - 1` = 134 217 727 (`erl_ptab.h:174`,
 //!   `erl_node_container_utils.h:180,248`).
 //! * `+sbt` — `erts/emulator/beam/erl_cpu_topology.c:623-647`: the nine bind types.
+//! * `+t`/`+e` — `erl_init.c:2217-2234` (`strtol` + `[MIN_ATOM_TABLE_SIZE,
+//!   MAX_ATOM_TABLE_SIZE]`) and `erl_init.c:1696-1707` (`atoi`, negative rejected).
 //! * `-M*`/`+M*` — `erts/emulator/beam/erl_alloc.c:handle_args` (1556-1879) and
 //!   `handle_au_arg` (1282-1553).
 //! * `+K` — `erts/emulator/sys/common/erl_check_io.c:2467`: the emulator only
@@ -132,6 +144,75 @@ pub(super) fn parse_sbt(switch: &str, value: &str) -> Result<()> {
     } else {
         Err(error::bad_switch_value(switch, value))
     }
+}
+
+/// `MIN_ATOM_TABLE_SIZE` (`erts/emulator/beam/atom.h:33`).
+///
+/// `pub(crate)` because the `+t` effect (`crate::info::limits`) reads a preserved value
+/// back through the same accepted range before it reports `atom_limit`.
+pub(crate) const MIN_ATOM_TABLE_SIZE: i64 = 8_192;
+/// `MAX_ATOM_TABLE_SIZE = MAX_ATOM_INDEX + 1` clamped to `(1 << 31) - 1`
+/// (`erts/emulator/beam/atom.h:41`) — the largest `+t` value the oracle accepts.
+pub(crate) const MAX_ATOM_TABLE_SIZE: i64 = (1 << 31) - 1;
+
+/// Validates a `+t N` atom-table size, exactly as the C does
+/// (`erts/emulator/beam/erl_init.c:2217-2234`): `strtol` the value and reject it unless it
+/// lies in `[MIN_ATOM_TABLE_SIZE, MAX_ATOM_TABLE_SIZE]`.
+///
+/// Verified against the oracle (OTP 29.1.1 / erts-17.1):
+///
+/// ```text
+/// +t 100        → exit 1, `bad atom table size 100`
+/// +t bogus      → exit 1, `bad atom table size bogus`   (strtol → 0)
+/// +t -1         → exit 1, `bad atom table size -1`
+/// +t 4000000000 → exit 1, `bad atom table size 4000000000`  (> MAX)
+/// +t 8192 / +t 1048576 / +t 2000000000 → accepted, and `atom_limit` follows the value
+/// ```
+///
+/// `beam_rt` reports its uniform malformed-value diagnostic (exit 2 + `USAGE`) instead of
+/// the oracle's exit 1 + usage — the crate's documented emulator-value convention.
+pub(super) fn parse_atom_table_size(switch: &str, value: &str) -> Result<()> {
+    match value.parse::<i64>() {
+        Ok(size) if (MIN_ATOM_TABLE_SIZE..=MAX_ATOM_TABLE_SIZE).contains(&size) => Ok(()),
+        _ => Err(error::bad_switch_value(switch, value)),
+    }
+}
+
+/// Validates a `+e N` ETS-table count, mirroring the C's single check
+/// (`erts/emulator/beam/erl_init.c:1696-1707`): the value is `atoi`'d and only a
+/// **negative** result is rejected; a non-numeric value `atoi`s to `0` and is accepted.
+///
+/// The effective `ets_limit` is `max(atoi(N), DB_DEF_MAX_TABS)` — `erl_db.c:4789-4792` —
+/// which is why `+e 100`, `+e 0` and `+e abc` all report `8192` while `+e 16384` reports
+/// `16384` (verified against OTP 29.1.1 / erts-17.1).
+pub(super) fn parse_ets_tables(switch: &str, value: &str) -> Result<()> {
+    if atoi(value) < 0 {
+        Err(error::bad_switch_value(switch, value))
+    } else {
+        Ok(())
+    }
+}
+
+/// The C `atoi` used by the emulator's numeric switch readers: an optional sign and the
+/// leading digits, `0` for anything else (`abc`, ``, `12abc` → `0`/`0`/`12`). A value too
+/// large to fit an `i64` saturates, which still lands on the same accept/reject side.
+///
+/// `pub(crate)` because the `+e` effect (`crate::info::limits`) must reproduce the C's own
+/// lax parse — the value `ets_limit` reports is `max(atoi(<the +e value>), 8192)`
+/// (`erl_init.c:1699`, `erl_db.c:4789-4792`).
+pub(crate) fn atoi(value: &str) -> i64 {
+    let (sign, digits) = match value.strip_prefix('-') {
+        Some(rest) => (-1i64, rest),
+        None => (1i64, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let mut result: i64 = 0;
+    for byte in digits.bytes() {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        result = result.saturating_mul(10).saturating_add(i64::from(byte - b'0'));
+    }
+    sign.saturating_mul(result)
 }
 
 /// `-emu_flavor F` → the [`Flavor`](beam_common::Flavor) it selects.

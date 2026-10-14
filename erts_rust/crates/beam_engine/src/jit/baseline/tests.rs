@@ -168,6 +168,211 @@ fn allocation_ignores_registers_outside_the_engine_bound() {
     assert!(allocation.slots.is_empty());
 }
 
+/// A block whose **touch-count** ranking and **live-interval** ranking disagree, so a
+/// selection over it pins *which* policy the allocator uses.
+///
+/// ```text
+///   i=1        x1          ; x1 is first touched
+///   i=2..5     x0 = x2     ; four touches each of x0 and x2
+///   i=6..7     x0 = x3     ; two more touches of x0, two of x3
+///   i=8        x1 = x3
+///   i=9        x3
+///   i=10       x4
+///   i=11..13   x4 = x5
+///   i=14       x5
+///   i=15       x1          ; x1 is last touched, closing its long interval
+/// ```
+///
+/// Touch counts: `x0=6, x2=x3=x4=x5=4, x1=3` — the **usage-weighted** ranking keeps
+/// `{x0, x2, x3, x4, x5}` and evicts `x1`.
+/// Live intervals: `x1=[1,15] (15)`, `x0=[2,7] (6)`, `x2=[2,5] (4)`, `x3=[6,9] (4)`,
+/// `x4=[10,13] (4)`, `x5=[11,14] (4)` — the **interval** scan keeps `{x1, x0, x2, x3,
+/// x4}` and evicts `x5`, whose short, late interval is the cheapest register to leave in
+/// `machine.x`.
+fn interval_vs_count_code() -> Vec<Instr> {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let copy = |src: u32, dst: u32| Instr::Move {
+        src: Operand::X(src),
+        dst: Operand::X(dst),
+    };
+    vec![
+        Instr::Label(Label(1)),
+        mv(0, 1),
+        copy(2, 0),
+        copy(2, 0),
+        copy(2, 0),
+        copy(2, 0),
+        copy(3, 0),
+        copy(3, 0),
+        copy(3, 1),
+        mv(0, 3),
+        mv(0, 4),
+        copy(5, 4),
+        copy(5, 4),
+        copy(5, 4),
+        mv(0, 5),
+        mv(0, 1),
+        Instr::Return,
+    ]
+}
+
+#[test]
+fn allocation_prefers_long_live_intervals_over_touch_counts() {
+    let code = interval_vs_count_code();
+    let allocation = allocate_registers(&Module::default(), &code, 0, code.len());
+
+    // The interval winner — x1, live from the block's first instruction to its
+    // penultimate one — is resident ...
+    assert_eq!(
+        allocation.slot(1),
+        Some(Reg::R12),
+        "x1's long live interval must be selected"
+    );
+    // ... and the fifth-most-touched register (x5, a short late interval) is not, even
+    // though a usage-weighted ranking would have kept it.
+    assert_eq!(
+        allocation.slot(5),
+        None,
+        "x5's short interval must be left in machine.x"
+    );
+    // The four registers both policies agree on stay resident.
+    for x in [0u32, 2, 3, 4] {
+        assert!(allocation.slot(x).is_some(), "x{x} is resident");
+    }
+    // The slots keep first-appearance order (x1 appears first), not selection order.
+    let order: Vec<u32> = allocation.slots.iter().map(|(x, _)| *x).collect();
+    assert_eq!(order, vec![1, 2, 0, 3, 4]);
+}
+
+#[test]
+fn allocation_selects_a_deterministic_subset_of_the_shape_touched_registers() {
+    // Six candidate registers — more than the five-slot budget — so the selection is a
+    // strict subset of what the block's native lowerings touch, and it must be the same
+    // subset on every run.
+    let code = interval_vs_count_code();
+    let module = Module::default();
+    let labels = LabelMap::new();
+
+    let first = allocate_registers(&module, &code, 0, code.len());
+    let second = allocate_registers(&module, &code, 0, code.len());
+    assert_eq!(
+        first.slots, second.slots,
+        "the selection must be deterministic across runs"
+    );
+    assert!(
+        first.slots.len() <= CACHE_REGISTERS.len(),
+        "the cache budget bounds the resident set"
+    );
+
+    // Every resident is a register some cacheable instruction's native lowering
+    // touches, and no register is cached through two different machine registers.
+    let mut touched: Vec<u32> = Vec::new();
+    for instr in &code {
+        for x in cacheable_touches(&module, &labels, instr) {
+            if x < MAX_REGISTER && !touched.contains(&x) {
+                touched.push(x);
+            }
+        }
+    }
+    for (x, reg) in &first.slots {
+        assert!(
+            touched.contains(x),
+            "x{x} is not touched by any of the block's native lowerings"
+        );
+        assert!(
+            CACHE_REGISTERS.contains(reg),
+            "{reg:?} is not one of the cache's machine registers"
+        );
+    }
+    let mut indices: Vec<u32> = first.slots.iter().map(|(x, _)| *x).collect();
+    let cached = indices.len();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(indices.len(), cached, "a register is cached at most once");
+
+    // The spill contract holds: the write set is a subset of the resident set.
+    for x in &first.written {
+        assert!(first.slot(*x).is_some(), "written x{x} must be resident");
+    }
+}
+
+/// The `swaps_memory` block shape (also built by `tests/jit.rs`): a block that swaps a
+/// cached register against `machine.x` in every combination.
+///
+/// `extra_add` appends one more `erlang:+/2` after the final `move`, which touches `x2`
+/// and `x4` and writes `x4` — it changes no result register (`x0` is the `dst` of
+/// neither) and is therefore the minimal retuning a fixture needs when its residents
+/// must be `{x0, x1, x2, x3, x4}`.
+fn swaps_memory_block(extra_add: bool) -> (Module, Vec<Instr>) {
+    let (module, refs) = module_with_imports(&[("erlang", "+", 2)]);
+    let plus = refs[0];
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let add = |a: u32, b: u32, dst: u32| {
+        gc_bif(plus, vec![Operand::X(a), Operand::X(b)], Operand::X(dst))
+    };
+    let swap = |a: u32, b: u32| Instr::Swap {
+        a: Operand::X(a),
+        b: Operand::X(b),
+    };
+
+    let mut code = vec![Instr::Label(Label(1))];
+    for x in 0..5 {
+        code.push(mv(i64::from(x) + 1, x));
+    }
+    code.push(mv(6, 5));
+    code.push(mv(7, 6));
+    for _ in 0..3 {
+        for (a, b, dst) in [(0, 1, 2), (2, 3, 4), (4, 0, 1), (1, 2, 3), (3, 4, 0)] {
+            code.push(add(a, b, dst));
+        }
+    }
+    code.extend([
+        swap(0, 5),
+        swap(5, 6),
+        swap(0, 1),
+        swap(5, 3),
+        Instr::Move {
+            src: Operand::X(5),
+            dst: Operand::X(0),
+        },
+    ]);
+    if extra_add {
+        // Writes x4, so x4 stays live to the block's end; reads x2 and x0 only.
+        code.push(add(2, 0, 4));
+    }
+    code.push(Instr::Return);
+    (module, code)
+}
+
+#[test]
+fn a_late_swap_operand_wins_on_interval_length_and_one_touch_retunes_it() {
+    // The interval policy keeps the five **longest** intervals, and on this shape the
+    // fifth-longest is `x5` — live from the `move` that initialises it all the way to
+    // the block's final `move`, i.e. spanning 22 instruction slots — while `x4`'s
+    // interval closes after the last `+` (18 slots). Touch counts rank them the other
+    // way round (`x5` reaches 5 touches, `x4` 10), so the two policies pin different
+    // residents and this test is the allocator-side evidence for both.
+    let (module, code) = swaps_memory_block(false);
+    let allocation = allocate_registers(&module, &code, 0, code.len());
+    let residents: Vec<u32> = allocation.slots.iter().map(|(x, _)| *x).collect();
+    assert_eq!(residents, vec![0, 1, 2, 3, 5]);
+
+    // One further touch of `x4` — a write, so it stays live to the end — and the
+    // residents become `{x0, x1, x2, x3, x4}`, which is what the `swaps_memory` fixture
+    // in `tests/jit.rs` documents (it must leave `x5`/`x6` in `machine.x` to exercise
+    // the cached/uncached swap combinations).
+    let (module, code) = swaps_memory_block(true);
+    let allocation = allocate_registers(&module, &code, 0, code.len());
+    let residents: Vec<u32> = allocation.slots.iter().map(|(x, _)| *x).collect();
+    assert_eq!(residents, vec![0, 1, 2, 3, 4]);
+}
+
 #[test]
 fn constant_words_match_the_operand_seam() {
     assert_eq!(constant_word(&Operand::Integer(5)), Some(make_small(5).raw() as i64));
@@ -1699,6 +1904,183 @@ fn a_collecting_helper_does_not_leave_a_cached_heap_term_stale() {
         RunOutcome::Returned(make_small(5)),
         "the inlined tuple read must reload x0 after the collecting helper — a stale \
          cached word returns the poisoned from-space element"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the written-set exit spill must leave an un-written cached register alone
+// ---------------------------------------------------------------------------
+
+/// The sentinel the probe BIF's host answer carries — the value the *helper* (the
+/// interpreter) writes into `machine.x`, not the block's cached register. A
+/// full-cache exit spill would store the block's stale cached argument over it.
+const HELPER_SENTINEL: i64 = 999;
+
+/// A context that answers the probe BIF `probe:mark/1` with the fixed small-int
+/// [`HELPER_SENTINEL`], delegating the heap and every other BIF to a
+/// [`MinimalContext`].
+struct SentinelBifCtx {
+    inner: MinimalContext,
+}
+
+impl SentinelBifCtx {
+    fn new() -> SentinelBifCtx {
+        SentinelBifCtx {
+            inner: MinimalContext::new(),
+        }
+    }
+}
+
+impl ExecutionContext for SentinelBifCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        if module == "probe" && function == "mark" && arity == 1 {
+            return Ok(make_small(HELPER_SENTINEL));
+        }
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+}
+
+/// **The written-set exit-spill soundness pin.** A cached x-register that no inline
+/// lowering of the block writes still holds exactly its `machine.x` value at every
+/// program point, so a block exit's [`spill`](super::emit::regs::spill) — which stores
+/// only [`Allocation::written`](super::emit::Allocation) — may skip it. It also
+/// **must**: a helper *is* the interpreter and writes `machine.x` directly, so storing a
+/// stale cached register over the helper's fresh word would clobber it. This test proves
+/// the invariant the whole partial-spill/partial-fill model rests on.
+///
+/// The experiment is a body block that caches x1 but never writes it:
+///
+/// * `move x1 -> x0` is inlined and charges x1 (its source) and x0 (its destination), so
+///   the allocator caches **both** — but the write set is `{x0}` only (`move`'s
+///   destination register);
+/// * a deopted `gc_bif` whose destination is x1 is a shape neither
+///   [`fast_arith`](super::emit::fast_arith) nor
+///   [`comparison_shape`](super::emit::comparison_shape) claims, so it runs through
+///   `jit_step_one` — the interpreter — which writes the helper's sentinel into
+///   `machine.x[1]`;
+/// * nothing later reads x1, so x1 is dead after the helper and is left out of the
+///   post-helper fill set at that pc;
+/// * the inlined `return`'s pre-helper spill stores the write set `{x0}` only.
+///
+/// So `machine.x[1]` keeps the helper's sentinel. Under a full-cache exit-spill model the
+/// block would store its stale cached x1 (the `22` argument) over it — which is exactly
+/// the observable that catches an unsound spill set. The post-helper fill-set analysis in
+/// [`super::emit::liveness`] IS this model: a cached register left out of the fill set is
+/// only ever overwritten, never read.
+#[test]
+fn the_written_set_exit_spill_leaves_an_unwritten_cached_register_untouched() {
+    let module = build_module(
+        "written_set_spill",
+        &[("probe", "mark", 1)],
+        vec![(
+            "f",
+            2,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                // Inlined: charges x1 (source) + x0 (destination); the write set is x0.
+                Instr::Move {
+                    src: Operand::X(1),
+                    dst: Operand::X(0),
+                },
+                // A non-inlined BIF (arity 1, an import the fast paths decline): it
+                // contributes no native touch and no write, and its interpreter step
+                // writes `machine.x[1]`.
+                Instr::GcBif {
+                    arity: 1,
+                    bif: ImportRef(0),
+                    fail: NO_FAIL,
+                    live: 2,
+                    args: vec![Operand::X(0)],
+                    dst: Operand::X(1),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 2, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+
+    // (a) x1 must really be cached, or the experiment proves nothing: a register
+    // addressed directly in `machine.x` is always current.
+    let compiled = compile_module(&module).expect("compile the module");
+    assert!(
+        compiled.cached_registers().contains(&1),
+        "x1 must be held in a machine register by the body block, got {:?}",
+        compiled.cached_registers()
+    );
+
+    // The interpreter's own outcome, for the cross-tier comparison.
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = SentinelBifCtx::new();
+    let interpreter_outcome = interpreter.run_export_outcome_with_tier(
+        &module,
+        name,
+        2,
+        &[make_small(11), make_small(22)],
+        &mut interpreter_ctx,
+        Tier::Interpreter,
+    );
+
+    let mut machine = Machine::new();
+    let mut ctx = SentinelBifCtx::new();
+    let baseline_outcome = run_compiled_outcome(
+        &compiled,
+        &mut machine,
+        &module,
+        name,
+        2,
+        &[make_small(11), make_small(22)],
+        &mut ctx,
+    );
+
+    // (c) the outcome is the interpreter's: the inlined `move x1 -> x0` leaves x0 = 22,
+    // and the BIF's write to x1 is not what `return` yields.
+    assert_same_outcome(
+        "written-set exit spill",
+        &interpreter_outcome,
+        &baseline_outcome,
+        &module.atom_table,
+    );
+    assert_eq!(
+        baseline_outcome.expect("the run deopts and returns"),
+        RunOutcome::Returned(make_small(22)),
+        "the inlined `move x1 -> x0` left x0 = 22"
+    );
+
+    // (b) the helper's write to `machine.x[1]` survived the block's exit spill: the exit
+    // spill stores only the write set (`{x0}`), so the stale cached x1 is never stored
+    // over it. A full-cache spill would clobber it with the cached `22`.
+    assert_eq!(
+        machine.x(1),
+        Some(make_small(HELPER_SENTINEL)),
+        "the exit spill must not store the un-written cached x1 over the helper's \
+         `machine.x[1]`; a full-cache spill writes the stale cached argument (22) here"
+    );
+    assert_eq!(
+        interpreter.x(1),
+        Some(make_small(HELPER_SENTINEL)),
+        "the interpreter tier's `machine.x[1]` is the helper's write too"
     );
 }
 
@@ -4500,6 +4882,39 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.ext_call_resolved, counters.ext_call_declined, counters.ext_call_fallback
     );
     println!("  driver round trips by word: {:?}", counters.round_trips_by_word);
+    println!(
+        "  blocks={} ir_instrs={} bytes={} cache_slots={} written_slots={} | \
+         blocks by cache-size: {:?} | blocks by write-size: {:?}",
+        counters.blocks,
+        counters.block_ir_instructions,
+        counters.block_emitted_bytes,
+        counters.block_cache_slots,
+        counters.block_written_slots,
+        counters.blocks_by_cache_slots,
+        counters.blocks_by_written_slots,
+    );
+    println!(
+        "  allocator live ranges: candidates={} selected-live-total={} selected-live-max={}",
+        counters.block_live_candidates, counters.block_live_total, counters.block_live_max,
+    );
+    println!(
+        "  spill stores: written-set={} (by site {:?}) vs full-cache={} (by site {:?}); \
+         spill calls={:?}",
+        counters.spill_stores,
+        counters.spill_stores_by_site,
+        counters.spill_stores_full,
+        counters.spill_stores_by_site_full,
+        counters.spill_calls_by_site,
+    );
+    println!(
+        "  fill registers: partial={} (by site {:?}) vs full-cache={} (by site {:?}); \
+         fill calls={:?}",
+        counters.fill_registers,
+        counters.fill_registers_by_site,
+        counters.fill_registers_full,
+        counters.fill_registers_by_site_full,
+        counters.fill_calls_by_site,
+    );
     let mut rows: Vec<(&String, &u64)> = counters.deopts_by_variant.iter().collect();
     rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     println!("  deopts by variant (descending):");
@@ -4577,7 +4992,16 @@ fn the_two_process_copy_bound_shape_is_measured_on_both_tiers() {
     }
 
     // 3. Counting passes (recording ON) — one per tier, small op count.
+    //
+    // The emission-time counters (`record_block`/`record_spill`/`record_fill`) fire
+    // while a block is *compiled*, and the timed passes above have already populated
+    // the per-thread baseline cache, so a counting pass that reused those artifacts
+    // would emit no block and record nothing. Clearing the cache first forces the
+    // baseline tier's counting pass to recompile the modules it enters, so every
+    // executed block's emission is counted exactly once. (The interpreter tier does
+    // not consult the cache at all; the clear is harmless there.)
     for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        crate::jit::cache::clear_baseline_cache();
         counters::reset();
         counters::set_enabled(true);
         let (value, reductions, _) = drive_probe(
@@ -4602,6 +5026,162 @@ fn the_two_process_copy_bound_shape_is_measured_on_both_tiers() {
     }
 
     println!("loadavg (end): {}", probe_loadavg());
+}
+
+/// The committed `erlc` fixtures whose bodies exercise `Y` slots — the offline "real
+/// shape" corpus for the `Y`-traffic measurement below (no oracle, no timing).
+const Y_TRAFFIC_FIXTURES: [&str; 27] = [
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/applyrecv.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bignum.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bitstrings.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsbig.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bscreate.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsfailseg.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsmatch.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bssmall.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsstring.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/catchtrace.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/exceptions.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/excpaths.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/floats.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/funs.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lists.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mapfx.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/raise_frames.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/records.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/recv.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/stacktrace.beam"),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlib_exports_harness.beam"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlib_more_harness.beam"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlib_text_harness.beam"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stdlists_harness.beam"
+    ),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tailcall.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tuples.beam"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/xmod_callee.beam"),
+];
+
+/// **The `Y`-window traffic baseline**: how much frame-window-guarded `Y`-slot traffic the
+/// committed `erlc` fixtures emit, and how little of it a per-block single-slot `Y`-value
+/// cache could at most save.
+///
+/// Every counted quantity is **structural** — emitted while the blocks are compiled — so
+/// the numbers are reproducible from the committed fixtures alone (no oracle, no timing,
+/// no host-load sensitivity):
+///
+/// * `y_loads`/`y_stores` — the emitted guarded `Y` accesses (each is a frame-window guard
+///   plus one load/store word) and `y_bytes`, the emitted size of all of them;
+/// * `y_blocks` — the emitted blocks whose body touches a `Y` slot at all;
+/// * `y_invalidations` — the in-block helper calls after which a **later** instruction of
+///   the same block still touches `Y` (each is a re-publish site a `Y`-value cache would
+///   also have to re-validate and reload through);
+/// * `y_slot_repeats` — `Y` accesses that re-touch a slot **already accessed earlier in
+///   the same block**. A per-block cache cannot forward across a block exit (the exit
+///   teardown destroys the cache registers) and cannot survive an in-block helper, so this
+///   is the **upper bound** on what such a cache could ever save.
+///
+/// The test asserts the counters are live and internally consistent and *prints* the
+/// totals; it deliberately asserts **no** traffic threshold, so it passes identically
+/// whether or not a `Y`-value cache exists (the printed numbers are the evidence).
+#[test]
+fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
+    // (1) The instrument itself, on a synthetic shape with *known* `Y` traffic:
+    // `y_slot_move_code` stores `Y(0)`, loads `Y(0)`, stores `Y(1)`, loads `Y(1)` — two
+    // loads, two stores, and two same-block slot reuses. Pinning these exact counts here
+    // is what makes the fixture totals below evidence rather than an unexplained number.
+    crate::jit::cache::clear_baseline_cache();
+    counters::reset();
+    counters::set_enabled(true);
+    let probe_module = build_module(
+        "y_traffic_probe",
+        &[],
+        vec![("f", 0, y_slot_move_code())],
+        &[("f", 0, Label(2))],
+    );
+    let probe_labels = crate::interpreter::build_label_map(&probe_module);
+    compile_function(&probe_module, &probe_labels, 0).expect("y_traffic_probe/f-0 compiles");
+    counters::set_enabled(false);
+    let probe = counters::snapshot();
+    assert_eq!(
+        (probe.y_loads, probe.y_stores, probe.y_slot_repeats),
+        (2, 2, 2),
+        "the Y-traffic instrument must see the synthetic shape's known traffic"
+    );
+    assert!(probe.y_blocks >= 1, "the synthetic block touches a Y slot");
+    assert!(probe.y_bytes > 0, "a guarded Y access emits bytes");
+
+    // (2) The committed fixture corpus, counted from zero.
+    counters::reset();
+    counters::set_enabled(true);
+
+    let mut functions = 0u64;
+    let mut skipped = 0u64;
+    for path in Y_TRAFFIC_FIXTURES {
+        let module =
+            beam_loader::load_file(path).unwrap_or_else(|error| panic!("load {path}: {error:?}"));
+        let labels = crate::interpreter::build_label_map(&module);
+        for func in 0..module.functions.len() as u32 {
+            match compile_function(&module, &labels, func) {
+                Ok(_) => functions += 1,
+                Err(_) => skipped += 1,
+            }
+        }
+    }
+
+    counters::set_enabled(false);
+    let snap = counters::snapshot();
+    let accesses = snap.y_loads + snap.y_stores;
+
+    println!(
+        "=== Y-window traffic over {} committed fixtures ===",
+        Y_TRAFFIC_FIXTURES.len()
+    );
+    println!(
+        "  compiled functions={functions} skipped={skipped} | blocks={} ir_instrs={} emitted_bytes={}",
+        snap.blocks, snap.block_ir_instructions, snap.block_emitted_bytes,
+    );
+    println!(
+        "  Y: loads={} stores={} (accesses={}) bytes={} blocks={} invalidations={} slot_repeats={}",
+        snap.y_loads,
+        snap.y_stores,
+        accesses,
+        snap.y_bytes,
+        snap.y_blocks,
+        snap.y_invalidations,
+        snap.y_slot_repeats,
+    );
+    println!(
+        "  Y accesses per 1000 IR instructions: {:.1}",
+        accesses as f64 * 1000.0 / snap.block_ir_instructions.max(1) as f64,
+    );
+
+    assert!(
+        functions > 0,
+        "the fixture corpus must compile at least one function"
+    );
+    assert!(
+        snap.y_blocks > 0,
+        "the corpus must emit at least one Y-touching block"
+    );
+    assert!(snap.y_loads > 0, "the corpus must emit guarded Y loads");
+    assert!(snap.y_stores > 0, "the corpus must emit guarded Y stores");
+    assert!(snap.y_bytes > 0, "a guarded Y access emits bytes");
+    assert!(
+        snap.y_slot_repeats <= accesses,
+        "a reuse is one of the accesses: {} > {accesses}",
+        snap.y_slot_repeats,
+    );
 }
 
 /// **The entry-lookup pin**: the baseline tier's per-slice artifact lookup must not
@@ -4794,6 +5374,82 @@ fn the_entry_module_priming_is_measured_on_both_tiers() {
         "baseline/interpreter ns-per-op ratio: UNPRIMED {:.2}x, PRIMED {:.2}x",
         baseline_unprimed.ns_per_op / interpreter_unprimed.ns_per_op,
         baseline_primed.ns_per_op / interpreter_primed.ns_per_op,
+    );
+    println!("loadavg (end): {}", probe_loadavg());
+}
+
+/// How many interleaved A/B passes the copy-bound tier comparison runs (the objective
+/// asks for `N ≥ 5`; 7 gives a little slack against a single loaded pass).
+const AB_PASSES: usize = 7;
+
+/// **The interleaved, same-window A/B**: the two-process copy-bound shape on both tiers,
+/// pass by pass, in one measurement window — so a shared host's load drifts **both** sides
+/// together and the min-over-N (taken independently per tier) is the honest figure. The
+/// block register cache's spill/fill traffic moved with the liveness-based partial model
+/// (see the structural counters above); this asks whether that moved the **wall clock** on
+/// the most spill/helper-heavy shape those counters reveal.
+///
+/// The cache is **primed** first (`remember_module` once per module the host enters). The
+/// probe's modules are synthetic (`Module::default()`-based, hence an all-zero checksum),
+/// so an unprimed baseline slice re-hashes the module's whole decoded IR on every slice
+/// entry/resume — the documented artifact of
+/// [`the_entry_module_priming_is_measured_on_both_tiers`] — which would swamp the tier's
+/// own execution work. Priming leaves the A/B measuring exactly the work this change
+/// touches, and the zero-fingerprint assertion below proves the priming held.
+///
+/// Assertions are correctness only (each pass's result and that both inboxes drained); the
+/// ns/op figures and their ratio are printed, never asserted — the host is shared, so the
+/// structural counters remain the honest evidence for the spill/fill change.
+#[test]
+fn the_copy_bound_tier_ab_is_interleaved_and_min_over_n() {
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+    let bench = std::sync::Arc::new(bench);
+    let worker = std::sync::Arc::new(worker);
+    // Prime: an O(1) memo entry per entered module, so no pass re-hashes the module IR.
+    crate::jit::cache::remember_module(&bench);
+    crate::jit::cache::remember_module(&worker);
+
+    println!(
+        "=== interleaved A/B: two-process copy-bound shape (primed), N={AB_PASSES} passes ==="
+    );
+    println!("loadavg (start): {}", probe_loadavg());
+
+    let mut interpreter_passes = Vec::with_capacity(AB_PASSES);
+    let mut baseline_passes = Vec::with_capacity(AB_PASSES);
+    for pass in 0..AB_PASSES {
+        let interpreter =
+            time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::Interpreter);
+        let baseline = time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::BaselineJit);
+        assert_eq!(
+            interpreter.fingerprints, 0,
+            "the interpreter tier resolves no module through the JIT cache"
+        );
+        assert_eq!(
+            baseline.fingerprints, 0,
+            "a primed baseline pass must not re-hash the module IR"
+        );
+        println!(
+            "  pass {pass}: {:>12} {:>10.2} ns/op | {:>12} {:>10.2} ns/op",
+            Tier::Interpreter.name(),
+            interpreter.ns_per_op,
+            Tier::BaselineJit.name(),
+            baseline.ns_per_op,
+        );
+        interpreter_passes.push(interpreter.ns_per_op);
+        baseline_passes.push(baseline.ns_per_op);
+    }
+
+    let min = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+    let interpreter_min = min(&interpreter_passes);
+    let baseline_min = min(&baseline_passes);
+    println!(
+        "min over {AB_PASSES} passes: {:>12} {:>10.2} ns/op | {:>12} {:>10.2} ns/op | \
+         baseline/interpreter = {:.3}x",
+        Tier::Interpreter.name(),
+        interpreter_min,
+        Tier::BaselineJit.name(),
+        baseline_min,
+        baseline_min / interpreter_min,
     );
     println!("loadavg (end): {}", probe_loadavg());
 }

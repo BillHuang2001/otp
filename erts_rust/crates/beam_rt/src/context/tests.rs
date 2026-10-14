@@ -26,7 +26,9 @@ use beam_term::{atom_val, is_small, make_atom, make_small, signed_value, Atom, A
 
 use super::*;
 use crate::config::RuntimeConfig;
-use crate::context::test_support::{compile_fixtures, resolve_erlc, skip_loudly};
+use crate::context::test_support::{
+    compile_fixtures, find_on_path, resolve_erlc, skip_loudly,
+};
 use crate::native::test_support::remote_pid;
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("the default runtime")
@@ -3481,6 +3483,212 @@ fn the_call_seam_is_idempotent_for_a_cached_observer_callee() {
             "consultation {consultation} of a non-observer callee must be admitted in-machine"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The in-machine fun-apply seam (`resolve_local_fun`) and its external-fun arm
+// ---------------------------------------------------------------------------------------
+
+/// `efwait:wait/0` materializes an **external** fun (`fun efcallee:block/1`, the `EXPORT_EXT`
+/// encoding) and hands it to a **second** module, so the compiler cannot inline the apply: the
+/// `call_fun` instruction lives in `efhelper:call1/2`. The spawned `efwait:sender/2` is the
+/// child that delivers the message the callee waits for.
+const EFWAIT_SRC: &str = r#"
+-module(efwait).
+-export([wait/0, sender/2]).
+
+wait() ->
+    spawn(efwait, sender, [self(), 42]),
+    efhelper:call1(fun efcallee:block/1, dummy).
+
+sender(To, Msg) -> To ! Msg.
+"#;
+
+/// The module the `call_fun` lives in — a **distinct** module is what defeats the compiler's
+/// fun inlining, so the external fun is genuinely applied with `call_fun`.
+const EFHELPER_SRC: &str = r#"
+-module(efhelper).
+-export([call1/2]).
+
+call1(F, X) -> F(X).
+"#;
+
+/// The external fun's callee: its body blocks in a bare `receive`, so the process can only
+/// finish if the engine entered the callee **in-machine** (the suspension is the *process's*)
+/// and the scheduler resumed it when the sender's message arrived.
+const EFCALLEE_SRC: &str = r#"
+-module(efcallee).
+-export([block/1]).
+
+block(_) -> receive X -> X end.
+"#;
+
+/// **An external `fun M:F/A` whose callee blocks is entered in-machine from a scheduled slice.**
+///
+/// `RuntimeContext::resolve_local_fun` resolves an **external** fun (`fun M:F/A`, `EXPORT_EXT`)
+/// to its callee module's export label, so the engine's `call_fun` arm enters the callee body
+/// in the **calling** machine — exactly as C's `call_fun` dispatches to the fun's code in the
+/// same process. The workload drives the CLI's `run` route
+/// ([`Runtime::run_scheduled`](crate::runtime::Runtime::run_scheduled)): a real scheduled
+/// process applies `fun efcallee:block/1` from a foreign module, the callee's bare `receive`
+/// finds an empty mailbox and [suspends](beam_engine::RunOutcome::Wait) the *process*, and a
+/// later scheduler pass — the sender child the process spawned — delivers the message that
+/// resumes it.
+///
+/// Without the external-fun arm the resolver answers `Ok(None)`, `call_fun` falls back to the
+/// value-returning `apply_fun`, whose nested `Machine` cannot re-enter the scheduler
+/// (`may_pump_scheduler() == false` on a slice), so the `receive` folds into the uncatchable
+/// `blocked()` capability gap and the process dies instead of returning. Asserting the
+/// oracle-shaped value `42` is what rules that out — a wrong rung on the seam is an error or a
+/// hang, never this value.
+///
+/// The final block reads the seam's own answer directly (the external fun resolves to
+/// `efcallee:block/1`'s export label), pinning the resolution the end-to-end run depends on.
+#[test]
+fn an_external_fun_whose_callee_blocks_resumes_on_a_scheduled_slice() {
+    // `run_scheduled` boots the runtime on demand, which resolves the system code path (natively
+    // from the filesystem, else `$ERTS_STDLIB_DIR` or the system `erl`). The guard below is
+    // conservative — it skips when neither `$ERTS_STDLIB_DIR` nor an `erl` on `$PATH` is
+    // available — and this test needs the compiler too. A missing toolchain is a loud skip,
+    // never a silent pass.
+    if std::env::var_os("ERTS_STDLIB_DIR").is_none() && find_on_path("erl").is_none() {
+        skip_loudly(
+            "external fun apply",
+            "no `erl` on $PATH and no $ERTS_STDLIB_DIR",
+        );
+        return;
+    }
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "external fun apply",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "external_fun_apply",
+        &[
+            ("efwait", EFWAIT_SRC),
+            ("efhelper", EFHELPER_SRC),
+            ("efcallee", EFCALLEE_SRC),
+        ],
+    );
+
+    let mut rt = runtime();
+    rt.add_code_path(dir.path());
+
+    // The scheduled route: a real process, a real run queue, real passes.
+    let result = rt
+        .run_scheduled(dir.join("efwait.beam"), "wait", 0, &[])
+        .expect(
+            "an external fun's blocking callee must suspend the scheduled process and be \
+             resumed — a missing in-machine entry folds this into the typed `blocked()` gap",
+        );
+    assert_eq!(
+        result,
+        make_small(42),
+        "the resumed receive took the message the sender child delivered"
+    );
+
+    // The seam's own outcome, read directly: the external fun resolves to `efcallee:block/1`'s
+    // export label, which is exactly what makes the engine enter the callee in the scheduled
+    // machine. `efcallee` is cached by the run above, so the resolution needs no code path.
+    let module_atom = atom_val(rt.intern("efcallee"));
+    let function_atom = atom_val(rt.intern("block"));
+    let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
+    let fun = beam_codec::term::make_fun_external(&mut heap, 1, module_atom, function_atom)
+        .expect("the external fun builds");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let (callee, label) = ctx
+        .resolve_local_fun(fun, &[make_small(0)])
+        .expect("the seam reports a routing, never an error")
+        .expect("an external fun resolves to its callee's export label");
+    assert_eq!(
+        callee.atom_name(callee.name),
+        Some("efcallee"),
+        "the seam names the callee module the fun's MFA carries"
+    );
+    let block = callee
+        .atom_table
+        .lookup("block")
+        .expect("`block` is interned in the callee's own table");
+    assert_eq!(
+        callee.export(block, 1),
+        Some(label),
+        "the resolved label is the callee's own export entry (what `call_ext` would enter)"
+    );
+}
+
+/// A `make_fun3` ([`beam_codec::FunKind::Local`]) fun term plus the storage owning its words.
+///
+/// The frozen layout is `[header, uniq, index, env…]` with
+/// `header = FUN_SUBTAG | arity << 8 | num_free << 16` (`beam_term::fun`). The returned
+/// `Box<[Eterm]>` owns the words and must outlive the term (the boxed word points into it).
+fn local_fun(arity: u32, uniq: u64, index: u32, env: &[Eterm]) -> (Box<[Eterm]>, Eterm) {
+    let header = beam_term::FUN_SUBTAG
+        | ((arity as usize) << 8)
+        | ((env.len() as usize) << beam_term::fun::FUN_HEADER_ENV_SIZE_OFFS);
+    let mut words: Vec<Eterm> = vec![
+        Eterm::from_raw(header),
+        Eterm::from_raw(uniq as usize),
+        Eterm::from_raw(index as usize),
+    ];
+    words.extend_from_slice(env);
+    let words = words.into_boxed_slice();
+    let term = beam_term::make_boxed(words.as_ptr());
+    (words, term)
+}
+
+/// **The seam's honest misses: the fun kinds it must NOT claim.**
+///
+/// [`ExecutionContext::resolve_local_fun`] enters a fun in-machine only for the two kinds it
+/// can resolve: a `.beam` **local** (`make_fun3`) closure (through
+/// [`RuntimeContext::local_fun_target`]) and an **external** fun (`fun M:F/A`, through
+/// [`RuntimeContext::external_fun_target`]). Everything else answers `Ok(None)`, so the engine
+/// keeps the value-returning [`ExecutionContext::apply_fun`] fallback for it — the seam must
+/// never fabricate an in-machine entry.
+///
+/// Two shapes the resolver must decline, one per fun kind:
+///
+/// * the `-eval` evaluator's own closure — a [`beam_codec::FunKind::Local`] fun stamped with the
+///   evaluator's sentinel `uniq` ([`crate::eval::EVAL_FUN_UNIQ`]). Only the evaluator can run its
+///   body, so `local_fun_target` declines it by that stamp alone (before it searches the loaded
+///   module set) and `external_fun_target` declines it because it is not an external fun;
+/// * an external fun naming a module this runtime cannot load — the cross-module seam's own
+///   refusal, so no export label is invented and the fun stays on the synchronous dynamic-call
+///   route.
+#[test]
+fn resolve_local_fun_declines_the_fun_kinds_it_cannot_claim() {
+    let mut rt = runtime();
+    let mut heap = beam_alloc::Heap::new(32).expect("a scratch heap");
+
+    // 1. The `-eval` evaluator's closure: a local fun stamped with the evaluator's sentinel
+    //    `uniq`, which `local_fun_target` declines up front. No module defines it, so a resolver
+    //    that claimed it would be entering the wrong code (or failing the descriptor lookup).
+    let (_eval_words, eval_closure) = local_fun(0, crate::eval::EVAL_FUN_UNIQ, 0, &[]);
+
+    // 2. An external fun naming a module this runtime does not have: the cross-module resolver
+    //    refuses the (failing) load, so no export label is fabricated.
+    let module = atom_val(rt.intern("no_such_module_zzz"));
+    let function = atom_val(rt.intern("no_such_function"));
+    let unknown = beam_codec::term::make_fun_external(&mut heap, 1, module, function)
+        .expect("the external fun builds");
+
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        ctx.resolve_local_fun(eval_closure, &[])
+            .expect("the seam reports a routing, never an error")
+            .is_none(),
+        "the `-eval` evaluator's own closure has no in-machine entry, so `apply_fun` stays its \
+         fallback"
+    );
+    assert!(
+        ctx.resolve_local_fun(unknown, &[make_small(1)])
+            .expect("the seam reports a routing, never an error")
+            .is_none(),
+        "an external fun whose module cannot be loaded keeps the synchronous dynamic-call route"
+    );
 }
 
 // ---------------------------------------------------------------------------
