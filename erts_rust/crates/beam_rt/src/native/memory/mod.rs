@@ -667,6 +667,14 @@ impl RuntimeContext<'_> {
     /// *does* have (a `func` index out of range) is its own typed error, propagated as-is —
     /// never replaced by a plausible-looking term.
     fn position_value(&mut self, name: &str, pid: ProcessId) -> Result<Option<Eterm>> {
+        // The runtime's **own** process, when a root action drives it (`-eval`/`-s`/`-run`):
+        // the oracle answers those items from that action's own driver frame, which this
+        // crate models in the root execution frame (see [`Self::root_frame_value`]).
+        if let Some(action) = self.runtime.root_action_of(pid) {
+            if let Some(value) = self.root_frame_value(name, action)? {
+                return Ok(Some(value));
+            }
+        }
         let Some(engines) = self.engines() else {
             return Ok(None);
         };
@@ -681,13 +689,8 @@ impl RuntimeContext<'_> {
             // A **fun-bodied** process's `$initial_call` is `erlang:apply/2` — ERTS
             // spawned it by *applying* the fun (oracle: `process_info(P, initial_call)`
             // of `spawn(fun() -> … end)` ⇒ `{initial_call,{erlang,apply,2}}`), so the
-            // entry lambda's own MFA would be a wrong answer. The atoms are interned by
-            // name because no loaded module owns this pair.
-            "initial_call" if applied => {
-                let module = self.atom("erlang")?;
-                let function = self.atom("apply")?;
-                terms::make_tuple(self, &[module, function, make_small(2)]).map(Some)
-            }
+            // entry lambda's own MFA would be a wrong answer.
+            "initial_call" if applied => self.apply_initial_call().map(Some),
             "current_function" => machine.current_function(module, self),
             "initial_call" => machine.initial_call(module, self),
             "current_location" => machine.current_location(module, self),
@@ -695,6 +698,95 @@ impl RuntimeContext<'_> {
             // Unreachable: only the four names above are routed here.
             _ => Ok(None),
         }
+    }
+
+    /// The value of one execution-position item sourced from the runtime's **root execution
+    /// frame** — the `-eval`/`-s`/`-run` root action driving the caller itself
+    /// ([`crate::runtime::executing`]).
+    ///
+    /// The frame carries *how* the runtime's own process was started, and two of the oracle's
+    /// answers follow from that alone (all measured on the system `erl`, OTP 29.1.1 /
+    /// erts-17.1, through `-eval`/`-s`/`-run`):
+    ///
+    /// * `initial_call` is `{erlang,apply,2}` for **every** start-instruction-driven process —
+    ///   the `-eval` root *and* a module function reached from it. ERTS spawned it by
+    ///   *applying* an export, exactly as it does for a fun-bodied `spawn/1` process.
+    /// * `catchlevel` is `1` — the root **driver's own** catch frame: the oracle reports `1`
+    ///   for a `-eval` root and for `-s`/`-run` alike (the frame is erl_eval's / `init`'s,
+    ///   whatever the evaluated expression nests inside it).
+    ///
+    /// `current_function`/`current_location` name the **innermost** frame, so they are only
+    /// sourceable for the `-eval` driver itself ([`crate::runtime::RootAction::Eval`] while no
+    /// module frame has been entered, i.e. [`RuntimeContext::executing_module`] is `None`):
+    /// the oracle then answers `{erl_eval,do_apply,7}` with
+    /// `[{file,"erl_eval.erl"},{line,1044}]` for *any* evaluated expression (verified for
+    /// literals, `case`, comprehensions, `catch`/`try`, a fun literal applied, and a nested
+    /// `receive`). Inside a real module frame the innermost function lives in the machine,
+    /// which the position reader cannot see (see the module docs), so the item falls through
+    /// to the honest typed gap.
+    ///
+    /// `Ok(None)` for every other name — `current_stacktrace` in particular, whose frame list
+    /// is fixed by *which* erl_eval function the driver is suspended inside and is therefore
+    /// not derivable from this runtime's evaluator — so the caller falls through to the engine
+    /// path (and usually to the typed gap).
+    fn root_frame_value(
+        &mut self,
+        name: &str,
+        action: crate::runtime::RootAction,
+    ) -> Result<Option<Eterm>> {
+        // `-eval` with a compiled module frame entered (a module function reached from the
+        // evaluated expression): the innermost position is that function's, which is not
+        // sourceable here — fall through to the gap rather than answer the driver's frame.
+        let evaluator_drives = matches!(action, crate::runtime::RootAction::Eval)
+            && self.executing_module().is_none();
+        match name {
+            "initial_call" => self.apply_initial_call().map(Some),
+            "current_function" if evaluator_drives => {
+                let mfa = self.eval_driver_mfa()?;
+                terms::make_tuple(self, &mfa).map(Some)
+            }
+            "current_location" if evaluator_drives => self.eval_driver_location().map(Some),
+            "catchlevel" => Ok(Some(make_small(1))),
+            _ => Ok(None),
+        }
+    }
+
+    /// `{erlang, apply, 2}` — the `$initial_call` the oracle reports for a process ERTS
+    /// started by **applying** something (a fun-valued `spawn`, or a start instruction)
+    /// rather than by entering an export. The atoms are interned by name because no loaded
+    /// module owns this pair.
+    fn apply_initial_call(&mut self) -> Result<Eterm> {
+        let module = self.atom("erlang")?;
+        let function = self.atom("apply")?;
+        terms::make_tuple(self, &[module, function, make_small(2)])
+    }
+
+    /// `{erl_eval, do_apply, 7}` — the `-eval` evaluator's own **driver frame**, the MFA the
+    /// oracle reports as `current_function` while it evaluates an expression.
+    fn eval_driver_mfa(&mut self) -> Result<[Eterm; 3]> {
+        Ok([
+            self.atom("erl_eval")?,
+            self.atom("do_apply")?,
+            make_small(7),
+        ])
+    }
+
+    /// `{erl_eval, do_apply, 7, [{file, "erl_eval.erl"}, {line, 1044}]}` — the `-eval`
+    /// evaluator's driver frame as `current_location`.
+    ///
+    /// `erl_eval.erl`/line `1044` are the oracle's own constants for that frame (the
+    /// `erl_eval:do_apply/7` clause the driver is suspended in), not a measured position of
+    /// this runtime's evaluator — the file is a plain char list, exactly as a stacktrace item
+    /// renders it.
+    fn eval_driver_location(&mut self) -> Result<Eterm> {
+        let mfa = self.eval_driver_mfa()?;
+        let file_tag = self.atom("file")?;
+        let file = self.charlist("erl_eval.erl")?;
+        let line_tag = self.atom("line")?;
+        let file_pair = terms::make_tuple(self, &[file_tag, file])?;
+        let line_pair = terms::make_tuple(self, &[line_tag, make_small(1044)])?;
+        let location = terms::make_list(self, &[file_pair, line_pair])?;
+        terms::make_tuple(self, &[mfa[0], mfa[1], mfa[2], location])
     }
 
     /// The `catchlevel` item: the process's live exception **catch-frame depth**, as an
@@ -718,6 +810,13 @@ impl RuntimeContext<'_> {
     /// one parked inside a single `try`; the caller itself reports its own live depth (a
     /// `process_info(self(), catchlevel)` evaluated inside one `try` answers `1`).
     fn catchlevel_value(&mut self, pid: ProcessId) -> Result<Option<Eterm>> {
+        // The root execution frame first: the oracle reports the root driver's own catch
+        // frame (`1`) for a `-eval`/`-s`/`-run` process (see [`Self::root_frame_value`]).
+        if let Some(action) = self.runtime.root_action_of(pid) {
+            if let Some(value) = self.root_frame_value("catchlevel", action)? {
+                return Ok(Some(value));
+            }
+        }
         let Some(engines) = self.engines() else {
             return Ok(None);
         };

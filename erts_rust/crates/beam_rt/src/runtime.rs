@@ -85,12 +85,14 @@ use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
 use crate::trace::TraceState;
 
+pub(crate) mod executing;
 mod ets_owner;
 mod gc;
 mod scheduler;
 
 pub use self::gc::GcStatsSnapshot;
 pub(crate) use self::gc::GcState;
+pub(crate) use self::executing::RootAction;
 pub use self::scheduler::RUN_DEADLINE;
 
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
@@ -282,6 +284,20 @@ pub struct Runtime {
     pub(crate) persistent_terms: Rc<RefCell<PersistentTermStore>>,
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
+    /// The **root execution frame**: which root action ([`RootAction::Eval`] for `-eval`,
+    /// [`RootAction::Module`] for `-s`/`-run`) is driving the runtime's own process right now,
+    /// or `None` when no root action is running.
+    ///
+    /// It is the *sourceable* part of the caller's own execution position: the process the
+    /// runtime runs itself has no engine in [`Runtime::runner_state`] to read a position from
+    /// (a root action's machine is a `&mut` local of the crossing call), so
+    /// `erlang:process_info/2`'s position items answer from this record for
+    /// [`Runtime::self_pid`] — see [`crate::runtime::executing`] for the design and the oracle
+    /// evidence, and [`crate::native::memory`] for the values.
+    ///
+    /// Written **only** by the root-action entries ([`Runtime::eval`]/[`Runtime::run_named`])
+    /// and restored on every exit path, so it is never a stale frame.
+    pub(crate) executing: Option<executing::ExecutingFrame>,
     /// The node-global **cumulative reduction count** — the `Total` behind
     /// `erlang:statistics(reductions)`/`(exact_reductions)`.
     ///
@@ -712,6 +728,7 @@ impl Runtime {
             nifs: Rc::new(RefCell::new(NifRegistry::new())),
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
+            executing: None,
             reductions: 0,
             reductions_anchor: Cell::new(0),
             exact_reductions_anchor: Cell::new(0),
@@ -1687,6 +1704,10 @@ impl Runtime {
     /// # Errors
     ///
     /// The code server's not-found diagnostic, plus any error the running code raises.
+    ///
+    /// The export runs under the [`RootAction::Module`] **root execution frame**, so a
+    /// `process_info(self(), …)` inside it answers the items that root action sources (see
+    /// [`crate::runtime::executing`]); the frame is restored on every exit path.
     pub fn run_named(
         &mut self,
         module: &str,
@@ -1700,8 +1721,13 @@ impl Runtime {
         // fatal: `CodeServer::load` below reports it, naming every directory searched.
         let _ = self.find_module_file(module);
         let loaded = self.code_server.load(module)?;
-        let mut context = RuntimeContext::new(self);
-        context.run_export(&loaded, function, arity, args)
+        let previous = self.enter_root_action(RootAction::Module);
+        let result = {
+            let mut context = RuntimeContext::new(self);
+            context.run_export(&loaded, function, arity, args)
+        };
+        self.leave_root_action(previous);
+        result
     }
 
     // --- spawning and scheduling (the process runner's public API) ------------
@@ -2359,9 +2385,18 @@ impl Runtime {
     /// a capability gap), whatever a called BIF/module raised, a raise of the evaluated
     /// expression itself (including the uncatchable `erlang:halt/0,1`), or a documented
     /// Milestone-1 gap.
+    ///
+    /// The whole evaluation runs under the [`RootAction::Eval`] **root execution frame**, so a
+    /// `process_info(self(), …)` inside the expression answers the evaluator driver's own
+    /// position (see [`crate::runtime::executing`]); the frame is restored on every exit path.
     pub fn eval(&mut self, expr: &str) -> Result<Eterm> {
-        let mut ctx = RuntimeContext::new(&mut *self);
-        crate::eval::eval(&mut ctx, expr)
+        let previous = self.enter_root_action(RootAction::Eval);
+        let result = {
+            let mut ctx = RuntimeContext::new(&mut *self);
+            crate::eval::eval(&mut ctx, expr)
+        };
+        self.leave_root_action(previous);
+        result
     }
 
     /// Prints `term` through the registered `io:format/2` `~p` printer.
