@@ -21,11 +21,14 @@
 //! Fun application and the callee-admission predicates.
 //!
 //! [`LocalFunTarget`] is the launch target of a `.beam` **local** (`make_fun3`) closure, and
-//! [`RuntimeContext::local_fun_target`] resolves one; [`RuntimeContext::apply_non_local_fun`]
-//! applies the two fun kinds that have no local label. The predicates
-//! ([`callee_observes_its_call_site`] and its helpers) decide whether the engine's
-//! cross-module call seam may enter a callee **in-machine** or must keep it on the
-//! synchronous call route.
+//! [`RuntimeContext::local_fun_target`] resolves one; [`RuntimeContext::external_fun_target`]
+//! resolves the **external** (`EXPORT_EXT`, `fun M:F/A`) kind of fun to the callee module's
+//! export label, so the engine's `call_fun` seam can enter *either* kind in-machine.
+//! [`RuntimeContext::apply_non_local_fun`] is the value-returning fallback for the fun kinds
+//! that have no in-machine entry. The predicates ([`callee_observes_its_call_site`] and its
+//! helpers) decide whether the engine's cross-module call seam may enter a callee **in-machine**
+//! or must keep it on the synchronous call route — and the external-fun resolver delegates to
+//! that seam so both routes share one verdict.
 
 use std::sync::Arc;
 
@@ -72,8 +75,10 @@ impl RuntimeContext<'_> {
     /// `Ok(None)` covers the two fun kinds that are *not* a compiled local closure:
     ///
     /// * an **external** fun (`fun M:F/A`, the `EXPORT_EXT` encoding) — not a closure at
-    ///   all, it carries no `uniq`/`index` descriptor and is applied as an ordinary dynamic
-    ///   call through [`RuntimeContext::call_bif`];
+    ///   all, it carries no `uniq`/`index` descriptor; it is resolved by
+    ///   [`RuntimeContext::external_fun_target`] when the engine's `call_fun` seam wants an
+    ///   in-machine entry, and otherwise applied as an ordinary dynamic call through
+    ///   [`RuntimeContext::call_bif`];
     /// * the `-eval` evaluator's own closure (`uniq ==` [`crate::eval::EVAL_FUN_UNIQ`]),
     ///   whose body only the evaluator can run
     ///   ([`crate::eval::apply_eval_closure`]).
@@ -161,21 +166,77 @@ impl RuntimeContext<'_> {
             beam_codec::term::fun_kind_term(fun)?,
             beam_codec::FunKind::External
         ) {
-            let (module, function, arity) = {
-                let module_atom = beam_codec::term::fun_module(fun)?;
-                let function_atom = beam_codec::term::fun_function(fun)?;
-                let arity = beam_codec::term::fun_arity_term(fun)? as u32;
-                // Resolve the atoms to names while the shared table is borrowed, then
-                // release the borrow: `call_bif` needs `&mut self`.
-                let atoms = self.runtime.code_server.atoms();
-                let module = atoms.name(module_atom).ok_or(BeamError::BadArg)?;
-                let function = atoms.name(function_atom).ok_or(BeamError::BadArg)?;
-                (module.to_string(), function.to_string(), arity)
-            };
+            let (module, function, arity) = self.external_fun_name(fun)?;
             return self.call_bif(&module, &function, arity, args);
         }
         let index = terms::fun_index(fun)? as usize;
         crate::eval::apply_eval_closure(self, fun, index, args)
+    }
+
+    /// The `(module, function, arity)` identity of an **external** fun (`fun M:F/A`, the
+    /// `EXPORT_EXT` encoding), as names.
+    ///
+    /// The three atoms are resolved to names **while the shared atom table is borrowed**, and the
+    /// borrow ends before the names are returned so the caller can take `&mut self` again —
+    /// [`RuntimeContext::call_bif`] and [`ExecutionContext::resolve_external_call`] both need it.
+    /// An atom the shared table does not know is [`BeamError::BadArg`].
+    ///
+    /// # Errors
+    ///
+    /// A non-external fun is [`BeamError::BadArg`] (the `beam_codec` accessors re-check the kind).
+    fn external_fun_name(&self, fun: Eterm) -> Result<(String, String, u32)> {
+        let module_atom = beam_codec::term::fun_module(fun)?;
+        let function_atom = beam_codec::term::fun_function(fun)?;
+        let arity = beam_codec::term::fun_arity_term(fun)? as u32;
+        let atoms = self.runtime.code_server.atoms();
+        let module = atoms.name(module_atom).ok_or(BeamError::BadArg)?;
+        let function = atoms.name(function_atom).ok_or(BeamError::BadArg)?;
+        Ok((module.to_string(), function.to_string(), arity))
+    }
+
+    /// Resolves an **external** fun (`fun M:F/A`, the `EXPORT_EXT` encoding) to the callee
+    /// module's export label, so the engine's `call_fun` seam can enter it **in this machine**
+    /// instead of taking the value-returning [`RuntimeContext::apply_fun`] fallback.
+    ///
+    /// An external fun is not a closure: it carries no `uniq`/`index` descriptor and no free
+    /// variables, and its whole identity is the `M:F/A` triple. Its callee is therefore exactly
+    /// the callee the engine's cross-module call seam resolves for a `call_ext*`, so it resolves
+    /// through the **same** [`ExecutionContext::resolve_external_call`] and inherits every one of
+    /// its refusals: a floor-served namespace key, a module with a loaded NIF library, a
+    /// registered `beam_bifs` key, a callee whose own code observes its call site
+    /// ([`callee_observes_its_call_site`]), and a name the module does not export all answer
+    /// `Ok(None)` — which keeps the call byte-for-byte on the ordinary
+    /// [`RuntimeContext::apply_non_local_fun`] route, exactly as a host without this seam.
+    ///
+    /// `Ok(None)` also covers the `-eval` evaluator's own closure — a
+    /// [`beam_codec::FunKind::Local`] fun, which [`RuntimeContext::local_fun_target`] already
+    /// declined, so it is never this helper's business — and an apply whose argument count
+    /// disagrees with the fun's arity, which must not enter the export entry with a mismatched
+    /// frame.
+    ///
+    /// # Errors
+    ///
+    /// A non-fun is [`BeamError::BadArg`] (the answer [`RuntimeContext::local_fun_target`] would
+    /// have given), plus whatever the resolver reports.
+    pub(crate) fn external_fun_target(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        if !matches!(
+            beam_codec::term::fun_kind_term(fun)?,
+            beam_codec::FunKind::External
+        ) {
+            return Ok(None);
+        }
+        let (module, function, arity) = self.external_fun_name(fun)?;
+        if args.len() as u32 != arity {
+            return Ok(None);
+        }
+        self.resolve_external_call(&module, &function, arity)
     }
 }
 
