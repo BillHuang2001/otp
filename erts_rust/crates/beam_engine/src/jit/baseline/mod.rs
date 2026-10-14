@@ -73,12 +73,15 @@
 //! lives in the 24-byte stack slot the prologue reserves (the byte count that keeps
 //! `rsp` 16-byte aligned after the six callee-saved pushes). The prologue pushes
 //! every callee-saved register it touches (so the Rust caller's state is preserved),
-//! loads the cached x-registers out of `machine.x`, and the epilogue **spills them
-//! back at every block exit**. That is the whole liveness model: within a block the
-//! cached values live in registers, and at a block boundary they are always back in
-//! `machine.x`, so a helper call / GC / the next block sees the interpreter's exact
+//! loads the cached x-registers out of `machine.x`, and the epilogue **spills the
+//! block's written set back at every block exit** (a cached register the block never
+//! wrote already holds its `machine.x` value, so storing it would be a no-op). That is
+//! the block-granular liveness model: within a block the cached values live in
+//! registers, and at a block boundary `machine.x` is authoritative for every cached
+//! register, so a helper call / GC / the next block sees the interpreter's exact
 //! root set (`x[0..live)` + the whole stack) with no per-frame liveness maps
-//! (`../../CONTEXT.md` §4).
+//! (`../../CONTEXT.md` §4). The post-helper `fill` is partial too — only the cached
+//! registers the continuation can still observe (`emit/liveness.rs`).
 //!
 //! The cache is **not** a coverage limit. An x-register the allocator could not
 //! cache is simply addressed **directly in `machine.x`** (`[rbx + x*8]`) — the same
