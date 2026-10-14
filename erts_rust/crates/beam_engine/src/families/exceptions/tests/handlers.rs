@@ -264,8 +264,15 @@ fn catch_end_error_class_builds_an_exit_tuple() {
     )
     .unwrap();
     assert_eq!(step, Some(Step::Next));
+    // Class `error`: C's `add_stacktrace` fold — `{'EXIT',{Reason,Stacktrace}}`
+    // (`emu/instrs.tab:1191-1198`). This synthetic machine never ran an instruction,
+    // so its raise snapshot (`Machine::raise_snapshot`, rebuilt by the `throw` above)
+    // is empty, the landed raw trace is `NIL`, and the cooked stacktrace is the empty
+    // list — C's own `build_stacktrace(c_p, NIL)` answer for a NIL raw trace. A
+    // snapshot-cooked trace's frame list is pinned by the fixture tests.
     let exit_atom = make_atom(module.atom_table.lookup("EXIT").unwrap());
-    let expected = terms::make_tuple(&mut ctx, &[exit_atom, reason]).unwrap();
+    let pair = terms::make_tuple(&mut ctx, &[reason, NIL]).unwrap();
+    let expected = terms::make_tuple(&mut ctx, &[exit_atom, pair]).unwrap();
     let actual = machine.x(0).unwrap();
     assert!(cmp(actual, expected, &module.atom_table).is_eq());
 }
