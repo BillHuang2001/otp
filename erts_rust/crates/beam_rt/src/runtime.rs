@@ -47,7 +47,7 @@
 //! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -396,6 +396,21 @@ pub struct Runtime {
     /// bumped when its table slot is reused ([`ProcessTable::take`]), so the stale key names
     /// no process that can ever be observed again.
     pub(crate) group_leaders: HashMap<ProcessId, ProcessId>,
+    /// The pids with `process_flag(async_dist, true)` set — the C's per-process
+    /// `F_ASYNC_DIST` PCB bit (`bif.c:2032-2043`).
+    ///
+    /// `beam_process::ProcessFlags` carries no such bit, so — like
+    /// [`Runtime::group_leaders`] — the runtime keeps the flag in its own per-pid store. It is
+    /// the **one** source of truth every reader shares:
+    /// the `beam_bifs` `process_flag/2` bridge ([`crate::context::process_bridge`]) and
+    /// `erlang:process_info/2`'s `async_dist` item ([`crate::native::memory`]), so they can
+    /// never disagree about the same process. Set membership is the value; a pid absent from it
+    /// has the oracle's fresh-process default `false`.
+    ///
+    /// As with [`Runtime::group_leaders`], a terminated process leaves its entry behind,
+    /// which is harmless: a pid's serial is bumped when its table slot is reused, so the stale
+    /// key names no process that can ever be observed again.
+    pub(crate) async_dist: HashSet<ProcessId>,
     /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
     ///
     /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
@@ -777,6 +792,7 @@ impl Runtime {
             refs: RefAllocator::new(),
             references: HashMap::new(),
             group_leaders: HashMap::new(),
+            async_dist: HashSet::new(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
             timer_resumes: HashMap::new(),
@@ -1439,6 +1455,31 @@ impl Runtime {
     /// `erlang:group_leader(<dead pid>, self())` ⇒ `true`).
     pub(crate) fn set_group_leader(&mut self, pid: ProcessId, leader: ProcessId) {
         self.group_leaders.insert(pid, leader);
+    }
+
+    /// Whether `pid` has `process_flag(async_dist, true)` set — the C's `F_ASYNC_DIST` bit
+    /// (`bif.c:2033`).
+    ///
+    /// A pid with no entry has the fresh-process default `false`, exactly the oracle's answer
+    /// for a process that never set the flag. This is the **one** source of truth every reader
+    /// shares (the `process_flag/2` bridge and the `process_info/2` `async_dist` item — see
+    /// [`Runtime::async_dist`]).
+    pub(crate) fn is_async_dist(&self, pid: ProcessId) -> bool {
+        self.async_dist.contains(&pid)
+    }
+
+    /// Sets `pid`'s `async_dist` flag (`erlang:process_flag(async_dist, Bool)`).
+    ///
+    /// The flag has no observable effect in this single-threaded runtime (its only purpose is
+    /// C's asynchronous distribution-message delivery), but the flag's **value** is real
+    /// per-process state: `process_flag/2` reports the previous value and `process_info/2`
+    /// reports the current one, both from the same store (see [`Runtime::async_dist`]).
+    pub(crate) fn set_async_dist(&mut self, pid: ProcessId, value: bool) {
+        if value {
+            self.async_dist.insert(pid);
+        } else {
+            self.async_dist.remove(&pid);
+        }
     }
 
     /// Gives a freshly spawned `child` the group leader its `parent` has

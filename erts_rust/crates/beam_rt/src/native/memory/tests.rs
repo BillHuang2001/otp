@@ -318,6 +318,31 @@ fn the_reachable_items_have_their_oracle_shapes() {
     );
 }
 
+/// The `async_dist` item is the process's **live** `process_flag(async_dist, …)` value — the
+/// C's `F_ASYNC_DIST` PCB bit (`erl_bif_info.c:986,2981`) — read out of the runtime's own
+/// per-pid store ([`crate::Runtime`]'s `async_dist`), the very store the `process_flag/2`
+/// bridge writes, so the read and the write can never disagree. A fresh process reports the
+/// oracle's default `false` (probed: `element(2, process_info(P, async_dist))` ⇒ `false` on
+/// OTP 29.1.1 / erts-17.1).
+#[test]
+fn the_async_dist_item_tracks_process_flag() {
+    let mut runtime = runtime();
+    let pid = root_pid(&mut runtime);
+    let internal = ProcessId::from_eterm(pid).expect("an internal pid");
+
+    let (key, value) = pair(info(&mut runtime, pid, "async_dist").expect("async_dist item"));
+    assert_eq!(runtime.atom_name_of(key), Some("async_dist"));
+    assert_eq!(runtime.atom_name_of(value), Some("false"), "a fresh process is false");
+
+    runtime.set_async_dist(internal, true);
+    let (_, value) = pair(info(&mut runtime, pid, "async_dist").expect("async_dist item"));
+    assert_eq!(runtime.atom_name_of(value), Some("true"), "the flag round-trips");
+
+    runtime.set_async_dist(internal, false);
+    let (_, value) = pair(info(&mut runtime, pid, "async_dist").expect("async_dist item"));
+    assert_eq!(runtime.atom_name_of(value), Some("false"), "clearing round-trips");
+}
+
 /// The `trace` item is the process's **live** ERTS tracee-flag **bitmask** — an integer, not
 /// the `trace_info(Pid, flags)` atom list — and it tracks `erlang:trace/3` for real.
 ///
@@ -489,7 +514,6 @@ fn every_unsupported_item_raises_the_typed_capability_gap() {
         "magic_ref",
         "parent",
         "label",
-        "async_dist",
         "priority_messages",
         "garbage_collection_info",
     ] {
@@ -1000,7 +1024,6 @@ fn every_remaining_gap_names_its_missing_accessor() {
         ("magic_ref", "magic ref"),
         ("parent", "parent field"),
         ("label", "label field"),
-        ("async_dist", "async_dist flag"),
         ("priority_messages", "priority_messages flag"),
         ("garbage_collection_info", "per-generation"),
     ] {

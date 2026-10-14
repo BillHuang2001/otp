@@ -284,6 +284,20 @@ impl ProcessHook for ProcessBridge<'_> {
                 process.set_sensitive(new);
                 Ok(Some(bool_term(atoms, previous)?))
             }
+            // `async_dist` is the one flag with **no PCB field**: `beam_process::ProcessFlags`
+            // carries no such bit, so the runtime keeps it in its own per-pid store
+            // ([`Runtime::async_dist`]) — the same pattern as `group_leaders`. The `process`
+            // borrow is unused in this arm, so the runtime can be read and written here; the
+            // store is the one source of truth the `process_info/2` item also reads, so the two
+            // can never disagree (the C: `bif.c:2032-2043`).
+            "async_dist" => {
+                let Some(new) = bool_value(atoms, value) else {
+                    return Ok(None);
+                };
+                let previous = self.runtime.is_async_dist(pid);
+                self.runtime.set_async_dist(pid, new);
+                Ok(Some(bool_term(atoms, previous)?))
+            }
             "priority" => {
                 let Some(priority) = atom_name(atoms, value)
                     .and_then(|name| Priority::from_name(&name))
@@ -511,6 +525,7 @@ mod tests {
         let mut rt = runtime();
         let trap = atom(&mut rt, "trap_exit");
         let sensitive = atom(&mut rt, "sensitive");
+        let async_dist = atom(&mut rt, "async_dist");
         let priority = atom(&mut rt, "priority");
         let save_calls = atom(&mut rt, "save_calls");
         let unknown = atom(&mut rt, "zz_bridge_frobnicate");
@@ -548,6 +563,23 @@ mod tests {
                 bridge.process_flag(&mut heap, &atoms, sensitive, make_atom(v_true))
             ),
             "false"
+        );
+        // `async_dist`: the default is `false`, and the flag round-trips through the runtime's
+        // own per-pid store (the one place it lives — `beam_process::ProcessFlags` has no such
+        // bit), so the second set really reports the `true` it replaced.
+        assert_eq!(
+            previous(
+                &atoms,
+                bridge.process_flag(&mut heap, &atoms, async_dist, make_atom(v_true))
+            ),
+            "false"
+        );
+        assert_eq!(
+            previous(
+                &atoms,
+                bridge.process_flag(&mut heap, &atoms, async_dist, make_atom(v_false))
+            ),
+            "true"
         );
         // `priority`: the default is the atom `normal`.
         assert_eq!(
@@ -592,6 +624,11 @@ mod tests {
         // ... and a non-priority atom for `priority`.
         assert!(bridge
             .process_flag(&mut heap, &atoms, priority, make_atom(frobnicate))
+            .unwrap()
+            .is_none());
+        // ... and a non-boolean value for `async_dist`.
+        assert!(bridge
+            .process_flag(&mut heap, &atoms, async_dist, make_atom(not_a_bool))
             .unwrap()
             .is_none());
     }

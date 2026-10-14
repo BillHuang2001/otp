@@ -40,7 +40,7 @@ use beam_common::Result;
 use beam_engine::context::RootSet;
 use beam_engine::ExecutionContext;
 use beam_loader::{Label, Module};
-use beam_term::Eterm;
+use beam_term::{Atom, Eterm};
 
 use super::apply::{callee_observes_its_call_site, LocalFunTarget};
 use super::gc;
@@ -75,6 +75,30 @@ impl ExecutionContext for RuntimeContext<'_> {
         Ok(crate::native::prim_tty::serves_local_call(
             module, function, arity,
         ))
+    }
+
+    /// Resolve an interned atom id to its name from the runtime's **live** shared namespace,
+    /// falling back to the running module's own load-time snapshot
+    /// ([`ExecutionContext::atom_name`]).
+    ///
+    /// [`Module::atom_name`](beam_loader::Module::atom_name) indexes only the module's *owned
+    /// load-time prefix clone* of the shared atom table, so a module loaded early cannot name an
+    /// atom interned later — its global id lies beyond that snapshot. The engine resolves a
+    /// **runtime atom value** (a variable `M`/`F` in `apply(M,F,A)` / `M:F(...)`) through this
+    /// seam, and on the A.9 boot path `gen_server:init_it/6` evaluates `{ok, Mod:init(Args)}`
+    /// with `Mod` = the runtime atom `supervisor_bridge`, whose id exceeds `gen_server`'s
+    /// snapshot — the default body would answer `None` and the call would raise `badarg`.
+    ///
+    /// This host owns the runtime-wide [`AtomTable`](beam_term::AtomTable), so the **live**
+    /// lookup answers first ([`Runtime::atoms`](crate::Runtime::atoms)); the module snapshot is
+    /// kept as the fallback so a term whose atom this runtime did not intern still resolves
+    /// exactly as the default body would.
+    fn atom_name(&self, module: &Module, atom: Atom) -> Option<String> {
+        self.runtime
+            .atoms()
+            .name(atom)
+            .or_else(|| module.atom_name(atom))
+            .map(str::to_owned)
     }
 
     /// The host's own call into a callee, under the arm's frame discipline.
@@ -333,9 +357,9 @@ impl ExecutionContext for RuntimeContext<'_> {
         // name to validate. Keeping the refusal would buy no correctness at all and would only
         // route the library's **Erlang wrappers** onto the synchronous non-pumping
         // [`Self::call_bif`] path, where a blocking `receive` folds into the typed `blocked()`
-        // gap (exit 3) — the A.9 boot blocker: `supervisor_bridge:standard_error/1` raises
-        // `badarg` and dies because `prim_tty:init/1` waits for the reader process it just
-        // spawned. Contract A.7's `prim_*` family is served from the floor
+        // gap (exit 3) — `prim_tty:init/1` waits for the reader process it just spawned, so the
+        // library's Erlang wrappers are entered in-machine rather than through that route.
+        // Contract A.7's `prim_*` family is served from the floor
         // ([`crate::native::prim_tty`]), which is what makes the library built-in in the first
         // place; [`crate::native::prim_tty::is_builtin_library`] is that ONE source of truth.
         //
