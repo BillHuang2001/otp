@@ -164,6 +164,12 @@ fn allocate_registers_with_labels(
         .filter(|(_, instr)| uses_y(module, instr))
         .map(|(offset, _)| (start + offset) as u32)
         .max();
+
+    // The **fill sets**: for every instruction of the block, the cached x-registers a
+    // helper call at that pc must reload out of `machine.x` (the block-local liveness of
+    // the continuation, unioned with the write set above). See `super::liveness`.
+    allocation.block_start = start as u32;
+    allocation.fill_sets = super::liveness::fill_sets(module, labels, code, start, end, &allocation);
     allocation
 }
 
@@ -182,7 +188,7 @@ fn allocate_registers_with_labels(
 /// `select_tuple_arity` only when [`select_tuple_arity_plan`] claims it (its source
 /// tuple counts). Every other
 /// instruction contributes nothing because it stays on the helper.
-fn cacheable_touches(
+pub(super) fn cacheable_touches(
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -323,7 +329,15 @@ fn cacheable_touches(
 /// never a missing one. A register the block writes but this set omitted would let a
 /// stale cache register survive an exit — the one failure mode the derivation may not
 /// have, which is why it mirrors the lowering shapes rather than the operands alone.
-fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr) -> Vec<u32> {
+///
+/// Besides the spill set, the write set is a **kill** in the block's register liveness
+/// (`super::liveness::fill_sets`): an instruction that writes a register makes everything
+/// before it stop needing that register's cached value. That is sound because a cached
+/// register is written through its **machine register** whenever the shape writes it
+/// (`super::r#move`'s destination arms), never through `machine.x` — a shape that writes a
+/// register it does not cache addresses `machine.x`, and a non-cached register is never in
+/// a fill set.
+pub(super) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr) -> Vec<u32> {
     match instr {
         Instr::Move { src, dst } => move_shape(src, dst)
             .map(|shape| shape.writes())

@@ -491,6 +491,7 @@ mod tests {
             slots: vec![(0u32, Reg::R12)],
             written: vec![0],
             y_last: None,
+            ..Default::default()
         };
         let store = encoded(|buffer| buffer.mov_mr(Reg::Rbx, 0, Reg::R12).unwrap());
         let spill = spill_bytes(&allocation);
@@ -563,6 +564,7 @@ mod tests {
             slots: vec![(0u32, Reg::R12)],
             written: vec![0],
             y_last: None,
+            ..Default::default()
         };
 
         linker

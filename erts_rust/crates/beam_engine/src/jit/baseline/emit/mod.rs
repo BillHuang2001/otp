@@ -91,7 +91,8 @@
 //! [`emit_block`] and the deopt-and-continue sequence); [`compile`] the compilation
 //! entry points ([`compile_module`]/[`compile_function`] via
 //! [`emit_function`](compile::emit_function)) and the continuation sub-blocks;
-//! [`regalloc`] the register allocator, [`operands`] the operand/constant readers,
+//! [`regalloc`] the register allocator, [`liveness`] the block-local fill-set
+//! computation, [`operands`] the operand/constant readers,
 //! [`r#move`] the inline `move`/`swap`, [`test`] the word-level `test` subset,
 //! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path,
 //! [`link`] the direct block-to-block linker and [`aggregate`] the guarded cons-cell
@@ -120,6 +121,7 @@ mod compare;
 mod compile;
 mod frame;
 mod link;
+mod liveness;
 mod r#move;
 mod operands;
 mod regalloc;
@@ -841,8 +843,10 @@ fn emit_helper_call(
 ///
 /// * `Step::Next` → `encode_target(func, pc + 1)` — the helper executed exactly the
 ///   instruction at `pc` and the block can carry on at `pc + 1`, so the emitted code
-///   refills the cached x-registers (mandatory: the helper *is* the interpreter and
-///   wrote `machine.x`) and **falls through** to the next instruction's lowering;
+///   refills the cached x-registers the continuation can still observe (mandatory: the
+///   helper *is* the interpreter and wrote `machine.x`; see [`emit_continue_check`] for
+///   why the refill is partial) and **falls through** to the next instruction's
+///   lowering;
 /// * any other word (`Goto`/`HALT`/`ERROR`/`ENTER`, and the `Wait` → `blocked`
 ///   error) → jump to the block epilogue with that word in `rax`, exactly as before.
 ///
@@ -947,8 +951,14 @@ fn emit_receive(
 /// with that word in `rax` for the driver to decode.
 ///
 /// The refill is what makes the continuation legal: every helper that can produce
-/// `Next` is the interpreter and wrote `machine.x`, so the block's cached x-registers
-/// are stale.
+/// `Next` is the interpreter and wrote `machine.x`, so a cached register whose
+/// `machine.x` slot it wrote is stale. It is a **partial** refill
+/// ([`regs::fill`]): only the cached registers [`Allocation::fill_slots`] lists — the
+/// continuation's block-local liveness unioned with the block's write set, see
+/// [`liveness`] — are reloaded. A cached register left out keeps a stale word on
+/// purpose, which is safe because it is never read (a later read through its machine
+/// register makes it live here) and never stored (every store writes exactly the block's
+/// write set, which the fill set always contains).
 fn emit_continue_check(
     buffer: &mut CodeBuffer,
     done: CodeLabel,
@@ -960,7 +970,7 @@ fn emit_continue_check(
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)?;
-    fill(buffer, allocation, FillSite::Helper)?;
+    fill(buffer, allocation, FillSite::Helper, pc)?;
     // Continuing in-block past the helper: the instruction it ran may have pushed or
     // popped a frame (moving the Y window) or reallocated `machine.stack` (freeing the
     // published one), so re-publish the window before the next instruction when a later
