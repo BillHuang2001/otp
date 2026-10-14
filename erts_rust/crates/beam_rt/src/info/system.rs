@@ -141,7 +141,20 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "async_dist" => Some(Ok(InfoValue::Bool(false))),
         "os_type" => Some(Ok(os_type())),
         "os_version" => Some(os_version()),
-        "break_ignored" => Some(Ok(InfoValue::Bool(false))),
+        // `+Bi` (or `+B i`) is the only spelling that sets the C's `ignore_break`
+        // (`erl_init.c:1823-1844`); `+Bc`/`+Bd`/a bare `+B` leave it clear. It is a
+        // **union** over occurrences (the C only ever assigns `1`), so any `i` on the
+        // command line makes the switch true.
+        //
+        // Verified against the oracle (OTP 29.1.1 / erts-17.1), measured with
+        // `erl <flags> -noshell -eval 'io:format("~p~n",[erlang:system_info(break_ignored)]),halt().'`:
+        //   `+Bi` → true    `+Bc +Bi` → true    `+Bi +Bc` → true    `+B +Bi` → true
+        //   (no `+B` / `+Bc` / `+Bd`) → false.
+        "break_ignored" => Some(Ok(InfoValue::Bool(
+            rt.config()
+                .preserved_emulator_flags("+B")
+                .any(|value| value == "i"),
+        ))),
         "debug_compiled" => Some(Ok(InfoValue::Bool(cfg!(debug_assertions)))),
         "dynamic_trace" => Some(Ok(InfoValue::Atom("none"))),
         "dynamic_trace_probes" => Some(Ok(InfoValue::Bool(false))),
