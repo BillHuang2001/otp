@@ -1405,10 +1405,12 @@ fn the_conversion_goldens_match_the_live_oracle() {
 // forms (and by the OTP-30 `*_to_binary/1` forms). That is a capability gap, not
 // an argument error: the oracle *does* render the identifier, but its channel
 // number is the node-name atom's index in the *running* VM's atom table — runtime
-// state the frozen external-identifier term does not carry. The full evidence and
-// the seam a faithful rendering would need are in `src/term_conv.rs`'s
-// `external_channel_gap`; the sibling `tests/print_port.rs` reaches the same
-// conclusion for `~p`/`~w`.
+// state the frozen external-identifier term does not carry. The refusal is
+// therefore the typed `error:unsupported_bif`, never `badarg` (the argument is
+// valid); a *wrong argument type* — a term that is not a pid/port/ref at all —
+// stays the plain `badarg`. The full evidence and the seam a faithful rendering
+// would need are in `src/term_conv.rs`'s `external_channel_gap`; the sibling
+// `tests/print_port.rs` reaches the same conclusion for `~p`/`~w`.
 // ---------------------------------------------------------------------------
 
 /// The atom table the external-identifier tests build from: the printable/binary
@@ -1422,6 +1424,47 @@ fn node_atoms() -> AtomTable {
 /// The atom term naming the node `name`.
 fn node_term(atoms: &AtomTable, name: &str) -> Eterm {
     make_atom(atoms.lookup(name).expect("the node name is seeded"))
+}
+
+/// The error class for the external-identifier **capability gap**: the typed
+/// `unsupported_bif`, never a plain argument error (`badarg`) — the argument is a
+/// valid external identifier, only its channel number is unrecoverable. The same
+/// matcher `tests/print_port.rs` uses for the identical printer gap.
+fn is_unsupported_bif(result: &Result<Eterm, BeamError>) -> bool {
+    matches!(result, Err(BeamError::Raise(r)) if r.reason.as_atom() == Some("unsupported_bif"))
+}
+
+/// A **wrong argument type** is still the plain argument error, not the capability
+/// gap: `pid_to_list/1`, `ref_to_list/1` and `port_to_list/1` of `5` are `badarg`
+/// in the oracle, and a client that passes a non-identifier is making a genuine
+/// argument error that must not be laundered into the typed gap. Pinned to the
+/// oracle: `erlang:pid_to_list(5)`, `erlang:ref_to_list(5)` and
+/// `erlang:port_to_list(5)` all raise `error:badarg`.
+///
+/// The node-atom table is the same one the external cases use: a wrong-type check
+/// that leaked into the external branch must not be able to hide here.
+#[test]
+fn a_wrong_argument_type_is_still_badarg_not_the_capability_gap() {
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = node_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+
+    let five = small(&mut ctx, 5);
+    for name in [
+        "pid_to_list",
+        "pid_to_binary",
+        "ref_to_list",
+        "ref_to_binary",
+        "port_to_list",
+        "port_to_binary",
+    ] {
+        let result = call(&reg, &mut ctx, "erlang", name, 1, &[five]);
+        assert!(
+            matches!(result, Err(BeamError::BadArg)),
+            "erlang:{name}/1 of a non-identifier must stay badarg, got {result:?}"
+        );
+    }
 }
 
 #[test]
@@ -1439,7 +1482,7 @@ fn an_external_pid_is_refused_and_the_internal_form_is_unchanged() {
     // 0,0,0,0>>)` => `<0.1.7>`, `erlang:pid_to_list(…)` => `"<0.1.7>"`.
     //
     // This runtime has no node-identity/channel seam, so both branches stay the
-    // documented refusal rather than a fabricated channel.
+    // typed capability gap (`unsupported_bif`) rather than a fabricated channel.
     let reg = default_registry();
     let mut heap = heap();
     let atoms = node_atoms();
@@ -1456,12 +1499,10 @@ fn an_external_pid_is_refused_and_the_internal_form_is_unchanged() {
             7
         );
         for name in ["pid_to_list", "pid_to_binary"] {
+            let result = call(&reg, &mut ctx, "erlang", name, 1, &[pid]);
             assert!(
-                matches!(
-                    call(&reg, &mut ctx, "erlang", name, 1, &[pid]),
-                    Err(BeamError::BadArg)
-                ),
-                "erlang:{name}/1 of an external pid must stay the documented refusal"
+                is_unsupported_bif(&result),
+                "erlang:{name}/1 of an external pid must be the typed capability gap, got {result:?}"
             );
         }
     }
@@ -1499,12 +1540,10 @@ fn an_external_port_is_refused_and_the_internal_form_is_unchanged() {
             7
         );
         for name in ["port_to_list", "port_to_binary"] {
+            let result = call(&reg, &mut ctx, "erlang", name, 1, &[port]);
             assert!(
-                matches!(
-                    call(&reg, &mut ctx, "erlang", name, 1, &[port]),
-                    Err(BeamError::BadArg)
-                ),
-                "erlang:{name}/1 of an external port must stay the documented refusal"
+                is_unsupported_bif(&result),
+                "erlang:{name}/1 of an external port must be the typed capability gap, got {result:?}"
             );
         }
     }
@@ -1540,12 +1579,10 @@ fn an_external_ref_is_refused_and_the_internal_form_is_unchanged() {
             &ids[..]
         );
         for name in ["ref_to_list", "ref_to_binary"] {
+            let result = call(&reg, &mut ctx, "erlang", name, 1, &[reference]);
             assert!(
-                matches!(
-                    call(&reg, &mut ctx, "erlang", name, 1, &[reference]),
-                    Err(BeamError::BadArg)
-                ),
-                "erlang:{name}/1 of an external reference must stay the documented refusal"
+                is_unsupported_bif(&result),
+                "erlang:{name}/1 of an external reference must be the typed capability gap, got {result:?}"
             );
         }
     }
