@@ -747,24 +747,37 @@ impl<'a> RuntimeContext<'a> {
         // for byte (the result stays on the pooled heap, which is then not rewound).
         let table = mailbox_table.as_deref_mut()?;
         let process = table.get_mut(pid)?;
-        let copied = {
-            let src = beam_message::OffHeapTable::new();
-            let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
-            beam_message::copy_struct(term, process.heap_mut(), &mut ctx)
-        };
-        if let Ok(copied) = copied {
-            return Some(copied);
-        }
-        // The nursery could not serve the copy: GROW (retiring the old space, moving nothing) and
-        // retry once. `size_object` is the graph's flat word count and the floor of 256 keeps a
-        // small result from landing exactly on the current space's edge.
-        let hint = beam_term::size::size_object(term).max(256);
-        process.grow_nursery(hint).ok()?;
-        // A fresh `CopyContext` over the (now current) grown space, whose bump pointer is at its
-        // base. Nothing the first attempt wrote needs unwinding: a non-clean destination takes
-        // `copy_struct`'s preflight path, which refuses **before** writing any destination word.
+        // **One** source table and **one** `CopyContext`, shared by the (at most two) attempts
+        // below. Neither construction allocates, and a refused attempt leaves both the
+        // destination heap and the off-heap table exactly as they were — the copier's optimistic
+        // single-pass attempt rolls its own off-heap pushes back before the preflight path
+        // re-derives the outcome, and the preflight path refuses *before* writing a destination
+        // word — so a retry needs no fresh pair.
         let src = beam_message::OffHeapTable::new();
         let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
+        let needed = match beam_message::copy_struct(term, process.heap_mut(), &mut ctx) {
+            Ok(copied) => return Some(copied),
+            Err(error) if !beam_message::is_message_heap_exhaustion(&error) => {
+                // A refusal that is **not** the destination running out of room — above all the
+                // copier's malformed-graph `badarg` — is permanent: growing the destination
+                // cannot fix it, so a retry would re-walk the whole graph, grow a whole space for
+                // nothing and fail again with the very same reason. Leave both the result and the
+                // pool exactly as they were.
+                return None;
+            }
+            // The destination could not hold the graph. The copier's **own** preflight has
+            // already counted the flat words it wanted and reports that count back in the
+            // exhaustion error (`AllocFailure::requested`, the `beam_message::error` contract's
+            // `words * size_of::<Eterm>()`), so the growth hint costs no second traversal of the
+            // graph: `beam_term::size_object(term)` — the obvious alternative — walks it all over
+            // again *and* builds a `HashSet` plus a `Vec` on the way.
+            Err(error) => copy_shortfall_words(&error),
+        };
+        // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
+        // and moves no live term, so the copy can simply be re-attempted from the fresh space's
+        // base — `needed` is the copier's exact flat word count, so the retry fits. The floor of
+        // 256 keeps a small result from landing exactly on the new space's edge.
+        process.grow_nursery(needed.max(256)).ok()?;
         beam_message::copy_struct(term, process.heap_mut(), &mut ctx).ok()
     }
 
@@ -981,6 +994,28 @@ impl RuntimeContext<'_> {
         if foreign {
             self.runtime.note_foreign_reachable(pid);
         }
+    }
+}
+
+/// The flat word count a refused copy reported it could not fit.
+///
+/// [`beam_message`]'s **message-heap exhaustion** ([`beam_message::is_message_heap_exhaustion`])
+/// carries the copier's own preflight shortfall: `AllocFailure::requested` is the flat term-word
+/// count the copy wanted, in bytes (the `beam_message::error` module's documented
+/// `words * size_of::<Eterm>()`), so recovering it here is free.
+///
+/// [`beam_term::size_object`], the obvious alternative, is a **second full traversal** of a graph
+/// the copier has just walked — and one that additionally builds a `HashSet` and a `Vec` to defend
+/// against a forged cycle. Paying for it on every refused copy is what this helper removes.
+///
+/// A refusal of any other class reports no room request at all; the returned `0` is the
+/// conservative answer, because the caller's floor raises it to a legal growth hint.
+fn copy_shortfall_words(error: &BeamError) -> usize {
+    match error {
+        BeamError::Alloc(failure) => failure.requested / core::mem::size_of::<Eterm>(),
+        // Unreachable from [`RuntimeContext::move_result_into_process_heap`], which only reaches
+        // this for `is_message_heap_exhaustion` (which implies the `Alloc` variant).
+        _ => 0,
     }
 }
 
