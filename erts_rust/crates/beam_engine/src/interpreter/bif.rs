@@ -24,7 +24,7 @@
 //! call the BIF through [`ExecutionContext::call_bif`]; `raise_bif_error` folds a
 //! BIF error into the catch-aware raise the dispatch loop expects.
 
-use beam_common::{BeamError, ExceptionClass, Result};
+use beam_common::{BeamError, ExceptionClass, Result, StackTrace};
 use beam_loader::{ImportRef, Label, Module, Operand, NO_FAIL};
 use beam_term::{make_atom, Eterm, NIL};
 
@@ -348,6 +348,15 @@ impl Machine {
     /// `Err(BeamError::Raise(..))`. This reproduces C, where `handle_error` always
     /// runs `next_catch` regardless of the reason's shape.
     ///
+    /// A [`BeamError::Raise`] whose [`stacktrace`](beam_common::Raise::stacktrace) is
+    /// **non-empty** arrived carrying explicit symbolic frames (e.g. an
+    /// `erlang:raise/3` whose third argument is a trace list). They are armed on the
+    /// one-shot `pending_supplied_trace` latch immediately before the landing
+    /// `throw_with_trace`, so the caught-path cooked trace renders THOSE frames in
+    /// preference to the `raise_snapshot` heuristic (see
+    /// [`crate::families::exceptions::stacktrace::symbolic_stacktrace`]). An
+    /// absent/empty supplied trace arms nothing and leaves every path byte-identical.
+    ///
     /// Shared with the instruction families (e.g. `families::receive`'s `send`,
     /// which carries no fail label either), so the landing convention stays defined
     /// in exactly one place.
@@ -389,6 +398,14 @@ impl Machine {
         // raw trace stays `NIL` and the latch is never armed.
         let has_head = head.is_some();
         let trace = head.unwrap_or(NIL);
+        // The symbolic frames an incoming raise **arrived carrying** (e.g.
+        // `erlang:raise/3` with a non-empty trace list). Extracted — never emptied —
+        // only when non-empty, so an absent/empty supplied trace leaves every path
+        // byte-identical to the `raise_snapshot`-derived behavior.
+        let supplied_trace = match &error {
+            BeamError::Raise(raise) if !raise.stacktrace.is_empty() => Some(raise.stacktrace.clone()),
+            _ => None,
+        };
         // A raise whose reason is a compound term lands (or propagates) with the
         // term, mirroring C's `handle_error` → `next_catch` for every reason shape.
         if let BeamError::Raise(raise) = &error {
@@ -401,7 +418,13 @@ impl Machine {
                 if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
                     self.set_class_atom(class, make_atom(class_atom));
                 }
-                return self.throw_with_trace_headed(class, reason, trace, has_head);
+                return self.throw_with_trace_headed(
+                    class,
+                    reason,
+                    trace,
+                    has_head,
+                    supplied_trace,
+                );
             }
         }
         // No live catch frame: the error propagates unchanged, carrying whatever
@@ -434,12 +457,13 @@ impl Machine {
         if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
             self.set_class_atom(class, make_atom(class_atom));
         }
-        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head)
+        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
     }
 
-    /// [`Machine::throw_with_trace`] that first arms the one-shot
-    /// `pending_callee_head` latch when `has_head`, so the raise being landed is
-    /// marked as carrying a synthesized callee head item (which lives in `trace`).
+    /// [`Machine::throw_with_trace`] that first arms the one-shot latches the raise
+    /// arrived with, so the raise being landed is marked as carrying a synthesized
+    /// callee head item (when `has_head`, which lives in `trace`) and/or the explicit
+    /// symbolic frames it arrived with (when `supplied_trace` is `Some`).
     #[inline]
     fn throw_with_trace_headed(
         &mut self,
@@ -447,9 +471,17 @@ impl Machine {
         reason: Eterm,
         trace: Eterm,
         has_head: bool,
+        supplied_trace: Option<StackTrace>,
     ) -> Result<Step> {
         if has_head {
             self.pending_callee_head = true;
+        }
+        // The supplied frames are armed on the same one-shot latch the landing
+        // `throw_with_trace` consumes. Only a non-empty trace arms it: an absent or
+        // empty supplied trace leaves the latch clear, so the caught-path cooked
+        // trace stays the `raise_snapshot`-derived one.
+        if supplied_trace.is_some() {
+            self.pending_supplied_trace = supplied_trace;
         }
         self.throw_with_trace(class, reason, trace)
     }

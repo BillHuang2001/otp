@@ -67,7 +67,7 @@
 //!   nested / blocking run path a fired `after T` has to work through.
 //! * `test_support` — the `cfg(test)`-only synthetic-module builder (`Fixture`)
 //!   and the cross-module seam context (`seam`) the `machine` tests share.
-use beam_common::{ExceptionClass, Result};
+use beam_common::{ExceptionClass, Result, StackTrace};
 use beam_loader::{Module, SharedLiteralArea};
 use beam_term::Eterm;
 
@@ -286,6 +286,35 @@ pub struct Machine {
     /// collecting host roots such a parked term the way `beam_rt` roots the pending
     /// exception.
     pub(crate) raise_function_clause_args: Option<Eterm>,
+    /// A **one-shot latch**: the symbolic [`StackTrace`] an incoming raise
+    /// **arrived carrying** (e.g. `erlang:raise/3` whose third argument is a
+    /// non-empty trace list).
+    ///
+    /// Armed by the raising site ([`Machine::raise_error`]) **immediately before**
+    /// the `throw_with_trace` that lands the raise, and consumed by that call (see
+    /// [`Machine::raise_supplied_trace`]) — the same two-latch protocol as
+    /// `Machine::pending_callee_head`/`pending_function_clause_args`. It is armed
+    /// **only when the incoming `Raise`'s stacktrace is non-empty**: an empty or
+    /// absent supplied trace leaves every path byte-identical to the
+    /// `raise_snapshot`-derived behavior.
+    ///
+    /// It is a separate latch from the live-raise state so a propelling `Err` path
+    /// — a raise with no live catch frame — cannot leave stale frames for a later,
+    /// unrelated cooked trace to inherit.
+    pub(crate) pending_supplied_trace: Option<StackTrace>,
+    /// The **live raise** state behind [`Machine::pending_supplied_trace`]: the
+    /// explicit frames the raise currently in flight arrived carrying.
+    ///
+    /// [`Machine::throw_with_trace`] sets it (from the one-shot latch) on **every**
+    /// raise, so a raise that carries no supplied trace clears it, and the
+    /// caught-path cooked-trace builder consumes it **exactly once**
+    /// ([`crate::families::exceptions::stacktrace::symbolic_stacktrace`]), which
+    /// then renders THOSE frames in preference to the `raise_snapshot` heuristic.
+    ///
+    /// The frames are plain metadata ([`beam_common::StackFrame`] values), never a
+    /// machine-held heap term, so they need no rooting across the cooked trace's
+    /// reservation.
+    pub(crate) raise_supplied_trace: Option<StackTrace>,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -468,6 +497,8 @@ impl Machine {
             raise_head_item: false,
             pending_function_clause_args: None,
             raise_function_clause_args: None,
+            pending_supplied_trace: None,
+            raise_supplied_trace: None,
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,

@@ -336,6 +336,11 @@ impl Machine {
         // belongs to the run that raised, not to this one).
         self.pending_function_clause_args = None;
         self.raise_function_clause_args = None;
+        // The supplied-symbolic-frames latches ride the same two-latch protocol: a
+        // fresh run begins with neither armed, so a raise in the new run can never
+        // render the frames an earlier run's raise arrived carrying.
+        self.pending_supplied_trace = None;
+        self.raise_supplied_trace = None;
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).

@@ -43,7 +43,7 @@
 
 use std::sync::Arc;
 
-use beam_common::Result;
+use beam_common::{Result, StackFrame, StackTrace};
 use beam_loader::{Atom, Instr, LineEntry, Module, Operand};
 use beam_term::{is_list, is_nil, make_atom, make_small, Eterm, NIL};
 
@@ -142,6 +142,20 @@ use crate::terms::{ContextSink, Sink};
 /// the one reservation (through the very operand `build_stacktrace` read it from)
 /// and consed in front of the carved frames. The list is then never empty: an empty
 /// frame chain with a live head cooks to the **one-element** list `[Item]`.
+///
+/// **Supplied frames come first.** A raise that **arrived carrying** explicit
+/// symbolic frames — `erlang:raise/3` with a non-empty trace list — renders THOSE
+/// frames verbatim and the `raise_snapshot` below is not consulted: the
+/// caller-supplied trace REPLACES the derived one, exactly as the oracle's
+/// `build_stacktrace` returns the supplied list unchanged. The live latch
+/// ([`Machine::take_raise_supplied_trace`]) is consumed **once** here, so a later
+/// raise that carries none falls back to the snapshot heuristic; an absent/empty
+/// supplied trace leaves every path byte-identical. A supplied frame carries an
+/// **arity** (never an argument list) in its `A` slot and its `Location` is the
+/// `[{file,File},{line,N}]` pair the [`SourceLocation`](beam_common::SourceLocation)
+/// describes when present, else [`NIL`]. Every name it needs is resolved from the
+/// running module's atom table — never substituted, so a name the table cannot
+/// intern is the typed [`crate::error::unsupported`].
 pub(crate) fn symbolic_stacktrace(
     machine: &mut Machine,
     entry_module: &Module,
@@ -149,6 +163,13 @@ pub(crate) fn symbolic_stacktrace(
     head_operand: &Operand,
     head: bool,
 ) -> Result<Eterm> {
+    // A raise that ARRIVED carrying explicit symbolic frames renders THOSE frames,
+    // replacing the `raise_snapshot` heuristic. Consumed once, so a later raise that
+    // carries none falls back to the snapshot below; `None` leaves this function
+    // byte-identical to the pre-supplied behavior.
+    if let Some(supplied) = machine.take_raise_supplied_trace() {
+        return carve_supplied_frames(machine, entry_module, ctx, &supplied);
+    }
     // The **raise-time** frame chain: the raising frame first, then every caller
     // innermost-first, exactly as it was captured *before* the raise unwound the
     // call frames. Copy it out of the machine so the `shapes` below borrow only
@@ -219,6 +240,89 @@ pub(crate) fn symbolic_stacktrace(
         return sink.cons(item, cooked);
     }
     Ok(cooked)
+}
+
+/// Cook a raise's **explicitly supplied** frames (a non-empty
+/// [`Raise::stacktrace`](beam_common::Raise::stacktrace) the raise arrived with)
+/// into the symbolic `[{M,F,A,Location}]` list, verbatim.
+///
+/// Each [`StackFrame`] becomes the item its `module`/`function`/`arity` name, with
+/// its `location` (when present) materialized as the `[{file,File},{line,N}]` shape
+/// [`write_location`] builds for a derived frame — so a supplied frame's `Location`
+/// is byte-identical to the oracle's. A supplied frame carries an **arity**, never
+/// an argument list, in its `A` slot.
+///
+/// Every atom a frame names (`Module`, `Function` and, for a location, `File` and
+/// `line`) is resolved from the running module's atom table **before** the one
+/// reservation; a name the table cannot intern is the typed
+/// [`crate::error::unsupported`], never a substituted atom. The whole list is one
+/// rooted reservation carved node-by-node, exactly like the snapshot path.
+fn carve_supplied_frames(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    frames: &StackTrace,
+) -> Result<Eterm> {
+    // Only the *shapes* are computed here: no BEAM-heap word is touched yet, and no
+    // shape is allocated. Every name is resolved before the reservation below.
+    let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.frames.len());
+    for frame in &frames.frames {
+        shapes.push(supplied_frame_shape(module, frame)?);
+    }
+    // `2` words per list cell plus every item's own nodes — sized before the
+    // reservation, exactly as the snapshot path does.
+    let total = 2 * shapes.len() + shapes.iter().map(ItemShape::words).sum::<usize>();
+    let mut sink = terms::reserve_slack(machine, ctx, total)?;
+    let mut items = Vec::with_capacity(shapes.len());
+    for shape in &shapes {
+        // Child nodes before the parent, in the order `ItemShape::words` counts.
+        items.push(write_item(&mut sink, shape)?);
+    }
+    sink.list(&items)
+}
+
+/// The [`ItemShape`] of one **supplied** frame: the
+/// `{Module,Function,Arity,Location}` metadata a [`StackFrame`] carries, with every
+/// atom resolved (by name) from the running module's atom table.
+///
+/// A name the table cannot intern is the typed [`crate::error::unsupported`] — the
+/// engine never substitutes an atom the caller did not name, because a substituted
+/// atom would be a *wrong* term. The shape borrows the supplied stacktrace (its file
+/// names), so the caller must reserve and carve while it is alive — which it is,
+/// since both happen inside [`carve_supplied_frames`].
+fn supplied_frame_shape<'a>(module: &Module, frame: &'a StackFrame) -> Result<ItemShape<'a>> {
+    let module_atom = lookup_supplied(module, frame.module.as_str(), "module")?;
+    let function_atom = lookup_supplied(module, frame.function.as_str(), "function")?;
+    let location = match &frame.location {
+        Some(location) => {
+            let file_atom = lookup_supplied(module, location.file.as_str(), "file name")?;
+            let line_atom = lookup_supplied(module, "line", "line")?;
+            Some(LocationShape {
+                file_atom,
+                line_atom,
+                file: location.file.as_str(),
+                line: location.line,
+            })
+        }
+        None => None,
+    };
+    Ok(ItemShape {
+        module: module_atom,
+        function: function_atom,
+        arity: u32::from(frame.arity),
+        args: None,
+        location,
+    })
+}
+
+/// The running module's atom for `name`, or the typed [`crate::error::unsupported`]
+/// naming the `what` a supplied frame asked for.
+fn lookup_supplied(module: &Module, name: &str, what: &str) -> Result<Atom> {
+    module.atom_table.lookup(name).ok_or_else(|| {
+        error::unsupported(&format!(
+            "build_stacktrace: supplied frame names a {what} atom the running module cannot resolve: {name}"
+        ))
+    })
 }
 
 /// Which [`Module`] a snapshot frame's `(func, pc)` pair belongs to, resolved

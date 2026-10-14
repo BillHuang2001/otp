@@ -180,6 +180,22 @@ impl Machine {
         self.raise_function_clause_args.take()
     }
 
+    /// Consume the **live raise**'s explicitly supplied symbolic frames
+    /// ([`Machine::raise_supplied_trace`]).
+    ///
+    /// `Some(frames)` means the exception currently in flight **arrived carrying
+    /// them** (e.g. `erlang:raise/3` with a non-empty trace list), and the
+    /// caught-path cooked stacktrace must render THOSE frames verbatim — the
+    /// caller-supplied trace replaces the engine's `raise_snapshot` heuristic,
+    /// exactly as the oracle's `build_stacktrace` returns the supplied list. `None`
+    /// for every raise that carried none, which keeps the `raise_snapshot`-derived
+    /// trace in force.
+    ///
+    /// Taking it consumes it: the frames describe exactly **one** cooking.
+    pub(crate) fn take_raise_supplied_trace(&mut self) -> Option<StackTrace> {
+        self.raise_supplied_trace.take()
+    }
+
     /// Push a catch frame (the `try`/`catch` handler target).
     ///
     /// The frame's module context is stamped from the context executing right now
@@ -328,6 +344,11 @@ impl Machine {
         // live state from here on, so a raise that carries no such list clears it to
         // `None` (never a stale list from an earlier raise).
         self.raise_function_clause_args = self.pending_function_clause_args.take();
+        // The explicitly **supplied** symbolic frames ride the same protocol: the
+        // raise site armed the one-shot latch (only when the incoming raise carried
+        // a non-empty trace), and this raise — whoever raised it — owns the live
+        // state from here on, so a raise that arrived with no such frames clears it.
+        self.raise_supplied_trace = self.pending_supplied_trace.take();
         self.pending_exception = Some((class, reason));
         // Rebuild the **pre-unwind** raise snapshot before anything is unwound: the
         // handler's `build_stacktrace` (and the uncaught funnel) must be able to name
