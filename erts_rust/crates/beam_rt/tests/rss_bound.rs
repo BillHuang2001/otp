@@ -74,6 +74,12 @@ use beam_term::{is_small, make_small, signed_value};
 /// `lists.beam` which would shadow stdlib's.
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/churn.beam");
 
+/// The committed **float-literal-carrying ETS insert/lookup** image (the `copy_bound`
+/// workload's `ets_copy` shape — see `fixtures/ets_floats.erl`). It is the module whose
+/// `payload/0` carries the float `3.5`, so its code lowers `fmove {float,K} {fr,N}` and the
+/// whole module is float-family. Passed by **path**, never through a `-pa` (see [`FIXTURE`]).
+const FIXTURE_ETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ets_floats.beam");
+
 /// The **real** executable under test (the test target's build guarantees it is current).
 const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
 
@@ -84,6 +90,10 @@ const LARGE_N: i64 = 20_000;
 
 /// The churn count the deterministic (non-RSS) collection test drives.
 const COLLECT_N: i64 = 2_000;
+
+/// The ETS copy count the deterministic (non-RSS) collection test drives — 10× the churn
+/// count, because the ETS round-trip does far more per-iteration work than one churn.
+const ETS_COLLECT_N: i64 = 2_000;
 
 /// How close to the child's death the peak `VmHWM` is sampled. `VmHWM` is a watermark, so a
 /// small interval is enough to observe it before the process is reaped.
@@ -347,5 +357,104 @@ fn the_churn_loop_really_collects() {
         "this run itself must have collected; before={before:?} after={after:?}"
     );
     assert_eq!(after.errors, 0, "no collection failed; {after:?}");
+    assert!(!after.disabled, "the escape-store valve did not trip; {after:?}");
+}
+
+/// **Test C — the float-literal-carrying ETS copy loop really collects.**
+///
+/// The `copy_bound/ets_copy` shape: every iteration builds a map carrying a float **literal**
+/// (`{ok, <<"hello world">>, 3.5}`), inserts it into a one-key ETS table and reads it back. A
+/// float literal lowers to `fmove {float,K} {fr,N}`, so the module is float-family.
+///
+/// # Status: **IGNORED** — the collection this asserts does not happen yet
+///
+/// `tools/bench/RESULTS.md` §8 item 5 asked for the `copy_bound/ets_copy` loop's rising peak
+/// RSS to be fixed. The prior investigation's mechanism was re-verified against the code and the
+/// prescribed fix (drop the caller-module float guard at the two **FR-publishing** doors) was
+/// applied to `src/context/gc.rs` — see that file's float-guard docs. The guard removal is
+/// **correct** (a float *literal* is `fmove {float,K} {fr,N}`, and both doors publish the whole
+/// FR file via `publish_roots_full`, so the guard only refused sound collections) but it is
+/// **not sufficient** — measured peak `VmHWM` is unchanged, and this test is the honest
+/// evidence:
+///
+/// ```text
+///   N=0       N=2 000    N=20 000   N=100 000      (peak VmHWM, same host, guard removed)
+///   19.73 M   21.99 M    35.41 M    95.02 M        (linear in N: ~790 B/iteration)
+///   collections: 0   fallbacks: 0   errors: 0   halted: 0   pinned: 0
+/// ```
+///
+/// With the DIAG instrumentation that found this, `ets_floats:run/500` drives
+/// `ensure_heap_full` **500×** (once per iteration, `forced == false`) and **never** reaches the
+/// unscanned-root valve, the collection branch, or `alloc_words_rooted` at all — it returns at
+/// `!process.should_collect(heap_need)` (`src/context/gc.rs`), because the machine's `test_heap`
+/// prefixes are tiny against the 233-word default nursery, so the occupancy short-circuit
+/// (`beam_gc/src/collector.rs::should_collect` = `nursery.available_words() < need_words`)
+/// declines every admission point.
+///
+/// Two further measurements pin the growth to the **registered-BIF result copy**, not to the
+/// float guard and not to the process heap:
+///
+/// * a **float-free** ETS loop of the same shape grows identically (30.47 M @ N=20 000 →
+///   69.70 M @ N=100 000) and never even enters `ensure_heap_full`;
+/// * a float-literal **map** loop with **no ETS** (`pchurn`) is flat and tiny (17.40 M @
+///   N=20 000 → 19.47 M @ N=100 000).
+///
+/// The residual is therefore in the BIF-result path — `move_result_into_process_heap`
+/// (`src/context/calls.rs`, owned by another agent: **not editable from this node**) cannot
+/// collect by design and meets a full nursery with `Process::grow_nursery(hint)` + one retry,
+/// and a *replaced* young space is **retained** (`beam_process`), so `ets:insert/2` +
+/// `ets:lookup/2` both growing the nursery per iteration accumulates the ~790 B/iteration
+/// exactly as measured. That is the blocker; see
+/// `src/context/CONTEXT.md`'s recorded gap for the sibling-file hand-off.
+///
+/// The test body is kept intact (and is expected to **pass** once the residual is closed) and
+/// is `#[ignore]`d so the crate gate stays green without a fabricated pass. Run it directly
+/// with `--ignored` to see the current counters.
+#[ignore = "residual blocker: the BIF-result nursery growth in src/context/calls.rs retains \
+            replaced young spaces (see this doc); the loop does not collect yet"]
+#[test]
+fn the_ets_copy_loop_really_collects() {
+    let Some(_oracle) = support::require_oracle("rss_bound") else {
+        return;
+    };
+
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.boot().expect("the boot sequence runs");
+    rt.load_module(FIXTURE_ETS)
+        .expect("the ets_floats fixture loads");
+
+    let before = rt.gc_stats();
+    let value = rt
+        .run_scheduled(FIXTURE_ETS, "run", 1, &[make_small(ETS_COLLECT_N)])
+        .expect("ets_floats:run/1 runs to completion on the scheduled path");
+    let after = rt.gc_stats();
+
+    assert!(
+        is_small(value),
+        "ets_floats:run/1 returns a small integer, got a boxed term"
+    );
+    assert_eq!(
+        signed_value(value),
+        ETS_COLLECT_N,
+        "ets_floats:run/1 returns exactly its argument"
+    );
+    eprintln!(
+        "rss_bound: ets_floats:run/{ETS_COLLECT_N} collected {} time(s) ({} major), fallbacks \
+         {}, errors {}, halted {}, pinned {}, disabled {}",
+        after.collections as i64 - before.collections as i64,
+        after.major as i64 - before.major as i64,
+        after.fallbacks - before.fallbacks,
+        after.errors,
+        after.halted,
+        after.pinned,
+        after.disabled
+    );
+    assert!(
+        after.collections > before.collections,
+        "the float-literal ETS loop must have driven at least one process-heap collection; \
+         before={before:?} after={after:?}"
+    );
+    assert_eq!(after.errors, 0, "no collection failed; {after:?}");
+    assert_eq!(after.halted, 0, "no process's collection was halted; {after:?}");
     assert!(!after.disabled, "the escape-store valve did not trip; {after:?}");
 }
