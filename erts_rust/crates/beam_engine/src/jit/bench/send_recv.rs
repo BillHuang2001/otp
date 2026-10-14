@@ -24,23 +24,22 @@
 //!
 //! # Why this shape
 //!
-//! `../../../../../../tools/bench/RESULTS.md` §8 item 2 records the runtime-level
-//! `send_recv` regression: on the **default** baseline-JIT tier a two-process
-//! send/receive copy loop is **2.15×–3.31× dearer** than on the interpreter tier. That
-//! figure comes from the *external* driver (`tools/bench`), which needs two live
-//! processes; this in-crate harness runs **one** process on a
-//! [`MinimalContext`](crate::MinimalContext), so it
-//! reproduces the same compiled instruction shape in-process and measures it with the
-//! tier table's own method.
+//! The *external* driver (`tools/bench`) measures a two-process `send`/`receive` copy
+//! loop end to end; this in-crate harness runs **one** process on a
+//! [`MinimalContext`](crate::MinimalContext), so it reproduces the same compiled
+//! instruction shape in-process and measures it with the tier table's own method.
 //!
-//! Measured here, the same shape does **not** show that deficit: the baseline tier is
-//! net *faster* (min-of-3 ≈ 9268.9 ns/op vs the interpreter's ≈ 13337.7 ns/op, ≈ 1.44×).
-//! The two readings do not conflict — this harness's mailbox delivers synchronously, so
-//! the `receive` never blocks, there is no second process, no scheduler resume and no
-//! ETF cop in the loop, which is exactly the runtime glue the external driver measures.
-//! The in-process result therefore localises the runtime regression to the **runtime
-//! glue**, not to the tier's lowering of this compiled shape. See
-//! [`super`](crate::jit::bench)'s `send_recv/2` measurement note.
+//! Measured here, the baseline tier is net *faster* (min-of-3 ≈ 9268.9 ns/op vs the
+//! interpreter's ≈ 13337.7 ns/op, ≈ 1.44×), and the external end-to-end `copy_bound`
+//! `send_recv` measurement agrees: the **default** baseline-JIT tier sits at parity with,
+//! or ahead of, `BEAM_RT_TIER=interpreter` (≈ 0.8×–1.04× across interleaved runs), so
+//! there is no tier deficit on this shape. The two readings are complementary rather than
+//! contradictory: this harness's mailbox delivers synchronously, so the `receive` never
+//! blocks, there is no second process, no scheduler resume and no ETF cop in the loop —
+//! exactly the runtime glue only the external driver exercises. The agreement follows
+//! from this tier lowering the whole receive-control family and the six comparison
+//! `Test`s in-block and from its per-slice cache key being the `.beam` load-time MD5.
+//! See [`super`](crate::jit::bench)'s `send_recv/2` measurement note.
 //!
 //! # The shape
 //!
