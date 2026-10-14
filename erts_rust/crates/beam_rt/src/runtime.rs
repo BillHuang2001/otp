@@ -298,6 +298,18 @@ pub struct Runtime {
     /// Written **only** by the root-action entries ([`Runtime::eval`]/[`Runtime::run_named`])
     /// and restored on every exit path, so it is never a stale frame.
     pub(crate) executing: Option<executing::ExecutingFrame>,
+    /// The executing process's **execution position**, published by the in-machine BIF door
+    /// for exactly one nested `erlang:process_info/1,2` call (see
+    /// [`crate::context::position`]).
+    ///
+    /// The scheduler takes the executing process's machine **out** of
+    /// [`Runtime::runner_state`] for the whole slice, so the caller's own position has no
+    /// other source; `beam_engine`'s in-machine BIF door hands that live machine to
+    /// [`crate::context::RuntimeContext`], which reads the five machine-sourced item values
+    /// here. Non-`None` only between the door's publication and the return of the one nested
+    /// `call_bif` it wraps — a straight-line assign/clear with no `?` between them — so it is
+    /// never a stale record, and only a read for the **published pid** ever consults it.
+    pub(crate) in_machine: Option<crate::context::InMachinePosition>,
     /// The node-global **cumulative reduction count** — the `Total` behind
     /// `erlang:statistics(reductions)`/`(exact_reductions)`.
     ///
@@ -737,6 +749,7 @@ impl Runtime {
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
             executing: None,
+            in_machine: None,
             reductions: 0,
             reductions_anchor: Cell::new(0),
             exact_reductions_anchor: Cell::new(0),

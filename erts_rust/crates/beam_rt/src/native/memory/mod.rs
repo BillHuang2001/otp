@@ -675,6 +675,16 @@ impl RuntimeContext<'_> {
                 return Ok(Some(value));
             }
         }
+        // The **in-machine door** (`crate::context::position`): the executing process's own
+        // machine is not in the runner state this reads below (the scheduler takes it out
+        // for the whole slice), but the in-machine BIF door publishes its five machine-
+        // sourced answers here for the one nested `process_info` call that needs them. It
+        // comes after the root frame so a `-eval`/`-s`/`-run` root process keeps that
+        // frame's answers, and before the runner state because no other source can name the
+        // caller's own position at all.
+        if let Some(value) = self.in_machine_value(name, pid) {
+            return Ok(Some(value));
+        }
         let Some(engines) = self.engines() else {
             return Ok(None);
         };
@@ -816,6 +826,10 @@ impl RuntimeContext<'_> {
             if let Some(value) = self.root_frame_value("catchlevel", action)? {
                 return Ok(Some(value));
             }
+        }
+        // The in-machine door's published depth (see [`Self::position_value`]).
+        if let Some(value) = self.in_machine_value("catchlevel", pid) {
+            return Ok(Some(value));
         }
         let Some(engines) = self.engines() else {
             return Ok(None);

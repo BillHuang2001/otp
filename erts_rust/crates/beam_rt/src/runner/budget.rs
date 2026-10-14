@@ -63,7 +63,7 @@ use std::sync::Arc;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::ExecutionContext;
+use beam_engine::{ExecutionContext, Machine};
 use beam_loader::{Label, Module};
 use beam_term::Eterm;
 
@@ -184,6 +184,41 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::call_bif(self.inner, module, function, arity, args)
     }
 
+    /// Forwarded like every other method — and **load-bearing** for the scheduled path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine's once-per-run latch
+    /// ([`Machine::dispatch_bif_call`](beam_engine::Machine)) reads the probe **here**:
+    /// without this override it would see the trait default (`false`), the engine would
+    /// never take the in-machine door, and a scheduled process could not answer its own
+    /// `erlang:process_info(self(), current_stacktrace)` — `gen_server`'s `?STACKTRACE()`.
+    fn wants_bif_in_machine(&self) -> bool {
+        ExecutionContext::wants_bif_in_machine(self.inner)
+    }
+
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path, because the
+    /// slice's machine runs on this wrapper and therefore reaches the entry-aware dispatch
+    /// here, never on the inner context directly.
+    fn call_bif_in_machine(
+        &mut self,
+        machine: &Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        ExecutionContext::call_bif_in_machine(
+            self.inner,
+            machine,
+            entry_module,
+            module,
+            function,
+            arity,
+            args,
+        )
+    }
     /// Forwarded like every other method (the wrapper's own overrides are
     /// [`reduce`](ExecutionContext::reduce)/[`wants_reduce`](ExecutionContext::wants_reduce)
     /// and the two `ensure_heap` doors).

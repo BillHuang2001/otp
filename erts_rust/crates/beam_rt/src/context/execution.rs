@@ -663,6 +663,39 @@ impl ExecutionContext for RuntimeContext<'_> {
         false
     }
 
+    /// The **in-machine BIF door** probe: this host takes it.
+    ///
+    /// `beam_engine` then hands the live [`Machine`] and the run's entry module to
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine) on every BIF dispatch,
+    /// which is the only way a `&mut self` context method can be shown the machine the
+    /// scheduler has taken out of its own runner state. The body
+    /// ([`RuntimeContext::in_machine_probe`], in the sibling `context/position.rs`) is a
+    /// constant `true`; the price is that method's own routing check, and the benefit is
+    /// `erlang:process_info(self(), current_stacktrace)` — `gen_server`'s `?STACKTRACE()` —
+    /// being answerable at all.
+    fn wants_bif_in_machine(&self) -> bool {
+        self.in_machine_probe()
+    }
+
+    /// The **entry-aware BIF dispatch**: answer the executing process's own execution
+    /// position, then dispatch exactly as [`call_bif`](ExecutionContext::call_bif) does.
+    ///
+    /// The body ([`RuntimeContext::dispatch_in_machine`], in the sibling
+    /// `context/position.rs`) publishes the five machine-sourced item values for the one
+    /// nested `call_bif` that needs them — see that module's docs for the routing, the
+    /// published window and why the terms are stable across it.
+    fn call_bif_in_machine(
+        &mut self,
+        machine: &beam_engine::Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.dispatch_in_machine(machine, entry_module, module, function, arity, args)
+    }
+
     /// Whether the running process requests the `call`/`return_from`/`return_to` execution
     /// trace family (contract A.8).
     ///
