@@ -12,6 +12,7 @@ Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`
 Test count at this HEAD: **457 tests**, 0 failures (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast`; re-run for the live figure).
 Differential gate: **`total=1839 agree=1837 mismatch=0 unsupported=2 skipped=0`**, exit **0** with the allowlisted capability gaps `wire/new_fun_ext_encode` (the deliberately unclosable `erl_eval` lambda) and `boot_extra/init_script_id_names_the_running_otp_release` (`../tools/differential/GAPS.md` — re-run `../tools/differential/gate.sh` for the live per-contract split).
 The full producible tag set round-trips with **no recognized tag left `unsupported`**; a `FunKind::Local` (`make_fun3`) fun encodes as `NEW_FUN_EXT` (`112`) when the caller supplies the module identity its layout lacks (§Tag coverage, §Fun identity).
+Both `term_to_binary/2` option-level encode gaps are closed: `with_deterministic` reproduces `[deterministic]` (map keys sorted by full term order) and `with_local_ext` reproduces the `[local]`/`DFLAG_LOCAL_EXT` internal-node marker form (§Map key encode order, §Local node identity).
 
 ## API Surface (FROZEN — dependents route here)
 Signatures only; the wire rules and C ground truth live below. All fallible calls return `beam_common::Result<_>`; a violated precondition is `BadArg` (§Constraints). Re-exported at the crate root and via `beam_codec::prelude::*`.
