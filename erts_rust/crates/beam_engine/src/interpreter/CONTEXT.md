@@ -88,16 +88,27 @@ shared catch-aware `raise_bif_error`.
   frames for the same raise. A raise in a cross-module callee context (non-zero) is left untouched here and framed by
   `Machine::drive`, which knows the run's true entry module.
 - **`FuncInfo` is NOT a metadata no-op** — a failed head-pattern/guard jumps into it and it raises class `error` with the
-  bare atom `function_clause`. Inlining it as a no-op would loop on the entry label. It raises through the shared
-  `raise_function_clause_no_fail` (see below).
-- `FuncInfo`, `Test`/`SelectVal` and the maps read path all raise on a `NO_FAIL` failure through the **one** helper
-  `raise_function_clause_no_fail` (`dispatch.rs`, `pub(crate)`, re-exported as
-  `crate::interpreter::raise_function_clause_no_fail`): class `error` with the **bare atom** `function_clause` (the
-  failed-clause reason — C's plain `FAIL(Fail)` sets no reason, so the `f,0` sentinel goes through
-  `i_func_info_IaaI` → `handle_error`; `what` names the site: `"func_info"`/`"test"`/`"select_val"`/`"maps"`),
-  resolved only from the running module's atom table; a module without that atom stays the typed
-  `unsupported("<what>: no 'function_clause' atom in the module")`. A comparison `Test`/`SelectVal` uses
-  `cmp` (`=:=`) vs `cmp_arith` (`==`).
+  bare atom `function_clause`. Inlining it as a no-op would loop on the entry label. It raises carrying the failed
+  clause's argument list through the shared `raise_function_clause_with_args` (see below).
+- **The one `function_clause` raise has two entry points.** `raise_function_clause_with_args` (`dispatch.rs`,
+  `pub(crate)`) is the definition — class `error`, the **bare atom** `function_clause` as the reason (the failed-clause
+  reason: C's plain `FAIL(Fail)` sets no reason, so the `f,0` sentinel goes through `i_func_info_IaaI` →
+  `handle_error`), resolved **only** from the running module's atom table (a module without that atom stays the typed
+  `unsupported("<what>: no 'function_clause' atom in the module")`, never a substituted atom index). `what` names the
+  raising site (`"func_info"`/`"test"`/`"select_val"`/`"maps"`). It additionally builds the failed clause's **real call
+  argument list** — a proper list of the `argv` leading argument registers (`NIL` for a zero-arity call), read *after*
+  the rooted reservation because `x` is in the frozen root set — and parks it on the machine as the one-shot
+  `Machine::pending_function_clause_args` latch, which `Machine::throw_with_trace` promotes to the live
+  `Machine::raise_function_clause_args` state the cooked-trace builders consume.
+  **`raise_function_clause_no_fail`** (`pub(crate)`, re-exported as
+  `crate::interpreter::raise_function_clause_no_fail`) is the **argument-free forwarder** to it (it passes no list, so
+  the cooked item for the raising function falls back to its declared arity); the maps read path's absent-key `NO_FAIL`
+  branch is its only consumer. `FuncInfo` (with `argv = arity.min(running_arity)`) and the `NO_FAIL`
+  `Test`/`SelectVal` arms (with `argv = running_arity`) use the argument-carrying form.
+  **The rule the cooked trace reports:** the failed function's argument list goes in the **frame-0** `A` slot (C's
+  `save_stacktrace`'s `non_bif_stacktrace:` + `erts_build_mfa_item`), and **every outer frame keeps its declared
+  arity** — so the oracle cooks `{Mod,Fun,[Arg,…],Location}` for the failing function and `{Mod,Fun,Arity,Location}`
+  for each caller. A comparison `Test`/`SelectVal` uses `cmp` (`=:=`) vs `cmp_arith` (`==`).
 - `gc_bif`/`bif` decode a boxed-term test only where the family/`predicates` do; the small-int `'+'`/`'-'`/`'*'` and the
   eight comparison BIFs have baseline-JIT inline paths (see `../jit/baseline/emit/`), everything else deopts to
   `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction`.
