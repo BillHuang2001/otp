@@ -65,8 +65,8 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 **`init`** (`init.rs`). `init:get_argument/1` serves the four **automatic** flags — `root` (the
 code root dir), `home` (`$HOME`), `progname` (`$PROGNAME` else the compile-time `"erl"`, the C rule
 `erlexec.c:1702-1705`) and `bindir` (`<root>/erts-<vsn>/bin`) — so it is *not* the boot determinant
-it once was: the real boot script runs to `{progress,started}` under the CLI-equivalent
-configuration and under a `RuntimeConfig`-default runtime alike. `init:get_arguments/0` **prepends**
+it once was: the real boot script stops at the same directive **18** (the kernel-application start)
+under the CLI-equivalent configuration and under a `RuntimeConfig`-default runtime alike. `init:get_arguments/0` **prepends**
 those four entries (`root`, `bindir`, `progname`, `home`, each `{Flag,[[Value]]}`, an unavailable
 value omitting its entry — the oracle's own shape) before the command-line flags (boot-chain
 consequence: [`../boot/CONTEXT.md`](../boot/CONTEXT.md)). `init:script_id/0` is the **loaded** boot

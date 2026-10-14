@@ -412,13 +412,19 @@ Figures, bisection and the discarded negative results: [`PERF.md`](PERF.md) *COP
   path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — COMPLETES.** `Runtime::boot_from_script` runs the real `bootstrap/bin/start.boot`
-  (OTP 30 / erts-17.1, **22 instructions**) to `{progress,started}` (the CLI `-boot` action exits `0`),
-  so the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** with the oracle;
-  `-boot FILE` drives it (`src/cli.rs::drive`), a plain start keeps the preloaded-only floor, and the
-  boot leaves a live `logger_server` registered as `logger`. The remaining cross-node gap is
-  **`beam_bifs`** — whatever the started applications still need. Detail:
-  [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+* **A.7/A.9 boot — stops at directive 18.** `Runtime::boot_from_script` runs the real
+  `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 instructions**) until directive **18 of 22**,
+  `{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, where the kernel
+  application's start (`application_controller:start_boot_application/2` → `spawn_starter/3` →
+  `application_master:start_link/2`) never completes, the boot drive's scheduler pass runs zero
+  processes, and `src/boot/drive.rs::apply_boot_call` folds the owed `gen_server:call` reply into the
+  uncatchable `beam_engine::blocked()` (the CLI `-boot` action exits **3**); the final
+  `{progress,started}` (index 21) is not reached. The differential case
+  `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** with the oracle, `-boot FILE` drives the
+  walk (`src/cli.rs::drive`), a plain start keeps the preloaded-only floor, and directive 13 leaves a
+  live `logger_server` registered as `logger`. The remaining cross-node gap is **`beam_bifs`** —
+  whatever the start needs that the runtime does not yet run. Mechanism, the eight currently-failing
+  tests and the not-a-native-floor-miss evidence: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.**
   `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process**
@@ -627,7 +633,7 @@ The holder the valve was built for is `Runtime::bif_heaps`: a container a regist
 
 ## Cross-node handoffs (crate index)
 * **Differential gate** — **no case disagrees** (`mismatch=0`); the two `unsupported` cases are allowlisted capability gaps (`wire/new_fun_ext_encode`, `boot_extra/init_script_id_names_the_running_otp_release`). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
-* **A.7/A.9 boot** — completes (the real `start.boot` to `{progress,started}`, leaving a live `logger_server` registered as `logger`); the residual is whatever the started applications still need from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
+* **A.7/A.9 boot** — stops at directive **18 of 22** (the kernel-application start; the CLI `-boot` action exits **3**), leaving a live `logger_server` registered as `logger`; the residual is the kernel application's supervisor tree, i.e. whatever the start still needs from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases drive a scheduled `run` and **agree** with the oracle on both the interpreter and the baseline tier; the mover (a `beam_process` signal-driven collection of a woken monitor watcher) is declined by the host collection gate installed on the process table, with the park-window relocation exemption as its complementary mitigation (both are the A.9 E0 bullet above and *GC-relocation hazards* below).
 * **The native `file_server_2` service** — its served request surface and every typed per-request gap are tabled in [`src/native/CONTEXT.md`](src/native/CONTEXT.md); a process-**alias** reply tag is the typed `unsupported`.
 * **`beam_process` / `beam_message`** — an owning drain for the wake list and a `!Send`-friendly `SchedulerPool` for SMP adoption; the split heap+mailbox borrow exists.

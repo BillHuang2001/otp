@@ -111,25 +111,35 @@ registered but the directive has not resumed). A directive that has **already** 
 
 ## Where the real `start.boot` gets now
 Execute the real script (`bootstrap/bin/start.boot`, 22 instructions) with the CLI-equivalent
-configuration and it runs **all 22 directives to completion**, ending at the final
-`{progress,started}`. The tail's 0-based indices: **12** `{kernelProcess,heart,{heart,start,[]}}`,
+configuration and it **stops at directive index 18 of 22**,
+`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, with the uncatchable
+`beam_engine::blocked()` gap (class `exit`, reason atom
+`unsupported_opcode: run: process blocked (no message available)`); the final `{progress,started}`
+(index 21) is **not** reached, and the CLI `-boot` route exits **3**.
+The tail's 0-based indices: **12** `{kernelProcess,heart,{heart,start,[]}}`,
 **13** `{kernelProcess,logger,{logger_server,start_link,[]}}`, **14**
 `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`, **15**
 `{progress,init_kernel_started}`, **16** `{apply,{application,load,[{application,stdlib,Props}]}}`,
 **17** `{progress,applications_loaded}`, **18**/**19**
-`{apply,{application,start_boot,[{application,kernel|stdlib,Props},permanent]}}`, **20**
-`{apply,{c,erlangrc,[]}}`, **21** `{progress,started}`.
-- **Instruction 20 is what the native `file_server_2` service unblocks.** `c:erlangrc/0`'s file
-  consult is `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
+`{apply,{application,start_boot,[{application,kernel|stdlib,Props},permanent]}}` (directive **18** is
+the **stop**), **20** `{apply,{c,erlangrc,[]}}`, **21** `{progress,started}`.
+Directives 0–17 run; the three `{kernelProcess, …}` startups (12–14) succeed; the stop is inside the
+kernel application's own `start_boot_application/2` (mechanism in *Remaining gaps* below, together
+with the tests that assert the former completion and currently fail).
+- **Instruction 20 is what the native `file_server_2` service would unblock — but the boot never
+  reaches it.** `c:erlangrc/0`'s file consult is
+  `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
   (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt` registers a runtime-native
   `file_server_2` at construction ([`../native/file_server.rs`](../native/CONTEXT.md)), which answers
-  the missing `$HOME/.erlang` with `{error,enoent}` — a value `c:erlangrc/0` treats as success — so the
-  directive returns and the chain reaches `{progress,started}`.
-- **The CLI and the in-crate executor reach the same end.** The CLI
-  (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **0** with empty
-  stdout/stderr. The in-crate executor (`boot_from_script` → `execute`) walks the same 22 directives;
-  its `BootStop`/`execute_reporting` report API is simply not reached on this path (there is no failure
-  to report).
+  the missing `$HOME/.erlang` with `{error,enoent}` — a value `c:erlangrc/0` treats as success — but the
+  directive-18 stop happens first, so instruction 20 does not run.
+- **The CLI and the in-crate executor stop in the same place.** The CLI
+  (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **3** with empty
+  stdout and the standard `beam_rt: unsupported: …` diagnostic on stderr (the `blocked()` reason atom
+  begins with `unsupported`, so the CLI classifies it as a capability gap). The in-crate executor
+  (`boot_from_script` → `execute`) hits the same directive-18 stop and reports it through the
+  `BootStop`/`execute_reporting` report API (`index = 18`, the script's `total = 22`, the failing
+  `apply` directive and the `blocked()` error).
 - **The configuration is part of the measurement.** `init:get_arguments/0` reports the whole command
   line, and the executor tests build their runtime with their own `system_runtime()` helper — the
   CLI's own parser (`crate::cli::parse`, not `parse_with_env`: a test must not depend on `ERL_*FLAGS`)
@@ -137,17 +147,19 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   (`boot_cli_runtime`). The **four automatic flags** (`root`/`home`/`progname`/`bindir`) are served
   by `init:get_argument/1` *and* prepended to `init:get_arguments/0`
   (`../native/init.rs::get_arguments`, in the oracle's order) — and they are not a boot determinant:
-  the real script runs to `{progress,started}` under a `RuntimeConfig::default()` runtime too
-  (`tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`).
-- **The kernel processes are ready when instruction 20 runs.** The three `{kernelProcess, …}` bursts
-  drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
+  the real script reaches the same directive-18 stop under a `RuntimeConfig::default()` runtime too
+  (`tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`, which drives the
+  script to report `init:script_id/0` and currently **fails** on that stop).
+- **The three `{kernelProcess, …}` directives (12–14) run and their servers survive.** Each burst
+  drives until its directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
   (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
-  `gen_server:enter_loop`.
+  `gen_server:enter_loop`. Those servers are the ones the directive-18 stop then consults.
   `heart` is not registered, legitimately: `heart:start/0` returns `ignore`.
 - **`logger` IS registered — a live `logger_server` named `logger`.** Instruction 13's
   `{kernelProcess,logger,{logger_server,start_link,[]}}` leaves a live `logger_server` registered as
-  `logger` after the boot, matching the oracle (a second `logger_server:start_link/0` reports
+  `logger` (directive 13 runs before the stop at 18, and the registered server outlives it), matching
+  the oracle (a second `logger_server:start_link/0` reports
   `{error,{already_started,Pid}}`).
   `logger_server:start_link/0` → `gen_server:start_link({local,logger}, …)` → `gen:start/6` →
   `proc_lib:start_link/5` spawns the child and parks the caller in `proc_lib:sync_start/2`; the child
@@ -166,17 +178,22 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   The `start_kernel_process` unlink (above) then keeps the registered server alive past the
   short-lived directive process.
   Pinned by `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` and, at the CLI, by
-  `../tests/boot.rs::the_cli_boot_registers_a_live_logger_process`.
-- **Instruction 20's `gen_server:call` suspends and resumes.** `apply_boot_call` runs `c:erlangrc/0`
-  through the engine's blocking-aware entry; the scheduler pass services the `file_server_2` mailbox
-  and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
-  resumes — so the drive does not take its `ran == 0` (nothing happened) fold.
+  `../tests/boot.rs::the_cli_boot_registers_a_live_logger_process` — both currently **fail**, because
+  each drives the whole script (which stops at directive 18) before checking `logger`.
+- **Directive 18's `gen_server:call` suspends and the drive finds nothing to run.** `apply_boot_call`
+  runs `application:start_boot/2` through the engine's blocking-aware entry; the call reaches
+  `application_controller:start_boot_application/2` and then
+  `gen_server:call(application_controller, {start_application,kernel,permanent}, infinity)`, whose
+  `handle_call` starts the application asynchronously (`{noreply, …}`) and owes its reply to a later
+  `handle_cast({application_started,…})` that never arrives. The scheduler pass then reports `0`
+  (`ran == 0`) and `apply_boot_call` returns the typed `beam_engine::blocked()` gap — the directive-18
+  stop.
 
 ### A `-boot` value's shape does not affect the outcome
 The boot is **not** sensitive to the byte length or the canonical form of the `-boot` value:
 `$P/bootstrap/bin/start`, `$P/bootstrap/./bin/start`, `$P/bootstrap//bin/start` and
-`$P/bootstrap/../bootstrap/bin/start` all carry the real script to completion (exit 0, empty
-stdout/stderr — 40/40 runs across the four forms).
+`$P/bootstrap/../bootstrap/bin/start` all carry the real script to the same **directive-18 stop**
+(exit 3, empty stdout).
 **What guarantees it is the runner's parked-root publication.** A suspended process's machine lives
 in `RunnerState.engines`, and a machine's registers are only a *copy* of the process's root set; the
 runner therefore publishes the parked machine's whole live root set into `Process::regs` — and its
@@ -193,14 +210,19 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **`beam_engine`/`beam_process` — a scheduled `compile:file/2` runs to completion and agrees with the oracle.** The incremental io-device read (`file:read/2`, `file:read_line/1`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`) completes from a **scheduled** process and agrees with the oracle (`../tests/scheduled_io_device.rs`, `../tests/io_scan.rs`), as does a `receive … after T` timeout reached through a nested run.
+1. **The kernel application's start does not complete — the boot stops at directive 18.** Directive 18 is `{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`; `application:start_boot/2` reaches `application_controller:start_boot_application/2` (`lib/kernel/src/application_controller.erl:271`), whose `application:load(kernel)` returns `{error,{already_loaded,kernel}}` (the AC's own `init/2` loaded kernel at `:531-558`), so it calls `gen_server:call(application_controller, {start_application,kernel,permanent}, infinity)`; `handle_call({start_application,…})` (`:697`) → `check_start_cond` → `application:get_env(kernel, permissions)` → `spawn_starter/3` (`:1443`) → `application_master:start_link/2` (a `proc_lib:start_link`, the observed `erlang:spawn_opt/4`).
+   The handler returns `{noreply, …}` and owes its reply to a later `handle_cast({application_started,…})` that never arrives: the run queue drains and the boot drive's scheduler pass reports **0** runnable processes, so the directive's `gen_server:call(…, infinity)` folds into the **uncatchable** `beam_engine::blocked()` (`../boot/drive.rs::apply_boot_call`, its `ran == 0` arm; the fold itself is the one described in `../context/pump.rs`) and `apply_boot_call` reports the stop at index 18.
+   In other words the kernel application's supervisor tree (`kernel_app:start/2` → `kernel_sup:start_link/0`) has not started/completed, and the runtime has no machinery to make it.
+   The stop is **not** a native-floor miss: an instrumented `try_native` recorded **177** dispatch entries for this directive and **zero** `code:*` calls (`code:where_is_file/1` is never called).
+   The tests that assert the former completion and currently **fail**: `bootscript.rs::tests::{the_real_start_boot_executes_every_directive_to_progress_started, the_real_start_boot_completes_through_execute_reporting, the_real_boot_registers_a_live_logger_process}`, `../tests/boot.rs::{the_real_start_boot_runs_to_completion, the_cli_runs_the_real_boot_script_to_completion, the_boot_chains_kernel_processes_survive_their_directive_processes, the_cli_boot_registers_a_live_logger_process}` and `../tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`.
+2. **`beam_engine`/`beam_process` — a scheduled `compile:file/2` runs to completion and agrees with the oracle.** The incremental io-device read (`file:read/2`, `file:read_line/1`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`) completes from a **scheduled** process and agrees with the oracle (`../tests/scheduled_io_device.rs`, `../tests/io_scan.rs`), as does a `receive … after T` timeout reached through a nested run.
    Both A.9 `selfhost/*` corpus cases — `selfhost/in_process_compile_file_no_spawn_deterministic` and `selfhost/scheduled_process_compile_file_deterministic` — **agree** with the oracle on both execution tiers. The corruption they once reported was a **signal-driven** collection of a woken monitor watcher (`beam_process`'s process-termination cascade, `crates/beam_process/src/ptab.rs` → `enqueue_down_signal` → `copy_reason_onto` → `grow_receiver_for_signal`), declined by the runner's park-window relocation exemption; the parked machine's live `Machine::pending_exception` reason remains a real GC root across that window (`../runner/run.rs::publish_parked_roots`, read back on resume by `RuntimeContext::resync_parked_roots`). The decline predicate is still owed to `ptab.rs`'s signal sites. [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey carries the detail.
-2. **`beam_rt` `../native/` — the io-device read path completes from library code on both routes.**
+3. **`beam_rt` `../native/` — the io-device read path completes from library code on both routes.**
    `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), and the service answers with the tag paired to the request, so `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` complete and agree with the oracle from the pumped `-eval` route (`../tests/io_scan.rs`) and from a **scheduled** `run` process (`../tests/scheduled_io_device.rs`), and `io:get_line/2` runs through the same `{get_line,…}` arm (the colocated `file_server/get_line/tests.rs`).
    The residual io-device divergence is a `{get_chars,…}` on a `{encoding,unicode}` **stream** counting BYTES where the oracle counts CHARACTERS, documented in `../native/file_server/CONTEXT.md`.
    Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode` (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s) and — for `{get_until,…}` only — a user-supplied continuation whose own code blocks in a `receive` (`../native/file_server/get_until.rs`, module header "A blocking continuation is a typed gap").
    The served device surface and the full gap list are itemised in `../native/CONTEXT.md`.
-3. **`beam_bifs`.** Whatever the started applications still need past the above.
+4. **`beam_bifs`.** Whatever the boot still needs to reach `{progress,started}`.
 
 ## The system code path resolution (`../codeserver.rs`)
 `CodeServer::add_system_paths` resolves the *system* ebin set through `codeserver.rs::resolve_system_ebins`:
@@ -265,10 +287,11 @@ normal installation pays **no** `erl` start-up (measured on this host: `run …s
   (pins `drive.rs`: a `{kernelProcess, …}` burst and a later `{apply, …}` blocked on it, resumed by a
   scheduler drive, its dictionary side effect read back through `runtime.eval`); 
   `a_malformed_boot_script_is_a_typed_error`; the full-script pins
-  `the_real_start_boot_completes_through_execute_reporting` (all 22 directives, ending at
-  `{progress,started}`) and `the_real_boot_registers_a_live_logger_process` (instruction 13 leaves a
-  live `logger` registered, and a second `logger_server:start_link/0` reports
-  `{error,{already_started,Pid}}`); the burst pins
+  `the_real_start_boot_completes_through_execute_reporting` (asserts all 22 directives ending at
+  `{progress,started}` — it **fails** on the directive-18 stop) and
+  `the_real_boot_registers_a_live_logger_process` (instruction 13 leaves a live `logger` registered, and
+  a second `logger_server:start_link/0` reports `{error,{already_started,Pid}}` — it **fails** because it
+  drives the whole script first); the burst pins
   `a_kernel_process_burst_waits_for_the_directive_to_return` (a fixture whose `serve/0` `spawn_link`s a
   server that registers the directive's name **first** and only then does its real setup, and which
   registers a *second* visible name only after the server acks — so a later `{apply, …}` answers `acked`
@@ -296,7 +319,9 @@ normal installation pays **no** `erl` start-up (measured on this host: `run …s
   logic is pinned indirectly by `bootscript.rs`'s synthetic-script tests
   (`a_boot_spawned_process_answers_a_blocked_apply`, `a_kernel_process_registers_its_own_directive_name`,
   `a_kernel_process_burst_waits_for_the_directive_to_return`, `registering_a_live_boot_name_is_badarg`)
-  and by `../tests/boot.rs` (`the_boot_chains_kernel_processes_survive_their_directive_processes`).
+  and by `../tests/boot.rs` (`the_boot_chains_kernel_processes_survive_their_directive_processes`,
+  which currently **fails** — its synthetic probe boot replays the real script's first 20 directives,
+  so it too stops at directive 18).
 - In-file `#[test]` counts: `bootscript.rs` **12** (lines 725–1855), `preloaded.rs` **3** (lines 75–143),
   `drive.rs` **0** — directory total **15**; the module root `../boot.rs` adds **9** (its own
   `#[cfg(test)] mod tests`).
@@ -304,23 +329,27 @@ normal installation pays **no** `erl` start-up (measured on this host: `run …s
   `boot_from_script_reporting` is the boot-stop-position entry point, and the in-crate boot-script suite
   exercises the `execute_reporting`/`BootStop` report API a genuine future stop would use.
 - `../tests/boot.rs` (integration, owned by this node): `start_boot()` builds the `-boot` value as a
-  canonical absolute path (`<repo>/bootstrap/bin/start`) from `CARGO_MANIFEST_DIR`'s ancestors and, with the CLI-equivalent configuration, asserts the real
-  script runs **all 22 directives** to `{progress,started}` — instruction 20 is the `{apply,{c,erlangrc,[]}}`
-  directive the native `file_server_2` service unblocks, and the `primLoad` batches really loaded; the
-  `-boot` CLI drive of a synthetic script; the CLI running the real `start.boot` to completion (exit 0,
-  empty stdout/stderr); a synthetic-probe boot (the real script's first 20 directives + a `probe:run/0`
+  canonical absolute path (`<repo>/bootstrap/bin/start`) from `CARGO_MANIFEST_DIR`'s ancestors and, with the CLI-equivalent configuration, drives the real
+  script to the **directive-18 stop** (`the_real_start_boot_runs_to_completion` asserts the former
+  all-22-directives run to `{progress,started}` and currently **fails**; the `primLoad` batches through
+  index 17 really loaded); the
+  `-boot` CLI drive of a synthetic script; the CLI running the real `start.boot`
+  (`the_cli_runs_the_real_boot_script_to_completion` asserts exit **0** and currently **fails** — the
+  route exits **3**); a synthetic-probe boot (the real script's first 20 directives + a `probe:run/0`
   `apply`, built with the oracle) proving the `application_controller` kernel process survives its
   short-lived directive process (`whereis` = a live pid); the CLI proving the real boot leaves a
-  live `logger` registered (`the_cli_boot_registers_a_live_logger_process`); and the preloaded-only
+  live `logger` registered (`the_cli_boot_registers_a_live_logger_process`, which currently **fails**
+  because it drives the whole script first); and the preloaded-only
   default.
 
-## Notes for Agents — the `file_server_2` link is closed
-The A.9 boot chain's last link is closed by a **runtime-native `file_server_2` service**
-(`../native/file_server.rs`), **not** by running the real `file_server`/`file_io_server` Erlang. The
+## Notes for Agents — the `file_server_2` service
+The runtime-native **`file_server_2` service** (`../native/file_server.rs`) is what the boot chain's
+final `{apply,{c,erlangrc,[]}}` directive (index 20) would need — **not** the real
+`file_server`/`file_io_server` Erlang — but the directive-18 stop means the boot never reaches it. The
 service is a `beam_process::Process` born `Runnable` and never enqueued (the `init`/`self_pid`
 precedent), so the runner never executes it and `ProcessEntry` needs no new variant;
 `Runtime::service_file_requests` drains its mailbox as an additive `scheduler_pass` step and delivers
-the replies, which is what lets `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete. The
+the replies, which is what would let `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete. The
 request/reply surface, the errno mapping, the io-device and the remaining gaps live in
 [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
 - **The native service is used instead of the real `file_server`.** The real Erlang
@@ -343,5 +372,5 @@ request/reply surface, the errno mapping, the io-device and the remaining gaps l
 - `../cli.rs` → the `Action::Boot` arm (`-boot FILE`) that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
-- `../native/file_server.rs` → the native `file_server_2` service the script's final `{apply,{c,erlangrc,[]}}` reaches (not owned here; see `../native/CONTEXT.md`)
+- `../native/file_server.rs` → the native `file_server_2` service the script's final `{apply,{c,erlangrc,[]}}` would reach (the boot stops at directive 18 before it; not owned here; see `../native/CONTEXT.md`)
 - `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the boot's `{apply, …}` chains are entered through; read-only from this node)

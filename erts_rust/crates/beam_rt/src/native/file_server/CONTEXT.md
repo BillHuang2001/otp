@@ -1,6 +1,6 @@
 # `beam_rt/src/native/file_server/` — the native `file_server_2` service (contract A.9)
 ## Intent
-The runtime-native **file service** that completes the real boot chain. `lib/kernel/src/file.erl`
+The runtime-native **file service** that would complete the real boot chain. `lib/kernel/src/file.erl`
 routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`,
 and the file service is first *reached* at the `{apply,{c,erlangrc,[]}}` directive of
 `bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
