@@ -85,6 +85,12 @@ impl ExecutionContext for RuntimeContext<'_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "ENTER [{:?}] {module}:{function}/{arity}",
+                self.mailbox_pid
+            ));
+        }
         let result = match self.call_bif_routed(module, function, arity, args) {
             Ok(result) => result,
             Err(error) => {
@@ -97,7 +103,8 @@ impl ExecutionContext for RuntimeContext<'_> {
                         })
                         .collect();
                     crate::debug_trace::trace(format_args!(
-                        "call_bif {module}:{function}/{arity} {rendered:?} -> {error:?}"
+                        "call_bif [{:?}] {module}:{function}/{arity} {rendered:?} -> {error:?}",
+                        self.mailbox_pid
                     ));
                 }
                 return Err(error);
@@ -182,6 +189,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         function: &str,
         arity: u32,
     ) -> Result<Option<(Arc<Module>, Label)>> {
+        let trace_pid = self.mailbox_pid;
         // The floor's namespaces: `try_native` serves them for modules that are *also*
         // loadable `.beam`s (`os`, `code`, `init`, `application`, `prim_file`,
         // `erts_internal`, `erlang`, `io`), so entering the module body would shadow the host
@@ -199,7 +207,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         if crate::native::floor_shadows(module, function, arity) {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: floor_shadows"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: floor_shadows"
                 ));
             }
             return Ok(None);
@@ -231,7 +239,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         if self.runtime.nifs.borrow().is_loaded(module) {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: nif-loaded"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: nif-loaded"
                 ));
             }
             return Ok(None);
@@ -242,7 +250,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         if self.runtime.registry.contains(module, function, arity) {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: registry key"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: registry key"
                 ));
             }
             return Ok(None);
@@ -299,7 +307,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         let Some(function_atom) = callee.atom_table.lookup(function) else {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: unknown function atom"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: unknown function atom"
                 ));
             }
             return Ok(None);
@@ -307,7 +315,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         if callee_observes_its_call_site(&callee, function_atom, arity) {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: observes its call site"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: observes its call site"
                 ));
             }
             return Ok(None);
@@ -319,7 +327,7 @@ impl ExecutionContext for RuntimeContext<'_> {
             None => {
                 if crate::debug_trace::enabled() {
                     crate::debug_trace::trace(format_args!(
-                        "seam decline {module}:{function}/{arity}: not exported"
+                        "seam decline [{trace_pid:?}] {module}:{function}/{arity}: not exported"
                     ));
                 }
                 Ok(None)
