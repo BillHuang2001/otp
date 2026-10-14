@@ -130,6 +130,28 @@ fn allocate_registers_with_labels(
             .push((x, CACHE_REGISTERS[allocation.slots.len()]));
     }
 
+    // The block's **write set**: the cached x-registers some inline lowering of the
+    // block may write (its destination operands). This is exactly the set the exit /
+    // helper [`spill`](super::regs::spill) stores — a cached register outside it holds
+    // exactly its `machine.x` value at every program point (see [`Allocation`]), so
+    // skipping its store is a no-op. The set is collected over the whole block (a
+    // register diverged anywhere is spilled at every later spill site) and restricted
+    // to the cached slots, so `written ⊆ slots`.
+    let mut written_set: Vec<u32> = Vec::new();
+    for instr in &code[start..end] {
+        for x in cacheable_writes(module, labels, instr) {
+            if x < MAX_REGISTER && !written_set.contains(&x) {
+                written_set.push(x);
+            }
+        }
+    }
+    allocation.written = allocation
+        .slots
+        .iter()
+        .map(|(x, _)| *x)
+        .filter(|x| written_set.contains(x))
+        .collect();
+
     // The last pc in the block whose native lowering reads or writes a `Y` slot. The
     // engine publishes the frame's Y window (see [`super::super::runtime`]) only in the
     // prologue of a block that touches Y, and refreshes it after an in-block deopt whose
@@ -142,6 +164,12 @@ fn allocate_registers_with_labels(
         .filter(|(_, instr)| uses_y(module, instr))
         .map(|(offset, _)| (start + offset) as u32)
         .max();
+
+    // The **fill sets**: for every instruction of the block, the cached x-registers a
+    // helper call at that pc must reload out of `machine.x` (the block-local liveness of
+    // the continuation, unioned with the write set above). See `super::liveness`.
+    allocation.block_start = start as u32;
+    allocation.fill_sets = super::liveness::fill_sets(module, labels, code, start, end, &allocation);
     allocation
 }
 
@@ -160,7 +188,7 @@ fn allocate_registers_with_labels(
 /// `select_tuple_arity` only when [`select_tuple_arity_plan`] claims it (its source
 /// tuple counts). Every other
 /// instruction contributes nothing because it stays on the helper.
-fn cacheable_touches(
+pub(super) fn cacheable_touches(
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -281,4 +309,96 @@ fn cacheable_touches(
         _ => {}
     }
     touches
+}
+
+/// The x-registers one instruction's **native** lowering **writes** — the block's
+/// write set ([`Allocation::written`]), a statically-derived superset of the cached
+/// registers an inline lowering of the block may diverge from `machine.x`.
+///
+/// It mirrors [`cacheable_touches`]'s per-instruction shape tests exactly (so the two
+/// agree on which instructions the block lowers), but keeps only each shape's
+/// **destination** registers: a `move` writes its (x-register) destination, a `swap`
+/// writes **both** operands, a list read writes its destinations, a tuple read writes
+/// its destination, an arith `gc_bif` writes its x-register destination, and a
+/// comparison BIF writes its destination. A `set_tuple_element` (a destructive heap
+/// store), a `select_tuple_arity`, a `test` and a `select_val` write no x-register at
+/// all, and every instruction the block does not lower contributes nothing.
+///
+/// The set is a **superset**: a register claimed here but never actually written (a
+/// shape whose run-time guard rejects and deopts) only costs a redundant spill store,
+/// never a missing one. A register the block writes but this set omitted would let a
+/// stale cache register survive an exit — the one failure mode the derivation may not
+/// have, which is why it mirrors the lowering shapes rather than the operands alone.
+///
+/// Besides the spill set, the write set is a **kill** in the block's register liveness
+/// (`super::liveness::fill_sets`): an instruction that writes a register makes everything
+/// before it stop needing that register's cached value. That is sound because a cached
+/// register is written through its **machine register** whenever the shape writes it
+/// (`super::r#move`'s destination arms), never through `machine.x` — a shape that writes a
+/// register it does not cache addresses `machine.x`, and a non-cached register is never in
+/// a fill set.
+pub(super) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr) -> Vec<u32> {
+    match instr {
+        Instr::Move { src, dst } => move_shape(src, dst)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        // `swap A B` writes both operands.
+        Instr::Swap { a, b } => {
+            let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {
+                return Vec::new();
+            };
+            if a_x >= MAX_REGISTER || b_x >= MAX_REGISTER {
+                return Vec::new();
+            }
+            vec![a_x, b_x]
+        }
+        Instr::GetList { source, head, tail } => get_list_shape(source, head, tail)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        Instr::GetHd { source, head } => get_hd_shape(source, head)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        Instr::GetTl { source, tail } => get_tl_shape(source, tail)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        Instr::GetTupleElement {
+            source,
+            element,
+            dst,
+        } => get_tuple_element_shape(source, *element, dst)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        // A tuple write stores into the heap, not into an x-register (its shape's
+        // write set is empty).
+        Instr::SetTupleElement {
+            element,
+            tuple,
+            offset,
+        } => set_tuple_element_shape(element, tuple, *offset)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        // An arity switch's only runtime operand is a read (its plan's write set is
+        // empty).
+        Instr::SelectTupleArity {
+            tuple,
+            fail,
+            destinations,
+        } => select_tuple_arity_plan(labels, tuple, *fail, destinations)
+            .map(|plan| plan.writes())
+            .unwrap_or_default(),
+        Instr::GcBif { .. } => {
+            if let Some(fast) = fast_arith(module, instr) {
+                fast.writes()
+            } else if let Some(plan) = comparison_shape(module, instr) {
+                plan.writes()
+            } else {
+                Vec::new()
+            }
+        }
+        Instr::Bif { .. } => comparison_shape(module, instr)
+            .map(|plan| plan.writes())
+            .unwrap_or_default(),
+        // `Test`/`SelectVal` branch but write no x-register; everything else deopts.
+        _ => Vec::new(),
+    }
 }

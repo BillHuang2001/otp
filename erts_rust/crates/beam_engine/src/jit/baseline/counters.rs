@@ -44,6 +44,30 @@
 //! * **`call_ext*` resolution outcomes** — [`record_ext_resolved`] (native transfer)
 //!   / [`record_ext_declined`] (the host's `Ok(None)`, the once-only seam) /
 //!   [`record_ext_fallback`] (the whole instruction re-run through `jit_step_one`).
+//! * **Register-cache traffic** — [`record_spill`] (every store of a cached
+//!   x-register back into `machine.x`) and [`record_fill`] (every load of a cached
+//!   x-register out of `machine.x`), each classified by its site, plus
+//!   [`record_block`] once per emitted block (its IR size, cache size, write-set size
+//!   and native byte length).
+//!
+//! # One run, both register-cache models
+//!
+//! Both directions of the cache are now **partial** — `spill` stores the block's
+//! **written** set (`Allocation::written`, a subset of the cache) and `fill` reloads
+//! the registers the continuation can still observe (`Allocation::fill_slots`, its
+//! block-local liveness unioned with the write set) — so a single measured run has to
+//! yield *both* the count that model produces **and** the count the previous
+//! full-cache model would have produced. Each `record_*` sees only its own partial
+//! count (that is all `spill`/`fill` know per call), so it records the **new** count and
+//! queues the site; [`record_block`] — which is handed the whole `Allocation` — then
+//! attributes `cache_size` to each of the block's queued sites. From one run:
+//!
+//! * **new** spill stores `= Σ_sites written.len()` = [`Counters::spill_stores`];
+//! * **old** (full-cache) spill stores `= Σ_sites slots.len()` =
+//!   [`Counters::spill_stores_full`];
+//! * **new** fill loads `= Σ_sites fill_slots(pc).len()` = [`Counters::fill_registers`];
+//! * **old** (full-cache) fill loads `= Σ_sites slots.len()` =
+//!   [`Counters::fill_registers_full`].
 //!
 //! # Two-phase use (timing vs counting)
 //!
@@ -59,11 +83,21 @@ use std::collections::BTreeMap;
 
 use beam_loader::{Instr, Module};
 
+use super::emit::{Allocation, FillSite, SpillSite};
+
 thread_local! {
     /// Whether this thread is currently recording (default: off — see the module docs).
     static ENABLED: Cell<bool> = const { Cell::new(false) };
     /// This thread's counter block.
     static COUNTERS: RefCell<Counters> = RefCell::new(Counters::default());
+    /// The spill sites emitted since the last [`record_block`], so the block that
+    /// emitted them can attribute the **old** (full-cache) store count it alone can
+    /// see (it owns the cache size). Drained by [`record_block`].
+    static PENDING_SPILLS: RefCell<Vec<SpillSite>> = const { RefCell::new(Vec::new()) };
+    /// The fill sites emitted since the last [`record_block`] — the same trick as
+    /// [`PENDING_SPILLS`], for the **full-cache** reload count the previous `fill` model
+    /// would have emitted. Drained by [`record_block`].
+    static PENDING_FILLS: RefCell<Vec<FillSite>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A snapshot of the baseline tier's structural counters.
@@ -103,6 +137,41 @@ pub(crate) struct Counters {
     /// The driver round-trips by the word class they returned (`HALT`/`ERROR`/
     /// `ENTER`/`WAIT`/`GOTO`).
     pub(crate) round_trips_by_word: BTreeMap<String, u64>,
+    /// `emit_block` calls (IR blocks **and** continuation sub-blocks).
+    pub(crate) blocks: u64,
+    /// Total IR instructions the emitted blocks cover (`end - start`, summed).
+    pub(crate) block_ir_instructions: u64,
+    /// Total native bytes the emitted blocks produced (prologue through `ret`).
+    pub(crate) block_emitted_bytes: u64,
+    /// Σ over blocks of the cache size (`Allocation::slots.len()`).
+    pub(crate) block_cache_slots: u64,
+    /// Σ over blocks of the write-set size (`Allocation::written.len()`).
+    pub(crate) block_written_slots: u64,
+    /// Blocks by write-set size: how many blocks spill `0`, `1`, `2`, … registers on an
+    /// exit under the written-set model.
+    pub(crate) blocks_by_written_slots: BTreeMap<u64, u64>,
+    /// Blocks by cache size (the full-cache model's per-exit store count).
+    pub(crate) blocks_by_cache_slots: BTreeMap<u64, u64>,
+    /// Spill sites by kind ([`SpillSite`]) — the number of `spill` calls.
+    pub(crate) spill_calls_by_site: BTreeMap<SpillSite, u64>,
+    /// Spill **stores** by kind under the written-set model: Σ `written.len()`.
+    pub(crate) spill_stores_by_site: BTreeMap<SpillSite, u64>,
+    /// Spill **stores** by kind under the previous full-cache model: Σ `slots.len()`.
+    pub(crate) spill_stores_by_site_full: BTreeMap<SpillSite, u64>,
+    /// Total spill stores under the written-set model (Σ `written.len()`).
+    pub(crate) spill_stores: u64,
+    /// Total spill stores under the previous full-cache model (Σ `slots.len()`).
+    pub(crate) spill_stores_full: u64,
+    /// Fill sites by kind ([`FillSite`]) — the number of `fill` calls.
+    pub(crate) fill_calls_by_site: BTreeMap<FillSite, u64>,
+    /// Fill register loads by kind under the liveness model: Σ `fill_slots(pc).len()`.
+    pub(crate) fill_registers_by_site: BTreeMap<FillSite, u64>,
+    /// Fill register loads by kind under the previous full-cache model: Σ `slots.len()`.
+    pub(crate) fill_registers_by_site_full: BTreeMap<FillSite, u64>,
+    /// Total fill register loads under the liveness model (Σ `fill_slots(pc).len()`).
+    pub(crate) fill_registers: u64,
+    /// Total fill register loads under the previous full-cache model (Σ `slots.len()`).
+    pub(crate) fill_registers_full: u64,
 }
 
 /// The thread-local counter block, or `None` when this thread is not recording.
@@ -121,6 +190,8 @@ pub(crate) fn set_enabled(on: bool) {
 /// Zero this thread's counters (recording state is left as it is).
 pub(crate) fn reset() {
     COUNTERS.with(|c| *c.borrow_mut() = Counters::default());
+    PENDING_SPILLS.with(|p| p.borrow_mut().clear());
+    PENDING_FILLS.with(|p| p.borrow_mut().clear());
 }
 
 /// This thread's counters, cloned.
@@ -236,6 +307,82 @@ pub(crate) fn record_refresh_y() {
     with(|c| c.refresh_y += 1);
 }
 
+/// One `spill` call: `written_len` cached x-registers are stored back into
+/// `machine.x`, at `site`.
+///
+/// `spill` stores only the block's **written** set, so this is the **new** store
+/// count; the **old** (full-cache) count is `slots.len()`, which only the enclosing
+/// block knows — the site is queued for [`record_block`] to attribute it.
+pub(crate) fn record_spill(site: SpillSite, written_len: u64) {
+    if with(|c| {
+        *c.spill_calls_by_site.entry(site).or_insert(0) += 1;
+        *c.spill_stores_by_site.entry(site).or_insert(0) += written_len;
+        c.spill_stores += written_len;
+    })
+    .is_none()
+    {
+        return;
+    }
+    PENDING_SPILLS.with(|p| p.borrow_mut().push(site));
+}
+
+/// One `fill` call: `n` cached x-registers are loaded out of `machine.x`, at `site`.
+///
+/// `fill` is **partial** ([`super::emit::regs::fill`]): it reloads only the registers a
+/// helper at that `pc` can still be observed through (the continuation's block-local
+/// liveness unioned with the block's write set), so `n` is the **new** load count. The
+/// **old** (full-cache) count is `slots.len()`, which only the enclosing block knows — so
+/// the site is queued for [`record_block`] to attribute it, exactly as
+/// [`record_spill`] does.
+pub(crate) fn record_fill(site: FillSite, n: u64) {
+    if with(|c| {
+        *c.fill_calls_by_site.entry(site).or_insert(0) += 1;
+        *c.fill_registers_by_site.entry(site).or_insert(0) += n;
+        c.fill_registers += n;
+    })
+    .is_none()
+    {
+        return;
+    }
+    PENDING_FILLS.with(|p| p.borrow_mut().push(site));
+}
+
+/// One emitted block: its IR size (`ir_len`), the `allocation` it was compiled with,
+/// and the native `bytes` it produced.
+///
+/// Besides the per-block sums/histograms, this **drains** the block's queued spill
+/// sites ([`record_spill`]) and adds the block's cache size to each, which is exactly
+/// the count the previous full-cache `spill` model would have stored there — so one
+/// recorded run yields both the old and the new spill-store totals (see the module
+/// docs).
+pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
+    if !ENABLED.with(Cell::get) {
+        return;
+    }
+    let cache_slots = allocation.slots.len() as u64;
+    let written_slots = allocation.written.len() as u64;
+    let pending = PENDING_SPILLS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    let pending_fills = PENDING_FILLS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    COUNTERS.with(|c| {
+        let c = &mut *c.borrow_mut();
+        c.blocks += 1;
+        c.block_ir_instructions += ir_len;
+        c.block_emitted_bytes += bytes;
+        c.block_cache_slots += cache_slots;
+        c.block_written_slots += written_slots;
+        *c.blocks_by_cache_slots.entry(cache_slots).or_insert(0) += 1;
+        *c.blocks_by_written_slots.entry(written_slots).or_insert(0) += 1;
+        for site in pending {
+            *c.spill_stores_by_site_full.entry(site).or_insert(0) += cache_slots;
+            c.spill_stores_full += cache_slots;
+        }
+        for site in pending_fills {
+            *c.fill_registers_by_site_full.entry(site).or_insert(0) += cache_slots;
+            c.fill_registers_full += cache_slots;
+        }
+    });
+}
+
 /// The word class of a block-ABI word (`HALT`/`ERROR`/`ENTER`/`WAIT`/`GOTO`).
 fn word_class(word: i64) -> &'static str {
     if word == super::HALT {
@@ -309,6 +456,76 @@ mod tests {
         let snap = snapshot();
         assert_eq!(snap.set_position, 1);
         assert_eq!(snap.step_one, 1);
+
+        set_enabled(false);
+        reset();
+        assert_eq!(snapshot(), Counters::default());
+    }
+
+    /// One recorded run yields **both** spill models: the written-set stores (`spill`)
+    /// and the full-cache stores the previous model would have emitted (attributed by
+    /// the enclosing `record_block`, which owns the cache size).
+    #[test]
+    fn one_run_yields_both_the_written_and_the_full_cache_spill_counts() {
+        use crate::jit::emitter::Reg;
+
+        set_enabled(true);
+        reset();
+
+        // A block caching 4 x-registers but writing only 2 of them.
+        let allocation = Allocation {
+            slots: vec![(0, Reg::R12), (1, Reg::R13), (2, Reg::R14), (3, Reg::R15)],
+            written: vec![0, 3],
+            y_last: None,
+            ..Default::default()
+        };
+        // Three fill sites in the block: the prologue's whole-cache load (4) and two
+        // partial post-helper refills (1 and 0 registers — the liveness model).
+        record_fill(FillSite::Prologue, allocation.slots.len() as u64);
+        record_fill(FillSite::Helper, 1);
+        record_fill(FillSite::Helper, 0);
+        record_spill(SpillSite::Helper, allocation.written.len() as u64);
+        record_spill(SpillSite::Exit, allocation.written.len() as u64);
+        record_block(6, &allocation, 128);
+
+        let snap = snapshot();
+        // New model: 2 + 2 written stores.
+        assert_eq!(snap.spill_stores, 4, "new: Σ written.len() over spill sites");
+        assert_eq!(snap.spill_calls_by_site.get(&SpillSite::Helper), Some(&1));
+        assert_eq!(snap.spill_stores_by_site.get(&SpillSite::Helper), Some(&2));
+        assert_eq!(snap.spill_stores_by_site.get(&SpillSite::Exit), Some(&2));
+        // Old model: 2 spill sites × a 4-register cache = 8 stores.
+        assert_eq!(
+            snap.spill_stores_full, 8,
+            "old: Σ slots.len() over spill sites"
+        );
+        assert_eq!(snap.spill_stores_by_site_full.get(&SpillSite::Helper), Some(&4));
+        assert_eq!(snap.spill_stores_by_site_full.get(&SpillSite::Exit), Some(&4));
+        // New (partial) fill model: 4 + 1 + 0 loads.
+        assert_eq!(snap.fill_registers, 5, "new: Σ fill_slots(pc).len()");
+        assert_eq!(snap.fill_calls_by_site.get(&FillSite::Prologue), Some(&1));
+        assert_eq!(snap.fill_calls_by_site.get(&FillSite::Helper), Some(&2));
+        // Old (full-cache) fill model: 3 fill sites × a 4-register cache = 12 loads.
+        assert_eq!(
+            snap.fill_registers_full, 12,
+            "old: Σ slots.len() over fill sites"
+        );
+        assert_eq!(
+            snap.fill_registers_by_site_full.get(&FillSite::Prologue),
+            Some(&4)
+        );
+        assert_eq!(
+            snap.fill_registers_by_site_full.get(&FillSite::Helper),
+            Some(&8)
+        );
+        // Per-block view.
+        assert_eq!(snap.blocks, 1);
+        assert_eq!(snap.block_ir_instructions, 6);
+        assert_eq!(snap.block_emitted_bytes, 128);
+        assert_eq!(snap.block_cache_slots, 4);
+        assert_eq!(snap.block_written_slots, 2);
+        assert_eq!(snap.blocks_by_cache_slots.get(&4), Some(&1));
+        assert_eq!(snap.blocks_by_written_slots.get(&2), Some(&1));
 
         set_enabled(false);
         reset();
