@@ -4604,3 +4604,52 @@ fn the_two_process_copy_bound_shape_is_measured_on_both_tiers() {
     println!("loadavg (end): {}", probe_loadavg());
 }
 
+/// **The entry-lookup pin**: the baseline tier's per-slice artifact lookup must not
+/// re-hash the module's decoded IR.
+///
+/// `CodeCache::compiled_handle` takes a bare `&Module` on the tier-entry path
+/// (`run_baseline_cached{,_outcome,_label_outcome,_resume_outcome}`), and its
+/// address-keyed resolution memo can only be filled from a shared `Arc<Module>`
+/// (the `Weak` liveness proof a pointer key needs). So a host that holds the
+/// module as an `Arc` and warms the memo once — the way the cross-module callee
+/// path already does — makes every later slice lookup an O(1) probe; a host that
+/// does not pays one full `module_fingerprint` re-hash **per slice**.
+///
+/// This test measures the re-hash count on the two-process copy-bound shape and
+/// asserts the *warmed* one is zero, which is what makes the tier's own per-slice
+/// overhead visible instead of being dominated by the IR hash. It names the tier
+/// explicitly (`Tier::BaselineJit`).
+#[test]
+fn the_entry_lookup_does_not_rehash_the_module_ir_once_the_memo_is_warmed() {
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+    let bench = std::sync::Arc::new(bench);
+    let worker = std::sync::Arc::new(worker);
+
+    // Cold: the tier-entry lookup takes the content-hash path on every slice.
+    let before = crate::jit::cache::fingerprint_calls();
+    let (value, _, _) = drive_probe(&bench, bench_atom, &worker, worker_atom, 16, Tier::BaselineJit)
+        .expect("the cold probe completes");
+    let cold = crate::jit::cache::fingerprint_calls() - before;
+    assert_eq!(value, make_small(16));
+    assert!(
+        cold >= 32,
+        "the unwarmed tier-entry path is expected to re-hash the IR per slice, saw {cold}"
+    );
+
+    // Warm: an `Arc`-backed warm of the same two addresses (the `Arc` payload IS the
+    // `Module`, so the driver's later `&Module` lookups land on the same memo key).
+    crate::jit::cache::cached_module_blocks(&bench).expect("stage bench");
+    crate::jit::cache::cached_module_blocks(&worker).expect("stage worker");
+
+    let before = crate::jit::cache::fingerprint_calls();
+    let (value, _, leftovers) =
+        drive_probe(&bench, bench_atom, &worker, worker_atom, 64, Tier::BaselineJit)
+            .expect("the warmed probe completes");
+    let warm = crate::jit::cache::fingerprint_calls() - before;
+    assert_eq!(value, make_small(64));
+    assert_eq!(leftovers, (0, 0));
+    assert_eq!(
+        warm, 0,
+        "a warmed entry module must be resolved without re-hashing its IR"
+    );
+}
