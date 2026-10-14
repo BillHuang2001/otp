@@ -314,7 +314,10 @@ fn same_module_receives_agree_with_the_oracle() {
         let spec = format!("{MODULE}:{function}/0");
         let ours = run_bounded(
             Path::new(env!("CARGO_BIN_EXE_beam_rt")),
-            &["-pa", dir, "run", beam, &spec],
+            // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
+            // invocation (exactly as the oracle's `erl` does), so suppress it to keep stdout
+            // byte-identical to `erl -noshell …`'s.
+            &["-noshell", "-pa", dir, "run", beam, &spec],
         );
         assert_eq!(
             ours.code, 0,
@@ -368,7 +371,10 @@ fn cross_module_receives_agree_with_the_oracle() {
         let spec = format!("{MODULE}:{function}/0");
         let ours = run_bounded(
             Path::new(env!("CARGO_BIN_EXE_beam_rt")),
-            &["-pa", dir, "run", beam, &spec],
+            // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
+            // invocation (exactly as the oracle's `erl` does), so suppress it to keep stdout
+            // byte-identical to `erl -noshell …`'s.
+            &["-noshell", "-pa", dir, "run", beam, &spec],
         );
         eprintln!("{spec} -> exit {} out={:?} err={:?}", ours.code, ours.out, ours.err);
         assert_eq!(

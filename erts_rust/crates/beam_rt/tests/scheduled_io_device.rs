@@ -237,7 +237,13 @@ fn beam_rt_run(beam: &Path, function: &str, path: &Path) -> Run {
     let spec = format!("siodev:{function}/1");
     let beam = beam.to_str().expect("an ASCII fixture path");
     let path = literal(path);
-    run(Path::new(BINARY), &["run", beam, &spec, &path])
+    run(
+        Path::new(BINARY),
+        // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
+        // invocation (the oracle's `erl` does the same), so suppress it to keep stdout
+        // byte-identical to the oracle probe's.
+        &["-noshell", "run", beam, &spec, &path],
+    )
 }
 
 /// The oracle's answer for `siodev:<function>(<path>)`, rendered with `~w` so the line
