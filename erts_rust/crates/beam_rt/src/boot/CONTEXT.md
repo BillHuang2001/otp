@@ -111,82 +111,77 @@ registered but the directive has not resumed). A directive that has **already** 
 
 ## Where the real `start.boot` gets now
 Executing the real script (`bootstrap/bin/start.boot`, 22 instructions) with the CLI-equivalent
-configuration **executes directives 0–18 and stops at 0-based directive index 19 of 22**,
-`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`; the final
-`{progress,started}` (index 21) is **not** reached, and the CLI `-boot` route exits **1**.
+configuration **executes directives 0–19** and stops inside **0-based directive index 20 of 22**,
+`{apply,{c,erlangrc,[]}}`; the final `{progress,started}` (index 21) is **not** reached, and the CLI
+`-boot` route exits **1**.
 The tail's 0-based indices: **12** `{kernelProcess,heart,{heart,start,[]}}`,
 **13** `{kernelProcess,logger,{logger_server,start_link,[]}}`, **14**
 `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`, **15**
 `{progress,init_kernel_started}`, **16** `{apply,{application,load,[{application,stdlib,Props}]}}`,
 **17** `{progress,applications_loaded}`, **18**
-`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}` (its `apply` **returns `Ok`**,
-but the kernel application's start fails during that directive's scheduler drive on its
-`global_name_server` child, so the app never stays up and
-`=CRASH REPORT====`/`=SUPERVISOR REPORT====`/`=INFO REPORT====` blocks are logged to stdout), **19**
-`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}` (the **stop**),
-**20** `{apply,{c,erlangrc,[]}}`, **21** `{progress,started}`.
-Directives 0–18 run and the three `{kernelProcess, …}` startups (12–14) succeed.
+`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, **19**
+`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}` (this directive's `apply`
+**returns `Ok`**), **20** `{apply,{c,erlangrc,[]}}` (the **stop**), **21** `{progress,started}`.
+Directives 0–19 run and the three `{kernelProcess, …}` startups (12–14) succeed.
 The stop has one cause, out of node.
-**The `{monitor_nodes, …}` tuple flag is refused by `beam_bifs` (`erts_rust/crates/beam_bifs` +
-`erts_rust/crates/beam_rt`).** `global:init/1` runs
-`ok = net_kernel:monitor_nodes(true, #{connection_id => true})` (`lib/kernel/src/global.erl:800`);
-`net_kernel:monitor_nodes/2` calls `process_flag({monitor_nodes, MapOpts}, Flag)`
-(`lib/kernel/src/net_kernel.erl:673`) — an undocumented **tuple** first argument the real C handles at
-`erts/emulator/beam/bif.c:2212-2227` — but `beam_bifs`'s `process_flag_2`
-(`crates/beam_bifs/src/proc_reg.rs:399`) rejects any non-atom first argument with `badarg` **before**
-its `ProcessHook` seam is reached (whose `process_flag` takes `flag: Atom`,
-`crates/beam_bifs/src/context.rs:775`). `monitor_nodes/2` catches the `badarg`, so
-`mk_monitor_nodes_error/2` returns `{error,internal_error}` and the `ok =` match raises
-`{badmatch,{error,internal_error}}` in `global:init/1` (`global.erl:800`).
-`global_name_server` is a **permanent** child of `kernel_sup`, so `kernel_sup` reports `start_error`,
-the `permanent` kernel application tears itself down, and directive 19's `application:load1/2` call then
-reaches no `application_controller`, raising
-`{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`.
-Closing it needs a `beam_bifs` change (recognize the `{monitor_nodes, MapOpts}` tuple flag and the bare
-`monitor_nodes` atom, and extend the `ProcessHook` seam to carry the options) plus a `beam_rt`
-implementation of `erts_monitor_nodes`.
-**Raw figures.** **stdout 84 lines / 3352 bytes** — the first `=CRASH REPORT====` block's `initial call`
-is `global:init/1`, raising `error: no match of right hand side value {error,internal_error}` at
-`global.erl:800` (through `gen_server:init_it/2`, `gen_server.erl:2276`); a second `=CRASH REPORT====`
-block covers `application_master:init/3`'s shutdown; the **1** `=SUPERVISOR REPORT====` block is
-`supervisor: {local,kernel_sup}`, `errorContext: start_error`, offender
-`[{id,global_name_server}, {mfargs,{global,start_link,[]}}, {restart_type,permanent}, …]`; and the **1**
-`=INFO REPORT====` block reports
-`application: kernel / exited: {{shutdown,{failed_to_start_child,global_name_server,{{badmatch,{error,internal_error}},…}}},{kernel,start,[normal,[]]}} / type: permanent`.
-The stop is **tier-independent** (`BEAM_RT_TIER=interpreter` reproduces the same 84 stdout lines).
-The full chain is in *Remaining gaps* item 1 below, together with the tests that assert the full
-22-directive completion and currently fail.
-The `BEAM_RT_BOOT_TRACE` trace (`src/debug_trace.rs`) confirms the ordering: directive 18's
-`apply application:start_boot /2` returns `Ok(Wait …)`, the drive runs the kernel application's start,
-the `global_name_server` child raises `{badmatch,{error,internal_error}}`, and directive 19's `apply`
-of the same MFA returns `Err` with the `{noproc, …}` reason.
-- **Instructions 20–21 are not reached, but both CAN run.** `c:erlangrc/0`'s file consult is
-  `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
+**`erlang:hibernate/0` is an undefined function the crashed `gen_server` calls
+(`erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine`).** `gen_server:loop_hibernate/4`
+(`lib/stdlib/src/gen_server.erl:2338`) calls `erlang:hibernate/0`, and `kernel_safe_sup`
+(`supervisor:kernel/1`) and `logger_sup` (`supervisor:logger_sup/1`) both crash on it — each
+`=CRASH REPORT====` reads `exception error: undefined function erlang:hibernate/0 / in function
+gen_server:loop_hibernate/4 (gen_server.erl:2338)`. `kernel_sup` then reports `child_terminated` and
+`reached_max_restart_intensity` for `kernel_safe_sup`, which **terminates** — so its `file_server_2`
+child (`lib/kernel/src/kernel.erl:117`) never registers the name, the `permanent` kernel application
+exits `shutdown`, and directive 20's `c:erlangrc/0` → `file:path_open_first` →
+`gen_server:call(file_server_2, {open,…})` raises
+`{noproc,{gen_server,call,[file_server_2,{open,<the `$HOME` erlangrc path>,[read]},infinity]}}`.
+`erlang:hibernate/0` is an OTP-28+ **instruction**, not a `bif.tab` BIF: the C rewrites
+`call_ext erlang:hibernate/0` to `i_hibernate` (`erts/emulator/beam/emu/ops.tab:896-898`, own opcode
+`ops.tab:975`), and neither `beam_loader` (no such transform, no `Instr`) nor `beam_engine` (no arm)
+models either, so the `call_ext` reaches dispatch and answers bare `undef`. Closing it is a
+`beam_loader`/`beam_engine` change — **outside this crate's file scope**.
+**`erts_internal:scheduler_wall_time/1` IS served** (`../context/runtime_hooks.rs`): its caller
+`kernel_sup`'s `kernel_refc` child calls `resource(scheduler_wall_time, Enable)`
+(`lib/kernel/src/kernel_refc.erl:141-142`), and the `RuntimeHooks` bridge answers the previous state
+(sampling itself is not implemented, but the exchange is faithful), so `kernel_refc` no longer
+`start_error`s and the boot runs past directive 18.
+**Raw figures.** **stdout 108 lines / 3891 bytes** — **2** `=CRASH REPORT====` blocks
+(`kernel_safe_sup` at `<0.32.0>`, `logger_sup` at `<0.27.0>`, both on `erlang:hibernate/0`), **3**
+`=SUPERVISOR REPORT====` blocks (`kernel_sup` `child_terminated` then `reached_max_restart_intensity`
+for `kernel_safe_sup`, then `shutdown_error` for `logger_sup`) and **1** `=INFO REPORT====` block
+(`application: kernel / exited: shutdown / type: permanent`); **stderr** is exactly one line / 204
+bytes — the terminal `{noproc, … file_server_2 …}` above — a *genuine* runtime error (exit 1), not a
+capability gap. (`tests/boot.rs`'s `the_cli_runs_the_real_boot_script_to_completion` asserts
+`stdout == ""` **and** `stderr == ""`; both hold only once the kernel crash stops being logged.) The
+in-crate executor (`boot_from_script` → `execute`) hits the same stop and reports it through the
+`BootStop`/`execute_reporting` report API (`index = Some(20)`, the script's `total = 22`, the
+`{apply,{c,erlangrc,[]}}` directive and the `{noproc, …}` error).
+**The tier does not change the stop** (`BEAM_RT_TIER=interpreter` reproduces it).
+- **Directive 20 IS reached — it is the stop.** `c:erlangrc/0`'s file consult is
+  `gen_server:call(file_server_2, {open,<the `$HOME` erlangrc path>,[read]}, infinity)`
   (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt`'s runtime-native
-  `file_server_2` service ([`../native/file_server.rs`](../native/CONTEXT.md)) answers the missing
-  `$HOME/.erlang` with `{error,enoent}` — registered under that name on every route **except** the
-  boot-script one, where `Runtime::new` leaves it unregistered so the booted `kernel_sup`'s own
-  `file_server_2` child owns the name. `c:erlangrc/0` **returns** that `{error,enoent}`
-  without raising (verified: `beam_rt -eval 'c:erlangrc()'` → `{error,enoent}`, the oracle's own answer)
-  and the executor discards a directive's value, so a synthetic two-directive boot
-  `[{apply,{c,erlangrc,[]}},{progress,started}]` runs to **exit 0** — instructions 20 and 21 already
-  work in isolation. They are simply never reached in the real chain because the directive-19 stop
-  happens first.
+  `file_server_2` service ([`../native/file_server.rs`](../native/CONTEXT.md)) is registered under
+  that name on every route **except** the boot-script one, where `Runtime::new` leaves it unregistered
+  so the booted `kernel_sup`'s own `file_server_2` child owns the name. That child never registers —
+  its `kernel_safe_sup` parent died on `erlang:hibernate/0` — so this is the one route where the name
+  resolves to no process and the `gen_server:call` raises the `noproc` above. On the other routes
+  `c:erlangrc/0` **returns** `{error,enoent}` without raising for a missing config file (verified:
+  `beam_rt -eval 'c:erlangrc()'` → `{error,enoent}`, the oracle's own answer), and the executor
+  discards a directive's value, so a synthetic two-directive boot
+  `[{apply,{c,erlangrc,[]}},{progress,started}]` runs to **exit 0** — directive 21 already works in
+  isolation, and directive 20 works as soon as a `file_server_2` owns the name.
 - **The CLI and the in-crate executor stop in the same place — exit 1.** The CLI
   (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **1**, as does the
-  `run` action. **stdout is NOT empty**: the boot's own crash reports are logged to **stdout** (84 lines,
-  3352 bytes measured) — **2** `=CRASH REPORT====` blocks (the `global_name_server` child raising
-  `{badmatch,{error,internal_error}}` in `global:init/1` at `global.erl:800`, then `kernel_sup`
-  reporting `errorContext: start_error` / `offender: [{id,global_name_server},…]`), **1**
-  `=SUPERVISOR REPORT====` block and **1** `=INFO REPORT====` block
-  (`application: kernel exited: {{shutdown,{failed_to_start_child,global_name_server,{{badmatch,{error,internal_error}},…}}}, type: permanent}`)
-  — while **stderr** carries only the terminal
-  `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`
-  — a *genuine* runtime error (exit 1), not a capability gap. (`tests/boot.rs`'s
-  `the_cli_runs_the_real_boot_script_to_completion` asserts `stdout == ""` **and** `stderr == ""`; both
-  hold only once the kernel crash stops being logged.) The in-crate executor
-  (`boot_from_script` → `execute`) hits the same directive-19 stop and reports it through the
-  `BootStop`/`execute_reporting` report API (`index = 19`, the script's `total = 22`, the failing
+  `run` action. **stdout is NOT empty**: the boot's own crash reports are logged to **stdout** (108
+  lines / 3891 bytes measured) — **2** `=CRASH REPORT====` blocks (`kernel_safe_sup` and `logger_sup`,
+  both on `erlang:hibernate/0`), **3** `=SUPERVISOR REPORT====` blocks and **1** `=INFO REPORT====`
+  block (`application: kernel exited: shutdown, type: permanent`) — while **stderr** carries only the
+  terminal `beam_rt: error {noproc,{gen_server,call,[file_server_2,{open,<the `$HOME` erlangrc
+  path>,[read]},infinity]}}` — a *genuine* runtime error (exit 1), not a capability gap.
+  (`tests/boot.rs`'s `the_cli_runs_the_real_boot_script_to_completion` asserts `stdout == ""` **and**
+  `stderr == ""`; both hold only once the kernel crash stops being logged.) The in-crate executor
+  (`boot_from_script` → `execute`) hits the same stop inside directive 20 and reports it through the
+  `BootStop`/`execute_reporting` report API (`index = Some(20)`, the script's `total = 22`, the failing
   `apply` directive and the `{noproc, …}` error).
 - **The configuration is part of the measurement.** `init:get_arguments/0` reports the whole command
   line, and the executor tests build their runtime with their own `system_runtime()` helper — the
@@ -195,9 +190,9 @@ of the same MFA returns `Err` with the `{noproc, …}` reason.
   (`boot_cli_runtime`). The **four automatic flags** (`root`/`home`/`progname`/`bindir`) are served
   by `init:get_argument/1` *and* prepended to `init:get_arguments/0`
   (`../native/init.rs::get_arguments`, in the oracle's order) — and they are not a boot determinant:
-  the real script reaches the same directive-19 stop under a `RuntimeConfig::default()` runtime too
+  the real script reaches the same stop under a `RuntimeConfig::default()` runtime too
   (`tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`, which drives the
-  script to report `init:script_id/0` and currently **fails** on that stop).
+  script to report `init:script_id/0` and is red on that stop — it asserts the full completion).
 - **The three `{kernelProcess, …}` directives (12–14) run and their servers survive.** Each burst
   drives until its directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
@@ -206,7 +201,7 @@ of the same MFA returns `Err` with the `{noproc, …}` reason.
   `heart` is not registered, legitimately: `heart:start/0` returns `ignore`.
 - **`logger` IS registered — a live `logger_server` named `logger`.** Instruction 13's
   `{kernelProcess,logger,{logger_server,start_link,[]}}` leaves a live `logger_server` registered as
-  `logger` (directive 13 runs before the stop at 19, and the registered server outlives it), matching
+  `logger` (directive 13 runs before the stop inside 20, and the registered server outlives it), matching
   the oracle (a second `logger_server:start_link/0` reports
   `{error,{already_started,Pid}}`).
   `logger_server:start_link/0` → `gen_server:start_link({local,logger}, …)` → `gen:start/6` →
@@ -225,10 +220,11 @@ of the same MFA returns `Err` with the `{noproc, …}` reason.
   `register(logger, self())` and the directive's parked `sync_start/2` (timeout `infinity`) resumes.
   The `start_kernel_process` unlink (above) then keeps the registered server alive past the
   short-lived directive process.
-  Pinned by `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` and, at the CLI, by
-  `../tests/boot.rs::the_cli_boot_registers_a_live_logger_process` — both currently **fail**, because
-  each drives the whole script (which stops at directive 19) before checking `logger`.
-- **Directive 18 starts the kernel application; the kernel start itself then fails.** Directive 18's
+  Pinned by `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` (red, because it
+  additionally asserts the whole 22-directive chain completes) and, at the CLI, by
+  `../tests/boot.rs::the_cli_boot_registers_a_live_logger_process`, which **passes** — it drives the
+  whole script and then checks `logger`, and the registration survives the current stop inside 20.
+- **The kernel application starts at directive 18 and then tears itself down.** Directive 18's
   `application:start_boot/2` reaches `application_controller:start_boot_application/2`, whose
   `application:load(kernel)` returns `{error,{already_loaded,kernel}}` (the AC's own `init/2` loaded
   kernel at `:531-558`), so it calls
@@ -236,38 +232,38 @@ of the same MFA returns `Err` with the `{noproc, …}` reason.
   `handle_call({start_application,…})` (`:697`) → `check_start_cond` → `spawn_starter/3` (`:1443`) →
   `application_master:start_link/2` (`proc_lib:start_link`) handshake completes, so the directive's
   `apply` **returns `Ok`** — but the kernel application does **not** stay up: during that directive's
-  scheduler drive its `global_name_server` child raises `{badmatch,{error,internal_error}}` in
-  `global:init/1` (`global.erl:800`) because `beam_bifs`'s `process_flag_2` refuses the tuple
-  `{monitor_nodes, MapOpts}` flag `net_kernel:monitor_nodes/2` passes
-  (`crates/beam_bifs/src/proc_reg.rs:399`; the cause above), so `kernel_sup` reports `start_error` and the
-  `permanent` kernel application tears itself down. The seam that lets the application master's
+  scheduler drive its `kernel_safe_sup` child (`supervisor:kernel/1`) crashes on
+  `erlang:hibernate/0`, hits `reached_max_restart_intensity` and terminates, so `kernel_sup` tears the
+  `permanent` kernel application down. The seam that lets the application master's
   callback fun be entered is `RuntimeContext::resolve_local_fun` (`../context/execution.rs`): it
   resolves an **external** fun (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through
   the `external_fun_target`/`external_fun_name` helpers (`../context/apply.rs`), so the engine enters
   e.g. `gen_server`'s callback fun **in-machine** instead of falling back to the value-returning
   `apply_fun`, which nested a fresh `Machine` under `may_pump_scheduler() == false` →
   `../context/pump.rs` refuses → the uncatchable `blocked()`.
-- **Directive 19's stdlib start is the stop.** `application:start_boot/2` reaches
-  `application_controller:start_boot_application/2`, whose
-  `gen_server:call(application_controller, {load_application,stdlib}, infinity)` finds **no**
-  `application_controller` — the kernel application is `permanent`, so the kernel child crash
-  (the `global_name_server` match failure above) tore the whole kernel supervision tree, and the
-  controller with it, down — so the call raises
-  `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`, which
-  `apply_boot_call` reports as the directive's typed error; the walk stops at index 19. The detail is
-  in [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
+- **Directive 19's stdlib start still runs; directive 20 is the stop.** `application:start_boot/2`
+  reaches `application_controller:start_boot_application/2`, and the `application_controller` started
+  by directive 14 (`{kernelProcess,application_controller,…}` — the controller itself, not a child of
+  the kernel application's supervision tree) is still registered, so its
+  `gen_server:call(application_controller, {load_application,stdlib}, infinity)` answers and the walk
+  reaches directive 20. Pinned by
+  `../tests/boot.rs::the_boot_chains_kernel_processes_survive_their_directive_processes`, which asserts
+  `whereis(application_controller)` is a live pid after the last directive. The detail is in
+  [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
 
-### The failing tests and why (they must keep asserting the full 22-directive completion)
+### The completion-asserting tests and why they stay red (they must keep asserting the full 22-directive completion)
 The three `cargo test --lib boot::` tests (`the_real_start_boot_executes_every_directive_to_progress_started`,
 `the_real_start_boot_completes_through_execute_reporting`, `the_real_boot_registers_a_live_logger_process`)
-and the four `cargo test --test boot` tests (`the_real_start_boot_runs_to_completion`,
-`the_cli_runs_the_real_boot_script_to_completion`,
-`the_boot_chains_kernel_processes_survive_their_directive_processes`,
-`the_cli_boot_registers_a_live_logger_process`) currently **fail** — each **only** because it asserts
-the FULL 22-directive completion (ending at `{progress,started}`) and the script stops at index 19.
+and the two `cargo test --test boot` tests (`the_real_start_boot_runs_to_completion`,
+`the_cli_runs_the_real_boot_script_to_completion`) are **red** — each **only** because it asserts
+the FULL 22-directive completion (ending at `{progress,started}`) and the script stops inside index 20.
 Their assertions are the contract and are kept unchanged; the stop has the cause above
 (*Remaining gaps* item 1). `tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`
-fails on the same stop for the same reason.
+is red on the same stop for the same reason. The other two `--test boot` cases
+(`the_boot_chains_kernel_processes_survive_their_directive_processes`,
+`the_cli_boot_registers_a_live_logger_process`) do **not** assert completion and **pass**, because the
+directive-12–14 `{kernelProcess, …}` registrations and the CLI `logger` registration all survive the
+stop inside 20.
 
 ### A `-boot` value's shape does not affect the outcome
 The boot is **not** sensitive to the byte length or the canonical form of the `-boot` value:
@@ -290,27 +286,22 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **The kernel application's start fails and the boot stops at directive 19 — a cross-crate blocker
-   owned by `erts_rust/crates/beam_bifs` + `erts_rust/crates/beam_rt`.** Directive 19 is
-   `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`; `application:start_boot/2`
-   reaches `application_controller:start_boot_application/2`, whose
-   `gen_server:call(application_controller, {load_application,stdlib}, infinity)` finds **no**
-   `application_controller`, and so raises
-   `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`. The cause
-   is out of node: `global:init/1`'s `ok = net_kernel:monitor_nodes(true, #{connection_id => true})`
-   (`global.erl:800`) fails because `beam_bifs`'s `process_flag_2` refuses the tuple
-   `{monitor_nodes, MapOpts}` flag `net_kernel:monitor_nodes/2` passes
-   (`crates/beam_bifs/src/proc_reg.rs:399`; the C handles it at `erts/emulator/beam/bif.c:2212-2227`),
-   so `global_name_server` — a `permanent` `kernel_sup` child — raises
-   `{badmatch,{error,internal_error}}`, the `permanent` kernel application tears itself down and
-   directive 19's `{load_application,stdlib}` call reaches no controller. The final
-   `{progress,started}` (index 21) is therefore **not** reached. Closing it needs a `beam_bifs` change
-   (recognize the `{monitor_nodes, MapOpts}` tuple flag and the bare `monitor_nodes` atom, and extend
-   the `ProcessHook` seam to carry the options) plus a `beam_rt` implementation of `erts_monitor_nodes`.
-   The per-link analysis, the minimal repros and the owning crates are in
-   [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
-   The tests that assert the full 22-directive completion and currently **fail** (they must keep
-   asserting it — never weakened): `bootscript.rs::tests::{the_real_start_boot_executes_every_directive_to_progress_started, the_real_start_boot_completes_through_execute_reporting, the_real_boot_registers_a_live_logger_process}`, `../tests/boot.rs::{the_real_start_boot_runs_to_completion, the_cli_runs_the_real_boot_script_to_completion, the_boot_chains_kernel_processes_survive_their_directive_processes, the_cli_boot_registers_a_live_logger_process}` and `../tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`.
+1. **`erlang:hibernate/0` is unmodelled, so the kernel supervisor dies and the boot stops inside
+   directive 20 — a cross-crate blocker owned by `erts_rust/crates/beam_loader` +
+   `erts_rust/crates/beam_engine`.** `gen_server:loop_hibernate/4` (`lib/stdlib/src/gen_server.erl:2338`)
+   calls `erlang:hibernate/0`; `kernel_safe_sup` and `logger_sup` both raise
+   `undefined function erlang:hibernate/0`, and `kernel_safe_sup` reaches
+   `reached_max_restart_intensity` and terminates, so its `file_server_2` child never registers the
+   name. The `permanent` kernel application exits `shutdown`, and directive 20's
+   `{apply,{c,erlangrc,[]}}` — `file:path_open_first` → `gen_server:call(file_server_2, {open,…})` —
+   raises `{noproc,{gen_server,call,[file_server_2,{open,<the `$HOME` erlangrc path>,[read]},infinity]}}`,
+   which `apply_boot_call` reports as the directive's typed error; the walk stops at index 20 so
+   `{progress,started}` (index 21) is **not** reached. `erlang:hibernate/0` is an OTP-28+ **instruction**
+   (the C rewrites `call_ext erlang:hibernate/0` to `i_hibernate`, `emu/ops.tab:896-898` / `ops.tab:975`),
+   not a `bif.tab` BIF — `bif.tab` declares only `hibernate/3`. Closing it needs the loader transform
+   plus an `Instr` and an engine arm.
+   The tests that assert the full 22-directive completion and are **red** (they must keep
+   asserting it — never weakened): `bootscript.rs::tests::{the_real_start_boot_executes_every_directive_to_progress_started, the_real_start_boot_completes_through_execute_reporting, the_real_boot_registers_a_live_logger_process}`, `../tests/boot.rs::{the_real_start_boot_runs_to_completion, the_cli_runs_the_real_boot_script_to_completion}` and `../tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`.
 2. **`beam_engine`/`beam_process` — a scheduled `compile:file/2` runs to completion and agrees with the oracle.** The incremental io-device read (`file:read/2`, `file:read_line/1`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`) completes from a **scheduled** process and agrees with the oracle (`../tests/scheduled_io_device.rs`, `../tests/io_scan.rs`), as does a `receive … after T` timeout reached through a nested run.
    Both A.9 `selfhost/*` corpus cases — `selfhost/in_process_compile_file_no_spawn_deterministic` and `selfhost/scheduled_process_compile_file_deterministic` — **agree** with the oracle on both execution tiers. The corruption they once reported was a **signal-driven** collection of a woken monitor watcher (`beam_process`'s process-termination cascade, `crates/beam_process/src/ptab.rs` → `enqueue_down_signal` → `copy_reason_onto` → `grow_receiver_for_signal`), declined by the runner's park-window relocation exemption; the parked machine's live `Machine::pending_exception` reason remains a real GC root across that window (`../runner/run.rs::publish_parked_roots`, read back on resume by `RuntimeContext::resync_parked_roots`). The decline predicate is still owed to `ptab.rs`'s signal sites. [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey carries the detail.
 3. **`beam_rt` `../native/` — the io-device read path completes from library code on both routes.**

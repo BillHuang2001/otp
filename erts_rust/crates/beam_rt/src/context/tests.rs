@@ -3071,6 +3071,72 @@ fn the_served_statistics_counters_read_the_runtimes_own_state() {
     );
 }
 
+/// `erts_internal:scheduler_wall_time/1` is the C's `atomic_xchg` on the node-global
+/// `sched_wall_time` switch (`erts/emulator/beam/bif.c:5357-5366`): **any** argument is
+/// accepted (only the atom `true` enables — every other term, `false`/`foo`/an integer,
+/// disables, never a `badarg`) and the answer is the state held *before* the call, as the
+/// atom `true`/`false`.
+///
+/// Oracle-verified (OTP 29/`erts-17.1`), one VM, in order —
+/// `scheduler_wall_time(true)` → `false`, `(false)` → `true`, `(true)` → `false`,
+/// `(foo)` → `true`, `(foo)` → `false`; on a fresh VM each of `(true)`/`(false)`/`(foo)`/`(1)`
+/// answers `false` (the switch starts disabled). `kernel_refc`'s
+/// `resource(scheduler_wall_time, Enable)` (`lib/kernel/src/kernel_refc.erl:141-142`) is the
+/// boot-path caller and `kernel_sup` starts it `permanent`, so a raise here tears `kernel_sup`
+/// down with `start_error`.
+///
+/// The switch is **recorded but never sampled**: `erlang:statistics(scheduler_wall_time)`
+/// keeps answering `undefined` even while armed — this runtime measures no per-scheduler wall
+/// time, so a fabricated `{SchedulerId, ActiveTime, TotalTime}` tuple list would be a wrong
+/// result (`tests/runtime_hooks.rs` cross-checks the disabled answer against the live oracle).
+#[test]
+fn the_runtime_hooks_bridge_serves_the_scheduler_wall_time_switch() {
+    let mut rt = runtime();
+    let on = rt.intern("true");
+    let off = rt.intern("false");
+    let other = rt.intern("foo");
+    let undefined = rt.intern("undefined");
+    let statistics_key = rt.intern("scheduler_wall_time");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    let call = |ctx: &mut RuntimeContext<'_>, arg: Eterm| {
+        ctx.call_bif("erts_internal", "scheduler_wall_time", 1, &[arg])
+            .expect("scheduler_wall_time/1 accepts any argument")
+    };
+    let stat = |ctx: &mut RuntimeContext<'_>| {
+        ctx.call_bif("erlang", "statistics", 1, &[statistics_key])
+            .expect("statistics(scheduler_wall_time)")
+    };
+
+    // Force the switch off first so the sequence is independent of any preceding call.
+    let _ = call(&mut ctx, off);
+
+    // The exchange answers the *previous* state: enabling a disabled switch answers `false`,
+    // disabling an enabled one answers `true`.
+    assert_eq!(call(&mut ctx, on), off, "arming answers the previous (disabled) state");
+    assert_eq!(call(&mut ctx, off), on, "disarming answers the previous (armed) state");
+    assert_eq!(call(&mut ctx, on), off);
+
+    // A non-`true` term disables exactly like `false` — never a `badarg`.
+    assert_eq!(call(&mut ctx, other), on, "`foo` disabled the armed switch");
+    assert_eq!(call(&mut ctx, other), off, "and is now the previous, disabled state");
+    // An integer is a disabling request too, not a `badarg`.
+    assert_eq!(call(&mut ctx, make_small(1)), off);
+    assert_eq!(call(&mut ctx, on), off, "re-arming a disabled switch");
+    // Still armed: a second `true` answers the previous (armed) state, which proves the switch
+    // really took the `true` above.
+    assert_eq!(call(&mut ctx, on), on, "the switch really is armed");
+
+    // The switch is recorded but drives no sampling: the statistics reader answers `undefined`
+    // while armed (here) and while disabled (below).
+    assert_eq!(
+        stat(&mut ctx),
+        undefined,
+        "no per-scheduler wall time is measured even while the switch is armed"
+    );
+    let _ = call(&mut ctx, off);
+    assert_eq!(stat(&mut ctx), undefined);
+}
 /// The guarded call-site imports, and the **scope** of the refusal each one forces
 /// ([`callee_observes_its_call_site`]): a module importing `erlang:load_nif/2` keeps **every**
 /// function off the in-machine route (a local call inside the module reaches the loader and a

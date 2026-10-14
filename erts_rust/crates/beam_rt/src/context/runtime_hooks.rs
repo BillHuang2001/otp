@@ -38,7 +38,8 @@
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set — a **local** pid through [`ProcessTable::link`]/`unlink`, a **remote** pid through [`ProcessTable::link_term`]/`unlink_term` (the remote-link set + the wire `DOP_LINK`/`DOP_UNLINK_ID`) |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
-//! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the live processes' own `beam_gc` collector counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined`, never enabled) |
+//! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the live processes' own `beam_gc` collector counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined` — the switch is recorded but no per-scheduler wall time is sampled) |
+//! | `erts_internal:scheduler_wall_time/1` | the node-global sampling switch: any non-`true` argument disables, `true` enables, and the **previous** state is answered as `true`/`false` (the C's `atomic_xchg`, `bif.c:5357-5366`) |
 //! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
 //! | `net_kernel:dflag_unicode_io/1` | `true` for a local pid (a `badarg` for a non-pid; the typed gap for a remote pid) — the io-device read path's unicode fast-path probe |
 //!
@@ -57,11 +58,17 @@
 //! * `statistics/1` serves **only** the keys this runtime can measure for real
 //!   (`run_queue`, the `run_queues`/`run_queue_lengths*`/`total_run_queue_lengths*` family,
 //!   `wall_clock`, `reductions`/`exact_reductions`, `context_switches`, `runtime`, `io`,
-//!   `garbage_collection` and the never-enabled
+//!   `garbage_collection` and
 //!   `scheduler_wall_time`/`scheduler_wall_time_all`, see
 //!   [`RuntimeHooksBridge::statistics`]); every other key the oracle accepts is a valid
 //!   statistics key this runtime cannot answer honestly, so it reports the typed capability
 //!   gap. A name that is not a statistics key at all is the oracle's `badarg`.
+//! * `scheduler_wall_time`/`scheduler_wall_time_all` answer `undefined` **whatever**
+//!   [`RuntimeHooksBridge::scheduler_wall_time`]'s switch holds: this runtime keeps no
+//!   per-scheduler wall-time accounting, so the C's `{SchedulerId, ActiveTime, TotalTime}`
+//!   tuple list cannot be produced honestly. The switch is recorded (so
+//!   `erts_internal:scheduler_wall_time/1`'s previous-value exchange is faithful) but drives
+//!   no sampling, and the reader never fabricates a figure from it.
 //! * `os:set_signal/2` installs the disposition for real (the one process-global
 //!   [`signal`] facility) and the `{notify, Signal}` leg is wired: a caught signal is
 //!   written to the facility's self-pipe, and the port layer's pumps deliver the 2-tuple
@@ -611,6 +618,69 @@ impl<'a> RuntimeHooksBridge<'a> {
         atom_term(atoms, "true")
     }
 
+    /// `erts_internal:scheduler_wall_time/1` — arm or disarm the node-global scheduler
+    /// wall-time sampling switch, answering the **previous** state.
+    ///
+    /// The C is `erts/emulator/beam/bif.c:5357-5366`:
+    ///
+    /// ```c
+    /// new = (BIF_ARG_1 == am_true) ? 1 : 0;      /* any non-`true` is 0, NOT badarg */
+    /// old = atomic_xchg(sched_wall_time, new);   /* the previous value */
+    /// BIF_RET(old ? am_true : am_false);
+    /// ```
+    ///
+    /// so this arm accepts **any** argument: the atom `true` enables sampling and everything
+    /// else (`false`, `foo`, `1`, a tuple, …) disables it — never a `badarg`, never a raise.
+    /// The answer is the state the switch held *before* this call, as the atom
+    /// `true`/`false`. `kernel_refc`'s `resource(scheduler_wall_time, Enable)`
+    /// (`lib/kernel/src/kernel_refc.erl:141-142`) is the boot-path caller: `kernel_sup` starts
+    /// it `permanent`, so a raise here tears `kernel_sup` down with `start_error`.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`), **one VM**, in order:
+    ///
+    /// ```text
+    /// erts_internal:scheduler_wall_time(true)  -> false
+    /// erts_internal:scheduler_wall_time(false) -> true
+    /// erts_internal:scheduler_wall_time(true)  -> false
+    /// erts_internal:scheduler_wall_time(foo)   -> true    (a non-`true` disables; prev was armed)
+    /// erts_internal:scheduler_wall_time(foo)   -> false
+    /// ```
+    ///
+    /// and on a **fresh** VM each of `(true)`, `(false)`, `(foo)`, `(1)` answers `false` (the
+    /// switch starts disabled). `erlang:system_flag(scheduler_wall_time, Bool)`
+    /// (`bif.c:5225-5227`) exchanges the same slot; the native floor that owns
+    /// `erlang:system_flag/2` here serves only its `reset_seq_trace`/`system_logger` arms, so
+    /// that spelling stays the typed gap (wiring it to this slot would touch the floor, not
+    /// this bridge) — see [`crate::seq_trace::SeqTrace::system_flag_2`].
+    ///
+    /// The switch lives in a `thread_local` ([`SCHEDULER_WALL_TIME`]), not on `Runtime`,
+    /// mirroring [`WALL_CLOCK`]: it is the C's single node-global `sched_wall_time` atomic,
+    /// and the runtime is single-threaded (`!Send`).
+    ///
+    /// **Residual (honest, not fabricated).** This runtime records the switch but does **not**
+    /// sample per-scheduler wall time — it keeps none of the per-scheduler CPU accounting the
+    /// C's `ERTS_SCHED_WALL_TIME` collects — so the sibling
+    /// `erlang:statistics(scheduler_wall_time|scheduler_wall_time_all)` keeps answering the
+    /// atom `undefined` **even once the switch is armed** (see [`Self::statistics`]). The
+    /// switch and that reader therefore cannot drift into a fabricated
+    /// `{SchedulerId, ActiveTime, TotalTime}` tuple list; arming it is observable only through
+    /// this exchange's own previous-value answer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`atom_term`]'s typed capability gap for a name the shared table does not
+    /// hold — the boot seed ([`CORE_ATOMS`](crate::boot::CORE_ATOMS)) interns both `true` and
+    /// `false`, so it is unreachable in practice. The **argument** is never rejected.
+    fn scheduler_wall_time(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        // Any non-`true` argument disables (`bif.c:5357`'s `BIF_ARG_1 == am_true` test): a
+        // missing argument can only happen if the dispatch arity drifts, and it is a disabling
+        // request rather than a `badarg`, exactly as any other non-`true` term is.
+        let enable = args
+            .first()
+            .is_some_and(|arg| is_atom(*arg) && atoms.name(atom_val(*arg)) == Some("true"));
+        let previous = SCHEDULER_WALL_TIME.with(|slot| slot.replace(enable));
+        atom_term(atoms, if previous { "true" } else { "false" })
+    }
     /// `erts_literal_area_collector:release_area_switch/0` — the literal-area switch probe.
     ///
     /// Oracle-verified (OTP 29/`erts-17.1`): the oracle **raises** `error notsup` (`i_notsup`
@@ -727,9 +797,13 @@ impl<'a> RuntimeHooksBridge<'a> {
     ///   collections really reclaimed (see [`Self::garbage_collection`]).
     /// * `scheduler_wall_time`, `scheduler_wall_time_all` → the atom `undefined`, the
     ///   oracle's own "not enabled" answer. Only
-    ///   `erlang:system_flag(scheduler_wall_time, true)` turns either into per-scheduler
-    ///   `{SchedulerId, ActiveTime, TotalTime}` tuples, and this runtime never enables it, so
-    ///   `undefined` is exact rather than an approximation.
+    ///   `erlang:system_flag(scheduler_wall_time, true)` (or
+    ///   [`Self::scheduler_wall_time`]) turns either into per-scheduler
+    ///   `{SchedulerId, ActiveTime, TotalTime}` tuples, and this runtime measures no
+    ///   per-scheduler wall time, so it answers `undefined` **even once the switch is armed**
+    ///   — the switch is recorded, never sampled. `undefined` is therefore exact for the
+    ///   disabled case and the honest "this runtime cannot measure it" for the armed one,
+    ///   never a fabricated tuple list.
     ///
     /// **Documented divergence (the epoch/scope, never the clock or counter).** The oracle's
     /// `wall_clock` total is measured from emulator start; this runtime anchors it at the
@@ -781,10 +855,12 @@ impl<'a> RuntimeHooksBridge<'a> {
             }
             // `scheduler_wall_time`/`scheduler_wall_time_all` answer `undefined` until
             // `erlang:system_flag(scheduler_wall_time, true)` has been applied
-            // (`erl_bif_info.c:4174-4183`), and this runtime never enables it — it keeps no
-            // per-scheduler CPU accounting to hand out. The oracle's own "not enabled"
-            // answer is therefore the exact one to give, not a substitute for a missing
-            // measurement (`tests/runtime_hooks.rs` pins it against the live oracle).
+            // (`erl_bif_info.c:4174-4183`). This runtime *records* that switch (see
+            // [`Self::scheduler_wall_time`]) but keeps no per-scheduler wall-time accounting,
+            // so it answers `undefined` even once the switch is armed — the oracle's own "not
+            // enabled" answer for the disabled case, and the honest "cannot measure" for the
+            // armed one, never a fabricated tuple list (`tests/runtime_hooks.rs` pins the
+            // disabled answer against the live oracle).
             "scheduler_wall_time" | "scheduler_wall_time_all" => atom_term(atoms, "undefined"),
             // The three `{Total, SinceLast}` counter pairs, read from the runtime's own real
             // cumulative counters (`SinceLast` is the delta since the previous read of this
@@ -1054,6 +1130,9 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
                 self.is_process_predicate(atoms, args, "is_process_executing_dirty")
             }
             ("erts_internal", "erase_persistent_terms", 0) => self.erase_persistent_terms(atoms),
+            ("erts_internal", "scheduler_wall_time", 1) => {
+                self.scheduler_wall_time(atoms, args)
+            }
             // The internal `notsup` probes and the trace-cleaner / error-logger constants.
             ("erts_literal_area_collector", "release_area_switch", 0) => self.notsup(),
             ("erts_trace_cleaner", "check", 0) => self.trace_cleaner_check(atoms),
@@ -1131,6 +1210,17 @@ thread_local! {
     static WALL_CLOCK: Cell<Option<(Instant, Instant)>> = const { Cell::new(None) };
 }
 
+thread_local! {
+    /// The node-global `sched_wall_time` switch behind
+    /// `erts_internal:scheduler_wall_time/1` — the C's `erts_atomic32_t sched_wall_time`
+    /// (`erts/emulator/beam/erl_bif_info.c`), which starts disabled.
+    ///
+    /// A `thread_local` for the same reason [`WALL_CLOCK`] is one: the seam may not touch the
+    /// runtime's layout, and it is sound because the runtime is single-threaded (`!Send`). The
+    /// switch is recorded but no sampling is driven from it (see
+    /// [`RuntimeHooksBridge::scheduler_wall_time`]).
+    static SCHEDULER_WALL_TIME: Cell<bool> = const { Cell::new(false) };
+}
 /// The wall clock in whole milliseconds: `(since the anchor, since the previous read)`.
 ///
 /// `Instant` is the platform's monotonic clock, so the figures are real elapsed time and

@@ -277,7 +277,9 @@ counter bumped at the real reduction charge site), `context_switches` (a real pr
 WordsReclaimed, 0}` from the live collectors' counters), `runtime` (`{Total, SinceLastCall}` user-CPU
 milliseconds from the runtime's one long-lived `beam_io::cpu_time::RuntimeClock`, whose anchor persists
 for the runtime's whole lifetime) and `scheduler_wall_time`/`scheduler_wall_time_all` ⇒ `undefined`
-(never enabled). Gaps: `statistics/0` is not served, and on `statistics/1` the keys naming per-scheduler
+(the switch `erts_internal:scheduler_wall_time/1` records — armed or not — but no per-scheduler wall
+time is sampled, so the tuple list is never fabricated). Gaps: `statistics/0` is not served, and on
+`statistics/1` the keys naming per-scheduler
 state this runtime genuinely lacks (`total_active_tasks`/`total_active_tasks_all`/`active_tasks`/
 `active_tasks_all` — a scheduler's current-process flag — and `microstate_accounting` — no MSACC
 accounting) are the typed `unsupported`; every other `RuntimeHooks` family is unserved too.

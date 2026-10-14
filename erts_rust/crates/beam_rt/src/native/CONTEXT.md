@@ -735,9 +735,12 @@ needs:
   surfaces add a flag/match-spec dimension `crate::trace` does not expose.
 - **Microstate accounting / scheduler wall time:** `await_microstate_accounting_modifications/3`,
   `gather_microstate_accounting_result/2`, `await_sched_wall_time_modifications/2`,
-  `gather_sched_wall_time_result/1`, `mc_iterator/1`, `mc_refill/1`, `scheduler_wall_time/1`,
+  `gather_sched_wall_time_result/1`, `mc_iterator/1`, `mc_refill/1`,
   `system_flag_scheduler_wall_time/1`. Needs per-scheduler run-time accounting (the M1 scheduler
-  is single-threaded and does not account).
+  is single-threaded and does not account). The *switch* itself —
+  `erts_internal:scheduler_wall_time/1` — **is served**, by the `RuntimeHooks` bridge
+  (`../context/runtime_hooks.rs`), not by this floor: it records the flag and answers the previous
+  state, and drives no sampling.
 - **System tasks / system monitors:** `request_system_task/3,4`, `spawn_system_process/3`,
   `system_check/1`, `gather_system_check_result/1`, `is_system_process/1`, `system_monitor/1,3`.
   Needs the system-task protocol between `init`/the application controller and side-effect-free
