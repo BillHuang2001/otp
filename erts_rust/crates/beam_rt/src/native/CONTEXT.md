@@ -296,7 +296,7 @@ the essentials:
 * **Honest typed `unsupported` items** (valid oracle names, gap reason names the missing
   accessor/hook): `backtrace` (no raw/binary stack-dump accessor — only the cooked stacktrace),
   `magic_ref` (the NIF resource API is unbound, so no resource is bound into a process),
-  `parent`/`label` (no such PCB field), `async_dist`/`priority_messages` (no such
+  `parent`/`label` (no such PCB field), `priority_messages` (no such
   `beam_process::ProcessFlags`), `garbage_collection_info` (`beam_gc::HeapInfo` measures no
   per-generation block sizes). An item this runtime cannot answer is **omitted** by `/1` (the
   C's own mechanism for an unregistered `registered_name`).
