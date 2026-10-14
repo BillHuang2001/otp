@@ -505,10 +505,34 @@ pub enum Action {
 pub struct RuntimeConfig {
     /// The emulator start-up surface of this invocation (`beam_common`'s A.6 skeleton).
     pub emulator: EmulatorConfig,
-    /// The code path: `-pa` directories first, then `-pz` directories, in order.
+    /// The `-pa` directories, in command-line order: the **head** of the code path.
+    ///
+    /// The oracle's `code_server` *prepends* each `-pa` directory in turn
+    /// (`add_pa_pz/3` over `add_paths(first, …)`), so the head of `code:get_path/0` is
+    /// this list in **reverse**; a directory that does not exist is filtered out
+    /// (`strip_path/2` over `check_path/1`). Both facts are reproduced where the path is
+    /// built, not here — this field is what the command line asked for. The `-pz`
+    /// directories are the separate [`pz_paths`](Self::pz_paths) tail.
     pub code_paths: Vec<PathBuf>,
+    /// The `-pz` directories, in command-line order: the **tail** of the code path.
+    ///
+    /// The oracle appends them after the system `ebin` directories (and `"."`), so a
+    /// `-pz` directory can never shadow an installed module — see
+    /// [`code_paths`](Self::code_paths) and
+    /// [`CodeServer::set_configured_paths`](crate::CodeServer::set_configured_paths).
+    pub pz_paths: Vec<PathBuf>,
     /// The process-heap size in term words.
     pub heap_words: usize,
+    /// The **online** scheduler count `+S Total:Online` asks for, or `None` when the
+    /// command line gave no explicit online half (`+S N`, or no `+S` at all).
+    ///
+    /// `+S 4:2` sizes the scheduler pool to `4` but puts only `2` online
+    /// (`emulator.schedulers` is the total), which `erlang:system_info(schedulers_online)`
+    /// — and the `schedulers_state`/`schedulers_active` rows derived from it — report.
+    /// Without an explicit online count the oracle uses the *default* online count,
+    /// `min(<total>, <available processors>)`; that resolution lives in
+    /// [`crate::info`]'s `schedulers_online`, which this field feeds.
+    pub online_schedulers: Option<u32>,
     /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) the runtime reports
     /// through its GC introspection (contract A.6 → A.8).
     pub heap: HeapOptions,
@@ -548,14 +572,17 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     /// The defaults of a bare `beam_rt` invocation: a `jit` emulator, an empty code
-    /// path, a [`DEFAULT_HEAP_WORDS`]-word heap, the emulator's heap-size defaults, no
-    /// init arguments, [`Action::Boot`], no port-table request and no environment
+    /// path (both the `-pa` head and the `-pz` tail), a [`DEFAULT_HEAP_WORDS`]-word heap,
+    /// the emulator's heap-size defaults, no init arguments, [`Action::Boot`], no
+    /// port-table request, no explicit online scheduler count and no environment
     /// variables.
     fn default() -> Self {
         RuntimeConfig {
             emulator: EmulatorConfig::default(),
             code_paths: Vec::new(),
+            pz_paths: Vec::new(),
             heap_words: DEFAULT_HEAP_WORDS,
+            online_schedulers: None,
             heap: HeapOptions::default(),
             max_ports: None,
             init_args: InitArgs::default(),
@@ -587,6 +614,18 @@ impl RuntimeConfig {
     /// Appends `path` to the code path.
     pub fn with_code_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.code_paths.push(path.into());
+        self
+    }
+
+    /// Replaces the `-pz` tail of the code path with `paths`.
+    pub fn with_pz_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.pz_paths = paths;
+        self
+    }
+
+    /// Sets the explicit **online** scheduler count (`+S Total:Online`).
+    pub fn with_online_schedulers(mut self, online: u32) -> Self {
+        self.online_schedulers = Some(online);
         self
     }
 

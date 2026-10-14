@@ -143,9 +143,11 @@ Switches:
   -eval EXPR                evaluate the documented integer subset (prints nothing)
   -s MOD FUNC [ARG...]      apply MOD:FUNC(ARG, ...) with atom arguments (result discarded)
   -run MOD FUNC [ARG...]    apply MOD:FUNC(ARG, ...) with string arguments (result discarded)
-  -pa DIR                   add DIR to the code path (searched before -pz dirs)
-  -pz DIR                   add DIR to the code path (searched after -pa dirs)
-  +S N[:N]                  number of normal schedulers
+  -pa DIR [DIR...]          add DIR(s) to the head of the code path (before the system
+                            directories; a missing dir is filtered out)
+  -pz DIR [DIR...]          add DIR(s) to the tail of the code path (after the system
+                            directories; a missing dir is filtered out)
+  +S N[:N]                  normal schedulers (total, and optionally the online count)
   -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
   +A N                      async-thread pool size (preserved verbatim)
   +P N                      maximum number of processes (legacy, or 1024..=134217727)
@@ -291,6 +293,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         emulator: EmulatorConfig::default(),
         pa: Vec::new(),
         pz: Vec::new(),
+        online_schedulers: None,
         heap: HeapOptions::new(),
         max_ports: None,
         init_args: InitArgs::new(),
@@ -320,16 +323,16 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "-pa" => {
-                let value = value_of(args, index, "-pa")?;
-                builder.record(argument, vec![value.clone()]);
-                builder.pa.push(PathBuf::from(value));
-                index += 2;
+                let (values, next) = path_values(args, index, "-pa")?;
+                builder.record(argument, values.clone());
+                builder.pa.extend(values.into_iter().map(PathBuf::from));
+                index = next;
             }
             "-pz" => {
-                let value = value_of(args, index, "-pz")?;
-                builder.record(argument, vec![value.clone()]);
-                builder.pz.push(PathBuf::from(value));
-                index += 2;
+                let (values, next) = path_values(args, index, "-pz")?;
+                builder.record(argument, values.clone());
+                builder.pz.extend(values.into_iter().map(PathBuf::from));
+                index = next;
             }
             "-name" | "-sname" => {
                 let value = value_of(args, index, argument)?;
@@ -338,10 +341,27 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "-setcookie" => {
-                let value = value_of(args, index, "-setcookie")?;
-                builder.record(argument, vec![value.clone()]);
-                builder.emulator.cookie = Some(value);
-                index += 2;
+                // `-setcookie` takes a list of values exactly like `-pa`/`-pz`: the oracle
+                // records one occurrence carrying *every* following non-switch token
+                // (`erl -setcookie a b …` ⇒ `init:get_argument(setcookie)` is
+                // `{ok,[["a","b"]]}`), and with anything but a single value it leaves the
+                // cookie unset (`erlang:get_cookie()` is `nocookie`) — verified against
+                // OTP 29.1.1 / erts-17.1.
+                let (values, next) = path_values(args, index, "-setcookie")?;
+                builder.record(argument, values.clone());
+                builder.emulator.cookie = match values.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                };
+                index = next;
+            }
+            "-env" => {
+                // `-env VAR VALUE` is consumed by the *launcher* (`erlexec`), so `init`
+                // never sees it: the oracle's `init:get_argument(env)` is the bare atom
+                // `error` — verified against OTP 29.1.1 / erts-17.1. The two values are
+                // taken blindly (the oracle consumes the following token even when it
+                // looks like a switch, e.g. `-noshell`).
+                index = parse_env_switch(args, index)?;
             }
             "-config" | "-boot" => {
                 let value = value_of(args, index, argument)?;
@@ -380,7 +400,9 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             }
             "+S" => {
                 let value = value_of(args, index, "+S")?;
-                builder.emulator.schedulers = Some(parse_schedulers(&value)?);
+                let (total, online) = parse_schedulers(&value)?;
+                builder.emulator.schedulers = total;
+                builder.online_schedulers = online;
                 index += 2;
             }
             "-smp" => index = parse_smp_switch(args, index, &mut builder),
@@ -449,7 +471,9 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
     Ok(RuntimeConfig {
         emulator: builder.emulator,
         code_paths,
+        pz_paths: builder.pz_paths(),
         heap_words: DEFAULT_HEAP_WORDS,
+        online_schedulers: builder.online_schedulers,
         heap: builder.heap,
         max_ports: builder.max_ports,
         init_args: builder.init_args,
@@ -469,6 +493,8 @@ struct Builder {
     pa: Vec<PathBuf>,
     /// `-pz` directories, in order.
     pz: Vec<PathBuf>,
+    /// The explicit **online** scheduler count (`+S Total:Online`), or `None`.
+    online_schedulers: Option<u32>,
     /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) being assembled.
     heap: HeapOptions,
     /// The requested port-table size (`+Q N`; `None` for the default table or `legacy`).
@@ -483,13 +509,19 @@ struct Builder {
 }
 
 impl Builder {
-    /// The code path: `-pa` directories first, then `-pz` directories.
+    /// The `-pa` directories, in command-line order — the **head** of the code path.
+    ///
+    /// The `-pz` directories are the separate tail ([`Builder::pz_paths`]): the oracle's
+    /// `code:get_path/0` puts `-pa` in front of the system `ebin` directories and `-pz`
+    /// **after** them, so the two groups must not be merged here.
     fn code_paths(&self) -> Vec<PathBuf> {
-        let mut paths = self.pa.clone();
-        paths.extend(self.pz.iter().cloned());
-        paths
+        self.pa.clone()
     }
 
+    /// The `-pz` directories, in command-line order — the **tail** of the code path.
+    fn pz_paths(&self) -> Vec<PathBuf> {
+        self.pz.clone()
+    }
     /// Records one occurrence of `switch` (the flag name is the switch without its
     /// leading `-`/`+`) with `values`.
     fn record(&mut self, switch: &str, values: Vec<String>) {
@@ -677,20 +709,87 @@ fn parse_max_heap_size(value: &str) -> Result<usize> {
     }
 }
 
-/// Parses the `+S N[:N]` value, taking the normal-scheduler count (the first number).
+/// Parses the `+S N[:N]` value into `(total, online)`.
 ///
-/// Both components must be numbers (and there may be at most one `:`): a malformed
-/// suffix is an error rather than something silently ignored.
-fn parse_schedulers(value: &str) -> Result<u32> {
+/// Both halves are `Option`: `0` is the oracle's "use the default" spelling, so
+/// `+S 0` and `+S 0:0` select the defaults for both counts (`None`/`None`).
+///
+/// The grammar is `erl_init.c:1107-1153`:
+/// * `+S Total` — the online count is **not** the total: the C sets it to
+///   `min(Total, <default online>)` (`onln = tot < schdlrs_onln ? tot : schdlrs_onln`),
+///   which is why `erl +S 16` reports `16` schedulers but only `14` online on a
+///   16-CPU box. That resolution needs the host's processor count, so it happens where
+///   the value is answered ([`crate::info`]'s `schedulers_online`), not here.
+/// * `+S Total:Online` — the online count is explicit and must be `1..=Total`
+///   (`bad amount of schedulers online`); `+S 4:5` and `+S 4:0` are rejected, while
+///   `+S 0:2` is accepted (the total defaults to the processor count).
+/// * Anything else (`+S 1:2:3`, a non-number) is rejected.
+///
+/// A malformed value is this parser's uniform usage error (exit 2 + [`USAGE`]); the
+/// oracle prints `bad amount of schedulers <value>` and its own usage, exiting 1.
+fn parse_schedulers(value: &str) -> Result<(Option<u32>, Option<u32>)> {
     let mut parts = value.split(':');
-    let normal = parse_u32("+S", parts.next().unwrap_or(value))?;
-    if let Some(online) = parts.next() {
-        parse_u32("+S", online)?;
-    }
+    let total = parse_u32("+S", parts.next().unwrap_or(value))?;
+    let online = match parts.next() {
+        Some(online) => Some(parse_u32("+S", online)?),
+        None => None,
+    };
     if parts.next().is_some() {
         return Err(error::bad_switch_value("+S", value));
     }
-    Ok(normal)
+    // `0` selects the default of that count; an explicit total of `0` therefore means
+    // "the processor count".
+    let schedulers = (total > 0).then_some(total);
+    let online = match online {
+        // `+S 0:0` is the all-defaults spelling.
+        Some(0) if total == 0 => None,
+        Some(online) if online > 0 => {
+            let ceiling = schedulers.unwrap_or_else(|| {
+                // The default total the online count can never exceed.
+                u32::try_from(crate::info::logical_processors()).unwrap_or(u32::MAX)
+            });
+            if online > ceiling {
+                return Err(error::bad_switch_value("+S", value));
+            }
+            Some(online)
+        }
+        Some(_) => return Err(error::bad_switch_value("+S", value)),
+    };
+    Ok((schedulers, online))
+}
+
+/// Collects the **list** of values of a `-pa`/`-pz`/`-setcookie` occurrence, returning
+/// them with the index of the next switch.
+///
+/// The oracle's grammar is "every following token up to the next switch is a value of
+/// this one occurrence" — verified against OTP 29.1.1 / erts-17.1: `erl -pa a b …` makes
+/// `init:get_argument(pa)` `{ok,[["a","b"]]}` (one occurrence, two values), while
+/// `-pa a -3 …` / `-pa a +S 3 …` both stop at the next switch. An occurrence with **no**
+/// value is a usage error, exactly as before.
+fn path_values(args: &[String], index: usize, switch: &str) -> Result<(Vec<String>, usize)> {
+    let (values, next) = collect_tail(args, index + 1);
+    if values.is_empty() {
+        return Err(error::missing_value(switch));
+    }
+    Ok((values, next))
+}
+
+/// Consumes a `-env VAR VALUE` pair, returning the index of the next switch.
+///
+/// `-env` is handled by the `erl` *launcher* (`erlexec`), which is why the oracle's
+/// `init:get_argument(env)` is the bare atom `error`: the pair never reaches `init` and
+/// is therefore **not** an init argument here either (verified against OTP 29.1.1 /
+/// erts-17.1). The launcher consumes the next two tokens blindly — `erl -env x -noshell`
+/// swallows `-noshell` as the value — so this does too.
+///
+/// The variable is *not* injected into this process's environment (`std::env::set_var`
+/// is `unsafe` in edition 2024 and this crate is `#![deny(unsafe_code)]`), so
+/// `os:getenv/1` does not observe it; see the crate's M1 gaps.
+fn parse_env_switch(args: &[String], index: usize) -> Result<usize> {
+    if args.len() < index + 3 {
+        return Err(error::missing_value("-env"));
+    }
+    Ok(index + 3)
 }
 
 /// Parses the `-smp` switch, returning the index of the next switch.
