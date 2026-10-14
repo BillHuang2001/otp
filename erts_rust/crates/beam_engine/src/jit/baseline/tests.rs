@@ -40,7 +40,8 @@ use crate::jit::Tier;
 use crate::machine::{Continuation, MAX_REGISTER};
 use crate::MinimalContext;
 use beam_loader::{
-    Block, Export, Function, Import, ImportRef, Instr, Label, Operand, Reg as RegRef, NO_FAIL,
+    Block, Export, Function, Import, ImportRef, Instr, Label, Operand, Reg as RegRef, TestKind,
+    NO_FAIL,
 };
 use beam_term::{make_small, MAX_SMALL, MIN_SMALL, NIL};
 use std::cmp::Ordering;
@@ -3934,3 +3935,788 @@ fn a_return_on_the_bottom_frame_halts_identically_on_both_tiers() {
     });
 }
 
+// ===========================================================================
+// PERFORMANCE PROBE — the two-process `send_recv` copy-bound shape
+// ===========================================================================
+//
+// `tools/bench` measures the baseline tier only through the **eager** artifact
+// (`jit_bench`), so the tier's real cost — the **lazy** per-function path the
+// runtime drives (`run_baseline_cached*` / `Machine::run_*_with_tier` /
+// `resume_outcome_with_tier`) — has no in-process measurement. This probe closes
+// that gap for the ONE workload where the baseline tier is dearer than the
+// interpreter (`tools/bench/RESULTS.md` §3.9 / §8 item 2): two processes
+// ping-ponging a message, each `receive` **suspending** on an empty mailbox and
+// being resumed by the counterpart's `send`.
+//
+// The IR mirrors the shape the system `erlc` emits for that workload
+// (`erlc -S` on OTP 29 / erts-17.1; see `../CONTEXT.md` and RESULTS.md §8):
+// `send` / `loop_rec` / `is_tuple` + `test_arity` + `get_tuple_element` +
+// `is_eq_exact` (Y-annotated boxed operand) / `remove_message` / `wait` /
+// `wait_timeout` / `put_tuple2` / `bif self` / `gc_bif '+'/'-'` on a `Y` operand /
+// a linked `call_last` / a frame-preserving `call` (continuation sub-block).
+//
+// It is a *measurement*, not an assertion of performance: it pins cross-tier
+// **result** equality plus the structural counters, and prints ns/op for both
+// tiers together with `/proc/loadavg` (this host is shared — ratios and counters
+// are the signal, absolute latency is not).
+
+/// Warmup ops (discarded): populates the per-thread compiled-block cache so the
+/// timed pass measures steady state, not first-entry compilation.
+const PROBE_WARMUP_OPS: u32 = 1_000;
+/// Timed ops: one op = one full `send`+`receive`+suspend+resume round trip.
+const PROBE_MEASURE_OPS: u32 = 20_000;
+/// Counting-pass ops: fewer, because recording re-formats an opcode name per deopt.
+const PROBE_COUNT_OPS: u32 = 64;
+
+/// The two "pids" the probe uses — small integers, so the mailbox routes on a
+/// plain word compare (the engine never inspects a pid term, only the host does).
+const PROBE_PID_A: i64 = 1;
+const PROBE_PID_B: i64 = 2;
+
+/// A mailbox that routes a `send` to the **peer** process's inbox when the
+/// destination is the peer pid, and to its own inbox otherwise.
+///
+/// The two inboxes are shared `Rc`s the probe owns, so the cooperative driver
+/// below can observe both when the ping-pong completes.
+#[derive(Clone)]
+struct PeeredMailbox {
+    /// This process's inbox.
+    own: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+    /// The counterpart's inbox (where a `send` addressed to the peer pid lands).
+    peer: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+    /// The peer's pid term.
+    peer_pid: Eterm,
+    /// This process's scan position (`loop_rec_end` advances it).
+    scan: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl PeeredMailbox {
+    fn new(
+        own: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+        peer: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+        peer_pid: Eterm,
+    ) -> PeeredMailbox {
+        PeeredMailbox {
+            own,
+            peer,
+            peer_pid,
+            scan: std::rc::Rc::new(std::cell::Cell::new(0)),
+        }
+    }
+}
+
+impl crate::Mailbox for PeeredMailbox {
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        if to == self.peer_pid {
+            self.peer.borrow_mut().push(message);
+        } else {
+            self.own.borrow_mut().push(message);
+        }
+        Ok(())
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        let scan = self.scan.get();
+        Ok(self.own.borrow().get(scan).copied())
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        self.scan.set(self.scan.get() + 1);
+        Ok(())
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        let scan = self.scan.get();
+        let mut own = self.own.borrow_mut();
+        if scan < own.len() {
+            own.remove(scan);
+        }
+        self.scan.set(0);
+        Ok(())
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        self.scan.set(0);
+        Ok(())
+    }
+
+    // The probe's receive shape carries no `recv_marker_*` instruction, so the
+    // marker family stays the seam's honest typed "cannot serve it" answer.
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        Err(crate::error::unsupported("receive_marker_reserve"))
+    }
+
+    fn receive_marker_bind(&mut self, _marker: Eterm, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_bind"))
+    }
+
+    fn receive_marker_use(&mut self, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_use"))
+    }
+
+    fn receive_marker_clear(&mut self, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_clear"))
+    }
+}
+
+/// The two inboxes plus the two pids the probe's processes route between.
+struct ProbeRouter {
+    a_inbox: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+    b_inbox: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+    a_pid: Eterm,
+    b_pid: Eterm,
+}
+
+impl ProbeRouter {
+    fn new() -> ProbeRouter {
+        ProbeRouter {
+            a_inbox: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            b_inbox: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            a_pid: make_small(PROBE_PID_A),
+            b_pid: make_small(PROBE_PID_B),
+        }
+    }
+}
+
+/// A BIF hook serving the three BIFs the probe's modules import:
+/// `erlang:self/0` (the process's own pid), and `erlang:'-'/2` / `erlang:'+'/2`
+/// over small integers. The baseline tier inlines the arithmetic fast path, so
+/// the hook is only reached on the interpreter tier — which is exactly the point.
+fn probe_bif_hook(self_pid: Eterm) -> crate::context::BifHook {
+    Box::new(
+        move |module: &str, function: &str, arity: u32, args: &[Eterm]| {
+            if module == "erlang" && function == "self" && arity == 0 {
+                return Ok(self_pid);
+            }
+            if module == "erlang"
+                && arity == 2
+                && (function == "-" || function == "+")
+                && args.len() == 2
+            {
+                let lhs = beam_term::signed_value(args[0]);
+                let rhs = beam_term::signed_value(args[1]);
+                let value = if function == "-" { lhs - rhs } else { lhs + rhs };
+                return Ok(make_small(value));
+            }
+            Err(crate::error::unsupported(&format!(
+                "srbench bif {module}:{function}/{arity}"
+            )))
+        },
+    )
+}
+
+/// The driver-process context: `bench/3`'s own pid, its inbox as `own` and the
+/// worker's as `peer`.
+fn probe_bench_context(router: &ProbeRouter) -> MinimalContext {
+    let mut ctx = MinimalContext::with_bif_hook(probe_bif_hook(router.a_pid));
+    ctx.set_mailbox(Box::new(PeeredMailbox::new(
+        std::rc::Rc::clone(&router.a_inbox),
+        std::rc::Rc::clone(&router.b_inbox),
+        router.b_pid,
+    )));
+    ctx
+}
+
+/// The worker-process context: `worker/1`'s own pid, its inbox as `own` and the
+/// driver's as `peer`.
+fn probe_worker_context(router: &ProbeRouter) -> MinimalContext {
+    let mut ctx = MinimalContext::with_bif_hook(probe_bif_hook(router.b_pid));
+    ctx.set_mailbox(Box::new(PeeredMailbox::new(
+        std::rc::Rc::clone(&router.b_inbox),
+        std::rc::Rc::clone(&router.a_inbox),
+        router.a_pid,
+    )));
+    ctx
+}
+
+/// `srbench:bench/3` — the driver loop of the copy-bound workload.
+///
+/// One iteration: build the payload with a **frame-preserving local call**
+/// (`call` → the continuation sub-block path), `self()`, `put_tuple2`, `send`,
+/// then the receive match (`loop_rec` / is_tuple / test_arity /
+/// get_tuple_element / is_eq_exact against a `Y` operand / remove_message /
+/// is_eq_exact against the bound variable), the two arithmetic `gc_bif`s on a `Y`
+/// operand, and a **linked** `call_last` back to the entry. An empty mailbox
+/// suspends at `wait_timeout`, resuming at the `loop_rec` label.
+fn probe_bench_code() -> Vec<Instr> {
+    vec![
+        Instr::Label(Label(1)), // the function label
+        Instr::Label(Label(2)), // the export entry
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(4),
+            live: 3,
+        },
+        Instr::InitYregs {
+            registers: vec![Operand::Y(0)],
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(1),
+        }, // y(1) = N
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::Y(2),
+        }, // y(2) = Worker
+        Instr::Move {
+            src: Operand::X(2),
+            dst: Operand::Y(3),
+        }, // y(3) = Acc
+        Instr::Label(Label(3)), // the loop head (also the tail-call target)
+        Instr::Test {
+            kind: TestKind::IsEqExact,
+            fail: Label(4),
+            args: vec![Operand::X(0), Operand::Integer(0)],
+        },
+        Instr::Move {
+            src: Operand::X(2),
+            dst: Operand::X(0),
+        },
+        Instr::DeallocateReturn(4),
+        Instr::Label(Label(4)), // N /= 0
+        Instr::Call {
+            arity: 0,
+            target: Label(31),
+        }, // T = payload()
+        Instr::TestHeap {
+            heap_need: beam_loader::HeapNeed::Words(3),
+            live: 1,
+        },
+        Instr::Bif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            args: vec![],
+            dst: Operand::X(1),
+        }, // self()
+        Instr::PutTuple2 {
+            dst: Operand::X(1),
+            elements: vec![Operand::X(1), Operand::X(0)],
+        }, // {self(), T}
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        }, // y(0) = T (the `case T2 of T` bound variable)
+        Instr::Move {
+            src: Operand::Y(2),
+            dst: Operand::X(0),
+        }, // x(0) = Worker
+        Instr::Send,
+        Instr::Label(Label(5)), // the receive loop head (the resume target)
+        Instr::LoopRec {
+            fail: Label(7),
+            dst: Operand::X(0),
+        },
+        Instr::Test {
+            kind: TestKind::IsTuple,
+            fail: Label(6),
+            args: vec![Operand::X(0)],
+        },
+        Instr::Test {
+            kind: TestKind::TestArity,
+            fail: Label(6),
+            args: vec![Operand::X(0), Operand::Integer(2)],
+        },
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 0,
+            dst: Operand::X(1),
+        },
+        Instr::Test {
+            kind: TestKind::IsEqExact,
+            fail: Label(6),
+            args: vec![Operand::X(1), Operand::Y(2)],
+        }, // the sender must be the worker (a `Y`-annotated boxed operand)
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 1,
+            dst: Operand::X(0),
+        },
+        Instr::RemoveMessage,
+        Instr::Test {
+            kind: TestKind::IsEqExact,
+            fail: Label(8),
+            args: vec![Operand::X(0), Operand::Y(0)],
+        }, // `case T2 of T`
+        Instr::GcBif {
+            arity: 2,
+            bif: ImportRef(1),
+            fail: NO_FAIL,
+            live: 3,
+            args: vec![Operand::Y(1), Operand::Integer(1)],
+            dst: Operand::X(0),
+        }, // x(0) = N - 1
+        Instr::GcBif {
+            arity: 2,
+            bif: ImportRef(2),
+            fail: NO_FAIL,
+            live: 3,
+            args: vec![Operand::Y(3), Operand::Integer(1)],
+            dst: Operand::X(2),
+        }, // x(2) = Acc + 1
+        Instr::Move {
+            src: Operand::Y(2),
+            dst: Operand::X(1),
+        }, // x(1) = Worker
+        Instr::CallLast {
+            arity: 3,
+            target: Label(2),
+            deallocate: 4,
+        },
+        Instr::Label(Label(6)), // a non-matching message
+        Instr::LoopRecEnd { target: Label(5) },
+        Instr::Label(Label(7)), // an empty mailbox
+        Instr::WaitTimeout {
+            target: Label(5),
+            time: Operand::Integer(30000),
+        },
+        Instr::Timeout,
+        Instr::DeallocateReturn(4),
+        Instr::Label(Label(8)), // `T2 =/= T`
+        Instr::CaseEnd {
+            value: Operand::X(0),
+        },
+    ]
+}
+
+/// `srbench:payload/0` — a leaf that builds a 3-tuple (the per-iteration term the
+/// workload copies). Reached through the frame-preserving `call` above, so the
+/// caller's continuation is a **sub-block** entry.
+fn probe_payload_code() -> Vec<Instr> {
+    vec![
+        Instr::Label(Label(31)),
+        Instr::TestHeap {
+            heap_need: beam_loader::HeapNeed::Words(4),
+            live: 0,
+        },
+        Instr::PutTuple2 {
+            dst: Operand::X(0),
+            elements: vec![Operand::Integer(1), Operand::Integer(2), Operand::Integer(3)],
+        },
+        Instr::Return,
+    ]
+}
+
+/// `srbench:worker/1` — the counterpart process: receive `{From, T}`, reply
+/// `{self(), T}`, loop. Suspends at `wait` on an empty mailbox.
+fn probe_worker_code() -> Vec<Instr> {
+    vec![
+        Instr::Label(Label(41)), // the function + export entry label
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 1,
+        },
+        Instr::InitYregs {
+            registers: vec![Operand::Y(0)],
+        },
+        Instr::Label(Label(42)), // the receive loop head (the resume target)
+        Instr::LoopRec {
+            fail: Label(45),
+            dst: Operand::X(0),
+        },
+        Instr::Test {
+            kind: TestKind::IsTuple,
+            fail: Label(43),
+            args: vec![Operand::X(0)],
+        },
+        Instr::Test {
+            kind: TestKind::TestArity,
+            fail: Label(43),
+            args: vec![Operand::X(0), Operand::Integer(2)],
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        }, // y(0) = the message
+        Instr::RemoveMessage,
+        Instr::GetTupleElement {
+            source: Operand::Y(0),
+            element: 0,
+            dst: Operand::X(0),
+        }, // x(0) = From (a `Y` source, so the reader deopts)
+        Instr::TestHeap {
+            heap_need: beam_loader::HeapNeed::Words(3),
+            live: 1,
+        },
+        Instr::Bif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            args: vec![],
+            dst: Operand::X(2),
+        }, // self()
+        Instr::GetTupleElement {
+            source: Operand::Y(0),
+            element: 1,
+            dst: Operand::X(3),
+        }, // x(3) = T
+        Instr::PutTuple2 {
+            dst: Operand::X(1),
+            elements: vec![Operand::X(2), Operand::X(3)],
+        }, // x(1) = {self(), T}
+        Instr::Send,
+        Instr::CallLast {
+            arity: 1,
+            target: Label(41),
+            deallocate: 2,
+        },
+        Instr::Label(Label(43)), // a non-matching message
+        Instr::LoopRecEnd { target: Label(42) },
+        Instr::Label(Label(45)), // an empty mailbox
+        Instr::Wait { target: Label(42) },
+    ]
+}
+
+/// The probe's two modules, with their export atoms.
+fn probe_modules() -> (Module, Atom, Module, Atom) {
+    let bench = build_module(
+        "srbench",
+        &[("erlang", "self", 0), ("erlang", "-", 2), ("erlang", "+", 2)],
+        vec![("bench", 3, probe_bench_code()), ("payload", 0, probe_payload_code())],
+        &[("bench", 3, Label(2))],
+    );
+    let bench_atom = export_atom(&bench, "bench");
+    let worker = build_module(
+        "srworker",
+        &[("erlang", "self", 0)],
+        vec![("worker", 1, probe_worker_code())],
+        &[("worker", 1, Label(41))],
+    );
+    let worker_atom = export_atom(&worker, "worker");
+    (bench, bench_atom, worker, worker_atom)
+}
+
+/// Drive `ops` round trips of the two-process ping-pong on `tier`, returning
+/// `(result, reductions_charged, inbox_leftovers)`.
+///
+/// The two machines are driven cooperatively: the worker parks first (empty
+/// inbox), the driver sends and parks, and then the two alternate — worker resume
+/// (consume + reply), driver resume (consume + next send) — until the driver's
+/// counter reaches zero and `bench/3` returns the iteration count.
+fn drive_probe(
+    bench: &Module,
+    bench_atom: Atom,
+    worker: &Module,
+    worker_atom: Atom,
+    ops: u32,
+    tier: Tier,
+) -> Result<(Eterm, u64, (usize, usize))> {
+    let router = ProbeRouter::new();
+    let mut driver_ctx = probe_bench_context(&router);
+    let mut worker_ctx = probe_worker_context(&router);
+    let mut driver = Machine::new();
+    let mut worker_machine = Machine::new();
+    let mut reductions = 0u64;
+
+    // The worker parks on the empty inbox first.
+    let mut worker_outcome = worker_machine.run_export_outcome_with_tier(
+        worker,
+        worker_atom,
+        1,
+        &[router.a_pid],
+        &mut worker_ctx,
+        tier,
+    )?;
+    reductions += worker_machine.reductions();
+
+    // The driver sends the first message and parks waiting for the reply.
+    let mut driver_outcome = driver.run_export_outcome_with_tier(
+        bench,
+        bench_atom,
+        3,
+        &[make_small(ops as i64), router.b_pid, make_small(0)],
+        &mut driver_ctx,
+        tier,
+    )?;
+    reductions += driver.reductions();
+
+    let mut result = None;
+    for _ in 0..=ops {
+        if let RunOutcome::Returned(value) = driver_outcome {
+            result = Some(value);
+            break;
+        }
+        let (func, pc) = match driver_outcome {
+            RunOutcome::Wait { func, pc } => (func, pc),
+            RunOutcome::Returned(_) => unreachable!("handled above"),
+        };
+        let (worker_func, worker_pc) = match worker_outcome {
+            RunOutcome::Wait { func, pc } => (func, pc),
+            RunOutcome::Returned(_) => {
+                return Err(crate::error::unsupported(
+                    "srbench probe: the worker returned before the driver",
+                ))
+            }
+        };
+        worker_outcome = worker_machine.resume_outcome_with_tier(
+            worker,
+            worker_func,
+            worker_pc,
+            &mut worker_ctx,
+            tier,
+        )?;
+        reductions += worker_machine.reductions();
+
+        driver_outcome =
+            driver.resume_outcome_with_tier(bench, func, pc, &mut driver_ctx, tier)?;
+        reductions += driver.reductions();
+    }
+
+    let value = result.ok_or_else(|| {
+        crate::error::unsupported("srbench probe: the driver never returned")
+    })?;
+    let a_left = router.a_inbox.borrow().len();
+    let b_left = router.b_inbox.borrow().len();
+    Ok((value, reductions, (a_left, b_left)))
+}
+
+/// `/proc/loadavg` as a string (empty when unreadable) — the probe's timing
+/// numbers are only meaningful next to the host load.
+fn probe_loadavg() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "<unavailable>".to_string())
+}
+
+/// The printed structural counter block for one tier's counting pass.
+fn print_probe_counters(label: &str, counters: &counters::Counters) {
+    println!("--- {label}: baseline structural counters (one pass, recording ON) ---");
+    println!(
+        "  jit_step_one={} jit_step_ext={} | block_entry lookups={} hits={} entered={} | \
+         driver round_trips={} driver_interp_steps={}",
+        counters.step_one,
+        counters.step_ext,
+        counters.block_entry_lookups,
+        counters.block_entry_hits,
+        counters.block_entry_natives,
+        counters.driver_round_trips,
+        counters.driver_interp_steps,
+    );
+    println!(
+        "  prologue: jit_set_position={} jit_publish_y={} jit_refresh_y={}",
+        counters.set_position, counters.publish_y, counters.refresh_y
+    );
+    println!(
+        "  call_ext: resolved={} declined={} fallback_to_step_one={}",
+        counters.ext_call_resolved, counters.ext_call_declined, counters.ext_call_fallback
+    );
+    println!("  driver round trips by word: {:?}", counters.round_trips_by_word);
+    let mut rows: Vec<(&String, &u64)> = counters.deopts_by_variant.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    println!("  deopts by variant (descending):");
+    for (name, count) in rows {
+        println!("    {name:<26} {count}");
+    }
+}
+
+/// The focused, in-process measurement of the two-process copy-bound shape: it
+/// pins cross-tier result equality, prints ns/op for **both** tiers with
+/// `/proc/loadavg`, and then runs one recording pass per tier to dump the
+/// structural counters (per-opcode deopts, block-entry/round-trip and prologue
+/// counts, and the reductions each tier charges).
+///
+/// This is a *diagnosis* harness: it asserts only correctness and reaches no
+/// conclusion from the wall-clock numbers (the host is shared).
+#[test]
+fn the_two_process_copy_bound_shape_is_measured_on_both_tiers() {
+    counters::set_enabled(false);
+    counters::reset();
+
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+
+    // 1. Correctness on both tiers, on a small op count.
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let (value, _reductions, leftovers) =
+            drive_probe(&bench, bench_atom, &worker, worker_atom, 16, tier)
+                .unwrap_or_else(|e| panic!("{tier:?}: {e:?}"));
+        assert_eq!(
+            value,
+            make_small(16),
+            "{tier:?}: bench/3 must return the iteration count"
+        );
+        assert_eq!(
+            leftovers,
+            (0, 0),
+            "{tier:?}: every message must be consumed by both processes"
+        );
+    }
+
+    println!("=== srbench two-process copy-bound probe ===");
+    println!("loadavg (start): {}", probe_loadavg());
+
+    // 2. Timed passes: warmup (populates the compiled-block cache) then measure.
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let _ = drive_probe(
+            &bench,
+            bench_atom,
+            &worker,
+            worker_atom,
+            PROBE_WARMUP_OPS,
+            tier,
+        )
+        .expect("the warmup pass completes");
+        let start = std::time::Instant::now();
+        let (value, reductions, _) = drive_probe(
+            &bench,
+            bench_atom,
+            &worker,
+            worker_atom,
+            PROBE_MEASURE_OPS,
+            tier,
+        )
+        .expect("the timed pass completes");
+        let elapsed = start.elapsed();
+        assert_eq!(value, make_small(PROBE_MEASURE_OPS as i64));
+        println!(
+            "{:>12} tier: {:>11.2} ns/op over {} ops in {:?} (reductions charged across all slices: {})",
+            tier.name(),
+            elapsed.as_nanos() as f64 / PROBE_MEASURE_OPS as f64,
+            PROBE_MEASURE_OPS,
+            elapsed,
+            reductions,
+        );
+    }
+
+    // 3. Counting passes (recording ON) — one per tier, small op count.
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        counters::reset();
+        counters::set_enabled(true);
+        let (value, reductions, _) = drive_probe(
+            &bench,
+            bench_atom,
+            &worker,
+            worker_atom,
+            PROBE_COUNT_OPS,
+            tier,
+        )
+        .expect("the counting pass completes");
+        counters::set_enabled(false);
+        let snapshot = counters::snapshot();
+        assert_eq!(value, make_small(PROBE_COUNT_OPS as i64));
+        println!(
+            "=== counting pass: {:>12} tier, {} ops, reductions charged = {} ===",
+            tier.name(),
+            PROBE_COUNT_OPS,
+            reductions,
+        );
+        print_probe_counters(tier.name(), &snapshot);
+    }
+
+    println!("loadavg (end): {}", probe_loadavg());
+}
+
+/// **The entry-lookup pin**: the baseline tier's per-slice artifact lookup must not
+/// re-hash the module's decoded IR.
+///
+/// `CodeCache::compiled_handle` takes a bare `&Module` on the tier-entry path
+/// (`run_baseline_cached{,_outcome,_label_outcome,_resume_outcome}`), and its
+/// address-keyed resolution memo can only be filled from a shared `Arc<Module>`
+/// (the `Weak` liveness proof a pointer key needs). So a host that holds the
+/// module as an `Arc` and warms the memo once — the way the cross-module callee
+/// path already does — makes every later slice lookup an O(1) probe; a host that
+/// does not pays one full `module_fingerprint` re-hash **per slice**.
+///
+/// This test measures the re-hash count on the two-process copy-bound shape and
+/// asserts the *warmed* one is zero, which is what makes the tier's own per-slice
+/// overhead visible instead of being dominated by the IR hash. It names the tier
+/// explicitly (`Tier::BaselineJit`).
+#[test]
+fn the_entry_lookup_does_not_rehash_the_module_ir_once_the_memo_is_warmed() {
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+    let bench = std::sync::Arc::new(bench);
+    let worker = std::sync::Arc::new(worker);
+
+    // Cold: the tier-entry lookup takes the content-hash path on every slice.
+    let before = crate::jit::cache::fingerprint_calls();
+    let (value, _, _) = drive_probe(&bench, bench_atom, &worker, worker_atom, 16, Tier::BaselineJit)
+        .expect("the cold probe completes");
+    let cold = crate::jit::cache::fingerprint_calls() - before;
+    assert_eq!(value, make_small(16));
+    assert!(
+        cold >= 32,
+        "the unwarmed tier-entry path is expected to re-hash the IR per slice, saw {cold}"
+    );
+
+    // Warm: an `Arc`-backed warm of the same two addresses (the `Arc` payload IS the
+    // `Module`, so the driver's later `&Module` lookups land on the same memo key).
+    crate::jit::cache::cached_module_blocks(&bench).expect("stage bench");
+    crate::jit::cache::cached_module_blocks(&worker).expect("stage worker");
+
+    let before = crate::jit::cache::fingerprint_calls();
+    let (value, _, leftovers) =
+        drive_probe(&bench, bench_atom, &worker, worker_atom, 64, Tier::BaselineJit)
+            .expect("the warmed probe completes");
+    let warm = crate::jit::cache::fingerprint_calls() - before;
+    assert_eq!(value, make_small(64));
+    assert_eq!(leftovers, (0, 0));
+    assert_eq!(
+        warm, 0,
+        "a warmed entry module must be resolved without re-hashing its IR"
+    );
+}
+
+/// **The receive/Send zero-deopt pin**: the `send` + receive-control family must be
+/// lowered as native code, not paid as a per-instruction `jit_step_one` deopt.
+///
+/// The two-process copy-bound probe exercises exactly this family (`send`, `loop_rec`,
+/// `loop_rec_end`, `wait_timeout`, `timeout`, `remove_message`) through the real mailbox
+/// seam, so a recording pass over it names the tier's deopts by opcode. With the family
+/// emitted through the `jit_receive` helper (`super::receive`) none of its opcodes may
+/// appear among the deopts, and the parser/ext-helper counter must stay zero — the tier
+/// is named explicitly (`Tier::BaselineJit`).
+///
+/// The total deopt count is pinned too: the family accounted for the majority of the
+/// pre-lowering deopts (642 of 1734 per 64 ops — `LoopRec` 257, `RemoveMessage` 128,
+/// `Send` 128, `Wait` 65, `WaitTimeout` 64), so the count must fall by at least that
+/// much. The remaining deopts are the structural/metadata opcodes (`PutTuple2`,
+/// `TestHeap`, `Allocate`, `InitYregs`, `Bif`, `GetTupleElement`, `Test`, `Call`) that
+/// are still the documented per-instruction deopt.
+#[test]
+fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+
+    counters::reset();
+    counters::set_enabled(true);
+    let (value, _, leftovers) = drive_probe(
+        &bench,
+        bench_atom,
+        &worker,
+        worker_atom,
+        PROBE_COUNT_OPS,
+        Tier::BaselineJit,
+    )
+    .expect("the counting pass completes");
+    counters::set_enabled(false);
+    let snapshot = counters::snapshot();
+
+    assert_eq!(value, make_small(PROBE_COUNT_OPS as i64));
+    assert_eq!(leftovers, (0, 0), "every message must be consumed");
+    assert_eq!(
+        snapshot.step_ext, 0,
+        "the probe's modules make no `call_ext*` call"
+    );
+    for opcode in [
+        "Send",
+        "LoopRec",
+        "LoopRecEnd",
+        "Wait",
+        "WaitTimeout",
+        "Timeout",
+        "RemoveMessage",
+    ] {
+        assert!(
+            !snapshot.deopts_by_variant.contains_key(opcode),
+            "`{opcode}` must be lowered natively, but it deopted {} time(s); \
+             deopts by variant: {:?}",
+            snapshot.deopts_by_variant.get(opcode).copied().unwrap_or(0),
+            snapshot.deopts_by_variant,
+        );
+    }
+    assert!(
+        snapshot.step_one <= 1100,
+        "the receive/Send family accounted for 642 of the 1734 pre-lowering deopts, so the \
+         total must have fallen below 1100; saw {} ({:?})",
+        snapshot.step_one,
+        snapshot.deopts_by_variant,
+    );
+    print_probe_counters(Tier::BaselineJit.name(), &snapshot);
+}

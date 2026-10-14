@@ -198,7 +198,11 @@ use crate::Step;
 
 mod code;
 mod emit;
+mod receive;
 mod runtime;
+
+#[cfg(test)]
+mod counters;
 
 #[cfg(test)]
 mod tests;
@@ -513,7 +517,11 @@ fn enter_compiled(
     func: u32,
     pc: u32,
 ) -> Option<i64> {
-    let (block_entry, bound) = compiled.native_entry(module, func, pc)?;
+    let entry = compiled.native_entry(module, func, pc);
+    // Structural counter: one driver block-entry lookup, hit or miss.
+    #[cfg(test)]
+    counters::record_block_entry(entry.is_some());
+    let (block_entry, bound) = entry?;
     if let Some(highest) = bound {
         // SAFETY: `rt` is the live driver-owned runtime block and its `machine`
         // pointer points at the driver's live `Machine`; the driver holds no
@@ -523,6 +531,9 @@ fn enter_compiled(
             return None;
         }
     }
+    // Structural counter: the lookup is entered (the register-file guard passed).
+    #[cfg(test)]
+    counters::record_block_entered();
     // SAFETY: `block_entry` points just past the start of a complete native
     // function emitted by `emit_block` with exactly the `NativeBlock` signature
     // (`extern "C" fn(*mut JitRuntime) -> i64`), inside a buffer sealed
@@ -907,6 +918,10 @@ fn drive(
             }
         };
         if let Some(word) = native {
+            // Structural counter: the driver had to decode a block-ABI word (a
+            // block-return round-trip), classified by that word.
+            #[cfg(test)]
+            counters::record_driver_round_trip(word);
             // The compiled block just ran, storing straight into `machine.x` (and,
             // potentially, the FR file) through the raw pointer it holds — writes the
             // `set_x`/`set_fr` high-water marks cannot observe. Declare the register
@@ -966,6 +981,12 @@ fn drive(
                 }
                 None => return Err(error::unsupported("jit: bad block target")),
             }
+        } else {
+            // Structural counter: no native entry for this address, so the driver
+            // takes exactly one interpreter step (the documented per-instruction
+            // deopt for an address the artifact compiled no block for).
+            #[cfg(test)]
+            counters::record_driver_interp_step();
         }
 
         // SAFETY: the native call returned, so no `&mut` derived from `rt` is alive;
