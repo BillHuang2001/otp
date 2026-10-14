@@ -496,6 +496,39 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
 * **Open observation — the crash report's `initial call: supervisor_bridge:standard_error/1` does not match
   the expected `{gen_server,init_it,6}`.** Worth a future check of the floor's initial-call / entry-module
   answer.
+* **The `standard_error` `supervisor_bridge` child's `error:badarg` — pinned to the
+  `gen_server:init_it/2` catch; the missing callee frame makes it a `beam_engine` blocker.**
+  `BEAM_RT_BOOT_TRACE=1 beam_rt -noshell -boot bootstrap/bin/start` shows the failing process (pid
+  `<0.9.0>` = `ProcessId { number: 9, serial: 0 }`) running `erlang:put/2` ×2
+  (`proc_lib:init_p_do_apply/3`'s `'$ancestors'`/`'$initial_call'`), then `erlang:apply/3` (the
+  `gen_server:init_it/6` entry), then `erlang:register/2`, `lists:keyfind/3`, `erlang:make_ref/0`,
+  `erlang:make_fun/3` ×4, `lists:keyfind/3`, `erlang:unregister/1`, and finally
+  `call_bif erlang:raise/3 ["'error'", "'badarg'", "Eterm(…)"]` — the `{'EXIT', Class, Reason,
+  Stacktrace}` clause at `gen_server.erl:2270-2272` (`gen:unregister_name(Name0)` then
+  `erlang:raise(Class, Reason, Stacktrace)`). The **inner** `Class = error`, `Reason = badarg`; the
+  inner `Stacktrace` term is non-immediate (a list), and the engine's decoded `Raise` for that call
+  carries `stacktrace: StackTrace { frames: [] }` (the third argument is dropped). Instrumenting
+  `gen_server:init_it/2`'s catch prints the inner `S` as
+  `[{gen_server,init_it,2,[{file,"gen_server.erl"},{line,2279}]},
+  {gen_server,init_it,6,[{file,"gen_server.erl"},{line,2236}]}]` (2279 = the `catch` line of
+  `try {ok, Mod:init(Args)}`, 2236 = the `case init_it(Mod, Args) of` call site): the stacktrace
+  carries **no `supervisor_bridge:init/1` frame and no `standard_error` frame at all**, so the raise is
+  attributed to the `Instr::Apply` for `Mod:init(Args)` rather than to a frame inside the callee.
+  Instrumenting `supervisor_bridge:init/1` to `erlang:display/1` each step shows
+  `standard_error:init([])` → `{ok,Pid,Pid}`, `link(Pid)` and `report_progress/4` (the `?LOG_INFO`
+  `logger:macro_log` path, whose `fun supervisor_bridge:format_log/2` `make_fun/3` group is the one in
+  the trace) all completing, so the bare `badarg` is raised **after** `report_progress` — in the
+  `#state{}` construction / `gen_server:init_it/6` continuation, or by the engine at the cross-module
+  apply. **Harness obstacle (why the fixture route is required):** `-pa DIR` DOES win under the
+  `-eval`/`run` route (`beam_rt -noshell -pa /tmp/sbx -eval
+  'io:format("~p~n",[code:which(supervisor_bridge)]),halt(0).'` → `"/tmp/sbx/supervisor_bridge.beam"`,
+  exit 0) but is **not honoured on the `-boot` route** — an instrumented `supervisor_bridge.beam` on
+  `/tmp/sbx` never emits its markers during `-noshell -pa /tmp/sbx -boot bootstrap/bin/start`, so the
+  boot chain resolves `supervisor_bridge` from a directory ahead of the prepended path. The faithful
+  repro is a `run` fixture under `tests/fixtures/` (`run/0` = a scheduled process starting the kernel
+  supervision tree and printing the caught `{Class,Reason,Stacktrace}` per child). **Ownership:** the
+  missing callee frame and the dropped `erlang:raise/3` stacktrace argument are `beam_engine` shapes
+  (the `build_stacktrace` frame-drop class below) — a sibling-crate blocker, not an in-node value.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs
   **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp`
