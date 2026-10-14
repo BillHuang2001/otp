@@ -826,6 +826,35 @@ impl RuntimeContext<'_> {
         Ok(self.runtime.self_pid.to_eterm())
     }
 
+    // -- erlang:hibernate/0 ---------------------------------------------------
+
+    /// `erlang:hibernate/0`: continue, answering the atom `true`.
+    ///
+    /// `erlang:hibernate/0` is an OTP-30 **instruction**, not a `bif.tab` BIF: the C's
+    /// `erts/emulator/beam/emu/ops.tab:896-898` rewrites `call_ext erlang:hibernate/0` to
+    /// `i_hibernate` (declared at `ops.tab:975`). This runtime's `beam_loader` performs no
+    /// such transform, so the call stays a `call_ext`; `erlang` is a floor namespace
+    /// ([`FLOOR_MODULES`](super::FLOOR_MODULES)), so the engine refuses to enter it
+    /// in-machine and the call reaches this arm.
+    ///
+    /// The C's `erts_hibernate` (`erts/emulator/beam/beam_common.c:1568-1602`) saves the
+    /// argument registers, and — when no signal is pending — shrinks the heap
+    /// (`erts_garbage_collect_hibernate`) and clears the process's ACTIVE flag
+    /// (`ERTS_PSFLG_ACTIVE`), then **returns** and execution continues at the next
+    /// instruction (it never blocks itself; the blocking is done by the `receive` that
+    /// *follows* a hibernate call, e.g. `gen_server:loop_wakeup/4`,
+    /// `lib/stdlib/src/gen_server.erl:2343-2348`). Those effects are memory/scheduling
+    /// optimizations with no result difference for any ordinary caller.
+    ///
+    /// This runtime therefore models "hibernate" as **continue**: it answers `true` and does
+    /// nothing else, because its process heap is a single nursery it cannot shrink in place
+    /// and it models no ACTIVE flag. The caller's own following `receive` blocks the process,
+    /// so the observable behaviour matches. The only OTP callers of `erlang:hibernate/0`
+    /// (`gen_server.erl:2340`, `gen_statem.erl:3587`) both enter a `receive` immediately
+    /// afterwards and use no return value, so no observable result depends on the heap shrink.
+    pub(super) fn hibernate_0(&mut self) -> Result<Eterm> {
+        self.atom("true")
+    }
     // -- whereis/1, register/2, unregister/1, module_loaded/1 -----------------
 
     /// `erlang:whereis(Name)`: the pid registered under `Name`, or the atom `undefined`.
@@ -1460,6 +1489,23 @@ mod tests {
     }
 
     #[test]
+    fn hibernate_continues_and_answers_true() {
+        // `erlang:hibernate/0` is an OTP-30 instruction modelled here as "continue": it
+        // answers the atom `true` (the C's `erts_hibernate` only shrinks the heap and clears
+        // the ACTIVE flag; the caller's own following `receive` does the blocking).
+        let mut runtime = runtime();
+        let answer = call(&mut runtime, "erlang", "hibernate", &[]).expect("erlang:hibernate/0");
+        assert_eq!(
+            atom_name(&runtime, answer),
+            Some("true"),
+            "hibernate/0 answers true"
+        );
+        // The arity is exact: `hibernate/1` is not a floor arm and falls through.
+        assert!(
+            call(&mut runtime, "erlang", "hibernate", &[NIL]).is_err(),
+            "hibernate/1 is not a floor BIF"
+        );
+    }    #[test]
     fn processes_lists_the_live_pids() {
         let mut runtime = runtime();
         let all = call(&mut runtime, "erlang", "processes", &[]).expect("processes/0");

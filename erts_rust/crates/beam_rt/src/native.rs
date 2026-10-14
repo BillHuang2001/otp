@@ -35,6 +35,7 @@
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
 //! | `erlang:process_info/2` | reads a **process's** heap/GC observables out of this runtime's own process table (`beam_gc`'s `HeapInfo`; contract A.8) |
 //! | `erlang:process_flag(monitor_nodes \| {monitor_nodes, Opts}, Bool)` | the undocumented node-monitor flag `net_kernel:monitor_nodes/1,2` sets: the `beam_bifs` `ProcessHook` seam takes an **atom** flag, so the tuple/option-map form is served here from the runtime's own per-pid monitor-node store (contract A.5/A.9, `src/native/process.rs`) |
+//! | `erlang:hibernate/0` | an OTP-30 **instruction** (`emu/ops.tab:896-898` rewrites `call_ext erlang:hibernate/0` to `i_hibernate`), not a `bif.tab` BIF; this runtime's loader performs no such transform, so the call reaches the floor, which models "hibernate" as **continue** (the C's `erts_hibernate` only shrinks the heap and clears the ACTIVE flag; the caller's own following `receive` blocks) — `src/native/process.rs` |
 //! | `init:get_argument/1` | reads the parsed command line (contract A.6, `RuntimeConfig::init_args`) |
 //! | `init:get_plain_arguments/0` | the (always empty) plain-argument list — the CLI models no plain arguments |
 //! | `init:get_arguments/0` | the whole command line, in order, from `RuntimeConfig::init_args`, preceded by the emulator's own automatic flags (`root`/`bindir`/`progname`/`home`) |
@@ -395,6 +396,17 @@ impl RuntimeContext<'_> {
             // every other flag — an ordinary atom flag still reaches the registry unchanged.
             // See [`process`](crate::native::process).
             ("erlang", "process_flag", 2) => self.process_flag_native(args),
+            // `erlang:hibernate/0` is an OTP-30 **instruction** (`emu/ops.tab:896-898`
+            // rewrites `call_ext erlang:hibernate/0` to `i_hibernate`), not a `bif.tab` BIF.
+            // This runtime's loader performs no such transform, so the call stays a
+            // `call_ext`; `erlang` is a floor namespace, so the engine refuses to enter it
+            // in-machine and the call reaches this arm. The C's `erts_hibernate`
+            // (`beam_common.c:1568-1602`) saves the argument registers, shrinks the heap and
+            // clears the process's ACTIVE flag, then returns and execution continues at the
+            // next instruction — no result difference for a caller whose next action is the
+            // `receive` hibernation precedes — so the floor answers the atom `true` and does
+            // nothing else. See [`process`].
+            ("erlang", "hibernate", 0) => Some(self.hibernate_0()),
             // The on-demand collection (contract A.7). `erlang:garbage_collect/0` is the
             // `erlang.erl` wrapper over `erts_internal:garbage_collect(major)`
             // (`erlang.erl:3051-3053`), `/1` is the wrapper over

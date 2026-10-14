@@ -47,7 +47,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
 | `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1` |
-| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
+| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; `hibernate/0` (the OTP-30 instruction, modelled as **continue**); the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
 | `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` |
 | `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs` and the end-to-end `memory/binary_e2e.rs` oracle case) |
@@ -179,7 +179,23 @@ through `Runtime::monitor_nodes_add`/`Runtime::monitor_nodes_remove` — the per
 `false` ⇒ `2`, then `false` ⇒ `0`; `process_flag(monitor_nodes, true)` ⇒ `0`;
 `process_flag({monitor_nodes, #{}}, true)` ⇒ `0`; `process_flag({monitor_nodes, #{bogus=>1}}, true)`
 ⇒ `error:badarg`. Unit tests in `process.rs`.
-`spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the
+
+**`erlang:hibernate/0` is an OTP-30 instruction, modelled as "continue" (contract A.9). Served by
+`process.rs::hibernate_0`, which answers the atom `true` and does nothing else.** `erlang:hibernate/0`
+is not a `bif.tab` BIF: the C's `erts/emulator/beam/emu/ops.tab:896-898` rewrites
+`call_ext erlang:hibernate/0` to the `i_hibernate` instruction (`ops.tab:975`). This runtime's
+`beam_loader` performs no such transform, so the call stays a `call_ext`; `erlang` is a floor
+namespace, so the engine refuses to enter it in-machine and the call reaches the floor. The C's
+`erts_hibernate` (`beam_common.c:1568-1602`) saves the argument registers and — when no signal is
+pending — shrinks the heap (`erts_garbage_collect_hibernate`) and clears the process's ACTIVE flag
+(`ERTS_PSFLG_ACTIVE`), then **returns** and execution continues at the next instruction: it never
+blocks itself, and its effects are memory/scheduling optimizations with no result difference for an
+ordinary caller. This runtime's process heap is a single nursery it cannot shrink in place and it
+models no ACTIVE flag, so "hibernate" is modelled as **continue** — the caller's own following
+`receive` does the blocking, so the observable behaviour matches. The only OTP callers of
+`erlang:hibernate/0` (`lib/stdlib/src/gen_server.erl:2340`, `gen_statem.erl:3587`) both enter a
+`receive` immediately afterwards and use no return value, so no observable result depends on the
+heap shrink. Unit test in `process.rs` (`hibernate_continues_and_answers_true`).`spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the
 child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the
 policy-aware `Runtime::spawn_*_with_policy`.
 
