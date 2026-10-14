@@ -411,11 +411,9 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   innermost `{M,F,Args,Loc}` frame, so the wrong case arm runs → `{callback_crashed,{error,undef,[]}}`
   → `case_clause` in `kernel:start/2` → the permanent kernel application tears down → directive 19's
   `{load_application,stdlib}` `gen_server:call` finds no `application_controller` → `{noproc,…}`.
-  Minimal repro (both verified): oracle
-  `erl -noshell -eval 'io:format("~p~n",[erlang:function_exported(logger_simple_h,changing_config,3)]), try apply(logger_simple_h,changing_config,[a,b,c]) catch C:R:S -> io:format("~p~n",[{C,R,S}]) end, halt(0).'`
-  → `false` and `{error,undef,[{logger_simple_h,changing_config,[a,b,c],[]},{erl_eval,do_apply,7,…},…]}`;
-  ours `beam_rt -noshell -eval 'try apply(logger_simple_h,changing_config,[a,b,c]) catch C:R:S -> io:format("~p~n",[{C,R,S}]) end'`
-  → `{error,undef,[]}`. **Fix shape:** `beam_engine`'s `undef` raise path must carry the failed
+  Minimal repro (both verified): the same `try apply(logger_simple_h,changing_config,[a,b,c]) catch C:R:S -> …` one-liner under `erl -noshell` (oracle) and `beam_rt -noshell` (ours) gives the oracle
+  `{error,undef,[{logger_simple_h,changing_config,[a,b,c],[]},{erl_eval,do_apply,7,…},…]}` (head = the args
+  item) vs ours `{error,undef,[]}`. **Fix shape:** `beam_engine`'s `undef` raise path must carry the failed
   callee's MFA **and the argument list** so
   `families/exceptions/stacktrace.rs::symbolic_stacktrace` can prepend that `{M,F,Args,Loc}` item;
   `beam_common::StackFrame` (`crates/beam_common/src/error.rs:518-541`, currently
