@@ -45,8 +45,9 @@ submodules and their docs; do not look for `boot.rs` here.
   `is_preloaded_loaded(name)` report the loaded set. `Runtime::boot_script_id` **retains the loaded
   script's `{Name,Vsn}`** (set by `boot_from_script`/`boot_from_script_reporting`, read by the
   `init:script_id/0` floor entry) so the script's identity survives the call. **The CLI really runs a
-  boot script**: a `-boot FILE` invocation selects the `Action::Boot` arm (`../cli.rs::drive`), which
-  calls `Runtime::boot()` (the 22 preloaded `.beam`s) and then `Runtime::boot_from_script(&path)`.
+  boot script on every action but `-version`**: `../cli.rs`'s `boot_script_to_drive` resolves the script
+  (the explicit `-boot FILE` value, else the default `start`) and `boot_then` boots the 22 preloaded
+  `.beam`s and then executes it.
 - `code:which/1` / `code:all_loaded/0` / `code:is_loaded/1` render `preloaded` from the **name registry**
   (`../native/code.rs`), not from this cache; `code:all_loaded/0` explicitly filters preloaded names out
   of the cache so it does not list them twice.
@@ -112,7 +113,8 @@ registered but the directive has not resumed). A directive that has **already** 
 ## Where the real `start.boot` gets now
 Executing the real script (`bootstrap/bin/start.boot`, 22 instructions) with the CLI-equivalent
 configuration **runs all 22 directives to completion**, ending at the final `{progress,started}`
-(0-based directive index 21 of 22); the CLI `-boot` route exits **0** and the in-crate executor
+(0-based directive index 21 of 22); the CLI exits **0** on every action but `-version` (each drives the
+resolved script) and the in-crate executor
 (`boot_from_script` → `execute`) returns `Ok` (`BootStop` is `None`).
 The tail's 0-based indices: **12** `{kernelProcess,heart,{heart,start,[]}}`,
 **13** `{kernelProcess,logger,{logger_server,start_link,[]}}`, **14**
@@ -145,16 +147,18 @@ so `gen_server:loop_hibernate/4` (`lib/stdlib/src/gen_server.erl:2338`) does not
 - **Directive 20's file consult completes.** `c:erlangrc/0`'s file consult is
   `gen_server:call(file_server_2, {open,<the `$HOME` erlangrc path>,[read]}, infinity)`
   (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt`'s runtime-native
-  `file_server_2` service ([`../native/file_server.rs`](../native/CONTEXT.md)) is registered under
-  that name on every route **except** the boot-script one, where `Runtime::new` leaves it unregistered
-  so the booted `kernel_sup`'s own `file_server_2` child owns the name; that child answers the request
+  `file_server_2` service ([`../native/file_server.rs`](../native/CONTEXT.md)) is spawned unregistered
+  (`Runtime::new` gates it on `RuntimeConfig::drives_a_boot_script()`) on every route that drives a boot
+  script — every CLI action but `-version`, plus an explicit `-boot FILE` — so the booted
+  `kernel_sup`'s own `file_server_2` child owns the name; that child answers the request
   with `{error,enoent}` for a missing config file, which `c:erlangrc/0` treats as success, so the walk
-  proceeds to `{progress,started}`. On the other routes `c:erlangrc/0` likewise **returns**
-  `{error,enoent}` without raising for a missing config file (verified: `beam_rt -eval 'c:erlangrc()'` →
+  proceeds to `{progress,started}`. `c:erlangrc/0` likewise **returns** `{error,enoent}` without
+  raising for a missing config file (verified: `beam_rt -eval 'c:erlangrc()'` →
   `{error,enoent}`, the oracle's own answer).
 - **The CLI and the in-crate executor agree — both complete.** The CLI
   (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **0** with empty
-  **stdout** and empty **stderr**, as does the `run` action; no crash report is logged.
+  **stdout** and empty **stderr**, and so does every other action but `-version` when its own
+  instruction prints nothing; no crash report is logged.
   `tests/boot.rs`'s `the_cli_runs_the_real_boot_script_to_completion` asserts `stdout == ""` **and**
   `stderr == ""`, which both hold. The in-crate executor (`boot_from_script` → `execute`) returns
   `Ok`, so `BootStop` is `None` and `execute_reporting` reports the completion.
@@ -282,8 +286,9 @@ The `erl` shell-out is kept because no filesystem probe can see *every* installa
 from neither the shim nor this executable, and a wrapper `erl` may live outside the release it starts.
 Asking `erl` is authoritative, and a path is never fabricated: if neither probe produces a stdlib the
 resolution fails with the typed `cannot locate the system code path: …` error (exit 1). Consequence: a
-normal installation pays **no** `erl` start-up (measured on this host: `run …slice.beam slice:add/2 2 3` in
-0.116 s total, where the spawn alone costs ≈0.5 s).
+normal installation pays **no** `erl` start-up (measured on this host: a bare `-eval` invocation now
+takes ≈2.19 s wall, since it drives the default boot script on every action, where the resident `erl`
+shell-out alone costs ≈0.5 s and is still avoided).
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
@@ -384,15 +389,16 @@ normal installation pays **no** `erl` start-up (measured on this host: `run …s
   a synthetic-probe boot (the real script's first 20 directives + a `probe:run/0`
   `apply`, built with the oracle) proving the `application_controller` kernel process survives its
   short-lived directive process (`whereis` = a live pid); the CLI proving the real boot leaves a
-  live `logger` registered (`the_cli_boot_registers_a_live_logger_process`); and the preloaded-only
-  default.
+  live `logger` registered (`the_cli_boot_registers_a_live_logger_process`); and a bare `-noshell`
+  invocation with no `-boot` (exit **0** with empty stdout and stderr, its default boot script
+  producing no output).
 
 ## Notes for Agents — the `file_server_2` service
-The runtime-native **`file_server_2` service** (`../native/file_server.rs`) supplies the service under that name on every route **except** the boot-script one.
+The runtime-native **`file_server_2` service** (`../native/file_server.rs`) is spawned unregistered on every route that drives a boot script, and supplies the service under that name only where the runtime drives none.
 The service is a `beam_process::Process` born `Runnable` and never enqueued (the `init`/`self_pid` precedent), so the runner never executes it and `ProcessEntry` needs no new variant.
 `Runtime::service_file_requests` drains its mailbox as an additive `scheduler_pass` step and delivers the replies, which is what lets a `gen_server:call(file_server_2, …)` to the native service complete.
-**It is registered under `file_server_2` on every route except the boot-script one.** `Runtime::new` consults `RuntimeConfig::boot_script()` and, when the runtime is driving a real `-boot FILE` boot, spawns the service **unregistered** (`FileServices::start_unclaimed`) so that the booted `kernel_sup`'s own `file_server_2` child owns the name — an initial child start that finds the name already taken aborts that supervisor, and `kernel` is `permanent`.
-On the boot-script route the boot chain's final `{apply,{c,erlangrc,[]}}` directive (index 20) is answered by that booted child — OTP's own `file_server`/`file_io_server` Erlang — not by the native service; `c:erlangrc/0`'s `gen_server:call` at instruction 20 completes through it.
+**It is registered under `file_server_2` only where the runtime drives no boot script.** `Runtime::new` consults `RuntimeConfig::drives_a_boot_script()` and, whenever it holds — every CLI action but `-version`, plus an explicit `-boot FILE` — spawns the service **unregistered** (`FileServices::start_unclaimed`) so that the booted `kernel_sup`'s own `file_server_2` child owns the name — an initial child start that finds the name already taken aborts that supervisor, and `kernel` is `permanent`.
+On such a route the boot chain's final `{apply,{c,erlangrc,[]}}` directive (index 20) is answered by that booted child — OTP's own `file_server`/`file_io_server` Erlang — not by the native service; `c:erlangrc/0`'s `gen_server:call` at instruction 20 completes through it.
 The request/reply surface, the errno mapping, the io-device and the remaining gaps live in [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
 - **The native service is used instead of the real `file_server`.** The real Erlang
   `file_server`/`file_io_server` needs the wider `prim_file` NIF surface this runtime does not serve;
@@ -411,8 +417,8 @@ The request/reply surface, the errno mapping, the io-device and the remaining ga
 - `./bootscript.rs` → the OTP boot-script reader (`read`/`BootScript`/`Instruction`/`Mfa`/`Value`) + executor (`execute`/`execute_reporting`/`BootStop`)
 - `./drive.rs` → the bounded scheduler-drive helpers (`drive_scheduler`/`start_kernel_process`/`apply_boot_call`, plus `DRIVE_DEADLINE`/`KERNEL_BURST_*`/`APPLY_BLOCK_SLICES`)
 - `../runtime.rs` → `Runtime::boot` / `boot_if_needed` / `preloaded_loaded` / `is_preloaded_loaded`, and the boot-script glue `boot_from_script` / `load_code_module` / `add_code_path` / `register_boot_process` / `unlink_processes`
-- `../cli.rs` → the `Action::Boot` arm (`-boot FILE`) that drives `boot_from_script`
+- `../cli.rs` → `boot_script_to_drive`/`boot_then` (the resolved boot script every action but `-version` drives) and the `Action::Boot` arm that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
-- `../native/file_server.rs` → the native `file_server_2` service, registered under that name on every route except the boot-script one (not owned here; see `../native/CONTEXT.md`)
+- `../native/file_server.rs` → the native `file_server_2` service, registered under that name only where the runtime drives no boot script (not owned here; see `../native/CONTEXT.md`)
 - `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the boot's `{apply, …}` chains are entered through; read-only from this node)

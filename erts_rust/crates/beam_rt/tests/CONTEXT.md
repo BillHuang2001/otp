@@ -41,7 +41,11 @@ The **read** path is exercised on both routes; the **write** path is exercised i
 * `proc_lib_start.rs` — `run` action, `proc_lib:start[_link]/4` → `proc_lib:sync_start/2` (a different kernel module), oracle `{ok,pid}`.
 * `multimodule.rs` — single-pass `run_function`/`run_module`: a compiled fixture calling `lists:reverse/1`, `maps:get/2`, `ordsets:from_list|to_list/1` (a real stdlib module loaded on demand) and `binary:part/3`.
 * `io_scan.rs` — the `{get_until,…}` io-device request drives the real `erl_scan:tokens/4` (and `erl_parse` via `io:parse_erl_exprs/4`) on the engine.
-* `boot.rs` — the real `bootstrap/bin/start.boot` chain, which boots **all 22** directives to completion (ending at the final `{progress,started}`, index 21) with CLI `-boot` exit **0** and empty stdout/stderr; directive 20 `{apply,{c,erlangrc,[]}}` — the call that loads `c.beam` and reaches `file:open($HOME/.erlang,[read])` through the booted `kernel_sup`'s own `file_server_2` child — is reached and answered.
+* `boot.rs` — the real `bootstrap/bin/start.boot` chain, which boots **all 22** directives to completion (ending at the final `{progress,started}`, index 21) with CLI `-boot` exit **0** and empty stdout/stderr.
+* The drive is the CLI's boot-script drive, which **every** CLI action except `-version` performs (not only `-boot`): the script is the explicit `-boot FILE` value when given, else the literal default `start` (`src/cli.rs::DEFAULT_BOOT_SCRIPT`), resolved to `<Root>/bin/start.boot`.
+* On a plain `-eval`/`run` route the resolved script is therefore the **installation's own** `bin/start.boot`, not this repo's committed `bootstrap/bin/start.boot`.
+* Directive 20 `{apply,{c,erlangrc,[]}}` — the call that loads `c.beam` and reaches `file:open($HOME/.erlang,[read])` through the booted `kernel_sup`'s own `file_server_2` child — is reached and answered.
+* `a9_native_floor.rs`'s `init:script_id/0` coverage reports the **loaded** script's real header on the CLI routes, because the script is loaded before the action's own start instruction runs.
 
 ## Distribution (A.5) evidence
 The routing half is pinned hermetically by `dist_delivery.rs` and the live half by four peer suites against a real `erl`; `dist.rs`, `node_cookie.rs` and `pid_roundtrip.rs` cover the accepting (listener) boundary, the cookie and the pid wire round trip.

@@ -3,14 +3,23 @@
 Three **dated, HEAD-labelled** measurement snapshots of the Rust runtime, each taken with the **same
 method** so the behavioural changes that landed between them can be read off directly. `BEFORE` and
 `AFTER` are **historical records kept verbatim** — their figures describe the tree at *their* HEAD, not
-today's — and `CURRENT` is measured at the HEAD named in its own section and is the snapshot to quote
-for the present tree. This file is **not** a change log and does **not** supersede the tool-specific
+today's — and `CURRENT` is measured at the HEAD named in its own section and is the latest snapshot to
+quote for the present tree (its startup figures excepted — see *Current startup regime*).
+This file is **not** a change log and does **not** supersede the tool-specific
 records — for the bench driver's full environment record, its per-target tables and its methodology see
 [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md); for the per-call harness and the
 dispatch-cost narrative see [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md).
 
 Every number here is **measured, never modelled**. Nothing was fabricated; the sys-only workloads
 that cannot produce a Rust-side figure are recorded as `skipped(<reason>)` with no number.
+
+## Current startup regime (read before quoting any `startup_ms` figure)
+
+Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else the literal default `start` resolved to `<Root>/bin/start.boot` (the installation's own script, not this repo's committed `bootstrap/bin/start.boot`).
+A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 2.19 s wall** on this host.
+Every `startup_ms` figure below is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band) and its ratio to the oracle is that snapshot's; those numbers do not describe the current whole-process wall.
+The present whole-process wall is dominated by that ≈ 2.19 s boot, so **no startup advantage at a recorded margin survives** — quote the ≈ 2.19 s figure for the current runtime.
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 2.19 s boot, so those rows measure the loop against a far larger whole-process wall than the snapshots below record.
 
 # `BEFORE` snapshot — HEAD `3f24c5ec9d`
 
@@ -66,6 +75,7 @@ The `sys` / `rust` columns are the **per-unit metric** min-of-3 for each side (b
 for context; the ratio is the headline. `slice` is per-case **whole-process** wall (one call per process);
 the `foreign`/`list_walk`/`copy_bound`/`gc_bound` rows are **startup-cancelled marginals**
 (`(mean wall@N − mean wall@0) / N`), the interpreter-throughput signal.
+These `baseline`/`slice` figures are this snapshot's own preloaded-only-slice measurements; every CLI action now pays the boot script (see *Current startup regime*), so they are not the current whole-process wall.
 
 | workload | case | metric (unit) | **rust/sys (min of 3)** | range over 3 | sys (min of 3) | rust (min of 3) |
 |---|---|---|---|---|---|---|
@@ -90,8 +100,9 @@ the `foreign`/`list_walk`/`copy_bound`/`gc_bound` rows are **startup-cancelled m
 | `gc_bound` | `churn` | `ns_per_op` (ns) | **40.2** | 40.2–46.3 | 4 531.62 | 187 960.84 |
 
 **Reading.** The same two-directional story the bench driver records (see `RESULTS.md` §3.8):
-whole-process cost is far lower under Rust (`baseline` startup **0.126×**, `slice` cases
-**0.063×–0.238×**), while the per-unit interpreter cost is far higher (**9.6×–120.5×** across the
+whole-process cost at this HEAD was far lower under Rust (`baseline` startup **0.126×**, `slice` cases
+**0.063×–0.238×** — this snapshot's preloaded-only slice, not the boot-paying regime of *Current startup
+regime*), while the per-unit interpreter cost is far higher (**9.6×–120.5×** across the
 startup-cancelled marginals). The bands sit inside the `RESULTS.md` m6 bands (rust startup 0.14×,
 `foreign` 74.9×–131.4×, `list_walk` 108.7×, `copy_bound` 17.5×–188.4×, `gc_bound` 55.6×) — the
 rust side reads **lower** here because this host carried a far lighter load than the m6 pass
@@ -132,11 +143,9 @@ load drift, best-of-5 (bracket best-of-3 at `N1=4M`):
 | `nb2:absb/2` — `erlang:abs/1` (`call_ext`) | **322.3** |
 
 **Recorded prior figure / discrepancy.** `TRACE_AND_PERF.md` records ≈ **116 ns/call** for a
-non-inlinable BIF (e.g. `trunc/1`) via this same harness. At this HEAD, on this host, the non-inlinable
-BIF path reads **≈ 3× higher (~300–320 ns/call)**; the two non-inlinable BIFs agree with each other, so
-it is a genuine per-call cost at this state, not a one-BIF artefact. Whether this is a since-reintroduced
-dispatch cost or a measurement-context difference is **not reconciled here** and is flagged for the
-workstream that owns the dispatch prologue (it is the natural `AFTER` target of this snapshot).
+non-inlinable BIF (e.g. `trunc/1`) via this same harness; at this HEAD the non-inlinable BIF path reads
+**≈ 3× higher (~300–320 ns/call)**, the two non-inlinable BIFs agreeing with each other, and it is
+flagged as the `AFTER` target of this snapshot.
 
 ## External-repo workloads (sys-only) — not part of this Rust-side snapshot
 
@@ -437,6 +446,7 @@ the headline). `sys` is the min-of-3 over the default set (the oracle does not s
 `slice` is per-case **whole-process** wall (one call per process); the
 `foreign`/`list_walk`/`copy_bound`/`gc_bound` rows are **startup-cancelled marginals**
 (`(mean wall@N − mean wall@0) / N`), the interpreter-throughput signal.
+This snapshot's `baseline`/`slice` figures are its own preloaded-only-slice measurements; the current runtime pays the boot script on every action (see *Current startup regime*), so they are not the current whole-process wall.
 
 | workload | case | metric (unit) | **rust/sys default (min3)** | range | rust/sys INTERP (min3) | sys (min3) | rust default (min3) | rust INTERP (min3) |
 |---|---|---|---|---|---|---|---|---|
@@ -460,8 +470,9 @@ the headline). `sys` is the min-of-3 over the default set (the oracle does not s
 | `copy_bound` | `send_recv` | `ns_per_op` (ns) | **145.51** | 145.511–150.696 | 101.65 | 1 455.51 | 215 321.19 | 147 862.60 |
 | `gc_bound` | `churn` | `ns_per_op` (ns) | **29.90** | 29.904–30.194 | 55.18 | 4 283.39 | 129 331.85 | 240 007.25 |
 
-**Reading.** Whole-process cost is still far lower under Rust (`baseline` startup **0.141×**, `slice`
-cases **0.104×–0.297×**), while the per-unit interpreter cost is still far higher
+**Reading.** Whole-process cost at this HEAD was still far lower under Rust (`baseline` startup
+**0.141×**, `slice` cases **0.104×–0.297×** — this snapshot's preloaded-only slice, not the boot-paying
+regime of *Current startup regime*), while the per-unit interpreter cost is still far higher
 (**13.9×–145.5×** across the startup-cancelled marginals). `slice` peak RSS remains the one
 like-for-like cross-runtime memory row (one call per process): `sys` **71.57 MB**, `rust` **27.48 MB**
 → rust **2.60× lower** (essentially unchanged from `AFTER`'s 2.46×); the loop workloads' rust peak RSS
@@ -497,7 +508,9 @@ Both columns are the **min of 3** of the `rust` metric; `< 1×` means the baseli
 
 **Reading the tier effect.** The baseline JIT is a clear win for **`foreign`** (**0.73×–0.87×**) and
 **`gc_bound churn`** (**0.539×**), and neutral for `baseline`, `list_walk` and most `slice` cases —
-where the whole-process wall is dominated by `beam_rt` startup, not the interpreted loop. The only real
+where the whole-process wall is dominated by `beam_rt` startup (this snapshot's preloaded-only slice; the
+current runtime pays the ≈ 2.19 s boot-script drive on every action, see *Current startup regime*), not
+the interpreted loop. The only real
 regressions are the **module-graph-heavy one-shot** rows, `slice`'s `string_str_length` (**1.295×**),
 `queue_from_size` (**1.217×**) and `copy_bound`'s `send_recv` (**1.456×**): the first-entry compile cost
 the section below characterises. `fib`/`base64_encode_size`/`ordsets_from_size` read *better* on the
@@ -649,39 +662,31 @@ Result — `A/B > 1` ⇒ charge ON is dearer; the variant removed `Δ = A − B`
 **Verdict.**
 
 - **Above the spread — the charge's full cost is resolved:** `emqx_base62:decode/1` **+14.9 %**
-  (19 998 → 17 403 ns; ranges disjoint, Δ exceeds the larger range) and
-  `cowboy_bstr:capitalize_token/1` **+3.9 %** (23 739 → 22 857 ns; ranges disjoint, same test).
+  (19 998 → 17 403 ns) and `cowboy_bstr:capitalize_token/1` **+3.9 %** (23 739 → 22 857 ns), both with
+  disjoint 5-run ranges and a Δ exceeding the larger range.
 - **Sign consistent, magnitude at the noise floor:** `cowboy_bstr:to_lower/1` (+3.0 %),
   `emqx_base62:encode/1` (+3.3 %) and `list_walk` (+8.4 %) have **disjoint** 5-run ranges (5/5
-  rank-separated — `list_walk` only nominally so: A min 145.59 vs B max 145.46 ns, a 0.13 ns margin),
-  but in each case the delta of minima is *inside* the larger set's own min–max range. The sign is
-  rank-separable; the **magnitude is not separable from the noise floor at this N** — which is a
-  different, weaker claim than a quotable ratio.
-- **Not separable from the noise floor at this N, sign not even consistent:** every `baseline` and
-  `slice` row, all three `copy_bound` rows and `gc_bound churn` — the ranges overlap, and
-  `slice add`, `slice pick`, `slice calendar_last_day`, `slice queue_from_size`,
-  `slice base64_encode_size`, `slice ordsets_from_size`, `slice string_str_length`,
-  `copy_bound etf_roundtrip` and `copy_bound send_recv` read *cheaper* under A.
+  rank-separated) but a delta of minima *inside* the larger set's own min–max range, so the sign is
+  rank-separable and the **magnitude is not separable at this N**.
+- **Not separable from the noise floor, sign not even consistent:** every `baseline` and `slice` row, all
+  three `copy_bound` rows and `gc_bound churn` (overlapping ranges; several read *cheaper* under A).
 
 Which rows could show it at all:
 
-- **Process-startup-dominated — cannot show it.** `baseline` `startup_ms` (≈ 13.7 ms of process boot)
-  and every `slice` row: `slice` is scored as **whole-process wall for one call per OS process**
-  (13.9–27.4 ms), of which the interpreted work is a small fraction. Their A/B ranges overlap with
-  10 %–115 % relative spreads.
+- **Process-startup-dominated — cannot show it.** `baseline` `startup_ms` (≈ 13.7 ms of process boot —
+  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 2.19 s boot-script drive,
+  see *Current startup regime*) and every `slice` row (whole-process wall for one call per OS process,
+  13.9–27.4 ms), of which the interpreted work is a small fraction.
 - **Interpreted-work marginals — the rows that *can* show it.** `foreign` (per `cowboy_bstr` /
   `emqx_base62` call) is the only family that resolved it, at **+3.0 % to +14.9 %** of per-call time.
-  `copy_bound`'s three cases are dominated by the copy itself (`term_to_binary`/`binary_to_term`,
-  `ets:insert`/`lookup`, a send round-trip) and `gc_bound churn` by the allocate-and-abandon work plus
-  any collection (≈ 239 µs/op), so one reduction charge is a small share there — and their
-  startup-cancelled marginals are noisier (2–4 % min–max per set), which leaves it unresolved at
-  N = 5.
-- The case-to-case deltas span **+3.0 % to +14.9 %** while the three disjoint-but-inside-spread rows
-  sit at ≈ +3 % to +8 %, so the charge does **not** behave as a single per-instruction constant across
-  these workloads. That is consistent with variant (ii) also removing the **pre-emptions** the charge
-  induced (a loop that still reaches the `ensure_heap` doors keeps being charged in B; one that does
-  not is never pre-empted in B) — which is exactly why the figures here are stated as an **upper
-  bound** on the pure dyn call.
+  `copy_bound`'s three cases are dominated by the copy itself and `gc_bound churn` by the
+  allocate-and-abandon work plus any collection (≈ 239 µs/op), so one reduction charge is a small share
+  there — and their startup-cancelled marginals are noisier (2–4 % min–max per set), leaving it
+  unresolved at N = 5.
+- The case-to-case deltas span **+3.0 % to +14.9 %** while the disjoint-but-inside-spread rows sit at
+  ≈ +3 % to +8 %, so the charge is **not** a single per-instruction constant across these workloads —
+  consistent with variant (ii) also removing the **pre-emptions** the charge induced, which is why the
+  figures are an **upper bound** on the pure dyn call.
 
 **Take-away for the tree.** On the **interpreter** tier the shipped per-instruction charge costs up to
 **≈ 15 %** of per-call time on the most instruction-bound workload measured here and **≈ 3–4 %** on
@@ -774,24 +779,18 @@ The marginals (ns/call − control) move by the same ratios, since the control i
 both sides. Reading: the **immediate-returning** rows (items 1 + 3) fall **25–31 %**, the ETS rows
 (the two names that shared a slot) fall **8–16 %**, and the container rows of path B fall **11–12 %**
 — the copy-out + rewind they pay dominates them, so the prologue cut is a smaller share there.
-## The path-C regression the byte hash introduced — found, diagnosed, fixed
-The first AFTER pass showed **path C (`Runtime::run_scheduled`, a compiled `.beam` loop of
-`lists:reverse/1` + `erlang:length/1`) at 659.53 / 663.73 / 645.48 ns/iteration vs BEFORE's
-285.23 / 284.96 / 286.29** — i.e. **2.3× dearer**, and reproducible at *low* load too (662.31 at
-loadavg 3.97), so it was a real regression, not the load difference.
-**Cause:** the naive byte hash put `lists:reverse/1` **and** `erlang:length/1` in the same memo
-slot (slot 2 of 8, computed from the FNV fold), so every call in the compiled loop was a permanent
-**miss** — the whole prologue (registry lookup + ten `needs_*` `binary_search`es + two `String`
-allocations) ran per iteration. The old length-only hash had the same defect for other keys
-(`erlang:length/1` shared a slot with the `ets:insert/2` · `ets:lookup/2` pair) but happened to give
-path C two distinct slots. **Fix:** a fixed avalanche multiply after the fold, taking the high
-bits (`dispatch.rs::dispatch_slot`), chosen so the crate's measured hot key set — `lists:reverse/1`,
-`erlang:length/1`, `ets:insert/2`, `ets:lookup/2`, `erlang:abs/1`, `erlang:trunc/1`,
-`erlang:'++'/2`, `lists:seq/2` — maps to **eight distinct slots**. The memo has only
-`DISPATCH_MEMO_SLOTS` = 8 slots (its size is pinned by `src/context/tests.rs`, which asserts the
-16-key probe set *exceeds* the memo so slot churn is exercised), so with more hot keys than slots
-*some* pair must collide: the constant is a **chosen** one, and a collision costs a recomputed
-prologue and never a different answer (the memo tags every entry with its key).
+## The path-C regression the byte hash introduced — found and fixed
+The byte hash put `lists:reverse/1` **and** `erlang:length/1` in the same memo slot, so every path-C
+(`Runtime::run_scheduled`, a compiled `lists:reverse/1` + `erlang:length/1` loop) call was a permanent
+**miss** and paid the whole prologue (registry lookup + ten `needs_*` `binary_search`es + two `String`
+allocations) per iteration — path C at **659.53 / 663.73 / 645.48** ns/iteration, **2.3× dearer** than
+BEFORE's 285.23 / 284.96 / 286.29 and reproducible at *low* load too (662.31 at loadavg 3.97).
+**Fix:** a fixed avalanche multiply after the FNV fold, taking the high bits
+(`dispatch.rs::dispatch_slot`), chosen so the measured hot key set (`lists:reverse/1`, `erlang:length/1`,
+`ets:insert/2`, `ets:lookup/2`, `erlang:abs/1`, `erlang:trunc/1`, `erlang:'++'/2`, `lists:seq/2`) maps to
+**eight distinct slots**; a collision costs a recomputed prologue and never a different answer (the memo
+tags every entry with its key). The memo is `DISPATCH_MEMO_SLOTS` = 8 slots, pinned by
+`src/context/tests.rs` (the 16-key probe set exceeds the memo so slot churn is exercised).
 ### AFTER-FIXED pass (3 runs, loadavg 2.51 / 2.31 / 2.31)
 | row | run 1 | run 2 | run 3 |
 |---|---|---|---|
@@ -814,44 +813,32 @@ Path C is back **below** the BEFORE band (≈ 0.78× of 285.23 at a *lower* load
 rows (their keys were never colliding in the offending slot), so the fix is specific to the
 collision, not a general re-measurement.
 ## The `emqx_base62:encode/1` A/B — controlled, copy-out ON vs OFF
-Between m9 and m10 `tools/bench/RESULTS.md` recorded `emqx_base62_encode` at 10 283 → 16 601
-ns/call (+61.4 %) while its three sibling `foreign` cases improved 8–9 %. Two hypotheses were on
-the table: **(i)** the m10 copy-out seam (`move_result_into_process_heap` + its rewind guard) made
-container-returning calls dearer; **(ii)** m9's figure was anomalously low.
-**A/B:** one binary, copy-out toggled by a **temporary, never-committed** edit
-(`move_result_into_process_heap` returning `None` immediately), reverted completely before the
-final tree (`git diff` clean; no `AB-TEMP` marker survives). Driver = a real
-`/home/bill/Source/emqx/apps/emqx/src/emqx_base62.erl` (byte-identical copy, `sha1
-44ce075b7ebe945b2d8bafce5fd50e0bc7f53a52`) driven through `beam_rt run` (best of 5, startup
-cancelled by the two-point slope).
-| driver fn | copy-out ON | copy-out OFF |
-|---|---|---|
-| `ab_drv:enc/1` (the `encode/2` shape), slope | 1 375 853 ns/iteration | 1 375 853 ns/iteration |
-| `ab_drv:dec/1`, slope | 37 341.60 ns/iteration | — |
-**Verdict: neither hypothesis is supported.** The copy-out contributes **≈ 0 %** to `encode/1` at
-this N (identical to three significant figures, confirmed independently by the wall times of each
-kept binary: `enc(25000)` 1942 ms ON / 1937 ms OFF, `enc(100000)` 105 131 ms ON). The blow-up is
-in `emqx_base62.erl` **itself**: `encode(<<Index1:6,…>>, Acc)` rebuilds
-`NewAcc = <<Acc/binary, (iolist_to_binary(CharList))/binary>>` once per group of three input bytes,
-so a 12-byte input appends 4 times and copies 2 + 4 + 6 + 8 = 20 bytes — a **superlinear**
-linear-append idiom under an interpreter, each `iolist_to_binary/1` a real registered BIF call.
-Scaling, copy-out ON, loadavg 2.32: `sum/1` 25 000 → 20 ms, 100 000 → 26 ms (≈ 0 ns/iteration, i.e.
-the runtime's own call path is *not* the cost), `bin/1` 16 → 17 ms, `iol/1` 27 → 58 ms, `enc/1`
-1930 ms → 101 522 ms. The current tree's own `foreign` `emqx_base62_encode` row reports
-**76 698 ns/call** (vs 16 601 in m10) — worse than both m9 and m10, consistent with a superlinear
-workload measured at different operating points.
-**Floor of what this A/B resolves:** it resolves the *direction and order of magnitude* of the
-copy-out's share of `encode/1` (≈ 0 %) and it rules out the m10 copy-out seam as the mover. It
-**cannot** produce a per-call figure for `encode/1`, because the workload has no stable per-call
-cost at any N (it grows with N). The A/B also produced a citable negative result: with the
-copy-out forced off, `perf_call`'s path-B loop **dies with exit 1** —
-`perf_call: lists:reverse/1 raised system_limit` — because each iteration's container result stays
-on the pooled BIF heap; that pool exhaustion is exactly why the copy-out + rewind exists.
+Between m9 and m10 `tools/bench/RESULTS.md` recorded `emqx_base62_encode` at 10 283 → 16 601 ns/call
+(+61.4 %) while its three sibling `foreign` cases improved 8–9 %; two hypotheses were on the table —
+**(i)** the m10 copy-out seam (`move_result_into_process_heap` + its rewind guard) made
+container-returning calls dearer, **(ii)** m9's figure was anomalously low.
+**A/B (one binary, copy-out toggled by a temporary never-committed edit, reverted completely before the
+final tree):** `ab_drv:enc/1` (the `encode/2` shape) reads **1 375 853 ns/iteration** with copy-out **ON
+and OFF** — identical to three significant figures — and `ab_drv:dec/1` 37 341.60 ns/iteration.
+**Verdict: neither hypothesis is supported** — the copy-out contributes **≈ 0 %**.
+The blow-up is in `emqx_base62.erl` itself: `encode/2` appends
+`<<Acc/binary, (iolist_to_binary(CharList))/binary>>` once per group of three input bytes, a
+**superlinear** linear-append idiom under an interpreter, each `iolist_to_binary/1` a real registered BIF
+call (copy-out ON, loadavg 2.32: `sum/1` 25 000 → 20 ms, 100 000 → 26 ms; `enc/1` 1930 ms → 101 522 ms).
+This tree's own `foreign` `emqx_base62_encode` row reports **76 698 ns/call** (vs 16 601 in m10) —
+consistent with a superlinear workload measured at different operating points.
+**The A/B resolves** the copy-out's direction and order of magnitude (≈ 0 %) and rules out the m10 seam as
+the mover, but **cannot** produce a per-call figure (the workload has no stable per-call cost at any N).
+It also produced a negative result: with copy-out forced off, `perf_call`'s path-B loop **dies with exit 1**
+(`perf_call: lists:reverse/1 raised system_limit`) — the pool exhaustion the copy-out + rewind prevents.
 ## Gate
 `erts_rust/tools/differential/gate.sh` on this tree: `differential gate: total=2497 agree=2495
-mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)**; the two
-non-agreeing cases are the allowlisted capability gaps `wire/new_fun_ext_encode` (A.5) and
-`boot_extra/init_script_id_names_the_running_otp_release` (A.9). A dispatch change is
+mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)** at that HEAD;
+the recorded capability gap is `wire/new_fun_ext_encode` (A.5). The A.9
+`boot_extra/init_script_id_names_the_running_otp_release` case is a **live divergence**, not a recorded
+gap: `init:script_id()` answers the resolved installation script's `{"Erlang/OTP","29"}` while
+`erlang:system_info(otp_release)` answers this runtime's target `"30"`, so its `=:=` assertion is `false`
+here and `true` on the oracle. A dispatch change is
 behaviour-adjacent, so this is the authoritative check that no result moved.
 ## Caveats that invalidate a comparison (`DISPATCH-CUT`)
 - The three windows have different host load (22.13 / 25.72 / 2.51 1-min); only per-row ratios and
@@ -1000,8 +987,11 @@ supporting API) and is **reported, not hacked around**: this node owns only the 
 ### Gate
 `erts_rust/tools/differential/gate.sh` on the AFTER tree: `differential gate: total=2497 agree=2495
 mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)**, against a
-real oracle (`erl` present on `$PATH`). The two non-agreeing cases are the allowlisted capability gaps
-`wire/new_fun_ext_encode` (A.5) and `boot_extra/init_script_id_names_the_running_otp_release` (A.9).
+real oracle (`erl` present on `$PATH`). The recorded capability gap is `wire/new_fun_ext_encode` (A.5);
+the A.9 `boot_extra/init_script_id_names_the_running_otp_release` case is a **live divergence**, not a
+recorded gap: `init:script_id()` answers the resolved installation script's `{"Erlang/OTP","29"}` while
+`erlang:system_info(otp_release)` answers this runtime's target `"30"`, so its `=:=` assertion is `false`
+here and `true` on the oracle.
 A copy-out change moves terms between heaps, so this is the authoritative check that no result moved.
 
 ### Caveats that invalidate a comparison (`COPY-OUT-CUT`)

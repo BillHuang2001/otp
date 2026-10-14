@@ -562,10 +562,11 @@ than once per load; and a loaded driver's monitor subscription is not delivered 
 `file_server.rs` + `file_server/` own the runtime-native **file service**: the `file_server_2`
 service process (never enqueued, drained by the scheduler-pass step), its per-`open` native
 io-devices, the `gen_server`/`file`/`io` request/reply wire, and the `{get_until,…}`/`{get_line,…}`
-readers. `Runtime::new` consults `RuntimeConfig::boot_script()`: on the **boot-script route**
-(`-boot FILE`) it spawns the service **unregistered** (`FileServices::start_unclaimed`) — that route's
-booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name — and on every other route
-it registers the service under the atom `file_server_2` (`FileServices::start`). The served `file_server`
+readers. `Runtime::new` consults `RuntimeConfig::drives_a_boot_script()`: whenever it holds — every CLI
+action but `-version`, plus an explicit `-boot FILE` — it spawns the service **unregistered**
+(`FileServices::start_unclaimed`), because that route's booted `kernel_sup` starts OTP's own
+`file_server_2` child and owns the name; a runtime that drives no boot script (a host-built one)
+registers the service under the atom `file_server_2` (`FileServices::start`). The served `file_server`
 requests are `open/2` (any mode, incl. write/append),
 `read_file/1`, `write_file/2`, `delete/1`, `make_dir/1`, `del_dir/1`, `read_link/1`, `altname/1`,
 `rename/2`, `make_link/2`, `make_symlink/2`, `get_cwd/0,1`, `list_dir/1`, and
@@ -880,9 +881,10 @@ closable the same way and the floor already serves all three, so none of them st
   and `(home)` agree through the same arm; `bindir` is `<root>/erts-<vsn>/bin` of the installation
   the runtime resolved (`$ERTS_STDLIB_DIR`, else the filesystem probe), which is the oracle's own
   emulator directory whenever both run against the same installation.
-- `init:script_id/0` is the **loaded** boot script's `{Name,Vsn}`; on the default `-eval`/`run` path
-  no script is loaded, so it is the precise typed gap
-  `unsupported: init:script_id/0 (no boot script has been loaded)` — never a fabricated version.
+- `init:script_id/0` is the **loaded** boot script's `{Name,Vsn}`.
+  Every CLI action but `-version` loads one, so it answers the resolved script's real header — measured `{"Erlang/OTP","29"}` on this host, read from the installation's own `bin/start.boot`.
+  The typed gap `unsupported: init:script_id/0 (no boot script has been loaded)` survives only for a runtime that drives no script.
+  **The live divergence**: `erlang:system_info(otp_release)` reports this runtime's target release (`"30"`), so `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `false` here, where the oracle answers `true` (its own loaded script and its release agree).
 - `erlang:module_loaded/1` answers this runtime's **own** loaded set: the boot set is smaller than
   the oracle's (an app outside the preloaded `primLoad` batches is not yet loaded here), a
   documented divergence pinned by `../tests/module_loaded.rs`.
