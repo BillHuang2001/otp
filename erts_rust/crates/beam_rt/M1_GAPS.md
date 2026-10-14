@@ -404,33 +404,38 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   The in-crate `BootStop` reports `index = 19`. `-boot FILE` drives the walk (`src/cli.rs::drive`), a
   plain start keeps the preloaded-only floor, directive 13 leaves a live `logger_server` registered as
   `logger`, and the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
-  **The current cause — out of node.** `global:init/1` runs
-  `ok = net_kernel:monitor_nodes(true, #{connection_id => true})` (`lib/kernel/src/global.erl:800`);
-  `net_kernel:monitor_nodes/2` calls `process_flag({monitor_nodes, MapOpts}, Flag)` — an undocumented
-  **tuple** first argument the real C handles at `erts/emulator/beam/bif.c:2212-2227`
-  (`lib/kernel/src/net_kernel.erl:673`) — but `beam_bifs`'s `process_flag_2`
-  (`erts_rust/crates/beam_bifs/src/proc_reg.rs:399`) rejects any non-atom first argument with `badarg`
-  **before** its `ProcessHook` seam is reached (whose `process_flag` takes `flag: Atom`,
-  `erts_rust/crates/beam_bifs/src/context.rs:775`). `monitor_nodes/2` catches the `badarg`, so
-  `mk_monitor_nodes_error/2` returns `{error,internal_error}` and the `ok =` match raises
-  `{badmatch,{error,internal_error}}` in `global:init/1` (`global.erl:800`).
+  **The current cause — one `RuntimeHooks` BIF in `beam_bifs`.** `global:init/1` runs
+  `Known = lists:foldl(…, #{}, nodes(visible, #{connection_id => true}))`
+  (`lib/kernel/src/global.erl:810`) just after the (now succeeding)
+  `ok = net_kernel:monitor_nodes(true, #{connection_id => true})` (`global.erl:802`).
+  `erlang:nodes/2` is a `beam_bifs` `RuntimeHooks` BIF
+  (`erts_rust/crates/beam_bifs/src/hook_sets.rs:420`, `erts_rust/crates/beam_bifs/src/runtime/erlang.rs:155`)
+  for which `beam_rt` installs **no** host hook — only `nodes/0,1` are served (`src/native/net.rs`) —
+  so the call raises `unsupported: erlang:nodes/2`.
   `global_name_server` is a **permanent** child of `kernel_sup`, so `kernel_sup` reports `start_error`,
   the `permanent` kernel application tears itself down, and directive 19's
   `{load_application,stdlib}` `gen_server:call` then finds no `application_controller` and raises the
   `{noproc,…}` above, which `apply_boot_call` reports as the directive's typed error.
-  **Raw figures.** **stdout 84 lines / 3352 bytes** — the first `=CRASH REPORT====` block's
-  `initial call` is `global:init/1`, raising
-  `error: no match of right hand side value {error,internal_error}` at `global.erl:800` (through
-  `gen_server:init_it/2`, `gen_server.erl:2276`); a second `=CRASH REPORT====` block covers
-  `application_master:init/3`'s shutdown; the **1** `=SUPERVISOR REPORT====` block is
-  `supervisor: {local,kernel_sup}`, `errorContext: start_error`, offender
-  `[{id,global_name_server}, {mfargs,{global,start_link,[]}}, {restart_type,permanent}, …]`; and the
-  **1** `=INFO REPORT====` block reports
-  `application: kernel / exited: {{shutdown,{failed_to_start_child,global_name_server,{{badmatch,{error,internal_error}},…}}},{kernel,start,[normal,[]]}} / type: permanent`.
-  The stop is **tier-independent** (`BEAM_RT_TIER=interpreter` reproduces the same 84 stdout lines).
-  **Closing it** needs a `beam_bifs` change (recognize the `{monitor_nodes, MapOpts}` tuple flag and
-  the bare `monitor_nodes` atom, and extend the `ProcessHook` seam to carry the options) plus a
-  `beam_rt` implementation of `erts_monitor_nodes`.
+  **Raw figures.** **stdout 43 lines / 1473 bytes** — **1** `=SUPERVISOR REPORT====` block,
+  **1** `=CRASH REPORT====` block and **1** `=INFO REPORT====` block. The **1**
+  `=SUPERVISOR REPORT====` block is `supervisor: {local,kernel_sup}`, `errorContext: start_error`,
+  `reason: 'unsupported: erlang:nodes/2'`, offender
+  `[{pid,undefined}, {id,global_name_server}, {mfargs,{global,start_link,[]}}, {restart_type,permanent}, …]`;
+  the **1** `=CRASH REPORT====` block's `initial call` is `application_master:init/3` (it exited with
+  `{shutdown,{failed_to_start_child,global_name_server,'unsupported: erlang:nodes/2'}}` through
+  `application_master.erl:147`); and the **1** `=INFO REPORT====` block reports
+  `application: kernel / exited: {{shutdown,{failed_to_start_child,global_name_server,'unsupported: erlang:nodes/2'}},{kernel,start,[normal,[]]}} / type: permanent`.
+  The stop is **tier-independent** (`BEAM_RT_TIER=interpreter` reproduces the same 43 stdout lines).
+  **The former cause here — the `process_flag({monitor_nodes, MapOpts}, Flag)` tuple flag — is
+  CLOSED.** `beam_rt`'s own native floor now serves the bare-`monitor_nodes` and
+  `{monitor_nodes, Opts}` forms of `process_flag/2`
+  (`src/native/process.rs::process_flag_native`; the C's `bif.c:2202-2227` and `erts_monitor_nodes`
+  at `dist.c:6754-6868`), backed by `Runtime::monitor_nodes_add`/`monitor_nodes_remove` — the
+  `beam_bifs` `ProcessHook` seam cannot express the tuple flag (it takes an `Atom`), so the floor
+  claims exactly those two shapes and answers `None` for every other first argument. So
+  `net_kernel:monitor_nodes/2` now succeeds and `global:init/1` advances past `global.erl:802`.
+  **Closing the remaining one** needs a `beam_bifs` `RuntimeHooks`-side change plus a `beam_rt`
+  implementation of the `nodes/2` hook — **outside this crate's file scope**.
   **An external fun resolves in-machine (why index 18's `apply` returns `Ok`):**
   `RuntimeContext::resolve_local_fun` (`src/context/execution.rs`) resolves an EXTERNAL fun
   (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through the
@@ -521,12 +526,13 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `erts_rust/crates/beam_engine`.
 * **The boot-chain crash attributes to the `process_flag({monitor_nodes,…})` tuple-flag rejection, not
   to a `process_info` capability gap.** The fatal step is the kernel application's `global_name_server`
-  child raising `{badmatch,{error,internal_error}}` in `global:init/1` (`global.erl:800`) because
-  `beam_bifs`'s `process_flag_2` refuses the tuple `{monitor_nodes, MapOpts}` flag
-  (`beam_bifs/src/proc_reg.rs:399`; the C handles it at `erts/emulator/beam/bif.c:2212-2227`). The
-  report's `initial call: global:init/1` is the child's own behaviour entry and agrees with the oracle,
+  child raising `unsupported: erlang:nodes/2` in `global:init/1` (`global.erl:810`) because `erlang:nodes/2`
+  is a `beam_bifs` `RuntimeHooks` BIF with no `beam_rt` host hook (`beam_bifs/src/hook_sets.rs:420`); the
+  former `{monitor_nodes, MapOpts}` tuple flag is now served by `beam_rt`'s own floor
+  (`src/native/process.rs`; the C handles it at `erts/emulator/beam/bif.c:2212-2227`). The
+  report's `initial call: application_master:init/3` agrees with the oracle,
   so it is not a divergence. The stop is tier-independent (`BEAM_RT_TIER=interpreter` reproduces the
-  same 84 stdout lines), so it is not a JIT defect. The in-machine execution-position door
+  same 43 stdout lines), so it is not a JIT defect. The in-machine execution-position door
   (`src/context/position.rs`) already serves `process_info(self(), current_stacktrace)`, so it is not a
   boot blocker. No boot failure here is a wrong result.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
