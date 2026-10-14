@@ -157,6 +157,11 @@ impl ExecutionContext for RuntimeContext<'_> {
         // unit test below pins against `try_native`'s source so it can never drift out of the
         // host's dispatch.
         if crate::native::floor_shadows(module, function, arity) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: floor_shadows"
+                ));
+            }
             return Ok(None);
         }
         // A module with a loaded NIF library is **never** entered here, for two reasons.
@@ -184,12 +189,22 @@ impl ExecutionContext for RuntimeContext<'_> {
         //
         // [`NifRegistry::lookup`]: crate::nif::NifRegistry
         if self.runtime.nifs.borrow().is_loaded(module) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: nif-loaded"
+                ));
+            }
             return Ok(None);
         }
         // A registered `beam_bifs` BIF (the `bif.tab` surface, including the stdlib fast
         // paths and `ets:*`) is the implementation `call_bif` serves; it is never a `.beam`
         // body here.
         if self.runtime.registry.contains(module, function, arity) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: registry key"
+                ));
+            }
             return Ok(None);
         }
         // Resolve the callee's module handle. A module that is **already cached** is used as
@@ -242,16 +257,33 @@ impl ExecutionContext for RuntimeContext<'_> {
         // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`. The guard is a
         // pure function of the (immutable) loaded IR, so it answers the same both times.
         let Some(function_atom) = callee.atom_table.lookup(function) else {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: unknown function atom"
+                ));
+            }
             return Ok(None);
         };
         if callee_observes_its_call_site(&callee, function_atom, arity) {
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam decline {module}:{function}/{arity}: observes its call site"
+                ));
+            }
             return Ok(None);
         }
         // Hand back the export entry label the synchronous `run_export` would enter. An export
         // the callee does not have is the synchronous path's `undef`.
         match callee.export(function_atom, arity) {
             Some(label) => Ok(Some((callee, label))),
-            None => Ok(None),
+            None => {
+                if crate::debug_trace::enabled() {
+                    crate::debug_trace::trace(format_args!(
+                        "seam decline {module}:{function}/{arity}: not exported"
+                    ));
+                }
+                Ok(None)
+            }
         }
     }
 
