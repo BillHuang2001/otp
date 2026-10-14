@@ -32,8 +32,8 @@
 //!
 //! | Key | Provider |
 //! |---|---|
-//! | `erlang:start_timer/3,4` | [`crate::timers`] — deliver `{timeout, TRef, Msg}` |
-//! | `erlang:send_after/4` | [`crate::timers`] — deliver `Msg` |
+//! | `erlang:start_timer/3,4` | [`crate::timers`] — deliver `{timeout, TRef, Msg}`; `/4`'s `{abs, boolean()}` selects a relative time or an absolute Erlang monotonic one |
+//! | `erlang:send_after/4` | [`crate::timers`] — deliver `Msg`, under the same `{abs, boolean()}` option |
 //! | `erlang:cancel_timer/2` | [`crate::timers`] — the `/1` answers under the option list |
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set — a **local** pid through [`ProcessTable::link`]/`unlink`, a **remote** pid through [`ProcessTable::link_term`]/`unlink_term` (the remote-link set + the wire `DOP_LINK`/`DOP_UNLINK_ID`) |
@@ -49,12 +49,14 @@
 //!
 //! # Documented gaps inside a served key
 //!
-//! * `{abs, true}` on `start_timer/4`/`send_after/4` is an absolute **Erlang monotonic**
-//!   time. The runtime's timer heap is a relative [`Instant`](std::time::Instant) deadline
-//!   heap and the monotonic clock's origin lives inside `beam_bifs`
-//!   (`beam_bifs/src/time.rs`'s process-global `OnceLock<Instant>`), which no safe API
-//!   exposes — so the absolute form is reported as the typed capability gap rather than
-//!   approximated by a millisecond-off estimate. `{abs, false}` (the default) IS served.
+//! * `{abs, true}` **is** served, and its accepted window is the oracle's exactly
+//!   (`[erlang:system_info(start_time), erlang:system_info(end_time)]` in ms, see
+//!   [`crate::timers::timer_absolute_delay`]) — but this runtime's monotonic **origin** is
+//!   its own process start rather than ERTS's fixed interface instant, so the absolute values
+//!   it hands out are small positives rather than `-576460752000`-and-up. A value the oracle
+//!   rejects is rejected here too (the window is the same one); a value in that window but
+//!   outside *this* runtime's own clock range is accepted and simply fires at the next
+//!   scheduler pass, exactly as the C's wheel does with a deadline in the past.
 //! * `statistics/1` serves **only** the keys this runtime can measure for real
 //!   (`run_queue`, the `run_queues`/`run_queue_lengths*`/`total_run_queue_lengths*` family,
 //!   `wall_clock`, `reductions`/`exact_reductions`, `context_switches`, `runtime`, `io`,
@@ -87,7 +89,7 @@
 
 use beam_alloc::Heap;
 use beam_bifs::bif_tab::BifTab;
-use beam_bifs::{BifRegistry, RuntimeHooks};
+use beam_bifs::{BifContext, BifRegistry, RuntimeHooks};
 use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use beam_io::signal::{Disposition, Signal};
@@ -138,20 +140,25 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// # Errors
     ///
     /// Propagates [`Self::start_timer`]'s errors.
-    fn start_timer_3(&mut self, heap: &mut Heap, args: &[Eterm]) -> Result<Eterm> {
-        self.start_timer(heap, args, false)
+    fn start_timer_3(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.start_timer(heap, atoms, args, false)
     }
 
-    /// `erlang:start_timer/4` — `{abs, false}` is served, `{abs, true}` is the typed gap.
+    /// `erlang:start_timer/4` — `{abs, false}` (the default) or `{abs, true}`.
     ///
     /// # Errors
     ///
-    /// `badarg` for a non-pid/non-atom destination, a negative or unrepresentable time, a
-    /// malformed option list; a typed capability gap for `{abs, true}`.
-    fn start_timer_4(&mut self, heap: &mut Heap, args: &[Eterm]) -> Result<Eterm> {
+    /// `badarg` for a non-pid/non-atom destination, a negative or unrepresentable time, an
+    /// absolute time outside the ERTS monotonic range, or a malformed option list.
+    fn start_timer_4(&mut self, heap: &mut Heap, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
         let options = *args.get(3).ok_or(BeamError::BadArg)?;
         let abs = self.timer_options(options)?;
-        self.start_timer(heap, args, abs)
+        self.start_timer(heap, atoms, args, abs)
     }
 
     /// The shared body of `erlang:start_timer/3,4`: `Time`, `Dest`, `Msg` (and whether the
@@ -161,8 +168,14 @@ impl<'a> RuntimeHooksBridge<'a> {
     ///
     /// As for [`Self::start_timer_4`]; plus [`BeamError::BadArg`] when an argument is
     /// missing.
-    fn start_timer(&mut self, heap: &mut Heap, args: &[Eterm], abs: bool) -> Result<Eterm> {
-        let delay = self.timer_delay_checked(heap, args, abs)?;
+    fn start_timer(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        args: &[Eterm],
+        abs: bool,
+    ) -> Result<Eterm> {
+        let delay = self.timer_delay_checked(heap, atoms, args, abs)?;
         let target = timers::timer_target(*args.get(1).ok_or(BeamError::BadArg)?)?;
         let message = *args.get(2).ok_or(BeamError::BadArg)?;
         let reference = self.runtime.refs_mut().next().to_eterm(heap)?;
@@ -181,10 +194,10 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// # Errors
     ///
     /// As for [`Self::start_timer_4`].
-    fn send_after_4(&mut self, heap: &mut Heap, args: &[Eterm]) -> Result<Eterm> {
+    fn send_after_4(&mut self, heap: &mut Heap, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
         let options = *args.get(3).ok_or(BeamError::BadArg)?;
         let abs = self.timer_options(options)?;
-        let delay = self.timer_delay_checked(heap, args, abs)?;
+        let delay = self.timer_delay_checked(heap, atoms, args, abs)?;
         let target = timers::timer_target(*args.get(1).ok_or(BeamError::BadArg)?)?;
         let message = *args.get(2).ok_or(BeamError::BadArg)?;
         let reference = self.runtime.refs_mut().next().to_eterm(heap)?;
@@ -1012,31 +1025,61 @@ impl<'a> RuntimeHooksBridge<'a> {
         Ok(reference)
     }
 
-    /// The time argument of a timer BIF, validated by the shared
-    /// [`crate::timers::timer_delay`] and then rejected as the typed capability gap when it
-    /// is an **absolute** time (`{abs, true}`, see the module docs).
+    /// The delay of a timer BIF's time argument.
     ///
-    /// The validation runs **first**: a bad time is the oracle's `badarg` even when the
-    /// options also ask for the absolute form.
+    /// A **relative** time (the `/3` forms, and `{abs, false}`) is validated by the shared
+    /// [`crate::timers::timer_delay`]. An **absolute** one (`{abs, true}`) is the remaining
+    /// time to that Erlang monotonic time, computed by
+    /// [`crate::timers::timer_absolute_delay`] against the runtime's own monotonic clock —
+    /// read from the registered `erlang:monotonic_time/0` by [`Self::monotonic_now_nanos`] so
+    /// that the subtraction cancels against the caller's value whatever the clock's origin.
+    ///
+    /// The time argument is validated **first**, so a bad time is the oracle's `badarg` even
+    /// when the option list also asks for the absolute form.
     ///
     /// # Errors
     ///
-    /// As for [`crate::timers::timer_delay`], plus the typed gap for `abs`.
+    /// `badarg` for a time the oracle rejects — a non-integer, a negative relative time, an
+    /// absolute time outside the ERTS monotonic range, or a deadline the runtime's monotonic
+    /// clock cannot represent — as for the two kernels; plus whatever
+    /// [`Self::monotonic_now_nanos`] reports.
     fn timer_delay_checked(
-        &self,
+        &mut self,
         heap: &mut Heap,
+        atoms: &AtomTable,
         args: &[Eterm],
         abs: bool,
     ) -> Result<std::time::Duration> {
-        let _ = heap;
-        let delay = timers::timer_delay(*args.first().ok_or(BeamError::BadArg)?)?;
-        if abs {
-            return Err(error::unsupported(
-                "erlang:start_timer/4, send_after/4 with {abs,true}: the runtime has no \
-                 Erlang monotonic clock anchor to interpret an absolute time",
-            ));
+        let time = *args.first().ok_or(BeamError::BadArg)?;
+        if !abs {
+            return timers::timer_delay(time);
         }
-        Ok(delay)
+        let now_nanos = self.monotonic_now_nanos(heap, atoms)?;
+        timers::timer_absolute_delay(time, now_nanos)
+    }
+
+    /// The runtime's monotonic clock, in native nanoseconds — read from the **registered**
+    /// `erlang:monotonic_time/0`.
+    ///
+    /// An `{abs, true}` time is an Erlang **monotonic** time, and its caller derived it from
+    /// that very BIF (`lib/stdlib/src/timer.erl`'s `system_time/0` is
+    /// `(erlang:monotonic_time(microsecond) + 999) div 1000`, and `req/2` adds the delay to
+    /// it). Reading the clock back through the same BIF is therefore what makes the
+    /// subtraction exact: an `Instant` epoch of this module's own — the same *unit*, a
+    /// different *origin* — would leave the whole origin difference in the delay. The
+    /// [`Rc`]`<`[`BifRegistry`]`>` is taken before the context is built, so the shared
+    /// registry is only ever borrowed immutably alongside the caller's heap and atom table.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the BIF's own errors: the heap's failure while materializing the reading,
+    /// and [`timers::monotonic_nanos`]'s typed refusal of a reading this runtime cannot
+    /// express as an `i64`.
+    fn monotonic_now_nanos(&mut self, heap: &mut Heap, atoms: &AtomTable) -> Result<i64> {
+        let registry = Rc::clone(&self.runtime.registry);
+        let mut context = BifContext::new(heap, atoms, self.self_pid);
+        let reading = registry.call("erlang", "monotonic_time", 0, &mut context, &[])?;
+        timers::monotonic_nanos(reading)
     }
 
     /// Parses the `start_timer/4` / `send_after/4` option list, answering whether the time is
@@ -1097,9 +1140,9 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
         args: &[Eterm],
     ) -> Result<Eterm> {
         match (module, function, args.len()) {
-            ("erlang", "start_timer", 3) => self.start_timer_3(heap, args),
-            ("erlang", "start_timer", 4) => self.start_timer_4(heap, args),
-            ("erlang", "send_after", 4) => self.send_after_4(heap, args),
+            ("erlang", "start_timer", 3) => self.start_timer_3(heap, atoms, args),
+            ("erlang", "start_timer", 4) => self.start_timer_4(heap, atoms, args),
+            ("erlang", "send_after", 4) => self.send_after_4(heap, atoms, args),
             ("erlang", "cancel_timer", 2) => self.cancel_timer_2(heap, args),
             ("erlang", "function_exported", 3) => self.function_exported(heap, atoms, args),
             ("os", "set_signal", 2) => self.set_signal(atoms, args),

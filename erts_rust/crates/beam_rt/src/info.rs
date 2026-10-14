@@ -89,7 +89,10 @@ mod limits;
 mod memory;
 mod schedulers;
 mod system;
-mod time;
+// The ERTS monotonic-time interface constants are shared: `system_info(start_time|end_time)`
+// answers them ([`time::START_TIME`]/[`time::END_TIME`]), and `crate::timers` uses the very
+// same two values as the accepted window of an `{abs, true}` timer time, in milliseconds.
+pub(crate) mod time;
 mod unsupported;
 
 // The host-identity helpers (`os_type`, `system_architecture`) live in their own child
