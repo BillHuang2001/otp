@@ -3,23 +3,24 @@
 The runtime-native **file service** answering the OTP file protocol.
 `lib/kernel/src/file.erl` routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`.
 `FileServices` supplies that service: it is **not** a BIF, but a process plus a scheduler-pass step.
-It is the registered `file_server_2` on every route **except** the **boot-script route** (`-boot FILE`), where it is spawned **unregistered** because the booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name.
-On the boot-script route that booted child answers every request — including the final `{apply,{c,erlangrc,[]}}` directive of `bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
+It is spawned **unregistered** on every route that drives a boot script (every CLI action but `-version`, plus an explicit `-boot FILE`), because there the booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name; it is the registered `file_server_2` on a runtime that drives no boot script (a host-built one).
+On a driving route that booted child answers every request — including the final `{apply,{c,erlangrc,[]}}` directive of `bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
 `file_server.rs` (this node's parent) owns the service; `setopts.rs`, `file_info.rs`, `get_until.rs`
 and `get_line.rs` are its child modules; `tests.rs` is its colocated unit suite.
 ## API Surface
 ### The process model (never enqueued) — `../file_server.rs`
 `Runtime::new`, next to the `init` registration, consults
-`RuntimeConfig::boot_script()` and spawns **one** process either way — born `ProcessState::Runnable`,
+`RuntimeConfig::drives_a_boot_script()` and spawns **one** process either way — born `ProcessState::Runnable`,
 `insert`ed into the table, **never enqueued** and given no engine, the pattern the runtime's own
-`init`/`self_pid` process already uses. On the **boot-script route** (`-boot FILE`) it calls
-`FileServices::start_unclaimed(&mut ProcessTable, HeapPolicy)`, which registers **nothing**: the booted
-`kernel_sup` starts OTP's own `file_server_2` child (`{file_server, start_link, []}`), and an
-**initial** child start that finds the name taken aborts that supervisor (`kernel` is `permanent`), so
-the native service is left unregistered and idle. On every other route
-`FileServices::start(&mut ProcessTable, &mut AtomTable, HeapPolicy)` registers it under the atom
+`init`/`self_pid` process already uses. Whenever that predicate holds — every CLI action but `-version`,
+plus an explicit `-boot FILE` — it calls `FileServices::start_unclaimed(&mut ProcessTable, HeapPolicy)`,
+which registers **nothing**: the booted `kernel_sup` starts OTP's own `file_server_2` child
+(`{file_server, start_link, []}`), and an **initial** child start that finds the name taken aborts that
+supervisor (`kernel` is `permanent`), so the native service is left unregistered and idle. A runtime
+that drives no boot script (a host-built one) calls
+`FileServices::start(&mut ProcessTable, &mut AtomTable, HeapPolicy)`, which registers it under the atom
 `file_server_2`. `whereis(file_server_2)`, `monitor(process, Name)` and a send therefore resolve it
-only off the boot-script route (`server()`/`is_running()` accessors). Because `Process::wake` only
+only where the runtime drives no boot script (`server()`/`is_running()` accessors). Because `Process::wake` only
 wakes a `Waiting`/`Suspended` process, a message delivered into the service's mailbox never puts it on
 a run queue, so the runner never sees it and `error::unknown_process_entry` is unreachable. A successful `{open,…}` spawns a
 **second** `Runnable`, never-enqueued process — the **io-device** — under the same heap policy, and

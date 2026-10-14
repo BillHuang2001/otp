@@ -51,6 +51,7 @@ Any other tuple tag/argument is `badarg`, exactly as in the oracle (`{wordsize,f
 The arithmetic is the C macro's, reproduced as Rust `const`s: `UNIT = 10⁹` ns (`erl_unix_sys.h:195`), `START_EXTERNAL = (MIN_SMALL/UNIT)*UNIT` with `MIN_SMALL = -(1<<59)` (`erl_time.h:312-323`, `erl_term.h:270`), `BEGIN = UNIT`, `END = (i64::MAX/UNIT)*UNIT`, `END_EXTERNAL = START + (END - BEGIN)` (the `START < 0` branch of `erl_time.h:403-407`); the internal→external offset is `START_EXTERNAL - BEGIN` (`erl_time.h:331-332`). The C's own invariants (`ASSERT(TIME_MIN < TIME_MAX)`, "START *need* to be a multiple of UNIT") are compile-time `assert!`s in the module.
 `end_time` exceeds the 60-bit small range, so `make_time_val` materializes a bignum (`erts_sint64_to_big`, one `ErtsDigit` on `ARCH_64`); `InfoValue::Int` reproduces that choice (small when it fits, else `beam_codec::term::make_big`).
 These are the only two keys whose value **must** be byte-equal to the oracle's — the recorded figures are re-probed in `tests/system_info_oracle.rs`.
+`mod time` is `pub(crate)` because `crate::timers` shares the two constants: its `ERTS_MONOTONIC_START_MSEC`/`ERTS_MONOTONIC_END_MSEC` are `START_TIME`/`END_TIME` divided by `1_000_000`, the inclusive window (`-576460752000` … `8646911283000` ms) an `{abs, true}` timer time must fall in.
 
 ### `trace_control_word`
 This runtime's trace-control word, which is always `0`.
