@@ -162,9 +162,7 @@ pub(crate) fn dispatch(
         | Instr::TryEnd { .. }
         | Instr::CatchEnd { .. }
         | Instr::BuildStacktrace
-        | Instr::RawRaise => {
-            exceptions::exec(machine, entry_module, module, labels, instr, func, pc, ctx)
-        }
+        | Instr::RawRaise => exceptions::exec(machine, module, labels, instr, func, pc, ctx),
         // floats
         Instr::Fmove { .. }
         | Instr::Fconv { .. }

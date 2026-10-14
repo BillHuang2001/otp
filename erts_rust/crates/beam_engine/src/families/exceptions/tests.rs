@@ -92,30 +92,13 @@ fn no_labels() -> LabelMap {
 }
 
 /// Run one instruction body with a machine that has a bottom frame.
-///
-/// `module` is both the active module and the run's entry module (context `0`):
-/// these helpers execute a single instruction body in one module, so the two
-/// coincide. A cross-module context is exercised through
-/// [`exec_one_with_entry`].
 fn exec_one(
     module: &Module,
     instr: &Instr,
     machine: &mut Machine,
     ctx: &mut MinimalContext,
 ) -> Result<Option<Step>> {
-    exec_one_with_entry(module, module, instr, machine, ctx)
-}
-
-/// [`exec_one`] with the run's **entry** module handed in separately from the
-/// **active** module (the callee a non-zero module context is executing).
-fn exec_one_with_entry(
-    entry_module: &Module,
-    module: &Module,
-    instr: &Instr,
-    machine: &mut Machine,
-    ctx: &mut MinimalContext,
-) -> Result<Option<Step>> {
-    exec(machine, entry_module, module, &no_labels(), instr, 0, 0, ctx)
+    exec(machine, module, &no_labels(), instr, 0, 0, ctx)
 }
 
 /// Assert that `reason` (an `Eterm`) equals the tuple `[tag, elem]`.

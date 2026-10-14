@@ -146,7 +146,7 @@ use crate::terms::{ContextSink, Sink};
 /// frame chain with a live head cooks to the **one-element** list `[Item]`.
 pub(crate) fn symbolic_stacktrace(
     machine: &mut Machine,
-    entry_module: &Module,
+    module: &Module,
     ctx: &mut dyn ExecutionContext,
     head_operand: &Operand,
     head: bool,
@@ -157,6 +157,10 @@ pub(crate) fn symbolic_stacktrace(
     // local module handles (never `machine`), leaving the later
     // `reserve_slack(machine, ..)` free to take `&mut machine`.
     let frames: Vec<(u32, u32, u32)> = machine.raise_snapshot().to_vec();
+    // Where the handler (`build_stacktrace`) is executing: only when it is the entry
+    // module's context (`0`) is the caller's `module` argument the module a
+    // context-`0` frame belongs to.
+    let handler_context = machine.current_context();
     // Resolve each frame's owning module *before* sizing: a non-zero context's
     // `Arc<Module>` must stay alive across the one reservation below, because an
     // [`ItemShape`] borrows its `Line` chunk (the file name).
@@ -164,9 +168,8 @@ pub(crate) fn symbolic_stacktrace(
     let mut plan: Vec<FrameOwner> = Vec::with_capacity(frames.len());
     for (context, _func, _pc) in &frames {
         match *context {
-            // Context `0` is ALWAYS the run's borrowed **entry module**, whatever
-            // module context the handler cooking the trace is executing in.
-            0 => plan.push(FrameOwner::EntryModule),
+            0 if handler_context == 0 => plan.push(FrameOwner::EntryModule),
+            0 => plan.push(FrameOwner::Skip),
             id => match machine.module_context(id) {
                 Some(handle) => {
                     plan.push(FrameOwner::Owned(owned.len()));
@@ -181,7 +184,7 @@ pub(crate) fn symbolic_stacktrace(
     let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
     for ((_context, func, pc), owner) in frames.iter().zip(plan.iter()) {
         let owner_module: &Module = match owner {
-            FrameOwner::EntryModule => entry_module,
+            FrameOwner::EntryModule => module,
             FrameOwner::Owned(index) => &owned[*index],
             FrameOwner::Skip => continue,
         };
