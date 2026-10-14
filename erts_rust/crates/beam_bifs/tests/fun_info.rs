@@ -58,12 +58,29 @@
 //!   new_uniq={new_uniq,<<…16 bytes…>>}
 //!   fun_info_mfa => {fiprobe,'-mk/1-fun-0-',1}
 //!   fun_to_list => "#Fun<fiprobe.1.85002344>"
+//! imported (`NEW_FUN_EXT`-decoded — what `binary_to_term(term_to_binary(F))`
+//! round-trips to, or a fun received over distribution):
+//!   `escript` over a compiled probe, `ME = binary_to_term(term_to_binary(fiprobe:mk1()))`
+//!   with `fiprobe:mk1() -> fun(X) -> X + 1 end`:
+//!     type={type,local} module={module,fiprobe} arity={arity,1} env={env,[]}
+//!     refc={refc,1} new_index={new_index,1} index={index,1} uniq={uniq,75998142}
+//!     new_uniq={new_uniq,<<144,244,119,221,232,238,161,253,84,16,58,
+//!                          236,101,200,54,54>>}
+//!     fun_to_list => "#Fun<fiprobe.1.75998142>"
+//!   a hand-built `NEW_FUN_EXT` (module `'weird mod'`, `index` 7, `old_index` 3,
+//!   `old_uniq` 0xFFFFFFFF) ⇒ new_index=7, index=3, uniq=-1 (the C `int` field is
+//!   sign-extended) and fun_to_list => "#Fun<weird mod.3.-1>" (the local-fun arm of
+//!   the `FUN_DEF` printer uses the RAW module name, no quoting)
+//!   name => its `ErlFunEntry`-derived `'-mk1/0-fun-0-'` needs the loaded module's
+//!   fun table, so it (and fun_info_mfa/1) stay an honest typed gap here.
 //! ```
 //!
-//! The local-fun identity items are an **honest typed gap** in this runtime (the
-//! inlined descriptor carries no module/MD5/`old_index`) — see
+//! The `make_fun3` local-fun identity items are an **honest typed gap** in this
+//! runtime (the inlined descriptor carries no module/MD5/`old_index`) — see
 //! `src/fun_info.rs`'s module docs — so they are asserted as
-//! `error:unsupported_bif` here, never as a fabricated value.
+//! `error:unsupported_bif` here, never as a fabricated value. An `Imported`
+//! (`NEW_FUN_EXT`) fun is **not** a gap for `module`/`new_index`/`new_uniq`/
+//! `index`/`uniq`/`fun_to_list`: its descriptor carries the whole wire signature.
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry};
@@ -356,7 +373,7 @@ fn fun_info_2_local_identity_items_are_the_documented_typed_gap() {
 }
 
 #[test]
-fn fun_info_2_imported_fun_is_a_local_fun_with_the_identity_items_gapped() {
+fn fun_info_2_imported_kind_independent_items_are_a_local_fun() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
@@ -376,15 +393,142 @@ fn fun_info_2_imported_fun_is_a_local_fun_with_the_identity_items_gapped() {
     let info = fun_info(&reg, &mut ctx, fun, "arity").expect("arity");
     let value = pair_value(&reg, &mut ctx, &atoms, info, "arity");
     assert_eq!(signed_value(value), 1);
+    let info = fun_info(&reg, &mut ctx, fun, "env").expect("env");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "env");
+    assert_eq!(value, NIL);
 
-    for item in ["module", "name", "new_index", "new_uniq", "index", "uniq"] {
-        assert_unsupported_bif(
-            fun_info(&reg, &mut ctx, fun, item),
-            &format!("fun_info(ImportedFun, {item})"),
-        );
-    }
+    // `name` needs the *loaded module's* fun table (`erts_get_fun_mfa`), which the
+    // term descriptor cannot supply — an honest typed gap for an `Imported` fun
+    // (as for a `Local` one), never a fabricated atom.
+    assert_unsupported_bif(
+        fun_info(&reg, &mut ctx, fun, "name"),
+        "fun_info(ImportedFun, name)",
+    );
 }
 
+// ---------------------------------------------------------------------------
+// fun_info/2 + fun_to_list/1 — an `Imported` (`NEW_FUN_EXT`) fun
+// ---------------------------------------------------------------------------
+
+/// The 16-byte MD5 `uniq` of the oracle's `fiprobe:mk1()` probe.
+const MK1_UNIQ: [u8; 16] = [
+    144, 244, 119, 221, 232, 238, 161, 253, 84, 16, 58, 236, 101, 200, 54, 54,
+];
+
+#[test]
+fn fun_info_2_imported_identity_items_match_the_oracle() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut ctx = make_ctx(&mut heap, &atoms);
+
+    // Oracle (`binary_to_term(term_to_binary(fiprobe:mk1()))` on OTP 29.1.1 /
+    // erts-17.1): module=fiprobe, new_index=1, new_uniq=MK1_UNIQ, index=1,
+    // uniq=75998142.
+    let fun = imported_fun(&mut ctx, 1, "fiprobe", &MK1_UNIQ, 1, 1, 75998142, &[]);
+
+    let info = fun_info(&reg, &mut ctx, fun, "module").expect("module");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "module");
+    assert_eq!(atom_name(&atoms, value), "fiprobe");
+
+    let info = fun_info(&reg, &mut ctx, fun, "new_index").expect("new_index");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "new_index");
+    assert_eq!(signed_value(value), 1);
+
+    let info = fun_info(&reg, &mut ctx, fun, "index").expect("index");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "index");
+    assert_eq!(signed_value(value), 1);
+
+    let info = fun_info(&reg, &mut ctx, fun, "uniq").expect("uniq");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "uniq");
+    assert_eq!(signed_value(value), 75998142);
+
+    let info = fun_info(&reg, &mut ctx, fun, "new_uniq").expect("new_uniq");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "new_uniq");
+    let (bytes, offset_bits, size_bits) =
+        beam_codec::term::bitstring_bytes(value).expect("a binary");
+    assert_eq!((offset_bits, size_bits), (0, 128));
+    assert_eq!(bytes, &MK1_UNIQ[..]);
+
+    // `fun_to_list/1` is the printer's local-fun arm: `#Fun<Module.OldIndex.OldUniq>`.
+    let text = call(&reg, &mut ctx, "fun_to_list", &[fun]).expect("fun_to_list");
+    assert_eq!(
+        list_to_string(&reg, &mut ctx, text),
+        "#Fun<fiprobe.1.75998142>"
+    );
+}
+
+/// The `index`/`old_index`/`old_uniq` fields are `int` in C (`erl_fun.h:31-59`), so
+/// a wire value above `2^31 - 1` is reported **negative** and the `FUN_DEF`
+/// printer renders the raw module name without quoting. Oracle (a hand-built
+/// `NEW_FUN_EXT` with module `'weird mod'`, `index` 7, `old_index` 3, `old_uniq`
+/// `0xFFFFFFFF`): `new_index=7`, `index=3`, `uniq=-1`,
+/// `fun_to_list => "#Fun<weird mod.3.-1>"`.
+#[test]
+fn fun_info_2_imported_identity_items_are_sign_extended_int_fields() {
+    let reg = default_registry();
+    let mut atoms = seeded_atoms();
+    atoms.seed(["weird mod"]);
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut ctx = make_ctx(&mut heap, &atoms);
+
+    let fun = imported_fun(&mut ctx, 2, "weird mod", &MK1_UNIQ, 7, 3, u32::MAX, &[]);
+
+    let info = fun_info(&reg, &mut ctx, fun, "module").expect("module");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "module");
+    assert_eq!(atom_name(&atoms, value), "weird mod");
+
+    let info = fun_info(&reg, &mut ctx, fun, "new_index").expect("new_index");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "new_index");
+    assert_eq!(signed_value(value), 7);
+
+    let info = fun_info(&reg, &mut ctx, fun, "index").expect("index");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "index");
+    assert_eq!(signed_value(value), 3);
+
+    let info = fun_info(&reg, &mut ctx, fun, "uniq").expect("uniq");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "uniq");
+    assert_eq!(signed_value(value), -1);
+
+    let text = call(&reg, &mut ctx, "fun_to_list", &[fun]).expect("fun_to_list");
+    assert_eq!(list_to_string(&reg, &mut ctx, text), "#Fun<weird mod.3.-1>");
+}
+
+/// An `Imported` fun's environment is its `env` in wire order (the `NEW_FUN_EXT`
+/// trailer), exactly like a `make_fun3` closure's.
+#[test]
+fn fun_info_2_imported_env_is_the_wire_environment() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut ctx = make_ctx(&mut heap, &atoms);
+    let seven = ctx.int(7).expect("7 fits");
+    let nine = ctx.int(9).expect("9 fits");
+    let fun = imported_fun(
+        &mut ctx,
+        2,
+        "fiprobe",
+        &MK1_UNIQ,
+        1,
+        1,
+        75998142,
+        &[seven, nine],
+    );
+
+    let info = fun_info(&reg, &mut ctx, fun, "env").expect("env");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "env");
+    let head = reg
+        .call("erlang", "hd", 1, &mut ctx, &[value])
+        .expect("hd/1 of the env list");
+    assert_eq!(signed_value(head), 7);
+    let tail = reg
+        .call("erlang", "tl", 1, &mut ctx, &[value])
+        .expect("tl/1");
+    let head2 = reg
+        .call("erlang", "hd", 1, &mut ctx, &[tail])
+        .expect("hd/1 of the env tail");
+    assert_eq!(signed_value(head2), 9);
+}
 // ---------------------------------------------------------------------------
 // fun_info/2 — badarg forms
 // ---------------------------------------------------------------------------
@@ -512,6 +656,16 @@ fn fun_info_mfa_1_matches_the_oracle() {
     assert_unsupported_bif(
         call(&reg, &mut ctx, "fun_info_mfa", &[local]),
         "fun_info_mfa/1 of a local fun",
+    );
+
+    // An `Imported` (`NEW_FUN_EXT`) fun resolves its *function* element through the
+    // loaded module's fun table (`erts_get_fun_mfa`), which the descriptor does not
+    // carry — the same honest typed gap (the oracle would answer
+    // `{fiprobe,'-mk1/0-fun-0-',1}` for a loaded module).
+    let imported = imported_fun(&mut ctx, 1, "fiprobe", &MK1_UNIQ, 1, 1, 75998142, &[]);
+    assert_unsupported_bif(
+        call(&reg, &mut ctx, "fun_info_mfa", &[imported]),
+        "fun_info_mfa/1 of an imported fun",
     );
 }
 
