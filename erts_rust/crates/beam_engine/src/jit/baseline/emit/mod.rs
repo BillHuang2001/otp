@@ -160,6 +160,8 @@ pub(crate) use arith::{
 pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
 #[cfg(test)]
 pub(crate) use r#move::{move_shape, MoveShape};
+#[cfg(test)]
+pub(crate) use regalloc::cacheable_touches;
 pub(crate) use regalloc::allocate_registers;
 
 // The compilation entry points live in the `compile` submodule; re-export them here

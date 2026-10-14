@@ -168,6 +168,211 @@ fn allocation_ignores_registers_outside_the_engine_bound() {
     assert!(allocation.slots.is_empty());
 }
 
+/// A block whose **touch-count** ranking and **live-interval** ranking disagree, so a
+/// selection over it pins *which* policy the allocator uses.
+///
+/// ```text
+///   i=1        x1          ; x1 is first touched
+///   i=2..5     x0 = x2     ; four touches each of x0 and x2
+///   i=6..7     x0 = x3     ; two more touches of x0, two of x3
+///   i=8        x1 = x3
+///   i=9        x3
+///   i=10       x4
+///   i=11..13   x4 = x5
+///   i=14       x5
+///   i=15       x1          ; x1 is last touched, closing its long interval
+/// ```
+///
+/// Touch counts: `x0=6, x2=x3=x4=x5=4, x1=3` — the **usage-weighted** ranking keeps
+/// `{x0, x2, x3, x4, x5}` and evicts `x1`.
+/// Live intervals: `x1=[1,15] (15)`, `x0=[2,7] (6)`, `x2=[2,5] (4)`, `x3=[6,9] (4)`,
+/// `x4=[10,13] (4)`, `x5=[11,14] (4)` — the **interval** scan keeps `{x1, x0, x2, x3,
+/// x4}` and evicts `x5`, whose short, late interval is the cheapest register to leave in
+/// `machine.x`.
+fn interval_vs_count_code() -> Vec<Instr> {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let copy = |src: u32, dst: u32| Instr::Move {
+        src: Operand::X(src),
+        dst: Operand::X(dst),
+    };
+    vec![
+        Instr::Label(Label(1)),
+        mv(0, 1),
+        copy(2, 0),
+        copy(2, 0),
+        copy(2, 0),
+        copy(2, 0),
+        copy(3, 0),
+        copy(3, 0),
+        copy(3, 1),
+        mv(0, 3),
+        mv(0, 4),
+        copy(5, 4),
+        copy(5, 4),
+        copy(5, 4),
+        mv(0, 5),
+        mv(0, 1),
+        Instr::Return,
+    ]
+}
+
+#[test]
+fn allocation_prefers_long_live_intervals_over_touch_counts() {
+    let code = interval_vs_count_code();
+    let allocation = allocate_registers(&Module::default(), &code, 0, code.len());
+
+    // The interval winner — x1, live from the block's first instruction to its
+    // penultimate one — is resident ...
+    assert_eq!(
+        allocation.slot(1),
+        Some(Reg::R12),
+        "x1's long live interval must be selected"
+    );
+    // ... and the fifth-most-touched register (x5, a short late interval) is not, even
+    // though a usage-weighted ranking would have kept it.
+    assert_eq!(
+        allocation.slot(5),
+        None,
+        "x5's short interval must be left in machine.x"
+    );
+    // The four registers both policies agree on stay resident.
+    for x in [0u32, 2, 3, 4] {
+        assert!(allocation.slot(x).is_some(), "x{x} is resident");
+    }
+    // The slots keep first-appearance order (x1 appears first), not selection order.
+    let order: Vec<u32> = allocation.slots.iter().map(|(x, _)| *x).collect();
+    assert_eq!(order, vec![1, 2, 0, 3, 4]);
+}
+
+#[test]
+fn allocation_selects_a_deterministic_subset_of_the_shape_touched_registers() {
+    // Six candidate registers — more than the five-slot budget — so the selection is a
+    // strict subset of what the block's native lowerings touch, and it must be the same
+    // subset on every run.
+    let code = interval_vs_count_code();
+    let module = Module::default();
+    let labels = LabelMap::new();
+
+    let first = allocate_registers(&module, &code, 0, code.len());
+    let second = allocate_registers(&module, &code, 0, code.len());
+    assert_eq!(
+        first.slots, second.slots,
+        "the selection must be deterministic across runs"
+    );
+    assert!(
+        first.slots.len() <= CACHE_REGISTERS.len(),
+        "the cache budget bounds the resident set"
+    );
+
+    // Every resident is a register some cacheable instruction's native lowering
+    // touches, and no register is cached through two different machine registers.
+    let mut touched: Vec<u32> = Vec::new();
+    for instr in &code {
+        for x in cacheable_touches(&module, &labels, instr) {
+            if x < MAX_REGISTER && !touched.contains(&x) {
+                touched.push(x);
+            }
+        }
+    }
+    for (x, reg) in &first.slots {
+        assert!(
+            touched.contains(x),
+            "x{x} is not touched by any of the block's native lowerings"
+        );
+        assert!(
+            CACHE_REGISTERS.contains(reg),
+            "{reg:?} is not one of the cache's machine registers"
+        );
+    }
+    let mut indices: Vec<u32> = first.slots.iter().map(|(x, _)| *x).collect();
+    let cached = indices.len();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(indices.len(), cached, "a register is cached at most once");
+
+    // The spill contract holds: the write set is a subset of the resident set.
+    for x in &first.written {
+        assert!(first.slot(*x).is_some(), "written x{x} must be resident");
+    }
+}
+
+/// The `swaps_memory` block shape (also built by `tests/jit.rs`): a block that swaps a
+/// cached register against `machine.x` in every combination.
+///
+/// `extra_add` appends one more `erlang:+/2` after the final `move`, which touches `x2`
+/// and `x4` and writes `x4` — it changes no result register (`x0` is the `dst` of
+/// neither) and is therefore the minimal retuning a fixture needs when its residents
+/// must be `{x0, x1, x2, x3, x4}`.
+fn swaps_memory_block(extra_add: bool) -> (Module, Vec<Instr>) {
+    let (module, refs) = module_with_imports(&[("erlang", "+", 2)]);
+    let plus = refs[0];
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let add = |a: u32, b: u32, dst: u32| {
+        gc_bif(plus, vec![Operand::X(a), Operand::X(b)], Operand::X(dst))
+    };
+    let swap = |a: u32, b: u32| Instr::Swap {
+        a: Operand::X(a),
+        b: Operand::X(b),
+    };
+
+    let mut code = vec![Instr::Label(Label(1))];
+    for x in 0..5 {
+        code.push(mv(i64::from(x) + 1, x));
+    }
+    code.push(mv(6, 5));
+    code.push(mv(7, 6));
+    for _ in 0..3 {
+        for (a, b, dst) in [(0, 1, 2), (2, 3, 4), (4, 0, 1), (1, 2, 3), (3, 4, 0)] {
+            code.push(add(a, b, dst));
+        }
+    }
+    code.extend([
+        swap(0, 5),
+        swap(5, 6),
+        swap(0, 1),
+        swap(5, 3),
+        Instr::Move {
+            src: Operand::X(5),
+            dst: Operand::X(0),
+        },
+    ]);
+    if extra_add {
+        // Writes x4, so x4 stays live to the block's end; reads x2 and x0 only.
+        code.push(add(2, 0, 4));
+    }
+    code.push(Instr::Return);
+    (module, code)
+}
+
+#[test]
+fn a_late_swap_operand_wins_on_interval_length_and_one_touch_retunes_it() {
+    // The interval policy keeps the five **longest** intervals, and on this shape the
+    // fifth-longest is `x5` — live from the `move` that initialises it all the way to
+    // the block's final `move`, i.e. spanning 22 instruction slots — while `x4`'s
+    // interval closes after the last `+` (18 slots). Touch counts rank them the other
+    // way round (`x5` reaches 5 touches, `x4` 10), so the two policies pin different
+    // residents and this test is the allocator-side evidence for both.
+    let (module, code) = swaps_memory_block(false);
+    let allocation = allocate_registers(&module, &code, 0, code.len());
+    let residents: Vec<u32> = allocation.slots.iter().map(|(x, _)| *x).collect();
+    assert_eq!(residents, vec![0, 1, 2, 3, 5]);
+
+    // One further touch of `x4` — a write, so it stays live to the end — and the
+    // residents become `{x0, x1, x2, x3, x4}`, which is what the `swaps_memory` fixture
+    // in `tests/jit.rs` documents (it must leave `x5`/`x6` in `machine.x` to exercise
+    // the cached/uncached swap combinations).
+    let (module, code) = swaps_memory_block(true);
+    let allocation = allocate_registers(&module, &code, 0, code.len());
+    let residents: Vec<u32> = allocation.slots.iter().map(|(x, _)| *x).collect();
+    assert_eq!(residents, vec![0, 1, 2, 3, 4]);
+}
+
 #[test]
 fn constant_words_match_the_operand_seam() {
     assert_eq!(constant_word(&Operand::Integer(5)), Some(make_small(5).raw() as i64));
@@ -4687,6 +4892,10 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.block_written_slots,
         counters.blocks_by_cache_slots,
         counters.blocks_by_written_slots,
+    );
+    println!(
+        "  allocator live ranges: candidates={} selected-live-total={} selected-live-max={}",
+        counters.block_live_candidates, counters.block_live_total, counters.block_live_max,
     );
     println!(
         "  spill stores: written-set={} (by site {:?}) vs full-cache={} (by site {:?}); \

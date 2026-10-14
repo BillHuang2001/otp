@@ -20,11 +20,17 @@
 
 //! The baseline JIT's register allocator: which x-registers a basic block caches.
 //!
-//! [`allocate_registers`] ranks a block's x-registers by how often the block's
-//! **inlinable** instructions would touch them, and the most-used
-//! [`CACHE_REGISTERS`]`.len()` of them are held in machine registers (the prologue
-//! loads them, every block exit spills them); every other register a block names is
-//! addressed directly in `machine.x` — see [`super`].
+//! [`allocate_registers`] computes each x-register's **live interval** over the block's
+//! IR — `[first touch, last touch]`, where a *touch* is exactly the set of x-register
+//! operands a cacheable instruction's **native lowering** references — and the
+//! [`CACHE_REGISTERS`]`.len()` registers with the **longest intervals** are held in
+//! machine registers (the prologue loads them, every block exit spills them); every other
+//! register a block names is addressed directly in `machine.x` — see [`super`].
+//!
+//! The interval is the same span [`super::liveness::fill_sets`] derives its live set
+//! from (a register is in a helper's fill set exactly when it has a later touch), so the
+//! selector and the emitter share **one** definition of liveness rather than agreeing by
+//! coincidence.
 
 use std::collections::BTreeMap;
 
@@ -47,19 +53,31 @@ use super::{Allocation, CACHE_REGISTERS};
 
 /// Pick the x-registers a block caches.
 ///
-/// The block keeps the [`CACHE_REGISTERS`]`.len()` x-registers its native lowering
-/// **touches the most**: every cacheable instruction (a `move` whose shape
+/// The block keeps the [`CACHE_REGISTERS`]`.len()` x-registers with the **longest live
+/// intervals** over the block's IR. A register's live interval is
+/// `[first touch, last touch]`, where a *touch* is exactly the x-register operands a
+/// cacheable instruction's **native lowering** references ([`cacheable_touches`],
+/// unioned with [`cacheable_writes`] so a register that an instruction only *writes* is
+/// live at that point too). The cacheable instructions are the ones
+/// [`super::emit_block`] lowers: a `move` whose shape
 /// [`super::r#move::try_inline_move`] lowers, a `swap` over two addressable x-registers, a `test`
 /// whose shape [`super::test::test_plan`] lowers, a `gc_bif` [`fast_arith`] lowers,
 /// a `get_list`/`get_hd`/`get_tl` its `*_shape` lowers, a `get_tuple_element` its
 /// [`get_tuple_element_shape`], a `set_tuple_element` its
 /// [`set_tuple_element_shape`], and a `select_tuple_arity` its
-/// [`select_tuple_arity_plan`])
-/// contributes one *native touch* per x-register operand, and the registers with the
-/// highest touch counts are held resident — a usage-weighted approximation of
-/// "keep the longest live ranges in machine registers". Ties are broken by ascending
-/// register index, so the choice is deterministic. Every register the budget cannot
-/// hold is read and written **directly in `machine.x`**, which is exactly the
+/// [`select_tuple_arity_plan`].
+///
+/// The selection is a **linear scan** over those intervals:
+///
+/// * **primary key** — the interval length `last - first + 1`, **descending**: the
+///   registers that stay live across the most instruction boundaries are held resident;
+/// * **tie-break** — **ascending register index**, so the choice is fully
+///   deterministic.
+///
+/// The span is the *same* one [`super::liveness::fill_sets`] derives its live set from
+/// (a register is in a helper's fill set exactly when it has a later touch), so the
+/// selector and the emitter share one definition of liveness. Every register the budget
+/// cannot hold is read and written **directly in `machine.x`**, which is exactly the
 /// fill/spill an in-block eviction scheme would perform; the membership itself stays
 /// **fixed for the whole block** (the correctness contract — see the module docs).
 ///
@@ -69,8 +87,8 @@ use super::{Allocation, CACHE_REGISTERS};
 /// not cache it either.
 ///
 /// The slots are returned in the registers' **first-appearance** order, so the
-/// physical (`rbp`/`r12`–`r15`) assignment is deterministic; only the *selection* is
-/// usage-weighted.
+/// physical (`rbp`/`r12`–`r15`) assignment is deterministic and stays stable across an
+/// allocator change; only the *selection* is interval-weighted.
 pub(crate) fn allocate_registers(
     module: &Module,
     code: &[Instr],
@@ -95,29 +113,59 @@ fn allocate_registers_with_labels(
     let end = end.min(code.len());
     let start = start.min(end);
 
-    // Native touch counts and the registers' first-appearance order.
-    let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut appearance: Vec<u32> = Vec::new();
+    // The block's per-instruction native touches and writes (the shared shape mirrors of
+    // `emit_block`'s inlining), restricted to registers the engine can hold. Built once
+    // and reused by the interval scan, the slot order and the write set, so the three
+    // views of the block can never disagree.
+    let mut touches: Vec<Vec<u32>> = Vec::with_capacity(end - start);
+    let mut writes: Vec<Vec<u32>> = Vec::with_capacity(end - start);
     for instr in &code[start..end] {
-        for x in cacheable_touches(module, labels, instr) {
-            if x >= MAX_REGISTER {
-                continue;
-            }
-            *counts.entry(x).or_insert(0) += 1;
-            if !appearance.contains(&x) {
-                appearance.push(x);
+        touches.push(
+            cacheable_touches(module, labels, instr)
+                .into_iter()
+                .filter(|x| *x < MAX_REGISTER)
+                .collect(),
+        );
+        writes.push(cacheable_writes(module, labels, instr));
+    }
+
+    // The registers' first-appearance order; the slots are assigned in it, so the
+    // physical mapping stays stable across an allocator change. Built over the union of
+    // the touches and the writes, so a register that only ever appears as a write can
+    // still be given a slot.
+    let mut appearance: Vec<u32> = Vec::new();
+    for (touched, written) in touches.iter().zip(&writes) {
+        for x in touched.iter().chain(written) {
+            if *x < MAX_REGISTER && !appearance.contains(x) {
+                appearance.push(*x);
             }
         }
     }
 
-    // Rank by descending touch count, ties by ascending register index, and keep the
+    // Every candidate register's live interval `[first, last]`, over the instruction
+    // indices `0..end - start` (scanning ascending, so the first occurrence fixes
+    // `first` and every later occurrence advances `last`).
+    let mut intervals: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+    for (i, (touched, written)) in touches.iter().zip(&writes).enumerate() {
+        for x in touched.iter().chain(written) {
+            if *x >= MAX_REGISTER {
+                continue;
+            }
+            intervals.entry(*x).or_insert((i, i)).1 = i;
+        }
+    }
+
+    // Rank by descending interval length, ties by ascending register index, and keep the
     // top `CACHE_REGISTERS.len()`.
-    let mut ranked: Vec<(u32, u32)> = counts.iter().map(|(x, count)| (*x, *count)).collect();
+    let mut ranked: Vec<(u32, usize)> = intervals
+        .iter()
+        .map(|(x, (first, last))| (*x, last - first + 1))
+        .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let selected: Vec<u32> = ranked
-        .into_iter()
+        .iter()
         .take(CACHE_REGISTERS.len())
-        .map(|(x, _)| x)
+        .map(|(x, _)| *x)
         .collect();
 
     let mut allocation = Allocation::default();
@@ -128,6 +176,25 @@ fn allocate_registers_with_labels(
         allocation
             .slots
             .push((x, CACHE_REGISTERS[allocation.slots.len()]));
+    }
+
+    // Live-range statistics for the test-only structural counters: the number of
+    // candidate registers the scan ranked, and the selected intervals' total and maximum
+    // length (the residency quality a longer selected interval set stands for).
+    #[cfg(test)]
+    {
+        allocation.live_candidates = intervals.len() as u32;
+        allocation.live_total = ranked
+            .iter()
+            .take(CACHE_REGISTERS.len())
+            .map(|(_, len)| *len as u32)
+            .sum();
+        allocation.live_max = ranked
+            .iter()
+            .take(CACHE_REGISTERS.len())
+            .map(|(_, len)| *len as u32)
+            .max()
+            .unwrap_or(0);
     }
 
     // The block's **write set**: the cached x-registers some inline lowering of the
@@ -174,7 +241,7 @@ fn allocate_registers_with_labels(
 }
 
 /// The x-registers one instruction's **native** lowering touches — the operands
-/// [`allocate_registers`] charges to the block's usage counts.
+/// [`allocate_registers`] charges to the block's per-register live intervals.
 ///
 /// Each arm mirrors the inlining decision of the instruction's lowering, so a
 /// register only counts when the emitted code would actually reference it: a `move`
@@ -188,7 +255,7 @@ fn allocate_registers_with_labels(
 /// `select_tuple_arity` only when [`select_tuple_arity_plan`] claims it (its source
 /// tuple counts). Every other
 /// instruction contributes nothing because it stays on the helper.
-pub(super) fn cacheable_touches(
+pub(crate) fn cacheable_touches(
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -337,7 +404,7 @@ pub(super) fn cacheable_touches(
 /// (`super::r#move`'s destination arms), never through `machine.x` — a shape that writes a
 /// register it does not cache addresses `machine.x`, and a non-cached register is never in
 /// a fill set.
-pub(super) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr) -> Vec<u32> {
+pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr) -> Vec<u32> {
     match instr {
         Instr::Move { src, dst } => move_shape(src, dst)
             .map(|shape| shape.writes())

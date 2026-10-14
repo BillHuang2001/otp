@@ -119,6 +119,20 @@ pub(crate) struct Allocation {
     /// **empty** table (a synthetic `Allocation` a unit test built directly) means "no
     /// liveness was computed" and makes every fill set the whole cache.
     pub(crate) fill_sets: Vec<Vec<u32>>,
+    /// Test-only: how many x-registers the allocator's interval scan **ranked** — the
+    /// candidate set a resident slot was chosen from ([`super::regalloc`]).
+    ///
+    /// Present only in test builds (like [`super::super::counters`]), so a production
+    /// `Allocation` carries no statistic state the tier never reads.
+    #[cfg(test)]
+    pub(crate) live_candidates: u32,
+    /// Test-only: the **total** live length (`last - first + 1`, summed) of the
+    /// selection's intervals — the residency quality a linear scan maximises.
+    #[cfg(test)]
+    pub(crate) live_total: u32,
+    /// Test-only: the **longest** selected live interval (0 when nothing was selected).
+    #[cfg(test)]
+    pub(crate) live_max: u32,
 }
 
 impl Allocation {

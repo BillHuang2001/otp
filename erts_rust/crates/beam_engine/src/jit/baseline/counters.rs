@@ -47,8 +47,9 @@
 //! * **Register-cache traffic** — [`record_spill`] (every store of a cached
 //!   x-register back into `machine.x`) and [`record_fill`] (every load of a cached
 //!   x-register out of `machine.x`), each classified by its site, plus
-//!   [`record_block`] once per emitted block (its IR size, cache size, write-set size
-//!   and native byte length).
+//!   [`record_block`] once per emitted block (its IR size, cache size, write-set size,
+//!   the allocator's live-range statistics — candidate-register count and the selected
+//!   intervals' total/max length — and native byte length).
 //!
 //! # One run, both register-cache models
 //!
@@ -147,6 +148,15 @@ pub(crate) struct Counters {
     pub(crate) block_cache_slots: u64,
     /// Σ over blocks of the write-set size (`Allocation::written.len()`).
     pub(crate) block_written_slots: u64,
+    /// Σ over blocks of the allocator's **candidate-register count**
+    /// (`Allocation::live_candidates`): how many x-registers the interval scan ranked.
+    pub(crate) block_live_candidates: u64,
+    /// Σ over blocks of the selection's **total live length**
+    /// (`Allocation::live_total`) — the residency quality the linear scan maximises.
+    pub(crate) block_live_total: u64,
+    /// The **longest** selected live interval over all blocks
+    /// (`max` of `Allocation::live_max`).
+    pub(crate) block_live_max: u64,
     /// Blocks by write-set size: how many blocks spill `0`, `1`, `2`, … registers on an
     /// exit under the written-set model.
     pub(crate) blocks_by_written_slots: BTreeMap<u64, u64>,
@@ -355,6 +365,11 @@ pub(crate) fn record_fill(site: FillSite, n: u64) {
 /// the count the previous full-cache `spill` model would have stored there — so one
 /// recorded run yields both the old and the new spill-store totals (see the module
 /// docs).
+///
+/// It also folds in the allocation's **live-range statistics**
+/// ([`Allocation::live_candidates`]/[`live_total`](Allocation::live_total)/
+/// [`live_max`](Allocation::live_max)), the allocator's own view of how much liveness the
+/// selection covers.
 pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
     if !ENABLED.with(Cell::get) {
         return;
@@ -370,6 +385,9 @@ pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
         c.block_emitted_bytes += bytes;
         c.block_cache_slots += cache_slots;
         c.block_written_slots += written_slots;
+        c.block_live_candidates += u64::from(allocation.live_candidates);
+        c.block_live_total += u64::from(allocation.live_total);
+        c.block_live_max = c.block_live_max.max(u64::from(allocation.live_max));
         *c.blocks_by_cache_slots.entry(cache_slots).or_insert(0) += 1;
         *c.blocks_by_written_slots.entry(written_slots).or_insert(0) += 1;
         for site in pending {
@@ -477,6 +495,9 @@ mod tests {
             slots: vec![(0, Reg::R12), (1, Reg::R13), (2, Reg::R14), (3, Reg::R15)],
             written: vec![0, 3],
             y_last: None,
+            live_candidates: 6,
+            live_total: 12,
+            live_max: 5,
             ..Default::default()
         };
         // Three fill sites in the block: the prologue's whole-cache load (4) and two
@@ -526,6 +547,10 @@ mod tests {
         assert_eq!(snap.block_written_slots, 2);
         assert_eq!(snap.blocks_by_cache_slots.get(&4), Some(&1));
         assert_eq!(snap.blocks_by_written_slots.get(&2), Some(&1));
+        // The allocator's live-range statistics ride along with the block.
+        assert_eq!(snap.block_live_candidates, 6);
+        assert_eq!(snap.block_live_total, 12);
+        assert_eq!(snap.block_live_max, 5);
 
         set_enabled(false);
         reset();
