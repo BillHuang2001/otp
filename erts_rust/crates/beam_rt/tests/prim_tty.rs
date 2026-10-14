@@ -375,10 +375,10 @@ struct Gap {
 ///
 /// `wcwidth/1` / `isprint/1` / `wcswidth/1` need libc's locale/Unicode width tables, which have
 /// no faithful safe-std equivalent (`libc::wcwidth` is `unsafe` and the crate is
-/// `#![deny(unsafe_code)]`), and `tty_select/2` arms an async NIF read-select this runtime does
-/// not model. The oracle's own module does not export `wcwidth/1`, `isprint/1` or
-/// `tty_select/2` either, so there is nothing to compare — the assertion is that the runtime
-/// refuses them **loudly** instead of inventing a width.
+/// `#![deny(unsafe_code)]`). The oracle's own module does not export `wcwidth/1` or `isprint/1`
+/// either, so there is nothing to compare — the assertion is that the runtime refuses them
+/// **loudly** instead of inventing a width. (`tty_select/2` **is** served: it arms a one-shot
+/// read select over the port layer's poller and answers `ok`.)
 const GAPS: &[Gap] = &[
     Gap {
         name: "wcwidth/1",
@@ -387,10 +387,6 @@ const GAPS: &[Gap] = &[
     Gap {
         name: "isprint/1",
         program: "prim_tty:isprint(65).",
-    },
-    Gap {
-        name: "tty_select/2",
-        program: "prim_tty:tty_select(ok, ok).",
     },
 ];
 

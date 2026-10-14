@@ -147,6 +147,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
+pub(crate) mod tty;
 pub(crate) mod watch;
 use beam_alloc::Heap;
 use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
@@ -556,6 +557,26 @@ enum PortEvent {
         /// The signal's BEAM atom name — [`beam_io::signal::Signal::name`] (`"sigusr1"`, …).
         name: &'static str,
     },
+    /// A `prim_tty:tty_select/2` read interest became ready — the delivery half of the
+    /// `enif_select` a `prim_tty` reader arms before it announces itself.
+    ///
+    /// Like [`PortEvent::Signal`] this variant has **no port**: the descriptor (`fd 0`) is
+    /// registered with the poller directly, not carried by any port, and the message's
+    /// recipient is the process that armed the select (recorded here as `owner`), not a
+    /// port-derived one. The message is the 4-tuple `{select, Handle, Reference, ready_input}`
+    /// with the emulator itself (`system`) as the sender, exactly the shape
+    /// `prepare_select_msg` (`erts/emulator/sys/common/erl_check_io.c:731-761`) builds and
+    /// `send_select_msg` (`:836-858`) queues — see [`tty`] for the C ground truth and the
+    /// one-shot rule.
+    Select {
+        /// The process the select message belongs to — `enif_select`'s implicit recipient (the
+        /// calling process).
+        owner: ProcessId,
+        /// The opaque tty handle (`argv[0]`), the tuple's second element.
+        handle: Eterm,
+        /// `prim_tty:reader/1`'s `ReaderRef` (`argv[1]`), the tuple's third element.
+        reference: Eterm,
+    },
 }
 
 /// The node-global **I/O byte counters** behind `erlang:statistics(io)`.
@@ -708,6 +729,9 @@ pub struct PortRegistry {
     /// The signal self-pipe's registration with [`PortRegistry::poller`] — the delivery half of
     /// `os:set_signal/2` (see [`watch`]).
     watch: watch::SignalWatch,
+    /// The `prim_tty:tty_select/2` read-select registrations with [`PortRegistry::poller`] — the
+    /// delivery half of the `enif_select` a `prim_tty` reader arms (see [`tty`]).
+    tty: tty::TtyWatch,
     /// The runtime's most recent process-liveness observation, shared with every
     /// `{spawn_driver, Name}` port's [`driver::DriverPort`] host — the state behind
     /// `driver_monitor_process`'s positive `ERL_DRV_MONITOR_NOT_ALIVE` (see
@@ -737,6 +761,7 @@ impl PortRegistry {
             heap: Heap::new(PORT_HEAP_WORDS)?,
             io_counters: Rc::new(IoCounters::default()),
             watch: watch::SignalWatch::new(),
+            tty: tty::TtyWatch::new(),
             liveness: ProcessLiveness::new(),
         })
     }
@@ -793,6 +818,47 @@ impl PortRegistry {
         } else {
             self.liveness.clear();
         }
+    }
+
+    /// Arms a **one-shot** read interest on the tty descriptor (fd 0) for `owner` — the
+    /// `enif_select` half of `prim_tty:tty_select/2` (see [`tty`]).
+    ///
+    /// `handle` and `reference` must already be **stabilized** terms (copied onto the runtime's
+    /// never-reset arena by [`Runtime::stabilize_term`]): a raw `Eterm` held across a scheduler
+    /// pass belongs to a heap a collection may relocate, and this registration outlives the call
+    /// that armed it. The caller — [`crate::native::prim_tty`] — owns that stabilisation, because
+    /// it holds the arguments and the runtime's arena.
+    ///
+    /// # Errors
+    ///
+    /// The poller's own registration failure, or the typed exhaustion of the key reservation.
+    /// The C **discards** `enif_select`'s answer, so the NIF answers `ok` either way — but the
+    /// failure is still returned here rather than swallowed, and the NIF maps it to "nothing
+    /// armed".
+    pub(crate) fn arm_tty_select(
+        &mut self,
+        owner: ProcessId,
+        handle: Eterm,
+        reference: Eterm,
+    ) -> Result<()> {
+        self.tty
+            .arm(&mut self.poller, owner, handle, reference)
+    }
+
+    /// Drops (and de-registers) every `tty_select/2` registration whose owner `live` denies —
+    /// the C's `tty_monitor_down` `ERL_NIF_SELECT_STOP` arm (see [`tty`]).
+    ///
+    /// Called from both port pumps, immediately after [`PortRegistry::refresh_liveness`], so a
+    /// reader that died without disarming its select cannot keep the runtime polling for ever.
+    ///
+    /// # Errors
+    ///
+    /// The poller's own de-registration failure.
+    pub(crate) fn prune_dead_tty(
+        &mut self,
+        live: impl FnMut(ProcessId) -> bool,
+    ) -> Result<()> {
+        self.tty.prune_dead(&mut self.poller, live)
     }
 
     /// Registers `driver` as a new port and records its `port_info` `meta`.
@@ -1099,15 +1165,16 @@ impl PortRegistry {
     ///
     /// This is the "nothing pollable" predicate. It is what tells a caller that a blocked
     /// process can no longer be woken and that a poll round is pure sleep: a live port can
-    /// deliver `{Port, {data, …}}`, and a registered signal watch can deliver
-    /// `{notify, Signal}` — either one keeps the runtime awake.
+    /// deliver `{Port, {data, …}}`, a registered signal watch can deliver
+    /// `{notify, Signal}`, and an armed `tty_select/2` can deliver
+    /// `{select, Handle, Ref, ready_input}` — any one of them keeps the runtime awake.
     ///
     /// It is *false* as soon as a `handle` disposition is installed, even before the
     /// descriptor is registered, because [`watch::SignalWatch::sync`] will register it on the
     /// very next poll round (the facility is created by `os:set_signal/2`, so it cannot exist
     /// when the registry is built).
     pub fn has_nothing_to_poll(&self) -> bool {
-        self.meta.is_empty() && !self.watch.is_pollable()
+        self.meta.is_empty() && !self.watch.is_pollable() && !self.tty.is_armed()
     }
     /// The ids of the **live** ports, in port-number order.
     ///
@@ -1198,7 +1265,7 @@ impl PortRegistry {
         // recorded in the facility's own bitmask, so it is drained unconditionally rather than
         // keyed to the readiness event.
         events.extend(self.take_signals());
-        if self.registry.is_empty() && !self.watch.is_pollable() {
+        if self.registry.is_empty() && !self.watch.is_pollable() && !self.tty.is_armed() {
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -1225,13 +1292,32 @@ impl PortRegistry {
             if self.watch.ready(&polled) {
                 events.extend(self.take_signals());
             }
+            // A `tty_select/2` read interest is the other non-port registration: its readiness
+            // is a one-shot `enif_select` report, so each ready key yields exactly one
+            // `{select, …}` event and is de-registered as it is reported (see [`tty`]). The
+            // reported handle/reference were stabilised when the select was armed, so they are
+            // valid across this pass.
+            let tty_keys: Vec<u64> = polled
+                .iter()
+                .map(|event| event.key())
+                .filter(|key| self.tty.owns(*key))
+                .collect();
+            for (owner, handle, reference) in self.tty.take_ready(&mut self.poller, &tty_keys)? {
+                events.push(PortEvent::Select {
+                    owner,
+                    handle,
+                    reference,
+                });
+            }
             if !polled.is_empty() {
                 // Readiness becomes *scheduled tasks* (the ERTS port-task model) — the
-                // driver is called when the task runs, never from the event loop.
+                // driver is called when the task runs, never from the event loop. The signal
+                // sentinel and this watch's own keys are **not** ports, so they are filtered
+                // out of the batch before the port scheduler sees them.
                 let port_events: Vec<Event> = polled
                     .iter()
                     .copied()
-                    .filter(|event| event.key() != watch::SIGNAL_KEY)
+                    .filter(|event| event.key() != watch::SIGNAL_KEY && !self.tty.owns(event.key()))
                     .collect();
                 if !port_events.is_empty() {
                     self.registry.schedule_events(&port_events);
@@ -2452,6 +2538,9 @@ impl Runtime {
             // The round is where driver callbacks run, so the liveness view their hosts query is
             // refreshed from the live table first (see [`PortRegistry::refresh_liveness`]).
             registry.refresh_liveness(table);
+            // A `prim_tty` reader that died without disarming its `tty_select/2` interest would
+            // otherwise keep the runtime polling for ever (see [`PortRegistry::prune_dead_tty`]).
+            registry.prune_dead_tty(|pid| table.contains(pid))?;
             registry.pump(timeout)?
         };
         // A driver callback cannot mint an atom (the live table is borrowed for the whole
@@ -2539,6 +2628,17 @@ impl Runtime {
                         let (from, message) = ctx.signal_notify_message(name)?;
                         (server, from, message)
                     }
+                    // A ready `tty_select/2` interest is addressed directly to the process that
+                    // armed it (`enif_select`'s implicit recipient, recorded as `owner`), with the
+                    // emulator (`system`) as the sender — the ordinary one-shot select delivery.
+                    PortEvent::Select {
+                        owner,
+                        handle,
+                        reference,
+                    } => {
+                        let (from, message) = ctx.tty_select_message(*handle, *reference)?;
+                        (*owner, from, message)
+                    }
                 }
             };
             // A port whose recipient has since terminated has no recipient: the message is
@@ -2593,6 +2693,9 @@ impl RuntimeContext<'_> {
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             registry.refresh_liveness(table);
+            // Same as the scheduler path's round: a dead `prim_tty` reader's armed select is
+            // dropped before the poll (see [`PortRegistry::prune_dead_tty`]).
+            registry.prune_dead_tty(|pid| table.contains(pid))?;
             registry.pump(timeout)?
         };
         let mut messages = Vec::with_capacity(events.len());
@@ -2632,6 +2735,10 @@ impl RuntimeContext<'_> {
                 // instead — rather than being matched as if it were the evaluator's own. Same
                 // reasoning as the driver-term arm above.
                 PortEvent::Signal { .. } => continue,
+                // A ready `tty_select/2` interest belongs in the **owning reader's** mailbox, which
+                // the evaluator is not: it can only observe its own mailbox, so — like the signal
+                // arm — the event is not returned here and the scheduler path delivers it.
+                PortEvent::Select { .. } => continue,
             }
         }
         Ok(messages)
@@ -2787,6 +2894,38 @@ impl RuntimeContext<'_> {
         let signal = make_atom(atoms.intern(name));
         let sender = make_atom(atoms.intern("system"));
         let message = terms::make_tuple(self, &[notify, signal])?;
+        Ok((sender, message))
+    }
+
+    /// The `{select, Handle, Reference, ready_input}` message a ready `tty_select/2` interest
+    /// produces, and its sender — the delivery half of the `enif_select` a `prim_tty` reader
+    /// arms.
+    ///
+    /// ERTS queues exactly this 4-tuple to the **calling** process, with `am_system` as the
+    /// sender: `prepare_select_msg` (`erts/emulator/sys/common/erl_check_io.c:731-761`) builds
+    /// it from the select's resource term and reference term and always closes with the
+    /// `ready_input` event atom, and `send_select_msg` (`:836-858`) queues it with `system` as
+    /// the sender. `handle` is the opaque tty term ([`crate::native::prim_tty`]'s reference) and
+    /// `reference` is `prim_tty:reader/1`'s `ReaderRef`; `prim_tty:reader_loop/2`
+    /// (`lib/kernel/src/prim_tty.erl:454-482`) matches the message on both.
+    ///
+    /// Both terms are already **stabilized** (see [`PortRegistry::arm_tty_select`]), so this
+    /// builder copies them into the tuple without re-homing them; the `select`/`ready_input`/
+    /// `system` atoms are interned in the runtime's **one shared** table.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the tuple does not fit.
+    pub(crate) fn tty_select_message(
+        &mut self,
+        handle: Eterm,
+        reference: Eterm,
+    ) -> Result<(Eterm, Eterm)> {
+        let atoms = self.runtime.code_server.atoms_mut();
+        let select = make_atom(atoms.intern("select"));
+        let ready_input = make_atom(atoms.intern("ready_input"));
+        let sender = make_atom(atoms.intern("system"));
+        let message = terms::make_tuple(self, &[select, handle, reference, ready_input])?;
         Ok((sender, message))
     }
 }

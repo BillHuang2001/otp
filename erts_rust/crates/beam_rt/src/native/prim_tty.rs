@@ -49,11 +49,16 @@
 //! `setupterm() =:= ok` on the boot path. The C's `#else` arms return `make_enotsup`
 //! *before* inspecting any argument, so neither do these.
 //!
-//! `isprint/1`, `wcwidth/1`, `wcswidth/1` and `tty_select/2` are typed capability gaps
+//! `isprint/1`, `wcwidth/1` and `wcswidth/1` are typed capability gaps
 //! ([`crate::error::unsupported`]): libc's locale/Unicode width tables have no faithful
 //! safe-std equivalent (`libc::wcwidth` is `unsafe` and this crate is
-//! `#![deny(unsafe_code)]`), and arming an async NIF read-select is not modelled. A typed
-//! gap, never a fabricated width.
+//! `#![deny(unsafe_code)]`). A typed gap, never a fabricated width.
+//!
+//! `tty_select/2` **is** served: the C's resource check, a discarded `enif_select`, and the
+//! atom `ok` (the `("tty_select", 2)` arm of [`RuntimeContext::prim_tty_call`]). The read
+//! interest it arms is delivered as `{select, Handle, Ref, ready_input}` by the port layer
+//! ([`crate::port::tty`]) — the runtime's one poller owns the descriptor, so the *answer*
+//! surface stays here and the *delivery* half lives there.
 //!
 //! # The opaque tty handle
 //!
@@ -307,9 +312,38 @@ impl RuntimeContext<'_> {
             ("isprint", 1) | ("wcwidth", 1) | ("wcswidth", 1) => Err(crate::error::unsupported(
                 "prim_tty character metrics (libc locale/Unicode width tables)",
             )),
-            ("tty_select", 2) => Err(crate::error::unsupported(
-                "prim_tty async read select (enif_select)",
-            )),
+            // `tty_select(Handle, Ref)`: the C's `enif_get_resource` check, then an
+            // `enif_select` whose return value is **discarded**, then an
+            // `enif_monitor_process`, answering the atom `ok` (`prim_tty_nif.c:1244-1264`). The
+            // read interest is one-shot and its delivery (`{select, Handle, Ref, ready_input}`)
+            // is the port layer's [`crate::port::tty`].
+            ("tty_select", 2) => {
+                // The resource check first: a term that is not a live handle is `badarg`,
+                // exactly the C's `enif_get_resource` miss (and the C tests it **before** it
+                // selects).
+                self.prim_tty_fd(args[0])?;
+                // Both terms must outlive the call: the handle is minted on the pooled BIF heap
+                // (rewound after the call) and the reference lives on the process heap, so each
+                // is copied onto the runtime's pointer-stable arena before the registration
+                // records it.
+                let handle = self.runtime.stabilize_term(args[0])?;
+                let reference = self.runtime.stabilize_term(args[1])?;
+                let owner = self.pid();
+                // `enif_select`'s answer is discarded — the C answers `ok` whether or not the
+                // registration was accepted, so a refused arming is not a raise. The failure is
+                // still surfaced to this point rather than fabricated away: a nested port-table
+                // borrow or an exhausted key reservation is reported as "nothing armed".
+                let armed = self
+                    .runtime
+                    .ports
+                    .try_borrow_mut()
+                    .map_err(|_| crate::error::unsupported("the port table is already in use"))
+                    .and_then(|mut registry| registry.arm_tty_select(owner, handle, reference));
+                if let Err(error) = armed {
+                    eprintln!("beam_rt: prim_tty:tty_select/2 could not arm the read select: {error}");
+                }
+                self.atom("ok")
+            }
             _ => Err(BeamError::BadArg),
         }
     }
@@ -528,9 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn character_metrics_and_select_are_typed_capability_gaps() {
+    fn character_metrics_are_typed_capability_gaps() {
         let mut runtime = runtime();
-        for (function, arity) in [("isprint", 1u32), ("wcwidth", 1), ("wcswidth", 1), ("tty_select", 2)] {
+        for (function, arity) in [("isprint", 1u32), ("wcwidth", 1), ("wcswidth", 1)] {
             let args = vec![make_small(0); arity as usize];
             match call(&mut runtime, "prim_tty", function, &args) {
                 Err(error) => assert!(
@@ -540,5 +574,26 @@ mod tests {
                 Ok(term) => panic!("{function} must not fabricate a value: {term:?}"),
             }
         }
+    }
+
+    #[test]
+    fn tty_select_arms_a_read_and_answers_ok() {
+        let mut runtime = runtime();
+        // The resource check comes first: a term that is not a live handle is `badarg`, the
+        // C's `enif_get_resource` miss (tested before the C selects at all).
+        match call(&mut runtime, "prim_tty", "tty_select", &[make_small(0), make_small(0)]) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("a non-handle must be badarg, got {other:?}"),
+        }
+        // A live handle arms the one-shot select and answers the atom `ok` — exactly the C,
+        // whose `enif_select` return value is discarded.
+        let stderr = atom(&mut runtime, "stderr");
+        let created =
+            call(&mut runtime, "prim_tty", "tty_create", &[stderr]).expect("a served answer");
+        let handle = terms::tuple_element(created, 1).expect("an element");
+        let reference = make_small(7);
+        let answer = call(&mut runtime, "prim_tty", "tty_select", &[handle, reference])
+            .expect("tty_select is served");
+        assert_eq!(name_of(&mut runtime, answer), "ok", "tty_select answers `ok`");
     }
 }

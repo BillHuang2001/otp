@@ -132,7 +132,7 @@ pub(crate) struct TtyWatch {
 
 impl TtyWatch {
     /// A watch with nothing armed.
-    pub(crate) const fn new() -> TtyWatch {
+    pub(crate) fn new() -> TtyWatch {
         TtyWatch {
             registrations: HashMap::new(),
             next_key: TTY_KEY_TOP,
@@ -255,7 +255,7 @@ mod tests {
     fn armed() -> (Poller, TtyWatch, ProcessId, Eterm, Eterm) {
         let mut poller = Poller::new().expect("a poller");
         let mut watch = TtyWatch::new();
-        let owner = ProcessId::new(7);
+        let owner = ProcessId::new(7, 0);
         let handle = make_small(11);
         let reference = make_small(22);
         watch

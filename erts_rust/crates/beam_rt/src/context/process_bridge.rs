@@ -343,6 +343,21 @@ impl ProcessHook for ProcessBridge<'_> {
                 let atom = atoms.lookup("error_handler").ok_or(BeamError::TermNotFound)?;
                 Ok(Some(make_atom(atom)))
             }
+            // `message_queue_data` (`on_heap`/`off_heap`) is the message-queue placement flag
+            // (`bif.c:2150-2163`). `off_heap`/`on_heap` are both **accepted** and the real
+            // current placement is answered: this runtime keeps every process's message queue
+            // heap-resident (`beam_message::Queue` on the process's own heap allocation), which
+            // is exactly the `on_heap` the `message_queue_data` `process_info/2` item reports —
+            // honouring `off_heap` would need per-process queue placement the runtime does not
+            // model. A value that is neither atom is the oracle's `badarg`.
+            "message_queue_data" => {
+                match atom_name(atoms, value).as_deref() {
+                    Some("on_heap") | Some("off_heap") => {}
+                    _ => return Ok(None),
+                }
+                let atom = atoms.lookup("on_heap").ok_or(BeamError::TermNotFound)?;
+                Ok(Some(make_atom(atom)))
+            }
             // Any other flag (including the ones this milestone has no state for) is the
             // oracle's `badarg` through the hook's `Ok(None)` contract.
             _ => Ok(None),
