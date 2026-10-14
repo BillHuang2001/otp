@@ -1090,16 +1090,18 @@ mod tests {
     /// `.`, and exactly the `-pz` directories after it.
     #[test]
     fn the_current_directory_sits_between_the_system_dirs_and_the_pz_tail() {
-        let Some(mut server) = system_server() else {
-            return;
-        };
         let pa = scratch("dot-pa");
         let pz1 = scratch("dot-pz1");
         let pz2 = scratch("dot-pz2");
         // `Runtime::new` order: the configured paths first, then the system directories
-        // (which is what installs `.` and appends the `-pz` tail).
+        // (which is what installs `.` and appends the `-pz` tail). A fresh server — calling
+        // `add_system_paths` first would leave the `-pa` directory *after* the system ones.
+        let mut server = CodeServer::new();
         server.set_configured_paths(std::slice::from_ref(&pa), &[pz1.clone(), pz2.clone()]);
-        server.add_system_paths().expect("the system paths");
+        if let Err(error) = server.add_system_paths() {
+            eprintln!("SKIP: no system code path ({error})");
+            return;
+        }
 
         let paths = server.paths();
         let dot = paths
