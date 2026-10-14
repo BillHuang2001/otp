@@ -193,14 +193,12 @@ pub(crate) enum MapOrder {
 ///   order, the `undefined` order);
 /// * [`MapOrder::Ordered`] — ascending **term** order (`map_pairs`);
 /// * [`MapOrder::Reversed`] — descending term order (`map_pairs` reversed);
-/// * [`MapOrder::Explicit`] — a `~K` order term: the atoms `ordered`/`reversed`
-///   select as above, **any other atom** (`undefined`, but also `{}`, `bogus`, …)
-///   selects [`MapOrder::Storage`] because the oracle's `maps:iterator/2` ignores
-///   every atom other than those two and falls back to the default iterator, a
-///   **2-arity fun** is the typed [`unsupported_bif`] (the printer has no
-///   `FunCaller` seam to invoke it, and a fabricated order would be a wrong
-///   result), and a non-atom order term (or a fun of another arity) is `badarg`,
-///   as the oracle's `maps:iterator/2` argument check.
+/// * [`MapOrder::Explicit`] — a `~K` order term: the atoms `ordered`/`reversed`/
+///   `undefined` select as above (`undefined` is the default iterator, which walks
+///   the stored order), a **2-arity fun** is the typed [`unsupported_bif`] (the
+///   printer has no `FunCaller` seam to invoke it, and a fabricated order would be a
+///   wrong result), and anything else (any other atom, a non-atom, or a fun of another
+///   arity) is `badarg`, as the oracle's `maps:iterator/2` argument check.
 ///
 /// # Errors
 ///
@@ -235,13 +233,16 @@ pub(crate) fn resolve_map_pairs(
             let resolved = match atoms.name(atom_val(order_term)).ok_or_else(badarg)? {
                 "ordered" => MapOrder::Ordered,
                 "reversed" => MapOrder::Reversed,
-                // `maps:iterator/2` ignores the *value* of any other order atom and
-                // falls back to the default iterator — `maps:iterator(M, undefined)`
-                // is `maps:iterator(M, fun(A,B) -> A =< B end)` — i.e. the storage
-                // order this crate's `MapOrder::Storage` renders. So `undefined`,
-                // `{}`, `bogus` and every other atom select the default, exactly as
-                // the oracle does; only a non-atom order term is `badarg`.
-                _ => MapOrder::Storage,
+                // `maps:iterator(Map, undefined)` is `maps:iterator(Map, fun(A,B) ->
+                // A =< B end)` — the default iterator, whose `maps:next/1` walk visits
+                // the map's *stored* pair order, exactly `MapOrder::Storage`. Verified
+                // against the oracle: `~Kp undefined` / `~Kw undefined` are byte-equal
+                // to the default `~p`/`~w` text for both a flat (≤32-key) and a HAMT
+                // (>32-key) map. Any other atom is `badarg`, as `maps:iterator/2`
+                // raises for an unrecognised order term (`~Kp bogus`, `~Kp {x}` and
+                // `~Kp 5` are all `error:badarg`).
+                "undefined" => MapOrder::Storage,
+                _ => return Err(badarg()),
             };
             resolve_map_pairs(term, resolved, atoms)
         }
