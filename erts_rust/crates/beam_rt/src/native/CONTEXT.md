@@ -47,7 +47,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
 | `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1` |
-| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
+| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
 | `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` |
 | `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs` and the end-to-end `memory/binary_e2e.rs` oracle case) |
@@ -152,6 +152,33 @@ high}]` is `badarg`). The node surface is split: `node.rs` reads the runtime's `
 `badarg` for a non-atom node/cookie (and for this runtime's own node name on a non-alive VM) and
 `distribution_not_started` for a well-typed remote pair — and `net.rs` answers the node set and the connector entry points (`nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`).
 
+**`erlang:process_flag(monitor_nodes | {monitor_nodes, Opts}, Bool)` — the node-monitor flag
+(contract A.5/A.9).** Served by `process.rs::process_flag_native`, which claims **only** the two
+undocumented first-argument shapes the C's `process_flag/2` intercepts before delegating to
+`process_flag_aux` (`bif.c:2202-2227`): the bare atom `monitor_nodes` (⇒ the empty option list) and
+the two-tuple `{monitor_nodes, Opts}`. Every other first argument — every ordinary atom flag
+(`trap_exit`, `async_dist`, `priority`, `save_calls`, …) and every other tuple — answers `None`, so
+the arm falls through to the registry and its `ProcessHook` bridge unchanged. The floor must serve
+these two forms because the `beam_bifs` `ProcessHook` seam cannot carry a tuple flag (its
+`process_flag` takes `flag: Atom`, so `process_flag_2` rejects the tuple with `badarg` *before* the
+seam is consulted) — the A.9 constraint `net_kernel:monitor_nodes/2` (`net_kernel.erl:673`) and
+`global:init/1` (`global.erl:802`) run into. `process_flag_native`'s body mirrors
+`erts_monitor_nodes` (`dist.c:6754-6868`): `On` must be the atom `true` or `false` (else `badarg`);
+`Opts` is `[]` (mask `0`) or a **map** whose keys must all be recognised — `list => true` clears
+`INFO_MAP` (8), `connection_id => true` sets `CONN_ID` (16) (`false` a no-op), `node_type =>
+visible|hidden|all` sets `TYPE_VISIBLE`(1)/`TYPE_HIDDEN`(2)/both, `nodedown_reason => true` sets
+`DOWN_REASON` (4) (`false` a no-op) — with any wrongly-typed value, any **unrecognised** key (the
+C's `no_opts != erts_map_size(options)` check, `dist.c:6821-6822`) and any non-`[]`, non-map argument
+`badarg`; the folded mask is the key. `true` answers the previous reference **count** of the calling
+process's `(pid, key)` entry (creating it at `0`) and increments it; `false` answers the current
+count (`0` when absent) and deletes the whole entry, pruning an emptied per-pid map. The store is
+[`Runtime::monitor_nodes`](../../runtime.rs)'s `HashMap<ProcessId, HashMap<u64, u64>>`, shared
+through `Runtime::monitor_nodes_add`/`Runtime::monitor_nodes_remove` — the per-pid counterpart of the
+`async_dist` store. Oracle-pinned (OTP 29.1.1 / erts-17.1):
+`process_flag({monitor_nodes, #{list=>true, connection_id=>true}}, true)` ⇒ `0`, again ⇒ `1`, then
+`false` ⇒ `2`, then `false` ⇒ `0`; `process_flag(monitor_nodes, true)` ⇒ `0`;
+`process_flag({monitor_nodes, #{}}, true)` ⇒ `0`; `process_flag({monitor_nodes, #{bogus=>1}}, true)`
+⇒ `error:badarg`. Unit tests in `process.rs`.
 `spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the
 child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the
 policy-aware `Runtime::spawn_*_with_policy`.

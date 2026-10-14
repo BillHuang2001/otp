@@ -34,6 +34,7 @@
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
 //! | `erlang:process_info/2` | reads a **process's** heap/GC observables out of this runtime's own process table (`beam_gc`'s `HeapInfo`; contract A.8) |
+//! | `erlang:process_flag(monitor_nodes \| {monitor_nodes, Opts}, Bool)` | the undocumented node-monitor flag `net_kernel:monitor_nodes/1,2` sets: the `beam_bifs` `ProcessHook` seam takes an **atom** flag, so the tuple/option-map form is served here from the runtime's own per-pid monitor-node store (contract A.5/A.9, `src/native/process.rs`) |
 //! | `init:get_argument/1` | reads the parsed command line (contract A.6, `RuntimeConfig::init_args`) |
 //! | `init:get_plain_arguments/0` | the (always empty) plain-argument list — the CLI models no plain arguments |
 //! | `init:get_arguments/0` | the whole command line, in order, from `RuntimeConfig::init_args`, preceded by the emulator's own automatic flags (`root`/`bindir`/`progname`/`home`) |
@@ -385,6 +386,15 @@ impl RuntimeContext<'_> {
             ("erlang", "exit", 3) => Some(self.exit_3(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
+            // The `{monitor_nodes, Options}` / bare `monitor_nodes` forms of
+            // `erlang:process_flag/2` — the undocumented flag `net_kernel:monitor_nodes/1,2`
+            // uses (`bif.c:2202-2227`, `erts_monitor_nodes` at `dist.c:6754-6868`). The
+            // `beam_bifs` `ProcessHook` seam cannot carry it (its `process_flag` takes an
+            // `Atom` flag, so `process_flag_2` rejects the tuple with `badarg` before the seam
+            // is consulted), so the floor serves exactly those two forms and answers `None` for
+            // every other flag — an ordinary atom flag still reaches the registry unchanged.
+            // See [`process`](crate::native::process).
+            ("erlang", "process_flag", 2) => self.process_flag_native(args),
             // The on-demand collection (contract A.7). `erlang:garbage_collect/0` is the
             // `erlang.erl` wrapper over `erts_internal:garbage_collect(major)`
             // (`erlang.erl:3051-3053`), `/1` is the wrapper over

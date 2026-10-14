@@ -411,6 +411,23 @@ pub struct Runtime {
     /// which is harmless: a pid's serial is bumped when its table slot is reused, so the stale
     /// key names no process that can ever be observed again.
     pub(crate) async_dist: HashSet<ProcessId>,
+    /// The `{monitor_nodes, Options}` registrations of every process — the C's
+    /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
+    ///
+    /// The undocumented `erlang:process_flag(monitor_nodes, Bool)` /
+    /// `process_flag({monitor_nodes, Opts}, Bool)` forms (`net_kernel:monitor_nodes/1,2` use
+    /// them) keep a per-process monitor entry keyed by the **bitmask** the option list folds to
+    /// (`dist.c:6758-6825`), and the flag's value is that entry's reference **count**.
+    /// `beam_process::ProcessFlags` carries no such store, so — like [`Runtime::async_dist`] —
+    /// the runtime keeps it in its own per-pid map: the outer key is the process, the inner key
+    /// the option bitmask and the inner value the C's `refc` (an absent inner entry is the C's
+    /// "no monitor", whose `old_value` is `0`).
+    ///
+    /// This is the **one** source of truth for the flag: `beam_rt`'s floor serves the tuple/atom
+    /// forms from it (see [`crate::native::process`]). A terminated process leaves its entry
+    /// behind, which is harmless: a pid's serial is bumped when its table slot is reused, so the
+    /// stale key names no process that can ever be observed again.
+    pub(crate) monitor_nodes: HashMap<ProcessId, HashMap<u64, u64>>,
     /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
     ///
     /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
@@ -793,6 +810,7 @@ impl Runtime {
             references: HashMap::new(),
             group_leaders: HashMap::new(),
             async_dist: HashSet::new(),
+            monitor_nodes: HashMap::new(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
             timer_resumes: HashMap::new(),
@@ -1482,6 +1500,46 @@ impl Runtime {
         }
     }
 
+    /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
+    /// bitmask `key`, answering the **previous** reference count — the C's
+    /// `erts_monitor_nodes` `on == true` arm (`dist.c:6827-6845`).
+    ///
+    /// The entry is created (with a count of `0`) when absent, so the first `true` answers `0`
+    /// and each repeat bumps the count by one — exactly the oracle's sequence
+    /// (`process_flag({monitor_nodes, #{list=>true, connection_id=>true}}, true)` ⇒ `0`, then
+    /// `1`, …). The count is the C's `mdep->u.refc`.
+    pub(crate) fn monitor_nodes_add(&mut self, pid: ProcessId, key: u64) -> u64 {
+        let count = self
+            .monitor_nodes
+            .entry(pid)
+            .or_default()
+            .entry(key)
+            .or_insert(0);
+        let old = *count;
+        *count = old + 1;
+        old
+    }
+
+    /// Removes `pid`'s `{monitor_nodes, Options}` monitor under the option bitmask `key`,
+    /// answering the count it had (`0` when absent) — the C's `erts_monitor_nodes` `on == false`
+    /// arm (`dist.c:6846-6865`).
+    ///
+    /// The C deletes the whole entry **regardless of the count** (`erts_monitor_tree_delete`),
+    /// so the next `true` starts again from `0`; an emptied inner map is pruned so the store
+    /// stays as small as the live registrations.
+    pub(crate) fn monitor_nodes_remove(&mut self, pid: ProcessId, key: u64) -> u64 {
+        let (old, empty) = match self.monitor_nodes.get_mut(&pid) {
+            Some(per_process) => {
+                let old = per_process.remove(&key).unwrap_or(0);
+                (old, per_process.is_empty())
+            }
+            None => return 0,
+        };
+        if empty {
+            self.monitor_nodes.remove(&pid);
+        }
+        old
+    }
     /// Gives a freshly spawned `child` the group leader its `parent` has
     /// (`erl_process.c:12654-12663`).
     ///
