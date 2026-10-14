@@ -421,6 +421,20 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `beam_common::StackFrame` (`crates/beam_common/src/error.rs:518-541`, currently
   `{module, function, arity, location}`) may need an optional argument-list slot; the `undef` raised on
   this crate's callee path comes from `src/context/calls.rs` and `src/context/pump.rs`.
+  **Why the trace reads `[]` (linchpin):** `logger:filter_stacktrace/2` (`lib/kernel/src/logger.erl:1982-1987`)
+  is a **head-prefix** filter (`filter_stacktrace(Module,[{Module,_,_,_}|_]) -> []`), and our trace's head is
+  the raising `logger_server` frame itself (the callee item is the missing one), so it is wiped to `[]` — the
+  oracle's filtered trace is exactly the single callee item. The defect is therefore *only* the missing
+  innermost callee item, not a generally empty trace: the same probe with the `try` inside a **compiled**
+  module (`apply/3` and a direct `call_ext`), on both the `-eval` and the scheduled `run` routes, yields a
+  non-empty trace with the raising function's own frame (`[{p3,call_h,3,[{file,…},{line,5}]}]`).
+  **Verdict: long-standing engine gap, newly exposed — not a `beam_rt` code regression.**
+  `stacktrace.rs`'s whole history carries no args variant, so `call_h/4`'s first two arms can never have
+  matched at any commit; 2026-10-09's completion (`f8b447c2f4`, `ee14327c11`, `fdcf1d3d91`) held only because
+  the in-machine `call_ext`→`erlang:apply/3` seam was not yet closed (`proc_lib:init_p_do_apply` folded into
+  `blocked()`, so the real `logger_server` never ran), and 2026-10-11 (`58d5dc65e4`, `42c0232d40`,
+  `1d9f287c87`) closed it — directive 13 now starts a **live** `logger_server` (a genuine capability gain
+  matching the oracle), which is exactly what runs the probe.
   The **8** currently-failing crate tests fail ONLY because each asserts FULL 22-directive completion (a
   correct contract that must be kept): `--lib boot::` (3:
   `the_real_start_boot_executes_every_directive_to_progress_started`,
