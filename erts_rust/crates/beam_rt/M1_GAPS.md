@@ -390,44 +390,47 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; the one remaining blocker is owned by
-  `erts_rust/crates/beam_loader`.** `Runtime::boot_from_script` runs the
+* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; the blocker is owned by
+  `erts_rust/crates/beam_bifs` + `erts_rust/crates/beam_rt`.** `Runtime::boot_from_script` runs the
   real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 directives**) past index 18
   (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, whose `apply` **returns
   `Ok`** — but the kernel application does **not** stay up) and stops at index **19**
   (`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`); the final
   `{progress,started}` (index 21) is not reached. The CLI `-boot bootstrap/bin/start` and the `run`
   action exit **1** (not 3): **stderr** is exactly
-  `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`
-  (102 bytes), while **stdout** carries 80 lines (3055 bytes) of crash reports — **2**
-  `=CRASH REPORT====` blocks (the `standard_error` `supervisor_bridge` child raising
-  `error:bad argument in function gen_server:init_it/6 (gen_server.erl:2272)`, then `kernel_sup`
-  reporting `errorContext: start_error` / `offender: [{id,standard_error},…]`), **1**
-  `=SUPERVISOR REPORT====` block and **1** `=INFO REPORT====` block
-  (`application: kernel exited: {{shutdown,{failed_to_start_child,standard_error,{badarg,…}}} …, type: permanent}`).
+  `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`,
+  while **stdout** carries **84 lines / 3352 bytes** of crash reports — **2**
+  `=CRASH REPORT====` blocks, **1** `=SUPERVISOR REPORT====` block and **1** `=INFO REPORT====` block.
   The in-crate `BootStop` reports `index = 19`. `-boot FILE` drives the walk (`src/cli.rs::drive`), a
   plain start keeps the preloaded-only floor, directive 13 leaves a live `logger_server` registered as
   `logger`, and the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
-  **The current cause — out of node.** **B2 — the per-module atom-table prefix-snapshot gap**
-  (`erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine`): `beam_loader::Module.atom_table`
-  is an owned load-time prefix clone with no global fallback, so a token interned *after* the reader
-  module loaded resolves to `None` and the engine raises `badarg` (`gen_server:init_it/6`,
-  `gen_server.erl:2272`). On the plain route this kills the kernel application's `standard_error`
-  `supervisor_bridge` child, so `kernel_sup` reports `start_error` and the `permanent` kernel application
-  tears itself down; on a route where a `-pa <shim>` (a stale `gen.beam` seeding `supervisor_bridge`) lets
-  that child get further, the same gap kills `inet_db`.
-  Directive 19's `{load_application,stdlib}` `gen_server:call` then finds no `application_controller`
-  and raises the `{noproc,…}` above, which `apply_boot_call` reports as the directive's typed error.
-  **Raw figures.** Plain route: **stdout 80 lines / 3055 bytes** — the first report carries
-  `initial call: supervisor_bridge:standard_error/1` and `in function gen_server:init_it/6 (gen_server.erl:2272)`,
-  offender `{id,standard_error}`, **2** `=CRASH REPORT====` blocks, **1** `=SUPERVISOR REPORT====` and **1**
-  `=INFO REPORT====` block
-  (`application: kernel exited: {{shutdown,{failed_to_start_child,standard_error,{badarg,…}}} …, type: permanent}`).
-  Shimmed route (`-pa <shim>` with the stale `gen.beam`): **stdout 165 lines / 5834 bytes** — the first
-  report is a `=CRASH REPORT====` for `initial call: prim_tty:writer/1` raising `error: bad argument`
-  with `ancestors: [standard_error]`, and the walk advances past `file_server_2` to the terminal
-  offender `{id,inet_db}` (`{mfargs,{inet_db,start_link,[]}}`, `gen_server:init_it/6` badarg) — no
-  `already_started`.
+  **The current cause — out of node.** `global:init/1` runs
+  `ok = net_kernel:monitor_nodes(true, #{connection_id => true})` (`lib/kernel/src/global.erl:800`);
+  `net_kernel:monitor_nodes/2` calls `process_flag({monitor_nodes, MapOpts}, Flag)` — an undocumented
+  **tuple** first argument the real C handles at `erts/emulator/beam/bif.c:2212-2227`
+  (`lib/kernel/src/net_kernel.erl:673`) — but `beam_bifs`'s `process_flag_2`
+  (`erts_rust/crates/beam_bifs/src/proc_reg.rs:399`) rejects any non-atom first argument with `badarg`
+  **before** its `ProcessHook` seam is reached (whose `process_flag` takes `flag: Atom`,
+  `erts_rust/crates/beam_bifs/src/context.rs:775`). `monitor_nodes/2` catches the `badarg`, so
+  `mk_monitor_nodes_error/2` returns `{error,internal_error}` and the `ok =` match raises
+  `{badmatch,{error,internal_error}}` in `global:init/1` (`global.erl:800`).
+  `global_name_server` is a **permanent** child of `kernel_sup`, so `kernel_sup` reports `start_error`,
+  the `permanent` kernel application tears itself down, and directive 19's
+  `{load_application,stdlib}` `gen_server:call` then finds no `application_controller` and raises the
+  `{noproc,…}` above, which `apply_boot_call` reports as the directive's typed error.
+  **Raw figures.** **stdout 84 lines / 3352 bytes** — the first `=CRASH REPORT====` block's
+  `initial call` is `global:init/1`, raising
+  `error: no match of right hand side value {error,internal_error}` at `global.erl:800` (through
+  `gen_server:init_it/2`, `gen_server.erl:2276`); a second `=CRASH REPORT====` block covers
+  `application_master:init/3`'s shutdown; the **1** `=SUPERVISOR REPORT====` block is
+  `supervisor: {local,kernel_sup}`, `errorContext: start_error`, offender
+  `[{id,global_name_server}, {mfargs,{global,start_link,[]}}, {restart_type,permanent}, …]`; and the
+  **1** `=INFO REPORT====` block reports
+  `application: kernel / exited: {{shutdown,{failed_to_start_child,global_name_server,{{badmatch,{error,internal_error}},…}}},{kernel,start,[normal,[]]}} / type: permanent`.
+  The stop is **tier-independent** (`BEAM_RT_TIER=interpreter` reproduces the same 84 stdout lines).
+  **Closing it** needs a `beam_bifs` change (recognize the `{monitor_nodes, MapOpts}` tuple flag and
+  the bare `monitor_nodes` atom, and extend the `ProcessHook` seam to carry the options) plus a
+  `beam_rt` implementation of `erts_monitor_nodes`.
   **An external fun resolves in-machine (why index 18's `apply` returns `Ok`):**
   `RuntimeContext::resolve_local_fun` (`src/context/execution.rs`) resolves an EXTERNAL fun
   (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through the
@@ -516,20 +519,16 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `RunnerState` (a typed gap where no machine is reachable).
   Owner: `erts_rust/crates/beam_rt` (`src/context/position.rs` + `src/native/memory/`); the seam lives in
   `erts_rust/crates/beam_engine`.
-* **The boot-chain crashes attribute to B2, not to a `process_info` capability gap.** On the
-  plain route the fatal step is the kernel application's `standard_error` `supervisor_bridge` child
-  raising `badarg` inside `gen_server:init_it/6` (`gen_server.erl:2270-2272`, the
-  `{'EXIT', Class, Reason, Stacktrace}` clause: `gen:unregister_name(Name0)` then
-  `erlang:raise(Class, Reason, Stacktrace)`) — **B2**, the per-module atom-table prefix snapshot
-  (`beam_loader::Module.atom_table` is an owned load-time prefix clone with no global fallback, so a token
-  interned after the reading module loaded resolves to `None`). The report's `initial call:
-  supervisor_bridge:standard_error/1` is the child's own behaviour entry and agrees with the oracle, so it
-  is not a divergence. B2 is tier-independent (`BEAM_RT_TIER=interpreter` reproduces the same 80 stdout
-  lines), so the plain route's stop is not a JIT defect. On the shimmed route (`-pa <shim>` seeding
-  `supervisor_bridge` with a stale `gen.beam`) the child starts and the same atom-snapshot gap then kills
-  `inet_db` (`gen_server:init_it/6` badarg). The in-machine execution-position door
-  (`src/context/position.rs`) already serves `process_info(self(), current_stacktrace)`, so it is no
-  longer a boot blocker. No boot failure here is a wrong result.
+* **The boot-chain crash attributes to the `process_flag({monitor_nodes,…})` tuple-flag rejection, not
+  to a `process_info` capability gap.** The fatal step is the kernel application's `global_name_server`
+  child raising `{badmatch,{error,internal_error}}` in `global:init/1` (`global.erl:800`) because
+  `beam_bifs`'s `process_flag_2` refuses the tuple `{monitor_nodes, MapOpts}` flag
+  (`beam_bifs/src/proc_reg.rs:399`; the C handles it at `erts/emulator/beam/bif.c:2212-2227`). The
+  report's `initial call: global:init/1` is the child's own behaviour entry and agrees with the oracle,
+  so it is not a divergence. The stop is tier-independent (`BEAM_RT_TIER=interpreter` reproduces the
+  same 84 stdout lines), so it is not a JIT defect. The in-machine execution-position door
+  (`src/context/position.rs`) already serves `process_info(self(), current_stacktrace)`, so it is not a
+  boot blocker. No boot failure here is a wrong result.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs
   **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp`

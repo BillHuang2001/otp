@@ -70,7 +70,7 @@ fn a_bif_builds_an_atom_from_the_shared_table() {
 }
 
 /// **The `atom_name` seam resolves through the runtime's LIVE namespace, not the running
-/// module's load-time snapshot** — the engine-side half of the A.9 boot blocker.
+/// module's load-time snapshot** — the engine-side half of the load-time atom-snapshot gap.
 ///
 /// [`Module::atom_name`](beam_loader::Module::atom_name) indexes only the module's **owned
 /// load-time prefix clone** of the shared table (`CodeServer::load_bytes` hands
@@ -3547,8 +3547,7 @@ init(Path) -> erlang:load_nif(Path, #{}).
 /// `current_module`-dependent identity exists for the module-wide guard to protect. Keeping the
 /// refusal would buy nothing and would route the library's Erlang wrappers (`load/0`, `init/1`,
 /// `writer/1`, `reader/1`, …) onto the synchronous non-pumping `call_bif` path, where `init/1`'s
-/// blocking `receive` folds into the typed `blocked()` gap — the A.9 boot blocker: the
-/// `standard_error` `supervisor_bridge` child dies on it.
+/// blocking `receive` folds into the typed `blocked()` gap.
 ///
 /// Both directions are pinned so the exemption cannot silently widen:
 ///
@@ -3565,7 +3564,8 @@ init(Path) -> erlang:load_nif(Path, #{}).
 fn the_call_seam_enters_a_built_in_nif_library_in_machine() {
     let mut rt = runtime();
 
-    // The real system module is the A.9 boot blocker's own callee. A bare container without an
+    // A built-in NIF library's Erlang wrappers are entered in-machine rather than through the
+    // synchronous `call_bif` route. A bare container without an
     // OTP installation skips **loudly**; once the system code path resolves, the module must be
     // there — so a seam regression below still fails rather than skips.
     if let Err(error) = rt.code_server.add_system_paths() {

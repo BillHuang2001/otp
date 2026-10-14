@@ -197,7 +197,7 @@ fn a_budget_allows_exactly_its_units_then_refuses() {
 /// forward the trait's default `Ok(false)` applies: every local call is declined and jumps
 /// in-machine into the callee's own code, so a built-in/static NIF library stub
 /// (`prim_tty:tty_create/1`, body `erlang:nif_error(undef)`) raises `undef` instead of reaching
-/// the host that serves it — the boot-blocking `standard_error` death.
+/// the host that serves it.
 ///
 /// The seam is driven through the wrapper and every answer is cross-checked against the bare
 /// inner context, so this pins the **forward** (a served key stays served, an unserved one

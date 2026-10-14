@@ -357,9 +357,9 @@ impl ExecutionContext for RuntimeContext<'_> {
         // name to validate. Keeping the refusal would buy no correctness at all and would only
         // route the library's **Erlang wrappers** onto the synchronous non-pumping
         // [`Self::call_bif`] path, where a blocking `receive` folds into the typed `blocked()`
-        // gap (exit 3) — the A.9 boot blocker: `supervisor_bridge:standard_error/1` raises
-        // `badarg` and dies because `prim_tty:init/1` waits for the reader process it just
-        // spawned. Contract A.7's `prim_*` family is served from the floor
+        // gap (exit 3) — `prim_tty:init/1` waits for the reader process it just spawned, so the
+        // library's Erlang wrappers are entered in-machine rather than through that route.
+        // Contract A.7's `prim_*` family is served from the floor
         // ([`crate::native::prim_tty`]), which is what makes the library built-in in the first
         // place; [`crate::native::prim_tty::is_builtin_library`] is that ONE source of truth.
         //

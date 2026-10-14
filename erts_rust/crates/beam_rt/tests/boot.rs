@@ -37,8 +37,8 @@
 //! 4. the real committed `bootstrap/bin/start.boot` executes directives 0–18 and **stops at
 //!    directive index 19 of 22**
 //!    (`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`) — the kernel
-//!    application's `standard_error` child crash (a per-module atom-table prefix snapshot owned
-//!    outside this node) tears down the `permanent` kernel application, so directive 19's
+//!    application's `global_name_server` child crash (a `{monitor_nodes,…}` tuple `process_flag`
+//!    refused outside this node) tears down the `permanent` kernel application, so directive 19's
 //!    `{load_application,stdlib}` call finds no `application_controller`
 //!    ([`the_real_start_boot_runs_to_completion`]);
 //! 5. a synthetic boot script — compiled at test time with the system toolchain — executes
