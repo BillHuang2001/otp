@@ -182,6 +182,10 @@ pub struct Scheduler {
     /// schedule-in/schedule-out port-monitor cleanup. `None` (the [`Scheduler::new`] default) is
     /// the port-less behaviour. See [`Scheduler::with_ports`].
     ports: Option<PortTable>,
+    /// The wake sweep's reusable scratch buffer: the table's wake list is *moved into* it by
+    /// `ProcessTable::drain_woken_into` at the end of every slice, so the sweep neither allocates
+    /// for the wake list nor frees it (see [`Scheduler::resume_woken`]).
+    woken: Vec<ProcessId>,
 }
 
 impl Scheduler {
@@ -201,6 +205,7 @@ impl Scheduler {
             progress: ThreadProgress::new(),
             slices: 0,
             ports: None,
+            woken: Vec::new(),
         }
     }
 
@@ -220,6 +225,7 @@ impl Scheduler {
             progress: ThreadProgress::new(),
             slices: 0,
             ports: Some(ports),
+            woken: Vec::new(),
         }
     }
 
@@ -391,14 +397,15 @@ impl Scheduler {
         explicit_ports: Option<&mut PortTable>,
         runner: &mut R,
     ) -> Result<Option<ProcessId>> {
-        // Destructure so the run-queue borrow (the requeue closure) and the port-table borrow
-        // are provably disjoint fields.
+        // Destructure so the run-queue borrow (the requeue closure), the port-table borrow and
+        // the wake scratch are provably disjoint fields.
         let Scheduler {
             run_queue,
             reductions_per_slice,
             slices,
             progress: _,
             ports: owned_ports,
+            woken,
         } = self;
         // An explicitly passed table wins over the scheduler's owned one.
         let mut ports: Option<&mut PortTable> = match explicit_ports {
@@ -410,7 +417,7 @@ impl Scheduler {
             // Nothing to run, but a wake produced by a send *outside* a slice (which the
             // orchestrator may not have absorbed yet) must still be turned into a run-queue
             // entry; absorbing here keeps a direct `run_slice` caller correct.
-            resume_woken_into(run_queue, table);
+            resume_woken_scratch_into(run_queue, table, woken);
             return Ok(None);
         };
 
@@ -425,7 +432,7 @@ impl Scheduler {
 
         // Absorb every wake produced during the slice (a send to a blocked receiver, or a
         // signal/trapped-`EXIT`/`{'DOWN'}` message) into this same sweep.
-        resume_woken_into(run_queue, table);
+        resume_woken_scratch_into(run_queue, table, woken);
 
         Ok(Some(pid))
     }
@@ -442,8 +449,12 @@ impl Scheduler {
     /// This is the hook `beam_rt` calls after it sends to a blocked process **outside** a
     /// scheduler slice (`run_slice` calls it automatically at each slice's end). See the
     /// crate `CONTEXT.md` for the full single-threaded orchestration contract.
+    ///
+    /// The sweep reuses the scheduler's own wake scratch buffer, so neither the table's wake list
+    /// nor its consumer allocates after the first non-empty sweep (see
+    /// [`ProcessTable::drain_woken_into`]).
     pub fn resume_woken(&mut self, table: &mut ProcessTable) -> usize {
-        resume_woken_into(&mut self.run_queue, table)
+        resume_woken_scratch_into(&mut self.run_queue, table, &mut self.woken)
     }
 
     /// Runs slices until the run queue empties (or `max_slices` have run), returning the
@@ -762,12 +773,18 @@ fn slice_end_inner<F: FnMut(ProcessId, Priority)>(
 }
 
 /// Turns the table's pending wakes into run-queue entries on `run_queue`, returning how many
-/// were enqueued. This is the free-function form of [`Scheduler::resume_woken`], so a caller that
+/// were enqueued. This is the free-function form of [`Scheduler::resume_woken`], over a
+/// caller-owned **reusable** wake buffer `woken` (see
+/// [`ProcessTable::drain_woken_into`](ProcessTable::drain_woken_into)): it exists so a caller that
 /// has already split-borrowed the scheduler (e.g. [`Scheduler::run_slice_inner`], which needs the
-/// run queue and the owned port table at once) can drive it without re-borrowing the whole
-/// scheduler.
-pub(crate) fn resume_woken_into(run_queue: &mut RunQueue, table: &mut ProcessTable) -> usize {
-    drain_woken_into(table, |pid, priority| {
+/// run queue, the owned port table and the wake scratch at once) can drive the sweep without
+/// re-borrowing the whole scheduler.
+pub(crate) fn resume_woken_scratch_into(
+    run_queue: &mut RunQueue,
+    table: &mut ProcessTable,
+    woken: &mut Vec<ProcessId>,
+) -> usize {
+    drain_woken_scratch_into(table, woken, |pid, priority| {
         run_queue.enqueue_with_priority(pid, priority)
     })
 }
@@ -785,10 +802,22 @@ pub(crate) fn resume_woken_into(run_queue: &mut RunQueue, table: &mut ProcessTab
 /// * `enqueue` — the run-queue insertion callback (`pid`, `priority`).
 pub(crate) fn drain_woken_into<F: FnMut(ProcessId, Priority)>(
     table: &mut ProcessTable,
+    enqueue: F,
+) -> usize {
+    let mut woken = Vec::new();
+    drain_woken_scratch_into(table, &mut woken, enqueue)
+}
+
+/// [`drain_woken_into`] over a caller-owned **reusable** wake buffer (`woken`), which keeps its
+/// capacity across sweeps.
+pub(crate) fn drain_woken_scratch_into<F: FnMut(ProcessId, Priority)>(
+    table: &mut ProcessTable,
+    woken: &mut Vec<ProcessId>,
     mut enqueue: F,
 ) -> usize {
     let mut resumed = 0;
-    for pid in table.drain_woken() {
+    table.drain_woken_into(woken);
+    for &pid in woken.iter() {
         let skip = match table.get(pid) {
             Some(process) => {
                 process.state() != ProcessState::Runnable || process.flags().in_run_queue()
