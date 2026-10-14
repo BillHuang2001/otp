@@ -6,10 +6,12 @@ correction saying why no case is possible. A recipe is added only **after** the 
 closes the gap it names, then `known-gaps.txt`/`GAPS.md` are refreshed in the same change (see
 `../CONTEXT.md` §"Notes for Agents").
 
-At a glance: **§1** and **§5b** are live gaps (recipes ready, not yet addable); **§2** and **§5a**
-already agree and are merely missing from the corpus; **§4**'s raw-DEFLATE surface and all of
-**§6** are faithful in `beam_rt` and are pinned by the concurrent `src/corpus/**` change; **§3**
-and **§7** record items that were named as gaps but are not gaps at all.
+At a glance: **§1** and **§5b** are live gaps (recipes ready, not yet addable); **§2**, **§5a**
+and **§4**'s tiny-body wrapped recipe already agree and are merely missing from the corpus; **§4**'s
+raw-DEFLATE surface and all of **§6** are faithful in `beam_rt` and are pinned by the
+`src/corpus/**` groups (`zlib.rs`, `flags.rs`, `flags_apply.rs`); **§4**'s gzip pair and its
+repetitive-body wrapped size form are unpinnable divergences recorded in `divergences.md`, not
+drafts; **§3** and **§7** record items that were named as gaps but are not gaps at all.
 
 This file is a hand-maintained companion to the generated `GAPS.md` and the hand-written
 `divergences.md`: `divergences.md` records divergences that are **unpinnable**, this file records
@@ -152,14 +154,17 @@ Case {
 
 ## 4. `zlib` — owner `beam_bifs`
 
-**Status:** `now-agreeing-and-promoted` for the **raw-DEFLATE** surface (`zlib:zip/1` /
-`zlib:unzip/1`, RFC 1951), whose cases are pinned by the concurrent `src/corpus/**` change
-(`src/corpus/zlib.rs`). The recipes below are the **zlib-wrapped** `zlib:compress/1` family — a
-**different** surface, `unverified this batch`: do not claim it agrees without evidence.
+**Status:** the **raw-DEFLATE** surface (`zlib:zip/1` / `zlib:unzip/1`, RFC 1951) is
+`now-agreeing-and-promoted` — its cases are pinned in `src/corpus/zlib.rs`. Of the two
+**zlib-wrapped** recipes below, the repetitive-body size one (4a) is **not a case** (a plain-value
+`mismatch`) and the tiny-body byte-exact one (4b) is `promotable (agrees today, not yet in the
+corpus)`; the `zlib:gzip/1` / `zlib:gunzip/1` pair (4c) is likewise a recorded divergence, not a
+draft.
 
 `code:which(zlib)` is the atom `preloaded` in **both** runtimes, and `beam_rt` lists `zlib` in its
-preloaded set (`crates/beam_rt/src/boot.rs`). Two wrapped-surface recipes (one volatile, one
-byte-exact), kept for reference:
+preloaded set (`crates/beam_rt/src/boot.rs`). The two wrapped-surface recipes, kept for reference:
+
+### 4a. `zlib:compress/1` of a repetitive body — **not a case** (plain-value `mismatch`)
 
 ```rust
 Case {
@@ -173,6 +178,18 @@ Case {
     },
     golden: Golden { stdout: Some("ok 17"), exit_code: 0 },
 }
+```
+
+* oracle `ok 17`, `beam_rt` `ok 23` (the two images are `<<120,156,99,96,24,5,163,96,20,140,84,0,
+  0,4,0,0,1>>` and `<<120,156,237,192,1,1,0,0,0,130,32,255,175,110,72,80,192,171,1,4,0,0,1>>`):
+  the wrapped image of a repetitive body is the encoder's own choice — a different block choice, not
+  a codec contract — so the recipe is a plain-value `mismatch` and must **not** be added. Recorded
+  in `divergences.md` §A.7 — zlib.
+* repro: `erts_rust/target/release/differential compare 'byte_size(zlib:compress(<<0:8192>>))'`
+
+### 4b. `zlib:compress/1` of a tiny body — **promotable** (agrees today, not yet in the corpus)
+
+```rust
 Case {
     id: "bifs/zlib_compress_bytes_are_deterministic",
     description: "zlib:compress/1 of a tiny body is a byte-exact, order-stable zlib stream",
@@ -186,13 +203,21 @@ Case {
 }
 ```
 
-* oracle: `ok 17` and the byte string above, both exit `0`. The `beam_rt` side of both recipes is
-  **unverified this batch** — confirm it before adding either one.
-* The exact-bytes form is fully deterministic (zlib level 6 on a 3-byte body is a stored/fixed-huffman
-  stream), so the `<<120,156,…>>` golden is host- and order-stable.
+* oracle and `beam_rt` both print `ok <<120,156,75,76,74,6,0,2,77,1,39>>`, exit `0` → **`[AGREE]`**
+  (zlib level 6 on a 3-byte body is a stored/fixed-huffman stream), so the golden is host- and
+  order-stable; the round trip `zlib:uncompress(zlib:compress(<<"abc">>)) =:= <<"abc">>` agrees too.
 * owner: `beam_bifs` (the `zlib` module's NIF-backed surface); `beam_rt` advertises the module as
   preloaded.
 * repro: `erts_rust/target/release/differential compare 'zlib:compress(<<"abc">>)'`
+
+### 4c. `zlib:gzip/1` / `zlib:gunzip/1` — **not a case** (plain `error:undef`)
+
+* the oracle returns the gzip container (`zlib:gzip(<<"abc">>)` →
+  `<<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>`, and `zlib:gunzip/1` inverts it)
+  while `beam_rt` raises the plain `error:undef`, so any case pinning either one is a plain-value
+  `mismatch`: this pair is a recorded divergence, not a draft. Recorded in `divergences.md`
+  §A.7 — zlib.
+* repro: `erts_rust/target/release/differential compare 'zlib:gzip(<<"abc">>)'`
 
 ## 5. `process_info/2` items — owner `beam_rt`
 
@@ -276,13 +301,13 @@ unpinned. No gap here.
 ## 6. `-pa` / `-pz` / `+S N:online` — owner `beam_rt`
 
 **Status:** `now-agreeing-and-promoted` — all three shapes below are faithful in `beam_rt` and are
-pinned by the concurrent `src/corpus/**` change (case ids in the literals).
+pinned in `src/corpus/flags.rs` (the ids in the literals are the ones that landed).
 
-`beam_rt`'s CLI (`crates/beam_rt/src/cli.rs`) now filters a non-existent `-pa`/`-pz` directory out
-of `code:get_path/0` (as `erl` does), accepts a multi-value `-pa`/`-pz` occurrence, and honours the
-`:N` half of `+S N:N` for `schedulers_online`.
+`beam_rt`'s CLI (`crates/beam_rt/src/cli.rs`) filters a non-existent `-pa`/`-pz` directory out of
+`code:get_path/0` (as `erl` does), accepts a multi-value `-pa`/`-pz` occurrence, and honours the
+`:N` half of `+S N:N` for `schedulers_online`. The shadowing half of the same surface is 6d.
 
-### 6a. a non-existent `-pa` directory
+### 6a. a non-existent `-pa` / `-pz` directory
 
 ```rust
 Case {
@@ -298,14 +323,16 @@ Case {
 }
 ```
 
-* both runtimes: `ok false`, exit `0`.
+* both runtimes: `ok false`, exit `0`. The append-side twin is the landed
+  `flags/pz_nonexistent_dir_is_not_on_the_code_path` (the same body with
+  `extra_argv: &["-pz", "…"]`; the landed switch value is `/nonexistent-differential-dir`).
 * repro: `beam_rt -noshell -pa /no/such/dir -eval 'io:format("~w~n",[lists:member("/no/such/dir", code:get_path())]),halt().'`
 
 ### 6b. multiple values in one occurrence
 
 ```rust
 Case {
-    id: "flags/pa_multiple_values_in_one_occurrence",
+    id: "flags/pa_multiple_values_one_occurrence",
     description: "erl records every following non-switch token as one -pa occurrence's values",
     contracts: &[Contract::Cli],
     kind: CaseKind::Eval {
@@ -317,15 +344,17 @@ Case {
 }
 ```
 
-* both runtimes: `ok {ok,[[[97],[98]]]}`, exit `0` (one occurrence carrying `["a","b"]`); `-pz` has
-  the identical multi-value shape (`crates/beam_rt/src/cli.rs`, the `-pz` arm).
+* both runtimes: `ok {ok,[[[97],[98]]]}`, exit `0` (one occurrence carrying `["a","b"]`); the
+  append-side twin is the landed `flags/pz_multiple_values_one_occurrence`
+  (`init:get_argument(pz)` with `["-pz", "a", "b"]`), which has the identical multi-value shape
+  (`crates/beam_rt/src/cli.rs`, the `-pz` arm).
 * repro: `beam_rt -noshell -pa a b -eval 'io:format("~w~n",[init:get_argument(pa)]),halt().'`
 
 ### 6c. `+S N:online`
 
 ```rust
 Case {
-    id: "flags/plus_s_online_half_sets_schedulers_online",
+    id: "flags/plus_s_total_online_sets_schedulers_online",
     description: "+S 4:2 sizes the scheduler pool to 4 but puts only 2 online",
     contracts: &[Contract::Cli],
     kind: CaseKind::Eval {
@@ -341,6 +370,18 @@ Case {
   `parse_schedulers` (`crates/beam_rt/src/cli.rs`) keeps the `:2` half and
   `schedulers_online` (`crates/beam_rt/src/info/schedulers.rs`) reports it.
 * repro: `beam_rt -noshell +S 4:2 -eval 'io:format("~w~n",[erlang:system_info(schedulers_online)]),halt().'`
+
+### 6d. a stdlib-module shadow — the `-pz` side only
+
+* The `-pz` non-shadowing check **is** expressible and landed as the `ModuleEnv` case
+  `flags_apply/erl_aflags_pz_does_not_shadow_a_stdlib_module` (`src/corpus/flags_apply.rs`): the
+  `ERL_AFLAGS`-carried directory holds a module *named* like a stdlib module (`proplists`) and
+  reaches the code path only through the environment, and the executed module reduces
+  `code:which(proplists) =:= <shadow beside ?MODULE>` to the integer `0` (the stdlib module still
+  wins) — the raw `code:which/1` answer is an installation-absolute path, so the integer reduction
+  is what makes the check portable at all.
+* The `-pa` side stays unpinnable: `-pa` *prepends*, so the shadow wins and is loaded during the
+  oracle's boot, which crashes it (empty stdout, no comparable golden).
 
 ## 7. Corrections — things named as gaps that are **not** gaps
 

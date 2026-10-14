@@ -198,6 +198,26 @@ not here.)
   bignum promotion is not observable and has no case.
 - The `ERL_*FLAGS` merge **order** IS pinned (`flags/env_*`); `ERL_OTP<sysver>_FLAGS` (29 vs 30) and
   an `-eval` carried by `ERL_FLAGS`/`ERL_AFLAGS` are deliberately not.
+- `-config <missing path>`: both runtimes exit `1` with empty stdout, but the **stderr text
+  differs** — the oracle writes `Could not start kernel pid (application_controller) ("error in
+  config file \"<path>\" (none): configuration file not found")` plus a crash-dump line, the Rust
+  runtime `beam_rt: error cannot read config file <path>`. An `Eval` case compares stderr (for
+  expression cases) so it would be a `mismatch`, and a `Command` case cannot pin exit `1` at all
+  (its golden requires non-empty stdout and exit `0`): the shape is unpinnable by the harness.
+  Owner: `beam_rt`.
+- A malformed atom-table size is refused at a **different exit code with different stderr**: `+t 2`
+  exits `1` in the oracle with `bad atom table size 2` + the `beam.smp` usage block on stderr
+  (7331 bytes), and exits `2` in the Rust runtime with `beam_rt: error bad value "2" for switch +t`
+  + the `beam_rt` usage — the crate's documented uniform malformed-value convention (`+t 1000` has
+  the same shape). The `-t 2` / `-t 1000` spellings are **not** `+t` aliases on either runtime
+  (both accept them silently, exit `0`), so only the `+t` form diverges. Owner: `beam_rt`
+  (`crates/beam_rt/src/cli/flags.rs`, `parse_atom_table_size`).
+- `-env Var Value`: both runtimes accept the switch (exit `0`), but only the oracle **applies** it
+  to the spawned process environment: `os:getenv("Var")` is the value (the charlist `"hello"` for
+  `-env Var hello`) in the oracle and `false` in the Rust runtime, which consumes the two tokens
+  and drops them. `init:get_argument(env)` and `init:get_argument(Var)` are `error` on both, so only
+  that recording half is pinnable (`flags/env_switch_is_not_an_init_argument`,
+  `flags/env_switch_value_is_not_an_init_argument`). Owner: `beam_rt`.
 
 ## A.7 — BIFs, ETS, printing, math (owner: `beam_bifs`, `beam_ets`)
 - ETS query surface: `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a
@@ -263,3 +283,22 @@ not here.)
   expressions verbatim once the literal builds). The source's own crate-level sweep for both
   (`crates/beam_bifs/src/re/oracle.rs`) still passes because it builds the subject as raw bytes
   rather than through the `-eval` literal parser.
+
+## A.7 — zlib (owner: `beam_bifs`)
+- `zlib:gzip/1` / `zlib:gunzip/1` are not implemented: the oracle returns the gzip container
+  (`zlib:gzip(<<"abc">>)` is `<<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>`, and
+  `zlib:gunzip/1` inverts it), the Rust runtime raises the plain `error:undef`. A case pinning
+  either is a plain-value `mismatch`, so neither is in `src/corpus/zlib.rs`.
+- `zlib:zip/1`'s **compressed image is the encoder's own choice**: for the 100-byte body
+  `list_to_binary(lists:seq(1,100))` the oracle's stream is 102 bytes and the Rust runtime's 105
+  (both valid DEFLATE — a different block choice), so `byte_size(zlib:zip(…))` is unpinnable and
+  only the bodies the oracle reproduces byte for byte carry a byte-exact golden; the 100-byte body
+  is pinned by the round-trip identity only (`src/corpus/zlib.rs`).
+- The zlib-**wrapped** sibling `zlib:compress/1` diverges the same way on a repetitive body: the
+  1 KiB zero body compresses to 17 bytes in the oracle
+  (`<<120,156,99,96,24,5,163,96,20,140,84,0,0,4,0,0,1>>`) and 23 in the Rust runtime
+  (`<<120,156,237,192,1,1,0,0,0,130,32,255,175,110,72,80,192,171,1,4,0,0,1>>`) — both valid zlib
+  streams, so `byte_size(zlib:compress(<<0:8192>>))` (`ok 17` vs `ok 23`) is a plain-value
+  `mismatch` and stays unpinned. The tiny body is byte-identical
+  (`zlib:compress(<<"abc">>)` → `<<120,156,75,76,74,6,0,2,77,1,39>>` on both), so that form and the
+  `uncompress(compress(B)) =:= B` round trip remain pinnable.
