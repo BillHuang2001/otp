@@ -123,6 +123,7 @@ use crate::Step;
 /// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
 pub(crate) fn exec(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -191,7 +192,7 @@ pub(crate) fn exec(
 
         // `apply Arity` — module = `x(arity)`, function = `x(arity+1)`, arguments
         // in `x(0..arity)` (`fixed_apply`).
-        Instr::Apply { arity } => match apply_target(machine, module, *arity, ctx)? {
+        Instr::Apply { arity } => match apply_target(machine, entry_module, module, *arity, ctx)? {
             ApplyTarget::Called(result) => {
                 machine.set_x(0, result)?;
                 Ok(Some(Step::Next))
@@ -243,7 +244,7 @@ pub(crate) fn exec(
         // `tests/call_ext_apply.rs::a_host_bif_error_from_a_tail_apply_last_lands_in_the_enclosing_try`.
         Instr::ApplyLast { arity, deallocate } => {
             machine.pop_frame_checked(*deallocate)?;
-            match apply_target(machine, module, *arity, ctx)? {
+            match apply_target(machine, entry_module, module, *arity, ctx)? {
                 ApplyTarget::Called(result) => {
                     machine.set_x(0, result)?;
                     // Follow the frame's continuation **context-aware**: this
@@ -413,6 +414,7 @@ pub(crate) enum ApplyTarget {
 /// the recursion into `apply()` computes.
 pub(crate) fn apply_target(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     arity: u32,
     ctx: &mut dyn ExecutionContext,
@@ -470,7 +472,14 @@ pub(crate) fn apply_target(
     // immediate terms that cannot move) and its arguments are the instruction's own
     // `x(0..arity)` registers, so the item is synthesized here: a no-op for any
     // other error shape and when the raise cannot land.
-    match ctx.call_bif(module_name, function_name, arity, &args) {
+    match machine.dispatch_bif_call(
+        entry_module,
+        module_name,
+        function_name,
+        arity,
+        &args,
+        ctx,
+    ) {
         Ok(value) => Ok(ApplyTarget::Called(value)),
         Err(e) => {
             let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;

@@ -862,6 +862,15 @@ fn drive(
     // deopt path's `step_instruction` reads the plain `bool`, so this single call
     // replaces a vtable call per call/return instruction.
     machine.trace_on = false;
+    // Latch the per-run in-machine BIF-dispatch gate too (see the
+    // `Machine::bif_in_machine_on` field docs). The native tier's deopt helper reaches
+    // the same BIF-dispatch funnel the interpreter does (`jit_step_one` →
+    // `step_instruction_with_entry` → `Machine::dispatch_bif_call`), so it must latch
+    // the same answer `Machine::drive` does — otherwise a host that opts in would be
+    // handed the live machine on one tier and silently bypassed on the other. The
+    // default `false` keeps the plain `call_bif` path byte-identical. (The traced early
+    // return above delegates to `Machine::drive`, which latches the gate itself.)
+    machine.bif_in_machine_on = ctx.wants_bif_in_machine();
     // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
@@ -896,6 +905,11 @@ fn drive(
         machine: machine_ptr,
         x_regs,
         module: state.module,
+        // The run's entry module is fixed for the whole loop (a context switch only
+        // rebinds `module`/`labels`), so a helper can name a context-`0` frame against
+        // it — for the in-machine BIF-dispatch door, the raise funnel's context-`0`
+        // half, and the receive family's dispatch.
+        entry_module: module as *const Module,
         labels: state.labels,
         ctx: ctx_ptr,
         error: None,
@@ -1006,7 +1020,14 @@ fn drive(
         // the loop (the entry module is the caller's, a callee's is held by the machine
         // and by `state`).
         let step = unsafe {
-            (*machine_ptr).step_instruction(&*state.module, &*state.labels, func, pc, &mut *ctx_ptr)
+            (*machine_ptr).step_instruction_with_entry(
+                module,
+                &*state.module,
+                &*state.labels,
+                func,
+                pc,
+                &mut *ctx_ptr,
+            )
         };
         // The uniform raise funnel's second half, exactly as `Machine::drive` runs it:
         // `step_instruction` attached the frames itself when the raise happened in the

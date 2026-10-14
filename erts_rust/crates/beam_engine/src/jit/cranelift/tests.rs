@@ -141,6 +141,7 @@ fn the_compiled_function_runs_the_export_natively() {
         y_base: std::ptr::null_mut(),
         y_end: std::ptr::null_mut(),
         module: &module as *const Module,
+        entry_module: &module as *const Module,
         labels: &labels as *const _,
         ctx: ctx_ptr,
         error: None,

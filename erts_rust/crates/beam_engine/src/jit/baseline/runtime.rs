@@ -172,6 +172,13 @@ pub(crate) struct JitRuntime<'a> {
     pub(crate) y_end: *mut Eterm,
     /// The module being executed (its `code`, labels, imports, literals).
     pub(crate) module: *const Module,
+    /// The run's **entry module** (module context `0`) — the module the driver was
+    /// entered at, distinct from [`Self::module`] only while a cross-module callee
+    /// runs. It is what the in-machine BIF-dispatch door
+    /// ([`ExecutionContext::call_bif_in_machine`]) and the raise funnel's
+    /// context-`0` half name a context-`0` frame against, and it is fixed for the
+    /// whole driver loop (a context switch only rebinds [`Self::module`]).
+    pub(crate) entry_module: *const Module,
     /// The module-wide `Label -> (func, pc)` map the helper resolves fail/target
     /// labels through (built once per driver call by
     /// [`interpreter::build_label_map`](crate::interpreter)).
@@ -366,6 +373,9 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
     // SAFETY: `runtime.module` points at the `&Module` the driver is running, which
     // outlives the loop.
     let module = unsafe { &*runtime.module };
+    // SAFETY: `runtime.entry_module` points at the run's entry module, which the
+    // driver holds alive for the whole loop (the caller's entry module).
+    let entry_module = unsafe { &*runtime.entry_module };
     // SAFETY: `runtime.labels` points at the driver's `labels` local, which outlives
     // the loop.
     let labels = unsafe { &*runtime.labels };
@@ -373,7 +383,7 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
     // a raw pointer; the driver holds no `&mut` to it while the helper runs.
     let ctx = unsafe { &mut *runtime.ctx };
 
-    let step = machine.step_instruction(module, labels, func, pc, ctx);
+    let step = machine.step_instruction_with_entry(entry_module, module, labels, func, pc, ctx);
     // Structural counter: attribute this per-instruction deopt to the opcode at
     // `(func, pc)` in the active module.
     #[cfg(test)]
@@ -428,6 +438,9 @@ fn jit_step_ext(
         // SAFETY: `runtime.module` points at the module the driver is running, which
         // outlives the loop.
         let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.entry_module` points at the run's entry module, which the
+        // driver holds alive for the whole loop.
+        let entry_module = unsafe { &*runtime.entry_module };
         // SAFETY: `runtime.labels` points at the driver's `labels` local, which
         // outlives the loop.
         let labels = unsafe { &*runtime.labels };
@@ -453,6 +466,7 @@ fn jit_step_ext(
             .and_then(|function| function.code.get(pc as usize))
         {
             Some(Instr::CallExt { arity, target }) => machine.call_ext_dispatch(
+                entry_module,
                 module,
                 labels,
                 *target,
@@ -464,6 +478,7 @@ fn jit_step_ext(
                 seam,
             ),
             Some(Instr::CallExtOnly { arity, target }) => machine.call_ext_dispatch(
+                entry_module,
                 module,
                 labels,
                 *target,
@@ -479,6 +494,7 @@ fn jit_step_ext(
                 target,
                 deallocate,
             }) => machine.call_ext_dispatch(
+                entry_module,
                 module,
                 labels,
                 *target,
@@ -492,7 +508,7 @@ fn jit_step_ext(
             // Not a `call_ext*`: `jit_ext_call` only reaches this helper for one, so
             // this defensive arm takes the interpreter's full step (exactly what the
             // helper's old fallback did) rather than inventing a result.
-            _ => machine.step_instruction(module, labels, func, pc, ctx),
+            _ => machine.step_instruction_with_entry(entry_module, module, labels, func, pc, ctx),
         };
         // The uniform raise funnel's context-`0` half, exactly as
         // `Machine::step_instruction` runs it: in context `0` the active module IS the
@@ -752,13 +768,16 @@ pub(crate) extern "C" fn jit_local_call(rt: *mut JitRuntime<'_>, func: u32, pc: 
         // SAFETY: `runtime.module` points at the module the driver is running, which
         // outlives the loop.
         let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.entry_module` points at the run's entry module, which the
+        // driver holds alive for the whole loop.
+        let entry_module = unsafe { &*runtime.entry_module };
         // SAFETY: `runtime.labels` points at the driver's `labels` local, which
         // outlives the loop.
         let labels = unsafe { &*runtime.labels };
         // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
         // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
-        probe_local_call(machine, module, labels, func, pc, ctx)
+        probe_local_call(machine, entry_module, module, labels, func, pc, ctx)
     };
     match outcome {
         None => LOCAL_DECLINE,
@@ -782,6 +801,7 @@ pub(crate) extern "C" fn jit_local_call(rt: *mut JitRuntime<'_>, func: u32, pc: 
 /// — the same split [`jit_step_ext`] uses.
 fn probe_local_call(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     labels: &LabelMap,
     func: u32,
@@ -804,7 +824,7 @@ fn probe_local_call(
         _ => return None,
     };
     let (callee, _) = labels.resolve(target).ok()?;
-    let step = match machine.local_call_seam(module, callee, arity, frame, func, pc, ctx) {
+    let step = match machine.local_call_seam(entry_module, module, callee, arity, frame, func, pc, ctx) {
         Ok(None) => return None,
         Ok(Some(step)) => Ok(step),
         Err(err) => Err(err),

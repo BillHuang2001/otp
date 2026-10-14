@@ -40,6 +40,7 @@ use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
 use crate::machine::{Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
+use crate::terms::{reserve_slack, Sink};
 use crate::Step;
 
 use super::{resolve, LabelMap};
@@ -144,9 +145,45 @@ impl Machine {
     /// driver ([`Machine::drive`], which knows the true entry module) attaches the
     /// fuller frame set — naming the callee's module for a context-`0` caller would
     /// be a wrong result.
+    ///
+    /// This is the **single-module shorthand** for
+    /// [`Machine::step_instruction_with_entry`] (the active module IS the entry
+    /// module): the crate's own drivers — the interpreter's
+    /// [`Machine::drive`](crate::machine::Machine) and the native tiers — call the
+    /// entry-aware variant so a cross-module callee is named against the run's true
+    /// entry module, and this shorthand remains for the callers that operate in the
+    /// run's **entry** context (`0`), where the two modules are the same.
+    #[allow(dead_code)] // consumed by the crate's `#[cfg(test)]` callers
     #[inline]
     pub(crate) fn step_instruction(
         &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> StepResult {
+        self.step_instruction_with_entry(module, module, labels, func, pc, ctx)
+    }
+
+    /// [`Machine::step_instruction`] with the run's **entry module** handed in
+    /// separately from the **active** module.
+    ///
+    /// The two differ only while a cross-module callee (a non-zero module context)
+    /// is executing: `active_module` is the callee the `(func, pc)` index, while
+    /// `entry_module` is the module the run was entered at (module context `0`,
+    /// which a [`Machine`](crate::Machine) borrows rather than owns). The entry
+    /// module is what the in-machine BIF-dispatch door
+    /// ([`ExecutionContext::call_bif_in_machine`](crate::context::ExecutionContext::call_bif_in_machine))
+    /// hands the host, and what the raise funnel's context-`0` half names frames
+    /// against — so both must travel to the BIF arms and the instruction families.
+    ///
+    /// The per-instruction semantics are unchanged: this is the same execution with
+    /// one extra read-only module reference threaded through.
+    #[inline]
+    pub(crate) fn step_instruction_with_entry(
+        &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         func: u32,
@@ -162,7 +199,7 @@ impl Machine {
         // blocking `wait` is interpreted, never inlined); a natively-executed JIT
         // block does not update it (see the field docs).
         self.current_code = Some((func, pc));
-        let result = self.step_instruction_inner(module, labels, func, pc, ctx);
+        let result = self.step_instruction_inner(entry_module, module, labels, func, pc, ctx);
         // The uniform raise funnel (see this method's docs). In context `0` the
         // active module is the entry module, so `Some(module)` is exactly the
         // `entry_module` `Machine::raise_stacktrace` needs; in a callee context the
@@ -180,6 +217,7 @@ impl Machine {
     #[inline]
     fn step_instruction_inner(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         func: u32,
@@ -229,14 +267,22 @@ impl Machine {
             // re-entry test in C. Treating it as a no-op instead would fall through to
             // the entry label and re-run the clause tests forever — the
             // `proplists:get_value(a, undefined)` hang.
-            Instr::FuncInfo { .. } => {
+            Instr::FuncInfo { arity, .. } => {
                 // The frames an *uncaught* `function_clause` carries (the boot path's
                 // failure mode) are attached uniformly as the raise leaves the machine
                 // ([`Machine::with_uncaught_frames`], via `step_instruction`), so this
                 // arm stays the plain raise and every raise kind shares one frame
                 // derivation. A caught raise is unaffected (the frames are metadata on
                 // the uncaught `Raise` only).
-                raise_function_clause_no_fail(self, module, "func_info").map_err(Box::new)
+                // The raise carries the failed clause's **real call argument list**: the
+                // function whose clause failed was entered with `x(0..arity)`, which is
+                // what C's cooked item for it puts in the `A` slot — never the declared
+                // arity. `arity` here is the instruction's own (the function's declared
+                // arity), intersected with the running function's table arity so a
+                // malformed module can never read past the registers it populated.
+                let argv = (*arity).min(running_arity(module, func));
+                raise_function_clause_with_args(self, module, "func_info", ctx, argv)
+                    .map_err(Box::new)
             }
             Instr::Move { src, dst } => {
                 let value = read_operand(self, ctx, src)?;
@@ -254,7 +300,9 @@ impl Machine {
                 if self.eval_test(module, *kind, args, ctx)? {
                     Ok(Step::Next)
                 } else if *fail == NO_FAIL {
-                    raise_function_clause_no_fail(self, module, "test").map_err(Box::new)
+                    let argv = running_arity(module, func);
+                    raise_function_clause_with_args(self, module, "test", ctx, argv)
+                        .map_err(Box::new)
                 } else {
                     let (func, pc) = resolve(labels, *fail)?;
                     Ok(Step::Goto { func, pc })
@@ -276,7 +324,9 @@ impl Machine {
                         Ok(Step::Goto { func, pc })
                     }
                     None if *fail == NO_FAIL => {
-                        raise_function_clause_no_fail(self, module, "select_val").map_err(Box::new)
+                        let argv = running_arity(module, func);
+                        raise_function_clause_with_args(self, module, "select_val", ctx, argv)
+                            .map_err(Box::new)
                     }
                     None => {
                         let (func, pc) = resolve(labels, *fail)?;
@@ -295,14 +345,14 @@ impl Machine {
                 dst,
                 ..
             } => self
-                .exec_bif(module, labels, *bif, args, *fail, dst, ctx)
+                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, ctx)
                 .map_err(Box::new),
             Instr::Bif0 { bif, dst } => {
                 // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
                 // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
                 // is no fail label, so any error is a raise; C routes the call
                 // through `call_light_bif`, whose error path is catch-aware.
-                self.exec_bif(module, labels, *bif, &[], NO_FAIL, dst, ctx)
+                self.exec_bif(entry_module, module, labels, *bif, &[], NO_FAIL, dst, ctx)
                     .map_err(Box::new)
             }
             // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
@@ -316,7 +366,7 @@ impl Machine {
                 dst,
                 ..
             } => self
-                .exec_bif(module, labels, *bif, args, *fail, dst, ctx)
+                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, ctx)
                 .map_err(Box::new),
             Instr::Call { target, arity } => {
                 let (callee, callee_pc) = resolve(labels, *target)?;
@@ -327,6 +377,7 @@ impl Machine {
                 // return address for a callee that does not run — exactly like the
                 // synchronous half of the `call_ext` arm.
                 if let Some(step) = self.local_call_seam(
+                    entry_module,
                     module,
                     callee,
                     *arity,
@@ -372,6 +423,7 @@ impl Machine {
                 // order `ImportFrame::Last` applies on the `call_ext_last` route), so
                 // the seam is asked before anything is popped.
                 if let Some(step) = self.local_call_seam(
+                    entry_module,
                     module,
                     callee,
                     *arity,
@@ -400,6 +452,7 @@ impl Machine {
                 // frame's existing continuation is followed), exactly like its
                 // `call_ext_only` twin.
                 if let Some(step) = self.local_call_seam(
+                    entry_module,
                     module,
                     callee,
                     *arity,
@@ -430,6 +483,7 @@ impl Machine {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
                 self.call_ext_dispatch(
+                    entry_module,
                     module,
                     labels,
                     *target,
@@ -449,6 +503,7 @@ impl Machine {
                 // the callee's `return` follows the frame's *existing* continuation
                 // (exactly like the local `Instr::CallOnly`).
                 self.call_ext_dispatch(
+                    entry_module,
                     module,
                     labels,
                     *target,
@@ -499,6 +554,7 @@ impl Machine {
                 // applies), so a raise leaves the live frame untouched and a success
                 // pops it exactly once.
                 self.call_ext_dispatch(
+                    entry_module,
                     module,
                     labels,
                     *target,
@@ -568,7 +624,7 @@ impl Machine {
             // this seam existed; a family that later implements an opcode returns
             // a [`Step`] telling the driver where to continue. Never a panic and
             // never a wrong result.
-            other => families::dispatch(self, module, labels, other, func, pc, ctx)
+            other => families::dispatch(self, entry_module, module, labels, other, func, pc, ctx)
                 .map_err(Box::new),
         }
     }
@@ -728,6 +784,7 @@ impl Machine {
     /// applies its own `CallExt*` frame discipline.
     fn resolve_call_ext_apply(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         target: ImportRef,
@@ -801,7 +858,7 @@ impl Machine {
         // `x(N)` and the function is `x(N+1)`, with the arguments in `x(0..N)`.
         self.set_x(count, module_term)?;
         self.set_x(count + 1, function_term)?;
-        Ok(Some(apply_target(self, module, count, ctx)?))
+        Ok(Some(apply_target(self, entry_module, module, count, ctx)?))
     }
 
     /// The `call_ext*`-encoded `erlang:send/2` / `erlang:'!'/2` seam.
@@ -928,6 +985,7 @@ impl Machine {
     /// frame when there is one.
     pub(crate) fn call_ext_dispatch(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         target: ImportRef,
@@ -939,7 +997,7 @@ impl Machine {
         seam: Option<Option<(u32, u32, u32)>>,
     ) -> StepResult {
         let apply_target =
-            if let Some(t) = self.resolve_call_ext_apply(module, labels, target, ctx)? {
+            if let Some(t) = self.resolve_call_ext_apply(entry_module, module, labels, target, ctx)? {
                 t
             } else if let Some(t) = self.resolve_call_ext_send(module, labels, target, ctx)? {
                 t
@@ -954,7 +1012,7 @@ impl Machine {
                         func: target_func,
                         pc: target_pc,
                     },
-                    None => match self.call_import(module, labels, target, arity, ctx) {
+                    None => match self.call_import(entry_module, module, labels, target, arity, ctx) {
                         Ok(value) => ApplyTarget::Called(value),
                         Err(e) => {
                             // An import the host cannot resolve raises `undef`, and the
@@ -1008,6 +1066,7 @@ impl Machine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn local_call_seam(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         callee: u32,
         nregs: u32,
@@ -1025,7 +1084,14 @@ impl Machine {
         {
             return Ok(None);
         }
-        let value = match self.call_bif_named(module_name, function_name, arity, nregs, ctx) {
+        let value = match self.call_bif_named(
+            entry_module,
+            module_name,
+            function_name,
+            arity,
+            nregs,
+            ctx,
+        ) {
             Ok(value) => value,
             Err(e) => return self.raise_bif_error(module, e).map_err(Box::new).map(Some),
         };
@@ -1186,10 +1252,61 @@ fn unwrap_apply3(list: Eterm) -> Option<(Eterm, Eterm, Eterm)> {
 ///
 /// `what` names the raising instruction/site (`"func_info"`, `"test"`,
 /// `"select_val"`, `"maps"`) for the typed error above.
+///
+/// This is the **argument-list-free** entry point: it raises exactly the reason above
+/// and arms no failed-clause argument list, so the cooked stacktrace item for the
+/// raising function falls back to its declared arity. The `func_info`/`test`/
+/// `select_val` arms use [`raise_function_clause_with_args`] instead, which passes the
+/// function's real call arguments.
 pub(crate) fn raise_function_clause_no_fail(
     machine: &mut Machine,
     module: &Module,
     what: &str,
+) -> Result<Step> {
+    function_clause_raise(machine, module, what, None)
+}
+
+/// Raise the failed-clause reason **carrying the failed function's real call argument
+/// list** — the one definition of the `function_clause` raise for the sites that know
+/// how the failing function was called.
+///
+/// C's `i_func_info_IaaI` (`../../erts/emulator/beam/emu/beam_emu.c:578-583`) sets
+/// `c_p->freason = EXC_FUNCTION_CLAUSE` and `goto handle_error`; the arguments ride in
+/// the **stacktrace**, and `save_stacktrace`'s `non_bif_stacktrace:` branch
+/// (`../../erts/emulator/beam/beam_common.c`) makes the innermost saved entry the
+/// **function itself** with `args = make_arglist(c_p, reg, a)`. Cooking that entry
+/// (`erts_build_mfa_item`, `../../erts/emulator/beam/utils.c:3430-3457`) emits `args`
+/// in the item's `A` slot when it is a list/nil — so the oracle reports
+/// `{Mod, Fun, [Arg, …], Location}` for the failing function while **every outer**
+/// frame keeps its declared arity.
+///
+/// `argv` is the number of leading argument registers the failed clause was entered
+/// with (`x(0..argv)`); the list is built through the **rooted** seam (the argument
+/// registers are inside the frozen root set, so a collecting host relocates them —
+/// and they are therefore read *after* the reservation, never before) and parked on
+/// the machine as the raise's one-shot latch
+/// ([`Machine::pending_function_clause_args`]), which
+/// [`Machine::throw_with_trace`] promotes to the live raise state that the two
+/// cooked-trace builders consume.
+pub(crate) fn raise_function_clause_with_args(
+    machine: &mut Machine,
+    module: &Module,
+    what: &str,
+    ctx: &mut dyn ExecutionContext,
+    argv: u32,
+) -> Result<Step> {
+    let args = failed_clause_arglist(machine, ctx, argv)?;
+    function_clause_raise(machine, module, what, Some(args))
+}
+
+/// The shared body of the two `function_clause` raise entry points: resolve the
+/// reason atom from the running module's own table, install the `error` class atom,
+/// arm `failed_clause_args` when there is one, and throw.
+fn function_clause_raise(
+    machine: &mut Machine,
+    module: &Module,
+    what: &str,
+    failed_clause_args: Option<Eterm>,
 ) -> Result<Step> {
     let atom = module.atom_table.lookup("function_clause").ok_or_else(|| {
         error::unsupported(&format!(
@@ -1201,5 +1318,51 @@ pub(crate) fn raise_function_clause_no_fail(
     if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
+    machine.pending_function_clause_args = failed_clause_args;
     machine.throw_error(reason)
+}
+
+/// The failed clause's argument list — a proper list of the `argv` leading argument
+/// registers — or [`NIL`] for a zero-arity call (which C emits as a list too: `nil`
+/// *is* the empty argument list, `erts_build_mfa_item`'s `is_nil(args)` arm).
+///
+/// The reservation is taken **before** the registers are read: a collecting host may
+/// relocate `x`, and the argument registers are its roots, so reading them first would
+/// capture from-space words.
+fn failed_clause_arglist(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    argv: u32,
+) -> Result<Eterm> {
+    // A `.beam`'s declared arity is bounded by the register file (the loader rejects
+    // anything larger), but clamping keeps a malformed module from reserving an
+    // absurd region and reading past the registers that were populated.
+    let n = (argv as usize).min(crate::machine::MAX_REGISTER as usize);
+    if n == 0 {
+        return Ok(NIL);
+    }
+    let mut sink = reserve_slack(machine, ctx, 2 * n)?;
+    let mut args = Vec::with_capacity(n);
+    for index in 0..n {
+        // Read the argument registers AFTER the reservation (`x` is in the root set,
+        // so a collection under the reservation relocates it).
+        args.push(machine.x(index as u32).unwrap_or(NIL));
+    }
+    sink.list(&args)
+}
+
+/// The declared arity of the function at index `func` of `module`: the arity a
+/// `function_clause` raised while executing **anywhere** in that function (a
+/// `NO_FAIL` `test`/`select_val` failure) must report, because the function's
+/// call arguments — which that raise does not otherwise know — are exactly its
+/// `arity` leading registers.
+///
+/// An index outside the module's function table yields `0` (an empty argument list),
+/// never a panic.
+fn running_arity(module: &Module, func: u32) -> u32 {
+    module
+        .functions
+        .get(func as usize)
+        .map(|function| function.arity)
+        .unwrap_or(0)
 }

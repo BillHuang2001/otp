@@ -111,6 +111,7 @@ mod tuples;
 #[inline]
 pub(crate) fn dispatch(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -147,7 +148,7 @@ pub(crate) fn dispatch(
         | Instr::CallFun { .. }
         | Instr::CallFun2 { .. }
         | Instr::Apply { .. }
-        | Instr::ApplyLast { .. } => funs::exec(machine, module, labels, instr, func, pc, ctx),
+        | Instr::ApplyLast { .. } => funs::exec(machine, entry_module, module, labels, instr, func, pc, ctx),
         // exceptions
         Instr::Try { .. }
         | Instr::Catch { .. }
@@ -161,7 +162,9 @@ pub(crate) fn dispatch(
         | Instr::TryEnd { .. }
         | Instr::CatchEnd { .. }
         | Instr::BuildStacktrace
-        | Instr::RawRaise => exceptions::exec(machine, module, labels, instr, func, pc, ctx),
+        | Instr::RawRaise => {
+            exceptions::exec(machine, entry_module, module, labels, instr, func, pc, ctx)
+        }
         // floats
         Instr::Fmove { .. }
         | Instr::Fconv { .. }
@@ -268,7 +271,7 @@ mod tests {
         let labels = LabelMap::new();
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
-        dispatch(&mut machine, &module, &labels, instr, 0, 0, &mut ctx)
+        dispatch(&mut machine, &module, &module, &labels, instr, 0, 0, &mut ctx)
             .expect_err("no family claims this instruction")
     }
 
@@ -297,7 +300,7 @@ mod tests {
         let module = Module::default();
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
-        dispatch(&mut machine, &module, labels, instr, 0, 0, &mut ctx)
+        dispatch(&mut machine, &module, &module, labels, instr, 0, 0, &mut ctx)
     }
 
     /// The `unsupported_opcode: <name>` reason of a typed error.

@@ -43,9 +43,9 @@
 
 use std::sync::Arc;
 
-use beam_common::Result;
+use beam_common::{Result, StackFrame, StackTrace};
 use beam_loader::{Atom, Instr, LineEntry, Module, Operand};
-use beam_term::{make_atom, make_small, Eterm, NIL};
+use beam_term::{is_list, is_nil, make_atom, make_small, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -82,12 +82,10 @@ use crate::terms::{ContextSink, Sink};
 /// its `(func, pc)` pair belongs to (a frame's continuation carries the module
 /// context it returns into — see [`crate::machine::ModuleContext`]):
 /// * context `0` — the run's entry module, which the machine **borrows** rather than
-///   owns — resolves against the `module` argument, but **only** when the machine's
-///   [`Machine::current_context`] is also `0` (then that argument *is* that entry
-///   module). When the handler — where `build_stacktrace` runs — is in a registered
-///   (non-zero) context, the caller's `module` argument is the *callee's* module, so
-///   a context-`0` snapshot frame cannot be resolved and is **skipped** rather than
-///   named against the wrong module.
+///   owns — resolves against the `entry_module` argument, whatever module context
+///   the handler cooking the trace executes in: context `0` *always* names the run's
+///   entry module, so a handler inside a cross-module callee still names the entry
+///   module's frames correctly.
 /// * a non-zero context `id` resolves through [`Machine::module_context`]; an id that
 ///   was never registered is **skipped**.
 ///
@@ -144,23 +142,40 @@ use crate::terms::{ContextSink, Sink};
 /// the one reservation (through the very operand `build_stacktrace` read it from)
 /// and consed in front of the carved frames. The list is then never empty: an empty
 /// frame chain with a live head cooks to the **one-element** list `[Item]`.
+///
+/// **Supplied frames come first.** A raise that **arrived carrying** explicit
+/// symbolic frames — `erlang:raise/3` with a non-empty trace list — renders THOSE
+/// frames verbatim and the `raise_snapshot` below is not consulted: the
+/// caller-supplied trace REPLACES the derived one, exactly as the oracle's
+/// `build_stacktrace` returns the supplied list unchanged. The live latch
+/// ([`Machine::take_raise_supplied_trace`]) is consumed **once** here, so a later
+/// raise that carries none falls back to the snapshot heuristic; an absent/empty
+/// supplied trace leaves every path byte-identical. A supplied frame carries an
+/// **arity** (never an argument list) in its `A` slot and its `Location` is the
+/// `[{file,File},{line,N}]` pair the [`SourceLocation`](beam_common::SourceLocation)
+/// describes when present, else [`NIL`]. Every name it needs is resolved from the
+/// running module's atom table — never substituted, so a name the table cannot
+/// intern is the typed [`crate::error::unsupported`].
 pub(crate) fn symbolic_stacktrace(
     machine: &mut Machine,
-    module: &Module,
+    entry_module: &Module,
     ctx: &mut dyn ExecutionContext,
     head_operand: &Operand,
     head: bool,
 ) -> Result<Eterm> {
+    // A raise that ARRIVED carrying explicit symbolic frames renders THOSE frames,
+    // replacing the `raise_snapshot` heuristic. Consumed once, so a later raise that
+    // carries none falls back to the snapshot below; `None` leaves this function
+    // byte-identical to the pre-supplied behavior.
+    if let Some(supplied) = machine.take_raise_supplied_trace() {
+        return carve_supplied_frames(machine, entry_module, ctx, &supplied);
+    }
     // The **raise-time** frame chain: the raising frame first, then every caller
     // innermost-first, exactly as it was captured *before* the raise unwound the
     // call frames. Copy it out of the machine so the `shapes` below borrow only
     // local module handles (never `machine`), leaving the later
     // `reserve_slack(machine, ..)` free to take `&mut machine`.
     let frames: Vec<(u32, u32, u32)> = machine.raise_snapshot().to_vec();
-    // Where the handler (`build_stacktrace`) is executing: only when it is the entry
-    // module's context (`0`) is the caller's `module` argument the module a
-    // context-`0` frame belongs to.
-    let handler_context = machine.current_context();
     // Resolve each frame's owning module *before* sizing: a non-zero context's
     // `Arc<Module>` must stay alive across the one reservation below, because an
     // [`ItemShape`] borrows its `Line` chunk (the file name).
@@ -168,8 +183,9 @@ pub(crate) fn symbolic_stacktrace(
     let mut plan: Vec<FrameOwner> = Vec::with_capacity(frames.len());
     for (context, _func, _pc) in &frames {
         match *context {
-            0 if handler_context == 0 => plan.push(FrameOwner::EntryModule),
-            0 => plan.push(FrameOwner::Skip),
+            // Context `0` is ALWAYS the run's borrowed **entry module**, whatever
+            // module context the handler cooking the trace is executing in.
+            0 => plan.push(FrameOwner::EntryModule),
             id => match machine.module_context(id) {
                 Some(handle) => {
                     plan.push(FrameOwner::Owned(owned.len()));
@@ -181,14 +197,24 @@ pub(crate) fn symbolic_stacktrace(
     }
     // Only the *shapes* are computed here: no BEAM-heap word is touched yet. A
     // skipped frame contributes no shape.
+    //
+    // The **failed clause's argument list** — a machine field the `function_clause`
+    // raise site armed (`Machine::pending_function_clause_args`) — belongs to the
+    // snapshot's FIRST frame (the raising frame, which is the one whose function
+    // contains the failed clause and is the only frame C gives an `args` slot to).
+    // It is taken here, once, so it can never leak into a later cooked trace; a frame
+    // the module/context cannot name consumes it all the same (there is no later
+    // frame it could belong to).
+    let mut failed_clause_args = machine.take_raise_function_clause_args();
     let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
     for ((_context, func, pc), owner) in frames.iter().zip(plan.iter()) {
+        let args = failed_clause_args.take();
         let owner_module: &Module = match owner {
-            FrameOwner::EntryModule => module,
+            FrameOwner::EntryModule => entry_module,
             FrameOwner::Owned(index) => &owned[*index],
             FrameOwner::Skip => continue,
         };
-        shapes.push(item_shape(owner_module, *func, *pc)?);
+        shapes.push(item_shape(owner_module, *func, *pc, args)?);
     }
     // `2` words per list cell plus every item's own nodes — sized **before** the
     // reservation, because a collection under it relocates the machine's roots and
@@ -216,6 +242,91 @@ pub(crate) fn symbolic_stacktrace(
     Ok(cooked)
 }
 
+/// Cook a raise's **explicitly supplied** frames (a non-empty
+/// [`Raise::stacktrace`](beam_common::Raise::stacktrace) the raise arrived with)
+/// into the symbolic `[{M,F,A,Location}]` list, verbatim.
+///
+/// Each [`StackFrame`] becomes the item its `module`/`function`/`arity` name, with
+/// its `location` (when present) materialized as the `[{file,File},{line,N}]` shape
+/// [`write_location`] builds for a derived frame — so a supplied frame's `Location`
+/// is byte-identical to the oracle's. A supplied frame carries an **arity**, never
+/// an argument list, in its `A` slot.
+///
+/// Every atom a frame names (`Module`, `Function` and, for a location, `File` and
+/// `line`) is resolved from the running module's atom table **before** the one
+/// reservation; a name the table cannot intern is the typed
+/// [`crate::error::unsupported`], never a substituted atom. The whole list is one
+/// rooted reservation carved node-by-node, exactly like the snapshot path.
+fn carve_supplied_frames(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    frames: &StackTrace,
+) -> Result<Eterm> {
+    // Only the *shapes* are computed here: no BEAM-heap word is touched yet, and no
+    // shape is allocated. Every name is resolved before the reservation below.
+    let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.frames.len());
+    for frame in &frames.frames {
+        shapes.push(supplied_frame_shape(module, frame)?);
+    }
+    // `2` words per list cell plus every item's own nodes — sized before the
+    // reservation, exactly as the snapshot path does.
+    let total = 2 * shapes.len() + shapes.iter().map(ItemShape::words).sum::<usize>();
+    let mut sink = terms::reserve_slack(machine, ctx, total)?;
+    let mut items = Vec::with_capacity(shapes.len());
+    for shape in &shapes {
+        // Child nodes before the parent, in the order `ItemShape::words` counts.
+        items.push(write_item(&mut sink, shape)?);
+    }
+    sink.list(&items)
+}
+
+/// The [`ItemShape`] of one **supplied** frame: the
+/// `{Module,Function,Arity,Location}` metadata a [`StackFrame`] carries, with every
+/// atom resolved (by name) from the running module's atom table.
+///
+/// A name the table cannot intern is the typed [`crate::error::unsupported`] — the
+/// engine never substitutes an atom the caller did not name, because a substituted
+/// atom would be a *wrong* term. The shape borrows the supplied stacktrace (its file
+/// names), so the caller must reserve and carve while it is alive — which it is,
+/// since both happen inside [`carve_supplied_frames`].
+fn supplied_frame_shape<'a>(module: &Module, frame: &'a StackFrame) -> Result<ItemShape<'a>> {
+    let module_atom = lookup_supplied(module, frame.module.as_str(), "module")?;
+    let function_atom = lookup_supplied(module, frame.function.as_str(), "function")?;
+    let location = match &frame.location {
+        Some(location) => {
+            // The location's `{file,Name}` KEY is the atom `file`; `Name` is the file
+            // name, rendered as a char list exactly as a derived frame's is.
+            let file_atom = lookup_supplied(module, "file", "file")?;
+            let line_atom = lookup_supplied(module, "line", "line")?;
+            Some(LocationShape {
+                file_atom,
+                line_atom,
+                file: location.file.as_str(),
+                line: location.line,
+            })
+        }
+        None => None,
+    };
+    Ok(ItemShape {
+        module: module_atom,
+        function: function_atom,
+        arity: u32::from(frame.arity),
+        args: None,
+        location,
+    })
+}
+
+/// The running module's atom for `name`, or the typed [`crate::error::unsupported`]
+/// naming the `what` a supplied frame asked for.
+fn lookup_supplied(module: &Module, name: &str, what: &str) -> Result<Atom> {
+    module.atom_table.lookup(name).ok_or_else(|| {
+        error::unsupported(&format!(
+            "build_stacktrace: supplied frame names a {what} atom the running module cannot resolve: {name}"
+        ))
+    })
+}
+
 /// Which [`Module`] a snapshot frame's `(func, pc)` pair belongs to, resolved
 /// **before** the shapes are computed and before the one reservation.
 ///
@@ -224,8 +335,8 @@ pub(crate) fn symbolic_stacktrace(
 /// `Line` chunk (the file name), so the handle must outlive every `reserve`/`write`
 /// step — never be dropped after the shape was computed.
 enum FrameOwner {
-    /// The run's **entry** module — the `module` argument. Valid only for a
-    /// context-`0` frame observed from a context-`0` handler.
+    /// The run's **entry** module — the `entry_module` argument. Context `0` always
+    /// names it, whatever module context the handler executes in.
     EntryModule,
     /// Index into the local handle vector: a registered context's module.
     Owned(usize),
@@ -256,13 +367,15 @@ pub(crate) fn stacktrace_item(
     func: u32,
     pc: u32,
 ) -> Result<Eterm> {
-    let shape = item_shape(module, func, pc)?;
+    let shape = item_shape(module, func, pc, None)?;
     let mut sink = ContextSink::new(ctx);
     write_item(&mut sink, &shape)
 }
 
 /// The metadata **shape** of a stacktrace item: everything [`write_item`] needs to
-/// carve the node, and nothing that points into the BEAM heap.
+/// carve the node, and nothing that points into the BEAM heap — with **one**
+/// deliberate exception, the failed clause's argument list ([`ItemShape::args`]),
+/// which C's cooked item carries in its `A` slot in place of the arity.
 ///
 /// Holding the shape rather than a built term is what lets the caller size a whole
 /// graph before allocating (see the module docs).
@@ -271,23 +384,42 @@ struct ItemShape<'a> {
     module: Atom,
     /// The item's function atom (`{M,F,A}`'s `F`).
     function: Atom,
-    /// The item's arity (`{M,F,A}`'s `A`).
+    /// The item's arity (`{M,F,A}`'s `A`) — what the `A` slot holds for every frame
+    /// except the failed clause's own, which [`ItemShape::args`] replaces.
     arity: u32,
+    /// The **failed clause's argument list**, for the one frame whose function
+    /// contains the failed clause; `None` for every other frame.
+    ///
+    /// C's `erts_build_mfa_item` (`../../erts/emulator/beam/utils.c:3430-3457`) puts
+    /// the saved `args` in the `A` slot when it is a list/nil, and only the
+    /// `function_clause` raise site publishes one (see
+    /// `Machine::take_raise_function_clause_args`) — so the oracle reports
+    /// `{Mod, Fun, [Arg, …], Location}` for the failing function while every outer
+    /// frame keeps its declared arity.
+    ///
+    /// The elements are read out **before** the one reservation (the list is a
+    /// machine-held term, exactly like `Machine::pending_exception`'s reason), and the
+    /// list is re-carved into the reservation so the whole cooked trace is one region:
+    /// [`ItemShape::words`] charges `2` words per element and [`write_item`] carves
+    /// exactly that many.
+    args: Option<Vec<Eterm>>,
     /// The `Location` element's shape, or `None` for the empty list.
     location: Option<LocationShape<'a>>,
 }
 
 impl ItemShape<'_> {
     /// The exact number of words this item's nodes occupy:
-    /// the 4-element tuple (`5`) plus, when there is a location, the char list
-    /// (`2 * chars`), the `{file,File}` tuple (`3`), the `{line,N}` tuple (`3`) and
-    /// the 2-element outer list (`4`) — i.e. `2 * chars + 10`. A `None` location is
-    /// [`NIL`] and occupies nothing.
+    /// the 4-element tuple (`5`), the failed clause's argument list (`2` per element,
+    /// `0` when the `A` slot is the arity) plus, when there is a location, the char
+    /// list (`2 * chars`), the `{file,File}` tuple (`3`), the `{line,N}` tuple (`3`)
+    /// and the 2-element outer list (`4`) — i.e. `2 * chars + 10`. A `None` location
+    /// is [`NIL`] and occupies nothing.
     fn words(&self) -> usize {
-        5 + match &self.location {
-            Some(location) => 2 * location.file.chars().count() + 10,
-            None => 0,
-        }
+        5 + self.args.as_ref().map_or(0, |args| 2 * args.len())
+            + match &self.location {
+                Some(location) => 2 * location.file.chars().count() + 10,
+                None => 0,
+            }
     }
 }
 
@@ -308,6 +440,12 @@ struct LocationShape<'a> {
 /// The [`ItemShape`] for the function at index `func`, located at `pc` — metadata
 /// only, no allocation.
 ///
+/// `failed_clause_args` is the argument list C puts in this item's `A` slot **instead
+/// of** the arity, for the one frame whose function contains the failed clause (see
+/// [`ItemShape::args`]); it is `None` for every other frame. A term that is neither a
+/// proper list nor [`NIL`] is not an argument list at all and degrades to the arity,
+/// exactly C's `is_list(args) || is_nil(args)` test.
+///
 /// The shape borrows the module's `Line` chunk (the file name), so the caller must
 /// reserve and carve while that module is alive — which it is, since the reservation
 /// happens inside the same call.
@@ -315,15 +453,25 @@ struct LocationShape<'a> {
 /// A `func` index outside the module's function table is a typed `unsupported`,
 /// never a panic; a location the module cannot name (no `file`/`line` atom, a file
 /// index outside the `Line` chunk) degrades to the empty list exactly as before.
-fn item_shape(module: &Module, func: u32, pc: u32) -> Result<ItemShape<'_>> {
+fn item_shape(
+    module: &Module,
+    func: u32,
+    pc: u32,
+    failed_clause_args: Option<Eterm>,
+) -> Result<ItemShape<'_>> {
     let function = module
         .functions
         .get(func as usize)
         .ok_or_else(|| error::unsupported("build_stacktrace: function index out of range"))?;
+    let args = match failed_clause_args {
+        Some(list) if is_list(list) || is_nil(list) => Some(terms::list_elements(list)?),
+        _ => None,
+    };
     Ok(ItemShape {
         module: function.module,
         function: function.name,
         arity: function.arity,
+        args,
         location: location_shape(module, func, pc)?,
     })
 }
@@ -379,12 +527,14 @@ fn write_item(sink: &mut dyn Sink, shape: &ItemShape<'_>) -> Result<Eterm> {
         Some(location) => write_location(sink, location)?,
         None => NIL,
     };
-    sink.tuple(&[
-        make_atom(shape.module),
-        make_atom(shape.function),
-        make_small(shape.arity as i64),
-        location,
-    ])
+    // The `A` slot: the failed clause's argument list when this item is the one whose
+    // function contains the failed clause, else the declared arity. The carve is
+    // exactly the `2` words per element [`ItemShape::words`] charged.
+    let arity = match &shape.args {
+        Some(args) => sink.list(args)?,
+        None => make_small(shape.arity as i64),
+    };
+    sink.tuple(&[make_atom(shape.module), make_atom(shape.function), arity, location])
 }
 
 /// Carve `location`'s four nodes out of `sink` (see [`write_item`]).

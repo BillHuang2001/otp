@@ -67,7 +67,7 @@
 //!   nested / blocking run path a fired `after T` has to work through.
 //! * `test_support` — the `cfg(test)`-only synthetic-module builder (`Fixture`)
 //!   and the cross-module seam context (`seam`) the `machine` tests share.
-use beam_common::{ExceptionClass, Result};
+use beam_common::{ExceptionClass, Result, StackTrace};
 use beam_loader::{Module, SharedLiteralArea};
 use beam_term::Eterm;
 
@@ -250,6 +250,71 @@ pub struct Machine {
     /// keeps it inside the frozen root set ([`crate::context::RootSet`]) across the
     /// rooted reservation the cooked trace takes.
     pub(crate) raise_head_item: bool,
+    /// A **one-shot latch**: the argument list of the function whose clause failed.
+    ///
+    /// Set by `crate::interpreter::dispatch::raise_function_clause_with_args` — the ONE
+    /// definition of the `function_clause` raise — immediately before the
+    /// `throw_with_trace` that lands it, and consumed by that call (see
+    /// [`Machine::raise_function_clause_args`]). It is the failed function's **real**
+    /// call arguments (`x(0..arity)` at the `func_info`/`test`/`select_val` raise
+    /// site), materialized as a proper list — C's `make_arglist(c_p, reg, a)`
+    /// (`../../erts/emulator/beam/beam_common.c`, `non_bif_stacktrace:`) — because
+    /// C's cooked stacktrace item for the failing function carries `args` in its `A`
+    /// slot, not the declared arity — C's `erts_build_mfa_item`
+    /// (`../../erts/emulator/beam/utils.c:3430-3457`) emits the argument list when it
+    /// is a list/nil — so the oracle cooks `{Mod, Fun, [2], Location}` for the failed
+    /// function while every outer frame keeps its declared arity.
+    ///
+    /// It is a separate latch from the live-raise state so a propelling `Err` path —
+    /// a raise with no live catch frame, which still reaches `throw_with_trace` —
+    /// cannot leave a stale list for a later, unrelated cooked trace to inherit.
+    pub(crate) pending_function_clause_args: Option<Eterm>,
+    /// The **live raise** state behind [`Machine::pending_function_clause_args`]: the
+    /// failed clause's argument list while the raise currently in flight was raised
+    /// by the `function_clause` site.
+    ///
+    /// [`Machine::throw_with_trace`] sets it (from the one-shot latch) on **every**
+    /// raise, so a raise that carries no such list clears it, and the two
+    /// cooked-trace builders consume it **exactly once** — the caught path
+    /// ([`crate::families::exceptions::stacktrace::symbolic_stacktrace`], which gives
+    /// the list to the FIRST frame's `A` slot) and the uncaught path
+    /// ([`Machine::with_uncaught_frames`]).
+    ///
+    /// The term is a machine-held heap term outside the frozen root set
+    /// ([`crate::context::RootSet`]), exactly like
+    /// [`Machine::pending_exception`](crate::machine::Machine)'s reason term: a
+    /// collecting host roots such a parked term the way `beam_rt` roots the pending
+    /// exception.
+    pub(crate) raise_function_clause_args: Option<Eterm>,
+    /// A **one-shot latch**: the symbolic [`StackTrace`] an incoming raise
+    /// **arrived carrying** (e.g. `erlang:raise/3` whose third argument is a
+    /// non-empty trace list).
+    ///
+    /// Armed by the raising site ([`Machine::raise_error`]) **immediately before**
+    /// the `throw_with_trace` that lands the raise, and consumed by that call (see
+    /// [`Machine::raise_supplied_trace`]) — the same two-latch protocol as
+    /// `Machine::pending_callee_head`/`pending_function_clause_args`. It is armed
+    /// **only when the incoming `Raise`'s stacktrace is non-empty**: an empty or
+    /// absent supplied trace leaves every path byte-identical to the
+    /// `raise_snapshot`-derived behavior.
+    ///
+    /// It is a separate latch from the live-raise state so a propelling `Err` path
+    /// — a raise with no live catch frame — cannot leave stale frames for a later,
+    /// unrelated cooked trace to inherit.
+    pub(crate) pending_supplied_trace: Option<StackTrace>,
+    /// The **live raise** state behind [`Machine::pending_supplied_trace`]: the
+    /// explicit frames the raise currently in flight arrived carrying.
+    ///
+    /// [`Machine::throw_with_trace`] sets it (from the one-shot latch) on **every**
+    /// raise, so a raise that carries no supplied trace clears it, and the
+    /// caught-path cooked-trace builder consumes it **exactly once**
+    /// ([`crate::families::exceptions::stacktrace::symbolic_stacktrace`]), which
+    /// then renders THOSE frames in preference to the `raise_snapshot` heuristic.
+    ///
+    /// The frames are plain metadata ([`beam_common::StackFrame`] values), never a
+    /// machine-held heap term, so they need no rooting across the cooked trace's
+    /// reservation.
+    pub(crate) raise_supplied_trace: Option<StackTrace>,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -323,6 +388,27 @@ pub struct Machine {
     /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
     /// test) cannot leak a stale value from an earlier run.
     pub(crate) reduce_on: bool,
+    /// The **per-run in-machine BIF-dispatch gate**: the cached answer of
+    /// [`ExecutionContext::wants_bif_in_machine`](crate::context::ExecutionContext::wants_bif_in_machine)
+    /// for the run currently executing.
+    ///
+    /// When it is `true` the engine routes every BIF dispatch through
+    /// [`ExecutionContext::call_bif_in_machine`](crate::context::ExecutionContext::call_bif_in_machine)
+    /// (handing the host the live `&Machine` and the run's entry module) instead of
+    /// [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif);
+    /// when it is the default `false` the plain `call_bif` path is taken
+    /// **byte-identically** and a dispatch pays a single `bool` load instead of an
+    /// extra vtable crossing.
+    ///
+    /// Latched at a run/resume entry exactly like [`Machine::trace_on`]/
+    /// [`Machine::reduce_on`] — by [`Machine::drive`](crate::machine::Machine) for the
+    /// interpreter **and** by the native baseline tier's own driver for
+    /// [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit), so the door is taken on
+    /// every tier — and [`Machine::reset`](crate::machine::Machine::reset)
+    /// leaves it `false`, so a run that never latches it (e.g. a direct
+    /// `Machine::step_instruction` call in a test) cannot leak a stale value from an
+    /// earlier run.
+    pub(crate) bif_in_machine_on: bool,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -409,10 +495,15 @@ impl Machine {
             raise_snapshot: Vec::new(),
             pending_callee_head: false,
             raise_head_item: false,
+            pending_function_clause_args: None,
+            raise_function_clause_args: None,
+            pending_supplied_trace: None,
+            raise_supplied_trace: None,
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,
             reduce_on: false,
+            bif_in_machine_on: false,
             current_code: None,
             entry_call: None,
             reductions: 0,

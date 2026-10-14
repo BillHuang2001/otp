@@ -24,7 +24,7 @@
 //! call the BIF through [`ExecutionContext::call_bif`]; `raise_bif_error` folds a
 //! BIF error into the catch-aware raise the dispatch loop expects.
 
-use beam_common::{BeamError, ExceptionClass, Result};
+use beam_common::{BeamError, ExceptionClass, Result, StackTrace};
 use beam_loader::{ImportRef, Label, Module, Operand, NO_FAIL};
 use beam_term::{make_atom, Eterm, NIL};
 
@@ -73,6 +73,7 @@ impl Machine {
     /// i.e. for every `bif0`) or branches to `fail`.
     pub(super) fn exec_bif(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         bif: ImportRef,
@@ -90,11 +91,19 @@ impl Machine {
             for (slot, arg) in buf.iter_mut().zip(args) {
                 *slot = read_operand(self, ctx, arg)?;
             }
-            ctx.call_bif(module_name, function_name, arity, &buf[..args.len()])
+            self.dispatch_bif_call(
+                entry_module,
+                module_name,
+                function_name,
+                arity,
+                &buf[..args.len()],
+                ctx,
+            )
         } else {
             // `?` propagates a *marshalling* error (a bad operand) as the typed error
             // the instruction already returned — never as a guard failure or a raise.
             self.dispatch_wide(
+                entry_module,
                 module_name,
                 function_name,
                 arity,
@@ -139,6 +148,7 @@ impl Machine {
     /// [`Result`] is the BIF's own outcome.
     fn dispatch_wide(
         &mut self,
+        entry_module: &Module,
         module: &str,
         function: &str,
         arity: u32,
@@ -151,7 +161,7 @@ impl Machine {
         scratch.reserve(len);
         let marshalled = fill(self, &mut *ctx, &mut scratch);
         let outcome = match marshalled {
-            Ok(()) => Ok(ctx.call_bif(module, function, arity, &scratch)),
+            Ok(()) => Ok(self.dispatch_bif_call(entry_module, module, function, arity, &scratch, ctx)),
             Err(e) => Err(e),
         };
         // Give the (now empty) buffer back so the next wide call reuses it.
@@ -173,6 +183,7 @@ impl Machine {
     /// exactly as before this seam.
     pub(super) fn call_import(
         &mut self,
+        entry_module: &Module,
         module: &Module,
         labels: &LabelMap,
         target: ImportRef,
@@ -180,7 +191,14 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
         let (module_name, function_name, bif_arity) = labels.import_target(module, target)?;
-        self.call_bif_named(module_name, function_name, bif_arity, arity, ctx)
+        self.call_bif_named(
+            entry_module,
+            module_name,
+            function_name,
+            bif_arity,
+            arity,
+            ctx,
+        )
     }
 
     /// Marshal the register arguments `x(0..nregs)` and dispatch
@@ -206,6 +224,7 @@ impl Machine {
     /// `Err`, exactly as the call sites expect.
     pub(crate) fn call_bif_named(
         &mut self,
+        entry_module: &Module,
         module_name: &str,
         function_name: &str,
         bif_arity: u32,
@@ -219,16 +238,19 @@ impl Machine {
                     .x(i as u32)
                     .ok_or_else(|| error::bad_register(i as u32))?;
             }
-            ctx.call_bif(
+            self.dispatch_bif_call(
+                entry_module,
                 module_name,
                 function_name,
                 bif_arity,
                 &buf[..nregs as usize],
+                ctx,
             )
         } else {
             // A marshalling error and a BIF failure are the same `Err` to this
             // function's callers (both are raised), so the two are flattened.
             self.dispatch_wide(
+                entry_module,
                 module_name,
                 function_name,
                 bif_arity,
@@ -242,6 +264,45 @@ impl Machine {
                 },
             )
             .and_then(|result| result)
+        }
+    }
+
+    /// Dispatch a BIF through the host, taking the **in-machine** door when the
+    /// host asked for it ([`ExecutionContext::wants_bif_in_machine`](crate::context::ExecutionContext::wants_bif_in_machine),
+    /// latched into [`Machine::bif_in_machine_on`](crate::machine::Machine) once per
+    /// run by whichever driver owns the run — [`Machine::drive`](crate::machine::Machine::drive)
+    /// for the interpreter and the native baseline tier's own driver for
+    /// [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit)).
+    ///
+    /// This is the **single** BIF-dispatch funnel the engine's marshalling helpers
+    /// call, so the two doors can never drift:
+    ///
+    /// * gate **off** (the default, every existing host): the plain
+    ///   [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif)
+    ///   with the same arguments — byte-identical to the pre-seam engine, one `bool`
+    ///   load and no extra vtable crossing;
+    /// * gate **on**: [`ExecutionContext::call_bif_in_machine`](crate::context::ExecutionContext::call_bif_in_machine)
+    ///   with `self` (the live machine) and `entry_module` (the run's entry module,
+    ///   which the host needs to name a context-`0` frame) handed in alongside the
+    ///   same `module`/`function`/`arity`/`args`.
+    ///
+    /// `entry_module` is the module the run was entered at — the same one
+    /// [`Machine::drive`](crate::machine::Machine::drive) threads down from its own
+    /// entry module argument. It is unused when the gate is off.
+    #[inline]
+    pub(crate) fn dispatch_bif_call(
+        &self,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Eterm> {
+        if self.bif_in_machine_on {
+            ctx.call_bif_in_machine(self, entry_module, module, function, arity, args)
+        } else {
+            ctx.call_bif(module, function, arity, args)
         }
     }
 
@@ -287,6 +348,15 @@ impl Machine {
     /// `Err(BeamError::Raise(..))`. This reproduces C, where `handle_error` always
     /// runs `next_catch` regardless of the reason's shape.
     ///
+    /// A [`BeamError::Raise`] whose [`stacktrace`](beam_common::Raise::stacktrace) is
+    /// **non-empty** arrived carrying explicit symbolic frames (e.g. an
+    /// `erlang:raise/3` whose third argument is a trace list). They are armed on the
+    /// one-shot `pending_supplied_trace` latch immediately before the landing
+    /// `throw_with_trace`, so the caught-path cooked trace renders THOSE frames in
+    /// preference to the `raise_snapshot` heuristic (see
+    /// [`crate::families::exceptions::stacktrace::symbolic_stacktrace`]). An
+    /// absent/empty supplied trace arms nothing and leaves every path byte-identical.
+    ///
     /// Shared with the instruction families (e.g. `families::receive`'s `send`,
     /// which carries no fail label either), so the landing convention stays defined
     /// in exactly one place.
@@ -328,6 +398,14 @@ impl Machine {
         // raw trace stays `NIL` and the latch is never armed.
         let has_head = head.is_some();
         let trace = head.unwrap_or(NIL);
+        // The symbolic frames an incoming raise **arrived carrying** (e.g.
+        // `erlang:raise/3` with a non-empty trace list). Extracted — never emptied —
+        // only when non-empty, so an absent/empty supplied trace leaves every path
+        // byte-identical to the `raise_snapshot`-derived behavior.
+        let supplied_trace = match &error {
+            BeamError::Raise(raise) if !raise.stacktrace.is_empty() => Some(raise.stacktrace.clone()),
+            _ => None,
+        };
         // A raise whose reason is a compound term lands (or propagates) with the
         // term, mirroring C's `handle_error` → `next_catch` for every reason shape.
         if let BeamError::Raise(raise) = &error {
@@ -340,7 +418,13 @@ impl Machine {
                 if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
                     self.set_class_atom(class, make_atom(class_atom));
                 }
-                return self.throw_with_trace_headed(class, reason, trace, has_head);
+                return self.throw_with_trace_headed(
+                    class,
+                    reason,
+                    trace,
+                    has_head,
+                    supplied_trace,
+                );
             }
         }
         // No live catch frame: the error propagates unchanged, carrying whatever
@@ -373,12 +457,13 @@ impl Machine {
         if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
             self.set_class_atom(class, make_atom(class_atom));
         }
-        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head)
+        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
     }
 
-    /// [`Machine::throw_with_trace`] that first arms the one-shot
-    /// `pending_callee_head` latch when `has_head`, so the raise being landed is
-    /// marked as carrying a synthesized callee head item (which lives in `trace`).
+    /// [`Machine::throw_with_trace`] that first arms the one-shot latches the raise
+    /// arrived with, so the raise being landed is marked as carrying a synthesized
+    /// callee head item (when `has_head`, which lives in `trace`) and/or the explicit
+    /// symbolic frames it arrived with (when `supplied_trace` is `Some`).
     #[inline]
     fn throw_with_trace_headed(
         &mut self,
@@ -386,9 +471,17 @@ impl Machine {
         reason: Eterm,
         trace: Eterm,
         has_head: bool,
+        supplied_trace: Option<StackTrace>,
     ) -> Result<Step> {
         if has_head {
             self.pending_callee_head = true;
+        }
+        // The supplied frames are armed on the same one-shot latch the landing
+        // `throw_with_trace` consumes. Only a non-empty trace arms it: an absent or
+        // empty supplied trace leaves the latch clear, so the caught-path cooked
+        // trace stays the `raise_snapshot`-derived one.
+        if supplied_trace.is_some() {
+            self.pending_supplied_trace = supplied_trace;
         }
         self.throw_with_trace(class, reason, trace)
     }

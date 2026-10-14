@@ -62,7 +62,29 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   head word is re-read **after** the reservation through `head_operand` (the very register
   `build_stacktrace` read the raw trace from) and consed in front of the carved frames, so a
   head-bearing raise cooks to the **one-element** list `[Item]` even over an empty frame
-  chain.
+  chain. **Supplied frames win:** when the live raise arrived carrying explicit
+  non-empty symbolic frames (`Machine::take_raise_supplied_trace`), `symbolic_stacktrace`
+  consumes that latch first and renders THOSE frames (see the section below) — the
+  snapshot is not consulted and any head item is superseded.
+
+## Supplied frames take precedence over the snapshot heuristic
+A raise that **arrives carrying** explicit symbolic frames — `erlang:raise/3` whose
+third argument is a non-empty trace list, modelled as
+[`beam_common::Raise::stacktrace`] — renders **those** frames: the caller-supplied
+trace REPLACES the derived one, exactly as the oracle's `build_stacktrace` returns
+the supplied list verbatim. The engine half lives in
+`Machine::raise_error` → the one-shot `pending_supplied_trace` latch →
+`Machine::throw_with_trace`'s live `raise_supplied_trace` state (the same two-latch
+protocol as the callee head item), which
+[`stacktrace::symbolic_stacktrace`] consumes **once** at its head and
+`Machine::reset` clears. Each frame renders as `{Module,Function,Arity,Location}`
+with an **arity** in the `A` slot (the model carries no argument list) and the
+`[{file,File},{line,N}]` location the `SourceLocation` describes; every name is
+resolved from the running module's atom table (never substituted — a name it cannot
+intern is a typed `unsupported`). When the incoming raise carries **no** non-empty
+trace (or an empty one) the latch stays clear and the `raise_snapshot` heuristic
+below is unchanged. The out-of-crate half — `beam_bifs`'s `erlang:raise/3` decoding
+its third argument into `Raise::stacktrace` — is not this family's.
 
 ## The raise's raw trace: `NIL`, or a synthesized callee head item
 C's raw trace is an **opaque object of saved code pointers** (`c_p->ftrace`) with no engine
