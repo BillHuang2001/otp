@@ -96,12 +96,23 @@
 //! the engine's side; the host decides *matching*, exactly as the oracle arms
 //! individual functions with `erlang:trace_pattern/3`.
 //!
+//! ## The atom-name resolution seam
+//!
+//! [`Module::atom_name`](beam_loader::Module::atom_name) indexes the module's
+//! **owned load-time snapshot** of the shared atom table, so a module loaded early
+//! cannot name an atom interned into the shared namespace afterwards. The engine
+//! resolves a **runtime atom value** (a variable `M`/`F` in `apply(M,F,A)` /
+//! `M:F(...)`) through [`ExecutionContext::atom_name`], whose default body is that
+//! module-local lookup and whose override lets a host that owns the live shared
+//! namespace answer where the snapshot cannot.
+//!
 //! [`alloc_words`]: ExecutionContext::alloc_words
 //! [`apply`]: ExecutionContext::apply
 //! [`apply_fun`]: ExecutionContext::apply_fun
 //! [`call_bif`]: ExecutionContext::call_bif
 //! [`wants_bif_in_machine`]: ExecutionContext::wants_bif_in_machine
 //! [`call_bif_in_machine`]: ExecutionContext::call_bif_in_machine
+//! [`atom_name`]: ExecutionContext::atom_name
 //!
 //! # `unsafe`
 //!
@@ -118,7 +129,7 @@ use std::sync::Arc;
 use beam_alloc::{GrowOutcome, ReservedHeap};
 use beam_common::Result;
 use beam_loader::{Label, Module};
-use beam_term::Eterm;
+use beam_term::{Atom, Eterm};
 
 use crate::machine::Machine;
 
@@ -783,6 +794,32 @@ pub trait ExecutionContext {
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
         let _ = (module, function, arity);
         Ok(false)
+    }
+
+    /// Resolve an interned atom id to its name, preferring the host's **live**
+    /// atom namespace over the running module's load-time snapshot.
+    ///
+    /// [`Module::atom_name`](beam_loader::Module::atom_name) indexes the module's
+    /// *owned load-time snapshot* of the shared atom table, so a module loaded
+    /// early cannot name an atom interned afterwards (its global id is beyond the
+    /// snapshot). The engine resolves a **runtime atom value** (a variable
+    /// `M`/`F` in `apply(M,F,A)` / `M:F(...)`) through this seam, so a host that
+    /// owns the live shared namespace can answer where the module's snapshot
+    /// cannot.
+    ///
+    /// The default body is this module's own table only
+    /// ([`Module::atom_name`](beam_loader::Module::atom_name)), so every existing
+    /// implementor — including every test context — is byte-identical.
+    ///
+    /// The name is returned **owned** so the caller can hold both resolved names
+    /// across subsequent `&mut` host calls (e.g.
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) and
+    /// [`call_bif`](ExecutionContext::call_bif), both of which take
+    /// `&mut dyn ExecutionContext`); a borrowed `&str` tied to `&self` would
+    /// conflict with that mutable borrow. The allocation is only on the
+    /// variable-`apply` path, never a hot path.
+    fn atom_name(&self, module: &Module, atom: Atom) -> Option<String> {
+        module.atom_name(atom).map(str::to_owned)
     }
 
     /// The **per-instruction reduction hook**: charge `n` reductions for the

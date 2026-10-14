@@ -64,7 +64,8 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `context.rs` → the `ExecutionContext` / `Mailbox` seams (`call_bif` + the defaulted in-machine twin
-  `call_bif_in_machine` behind the `wants_bif_in_machine` probe), `RootSet`, `MinimalContext` (incl. its
+  `call_bif_in_machine` behind the `wants_bif_in_machine` probe; the resolver seams
+  `resolve_external_call`/`resolve_local_fun`/`resolve_local_call`/`atom_name`), `RootSet`, `MinimalContext` (incl. its
   `ContextHeap` — a pointer-stable region heap over `beam_alloc::ReservedHeap`: ~4 MiB is reserved up
   front and **grown in place** as terms are built, so an allocation costs its payload only; on
   reservation exhaustion a fresh, larger region starts and **every earlier region is kept alive**, so a

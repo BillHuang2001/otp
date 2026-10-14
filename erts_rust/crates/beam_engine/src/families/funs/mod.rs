@@ -428,8 +428,8 @@ pub(crate) fn apply_target(
     // `p->freason = BADARG` and return NULL into `handle_error` → `next_catch`, so
     // the `badarg` is a **catchable raise**, not a bare return.
     let (module_name, function_name) = match (
-        atom_name(module, module_term),
-        atom_name(module, function_term),
+        atom_name(ctx, module, module_term),
+        atom_name(ctx, module, function_term),
     ) {
         (Ok(module_name), Ok(function_name)) => (module_name, function_name),
         _ => return raise_badarg(machine, module).map(ApplyTarget::Raised),
@@ -441,7 +441,9 @@ pub(crate) fn apply_target(
     // context and its entry `Label` resolved against the callee's **own** label
     // index — an unknown label is a typed error, never a jump into the wrong
     // module.
-    if let Some((callee, label)) = ctx.resolve_external_call(module_name, function_name, arity)? {
+    if let Some((callee, label)) =
+        ctx.resolve_external_call(&module_name, &function_name, arity)?
+    {
         let context = machine.register_context(&callee);
         let handle = machine
             .module_context(context)
@@ -474,8 +476,8 @@ pub(crate) fn apply_target(
     // other error shape and when the raise cannot land.
     match machine.dispatch_bif_call(
         entry_module,
-        module_name,
-        function_name,
+        &module_name,
+        &function_name,
         arity,
         &args,
         ctx,
@@ -522,16 +524,23 @@ pub(crate) fn raise_badarg(machine: &mut Machine, module: &Module) -> Result<Ste
     machine.throw_error(make_atom(atom))
 }
 
-/// The name of an atom term, resolved through the running module's atom table.
+/// The name of an atom term, resolved through
+/// [`ExecutionContext::atom_name`](crate::ExecutionContext::atom_name).
 ///
-/// A non-atom term, or an atom index absent from the table, is a typed
+/// A runtime atom **value** (a variable `M`/`F`) is looked up through the host
+/// seam, which prefers the host's **live** atom namespace over the running
+/// module's load-time snapshot (a module loaded early cannot name an atom
+/// interned afterwards). The default seam body is the module's own table, so a
+/// host that does not override it behaves exactly as a bare module lookup.
+///
+/// A non-atom term, or an atom id the host cannot name, is a typed
 /// [`BeamError::BadArg`] (the C's `BADARG`); the engine never substitutes a
 /// *different* atom.
-fn atom_name<'a>(module: &'a Module, term: Eterm) -> Result<&'a str> {
+fn atom_name(ctx: &dyn ExecutionContext, module: &Module, term: Eterm) -> Result<String> {
     if !is_atom(term) {
         return Err(BeamError::BadArg);
     }
-    module.atom_name(atom_val(term)).ok_or(BeamError::BadArg)
+    ctx.atom_name(module, atom_val(term)).ok_or(BeamError::BadArg)
 }
 
 #[cfg(test)]
