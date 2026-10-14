@@ -46,6 +46,12 @@
 //!
 //! Every golden below is the oracle's own output, verified with `differential run <id>`.
 //! The probe wrapper binds `V`/`C`/`R`, so no expression here binds those names.
+//!
+//! The widened family at the end of this file applies the remaining `ERL_*FLAGS` sources and
+//! request channels: `+P` through `ERL_FLAGS` (the `process_limit` observable), `+Q` through
+//! `ERL_ZFLAGS` (the last merge source, sized by the same round-up rule), `-pa` through
+//! `ERL_ZFLAGS` (the code path), `ERL_MAX_PORTS` at a request that is *not* already a power of
+//! two, and a single `ERL_FLAGS` value carrying **two** emulator switches at once (both applied).
 use super::{
     Case, CaseKind, Contract, EmbeddedModule, Golden, ModuleRun, Probe,
 };
@@ -271,6 +277,89 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
+        // --- the remaining merge sources / request channels --------------------------------
+        // `+P` reaches `process_limit` through `ERL_FLAGS` exactly as its command-line form does;
+        // `ERL_ZFLAGS` (the last merge source) applies both an emulator flag (`+Q`, sized by the
+        // same round-up rule) and a code-path switch (`-pa`); `ERL_MAX_PORTS` is sized through
+        // that same rule at a request that is not already a power of two; and one `ERL_FLAGS`
+        // value carrying two switches applies both of them.
+        Case {
+            id: "flags_apply/erl_flags_plus_p_sets_process_limit",
+            description: "an ERL_FLAGS-carried +P N is applied to the process limit",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(process_limit)",
+                extra_argv: &[],
+                env: &[("ERL_FLAGS", "+P 4096")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 4096"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_zflags_plus_q_sets_port_limit",
+            description: "an ERL_ZFLAGS-carried +Q N is applied to the port-table limit",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &[],
+                env: &[("ERL_ZFLAGS", "+Q 4096")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 4096"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_zflags_pa_puts_the_dir_on_the_code_path",
+            description: "an ERL_ZFLAGS-carried -pa D really adds D to the code path",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                // The CWD-relative `..` (see the ordering cases) is not on either runtime's
+                // default code path, so membership proves the last merge source was applied.
+                expr: "lists:member(\"..\", code:get_path())",
+                extra_argv: &[],
+                env: &[("ERL_ZFLAGS", "-pa ..")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_max_ports_2000_rounds_a_request_up",
+            description: "ERL_MAX_PORTS=2000 is sized up to the 2048-port table",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &[],
+                env: &[("ERL_MAX_PORTS", "2000")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2048"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_flags_two_emulator_flags_are_both_applied",
+            description: "one ERL_FLAGS value carrying +S and +A applies both switches",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "{erlang:system_info(schedulers), erlang:system_info(thread_pool_size)}",
+                extra_argv: &[],
+                env: &[("ERL_FLAGS", "+S 2 +A 3")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {2,3}"),
                 exit_code: 0,
             },
         },
