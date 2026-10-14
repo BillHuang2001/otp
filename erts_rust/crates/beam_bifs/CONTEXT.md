@@ -393,8 +393,8 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
 ## Test Strategy
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` with a `BytesSink`/`NullSink` capture.
-- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **83
-  suite result lines / 1618 tests** (all green): the lib suite (816), 80 integration files (802), and two empty
+- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **84
+  suite result lines / 1625 tests** (all green): the lib suite (822), 81 integration files (803), and two empty
   harnesses. Re-derive the split from the per-suite `test result` lines, not from a hand-maintained table.
 - **Pins.** `tests/roster_audit.rs` is the roster pin (see the census section). `tests/bif_tab.rs` pins the parsed
   `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 89`,
