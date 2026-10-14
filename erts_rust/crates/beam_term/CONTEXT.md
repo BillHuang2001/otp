@@ -622,6 +622,15 @@ runtime that wants novel atoms to be free too should hold a single stable instan
   (verified against `../../erts/emulator/utils/make_tables`: `#define am_<alias> make_atom($i)` with
   `$i` the 0-based file order), which is required for preloaded modules that reference atoms
   positionally.
+- **`AtomTable::clone` mints a new *identity*, and the O(1) witness depends on it.** Because the table
+  is append-only, a monotonic generation plus a length check proves "same table, only appended to" —
+  *given* a way to tell two tables apart. A per-construction identity from a process-global counter
+  supplies that, so a replaced table, or a clone that later diverges by independent appends, can never
+  validate against the other's snapshot. Preserving the identity across `clone` would be unsound under
+  copy-on-write (`Rc::make_mut` — the live shared table is cloned on intern), so a clone deliberately
+  takes a fresh one; the only cost is a conservative memo rebuild right after a clone. The counter is
+  bookkeeping: not observable behaviour, not part of any compatibility contract, and its value/order/
+  spacing is never meaningful.
 - **`heap::Heap` is a minimal term-construction arena, NOT the production allocator.** The workspace
   routing table assigns the production per-process heap / bump allocator to `beam_alloc`. This module
   exists (per the node objective) only so the representation has a concrete, testable backing store
