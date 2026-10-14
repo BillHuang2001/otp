@@ -600,18 +600,21 @@ const REF_TEXT_MAX: usize = 71;
 /// are `badarg`.
 const MAX_REFERENCE: u64 = 1 << 18;
 
-/// The `%T` text of an internal pid as raw bytes — `<channel.number.serial>`
+/// The `%T` text of an internal pid — `<channel.number.serial>`
 /// (`erl_printf_term.c:508-519`): the channel is the local node's, then the
-/// process-table number, then the serial. The same shape `crate::print`'s
-/// `format_term` renders (`src/print.rs:328-333`).
+/// process-table number, then the serial.
+///
+/// This is the **one** home of that text: `crate::print`'s leaf renderer splices it
+/// in for an internal pid (the oracle's `io_lib:write1/4` calls the same
+/// `erlang:pid_to_list/1`) instead of re-deriving the shape.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a pid
 /// (`erlang:pid_to_list(5)` ⇒ `badarg`). An **external** pid is likewise `badarg`:
-/// its node is a frozen external term no byte-exact text can be derived from, the
-/// same treatment `crate::print`'s `format_term` gives it.
-fn pid_text(term: Eterm) -> Result<Vec<u8>> {
+/// its node is a frozen external term no byte-exact text can be derived from (see
+/// `crate::print`'s module docs).
+pub(crate) fn pid_text_str(term: Eterm) -> Result<String> {
     if !access::is_pid(term) {
         return Err(badarg());
     }
@@ -623,45 +626,44 @@ fn pid_text(term: Eterm) -> Result<Vec<u8>> {
         LOCAL_NODE_NUMBER,
         pid.number(),
         pid.serial()
-    )
-    .into_bytes())
+    ))
 }
 
-/// The `%T` text of an internal port as raw bytes — `#Port<channel.number>`
+/// The `%T` text of an internal port — `#Port<channel.number>`
 /// (`erl_printf_term.c:521-530`), the shape `src/port.rs`'s `port_to_list/1`
-/// builds as a charlist.
+/// builds as a charlist and `crate::print`'s leaf renderer splices in.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a port,
 /// or is an external one.
-fn port_text(term: Eterm) -> Result<Vec<u8>> {
+pub(crate) fn port_text_str(term: Eterm) -> Result<String> {
     if !access::is_port(term) {
         return Err(badarg());
     }
     let port = PortId::from_eterm(term)?;
-    Ok(format!("#Port<{}.{}>", LOCAL_NODE_NUMBER, port.number()).into_bytes())
+    Ok(format!("#Port<{}.{}>", LOCAL_NODE_NUMBER, port.number()))
 }
 
-/// The `%T` text of an internal reference as raw bytes — `#Ref<channel.n2.n1.n0>`
+/// The `%T` text of an internal reference — `#Ref<channel.n2.n1.n0>`
 /// (`erl_printf_term.c:493-507`; the ref numbers print most significant first).
 ///
 /// The Milestone-1 ref thing is `[header, node, serial, id]`
 /// (`access::make_ref_thing`, this crate's only producer of an internal ref), so it
 /// carries **one** id word; the rendered text is the `#Ref<0.0.0.N>` shape
-/// `src/print.rs`'s `format_ref` already emits.
+/// `crate::print`'s leaf renderer splices in.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a
 /// reference (`erlang:ref_to_list(5)` ⇒ `badarg`), or is an external one (its node
 /// is a frozen external term).
-fn ref_text(term: Eterm) -> Result<Vec<u8>> {
+pub(crate) fn ref_text_str(term: Eterm) -> Result<String> {
     if !access::is_reference(term) {
         return Err(badarg());
     }
     let id = access::ref_thing_id(term)?;
-    Ok(format!("#Ref<{}.0.0.{}>", LOCAL_NODE_NUMBER, id).into_bytes())
+    Ok(format!("#Ref<{}.0.0.{}>", LOCAL_NODE_NUMBER, id))
 }
 
 /// Collects `term` into the bytes of a proper list of byte-sized small integers —
@@ -795,10 +797,10 @@ fn parse_ref_text(bytes: &[u8]) -> Result<u64> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text`].
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text_str`].
 fn pid_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = pid_text(args[0])?;
-    bytes_to_string(ctx, &text)
+    let text = pid_text_str(args[0])?;
+    bytes_to_string(ctx, text.as_bytes())
 }
 
 /// `pid_to_binary(Pid)` (`bif.c:4879`) — the *same* `%T` bytes as
@@ -807,12 +809,12 @@ fn pid_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text`], or
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text_str`], or
 /// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when the heap cannot fit the
 /// binary.
 fn pid_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = pid_text(args[0])?;
-    bits::make_binary(ctx.heap(), &text)
+    let text = pid_text_str(args[0])?;
+    bits::make_binary(ctx.heap(), text.as_bytes())
 }
 
 /// `list_to_pid(PidString)` (`bif.c:4532`) — the internal pid the text names.
@@ -840,10 +842,10 @@ fn list_to_pid_1(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text`].
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text_str`].
 fn ref_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = ref_text(args[0])?;
-    bytes_to_string(ctx, &text)
+    let text = ref_text_str(args[0])?;
+    bytes_to_string(ctx, text.as_bytes())
 }
 
 /// `ref_to_binary(Ref)` (`bif.c:4893`) — the same `%T` bytes as [`ref_to_list_1`],
@@ -851,11 +853,11 @@ fn ref_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text`], or
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text_str`], or
 /// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
 fn ref_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = ref_text(args[0])?;
-    bits::make_binary(ctx.heap(), &text)
+    let text = ref_text_str(args[0])?;
+    bits::make_binary(ctx.heap(), text.as_bytes())
 }
 
 /// `port_to_binary(Port)` (`bif.c:4886`) — the port's `#Port<channel.number>` text as
@@ -863,11 +865,11 @@ fn ref_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`port_text`], or
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`port_text_str`], or
 /// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
 fn port_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = port_text(args[0])?;
-    bits::make_binary(ctx.heap(), &text)
+    let text = port_text_str(args[0])?;
+    bits::make_binary(ctx.heap(), text.as_bytes())
 }
 
 /// `list_to_ref(RefString)` (`bif.c:4712`) — the internal reference the text names.

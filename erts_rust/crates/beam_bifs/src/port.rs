@@ -173,10 +173,11 @@ fn list_to_port(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Ok(port.to_eterm())
 }
 
-/// The `erlang:port_to_list/1` BIF: renders `#Port<0.Num>` for an internal port.
+/// The `erlang:port_to_list/1` BIF: renders `#Port<0.Num>` for an internal port —
+/// the shared `%T` text of
+/// [`crate::term_conv::port_text_str`](crate::term_conv::port_text_str).
 fn port_to_list(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let port = PortId::from_eterm(args[0])?;
-    let text = format!("#Port<{}.{}>", LOCAL_NODE_NUMBER, port.number());
+    let text = crate::term_conv::port_text_str(args[0])?;
     let mut elems = Vec::with_capacity(text.len());
     for byte in text.bytes() {
         elems.push(ctx.int(i64::from(byte))?);

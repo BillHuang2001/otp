@@ -24,7 +24,7 @@
 //! Milestone-1 term set the way `io_lib:write/…` and the `~p` pretty printer do,
 //! and pins every case against the OTP oracle (erts-17.1): small integers, atoms
 //! (bare vs quoted), `NIL`, floats, proper/improper lists, tuples, maps, binaries,
-//! bignums, internal pids and internal refs.
+//! bignums, internal pids, internal ports and internal refs.
 //!
 //! This module owns the **leaf renderer** ([`term_chunk`]/[`render_chunk`], the
 //! `io_lib:write1/4` tree) and the shared `io_lib_format` chunk helpers; the
@@ -136,24 +136,33 @@
 //!   `[header, node, serial, id]` thing of [`crate::access::make_ref_thing`]), so
 //!   only `Id` varies. The oracle's numbers are the same shape.
 //! * **Internal ports** render as `#Port<0.N>` (see [`format_port`]), the oracle's
-//!   `#Port<Channel.Num>` with the local node's channel `0`. An **external** port —
-//!   and an external pid/ref, a fun or a record — is outside the Milestone-1
-//!   printable set: the first three carry a *node* whose dist channel/identity no
-//!   byte-faithful text can be derived from, and a fun's module/name is not in a
-//!   `make_fun3` descriptor. Each is rejected with a typed error (an external port
-//!   with `BeamError::UnsupportedBif`, the rest with `BeamError::BadArg`) rather
-//!   than guessed — never a *silently wrong* result.
+//!   `#Port<Channel.Num>` with the local node's channel `0`.
+//! * **External identifiers** (a pid, port or ref naming another node), a **fun** and
+//!   a **native record** are outside the Milestone-1 printable set. The oracle renders
+//!   all of them, but for an external identifier the rendered channel number is
+//!   `atom_val(x->sysname)` — the node-name atom's index in the **running VM's** atom
+//!   table, runtime state the frozen external-identifier term does not carry (measured:
+//!   the same wire image printed `#Port<10643.7>` and `#Port<10639.7>` in two runs), so
+//!   no byte-faithful text exists; a fun's module/name is likewise not in a `make_fun3`
+//!   descriptor. Each is rejected with a typed error — the external identifiers with
+//!   `BeamError::UnsupportedBif` (a capability gap), a fun and a native record with
+//!   `BeamError::BadArg` — rather than guessed. A native record's *single-line* form
+//!   (`#rec:r{a = 1,b = 2}`) is derivable from [`beam_term::record`], but the printer
+//!   cannot emit it as a leaf: `~p`/`~P` route a record through the same
+//!   [`render_chunk`] and would then print the flat form where the oracle's
+//!   `io_lib_pretty` **re-flows** a long record (`pp_record`/`rec_indent` in
+//!   `lib/stdlib/src/io_lib_pretty.erl:249-376`), a *silently wrong* result — so the
+//!   whole class stays a typed gap until that template is ported.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
-use beam_term::{
-    atom_val, pid_number, pid_serial, port_number, signed_value, AtomTable, Eterm,
-};
+use beam_term::{atom_val, signed_value, AtomTable, Eterm};
 
 use crate::access::{
     bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
-    is_float, is_function, is_internal_pid, is_internal_port, is_internal_ref, is_list, is_map,
-    is_nil, is_port, is_small, is_tuple, ref_thing_id, tuple_element, tuple_size,
+    is_external_pid, is_external_ref, is_float, is_function, is_internal_pid, is_internal_port,
+    is_internal_ref, is_list, is_map, is_nil, is_port, is_small, is_tuple, tuple_element,
+    tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -585,17 +594,27 @@ fn render_chunk(
         return render_map_chunk(atoms, term, printable, depth, order);
     }
     if is_internal_pid(term) {
-        return Ok(Chunk::text(&format!(
-            "<0.{}.{}>",
-            pid_number(term),
-            pid_serial(term)
-        )));
+        // The `%T` text `erlang:pid_to_list/1` renders (the oracle's `write1/4`
+        // calls exactly that), from its one home in `crate::term_conv`.
+        return Ok(Chunk::text(&crate::term_conv::pid_text_str(term)?));
     }
     if is_internal_ref(term) {
         return Ok(Chunk::text(&format_ref(term)?));
     }
     if is_port(term) {
         return Ok(Chunk::text(&format_port(term)?));
+    }
+    // An **external** pid/ref is a typed gap, exactly like an external port (see
+    // [`format_port`]): the oracle renders it through `pid_channel_no` /
+    // `ref_channel_no`, which for a foreign node is `external_channel_no(x)` =
+    // `dist_entry_channel_no(external_dist_entry(x))` = `atom_val(x->sysname)` — the
+    // index of the node-name atom in the **running VM's** atom table
+    // (`erl_node_container_utils.h:109-116`). That index is runtime state the frozen
+    // external-identifier term does not carry (measured: the same `V4_PORT_EXT` image
+    // naming `a@b` printed `#Port<10643.7>` and `#Port<10639.7>` in two runs), so a
+    // fabricated channel would be a *silently wrong* result.
+    if is_external_pid(term) || is_external_ref(term) {
+        return Err(unsupported_bif());
     }
     // A **fun** cannot be rendered byte-faithfully here. The oracle's leaf is
     // `erlang:fun_to_list/1` (`io_lib:write1/4` → `fun_to_list`, and `io_lib_pretty`
@@ -606,29 +625,18 @@ fn render_chunk(
     // module docs), never a guessed `#Fun<…>`.
     Err(badarg())
 }
-/// The channel number of the local node — the `%T` renderer's `port_channel_no` /
-/// `pid_channel_no` (`../../erts/emulator/beam/erl_printf_term.c:508-530`), which is
-/// `0` for the `nonode@nohost` node Milestone-1 always is. The same constant
-/// `src/port.rs`'s `port_to_list/1` and `src/term_conv.rs`'s `port_text` use for
-/// `#Port<0.Num>` / `<0.Num.Ser>`.
-const LOCAL_CHANNEL_NO: u64 = 0;
 
-/// The `%T` text of a port — `#Port<channel.number>`
+/// The `%T` text of an internal port — `#Port<channel.number>`
 /// (`../../erts/emulator/beam/erl_printf_term.c:521-530`, the leaf
 /// `erlang:port_to_list/1` renders and `io_lib:write1/4` / `io_lib_pretty`'s
-/// `print_length/7` both splice in).
+/// `print_length/7` both splice in), from its one home in `crate::term_conv`'s
+/// [`port_text_str`](crate::term_conv::port_text_str). An **internal** port renders
+/// `#Port<0.N>` — the local node's channel number and the port-table number —
+/// byte-identical to the oracle, where `io_lib:format("~p", [hd(erlang:ports())])`
+/// is `"#Port<0.0>"`.
 ///
-/// * An **internal** port renders `#Port<0.N>` — the local node's channel number
-///   (0) and the port-table number — byte-identical to the crate's
-///   [`crate::port`]`::port_to_list/1` (`src/port.rs`) and to the oracle, where
-///   `io_lib:format("~p", [hd(erlang:ports())])` is `"#Port<0.0>"`.
-/// * An **external** port is the typed [`unsupported_bif`]: its channel number is
-///   its *node*'s dist channel, runtime state the frozen
-///   `[header, node, next, id]` external-port term does not carry, and the oracle
-///   assigns it per run (decoding the same `PORT_EXT` image naming `a@b` printed
-///   `#Port<10592.7>` in one run and `#Port<10595.7>` in the next). No faithful text
-///   exists, and a guessed channel — e.g. the local `0` — would be a **silently
-///   wrong** result, which this printer never emits.
+/// An **external** port is the typed [`unsupported_bif`]; see the external
+/// pid/ref comment in [`render_chunk`] for why no faithful channel exists.
 ///
 /// # Errors
 ///
@@ -636,7 +644,7 @@ const LOCAL_CHANNEL_NO: u64 = 0;
 /// above); a term that is not a port at all never reaches this function.
 fn format_port(term: Eterm) -> Result<String> {
     if is_internal_port(term) {
-        return Ok(format!("#Port<{LOCAL_CHANNEL_NO}.{}>", port_number(term)));
+        return crate::term_conv::port_text_str(term);
     }
     Err(unsupported_bif())
 }/// Renders a list (`[e1,e2]` / `[e1|tail]`), the caller having already handled
@@ -1298,11 +1306,12 @@ fn format_float(value: f64) -> Result<String> {
     crate::numeric::format_short(value)
 }
 
-/// Renders an internal ref as `#Ref<0.0.0.Id>` (Milestone-1 refs carry no channel,
-/// node or serial — see the module docs).
+/// Renders an internal ref as `#Ref<0.0.0.Id>` — the `%T` text
+/// `erlang:ref_to_list/1` renders, from its one home in
+/// [`crate::term_conv::ref_text_str`] (Milestone-1 refs carry no channel, node or
+/// serial — see the module docs).
 fn format_ref(term: Eterm) -> Result<String> {
-    let id = ref_thing_id(term)?;
-    Ok(format!("#Ref<0.0.0.{id}>"))
+    crate::term_conv::ref_text_str(term)
 }
 
 #[cfg(test)]
