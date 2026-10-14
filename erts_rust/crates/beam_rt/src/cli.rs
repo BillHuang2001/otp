@@ -41,7 +41,7 @@
 //! | `+hmaxk B` / `+hmaxel B` / `+hmaxib B` | the `+hmax` kill / error-logger / shared-binary flags (`true`\|`false`) |
 //! | `-name N` / `-sname N` | distribution node name |
 //! | `-setcookie C` | distribution cookie (recorded as an init argument; sets `emulator.cookie`) |
-//! | `-config F` | config file, recorded as the init argument `config` |
+//! | `-config F` | config file, recorded as the init argument `config` **and** resolved/read-checked by every booting action (a missing file is a runtime error, exit 1) |
 //! | `-boot F` | boot script: recorded as the init argument `boot` **and** executed by the A.7 boot-script executor (the `Boot` action) |
 //! | `-emu_flavor F` | emulator flavor: `emu` ⇒ interpreter, `jit`/`smp` ⇒ JIT (recorded) |
 //! | `+Q N` | maximum number of ports (`legacy`, or `1024..=134217727`) |
@@ -1182,8 +1182,15 @@ fn report_unsupported(reason: &str) -> i32 {
 /// constructed, so the slot stays empty and the dump is skipped.
 fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
     let action = config.action.clone();
-    match action {
-        Action::Version => {
+    // `-config FILE` is read while the node **boots**, before any Start instruction runs: a
+    // config file the boot cannot read is the boot failure the oracle reports with exit 1
+    // (`erl -noshell -config /nonexistent -eval 'ok'` ⇒ **1**, no stdout, no stderr —
+    // verified against OTP 29.1.1 / erts-17.1). Only `-version` builds no runtime at all, so
+    // it stays exempt (`erl -version -config /nonexistent` ⇒ **0**, the banner).
+    if !matches!(action, Action::Version) {
+        check_config_file(&config)?;
+    }
+    match action {        Action::Version => {
             println!("{}", boot::boot_banner());
             Ok(())
         }
@@ -1278,18 +1285,88 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
 /// directive the runtime cannot execute all return their typed [`BeamError`] — which [`run`]
 /// reports as `beam_rt: <error>` with exit code 1 — never a panic, a hang or a wrong result.
 ///
-/// The real `start.boot` runs to **completion**: all 22 directives execute, the last being
-/// `{progress,started}`. The `{apply,{c,erlangrc,[]}}` directive's `{open, …}` of `$HOME/.erlang`
-/// is answered `{error,enoent}` by the native `file_server_2` service whenever that file is
-/// absent, which `file:path_eval/2` treats as success; see [`crate::boot`].
-fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {
-    runtime.boot()?;
+/// The real `start.boot` does **not** run to completion: it stops at the 0-based directive
+/// index **19** of 22, `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`,
+/// because the stdlib start's own `application_controller` is already gone — the CLI reports
+/// `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`
+/// with exit code 1. The final `{progress,started}` (index 21) is therefore not reached, and
+/// neither is the `{apply,{c,erlangrc,[]}}` directive (index 20) whose `{open, …}` of
+/// `$HOME/.erlang` the native `file_server_2` service answers. Per-directive detail is in
+/// [`crate::boot`].
+fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {    runtime.boot()?;
     let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;
     runtime.boot_from_script(&path).map(|_| ())
 }
 
-/// The `-boot FILE` argument of the merged command line, or `None` when none was given.
+/// Checks the `-config FILE` init argument(s) the way the oracle's boot reads them, so a
+/// config file the node cannot read fails the boot instead of being silently ignored.
 ///
+/// # Ground truth (OTP 29.1.1 / erts-17.1)
+///
+/// `init` hands each `-config` value to the application controller, which resolves it and
+/// then `file:consult/1`s the result (`lib/kernel/src/application_controller.erl:1876-1903`,
+/// `conf_param_to_conf/1`): `filename:basename(FileName, ".config")` strips a **trailing**
+/// `.config` and the name is rebuilt as `<dir>/<base>.config`. So `-config /x/conf` and
+/// `-config /x/conf.config` both read `/x/conf.config`. A file that cannot be read throws
+/// `{error, {FName, Line, Str}}` out of the boot, which the emulator turns into exit **1**:
+///
+/// ```text
+/// erl -noshell -config /nonexistent      -eval 'ok'  → exit 1   (no stdout, no stderr)
+/// erl -noshell -config <dir>.config      -eval 'ok'  → exit 1   (a directory is not a file)
+/// erl -noshell -config <existing>.config -eval 'ok'  → exit 0
+/// erl -version -config /nonexistent                  → exit 0   (the banner; `-version` never boots)
+/// ```
+///
+/// **Every** occurrence is checked, not just the first: `-config <missing> -config <ok>` and
+/// `-config <ok> -config <missing>` both exit 1 in the oracle (verified).
+///
+/// # Scope
+///
+/// Only the file's *presence as a regular file* is decided here. A readable file whose
+/// contents are malformed (or empty — the oracle's own `sys.config` grammar wants a list of
+/// terms) is a **content** failure this runtime does not model, exactly as it does not model
+/// the config terms themselves; that residual divergence changes no working invocation (a
+/// file `[].`-style boot reads is accepted by both).
+///
+/// The error is a message-carrying `error`-class raise (`error::message`), which [`run`]
+/// reports as `beam_rt: <error>` with [`EXIT_RUNTIME`] — the same classification every other
+/// runtime failure takes. No runtime has been built at this point, so [`run`]'s crash-dump
+/// path finds an empty snapshot and writes nothing (the oracle writes no dump either).
+fn check_config_file(config: &RuntimeConfig) -> Result<()> {
+    let Some(occurrences) = config.init_args.get("config") else {
+        return Ok(());
+    };
+    for values in &occurrences {
+        for value in values.iter() {
+            let resolved = resolve_config_file(value);
+            if !resolved.is_file() {
+                return Err(error::message(format!(
+                    "cannot read config file {}",
+                    resolved.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+/// Resolves a `-config` value to the file the oracle reads: a trailing `.config` is kept,
+/// any other name gets it appended (`application_controller.erl:1877-1879`).
+///
+/// The rewrite is a **basename + join**, so `-config /a.b/conf` becomes `/a.b/conf.config`
+/// and a value already ending in `.config` is unchanged (`filename:basename(X, ".config")`
+/// strips at most one occurrence).
+fn resolve_config_file(value: &str) -> PathBuf {
+    let path = Path::new(value);
+    let base = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => format!("{}.config", name.strip_suffix(".config").unwrap_or(name)),
+        None => format!("{value}.config"),
+    };
+    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir.join(base),
+        None => PathBuf::from(base),
+    }
+}
+/// The `-boot FILE` argument of the merged command line, or `None` when none was given.///
 /// The value is read from the recorded init arguments rather than a field of its own
 /// because that is exactly where `init` reads it: `bootfile/2` resolves `get_flag(boot,
 /// Flags, Root ++ "/bin/start")` (`erts/preloaded/src/init.erl:1257-1258`), and the `boot`
@@ -2422,6 +2499,106 @@ mod tests {
         assert_eq!(
             run(vec!["-boot".to_string(), "/nonexistent/nope".to_string()]),
             EXIT_RUNTIME
+        );
+    }
+
+    /// `-config FILE` is resolved exactly as the application controller resolves it:
+    /// `filename:basename(FileName, ".config")` strips **one** trailing `.config` and the
+    /// name is rebuilt in its own directory (`lib/kernel/src/application_controller.erl:1876-1879`).
+    #[test]
+    fn the_config_file_name_is_resolved_the_way_the_oracle_resolves_it() {
+        for (value, resolved) in [
+            ("/x/conf", "/x/conf.config"),
+            ("/x/conf.config", "/x/conf.config"),
+            ("conf", "conf.config"),
+            ("conf.config", "conf.config"),
+            // The strip is on the **basename** only, so a dotted directory survives.
+            ("/a.b/conf", "/a.b/conf.config"),
+            // At most one occurrence is stripped and re-appended.
+            ("/x/y.config.config", "/x/y.config.config"),
+        ] {
+            assert_eq!(resolve_config_file(value), PathBuf::from(resolved), "{value}");
+        }
+    }
+
+    /// The boot-time `-config` check. Oracle (OTP 29.1.1 / erts-17.1), all verified:
+    ///
+    /// ```text
+    /// erl -noshell -config /nonexistent      -eval 'ok'  → exit 1  (no stdout, no stderr)
+    /// erl -noshell -config <dir named>.config -eval 'ok' → exit 1
+    /// erl -noshell -config <missing> -config <ok> -eval  → exit 1
+    /// erl -noshell -config <ok> -config <missing> -eval  → exit 1
+    /// erl -noshell -config <existing>.config -eval 'ok'  → exit 0
+    /// ```
+    #[test]
+    fn a_config_file_that_cannot_be_read_is_refused() {
+        let scratch = ScratchDir::new("config");
+        let present = scratch.write("app.config", b"[].\n");
+
+        // No `-config` at all: nothing to check.
+        assert!(check_config_file(&parsed(&["-noshell"])).is_ok());
+
+        // Both spellings of the same file are accepted (`.config` is appended unless present).
+        let stem = present.with_extension("");
+        for value in [present.to_string_lossy(), stem.to_string_lossy()] {
+            let config = parsed(&["-config", value.as_ref()]);
+            assert!(check_config_file(&config).is_ok(), "{value}");
+        }
+
+        // A missing file is refused with a message naming the **resolved** path.
+        let absent = scratch.path.join("absent");
+        let error = check_config_file(&parsed(&["-config", absent.to_string_lossy().as_ref()]))
+            .expect_err("a missing config file is refused");
+        let text = format!("{error}");
+        assert!(text.contains("cannot read config file"), "{text}");
+        assert!(text.contains("absent.config"), "{text}");
+
+        // A directory carrying the suffix is not a file (the oracle's `file:consult`
+        // reports `eisdir` out of the boot).
+        std::fs::create_dir_all(scratch.path.join("dir.config")).expect("a directory");
+        let directory = scratch.path.join("dir");
+        assert!(
+            check_config_file(&parsed(&["-config", directory.to_string_lossy().as_ref()])).is_err(),
+            "a directory is not a readable config file"
+        );
+
+        // **Every** occurrence is checked, not just the first — the oracle refuses either
+        // order when one of the two cannot be read.
+        let present = present.to_string_lossy().into_owned();
+        let absent = absent.to_string_lossy().into_owned();
+        for (first, second) in [(&absent, &present), (&present, &absent)] {
+            let config = parsed(&["-config", first, "-config", second]);
+            assert!(
+                check_config_file(&config).is_err(),
+                "-config {first} -config {second} must be refused"
+            );
+        }
+        // … and two readable ones are accepted.
+        let config = parsed(&["-config", &present, "-config", &present]);
+        assert!(check_config_file(&config).is_ok());
+    }
+
+    /// The end-to-end classification: a `-config` the boot cannot read is a **runtime** error
+    /// (exit 1 + `beam_rt: <error>`), never a usage error (2) and never a silent success —
+    /// while `-version`, which builds no runtime at all, stays exempt (the oracle's own
+    /// `erl -version -config /nonexistent` exits 0 with the banner).
+    #[test]
+    fn a_missing_config_file_exits_1_but_version_stays_exempt() {
+        for action in [
+            vec!["-noshell", "-config", "/nonexistent/nope", "-eval", "ok"],
+            vec!["-noshell", "-config", "/nonexistent/nope"],
+            vec!["-noshell", "-config", "/nonexistent/nope", "-s", "init", "stop"],
+        ] {
+            let args: Vec<String> = action.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(run(args), EXIT_RUNTIME, "{action:?}");
+        }
+        assert_eq!(
+            run(vec![
+                "-version".to_string(),
+                "-config".to_string(),
+                "/nonexistent/nope".to_string(),
+            ]),
+            EXIT_OK
         );
     }
 }
