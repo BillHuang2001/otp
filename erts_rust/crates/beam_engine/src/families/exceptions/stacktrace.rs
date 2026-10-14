@@ -295,7 +295,9 @@ fn supplied_frame_shape<'a>(module: &Module, frame: &'a StackFrame) -> Result<It
     let function_atom = lookup_supplied(module, frame.function.as_str(), "function")?;
     let location = match &frame.location {
         Some(location) => {
-            let file_atom = lookup_supplied(module, location.file.as_str(), "file name")?;
+            // The location's `{file,Name}` KEY is the atom `file`; `Name` is the file
+            // name, rendered as a char list exactly as a derived frame's is.
+            let file_atom = lookup_supplied(module, "file", "file")?;
             let line_atom = lookup_supplied(module, "line", "line")?;
             Some(LocationShape {
                 file_atom,
