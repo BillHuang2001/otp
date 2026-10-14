@@ -105,6 +105,7 @@ use crate::error;
 use crate::machine::{CatchFrame, Machine};
 use crate::operand::{read_operand, write_operand};
 use crate::terms;
+use crate::terms::Sink;
 use crate::Step;
 
 use raise::{classify_class, install_class_atom, raise_error_atom, raise_error_tuple};
@@ -124,6 +125,7 @@ mod tests;
 /// raise.
 pub(crate) fn exec(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -219,30 +221,61 @@ pub(crate) fn exec(
                     // Class `throw`: the caught value is the thrown term itself.
                     machine.set_x(0, reason)?;
                 } else {
-                    // Classes `error`/`exit` ⇒ `{'EXIT',Reason}`. M1 appends no
-                    // stacktrace (C's `add_stacktrace`).
                     let exit_atom = module.atom_table.lookup("EXIT").ok_or_else(|| {
                         error::unsupported("catch_end: module atom table lacks the 'EXIT' atom")
                     })?;
                     let exit_term = make_atom(exit_atom);
-                    // Reserve → read → write: the reason is re-read from the machine
-                    // root `x(1)` *inside* the reader closure, so a moving collector
-                    // running under the one rooted reservation cannot leave this build
-                    // holding the stale copy read above.
-                    let tuple = terms::make_tuple_rooted(
-                        machine,
-                        ctx,
-                        RootSet::ALL_LIVE,
-                        2,
-                        0,
-                        |m, _slack| {
-                            let reason = m.x(1).ok_or_else(|| {
-                                error::unsupported("catch_end: x(1) out of range")
-                            })?;
-                            Ok(vec![exit_term, reason])
-                        },
-                    )?;
-                    machine.set_x(0, tuple)?;
+                    // Class `error` ⇒ `{'EXIT',{Reason, build_stacktrace(Trace)}}`; every other
+                    // class (`exit`, an unnameable class) ⇒ `{'EXIT',Reason}`. C:
+                    // `if (x(3) == am_error) x(1) = add_stacktrace(c_p, x(1), x(2));`
+                    // (`erts/emulator/beam/emu/instrs.tab:1175-1220`).
+                    let error_class = module.atom_table.lookup("error").map(make_atom) == Some(class);
+                    if error_class {
+                        // The cooked stacktrace, from the same raise snapshot
+                        // `build_stacktrace` cooks: C's `add_stacktrace` calls `build_stacktrace`.
+                        let raw = read_operand(machine, ctx, &Operand::X(2))?;
+                        let has_snapshot = !machine.raise_snapshot().is_empty();
+                        let head = machine.take_raise_head_item();
+                        let cooked = if is_nil(raw) && !has_snapshot && !head {
+                            NIL
+                        } else {
+                            symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), head)?
+                        };
+                        // Root the trace in `x(2)` (a `RootSet` slot) across the tuple
+                        // reservation, then re-read it post-collection.
+                        machine.set_x(2, cooked)?;
+                        // One rooted reservation for the two tuples (`{Reason,Trace}` and
+                        // `{'EXIT',Inner}` — 3 + 3 words).
+                        let mut sink = terms::reserve_slack(machine, ctx, 6)?;
+                        let reason = machine.x(1).ok_or_else(|| {
+                            error::unsupported("catch_end: x(1) out of range")
+                        })?;
+                        let cooked = machine.x(2).ok_or_else(|| {
+                            error::unsupported("catch_end: x(2) out of range")
+                        })?;
+                        let inner = sink.tuple(&[reason, cooked])?;
+                        let outer = sink.tuple(&[exit_term, inner])?;
+                        machine.set_x(0, outer)?;
+                    } else {
+                        // Reserve → read → write: the reason is re-read from the machine
+                        // root `x(1)` *inside* the reader closure, so a moving collector
+                        // running under the one rooted reservation cannot leave this build
+                        // holding the stale copy read above.
+                        let tuple = terms::make_tuple_rooted(
+                            machine,
+                            ctx,
+                            RootSet::ALL_LIVE,
+                            2,
+                            0,
+                            |m, _slack| {
+                                let reason = m.x(1).ok_or_else(|| {
+                                    error::unsupported("catch_end: x(1) out of range")
+                                })?;
+                                Ok(vec![exit_term, reason])
+                            },
+                        )?;
+                        machine.set_x(0, tuple)?;
+                    }
                 }
             }
             Ok(Some(Step::Next))
@@ -281,7 +314,7 @@ pub(crate) fn exec(
             let cooked = if is_nil(raw) && !has_snapshot && !head {
                 NIL
             } else {
-                symbolic_stacktrace(machine, module, ctx, &Operand::X(0), head)?
+                symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(0), head)?
             };
             machine.set_x(0, cooked)?;
             Ok(Some(Step::Next))
