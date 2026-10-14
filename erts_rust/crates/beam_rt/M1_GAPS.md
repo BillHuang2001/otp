@@ -496,13 +496,12 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
 * **Open observation — the crash report's `initial call: supervisor_bridge:standard_error/1` does not match
   the expected `{gen_server,init_it,6}`.** Worth a future check of the floor's initial-call / entry-module
   answer.
-* **The `standard_error` `supervisor_bridge` child's `error:badarg` — PINNED to the `Mod:init(Args)`
-  call inside `gen_server:init_it/2`, which raises **without ever entering the callee's body**; the
-  raising instruction is therefore an engine-level entry failure, not a value in the kernel
-  supervision tree.**
+* **The `standard_error` `supervisor_bridge` child's `error:badarg` — NOT an engine entry failure; the
+  pinned "the callee's body never runs" claim is falsified, and the terminal blocker on the crash path
+  is the floor's uncatchable `unsupported: process_info: current_stacktrace` gap.**
   The failing process is pid `<0.9.0>` (`ProcessId { number: 9, serial: 0 }`, entry module
-  `proc_lib`). `BEAM_RT_BOOT_TRACE=1` now attributes every seam-decline/BIF line to its pid, so its
-  whole BIF sequence is visible: `erlang:put/2` ×2 (`proc_lib:init_p`'s `'$ancestors'` /
+  `proc_lib`). `BEAM_RT_BOOT_TRACE=1` attributes every seam-decline/BIF line to its pid, so its whole
+  BIF sequence is visible: `erlang:put/2` ×2 (`proc_lib:init_p`'s `'$ancestors'` /
   `'$initial_call'`), the `erlang:apply/3` that enters `gen:init_it/7`, `erlang:register/2`
   (`gen:register_name/1` → `register(standard_error_sup, self())`), `lists:keyfind/3`
   (`gen:hibernate_after/1`), `erlang:make_ref/0` + `erlang:make_fun/3` ×4 (the `#server_data{}`
@@ -511,37 +510,43 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `erlang:raise/3 ["'error'", "'badarg'", <list>]` — i.e. `gen_server.erl:2270-2272`, the
   `{'EXIT', Class, Reason, Stacktrace}` clause (`gen:unregister_name(Name0)` then
   `erlang:raise(Class, Reason, Stacktrace)`).
-  **The raise is at the call, not in the callee.** `-pa DIR` **IS** honoured on the `-boot` route
-  (the earlier "not honoured" observation was wrong): with an instrumented
-  `-pa` copy of `gen.erl`/`gen_server.erl`/`supervisor_bridge.erl`, the boot prints the `gen`/
-  `gen_server` markers, and `code:which/1` / `code:is_loaded/1` / `erlang:function_exported(Mod,init,1)`
-  all report the `-pa` module (`"/tmp/sbx/supervisor_bridge.beam"`, `{file,…}`, `true`). An
-  instrumented `gen_server:init_it/2` prints `{gs_marker_e_about_to_call_init, supervisor_bridge, …}`
-  immediately before `Res = {ok, Mod:init(Args)}` and then
-  `{gs_marker_g_caught, supervisor_bridge, error, badarg, [{gen_server,init_it,2,[{file,…},{line,2281}]},
-  {gen_server,init_it,6,[…]}]}` — the stacktrace names the **call site** and carries no callee frame.
-  Yet the same `-pa` `supervisor_bridge.beam` has `erlang:error(sb_marker_v2)` as the FIRST statement of
-  `init/1`, and that marker never fires (and the reason stays `badarg`, not `sb_marker_v2`) — so
-  `supervisor_bridge:init/1` is **entered but its body never executes**. On the `run` route the same
-  pair (`erlang:apply(supervisor_bridge, init, [Args])` and the direct static
-  `supervisor_bridge:init([Args])`) both raise `sb_marker_v2`, i.e. both enter the body normally — so
-  the failure needs the boot chain's state, not the call shape. It is not the execution tier
-  (`BEAM_RT_TIER=interpreter` reproduces it identically).
-  `grep -c` of the raw `BEAM_RT_BOOT_TRACE=1` run: ~21 800 trace lines; the crasher's own window is the
-  10 BIFs above.
-  **Ownership:** this is a sibling-crate (`beam_engine`) `call_ext`/`apply` entry failure — the
-  `beam_rt` side supplies the correct resolved module, the correct `Args` term and the correct
-  `function_exported` answer, and every `beam_rt`-served arm on the path (`erlang:apply/3`,
-  `erlang:register/2`, `erlang:unregister/1`, `erlang:make_fun/3`, `erlang:make_ref/0`) returns
-  normally. Nothing in `beam_rt` fabricates this `badarg`, so it is **not fixed in-node**; it is
-  reported upward with the evidence above. Related sibling shapes: the dropped `erlang:raise/3`
-  stacktrace argument (the decoded `Raise` for that call carries `stacktrace: Stacktrace { frames: [] }`)
-  and the missing callee frame (the `build_stacktrace` frame-drop class below).
-  **Repro (fast, `run` route, no `-boot`):** `erts_rust/crates/beam_rt/tests/fixtures/sbprobe2.beam`
-  is not committed; the equivalent one-liner is a fixture whose `run/0` calls
-  `erlang:apply(supervisor_bridge, init, [[standard_error,[],{local,standard_error_sup}]])` after
-  `logger_server:start_link()` — on the `run` route it succeeds, on the `-boot` route it raises
-  `error:badarg`.
+  **The callee's body DOES run.** With an instrumented `-pa` `gen_server.beam` (probes via
+  `erlang:display/1`), the boot prints **173** stdout lines (vs 80) and pid 9's trace continues *past*
+  the `Mod:init(Args)` call: the BIFs of `supervisor_bridge:init/1`'s own body —
+  `erlang:process_flag/2` (`trap_exit`), the `spawn/1` + `link/1` + `persistent_term:put/2` of its
+  `report_progress`-style start (supervisor_bridge.erl:182/187) — all execute, and pid 9 then parks in
+  `gen_server:loop/5 +23 { target: Label(190), time: Y(0) } (blocked (no message), entry=Some("proc_lib"))`.
+  So the compiler's `apply` at `gen_server:init_it/2` (label 172/173:
+  `{move,{atom,init},{x,2}} / {swap,{x,0},{x,1}} / {apply,1}`) enters the callee normally. **Verdict
+  (a) as stated — "the engine raises `badarg` between module+function resolved and the first callee
+  instruction" — is refuted**; the engine's `call_ext`/`resolve_external_call` path is not implicated
+  (the boot trace contains **zero** `supervisor_bridge` occurrences, because a variable-module call is
+  compiled to `apply`, not `call_ext`), and `-pa` IS honoured on the `-boot` route (pinned by
+  `tests/boot_code_path.rs`).
+  **The terminal blocker on that process's crash path is a floor capability gap, not a load/host-seam
+  answer**: pid 9 later dies inside `gen_server:decode_msg/6 +47` on
+  `erlang:process_info/2 [<pid>, 'current_stacktrace']`, answered by `src/native/memory/mod.rs`'s
+  `position_value` with the uncatchable `unsupported: process_info: current_stacktrace (this runtime
+  holds no engine for that process: it is the caller, a fun-bodied process or an unscheduled pid)`
+  (`stacktrace: StackTrace { frames: [] }`, `live_reason: None`) — the machine is removed from
+  `RunnerState.engines` for the whole slice (`src/runner/run.rs:284`), so the caller's own stacktrace
+  is unreachable. This is the same gap that already kills `application_controller` on directive 19
+  (`gen_server:handle_common_reply/5`'s `?STACKTRACE()`). It is `beam_rt`-owned floor code but closing
+  it needs the **additive, defaulted `beam_engine` `ExecutionContext` seam** that exposes the executing
+  machine's stack, so it is a cross-crate handoff (see the `beam_engine` handoff bullet below), not a
+  pure in-node fix.
+  It is not the execution tier (`BEAM_RT_TIER=interpreter` reproduces the pinned end state
+  identically).
+  **Still open / unreconciled:** the *uninstrumented* run's crash report names
+  `error:bad argument in function gen_server:init_it/6 (gen_server.erl:2272)` with stacktrace
+  `[{gen_server,init_it,2,[{line,2281}]},{gen_server,init_it,6,[{line,2240}]}]`, and the third
+  `erlang:raise/3` argument renders as an on-heap term (`Eterm(136173495972217)`, not an atom) that has
+  not been decoded — so the exact reason the *uninstrumented* `init_it/2` catch fired is not yet
+  attributed. The two observations (body runs vs. `init_it/2` catch) are not yet reconciled; a
+  `-pa` `supervisor_bridge` whose `init/1` first statement is a displayed marker is the next decisive
+  probe.
+  `grep -c` of a raw `BEAM_RT_BOOT_TRACE=1` run: ~21 800 trace lines (and ~1.7 MB of seam-decline
+  text); the crasher's own window is the 10 BIFs above plus the `decode_msg/6` `process_info/2` raise.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs
   **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp`
