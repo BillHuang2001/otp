@@ -37,7 +37,7 @@ use beam_common::{
     StackFrame, StackTrace,
 };
 use beam_loader::Module;
-use beam_term::{is_non_value, Eterm, NIL, THE_NON_VALUE};
+use beam_term::{is_list, is_nil, is_non_value, Eterm, NIL, THE_NON_VALUE};
 
 use crate::error;
 use crate::families::exceptions::stacktrace::nearest_line;
@@ -163,6 +163,21 @@ impl Machine {
     /// flight.
     pub(crate) fn take_raise_head_item(&mut self) -> bool {
         std::mem::take(&mut self.raise_head_item)
+    }
+
+    /// Consume the **live raise**'s failed-clause argument list
+    /// ([`Machine::raise_function_clause_args`]).
+    ///
+    /// `Some(args)` means the exception currently in flight was raised by the
+    /// `function_clause` site of the function whose clause failed, and `args` is that
+    /// function's real call argument list — C's cooked item for the **failing**
+    /// function carries the argument list in its `A` slot (`erts_build_mfa_item`,
+    /// `../../erts/emulator/beam/utils.c:3430-3457`), while every outer frame keeps
+    /// its declared arity. `None` for every other raise.
+    ///
+    /// Taking it consumes it: the list describes exactly **one** cooking.
+    pub(crate) fn take_raise_function_clause_args(&mut self) -> Option<Eterm> {
+        self.raise_function_clause_args.take()
     }
 
     /// Push a catch frame (the `try`/`catch` handler target).
@@ -308,6 +323,11 @@ impl Machine {
         // records that the cooked trace must prepend it. A raise raised by a site
         // that published no head clears the state to `false`.
         self.raise_head_item = std::mem::take(&mut self.pending_callee_head);
+        // The failed-clause argument list rides the same two-latch protocol: the raise
+        // site armed the one-shot latch, and this raise — whoever raised it — owns the
+        // live state from here on, so a raise that carries no such list clears it to
+        // `None` (never a stale list from an earlier raise).
+        self.raise_function_clause_args = self.pending_function_clause_args.take();
         self.pending_exception = Some((class, reason));
         // Rebuild the **pre-unwind** raise snapshot before anything is unwound: the
         // handler's `build_stacktrace` (and the uncaught funnel) must be able to name
@@ -405,7 +425,7 @@ impl Machine {
     /// `exit`, a BIF's own `badarg`/`badmatch`/… reason, the `func_info`
     /// `function_clause`) is decorated.
     pub(crate) fn with_uncaught_frames(
-        &self,
+        &mut self,
         err: BeamError,
         entry_module: Option<&Module>,
         func: u32,
@@ -415,7 +435,10 @@ impl Machine {
             BeamError::Raise(raise)
                 if raise.stacktrace.is_empty() && !is_engine_diagnostic(&raise.reason) =>
             {
-                let frames = self.raise_stacktrace(entry_module, func, pc);
+                // Consume the failed-clause argument list: it belongs to the raising
+                // frame, which is the frame this funnel names first.
+                let failed_clause_args = self.take_raise_function_clause_args();
+                let frames = self.raise_stacktrace(entry_module, func, pc, failed_clause_args);
                 if frames.is_empty() {
                     BeamError::Raise(raise)
                 } else {
@@ -482,12 +505,16 @@ impl Machine {
         entry_module: Option<&Module>,
         func: u32,
         pc: u32,
+        first_frame_args: Option<Eterm>,
     ) -> StackTrace {
         let mut trace = StackTrace::new();
         // The raising function itself — the `(func, pc)` of the instruction that
-        // raised, in the module context executing right now.
+        // raised, in the module context executing right now. `first_frame_args` is the
+        // failed clause's argument list, when this raise came from the
+        // `function_clause` site (see [`Machine::raise_function_clause_args`]); it
+        // belongs to THIS frame and to no other.
         if let Some(module) = self.frame_module(entry_module, self.context) {
-            push_stack_frame(&mut trace, &module, func, pc);
+            push_stack_frame(&mut trace, &module, func, pc, first_frame_args);
         }
         // Then the live caller chain, innermost frame first. The bottom frame's
         // `Continuation::Halt` contributes nothing (there is no address to name).
@@ -496,7 +523,7 @@ impl Machine {
                 continue;
             };
             if let Some(module) = self.frame_module(entry_module, context) {
-                push_stack_frame(&mut trace, &module, func, pc);
+                push_stack_frame(&mut trace, &module, func, pc, None);
             }
         }
         trace
@@ -547,7 +574,23 @@ impl std::ops::Deref for FrameModule<'_> {
 /// An out-of-range `func`, or a module/function atom the module's own table cannot
 /// name, appends nothing: the frames are best-effort metadata and must never
 /// invent a name (see [`Machine::raise_stacktrace`]).
-fn push_stack_frame(trace: &mut StackTrace, module: &Module, func: u32, pc: u32) {
+///
+/// `failed_clause_args` is the failed clause's real argument list for the **one**
+/// frame whose function contains the failed clause (C's `args`,
+/// `erts_build_mfa_item`); it is `None` for every other frame. A
+/// [`StackFrame`](beam_common::StackFrame) carries only an **arity**, so the list
+/// cannot be represented here — and it does not have to be: the list is built from
+/// exactly the function's `arity` argument registers, so its length IS that arity.
+/// C's rule (`erts_build_mfa_item`: the argument list when it is a list/nil, else
+/// the declared arity) therefore renders identically either way, and the parameter
+/// exists to state that rule at the one frame it applies to.
+fn push_stack_frame(
+    trace: &mut StackTrace,
+    module: &Module,
+    func: u32,
+    pc: u32,
+    failed_clause_args: Option<Eterm>,
+) {
     let Some(function) = module.functions.get(func as usize) else {
         return;
     };
@@ -557,13 +600,34 @@ fn push_stack_frame(trace: &mut StackTrace, module: &Module, func: u32, pc: u32)
     ) else {
         return;
     };
-    let mut frame = StackFrame::new(
-        module_name.to_string(),
-        function_name.to_string(),
-        function.arity as u8,
-    );
+    let arity = match failed_clause_args {
+        // The argument list, when it is the list/nil C emits in the `A` slot; its
+        // length is the failed function's arity by construction.
+        Some(args) if is_list(args) || is_nil(args) => {
+            failed_clause_arity(args).unwrap_or(function.arity as u8)
+        }
+        _ => function.arity as u8,
+    };
+    let mut frame = StackFrame::new(module_name.to_string(), function_name.to_string(), arity);
     frame.location = source_location(module, func, pc);
     trace.push(frame);
+}
+
+/// The number of elements of the proper list `list`, or `None` when it is not a
+/// proper list (an improper tail).
+///
+/// Only used for the **failed clause's** argument list, which
+/// [`crate::interpreter::raise_function_clause_with_args`] builds as a proper list of
+/// the call's argument registers — its length is the failed function's arity, which
+/// is what C's `erts_build_mfa_item` emits for a list/nil `args`.
+fn failed_clause_arity(list: Eterm) -> Option<u8> {
+    let mut count = 0u8;
+    let mut cursor = list;
+    while !is_nil(cursor) {
+        cursor = crate::terms::cons_tail(cursor).ok()?;
+        count = count.checked_add(1)?;
+    }
+    Some(count)
 }
 
 /// The [`SourceLocation`] in effect at code offset `pc` of the function at index
@@ -775,7 +839,7 @@ mod tests {
             })
             .unwrap();
 
-        let trace = machine.raise_stacktrace(Some(&entry), 1, 7);
+        let trace = machine.raise_stacktrace(Some(&entry), 1, 7, None);
         assert_eq!(trace.len(), 2, "the raising function then its caller");
         // The function that raised comes first: `g/2` at `(1, 7)`.
         assert_eq!(trace.frames[0].module.as_str(), "m");
@@ -804,7 +868,7 @@ mod tests {
             Instr::Return,
         ];
 
-        let trace = Machine::new().raise_stacktrace(Some(&module), 0, 2);
+        let trace = Machine::new().raise_stacktrace(Some(&module), 0, 2, None);
         let location = trace.frames[0]
             .location
             .as_ref()
@@ -813,7 +877,7 @@ mod tests {
         assert_eq!(location.line, 7);
         // Before the marker there is no location (C's LINE_INVALID_LOCATION).
         assert_eq!(
-            Machine::new().raise_stacktrace(Some(&module), 0, 0).frames[0].location,
+            Machine::new().raise_stacktrace(Some(&module), 0, 0, None).frames[0].location,
             None
         );
     }
@@ -838,7 +902,7 @@ mod tests {
         let id = machine.register_context(&callee);
         machine.switch_context(id).unwrap();
 
-        let trace = machine.raise_stacktrace(Some(&entry), 0, 5);
+        let trace = machine.raise_stacktrace(Some(&entry), 0, 5, None);
         assert_eq!(trace.len(), 2);
         assert_eq!(trace.frames[0].module.as_str(), "c", "the raising function");
         assert_eq!(trace.frames[0].function.as_str(), "g");
@@ -850,7 +914,7 @@ mod tests {
     fn raise_stacktrace_skips_a_frame_the_module_or_context_cannot_name() {
         let entry = module_with("m", &[("f", 1)]);
         // A function index outside the module's table is skipped, never invented.
-        assert!(Machine::new().raise_stacktrace(Some(&entry), 9, 0).is_empty());
+        assert!(Machine::new().raise_stacktrace(Some(&entry), 9, 0, None).is_empty());
 
         // A continuation in a context that was never registered is skipped too: the
         // address cannot be attributed to a module, so it is not named at all.
@@ -864,7 +928,7 @@ mod tests {
                 context: 9,
             })
             .unwrap();
-        let trace = machine.raise_stacktrace(Some(&entry), 0, 0);
+        let trace = machine.raise_stacktrace(Some(&entry), 0, 0, None);
         assert_eq!(trace.len(), 1, "only the raising function is named");
         assert_eq!(trace.frames[0].function.as_str(), "f");
     }
@@ -891,10 +955,10 @@ mod tests {
         machine.switch_context(id).unwrap();
 
         // With an entry module: the raising function (callee) and the caller.
-        assert_eq!(machine.raise_stacktrace(Some(&module_with("m", &[("f", 1)])), 0, 5).len(), 2);
+        assert_eq!(machine.raise_stacktrace(Some(&module_with("m", &[("f", 1)])), 0, 5, None).len(), 2);
         // Without one: the context-`0` caller frame is skipped, so only the callee's
         // frame remains — never named against the wrong module.
-        let trace = machine.raise_stacktrace(None, 0, 5);
+        let trace = machine.raise_stacktrace(None, 0, 5, None);
         assert_eq!(trace.len(), 1, "the context-0 caller is skipped");
         assert_eq!(trace.frames[0].module.as_str(), "c");
         assert_eq!(trace.frames[0].function.as_str(), "g");
@@ -987,7 +1051,7 @@ mod tests {
             .unwrap();
 
         // The very frames the funnel *would* have named for a program-level raise.
-        assert_eq!(machine.raise_stacktrace(Some(&entry), 1, 7).len(), 2);
+        assert_eq!(machine.raise_stacktrace(Some(&entry), 1, 7, None).len(), 2);
 
         // A diagnostic is returned byte-identically: same reason, empty trace.
         let diagnostic = error::unsupported("deallocate: frame size mismatch");

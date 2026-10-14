@@ -330,6 +330,12 @@ impl Machine {
         // cooked trace of the new run prepend an item no raise published).
         self.pending_callee_head = false;
         self.raise_head_item = false;
+        // The failed-clause argument list rides the same two latches, so a fresh run
+        // begins with neither armed: a stale list would make the first cooked trace of
+        // the new run render an argument list no raise in it published (and the term
+        // belongs to the run that raised, not to this one).
+        self.pending_function_clause_args = None;
+        self.raise_function_clause_args = None;
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).

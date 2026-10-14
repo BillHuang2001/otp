@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use beam_common::Result;
 use beam_loader::{Atom, Instr, LineEntry, Module, Operand};
-use beam_term::{make_atom, make_small, Eterm, NIL};
+use beam_term::{is_list, is_nil, make_atom, make_small, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -176,14 +176,24 @@ pub(crate) fn symbolic_stacktrace(
     }
     // Only the *shapes* are computed here: no BEAM-heap word is touched yet. A
     // skipped frame contributes no shape.
+    //
+    // The **failed clause's argument list** — a machine field the `function_clause`
+    // raise site armed (`Machine::pending_function_clause_args`) — belongs to the
+    // snapshot's FIRST frame (the raising frame, which is the one whose function
+    // contains the failed clause and is the only frame C gives an `args` slot to).
+    // It is taken here, once, so it can never leak into a later cooked trace; a frame
+    // the module/context cannot name consumes it all the same (there is no later
+    // frame it could belong to).
+    let mut failed_clause_args = machine.take_raise_function_clause_args();
     let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
     for ((_context, func, pc), owner) in frames.iter().zip(plan.iter()) {
+        let args = failed_clause_args.take();
         let owner_module: &Module = match owner {
             FrameOwner::EntryModule => entry_module,
             FrameOwner::Owned(index) => &owned[*index],
             FrameOwner::Skip => continue,
         };
-        shapes.push(item_shape(owner_module, *func, *pc)?);
+        shapes.push(item_shape(owner_module, *func, *pc, args)?);
     }
     // `2` words per list cell plus every item's own nodes — sized **before** the
     // reservation, because a collection under it relocates the machine's roots and
@@ -251,13 +261,15 @@ pub(crate) fn stacktrace_item(
     func: u32,
     pc: u32,
 ) -> Result<Eterm> {
-    let shape = item_shape(module, func, pc)?;
+    let shape = item_shape(module, func, pc, None)?;
     let mut sink = ContextSink::new(ctx);
     write_item(&mut sink, &shape)
 }
 
 /// The metadata **shape** of a stacktrace item: everything [`write_item`] needs to
-/// carve the node, and nothing that points into the BEAM heap.
+/// carve the node, and nothing that points into the BEAM heap — with **one**
+/// deliberate exception, the failed clause's argument list ([`ItemShape::args`]),
+/// which C's cooked item carries in its `A` slot in place of the arity.
 ///
 /// Holding the shape rather than a built term is what lets the caller size a whole
 /// graph before allocating (see the module docs).
@@ -266,23 +278,42 @@ struct ItemShape<'a> {
     module: Atom,
     /// The item's function atom (`{M,F,A}`'s `F`).
     function: Atom,
-    /// The item's arity (`{M,F,A}`'s `A`).
+    /// The item's arity (`{M,F,A}`'s `A`) — what the `A` slot holds for every frame
+    /// except the failed clause's own, which [`ItemShape::args`] replaces.
     arity: u32,
+    /// The **failed clause's argument list**, for the one frame whose function
+    /// contains the failed clause; `None` for every other frame.
+    ///
+    /// C's `erts_build_mfa_item` (`../../erts/emulator/beam/utils.c:3430-3457`) puts
+    /// the saved `args` in the `A` slot when it is a list/nil, and only the
+    /// `function_clause` raise site publishes one (see
+    /// `Machine::take_raise_function_clause_args`) — so the oracle reports
+    /// `{Mod, Fun, [Arg, …], Location}` for the failing function while every outer
+    /// frame keeps its declared arity.
+    ///
+    /// The elements are read out **before** the one reservation (the list is a
+    /// machine-held term, exactly like `Machine::pending_exception`'s reason), and the
+    /// list is re-carved into the reservation so the whole cooked trace is one region:
+    /// [`ItemShape::words`] charges `2` words per element and [`write_item`] carves
+    /// exactly that many.
+    args: Option<Vec<Eterm>>,
     /// The `Location` element's shape, or `None` for the empty list.
     location: Option<LocationShape<'a>>,
 }
 
 impl ItemShape<'_> {
     /// The exact number of words this item's nodes occupy:
-    /// the 4-element tuple (`5`) plus, when there is a location, the char list
-    /// (`2 * chars`), the `{file,File}` tuple (`3`), the `{line,N}` tuple (`3`) and
-    /// the 2-element outer list (`4`) — i.e. `2 * chars + 10`. A `None` location is
-    /// [`NIL`] and occupies nothing.
+    /// the 4-element tuple (`5`), the failed clause's argument list (`2` per element,
+    /// `0` when the `A` slot is the arity) plus, when there is a location, the char
+    /// list (`2 * chars`), the `{file,File}` tuple (`3`), the `{line,N}` tuple (`3`)
+    /// and the 2-element outer list (`4`) — i.e. `2 * chars + 10`. A `None` location
+    /// is [`NIL`] and occupies nothing.
     fn words(&self) -> usize {
-        5 + match &self.location {
-            Some(location) => 2 * location.file.chars().count() + 10,
-            None => 0,
-        }
+        5 + self.args.as_ref().map_or(0, |args| 2 * args.len())
+            + match &self.location {
+                Some(location) => 2 * location.file.chars().count() + 10,
+                None => 0,
+            }
     }
 }
 
@@ -303,6 +334,12 @@ struct LocationShape<'a> {
 /// The [`ItemShape`] for the function at index `func`, located at `pc` — metadata
 /// only, no allocation.
 ///
+/// `failed_clause_args` is the argument list C puts in this item's `A` slot **instead
+/// of** the arity, for the one frame whose function contains the failed clause (see
+/// [`ItemShape::args`]); it is `None` for every other frame. A term that is neither a
+/// proper list nor [`NIL`] is not an argument list at all and degrades to the arity,
+/// exactly C's `is_list(args) || is_nil(args)` test.
+///
 /// The shape borrows the module's `Line` chunk (the file name), so the caller must
 /// reserve and carve while that module is alive — which it is, since the reservation
 /// happens inside the same call.
@@ -310,15 +347,25 @@ struct LocationShape<'a> {
 /// A `func` index outside the module's function table is a typed `unsupported`,
 /// never a panic; a location the module cannot name (no `file`/`line` atom, a file
 /// index outside the `Line` chunk) degrades to the empty list exactly as before.
-fn item_shape(module: &Module, func: u32, pc: u32) -> Result<ItemShape<'_>> {
+fn item_shape(
+    module: &Module,
+    func: u32,
+    pc: u32,
+    failed_clause_args: Option<Eterm>,
+) -> Result<ItemShape<'_>> {
     let function = module
         .functions
         .get(func as usize)
         .ok_or_else(|| error::unsupported("build_stacktrace: function index out of range"))?;
+    let args = match failed_clause_args {
+        Some(list) if is_list(list) || is_nil(list) => Some(terms::list_elements(list)?),
+        _ => None,
+    };
     Ok(ItemShape {
         module: function.module,
         function: function.name,
         arity: function.arity,
+        args,
         location: location_shape(module, func, pc)?,
     })
 }
@@ -374,12 +421,14 @@ fn write_item(sink: &mut dyn Sink, shape: &ItemShape<'_>) -> Result<Eterm> {
         Some(location) => write_location(sink, location)?,
         None => NIL,
     };
-    sink.tuple(&[
-        make_atom(shape.module),
-        make_atom(shape.function),
-        make_small(shape.arity as i64),
-        location,
-    ])
+    // The `A` slot: the failed clause's argument list when this item is the one whose
+    // function contains the failed clause, else the declared arity. The carve is
+    // exactly the `2` words per element [`ItemShape::words`] charged.
+    let arity = match &shape.args {
+        Some(args) => sink.list(args)?,
+        None => make_small(shape.arity as i64),
+    };
+    sink.tuple(&[make_atom(shape.module), make_atom(shape.function), arity, location])
 }
 
 /// Carve `location`'s four nodes out of `sink` (see [`write_item`]).
