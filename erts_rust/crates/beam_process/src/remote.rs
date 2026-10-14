@@ -18,8 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! Remote-node (distributed) links and monitors: [`RemotePid`], [`PidTarget`],
-//! [`RemoteMonitor`], [`DistSignal`] and the [`DistSignalRouter`] seam.
+//! Remote-node (distributed) links and monitors: [`RemotePid`], [`RemoteRef`], [`PidTarget`],
+//! [`RemoteMonitor`], [`RemoteWatcher`], [`DistSignal`] and the [`DistSignalRouter`] seam.
 //!
 //! This module is the **local record** of a process's relationships with processes living on
 //! *other* nodes. A local pid is fully described by [`crate::pid::ProcessId`] (a table number
@@ -27,7 +27,9 @@
 //! 4-word thing `[header, node, creation, data]` whose `data` word holds two `u32`s (`number`,
 //! `serial`) and whose `node` slot holds the sysname atom term (see `beam_term::thing`).
 //! [`RemotePid`] decomposes that term into its stable parts so the table never retains a boxed
-//! pointer into another heap; [`RemotePid::to_eterm`] materialises it again on demand.
+//! pointer into another heap; [`RemotePid::to_eterm`] materialises it again on demand. A
+//! peer-minted **reference** (the `Ref` of an inbound `DOP_MONITOR_P`) gets the same treatment
+//! through [`RemoteRef`].
 //!
 //! # The distribution seam is a trait (anti-cycle)
 //!
@@ -83,8 +85,12 @@
 //! half — a `DOP_*` a peer sent us — is decoded by `beam_rt` (which owns the wire) and handed
 //! to [`ProcessTable`](crate::ptab::ProcessTable) as the *already-parsed* pieces
 //! (`ProcessTable::record_remote_link`, `apply_remote_exit_signal`,
-//! `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote`/`demonitor_from_remote`,
-//! `remote_monitor_down`, `set_group_leader_from_remote`).
+//! `unlink_from_remote`/`unlink_ack_from_remote`,
+//! `monitor_from_remote`/`monitor_from_remote_ref` +
+//! `demonitor_from_remote`/`demonitor_from_remote_ref`, `remote_monitor_down`,
+//! `set_group_leader_from_remote`). The `_ref` spellings are the ones an inbound
+//! `DOP_MONITOR_P`/`DOP_DEMONITOR_P` uses: their `Ref` is a **peer-minted external reference**,
+//! held as a [`RemoteRef`] (see [`RemoteWatcherRef`]).
 //!
 //! Those entry points are deliberately **separate** from the locally-initiated ones
 //! (`link_term`, `unlink_term`, `monitor_term`, `demonitor`, `send_exit_term`): the C's inbound
@@ -97,8 +103,9 @@
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{
-    external_pid_parts, external_pid_size_words, is_external_pid, is_internal_pid,
-    write_external_pid, Eterm,
+    arityval, boxed_val, external_pid_parts, external_pid_size_words, external_ref_parts,
+    external_ref_size_words, is_external_pid, is_external_ref, is_internal_pid,
+    write_external_pid, write_external_ref, Eterm, MAX_REF_IDS,
 };
 
 use crate::error;
@@ -181,6 +188,114 @@ impl RemotePid {
     }
 }
 
+/// A remote (external-node) **reference**, decomposed into its stable parts so no boxed
+/// pointer into another heap is retained.
+///
+/// `node` is the sysname atom term (an immediate, safe to hold long-term); `ids` are the
+/// 32-bit identifier words of the external-reference thing (at most [`MAX_REF_IDS`], copied
+/// out of the block's `data.ui32` section), `n_ids` the count actually in use and `creation`
+/// the node incarnation (see the module docs and `beam_term::thing`).
+///
+/// A peer mints the reference it puts in an inbound `DOP_MONITOR_P`, so its identity is the
+/// whole `(node, creation, ids[0..n_ids])` tuple — never a lossy `u64` image
+/// ([`RemoteWatcherRef`] keeps both spellings distinct).
+///
+/// # All-immediate, not a GC root
+///
+/// Every field is a plain value (the `node` is an atom immediate), so a `RemoteRef` is safe to
+/// hold for the record's whole life and adds **no** root to the collector — the same invariant
+/// [`RemotePid`] observes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RemoteRef {
+    node: Eterm,
+    ids: [u32; MAX_REF_IDS],
+    n_ids: u8,
+    creation: u32,
+}
+
+impl RemoteRef {
+    /// Decomposes an external reference term, rejecting every other term with `badarg`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `term` is not an external reference, or
+    /// when its self-describing id count does not fit its data section (a corrupt block is
+    /// refused rather than over-read).
+    pub fn from_eterm(term: Eterm) -> Result<RemoteRef> {
+        // SAFETY: `term` is a live term held by the runtime, so if it is boxed its header word
+        // is a live, aligned term word — exactly the precondition the predicate documents.
+        if !unsafe { is_external_ref(term) } {
+            return Err(error::bad_arg());
+        }
+        // The id count lives in the first `u32` of the data section and is used as a slice
+        // length, so it must be proven to fit that section *before* the raw reader trusts it.
+        // This mirrors `beam_codec::term::external_ref_parts`'s guard (which cannot be reused
+        // here: `beam_process` must not depend on the wire crate).
+        const REF_HEAD_WORDS: usize = 3; // `[header, node, next]`, `erl_term.h:1161`
+        let u32_per_word = core::mem::size_of::<usize>() / core::mem::size_of::<u32>();
+        // SAFETY: `is_external_ref` proved `term` is a boxed, live external-reference block, so
+        // its header word is in bounds and its data section starts at word `REF_HEAD_WORDS`.
+        let data_words = arityval(unsafe { *boxed_val(term) })
+            .checked_sub(REF_HEAD_WORDS - 1)
+            // A valid block always carries the count word, so a section smaller than one word is
+            // corrupt: refuse it rather than read a word the block does not have.
+            .filter(|&words| words >= 1)
+            .ok_or_else(error::bad_arg)?;
+        // SAFETY: the header arity fixes the block at `REF_HEAD_WORDS + data_words` words with
+        // `data_words >= 1`, so the first `u32` of its data section is a live, initialised word.
+        let n = unsafe { *boxed_val(term).add(REF_HEAD_WORDS).cast::<u32>() as usize };
+        if n > MAX_REF_IDS || n + 1 > data_words * u32_per_word {
+            return Err(error::bad_arg());
+        }
+        // SAFETY: `is_external_ref` plus the count/section guards prove `term` is a live
+        // external reference written by `write_external_ref` (`0 <= n <= MAX_REF_IDS` and the
+        // ids fit the data section), which is exactly that reader's precondition.
+        let (node, ids, creation) = unsafe { external_ref_parts(term) };
+        let mut out = [0u32; MAX_REF_IDS];
+        out[..ids.len()].copy_from_slice(ids);
+        Ok(RemoteRef {
+            node,
+            ids: out,
+            n_ids: ids.len() as u8,
+            creation,
+        })
+    }
+
+    /// The sysname atom term of the remote node.
+    pub fn node(&self) -> Eterm {
+        self.node
+    }
+
+    /// The identifier words actually in use (an empty slice for a zero-id reference).
+    pub fn ids(&self) -> &[u32] {
+        &self.ids[..self.n_ids as usize]
+    }
+
+    /// The remote node's creation.
+    pub fn creation(&self) -> u32 {
+        self.creation
+    }
+
+    /// Writes the external-reference thing on `heap` and returns the tagged term.
+    ///
+    /// The exact inverse of [`RemoteRef::from_eterm`], so a round-trip through a heap
+    /// reproduces the same parts.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`beam_common::BeamError::Alloc`] when `heap` cannot fit the block.
+    pub fn to_eterm(self, heap: &mut Heap) -> Result<Eterm> {
+        let ids = self.ids();
+        // SAFETY: `alloc_words` returns `external_ref_size_words(ids.len())` exclusively-owned,
+        // writable words, and `ids.len() <= MAX_REF_IDS` by construction.
+        let p = unsafe { heap.alloc_words(external_ref_size_words(ids.len()))? };
+        // SAFETY: `p` addresses exactly those words; `write_external_ref` writes every one of
+        // them before the pointer escapes this block, and `self.node` is an immediate/literal
+        // term owned by the runtime rather than by `heap`.
+        Ok(unsafe { write_external_ref(p, self.node, ids, self.creation) })
+    }
+}
+
 /// Whether a pid term names a local or a remote process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PidTarget {
@@ -222,14 +337,37 @@ pub struct RemoteMonitor {
     pub kind: MonitorKind,
 }
 
+/// The **reference identity** a [`RemoteWatcher`] is recorded under.
+///
+/// A monitor's `Ref` may be minted on *this* node (a locally initiated monitor's
+/// [`MonitorRef`], e.g. the reference a self-monitor of the local process would carry) or by the
+/// **peer** that sent the `DOP_MONITOR_P`. A peer-minted reference is a full external reference
+/// whose identity is `(node, creation, ids[0..n])`, which has no faithful `u64` image: a lossy
+/// pack could collapse two distinct remote monitors of one local process into a single record (a
+/// replaced watcher, or a `demonitor` that cancels the wrong monitor). Keeping the two spellings
+/// as distinct variants makes that collapse impossible.
+///
+/// # All-immediate, not a GC root
+///
+/// Both variants are all-immediate values ([`MonitorRef`] is a plain `u64` handle, [`RemoteRef`]
+/// decomposes the wire thing), so a watcher record stays collectible-safe — the side table is
+/// never scanned by the collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteWatcherRef {
+    /// A reference minted on this node (the bare-`u64` [`MonitorRef`] image).
+    Local(MonitorRef),
+    /// A peer-minted external reference, decomposed (`DOP_MONITOR_P`'s wire `Ref`).
+    Remote(RemoteRef),
+}
+
 /// An **incoming** remote monitor: a process on another node watching a **local** process or
 /// port — the mirror of [`RemoteMonitor`].
 ///
 /// It is the record an inbound `DOP_MONITOR_P` ({`DOP_MONITOR_P`, `Remote(watcher)`,
 /// `Local pid-or-name(watched)`, `Ref`}, `dist.c:2341`) installs, and an inbound
 /// `DOP_DEMONITOR_P` (`dist.c:2415`) removes. The record holds no term that can be relocated:
-/// [`RemotePid`] is a decomposed external pid (its `node` is an immediate) and the reference is
-/// a plain value, so it is not a GC root.
+/// [`RemotePid`] is a decomposed external pid, its [`RemoteWatcherRef`] is all-immediate (an
+/// internal [`MonitorRef`] or a decomposed [`RemoteRef`]), so it is not a GC root.
 ///
 /// It lives in a side table on
 /// [`ProcessTable`](crate::ptab::ProcessTable) rather than in
@@ -239,7 +377,7 @@ pub struct RemoteMonitor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteWatcher {
     /// The reference the watcher's `{'DOWN', …}` will carry.
-    pub reference: MonitorRef,
+    pub reference: RemoteWatcherRef,
     /// The watching remote process.
     pub watcher: RemotePid,
     /// Whether a process or a port is watched.

@@ -99,7 +99,8 @@ use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
 use crate::process::{CollectionGate, DeliverOutcome, Process, ProcessState};
 use crate::remote::{
-    DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid, RemoteWatcher,
+    DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid, RemoteRef, RemoteWatcher,
+    RemoteWatcherRef,
 };
 use crate::run_queue::Priority;
 use crate::signal::{
@@ -3291,17 +3292,19 @@ impl ProcessTable {
     /// `watched`.
     ///
     /// The record is a [`RemoteWatcher`] in the `remote_watchers` side table — the mirror of the
-    /// outgoing [`RemoteMonitor`] [`ProcessTable::monitor_term`] records. A record is keyed by its
-    /// reference, as the C keys its origin tree: a re-sent `DOP_MONITOR_P` for an already-recorded
-    /// reference changes no observable state (the C's `erts_monitor_dist_insert` fails on the
-    /// duplicate and the new monitor is released, `dist.c:2374-2378`; replacing in place is the
-    /// same from the outside). **Nothing is routed**: the C's arm ends `break; /* done */` once
-    /// the local monitor signal has been queued (`dist.c:2378-2381`), so no `DOP_MONITOR_P` goes
-    /// back.
+    /// outgoing [`RemoteMonitor`] [`ProcessTable::monitor_term`] records. A record is keyed by
+    /// its **whole reference identity** ([`RemoteWatcherRef`], see that type for why a bare
+    /// `u64` cannot hold a peer-minted wire reference): a re-sent `DOP_MONITOR_P` for an
+    /// already-recorded reference changes no observable state (the C's `erts_monitor_dist_insert`
+    /// fails on the duplicate and the new monitor is released, `dist.c:2374-2378`; replacing in
+    /// place is the same from the outside). **Nothing is routed**: the C's arm ends `break;
+    /// /* done */` once the local monitor signal has been queued (`dist.c:2378-2381`), so no
+    /// `DOP_MONITOR_P` goes back.
     ///
     /// The wire target may be a registered **name**; resolving the name and passing the resulting
     /// `ProcessId` here is `beam_rt`'s job (this crate decodes no wire term), so this takes the
-    /// resolved local pid.
+    /// resolved local pid. This spelling is for an **internal** [`MonitorRef`]; a peer-minted wire
+    /// reference goes through [`ProcessTable::monitor_from_remote_ref`].
     ///
     /// # Errors
     ///
@@ -3313,6 +3316,40 @@ impl ProcessTable {
         watched: ProcessId,
         watcher: RemotePid,
         reference: MonitorRef,
+        kind: MonitorKind,
+    ) -> Result<()> {
+        self.record_remote_watcher(watched, RemoteWatcherRef::Local(reference), watcher, kind)
+    }
+
+    /// Records an incoming `DOP_MONITOR_P` whose `Ref` is a **peer-minted external reference**
+    /// (the wire shape: the peer mints the reference, `dist.c:2341`), decomposed into a
+    /// [`RemoteRef`].
+    ///
+    /// Identical to [`ProcessTable::monitor_from_remote`] except for the reference identity it is
+    /// keyed by: a decomposed [`RemoteRef`] stores the peer's whole `(node, creation, ids)` —
+    /// no lossy `u64` pack, so two distinct peer references never collapse
+    /// ([`RemoteWatcherRef`]). Nothing is routed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `watched` is not a live local process.
+    pub fn monitor_from_remote_ref(
+        &mut self,
+        watched: ProcessId,
+        watcher: RemotePid,
+        reference: RemoteRef,
+        kind: MonitorKind,
+    ) -> Result<()> {
+        self.record_remote_watcher(watched, RemoteWatcherRef::Remote(reference), watcher, kind)
+    }
+
+    /// The shared body of the two `DOP_MONITOR_P` receipts: validates `watched`, then replaces or
+    /// pushes the [`RemoteWatcher`] keyed by `reference`.
+    fn record_remote_watcher(
+        &mut self,
+        watched: ProcessId,
+        reference: RemoteWatcherRef,
+        watcher: RemotePid,
         kind: MonitorKind,
     ) -> Result<()> {
         if !self.contains(watched) {
@@ -3335,9 +3372,11 @@ impl ProcessTable {
     /// pid-or-name(watched), Ref}` (`dist.c:2415`): the remote watcher cancels its monitor of
     /// the local `watched`.
     ///
-    /// Removes the matching [`RemoteWatcher`]. Removing a reference that is not recorded is an
-    /// `Ok(())` no-op (the record could already be gone). **Nothing is routed** — the C's arm
-    /// only cancels the local record and answers nothing.
+    /// Removes the matching [`RemoteWatcher`] by its whole reference identity. Removing a
+    /// reference that is not recorded is an `Ok(())` no-op (the record could already be gone).
+    /// **Nothing is routed** — the C's arm only cancels the local record and answers nothing.
+    /// This spelling is for an **internal** [`MonitorRef`]; a peer-minted wire reference goes
+    /// through [`ProcessTable::demonitor_from_remote_ref`].
     ///
     /// # Errors
     ///
@@ -3346,6 +3385,35 @@ impl ProcessTable {
         &mut self,
         watched: ProcessId,
         reference: MonitorRef,
+    ) -> Result<()> {
+        self.remove_remote_watcher(watched, RemoteWatcherRef::Local(reference))
+    }
+
+    /// Applies an incoming `DOP_DEMONITOR_P` whose `Ref` is a **peer-minted external reference**,
+    /// decomposed into a [`RemoteRef`] (`dist.c:2415`).
+    ///
+    /// Identical to [`ProcessTable::demonitor_from_remote`] except that it matches the peer's
+    /// whole reference identity — so a `demonitor` cancels exactly the monitor the matching
+    /// `DOP_MONITOR_P` installed, never a different one under a collapsing `u64` pack. Nothing is
+    /// routed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `watched` is not a live local process.
+    pub fn demonitor_from_remote_ref(
+        &mut self,
+        watched: ProcessId,
+        reference: RemoteRef,
+    ) -> Result<()> {
+        self.remove_remote_watcher(watched, RemoteWatcherRef::Remote(reference))
+    }
+
+    /// The shared body of the two `DOP_DEMONITOR_P` receipts: validates `watched`, then `retain`s
+    /// out the [`RemoteWatcher`] matching `reference`, dropping the entry once it is empty.
+    fn remove_remote_watcher(
+        &mut self,
+        watched: ProcessId,
+        reference: RemoteWatcherRef,
     ) -> Result<()> {
         if !self.contains(watched) {
             return Err(error::unknown_process());
@@ -3364,7 +3432,7 @@ impl ProcessTable {
     }
 
     /// The **incoming** remote monitors recorded for `watched` — the remote processes that
-    /// monitor it (an inbound `DOP_MONITOR_P` per entry).
+    /// monitor it (an inbound `DOP_MONITOR_P` per entry, keyed by its [`RemoteWatcherRef`]).
     ///
     /// A pid that is no longer live resolves to nothing, the same rule
     /// [`ProcessTable::remote_links`] applies.

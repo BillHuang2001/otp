@@ -42,11 +42,11 @@
 //! straight into the public [`LocalDeliverySink`] over a **standalone**
 //! [`ProcessTable`], pinning the routing table one family at a time — each routed
 //! family by its delivered effect (the ordinary message families by a mailbox
-//! delivery, the link/exit/unlink/monitor-down/group-leader signal families by the
-//! **route-free receipt** state they install) and each still-unrouted family by its
-//! honest `Unsupported`. A receipt family installs (or drops) its local record and
-//! echoes nothing, so a recording [`DistSignalRouter`] proves the whole set leaves
-//! the wire untouched.
+//! delivery, the link/exit/unlink/monitor/demonitor/monitor-down/group-leader signal
+//! families by the **route-free receipt** state they install) and each still-unrouted
+//! family by its honest `Unsupported`. A receipt family installs (or drops) its local
+//! record and echoes nothing, so a recording [`DistSignalRouter`] proves the whole set
+//! leaves the wire untouched.
 //!
 //! Small integers are used as the payload wherever the exact term matters: unlike
 //! atoms (whose raw encoding is table-local), a small integer is its own immediate
@@ -68,7 +68,7 @@ use beam_dist::{
 };
 use beam_process::{
     DistSignal, DistSignalRouter, MonitorKind, PidTarget, ProcessId, ProcessTable, RemotePid,
-    SignalAtoms, UnaliasMode,
+    RemoteRef, RemoteWatcher, RemoteWatcherRef, SignalAtoms, UnaliasMode,
 };
 use beam_rt::dist::LocalDeliverySink;
 use beam_rt::{Runtime, RuntimeConfig};
@@ -1758,23 +1758,24 @@ fn a_monitor_down_for_our_own_outgoing_reference_fires_or_is_dropped() {
     );
 }
 
-/// A remote watcher's own monitor is still unrouted: the receipt `RemoteWatcher` is keyed
-/// by a bare `u64` that a peer-minted wire reference has no faithful image of, so both the
-/// monitor and its demonitor are the honest `Unsupported` and record nothing.
+/// A remote watcher's own monitor is **routed**: the peer-minted wire reference is decomposed into
+/// a [`RemoteRef`] and the [`RemoteWatcher`] record is keyed by its whole identity — so two
+/// distinct peer references of one local process coexist (no lossy `u64` collapse) and each
+/// demonitor cancels exactly its own. The C's inbound arms install/remove the local record and
+/// answer nothing (`dist.c:2341`/`:2415`).
 #[test]
-fn an_inbound_monitor_or_demonitor_is_the_honest_unsupported() {
+fn an_inbound_monitor_and_demonitor_install_and_remove_a_remote_watcher() {
     let mut fixture = Fixture::new();
     let node = fixture.local_node;
     let pid = fixture.pid;
     let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
     let watcher = foreign_pid(&fixture, &mut heap, 3);
-    let reference = make_external_ref(
-        &mut heap,
-        make_atom(fixture.foreign_node),
-        &[1u32, 2u32, 3u32],
-        CLIENT_CREATION,
-    )
-    .expect("a peer-minted reference image");
+    let watcher_pid = RemotePid::from_eterm(watcher).expect("decompose the watcher pid");
+
+    let reference =
+        make_external_ref(&mut heap, make_atom(fixture.foreign_node), &[1, 2, 3], CLIENT_CREATION)
+            .expect("a peer-minted reference");
+    let expected_ref = RemoteRef::from_eterm(reference).expect("decompose the reference");
 
     let monitor = Delivery::Monitor {
         watcher,
@@ -1783,14 +1784,44 @@ fn an_inbound_monitor_or_demonitor_is_the_honest_unsupported() {
     };
     assert_eq!(
         route(&mut fixture.table, node, &monitor),
-        DeliveryOutcome::Unsupported,
-        "a peer-minted monitor reference has no faithful local key"
+        DeliveryOutcome::Delivered,
+        "a peer monitor of a live local process is recorded"
+    );
+    assert_eq!(
+        fixture.table.remote_watchers(pid),
+        &[RemoteWatcher {
+            reference: RemoteWatcherRef::Remote(expected_ref),
+            watcher: watcher_pid,
+            kind: MonitorKind::Process,
+        }],
+        "the record is keyed by the whole peer-minted reference"
     );
     assert!(
-        fixture.table.remote_watchers(pid).is_empty(),
-        "an unsupported monitor must record nothing"
+        mailbox(&fixture.table, pid).is_empty(),
+        "installing a remote watcher delivers no message"
     );
 
+    // A second monitor with a **different** peer reference coexists — no collapse.
+    let second =
+        make_external_ref(&mut heap, make_atom(fixture.foreign_node), &[1, 2, 4], CLIENT_CREATION)
+            .expect("a second peer reference");
+    let second_ref = RemoteRef::from_eterm(second).expect("decompose the second reference");
+    let second_monitor = Delivery::Monitor {
+        watcher,
+        watched: pid.to_eterm(),
+        reference: second,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &second_monitor),
+        DeliveryOutcome::Delivered
+    );
+    assert_eq!(
+        fixture.table.remote_watchers(pid).len(),
+        2,
+        "both peer references coexist"
+    );
+
+    // The demonitor for the first removes exactly that one.
     let demonitor = Delivery::Demonitor {
         watcher,
         watched: pid.to_eterm(),
@@ -1798,9 +1829,54 @@ fn an_inbound_monitor_or_demonitor_is_the_honest_unsupported() {
     };
     assert_eq!(
         route(&mut fixture.table, node, &demonitor),
-        DeliveryOutcome::Unsupported
+        DeliveryOutcome::Delivered,
+        "the matching demonitor removes its record"
     );
-    assert!(mailbox(&fixture.table, pid).is_empty());
+    assert_eq!(
+        fixture.table.remote_watchers(pid),
+        &[RemoteWatcher {
+            reference: RemoteWatcherRef::Remote(second_ref),
+            watcher: watcher_pid,
+            kind: MonitorKind::Process,
+        }],
+        "only the demonitored reference goes"
+    );
+
+    // A name-targeted monitor resolves through the table's name registry.
+    let name = fixture.atoms.intern("delivery-monitor-name");
+    fixture.table.register(name, pid).expect("register the name");
+    let by_name = Delivery::Monitor {
+        watcher,
+        watched: make_atom(name),
+        reference: make_external_ref(
+            &mut heap,
+            make_atom(fixture.foreign_node),
+            &[9, 9, 9],
+            CLIENT_CREATION,
+        )
+        .expect("a name-targeted peer reference"),
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &by_name),
+        DeliveryOutcome::Delivered,
+        "a registered name is a valid DOP_MONITOR_P target"
+    );
+    assert_eq!(fixture.table.remote_watchers(pid).len(), 2);
+
+    // An unregistered name is the honest NoSuchProcess (the C replies noproc).
+    let unregistered = Delivery::Monitor {
+        watcher,
+        watched: make_atom(fixture.atoms.intern("nobody-holds-me")),
+        reference,
+    };
+    assert_eq!(
+        route(&mut fixture.table, node, &unregistered),
+        DeliveryOutcome::NoSuchProcess
+    );
+    assert!(
+        mailbox(&fixture.table, pid).is_empty(),
+        "no monitor-family delivery may have enqueued a message"
+    );
 }
 
 /// An inbound `DOP_GROUP_LEADER` installs the remote `from` as the local `to`'s group
@@ -1884,6 +1960,10 @@ fn every_routed_inbound_family_routes_nothing_outbound() {
     }));
 
     let directed = pid.to_eterm();
+    // A peer-minted reference for the monitor family: recording it must route nothing.
+    let peer_ref =
+        make_external_ref(&mut heap, make_atom(fixture.foreign_node), &[5, 6, 7], CLIENT_CREATION)
+            .expect("a peer-minted reference");
     let families = [
         Delivery::Link {
             from: peer,
@@ -1915,6 +1995,16 @@ fn every_routed_inbound_family_routes_nothing_outbound() {
             reason: normal,
             token: None,
         },
+        Delivery::Monitor {
+            watcher: peer,
+            watched: directed,
+            reference: peer_ref,
+        },
+        Delivery::Demonitor {
+            watcher: peer,
+            watched: directed,
+            reference: peer_ref,
+        },
         Delivery::MonitorExit {
             watched: peer,
             watcher: directed,
@@ -1942,11 +2032,11 @@ fn every_routed_inbound_family_routes_nothing_outbound() {
 
 // --- the escalation list ----------------------------------------------------
 
-/// **One row per remaining unrouted family**: after the link/exit/unlink/monitor-down/
-/// group-leader receipt families were routed, the families `beam_process` still has no
-/// route-free counterpart for are the honest `Unsupported` — never a substituted
-/// message, never a dropped signal. This pins the escalation list so a future change
-/// must flip a row on purpose rather than by accident.
+/// **One row per remaining unrouted family**: after the link/exit/unlink/monitor/demonitor/
+/// monitor-down/group-leader receipt families were routed, the families `beam_process` still has
+/// no route-free counterpart for are the honest `Unsupported` — never a substituted message,
+/// never a dropped signal. This pins the escalation list so a future change must flip a row on
+/// purpose rather than by accident.
 #[test]
 fn every_unrouted_family_is_the_honest_unsupported() {
     let mut fixture = Fixture::new();
@@ -1956,21 +2046,7 @@ fn every_unrouted_family_is_the_honest_unsupported() {
     let target = pid.to_eterm();
     let aux = make_small(2);
 
-    let rows: [(Dop, Delivery); 5] = [
-        // A remote watcher: a monitor's origin side is a local pid here, and the receipt
-        // `RemoteWatcher` is keyed by a bare `u64` `MonitorRef` that a peer-minted wire
-        // reference has no faithful image of (a lossy pack could collapse two remote
-        // monitors into one record).
-        (Dop::MonitorP, Delivery::Monitor {
-            watcher: sender,
-            watched: target,
-            reference: aux,
-        }),
-        (Dop::DemonitorP, Delivery::Demonitor {
-            watcher: sender,
-            watched: target,
-            reference: aux,
-        }),
+    let rows: [(Dop, Delivery); 3] = [
         // The distributed-spawn family: a CLI process serves no spawn requests and
         // holds no spawn reservations.
         (Dop::SpawnRequest, Delivery::SpawnRequest {

@@ -113,7 +113,7 @@ use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
 use beam_dist::{AltactSigFlags, Delivery, DeliveryOutcome, Dispatched, InboundSink};
 use beam_dist::TcpListener;
-use beam_process::{MonitorRef, PidTarget, ProcessId, ProcessTable, RemotePid};
+use beam_process::{MonitorKind, MonitorRef, PidTarget, ProcessId, ProcessTable, RemotePid, RemoteRef};
 use beam_term::prelude::{
     atom_val, is_atom, is_immediate, is_small, make_atom, signed_value, Atom, Eterm,
 };
@@ -806,6 +806,11 @@ pub const NONODE_NAME: &str = "nonode@nohost";
 ///   (`DOP_EXIT`/`DOP_EXIT2`, `dist.c:2760`/`:2824`), with `untrappable` selecting the
 ///   link-exit vs `erlang:exit/2` family;
 /// * [`Delivery::UnlinkIdAck`] (the ack **consumption** half of the OTP-26+ handshake);
+/// * [`Delivery::Monitor`]/[`Delivery::Demonitor`] (`DOP_MONITOR_P`/`DOP_DEMONITOR_P`,
+///   `dist.c:2341`/`:2415`): a peer's monitor of a local pid-or-name is recorded as a
+///   [`RemoteWatcher`](beam_process::RemoteWatcher) keyed by the whole **peer-minted wire
+///   reference** ([`RemoteRef`](beam_process::RemoteRef)), and its demonitor removes exactly
+///   that record (see [`LocalDeliverySink::monitor`]);
 /// * [`Delivery::MonitorExit`]/[`Delivery::PayloadMonitorExit`]
 ///   (`DOP_MONITOR_P_EXIT`, `dist.c:2700-2714`) for a DOWN whose reference is one
 ///   **this** node minted (see [`LocalDeliverySink::wire_monitor_ref_id`]);
@@ -816,10 +821,11 @@ pub const NONODE_NAME: &str = "nonode@nohost";
 /// channel to emit, so that case reports the typed
 /// [`DeliveryOutcome::Unsupported`] for the wire half (see its arm).
 ///
-/// **Not routed** — [`Delivery::Monitor`]/[`Delivery::Demonitor`] (a peer-minted
-/// reference has no faithful `u64` key, see their arm), the distributed-spawn family
-/// and [`Delivery::Other`] are reported as [`DeliveryOutcome::Unsupported`], with the
-/// still-missing sibling API named at each match arm.
+/// **Not routed** — the distributed-spawn family and [`Delivery::Other`] are reported as
+/// [`DeliveryOutcome::Unsupported`], with the still-missing sibling API named at each
+/// match arm. (The `DOP_MONITOR_P_EXIT`-on-local-death echo a recorded
+/// [`RemoteWatcher`](beam_process::RemoteWatcher) would owe its peer is a separate
+/// **outbound** concern, still unimplemented and out of this sink's scope.)
 ///
 /// Every unrouted arm is *structural*, not incidental: routing one through the nearest
 /// *locally-initiated* `beam_process` entry point (`link_term`/`monitor_term`/`…`) would
@@ -949,23 +955,31 @@ impl InboundSink for LocalDeliverySink<'_> {
             // A **remote watcher** monitoring a local process/name
             // (`DOP_MONITOR_P`/`DOP_DEMONITOR_P`, `dist.c:2341`/`:2415`).
             //
-            // The receipt API exists (`monitor_from_remote(watched, watcher,
-            // reference, kind)` / `demonitor_from_remote(watched, reference)`), but it
-            // keys the `RemoteWatcher` by a bare `u64` `MonitorRef`, and the reference a
-            // **peer** puts on the wire is one *it* minted: a full external reference
-            // whose identity is `(node, creation, ids[0..3])`. No injective `u64` image
-            // of that exists, and a lossy pack would be a wrong result — two remote
-            // monitors of one local process could collapse into one `RemoteWatcher`
-            // record (a replaced watcher, or a `demonitor` that cancels the wrong
-            // monitor). The full reference is needed for a second reason too: when the
-            // watched process dies, the `DOP_MONITOR_P_EXIT` owed to each watcher must
-            // carry that watcher's own reference back, which a collapsed `u64` cannot
-            // reconstruct. Still-missing API: a `RemoteWatcher` (and its
-            // `demonitor_from_remote`) keyed by the **whole** wire reference, or one
-            // carrying the watcher's `RemotePid`.
-            Delivery::Monitor { .. } | Delivery::Demonitor { .. } => {
-                Ok(DeliveryOutcome::Unsupported)
-            }
+            // The C's inbound arms only install (respectively, remove) the **local record**:
+            // `DOP_MONITOR_P` creates the monitor and queues the local monitor signal, then
+            // `break; /* done */` (`dist.c:2341-2381`), and `DOP_DEMONITOR_P` sends the local
+            // demonitor signal and answers nothing (`dist.c:2415-2460`). Neither echoes its own
+            // opcode, so neither may go through a *locally-initiated* entry point
+            // (`monitor_term`/`demonitor`, which route a `DOP_*`).
+            //
+            // The reference a **peer** puts on the wire is one *it* minted — a full external
+            // reference whose identity is `(node, creation, ids[0..n])`. It is decomposed into a
+            // `RemoteRef` and the record is keyed by the whole identity, so two distinct peer
+            // monitors of one local process never collapse (a replaced watcher, or a `demonitor`
+            // that cancels the wrong monitor). `beam_process::RemoteRef::from_eterm` is the safe
+            // decoder — the `unsafe` block reader stays confined to `beam_process` — and a term
+            // that is not a well-formed external reference is outside this opcode's wire contract:
+            // `Unsupported`.
+            Delivery::Monitor {
+                watcher,
+                watched,
+                reference,
+            } => self.monitor(*watcher, *watched, *reference),
+            Delivery::Demonitor {
+                watcher,
+                watched,
+                reference,
+            } => self.demonitor(*watcher, *watched, *reference),
 
             // A monitor **DOWN** from a remote target (`DOP_MONITOR_P_EXIT` /
             // `DOP_PAYLOAD_MONITOR_P_EXIT`, `dist.c:2700-2714`). This is the **inverse**
@@ -1369,6 +1383,94 @@ impl LocalDeliverySink<'_> {
         receipt(self.table.set_group_leader_from_remote(pid, remote))
     }
 
+    /// Applies an inbound `DOP_MONITOR_P` — `{DOP_MONITOR_P, Remote(watcher), Local
+    /// pid-or-name(watched), Ref}` (`dist.c:2341`): records the `watcher`'s monitor of the local
+    /// `watched`. Routes nothing (the C's arm ends `break; /* done */` once the local monitor
+    /// signal is queued).
+    ///
+    /// `watched` is the C's `local pid or name` slot: an internal pid (or an external pid of
+    /// *this* node, the shape the decoder materialises) resolves through
+    /// [`LocalDeliverySink::resolve_live`], and a registered **name** through the table's name
+    /// registry (`erts_whereis_name_to_id`, `dist.c:2353-2360`) — an unregistered name is the
+    /// honest [`DeliveryOutcome::NoSuchProcess`] (the C replies `noproc`, a wire artifact this
+    /// sink owes no channel for).
+    ///
+    /// The wire `watcher` must be an external pid and the wire `Ref` a peer-minted external
+    /// reference; anything else is outside this opcode's wire contract and reported
+    /// [`DeliveryOutcome::Unsupported`]. The reference is decomposed into a
+    /// [`RemoteRef`](beam_process::RemoteRef) and stored whole, so the record is faithful — a
+    /// later demonitor matches exactly this reference (see [`LocalDeliverySink::demonitor`]).
+    ///
+    /// `DOP_MONITOR_P` is a **process** monitor on the wire, so the record's kind is
+    /// [`MonitorKind::Process`](beam_process::MonitorKind).
+    fn monitor(&mut self, watcher: Eterm, watched: Eterm, reference: Eterm) -> Result<DeliveryOutcome> {
+        let pid = match self.resolve_watched(watched) {
+            Ok(pid) => pid,
+            Err(outcome) => return Ok(outcome),
+        };
+        let Some(watcher) = remote_pid(watcher) else {
+            return Ok(DeliveryOutcome::Unsupported);
+        };
+        // A term that is not a well-formed external reference (`is_not_ref` in the C,
+        // `dist.c:2350`) is outside the opcode's contract; the per-link validator owns the
+        // connection-level answer.
+        let Ok(reference) = RemoteRef::from_eterm(reference) else {
+            return Ok(DeliveryOutcome::Unsupported);
+        };
+        receipt(
+            self.table
+                .monitor_from_remote_ref(pid, watcher, reference, MonitorKind::Process),
+        )
+    }
+
+    /// Applies an inbound `DOP_DEMONITOR_P` — `{DOP_DEMONITOR_P, Remote(watcher), Local
+    /// pid-or-name(watched), Ref}` (`dist.c:2415`): removes the `watch`er's record under
+    /// `reference`. Routes nothing (the C's arm answers nothing).
+    ///
+    /// The same resolution as [`LocalDeliverySink::monitor`]: `watched` is a local pid / this
+    /// node's external pid / a registered name; the wire `watcher` must be an external pid and the
+    /// wire `Ref` a peer-minted external reference. Removal matches the reference by its **whole**
+    /// decomposed identity, so it cancels exactly the monitor the matching `DOP_MONITOR_P`
+    /// installed, never a different one.
+    fn demonitor(
+        &mut self,
+        watcher: Eterm,
+        watched: Eterm,
+        reference: Eterm,
+    ) -> Result<DeliveryOutcome> {
+        let pid = match self.resolve_watched(watched) {
+            Ok(pid) => pid,
+            Err(outcome) => return Ok(outcome),
+        };
+        // The demonitor key is `(watched, ref)` — the C still validates the `watcher` is an
+        // external pid on the peer's dist entry (`dist.c:2424`), so a bogus one is outside the
+        // wire contract rather than a silent removal.
+        if remote_pid(watcher).is_none() {
+            return Ok(DeliveryOutcome::Unsupported);
+        }
+        let Ok(reference) = RemoteRef::from_eterm(reference) else {
+            return Ok(DeliveryOutcome::Unsupported);
+        };
+        receipt(self.table.demonitor_from_remote_ref(pid, reference))
+    }
+
+    /// Resolves the `watched` slot of the monitor family: a local pid (or this node's external
+    /// pid) through [`LocalDeliverySink::resolve_live`], or a registered **name** through the
+    /// table's process-name registry.
+    ///
+    /// An unregistered name, a pid of another node and a stale incarnation of this one are all
+    /// [`DeliveryOutcome::NoSuchProcess`] — the C replies `noproc` for the first two
+    /// (`dist.c:2353-2362`, `erl_proc_sig_queue.c`) and drops the stale-pid case. A term that is
+    /// neither a pid nor an atom is outside the wire contract: [`DeliveryOutcome::Unsupported`].
+    fn resolve_watched(&self, watched: Eterm) -> std::result::Result<ProcessId, DeliveryOutcome> {
+        if is_atom(watched) {
+            return match self.table.whereis(atom_val(watched)) {
+                Some(pid) => Ok(pid),
+                None => Err(DeliveryOutcome::NoSuchProcess),
+            };
+        }
+        self.resolve_live(watched)
+    }
     /// Applies an inbound `DOP_MONITOR_P_EXIT`/`DOP_PAYLOAD_MONITOR_P_EXIT`: resolves the
     /// **local** `watcher`'s outgoing remote monitor under `reference` and delivers the
     /// `{'DOWN', …}` — without routing any `DOP_DEMONITOR_P` back (the C's arm queues

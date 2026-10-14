@@ -85,13 +85,16 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
 16. `remote.rs` — an external pid links/monitors via the same table entry points, is recorded
     separately, and every change is handed to a recording `DistSignalRouter`; `node_down` resolves then
     purges.
-16b. `remote_inbound.rs` (25 tests) — the **inbound (receipt)** half of the distribution
+16b. `remote_inbound.rs` (29 tests) — the **inbound (receipt)** half of the distribution
     link/monitor/exit/unlink/group-leader families: every new `ProcessTable` primitive
     (`record_remote_link`, `apply_remote_exit_signal` for both the link-exit and the `exit/2`
     families, `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote`/
-    `demonitor_from_remote`/`remote_watchers`, `remote_monitor_down`, `set_group_leader_from_remote`/
-    `group_leader`, `next_reference`) applies its local effect and routes **nothing** — the recording
-    router staying empty is the proof of the C's non-echoing receipt arms (`dist.c:2258`).
+    `monitor_from_remote_ref`/`demonitor_from_remote`/`demonitor_from_remote_ref`/`remote_watchers`,
+    `remote_monitor_down`, `set_group_leader_from_remote`/`group_leader`, `next_reference`) applies
+    its local effect and routes **nothing** — the recording router staying empty is the proof of the
+    C's non-echoing receipt arms (`dist.c:2258`). The `_ref` spellings key a `RemoteWatcher` by the
+    whole peer-minted reference (a decomposed `RemoteRef`), so two distinct peer references never
+    collapse; `RemoteRef::from_eterm`/`to_eterm` round-trips and rejects a non-reference with `badarg`.
     `a_link_exit_traps_for_every_reason_including_normal_and_kill` pins that the link-exit family
     traps **every** reason (the `killed` rewrite is confined to `op == ERTS_SIG_Q_OP_EXIT`), so a
     trapping receiver takes `{'EXIT', RemotePid, normal|kill|Other}` verbatim with the recorded link
@@ -604,6 +607,5 @@ SMP pool:
   when `erl` is absent); their driver is the shared `common/mod.rs`
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `remote_inbound.rs` → the inbound (receipt) half of the same families: the route-free `ProcessTable`
-  entry points (non-echoing by construction), pinned with a recording `DistSignalRouter`
-- `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
+  entry points (non-echoing by construction), pinned with a recording `DistSignalRouter`- `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
   `../src/smp/CONTEXT.md`)
