@@ -55,6 +55,27 @@
 //! order and the fact that a total is an integer — and never the volatile byte totals. The
 //! tracing/`seq_trace` observability and the `halt` argument check below likewise **agree**
 //! on both sides and pin the shared surface.
+//!
+//! # `fun_info`, the wider `system_info` keys, bulk `process_info` and `statistics` (A.8)
+//!
+//! Three more veins of host-independent introspection, each verified to **agree** with the
+//! oracle:
+//!
+//! * **`erlang:fun_info/1,2`** (ids under the `fun_info/` prefix) — the arity/type/module/name/env
+//!   of an *external* fun, a *BIF* fun and a *local fun literal*, in both the `element(2, …)`
+//!   extraction form and the `{Key, Value}` tuple form. Only the fields whose answer is a
+//!   structural property of the fun are pinned; the identity fields (`uniq`, `new_index`, `index`,
+//!   `new_uniq`) and a local fun's `env` are **not** (they legitimately differ).
+//! * **the wider `system_info/1` build/state keys** — `update_cpu_info`, `break_ignored`,
+//!   `multi_scheduling(_blockers)`, `emu_type`, `lock_checking`, `port_parallelism`,
+//!   `scheduler_bind_type`, `min_heap_size`, `min_bin_vheap_size`, `dist`, the `{allocator, …}`
+//!   instance lists and `allocated_areas` (list *shape* only — its sizes are volatile). Each is a
+//!   frozen build constant, a documented default, or a type assertion.
+//! * **bulk `process_info/1`** — the no-item-list form returns *a list* whose membership/value for
+//!   the documented items is pinned (`priority` `normal`, `message_queue_len`, `total_heap_size`),
+//!   never its order or length; plus the tagged `max_heap_size` item.
+//! * **`erlang:statistics/1`** — the `runtime` tuple's *shape* (`{Total, SinceLast}`, both integers)
+//!   and `run_queue`'s integer type. The clock *values* are volatile and never pinned.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -666,6 +687,306 @@ pub(crate) fn group() -> Vec<Case> {
             "seq_trace:set_token(print, true)",
             "ok false",
         ),
+        case(
+            "fun_info/external_fun_arity",
+            "fun_info/2 arity of an external fun is its declared arity (1)",
+            "element(2, erlang:fun_info(fun lists:reverse/1, arity))",
+            "ok 1",
+        ),
+        case(
+            "fun_info/external_fun_type",
+            "fun_info/2 type of an external fun is the atom external",
+            "element(2, erlang:fun_info(fun lists:reverse/1, type))",
+            "ok external",
+        ),
+        case(
+            "fun_info/external_fun_module",
+            "fun_info/2 module of an external fun names its defining module",
+            "element(2, erlang:fun_info(fun lists:reverse/1, module))",
+            "ok lists",
+        ),
+        case(
+            "fun_info/external_fun_name",
+            "fun_info/2 name of an external fun is its exported function name",
+            "element(2, erlang:fun_info(fun lists:reverse/1, name))",
+            "ok reverse",
+        ),
+        case(
+            "fun_info/external_fun_env_is_empty",
+            "fun_info/2 env of an external fun carries no free variables",
+            "element(2, erlang:fun_info(fun lists:reverse/1, env))",
+            "ok []",
+        ),
+        case(
+            "fun_info/external_fun_arity_three",
+            "fun_info/2 arity reports 3 for an arity-3 external fun",
+            "element(2, erlang:fun_info(fun lists:seq/3, arity))",
+            "ok 3",
+        ),
+        case(
+            "fun_info/external_fun_module_three",
+            "fun_info/2 module of an arity-3 external fun is its defining module",
+            "element(2, erlang:fun_info(fun lists:seq/3, module))",
+            "ok lists",
+        ),
+        case(
+            "fun_info/bif_module",
+            "fun_info/2 module of a BIF fun is the erlang module",
+            "element(2, erlang:fun_info(fun erlang:abs/1, module))",
+            "ok erlang",
+        ),
+        case(
+            "fun_info/bif_name",
+            "fun_info/2 name of a BIF fun is the BIF name",
+            "element(2, erlang:fun_info(fun erlang:abs/1, name))",
+            "ok abs",
+        ),
+        case(
+            "fun_info/bif_arity",
+            "fun_info/2 arity of a BIF fun is its declared arity",
+            "element(2, erlang:fun_info(fun erlang:abs/1, arity))",
+            "ok 1",
+        ),
+        case(
+            "fun_info/bif_env_is_empty",
+            "fun_info/2 env of a BIF fun carries no free variables",
+            "element(2, erlang:fun_info(fun erlang:abs/1, env))",
+            "ok []",
+        ),
+        case(
+            "fun_info/bif_type_is_external",
+            "fun_info/2 type of a BIF fun is external",
+            "element(2, erlang:fun_info(fun erlang:abs/1, type))",
+            "ok external",
+        ),
+        case(
+            "fun_info/local_fun_unary_arity",
+            "fun_info/2 arity of a local fun literal is its declared arity",
+            "element(2, erlang:fun_info(fun (X) -> X + 1 end, arity))",
+            "ok 1",
+        ),
+        case(
+            "fun_info/local_fun_unary_type",
+            "fun_info/2 type of a local fun literal is the atom local",
+            "element(2, erlang:fun_info(fun (X) -> X + 1 end, type))",
+            "ok local",
+        ),
+        case(
+            "fun_info/local_fun_binary_arity",
+            "fun_info/2 arity of an arity-2 local fun literal is 2",
+            "element(2, erlang:fun_info(fun (A,B) -> {A,B} end, arity))",
+            "ok 2",
+        ),
+        case(
+            "fun_info/local_fun_binary_type",
+            "fun_info/2 type of an arity-2 local fun literal is local",
+            "element(2, erlang:fun_info(fun (A,B) -> {A,B} end, type))",
+            "ok local",
+        ),
+        case(
+            "fun_info/maps_get_name",
+            "fun_info/2 name of the maps:get/2 external fun is get",
+            "element(2, erlang:fun_info(fun maps:get/2, name))",
+            "ok get",
+        ),
+        case(
+            "fun_info/erlang_system_info_name",
+            "fun_info/2 name of the system_info/1 BIF fun is system_info",
+            "element(2, erlang:fun_info(fun erlang:system_info/1, name))",
+            "ok system_info",
+        ),
+        case(
+            "fun_info/erlang_system_info_module",
+            "fun_info/2 module of the system_info/1 BIF fun is erlang",
+            "element(2, erlang:fun_info(fun erlang:system_info/1, module))",
+            "ok erlang",
+        ),
+        case(
+            "fun_info/tuple_form_arity",
+            "fun_info/2 returns an {arity, A} tuple",
+            "erlang:fun_info(fun lists:reverse/1, arity)",
+            "ok {arity,1}",
+        ),
+        case(
+            "fun_info/tuple_form_type",
+            "fun_info/2 returns a {type, external} tuple for an external fun",
+            "erlang:fun_info(fun lists:reverse/1, type)",
+            "ok {type,external}",
+        ),
+        case(
+            "fun_info/tuple_form_name",
+            "fun_info/2 returns a {name, F} tuple",
+            "erlang:fun_info(fun lists:reverse/1, name)",
+            "ok {name,reverse}",
+        ),
+        case(
+            "fun_info/tuple_form_module",
+            "fun_info/2 returns a {module, M} tuple",
+            "erlang:fun_info(fun lists:reverse/1, module)",
+            "ok {module,lists}",
+        ),
+        case(
+            "fun_info/tuple_form_env",
+            "fun_info/2 returns an {env, []} tuple for an external fun",
+            "erlang:fun_info(fun lists:reverse/1, env)",
+            "ok {env,[]}",
+        ),
+        case(
+            "fun_info/bif_tuple_form_name",
+            "fun_info/2 on a BIF fun returns a {name, F} tuple",
+            "erlang:fun_info(fun erlang:self/0, name)",
+            "ok {name,self}",
+        ),
+        case(
+            "system_info/update_cpu_info",
+            "system_info(update_cpu_info) reports the frozen unchanged default",
+            "erlang:system_info(update_cpu_info)",
+            "ok unchanged",
+        ),
+        case(
+            "system_info/break_ignored",
+            "system_info(break_ignored) reports the frozen false default",
+            "erlang:system_info(break_ignored)",
+            "ok false",
+        ),
+        case(
+            "system_info/multi_scheduling",
+            "system_info(multi_scheduling) reports scheduling as enabled on a mult-core-capable build",
+            "erlang:system_info(multi_scheduling)",
+            "ok enabled",
+        ),
+        case(
+            "system_info/multi_scheduling_blockers",
+            "system_info(multi_scheduling_blockers) lists no blockers for an idle VM",
+            "erlang:system_info(multi_scheduling_blockers)",
+            "ok []",
+        ),
+        case(
+            "system_info/emu_type",
+            "system_info(emu_type) is opt for an optimised emulator build",
+            "erlang:system_info(emu_type)",
+            "ok opt",
+        ),
+        case(
+            "system_info/lock_checking",
+            "system_info(lock_checking) reports the runtime lock-checking mode as false",
+            "erlang:system_info(lock_checking)",
+            "ok false",
+        ),
+        case(
+            "system_info/port_parallelism",
+            "system_info(port_parallelism) reports the port-parallelism default as false",
+            "erlang:system_info(port_parallelism)",
+            "ok false",
+        ),
+        case(
+            "system_info/scheduler_bind_type",
+            "system_info(scheduler_bind_type) is unbound without a scheduler-bind flag",
+            "erlang:system_info(scheduler_bind_type)",
+            "ok unbound",
+        ),
+        case(
+            "system_info/min_heap_size",
+            "system_info(min_heap_size) is the frozen default minimum heap size proplist",
+            "erlang:system_info(min_heap_size)",
+            "ok {min_heap_size,233}",
+        ),
+        case(
+            "system_info/min_bin_vheap_size",
+            "system_info(min_bin_vheap_size) is the frozen default virtual-binary-heap proplist",
+            "erlang:system_info(min_bin_vheap_size)",
+            "ok {min_bin_vheap_size,46422}",
+        ),
+        case(
+            "system_info/dist_is_encoded_nonode",
+            "system_info(dist) encodes the non-distributed node identity of an unconnected VM",
+            "erlang:system_info(dist)",
+            "ok <<61,110,111,100,101,58,39,110,111,110,111,100,101,64,110,111,104,111,115,116,39,10,61,110,111,95,100,105,115,116,114,105,98,117,116,105,111,110,10>>",
+        ),
+        case(
+            "system_info/allocator_binary_info_is_list",
+            "system_info({allocator, binary_alloc}) is a list of allocator instances",
+            "is_list(erlang:system_info({allocator, binary_alloc}))",
+            "ok true",
+        ),
+        case(
+            "system_info/allocator_eheap_info_is_list",
+            "system_info({allocator, eheap_alloc}) is a list of allocator instances",
+            "is_list(erlang:system_info({allocator, eheap_alloc}))",
+            "ok true",
+        ),
+        case(
+            "system_info/allocated_areas_is_list",
+            "system_info(allocated_areas) is a list of area entries (its sizes are volatile)",
+            "is_list(erlang:system_info(allocated_areas))",
+            "ok true",
+        ),
+        case(
+            "system_info/dirty_cpu_schedulers_online_is_integer",
+            "system_info(dirty_cpu_schedulers_online) is an integer count",
+            "is_integer(erlang:system_info(dirty_cpu_schedulers_online))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_bulk_returns_list",
+            "process_info(self()) with no item list returns the full bulk item list",
+            "is_list(erlang:process_info(self()))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_bulk_has_priority",
+            "the bulk process_info(self()) list contains the priority item",
+            "lists:keymember(priority, 1, erlang:process_info(self()))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_bulk_has_message_queue_len",
+            "the bulk process_info(self()) list contains the message_queue_len item",
+            "lists:keymember(message_queue_len, 1, erlang:process_info(self()))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_bulk_priority_value",
+            "the bulk process_info(self()) list carries priority normal",
+            "lists:keyfind(priority, 1, erlang:process_info(self()))",
+            "ok {priority,normal}",
+        ),
+        case(
+            "system_info/process_info_bulk_has_total_heap_size",
+            "the bulk process_info(self()) list contains the total_heap_size item",
+            "lists:keymember(total_heap_size, 1, erlang:process_info(self()))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_max_heap_size_is_tagged",
+            "process_info(self(), max_heap_size) is tagged by its own key",
+            "element(1, erlang:process_info(self(), max_heap_size))",
+            "ok max_heap_size",
+        ),
+        case(
+            "system_info/statistics_runtime_is_tuple",
+            "erlang:statistics(runtime) is a tuple",
+            "is_tuple(erlang:statistics(runtime))",
+            "ok true",
+        ),
+        case(
+            "system_info/statistics_runtime_is_two_tuple",
+            "erlang:statistics(runtime) is a two-element {Total, SinceLast} tuple",
+            "tuple_size(erlang:statistics(runtime))",
+            "ok 2",
+        ),
+        case(
+            "system_info/statistics_runtime_total_is_integer",
+            "the total runtime in erlang:statistics(runtime) is an integer",
+            "is_integer(element(1, erlang:statistics(runtime)))",
+            "ok true",
+        ),
+        case(
+            "system_info/statistics_run_queue_is_integer",
+            "erlang:statistics(run_queue) is an integer count",
+            "is_integer(erlang:statistics(run_queue))",
+            "ok true",
+        ),
     ]
 }
 
@@ -683,8 +1004,8 @@ mod tests {
         for case in group() {
             assert_eq!(case.contracts, &[Contract::Introspection], "case {}", case.id);
             assert!(
-                case.id.starts_with("system_info/"),
-                "case {} is outside the system_info group",
+                case.id.starts_with("system_info/") || case.id.starts_with("fun_info/"),
+                "case {} is outside the documented A.8 introspection prefixes",
                 case.id
             );
             assert!(!case.description.is_empty(), "case {}", case.id);
@@ -765,6 +1086,83 @@ mod tests {
             assert_eq!(case.golden.stdout, Some("exception error badarg"), "case {id}");
             assert_eq!(case.golden.exit_code, 1, "case {id}");
             assert_eq!(case.expr(), Some(expr), "case {id}");
+        }
+    }
+
+    /// The `fun_info/` + extended `system_info`/`process_info`/`statistics` block: each case pins a
+    /// structural property of the fun, a frozen build constant, a documented default, or a type —
+    /// never a per-VM figure, a fun identity field, a volatile clock value, or a mailbox order.
+    #[test]
+    fn the_fun_info_and_extended_block_pins_structural_facts() {
+        let golden = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+                .expect("a golden")
+        };
+        // `fun_info`: external / BIF / local funs, extraction and tuple forms.
+        for (id, want) in [
+            ("fun_info/external_fun_arity", "ok 1"),
+            ("fun_info/external_fun_type", "ok external"),
+            ("fun_info/external_fun_module", "ok lists"),
+            ("fun_info/external_fun_name", "ok reverse"),
+            ("fun_info/external_fun_env_is_empty", "ok []"),
+            ("fun_info/bif_module", "ok erlang"),
+            ("fun_info/bif_name", "ok abs"),
+            ("fun_info/local_fun_unary_arity", "ok 1"),
+            ("fun_info/local_fun_unary_type", "ok local"),
+            ("fun_info/local_fun_binary_arity", "ok 2"),
+            ("fun_info/maps_get_name", "ok get"),
+            ("fun_info/tuple_form_arity", "ok {arity,1}"),
+            ("fun_info/tuple_form_type", "ok {type,external}"),
+            ("fun_info/tuple_form_name", "ok {name,reverse}"),
+            ("fun_info/tuple_form_module", "ok {module,lists}"),
+            ("fun_info/tuple_form_env", "ok {env,[]}"),
+            ("fun_info/bif_tuple_form_name", "ok {name,self}"),
+        ] {
+            assert_eq!(golden(id), want, "case {id}");
+        }
+        // The extended `system_info` keys: frozen defaults, documented state, list/integer shapes.
+        for (id, want) in [
+            ("system_info/update_cpu_info", "ok unchanged"),
+            ("system_info/break_ignored", "ok false"),
+            ("system_info/multi_scheduling", "ok enabled"),
+            ("system_info/multi_scheduling_blockers", "ok []"),
+            ("system_info/emu_type", "ok opt"),
+            ("system_info/lock_checking", "ok false"),
+            ("system_info/port_parallelism", "ok false"),
+            ("system_info/scheduler_bind_type", "ok unbound"),
+            ("system_info/min_heap_size", "ok {min_heap_size,233}"),
+            ("system_info/min_bin_vheap_size", "ok {min_bin_vheap_size,46422}"),
+            ("system_info/allocator_binary_info_is_list", "ok true"),
+            ("system_info/allocator_eheap_info_is_list", "ok true"),
+            ("system_info/allocated_areas_is_list", "ok true"),
+            ("system_info/dirty_cpu_schedulers_online_is_integer", "ok true"),
+        ] {
+            assert_eq!(golden(id), want, "case {id}");
+        }
+        // Bulk `process_info/1`: membership/value only, never the order or the length.
+        for (id, want) in [
+            ("system_info/process_info_bulk_returns_list", "ok true"),
+            ("system_info/process_info_bulk_has_priority", "ok true"),
+            ("system_info/process_info_bulk_has_message_queue_len", "ok true"),
+            ("system_info/process_info_bulk_priority_value", "ok {priority,normal}"),
+            ("system_info/process_info_bulk_has_total_heap_size", "ok true"),
+            ("system_info/process_info_max_heap_size_is_tagged", "ok max_heap_size"),
+        ] {
+            assert_eq!(golden(id), want, "case {id}");
+        }
+        // `statistics/1`: shape and type only, never the volatile clock values.
+        for (id, want) in [
+            ("system_info/statistics_runtime_is_tuple", "ok true"),
+            ("system_info/statistics_runtime_is_two_tuple", "ok 2"),
+            ("system_info/statistics_runtime_total_is_integer", "ok true"),
+            ("system_info/statistics_run_queue_is_integer", "ok true"),
+        ] {
+            assert_eq!(golden(id), want, "case {id}");
         }
     }
 }

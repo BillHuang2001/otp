@@ -62,6 +62,17 @@
 //! so the case pins only that the opt-in does **not** perturb observable semantics for an
 //! allocation that really grows the process heap (the runtime has no CLI or `system_info`
 //! surface for the strategy; `beam_rt`'s `tests/gc_strategy.rs` pins the selector itself).
+//!
+//! The widened recording surface at the end of this file (`flags/hidden_*` … `flags/plus_s_one_*`)
+//! pins the remaining command-line shapes of A.6: a recognized distribution/launcher switch with
+//! no value (`-hidden`) or one value (`-remsh`/`-connect_all`/`-smp`/`-start_epmd`/`-mode`); the
+//! `-s` and `-run` Start instructions, which are consumed before `init` exactly as `-eval` is (so
+//! `init:get_argument/1` answers `error` for their names); a second application-env flag
+//! (`-mnesia K V`); the value-list boundary (a value list ends at the *next switch*, including a
+//! `+`-flag); flag-name spelling (`=` is kept verbatim in the name, a name may contain `.`, names
+//! are case-sensitive); empty values; `-kernel` given twice; the interleaved `-pa`/`-pz`
+//! occurrence order; and the documented `+P`/`+Q`/`+S` minima. Every golden is the live oracle's
+//! output (OTP 29.1.1 / erts-17.1), verified with `differential run <id>`.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.6 cases: the `-noshell` flag and an arbitrary user flag.
@@ -1005,6 +1016,445 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the widened recording surface: recognized switches, Start instructions, name
+        // --- spelling, value-list boundaries, and the +P/+Q/+S minima ----------------------
+        // A recognized switch that takes no value is still an *occurrence*: `-hidden` (a
+        // distribution switch) is recorded as the valueless occurrence `[]`, exactly like an
+        // unknown bare `-flag`. A recognized switch that *does* take a value registers it as a
+        // single element of that occurrence's value list.
+        Case {
+            id: "flags/hidden_switch_is_a_valueless_occurrence",
+            description: "the valueless -hidden distribution switch is recorded as an empty occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(hidden)",
+                extra_argv: &["-hidden"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/remsh_switch_value",
+            description: "the -remsh launcher switch is recorded with its node name",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(remsh)",
+                extra_argv: &["-remsh", "foo"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[102,111,111]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/connect_all_switch_value",
+            description: "the -connect_all distribution switch is recorded with its boolean value",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(connect_all)",
+                extra_argv: &["-connect_all", "false"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[102,97,108,115,101]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/smp_enable_switch_value",
+            description: "the -smp scheduler-model switch is recorded with its (accepted) value",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(smp)",
+                extra_argv: &["-smp", "enable"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[101,110,97,98,108,101]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/start_epmd_switch_value",
+            description: "the -start_epmd launcher switch is recorded with its boolean value",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(start_epmd)",
+                extra_argv: &["-start_epmd", "false"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[102,97,108,115,101]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/mode_interactive_switch_value",
+            description: "the alternative -mode interactive start-up mode is recorded verbatim",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(mode)",
+                extra_argv: &["-mode", "interactive"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[105,110,116,101,114,97,99,116,105,118,101]]]}"),
+                exit_code: 0,
+            },
+        },
+        // `-s MOD FUNC [ARG…]` and `-run MOD FUNC [ARG…]` are **Start instructions** consumed by
+        // `init` in argv order, exactly like `-eval`: `init` never records them, so
+        // `init:get_argument/1` answers `error` for their names. `init get_argument ok` is a
+        // harmless target (its result is discarded) that keeps the runtime booting to the probe.
+        Case {
+            id: "flags/s_instruction_is_not_an_init_argument",
+            description: "the -s Start instruction is consumed before init and is not recorded",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(s)",
+                extra_argv: &["-s", "init", "get_argument", "ok"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/run_instruction_is_not_an_init_argument",
+            description: "the -run Start instruction is consumed before init and is not recorded",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(run)",
+                extra_argv: &["-run", "init", "get_argument", "ok"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        // An application-env flag is not special to `kernel`: any `-app key value` form is
+        // recorded under the application name with both tokens as its values.
+        Case {
+            id: "flags/mnesia_application_env_flag_is_recorded",
+            description: "an `-mnesia key value` application-env flag is recorded with both values",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(mnesia)",
+                extra_argv: &["-mnesia", "dump_log_write_threshold", "100"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {ok,[[[100,117,109,112,95,108,111,103,95,119,114,105,116,101,95,116,104,\
+                     114,101,115,104,111,108,100],[49,48,48]]]}",
+                ),
+                exit_code: 0,
+            },
+        },
+        // The value-list boundary: an occurrence's values are the following non-switch tokens,
+        // so the next switch (of any kind) ends the list -- `-dif_b` here, `+K` in the next case.
+        Case {
+            id: "flags/value_list_stops_at_the_next_switch",
+            description: "an occurrence collects only the tokens up to the next switch",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_boundary_a)",
+                extra_argv: &[
+                    "-differential_boundary_a",
+                    "one",
+                    "two",
+                    "-differential_boundary_b",
+                    "three",
+                ],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[111,110,101],[116,119,111]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/switch_after_a_value_list_records_its_own_value",
+            description: "the switch that ended the previous value list is recorded with its own value",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_boundary_b)",
+                extra_argv: &[
+                    "-differential_boundary_a",
+                    "one",
+                    "two",
+                    "-differential_boundary_b",
+                    "three",
+                ],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[116,104,114,101,101]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/value_list_stops_at_an_emulator_flag",
+            description: "a +-flag also ends an init argument's value list",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_boundary_e)",
+                extra_argv: &["-differential_boundary_e", "one", "+K", "true"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[111,110,101]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/kernel_flag_twice_is_two_occurrences",
+            description: "an application-env flag given twice is two occurrences, each with its pair",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(kernel)",
+                extra_argv: &["-kernel", "k1", "v1", "-kernel", "k2", "v2"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[107,49],[118,49]],[[107,50],[118,50]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/kernel_flag_with_a_single_value",
+            description: "an application-env flag with a lone key is recorded as one value",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(kernel)",
+                extra_argv: &["-kernel", "onlykey"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[111,110,108,121,107,101,121]]]}"),
+                exit_code: 0,
+            },
+        },
+        // Flag-name spelling: `=` does **not** split a switch (the whole `-dif_eq=v` is the flag
+        // name), so `-dif_eq=v` is one *valueless* occurrence under the name `'dif_eq=v'` while a
+        // separate `=v` token is an ordinary value. An unknown flag key may contain `.`, and
+        // keys are case-sensitive (an uppercase `-DIF` is not the lowercase `dif` key).
+        Case {
+            id: "flags/equals_in_a_flag_name_is_not_split",
+            description: "an `-flag=value` token is one valueless occurrence named `flag=value`",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('differential_eq=v')",
+                extra_argv: &["-differential_eq=v"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/equals_prefixed_value_is_recorded_verbatim",
+            description: "an `=value` token is an ordinary value with the `=` kept",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_eq)",
+                extra_argv: &["-differential_eq", "=v"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[61,118]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/a_flag_key_may_contain_a_dot",
+            description: "an unknown flag key may contain a dot and is recorded verbatim",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('differential.key')",
+                extra_argv: &["-differential.key", "v"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[118]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/a_flag_key_is_case_sensitive",
+            description: "an uppercase -DIF switch is not the lowercase `dif` key",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(dif)",
+                extra_argv: &["-DIF", "v"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        // Empty values: an occurrence may carry an empty value, alone or beside a non-empty one.
+        Case {
+            id: "flags/empty_string_value_is_recorded",
+            description: "an empty-string value is recorded as one empty value element",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_empty)",
+                extra_argv: &["-differential_empty", ""],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/empty_and_nonempty_values_in_one_occurrence",
+            description: "one occurrence may hold an empty value beside a non-empty one",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_empty)",
+                extra_argv: &["-differential_empty", "", "x"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[],[120]]]}"),
+                exit_code: 0,
+            },
+        },
+        // A bare flag immediately followed by a *valued* flag: the first is the valueless
+        // occurrence `[]` and the second owns the following token.
+        Case {
+            id: "flags/bare_flag_before_a_valued_flag",
+            description: "a bare flag before a valued flag stays a valueless occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_bare_a)",
+                extra_argv: &["-differential_bare_a", "-differential_bare_b", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/value_after_a_bare_flag_belongs_to_that_flag",
+            description: "the token after a bare flag belongs to the following valued flag",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_bare_b)",
+                extra_argv: &["-differential_bare_a", "-differential_bare_b", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[104,101,108,108,111]]]}"),
+                exit_code: 0,
+            },
+        },
+        // Interleaving `-pz` between `-pa` occurrences must neither join the `-pa` list nor
+        // reorder it: each switch keeps its own occurrences, in argv order.
+        Case {
+            id: "flags/interleaved_pa_occurrences_keep_order",
+            description: "interleaved -pz switches leave the -pa occurrences in argv order",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pa)",
+                extra_argv: &["-pa", "/a", "-pz", "/z", "-pa", "/b", "-pz", "/w", "-pa", "/c"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[47,97]],[[47,98]],[[47,99]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/interleaved_pz_occurrences_keep_order",
+            description: "interleaved -pa switches leave the -pz occurrences in argv order",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pz)",
+                extra_argv: &["-pa", "/a", "-pz", "/z", "-pa", "/b", "-pz", "/w", "-pa", "/c"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[47,122]],[[47,119]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/nonadjacent_occurrences_keep_argv_order",
+            description: "non-adjacent occurrences of one flag are recorded in argv order",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_spread)",
+                extra_argv: &[
+                    "-differential_spread",
+                    "1",
+                    "-differential_other",
+                    "2",
+                    "-differential_spread",
+                    "3",
+                ],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[49]],[[51]]]}"),
+                exit_code: 0,
+            },
+        },
+        // The documented *minima* of the sizing flags: `+P` and `+Q` accept 1024, and `+S 1`
+        // pins the online scheduler count deterministically (no host CPU count leaks in).
+        Case {
+            id: "flags/plus_p_sets_the_minimum_process_limit",
+            description: "the +P emulator flag accepts its documented minimum (1024)",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(process_limit)",
+                extra_argv: &["+P", "1024"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1024"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_q_sets_the_minimum_port_limit",
+            description: "the +Q emulator flag accepts its documented minimum (1024)",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &["+Q", "1024"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1024"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_s_one_sets_schedulers_online",
+            description: "the +S emulator flag sets the observable online scheduler count",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(schedulers_online)",
+                extra_argv: &["+S", "1"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1405,6 +1855,234 @@ mod tests {
                 matches!(case.kind, CaseKind::EvalEnv { .. }),
                 "case {id}: an environment case is an EvalEnv"
             );
+        }
+    }
+
+    /// The second half of the widened recording surface: the recognized valueless/valued
+    /// switches (`-hidden`/`-remsh`/`-connect_all`/`-smp`/`-start_epmd`/`-mode`), the `-s`/`-run`
+    /// Start instructions, the second application-env flag (`-mnesia`), the value-list boundary,
+    /// flag-name spelling (a verbatim `=`, a dotted key, case sensitivity), empty values, the
+    /// interleaved `-pa`/`-pz` order,
+    /// and the `+P`/`+Q`/`+S` minima. Each new case pins the live oracle's answer for **its own**
+    /// argv, so a parser regression surfaces on its own case instead of only through the umbrella
+    /// shape assertion above.
+    #[test]
+    fn the_widened_recording_surface_pins_the_oracle_recording() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+        for (id, argv, expr, golden) in [
+            (
+                "flags/hidden_switch_is_a_valueless_occurrence",
+                &["-hidden"][..],
+                "init:get_argument(hidden)",
+                "ok {ok,[[]]}",
+            ),
+            (
+                "flags/remsh_switch_value",
+                &["-remsh", "foo"][..],
+                "init:get_argument(remsh)",
+                "ok {ok,[[[102,111,111]]]}",
+            ),
+            (
+                "flags/connect_all_switch_value",
+                &["-connect_all", "false"][..],
+                "init:get_argument(connect_all)",
+                "ok {ok,[[[102,97,108,115,101]]]}",
+            ),
+            (
+                "flags/smp_enable_switch_value",
+                &["-smp", "enable"][..],
+                "init:get_argument(smp)",
+                "ok {ok,[[[101,110,97,98,108,101]]]}",
+            ),
+            (
+                "flags/start_epmd_switch_value",
+                &["-start_epmd", "false"][..],
+                "init:get_argument(start_epmd)",
+                "ok {ok,[[[102,97,108,115,101]]]}",
+            ),
+            (
+                "flags/mode_interactive_switch_value",
+                &["-mode", "interactive"][..],
+                "init:get_argument(mode)",
+                "ok {ok,[[[105,110,116,101,114,97,99,116,105,118,101]]]}",
+            ),
+            (
+                "flags/s_instruction_is_not_an_init_argument",
+                &["-s", "init", "get_argument", "ok"][..],
+                "init:get_argument(s)",
+                "ok error",
+            ),
+            (
+                "flags/run_instruction_is_not_an_init_argument",
+                &["-run", "init", "get_argument", "ok"][..],
+                "init:get_argument(run)",
+                "ok error",
+            ),
+            (
+                "flags/mnesia_application_env_flag_is_recorded",
+                &["-mnesia", "dump_log_write_threshold", "100"][..],
+                "init:get_argument(mnesia)",
+                "ok {ok,[[[100,117,109,112,95,108,111,103,95,119,114,105,116,101,95,116,104,114,\
+                 101,115,104,111,108,100],[49,48,48]]]}",
+            ),
+            (
+                "flags/value_list_stops_at_the_next_switch",
+                &[
+                    "-differential_boundary_a",
+                    "one",
+                    "two",
+                    "-differential_boundary_b",
+                    "three",
+                ][..],
+                "init:get_argument(differential_boundary_a)",
+                "ok {ok,[[[111,110,101],[116,119,111]]]}",
+            ),
+            (
+                "flags/switch_after_a_value_list_records_its_own_value",
+                &[
+                    "-differential_boundary_a",
+                    "one",
+                    "two",
+                    "-differential_boundary_b",
+                    "three",
+                ][..],
+                "init:get_argument(differential_boundary_b)",
+                "ok {ok,[[[116,104,114,101,101]]]}",
+            ),
+            (
+                "flags/value_list_stops_at_an_emulator_flag",
+                &["-differential_boundary_e", "one", "+K", "true"][..],
+                "init:get_argument(differential_boundary_e)",
+                "ok {ok,[[[111,110,101]]]}",
+            ),
+            (
+                "flags/kernel_flag_twice_is_two_occurrences",
+                &["-kernel", "k1", "v1", "-kernel", "k2", "v2"][..],
+                "init:get_argument(kernel)",
+                "ok {ok,[[[107,49],[118,49]],[[107,50],[118,50]]]}",
+            ),
+            (
+                "flags/kernel_flag_with_a_single_value",
+                &["-kernel", "onlykey"][..],
+                "init:get_argument(kernel)",
+                "ok {ok,[[[111,110,108,121,107,101,121]]]}",
+            ),
+            (
+                "flags/equals_in_a_flag_name_is_not_split",
+                &["-differential_eq=v"][..],
+                "init:get_argument('differential_eq=v')",
+                "ok {ok,[[]]}",
+            ),
+            (
+                "flags/equals_prefixed_value_is_recorded_verbatim",
+                &["-differential_eq", "=v"][..],
+                "init:get_argument(differential_eq)",
+                "ok {ok,[[[61,118]]]}",
+            ),
+            (
+                "flags/a_flag_key_may_contain_a_dot",
+                &["-differential.key", "v"][..],
+                "init:get_argument('differential.key')",
+                "ok {ok,[[[118]]]}",
+            ),
+            (
+                "flags/a_flag_key_is_case_sensitive",
+                &["-DIF", "v"][..],
+                "init:get_argument(dif)",
+                "ok error",
+            ),
+            (
+                "flags/empty_string_value_is_recorded",
+                &["-differential_empty", ""][..],
+                "init:get_argument(differential_empty)",
+                "ok {ok,[[[]]]}",
+            ),
+            (
+                "flags/empty_and_nonempty_values_in_one_occurrence",
+                &["-differential_empty", "", "x"][..],
+                "init:get_argument(differential_empty)",
+                "ok {ok,[[[],[120]]]}",
+            ),
+            (
+                "flags/bare_flag_before_a_valued_flag",
+                &["-differential_bare_a", "-differential_bare_b", "hello"][..],
+                "init:get_argument(differential_bare_a)",
+                "ok {ok,[[]]}",
+            ),
+            (
+                "flags/value_after_a_bare_flag_belongs_to_that_flag",
+                &["-differential_bare_a", "-differential_bare_b", "hello"][..],
+                "init:get_argument(differential_bare_b)",
+                "ok {ok,[[[104,101,108,108,111]]]}",
+            ),
+            (
+                "flags/interleaved_pa_occurrences_keep_order",
+                &["-pa", "/a", "-pz", "/z", "-pa", "/b", "-pz", "/w", "-pa", "/c"][..],
+                "init:get_argument(pa)",
+                "ok {ok,[[[47,97]],[[47,98]],[[47,99]]]}",
+            ),
+            (
+                "flags/interleaved_pz_occurrences_keep_order",
+                &["-pa", "/a", "-pz", "/z", "-pa", "/b", "-pz", "/w", "-pa", "/c"][..],
+                "init:get_argument(pz)",
+                "ok {ok,[[[47,122]],[[47,119]]]}",
+            ),
+            (
+                "flags/nonadjacent_occurrences_keep_argv_order",
+                &[
+                    "-differential_spread",
+                    "1",
+                    "-differential_other",
+                    "2",
+                    "-differential_spread",
+                    "3",
+                ][..],
+                "init:get_argument(differential_spread)",
+                "ok {ok,[[[49]],[[51]]]}",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the recorded argv");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(
+                case.env().is_empty(),
+                "case {id}: a command-line switch is not an env case"
+            );
+        }
+
+        // The three sizing-flag *minima* are observable through `system_info/1`, so they carry
+        // the A.8 contract beside A.6.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/plus_p_sets_the_minimum_process_limit",
+                &["+P", "1024"][..],
+                "erlang:system_info(process_limit)",
+                "ok 1024",
+            ),
+            (
+                "flags/plus_q_sets_the_minimum_port_limit",
+                &["+Q", "1024"][..],
+                "erlang:system_info(port_limit)",
+                "ok 1024",
+            ),
+            (
+                "flags/plus_s_one_sets_schedulers_online",
+                &["+S", "1"][..],
+                "erlang:system_info(schedulers_online)",
+                "ok 1",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(
+                case.contracts,
+                &[Contract::Cli, Contract::Introspection],
+                "{id}"
+            );
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the emulator flag");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(case.env().is_empty(), "case {id}: a +-flag is not an env case");
         }
     }
 }
