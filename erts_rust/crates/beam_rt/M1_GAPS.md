@@ -433,6 +433,69 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `the_cli_boot_registers_a_live_logger_process`), `--test a9_native_floor` (1:
   `script_id_is_the_loaded_boot_scripts_real_header`). Mechanism:
   [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+* **`beam_bifs` — the registered `io:format/2` `~p`/`~w` printer raises `badarg` on any term carrying a
+  fun.** The registered `io:format/2` implementation is `erts_rust/crates/beam_bifs/src/io.rs`, driven by
+  `src/format.rs`, and a fun is not renderable there. Raw evidence, the same command on both runtimes:
+  `beam_rt -noshell -eval 'io:format("~p~n",[fun lists:reverse/1]),halt(0).'` → `beam_rt: badarg`, exit 1,
+  vs the oracle's `fun lists:reverse/1`, exit 0; and
+  `beam_rt -noshell -eval 'io:format("~p~n",[[{k,fun lists:reverse/1}]]),halt(0).'` → `beam_rt: badarg`,
+  exit 1, vs the oracle's `[{k,fun lists:reverse/1}]`, exit 0. The fun itself is sound — `erlang:make_fun/3`
+  and `fun M:F/A` both work, only printing fails, and the failure is catchable
+  (`catch io:format(...)` → `{'EXIT',badarg}`). Owner: `erts_rust/crates/beam_bifs`.
+* **`beam_engine` — `catch Expr` drops the `{Reason, Stacktrace}` pair ERTS appends to a class-`error`
+  exception.** ERTS' `catch_end` (`erts/emulator/beam/emu/instrs.tab`, `add_stacktrace`) appends the
+  stacktrace to an `error` reason and skips the append only for `exit`; the `Instr::CatchEnd` arm's `else`
+  branch (`erts_rust/crates/beam_engine/src/families/exceptions/mod.rs:207-248`, lines 221-245) builds
+  `{'EXIT',Reason}` for **both** classes and never calls the stacktrace builder. Raw evidence on the
+  scheduled `run` route: `(catch erlang:error(ereason))` → runtime `{'EXIT',ereason}`, oracle
+  `{'EXIT',{ereason,[{cls,run,0,[{file,…},{line,4}]},…]}}`; `catch throw(_)`, `catch exit(_)` and
+  `catch erlang:raise(exit,…)` all agree. A `try … catch C:R:S` binds the right `S` (that path uses
+  `Instr::BuildStacktrace`), so the divergence is specific to `catch Expr`. It is the documented M1 omission
+  in `beam_engine/src/families/exceptions/CONTEXT.md` and is pinned by
+  `beam_engine/tests/exceptions.rs::old_style_catch_builds_the_exit_tuple_without_a_stacktrace`.
+  Owner: `erts_rust/crates/beam_engine`.
+* **`beam_engine` — a stacktrace's top frame is duplicated (the same `{M,F,A}` at two adjacent lines).**
+  `Machine::throw_with_trace` (`erts_rust/crates/beam_engine/src/machine/catch.rs:318-324`) pushes the
+  raising frame from `Machine::current_code()` and then again from `Machine::resumption_contexts()`
+  (`machine/frames.rs:316-325`), which re-yields that same function with its stale call-site CP; the same
+  duplication is in `Machine::raise_stacktrace` (`machine/catch.rs:480-503`). Raw evidence:
+  `try _ = inner(), erlang:error(badarg) catch error:_R:S2 -> S2 end` → oracle
+  `[{probe,dup,0,[{file,…},{line,15}]}, …]`, engine
+  `[{probe,dup,0,[{file,…},{line,15}]}, {probe,dup,0,[{file,…},{line,14}]}]`; the boot-trace witnesses are
+  `[{proc_lib,exit_p,3,[{line,355}]},{proc_lib,exit_p,3,[{line,355}]}]` and
+  `[{gen_server,init_it,6,[{line,2272}]},{gen_server,init_it,6,[{line,2271}]}]` — the latter is why the
+  crash report mis-attributes the `error:badarg` to the re-raise site. Owner: `erts_rust/crates/beam_engine`.
+* **`beam_engine` — `build_stacktrace` drops the run's entry-module frames when the handler lives in a
+  non-zero module context.** `erts_rust/crates/beam_engine/src/families/exceptions/stacktrace.rs:163` plus
+  the `context == 0` heuristic at lines 169-181 (`FrameOwner::Skip` for every context-0 frame when
+  `handler_context != 0`); the same heuristic is in `Machine::current_stacktrace`
+  (`machine/location.rs:238-241,261-268`). Raw evidence: `ent:g/0 -> mid3:run/0 -> callee:h/1 ->
+  erlang:error(badarg)` with the `try … catch error:R:S -> S end` in the callee module → oracle
+  `[{callee,h,…},{mid3,run,0,…},{ent,g,0,…},…]`, engine `[{callee,h,…},{mid3,run,0,…}]` (the
+  `{ent,g,0,…}` entry-module frame is missing). Owner: `erts_rust/crates/beam_engine`.
+* **`beam_engine` — the reported `make_small(arity)` → `NIL` degradation does not reproduce.**
+  `write_item` always emits an integer arity
+  (`erts_rust/crates/beam_engine/src/families/exceptions/stacktrace.rs:377-388`) and
+  `beam_term::make_small` (`erts_rust/crates/beam_term/src/immediate.rs:76`) is total, so
+  `erlang:make_fun/3` works; the `[]` an oracle prints for a 0-arity caller is the **oracle's own** `A`
+  slot (it prints the argument LIST) where this engine prints the integer arity — the separate,
+  already-documented `function_clause` `A`-slot divergence (Int vs ArgList).
+  Owner: `erts_rust/crates/beam_engine`.
+* **`beam_engine` — the `process_info(self(), current_stacktrace)` reachability seam.** `position_value`
+  (`erts_rust/crates/beam_rt/src/native/memory/mod.rs`) reads the machine through
+  `RunnerState::position_engine_at`, but a scheduler pass takes the executing process's engine **out** of
+  that map for the whole slice (`erts_rust/crates/beam_rt/src/runner/run.rs:284`), so during a BIF the
+  running process has no reachable `&Machine` and the item becomes the uncatchable
+  `unsupported: process_info: current_stacktrace` typed gap. No `ExecutionContext` method exposes the
+  executing `Machine`, and a raw-pointer publish is impossible in this crate (`#![deny(unsafe_code)]`), so
+  closing it needs an additive, defaulted `beam_engine` `ExecutionContext` seam.
+  Owner: `erts_rust/crates/beam_engine` (the seam), `erts_rust/crates/beam_rt` (the consumer).
+* **`beam_engine` — the boot-chain failure is tier-independent.** `BEAM_RT_TIER=interpreter beam_rt
+  -noshell -boot bootstrap/bin/start` → exit 1 with the same 80 stdout lines, so the directive-19 stop is
+  not a baseline-JIT codegen defect.
+* **Open observation — the crash report's `initial call: supervisor_bridge:standard_error/1` does not match
+  the expected `{gen_server,init_it,6}`.** Worth a future check of the floor's initial-call / entry-module
+  answer.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs
   **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp`
@@ -707,6 +770,8 @@ A by-owner index of the long forms in `## Cross-node handoff detail` above; the 
 * **Differential gate** → [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md) (re-run `gate.sh` for the live figure).
 * **A.7/A.9 boot (index 19 stop)** → the bullet above + [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
 * **A.9 E0 (in-process `compile:file`)** → `tests/compile_file.rs`; mover: [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).
+* **`beam_bifs` — the `io:format/2` `~p`/`~w` fun-printing `badarg`** → the bullet above (`beam_bifs/src/io.rs`).
+* **`beam_engine` — the boot-chain stacktrace defects and the `current_stacktrace` seam** → `catch Expr`'s dropped stacktrace, the duplicated top frame, the dropped entry-module frame and the `process_info(self(), current_stacktrace)` reachability seam (bullets above).
 * **The native `file_server_2` service** → [`src/native/CONTEXT.md`](src/native/CONTEXT.md) + [`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md).
 * **`beam_process` / `beam_message`** → the wake-list drain + `!Send`-friendly `SchedulerPool` (bullet above).
 * **`beam_engine`** → the `MinimalContext` arena accessor (bullet above).
