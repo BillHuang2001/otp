@@ -652,14 +652,28 @@ impl Runtime {
             .register(init_name, self_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
         // The native **`file_server_2` service** (contract A.9): a `Runnable`, never-enqueued
-        // process that answers the OTP file protocol, so the real `bootstrap/bin/start.boot`'s
-        // final `{apply,{c,erlangrc,[]}}` directive completes instead of dying with
-        // `{noproc,{gen_server,call,[file_server_2,…]}}` (see `src/native/file_server.rs`).
-        let file_services = crate::native::file_server::FileServices::start(
-            &mut processes,
-            code_server.atoms_mut(),
-            config.heap.policy().clone(),
-        )?;
+        // process that answers the OTP file protocol, so a caller like `c:erlangrc/0` finds the
+        // service instead of dying with `{noproc,{gen_server,call,[file_server_2,…]}}` (see
+        // `src/native/file_server.rs`).
+        //
+        // The **boot-script route** (`-boot FILE`) is the exception, because there the booted
+        // system owns the name: `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
+        // `file_server_2` child (`{file_server, start_link, []}`), and an **initial** child
+        // start that finds the name already taken aborts that supervisor — `kernel` is
+        // `permanent`, so the node tears down. The native service must therefore leave the name
+        // free and let the booted application serve it.
+        let file_services = if config.boot_script().is_some() {
+            crate::native::file_server::FileServices::start_unclaimed(
+                &mut processes,
+                config.heap.policy().clone(),
+            )?
+        } else {
+            crate::native::file_server::FileServices::start(
+                &mut processes,
+                code_server.atoms_mut(),
+                config.heap.policy().clone(),
+            )?
+        };
         // A zero-word heap can hold nothing, so the configured size is floored — and a
         // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
         let heap_words = term_heap_words(&config);
