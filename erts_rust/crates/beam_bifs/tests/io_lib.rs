@@ -832,10 +832,10 @@ fn check_format(
 /// (`lib/stdlib/src/io_lib.erl:354-360`), so *every* inner failure — `scan/2`'s
 /// missing clause and `string:length/1`'s structured `{badarg, Bin}` alike — leaves
 /// as the bare atom. This crate raises the bare [`BeamError::BadArg`] for every
-/// `scan/2`/`collect/2` reject, and for a top-level binary element `string:length/1`
-/// cannot decode it propagates that function's own **structured** `{badarg, Bin}`
-/// raise instead (a known divergence in the reason's *shape* only, reported
-/// upstream): both are `error`-class badarg raises, which is what is asserted here.
+/// `scan/2`/`collect/2` reject and for a top-level binary element `string:length/1`
+/// cannot decode — that function's own **structured** `{badarg, Bin}` raise is
+/// mapped back to the bare atom at the format boundary, exactly as the oracle's
+/// wrapper does.
 fn check_format_badarg(
     ctx: &mut BifContext<'_>,
     reg: &BifRegistry,
@@ -1091,24 +1091,16 @@ fn a_nested_element_of_a_list_format_is_kept_verbatim() {
     let want = ctx.list(&[tilde_n]).expect("fits");
     check_format(&mut ctx, &reg, f, &[], want);
 
-    // `[20013, 120]` — 20013 is outside 0..=255, so the oracle keeps it as an
-    // *integer element* (`count_small/1`'s `is_integer(C) -> Other + 1` clause) while
-    // 120 stays the literal character `x`.
-    //
-    // KNOWN DIVERGENCE (reported upstream, not fixed here): the oracle returns
-    // `[20013,120]`
+    // `[20013, 120]` — 20013 is outside 0..=255, so it is a *verbatim integer*
+    // element: `count_small/1`'s `is_integer(C) -> Other + 1` clause counts it as
+    // one character while it is emitted verbatim, and 120 stays the literal `x`.
     //     erl -noshell -eval 'io:format("~p~n",[io_lib:format([20013,120],[])]),halt().'
     //     % [20013,120]
-    // while this crate raises `error:badarg`: `render_format_unlimited` measures the
-    // verbatim element through `io_lib:chars_length/1` (`literal_other` →
-    // `chars_length_chunk`), whose `string:length/1` fallback has no clause for a
-    // bare integer. Only the integer element is affected — a *list* element holding
-    // the same code point is measured by `iolist_size/1` and succeeds.
     let big = int(&mut ctx, 20013);
     let x = int(&mut ctx, 120);
     let f = ctx.list(&[big, x]).expect("fits");
-    check_format_badarg(&mut ctx, &reg, f, &[]);
-
+    let want = ctx.list(&[big, x]).expect("fits");
+    check_format(&mut ctx, &reg, f, &[], want);
     // `[[[<<"a">>]]]` — a triple-nested binary element.
     let bin_a = binary(&mut ctx, &reg, b"a");
     let l1 = ctx.list(&[bin_a]).expect("fits");
