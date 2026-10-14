@@ -62,8 +62,8 @@
 use std::rc::Rc;
 
 use beam_abi::nif::loader::NifCallError;
-use beam_bifs::BifContext;
-use beam_common::Result;
+use beam_bifs::{BifContext, BifFn};
+use beam_common::{BeamError, Result};
 use beam_process::ProcessTable;
 use beam_term::Eterm;
 
@@ -119,8 +119,19 @@ impl<'a> RuntimeContext<'a> {
     /// **instead of** the fun-caller bridge. No dict BIF applies a fun argument, so nothing
     /// is lost (see [`DictBridge`]).
 
+    /// # The implementation is already resolved
+    ///
+    /// `bif` is the [`BifFn`] the per-context dispatch memo resolved
+    /// ([`Self::dispatch`] → `BifRegistry::lookup`), so this method invokes it **directly**
+    /// through [`invoke_registered`] instead of re-entering `BifRegistry::call` — which would
+    /// re-hash the two names on every call, the dominant cost of the prologue. The registry
+    /// lookup stays the **single** source of truth for "is this key registered": it ran once to
+    /// produce `bif`, and [`Self::call_bif_routed`] only reaches this method when it answered
+    /// `Some`.
+
     pub(super) fn call_registered(
         &mut self,
+        bif: BifFn,
         module: &str,
         function: &str,
         arity: u32,
@@ -129,7 +140,6 @@ impl<'a> RuntimeContext<'a> {
     ) -> Result<Eterm> {
         // Cheap handles that do NOT borrow the runtime: the runtime stays free for the
         // fun-caller bridge.
-        let registry = Rc::clone(&self.runtime.registry);
         let atoms = self.runtime.code_server.atoms_handle();
         let tables_handle = Rc::clone(&self.runtime.tables);
         let ports_handle = Rc::clone(&self.runtime.ports);
@@ -339,7 +349,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_process_hook {
                 // The eleven process/name/global-state BIFs: the bridge borrows the process
                 // table (the caller-supplied pass table when there is one, else the
@@ -370,7 +380,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_nif_loader {
                 // `erlang:load_nif/2`: the NIF bridge needs `&mut Runtime` (to store the loaded
                 // library in the runtime's NIF registry), so it is the only runtime borrow in
@@ -401,7 +411,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_record_source {
                 // `records:get_definition/2` answers from the *loaded module's* `Recs` chunk,
                 // which lives in the code server's module map — a `&CodeServer` borrow, so it
@@ -427,7 +437,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_send_hook {
                 // `erlang:send/2`/`erlang:'!'/2` (`SendBridge`): the delivery bridge borrows the
                 // whole `Runtime` (it delegates to the existing `RuntimeContext::send_message`
@@ -460,7 +470,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_module_info {
                 // `erlang:get_module_info/1,2`: answers from the loaded module's IR — a
                 // `&CodeServer` borrow, its own mutually exclusive arm. It applies no fun
@@ -485,7 +495,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_persistent_term {
                 // The seven `persistent_term:*` BIFs: a cheap `Rc` clone of the
                 // node-global store, plus a clone of the shared atom-table handle so the
@@ -534,7 +544,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else if uses_runtime_hooks {
                 // The runtime-coupled BIF families (`RuntimeHooksBridge`): the timer heap and
                 // reference space (`&mut Runtime`) plus the caller's process table
@@ -565,7 +575,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             } else {
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
@@ -596,7 +606,7 @@ impl<'a> RuntimeContext<'a> {
                 if let Some(tables) = tables.as_deref_mut() {
                     context = context.with_tables(tables);
                 }
-                registry.call(module, function, arity, &mut context, args)
+                invoke_registered(bif, arity, &mut context, args)
             }
         };
         // The result is still on the pooled BIF heap. Left there it is a container in a region
@@ -788,8 +798,14 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Option<Eterm>> {
-        if !self.runtime.nifs.borrow().lookup(module, function, arity) {
-            return Ok(None);
+        {
+            // The registry is normally **empty** — only `load_nif/2` ever fills it — so
+            // `is_empty()` (a length compare) short-circuits *before* the `HashMap` SipHash of
+            // the module name that `lookup` pays on this fast path.
+            let nifs = self.runtime.nifs.borrow();
+            if nifs.is_empty() || !nifs.lookup(module, function, arity) {
+                return Ok(None);
+            }
         }
         let atoms = self.runtime.code_server.atoms_handle();
         let mut interner = PendingInterner::new(atoms.len());
@@ -881,7 +897,10 @@ impl RuntimeContext<'_> {
             return result.map_err(error::enforce_term_heap_limit);
         }
         let dispatch = self.dispatch(module, function, arity);
-        if dispatch.bif.is_some() {
+        // `Some` is exactly "the registry has this key" — the memo resolved it through
+        // `BifRegistry::lookup`, which stays the single source of truth — and the resolved
+        // `BifFn` is what `call_registered` invokes (no second registry lookup).
+        if let Some(bif) = dispatch.bif {
             // A table-creating `ets:new/2` is observed here so the runtime's owner index can
             // release the table when its creator dies (see `crate::runtime::ets_owner`). Only
             // a `named_table` is reachable through the registry's *public* surface, so only it
@@ -895,7 +914,8 @@ impl RuntimeContext<'_> {
                     .filter(|term| beam_term::is_atom(*term))
                     .map(beam_term::atom_val);
                 let before = name.and_then(|atom| self.runtime.tables.borrow().lookup_name(atom));
-                let result = self.call_registered(module, function, arity, args, dispatch.hooks);
+                let result =
+                    self.call_registered(bif, module, function, arity, args, dispatch.hooks);
                 if let (Some(atom), Ok(_)) = (name, &result) {
                     let after = self.runtime.tables.borrow().lookup_name(atom);
                     if let Some(handle) = after.filter(|handle| Some(*handle) != before) {
@@ -907,7 +927,7 @@ impl RuntimeContext<'_> {
                 }
                 return result;
             }
-            return self.call_registered(module, function, arity, args, dispatch.hooks);
+            return self.call_registered(bif, module, function, arity, args, dispatch.hooks);
         }
         if module == "erlang" {
             // The **effective** gap set: the curated list intersected with what the live
@@ -962,4 +982,28 @@ impl RuntimeContext<'_> {
             self.runtime.note_foreign_reachable(pid);
         }
     }
+}
+
+/// Invokes a `beam_bifs` implementation the dispatch memo already **resolved**.
+///
+/// This is [`BifRegistry::call`](beam_bifs::BifRegistry::call) minus the registry lookup. The
+/// memo holds the [`BifFn`] `BifRegistry::lookup` returned — the registry's own answer to "is this
+/// key registered", so it can never become a second, drifting registry — and re-running that
+/// lookup here would only re-hash the two names, which is the dominant cost of the dispatch
+/// prologue ([`super::dispatch`]) and exactly what memoizing the implementation is for.
+///
+/// What is invoked and what it returns are **unchanged**: the arity check `BifRegistry::call`
+/// performs is reproduced byte for byte (`args.len() != arity` is the same `error:badarity`
+/// [`BeamError::BadArity`] the registry raises), and the implementation is called with the same
+/// context and the same argument slice. Only the lookup in front of it is gone.
+fn invoke_registered(
+    bif: BifFn,
+    arity: u32,
+    context: &mut BifContext<'_>,
+    args: &[Eterm],
+) -> Result<Eterm> {
+    if args.len() != arity as usize {
+        return Err(BeamError::BadArity);
+    }
+    bif(context, args)
 }
