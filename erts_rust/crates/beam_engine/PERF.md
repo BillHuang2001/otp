@@ -4,6 +4,50 @@ Current-state record of execution-tier performance investigations (the default *
 Detailed current measured figures and execution-coverage evidence live in `MEASURED.md`; this file owns the *tier-regression* narrative (what was slower than what, why, and what changed).
 **The sandbox is heavily oversubscribed**, so every figure here is wall-clock with no CPU pinning: a single sample is meaningless — read the explicitly two-sided **ratio** and the `/proc/loadavg` recorded with it, never an absolute number.
 
+## Batch 53 — block register allocator (liveness-based partial spill/fill) + the sub-block O(n²) fix
+
+### What changed
+- **Partial spill / partial fill** (`src/jit/baseline/emit/regs.rs`, new; `emit/liveness.rs`, new). The block cache is still a *fixed* per-block set of 5 x-registers (`Allocation::slots`, usage-ranked), but the register traffic is now liveness-restricted instead of whole-cache:
+  - `spill(.., SpillSite)` stores only `Allocation::written` — the block's static write set (`regalloc.rs::cacheable_writes`, a superset of what the inline lowerings actually write). A resident register outside it still holds its `machine.x` value, so storing it is a no-op. Sites: `SpillSite::Helper` (before an in-block helper — the helper *is* the interpreter and reads `machine.x`) and `SpillSite::Exit`.
+  - `fill(.., FillSite, pc)` reloads `Allocation::fill_slots(pc)` = `(live ∪ written) ∩ slots`, where `live` is a block-local continuation liveness from a backwards walk (`liveness.rs::fill_sets`). The prologue load stays whole-cache; an empty/absent table falls back to the conservative whole-cache fill.
+  - Soundness: every store writes exactly the write set on every path (fast path ⇒ register authoritative; guarded fallback ⇒ `machine.x` authoritative + reload), so the two representations never disagree — proven by a runtime clobber test. **Y slots stay uncached** (honest scoping: full Y-slot caching was not attempted; no gain proven, no wrong result shipped).
+- **Sub-block range dedup** (`src/jit/baseline/emit/compile.rs`): each continuation sub-block's range is capped at the **next continuation address** in the same function (`sub_block_end`), so the emitted ranges are disjoint and the total lowered length is O(range) instead of O(n²).
+
+### Structural counters (test-only, `src/jit/baseline/counters.rs`) — full-cache → partial, one recorded pass
+Two-process copy-bound probe, baseline-jit tier, recording ON:
+
+| counter | before (full cache) | after (partial) |
+|---|---|---|
+| spill stores | 91 | 59 (−35 %) |
+| — `SpillSite::Helper` | 66 | 41 |
+| — `SpillSite::Exit` | 25 | 18 |
+| fill loads | 75 | 61 (−19 %) |
+| — `FillSite::Helper` | 64 | 50 |
+| — `FillSite::Prologue` | 11 | 11 |
+| `jit_step_one` deopts | 964 | 964 (unchanged) |
+
+New counters: `record_block` (per-block IR size / emitted bytes / cache- and write-set sizes + histograms), `record_spill`/`record_fill` by site, and both cache models side-by-side in one run (`spill_stores` vs `spill_stores_full`, `fill_registers` vs `fill_registers_full`).
+
+### Interleaved same-window A/B — both sides named, min-over-N=7, primed
+`src/jit/baseline/tests.rs::the_copy_bound_tier_ab_is_interleaved_and_min_over_n`:
+- **before** (temp full-cache patch, reverted): `Interpreter` min **887.89** ns/op vs `BaselineJit` min **706.71** ns/op → **0.796×**.
+- **after** (partial model): `Interpreter` min **905.70** ns/op vs `BaselineJit` min **689.16** ns/op → **0.761×**.
+- `/proc/loadavg` over the window: 5.48 → 4.56 → 4.14.
+- **Verdict: the wall-clock effect is within noise** (`BaselineJit` min −2.5 %, interpreter min drifted +2 %). The structural counters are the honest evidence: a real reduction in register-cache traffic, not a measured wall-clock win. Nothing to revert — a strict, sound traffic reduction was shipped, just not a load-bearing speedup.
+
+### Sub-block O(n²) → O(n) (`emit/compile.rs`) — emitted bytes for one call-dense IR block
+
+| calls (`CallExt`, one block) | OLD eager | OLD lazy | NEW eager | NEW lazy |
+|---|---|---|---|---|
+| 64 | 256 439 | — | 24 032 | — |
+| 256 | 3 924 791 | 3 003 703 | 95 456 | 81 148 |
+| 1024 | 62 097 719 | — | 381 152 | — |
+
+4× calls → ~4× bytes (linear) vs ~16× before. At 256 calls: ~41× smaller eager, ~37× smaller lazy. Real-module figures are unchanged where a block holds one continuation per tail (the cap is inert). Pinned by `emit/compile.rs::the_continuation_sub_blocks_scale_linearly_not_quadratically` (both layouts) and `::the_disjoint_sub_blocks_still_run_every_call_ext`.
+
+### Pins
+No existing pinned counter value changed — the new counters are purely additive. New pins: the interleaved A/B test; the two `emit/compile.rs` sub-block tests; the partial-fill clobber test. `src/jit/baseline/tests.rs::the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt`, `tests/jit_real_module.rs` (736/736 tier equivalence), `tests/jit_cross_module.rs` and `tests/jit_linking.rs` all stay green; `-p beam_engine` = **1408 passed / 0 failed / 2 ignored**; `--features jit-cranelift` builds warning-free.
+
 ## Batch 52 — item 2: baseline-JIT `send_recv` regression (CLOSED)
 
 ### Symptom
@@ -51,4 +95,4 @@ Claim: the `slice` system-module per-process rows rose +7–44 % vs m9 (`gb_tree
 
 **The one real, attributable engine cost behind this hypothesis is now removed:** the `CodeCache` entry-path IR re-hash (item 2's root cause above, now O(1) via the digest key). It scales with module size (~2 µs tiny, ~141 µs at 2048 instructions), i.e. up to a few hundred µs per process on a `string.beam`-sized module.
 
-**Latent hazard, not the slice rise (recorded for a future pass):** `emit_sub_blocks` / `emit_shared_sub_blocks` (`src/jit/baseline/emit/compile.rs`) emit one block `[pc+1, block.end)` per frame-preserving call with **no range dedup**, which is O(n²) for a call-dense straight-line block (a 256-`call_ext` unrolled block emits ~33k instructions; `src/jit/baseline/tests.rs::measure_declined_call_ext` shows the resulting ~3.2–4.1× cost vs the interpreter, while the small-loop `jit_bench call_ext/0` is ~1.6× *faster*). On real OTP modules the growth is bounded — a whole-OTP `beam_disasm` census of extra instructions: `gb_trees` 1.010×, `ordsets` 1.005×, `base64` 1.011×, `lists` 1.047×, `queue` 1.164×, `string` 1.222×, `calendar` 1.627× — so it is a synthetic-shape hazard only.
+**Closed in Batch 53** (it was a latent hazard, *not* the slice rise): `emit_sub_blocks` / `emit_shared_sub_blocks` (`src/jit/baseline/emit/compile.rs`) now cap each sub-block range at the next continuation address, so the ranges are disjoint and the emitted code is linear. The old shape — one block `[pc+1, block.end)` per frame-preserving call with **no range dedup**, O(n²) for a call-dense straight-line block (a 256-`call_ext` unrolled block emitted ~33k instructions) — is gone (256 calls: ~3.9 MB → 95 KB eager, ~3.0 MB → 81 KB lazy). See the Batch 53 section above.

@@ -299,9 +299,18 @@ address, through the same `emit_block` an IR block uses (identical shape rules, 
   `seal`, recording each entry in `EagerLayout::sub_entries`.
 
 For each `p` that lies strictly inside an IR block (`b.start < p < b.end`, `p < code.len()`) and is not
-already a compiled block start, the pass lowers `[p, b.end)`. An address already at a block start, or at/
-past the end of the function, needs no sub-block; a second call nested inside an earlier sub-block's range
-gets its own (the code is duplicated, correctness first).
+already a compiled block start, the pass lowers `[p, sub_block_end(code, b, p))`, where `sub_block_end`
+caps the containing IR block's `end` at the **next continuation address** in the same function
+(`(start..code.len()).find(stores_continuation).map(|pc| pc + 1)`), or the block's `end` when no later call
+exists. The emitted sub-block ranges are therefore **disjoint**, so the total lowered length is
+**linear** — O(`code.len()`) — instead of the O(n²) of overlapping `[p, block.end)` tails for n calls in one
+straight-line block.
+
+The truncation loses no native coverage: the last instruction of `[p_i, p_{i+1})` is the frame-preserving
+call at `p_{i+1} - 1`, which always transfers control out of the block (a deopt / `ENTER`, or a `call_bif`
+continue that the shared `done` epilogue turns into an `encode_target(func, p_{i+1})` word), and
+`p_{i+1}` has its own sub-block entry — so the driver resumes natively at the next sub-block. An address
+already at a block start, or at/past the end of the function, needs no sub-block.
 
 Sub-blocks are emitted after all IR blocks, so the block-entry table and the `code_map` regions keep
 describing IR blocks only; they reserve no entry label (nothing branches to a continuation address), they
@@ -312,18 +321,15 @@ discards its touches, so the whole-module `Summary` is provably untouched. Both 
 `sub_blocks_capacity_estimate` (`BLOCK_BYTES + INSTRUCTION_BYTES` per instruction of each sub-block range)
 to the buffer size, so the extra code cannot under-allocate the `CodeBuffer`.
 
-**Measured cost of the duplication (the pass is O(n²) in a pathological shape).** There is no range
-dedup: n `stores_continuation` instructions inside one IR block, none a block start, each with
-`p < b.end`, emit ~n²/2 instructions. The synthetic `baseline/tests.rs::measure_declined_call_ext`
-module is exactly that shape (256 unrolled non-tail `CallExt` in a single block, `~33k` instructions
-emitted) and it runs ~96–133 ns/call_ext on the lazy cache/outcome baseline path vs ~20–30 ns/call_ext
-on the interpreter — whereas the eager pre-compiled `jit_bench call_ext/0` (a small *loop* body with few
-continuations) is ~1.6× **faster** than the interpreter. The same instruction reads with opposite sign
-purely because the body shape differs, so quote either only alongside the shape. Real OTP modules stay
-bounded: a whole-OTP `beam_disasm` census of extra instructions attributable to sub-blocks gives
-`gb_trees` 1.010×, `ordsets` 1.005×, `base64` 1.011×, `lists` 1.047×, `queue` 1.164×, `string` 1.222×,
-`calendar` 1.627×. A sub-block whose range would contain another continuation address could be skipped
-(the nested call's own sub-block covers that tail), bounding the growth — correctness-first for now.
+**The O(n²) pathology is gone.** With disjoint ranges the total emitted code is linear, so the synthetic
+`baseline/tests.rs::measure_declined_call_ext` shape (256 unrolled non-tail `CallExt` in one block — the
+old O(n²) worst case at ~33k emitted instructions) now emits ~95 KB (eager) / ~81 KB (lazy) rather than
+~3.9 MB / ~3.0 MB; a call-dense body costs ~4× per 4× call count (linear) vs ~16× before, pinned by
+`emit/compile.rs::the_continuation_sub_blocks_scale_linearly_not_quadratically` (both layouts) and
+`::the_disjoint_sub_blocks_still_run_every_call_ext` (all calls executed on both tiers).
+`sub_blocks_capacity_estimate` now budgets the **disjoint** ranges (so it is linear in the function size)
+rather than the overlapping ones. Real-module figures are unchanged where a block holds one continuation
+per tail (the cap is inert).
 
 ## Register cache: partial spill AND partial fill (liveness-based)
 

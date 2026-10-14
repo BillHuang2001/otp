@@ -138,6 +138,7 @@ Per-module `#[cfg(test)]` unit tests plus integration tests over committed real 
 ## Measured / Execution coverage
 `tests/census.rs` gates **108 `beam_loader::Instr` variants = 49 EXECUTED + 59 CLAIMED-BLOCKED + 0 UNCLAIMED** (`unclaimed == 0` asserted; `TestKind` 25/25), and the whole 1366-`.beam` / 34-application corpus loads with **zero unmodelled opcodes**.
 Full detail (census/corpus reachability, `engine_bench` ns/instruction rows, `bif_cost` per-call attribution, `jit_bench` speed-ups and caveats) is in `MEASURED.md`; every remaining execution gap is a typed error pinned in-suite (`tests/gaps.rs` etc.).
+The baseline tier's **block register cache** is a fixed, usage-ranked set of 5 x-registers per block (`src/jit/baseline/emit/regalloc.rs::allocate_registers`) with **liveness-restricted partial spill/fill** (`src/jit/baseline/emit/regs.rs` + `emit/liveness.rs`); Y slots stay uncached (guarded `lea`). The tier-vs-interpreter A/B narratives (incl. Batch 53's register-traffic reduction and the sub-block O(n²)→O(n) fix) and their `/proc/loadavg` are in `PERF.md`.
 
 ## Known Issues / Intentional M1 gaps
 The full list, each with its ground-truth detail, is in `INSTRUCTION_SURFACE.md`; the headline items:
