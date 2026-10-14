@@ -238,15 +238,15 @@ needs the port write path and the distributed `{Name, Node}` send is contract A.
 ## Distribution and the node (A.5)
 `-name`/`-sname` make the runtime a distributed node: `DistNode` binds a wildcard listener, publishes to
 `epmd` best-effort (a failure is recorded, never fatal) and completes the server-side `'N'` handshake
-against a real OTP peer (`tests/dist.rs`). Gaps: no `net_kernel` protocol; the inbound
-link/exit/monitor/alias `DOP_*` families stay typed `Unsupported` (no remote-peer seam in
-`beam_process`); `node/0` and the node atom a pid image carries **do** reflect the live
+against a real OTP peer (`tests/dist.rs`). Gaps: no `net_kernel` protocol; the distributed-spawn
+family (`SpawnRequest`/`SpawnReply`), `Delivery::Other(_)` and the ack-owing `UnlinkId` half stay
+typed `Unsupported`; `node/0` and the node atom a pid image carries **do** reflect the live
 `-name`/`-sname` node (`Runtime::local_node()` is stamped on every `call_registered` arm), but the
 `NodeIdentity` reports creation `0` (the placeholder above), so a decoded local id is still external
 (see the `beam_codec`/`beam_bifs` handoff). `DOP_SEND`/`DOP_REG_SEND` already reach
-local mailboxes through `LocalDeliverySink`, gated by `Runtime::allow_inbound_delivery` (default OFF, so
-the differential corpus is byte-identical); a live-peer loop past the handshake needs the
-`FragmentAssembler` receive-buffer coupling.
+local mailboxes through `LocalDeliverySink`, as do the route-free receipt families
+(link/exit/unlink/monitor/demonitor/group-leader) — each emitting no outbound `DOP_*` — gated by
+`Runtime::inbound_delivery` (default **ON**; `Runtime::allow_inbound_delivery` turns it off).
 
 **The Erlang-level distribution subtree is not run** on a `-sname`/`-name` node: the native floor
 answers `erl_distribution:start_link/0,1` with `ignore` (this runtime's distribution is the native
