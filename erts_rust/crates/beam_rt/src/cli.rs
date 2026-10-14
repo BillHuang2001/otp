@@ -769,11 +769,33 @@ fn parse_schedulers(value: &str) -> Result<(Option<u32>, Option<u32>)> {
 /// `-pa a -3 …` / `-pa a +S 3 …` both stop at the next switch. An occurrence with **no**
 /// value is a usage error, exactly as before.
 fn path_values(args: &[String], index: usize, switch: &str) -> Result<(Vec<String>, usize)> {
-    let (values, next) = collect_tail(args, index + 1);
+    let (values, next) = collect_path_values(args, index + 1);
     if values.is_empty() {
         return Err(error::missing_value(switch));
     }
     Ok((values, next))
+}
+/// The tokens from `from` up to (but not including) the next switch **or** the terminal
+/// `run` action keyword, plus the index of that stopper.
+///
+/// This is the value collector for `-pa`/`-pz`/`-setcookie`. It differs from the generic
+/// [`collect_tail`] in exactly one way: it also stops at a bare `run` token. `run` is
+/// this runtime's own terminal CLI keyword (the vertical slice, see [`parse_run_file`]),
+/// so it can never be a directory/cookie *value*; treating it as one would swallow the
+/// whole action (`beam_rt -pa DIR run FILE M:F/A` would leave the `Action` at `Boot` and
+/// print nothing). Real `erl` has no `run` keyword, so this is a beam_rt-only rule and
+/// the oracle's `-pa a b` multi-value grammar is unaffected.
+fn collect_path_values(args: &[String], from: usize) -> (Vec<String>, usize) {
+    let mut values = Vec::new();
+    let mut next = from;
+    while let Some(candidate) = args.get(next) {
+        if is_switch(candidate) || candidate == "run" {
+            break;
+        }
+        values.push(candidate.clone());
+        next += 1;
+    }
+    (values, next)
 }
 
 /// Consumes a `-env VAR VALUE` pair, returning the index of the next switch.
