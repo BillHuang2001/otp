@@ -390,8 +390,8 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; the two remaining blockers are owned by
-  `erts_rust/crates/beam_loader` and `erts_rust/crates/beam_engine`.** `Runtime::boot_from_script` runs the
+* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; the one remaining blocker is owned by
+  `erts_rust/crates/beam_loader`.** `Runtime::boot_from_script` runs the
   real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 directives**) past index 18
   (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`, whose `apply` **returns
   `Ok`** — but the kernel application does **not** stay up) and stops at index **19**
@@ -408,28 +408,25 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   The in-crate `BootStop` reports `index = 19`. `-boot FILE` drives the walk (`src/cli.rs::drive`), a
   plain start keeps the preloaded-only floor, directive 13 leaves a live `logger_server` registered as
   `logger`, and the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
-  **The two current causes — both out of node.** (i) **B2 — the per-module atom-table prefix-snapshot
-  gap** (`erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine`): `beam_loader::Module.atom_table`
+  **The current cause — out of node.** **B2 — the per-module atom-table prefix-snapshot gap**
+  (`erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine`): `beam_loader::Module.atom_table`
   is an owned load-time prefix clone with no global fallback, so a token interned *after* the reader
   module loaded resolves to `None` and the engine raises `badarg` (`gen_server:init_it/6`,
   `gen_server.erl:2272`). On the plain route this kills the kernel application's `standard_error`
   `supervisor_bridge` child, so `kernel_sup` reports `start_error` and the `permanent` kernel application
   tears itself down; on a route where a `-pa <shim>` (a stale `gen.beam` seeding `supervisor_bridge`) lets
-  that child get further, the same gap kills `inet_db`, then `global_name_server`.
-  (ii) **B3' — the native baseline-JIT tier enters a non-tail same-module local `call` without consulting
-  the local-call seam** (`erts_rust/crates/beam_engine`, `src/jit/baseline`), so `prim_tty:tty_create/1`'s
-  `erlang:nif_error/1` stub body runs and raises `undef`; it is what kills `standard_error` on the shimmed
-  route. Directive 19's `{load_application,stdlib}` `gen_server:call` then finds no `application_controller`
+  that child get further, the same gap kills `inet_db`.
+  Directive 19's `{load_application,stdlib}` `gen_server:call` then finds no `application_controller`
   and raises the `{noproc,…}` above, which `apply_boot_call` reports as the directive's typed error.
   **Raw figures.** Plain route: **stdout 80 lines / 3055 bytes** — the first report carries
   `initial call: supervisor_bridge:standard_error/1` and `in function gen_server:init_it/6 (gen_server.erl:2272)`,
   offender `{id,standard_error}`, **2** `=CRASH REPORT====` blocks, **1** `=SUPERVISOR REPORT====` and **1**
   `=INFO REPORT====` block
   (`application: kernel exited: {{shutdown,{failed_to_start_child,standard_error,{badarg,…}}} …, type: permanent}`).
-  Shimmed route (`-pa <shim>` with the stale `gen.beam`): **stdout 132 lines / 4850 bytes** — the first
-  report is
-  `=SUPERVISOR REPORT==== supervisor: {local,standard_error_sup} errorContext: child_terminated reason: undef offender: [{pid,<0.10.0>},{mod,standard_error}]`,
-  and the walk advances past `file_server_2` to `{id,inet_db}` (`{mfargs,{inet_db,start_link,[]}}`) — no
+  Shimmed route (`-pa <shim>` with the stale `gen.beam`): **stdout 165 lines / 5834 bytes** — the first
+  report is a `=CRASH REPORT====` for `initial call: prim_tty:writer/1` raising `error: bad argument`
+  with `ancestors: [standard_error]`, and the walk advances past `file_server_2` to the terminal
+  offender `{id,inet_db}` (`{mfargs,{inet_db,start_link,[]}}`, `gen_server:init_it/6` badarg) — no
   `already_started`.
   **An external fun resolves in-machine (why index 18's `apply` returns `Ok`):**
   `RuntimeContext::resolve_local_fun` (`src/context/execution.rs`) resolves an EXTERNAL fun
@@ -446,7 +443,7 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `kernel_sup`/`timer_server` do not exist and `timer:apply_after/4` →
   `supervisor:start_child(kernel_sup, …)` raises an **uncaught**
   `{noproc,{gen_server,call,[kernel_sup,{start_child,…},infinity]}}`. This is **independent** of the boot
-  blockers above. The `<structured reason>` is an **incidental rendering gap**: `src/cli.rs`'s
+  blocker above. The `<structured reason>` is an **incidental rendering gap**: `src/cli.rs`'s
   `Action::Eval` arm does not pass its error through `reported_reason` (only `Boot`/`Run`/`RunFile` do —
   `src/cli.rs` ~:1213, ~:1500), so a structured raise reason renders as the literal placeholder instead of
   the real term.
@@ -519,7 +516,7 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `RunnerState` (a typed gap where no machine is reachable).
   Owner: `erts_rust/crates/beam_rt` (`src/context/position.rs` + `src/native/memory/`); the seam lives in
   `erts_rust/crates/beam_engine`.
-* **The boot-chain crashes attribute to B2 and B3', not to a `process_info` capability gap.** On the
+* **The boot-chain crashes attribute to B2, not to a `process_info` capability gap.** On the
   plain route the fatal step is the kernel application's `standard_error` `supervisor_bridge` child
   raising `badarg` inside `gen_server:init_it/6` (`gen_server.erl:2270-2272`, the
   `{'EXIT', Class, Reason, Stacktrace}` clause: `gen:unregister_name(Name0)` then
@@ -529,10 +526,8 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   supervisor_bridge:standard_error/1` is the child's own behaviour entry and agrees with the oracle, so it
   is not a divergence. B2 is tier-independent (`BEAM_RT_TIER=interpreter` reproduces the same 80 stdout
   lines), so the plain route's stop is not a JIT defect. On the shimmed route (`-pa <shim>` seeding
-  `supervisor_bridge` with a stale `gen.beam`) the child gets further and then dies with `reason: undef`
-  from `prim_tty:tty_create/1`'s `erlang:nif_error(undef)` stub — **B3'**, the native baseline-JIT tier
-  running a non-tail same-module local `call` without consulting the local-call seam (the interpreter
-  tier consults the seam and reaches the library's NIF). The in-machine execution-position door
+  `supervisor_bridge` with a stale `gen.beam`) the child starts and the same atom-snapshot gap then kills
+  `inet_db` (`gen_server:init_it/6` badarg). The in-machine execution-position door
   (`src/context/position.rs`) already serves `process_info(self(), current_stacktrace)`, so it is no
   longer a boot blocker. No boot failure here is a wrong result.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both

@@ -126,30 +126,28 @@ blocks are logged to stdout), **19**
 `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}` (the **stop**),
 **20** `{apply,{c,erlangrc,[]}}`, **21** `{progress,started}`.
 Directives 0–18 run and the three `{kernelProcess, …}` startups (12–14) succeed.
-The stop has two causes, both out of node.
+The stop has one cause, out of node.
 **B2 — the per-module atom-table prefix snapshot** (`erts_rust/crates/beam_loader` +
 `erts_rust/crates/beam_engine`): `beam_loader::Module.atom_table` is an owned load-time prefix clone with
 no global fallback, so a token interned *after* the reader module loaded resolves to `None` and the engine
 raises `badarg` (`gen_server:init_it/6`, `gen_server.erl:2272`). On the plain route this kills the kernel
 application's `standard_error` `supervisor_bridge` child, so `kernel_sup` reports `start_error` and the
-`permanent` kernel application tears itself down. **B3' — the native baseline-JIT tier enters a non-tail
-same-module local `call` without consulting the local-call seam** (`erts_rust/crates/beam_engine`,
-`src/jit/baseline`), so `prim_tty:tty_create/1`'s `erlang:nif_error/1` stub body runs and raises `undef`;
-it is what kills `standard_error` on the shimmed route.
+`permanent` kernel application tears itself down; on a `-pa <shim>` route (a stale `gen.beam` seeding
+`supervisor_bridge`) the child starts and the same gap then kills `inet_db`.
 Directive 19's `application:load1/2` call then reaches no `application_controller`, so it raises
 `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`.
 **Raw figures.** Plain route: **stdout 80 lines / 3055 bytes** — the first report carries
 `initial call: supervisor_bridge:standard_error/1` and `in function gen_server:init_it/6 (gen_server.erl:2272)`,
 offender `{id,standard_error}`, **2** `=CRASH REPORT====` blocks. Shimmed route (`-pa <shim>` with a stale
-`gen.beam` seeding `supervisor_bridge`): **stdout 132 lines / 4850 bytes** — the first report is
-`=SUPERVISOR REPORT==== supervisor: {local,standard_error_sup} errorContext: child_terminated reason: undef offender: [{pid,<0.10.0>},{mod,standard_error}]`,
-and the walk advances past `file_server_2` to `{id,inet_db}` (`{mfargs,{inet_db,start_link,[]}}`) — no
-`already_started`.
+`gen.beam` seeding `supervisor_bridge`): **stdout 165 lines / 5834 bytes** — the first report is a
+`=CRASH REPORT====` for `initial call: prim_tty:writer/1` raising `error: bad argument` with
+`ancestors: [standard_error]`, and the walk advances past `file_server_2` to the terminal offender
+`{id,inet_db}` (`{mfargs,{inet_db,start_link,[]}}`, `gen_server:init_it/6` badarg) — no `already_started`.
 The full chain is in *Remaining gaps* item 1 below, together with the tests that assert the full
 22-directive completion and currently fail.
 The `BEAM_RT_BOOT_TRACE` trace (`src/debug_trace.rs`) confirms the ordering: directive 18's
 `apply application:start_boot /2` returns `Ok(Wait …)`, the drive runs the kernel application's start,
-the `standard_error` child raises `badarg`/`undef`, and directive 19's `apply` of the same MFA returns
+the `standard_error` child raises `badarg`, and directive 19's `apply` of the same MFA returns
 `Err` with the `{noproc, …}` reason.
 - **Instructions 20–21 are not reached, but both CAN run.** `c:erlangrc/0`'s file consult is
   `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
@@ -229,7 +227,7 @@ the `standard_error` child raises `badarg`/`undef`, and directive 19's `apply` o
   `apply` **returns `Ok`** — but the kernel application does **not** stay up: during that directive's
   scheduler drive its `standard_error` `supervisor_bridge` child raises `error:badarg` inside
   `gen_server:init_it/6` (`gen_server.erl:2272`) — the per-module atom-table prefix snapshot (*B2*
-  above; on the shimmed route the `undef` from `prim_tty:tty_create/1`, *B3'*) — `kernel_sup` reports
+  above; on the shimmed route the same gap reaches its next kernel child, `inet_db`) — `kernel_sup` reports
   `start_error`, and the `permanent` kernel application tears itself down. The seam that lets the application master's
   callback fun be entered is `RuntimeContext::resolve_local_fun` (`../context/execution.rs`): it
   resolves an **external** fun (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through
@@ -240,10 +238,9 @@ the `standard_error` child raises `badarg`/`undef`, and directive 19's `apply` o
 - **Directive 19's stdlib start is the stop.** `application:start_boot/2` reaches
   `application_controller:start_boot_application/2`, whose
   `gen_server:call(application_controller, {load_application,stdlib}, infinity)` finds **no**
-  `application_controller` — the kernel application is `permanent`, so the `standard_error` child crash
-  (the per-module atom-table prefix snapshot, *B2* above; on the shimmed route `prim_tty:tty_create/1`'s
-  `undef` stub, *B3'*) tore the whole kernel supervision tree, and the controller with it, down — so the
-  call raises
+  `application_controller` — the kernel application is `permanent`, so the kernel child crash
+  (the per-module atom-table prefix snapshot, *B2* above) tore the whole kernel supervision tree, and
+  the controller with it, down — so the call raises
   `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`, which
   `apply_boot_call` reports as the directive's typed error; the walk stops at index 19. The detail is
   in [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
@@ -256,7 +253,7 @@ and the four `cargo test --test boot` tests (`the_real_start_boot_runs_to_comple
 `the_boot_chains_kernel_processes_survive_their_directive_processes`,
 `the_cli_boot_registers_a_live_logger_process`) currently **fail** — each **only** because it asserts
 the FULL 22-directive completion (ending at `{progress,started}`) and the script stops at index 19.
-Their assertions are the contract and are kept unchanged; the stop has the two causes above
+Their assertions are the contract and are kept unchanged; the stop has the cause above
 (*Remaining gaps* item 1). `tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`
 fails on the same stop for the same reason.
 
@@ -281,22 +278,19 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **The kernel application's start fails and the boot stops at directive 19 — two cross-crate blockers
-   owned by `erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine` (B2) and
-   `erts_rust/crates/beam_engine` (B3').** Directive 19 is
+1. **The kernel application's start fails and the boot stops at directive 19 — a cross-crate blocker
+   owned by `erts_rust/crates/beam_loader` + `erts_rust/crates/beam_engine` (B2).** Directive 19 is
    `{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`; `application:start_boot/2`
    reaches `application_controller:start_boot_application/2`, whose
    `gen_server:call(application_controller, {load_application,stdlib}, infinity)` finds **no**
    `application_controller`, and so raises
-   `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`. The two
-   causes are: (i) **B2** — `beam_loader::Module.atom_table` is an owned load-time prefix clone with no
+   `{noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`. The cause
+   is **B2** — `beam_loader::Module.atom_table` is an owned load-time prefix clone with no
    global fallback, so a token interned *after* the reader module loaded resolves to `None` and the
    engine raises `badarg` in `gen_server:init_it/6` (`gen_server.erl:2272`); on the plain route that is
    the kernel application's `standard_error` `supervisor_bridge` child, so the `permanent` kernel
    application tears itself down and directive 19's `{load_application,stdlib}` call reaches no
-   controller. (ii) **B3'** — the native baseline-JIT tier enters a non-tail same-module local `call`
-   without consulting the local-call seam, so `prim_tty:tty_create/1`'s `erlang:nif_error/1` stub body
-   runs and raises `undef`; on the shimmed route that is what kills `standard_error`. The final
+   controller (on the shimmed `-pa` route the child starts and the same gap kills `inet_db`). The final
    `{progress,started}` (index 21) is therefore **not** reached. The per-link analysis, the minimal repros
    and the owning crates are in [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
    The tests that assert the full 22-directive completion and currently **fail** (they must keep
@@ -308,7 +302,7 @@ because it cannot be duplicated.
    The residual io-device divergence is a `{get_chars,…}` on a `{encoding,unicode}` **stream** counting BYTES where the oracle counts CHARACTERS, documented in `../native/file_server/CONTEXT.md`.
    Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode` (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s) and — for `{get_until,…}` only — a user-supplied continuation whose own code blocks in a `receive` (`../native/file_server/get_until.rs`, module header "A blocking continuation is a typed gap").
    The served device surface and the full gap list are itemised in `../native/CONTEXT.md`.
-4. **`beam_bifs`.** Whatever else the boot still needs to reach `{progress,started}` beyond the two causes in item 1.
+4. **`beam_bifs`.** Whatever else the boot still needs to reach `{progress,started}` beyond the cause in item 1.
 
 ## The system code path resolution (`../codeserver.rs`)
 `CodeServer::add_system_paths` resolves the *system* ebin set through `codeserver.rs::resolve_system_ebins`:
