@@ -95,7 +95,7 @@ use core::cmp::Ordering;
 use beam_codec::term as codec_term;
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_term::compare::cmp_arith;
-use beam_term::{atom_val, make_atom, signed_value, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, is_byte, make_atom, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
@@ -284,17 +284,36 @@ fn float_to_list_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // list_to_float/1
 // ---------------------------------------------------------------------------
 
-/// `list_to_float(String)`.
+/// `list_to_float(String)` — `intlist_to_buf` (`utils.c:2827-2849`) copies the
+/// list into a NUL-terminated `char` buffer handed to `sys_chars_to_double`.
+///
+/// Two C details decide the accept/reject set, and they differ from
+/// [`list_to_integer`]'s scan on purpose:
+///
+/// * Every element must **be** a byte, i.e. `is_byte` (`utils.c:2840`): the
+///   `byte c = unsigned_val(CAR(list))` store is guarded by `!is_byte` first, so
+///   an element outside `0..=255` (or a negative one) is `error:badarg`. Unlike
+///   `list_to_integer`, this reader must **not** truncate through
+///   [`element_byte`]: `list_to_float([49,46,304])` is `badarg`, never `1.0`.
+/// * The buffer is a C string, so an embedded NUL element terminates the text —
+///   while the elements *after* it are still byte-checked (`intlist_to_buf` walks
+///   the whole list before `sys_chars_to_double` ever sees it).
 fn list_to_float_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let elems = proper_list(args[0]).ok_or_else(badarg)?;
-    let mut text = String::with_capacity(elems.len());
-    for elem in elems {
-        if !access::is_small(elem) {
+    let mut bytes = Vec::with_capacity(elems.len());
+    for elem in &elems {
+        if !is_byte(*elem) {
             return Err(badarg());
         }
-        let byte = u8::try_from(signed_value(elem)).map_err(|_| badarg())?;
-        text.push(char::from(byte));
+        // `is_byte` proves the value is in `0..=255`, so the cast is exact.
+        bytes.push(signed_value(*elem) as u8);
     }
+    // The embedded-NUL truncation: `list_to_float([49,46,53,0,50])` ⇒ `1.5`.
+    let text: String = bytes
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| char::from(byte))
+        .collect();
     let value = parse_float(&text)?;
     ctx.make_float(value)
 }
