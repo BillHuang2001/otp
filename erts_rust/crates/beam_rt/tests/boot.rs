@@ -308,14 +308,18 @@ fn the_real_start_boot_runs_to_completion() {
     // The real `start.boot` now runs to completion: `boot_from_script` walks every directive
     // in order — loading each `primLoad` batch, running all three `kernelProcess` directives
     // (whose servers really register) and then `{apply,{c,erlangrc,[]}}`, whose file consult
-    // reaches the **native `file_server_2` service** the runtime registers at construction
-    // (`src/native/file_server.rs`). That service answers `{open,"$HOME/.erlang",[read]}` with
-    // `{error,enoent}` (this environment has no `$HOME/.erlang`), which `c:erlangrc/0` treats
-    // as success, so the executor reaches the final `{progress,started}` directive. It cannot
-    // panic or hang — `execute` drives the engine directly (never `run_scheduler`), so a
-    // blocking receive is the engine's typed `error::blocked()`, and every scheduler drive is
-    // bounded. A watchdog thread is impossible here because `Runtime` is `!Send`; the
-    // boundedness is the executor's own by construction.
+    // reaches `file_server_2`. On **this** route the name is the booted `kernel_sup`'s own
+    // `file_server_2` child (`lib/kernel/src/kernel.erl` starts `{file_server, start_link, []}`,
+    // which registers the name — `file_server.erl:266-269`), because `Runtime::new` spawns the
+    // runtime's **native** service *unclaimed* whenever a `-boot FILE` argument is configured
+    // (`src/runtime.rs`; `RuntimeConfig::boot_script`); on every other route that native service
+    // is the one registered under the name. The consult of `{open,"$HOME/.erlang",[read]}`
+    // fails with `{error,enoent}` (this environment has no `$HOME/.erlang`), which
+    // `c:erlangrc/0` treats as success, so the executor reaches the final `{progress,started}`
+    // directive. It cannot panic or hang — `execute` drives the engine directly (never
+    // `run_scheduler`), so a blocking receive is the engine's typed `error::blocked()`, and
+    // every scheduler drive is bounded. A watchdog thread is impossible here because
+    // `Runtime` is `!Send`; the boundedness is the executor's own by construction.
     let script = rt
         .boot_from_script(&path)
         .expect("the real start.boot runs to completion now that file_server_2 answers");
@@ -335,8 +339,8 @@ fn the_real_start_boot_runs_to_completion() {
         script.instructions.last()
     );
     // The last `apply` directive really is instruction 20 — `{apply,{c,erlangrc,[]}}`, whose
-    // file consult the native `file_server_2` service answers, so the chain proceeds to
-    // `{progress,started}`.
+    // file consult the `file_server_2` service registered by the booted `kernel_sup` answers on
+    // this route, so the chain proceeds to `{progress,started}`.
     assert!(
         matches!(
             script.instructions.get(20),

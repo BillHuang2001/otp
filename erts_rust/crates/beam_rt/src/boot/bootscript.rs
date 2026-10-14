@@ -1109,8 +1109,10 @@ mod tests {
     fn the_real_start_boot_executes_every_directive_to_progress_started() {
         // The full script loads every `primLoad` batch, spawns (and drives) the three kernel
         // processes, runs the four `apply` directives — the last of them, `{apply,{c,erlangrc,
-        // []}}`, against the runtime-native `file_server_2` service registered by
-        // `Runtime::new` — and ends at the final `{progress,started}`. It **must not** panic
+        // []}}`, against `file_server_2`, which on this (`-boot FILE`) route is the booted
+        // `kernel_sup`'s own `file_server` child because `Runtime::new` spawns the runtime's
+        // native service **unclaimed** when a boot script is configured — and ends at the final
+        // `{progress,started}`. It **must not** panic
         // or hang: every scheduler drive `execute` performs is bounded by its own deadline.
         //
         // Each instruction is executed in isolation here so a regression names the *exact*
@@ -1249,11 +1251,14 @@ mod tests {
             registered(&runtime, "application_controller"),
             "the application_controller server must survive its directive process"
         );
-        // The boot's own file service is a permanent runtime process, registered at
-        // construction and still registered after the script has consumed its replies.
+        // The boot's own file service. On **this** (`-boot FILE`) route `Runtime::new` spawns the
+        // runtime's **native** `file_server_2` service *unclaimed*, so the name belongs to the
+        // booted `kernel_sup`'s own `file_server` child (`lib/kernel/src/kernel.erl` starts it,
+        // `file_server.erl:266-269` registers it) — which must still hold the name after the
+        // script has consumed its replies.
         assert!(
             registered(&runtime, "file_server_2"),
-            "the native file_server_2 service must still be registered after the boot"
+            "the booted kernel's own file_server_2 child must still be registered after the boot"
         );
     }
 

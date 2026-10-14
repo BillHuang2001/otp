@@ -644,7 +644,7 @@ fn script_id_is_the_loaded_boot_scripts_real_header() {
     // In-process, through the runtime's own API: the same header, and the proof that the script's
     // `primLoad` batch really loaded a module (`erlang:module_loaded/1` — the boot-set divergence
     // itself is pinned by the sibling `module_loaded.rs` suite).
-    let Some(mut runtime) = booted_runtime() else {
+    let Some(mut runtime) = boot_script_runtime(&probe.script) else {
         return;
     };
     runtime
@@ -667,6 +667,47 @@ fn booted_runtime() -> Option<Runtime> {
         Ok(()) => Some(runtime),
         Err(error) => {
             eprintln!("SKIP a9_native_floor: boot needs the system Erlang install ({error})");
+            None
+        }
+    }
+}
+
+/// A runtime configured **exactly as the CLI configures a `-boot FILE` invocation** for `script`,
+/// or `None` — loudly — when the system Erlang install is unavailable or the invocation does not
+/// parse.
+///
+/// The **route** is part of the measurement, not an implementation detail: on the bare
+/// [`Runtime::with_defaults`] path (an empty command line, hence no `boot` init argument)
+/// [`Runtime::new`](beam_rt::Runtime::new) **registers** the native `file_server_2` service under
+/// that name, so a script that really starts `kernel` aborts its `kernel_sup` with
+/// `{shutdown,{failed_to_start_child,file_server_2,{already_started,_}}}` — and `kernel` is
+/// `permanent`, so the node tears down and the drive stops short of the script's end. A runtime
+/// built through the CLI's **own parser** carries the `-boot` argument
+/// ([`RuntimeConfig::boot_script`](beam_rt::RuntimeConfig::boot_script)), on which
+/// [`Runtime::new`](beam_rt::Runtime::new) spawns that service **unclaimed** so the booted
+/// `kernel_sup`'s own `file_server_2` child claims the name. This mirrors
+/// `tests/boot.rs::boot_cli_runtime` (the same construction, the same reason), so both suites
+/// measure the invocation the CLI really runs.
+fn boot_script_runtime(script: &Path) -> Option<Runtime> {
+    if booted_runtime().is_none() {
+        return None;
+    }
+    let argv = vec![
+        "-noshell".to_string(),
+        "-boot".to_string(),
+        script.to_string_lossy().into_owned(),
+    ];
+    let config = match beam_rt::parse(&argv) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("SKIP a9_native_floor: cannot build the `-boot` invocation's configuration ({error})");
+            return None;
+        }
+    };
+    match Runtime::new(config) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            eprintln!("SKIP a9_native_floor: no system Erlang install ({error})");
             None
         }
     }
