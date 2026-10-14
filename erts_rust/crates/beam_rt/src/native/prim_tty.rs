@@ -426,10 +426,26 @@ mod tests {
     #[test]
     fn an_unlisted_key_is_not_served() {
         let mut runtime = runtime();
-        for (function, arity) in [("load", 0u32), ("init", 1), ("isatty", 2)] {
-            let outcome = call(&mut runtime, "prim_tty", function, &[]);
-            assert!(outcome.is_err(), "{function}/{arity} must not be served");
-            assert_eq!(arity, arity);
+        // The floor owns exactly `NIF_KEYS`; every other `prim_tty:*` is an ordinary
+        // `lib/kernel/src/prim_tty.erl` body (`load/0`, `init/1`, `writer/1`, …), so
+        // `try_native` answers `None` for it (it then falls through to the real module),
+        // the local-call seam declines it, and `floor_shadows` lets it enter in-machine.
+        for (function, arity) in [("load", 0u32), ("init", 1), ("isatty", 2), ("handles", 1)] {
+            assert!(
+                !serves_local_call("prim_tty", function, arity),
+                "`prim_tty:{function}/{arity}` is not a NIF key"
+            );
+            assert!(
+                !crate::native::floor_shadows("prim_tty", function, arity),
+                "`prim_tty:{function}/{arity}` must stay enterable in-machine"
+            );
+            let mut sink = beam_bifs::NullSink;
+            let mut context =
+                crate::context::RuntimeContext::with_output(&mut runtime, &mut sink);
+            assert!(
+                context.try_native("prim_tty", function, arity, &[]).is_none(),
+                "the floor must not claim `prim_tty:{function}/{arity}`"
+            );
         }
     }
 
