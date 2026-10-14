@@ -43,6 +43,15 @@
 //!   and the executed module calls into a **helper** module that lives only in that
 //!   directory. A runtime that recorded the `-pa` without applying it could not resolve the
 //!   helper, so the case genuinely discriminates on *application*.
+//! * `flags_apply/erl_aflags_pz_does_not_shadow_a_stdlib_module` is the append-side companion:
+//!   the same compiled directory also holds a module *named* like a stdlib module
+//!   (`proplists`), is carried by `ERL_AFLAGS=-pz {dir}` (append), and the executed module
+//!   reduces `code:which(proplists) =:= <shadow beside ?MODULE>` to an integer — `0` when the
+//!   stdlib module still wins, which is the pinned answer. The reduction to an integer is
+//!   what makes the case expressible at all: the raw `code:which/1` answer is an
+//!   installation-absolute path (no portable golden), and the `-pa` side cannot be pinned
+//!   because a shadow that wins is loaded during the oracle's boot and crashes it. The oracle
+//!   argv carries no `-pz`; the directory reaches the code path only through the environment.
 //!
 //! Every golden below is the oracle's own output, verified with `differential run <id>`.
 //! The probe wrapper binds `V`/`C`/`R`, so no expression here binds those names.
@@ -363,6 +372,53 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "flags_apply/erl_aflags_pz_does_not_shadow_a_stdlib_module",
+            description: "an ERL_AFLAGS-carried -pz appends its dir, so the proplists.beam \
+                          shadow it holds does not shadow the stdlib module",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::ModuleEnv {
+                // `-pa` *prepends* and `-pz` *appends*, so a shadow of a stdlib module is only
+                // observable on the `-pa` side — and there the shadow wins, is loaded during the
+                // oracle's boot and crashes it (empty stdout, no comparable golden). The `-pz`
+                // side is expressible only by reducing `code:which/1` to an integer, which is
+                // what `go/0` does: `1` iff `proplists` resolves to the shadow beside this
+                // module, `0` iff it still resolves into the installation (the pinned answer).
+                run: ModuleRun {
+                    source: "-module(flags_apply_pz_main).\n\
+                             -export([go/0]).\n\
+                             go() ->\n\
+                                 Shadow = filename:join(\n\
+                                     filename:dirname(code:which(?MODULE)), \"proplists.beam\"),\n\
+                                 case code:which(proplists) =:= Shadow of\n\
+                                     true -> 1;\n\
+                                     false -> 0\n\
+                                 end.\n",
+                    module: "flags_apply_pz_main",
+                    function: "go",
+                    arity: 0,
+                    args: &[],
+                    nif: None,
+                },
+                // The shadow itself: a second module named like a stdlib module, compiled into
+                // the same directory the `-pz` flag carries. It is never called — its presence
+                // is the whole point.
+                extra: &[EmbeddedModule {
+                    module: "proplists",
+                    source: "-module(proplists).\n\
+                             -export([shadow_marker/0]).\n\
+                             shadow_marker() -> shadow.\n",
+                }],
+                // As in `flags_apply/erl_aflags_pa_puts_the_compiled_dir_on_the_code_path`, the
+                // oracle argv carries no `-pz`: the directory (and therefore the shadow) reaches
+                // the code path only through this environment.
+                env: &[("ERL_AFLAGS", "-pz {dir}")],
+            },
+            golden: Golden {
+                stdout: Some("0"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -481,6 +537,42 @@ mod tests {
         assert_eq!(
             find("flags_apply/erl_flags_plus_hmax_bounded_allocation").expr(),
             Some("length(lists:seq(1,1000))")
+        );
+    }
+
+    /// The append-side `-pz` case: a shadow of a stdlib module in the `-pz` directory must not
+    /// win, so the module's `code:which/1`-derived counter is the oracle's `0`.
+    #[test]
+    fn the_pz_case_pins_the_appended_dir_as_non_shadowing() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+        let case = find("flags_apply/erl_aflags_pz_does_not_shadow_a_stdlib_module");
+        assert_eq!(case.contracts, &[Contract::Cli]);
+        assert_eq!(case.golden.stdout, Some("0"));
+        assert_eq!(case.golden.exit_code, 0);
+        let CaseKind::ModuleEnv { run, extra, env } = case.kind else {
+            panic!("the -pz case is a ModuleEnv case");
+        };
+        assert_eq!(env, &[("ERL_AFLAGS", "-pz {dir}")]);
+        // The shadow is a *stdlib* module name compiled beside the runner, and the runner's
+        // observable is an integer (a module-run golden is a plain integer line).
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].module, "proplists");
+        assert!(extra[0].source.contains("-module(proplists)"));
+        assert!(
+            run.source.contains("code:which(proplists)"),
+            "the runner must observe the shadowed module: {}",
+            run.source
+        );
+        assert!(
+            run.source.contains("code:which(?MODULE)"),
+            "the shadow path is derived from the runner's own directory: {}",
+            run.source
+        );
+        assert_eq!(run.module, "flags_apply_pz_main");
+        assert_eq!(
+            (run.function, run.arity),
+            ("go", 0),
+            "the module-run entry point"
         );
     }
 }

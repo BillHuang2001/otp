@@ -63,7 +63,7 @@
 //! allocation that really grows the process heap (the runtime has no CLI or `system_info`
 //! surface for the strategy; `beam_rt`'s `tests/gc_strategy.rs` pins the selector itself).
 //!
-//! The widened recording surface at the end of this file (`flags/hidden_*` … `flags/plus_s_one_*`)
+//! The widened recording surface at the end of this file (`flags/hidden_*` … `flags/pz_*`)
 //! pins the remaining command-line shapes of A.6: a recognized distribution/launcher switch with
 //! no value (`-hidden`) or one value (`-remsh`/`-connect_all`/`-smp`/`-start_epmd`/`-mode`); the
 //! `-s` and `-run` Start instructions, which are consumed before `init` exactly as `-eval` is (so
@@ -73,6 +73,30 @@
 //! are case-sensitive); empty values; `-kernel` given twice; the interleaved `-pa`/`-pz`
 //! occurrence order; and the documented `+P`/`+Q`/`+S` minima. Every golden is the live oracle's
 //! output (OTP 29.1.1 / erts-17.1), verified with `differential run <id>`.
+//!
+//! The tail of the group adds the remaining switch *effects* observed through `system_info/1`:
+//! the `+S Sched:SchedOnline` form (`+S 4:2` → `schedulers_online` = 2), `+t N` (`atom_limit`),
+//! `+e N` (`ets_limit` — a request above the default raises the limit, one below it is clamped
+//! to the default floor 8192), `+B i` (`break_ignored`, with its no-switch contrast) and
+//! `+sbt db` (`thread_no_node_processor_spread`, beside the pre-existing `+sbt u` case); the
+//! `-env VAR VALUE` launcher switch, which is consumed before `init` and therefore recorded
+//! **neither** under its own name nor under the variable's (its *effect* — the variable being
+//! set in the child's environment — is a divergence and is deliberately not pinned); the
+//! implied `.` entry of the default code path; a multi-value `-setcookie`/`-pa`/`-pz`
+//! occurrence; and a non-existent `-pa`/`-pz` directory (dropped rather than stored).
+//!
+//! **Why no `-pz`-shadowing case lives in this file.** `-pz D` must *append* `D`, so a
+//! `proplists.beam` living in `D` must not shadow the stdlib module: `code:which(proplists)`
+//! still answers with the stdlib path. A plain `-`-switch case cannot express that, because
+//! `code:which/1` — and its only faithful alternative, `code:which(proplists) =:=
+//! filename:join(code:lib_dir(stdlib), "ebin/proplists.beam")` — answers with an
+//! *installation-absolute* path, so there is no host-independent golden; and no expression
+//! case can put a shadow *file* on the code path in the first place. The property is
+//! nevertheless pinned, in the one shape the harness can express: the `ModuleEnv` case
+//! `flags_apply/erl_aflags_pz_does_not_shadow_a_stdlib_module`, whose compiled directory
+//! carries the shadow and whose module reduces `code:which/1` to an integer. (The `-pa` half
+//! of the ordering is *not* pinnable the same way: a shadow that wins is loaded during the
+//! oracle's boot and crashes it, leaving an empty stdout instead of a comparable golden.)
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.6 cases: the `-noshell` flag and an arbitrary user flag.
@@ -1455,6 +1479,238 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // The newly-faithful switch surfaces: the `+S Sched:SchedOnline` form (only the online
+        // count is observable), the `-env` launcher switch (consumed before `init`, so *not*
+        // recorded), a multi-value `-setcookie` occurrence, the implied `.` code-path entry, and
+        // the `+t`/`+e`/`+B`/`+sbt` emulator flags, each through its own `system_info/1`
+        // observable. `+e` is pinned twice: a request above the default really raises the limit,
+        // and one below it is clamped to the documented default floor (8192 on both runtimes).
+        Case {
+            id: "flags/plus_s_total_online_sets_schedulers_online",
+            description: "the +S Sched:SchedOnline form sets the online scheduler count",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                // `+S 4:2` is "4 schedulers, 2 online": `schedulers_online/0` is the observable
+                // half (the total is `schedulers/0`, which the host CPU count can influence).
+                expr: "erlang:system_info(schedulers_online)",
+                extra_argv: &["+S", "4:2"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_switch_is_not_an_init_argument",
+            description: "the -env VAR VALUE launcher switch is consumed and never recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // `-env` is the `erl` launcher's own switch (it sets the variable in the spawned
+                // process environment), so `init` never sees it: neither its own name nor its
+                // variable name is an argument. (The *effect* — the variable being set — is a
+                // divergence and is deliberately NOT pinned; only the recording is.)
+                expr: "init:get_argument(env)",
+                extra_argv: &["-env", "differential_env_var", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_switch_value_is_not_an_init_argument",
+            description: "the -env variable name is not recorded as an init argument either",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_env_var)",
+                extra_argv: &["-env", "differential_env_var", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/setcookie_multiple_values_one_occurrence",
+            description: "one -setcookie occurrence may carry two values, recorded as one occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(setcookie)",
+                extra_argv: &["-setcookie", "a", "b"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97],[98]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/dot_is_on_the_code_path",
+            description: "the current directory is on the default code path",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // `.` is the code path's implied last entry; it is a literal (not a
+                // host-dependent absolute path), so the membership answer is portable.
+                expr: "lists:member(\".\", code:get_path())",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_t_sets_the_atom_table_size",
+            description: "the +t emulator flag sets the observable atom-table limit",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(atom_limit)",
+                extra_argv: &["+t", "100000"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 100000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_e_sets_the_ets_table_limit",
+            description: "the +e emulator flag raises the observable ETS-table limit",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(ets_limit)",
+                extra_argv: &["+e", "10000"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 10000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_e_request_below_the_default_is_clamped",
+            description: "a +e request below the default ETS limit is clamped to the floor",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                // The floor is the default limit (8192) — a constant, not a host property — so
+                // this pins the clamp rule itself; `+e 10000` above pins the effective raise.
+                expr: "erlang:system_info(ets_limit)",
+                extra_argv: &["+e", "10"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 8192"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_b_i_sets_break_ignored",
+            description: "the +B i emulator flag makes the break handler ignored",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(break_ignored)",
+                extra_argv: &["+B", "i"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_b_default_is_not_ignored",
+            description: "without +B the break handler is enabled, so break_ignored is false",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                // The contrast case for `flags/plus_b_i_sets_break_ignored`: the same observable
+                // without the switch, so the `+B i` effect is unambiguous.
+                expr: "erlang:system_info(break_ignored)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_sbt_db_sets_scheduler_bind_type",
+            description: "the +sbt db emulator flag selects thread_no_node_processor_spread",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                // `db` = "default binding, no node/processor spreading" — the same observable as
+                // `flags/plus_sbt_sets_scheduler_bind_type` (which pins `u`).
+                expr: "erlang:system_info(scheduler_bind_type)",
+                extra_argv: &["+sbt", "db"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok thread_no_node_processor_spread"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/pa_multiple_values_one_occurrence",
+            description: "one -pa occurrence may carry two directories, recorded as one occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pa)",
+                extra_argv: &["-pa", "a", "b"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97],[98]]]}"),
+                exit_code: 0,
+            },
+        },
+        // A non-existent code-path directory is dropped rather than stored: `.` is on the path
+        // but the bogus literal is not, on either `-pa` (prepend) or `-pz` (append).
+        Case {
+            id: "flags/pa_nonexistent_dir_is_not_on_the_code_path",
+            description: "a -pa directory that does not exist never reaches code:get_path/0",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "lists:member(\"/nonexistent-differential-dir\", code:get_path())",
+                extra_argv: &["-pa", "/nonexistent-differential-dir"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/pz_nonexistent_dir_is_not_on_the_code_path",
+            description: "a -pz directory that does not exist never reaches code:get_path/0",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "lists:member(\"/nonexistent-differential-dir\", code:get_path())",
+                extra_argv: &["-pz", "/nonexistent-differential-dir"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/pz_multiple_values_one_occurrence",
+            description: "one -pz occurrence may carry two directories, recorded as one occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pz)",
+                extra_argv: &["-pz", "a", "b"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97],[98]]]}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1511,19 +1767,25 @@ mod tests {
                 expr.starts_with("init:get_argument(")
                     || expr == "init:get_plain_arguments()"
                     || expr.starts_with("erlang:system_info(")
+                    // The code-path membership probes (the implied `.` entry, and the dropped
+                    // non-existent `-pa`/`-pz` directories) are the other half of the flag
+                    // contract: a switch is not only *recorded* but *applied*.
+                    || expr.starts_with("lists:member(")
                     || expr == "length(lists:seq(1,1000))"
                     // The `BEAM_RT_GC_STRATEGY` host opt-in has no `init`/`system_info`
                     // observable either, so it too is pinned by acceptance — with an
                     // allocation big enough to grow the heap (see `flags/env_gc_strategy_*`).
                     || expr == "length(lists:seq(1,100000))",
                 "case {}: A.6 is observed through init:get_argument/1, get_plain_arguments/0, \
-                 (for a +-flag) erlang:system_info/1, or (for an argv flag with no other \
-                 observable) the bounded-allocation acceptance probe, got {expr}",
+                 (for a +-flag) erlang:system_info/1, a code-path membership probe, or (for an \
+                 argv flag with no other observable) the bounded-allocation acceptance probe, \
+                 got {expr}",
                 case.id
             );
             // The golden is the valueless `-noshell` occurrence `[]`, the error atom, a
-            // list of per-occurrence value lists, the (always empty) plain-argument list, or
-            // (for a `+`-flag / `ERL_MAX_PORTS` request) an integer `system_info/1` value.
+            // list of per-occurrence value lists, the (always empty) plain-argument list, a
+            // code-path membership boolean, or (for a `+`-flag / `ERL_MAX_PORTS` request) an
+            // integer `system_info/1` value.
             let golden = case.golden.stdout.expect("every case pins a golden");
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
             let is_int_value = golden
@@ -1534,6 +1796,7 @@ mod tests {
                     || golden == "ok error"
                     || golden == "ok []"
                     || golden == "ok true"
+                    || golden == "ok false"
                     || golden == "ok unbound"
                     || is_int_value,
                 "case {}: unexpected golden {golden:?}",
@@ -2083,6 +2346,151 @@ mod tests {
             assert_eq!(case.extra_argv(), argv, "case {id}: the emulator flag");
             assert_eq!(case.expr(), Some(expr), "case {id}");
             assert!(case.env().is_empty(), "case {id}: a +-flag is not an env case");
+        }
+    }
+
+    /// The tail of the group: the emulator-flag *effects* (`+S Sched:Online`, `+t`, `+e`, `+B`,
+    /// `+sbt db`), the `-env` launcher switch (consumed before `init`, so recorded nowhere), the
+    /// implied `.` code-path entry, the code-path switches with several values in one
+    /// occurrence, and the dropped non-existent `-pa`/`-pz` directory. Each golden is the live
+    /// oracle's own answer for its own argv, so a switch that stopped being *applied* (rather
+    /// than merely accepted) surfaces on its own case.
+    #[test]
+    fn the_switch_effects_pin_the_oracle_answers() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+
+        // The `system_info/1` observables: these flags are consumed by the emulator, so the
+        // observable is the *other* half of A.6 — an applied value, not a recording.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/plus_s_total_online_sets_schedulers_online",
+                &["+S", "4:2"][..],
+                "erlang:system_info(schedulers_online)",
+                "ok 2",
+            ),
+            (
+                "flags/plus_t_sets_the_atom_table_size",
+                &["+t", "100000"][..],
+                "erlang:system_info(atom_limit)",
+                "ok 100000",
+            ),
+            (
+                "flags/plus_e_sets_the_ets_table_limit",
+                &["+e", "10000"][..],
+                "erlang:system_info(ets_limit)",
+                "ok 10000",
+            ),
+            (
+                "flags/plus_e_request_below_the_default_is_clamped",
+                &["+e", "10"][..],
+                "erlang:system_info(ets_limit)",
+                "ok 8192",
+            ),
+            (
+                "flags/plus_b_i_sets_break_ignored",
+                &["+B", "i"][..],
+                "erlang:system_info(break_ignored)",
+                "ok true",
+            ),
+            (
+                "flags/plus_b_default_is_not_ignored",
+                &[][..],
+                "erlang:system_info(break_ignored)",
+                "ok false",
+            ),
+            (
+                "flags/plus_sbt_db_sets_scheduler_bind_type",
+                &["+sbt", "db"][..],
+                "erlang:system_info(scheduler_bind_type)",
+                "ok thread_no_node_processor_spread",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(
+                case.contracts,
+                &[Contract::Cli, Contract::Introspection],
+                "{id}"
+            );
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the emulator flag");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(case.env().is_empty(), "case {id}: a +-flag is not an env case");
+        }
+
+        // The recording family: `-env` is consumed before `init` (so neither its own name nor
+        // its variable name is an argument), while a multi-value `-setcookie`/`-pa`/`-pz`
+        // occurrence stays **one** occurrence carrying both values.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/env_switch_is_not_an_init_argument",
+                &["-env", "differential_env_var", "hello"][..],
+                "init:get_argument(env)",
+                "ok error",
+            ),
+            (
+                "flags/env_switch_value_is_not_an_init_argument",
+                &["-env", "differential_env_var", "hello"][..],
+                "init:get_argument(differential_env_var)",
+                "ok error",
+            ),
+            (
+                "flags/setcookie_multiple_values_one_occurrence",
+                &["-setcookie", "a", "b"][..],
+                "init:get_argument(setcookie)",
+                "ok {ok,[[[97],[98]]]}",
+            ),
+            (
+                "flags/pa_multiple_values_one_occurrence",
+                &["-pa", "a", "b"][..],
+                "init:get_argument(pa)",
+                "ok {ok,[[[97],[98]]]}",
+            ),
+            (
+                "flags/pz_multiple_values_one_occurrence",
+                &["-pz", "a", "b"][..],
+                "init:get_argument(pz)",
+                "ok {ok,[[[97],[98]]]}",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli], "{id}");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the recorded argv");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(
+                case.env().is_empty(),
+                "case {id}: a command-line switch is not an env case"
+            );
+        }
+
+        // The code-path family: `.` is implied by default, and a directory that does not exist
+        // is dropped instead of stored — on both the prepend (`-pa`) and append (`-pz`) side.
+        let nonexistent = "/nonexistent-differential-dir";
+        for (id, argv, expr, golden) in [
+            (
+                "flags/dot_is_on_the_code_path",
+                &[][..],
+                "lists:member(\".\", code:get_path())",
+                "ok true",
+            ),
+            (
+                "flags/pa_nonexistent_dir_is_not_on_the_code_path",
+                &["-pa", nonexistent][..],
+                "lists:member(\"/nonexistent-differential-dir\", code:get_path())",
+                "ok false",
+            ),
+            (
+                "flags/pz_nonexistent_dir_is_not_on_the_code_path",
+                &["-pz", nonexistent][..],
+                "lists:member(\"/nonexistent-differential-dir\", code:get_path())",
+                "ok false",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli], "{id}");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the code-path argv");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
         }
     }
 }
