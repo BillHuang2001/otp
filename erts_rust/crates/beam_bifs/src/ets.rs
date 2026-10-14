@@ -73,6 +73,13 @@
 //! a **live** table — the verified system `erl` behaviour (it does **not** return
 //! `undefined`).
 //!
+//! `ets:info/2` also serves the items that are *not* part of the `info/1` list —
+//! `fixed`, `safe_fixed`/`safe_fixed_monotonic_time`, `binary` and `stats` (see
+//! [`info_field`] and [`table_holds_a_bitstring`]); the two items whose value comes
+//! from table state this crate cannot represent (`safe_fixed*` on a *fixed* table,
+//! `stats` outright, `binary` when the table really holds a binary) answer the typed
+//! `unsupported_bif` gap rather than a fabricated value.
+//!
 //! A *well-formed* table argument that names no live table is the other way round:
 //! both arities answer the bare atom `undefined` (verified on erts-17.1) — an unknown
 //! atom, an atom naming a table that was *not* created with `named_table`, and a
@@ -194,8 +201,8 @@ use beam_process::ProcessId;
 use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access::{
-    is_atom, is_list, is_nil, is_small, is_tuple, make_ref_thing, ref_thing_id, tuple_element,
-    tuple_size,
+    car, cdr, is_atom, is_bitstring, is_list, is_map, is_nil, is_small, is_tuple, make_ref_thing,
+    map_pairs_storage_order, ref_thing_id, tuple_element, tuple_size,
 };
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
@@ -848,6 +855,7 @@ fn info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     };
     let table = take_table(ctx, handle)?;
     let info = table.info();
+    let fixed = table.is_fixed();
     restore_table(ctx, handle, table)?;
     let profile = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
@@ -857,7 +865,7 @@ fn info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let mut pairs = Vec::with_capacity(INFO_ITEMS.len());
     for item in INFO_ITEMS {
         let key = ctx.intern_atom(item)?;
-        let value = info_field(ctx, &info, profile, item)?;
+        let value = info_field(ctx, &info, profile, fixed, item)?;
         pairs.push(ctx.tuple(&[key, value])?);
     }
     ctx.list(&pairs)
@@ -891,12 +899,30 @@ fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     let table = take_table(ctx, handle)?;
     let info = table.info();
+    let fixed = table.is_fixed();
+    // `binary` is the one item whose value comes from the table's *contents*
+    // rather than from the [`TableInfo`] snapshot: the oracle runs
+    // `erts_internal:ets_info_binary/1`, which walks every object and reports the
+    // shared off-heap binaries it holds as `{BinaryId, Size, RefCount}` triples.
+    // Those ids (host addresses) and reference counts are ERTS internals this
+    // crate cannot reproduce, so a table that holds a binary is the typed gap
+    // while one that holds none answers the oracle's `[]` (verified: `[]` for an
+    // empty table, an integer-valued one and every kind).
+    if name == "binary" {
+        let holds_binary = table_holds_a_bitstring(&table)?;
+        restore_table(ctx, handle, table)?;
+        return if holds_binary {
+            Err(unsupported_bif())
+        } else {
+            ctx.list(&[])
+        };
+    }
     restore_table(ctx, handle, table)?;
     let profile = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         tables.profile(handle)
     };
-    info_field(ctx, &info, profile, &name)
+    info_field(ctx, &info, profile, fixed, &name)
 }
 
 /// `ets:tab2list(Tab)` — every object of the table, in iteration order.
@@ -1624,11 +1650,33 @@ pub(super) fn element_pos(term: Eterm) -> Result<usize> {
 /// creation-time `profile` for the forms the model's boolean cannot express (the
 /// atom `auto` and the hidden lock-count tuple) and the boolean otherwise.
 ///
+/// Three items of the oracle's `ets:info/2` surface are **not** part of
+/// [`INFO_ITEMS`] — `fixed`, `safe_fixed`/`safe_fixed_monotonic_time` and `stats`
+/// — and are answered here for [`info_2`] only (`binary` is answered by [`info_2`]
+/// itself, since it needs the table's *contents*; see [`table_holds_a_bitstring`]):
+///
+/// * `fixed` is the oracle's `IS_FIXED(tb)` (`erl_db_util.h:386`) — whether *any*
+///   process currently holds a fixation of the table — which `fixed` (the value
+///   [`beam_ets::Table::is_fixed`] reported while the table was taken) carries.
+/// * `safe_fixed`/`safe_fixed_monotonic_time` are `false` on an **unfixed** table
+///   (the ordinary case, matching the oracle). On a fixed one the oracle answers
+///   `{FixationTime, [{Pid, RefCount}]}`, which needs the fixation's timestamp and
+///   the per-process reference counts — state the table model does not keep (it
+///   has a single boolean) — so that case is the typed gap rather than a
+///   fabricated tuple.
+/// * `stats` is a typed gap: the oracle answers it from the interior's chain/tree
+///   statistics (an eight-element hash tuple for `set`/`bag`/`duplicate_bag`, a
+///   three-element catree tuple for a fine-locked `ordered_set`), and those counts
+///   (active slots, average/standard-deviation chain length, per-lock fields) live
+///   in the ERTS interiors `beam_ets` does not expose. They must not be
+///   fabricated, so the item is left to the runtime to close.
+///
 /// [`entries`]: TableInfo::entries
 fn info_field(
     ctx: &mut BifContext<'_>,
     info: &TableInfo,
     profile: Option<resolve::TableProfile>,
+    fixed: bool,
     item: &str,
 ) -> Result<Eterm> {
     match item {
@@ -1678,8 +1726,67 @@ fn info_field(
         "type" => ctx.intern_atom(info.kind.as_atom_name()),
         "keypos" => ctx.int(info.keypos as i64),
         "protection" => ctx.intern_atom(info.access.as_atom_name()),
+        // `IS_FIXED(tb) != 0` — whether any process currently holds a fixation of
+        // the table. An ordinary (unfixed) table answers `false`, exactly as the
+        // oracle.
+        "fixed" => ctx.boolean(fixed),
+        // `false` while unfixed (the ordinary case). A *fixed* table's
+        // `{FixationTime, [{Pid, RefCount}]}` needs the fixation timestamp and the
+        // per-process reference counts the table model does not keep, so it is the
+        // typed gap (see the `info_field` doc).
+        "safe_fixed" | "safe_fixed_monotonic_time" => {
+            if fixed {
+                Err(unsupported_bif())
+            } else {
+                ctx.boolean(false)
+            }
+        }
+        // The interior's chain/tree statistics, which `beam_ets` does not expose —
+        // see the `info_field` doc.
+        "stats" => Err(unsupported_bif()),
         _ => Err(badarg()),
     }
+}
+
+/// Whether any object of `table` contains a bitstring anywhere.
+///
+/// The `ets:info(T, binary)` item reports the table's *shared off-heap* binaries
+/// as `{BinaryId, Size, RefCount}` triples (the oracle walks the table through
+/// `erts_internal:ets_info_binary/1`); this crate cannot reproduce those host
+/// addresses or ERTS reference counts, so [`info_2`] uses this predicate to tell
+/// the oracle's two answers apart: the empty list when the table holds no binary
+/// at all, and the typed gap when it does.
+///
+/// The walk is iterative — one work list, never native recursion — so a deeply
+/// nested object cannot overflow the stack: a tuple contributes its elements, a
+/// list its head and tail, a map its keys and values, and a bitstring is the
+/// sought leaf (the oracle counts a non-byte-aligned bitstring too).
+///
+/// # Errors
+///
+/// Propagates [`crate::access::map_pairs_storage_order`]'s error. A stored object
+/// is always a well-formed map there (the copy boundary validated it on insert),
+/// so the error is unreachable in practice.
+fn table_holds_a_bitstring(table: &Table) -> Result<bool> {
+    let mut work: Vec<Eterm> = table.tab2list();
+    while let Some(term) = work.pop() {
+        if is_bitstring(term) {
+            return Ok(true);
+        } else if is_tuple(term) {
+            for i in 0..tuple_size(term) {
+                work.push(tuple_element(term, i));
+            }
+        } else if is_list(term) {
+            work.push(car(term));
+            work.push(cdr(term));
+        } else if is_map(term) {
+            for (key, value) in map_pairs_storage_order(term)? {
+                work.push(key);
+                work.push(value);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The term of the `ets:info(T, write_concurrency)` value the model's
