@@ -128,7 +128,7 @@ use crate::perf_map::{self, PerfMapConfig};
 use crate::runtime::Runtime;
 
 mod env;
-mod flags;
+pub(crate) mod flags;
 mod vars;
 pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
 pub use vars::{from_env, ErlEnv};
