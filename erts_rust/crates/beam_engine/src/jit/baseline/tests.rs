@@ -1703,6 +1703,183 @@ fn a_collecting_helper_does_not_leave_a_cached_heap_term_stale() {
 }
 
 // ---------------------------------------------------------------------------
+// the written-set exit spill must leave an un-written cached register alone
+// ---------------------------------------------------------------------------
+
+/// The sentinel the probe BIF's host answer carries — the value the *helper* (the
+/// interpreter) writes into `machine.x`, not the block's cached register. A
+/// full-cache exit spill would store the block's stale cached argument over it.
+const HELPER_SENTINEL: i64 = 999;
+
+/// A context that answers the probe BIF `probe:mark/1` with the fixed small-int
+/// [`HELPER_SENTINEL`], delegating the heap and every other BIF to a
+/// [`MinimalContext`].
+struct SentinelBifCtx {
+    inner: MinimalContext,
+}
+
+impl SentinelBifCtx {
+    fn new() -> SentinelBifCtx {
+        SentinelBifCtx {
+            inner: MinimalContext::new(),
+        }
+    }
+}
+
+impl ExecutionContext for SentinelBifCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        if module == "probe" && function == "mark" && arity == 1 {
+            return Ok(make_small(HELPER_SENTINEL));
+        }
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+}
+
+/// **The written-set exit-spill soundness pin.** A cached x-register that no inline
+/// lowering of the block writes still holds exactly its `machine.x` value at every
+/// program point, so a block exit's [`spill`](super::emit::regs::spill) — which stores
+/// only [`Allocation::written`](super::emit::Allocation) — may skip it. It also
+/// **must**: a helper *is* the interpreter and writes `machine.x` directly, so storing a
+/// stale cached register over the helper's fresh word would clobber it. This test proves
+/// the invariant the whole partial-spill/partial-fill model rests on.
+///
+/// The experiment is a body block that caches x1 but never writes it:
+///
+/// * `move x1 -> x0` is inlined and charges x1 (its source) and x0 (its destination), so
+///   the allocator caches **both** — but the write set is `{x0}` only (`move`'s
+///   destination register);
+/// * a deopted `gc_bif` whose destination is x1 is a shape neither
+///   [`fast_arith`](super::emit::fast_arith) nor
+///   [`comparison_shape`](super::emit::comparison_shape) claims, so it runs through
+///   `jit_step_one` — the interpreter — which writes the helper's sentinel into
+///   `machine.x[1]`;
+/// * nothing later reads x1, so x1 is dead after the helper and is left out of the
+///   post-helper fill set at that pc;
+/// * the inlined `return`'s pre-helper spill stores the write set `{x0}` only.
+///
+/// So `machine.x[1]` keeps the helper's sentinel. Under a full-cache exit-spill model the
+/// block would store its stale cached x1 (the `22` argument) over it — which is exactly
+/// the observable that catches an unsound spill set. The post-helper fill-set analysis in
+/// [`super::emit::liveness`] IS this model: a cached register left out of the fill set is
+/// only ever overwritten, never read.
+#[test]
+fn the_written_set_exit_spill_leaves_an_unwritten_cached_register_untouched() {
+    let module = build_module(
+        "written_set_spill",
+        &[("probe", "mark", 1)],
+        vec![(
+            "f",
+            2,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                // Inlined: charges x1 (source) + x0 (destination); the write set is x0.
+                Instr::Move {
+                    src: Operand::X(1),
+                    dst: Operand::X(0),
+                },
+                // A non-inlined BIF (arity 1, an import the fast paths decline): it
+                // contributes no native touch and no write, and its interpreter step
+                // writes `machine.x[1]`.
+                Instr::GcBif {
+                    arity: 1,
+                    bif: ImportRef(0),
+                    fail: NO_FAIL,
+                    live: 2,
+                    args: vec![Operand::X(0)],
+                    dst: Operand::X(1),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 2, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+
+    // (a) x1 must really be cached, or the experiment proves nothing: a register
+    // addressed directly in `machine.x` is always current.
+    let compiled = compile_module(&module).expect("compile the module");
+    assert!(
+        compiled.cached_registers().contains(&1),
+        "x1 must be held in a machine register by the body block, got {:?}",
+        compiled.cached_registers()
+    );
+
+    // The interpreter's own outcome, for the cross-tier comparison.
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = SentinelBifCtx::new();
+    let interpreter_outcome = interpreter.run_export_outcome_with_tier(
+        &module,
+        name,
+        2,
+        &[make_small(11), make_small(22)],
+        &mut interpreter_ctx,
+        Tier::Interpreter,
+    );
+
+    let mut machine = Machine::new();
+    let mut ctx = SentinelBifCtx::new();
+    let baseline_outcome = run_compiled_outcome(
+        &compiled,
+        &mut machine,
+        &module,
+        name,
+        2,
+        &[make_small(11), make_small(22)],
+        &mut ctx,
+    );
+
+    // (c) the outcome is the interpreter's: the inlined `move x1 -> x0` leaves x0 = 22,
+    // and the BIF's write to x1 is not what `return` yields.
+    assert_same_outcome(
+        "written-set exit spill",
+        &interpreter_outcome,
+        &baseline_outcome,
+        &module.atom_table,
+    );
+    assert_eq!(
+        baseline_outcome.expect("the run deopts and returns"),
+        RunOutcome::Returned(make_small(22)),
+        "the inlined `move x1 -> x0` left x0 = 22"
+    );
+
+    // (b) the helper's write to `machine.x[1]` survived the block's exit spill: the exit
+    // spill stores only the write set (`{x0}`), so the stale cached x1 is never stored
+    // over it. A full-cache spill would clobber it with the cached `22`.
+    assert_eq!(
+        machine.x(1),
+        Some(make_small(HELPER_SENTINEL)),
+        "the exit spill must not store the un-written cached x1 over the helper's \
+         `machine.x[1]`; a full-cache spill writes the stale cached argument (22) here"
+    );
+    assert_eq!(
+        interpreter.x(1),
+        Some(make_small(HELPER_SENTINEL)),
+        "the interpreter tier's `machine.x[1]` is the helper's write too"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // the block-entry position store
 // ---------------------------------------------------------------------------
 
@@ -4521,8 +4698,13 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.spill_calls_by_site,
     );
     println!(
-        "  fill registers={} (by site {:?}); fill calls={:?}",
-        counters.fill_registers, counters.fill_registers_by_site, counters.fill_calls_by_site,
+        "  fill registers: partial={} (by site {:?}) vs full-cache={} (by site {:?}); \
+         fill calls={:?}",
+        counters.fill_registers,
+        counters.fill_registers_by_site,
+        counters.fill_registers_full,
+        counters.fill_registers_by_site_full,
+        counters.fill_calls_by_site,
     );
     let mut rows: Vec<(&String, &u64)> = counters.deopts_by_variant.iter().collect();
     rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -4827,6 +5009,82 @@ fn the_entry_module_priming_is_measured_on_both_tiers() {
         "baseline/interpreter ns-per-op ratio: UNPRIMED {:.2}x, PRIMED {:.2}x",
         baseline_unprimed.ns_per_op / interpreter_unprimed.ns_per_op,
         baseline_primed.ns_per_op / interpreter_primed.ns_per_op,
+    );
+    println!("loadavg (end): {}", probe_loadavg());
+}
+
+/// How many interleaved A/B passes the copy-bound tier comparison runs (the objective
+/// asks for `N ≥ 5`; 7 gives a little slack against a single loaded pass).
+const AB_PASSES: usize = 7;
+
+/// **The interleaved, same-window A/B**: the two-process copy-bound shape on both tiers,
+/// pass by pass, in one measurement window — so a shared host's load drifts **both** sides
+/// together and the min-over-N (taken independently per tier) is the honest figure. The
+/// block register cache's spill/fill traffic moved with the liveness-based partial model
+/// (see the structural counters above); this asks whether that moved the **wall clock** on
+/// the most spill/helper-heavy shape those counters reveal.
+///
+/// The cache is **primed** first (`remember_module` once per module the host enters). The
+/// probe's modules are synthetic (`Module::default()`-based, hence an all-zero checksum),
+/// so an unprimed baseline slice re-hashes the module's whole decoded IR on every slice
+/// entry/resume — the documented artifact of
+/// [`the_entry_module_priming_is_measured_on_both_tiers`] — which would swamp the tier's
+/// own execution work. Priming leaves the A/B measuring exactly the work this change
+/// touches, and the zero-fingerprint assertion below proves the priming held.
+///
+/// Assertions are correctness only (each pass's result and that both inboxes drained); the
+/// ns/op figures and their ratio are printed, never asserted — the host is shared, so the
+/// structural counters remain the honest evidence for the spill/fill change.
+#[test]
+fn the_copy_bound_tier_ab_is_interleaved_and_min_over_n() {
+    let (bench, bench_atom, worker, worker_atom) = probe_modules();
+    let bench = std::sync::Arc::new(bench);
+    let worker = std::sync::Arc::new(worker);
+    // Prime: an O(1) memo entry per entered module, so no pass re-hashes the module IR.
+    crate::jit::cache::remember_module(&bench);
+    crate::jit::cache::remember_module(&worker);
+
+    println!(
+        "=== interleaved A/B: two-process copy-bound shape (primed), N={AB_PASSES} passes ==="
+    );
+    println!("loadavg (start): {}", probe_loadavg());
+
+    let mut interpreter_passes = Vec::with_capacity(AB_PASSES);
+    let mut baseline_passes = Vec::with_capacity(AB_PASSES);
+    for pass in 0..AB_PASSES {
+        let interpreter =
+            time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::Interpreter);
+        let baseline = time_probe_shape(&bench, bench_atom, &worker, worker_atom, Tier::BaselineJit);
+        assert_eq!(
+            interpreter.fingerprints, 0,
+            "the interpreter tier resolves no module through the JIT cache"
+        );
+        assert_eq!(
+            baseline.fingerprints, 0,
+            "a primed baseline pass must not re-hash the module IR"
+        );
+        println!(
+            "  pass {pass}: {:>12} {:>10.2} ns/op | {:>12} {:>10.2} ns/op",
+            Tier::Interpreter.name(),
+            interpreter.ns_per_op,
+            Tier::BaselineJit.name(),
+            baseline.ns_per_op,
+        );
+        interpreter_passes.push(interpreter.ns_per_op);
+        baseline_passes.push(baseline.ns_per_op);
+    }
+
+    let min = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+    let interpreter_min = min(&interpreter_passes);
+    let baseline_min = min(&baseline_passes);
+    println!(
+        "min over {AB_PASSES} passes: {:>12} {:>10.2} ns/op | {:>12} {:>10.2} ns/op | \
+         baseline/interpreter = {:.3}x",
+        Tier::Interpreter.name(),
+        interpreter_min,
+        Tier::BaselineJit.name(),
+        baseline_min,
+        baseline_min / interpreter_min,
     );
     println!("loadavg (end): {}", probe_loadavg());
 }
