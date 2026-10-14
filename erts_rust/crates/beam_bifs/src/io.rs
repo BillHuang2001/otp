@@ -553,25 +553,41 @@ fn elem_byte(items: &[FmtElem], i: usize) -> Option<u8> {
 
 /// `io_lib_format:count_small/1` over **one** verbatim element (`FmtElem::Lit`).
 ///
-/// The oracle dispatches on the element's *shape*: a top-level **binary** element is
-/// measured by `string:length/1` — grapheme clusters, and the structured
-/// `{badarg, Bin}` raise for a binary that is not valid UTF-8 — while a list (or an
-/// integer) element is measured by `io_lib:chars_length/1`
-/// (`try iolist_size(S) catch _:_ -> string:length(S) end`, so a binary nested
-/// *inside* a list element is safe). The binary arm's raise is observable even with
-/// no `chars_limit` at all — `io_lib:format([<<255>>], [])` ⇒ `error:{badarg,
-/// <<255>>}` — because `io_lib_format:build/2` runs `count_small/1` on every format
-/// list, so **both** rendering paths call this.
+/// The oracle dispatches on the element's *shape*:
+///
+/// * a top-level **binary** element is measured by `string:length/1` — grapheme
+///   clusters, and a raise for a binary that is not valid UTF-8 — while a list /
+///   integer element is measured by `io_lib:chars_length/1`
+///   (`try iolist_size(S) catch _:_ -> string:length(S) end`, so a binary nested
+///   *inside* a list element is safe) or by the plain `is_integer(C) -> Other + 1`
+///   clause, which is what a bare integer above 255 (or an atom name's code point)
+///   takes;
+/// * the binary arm's raise is observable even with no `chars_limit` at all —
+///   `io_lib:format([<<255>>], [])` ⇒ `error:badarg` — because
+///   `io_lib_format:build/2` runs `count_small/1` on every format list, so **both**
+///   rendering paths call this.
+///
+/// The reason is the **bare** `badarg`, not the structured `{badarg, Bin}` that
+/// `string:length/1` itself raises: `io_lib:format/2` wraps `io_lib_format:fwrite`
+/// in a catch-all that re-raises `erlang:error(badarg, [Format, Args])`
+/// (`../../lib/stdlib/src/io_lib.erl:350-356`).
 fn literal_other(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<i64> {
-    if let Chunk::Bin(bytes) = chunk {
-        let term = bits::make_binary(ctx.heap(), bytes)?;
-        let count = crate::unicode::grapheme::grapheme_count(ctx, term)?;
-        if !is_small(count) {
-            return Err(badarg());
+    match chunk {
+        Chunk::Bin(bytes) => {
+            // `string:length/1` counts grapheme clusters and raises on a binary
+            // whose head is not a valid UTF-8 sequence; either outcome lands here.
+            let term = bits::make_binary(ctx.heap(), bytes)?;
+            let count = crate::unicode::grapheme::grapheme_count(ctx, term).map_err(|_| badarg())?;
+            if !is_small(count) {
+                return Err(badarg());
+            }
+            Ok(signed_value(count))
         }
-        return Ok(signed_value(count));
+        // `count_small/1`'s `is_integer(C) -> Other + 1`: one character, whether the
+        // element is `20013`, a bignum, or an atom name's code point above 255.
+        Chunk::Char(_) | Chunk::Int(_) => Ok(1),
+        Chunk::List(_) => i64::try_from(chars_length_chunk(ctx, chunk)?).map_err(|_| badarg()),
     }
-    i64::try_from(chars_length_chunk(ctx, chunk)?).map_err(|_| badarg())
 }/// The control-sequence prefix shared by every directive
 /// (`io_lib_format:collect_cseq/2`).
 ///
