@@ -866,3 +866,155 @@ behaviour-adjacent, so this is the authoritative check that no result moved.
 - **Cold start:** `perf_call`'s path C spawns/loads per run and the example compiles the fixture
   with `erlc` once per invocation, so its *first* samples carry first-entry compile + load cost;
   the slope cancels that, the absolute ms do not.
+## The BIF-result copy-out cut (`COPY-OUT-CUT`)
+
+HEAD `9d238e22bc8f143cec056e95ca9d19af0fa960b7` (BEFORE) → `4de5b69109e93a116c38793054b472fab35190ec` (AFTER).
+Host: 8-core x86-64 dev container, loadavg 1-min **6.55 → 20.5** during the BEFORE window and
+**≈ 1.15** during the AFTER A/B (per-block `/proc/loadavg` is quoted with each table below, exactly as
+`perf_call` prints it). Release profile. Commands:
+
+```
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml --release -p beam_rt --example perf_call -- 100000   # BEFORE (HEAD 9d238e22bc)
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml --release -p beam_rt --example perf_call -- 100000   # AFTER  (HEAD 4de5b69109)
+```
+The harness measures best-of-5 per row at 100 000 calls/sample and prints `/proc/loadavg` before and
+after every block; its own `control` row (the same loop with inlined arithmetic only) is the floor
+that every marginal is taken against.
+
+### What changed
+`src/context/calls.rs::move_result_into_process_heap` used to pay, on every container-returning BIF
+call in the scheduler shape (path B): a **failed** copier preflight walk, then
+`beam_term::size_object(term)` (a *second* full walk, plus a `HashSet` and a `Vec`), then a fresh
+`OffHeapTable` + `CopyContext`, then a second copy — up to three graph traversals where one copy needs
+one. `copy_struct`'s refusal is a preflight: it refuses **before** writing any destination word, so the
+first attempt is an entire wasted walk. The new body sources the growth hint from the refusal the
+copier itself already produced (`AllocFailure::requested / size_of::<Eterm>()`, the `beam_message::error`
+contract's exact flat word count — no second traversal), shares **one** `OffHeapTable`/`CopyContext`
+across both attempts, and gates the retry on `beam_message::is_message_heap_exhaustion` so a refusal
+growing the destination cannot fix (above all the malformed-graph `badarg`) no longer grows a whole
+space and fails identically. Nothing in the frozen precondition set was weakened: the rewind still
+requires an empty source `OffHeapTable`, `!reentrant`, an `Ok` result, a scheduled process
+(`mailbox_table.is_some()`) and a **successful** copy before `Heap::reset_to(mark)`; a term that cannot
+be re-homed leaves both the result and the pool exactly as they were.
+
+### BEFORE — path A (`RuntimeContext::new`, copy-out skipped by construction), 100 000 calls
+loadavg 1-min: 6.55 / 2.00 / 4.00 across the three runs.
+
+| row | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `erlang:abs/1` | 64.86 | 69.11 | 64.05 |
+| `erlang:trunc/1` | 67.08 | 80.13 | 72.47 |
+| `lists:reverse/1` | 65.15 | 95.82 | 65.00 |
+| `erlang:'++'/2` | 53.50 | 78.56 | 52.35 |
+| `lists:seq/2` | 68.80 | 72.67 | 70.28 |
+| `ets:insert/2` (A2) | 175.53 | 177.09 | 176.79 |
+| `ets:lookup/2` (A2) | 144.47 | 139.29 | 142.76 |
+| **control** | 0.16 | 0.16 | 0.15 |
+
+### BEFORE — path B (`RuntimeContext::for_process`, copy-out + pooled rewind ON)
+Same three blocks/loads as above.
+
+| row | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `erlang:abs/1` | 46.98 | 47.00 | 46.02 |
+| `lists:reverse/1` | 115.57 | 115.76 | 114.98 |
+| `lists:seq/2` | 187.28 | 188.11 | 184.06 |
+| `ets:insert/2` (B2) | 182.29 | 181.71 | 177.38 |
+| `ets:lookup/2` (B2) | 183.03 | 176.90 | 177.47 |
+| **block C slope** | 224.28 | 221.69 | — |
+
+Copy-out delta B−A (marginal, the harness's own `copy-out delta` table): `lists:reverse/1` **+50.42 /
++19.94 ns**, `lists:seq/2` **+118.48 / +115.45 ns**, `ets:lookup/2` **+38.56 / +37.61 ns** — taken
+against a 0.16 ns control.
+
+### AFTER — interleaved binary A/B (`BASE` = HEAD `9d238e22bc`, `OPT1` = the new body)
+Same script, same host, same 30-minute window, loadavg **≈ 1.15** throughout (1-min);
+`BASE`/`OPT1`/`OPT1`/`BASE` per round, two samples each, path B only (the block the change touches).
+This interleaved binary A/B — not a sequential BEFOR/AFTER pair — is the AFTER evidence: the shared
+host's load varied by more than the effect across the session, and interleaving is what makes the
+ratio citable.
+
+| row (path B) | BASE min / mean | OPT1 min / mean | ratio (OPT1 / BASE, mean) | ratio (OPT1 / BASE, min) |
+|---|---|---|---|---|
+| `lists:reverse/1` | 115.20 / 117.95 | 110.14 / 112.02 | **0.950** | 0.956 |
+| `lists:seq/2` | 185.84 / 190.09 | 164.74 / 166.65 | **0.877** | 0.886 |
+| `ets:lookup/2` (B2) | 177.94 / 185.61 | 175.65 / 180.94 | **0.975** (noise-dominated) | 0.987 |
+| control | 0.15 | 0.15 | 1.0 | 1.0 |
+
+Every `OPT1` sample was ≤ its paired `BASE` sample within every round. **Marginals vs the control:**
+`lists:reverse/1` **≈ −5.9 ns/call** (117.95 → 112.02), `lists:seq/2` **≈ −23.4 ns/call**
+(190.09 → 166.65), `ets:lookup/2` **≈ −4.7 ns/call** (inside the row's own spread — not claimed as a
+win). The control is unchanged at 0.15 ns, so the deltas are the copy-out's, not the harness loop's.
+
+### Verdict
+**The cut wins where the copy-out dominates, and it does not regress anything measured.**
+`lists:seq/2` — the row with the largest graph per call — improves **≈ 12 %** (`lists:seq/2` OPT1/BASE
+mm 0.877), `lists:reverse/1` **≈ 5 %** (0.950), `ets:lookup/2` is unchanged within noise (0.975/0.987).
+`erlang:abs/1` is an immediate result and never enters the copy-out at all, so it is expected flat
+before *and* after. **Unchanged rows are reported as unchanged:** the ETS path B2 row is not claimed.
+Absolute latency is not signal on this host — the BEFORE window ran at load 6.55–20.5 and the AFTER
+window at ≈ 1.15, so no BEFORE ns/call is compared to an AFTER ns/call anywhere above; only the
+interleaved ratios and the marginals-vs-control are.
+
+### Negative results (measured, then discarded)
+- **"Size first, grow if needed, one copy"** (temporary, never-committed edit): `size_object(term)`,
+  `if available < needed { grow_nursery(needed.max(256)) }`, then one `copy_struct`. Measured **≈ 290
+  ns/call for `lists:reverse/1`** against a BASE of ≈ 121 ns — **≈ 2.5× worse** — *and* it grew the
+  nursery on **every** call (the target `max(capacity, next_words(need, 0))` walked 3→6→12→…→256
+  words), i.e. it strictly worsens the item-4 peak-RSS effect below. Discarded on both counts.
+- **Why a size-first policy loses in general:** `beam_term::size_object` and the copier's own
+  `preflight_words` cost the same order, but a size-first policy pays that walk on **every** call
+  whereas the retry policy pays the copier's own bounded walk only on the (in the scheduler shape,
+  every-call) refusal path — and the refusal already carries the count back.
+- **Forcing the copy-out off entirely** (temporary edit): `perf_call` path B dies with
+  `beam_rt: lists:reverse/1 raised system_limit`. The copy-out + `reset_to(mark)` rewind is what
+  bounds the 16 MiB pooled BIF heap; it is load-bearing and was never removed.
+- **Instrumentation count:** a temporary `eprintln!` in the failure arm showed **32 001 failure
+  events for a 20 000-iteration run** — the retry really does fire on essentially every container
+  copy-out in the scheduler shape, which is what makes the removed `size_object` walk a per-call cost.
+
+### Reachability of the second attempt
+The retry is now reached **only** for `beam_message::is_message_heap_exhaustion` — i.e. the copier's
+typed `AllocKind::Message` refusal from its own preflight. Every other refusal a legal BIF result can
+produce (`BadArg` for a malformed graph, an `AllocKind::Heap`/`LiveObject` failure from a nested push,
+a `Raised` reason) is permanent for this destination and now returns `None` immediately. Pinned by
+`src/context/calls.rs::tests::a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing` (a
+`make_header(0, 0)` term: the nursery's `young_space_count()` and the destination's `used()` are both
+unchanged and the call answers `None`) and its positive control
+`an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies` (an oversized `lists:seq(1, 2000)`
+result still grows the nursery and is copied on the retry).
+
+### The ceiling that is NOT reachable from this node
+The real remaining cost is that the copy-out's destination, `Process::heap_mut()`, is **never clean**:
+`beam_message::copy::is_clean_destination` requires `to.used() == 0`, so the copier's allocation-free
+optimistic single-pass path (`try_copy_fast`) is **bypassed on every copy-out** and every copy pays a
+full `preflight_words` walk before writing a word. Relaxing that guard (it already rolls its own
+off-heap pushes back via `OffHeapTable::rollback`, and `Heap::reset` rewinds the trial bump pointer, so
+dropping the `to.used() == 0` half would be safe **for this call site**, whose destination is a
+`Process` young heap the caller owns) would eliminate one of the two remaining walks *and* the growth
+entirely — which is also the item-4 RSS mechanism below. That is a **sibling-crate** change
+(`erts_rust/crates/beam_message/src/copy.rs::is_clean_destination`, with
+`beam_message/src/off_heap.rs::{is_fully_empty, rollback}` and `beam_process::Process::heap_mut` as the
+supporting API) and is **reported, not hacked around**: this node owns only the call site.
+
+### Gate
+`erts_rust/tools/differential/gate.sh` on the AFTER tree: `differential gate: total=2497 agree=2495
+mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)**, against a
+real oracle (`erl` present on `$PATH`). The two non-agreeing cases are the allowlisted capability gaps
+`wire/new_fun_ext_encode` (A.5) and `boot_extra/init_script_id_names_the_running_otp_release` (A.9).
+A copy-out change moves terms between heaps, so this is the authoritative check that no result moved.
+
+### Caveats that invalidate a comparison (`COPY-OUT-CUT`)
+- The BEFORE and AFTER windows have very different host load (6.55–20.5 vs ≈ 1.15 1-min). **No BEFORE
+  ns/call is compared to an AFTER ns/call anywhere in this section**; the AFTER evidence is the
+  interleaved `BASE`-vs-`OPT1` binary A/B, which shares one window and one load.
+- `erlang:abs/1` is under 50 ns and the `control` under 0.2 ns, so both are at the resolution floor;
+  neither is used to claim a win.
+- **A fresh 3-run AFTER pass on the final committed HEAD was not run** — the turn budget went to the
+  code, the units and the gate. The A/B above is on the same body that the commit `4de5b69109` pins;
+  re-run the two commands at the top of this section to reproduce a sequential pair.
+- The change does **not** address the item-4 growth in retained nursery space (see below): it removes a
+  wasted graph walk and a needless retry, not the `grow_nursery` itself.
+
+### `ets_copy` peak RSS (measured 94.68 MiB at N = 100 000, still linear in N) — a structural limit, not the ETS adopt path
+**`ets_copy` peak RSS (measured 94.68 MiB at N = 100 000, still linear in N) — a structural limit, not the ETS adopt path.** The recorded `RESULTS.md` §8 item-5 lead (the ETS adopt path / the rewind guard) is **refuted**: `safe_to_rewind` is already true for `ets:*` and the pooled heap is already rewound. The growth is per-iteration, ≈790 B ≈ 99 words, and it was bisected: a float-free ETS loop of the same shape grows identically, while a float-carrying churn loop with no ETS is flat — so it tracks **BIF calls**, not floats and not ETS table state. Mechanism: almost all of the loop's heap traffic is the BIF-result copy-out, which by design cannot collect (the machine's live x registers / Erlang stack are not published at a BIF call, so a collection there would free live terms); a full nursery is met by `Process::grow_nursery(hint)` (`src/context/calls.rs::move_result_into_process_heap`), and a **retired young space is retained**, so the retained capacity accumulates linearly. The loop never reaches a real collection either: `ensure_heap_full` returns at `!process.should_collect(heap_need)` (`src/context/gc.rs` → `beam_gc`'s `nursery.current().available_words() < need_words`) because the loop's own `test_heap` prefixes are tiny (a 233-word default nursery, `beam_gc/src/policy.rs`), and `alloc_words_rooted` is never entered (the BIF, not the engine, builds the result). Removing the caller-module float guard at the two FR-publishing GC doors was tried and **reverted**: it changes nothing here (94.68 → 95.02 MiB) and contradicts the pinned float-collection contract. Closing this needs either a **`beam_process`** seam that can shrink/reuse a retired young space (`Process::grow_nursery` retains it) or a **`beam_engine`/runner** seam that publishes the driving machine's roots at the BIF call so the copy-out can collect — both sibling-crate changes, not reachable from `src/context/calls.rs`.
