@@ -15,10 +15,11 @@ Ground truth (read-only): `../../erts/emulator/beam/` (files in the Routing Tabl
 
 ## Roster census (authoritative; code-derived, pinned by `tests/roster_audit.rs`)
 `bif.tab` declares **556** entries (`bif` 476, `ubif` 73, `hbif` 7); **0 are missing**. `default_registry()` =
-`BifRegistry::with_core_bifs()` = **643 keys** = **556 declared + 87 stdlib fast paths** (exports `bif.tab` does
+`BifRegistry::with_core_bifs()` = **645 keys** = **556 declared + 89 stdlib fast paths** (exports `bif.tab` does
 not declare: `lists` +40 over its 5 declared keys — 18 of them fun-taking — `maps` +12 over its 12, 8 `ets:*`,
 `io`/`io_lib`, `unicode`, `binary:referenced_byte_size/1`, the OTP-30 `pid_to_binary`/`ref_to_binary`/
-`port_to_binary`, `erlang:memory/0,1`, `erlang:convert_time_unit/3`, `zlib:compress/1`/`uncompress/1`). Re-derive
+`port_to_binary`, `erlang:memory/0,1`, `erlang:convert_time_unit/3`, the four `zlib:compress/1`/`uncompress/1`/
+`zip/1`/`unzip/1`). Re-derive
 any split from the registry, never from this prose.
 **Declared ≠ registered ≠ adopted.** Of the 556, **346 are unconditional in-crate** and **210 are seam-backed**
 (they route through one of the fifteen optional `BifContext` hooks and answer the typed `unsupported_bif` until a
@@ -42,7 +43,7 @@ Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifCo
 (validation tooling, not a runtime seam).
 - **`registry.rs`** — `BifFn = fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>`; `BifRegistry` (nested
   `module → function → [(arity, BifFn)]` maps, so `lookup`/`contains` are allocation-free; `new`/`is_empty`/`len`/
-  `names`/`entries`); `with_core_bifs()` (the 643-key roster) = `default_registry()`; `register(...) -> Option<BifFn>`
+  `names`/`entries`); `with_core_bifs()` (the 645-key roster) = `default_registry()`; `register(...) -> Option<BifFn>`
   (replaces on repeat); `call(...)` (unknown key ⇒ `error::undefined_bif`; wrong arg count ⇒ `BadArity`). Operator
   BIFs keep their *quoted* `bif.tab` names (`"+"`, `"=<"`, `"=:="`, `"!"`, `"++"`, `"not"`, …). `with_core_bifs`
   calls each module's `pub(crate) fn register` in a fixed order (`ets` wiring
@@ -172,22 +173,28 @@ unit), every other atom is its units-per-second ratio (`UnitRatio::Small`), and 
 `try … catch _:_ -> error_with_info(badarg, …)`, so **every** failure (an unknown unit atom, a zero/negative unit, a
 non-atom non-integer unit, a non-integer `Time`, a product past the bignum cap — `trap_arith_class`) is `badarg`.
 
-### `zlib` (`src/zlib.rs`) — the `compress/1` / `uncompress/1` fast paths
-`zlib` is **preloaded**: `../../erts/preloaded/src/zlib.erl` is real Erlang, and these two are written over the
-stream interface (`open/0`→`deflateInit/2`→`deflate/3`→`deflateEnd/1`→`close/1`), every one of which is an
-`erlang:nif_error(undef)` stub for the statically linked zlib NIF (`../../erts/emulator/beam/erl_zlib.c`) this
-runtime does not carry — so the whole family is `undef` unless a host serves it. Only these two self-contained
-functions are registered, and neither is a `bif.tab` entry (the table declares the NIF stubs). `compress/1` takes
-**iodata** (exactly the `binary::iodata_bytes` shape set — a bare integer, an atom, an element outside `0..=255`
-and a non-byte-aligned bitstring are all `badarg`) and emits one RFC 1950 stream (2-byte header + deflate +
-Adler-32) at `DEFAULT_COMPRESSION_LEVEL` = 6. `uncompress/1` requires iodata and at least `MIN_UNCOMPRESS_LENGTH` =
-8 bytes; **every** other failure is `data_error`, never `badarg` (the length arm is raised *inside* `zlib.erl`'s
-`try` body, so that body's own `catch _:_ -> badarg` does not cover it). The codec is `beam_codec::compress` (the
-existing `flate2`/`rust_backend` RFC 1950 codec — **no new dependency edge**): the deflate payload is
-miniz_oxide's, so byte identity with the oracle's stream is **not** promised (the framing, interop and the round
-trip are). Two documented typed limits: a decompressed payload above `beam_codec::compress::MAX_UNCOMPRESSED`
-(32 MiB) is `data_error` where the oracle inflates, and `zlib:zip/1`/`unzip/1` (gzip / RFC 1952) plus the whole
-stream API stay `undef`. No `unsafe`.
+### `zlib` (`src/zlib.rs`, `src/deflate.rs`) — the four self-contained fast paths
+`zlib` is **preloaded**: `../../erts/preloaded/src/zlib.erl` is real Erlang, and its stream interface
+(`open/0`→`deflateInit/2`→`deflate/3`→…→`close/1`) is `erlang:nif_error(undef)` stubs for the statically linked
+zlib NIF (`../../erts/emulator/beam/erl_zlib.c`) this runtime does not carry, so four self-contained functions are
+registered instead — none is a `bif.tab` entry (the table declares the NIF stubs). All four take **iodata**
+(`binary::iodata_bytes`: a bare integer, an atom, an element outside `0..=255` and a non-byte-aligned bitstring are
+all `badarg`).
+- `compress/1` emits one RFC 1950 stream (2-byte header + deflate + Adler-32) at `DEFAULT_COMPRESSION_LEVEL` = 6 over
+  `beam_codec::compress` (the existing `flate2`/`rust_backend` codec — **no new dependency edge**); `uncompress/1`
+  requires at least `MIN_UNCOMPRESS_LENGTH` = 8 bytes, and **every** other failure is `data_error`, never `badarg`
+  (the length arm is raised *inside* `zlib.erl`'s `try` body, so that body's own `catch _:_ -> badarg` does not cover it).
+- `zip/1`/`unzip/1` are the **raw DEFLATE (RFC 1951)** pair — *not* gzip: `zlib.erl` opens them with `-MAX_WBITS`.
+  `zip/1` strips the 2-byte header and 4-byte Adler-32 off a `beam_codec::compress` stream (the framing and the
+  FDICT bit are asserted before the slice is taken); `unzip/1` is the self-contained safe-Rust RFC 1951 decoder in
+  `src/deflate.rs` (stored/fixed/dynamic blocks, the code-length repeat codes 16/17/18, the 32 KiB window), because
+  `beam_codec`'s inflater is RFC 1950-only *and* verifies the Adler-32, so a raw stream cannot be re-wrapped.
+  Argument errors are `badarg`; a stream the inflater cannot finish (empty, truncated, bad tables, reserved block) is
+  the bare-atom `error:data_error`; bytes after the final block are ignored, exactly like the oracle.
+The deflate payload is miniz_oxide's, so byte identity with the oracle's stream is **not** promised (the framing,
+interop and the round trip are). Typed limits: a decompressed payload above `beam_codec::compress::MAX_UNCOMPRESSED`
+(32 MiB) is `data_error` where the oracle inflates, and `gzip/1`/`gunzip/1` (RFC 1952) plus the whole stream API
+stay `undef`. No `unsafe`.
 
 ### The auxiliary BIF modules
 - `checksum.rs` (10): CRC-32/Adler-32 (+ the `*_combine/3` forms) and `md5/1` plus the streaming
@@ -233,9 +240,14 @@ short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
 - **The decode table image is memoized:** `decode_term_bif` decodes into `DECODE_SCRATCH`, a per-thread **image** of
   `ctx.atoms()`, reused only when `prefix_matches` names every index the same atom and then extended to an **exact**
   image, so a novel atom's index equals the `AtomInterner` prediction (`base = shared.len()`); any other table shape
-  (moved/shorter, or a scratch left ahead by a failed/`safe` decode) forces a rebuild. Measured
-  (`examples/etf_bench.rs`): 122.6 µs/op ⇒ **5.39 µs/op (22.7×)**; round trip **20.5×**; **no BIF clones the whole
-  `AtomTable` per call** (`BifContext::atom_and_heap` is the one borrow-split route).
+  (moved/shorter, or a scratch left ahead by a failed/`safe` decode) forces a rebuild. `BifContext::atom_and_heap` is
+  the one borrow-split route, so **no BIF clones the whole `AtomTable` per call** — `tests/decode_hot_path.rs` pins the
+  steady-state per-call allocation count as table-size-**independent** (9 allocations / 602 bytes for a 114-byte image,
+  identical at 137 and 4105 atoms; the plain `AtomTable::clone()` counterfactual is 276 → 8212, and clone+decode
+  284 → 8220). `prefix_matches` is the
+  remaining O(table) cost and is deliberately a *correct* revalidation, not a clone (no table identity signal exists to
+  make it O(1)). Measured (`examples/etf_bench.rs`, atoms=3009, 20k iters): a clone-per-call decode is 130.3 µs/op
+  against the memoized **5.45 µs/op (23.9×)**, of which ~5.85 µs is that verification.
 - **Options.** `compressed`/`{compressed,0..=9}` really deflate a version-less body and wrap it `[131][80][len][zlib]`
   **only** when the stream fits the C's `body_len - 5` budget (bare atom = level 6); `{minor_version,0|1|2}` selects
   the tag set byte-identically; `iovec`/`fragment` are `badarg`. `local`/`deterministic` are **parsed but mostly a
@@ -352,14 +364,16 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
 ## Test Strategy
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` with a `BytesSink`/`NullSink` capture.
-- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **80
-  suite result lines / 1588 tests** (all green): the lib suite (799), 77 integration files (789), and two empty
+- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **82
+  suite result lines / 1613 tests** (all green): the lib suite (816), 79 integration files (797), and two empty
   harnesses. Re-derive the split from the per-suite `test result` lines, not from a hand-maintained table.
 - **Pins.** `tests/roster_audit.rs` is the roster pin (see the census section). `tests/bif_tab.rs` pins the parsed
-  `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 87`,
-  `REGISTRY_SIZE = 643`) — it reads the registry, never altering dispatch. `tests/registry_hot_path.rs` is a
+  `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 89`,
+  `REGISTRY_SIZE = 645`) — it reads the registry, never altering dispatch. `tests/registry_hot_path.rs` is a
   per-thread-armed counting `#[global_allocator]` proving `lookup`/`contains`/hit-`call` allocate **0** bytes, plus a
-  median/p99 ns/call print with a loose regression tripwire.
+  median/p99 ns/call print with a loose regression tripwire; `tests/decode_hot_path.rs` is the same
+  allocation-counting technique applied to `binary_to_term/1`, pinning that its steady-state cost does not scale with
+  the shared `AtomTable` (a per-call clone would allocate on the order of the table size).
 - **Correctness-by-construction pins.** `tests/decode_scratch.rs` carries the per-thread `DECODE_SCRATCH` image
   across calls, covering every stale-image shape (same table twice, a growing table, a *moved* name index, a shorter
   table, a fresh atom at exactly `shared.len()`, a truncated and a `safe` decode); `tests/binary_to_term_atoms.rs`
@@ -368,8 +382,9 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
   shape above `ERL_ONHEAP_BINARY_LIMIT`). `tests/match_spec_arith.rs` proves both halves of the arithmetic hook.
 - **Oracle-backed suites.** `tests/{io_lib_format_chars_limit,io_lib_format_ts,io_lib_format_ts_limited}.rs` pin the
   limiting `{chars_limit,N}` rendering and the `~ts` matrix against committed goldens **plus** a fail-loud live-oracle
-  cross-check; `tests/phash.rs`, `tests/checksum.rs` (incl. the MD5 `pad` KAT boundary) and `tests/packet*.rs` do the
-  same. Most other "matches the oracle" tests are pinned-golden self-checks. Integration files that shell out to `erl`
+  cross-check; `tests/phash.rs`, `tests/checksum.rs` (incl. the MD5 `pad` KAT boundary), `tests/packet*.rs` and
+  `tests/zlib.rs` (the raw-DEFLATE pairs, incl. a level/size sweep that crosses all three block types and a
+  `zlib:zip/1` cross-check against the live oracle) do the same. Most other "matches the oracle" tests are pinned-golden self-checks. Integration files that shell out to `erl`
   are **fail-loud** (they panic when `erl` is absent or errors, instead of passing vacuously). **Still missing:** a
   dedicated `math` domain-error-matrix file (differential evidence for `math` (32 probes), `checksum` (34),
   `match_spec_test/3` (9), `calendar`/`os_bif` (21) was gathered during development but is not yet committed).
@@ -498,8 +513,12 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   twice (`contains`, then `call`→`lookup`) but allocates nothing.
 - **Arithmetic widens even small ints to a heap `Big`:** `erlang:'-'/2` of two small ints does ~4 small `Vec`
   allocations (a `Big::from_i64` per operand, then `sub`/`add`/`neg`) with no checked-`i64` fast path.
-- **Cross-node:** the shared `AtomTable` copy-on-write clone belongs to `beam_rt` (`RuntimeContext::call_registered`
-  + `Rc::make_mut`, `beam_rt/src/codeserver.rs`); only a call that actually **interns** a name pays the deep clone.
+- **Cross-node:** the shared `AtomTable` copy-on-write clone belongs to `beam_rt`
+  (`CodeServer::atoms_mut` = `Rc::make_mut(&mut self.atoms)`, `beam_rt/src/codeserver.rs:240`); only a call that
+  actually **interns** a name pays the deep clone, which is why the all-known-atom `binary_to_term` hot path pays
+  nothing (`tests/decode_hot_path.rs`).
+- **`prefix_matches` is O(table), and cannot be made O(1) from here:** validating the memoized decode image against
+  the live table needs a cheap *identity* for that table, and `beam_term::AtomTable` exposes none (see Handoffs).
 ## A.9 blockers (self-hosted build: booting kernel, running lib/compiler)
 The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `ets:new/2` option matrix, so
 `application_controller`'s `ets:new(ac_tab, …)` and name-resolved `ets:insert/lookup` work; the normalized
@@ -508,64 +527,56 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 
 ## Handoffs (sibling nodes)
 ### Required from `beam_rt` (exact locations)
-- **batch-52 cross-crate findings (verbose detail): `./HANDOFF_batch52.md`.** `-pa`/`-pz` ordering (`-pz` must be a
-  tail, currently merged into the `-pa` head), the `+S Total:Online` online count being parsed then discarded, and
-  the `process_info/2` position items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`/
-  `catchlevel`) being typed gaps for a live module-scheduled process — each with an exact file:line, a fix shape and
-  a one-line repro. Also records what is **not** a gap (`string:concat/1`, the four `enif_*` names) and the two
-  sibling doc corrections owed (`tools/differential/src/corpus/nif_abi_extra.rs:2092-2095`, `crates/beam_rt/CONTEXT.md`).
-- **`ets:foldl/3`/`foldr/3` are unreachable in `beam_rt`.** `beam_rt/src/context/calls.rs` drops the shared
-  `TableRegistry` whenever `reentrancy_capable(args)` is true (any fun arg), so `ets:foldl(Fun, Acc, T)` — this crate's
-  real `FunCaller` fast path — answers `beam_rt: unsupported: bif`. **Required change:** keep the table handle for the
-  two `ets` folds (the only `FUN_CALLER_BIFS` members that also need `ctx.tables()`) — exclude them from the drop.
-- **The `FunIdentityBridge` snapshot is rebuilt per BIF call.** `beam_rt/src/context/calls.rs:201` calls
-  `FunIdentityBridge::new(...)` **per registered-BIF call** for the four `LOCAL_FUN_IDENTITY_BIFS` (incl.
-  `erlang:term_to_binary/1,2`), and `FunIdentityBridge::new` (`beam_rt/src/context/fun_identity.rs`) walks
-  `code_server.loaded()` building `modules: Vec<(Arc<Module>, PathBuf)>` — `O(loaded modules)` allocations per call the
-  common `term_to_binary` never reads (the consumer is already lazy: `binconv::encode_body` calls
-  `ctx.local_fun_identity(term)` only on a runtime-made `Local` fun). **Required change:** cache the snapshot in
-  `Runtime` behind a generation counter (the code server knows both the loaded-module and `LocalFunIdentity` events)
-  and build the per-call bridge over it (`FunIdentityBridge::new_cached(&Arc<Snapshot>, …)` or a
-  `Runtime::fun_identity_snapshot()`). Re-verify with `copy_bound/etf_roundtrip` in `../tools/bench/RESULTS.md`.
-- **~99 of the 172 `RUNTIME_HOOKS_BIFS` keys are still unserved** (example: `erlang:read_timer/1,2`,
-  `beam_rt/src/context/tests.rs:2315-2325`); `beam_rt` serves 32 via `RuntimeHooksBridge`
-  (`beam_rt/src/context/runtime_hooks.rs`) + ~41 via the native floor (re-derive by counting match arms). Registering
-  a key can only turn an `undef` into the honest `unsupported_bif`, never shadow a working result (the native floor is
-  dispatched *before* the registry).
-- **Two stale near-miss fixtures** at `beam_rt/src/context/tests.rs:666`
-  (`the_send_predicate_selects_only_the_message_sending_bifs`) and `:1022` (the `SEND_HOOK_BIFS` `HookRoster`
-  `misses`): `erlang:send/3` is now a real `BifFn` in `src/proc.rs` and a `SEND_HOOK_BIFS` consumer, so each fixture
-  must name a different near-miss (e.g. `("erlang", "send", 1)`).
+- **batch-52 cross-crate findings (verbose detail): `./HANDOFF_batch52.md`** — `-pa`/`-pz` ordering (`-pz` must be a
+  tail, currently merged into the `-pa` head), the `+S Total:Online` online count parsed then discarded, and the
+  `process_info/2` position items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`/
+  `catchlevel`) as typed gaps for a live module-scheduled process; each with a file:line, a fix shape and a repro. It
+  also records what is **not** a gap (`string:concat/1`, the four `enif_*` names) and two sibling doc corrections owed
+  (`tools/differential/src/corpus/nif_abi_extra.rs:2092-2095`, `crates/beam_rt/CONTEXT.md`).
+- **`ets:foldl/3`/`foldr/3` are unreachable in `beam_rt`:** `beam_rt/src/context/calls.rs` drops the shared
+  `TableRegistry` whenever `reentrancy_capable(args)` is true (any fun arg), so the `FunCaller` fast path answers
+  `beam_rt: unsupported: bif`. **Required change:** exclude the two `ets` folds (the only `FUN_CALLER_BIFS` members
+  that also need `ctx.tables()`) from the drop.
+- **The `FunIdentityBridge` snapshot is rebuilt per BIF call:** `beam_rt/src/context/calls.rs:201` calls
+  `FunIdentityBridge::new(...)` per registered-BIF call for the four `LOCAL_FUN_IDENTITY_BIFS` (incl.
+  `term_to_binary/1,2`), and `new` (`beam_rt/src/context/fun_identity.rs`) walks `code_server.loaded()` building
+  `modules: Vec<(Arc<Module>, PathBuf)>` — O(loaded modules) allocations the common `term_to_binary` never reads (the
+  consumer is already lazy: `binconv::encode_body` asks `ctx.local_fun_identity(term)` only for a `Local` fun).
+  **Required change:** cache the snapshot in `Runtime` behind a generation counter and build the per-call bridge over
+  it (`FunIdentityBridge::new_cached(&Arc<Snapshot>, …)`). Re-verify with `copy_bound/etf_roundtrip` in `RESULTS.md`.
+- **~99 of the 172 `RUNTIME_HOOKS_BIFS` keys are still unserved** (e.g. `erlang:read_timer/1,2`,
+  `beam_rt/src/context/tests.rs:2315-2325`); `beam_rt` serves 32 via `RuntimeHooksBridge` + ~41 via the native floor.
+  Registering a key can only turn an `undef` into the honest `unsupported_bif`, never shadow a working result (the
+  native floor is dispatched *before* the registry).
+- **Two stale near-miss fixtures** at `beam_rt/src/context/tests.rs:666` (`the_send_predicate_selects_only_the_message_sending_bifs`)
+  and `:1022` (`SEND_HOOK_BIFS` `HookRoster` `misses`): `erlang:send/3` is now a real `BifFn` in `src/proc.rs` and a
+  `SEND_HOOK_BIFS` consumer, so each must name a different near-miss (e.g. `("erlang", "send", 1)`).
 - **`beam_rt` must install every hook this crate exposes** (each defaults to an honest typed gap): `RecordSource`
-  for `records:get_definition/2` (else `badarg`); `LocalNode` for internal pid/port `term_to_binary` (its
-  `(nonode@nohost, 0)` fallback and the `bm`/`ac` pattern tags need atoms `beam_rt`'s `CORE_ATOMS` lacks);
-  `LocalFunIdentity` (installed — byte-faithful for a **compiled module's** local fun, NOT the `-eval` case);
-  `ModuleInfo`; `ProcessHook` for the 11 `proc_reg` BIFs; `PersistentTerm` for the 7 `persistent_term` BIFs; the
-  defaulted `DictHook::get_all`/`erase_all` for `erlang:get/0`/`erase/0`; `AtomInterner`/`FunCaller`; `NifLoader` +
-  `with_current_module` for `load_nif/2`; `PortHook` via `with_port_hook` (spawn driver + `beam_process::PortTable::
-  alloc()` + the `beam_io` poller); and it must build `fun M:F/A` for `wire/export_ext_encode`. `MemoryHook` and
-  `RuntimeHooks` are installed today; gate via `needs_memory_hook`/`needs_runtime_hooks`/`needs_local_fun_identity`
-  (delegate `RuntimeContext::uses_*` to `beam_bifs::needs_*`, never a private copy). `MemoryHook::memory` returns
-  `Vec<(&'static str, u64)>` in oracle order `total, processes, processes_used, system, atom, atom_used, binary,
-  code, ets`; `RuntimeHooks::call(heap, atoms, module, function, args)` is one `(module, function, arity)` dispatch
-  (partial adopters return the typed `unsupported_bif` for the rest).
+  (`records:get_definition/2`, else `badarg`); `LocalNode` (internal pid/port `term_to_binary` — its
+  `(nonode@nohost, 0)` fallback and the `bm`/`ac` pattern tags need atoms `CORE_ATOMS` lacks); `LocalFunIdentity`
+  (installed — byte-faithful for a compiled module's local fun, NOT `-eval`); `ModuleInfo`; `ProcessHook` (11
+  `proc_reg` BIFs); `PersistentTerm`; the defaulted `DictHook::get_all`/`erase_all`; `AtomInterner`/`FunCaller`;
+  `NifLoader` + `with_current_module`; `PortHook` via `with_port_hook`; and `fun M:F/A` for
+  `wire/export_ext_encode`. `MemoryHook`/`RuntimeHooks` are installed; gate via `needs_*` (never a private copy).
+  `MemoryHook::memory` returns `Vec<(&'static str, u64)>` in the oracle order `total, processes, processes_used,
+  system, atom, atom_used, binary, code, ets`; `RuntimeHooks::call(heap, atoms, module, function, args)` is one
+  `(module, function, arity)` dispatch.
 - **A node-identity + channel seam** is the only way to close the external-identifier gap (see Known Issues): the
-  runtime's own node name plus a node-name-atom → dist-channel provider. Additive to `LocalNode`
-  (`local_node() -> Option<(Eterm, u32)>`) or a new seam; a new dependency edge, so it is reported, not assumed.
-- **The A.9 in-machine self-host route's stale word is a runtime-level store, NOT a `beam_bifs` local.** The holder is
-  `beam_rt`'s node-global `Runtime::persistent_terms` — the only runtime-level store not routed through
-  `Runtime::try_stabilize_escaped`: `persistent_term:put/2` stores the caller's words verbatim
-  (`../beam_rt/src/context/persistent_term.rs`), `erl_features` puts runtime-built terms during parsing, and a
-  collection at the slice machine's own door abandons them, so `get/1` returns a stale word (why the door's root-set
-  audit is silent). Fix: stabilize key/value at `put`/`get` inside `beam_rt`; publishing BIF locals via
-  `Registers::extra_roots` would be a no-op and must not be added (Design Decisions).
-- **`beam_rt`'s `-eval` path does NOT route the bit operators through this crate's registry**: its `eval/mod.rs`
-  implements `band`/`bor`/`bxor`/`bsl`/`bsr` as **small-int** arithmetic (no negative-shift flip, no bignum
-  promotion), while compiled-module code resolves the registered `arith` BIFs and agrees byte-for-byte with `erl`.
-- **ETS owner reclamation:** `TableRegistry::handles_owned_by(owner: OwnerId) -> Vec<u64>` (every table owned by
-  `owner`, ascending, **unnamed included**) and `owner_of(pid) -> OwnerId`. A process-exit observer lists the dead
-  pid's handles and applies `beam_ets::Table::owner_died` per table — delete an orphan, hand to a live heir, or
-  deliver `{'ETS-TRANSFER', Tid, FromPid, Data}` **only when `heir.data` is `Some`**. `./src/ets/CONTEXT.md`.
+  runtime's own node name plus a node-name-atom → dist-channel provider, additive to `LocalNode`
+  (`local_node() -> Option<(Eterm, u32)>`) or a new seam (a new dependency edge, so reported, not assumed).
+- **The A.9 in-machine self-host route's stale word is a runtime-level store, NOT a `beam_bifs` local:** the holder is
+  `beam_rt`'s node-global `Runtime::persistent_terms`, the only runtime-level store not routed through
+  `Runtime::try_stabilize_escaped` (`persistent_term:put/2` stores the caller's words verbatim, `erl_features` puts
+  runtime-built terms during parsing), so `get/1` returns a stale word. Fix: stabilize key/value at `put`/`get`
+  inside `beam_rt`; publishing BIF locals via `Registers::extra_roots` would be a no-op and must not be added
+  (Design Decisions).
+- **`beam_rt`'s `-eval` path does NOT route the bit operators through this crate's registry:** its `eval/mod.rs` does
+  `band`/`bor`/`bxor`/`bsl`/`bsr` as **small-int** arithmetic (no negative-shift flip, no bignum promotion), while
+  compiled-module code resolves the registered `arith` BIFs and agrees byte-for-byte with `erl`.
+- **ETS owner reclamation:** `TableRegistry::handles_owned_by(owner: OwnerId) -> Vec<u64>` (every table owned,
+  ascending, **unnamed included**) and `owner_of(pid) -> OwnerId`; a process-exit observer applies
+  `beam_ets::Table::owner_died` per table — delete an orphan, hand to a live heir, or deliver
+  `{'ETS-TRANSFER', Tid, FromPid, Data}` **only when `heir.data` is `Some`** (`./src/ets/CONTEXT.md`).
 - **The `erl_ddll` registry is a *separate* table from `beam_rt`'s port driver registry**
   (`../beam_rt/src/port/driver.rs`), so a driver loaded via `erl_ddll:try_load/3` is invisible to
   `open_port({spawn_driver, Name})` and vice versa; unifying the two is the `beam_rt`-side handoff.
@@ -596,7 +607,7 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 
 ## Routing Table
 - `src/lib.rs` -> crate docs, module wiring, root re-exports, `prelude`, `#![deny(unsafe_code)]`
-- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (643 keys, `runtime` last), `default_registry`
+- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (645 keys, `runtime` last), `default_registry`
 - `src/hook_sets.rs` -> the thirteen hook-gate sets (244 keys; 240 deduped) + the `needs_*` predicates
 - `src/runtime/` (**`./src/runtime/CONTEXT.md`**) -> the 209 runtime-coupled BIFs (incl. the 8 real `re` keys)
 - `src/re/` (**`./src/re/CONTEXT.md`**) -> the self-contained regex engine serving the 8 `re:*` BIFs
@@ -620,7 +631,8 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - `src/string.rs` / `src/unicode.rs` / `src/unicode/` (**`./src/unicode/CONTEXT.md`**, sub-node `grapheme/`) /
   `src/time.rs` -> `string:list_to_float/1`; the `unicode` conversions (UTF-16/32 codecs, the grapheme-cluster port);
   `time` — `monotonic_time`/`system_time`/`time_offset`/`unique_integer`/`timestamp` **and** the `erlang:convert_time_unit/3` fast path
-- `src/zlib.rs` -> the `zlib:compress/1` / `zlib:uncompress/1` stdlib fast paths over `beam_codec::compress` (RFC 1950)
+- `src/zlib.rs` / `src/deflate.rs` -> the four `zlib` fast paths (`compress/1`/`uncompress/1` over
+  `beam_codec::compress`, RFC 1950) and the raw DEFLATE `zip/1`/`unzip/1` pair over the self-contained RFC 1951 decoder
 - `src/proc.rs` / `src/dict.rs` / `src/port.rs` -> `self`/`send`/`!`/`send/3` (the `SendHook` family); the
   `DictHook` BIFs; the `PortHook` BIFs
 - `src/ets.rs` / `src/ets/` (**`./src/ets/CONTEXT.md`**) -> the `ets:*` bridge (59 keys) + `arith_hook.rs` (`PrecisionArith`)
@@ -628,7 +640,8 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - `src/io.rs` / `src/io_ts.rs` / `src/print.rs` -> the `io`/`io_lib` format engine (the `{chars_limit,N}` limited
   paths, the unicode `~ts` arm); the `~w`/`~p`/`~W`/`~P` leaf renderer with `~k`/`~K`
 - `src/print/pretty.rs` / `src/print/pretty/cind.rs` -> the `io_lib_pretty` port; the `cind/7` family
-- `tests/` -> 77 integration files / 789 tests (lib suite 799); the roster pin is `tests/roster_audit.rs`
+- `tests/` -> 79 integration files / 797 tests (lib suite 816); the roster pin is `tests/roster_audit.rs`, and
+  `tests/{registry_hot_path,decode_hot_path}.rs` are the allocation-count pins
 - `HANDOFF_batch52.md` -> the batch-52 cross-crate gap report (owner/repro/fix-shape per finding)
 - siblings `../beam_engine`/`../beam_process`/`../beam_ets`/`../beam_codec`/`../beam_term`/`../beam_loader`/`../beam_io`
   -> the `call_bif` seam, `ProcessId`/`PortId`/`PortTable`, the `Table`/match-spec engine, the ETF codec, the frozen
