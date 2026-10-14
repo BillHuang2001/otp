@@ -146,12 +146,16 @@ immediately returns `Err` (the `application_controller` is already gone, so its 
   happens first.
 - **The CLI and the in-crate executor stop in the same place — exit 1.** The CLI
   (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **1**, as does the
-  `run` action, with empty stdout and, on stderr, an `=INFO REPORT==== …` line
-  (`application: kernel exited: {bad_return,{{kernel,start,[normal,[]]},{'EXIT',{case_clause,{error,{callback_crashed,{error,undef,[]}}}}}}} type: permanent`),
-  an `=ERROR REPORT==== …` line
-  (`logger: callback_crashed process: logger reason: {error,undef,[]}`) and the terminal
+  `run` action. **stdout is NOT empty**: the two logger reports go to **stdout** (428 bytes measured) —
+  an `=INFO REPORT==== …` block
+  (`application: kernel exited: {bad_return,{{kernel,start,[normal,[]]},{'EXIT',{case_clause,{error,{callback_crashed,{error,undef,[]}}}}}}} type: permanent`)
+  and an `=ERROR REPORT==== …` block
+  (`logger: callback_crashed process: logger reason: {error,undef,[]}`) — while **stderr** carries only
+  the terminal
   `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`
-  — a *genuine* runtime error (exit 1), not a capability gap. The in-crate executor
+  (102 bytes) — a *genuine* runtime error (exit 1), not a capability gap. (`tests/boot.rs`'s
+  `the_cli_runs_the_real_boot_script_to_completion` asserts `stdout == ""` **and** `stderr == ""`; both
+  hold only once the kernel crash stops being logged.) The in-crate executor
   (`boot_from_script` → `execute`) hits the same directive-19 stop and reports it through the
   `BootStop`/`execute_reporting` report API (`index = 19`, the script's `total = 22`, the failing
   `apply` directive and the `{noproc, …}` error).
