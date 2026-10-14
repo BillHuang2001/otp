@@ -395,6 +395,46 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.preserve("+sbt", &value);
                 index += 2;
             }
+            // `+t N` — the atom-table size (`erl_init.c:2217-2234`); the value is
+            // validated and preserved verbatim, so `atom_limit` can follow it
+            // (`crate::info::limits`). Like every `+`-flag it is not an init argument.
+            "+t" => {
+                let value = value_of(args, index, "+t")?;
+                flags::parse_atom_table_size("+t", &value)?;
+                builder.preserve("+t", &value);
+                index += 2;
+            }
+            // `+e N` — the maximum number of ETS tables (`erl_init.c:1696-1707`); only a
+            // negative value is rejected; `ets_limit` follows the value (see
+            // `crate::info::limits`).
+            "+e" => {
+                let value = value_of(args, index, "+e")?;
+                flags::parse_ets_tables("+e", &value)?;
+                builder.preserve("+e", &value);
+                index += 2;
+            }
+            // `+B [c|d|i]` (and the in-token `+Bi`/`+Bc`/`+Bd`) — the break-handler switch
+            // (`erl_init.c:1822-1843`). It never rejects a value: an unrecognized one falls
+            // to the `+B` arm (`have_break_handler = 0`). Only `+B i` sets `ignore_break`,
+            // which `erlang:system_info(break_ignored)` reports (see `crate::info::system`).
+            // The switch and its value are preserved verbatim so that derivation can read
+            // them; a valueless `+B` preserves an empty value so the `(switch, value)` stride
+            // stays even.
+            "+B" => {
+                let value = match args.get(index + 1) {
+                    Some(candidate) if matches!(candidate.as_str(), "i" | "c" | "d") => {
+                        candidate.clone()
+                    }
+                    _ => String::new(),
+                };
+                let consumed = !value.is_empty();
+                builder.preserve("+B", &value);
+                index += if consumed { 2 } else { 1 };
+            }
+            "+Bi" | "+Bc" | "+Bd" => {
+                builder.preserve("+B", &argument[2..]);
+                index += 1;
+            }
             other if flags::is_allocator_switch(other) => {
                 index = flags::parse_allocator(&args[index], args, index)?;
             }
