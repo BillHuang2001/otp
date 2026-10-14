@@ -200,6 +200,7 @@ mod code;
 mod emit;
 mod receive;
 mod runtime;
+mod test_helper;
 
 #[cfg(test)]
 mod counters;

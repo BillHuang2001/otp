@@ -145,7 +145,14 @@ fn variant_at(module: &Module, func: u32, pc: u32) -> String {
 /// The variant name of an `Instr`: the leading identifier of its `Debug` rendering
 /// (`Move { .. }` -> `Move`, `Send` -> `Send`). Test-only, so the allocation and the
 /// `Debug` formatting are acceptable.
+///
+/// A `Test` is keyed by its **kind** (`Test(IsEqExact)`, `Test(IsTuple)`, …) because the
+/// inline subset decides a `test` predicate by predicate: the per-kind split is what
+/// makes "which `test` shapes still deopt" readable from the counter table.
 fn variant_name(instr: &Instr) -> String {
+    if let Instr::Test { kind, .. } = instr {
+        return format!("Test({kind:?})");
+    }
     let rendered = format!("{instr:?}");
     let end = rendered
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -248,7 +255,8 @@ fn word_class(word: i64) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The variant name is the leading identifier of the `Debug` rendering.
+    /// The variant name is the leading identifier of the `Debug` rendering, except
+    /// that a `Test` is keyed by its kind.
     #[test]
     fn variant_names_are_the_opcode_identifier() {
         assert_eq!(variant_name(&Instr::Send), "Send");
@@ -258,6 +266,22 @@ mod tests {
                 dst: beam_loader::Operand::X(1),
             }),
             "Move"
+        );
+        assert_eq!(
+            variant_name(&Instr::Test {
+                kind: beam_loader::TestKind::IsEqExact,
+                fail: beam_loader::Label(0),
+                args: vec![beam_loader::Operand::X(0), beam_loader::Operand::X(1)],
+            }),
+            "Test(IsEqExact)"
+        );
+        assert_eq!(
+            variant_name(&Instr::Test {
+                kind: beam_loader::TestKind::IsTuple,
+                fail: beam_loader::Label(0),
+                args: vec![beam_loader::Operand::X(0)],
+            }),
+            "Test(IsTuple)"
         );
     }
 
