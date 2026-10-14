@@ -951,6 +951,7 @@ impl RuntimeContext<'_> {
             }
             // A name the release does not have raises the bare `error:undef` the oracle does
             // (never a fabricated value and never a capability gap — see `error::undef`).
+            crate::debug_trace::trace(format_args!("UNDEF erlang:{function}/{arity}"));
             return Err(error::undef());
         }
         // The code server adds the system library directories (stdlib, kernel) the first
@@ -958,7 +959,15 @@ impl RuntimeContext<'_> {
         // without an explicit `-pa`. A miss here is not fatal: `CodeServer::load` below
         // reports it, naming every directory searched.
         let _ = self.runtime.find_module_file(module);
-        let loaded = self.runtime.code_server.load(module)?;
+        let loaded = match self.runtime.code_server.load(module) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                crate::debug_trace::trace(format_args!(
+                    "UNDEF load {module}:{function}/{arity}: {err}"
+                ));
+                return Err(err);
+            }
+        };
         self.run_export(&loaded, function, arity, args)
     }
 

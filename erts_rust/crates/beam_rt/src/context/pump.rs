@@ -154,6 +154,10 @@ impl<'a> RuntimeContext<'a> {
             .lookup(function)
             .ok_or_else(error::undef)?;
         if module.export(function_atom, arity).is_none() {
+            crate::debug_trace::trace(format_args!(
+                "UNDEF no-export {}:{function}/{arity}",
+                module.atom_name(module.name).unwrap_or("<unnamed>")
+            ));
             return Err(error::undef());
         }
         if crate::debug_trace::enabled() {
