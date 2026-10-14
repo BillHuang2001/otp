@@ -150,7 +150,7 @@ fn default_registry_contains_the_core_bifs() {
 
 /// The per-module shape of the assembled registry: every module in
 /// `default_registry()` with its key count, verbatim from the crate `CONTEXT.md`
-/// "the implemented BIFs (643)" census (26 modules).
+/// "the implemented BIFs (643)" census (27 modules).
 ///
 /// This is the public-API complement of the crate-internal shadowing guard
 /// (`src/hook_sets.rs::tests::no_registration_body_shadows_another`). The internal
@@ -166,7 +166,7 @@ const MODULE_KEY_COUNTS: &[(&str, usize)] = &[
     ("code", 7),
     ("erl_ddll", 7),
     ("erl_debugger", 13),
-    ("erlang", 281),
+    ("erlang", 282),
     ("error_logger", 1),
     ("erts_debug", 20),
     ("erts_internal", 71),
@@ -187,6 +187,7 @@ const MODULE_KEY_COUNTS: &[(&str, usize)] = &[
     ("records", 8),
     ("string", 1),
     ("unicode", 6),
+    ("zlib", 2),
 ];
 
 #[test]
