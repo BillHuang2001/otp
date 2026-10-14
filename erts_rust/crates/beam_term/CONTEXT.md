@@ -520,6 +520,54 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `RefIdentityUnavailable` (a well-formed M1 reference with an unreproducible C hash) and from
   `NotATerm` (the word is not a term at all).
 
+## Atom-table snapshots — the O(1) append-only memo witness
+`AtomSnapshot` + `AtomTable::{snapshot, appended_since, generation}` let a caller that memoizes an
+*image* of the table validate it in **O(1)** instead of scanning it (`src/atom.rs`; cost and the
+flat-vs-linear shape are measured by `examples/atom_witness.rs`).
+
+**The contract.** `AtomTable` is append-only: `intern` is its only mutating path (`seed` /
+`seed_from_atom_names` route through it; there is no remove/rename/reorder API), so an atom index — and
+any prefix of the table — is stable for the table's lifetime. `snapshot()` reads three scalars
+(identity, generation, length); `appended_since(snapshot)` is `true` **only** when
+1. `self` is the **same instance** as the snapshotting table (a *clone* is a new instance — see
+   [`## Design Decisions`](#design-decisions)), and
+2. the length delta equals the generation delta (each append adds exactly one name and bumps the
+   generation by one, so any non-append mutation breaks the equality — defence in depth against a
+   future mutating API).
+
+It follows that every index `< snapshot.len()` still names the same atom, that any name added since
+occupies an index `>= snapshot.len()`, and that `self.len() >= snapshot.len()`. The check never scans,
+never allocates, and never returns a wrong `true` (a different or replaced table, a clone, a shrunken
+table and a generation that went backwards all give `false`).
+
+**The memo protocol — both halves are required.** A caller holding `(image, snap)` may reuse `image` as
+an exact index→atom image of `shared` iff `shared.appended_since(snap) && image.len() <= shared.len()`,
+and must then extend `image` with `shared`'s names at `image.len()..shared.len()`. Re-take
+`snap = shared.snapshot()` **every time the image is extended** (so `snap.len() == image.len()` at all
+times) and drop the memo — never keep an image that ran ahead of `shared` — when a decode fails
+part-way. With that discipline the `appended_since` half proves `image[0..image.len())` is
+index-identical to `shared`, and the second half rules out a memo longer than the live table.
+
+**Adoption — `beam_bifs::binconv` (the last table-proportional cost on the codec hot path).**
+`with_decode_scratch` (`../../beam_bifs/src/binconv.rs:1105`) validates its per-thread `DECODE_SCRATCH`
+via `prefix_matches` (`:1089`), an index-by-index `name()` comparison that is O(table) — ~1.6–1.8 ns per
+atom, 5438 ns at 3009 atoms and 19602 ns at 12009 (batch-53 `etf_bench` figures), which is what made the
+round trip verification-bound. `DECODE_SCRATCH` becomes `RefCell<Option<(AtomTable, AtomSnapshot)>>`; the
+install/rebuild branch stores `(shared.clone(), shared.snapshot())`, each extension of the scratch
+re-takes the snapshot, and the validation becomes the O(1) pair above. `prefix_matches` and its `name()`
+loop are then dead and should be deleted with the change. Measured on this host (`examples/atom_witness.rs`,
+release, loadavg ~31): the witness itself is **~0.5–0.9 ns/op flat from 4 to 30 009 atoms**, against
+0.09 µs–1.22 ms for the `AtomTable::clone()` it replaces — i.e. the 5438 ns verification step at
+n=3009 collapses to ~1 ns, leaving the term decode itself (~1 µs) as the round trip.
+
+**Adoption — `beam_rt`.** `CodeServer::atoms_mut()` (`../../beam_rt/src/codeserver.rs:293`) is
+`Rc::make_mut` (copy-on-write), so **interning a novel name mints a fresh instance** and conservatively
+invalidates the memo → one O(table) rebuild per novel-atom batch. The steady state (every atom already
+known) performs no `make_mut`, so the witness holds and the check is O(1). The call sites worth wiring
+are the decode memo above and any future memo of the table's shape on `codeserver.rs`'s interning path; a
+runtime that wants novel atoms to be free too should hold a single stable instance
+(`Rc<RefCell<AtomTable>>`) rather than cloning on write — a `beam_rt` decision, not this crate's.
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
