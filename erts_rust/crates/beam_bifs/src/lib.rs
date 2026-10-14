@@ -76,6 +76,7 @@ mod checksum;
 mod compare;
 mod context;
 mod convert;
+mod deflate;
 mod dict;
 mod error;
 mod erts_internal;
