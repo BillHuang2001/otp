@@ -49,9 +49,13 @@
 //! their customary shapes and the two printed lines are compared:
 //!
 //! ```none
-//! beam_rt -pa DIR run DIR/<mod>.beam <mod>:<fun>/0        %% prints the result as `~w~n`
+//! beam_rt -noshell -pa DIR run DIR/<mod>.beam <mod>:<fun>/0   %% prints the result as `~w~n`
 //! erl     -noshell -pa DIR -eval 'io:format("~w~n",[<mod>:<fun>()])' -s init stop
 //! ```
+//!
+//! Both sides pass `-noshell` so the OTP banner the booted kernel prints to stdout is
+//! suppressed identically: the oracle emits its banner without `-noshell`, and this runtime
+//! now mirrors that on every action but `-version`.
 //!
 //! A few cases additionally run on the `-eval` route (`beam_rt -noshell -eval …`), the route
 //! `tests/monitor.rs` and `tests/send.rs` use, so both of this runtime's send entry points are
@@ -527,8 +531,15 @@ fn run_bounded(program: &Path, args: &[&str]) -> Run {
     }
 }
 
-/// `beam_rt -pa DIR run DIR/<mod>.beam <mod>:<fun>/0` — the scheduled-process route, which
-/// prints the result as `~w~n`.
+/// `beam_rt -noshell -pa DIR run DIR/<mod>.beam <mod>:<fun>/0` — the scheduled-process route,
+/// which prints the result as `~w~n`.
+///
+/// `-noshell` is required for the exact-line comparison: every CLI action except `-version`
+/// drives the default boot script, so a booted kernel prints the OTP banner
+/// (`Erlang/OTP 30 [erts-17.1] [source] [64-bit]`) to **stdout** without it. That is
+/// byte-faithful to the oracle — `erl` printed without `-noshell` emits its banner too, while
+/// the oracle side of every case here runs `erl -noshell …` — so suppressing it on our side
+/// keeps the two lines comparable without loosening the assertion.
 fn run_scheduled(fixtures: &Fixtures, module: &str, function: &str) -> Run {
     let beam = fixtures.beam(module);
     let beam = beam
@@ -537,7 +548,7 @@ fn run_scheduled(fixtures: &Fixtures, module: &str, function: &str) -> Run {
     let spec = format!("{module}:{function}/0");
     run_bounded(
         Path::new(BINARY),
-        &["-pa", fixtures.dir_str(), "run", beam, &spec],
+        &["-noshell", "-pa", fixtures.dir_str(), "run", beam, &spec],
     )
 }
 
