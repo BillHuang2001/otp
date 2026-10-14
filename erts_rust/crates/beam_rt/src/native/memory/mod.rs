@@ -109,7 +109,6 @@
 //! | `magic_ref` | no magic ref is bound into a process off-heap table — `beam_abi`'s NIF resource API is unbound and nothing registers a resource with a process |
 //! | `parent` | no parent field on the PCB ([`beam_process::Process`]) — the spawn path never records the spawning process |
 //! | `label` | no label field on the PCB ([`beam_process::Process`]) |
-//! | `async_dist` | no `async_dist` flag in [`beam_process::ProcessFlags`] |
 //! | `priority_messages` | no `priority_messages` flag in [`beam_process::ProcessFlags`] |
 //! | `garbage_collection_info` | [`beam_gc::HeapInfo`] tracks no per-generation block detail (the oracle's `old_heap_block_size`/`mbuf_size`/`recent_size`/`bin_vheap_block_size`/`bin_old_vheap_block_size` are unmeasured) |
 //!
@@ -254,6 +253,7 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
     "monitored_by",
     "dictionary",
     "trap_exit",
+    "async_dist",
     "error_handler",
     "priority",
     "group_leader",
@@ -290,7 +290,6 @@ const UNSUPPORTED_ITEMS: &[&str] = &[
     "magic_ref",
     "parent",
     "label",
-    "async_dist",
     "priority_messages",
     "garbage_collection_info",
 ];
@@ -320,10 +319,6 @@ const UNSUPPORTED_ITEM_REASONS: &[(&str, &str)] = &[
     (
         "label",
         "no label field on the PCB (`beam_process::Process`)",
-    ),
-    (
-        "async_dist",
-        "no async_dist flag in `beam_process::ProcessFlags`",
     ),
     (
         "priority_messages",
@@ -895,6 +890,15 @@ impl RuntimeContext<'_> {
             "dictionary" => self.dictionary_value(snapshot)?,
             "trap_exit" => {
                 let atom = bool_atom(snapshot.trap_exit);
+                self.atom(atom)?
+            }
+            // The C's per-process `F_ASYNC_DIST` flag (`erl_bif_info.c:986,2981`), read out of
+            // the runtime's own per-pid store — the very store
+            // `process_flag(async_dist, …)` ([`crate::context::process_bridge`]) writes, so the
+            // read and the write can never disagree. A pid that never set the flag reports the
+            // fresh-process default `false`, the oracle's answer.
+            "async_dist" => {
+                let atom = bool_atom(self.runtime.is_async_dist(snapshot.pid));
                 self.atom(atom)?
             }
             "error_handler" => self.atom("error_handler")?,
