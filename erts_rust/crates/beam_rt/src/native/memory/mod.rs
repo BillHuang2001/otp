@@ -1004,6 +1004,15 @@ impl RuntimeContext<'_> {
     fn snapshot(&self, pid: ProcessId) -> Option<Snapshot> {
         let table = self.process_table();
         let process = table.get(pid)?;
+        // The oracle's `process_info(Pid, _)` answers the bare atom `undefined` — for **any**
+        // item — once the pid names a dead process; it does not keep a terminated PCB around
+        // long enough to answer `{status, exiting}`. This runtime's table may still hold a
+        // `Terminated` entry while its death is being propagated (the crash reporter runs
+        // before the reaper), and `Process::status` reports exactly that state as `None`, so
+        // treat it as absent here too. Without this the crash-report path's
+        // `process_info(Pid, current_function)` on a just-dead neighbour would raise the
+        // uncatchable `unsupported` capability gap instead of the oracle's `undefined`.
+        process.status()?;
         let atoms = self.runtime.code_server.atoms();
         let registered_name = table
             .registered()
