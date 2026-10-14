@@ -32,8 +32,8 @@
 
 mod float;
 mod fun;
+mod map;
 mod record;
-
 use beam_common::Result;
 use beam_term::prelude::{
     atom_val, is_atom, is_internal_pid, is_internal_port, is_list, is_nil, is_small, make_atom,
@@ -208,8 +208,12 @@ pub struct Encoder<'a> {
     /// `NEW_FUN_EXT`. `None` — the default — keeps such a fun
     /// [`crate::error::unsupported_local_fun`] (the identity cannot be invented).
     fun_identity: Option<FunIdentity>,
+    /// The `term_to_binary/2` `deterministic` option (`DFLAG_DETERMINISTIC`): when
+    /// set, a map's pairs are emitted sorted by **full term order** on the key
+    /// rather than in the map's stored order (see [`Encoder::set_deterministic`]).
+    /// `false` — the default — reproduces today's bytes exactly.
+    deterministic: bool,
 }
-
 impl<'a> Encoder<'a> {
     /// Creates an encoder whose output begins with the version byte `131`.
     pub fn new(atoms: &'a AtomTable) -> Encoder<'a> {
@@ -231,9 +235,9 @@ impl<'a> Encoder<'a> {
             atom_cache: None,
             local_node: None,
             fun_identity: None,
+            deterministic: false,
         }
     }
-
     /// Selects the atom tag family; defaults to [`AtomEncoding::Utf8`].
     ///
     /// Ignored when a [`MinorVersion`] other than [`MinorVersion::V2`] is selected:
@@ -264,6 +268,28 @@ impl<'a> Encoder<'a> {
         self
     }
 
+    /// Selects the `term_to_binary/2` `deterministic` option
+    /// (`DFLAG_DETERMINISTIC`, `parse_t2b_opts` `external.c:1497-1499`/`:1551-1553`).
+    ///
+    /// When set, a map's `(key, value)` pairs are collected and **sorted by the key
+    /// in full Erlang term order** before being emitted, for **both** a ≤ 32-pair
+    /// flat map and a > 32-pair hash map (HAMT) — exactly the C behaviour
+    /// (`map_key_compare` = `CMP_TERM` = `erts_cmp(a, b, 1, 0)`, `external.c:3217-3227`,
+    /// applied at `external.c:3757-3764` and `:3783-3807`). This makes the image
+    /// independent of the map's internal storage order.
+    ///
+    /// The default is `false`, so every existing signature and every un-flavoured
+    /// [`encode_term`] is byte-for-byte unchanged; the flag changes **only** map
+    /// emission (atom encoding, floats and all other tags are untouched).
+    pub fn set_deterministic(&mut self, on: bool) {
+        self.deterministic = on;
+    }
+
+    /// Builder form of [`Encoder::set_deterministic`].
+    pub fn with_deterministic(mut self) -> Encoder<'a> {
+        self.deterministic = true;
+        self
+    }
     /// The atom-tag family in effect: [`AtomEncoding`] under [`MinorVersion::V2`],
     /// the pinned `term_to_binary` Latin-1 form under `V0`/`V1`.
     fn atom_flavour(&self) -> AtomFlavour {
@@ -672,8 +698,17 @@ impl<'a> Encoder<'a> {
     /// sort without the `deterministic` dflag), so sorting here would corrupt a
     /// decode→re-encode round-trip. See the crate `CONTEXT.md`, §"Map key encode order".
     /// The pair count must fit the flatmap `arityval` (24-bit), else `SystemLimit`.
+    ///
+    /// With [`Encoder::set_deterministic`] the pairs are instead collected and sorted by
+    /// full term order before emitting (the C `DFLAG_DETERMINISTIC` flat-map path,
+    /// `external.c:3757-3764`).
     fn encode_map(&mut self, keys: &[Eterm], values: &[Eterm]) -> Result<()> {
         debug_assert_eq!(keys.len(), values.len(), "a flatmap's keys and values are paired");
+        if self.deterministic {
+            let pairs: Vec<(Eterm, Eterm)> =
+                keys.iter().copied().zip(values.iter().copied()).collect();
+            return self.encode_pairs_sorted_by_key(&pairs);
+        }
         self.encode_map_header(keys.len())?;
         for i in 0..keys.len() {
             self.encode(keys[i])?;
@@ -681,7 +716,6 @@ impl<'a> Encoder<'a> {
         }
         Ok(())
     }
-
     /// Encodes a **hash map** (> 32 pairs, a HAMT) as `MAP_EXT`, in the C encoder's wire
     /// order.
     ///
@@ -698,7 +732,14 @@ impl<'a> Encoder<'a> {
     /// A flat map is a single leaf run and is **not** reversed: the C emits it in stored
     /// order (`external.c:3391-3401`/`3745-3769`), which [`encode_map`](Self::encode_map)
     /// preserves. The pair count must fit the `arityval` 24-bit field, else `SystemLimit`.
+    ///
+    /// With [`Encoder::set_deterministic`] the reversal does not apply: the C collects
+    /// the pairs into an array and sorts them by key in full term order (`external.c:3783-3807`),
+    /// so the stored traversal order is discarded entirely.
     fn encode_hashmap_pairs(&mut self, pairs: &[(Eterm, Eterm)]) -> Result<()> {
+        if self.deterministic {
+            return self.encode_pairs_sorted_by_key(pairs);
+        }
         self.encode_map_header(pairs.len())?;
         for (key, value) in pairs.iter().rev() {
             self.encode(*key)?;
@@ -706,7 +747,6 @@ impl<'a> Encoder<'a> {
         }
         Ok(())
     }
-
     /// Writes the `MAP_EXT` tag and the big-endian pair count `n` (the shared map
     /// prologue). `n > MAX_ARITYVAL` cannot be represented by the `arityval` header, so
     /// it is a `SystemLimit`.

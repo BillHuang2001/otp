@@ -425,6 +425,127 @@
         assert_eq!(bytes[10], 0);
     }
 
+    /// The `deterministic` option (`DFLAG_DETERMINISTIC`) sorts a flat map's atom keys
+    /// in **full term order** (name order for atoms), not the stored order — the
+    /// oracle's `term_to_binary(#{b=>1,a=>2,c=>3},[deterministic])` (see
+    /// `tests/t2b_options.rs` for the live cross-check).
+    #[test]
+    fn deterministic_sorts_a_flat_map_with_atom_keys() {
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        let a = make_atom(atoms.intern("a"));
+        let b = make_atom(atoms.intern("b"));
+        let c = make_atom(atoms.intern("c"));
+        // Stored order b, a, c — a caller-built flat map keeps the caller's order.
+        let map = make_flatmap(
+            &mut heap,
+            &[(b, make_small(1)), (a, make_small(2)), (c, make_small(3))],
+        )
+        .unwrap();
+
+        // Flag OFF: the stored order is preserved verbatim (byte-for-byte today's bytes).
+        assert_eq!(
+            encode_term_body(map, &atoms).unwrap(),
+            vec![116, 0, 0, 0, 3, 119, 1, 98, 97, 1, 119, 1, 97, 97, 2, 119, 1, 99, 97, 3]
+        );
+
+        // Flag ON: keys sort into full term order (a, b, c).
+        let mut encoder = Encoder::new_body(&atoms).with_deterministic();
+        encoder.encode(map).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![116, 0, 0, 0, 3, 119, 1, 97, 97, 2, 119, 1, 98, 97, 1, 119, 1, 99, 97, 3]
+        );
+    }
+
+    /// `deterministic` sorts an integer-keyed flat map numerically (full term order),
+    /// regardless of the stored order.
+    #[test]
+    fn deterministic_sorts_an_integer_keyed_flat_map() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        // Stored order 10, 2, 3.
+        let map = make_flatmap(
+            &mut heap,
+            &[
+                (make_small(10), make_small(1)),
+                (make_small(2), make_small(2)),
+                (make_small(3), make_small(3)),
+            ],
+        )
+        .unwrap();
+
+        let default = encode_term_body(map, &atoms).unwrap();
+        assert_eq!(
+            default,
+            vec![116, 0, 0, 0, 3, 97, 10, 97, 1, 97, 2, 97, 2, 97, 3, 97, 3]
+        );
+
+        let mut encoder = Encoder::new_body(&atoms).with_deterministic();
+        encoder.encode(map).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![116, 0, 0, 0, 3, 97, 2, 97, 2, 97, 3, 97, 3, 97, 10, 97, 1]
+        );
+    }
+
+    /// `deterministic` reorders a > 32-pair **hash map** (HAMT) into ascending key
+    /// order — the C's `DFLAG_DETERMINISTIC` HAMT path (`external.c:3783-3807`).
+    #[test]
+    fn deterministic_sorts_a_hash_map_emission() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(1 << 16);
+        // 40 pairs (> MAP_SMALL_MAP_LIMIT): `make_map` builds a HAMT, whose *stored*
+        // order is node-slot order, not key order.
+        let pairs: Vec<(Eterm, Eterm)> = (1..=40i64).map(|n| (make_small(n), make_small(n))).collect();
+        let map = crate::term::make_map(&mut heap, &pairs, &atoms).unwrap();
+
+        let default = encode_term_body(map, &atoms).unwrap();
+        let mut encoder = Encoder::new_body(&atoms).with_deterministic();
+        encoder.encode(map).unwrap();
+        let sorted = encoder.finish();
+
+        assert_eq!(default[0], 116);
+        assert_eq!(sorted[0], 116);
+        assert_eq!(
+            u32::from_be_bytes([sorted[1], sorted[2], sorted[3], sorted[4]]),
+            40
+        );
+        assert_ne!(default, sorted, "deterministic must reorder a HAMT");
+
+        // Read the wire keys straight off the image (each key/value is a small):
+        // the deterministic image carries the keys in ascending order 1..40.
+        let mut keys = Vec::new();
+        let mut i = 5; // past `[MAP_EXT, count:4]`
+        for _ in 0..40 {
+            assert_eq!(sorted[i], 97, "SMALL_INTEGER_EXT key");
+            keys.push(i64::from(sorted[i + 1]));
+            i += 4;
+        }
+        assert_eq!(keys, (1..=40).collect::<Vec<_>>());
+    }
+
+    /// `set_deterministic(false)` restores the byte-identical default: the flag is
+    /// purely additive and OFF by default.
+    #[test]
+    fn set_deterministic_false_restores_the_default_bytes() {
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        let a = make_atom(atoms.intern("a"));
+        let b = make_atom(atoms.intern("b"));
+        let map = make_flatmap(&mut heap, &[(b, make_small(1)), (a, make_small(2))]).unwrap();
+
+        let default = encode_term_body(map, &atoms).unwrap();
+        let mut encoder = Encoder::new_body(&atoms);
+        encoder.set_deterministic(false);
+        encoder.encode(map).unwrap();
+        assert_eq!(encoder.finish(), default);
+        // ... and the default is the stored (b, a) order, not the sorted one.
+        assert_eq!(
+            default,
+            vec![116, 0, 0, 0, 2, 119, 1, 98, 97, 1, 119, 1, 97, 97, 2]
+        );
+    }
     #[test]
     fn external_pid_uses_new_pid_ext() {
         let mut atoms = AtomTable::new();
