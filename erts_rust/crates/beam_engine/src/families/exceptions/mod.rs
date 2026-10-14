@@ -124,6 +124,7 @@ mod tests;
 /// raise.
 pub(crate) fn exec(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -281,7 +282,7 @@ pub(crate) fn exec(
             let cooked = if is_nil(raw) && !has_snapshot && !head {
                 NIL
             } else {
-                symbolic_stacktrace(machine, module, ctx, &Operand::X(0), head)?
+                symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(0), head)?
             };
             machine.set_x(0, cooked)?;
             Ok(Some(Step::Next))

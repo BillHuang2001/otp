@@ -250,6 +250,7 @@ fn a_headed_raise_cooks_the_callee_item_in_front_of_the_frames() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &no_labels(),
         &Instr::BuildStacktrace,
         0,
@@ -303,6 +304,7 @@ fn an_empty_frame_chain_with_a_head_cooks_to_a_one_element_list() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &no_labels(),
         &Instr::BuildStacktrace,
         0,
@@ -334,6 +336,7 @@ fn a_cooked_trace_without_a_head_is_unchanged() {
 
     let step = exec(
         &mut machine,
+        &module,
         &module,
         &no_labels(),
         &Instr::BuildStacktrace,

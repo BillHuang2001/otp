@@ -45,6 +45,7 @@ fn try_pushes_a_catch_frame_and_blanks_the_slot() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &labels,
         &Instr::Try {
             frame: Operand::X(1),
@@ -71,6 +72,7 @@ fn catch_is_the_same_as_try() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &labels,
         &Instr::Catch {
             frame: Operand::X(0),
@@ -93,6 +95,7 @@ fn try_with_an_unknown_fail_label_is_a_typed_error() {
     let mut ctx = MinimalContext::new();
     let err = exec(
         &mut machine,
+        &module,
         &module,
         &no_labels(),
         &Instr::Try {

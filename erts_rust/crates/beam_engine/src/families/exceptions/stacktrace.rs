@@ -82,12 +82,10 @@ use crate::terms::{ContextSink, Sink};
 /// its `(func, pc)` pair belongs to (a frame's continuation carries the module
 /// context it returns into — see [`crate::machine::ModuleContext`]):
 /// * context `0` — the run's entry module, which the machine **borrows** rather than
-///   owns — resolves against the `module` argument, but **only** when the machine's
-///   [`Machine::current_context`] is also `0` (then that argument *is* that entry
-///   module). When the handler — where `build_stacktrace` runs — is in a registered
-///   (non-zero) context, the caller's `module` argument is the *callee's* module, so
-///   a context-`0` snapshot frame cannot be resolved and is **skipped** rather than
-///   named against the wrong module.
+///   owns — resolves against the `entry_module` argument, whatever module context
+///   the handler cooking the trace executes in: context `0` *always* names the run's
+///   entry module, so a handler inside a cross-module callee still names the entry
+///   module's frames correctly.
 /// * a non-zero context `id` resolves through [`Machine::module_context`]; an id that
 ///   was never registered is **skipped**.
 ///
@@ -146,7 +144,7 @@ use crate::terms::{ContextSink, Sink};
 /// frame chain with a live head cooks to the **one-element** list `[Item]`.
 pub(crate) fn symbolic_stacktrace(
     machine: &mut Machine,
-    module: &Module,
+    entry_module: &Module,
     ctx: &mut dyn ExecutionContext,
     head_operand: &Operand,
     head: bool,
@@ -157,10 +155,6 @@ pub(crate) fn symbolic_stacktrace(
     // local module handles (never `machine`), leaving the later
     // `reserve_slack(machine, ..)` free to take `&mut machine`.
     let frames: Vec<(u32, u32, u32)> = machine.raise_snapshot().to_vec();
-    // Where the handler (`build_stacktrace`) is executing: only when it is the entry
-    // module's context (`0`) is the caller's `module` argument the module a
-    // context-`0` frame belongs to.
-    let handler_context = machine.current_context();
     // Resolve each frame's owning module *before* sizing: a non-zero context's
     // `Arc<Module>` must stay alive across the one reservation below, because an
     // [`ItemShape`] borrows its `Line` chunk (the file name).
@@ -168,8 +162,9 @@ pub(crate) fn symbolic_stacktrace(
     let mut plan: Vec<FrameOwner> = Vec::with_capacity(frames.len());
     for (context, _func, _pc) in &frames {
         match *context {
-            0 if handler_context == 0 => plan.push(FrameOwner::EntryModule),
-            0 => plan.push(FrameOwner::Skip),
+            // Context `0` is ALWAYS the run's borrowed **entry module**, whatever
+            // module context the handler cooking the trace is executing in.
+            0 => plan.push(FrameOwner::EntryModule),
             id => match machine.module_context(id) {
                 Some(handle) => {
                     plan.push(FrameOwner::Owned(owned.len()));
@@ -184,7 +179,7 @@ pub(crate) fn symbolic_stacktrace(
     let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
     for ((_context, func, pc), owner) in frames.iter().zip(plan.iter()) {
         let owner_module: &Module = match owner {
-            FrameOwner::EntryModule => module,
+            FrameOwner::EntryModule => entry_module,
             FrameOwner::Owned(index) => &owned[*index],
             FrameOwner::Skip => continue,
         };
@@ -224,8 +219,8 @@ pub(crate) fn symbolic_stacktrace(
 /// `Line` chunk (the file name), so the handle must outlive every `reserve`/`write`
 /// step — never be dropped after the shape was computed.
 enum FrameOwner {
-    /// The run's **entry** module — the `module` argument. Valid only for a
-    /// context-`0` frame observed from a context-`0` handler.
+    /// The run's **entry** module — the `entry_module` argument. Context `0` always
+    /// names it, whatever module context the handler executes in.
     EntryModule,
     /// Index into the local handle vector: a registered context's module.
     Owned(usize),
