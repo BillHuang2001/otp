@@ -110,10 +110,10 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::runtime::{
     encode_target, ExtCallHelper, PositionHelper, RefreshHelper, StepHelper, EXT_CALL,
-    EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
+    EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_DECLINE, RUNTIME_XREGS_DISP,
 };
 use super::receive::jit_receive;
-use super::{jit_ext_call, jit_set_position, jit_step_one};
+use super::{jit_ext_call, jit_local_call, jit_set_position, jit_step_one};
 use super::runtime::{jit_publish_y, jit_refresh_y};
 
 mod aggregate;
@@ -579,10 +579,16 @@ fn emit_block(
             // documented deopt: the helper runs the interpreter's own `call_last` and so
             // reports its exact `unknown_label`/frame error. Like `jump`, the
             // instruction always transfers control, so the block ends here either way.
+            //
+            // The seam probe ([`emit_local_call_probe`]) runs first: the host's
+            // **local-call** seam must be consulted even when the call is statically
+            // linkable, because a host that serves the callee as a BIF means the callee
+            // never runs at all. A **decline** falls through to the unchanged link.
             Instr::CallLast {
                 target, deallocate, ..
             } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) if linker.is_compiled(target_func, target_pc) => {
+                    emit_local_call_probe(buffer, allocation, done, func, pc)?;
                     linker.emit_tail_exit(
                         buffer,
                         allocation,
@@ -599,8 +605,13 @@ fn emit_block(
             // A local tail call **without** a frame to pop (`call_only Arity Label`):
             // `i_call_only(CallDest)` is `$DISPATCH_REL(Dest)`, so it lowers exactly
             // like the `jump` arm above — resolve at compile time, then link or deopt.
+            // The seam probe precedes the link here too (a `call_only` is the shape a
+            // NIF-stub tail call takes), and a decline falls through to the unchanged
+            // exit — which for a successor this compilation did not emit is
+            // `emit_exit`'s return word, exactly as before.
             Instr::CallOnly { target, .. } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
+                    emit_local_call_probe(buffer, allocation, done, func, pc)?;
                     linker.emit_exit(buffer, allocation, done, target_func, target_pc)?;
                     terminated = true;
                     break;
@@ -872,6 +883,40 @@ pub(super) fn emit_step_and_continue(
         &[i64::from(func), i64::from(pc)],
     )?;
     emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// Emit the **local-call seam probe** in front of a local tail call's exit: call
+/// [`jit_local_call`], and either leave for the driver with the helper's word or fall
+/// through to the block's own — unchanged — static exit.
+///
+/// The probe is the run-time half of the seam a compiled block needs: the cross-run
+/// code cache shares blocks between runs and hosts, so whether a same-module callee is
+/// served as a BIF can only be decided while the block runs, never at compile time.
+///
+/// The helper's word is left in `rax` (the block ABI's return register); the decline
+/// comparison is against a constant loaded into `r11` — never a `movabs` into `rax`,
+/// which must keep the word — and on a non-decline word the emitted code jumps to the
+/// block epilogue **without a refill**, exactly as a deopt's exit path does. A decline
+/// is the only path that runs on into the caller's static exit; it is safe there
+/// because a decline mutates nothing (see [`jit_local_call`]), so the cached
+/// x-registers that exit spills are still the values `machine.x` must receive.
+fn emit_local_call_probe(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+) -> Result<()> {
+    let helper: StepHelper = jit_local_call;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[i64::from(func), i64::from(pc)],
+    )?;
+    buffer.mov_ri(Reg::R11, LOCAL_DECLINE)?;
+    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+    buffer.jcc(Cond::Ne, done)
 }
 
 /// Emit the native arm for one `call_ext*` instruction: the `jit_ext_call` helper

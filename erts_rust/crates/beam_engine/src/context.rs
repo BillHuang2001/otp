@@ -635,6 +635,53 @@ pub trait ExecutionContext {
         Ok(None)
     }
 
+    /// Serve a **local** (same-module) call as a BIF instead of entering the
+    /// callee's own code — the *local-call* seam.
+    ///
+    /// The OTP compiler emits a **local** `call`/`call_only`/`call_last` for a
+    /// same-module function: a self-qualified call to an *exported* function is a
+    /// `call_ext`, but a call to a non-exported one stays local. A local call
+    /// therefore consults **no** BIF seam today — the engine resolves the label and
+    /// enters that code — so a module's non-exported functions can never reach
+    /// [`call_bif`](ExecutionContext::call_bif). That is exactly the shape ERTS uses
+    /// for a built-in/static NIF library (`lib/kernel/src/prim_tty.erl`: the exported
+    /// Erlang wrappers run in-module and chain **locally** into the non-exported NIF
+    /// stubs `tty_create/1`/`read_nif/3`/…), and this seam is the only way a host can
+    /// serve those stubs: the three local call arms
+    /// (`call`/`call_only`/`call_last`) consult it before jumping, in the interpreter
+    /// **and** on the native baseline tier.
+    ///
+    /// * `Ok(true)` — "I serve this `module:function/arity`": the engine marshals the
+    ///   instruction's own register arguments (`x(0..arity)`) into a
+    ///   [`call_bif`](ExecutionContext::call_bif) call exactly as a `call_ext` would,
+    ///   then applies the arm's own frame discipline to the returned value (a
+    ///   non-tail `call` continues at the next instruction; a tail `call_only`/
+    ///   `call_last` follows the frame's existing continuation, `call_last` popping
+    ///   its `deallocate` frame first). **No callee code runs**, so the host must be
+    ///   able to produce the result from the arguments alone.
+    /// * `Ok(false)` — "enter the callee in this machine": today's behaviour, an
+    ///   in-machine jump to the local label (with the arm's continuation store, its
+    ///   `call_last` frame pop and its contract-A.8 `call` event). **This is the
+    ///   default**, and it is byte-identical to the tier before the seam existed.
+    ///
+    /// The engine recovers `module:function/arity` from the resolved callee's own
+    /// function entry and atom table; when either name cannot be resolved it does not
+    /// call this method at all and takes the in-machine jump, so a host is never
+    /// asked about a fabricated name.
+    ///
+    /// An `Err` propagates out of the run exactly like any other engine failure — the
+    /// raise funnel's frame discipline included, so a raise lands in a live
+    /// `try`/`catch` when there is one.
+    ///
+    /// The default body returns `Ok(false)`, so every existing host compiles and
+    /// behaves byte-identically (it pays only the call).
+    ///
+    /// [`call_bif`]: ExecutionContext::call_bif
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        let _ = (module, function, arity);
+        Ok(false)
+    }
+
     /// The **per-instruction reduction hook**: charge `n` reductions for the
     /// instruction the engine is about to execute.
     ///
@@ -776,6 +823,17 @@ pub type ExternalResolver =
 /// [`MinimalContext::new`] leaves it unset, so `resolve_local_fun` stays the
 /// trait's `Ok(None)` default.
 pub type LocalFunResolver = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Option<(Arc<Module>, Label)>>>;
+
+/// A local-call resolver: the pluggable body of
+/// [`ExecutionContext::resolve_local_call`].
+///
+/// Answers whether the host serves a **same-module** `call`/`call_only`/`call_last`
+/// target as a BIF instead of letting the engine enter its code: `true` = serve it
+/// (the engine dispatches `(module, function, arity)` through
+/// [`call_bif`](ExecutionContext::call_bif)), `false` = the in-machine jump (the trait
+/// default). [`MinimalContext::new`] leaves it unset, so `resolve_local_call` stays the
+/// trait's `Ok(false)` default.
+pub type LocalCallResolver = Box<dyn FnMut(&str, &str, u32) -> Result<bool>>;
 
 /// The first region's **reservation** in `Eterm` words (4 MiB).
 ///
@@ -989,6 +1047,9 @@ pub struct MinimalContext {
     /// An optional local-closure resolver (the
     /// [`ExecutionContext::resolve_local_fun`] body).
     local_fun_resolver: Option<LocalFunResolver>,
+    /// An optional local-call resolver (the
+    /// [`ExecutionContext::resolve_local_call`] body).
+    local_call_resolver: Option<LocalCallResolver>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
     /// The pointer-stable heap backing [`ExecutionContext::alloc_words`].
@@ -1020,6 +1081,7 @@ impl MinimalContext {
             apply_hook: None,
             external_resolver: None,
             local_fun_resolver: None,
+            local_call_resolver: None,
             mailbox: None,
             heap: ContextHeap::new(),
         }
@@ -1082,6 +1144,21 @@ impl MinimalContext {
     /// Install (or replace) the local-closure resolver.
     pub fn set_local_fun_resolver(&mut self, resolver: LocalFunResolver) {
         self.local_fun_resolver = Some(resolver);
+    }
+
+    /// A context with the given local-call resolver and the default (rejecting) BIF
+    /// hook.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_local_call_resolver(resolver: LocalCallResolver) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.local_call_resolver = Some(resolver);
+        ctx
+    }
+
+    /// Install (or replace) the local-call resolver.
+    pub fn set_local_call_resolver(&mut self, resolver: LocalCallResolver) {
+        self.local_call_resolver = Some(resolver);
     }
 
     /// Install (or replace) the mailbox.
@@ -1211,6 +1288,18 @@ impl ExecutionContext for MinimalContext {
             None => {
                 let _ = (fun, args);
                 Ok(None)
+            }
+        }
+    }
+
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        // Without an installed resolver the in-machine jump is the only route, so the
+        // three local call arms behave exactly as they did before the seam existed.
+        match self.local_call_resolver.as_mut() {
+            Some(resolver) => resolver(module, function, arity),
+            None => {
+                let _ = (module, function, arity);
+                Ok(false)
             }
         }
     }

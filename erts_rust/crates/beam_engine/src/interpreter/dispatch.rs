@@ -318,7 +318,25 @@ impl Machine {
             } => self
                 .exec_bif(module, labels, *bif, args, *fail, dst, ctx)
                 .map_err(Box::new),
-            Instr::Call { target, .. } => {
+            Instr::Call { target, arity } => {
+                let (callee, callee_pc) = resolve(labels, *target)?;
+                // The local-call seam: a host that serves this same-module callee as a
+                // BIF answers `true` and the callee's code never runs (see
+                // [`Machine::local_call_seam`]). The seam is asked **before** the
+                // continuation is stored, so the accepted path never leaves a
+                // return address for a callee that does not run — exactly like the
+                // synchronous half of the `call_ext` arm.
+                if let Some(step) = self.local_call_seam(
+                    module,
+                    callee,
+                    *arity,
+                    ImportFrame::Call,
+                    func,
+                    pc,
+                    ctx,
+                )? {
+                    return Ok(step);
+                }
                 // Store the continuation in the *current* frame's CP slot, tagged
                 // with the module context it points into (the one executing now).
                 self.set_continuation(Continuation::Address {
@@ -326,7 +344,6 @@ impl Machine {
                     pc: pc + 1,
                     context: self.current_context(),
                 })?;
-                let (callee, callee_pc) = resolve(labels, *target)?;
                 // Contract A.8: report the callee's `call` event (the oracle's
                 // breakpoint fires on entry to the callee). Gated, so an untraced
                 // run pays one predictable branch and builds no event.
@@ -339,7 +356,9 @@ impl Machine {
                 })
             }
             Instr::CallLast {
-                target, deallocate, ..
+                target,
+                arity,
+                deallocate,
             } => {
                 // `i_call_last(CallDest, Deallocate)` is `$deallocate(D);
                 // $DISPATCH_REL(Dest)` (`emu/instrs.tab:163`): the frame is popped
@@ -348,6 +367,21 @@ impl Machine {
                 // the jump itself is the only step that depends on the popped
                 // frame, and by then nothing may fail.
                 let (callee, callee_pc) = resolve(labels, *target)?;
+                // The local-call seam: a served callee is dispatched as a BIF and its
+                // frame discipline pops **after** the call succeeded (the same
+                // order `ImportFrame::Last` applies on the `call_ext_last` route), so
+                // the seam is asked before anything is popped.
+                if let Some(step) = self.local_call_seam(
+                    module,
+                    callee,
+                    *arity,
+                    ImportFrame::Last(*deallocate),
+                    func,
+                    pc,
+                    ctx,
+                )? {
+                    return Ok(step);
+                }
                 self.pop_frame_checked(*deallocate)?;
                 // The `call` event names the tail-callee; the frame that remains is
                 // the original caller's, so the callee's eventual `return` reports
@@ -360,8 +394,22 @@ impl Machine {
                     pc: callee_pc,
                 })
             }
-            Instr::CallOnly { target, .. } => {
+            Instr::CallOnly { target, arity } => {
                 let (callee, callee_pc) = resolve(labels, *target)?;
+                // The local-call seam: a served `call_only` stores nothing (the
+                // frame's existing continuation is followed), exactly like its
+                // `call_ext_only` twin.
+                if let Some(step) = self.local_call_seam(
+                    module,
+                    callee,
+                    *arity,
+                    ImportFrame::Only,
+                    func,
+                    pc,
+                    ctx,
+                )? {
+                    return Ok(step);
+                }
                 if self.trace_on {
                     self.trace_call_local(module, callee, ctx);
                 }
@@ -928,6 +976,63 @@ impl Machine {
             };
         self.apply_import_target(apply_target, frame, func, pc)
     }
+
+    /// The **local-call seam**: consult the host's
+    /// [`ExecutionContext::resolve_local_call`] for the same-module callee a local
+    /// `call`/`call_only`/`call_last` resolved to, and — when the host serves it —
+    /// dispatch it as a BIF under the arm's own frame discipline.
+    ///
+    /// `Some(step)` is the instruction's outcome: the synchronous [`Step`] the
+    /// arm's `frame` discipline produces for the BIF's value (via
+    /// [`Machine::apply_import_target`]'s `ApplyTarget::Called`, so a
+    /// `call` continues at the next instruction while a tail `call_only`/`call_last`
+    /// follows the frame's existing continuation — `call_last` popping its frame
+    /// first), or the landing of the raise a failing BIF produced
+    /// ([`Machine::raise_bif_error`], the engine's one raise funnel).
+    ///
+    /// `None` means **"enter the callee in this machine"**: the host declined
+    /// (`Ok(false)`), or the resolved callee's function entry / one of its two names
+    /// is missing — in which case the caller runs its unchanged in-machine jump. The
+    /// seam is **never asked about a fabricated name** (the identity comes from the
+    /// callee's own function entry and the module's atom table) and **nothing is
+    /// mutated on the `None` path**, so the caller's continuation-store / frame-pop /
+    /// A.8-event order is byte-identical to the tier before the seam existed.
+    ///
+    /// `nregs` is the *instruction's* own `arity` operand: the number of register
+    /// arguments marshalled into the BIF call. The callee's declared arity is the BIF
+    /// arity, so for a well-formed local call the two agree.
+    ///
+    /// The native baseline tier drives this same method from its `jit_local_call`
+    /// helper ([`crate::jit::baseline`]), so the two tiers share **one** definition of
+    /// the seam's behaviour and cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn local_call_seam(
+        &mut self,
+        module: &Module,
+        callee: u32,
+        nregs: u32,
+        frame: ImportFrame,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> std::result::Result<Option<Step>, Box<BeamError>> {
+        let Some((module_name, function_name, arity)) = local_callee_identity(module, callee) else {
+            return Ok(None);
+        };
+        if !ctx
+            .resolve_local_call(module_name, function_name, arity)
+            .map_err(Box::new)?
+        {
+            return Ok(None);
+        }
+        let value = match self.call_bif_named(module_name, function_name, arity, nregs, ctx) {
+            Ok(value) => value,
+            Err(e) => return self.raise_bif_error(module, e).map_err(Box::new).map(Some),
+        };
+        self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
+            .map(Some)
+    }
+
     /// Apply an arm's own frame discipline to the [`ApplyTarget`]
     /// [`Machine::call_ext_dispatch`] resolved for it (from either special-case
     /// seam, the host's cross-module seam, or the synchronous BIF route).
@@ -940,7 +1045,7 @@ impl Machine {
     /// value, before following the now-current caller's continuation). A
     /// [`ApplyTarget::Raised`] leaves the caller's frame untouched and its landed
     /// `x(0..=3)` registers are returned as-is.
-    fn apply_import_target(
+    pub(crate) fn apply_import_target(
         &mut self,
         target: ApplyTarget,
         frame: ImportFrame,
@@ -1008,6 +1113,22 @@ pub(crate) enum ImportFrame {
 /// The argument count past which C's `apply()` raises `error:system_limit`
 /// (`../../erts/emulator/beam/erl_vm.h:48`, `MAX_ARG = 255`).
 const MAX_ARG: usize = 255;
+
+/// The `(module name, function name, arity)` of the **same-module** callee a local
+/// `call`/`call_only`/`call_last` resolved to, or `None` when the callee's function
+/// entry — or either of its two names — is missing from the running module.
+///
+/// The identity comes from the callee's **own** function entry
+/// (`Module::functions[func]`) and the module's atom table, never from the call
+/// site's operands: the label was already resolved, so this names the function that
+/// will really run. An un-nameable identity declines the local-call seam rather than
+/// asking the host about a fabricated name (see [`Machine::local_call_seam`]).
+fn local_callee_identity(module: &Module, func: u32) -> Option<(&str, &str, u32)> {
+    let function = module.functions.get(func as usize)?;
+    let name = module.atom_name(function.name)?;
+    let owner = module.atom_name(function.module)?;
+    Some((owner, name, function.arity))
+}
 
 /// C's `apply of apply/3` argument-list shape (`beam_common.c:1472-1495`): a
 /// **3-element** list `[M, F, Inner]`, returning the three elements. Anything else

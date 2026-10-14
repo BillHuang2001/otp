@@ -162,13 +162,15 @@ impl Machine {
 
     /// Call an imported BIF with the `arity` register arguments `x(0..arity)`.
     ///
-    /// Like [`Machine::exec_bif`] the arguments are marshalled through a stack
-    /// array for the common arities and through the machine's reusable scratch
-    /// buffer beyond it, so a `call_ext` pays no heap allocation in either case;
-    /// the import target comes from the same per-run cache
-    /// ([`LabelMap::import_target`], `labels`). A marshalling error (a bad import or
-    /// an out-of-range register) is handed back as an `Err` like a BIF failure —
-    /// which the caller raises, exactly as before this seam.
+    /// The import's `(module, function, arity)` comes from the per-run cache
+    /// ([`LabelMap::import_target`], `labels`) and the marshalling is
+    /// [`Machine::call_bif_named`]'s. Note the two arities it passes on: the
+    /// **registers** are the *instruction's* `arity` operand while the BIF is
+    /// dispatched with the **import table's** declared arity — the split an
+    /// `call_ext N erlang:apply/3`-shaped import needs, preserved verbatim by the
+    /// shared helper. A marshalling error (a bad import or an out-of-range register)
+    /// is handed back as an `Err` like a BIF failure — which the caller raises,
+    /// exactly as before this seam.
     pub(super) fn call_import(
         &mut self,
         module: &Module,
@@ -178,9 +180,41 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
         let (module_name, function_name, bif_arity) = labels.import_target(module, target)?;
-        if arity as usize <= STACK_ARGS {
+        self.call_bif_named(module_name, function_name, bif_arity, arity, ctx)
+    }
+
+    /// Marshal the register arguments `x(0..nregs)` and dispatch
+    /// `module_name:function_name/bif_arity` through [`ExecutionContext::call_bif`].
+    ///
+    /// The **one** definition of the register-marshalling shape every BIF-dispatching
+    /// seam shares — a `call_ext*` ([`Machine::call_import`]) and the *local-call*
+    /// seam's synchronous route (the three local call arms, which serve a same-module
+    /// callee through this helper when the host's
+    /// [`ExecutionContext::resolve_local_call`] answers `true`).
+    ///
+    /// The two arities are deliberately separate: `nregs` is how many register
+    /// arguments to marshal (the instruction's own `arity` operand) while `bif_arity`
+    /// is what the BIF is dispatched with (the import table's declared arity). For a
+    /// well-formed call they are equal; a `call_ext 3 erlang:apply/3`-shaped import is
+    /// where they differ — which is exactly the distinction the local-call route must
+    /// not lose.
+    ///
+    /// Like [`Machine::exec_bif`] the arguments are marshalled through a **stack
+    /// array** for the common arities ([`STACK_ARGS`]) and through the machine's
+    /// reusable scratch buffer beyond it, so no arity allocates a heap block per call
+    /// (after the first wide one). A marshalling error (an out-of-range register) is an
+    /// `Err`, exactly as the call sites expect.
+    pub(crate) fn call_bif_named(
+        &mut self,
+        module_name: &str,
+        function_name: &str,
+        bif_arity: u32,
+        nregs: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Eterm> {
+        if nregs as usize <= STACK_ARGS {
             let mut buf = EMPTY_ARGS;
-            for (i, slot) in buf.iter_mut().enumerate().take(arity as usize) {
+            for (i, slot) in buf.iter_mut().enumerate().take(nregs as usize) {
                 *slot = self
                     .x(i as u32)
                     .ok_or_else(|| error::bad_register(i as u32))?;
@@ -189,7 +223,7 @@ impl Machine {
                 module_name,
                 function_name,
                 bif_arity,
-                &buf[..arity as usize],
+                &buf[..nregs as usize],
             )
         } else {
             // A marshalling error and a BIF failure are the same `Err` to this
@@ -198,10 +232,10 @@ impl Machine {
                 module_name,
                 function_name,
                 bif_arity,
-                arity as usize,
+                nregs as usize,
                 ctx,
                 |machine, _ctx, scratch| {
-                    for i in 0..arity {
+                    for i in 0..nregs {
                         scratch.push(machine.x(i).ok_or_else(|| error::bad_register(i))?);
                     }
                     Ok(())

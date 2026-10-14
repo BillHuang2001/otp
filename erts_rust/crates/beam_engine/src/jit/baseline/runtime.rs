@@ -115,10 +115,10 @@ pub const fn encode_wait(func: u32, pc: u32) -> i64 {
 }
 
 /// Decodes a [`Step::Wait`] block-return word into its `(func, pc)` resume address,
-/// or `None` for every other word (a real continuation, [`HALT`], [`ERROR`] or
-/// [`ENTER`]).
+/// or `None` for every other word (a real continuation, [`HALT`], [`ERROR`],
+/// [`ENTER`] or [`LOCAL_DECLINE`]).
 pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
-    if word >= 0 || word == HALT || word == ERROR || word == ENTER {
+    if word >= 0 || word == HALT || word == ERROR || word == ENTER || word == LOCAL_DECLINE {
         return None;
     }
     decode_target(word & !WAIT_BIT)
@@ -523,6 +523,18 @@ pub(crate) const EXT_CALL_ONLY: u32 = 1;
 /// Bif Deallocate` — the caller's frame is popped before the callee is entered.
 pub(crate) const EXT_CALL_LAST: u32 = 2;
 
+/// The **local-call seam's decline word**: [`jit_local_call`] emits a *local*
+/// `call_only`/`call_last` as a run-time seam probe whose decline arm must fall
+/// through to the block's **static** link, so the helper needs a word that is neither
+/// a real continuation nor one of the block ABI's other sentinels.
+///
+/// It is compared (and consumed) entirely **inside the emitted block** — `cmp rax,
+/// LOCAL_DECLINE; jcc Ne, done` — so it never reaches the driver: the only word a
+/// block returns for a probed local call is the static exit's own (a continuation
+/// word, or one of [`HALT`]/[`ERROR`]/[`ENTER`]/the [`WAIT_BIT`] encoding), exactly as
+/// before the probe existed.
+pub const LOCAL_DECLINE: i64 = -4;
+
 /// The **`call_ext*`** helper: resolve the import through the host's cross-module-call
 /// seam and, when it answers, apply the variant's frame discipline and hand the
 /// callee to the driver as the [`ENTER`] word — the same transfer [`jit_step_one`]
@@ -698,6 +710,127 @@ fn resolve_ext_entry(
     };
     discipline.ok()?;
     Some(Some((context, callee_func, callee_pc)))
+}
+
+/// The **local-call seam** helper: consult the host's
+/// [`ExecutionContext::resolve_local_call`] for a same-module `call_only`/`call_last`
+/// target and, when the host serves it, execute the arm's synchronous BIF route — the
+/// native tier's half of the seam the interpreter's three local call arms honour (see
+/// [`Machine::local_call_seam`], the **one** definition of that behaviour the two tiers
+/// share).
+///
+/// The instruction's own operand shape selects the frame discipline and the register
+/// arity, exactly as the interpreter's arms do ([`ImportFrame::Only`] for a
+/// `call_only`, [`ImportFrame::Last`] with its `deallocate` for a `call_last`); a
+/// `call` is not in the baseline tier's inline set at all, so it never probes — the
+/// block deopts to [`jit_step_one`], whose `Machine::step_instruction` consults the
+/// seam there. The label is re-resolved through the same per-run label map the
+/// interpreter uses, and an unresolvable one is a decline.
+///
+/// Three outcomes, all of them the block ABI's own vocabulary:
+///
+/// * the folded [`Step`] of a served local call (a tail call always yields a
+///   `Goto`/[`Step::Done`]/[`Step::Enter`], never a `Next`), including the landed raise
+///   a failing BIF produced (`ERROR` with `rt.error` set);
+/// * [`LOCAL_DECLINE`] when the host declined (`Ok(false)`), the instruction is not a
+///   local tail call, or the callee's identity cannot be named. **Nothing is mutated**
+///   on this path — the host seam is a `&mut ExecutionContext`, which cannot reach
+///   `machine.x` — so the emitted block's unchanged static exit (the direct `jmp`, or
+///   `jit_tail_call`'s checked pop plus its `jmp`) sees exactly the state it saw before
+///   the probe existed.
+pub(crate) extern "C" fn jit_local_call(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+    let outcome = {
+        // SAFETY: the driver passes `rt` as the address of a live, exclusively
+        // borrowed `JitRuntime` and never aliases it for the duration of the call;
+        // every pointer it holds points at an object the driver owns and keeps alive
+        // for the whole loop (`machine`, `module`), or at a local (`labels`) that
+        // outlives the loop.
+        let runtime = unsafe { &mut *rt };
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // SAFETY: `runtime.module` points at the module the driver is running, which
+        // outlives the loop.
+        let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.labels` points at the driver's `labels` local, which
+        // outlives the loop.
+        let labels = unsafe { &*runtime.labels };
+        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
+        // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
+        let ctx = unsafe { &mut *runtime.ctx };
+        probe_local_call(machine, module, labels, func, pc, ctx)
+    };
+    match outcome {
+        None => LOCAL_DECLINE,
+        Some(step) => {
+            // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the
+            // driver owns; the `&mut` derived from it above is dead by now, so this
+            // borrow does not alias it.
+            let runtime = unsafe { &mut *rt };
+            fold_step(runtime, step, func, pc)
+        }
+    }
+}
+
+/// The Rust body of [`jit_local_call`]: recover the local tail call at `(func, pc)`,
+/// consult the host seam through [`Machine::local_call_seam`], and report either the
+/// arm's outcome or `None` for a **decline** (today's static link).
+///
+/// Separate from the `extern "C"` helper so it may take ordinary Rust types (the
+/// `Option`, the `&Module` both come from the driver's live objects) and so the
+/// exit path's borrows are provably dead before [`fold_step`] takes the runtime again
+/// — the same split [`jit_step_ext`] uses.
+fn probe_local_call(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &LabelMap,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Option<std::result::Result<Step, Box<BeamError>>> {
+    let (target, arity, frame) = match module
+        .functions
+        .get(func as usize)
+        .and_then(|function| function.code.get(pc as usize))
+    {
+        Some(Instr::CallOnly { target, arity }) => (*target, *arity, ImportFrame::Only),
+        Some(Instr::CallLast {
+            target,
+            arity,
+            deallocate,
+        }) => (*target, *arity, ImportFrame::Last(*deallocate)),
+        // Not a local tail call: only the two forms the emitter probes reach here, and
+        // anything else keeps the instruction on its existing path.
+        _ => return None,
+    };
+    let (callee, _) = labels.resolve(target).ok()?;
+    let step = match machine.local_call_seam(module, callee, arity, frame, func, pc, ctx) {
+        Ok(None) => return None,
+        Ok(Some(step)) => Ok(step),
+        Err(err) => Err(err),
+    };
+    Some(decorate(machine, module, step, func, pc))
+}
+
+/// Apply the uniform raise funnel's **entry-context** half to a probed local call's
+/// outcome — exactly what `Machine::step_instruction` does around an instruction it
+/// executes: in the run's entry context (`0`) the active module IS the entry module,
+/// so a propagating raise is decorated here; a non-zero context is left to the
+/// driver, which knows the true entry module. The driver's `ERROR` path returns
+/// `rt.error` without re-running the funnel, so decorating here is what makes a
+/// probed raise carry the same frames as the interpreter's.
+fn decorate(
+    machine: &mut Machine,
+    module: &Module,
+    step: std::result::Result<Step, Box<BeamError>>,
+    func: u32,
+    pc: u32,
+) -> std::result::Result<Step, Box<BeamError>> {
+    if machine.current_context() == 0 {
+        step.map_err(|err| Box::new(machine.with_uncaught_frames(*err, Some(module), func, pc)))
+    } else {
+        step
+    }
 }
 
 /// The **position store** helper: record a compiled block's own `(func, pc)` as the
