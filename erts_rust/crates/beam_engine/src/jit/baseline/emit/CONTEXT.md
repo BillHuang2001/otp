@@ -316,3 +316,53 @@ bounded: a whole-OTP `beam_disasm` census of extra instructions attributable to 
 `gb_trees` 1.010×, `ordsets` 1.005×, `base64` 1.011×, `lists` 1.047×, `queue` 1.164×, `string` 1.222×,
 `calendar` 1.627×. A sub-block whose range would contain another continuation address could be skipped
 (the nested call's own sub-block covers that tail), bounding the growth — correctness-first for now.
+
+## Register cache: partial spill AND partial fill (liveness-based)
+
+`regs.rs` owns the block register cache: a fixed per-block set of x-registers
+(`Allocation::slots`) is held in machine registers for the block's whole duration, so an
+x-register is either *always* cached or *never* cached and the two representations can
+never disagree. Both directions of the traffic are **partial**:
+
+- `spill(buffer, allocation, SpillSite)` stores exactly `Allocation::written` — the
+  block's statically-derived write set (`regalloc.rs::cacheable_writes`, a superset of
+  what the inline lowerings actually write). A cached register outside that set still
+  holds its `machine.x` value at every program point, so storing it is a no-op. Sites:
+  `SpillSite::Helper` (before an in-block helper call — the helper *is* the interpreter
+  and reads `machine.x`) and `SpillSite::Exit` (the block exit and the tail exit).
+  Because `resident ⊆ slots` and a non-resident slot's `machine.x` is already
+  authoritative, storing the write set is exact on every path — including the deopt and
+  epilogue paths.
+- `fill(buffer, allocation, FillSite, pc)` reloads exactly `Allocation::fill_slots(pc)`:
+  the cached registers the continuation at `pc + 1` can still observe, computed
+  block-locally and conservatively by `liveness.rs::fill_sets` as
+  `(live ∪ written) ∩ slots` where `live = (live \ cacheable_writes) ∪ cacheable_touches`
+  in a backwards walk over the block. The write-set term is the **join rule** for a
+  guarded lowering's fallback label: on the fast path the destination register is
+  authoritative and `machine.x` stale, on the fallback path the reverse — reloading the
+  write set makes them agree, so the exit spill (which stores the write set on both
+  paths) stays exact. A cached register left out of the fill set keeps a stale word,
+  which is safe: a later **read** through its machine register makes it live at that
+  helper (so it is reloaded) and every **store** stores exactly the write set, which the
+  fill set always contains. The register is only ever overwritten, never read.
+
+`Allocation` carries `block_start` and `fill_sets` (indexed by `pc - block_start`),
+derived once by `regalloc.rs` at allocation time so the emitter stays a pure reader. An
+**empty** `fill_sets` table (a synthetic `Allocation` a unit test built directly) means
+"no liveness was computed" and makes every fill set the whole cache — the conservative
+pre-liveness model. The prologue load is always the whole cache (`FillSite::Prologue`),
+and the table is always block-length so an in-block pc always resolves. This keeps
+`allocate_registers(module, code, start, end) -> Allocation` and
+`Allocation::slots`' meaning unchanged, so `compile.rs` (and the continuation
+sub-blocks, which drive `emit_block` with their own `start`) compile unchanged.
+
+Helper sites and their treatment: `jit_step_one` (the interpreter — may write any
+x-register) and `jit_ext_call`, the comparison-`test` helper `jit_test` (it can fall back
+to `jit_step_one`), and the receive/send family (`emit_receive`) all route through
+`emit_helper_call` + `emit_continue_check` (or `test.rs::emit_test_helper`'s own
+`success` arm) and are therefore covered by `fill_slots`. The frame-discipline trio
+(`frame.rs`: `deallocate`/`return`/`deallocate_return`) uses `jit_deallocate`, which
+provably writes no x-register, so those paths deliberately emit **no** refill.
+`counters.rs` yields both models from one run: `fill_registers` (new, partial) and
+`fill_registers_full` (`Σ slots.len()`, the previous full-cache model), the latter
+attributed per site by a `PENDING_FILLS` queue that `record_block` drains.
