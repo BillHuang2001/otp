@@ -13,12 +13,19 @@
 %%   * `nested/0` — the same class-`error` shape raised through a NON-tail local
 %%                  call, so the cooked stacktrace names more than one frame.
 %%   * `plain/0` — no exception at all: the value passes through unchanged.
+%%
+%% `thrown/0`/`exited/0` raise through `erlang:raise/3` — the class-carrying BIF
+%% the compiler lowers the `throw(X)` sugar to, and the only raise BIF with an
+%% explicit class the test host's BIF floor serves. The class-`error` shapes use
+%% the in-VM `badmatch` opcode instead, so their reason and stacktrace come from
+%% the engine's own raise path exactly as a compiled `case`/`=` failure does.
 -module(catchclasses).
+-compile(nowarn_deprecated_catch).
 -export([plain/0, thrown/0, exited/0, errored/0, nested/0]).
 
 plain() -> catch ok.
-thrown() -> catch throw(ball).
-exited() -> catch exit(bye).
-errored() -> catch erlang:error(boom).
+thrown() -> catch erlang:raise(throw, ball, []).
+exited() -> catch erlang:raise(exit, bye, []).
+errored() -> catch (a = b).
 nested() -> catch deeper().
-deeper() -> erlang:error(boom).
+deeper() -> a = b.
