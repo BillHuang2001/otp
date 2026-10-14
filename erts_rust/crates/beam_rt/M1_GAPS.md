@@ -98,9 +98,16 @@ min-heap / `fullsweep_after` / `max_heap_size` is observable. Two `max_heap_size
 the key order here is `kill, error_logger, include_shared_binaries, size` (oracle: `error_logger, include_shared_binaries, kill, size`)
 and the per-map flags are not honoured. ~28 items are answered from this runtime's real state (catalog in
 [`src/native/CONTEXT.md`](src/native/CONTEXT.md)); the four **execution-position**
-items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`) only for a scheduled
-process whose entry is a module export, and any other valid oracle item it cannot answer (`catchlevel`,
-`magic_ref`, `priority_messages`, `binary`, ...) raises the typed `unsupported`. `registered_name`'s
+items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`) are answered for a
+scheduled process (a parked one probed from another process; the executing one for its **own** query
+from compiled code, through the in-machine BIF door) and omitted for a process this runtime gave no
+position (a fun-bodied process with no resolved local target, a never-scheduled pid, a direct/no-machine
+caller); `catchlevel` follows the same rule. Two honest residuals of the door: `initial_call` is the
+machine's **entry MFA**, where the oracle answers `{erlang,apply,2}` for some spawn shapes (a
+fun-valued spawn, a start instruction), and the published slot is runtime-wide, so a **nested**
+fun-applied run inside its window reads the **outer** machine's position for that pid. Any other valid
+oracle item it cannot answer (`magic_ref`, `priority_messages`, ...) raises the typed `unsupported`.
+`registered_name`'s
 wrapping and `process_info/1`'s fixed `pi_1_keys` order are exact; `total_heap_size` is **466** (vs the
 oracle's 233) and `memory`/`reductions`/`group_leader` are this runtime's own figures. A pid not in the
 table is `undefined`; an unknown item or a non-pid is `badarg`.
