@@ -15,10 +15,11 @@ Ground truth (read-only): `../../erts/emulator/beam/` (files in the Routing Tabl
 
 ## Roster census (authoritative; code-derived, pinned by `tests/roster_audit.rs`)
 `bif.tab` declares **556** entries (`bif` 476, `ubif` 73, `hbif` 7); **0 are missing**. `default_registry()` =
-`BifRegistry::with_core_bifs()` = **640 keys** = **556 declared + 84 stdlib fast paths** (exports `bif.tab` does
+`BifRegistry::with_core_bifs()` = **643 keys** = **556 declared + 87 stdlib fast paths** (exports `bif.tab` does
 not declare: `lists` +40 over its 5 declared keys — 18 of them fun-taking — `maps` +12 over its 12, 8 `ets:*`,
 `io`/`io_lib`, `unicode`, `binary:referenced_byte_size/1`, the OTP-30 `pid_to_binary`/`ref_to_binary`/
-`port_to_binary`, `erlang:memory/0,1`). Re-derive any split from the registry, never from this prose.
+`port_to_binary`, `erlang:memory/0,1`, `erlang:convert_time_unit/3`, `zlib:compress/1`/`uncompress/1`).
+Re-derive any split from the registry, never from this prose.
 **Declared ≠ registered ≠ adopted.** Of the 556, **346 are unconditional in-crate** and **210 are seam-backed**
 (they route through one of the fifteen optional `BifContext` hooks and answer the typed `unsupported_bif` until a
 host installs the hook). The dedup **seam union is 240** = the 13 `hook_sets.rs` tables (244 raw keys − the 4
@@ -43,7 +44,7 @@ Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifCo
 (validation tooling, not a runtime seam).
 - **`registry.rs`** — `BifFn = fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>`; `BifRegistry` (nested
   `module → function → [(arity, BifFn)]` maps, so `lookup`/`contains` are allocation-free; `new`/`is_empty`/`len`/
-  `names`/`entries`); `with_core_bifs()` (the 640-key roster) = `default_registry()`; `register(...) -> Option<BifFn>`
+  `names`/`entries`); `with_core_bifs()` (the 643-key roster) = `default_registry()`; `register(...) -> Option<BifFn>`
   (replaces on repeat); `call(...)` (unknown key ⇒ `error::undefined_bif`; wrong arg count ⇒ `BadArity`). Operator
   BIFs keep their *quoted* `bif.tab` names (`"+"`, `"=<"`, `"=:="`, `"!"`, `"++"`, `"not"`, …). `with_core_bifs`
   calls each module's `pub(crate) fn register` in a fixed order (`ets` wiring
@@ -261,12 +262,9 @@ short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
   byte-identical output. Nesting **depth** is still recursive (Known Issues).
 ### The `ets` bridge
 `bif.tab` declares 51 `ets:*` keys; the crate **registers 59** (51 declared + 8 `ets.erl` fast paths) and **serves
-58** (`src/ets.rs` plus the `matches`/`extra`/`adopt`/`nav`/`reverse`/`specs` modules); the 1 remaining C-interior
-key (`ets:internal_request_all/0`) is a seam-backed typed gap in `src/runtime/other.rs`. `ets:fun2ms/1` and
-`ets:repair_continuation/2` are pure `ets.erl` functions needing AST access a `BifFn` lacks, so they stay
-unregistered. `TableRegistry` (the single table-argument resolver), owner/access gating, the `ets:new/2` option
-parser + `TableProfile` sidecar, the unknown-table `undefined`, the adopted verbs and the typed gaps:
-`./src/ets/CONTEXT.md`.
+58**; the 1 remaining C-interior key (`ets:internal_request_all/0`) is a seam-backed typed gap in
+`src/runtime/other.rs`. `ets:fun2ms/1` and `ets:repair_continuation/2` are pure `ets.erl` functions needing AST
+access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
 - **`select_replace/2` requires a statically key-preserving body** (`beam_ets`'s `db_match_keeps_key` mirror, run
   **before** the table is traversed), so a rejected body is `badarg` *even when the spec matches nothing*, a **valid**
   never-matching spec replaces 0 objects, and a `bag` is `badarg` up front.
@@ -281,7 +279,9 @@ parser + `TableProfile` sidecar, the unknown-table `undefined`, the adopted verb
   `ets` match-spec BIFs, the `/1` continuation resumes included, plus `erlang:match_spec_test/3`), `INSTALL_DEPTH`
   makes nested guards share one install, and a failed operator maps to the `badarg` class the executor treats as the
   oracle's own raise — the hook never fabricates a result. `tests/match_spec_arith.rs` proves both halves against the
-  live oracle.
+  live oracle. `TableRegistry` (the single table-argument resolver), owner/access gating, the `ets:new/2` option
+  parser + `TableProfile` sidecar, the unknown-table `undefined`, the adopted verbs and every remaining typed gap:
+  **`./src/ets/CONTEXT.md`**.
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only, never a crate-local error enum, never `panic!`, never
   `unwrap()` on runtime data, never a wrong result. `BadArg`/`BadArith`/`BadArity`/`SystemLimit` for the
@@ -330,11 +330,11 @@ parser + `TableProfile` sidecar, the unknown-table `undefined`, the adopted verb
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` with a `BytesSink`/`NullSink` capture.
 - `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` runs **80
-  suite result lines / 1575 tests** (all green): the lib suite (786), 77 integration files (789), and two empty
+  suite result lines / 1588 tests** (all green): the lib suite (799), 77 integration files (789), and two empty
   harnesses. Re-derive the split from the per-suite `test result` lines, not from a hand-maintained table.
 - **Pins.** `tests/roster_audit.rs` is the roster pin (see the census section). `tests/bif_tab.rs` pins the parsed
-  `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 84`,
-  `REGISTRY_SIZE = 640`) — it reads the registry, never altering dispatch. `tests/registry_hot_path.rs` is a
+  `bif.tab` shape and the census (`IMPLEMENTED_DECLARED = 556`, `MISSING_DECLARED = 0`, `FAST_PATHS = 87`,
+  `REGISTRY_SIZE = 643`) — it reads the registry, never altering dispatch. `tests/registry_hot_path.rs` is a
   per-thread-armed counting `#[global_allocator]` proving `lookup`/`contains`/hit-`call` allocate **0** bytes, plus a
   median/p99 ns/call print with a loose regression tripwire.
 - **Correctness-by-construction pins.** `tests/decode_scratch.rs` issues several decodes per thread so the
@@ -507,19 +507,13 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   the deep clone.
 
 ## A.9 blockers (self-hosted build: booting kernel, running lib/compiler)
-This crate's link in the A.9 boot-blocker chain (the other links: `../beam_rt/CONTEXT.md`, `../CONTEXT.md`).
-- **The `ets` links are closed.** `src/ets/resolve.rs::parse_options` accepts the full `ets:new/2` option matrix (the
-  bare kind/access atoms plus `named_table`, `compressed`, `{keypos,N>0}`, `{read_concurrency,Bool}`,
-  `{write_concurrency,Bool|auto|{debug_hash_fixed_number_of_locks,N}}`, `{heir,…}`, `{decentralized_counters,Bool}`),
-  so `application_controller:init/1`'s `ets:new(ac_tab, [set,public,named_table,{read_concurrency,true}])` succeeds;
-  every table-taking `ets` BIF resolves through the single `resolve_handle` (a handle `Ref` thing, or the
-  `named_table` name atom), so `ets:insert/lookup(ac_tab, …)` by name work. The normalized lock count of
-  `write_concurrency` `auto`/`{debug_hash_fixed_number_of_locks,N}` — inexpressible in `TableInfo`'s `bool` — lives
-  in the `TableProfile` sidecar.
-- **The remaining blocker is `beam_engine`:** a cross-module callee that blocks in `receive` cannot suspend the
-  process (the synchronous `CallExt` path folds a suspend into a typed error), so the `proc_lib:sync_start/2`-class
-  `logger`/`gen_server` starts on the boot path fail (seam: `beam_rt/tests/proc_lib_start.rs`). The
-  `ets:foldl/3`/`foldr/3` blocker is in Handoffs.
+This crate's link in the A.9 chain; the live status is `../CONTEXT.md` (A.9) and `../beam_rt/CONTEXT.md`.
+**The `ets` link is closed:** `src/ets/resolve.rs::parse_options` accepts the full `ets:new/2` option matrix (the
+bare kind/access atoms plus `named_table`, `compressed`, `{keypos,N>0}`, `{read_concurrency,Bool}`,
+`{write_concurrency,Bool|auto|{debug_hash_fixed_number_of_locks,N}}`, `{heir,…}`, `{decentralized_counters,Bool}`),
+so `application_controller`'s `ets:new(ac_tab, …)` and every name-resolved `ets:insert/lookup` work, and the
+normalized `write_concurrency` lock count — inexpressible in `TableInfo`'s `bool` — lives in the `TableProfile`
+sidecar. There is **no self-hosted build** yet; the `ets:foldl/3`/`foldr/3` blocker is in Handoffs.
 
 ## Handoffs (sibling nodes)
 ### Required from `beam_rt` (exact locations)
@@ -621,7 +615,7 @@ This crate's link in the A.9 boot-blocker chain (the other links: `../beam_rt/CO
 
 ## Routing Table
 - `src/lib.rs` -> crate docs, module wiring, root re-exports, `prelude`, `#![deny(unsafe_code)]`
-- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (640 keys, `runtime` last), `default_registry`
+- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (643 keys, `runtime` last), `default_registry`
 - `src/hook_sets.rs` -> the thirteen hook-gate sets (244 keys; 240 deduped) + the `needs_*` predicates
 - `src/runtime/` (**`./src/runtime/CONTEXT.md`**) -> the 209 runtime-coupled BIFs (incl. the 8 real `re` keys)
 - `src/re/` (**`./src/re/CONTEXT.md`**) -> the self-contained regex engine serving the 8 `re:*` BIFs
@@ -643,7 +637,9 @@ This crate's link in the A.9 boot-blocker chain (the other links: `../beam_rt/CO
 - `src/modinfo.rs` / `src/match_spec.rs` / `src/packet/` (**`./src/packet/CONTEXT.md`**) / `src/proc_reg.rs` /
   `src/persistent_term.rs` -> `get_module_info`; `match_spec_test`; `decode_packet`; the `ProcessHook`/`PersistentTerm` BIFs
 - `src/string.rs` / `src/unicode.rs` / `src/unicode/` (**`./src/unicode/CONTEXT.md`**, sub-node `grapheme/`) /
-  `src/time.rs` -> `string:list_to_float/1`; the `unicode` conversions (UTF-16/32 codecs, the grapheme-cluster port); `time`
+  `src/time.rs` -> `string:list_to_float/1`; the `unicode` conversions (UTF-16/32 codecs, the grapheme-cluster port);
+  `time` — `monotonic_time`/`system_time`/`time_offset`/`unique_integer`/`timestamp` **and** the `erlang:convert_time_unit/3` fast path
+- `src/zlib.rs` -> the `zlib:compress/1` / `zlib:uncompress/1` stdlib fast paths over `beam_codec::compress` (RFC 1950)
 - `src/proc.rs` / `src/dict.rs` / `src/port.rs` -> `self`/`send`/`!`/`send/3` (the `SendHook` family); the
   `DictHook` BIFs; the `PortHook` BIFs
 - `src/ets.rs` / `src/ets/` (**`./src/ets/CONTEXT.md`**) -> the `ets:*` bridge (59 keys) + `arith_hook.rs` (`PrecisionArith`)
