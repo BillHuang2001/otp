@@ -24,10 +24,13 @@ level up in `../mod.rs` / `../runtime.rs`; this node only *emits calls* to them.
   `machine.x`** via `[rbx + x*8]` (`rbx` = `rt->x_regs`, loaded in the prologue). A register is either
   *always* cached in its machine register or *never* cached, fixed for the whole block, so the two
   representations can never disagree.
-- **The register cache is written-set-spill / full-fill.** `spill` stores only the block's **written**
+- **Both directions of the register cache are partial.** `spill` stores only the block's **written**
   set — the cached x-registers some inline lowering of the block may write (`Allocation::written`, a
-  static superset populated by `regalloc.rs::cacheable_writes`); `fill` reloads **all** of them after a
-  helper call (no per-register liveness). See `regs.rs`'s own `CONTEXT.md` for the soundness argument.
+  static superset populated by `regalloc.rs::cacheable_writes`); `fill` reloads only
+  `Allocation::fill_slots(pc)` — the registers the continuation can still observe, the block-local
+  liveness of `liveness.rs::fill_sets` unioned with the write set, `(live ∪ written) ∩ slots` — except
+  the prologue load, which is always the whole cache. See the **Register cache: partial spill AND
+  partial fill (liveness-based)** section below for the model and its soundness argument.
   The cache itself lives in `regs.rs` (`Allocation`/`spill`/`fill`); the call sites are in `mod.rs`.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
   `MOVE_SCRATCH_2`=`r10` (`mod.rs`); `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10`,
@@ -164,7 +167,10 @@ block map, so the driver compiles the target's function on entry — or takes on
   (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
   re-publishes the current frame's Y window in one call — then load each cached register from `machine.x`.
 - `regs.rs::spill` / `regs.rs::fill`: `spill` stores every `(x, reg)` in `Allocation::spill_slots()`
-  (the **written** subset of `Allocation::slots`); `fill` loads every `(x, reg)` in `Allocation::slots`.
+  (the **written** subset of `Allocation::slots`); `fill` loads every `(x, reg)` in
+  `Allocation::fill_slots(pc)` — the continuation's block-local liveness unioned with the write set —
+  except the prologue load, which is the whole cache (see the **Register cache: partial spill AND
+  partial fill** section below).
 - **Every helper call spills first.** `mod.rs::emit_helper_call` (used by `emit_step_and_continue` and
   `emit_ext_call`) calls `spill` before loading `rdi` from the `rt` slot, filling the ABI argument
   registers `rsi`/`rdx`/`rcx`/`r8`/`r9` with the caller's argument words, and `call r11`; it does **not**
@@ -228,10 +234,12 @@ entry (the driver's bound is `machine.x.len() > bound`).
   `compile_module`/`compile_function`
   (keeping those item paths stable for `baseline/mod.rs` and `baseline/code.rs`) plus the `#[cfg(test)]`
   names `baseline/tests.rs` reaches through `emit::*`.
-- `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`y_last`, `slot`/`is_written`/
-  `spill_slots`/`refresh_y_after`), `spill` (stores only `written`), `fill` (loads the whole cache), and the
+- `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`y_last`/`block_start`/
+  `fill_sets`, `slot`/`is_written`/`spill_slots`/`fill_slots`/`refresh_y_after`), `spill` (stores only
+  `written`), `fill` (loads only `fill_slots(pc)`, else the whole cache at the prologue), and the
   test-only `SpillSite`/`FillSite` classification of the two call sites (`baseline/CONTEXT.md` and this
-  file carry the contract; the sibling `CONTEXT.md` carries the soundness argument).
+  file carry the contract; the **Register cache: partial spill AND partial fill** section below carries
+  the soundness argument); `liveness.rs` computes the per-pc `fill_sets`.
 - `compile.rs` -> the compilation entry points and what they share: `compile_module` (**eager**:
   whole-module block map + the merged whole-module summary that guards entry, plus `emit_shared_sub_blocks`)
   and `compile_function` (**lazy**: one function's own buffer/entries/sub_entries/summary, sharing
