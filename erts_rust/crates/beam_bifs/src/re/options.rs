@@ -75,64 +75,86 @@ impl Newline {
         matches!(self, Newline::Crlf | Newline::AnyCrlf | Newline::Any)
     }
 
-    /// All characters that *terminate* a line under this convention, in codepoint
-    /// order. `\r\n` (CRLF) is handled by [`Newline::newline_len_at`].
+    /// The single-codepoint characters that *terminate* a line under this
+    /// convention, in codepoint order.
+    ///
+    /// This is the per-character half of PCRE2's `is_newline`/`was_newline`
+    /// (`../../../../erts/emulator/pcre/pcre2_newline.c`) and is used only for
+    /// the `NLTYPE_ANY`/`NLTYPE_ANYCRLF` conventions; the `NLTYPE_FIXED` ones
+    /// are handled positionally by [`Newline::newline_len_at`] and
+    /// [`Newline::ends_at`], because `lone \n`/`lone \r` are *not* line ends
+    /// under `crlf` (the pair `\r\n` is the whole terminator).
     fn line_terminators(self) -> &'static [u32] {
         match self {
-            // A lone `\r` is a newline under CR/ANYCRLF/ANY; under CRLF the pair
-            // `\r\n` is handled positionally, but a standalone `\n` is still a
-            // terminator (`PCRE2_NEWLINE_CRLF` treats both bytes as line ends).
-            Newline::Lf | Newline::Crlf => &[10],
+            Newline::Lf => &[10],
             Newline::Cr => &[13],
+            // `PCRE2_NEWLINE_CRLF` (`NLTYPE_FIXED`, `nllen == 2`): the terminator
+            // is exactly `\r\n`; neither byte alone terminates a line.
+            Newline::Crlf => &[],
             Newline::Nul => &[0],
             Newline::AnyCrlf => &[10, 13],
             Newline::Any => &[10, 11, 12, 13, 0x85, 0x2028, 0x2029],
         }
     }
 
-    /// Whether `c` is one of the characters `.` refuses to match (a newline
-    /// terminator of this convention).
-    pub(crate) fn is_newline_char(self, c: u32) -> bool {
+    /// PCRE2's `IS_NEWLINE(pos)`: whether a newline sequence of this convention
+    /// **starts** at `pos`.
+    ///
+    /// This is the predicate `.`/`\N` refuse (`OP_ANY`) and that `firstline`
+    /// scans for. It is *positional*, not per-character: under `crlf` only the
+    /// `\r` of a `\r\n` pair is a newline start, so a lone `\r` or `\n` is
+    /// matched by `.` (oracle-verified: `re:run(<<"\\r">>, <<".">>,
+    /// [{newline,crlf}])` matches, `re:run(<<"\\r\\n">>, <<".">>,
+    /// [{newline,crlf}])` is `nomatch`).
+    pub(crate) fn is_newline_at(self, codes: &[u32], pos: usize) -> bool {
         match self {
-            // `PCRE2_NEWLINE_CRLF` excludes both bytes of the pair from `.`.
-            Newline::Crlf => c == 10 || c == 13,
-            Newline::Lf | Newline::Cr | Newline::Nul | Newline::AnyCrlf | Newline::Any => {
-                self.line_terminators().contains(&c)
-            }
+            Newline::Crlf => codes.get(pos) == Some(&13) && codes.get(pos + 1) == Some(&10),
+            _ => match codes.get(pos) {
+                Some(c) => self.line_terminators().contains(c),
+                None => false,
+            },
         }
     }
 
     /// The number of codepoints of the newline sequence starting at `pos`, or
     /// `None` when no sequence starts there.
+    ///
+    /// `IS_NEWLINE` in PCRE2 returns the length through its `nllen` out-parameter
+    /// (`pcre2_newline.c`), which `$`/`\Z` (the `OP_EODN` arm of
+    /// `pcre2_match.c`) use to test whether the newline is the *final* thing in
+    /// the subject — so a `\r\n` pair reports `Some(2)` under every convention
+    /// that treats it as one newline.
     pub(crate) fn newline_len_at(self, codes: &[u32], pos: usize) -> Option<usize> {
         let c = *codes.get(pos)?;
         match self {
             Newline::Crlf => match c {
                 13 if codes.get(pos + 1) == Some(&10) => Some(2),
-                10 | 13 => Some(1),
                 _ => None,
             },
             _ => {
-                if self.line_terminators().contains(&c) {
-                    Some(1)
+                if !self.line_terminators().contains(&c) {
+                    return None;
+                }
+                // A CR followed by LF is a single two-codepoint newline under the
+                // `NLTYPE_ANY`/`NLTYPE_ANYCRLF` conventions.
+                if c == 13 && codes.get(pos + 1) == Some(&10) {
+                    Some(2)
                 } else {
-                    None
+                    Some(1)
                 }
             }
         }
     }
 
-    /// Whether a newline sequence of this convention *ends* exactly at `pos` (so
-    /// `^` may match there in multiline mode).
+    /// PCRE2's `WAS_NEWLINE(pos)`: whether a newline sequence of this convention
+    /// **ends** exactly at `pos` (so `^` may match there in multiline mode).
     pub(crate) fn ends_at(self, codes: &[u32], pos: usize) -> bool {
         if pos == 0 {
             return false;
         }
         match self {
-            // Under the CRLF convention a line ends after the `\n` that closes a
-            // `crlf` pair, and also after a lone `\r` or `\n`
-            // (`PCRE2_NEWLINE_CRLF` treats both bytes as line ends).
-            Newline::Crlf => codes[pos - 1] == 10 || codes[pos - 1] == 13,
+            // Under `crlf` the line ends after a `\r\n` pair only.
+            Newline::Crlf => pos >= 2 && codes[pos - 2] == 13 && codes[pos - 1] == 10,
             _ => self.line_terminators().contains(&codes[pos - 1]),
         }
     }
@@ -150,12 +172,8 @@ impl Newline {
         }
         match self {
             Newline::Crlf => {
-                if codes[pos - 1] == 13 && codes.get(pos) == Some(&10) {
-                    Some(1)
-                } else if codes[pos - 1] == 10 {
-                    Some(1)
-                } else if codes[pos - 1] == 13 {
-                    Some(1)
+                if pos >= 2 && codes[pos - 2] == 13 && codes[pos - 1] == 10 {
+                    Some(2)
                 } else {
                     None
                 }
@@ -168,6 +186,20 @@ impl Newline {
                 }
             }
         }
+    }
+
+    /// Whether the global-loop `forward/5` step (and PCRE2's bump-along scan)
+    /// skips a `\r\n` pair as a single unit.
+    ///
+    /// PCRE2's bump-along loop (`pcre2_match.c:8696-8731`) advances one code unit
+    /// at a time, then, when the previous unit is CR and the current one is LF
+    /// *and* the pattern cannot itself match CR or LF (`PCRE2_HASCRORLF` unset,
+    /// the `has_cr_or_lf` argument here) *and* the convention is
+    /// `ANY`/`ANYCRLF`/`nllen == 2` (exactly [`Newline::is_crlf_like`]), skips
+    /// the LF as well. Without the flag a pattern that *does* name a newline byte
+    /// (e.g. `[\r\n]`) must see both units of the pair, so the skip is disabled.
+    pub(crate) fn skip_crlf_pair_on_bump(self, has_cr_or_lf: bool) -> bool {
+        self.is_crlf_like() && !has_cr_or_lf
     }
 }
 
@@ -737,24 +769,49 @@ mod tests {
         let lf = |s: &[u32], p: usize| Newline::Lf.newline_len_at(s, p);
         assert_eq!(lf(&[10], 0), Some(1));
         assert_eq!(lf(&[13], 0), None);
+        // `crlf`: only the PAIR is a line terminator (`IS_NEWLINE` is positional).
         let crlf = |s: &[u32], p: usize| Newline::Crlf.newline_len_at(s, p);
         assert_eq!(crlf(&[13, 10], 0), Some(2));
-        assert_eq!(crlf(&[10], 0), Some(1));
-        assert_eq!(crlf(&[13], 0), Some(1));
+        assert_eq!(crlf(&[10], 0), None);
+        assert_eq!(crlf(&[13], 0), None);
+        assert_eq!(crlf(&[13, 97], 0), None);
         let any = |s: &[u32], p: usize| Newline::Any.newline_len_at(s, p);
         assert_eq!(any(&[0x2028], 0), Some(1));
         assert_eq!(any(&[0x85], 0), Some(1));
+        // A CR followed by LF is a single two-codepoint newline under ANY/ANYCRLF.
+        assert_eq!(any(&[13, 10], 0), Some(2));
+        assert_eq!(any(&[13, 97], 0), Some(1));
         assert_eq!(Newline::AnyCrlf.newline_len_at(&[0x2028], 0), None);
+        assert_eq!(Newline::AnyCrlf.newline_len_at(&[13, 10], 0), Some(2));
 
-        // `ends_at` for the CRLF convention accepts a lone `\n` / `\r`.
+        // `IS_NEWLINE` (what `.`/`\N` refuse) is positional under `crlf`:
+        // lone `\r` and lone `\n` are NOT newline starts (oracle-verified).
+        assert!(Newline::Crlf.is_newline_at(&[13, 10], 0));
+        assert!(!Newline::Crlf.is_newline_at(&[13], 0));
+        assert!(!Newline::Crlf.is_newline_at(&[10], 0));
+        assert!(!Newline::Crlf.is_newline_at(&[13, 10], 1));
+        assert!(!Newline::Crlf.is_newline_at(&[97, 98], 0));
+        assert!(Newline::Cr.is_newline_at(&[13], 0));
+        assert!(!Newline::Cr.is_newline_at(&[10], 0));
+        assert!(Newline::Any.is_newline_at(&[0x2029], 0));
+        assert!(Newline::AnyCrlf.is_newline_at(&[13], 0));
+
+        // `WAS_NEWLINE` (what `^` uses) is positional under `crlf` too: the
+        // reference answer is the live oracle's `^`-scan.
         assert!(Newline::Crlf.ends_at(&[13, 10, 98], 2));
-        assert!(Newline::Crlf.ends_at(&[10, 98], 1));
+        assert!(!Newline::Crlf.ends_at(&[13, 98], 1));
+        assert!(!Newline::Crlf.ends_at(&[10, 98], 1));
         assert!(!Newline::Crlf.ends_at(&[97, 98], 1));
+        assert!(Newline::Cr.ends_at(&[13, 98], 1));
+        assert!(Newline::AnyCrlf.ends_at(&[10, 98], 1));
+        assert!(Newline::AnyCrlf.ends_at(&[13, 98], 1));
 
-        // `.` excludes both bytes of a CRLF pair under the CRLF convention.
-        assert!(Newline::Crlf.is_newline_char(13));
-        assert!(Newline::Crlf.is_newline_char(10));
-        assert!(!Newline::Cr.is_newline_char(10));
-        assert!(Newline::Any.is_newline_char(0x2029));
+        // The bump-along CRLF skip is disabled when the pattern names CR/LF.
+        assert!(Newline::Crlf.skip_crlf_pair_on_bump(false));
+        assert!(!Newline::Crlf.skip_crlf_pair_on_bump(true));
+        assert!(Newline::AnyCrlf.skip_crlf_pair_on_bump(false));
+        assert!(Newline::Any.skip_crlf_pair_on_bump(false));
+        assert!(!Newline::Cr.skip_crlf_pair_on_bump(false));
+        assert!(!Newline::Lf.skip_crlf_pair_on_bump(false));
     }
 }
