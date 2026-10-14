@@ -503,10 +503,11 @@ fn the_append_segment_agrees_on_both_tiers() {
 #[test]
 fn the_fixture_stays_within_the_cache_budget() {
     // The baseline emitter holds up to `CACHE_BUDGET` x-registers in machine
-    // registers, chosen by a **usage-weighted** allocator: the registers a block
-    // touches most often (ties by ascending index) become resident and everything
-    // else is addressed directly in `machine.x`. The artifact records both the
-    // resident set and the highest index the driver's `native_ok` guard has to cover.
+    // registers, chosen by a **live-interval** allocator: the registers whose
+    // `[first touch, last touch]` spans the block most widely (ties by ascending
+    // index) become resident and everything else is addressed directly in
+    // `machine.x`. The artifact records both the resident set and the highest index
+    // the driver's `native_ok` guard has to cover.
     //
     // This fixture — idiomatic output of the system `erlc` — turns out to name only
     // x0..x3 in its inlined instructions, so `highest_native_register == 3` and the
