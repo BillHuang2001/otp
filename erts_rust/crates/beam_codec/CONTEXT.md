@@ -9,7 +9,6 @@ Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`
 **Implemented.** Every module (list in §API Surface) carries real bodies, incl. `decode/local_node.rs` and the `term` forwarding layer (over `beam_term::{thing,fun,bitstring,refc,record,hashing}`).
 Test count at this HEAD: **457 tests**, 0 failures (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast`; re-run for the live figure).
 Differential gate: **`total=1839 agree=1837 mismatch=0 unsupported=2 skipped=0`**, exit **0** with the allowlisted capability gaps `wire/new_fun_ext_encode` (the deliberately unclosable `erl_eval` lambda) and `boot_extra/init_script_id_names_the_running_otp_release` (`../tools/differential/GAPS.md`; re-run `../tools/differential/gate.sh` for the live per-contract split).
-Every producible tag round-trips with **no recognized tag left `unsupported`** (§Tag coverage).
 ## API Surface (FROZEN — dependents route here)
 Signatures only; the wire rules and C ground truth live below. All fallible calls return `beam_common::Result<_>`; a violated precondition is `BadArg` (§Constraints). Re-exported at the crate root and via `beam_codec::prelude::*`.
 `src/lib.rs` — modules `tag`, `reader`, `writer`, `atom_cache`, `off_heap`, `compress`, `encode`, `decode`, `error`, `term`, `prelude`, plus `pub const VERSION_MAGIC: u8 = 131`; lints `#![deny(unsafe_code)]` with exactly one `#[allow(unsafe_code)] mod term;`.
