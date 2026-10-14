@@ -54,7 +54,7 @@ These are the only two keys whose value **must** be byte-equal to the oracle's â
 
 ### `trace_control_word`
 This runtime's trace-control word, which is always `0`.
-The word is an independent node-global knob whose only writers are `erlang:system_flag(trace_control_word, N)` / `erts_internal:set_tcw` (`erl_db_util.c:1080-1110`), neither of which this runtime implements (`src/seq_trace.rs::system_flag_2` serves only `reset_seq_trace` and is a typed gap for every other flag).
+The word is an independent node-global knob whose only writers are `erlang:system_flag(trace_control_word, N)` / `erts_internal:set_tcw` (`erl_db_util.c:1080-1110`), neither of which this runtime implements (`src/seq_trace.rs::system_flag_2` serves only `reset_seq_trace` and `system_logger`, and is a typed gap for every other flag).
 Process tracing does **not** change it: the oracle returns `0` both before and after `erlang:trace(self(),true,[call])` + `trace_pattern/3`, so `0` is this runtime's truthful live value and must **not** be derived from the process-trace state (that would report a wrong value).
 Making it live for a future `system_flag(trace_control_word, _)` implementation would need a `u32` field on `TraceState` (e.g. `TraceState::trace_control_word(&self) -> u32` + a setter), read through `Runtime::trace()`.
 
