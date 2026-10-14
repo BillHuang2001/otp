@@ -711,3 +711,158 @@ exists for (see `src/runner/budget.rs`) — it only prices it.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the `perf_bif` harness, the dispatch-cost narrative and the
   execution-trace seam.
 - [`CONTEXT.md`](CONTEXT.md) → the runtime crate's contracts and current state.
+
+# `DISPATCH-CUT` snapshot — HEAD `af6d8b07bd` (+ `1b643ead0b`)
+## What changed
+Three cuts to the **registered-BIF dispatch prologue** (`src/context/calls.rs`,
+`src/context/dispatch.rs`, `src/nif.rs`):
+1. **The memoized `BifFn` is invoked directly.** `call_registered` now takes the resolved
+   `BifFn` (from `DispatchMemo`, via `call_bif_routed`'s `dispatch.bif`) and calls it through the
+   new `invoke_registered`, instead of re-running `BifRegistry::call` → `BifRegistry::lookup` —
+   i.e. the second `HashMap<String,_>` SipHash lookup per call is gone. `BifRegistry::lookup`
+   remains the *only* source of truth for "is this key registered": the memo is never consulted
+   as a registry, so it cannot drift.
+2. **`dispatch_slot` hashes the key's bytes** (FNV-1a over `module`, `0xFF`, `function`, then the
+   arity), not just the name *lengths*. The old length-only mix made same-length keys collide by
+   construction (`ets:insert/2` and `ets:lookup/2` shared a slot), so an ETS insert/lookup loop
+   was a permanent memo **miss**, paying the whole miss prologue on every iteration.
+3. **`NifRegistry::is_empty()` short-circuit** in `try_call_nif`, so an empty NIF registry costs
+   one `RefCell` borrow + one length compare instead of a third SipHash lookup.
+Items 4 (`RuntimePorts::new` construction) and 7 (`BifContext` size) from the ranked list were
+**not** taken: item 4's unconditional construction is the only thing that keeps the shared
+`ports` cell reachable from every arm's `BifContext` (gating it needs nine more field types for
+~two `Rc` bumps), and item 7's 20 fields are built through one chained builder shared by all
+arms. `reentrancy_capable` (the arity-proportional `is_fun` scan) was **kept** — it is what makes
+the shared-tables borrow safe. The rewind preconditions (`safe_to_rewind`: empty source table,
+`!reentrant`, `Ok`, scheduled process, successful copy) and the `pending.is_empty()` guard before
+`atoms_mut()` are unchanged.
+## Method
+`examples/perf_call.rs` (in-process, best of 5, 100 000 calls/sample, one warm-up run), **release**
+profile. Marginal = `ns/call − control`; the control is the same loop with inlined arithmetic only.
+**BEFORE** = the pre-cut tree, **AFTER** = the cut tree (both rebuilt at their own HEAD). Three
+runs each; the tables below are the per-run figures, not an average.
+```sh
+# BEFORE (source stashed) and AFTER (source in place), identical commands:
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p beam_rt --example perf_call
+erts_rust/target/release/examples/perf_call          # 3 x, /proc/loadavg printed by the harness
+```
+### Host-load caveat (read before quoting any absolute number)
+This is a shared, oversubscribed 14-CPU host and the two windows were **not** equally loaded:
+BEFORE ran at 1-min loadavg **22.13 / 22.13 / 20.60**, AFTER at **25.72 / 25.72 / 23.82**, the
+AFTER-FIXED pass at **2.51 / 2.31 / 2.31**. Absolute ns therefore do **not** compare across the
+three blocks; the **marginal-vs-control** figure and the **before/after ratio at the same row**
+(with both sides named) are the signal, and even those carry the load caveat.
+## Registered-BIF per-call cost — `perf_call`
+Path A = `RuntimeContext::new` (the `-eval` shape: copy-out skipped by construction).
+Path B = `RuntimeContext::for_process` (the scheduler shape: copy-out + pooled rewind ON).
+| row (path A) | BEFORE ns/call | AFTER ns/call | ratio (AFTER/BEFORE) |
+|---|---|---|---|
+| `erlang:abs/1` | 67.37 | 46.51 | 0.69 |
+| `erlang:trunc/1` | 71.28 | 53.81 | 0.75 |
+| `lists:reverse/1` | 89.13 | 65.42 | 0.73 |
+| `erlang:'++'/2` | 74.78 | 53.94 | 0.72 |
+| `lists:seq/2` | 99.99 | 72.29 | 0.72 |
+| **control** (no BIF call) | 0.11 | 0.11 | 1.00 |
+| `ets:insert/2` (A2) | 214.34 | 196.26 | 0.92 |
+| `ets:lookup/2` (A2) | 165.96 | 149.70 | 0.90 |
+| `erlang:abs/1` (B) | 70.79 | 49.06 | 0.69 |
+| `lists:reverse/1` (B) | 144.04 | 126.76 | 0.88 |
+| `lists:seq/2` (B) | 215.66 | 192.87 | 0.89 |
+| `ets:insert/2` (B2) | 222.20 | 199.19 | 0.90 |
+| `ets:lookup/2` (B2) | 234.90 | 203.19 | 0.86 |
+The marginals (ns/call − control) move by the same ratios, since the control is ~0.1 ns/call on
+both sides. Reading: the **immediate-returning** rows (items 1 + 3) fall **25–31 %**, the ETS rows
+(the two names that shared a slot) fall **8–16 %**, and the container rows of path B fall **11–12 %**
+— the copy-out + rewind they pay dominates them, so the prologue cut is a smaller share there.
+## The path-C regression the byte hash introduced — found, diagnosed, fixed
+The first AFTER pass showed **path C (`Runtime::run_scheduled`, a compiled `.beam` loop of
+`lists:reverse/1` + `erlang:length/1`) at 659.53 / 663.73 / 645.48 ns/iteration vs BEFORE's
+285.23 / 284.96 / 286.29** — i.e. **2.3× dearer**, and reproducible at *low* load too (662.31 at
+loadavg 3.97), so it was a real regression, not the load difference.
+**Cause:** the naive byte hash put `lists:reverse/1` **and** `erlang:length/1` in the same memo
+slot (slot 2 of 8, computed from the FNV fold), so every call in the compiled loop was a permanent
+**miss** — the whole prologue (registry lookup + ten `needs_*` `binary_search`es + two `String`
+allocations) ran per iteration. The old length-only hash had the same defect for other keys
+(`erlang:length/1` shared a slot with the `ets:insert/2` · `ets:lookup/2` pair) but happened to give
+path C two distinct slots. **Fix:** a fixed avalanche multiply after the fold, taking the high
+bits (`dispatch.rs::dispatch_slot`), chosen so the crate's measured hot key set — `lists:reverse/1`,
+`erlang:length/1`, `ets:insert/2`, `ets:lookup/2`, `erlang:abs/1`, `erlang:trunc/1`,
+`erlang:'++'/2`, `lists:seq/2` — maps to **eight distinct slots**. The memo has only
+`DISPATCH_MEMO_SLOTS` = 8 slots (its size is pinned by `src/context/tests.rs`, which asserts the
+16-key probe set *exceeds* the memo so slot churn is exercised), so with more hot keys than slots
+*some* pair must collide: the constant is a **chosen** one, and a collision costs a recomputed
+prologue and never a different answer (the memo tags every entry with its key).
+### AFTER-FIXED pass (3 runs, loadavg 2.51 / 2.31 / 2.31)
+| row | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `erlang:abs/1` (A) | 64.34 | 68.46 | 65.02 |
+| `erlang:trunc/1` (A) | 58.23 | 50.60 | 58.88 |
+| `lists:reverse/1` (A) | 64.96 | 64.02 | 64.13 |
+| `erlang:'++'/2` (A) | 51.40 | 52.09 | 52.20 |
+| `lists:seq/2` (A) | 74.11 | 72.87 | 72.40 |
+| control (A) | 0.15 | 0.17 | 0.16 |
+| `ets:insert/2` (A2) | 177.88 | 185.40 | 174.90 |
+| `ets:lookup/2` (A2) | 139.08 | 144.36 | 140.67 |
+| `erlang:abs/1` (B) | 45.42 | 46.07 | 47.13 |
+| `lists:reverse/1` (B) | 118.31 | 120.52 | 116.75 |
+| `lists:seq/2` (B) | 189.14 | 192.90 | 184.80 |
+| `ets:insert/2` (B2) | 176.57 | 195.08 | 175.77 |
+| `ets:lookup/2` (B2) | 179.86 | 198.55 | 195.20 |
+| **block C slope** | **223.86** | **223.41** | **213.90** |
+Path C is back **below** the BEFORE band (≈ 0.78× of 285.23 at a *lower* load — do not read the
+0.78 as a clean speed-up; the load differs). The in-process rows sit within noise of the buggy-AFTER
+rows (their keys were never colliding in the offending slot), so the fix is specific to the
+collision, not a general re-measurement.
+## The `emqx_base62:encode/1` A/B — controlled, copy-out ON vs OFF
+Between m9 and m10 `tools/bench/RESULTS.md` recorded `emqx_base62_encode` at 10 283 → 16 601
+ns/call (+61.4 %) while its three sibling `foreign` cases improved 8–9 %. Two hypotheses were on
+the table: **(i)** the m10 copy-out seam (`move_result_into_process_heap` + its rewind guard) made
+container-returning calls dearer; **(ii)** m9's figure was anomalously low.
+**A/B:** one binary, copy-out toggled by a **temporary, never-committed** edit
+(`move_result_into_process_heap` returning `None` immediately), reverted completely before the
+final tree (`git diff` clean; no `AB-TEMP` marker survives). Driver = a real
+`/home/bill/Source/emqx/apps/emqx/src/emqx_base62.erl` (byte-identical copy, `sha1
+44ce075b7ebe945b2d8bafce5fd50e0bc7f53a52`) driven through `beam_rt run` (best of 5, startup
+cancelled by the two-point slope).
+| driver fn | copy-out ON | copy-out OFF |
+|---|---|---|
+| `ab_drv:enc/1` (the `encode/2` shape), slope | 1 375 853 ns/iteration | 1 375 853 ns/iteration |
+| `ab_drv:dec/1`, slope | 37 341.60 ns/iteration | — |
+**Verdict: neither hypothesis is supported.** The copy-out contributes **≈ 0 %** to `encode/1` at
+this N (identical to three significant figures, confirmed independently by the wall times of each
+kept binary: `enc(25000)` 1942 ms ON / 1937 ms OFF, `enc(100000)` 105 131 ms ON). The blow-up is
+in `emqx_base62.erl` **itself**: `encode(<<Index1:6,…>>, Acc)` rebuilds
+`NewAcc = <<Acc/binary, (iolist_to_binary(CharList))/binary>>` once per group of three input bytes,
+so a 12-byte input appends 4 times and copies 2 + 4 + 6 + 8 = 20 bytes — a **superlinear**
+linear-append idiom under an interpreter, each `iolist_to_binary/1` a real registered BIF call.
+Scaling, copy-out ON, loadavg 2.32: `sum/1` 25 000 → 20 ms, 100 000 → 26 ms (≈ 0 ns/iteration, i.e.
+the runtime's own call path is *not* the cost), `bin/1` 16 → 17 ms, `iol/1` 27 → 58 ms, `enc/1`
+1930 ms → 101 522 ms. The current tree's own `foreign` `emqx_base62_encode` row reports
+**76 698 ns/call** (vs 16 601 in m10) — worse than both m9 and m10, consistent with a superlinear
+workload measured at different operating points.
+**Floor of what this A/B resolves:** it resolves the *direction and order of magnitude* of the
+copy-out's share of `encode/1` (≈ 0 %) and it rules out the m10 copy-out seam as the mover. It
+**cannot** produce a per-call figure for `encode/1`, because the workload has no stable per-call
+cost at any N (it grows with N). The A/B also produced a citable negative result: with the
+copy-out forced off, `perf_call`'s path-B loop **dies with exit 1** —
+`perf_call: lists:reverse/1 raised system_limit` — because each iteration's container result stays
+on the pooled BIF heap; that pool exhaustion is exactly why the copy-out + rewind exists.
+## Gate
+`erts_rust/tools/differential/gate.sh` on this tree: `differential gate: total=2497 agree=2495
+mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)**; the two
+non-agreeing cases are the allowlisted capability gaps `wire/new_fun_ext_encode` (A.5) and
+`boot_extra/init_script_id_names_the_running_otp_release` (A.9). A dispatch change is
+behaviour-adjacent, so this is the authoritative check that no result moved.
+## Caveats that invalidate a comparison (`DISPATCH-CUT`)
+- The three windows have different host load (22.13 / 25.72 / 2.51 1-min); only per-row ratios and
+  marginals are signal, and never across windows without naming both sides.
+- Path C is a *mixed* row: each iteration is one `lists:reverse/1` `call_ext` **plus** one
+  `erlang:length/1` `call_ext` plus the engine's surrounding instructions, so it prices the memo
+  (hits vs misses) rather than any single BIF.
+- The `MIX` constant in `dispatch_slot` is **chosen against the measured hot key set**, not derived;
+  a workload whose hot key set differs can still collide (cost only, never a wrong answer). The
+  8-slot table is the binding limit; enlarging it requires the `src/context/tests.rs` churn
+  assertion to change with it.
+- **Cold start:** `perf_call`'s path C spawns/loads per run and the example compiles the fixture
+  with `erlc` once per invocation, so its *first* samples carry first-entry compile + load cost;
+  the slope cancels that, the absolute ms do not.
