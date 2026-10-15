@@ -220,6 +220,9 @@ mod tests;
 #[cfg(test)]
 #[path = "tail_exit_tests.rs"]
 mod tail_exit_tests;
+#[cfg(test)]
+#[path = "y_operand_tests.rs"]
+mod y_operand_tests;
 
 // The block ABI lives in `runtime` and the artifact in `code`; re-export their names
 // here so every item path outside this module (`crate::jit::baseline::…`) stays
