@@ -214,6 +214,30 @@ pub enum SendOutcome {
 /// table (`beam_rt` wires it to `beam_engine::ExecutionContext`'s apply-fun seam).
 /// Milestone-1 has no in-crate evaluator, so those BIFs raise `unsupported_bif`
 /// when no hook is installed — never a wrong result.
+///
+/// # Lending the `ets` table registry into a nested call
+///
+/// A callee may itself run `ets:*` code — `ets:foldl/3`/`ets:foldr/3` are the two
+/// `fun`-taking `ets` verbs, and the fun they apply may look at *any* table. The
+/// registry a BIF operates on is owned by the runtime
+/// ([`BifContext::tables`](crate::context::BifContext::tables)) and is only
+/// *lent* for the duration of one call, so a nested call cannot reach it through
+/// [`call_fun`](FunCaller::call_fun) (whose signature carries no context).
+/// [`call_fun_with_tables`](FunCaller::call_fun_with_tables) closes that gap: the
+/// caller passes the registry it currently holds, and the callee installs it into
+/// its own nested context.
+///
+/// The borrow is **moved**, not shared: [`BifContext::call_fun`] `take`s the
+/// registry out of the outer context before invoking this method and puts it back
+/// afterwards (on the error path too), so the outer context holds `None` for the
+/// whole nested call. Two live `&mut TableRegistry` borrows are therefore
+/// structurally impossible — not merely avoided by convention.
+///
+/// The method is **defaulted**: the default ignores `tables` and delegates to
+/// [`call_fun`](FunCaller::call_fun), so an implementor that does not run nested
+/// `ets` code (and every in-crate test double) is unaffected. A host that *does*
+/// run nested `ets` code (`beam_rt`'s `FunBridge`) overrides it to install the
+/// registry with `BifContext::with_tables` on the nested context.
 pub trait FunCaller {
     /// Calls `fun` with `args`, returning its result term.
     ///
@@ -223,6 +247,29 @@ pub trait FunCaller {
     /// (`badarg`/`badarity`), or a BEAM raise (`error`/`exit`/`throw`) raised by
     /// the fun body, as a [`BeamError`].
     fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm>;
+
+    /// Calls `fun` with `args` **while lending the `ets` table registry** the
+    /// outer BIF call holds, so `ets:*` executed by the callee resolves tables.
+    ///
+    /// `tables` is the registry taken out of the calling
+    /// [`BifContext`](crate::context::BifContext) for the duration of this call
+    /// (`None` when the outer call holds none). The default implementation ignores
+    /// it and behaves exactly like [`call_fun`](FunCaller::call_fun); a host that
+    /// can run nested `ets` code (for `ets:foldl/3`/`ets:foldr/3`) overrides it to
+    /// install the registry into the nested call's context.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`call_fun`](FunCaller::call_fun).
+    fn call_fun_with_tables(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+        tables: Option<&mut TableRegistry>,
+    ) -> Result<Eterm> {
+        let _ = tables;
+        self.call_fun(fun, args)
+    }
 }
 
 /// Interns a new atom name into the runtime's *global* atom table.
@@ -1360,18 +1407,35 @@ impl<'a> BifContext<'a> {
 
     /// Calls `fun` with `args` through the installed [`FunCaller`].
     ///
-    /// This is the seam the `fun`-taking `lists`/`maps` BIFs use to execute an
-    /// Erlang fun (`lists:map/2`, `lists:foldl/3`, `maps:map/2`, …).
+    /// This is the seam the `fun`-taking `lists`/`maps`/`ets` BIFs use to execute
+    /// an Erlang fun (`lists:map/2`, `lists:foldl/3`, `maps:map/2`,
+    /// `ets:foldl/3`, …).
+    ///
+    /// The installed `ets` table registry is **lent** to the callee for the
+    /// duration of the call ([`FunCaller::call_fun_with_tables`]) so a nested
+    /// `ets:*` — the fun of an `ets:foldl/3`/`ets:foldr/3` — resolves its tables.
+    /// The registry is `take`n out of `self` before the call and restored after it
+    /// (on the error path too), so this context holds `None` for the whole nested
+    /// call and two live `&mut TableRegistry` borrows cannot coexist.
     ///
     /// # Errors
     ///
     /// Raises `unsupported_bif` when the runtime has installed no caller;
-    /// otherwise propagates the callee's own failure.
+    /// otherwise propagates the callee's own failure. A failure still restores the
+    /// lent registry before it is returned.
     pub fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        match self.fun_caller.as_deref_mut() {
-            Some(caller) => caller.call_fun(fun, args),
+        // Release the registry for the duration of the nested call: the callee
+        // (which may run `ets:*` itself) receives the one live `&mut` borrow, so
+        // the outer context provably cannot hold a conflicting one.
+        let mut tables = self.tables.take();
+        let outcome = match self.fun_caller.as_deref_mut() {
+            Some(caller) => caller.call_fun_with_tables(fun, args, tables.as_deref_mut()),
             None => Err(crate::error::unsupported_bif()),
-        }
+        };
+        // Restore it *before* propagating, so a raising nested call does not lose
+        // the outer call's registry.
+        self.tables = tables;
+        outcome
     }
 
     /// Creates a port through the installed [`PortHook`] — the seam behind
@@ -1735,6 +1799,8 @@ mod tests {
     use beam_alloc::Heap;
     use beam_term::{atom_val, is_list, make_small};
 
+    use crate::registry::BifRegistry;
+
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
         atoms.seed(["true", "false", "ok"]);
@@ -1886,10 +1952,229 @@ mod tests {
         assert_eq!(caller.calls, vec![vec![make_small(7), make_small(8)]]);
     }
 
+    /// A `FunCaller` double that records what the [`BifContext`] lent it and — when
+    /// a registry IS lent — runs a **real nested `ets:*` BIF** against it through the
+    /// registered [`BifRegistry`].
+    ///
+    /// It borrows the *same* atom table the outer context uses, so a nested
+    /// `ets:lookup/2` compares the stored key and the probe key by identical atom
+    /// indices (the table stores the caller's terms verbatim).
+    struct NestedEtsCaller<'x> {
+        atoms: &'x AtomTable,
+        heap: Heap,
+        bifs: BifRegistry,
+        /// The `(function, arity)` of the nested `ets:*` BIF to run.
+        verb: (&'static str, u32),
+        /// One entry per nested call: the number of tables in the lent registry, or
+        /// `None` when the hook was handed no registry.
+        lent: Vec<Option<usize>>,
+    }
+
+    impl<'x> NestedEtsCaller<'x> {
+        fn new(atoms: &'x AtomTable, verb: (&'static str, u32)) -> NestedEtsCaller<'x> {
+            NestedEtsCaller {
+                atoms,
+                heap: Heap::new(8192).expect("test heap"),
+                bifs: crate::registry::default_registry(),
+                verb,
+                lent: Vec::new(),
+            }
+        }
+    }
+
+    impl FunCaller for NestedEtsCaller<'_> {
+        fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+            // Reached only when the default `call_fun_with_tables` body is used; the
+            // tests go through `BifContext::call_fun`, which always uses the
+            // registry-aware entry point.
+            self.call_fun_with_tables(fun, args, None)
+        }
+
+        fn call_fun_with_tables(
+            &mut self,
+            _fun: Eterm,
+            args: &[Eterm],
+            tables: Option<&mut TableRegistry>,
+        ) -> Result<Eterm> {
+            self.lent.push(tables.as_ref().map(|reg| reg.len()));
+            let Some(reg) = tables else {
+                // A nested `ets:*` with nothing to resolve against reports the same
+                // typed gap as the no-hook path — never a fabricated answer.
+                return Err(crate::error::unsupported_bif());
+            };
+            // A nested context over the *lent* registry: the outer context released
+            // it, so this is the one live `&mut TableRegistry` borrow in existence.
+            let (function, arity) = self.verb;
+            let mut nested = BifContext::new(&mut self.heap, self.atoms, ProcessId::new(1, 0))
+                .with_tables(reg);
+            self.bifs.call("ets", function, arity, &mut nested, args)
+        }
+    }
+
+    /// The atom names the nested-`ets` tests need.
+    fn ets_test_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed(["true", "false", "ok", "set", "mytab", "a", "b"]);
+        atoms
+    }
+
+    /// Creates a `set` table named `mytab` in `ctx` through the real `ets:new/2` and
+    /// returns its handle.
+    fn new_ets_table(ctx: &mut BifContext<'_>, bifs: &BifRegistry) -> Eterm {
+        let name = ctx.atom("mytab").expect("seeded");
+        let kind = ctx.atom("set").expect("seeded");
+        let opts = ctx.list(&[kind]).expect("fits");
+        bifs.call("ets", "new", 2, ctx, &[name, opts])
+            .expect("ets:new/2")
+    }
+
+    /// Builds the 2-tuple `{a, 1}` in `ctx`.
+    fn ets_object(ctx: &mut BifContext<'_>) -> Eterm {
+        let key = ctx.atom("a").expect("seeded");
+        let value = ctx.int(1).expect("fits");
+        ctx.tuple(&[key, value]).expect("fits")
+    }
+
+    #[test]
+    fn call_fun_lends_the_registry_and_restores_it() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = ets_test_atoms();
+        let bifs = crate::registry::default_registry();
+        // A stub that runs a real nested `ets:lookup/2` against the lent registry.
+        let mut caller = NestedEtsCaller::new(&atoms, ("lookup", 2));
+        let mut reg = TableRegistry::new();
+        let key;
+        let result;
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_tables(&mut reg)
+                .with_fun_caller(&mut caller);
+            let handle = new_ets_table(&mut ctx, &bifs);
+            let object = ets_object(&mut ctx);
+            bifs.call("ets", "insert", 2, &mut ctx, &[handle, object])
+                .expect("ets:insert/2");
+            key = ctx.atom("a").expect("seeded");
+
+            // The fun call hands the registry over; the nested `ets:lookup/2` sees
+            // the table inserted before the call.
+            result = ctx
+                .call_fun(make_small(1), &[handle, key])
+                .expect("the nested lookup answers");
+            // ... and the outer context still holds it, usable, after the call.
+            assert_eq!(ctx.tables().expect("restored").len(), 1);
+        }
+        // The stub observed a lent registry...
+        assert_eq!(caller.lent, vec![Some(1)], "the registry was lent");
+        // ... and its nested `ets:lookup/2` answered the object inserted before it.
+        assert!(crate::access::is_list(result));
+        let object = crate::access::car(result);
+        assert_eq!(crate::access::tuple_size(object), 2);
+        assert_eq!(crate::access::tuple_element(object, 0), key);
+        assert_eq!(crate::access::tuple_element(object, 1), make_small(1));
+        assert!(crate::access::is_nil(crate::access::cdr(result)));
+        // The registry survived the whole call on the host side too.
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn call_fun_without_a_registry_lends_none() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = ets_test_atoms();
+        let mut caller = NestedEtsCaller::new(&atoms, ("lookup", 2));
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_fun_caller(&mut caller);
+
+            // The stub, handed no registry, answers the typed gap (it has no table
+            // to look anything up in).
+            match ctx.call_fun(make_small(1), &[make_small(2)]) {
+                Err(BeamError::Raise(raise)) => {
+                    assert_eq!(
+                        raise.reason,
+                        beam_common::ExitReason::atom("unsupported_bif")
+                    );
+                }
+                other => panic!("expected an unsupported_bif raise, got {other:?}"),
+            }
+            assert!(ctx.tables().is_none(), "no registry before or after");
+        }
+        assert_eq!(caller.lent, vec![None], "no registry was lent");
+    }
+
+    #[test]
+    fn a_raising_nested_call_still_restores_the_registry() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = ets_test_atoms();
+        let bifs = crate::registry::default_registry();
+        let mut caller = NestedEtsCaller::new(&atoms, ("lookup", 2));
+        let mut reg = TableRegistry::new();
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_tables(&mut reg)
+                .with_fun_caller(&mut caller);
+            let handle = new_ets_table(&mut ctx, &bifs);
+            let key = ctx.atom("a").expect("seeded");
+
+            // `ets:lookup/2` on a non-table argument is `badarg`: a *raising* nested
+            // call, which must still put the registry back.
+            match ctx.call_fun(make_small(1), &[NIL, key]) {
+                Err(BeamError::BadArg) => {}
+                other => panic!("expected badarg from the nested lookup, got {other:?}"),
+            }
+            let restored = ctx.tables().expect("restored after the raise");
+            assert_eq!(restored.len(), 1);
+
+            // The restored registry is the live one — a normal `ets:*` on the outer
+            // context works again.
+            let object = ets_object(&mut ctx);
+            bifs.call("ets", "insert", 2, &mut ctx, &[handle, object])
+                .expect("the outer registry is usable after the raise");
+        }
+        assert_eq!(caller.lent, vec![Some(1)], "the registry was lent");
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn a_nested_ets_insert_mutates_the_lent_registry_visibly() {
+        // A mutating nested BIF proves the registry was genuinely *handed over* (a
+        // shared borrow would not let the nested `ets:insert/2` take the table out
+        // and put it back): the change is visible to the outer context afterwards.
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = ets_test_atoms();
+        let bifs = crate::registry::default_registry();
+        let mut caller = NestedEtsCaller::new(&atoms, ("insert", 2));
+        let mut reg = TableRegistry::new();
+        let found;
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_tables(&mut reg)
+                .with_fun_caller(&mut caller);
+            let handle = new_ets_table(&mut ctx, &bifs);
+            let key = ctx.atom("a").expect("seeded");
+            let object = ets_object(&mut ctx);
+
+            let inserted = ctx
+                .call_fun(make_small(1), &[handle, object])
+                .expect("the nested insert answers");
+            assert_eq!(ctx.atoms().name(atom_val(inserted)), Some("true"));
+
+            // The object the *nested* call inserted is now in the outer registry.
+            found = bifs
+                .call("ets", "lookup", 2, &mut ctx, &[handle, key])
+                .expect("ets:lookup/2");
+            assert!(crate::access::is_list(found));
+        }
+        assert_eq!(caller.lent, vec![Some(1)], "the registry was lent");
+        assert_eq!(
+            crate::access::tuple_element(crate::access::car(found), 0),
+            atoms.lookup("a").map(make_atom).expect("seeded")
+        );
+        assert_eq!(reg.len(), 1);
+    }
+
     /// A minimal `PortHook` test double: it allocates `PortId::new(11)` for every
     /// open and answers a fixed pair list from `port_info`.
     struct StubPorts;
-
     impl PortHook for StubPorts {
         fn open_port(&mut self, _name: Eterm, _options: Eterm) -> Result<PortId> {
             Ok(PortId::new(11))

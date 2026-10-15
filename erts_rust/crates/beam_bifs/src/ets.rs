@@ -157,7 +157,9 @@
 //! in [`extra`], and the adopted `ets:all/0`, `ets:setopts/2`, `ets:give_away/3`,
 //! `ets:foldl/3` and `ets:foldr/3` in [`adopt`]. (`ets:foldl/3`/`foldr/3` apply the
 //! fun through the `FunCaller` seam, so a non-empty fold is the typed
-//! `unsupported_bif` gap until a host installs it.)
+//! `unsupported_bif` gap until a host installs it; the fun they apply may itself
+//! run `ets:*`, so [`BifContext::call_fun`] *lends* the registry to the callee for
+//! the duration of the nested call — see [`FunCaller::call_fun_with_tables`].)
 //!
 //! Three `ets` keys stay honest typed gaps, each for a reason no `BifFn` can
 //! satisfy (see [`adopt`] and [`extra`]): `ets:internal_request_all/0` (a ref +

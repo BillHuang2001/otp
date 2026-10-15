@@ -55,7 +55,8 @@ Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifCo
   route that borrows the table *and* the destination heap at once), the `ProcessInfoItem` enum and the
   `OutputSink` impls.
 - **The fifteen optional seams:** `OutputSink` (`write_str`); `SendHook` (`send`); `AtomInterner` (`intern`);
-  `FunCaller` (`call_fun`); `PortHook` (`open_port`/`close_port`/`port_info`); `DictHook`
+  `FunCaller` (`call_fun` + the **defaulted** `call_fun_with_tables`, which lends the caller's `TableRegistry` to
+  the nested call — see the `FunCaller` section); `PortHook` (`open_port`/`close_port`/`port_info`); `DictHook`
   (`put`/`get`/`erase`/`get_keys`/`get_keys_for_value` + defaulted `get_all`/`erase_all`); `PersistentTerm`
   (`get`/`put`/`erase`/`get_all`/`info`); `NifLoader` (`load_nif`); `RecordSource` (`record_definition`);
   `LocalNode` (`local_node`/`local_node_hash`); `LocalFunIdentity` (`local_fun_identity`); `ModuleInfo` (`module_info`);
@@ -279,6 +280,14 @@ list/map inspection**: `lists` raises the bare `error:function_clause` for a non
 `lists.erl` head), `maps`' raise plain `error:badarg` (the `maps.erl` fallback clause); a **valid** fun with no hook
 is the typed `unsupported_bif`. `zipwith/3` raises `error:function_clause` on a length mismatch; `all/2`/`any/2`
 short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
+
+`BifContext::call_fun` reaches the hook through the **defaulted** `FunCaller::call_fun_with_tables(fun, args,
+tables: Option<&mut TableRegistry>)`, and `take`s the `ets` registry out of itself for the duration of the nested
+call (`self.tables = tables;` restore happens on the **error path too**). A callee that runs `ets:*` — the fun of
+`ets:foldl/3`/`ets:foldr/3` — therefore receives the one live `&mut TableRegistry`; two live borrows are
+structurally impossible, not merely avoided. The default body ignores `tables` and calls `call_fun`, so every
+implementor that runs no nested `ets` code (incl. the in-crate test doubles) is unaffected.
+
 ### `erlang:term_to_binary/1,2` and `binary_to_term/1,2` (`binconv.rs`)
 - **The decode table image is memoized:** `decode_term_bif` decodes into `DECODE_SCRATCH`, a per-thread **image** of
   `ctx.atoms()`, reused only when `prefix_matches` names every index the same atom and then extended to an **exact**
@@ -438,9 +447,9 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
   limiting `{chars_limit,N}` rendering and the `~ts` matrix against committed goldens **plus** a fail-loud live-oracle
   cross-check; `tests/phash.rs`, `tests/checksum.rs` (incl. the MD5 `pad` KAT boundary), `tests/packet*.rs` and
   `tests/zlib.rs` (the raw-DEFLATE pairs, incl. a level/size sweep that crosses all three block types and a
-  `zlib:zip/1` cross-check against the live oracle) do the same. **Still missing:** a committed differential case for
-  the `math` domain-error matrix (development-only evidence exists for `math` 32 probes, `checksum` 34,
-  `match_spec_test/3` 9, `calendar`/`os_bif` 21).
+  `zlib:zip/1` cross-check against the live oracle) do the same. **Still missing:** committed differential cases for
+  the `checksum` (34 development probes), `match_spec_test/3` (9) and `os_bif` (21) surfaces — the `math` and
+  `calendar` matrices now have committed cases (`differential/src/corpus/{math_bifs,mexec,mexec_extra}.rs`).
 - **Committed micro-benchmarks** (`--release`; read the printed ratios, absolute latencies are meaningless on the
   shared host, both print `/proc/loadavg` first): `examples/etf_bench.rs` (the `term_to_binary`/`binary_to_term`
   round trip vs. an isolated `AtomTable::clone`) and `src/bin/ets_bench.rs` (the match-spec/`ets` traversal with an
@@ -520,9 +529,7 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   form (a byte-exact round-trip); `list_to_ref/1` accepts only `#Ref<0.0.0.N>`. Widening the slot spans
   `beam_term::boxed` + `beam_codec::ref_wire` + `beam_gc` copy sizing.
 - **`match_spec_test/3`'s `trace` dialect** needs a trace-programme runner, and the `table` dialect's
-  compile-rejection gap turns the oracle's semantic-lint `{error,[…]}` into a raise — neither fixable here. **A match
-  spec with a 0-arity tuple `{}` panics in the sibling `beam_ets` evaluator** (`ets:select/2`, `ets:match_spec_run/2`,
-  `ets:match_spec_compile/1`, `match_spec_test/3`; oracle `badarg`) — fix in `../beam_ets/src/select/CONTEXT.md`.
+  compile-rejection gap turns the oracle's semantic-lint `{error,[…]}` into a raise — neither fixable here.
 - **Deep *nesting* still recurses in the printer** — an unbounded-*depth* concern; the per-element walks are
   iterative, so a long flat container no longer aborts.
 ### Environment-bounded values and bounded M1 leaks
@@ -607,10 +614,17 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
   `process_info/2` position items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`/
   `catchlevel`) as typed gaps for a live module-scheduled process; each with a file:line, a fix shape and a repro,
   plus what is **not** a gap and two sibling doc corrections owed.
-- **`ets:foldl/3`/`foldr/3` are unreachable in `beam_rt`:** `beam_rt/src/context/calls.rs` drops the shared
-  `TableRegistry` whenever `reentrancy_capable(args)` is true (any fun arg), so the `FunCaller` fast path answers
-  `beam_rt: unsupported: bif`. **Required change:** exclude the two `ets` folds (the only `FUN_CALLER_BIFS` members
-  that also need `ctx.tables()`) from the drop.
+- **`ets:foldl/3`/`foldr/3` need the registry *lent* into the nested call.** `beam_rt/src/context/calls.rs` drops
+  the shared `TableRegistry` whenever `reentrancy_capable(args)` is true (any fun arg), so an `ets:*` executed by the
+  fold's own fun answers `beam_rt: unsupported: bif`. This crate's side is done: `BifContext::call_fun` now `take`s
+  the registry out and hands it to the **defaulted** `FunCaller::call_fun_with_tables(fun, args, tables)`, restoring
+  it after the call (error path included), so double-borrow is structurally impossible.
+  **Required change (`beam_rt`):** implement `call_fun_with_tables` on `beam_rt`'s `FunBridge`
+  (`src/context/bridges.rs`) — install the lent registry into the nested `BifContext` with `with_tables` (it may
+  simply forward the `Option<&mut TableRegistry>` to the nested context the bridge builds) — and then drop the
+  `reentrancy_capable` special-casing of the two `ets` folds (the only `FUN_CALLER_BIFS` members that also need
+  `ctx.tables()`), or keep it: either way the nested registry must arrive. The default body of the new method
+  ignores `tables`, so `beam_rt` compiles unchanged until it opts in.
 - **The `FunIdentityBridge` snapshot is rebuilt per BIF call:** `beam_rt/src/context/calls.rs:201` calls
   `FunIdentityBridge::new(...)` per registered-BIF call for the four `LOCAL_FUN_IDENTITY_BIFS` (incl.
   `term_to_binary/1,2`), and `new` (`beam_rt/src/context/fun_identity.rs`) walks `code_server.loaded()` building
@@ -686,8 +700,6 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - **`beam_ets` — interior statistics for `ets:info(T, stats)`.** `TableInfo` has no per-table counters
   (inserts/lookups/deletes), so `ets:info/2`'s `stats` item is the typed gap; an additive `TableInfo::stats()` (or
   `Table::stats()`) returning the oracle's `[{Item, Value}]` shape is the fix.
-- **`beam_ets` — the `{}`-in-match-spec panic** (see Known Issues): the one-line index fix belongs in
-  `beam_ets/src/select/expr/mod.rs::decode_tuple`.
 - **`beam_process` — `erlang:monitor/3` with a non-immediate tag.** The key is registered here but is **shadowed** by
   `beam_rt`'s native floor (`native/process/monitor.rs`), which forwards the tag to
   `ProcessTable::monitor_*_with_tag`; `beam_process::check_tag` refuses a **non-immediate** tag (`{a,b}`, a binary)
