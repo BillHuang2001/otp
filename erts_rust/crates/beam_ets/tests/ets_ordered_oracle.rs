@@ -67,9 +67,39 @@
 //!
 //! Each step consumes exactly four draws on both sides, whatever the op:
 //! `op`, the key index, the value, and an auxiliary key index (used by
-//! `next`/`prev`). The op space is 24 `insert` slots followed by one slot for each
-//! other operation, so inserts dominate enough for the table to exceed
-//! `ORDER = 32` while every other op still fires.
+//! `next`/`prev`). The op space is 55 slots: 34 `insert` slots (so the upsert
+//! dominates and the table exceeds `ORDER = 32`), then one slot per remaining
+//! operation:
+//!
+//! | slot(s) | operation |
+//! |---------|-----------|
+//! | `0..=33` | `insert` (upsert) |
+//! | `34` | `insert_new` |
+//! | `35` | `delete` |
+//! | `36` | `delete_object` |
+//! | `37` | `take` |
+//! | `38` | `delete_all_objects` |
+//! | `39` | `lookup` |
+//! | `40` | `member` |
+//! | `41` | `first` |
+//! | `42` | `last` |
+//! | `43` | `next` |
+//! | `44` | `prev` |
+//! | `45` | `select` |
+//! | `46` | `select_count` |
+//! | `47` | `match_object` |
+//! | `48` | `select_reverse` |
+//! | `49` | `foldl` |
+//! | `50` | `update_counter` |
+//! | `51` | `update_element` |
+//! | `52` | `foldr` |
+//! | `53` | `lookup_element/3` |
+//! | `54` | `lookup_element/4` |
+//!
+//! The value drawn per step is in `0..VALUES`; the value element's position (2,
+//! `keypos + 1`) is the one the element-update/element-read operations target, so
+//! `{2, Value - 3}` is the counter increment and `Value` the element/default term
+//! — the same operands the escript spells out.
 //!
 //! This test is `#[ignore]`d (run it with `--ignored`): it needs the system Erlang
 //! as the oracle and a few seconds of wall clock. It is expected to **pass**; it
@@ -90,16 +120,58 @@ use common::*;
 /// The seeds the trace is driven with. Each is compared step by step.
 const SEEDS: [u64; 3] = [1, 12_345, 20_250_601];
 
-/// Steps per seed. Measured over these seeds the trace reaches 41–54 live keys
+/// Steps per seed. Measured over these seeds the trace reaches 49–63 live keys
 /// (comfortably past the B+-tree's `ORDER = 32`, so leaves split and internal
 /// nodes are created) and then churns back down (so leaves merge again).
 const STEPS: u64 = 600;
 
-/// The op space: `0..=23` insert, then one slot per remaining operation.
-const NUM_OPS: u64 = 40;
-
 /// How many distinct `Value`s an inserted object may carry.
 const VALUES: u64 = 6;
+
+/// The B+-tree's fan-out (`ordered_interior::node::ORDER`, which is crate-private):
+/// the trace asserts it exceeds it, so leaves really split and internal nodes form.
+const ORDER: usize = 32;
+
+/// The 1-based element position the element-update/element-read operations target:
+/// the value of a `{Key, Value}` object (`keypos + 1`).
+const VALUE_POS: usize = 2;
+
+/// The bias subtracted from the drawn value to form the counter increment, so an
+/// `update_counter` step moves the counter by `-3..=2`.
+const COUNTER_BIAS: i64 = 3;
+
+/// The op space: `0..INSERT_SLOTS` is `insert`, then one slot per remaining
+/// operation (the slot table is in the module docs).
+const INSERT_SLOTS: u64 = 34;
+const OP_INSERT_NEW: u64 = INSERT_SLOTS;
+const OP_DELETE: u64 = OP_INSERT_NEW + 1;
+const OP_DELETE_OBJECT: u64 = OP_DELETE + 1;
+const OP_TAKE: u64 = OP_DELETE_OBJECT + 1;
+const OP_DELETE_ALL: u64 = OP_TAKE + 1;
+const OP_LOOKUP: u64 = OP_DELETE_ALL + 1;
+const OP_MEMBER: u64 = OP_LOOKUP + 1;
+const OP_FIRST: u64 = OP_MEMBER + 1;
+const OP_LAST: u64 = OP_FIRST + 1;
+const OP_NEXT: u64 = OP_LAST + 1;
+const OP_PREV: u64 = OP_NEXT + 1;
+const OP_SELECT: u64 = OP_PREV + 1;
+const OP_SELECT_COUNT: u64 = OP_SELECT + 1;
+const OP_MATCH_OBJECT: u64 = OP_SELECT_COUNT + 1;
+const OP_SELECT_REVERSE: u64 = OP_MATCH_OBJECT + 1;
+const OP_FOLDL: u64 = OP_SELECT_REVERSE + 1;
+const OP_UPDATE_COUNTER: u64 = OP_FOLDL + 1;
+const OP_UPDATE_ELEMENT: u64 = OP_UPDATE_COUNTER + 1;
+const OP_FOLDR: u64 = OP_UPDATE_ELEMENT + 1;
+const OP_LOOKUP_ELEMENT: u64 = OP_FOLDR + 1;
+const OP_LOOKUP_ELEMENT_DEFAULT: u64 = OP_LOOKUP_ELEMENT + 1;
+
+/// The op space size: the last slot plus one.
+const NUM_OPS: u64 = OP_LOOKUP_ELEMENT_DEFAULT + 1;
+
+// The slot table in the module docs is only correct if the space is 55 slots wide
+// and the non-`insert` operations begin at `INSERT_SLOTS`.
+const _: () = assert!(NUM_OPS == 55);
+const _: () = assert!(OP_INSERT_NEW == INSERT_SLOTS);
 
 /// Wall-clock bound for the oracle program (it drives 1800 steps and writes a
 /// few hundred kilobytes; seconds, not minutes).
@@ -287,6 +359,16 @@ impl Trace<'_> {
         }
     }
 
+    /// The value element of the `{Key, Value}` object this step acts on.
+    ///
+    /// The value is drawn from `0..VALUES`; the element-update and element-read
+    /// operations reuse it (`{2, value - COUNTER_BIAS}` for the counter, the value
+    /// itself for the element/default), keeping every operand an immediate.
+    fn value_of(&self, object: Eterm) -> i64 {
+        // SAFETY: every object the trace builds is a `{Key, Value}` two-word tuple.
+        signed_value(unsafe { tuple_element(object, 1) })
+    }
+
     /// Drive one step and return the operation's rendered result.
     fn step(
         &mut self,
@@ -297,64 +379,98 @@ impl Trace<'_> {
         aux: Eterm,
     ) -> String {
         match op {
-            0..=23 => match table.insert(object, self.atoms) {
+            op if op < INSERT_SLOTS => match table.insert(object, self.atoms) {
                 Ok(()) => "ok".to_string(),
                 Err(error) => failure(op, error),
             },
-            24 => match table.insert_new(object, self.atoms) {
+            OP_INSERT_NEW => match table.insert_new(object, self.atoms) {
                 Ok(true) => "true".to_string(),
                 Ok(false) => "false".to_string(),
                 Err(error) => failure(op, error),
             },
-            25 => match table.delete(key, self.atoms) {
+            OP_DELETE => match table.delete(key, self.atoms) {
                 Ok(()) => "ok".to_string(),
                 Err(error) => failure(op, error),
             },
-            26 => match table.delete_object(object, self.atoms) {
+            OP_DELETE_OBJECT => match table.delete_object(object, self.atoms) {
                 Ok(()) => "ok".to_string(),
                 Err(error) => failure(op, error),
             },
-            27 => match table.take(key, self.atoms) {
+            OP_TAKE => match table.take(key, self.atoms) {
                 Ok(taken) => self.objects(&taken),
                 Err(error) => failure(op, error),
             },
-            28 => {
+            OP_DELETE_ALL => {
                 table.delete_all_objects();
                 "ok".to_string()
             }
-            29 => self.objects(&table.lookup(key, self.atoms)),
-            30 => if table.member(key, self.atoms) {
+            OP_LOOKUP => self.objects(&table.lookup(key, self.atoms)),
+            OP_MEMBER => if table.member(key, self.atoms) {
                 "true".to_string()
             } else {
                 "false".to_string()
             },
-            31 => self.nav(table.first(self.atoms)),
-            32 => self.nav(table.last(self.atoms)),
-            33 => match table.next(aux, self.atoms) {
+            OP_FIRST => self.nav(table.first(self.atoms)),
+            OP_LAST => self.nav(table.last(self.atoms)),
+            OP_NEXT => match table.next(aux, self.atoms) {
                 Ok(key) => self.nav(key),
                 Err(error) => failure(op, error),
             },
-            34 => match table.prev(aux, self.atoms) {
+            OP_PREV => match table.prev(aux, self.atoms) {
                 Ok(key) => self.nav(key),
                 Err(error) => failure(op, error),
             },
-            35 => match table.select(self.key_spec, self.atoms, &mut self.out) {
+            OP_SELECT => match table.select(self.key_spec, self.atoms, &mut self.out) {
                 Ok(keys) => self.keys(&keys),
                 Err(error) => failure(op, error),
             },
-            36 => match table.select_count(self.count_spec, self.atoms, &mut self.out) {
+            OP_SELECT_COUNT => match table.select_count(self.count_spec, self.atoms, &mut self.out) {
                 Ok(count) => count.to_string(),
                 Err(error) => failure(op, error),
             },
-            37 => match table.match_object(self.any_object, self.atoms, &mut self.out) {
+            OP_MATCH_OBJECT => match table.match_object(self.any_object, self.atoms, &mut self.out) {
                 Ok(objects) => self.objects(&objects),
                 Err(error) => failure(op, error),
             },
-            38 => match table.select_reverse(self.key_spec, self.atoms, &mut self.out) {
+            OP_SELECT_REVERSE => match table.select_reverse(self.key_spec, self.atoms, &mut self.out) {
                 Ok(keys) => self.keys(&keys),
                 Err(error) => failure(op, error),
             },
-            39 => self.keys(&foldl_keys(table)),
+            OP_FOLDL => self.keys(&foldl_keys(table)),
+            OP_FOLDR => self.keys(&foldr_keys(table)),
+            OP_UPDATE_COUNTER => {
+                let incr = make_small(self.value_of(object) - COUNTER_BIAS);
+                // The `{Pos, Incr}` operand rides the scratch heap `self.out`; the
+                // bump heap never reallocates, so the term stays live across the
+                // call (which allocates the rebuilt object on the same heap).
+                let operand = self
+                    .out
+                    .tuple(&[make_small(VALUE_POS as i64), incr])
+                    .expect("the scratch heap has room for the counter operand");
+                match table.update_counter(key, operand, self.atoms, &mut self.out) {
+                    Ok(new) => signed_value(new).to_string(),
+                    Err(error) => failure(op, error),
+                }
+            }
+            OP_UPDATE_ELEMENT => {
+                let value = make_small(self.value_of(object));
+                match table.update_element(key, &[(VALUE_POS, value)], self.atoms, &mut self.out) {
+                    Ok(true) => "true".to_string(),
+                    Ok(false) => "false".to_string(),
+                    Err(error) => failure(op, error),
+                }
+            }
+            OP_LOOKUP_ELEMENT => match table.lookup_element(key, VALUE_POS, self.atoms) {
+                Ok(element) => signed_value(element).to_string(),
+                Err(error) => failure(op, error),
+            },
+            OP_LOOKUP_ELEMENT_DEFAULT => {
+                let default = make_small(self.value_of(object));
+                match table.lookup_element_or(key, VALUE_POS, default, self.atoms) {
+                    Ok(element) => signed_value(element).to_string(),
+                    Err(error) => failure(op, error),
+                }
+            }
             _ => unreachable!("`op` is drawn modulo {NUM_OPS}"),
         }
     }
@@ -390,13 +506,30 @@ fn foldl_keys(table: &Table) -> Vec<Eterm> {
     acc
 }
 
+/// `ets:foldr(fun({K, _}, Acc) -> [K | Acc] end, [], T)` over the table's own
+/// iteration order.
+///
+/// `lists:foldr` applies the fold function to the elements from the last to the
+/// first, prepending each key, so the accumulator ends up in **ascending** key
+/// order — the mirror of [`foldl_keys`] and the same list the `select` op yields.
+/// The escript runs the identical fold.
+fn foldr_keys(table: &Table) -> Vec<Eterm> {
+    let mut acc = Vec::new();
+    for object in table.tab2list().into_iter().rev() {
+        // SAFETY: every object the trace inserts is a `{Key, Value}` two-word tuple.
+        acc.insert(0, unsafe { tuple_element(object, 0) });
+    }
+    acc
+}
+
 // ---------------------------------------------------------------------------
 // The trace
 // ---------------------------------------------------------------------------
 
 /// Drive the trace on the crate's `ordered_set` and collect
-/// `"<seed>.<step>" -> "S=<size> T=<objects> R=<result>"`.
-fn trace() -> BTreeMap<String, String> {
+/// `"<seed>.<step>" -> "S=<size> T=<objects> R=<result>"`, alongside the **peak
+/// live-key count** it reached (asserted to exceed the B+-tree's fan-out).
+fn trace() -> (BTreeMap<String, String>, usize) {
     let mut atoms = AtomTable::new();
     let mut heap = Heap::new(1 << 18);
     let pool = key_pool(&mut heap, &mut atoms);
@@ -416,6 +549,7 @@ fn trace() -> BTreeMap<String, String> {
     };
 
     let mut facts = BTreeMap::new();
+    let mut peak_live = 0usize;
     for seed in SEEDS {
         // The default `ordered_set` interior is the K-ary B+-tree; assert it so a
         // future change of the default cannot silently retarget this trace.
@@ -437,6 +571,7 @@ fn trace() -> BTreeMap<String, String> {
             let object = tuple_of(&mut heap, &[key, make_small(value)]);
 
             let result = trace.step(&mut table, op, object, key, aux);
+            peak_live = peak_live.max(table.size());
             facts.insert(
                 format!("{seed}.{step}"),
                 format!(
@@ -448,7 +583,7 @@ fn trace() -> BTreeMap<String, String> {
             );
         }
     }
-    facts
+    (facts, peak_live)
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +612,7 @@ main([OutPath]) ->
            [{a,1}, {b,2}, {}] ++
            [[1,2], [3], []],
     PLen = length(Keys),
-    NumOps = 40,
+    NumOps = 55,
     Steps = 600,
     Seeds = [1, 12345, 20250601],
     {ok, F} = file:open(OutPath, [write, raw, binary]),
@@ -498,29 +633,37 @@ main([OutPath]) ->
             A = lists:nth(Ai + 1, Keys),
             R = try
                     case Op of
-                      _ when Op < 24 -> ets:insert(T, {K, Vi}), "ok";
-                      24 -> case ets:insert_new(T, {K, Vi}) of
+                      _ when Op < 34 -> ets:insert(T, {K, Vi}), "ok";
+                      34 -> case ets:insert_new(T, {K, Vi}) of
                               true -> "true";
                               false -> "false"
                             end;
-                      25 -> ets:delete(T, K), "ok";
-                      26 -> ets:delete_object(T, {K, Vi}), "ok";
-                      27 -> RObjs(ets:take(T, K));
-                      28 -> ets:delete_all_objects(T), "ok";
-                      29 -> RObjs(ets:lookup(T, K));
-                      30 -> case ets:member(T, K) of
+                      35 -> ets:delete(T, K), "ok";
+                      36 -> ets:delete_object(T, {K, Vi}), "ok";
+                      37 -> RObjs(ets:take(T, K));
+                      38 -> ets:delete_all_objects(T), "ok";
+                      39 -> RObjs(ets:lookup(T, K));
+                      40 -> case ets:member(T, K) of
                               true -> "true";
                               false -> "false"
                             end;
-                      31 -> REnd(ets:first(T));
-                      32 -> REnd(ets:last(T));
-                      33 -> REnd(ets:next(T, A));
-                      34 -> REnd(ets:prev(T, A));
-                      35 -> RKeys(ets:select(T, [{{'$1','_'},[],['$1']}]));
-                      36 -> integer_to_list(ets:select_count(T, [{{'_','_'},[],[true]}]));
-                      37 -> RObjs(ets:match_object(T, {'_','_'}));
-                      38 -> RKeys(ets:select_reverse(T, [{{'$1','_'},[],['$1']}]));
-                      39 -> RKeys(ets:foldl(fun({Kk, _}, Acc) -> [Kk|Acc] end, [], T))
+                      41 -> REnd(ets:first(T));
+                      42 -> REnd(ets:last(T));
+                      43 -> REnd(ets:next(T, A));
+                      44 -> REnd(ets:prev(T, A));
+                      45 -> RKeys(ets:select(T, [{{'$1','_'},[],['$1']}]));
+                      46 -> integer_to_list(ets:select_count(T, [{{'_','_'},[],[true]}]));
+                      47 -> RObjs(ets:match_object(T, {'_','_'}));
+                      48 -> RKeys(ets:select_reverse(T, [{{'$1','_'},[],['$1']}]));
+                      49 -> RKeys(ets:foldl(fun({Kk, _}, Acc) -> [Kk|Acc] end, [], T));
+                      50 -> integer_to_list(ets:update_counter(T, K, {2, Vi - 3}));
+                      51 -> case ets:update_element(T, K, {2, Vi}) of
+                              true -> "true";
+                              false -> "false"
+                            end;
+                      52 -> RKeys(ets:foldr(fun({Kk, _}, Acc) -> [Kk|Acc] end, [], T));
+                      53 -> integer_to_list(ets:lookup_element(T, K, 2));
+                      54 -> integer_to_list(ets:lookup_element(T, K, 2, Vi))
                     end
                 catch error:badarg -> "badarg"
                 end,
@@ -598,7 +741,7 @@ fn randomised_ordered_set_trace_matches_the_live_oracle() {
         oracle_facts.len()
     );
 
-    let ours = trace();
+    let (ours, peak_live) = trace();
     for (name, want) in &oracle_facts {
         let got = ours
             .get(name)
@@ -613,9 +756,17 @@ fn randomised_ordered_set_trace_matches_the_live_oracle() {
         oracle_facts.len(),
         "the crate and the oracle ran different numbers of steps"
     );
+    // The trace must really stress the B+-tree's structure: exceeding the fan-out
+    // means leaves split and internal nodes form on the way up (and the delete
+    // churn merges them back down), which a single-leaf trace would not.
+    assert!(
+        peak_live > ORDER,
+        "the trace reached {peak_live} live keys, not more than the B+-tree fan-out \
+         ({ORDER}); it no longer exercises node splits"
+    );
 
     println!(
-        "[ordered trace] compared {} steps across {} seeds x {} steps",
+        "[ordered trace] compared {} steps across {} seeds x {} steps; peak live keys = {peak_live}",
         ours.len(),
         SEEDS.len(),
         STEPS
