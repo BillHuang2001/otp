@@ -128,17 +128,27 @@ impl Collector {
         self.minor_since_major
     }
 
-    /// Whether the nursery can no longer satisfy `need_words` more words.
+    /// Whether the young heap **needs a collection**: the current space cannot satisfy
+    /// `need_words` more words, or the nursery chain carries a
+    /// [retired](Self::grow_nursery) space whose words only a collection can reclaim.
     ///
-    /// This reads the **current** (allocatable) space only — a [growth](Self::grow_nursery)
-    /// retires the space it replaced and nothing is ever allocated in a retired one, so the
-    /// current space is the correct one for an allocation-admission signal. A *collection*
-    /// must instead cover the whole chain, which is why [`collect`](Self::collect) compares
-    /// the mature's room against the chain-wide [`Nursery::used_words`].
+    /// The first half reads the **current** (allocatable) space only — a
+    /// [growth](Self::grow_nursery) retires the space it replaced and nothing is ever allocated
+    /// in a retired one, so the current space is the correct one for an allocation-admission
+    /// signal, and an exact-fit allocation still fits. A *collection* must instead cover the
+    /// whole chain, which is why [`collect`](Self::collect) compares the mature's room against
+    /// the chain-wide [`Nursery::used_words`].
+    ///
+    /// The second half is the **collection debt**: a growth can never reclaim anything (it
+    /// never moves a term), so the only thing that frees a retired space is a collection. A
+    /// host asks this question at its heap-admission point to decide whether to collect, so
+    /// reporting the debt is what stops it from suppressing the collection that clears the
+    /// chain — without it the spent capacity of every growth accumulates for as long as the
+    /// nursery keeps being enlarged.
     pub fn should_collect(&self, need_words: usize) -> bool {
         self.nursery.current().available_words() < need_words
+            || self.nursery.retains_old_spaces()
     }
-
     /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
@@ -262,7 +272,7 @@ impl Collector {
 
     /// Grows the nursery **on demand** so that a `need_words`-word allocation can proceed —
     /// the seam a runtime calls when [`should_collect`](Self::should_collect) reports the
-    /// nursery is full.
+    /// young heap needs a collection.
     ///
     /// It collects once (a minor, escalating to a major when a minor cannot make room), then
     /// grows the now-empty nursery to the smallest curated size that covers `need_words`.
@@ -296,11 +306,12 @@ impl Collector {
     /// collecting and without moving any live term** — the no-relocation growth seam.
     ///
     /// It is safe for a caller that holds no root set (so cannot collect): the space it
-    /// replaces is **retained** and every live word stays addressable at its original address,
-    /// so a chained nursery is just as collectable later as a single space
-    /// ([`young_contains`](Self::young_contains) covers the retained spaces and the next
-    /// collection evacuates them all). When the current space already has room this is a
-    /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
+    /// replaces is **retained** whenever it has handed the mutator words, so every live word
+    /// stays addressable at its original address, and a provably empty one (nothing can name
+    /// into it) is dropped outright — a chained nursery is just as collectable later as a
+    /// single space ([`young_contains`](Self::young_contains) covers the retained spaces and
+    /// the next collection evacuates them all). When the current space already has room this is
+    /// a no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
     /// cannot reach the request, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {

@@ -29,6 +29,14 @@
 //! the allocator at a fresh, larger one: live words stay addressable at their original
 //! address and nothing is moved.
 //!
+//! A retained space is only *kept* when it is **provably live-or-dormant**, never when it is
+//! provably dead: the one-way rule this module enforces is that a superseded space may be
+//! dropped only when no live term can name one of its words — either it never handed a single
+//! word to the mutator (`used_words() == 0`, e.g. the space a [collapse](Nursery::collapse)
+//! just emptied), or a collection has evacuated it ([`collapse`](Nursery::collapse)).
+//! [`retains_old_spaces`](Nursery::retains_old_spaces) reports the retained chain — the
+//! "collection debt" a growth accumulates and only a collection can clear.
+//!
 //! Once a collection has evacuated **every** space the chain is no longer needed, so
 //! [`Nursery::collapse`] drops the retired spaces and re-sizes the single remaining current
 //! space — the chain is exactly one space before any mutator allocates again. While a chain
@@ -90,6 +98,17 @@ impl Nursery {
         self.retired.len() + 1
     }
 
+    /// Whether a growth has **retired** a space — the chain's *collection debt*: words that a
+    /// growth can never reclaim (it moves nothing) and that only a
+    /// [collection](Nursery::collapse) can free.
+    ///
+    /// This is the second half of the collectors' admission signal
+    /// ([`Collector::should_collect`](crate::Collector::should_collect)): a host asks that
+    /// question at its heap-admission point to decide whether to collect, so reporting the debt
+    /// is what stops the host from suppressing the very collection that clears it.
+    pub(crate) fn retains_old_spaces(&self) -> bool {
+        !self.retired.is_empty()
+    }
     /// The words handed out across **every** nursery space — the exact word count a collection
     /// of a chained nursery evacuates.
     pub(crate) fn used_words(&self) -> usize {
@@ -124,6 +143,15 @@ impl Nursery {
     /// allocator is pointed at a fresh, larger space. A caller that holds no root set may
     /// therefore use it safely.
     ///
+    /// A superseded space is retained **only while it could still hold a live word**; one that
+    /// never handed a single word to the mutator is dropped instead. `used_words() == 0` is
+    /// exactly that proof — a [`HeapSpace`] hands words out only through its own bump pointer
+    /// and is emptied only by [`HeapSpace::reset`], which a
+    /// [collection](Nursery::collapse) runs *after* it has evacuated every word — so no term
+    /// can name into it and dropping it frees the backing allocation at once. This is what
+    /// keeps a growth that follows a collection (the collected space is empty) from retaining
+    /// anything, and so breaks the collect/grow oscillation.
+    ///
     /// The fresh space is the smallest size the policy allows that covers the request
     /// (`policy.next_words(need_words, 0)`, never smaller than the space it replaces); when the
     /// current space already has room the call is a no-op. The growth is **bounded to one
@@ -143,10 +171,11 @@ impl Nursery {
         }
         let fresh = HeapSpace::with_allocator(self.current.allocator().clone(), target)?;
         let old = core::mem::replace(&mut self.current, fresh);
-        self.retired.push(old);
+        if old.used_words() != 0 {
+            self.retired.push(old);
+        }
         Ok(())
     }
-
     /// Collapses the chain back to **exactly one** space, after a collection has evacuated
     /// every space.
     ///
