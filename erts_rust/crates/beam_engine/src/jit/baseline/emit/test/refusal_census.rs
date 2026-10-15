@@ -44,7 +44,7 @@ use crate::interpreter::{build_label_map, LabelMap};
 use crate::machine::MAX_REGISTER;
 
 use super::super::arith::import_names;
-use super::super::operands::{constant_word, x_register};
+use super::super::operands::{constant_word, x_register, Loc};
 use super::{test_plan, test_src};
 
 /// A safety bound on the installed-OTP sample (mirrors the sibling census).
@@ -220,10 +220,13 @@ fn select_tuple_arity_refusal(
     if labels.resolve(fail).is_err() {
         return Some("unresolved fail label".to_string());
     }
-    match x_register(tuple) {
-        Some(x) if x < MAX_REGISTER => {}
-        Some(_) => return Some("tuple X out-of-bound".to_string()),
-        None => return Some(format!("tuple: {}", shape(tuple))),
+    // The scrutinee must be an addressable `Loc` (an in-bound x-register or an
+    // addressable `Y` slot) — exactly what `select_tuple_arity_plan` accepts.
+    if Loc::of(tuple).is_none() {
+        return Some(match x_register(tuple) {
+            Some(_) => "tuple X out-of-bound".to_string(),
+            None => format!("tuple: {}", shape(tuple)),
+        });
     }
     for (candidate, label) in destinations {
         match candidate {

@@ -184,15 +184,6 @@ fn shape(source: &Operand, writes: &[(Half, &Operand)]) -> Option<ListShape> {
     })
 }
 
-/// The x-register index `operand` names, if it lies inside [`MAX_REGISTER`].
-///
-/// An out-of-bound index makes the instruction deopt, so the helper reports the
-/// interpreter's exact `bad_register` instead of the emitted code reading past
-/// the end of `machine.x`.
-fn in_bound_x(operand: &Operand) -> Option<u32> {
-    x_register(operand).filter(|x| *x < MAX_REGISTER)
-}
-
 /// Emit `get_list Source Head Tail` natively, or report that the block must
 /// helper it.
 ///
@@ -539,8 +530,9 @@ pub(super) fn try_inline_get_tuple_element(
 
 /// The inlinable shape of a `select_tuple_arity` the tier lowers natively.
 pub(super) struct AritySwitchPlan {
-    /// The scrutinee tuple's x-register.
-    tuple: u32,
+    /// The scrutinee tuple's location (an in-bound x-register or an addressable `Y`
+    /// slot).
+    tuple: Loc,
     /// The `(arityval header word, resolved target)` alternatives, in source order.
     cases: Vec<(i64, (u32, u32))>,
     /// The resolved fail label's `(func, pc)`.
@@ -549,9 +541,10 @@ pub(super) struct AritySwitchPlan {
 
 impl AritySwitchPlan {
     /// The x-register indices the plan's native lowering touches — the scrutinee is
-    /// its only runtime operand (every alternative is an immediate).
+    /// its only runtime operand (every alternative is an immediate). A `Y` scrutinee
+    /// is a stack slot, never an x-register.
     pub(super) fn registers(&self) -> Vec<u32> {
-        vec![self.tuple]
+        self.tuple.register().into_iter().collect()
     }
 
     /// An arity switch writes **no** x-register: the scrutinee is only read, every
@@ -563,8 +556,9 @@ impl AritySwitchPlan {
 
 /// The inlinable shape of a `select_tuple_arity`, or `None` for any shape above the
 /// subset (see the section comment above): a `NO_FAIL` switch — which *raises* on
-/// the no-match path — an unresolved label, a non-x-register scrutinee, or an
-/// alternative that is not a non-negative `Integer` with a resolved label.
+/// the no-match path — an unresolved label, an un-addressable scrutinee (a float
+/// register, a literal, or an out-of-bound x-register), or an alternative that is not
+/// a non-negative `Integer` with a resolved label.
 pub(super) fn select_tuple_arity_plan(
     labels: &LabelMap,
     tuple: &Operand,
@@ -577,7 +571,7 @@ pub(super) fn select_tuple_arity_plan(
     }
     // An unresolved label keeps the interpreter's exact `unknown_label`.
     let fail = labels.resolve(fail).ok()?;
-    let tuple = in_bound_x(tuple)?;
+    let tuple = Loc::of(tuple)?;
     let mut cases = Vec::with_capacity(destinations.len());
     for (candidate, label) in destinations {
         let Operand::Integer(n) = candidate else {
@@ -618,13 +612,7 @@ pub(super) fn try_inline_select_tuple_arity(
     };
 
     let fallback: CodeLabel = buffer.label();
-    emit_tuple_header_guard(
-        buffer,
-        Loc::X(plan.tuple),
-        allocation,
-        fallback,
-        highest_touched,
-    )?;
+    emit_tuple_header_guard(buffer, plan.tuple, allocation, fallback, highest_touched)?;
 
     // One `cmp`/`jcc` per alternative, in source order — the interpreter takes the
     // **first** alternative whose arity equals the tuple's, and a word compare on

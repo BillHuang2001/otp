@@ -234,9 +234,12 @@ impl FastArith<'_> {
 /// `Y` operand or a `Y` destination `gc_bif`), a `move` with a `Y` source or destination
 /// ([`move_shape`] + [`super::r#move::MoveShape::uses_y`]), a `swap` with a `Y` side
 /// ([`super::r#move::swap_shape`]), the cons-cell readers and the tuple reader/writer
-/// with a `Y` source/destination/target (`super::aggregate`'s `*_shape`), and an
+/// with a `Y` source/destination/target (`super::aggregate`'s `*_shape`), an
 /// `init_yregs` listing an addressable `Y` register
-/// ([`super::operands::locate_all`]). MUST stay in exact agreement with the inliners: a
+/// ([`super::operands::locate_all`]), and a `test`/`select_val`/`select_tuple_arity`
+/// whose operand is an addressable `Y` slot ([`operand_uses_y`] — the guarded frame
+/// window read of [`super::test`]/[`super::select`]/[`super::aggregate`]). MUST stay in
+/// exact agreement with the inliners: a
 /// shape an inliner **refuses** deopts and reads nothing, so it must be false here too,
 /// or a later in-block Y access would use a window published before a `machine.stack`
 /// reallocation. Gate conservatively at the call site — a block whose code contains any
@@ -273,8 +276,21 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             .map_or(false, |shape| shape.uses_y()),
         Instr::InitYregs { registers } => super::operands::locate_all(registers)
             .map_or(false, |locations| locations.iter().any(|location| location.is_y())),
+        // A `test`/`select_val`/`select_tuple_arity` whose operand is an addressable
+        // `Y` slot reads the frame window ([`super::test`]'s / [`super::select`]'s /
+        // [`super::aggregate`]'s guarded Y read). Purely syntactic, so it is an exact
+        // superset of the Y sources the plans claim.
+        Instr::Test { args, .. } => args.iter().any(|operand| operand_uses_y(operand)),
+        Instr::SelectVal { value, .. } => operand_uses_y(value),
+        Instr::SelectTupleArity { tuple, .. } => operand_uses_y(tuple),
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
+}
+
+/// Whether an operand is an addressable `Y` slot (the syntactic Y-source test the
+/// `test`/`select_val`/`select_tuple_arity` lowerings share).
+fn operand_uses_y(operand: &Operand) -> bool {
+    super::operands::Loc::of(operand).map_or(false, super::operands::Loc::is_y)
 }
 
 /// The fast path's shape test for `instr`, a *purely syntactic* check (it never

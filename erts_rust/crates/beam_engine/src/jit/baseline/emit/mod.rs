@@ -928,6 +928,8 @@ fn emit_block(
                     instr,
                     allocation,
                     done,
+                    func,
+                    pc,
                     highest_touched,
                 )? {
                     terminated = true;
