@@ -231,15 +231,20 @@ impl Runtime {
     ///   raise (its class, its `unsupported` marker) exactly as the single-pass path did
     ///   (see [`Runtime::take_process_error`]);
     /// * is **blocked with nothing left that could wake it** — the run queue drained,
-    ///   nothing left to poll (no live port and no registered signal watch) and no pending
-    ///   timer deadline — reported with the very
+    ///   nothing left to poll (no live port, no armed `tty_select/2` interest and no
+    ///   **caught, undelivered** signal — an *armed but idle* `handle` disposition is not
+    ///   pending work) and no pending timer deadline — reported with the very
     ///   [`beam_engine::blocked`] diagnostic the single-pass path reports, so a bare `wait`
     ///   keeps its immediate, honest answer instead of spinning out the deadline; or
     /// * **outlived [`RUN_DEADLINE`]** — an honest "did not terminate" diagnostic.
     ///
     /// Every step is **bounded** ([`RUN_STEP_SLICES`] slices, and a wait of at most
     /// [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE)), so the pump never busy-spins at
-    /// 100 % CPU and the wall-clock deadline is always reached.
+    /// 100 % CPU and the wall-clock deadline is always reached. The `TimerWait::AtMost`
+    /// wait is further clamped to the earliest live deadline
+    /// ([`Runtime::timer_wait`](Runtime) → `remaining.min(max)`) and is **never** taken when
+    /// there is no deadline at all (it returns `None`, so the pass ends instead of waiting) —
+    /// there is no unbounded or `None` poll timeout anywhere on this path.
     ///
     /// # Errors
     ///
@@ -313,7 +318,8 @@ impl Runtime {
     }
 
     /// Whether the scheduler has nothing left that could wake a blocked process: an empty
-    /// run queue, **nothing left to poll** (no live port *and* no registered signal watch —
+    /// run queue, **nothing left to poll** (no live port, no armed `tty_select/2` interest and
+    /// no **caught, undelivered** signal —
     /// [`PortRegistry::has_nothing_to_poll`](crate::port::PortRegistry::has_nothing_to_poll))
     /// and no pending timer deadline.
     ///
@@ -321,10 +327,15 @@ impl Runtime {
     /// process can run, no port can deliver and no timer can fire, so a blocked process
     /// would block forever and the honest answer is [`beam_engine::blocked`].
     ///
-    /// The predicate is the port layer's own "is there anything for a poll round to wait
-    /// on?" question, not "is a port open": `os:set_signal/2`'s self-pipe is pollable with
-    /// **zero** ports, so a runtime that only watches a signal must not be declared stalled
-    /// while a caught signal could still deliver `{notify, Signal}`.
+    /// The predicate is the port layer's own "is there anything a poll round must wait on?"
+    /// question, not "is a port open". An **armed but idle** `os:set_signal/2` self-pipe is a
+    /// descriptor that can only become readable when a signal actually arrives, so it does
+    /// **not** keep the runtime awake — every CLI action but `-version` drives a boot script
+    /// that arms one, and counting it made a blocked `run`-route workload pay a fixed
+    /// `PORT_POLL_SLICE` of sleep per round. A signal that *has* been caught makes the pipe
+    /// readable, is therefore pending work, and is still delivered promptly
+    /// (`{notify, Signal}`) because [`PortRegistry::pump`](crate::port::PortRegistry::pump)
+    /// harvests the facility unconditionally at the top of every round.
     ///
     /// A port table that cannot be borrowed (a nested borrow) is reported as **not**
     /// quiescent: the pump then keeps stepping rather than declaring a stall it cannot
@@ -1120,9 +1131,9 @@ impl Runtime {
 #[cfg(test)]
 mod tests;
 
-/// The two pins that live next to the code they pin: the **quiescence predicate** (a
-/// portless runtime that only watches a signal is *not* stalled) and the **short-borrow
-/// seam** ([`Runtime::with_port_table`]).
+/// The two pins that live next to the code they pin: the **quiescence predicate** (an
+/// armed-but-idle signal watch does *not* keep a portless runtime awake; a caught signal
+/// does) and the **short-borrow seam** ([`Runtime::with_port_table`]).
 ///
 /// They are inlined here rather than added to the sibling [`tests`] module because both are
 /// about this file's own borrow/quiescence pairing; the fixtures the sibling module needs
@@ -1135,36 +1146,75 @@ mod quiescence_and_port_table_tests {
 
     use crate::port::watch;
 
-    /// A `handle` disposition makes `os:set_signal/2`'s self-pipe worth polling — with
-    /// **zero** ports open — so the pump must not declare quiescence while one is installed;
-    /// and once the disposition is gone the very same runtime is quiescent again.
+    /// An **armed but idle** `os:set_signal/2` self-pipe is not pending work: with **zero**
+    /// ports open the runtime is still quiescent, so a blocked `run`-route workload reports the
+    /// honest `beam_engine::blocked()` instead of paying a fixed `PORT_POLL_SLICE` per round.
+    /// A signal that is actually **caught** (the pipe holds an undrained byte) *is* pending
+    /// work and makes the runtime non-quiescent again, and draining it restores quiescence.
     ///
     /// A signal disposition is **process-global**, so the test serializes on the port
-    /// layer's own lock ([`watch::test_guard`]) and restores `default` before it returns.
+    /// layer's own lock ([`watch::test_guard`]) and restores the prior disposition before it
+    /// returns.
     #[test]
-    fn a_pollable_signal_watch_keeps_a_portless_runtime_from_being_quiescent() {
+    fn an_idle_signal_watch_is_quiescent_but_a_caught_one_is_not() {
         let _guard = watch::test_guard();
         let mut rt = Runtime::with_defaults().expect("the default runtime");
         assert!(rt.is_quiescent(), "an idle runtime is quiescent");
 
+        let before = watch::watcher::current(Signal::SigUsr1);
         watch::install(Signal::SigUsr1, Disposition::Handle).expect("handle on sigusr1");
+
+        // (1) Armed but idle: the descriptor is idle, so there is nothing to wait on and the
+        // runtime is still stalled — exactly the state every CLI action but `-version` boots
+        // into, which used to cost a 25 ms sleep per round.
+        assert!(
+            rt.ports
+                .try_borrow()
+                .expect("the port registry is free")
+                .has_nothing_to_poll(),
+            "an armed but idle handle disposition is not pending work"
+        );
+        assert!(
+            rt.is_quiescent(),
+            "an idle signal self-pipe must not keep a portless runtime awake"
+        );
+
+        // (2) A real signal is caught: the trampoline writes the self-pipe and no drain has
+        // consumed it yet, so the round has work to do again.
+        watch::watcher::send_to_self(Signal::SigUsr1);
+        watch::watcher::wait_until_pending();
         assert!(
             !rt.ports
                 .try_borrow()
                 .expect("the port registry is free")
                 .has_nothing_to_poll(),
-            "a handled signal leaves something to poll with no port open"
+            "a caught, undelivered signal is pending work"
         );
         assert!(
             !rt.is_quiescent(),
-            "a pollable signal watch is work the pump still has, not a stall"
+            "a caught signal must keep the pump stepping so it is delivered"
         );
 
-        watch::install(Signal::SigUsr1, Disposition::Default).expect("restore the disposition");
+        // (3) Draining consumes it, so the very same runtime is quiescent again. The drain is
+        // the ordinary port round — the same call a scheduler pass makes once the run queue is
+        // empty — which harvests the facility at its top. With no process registered as
+        // `erl_signal_server` the notification has no recipient and is dropped, exactly as the
+        // C's `signal_notify_requested` drops it, so nothing is delivered.
+        let mut table = rt.take_processes();
+        let delivered = rt
+            .deliver_port_messages(&mut table, Duration::from_millis(1))
+            .expect("a port round with a caught signal");
+        rt.put_processes(table);
+        assert_eq!(
+            delivered, 0,
+            "with no `erl_signal_server` the notification is dropped, not delivered"
+        );
         assert!(
             rt.is_quiescent(),
-            "with the watch no longer pollable there is nothing left that could wake a process"
+            "with nothing left that could wake a process the runtime is stalled again"
         );
+
+        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
     }
 
     /// The seam hands a caller the **process table** and the live **port table** together for

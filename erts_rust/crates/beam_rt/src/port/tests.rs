@@ -2289,14 +2289,29 @@ fn ignore_and_default_leave_nothing_to_poll_and_notify_nobody() {
     assert!(rt.ports.borrow().has_nothing_to_poll());
 }
 
-/// The regression guard for the "don't sleep" shortcut: with **zero** live ports but a
-/// registered signal watch, [`PortRegistry::has_nothing_to_poll`] is false, so the pump
-/// still registers the self-pipe and **waits** on it for its slice instead of returning at
-/// once (the old port-only predicate would have let a caught signal sit undelivered).
+/// The regression guard for **both** halves of the idle-vs-fired signal contract.
+///
+/// **(a) An armed but idle `handle` disposition must not make a round sleep.** A `handle`
+/// disposition's self-pipe is an *idle* descriptor — it can only become readable when a signal
+/// actually arrives — so [`PortRegistry::has_nothing_to_poll`] stays **true** with zero ports
+/// and the round returns at once. This is what removes the fixed `PORT_POLL_SLICE` of sleep a
+/// blocked `run`-route workload used to pay every round (every CLI action but `-version` drives
+/// a boot script that arms exactly one such disposition).
+///
+/// **(b) A signal that *has* been caught is pending work and is still delivered.** The pipe
+/// holds the trampoline's byte until a drain consumes it, so [`has_nothing_to_poll`] is false
+/// and the round proceeds — but it does **not** block: the signal was harvested
+/// unconditionally at the top of the round, so the round can return immediately. The
+/// `{notify, Sigusr1}` notification reaches the registered `erl_signal_server`.
+///
+/// [`has_nothing_to_poll`]: PortRegistry::has_nothing_to_poll
 #[test]
-fn a_zero_port_runtime_still_polls_a_registered_signal_watch() {
+fn an_idle_signal_watch_does_not_block_a_round_but_a_caught_one_is_delivered() {
     let _guard = watch::test_guard();
     let (mut rt, mut table) = runtime_with_table();
+    let server = table.spawn_default().expect("the signal server process");
+    register_signal_server(&mut rt, &mut table, server);
+
     // No port is opened at all: the *ports* predicate is empty …
     assert!(rt.ports.borrow().is_empty(), "no port is open");
     assert!(
@@ -2307,32 +2322,79 @@ fn a_zero_port_runtime_still_polls_a_registered_signal_watch() {
     let before = watch::watcher::current(Signal::SigUsr1);
     watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
 
-    // … yet a `handle` disposition means there is still something to wait on, so the pump
-    // must not take its early return.
+    // (a) … and an armed but idle `handle` disposition is still nothing to wait on, so the
+    // round must return promptly instead of sleeping its slice out. The bound is generous
+    // (well below `PORT_POLL_SLICE`) because readiness is the property under test, not a tight
+    // timing: only an implementation that really blocked a slice could exceed it.
     assert!(
-        !rt.ports.borrow().has_nothing_to_poll(),
-        "a `handle` disposition keeps the poller awake with zero ports"
+        rt.ports.borrow().has_nothing_to_poll(),
+        "an armed but idle `handle` disposition is not pending work"
     );
-
     let started = Instant::now();
     let delivered = rt
         .deliver_port_messages(&mut table, PORT_POLL_SLICE)
         .expect("deliver");
-    let elapsed = started.elapsed();
+    let idle_elapsed = started.elapsed();
+    assert_eq!(delivered, 0, "no signal has been sent yet");
+    assert!(
+        idle_elapsed < Duration::from_millis(10),
+        "an idle signal watch must not make the round sleep its {PORT_POLL_SLICE:?} slice \
+         (it returned after {idle_elapsed:?})"
+    );
+    // The round returned before the poller was ever consulted, so the self-pipe was not
+    // registered: it is a descriptor nothing can make ready, so it is not worth having in the
+    // poll set of a wait that will not happen. It is still **pollable**
+    // ([`SignalWatch::is_pollable`] — the poll-set half of the watch), so the first round that
+    // really has to wait (a live port, an armed `tty_select/2`) registers it, and a signal
+    // arriving then wakes that wait.
+    assert!(
+        rt.ports.borrow().watch.is_pollable(),
+        "an armed `handle` disposition is still the poll-set half of the watch"
+    );
+    assert!(
+        !rt.ports.borrow().watch.is_registered(),
+        "an idle round has nothing to wait on, so it never reaches the poller"
+    );
+
+    // (b) A caught signal is pending work, and it is delivered without any blocking wait.
+    watch::watcher::send_to_self(Signal::SigUsr1);
+    assert!(
+        wait_until_caught(),
+        "the signal was never caught, so the assertions below would be vacuous"
+    );
+    assert!(
+        !rt.ports.borrow().has_nothing_to_poll(),
+        "a caught, undelivered signal is pending work"
+    );
+    let started = Instant::now();
+    let delivered = rt
+        .deliver_port_messages(&mut table, PORT_POLL_SLICE)
+        .expect("deliver");
+    let fired_elapsed = started.elapsed();
     watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
 
-    assert_eq!(delivered, 0, "no signal has been sent in this test");
-    assert!(
-        rt.ports.borrow().watch.is_registered(),
-        "the round registered the self-pipe with the runtime's poller"
+    assert_eq!(
+        delivered, 1,
+        "the caught signal reaches the registered `erl_signal_server`"
     );
-    // The wait is real and bounded by the slice: the poll blocks for it when nothing is
-    // ready, where a port-only shortcut returned immediately (every other path in this test
-    // is unchanged whether the round waits or not, which is why the timing *is* the guard).
     assert!(
-        elapsed >= Duration::from_millis(5),
-        "the zero-port pump must really poll the self-pipe, not return at once \
-         (it returned after {elapsed:?})"
+        fired_elapsed < Duration::from_millis(10),
+        "a caught signal is already readable, so the round must not block either \
+         (it returned after {fired_elapsed:?})"
+    );
+    let message = notify_payload(&table, server);
+    assert_eq!(
+        rt.atom_name_of(terms::tuple_element(message, 0).expect("element 0")),
+        Some("notify"),
+        "message={message:?}"
+    );
+    assert_eq!(
+        rt.atom_name_of(terms::tuple_element(message, 1).expect("element 1")),
+        Some("sigusr1")
+    );
+    assert!(
+        rt.ports.borrow().has_nothing_to_poll(),
+        "the delivered signal leaves nothing pending again"
     );
 }
 
