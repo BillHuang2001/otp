@@ -52,8 +52,11 @@ Inlined: metadata no-ops, `Move`, `Swap`, `Jump`, `CallOnly`, `Test`, small-int 
 `GcBif`/`Bif`, `SelectVal`, `SelectTupleArity`, `GetTupleElement`, `GetList`/`GetHd`/`GetTl`.
 
 ## Constraints
-`unsafe` only in `mod.rs`; the tier never touches `Machine` state a block cannot address — anything
-requiring a frame pop or context switch deopts to the shared helper.
+`unsafe` only inside the `mod.rs` module subtree: `mod.rs` declares `#![allow(unsafe_code)]` and its
+children inherit it, so `codegen.rs`/`inline.rs`/`compare.rs`/`shape.rs`/`report.rs` are safe Rust and
+the one `unsafe` block in the `#[cfg(test)] mod tests` is test-only. The tier never touches `Machine`
+state a block cannot address — anything requiring a frame pop or context switch deopts to the shared
+helper.
 
 ## Cross-module transfer
 The tier runs on the **shared** driver (`../baseline`), which handles a `Step::Enter` (a
