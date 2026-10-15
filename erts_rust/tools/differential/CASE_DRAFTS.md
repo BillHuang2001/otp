@@ -6,12 +6,12 @@ correction saying why no case is possible. A recipe is added only **after** the 
 closes the gap it names, then `known-gaps.txt`/`GAPS.md` are refreshed in the same change (see
 `../CONTEXT.md` §"Notes for Agents").
 
-At a glance: **§1** and **§5b** are live gaps (recipes ready, not yet addable); **§2**, **§5a**
-and **§4**'s tiny-body wrapped recipe already agree and are merely missing from the corpus; **§4**'s
-raw-DEFLATE surface and all of **§6** are faithful in `beam_rt` and are pinned by the
-`src/corpus/**` groups (`zlib.rs`, `flags.rs`, `flags_apply.rs`); **§4**'s gzip pair and its
-repetitive-body wrapped size form are unpinnable divergences recorded in `divergences.md`, not
-drafts; **§3** and **§7** record items that were named as gaps but are not gaps at all.
+At a glance: **§1**, **§2**, **§4b**, **§4c**, **§5a**, **§5b** and **§6** are now **landed** — every
+one agrees in `beam_rt` and is pinned by the `src/corpus/**` groups (`zlib.rs`, `bifs.rs`,
+`system_info.rs`, `flags.rs`, `flags_apply.rs`); **§3** and **§7** record items that were named as
+gaps but are not gaps at all. The only remaining zlib divergences are **§4a** (the repetitive-body
+wrapped size form) and **§4**'s large-body image-choice (the 100-byte raw-DEFLATE `zip/1` stream),
+both unpinnable and recorded in `divergences.md`, not drafts.
 
 This file is a hand-maintained companion to the generated `GAPS.md` and the hand-written
 `divergences.md`: `divergences.md` records divergences that are **unpinnable**, this file records
@@ -49,26 +49,31 @@ exit `0`.
 ## How an open recipe classifies
 
 * A runtime that returns a **differing observable** (a plain Erlang value or a plain reason such as
-  `exception error undef`) is a `mismatch` — the gate's hard failure. §1 is this shape today.
+  `exception error undef`) is a `mismatch` — the gate's hard failure. §1 was this shape before it
+  landed.
 * A runtime that signals the gap through its documented convention — exit `3` with
   `beam_rt: unsupported: …`, or a probe-caught `exception … unsupported: …` — is an `unsupported`
-  capability gap. The four `process_info/2` position items in §5b are this shape today.
+  capability gap. The four `process_info/2` position items in §5b were this shape before they landed.
 
 ---
 
-## 1. `timer` — owner `beam_bifs` (root cause: `erlang:convert_time_unit/3`)
+## 1. `timer` — **landed**; owner `beam_bifs`
 
-**Status:** `still-a-gap` (inferred from batch context, not re-verified this batch).
+**Status:** `landed` — no longer a gap: `timer:tc/1` and `timer:apply_after/4` now **agree** in
+`beam_rt` and are pinned as `bifs/timer_tc_returns_the_fun_value` and
+`bifs/timer_apply_after_first_element_is_ok` (the root cause was the absent
+`erlang:convert_time_unit/3`).
 
 `timer` **loads and runs** in `beam_rt` already (`timer:now_diff/2`, `timer:sleep/1`,
-`timer:seconds/1` … all agree; `code:which(timer)` resolves to the stdlib `timer.beam`). The gap is
-**not** the `timer` module surface: `timer:tc/1,2,3,4` and `timer:apply_after/4` all fail, and the
-missing piece for the `tc/*` family is a single absent BIF —
-**`erlang:convert_time_unit/3` is `undef`**:
+`timer:seconds/1` … all agree; `code:which(timer)` resolves to the stdlib `timer.beam`). The gap was
+**not** the `timer` module surface but a single absent BIF — **`erlang:convert_time_unit/3`**
+(`timer:tc/1,2,3,4` and `timer:apply_after/4` all failed on it). It is now implemented, so the
+landed recipes below agree:
 
 ```sh
 erts_rust/target/release/differential compare 'erlang:convert_time_unit(1000, native, microsecond)'
-# oracle: ok 1000   rust: exception error undef   -> MISMATCH
+# before the fix: oracle: ok 1000   rust: exception error undef   -> MISMATCH
+# now: oracle and rust both ok 1000   -> AGREE
 ```
 
 `convert_time_unit/3` is injected via `erts_export_put` (`erts/emulator/beam/bif.c:5608`), so it is
@@ -90,8 +95,9 @@ Case {
 }
 ```
 
-* oracle: `ok 42`, exit `0`. `beam_rt`: `exception error undef`, exit `1` → **mismatch**.
-* `timer:tc/2,3,4` fail identically (each computes the elapsed time with `convert_time_unit/3`).
+* oracle: `ok 42`, exit `0`; `beam_rt` now **agrees** (`ok 42`, exit `0`) — landed as
+  `bifs/timer_tc_returns_the_fun_value`.
+* `timer:tc/2,3,4` behaved identically (each computes the elapsed time with `convert_time_unit/3`).
 * repro: `erts_rust/target/release/differential compare 'element(2, timer:tc(fun () -> 42 end))'`
 
 ### 1b. `timer:apply_after/4` — owner `beam_rt`
@@ -110,18 +116,18 @@ Case {
 }
 ```
 
-* oracle: `ok false`, exit `0`. `beam_rt`: exit `1` with
-  `exception exit {noproc,{gen_server,call,[kernel_sup,{start_child,#{id => timer_server,…}},…]}}`
-  → **mismatch**.
-* The gap is `beam_rt`'s missing kernel supervision tree (`kernel_sup` / `timer_server`), not the
-  `timer` module: the module's `apply_after/4` reaches `supervisor:start_child(kernel_sup, …)` and
-  the parent is absent. A stable alternative that observes the same failure:
-  `element(1, timer:apply_after(50, erlang, self, []))` → oracle `ok ok`.
+* oracle: `ok false`, exit `0`; `beam_rt` now **agrees** (`ok false`, exit `0`) — landed as
+  `bifs/timer_apply_after_first_element_is_ok`.
+* The gap was `beam_rt`'s missing kernel supervision tree (`kernel_sup` / `timer_server`), not the
+  `timer` module: the module's `apply_after/4` reaches `supervisor:start_child(kernel_sup, …)`; that
+  parent is now present, so the stable `element(1, timer:apply_after(50, erlang, self, []))` form
+  reads `ok ok` on both runtimes.
 * repro: `erts_rust/target/release/differential compare 'is_reference(timer:apply_after(50,erlang,self,[]))'`
 
-## 2. `timer:now_diff/2` — **already agrees**; a case could be ADDED
+## 2. `timer:now_diff/2` — **landed**
 
-**Status:** `promotable (agrees today, not yet in the corpus)` — not a gap, just a missing case.
+**Status:** `landed` — pinned as `bifs/timer_now_diff_of_two_timestamps` (never a gap, just a case
+the corpus was missing).
 
 ```rust
 Case {
@@ -138,8 +144,7 @@ Case {
 ```
 
 * oracle and `beam_rt` both print `ok -1000002000003`, exit `0` → **`[AGREE]`** (verified with
-  `differential compare 'timer:now_diff({0,0,0},{1,2,3})'`). Not a gap — a case the corpus is simply
-  missing.
+  `differential compare 'timer:now_diff({0,0,0},{1,2,3})'`). Not a gap — the case has now landed.
 
 ## 3. `string:concat` — **not a usable case** (`string:concat/1` is `undef` on the oracle too)
 
@@ -148,18 +153,22 @@ Case {
 * `string:concat/1` does **not** exist: `differential compare 'string:concat("a")'` → **`[AGREE]`**
   with both sides printing `exception error undef`, exit `1`. It cannot be a `mismatch` and it is
   not a gap; do not add it.
-* The intended functions both exist and **agree**, so they are the ones to pin if desired:
+* The intended functions both exist and **agree**, and both have now landed as
+  `bifs/string_concat_two` and `bifs/lists_concat`:
   * `string:concat/2` — `differential compare 'string:concat("a","b")'` → `ok [97,98]`, exit `0`.
   * `lists:concat/1` — `differential compare 'lists:concat(["a","b",1])'` → `ok [97,98,49]`, exit `0`.
 
 ## 4. `zlib` — owner `beam_bifs`
 
 **Status:** the **raw-DEFLATE** surface (`zlib:zip/1` / `zlib:unzip/1`, RFC 1951) is
-`now-agreeing-and-promoted` — its cases are pinned in `src/corpus/zlib.rs`. Of the two
-**zlib-wrapped** recipes below, the repetitive-body size one (4a) is **not a case** (a plain-value
-`mismatch`) and the tiny-body byte-exact one (4b) is `promotable (agrees today, not yet in the
-corpus)`; the `zlib:gzip/1` / `zlib:gunzip/1` pair (4c) is likewise a recorded divergence, not a
-draft.
+`now-agreeing-and-promoted` — its cases are pinned in `src/corpus/zlib.rs`. Both **zlib-wrapped**
+recipes landed: 4b as `zlib/compress_bytes_are_deterministic`,
+`zlib/uncompress_compress_roundtrip_tiny` and
+`zlib/uncompress_compress_roundtrip_100_bytes_is_identity`, and 4c (the `zlib:gzip/1` /
+`zlib:gunzip/1` pair) as `zlib/gzip_bytes_are_deterministic` and `zlib/gunzip_gzip_roundtrip_tiny`;
+two `data_error` failure classes also landed (`zlib/uncompress_three_bytes_is_data_error`,
+`zlib/gunzip_non_gzip_is_data_error`). Only 4a (the repetitive-body wrapped size form) stays a
+divergence.
 
 `code:which(zlib)` is the atom `preloaded` in **both** runtimes, and `beam_rt` lists `zlib` in its
 preloaded set (`crates/beam_rt/src/boot.rs`). The two wrapped-surface recipes, kept for reference:
@@ -187,7 +196,7 @@ Case {
   in `divergences.md` §A.7 — zlib.
 * repro: `erts_rust/target/release/differential compare 'byte_size(zlib:compress(<<0:8192>>))'`
 
-### 4b. `zlib:compress/1` of a tiny body — **promotable** (agrees today, not yet in the corpus)
+### 4b. `zlib:compress/1` of a tiny body — **landed**
 
 ```rust
 Case {
@@ -206,29 +215,31 @@ Case {
 * oracle and `beam_rt` both print `ok <<120,156,75,76,74,6,0,2,77,1,39>>`, exit `0` → **`[AGREE]`**
   (zlib level 6 on a 3-byte body is a stored/fixed-huffman stream), so the golden is host- and
   order-stable; the round trip `zlib:uncompress(zlib:compress(<<"abc">>)) =:= <<"abc">>` agrees too.
+  Landed as `zlib/compress_bytes_are_deterministic`, `zlib/uncompress_compress_roundtrip_tiny` and
+  `zlib/uncompress_compress_roundtrip_100_bytes_is_identity` (the last with the 100-byte body).
 * owner: `beam_bifs` (the `zlib` module's NIF-backed surface); `beam_rt` advertises the module as
   preloaded.
 * repro: `erts_rust/target/release/differential compare 'zlib:compress(<<"abc">>)'`
 
-### 4c. `zlib:gzip/1` / `zlib:gunzip/1` — **not a case** (plain `error:undef`)
+### 4c. `zlib:gzip/1` / `zlib:gunzip/1` — **landed**
 
-* the oracle returns the gzip container (`zlib:gzip(<<"abc">>)` →
-  `<<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>`, and `zlib:gunzip/1` inverts it)
-  while `beam_rt` raises the plain `error:undef`, so any case pinning either one is a plain-value
-  `mismatch`: this pair is a recorded divergence, not a draft. Recorded in `divergences.md`
-  §A.7 — zlib.
+* the oracle and `beam_rt` both return the gzip container (`zlib:gzip(<<"abc">>)` →
+  `<<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>`, and `zlib:gunzip/1` inverts it):
+  the pair now **agrees** and is pinned as `zlib/gzip_bytes_are_deterministic` and
+  `zlib/gunzip_gzip_roundtrip_tiny`, with the non-gzip failure class pinned as
+  `zlib/gunzip_non_gzip_is_data_error`.
 * repro: `erts_rust/target/release/differential compare 'zlib:gzip(<<"abc">>)'`
 
 ## 5. `process_info/2` items — owner `beam_rt`
 
-**Status:** §5a `promotable (agrees today, not yet in the corpus)`; §5b `still-a-gap` (inferred
-from batch context, not re-verified this batch); §5c no gap, no case needed.
+**Status:** §5a `landed` (the three `process_info_spawned_*` cases); §5b `landed` — no longer a gap
+(the four `process_info_*` position cases now agree); §5c no gap, no case needed.
 
 The most stable receivable form inspects a **freshly spawned** process, not `self()`: the oracle's
 `-eval` root process has a different boot shape than `beam_rt`'s (registered / links / trap_exit),
 so a `self()`-based golden is not host-independent.
 
-### 5a. `registered_name`, `links`, `trap_exit` on a spawned process — **already agree**; ADD
+### 5a. `registered_name`, `links`, `trap_exit` on a spawned process — **landed**
 
 ```rust
 case(
@@ -254,8 +265,11 @@ case(
 )
 ```
 
-* All three **`[AGREE]`** today (verified by hand under both runtimes: oracle `[]` / `0` /
-  `{trap_exit,false}`, `beam_rt` identical). Not gaps — the corpus is simply missing the
+* All three **`[AGREE]`** (verified by hand under both runtimes: oracle `[]` / `0` /
+  `{trap_exit,false}`, `beam_rt` identical) and have now landed as
+  `system_info/process_info_spawned_registered_name`,
+  `system_info/process_info_spawned_links_length` and
+  `system_info/process_info_spawned_trap_exit`. Not gaps — the corpus was simply missing the
   spawned-process form. (`case(...)` is the `system_info.rs` helper that builds an `Eval` case with
   `Probe::Value`.)
 
@@ -264,7 +278,7 @@ case(
   `{registered_name,init}`; `length(element(2, erlang:process_info(self(), links)))` → oracle `1`,
   `beam_rt` `0`; `erlang:process_info(self(), trap_exit)` → oracle `true`, `beam_rt` `false`.
 
-### 5b. the four position items — **typed `unsupported`** (capability gap; add once served)
+### 5b. the four position items — **landed** (now agree, no longer a gap)
 
 ```rust
 case("system_info/process_info_current_function", "…",
@@ -277,11 +291,13 @@ case("system_info/process_info_catchlevel",       "…",
      "element(1, erlang:process_info(self(), catchlevel))",           "ok catchlevel")
 ```
 
-* oracle: the key atom (`ok current_function` …), exit `0`. `beam_rt`: exit `3` with
-  `beam_rt: unsupported: process_info: <item> (this runtime holds no engine for that process…)` →
-  **`unsupported`** (a capability gap; it must be added to `known-gaps.txt` if pinned before the
-  crate serves it). Verified for both the `self()` and the spawned-process form — the runtime
-  answers the typed gap either way (`current_stacktrace` is in the same family).
+* oracle: the key atom (`ok current_function` …), exit `0`; `beam_rt` now **agrees** (the native
+  `process_info` floor serves all four items), landed as
+  `system_info/process_info_current_function`, `system_info/process_info_initial_call`,
+  `system_info/process_info_current_location` and `system_info/process_info_catchlevel`. These were
+  previously a typed `unsupported` capability gap (`beam_rt: unsupported: process_info: <item>`,
+  exit `3`) for both the `self()` and the spawned-process form (the `current_stacktrace` item is in
+  the same family).
 * The key-atom form (`element(1, …)`) is the stable observable: the oracle's *values*
   (`{current_function,{erl_eval,do_apply,7}}`, `{initial_call,{erlang,apply,2}}`, a path-bearing
   `current_location`, `{catchlevel,3}`) are `-eval`-shape-specific.
