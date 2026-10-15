@@ -68,12 +68,17 @@ pub(super) const HELPER_SYMBOL: &str = "jit_step_one";
 /// unique within a module and legible in a disassembler.
 pub(super) const FUNCTION_PREFIX: &str = "beam_func_";
 
-/// The native signature of a compiled Cranelift function: one `i64` runtime
-/// pointer in, the block-ABI control word out.
+/// The native signature of a compiled Cranelift function: the `i64` runtime pointer
+/// in, the entry `pc` the caller wants to start at, and the block-ABI control word
+/// out.
 ///
-/// This is the Rust-side view of the Cranelift signature `(I64) -> I64`; the two
-/// must stay in step.
-pub(super) type NativeFunc = extern "C" fn(i64) -> i64;
+/// This is the Rust-side view of the Cranelift signature `(I64, I64) -> I64`; the two
+/// must stay in step. The second `i64` is an **entry `pc`**: the function's prologue
+/// dispatches on it (see [`emit_pc_entry_dispatch`]) over the same candidate set the
+/// helper-word continuation chain resolves against ([`candidate_pcs`]), so a compiled
+/// function can be natively entered at any IR block start or non-tail-call
+/// continuation, not only at its entry `pc`.
+pub(super) type NativeFunc = extern "C" fn(i64, i64) -> i64;
 
 /// The byte offset of `JitRuntime::x_regs` inside the runtime block (the `8` the
 /// block ABI documents on a 64-bit target).
@@ -114,8 +119,11 @@ pub(super) fn compile_module(
         .declare_function(HELPER_SYMBOL, Linkage::Import, &helper_sig)
         .map_err(module_error)?;
 
-    // One shared signature per IR function: `(rt: i64) -> i64`.
+    // One shared signature per IR function: `(rt: i64, pc: i64) -> i64`. The second
+    // parameter is the entry `pc` the caller wants to start at, dispatched in the
+    // function's prologue (see `emit_pc_entry_dispatch`).
     let mut function_sig = jit.make_signature();
+    function_sig.params.push(AbiParam::new(types::I64));
     function_sig.params.push(AbiParam::new(types::I64));
     function_sig.returns.push(AbiParam::new(types::I64));
 
@@ -124,6 +132,7 @@ pub(super) fn compile_module(
     let labels = crate::interpreter::build_label_map(module);
 
     let mut entry_pc: HashMap<u32, u32> = HashMap::new();
+    let mut enter_pcs: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut defined: Vec<(u32, FuncId)> = Vec::new();
     let mut report = CodegenReport::default();
     for (index, function) in module.functions.iter().enumerate() {
@@ -138,6 +147,22 @@ pub(super) fn compile_module(
         let id = jit
             .declare_function(&name, Linkage::Export, &function_sig)
             .map_err(module_error)?;
+        // The pcs the compiled function may be **natively entered** at: the IR block
+        // starts plus every non-tail-call continuation. A pc must have a real
+        // instruction to start a block for (`< code.len()`), so a candidate at or past
+        // the end of the code is dropped — exactly the set [`emit_pc_entry_dispatch`]
+        // can dispatch to, so [`CompiledFunctions::is_enterable`] never claims an
+        // address the prologue would send to its defensive fallback. The entry label's
+        // `pc` is always added back, so a function is always enterable at its entry
+        // (the pre-existing behaviour) even for odd input.
+        let code_len = function.code.len();
+        let mut candidates = candidate_pcs(function);
+        candidates.retain(|&candidate| (candidate as usize) < code_len);
+        if !candidates.contains(&(pc as u32)) {
+            candidates.push(pc as u32);
+            candidates.sort_unstable();
+            candidates.dedup();
+        }
         emit_function(
             &mut jit,
             builder_context,
@@ -149,9 +174,11 @@ pub(super) fn compile_module(
             &labels,
             function,
             pc as u32,
+            &candidates,
             &mut report,
         )?;
         entry_pc.insert(func_index, pc as u32);
+        enter_pcs.insert(func_index, candidates);
         defined.push((func_index, id));
     }
 
@@ -168,6 +195,7 @@ pub(super) fn compile_module(
         _module: jit,
         entries,
         entry_pc,
+        enter_pcs,
         highest_native_register: report.highest_native_register,
         inlined_tests: report.inlined_tests,
         inlined_gc_bifs: report.inlined_gc_bifs,
@@ -180,7 +208,8 @@ pub(super) fn compile_module(
     })
 }
 /// Emit one cranelift function for IR function `function` (`func_index` of
-/// `module`), starting at `entry_pc`; see the module docs for the pc-block CFG.
+/// `module`), entering at `entry_pc` and able to be entered across `candidates`; see
+/// the module docs for the pc-block CFG.
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     jit: &mut JITModule,
@@ -193,11 +222,11 @@ fn emit_function(
     labels: &LabelMap,
     function: &Function,
     entry_pc: u32,
+    candidates: &[u32],
     report: &mut CodegenReport,
 ) -> Result<()> {
     let code = &function.code;
     let code_len = code.len();
-    let candidates = candidate_pcs(function);
     let mut ctx = jit.make_context();
     ctx.func.signature = signature.clone();
     ctx.func.name = UserFuncName::user(0, id.as_u32());
@@ -205,11 +234,12 @@ fn emit_function(
         let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
         let helper = jit.declare_func_in_func(helper_id, &mut builder.func);
 
-        // --- entry: jump into the entry `pc`'s block. --------------------------
+        // --- entry: dispatch on the entry `pc` argument. -----------------------
         let entry = builder.create_block();
         builder.switch_to_block(entry);
         builder.append_block_params_for_function_params(entry);
         let rt = builder.block_params(entry)[0];
+        let pc_param = builder.block_params(entry)[1];
         let this_func = builder.ins().iconst(types::I32, i64::from(func_index));
 
         let mut cfg = Cfg {
@@ -220,8 +250,7 @@ fn emit_function(
             dispatch: None,
             dispatch_emitted: false,
         };
-        let start = block_for(&mut builder, &mut cfg, entry_pc);
-        builder.ins().jump(start, &[]);
+        emit_pc_entry_dispatch(&mut builder, &mut cfg, code_len, pc_param, entry_pc, candidates);
 
         // --- one round per reachable `pc`, in worklist order. ------------------
         //
@@ -259,7 +288,7 @@ fn emit_function(
                 Some(dispatch) if !cfg.dispatch_emitted => {
                     cfg.dispatch_emitted = true;
                     builder.switch_to_block(dispatch);
-                    emit_dispatch_chain(&mut builder, &mut cfg, code_len, &candidates);
+                    emit_dispatch_chain(&mut builder, &mut cfg, code_len, candidates);
                 }
                 _ => break,
             }
@@ -773,6 +802,62 @@ fn emit_dispatch_chain(
     // No candidate matched (or there are none): the driver takes the interpreter's
     // exact step for that address.
     builder.ins().return_(&[word]);
+}
+/// Emit the function-prologue **pc dispatch**: transfer control to the block for the
+/// entry `pc` the compiled function was called with.
+///
+/// The native function's second argument is the entry `pc` the driver asked for
+/// ([`CompiledEntries::enter`](super::CompiledEntries) only ever passes a member of
+/// [`candidate_pcs`]), so the prologue compares it against the candidate set:
+///
+/// * the function's `entry_pc` is checked **first** — a one-comparison fast path, the
+///   common case (the driver enters a function at its entry `pc`, and a cross-function
+///   `Step::Goto`/non-tail-call return that lands in a **different** function also
+///   starts a fresh native call at that function's entry `pc`);
+/// * every other candidate (a same-function IR block start, or a non-tail-call
+///   continuation `call_site + 1`) follows in the candidates' sorted order, so the
+///   driver can natively pick up a cross-function call return;
+/// * the final fallback jumps to `block_for(entry_pc)` — **defensive and unreachable**,
+///   because `enter` guarantees membership, so a `pc` outside the set never arrives.
+///
+/// This is deliberately separate from [`emit_dispatch_chain`]: that chain folds a word
+/// a *helper step* returned, whereas this folds the entry-`pc` *argument*. They share
+/// the candidate set but neither shares the other's mechanism, so the helper-word
+/// chain keeps its existing behaviour byte-for-byte.
+///
+/// The current block must already be the function's entry block when this is called.
+fn emit_pc_entry_dispatch(
+    builder: &mut FunctionBuilder,
+    cfg: &mut Cfg,
+    code_len: usize,
+    pc_value: Value,
+    entry_pc: u32,
+    candidates: &[u32],
+) {
+    let pc = builder.ins().ireduce(types::I32, pc_value);
+    let entry_block = block_for(builder, cfg, entry_pc);
+    let is_entry = builder.ins().icmp_imm(IntCC::Equal, pc, i64::from(entry_pc));
+    let mut cursor = builder.create_block();
+    builder
+        .ins()
+        .brif(is_entry, entry_block, &[], cursor, &[]);
+
+    for &candidate in candidates {
+        if candidate == entry_pc || candidate as usize >= code_len {
+            continue;
+        }
+        builder.switch_to_block(cursor);
+        let constant = builder.ins().iconst(types::I32, i64::from(candidate));
+        let hit = builder.ins().icmp(IntCC::Equal, pc, constant);
+        let block = block_for(builder, cfg, candidate);
+        let miss = builder.create_block();
+        builder.ins().brif(hit, block, &[], miss, &[]);
+        cursor = miss;
+    }
+
+    builder.switch_to_block(cursor);
+    // Defensive fallback (unreachable — `enter` guarantees membership).
+    builder.ins().jump(entry_block, &[]);
 }
 /// Every `pc` a helper step inside `function` may continue at natively.
 ///
