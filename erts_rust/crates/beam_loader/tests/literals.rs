@@ -109,7 +109,9 @@ use beam_codec::{
 };
 use beam_loader::container::{parse as parse_container, ChunkId};
 use beam_loader::Module;
-use beam_term::prelude::{atom_val, cmp, is_atom, is_nil, signed_value, Eterm};
+use beam_term::prelude::{
+    atom_val, cmp, is_atom, is_boxed, is_list, is_nil, signed_value, Eterm,
+};
 
 use crate::common::raw_map_key_names;
 
@@ -506,6 +508,119 @@ fn the_fixture_covers_every_required_literal_kind() {
     assert_eq!(list_elements(tuple_element(l[8], 1).unwrap()).len(), 3);
     assert_eq!(float_value(tuple_element(tuple_element(l[8], 2).unwrap(), 1).unwrap()).unwrap(), 1.5);
     assert_eq!(flatmap_parts(tuple_element(l[8], 3).unwrap()).unwrap().0.len(), 1);
+}
+
+/// Recursively asserts every BOXED/LIST word reachable from `term` carries
+/// `TAG_LITERAL_PTR`, returning (through `checked`) how many such words were seen.
+///
+/// A compound word is checked here and its term children walked: a cons cell
+/// (`CAR`/`CDR`), a tuple (every element) or a map (every key/value). A boxed term
+/// with no *term* children — a binary, float, bignum, fun, … — has its payload
+/// words, never pointers, so the walk stops there. An immediate (small int, atom,
+/// `NIL`) carries no pointer and is a leaf: [`beam_term::literal::is_literal`] is a
+/// plain bit test that is only meaningful on a BOXED/LIST word, so it is
+/// deliberately not applied to an immediate.
+fn assert_tagged(module: &Module, term: Eterm, checked: &mut usize) {
+    if is_list(term) {
+        assert!(
+            beam_term::literal::is_literal(term),
+            "a cons-cell literal word must carry TAG_LITERAL_PTR"
+        );
+        *checked += 1;
+        assert_tagged(module, cons_head(term).expect("a cons head"), checked);
+        assert_tagged(module, cons_tail(term).expect("a cons tail"), checked);
+        return;
+    }
+    if is_boxed(term) {
+        assert!(
+            beam_term::literal::is_literal(term),
+            "a boxed literal word must carry TAG_LITERAL_PTR"
+        );
+        *checked += 1;
+        if let Ok(pairs) = beam_term::map::map_pairs(term, &module.atom_table) {
+            for (key, value) in pairs {
+                assert_tagged(module, key, checked);
+                assert_tagged(module, value, checked);
+            }
+        } else if let Ok(arity) = tuple_arity(term) {
+            for index in 0..arity {
+                assert_tagged(
+                    module,
+                    tuple_element(term, index).expect("a tuple element"),
+                    checked,
+                );
+            }
+        }
+        // A binary/float/bignum/fun box holds payload words, not terms: leaf.
+        return;
+    }
+    // An immediate: no pointer, no literal bit — nothing to assert or walk.
+}
+
+/// The `LitT` decode **literal-tags** the arena: every boxed/list word — the roots
+/// *and* every compound child reachable through them — carries `TAG_LITERAL_PTR`
+/// (the safe form of the C load-time `erts_set_literal_tag`), while the graph's
+/// immediates stay intact and decode back to the expected values.
+///
+/// The committed `coverage.beam` `LitT` holds `{error,division_by_zero}`,
+/// `{error,badarith}` and `#{a => 1, b => 2}`, so the three roots are all compound
+/// (two 2-tuples and a flat map).
+#[test]
+fn the_literal_area_words_carry_the_literal_tag() {
+    let module = load(include_bytes!("fixtures/coverage.beam"));
+    assert_eq!(module.literals().len(), 3, "the fixture's LitT pool");
+
+    let mut checked = 0;
+    for index in 0..module.literals().len() {
+        assert_tagged(&module, literal(&module, index), &mut checked);
+    }
+    // The pool's three roots are each one compound word with only immediate
+    // children, so exactly three words were checked — the assertion above cannot
+    // have passed vacuously.
+    assert_eq!(checked, 3, "three compound literal roots, no nested compounds");
+
+    // Tagging must not corrupt the graph: the immediates still read back as the
+    // expected atoms/ints (the literal bit lives *inside* the pointer tag, so
+    // address resolution is unchanged).
+    let first = literal(&module, 0);
+    assert_eq!(tuple_arity(first).unwrap(), 2);
+    assert_eq!(atom_name(&module, tuple_element(first, 0).unwrap()), "error");
+    assert_eq!(
+        atom_name(&module, tuple_element(first, 1).unwrap()),
+        "division_by_zero"
+    );
+
+    let second = literal(&module, 1);
+    assert_eq!(tuple_arity(second).unwrap(), 2);
+    assert_eq!(atom_name(&module, tuple_element(second, 0).unwrap()), "error");
+    assert_eq!(atom_name(&module, tuple_element(second, 1).unwrap()), "badarith");
+
+    let (keys, values) = flatmap_parts(literal(&module, 2)).expect("a flat map literal");
+    assert_eq!(keys.len(), 2);
+    assert_eq!(atom_name(&module, keys[0]), "a");
+    assert_eq!(signed_value(values[0]), 1);
+    assert_eq!(atom_name(&module, keys[1]), "b");
+    assert_eq!(signed_value(values[1]), 2);
+}
+
+/// The literal bit reaches **nested** children, not just the roots: the committed
+/// `literals_verbatim.beam` pool carries tuples holding nested tuples/lists/maps,
+/// lists of lists, and maps with tuple/binary keys, so the recursive walk must
+/// visit strictly more compound words than there are roots.
+#[test]
+fn nested_literal_children_carry_the_literal_tag() {
+    let module = load(VERBATIM_BEAM);
+    let roots = module.literals().len();
+    assert!(roots > 0, "the fixture has a non-empty literal pool");
+
+    let mut checked = 0;
+    for index in 0..roots {
+        assert_tagged(&module, literal(&module, index), &mut checked);
+    }
+    assert!(
+        checked > roots,
+        "the nested pool must tag more than its {roots} root words (checked {checked})"
+    );
 }
 
 // ---------------------------------------------------------------------------
