@@ -32,7 +32,7 @@
 //! | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` directories) |
 //! | `-pz Dir` | add `Dir` to the code path (searched after) |
 //! | `+S N[:N]` | normal scheduler count (the first number) |
-//! | `-smp enable\|disable\|auto` | SMP scheduler model (only `disable` changes behaviour) |
+//! | `-smp enable\|disable\|auto` | SMP scheduler model (`disable` is refused in favour of `+S 1`; every other value leaves SMP on) |
 //! | `+A N` | async-thread pool size, preserved verbatim in `extra_emulator_flags` |
 //! | `+P N` | maximum number of processes |
 //! | `+hms N` | minimum heap size, in words (rounded through the growth table) |
@@ -67,9 +67,13 @@
 //!
 //! # Init arguments (`init:get_argument/1`), exactly as the oracle
 //!
-//! A switch that is **not** in the table above is **not** a usage error (real `erl`
-//! accepts unmodeled switches: `erl -noshell --nope -eval 'halt(0).'` exits 0), and
-//! only a **stray positional argument** is a usage error.
+//! A **`-`-switch** that is not in the table above is **not** a usage error (real `erl`
+//! accepts unmodeled `-`-switches: `erl -noshell --nope -eval 'halt(0).'` exits 0), so it
+//! is recorded and ignored. An **unrecognized `+`-flag** is different: the launcher
+//! rewrites it to `-X` for the emulator, which prints `unknown flag -X` and exits **1**
+//! (a *recognized* spelling such as `+Weird` stays accepted). A **plain positional
+//! argument** is accepted and ignored, never a usage error (the launcher forwards it to
+//! `init`, which accepts it).
 //!
 //! Which switches become **init arguments** follows the oracle exactly: a **`-`-switch**
 //! (recognized or not) is recorded, while a **`+`-flag** and the `-eval`/`-s`/`-run`
@@ -102,7 +106,7 @@
 //! |---|---|---|
 //! | `0` | success | — |
 //! | `1` | genuine runtime error (a load/execute/BIF failure), **and** a switch value the oracle's emulator/launcher rejects (`+t 2`, `+P 0`, `+sbt zz`, a `-env` with no operand, an unreadable `-config`) | the oracle-shaped one-line diagnostic, or `beam_rt: <error>` |
-//! | `2` | malformed invocation / usage error (a missing operand of a recognized switch, a stray positional argument, a malformed `run` spec) | `beam_rt: <error>` then [`USAGE`] |
+//! | `2` | malformed invocation / usage error (a missing operand of an ordinary `-`-switch, a malformed `run` spec) | `beam_rt: <error>` then [`USAGE`] |
 //! | `3` | unsupported (capability gap) | exactly one line, `beam_rt: unsupported: <reason>` |
 //!
 //! A malformed value of an **emulator switch** is exit 1, not exit 2: the oracle's
@@ -156,7 +160,8 @@ Switches:
   -pz DIR [DIR...]          add DIR(s) to the tail of the code path (after the system
                             directories; a missing dir is filtered out)
   +S N[:N]                  normal schedulers (total, and optionally the online count)
-  -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
+  -smp enable|disable|auto  SMP scheduler model (SMP stays on; 'disable' is refused in
+                            favour of +S 1)
   +A N                      async-thread pool size (preserved verbatim)
   +P N                      maximum number of processes (legacy, or 1024..=134217727)
   +Q N                      maximum number of ports (legacy, or 1024..=134217727)
@@ -292,17 +297,22 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 /// `-eval`/`-s`/`-run` Start instructions, are consumed by the emulator/`init` and are
 /// **not** init arguments (verified against OTP 29.1.1 / erts-17.1, where
 /// `init:get_argument('S'|'Q'|eval|s|run)` is the bare atom `error`). An unmodeled
-/// switch is never a usage error.
+/// `-`-switch is never a usage error.
 ///
 /// # Errors
 ///
 /// A message-carrying [`beam_common::BeamError`] naming the offending switch or
-/// argument. A **missing operand of a recognized switch**, a **malformed `run`
-/// spec/argument** and a **stray positional argument** are genuine usage errors
-/// (reported with [`USAGE`], exit code [`EXIT_USAGE`]). A **rejected emulator switch
-/// value** is *not* a usage error: [`error::bad_switch_value`] returns the
-/// flag-rejection kind ([`error::flag_rejected_diagnostic`]) and [`run`] reports it as
-/// exit 1 with a single diagnostic line and no [`USAGE`] block, matching the oracle. A malformed
+/// argument. A **missing operand of an ordinary `-`-switch** and a **malformed `run`
+/// spec/argument** are genuine usage errors (reported with [`USAGE`], exit code
+/// [`EXIT_USAGE`]). A **rejected emulator switch value** is *not* a usage error:
+/// [`error::bad_switch_value`] returns the flag-rejection kind
+/// ([`error::flag_rejected_diagnostic`]) and [`run`] reports it as exit 1 with a single
+/// diagnostic line and no [`USAGE`] block, matching the oracle. The same exit 1 covers the
+/// launcher's own rejections — an **unrecognized `+`-flag** ([`error::unknown_flag`]), a
+/// **missing operand of a `+`-switch** or of `-name`/`-sname`
+/// ([`error::missing_switch_operand`]) and the **refused `-smp disable`**
+/// ([`error::smp_disable_not_supported`]). A **plain positional argument** is accepted and
+/// ignored, never a usage error. A malformed
 /// `-eval` expression is *not* decided here — it is a capability gap detected when the
 /// expression is evaluated (exit code [`EXIT_UNSUPPORTED`], see [`crate::eval`]).
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
@@ -968,14 +978,14 @@ fn apply_env_switches(args: &[String]) {
 
 /// Parses the `-smp` switch, returning the index of the next switch.
 ///
-/// `-smp` selects the runtime's scheduler model: `disable` turns SMP off
-/// ([`FeatureFlags::smp`](beam_common::FeatureFlags::smp) becomes `false`), while
-/// `enable`/`auto` leave it on (the default). The value is **optional** and any other
-/// value is accepted and recorded but changes nothing — this matches the oracle, which
-/// accepts `-smp` (with or without a value) and ignores every value but `disable`
-/// (`erl -noshell -smp bogus -eval 'halt().'` exits 0). The one documented divergence is
-/// `-smp disable`: real `erl` rejects it outright (`Argument '-smp disable' not supported.
-/// Use "+S 1" instead.`) whereas this runtime accepts it as the honest "SMP off" request.
+/// `-smp` selects the runtime's scheduler model. `disable` (and its one-token spelling
+/// `-smpdisable`) is **refused** exactly as the launcher refuses it — `Argument '-smp
+/// disable' not supported. Use "+S 1" instead.` (`erlexec.c:511-514`, `usage_notsup`),
+/// exit **1** — so SMP always stays on here. `enable`/`auto` and any other value are
+/// accepted and recorded but leave SMP on — this matches the oracle, which accepts `-smp`
+/// (with or without a value) and refuses only `disable` (`erl -noshell -smp bogus -eval
+/// 'halt().'` exits 0). The value is **optional**: a missing value (or one that itself
+/// looks like a switch) leaves SMP on too.
 ///
 /// The switch is recorded as an init argument exactly like every other switch, so a
 /// program can still observe its own command line (`init:get_argument(smp)`).
