@@ -6650,41 +6650,30 @@ run(N, Tab, Acc) ->
 "#
     )
 }
-/// **The deciding gate for `copy_bound/ets_copy`: an untagged literal-area pointer in a root
-/// declines every collection.**
+/// **A tagged literal-area root passes the valve: the constant-payload loop collects and its
+/// `collections` scale with `N`.**
 ///
-/// KNOWN GAP — ESCALATED, NOT A FIX. This test asserts the **current, declined** behaviour so
-/// the gap is visible and cannot silently get worse; when the escalation lands the `const`
-/// assertions below must be **flipped** (see the crate report / the escalation note).
+/// The loader's `LiteralArea::decode` literal-tags the decoded arena with
+/// [`beam_term::literal::tag_literal_area`] — the safe form of the C load-time step
+/// `erts_set_literal_tag` (`erts/emulator/beam/erl_term.c:36`) — so every boxed/list word a
+/// module's `LitT` chunk lowers to, and the literal roots the engine is handed, carry the
+/// literal bit **set**.
 ///
-/// The chain, proven by instrumentation of [`ensure_heap_full`] (see the escalation note):
+/// [`super::gc::root_is_unscanned`] classifies a term by the C's own `erts_is_literal` rule (a
+/// bare bit test), so a **tagged** literal-area pointer in a root is recognized as a literal —
+/// an immutable, never-moved region the collector does not scan — rather than as a container in
+/// a region the collector does not scan, and the valve passes. The loop's `test_heap`/
+/// `test_heap_full` sites therefore collect on schedule.
 ///
-/// 1. [`beam_loader`]'s `LiteralArea::decode` lowers the `LitT` chunk into a private immutable
-///    heap and **never calls `beam_term::literal::set_literal_tag`** — the C step
-///    `erts_set_literal_tag` (`erts/emulator/beam/erl_term.c`) that ORs `TAG_LITERAL_PTR` into
-///    every boxed/list literal word. So a literal handed to the engine carries the literal bit
-///    **clear**.
-/// 2. [`super::gc::root_is_unscanned`] classifies a word by the C's own
-///    `erts_is_literal` rule (a bare bit test), so an untagged literal-area map is read as a
-///    **container in a region the collector does not scan** — which is exactly what the valve
-///    must decline.
-/// 3. The loop's `test_heap,3,1`/`test_heap,5,1` therefore declines on **every** iteration
-///    (the payload literal is in `x(0)`), while the only allocation that *creates* retention —
-///    the registered-BIF copy-out's no-relocation `Process::grow_nursery` — keeps retiring a
-///    whole nursery space, so the retired chain grows by 94 words/iteration and nothing ever
-///    collapses it.
-///
-/// The heap-built twin (`payload(N)/1`) has no literal in a register, so its valve passes, its
-/// collection-debt term fires and its `collections` scale with `N`. **The two fixtures differ in
-/// exactly that one way**, so this test is the discriminating pair the escalation rests on.
-///
-/// Instrumented proof of the gate: `PROBE VALVE-DECLINE pid=ProcessId { number: 2, serial: 0 }
-/// x[0]=Eterm(127376308180258) raw=0x73d91b9a1522 lit=false heap=[0x73d91b9a5ae8,0x73d91b9a6450)
-/// in_literal_of="gcab_lit"(true)` — the blocking root is a pointer inside the running module's
-/// own literal area with the literal bit clear, and sweeping every loaded module's literal heap
-/// showed it is inside exactly one of them.
+/// `gclit`'s `payload/0` takes no argument, so the compiler folds it into the module's literal
+/// area and the loop leaves a literal-area pointer live in `x(0)`; its `collections` are
+/// non-zero and scale with `N`. The heap-built twin ([`gc_ab_module`]'s `payload(N)/1`) cannot
+/// fold — the payload holds the loop counter — so it builds on the young heap; this test is the
+/// discriminating pair, **the two fixtures differing in exactly one way: whether the term the
+/// loop leaves live in a register is a literal-area pointer or a young-heap one**. Now that the
+/// literal is tagged, the two are indistinguishable in collection count, which is the point.
 #[test]
-fn an_untagged_literal_root_declines_the_collection_until_the_loader_tags_literals() {
+fn a_tagged_literal_root_is_scanned_and_the_loop_collects() {
     let Some(erlc) = resolve_erlc() else {
         skip_loudly("gc-literal-root", "erlc was not found beside $ERTS_ORACLE or on $PATH");
         return;
@@ -6702,13 +6691,13 @@ fn an_untagged_literal_root_declines_the_collection_until_the_loader_tags_litera
     let lit_large = gc_ab_run(&dir.join("gclit.beam"), "run", 40_000);
     let heap_small = gc_ab_run(&dir.join("gcab_free.beam"), "run", 1_000);
     let heap_large = gc_ab_run(&dir.join("gcab_free.beam"), "run", 40_000);
-    // Both loops compute the same answer; neither is corrupted — this is a *retention* gap,
-    // never a wrong result.
+    // Both loops compute the same answer; neither is corrupted — a literal root only affects
+    // *retention*, never the result.
     assert_eq!(signed_value(lit_small.value), 1_000);
     assert_eq!(signed_value(lit_large.value), 40_000);
     assert_eq!(signed_value(heap_large.value), 40_000);
-    // The control: a heap-built payload leaves no unscanned root, so the debt term fires and
-    // the collections really scale.
+    // The control: a heap-built payload leaves no literal root, so the debt term fires and the
+    // collections really scale.
     assert_eq!(heap_small.stats.pinned, 0);
     assert!(
         heap_large.stats.collections > heap_small.stats.collections * 4,
@@ -6716,13 +6705,32 @@ fn an_untagged_literal_root_declines_the_collection_until_the_loader_tags_litera
         heap_small.stats.collections,
         heap_large.stats.collections
     );
-    // The gate. (`valve_trips` stays 0 and `fallbacks` stays 0: a decline on the full-root door
-    // records `foreign_reachable`, never a fallback — which is why `collections` alone is the
-    // discriminator.)
+    // Not the post-slice float pin: the constant-payload loop is float-free, so it is never
+    // pinned and never falls back — `collections` alone is the discriminator.
     assert_eq!(
         lit_large.stats.pinned, 0,
         "not the post-slice float pin: the constant-payload loop is float-free",
     );
     assert_eq!(lit_large.stats.fallbacks, 0);
-    assert_eq!(lit_large.stats.collections, 0, "KNOWN GAP: flip this once beam_loader sets TAG_LITERAL_PTR on decoded literals (the constant-payload loop never collects, because its live literal root is untagged)");
+    // The pin: a tagged literal-area root is recognized as a literal, so the valve passes and
+    // the loop's heap-admission points really collect. (Before the loader tagged the arena the
+    // same loop's live literal root read as an unscanned container and every collection was
+    // declined, leaving `collections == 0`.)
+    assert!(
+        lit_large.stats.collections > 0,
+        "a tagged literal root must collect (a literal is a never-moved region the collector \
+         does not scan, so the valve passes): lit_large={} lit_small={}",
+        lit_large.stats.collections,
+        lit_small.stats.collections,
+    );
+    // And the literal-rooted loop scales with `N` exactly like the heap-built control.
+    assert!(
+        lit_large.stats.collections > lit_small.stats.collections * 4,
+        "the literal-rooted loop's collections must scale with N like the heap-built control: \
+         lit_small={} lit_large={} (heap_small={} heap_large={})",
+        lit_small.stats.collections,
+        lit_large.stats.collections,
+        heap_small.stats.collections,
+        heap_large.stats.collections,
+    );
 }
