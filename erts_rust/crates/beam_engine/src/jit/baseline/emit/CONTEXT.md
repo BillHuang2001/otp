@@ -12,7 +12,9 @@ map) and `compile_function`/`emit_function` (the **lazy** layout's per-function 
 estimates; `regalloc.rs` picks the cached x-registers and derives each block's Y/refresh gates;
 `liveness.rs` computes the per-pc fill sets; `operands.rs` reads operand shapes and owns the shared
 guarded-Y access plus the `Loc` location abstraction; `r#move.rs`/`test.rs`/`select.rs`/`arith.rs`/
-`compare.rs`/`aggregate.rs` each lower one instruction group; `frame.rs` lowers the frame-discipline
+`compare.rs`/`aggregate.rs`/`bif.rs` each lower one instruction group (a `bif.rs` accessor that is a
+reused aggregate read emits that read's own bytes; the helper-evaluated value accessors emit a plain
+helper call); `frame.rs` lowers the frame-discipline
 trio that ends a function body (`deallocate`/`return`/`deallocate_return`); `heap.rs` lowers the heap
 / frame-admission family (`allocate`/`allocate_heap`/`test_heap`/`trim`); `family.rs` emits the shared
 helper arm for every instruction the interpreter routes to `crate::families::dispatch`; `link.rs`
@@ -63,8 +65,10 @@ Logical groups:
 | Cons readers | `GetList`,`GetHd`,`GetTl` | `aggregate.rs::try_inline_get_{list,hd,tl}` via `emit_list_read` | `get_{list,hd,tl}_shape` -> `shape`; source and every destination are a `Loc` |
 | Tuple read | `GetTupleElement` | `aggregate.rs::try_inline_get_tuple_element` via `emit_tuple_read` | `get_tuple_element_shape` (source and destination are a `Loc`) |
 | Tuple write | `SetTupleElement` | `aggregate.rs::try_inline_set_tuple_element` via `emit_tuple_write` | `set_tuple_element_shape` (the tuple is a `Loc`) |
-| Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` (x-register **or Y-slot** operand/destination; a Y access carries a run-time frame-window guard) |
+| Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` (x-register **or Y-slot** operand/destination; a Y access carries a run-time frame-window guard). `band`/`bor`/`bsr` are lowered by the same entry (`GcBif` only — the corpus never emits them as `Bif`) |
 | Comparisons | `Bif` (and `GcBif` fallback) | `compare.rs::try_inline_comparison` | `compare.rs::comparison_shape` |
+| BIF accessors | `Bif` (`hd`, `element`, `tuple_size`) | `bif.rs::try_inline_bif` -> the reused `aggregate.rs` cons/tuple read | `bif.rs::bif_shape` (the cons/tuple read shapes; `element/2` additionally needs a **compile-time small-int index `>= 1`**) |
+| BIF value accessors | `Bif` and `GcBif` (`byte_size`, `length`) | `bif.rs::try_inline_bif` -> `emit_helper_call(jit_bif_value)` (`../bif_helper.rs`) | `bif.rs::value_shape` (the operand is re-read and written through the engine's own `read_operand`/`write_operand`) |
 | Frame pop | `Deallocate` | `frame.rs::emit_deallocate` (an `emit_helper_call` to `jit_deallocate`) | always lowered (the instruction's own outcome is the helper's block-ABI word): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
 | Return | `Return` | `frame.rs::emit_return` (an `emit_helper_call` to `jit_return`) | always lowered — a `return` always transfers control, so the block leaves via `emit_word_exit` |
 | Fused frame pop + return | `DeallocateReturn` | `frame.rs::emit_deallocate_return` (an `emit_helper_call` to `jit_deallocate_return`); `emit_block` also fuses a separate adjacent `Deallocate`+`Return` pair into one such call | always lowered — always transfers control, leaves via `emit_word_exit` |
@@ -92,8 +96,10 @@ above do not: `put_list`/`put_tuple2`, `update_record`/`is_any_native_record`/`i
 It routes each to `jit_family`, which runs the identical `crate::families::dispatch` call the
 interpreter's per-instruction step would, so the arm can never produce a different result than the
 step it replaces.
-Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison (the settled corpus emits
-the eight comparison ops as non-collecting `Bif`).
+Note `GcBif` tries arith **then** comparison **then** the BIF accessors; `Bif` tries the comparison
+shape then the BIF accessors. The settled corpus emits the eight comparison ops and `hd`/`element`/
+`tuple_size` as non-collecting `Bif`, and `byte_size`/`length` as collecting `GcBif` (so the value
+accessors are claimed from either variant and the three pure accessors from `Bif` only).
 
 ## Restricted shapes (where each is enforced)
 - **Operand readers** (`operands.rs`): `x_register` accepts only `X(n)` / `Typed{reg:X(n)}` (a `Y`
@@ -159,10 +165,33 @@ the eight comparison ops as non-collecting `Bif`).
   `jit_step_one`); an un-addressable Y index (`operands.rs::y_addressable`) is refused at compile time.
   `FastArith::uses_y` is the emitter's Y-window gate and `FastArith::registers` pushes only x-register
   operands plus an x-register destination, so a Y slot never enters the usage counts.
+  `band`/`bor`/`bsr` join the same predicate (`SmallArith::{And,Or,Bsr}`), reached from the `GcBif` arm
+  only (the corpus never emits them as `Bif`): `band`/`bor` emit a raw **tagged-word** `and_rr`/`or_rr`
+  — exact even for negative smalls, because both operands' low nibble is the small tag, so there is no
+  untag/retag and no range guard — while `bsr` emits untag → `sar_ri` → small-range check → retag and
+  claims only an **immediate small-int constant count in `0..64`** (a register count has no immediate
+  encoding, a negative count is a `bsl` that may overflow to a bignum, and `>= 64` would be masked by
+  the hardware, so all three deopt). A bignum/float/other operand on any of the three deopts.
 - **compare** (`compare.rs::comparison_shape`): only the eight `erlang` comparison ops at arity 2; both
   operands must be `cmp_operand`; a derivable guard; and the module must have both `true` and `false`
   interned (else the whole instruction deopts — a wrong atom is never fabricated). `Fail` is
   deliberately not inspected (the fast path never errors; a guard rejection deopts to the full step).
+- **bif** (`bif.rs::bif_shape` / `value_shape`): only an `erlang` import whose **name** is one of the
+  five lowered accessors and whose arity matches the instruction's, and only an operand shape the
+  lowering can prove. `bif_shape`/`bif_uses_y` are **purely syntactic** (import names + operand kinds,
+  never the register allocation), so `regalloc.rs` and `emit_block` agree. `hd/1` needs a `ListShape`
+  source (`Loc`); `element/2` needs a `TupleReadShape` tuple **and a compile-time small-int index
+  `>= 1`** (`element_index` — a non-immediate index keeps the interpreter's `badarg`); `tuple_size/1`
+  needs a `TupleReadShape` source/destination (its element offset is never read); `byte_size/1`/
+  `length/1` (`value_shape`) need a single argument that `bif_helper.rs::read_is_allocation_free`
+  accepts — only a **non-small `Integer` constant** would make `read_operand` materialize a bignum, and
+  such a shape is not a fast path. The three pure accessors are claimed from `Instr::Bif` only;
+  the two value accessors from **either** `Bif` or `GcBif` (the corpus's `byte_size`/`length` are
+  collecting), and the helper deliberately reproduces no fail label or raise of its own — a shape it
+  cannot serve hands the **whole** instruction to `jit_step_one`. Every rejection branches to the same
+  `emit_step_and_continue`: a non-addressable operand, a non-immediate/`0` index, a non-cons or
+  non-tuple source, an out-of-range element, a non-bitstring, an improper list, an out-of-small-range
+  count. The fast path **allocates nothing and writes no heap word**.
 
 ## Deopt mechanism (three levels)
 1. **Compile-time shape refusal**: a `try_inline_*` returns `Ok(false)` **without emitting a byte**, and
@@ -170,7 +199,7 @@ the eight comparison ops as non-collecting `Bif`).
    `Instr`. `emit_deopt` records the static-census deopt, then runs `emit_step_and_continue`.
 2. **Run-time guard rejection**: an inlined sequence that passed the shape test but whose *runtime* guard
    fails branches to a local `fallback` label that runs `emit_step_and_continue` and then falls through
-   to the rest of the block (`fast_done`). Present in `arith.rs`, `compare.rs`, `test.rs`,
+   to the rest of the block (`fast_done`). Present in `arith.rs`, `compare.rs`, `bif.rs`, `test.rs`,
    `aggregate.rs` (`emit_list_read`/`emit_tuple_read`/`try_inline_select_tuple_arity`), `select.rs`, and
    every guarded Y access (`operands.rs::emit_guarded_y_address`/`_load`/`_store`). `select_val`
    has no fallback (all-immediate alternatives are total).
@@ -295,7 +324,8 @@ Under `#[cfg(test)]` the scan also records live-range statistics on `Allocation`
 structural counters; they hold no production state.
 
 `allocate_registers` also derives `Allocation::y_last` — the highest pc of the block whose instruction
-accesses a Y slot (`arith::uses_y`, the union of every lowering's per-shape Y test) — which is the
+accesses a Y slot (`arith::uses_y`, the union of every lowering's per-shape Y test — including
+`bif::bif_uses_y` for the named-BIF accessors, whose `Value` route is never a Y-window access) — which is the
 compile-time gate for the emitter's prologue publish and its post-helper refresh. A `Y` slot is **not** an
 x-register, so it is neither a candidate nor charged to any live interval, and it never raises
 `highest_native_register`: a stack slot must not refuse native entry (the driver's bound is
@@ -393,10 +423,18 @@ the driver's decoder.
   `TEST_A`/`TEST_T` reused by `select.rs`); `test/refusal_census.rs` -> the test-only refusal
   attribution.
 - `select.rs` -> `SelectPlan`, `select_val_plan`, `try_inline_select_val`.
-- `arith.rs` -> `SmallArith`, `fast_arith`, `FastArith`/`FastDest`/`FastSource`, `uses_y`, `import_names`,
-  `try_inline_gc_bif`, `emit_y_load`/`emit_y_store` (+ the small-int constants).
+- `arith.rs` -> `SmallArith` (`{Add,Sub,Mul,And,Or,Bsr}`), `fast_arith`, `FastArith`/`FastDest`/
+  `FastSource`, `FastArith::shift`, `SHIFT_COUNT_LIMIT`, `integer_value`, `uses_y`, `import_names` (the
+  shared import→name resolver, also reused by `../bif_helper.rs`), `try_inline_gc_bif`,
+  `emit_y_load`/`emit_y_store` (+ the small-int constants).
 - `compare.rs` -> `ComparisonOp`, `comparison_shape`, `cmp_operand`, `comparison_guard`,
   `try_inline_comparison`.
+- `bif.rs` -> the named-BIF fast paths: `Target`/`Inlined`, `classify`, `element_index`, `value_shape`/
+  `value_registers`, the shape predicates `bif_shape`/`bif_uses_y`, the entry `try_inline_bif` and the
+  in-block accessors `try_inline_tuple_size`, plus `ARITY_SHIFT` (the `arity << TAG_IMMED1_SIZE`
+  derivation from a tuple header). The helper-evaluated `Value` route emits
+  `emit_helper_call(jit_bif_value)` + `emit_continue_check`, so it needs no reference-counted operand
+  model of its own.
 - `aggregate.rs` -> `ListShape`/`get_*_shape`/`emit_list_read`, `TupleReadShape`/
   `get_tuple_element_shape`/`emit_tuple_read`, `TupleWriteShape`/`TupleWriteValue`/
   `set_tuple_element_shape`/`emit_tuple_write`/`try_inline_set_tuple_element`,
