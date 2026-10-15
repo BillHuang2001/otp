@@ -162,6 +162,20 @@ pub(super) struct ProcessEngine {
     /// [`Tier::Interpreter`] (its first entry overwrites it), which is also the always-correct
     /// value if a tier were ever read before that entry.
     pub(super) tier: Tier,
+    /// How many of the machine's `refc_binaries` — in reservoir order — have already been
+    /// registered onto this process's own off-heap table.
+    ///
+    /// [`Machine::refc_binaries`](beam_engine::Machine::refc_binaries) is **append-only** and is
+    /// never cleared by [`Machine::reset`](beam_engine::Machine::reset), so the reservoir a later
+    /// slice sees is the earlier slice's reservoir plus whatever that slice built. This cursor
+    /// records the prefix already copied onto the process, so each slice registers only its
+    /// **not-yet-registered suffix** instead of re-walking the whole reservoir.
+    ///
+    /// The value is a *count of reservoir slots* (`0..=all.len()`), held on the engine that is
+    /// removed from and re-inserted into [`RunnerState::engines`](RunnerState::engines) across a
+    /// park/resume, so it survives the whole life of the process. It starts at `0` on a fresh
+    /// engine and only ever grows; the reservoir never shrinks, so the cursor is never stale.
+    pub(super) registered_payloads: usize,
 }
 
 /// The per-pid engine state and recorded outcomes of every process the runtime spawned.
@@ -219,6 +233,8 @@ impl RunnerState {
                 // Only a placeholder: the process's first entry selects the real tier and
                 // writes it here (see the field docs).
                 tier: Tier::Interpreter,
+                // A fresh machine's reservoir is empty, so nothing has been registered yet.
+                registered_payloads: 0,
             },
         );
     }

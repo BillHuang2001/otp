@@ -45,6 +45,34 @@ use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::tier::select_entry_tier;
 
+// The number of off-heap payloads this thread's slices have registered onto a process's
+// off-heap table, for the cursor regression pin (see
+// `super::tests::a_process_registers_each_off_heap_payload_exactly_once_across_slices`).
+//
+// The counter backs a **deterministic** observation of the registration seam: the total number
+// of `register_off_heap_binary` calls the runner makes over a process's whole life is
+// `== the number of distinct payloads it built` under the reservoir cursor, but
+// `>= slices × payloads` under the old whole-reservoir walk. It is **per thread** (not a shared
+// `static`) so a concurrently running unit test's slices cannot perturb this test's count — a
+// shared atomic would make the pin flaky under `cargo test`'s parallel harness.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REGISTERED_PAYLOAD_TOTAL: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The payloads registered on this thread since the last [`reset_registered_payload_total`].
+#[cfg(test)]
+pub(crate) fn registered_payload_total() -> usize {
+    REGISTERED_PAYLOAD_TOTAL.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's registration counter (the pin's "before" reading).
+#[cfg(test)]
+pub(crate) fn reset_registered_payload_total() {
+    REGISTERED_PAYLOAD_TOTAL.with(|counter| counter.set(0));
+}
+
 /// The `beam_process::ProcessRunner` the runtime hands to the scheduler.
 ///
 /// It borrows the runtime (for BIF dispatch, atoms and heaps) and the
@@ -594,16 +622,37 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // alive, so a registration that has not happened yet can never *dangle* a payload; the
         // worst it can do is omit an entry from a roster the process reads back about itself.
         //
+        // # Why the registration advances a cursor instead of re-walking the reservoir
+        //
+        // The reservoir is **append-only** and never cleared, so a later slice's reservoir is an
+        // earlier slice's reservoir plus whatever that slice built. Re-offering the whole
+        // reservoir on every slice would re-offer every already-registered payload on every later
+        // slice, and each offer costs an O(slots) `owned_binary_slot` scan inside
+        // `Process::register_off_heap_binary` before its idempotent drop — Θ(slices × slots) over a
+        // long-lived process, i.e. the quadratic-to-cubic blow-up the `foreign` `enc` workload
+        // showed. The engine's `ProcessEngine::registered_payloads` records the reservoir prefix
+        // already registered, so each slice registers only its **not-yet-registered suffix** and the
+        // total work over the process's whole life is linear in the number of payloads it built.
+        //
+        // The cursor lives on the `ProcessEngine`, which is removed from and re-inserted into
+        // [`RunnerState::engines`](super::entry::RunnerState) at every slice boundary (both park
+        // arms re-insert the **same** mutated engine), so it survives a pre-emption and a
+        // `receive` park: slices 2..N observe the cursor the earlier slices advanced, not the `0`
+        // of a fresh engine. The `min` against `all.len()` keeps the cursor in range even if the
+        // reservoir were ever rebuilt smaller (it cannot shrink today, since `Machine::reset` does
+        // not clear it), so a stale cursor can only skip work, never index out of bounds or
+        // under-register a payload the suffix walk already covered.
+        //
         // # Why over-reporting is the safe and faithful direction
         //
-        // Because the reservoir is never cleared, re-registering the whole of it on every slice
-        // re-lists a payload that `Process::sweep_off_heap_binaries_reachable` pruned at an
-        // earlier rooted collection. That costs nothing: `register_off_heap_binary` is
-        // dedup-by-`data_ptr` and idempotent (re-registering an existing slot drops the surplus
-        // handle), so repeats are cheap and slot-stable. And the over-report itself **mirrors
-        // the oracle**, which likewise lists a dropped binary until a GC collects it — so
-        // listing a payload the never-cleared reservoir still owns is both the safe and the
-        // faithful direction, never a fabricated entry.
+        // A payload registered at the end of the first slice that built it stays registered: the
+        // cursor never un-registers, so the roster `Process::off_heap_binaries` reads back still
+        // lists a payload that `Process::sweep_off_heap_binaries_reachable` pruned at a later
+        // rooted collection. That is harmless — `register_off_heap_binary` is dedup-by-`data_ptr`
+        // and idempotent, so a repeat drops the surplus handle — and the over-report itself
+        // **mirrors the oracle**, which likewise lists a dropped binary until a GC collects it.
+        // Listing a payload the never-cleared reservoir still owns is therefore both safe and
+        // faithful, never a fabricated entry.
         //
         // # Why `Runtime::eval_off_heap` is deliberately NOT registered here
         //
@@ -611,9 +660,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // not this machine's work. Attributing it to this process would fabricate a roster entry
         // for a payload the process never built, so it stays out of this seam entirely.
         if let Some(process) = table.get_mut(pid) {
-            for payload in engine.machine.refc_binaries() {
+            let all = engine.machine.refc_binaries();
+            let start = engine.registered_payloads.min(all.len());
+            for payload in &all[start..] {
                 process.register_off_heap_binary(payload.clone());
             }
+            #[cfg(test)]
+            REGISTERED_PAYLOAD_TOTAL.with(|counter| counter.set(counter.get() + (all.len() - start)));
+            engine.registered_payloads = all.len();
         }
 
         // Pre-emption: the budget ran out at a charging point of this slicing machine
