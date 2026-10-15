@@ -85,7 +85,11 @@ intern is a typed `unsupported`). When the incoming raise carries **no** non-emp
 trace (or an empty one) the latch stays clear and the `raise_snapshot` heuristic
 below is unchanged. The out-of-crate half — `beam_bifs`'s `erlang:raise/3` decoding
 its third argument into `Raise::stacktrace` — is not this family's.
-
+The carve itself (`carve_supplied_frames`) is **also public**: the crate root exposes
+`beam_engine::encode_supplied_stacktrace` (free function) and its `Machine` twin
+(`src/supplied_stacktrace.rs`), both thin wrappers over this one carve, so a host that
+runs no compiled handler — `beam_rt`'s `-eval` tree-walking route — renders the same
+frames through the same code.
 ## The raise's raw trace: `NIL`, or a synthesized callee head item
 C's raw trace is an **opaque object of saved code pointers** (`c_p->ftrace`) with no engine
 equivalent, and the oracle's own cooked `S` for `try ... catch C:R:S -> S end` additionally
@@ -160,6 +164,13 @@ builder, `no_labels`, `exec_one` and `assert_reason_tuple`; several submodules a
   snapshot is cooked rather than the live stack), a snapshot frame resolved in its own
   module context (with a context-`0` frame skipped from a non-zero handler context),
   the source-location item, and the typed errors.
+- `encoder.rs` — the **public supplied-stacktrace encoder**
+  (`crate::encode_supplied_stacktrace` and its `Machine` twin): the cooked
+  `[{M,F,A,Location}]` layout with and without a location (against a hand-built
+  expectation and against the system `erl` oracle's `catch erlang:raise/3` output,
+  skipping loudly when `erl` is absent), that the free function and the `Machine`
+  method agree, that both produce **exactly** the private `carve_supplied_frames`
+  term, and the unresolvable-atom typed `unsupported` error.
 - `end_to_end.rs` — whole synthetic sequences.
 - `cross_module.rs` — **cross-module containment**: one shared `beam_term::AtomTable`
   (`Universe`) so exception *class* atoms compare equal across modules, modules entered

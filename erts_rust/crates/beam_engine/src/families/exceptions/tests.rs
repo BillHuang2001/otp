@@ -140,6 +140,7 @@ fn assert_reason_tuple(
 
 mod callee;
 mod cross_module;
+mod encoder;
 mod end_to_end;
 mod function_clause;
 mod handlers;

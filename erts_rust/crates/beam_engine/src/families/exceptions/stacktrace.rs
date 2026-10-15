@@ -257,7 +257,11 @@ pub(crate) fn symbolic_stacktrace(
 /// reservation; a name the table cannot intern is the typed
 /// [`crate::error::unsupported`], never a substituted atom. The whole list is one
 /// rooted reservation carved node-by-node, exactly like the snapshot path.
-fn carve_supplied_frames(
+///
+/// This is the engine's **single** carve of a supplied trace: the public encoder
+/// ([`crate::encode_supplied_stacktrace`] and its `Machine` twin) reuses it rather
+/// than growing a second layout that could drift.
+pub(crate) fn carve_supplied_frames(
     machine: &mut Machine,
     module: &Module,
     ctx: &mut dyn ExecutionContext,
