@@ -451,3 +451,12 @@ collections**.
 read-only here); `VmRSS_first` is unusable (pure sample-timing noise, 2.4–9.1 MB while `VmHWM` was already
 385 MB); the ~376.5 MiB boot/`VmSize` baseline (peak `VmSize` 1 000 812 kB) dominates at these N; no
 `/usr/bin/time`; raw series/artifacts were kept outside the repository.
+
+## Runtime-shaped dispatch (the break-even through the runtime's own GC doors)
+Source: `../beam_rt/tests/gc_immix_payload.rs` and `../beam_rt/tests/gc_strategy.rs` (crate `beam_rt`,
+outside this crate's own test tree). The same workload driven through `beam_rt`'s own GC doors with a
+runtime-spawned process reproduces the small-object/high-churn verdict exactly at the break-even: with
+`initial_mature_words` **2047** (Copying) vs **2048** (Immix), Immix moves **1.146×** the words for
+**6.57×** the mature occupancy. That is why the automatic rule's default stays Copying and
+`MatureKind::Immix` remains an opt-in — `BEAM_RT_GC_STRATEGY=immix` raises the spawned policy's mature
+generation past the break-even. Load-invariant counts only; timings are not asserted.
