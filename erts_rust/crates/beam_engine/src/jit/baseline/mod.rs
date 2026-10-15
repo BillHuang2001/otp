@@ -200,6 +200,7 @@ use crate::jit::JitBackend;
 use crate::machine::{Machine, RunOutcome};
 use crate::Step;
 
+mod bif_helper;
 mod call;
 mod code;
 mod emit;

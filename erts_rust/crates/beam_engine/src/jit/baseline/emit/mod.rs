@@ -1116,7 +1116,7 @@ fn emit_refresh_y(buffer: &mut CodeBuffer) -> Result<()> {
 /// the caller's continuation check. Passing the helper as a raw pointer keeps the
 /// call sites' own function-pointer types (`StepHelper`, `ExtCallHelper`) as the
 /// type check on its signature.
-fn emit_helper_call(
+pub(super) fn emit_helper_call(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     helper: *const (),
@@ -1317,7 +1317,7 @@ fn emit_receive(
 /// purpose, which is safe because it is never read (a later read through its machine
 /// register makes it live here) and never stored (every store writes exactly the block's
 /// write set, which the fill set always contains).
-fn emit_continue_check(
+pub(super) fn emit_continue_check(
     buffer: &mut CodeBuffer,
     done: CodeLabel,
     allocation: &Allocation,

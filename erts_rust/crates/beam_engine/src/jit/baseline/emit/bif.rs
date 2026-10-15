@@ -58,8 +58,13 @@ use crate::jit::emitter::{CodeBuffer, Label as CodeLabel};
 
 use super::aggregate::{self, ListShape, TupleReadShape};
 use super::arith::import_names;
-use super::operands::Y_ADDR_SCRATCH;
-use super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
+use super::operands::{constant_word, Loc, Y_ADDR_SCRATCH};
+use super::runtime::StepHelper;
+use super::{
+    emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, MOVE_SCRATCH,
+    MOVE_SCRATCH_2,
+};
+use crate::jit::baseline::bif_helper::jit_bif_value;
 
 /// The right shift turning a tuple's header word into its arity's **untagged** value: the
 /// header of an `N`-tuple is `(N << HEADER_ARITY_OFFS) + ARITYVAL_SUBTAG` and a small int
@@ -87,6 +92,11 @@ enum Target<'a> {
     },
     /// `tuple_size/1` over the tuple in this operand.
     TupleSize(&'a Operand),
+    /// `byte_size/1` or `length/1` over the term in this operand — evaluated by the
+    /// native helper [`jit_bif_value`] (`super::super::bif_helper`), whose Rust body is
+    /// the `beam_bifs` ground truth itself (`dimply`/`bit_size` rounded up for
+    /// `byte_size/1`; the proper-list walk for `length/1`).
+    Value(&'a Operand),
 }
 
 /// The accessor shape a lowered `Bif` uses — the aggregate module's own shape types, so a
@@ -96,6 +106,16 @@ enum Inlined {
     Cons(ListShape),
     /// A tuple read ([`TupleReadShape`], the `get_tuple_element` shape).
     Tuple(TupleReadShape),
+    /// A helper call ([`jit_bif_value`]): the block spills, calls the helper and refills
+    /// on its `encode_target(func, pc + 1)` word, so its only x-register traffic is the
+    /// destination it writes (a `Y` slot destination contributes nothing).
+    Value {
+        /// The x-register indices the sequence touches (the destination).
+        touches: Vec<u32>,
+        /// The x-register indices the sequence writes (the destination) — the block
+        /// cache's write set; a missed destination here is a silent wrong result.
+        writes: Vec<u32>,
+    },
 }
 
 impl Inlined {
@@ -104,6 +124,7 @@ impl Inlined {
         match self {
             Inlined::Cons(shape) => shape.registers(),
             Inlined::Tuple(shape) => shape.registers(),
+            Inlined::Value { touches, .. } => touches.clone(),
         }
     }
 
@@ -113,17 +134,52 @@ impl Inlined {
         match self {
             Inlined::Cons(shape) => shape.writes(),
             Inlined::Tuple(shape) => shape.writes(),
+            Inlined::Value { writes, .. } => writes.clone(),
         }
     }
 
     /// Whether the lowered sequence reads the current frame's `Y` window (a `Y` source or
     /// destination), i.e. whether the block must publish/refresh it
     /// ([`super::arith::uses_y`]).
+    ///
+    /// The helper-evaluated accessors are always `false`: [`jit_bif_value`] reads and
+    /// writes `machine.x`/`machine.stack` through the engine's own `read_operand`/
+    /// `write_operand`, which address a `Y` slot in `machine.stack` directly and never
+    /// through the emitted window.
     fn uses_y(&self) -> bool {
         match self {
             Inlined::Cons(shape) => shape.uses_y(),
             Inlined::Tuple(shape) => shape.uses_y(),
+            Inlined::Value { .. } => false,
         }
+    }
+}
+
+/// Whether `source`/`dst` are a shape [`jit_bif_value`] can serve for `byte_size/1` or
+/// `length/1`.
+///
+/// Purely syntactic: the source must be a **pure machine read** the helper can address
+/// (an in-bound `X` register or an addressable `Y` slot) or a **constant** operand
+/// (`small_word`: a small-int `Integer`/`Character`, an `Atom`, or `[]`), and the
+/// destination must be a [`Loc`] the helper can write (an in-bound `X` register or an
+/// addressable `Y` slot). Anything else — a float register, a literal-area pointer, an
+/// out-of-bound register, or a non-small `Integer` constant whose `read_operand` would
+/// materialise a bignum — is not a fast-path shape and keeps today's interpreter step.
+fn value_shape(source: &Operand, dst: &Operand) -> bool {
+    (Loc::of(source).is_some() || constant_word(source).is_some()) && Loc::of(dst).is_some()
+}
+
+/// The `(touches, writes)` x-register sets a [`Target::Value`] lowering charges.
+///
+/// The helper call's own lived registers are never held in a machine register (the spill
+/// writes `machine.x` first and the helper reads it back), so the shape charges exactly
+/// the destination — **including it in the write set is load-bearing**: the block's exit
+/// spill must store the (refilled) cached destination back to `machine.x`, and the
+/// post-helper [`emit_continue_check`] fill set is `(live ∪ written) ∩ slots`.
+fn value_registers(dst: &Operand) -> (Vec<u32>, Vec<u32>) {
+    match Loc::of(dst).and_then(Loc::register) {
+        Some(x) => (vec![x], vec![x]),
+        None => (Vec::new(), Vec::new()),
     }
 }
 
@@ -155,6 +211,11 @@ fn classify<'a>(module: &Module, instr: &'a Instr) -> Option<(Target<'a>, &'a Op
             dst,
         )),
         ("tuple_size", [source]) => Some((Target::TupleSize(source), dst)),
+        // The helper-evaluated value accessors: `byte_size/1` and `length/1`, accepted
+        // only for a shape their Rust body can serve end to end (`value_shape`).
+        ("byte_size" | "length", [source]) if value_shape(source, dst) => {
+            Some((Target::Value(source), dst))
+        }
         _ => None,
     }
 }
@@ -183,6 +244,10 @@ fn shape(module: &Module, instr: &Instr) -> Option<Inlined> {
         }
         Target::TupleSize(source) => {
             Inlined::Tuple(aggregate::get_tuple_element_shape(source, 0, dst)?)
+        }
+        Target::Value(_) => {
+            let (touches, writes) = value_registers(dst);
+            Inlined::Value { touches, writes }
         }
     })
 }
@@ -271,7 +336,49 @@ pub(super) fn try_inline_bif(
             pc,
             highest_touched,
         ),
+        // `byte_size/1`/`length/1` are served by the native helper `jit_bif_value`, whose
+        // Rust body reproduces `beam_bifs`'s own value (or declines to the interpreter's
+        // step, which raises its exact `badarg`/`system_limit`).
+        Target::Value(_) => try_inline_bif_value(buffer, allocation, done, func, pc),
     }
+}
+
+/// Emit the native helper call for `erlang:byte_size/1` / `erlang:length/1`, always
+/// continuing in block on the helper's "advanced by one" word.
+///
+/// [`jit_bif_value`] has [`StepHelper`]'s exact signature, so the sequence is the shared
+/// [`emit_helper_call`] (which **spills the cached x-registers first**, so the helper's
+/// `read_operand` sees the interpreter's exact live `machine.x`) followed by the shared
+/// [`emit_continue_check`]:
+///
+/// * `encode_target(func, pc + 1)` — the value is in the destination (written through
+///   `write_operand`) **or** the interpreter's own step ran the instruction and advanced
+///   by one (a declined shape) — the emitted code refills the cached registers the
+///   continuation can still observe (the destination among them, being in the block's
+///   write set) and continues in block;
+/// * any other word — the folded `Step` of the interpreter's own step (the `ERROR` of a
+///   propagating `badarg`/`system_limit`, a `Goto`, an `ENTER`, the `Wait` bit, `HALT`) —
+///   leaves the block with that word in `rax`, exactly as a deopt's.
+///
+/// Nothing here allocates: the accepted shapes are only ones whose `read_operand` is a
+/// pure machine read (`value_shape`), and the helper declines a non-small `Integer`
+/// constant to the interpreter.
+fn try_inline_bif_value(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+) -> Result<bool> {
+    let helper: StepHelper = jit_bif_value;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[i64::from(func), i64::from(pc)],
+    )?;
+    emit_continue_check(buffer, done, allocation, func, pc)?;
+    Ok(true)
 }
 
 /// Emit `erlang:tuple_size/1` natively, or report that the block must helper it
