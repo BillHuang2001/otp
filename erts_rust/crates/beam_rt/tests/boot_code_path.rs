@@ -42,7 +42,11 @@
 //!    ([`a_pz_directory_is_on_the_code_path_on_the_boot_route`],
 //!    [`pa_precedes_pz_on_the_boot_route`]);
 //! 3. the very same directory is honoured on the ordinary `-eval` route, so the two routes
-//!    cannot drift apart ([`the_same_pa_directory_is_honoured_on_the_eval_route`]).
+//!    cannot drift apart ([`the_same_pa_directory_is_honoured_on_the_eval_route`]);
+//! 4. a `-pa` directory that merely **ends in** `ebin` is an ordinary code-path directory, not
+//!    an installed library's `ebin`
+//!    ([`a_pa_directory_ending_in_ebin_is_an_ordinary_code_path_directory`]) — the scratch
+//!    directory's shape must never repoint the runtime's `<lib>` root at itself.
 //!
 //! # How the observable is produced
 //!
@@ -280,6 +284,69 @@ fn eval_route(program: &Path, fixture: &Fixture, expr: &str, what: &str) -> Outp
     run(program, &args, what)
 }
 
+/// `<program> -noshell -pa <dir> -boot <stem>` — the boot route with an **explicit** `-pa`
+/// directory (the fixture's own [`Fixture::pa`] is not used), the switches handed before
+/// `-boot` exactly as [`boot_route`] hands them.
+fn boot_route_with_pa(program: &Path, fixture: &Fixture, pa: &Path, what: &str) -> Output {
+    let args = vec![
+        "-noshell".to_string(),
+        "-pa".to_string(),
+        pa.display().to_string(),
+        "-boot".to_string(),
+        fixture.boot.display().to_string(),
+    ];
+    run(program, &args, what)
+}
+
+/// Compiles the [`PA_STATUS`] marker into `<fixture root>/scratch/ebin` and returns that
+/// directory: a `-pa` **user** directory that merely *ends in* `ebin` — the shape of a scratch
+/// directory filled by `erlc -o <X>/ebin <X>/ebin/<mod>.erl` (`.` and `.beam` side by side,
+/// no application layout above it).
+fn compile_ebin_shaped_pa(fixture: &Fixture, erlc: &Path) -> Option<PathBuf> {
+    let dir = fixture.root.join("scratch").join("ebin");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        support::skip_loudly(BANNER, &format!("cannot create {}: {error}", dir.display()));
+        return None;
+    }
+    let source = dir.join(format!("{MARKER}.erl"));
+    if let Err(error) = std::fs::write(&source, marker_source(PA_STATUS)) {
+        support::skip_loudly(BANNER, &format!("cannot write {}: {error}", source.display()));
+        return None;
+    }
+    let output = match Command::new(erlc)
+        .arg("+deterministic")
+        .arg("-o")
+        .arg(&dir)
+        .arg(&source)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            support::skip_loudly(BANNER, &format!("cannot run `erlc`: {error}"));
+            return None;
+        }
+    };
+    if !output.status.success() {
+        support::skip_loudly(
+            BANNER,
+            &format!(
+                "`erlc` exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        );
+        return None;
+    }
+    if !dir.join(format!("{MARKER}.beam")).is_file() {
+        support::skip_loudly(
+            BANNER,
+            &format!("`erlc` produced no {}/{MARKER}.beam", dir.display()),
+        );
+        return None;
+    }
+    Some(dir)
+}
+
 /// The marker selected by a boot-route run: `(exit status, what the runtime said)`.
 fn boot_outcome(output: &Output) -> (Option<i32>, String) {
     let said = if output.stderr.is_empty() {
@@ -435,4 +502,85 @@ fn the_same_pa_directory_is_honoured_on_the_eval_route() {
         ),
         None => eprintln!("warning: the oracle could not answer `code:which/1` — not compared"),
     }
+}
+
+/// A `-pa` directory that merely **ends in** `ebin` is an ordinary code-path directory, not an
+/// installed library's `ebin` directory.
+///
+/// The directory is the reported reproducer — a scratch directory compiled with
+/// `erlc -o <X>/ebin <X>/ebin/m.erl`. Read as `<lib>/<app>-<vsn>/ebin` it made the runtime's
+/// `<lib>` root (and with it `code:root_dir/0`, the boot script's `$ROOT`, `app_dir`/`bindir`)
+/// describe the *scratch* directory, and the boot's own `code_server:init` — `{ok, Dirs} =
+/// erl_prim_loader:list_dir(Root ++ "/lib")` — raised `{badmatch, …}`, so the run ended
+/// blocked (`beam_rt: unsupported: opcode: run: process blocked (no message available)`, exit
+/// 3) instead of running anything.
+///
+/// Both routes now complete: the marker resolves from the directory, `code:which/1` names the
+/// file there, and the boot route's exit status is the status that copy halts with — the same
+/// observable as the oracle's.
+#[test]
+fn a_pa_directory_ending_in_ebin_is_an_ordinary_code_path_directory() {
+    let Some(oracle) = support::require_oracle(BANNER) else {
+        return;
+    };
+    let Some(erlc) = resolve_erlc() else {
+        support::skip_loudly(BANNER, "no `erlc` on $PATH (and none beside the oracle)");
+        return;
+    };
+    let Some(fixture) = build_fixture(&erlc, &oracle, "pa_ebin") else {
+        return;
+    };
+    let Some(ebin) = compile_ebin_shaped_pa(&fixture, &erlc) else {
+        return;
+    };
+    let resolved = ebin.join(format!("{MARKER}.beam")).display().to_string();
+
+    // (1) The ordinary `-eval` route: the marker resolves from `<X>/ebin` and the run boots
+    //     and exits 0. A run whose `<lib>` root pointed at the scratch directory could not
+    //     reach this point at all.
+    let expr = format!("io:format(\"~s~n\",[code:which({MARKER})]),halt(0).");
+    let args = vec![
+        "-noshell".to_string(),
+        "-pa".to_string(),
+        ebin.display().to_string(),
+        "-eval".to_string(),
+        expr.clone(),
+    ];
+    let ours = run(&beam_rt(), &args, "beam_rt: -pa <X>/ebin -eval");
+    assert_eq!(
+        ours.status.code(),
+        Some(0),
+        "beam_rt: -pa <X>/ebin -eval must boot and run (it said {:?})",
+        String::from_utf8_lossy(&ours.stderr).trim()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ours.stdout).trim(),
+        resolved,
+        "beam_rt: -eval must resolve the marker from the `<X>/ebin` directory"
+    );
+    match support::oracle_eval(&oracle, Some(&ebin), &expr) {
+        Some(theirs) => assert_eq!(
+            theirs, resolved,
+            "the system erl must resolve the marker from the same `<X>/ebin` directory"
+        ),
+        None => eprintln!("warning: the oracle could not answer `code:which/1` — not compared"),
+    }
+
+    // (2) The boot route: the directory still heads the code path before the script's first
+    //     directive, so the marker it holds is the copy that runs (the [`PZ_STATUS`] copy is
+    //     not on this run's path) — and the oracle exits the same way.
+    let ours = boot_route_with_pa(&beam_rt(), &fixture, &ebin, "beam_rt: -pa <X>/ebin -boot S");
+    let (our_code, our_said) = boot_outcome(&ours);
+    assert_eq!(
+        our_code,
+        Some(PA_STATUS),
+        "beam_rt: -pa <X>/ebin -boot S: expected exit {PA_STATUS} (it said {our_said:?})"
+    );
+    let theirs = boot_route_with_pa(&oracle, &fixture, &ebin, "oracle: -pa <X>/ebin -boot S");
+    let (their_code, their_said) = boot_outcome(&theirs);
+    assert_eq!(
+        their_code,
+        Some(PA_STATUS),
+        "the system erl: -pa <X>/ebin -boot S: expected exit {PA_STATUS} (it said {their_said:?})"
+    );
 }
