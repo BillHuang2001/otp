@@ -85,7 +85,7 @@ All 8 `re:*` keys (`version/0`, `compile/1,2`, `run/2,3`, `internal_run/4`, `ins
 ## Notes for Agents
 - **The `RUNTIME_HOOKS_BIFS` roster is authoritative and current.** It lives in `../hook_sets.rs`, lists exactly the **172** keys that forward to the seam, and is asserted equal to `runtime::register`'s seam roster (every family's `REAL_BIFS` retained out) by `runtime/mod.rs::tests::the_family_key_counts_are_pinned`. `beam_rt::needs_runtime_hooks` (and its `RuntimeContext::uses_runtime_hooks`) delegates to it verbatim. The per-family doc rows in `../hook_sets.rs` and the crate `../CONTEXT.md` must track the roster if it changes.
 - **`beam_rt`'s `RuntimeHooks` bridge serves `erlang:function_exported/3` from registry membership** (`crates/beam_rt/src/context/runtime_hooks.rs`; it is NOT one of the native floor's 25 `erlang` keys) rather than the `bif.tab`-declaration membership `erlang:is_builtin/3` reproduces — the same wrong-value class (a stdlib fast path is not "exported" in the oracle's sense).
-- **`beam_rt/src/context/CONTEXT.md` describes this node's seam width as "~47 keys of the 195-key roster"** — both figures are stale (the roster is 172 and the bridge serves 32); a sibling-crate doc fix, outside this node's edit scope.
+- **`beam_rt/src/context/CONTEXT.md` describes this node's seam width as "~47 keys of the 195-key roster"** — both figures are stale (the roster is 172 and the bridge serves 33); a sibling-crate doc fix, outside this node's edit scope.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only; a missing/incomplete seam is the typed `unsupported_bif` capability gap, never a fabricated value and never `undef`.
