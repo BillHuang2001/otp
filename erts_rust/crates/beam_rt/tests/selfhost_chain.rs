@@ -311,6 +311,25 @@ const B_EXPECTED: &str = "non_existing|{ok,ordsets}|true|true|{error,sticky_dire
 /// matches the oracle's (the module would then load from the added directory instead of being
 /// refused) — read the value, not just the assertion, before changing anything.
 ///
+/// # Known gap: the `code:delete/1` route is NOT part of this chain
+///
+/// The way to get *past* the sticky refusal is `code:unstick_mod/1` + `code:delete/1`, and that
+/// route **diverges today** — a capability gap in `erlang:delete_module/1` (registered as a
+/// known-unimplemented `erlang` BIF, so it raises `unsupported: erlang:delete_module/1`). Measured
+/// on this host with `U = code:unstick_mod(ordsets), D = (catch code:delete(ordsets)),
+/// L = code:load_file(ordsets), W = code:which(ordsets)`:
+///
+/// * `beam_rt`: `U` = `true`, then the live `code_server` process **dies** on the raise
+///   (`kernel_sup` logs `child_terminated` → `reached_max_restart_intensity`), the caller's
+///   `catch` yields `D` = `{'EXIT',{'DOWN',code_server,{delete,ordsets}}}`, and `L` stays
+///   `{error,sticky_directory}`;
+/// * system `erl`: `D` = `true` and `L` = `{module,ordsets}`.
+///
+/// So this suite deliberately pins the **plain** `code:load_file/1` answer (which the two
+/// runtimes share) and never drives `code:delete/1`; the gap is `beam_rt`'s (a `src/` BIF
+/// surface), reported rather than papered over. Adding `code:delete/1` to the probe above would
+/// turn this test red on a real divergence — do that when the BIF is implemented, not before.
+///
 /// Measured wall time: ~1.5–2.2 s for the whole test on this host — the whole-process start-up
 /// plus the in-process `ordsets.erl` compile, the directory-only compile and both probes — of
 /// which the oracle's own invocation is ~0.3 s (host load moves the compile's share; see
