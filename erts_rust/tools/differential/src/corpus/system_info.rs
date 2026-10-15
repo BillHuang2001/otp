@@ -58,19 +58,24 @@
 //!
 //! # `fun_info`, the wider `system_info` keys, bulk `process_info` and `statistics` (A.8)
 //!
-//! Three more veins of host-independent introspection, each verified to **agree** with the
+//! Several more veins of host-independent introspection, each verified to **agree** with the
 //! oracle:
 //!
 //! * **`erlang:fun_info/1,2`** (ids under the `fun_info/` prefix) — the arity/type/module/name/env
 //!   of an *external* fun, a *BIF* fun and a *local fun literal*, in both the `element(2, …)`
 //!   extraction form and the `{Key, Value}` tuple form. Only the fields whose answer is a
 //!   structural property of the fun are pinned; the identity fields (`uniq`, `new_index`, `index`,
-//!   `new_uniq`) and a local fun's `env` are **not** (they legitimately differ).
+//!   `new_uniq`) and a local fun's `env` are **not** (they legitimately differ). The whole-proplist
+//!   form of an *external* fun is pinned by its length and its exact sorted key set.
 //! * **the wider `system_info/1` build/state keys** — `update_cpu_info`, `break_ignored`,
 //!   `multi_scheduling(_blockers)`, `emu_type`, `lock_checking`, `port_parallelism`,
 //!   `scheduler_bind_type`, `min_heap_size`, `min_bin_vheap_size`, `dist`, the `{allocator, …}`
 //!   instance lists and `allocated_areas` (list *shape* only — its sizes are volatile). Each is a
 //!   frozen build constant, a documented default, or a type assertion.
+//! * **`process_info/2` defaults that `self()` cannot show** — `registered_name`, `links` and
+//!   `trap_exit` are read from a **freshly spawned** process (unregistered, unlinked, not trapping
+//!   exits), and `current_function` / `initial_call` / `current_location` / `catchlevel` are pinned
+//!   by their **key tag** only, since each value is a per-run or host-specific figure.
 //! * **bulk `process_info/1`** — the no-item-list form returns *a list* whose membership/value for
 //!   the documented items is pinned (`priority` `normal`, `message_queue_len`, `total_heap_size`),
 //!   never its order or length; plus the tagged `max_heap_size` item.
@@ -554,9 +559,10 @@ pub(crate) fn group() -> Vec<Case> {
         // --- process_info/2: the per-process fields pinned through their documented type -----
         // A figure such as the reduction count or a heap size differs per run-time and per VM
         // start, so only its *type* is pinned; `garbage_collection` is a proplist and `status`
-        // is tagged by its own key. `trap_exit`/`registered_name`/`links` are deliberately
-        // absent: the oracle's `-eval` runs in its `init` process (trap_exit true, registered as
-        // `init`, linked to the node), so their values are not host-independent on this path.
+        // is tagged by its own key. `trap_exit`/`registered_name`/`links` are never observed on
+        // `self()` — the oracle's `-eval` runs in its `init` process (trap_exit true, registered
+        // as `init`, linked to the node), so those values are not host-independent on this path;
+        // they are pinned below through a *freshly spawned* process instead.
         case(
             "system_info/process_info_reductions_is_integer",
             "process_info(self(), reductions) is an integer (the exact count is volatile)",
@@ -592,6 +598,57 @@ pub(crate) fn group() -> Vec<Case> {
             "process_info(self(), status) is tagged by its own key",
             "element(1, erlang:process_info(self(), status))",
             "ok status",
+        ),
+        // --- process_info/2 of a *freshly spawned* process ------------------------------------
+        // `self()` cannot expose these: the oracle's `-eval` runs in its `init` process, which
+        // traps exits, is registered as `init` and is linked to the node. A plain `spawn/1`
+        // process is unregistered, unlinked and does not trap exits — the same answer on both
+        // runtimes — so its fields are host-independent. (The spawned process is left parked in
+        // a `receive`; the 5000 ms timeout is never reached.)
+        case(
+            "system_info/process_info_spawned_registered_name",
+            "process_info(P, registered_name) of a fresh spawned process is the bare empty list",
+            "begin P = spawn(fun() -> receive after 5000 -> ok end end), erlang:process_info(P, registered_name) end",
+            "ok []",
+        ),
+        case(
+            "system_info/process_info_spawned_links_length",
+            "a fresh spawned process has no links",
+            "begin P = spawn(fun() -> receive after 5000 -> ok end end), length(element(2, erlang:process_info(P, links))) end",
+            "ok 0",
+        ),
+        case(
+            "system_info/process_info_spawned_trap_exit",
+            "a fresh spawned process does not trap exits",
+            "begin P = spawn(fun() -> receive after 5000 -> ok end end), erlang:process_info(P, trap_exit) end",
+            "ok {trap_exit,false}",
+        ),
+        // --- process_info/2: the items pinned by their own key tag ----------------------------
+        // The *value* of each item below is a per-run figure (the executing function, the start
+        // function, a code location, the catch depth), so only its key tag is pinned.
+        case(
+            "system_info/process_info_current_function",
+            "process_info/2 current_function is a tuple keyed by the atom current_function",
+            "element(1, erlang:process_info(self(), current_function))",
+            "ok current_function",
+        ),
+        case(
+            "system_info/process_info_initial_call",
+            "process_info/2 initial_call is a tuple keyed by the atom initial_call",
+            "element(1, erlang:process_info(self(), initial_call))",
+            "ok initial_call",
+        ),
+        case(
+            "system_info/process_info_current_location",
+            "process_info/2 current_location is a tuple keyed by the atom current_location",
+            "element(1, erlang:process_info(self(), current_location))",
+            "ok current_location",
+        ),
+        case(
+            "system_info/process_info_catchlevel",
+            "process_info/2 catchlevel is a tuple keyed by the atom catchlevel",
+            "element(1, erlang:process_info(self(), catchlevel))",
+            "ok catchlevel",
         ),
         // --- the scheduler / thread introspection keys ($+S / +A observables) ---------------
         // `scheduler_id/0` (the calling scheduler), the dirty-scheduler counts and the
@@ -728,6 +785,18 @@ pub(crate) fn group() -> Vec<Case> {
             "fun_info/2 module of an arity-3 external fun is its defining module",
             "element(2, erlang:fun_info(fun lists:seq/3, module))",
             "ok lists",
+        ),
+        case(
+            "fun_info/external_fun_info_length",
+            "erlang:fun_info/1 of an external fun is a 5-element proplist",
+            "length(erlang:fun_info(fun lists:reverse/1))",
+            "ok 5",
+        ),
+        case(
+            "fun_info/external_fun_info_keys",
+            "erlang:fun_info/1 of an external fun carries exactly the arity/env/module/name/type keys",
+            "lists:sort([element(1,X) || X <- erlang:fun_info(fun lists:reverse/1)])",
+            "ok [arity,env,module,name,type]",
         ),
         case(
             "fun_info/bif_module",
@@ -1063,6 +1132,19 @@ mod tests {
             golden("system_info/process_info_min_heap_size_is_tagged"),
             "ok min_heap_size"
         );
+        // The `process_info/2` items that `self()` cannot show (read from a freshly spawned
+        // process) and the key-tag-only items: the *value* is a per-run figure, the tag is not.
+        for (id, want) in [
+            ("system_info/process_info_spawned_registered_name", "ok []"),
+            ("system_info/process_info_spawned_links_length", "ok 0"),
+            ("system_info/process_info_spawned_trap_exit", "ok {trap_exit,false}"),
+            ("system_info/process_info_current_function", "ok current_function"),
+            ("system_info/process_info_initial_call", "ok initial_call"),
+            ("system_info/process_info_current_location", "ok current_location"),
+            ("system_info/process_info_catchlevel", "ok catchlevel"),
+        ] {
+            assert_eq!(golden(id), want, "case {id}");
+        }
         // The `seq_trace` setters answer the *previous* token, so the goldens are the
         // documented defaults (`{0,0}` / `false`).
         assert_eq!(
@@ -1110,6 +1192,8 @@ mod tests {
             ("fun_info/external_fun_module", "ok lists"),
             ("fun_info/external_fun_name", "ok reverse"),
             ("fun_info/external_fun_env_is_empty", "ok []"),
+            ("fun_info/external_fun_info_length", "ok 5"),
+            ("fun_info/external_fun_info_keys", "ok [arity,env,module,name,type]"),
             ("fun_info/bif_module", "ok erlang"),
             ("fun_info/bif_name", "ok abs"),
             ("fun_info/local_fun_unary_arity", "ok 1"),
