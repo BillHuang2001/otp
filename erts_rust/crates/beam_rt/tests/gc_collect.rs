@@ -33,19 +33,23 @@
 //! 2. **Memory is bounded.** The same loop at a 10× larger `N` collects proportionally more
 //!    often, while the young heap's **capacity and peak occupancy do not scale with `N`** —
 //!    the collector's guarantee.
-//! 3. **Float code collects safely — and the pid is still pinned.** A module doing float
+//! 3. **Float code collects safely — and is never pinned.** A module doing float
 //!    arithmetic across a heap boundary (`gc_floats:l1/1`) must produce **correct** float
 //!    results and **is** collected over: the engine reaches only the **full** heap-admission
 //!    door (`ensure_heap_full`), which publishes the machine's **whole** root set — the FR file
 //!    included — so a live float register is relocated exactly like an x register and the
 //!    collection is FR-safe for **any** module (`gc_stats().collections > 0`). A float register
 //!    still live when a slice ends is caught out of band by the runner's post-slice
-//!    `Machine::fr_mark` check, which pins the process permanently (`gc_stats().pinned >= 1`),
-//!    so the run's later slices are refused.
-//! 4. **A pinned float run needs no arena fallback.** That same pinned float run's allocations
-//!    stay on its **own** young heap for the whole run: `Runtime::gc_stats().fallbacks` stays
-//!    `0` and the program stays correct — never a wrong answer, never a failure. (The arena
-//!    fallback is the reserve for *nested* runs — see the limitation below.)
+//!    `Machine::fr_mark` check, which marks the pid **relocation-exempt for the inter-slice
+//!    window only** — the park publishes that live FR prefix onto the process's root set, the
+//!    next slice's resume clears the mark, and `Runtime::gc_stats().pinned` stays **`0`**, so
+//!    the process collects at its own heap-admission points throughout.
+//! 4. **A float run needs no arena fallback, and scales.** A longer float run collects
+//!    **more** (the loop's collections grow with its iteration count — the plateau the old
+//!    permanent pin produced is gone), its allocations stay on its **own** young heap
+//!    (`Runtime::gc_stats().fallbacks` stays `0`) and the program stays correct — never a wrong
+//!    answer, never a failure. (The arena fallback is the reserve for *nested* runs — see the
+//!    limitation below.)
 //!
 //! # Honest limitation (pinned by these tests, not hidden by them)
 //!
@@ -91,7 +95,8 @@ const GC_INTS_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/
 
 /// The float image: `l1(N)` accumulates `math:sqrt(float(N))`, i.e. float arithmetic across a
 /// heap boundary — a module whose code writes `Machine::fr`, so it collects through the full
-/// door's FR-safe root set and its pid is pinned post-slice once a float register is live.
+/// door's FR-safe root set; a float register live at a slice end opens the inter-slice window's
+/// relocation exemption (cleared at the next resume), never a permanent pin.
 const GC_FLOATS_BEAM: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gc_floats.beam");
 
@@ -344,7 +349,7 @@ fn the_young_heap_stays_bounded_as_the_loop_count_grows() {
     );
 }
 
-/// **Acceptance 3 — a float-using module is collected over, and its pid is still pinned.**
+/// **Acceptance 3 — a float-using module is collected over, and its pid is never pinned.**
 ///
 /// A module doing float arithmetic across a heap boundary returns the **correct** result. The
 /// engine reaches only the **full** heap-admission door (`ensure_heap_full`), which publishes the
@@ -352,10 +357,11 @@ fn the_young_heap_stays_bounded_as_the_loop_count_grows() {
 /// exactly like an x register or a stack word, and the collection is FR-safe for **any** module:
 /// a float-using call site therefore **is** collected over (`collections > 0`). A float register
 /// still live when a slice ends is caught out of band by the runner's post-slice
-/// [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, which pins the process permanently
-/// (`pinned >= 1`), so this run's later slices are refused.
+/// [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, but the reaction is now scoped to
+/// the **inter-slice window** (a relocation exemption the next resume clears) rather than the
+/// process's whole life, so `gc_stats().pinned` stays `0` and the loop keeps collecting.
 #[test]
-fn a_float_using_module_is_collected_over_and_still_pinned() {
+fn a_float_using_module_is_collected_over_and_never_pinned() {
     let Some(mut rt) = runtime_with(GC_FLOATS_BEAM) else {
         return;
     };
@@ -375,43 +381,60 @@ fn a_float_using_module_is_collected_over_and_still_pinned() {
         "the full door publishes the whole root set (FR file included), so a float-using \
          module IS collected over; {stats:?}"
     );
-    assert!(
-        stats.pinned >= 1,
-        "the post-slice float-register scan must pin the pid once a float register is live; \
-         {stats:?}"
+    assert_eq!(
+        stats.pinned, 0,
+        "the post-slice float-register reaction is scoped to the inter-slice window, so the pid \
+         is NEVER pinned and its own heap-admission points keep collecting; {stats:?}"
     );
     assert_eq!(stats.errors, 0, "{stats:?}");
     assert!(!stats.disabled, "{stats:?}");
 }
 
-/// **Acceptance 4 — a long pinned float run needs no arena fallback, and stays correct.**
+/// **Acceptance 4 — a long float run needs no arena fallback, and its collections scale.**
 ///
-/// The float process is collected over during its early slices (the full door's FR-safe
-/// collection) and only pinned once a float register is live at a slice end. Its allocations are
-/// served from its **own** young heap throughout, so the run must return exactly the right answer
-/// and report `errors == 0`, with **no** allocation falling back to the pointer-stable arena
-/// (`fallbacks == 0`) — the contrast with a *nested* run, whose allocations do fall back (see the
-/// module docs' *Honest limitation*).
+/// The float process is collected over at its own heap-admission points throughout; the
+/// inter-slice window's relocation exemption is cleared by every resume, so it never becomes a
+/// permanent refusal. Its allocations are served from its **own** young heap, so the run must
+/// return exactly the right answer, report `errors == 0` and `pinned == 0`, with **no**
+/// allocation falling back to the pointer-stable arena (`fallbacks == 0`) — the contrast with a
+/// *nested* run, whose allocations do fall back (see the module docs' *Honest limitation*).
 #[test]
-fn a_pinned_float_run_needs_no_arena_fallback_and_stays_correct() {
+fn a_float_run_needs_no_arena_fallback_and_collects_more_as_n_grows() {
     let Some(mut rt) = runtime_with(GC_FLOATS_BEAM) else {
         return;
     };
-    let run = run_loop(&mut rt, "gc_floats", "l1", 20_000);
+    let small = run_loop(&mut rt, "gc_floats", "l1", 500);
+    let large = run_loop(&mut rt, "gc_floats", "l1", 20_000);
 
+    assert_eq!(small.float(), expected_float_loop(500));
     assert_eq!(
-        run.float(),
+        large.float(),
         expected_float_loop(20_000),
-        "the pinned run returns exactly the same float"
+        "the collected-over float run returns exactly the same float"
     );
     assert!(
-        run.fallbacks == 0,
-        "a collected-over float run stays on its own young heap — never the arena; {run:?}"
+        small.fallbacks == 0 && large.fallbacks == 0,
+        "a collected-over float run stays on its own young heap — never the arena; \
+         {small:?} {large:?}"
     );
     assert!(
-        run.collections > 0,
-        "the float run really was collected over; {run:?}"
+        small.collections > 0,
+        "the float run really was collected over; {small:?}"
     );
-    assert!(rt.gc_stats().pinned >= 1, "the pid was pinned; {run:?}");
-    assert_eq!(rt.gc_stats().errors, 0);
+    // The defect this suite pins: while the post-slice FR reaction was a PERMANENT runtime-level
+    // pin, `Runtime::gc_process_enabled` answered `false` for the rest of the process's life, so
+    // every later collection door consumed and dropped the request and the float loop's
+    // collections PLATEAUED at whatever it had reached before the first pin
+    // (`large.collections == small.collections`, with the nursery growing instead). Scoped to the
+    // inter-slice window, the loop's collections now grow with its iteration count.
+    assert!(
+        large.collections > small.collections,
+        "a longer float loop must collect MORE, not plateau on a permanent pin \
+         (small: {}, large: {})",
+        small.collections,
+        large.collections
+    );
+    let stats = rt.gc_stats();
+    assert_eq!(stats.pinned, 0, "nothing is ever pinned; {stats:?}");
+    assert_eq!(stats.errors, 0, "{stats:?}");
 }
