@@ -639,7 +639,12 @@ silently-accepted wrong value:
   framings; plus structural assertions for every literal kind, and a whole-corpus sweep re-encoding
   every decoded literal and comparing semantically against `literals_oracle.escript`. Raw-payload byte
   inspection — the only way to observe the pre-normalization key order — lives in the `tests/`-level
-  test-support module `tests/common/mod.rs`.
+  test-support module `tests/common/mod.rs`. Two tests pin the arena literal-tagging itself:
+  `the_literal_area_words_carry_the_literal_tag` (loads `coverage.beam`; every boxed/list root reports
+  `beam_term::literal::is_literal`, the three compound roots are counted, and the immediates still read
+  back as `{error,division_by_zero}` / `{error,badarith}` / `#{a=>1,b=>2}`) and
+  `nested_literal_children_carry_the_literal_tag` (the nested `literals_verbatim.beam` pool tags
+  strictly more compound words than its roots, recursively through tuples/lists/maps).
 - **`tests/load_cost.rs`:** the committed, dependency-free module-load-cost measurement (Design Decisions):
   a deterministic 200-module sample reporting ns/instruction and bytes/second, with per-stage and
   per-module breakdown; loud skip without OTP.
@@ -650,6 +655,18 @@ silently-accepted wrong value:
 - Cross-checks against the real system ERTS belong to the sibling `../tools/differential/` harness.
 
 ## Known Issues / Intentional M1 gaps
+- **The `LitT` literal-tagging walk corrupts a fun literal's raw descriptor words (BLOCKER, owned by
+  `beam_term`).** `LiteralArea::decode` calls `beam_term::literal::tag_literal_area`, whose `tag_words`
+  walk is a verbatim port of the C `erts_set_literal_tag` and therefore skips only
+  `thing_arityval(fun_header) == ERL_FUN_SIZE - 1 == 1` word of a fun block. The frozen `beam_term` fun
+  layout inlines the C `entry` pointer as a **2/3/10-word** descriptor (`crate::fun`), so the walk
+  resumes inside it and ORs `TAG_LITERAL_PTR` into the *raw* descriptor words — e.g. an `EXPORT_EXT`
+  fun's true-arity word (read by `fun_true_arity`) turns `1` into `5` and `2` into `6`. Consequence:
+  `tests/literals.rs::{both_litt_forms_decode_to_identically_encoded_terms,
+  installed_literal_pools_agree_with_the_oracle}` fail on any literal containing a fun
+  (`350 passed / 2 failed` for `cargo test -p beam_loader`). The fix belongs in `beam_term` (make
+  `header_arity`/`thing_arityval` fun-aware — return `fun_desc_words(fun_kind_of_header(hdr))` for a fun
+  header — or special-case funs in `tag_words`); with it the whole `beam_loader` suite is green.
 - **A map-bearing `LitT` payload is NOT byte-preservable — do not assert a byte-exact round-trip for
   it.** The committed literals fixtures are compiled with `erlc +deterministic`, which writes a flat
   map's keys in **name-lexicographic** order (the `term_to_binary/2` `[deterministic]` option), while
