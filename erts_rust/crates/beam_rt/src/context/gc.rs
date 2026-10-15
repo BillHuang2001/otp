@@ -895,14 +895,31 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 ///   serve the young heap or fall back to the arena, and never collect. The machine that owns
 ///   a nested run's roots is not the one this context was armed for, so collecting there would
 ///   relocate a heap against the wrong root set.
-/// * **The latch is set** (the slice's own machine): prefer the young heap exactly as
-///   [`alloc_words`] does, and only when that bump **fails** run one collection over the
-///   handed-in roots and retry the bump. A collection or scatter failure halts collection for
-///   that process ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the
-///   arena. This door applies **no** caller-module float guard — it publishes the machine's
-///   **whole FR file** ([`publish_roots_full`]), so a live float register is relocated, not
-///   corrupted (see the module docs' float-guard section) — and it requires only that the run
-///   has a caller module to name at all, exactly as in [`ensure_heap_full`].
+/// * **The latch is set** (the slice's own machine): serve the young heap exactly as
+///   [`alloc_words`] does, and run one collection over the handed-in roots and retry the bump
+///   when that bump **fails** — or immediately, when a **forced** collection has been
+///   requested (below). A collection or scatter failure halts collection for that process
+///   ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the arena. This door
+///   applies **no** caller-module float guard — it publishes the machine's **whole FR file**
+///   ([`publish_roots_full`]), so a live float register is relocated, not corrupted (see the
+///   module docs' float-guard section) — and it requires only that the run has a caller module
+///   to name at all, exactly as in [`ensure_heap_full`].
+///
+/// # Forced collections
+///
+/// A forced request ([`Runtime::request_gc`](crate::runtime::Runtime),
+/// `erlang:garbage_collect/0,1` and `erts_internal:garbage_collect/1`) is honoured here
+/// **before** the young-heap attempt, so this door's gate order matches
+/// [`ensure_heap_full`]'s: latch → forced request → valves → caller-module test →
+/// commit-once → collect. `ensure_heap_full` needs the peek because a forced request must
+/// bypass its *occupancy* test; this door needs it because the bump **is** its test — a
+/// request armed before an allocation the young heap can serve would otherwise be carried,
+/// unserved, to the pass boundary and pruned. When the request is armed the bump is
+/// bypassed, the whole root set is published, one collection runs and the request is
+/// consumed exactly once; every refusal (the valves, the missing caller module, the
+/// unscanned-root valve) leaves the request armed, so the runner's park arm
+/// ([`Runtime::serve_gc_request`](crate::runtime::gc)) may still serve it.
+///
 /// # Errors
 ///
 /// Propagates the arena's allocation failure only — never a collection failure.
@@ -915,11 +932,15 @@ pub(crate) fn alloc_words_rooted(
     let pid = ctx.mailbox_pid;
     // The latch is not set: every nested run — a cross-module callee's second machine, a fun
     // the engine applied, the `-eval` evaluator — keeps `alloc_words`' arena fallback, byte
-    // for byte, and never collects. The machine that owns a nested run's roots is not the one
-    // this context was armed for, so collecting there would relocate a heap against the wrong
-    // root set. A fun entry or the `-eval` evaluator has no call site at all
-    // (`current_module`), and is equally left alone: the door has no machine to name.
-    let call_site_known = armed && ctx.current_module.is_some();
+    // for byte, and never collects, and it consumes **no** forced request: the machine that
+    // owns a nested run's roots is not the one this context was armed for.
+    if !armed {
+        let RuntimeContext { runtime, .. } = ctx;
+        return runtime.alloc_words(n);
+    }
+    // A fun entry or the `-eval` evaluator has no call site at all (`current_module`), and is
+    // equally left alone: the door has no machine to name.
+    let call_site_known = ctx.current_module.is_some();
     let RuntimeContext {
         runtime,
         mailbox_table,
@@ -928,18 +949,39 @@ pub(crate) fn alloc_words_rooted(
     let Some(table) = mailbox_table else {
         return runtime.alloc_words(n);
     };
+    // A **forced** collection request (see [`Runtime::request_gc`](crate::runtime::Runtime))
+    // is peeked here, *before* the young-heap attempt — this door's analog of
+    // [`ensure_heap_full`]'s occupancy test, which a forced request bypasses. The two
+    // full-root doors therefore honour the request in the same order: latch → request →
+    // valves → caller module → commit-once. The peek is gated on the call site for the same
+    // reason the collection is: a run with no module to collect for must not consume a
+    // request it can never serve.
+    let forced = call_site_known && runtime.gc_request_pending(pid);
     if !runtime.gc_process_enabled(pid) {
+        // The valves refuse the pid outright (a post-slice float pin, a halt from an earlier
+        // failure, or the runtime-wide escape-store valve): the request can never be served,
+        // so it is dropped rather than left armed for a valve that may never open again —
+        // exactly as the two `ensure_heap` doors drop it — and the block comes from the
+        // pointer-stable arena, byte for byte as before.
+        runtime.take_gc_request(pid);
         return runtime.alloc_words(n);
     }
-    // The same attempt `alloc_words` makes: the running process's own young heap.
-    if let Some(process) = table.get_mut(pid) {
-        let fill = runtime.gc_scratch(n.saturating_sub(1));
-        if let Ok(block) = bump(process.heap_mut(), n, fill) {
-            return Ok(block);
+    // The same attempt `alloc_words` makes: the running process's own young heap. A forced
+    // request **bypasses** it: the block is the collection's to serve, and a bump taken first
+    // would end this call with the request still armed — the exact way a
+    // `erlang:garbage_collect()` from a process whose only allocation goes through this seam
+    // used to be carried, silently, to the pass boundary.
+    if !forced {
+        if let Some(process) = table.get_mut(pid) {
+            let fill = runtime.gc_scratch(n.saturating_sub(1));
+            if let Ok(block) = bump(process.heap_mut(), n, fill) {
+                return Ok(block);
+            }
         }
     }
-    // The young heap refused. Only the slice's own machine may collect over the roots it
-    // handed in; every other context keeps `alloc_words`' arena fallback, byte for byte.
+    // The young heap refused (or a forced request bypassed it). Only the slice's own machine
+    // may collect over the roots it handed in; every other context keeps `alloc_words`' arena
+    // fallback, byte for byte.
     if !call_site_known {
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
@@ -953,7 +995,8 @@ pub(crate) fn alloc_words_rooted(
     // words it reaches without updating it, so this collection is declined and the block comes
     // from the pointer-stable arena — the same honest fallback every other refusal path takes.
     // The descent is gated on `pid`'s foreign-reachability bit and a hit opens it permanently,
-    // exactly as in [`ensure_heap`].
+    // exactly as in [`ensure_heap`]. A declined collection leaves a forced request **armed**,
+    // exactly as at [`ensure_heap_full`], so the runner's park arm may still serve it.
     let descend = runtime.foreign_reachable(pid);
     if any_root_is_unscanned(
         runtime.walk_scratch(),
@@ -968,6 +1011,13 @@ pub(crate) fn alloc_words_rooted(
         runtime.note_foreign_reachable(pid);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
+    }
+    // From here the collection is committed to, so a pending forced request is consumed
+    // **once**, at the commit point — the single `take_gc_request` [`ensure_heap_full`]
+    // performs. A refusal above leaves it armed; every path below has already collected (or
+    // halted), so the request is spent either way.
+    if forced {
+        runtime.take_gc_request(pid);
     }
     // This door publishes the **whole** FR file: it hands the machine's root set over while
     // the machine is running, so it cannot bound the live prefix — the count is the file's own
