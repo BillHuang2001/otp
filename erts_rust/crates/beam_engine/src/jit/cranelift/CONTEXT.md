@@ -8,8 +8,39 @@ With the feature off the crate carries **no** Cranelift dependency and `Tier::Cr
 a typed `unsupported("jit-cranelift tier not built")` — never a panic, never a silent fallback.
 
 ## API Surface
-- `mod.rs` — `CraneliftJit` (the `JitBackend`), `CompiledFunctions` (owns the `JITModule`; accessors `entry`/`entry_pc`/`function_count`/`highest_native_register` + the `inlined_*` introspection), `run_cranelift*`.
-- `codegen.rs` — `compile_module` (`emit_pc` per instruction); `inline.rs`/`compare.rs`/`shape.rs` — the inline-set lowering and shape tests; `report.rs` — `CodegenReport` (`inlined_tests`/`inlined_gc_bifs`/`inlined_comparisons`/`inlined_select_vals`/`inlined_tuple_reads`/`inlined_list_reads`/`inlined_swaps`/`inlined_tail_calls`).
+- `mod.rs` — `CraneliftJit` (the `JitBackend`), `CompiledFunctions` (owns the `JITModule`; accessors
+  `entry`/`entry_pc`/`function_count`/`highest_native_register`/`is_enterable` + the `inlined_*`
+  introspection), `run_cranelift*`.
+- `codegen.rs` — `compile_module` (`emit_pc` per instruction); `inline.rs`/`compare.rs`/`shape.rs` —
+  the inline-set lowering and shape tests; `report.rs` — `CodegenReport`
+  (`inlined_tests`/`inlined_gc_bifs`/`inlined_comparisons`/`inlined_select_vals`/`inlined_tuple_reads`/
+  `inlined_list_reads`/`inlined_swaps`/`inlined_tail_calls`).
+
+## Signature and native entry points
+Each compiled function has the signature `extern "C" fn(rt: i64, pc: i64) -> i64` (the Rust-side
+view is `codegen::NativeFunc`); `rt` in `rdi`, the entry `pc` in `rsi`, the block-ABI word in `rax`.
+The `pc` argument is an **entry `pc`**: the function's prologue
+(`codegen::emit_pc_entry_dispatch`, emitted by `emit_function`) dispatches on it over the function's
+candidate set, checking the function's own `entry_pc` **first** as a one-comparison fast path and
+falling back (defensively, unreachable) to `block_for(entry_pc)`. That set is
+`codegen::candidate_pcs` — every IR block start plus every non-tail-call continuation
+(`call_site + 1`) — restricted to addresses with a real instruction and exposed through
+`CompiledFunctions::is_enterable(func, pc)`. The `NativeCode::enter` impl (`CompiledEntries`) gates
+native entry on `is_enterable` and calls `code(rt as i64, pc as i64)`, so the shared driver can enter
+a compiled function natively at **any** of those addresses — which is how a cross-function non-tail
+call's return (`call_site + 1`) is picked up natively instead of on the driver's per-instruction
+interpreter step. An address outside the set (a `wait`/`wait_timeout` suspension `pc`) stays on the
+interpreter step — never a wrong result. `CompiledFunctions::entry_pc(func)` (the function's entry
+`pc`) is kept for introspection; native entry is gated on the wider `is_enterable` set.
+`emit_pc_entry_dispatch` is separate from `emit_dispatch_chain` (the helper-*word* continuation
+chain): the two share the candidate set but neither shares the other's mechanism, so the helper-word
+chain is unchanged. Since the tier caches **no** x-registers across instructions (it addresses
+`machine.x` directly), entering a function at a mid-function `pc` with the machine's current state is
+correct by construction.
+
+`run_resume_outcome` remains a typed `error::unsupported("cranelift jit: cannot resume at an arbitrary
+pc (the cranelift tier has no resume entry point)")`: unlike first entry it is handed **no** compiled
+artifact and the tier has no path that would compile and bind one at a parked address on demand.
 
 ## Inline set relative to the baseline
 **Strict subset by `Instr` variant set**: identical to the baseline's *except* `CallLast`, which the
@@ -29,46 +60,19 @@ The tier runs on the **shared** driver (`../baseline`), which handles a `Step::E
 `call_ext*` the host resolved through `ExecutionContext::resolve_external_call`) by switching module
 context and re-entering. The Cranelift tier inherits `NativeCode::module_blocks`'s default (`None`),
 so the callee is not accelerated — the driver runs it on its per-instruction interpreter step — but
-it *executes*, so a compiled caller reaches the callee and returns correctly. Its own
-`run_resume_outcome` remains the typed `unsupported("cranelift jit: cannot resume at an arbitrary
-pc …")` because each compiled function bakes in its entry `pc`.
-
-## Measured verdict — the tier stays DEFAULT-OFF
-The feature is measurement-gated, and the measurement says **no**: Cranelift is *not* a win. Two
-independent harnesses agree (the fixed-order tier table in crate `tests/jit_bench.rs`, and the
-order-balanced ABBA harness below). Every figure is the min of ≥30 samples per tier — the sandbox is
-shared and heavily loaded (load average 20–72 observed while measuring), so only the min is stable.
-The table gives the range over 6 independent sessions; the per-round paired ratio
-(2 samples/tier × 15 rounds, so position drift cancels) brackets it the same way.
-
-| workload (shape) | cranelift/baseline ns/op | paired-ratio range | one-time compile |
-|---|---|---|---|
-| `aggr/2` — aggregate reads + `'*'` | **0.92–0.95× (5–8% faster)** | 0.61–1.07 (mean 0.88–0.95) | ~140–295 ms vs ~2 ms |
-| `arith/2` — 256 chained small-int `'+'` | **1.34–1.44× (34–44% slower)** | 1.05–1.65 (mean 1.33–1.44) | ~22–47 ms vs ~0.3–0.5 ms |
-| `cmp/2` — 512 comparison BIFs | **1.00–1.08× (tie to 8% slower)** | 0.75–1.19 (mean 1.01–1.08) | ~55–122 ms vs ~1.2–2.5 ms |
-| `slice:fib/1` (call chain) | 1.01× (tie) | — | ~1.4 ms vs ~0.05 ms |
-
-The `aggr` win and the `arith` loss are far outside the noise band (tight paired ratios); `cmp`
-ranges from a tie to a small loss depending on how loaded the box is (the baseline slows more than
-Cranelift when contended, which narrows its lead). Note also that **fixed-order measurement
-understates the Cranelift loss**: `tests/jit_bench.rs` always runs the baseline first, so drift is
-charged to the later tier — the ABBA harness is what separates position from cost.
-
-Why: the baseline's emitter is a hand-written x86-64 backend with a per-block register cache (the
-five most-touched x-registers resident, the rest addressed directly in `machine.x`), native linking
-of the local tail calls (`call_only`/`call_last`) and a cross-run compiled-block cache. Cranelift
-re-loads/re-stores the x-register slots per instruction and **deopts `call_last`/`call_only`** (a
-strict subset by `Instr` variant), so it pays for every straight-line inlined op and never links a
-tail chain. It wins only on the aggregate-read mix — 5–8%, which cannot justify 45–80× the compile
-latency on the tier whose whole point is a *hot* tier, and it loses on everything else.
-
-Consequence: `jit-cranelift` **remains default-OFF**; the tier is a correctness-complete mechanism
-(interpreter-identical by construction) and an honest negative performance result, not a selected
-tier. Closing the gap is not a bounded change — it means porting the baseline's register cache, its
-direct `machine.x` addressing and its tail-call linking into the Cranelift lowering. Re-test with
-`bench.rs` before ever revisiting.
+it *executes*, so a compiled caller reaches the callee and returns correctly; the return from a
+**same-module** cross-function non-tail call is now picked up natively at its continuation `pc`
+(see "Signature and native entry points"). Its own `run_resume_outcome` is the typed error above.
 
 ## Routing Table
 - `codegen.rs`/`inline.rs`/`shape.rs`/`compare.rs` → the inline set + shape tests; `report.rs` → the introspection report; `tests.rs` → in-module unit tests; `bench.rs` → the `#[ignore]`d ABBA Cranelift-vs-baseline measurement harness (its synthetic-`Module` builder, BIF hook and ns/op primitives are the shared `crate::jit::bench::support`, not a second copy); `mod.rs` → the backend + accessors.
 - Tier equivalence on real modules: crate `tests/jit_cranelift.rs`, `tests/jit_cranelift_real.rs` (see `../CONTEXT.md`).
 - `bench.rs` is run with `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --features jit-cranelift --lib -- --ignored --nocapture cl_bench`.
+
+## Test Strategy
+In-module unit tests (`tests.rs`) cover the backend naming/availability, the per-function entry
+points, the reported inlined set, a direct native call into a compiled entry, and
+`CompiledFunctions::is_enterable` — the latter pinned against an independent test-side oracle (IR
+block starts ∪ non-tail-call continuations) on the `coverage.beam` fixture, asserting the entry `pc`
+and every `call_site + 1` are enterable while an interior `pc` no boundary names is not. Tier
+equivalence on real modules lives in the crate's `tests/jit_cranelift.rs` / `tests/jit_cranelift_real.rs`.
