@@ -21,6 +21,8 @@ Sections:
   plus three shapes.
 * [Heap-sizing measurements](#heap-sizing-measurements) — why the fresh mature space is sized from
   the exact live set and the nursery from the surviving set.
+* [End-to-end RSS and latency](#end-to-end-rss-and-latency-ets_copy-a-b-in-this-worktree) — the
+  nursery-chain fix measured on a real `ets_copy` loop (pre-fix vs post-fix).
 
 ## The allocation-heavy workload
 
@@ -383,20 +385,57 @@ throughout — the retention path not exercised at all). Recorded in `CONTEXT.md
 deliberately uses a block-aligned 256-word object so it pins the retention, not this gap.
 
 **Caveats.**
-* **The external `tools/bench` RSS numbers are missing from this entry.** The pre-fix reference is the one
-  already in `../beam_rt/PERF.md` (`ets_copy` peak RSS **94.68 MiB** at N=100000, `VmHWM`-sampled). The
-  post-fix re-run was not completed (tool budget); the in-process pre/post chain measurement above is the
-  load-invariant substitute, and it measures the mechanism directly (retained spaces), which is what the
-  RSS followed. **Treat the post-fix RSS figure as open**, and note that the host was heavily loaded.
+* **The external RSS/latency figures are in [the end-to-end section below](#end-to-end-rss-and-latency-ets_copy-a-b-in-this-worktree).**
+  They show the mechanism fix is **necessary but not sufficient**: on a real `ets_copy` loop the process
+  RSS is **unchanged** by this fix, because the runtime's heap-admission *door* declines the collection
+  that would `collapse` the chain. The in-process pre/post chain measurement above is the load-invariant
+  evidence for the mechanism itself (retained spaces); the two are not interchangeable.
 * **Retained *words* are a capacity figure, not RSS.** A retired `HeapSpace` holds a whole backing
   allocation, so "2 spaces instead of 401" is the RSS-relevant quantity, but the two are not numerically
   interchangeable (allocator carriering, page granularity, and the rest of the process's footprint sit on
   top).
-* **Latency was not sampled** (`/usr/bin/time` is absent in the sandbox; the bench harness's own sampler
-  was not driven). The cost argument above is structural (the bump path is untouched, one collection per
-  growth episode) plus the <10 ms in-process loop time.
 * **A pure un-rooted growth loop still grows the chain** — it never reaches a heap-admission point, so
   nothing claims the debt. That is pinned deliberately by `beam_rt`'s own
   `alloc_words_grows_the_nursery_and_never_falls_back_to_the_arena` (it asserts `young_space_count() > 1`).
   Every real Erlang loop reaches an admission point at its `test_heap` prefixes, where the retention is
   bounded from that point on.
+
+## End-to-end RSS and latency (`ets_copy`, A/B in this worktree)
+**What was run.** The real runtime binary (`erts_rust/target/release/beam_rt`, release, one scheduler) on
+`tools/bench`'s own `copy_bound` loop body, reconstructed and cross-checked against the bench tool:
+`beam_rt -pa bin run bin/bench_copy_bound.beam bench_copy_bound:ets_copy/1 <N>` (the `/1` arity suffix is
+required). Peak-granularity `VmHWM` plus a ~4 ms `VmRSS` series sampled from `/proc/<pid>/status` by hand
+(`/usr/bin/time` is absent); wall-clock around the child. A/B: the same binary built twice — **AFTER** =
+`beam_gc` at `5109182990`, **BEFORE** = `beam_gc` at `0f5e2130ca` (`git checkout <sha> -- .../beam_gc/src
+.../beam_gc/tests`, build, restore; no `git stash`).
+| N | VmHWM kB AFTER (2 reps) | VmHWM kB BEFORE (2 reps) | wall ms AFTER | wall ms BEFORE |
+|---|---|---|---|---|
+| 0 | 385604 / 385644 | 385512 / 385576 | 2280 / 2349 / 2590 | 2111 / 2134 / 2153 |
+| 1 000 | 386352 / 386352 | 386376 / 386292 | 2237 / 2220 | 2222 / 2083 |
+| 10 000 | 393200 / 393212 | 393076 / 393216 | 2265 / 2258 | 2488 / 2114 |
+| 25 000 | 404044 / 404148 | 404092 / 403876 | 2430 / 2421 / 2468 | 2215 / 2245 / 2155 |
+| 50 000 | 422864 / 423132 | 422776 / 422964 | 2533 / 2476 | 2264 / 2247 |
+| 100 000 | **461012 / 460856** | **460868 / 460628** | 3747 / 4015 / 3580 / 3874 | 2788 / 2548 / 2476 / 2582 |
+**Verdict: the RSS is NOT bounded by this fix, and the before/after curves are identical** (within
+run-to-run noise) — ≈ **376.5 MiB fixed baseline** at N=0, **+≈750 B (~94 words) per iteration**, ≈
+**450 MiB** at N=100 000. The bench tool's own figure matches: `case_ets_copy_peak_rss_bytes` mean
+**450.1 MiB** (471 926 101 B), `ns_per_op` 4717.8, `wall_ms` 2599, `startup_ms` 2127; the same tool's
+`gc_bound/churn` control reads **376.6 MiB** — i.e. the *baseline only*, ~0 marginal growth where the loop
+is GC-bounded. So this workload is **not** GC-bounded, and the fix (whose in-crate effect is proven above)
+never gets to act: `process_info(self(), memory)` grows 3 728 B → **75 203 768 B** at N=100 000 with
+**`minor_gcs = 0`** throughout, while the same loop with the container result not copied out
+(`ets_copy_nogc`, and a named-table variant alike) stays at **5 624 B**. The blocker is therefore
+downstream of `beam_gc`: `beam_rt`'s heap-admission door declines the collection
+(`src/context/gc.rs`'s unscanned-root valve `any_root_is_unscanned` / the pointer-stable arena escape of
+`move_result_into_process_heap`; the caller-module float guard `module_may_be_collected` is **not** the
+mover — the module has no float ops). Not chased further; it is outside this crate.
+**Cost: material at high N.** Interleaved reps on a heavily loaded host (`/proc/loadavg` 84–128, `nproc`
+14; the RSS sweep itself ran at load 10–34) show AFTER consistently dearer: **+1 205 ms at N=100 000**
+(4/4 reps), ≈ +235 ms at N=25 000, and within the ±250 ms noise floor at N=0 (no loop work). That is a
+marginal ≈ **5 µs/op before vs ≈ 18 µs/op after** (slope between N=25 000 and N=100 000) — consistent
+with the now-attempted collections whose *checks* run and then decline (no `minor_gcs` increments), i.e.
+the same blocker, not a new per-allocation tax on the bump path.
+**Caveats.** Reconstructed harness (the sibling `tools/bench` N is a compile-time constant and is
+read-only here); `VmRSS_first` is unusable (pure sample-timing noise, 2.4–9.1 MB while `VmHWM` was already
+385 MB); the ~376.5 MiB boot/`VmSize` baseline (peak `VmSize` 1 000 812 kB) dominates at these N; no
+`/usr/bin/time`; raw series/artifacts were kept outside the repository.
