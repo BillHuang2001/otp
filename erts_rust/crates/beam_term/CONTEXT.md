@@ -77,7 +77,7 @@ Minimal and `unsafe`-by-design; `beam_alloc`/`beam_gc` extend/replace it. Never 
 ### `literal.rs` (off-heap literal areas, `TAG_LITERAL_PTR`)
 - `make_literal(Eterm)->Eterm`; `is_literal(Eterm)->bool` (bare bit test for `0x4`, meaningful **only** on BOXED/LIST words); `clear_literal(Eterm)->Eterm`.
 - `unsafe fn set_literal_tag(term: *mut Eterm, hp_start: *mut Eterm, hsz: usize)` — the `erts_set_literal_tag` graph walk (ORs `TAG_LITERAL_PTR` into every BOXED/LIST word + the root); a thin raw-pointer shim over `tag_literal_area`.
-- `tag_literal_area(area: &mut [Eterm], roots: &mut [Eterm])` — the **safe slice-based** form: tags every BOXED/LIST word of the contiguous `area` (stepping over HEADER bodies, with the `HEADER_SUB_BITS` `orig` special case; IMMED1 untouched), then each `roots` word that `is_boxed`/`is_list`. Shares the private `tag_words` walk (`src/literal.rs`).
+- `tag_literal_area(area: &mut [Eterm], roots: &mut [Eterm])` — the **safe slice-based** form: tags every BOXED/LIST word of the contiguous `area` (stepping over HEADER bodies, with the `HEADER_SUB_BITS` `orig` special case; IMMED1 untouched), then each `roots` word that `is_boxed`/`is_list`. Shares the private `tag_words` walk (`src/literal.rs`), which steps over a HEADER body by `thing_arityval` — except a **fun** header, stepped over by `fun_desc_words(fun_kind_of_header(hdr))` (2/3/10) so the inlined raw descriptor words are never tagged, and `HEADER_SUB_BITS` by `thing_arityval - 1` (the `orig` field).
 - `pub struct LiteralArea` — bump-allocated frozen block (`start`/`end`/`off_heap`) with `alloc_words`, `contains(ptr)`, `is_literal(ptr)`.
 
 ### `ops.rs`
