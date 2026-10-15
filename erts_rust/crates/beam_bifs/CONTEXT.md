@@ -464,6 +464,13 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
 - **Reject-where-the-oracle-succeeds / class mismatch:** `re:inspect/2` of a non-`namelist` item is the typed gap where
   the oracle raises `badarg`; `lists` of a non-list/improper argument raises `badarg` where the oracle raises
   `function_clause`/`case_clause`/`{bad_generator,_}`. No differential case covers these.
+- **The `fun`-taking `maps` fast paths reject an *iterator*** (`map_2`/`fold_3`/`filter_2`/`foreach_2`, `src/maps.rs`):
+  they hand the 2nd/3rd argument straight to [`map_pairs`], which raises the structured `{badmap,Iter}` for
+  `maps:iterator/1,2`'s `[Keys|Map]` improper cons, whereas the oracle's clauses (`maps.erl:836-846`, `887-897`,
+  `932-944`) accept **map *or* iterator** and walk it via `next/1`. This blocks in-process compilation of any module
+  whose compile reaches a pass folding over an iterator — e.g. `beam_ssa_recv:plan_clears/2`
+  (`maps:fold(F, #{}, maps:iterator(UsageMap, ordered))`) — so `compile:file("…/{timer,io,c,sys,qlc}.erl", …)` crashes
+  `{badmap,[Keys|Map]}` (a *valid*, not malformed, iterator).
 ### Typed capability gaps (`unsupported_bif`, never a fabricated value)
 - **External (remote-node) pid/port/ref textual ids and rendering:** `pid_to_list`/`ref_to_list`/`port_to_list`, the
   `*_to_binary` forms and the printer's external branch answer the typed gap (`src/term_conv.rs::external_channel_gap`).
