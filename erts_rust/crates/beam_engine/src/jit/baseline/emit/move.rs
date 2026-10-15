@@ -30,7 +30,7 @@ use crate::machine::MAX_REGISTER;
 
 use super::operands::{
     constant_word, emit_guarded_y_load, emit_guarded_y_store, x_offset, x_register, y_addressable,
-    y_register,
+    y_register, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2,
 };
 use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
@@ -44,6 +44,17 @@ use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATC
 /// works; this one is neither a cache register ([`super::CACHE_REGISTERS`]) nor the
 /// block's reserved `rbx` (the `machine.x` base) / `rsp` (the `rt` slot).
 const Y_SCRATCH: Reg = Reg::R9;
+
+/// The caller-saved register a `Y`-slot **exchange** uses as the frame-window bound
+/// scratch of its guards.
+///
+/// A `swap` holds *two* values live at once ([`MOVE_SCRATCH`]/[`MOVE_SCRATCH_2`]) and up
+/// to two `Y` slot addresses ([`Y_ADDR_SCRATCH`]/[`Y_ADDR_SCRATCH_2`]), so the guard's
+/// window bound needs a fifth scratch; `rax` is caller-saved and used strictly within one
+/// instruction's lowering (the same role it plays for the arithmetic fast path). It is
+/// neither a cache register ([`super::CACHE_REGISTERS`]) nor the block's reserved
+/// `rbx`/`rsp`.
+const SWAP_END: Reg = Reg::Rax;
 
 /// Where a `move`'s source value comes from, syntactically.
 #[derive(Clone, Copy)]
@@ -345,28 +356,93 @@ fn emit_move_y(
     Ok(())
 }
 
+/// The inlinable shape of a `swap` the tier lowers natively: the two locations the
+/// exchange reads and writes.
+///
+/// Purely syntactic (it never consults the register allocation, so
+/// [`super::regalloc::allocate_registers`] and [`super::emit_block`] agree on which
+/// swaps are lowered): each operand must be an in-bound x-register or an addressable `Y`
+/// slot ([`Loc`]).
+pub(crate) struct SwapShape {
+    /// The `a` operand's location.
+    a: Loc,
+    /// The `b` operand's location.
+    b: Loc,
+}
+
+impl SwapShape {
+    /// The x-register indices the exchange touches, in emission order (`a`, then `b`).
+    ///
+    /// A `Y` slot is **not** an x-register, so it is never charged: raising the
+    /// x-register bound the driver's entry guard reads for a stack slot would wrongly
+    /// refuse native entry.
+    pub(crate) fn registers(&self) -> Vec<u32> {
+        let mut registers = Vec::with_capacity(2);
+        registers.extend(self.a.register());
+        registers.extend(self.b.register());
+        registers
+    }
+
+    /// The x-register indices the exchange **writes** — both operands when they are
+    /// x-registers (the shuffle writes `machine.x` slots / the cache registers directly).
+    /// A `Y` side is a stack slot, never a cached register.
+    pub(crate) fn writes(&self) -> Vec<u32> {
+        let mut writes = Vec::with_capacity(2);
+        writes.extend(self.a.register());
+        writes.extend(self.b.register());
+        writes
+    }
+
+    /// Whether the lowered exchange reads or writes the current frame's Y window (a `Y`
+    /// side), i.e. whether [`super::arith::uses_y`] must report this instruction so the
+    /// window is published in the prologue and refreshed after an in-block helper.
+    pub(crate) fn uses_y(&self) -> bool {
+        self.a.is_y() || self.b.is_y()
+    }
+}
+
+/// The inlinable shape of a `swap`, or `None` when the whole instruction must stay on the
+/// helper (see [`SwapShape`]).
+pub(crate) fn swap_shape(a: &Operand, b: &Operand) -> Option<SwapShape> {
+    Some(SwapShape {
+        a: Loc::of(a)?,
+        b: Loc::of(b)?,
+    })
+}
+
 /// Emit `swap A B` natively, or report that the block must helper it.
 ///
-/// Returns `true` when the exchange was emitted. Both operands must name
-/// x-registers inside the engine's [`MAX_REGISTER`] bound; each is then read and
-/// written through its own representation — a cached operand through its machine
-/// register, a non-cached one through its `machine.x` slot — so the swap is exact
-/// for every combination of the four. A `Y` (or other) operand deopts, and the
-/// helper performs the interpreter's exact `write(b, read(a))` / `write(a, read(b))`
-/// exchange.
+/// Returns `true` when the exchange was emitted for the shape [`swap_shape`] claims.
+/// A **`Y`-free** shape (both operands in-bound x-registers) is the direct
+/// register/`machine.x` shuffle it always was — each operand read and written through its
+/// own representation, so the exchange is exact for all four cache combinations and
+/// **byte-identical** to the pre-widening emission. A shape with a `Y` side goes through
+/// [`emit_swap_y`] behind the shared frame-window guard: an in-frame `Y` exchange runs
+/// natively, and a malformed frame keeps the interpreter's exact error. Anything
+/// [`swap_shape`] refuses (a float register, a literal, an out-of-bound index, an
+/// un-addressable `Y` index) deopts, and the helper performs the interpreter's exact
+/// `va = read(a); vb = read(b); write(a, vb); write(b, va)` exchange.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn try_inline_swap(
     buffer: &mut CodeBuffer,
     a: &Operand,
     b: &Operand,
     allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
     highest_touched: &mut Option<u32>,
 ) -> Result<bool> {
-    let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {
+    let Some(shape) = swap_shape(a, b) else {
         return Ok(false);
     };
-    if a_x >= MAX_REGISTER || b_x >= MAX_REGISTER {
-        return Ok(false);
+    if shape.uses_y() {
+        emit_swap_y(buffer, &shape, allocation, done, func, pc, highest_touched)?;
+        return Ok(true);
     }
+    let (Loc::X(a_x), Loc::X(b_x)) = (shape.a, shape.b) else {
+        return Ok(false);
+    };
     match (allocation.slot(a_x), allocation.slot(b_x)) {
         (Some(a_reg), Some(b_reg)) => {
             // `xchg` spelled as three moves through the scratch register (the
@@ -399,4 +475,85 @@ pub(super) fn try_inline_swap(
         }
     }
     Ok(true)
+}
+
+/// Lower a `swap` with an addressable `Y` side through the shared frame-window guard
+/// (see [`try_inline_swap`]). The emitted shape:
+///
+/// ```text
+///   <read both operands>    ; va -> MOVE_SCRATCH, vb -> MOVE_SCRATCH_2, in the
+///                           ;   interpreter's own `read(a)`-then-`read(b)` order, so an
+///                           ;   exchange whose sides alias still ends with the
+///                           ;   interpreter's values (a Y read is the guarded load)
+///   <guard phase>           ; every Y side's window guard, leaving its slot address in
+///                           ;   Y_ADDR_SCRATCH / Y_ADDR_SCRATCH_2 — BEFORE any store, so
+///                           ;   a rejection can never leave one side exchanged and the
+///                           ;   other not
+///   <store phase>           ; write(a, vb); write(b, va)
+///   jmp  fast_done
+/// fallback:
+///   <the `emit_step_and_continue` sequence: spend one `jit_step_one` on the
+///    instruction — which either advances and lets the block carry on at
+///    `pc + 1`, or exits to the driver with the helper's word>
+/// fast_done:
+///   <emit the rest of the block>
+/// ```
+///
+/// Both values live in scratch across the whole sequence (a value is never read from a
+/// destination), so the alias-safe read-both-then-write-both order of the interpreter is
+/// reproduced exactly for every combination of x-register (`machine.x` slot or cache
+/// register) and `Y` slot. A `Y` slot is never charged to `highest_touched` (it is not an
+/// x-register); the x-register sides are, exactly as [`SwapShape::registers`] lists them.
+#[allow(clippy::too_many_arguments)]
+fn emit_swap_y(
+    buffer: &mut CodeBuffer,
+    shape: &SwapShape,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    let fallback: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+
+    // `va = read(a); vb = read(b)` — both before any store.
+    shape
+        .a
+        .load(buffer, allocation, MOVE_SCRATCH, SWAP_END, fallback, highest_touched)?;
+    shape.b.load(
+        buffer,
+        allocation,
+        MOVE_SCRATCH_2,
+        SWAP_END,
+        fallback,
+        highest_touched,
+    )?;
+
+    // The guard phase: each `Y` side's window guard, both before the first store.
+    if shape.a.is_y() {
+        shape
+            .a
+            .guard_store(buffer, Y_ADDR_SCRATCH, SWAP_END, fallback)?;
+    }
+    if shape.b.is_y() {
+        shape
+            .b
+            .guard_store(buffer, Y_ADDR_SCRATCH_2, SWAP_END, fallback)?;
+    }
+
+    // `write(a, vb); write(b, va)` — the interpreter's order.
+    shape
+        .a
+        .store_at(buffer, Y_ADDR_SCRATCH, MOVE_SCRATCH_2, allocation, highest_touched)?;
+    shape
+        .b
+        .store_at(buffer, Y_ADDR_SCRATCH_2, MOVE_SCRATCH, allocation, highest_touched)?;
+    buffer.jmp(fast_done)?;
+
+    // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
+    Ok(())
 }

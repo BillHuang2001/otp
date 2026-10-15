@@ -46,7 +46,6 @@ use super::aggregate::{
 use super::arith::{fast_arith, uses_y};
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
-use super::operands::x_register;
 use super::select::select_val_plan;
 use super::test::{test_plan, TestSrc};
 use super::{Allocation, CACHE_REGISTERS};
@@ -273,14 +272,20 @@ pub(crate) fn cacheable_touches(
             }
         }
         Instr::Swap { a, b } => {
-            let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {
-                return touches;
-            };
-            if a_x >= MAX_REGISTER || b_x >= MAX_REGISTER {
-                return touches;
+            // Charged exactly the x-register sides of the shape the swap inliner lowers;
+            // a `Y` side is a stack slot, **not** an x-register, so it is never charged.
+            if let Some(shape) = super::r#move::swap_shape(a, b) {
+                touches.extend(shape.registers());
             }
-            touches.push(a_x);
-            touches.push(b_x);
+        }
+        // `init_yregs Registers` writes every listed register (all `NIL`) through its own
+        // representation: a `Y` register is a stack slot and is never charged, while each
+        // in-bound x-register is charged (it is written through its cache register when
+        // the block caches it, else through its `machine.x` slot).
+        Instr::InitYregs { registers } => {
+            if let Some(locations) = super::operands::locate_all(registers) {
+                touches.extend(locations.iter().filter_map(|location| location.register()));
+            }
         }
         // A cons-cell read is charged its source and every destination, and only when
         // its `*_shape` claims it (a `Y` operand or an out-of-bound register keeps the
@@ -409,16 +414,16 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         Instr::Move { src, dst } => move_shape(src, dst)
             .map(|shape| shape.writes())
             .unwrap_or_default(),
-        // `swap A B` writes both operands.
-        Instr::Swap { a, b } => {
-            let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {
-                return Vec::new();
-            };
-            if a_x >= MAX_REGISTER || b_x >= MAX_REGISTER {
-                return Vec::new();
-            }
-            vec![a_x, b_x]
-        }
+        // `swap A B` writes both operands (a `Y` side is a stack slot, never a cached
+        // register).
+        Instr::Swap { a, b } => super::r#move::swap_shape(a, b)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        // `init_yregs Registers` writes every listed register (all `NIL`), so each cached
+        // x-register operand is a destination the exit spill must store.
+        Instr::InitYregs { registers } => super::operands::locate_all(registers)
+            .map(|locations| locations.iter().filter_map(|location| location.register()).collect())
+            .unwrap_or_default(),
         Instr::GetList { source, head, tail } => get_list_shape(source, head, tail)
             .map(|shape| shape.writes())
             .unwrap_or_default(),

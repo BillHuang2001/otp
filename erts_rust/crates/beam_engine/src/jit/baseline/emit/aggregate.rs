@@ -39,8 +39,8 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
 use super::link::Linker;
-use super::operands::{constant_word, x_offset, x_register};
-use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
+use super::operands::{constant_word, x_register, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2};
+use super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
 // ---------------------------------------------------------------------------
 // The cons-cell readers
@@ -55,10 +55,10 @@ use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATC
 //
 // The subset below is lowered natively and mirrors that branch for branch:
 //
-// * the source and **every** destination must be an x-register inside the
-//   engine's [`MAX_REGISTER`] bound — a `Y` operand is not something the tier
-//   can address, and a register index past the bound would read out of
-//   `machine.x` (the interpreter step reports the faithful `bad_register`);
+// * the source and **every** destination must be an in-bound x-register or an
+//   addressable `Y` slot ([`Loc`]): a register index past the bound would read out
+//   of `machine.x`, and a `Y` slot is addressed through the guarded frame window —
+//   both refused kinds deopt, so the interpreter step reports the faithful error;
 // * the guard is `is_list` itself, the C bit trick
 //   `(word & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0`: the emitted `and`
 //   leaves `0` for a cons cell (primary tag `LIST`) and the mask itself for
@@ -73,6 +73,13 @@ use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATC
 // The destinations are written **CAR first, then CDR** — the interpreter's write
 // order — so a list read whose destinations alias each other (or the source)
 // ends with the CDR value, exactly as the interpreter's does.
+//
+// A `Y` destination's frame-window guard is evaluated **before any store** (the
+// guards first, then the stores): the fallback re-runs the whole instruction in the
+// interpreter, so a guard that rejected *after* an earlier store had already
+// clobbered an operand the interpreter then re-reads (a destination that aliases the
+// source) would diverge — front-loading every guard makes a rejection leave the
+// machine exactly as the interpreter will re-run it.
 
 /// `TAG_PRIMARY_MASK - TAG_PRIMARY_LIST` as an `i64` — the mask of the
 /// `is_not_list` bit trick (`beam_term::list::is_not_list`), which is `0x2`.
@@ -96,35 +103,45 @@ enum Half {
     Tail,
 }
 
-/// The x-register operands of a list read the tier lowers natively: the source cons
-/// cell and the destinations it writes, in emission order.
+/// The operands of a list read the tier lowers natively: the source cons cell and the
+/// destinations it writes, in emission order.
 #[derive(Clone)]
 pub(super) struct ListShape {
-    /// The `source` operand's x-register.
-    source: u32,
+    /// The `source` operand's location.
+    source: Loc,
     /// The `(half, destination)` writes, in emission order: the CAR before the CDR
     /// wherever both are written (`get_list`), so aliasing destinations end with the
     /// CDR value exactly as the interpreter's write order does.
-    destinations: Vec<(Half, u32)>,
+    destinations: Vec<(Half, Loc)>,
 }
 
 impl ListShape {
     /// The x-register indices the shape's native lowering touches, in emission
     /// order (the source first, then each destination).
+    ///
+    /// A `Y` slot is **not** an x-register, so it is never charged: raising the
+    /// x-register bound the driver's entry guard reads for a stack slot would wrongly
+    /// refuse native entry.
     pub(super) fn registers(&self) -> Vec<u32> {
         let mut registers = Vec::with_capacity(self.destinations.len() + 1);
-        registers.push(self.source);
-        registers.extend(self.destinations.iter().map(|(_, x)| *x));
+        registers.extend(self.source.register());
+        registers.extend(self.destinations.iter().filter_map(|(_, loc)| loc.register()));
         registers
     }
 
     /// The x-register indices the shape's native lowering **writes** — its
     /// destinations, in emission order (CAR before CDR wherever both are written).
-    /// The source is only read.
+    /// The source is only read, and a `Y` destination is not an x-register.
     ///
     /// This is the block register cache's write set ([`super::Allocation::written`]).
     pub(super) fn writes(&self) -> Vec<u32> {
-        self.destinations.iter().map(|(_, x)| *x).collect()
+        self.destinations.iter().filter_map(|(_, loc)| loc.register()).collect()
+    }
+
+    /// Whether the lowered sequence reads the current frame's Y window — a `Y` source
+    /// or a `Y` destination ([`super::arith::uses_y`]'s per-shape test).
+    pub(super) fn uses_y(&self) -> bool {
+        self.source.is_y() || self.destinations.iter().any(|(_, loc)| loc.is_y())
     }
 }
 
@@ -153,13 +170,13 @@ pub(super) fn get_tl_shape(source: &Operand, tail: &Operand) -> Option<ListShape
 /// The inlinable shape of a list read that writes `writes` (in that order), or
 /// `None` for a shape above the subset.
 ///
-/// The source and every destination must be an x-register inside
-/// [`MAX_REGISTER`] — see the section comment above.
+/// The source and every destination must be an in-bound x-register or an addressable
+/// `Y` slot — see the section comment above.
 fn shape(source: &Operand, writes: &[(Half, &Operand)]) -> Option<ListShape> {
-    let source = in_bound_x(source)?;
+    let source = Loc::of(source)?;
     let destinations = writes
         .iter()
-        .map(|(half, operand)| in_bound_x(operand).map(|x| (*half, x)))
+        .map(|(half, operand)| Loc::of(operand).map(|loc| (*half, loc)))
         .collect::<Option<Vec<_>>>()?;
     Some(ListShape {
         source,
@@ -246,7 +263,8 @@ pub(super) fn try_inline_get_tl(
 /// exact). The emitted shape:
 ///
 /// ```text
-///   mov  r11, <source>      ; the source word: a cached register, or `[rbx + x*8]`
+///   mov  r11, <source>      ; the source word: a cached register, `[rbx + x*8]`,
+///                           ;   or a guarded Y read (r10 = the window bound)
 ///   mov  r10, NOT_LIST_MASK ; the `is_not_list` bit
 ///   and  r11, r10
 ///   cmp  r11, r10           ; the masked word is 0 (a cons cell) or the mask itself
@@ -254,9 +272,13 @@ pub(super) fn try_inline_get_tl(
 ///   mov  r11, <source>      ; reload (the mask consumed the word)
 ///   mov  r10, POINTER_MASK
 ///   and  r11, r10           ; r11 = the cons cell's address, `list_val(word)`
-///   mov  r10, [r11 + 0]     ; the CAR           — for a `get_list`, first ...
-///   mov  <head>, r10
-///   mov  r10, [r11 + 8]     ; the CDR           — ... then the tail
+///   <guard phase>           ; each Y destination's window guard, leaving its slot
+///                           ;   address in r9 / r8 — BEFORE any store, so a
+///                           ;   rejection leaves no destination half-written
+///   <store phase>           ; CAR first, then the CDR:
+///   mov  r10, [r11 + 0]     ;   for a `get_list`, first ...
+///   mov  <head>, r10        ;     <head> = a cache register, `[rbx + x*8]`, or `[r9]`
+///   mov  r10, [r11 + 8]     ;   ... then the tail
 ///   mov  <tail>, r10
 ///   jmp  fast_done
 /// fallback:
@@ -269,10 +291,10 @@ pub(super) fn try_inline_get_tl(
 ///
 /// A `get_hd` writes only the CAR and a `get_tl` only the CDR (the half each
 /// destination receives is [`ListShape::destinations`]' `Half`). Every destination
-/// is written through its own representation — a cached register, or its
-/// `machine.x` slot (the very slot the exit spill would write) — and the source is
-/// read the same way, so the tier's liveness model is unchanged. The fast path
-/// never spills.
+/// is written through its own representation — a cached register, its `machine.x`
+/// slot (the very slot the exit spill would write), or a `Y` slot behind its guard —
+/// and the source is read the same way, so the tier's liveness model is unchanged.
+/// The fast path never spills.
 fn emit_list_read(
     buffer: &mut CodeBuffer,
     shape: &ListShape,
@@ -287,13 +309,9 @@ fn emit_list_read(
 
     // The guard: `is_not_list(source)` — a non-cons source (`[]`, a small int, an
     // atom, a tuple) branches to the helper, which raises `{badmatch, Source}`.
-    load_x(
-        buffer,
-        shape.source,
-        allocation,
-        MOVE_SCRATCH,
-        highest_touched,
-    )?;
+    shape
+        .source
+        .load(buffer, allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, fallback, highest_touched)?;
     buffer.mov_ri(MOVE_SCRATCH_2, NOT_LIST_MASK)?;
     buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
     buffer.cmp_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
@@ -301,32 +319,44 @@ fn emit_list_read(
 
     // The cell's address: reload the source word (the mask above consumed it) and
     // clear the pointer tag — `list_val(word)`.
-    load_x(
-        buffer,
-        shape.source,
-        allocation,
-        MOVE_SCRATCH,
-        highest_touched,
-    )?;
+    shape
+        .source
+        .load(buffer, allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, fallback, highest_touched)?;
     buffer.mov_ri(MOVE_SCRATCH_2, POINTER_MASK)?;
     buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
 
-    // The destinations, in emission order — CAR first, then CDR — the interpreter's
-    // write order, so aliasing destinations (`head == tail`, or a destination that
-    // is the source) end with the CDR value.
-    for (half, destination) in &shape.destinations {
+    // The **guard phase**: every `Y` destination's frame-window guard, leaving the slot
+    // address in its own scratch. All of them run before the first store, so a rejection
+    // can never leave a destination written for the interpreter's re-run to read
+    // (a destination may alias the source). The two address scratches are enough:
+    // `get_list` has at most two destinations.
+    let mut y_addresses: Vec<(usize, Reg)> = Vec::new();
+    for (index, (_, destination)) in shape.destinations.iter().enumerate() {
+        if destination.is_y() {
+            let addr = if y_addresses.is_empty() {
+                Y_ADDR_SCRATCH
+            } else {
+                Y_ADDR_SCRATCH_2
+            };
+            destination.guard_store(buffer, addr, MOVE_SCRATCH_2, fallback)?;
+            y_addresses.push((index, addr));
+        }
+    }
+
+    // The **store phase**: CAR first, then CDR — the interpreter's write order, so
+    // aliasing destinations (`head == tail`, or a destination that is the source) end
+    // with the CDR value.
+    for (index, (half, destination)) in shape.destinations.iter().enumerate() {
         let disp = match half {
             Half::Head => CAR_DISP,
             Half::Tail => CDR_DISP,
         };
         buffer.mov_rm(MOVE_SCRATCH_2, MOVE_SCRATCH, disp)?;
-        store_x(
-            buffer,
-            *destination,
-            MOVE_SCRATCH_2,
-            allocation,
-            highest_touched,
-        )?;
+        let addr = y_addresses
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map_or(Y_ADDR_SCRATCH, |(_, addr)| *addr);
+        destination.store_at(buffer, addr, MOVE_SCRATCH_2, allocation, highest_touched)?;
     }
     buffer.jmp(fast_done)?;
 
@@ -335,45 +365,6 @@ fn emit_list_read(
     emit_step_and_continue(buffer, done, allocation, func, pc)?;
     buffer.bind(fast_done)?;
     Ok(())
-}
-
-/// Load x-register `x` into scratch register `reg` — from its cache register, or
-/// straight from its `machine.x` slot, recording the direct access.
-fn load_x(
-    buffer: &mut CodeBuffer,
-    x: u32,
-    allocation: &Allocation,
-    reg: Reg,
-    highest_touched: &mut Option<u32>,
-) -> Result<()> {
-    match allocation.slot(x) {
-        Some(src) => buffer.mov_rr(reg, src),
-        None => {
-            buffer.mov_rm(reg, Reg::Rbx, x_offset(x))?;
-            touch(highest_touched, x);
-            Ok(())
-        }
-    }
-}
-
-/// Store scratch register `src` into x-register `x` — into its cache register, or
-/// straight into its `machine.x` slot (the slot the exit spill writes), recording
-/// the direct access.
-fn store_x(
-    buffer: &mut CodeBuffer,
-    x: u32,
-    src: Reg,
-    allocation: &Allocation,
-    highest_touched: &mut Option<u32>,
-) -> Result<()> {
-    match allocation.slot(x) {
-        Some(dst) => buffer.mov_rr(dst, src),
-        None => {
-            buffer.mov_mr(Reg::Rbx, x_offset(x), src)?;
-            touch(highest_touched, x);
-            Ok(())
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,10 +383,11 @@ fn store_x(
 //
 // The subset below is lowered natively and mirrors that branch for branch:
 //
-// * the source (and, for a tuple read, the destination) must be an x-register
-//   inside the engine's [`MAX_REGISTER`] bound — a `Y` operand is not something the
-//   tier can address, and a register index past the bound would read out of
-//   `machine.x` (the interpreter step reports the faithful `bad_register`);
+// * the source and the destination must be an in-bound x-register or an addressable
+//   `Y` slot ([`Loc`]): a register index past the bound would read out of
+//   `machine.x`, and a `Y` slot is addressed through the guarded frame window — both
+//   refused kinds deopt, so the interpreter step reports the faithful
+//   `bad_register`;
 // * the guard is `beam_term::is_tuple`: the `is_boxed` bit trick
 //   `(word & (TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0`, the header pointer
 //   `word & !TAG_PTR_MASK` (`boxed_val`, the literal-area bit included), and
@@ -447,14 +439,15 @@ fn element_disp(element: u32) -> Option<i32> {
     i32::try_from(size_of::<Eterm>() as i64 * (i64::from(element) + 1)).ok()
 }
 
-/// The x-register operands of a tuple read the tier lowers natively: the source
-/// tuple and the destination it writes.
+/// The operands of a tuple read the tier lowers natively: the source tuple and the
+/// destination it writes.
 #[derive(Clone, Copy)]
 pub(super) struct TupleReadShape {
-    /// The `source` operand's x-register.
-    source: u32,
-    /// The `dst` operand's x-register.
-    dst: u32,
+    /// The `source` operand's location (an in-bound x-register or an addressable `Y`
+    /// slot).
+    source: Loc,
+    /// The `dst` operand's location.
+    dst: Loc,
     /// The byte offset of the read element from the header word.
     element_disp: i32,
 }
@@ -462,34 +455,48 @@ pub(super) struct TupleReadShape {
 impl TupleReadShape {
     /// The x-register indices the shape's native lowering touches, in emission
     /// order (the source first, then the destination).
+    ///
+    /// A `Y` slot is **not** an x-register, so it is never charged: raising the
+    /// x-register bound the driver's entry guard reads for a stack slot would wrongly
+    /// refuse native entry.
     pub(super) fn registers(&self) -> Vec<u32> {
-        vec![self.source, self.dst]
+        let mut registers = Vec::with_capacity(2);
+        registers.extend(self.source.register());
+        registers.extend(self.dst.register());
+        registers
     }
 
-    /// The x-register index the shape's native lowering **writes** — its
-    /// destination. The source tuple is only read.
+    /// The x-register indices the shape's native lowering **writes** — its
+    /// destination when that is an x-register. The source tuple is only read, and a `Y`
+    /// destination is a stack slot.
     ///
     /// This is the block register cache's write set ([`super::Allocation::written`]).
     pub(super) fn writes(&self) -> Vec<u32> {
-        vec![self.dst]
+        self.dst.register().into_iter().collect()
+    }
+
+    /// Whether the lowered sequence reads the current frame's Y window — a `Y` source
+    /// or a `Y` destination ([`super::arith::uses_y`]'s per-shape test).
+    pub(super) fn uses_y(&self) -> bool {
+        self.source.is_y() || self.dst.is_y()
     }
 }
 
 /// The inlinable shape of a `get_tuple_element Source Element Dst`, or `None` when
 /// the whole instruction must stay on the helper.
 ///
-/// The source and the destination must be x-registers inside [`MAX_REGISTER`], and
-/// the element's word offset must be addressable — see the section comment above.
-/// The element index itself is an immediate, so an out-of-range one is a guard
-/// rejection rather than a shape the tier refuses.
+/// The source and the destination must be an in-bound x-register or an addressable `Y`
+/// slot ([`Loc`]), and the element's word offset must be addressable — see the section
+/// comment above. The element index itself is an immediate, so an out-of-range one is a
+/// guard rejection rather than a shape the tier refuses.
 pub(super) fn get_tuple_element_shape(
     source: &Operand,
     element: u32,
     dst: &Operand,
 ) -> Option<TupleReadShape> {
     Some(TupleReadShape {
-        source: in_bound_x(source)?,
-        dst: in_bound_x(dst)?,
+        source: Loc::of(source)?,
+        dst: Loc::of(dst)?,
         element_disp: element_disp(element)?,
     })
 }
@@ -611,7 +618,13 @@ pub(super) fn try_inline_select_tuple_arity(
     };
 
     let fallback: CodeLabel = buffer.label();
-    emit_tuple_header_guard(buffer, plan.tuple, allocation, fallback, highest_touched)?;
+    emit_tuple_header_guard(
+        buffer,
+        Loc::X(plan.tuple),
+        allocation,
+        fallback,
+        highest_touched,
+    )?;
 
     // One `cmp`/`jcc` per alternative, in source order — the interpreter takes the
     // **first** alternative whose arity equals the tuple's, and a word compare on
@@ -640,24 +653,32 @@ pub(super) fn try_inline_select_tuple_arity(
     Ok(true)
 }
 
-/// Emit the `is_tuple` guard for x-register `source`: branch to `fallback` unless it
-/// holds a boxed term whose header word is an arityval, leaving that header word in
+/// Emit the `is_tuple` guard for `source`: branch to `fallback` unless it holds a boxed
+/// term whose header word is an arityval, leaving that header word in
 /// [`GUARD_SCRATCH`].
 ///
 /// The guard is `beam_term::is_tuple` exactly — `is_boxed`, the header pointer
 /// `word & !TAG_PTR_MASK`, then `is_arity_value(hdr)` (see the section comment
 /// above). It can only ever *reject*: `fallback` runs one interpreter step, whose
-/// typed error is the ground truth.
+/// typed error is the ground truth. `source` may be an addressable `Y` slot, in which
+/// case its two reads are the guarded frame-window reads ([`Loc::load`]).
 fn emit_tuple_header_guard(
     buffer: &mut CodeBuffer,
-    source: u32,
+    source: Loc,
     allocation: &Allocation,
     fallback: CodeLabel,
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
     // `is_boxed(source)`: the masked word is `0` for a boxed term and the mask itself
     // for everything else — `NIL`, a small int, an atom, a cons cell, … .
-    load_x(buffer, source, allocation, MOVE_SCRATCH, highest_touched)?;
+    source.load(
+        buffer,
+        allocation,
+        MOVE_SCRATCH,
+        MOVE_SCRATCH_2,
+        fallback,
+        highest_touched,
+    )?;
     buffer.mov_ri(MOVE_SCRATCH_2, NOT_BOXED_MASK)?;
     buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
     buffer.cmp_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
@@ -665,7 +686,14 @@ fn emit_tuple_header_guard(
 
     // The header pointer: reload the source word (the mask consumed it) and clear
     // the pointer tag — `boxed_val(word)`.
-    load_x(buffer, source, allocation, MOVE_SCRATCH, highest_touched)?;
+    source.load(
+        buffer,
+        allocation,
+        MOVE_SCRATCH,
+        MOVE_SCRATCH_2,
+        fallback,
+        highest_touched,
+    )?;
     buffer.mov_ri(MOVE_SCRATCH_2, POINTER_MASK)?;
     buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
 
@@ -735,15 +763,21 @@ fn emit_tuple_read(
     buffer.cmp_rr(GUARD_SCRATCH, MOVE_SCRATCH_2)?;
     buffer.jcc(Cond::L, fallback)?;
 
+    // A `Y` destination's frame-window guard goes **before** the element is read into
+    // the value scratch the guard uses as its window bound, so the guard cannot clobber
+    // the value and a rejection leaves no destination written (there is exactly one `Y`
+    // access per tuple read, so one guard is enough).
+    if shape.dst.is_y() {
+        shape
+            .dst
+            .guard_store(buffer, Y_ADDR_SCRATCH, MOVE_SCRATCH_2, fallback)?;
+    }
+
     // The element word, `8 * (1 + element)` past the header word.
     buffer.mov_rm(MOVE_SCRATCH_2, MOVE_SCRATCH, shape.element_disp)?;
-    store_x(
-        buffer,
-        shape.dst,
-        MOVE_SCRATCH_2,
-        allocation,
-        highest_touched,
-    )?;
+    shape
+        .dst
+        .store_at(buffer, Y_ADDR_SCRATCH, MOVE_SCRATCH_2, allocation, highest_touched)?;
     buffer.jmp(fast_done)?;
 
     // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
@@ -769,9 +803,9 @@ fn emit_tuple_read(
 //
 // The subset below is lowered natively and mirrors that branch for branch:
 //
-// * the tuple must be an x-register inside the engine's [`MAX_REGISTER`] bound — a `Y`
-//   operand, a literal operand or a register past the bound deopts (the interpreter
-//   step reports the faithful `bad_register`);
+// * the tuple must be an in-bound x-register or an addressable `Y` slot ([`Loc`]) — a
+//   literal operand, a register past the bound or an un-addressable `Y` index deopts
+//   (the interpreter step reports the faithful `bad_register`);
 // * the element operand must be an immediate constant word
 //   ([`super::operands::constant_word`]) or an in-bound x-register: a value that needs
 //   heap materialisation (a bignum/float/literal) is not a shape the tier lowers, so
@@ -802,12 +836,13 @@ pub(super) enum TupleWriteValue {
     Register(u32),
 }
 
-/// The x-register operands of a tuple write the tier lowers natively: the target
-/// tuple and the element value it stores.
+/// The operands of a tuple write the tier lowers natively: the target tuple and the
+/// element value it stores.
 #[derive(Clone, Copy)]
 pub(super) struct TupleWriteShape {
-    /// The `tuple` operand's x-register.
-    tuple: u32,
+    /// The `tuple` operand's location (an in-bound x-register or an addressable `Y`
+    /// slot).
+    tuple: Loc,
     /// The element value to store.
     value: TupleWriteValue,
     /// The byte offset of the written element from the header word.
@@ -817,8 +852,11 @@ pub(super) struct TupleWriteShape {
 impl TupleWriteShape {
     /// The x-register indices the shape's native lowering touches, in emission
     /// order (the target tuple first, then the value register when there is one).
+    ///
+    /// A `Y` tuple is a stack slot, not an x-register, so it is never charged.
     pub(super) fn registers(&self) -> Vec<u32> {
-        let mut registers = vec![self.tuple];
+        let mut registers = Vec::with_capacity(2);
+        registers.extend(self.tuple.register());
         if let TupleWriteValue::Register(x) = self.value {
             registers.push(x);
         }
@@ -832,22 +870,28 @@ impl TupleWriteShape {
     pub(super) fn writes(&self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// Whether the lowered sequence reads the current frame's Y window — a `Y` target
+    /// tuple ([`super::arith::uses_y`]'s per-shape test).
+    pub(super) fn uses_y(&self) -> bool {
+        self.tuple.is_y()
+    }
 }
 
 /// The inlinable shape of a `set_tuple_element Element Tuple Offset`, or `None` when
 /// the whole instruction must stay on the helper.
 ///
-/// The target tuple must be an x-register inside [`MAX_REGISTER`]; the element value
-/// must be an immediate constant word or an in-bound x-register (a value needing heap
-/// materialisation deopts); the offset's word must be addressable — see the section
-/// comment above.
+/// The target tuple must be an in-bound x-register or an addressable `Y` slot
+/// ([`Loc`]); the element value must be an immediate constant word or an in-bound
+/// x-register (a value needing heap materialisation deopts); the offset's word must be
+/// addressable — see the section comment above.
 pub(super) fn set_tuple_element_shape(
     element: &Operand,
     tuple: &Operand,
     offset: u32,
 ) -> Option<TupleWriteShape> {
     Some(TupleWriteShape {
-        tuple: in_bound_x(tuple)?,
+        tuple: Loc::of(tuple)?,
         value: match x_register(element) {
             Some(x) if x < MAX_REGISTER => TupleWriteValue::Register(x),
             Some(_) => return None,
@@ -948,11 +992,14 @@ fn emit_tuple_write(
     // the pointer tag *and* the literal bit from `MOVE_SCRATCH`, which must keep the
     // header pointer for the store — and reject `TAG_LITERAL_PTR`. The interpreter
     // refuses a shared-literal-area target rather than writing it, so the tier must too.
-    load_x(
+    // (A `Y` target re-reads its slot behind the same frame-window guard; `GUARD_SCRATCH`
+    // is the window bound here and is reloaded with the literal mask right after.)
+    shape.tuple.load(
         buffer,
-        shape.tuple,
         allocation,
         MOVE_SCRATCH_2,
+        GUARD_SCRATCH,
+        fallback,
         highest_touched,
     )?;
     buffer.mov_ri(GUARD_SCRATCH, LITERAL_MASK)?;
@@ -963,7 +1010,14 @@ fn emit_tuple_write(
     match shape.value {
         TupleWriteValue::Immediate(word) => buffer.mov_ri(MOVE_SCRATCH_2, word)?,
         TupleWriteValue::Register(x) => {
-            load_x(buffer, x, allocation, MOVE_SCRATCH_2, highest_touched)?
+            Loc::X(x).load(
+                buffer,
+                allocation,
+                MOVE_SCRATCH_2,
+                GUARD_SCRATCH,
+                fallback,
+                highest_touched,
+            )?;
         }
     }
     // The destructive store, `8 * (1 + offset)` past the header pointer.

@@ -226,6 +226,70 @@ pub(super) fn touch(highest: &mut Option<u32>, x: u32) {
     });
 }
 
+/// Emit `init_yregs Registers` natively, or report that the block must helper it.
+///
+/// Returns `true` when every listed register was written; returns `false` **without
+/// having emitted a byte** when any operand is neither an in-bound x-register nor an
+/// addressable `Y` slot ([`operands::locate_all`]) — the caller then emits exactly today's
+/// `jit_step_one` step, whose interpreter run reports the faithful `bad_register`.
+///
+/// The interpreter's arm writes `NIL` to each listed register in order (`write_operand`),
+/// and so does this: `NIL` is materialised once and stored into each register through its
+/// own representation — a cache register, its `machine.x` slot, or an addressable `Y` slot
+/// behind the shared frame-window guard. The instruction is emitted right after
+/// `allocate`, so the frame is live and the window was already published by the block
+/// prologue ([`Allocation::y_last`]).
+///
+/// A rejected `Y` guard branches to the single `fallback`, whose `jit_step_one` re-runs
+/// the whole instruction in the interpreter. A partially applied prefix is *idempotent*
+/// here: every store is `NIL` into the very slot the interpreter stores `NIL` into, so the
+/// re-run reaches exactly the interpreter's end state (a rejection only ever means "the
+/// slot lies outside the published frame window", which the interpreter's own `y(k)`
+/// resolves the same way).
+#[allow(clippy::too_many_arguments)]
+fn try_inline_init_yregs(
+    buffer: &mut CodeBuffer,
+    registers: &[beam_loader::Operand],
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Some(locations) = operands::locate_all(registers) else {
+        return Ok(false);
+    };
+
+    let fallback: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+
+    buffer.mov_ri(MOVE_SCRATCH, beam_term::NIL.raw() as i64)?;
+    for location in &locations {
+        if location.is_y() {
+            location.guard_store(
+                buffer,
+                operands::Y_ADDR_SCRATCH,
+                operands::Y_ADDR_SCRATCH_2,
+                fallback,
+            )?;
+        }
+        location.store_at(
+            buffer,
+            operands::Y_ADDR_SCRATCH,
+            MOVE_SCRATCH,
+            allocation,
+            highest_touched,
+        )?;
+    }
+    buffer.jmp(fast_done)?;
+
+    // Rejected (a `Y` register outside the current frame): one interpreter step.
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
+    Ok(true)
+}
+
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
 ///
 /// `highest_touched` accumulates the highest x-register index the emitted code
@@ -331,11 +395,43 @@ fn emit_block(
                     emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
-            // `swap A B` exchanges two x-registers; a block normally caches fewer
+            // `swap A B` exchanges two registers; a block normally caches fewer
             // registers than the instruction touches, so this is a common deopt it
-            // is cheap to remove (a three-`mov` shuffle, register or memory).
+            // is cheap to remove (a three-`mov` shuffle, register or memory). A `Y`
+            // side is exchanged through the shared frame-window guard (see
+            // [`r#move::emit_swap_y`]).
             Instr::Swap { a, b } => {
-                if !try_inline_swap(buffer, a, b, allocation, highest_touched)? {
+                if !try_inline_swap(
+                    buffer,
+                    a,
+                    b,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
+                }
+            }
+            // `init_yregs Registers` writes `NIL` into each listed register — the
+            // instruction the compiler emits right after `allocate` to clear a frame's
+            // `Y` slots. Every operand is written natively: an in-bound x-register
+            // (through its cache register when the block caches it, else its `machine.x`
+            // slot) or an addressable `Y` slot behind the frame-window guard. Any other
+            // operand kind (a float register, a literal, an out-of-bound index, an
+            // un-addressable `Y` index) refuses the whole instruction, which then deopts
+            // to the interpreter's own step.
+            Instr::InitYregs { registers } => {
+                if !try_inline_init_yregs(
+                    buffer,
+                    registers,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
                     emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }

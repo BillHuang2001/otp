@@ -230,20 +230,52 @@ impl FastArith<'_> {
 /// Whether lowering `instr` would read the current frame's Y window — the emitter's
 /// per-instruction Y gate ([`super::Allocation::y_last`]).
 ///
-/// True exactly for the two lowerings that read the window: the arithmetic fast path
-/// ([`FastArith::uses_y`], for a `Y` operand or `Y` destination `gc_bif`) and a `move`
-/// whose inlined shape has a `Y` source or `Y` destination ([`move_shape`] +
-/// [`super::r#move::MoveShape::uses_y`]). MUST stay in exact agreement with the inliners: a `move`
-/// shape the move inliner **refuses** deopts and reads nothing, so it must be false
-/// here too, or a later in-block Y access would use a window published before a
-/// `machine.stack` reallocation. Gate conservatively at the call site — a block whose
-/// code contains any such instruction publishes the window in its prologue, and
-/// refreshes it after an in-block helper call when one still follows.
+/// True exactly for the lowerings that read the window, each through its own
+/// **syntactic** shape predicate: the arithmetic fast path ([`FastArith::uses_y`], for a
+/// `Y` operand or a `Y` destination `gc_bif`), a `move` with a `Y` source or destination
+/// ([`move_shape`] + [`super::r#move::MoveShape::uses_y`]), a `swap` with a `Y` side
+/// ([`super::r#move::swap_shape`]), the cons-cell readers and the tuple reader/writer
+/// with a `Y` source/destination/target (`super::aggregate`'s `*_shape`), and an
+/// `init_yregs` listing an addressable `Y` register
+/// ([`super::operands::locate_all`]). MUST stay in exact agreement with the inliners: a
+/// shape an inliner **refuses** deopts and reads nothing, so it must be false here too,
+/// or a later in-block Y access would use a window published before a `machine.stack`
+/// reallocation. Gate conservatively at the call site — a block whose code contains any
+/// such instruction publishes the window in its prologue, and refreshes it after an
+/// in-block helper call when one still follows.
+///
+/// A `Y` slot is never an x-register, so none of these shapes charge the live intervals
+/// or `highest_native_register` (see [`super::regalloc`]).
 pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
-    if let Instr::Move { src, dst } = instr {
-        return move_shape(src, dst).map_or(false, |shape| shape.uses_y());
+    match instr {
+        Instr::Move { src, dst } => move_shape(src, dst).map_or(false, |shape| shape.uses_y()),
+        Instr::Swap { a, b } => {
+            super::r#move::swap_shape(a, b).map_or(false, |shape| shape.uses_y())
+        }
+        Instr::GetList { source, head, tail } => super::aggregate::get_list_shape(source, head, tail)
+            .map_or(false, |shape| shape.uses_y()),
+        Instr::GetHd { source, head } => {
+            super::aggregate::get_hd_shape(source, head).map_or(false, |shape| shape.uses_y())
+        }
+        Instr::GetTl { source, tail } => {
+            super::aggregate::get_tl_shape(source, tail).map_or(false, |shape| shape.uses_y())
+        }
+        Instr::GetTupleElement {
+            source,
+            element,
+            dst,
+        } => super::aggregate::get_tuple_element_shape(source, *element, dst)
+            .map_or(false, |shape| shape.uses_y()),
+        Instr::SetTupleElement {
+            element,
+            tuple,
+            offset,
+        } => super::aggregate::set_tuple_element_shape(element, tuple, *offset)
+            .map_or(false, |shape| shape.uses_y()),
+        Instr::InitYregs { registers } => super::operands::locate_all(registers)
+            .map_or(false, |locations| locations.iter().any(|location| location.is_y())),
+        _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
-    fast_arith(module, instr).map_or(false, |fast| fast.uses_y())
 }
 
 /// The fast path's shape test for `instr`, a *purely syntactic* check (it never
