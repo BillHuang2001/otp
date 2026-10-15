@@ -445,7 +445,13 @@ fn small_constant(operand: &Operand) -> Option<i64> {
 /// the fast path must classify a BIF by exactly the strings the interpreter's
 /// `GcBif` arm hands to [`ExecutionContext::call_bif`], or it would lower a call
 /// the interpreter routes somewhere else.
-pub(super) fn import_names<'m>(module: &'m Module, target: ImportRef) -> Option<(&'m str, &'m str, u32)> {
+///
+/// The sibling `baseline/bif_helper.rs` value helper reuses this same resolver (hence
+/// `pub(in crate::jit::baseline)`), so both fast-path routes classify a BIF identically.
+pub(in crate::jit::baseline) fn import_names<'m>(
+    module: &'m Module,
+    target: ImportRef,
+) -> Option<(&'m str, &'m str, u32)> {
     let import = module.imports.get(target.0 as usize)?;
     let module_name = module.atom_name(import.module)?;
     let function_name = module.atom_name(import.function)?;

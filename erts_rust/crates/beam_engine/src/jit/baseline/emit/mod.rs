@@ -124,7 +124,7 @@ use super::{jit_ext_call, jit_local_call, jit_set_position, jit_step_one};
 use super::runtime::{jit_publish_y, jit_refresh_y};
 
 mod aggregate;
-mod arith;
+pub(super) mod arith;
 mod bif;
 mod compare;
 mod compile;

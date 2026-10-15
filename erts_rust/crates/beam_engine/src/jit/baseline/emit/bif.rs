@@ -18,14 +18,16 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's **BIF** fast paths: `erlang:hd/1`, `erlang:element/2` and
-//! `erlang:tuple_size/1` lowered in block instead of deopting to one interpreter step.
+//! The baseline JIT's **BIF** fast paths: five `erlang:` accessors lowered in block
+//! instead of deopting to one interpreter step, through **two routes**.
 //!
-//! The compiler emits these three as a non-collecting `{bif,…}` (`Instr::Bif`) — pure
-//! term accessors with no heap effect — so leaving them to `jit_step_one` costs a helper
-//! round-trip per call for an operation that is two machine instructions plus a guard.
-//! Each is lowered through **the very code the equivalent aggregate instruction already
-//! uses**, so no new guard or store shape is invented:
+//! **(a) The pure aggregate accessors, reused in block.** `hd/1`, `element/2` (with a
+//! compile-time small-int index `>= 1`) and `tuple_size/1` are lowered through **the very
+//! code the equivalent aggregate instruction already uses**, so no new guard or store shape
+//! is invented. The compiler emits these three as a non-collecting `{bif,…}` (`Instr::Bif`)
+//! — pure term accessors with no heap effect — so leaving them to `jit_step_one` costs a
+//! helper round-trip per call for an operation that is two machine instructions plus a
+//! guard. Each is claimed **only** from `Instr::Bif`:
 //!
 //! * `hd/1` is [`emit::aggregate::try_inline_get_hd`] — the `get_hd Source Head` lowering
 //!   (guard `is_list`, then read the CAR word into the destination);
@@ -36,18 +38,32 @@
 //! * `tuple_size/1` reuses the same `is_tuple` header guard and derives the arity from the
 //!   header word the guard leaves behind (see [`try_inline_tuple_size`]).
 //!
+//! **(b) `byte_size/1` and `length/1`, evaluated natively by the Rust helper.** Neither
+//! value is a plain word read — `byte_size/1` rounds the bit size up to whole bytes and
+//! `length/1` walks a *proper* list — so both are computed by [`jit_bif_value`], whose Rust
+//! body reproduces the `beam_bifs` ground truth word for word. This route is claimed from
+//! **either** `Instr::Bif` or `Instr::GcBif`, because the installed corpus emits both as the
+//! collecting `{gc_bif,…}` (`Instr::GcBif`); the instruction's own `fail` label and raise
+//! semantics stay the interpreter's, and the helper re-reads its operand from the running
+//! module.
+//!
 //! Every rejection — an operand outside the addressable set, an index that is not a
 //! compile-time small int, or any *run-time* guard failure (a non-cons source, a non-tuple
-//! source, an out-of-range index) — branches to the same [`emit_step_and_continue`] the
-//! instruction would have taken before, i.e. exactly one interpreter step. The
-//! interpreter's `Bif` arm then calls the real BIF through the host, so every error
-//! (`badarg` for `hd(5)`/`hd([])`/`element(0, T)`/`element(9, {a})`/`tuple_size([1])`) is
-//! the interpreter's own: the fast path can only ever *produce the same value* or
-//! *decline*, never a different result. It allocates nothing and touches no heap word.
+//! source, an out-of-range index, a non-bitstring `byte_size/1`, a non-list/improper
+//! `length/1`, or a shape the helper's pure read cannot address) — branches to the same
+//! [`emit_step_and_continue`] the instruction would have taken before, i.e. exactly one
+//! interpreter step. The interpreter's `Bif`/`GcBif` arm then calls the real BIF through the
+//! host, so every error (`badarg` for `hd(5)`/`hd([])`/`element(0, T)`/`element(9, {a})`/
+//! `tuple_size([1])`/`byte_size(0)`/`length({a})`) is the interpreter's own: the fast path
+//! can only ever *produce the same value* or *decline*, never a different result. Route (a)
+//! allocates nothing and touches no heap word; route (b) reads its operand through the
+//! engine's own `read_operand` and writes its result through `write_operand`, and the emitted
+//! code refills the cached x-registers from the helper's [`emit_continue_check`] word exactly
+//! as it does after a deopt.
 //!
-//! The two shape functions ([`bif_shape`]/[`bif_uses_y`]) are **purely syntactic** — they
+//! The shape functions ([`bif_shape`]/[`bif_uses_y`]) are **purely syntactic** — they
 //! classify by the import's names and the operands' kinds and never consult the register
-//! allocation — so [`super::regalloc`] and [`super::emit_block`] agree on which `Bif`s are
+//! allocation — so [`super::regalloc`] and [`super::emit_block`] agree on which BIFs are
 //! lowered, exactly like every other shape predicate in this directory.
 
 use beam_common::Result;
@@ -184,8 +200,9 @@ fn value_registers(dst: &Operand) -> (Vec<u32>, Vec<u32>) {
     }
 }
 
-/// Classify `instr` as one of the three lowered BIFs, with the destination operand every
-/// one of them writes.
+/// Classify `instr` as one of the five lowered BIFs — the three pure accessors reused from
+/// the aggregate read guards, or the two helper-evaluated value accessors — with the
+/// destination operand every one of them writes.
 ///
 /// The test is exactly the interpreter's own dispatch key: the import's **module** name is
 /// `erlang`, its arity matches `Instr::Bif`'s, and the argument count matches; anything
