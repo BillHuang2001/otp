@@ -313,7 +313,7 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   return to baseline (no leak on the tested paths).
 - Gate (GREEN required, current): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
   -p beam_alloc --no-fail-fast` → **244 lib + 18 (`tests/allocator.rs`) + 13 (`tests/heap.rs`) + 4
-  (`tests/hot_path.rs`) + 12 (`tests/reserved_heap.rs`) = 288 tests, 0 failures**;
+  (`tests/hot_path.rs`) + 12 (`tests/reserved_heap.rs`) = 291 tests, 0 failures**;
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets` is
   warning-free; and `... clippy -p beam_alloc --all-targets` reports nothing for this crate.
 - Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
