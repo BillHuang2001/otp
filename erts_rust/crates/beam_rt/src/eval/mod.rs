@@ -146,6 +146,15 @@ enum Flow {
         /// The original error, when the raise came from a BIF (kept so an
         /// uncaught exception reaches the CLI unchanged).
         origin: Option<BeamError>,
+        /// The **synthesized innermost trace item** of an `undef` raised by an
+        /// unresolved call target — `{CalleeModule, CalleeFunction, ArgList, []}`,
+        /// built at the failing call site from that site's own callee identity and
+        /// its **real** arguments (see [`Evaluator::with_callee_head_item`]).
+        ///
+        /// `None` for every other raise: the tree-walker renders no `erl_eval`
+        /// frame of its own (there is no `erl_eval` port here), so this is the one
+        /// item it can honestly contribute to a trace.
+        head: Option<Eterm>,
     },
     /// An uncatchable error: a `halt`, or a typed runtime failure.
     Fatal(BeamError),
@@ -356,6 +365,10 @@ fn finish(result: EResult<Eterm>, ctx: &RuntimeContext<'_>) -> Result<Eterm> {
             class,
             reason,
             origin,
+            // The cooked trace (a `try … catch C:R:S` / `catch` binding) is rendered
+            // where it is caught, not here; an *uncaught* raise reaches the CLI as the
+            // raise's own `origin` error, exactly as before.
+            head: _,
         }) => match origin {
             Some(err) => Err(err),
             None => {
@@ -811,6 +824,7 @@ impl Evaluator<'_, '_> {
             class: ExceptionClass::Error,
             reason,
             origin: None,
+            head: None,
         })
     }
 
@@ -903,6 +917,7 @@ impl Evaluator<'_, '_> {
                         class: ExceptionClass::Error,
                         reason: args[0],
                         origin: None,
+                        head: None,
                     })
                 }
                 ("exit", 1) => {
@@ -910,6 +925,7 @@ impl Evaluator<'_, '_> {
                         class: ExceptionClass::Exit,
                         reason: args[0],
                         origin: None,
+                        head: None,
                     })
                 }
                 ("throw", 1) => {
@@ -917,6 +933,7 @@ impl Evaluator<'_, '_> {
                         class: ExceptionClass::Throw,
                         reason: args[0],
                         origin: None,
+                        head: None,
                     })
                 }
                 ("nif_error", 1) | ("nif_error", 2) => {
@@ -931,6 +948,7 @@ impl Evaluator<'_, '_> {
                         class: ExceptionClass::Error,
                         reason: args[0],
                         origin: None,
+                        head: None,
                     });
                 }
                 ("apply", 2) => return self.apply_2(&args),
@@ -985,7 +1003,23 @@ impl Evaluator<'_, '_> {
         }
         match self.ctx.apply_fun(function, args) {
             Ok(value) => Ok(value),
-            Err(err) => Err(self.flow_from_error(err)),
+            Err(err) => {
+                let flow = self.flow_from_error(err);
+                // An external `fun m:f/A` whose target does not exist raises `undef`
+                // naming that callee; a local/imported fun exposes no module through
+                // the term (its descriptor carries none), so nothing is synthesized
+                // there rather than a guess.
+                let flow = match (
+                    beam_codec::term::fun_module(function),
+                    beam_codec::term::fun_function(function),
+                ) {
+                    (Ok(module), Ok(name)) => {
+                        self.with_callee_head_item(flow, make_atom(module), make_atom(name), args)
+                    }
+                    _ => flow,
+                };
+                Err(flow)
+            }
         }
     }
 
@@ -1042,6 +1076,7 @@ impl Evaluator<'_, '_> {
             class: ExceptionClass::Error,
             reason,
             origin: None,
+            head: None,
         })
     }
 
@@ -1096,6 +1131,7 @@ impl Evaluator<'_, '_> {
                                 class: ExceptionClass::Error,
                                 reason,
                                 origin: None,
+                                head: None,
                             })
                         }
                     }
@@ -1106,7 +1142,8 @@ impl Evaluator<'_, '_> {
                 class,
                 reason,
                 origin,
-            }) => self.catch_clauses(&try_block.catches, class, reason, origin, env),
+                head,
+            }) => self.catch_clauses(&try_block.catches, class, reason, origin, head, env),
         };
         if !try_block.after.is_empty() {
             let mut after_env = env.clone();
@@ -1118,7 +1155,8 @@ impl Evaluator<'_, '_> {
     /// Matches an exception against a `try`'s catch clauses.
     ///
     /// The 3rd (stacktrace) pattern of a clause is matched against the **cooked** trace,
-    /// exactly as the oracle's `try … catch C:R:S -> … end` binds it: the supplied
+    /// exactly as the oracle's `try … catch C:R:S -> … end` binds it: the raise's
+    /// synthesized callee head item (an `undef`) followed by the supplied
     /// `erlang:raise/3` frames, rendered `[{M,F,A,Location}]` (see
     /// [`Evaluator::cook_supplied_trace`]). The trace is computed **lazily**, at most
     /// once, and only when some clause actually carries a stacktrace pattern, so a
@@ -1129,6 +1167,7 @@ impl Evaluator<'_, '_> {
         class: ExceptionClass,
         reason: Eterm,
         origin: Option<BeamError>,
+        head: Option<Eterm>,
         env: &Env,
     ) -> EResult<Eterm> {
         let class_term = self.atom(class.as_str());
@@ -1145,7 +1184,7 @@ impl Evaluator<'_, '_> {
             if matched {
                 if let Some(pattern) = &clause.stacktrace {
                     if cooked_trace.is_none() {
-                        cooked_trace = Some(self.cook_supplied_trace(&origin)?);
+                        cooked_trace = Some(self.cook_supplied_trace(&origin, head)?);
                     }
                     let trace = cooked_trace.expect("the cooked trace was just computed");
                     matched = self.match_pattern(pattern, trace, &mut clause_env)?;
@@ -1159,12 +1198,14 @@ impl Evaluator<'_, '_> {
             }
             return self.exprs(&clause.body, &mut clause_env);
         }
-        // No clause matched: re-raise the **same** exception, `origin` included, so an
-        // outer `catch`/`try` still sees the supplied stacktrace.
+        // No clause matched: re-raise the **same** exception, `origin` and the
+        // synthesized head item included, so an outer `catch`/`try` still sees the
+        // supplied stacktrace.
         Err(Flow::Raise {
             class,
             reason,
             origin,
+            head,
         })
     }
 
@@ -1336,8 +1377,8 @@ impl Evaluator<'_, '_> {
     /// Folds **by class**, the literal `erl_eval` rule (`lib/stdlib/src/erl_eval.erl`):
     /// a `throw` yields the reason, an `exit` yields `{'EXIT', Reason}` (never a trace,
     /// even if one was supplied), and an `error` yields `{'EXIT', {Reason, Trace}}`
-    /// **always** — a 2-tuple whose trace is the raise's supplied `erlang:raise/3`
-    /// frames (or `[]`).
+    /// **always** — a 2-tuple whose trace is the raise's synthesized callee head item
+    /// (an `undef`) followed by its supplied `erlang:raise/3` frames (or `[]`).
     fn catch_expr(&mut self, inner: &Expr, env: &mut Env) -> EResult<Eterm> {
         match self.expr(inner, env) {
             Ok(value) => Ok(value),
@@ -1346,10 +1387,11 @@ impl Evaluator<'_, '_> {
                 class,
                 reason,
                 origin,
+                head,
             }) => match class {
                 ExceptionClass::Throw => Ok(reason),
                 ExceptionClass::Error => {
-                    let trace = self.cook_supplied_trace(&origin)?;
+                    let trace = self.cook_supplied_trace(&origin, head)?;
                     let tag = self.atom("EXIT");
                     let reason = heap!(terms::make_tuple(self.ctx, &[reason, trace]));
                     Ok(heap!(terms::make_tuple(self.ctx, &[tag, reason])))
@@ -1362,34 +1404,51 @@ impl Evaluator<'_, '_> {
         }
     }
 
-    /// Cooks a raise's supplied stacktrace into the oracle's `[{M,F,A,Location}]` list.
+    /// Cooks a raise's trace into the oracle's `[{M,F,A,Location}]` list.
     ///
-    /// The trace is the frames an `erlang:raise/3` **supplied** (`raise.stacktrace`),
-    /// rendered by the engine's public
-    /// [`encode_supplied_stacktrace`](beam_engine::encode_supplied_stacktrace) exactly as
-    /// the oracle renders it (innermost first). A raise that carries no
-    /// [`BeamError::Raise`] (e.g. `erlang:error/1`, an arithmetic error — the tree-walker
-    /// gathers no frames) cooks to [`NIL`], the empty trace.
+    /// Two sources, innermost first:
+    ///
+    /// * the raise's **synthesized callee head item** (`head`) — the one item the
+    ///   tree-walker can honestly contribute, built at the failing call site of an
+    ///   `undef` (see [`Evaluator::with_callee_head_item`]); and
+    /// * the frames an `erlang:raise/3` **supplied** (`raise.stacktrace`), rendered by
+    ///   the engine's public
+    ///   [`encode_supplied_stacktrace`](beam_engine::encode_supplied_stacktrace) exactly
+    ///   as the oracle renders it (innermost first).
+    ///
+    /// A raise with neither — `erlang:error/1`, an arithmetic error — cooks to [`NIL`],
+    /// the empty trace. The walker renders **no** `erl_eval`/`init` frame of its own:
+    /// there is no `erl_eval` port here, and a fabricated frame would be a wrong term.
     ///
     /// The `module` argument is an **atom source only** — resolved by lookup, nothing is
     /// interned — so it carries a **clone** of the runtime's shared atom table (built
     /// after the raise's frame names were already interned by the `-eval` expression), and
     /// a name the table cannot resolve surfaces as the typed `error::unsupported(...)`,
     /// never a substituted atom.
-    fn cook_supplied_trace(&mut self, origin: &Option<BeamError>) -> EResult<Eterm> {
-        let Some(BeamError::Raise(raise)) = origin else {
-            return Ok(NIL);
+    fn cook_supplied_trace(
+        &mut self,
+        origin: &Option<BeamError>,
+        head: Option<Eterm>,
+    ) -> EResult<Eterm> {
+        let mut trace = match origin {
+            Some(BeamError::Raise(raise)) => {
+                let module = beam_loader::Module {
+                    atom_table: self.ctx.runtime.code_server.atoms().clone(),
+                    ..beam_loader::Module::default()
+                };
+                let ctx: &mut dyn ExecutionContext = &mut *self.ctx;
+                heap!(beam_engine::encode_supplied_stacktrace(
+                    &module,
+                    ctx,
+                    &raise.stacktrace
+                ))
+            }
+            _ => NIL,
         };
-        let module = beam_loader::Module {
-            atom_table: self.ctx.runtime.code_server.atoms().clone(),
-            ..beam_loader::Module::default()
-        };
-        let ctx: &mut dyn ExecutionContext = &mut *self.ctx;
-        Ok(heap!(beam_engine::encode_supplied_stacktrace(
-            &module,
-            ctx,
-            &raise.stacktrace
-        )))
+        if let Some(item) = head {
+            trace = heap!(terms::make_cons(self.ctx, item, trace));
+        }
+        Ok(trace)
     }
 
     /// `fun Name/Arity` / `fun Mod:Name/Arity` — a local `fun f/A` is `erlang:f/A`.
@@ -1551,6 +1610,7 @@ impl Evaluator<'_, '_> {
                         class: ExceptionClass::Error,
                         reason: self.bad_generator(source)?,
                         origin: None,
+                        head: None,
                     });
                 };
                 // The pattern may materialize terms (a `binary` sub-segment) on the heaps
@@ -1597,6 +1657,7 @@ impl Evaluator<'_, '_> {
             class: ExceptionClass::Error,
             reason: self.bad_generator(value)?,
             origin: None,
+            head: None,
         })
     }
 
@@ -1848,16 +1909,131 @@ impl Evaluator<'_, '_> {
     // -- primitives -----------------------------------------------------------
 
     /// Dispatches `module:function(args)` through the host, converting an error.
+    ///
+    /// A failure that is the bare `error:undef` — the host could not resolve the call
+    /// target — additionally carries the synthesized callee head item (see
+    /// [`Evaluator::with_callee_head_item`]), so a caught raise renders the oracle's
+    /// innermost `{Module, Function, ArgList, []}` trace item.
     fn call(&mut self, module: &str, function: &str, args: &[Eterm]) -> EResult<Eterm> {
         match self
             .ctx
             .call_bif(module, function, args.len() as u32, args)
         {
             Ok(value) => Ok(value),
-            Err(err) => Err(self.flow_from_error(err)),
+            Err(err) => {
+                let flow = self.flow_from_error(err);
+                let flow = self.with_callee_head_str(flow, module, function, args);
+                Err(flow)
+            }
         }
     }
 
+    /// [`Evaluator::with_callee_head_item`] for a call named by its `module`/`function`
+    /// **strings** (interned here); the atoms are already interned for an `apply/3` whose
+    /// module/function came from a term, so interning is a no-op lookup there.
+    fn with_callee_head_str(
+        &mut self,
+        flow: Flow,
+        module: &str,
+        function: &str,
+        args: &[Eterm],
+    ) -> Flow {
+        if !self.is_undef_raise(&flow) {
+            return flow;
+        }
+        let module = self.atom(module);
+        let function = self.atom(function);
+        self.with_callee_head_item(flow, module, function, args)
+    }
+
+    /// Attaches the **synthesized callee head item** — `{Module, Function, ArgList, []}`
+    /// — to a bare-`error:undef` raise, so a caught `try … catch C:R:S` (or a bare
+    /// `catch`) renders the oracle's innermost trace item.
+    ///
+    /// The oracle's `undef` names its missing callee **only** through the trace: C's
+    /// `build_stacktrace` puts the failing call's **real** argument list in the item's
+    /// `A` slot (see `crates/beam_engine/src/families/exceptions/callee.rs`, whose
+    /// compiled-code path synthesizes the same item). The tree-walker is the failing call
+    /// site here, so it is the one place that knows the callee identity and its evaluated
+    /// arguments.
+    ///
+    /// * `module`/`function` are **atom immediates** and `args` the **real** argument
+    ///   list, so nothing is fabricated: no `erl_eval`/`init` frame is invented (there is
+    ///   no `erl_eval` port), and `Location` is the empty list exactly as the oracle's is
+    ///   for a callee that does not exist.
+    /// * It applies only to the bare `undef` ([`Evaluator::is_undef_raise`]) and only when
+    ///   no head item is present yet, so every other raise keeps today's trace and a
+    ///   re-raised `undef` keeps the item it already carries.
+    ///
+    /// A failure to build the item (heap exhaustion) leaves the raise's class/reason
+    /// untouched — today's empty trace — rather than masking the real exception with a
+    /// `system_limit`.
+    fn with_callee_head_item(
+        &mut self,
+        flow: Flow,
+        module: Eterm,
+        function: Eterm,
+        args: &[Eterm],
+    ) -> Flow {
+        let Flow::Raise {
+            class,
+            reason,
+            origin,
+            head: None,
+        } = flow
+        else {
+            return flow;
+        };
+        if !self.is_bare_undef_start(class, reason) {
+            return Flow::Raise {
+                class,
+                reason,
+                origin,
+                head: None,
+            };
+        }
+        match self.callee_head_item(module, function, args) {
+            Ok(item) => Flow::Raise {
+                class,
+                reason,
+                origin,
+                head: Some(item),
+            },
+            Err(_) => Flow::Raise {
+                class,
+                reason,
+                origin,
+                head: None,
+            },
+        }
+    }
+
+    /// Whether `flow` is the bare `error:undef` raise a synthesized head item belongs to.
+    fn is_undef_raise(&self, flow: &Flow) -> bool {
+        matches!(
+            flow,
+            Flow::Raise { class, reason, head: None, .. }
+                if self.is_bare_undef_start(*class, *reason)
+        )
+    }
+
+    /// Whether a raise of `class` with `reason` is the bare `undef` — class `error` and
+    /// the reason **atom** `undef` (never a structured reason, and never another class).
+    fn is_bare_undef_start(&self, class: ExceptionClass, reason: Eterm) -> bool {
+        class == ExceptionClass::Error && self.atom_name(reason).as_deref() == Some("undef")
+    }
+
+    /// The item `{Module, Function, ArgList, []}` for the callee `module:function` applied
+    /// to `args` — one 4-element tuple plus one cons cell per argument.
+    fn callee_head_item(
+        &mut self,
+        module: Eterm,
+        function: Eterm,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let arg_list = terms::make_list(self.ctx, args)?;
+        terms::make_tuple(self.ctx, &[module, function, arg_list, NIL])
+    }
     /// Converts a [`BeamError`] into the evaluator's control flow.
     ///
     /// A `halt` is [`Flow::Fatal`] — an Erlang `catch`/`try` must not intercept
@@ -1899,6 +2075,7 @@ impl Evaluator<'_, '_> {
                     class,
                     reason,
                     origin: Some(err),
+                    head: None,
                 };
             }
         }
@@ -1922,6 +2099,7 @@ impl Evaluator<'_, '_> {
                     class,
                     reason,
                     origin: Some(err),
+                    head: None,
                 }
             }
             None => Flow::Fatal(err),
@@ -2001,6 +2179,7 @@ impl Evaluator<'_, '_> {
             class,
             reason,
             origin: None,
+            head: None,
         }
     }
 
