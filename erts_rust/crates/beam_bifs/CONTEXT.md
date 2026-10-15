@@ -614,16 +614,17 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
   `process_info/2` position items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`/
   `catchlevel`) as typed gaps for a live module-scheduled process; each with a file:line, a fix shape and a repro,
   plus what is **not** a gap and two sibling doc corrections owed.
-- **`ets:foldl/3`/`foldr/3` need the registry *lent* into the nested call.** `beam_rt/src/context/calls.rs` drops
-  the shared `TableRegistry` whenever `reentrancy_capable(args)` is true (any fun arg), so an `ets:*` executed by the
-  fold's own fun answers `beam_rt: unsupported: bif`. This crate's side is done: `BifContext::call_fun` now `take`s
-  the registry out and hands it to the **defaulted** `FunCaller::call_fun_with_tables(fun, args, tables)`, restoring
-  it after the call (error path included), so double-borrow is structurally impossible.
+- **`ets:foldl/3`/`foldr/3` need the registry *lent* into the nested call.** `beam_rt` installs the shared table cell
+  for the two folds (`beam_rt/src/context/dispatch.rs::tables_capable`; `beam_rt/src/context/calls.rs` exempts the
+  two `FUN_CALLER_BIFS` members that also need `ctx.tables()`), so the fold itself reaches the table — but the outer
+  borrow makes a **nested** `ets:*` inside the fold's own fun fail its `try_borrow_mut` and answer
+  `beam_rt: unsupported: bif` (`beam_rt/src/context/calls.rs:326-333`). This crate's side is done: `BifContext::call_fun`
+  now `take`s the registry out and hands it to the **defaulted** `FunCaller::call_fun_with_tables(fun, args, tables)`,
+  restoring it after the call (error path included), so double-borrow is structurally impossible.
   **Required change (`beam_rt`):** implement `call_fun_with_tables` on `beam_rt`'s `FunBridge`
   (`src/context/bridges.rs`) — install the lent registry into the nested `BifContext` with `with_tables` (it may
   simply forward the `Option<&mut TableRegistry>` to the nested context the bridge builds) — and then drop the
-  `reentrancy_capable` special-casing of the two `ets` folds (the only `FUN_CALLER_BIFS` members that also need
-  `ctx.tables()`), or keep it: either way the nested registry must arrive. The default body of the new method
+  `reentrancy_capable` special-casing of the two `ets` folds. The default body of the new method
   ignores `tables`, so `beam_rt` compiles unchanged until it opts in.
 - **The `FunIdentityBridge` snapshot is rebuilt per BIF call:** `beam_rt/src/context/calls.rs:201` calls
   `FunIdentityBridge::new(...)` per registered-BIF call for the four `LOCAL_FUN_IDENTITY_BIFS` (incl.
