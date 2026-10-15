@@ -1986,6 +1986,28 @@ mod tests {
         }
     }
 
+    /// The `run` batch action records a synthetic `-noshell` so it is banner-free (the booted
+    /// kernel's `user_drv` gates the OTP slogan on `init:get_argument(noshell)`), while still
+    /// driving the full default boot script. The recording is **scoped to `run`** and never
+    /// duplicated when the user already supplied one.
+    #[test]
+    fn run_action_records_a_single_scoped_noshell_init_argument() {
+        // `run` records exactly one `-noshell` (no values) alongside the batch action.
+        let config = parsed(&["run", "mod.beam", "m:f/0"]);
+        assert!(matches!(config.action, Action::RunFile { .. }));
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+
+        // A user-supplied `-noshell` before `run` is NOT duplicated: still exactly one.
+        let config = parsed(&["-noshell", "run", "mod.beam", "m:f/0"]);
+        assert!(matches!(config.action, Action::RunFile { .. }));
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+
+        // The synthetic `noshell` is scoped to `run`: the other ERTS-native actions keep their
+        // oracle-faithful banner behaviour and record no `noshell`.
+        assert_eq!(parsed(&["-eval", "2+3"]).init_args.get("noshell"), None);
+        assert_eq!(parsed(&["-s", "mod", "fun"]).init_args.get("noshell"), None);
+    }
+
     #[test]
     fn run_argument_tokens_are_parsed_individually() {
         assert_eq!(parse_arg_term("2").expect("int"), ArgTerm::Int(2));
