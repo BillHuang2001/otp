@@ -53,7 +53,7 @@ Everything outside the grammar is a typed capability gap: the parser (and a few 
 - The compatibility gate (`../../tools/differential/`) is the end-to-end check; this node's corpus probes are the `Eval`/`semantics`/`boot` groups.
 
 ## Routing Table
-- `mod.rs` → the tree-walking `Evaluator` (expressions, patterns, guards, comprehensions, the `BitBuf` binary builder), `Flow`/`EResult`/`Env`, the entry points (`eval`, `apply_eval_closure`, `EVAL_FUN_UNIQ`, `FunBody`), `finish`/`flow_from_error`, `catch_expr`/`catch_clauses`/`cook_supplied_trace` (the per-class caught-raise fold), and the colocated unit suite (incl. the evaluation-order gate).
+- `mod.rs` → the tree-walking `Evaluator` (expressions, patterns, guards, comprehensions, the `BitBuf` binary builder), `Flow`/`EResult`/`Env`, the entry points (`eval`, `apply_eval_closure`, `EVAL_FUN_UNIQ`, `FunBody`), `finish`/`flow_from_error`, `with_callee_head_item`/`callee_head_item` (the `undef` callee head trace item), `catch_expr`/`catch_clauses`/`cook_supplied_trace` (the per-class caught-raise fold), and the colocated unit suite (incl. the evaluation-order gate).
 - `ast.rs` → the untyped AST: `Expr` (used for both expressions and patterns) plus `BinOp`/`UnOp`/`Seg`/`SegKind`/`Endian`/`Clause`/`CatchClause`/`FunClause`/`Try`/`Receive`/`Qual`/`MapField` and `is_var_name`.
 - `parse.rs` → the `Lexer` (tokens, all bases, floats, strings/chars + escapes, comments) and the Pratt `Parser` (`parse`, the `in_segment`/`no_remote` context flags, all control forms), plus the colocated unit suite.
 
