@@ -94,6 +94,11 @@ Both are the *only* entry points; all intermediate types are public for inspecti
 - `pub struct FunDescriptor { pub function: Atom, pub arity: u32, pub label: Label, pub index: u32,
   pub num_free: u32, pub uniq: u32 }` — one `FunT` lambda descriptor; `Module::fun(i)` selects the
   entry whose `make_fun3`/`call_fun2` *fun-table index* is `i` (its position in `Module::funs`).
+  `function` is the `FunT` entry's **function atom** — the atom of the function whose body `label`
+  names (`beam_dict:lambda_table/1` resolves it through the module's local/export label tables), i.e.
+  exactly the name `erlang:fun_info(F, name)` reports: `mk` for a named local fun (`fun mk/1`, `mk/1`
+  being a local non-exported function), the compiler-generated `'-anon/1-fun-0-'` for an anonymous
+  `fun … end` (oracle-cross-checked by `tests/fun_name.rs`).
 - `pub struct RecordDefinition { pub name: Atom, pub is_exported: bool, pub fields: Vec<RecordField> }`
   — one `Recs` **native-record** definition (`-record #name{…}`), i.e. what the
   `records:get_definition/2` BIF serves as `{#{is_exported => Bool}, Fields}`. `name` is the record-name
@@ -576,6 +581,15 @@ silently-accepted wrong value:
   `gen_server:format_log/1,2`) — semantic evidence, not a count. Loudly skips when the system `erl`/OTP is
   unavailable (`skip_reason` still requires `stdlib`+`kernel`).
 - **`tests/widened_ir.rs`** also loads `tests/fixtures/bsalloc.beam` (the `bs_create_bin` `z,3` operand).
+- **`tests/fun_name.rs`:** the `FunT` **function-atom** oracle cross-check (no committed fixture — the
+  scratch `fiprobe` module is written to a temp dir and compiled with the system `erlc` at test time):
+  the descriptors of `named() -> fun mk/1` (a **named** local fun) and `anon(X) -> fun(Y) -> X + Y end`
+  (an **anonymous** lambda) are located by their module-unique `FunT` `index` (confirmed by `uniq` — the
+  name never takes part in the matching) and their `function` atom is asserted to name exactly the
+  string the live `erl` answers for `element(2, erlang:fun_info(F, name))` (`mk` / `-anon/1-fun-0-`,
+  both pinned so a change in what `erlc` emits cannot slip through). Skips **loudly** (never vacuously)
+  without `erl`/`erlc`; the oracle resolution mirrors `beam_bifs/tests/fun_info_whole_list.rs`
+  (`$ERTS_ORACLE` if executable, else `erl` on `$PATH`; `erlc` from the same directory else `$PATH`).
 - **`tests/records.rs`:** the `Recs` chunk over `tests/fixtures/records_fixture.beam` — the parsed
   definitions reproduce the pinned `records:get_definition/2` output (declaration order, every default
   encoding incl. the `u,0`/`i,0` distinction and the synthesized wide-`i` bignum literal), plus the
@@ -715,6 +729,7 @@ silently-accepted wrong value:
 - `tests/` → container/IR/widened-IR/records/checksum/negative/real-module integration tests
 - `tests/checksum.rs` → the module-checksum oracle: every committed fixture's digest against a pinned `beam_lib:md5/1` hex constant (meaningful without `erl`) *and* a live `erl` cross-check, plus a generically-discovered sample of installed OTP modules vs the live oracle, the `load_file`-digest == `module_md5` cross-path check, `Module::default()` == zeros, and a hand-built corrupt-`FunT` image rejected `BadArg`
 - `tests/records.rs` → `Recs`-chunk integration tests: declaration order, every default encoding, name/atom lookups, the pinned-`ORACLE` ↔ live-`erl` `records:get_definition/2` cross-check (bounded), and malformed-image rejection through `load` beside a well-formed control image
+- `tests/fun_name.rs` → the `FunT` function-atom oracle cross-check over a scratch `erlc`-compiled `fiprobe` module (named local fun vs anonymous lambda) against the live `erl`'s `fun_info(F, name)`
 - `tests/generic_census.rs` → the residual `Instr::Generic` census over the whole installed OTP `lib` root (all 34 apps / ≈1366 modules, discovered via the shared `tests/common/mod.rs` helpers; asserts the unmodelled-opcode set equals the documented baseline)
 - `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively, discovered via the shared `tests/common/mod.rs` helpers; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
 - `tests/native_record.rs` → the OTP-29 native-record family (186-191) over the committed `nr_def`/`nr_use` fixtures + the `erl_eval` `is_any_native_record` positive control + a stdlib/kernel/compiler sweep asserting no family member lowers to `Instr::Generic`

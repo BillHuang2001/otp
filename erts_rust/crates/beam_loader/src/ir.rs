@@ -228,7 +228,12 @@ impl Default for LineTable {
 /// (`beam_asm.erl`'s `beam_dict:lambda/3` hands out exactly that number).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FunDescriptor {
-    /// The name of the lambda's anonymous function.
+    /// The `FunT` entry's **function atom** — the atom of the function whose body
+    /// the lambda's `label` names (`beam_dict:lambda_table/1` resolves it through
+    /// the module's local/export label tables). This is the name
+    /// `erlang:fun_info(F, name)` reports: `mk` for a named local fun (`fun mk/1`,
+    /// `mk/1` being a local non-exported function), the compiler-generated
+    /// `'-anon/1-fun-0-'` for an anonymous `fun … end`.
     pub function: Atom,
     /// The lambda's arity (the number of *non-captured* arguments).
     pub arity: u32,
