@@ -200,8 +200,10 @@ use crate::jit::JitBackend;
 use crate::machine::{Machine, RunOutcome};
 use crate::Step;
 
+mod call;
 mod code;
 mod emit;
+mod family;
 mod receive;
 mod runtime;
 mod test_helper;

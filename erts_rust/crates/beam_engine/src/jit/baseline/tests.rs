@@ -6164,3 +6164,14 @@ fn the_heap_and_frame_admission_family_is_lowered_without_a_jit_step_one_deopt()
         snapshot.deopts_by_variant,
     );
 }
+
+// The lowering-specific test suites live in their own files, `#[path]`-included here so
+// they are children of this module and share its private harness (`with_both_tiers`,
+// `assert_same_outcome`, `body_module`, `build_module`).
+#[cfg(test)]
+#[path = "call_tests.rs"]
+mod call_tests;
+
+#[cfg(test)]
+#[path = "family_tests.rs"]
+mod family_tests;
