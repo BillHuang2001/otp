@@ -58,7 +58,7 @@ Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifCo
   `FunCaller` (`call_fun`); `PortHook` (`open_port`/`close_port`/`port_info`); `DictHook`
   (`put`/`get`/`erase`/`get_keys`/`get_keys_for_value` + defaulted `get_all`/`erase_all`); `PersistentTerm`
   (`get`/`put`/`erase`/`get_all`/`info`); `NifLoader` (`load_nif`); `RecordSource` (`record_definition`);
-  `LocalNode` (`local_node`); `LocalFunIdentity` (`local_fun_identity`); `ModuleInfo` (`module_info`);
+  `LocalNode` (`local_node`/`local_node_hash`); `LocalFunIdentity` (`local_fun_identity`); `ModuleInfo` (`module_info`);
   `ProcessHook` (`whereis`/`register`/`unregister`/`registered`/`is_process_alive`/`processes`/`ports`/
   `process_info_keys`/`process_info_item`/`process_flag`/`group_leader`); `MemoryHook` (`memory`); `RuntimeHooks`
   (`call`).
@@ -68,7 +68,8 @@ Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifCo
   `send/2`/`"!"/2`/`send/3`, the port/dict/`PersistentTerm`/`ProcessHook`/`ModuleInfo` BIFs, `load_nif/2`, and
   the fun-taking `lists`/`maps` BIFs **for a valid fun** (an invalid fun is rejected by the clause guard first,
   see the `FunCaller` section); `TermNotFound` for a new-atom BIF; `Ok(None)` for
-  `record_definition`/`local_fun_identity`/`module_info`; `(nonode@nohost, 0)` for `local_node`, else `None` when
+  `record_definition`/`local_fun_identity`/`module_info`/`local_node_hash` (the last keeps `term_to_binary/2`'s
+  `[local]` a typed gap); `(nonode@nohost, 0)` for `local_node`, else `None` when
   that atom is not interned here.
 - **`hook_sets.rs`** is the one authoritative home of the *seam-consumer* key sets: a `&'static` table per seam +
   an allocation-free `needs_*` predicate, re-exported at the root and in the prelude, pinned and `contains`-checked
@@ -290,8 +291,12 @@ short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
 - **Options.** `compressed`/`{compressed,0..=9}` really deflate a version-less body and wrap it `[131][80][len][zlib]`
   **only** when the stream fits the C's `body_len - 5` budget (bare atom = level 6); `{minor_version,0|1|2}` selects
   the tag set byte-identically; `iovec`/`fragment` are `badarg`. `[deterministic]` is **fully honoured** (threaded as
-  `Encoder::with_deterministic`, so every flat/HAMT/nested map is re-sorted into full term order); `local` stays the one
-  typed gap (its `LOCAL_EXT` payload is the per-VM `local_node_hash` — no seam). `[deterministic,local]`/unknown ⇒
+  `Encoder::with_deterministic`, so every flat/HAMT/nested map is re-sorted into full term order). `[local]` is honoured
+  whenever the runtime installs the `LocalNode::local_node_hash` seam (`BifContext::local_node_hash`): the image is the
+  `[131][121][hash:4 BE][body]` `LOCAL_EXT` wrapper (`Encoder::with_local_ext`/`finish_local(hash)`), whose **shape** is
+  byte-identical to the oracle's while its four payload bytes are the node-local, per-VM-start `local_node_hash`; with no
+  seam (or a hook answering `None`) it is the typed `unsupported_bif` gap, never a fabricated hash. `[local,compressed]`
+  deflates the *local body* (wrapper included), exactly as `erts_term_to_binary_simple` does. `[deterministic,local]`/unknown ⇒
   `badarg`; `/3` does not exist (oracle `undef`). `binary_to_term/2` takes `safe`/`used` (the count includes the `131` byte); on a
   top-level `COMPRESSED` image `[used]` is the compressed image's own length (trailing bytes ignored *and* uncounted).
 - **The local-node identity is installed on BOTH directions** (`LocalNode`; `(nonode@nohost, 0)` fallback): encoding
@@ -423,7 +428,10 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
 - **Correctness-by-construction pins.** `tests/decode_scratch.rs` carries the per-thread `DECODE_SCRATCH` image
   across calls, covering every stale-image shape (same table twice, a growing table, a *moved* name index, a shorter
   table, a fresh atom at exactly `shared.len()`, a truncated and a `safe` decode); `tests/binary_to_term_atoms.rs`
-  pins the hook level. `src/binconv.rs`'s unit tests cover the local-node identity both ways. `tests/binary_family.rs`
+  pins the hook level. `src/binconv.rs`'s unit tests cover the local-node identity both ways, and
+  `tests/term_to_binary_options.rs` pins the `[local]` seam image (`[131,121,1,2,3,4,body]` for a stub hash
+  `0x0102_0304`), the `NIL_EXT` node substitution under it, its `compressed` combination and the no-seam gap.
+  `tests/binary_family.rs`
   drives `binary:*` over an **off-heap** refc binary (a 96-byte `write_refc_binary` payload — the `bs_create_bin`
   shape above `ERL_ONHEAP_BINARY_LIMIT`). `tests/match_spec_arith.rs` proves both halves of the arithmetic hook.
 - **Oracle-backed suites.** `tests/{io_lib_format_chars_limit,io_lib_format_ts,io_lib_format_ts_limited}.rs` pin the
@@ -470,8 +478,10 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   The oracle's channel is `atom_val(x->sysname)` — the node-name atom's index in the **running VM's** atom table,
   state the frozen term does not carry (one `V4_PORT_EXT` image printed `#Port<10643.7>` then `#Port<10639.7>`). Needs a
   node-identity seam **and** a node-atom → dist-channel provider (both `beam_rt`, a new edge — Handoffs).
-- **`term_to_binary/2`'s `local`** answers the typed gap (the `LOCAL_EXT` hash is the running VM's per-start random
-  state, no seam); `deterministic` is closed (byte-exact). `erlang:external_size/2`'s `local` is the same gap.
+- **`term_to_binary/2`'s `local`** is seam-backed: it answers the typed gap only until the runtime installs
+  `LocalNode::local_node_hash` (the seam this crate exposes for it), because the `LOCAL_EXT` payload is the running VM's
+  per-start node-local hash. With a seam installed the image is byte-identical to the oracle's apart from those four
+  documented bytes. `deterministic` is closed (byte-exact). `erlang:external_size/2`'s `local` inherits the same seam.
 - **`erlang:raise/3`'s unrepresentable stacktrace elements** answer the typed gap while the argument is valid: an
   `erl_eval`-style `{Fun,Args}`/`{Fun,Args,Location}` call frame, a 3rd element that is an argument list or any
   other non-`0..=255` value (`-1`, `256`, `1.0`), an unnameable `Module`/`Function` atom, and a location that is
@@ -493,11 +503,10 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   `persistent_term:*`, `erlang:get/0`/`erase/0` (until `DictHook::get_all`/`erase_all`), `list_to_atom`/`binary_to_atom`/
   `binary_to_existing_atom` without an `AtomInterner` (`TermNotFound`), and `erlang:load_nif/2` without the
   `NifLoader` **and** `with_current_module`.
-- **The 172 `RuntimeHooks` seam keys: 32 served by `beam_rt`, ~99 unreachable** (re-derive by counting the
-  `RuntimeHooks::call` match arms in `beam_rt/src/context/runtime_hooks.rs`); 36 more are *shadowed* by `beam_rt`'s
-  native floor (dispatched before the registry) and ~41 are served by it. The gaps are the real work
-  (`erts_debug`/`erl_debugger` internals; distribution/tracing/code-loading/spawn/monitor machinery; NFC tables for
-  `prim_file:internal_normalize_utf8/1`). Detail: `./src/runtime/CONTEXT.md`.
+- **The 172 `RuntimeHooks` seam keys:** 32 served by `beam_rt` via `RuntimeHooksBridge`, ~41 by its native floor and
+  36 *shadowed* by it (dispatched before the registry); the remainder are unserved — re-derive by counting the
+  `RuntimeHooks::call` match arms in `beam_rt/src/context/runtime_hooks.rs`. Detail: `./src/runtime/CONTEXT.md`, and
+  the actionable list in Handoffs.
 - **`records:get_definition/2` without a `RecordSource` hook is `badarg`** (the oracle resolves in-module), and
   `records:create/4`'s error precedence differs for `[{1,1},5]` (oracle `{badfield,{{m,r},1}}`, here `badarg`).
 - **Integer/text limits:** `list_to_integer`/`binary_to_integer` of an over-long string ⇒ `SystemLimit`
@@ -619,13 +628,15 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - **~99 of the 172 `RUNTIME_HOOKS_BIFS` keys are still unserved** (e.g. `erlang:read_timer/1,2`,
   `beam_rt/src/context/tests.rs:2315-2325`); `beam_rt` serves 32 via `RuntimeHooksBridge` + ~41 via the native floor.
   Registering a key can only turn an `undef` into the honest `unsupported_bif`, never shadow a working result (the
-  native floor is dispatched *before* the registry).
+  native floor is dispatched *before* the registry). The gaps are the real work: `erts_debug`/`erl_debugger` internals;
+  distribution/tracing/code-loading/spawn/monitor machinery; NFC tables for `prim_file:internal_normalize_utf8/1`.
 - **Two stale near-miss fixtures** at `beam_rt/src/context/tests.rs:666` (`the_send_predicate_selects_only_the_message_sending_bifs`)
   and `:1022` (`SEND_HOOK_BIFS` `HookRoster` `misses`): `erlang:send/3` is now a real `BifFn` in `src/proc.rs` and a
   `SEND_HOOK_BIFS` consumer, so each must name a different near-miss (e.g. `("erlang", "send", 1)`).
 - **`beam_rt` must install every hook this crate exposes** (each defaults to an honest typed gap): `RecordSource`
   (`records:get_definition/2`, else `badarg`); `LocalNode` (internal pid/port `term_to_binary` — its
-  `(nonode@nohost, 0)` fallback and the `bm`/`ac` pattern tags need atoms `CORE_ATOMS` lacks); `LocalFunIdentity`
+  `(nonode@nohost, 0)` fallback and the `bm`/`ac` pattern tags need atoms `CORE_ATOMS` lacks — **and** the new
+  `local_node_hash` — see below); `LocalFunIdentity`
   (installed for compiled modules' local funs, NOT `-eval`; the answer must carry the `function` name atom —
   `FunIdentity::with_function` — so `fun_info(F, name)` resolves); `ModuleInfo`; `ProcessHook` (11
   `proc_reg` BIFs); `PersistentTerm`; the defaulted `DictHook::get_all`/`erase_all`; `AtomInterner`/`FunCaller`;
@@ -637,6 +648,19 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - **A node-identity + channel seam** is the only way to close the external-identifier gap (see Known Issues): the
   runtime's own node name plus a node-name-atom → dist-channel provider, additive to `LocalNode`
   (`local_node() -> Option<(Eterm, u32)>`) or a new seam (a new dependency edge, so reported, not assumed).
+- **`term_to_binary(T, [local])` / `erlang:external_size(T, [local])` — the write side is wired, the round trip needs
+  `beam_rt`'s hash.** This crate now builds the whole image (`src/binconv.rs::term_encoder` + `finish_local(hash)`), and
+  `src/term_conv.rs::external_size` routes `[local]` through the same encoder, so both BIFs answer the typed
+  `unsupported_bif` gap **only** while no `LocalNode::local_node_hash` hook is installed. To close the corpus divergence
+  `beam_rt` must do two things: (a) compute its own `local_node_hash` — the C's algorithm (`external.c:136-200`: the
+  Bob-Jenkins block hash over `[time_offset:8 LE][hostname][pid]` seeded with `erts_block_hash_init(…, monotonic_time &
+  0xffffffff)`, then folded through `erts_block_hash`) over its own hostname/pid/monotonic seed, and install it via
+  `with_local_node(...)` (the hash method is *on the same trait*, so one hook object supplies both); and (b) install that
+  same value into `beam_codec`'s decoder as the expected `LOCAL_EXT` hash (`beam_codec/src/decode/local_node.rs`, the
+  "D4" expected-hash slot) so `binary_to_term(term_to_binary(T,[local]))` round-trips **within** the runtime. Because the
+  seed includes the monotonic clock the value is **per-VM-start** — it can never match another VM's, so the differential
+  case must **mask** the four bytes (the `[131][121]` prologue, the four hash bytes and the body shape are what is
+  comparable).
 - **The A.9 in-machine self-host route's stale word is a runtime-level store, NOT a `beam_bifs` local:** the holder is
   `beam_rt`'s node-global `Runtime::persistent_terms`, the only runtime-level store not routed through
   `Runtime::try_stabilize_escaped` (`persistent_term:put/2` stores the caller's words verbatim, `erl_features` puts
@@ -671,9 +695,11 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
   `{{a,b}, Ref, process, P, Reason}`. Closing needs `beam_process` to hold a deep-copied tag (a table-owned/
   `TermStore` copy, like `Table::install_heir`) instead of a raw heap `Eterm`.
 - **`beam_codec` — `with_deterministic()` is wired** by `binconv::encode_body`; `encode_fun_external` already emits an
-  `EXPORT_EXT`'s **true** arity (`fun_true_arity_term`), so no >255-truncation. **Still owed:** a `local_node_hash` seam
-  so `beam_rt` can close `[local]` (and `external_size/2`'s inherited gap). Its only other remaining gap is the
-  reference-`id` representability one.
+  `EXPORT_EXT`'s **true** arity (`fun_true_arity_term`), so no >255-truncation. Its `with_local_ext()`/`finish_local(hash)`
+  write the `[131][121][hash:4 BE][body]` `LOCAL_EXT` image, so **the `local` option is now wired on this side too** —
+  `beam_bifs` supplies the four bytes from the (new, defaulted) `LocalNode::local_node_hash` seam. **Still owed by
+  `beam_rt`:** produce that hash (see below) and install it as the decoder's expected `LOCAL_EXT` value. `beam_codec`'s
+  only remaining gap is the reference-`id` representability one.
 - **Differential cases this node's coverage should be pinned by** (corpus owner: `../../tools/differential/`):
   records; wire (self-pid/internal-port `term_to_binary`, `export_ext_encode`); phash/phash2 edge values;
   `binary:compile_pattern` shapes; `short` float rendering; the printer (`~p`/`~P` re-flow, `~W` depth,
