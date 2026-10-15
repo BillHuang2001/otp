@@ -103,11 +103,11 @@ pub(crate) struct Allocation {
     /// * the **post-deopt refresh** ([`Allocation::refresh_y_after`]) is emitted only
     ///   when a still-later instruction accesses a Y slot.
     ///
-    /// Only the arithmetic fast path reads the window (see the Y-operand contract in
-    /// [`super::arith`]): an instruction "accesses a Y slot" exactly when
-    /// [`super::arith::uses_y`] says so. A `move`/`get_list`/… with a Y operand is
-    /// *not* a window access — it deopts to the interpreter, which reads
-    /// `machine.stack` itself.
+    /// Only the lowerings that read the window count: an instruction "accesses a Y
+    /// slot" exactly when [`super::arith::uses_y`] says so — the arithmetic fast path,
+    /// a `move`/`swap` with a `Y` side, a cons-cell read or tuple read/write with a `Y`
+    /// operand (each through its own syntactic shape predicate), and an `init_yregs`
+    /// listing an addressable `Y` register.
     pub(crate) y_last: Option<u32>,
     /// The block's **first pc** (`start`), the base `fill_sets` is indexed from.
     pub(crate) block_start: u32,

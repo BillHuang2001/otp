@@ -215,11 +215,10 @@ impl FastArith<'_> {
     ///
     /// A `Y` operand or a `Y` destination is read/written through
     /// `JitRuntime::y_base`/`y_end`, so the emitted code needs the window published.
-    /// This is the **one** predicate the emitter's Y-window gate rests on: the arith
-    /// fast path is the only lowering that reads the window (a `move`/`get_list`/… with
-    /// a Y operand deopts to the interpreter, which reads `machine.stack` itself). Any
-    /// future lowering that reads `y_base`/`y_end` MUST be reflected here, or the window
-    /// it reads would not be published.
+    /// This predicate feeds the emitter's per-instruction Y-window gate
+    /// ([`super::arith::uses_y`], which unions it with every other Y-reading lowering):
+    /// a `gc_bif` the fast path declines contributes nothing here and deopts to the
+    /// interpreter, which reads `machine.stack` itself.
     pub(crate) fn uses_y(&self) -> bool {
         matches!(self.dst, FastDest::Y(_))
             || y_register(self.a).is_some()
