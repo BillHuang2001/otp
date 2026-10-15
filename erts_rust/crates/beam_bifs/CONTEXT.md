@@ -215,7 +215,13 @@ interop and the round trip are). The stream API (`open`/`deflate`/`inflate`/`clo
   `/1` in Erlang) is the OTP-29 ten-key walk, sharing `item_value` with `/2` (so the two forms cannot disagree, and
   the `LocalFunIdentity` seam is consulted **once** per call) while dropping every `{Key,undefined}` pair; `/2` also
   gains the OTP-29 `pid` item (seam detail: Known Issues). Plus `fun_info_mfa/1`, `fun_to_list/1` and `make_fun/3`.
-  Arity split (oracle-verified): `fun_to_list/1` renders the **true** arity while `fun_info/2`'s `arity` and
+  `name` IS served for a `Local`/`Imported` fun: it is the lambda's local function atom, read from the seam's
+  `beam_codec::FunIdentity.function` (the `FunT` entry's `function` atom) — the same seam field for both kinds,
+  since a `NEW_FUN_EXT` wire image carries no name. The seam is consulted for `name` on a `Local` **or** `Imported`
+  fun, while every other `Imported` identity item keeps reading the inlined wire descriptor (the seam predicate is
+  `Item::needs_identity(kind)`: `External` → never, `Imported` → `Name` only, `Local` → `pid`/`new_uniq`/`index`/
+  `uniq`/`module`/`name`). An identity whose `function` is `None` leaves `name` the typed gap, never a fabricated
+  atom. Arity split (oracle-verified): `fun_to_list/1` renders the **true** arity while `fun_info/2`'s `arity` and
   `fun_info_mfa/1` read the header's 8-bit field — both are the C's own behaviour.
 - `term_conv.rs` (17): the term-conversion/textual-id BIFs plus `binary:referenced_byte_size/1`; the OTP-30
   `*_to_binary/1` are pinned to the C `"%T"` format (the oracle does not export them); `list_to_ref/1` bounds the id
@@ -373,7 +379,10 @@ access a `BifFn` lacks, so they stay unregistered. Load-bearing invariants:
   dependency edge requires reporting to `../`.
 - **Files target ~1000 lines**; several exceed that only via their in-module `#[cfg(test)]` suites, each
   implementation section staying under ~1300 lines. The printer and the `ets` bridge are **split by
-  responsibility**. Licensing Apache-2.0; every `*.rs` carries the OTP `// %CopyrightBegin% … // %CopyrightEnd%`
+  responsibility**. `src/fun_info.rs` is such a case (~1440 lines, implementation ~860): its size is the
+  comprehensive inline `#[cfg(test)]` module (the whole-list `/1` walk, the seam-backed identity items, the
+  `name` item and the produced-atom interning), not a bloated implementation.
+  Licensing Apache-2.0; every `*.rs` carries the OTP `// %CopyrightBegin% … // %CopyrightEnd%`
   Apache-2.0 block.
 
 ## Notes for Agents
@@ -469,11 +478,13 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   not exactly `[{file,CharList},{line,Integer}]` (an atom file name, a missing/extra pair, reversed order, a
   non-integer or out-of-`u32`-range line, an out-of-range code point). The oracle echoes every such shape
   verbatim — see the per-module contract above for the exact mapping and the untouched returned-`badarg` cases.
-- **Fun identity — `name` (and `fun_info_mfa/1`'s function element) only.** They need the loaded module's lambda
-  (`FunT`) name, which **no** seam carries (the oracle returns it for a *loaded* module, `[]` otherwise), so
-  `fun_info/1` of a non-external fun also raises. Every other identity item IS real: a `FunKind::Local` fun's
+- **Fun identity — `fun_info_mfa/1` of a `Local`/`Imported` fun only.** It needs the resolved MFA's *function* atom
+  **and** the lambda's true code arity, which no seam carries (the `LocalFunIdentity` seam's
+  `beam_codec::FunIdentity.function` supplies the `name` item, but not the code arity `fun_info_mfa/1` needs), so it
+  stays the typed gap. Every identity item IS real: `name` (for either kind) and, for a `FunKind::Local` fun,
   `module`/`new_uniq`/`index`/`uniq`/`pid` come from the `LocalFunIdentity` seam and `new_index` from the term
-  itself; a `FunKind::Imported` fun's from its own descriptor.
+  itself; a `FunKind::Imported` fun's identity items come from its own wire descriptor and its `name` from the same
+  seam. The `make_fun3` arm of the **printer**/`fun_to_list/1` is the one other remaining fun gap (see Divergences).
   **`phash2/1,2`/`phash/2`** of a `Local` fun and of an internal reference
   (`RefIdentityUnavailable`) are the same gap (the LCA's own `TermError`); a native record hashes with its real
   definition hash. **`erts_debug:flat_size/1`** of an external pid/port/ref is a gap too; every other term is computed.
@@ -598,6 +609,13 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
   consumer is already lazy: `binconv::encode_body` asks `ctx.local_fun_identity(term)` only for a `Local` fun).
   **Required change:** cache the snapshot in `Runtime` behind a generation counter and build the per-call bridge over
   it (`FunIdentityBridge::new_cached(&Arc<Snapshot>, …)`). Re-verify with `copy_bound/etf_roundtrip` in `RESULTS.md`.
+- **`fun_info(F, name)` on the real runtime needs the lambda name plumbed through.** `beam_rt/src/context/bridges.rs`
+  builds the `beam_codec::FunIdentity` from the running module's `FunT` entry, so it must attach the name
+  (`FunDescriptor.function`) — e.g. `…with_function(descriptor.function)` — or `name` stays the typed gap for a
+  compiled `make_fun3` fun. And `beam_rt/src/context/fun_identity.rs` (`FunIdentityBridge`) answers `Ok(None)` for
+  any non-`Local` term, so naming an `Imported` (`NEW_FUN_EXT`) fun in the real runtime needs this crate's
+  `LocalFunIdentity` seam to resolve `(module, old_index)` for an `Imported` term too (this crate already consults
+  it for an `Imported` fun's `name` only — see `Item::needs_identity`).
 - **~99 of the 172 `RUNTIME_HOOKS_BIFS` keys are still unserved** (e.g. `erlang:read_timer/1,2`,
   `beam_rt/src/context/tests.rs:2315-2325`); `beam_rt` serves 32 via `RuntimeHooksBridge` + ~41 via the native floor.
   Registering a key can only turn an `undef` into the honest `unsupported_bif`, never shadow a working result (the
@@ -608,7 +626,8 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - **`beam_rt` must install every hook this crate exposes** (each defaults to an honest typed gap): `RecordSource`
   (`records:get_definition/2`, else `badarg`); `LocalNode` (internal pid/port `term_to_binary` — its
   `(nonode@nohost, 0)` fallback and the `bm`/`ac` pattern tags need atoms `CORE_ATOMS` lacks); `LocalFunIdentity`
-  (installed for compiled modules' local funs, NOT `-eval`); `ModuleInfo`; `ProcessHook` (11
+  (installed for compiled modules' local funs, NOT `-eval`; the answer must carry the `function` name atom —
+  `FunIdentity::with_function` — so `fun_info(F, name)` resolves); `ModuleInfo`; `ProcessHook` (11
   `proc_reg` BIFs); `PersistentTerm`; the defaulted `DictHook::get_all`/`erase_all`; `AtomInterner`/`FunCaller`;
   `NifLoader` + `with_current_module`; `PortHook` via `with_port_hook`; and `fun M:F/A` for
   `wire/export_ext_encode`. `MemoryHook`/`RuntimeHooks` are installed; gate via `needs_*` (never a private copy).
@@ -698,11 +717,11 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 - `src/io.rs` / `src/io_ts.rs` / `src/print.rs` -> the `io`/`io_lib` format engine (the `{chars_limit,N}` limited
   paths, the unicode `~ts` arm); the `~w`/`~p`/`~W`/`~P` leaf renderer with `~k`/`~K`
 - `src/print/pretty.rs` / `src/print/pretty/cind.rs` -> the `io_lib_pretty` port; the `cind/7` family
-- `tests/` -> 81 integration files / 810 tests (lib suite 830); the roster pin is `tests/roster_audit.rs`,
+- `tests/` -> 83 integration files / 821 tests (lib suite 839); the roster pin is `tests/roster_audit.rs`,
   `tests/{registry_hot_path,decode_hot_path}.rs` are the allocation-count pins, `tests/term_to_binary_options.rs`
   and `tests/fun_info_whole_list.rs` are the fail-loud oracle suites for `term_to_binary/2`'s write-side options
-  and for `fun_info/1`'s whole list + the seam-backed local-fun items, and `tests/fun_info.rs` is the pinned-golden
-  fun-introspection suite
+  and for `fun_info/1`'s whole list + `fun_info/2`'s `name` item (named local, anonymous local, imported, external
+  and BIF funs), and `tests/fun_info.rs` is the pinned-golden fun-introspection suite
 - `HANDOFF_batch52.md` -> the batch-52 cross-crate gap report (owner/repro/fix-shape per finding)
 - siblings `../beam_engine`/`../beam_process`/`../beam_ets`/`../beam_codec`/`../beam_term`/`../beam_loader`/`../beam_io`
   -> the `call_bif` seam, `ProcessId`/`PortId`/`PortTable`, the `Table`/match-spec engine, the ETF codec, the frozen
