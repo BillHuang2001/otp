@@ -647,29 +647,25 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   integer/float pair is exact.
 
 ## Handoffs (to other nodes — NOT adopted here)
-- **`beam_bifs` — adopt the new `{protection, Access}` setter.** This crate exposes the post-creation
-  protection change (`SetOpt::Access(Access)` + the owner-gated `Table::setopts(caller, SetOpt)` + the
-  primitive `Table::set_access` + the enforcing `TableAccess::set_access`).
-  `beam_bifs::ets::adopt::setopts_2` still answers the typed `unsupported_bif` for **any**
-  `{protection, _}`. The adoption is: after the existing owner check, map the parsed protection onto
-  `SetOpt::Access` and call `table.as_requester(Some(caller)).setopts(opt)` — the parse-level
-  `{protection, bogus}` `badarg` stays `beam_bifs`'s (`parse_setopts`).
-- **`beam_bifs` — the `auto` / `{debug_hash_fixed_number_of_locks, Nlocks}` rendering stays host-side**
-  (`TableInfo::write_concurrency` is a `bool`), and the hash-kind `last`/`prev` workaround can now go:
-  `beam_bifs/src/ets.rs` still special-cases the hash kinds in `last_1`/`prev_2`, but `Table::last`/
-  `Table::prev` are C-faithful now, so both BIFs could call them unconditionally (the ordered-kind
-  `'$end_of_table'` anchor rejection stays).
-- **`beam_bifs` — adopt `ets:slot/2`.** Call the **read**-gated `TableAccess::slot` (the oracle's
-  `erl_db.c:3744` `ets_slot_2` takes a `DB_READ` gate); a non-integer or bignum slot is the BIF layer's
-  `badarg`, an out-of-range/negative slot is the crate's `Err(BeamError::BadArg)`, `Ok(None)` is
-  `'$end_of_table'`. `beam_bifs::runtime::other` still answers the typed `unsupported_bif`.
-- **`beam_bifs/src/match_spec.rs` still refuses ANY head pattern mentioning a map.** `test_table`'s
-  `head_mentions_a_map`/`term_mentions_a_map`, its doc block and the test
-  `beam_bifs/tests/match_spec.rs::a_head_pattern_with_a_map_is_a_typed_gap` are stale: `beam_ets`
-  implements head maps and the oracle's **`table`** dialect accepts them (verified against the live
-  oracle for a map head with literal and with `'$N'` values). Delegate to `beam_ets::select::compile`
-  instead of refusing a map head. The `trace` dialect stays typed `unsupported` until the trace runner
-  subsystem exists; the exact `{ok,…}`/`{error,…}` shapes and lint strings are in `src/select/CONTEXT.md`.
+- **`beam_bifs` — adopt the `{protection, Access}` setter and `ets:slot/2`.** This crate exposes the
+  post-creation protection change (`SetOpt::Access(Access)` + the owner-gated
+  `Table::setopts(caller, SetOpt)` + the enforcing `TableAccess::set_access`) and the **read**-gated
+  `TableAccess::slot`. `beam_bifs::ets::adopt::setopts_2` still answers the typed `unsupported_bif` for
+  any `{protection, _}` (the parse-level `{protection, bogus}` `badarg` stays its own) and
+  `beam_bifs::runtime::other` still refuses `ets:slot/2`; adopting either is a call-through (the
+  oracle's `erl_db.c:3744` slot takes a `DB_READ` gate; a non-integer/bignum slot is the BIF layer's
+  `badarg`, an out-of-range slot the crate's `Err(BeamError::BadArg)`, `Ok(None)` is `'$end_of_table'`).
+- **`beam_bifs` — the hash-kind `last`/`prev` workaround can go.** `Table::last`/`Table::prev` are
+  C-faithful now, so `beam_bifs/src/ets.rs`'s `last_1`/`prev_2` need no hash-kind special case (the
+  ordered-kind `'$end_of_table'` anchor rejection stays). The `auto` /
+  `{debug_hash_fixed_number_of_locks, Nlocks}` `write_concurrency` rendering stays host-side
+  (`TableInfo::write_concurrency` is a `bool`).
+- **`beam_bifs/src/match_spec.rs` still refuses ANY head pattern mentioning a map.** Its
+  `head_mentions_a_map`/`term_mentions_a_map`, doc block and the
+  `a_head_pattern_with_a_map_is_a_typed_gap` test are stale: `beam_ets` implements head maps and the
+  oracle's **`table`** dialect accepts them (verified live, for a map head with literal and with `'$N'`
+  values). Delegate to `beam_ets::select::compile`. The `trace` dialect stays typed `unsupported` until
+  a trace-runner subsystem exists (exact shapes/lint strings in `src/select/CONTEXT.md`).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; tests in `src/kind/tests.rs`
