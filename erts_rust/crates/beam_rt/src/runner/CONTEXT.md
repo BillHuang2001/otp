@@ -278,8 +278,9 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
-* `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier` and the park's published
-  FR-prefix count `fr_published`) + `RunnerState` (the `jit_mode` field and the `jit_mode()` accessor).
+* `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`, the park's published
+  FR-prefix count `fr_published`, and the registration cursor `registered_payloads`) + `RunnerState`
+  (the `jit_mode` field and the `jit_mode()` accessor).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`, whose `fr_count`
   argument is the live prefix `Machine::fr_mark()` — the value that also pins the process), the
