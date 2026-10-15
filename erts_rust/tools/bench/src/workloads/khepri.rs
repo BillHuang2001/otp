@@ -174,6 +174,7 @@ mod tests {
         let w = Khepri;
         assert_eq!(w.id(), "khepri");
         assert_eq!(w.category(), Category::Gc);
+        assert_eq!(w.contracts(), &["A.1", "A.9"]);
         assert!(matches!(w.runtimes(), Runtimes::SysOnly));
     }
 
@@ -182,6 +183,30 @@ mod tests {
         let p = Khepri.probe();
         if repo().is_dir() && !tool::available(TOOL) {
             assert_eq!(p.reason(), Some(TOOL_ABSENT));
+        }
+    }
+
+    /// When the checkout **and** `rebar3` are both present the workload must be *ready* — the
+    /// newly-enabled target must not silently regress to `skipped(rebar3-absent)`, and the
+    /// resolved tool must be a real executable on disk. Early-returns when either prerequisite
+    /// is absent, so CI (no checkout, no `rebar3`) stays green.
+    #[test]
+    fn probe_is_ready_when_the_checkout_and_rebar3_are_present() {
+        if !(repo().is_dir() && tool::available(TOOL)) {
+            return;
+        }
+        assert_eq!(
+            Khepri.probe(),
+            Probe::Ready,
+            "a present checkout + rebar3 must probe ready"
+        );
+        if let Some(cmd) = tool::command_for(TOOL, TOOL_NIX_ATTR) {
+            let program = cmd.get_program();
+            assert!(
+                std::path::Path::new(program).is_file(),
+                "the resolved {TOOL} ({}) must exist on disk",
+                program.to_string_lossy()
+            );
         }
     }
 }

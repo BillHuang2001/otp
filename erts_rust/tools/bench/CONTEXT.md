@@ -127,7 +127,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 | `plb` | compute | `/home/bill/Source/Programming-Language-Benchmarks` (dotnet tool, build+bench; needs a ≥ 9.0 SDK, resolved by `command_for_min`) | **runs** (sys) | `dotnet-absent`, `repo-missing`, `plb-build-failed`, `plb-tool-failed`, `plb-no-results` |
 | `cowboy` | io | `/home/bill/Source/cowboy` hello_world built in a scratch copy, driven by the in-process loader | **runs** (sys) | `repo-missing`, `make-absent`, `deps-unavailable` |
 | `khepri` | gc | `/home/bill/Source/khepri` (`rebar3 eunit`, in a scratch copy) | **runs** (sys) | `rebar3-absent`, `repo-missing` |
-| `emqx` | messaging | `/home/bill/Source/emqx` (real `make`/`mix` build, in a scratch copy) | **runs** on an OTP-28 host; `skipped(emqx-requires-otp-28)` on this OTP-29 host (checkout pins OTP **28.5.0.7-2** at `env.sh:3`/`.tool-versions:1`) | `mix-absent`, `make-absent`, `repo-missing`, `not-an-emqx-project`, `emqx-requires-otp-28`, `emqx-build-failed` |
+| `emqx` | messaging | `/home/bill/Source/emqx` (real `make`/`mix` build, in a scratch copy) | **runs** on an OTP-28 host; `skipped(emqx-requires-otp-28)` on this OTP-29 host (checkout pins OTP **28.5.0.7-2** at `env.sh:3`/`.tool-versions:1`; two verified blockers: the `:ezstd` `env.mk` `-s init stop -eval` idiom under OTP ≥ 29 **and** host build tooling/libs absent here — `automake`/`libtool`/`cmake`/`krb5`; full ladder in `results/m12-emqx-enablement-attempt.md`) | `mix-absent`, `make-absent`, `repo-missing`, `not-an-emqx-project`, `emqx-requires-otp-28`, `emqx-build-failed` |
 | `slice` | compute | committed `slice.beam` fixture + stdlib wrapper modules, run under **each scheduled runtime** | **runs** (sys+rust) | `erlc-absent`, `fixture-missing`, `runtime-unsupported` |
 | `foreign` | compute | **real Cowboy + EMQX modules** (`cowboy_bstr.erl`, `emqx_base62.erl`) compiled with the system `erlc`, run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `sources-missing`, `runtime-unsupported` |
 | `list_walk` | compute | in-tree embedded `bench_list_walk` module (BIF-free recursive `sum/1` list walk), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent` |
@@ -166,8 +166,12 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   `HEX_HOME` redirected into the scratch so the read-only checkout and developer home are untouched. A
   toolchain-matching host yields a real wall time; a mismatched one records the **precise** blocker rather
   than a fabricated number (this host is OTP 29.1.1 / erts-17.1 while EMQX pins **28.5.0.7-2** at
-  `env.sh:3`/`.tool-versions:1` ⇒ `skipped(emqx-requires-otp-28)`, the `:ezstd` `env.mk` make-target being
-  the mechanism). `mix`/`make` absent ⇒ `mix-absent`/`make-absent`;
+  `env.sh:3`/`.tool-versions:1` ⇒ `skipped(emqx-requires-otp-28)`). Two verified blockers: the
+  `:ezstd` `env.mk` make-target (generated via `erl -noshell -s init stop -eval …`, which OTP ≥ 29
+  halts before evaluating) **and**, even with that idiom patched, host build tooling/libs absent here
+  (the `:jq` NIF needs `automake`+`libtool`+`cmake`, `:sasl_auth` needs Kerberos headers — `krb5.h`);
+  the full enablement ladder is `results/m12-emqx-enablement-attempt.md`, and the note names both
+  blockers. `mix`/`make` absent ⇒ `mix-absent`/`make-absent`;
   a checkout that is not an EMQX project ⇒ `not-an-emqx-project`.
 - `plb`: stages the checkout into a `ScratchDir` and drives the dotnet tool in **two stages**:
   `--task build --langs elixir --no-docker` (copies sources + templates, runs the env's `build:` command,
@@ -301,7 +305,9 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   resolved `foreign`/RSS verdicts: `b54-foreign-ab-m10.json` / `b54-foreign-ab-head.json` (the `--quick`
   `foreign` A/B with `$BEAM_RT` alternating the m10 (`b4593818b3`) and HEAD binaries at matched `N`; the m10
   side's program is normalised to `$TMPDIR/m10wt/erts_rust/target/release/beam_rt`) and
-  `b54-foreign-growth-curve.md` (the direct `enc` ladder on both binaries, both tiers).
+  `b54-foreign-growth-curve.md` (the direct `enc` ladder on both binaries, both tiers). The committed
+  prose records live beside the JSON: `b54-foreign-growth-curve.md`, `b55-foreign-regression-fix.md`,
+  and `m12-emqx-enablement-attempt.md` (the verified ladder behind `emqx`'s honest skip).
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
@@ -338,16 +344,21 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - **`$BENCH_TOOL_PATH`** (colon-separated `bin` dirs, searched before the store scan) is the documented way
   to force a specific tool build; **`$BENCH_TRY_NIX`** (opt-in, default off) is the last-resort
   `nix shell nixpkgs#<attr> --command <tool>` fallback. Neither is required for the default path.
-- **`emqx` needs an OTP-28 toolchain.** It drives EMQX's real `make`/`mix` build, but the checkout pins OTP
-  **28.5.0.7-2** (`erlang 28.5.0.7-2` at `.tool-versions:1`, `export OTP_VSN=28.5.0.7-2` at `env.sh:3`) while
-  the host `erl` is OTP 29.1.1 / erts-17.1, so `:ezstd`'s `env.mk` make-target (generated via
-  `erl -noshell -s init stop -eval …`, an idiom that produces no output under OTP 29 because `init stop` halts
-  before the `-eval` — verified on this host) writes nothing and `mix compile` aborts with
-  `No rule to make target '…/env.mk'` ⇒ `skipped(emqx-requires-otp-28)`. The gate reads ONLY these declared
-  pins (no checkout-layout assumptions) and the note records the pin, its file:line, and the exact host
-  `erl` + versions. It is not satisfiable by a version override: the only OTP-28 binding in the store cannot
-  be paired with the OTP-29-built Elixir/`mix` the umbrella build needs, and the pin lives in the read-only
-  target. Swapping the whole toolchain is out of the driver's scope.
+- **`emqx` needs an OTP-28 toolchain, and that is not its only blocker.** It drives EMQX's real
+  `make`/`mix` build, but the checkout pins OTP **28.5.0.7-2** (`erlang 28.5.0.7-2` at `.tool-versions:1`,
+  `export OTP_VSN=28.5.0.7-2` at `env.sh:3`) while the host `erl` is OTP 29.1.1 / erts-17.1. Two
+  **verified** blockers (full ladder + exact failing output lines in
+  `results/m12-emqx-enablement-attempt.md`): (1) `:ezstd`'s `env.mk` make-target is generated via
+  `erl -noshell -s init stop -eval …`, an idiom that produces no output under OTP 29 because `init stop`
+  halts before the `-eval` — verified on this host — so it writes nothing and `mix compile` aborts with
+  `No rule to make target '…/env.mk'`; and (2) **even once that idiom is patched**, the umbrella build
+  additionally needs host build tooling/system libraries this sandbox lacks (`:jq`'s `autoreconf`/
+  `configure` needs `automake`+`libtool`+`cmake`, and `:sasl_auth` fails on `krb5.h`) — the checkout's own
+  CI builds it in a prepared image, not on a bare host. Hence `skipped(emqx-requires-otp-28)`, with a note
+  naming the pin, its file:line, the exact host `erl` + versions, and **both** blockers. The gate reads
+  ONLY these declared pins (no checkout-layout assumptions) and runs cheaply up front. Not satisfiable by
+  a version override: the checkout pin lives in the read-only target and the host tooling gaps are
+  independent of it. Swapping in a prepared toolchain/image is out of the driver's scope.
 - **`khepri`'s suite may run under an Erlang other than the reported oracle.** The store `rebar3` is an
   escript whose shebang points at an Erlang/OTP 28 `escript`, so it runs the Khepri suite under OTP 28 while a
   `SysOnly` tool-driven row's `runtimes[]` version describes the driver's resolved oracle (`erl` on `PATH`,
@@ -403,7 +414,11 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `workloads::plb` (a run with no result JSON is a
   *failed* row, never `ok`), `workloads::foreign`, `workloads::list_walk`, `workloads::copy_bound` and
   `workloads::gc_bound` (case tables, per-side argv, the startup-cancelling per-op/per-call/per-element
-  math, deterministic stdout).
+  math, deterministic stdout). The tool-driven targets' **enable/skip decisions** are pinned so a
+  future environment change cannot silently turn a real measurement into a skip — `khepri` probes
+  `Ready` and its resolved `rebar3` exists on disk when the checkout + tool resolve; `plb` probes
+  `Ready` and its version-resolved `dotnet` satisfies `MIN_DOTNET_SDK`; `emqx` gates a pinned checkout
+  on a newer host. Each early-returns when its prerequisite is absent, so CI stays green.
 - Library integration test: build a synthetic in-memory `Report`, serialize, reload, and compare —
   hermetic, no oracle needed; plus the `Runtimes::Both` regression guard for `foreign`, `list_walk`,
   `copy_bound` and `gc_bound`.
@@ -655,7 +670,12 @@ is **not** produced here; it is a `beam_rt` measurement.
 - `RESULTS.md` → the current results summary (one table per workload category, exact reproduction
   commands, verified skip reasons, host-load record, stability, and "what these numbers mean").
 - `results/` → the raw harness JSON behind `RESULTS.md` (committed, so the numbers stay reviewable)
-  plus the `bench compare` diffs (`m11-*` current, `m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` previous).
+  plus the `bench compare` diffs (`m11-*` current, `m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` previous) and the
+  prose records (`b54-foreign-growth-curve.md`, `b55-foreign-regression-fix.md`,
+  `m12-emqx-enablement-attempt.md`).
+- `results/m12-emqx-enablement-attempt.md` → the verified, bounded `emqx` enablement attempt (exact
+  commands, each blocker's exact failing output) establishing that EMQX-enterprise is unbuildable here:
+  the `:ezstd` OTP-29 idiom **plus** missing host build tooling/libs ⇒ the driver's `emqx` skip is honest.
 - `../CONTEXT.md` → the `tools/` node's binding shared conventions (runtime resolution, exit codes, JSON, `out/`).
 - `../../CONTEXT.md` §6/§7 → test strategy, the differential gate, staging.
 - `../../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` → the concrete target workloads + build/bench entry points.

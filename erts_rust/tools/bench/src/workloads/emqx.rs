@@ -41,16 +41,21 @@
 //! `export OTP_VSN=…` (which the root `Makefile` `include`s, so it also feeds the
 //! `scripts/ensure-rebar3.sh` bootstrap, whose `case ${OTP_VSN}` accepts only `25*`–`28*`)
 //! and `.tool-versions`' `erlang …` line — and does not build on a newer one. This checkout
-//! pins **28.5.0.7-2**; the `erl` on `PATH` here is OTP **29.1.1** (erts 17.1). Under OTP 29
+//! pins **28.5.0.7-2**; the `erl` on `PATH` here is OTP **29.1.1** (erts 17.1). Two
+//! **verified** blockers make that combination unbuildable in this sandbox: (1) under OTP 29
 //! the `:ezstd` dependency's NIF makefile generates its `env.mk` with
 //! `erl -noshell -s init stop -eval …`, an idiom OTP 29 halts before evaluating (verified on
 //! this host: exit 0, no output at all), so `mix compile` aborts with *No rule to make target
-//! '…/env.mk'*. Rather than spend minutes discovering that, the mismatch is detected cheaply
-//! up front and recorded as an honest `skipped(emqx-requires-otp-<major>)` whose note names
-//! the exact pin (version + `file:line`) and the host's exact toolchain. When the toolchain
-//! *does* match the checkout's pin, the real build runs and the row carries a real wall
-//! time — or `failed(emqx-build-failed)` with the captured error. No number is ever
-//! fabricated.
+//! '…/env.mk'*; and (2) even with that idiom patched, the umbrella build additionally needs
+//! host build tooling/system libraries that are absent here — the `:jq` NIF's
+//! `autoreconf`/`configure` needs `automake` + `libtool` + `cmake`, and `:sasl_auth` needs
+//! Kerberos headers (`krb5.h`). The full ladder is recorded in
+//! `results/m12-emqx-enablement-attempt.md`. Rather than spend minutes discovering that, the
+//! mismatch is detected cheaply up front and recorded as an honest
+//! `skipped(emqx-requires-otp-<major>)` whose note names the exact pin (version + `file:line`),
+//! the host's exact toolchain and both blockers. When the toolchain *does* match the checkout's
+//! pin, the real build runs and the row carries a real wall time — or
+//! `failed(emqx-build-failed)` with the captured error. No number is ever fabricated.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -245,14 +250,20 @@ fn otp_gate_reason(required: u32, host: u32) -> Option<String> {
 }
 
 /// The note explaining an [`otp_gate_reason`] skip: the exact pin (version + `file:line`), the
-/// host toolchain it conflicts with, and the observed build breakage.
+/// host toolchain it conflicts with, and the **two verified blockers** — the `:ezstd` `env.mk`
+/// idiom that OTP ≥ 29 halts before evaluating, and (even once that idiom is patched) the host
+/// build tooling/system libraries this sandbox is missing.
 fn otp_gate_note(pin: &OtpPin, host: &HostOtp) -> String {
     format!(
-        "EMQX pins Erlang/OTP {} ({}), but the `erl` on PATH ({}) is OTP {} (erts-{}): the \
-         umbrella build aborts in the :ezstd dependency's NIF makefile, which generates its \
-         env.mk via `erl -noshell -s init stop -eval …` — an idiom OTP {} halts before \
-         evaluating (verified on this host: exit 0, no output at all), so `mix compile` fails \
-         with \"No rule to make target '…/env.mk'\"; no number is fabricated",
+        "EMQX pins Erlang/OTP {} ({}), but the `erl` on PATH ({}) is OTP {} (erts-{}) — a \
+         combination EMQX does not build on. Two verified blockers: (1) the :ezstd dependency's \
+         NIF makefile generates its env.mk via `erl -noshell -s init stop -eval …` — an idiom \
+         OTP {} halts before evaluating (verified on this host: exit 0, no output at all) — so \
+         `mix compile` fails with \"No rule to make target '…/env.mk'\"; and (2) even with that \
+         idiom patched the umbrella build needs host build tooling/system libraries absent here \
+         (the :jq NIF runs autoreconf/configure and needs automake + libtool + cmake, and \
+         :sasl_auth needs Kerberos headers — krb5.h). The full enablement ladder is in \
+         results/m12-emqx-enablement-attempt.md; no number is fabricated",
         pin.version,
         pin.source,
         host.program.display(),
@@ -548,7 +559,7 @@ mod tests {
         assert_eq!(otp_gate_reason(28, 27), None, "an older host is attempted");
 
         // The note names both sides of the mismatch — the exact pin *with its file:line* and
-        // the host's exact toolchain — plus the observed mechanism.
+        // the host's exact toolchain — plus **both** verified blockers.
         let pin = OtpPin {
             version: "28.5.0.7-2".to_string(),
             source: "env.sh:3 (export OTP_VSN=28.5.0.7-2)".to_string(),
@@ -565,10 +576,83 @@ mod tests {
             "OTP 29",
             "erts-17.1",
             "/usr/bin/erl",
+            // Blocker 1: the `:ezstd` `env.mk` idiom.
             "env.mk",
+            "init stop",
+            // Blocker 2: the host build tooling/system libs the umbrella build needs.
+            "automake",
+            "libtool",
+            "cmake",
+            "krb5",
+            // The committed evidence and the explicit no-fabrication statement.
+            "m12-emqx-enablement-attempt.md",
+            "no number is fabricated",
         ] {
             assert!(note.contains(needle), "{needle} missing from: {note}");
         }
+    }
+
+    /// On a host whose OTP major exceeds the checkout's pin the cheap gate must yield the
+    /// pinned skip reason — so the `emqx` row can never silently turn into a fabricated
+    /// measurement. Host-independent: a scratch checkout fixture feeds the pure
+    /// [`required_otp`]/[`otp_gate_reason`]/[`otp_gate_note`] decision path.
+    #[test]
+    fn a_newer_host_gates_the_pinned_checkout() {
+        let s = Scratch::new("gate-pinned");
+        std::fs::write(s.dir.join("env.sh"), "set -eu\nexport OTP_VSN=28.5.0.7-2\n")
+            .expect("write env.sh");
+
+        let pin = required_otp(&s.dir).expect("the fixture declares the pin");
+        let required = pin.major().expect("a numeric pin");
+        assert_eq!(required, 28);
+
+        let host = HostOtp {
+            major: 29,
+            erts: "17.1".to_string(),
+            program: PathBuf::from("/usr/bin/erl"),
+        };
+        let reason = otp_gate_reason(required, host.major).expect("a newer host is gated");
+        assert_eq!(reason, "emqx-requires-otp-28");
+
+        let note = otp_gate_note(&pin, &host);
+        for needle in [
+            "env.sh:2",
+            "28.5.0.7-2",
+            "env.mk",
+            "automake",
+            "krb5",
+            "m12-emqx-enablement-attempt.md",
+        ] {
+            assert!(note.contains(needle), "{needle} missing from: {note}");
+        }
+    }
+
+    /// The same decision against the **real** checkout: when this host's `erl` is newer than
+    /// the checkout's pin the gate must trip with the pinned reason and the full note.
+    /// Early-returns when the checkout is absent or the host is not newer, so CI (no checkout)
+    /// stays green.
+    #[test]
+    fn the_real_checkout_is_gated_when_the_host_is_newer() {
+        let r = repo();
+        if !r.is_dir() {
+            return;
+        }
+        let Some(pin) = required_otp(&r) else {
+            return;
+        };
+        let Some(required) = pin.major() else {
+            return;
+        };
+        let Some(host) = host_otp() else {
+            return;
+        };
+        if host.major <= required {
+            return;
+        }
+        let (reason, note) = toolchain_gate(&r).expect("a newer host must gate the checkout");
+        assert_eq!(reason, format!("emqx-requires-otp-{required}"));
+        assert!(note.contains("env.mk"), "{note}");
+        assert!(note.contains("krb5"), "{note}");
     }
 
     #[test]
