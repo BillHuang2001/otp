@@ -369,16 +369,23 @@ A.9 is the shallowest contract: its only differential coverage is boot/version *
 is **no self-hosted build** (the Rust runtime does not compile and run itself).
 - **Boot path — completes.** `beam_rt`'s boot (`src/boot/`, the boot node: `beam_rt/src/boot/CONTEXT.md`)
   reads and executes the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to
-  completion**, ending at the final `{progress,started}` (index 21). The former stop at instruction 16
-  (`{apply,{application,load,[{application,stdlib,…}]}}`, `exit noproc`) is closed: the `{kernelProcess,…}`
-  servers survive their short-lived directive process via the unlink in `beam_rt/src/boot/drive.rs`, and
-  the final `{apply,{c,erlangrc,[]}}` (index 20) is unblocked by the runtime-native `file_server_2` service
-  (`beam_rt/src/native/file_server.rs`). Pinned by
-  `beam_rt/tests/boot.rs::the_real_start_boot_runs_to_completion`,
-  `beam_rt/src/boot/bootscript.rs::the_real_start_boot_completes_through_execute_reporting`, and the CLI
-  test `beam_rt/tests/boot.rs::the_cli_runs_the_real_boot_script_to_completion` (exit 0, empty
-  stdout/stderr). The differential case `boot/proc_lib_start_link_blocks_the_boot_path` now **agrees** (it
-  is no longer in `tools/differential/known-gaps.txt`).
+  completion**, ending at the final `{progress,started}` (index 21): `beam_rt -noshell -boot
+  bootstrap/bin/start` exits **0 with empty stdout/stderr**. `{kernelProcess,…}` servers survive their
+  short-lived directive process via the unlink in `beam_rt/src/boot/drive.rs`; `{apply,{c,erlangrc,[]}}`
+  (index 20) is served by the runtime-native `file_server_2` service
+  (`beam_rt/src/native/file_server.rs`). Pinned by `beam_rt/tests/boot.rs::{the_real_start_boot_runs_to_completion,
+  the_cli_runs_the_real_boot_script_to_completion}` and
+  `beam_rt/src/boot/bootscript.rs::the_real_start_boot_completes_through_execute_reporting`.
+  `beam_rt`'s `-eval`/`-s`/`-run` actions drive the default boot script too (as the oracle does), so a
+  `-eval` process has the live `kernel_sup`/`timer_server` tree — `timer:apply_after/4` is
+  oracle-identical (`false`, exit 0). The differential case
+  `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** (not in `tools/differential/known-gaps.txt`).
+- **Cross-node note (tools-owned):** the differential harness `tools/differential` passes `-noshell` to
+  the oracle but **not** to the Rust side (`corpus/mod.rs::rust_argv` emits `run <beam> <mfa>`), so on the
+  now-booting non-`Boot` routes the Rust banner leaks into stdout and the `Module`/`ModuleEnv` cases' stdout
+  no longer matches; the suite also boots per case (~2.2 s startup) so the full gate now exceeds ~14 min.
+  `beam_rt -noshell run <beam> <mfa>` prints no banner and matches the oracle's `-noshell` output exactly,
+  so the one-line fix is on the `tools/` side. Reported to the parent (root-owned).
 - **Remaining A.9 gaps (fidelity, not boot-completion):**
   1. **No self-hosted build.** The Rust runtime does not compile/run itself; the compiler bootstrap
      (Stage 2, `../lib/compiler`) is not wired into `beam_rt`.
