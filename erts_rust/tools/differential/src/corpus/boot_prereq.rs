@@ -353,6 +353,25 @@ pub(crate) fn group() -> Vec<Case> {
             &["-boot", "start"],
             "ok true",
         ),
+        // Two further observations of the *booted* system under the same `-boot start` argv: the
+        // I/O servers the boot script starts are live registered processes, and the `boot`
+        // argument the CLI supplied is recorded in the full `init:get_arguments/0` table (not
+        // just via `init:get_argument/1`). Both are reduced to a boolean / a boolean tuple, so no
+        // pid is ever pinned.
+        eval_with_argv(
+            "boot/io_servers_registered_under_boot_flag",
+            "under `-boot start` the boot script's I/O servers are live registered processes (user and standard_error)",
+            "{is_pid(whereis(user)), is_pid(whereis(standard_error))}",
+            &["-boot", "start"],
+            "ok {true,true}",
+        ),
+        eval_with_argv(
+            "boot/init_get_arguments_records_boot_under_boot_flag",
+            "under `-boot start` the `boot` switch appears in the full init:get_arguments/0 table",
+            "lists:keymember(boot, 1, init:get_arguments())",
+            &["-boot", "start"],
+            "ok true",
+        ),
         Case {
             id: "boot/no_boot_flag_is_badarg",
             description: "with no `-boot`, init:get_argument/1 has no `boot` argument (element(1,_) raises badarg)",
@@ -432,6 +451,40 @@ pub(crate) fn group() -> Vec<Case> {
             "init:get_argument/1 reports the atom `error` for a flag that was never passed",
             "init:get_argument(no_such_flag_xyz)",
             "ok error",
+        ),
+        // The `-eval` **Start instruction** is consumed by `init` before it records the flags, so
+        // it (like `-boot`/`-pa`/`-mode`/`-console`) leaves no argument behind. The booted
+        // system's `init:get_argument/1` therefore reports `error` for every switch that is an
+        // instruction rather than a plain flag.
+        eval(
+            "boot/init_get_argument_eval_instruction_is_not_recorded",
+            "the -eval Start instruction (which the harness passes) is not recorded as an init argument",
+            "init:get_argument(eval)",
+            "ok error",
+        ),
+        eval(
+            "boot/init_get_argument_root_value_is_a_list",
+            "init:get_argument(root)'s value is the flag's occurrence list (a list of paths)",
+            "is_list(element(2, init:get_argument(root)))",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_argument_is_a_two_element_tuple",
+            "init:get_argument/1 answers a two-element {ok|error,Values} tuple",
+            "tuple_size(init:get_argument(noshell)) =:= 2",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_argument_automatic_flags_are_present",
+            "the emulator's automatic flags (root/bindir/progname) all answer {ok,_} (their values are host-specific)",
+            "lists:all(fun(F) -> element(1, init:get_argument(F)) =:= ok end, [root, bindir, progname])",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_argument_consumed_switches_are_absent",
+            "the switches the harness passes as start instructions / switch flags leave no init argument behind",
+            "lists:all(fun(F) -> init:get_argument(F) =:= error end, [eval, boot, pa, mode, console])",
+            "ok true",
         ),
         eval(
             "boot/init_get_status_first_element_is_starting",
@@ -737,6 +790,16 @@ pub(crate) fn group() -> Vec<Case> {
             "lists:all(fun({A,D,Vs}) -> is_atom(A) andalso is_list(D) andalso is_list(Vs) end, application:loaded_applications())",
             "ok true",
         ),
+        // The boot script loads exactly the `kernel` and `stdlib` applications on a plain boot
+        // (no user application is started), so the *set* of loaded applications is a frozen
+        // release-stable value, not merely a shape. `sasl`/`compiler` are on the code path but
+        // are not started by the boot script.
+        eval(
+            "boot/loaded_applications_set_is_kernel_and_stdlib",
+            "a plain boot loads exactly the kernel and stdlib applications (the boot script's own start set)",
+            "lists:sort([A || {A, _, _} <- application:loaded_applications()])",
+            "ok [kernel,stdlib]",
+        ),
         eval(
             "boot/application_lib_dirs_are_under_the_library_root",
             "code:lib_dir/1 places every installed application under the library root (code:lib_dir/0)",
@@ -799,6 +862,11 @@ mod tests {
         "boot/init_get_plain_arguments_is_empty",
         "boot/init_get_argument_noshell_is_ok_empty",
         "boot/init_get_argument_absent_flag_is_error",
+        "boot/init_get_argument_eval_instruction_is_not_recorded",
+        "boot/init_get_argument_root_value_is_a_list",
+        "boot/init_get_argument_is_a_two_element_tuple",
+        "boot/init_get_argument_automatic_flags_are_present",
+        "boot/init_get_argument_consumed_switches_are_absent",
         "boot/init_get_status_first_element_is_starting",
         "boot/init_get_status_second_element_is_started",
         "boot/code_get_mode_is_interactive",
@@ -846,6 +914,7 @@ mod tests {
         "boot/application_get_application_of_a_kernel_module_is_kernel",
         "boot/application_get_application_of_a_preloaded_module_is_undefined",
         "boot/loaded_applications_entries_are_tagged_triples",
+        "boot/loaded_applications_set_is_kernel_and_stdlib",
         "boot/application_lib_dirs_are_under_the_library_root",
     ];
 
@@ -886,6 +955,7 @@ mod tests {
             .chain(BOOT_FLAG_CASES)
             .chain(BOOT_KERNEL_PROCESS_CASES)
             .chain(BOOT_COMPLETION_CASES)
+            .chain(BOOT_UNDER_FLAG_CASES)
         {
             let golden = case(cases, id)
                 .golden
@@ -997,6 +1067,15 @@ mod tests {
         "ok undefined",
         "ok {ok,infinity}",
         "ok {ok,kernel}",
+        "ok [kernel,stdlib]",
+    ];
+
+    /// The `-boot start` cases that observe the booted system *beyond* the boot-completion
+    /// signals: the I/O servers the boot script starts and the `boot` switch in the full
+    /// `init:get_arguments/0` table. Collected so a new case cannot silently escape review.
+    const BOOT_UNDER_FLAG_CASES: &[&str] = &[
+        "boot/io_servers_registered_under_boot_flag",
+        "boot/init_get_arguments_records_boot_under_boot_flag",
     ];
 
     #[test]
@@ -1096,6 +1175,55 @@ mod tests {
         }
     }
 
+    /// The `-boot start` cases that observe the booted system beyond the boot-completion signals:
+    /// each must carry the flag argv, pin no environment, and assert a scalar / scalar-tuple
+    /// golden with no volatile rendering (a pid, a path, a map). The expressions must differ, so
+    /// a copy-paste cannot turn them into a disguised repeat of one observation.
+    #[test]
+    fn boot_under_flag_cases_observe_the_booted_system() {
+        use std::collections::HashSet;
+        let cases = group();
+        let cases = cases.as_slice();
+        let mut exprs: HashSet<&str> = HashSet::new();
+        for id in BOOT_UNDER_FLAG_CASES {
+            let case = case(cases, id);
+            assert_eq!(case.contracts, &[Contract::Build], "case {id}");
+            assert!(
+                matches!(case.kind, CaseKind::Eval { .. }),
+                "case {id} must be an Eval case"
+            );
+            assert_eq!(
+                case.extra_argv(),
+                &["-boot", "start"],
+                "case {id} must observe the booted system under `-boot start`"
+            );
+            assert!(case.env().is_empty(), "case {id} pins no environment");
+            assert!(
+                !case.description.is_empty(),
+                "case {id} has no description"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id} exits 0");
+            let golden = case
+                .golden
+                .stdout
+                .unwrap_or_else(|| panic!("case {id} asserts stdout"));
+            assert!(
+                golden.starts_with("ok "),
+                "case {id}: a Probe::Value golden is an `ok <value>` line, got {golden:?}"
+            );
+            // No volatile rendering may be baked into a golden: no pid/ref/port (`<`), no
+            // filesystem path (`/`), no map (`#{`).
+            for unstable in ["<", "/", "#{"] {
+                assert!(
+                    !golden.contains(unstable),
+                    "case {id}: the golden pins an unstable rendering: {golden:?}"
+                );
+            }
+            let expr = case.expr().expect("an Eval case has an expr");
+            assert!(exprs.insert(expr), "case {id}: duplicate expression {expr:?}");
+        }
+    }
+
     #[test]
     fn boot_pa_case_carries_the_pa_argument() {
         let cases = group();
@@ -1134,6 +1262,7 @@ mod tests {
             .iter()
             .chain(BOOT_PA_CASES)
             .chain(BOOT_COMPLETION_CASES)
+            .chain(BOOT_UNDER_FLAG_CASES)
         {
             let expr = case(cases, id).expr().expect("an Eval case has an expr");
             for reserved in [" V ", " C ", " R ", "V =", "C =", "R ="] {
