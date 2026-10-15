@@ -120,6 +120,7 @@ mod aggregate;
 mod arith;
 mod compare;
 mod compile;
+mod family;
 mod frame;
 mod heap;
 mod link;
