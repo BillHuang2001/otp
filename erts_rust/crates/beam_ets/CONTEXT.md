@@ -699,7 +699,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 
 ## See Also
 - `ETS_SURFACE.md` → coverage census: every `ets:*` operation mapped to this crate / `beam_bifs` / missing, the oracle-probed facts, and the runtime-level gaps with the exact API each needs.
-- `PERF.md` → the crate's measured memory/perf figures (the `ets_copy` peak-RSS attribution, per-object reclamation vs the oracle, both sides of every ratio + `/proc/loadavg`).
+- `PERF.md` → the crate's measured memory/perf figures (§3: the `ordered_set` B+-tree-vs-sorted-`Vec` comparison at several sizes and key orders; §1: the `ets_copy` peak-RSS attribution; §2: per-object reclamation vs the oracle) — both sides of every ratio + `/proc/loadavg`.
 - `../CONTEXT.md` → crate-layer contracts, the `Table` seam, dependency waves, milestone scope.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1/A.8, §2 frozen term layout, §3 error strategy, §7).
 - `../beam_term/CONTEXT.md` → the frozen term API + the shared `compare`/`hashing` utilities.
