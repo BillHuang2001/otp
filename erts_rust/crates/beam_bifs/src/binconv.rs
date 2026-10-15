@@ -77,8 +77,8 @@
 //!   `compressed` (zlib level 6, the oracle's `Z_DEFAULT_COMPRESSION`),
 //!   `{compressed, 0..=9}`, `{minor_version, 0|1|2}` (`3`, `-1` and a non-small
 //!   version are `badarg`) and the bare `deterministic`/`local` atoms (see the
-//!   option section below — `deterministic` is honoured in full, `local` is the one
-//!   typed gap).
+//!   option section below — both are honoured; `local` needs the runtime's node
+//!   hash through the [`BifContext::local_node_hash`] seam).
 //!   `binary_to_term/1` ignores trailing bytes; `binary_to_term/2` takes `safe` and
 //!   `used` (`binary_to_term(<<131,97,17>>, [used])` is `{17, 3}` — the count
 //!   includes the `131` version byte; for a top-level `COMPRESSED` image it stops at
@@ -119,14 +119,19 @@
 //!   while the plain image of the same map is index-ordered.
 //! * **`local`.** Selects `DFLAG_LOCAL_EXT`, which wraps the image in
 //!   `[131][LOCAL_EXT:121][4-byte node hash]` (`external.c:3305-3317`) and replaces
-//!   an internal pid/port/ref's node atom with `NIL_EXT`. `beam_codec` can write the
-//!   wrapper (`Encoder::finish_local(hash)`), but the 4 bytes are
-//!   `local_node_hash(...)`: a Bob-Jenkins block hash of the node's
-//!   hostname/pid/time-offset and the VM's monotonic clock (`external.c:136-200`),
-//!   i.e. `beam_rt`/`beam_dist` runtime state that changes on every VM start and has
-//!   no seam into this crate. A typed `unsupported_bif` is the honest answer —
-//!   fabricating four bytes would produce an image the oracle (and every other node)
-//!   rejects.
+//!   an internal pid/port/ref's node atom with `NIL_EXT` (`:5589`). `beam_codec`
+//!   writes the wrapper (`Encoder::finish_local(hash)`) and the internal-node marker
+//!   (`Encoder::with_local_ext`), so the **shape** is byte-identical to the oracle's;
+//!   the four payload bytes are the node's `local_node_hash` — a Bob-Jenkins block
+//!   hash of the node's hostname/pid/time-offset and the VM's monotonic clock
+//!   (`external.c:136-200`) — so they are node-local by design and differ between VM
+//!   starts (two `erl` runs of `term_to_binary(self(), [local])` differ in exactly
+//!   those bytes). The value comes from the runtime through the
+//!   [`BifContext::local_node_hash`] seam ([`LocalNode::local_node_hash`]); with no
+//!   seam installed `[local]` is the typed `unsupported_bif` gap — the hash is
+//!   **never** fabricated (four invented bytes would produce an image the oracle and
+//!   every other node reject). A differential case must therefore **mask** those four
+//!   bytes rather than compare them.
 //! * **`iovec`/`fragment` (and any other unknown atom or tuple) are `badarg`.**
 //!   `parse_t2b_opts` accepts `iovec` only when the caller can receive an iovec
 //!   (`iovecp != NULL`) and `{fragment, N}` only when it has a fragment size
@@ -144,10 +149,12 @@
 //!   registering it would *invent* a BIF arity the oracle answers with `undef`.
 //!   Following the same rule as `io:format`'s `~d` (see [`crate::io`]), the
 //!   oracle wins over the illustrative list: only `/1` and `/2` are registered.
-//! * **`local` is a typed gap.** `[local]` reports `unsupported_bif` because the
-//!   `LOCAL_EXT` payload is the node-local hash (`beam_rt`/`beam_dist` runtime state
-//!   with no seam — see the option section above). `[deterministic]` is **fully**
-//!   honoured. Neither ever returns a wrong image.
+//! * **`local` needs the runtime's node hash.** `[local]` reports `unsupported_bif`
+//!   when no [`LocalNode::local_node_hash`] seam answers, because the `LOCAL_EXT`
+//!   payload is the node-local, per-VM-start hash (`external.c:136-200`). With a seam
+//!   installed the image is byte-identical to the oracle's apart from those four
+//!   documented bytes. `[deterministic]` is **fully** honoured. Neither ever returns
+//!   a wrong image.
 //! * **Internal pid/port/ref ids need a resolvable local node, in both
 //!   directions.** `self()` and an internal port are 60-bit `Eterm` immediates
 //!   carrying no node identity, so `term_to_binary` writes them as the oracle's
@@ -807,31 +814,46 @@ pub(crate) fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Re
 
 /// Encodes `term` as the `term_to_binary/2` image `options` select.
 ///
-/// Takes `ctx` mutably because the local-node identity is read through
-/// [`BifContext::local_node`] (see [`encode_body`]).
+/// Takes `ctx` mutably because the local-node identity, the local-node hash and the
+/// local-fun identity are read through the context (see [`term_encoder`]).
 ///
 /// # Errors
 ///
-/// The encoder's and zlib's errors (see [`encode_body`]).
+/// The encoder's and zlib's errors (see [`encode_body`]), plus
+/// `error:unsupported_bif` for the `local` option when the runtime installed no node
+/// hash ([`BifContext::local_node_hash`]).
 fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
-    // `local` selects the `LOCAL_EXT` wrapper, whose 4-byte payload is the *node's*
-    // local hash: `local_node_hash` seeds a Bob-Jenkins block hash from the node's
+    // `local` selects the `LOCAL_EXT` wrapper: `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE]`
+    // (`external.c:3305-3317`) followed by the plain body, whose internal pid/port/ref
+    // node atom is replaced by `NIL_EXT` (`:5589`). The *shape* is therefore
+    // byte-identical to the oracle's — the codec owns the wrapper
+    // ([`Encoder::finish_local`]) and the internal-node marker
+    // ([`Encoder::with_local_ext`]) — **except** the four hash bytes: they are the
+    // node's `local_node_hash`, a Bob-Jenkins block hash seeded from the node's
     // hostname/pid/time-offset and the runtime's monotonic clock
-    // (`external.c:136-200`), patches the `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE]`
-    // prologue (`:3305-3317`, `:4046-4109`) and — for an internal pid/port/ref —
-    // replaces the node atom with `NIL_EXT` (`:5589`). `beam_codec` can write that
-    // wrapper (`Encoder::finish_local(hash)`) and the internal-node marker
-    // (`Encoder::with_local_ext`), so the **only** missing piece is the hash value
-    // itself: it is runtime/node state that changes on every VM start, so it belongs to
-    // `beam_rt`/`beam_dist`, not to this crate, and there is no seam to obtain it.
-    // Oracle-checked: two `erl` runs of
-    // `term_to_binary(self(), [local])` differ in exactly those four bytes
+    // (`external.c:136-200`), i.e. node-local by design, so two oracle runs of
+    // `term_to_binary(self(), [local])` differ in exactly those bytes
     // (`<<131,121,1,194,117,38,…>>` vs `<<131,121,6,240,188,32,…>>`) — see
-    // `tests/term_to_binary_options.rs`. A typed gap is therefore the honest answer —
-    // fabricating four bytes would produce an image the oracle (and every other node)
-    // rejects.
+    // `tests/term_to_binary_options.rs`. The value therefore comes from the runtime
+    // through the [`BifContext::local_node_hash`] seam; with no seam installed
+    // `[local]` stays the typed `unsupported_bif` gap, and the hash is **never**
+    // fabricated (four invented bytes would produce an image the oracle and every other
+    // node reject).
     if options.local {
-        return Err(unsupported_bif());
+        let hash = ctx.local_node_hash().ok_or_else(unsupported_bif)?;
+        // `finish_local` writes the uncompressed `[local]` image
+        // `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]`, body included.
+        let image = term_encoder(ctx, term, options)?.finish_local(hash);
+        return match options.compression {
+            None => Ok(image),
+            // `[local, compressed]`: the C deflates the **local body** — the wrapper
+            // plus the term body, i.e. the image minus its version byte — because it
+            // writes the `LOCAL_EXT` prologue into the buffer it compresses
+            // (`erts_term_to_binary_simple`, `external.c:2265-2298`): the image is
+            // `[VERSION_MAGIC][COMPRESSED_EXT][local_body_len:4 BE][zlib local body]`,
+            // reverting to the plain `[local]` image when compression does not help.
+            Some(level) => compressed_image(&image[1..], level),
+        };
     }
     // `deterministic` is threaded into the encoder itself (`DFLAG_DETERMINISTIC`
     // re-sorts every map's pairs into full Erlang term order, `external.c:3757-3764`
@@ -844,29 +866,40 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
 }
 
 /// The **uncompressed** external image of `term` under `options`: the version byte
-/// followed by [`encode_body`]'s bytes.
+/// followed by [`encode_body`]'s bytes — or, for the `local` option, the
+/// `LOCAL_EXT`-wrapped image `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]` (see
+/// [`encode_image`]; the hash comes from [`BifContext::local_node_hash`], and with no
+/// seam installed `[local]` is the typed `unsupported_bif` gap).
 ///
 /// This is the image `erlang:term_to_binary/1` produces, and the one
 /// `erlang:external_size/1,2` ([`crate::term_conv`]) sizes.
 ///
 /// The oracle's `external_size_2` (`external.c:2221-2246`) validates the whole option
 /// list — `compressed`/`{compressed, Level}` included — but passes only the *flags*
-/// (the `{minor_version, N}` tag set), never the compression level, to its size probe
+/// (the `{minor_version, N}` tag set, and `local`) to its size probe
 /// (`erts_encode_ext_size_2`, `external.c:736-743`, which never deflates). The
 /// documented contract is an upper bound — `byte_size(term_to_binary(T, Opts)) =<
 /// erlang:external_size(T, Opts)` (`../../erts/preloaded/src/erlang.erl:2687-2710`) —
 /// so a compressed image is deliberately **not** what this returns. Oracle-pinned:
 /// `erlang:external_size(lists:duplicate(500,hello),[compressed])` is `3507` while
-/// `byte_size(term_to_binary(lists:duplicate(500,hello),[compressed]))` is `50`.
+/// `byte_size(term_to_binary(lists:duplicate(500,hello),[compressed]))` is `50`; with
+/// `[local]` the probe sees the `LOCAL_EXT` wrapper (and the `NIL_EXT` substitution),
+/// so `external_size([1,2],[local])` is `11` and `external_size(self(),[local])` is
+/// `20` (the plain sizes are `6` and `29`).
 ///
 /// # Errors
 ///
-/// The encoder's errors (see [`encode_body`]).
+/// The encoder's errors (see [`encode_body`]), plus `error:unsupported_bif` for the
+/// `local` option when the runtime installed no node hash.
 pub(crate) fn plain_image_of(
     ctx: &mut BifContext<'_>,
     term: Eterm,
     options: &T2bOptions,
 ) -> Result<Vec<u8>> {
+    if options.local {
+        let hash = ctx.local_node_hash().ok_or_else(unsupported_bif)?;
+        return Ok(term_encoder(ctx, term, options)?.finish_local(hash));
+    }
     Ok(plain_image(&encode_body(ctx, term, options)?))
 }
 
@@ -875,7 +908,9 @@ pub(crate) fn plain_image_of(
 ///
 /// Shared by `term_to_binary/1,2` (via [`encode_image`]) and by
 /// `erlang:external_size/1,2` (via [`plain_image_of`]), so both BIFs agree on the tag
-/// set and on what is encodable.
+/// set and on what is encodable. It is [`term_encoder`] plus [`Encoder::finish`]; the
+/// `local` option's `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE]` prologue is added by
+/// [`Encoder::finish_local`] in [`encode_image`]/[`plain_image_of`], not here.
 ///
 /// The three `{minor_version, N}` flavours are [`MinorVersion`]'s (`external.c:1499-1514`:
 /// `DFLAG_UTF8_ATOMS` and `DFLAG_NEW_FLOATS`); the codec owns the tag selection, so an
@@ -885,20 +920,6 @@ pub(crate) fn plain_image_of(
 ///
 /// Because the flavour is threaded through the *encoder*, `compressed` (which deflates
 /// exactly these bytes) combines with any minor version.
-///
-/// The context's local node identity and local-fun identity are read **first** (they
-/// borrow `ctx` mutably) and installed on the encoder, so an internal pid/port id
-/// encodes as the oracle's `NEW_PID_EXT`/`V4_PORT_EXT` and a local (`make_fun3`) fun
-/// as its `NEW_FUN_EXT` image; with no resolvable local node / fun identity the encoder
-/// leaves the term unencodable (see [`BifContext::local_node`] and
-/// [`BifContext::local_fun_identity`]).
-///
-/// `options.deterministic` is threaded through as
-/// [`Encoder::with_deterministic`], so a map's pairs are emitted in full Erlang term
-/// order on the key — the `DFLAG_DETERMINISTIC` behaviour for **both** a ≤ 32-pair flat
-/// map and a > 32-pair HAMT (`external.c:3757-3764`, `:3783-3807`). The flag changes
-/// neither the tag set nor the encoded length, so the `erlang:external_size/2` probe
-/// that also runs through here stays correct.
 ///
 /// # Errors
 ///
@@ -911,9 +932,42 @@ pub(crate) fn encode_body(
     term: Eterm,
     options: &T2bOptions,
 ) -> Result<Vec<u8>> {
-    // The local node identity and the local-fun identity both borrow `ctx` mutably,
-    // and the encoder holds an immutable borrow of `ctx`'s atom table for its whole
-    // lifetime — so read both first and install them afterwards.
+    Ok(term_encoder(ctx, term, options)?.finish())
+}
+
+/// Builds the term encoder for `term` under `options`, over `ctx`'s atom table.
+///
+/// Factored out of [`encode_body`] so the `local` path can consume the encoder through
+/// [`Encoder::finish_local`] (the `LOCAL_EXT` wrapper) instead of [`Encoder::finish`]
+/// (the plain body).
+///
+/// The context's local node identity, its `local` node hash and the local-fun identity
+/// all borrow `ctx` mutably, while the encoder holds an immutable borrow of `ctx`'s
+/// atom table for its whole lifetime — so the mutably-read values are taken **first**
+/// and installed on the encoder afterwards.
+///
+/// * `options.deterministic` installs [`Encoder::with_deterministic`] (a map's pairs
+///   are emitted in full Erlang term order on the key — the `DFLAG_DETERMINISTIC`
+///   behaviour for **both** a ≤ 32-pair flat map and a > 32-pair HAMT
+///   (`external.c:3757-3764`, `:3783-3807`); the flag changes neither the tag set nor
+///   the encoded length, so the `erlang:external_size/2` probe stays correct).
+/// * `options.local` installs [`Encoder::with_local_ext`], so an internal pid/port/ref
+///   writes an `NIL_EXT` (`106`) node marker instead of a sysname atom
+///   (`external.c:2978`/`:5589`) — it needs no node identity. Otherwise the context's
+///   [`BifContext::local_node`] identity (when resolvable) is installed, so an internal
+///   id becomes the oracle's `NEW_PID_EXT`/`V4_PORT_EXT` (and an internal reference its
+///   `NEWER_REFERENCE_EXT`).
+/// * The context's [`BifContext::local_fun_identity`] (when resolvable) is installed so
+///   a local (`make_fun3`) fun is written as its `NEW_FUN_EXT` image.
+///
+/// # Errors
+///
+/// Propagates the local-fun-identity hook's failure.
+fn term_encoder<'c>(
+    ctx: &'c mut BifContext<'_>,
+    term: Eterm,
+    options: &T2bOptions,
+) -> Result<Encoder<'c>> {
     let local = ctx.local_node();
     let identity = ctx.local_fun_identity(term)?;
     // The body carries no version byte; `Encoder::new_body` plus the selected
@@ -927,14 +981,18 @@ pub(crate) fn encode_body(
     if options.deterministic {
         encoder = encoder.with_deterministic();
     }
-    if let Some((node, creation)) = local {
+    if options.local {
+        // The `[local]` marker wins over any local-node identity (an internal id's node
+        // field is then the `NIL_EXT` marker), so it needs no sysname/creation.
+        encoder = encoder.with_local_ext();
+    } else if let Some((node, creation)) = local {
         encoder = encoder.with_local_node(node, creation);
     }
     if let Some(identity) = identity {
         encoder = encoder.with_fun_identity(identity);
     }
     encoder.encode(term)?;
-    Ok(encoder.finish())
+    Ok(encoder)
 }
 /// The plain image: the version byte followed by the body.
 fn plain_image(body: &[u8]) -> Vec<u8> {
@@ -2482,12 +2540,13 @@ mod tests {
             // The oracle returns `<<131,121,Hash:4/binary,Body/binary>>`: a `LOCAL_EXT`
             // (121) wrapper whose 4-byte payload is `local_node_hash` — a Bob-Jenkins
             // block hash seeded from the node's hostname/pid/time-offset and the VM's
-            // monotonic clock (`external.c:136-200`). It is runtime state this crate has
-            // no seam for, and it changes on every VM start, so the option is the typed
-            // `unsupported_bif`, never a fabricated hash:
+            // monotonic clock (`external.c:136-200`). It is runtime state the runtime
+            // supplies through the `LocalNode::local_node_hash` seam; with none installed
+            // the option is the typed `unsupported_bif`, never a fabricated hash:
             //   erl ... 'term_to_binary([1,2],[local])'          % <<131,121,_,_,_,_,107,0,2,1,2>>
             //   erl ... 'term_to_binary(self(),[local])'         % 3rd..6th byte differ per run
-            // (see `tests/term_to_binary_options.rs`, which pins the two-run difference).
+            // (see `tests/term_to_binary_options.rs`, which pins the two-run difference
+            // and the hash-seam image).
             let local = atom_option(ctx, "local");
             let err = term_to_binary_2(ctx, &[list, local]).unwrap_err();
             assert!(
@@ -2495,15 +2554,15 @@ mod tests {
                 "expected the typed unsupported_bif gap, got {err:?}"
             );
 
-            // `local` combines with `compressed` in the oracle, but the gap is reached
-            // before compression matters — the option is refused whatever else is set.
+            // `local` combines with `compressed` in the oracle; with no hash seam the gap
+            // is reached before compression matters — the option is refused whatever else
+            // is set.
             let both = atom_options(ctx, "local", "compressed");
             let err = term_to_binary_2(ctx, &[list, both]).unwrap_err();
             assert!(is_unsupported_bif(&err), "local + compressed, got {err:?}");
 
-            // `local` is refused for a term holding an internal pid too — the id itself
-            // is encodable (through the `LocalNode` fallback), so the gap is the wrapper
-            // and nothing else.
+            // `local` is refused for a term holding an internal pid too — with no seam the
+            // wrapper (and nothing else) is the gap.
             let pid = ctx.self_pid().to_eterm();
             let local = atom_option(ctx, "local");
             let err = term_to_binary_2(ctx, &[pid, local]).unwrap_err();

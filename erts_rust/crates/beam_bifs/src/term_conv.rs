@@ -1068,8 +1068,12 @@ fn external_size_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// of `term` under `options`, as an integer term.
 ///
 /// The image is [`plain_image_of`]'s — the version byte plus the same body
-/// `term_to_binary/2` writes under the option list's tag set — so the two BIFs share
-/// one parser and one encoder. The compression level is deliberately ignored:
+/// `term_to_binary/2` writes under the option list's tag set, and for the `local`
+/// option the same `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]` wrapper (the hash
+/// *value* does not change the length, so the node-hash seam only has to be present;
+/// with none the BIF answers the same typed `unsupported_bif` gap as
+/// `term_to_binary/2`) — so the two BIFs share one parser and one encoder. The
+/// compression level is deliberately ignored:
 /// the oracle's `external_size_2` (`external.c:2221-2246`) never passes it to
 /// `erts_encode_ext_size_2` (`external.c:736-743`), and the documented contract is
 /// `byte_size(term_to_binary(T, Opts)) =< erlang:external_size(T, Opts)`

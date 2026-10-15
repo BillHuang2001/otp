@@ -534,6 +534,20 @@ pub trait RecordSource {
 pub trait LocalNode {
     /// The local node identity `(node_atom, creation)`, or `None` when unknown.
     fn local_node(&mut self) -> Option<(Atom, u32)>;
+
+    /// The node's `LOCAL_EXT` (`121`) hash — the 4-byte payload
+    /// `term_to_binary(Term, [local])` carries — or `None` when unknown.
+    ///
+    /// The value is the C's `local_node_hash` (`external.c:136-200`): a Bob-Jenkins
+    /// block hash seeded from the node's hostname/pid/time-offset **and the VM's
+    /// monotonic clock**, so it changes on every VM start and is node-local by
+    /// design. It is runtime state owned by `beam_rt`/`beam_dist`, and this crate
+    /// never fabricates it: the default answers `None`, which keeps
+    /// `term_to_binary/2`'s `[local]` a typed `unsupported_bif` gap (see
+    /// [`BifContext::local_node_hash`]).
+    fn local_node_hash(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 /// The `NEW_FUN_EXT` (`112`) identity of a local (`make_fun3`) fun, for
@@ -1117,6 +1131,19 @@ impl<'a> BifContext<'a> {
             return hook.local_node();
         }
         self.atoms().lookup("nonode@nohost").map(|node| (node, 0))
+    }
+
+    /// The node's `LOCAL_EXT` (`121`) hash for `term_to_binary(Term, [local])`, or
+    /// `None` when the runtime installed no hash.
+    ///
+    /// With a [`LocalNode`] hook installed the hook's [`LocalNode::local_node_hash`]
+    /// answers. Unlike [`BifContext::local_node`] there is **no fallback**: the hash is
+    /// a Bob-Jenkins block hash seeded from the node's hostname/pid/time-offset and the
+    /// VM's monotonic clock (`external.c:136-200`), so a value this crate invented
+    /// would produce an image the oracle rejects. With no hook (or a hook that answers
+    /// `None`), `[local]` stays the typed `unsupported_bif` gap.
+    pub fn local_node_hash(&mut self) -> Option<u32> {
+        self.local_node.as_deref_mut()?.local_node_hash()
     }
 
     /// The `NEW_FUN_EXT` identity of the local (`make_fun3`) fun `term`.
