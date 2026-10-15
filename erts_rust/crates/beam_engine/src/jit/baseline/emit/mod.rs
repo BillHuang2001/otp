@@ -875,6 +875,14 @@ fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
+            // The family-owned **term constructors** the interpreter's `other` arm hands to
+            // [`crate::families::dispatch`]: `put_list` builds a cons cell and `put_tuple2`
+            // a tuple, so the lowering is interpreter-identical **by construction** (one
+            // block-local continue, else the family's own word for the driver) — the same
+            // shape as the receive family's arm above, through the shared family helper.
+            Instr::PutList { .. } | Instr::PutTuple2 { .. } => {
+                family::emit_family(buffer, allocation, done, func, pc)?
+            }
             // Everything else: one interpreter step, then continue at `pc + 1`.
             _ => emit_deopt(buffer, done, allocation, func, pc, instr)?,
         }

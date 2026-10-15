@@ -35,7 +35,11 @@
 //! `loop_rec` candidate's `write_operand`/fail-label branch, the mailbox seam calls,
 //! and the suspend a `wait`/`wait_timeout` reports.
 //!
-//! Everything else is [`jit_step_one`]'s, exactly:
+//! The body is the instruction-agnostic [`super::family::jit_family`] — the one
+//! implementation every family-owned shape the emitter claims shares — so this module
+//! carries only the receive family's shape names (the emitter's `emit_receive` is
+//! likewise the same emission sequence as `emit_family`). What that shared helper does
+//! beyond the family body is exactly [`jit_step_one`]'s:
 //!
 //! * the position store ([`Machine::set_current_code`]) the interpreter's step makes
 //!   at entry, so `Machine::current_code` keeps the instruction granularity a raise
@@ -51,80 +55,16 @@
 //!
 //! [`encode_wait`]: super::encode_wait
 
-use super::jit_step_one;
-use super::runtime::{fold_step, JitRuntime};
+use super::family::jit_family;
+use super::runtime::JitRuntime;
 
 /// Run the `send`/receive-control instruction at `(func, pc)` natively and encode its
 /// outcome as a block-ABI word.
 ///
-/// The helper has the [`StepHelper`](super::runtime::StepHelper) signature, so the
-/// emitter's `emit_receive` arm drives it through the shared
-/// [`emit_helper_call`](super::emit::emit_helper_call) /
-/// [`emit_continue_check`](super::emit::emit_continue_check) sequence: a `send`,
-/// `loop_rec` (with a candidate), `timeout`, `remove_message` or a zero-time
-/// `wait_timeout` returns "the next instruction" and the block **continues in-block**;
-/// a `loop_rec` fail-label branch, a suspending `wait`/`wait_timeout` and every raise
-/// leave the block with that word for the driver — the driver folds a suspend into
-/// [`RunOutcome::Wait`](crate::RunOutcome::Wait) exactly as it folds a deopted one.
+/// A thin wrapper over the shared [`jit_family`] — the receive family's shape names,
+/// nothing more — so the emitted sequence's contract (`emit_receive` in
+/// [`super::emit`]) is the one implementation's.
+#[inline]
 pub(crate) extern "C" fn jit_receive(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
-    let step = {
-        // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
-        // `JitRuntime` and never aliases it for the duration of the call; every pointer
-        // it holds points at an object the driver owns and keeps alive for the whole
-        // loop (`machine`, `module`), or at a local (`labels`) that outlives the loop.
-        let runtime = unsafe { &mut *rt };
-        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
-        // `Machine`; no other `&mut Machine` exists while the helper runs (the driver is
-        // blocked in the block call that reached us).
-        let machine = unsafe { &mut *runtime.machine };
-        // SAFETY: `runtime.module` points at the module the driver is running, which
-        // outlives the loop.
-        let module = unsafe { &*runtime.module };
-        // SAFETY: `runtime.entry_module` points at the run's entry module, which the
-        // driver holds alive for the whole loop.
-        let entry_module = unsafe { &*runtime.entry_module };
-        // SAFETY: `runtime.labels` points at the driver's `labels` local, which outlives
-        // the loop.
-        let labels = unsafe { &*runtime.labels };
-        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as
-        // a raw pointer; the driver holds no `&mut` to it while the helper runs.
-        let ctx = unsafe { &mut *runtime.ctx };
-
-        // The same position store `Machine::step_instruction` makes at entry: a
-        // `send`/`receive` is an exact suspension and raise position, so the machine's
-        // saved instruction pointer must name this instruction, not the block.
-        machine.set_current_code(func, pc);
-
-        // The instruction this block emitted the helper for. An address outside the
-        // module cannot be here (the block was compiled from this very code), so it is
-        // handed to the interpreter's own step rather than invented — it reports the
-        // interpreter's exact diagnostic for a bad `(func, pc)`.
-        let instr = match module
-            .functions
-            .get(func as usize)
-            .and_then(|function| function.code.get(pc as usize))
-        {
-            Some(instr) => instr,
-            None => return jit_step_one(rt, func, pc),
-        };
-
-        // The receive family's own body (the entry the interpreter's `other` arm
-        // reaches), so the mailbox seam calls, the operand reads/writes and the
-        // `send` error landing are the family's, unchanged.
-        let step = crate::families::dispatch(machine, entry_module, module, labels, instr, func, pc, ctx)
-            .map_err(Box::new);
-        // The uniform raise funnel's context-`0` half, exactly as
-        // `Machine::step_instruction` runs it: in context `0` the active module IS the
-        // entry module, so a propagating raise is decorated here; a non-zero context is
-        // left to the driver, which knows the true entry module.
-        if machine.current_context() == 0 {
-            step.map_err(|err| Box::new(machine.with_uncaught_frames(*err, Some(module), func, pc)))
-        } else {
-            step
-        }
-    };
-    // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver owns;
-    // the `&mut` derived from it above is dead by now, so this borrow does not alias it.
-    let runtime = unsafe { &mut *rt };
-    fold_step(runtime, step, func, pc)
+    jit_family(rt, func, pc)
 }
