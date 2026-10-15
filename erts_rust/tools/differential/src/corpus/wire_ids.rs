@@ -78,6 +78,10 @@ use super::{Case, CaseKind, Contract, Golden, Probe};
 /// node name/creation identity the handshake and every `NEW_PID_EXT`/`V4_PORT_EXT` term carry.
 const NODE_IDENTITY_CONTRACTS: &[Contract] = &[Contract::Distribution];
 
+/// The contracts a *local-id byte image* covers: the ETF encoding (A.2) and the distribution
+/// identity the very same image carries on the wire (A.5).
+const LOCAL_ID_CONTRACTS: &[Contract] = &[Contract::BeamAsm, Contract::Distribution];
+
 /// One A.5 node-identity eval case: evaluate `expr` under both runtimes and pin the oracle's
 /// `~w` rendering **and** exit code (a pinned `exception ...` line exits `1`, an `ok ...` line `0`).
 fn node_case(
@@ -103,11 +107,36 @@ fn node_case(
     }
 }
 
+/// One A.2/A.5 reference-encoding case: the *same* probe shape as [`local_id_cases`] (a plain
+/// value probe with no extra argv), but over `make_ref/0` -- the third local id the ETF encoder
+/// must render with the runtime's own node identity (`NEWER_REFERENCE_EXT`, tag 90).
+fn reference_case(
+    id: &'static str,
+    description: &'static str,
+    expr: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: LOCAL_ID_CONTRACTS,
+        kind: CaseKind::Eval {
+            expr,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
 /// The A.2/A.5 local-pid/port byte-image cases (the encoding half of the node identity).
 fn local_id_cases() -> Vec<Case> {
     // A.2 is the ETF byte image `term_to_binary/1` produces; A.5 is the same tag the
     // distribution codec transmits, and both tags are wire tags.
-    let contracts = &[Contract::BeamAsm, Contract::Distribution];
+    let contracts = LOCAL_ID_CONTRACTS;
     vec![
         Case {
             id: "wire/term_to_binary_self_pid",
@@ -141,6 +170,31 @@ fn local_id_cases() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+    ]
+}
+
+/// The A.2/A.5 reference-id cases: `make_ref/0` is the third local id whose image is built from
+/// the runtime's own node identity (`NEWER_REFERENCE_EXT`, tag 90).
+///
+/// A reference's id field is per-VM-start (VM-unique), so its **bytes are never asserted** -- only
+/// the stable tag byte, the stable image length and the round-trip *identity* (`=:=`, not merely
+/// `is_reference/1`) are pinned. The image is
+/// `[131][90][node atom = 15][creation:u32 = 4][id]`, 35 bytes on `nonode@nohost`.
+fn reference_cases() -> Vec<Case> {
+    vec![
+        reference_case(
+            "wire_ids/newer_reference_image_shape",
+            "term_to_binary/1 of a local reference is a 35-byte NEWER_REFERENCE_EXT (90) that decodes back to a reference",
+            "begin B = term_to_binary(make_ref()), \
+             {binary:at(B,1), byte_size(B), is_reference(binary_to_term(B))} end",
+            "ok {90,35,true}",
+        ),
+        reference_case(
+            "wire_ids/newer_reference_round_trip_identity",
+            "binary_to_term(term_to_binary(Ref)) is the very reference that went in (the id bytes are per-VM, the value is not)",
+            "begin Ref = make_ref(), binary_to_term(term_to_binary(Ref)) =:= Ref end",
+            "ok true",
+        ),
     ]
 }
 
@@ -182,6 +236,35 @@ fn node_identity_cases() -> Vec<Case> {
             "the node identity is an atom (the type the ETF node field requires) in both runtimes",
             "is_atom(erlang:node())",
             "ok true",
+            0,
+        ),
+        node_case(
+            "wire_ids/term_to_binary_of_the_node_atom",
+            "term_to_binary/1 of erlang:node() is the 16-byte SMALL_ATOM_UTF8_EXT image of nonode@nohost (the node atom every NEW_PID_EXT/V4_PORT_EXT term carries)",
+            "term_to_binary(erlang:node())",
+            "ok <<131,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116>>",
+            0,
+        ),
+        node_case(
+            "wire_ids/node_atom_image_shape_and_round_trip",
+            "the node atom's image is a 16-byte SMALL_ATOM_UTF8_EXT (119) and decodes back to nonode@nohost",
+            "begin B = term_to_binary(erlang:node()), \
+             {binary_to_term(B) =:= nonode@nohost, binary:at(B,1), byte_size(B)} end",
+            "ok {true,119,16}",
+            0,
+        ),
+        node_case(
+            "wire_ids/node_1_of_local_ids_matches_node_0",
+            "erlang:node/1 of self() and of a fresh reference both name the same local node erlang:node/0 answers",
+            "{erlang:node(self()) =:= erlang:node(), erlang:node(make_ref()) =:= erlang:node()}",
+            "ok {true,true}",
+            0,
+        ),
+        node_case(
+            "wire_ids/nodes_by_selector_on_a_non_distributed_node",
+            "erlang:nodes/1 by selector on a non-distributed node: connected/visible/hidden are [], known is the local node",
+            "{erlang:nodes(connected), erlang:nodes(visible), erlang:nodes(known), erlang:nodes(hidden)}",
+            "ok {[],[],[nonode@nohost],[]}",
             0,
         ),
         node_case(
@@ -263,31 +346,83 @@ fn node_identity_cases() -> Vec<Case> {
     ]
 }
 
-/// The A.2/A.5 local-pid/port encoding cases and the A.5 node/identity cases.
+/// The A.2/A.5 local-pid/port/reference encoding cases and the A.5 node/identity cases.
 pub(crate) fn group() -> Vec<Case> {
     let mut cases = local_id_cases();
+    cases.extend(reference_cases());
     cases.extend(node_identity_cases());
     cases
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{group, local_id_cases, node_identity_cases};
+    use super::{group, local_id_cases, node_identity_cases, reference_cases};
     use crate::corpus::{CaseKind, Contract, Probe};
 
     /// The 15-byte node-name atom (`SMALL_ATOM_UTF8_EXT` 119, length 13, `nonode@nohost`).
     const NODE_NAME: &str = "<<119,13,110,111,110,111,100,101,64,110,111,104,111,115,116>>";
 
     #[test]
-    fn the_group_is_the_local_id_cases_then_the_node_identity_cases() {
+    fn the_group_is_the_local_id_cases_then_the_reference_then_the_node_identity_cases() {
         let ids: Vec<&str> = group().iter().map(|c| c.id).collect();
         let mut expected: Vec<&str> = local_id_cases().iter().map(|c| c.id).collect();
+        expected.extend(reference_cases().iter().map(|c| c.id));
         expected.extend(node_identity_cases().iter().map(|c| c.id));
         assert_eq!(ids, expected);
         assert_eq!(
             group().len(),
-            2 + 15,
-            "two byte-image cases + 15 identity cases"
+            2 + 2 + 19,
+            "two byte-image cases + two reference cases + 19 identity cases"
+        );
+    }
+
+    /// The A.2/A.5 reference cases: same probe shape as the pid/port byte images, but only the
+    /// stable tag byte, the stable image length and the round-trip identity are pinned (a
+    /// reference's id field is per-VM-start).
+    #[test]
+    fn the_reference_cases_are_a2_a5_value_probes() {
+        let cases = reference_cases();
+        assert_eq!(cases.len(), 2, "an image-shape case and an identity case");
+        assert_eq!(
+            cases.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [
+                "wire_ids/newer_reference_image_shape",
+                "wire_ids/newer_reference_round_trip_identity"
+            ]
+        );
+        for case in &cases {
+            assert!(case.id.starts_with("wire_ids/"), "{}", case.id);
+            assert!(!case.description.is_empty(), "{}", case.id);
+            assert_eq!(
+                case.contracts,
+                &[Contract::BeamAsm, Contract::Distribution],
+                "{}",
+                case.id
+            );
+            assert_eq!(case.kind_label(), "value", "{}", case.id);
+            assert!(
+                matches!(
+                    &case.kind,
+                    CaseKind::Eval { probe: Probe::Value, extra_argv, .. } if extra_argv.is_empty()
+                ),
+                "{}: a reference case is a plain value probe",
+                case.id
+            );
+            assert_eq!(case.golden.exit_code, 0, "{}", case.id);
+        }
+        // The shape case pins the tag byte (90) and the image length (35); the identity case
+        // reduces to a boolean, so no per-VM-start id byte can ever reach a golden.
+        assert_eq!(
+            cases[0].golden.stdout,
+            Some("ok {90,35,true}"),
+            "the NEWER_REFERENCE_EXT shape"
+        );
+        assert_eq!(cases[1].golden.stdout, Some("ok true"), "the identity");
+        assert!(
+            cases
+                .iter()
+                .all(|c| !c.golden.stdout.is_some_and(|g| g.contains("119,13"))),
+            "no reference case may pin the node-name bytes"
         );
     }
 
@@ -342,7 +477,7 @@ mod tests {
     #[test]
     fn the_node_identity_cases_are_a5_value_probes() {
         let cases = node_identity_cases();
-        assert_eq!(cases.len(), 15, "the A.5 identity surface");
+        assert_eq!(cases.len(), 19, "the A.5 identity surface");
         let mut seen = std::collections::HashSet::new();
         for case in &cases {
             assert!(case.id.starts_with("wire_ids/"), "{}", case.id);

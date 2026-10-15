@@ -831,6 +831,227 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- the big-integer (`SMALL_BIG_EXT`) images and the decoder's normalization -------
+        //
+        // An integer outside the 60-bit immediate / 64-bit signed range encodes as
+        // `SMALL_BIG_EXT` (110): `[131][110][sign:u8][byte count:u8][magnitude, LITTLE-endian]`.
+        // `binary_to_term/1` normalizes the *value*, not the tag, so a `SMALL_BIG_EXT` blob whose
+        // magnitude fits a machine word comes back out re-encoded as `SMALL_INT_EXT`/`INT_EXT`.
+        Case {
+            id: "etf/term_to_binary_bignum_positive",
+            description: "an integer above 2^64-1 encodes as SMALL_BIG_EXT (110) with a little-endian magnitude",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "123456789012345678901234567890",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,110,13,0,210,10,63,78,238,224,115,195,246,15,233,142,1>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_bignum_negative",
+            description: "a negative SMALL_BIG_EXT image carries the sign byte 1 and the same magnitude",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "0-123456789012345678901234567890",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,110,13,1,210,10,63,78,238,224,115,195,246,15,233,142,1>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_int64_max_small_big",
+            description: "2^63-1 overflows the 60-bit immediate and encodes as an 8-byte SMALL_BIG_EXT",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "9223372036854775807",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,110,8,0,255,255,255,255,255,255,255,127>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_small_big_u64_overflow",
+            description: "2^64 needs a ninth magnitude byte, so the SMALL_BIG_EXT length field grows to 9",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "18446744073709551616",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,110,9,0,0,0,0,0,0,0,0,0,1>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_small_big_normalization",
+            description: "decoding a SMALL_BIG_EXT blob re-encodes the value by its magnitude (small int / int / bignum)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // `<<131,110,2,0,1,0>>` is the two-byte bignum 1 => SMALL_INT_EXT 1;
+                // `<<131,110,2,0,255,255>>` is 65535 => INT_EXT; the 9-byte negative blob stays a
+                // bignum. The probe renders `term_to_binary/1` of the *decoded* tuple, so the
+                // canonical re-encoding is what the golden pins.
+                expr: "{binary_to_term(<<131,110,2,0,1,0>>), binary_to_term(<<131,110,2,0,255,255>>), \
+                       binary_to_term(<<131,110,9,1,0,0,0,0,0,0,0,0,1>>)}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,97,1,98,0,0,255,255,110,9,1,0,0,0,0,0,0,0,0,1>>"),
+                exit_code: 0,
+            },
+        },
+        // -- the string-tag normalization and the empty-atom forms -------------------------
+        //
+        // Three string-ish input tags decode to the same term, and the encoder canonicalizes on
+        // the way out: an empty `STRING_EXT` becomes `NIL_EXT` (106), and a `LIST_EXT` whose
+        // elements are all bytes becomes `STRING_EXT` (107).
+        Case {
+            id: "etf/binary_to_term_string_normalization",
+            description: "an empty STRING_EXT decodes to [] and a byte-listed LIST_EXT decodes to a string",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "{binary_to_term(<<131,107,0,0>>), \
+                       binary_to_term(<<131,108,0,0,0,2,97,1,97,2,106>>)}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,106,107,0,2,1,2>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_empty_atom_forms",
+            description: "the three atom tags decode to the empty atom, whatever their name encoding was",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // Tag 100 `ATOM_EXT` (Latin-1), 118 `ATOM_UTF8_EXT`, 115 `SMALL_ATOM_EXT`; all
+                // three with a zero-length name decode to `''`, which re-encodes as 119.
+                expr: "{binary_to_term(<<131,100,0,0>>), binary_to_term(<<131,118,0,0>>), \
+                       binary_to_term(<<131,115,0>>)}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,119,0,119,0,119,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_string_ext_u16_length_boundary",
+            description: "a 256-byte byte list fills STRING_EXT's 16-bit length to its first overflow value",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // `STRING_EXT` (107) carries a big-endian 16-bit length; 256 is the smallest value
+                // that needs its high byte. The image is 1 + 1 + 2 + 256 = 260 bytes.
+                expr: "begin B = term_to_binary(lists:seq(0,255)), \
+                       {byte_size(B), binary:part(B,0,4)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {260,<<131,107,1,0>>}"),
+                exit_code: 0,
+            },
+        },
+        // -- the `{minor_version,1}` dialect and the `[used]` option ----------------------
+        Case {
+            id: "etf/term_to_binary_minor_version_1_dialect",
+            description: "term_to_binary/2 with {minor_version,1} wraps a legacy ATOM_EXT (100) image in a binary",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // Where the default (version-2) encoder emits `SMALL_ATOM_UTF8_EXT` (119), the
+                // version-1 dialect emits `ATOM_EXT` (100) with a 16-bit length.
+                expr: "{term_to_binary(hello, [{minor_version, 1}]), \
+                       term_to_binary({ok,42}, [{minor_version, 1}])}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,104,2,109,0,0,0,9,131,100,0,5,104,101,108,108,111,\
+                    109,0,0,0,10,131,104,2,100,0,2,111,107,97,42>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_used_option",
+            description: "binary_to_term/2 with [used] answers {Term, BytesUsed} on an uncompressed image",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // An uncompressed image is consumed exactly, so `used` is the whole byte count
+                // (9 here) in both runtimes.
+                expr: "{binary_to_term(term_to_binary({ok,42}), [used]), \
+                       binary_to_term(term_to_binary(lists:seq(1,5)), [used])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {{{ok,42},9},{[1,2,3,4,5],9}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_nested_mixed_roundtrip",
+            description: "a tuple mixing an atom, a string list, an integer-keyed map and a binary round-trips",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary({a,[1,2],#{1=>2},<<3>>}))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,4,119,1,97,107,0,2,1,2,116,0,0,0,1,97,1,97,2,109,0,0,0,1,3>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_bit_binary_nonzero_padding_is_badarg",
+            description: "a BIT_BINARY_EXT whose padding byte has non-zero low bits is rejected with badarg",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // Tag 77 with length 2 bits: only the top two bits of the single payload byte are
+                // meaningful, so a payload of 255 (three set padding bits) is a malformed image.
+                expr: "binary_to_term(<<131,77,0,0,0,2,1,255>>)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_improper_list",
+            description: "an improper list round-trips through term_to_binary/1 as LIST_EXT with a tail",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary([a|b]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,108,0,0,0,1,119,1,97,119,1,98>>"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1031,6 +1252,107 @@ mod tests {
             assert_eq!(
                 case.golden,
                 Golden { stdout: Some(stdout), exit_code: 0 },
+                "{id}"
+            );
+        }
+    }
+
+    /// The bignum / decoder-normalization / dialect cases added to widen A.2: every golden is the
+    /// oracle's own single line (re-measured with `differential run <id>`), and the one malformed
+    /// image pins the decoder's `badarg` refusal with the matching exit code.
+    #[test]
+    fn the_small_big_and_dialect_cases_pin_the_oracle_lines() {
+        let cases = group();
+        for (id, label, stdout, exit_code) in [
+            (
+                "etf/term_to_binary_bignum_positive",
+                "term_to_binary",
+                "ok <<131,110,13,0,210,10,63,78,238,224,115,195,246,15,233,142,1>>",
+                0,
+            ),
+            (
+                "etf/term_to_binary_bignum_negative",
+                "term_to_binary",
+                "ok <<131,110,13,1,210,10,63,78,238,224,115,195,246,15,233,142,1>>",
+                0,
+            ),
+            (
+                "etf/term_to_binary_int64_max_small_big",
+                "term_to_binary",
+                "ok <<131,110,8,0,255,255,255,255,255,255,255,127>>",
+                0,
+            ),
+            (
+                "etf/term_to_binary_small_big_u64_overflow",
+                "term_to_binary",
+                "ok <<131,110,9,0,0,0,0,0,0,0,0,0,1>>",
+                0,
+            ),
+            (
+                "etf/binary_to_term_small_big_normalization",
+                "term_to_binary",
+                "ok <<131,104,3,97,1,98,0,0,255,255,110,9,1,0,0,0,0,0,0,0,0,1>>",
+                0,
+            ),
+            (
+                "etf/binary_to_term_string_normalization",
+                "term_to_binary",
+                "ok <<131,104,2,106,107,0,2,1,2>>",
+                0,
+            ),
+            (
+                "etf/binary_to_term_empty_atom_forms",
+                "term_to_binary",
+                "ok <<131,104,3,119,0,119,0,119,0>>",
+                0,
+            ),
+            (
+                "etf/term_to_binary_string_ext_u16_length_boundary",
+                "value",
+                "ok {260,<<131,107,1,0>>}",
+                0,
+            ),
+            (
+                "etf/term_to_binary_minor_version_1_dialect",
+                "term_to_binary",
+                "ok <<131,104,2,109,0,0,0,9,131,100,0,5,104,101,108,108,111,\
+                 109,0,0,0,10,131,104,2,100,0,2,111,107,97,42>>",
+                0,
+            ),
+            (
+                "etf/binary_to_term_used_option",
+                "value",
+                "ok {{{ok,42},9},{[1,2,3,4,5],9}}",
+                0,
+            ),
+            (
+                "etf/binary_to_term_nested_mixed_roundtrip",
+                "term_to_binary",
+                "ok <<131,104,4,119,1,97,107,0,2,1,2,116,0,0,0,1,97,1,97,2,109,0,0,0,1,3>>",
+                0,
+            ),
+            (
+                "etf/binary_to_term_bit_binary_nonzero_padding_is_badarg",
+                "term_to_binary",
+                "exception error badarg",
+                1,
+            ),
+            (
+                "etf/roundtrip_improper_list",
+                "term_to_binary",
+                "ok <<131,108,0,0,0,1,119,1,97,119,1,98>>",
+                0,
+            ),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), label, "{id}");
+            assert_eq!(
+                case.golden,
+                Golden {
+                    stdout: Some(stdout),
+                    exit_code
+                },
                 "{id}"
             );
         }
