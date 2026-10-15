@@ -210,6 +210,9 @@ mod test_helper;
 mod counters;
 
 #[cfg(test)]
+mod census;
+
+#[cfg(test)]
 mod tests;
 
 // The block ABI lives in `runtime` and the artifact in `code`; re-export their names

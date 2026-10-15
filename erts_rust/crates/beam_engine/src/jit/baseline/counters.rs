@@ -221,6 +221,18 @@ pub(crate) struct Counters {
     pub(crate) fill_registers: u64,
     /// Total fill register loads under the previous full-cache model (Σ `slots.len()`).
     pub(crate) fill_registers_full: u64,
+    /// **Static census.** Every instruction the emitter's lowering dispatch
+    /// ([`super::emit::emit_block`]) **visited**, keyed by variant name: one count per
+    /// IR instruction per emitted block, so a continuation sub-block counts its range a
+    /// second time. This is the census' denominator.
+    pub(crate) instr_instances: BTreeMap<String, u64>,
+    /// **Static census.** Every instruction the dispatch did **not** lower — the `_`
+    /// arm plus each `try_inline_*` refusal — keyed by variant name. This is the
+    /// census' numerator, and it is a *compile-time* decision: a run-time guard
+    /// rejection of a shape that **is** inlined (a `try_inline_*`'s internal
+    /// `emit_step_and_continue`) is not counted here, only by the run-time
+    /// [`deopts_by_variant`](Counters::deopts_by_variant).
+    pub(crate) instr_deopts: BTreeMap<String, u64>,
 }
 
 /// The thread-local counter block, or `None` when this thread is not recording.
@@ -270,7 +282,7 @@ fn variant_at(module: &Module, func: u32, pc: u32) -> String {
 /// A `Test` is keyed by its **kind** (`Test(IsEqExact)`, `Test(IsTuple)`, …) because the
 /// inline subset decides a `test` predicate by predicate: the per-kind split is what
 /// makes "which `test` shapes still deopt" readable from the counter table.
-fn variant_name(instr: &Instr) -> String {
+pub(crate) fn variant_name(instr: &Instr) -> String {
     if let Instr::Test { kind, .. } = instr {
         return format!("Test({kind:?})");
     }
@@ -393,6 +405,19 @@ pub(crate) fn record_y_access(load: bool, slot: u32, bytes: u64) {
 /// One emitted Y-window refresh site (see [`Counters::y_invalidations`]).
 pub(crate) fn record_y_invalidation() {
     with(|c| c.y_invalidations += 1);
+}
+
+/// **Static census.** One instruction the emitter's lowering dispatch visited (see
+/// [`Counters::instr_instances`]). Recorded at the top of [`emit_block`]'s per-instruction
+/// loop, so it counts a continuation sub-block's range a second time.
+pub(crate) fn record_instr_instance(name: &str) {
+    with(|c| *c.instr_instances.entry(name.to_string()).or_insert(0) += 1);
+}
+
+/// **Static census.** One instruction the dispatch did **not** lower — the `_` arm or a
+/// `try_inline_*` refusal (see [`Counters::instr_deopts`]).
+pub(crate) fn record_instr_deopt(name: &str) {
+    with(|c| *c.instr_deopts.entry(name.to_string()).or_insert(0) += 1);
 }
 
 /// One `spill` call: `written_len` cached x-registers are stored back into

@@ -74,10 +74,40 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 ## Test Strategy
 `tests.rs` unit-tests the ABI encoding, the `#[repr(C)]` runtime layout, regalloc, the fast-path constants/arithmetic, the deopt/yield folding (a deopted `wait` folds to `RunOutcome::Wait`), and that a deopted collecting `test_heap` reaches the host's admission door exactly once and reloads the cached registers afterwards. It also pins that the comparison-`test` lowering leaves no `Test` entry in the two-process copy-bound probe's per-opcode `jit_step_one` table. `the_y_window_traffic_of_the_committed_fixtures_is_measured` first pins the Y-traffic instrument on a synthetic shape with known traffic (2 loads / 2 stores / 2 same-block slot reuses), then counts the 27 committed `erlc` fixtures: **12 guarded Y accesses over 235,977 emitted bytes**, 9 `Y`-touching blocks and **1** same-block slot reuse — the measured bound on what a per-block single-slot Y-value cache could save. Tier equivalence on real modules is in the crate's `tests/jit*.rs` (see `../CONTEXT.md`), which drive the **lazy** path through `Machine::run_with_tier`.
 
+### The deopt census (`census.rs` + `counters.rs`)
+**A test-only static + dynamic deopt census** ranks which `beam_loader::Instr` opcodes the
+tier still fails to lower — the evidence a widening of the inline set is chosen from
+(no production cost: both modules are `#[cfg(test)]`). Two independent views:
+- **Static** (`census.rs::the_static_deopt_census_over_the_corpus_is_printed`): scores the
+  **compile-time** dispatch decision deterministically. `counters.rs::record_instr_instance`
+  (the emitter loop's top, `emit/mod.rs`) counts every instruction the lowering dispatch
+  visits per variant, and `counters.rs::record_instr_deopt` — reached through the
+  `emit/mod.rs::emit_deopt` wrapper that **every** `try_inline_*` refusal and the `_` arm
+  now call instead of `emit_step_and_continue` directly — counts the ones it did not lower.
+  (The run-time guard fallbacks *inside* the `try_inline_*` functions keep calling
+  `emit_step_and_continue`; they are run-time deopts, attributed by `deopts_by_variant`, not
+  static ones.) The corpus is the crate's `tests/fixtures/*.beam` (discovered by directory
+  scan, no hardcoded names) plus the installed OTP `.beam`s discovered generically from
+  `erl`'s `code:lib_dir()` (**no hardcoded app names**; `ERTS_ORACLE` honoured; a bounded
+  sample via `OTP_MODULE_CAP`, default covering the whole tree; the OTP part is skipped
+  loudly without a usable `erl`). Prints a **raw deopt-count** ranking
+  (`variant | deopts | instances | deopt_ratio`) and a **weighted-score** ranking
+  (`score = deopts * deopt_weight`, where the block-terminating dispatch opcodes `Jump`/
+  `SelectVal`/`SelectTupleArity` weigh 4 because a deopt there also forfeits the direct
+  block-to-block link — see `deopt_weight`'s rationale).
+- **Runtime** (`census.rs::the_runtime_deopt_census_over_the_hot_shapes_is_printed`): runs
+  `crate::jit::bench::assert_tier_agreement()` with recording on and dumps the per-variant
+  `Counters::deopts_by_variant` the executed blocks produced — which un-lowered opcodes
+  dominate the **hot** shapes.
+Both write a machine-readable TSV to `$TMPDIR` and assert only liveness/consistency (never
+a threshold), so the printed rankings are the evidence and the tests pass as the inline set
+changes. Run with `... -p beam_engine census -- --nocapture`.
+
 ## Routing Table
 - `code.rs` → the artifact in its two layouts (`CompiledModule`/`CompiledFunction` [`entries` + `sub_entries`]/`EagerLayout::sub_entries`/`Summary`) + the compile-on-entry point.
 - `emit/` → the compilation entry points + the per-instruction emitters (`compile.rs` `compile_module`/`compile_function`/`emit_function` + the continuation sub-blocks `stores_continuation`/`sub_blocks_capacity_estimate`/`emit_sub_blocks`/`emit_shared_sub_blocks` + the code-size estimates; `mod.rs` dispatch + helpers, `move/test/select/aggregate/arith/compare/frame/link/operands/regalloc.rs`, `regs.rs` (the register cache: the `Allocation` + `spill`/`fill` + `SpillSite`/`FillSite`) — `frame.rs` is the frame-discipline trio `Deallocate`/`Return`/`DeallocateReturn`), the Y-window publish/refresh emission (`Allocation::y_last`/`refresh_y_after`), the `emit/operands.rs` Y readers (`y_offset`/`y_addressable`/`y_register`) plus the shared guarded-Y emission (`emit_guarded_y_address`/`emit_guarded_y_load`/`emit_guarded_y_store`), the `emit/arith.rs` + `emit/move.rs` Y operand/destination support (`uses_y`) and the `emit/regalloc.rs` `y_last` derivation; see its `CONTEXT.md`.
 - `receive.rs` → the `jit_receive` `send`/receive-control helper; `runtime.rs` → block ABI + `jit_step_one`/`jit_ext_call`/`jit_tail_call`/`jit_deallocate`/`jit_return`/`jit_deallocate_return`/`jit_publish_y`/`jit_refresh_y`
   + `RUNTIME_YBASE_DISP`/`RUNTIME_YEND_DISP`; `tests.rs` → unit tests.
 - `test_helper.rs` → the comparison-`test` helper (`jit_test`, `TEST_TRUE`/`TEST_FALSE`) + its `jit_step_one` fallback for anything it does not own.
-- `counters.rs` → the `#[cfg(test)]` structural counters (`Counters`, `record_*`, `snapshot`): the `jit_step_one`/`jit_step_ext` deopts (a `Test` deopt is keyed by kind — `"Test(IsEqExact)"`, `"Test(IsTuple)"`, … — in `deopts_by_variant`, so which `test` shapes still deopt is readable per predicate), the driver round-trips, the prologue position/publish calls, and the **register-cache traffic** (`record_spill`/`record_fill`/`record_block`: per-block IR/byte/cache/write-set sizes + spill/fill stores by site), and the **Y-window traffic** (`record_y_access`/`record_y_invalidation`/`record_block`: emitted guarded `Y` loads/stores + their emitted bytes, `Y`-touching blocks, the in-block refresh sites, and the same-block `Y`-slot reuse count) — designed so **one recorded run yields both** the current written-set spill stores and the full-cache count the previous model would have emitted.
+- `counters.rs` → the `#[cfg(test)]` structural counters (`Counters`, `record_*`, `snapshot`): the `jit_step_one`/`jit_step_ext` deopts (a `Test` deopt is keyed by kind — `"Test(IsEqExact)"`, `"Test(IsTuple)"`, … — in `deopts_by_variant`, so which `test` shapes still deopt is readable per predicate), the driver round-trips, the prologue position/publish calls, the **register-cache traffic** (`record_spill`/`record_fill`/`record_block`: per-block IR/byte/cache/write-set sizes + spill/fill stores by site), the **Y-window traffic** (`record_y_access`/`record_y_invalidation`/`record_block`: emitted guarded `Y` loads/stores + their emitted bytes, `Y`-touching blocks, the in-block refresh sites, and the same-block `Y`-slot reuse count) — designed so **one recorded run yields both** the current written-set spill stores and the full-cache count the previous model would have emitted — and the **static deopt census** (`record_instr_instance`/`record_instr_deopt` + the `instr_instances`/`instr_deopts` maps driving `census.rs`).
+- `census.rs` → the `#[cfg(test)]` deopt census: the static corpus census (fixtures + generically-discovered OTP modules) and the runtime hot-shape census, each printing a ranked table; see `## Test Strategy` above and the file's own module docs.

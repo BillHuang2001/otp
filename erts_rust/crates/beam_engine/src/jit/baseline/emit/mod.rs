@@ -301,6 +301,11 @@ fn emit_block(
     let mut terminated = false;
     for (i, instr) in code[start..end].iter().enumerate() {
         let pc = (start + i) as u32;
+        // Static-census instrument: every instruction this dispatch visits is an
+        // "instance"; the ones it does not lower (below, through `emit_deopt`) are the
+        // "deopts". Test-only and zero-cost in a production build (`#[cfg(test)]`).
+        #[cfg(test)]
+        super::counters::record_instr_instance(&super::counters::variant_name(instr));
         match instr {
             // Metadata / no-ops (`ops.tab:103-108`): they never change control flow.
             // `func_info` is **not** here: it is the failed-clause raise (see the
@@ -323,7 +328,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // `swap A B` exchanges two x-registers; a block normally caches fewer
@@ -331,7 +336,7 @@ fn emit_block(
             // is cheap to remove (a three-`mov` shuffle, register or memory).
             Instr::Swap { a, b } => {
                 if !try_inline_swap(buffer, a, b, allocation, highest_touched)? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // The guarded cons-cell readers: `get_list`/`get_hd`/`get_tl` split a
@@ -351,7 +356,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             Instr::GetHd { source, head } => {
@@ -365,7 +370,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             Instr::GetTl { source, tail } => {
@@ -379,7 +384,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // The guarded tuple readers: `get_tuple_element` reads one element of a
@@ -405,7 +410,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // The guarded tuple writer: `set_tuple_element` overwrites one element word
@@ -431,7 +436,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // Like the `select_val` arm below, this instruction **always** transfers
@@ -458,7 +463,7 @@ fn emit_block(
                     terminated = true;
                     break;
                 }
-                emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                emit_deopt(buffer, done, allocation, func, pc, instr)?;
             }
             // The one optimised BIF family: the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2`.
             // When the guarded fast path is emitted the block keeps going; otherwise
@@ -485,7 +490,7 @@ fn emit_block(
                     highest_touched,
                 )?;
                 if !inlined {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // The comparison BIFs (`erlang`'s `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`),
@@ -503,7 +508,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // `deallocate N` — the **checked frame pop**. What a compiled block cannot
@@ -566,7 +571,7 @@ fn emit_block(
                 }
                 // An undefined label keeps the interpreter's exact `unknown_label`
                 // error: hand the jump to the helper rather than inventing one.
-                Err(_) => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+                Err(_) => emit_deopt(buffer, done, allocation, func, pc, instr)?,
             },
             // A **local tail call** (`call_last Arity Label Deallocate`) transfers
             // control to another block — usually of another function — after popping
@@ -600,7 +605,7 @@ fn emit_block(
                     terminated = true;
                     break;
                 }
-                _ => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+                _ => emit_deopt(buffer, done, allocation, func, pc, instr)?,
             },
             // A local tail call **without** a frame to pop (`call_only Arity Label`):
             // `i_call_only(CallDest)` is `$DISPATCH_REL(Dest)`, so it lowers exactly
@@ -616,7 +621,7 @@ fn emit_block(
                     terminated = true;
                     break;
                 }
-                Err(_) => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+                Err(_) => emit_deopt(buffer, done, allocation, func, pc, instr)?,
             },
             // The **cross-module** calls. Unlike a local `call_*` these enter code
             // outside this module's compiled blocks, so the transfer is always a
@@ -677,7 +682,7 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? {
-                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                    emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }
             // The exact-value switch subset (see the section below): a chain of
@@ -702,7 +707,7 @@ fn emit_block(
                     terminated = true;
                     break;
                 }
-                emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                emit_deopt(buffer, done, allocation, func, pc, instr)?;
             }
             // The `send` / receive-control family — the copy-bound message-passing
             // path (`send`, `loop_rec`, `loop_rec_end`, `wait`, `wait_timeout`,
@@ -722,7 +727,7 @@ fn emit_block(
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
             // Everything else: one interpreter step, then continue at `pc + 1`.
-            _ => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+            _ => emit_deopt(buffer, done, allocation, func, pc, instr)?,
         }
     }
 
@@ -883,6 +888,32 @@ pub(super) fn emit_step_and_continue(
         &[i64::from(func), i64::from(pc)],
     )?;
     emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// [`emit_step_and_continue`] plus the **static-census** deopt attribution: the whole
+/// point of the wrapper is that it is the *one* place the dispatch's "did not lower
+/// this instruction" decision is taken, so a test build can count it per variant.
+///
+/// Every refusal in [`emit_block`] — each `try_inline_*` returning `Ok(false)` and the
+/// `_` arm — goes through here, while the *run-time* guard fallbacks **inside** the
+/// `try_inline_*` functions keep calling [`emit_step_and_continue`] directly: those are
+/// a rejection of an operand shape for an instruction the dispatch **did** lower, so
+/// they are run-time deopts ([`super::counters::record_step_one`]), not static ones.
+///
+/// The production build is byte-for-byte the old one: the whole wrapper body is the one
+/// call, and it is `#[inline]`.
+#[inline]
+fn emit_deopt(
+    buffer: &mut CodeBuffer,
+    done: CodeLabel,
+    allocation: &Allocation,
+    func: u32,
+    pc: u32,
+    #[cfg_attr(not(test), allow(unused_variables))] instr: &Instr,
+) -> Result<()> {
+    #[cfg(test)]
+    super::counters::record_instr_deopt(&super::counters::variant_name(instr));
+    emit_step_and_continue(buffer, done, allocation, func, pc)
 }
 
 /// Emit the **local-call seam probe** in front of a local tail call's exit: call
