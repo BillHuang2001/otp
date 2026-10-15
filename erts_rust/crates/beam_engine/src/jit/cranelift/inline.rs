@@ -157,7 +157,7 @@ pub(super) fn emit_inline_swap(
 // The inlined small-int arithmetic fast path
 // ---------------------------------------------------------------------------
 
-/// The two BIFs the inlined fast path lowers — `erlang:'+'/2`, `erlang:'-'/2` and
+/// The three BIFs the inlined fast path lowers — `erlang:'+'/2`, `erlang:'-'/2` and
 /// `erlang:'*'/2`, and nothing else.
 ///
 /// A [`super::CompiledFunctions`] artifact reports the ops it inlined through
@@ -210,7 +210,7 @@ enum FastOperand {
 
 /// A `gc_bif` shape the fast path lowers, resolved at compile time.
 pub(super) struct FastArith {
-    /// Which of the two BIFs is called.
+    /// Which of the three BIFs is called.
     pub(super) op: SmallArith,
     /// The first operand.
     a: FastOperand,

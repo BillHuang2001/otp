@@ -31,14 +31,18 @@
 //! function with the System V signature
 //!
 //! ```text
-//! extern "C" fn(rt: i64) -> i64
+//! extern "C" fn(rt: i64, pc: i64) -> i64
 //! ```
 //!
-//! (`rt` in `rdi`, the block-ABI word in `rax`). Its body is a **pc-block CFG**:
-//! one Cranelift basic block per **reachable** `pc` of the IR function, created
-//! lazily by a worklist from the function's entry `pc` (so an unreachable `pc`
-//! costs nothing), plus one shared "hand the block-ABI word back to the driver"
-//! block. Each `pc`-block either
+//! (`rt` in `rdi`, the entry `pc` in `rsi`, the block-ABI word in `rax`). Its body is
+//! a **pc-block CFG**: one Cranelift basic block per **reachable** `pc` of the IR
+//! function, created lazily by a worklist from the function's entry `pc` (so an
+//! unreachable `pc` costs nothing), plus one shared "hand the block-ABI word back to
+//! the driver" block. The prologue **dispatches on the entry `pc` argument** over the
+//! function's enterable pc set (see below), so the same compiled function can be
+//! entered at its entry `pc` *or* at any IR block start / non-tail-call continuation —
+//! that is how a cross-function call return is picked up natively. Each `pc`-block
+//! either
 //!
 //! 1. **inlines** the IR instruction and transfers control to a successor block —
 //!    the metadata no-ops fall through to `pc + 1`, an inlinable `move` writes the
@@ -65,12 +69,12 @@
 //! every single instruction stay the interpreter's — the results are
 //! **interpreter-identical by construction**. This is the tier's documented
 //! **cheap-deopt boundary**: every instruction the tier does not inline is executed
-//! by the shared helper, and the driver falls back to one interpreter step for any
-//! address no compiled function starts at.
+//! by the shared helper, and the driver falls back to one interpreter step only for
+//! an address the compiled function cannot be natively entered at.
 //!
 //! [`compile`]: JitBackend::compile
 //!
-//! # The continuation candidate set
+//! # The continuation candidate set — and the native entry set
 //!
 //! A helper block's `Step::Goto { func, pc }` is a **runtime** value, so the block
 //! cannot statically pick a target block. A same-function continuation is always
@@ -84,10 +88,23 @@
 //! today) is handed back to the driver, which takes the interpreter's exact step —
 //! never a wrong result.
 //!
+//! The **same** set is the function's **native entry set**: the compiled function's
+//! prologue dispatches on the entry `pc` argument over it (see
+//! [`codegen::emit_pc_entry_dispatch`], which checks the function's `entry_pc` first as a
+//! one-comparison fast path), and the artifact exposes it through
+//! [`CompiledFunctions::is_enterable`]. The driver
+//! ([`CompiledEntries::enter`]) therefore enters a compiled function natively at **any**
+//! IR block start or non-tail-call continuation — so a cross-function non-tail call's
+//! return (`call_site + 1`) is picked up natively instead of on the driver's
+//! interpreter step, and a label-addressed run enters natively wherever the label
+//! resolves. An address **outside** the set (a `wait`/`wait_timeout` suspension `pc`,
+//! an instruction no block boundary names) is not enterable and stays on the driver's
+//! per-instruction interpreter step — never a wrong result.
+//!
 //! # What it does **not** inline
 //!
 //! Everything outside the set above: `func_info` (the failed-clause raise, which
-//! must **not** be a no-op — see the interpreter's `Instr::FuncInfo` arm), `swap`,
+//! must **not** be a no-op — see the interpreter's `Instr::FuncInfo` arm),
 //! every call/return/frame instruction, every `test` shape outside
 //! [`inline::inline_test`]'s provably-exact subset (see that function), `select_*`,
 //! every BIF outside the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` fast path and the
@@ -95,7 +112,8 @@
 //! `Y` (or other non-x) operand or an x-register index past the engine's
 //! `MAX_REGISTER` bound, and a `jump` to a label the module does not define (so the
 //! interpreter's exact `bad_register` / `unknown_label` error surfaces). Each of
-//! those runs through `jit_step_one`.
+//! those runs through `jit_step_one`. (An inlined `swap` **is** lowered — see
+//! [`inline::inline_swap`].)
 //!
 //! # The inlined `test` subset
 //!
@@ -272,9 +290,11 @@ pub(crate) fn run_outcome(
 /// The label-addressed counterpart of [`run_outcome`]: the shared outcome-aware
 /// label driver ([`run_native_label_outcome`](crate::jit::baseline::run_native_label_outcome))
 /// resolves `label` against the module-wide label map and enters the compiled code
-/// wherever a function's entry `pc` matches. A label that is not a compiled
-/// function's entry simply stays on the driver's interpreter step — the documented
-/// per-instruction deopt, never a wrong result.
+/// natively at that address whenever the compiled function for the resolved
+/// `(func, pc)` can be entered there (an IR block start, which every label position
+/// is, or a non-tail-call continuation). An address outside that set stays on the
+/// driver's interpreter step — the documented per-instruction deopt, never a wrong
+/// result.
 pub(crate) fn run_label_outcome(
     machine: &mut Machine,
     module: &Module,
@@ -293,17 +313,13 @@ pub(crate) fn run_label_outcome(
 
 /// Resume a suspended machine on the Cranelift hot tier.
 ///
-/// The Cranelift tier compiles **one function per IR function** and bakes that
-/// function's entry `pc` into the generated code ([`CompiledFunctions::entry_pc`]),
-/// so [`CompiledEntries::enter`] refuses any other address. A suspension address is a
-/// `wait`/`wait_timeout` **mid-function** `pc`, which no compiled function can be
-/// entered at, so an arbitrary-`pc` resume is unserviceable natively.
-///
-/// Rather than silently fall back to another tier (which would hide a real
-/// capability limit and misreport which tier ran the slice), this reports the honest
-/// typed error. The resume position is not even examined: a compiled function can
-/// only be entered at its entry `pc`, so the mismatching-entry case is the required,
-/// deterministic behavior. This backs
+/// Unlike first entry, a resume is handed **no** compiled artifact: this entry point
+/// receives only `(machine, module, func, pc)` and the tier has no path that would
+/// compile and bind an artifact at a parked address on demand, so the Cranelift tier
+/// has no resume entry point at all. Rather than silently recompile the whole module
+/// on every resume or fall back to another tier (which would hide a real capability
+/// limit and misreport which tier ran the slice), this reports the honest typed
+/// error. The resume position is not even examined. This backs
 /// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
 /// for [`Tier::Cranelift`](crate::jit::Tier::Cranelift) (see
 /// [`crate::jit::run_cranelift_resume_outcome`]).
@@ -315,7 +331,7 @@ pub(crate) fn run_resume_outcome(
     _ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
     Err(error::unsupported(
-        "cranelift jit: cannot resume at an arbitrary pc (a compiled function can only be entered at its entry pc)",
+        "cranelift jit: cannot resume at an arbitrary pc (the cranelift tier has no resume entry point)",
     ))
 }
 
@@ -335,11 +351,26 @@ pub struct CompiledFunctions {
     _module: JITModule,
     /// The function index → finalized native entry point.
     entries: HashMap<u32, *const u8>,
-    /// The function index → the `pc` its compiled function starts at.
+    /// The function index → the `pc` its compiled function's **entry** is (an IR block
+    /// start).
     ///
-    /// A compiled function bakes its entry `pc` in, so it may only be entered at
-    /// that address (the driver checks it; see [`CompiledEntries::enter`]).
+    /// Kept for introspection ([`CompiledFunctions::entry_pc`]): native entry is gated
+    /// on the wider [`is_enterable`](CompiledFunctions::is_enterable) set, which
+    /// includes this `pc` alongside every other IR block start and every non-tail-call
+    /// continuation.
     entry_pc: HashMap<u32, u32>,
+    /// The function index → the sorted pcs its compiled function may be **natively
+    /// entered** at: every IR block start of the function plus every non-tail-call
+    /// continuation (`call_site + 1`), each one an address with a real instruction to
+    /// start a block for.
+    ///
+    /// The compiled function's prologue dispatches on its entry-`pc` argument over
+    /// exactly this set ([`codegen`]'s pc-block CFG), so the driver
+    /// ([`CompiledEntries::enter`]) may enter the function at any member — which is
+    /// what lets a cross-function non-tail call's return be picked up natively instead
+    /// of on the driver's interpreter step. A `pc` outside the set is not enterable and
+    /// stays on the interpreter step. An uncompiled function has no entry here.
+    enter_pcs: HashMap<u32, Vec<u32>>,
     /// The highest x-register index any inlined instruction addresses directly in
     /// `machine.x`.
     ///
@@ -431,6 +462,19 @@ impl CompiledFunctions {
         self.entry_pc.get(&func).copied()
     }
 
+    /// Whether the compiled function for `func` may be **entered natively at `pc`**.
+    ///
+    /// The set is every IR block start of the function plus every non-tail-call
+    /// continuation (`call_site + 1`) — the addresses the function's prologue can
+    /// dispatch to ([`codegen::emit_pc_entry_dispatch`]). An uncompiled function (or a
+    /// `pc` outside the set, e.g. a `wait`/`wait_timeout` suspension address) is never
+    /// enterable: the driver takes the interpreter's exact step for it instead.
+    pub fn is_enterable(&self, func: u32, pc: u32) -> bool {
+        self.enter_pcs
+            .get(&func)
+            .is_some_and(|pcs| pcs.contains(&pc))
+    }
+
     /// The number of compiled functions.
     pub fn function_count(&self) -> usize {
         self.entries.len()
@@ -457,7 +501,7 @@ impl CompiledFunctions {
     ///
     /// Read-only introspection, the arithmetic counterpart of
     /// [`inlined_test_kinds`](CompiledFunctions::inlined_test_kinds): it names
-    /// **which** of the two BIFs the compile took the inline fast path for, so a
+    /// **which** of the three BIFs the compile took the inline fast path for, so a
     /// test can prove the fast path ran instead of silently deopting to
     /// `jit_step_one` (agreeing results alone would not). Each entry carries its
     /// own [`name`](SmallArith::name).
@@ -523,8 +567,10 @@ impl CompiledFunctions {
         self.inlined_tail_calls
     }
 }
-/// The Cranelift tier's [`NativeCode`] lookup: a compiled function is entered
-/// exactly at its entry `pc`.
+/// The Cranelift tier's [`NativeCode`] lookup: a compiled function is entered at any
+/// address in its enterable pc set — its entry `pc`, any other IR block start, or a
+/// non-tail-call continuation (see [`CompiledFunctions::is_enterable`]). Every other
+/// address stays on the driver's interpreter step.
 struct CompiledEntries<'a> {
     /// The compiled functions of the module being run.
     compiled: &'a CompiledFunctions,
@@ -532,13 +578,14 @@ struct CompiledEntries<'a> {
 
 impl NativeCode for CompiledEntries<'_> {
     fn enter(&self, rt: *mut JitRuntime<'_>, module: &Module, func: u32, pc: u32) -> Option<i64> {
-        // The Cranelift tier compiles each function once at its entry `pc`, so it has
-        // no lazy compile-on-entry and ignores the active module the driver supplies.
+        // The Cranelift tier compiles each function once, up front, so it has no lazy
+        // compile-on-entry and ignores the active module the driver supplies.
         let _ = module;
-        // The compiled function starts at the IR function's entry `pc`; entering it
-        // anywhere else would run the wrong code, so every other address stays on the
-        // driver's interpreter step (the documented per-instruction deopt).
-        if self.compiled.entry_pc(func)? != pc {
+        // The compiled function's prologue dispatches on the entry `pc` argument over
+        // this very set, so any member runs the right code; an address outside it (a
+        // function the tier did not compile, or a `pc` no block boundary names) stays
+        // on the driver's interpreter step (the documented per-instruction deopt).
+        if !self.compiled.is_enterable(func, pc) {
             return None;
         }
         // An inlined `move` addresses `machine.x` unchecked, so a machine whose
@@ -555,12 +602,15 @@ impl NativeCode for CompiledEntries<'_> {
         }
         let entry = self.compiled.entry(func)?;
         // SAFETY: `entry` is the finalized entry of a function declared with the
-        // `NativeFunc` signature (`extern "C" fn(i64) -> i64`) in the JIT module that
-        // owns it, so the pointer is callable with exactly that ABI; `rt` is the live
-        // driver-owned runtime block, passed as the `i64` first parameter (a pointer
-        // and an `i64` use the same argument register under the System V AMD64 ABI).
+        // `NativeFunc` signature (`extern "C" fn(i64, i64) -> i64`) in the JIT module
+        // that owns it, so the pointer is callable with exactly that ABI; `rt` is the
+        // live driver-owned runtime block, passed as the `i64` first parameter and the
+        // entry `pc` as the `i64` second parameter (a pointer and an `i64` use the same
+        // argument registers under the System V AMD64 ABI). `pc` is a member of the
+        // function's enterable set, so the prologue dispatches it to a real block (its
+        // defensive fallback is unreachable).
         let code: NativeFunc = unsafe { mem::transmute(entry) };
-        Some(code(rt as i64))
+        Some(code(rt as i64, pc as i64))
     }
 }
 // ---------------------------------------------------------------------------
