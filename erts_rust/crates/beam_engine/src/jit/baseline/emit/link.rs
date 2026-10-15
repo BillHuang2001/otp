@@ -86,10 +86,14 @@
 //! A failed pop (a `Deallocate` operand that does not match the live frame — a
 //! `trim`ed frame, or a tail call reaching past the bottom frame) takes the `jne` to
 //! the shared epilogue, whose `ERROR` word makes the driver propagate the exact typed
-//! error the interpreter produces. A successor that is **not** this compilation's
-//! block (an undefined label, a block that is empty, an address inside a block) is not
-//! linked at all: the caller keeps the documented deopt, so the interpreter's own
-//! `call_last` — and therefore its exact `unknown_label`/frame error — surfaces.
+//! error the interpreter produces. A successor that is a *resolved* label this
+//! compilation emitted no block for (another function of a lazy per-function artifact,
+//! or an address inside a block) is not linked either, but it is not handed to the
+//! interpreter: [`Linker::emit_tail_exit_to_driver`] does the same checked pop and then
+//! leaves the resolved `(func, pc)` word in `rax` for the driver — the interpreter's own
+//! `Step::Goto`. Only an **undefined** label keeps the documented deopt, so the
+//! interpreter's own `call_last` — and therefore its exact `unknown_label` error —
+//! surfaces.
 //!
 //! `call_only` (a local tail call with **no** frame to pop) needs no helper: it is
 //! `$DISPATCH_REL(Dest)`, i.e. [`Linker::emit_exit`] exactly as `jump` uses it.
@@ -98,13 +102,17 @@
 //!
 //! # What is *not* linked
 //!
-//! `(func, pc)` is linked only when it is the start of a block this compilation
-//! emitted — including blocks of **other functions** of the same module (`fib/1`'s
-//! tail call into `fib/3`), because every block is a standalone frame. Every other
-//! continuation keeps today's documented deopt: spill, materialise the
-//! `encode_target` word in `rax`, and jump to the block epilogue so the driver
-//! decodes it and takes one interpreter step (an address inside a block, an empty
-//! block's start, the end of a function's code, a label the module does not define).
+//! `(func, pc)` is linked directly only when it is the start of a block **this
+//! compilation emitted** — including blocks of **other functions** of the same module
+//! (`fib/1`'s tail call into `fib/3`) for the *eager* whole-module artifact, because
+//! every block is a standalone frame. A `call_last` whose resolved target is not in the
+//! map (the lazy per-function artifact's cross-function case) still runs natively: it
+//! takes [`Linker::emit_tail_exit_to_driver`]'s checked pop + return-to-driver, exactly
+//! the interpreter's `Step::Goto`. Every other continuation keeps today's documented
+//! deopt: spill, materialise the `encode_target` word in `rax`, and jump to the block
+//! epilogue so the driver decodes it and takes one interpreter step (an unexplained
+//! label — the interpreter's `unknown_label` — plus, for `jump`/`call_only`, an
+//! address inside a block, an empty block's start and the end of a function's code).
 //!
 //! # How the successor is resolved without post-`seal` patching
 //!
@@ -246,6 +254,59 @@ impl<'a> Linker<'a> {
         buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
         emit_frame_teardown(buffer)?;
         buffer.jmp(target)
+    }
+
+    /// Emit the exit of a **resolved but unlinked** local tail call (`call_last`):
+    /// pop the current frame with the interpreter's exact semantics, then hand the
+    /// successor's `(func, pc)` word back to the driver in `rax` — exactly what the
+    /// interpreter's own `Step::Goto` folds to.
+    ///
+    /// This is [`Linker::emit_tail_exit`] **minus** the final frame teardown + direct
+    /// jump: the frame pop is still the interpreter's own checked pop
+    /// ([`jit_tail_call`] = `Machine::pop_frame_checked`, the call the interpreter's
+    /// `Instr::CallLast` arm makes) and the block still spills the cached x-registers
+    /// first (the tier's root-set contract, see [`super::spill`]), but the transfer is
+    /// the shared `done` epilogue's — which `ret`s to the driver with the helper's word
+    /// still in `rax`. The driver decodes that word into `(func, pc)` and takes one
+    /// interpreter step there, i.e. the interpreter's own `call_last` arm
+    /// (`resolve` → `pop_frame_checked` → `Step::Goto`) — so this exit is
+    /// interpreter-identical **by construction** and needs no landing address.
+    ///
+    /// Unlike [`Linker::emit_tail_exit`] it therefore never returns a typed error: a
+    /// resolved label this compilation emitted no block for (the common case for a tail
+    /// call into **another** function of the lazy per-function artifact) is precisely
+    /// what the driver serves.
+    pub(super) fn emit_tail_exit_to_driver(
+        &self,
+        buffer: &mut CodeBuffer,
+        allocation: &Allocation,
+        done: CodeLabel,
+        func: u32,
+        pc: u32,
+        deallocate: u32,
+    ) -> Result<()> {
+        let word = encode_target(func, pc);
+
+        // The root set first (the exit's contract, see [`super::spill`]), then `rt` and
+        // the helper's two value arguments: the resolved successor word and the frame
+        // size the pop must match.
+        spill(buffer, allocation, SpillSite::Exit)?;
+        buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+        buffer.mov_ri(Reg::Rsi, word)?;
+        buffer.mov_ri(Reg::Rdx, i64::from(deallocate))?;
+        let helper: TailHelper = jit_tail_call;
+        buffer.mov_ri(Reg::R11, helper as *const () as i64)?;
+        buffer.call_r(Reg::R11)?;
+        // `rax` is the successor word on success and `ERROR` (with `rt.error` set)
+        // otherwise. Compare it against the compiled-in word: any other outcome leaves for
+        // the epilogue, whose `ERROR` the driver reports as the interpreter's exact frame
+        // error. A success falls through with the word **still in `rax`** — nothing after
+        // the compare writes `rax` — so the driver decodes it and steps at that address,
+        // exactly as it decodes the word `emit_exit`'s unlinked path leaves there.
+        buffer.mov_ri(Reg::R11, word)?;
+        buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+        buffer.jcc(Cond::Ne, done)?;
+        buffer.jmp(done)
     }
 }
 
@@ -645,5 +706,154 @@ mod tests {
             format!("{err:?}").contains("no compiled block"),
             "the error must name the missing block, got {err:?}"
         );
+    }
+
+    /// The exit the `call_last` arm uses for a **resolved but unlinked** target: the
+    /// interpreter's own checked frame pop, then the resolved `(func, pc)` word left in
+    /// `rax` for the **driver** (the interpreter's `Step::Goto`), *not* a direct jump
+    /// into a successor's native entry.
+    ///
+    /// Four structural facts, each of which the exit would get wrong a different way:
+    ///
+    /// * **(a) the spill comes first** — the tier's root-set contract, which no exit may
+    ///   skip ([`super::spill`]);
+    /// * **(b) the helper gets the resolved successor word and then the frame size**, in
+    ///   that order (the interpreter's `resolve`-then-`pop` order);
+    /// * **(c) the exit does not leave the frame** — no [`emit_frame_teardown`], and the
+    ///   trailing jump lands on the block's **shared epilogue** (the driver), never on a
+    ///   successor entry (so a successor this compilation has no code for needs no
+    ///   address at all);
+    /// * **(d) `rax` still holds the helper's word after the compare** — the word is
+    ///   never materialised into (nor clobbered out of) `rax`, so the epilogue's `ret`
+    ///   hands the driver exactly the word to decode.
+    #[test]
+    fn an_unlinked_tail_exit_pops_the_frame_and_returns_the_word_to_the_driver() {
+        let mut buffer = CodeBuffer::new().unwrap();
+        let done = buffer.label();
+        // The successor entry the exit must **not** jump to (it is a filler offset that
+        // a `jmp` into the successor's compiled entry would land on instead).
+        let successor = buffer.label();
+        let entries = BTreeMap::new();
+        let linker = Linker::new(&entries);
+        let allocation = Allocation {
+            slots: vec![(0u32, Reg::R12)],
+            written: vec![0],
+            y_last: None,
+            ..Default::default()
+        };
+
+        linker
+            .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3)
+            .unwrap();
+        let exit_len = buffer.len();
+        // A filler byte between the exit and the epilogue, so the trailing jump's
+        // displacement is non-trivial.
+        buffer.ret().unwrap();
+        let successor_at = buffer.len();
+        buffer.bind(successor).unwrap();
+        // … and the epilogue one byte further on, so "lands on the epilogue" and "lands
+        // on the successor entry" are distinguishable addresses.
+        buffer.int3().unwrap();
+        let done_at = buffer.len();
+        buffer.bind(done).unwrap();
+        buffer.seal().unwrap();
+
+        let code = emitted(&buffer);
+        let exit = &code[..exit_len];
+        let word = encode_target(0, 7);
+
+        // (a) the spill is byte-for-byte first.
+        let spill = spill_bytes(&allocation);
+        assert_eq!(&exit[..spill.len()], &spill[..], "the spill comes first");
+
+        // (b) the helper's two value arguments, in the order the block passes them: the
+        // resolved successor word, then the frame size the pop must match — and they are
+        // handed to `jit_tail_call` (the interpreter's own checked pop).
+        let mov_word = encoded(|buffer| buffer.mov_ri(Reg::Rsi, word).unwrap());
+        let mov_deallocate = encoded(|buffer| buffer.mov_ri(Reg::Rdx, 3).unwrap());
+        let word_at = exit
+            .windows(mov_word.len())
+            .position(|window| window == mov_word.as_slice())
+            .expect("the resolved successor is passed to the pop helper");
+        let deallocate_at = exit
+            .windows(mov_deallocate.len())
+            .position(|window| window == mov_deallocate.as_slice())
+            .expect("the frame size is passed to the pop helper");
+        assert!(word_at < deallocate_at, "successor word, then frame size");
+        let helper_bytes = encoded(|buffer| {
+            buffer
+                .mov_ri(Reg::R11, jit_tail_call as *const () as i64)
+                .unwrap();
+            buffer.call_r(Reg::R11).unwrap();
+        });
+        let helper_at = exit
+            .windows(helper_bytes.len())
+            .position(|window| window == helper_bytes.as_slice())
+            .expect("the frame is popped by `jit_tail_call`, the interpreter's own pop");
+        assert!(
+            deallocate_at < helper_at,
+            "the frame size is in its argument register before the pop runs"
+        );
+
+        // (c) the exit does not leave this block's frame: a linked exit, by contrast,
+        // tears the frame down and jumps straight into the successor's entry.
+        let teardown = teardown_bytes();
+        assert!(
+            !exit.windows(teardown.len()).any(|w| w == teardown.as_slice()),
+            "an unlinked tail exit must leave the frame teardown to the shared epilogue"
+        );
+        let (site, rel) = trailing_jump(exit);
+        let landing = (site + 5) as i64 + i64::from(rel);
+        assert_eq!(
+            landing, done_at as i64,
+            "the exit must return the word to the driver's epilogue, not jump into a \
+             successor's entry"
+        );
+        assert_ne!(
+            landing, successor_at as i64,
+            "the exit must not jump into the successor's compiled entry"
+        );
+        // The frame window is untouched: no `lea rsp, [rsp+24]` either.
+        let lea_release = encoded(|buffer| buffer.lea(Reg::Rsp, Reg::Rsp, 24).unwrap());
+        assert!(
+            !exit.windows(lea_release.len()).any(|w| w == lea_release.as_slice()),
+            "an unlinked tail exit must not release its own `rt` slot"
+        );
+
+        // (d) `rax` keeps the helper's answer: the exit materialises no word into `rax`
+        // (no `movabs rax, imm64`) and, after the compare, only branches on it — so the
+        // epilogue's `ret` hands the driver the word to decode.
+        assert!(
+            !exit.windows(2).any(|w| w == [0x48, 0xB8]),
+            "the unlinked tail exit must not materialise a word in rax"
+        );
+        let compare_tail = encoded(|buffer| {
+            buffer.mov_ri(Reg::R11, word).unwrap();
+            buffer.cmp_rr(Reg::Rax, Reg::R11).unwrap();
+        });
+        let compare_at = exit
+            .windows(compare_tail.len())
+            .position(|window| window == compare_tail.as_slice())
+            .expect("the exit compares the helper's answer against the compiled-in word");
+        // Immediately after the compare come exactly two branches — the `jne <done>`
+        // guard and the unconditional fall-through to that same epilogue — and nothing
+        // else, so no instruction between the compare and the exit could clobber `rax`.
+        let jcc_at = site - 6;
+        assert_eq!(
+            compare_at + compare_tail.len(),
+            jcc_at,
+            "after the compare (`cmp rax, r11`) the exit does exactly one `jcc` and one \
+             `jmp` — nothing that could clobber `rax`"
+        );
+        let jcc = &exit[jcc_at..site];
+        assert_eq!(jcc[0], 0x0F, "the compare is followed by a `jcc`");
+        assert_eq!(jcc[1], 0x85, "… and it is `jne`");
+        let guard_rel = i32::from_le_bytes(jcc[2..6].try_into().unwrap());
+        assert_eq!(
+            (site as i64) + i64::from(guard_rel),
+            done_at as i64,
+            "a failed pop leaves for the epilogue with the helper's `ERROR`"
+        );
+        assert_eq!(exit[site], 0xE9, "a successful pop falls through to `jmp done`");
     }
 }

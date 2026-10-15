@@ -78,14 +78,19 @@
 //! documented deopt: spill, materialise the `encode_target` word in `rax`, and jump
 //! to the block epilogue for the driver to decode.
 //!
-//! The **local tail calls** are linked the same way. `call_only` is a plain jump
+//! The **local tail calls** are lowered natively too. `call_only` is a plain jump
 //! (`$DISPATCH_REL(Dest)`), so it lowers exactly like `jump`; `call_last` additionally
 //! pops the current frame *before* the transfer, which the tier does through the
 //! `jit_tail_call` helper — the interpreter's own `Machine::pop_frame_checked` — with
 //! the module-local target already resolved at compile time, i.e. in the interpreter's
-//! `resolve`-then-`pop`-then-transfer order ([`Linker::emit_tail_exit`]). A tail-call
-//! target that is not a compiled block's entry, and every `call_ext_*` (which enters
-//! code outside this module's blocks), keep the documented deopt.
+//! `resolve`-then-`pop`-then-transfer order. A successor that is a compiled block's
+//! entry is linked directly ([`Linker::emit_tail_exit`]); a successor that is a
+//! **resolved** label this compilation emitted no block for — the common case for a
+//! tail call into another function of the lazy per-function artifact — takes the same
+//! checked pop and then leaves the resolved `(func, pc)` word in `rax` for the driver
+//! ([`Linker::emit_tail_exit_to_driver`]), which is exactly the interpreter's
+//! `Step::Goto`. Only an **undefined** label deopts, and every `call_ext_*` (which
+//! enters code outside this module's blocks) keeps its own documented deopt.
 //!
 //! The emitter is split by responsibility across this directory: this file owns the
 //! compiled-block shape (the register-file constants, the allocation artifact,
@@ -726,36 +731,60 @@ fn emit_block(
             // A **local tail call** (`call_last Arity Label Deallocate`) transfers
             // control to another block — usually of another function — after popping
             // the current frame. The label is module-local, so it is resolved here, at
-            // compile time; when the successor is a compiled block's entry the frame is
-            // popped by the interpreter's own checked pop (`jit_tail_call`, in the
-            // interpreter's resolve-then-pop order) and control jumps straight to the
-            // successor's native entry (see [`link`]). A label the module does not
-            // define, or a successor this compilation emitted no block for, keeps the
-            // documented deopt: the helper runs the interpreter's own `call_last` and so
-            // reports its exact `unknown_label`/frame error. Like `jump`, the
-            // instruction always transfers control, so the block ends here either way.
+            // compile time. Three outcomes, all native:
+            //
+            // * the successor is a block **this compilation emitted** — the frame is
+            //   popped by the interpreter's own checked pop (`jit_tail_call`, in the
+            //   interpreter's resolve-then-pop order) and control jumps straight to the
+            //   successor's native entry ([`link::Linker::emit_tail_exit`]);
+            // * the successor is a resolved label this compilation emitted **no** block
+            //   for — the common case for a tail call into another function of the
+            //   **lazy** per-function artifact — the same checked pop runs and the
+            //   resolved `(func, pc)` word is left in `rax` for the driver
+            //   ([`link::Linker::emit_tail_exit_to_driver`]), which is exactly the
+            //   interpreter's `resolve` → `pop_frame_checked` → `Step::Goto`;
+            // * a label the module does **not** define keeps the documented deopt, so
+            //   the interpreter's own `call_last` reports its exact `unknown_label`.
+            //
+            // Like `jump`, the instruction always transfers control, so the block ends
+            // here on every path.
             //
             // The seam probe ([`emit_local_call_probe`]) runs first: the host's
             // **local-call** seam must be consulted even when the call is statically
-            // linkable, because a host that serves the callee as a BIF means the callee
-            // never runs at all. A **decline** falls through to the unchanged link.
+            // linkable (or resolved but unlinked), because a host that serves the callee
+            // as a BIF means the callee never runs at all. A **decline** falls through to
+            // the unchanged exit.
             Instr::CallLast {
                 target, deallocate, ..
             } => match labels.resolve(*target) {
-                Ok((target_func, target_pc)) if linker.is_compiled(target_func, target_pc) => {
+                Ok((target_func, target_pc)) => {
                     emit_local_call_probe(buffer, allocation, done, func, pc)?;
-                    linker.emit_tail_exit(
-                        buffer,
-                        allocation,
-                        done,
-                        target_func,
-                        target_pc,
-                        *deallocate,
-                    )?;
+                    if linker.is_compiled(target_func, target_pc) {
+                        linker.emit_tail_exit(
+                            buffer,
+                            allocation,
+                            done,
+                            target_func,
+                            target_pc,
+                            *deallocate,
+                        )?;
+                    } else {
+                        linker.emit_tail_exit_to_driver(
+                            buffer,
+                            allocation,
+                            done,
+                            target_func,
+                            target_pc,
+                            *deallocate,
+                        )?;
+                    }
                     terminated = true;
                     break;
                 }
-                _ => emit_deopt(buffer, done, allocation, func, pc, instr)?,
+                // An undefined label keeps the interpreter's exact `unknown_label`
+                // error: hand the call to the interpreter's own step rather than
+                // inventing one.
+                Err(_) => emit_deopt(buffer, done, allocation, func, pc, instr)?,
             },
             // A local tail call **without** a frame to pop (`call_only Arity Label`):
             // `i_call_only(CallDest)` is `$DISPATCH_REL(Dest)`, so it lowers exactly

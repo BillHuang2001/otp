@@ -777,7 +777,7 @@ fn the_export_entry_records_the_run_entry_call_like_the_interpreter() {
 ///
 /// The general form of [`exported_module`]. Label ids must be unique
 /// module-wide (the module's label map is global, exactly like a real `.beam`).
-fn build_module(
+pub(crate) fn build_module(
     name: &str,
     imports: &[(&str, &str, u32)],
     functions: Vec<(&str, u32, Vec<Instr>)>,
@@ -848,7 +848,7 @@ fn build_module(
 }
 
 /// The atom `name` in `module`'s table (interned by [`build_module`]).
-fn export_atom(module: &Module, name: &str) -> Atom {
+pub(crate) fn export_atom(module: &Module, name: &str) -> Atom {
     module
         .atom_table
         .lookup(name)
@@ -858,7 +858,7 @@ fn export_atom(module: &Module, name: &str) -> Atom {
 /// A one-function module exported as `f/0`, with the body starting at
 /// `Label(2)` (so the run entry is a label *after* the function label, exactly
 /// as the loader decomposes a real function).
-fn body_module(code: Vec<Instr>) -> (Module, Atom) {
+pub(crate) fn body_module(code: Vec<Instr>) -> (Module, Atom) {
     let module = build_module("deopt", &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
     let atom = export_atom(&module, "f");
     (module, atom)
@@ -867,7 +867,7 @@ fn body_module(code: Vec<Instr>) -> (Module, Atom) {
 /// The reason of a typed error as its atom, else a `Debug` rendering — the only
 /// way to compare two `BeamError`s (they are not `PartialEq`: a raise carries an
 /// opaque live-reason slot).
-fn error_reason(err: &beam_common::BeamError) -> String {
+pub(crate) fn error_reason(err: &beam_common::BeamError) -> String {
     match err {
         beam_common::BeamError::Raise(raise) => raise
             .reason
@@ -887,7 +887,7 @@ fn error_reason(err: &beam_common::BeamError) -> String {
 /// *inside* this function: returning the outcomes and comparing them after the
 /// contexts have been dropped would dereference freed memory (the boxed-term
 /// cases would then be compared against recycled heap words, not values).
-fn with_both_tiers<R>(
+pub(crate) fn with_both_tiers<R>(
     module: &Module,
     name: Atom,
     check: impl FnOnce(&Result<RunOutcome>, &Result<RunOutcome>) -> R,
@@ -918,7 +918,7 @@ fn with_both_tiers<R>(
 /// Assert the two tiers' outcomes are observably identical: structurally equal
 /// terms (they are built on two separate heaps, so raw-word equality would be
 /// wrong) or the same typed-error reason.
-fn assert_same_outcome(
+pub(crate) fn assert_same_outcome(
     label: &str,
     interpreter: &Result<RunOutcome>,
     baseline: &Result<RunOutcome>,
