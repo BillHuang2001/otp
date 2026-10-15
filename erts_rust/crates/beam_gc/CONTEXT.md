@@ -582,16 +582,24 @@ constructors only (no new error enum).
   the policy admits the request and otherwise collects, and `Process::deliver` retries a refused copy the
   same way; a bounded `+hmax N` policy the request cannot reach still refuses, and that exhaustion raises
   `error:system_limit`. `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap".
-- **The heap-admission door must adopt `collection_debt()` — but only after it admits collections.** The
-  chain's retention is reclaimable only by a collection, and `beam_rt`'s doors
-  (`src/context/gc.rs::ensure_heap` / `ensure_heap_full`) still decline every collection for a process with a
-  live root in an unscanned region (`any_root_is_unscanned` / the latching `note_foreign_reachable`, and/or
-  the live unscanned root `move_result_into_process_heap` can leave on the pooled BIF heap or the
-  pointer-stable arena). Measured on the `ets_copy` loop: `minor_gcs` stays **0** at every N while the
-  process's own `process_info(memory)` grows 3.7 KB → 75.2 MB, and RSS grows ~750 B/iteration. So (i) close
-  that valve first; then (ii) OR `collection_debt()` into the doors' `should_collect` decision. Adopting it
-  before (i) is a measurable loss: **+1 205 ms at N = 100 000** (≈5 → ≈18 µs/op, ≈30 %) while still declining
-  every collection (`MEASURED.md`). Owner: `beam_rt`.
+- **A collection never runs on `beam_rt`'s `run` path, so the retained chain is never collapsed — and
+  `collection_debt()` alone cannot change that.** Confirmed with `$TMPDIR`-built probe modules under
+  `beam_rt run` (three bodies: an `ets:insert`/`ets:lookup` loop, the same payload with **no ETS**, and a
+  **no-float** variant): an **explicit** `erlang:garbage_collect()` — which sets the *forced* flag and so
+  bypasses the occupancy short-circuit — answers `true` and performs **no collection**, at N = 0 (empty
+  heap), N = 2 000 and N = 20 000 alike (`minor_gcs` stays **0**; `process_info(memory)` does not drop, it
+  grows). The caller-module float guard and the ETS bridge are therefore both **exonerated**, and the
+  occupancy-only `should_collect` is refuted as the blocker. A `run` process's collection is refused — or
+  never reached at all — *above* the occupancy check, by `Runtime::serve_gc_request`'s and the doors' own
+  valves: `gc_process_enabled` (pinned / halted / the global escape-store valve), `is_relocation_exempt()`,
+  the unscanned-root valve, or the doors not being armed on this path. `gc_stats()`'s
+  `collections`/`fallbacks`/`pinned`/`halted`/`disabled` discriminate those and are runtime-internal, so the
+  remaining discrimination is `beam_rt`'s. The retention is exactly the retired chain: the measured slope is
+  **94.0 words (752 B) per iteration** for the ETS and no-ETS bodies, and 94.0 = `policy.next_words(256, 0)`
+  = **376** words — the fresh space a copy-out's `needed.max(256)` grow installs — ÷ the ~4 iterations a
+  copy-out fits in it (`MEASURED.md`). The door must OR `collection_debt()` in **only once a collection can
+  actually run**: adopting it while collections are still refused measured **+1 205 ms at N = 100 000** for
+  no reclaim (`MEASURED.md`). Owner: `beam_rt`.
 - **Test-id / MSO / `compare` caveats (cross-crate).** A pid is a heap term via
   `beam_term::thing::write_external_pid` (4 words) **and** `beam_term::compare::eq` orders it
   **structurally through its parts** (field order per the C `erts_cmp`), with `external_pid_parts` available
