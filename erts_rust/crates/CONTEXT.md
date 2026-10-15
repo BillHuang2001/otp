@@ -256,11 +256,15 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
-  `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=2580 agree=2578 mismatch=0 unsupported=2 skipped=0 allowed=2` (`../tools/differential/gate.sh`
-  → exit 0); re-run `gate.sh` for the live per-contract split. The two recorded capability gaps (the
-  `known-gaps.txt` ratchet allowlist) are A.9 `wire/new_fun_ext_encode` and
-  `boot_extra/init_script_id_names_the_running_otp_release` (the `-eval`/`run` path loads no boot script).
+  `erlang:port_close/1` returns the oracle's `true`. The compatibility gate is `../tools/differential/gate.sh`
+  (root-owned) — re-run it for the live per-contract split (it now boots the script per case, so it runs >14 min).
+  The `known-gaps.txt` ratchet allowlist holds ONE recorded capability gap, `wire/new_fun_ext_encode` (A.5,
+  unclosable by design — see below). Two value-level `mismatch`es remain, both needing root/`tools/` action:
+  `boot_extra/init_script_id_names_the_running_otp_release` — `system_info(otp_release)` is the compile-time repo
+  constant `"30"` while the DEFAULT boot script resolves to the consumed **system install's** OTP-29
+  `<Root>/bin/start.boot`, so `init:script_id/0`'s release no longer equals `otp_release` (a versioning-policy
+  decision, not a bug); and `system_info/emu_type` — this runtime's honest `debug` (a dev build) vs the corpus
+  golden `opt` (environmental).
   The one unclosable by design is
   `wire/new_fun_ext_encode` (A.5): its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
