@@ -341,9 +341,54 @@ pub(crate) fn missing_value(switch: &str) -> BeamError {
     message(format!("switch {switch} requires a value"))
 }
 
-/// A command-line argument that is neither a switch nor part of an action.
-pub(crate) fn unexpected_argument(argument: &str) -> BeamError {
-    message(format!("unexpected argument {argument:?}"))
+/// A **`+`-switch with no operand**, i.e. at the end of argv or followed by the
+/// terminator `--`.
+///
+/// This is the oracle **launcher's** own diagnostic, not a CLI usage error: `erlexec`'s
+/// `NEXT_ARG_CHECK_NAMED` (`erts/etc/common/erlexec.c:414-418`) prints
+/// `Missing argument(s) for '+K'.` and exits **1** (with the launcher's usage block, which
+/// [`crate::cli::USAGE`] deliberately does not reproduce). It is therefore a
+/// [`flag_rejected`] raise — [`crate::cli::run`] prints the one line and exits 1, exactly
+/// like the other launcher/emulator rejections — and **not** [`missing_value`], which is
+/// the CLI's own exit-2 usage status.
+///
+/// Verified against OTP 29.1.1 / erts-17.1: `erl -noshell -eval 'halt(0).' +K` and
+/// `erl +K -- -eval 'halt(0).'` both exit 1 with this line and no `beam.smp` usage text
+/// of their own (`+Q`/`+t`/`+e`/`+A`/`+S`/`+P`/`+hms`/`+hmbs`/`+hmax`/`+hmaxk`/`+hmaxel`/
+/// `+hmaxib`/`+sbt`/`+JPperf`/`+JPperfdirectory`/`+M*` behave identically).
+pub(crate) fn missing_switch_operand(switch: &str) -> BeamError {
+    flag_rejected(format!("Missing argument(s) for '{switch}'."))
+}
+
+/// An unrecognized **`+`-flag** the emulator itself rejects.
+///
+/// `erlexec` rewrites an unrecognized `+X` to `-X` and hands it to `beam.smp`
+/// (`erts/etc/common/erlexec.c:1098-1101`), whose argument loop prints
+/// `<progname> unknown flag -X` and exits **1** for a flag it has no `case` for
+/// (`erts/emulator/beam/erl_init.c:2488-2490`). [`flag_rejected`] reproduces that exit
+/// status; the diagnostic names the rewritten `-X` spelling, exactly as the oracle does.
+///
+/// Verified against OTP 29.1.1 / erts-17.1: `erl +k x …` and `erl +YY …` exit 1 with
+/// `… unknown flag -k`/`… unknown flag -YY`, while `erl +Weird …` exits 0 (`-Weird` is the
+/// `-W` warning-map switch) — see [`crate::cli::flags::emulator_flag_recognized`].
+pub(crate) fn unknown_flag(flag: &str) -> BeamError {
+    // The launcher flips the leading `+` to `-` before the emulator ever sees the token.
+    let rewritten = match flag.strip_prefix('+') {
+        Some(rest) => format!("-{rest}"),
+        None => flag.to_string(),
+    };
+    flag_rejected(format!("unknown flag {rewritten}"))
+}
+
+/// `-smp disable` (and its one-token spelling `-smpdisable`), which the launcher refuses
+/// outright in favour of `+S 1`.
+///
+/// `erts/etc/common/erlexec.c:511-514` calls `usage_notsup("-smp disable", " Use \"+S 1\"
+/// instead.")`, which prints `Argument '-smp disable' not supported. Use "+S 1" instead.`
+/// and exits **1**. The other `-smp` spellings (`enable`, `auto`, a missing value and any
+/// other value) are **accepted** by the launcher, so they stay accepted here.
+pub(crate) fn smp_disable_not_supported() -> BeamError {
+    flag_rejected("Argument '-smp disable' not supported. Use \"+S 1\" instead.")
 }
 
 /// A malformed `run` target spec (expected `module:function/arity`).
@@ -691,7 +736,7 @@ mod tests {
     #[test]
     fn genuine_errors_are_not_classified_as_capability_gaps() {
         assert_eq!(unsupported_reason(&missing_value("-eval")), None);
-        assert_eq!(unsupported_reason(&unexpected_argument("junk")), None);
+        assert_eq!(unsupported_reason(&missing_value("junk")), None);
         assert_eq!(unsupported_reason(&bad_spec("slice-add-2")), None);
         assert_eq!(unsupported_reason(&unknown_info_key("nonsense")), None);
         assert_eq!(unsupported_reason(&BeamError::BadArg), None);
@@ -903,7 +948,7 @@ mod tests {
     fn diagnostics_name_the_offending_item() {
         assert!(bad_run_argument("1+").to_string().contains("1+"));
         assert!(bad_switch_value("+P", "x").to_string().contains("\"x\""));
-        assert!(unexpected_argument("junk").to_string().contains("junk"));
+        assert!(missing_value("junk").to_string().contains("junk"));
         assert!(unknown_module("slice").to_string().contains("slice"));
         assert!(bad_eval("1+", "unexpected end").to_string().contains("1+"));
         assert!(unsupported("preloaded beams")

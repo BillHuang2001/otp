@@ -506,14 +506,14 @@ fn the_perf_directory_value_is_taken_verbatim() {
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     assert!(!missing.exists());
 
-    // With the appended `-eval ok`, `+JPperfdirectory` swallows the `-eval` as its directory; the
-    // gratuitous `ok` left behind is then the **only** complaint (a stray positional argument,
-    // exit 2) — the directory value itself is never rejected.
+    // With the appended `-eval ok`, `+JPperfdirectory` blindly swallows the `-eval` as its
+    // directory (the launcher's `NEXT_ARG_CHECK` rule); the gratuitous `ok` left behind is a
+    // plain positional, which this runtime accepts and ignores (the oracle forwards it to
+    // `init`) — the directory value itself is never rejected.
     let (_, output) = beam_rt_perf(&["+JPperfdirectory"], &[]);
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unexpected argument"), "{stderr}");
-    assert!(stderr.contains("Usage:"), "{stderr}");
+    assert!(!stderr.contains("Usage:"), "{stderr}");
 }
 
 // ---------------------------------------------------------------------------------------

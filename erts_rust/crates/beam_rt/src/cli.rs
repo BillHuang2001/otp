@@ -352,9 +352,17 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index = next;
             }
             "-name" | "-sname" => {
-                let value = value_of(args, index, argument)?;
+                // The launcher consumes the next token **blindly** (`erlexec.c:775-821`):
+                // `erl -name -env X Y ...` swallows `-env` as the name. Only a value that
+                // does not itself look like a switch is taken as this node's name; the
+                // launcher would reject such a name and force `isdistributed = 0`, which is
+                // a runtime-core fidelity gap (`M1_GAPS.md`), so only the exit status is
+                // matched here.
+                let value = plus_value_of(args, index, argument)?;
                 builder.record(argument, vec![value.clone()]);
-                builder.emulator.node_name = Some(value);
+                if !is_switch(&value) {
+                    builder.emulator.node_name = Some(value);
+                }
                 index += 2;
             }
             "-setcookie" => {
@@ -395,13 +403,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "+Q" => {
-                let value = value_of(args, index, "+Q")?;
+                let value = plus_value_of(args, index, "+Q")?;
                 builder.max_ports = flags::parse_max_ports("+Q", &value)?;
                 builder.preserve("+Q", &value);
                 index += 2;
             }
             "+K" => {
-                let value = value_of(args, index, "+K")?;
+                let value = plus_value_of(args, index, "+K")?;
                 // The emulator only `get_arg`s the value — there is **no** validation
                 // (`erl_check_io.c:2467`) — so every value is accepted, `+K bogus` and bare
                 // `+K` (which consumes whatever follows, blindly) included.
@@ -410,7 +418,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "+sbt" => {
-                let value = value_of(args, index, "+sbt")?;
+                let value = plus_value_of(args, index, "+sbt")?;
                 flags::parse_sbt("+sbt", &value)?;
                 builder.preserve("+sbt", &value);
                 index += 2;
@@ -419,7 +427,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // validated and preserved verbatim, so `atom_limit` can follow it
             // (`crate::info::limits`). Like every `+`-flag it is not an init argument.
             "+t" => {
-                let value = value_of(args, index, "+t")?;
+                let value = plus_value_of(args, index, "+t")?;
                 flags::parse_atom_table_size("+t", &value)?;
                 builder.preserve("+t", &value);
                 index += 2;
@@ -428,7 +436,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // negative value is rejected; `ets_limit` follows the value (see
             // `crate::info::limits`).
             "+e" => {
-                let value = value_of(args, index, "+e")?;
+                let value = plus_value_of(args, index, "+e")?;
                 flags::parse_ets_tables("+e", &value)?;
                 builder.preserve("+e", &value);
                 index += 2;
@@ -463,15 +471,15 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index = flags::parse_allocator(&args[index], args, index)?;
             }
             "+S" => {
-                let value = value_of(args, index, "+S")?;
+                let value = plus_value_of(args, index, "+S")?;
                 let (total, online) = parse_schedulers(&value)?;
                 builder.emulator.schedulers = total;
                 builder.online_schedulers = online;
                 index += 2;
             }
-            "-smp" => index = parse_smp_switch(args, index, &mut builder),
+            "-smp" => index = parse_smp_switch(args, index, &mut builder)?,
             "+A" => {
-                let value = value_of(args, index, "+A")?;
+                let value = plus_value_of(args, index, "+A")?;
                 // The async-thread pool is not modelled by the runtime core; it is
                 // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
                 // The emulator's reader is a bare `atoi`, so any value is accepted (junk
@@ -484,31 +492,31 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "+P" => {
-                let value = value_of(args, index, "+P")?;
+                let value = plus_value_of(args, index, "+P")?;
                 builder.emulator.max_processes = flags::parse_max_processes("+P", &value)?;
                 index += 2;
             }
             "+hms" => {
-                let value = value_of(args, index, "+hms")?;
+                let value = plus_value_of(args, index, "+hms")?;
                 builder.heap.set_min_heap_words(parse_heap_words("+hms", &value)?);
                 index += 2;
             }
             "+hmbs" => {
-                let value = value_of(args, index, "+hmbs")?;
+                let value = plus_value_of(args, index, "+hmbs")?;
                 builder
                     .heap
                     .set_min_bin_vheap_words(parse_heap_words("+hmbs", &value)?);
                 index += 2;
             }
             "+hmax" => {
-                let value = value_of(args, index, "+hmax")?;
+                let value = plus_value_of(args, index, "+hmax")?;
                 builder
                     .heap
                     .set_max_heap_words(parse_max_heap_size(&value)?);
                 index += 2;
             }
             "+hmaxk" | "+hmaxel" | "+hmaxib" => {
-                let value = value_of(args, index, argument)?;
+                let value = plus_value_of(args, index, argument)?;
                 builder.set_max_heap_flag(argument, &value)?;
                 index += 2;
             }
@@ -518,13 +526,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // value is taken verbatim — an unusable directory surfaces as a failed file
             // creation, not as a usage error (`PerfMap::error`), exactly as in the C.
             "+JPperf" => {
-                let value = value_of(args, index, "+JPperf")?;
+                let value = plus_value_of(args, index, "+JPperf")?;
                 builder.perf_map.set_flag(&value)?;
                 builder.preserve("+JPperf", &value);
                 index += 2;
             }
             "+JPperfdirectory" => {
-                let value = value_of(args, index, "+JPperfdirectory")?;
+                let value = plus_value_of(args, index, "+JPperfdirectory")?;
                 builder.perf_map.set_directory(value.clone());
                 builder.preserve("+JPperfdirectory", &value);
                 index += 2;
@@ -532,8 +540,24 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             "-s" => index = builder.parse_apply(args, index, "-s")?,
             "-run" => index = builder.parse_apply(args, index, "-run")?,
             "run" => index = parse_run_file(args, index, &mut builder)?,
-            other if is_switch(other) => index = builder.record_unmodeled(args, index),
-            other => return Err(error::unexpected_argument(other)),
+            // `-smpdisable` is the one-token spelling of the refused `-smp disable`.
+            "-smpdisable" => return Err(error::smp_disable_not_supported()),
+            // The `erlexec` default: an unrecognized `+X` is rewritten to `-X` and handed to
+            // the emulator, which prints `unknown flag -X` and exits **1** for a flag it has
+            // no `case` for (`erl_init.c:2488-2490`). A *recognized* spelling — and any
+            // `-`-switch — is recorded exactly as before.
+            other if is_switch(other) => {
+                if let Some(name) = other.strip_prefix('+') {
+                    if !flags::emulator_flag_recognized(name) {
+                        return Err(error::unknown_flag(other));
+                    }
+                }
+                index = builder.record_unmodeled(args, index);
+            }
+            // A plain positional token: the oracle's launcher forwards it to `init` as an
+            // ordinary argument, which is never a usage error (`erl junk -noshell ...` exits
+            // 0). This runtime ignores it, matching that status.
+            _ => index += 1,
         }
     }
     let code_paths = builder.code_paths();
@@ -730,6 +754,24 @@ fn value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
     args.get(index + 1)
         .cloned()
         .ok_or_else(|| error::missing_value(switch))
+}
+
+/// The operand of a **`+`-switch**, consumed **blindly**.
+///
+/// The oracle launcher's `NEXT_ARG_CHECK_NAMED` (`erts/etc/common/erlexec.c:414-418`, with
+/// `sep = "--"` at 193) rejects the switch only when it is the **last** token or the next
+/// token is exactly `--`; every other following token is taken as the value, even one that
+/// itself looks like a switch. So `erl +K -eval 'halt(0).'` consumes `-eval` as `+K`'s value
+/// (the `-eval` never runs) and exits 0, while `erl -noshell ... +K` and `erl +K -- ...`
+/// exit **1** with `Missing argument(s) for '+K'.`
+///
+/// That diagnostic is the launcher's, so the error is [`error::missing_switch_operand`] (a
+/// flag rejection, exit 1), **not** [`error::missing_value`] (this CLI's usage status).
+fn plus_value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
+    match args.get(index + 1) {
+        Some(next) if next != "--" => Ok(next.clone()),
+        _ => Err(error::missing_switch_operand(switch)),
+    }
 }
 
 /// `-eval` tolerates **one** trailing `.` (the shell-style statement terminator):
@@ -937,11 +979,17 @@ fn apply_env_switches(args: &[String]) {
 ///
 /// The switch is recorded as an init argument exactly like every other switch, so a
 /// program can still observe its own command line (`init:get_argument(smp)`).
-fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> usize {
+fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> Result<usize> {
     let value = match args.get(index + 1) {
         Some(candidate) if !is_switch(candidate) => Some(candidate.clone()),
         _ => None,
     };
+    // `-smp disable` is refused by the launcher in favour of `+S 1`
+    // (`erlexec.c:511-514`, `usage_notsup`), exit **1**. Every other value — `enable`,
+    // `auto`, an unknown word and a missing value — is accepted.
+    if value.as_deref() == Some("disable") {
+        return Err(error::smp_disable_not_supported());
+    }
     let has_value = value.is_some();
     if let Some(value) = &value {
         if let Some(enabled) = parse_smp(value) {
@@ -949,11 +997,7 @@ fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> usi
         }
     }
     builder.record("-smp", value.into_iter().collect());
-    if has_value {
-        index + 2
-    } else {
-        index + 1
-    }
+    Ok(if has_value { index + 2 } else { index + 1 })
 }
 
 /// The [`FeatureFlags::smp`](beam_common::FeatureFlags::smp) an `-smp` *value* selects, or
@@ -2584,10 +2628,31 @@ mod tests {
 
     #[test]
     fn a_usage_error_exits_with_the_usage_code() {
-        // A genuine usage error: a missing operand of a known switch and a stray
-        // positional argument.
+        // A genuine usage error: a missing operand of a known `-`-switch. A stray
+        // positional is *not* one — the oracle's launcher forwards it to `init` (exit 0).
         assert_eq!(run(vec!["-eval".to_string()]), EXIT_USAGE);
-        assert_eq!(run(vec!["junk".to_string()]), EXIT_USAGE);
+        assert_eq!(run(vec!["junk".to_string()]), EXIT_OK);
+    }
+
+    #[test]
+    fn an_unrecognized_plus_flag_is_rejected_by_the_emulator() {
+        // `erlexec` rewrites an unrecognized `+X` to `-X`; the emulator prints
+        // `unknown flag -X` and exits 1 for a flag it has no `case` for.
+        assert_eq!(run(vec!["+k".to_string()]), EXIT_RUNTIME);
+        assert_eq!(run(vec!["+YY".to_string()]), EXIT_RUNTIME);
+        // A *recognized* spelling (`-Weird` is the `-W` warning-map switch) is accepted.
+        assert_eq!(run(vec!["+Weird".to_string()]), EXIT_OK);
+    }
+
+    #[test]
+    fn smp_disable_is_refused_in_favour_of_plus_s() {
+        assert_eq!(
+            run(vec!["-smp".to_string(), "disable".to_string()]),
+            EXIT_RUNTIME
+        );
+        assert_eq!(run(vec!["-smpdisable".to_string()]), EXIT_RUNTIME);
+        // `enable`/`auto`/an unknown value and a missing value stay accepted.
+        assert_eq!(run(vec!["-smp".to_string(), "bogus".to_string()]), EXIT_OK);
     }
 
     #[test]

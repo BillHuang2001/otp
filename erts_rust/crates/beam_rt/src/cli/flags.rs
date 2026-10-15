@@ -138,7 +138,102 @@ pub(super) fn parse_kernel_poll(switch: &str, value: &str) -> Result<()> {
 /// The nine `+sbt` scheduler bind types (`erl_cpu_topology.c:628-647`).
 pub(super) const SCHEDULER_BIND_TYPES: [&str; 9] =
     ["u", "db", "s", "ps", "ts", "tnnps", "nnps", "nnts", "ns"];
+/// The `+s` sub-options with a value (`erlexec.c:129-150` `pluss_val_switches`, plus
+/// `early_init`'s `+ssrct`, `erl_init.c:943-954`).
+const EMULATOR_S_SUB_OPTIONS: &[&str] = &[
+    "sbt", "sbwtdcpu", "sbwtdio", "sbwt", "scl", "sct", "secio", "sfwi", "stbt", "swct",
+    "swtdcpu", "swtdio", "swt", "sws", "sss", "sssdcpu", "sssdio", "spp", "sub", "srct",
+];
 
+/// Whether the emulator's own argument loop recognizes the flag spelling `name` — the
+/// recognition rule the oracle's `+X` fallthrough depends on.
+///
+/// `erlexec` rewrites an **unrecognized** `+X` to `-X` and hands it to `beam.smp`
+/// (`erts/etc/common/erlexec.c:1098-1101`), whose argument loop has one `case` per
+/// recognized flag letter and otherwise prints `<progname> unknown flag -X` and exits
+/// **1** (`erts/emulator/beam/erl_init.c:1370-2491`, `default:` at 2488). So an
+/// unrecognized `+X` is accepted **iff the emulator recognizes `-X`** — which is why
+/// `+Weird` exits 0 (`-Weird` is the `-W` warning-map switch, whose inline value `eird`
+/// starts with `e`) while `+k`, `+YY` and `+Z` exit 1 (no `-k`/`-Y`/`-Z` case), and why
+/// `+z` exits 1 even though `-z` *is* a case: that case dispatches on a sub-option and
+/// rejects a bare spelling. Verified against OTP 29.1.1 / erts-17.1.
+///
+/// The letters whose `case` dispatches on a **name** (`has_prefix`) carry their accepted
+/// sub-options here. The emulator's *value* validation for an unmodeled flag
+/// (`+Wx` ⇒ `unrecognized warning_map option x`, `+Cfoo` ⇒ `Invalid time warp mode`) is
+/// deliberately **not** modelled: a recognized name is accepted, and this runtime reports
+/// no divergence rather than guessing at a value grammar the CLI has no other use for.
+///
+/// `++…` is accepted too: `erlexec`'s `case '+'` (`erlexec.c:1086-1096`) forwards it
+/// (`++S` is the documented command-line `-S` passthrough), never the emulator's
+/// `unknown flag` arm.
+pub(super) fn emulator_flag_recognized(name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        // A bare `+`: `erlexec`'s default rewrites it to `-`, which has no case.
+        return false;
+    };
+    let rest = &name[first.len_utf8()..];
+    match first {
+        // The `++…` passthrough (and `++S`, the documented `-S` spelling).
+        '+' => true,
+        // Cases dispatched purely on the letter: any spelling is accepted.
+        'L' | 'v' | 'V' | 'H' | 'i' | 'e' | 'P' | 'Q' | 't' | 'T' | 'R' | 'A' | 'a' | 'C'
+        | 'c' => true,
+        // `-p` requires `pc`/`pad` (`erl_init.c:1377-1409`).
+        'p' => matches!(rest, "c" | "ad"),
+        // `-f` requires the `fn` filename-encoding option (`erl_init.c:1411-1477`).
+        'f' => rest.starts_with('n'),
+        // `-h` requires one of its named sub-options, or the numeric backward-compatibility
+        // form (`erl_init.c:1539-1651`).
+        'h' => {
+            ["ms", "mbs", "pds", "mqd", "max", "maxk", "maxel", "maxib"]
+                .iter()
+                .any(|option| rest.starts_with(option))
+                || rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        }
+        // `-D`/`-Dibpl` (`erl_init.c:1653-1679`).
+        'D' => rest.is_empty() || rest == "ibpl",
+        // `-d`/`-dcg` (`erl_init.c:893-909`, `1681-1690`).
+        'd' => rest.is_empty() || rest.starts_with("cg"),
+        // `-J` JIT options (`erl_init.c:1714-1821`).
+        'J' => [
+            "Ddump",
+            "Pperf",
+            "Pperfdirectory",
+            "Pcover",
+            "Msingle",
+        ]
+        .iter()
+        .any(|option| rest.starts_with(option)),
+        // `-B`/`-Bi`/`-Bc`/`-Bd` (`erl_init.c:1823-1845`).
+        'B' => matches!(rest, "" | "i" | "c" | "d"),
+        // `-n` requires `ns`/`na`/`nd` (`erl_init.c:1846-1869`).
+        'n' => ["s", "a", "d"].iter().any(|option| rest.starts_with(option)),
+        // The `-s` scheduler sub-options (`erl_init.c:1922`).
+        's' => EMULATOR_S_SUB_OPTIONS
+            .iter()
+            .any(|option| rest.starts_with(option)),
+        // `-S`/`-SP`/`-SD{cpu,Pcpu,io}` (the early-init scheduler switches,
+        // `erl_init.c:955-...`); the bare `+S` is consumed by the CLI's own arm.
+        'S' => ["P", "Dcpu", "DPcpu", "Dio"].contains(&rest),
+        // `-r`/`-rg` (`erl_init.c:911-928`, `2299`).
+        'r' => rest.is_empty() || rest.starts_with('g'),
+        // `-W{i,w,e}`: the warning-map switch reads its value inline, so the flag is only
+        // recognized when the spelling carries one (`erl_init.c:2356-2372`).
+        'W' => matches!(rest.chars().next(), Some('i' | 'w' | 'e')),
+        // `-z`'s named sub-options (`erl_init.c:2374-2485`, `plusz_val_switches`).
+        'z' => ["dbbl", "dntgc", "ebwt", "osrl", "hft", "mml", "mel"]
+            .iter()
+            .any(|option| rest.starts_with(option)),
+        // `-IOt`/`-IOPt`/`-IOs` (the `erlexec` `+I` family, `erlexec.c:904-937`).
+        'I' => matches!(rest, "Ot" | "OPt" | "Os"),
+        // Everything else — `b`, `g`, `j`, `k`, `l`, `m` (the allocator surface reaches
+        // the emulator as `-M`, handled before this fallthrough), `o`, `q`, `u`, `w`, `x`,
+        // `y`, `E`, `F`, `G`, `K`(the CLI's own arm), `N`, `O`, `U`, `X`, `Y`, `Z`, … —
+        // has no emulator `case`, so the emulator rejects it.
+        _ => false,
+    }
+}
 /// `+sbt <type>` — the scheduler bind type (`erl_cpu_topology.c:623-647`).
 pub(super) fn parse_sbt(switch: &str, value: &str) -> Result<()> {
     if SCHEDULER_BIND_TYPES.contains(&value) {
@@ -270,7 +365,10 @@ impl<'a> Reader<'a> {
                 self.index += 1;
                 Ok(next.clone())
             }
-            _ => Err(error::bad_switch_value(switch, "<missing value>")),
+            // The allocator switches (`+M*`) are emulator flags, so a missing operand is
+            // the emulator/launcher diagnostic (`Missing argument(s) for '+M...'.`, exit 1),
+            // not this CLI's usage status.
+            _ => Err(error::missing_switch_operand(switch)),
         }
     }
 }
