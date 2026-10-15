@@ -1093,25 +1093,47 @@ static int chk_enqv_partial_skip(extra_state *st) {
     return driver_deq(st->port, 3) == 0;
 }
 
-/* The same partial skip for the head-inserting sibling. */
+/* The same partial skip for the head-inserting sibling, over a **binary-backed** vector: the
+ * vector names a real `driver_alloc_binary/1` payload through `binv[0]` and the queue takes a
+ * reference to it — the shape every `driver_pushq`/`driver_pushq_bin` builds for itself
+ * (`io.c:6874-6890`, `driver_pushq` hands `&bin` as the `binv` array), so the skip walk and the
+ * head insert at the small array's boundary are the whole behaviour under test.
+ *
+ * Deliberately **not** the `binv[0] == NULL` "create a binary from the iovec" form here: on a
+ * fresh queue the head sits at the end of `v_small`, and the installed oracle (OTP 29.1.1) has
+ * the `erts_ioq_pushqv` off-by-one that creates the binary and writes its `orig_bytes` through
+ * `q->v_head` **before** decrementing `v_head` — i.e. one `SysIOVec` past `v_small`, straight
+ * over `q->b_start` (upstream OTP 30 fixed it: the fixed code decrements first and allocates into
+ * the decremented `q->v_head`, `erl_io_queue.c:315-325`). `erts_ioq_clear` then frees that stale
+ * interior pointer at port close and the oracle dies of SIGSEGV (~1 run in 10, stdout already
+ * correct) — a runtime-version defect, never a Rust-runtime divergence. See *Known gaps*.
+ *
+ * The queue is drained back to empty before the callback returns (a non-empty private queue at
+ * port close hangs the oracle). */
 static int chk_pushqv_partial_skip(extra_state *st) {
     SysIOVec iov[1];
     ErlDrvBinary *binv[1];
     ErlIOVec ev;
-    char in[5];
-    memcpy(in, "abcde", 5);
-    iov[0].iov_base = in;
+    ErlDrvBinary *bin;
+    int ok;
+
+    bin = driver_alloc_binary(5);
+    if (bin == NULL)
+        return 0;
+    memcpy(bin->orig_bytes, "abcde", 5);
+    iov[0].iov_base = bin->orig_bytes;
     iov[0].iov_len = 5;
-    binv[0] = NULL;
+    binv[0] = bin;
     ev.vsize = 1;
     ev.size = 5;
     ev.iov = iov;
     ev.binv = binv;
-    if (driver_pushqv(st->port, &ev, 2) != 0)
-        return 0;
-    if (driver_sizeq(st->port) != 3)
-        return 0;
-    return driver_deq(st->port, 3) == 0;
+
+    ok = (driver_pushqv(st->port, &ev, 2) == 0)
+        && (driver_sizeq(st->port) == 3)
+        && (driver_deq(st->port, 3) == 0);
+    driver_free_binary(bin);  /* drop our own reference; the queue's was dropped by driver_deq */
+    return ok;
 }
 
 /* `driver_vec_to_buf` with a buffer **longer** than the vector copies the whole vector and reports
