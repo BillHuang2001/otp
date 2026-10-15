@@ -21,11 +21,11 @@
 //! The `code:*` runtime-native floor: the code path, the loaded and preloaded module set,
 //! the code server's `interactive`/`embedded` mode and the installation directories.
 //!
-//! `code` is the module library's front end; its `.beam` (and the `code_server` process
-//! behind it) needs facilities outside Milestone-1, so the runtime answers these calls
-//! directly from the state of its own [`CodeServer`](crate::CodeServer) and the
-//! preloaded-module registry instead of loading a module it cannot execute (see the
-//! parent module's docs).
+//! `code` is the module library's front end; the runtime answers these calls directly from the
+//! state of its own [`CodeServer`](crate::CodeServer) and the preloaded-module registry — the
+//! path/load state this runtime really searches, so it is authoritative for the `code:*` queries
+//! and mutators — instead of loading the module, whose bodies are client calls into the live
+//! `code_server` process's own separate copy of that state (see the parent module's docs).
 //!
 //! `src/native.rs`'s `code:*` behaviour is load-bearing for the differential corpus's
 //! `boot/*` cases, all of which currently agree with the oracle.
