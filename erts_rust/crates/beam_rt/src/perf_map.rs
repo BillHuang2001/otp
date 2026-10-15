@@ -570,11 +570,17 @@ mod tests {
         assert_eq!(config(&["map", "false", "dump"]), (false, true, false));
     }
 
-    /// A value outside the grammar is the crate's usage error, never a silent default.
+    /// A value outside the grammar is rejected with the **emulator's own** flag-rejection
+    /// diagnostic ([`crate::error`]'s `bad_switch_value`, which the CLI prints as one line and
+    /// exits **1** for — `beam.smp`'s contract), never a silent default.
     #[test]
     fn a_malformed_value_is_rejected() {
         let mut config = PerfMapConfig::new();
-        assert!(config.set_flag("bogus").is_err());
+        let error = config.set_flag("bogus").expect_err("the grammar rejects it");
+        assert_eq!(
+            error::flag_rejected_diagnostic(&error),
+            Some("bad value \"bogus\" for switch +JPperf")
+        );
         assert!(!config.map_enabled() && !config.dump_enabled());
         assert_eq!(PerfMapConfig::new(), config);
     }

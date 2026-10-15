@@ -2479,8 +2479,10 @@ mod tests {
             );
         }
 
-        // `+M*`, by contrast, *is* an emulator flag and its value is validated (the oracle
-        // rejects all of these with exit 1; `beam_rt` reports its uniform usage error).
+        // `+M*`, by contrast, *is* an emulator flag and its value is validated: the oracle
+        // rejects every spelling below with exit 1, and `beam_rt` carries the same
+        // flag-rejection kind — the CLI prints its one-line `beam_rt: bad value …` diagnostic
+        // and exits 1, never the usage status (2) and never a capability gap (3).
         for args in [
             &["+Mfoo"][..],
             &["+M"][..],
@@ -2489,6 +2491,10 @@ mod tests {
         ] {
             let error = parse_args(args).expect_err("a bad +M* value");
             assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+            assert!(
+                error::flag_rejected_diagnostic(&error).is_some(),
+                "{args:?}: a rejected value, not a capability gap"
+            );
         }
 
         // `+Mea <preset>` is the emulator-wide allocator preset the oracle accepts
