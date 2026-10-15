@@ -1259,6 +1259,11 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         int r1, r2, r3, ok;
         if (d == NULL)
             return enif_make_int(env, 0);
+        /* `enif_alloc_resource` hands back uninitialised memory (the `dyncall` below counts into
+           `calls`), so the state the probe pins must be set here; leaving it to the allocator
+           makes the `d->calls == 1` conjunct below read garbage. */
+        d->calls = 0;
+        d->magic = 0;
         mod = enif_make_atom(env, "nif_extra");
         term = enif_make_resource(env, d);
         dyn_runs = 0;
