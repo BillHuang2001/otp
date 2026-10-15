@@ -420,16 +420,16 @@ fn every_env_flag_case_matches_the_oracle() {
 // * `-setcookie`/`-config`/`-boot`/`-emu_flavor` are `-`-switches: accepted and recorded
 //   (`-emu_flavor` only for `smp`, its one accepted value).
 // * `+Q|+P 1024|134217727|legacy` → exit 0; `+Q|+P 1000|0|134217728|abc` → exit 1 (the
-//   `bad number of ports|processes …` usage error).
+//   `bad number of ports|processes …` rejection).
 // * `+K <anything>` → exit 0 (the emulator never validates the value).
 // * all nine `+sbt` types → exit 0, `+sbt bogus` → exit 1.
 // * the validated `+M*` spellings → exit 0, the bad ones → exit 1; `-M*` is never
 //   forwarded to the emulator, so it always exits 0.
 //
-// `beam_rt` keeps its uniform four-exit-code contract, so a value the oracle rejects with
-// exit 1 is a **usage** error here (exit 2) — `mismatch=0` at the differential gate. What
-// the table below compares is therefore **acceptance** (`exit 0` vs not), with
-// `beam_rt`'s own exact code pinned alongside.
+// A rejected emulator-switch value is now **exit 1** (like the oracle's `beam.smp`), with a
+// one-line `beam_rt: …` diagnostic and **no** usage block; only a missing operand, a stray
+// positional argument and a malformed `run` spec remain exit 2. The table below therefore
+// pins `beam_rt`'s exact code (`rust_code`) alongside the acceptance comparison.
 
 /// The self-terminating probe for `init:get_argument(FLAG)`.
 fn argument_probe(flag: &str) -> String {
@@ -535,7 +535,7 @@ fn the_new_configuration_switches_reach_init_get_argument_like_the_oracle() {
 }
 
 /// One new-flag invocation whose **acceptance** must match the oracle; `rust_code` pins
-/// `beam_rt`'s exact exit code (0 accepted, 2 usage error).
+/// `beam_rt`'s exact exit code (0 accepted, 1 a value the emulator rejects).
 struct FlagCase {
     description: &'static str,
     args: &'static [&'static str],
@@ -564,22 +564,22 @@ const AGREEING_CASES: &[FlagCase] = &[
     FlagCase {
         description: "+Q 1000 (below ERTS_MIN_PORTS)",
         args: &["+Q", "1000"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+Q 0",
         args: &["+Q", "0"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+Q 134217728 (above ERTS_MAX_PORTS)",
         args: &["+Q", "134217728"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+Q abc",
         args: &["+Q", "abc"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+P 1024 (the low end of the process range)",
@@ -599,17 +599,17 @@ const AGREEING_CASES: &[FlagCase] = &[
     FlagCase {
         description: "+P 1000 (below ERTS_MIN_PROCESSES)",
         args: &["+P", "1000"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+P 0",
         args: &["+P", "0"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+P 134217728 (above ERTS_MAX_PROCESSES)",
         args: &["+P", "134217728"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+K true",
@@ -619,6 +619,11 @@ const AGREEING_CASES: &[FlagCase] = &[
     FlagCase {
         description: "+K false",
         args: &["+K", "false"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+K bogus (the emulator never validates the +K value)",
+        args: &["+K", "bogus"],
         rust_code: 0,
     },
     FlagCase {
@@ -669,7 +674,7 @@ const AGREEING_CASES: &[FlagCase] = &[
     FlagCase {
         description: "+sbt bogus",
         args: &["+sbt", "bogus"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MMscs 1024 (the mseg carrier size)",
@@ -714,27 +719,27 @@ const AGREEING_CASES: &[FlagCase] = &[
     FlagCase {
         description: "+Mfoo (an unknown allocator letter)",
         args: &["+Mfoo"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+M (no allocator letter at all)",
         args: &["+M"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MMscs bogus (a non-numeric carrier size)",
         args: &["+MMscs", "bogus"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MBas chaosff (chaosff is test_alloc-only)",
         args: &["+MBas", "chaosff"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MYe false (the system allocator only accepts true)",
         args: &["+MYe", "false"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+Mea min (the emulator-wide allocator preset)",
@@ -744,32 +749,32 @@ const AGREEING_CASES: &[FlagCase] = &[
     FlagCase {
         description: "+Mea 1024 (an unknown -Mea value)",
         args: &["+Mea", "1024"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MIe false (literal_alloc cannot be disabled)",
         args: &["+MIe", "false"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MTe false (temp_alloc cannot be disabled)",
         args: &["+MTe", "false"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MIt true (literal_alloc has no thread-specific instance)",
         args: &["+MIt", "true"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MIcp B (literal_alloc cannot migrate carriers)",
         args: &["+MIcp", "B"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "+MTacul 50 (temp_alloc cannot migrate carriers)",
         args: &["+MTacul", "50"],
-        rust_code: 2,
+        rust_code: 1,
     },
     FlagCase {
         description: "-Mfoo (a -M* flag is an ordinary unknown -flag)",
@@ -841,12 +846,6 @@ const DIVERGENT_CASES: &[(&str, &[&str], bool, i32)] = &[
         &["-emu_flavor", "emu"],
         false,
         0,
-    ),
-    (
-        "+K bogus (the emulator never validates the +K value)",
-        &["+K", "bogus"],
-        true,
-        2,
     ),
 ];
 

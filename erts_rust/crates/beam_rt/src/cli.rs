@@ -1803,6 +1803,42 @@ mod tests {
         );
     }
 
+    /// `-env VAR VALUE` is the **launcher**'s switch (`erts/etc/common/erlexec.c:724`): its two
+    /// tokens are consumed blindly and it is **never** recorded as an init argument — the
+    /// oracle's `init:get_argument(env)` is the bare atom `error` (verified against OTP 29.1.1
+    /// / erts-17.1). Applying the pair to the environment is [`apply_env_switches`]'s job,
+    /// which [`run`] performs *before* the parse (the launcher's own order).
+    ///
+    /// A trailing `-env` — no tokens left, or a name with no value — is the launcher's own
+    /// diagnostic and exit status, carried by the flag-rejection kind (not a usage error).
+    #[test]
+    fn env_switch_is_consumed_and_never_an_init_argument() {
+        let config = parsed(&["-env", "NAME", "VALUE", "-noshell"]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(config.init_args.get("env"), None);
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+
+        // Several pairs are consumed in order; still no `env` init argument.
+        let config = parsed(&["-env", "A", "1", "-env", "B", "2", "-noshell"]);
+        assert_eq!(config.init_args.get("env"), None);
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+
+        // The value is taken **blindly**: a following `-noshell` is swallowed as the value.
+        let config = parsed(&["-env", "A", "-noshell"]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(config.init_args.get("noshell"), None);
+
+        // A trailing `-env` is the launcher's diagnostic, not a usage error.
+        for args in [&["-env"][..], &["-env", "NAME"][..], &["-noshell", "-env", "NAME"][..]] {
+            let error = parse_args(args).expect_err("a trailing -env is refused");
+            assert_eq!(
+                error::flag_rejected_diagnostic(&error),
+                Some("Missing argument(s) for '-env'."),
+                "{args:?}"
+            );
+        }
+    }
+
     #[test]
     fn emulator_switches_are_mapped() {
         let config = parsed(&["+S", "4"]);
@@ -1825,7 +1861,15 @@ mod tests {
         assert!(parse_args(&["+S", "x"]).is_err());
         assert!(parse_args(&["+S", "1:x"]).is_err());
         assert!(parse_args(&["+P", "-1"]).is_err());
-        assert!(parse_args(&["+A", "many"]).is_err());
+        // `+A` uses the C's bare `atoi`, so a value that parses to a non-negative result —
+        // junk like `many`/`abc` included (both parse to 0) — is accepted (`erl +A abc
+        // -noshell -eval 'halt(0).'` exits 0); only a **negative** result is rejected
+        // (`erl +A -5` ⇒ exit 1, `bad number of async threads -5`).
+        assert_eq!(
+            parsed(&["+A", "many"]).emulator.extra_emulator_flags,
+            vec!["+A".to_string(), "many".to_string()]
+        );
+        assert!(parse_args(&["+A", "-5"]).is_err());
         assert!(parse_args(&["+S"]).is_err());
     }
 
@@ -1857,8 +1901,15 @@ mod tests {
         // The last occurrence wins.
         let config = parsed(&["+hms", "100", "+hms", "234"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 376);
+        // The C's reader is a bare `atoi`, so trailing junk is ignored: `+hms 100abc` is
+        // 100 in both runtimes (`erl +hms 100abc … -eval 'halt(0).'` exits 0).
+        assert_eq!(
+            parsed(&["+hms", "100abc"]).heap_options().policy().min_heap_words,
+            parsed(&["+hms", "100"]).heap_options().policy().min_heap_words
+        );
         // `+hms 0`, a negative and a non-numeric value are all rejected — the emulator
-        // rejects anything `<= 0` (`erl_init.c:1554-1567`) or non-numeric (`atoi`).
+        // rejects anything `<= 0` (`erl_init.c:1554-1567`), so a junk value (`atoi`'s 0) is
+        // rejected too.
         for args in [
             &["+hms", "0"][..],
             &["+hms", "abc"][..],
@@ -1868,7 +1919,7 @@ mod tests {
             &["+hmbs", "abc"][..],
             &["+hmbs"][..],
         ] {
-            let error = parse_args(args).expect_err("a malformed heap switch is a usage error");
+            let error = parse_args(args).expect_err("a malformed heap switch is refused");
             assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
         }
     }
@@ -1910,21 +1961,22 @@ mod tests {
         );
         assert_eq!(config.init_args.get("hmaxk"), None);
         assert_eq!(config.init_args.get("hmaxib"), None);
-        // `+hmax 0` is the emulator's own "no limit" value.
+        // `+hmax 0` is the emulator's own "no limit" value, and `+hmax abc` is the C's
+        // `atoi` zero — accepted, like the oracle (`erl +hmax abc …` exits 0).
         assert_eq!(parsed(&["+hmax", "0"]).heap_options().policy().max_heap_words, 0);
-        // A negative, a non-numeric or an out-of-range value is rejected (the C bounds it
-        // by `0..=MAX_SMALL`, `erl_init.c:1626-1633`), as is a non-boolean flag value
+        assert_eq!(parsed(&["+hmax", "abc"]).heap_options().policy().max_heap_words, 0);
+        // A negative or an out-of-range value is rejected (the C bounds it by
+        // `0..=MAX_SMALL`, `erl_init.c:1626-1633`), as is a non-boolean flag value
         // (`erl_init.c:1592-1624`).
         for args in [
             &["+hmax", "-1"][..],
-            &["+hmax", "abc"][..],
             &["+hmax", "1000000000000000000000"][..],
             &["+hmax"][..],
             &["+hmaxk", "bogus"][..],
             &["+hmaxel", "1"][..],
             &["+hmaxib"][..],
         ] {
-            let error = parse_args(args).expect_err("a malformed max-heap switch is a usage error");
+            let error = parse_args(args).expect_err("a malformed max-heap switch is refused");
             assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
         }
     }
@@ -2352,9 +2404,10 @@ mod tests {
         }
         assert!(parse_args(&["+P"]).is_err(), "+P needs a value");
 
-        // `+K` — preserved; the oracle accepts *any* value here, so validating the two
-        // literals is a documented divergence (`erl +K bogus …` exits 0).
-        for value in ["true", "false"] {
+        // `+K` — preserved; the oracle accepts *any* value here (the emulator only
+        // `get_arg`s it — `erl_check_io.c:2467`; `erl +K bogus …` exits 0), and so does
+        // this runtime now.
+        for value in ["true", "false", "bogus", "1"] {
             let config = parsed(&["+K", value]);
             assert_eq!(
                 config.emulator.extra_emulator_flags,
@@ -2362,8 +2415,6 @@ mod tests {
             );
             assert_eq!(config.init_args.get("K"), None);
         }
-        let error = parse_args(&["+K", "bogus"]).expect_err("beam_rt validates the literals");
-        assert_eq!(error::unsupported_reason(&error), None);
         assert!(parse_args(&["+K"]).is_err(), "+K needs a value");
 
         // `+sbt` — the nine bind types of `erl_cpu_topology.c:628-647`.
@@ -2708,44 +2759,49 @@ mod tests {
         }
     }
 
-    /// The boot-time `-config` check. Oracle (OTP 29.1.1 / erts-17.1), all verified:
+    /// The boot-time `-config` check ([`missing_config_file`]). Oracle (OTP 29.1.1 /
+    /// erts-17.1), all verified:
     ///
     /// ```text
-    /// erl -noshell -config /nonexistent      -eval 'ok'  → exit 1  (no stdout, no stderr)
+    /// erl -noshell -config /nonexistent      -eval 'ok'  → exit 1
     /// erl -noshell -config <dir named>.config -eval 'ok' → exit 1
     /// erl -noshell -config <missing> -config <ok> -eval  → exit 1
     /// erl -noshell -config <ok> -config <missing> -eval  → exit 1
     /// erl -noshell -config <existing>.config -eval 'ok'  → exit 0
     /// ```
+    ///
+    /// The check now reports the **resolved missing path** (so [`run`] can reproduce the
+    /// oracle's byte-exact `Could not start kernel pid …` stderr), or `None` when every
+    /// `-config` occurrence resolves to a real file.
     #[test]
     fn a_config_file_that_cannot_be_read_is_refused() {
         let scratch = ScratchDir::new("config");
         let present = scratch.write("app.config", b"[].\n");
 
         // No `-config` at all: nothing to check.
-        assert!(check_config_file(&parsed(&["-noshell"])).is_ok());
+        assert_eq!(missing_config_file(&parsed(&["-noshell"])), None);
 
         // Both spellings of the same file are accepted (`.config` is appended unless present).
         let stem = present.with_extension("");
         for value in [present.to_string_lossy(), stem.to_string_lossy()] {
             let config = parsed(&["-config", value.as_ref()]);
-            assert!(check_config_file(&config).is_ok(), "{value}");
+            assert_eq!(missing_config_file(&config), None, "{value}");
         }
 
-        // A missing file is refused with a message naming the **resolved** path.
+        // A missing file is named by its **resolved** path (`absent` ⇒ `absent.config`).
         let absent = scratch.path.join("absent");
-        let error = check_config_file(&parsed(&["-config", absent.to_string_lossy().as_ref()]))
-            .expect_err("a missing config file is refused");
-        let text = format!("{error}");
-        assert!(text.contains("cannot read config file"), "{text}");
-        assert!(text.contains("absent.config"), "{text}");
+        assert_eq!(
+            missing_config_file(&parsed(&["-config", absent.to_string_lossy().as_ref()])),
+            Some(absent.with_extension("config"))
+        );
 
         // A directory carrying the suffix is not a file (the oracle's `file:consult`
         // reports `eisdir` out of the boot).
         std::fs::create_dir_all(scratch.path.join("dir.config")).expect("a directory");
         let directory = scratch.path.join("dir");
         assert!(
-            check_config_file(&parsed(&["-config", directory.to_string_lossy().as_ref()])).is_err(),
+            missing_config_file(&parsed(&["-config", directory.to_string_lossy().as_ref()]))
+                .is_some(),
             "a directory is not a readable config file"
         );
 
@@ -2756,13 +2812,13 @@ mod tests {
         for (first, second) in [(&absent, &present), (&present, &absent)] {
             let config = parsed(&["-config", first, "-config", second]);
             assert!(
-                check_config_file(&config).is_err(),
+                missing_config_file(&config).is_some(),
                 "-config {first} -config {second} must be refused"
             );
         }
         // … and two readable ones are accepted.
         let config = parsed(&["-config", &present, "-config", &present]);
-        assert!(check_config_file(&config).is_ok());
+        assert_eq!(missing_config_file(&config), None);
     }
 
     /// The end-to-end classification: a `-config` the boot cannot read is a **runtime** error
