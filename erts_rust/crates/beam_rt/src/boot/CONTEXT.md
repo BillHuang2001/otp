@@ -85,12 +85,20 @@ these eight directives, the full modelled set:
   (matching `init`, which never checks — the failure surfaces at the next dependent directive). An
   `{apply, …}` runs the export through the engine's blocking-aware entries and drives the scheduler
   whenever the call suspends, resuming it once a boot-spawned process answers. Both drives go through
-  `drive_scheduler` over the crate-internal `Runtime::pump_scheduler`, with per-call slice budgets
+  `drive_scheduler` over the crate-internal `Runtime::pump_scheduler_boot`, with per-call slice budgets
   between deadline checks and **one** wall-clock `DRIVE_DEADLINE` (10 s) shared by the whole `execute`
   pass, plus a 1 s `KERNEL_BURST_DEADLINE` cap per burst. An exhausted deadline is a typed
   `error::message`; a blocked apply whose drive ran nothing is the engine's typed `error::blocked()`; a
-  drive stops as soon as a `pump_scheduler` call reports `0`.
+  drive stops as soon as a `pump_scheduler_boot` call reports `0`.
   A capability gap stays an `error::unsupported` raise.
+  `pump_scheduler_boot` is `pump_scheduler` with an **imminent-only** sleep policy
+  (`TimerWait::ImminentWithin(TIMER_PUMP_SLICE)`): a step sleeps the remaining time to the earliest
+  pending deadline **only when that deadline is within one pump slice (100 ms)** and returns `0` at once
+  otherwise, so a boot-armed timer a second (or an hour) away — the `gen_server` `WaitTimeout`s the
+  boot's parked processes hold — costs the drive nothing. Every already-due timer still fires
+  (`fire_due_timers` runs before the wait), and a boot-spawned process parked on a short
+  `receive … after T` (T ≤ the window) is still slept to and resumed. The boot's blocking calls are
+  `infinity` receives, so nothing a directive synchronously awaits lies beyond a slice.
 
 ### Surviving a `{kernelProcess, …}`'s directive exit (the unlink)
 This runtime runs a `{kernelProcess, …}` MFA in a **short-lived** process that exits when the MFA
@@ -336,7 +344,7 @@ an explicit CWD-relative `-boot bootstrap/bin/start`. Consequence: `init:script_
   rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
   `../context/CONTEXT.md`.
 - `bootscript.rs` is ~1855 lines (production lines 1–724, the rest its oracle test module) — the
-  crate's documented long-file precedent; `drive.rs` is ~391 lines. Both are `#![deny(unsafe_code)]`;
+  crate's documented long-file precedent; `drive.rs` is ~423 lines. Both are `#![deny(unsafe_code)]`;
   no `unwrap()` on runtime data.
 
 ## Test Strategy
@@ -385,6 +393,13 @@ an explicit CWD-relative `-boot bootstrap/bin/start`. Consequence: `init:script_
   (`a_boot_spawned_process_answers_a_blocked_apply`, `a_kernel_process_registers_its_own_directive_name`,
   `a_kernel_process_burst_waits_for_the_directive_to_return`, `registering_a_live_boot_name_is_badarg`)
   and by `../tests/boot.rs` (`the_boot_chains_kernel_processes_survive_their_directive_processes`).
+  The **imminent-only wait policy** the drives now use is pinned in `../runtime/scheduler/tests.rs`:
+  `the_imminent_only_wait_policy_sleeps_for_an_imminent_deadline_only` (the `TimerWait::ImminentWithin`
+  unit: no deadline → `None`; an hour out → `None`; 20 ms out → the remaining time, clamped to the
+  window; one wait per pass), `a_boot_drive_step_does_not_sleep_on_a_far_future_deadline` (a
+  `pump_scheduler_boot` step with a 1 h timer returns `0` in well under 100 ms, timer untouched) and
+  `a_boot_drive_step_sleeps_to_an_imminent_deadline_and_fires_it` (a 5 ms timer is slept to, the parked
+  receiver is resumed and the message delivered).
 - In-file `#[test]` counts: `bootscript.rs` **12** (lines 725–1855), `preloaded.rs` **3** (lines 75–143),
   `drive.rs` **0** — directory total **15**; the module root `../boot.rs` adds **9** (its own
   `#[cfg(test)] mod tests`).

@@ -24,8 +24,8 @@
 //! [`{kernelProcess, …}`](crate::boot::bootscript::Instruction::KernelProcess) spawn and an
 //! [`{apply, …}`](crate::boot::bootscript::Instruction::Apply) call — are what make `init`'s
 //! sequence more than a list of loads, and this module really drives the runtime's
-//! **scheduler** ([`Runtime::pump_scheduler`](crate::runtime::Runtime::pump_scheduler)) for
-//! them:
+//! **scheduler** ([`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot))
+//! for them:
 //!
 //! * a `{kernelProcess, …}` spawns its process and then drives a **bounded burst** of
 //!   scheduler slices, so a long-lived kernel server (`heart`, `logger_server`,
@@ -49,11 +49,17 @@
 //!   runtime-native floor, a registered `beam_bifs` BIF — is *not* a module export and is
 //!   dispatched there instead (see [`apply_boot_call`]).
 //!
-//! Every drive is **bounded**: a per-`pump_scheduler` slice budget between deadline checks
-//! and one wall-clock [`DRIVE_DEADLINE`] per [`execute`](crate::boot::bootscript::execute),
+//! Every drive is **bounded**: a per-`pump_scheduler_boot` slice budget between deadline
+//! checks and one wall-clock [`DRIVE_DEADLINE`] per [`execute`](crate::boot::bootscript::execute),
 //! so the boot can never hang. When the deadline expires the drive reports a typed
 //! [`error::message`] rather than waiting forever; when a blocked apply has nothing left
 //! that could wake it, the engine's own typed [`beam_engine::blocked`] is reported.
+//!
+//! A drive **sleeps only on an imminent deadline**: `pump_scheduler_boot` waits for the
+//! earliest pending timer only when it is within one pump slice (100 ms) and never stalls
+//! on a deadline a second — or an hour — away. A boot directive's blocking calls are
+//! `infinity` receives, so nothing the boot synchronously awaits lies beyond a slice,
+//! while a boot-spawned process parked on a short `receive … after T` is still resumed.
 use std::time::{Duration, Instant};
 
 use beam_common::Result;
@@ -73,7 +79,7 @@ use super::bootscript::Mfa;
 /// by every `{kernelProcess, …}` burst and every `{apply, …}` block wait it performs — so a
 /// boot script can never hang the runtime, however long a scheduler-driven process stays
 /// runnable. The bound is a safety net, not the normal path: a drive ends as soon as a
-/// `pump_scheduler` call reports that nothing ran (see [`drive_scheduler`]).
+/// `pump_scheduler_boot` call reports that nothing ran (see [`drive_scheduler`]).
 pub(super) const DRIVE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How long the **bounded burst** after a `{kernelProcess, …}` spawn may run.
@@ -86,21 +92,21 @@ pub(super) const DRIVE_DEADLINE: Duration = Duration::from_secs(10);
 /// MFA never returns cannot stall the boot.
 pub(super) const KERNEL_BURST_DEADLINE: Duration = Duration::from_secs(1);
 
-/// The per-`pump_scheduler`-call slice budget of a `{kernelProcess, …}` burst.
+/// The per-`pump_scheduler_boot`-call slice budget of a `{kernelProcess, …}` burst.
 ///
 /// The budget is **one slice**: the burst advances the scheduler one process at a time and
 /// re-checks `erlang:whereis(Name)` at the top of every iteration, so the check lands in the
 /// window between the kernel process registering its name and the directive process it is
 /// linked to resuming. That window is what makes the unlink in
 /// [`start_kernel_process`] beat the directive's `normal` exit: a coarser budget would let a
-/// single `pump_scheduler` call run both the registration *and* the directive's
+/// single `pump_scheduler_boot` call run both the registration *and* the directive's
 /// exit-signal-driven teardown, and a `{'EXIT', _, normal}` already queued in the kernel
 /// process's mailbox cannot be undone by a later unlink. The budget is also small enough that
 /// the burst's deadline is always reachable and the burst stays a *burst* rather than a
 /// scheduler pass of its own.
 pub(super) const KERNEL_BURST_SLICES: u64 = 1;
 
-/// The per-`pump_scheduler`-call slice budget of an `{apply, …}` block wait.
+/// The per-`pump_scheduler_boot`-call slice budget of an `{apply, …}` block wait.
 ///
 /// The apply is waiting for a boot-spawned process to *answer* it, so a step has to be long
 /// enough to carry a `gen_server` round trip; the deadline is checked between steps.
@@ -150,7 +156,7 @@ const APPLY_BLOCK_SLICES: u64 = 256;
 /// * the **directive process has terminated** — the normal case, and the point of the burst:
 ///   its MFA returned, so a `proc_lib`/`gen_server` server has registered, acked and entered
 ///   its loop, and the next directive that talks to the server by name finds it answering;
-/// * the run queue drains (`pump_scheduler` reports `0`) — every process settled, died or is
+/// * the run queue drains (`pump_scheduler_boot` reports `0`) — every process settled, died or is
 ///   blocked (`heart`'s `start/0` returns immediately and its `spawn`ed `heart:init/2` is
 ///   **not** linked to the directive, so the directive is already gone by then; a directive
 ///   that merely parks in an unmatched `receive` ends the burst the same way);
@@ -256,19 +262,23 @@ pub(super) fn start_kernel_process(
         if Instant::now() >= burst {
             return Ok(());
         }
-        if runtime.pump_scheduler(KERNEL_BURST_SLICES)? == 0 {
+        if runtime.pump_scheduler_boot(KERNEL_BURST_SLICES)? == 0 {
             return Ok(());
         }
     }
 }
 
-/// Runs one scheduler drive: repeated bounded [`Runtime::pump_scheduler`] steps until the
-/// scheduler reports that nothing ran, returning the total slices + port deliveries.
+/// Runs one scheduler drive: repeated bounded
+/// [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) steps until
+/// the scheduler reports that nothing ran, returning the total slices + port deliveries.
 ///
 /// This is the executor's [`Runtime::run_scheduled`](crate::runtime::Runtime::run_scheduled)
 /// counterpart — the same "bounded step between deadline checks" shape, with its own local
-/// constants ([`DRIVE_DEADLINE`], and the caller's per-`pump_scheduler` budget `slices`) so
-/// the boot can never hand control to the scheduler for good.
+/// constants ([`DRIVE_DEADLINE`], and the caller's per-`pump_scheduler_boot` budget `slices`)
+/// so the boot can never hand control to the scheduler for good. The step's **imminent-only**
+/// sleep policy is what keeps the drive from paying a fixed 100 ms per step for a boot-armed
+/// timer that is a second (or an hour) away: a deadline beyond one pump slice makes
+/// `pump_scheduler_boot` report `0` at once, exactly as it does when nothing is pending.
 ///
 /// The two stop conditions are the point:
 ///
@@ -293,7 +303,7 @@ pub(super) fn drive_scheduler(runtime: &mut Runtime, deadline: Instant, slices: 
                 DRIVE_DEADLINE.as_millis()
             )));
         }
-        let ran = runtime.pump_scheduler(slices)?;
+        let ran = runtime.pump_scheduler_boot(slices)?;
         total += ran;
         if ran == 0 {
             return Ok(total);

@@ -438,6 +438,109 @@ fn after_infinity_parks_forever() {
     assert!(rt.processes().get(receiver).is_some(), "it is still parked");
 }
 
+// -- the boot drive's imminent-only wait policy ---------------------------
+
+/// The `TimerWait::ImminentWithin` policy sleeps **only** when the earliest deadline is
+/// within its window: a far-future deadline (an hour out) is not a reason to wait, and an
+/// imminent one is waited out for exactly the remaining time (clamped to the window). It
+/// allows at most one wait per pass, exactly like `TimerWait::AtMost`.
+///
+/// This is the policy `Runtime::pump_scheduler_boot` — the boot drives' step — uses; the
+/// `-eval` pump keeps `TimerWait::AtMost`, whose bounded semantics its `receive … after`
+/// loop relies on.
+#[test]
+fn the_imminent_only_wait_policy_sleeps_for_an_imminent_deadline_only() {
+    let mut rt = runtime();
+    let window = Duration::from_millis(100);
+    let me = rt.self_pid();
+
+    // Nothing pending at all: no wait.
+    assert_eq!(rt.timer_wait(TimerWait::ImminentWithin(window), 0), None);
+
+    // The policy allows one wait per pass — the same bound as `AtMost` — so an already-spent
+    // pass never waits again.
+    assert!(TimerWait::ImminentWithin(window).allows(0));
+    assert!(!TimerWait::ImminentWithin(window).allows(1));
+
+    // A deadline an hour away is **not** slept on: the pass yields instead.
+    let far = send_after(&mut rt, 3_600_000, me.to_eterm(), make_small(1));
+    assert_eq!(
+        rt.timer_wait(TimerWait::ImminentWithin(window), 0),
+        None,
+        "a deadline beyond the window must not stall the pass"
+    );
+
+    // An imminent deadline (20 ms out) is waited out for the remaining time, never longer
+    // than the window.
+    assert!(
+        rt.timers.cancel(far).is_some(),
+        "the far timer is still pending and cancellable"
+    );
+    let _soon = send_after(&mut rt, 20, me.to_eterm(), make_small(2));
+    let wait = rt
+        .timer_wait(TimerWait::ImminentWithin(window), 0)
+        .expect("an imminent deadline is slept to");
+    assert!(wait <= window, "the wait is clamped to the window: {wait:?}");
+    assert!(!wait.is_zero(), "the wait is the remaining time, not zero");
+}
+
+/// A boot-drive step ([`Runtime::pump_scheduler_boot`]) with a **far-future** timer pending
+/// and nothing runnable returns `0` **without sleeping** — the fixed-cost regression this
+/// policy removes. (The `-eval` pump would sleep a full `TIMER_PUMP_SLICE` here.)
+#[test]
+fn a_boot_drive_step_does_not_sleep_on_a_far_future_deadline() {
+    let mut rt = runtime();
+    rt.load_module(RECV_BEAM).expect("load recv.beam");
+    let receiver = rt.spawn_process("recv", "wait", vec![]).expect("spawn recv:wait/0");
+
+    // Slice 1: the receiver blocks on an empty mailbox, so the run queue is empty.
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+    assert_eq!(
+        rt.processes().get(receiver).expect("in the table").state(),
+        ProcessState::Waiting
+    );
+    assert_eq!(rt.run_queue_len(), 0, "nothing is runnable");
+
+    // A deadline an hour out: the step has nothing to do and must not wait for it.
+    let reference = send_after(&mut rt, 3_600_000, receiver.to_eterm(), make_small(42));
+    let started = Instant::now();
+    let ran = rt.pump_scheduler_boot(1).expect("a boot-drive step");
+    let elapsed = started.elapsed();
+    assert_eq!(ran, 0, "nothing ran and nothing was delivered");
+    assert!(
+        elapsed < Duration::from_millis(90),
+        "the step must not sleep on a far-future deadline (took {elapsed:?})"
+    );
+    assert!(rt.timers.is_timer_ref(reference), "the timer is untouched");
+    assert_eq!(rt.timers.pending_count(), 1, "the far deadline is still pending");
+    assert!(rt.process_result(receiver).is_none(), "the receiver is still parked");
+}
+
+/// A boot-drive step with an **imminent** deadline (a boot-spawned receiver parked on a
+/// short `receive … after T`/`send_after` far inside the window) still sleeps to it and
+/// resumes the parked receiver — so the boot keeps making progress without the old
+/// unconditional 100 ms wait.
+#[test]
+fn a_boot_drive_step_sleeps_to_an_imminent_deadline_and_fires_it() {
+    let mut rt = runtime();
+    rt.load_module(RECV_BEAM).expect("load recv.beam");
+    let receiver = rt.spawn_process("recv", "wait", vec![]).expect("spawn recv:wait/0");
+
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+    assert_eq!(rt.run_queue_len(), 0, "nothing is runnable");
+
+    // 5 ms out — well inside the 100 ms window — so the step waits for it and delivers.
+    let _ = send_after(&mut rt, 5, receiver.to_eterm(), make_small(42));
+    let ran = rt.pump_scheduler_boot(1).expect("a boot-drive step");
+    assert!(ran >= 1, "the imminent deadline was slept to and the receiver resumed");
+    assert_eq!(
+        signed_value(rt.process_result(receiver).expect("the receiver returned")),
+        42,
+        "the timer's message became the receive's value"
+    );
+    assert_eq!(rt.timers.pending_count(), 0, "the deadline fired exactly once");
+}
+
 // -- the CLI `run` action (`run_scheduled`) -------------------------------
 
 /// A non-blocking export returns exactly what the single-pass `run_function` returns:

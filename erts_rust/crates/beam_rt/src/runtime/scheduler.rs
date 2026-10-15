@@ -103,7 +103,7 @@ const RUN_STEP_SLICES: u64 = 1_000;
 /// This is the timer counterpart of the port half's poll clamp: the loop never *spins*, it
 /// sleeps exactly as long as the earliest deadline requires — and only when it has nothing
 /// else to do.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TimerWait {
     /// Never sleep: a **bounded** pass ([`Runtime::run_slices`]/[`Runtime::run_one_slice`])
     /// only fires deadlines that have already passed, so a step stays a step.
@@ -115,6 +115,18 @@ enum TimerWait {
     /// Sleep at most this long, once per pass — the bounded `-eval` pump
     /// ([`Runtime::pump_scheduler`], see [`TIMER_PUMP_SLICE`]).
     AtMost(Duration),
+    /// Sleep **once per pass**, and only when the earliest pending deadline is already
+    /// **imminent** — within this window. The pass sleeps exactly the remaining time when
+    /// `remaining <= window` and returns **without sleeping** otherwise, so a deadline far
+    /// out (a `gen_server` housekeeping timeout, say) is not a reason to stall a caller
+    /// that has no work to do.
+    ///
+    /// The boot drives ([`crate::boot::drive`]) use this. A boot directive's blocking calls
+    /// are `infinity` receives, so no deadline beyond a pump slice is something a drive
+    /// synchronously awaits; a boot-spawned process parked on a **short**
+    /// `receive … after T` (T ≤ the window) is still slept to and resumed, and every timer
+    /// that is already due still fires (`fire_due_timers` runs before the wait).
+    ImminentWithin(Duration),
 }
 
 impl TimerWait {
@@ -123,7 +135,7 @@ impl TimerWait {
         match self {
             TimerWait::Never => false,
             TimerWait::Deadline => true,
-            TimerWait::AtMost(_) => waits == 0,
+            TimerWait::AtMost(_) | TimerWait::ImminentWithin(_) => waits == 0,
         }
     }
 }
@@ -162,6 +174,39 @@ impl Runtime {
     pub(crate) fn pump_scheduler(&mut self, max_slices: u64) -> Result<u64> {
         let (ran, delivered) =
             self.scheduler_pass(Some(max_slices), true, TimerWait::AtMost(TIMER_PUMP_SLICE))?;
+        Ok(ran + delivered as u64)
+    }
+
+    /// Runs a **bounded, boot-drive** scheduler step: [`Runtime::pump_scheduler`] with an
+    /// **imminent-only** sleep policy ([`TimerWait::ImminentWithin`]).
+    ///
+    /// The boot drives ([`crate::boot::drive`]) call this instead of
+    /// [`Runtime::pump_scheduler`]. Both perform the same move-out dance, absorb the wake
+    /// list first and return `ran + delivered`, and both are bounded by `max_slices`; the
+    /// only difference is what the pass does when the run queue is empty:
+    ///
+    /// * [`Runtime::pump_scheduler`] sleeps `min(100 ms, time to the nearest deadline)`
+    ///   whenever *any* deadline is pending, so a boot drive that has nothing to run still
+    ///   pays a full 100 ms per step for a deadline a second (or an hour) away;
+    /// * this entry sleeps **only when the earliest deadline is within
+    ///   [`TIMER_PUMP_SLICE`]**, and then exactly the remaining time. A deadline further
+    ///   out returns `0` immediately (as it already does when there is no deadline at all),
+    ///   so the drive yields promptly and its caller decides — the boot's blocking calls
+    ///   are `infinity` receives that no such timer answers.
+    ///
+    /// Due timers are unaffected: [`fire_due_timers`] runs before the wait, so a deadline
+    /// that has already passed still fires on this step; a short `receive … after T`
+    /// (T ≤ the window) is slept to and its process resumed exactly as before.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::pump_scheduler`].
+    pub(crate) fn pump_scheduler_boot(&mut self, max_slices: u64) -> Result<u64> {
+        let (ran, delivered) = self.scheduler_pass(
+            Some(max_slices),
+            true,
+            TimerWait::ImminentWithin(TIMER_PUMP_SLICE),
+        )?;
         Ok(ran + delivered as u64)
     }
 
@@ -964,11 +1009,20 @@ impl Runtime {
         }
         let deadline = self.timers.next_deadline()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        Some(match policy {
-            TimerWait::Never => return None,
-            TimerWait::Deadline => remaining,
-            TimerWait::AtMost(max) => remaining.min(max),
-        })
+        let chosen = match policy {
+            TimerWait::Never => None,
+            TimerWait::Deadline => Some(remaining),
+            TimerWait::AtMost(max) => Some(remaining.min(max)),
+            // Sleep only when the deadline is already imminent; a window's worth of slack
+            // beyond it is not this pass's business (see `TimerWait::ImminentWithin`).
+            TimerWait::ImminentWithin(window) => (remaining <= window).then_some(remaining),
+        };
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "timer wait: policy={policy:?} remaining={remaining:?} wait={chosen:?}"
+            ));
+        }
+        chosen
     }
 
     /// Fires every timer whose deadline has passed, delivering its message into the target's
