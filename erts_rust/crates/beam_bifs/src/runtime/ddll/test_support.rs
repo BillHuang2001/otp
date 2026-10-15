@@ -39,7 +39,7 @@ use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
 /// The atoms the tests build or route by name.
-pub(crate) const SEEDED: [&str; 27] = [
+pub(crate) const SEEDED: [&str; 30] = [
     // The loading keys' atoms.
     "ok",
     "error",
@@ -70,6 +70,10 @@ pub(crate) const SEEDED: [&str; 27] = [
     "false",
     // The driver fixture's name (so `info/2`'s atom-name arm can name a loaded driver).
     "test_drv",
+    // The statically linked built-ins (so `try_load`/`try_unload`/`info/2` can name them by atom).
+    "tcp_inet",
+    "udp_inet",
+    "ram_file_drv",
 ];
 
 /// An `erl_ddll` call fixture over its own heap, seeded atom table and a registry
