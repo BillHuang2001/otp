@@ -205,16 +205,21 @@ pub(crate) fn symbolic_stacktrace(
     // It is taken here, once, so it can never leak into a later cooked trace; a frame
     // the module/context cannot name consumes it all the same (there is no later
     // frame it could belong to).
-    let mut failed_clause_args = machine.take_raise_function_clause_args();
+    let live_clause_args = machine.live_raise_function_clause_args();
+    let mut args_item: Option<usize> = None;
     let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
-    for ((_context, func, pc), owner) in frames.iter().zip(plan.iter()) {
-        let args = failed_clause_args.take();
+    for (index, ((_context, func, pc), owner)) in frames.iter().zip(plan.iter()).enumerate() {
+        let args = if index == 0 { live_clause_args } else { None };
         let owner_module: &Module = match owner {
             FrameOwner::EntryModule => entry_module,
             FrameOwner::Owned(index) => &owned[*index],
             FrameOwner::Skip => continue,
         };
-        shapes.push(item_shape(owner_module, *func, *pc, args)?);
+        let shape = item_shape(owner_module, *func, *pc, args)?;
+        if shape.args.is_some() {
+            args_item = Some(shapes.len());
+        }
+        shapes.push(shape);
     }
     // `2` words per list cell plus every item's own nodes — sized **before** the
     // reservation, because a collection under it relocates the machine's roots and
@@ -223,6 +228,27 @@ pub(crate) fn symbolic_stacktrace(
     let total =
         2 * shapes.len() + shapes.iter().map(ItemShape::words).sum::<usize>() + if head { 2 } else { 0 };
     let mut sink = terms::reserve_slack(machine, ctx, total)?;
+    // The reservation above may have MOVED the failed clause's argument list: the
+    // list is a machine-held term behind the raise latch, and `Machine::with_roots`
+    // parks that latch (and re-seats it from the slot a conforming host wrote the
+    // relocated word back through) for exactly this reason. The word captured before
+    // the reservation is therefore finished with — the list is re-read HERE, from the
+    // re-seated latch, and its elements are carved straight out of it by `write_item`,
+    // so no element word is held across a collection either. The element count is
+    // invariant under a move, so the region sized above is still exactly right.
+    if live_clause_args.is_some() {
+        let list = machine.take_raise_function_clause_args();
+        if let Some(index) = args_item {
+            match list {
+                Some(list) if is_list(list) || is_nil(list) => shapes[index].args = Some(list),
+                _ => {
+                    return Err(error::unsupported(
+                        "build_stacktrace: the live function-clause argument latch vanished across its reservation",
+                    ))
+                }
+            }
+        }
+    }
     let mut items = Vec::with_capacity(shapes.len());
     for shape in &shapes {
         // Child nodes before the parent, in the order `ItemShape::words` counts.
@@ -317,6 +343,7 @@ fn supplied_frame_shape<'a>(module: &Module, frame: &'a StackFrame) -> Result<It
         function: function_atom,
         arity: u32::from(frame.arity),
         args: None,
+        args_len: 0,
         location,
     })
 }
@@ -406,7 +433,16 @@ struct ItemShape<'a> {
     /// list is re-carved into the reservation so the whole cooked trace is one region:
     /// [`ItemShape::words`] charges `2` words per element and [`write_item`] carves
     /// exactly that many.
-    args: Option<Vec<Eterm>>,
+    ///
+    /// This is the argument **list term**, never its elements: the elements are read at
+    /// carve time by [`write_item`], *inside* the reservation, where no further
+    /// allocation can strand them.
+    args: Option<Eterm>,
+    /// The element count of [`ItemShape::args`], captured before the rooted reservation
+    /// from the still-valid latch word — the fact [`ItemShape::words`] sizes by. A
+    /// proper list's length is invariant under a move, so the pre-reservation count is
+    /// exact for the re-seated list `write_item` follows. `0` when there is no list.
+    args_len: usize,
     /// The `Location` element's shape, or `None` for the empty list.
     location: Option<LocationShape<'a>>,
 }
@@ -419,7 +455,7 @@ impl ItemShape<'_> {
     /// and the 2-element outer list (`4`) — i.e. `2 * chars + 10`. A `None` location
     /// is [`NIL`] and occupies nothing.
     fn words(&self) -> usize {
-        5 + self.args.as_ref().map_or(0, |args| 2 * args.len())
+        5 + if self.args.is_some() { 2 * self.args_len } else { 0 }
             + match &self.location {
                 Some(location) => 2 * location.file.chars().count() + 10,
                 None => 0,
@@ -467,17 +503,35 @@ fn item_shape(
         .functions
         .get(func as usize)
         .ok_or_else(|| error::unsupported("build_stacktrace: function index out of range"))?;
-    let args = match failed_clause_args {
-        Some(list) if is_list(list) || is_nil(list) => Some(terms::list_elements(list)?),
-        _ => None,
+    let (args, args_len) = match failed_clause_args {
+        Some(list) if is_list(list) || is_nil(list) => (Some(list), list_len(list)?),
+        _ => (None, 0),
     };
     Ok(ItemShape {
         module: function.module,
         function: function.name,
         arity: function.arity,
         args,
+        args_len,
         location: location_shape(module, func, pc)?,
     })
+}
+
+/// The element count of a **proper** list, without materializing its elements.
+///
+/// The failed clause's argument list is a live machine term that must not be held
+/// across a collection (see [`ItemShape::args`]), so only its length is read before
+/// the rooted reservation — the elements themselves are re-read from the re-seated
+/// list at carve time. An improper tail is [`BeamError::BadArg`], exactly as
+/// [`terms::list_elements`] reports it.
+fn list_len(list: Eterm) -> Result<usize> {
+    let mut len = 0usize;
+    let mut cursor = list;
+    while !is_nil(cursor) {
+        len += 1;
+        cursor = terms::cons_tail(cursor)?;
+    }
+    Ok(len)
 }
 
 /// The `Location` element of a stacktrace item: `[{file,Name},{line,N}]` when the
@@ -533,9 +587,15 @@ fn write_item(sink: &mut dyn Sink, shape: &ItemShape<'_>) -> Result<Eterm> {
     };
     // The `A` slot: the failed clause's argument list when this item is the one whose
     // function contains the failed clause, else the declared arity. The carve is
-    // exactly the `2` words per element [`ItemShape::words`] charged.
-    let arity = match &shape.args {
-        Some(args) => sink.list(args)?,
+    // exactly the `2` words per element [`ItemShape::words`] charged. The list's
+    // elements are read **here**, inside the reservation: the list word was re-seated
+    // from the raise latch after the rooted allocation, so following it cannot
+    // dereference a pre-move cell, and the carve below never allocates.
+    let arity = match shape.args {
+        Some(list) => {
+            let elements = terms::list_elements(list)?;
+            sink.list(&elements)?
+        }
         None => make_small(shape.arity as i64),
     };
     sink.tuple(&[make_atom(shape.module), make_atom(shape.function), arity, location])

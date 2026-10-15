@@ -180,6 +180,22 @@ impl Machine {
         self.raise_function_clause_args.take()
     }
 
+    /// The **read half** of [`Machine::take_raise_function_clause_args`]: the live
+    /// failed-clause argument list, **without** consuming it.
+    ///
+    /// The cooked-trace builder needs the list's *length* to size its single rooted
+    /// reservation before taking it. It must not copy the list word into a Rust local
+    /// for later use, though: a collecting host may **move** the list under that
+    /// reservation, so the word returned here is only valid until the next collecting
+    /// allocation. The builder therefore consumes the list *after* the reservation,
+    /// through [`Machine::take_raise_function_clause_args`], which yields the
+    /// re-seated (post-move) word — the machine parks and re-seats the latch for
+    /// exactly that reason (see [`Machine::with_roots`]). `None` when no
+    /// `function_clause` raise is in flight.
+    pub(crate) fn live_raise_function_clause_args(&self) -> Option<Eterm> {
+        self.raise_function_clause_args
+    }
+
     /// Consume the **live raise**'s explicitly supplied symbolic frames
     /// ([`Machine::raise_supplied_trace`]).
     ///

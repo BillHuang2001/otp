@@ -550,14 +550,69 @@ impl Machine {
     /// copying collector may always over-approximate the root set — it can only
     /// keep a term alive, never free a live one). The root-set contract itself is
     /// the frozen one on [`RootSet`].
+    ///
+    /// # The machine-held heap terms `f` also roots
+    ///
+    /// A raise parks heap terms in `Machine` fields that are **not** part of the
+    /// frozen [`RootSet`]: the two failed-clause argument latches
+    /// ([`Machine::pending_function_clause_args`] — armed immediately before the
+    /// `throw_with_trace` that lands the raise, so never live across an allocation —
+    /// and [`Machine::raise_function_clause_args`] — the **live raise** state the
+    /// cooked-trace builders read *after* their rooted reservation). A collecting
+    /// host must relocate those terms too, so this method **parks** whichever of the
+    /// two is armed at the end of the **Erlang stack** for the duration of `f` and
+    /// **re-seats** each field from its slot afterwards — the stack is part of the
+    /// frozen root set and is rooted in full (there is no liveness map over Y slots),
+    /// so a conforming host that only scans `x[0..live_len()]` roots the parked term
+    /// regardless of the `live` hint. The parked words lengthen `roots.stack` by at
+    /// most two; over-approximating a root set is always safe for a copying
+    /// collector, and the length is restored before this method returns, so no
+    /// engine state observes the temporary words.
+    ///
+    /// When no latch is armed (the overwhelming majority of hand-offs) the stack is
+    /// untouched and this method is byte-identical to the pre-parking behavior.
+    ///
+    /// [`Machine::pending_exception`]'s reason term is deliberately **not** parked
+    /// here: it is a copy of the word `land_exception` publishes in `x(1)`/`x(3)`,
+    /// so it is already relocated through the ordinary root set on the caught path
+    /// (and rides out of the machine in the raise's live-reason slot on the uncaught
+    /// path, never re-read from the field).
     pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
         // The receiver is handed mutable slices of BOTH register files, so it may write
         // any slot of either — a move that the `set_x`/`set_fr` high-water marks cannot
         // see. Mark the files escaped so the next `reset` refills them in full rather
         // than trusting the marks.
         self.regs_escaped = true;
-        let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
-        f(roots)
+        let raise_args = self.raise_function_clause_args;
+        let pending_args = self.pending_function_clause_args;
+        if raise_args.is_none() && pending_args.is_none() {
+            let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
+            return f(roots);
+        }
+        // A raise is in flight and holds at least one heap-term latch: park them so the
+        // host roots (and relocates) them, then re-seat them from the slots the host
+        // wrote back through.
+        let base = self.stack.len();
+        if let Some(term) = raise_args {
+            self.stack.push(term);
+        }
+        if let Some(term) = pending_args {
+            self.stack.push(term);
+        }
+        let result = {
+            let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
+            f(roots)
+        };
+        let mut cursor = base;
+        if raise_args.is_some() {
+            self.raise_function_clause_args = self.stack.get(cursor).copied();
+            cursor += 1;
+        }
+        if pending_args.is_some() {
+            self.pending_function_clause_args = self.stack.get(cursor).copied();
+        }
+        self.stack.truncate(base);
+        result
     }
 
     /// Allocate `n` heap words **with the live root set handed to `ctx`**, so a
