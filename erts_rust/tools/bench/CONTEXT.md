@@ -647,6 +647,19 @@ So the rust `foreign`/`copy_bound` per-case `case_<name>_peak_rss_bytes` is **no
 comparison (loop-length- **and** boot-dependent, `RESULTS.md` §8 item 5); `slice` (one call per process,
 `N`=1) remains the comparable per-process memory metric. The figures are in `RESULTS.md` §3.3/§3.6/§6.7.
 
+**Reproducing the counter-level evidence (the driver prints none of it).** A `copy_bound`/`gc_bound` row
+records only `case_<name>_{wall_ms,startup_ms,peak_rss_bytes,ns_per_op,ops}` plus notes — it prints **no**
+`collections`/`minor_gcs`/`heap_size`. Those per-process counters come from a **probe module** of your own
+(`erlang:process_info(self(), heap_size | total_heap_size | garbage_collection)` +
+`erlang:statistics(garbage_collection)`) that calls the staged `bench_copy_bound:<case>/1` and is run through
+the **`run` action** (`beam_rt -pa <dir> run <probe.beam> <probe>:<f>/1 <N>`) — the same route the `rust`
+side of every `Runtimes::Both` loop workload uses, which is what exposes the loop's real scheduled-process
+nursery. The `-eval` route does **not**: there the counters stay at their fresh values (the growth is
+invisible through `process_info(self(), _)`) even though the run's peak RSS still grows, so counter
+measurements must go through `run`. (`heap_size` is `Nursery::capacity_words` — the **sum over retired +
+current** spaces — so it is the retained-capacity signal.) The measured values and root causes are the
+`beam_rt` node's (`../crates/beam_rt/src/context/CONTEXT.md`, `M1_GAPS.md`, `PERF.md`), not this node's.
+
 ## Honesty audit — measurement-integrity notes (current state)
 
 No workload returns a hard-coded or estimated metric; a workload that fails to build/run is always
