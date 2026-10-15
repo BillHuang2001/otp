@@ -78,7 +78,7 @@ use crate::jit::baseline::bif_helper::jit_bif_value;
 const ARITY_SHIFT: u32 = HEADER_ARITY_OFFS - TAG_IMMED1_SIZE;
 const _: () = assert!(ARITYVAL_SUBTAG == 0);
 
-/// One of the three `Bif`s this module lowers, reduced to the access it performs.
+/// One of the named `Bif`s this module lowers, reduced to the access it performs.
 #[derive(Clone, Copy)]
 enum Target<'a> {
     /// `hd/1` over the cons cell in this operand.
@@ -92,11 +92,12 @@ enum Target<'a> {
     },
     /// `tuple_size/1` over the tuple in this operand.
     TupleSize(&'a Operand),
-    /// `byte_size/1` or `length/1` over the term in this operand — evaluated by the
-    /// native helper [`jit_bif_value`] (`super::super::bif_helper`), whose Rust body is
-    /// the `beam_bifs` ground truth itself (`dimply`/`bit_size` rounded up for
-    /// `byte_size/1`; the proper-list walk for `length/1`).
-    Value(&'a Operand),
+    /// `byte_size/1` or `length/1` — evaluated by the native helper
+    /// [`jit_bif_value`] (`super::super::bif_helper`), whose Rust body is the `beam_bifs`
+    /// ground truth itself (`bit_size` rounded up for `byte_size/1`; the proper-list walk
+    /// for `length/1`). The operand is re-read from the module by the helper, so the
+    /// target carries no operand of its own.
+    Value,
 }
 
 /// The accessor shape a lowered `Bif` uses — the aggregate module's own shape types, so a
@@ -214,7 +215,7 @@ fn classify<'a>(module: &Module, instr: &'a Instr) -> Option<(Target<'a>, &'a Op
         // The helper-evaluated value accessors: `byte_size/1` and `length/1`, accepted
         // only for a shape their Rust body can serve end to end (`value_shape`).
         ("byte_size" | "length", [source]) if value_shape(source, dst) => {
-            Some((Target::Value(source), dst))
+            Some((Target::Value, dst))
         }
         _ => None,
     }
@@ -245,8 +246,7 @@ fn shape(module: &Module, instr: &Instr) -> Option<Inlined> {
         Target::TupleSize(source) => {
             Inlined::Tuple(aggregate::get_tuple_element_shape(source, 0, dst)?)
         }
-        Target::Value(_) => {
-            let (touches, writes) = value_registers(dst);
+        Target::Value => {            let (touches, writes) = value_registers(dst);
             Inlined::Value { touches, writes }
         }
     })
@@ -339,7 +339,7 @@ pub(super) fn try_inline_bif(
         // `byte_size/1`/`length/1` are served by the native helper `jit_bif_value`, whose
         // Rust body reproduces `beam_bifs`'s own value (or declines to the interpreter's
         // step, which raises its exact `badarg`/`system_limit`).
-        Target::Value(_) => try_inline_bif_value(buffer, allocation, done, func, pc),
+        Target::Value => try_inline_bif_value(buffer, allocation, done, func, pc),
     }
 }
 
