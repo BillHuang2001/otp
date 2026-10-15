@@ -54,6 +54,13 @@
 //! `BEAM_ETS_BENCH_INDEX=bplus` to leave the `O(n)`-per-op sorted `Vec` out of the
 //! run. A single pass is not comparable between runs on a shared machine.
 //!
+//! The ordered family additionally varies the **key order** it drives with, via
+//! `BEAM_ETS_BENCH_ORDER=shuffled|ascending|descending|all` (default `shuffled`,
+//! the behaviour every earlier run used). Order is decisive only for the sorted
+//! `Vec`, whose insert/delete shift every element after the position: ascending
+//! inserts are its append fast path while ascending deletes are its
+//! shift-the-whole-tail worst case. `all` measures the three orders in one run.
+//!
 //! Each measurement also **asserts** the results (`size`, hit/miss answers,
 //! iteration count, `insert_new`'s `true`/`false`), so a wrong-but-fast index fails
 //! the run rather than winning the benchmark.
@@ -196,6 +203,76 @@ fn indexes() -> Indexes {
         Ok(spec) => Indexes::parse(&spec),
         Err(_) => Indexes::Both,
     }
+}
+
+/// The key order the *ordered* benchmark drives with. Default `Shuffled`.
+///
+/// The order is irrelevant to the hash interiors but decisive for the sorted
+/// `Vec`, whose insert/delete move every element after the position: ascending
+/// inserts are its append fast path while ascending deletes are its
+/// shift-the-whole-tail worst case. The B+-tree is order-insensitive, so any gap
+/// the order opens is the `Vec`'s.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// A deterministic pseudo-random permutation (the default).
+    Shuffled,
+    /// Ascending in the interior's own key order ([`cmp_arith`]).
+    Ascending,
+    /// Descending in the interior's own key order.
+    Descending,
+}
+
+impl Order {
+    fn name(self) -> &'static str {
+        match self {
+            Order::Shuffled => "shuffled",
+            Order::Ascending => "ascending",
+            Order::Descending => "descending",
+        }
+    }
+
+    fn parse(spec: &str) -> Order {
+        match spec.trim() {
+            "shuffled" | "random" => Order::Shuffled,
+            "ascending" | "asc" => Order::Ascending,
+            "descending" | "desc" => Order::Descending,
+            other => panic!("BEAM_ETS_BENCH_ORDER: unknown order {other:?}"),
+        }
+    }
+}
+
+/// The orders to measure. Default `[Shuffled]` (the previous behaviour); `all`
+/// measures all three. Override with `BEAM_ETS_BENCH_ORDER=ascending`.
+fn orders() -> Vec<Order> {
+    match std::env::var("BEAM_ETS_BENCH_ORDER") {
+        Ok(spec) if spec.trim() == "all" => {
+            vec![Order::Shuffled, Order::Ascending, Order::Descending]
+        }
+        Ok(spec) => vec![Order::parse(&spec)],
+        Err(_) => vec![Order::Shuffled],
+    }
+}
+
+/// `keys` in the requested order: the seeded shuffled permutation, or the keys
+/// sorted by the interior's own comparison ([`cmp_arith`], so `1` and `1.0` order
+/// by arithmetic value) ascending / descending.
+fn arrange(order: Order, keys: &[Eterm], atoms: &AtomTable, seed: u64) -> Vec<Eterm> {
+    match order {
+        Order::Shuffled => shuffled(keys, seed),
+        Order::Ascending => ascending_by_key(keys, atoms),
+        Order::Descending => {
+            let mut descending = ascending_by_key(keys, atoms);
+            descending.reverse();
+            descending
+        }
+    }
+}
+
+/// `keys` in ascending [`cmp_arith`] order (a stable sort over the key terms).
+fn ascending_by_key(keys: &[Eterm], atoms: &AtomTable) -> Vec<Eterm> {
+    let mut out = keys.to_vec();
+    out.sort_by(|a, b| cmp_arith(*a, *b, atoms));
+    out
 }
 
 /// Build `n` distinct keys of `shape`; `salt` shifts the key space so a second
@@ -408,6 +485,42 @@ fn print_row(shape: Shape, index: &str, n: usize, m: &Metrics) {
     );
 }
 
+/// Print one ordered-benchmark row: the `set` columns plus the driven key order.
+fn print_ordered_row(shape: Shape, order: Order, index: &str, n: usize, m: &Metrics) {
+    println!(
+        "{:<9} {:>9} {:<11} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10.1}",
+        shape.name(),
+        n,
+        order.name(),
+        index,
+        ns(m.insert_ns),
+        ns(m.insert_new_ns),
+        ns(m.hit_ns),
+        ns(m.miss_ns),
+        ns(m.iter_ns),
+        ns(m.delete_ns),
+        m.bytes_per_entry,
+    );
+}
+
+/// Print one `sorted/tree` ratio row for the ordered benchmark.
+fn print_ordered_ratio(shape: Shape, order: Order, n: usize, sorted: &Metrics, tree: &Metrics) {
+    println!(
+        "{:<9} {:>9} {:<11} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+        shape.name(),
+        n,
+        order.name(),
+        "sorted/tree",
+        ratio(sorted.insert_ns, tree.insert_ns),
+        ratio(sorted.insert_new_ns, tree.insert_new_ns),
+        ratio(sorted.hit_ns, tree.hit_ns),
+        ratio(sorted.miss_ns, tree.miss_ns),
+        ratio(sorted.iter_ns, tree.iter_ns),
+        ratio(sorted.delete_ns, tree.delete_ns),
+        ratio(sorted.bytes_per_entry, tree.bytes_per_entry),
+    );
+}
+
 #[test]
 fn interior_microbenchmark() {
     let sizes = sizes();
@@ -467,11 +580,11 @@ fn interior_microbenchmark() {
 /// Fisher-Yates shuffle, so no `rand` dependency), used only by the *ordered*
 /// benchmark.
 ///
-/// The sorted-`Vec` interior's cost depends on the position it inserts/deletes at:
-/// appending keys in ascending order is its O(1) fast path, while deleting them in
-/// ascending order is its shift-the-whole-tail worst case. Measuring in that
-/// order would flatter it (and the hash interiors do not care), so the ordered
-/// benchmark drives a shuffled key order instead.
+/// The sorted-`Vec` interior's cost depends on the position it inserts/deletes at,
+/// so the ordered benchmark drives several key orders ([`Order`]): the **shuffled**
+/// one is the order-neutral default (it neither flatters nor penalises the `Vec`),
+/// while `BEAM_ETS_BENCH_ORDER=ascending|descending` expose its append fast path
+/// and its shift-the-whole-tail worst case.
 fn shuffled(keys: &[Eterm], seed: u64) -> Vec<Eterm> {
     let mut out = keys.to_vec();
     let mut state = seed | 1;
@@ -498,14 +611,25 @@ fn ordered_interior_microbenchmark() {
     let sizes = sizes();
     let shapes = shapes();
     let indexes = indexes();
+    let orders = orders();
     let mut atoms = AtomTable::new();
 
     println!();
     println!("# beam_ets ordered_set-interior microbenchmark: B+-tree (OrderedSetInterior) vs sorted Vec (SortedOrderedInterior)");
-    println!("# keys are driven in a shuffled order (see `shuffled`); cells: ns per operation");
+    println!("# cells: ns per operation; keys are driven in each `order` (BEAM_ETS_BENCH_ORDER=shuffled|ascending|descending|all)");
     println!(
-        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "shape", "n", "index", "insert", "insert_new", "hit", "miss", "iter", "delete", "B/entry"
+        "{:<9} {:>9} {:<11} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "shape",
+        "n",
+        "order",
+        "index",
+        "insert",
+        "insert_new",
+        "hit",
+        "miss",
+        "iter",
+        "delete",
+        "B/entry"
     );
 
     for shape in shapes {
@@ -513,49 +637,39 @@ fn ordered_interior_microbenchmark() {
             let present = build_keys(shape, n, &mut atoms, 0);
             let missing = build_keys(shape, n, &mut atoms, n as u128);
             let fresh = build_keys(shape, n, &mut atoms, 2 * n as u128);
-            let present_keys = shuffled(&present.keys, 0x9E37_79B9_7F4A_7C15);
-            let missing_keys = shuffled(&missing.keys, 0x2545_F491_4F6C_DD1D);
-            let fresh_keys = shuffled(&fresh.keys, 0x6C07_8965_CA92_A6ED);
+            for &order in &orders {
+                let present_keys = arrange(order, &present.keys, &atoms, 0x9E37_79B9_7F4A_7C15);
+                let missing_keys = arrange(order, &missing.keys, &atoms, 0x2545_F491_4F6C_DD1D);
+                let fresh_keys = arrange(order, &fresh.keys, &atoms, 0x6C07_8965_CA92_A6ED);
 
-            let tree = indexes.measures_bplus().then(|| {
-                measure_best(
-                    OrderedSetInterior::new,
-                    &present_keys,
-                    &missing_keys,
-                    &fresh_keys,
-                    &atoms,
-                )
-            });
-            let sorted = indexes.measures_sorted().then(|| {
-                measure_best(
-                    SortedOrderedInterior::new,
-                    &present_keys,
-                    &missing_keys,
-                    &fresh_keys,
-                    &atoms,
-                )
-            });
+                let tree = indexes.measures_bplus().then(|| {
+                    measure_best(
+                        OrderedSetInterior::new,
+                        &present_keys,
+                        &missing_keys,
+                        &fresh_keys,
+                        &atoms,
+                    )
+                });
+                let sorted = indexes.measures_sorted().then(|| {
+                    measure_best(
+                        SortedOrderedInterior::new,
+                        &present_keys,
+                        &missing_keys,
+                        &fresh_keys,
+                        &atoms,
+                    )
+                });
 
-            if let Some(tree) = &tree {
-                print_row(shape, "bplus", n, tree);
-            }
-            if let Some(sorted) = &sorted {
-                print_row(shape, "sorted", n, sorted);
-            }
-            if let (Some(tree), Some(sorted)) = (&tree, &sorted) {
-                println!(
-                    "{:<9} {:>9} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
-                    shape.name(),
-                    n,
-                    "sorted/tree",
-                    ratio(sorted.insert_ns, tree.insert_ns),
-                    ratio(sorted.insert_new_ns, tree.insert_new_ns),
-                    ratio(sorted.hit_ns, tree.hit_ns),
-                    ratio(sorted.miss_ns, tree.miss_ns),
-                    ratio(sorted.iter_ns, tree.iter_ns),
-                    ratio(sorted.delete_ns, tree.delete_ns),
-                    ratio(sorted.bytes_per_entry, tree.bytes_per_entry),
-                );
+                if let Some(tree) = &tree {
+                    print_ordered_row(shape, order, "bplus", n, tree);
+                }
+                if let Some(sorted) = &sorted {
+                    print_ordered_row(shape, order, "sorted", n, sorted);
+                }
+                if let (Some(tree), Some(sorted)) = (&tree, &sorted) {
+                    print_ordered_ratio(shape, order, n, sorted, tree);
+                }
             }
         }
     }
