@@ -278,10 +278,42 @@ impl<'a> RuntimeContext<'a> {
     /// The `fun`-taking `lists`/`maps` BIFs (`lists:map/2`, `lists:foldl/3`, `maps:map/2`,
     /// …) take the fun they apply as a **direct argument** and call it back through
     /// [`FunBridge`]; a BIF with no fun argument never re-enters. [`Self::call_registered`]
-    /// uses this to decide whether it may hold the shared ETS cell for the call (see the
-    /// limitation documented there).
+    /// uses this — together with [`Self::tables_capable`] — to decide whether it may hold the
+    /// shared ETS cell for the call (see the limitation documented there).
     pub(super) fn reentrancy_capable(args: &[Eterm]) -> bool {
         args.iter().any(|arg| terms::is_fun(*arg))
+    }
+
+    /// Whether `(module, function, arity)` is a registered BIF whose body reads the
+    /// `TableRegistry` seam — i.e. a key that resolves a table handle through
+    /// `BifContext::tables()`.
+    ///
+    /// [`Self::call_registered`] combines this with [`Self::reentrancy_capable`]: a
+    /// **reentrant** call normally leaves the shared ETS cell free so a fun it applies can
+    /// re-enter and reach `ets:*`, but a reentrant call that *itself* reads the seam must hold
+    /// the cell or the BIF's `ctx.tables()` is `None` and it raises the typed `unsupported_bif`.
+    /// The set is derived from the seam's consumers in `beam_bifs` (`src/ets*.rs`) and is not
+    /// invented:
+    ///
+    /// * **every registered `ets:*` verb** — `src/ets.rs` and its children
+    ///   (`ets/{adopt,extra,matches,nav,resolve,reverse,specs}.rs`) resolve their handle through
+    ///   `resolve_handle`/`take_table_gated`, and every one of those reads `ctx.tables()`; and
+    /// * **the two `erts_internal` raw-walk keys** (`ets_raw_first/1`, `ets_raw_next/2`), which
+    ///   the C declares as plain aliases of `ets:first/1`/`ets:next/2` and which `beam_bifs`
+    ///   implements by *delegating* into that same `ets` family — so they read the seam too.
+    ///
+    /// Only the two fun-folds (`ets:foldl/3`, `ets:foldr/3` — the ETS members of
+    /// [`beam_bifs::FUN_CALLER_BIFS`]) are both reentrant *and* on this set, which is exactly
+    /// the pair that was unreachable before the cell was installed for them.
+    pub(super) fn tables_capable(module: &str, function: &str, arity: u32) -> bool {
+        if module == "ets" {
+            return true;
+        }
+        // The only non-`ets` keys that read the same seam: the C's raw first/next aliases.
+        matches!(
+            (module, function, arity),
+            ("erts_internal", "ets_raw_first", 1) | ("erts_internal", "ets_raw_next", 2)
+        )
     }
 
     /// Whether `(module, function, arity)` is `erlang:load_nif/2`, which must run against the

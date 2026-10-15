@@ -250,6 +250,102 @@ fn a_nested_call_without_a_fun_still_sees_the_outer_tables() {
 }
 
 #[test]
+fn ets_foldl_reaches_the_shared_tables_with_a_fun_argument() {
+    let mut rt = runtime();
+    // `ets:foldl/3`/`ets:foldr/3` are the only fun-taking `ets:*` BIFs (`beam_bifs`'
+    // `FUN_CALLER_BIFS` intersected with the `ets` namespace): they resolve the table out of
+    // the shared `TableRegistry`, so `call_registered` must install the cell even though the
+    // call is re-entrancy-capable. Before that, these calls raised `unsupported: bif`.
+    //
+    // An `ordered_set` is used so the traversal order is exact (ascending keys) and the
+    // comparison is deterministic; a hash `set`'s iteration order is a documented *interior*
+    // freedom of `beam_ets`, so a fold over one is order-insensitive by construction.
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X}) || X <- [1,2,3,4]], \
+             ets:foldl(fun(X, A) -> element(2, X) + A end, 0, T) end",
+        )
+        .expect("ets:foldl/3 applies its fun and folds the table left-to-right");
+    assert_eq!(signed_value(term), 10, "1+2+3+4");
+}
+
+#[test]
+fn ets_foldr_reaches_the_shared_tables_with_a_fun_argument() {
+    let mut rt = runtime();
+    // As above, but the right-to-left direction: an `ordered_set` is walked keys-descending,
+    // so prepending each object yields the ascending list — the oracle's own answer.
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X}) || X <- [1,2,3,4]], \
+             ets:foldr(fun(X, A) -> [element(2, X) | A] end, [], T) end",
+        )
+        .expect("ets:foldr/3 applies its fun and folds the table right-to-left");
+    let printed = rt
+        .format_term(term, None)
+        .expect("~p renders the folded list");
+    assert_eq!(printed.trim_end(), "[1,2,3,4]");
+}
+
+#[test]
+fn ets_fold_over_an_empty_table_answers_the_accumulator_without_calling_the_fun() {
+    let mut rt = runtime();
+    // The oracle's `do_foldl`/`do_foldr` answer `Accu` for `'$end_of_table'` without ever
+    // applying the fun, so a completely unvalidated (0-arity) fun is accepted on an empty
+    // table — the probe is that this must not raise `badarity`.
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [set]), \
+             {ets:foldl(fun() -> never end, acc0, T), \
+              ets:foldr(fun() -> never end, acc1, T)} end",
+        )
+        .expect("an empty fold returns the accumulator and never calls the fun");
+    let printed = rt
+        .format_term(term, None)
+        .expect("~p renders the two accumulators");
+    assert_eq!(printed.trim_end(), "{acc0,acc1}");
+}
+
+#[test]
+fn ets_inside_a_lists_map_fun_still_reaches_the_shared_tables() {
+    let mut rt = runtime();
+    // The re-entrancy guard is unweakened: `lists:map/2` reads no `TableRegistry`, so it
+    // installs no ETS cell and the `ets:lookup/2` its fun performs borrows the free cell and
+    // resolves. A blanket "install the cell for every re-entrant call" would break this.
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [set]), ets:insert(T, {k, 1}), \
+             lists:map(fun(X) -> ets:lookup(T, X) end, [k]) end",
+        )
+        .expect("ets:lookup inside a fun applied by lists:map/2");
+    let printed = rt.format_term(term, None).expect("~p renders the lookup");
+    assert_eq!(printed.trim_end(), "[[{k,1}]]");
+}
+
+#[test]
+fn tables_capable_names_exactly_the_table_registry_seam_consumers() {
+    // The two fun-folds: the only reentrant keys on the set, and the reason the cell is now
+    // installed for a reentrant call at all.
+    assert!(RuntimeContext::tables_capable("ets", "foldl", 3));
+    assert!(RuntimeContext::tables_capable("ets", "foldr", 3));
+    // The whole `ets` namespace resolves its handle through `ctx.tables()`.
+    assert!(RuntimeContext::tables_capable("ets", "new", 2));
+    assert!(RuntimeContext::tables_capable("ets", "lookup", 2));
+    // The two `erts_internal` raw-walk aliases delegate into the `ets` family.
+    assert!(RuntimeContext::tables_capable("erts_internal", "ets_raw_first", 1));
+    assert!(RuntimeContext::tables_capable("erts_internal", "ets_raw_next", 2));
+    // A fun-applying BIF that does NOT read the seam must not be gated on it — that is what
+    // keeps `lists:map(fun(X) -> ets:lookup(T, X) end, L)` working.
+    assert!(!RuntimeContext::tables_capable("lists", "map", 2));
+    assert!(!RuntimeContext::tables_capable("maps", "map", 2));
+    assert!(!RuntimeContext::tables_capable("lists", "foldl", 3));
+    // Near misses on the `erts_internal` aliases fall back to the `ets`-namespace test.
+    assert!(!RuntimeContext::tables_capable("erts_internal", "ets_raw_first", 2));
+    assert!(!RuntimeContext::tables_capable("erts_internal", "ets_raw_next", 1));
+}
+
+#[test]
 fn the_arena_is_unbounded_in_milestone_one() {
     let mut rt = runtime();
     let mut ctx = RuntimeContext::new(&mut rt);
