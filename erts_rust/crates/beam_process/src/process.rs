@@ -749,15 +749,17 @@ impl Process {
             Some(slot) => slot,
             None => {
                 let slot = self.owned_binaries.insert(OffHeapEntry::Binary(binary));
-                self.owned_binary_index.insert(data_ptr, slot);
-                self.owned_binary_slots = slot + 1;
-                // `beam_gc::OffHeap::insert` only ever appends, so a fresh slot is exactly the slot
-                // space's last index: the mirror tracks the slot count across sweeps.
+                // `beam_gc::OffHeap` is append-only and marks a released slot in place (it never
+                // removes or reorders entries), so `entries.len() - 1` — the slot a fresh insert
+                // hands out — is exactly the slot space's next index, i.e. the mirror's value
+                // **before** this insert bumps it. Compare against that pre-insert mirror, not
+                // against the value just written below.
                 debug_assert_eq!(
-                    slot + 1,
-                    self.owned_binary_slots,
+                    slot, self.owned_binary_slots,
                     "a fresh insert hands out the slot space's next index"
                 );
+                self.owned_binary_index.insert(data_ptr, slot);
+                self.owned_binary_slots = slot + 1;
                 slot
             }
         }
@@ -2257,14 +2259,19 @@ mod tests {
     /// has ever handed out (live *or* released), so re-registering a set of payloads costs exactly
     /// what registering them the first time cost.
     ///
-    /// The `registration_probes` counter records one unit per `data_ptr → slot` resolution inside
-    /// [`Process::register_off_heap_binary`] — a single lookup in `Process::owned_binary_index`. The
+    /// The `registration_probes` counter records the **per-call work of one `data_ptr → slot`
+    /// resolution** inside [`Process::register_off_heap_binary`] — in the index path exactly one
+    /// unit per call, because a resolution is a single keyed lookup in
+    /// `Process::owned_binary_index` and therefore considers exactly one slot candidate. The
     /// **old** implementation resolved through `owned_binary_slot`'s
-    /// `(0..owned_binary_slots).find(...)`, which probed one unit per **candidate** it examined: the
-    /// scan is `O(slots)`, and the slot space grows monotonically with successful registrations, so
-    /// batch 1 (each call a miss over an ever-larger space) probed `0 + 1 + … + (N-1)` units and
-    /// batch 2 — with all `N` slots now live — probed an `O(N)` prefix per call (≈`N²/2`), never
-    /// equal to batch 1. With the index every call probes exactly once, so both batches probe `N`.
+    /// `(0..owned_binary_slots).find(...)`, whose per-call work is one candidate examined per slot
+    /// in the space, so the honest per-candidate count for a call over `S` slots (`S` = that call's
+    /// pre-insert mirror: the slot space grows monotonically with successful registrations) is
+    /// `O(S)`. Counting the old code that way would make batch 1 (each call a miss over an
+    /// ever-larger space) probe `0 + 1 + … + (N-1)` units and batch 2 — all `N` slots live — probe
+    /// an `O(N)` prefix per call (≈`N²/2`), so `batch2` would be far larger than `batch1`; that is
+    /// exactly the inequality the `batch2 == batch1` assertion rejects. With the index every call
+    /// probes exactly once, so both batches probe `N`.
     #[test]
     fn off_heap_binary_registration_work_is_independent_of_slot_count() {
         const N: usize = 1000;
