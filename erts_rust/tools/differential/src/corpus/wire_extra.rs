@@ -601,6 +601,115 @@ pub(crate) fn group() -> Vec<Case> {
         // REFERENCE_EXT (101) -> NEWER_REFERENCE_EXT (90) re-encode ------------------------
         v("wire_extra/exp_id_node_of_external_pid", "erlang:node/1 of a decoded remote NEW_PID_EXT (88) names the node atom that image carries", "node(binary_to_term(<<131,88,119,7,102,111,111,64,98,97,114,0,0,0,10,0,0,0,0,0,0,0,0>>))", "ok foo@bar"),
         v("wire_extra/exp_id_reference_ext_rereencode_bytes", "a legacy REFERENCE_EXT (101) blob decodes and re-encodes as the equivalent NEWER_REFERENCE_EXT (90) image", "term_to_binary(binary_to_term(<<131,101,119,7,102,111,111,64,98,97,114,0,0,0,1,0>>))", "ok <<131,90,0,1,119,7,102,111,111,64,98,97,114,0,0,0,0,0,0,0,1>>"),
+        // -- `term_to_binary/2` `{minor_version, N}`: the dialect's effect on the tag set --
+        // `N >= 2` writes the UTF-8 atom tags (`SMALL_ATOM_UTF8_EXT` 119 / `ATOM_UTF8_EXT`
+        // 118) and `NEW_FLOAT_EXT` (70); `N <= 1` writes the legacy `ATOM_EXT` (100) /
+        // ASCII `FLOAT_EXT` (99) forms — **wherever** an atom or float sits, including a
+        // map's keys and a list's elements. Every other tag is untouched by the dialect,
+        // so the pid/port/reference/bignum/binary images are unchanged. The byte goldens
+        // below pin the atom-tag switch; the identity cases pin the tags it must NOT move.
+        v("wire_extra/mv2_atom_utf8_bytes", "{minor_version,2} encodes a small atom as SMALL_ATOM_UTF8_EXT (119)", "term_to_binary(hello, [{minor_version, 2}])", "ok <<131,119,5,104,101,108,108,111>>"),
+        v("wire_extra/mv1_map_legacy_atom_key_bytes", "{minor_version,1} encodes a map's atom key as the legacy ATOM_EXT (100)", "term_to_binary(#{a => 1}, [{minor_version, 1}])", "ok <<131,116,0,0,0,1,100,0,1,97,97,1>>"),
+        v("wire_extra/mv0_map_legacy_atom_key_bytes", "{minor_version,0} also encodes a map's atom key as the legacy ATOM_EXT (100)", "term_to_binary(#{a => 1}, [{minor_version, 0}])", "ok <<131,116,0,0,0,1,100,0,1,97,97,1>>"),
+        v("wire_extra/mv0_list_legacy_atom_bytes", "{minor_version,0} encodes a list of atoms with legacy ATOM_EXT (100) elements", "term_to_binary([a,b],[{minor_version,0}])", "ok <<131,108,0,0,0,2,100,0,1,97,100,0,1,98,106>>"),
+        v("wire_extra/mv1_list_legacy_atom_bytes", "{minor_version,1} also encodes a list's atoms as legacy ATOM_EXT (100)", "term_to_binary([a,b],[{minor_version,1}])", "ok <<131,108,0,0,0,2,100,0,1,97,100,0,1,98,106>>"),
+        v("wire_extra/mv2_list_utf8_atom_bytes", "{minor_version,2} encodes a list's atoms as SMALL_ATOM_UTF8_EXT (119)", "term_to_binary([a,b],[{minor_version,2}])", "ok <<131,108,0,0,0,2,119,1,97,119,1,98,106>>"),
+        v("wire_extra/mv1_nonlatin_atom_bytes", "{minor_version,1} keeps a non-latin1 atom's UTF-8 bytes under SMALL_ATOM_UTF8_EXT (119)", "term_to_binary(list_to_atom([945]), [{minor_version, 1}])", "ok <<131,119,2,206,177>>"),
+        t("wire_extra/mv0_bignum_identity", "minor_version 0 leaves a bignum image unchanged", "begin T = 12345678901234567890, term_to_binary(T,[{minor_version,0}]) =:= term_to_binary(T) end", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/mv0_binary_identity", "minor_version 0 leaves a binary image unchanged", "begin B = <<1,2,3>>, term_to_binary(B,[{minor_version,0}]) =:= term_to_binary(B) end", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/mv2_ref_identity", "minor_version 2 leaves a local reference image unchanged", "begin Rf = make_ref(), term_to_binary(Rf,[{minor_version,2}]) =:= term_to_binary(Rf) end", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/mv2_external_pid_identity", "minor_version 2 leaves an external pid image unchanged", "begin P = binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>), term_to_binary(P,[{minor_version,2}]) =:= term_to_binary(P) end", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/mv2_internal_port_identity", "minor_version 2 leaves an internal port image unchanged", "begin P = open_port({spawn,\"cat\"},[binary]), Same = (term_to_binary(P,[{minor_version,2}]) =:= term_to_binary(P)), port_close(P), Same end", "ok <<131,119,4,116,114,117,101>>"),
+        // -- `term_to_binary/2` option refusal matrix + the framing identities -----------
+        // Each option is validated before the term is encoded: an out-of-range or
+        // mistyped `{minor_version, _}` / `{compressed, _}`, a wrapped option, and a
+        // wrong-shaped option list are all `badarg`. A repeated option is last-wins, and
+        // the COMPRESSED (80) header's declared 32-bit size is the *body* size (the plain
+        // image minus `VERSION_MAGIC`), which is pinned as a `{Declared, Plain}` pair —
+        // the zlib middle stays unpinned because each encoder chooses its own bytes.
+        verr("wire_extra/err_t2b_minor_version_three_badarg", "{minor_version,3} is above the supported maximum (2)", "term_to_binary(1,[{minor_version,3}])"),
+        verr("wire_extra/err_t2b_minor_version_negative_badarg", "a negative {minor_version,-1} is badarg", "term_to_binary(1,[{minor_version,-1}])"),
+        verr("wire_extra/err_t2b_minor_version_float_badarg", "a float {minor_version,1.0} is badarg", "term_to_binary(1,[{minor_version,1.0}])"),
+        verr("wire_extra/err_t2b_compressed_level_ten_badarg", "{compressed,10} is above the zlib maximum (9)", "term_to_binary(1,[{compressed,10}])"),
+        verr("wire_extra/err_t2b_compressed_level_negative_badarg", "a negative {compressed,-1} is badarg", "term_to_binary(1,[{compressed,-1}])"),
+        verr("wire_extra/err_t2b_compressed_level_float_badarg", "a float {compressed,1.0} is badarg", "term_to_binary(1,[{compressed,1.0}])"),
+        verr("wire_extra/err_t2b_option_not_list_badarg", "term_to_binary/2 with a non-list option is badarg", "term_to_binary(1,bogus)"),
+        verr("wire_extra/err_t2b_unknown_option_badarg", "an unknown term_to_binary/2 option is badarg", "term_to_binary(1,[bogus])"),
+        verr("wire_extra/err_t2b_option_nested_list_badarg", "a wrapped option ({minor_version,1} inside a list) is badarg", "term_to_binary(1,[[minor_version,1]])"),
+        verr("wire_extra/err_t2b_minor_version_missing_value_badarg", "{minor_version} with no value is badarg", "term_to_binary(1,[{minor_version}])"),
+        verr("wire_extra/err_t2b_minor_version_arity_badarg", "a three-element {minor_version,1,2} option is badarg", "term_to_binary(1,[{minor_version,1,2}])"),
+        v("wire_extra/opt_option_repeat_last_wins", "a repeated option keeps the last occurrence", "begin T = hello, term_to_binary(T,[{minor_version,0},{minor_version,2}]) =:= term_to_binary(T,[{minor_version,2}]) end", "ok true"),
+        v("wire_extra/opt_option_repeat_last_wins_bytes", "the last repeated minor_version wins, so the atom uses the UTF-8 tag", "term_to_binary(hello,[{minor_version,0},{minor_version,2}])", "ok <<131,119,5,104,101,108,108,111>>"),
+        v("wire_extra/opt_compressed_declared_size_pair", "the COMPRESSED (80) header declares the uncompressed body size (one less than the plain image) for a 1000-atom list", "begin T = lists:duplicate(1000, a), U = byte_size(term_to_binary(T)), <<131,80,Sz:32,_/binary>> = term_to_binary(T,[compressed]), {Sz, U} end", "ok {3006,3007}"),
+        v("wire_extra/opt_compressed_declared_size_pair_binary", "the COMPRESSED (80) header declares the uncompressed body size for a 5000-byte binary", "begin T = binary:copy(<<0>>,5000), U = byte_size(term_to_binary(T)), <<131,80,Sz:32,_/binary>> = term_to_binary(T,[compressed]), {Sz, U} end", "ok {5005,5006}"),
+        t("wire_extra/opt_compressed_level_zero_roundtrip", "the {compressed,0} option round-trips a 2000-byte body", "binary_to_term(term_to_binary(lists:seq(1,2000),[{compressed,0}])) =:= lists:seq(1,2000)", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/opt_compressed_level_two_roundtrip", "the {compressed,2} option round-trips a 2000-byte body", "binary_to_term(term_to_binary(lists:seq(1,2000),[{compressed,2}])) =:= lists:seq(1,2000)", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/opt_compressed_level_six_roundtrip", "the {compressed,6} option round-trips a 2000-byte body", "binary_to_term(term_to_binary(lists:seq(1,2000),[{compressed,6}])) =:= lists:seq(1,2000)", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/opt_compressed_body_binary_roundtrip", "a 5000-byte all-zero binary round-trips through the compressed option", "binary_to_term(term_to_binary(binary:copy(<<0>>,5000),[compressed])) =:= binary:copy(<<0>>,5000)", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/opt_compressed_body_atom_list_roundtrip", "a 300-element repeated-atom list round-trips through the compressed option", "binary_to_term(term_to_binary(lists:duplicate(300,alpha),[compressed])) =:= lists:duplicate(300,alpha)", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/opt_compressed_body_map_roundtrip", "a 50-key integer map round-trips through the compressed option", "binary_to_term(term_to_binary(maps:from_list([{I, I*I} || I <- lists:seq(1,50)]),[compressed])) =:= maps:from_list([{I, I*I} || I <- lists:seq(1,50)])", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/opt_compressed_mv1_roundtrip", "the [compressed, {minor_version,1}] pair round-trips a 500-element list", "binary_to_term(term_to_binary(lists:seq(1,500),[compressed,{minor_version,1}])) =:= lists:seq(1,500)", "ok <<131,119,4,116,114,117,101>>"),
+        v("wire_extra/opt_compressed_mv1_differs_from_mv2", "the [compressed, {minor_version,1}] image of an atom list differs from the [compressed, {minor_version,2}] image", "begin T = lists:duplicate(500, alpha), term_to_binary(T,[compressed,{minor_version,1}]) =/= term_to_binary(T,[compressed,{minor_version,2}]) end", "ok true"),
+        // -- `binary_to_term/2` over those images: the `[safe]` / `[used]` inverse --------
+        v("wire_extra/b2t_used_mv1_atom_bytes", "[used] on a {minor_version,1} atom image reports the atom and its 9 consumed bytes", "binary_to_term(term_to_binary(hello,[{minor_version,1}]),[used])", "ok {hello,9}"),
+        v("wire_extra/b2t_safe_used_mv1_atom_bytes", "[safe,used] on a {minor_version,1} atom image reports the atom and its 9 consumed bytes", "binary_to_term(term_to_binary(hello,[{minor_version,1}]),[safe,used])", "ok {hello,9}"),
+        v("wire_extra/b2t_safe_export_fun_image", "[safe] accepts an EXPORT_EXT (113) external-fun image", "binary_to_term(term_to_binary(fun lists:reverse/1), [safe])", "ok fun lists:reverse/1"),
+        t("wire_extra/b2t_safe_export_fun_is_function1", "[safe] on an external-fun image yields a callable fun of arity 1", "is_function(binary_to_term(term_to_binary(fun lists:reverse/1), [safe]), 1)", "ok <<131,119,4,116,114,117,101>>"),
+        v("wire_extra/b2t_safe_export_fun_call", "[safe] on an external-fun image yields a fun that calls through", "begin F = binary_to_term(term_to_binary(fun lists:reverse/1), [safe]), F([1,2,3]) end", "ok [3,2,1]"),
+        t("wire_extra/b2t_used_compressed_bytes_is_full_image", "[used] over a compressed image reports the whole image's byte count", "begin T = lists:duplicate(200, 122), B = term_to_binary(T,[compressed]), {T2,U} = binary_to_term(B,[used]), (T2 =:= T) andalso (U =:= byte_size(B)) end", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/b2t_safe_external_pid_image_accept", "[safe] accepts an external NEW_PID_EXT (88) image", "is_pid(binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>, [safe]))", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/b2t_safe_external_ref_image_accept", "[safe] accepts an external NEWER_REFERENCE_EXT (90) image", "is_reference(binary_to_term(<<131,90,0,1,119,5,111,116,104,101,114,0,0,0,0,0,2,35,202,0,0,0,7>>, [safe]))", "ok <<131,119,4,116,114,117,101>>"),
+        v("wire_extra/b2t_empty_options_same_as_one_arg", "binary_to_term/2 with an empty option list behaves as binary_to_term/1", "binary_to_term(<<131,97,1>>, [])", "ok 1"),
+        verr("wire_extra/err_b2t_option_not_list_badarg", "binary_to_term/2 with a non-list option is badarg", "binary_to_term(<<131,97,1>>, used)"),
+        // -- decode-side tag gaps: the shapes an encode-only case never emits ------------
+        // The 64-bit id of a `V4_PORT_EXT` (120) and the 32-bit id of a `NEW_PORT_EXT` (89)
+        // (see the decoder in `external.c`), the tiny-creation ceiling of the legacy
+        // `PORT_EXT` (102) / `PID_EXT` (103) / `REFERENCE_EXT` (101) forms (they upgrade on
+        // re-encode to the modern tag), the ignored bytes after a declared id count, the
+        // `LIST_EXT` integer tail, a `STRING_EXT` byte above 127, and the `BIT_BINARY_EXT`
+        // (77) bit-count bounds.
+        v("wire_extra/dec_list_ext_zero_elements_int_tail", "a LIST_EXT (108) with zero elements and an integer tail decodes to that integer", "binary_to_term(<<131,108,0,0,0,0,97,9>>)", "ok 9"),
+        v("wire_extra/dec_string_ext_byte_200", "a STRING_EXT (107) byte above 127 decodes to that code point", "binary_to_term(<<131,107,0,1,200>>)", "ok [200]"),
+        t("wire_extra/dec_string_ext_abc_is_string", "a STRING_EXT (107) body decodes to a list of the same code points", "binary_to_term(<<131,107,0,3,97,98,99>>) =:= [97,98,99]", "ok <<131,119,4,116,114,117,101>>"),
+        v("wire_extra/dec_newer_reference_declared_five_ignores_trailing_sixth", "a NEWER_REFERENCE_EXT (90) declaring five ids re-encodes the five ids and ignores a trailing sixth", "term_to_binary(binary_to_term(<<131,90,0,5,119,5,111,116,104,101,114,0,0,0,0,0,2,35,202,0,0,0,1,0,0,0,2,0,0,0,3,0,0,0,4,0,0,0,5>>))", "ok <<131,90,0,5,119,5,111,116,104,101,114,0,0,0,0,0,2,35,202,0,0,0,1,0,0,0,2,0,0,0,3,0,0,0,4>>"),
+        t("wire_extra/dec_newer_reference_declared_five_rereencode_size", "the five-id NEWER_REFERENCE_EXT re-encode is 35 bytes", "byte_size(term_to_binary(binary_to_term(<<131,90,0,5,119,5,111,116,104,101,114,0,0,0,0,0,2,35,202,0,0,0,1,0,0,0,2,0,0,0,3,0,0,0,4,0,0,0,5>>)))", "ok <<131,97,35>>"),
+        v("wire_extra/dec_new_pid_ext_creation_three_rereencode", "a NEW_PID_EXT (88) with creation 3 re-encodes byte-identically", "term_to_binary(binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>))", "ok <<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>"),
+        t("wire_extra/dec_new_pid_ext_creation_four_is_pid", "a NEW_PID_EXT (88) with the 32-bit creation field 4 decodes to a pid", "is_pid(binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,4>>))", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/dec_new_pid_ext_serial_256_is_pid", "a NEW_PID_EXT (88) with serial 256 decodes to a pid", "is_pid(binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,1,0,0,0,0,3>>))", "ok <<131,119,4,116,114,117,101>>"),
+        t("wire_extra/dec_new_pid_ext_max_id_is_pid", "a NEW_PID_EXT (88) with the largest 32-bit id and serial decodes to a pid", "is_pid(binary_to_term(<<131,88,119,5,111,116,104,101,114,255,255,255,255,255,255,255,255,0,0,0,3>>))", "ok <<131,119,4,116,114,117,101>>"),
+        v("wire_extra/dec_legacy_pid_ext_creation_three_upgrades", "a legacy PID_EXT (103) with creation 3 re-encodes as NEW_PID_EXT (88)", "term_to_binary(binary_to_term(<<131,103,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,3>>))", "ok <<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>"),
+        v("wire_extra/dec_legacy_port_ext_creation_three_upgrades", "a legacy PORT_EXT (102) with creation 3 (the tiny creation ceiling) re-encodes as V4_PORT_EXT (120)", "term_to_binary(binary_to_term(<<131,102,119,5,111,116,104,101,114,0,0,0,7,3>>))", "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,0,3>>"),
+        v("wire_extra/dec_legacy_reference_ext_creation_three_upgrades", "a legacy REFERENCE_EXT (101) with creation 3 re-encodes as NEWER_REFERENCE_EXT (90)", "term_to_binary(binary_to_term(<<131,101,119,5,111,116,104,101,114,0,0,0,7,3>>))", "ok <<131,90,0,1,119,5,111,116,104,101,114,0,0,0,3,0,0,0,7>>"),
+        t("wire_extra/dec_newer_port_ext_v4_creation_256_is_port", "a V4_PORT_EXT (120) with a 64-bit id and a 32-bit creation of 256 decodes to a port", "is_port(binary_to_term(<<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,1,0>>))", "ok <<131,119,4,116,114,117,101>>"),
+        v("wire_extra/dec_newer_port_ext_v4_rereencode", "a V4_PORT_EXT (120) with a 64-bit id re-encodes byte-identically", "term_to_binary(binary_to_term(<<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,1,0>>))", "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,1,0>>"),
+        t("wire_extra/dec_new_port_ext_creation_256_is_port", "a NEW_PORT_EXT (89) with a 32-bit id and creation 256 decodes to a port", "is_port(binary_to_term(<<131,89,119,5,111,116,104,101,114,0,0,0,7,0,0,1,0>>))", "ok <<131,119,4,116,114,117,101>>"),
+        v("wire_extra/dec_new_port_ext_creation_three_upgrades_to_v4", "a NEW_PORT_EXT (89) with creation 3 re-encodes as V4_PORT_EXT (120)", "term_to_binary(binary_to_term(<<131,89,119,5,111,116,104,101,114,0,0,0,7,0,0,0,3>>))", "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,0,3>>"),
+        v("wire_extra/dec_bit_binary_ext_eight_bits_is_binary", "a BIT_BINARY_EXT (77) declaring 8 bits decodes to a byte-aligned binary", "binary_to_term(<<131,77,0,0,0,1,8,0>>)", "ok <<0>>"),
+        verr("wire_extra/err_bit_binary_ext_nine_bits_badarg", "a BIT_BINARY_EXT (77) declaring 9 bits is badarg", "binary_to_term(<<131,77,0,0,0,1,9,0>>)"),
+        verr("wire_extra/err_bit_binary_ext_zero_bits_badarg", "a BIT_BINARY_EXT (77) declaring 0 bits is badarg", "binary_to_term(<<131,77,0,0,0,1,0,0>>)"),
+        verr("wire_extra/err_small_atom_utf8_invalid_badarg", "a SMALL_ATOM_UTF8_EXT (119) body that is not valid UTF-8 is badarg", "binary_to_term(<<131,119,2,206,64>>)"),
+        verr("wire_extra/err_atom_utf8_invalid_badarg", "an ATOM_UTF8_EXT (118) body that is not valid UTF-8 is badarg", "binary_to_term(<<131,118,0,2,206,64>>)"),
+        // -- the remaining `DOP_*` control-message tags --------------------------------
+        // `dist.h`'s `enum dop` assigns 1-8 to the classic operations, 12/13/16/18 to the
+        // trace-token variants, 19-24 to the monitor / sender / payload-exit family, and
+        // 29-37 to the spawn-request / alias-send / unlink-id / altact-signal operations.
+        // The members pinned above cover 1-8, 12, 13, 16, 18-24 and 29; these cases close
+        // the remaining 25-28 and 30-37. A control tuple is *just an ETF term* here (a live
+        // handshake needs two connected nodes — see the module docs), so every payload is
+        // chosen from small integers, atoms and the (deterministic) local node atom; the
+        // byte/2-tuple goldens pin the tag and the tuple encoding.
+        v("wire_extra/dist_payload_exit_tt_tag_25_bytes", "the DOP_PAYLOAD_EXIT_TT (25) control tuple round-trips with the node atoms and atom payloads", "{25, node(), node(), normal, hello}", "ok {25,nonode@nohost,nonode@nohost,normal,hello}"),
+        v("wire_extra/dist_payload_exit2_tag_26_bytes", "the DOP_PAYLOAD_EXIT2 (26) control tuple round-trips with the node atoms and atom payloads", "{26, node(), node(), normal, hello}", "ok {26,nonode@nohost,nonode@nohost,normal,hello}"),
+        v("wire_extra/dist_payload_exit2_tt_tag_27_bytes", "the DOP_PAYLOAD_EXIT2_TT (27) control tuple round-trips with the node atoms and atom payloads", "{27, node(), node(), normal, hello}", "ok {27,nonode@nohost,nonode@nohost,normal,hello}"),
+        v("wire_extra/dist_payload_monitor_p_exit_tag_28_bytes", "the DOP_PAYLOAD_MONITOR_P_EXIT (28) control tuple round-trips with the node atoms and atom payloads", "{28, node(), node(), node(), noproc, hello}", "ok {28,nonode@nohost,nonode@nohost,nonode@nohost,noproc,hello}"),
+        v("wire_extra/dist_spawn_request_tt_tag_30_bytes", "the DOP_SPAWN_REQUEST_TT (30) control tuple round-trips with the node atoms and atom payloads", "{30, node(), node(), normal, hello, world, token}", "ok {30,nonode@nohost,nonode@nohost,normal,hello,world,token}"),
+        v("wire_extra/dist_spawn_reply_tag_31_tag_and_size", "the DOP_SPAWN_REPLY (31) control tuple keeps its tag and its arity", "{element(1, {31, node(), node(), normal}), tuple_size({31, node(), node(), normal})}", "ok {31,4}"),
+        v("wire_extra/dist_spawn_reply_tt_tag_32_tag_and_size", "the DOP_SPAWN_REPLY_TT (32) control tuple keeps its tag and its arity", "{element(1, {32, node(), node(), normal, token}), tuple_size({32, node(), node(), normal, token})}", "ok {32,5}"),
+        v("wire_extra/dist_alias_send_tag_33_bytes", "the DOP_ALIAS_SEND (33) control tuple round-trips with the node atoms and atom payloads", "{33, node(), node(), hello}", "ok {33,nonode@nohost,nonode@nohost,hello}"),
+        v("wire_extra/dist_alias_send_tt_tag_34_tag_and_size", "the DOP_ALIAS_SEND_TT (34) control tuple keeps its tag and its arity", "{element(1, {34, node(), node(), hello, token}), tuple_size({34, node(), node(), hello, token})}", "ok {34,5}"),
+        v("wire_extra/dist_unlink_id_tag_35_bytes", "the DOP_UNLINK_ID (35) control tuple round-trips with the node atoms and atom payloads", "{35, node(), node(), someid}", "ok {35,nonode@nohost,nonode@nohost,someid}"),
+        v("wire_extra/dist_unlink_id_ack_tag_36_bytes", "the DOP_UNLINK_ID_ACK (36) control tuple round-trips with the node atoms and atom payloads", "{36, node(), node(), someid}", "ok {36,nonode@nohost,nonode@nohost,someid}"),
+        v("wire_extra/dist_altact_sig_send_tag_37_tag_and_size", "the DOP_ALTACT_SIG_SEND (37) control tuple keeps its tag and its arity", "{element(1, {37, node(), node(), normal}), tuple_size({37, node(), node(), normal})}", "ok {37,4}"),
     ]
 }
 
@@ -960,6 +1069,130 @@ mod tests {
                 .iter()
                 .find(|c| c.id == id)
                 .unwrap_or_else(|| panic!("expected the widened-wire error case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some("exception error badarg"),
+                "case {id} must carry the oracle-derived badarg golden"
+            );
+            assert_eq!(case.golden.exit_code, 1, "case {id} golden must exit 1");
+        }
+    }
+
+    #[test]
+    fn wire_extra_covers_the_widened_options_decode_and_control_families() {
+        let cases = group();
+        // The third widened A.5 block: the `{minor_version, N}` dialect's effect on the tag
+        // set (UTF-8 atom tags above `N >= 2` vs the legacy `ATOM_EXT` form below), the
+        // `term_to_binary/2` option refusal matrix, the compressed-body round trips and the
+        // COMPRESSED (80) declared-size pairs, the `binary_to_term/2` `[safe]`/`[used]`
+        // inverse, the decode-side tag gaps (the `LIST_EXT` integer tail, the `STRING_EXT`
+        // high byte, the id-field widths of `V4_PORT_EXT` (120) / `NEW_PORT_EXT` (89), the
+        // legacy tiny-creation forms upgrading on re-encode, and the `BIT_BINARY_EXT`
+        // bit-count bounds) and the remaining `DOP_*` control tuples 25-28 / 30-37. Every
+        // golden is the oracle's own line and the Rust runtime reproduces it (each case
+        // `agree`s); pin the ids and their goldens here so the agreements cannot regress
+        // silently.
+        for (id, golden) in [
+            ("wire_extra/b2t_empty_options_same_as_one_arg", "ok 1"),
+            ("wire_extra/b2t_safe_export_fun_call", "ok [3,2,1]"),
+            ("wire_extra/b2t_safe_export_fun_image", "ok fun lists:reverse/1"),
+            ("wire_extra/b2t_safe_export_fun_is_function1", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/b2t_safe_external_pid_image_accept", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/b2t_safe_external_ref_image_accept", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/b2t_safe_used_mv1_atom_bytes", "ok {hello,9}"),
+            ("wire_extra/b2t_used_compressed_bytes_is_full_image", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/b2t_used_mv1_atom_bytes", "ok {hello,9}"),
+            ("wire_extra/dec_bit_binary_ext_eight_bits_is_binary", "ok <<0>>"),
+            ("wire_extra/dec_legacy_pid_ext_creation_three_upgrades", "ok <<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>"),
+            ("wire_extra/dec_legacy_port_ext_creation_three_upgrades", "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,0,3>>"),
+            ("wire_extra/dec_legacy_reference_ext_creation_three_upgrades", "ok <<131,90,0,1,119,5,111,116,104,101,114,0,0,0,3,0,0,0,7>>"),
+            ("wire_extra/dec_list_ext_zero_elements_int_tail", "ok 9"),
+            ("wire_extra/dec_new_pid_ext_creation_four_is_pid", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/dec_new_pid_ext_creation_three_rereencode", "ok <<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>"),
+            ("wire_extra/dec_new_pid_ext_max_id_is_pid", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/dec_new_pid_ext_serial_256_is_pid", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/dec_new_port_ext_creation_256_is_port", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/dec_new_port_ext_creation_three_upgrades_to_v4", "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,0,3>>"),
+            ("wire_extra/dec_newer_port_ext_v4_creation_256_is_port", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/dec_newer_port_ext_v4_rereencode", "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,1,0>>"),
+            ("wire_extra/dec_newer_reference_declared_five_ignores_trailing_sixth", "ok <<131,90,0,5,119,5,111,116,104,101,114,0,0,0,0,0,2,35,202,0,0,0,1,0,0,0,2,0,0,0,3,0,0,0,4>>"),
+            ("wire_extra/dec_newer_reference_declared_five_rereencode_size", "ok <<131,97,35>>"),
+            ("wire_extra/dec_string_ext_abc_is_string", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/dec_string_ext_byte_200", "ok [200]"),
+            ("wire_extra/dist_alias_send_tag_33_bytes", "ok {33,nonode@nohost,nonode@nohost,hello}"),
+            ("wire_extra/dist_alias_send_tt_tag_34_tag_and_size", "ok {34,5}"),
+            ("wire_extra/dist_altact_sig_send_tag_37_tag_and_size", "ok {37,4}"),
+            ("wire_extra/dist_payload_exit2_tag_26_bytes", "ok {26,nonode@nohost,nonode@nohost,normal,hello}"),
+            ("wire_extra/dist_payload_exit2_tt_tag_27_bytes", "ok {27,nonode@nohost,nonode@nohost,normal,hello}"),
+            ("wire_extra/dist_payload_exit_tt_tag_25_bytes", "ok {25,nonode@nohost,nonode@nohost,normal,hello}"),
+            ("wire_extra/dist_payload_monitor_p_exit_tag_28_bytes", "ok {28,nonode@nohost,nonode@nohost,nonode@nohost,noproc,hello}"),
+            ("wire_extra/dist_spawn_reply_tag_31_tag_and_size", "ok {31,4}"),
+            ("wire_extra/dist_spawn_reply_tt_tag_32_tag_and_size", "ok {32,5}"),
+            ("wire_extra/dist_spawn_request_tt_tag_30_bytes", "ok {30,nonode@nohost,nonode@nohost,normal,hello,world,token}"),
+            ("wire_extra/dist_unlink_id_ack_tag_36_bytes", "ok {36,nonode@nohost,nonode@nohost,someid}"),
+            ("wire_extra/dist_unlink_id_tag_35_bytes", "ok {35,nonode@nohost,nonode@nohost,someid}"),
+            ("wire_extra/mv0_bignum_identity", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/mv0_binary_identity", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/mv0_list_legacy_atom_bytes", "ok <<131,108,0,0,0,2,100,0,1,97,100,0,1,98,106>>"),
+            ("wire_extra/mv0_map_legacy_atom_key_bytes", "ok <<131,116,0,0,0,1,100,0,1,97,97,1>>"),
+            ("wire_extra/mv1_list_legacy_atom_bytes", "ok <<131,108,0,0,0,2,100,0,1,97,100,0,1,98,106>>"),
+            ("wire_extra/mv1_map_legacy_atom_key_bytes", "ok <<131,116,0,0,0,1,100,0,1,97,97,1>>"),
+            ("wire_extra/mv1_nonlatin_atom_bytes", "ok <<131,119,2,206,177>>"),
+            ("wire_extra/mv2_atom_utf8_bytes", "ok <<131,119,5,104,101,108,108,111>>"),
+            ("wire_extra/mv2_external_pid_identity", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/mv2_internal_port_identity", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/mv2_list_utf8_atom_bytes", "ok <<131,108,0,0,0,2,119,1,97,119,1,98,106>>"),
+            ("wire_extra/mv2_ref_identity", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_compressed_body_atom_list_roundtrip", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_compressed_body_binary_roundtrip", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_compressed_body_map_roundtrip", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_compressed_declared_size_pair", "ok {3006,3007}"),
+            ("wire_extra/opt_compressed_declared_size_pair_binary", "ok {5005,5006}"),
+            ("wire_extra/opt_compressed_level_six_roundtrip", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_compressed_level_two_roundtrip", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_compressed_level_zero_roundtrip", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_compressed_mv1_differs_from_mv2", "ok true"),
+            ("wire_extra/opt_compressed_mv1_roundtrip", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/opt_option_repeat_last_wins", "ok true"),
+            ("wire_extra/opt_option_repeat_last_wins_bytes", "ok <<131,119,5,104,101,108,108,111>>"),
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the widened options/decode/control case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some(golden),
+                "case {id} must carry the oracle-derived golden"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id} golden must exit 0");
+        }
+        // The refusal shapes added by this block — the `term_to_binary/2` option matrix
+        // (out-of-range / mistyped / wrapped options), the `binary_to_term/2` option-shape
+        // refusal, the `BIT_BINARY_EXT` bit-count bounds and the invalid-UTF-8 atom bodies —
+        // are all badarg.
+        for id in [
+            "wire_extra/err_atom_utf8_invalid_badarg",
+            "wire_extra/err_b2t_option_not_list_badarg",
+            "wire_extra/err_bit_binary_ext_nine_bits_badarg",
+            "wire_extra/err_bit_binary_ext_zero_bits_badarg",
+            "wire_extra/err_small_atom_utf8_invalid_badarg",
+            "wire_extra/err_t2b_compressed_level_float_badarg",
+            "wire_extra/err_t2b_compressed_level_negative_badarg",
+            "wire_extra/err_t2b_compressed_level_ten_badarg",
+            "wire_extra/err_t2b_minor_version_arity_badarg",
+            "wire_extra/err_t2b_minor_version_float_badarg",
+            "wire_extra/err_t2b_minor_version_missing_value_badarg",
+            "wire_extra/err_t2b_minor_version_negative_badarg",
+            "wire_extra/err_t2b_minor_version_three_badarg",
+            "wire_extra/err_t2b_option_nested_list_badarg",
+            "wire_extra/err_t2b_option_not_list_badarg",
+            "wire_extra/err_t2b_unknown_option_badarg",
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the widened options/decode error case {id}"));
             assert_eq!(
                 case.golden.stdout,
                 Some("exception error badarg"),
