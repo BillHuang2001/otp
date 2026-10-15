@@ -252,9 +252,10 @@ fn the_run_route_ignores_a_pending_deadline_that_cannot_wake_its_workload() {
     );
     // A far-off delivery for a **different** process: pending, but nothing the receiver can
     // ever be woken by.
+    let other = rt.self_pid();
     rt.timers_mut().schedule(
         Duration::from_secs(3600),
-        crate::timers::TimerTarget::Pid(rt.self_pid()),
+        crate::timers::TimerTarget::Pid(other),
         make_small(0),
         make_small(1),
         make_small(2),
@@ -313,9 +314,10 @@ fn the_run_route_still_waits_for_a_deadline_that_can_wake_its_workload() {
 fn run_scheduled_reports_the_blocked_stall_with_only_an_unrelated_deadline_pending() {
     let mut rt = runtime();
     rt.load_module(RECV_BEAM).expect("load recv.beam");
+    let other = rt.self_pid();
     rt.timers_mut().schedule(
         Duration::from_secs(3600),
-        crate::timers::TimerTarget::Pid(rt.self_pid()),
+        crate::timers::TimerTarget::Pid(other),
         make_small(0),
         make_small(1),
         make_small(4),
