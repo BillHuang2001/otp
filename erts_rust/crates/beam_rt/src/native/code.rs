@@ -30,6 +30,13 @@
 //! `src/native.rs`'s `code:*` behaviour is load-bearing for the differential corpus's
 //! `boot/*` cases, all of which currently agree with the oracle.
 
+// The **path-mutating** half of this floor — `add_patha/1,2`, `add_pathz/1,2`,
+// `add_path/1,2` and `del_path/1` — is a distinct responsibility (it is what makes the
+// runtime's code path the ONE `CodeServer` store instead of the live code server's separate
+// copy) and lives in its own submodule (see `path.rs`); the `try_native` arms in
+// `native.rs` are its only entry points from here.
+mod path;
+
 use std::path::Path;
 
 use beam_common::{BeamError, Result};

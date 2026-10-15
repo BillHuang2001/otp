@@ -194,18 +194,31 @@ impl CodeServer {
     ///   `[…, <system lib ebins>, ".", <-pz dirs>]` (verified against OTP 29.1.1 /
     ///   erts-17.1 with and without `-pa`/`-pz`); it is installed by
     ///   [`CodeServer::add_system_paths`], which is where the group order is decided;
+    /// * each directory is first reduced to its **normalised** spelling by the same rule the
+    ///   oracle's code server applies (`filename:join([Dir])` in `do_add/6`), so `-pa <D>/`
+    ///   puts `<D>` — not `<D>/` — on the path (verified against OTP 29.1.1 / erts-17.1);
+    ///   `init:get_argument(pa)` still reports the raw command-line spelling;
     /// * a directory that does not exist is filtered **out of the code path**
     ///   (`strip_path/2` over `check_path/1`) while `init:get_argument(pa|pz)` keeps it —
     ///   which is why the filtering is here and not in the parser: `erl -pa /no/such/dir …`
     ///   reports `false` for `lists:member("/no/such/dir", code:get_path())`.
-    pub fn set_configured_paths(&mut self, pa: &[PathBuf], pz: &[PathBuf]) {        for dir in pa.iter().rev() {
+    pub fn set_configured_paths(&mut self, pa: &[PathBuf], pz: &[PathBuf]) {
+        // Every configured directory is normalised exactly as the oracle's `code_server`
+        // normalises one (`code_server.erl`'s `do_add/6` calls `filename:join([Dir])`), so
+        // `-pa <D>/` reports `<D>` — the same string `code:get_path/0` answers for `-pa <D>`
+        // — while `init:get_argument(pa)` keeps the raw command-line spelling. The
+        // normalisation is applied **before** the `is_dir()` filter (it cannot change which
+        // directory is meant, only how it is spelled).
+        for dir in pa.iter().rev() {
+            let dir = normalize_dir_path(dir);
             if dir.is_dir() {
-                self.add_default_path(dir.clone());
+                self.add_default_path(dir);
             }
         }
         for dir in pz {
-            if dir.is_dir() && !self.tail_paths.contains(dir) {
-                self.tail_paths.push(dir.clone());
+            let dir = normalize_dir_path(dir);
+            if dir.is_dir() && !self.tail_paths.contains(&dir) {
+                self.tail_paths.push(dir);
             }
         }
     }
@@ -217,6 +230,39 @@ impl CodeServer {
         let dir = dir.into();
         if !self.paths.contains(&dir) {
             self.paths.push(dir);
+        }
+    }
+
+    /// **Prepends** `dir` to the code path — `code:add_patha/1,2` and the `first` form of the
+    /// oracle's code-server `do_add/6` (`code_server.erl:745-754`).
+    ///
+    /// A directory already present is **moved** to the head, never duplicated: the oracle's
+    /// `lists:keytake(Dir, 1, Path0)` drops the old entry before the new one is consed on.
+    ///
+    /// Like [`CodeServer::add_path`] — and unlike [`CodeServer::add_default_path`] — the entry
+    /// is **not** part of the boot-time default, so [`CodeServer::reset_paths_to_defaults`]
+    /// drops it again; that is what makes `init:restart/0` forget a `code:add_patha/1`.
+    pub fn add_path_first(&mut self, dir: impl Into<PathBuf>) {
+        let dir = dir.into();
+        self.paths.retain(|entry| entry != &dir);
+        self.paths.insert(0, dir);
+    }
+
+    /// Removes the **first** code-path entry `matches` accepts, answering whether one was
+    /// removed.
+    ///
+    /// The `default_paths` bookkeeping is untouched: an entry removed here is gone from the
+    /// path but a later [`CodeServer::reset_paths_to_defaults`] re-establishes it if it was a
+    /// default — which is what the oracle's restart does too (the boot script's own
+    /// `{path, …}` directives re-add it). This is the removal half of `code:del_path/1`
+    /// (`code_server.erl:884-912`); the *matching* rule lives with the caller.
+    pub fn remove_path_where(&mut self, mut matches: impl FnMut(&Path) -> bool) -> bool {
+        match self.paths.iter().position(|entry| matches(entry)) {
+            Some(index) => {
+                self.paths.remove(index);
+                true
+            }
+            None => false,
         }
     }
 
@@ -708,6 +754,64 @@ impl Default for CodeServer {
     /// Same as [`CodeServer::new`].
     fn default() -> CodeServer {
         CodeServer::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Normalising a code-path directory
+// ---------------------------------------------------------------------------
+
+/// [`normalize_dir`] applied to a filesystem path.
+///
+/// The conversion is lossless for the shapes a code-path directory has: the normalisation
+/// only removes redundant separators and a trailing one, so the result still names the very
+/// same directory on disk.
+pub(crate) fn normalize_dir_path(dir: &Path) -> PathBuf {
+    PathBuf::from(normalize_dir(&dir.to_string_lossy()))
+}
+
+/// The **normal form** of the code-path directory `name` — the oracle's
+/// `filename:join([Name])`, which `code_server.erl:730` applies to every directory before it
+/// lands on the code path.
+///
+/// This is Erlang's `filename:join/1` on its **list-of-one** input, for the `unix` path type
+/// (`major_os_type/0`; the runtime's other path handling — [`crate::native::code`]'s
+/// `where_is_file/1` candidate join, `absolute_path/1` — is likewise unix-shaped). Splitting
+/// the name the way `filename:split/1` does gives three rules:
+///
+/// 1. repeated separators collapse to one, and a trailing separator is removed (`/x/` ⇒ `/x`,
+///    `//x//` ⇒ `/x`);
+/// 2. a `.` segment **between** separators is swallowed (`/./x` ⇒ `/x`, `/a/./b/` ⇒ `/a/b`)
+///    — but the first segment of a **relative** name is kept (`./x` ⇒ `./x`) and a lone `.`
+///    is kept (`/.` ⇒ `/.`, `./` ⇒ `.`, `.` ⇒ `.`);
+/// 3. an all-separator name is the root `/` (`//` ⇒ `/`).
+///
+/// Oracle-verified (OTP 29.1.1 / erts-17.1, `[filename:join([X]) || X <- …]`): `/x/` ⇒ `/x`,
+/// `//` ⇒ `/`, `//x//` ⇒ `/x`, `/a//b` ⇒ `/a/b`, `/a/./b/` ⇒ `/a/b`, `/./x` ⇒ `/x`, `x/` ⇒ `x`,
+/// `a//` ⇒ `a`, `./x` ⇒ `./x`, `.//x` ⇒ `./x`, `./` ⇒ `.`, `.` ⇒ `.`, `/.` ⇒ `/.`, `..` ⇒ `..`,
+/// `a/..` ⇒ `a/..`, `/` ⇒ `/`, `/tmp/x/../y` ⇒ unchanged, and `""` ⇒ `""`.
+pub(crate) fn normalize_dir(name: &str) -> String {
+    let absolute = name.starts_with('/');
+    // `filename:split/1`'s segments, with the empty ones (repeated separators) dropped.
+    let segments: Vec<&str> = name.split('/').filter(|part| !part.is_empty()).collect();
+
+    // Rule 2, applied in one pass: a `.` is dropped only when something follows it and it is
+    // not the leading component of a relative name.
+    let last = segments.len().saturating_sub(1);
+    let kept: Vec<&str> = segments
+        .iter()
+        .enumerate()
+        .filter(|(index, segment)| {
+            **segment != "." || *index == last || (*index == 0 && !absolute)
+        })
+        .map(|(_, segment)| *segment)
+        .collect();
+
+    let joined = kept.join("/");
+    match (absolute, joined.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{joined}"),
+        (false, _) => joined,
     }
 }
 
