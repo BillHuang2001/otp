@@ -5244,6 +5244,196 @@ fn a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region
     );
 }
 
+/// **The collecting allocation seam serves a forced `garbage_collect` request that a bump would
+/// have answered on its own.**
+///
+/// `erlang:garbage_collect/0,1` (`erts_internal:garbage_collect/1`) answers the oracle's `true`
+/// but performs no collection itself: it records **one** request (`Runtime::request_gc`) and the
+/// process's own root set is collected over at the sites that hold it. [`alloc_words_rooted`] is
+/// one of them, and for a process whose only allocation goes through this seam it is the *only*
+/// one — before the fix the request was carried, silently, all the way to the pass boundary,
+/// where the runner's park arm no longer had the machine to collect over.
+///
+/// The nursery is deliberately **not** filled: the bump this call would reach succeeds on its
+/// own, so a collection here can only be the forced request's. The block still comes back from
+/// the process's own young heap (the collection emptied the nursery and then served the retry),
+/// and both roots really moved.
+#[test]
+fn the_collecting_allocation_seam_serves_a_forced_request_a_bump_would_have_answered() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    assert!(
+        !rt.gc_request_pending(pid),
+        "the rig starts with no request armed; {before:?}"
+    );
+    rt.request_gc(pid);
+    let block = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(4, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("a rooted allocation")
+    };
+    let after = rt.gc_stats();
+
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the forced request really ran a collection, though the young bump would have succeeded; \
+         {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "{after:?}");
+    assert!(
+        !rt.gc_request_pending(pid),
+        "the committed collection consumed the forced request; {after:?}"
+    );
+    assert_eq!(
+        after.fallbacks, before.fallbacks,
+        "the collection emptied the nursery, so the retry was served from the young heap (no arena \
+         fallback); {after:?}"
+    );
+    assert!(!block.is_null(), "a block was really handed out");
+    assert!(
+        table
+            .get(pid)
+            .expect("the process is still in the table")
+            .collector()
+            .young_contains(block as *const Eterm),
+        "the retried block is served from the process's own young nursery — an arena block would \
+         fail this region check"
+    );
+
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (beyond the `live` hint)");
+    assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
+}
+
+/// **The forced request is consumed EXACTLY once: a second allocation on the same rig does not
+/// collect.**
+///
+/// The first call answered the pending `garbage_collect`, so the second must take the ordinary
+/// path — the nursery's bump, which the now-empty nursery can serve — and leave `collections`
+/// alone. A seam that peeked the request without consuming it (or re-armed it) would collect on
+/// every allocation while the flag stayed set, the opposite failure of the one the fix closes.
+#[test]
+fn the_collecting_allocation_seam_consumes_the_forced_request_exactly_once() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(4, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the first rooted allocation");
+    }
+    let after_first = rt.gc_stats();
+    assert_eq!(
+        after_first.collections,
+        before.collections + 1,
+        "the first call served the forced request; {after_first:?}"
+    );
+
+    // The same rig, a second call: the request is spent, so this is an ordinary young-heap bump.
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(4, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the second rooted allocation");
+    }
+    let after_second = rt.gc_stats();
+    assert_eq!(
+        after_second.collections, after_first.collections,
+        "the request was already spent, so the second call takes the ordinary young-heap bump and \
+         does not collect; {after_second:?}"
+    );
+    assert_eq!(
+        after_second.fallbacks, after_first.fallbacks,
+        "the second call is a plain bump, so it takes no arena fallback either; {after_second:?}"
+    );
+}
+
+/// **A forced request the valve DECLINES stays armed for the runner's park arm.**
+///
+/// The collecting allocation seam is exactly the site the runner's park arm falls back on, so a
+/// request refused here — an unscanned root would make the move unsound — must NOT be consumed:
+/// the park arm serves it later, where the machine's root set is provably at rest. The nursery is
+/// filled with unreachable tuples so the ordinary (non-forced) refusal path is exercised too, but
+/// here the request **bypasses** the bump and it is the valve that declines.
+#[test]
+fn the_collecting_allocation_seam_leaves_a_declined_forced_request_armed() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (foreign, _child) = foreign_root_aliasing_a_young_child(&mut rt, &mut table, pid);
+
+    // Fill the nursery with unreachable tuples so a 16-word bump cannot be served — the shape the
+    // ordinary refusal takes, so the case would exercise the same decline without the request.
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+    }
+
+    let mut x = [foreign, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        let block = ctx
+            .alloc_words_rooted(16, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the declined collection falls back to the arena, which never errors");
+        assert!(!block.is_null(), "a block was really handed out");
+    }
+    let after = rt.gc_stats();
+
+    assert_eq!(
+        after.collections, before.collections,
+        "the valve must decline the forced collection while a live root is a container in a \
+         region the collector does not scan; {after:?}"
+    );
+    assert_eq!(
+        after.fallbacks,
+        before.fallbacks + 1,
+        "the declined collection takes the pointer-stable arena fallback; {after:?}"
+    );
+    assert!(
+        rt.gc_request_pending(pid),
+        "a declined forced request must stay armed: the runner's park arm is where it can still be \
+         served, and consuming it here would silently drop the caller's `garbage_collect`"
+    );
+    assert_eq!(
+        x[0], foreign,
+        "the arena fallback moved nothing, so the unscanned root is unchanged"
+    );
+    let head = terms::cons_head(x[0]).expect("the root is still the cons cell");
+    assert_eq!(
+        terms::tuple_element(head, 0).expect("in range"),
+        make_small(7),
+        "the aliased young child is still intact"
+    );
+}
+
 /// The nested blocking pump ([`super::pump_until_returned`], the engine of
 /// [`RuntimeContext::run_export_blocking`]/[`run_label_blocking`]) must not spin without end
 /// when a process stays **runnable forever**: its `ran == 0` exit never triggers, so only the

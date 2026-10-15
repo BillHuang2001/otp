@@ -486,7 +486,8 @@ fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> 
 /// ([`ensure_heap_full`], [`alloc_words_rooted`]) publish the FR file itself
 /// ([`publish_roots_full`]) and apply no float guard at all (see the module docs' float-guard
 /// section). The engine reaches only the full door, so this narrow form is not on the engine's
-/// path today.///
+/// path today.
+///
 /// # Growth
 ///
 /// The collection this runs is the collector's on-demand growth seam
@@ -577,7 +578,8 @@ pub(crate) fn ensure_heap(
     let debt = process.collection_debt();
     if !forced && !process.should_collect(heap_need as usize) && !debt {
         return Ok(());
-    }    // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root in a region the
+    }
+    // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root in a region the
     // collector does not scan would be left pointing at young words this move relocates, so the
     // move is **declined** — the heap keeps its terms, the unscanned root stays valid and the
     // program stays correct. The test runs *after* the occupancy short-circuit (an ordinary
