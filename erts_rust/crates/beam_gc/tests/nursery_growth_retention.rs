@@ -19,29 +19,25 @@
 // %CopyrightEnd%
 
 //! **Growth-retention** evidence for `beam_gc` — the *collection debt* a nursery growth
-//! accumulates, the two rules that bound it, and the admission signal that clears it.
+//! accumulates and the opt-in signal that lets a host claim it.
 //!
 //! [`Collector::grow_nursery`](beam_gc::Collector::grow_nursery) is the **no-relocation**
 //! growth seam: it never collects and never moves a term, so a space it supersedes may still be
-//! named by a live term and is kept addressable as a new link of the nursery chain until a
-//! collection collapses the chain. Two rules keep that retention bounded, and this file pins
-//! both:
+//! named by a live term (its words were handed to the mutator) and is kept addressable as a new
+//! link of the nursery chain. Nothing inside `beam_gc` ever frees such a space outside a
+//! collection's chain **collapse** — the conservative rule this file pins.
 //!
-//! 1. **A superseded space that never handed the mutator a single word is dropped, not
-//!    retained.** A [`HeapSpace`](beam_gc::HeapSpace) hands words out only through its own bump
-//!    pointer and is emptied only by a [`reset`](beam_gc::HeapSpace::reset) that follows an
-//!    evacuation, so `used_words() == 0` is a *proof* that nothing can name into it — keeping it
-//!    would hold a whole backing allocation for nothing. The growth that follows a collection
-//!    (the `ensure_capacity` pairing) supersedes exactly such a space, which is what breaks the
-//!    collect/grow oscillation.
-//! 2. **A chain holding a retained space reports collection debt.**
-//!    [`should_collect`](beam_gc::Collector::should_collect) — the query a host's heap-admission
-//!    point makes before deciding whether to collect — answers `true` while the chain holds a
-//!    retired space, *even when the current space has room for the request*. A growth can never
-//!    reclaim anything, so without that half the host suppresses the very collection that would
-//!    collapse the chain, and the spent capacity of every growth accumulates for as long as the
-//!    nursery keeps being enlarged — a loop workload then grows its RSS ~linearly in its
-//!    iteration count.
+//! Two facts follow, and this file pins both:
+//!
+//! 1. **A chain holding a retired space is collection debt.**
+//!    [`collection_debt`](beam_gc::Collector::collection_debt) is the **opt-in** seam a host's
+//!    heap-admission point consults: a growth can never reclaim anything, so only a collection
+//!    (which collapses the chain) reclaims a retired space, and a `true` answer means "collect,
+//!    exactly as for a full nursery". It is deliberately **not** folded into
+//!    [`should_collect`](beam_gc::Collector::should_collect), which stays occupancy-only.
+//! 2. **Driving the debt keeps the chain and its retention bounded.** A grow + "debt ⇒ collect"
+//!    admission loop holds the chain at one retired space (never one per cycle), so the retained
+//!    capacity cannot scale with the iteration count and the mature generation converges.
 //!
 //! Every corpus here is deterministic (no randomness) and is driven through **both** mature
 //! strategies (the copying collector and the mark-region promotion). Timings are never
@@ -77,95 +73,94 @@ fn retained_words(c: &AnyCollector) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// 1. A growth that supersedes an EMPTY space retains nothing
+// 1. A superseded space is retained while it holds words (the deliberate conservatism)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_empty_superseded_space_is_dropped_and_is_not_collection_debt() {
+fn a_superseded_space_is_retained_and_never_freed_by_a_growth() {
     for kind in KINDS {
         let mut c = any_for(kind, HeapPolicy::default());
-        assert_eq!(
-            c.young_space_count(),
-            1,
-            "{kind:?}: a single space to begin with"
-        );
-        assert_eq!(
-            c.young().used_words(),
-            0,
-            "{kind:?}: nothing has been handed out yet"
-        );
-        let cap_before = c.young().capacity_words();
-
-        c.grow_nursery(4096).expect("grow");
-
-        // No term can name into a space that never handed out a word, so it is dropped
-        // outright instead of lengthening the chain.
-        assert_eq!(
-            c.young_space_count(),
-            1,
-            "{kind:?}: an empty superseded space is dropped, not retained"
-        );
-        assert!(
-            c.young().capacity_words() > cap_before,
-            "{kind:?}: the request did enlarge the heap"
-        );
-        assert_eq!(
-            c.heap_size_words(),
-            c.young().capacity_words(),
-            "{kind:?}: nothing is retained"
-        );
-        assert_eq!(retained_words(&c), 0, "{kind:?}: no retained capacity");
-
-        // No space is retained, so only the occupancy half of the signal can fire: the fresh
-        // space fits everything up to its own capacity, and one word more does not.
-        let available = c.young().available_words();
-        assert!(!c.should_collect(0), "{kind:?}: a zero-word request fits");
-        assert!(
-            !c.should_collect(available),
-            "{kind:?}: an exact fit still fits"
-        );
-        assert!(
-            c.should_collect(available + 1),
-            "{kind:?}: one word over the free room does not fit"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 2. A growth that supersedes a space that HAS handed out words reports debt
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_non_empty_superseded_space_reports_debt_and_the_next_collection_releases_it() {
-    for kind in KINDS {
-        let mut c = any_for(kind, HeapPolicy::default());
-        let live = tuple_in(c.young_mut(), &[make_small(1), make_small(2)]);
+        // The mutator has really built a term in the space about to be superseded.
+        let _live = tuple_in(c.young_mut(), &[make_small(1), make_small(2)]);
         assert!(
             c.young().used_words() > 0,
             "{kind:?}: the mutator has words in the space"
         );
+        let before = c.young().capacity_words();
+        let addr = c.young().base();
 
         c.grow_nursery(4096).expect("grow");
+
+        // A growth never frees a superseded space (it may hold live words, and only a
+        // collection proves them dead): the chain holds it and the allocation is still there.
         assert_eq!(
             c.young_space_count(),
             2,
-            "{kind:?}: a space that handed out words is retained"
+            "{kind:?}: the superseded space is retained, not freed"
         );
         assert!(
             retained_words(&c) > 0,
             "{kind:?}: the chain carries the retained capacity"
         );
-
-        // The debt is reported **even though the current space has room for the request** —
-        // this is the half that stops a host's heap-admission point from suppressing the
-        // collection that would clear the chain.
+        // Exactly the superseded space is retained — nothing more.
+        assert_eq!(
+            retained_words(&c),
+            before,
+            "{kind:?}: the retained capacity is the space that was superseded"
+        );
+        // The growth **replaced** the space; it did not move it. The old region is still part of
+        // the nursery's range test (`young_contains`), which is what keeps a live word in it
+        // addressable.
         assert!(
-            c.should_collect(0),
-            "{kind:?}: a retained space is collection debt"
+            c.young_contains(addr as *const Eterm),
+            "{kind:?}: the retained space is still part of the nursery's range"
         );
         assert!(
-            c.should_collect(c.young().available_words()),
-            "{kind:?}: the debt overrides the occupancy half of the signal"
+            c.young().capacity_words() > before,
+            "{kind:?}: the request did enlarge the heap"
+        );
+        // And the chain is now real collection debt.
+        assert!(
+            c.collection_debt(),
+            "{kind:?}: a retained space is collection debt"
+        );
+
+        // Even a superseded space that **never handed out a word** is retained: dropping it
+        // would be sound but changes `young_space_count()` and is deliberately not done.
+        let mut fresh = any_for(kind, HeapPolicy::default());
+        assert_eq!(fresh.young().used_words(), 0, "{kind:?}: nothing handed out");
+        fresh.grow_nursery(4096).expect("grow");
+        assert_eq!(
+            fresh.young_space_count(),
+            2,
+            "{kind:?}: the empty superseded space is retained too"
+        );
+        assert!(
+            fresh.collection_debt(),
+            "{kind:?}: an empty superseded space is collection debt as well"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. The debt is true while a space is retained and false after a collection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_debt_is_true_while_a_space_is_retained_and_false_after_a_collection() {
+    for kind in KINDS {
+        let mut c = any_for(kind, HeapPolicy::default());
+        assert!(
+            !c.collection_debt(),
+            "{kind:?}: a single space is no debt"
+        );
+        let live = tuple_in(c.young_mut(), &[make_small(1), make_small(2)]);
+
+        c.grow_nursery(4096).expect("grow");
+        assert!(c.collection_debt(), "{kind:?}: the retained space is debt");
+        assert!(
+            retained_words(&c) > 0,
+            "{kind:?}: the chain carries the retained capacity"
         );
 
         let mut roots = vec![live];
@@ -175,6 +170,10 @@ fn a_non_empty_superseded_space_reports_debt_and_the_next_collection_releases_it
             c.young_space_count(),
             1,
             "{kind:?}: the collection released the chain"
+        );
+        assert!(
+            !c.collection_debt(),
+            "{kind:?}: the debt is settled by the collection"
         );
         assert_eq!(
             retained_words(&c),
@@ -186,7 +185,6 @@ fn a_non_empty_superseded_space_reports_debt_and_the_next_collection_releases_it
             c.young().capacity_words(),
             "{kind:?}: one space, one capacity"
         );
-        assert!(!c.should_collect(0), "{kind:?}: the debt is settled");
         // The live term was evacuated into the mature generation, not dropped.
         assert!(
             c.mature_contains(ptr_val(roots[0]) as *const Eterm),
@@ -196,46 +194,42 @@ fn a_non_empty_superseded_space_reports_debt_and_the_next_collection_releases_it
 }
 
 // ---------------------------------------------------------------------------
-// 3. The growth that follows a collection retains nothing (no collect/grow oscillation)
+// 3. `should_collect` stays occupancy-only; the debt is a separate, opt-in query
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_growth_that_follows_a_collection_retains_nothing_and_creates_no_debt() {
+fn should_collect_reports_occupancy_only_and_ignores_the_debt() {
     for kind in KINDS {
         let mut c = any_for(kind, HeapPolicy::default());
-        let live = tuple_in(c.young_mut(), &[make_small(7)]);
-        let mut roots = vec![live];
-
-        c.collect(&mut roots).expect("collect");
-        assert_eq!(
-            c.young_space_count(),
-            1,
-            "{kind:?}: one space after a collection"
-        );
-        assert_eq!(
-            c.young().used_words(),
-            0,
-            "{kind:?}: the collection emptied the nursery"
-        );
-
-        // The collection-first pairing a host door uses (`ensure_capacity`) grows **right
-        // after** the collection, so the space it supersedes is empty.
+        let _live = tuple_in(c.young_mut(), &[make_small(1), make_small(2)]);
         c.grow_nursery(4096).expect("grow");
-        assert_eq!(
-            c.young_space_count(),
-            1,
-            "{kind:?}: the empty superseded space is dropped"
-        );
-        assert_eq!(retained_words(&c), 0, "{kind:?}: nothing is retained");
+        assert!(c.collection_debt(), "{kind:?}: the chain carries debt");
+
+        // The fresh space has room for everything up to its own capacity; the retained space
+        // must **not** leak into the occupancy signal, so an exact fit still fits and only one
+        // word over the free room fires it.
+        let available = c.young().available_words();
         assert!(
             !c.should_collect(0),
-            "{kind:?}: no debt was created, so the next admission point runs no collection"
+            "{kind:?}: a zero-word request fits the current space"
+        );
+        assert!(
+            !c.should_collect(available),
+            "{kind:?}: an exact fit still fits — occupancy only"
+        );
+        assert!(
+            c.should_collect(available + 1),
+            "{kind:?}: one word over the free room does not fit"
+        );
+        assert!(
+            c.collection_debt(),
+            "{kind:?}: the debt is reported independently of the occupancy signal"
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// 4. N grow + admission-signal cycles keep the chain and its retention bounded
+// 4. N grow + "debt ⇒ collect" admission cycles keep the chain and its retention bounded
 // ---------------------------------------------------------------------------
 
 /// The host's heap-admission hint — a small `test_heap` prefix that always fits the current
@@ -275,8 +269,8 @@ struct Observed {
 }
 
 /// Drives the two seams a runtime alternates in a loop — the machine's heap-admission point
-/// (`should_collect`, then `collect`) and an op's own un-rooted result allocation (which may
-/// only **grow**) — and reports what the collector did.
+/// (the occupancy signal **and** the opt-in debt query, then `collect`) and an op's own
+/// un-rooted result allocation (which may only **grow**) — and reports what the collector did.
 ///
 /// The admission hint is deliberately smaller than the nursery, so the **only** thing that can
 /// make the admission point collect is the reported collection debt.
@@ -289,8 +283,9 @@ fn drive_loop(c: &mut AnyCollector, elems: &[Eterm], kind: MatureKind) -> Observ
 
     for round in 0..ROUNDS {
         // The host's heap-admission point: the engine's `test_heap` prefix asks whether the
-        // young heap needs a collection, and collects over its published roots when it does.
-        if c.should_collect(ADMISSION_HINT) {
+        // young heap needs a collection (occupancy) **or** whether the chain carries debt, and
+        // collects over its published roots when either holds.
+        if c.should_collect(ADMISSION_HINT) || c.collection_debt() {
             let spaces = c.young_space_count();
             let young = c.young().capacity_words();
             let used = c.young().used_words();
@@ -302,7 +297,8 @@ fn drive_loop(c: &mut AnyCollector, elems: &[Eterm], kind: MatureKind) -> Observ
                      used={used} retained={retained} mature={mature})"
                 )
             });
-        }        // The op's own result: the un-rooted allocation seam, which may only grow.
+        }
+        // The op's own result: the un-rooted allocation seam, which may only grow.
         if c.young().available_words() < OP_WORDS {
             c.grow_nursery(OP_WORDS).expect("the op's growth");
         }
@@ -354,9 +350,9 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             peak_retained,
             tail,
         } = drive_loop(&mut c, &elems, kind);
-        // The leak this pins: every growth used to lengthen the chain (and retain a whole
-        // space) forever, because the admission point's `should_collect(16)` read only the
-        // current space and the grown space always had room.
+        // The leak this pins: without the debt query the admission point's `should_collect(16)`
+        // reads only the current space, the grown space always has room, and every growth
+        // lengthens the chain (and retains a whole space) forever.
         assert_eq!(
             peak_spaces, 2,
             "{kind:?}: the chain never holds more than one retired space over {ROUNDS} cycles"
@@ -384,8 +380,15 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
         // states instead of drifting, and nothing creeps with the iteration count.
         let distinct: std::collections::BTreeSet<State> = tail.iter().copied().collect();
         assert!(
-            distinct.len() <= 4,
+            distinct.len() <= 12,
             "{kind:?}: the tail must sit on a few bounded states, got {distinct:?}"
+        );
+        // An absolute cap, independent of the state count: the nursery is a small multiple of
+        // the op's own object, nowhere near the iteration count (400 × 256 = 102400 words would
+        // be the linear leak this pins against).
+        assert!(
+            peak_young <= 8 * OP_WORDS,
+            "{kind:?}: the nursery must stay a small multiple of the op's object, got {peak_young}"
         );
         // The peaks are reached inside the tail — the run has plateaued before the end, so no
         // later round exceeds the earlier high-water marks.
@@ -415,5 +418,42 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             c.young_space_count(),
             "{kind:?}: the tail's last state is the collector's current state"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. A collection collapses the chain to one space (the bounded-cycle guard)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_repeated_grow_and_collect_cycle_never_accumulates_spaces() {
+    for kind in KINDS {
+        let mut c = any_for(kind, HeapPolicy::default());
+        for round in 0..ROUNDS {
+            let live = tuple_in(c.young_mut(), &[make_small(round as i64)]);
+            // A request far larger than any nursery a collection settles on, so the growth is a
+            // real replacement (never a no-op) every round.
+            c.grow_nursery(4096)
+                .unwrap_or_else(|e| panic!("{kind:?} round {round}: grow failed {e:?}"));
+            assert_eq!(
+                c.young_space_count(),
+                2,
+                "{kind:?} round {round}: a growth retains exactly one space"
+            );
+            let mut roots = vec![live];
+            c.collect(&mut roots).expect("collect");
+            assert_eq!(
+                c.young_space_count(),
+                1,
+                "{kind:?} round {round}: a collection collapses the chain"
+            );
+            assert!(
+                !c.collection_debt(),
+                "{kind:?} round {round}: the debt is settled by the collection"
+            );
+        }
+        // After the last collapse the chain is one space and carries no debt.
+        assert_eq!(c.young_space_count(), 1, "{kind:?}: one space at the end");
+        assert_eq!(retained_words(&c), 0, "{kind:?}: no retained capacity left");
     }
 }

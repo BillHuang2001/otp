@@ -224,22 +224,45 @@ impl AnyCollector {
         crate::heap_info::HeapInfo::of(self)
     }
 
-    /// Whether the young heap **needs a collection** — the query a runtime makes at its
-    /// heap-admission point before it decides to collect. Forwarded to whichever strategy is
-    /// selected ([`Collector::should_collect`] / [`GenImmixCollector::should_collect`]).
+    /// Whether the nursery can no longer satisfy `need_words` more words — the query a runtime
+    /// makes at its heap-admission point before it decides to collect. Forwarded to whichever
+    /// strategy is selected ([`Collector::should_collect`] /
+    /// [`GenImmixCollector::should_collect`]).
     ///
     /// Both strategies answer this from the **shared** young nursery (an exact-fit allocation
-    /// still fits, and a chain a [growth](AnyCollector::grow_nursery) left with a **retired**
-    /// space reports its collection debt — only a collection can free it), so the answer is
-    /// strategy-independent: a caller that switches the mature generation gets the same
-    /// admission decisions, and neither strategy can leave the chain's spent capacity
-    /// accumulating unclaimed.
-    pub fn should_collect(&self, need_words: usize) -> bool {        match self {
+    /// still fits), so the answer is strategy-independent — a caller that switches the mature
+    /// generation gets the same admission decisions. The chain's
+    /// [collection debt](Self::collection_debt) is deliberately **not** folded in; see that
+    /// method for the opt-in seam a host consults alongside this one.
+    pub fn should_collect(&self, need_words: usize) -> bool {
+        match self {
             AnyCollector::Copying(c) => c.should_collect(need_words),
             AnyCollector::Immix(c) => c.should_collect(need_words),
         }
     }
 
+    /// Whether the nursery chain carries a space a [growth](Self::grow_nursery) retired — the
+    /// chain's **collection debt** — forwarded to whichever strategy is selected
+    /// ([`Collector::collection_debt`] / [`GenImmixCollector::collection_debt`]), the same way
+    /// [`should_collect`](Self::should_collect) is.
+    ///
+    /// A growth never collects and never moves a term, so only a
+    /// [collection](Self::collect) reclaims a retired space (it collapses the chain). A `true`
+    /// answer therefore means **a collection is required to reclaim the chain: a
+    /// heap-admission door should treat it like a full nursery** and collect, even when the
+    /// current space still has room for the request.
+    ///
+    /// This is an **opt-in** seam, not part of [`should_collect`](Self::should_collect): a
+    /// caller that ignores it pays nothing for it. `beam_rt`'s heap-admission doors
+    /// (`src/context/gc.rs::ensure_heap` / `ensure_heap_full`) must OR it into their
+    /// `should_collect` decision once they unconditionally admit the collection — see the
+    /// handoff in the crate `CONTEXT.md`.
+    pub fn collection_debt(&self) -> bool {
+        match self {
+            AnyCollector::Copying(c) => c.collection_debt(),
+            AnyCollector::Immix(c) => c.collection_debt(),
+        }
+    }
     /// Runs a collection on the selected strategy.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         match self {
@@ -290,12 +313,11 @@ impl AnyCollector {
     /// [`GenImmixCollector::grow_nursery`].
     ///
     /// It is safe for a caller that holds no root set: the space it replaces is retained (the
-    /// nursery becomes a chain of spaces) whenever it has handed the mutator words — so every
-    /// live word stays addressable at its original address — and is dropped outright when it is
-    /// provably empty, so nothing can name into it. When the policy's
-    /// [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth table's ceiling) cannot
-    /// reach the request the typed heap-exhaustion error is returned instead. This is
-    /// strategy-agnostic — the caller does not need to know which mature generation is in use.
+    /// nursery becomes a chain of spaces), so every live word stays addressable at its original
+    /// address. When the policy's [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth
+    /// table's ceiling) cannot reach the request the typed heap-exhaustion error is returned
+    /// instead. This is strategy-agnostic — the caller does not need to know which mature
+    /// generation is in use.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
         match self {
             AnyCollector::Copying(c) => c.grow_nursery(need_words),

@@ -397,26 +397,38 @@ impl GenImmixCollector {
         self.minor_since_major
     }
 
-    /// Whether the young heap **needs a collection**: the current space cannot satisfy
-    /// `need_words` more words, or the nursery chain carries a
-    /// [retired](Self::grow_nursery) space whose words only a collection can reclaim — the
-    /// same signal [`crate::Collector`] answers, so an admission decision does not depend on
-    /// the mature strategy (an exact-fit allocation still fits).
+    /// Whether the nursery can no longer satisfy `need_words` more words — the same signal
+    /// [`crate::Collector`] uses (an exact-fit allocation still fits).
     ///
-    /// The first half reads the **current** (allocatable) space only — a
-    /// [growth](Self::grow_nursery) retires the space it replaced and nothing is ever allocated
-    /// in a retired one, so the current space is the correct one for an allocation-admission
-    /// signal. A *collection* must instead cover the whole chain, which is why
-    /// [`collect`](Self::collect) sizes the promotion (and the region the fullsweep leaves
-    /// behind) from the chain-wide [`Nursery::used_words`].
+    /// This reads the **current** (allocatable) space only — a [growth](Self::grow_nursery)
+    /// retires the space it replaced and nothing is ever allocated in a retired one, so the
+    /// current space is the correct one for an allocation-admission signal. A *collection*
+    /// must instead cover the whole chain, which is why [`collect`](Self::collect) sizes the
+    /// promotion (and the region the fullsweep leaves behind) from the chain-wide
+    /// [`Nursery::used_words`].
     ///
-    /// The second half is the **collection debt**: a growth can never reclaim anything (it
-    /// never moves a term), so the only thing that frees a retired space is a collection.
-    /// Reporting it here is what stops a host's heap-admission point from suppressing the
-    /// collection that clears the chain.
+    /// The chain's [collection debt](Self::collection_debt) is deliberately **not** folded in —
+    /// see that method for the opt-in seam a host consults alongside this one.
     pub fn should_collect(&self, need_words: usize) -> bool {
         self.nursery.current().available_words() < need_words
-            || self.nursery.retains_old_spaces()
+    }
+
+    /// Whether the nursery chain carries a space a [growth](Self::grow_nursery) retired — the
+    /// chain's **collection debt** (the [`crate::Collector`] seam, made strategy-independent).
+    ///
+    /// A growth never collects and never moves a term, so the only thing that reclaims a
+    /// retired space is a [collection](Self::collect) (which collapses the chain). A `true`
+    /// answer therefore means **a collection is required to reclaim the chain: a
+    /// heap-admission door should treat it like a full nursery** and collect, even when the
+    /// current space still has room for the request.
+    ///
+    /// This is an **opt-in** seam, not part of [`should_collect`](Self::should_collect): a
+    /// caller that ignores it pays nothing for it (one `Vec::is_empty`). `beam_rt`'s
+    /// heap-admission doors (`src/context/gc.rs::ensure_heap` / `ensure_heap_full`) must OR it
+    /// into their `should_collect` decision once they unconditionally admit the collection —
+    /// see the handoff in the crate `CONTEXT.md`.
+    pub fn collection_debt(&self) -> bool {
+        self.nursery.retains_old_spaces()
     }
     /// Runs a collection, picking minor vs major by policy and escalating a would-not-fit
     /// minor to a major.
@@ -493,12 +505,11 @@ impl GenImmixCollector {
     /// [`crate::Collector::grow_nursery`] counterpart for the mark-region strategy.
     ///
     /// It is safe for a caller that holds no root set (so cannot collect): the space it
-    /// replaces is **retained** whenever it has handed the mutator words, so every live word
-    /// stays addressable at its original address, and a provably empty one (nothing can name
-    /// into it) is dropped outright — a chained nursery is just as collectable later as a
-    /// single space ([`young_contains`](Self::young_contains) covers the retained spaces and
-    /// the next collection evacuates them all). When the current space already has room this is
-    /// a no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
+    /// replaces is **retained** and every live word stays addressable at its original address,
+    /// so a chained nursery is just as collectable later as a single space
+    /// ([`young_contains`](Self::young_contains) covers the retained spaces and the next
+    /// collection evacuates them all). When the current space already has room this is a
+    /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
     /// cannot reach the request, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {

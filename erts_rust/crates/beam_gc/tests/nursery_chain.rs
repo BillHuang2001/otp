@@ -459,9 +459,9 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     // third (or drifting) state, which the exact-set assertion below rejects.
     //
     // The grown capacity is the curated size the request resolves to (`987` = the smallest
-    // growth-table entry covering `STEADY_NEED`): a growth that supersedes the *empty* space a
-    // collection left behind retains nothing, so the collapse that follows re-sizes the next
-    // nursery from that single space's capacity — never inflated by a superseded space.
+    // growth-table entry covering `STEADY_NEED`) plus the capacity of the space the growth
+    // superseded (`90`): a superseded space is retained until a collection evacuates it, and
+    // the collapse that follows sizes the single remaining space from the whole chain.
     const PERIOD: usize = 2;
     let tail = &recorded[ROUNDS - 50..];
     assert!(
@@ -471,7 +471,8 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     let distinct: std::collections::BTreeSet<(usize, usize, usize)> =
         tail.iter().copied().collect();
     let pinned: std::collections::BTreeSet<(usize, usize, usize)> =
-        [(1, 90, 1598), (1, 987, 1598)].into_iter().collect();    assert_eq!(
+        [(1, 90, 1598), (1, 1077, 1598)].into_iter().collect();
+    assert_eq!(
         distinct, pinned,
         "the converged cycle must be exactly the pinned grown/collapsed alternation"
     );
