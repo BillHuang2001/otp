@@ -511,9 +511,7 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
   form (a byte-exact round-trip); `list_to_ref/1` accepts only `#Ref<0.0.0.N>`. Widening the slot spans
   `beam_term::boxed` + `beam_codec::ref_wire` + `beam_gc` copy sizing.
 - **`match_spec_test/3`'s `trace` dialect** needs a trace-programme runner, and the `table` dialect's
-  compile-rejection gap turns the oracle's semantic-lint `{error,[…]}` into a raise — neither fixable here. **A match
-  spec with a 0-arity tuple `{}` panics in the sibling `beam_ets` evaluator** (`ets:select/2`, `ets:match_spec_run/2`,
-  `ets:match_spec_compile/1`, `match_spec_test/3`; oracle `badarg`) — fix in `../beam_ets/src/select/CONTEXT.md`.
+  compile-rejection gap turns the oracle's semantic-lint `{error,[…]}` into a raise — neither fixable here.
 - **Deep *nesting* still recurses in the printer** — an unbounded-*depth* concern; the per-element walks are
   iterative, so a long flat container no longer aborts.
 ### Environment-bounded values and bounded M1 leaks
