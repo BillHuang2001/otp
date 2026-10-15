@@ -3587,9 +3587,11 @@ const GC_FLOATS_BEAM: &str = concat!(
 /// root (`crate::context::gc::publish_roots_full`), so a collection over a callee that left a
 /// float register live relocates it instead of dangling it — for any module.
 ///
-/// The GC doors keep their own copy of the caller-module test (the narrow
-/// [`ExecutionContext::ensure_heap`] door cannot see the FR file), so the module is still *not*
-/// float-free — the check that makes the resolution below meaningful.
+/// The GC doors keep a caller-module float test of their own; only the **narrow**
+/// [`ExecutionContext::ensure_heap`] door still refuses on it (that door cannot see the FR
+/// file). The full doors apply none. The module is therefore still *not* float-free — the
+/// property this case needs — and its narrow-door refusal is pinned by
+/// [`the_narrow_door_still_refuses_a_float_using_call_site`].
 #[test]
 fn the_call_seam_enters_a_float_using_module_in_machine() {
     let mut rt = runtime();
@@ -5909,4 +5911,203 @@ fn a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected() {
             );
         }
     }
+}/// **The full door collects over a float-using call site.** The full door publishes the
+/// machine's **whole FR file** ([`super::gc::publish_roots_full`]), so a live float register is
+/// relocated like any x register or stack word and the caller-module float guard would only be
+/// a redundant conservative extra: the door applies **no** float guard at all. A float-using
+/// call site therefore collects exactly like a float-free one, and the FR-only root comes back
+/// relocated.
+#[test]
+fn the_full_door_collects_over_a_float_using_call_site() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    assert!(
+        !rt.module_is_float_free(
+            "gc_floats",
+            &rt.code_server()
+                .module_handle("gc_floats")
+                .expect("cached under its own name")
+        ),
+        "the fixture really is float-using, so the test would be vacuous otherwise"
+    );
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some("gc_floats".to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "a float-using call site is collected over at the full door; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "the scatter completed; {after:?}");
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (float-using call site)");
+    assert_relocated_tuple(
+        fr[0],
+        fr_only,
+        [9, 10],
+        "fr[0] — the FR word the full door publishes",
+    );
+}
+
+/// **A run with no caller module is still refused at the full door.** A fun entry and the
+/// `-eval` evaluator have no `current_module`; the door has no machine to name, so it leaves
+/// the heap alone rather than guessing. Nothing about the float guard is involved: this refusal
+/// survives the guard's removal.
+#[test]
+fn the_full_door_still_refuses_a_run_with_no_caller_module() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let mut x = [NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        assert!(ctx.current_module.is_none(), "no caller module is set");
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections,
+        "an unnamed call site is never collected over"
+    );
+}
+
+/// **The narrow door still refuses a float-using call site — and collects over a float-free
+/// one.**
+///
+/// The narrow [`ExecutionContext::ensure_heap`] door receives only an x prefix and the stack,
+/// so it can never see the machine's FR file: the caller-module float guard is load-bearing
+/// there and must survive the full doors' removal of it. The second half drives the **same**
+/// door with the same (still-armed) forced request and a float-free call site, so the refusal
+/// above is about the float guard and not about the door being inert.
+#[test]
+fn the_narrow_door_still_refuses_a_float_using_call_site() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    let mut x = [NIL, NIL];
+    let mut stack = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some("gc_floats".to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap(0, 1, &mut x, &mut stack)
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections,
+        "the narrow door must not collect over a float-using call site"
+    );
+    assert!(
+        rt.gc_request_pending(pid),
+        "the refused forced request stays armed for the runner's park arm"
+    );
+
+    // The same door, the same armed request, a float-free call site: it collects.
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap(0, 1, &mut x, &mut stack)
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections + 1,
+        "the narrow door does collect over a float-free call site"
+    );
+}
+
+/// **The collection debt forces the collection the occupancy test would not.**
+///
+/// [`Process::grow_nursery`] is the no-relocation growth seam: it retires the young space it
+/// replaces instead of freeing it, so the nursery becomes a chain only a collection can
+/// evacuate. With `heap_need = 0` the occupancy test can never fire on a fresh nursery
+/// (`available_words() < 0` is false), so without the debt term the door would return and the
+/// chain would grow for as long as the load keeps enlarging it. The case drives the full door
+/// with `heap_need = 0` on a process whose nursery really carries a retired space.
+#[test]
+fn the_collection_debt_forces_a_collection_the_occupancy_test_would_not() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let mut x = [NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    // The door with no debt: an occupancy test of zero words is never a trigger, and no
+    // request is pending, so this is a no-op.
+    let before = rt.gc_stats();
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections,
+        "an empty nursery with no debt is not collected over"
+    );
+    assert!(
+        !table.get(pid).expect("the process").should_collect(0),
+        "the occupancy test alone says there is room, so the debt term is what decides"
+    );
+
+    // Create the debt through the real growth seam, then re-drive the same door with the same
+    // zero-word request. The request must exceed the current space, or `grow_nursery` is a
+    // no-op by construction.
+    let over = table
+        .get(pid)
+        .expect("the process")
+        .collector()
+        .young()
+        .capacity_words()
+        + 64;
+    table
+        .get_mut(pid)
+        .expect("the process")
+        .grow_nursery(over)
+        .expect("the nursery grows");
+    assert!(
+        table.get(pid).expect("the process").collection_debt(),
+        "the growth retired a space, which is the debt"
+    );
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the retired-space chain forces the collection; {after:?}"
+    );
+    assert!(
+        !table.get(pid).expect("the process").collection_debt(),
+        "the collection collapsed the chain and settled the debt"
+    );
 }
