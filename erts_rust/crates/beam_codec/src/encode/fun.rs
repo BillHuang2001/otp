@@ -207,6 +207,7 @@ mod tests {
     use crate::encode::tests::new_heap;
     use crate::encode::{encode_term, encode_term_body, Encoder, FunIdentity};
     use crate::error::{is_unsupported, is_unsupported_local_fun};
+    use crate::tag::NEW_FUN_EXT;
     use crate::term::{make_fun_external, make_fun_imported, make_fun_local, FunPid, MAX_ARG};
 
     #[test]
@@ -385,5 +386,44 @@ mod tests {
         expected.extend_from_slice(&payload);
 
         assert_eq!(encoder.as_bytes(), expected.as_slice());
+    }
+
+    #[test]
+    fn the_function_name_is_never_encoded() {
+        let mut atoms = AtomTable::new();
+        let module = atoms.intern("m");
+        let node = atoms.intern("n1");
+        let mut uniq = [0u8; 16];
+        for (i, byte) in uniq.iter_mut().enumerate() {
+            *byte = i as u8 + 1; // 1..=16
+        }
+        let creator = FunPid {
+            node,
+            number: 0xAAAA_BBBB,
+            serial: 0xCCCC_DDDD,
+            creation: 0x1122_3344,
+        };
+        let env = [make_small(11), make_small(22)];
+        let mut heap = new_heap(64);
+        let local = make_fun_local(&mut heap, 2, 0xDEAD_BEEF, 0x0102_0304, &env).unwrap();
+
+        let unnamed = FunIdentity::new(module, uniq, 7, 3, creator);
+        assert_eq!(unnamed.function, None);
+        let mut encoder = Encoder::new(&atoms).with_fun_identity(unnamed);
+        encoder.encode(local).unwrap();
+        let without = encoder.as_bytes().to_vec();
+
+        // The lambda's `FunT` function-name atom is introspection-only metadata
+        // (`erlang:fun_info/2`'s `name` item): `NEW_FUN_EXT` has no function-name
+        // field, so attaching it must leave the wire image byte-for-byte identical.
+        let lambda = atoms.intern("-mk/1-fun-0-");
+        let named = FunIdentity::named(module, uniq, 7, 3, creator, lambda);
+        assert_eq!(named.function, Some(lambda));
+        let mut encoder = Encoder::new(&atoms).with_fun_identity(named);
+        encoder.encode(local).unwrap();
+        let with = encoder.as_bytes().to_vec();
+
+        assert_eq!(without, with);
+        assert_eq!(with[1], NEW_FUN_EXT);
     }
 }
