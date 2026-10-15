@@ -280,7 +280,10 @@ short-circuit; `maps:filter/2` treats a non-boolean result as `BadArg`.
   the one borrow-split route, so **no BIF clones the whole `AtomTable` per call** — `tests/decode_hot_path.rs` pins the
   steady-state per-call allocation count as table-size-**independent** (9 allocations / 602 bytes, identical at 137
   and 4105 atoms). Measured (`examples/etf_bench.rs`): a clone-per-call decode is 130.3 µs/op against the memoized
-  **5.45 µs/op (23.9×)**.
+  **5.45 µs/op (23.9×)**. The memo is a *hit* every call (the clone is never paid), but its **latency** is still
+  Θ(table): `prefix_matches` scans all interned atoms each call, so a runtime whose shared table grew from loading
+  the preloaded-module set pays proportionally more per decode (an O(1) `appended_since` check is the unadopted fix
+  — see Performance Notes).
 - **Options.** `compressed`/`{compressed,0..=9}` really deflate a version-less body and wrap it `[131][80][len][zlib]`
   **only** when the stream fits the C's `body_len - 5` budget (bare atom = level 6); `{minor_version,0|1|2}` selects
   the tag set byte-identically; `iovec`/`fragment` are `badarg`. `[deterministic]` is **fully honoured** (threaded as
