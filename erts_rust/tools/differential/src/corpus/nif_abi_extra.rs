@@ -169,6 +169,38 @@
 //! `[[],[]]`, nested numeric lists, a binary element followed by a byte) plus one
 //! `enif_make_sub_binary` window.
 //!
+//! # The widened dynamic-table / select / monitor / time block, pinned
+//!
+//! A fourth block (`96`..`99` on `probe/1`, `112`..`114` on `probe_term/2`) reaches the exported
+//! `enif_*` slots no earlier block ever *called*, plus two shapes the earlier binary block left
+//! out. Every one of them is answered alike by both runtimes:
+//!
+//! * **`enif_time_offset`** (`96`) — never called before. Its absolute value is documented to be
+//!   anchored differently from the oracle's, so the case pins the *invariant* both runtimes
+//!   guarantee instead: the wall clock `enif_now_time` reports is the sum of `enif_monotonic_time`
+//!   and `enif_time_offset` in the same unit, to within the second-truncation slack of the three
+//!   separate readings (tolerance `3`, against an anchor error of `576460753`).
+//! * **`enif_select`/`enif_select_x`** (`97`) — never called before. An event outside the fd range
+//!   answers `INT_MIN | ERL_NIF_SELECT_INVALID_EVENT` and never reaches the poller (the C's
+//!   `grow_drv_ev_state` refusal, `erl_check_io.c:1263-1268`). The `obj` operand is a **live
+//!   resource** of the `down`-carrying type opened in `load`, not `NULL`: the C turns it into a
+//!   resource pointer before the fd check, so a `NULL` one would fault on the oracle.
+//! * **`enif_monitor_process`** (`98`) — never called before. Against a resource whose type really
+//!   carries a `down` callback (opened in `load` with `enif_open_resource_type_x`, three members:
+//!   the C refuses `-1` when the type has none) an `enif_set_pid_undefined` target answers
+//!   [`MONITOR_TARGET_DEAD`] on both sides. A *live* pid would create a real monitor and is
+//!   deliberately not asserted (the runtime's host installs no `monitor_process` hook).
+//! * **`enif_dynamic_resource_call`** (`99`) — never called before. A `dyncall`-carrying type
+//!   (opened in `load` with `enif_init_resource_type`, `members = 4`) runs its callback on the
+//!   (module, name) **name** match and answers `0`, while an unknown **name** and a non-resource
+//!   term both answer `1`. The type's *module* atom is not part of the case: the Rust runtime
+//!   compares the name only (a documented substitution), so a wrong-module call is a divergence,
+//!   not a corpus case.
+//! * **the off-heap window** (`112`..`114`) — `enif_make_sub_binary` of a sub-binary composes its
+//!   windows, and a **refc** (off-heap, 100-byte) source binary is inspected and windowed byte for
+//!   byte. `enif_term_size` of that binary is **not** asserted: the counted word size above
+//!   `ERL_ONHEAP_BINARY_LIMIT` is a documented representational deviation.
+//!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
 //! A C-compiled fixture needs a C compiler *and* the host `erl_nif.h`; when either is missing the
@@ -236,7 +268,15 @@ built_term(139) -> [0];                           %% the zero byte
 built_term(140) -> [255];                         %% the highest byte
 built_term(141) -> [<<>>];                        %% a byte-less binary element
 built_term(142) -> [[],[]];                       %% two byte-less nested lists
+built_term(112) -> <<"abcdefgh">>;                %% a window-of-a-window source
+built_term(113) -> large_binary();                %% a 100-byte refc (off-heap) binary
+built_term(114) -> large_binary();                %% the same source, windowed near its end
 built_term(143) -> <<"abcd">>.                    %% a sub-binary window source
+
+%% A 100-byte binary (above the on-heap limit, so the runtime keeps it off-heap) whose byte at
+%% position `i` is `i`, so both its size and every byte are visible in the checksum.
+large_binary() ->
+    list_to_binary(lists:seq(1, 100)).
 
 %% A 40-byte window that starts five bits into `<<0,1,…,45>>` — a byte-sized bitstring with a
 %% non-zero bit offset, exactly the shape enif_inspect_binary used to refuse.
@@ -279,10 +319,68 @@ const NIF_EXTRA_C: &str = r#"/* A second real NIF exercising the enif_* C ABI en
 #include <string.h>
 #include <stdint.h>
 
-/* The load callback: succeeds and stores no private state. */
-static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
+/* The two resource types the dynamic-table / select / monitor block needs. Both are opened in the
+   load callback: the C may only open a resource type while the module is loading
+   (`open_resource_type` requires the module's LOADING flag, `erl_nif.c:2704`), so a probe that
+   opened one would get NULL from the oracle. */
+static ErlNifResourceType* down_type = NULL;
+static ErlNifResourceType* dyn_type = NULL;
+
+/* The `dyncall` callbacks the dynamic-table probe runs are counted, so the probe can tell a call
+   that happened from one that merely returned the success code. */
+static int dyn_runs = 0;
+
+struct extra_mon { int pad; };
+struct extra_dyn { int calls; int magic; };
+
+static void extra_mon_dtor(ErlNifEnv* env, void* obj) {
     (void) env;
+    (void) obj;
+}
+
+/* The `down` callback the monitor probe needs: `enif_monitor_process` answers -1 (not 1) for a
+   resource whose type has none (`erl_nif.c:3968-3972`). */
+static void extra_mon_down(ErlNifEnv* env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon) {
+    (void) env;
+    (void) obj;
+    (void) pid;
+    (void) mon;
+}
+
+static void extra_dyn_dtor(ErlNifEnv* env, void* obj) {
+    (void) env;
+    (void) obj;
+}
+
+/* The `dyncall` the dynamic-table probe looks for: it records that it ran, and the `call_data`
+   pointer the caller handed `enif_dynamic_resource_call`. */
+static void extra_dyn_call(ErlNifEnv* env, void* obj, void* call_data) {
+    struct extra_dyn* d = (struct extra_dyn*) obj;
+    (void) env;
+    dyn_runs++;
+    d->calls++;
+    if (call_data != NULL)
+        d->magic = *(int*) call_data;
+}
+
+/* The load callback: opens the two resource types above (three members = dtor/stop/down for the
+   monitor type, four = those plus `dyncall` for the dynamic-table type) and stores no private
+   state. */
+static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
+    ErlNifResourceTypeInit down_init, dyn_init;
     (void) load_info;
+    memset(&down_init, 0, sizeof down_init);
+    down_init.dtor = extra_mon_dtor;
+    down_init.down = extra_mon_down;
+    down_init.members = 3;
+    down_type = enif_open_resource_type_x(env, "nif_extra_down", &down_init,
+                                          ERL_NIF_RT_CREATE, NULL);
+    memset(&dyn_init, 0, sizeof dyn_init);
+    dyn_init.dtor = extra_dyn_dtor;
+    dyn_init.members = 4;
+    dyn_init.dyncall = extra_dyn_call;
+    dyn_type = enif_init_resource_type(env, "nif_extra_dyn", &dyn_init,
+                                       ERL_NIF_RT_CREATE, NULL);
     *priv = NULL;
     return 0;
 }
@@ -1102,6 +1200,81 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, enif_equal_tids(tid, tid) ? 1 : 0);
     }
 
+    /* ------------------------------------------------------------ time / select / monitors (96..99) */
+    case 96: {                                 /* time_offset closes the monotonic -> wall loop */
+        ERL_NIF_TERM t = enif_now_time(env);
+        const ERL_NIF_TERM* a = NULL;
+        int arity = 0;
+        ErlNifSInt64 mega = 0, sec = 0, usec = 0;
+        long long now_secs, diff;
+        if (!enif_get_tuple(env, t, &arity, &a) || arity != 3)
+            return enif_make_int(env, 0);
+        if (!enif_get_int64(env, a[0], &mega) || !enif_get_int64(env, a[1], &sec)
+            || !enif_get_int64(env, a[2], &usec))
+            return enif_make_int(env, 0);
+        (void) usec;
+        now_secs = (long long) mega * 1000000LL + (long long) sec;
+        /* `enif_time_offset`'s absolute value is anchored differently on the two runtimes; the
+           relation it exists to guarantee is not, so only the invariant is asserted (the three
+           readings truncate to the second separately, hence the slack). */
+        diff = now_secs - ((long long) enif_monotonic_time(ERL_NIF_SEC)
+                           + (long long) enif_time_offset(ERL_NIF_SEC));
+        if (diff < 0)
+            diff = -diff;
+        return enif_make_int(env, (diff <= 3) ? 1 : 0);
+    }
+    case 97: {                                 /* an event outside the fd range is refused */
+        struct extra_mon* r =
+            (struct extra_mon*) enif_alloc_resource(down_type, sizeof(struct extra_mon));
+        int want, r1, r2;
+        if (r == NULL)
+            return enif_make_int(env, 0);
+        want = INT_MIN | ERL_NIF_SELECT_INVALID_EVENT;
+        /* A live resource, never NULL: the C turns `obj` into a resource pointer before it looks
+           at the event (`erl_check_io.c:1245`, `:1263-1268`). */
+        r1 = enif_select(env, -1, ERL_NIF_SELECT_READ, r, NULL, 0);
+        r2 = enif_select_x(env, -1, ERL_NIF_SELECT_READ, r, NULL, 0, NULL);
+        enif_release_resource(r);
+        return enif_make_int(env, (r1 == want && r2 == want) ? 1 : 0);
+    }
+    case 98: {                                 /* an undefined monitor target is "dead" */
+        struct extra_mon* r =
+            (struct extra_mon*) enif_alloc_resource(down_type, sizeof(struct extra_mon));
+        ErlNifPid pid;
+        ErlNifMonitor mon;
+        int rc;
+        if (r == NULL)
+            return enif_make_int(env, 0);
+        enif_set_pid_undefined(&pid);
+        memset(&mon, 0, sizeof mon);
+        rc = enif_monitor_process(env, r, &pid, &mon);
+        enif_release_resource(r);
+        return enif_make_int(env, (rc == 1) ? 1 : 0);
+    }
+    case 99: {                                 /* the dynamic resource table runs its dyncall */
+        struct extra_dyn* d =
+            (struct extra_dyn*) enif_alloc_resource(dyn_type, sizeof(struct extra_dyn));
+        ERL_NIF_TERM mod, term;
+        int cd = 4242;
+        int r1, r2, r3, ok;
+        if (d == NULL)
+            return enif_make_int(env, 0);
+        mod = enif_make_atom(env, "nif_extra");
+        term = enif_make_resource(env, d);
+        dyn_runs = 0;
+        r1 = enif_dynamic_resource_call(env, mod, enif_make_atom(env, "nif_extra_dyn"),
+                                        term, &cd);
+        r2 = enif_dynamic_resource_call(env, mod, enif_make_atom(env, "nif_extra_nope"),
+                                        term, &cd);
+        r3 = enif_dynamic_resource_call(env, mod, enif_make_atom(env, "nif_extra_dyn"),
+                                        enif_make_int(env, 7), &cd);
+        /* The module atom is deliberately the matching one: the Rust runtime compares the type's
+           *name* only (a documented substitution), so a wrong-module call is a divergence. */
+        ok = (r1 == 0 && r2 == 1 && r3 == 1 && dyn_runs == 1 && d->calls == 1 && d->magic == 4242);
+        enif_release_resource(d);
+        return enif_make_int(env, ok ? 1 : 0);
+    }
+
     default:
         break;
     }
@@ -1248,6 +1421,17 @@ static ERL_NIF_TERM probe_term(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
         size_t pos = 1, size = 2;
         return enif_make_int64(env, (ErlNifSInt64) sub_binary_view(env, term, pos, size));
     }
+
+    /* -------------------------------------------------- the off-heap / composed windows (112..114) */
+    case 112: {                                /* a window of a window is the composed window */
+        ERL_NIF_TERM inner = enif_make_sub_binary(env, term, 2, 5);   /* "cdefg" */
+        ERL_NIF_TERM outer = enif_make_sub_binary(env, inner, 1, 3);  /* "def" */
+        return enif_make_int64(env, (ErlNifSInt64) binary_view(env, outer));
+    }
+    case 113:                                  /* the whole refc (off-heap) binary */
+        return enif_make_int64(env, (ErlNifSInt64) binary_view(env, term));
+    case 114:                                  /* a window near the end of the refc binary */
+        return enif_make_int64(env, (ErlNifSInt64) sub_binary_view(env, term, 94, 6));
 
     default:
         break;
@@ -1751,6 +1935,30 @@ pub(crate) fn group() -> Vec<Case> {
             "1",
         ),        // --- enif_inspect_iolist_as_binary: the C's positional shape rules ------------------
         case(
+            "nif_extra/time_offset_completes_the_monotonic_to_wall_clock_loop",
+            "enif_time_offset + enif_monotonic_time is the wall clock enif_now_time reports",
+            &[96],
+            "1",
+        ),
+        case(
+            "nif_extra/select_negative_event_is_an_invalid_event",
+            "enif_select and enif_select_x answer INT_MIN | ERL_NIF_SELECT_INVALID_EVENT outside the fd range",
+            &[97],
+            "1",
+        ),
+        case(
+            "nif_extra/monitor_process_undefined_target_is_dead",
+            "enif_monitor_process answers MONITOR_TARGET_DEAD for an undefined pid on a down-carrying resource",
+            &[98],
+            "1",
+        ),
+        case(
+            "nif_extra/dynamic_resource_call_runs_the_registered_dyncall",
+            "enif_dynamic_resource_call runs the type dyncall on the name match, and answers 1 for an unknown name and a non-resource term",
+            &[99],
+            "1",
+        ),
+        case(
             "nif_extra/iolist_refuses_bare_byte_integer",
             "enif_inspect_iolist_as_binary refuses a bare byte integer (a byte is only ever a cons head)",
             &[101],
@@ -1817,6 +2025,24 @@ pub(crate) fn group() -> Vec<Case> {
             "1",
         ),
         // --- enif_make_sub_binary: bit-offset windows and the zero-size request -------------
+        case(
+            "nif_extra/sub_binary_of_a_sub_binary_composes_the_windows",
+            "enif_make_sub_binary of a sub-binary windows \"cdefg\" at 1 for three bytes: \"def\"",
+            &[112],
+            "3000608",
+        ),
+        case(
+            "nif_extra/inspect_binary_of_an_offheap_binary",
+            "enif_inspect_binary reports the 100 bytes of a refc (off-heap) binary",
+            &[113],
+            "100338350",
+        ),
+        case(
+            "nif_extra/sub_binary_window_of_an_offheap_binary",
+            "enif_make_sub_binary windows an off-heap binary at byte 94 for six bytes",
+            &[114],
+            "6002065",
+        ),
         case(
             "nif_extra/sub_binary_bit_offset_window_from_zero",
             "enif_make_sub_binary windows a bit-offset source by bits (byte pos 0, 8 bytes)",
@@ -2077,6 +2303,19 @@ mod tests {
             "enif_make_map_update",
             "enif_thread_self",
             "enif_equal_tids",
+            "enif_time_offset",
+            "enif_now_time",
+            "enif_monotonic_time",
+            "enif_select",
+            "enif_select_x",
+            "enif_monitor_process",
+            "enif_set_pid_undefined",
+            "enif_dynamic_resource_call",
+            "enif_open_resource_type_x",
+            "enif_init_resource_type",
+            "enif_alloc_resource",
+            "enif_make_resource",
+            "enif_release_resource",
         ] {
             assert!(
                 super::NIF_EXTRA_C.contains(symbol),
@@ -2169,7 +2408,7 @@ mod tests {
         // Every selector a case claims must have a real `case <sel>:` label in the shared library:
         // a missing arm would fall through to the `-1` "unknown selector" tail and the case would
         // pin that sentinel instead of the behaviour it names.
-        for sel in (84..=95).chain(133..=143) {
+        for sel in (84..=99).chain(112..=114).chain(133..=143) {
             assert!(
                 super::NIF_EXTRA_C.contains(&format!("case {sel}:")),
                 "the library must carry a case arm for the widened selector {sel}"
