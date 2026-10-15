@@ -45,6 +45,14 @@
 //! each of those cases now agrees. `modules/bif_base64_encode_empty_size` pins a second
 //! regression on the `run` result path: a zero-length binary result (`base64:encode/1` of an
 //! empty input, an off-heap refc binary) used to be refused (`beam_rt: badarg`, exit `1`).
+//!
+//! The `modules/undef_head_item_*` block pins the **callee-head `undef` stacktrace item** as the
+//! engine synthesizes it from **real bytecode**: the three-argument `try C:R:St ->` pattern —
+//! which the `-eval` evaluator cannot parse — binds the stacktrace directly, and its innermost
+//! item must be the 4-tuple `{Module, Function, ArgList, Location}` (atom module, atom function,
+//! the real argument list, a location list). `modules/fun_info_external_fun_created_in_compiled_code`
+//! pins `erlang:fun_info/1` of a `fun ?MODULE:f/0` **built by compiled code** (an *external* fun:
+//! exactly the `arity`/`env`/`module`/`name`/`type` keys and their values).
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 
@@ -167,6 +175,51 @@ pub(crate) const DIFF_ERL_ERROR_SOURCE: &str = "-module(diff_erl_error).\n\
      fmt_throw_atom_tuple() -> length(lists:flatten(erl_error:format_exception(throw, {a,b}, []))).\n\
      fmt_error_badarg() -> length(lists:flatten(erl_error:format_exception(error, badarg, []))).\n";
 
+/// The source compiled for the `undef`-stacktrace / `fun_info` module-run cases.
+///
+/// These are shapes the runtime's `-eval` evaluator cannot express — it rejects the
+/// three-argument `try C:R:St ->` pattern (the innermost `undef` stacktrace item is therefore
+/// only reachable from **real bytecode**) and it cannot build a *local* fun literal — so the
+/// cases drive them through a compiled module. Every exported function returns an **integer**
+/// (the single shape a module-run golden pins) and reduces its observation to a bit mask over
+/// the properties being checked, so the golden is format- and locale-stable:
+///
+/// * `undef_head_shape/0` — the callee-head item's property mask plus `100 * length(Args)`;
+/// * `undef_head_arg_list/0` — the head item's `Module`/`Function`/`ArgList` identity;
+/// * `external_fun_info/0` — `erlang:fun_info/1` of a `fun ?MODULE:f/0` created by compiled
+///   code (an *external* fun), reduced to its five-key list plus each value.
+pub(crate) const DIFF_TRACE_SOURCE: &str = "-module(diff_trace_info).\n\
+     -export([undef_head_shape/0, undef_head_arg_list/0, external_fun_info/0]).\n\
+     undef_head_shape() ->\n\
+     \x20   try lists:nonexistent_fn_xyz(1,2) of\n\
+     \x20       _ -> 0\n\
+     \x20   catch\n\
+     \x20       _C:_R:St ->\n\
+     \x20           {M,F,Args,Loc} = hd(St),\n\
+     \x20           bool2int(is_atom(M)) + 2 * bool2int(is_atom(F))\n\
+     \x20               + 4 * bool2int(is_list(Args)) + 8 * bool2int(is_list(Loc))\n\
+     \x20               + 100 * length(Args)\n\
+     \x20   end.\n\
+     undef_head_arg_list() ->\n\
+     \x20   try lists:nonexistent_fn_xyz(1,2) of\n\
+     \x20       _ -> 0\n\
+     \x20   catch\n\
+     \x20       _C:_R:St ->\n\
+     \x20           {M,F,Args,_Loc} = hd(St),\n\
+     \x20           bool2int(M =:= lists) + 2 * bool2int(F =:= nonexistent_fn_xyz)\n\
+     \x20               + 4 * bool2int(Args =:= [1,2])\n\
+     \x20   end.\n\
+     external_fun_info() ->\n\
+     \x20   I = erlang:fun_info(fun ?MODULE:undef_head_shape/0),\n\
+     \x20   Keys = lists:sort([K || {K,_} <- I]),\n\
+     \x20   bool2int(Keys =:= [arity, env, module, name, type])\n\
+     \x20       + 2 * bool2int(proplists:get_value(arity, I) =:= 0)\n\
+     \x20       + 4 * bool2int(proplists:get_value(module, I) =:= diff_trace_info)\n\
+     \x20       + 8 * bool2int(proplists:get_value(name, I) =:= undef_head_shape)\n\
+     \x20       + 16 * bool2int(proplists:get_value(type, I) =:= external).\n\
+     bool2int(true) -> 1;\n\
+     bool2int(false) -> 0.\n";
+
 /// Build one module-run case.
 fn case(
     id: &'static str,
@@ -210,6 +263,33 @@ fn err_case(
         kind: CaseKind::Module(ModuleRun {
             source: DIFF_ERL_ERROR_SOURCE,
             module: "diff_erl_error",
+            function,
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
+/// Build one `undef`-stacktrace / `fun_info` module-run case (arity-0, integer result).
+fn trace_case(
+    id: &'static str,
+    description: &'static str,
+    contracts: &'static [Contract],
+    function: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts,
+        kind: CaseKind::Module(ModuleRun {
+            source: DIFF_TRACE_SOURCE,
+            module: "diff_trace_info",
             function,
             arity: 0,
             args: &[],
@@ -854,6 +934,56 @@ pub(crate) fn group() -> Vec<Case> {
             1,
             &[65],
             "0",
+        ),
+        // --- A.1/A.2: the callee-head `undef` stacktrace item from real bytecode ------------
+        //
+        // The three-argument `try C:R:St ->` pattern binds the **stacktrace** directly, but the
+        // runtime's `-eval` evaluator cannot parse that grammar (`beam_rt: unsupported: …
+        // expected an atom, found Some(Var("St"))`), so the shape the `errors/undef_head_item_*`
+        // expression cases reach indirectly — through `element(2, element(2, (catch EXPR)))` — is
+        // only observable verbatim from a **compiled** module. The innermost item of an `undef`
+        // raised by a `call_ext` must be `{Module, Function, ArgList, Location}`: an atom
+        // module, an atom function, the real argument **list** and a location list. The golden
+        // is the bit mask `is_atom(M) + 2*is_atom(F) + 4*is_list(Args) + 8*is_list(Loc)` plus
+        // `100 * length(Args)`, so a 4-tuple with the real 2-element argument list is `215`.
+        trace_case(
+            "modules/undef_head_item_shape_in_compiled_code",
+            "from compiled bytecode the innermost undef stacktrace item has an atom module, atom function and list arg list",
+            &[BeamAsm, LanguageSemantics],
+            "undef_head_shape",
+            "215",
+        ),
+        // The bit mask alone would accept *any* module/function/argument list, so the identity of
+        // the head item is pinned separately: the `call_ext` names `lists:nonexistent_fn_xyz/2`,
+        // so the item must read `{lists, nonexistent_fn_xyz, [1,2], _Loc}` (mask `1 + 2 + 4`).
+        trace_case(
+            "modules/undef_head_item_identity_in_compiled_code",
+            "from compiled bytecode the innermost undef stacktrace item names the called module, function and its argument list",
+            &[BeamAsm, LanguageSemantics],
+            "undef_head_arg_list",
+            "7",
+        ),
+        // --- A.7/A.2: `erlang:fun_info/1` of a fun built by compiled code --------------------
+        //
+        // `fun ?MODULE:f/0` compiled into the module's own code yields an **external** fun: its
+        // `fun_info/1` carries exactly the five `arity`/`env`/`module`/`name`/`type` keys, with
+        // the defining module, the exported function's name, arity 0, an empty env and the atom
+        // `external` (the `-eval` route reaches only the `fun lists:reverse/1` form, pinned by
+        // `system_info.rs`'s `fun_info/external_fun_*` cases). The golden is the five-key list
+        // plus all four values, so a full match is `1 + 2 + 4 + 8 + 16 = 31`.
+        //
+        // The **local**-fun sibling is deliberately absent: `erlang:fun_info/1` of a local fun
+        // created by compiled code is an honest capability gap today (the runtime answers
+        // `beam_rt: unsupported: bif`, exit 3 — its `fun_info/2` `module` item needs the
+        // local-fun identity seam and the whole-list walk needs the loaded module's fun table
+        // for the lambda name), so a case pinning it would be an unrecorded gap, never
+        // agreement. It stays unpinned until the owning crate (`beam_bifs` / `beam_rt`) closes it.
+        trace_case(
+            "modules/fun_info_external_fun_created_in_compiled_code",
+            "erlang:fun_info/1 of a compiled `fun ?MODULE:f/0` is the five-key external-fun proplist",
+            &[BeamAsm, OtpApps],
+            "external_fun_info",
+            "31",
         ),
     ]
 }
