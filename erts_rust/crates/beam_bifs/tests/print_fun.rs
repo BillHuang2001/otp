@@ -679,9 +679,11 @@ fn beam_rt_binary() -> Option<PathBuf> {
     None
 }
 
-/// The original end-to-end repro: `beam_rt -eval
+/// The original end-to-end repro: `beam_rt -noshell -eval
 /// 'io:format("~p~n",[fun lists:reverse/1]),halt(0).'` must print the fun's text and
-/// exit 0 (it used to print `beam_rt: badarg` and exit 1).
+/// exit 0 (it used to print `beam_rt: badarg` and exit 1). `-noshell` is required so
+/// the runtime prints no startup banner ahead of the result (the oracle is also run
+/// with `-noshell`).
 ///
 /// The `beam_rt` binary is only present when the workspace has been built beyond
 /// `-p beam_bifs`, so a missing binary prints a LOUD warning and skips.
@@ -698,6 +700,7 @@ fn beam_rt_prints_a_fun_in_byte_code_eval() {
 
     let eval = "io:format(\"~p~n\",[fun lists:reverse/1]),halt(0).";
     let output = Command::new(&binary)
+        .arg("-noshell")
         .arg("-eval")
         .arg(eval)
         .stdin(Stdio::null())
@@ -712,7 +715,7 @@ fn beam_rt_prints_a_fun_in_byte_code_eval() {
     );
     assert!(
         output.status.success(),
-        "`beam_rt -eval '{eval}'` exited with {:?}\n--- stderr ---\n{stderr}",
+        "`beam_rt -noshell -eval '{eval}'` exited with {:?}\n--- stderr ---\n{stderr}",
         output.status.code(),
     );
 
