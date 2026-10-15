@@ -477,8 +477,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   selectors, and pins the `cmp`→`cmp_arith` arithmetic-key behaviour.
 - **Microbenchmarks** (`interior_bench.rs`): chained vs CHAMP and B+-tree vs sorted `Vec`, with in-line
   correctness assertions. Run with `… -p beam_ets --lib interior_microbenchmark -- --nocapture` (or
-  `ordered_interior_microbenchmark`); sizes/shapes via `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`.
-  The measured outcomes, and every memory figure quoted in this file, live in `PERF.md`.
+  `ordered_interior_microbenchmark`); sizes/shapes via `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`,
+  plus the ordered interior's **key-order** dimension via
+  `BEAM_ETS_BENCH_ORDER=shuffled|ascending|descending|all` (default `shuffled`) — the order is
+  irrelevant to the B+-tree and decisive for the sorted `Vec`, so both interiors' best *and* worst cases
+  get measured. The measured outcomes live in `PERF.md` (§3 for the ordered interior).
 - Crate-level integration over the **public API**: `tests/ets_*.rs`, `tests/select.rs`,
   `tests/match_spec_run.rs`, helpers from `tests/common/` and the live-`erl` plumbing in
   `tests/common/oracle.rs`. Reclamation/accounting files:
