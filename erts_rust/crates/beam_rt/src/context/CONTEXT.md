@@ -123,9 +123,32 @@ Oracle answers below are from the system `erl` (OTP 29.1.1 / erts-17.1).
 * **Dispatch cost is a first-class concern**: every handle built in `call_bif`/`call_registered` must be gated by its own `uses_*`/`needs_*` predicate, and every per-call input the prologue derives belongs in the `dispatch` memo (any input that can change during a run — the NIF registry — must stay out). Measure with [`../../examples/perf_call.rs`](../../examples/perf_call.rs) (figures in [`../../PERF.md`](../../PERF.md)); `../../examples/perf_bif.rs`'s `pc:*` fixture lowers to an inlined `gc_bif` and **cannot** measure registry dispatch ([`../../TRACE_AND_PERF.md`](../../TRACE_AND_PERF.md)).
 
 ## Known Issues
-* **A float-using call-site module never reaches a collection, so its loop's garbage lands in the never-freed arena and peak RSS grows with the iteration count.** The collection chain is gated **first** by the caller-module float test (`!module_may_be_collected(runtime, name)`), before the unscanned-root valve, in `gc.rs::ensure_heap`/`ensure_heap_full`/`alloc_words_rooted`, each of which returns `Ok(())`/falls back; `module_uses_floats` (`gc.rs:130`) is `true` for any module whose IR contains a float op (`Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`), reached by a **float literal** (`fmove {float,K} {fr,N}`, `../beam_engine/src/families/floats/mod.rs`).
-  `beam_gc`'s default nursery is **233 words** (`HeapPolicy::default().initial_young_words`, `../../../beam_gc/src/policy.rs:147`, `max_heap_words == 0`), so it fills within one iteration and every later `alloc_words_rooted` refusal takes the arena fallback (`gc.rs:916-919` → `runtime.rs:1068`'s never-reset arena region heap).
-  **Scope:** the float-using-module gap only — `copy_bound/ets_copy`'s RSS growth is a **different** mechanism (the BIF-result copy-out retaining retired young space), documented in [`../M1_GAPS.md`](../M1_GAPS.md) *GC / heap model*.
+* **The float guard lives on the narrow door alone; the full doors are FR-safe.** The engine
+  reaches only [`ensure_heap_full`](gc.rs) (`Machine::ensure_heap`/`test_heap`/`allocate_heap` →
+  `ExecutionContext::ensure_heap_full` → `BudgetContext::ensure_heap_full` → `arm_gc`), which
+  publishes and scatters the machine's **whole** [`RootSet`] — every x slot, the whole stack and
+  the whole FR file (`fr_count = roots.fr.len()`) — so a live float register is relocated like any
+  other root and [`ensure_heap_full`](gc.rs) and [`alloc_words_rooted`](gc.rs) consult **no**
+  caller-module float test at all. A float-using call site therefore collects exactly like a
+  float-free one. The **narrow** [`ensure_heap`](gc.rs) is handed only an x prefix and the stack
+  and can never see the FR file, so its caller-module guard ([`module_may_be_collected`](gc.rs) →
+  [`module_uses_floats`](gc.rs), matching `Instr::{Fmove,Fconv,Fadd,Fsub,Fmul,Fdiv,Fnegate}` and
+  reached by a float literal `fmove {float,K} {fr,N}`) is load-bearing there and stays — the narrow
+  door is not on the engine's path today. All four doors still refuse a run with **no** caller
+  module (a fun entry, the `-eval` evaluator): no machine to name, left alone rather than guessed.
+* **Both heap-admission doors OR the occupancy test with the collector's collection debt.**
+  [`Process::grow_nursery`] is the no-relocation growth seam: it retires the young space it
+  replaces instead of freeing it, so a growth-shaped workload keeps its whole allocation history
+  resident in the retired chain until a real collection evacuates it. The doors therefore read
+  `let debt = process.collection_debt();` and collect when `forced || process.should_collect(need)
+  || debt`. [`Process::should_collect`] stays the **occupancy test alone** (pinned as such by its
+  own unit tests); the debt is the growth seam's separate signal.
+* **Residual blocker (out of this node): the runner's post-slice float pin.** A slice that ends
+  with a live FR slot (`Machine::fr_mark() > 0`) pins the process **permanently**
+  (`src/runner/run.rs:586-589` → `Runtime::pin_process`), so a float-using module collects
+  *inside* its first slice and is then refused by that pin from its second slice on
+  (`gc_stats()` shows `collections > 0, pinned: 1`). Closing it needs a `src/runner/**` change (a
+  per-slice fr_mark reset/react rather than a permanent pin) — escalated, not papered over here.
 * **A scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks in a `receive` is the typed `blocked()` gap.** A cross-module call the engine cannot enter in-machine goes through `call_bif` → `run_export` → `run_export_blocking` (a fresh `Machine` on the same pid under a `for_process*` context, so `may_pump_scheduler()` is `false`) and `pump_once` returns `Ok(None)` **on its first line**, folding the parked callee into `beam_engine::blocked()` (an uncatchable capability gap) whether or not its `receive` carries an `after T` — the refusal is per `callee_observes_its_call_site`. Nothing here is a wrong result.
 * **`erlang:fun_info/1,2` reads the `LocalFunIdentity` seam, and its `name` item comes from two wiring sites here.** `bridges.rs::local_fun_identity` attaches the `FunT` entry's `function` to the `FunIdentity` it derives for a compiled `make_fun3` fun (`with_function`; introspection-only, so the `term_to_binary` bytes are unchanged); `fun_identity.rs::imported_identity` resolves a decoded `NEW_FUN_EXT` fun's `name` from the loaded module named by the term's own `module` atom, requiring `descriptor_position(module, old_uniq, index) == Some(old_index)`. Both reachable only on the `uses_fun_identity` arm, which `dispatch.rs::reads_fun_identity_for_introspection` extends to the `erlang:fun_info/1,2` pair (`beam_bifs`' `LOCAL_FUN_IDENTITY_BIFS` roster names only the two encoders).
   The one residual: an imported fun whose **defining module is not loaded** (`descriptor_position` finds no matching module) is the typed `unsupported_bif` gap, where the oracle reports `{name,[]}` (C `mfa == NULL ⇒ NIL`, `erl_bif_info.c:4007-4010`) — the seam has no `NIL` to hand over. Pinned by `fun_identity.rs`'s `an_imported_funs_unloaded_defining_module_is_the_typed_gap_not_an_empty_name`; never a fabricated name.
