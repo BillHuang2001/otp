@@ -25,6 +25,8 @@ the table footprint `Table::memory`/`TermStore::words` vs process RSS — plus t
 one-time warm-up step in process RSS. The `copy_bound/ets_copy` bench loop's rust-vs-oracle peak-RSS
 growth is therefore **sibling-side**: `beam_rt/src/context/calls.rs`'s nursery growth
 (`move_result_into_process_heap` + a one-shot `Process::grow_nursery`, nothing shrinking it back).
+**§3** records the `ordered_set` interior itself — the B+-tree vs the sorted `Vec` at several sizes and
+key orders, both sides of every ratio plus the run's `/proc/loadavg`.
 
 ## Position & dependencies
 Crate-layer **wave 1** (`../CONTEXT.md`). Depends only on `beam_common` (errors), `beam_term` (terms +
