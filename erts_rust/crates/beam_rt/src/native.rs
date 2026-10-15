@@ -232,9 +232,19 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("loaded_applications", 0),
             ("which_applications", 0),
         ]),
-        // `code` is the same shape: the floor answers the *queries* below and the
-        // `lib/kernel/src/code.erl` bodies (`start_link/0`, `add_path/1`, `stick_dir/1`, …)
-        // delegate to the code server.
+        // `code` is the same shape: the floor answers the *queries* below **and** the
+        // path-mutating entries (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`,
+        // `del_path/1`). Entering the `lib/kernel/src/code.erl` bodies instead would reach the
+        // *live* `code_server` process, whose path store is a **second, incoherent** one: this
+        // runtime's `code:get_path/0`, `code:load_file/1`, `code:which/1`,
+        // `code:get_object_code/1`, `code:ensure_loaded/1` and `code:where_is_file/1` all read
+        // [`CodeServer`](crate::CodeServer)'s path, so a directory added through the module
+        // body landed only in the code server's own copy —
+        // `code:add_patha(Dir), code:load_file(M)` answered `{error,nofile}` while
+        // `lists:member(Dir, code:get_path())` (answered by that same process) said `true`.
+        // The floor owns the **one** authoritative store instead. Every *other* `code:*`
+        // (`stick_dir/1`, `set_path/1,2`, `add_paths/1`, `del_paths/1`, `unstick_dir/1`, …)
+        // stays an ordinary `lib/kernel/src/code.erl` body.
         // `init` is the same shape as `io`/`application`/`code`: the floor answers the
         // queries below and every other `init:*` is a `lib/kernel/src/init.erl` body
         // (`code_path_choice/0`, …). Refusing it wholesale routed `code_server`'s
@@ -270,6 +280,18 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("get_mode", 0),
             ("priv_dir", 1),
             ("where_is_file", 1),
+            // The **path-mutating** half of `code` — see the note on [`floor_keys`]'s `code`
+            // arm. The floor owns these so the path this runtime *searches* and the path
+            // `code:get_path/0` *reports* are the one [`CodeServer`](crate::CodeServer) store;
+            // entering the `code.erl` bodies would talk to the live `code_server` process and
+            // its separate copy. The bodies live in [`native::code::path`].
+            ("add_patha", 1),
+            ("add_patha", 2),
+            ("add_pathz", 1),
+            ("add_pathz", 2),
+            ("add_path", 1),
+            ("add_path", 2),
+            ("del_path", 1),
         ]),
         // The Erlang-level distribution supervisor entry. `kernel_sup`'s `net_sup` child is
         // `{erl_distribution, start_link, []}` (`lib/kernel/src/kernel.erl:264`) and
@@ -355,6 +377,15 @@ impl RuntimeContext<'_> {
             // path-based and needs no loaded module, so the floor serves it (see
             // [`code`](crate::native::code)).
             ("code", "where_is_file", 1) => Some(self.code_where_is_file(args)),
+            // The **path-mutating** `code:*` entries (see [`floor_keys`]): the floor owns them
+            // so this runtime's [`CodeServer`](crate::CodeServer) is the ONE code path — both
+            // the store `code:get_path/0` reports and the one `code:load_file/1`,
+            // `code:which/1` and every module lookup search. `add_path/1,2` folds into
+            // `add_pathz` exactly as `code.erl:1075-1077` does.
+            ("code", "add_patha", 1 | 2) => Some(self.code_add_patha(args)),
+            ("code", "add_pathz", 1 | 2) => Some(self.code_add_pathz(args)),
+            ("code", "add_path", 1 | 2) => Some(self.code_add_pathz(args)),
+            ("code", "del_path", 1) => Some(self.code_del_path(args)),
             ("application", "get_env", 1) => Some(self.application_get_env_1()),
             ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
             ("application", "get_env", 3) => Some(self.application_get_env_3(args)),

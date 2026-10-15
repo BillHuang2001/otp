@@ -21,10 +21,12 @@
 //! `code:load_file/1` (contract A.7) end to end, through the built `beam_rt` binary and
 //! cross-checked against the live system Erlang.
 //!
-//! The runtime serves `code:*` from its **native floor** (`src/native/code.rs`), not from a
-//! live `code_server` process, so `code:load_file/1` is a BIF-level load of the module's
-//! `.beam` through this runtime's own code server. Its contract is the oracle's three-way
-//! `{error, Reason}` / `{module, Module}`:
+//! `code:load_file/1` is a BIF-level load of the module's `.beam`: every route but `-version`
+//! drives a boot script, and the booted `kernel_sup` carries a **live `code_server` process**,
+//! while the code-path mutators and the read-side queries are served from **one** authoritative
+//! store on the native floor (`src/native/code.rs` + `src/native/code/path.rs`) so the path they
+//! report and the path the loader searches can never disagree. This suite pins the loader's
+//! observable contract, which is the oracle's `{error, Reason}` / `{module, Module}`:
 //!
 //! 1. a **sticky** module (preloaded, or resolved under a `kernel`/`stdlib`/`compiler`
 //!    directory) ⇒ `{error,sticky_directory}`;
