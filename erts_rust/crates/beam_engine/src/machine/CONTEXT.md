@@ -28,8 +28,7 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   alongside the module contexts (both belong to the run that is starting) **and clears all four raise
   latches** (`pending_function_clause_args`/`raise_function_clause_args`/`pending_supplied_trace`/
   `raise_supplied_trace`).
-- `mod.rs` — the four raise latches, all machine-held values outside the frozen root set (a collecting host
-  roots the heap-term ones the way it roots the pending exception). The failed-clause pair:
+- `mod.rs` — the four raise latches. The failed-clause pair:
   `pending_function_clause_args: Option<Eterm>` (one-shot — armed by the raise site, consumed by the
   `throw_with_trace` that lands it, so a propelling `Err` cannot leave a stale list for a later trace) and
   `raise_function_clause_args: Option<Eterm>` (the **live raise** state, set on every `throw_with_trace` and
@@ -37,6 +36,14 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `pending_supplied_trace: Option<StackTrace>` (one-shot, armed only when an incoming `BeamError::Raise`
   carries **non-empty** symbolic frames — the `erlang:raise/3` trace-list shape) and
   `raise_supplied_trace: Option<StackTrace>` (the live state for the raise being landed).
+  **Rooting: `Machine::with_roots` (the single root hand-off behind `alloc_rooted`/`ensure_heap`) PARKS the
+  two armed heap-term latches** — `raise_function_clause_args` then `pending_function_clause_args` — onto the
+  tail of `self.stack` for the duration of the hand-off, hands over the `RootSet`, then **re-seats** each
+  field from its slot (`self.stack.get(cursor).copied()` — the stack is rooted in full, so a conforming host
+  relocates the parked word and the engine reads the *moved* term back), and finally `stack.truncate(base)`.
+  With both latches `None` the `RootSet` is handed over **unmodified** (byte-identical fast path). The
+  supplied-trace pair is plain `Vec<StackFrame>` **metadata**, not a heap term, so it needs no rooting.
+  `Machine::pending_exception` is **not** parked here — `beam_rt` roots it via `Registers::extra_roots`.
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
   caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).

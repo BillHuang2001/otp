@@ -120,14 +120,15 @@ allocation to reserve, so `with_roots`/`alloc_rooted` do not apply (and cannot: 
 `x(arity)`/the operand and re-collect `args` after the seam call and before `fun_free`, never to
 "publish" (there is no door to publish through).
 
-**The real relocation hazard on this call stack is not at the copy site** — it is engine-held live terms
-absent from the host's *published* root set, on a collection that fires outside the admission hand-off.
-The one named instance is `Machine::pending_exception` (`machine/catch.rs:119`), a live reason `Eterm`
-that `beam_process::Registers::gather_roots` does not carry; the write accessor a collecting host needs
-(`Machine::pending_exception_mut`, `machine/catch.rs:135`) already exists, so the **engine-side half is
-done**. The remaining fix is host-side (`beam_process` extra-root slot + `beam_rt`'s
-`publish_parked_roots`, or `gc::halt_process_gc` on the park/yield arm); it and the other Rust-local
-vectors are recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
+**Engine-held live terms and the published root set.** The two heap-term raise latches
+(`raise_function_clause_args`/`pending_function_clause_args`) are **parked into the published root set**
+by `Machine::with_roots` for the duration of every hand-off and re-seated from their slots afterwards (a
+`with_roots` fast path hands over an unmodified `RootSet` when neither is armed), so a collecting host
+relocates them with no host-side change; the supplied-trace latches are `Vec<StackFrame>` metadata and
+need no rooting. `Machine::pending_exception` (`machine/catch.rs`) is the remaining engine-held live
+reason `Eterm`: it is rooted **host-side** by `beam_rt` via `Registers::extra_roots` (the write accessor a
+collecting host needs, `Machine::pending_exception_mut`, exists). The other Rust-local vectors are
+recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
 
 ## See Also
 - `../CONTEXT.md` → the crate-level FROZEN API surface, execution model, constraints and handoffs.
