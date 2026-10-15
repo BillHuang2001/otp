@@ -47,7 +47,17 @@ This is the frozen public-API shape dependents design against; keep it stable.
 - `beam_engine` → the execution loop + an **`ExecutionContext` trait** (BIF dispatch, term alloc,
   process/stack state, trap/signal handling) plus a **`Mailbox` trait** — the receive/message seam
   (`send_message`/`receive_next`/`receive_skip`/`receive_remove`/`receive_reset`/`receive_marker_*`,
-  every method **defaulted** to a typed `unsupported`) — so the engine depends only on
+  every method **defaulted** to a typed `unsupported`). `ExecutionContext` also carries the
+  **defaulted case-lowering seams**: the in-machine module-context switch (`enter_module`), the
+  local-fun resolver (`resolve_local_fun`), the runtime-atom name/VALUE accessors (`atom_name` +
+  `atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable`), the reduction/`reduce` hook,
+  `apply_fun`/`apply_target`, `resolve_external_call` and `current_module`. **`atoms` is the
+  atom-namespace seam every guard/`select_val`/map-key comparison site reads** (trait default =
+  `&module.atom_table`, the module's load-time snapshot), so a host that owns ONE live shared
+  namespace (all of `beam_rt`, via `RuntimeContext` **and** the scheduled path's `BudgetContext`)
+  makes atom ordering name-exact and identical to the comparison BIFs', instead of silently falling
+  back to raw atom-index order when a name is missing from the snapshot
+  (`beam_term/src/compare.rs::cmp_atoms`). The engine therefore depends only on
   `beam_loader`/`beam_alloc` and the concrete context is supplied by `beam_rt` (keeps the
   Stage-1/Stage-5 DAG acyclic). A receive that finds no message suspends through the engine's block
   outcome (`RunOutcome { Returned, Wait }` + `run_export_outcome`/`run_label_outcome`/`resume_outcome`;
