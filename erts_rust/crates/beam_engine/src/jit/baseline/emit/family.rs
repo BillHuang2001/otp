@@ -44,7 +44,7 @@ use super::{emit_continue_check, emit_helper_call, Allocation};
 /// [`emit_helper_call`] + [`emit_continue_check`] — the spill-then-call contract and the
 /// partial refill after the call included. It writes any destination **through
 /// `machine.x`** (like every other helper), which is why the variants it serves
-/// contribute no [`cacheable register`](super::regalloc) touches or writes: the
+/// contribute no cacheable register touches or writes to the block's allocation: the
 /// continuation's refill is what keeps a cached register coherent, and every register a
 /// later instruction reads natively is in that refill set by construction.
 ///
