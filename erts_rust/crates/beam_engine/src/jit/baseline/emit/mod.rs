@@ -923,14 +923,43 @@ fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
-            // The family-owned **term constructors** the interpreter's `other` arm hands to
-            // [`crate::families::dispatch`]: `put_list` builds a cons cell and `put_tuple2`
-            // a tuple, so the lowering is interpreter-identical **by construction** (one
-            // block-local continue, else the family's own word for the driver) — the same
-            // shape as the receive family's arm above, through the shared family helper.
-            Instr::PutList { .. } | Instr::PutTuple2 { .. } => {
-                family::emit_family(buffer, allocation, done, func, pc)?
-            }
+            // The **whole family-owned surface** the interpreter's `other` arm hands to
+            // [`crate::families::dispatch`] — every variant [`crate::families::dispatch`]
+            // claims and the interpreter's core arms above do **not** (the tuples/list
+            // *readers* `get_tuple_element`/`set_tuple_element`/`select_tuple_arity`/
+            // `get_list`/`get_hd`/`get_tl` and the receive family keep their own arms
+            // above). Each is routed to its owning family's own body through the shared
+            // family helper, so the lowering is interpreter-identical **by construction**
+            // (one block-local continue, else the family's own word for the driver) — the
+            // same shape as the receive family's arm above.
+            //
+            // `dispatch` routes by the instruction's own variant to the single owning
+            // family, and an unclaimed variant is the same documented `unsupported` the
+            // interpreter emits (both reach the identical `families::dispatch` call), so
+            // this arm can never produce a different result than the interpreter's
+            // per-instruction step it replaces.
+            Instr::PutList { .. } | Instr::PutTuple2 { .. }
+            | Instr::UpdateRecord(_) | Instr::IsAnyNativeRecord { .. } | Instr::IsNativeRecord { .. }
+            | Instr::GetRecordElements { .. } | Instr::GetRecordElementsId { .. } | Instr::PutRecord(_)
+            | Instr::IsRecordAccessible { .. } | Instr::GetRecordField(_) | Instr::UpdateRecordId(_)
+            | Instr::MakeFun3 { .. } | Instr::CallFun { .. } | Instr::CallFun2 { .. }
+            | Instr::Apply { .. } | Instr::ApplyLast { .. }
+            | Instr::Try { .. } | Instr::Catch { .. } | Instr::Badmatch { .. } | Instr::CaseEnd { .. }
+            | Instr::TryCaseEnd { .. } | Instr::Badrecord { .. } | Instr::IfEnd | Instr::Raise { .. }
+            | Instr::TryCase { .. } | Instr::TryEnd { .. } | Instr::CatchEnd { .. }
+            | Instr::BuildStacktrace | Instr::RawRaise
+            | Instr::Fmove { .. } | Instr::Fconv { .. } | Instr::Fadd { .. } | Instr::Fsub { .. }
+            | Instr::Fmul { .. } | Instr::Fdiv { .. } | Instr::Fnegate { .. }
+            | Instr::GetMapElements { .. } | Instr::HasMapFields { .. } | Instr::PutMapAssoc(_) | Instr::PutMapExact(_)
+            | Instr::BsStartMatch3 { .. } | Instr::BsStartMatch4 { .. } | Instr::BsGetPosition { .. }
+            | Instr::BsSetPosition { .. } | Instr::BsGetTail { .. } | Instr::BsTestTail2 { .. }
+            | Instr::BsGetInteger2(_) | Instr::BsGetBinary2(_) | Instr::BsSkipBits2 { .. } | Instr::BsMatch { .. }
+            | Instr::BsMatchString { .. } | Instr::BsGetFloat2(_) | Instr::BsGetUtf8 { .. }
+            | Instr::BsGetUtf16 { .. } | Instr::BsGetUtf32 { .. } | Instr::BsSkipUtf8 { .. }
+            | Instr::BsSkipUtf16 { .. } | Instr::BsSkipUtf32 { .. } | Instr::BsInitWritable | Instr::BsCreateBin { .. }
+            | Instr::RecvMarkerReserve { .. } | Instr::RecvMarkerBind { .. }
+            | Instr::RecvMarkerUse { .. } | Instr::RecvMarkerClear { .. }
+            => { family::emit_family(buffer, allocation, done, func, pc)? }
             // Everything else: one interpreter step, then continue at `pc + 1`.
             _ => emit_deopt(buffer, done, allocation, func, pc, instr)?,
         }
