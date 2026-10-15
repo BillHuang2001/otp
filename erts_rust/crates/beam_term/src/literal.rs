@@ -27,7 +27,7 @@
 
 use core::mem::MaybeUninit;
 
-use crate::boxed::{header_is_thing, thing_arityval, HEADER_SUB_BITS, is_boxed};
+use crate::boxed::{header_is_thing, is_boxed, is_fun_header, thing_arityval, HEADER_SUB_BITS};
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::list::is_list;
@@ -72,6 +72,16 @@ fn tag_words(area: &mut [Eterm]) {
                     // inside the thing structure, so we can handle it by
                     // pretending it is not part of the thing.
                     i += thing_arityval(word) - 1;
+                } else if is_fun_header(word) {
+                    // Ground truth: C's `erts_set_literal_tag` advances by
+                    // `thing_arityval(*hp)` = ERL_FUN_SIZE - 1 = 1 — the single
+                    // raw out-of-line `entry` pointer word. This tree inlines
+                    // that pointer as `fun_desc_words(kind)` raw descriptor
+                    // words, so the raw-word skip is
+                    // `fun_desc_words(fun_kind_of_header(word))`; the
+                    // environment terms that follow are then tagged normally
+                    // (as in C).
+                    i += crate::fun::fun_desc_words(crate::fun::fun_kind_of_header(word));
                 } else if header_is_thing(word) {
                     i += thing_arityval(word);
                 }
@@ -126,6 +136,17 @@ pub unsafe fn set_literal_tag(term: *mut Eterm, hp_start: *mut Eterm, hsz: usize
 ///     i.e. advance by `thing_arityval(word) - 1` words, leaving the walk on the
 ///     `orig` field (the last thing word) so the *following* iteration tags it
 ///     as a pointer.
+///   * A **fun header** (`is_fun_header`, `FUN_SUBTAG`): the C advances by
+///     `thing_arityval(word) = ERL_FUN_SIZE - 1 = 1`, the single raw out-of-line
+///     `entry` pointer word of the C `ErlFunThing` (`[thing_word][entry][env…]`,
+///     `erl_term.c:36-69`). This tree *inlines* that pointer as
+///     `fun_desc_words(fun_kind_of_header(word))` descriptor words (`2` for a
+///     `Local`, `3` for an `External`, `10` for an `Imported` fun — see
+///     [`crate::fun`]), so the raw-word skip is the whole descriptor. The
+///     environment terms that follow are then tagged normally, exactly as the C
+///     tags them after stepping over `entry`. Without this arm the walk would
+///     resume *inside* the descriptor and OR `TAG_LITERAL_PTR` into raw
+///     descriptor words (e.g. an `External` fun's true-arity word `1 → 5`).
 ///   * Otherwise, if `header_is_thing(word)` (a genuine thing header, not a
 ///     transparent arityval/record), advance by its `thing_arityval(word)` body
 ///     words so the whole thing body is left intact.
@@ -227,8 +248,12 @@ impl LiteralArea {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atom::Atom;
     use crate::boxed::make_arityval;
-    use crate::immediate::{make_small, NIL};
+    use crate::fun::{
+        fun_desc_words, fun_kind, fun_kind_of_header, fun_words, make_fun_header, FunKind,
+    };
+    use crate::immediate::{make_atom, make_small, NIL};
     use crate::list::{car, cdr, list_val, make_list};
     use crate::tuple::make_tuple;
 
@@ -331,6 +356,93 @@ mod tests {
                 "list_val masks the literal bit, so the pointer is unchanged"
             );
         }
+    }
+
+    #[test]
+    fn tag_literal_area_leaves_the_local_fun_descriptor_intact() {
+        // A fun header is a HEADER word, but its body is NOT `thing_arityval`
+        // (the legacy C `ERL_FUN_SIZE - 1 == 1`) words: the C's single raw
+        // out-of-line `entry` pointer is inlined here as `fun_desc_words(kind)`
+        // raw descriptor words. So the walk must skip the WHOLE descriptor and
+        // only resume tagging at the environment.
+        assert_eq!(fun_desc_words(FunKind::Local), 2);
+        assert_eq!(fun_words(FunKind::Local, 1), 4);
+
+        // Local fun: [header][uniq][index][env[0]] with num_free == 1, followed by
+        // the cons cell the env slot points at.
+        let header = make_fun_header(1, 1, FunKind::Local).unwrap();
+        let mut words = [NIL; 6];
+        words[0] = header;
+        // Raw descriptor words, chosen so their low bits read as pointer tags:
+        // `uniq`'s low bits are BOXED (0b10) and `index == 2` is BOXED too, so
+        // pre-fix (when the walk resumed *inside* the descriptor) they picked up
+        // `TAG_LITERAL_PTR`.
+        words[1] = Eterm::from_raw(0xDEAD_BEEF_0000_0002);
+        words[2] = Eterm::from_raw(2);
+        let cons_ptr = unsafe { words.as_ptr().add(4) };
+        words[3] = make_list(cons_ptr); // env[0] — a cons cell (BOXED/LIST slot)
+        words[4] = make_small(7); // CAR
+        words[5] = NIL; // CDR
+        let mut root = crate::boxed::make_boxed(words.as_ptr());
+
+        let desc_before = [words[1], words[2]];
+        tag_literal_area(&mut words, core::slice::from_mut(&mut root));
+
+        // The fun header itself is never tagged (ORing bit 2 would corrupt its subtag).
+        assert_eq!(words[0], header, "the fun header is left bit-identical");
+        assert_eq!(fun_kind(words[0]).unwrap(), FunKind::Local);
+        // The regression pin: every raw descriptor word is byte-unchanged.
+        assert_eq!(
+            words[1], desc_before[0],
+            "the raw `uniq` word is not tagged"
+        );
+        assert_eq!(
+            words[2], desc_before[1],
+            "the raw `index` word is not tagged"
+        );
+        // The environment terms that follow the descriptor ARE tagged, as in C.
+        assert!(is_literal(words[3]), "the boxed env slot must be tagged");
+        assert!(is_literal(root), "the fun root must be tagged");
+        // The graph still resolves: `list_val` masks the literal bit.
+        unsafe {
+            assert_eq!(list_val(words[3]) as *const Eterm, cons_ptr);
+            assert_eq!(car(words[3]), make_small(7));
+            assert_eq!(cdr(words[3]), NIL);
+        }
+        assert_eq!(words[4], make_small(7), "the CAR small int is untouched");
+        assert_eq!(words[5], NIL, "the CDR NIL is untouched");
+    }
+
+    #[test]
+    fn tag_literal_area_leaves_the_external_fun_descriptor_intact() {
+        // `External` (EXPORT_EXT) descriptor: [header][module][function][true arity].
+        assert_eq!(fun_desc_words(FunKind::External), 3);
+        assert_eq!(fun_words(FunKind::External, 0), 4);
+
+        let header = make_fun_header(1, 0, FunKind::External).unwrap();
+        let mut words = [NIL; 4];
+        words[0] = header;
+        // The module/function atoms are immediate atoms, never tagged.
+        words[1] = make_atom(Atom::from_raw(0));
+        words[2] = make_atom(Atom::from_raw(1));
+        // The raw true-arity word. `1` has primary tag LIST, which is exactly the
+        // C value the pre-fix walk corrupted (`1 -> 5`).
+        words[3] = Eterm::from_raw(1);
+        let mut root = crate::boxed::make_boxed(words.as_ptr());
+
+        let desc_before = [words[1], words[2], words[3]];
+        tag_literal_area(&mut words, core::slice::from_mut(&mut root));
+
+        assert_eq!(words[0], header, "the fun header is left bit-identical");
+        assert_eq!(fun_kind_of_header(words[0]), FunKind::External);
+        assert_eq!(words[1], desc_before[0], "the module word is unchanged");
+        assert_eq!(words[2], desc_before[1], "the function word is unchanged");
+        assert_eq!(
+            words[3], desc_before[2],
+            "the raw true-arity word is left bit-identical (pre-fix: 1 -> 5)"
+        );
+        assert_eq!(words[3].raw(), 1);
+        assert!(is_literal(root), "the fun root must be tagged");
     }
 
     #[test]
