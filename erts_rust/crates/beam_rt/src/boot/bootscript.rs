@@ -392,7 +392,18 @@ fn execute_instruction(
         Instruction::Path(directories) => {
             for directory in directories {
                 let expanded = expand_root(runtime, directory)?;
-                runtime.add_code_path(expanded);
+                // The code server keeps only **real** directories: `code:add_patha/1`
+                // answers `{error,bad_directory}` for an absent one and `strip_path/2`
+                // runs over `check_path/1`, so a dangling entry never lands on the path
+                // (verified against OTP 29.1.1 / erts-17.1). A `{path, …}` directive can
+                // name a directory the running installation does not have — the committed
+                // `bootstrap/bin/start.boot` is a *source tree*'s primary bootstrap, so its
+                // `$ROOT/lib/kernel/ebin` is unversioned and need not exist under the
+                // consumed installation's `<Root>` — and appending it would put a
+                // non-existent directory on `code:get_path/0` where the oracle has none.
+                if expanded.is_dir() {
+                    runtime.add_code_path(expanded);
+                }
             }
             Ok(())
         }

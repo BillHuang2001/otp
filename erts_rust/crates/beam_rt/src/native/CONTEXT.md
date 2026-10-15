@@ -910,9 +910,9 @@ it lazily through `kernel_sup`).
   the runtime resolved (`$ERTS_STDLIB_DIR`, else the filesystem probe), which is the oracle's own
   emulator directory whenever both run against the same installation.
 - `init:script_id/0` is the **loaded** boot script's `{Name,Vsn}`.
-  Every CLI action but `-version` loads one, so it answers the resolved script's real header — measured `{"Erlang/OTP","29"}` on this host, read from the installation's own `bin/start.boot`.
+  Every CLI action but `-version` loads one, so it answers the resolved script's real header — on the default route (no `-boot`) that is **this runtime's own** release's committed `bootstrap/bin/start.boot`, i.e. `{"Erlang/OTP","30"}`.
   The typed gap `unsupported: init:script_id/0 (no boot script has been loaded)` survives only for a runtime that drives no script.
-  **The live divergence**: `erlang:system_info(otp_release)` reports this runtime's target release (`"30"`), so `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `false` here, where the oracle answers `true` (its own loaded script and its release agree).
+  **Self-consistent with the release**: because the default route loads this runtime's own release's script, `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `true` here exactly as on the oracle; an explicit `-boot FILE` reports *that* script's header instead (measured `{"Erlang/OTP","29"}` for the consumed OTP-29 installation's `bin/start.boot`).
 - `erlang:module_loaded/1` answers this runtime's **own** loaded set: the boot set is smaller than
   the oracle's (an app outside the preloaded `primLoad` batches is not yet loaded here), a
   documented divergence pinned by `../tests/module_loaded.rs`.

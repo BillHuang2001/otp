@@ -397,12 +397,12 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
 * **The differential gate.** Every recorded non-agreeing case is an honest capability gap in
   `tools/differential/known-gaps.txt`, never a `mismatch`. The one structurally unclosable gap is
   `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — `erl_eval` internals).
-  `boot_extra/init_script_id_names_the_running_otp_release` is a **live divergence**: the route now
-  answers (no longer `unsupported`), but `init:script_id()` returns the resolved installation script's
-  header (`{"Erlang/OTP","29"}` on this host) while `erlang:system_info(otp_release)` returns this
-  runtime's target release (`"30"`), so its `=:=` assertion is `false` here and `true` on the oracle —
-  the oracle's own loaded script and its release agree, this runtime's do not. Both A.9 `selfhost/*`
-  cases agree (the A.9 E0 bullet below).
+  `boot_extra/init_script_id_names_the_running_otp_release` **agrees**: with no `-boot` the default
+  route now drives this runtime's **own** release's script (`CodeServer::own_bootstrap_boot_script`,
+  the committed `bootstrap/bin/start.boot`), so `init:script_id()` answers `{"Erlang/OTP","30"}` — the
+  same release `erlang:system_info(otp_release)` reports (`"30"`) — and its `=:=` assertion is `true`,
+  as on the oracle (whose own loaded script and release likewise agree). Both A.9 `selfhost/*` cases
+  agree too (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
 * **A.7/A.9 boot — the boot script executes all 22 directives to completion;
@@ -411,8 +411,10 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   `BootStop` is `None` (`execute` returns `Ok`). The CLI
   `-boot bootstrap/bin/start` and the `run` action exit **0** with **empty stdout and empty stderr**
   (0 bytes each). Every CLI action but `-version` drives the walk
-  (`src/cli.rs::{boot_script_to_drive, boot_then}`: the `-boot FILE` value when given, else the literal
-  default `start` → `<Root>/bin/start.boot`), so a plain `-eval`/`-s`/`-run`/`run`/bare-`-noshell` route
+  (`src/cli.rs::{boot_script_to_drive, boot_then}`: the `-boot FILE` value when given, else this
+  runtime's **own** release's script — the committed `bootstrap/bin/start.boot`, discovered from the
+  binary's source tree by `CodeServer::own_bootstrap_boot_script`; the literal `start` only when even
+  that is undiscoverable), so a plain `-eval`/`-s`/`-run`/`run`/bare-`-noshell` route
   runs against a really booted node — measured there: `whereis(kernel_sup)`, `whereis(application_controller)`
   and `whereis(logger)` are live PIDs, `whereis(timer_server)` is `undefined`. Directive 13 leaves a live
   `logger_server` registered as `logger`, and the

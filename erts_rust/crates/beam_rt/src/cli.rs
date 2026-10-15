@@ -126,6 +126,7 @@ use beam_common::{BeamError, Result};
 use beam_term::{Eterm, MAX_SMALL};
 
 use crate::boot;
+use crate::codeserver::CodeServer;
 use crate::config::{
     Action, ArgTerm, EmulatorConfig, HeapOptions, InitArgs, RuntimeConfig, DEFAULT_HEAP_WORDS,
 };
@@ -1296,9 +1297,9 @@ fn report_unsupported(reason: &str) -> i32 {
 /// `-run`, `run` and the bare `-noshell` all run against a node whose
 /// `kernel`/`stdlib`/`application_controller`/`logger` are really up — exactly as the
 /// oracle's do. The script driven is the explicit `-boot FILE` value when one was given,
-/// else `init`'s literal default `start` ([`boot_script_to_drive`], the invocation's one
-/// resolution). `-version` is the one action that never boots: it prints the banner, builds
-/// no runtime and exits.
+/// else this runtime's own release's `bootstrap/bin/start.boot` ([`boot_script_to_drive`], the
+/// invocation's one resolution). `-version` is the one action that never boots: it prints the
+/// banner, builds no runtime and exits.
 ///
 /// The runtime the action built is handed back through `snapshot` — [`run`] needs it to
 /// write a crash dump when the action fails abnormally. `Action::Version` builds none
@@ -1322,7 +1323,8 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
         }
     }
     // The **one** resolution of "does this invocation boot a script, and which": the
-    // explicit `-boot FILE` value when one was given, else `init`'s literal default `start`.
+    // explicit `-boot FILE` value when one was given, else this runtime's own release's
+    // script.
     // Recording it on the configuration is what lets [`Runtime::new`] decide the native
     // `file_server_2` registration from the very value the drive below consumes
     // (`RuntimeConfig::drives_a_boot_script`), so the two can never disagree.
@@ -1405,24 +1407,45 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
 /// The literal boot script `init` falls back to when the command line names none
 /// (`bootfile/2`: `get_flag(boot, Flags, Root ++ "/bin/start")`,
 /// `erts/preloaded/src/init.erl:1257-1258`).
+///
+/// With no `-boot`, this runtime prefers **its own** release's script — the committed
+/// [`CodeServer::own_bootstrap_boot_script`] of the source tree the binary runs from — so the
+/// loaded script's header and `erlang:system_info(otp_release)` agree (contract A.9). This
+/// literal is the fallback for a deployment with no `bootstrap/` above the binary, where
+/// `init`'s own `<Root>/bin/start` resolution is all there is.
 const DEFAULT_BOOT_SCRIPT: &str = "start";
 
 /// The boot script this invocation drives, or `None` when it drives none.
 ///
 /// `init` resolves the boot file **first** and runs it before the start instruction, on
 /// every invocation that reaches the boot (`do_boot/3`, `erts/preloaded/src/init.erl:1197-1225`):
-/// the explicit `-boot FILE` value when one was given, else [`DEFAULT_BOOT_SCRIPT`].
-/// `-version` is the one action that never reaches the boot — [`run`] prints the banner and
-/// exits without building a runtime — so it resolves no script.
+/// the explicit `-boot FILE` value when one was given (left exactly as typed), else — no
+/// `-boot` — this runtime's **own** release's script
+/// ([`CodeServer::own_bootstrap_boot_script`]), and only when even that is undiscoverable
+/// `init`'s literal default [`DEFAULT_BOOT_SCRIPT`]. `-version` is the one action that never
+/// reaches the boot — [`run`] prints the banner and exits without building a runtime — so it
+/// resolves no script.
+///
+/// An explicit `-boot FILE` is untouched: its resolution stays `init`'s own (see
+/// [`resolve_boot_file`]), never this runtime's preference.
 fn boot_script_to_drive(config: &RuntimeConfig) -> Option<String> {
     if config.is_version() {
         return None;
     }
-    Some(
-        boot_file_argument(config)
-            .unwrap_or(DEFAULT_BOOT_SCRIPT)
-            .to_string(),
-    )
+    if let Some(explicit) = boot_file_argument(config) {
+        return Some(explicit.to_string());
+    }
+    // No `-boot`: prefer the boot script of the release this runtime **is**. The value is the
+    // extensionless base — [`resolve_boot_file`] appends `.boot`, so the base resolves to the
+    // very file [`CodeServer::own_bootstrap_boot_script`] found (handing it a path already
+    // ending in `.boot` would look for a `.boot.boot`). A deployment with no `bootstrap/`
+    // above the binary keeps `init`'s literal default.
+    if let Some(path) = CodeServer::own_bootstrap_boot_script() {
+        let value = path.to_string_lossy();
+        let base = value.strip_suffix(".boot").unwrap_or(&value).to_string();
+        return Some(base);
+    }
+    Some(DEFAULT_BOOT_SCRIPT.to_string())
 }
 
 /// The `init` order for every action that boots: drive the boot script `script`, then hand
@@ -1565,9 +1588,14 @@ fn boot_file_root(runtime: &Runtime) -> Option<PathBuf> {
 ///    current directory) and `-boot /x/y` is `/x/y.boot`;
 /// 2. when (1) does not exist, `<Root>/bin/<candidate>` — a **string concatenation**, as the
 ///    oracle writes it (`Root ++ "/bin/" ++ BootFile`, `init.erl:1275`), so a bare
-///    `-boot start` lands on the installed `<Root>/bin/start.boot` (the installed location
-///    of this checkout's `bootstrap/bin/start.boot`) and `init`'s own default `start`
-///    resolves to the very same file.
+///    `-boot start` lands on the installed `<Root>/bin/start.boot` (OTP's own default
+///    `start` resolves to that file, `init.erl:1257-1258`).
+///
+/// This resolution is **only** for a value `init` resolves — the explicit `-boot FILE` value
+/// and the native `init:boot/1` argument. The CLI's own default (no `-boot`) never reaches it:
+/// [`boot_script_to_drive`] prefers this runtime's own release's script (the committed
+/// `bootstrap/bin/start.boot`), because the consumed installation's `<Root>/bin/start.boot`
+/// belongs to whatever release is installed there (contract A.9).
 ///
 /// `<Root>` is the Erlang root ([`boot_file_root`]); it is `None` for a runtime with no
 /// system install on its code path, which is why a `$ROOT/…` value then fails rather than
