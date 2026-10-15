@@ -33,8 +33,10 @@ use super::operands::{
     constant_word, emit_guarded_y_load, emit_guarded_y_store, x_offset, x_register, y_addressable,
     y_register, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2,
 };
-use super::super::runtime::{RUNTIME_LITERALS_DISP, RUNTIME_LITERALS_END_DISP, RUNTIME_SLOT_DISP};
-use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
+use super::super::runtime::{RUNTIME_LITERALS_DISP, RUNTIME_LITERALS_END_DISP};
+use super::{
+    emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, RUNTIME_SLOT_DISP,
+};
 use std::mem;
 
 /// The third caller-saved scratch a Y-operand `move` needs.
