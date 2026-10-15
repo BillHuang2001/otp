@@ -1207,9 +1207,314 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // ---------------------------------------------------------------------------------
+        // The second widened block: the `binary:`/`string:`/`lists:`/`maps:`/`float`
+        // conversion surface that the first block does not reach, plus the two `erlang`
+        // integer-conversion and time BIFs. Every expression was probed under BOTH runtimes
+        // before pinning (`differential run <id>` ⇒ `[AGREE]`) and every golden is the
+        // oracle's own single line. No `~w` of a multi-key map is pinned: a map-bearing case
+        // renders through `lists:sort(maps:to_list(M))` or reduces to `maps:size/1`.
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "bifs/integer_to_list_radix_and_binary_digits",
+            description: "integer_to_list/1,2 across radices (incl. a negative) and integer_to_binary/2 in base 2",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{integer_to_list(255, 16), integer_to_list(-1), integer_to_binary(255, 2), \
+                       binary_to_integer(<<\"FF\">>, 16)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[70,70],[45,49],<<49,49,49,49,49,49,49,49>>,255}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/binary_split_match_search",
+            description: "binary:split/2,3 (with `global`), match/2, matches/2 and longest_common_prefix/suffix/1",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:split(<<\"a,b,c\">>, <<\",\">>), \
+                       binary:split(<<\"a,b,c\">>, <<\",\">>, [global]), \
+                       binary:match(<<\"hello\">>, <<\"ll\">>), \
+                       binary:matches(<<\"hello\">>, <<\"l\">>), \
+                       binary:longest_common_prefix([<<\"ab\">>, <<\"ac\">>]), \
+                       binary:longest_common_suffix([<<\"ab\">>, <<\"cb\">>])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[<<97>>,<<98,44,99>>],[<<97>>,<<98>>,<<99>>],{2,2},[{2,1},{3,1}],1,1}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/binary_part_first_last_at_copy",
+            description: "binary:part/2,3, first/1, last/1, at/2 and copy/2",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:part(<<\"hello\">>, 1, 3), binary:part(<<\"hello\">>, {1,3}), \
+                       binary:first(<<\"ab\">>), binary:last(<<\"ab\">>), binary:at(<<\"ab\">>, 1), \
+                       binary:copy(<<\"ab\">>, 3)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<101,108,108>>,<<101,108,108>>,97,98,98,<<97,98,97,98,97,98>>}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/binary_replace_encode_decode_unsigned",
+            description: "binary:replace/3,4, encode_unsigned/1,2 (big/little), decode_unsigned/1,2 and bin_to_list/list_to_bin",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:replace(<<\"hello\">>, <<\"l\">>, <<\"L\">>), \
+                       binary:replace(<<\"hello\">>, <<\"l\">>, <<\"L\">>, [global]), \
+                       binary:encode_unsigned(300), binary:encode_unsigned(300, little), \
+                       binary:decode_unsigned(<<1,44>>), binary:decode_unsigned(<<44,1>>, little), \
+                       binary:bin_to_list(<<\"ab\">>), binary:list_to_bin([1,2])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {<<104,101,76,108,111>>,<<104,101,76,76,111>>,<<1,44>>,<<44,1>>,300,300,[97,98],<<1,2>>}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/string_to_number_substr_and_padding",
+            description: "string:to_integer/1, to_float/1, substr/3, str/2, left/2, right/3, centre/3, words/2 and sub_word/3",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{string:to_integer(\"42ab\"), string:to_float(\"1.5ab\"), \
+                       string:substr(\"hello\", 2, 3), string:str(\"hello\", \"ll\"), \
+                       string:left(\"ab\", 4), string:right(\"ab\", 4, $0), \
+                       string:centre(\"ab\", 6, $-), string:words(\"a b c\", 32), \
+                       string:sub_word(\"a b c\", 2, 32)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {{42,[97,98]},{1.5,[97,98]},[101,108,108],3,[97,98,32,32],\
+                     [48,48,97,98],[45,45,97,98,45,45],3,[98]}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/string_next_grapheme_split_all_is_empty_equal",
+            description: "string:next_grapheme/1, split/3 with `all`, is_empty/1 and equal/2",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{string:next_grapheme(\"abc\"), string:split(\"a-b-c\", \"-\", all), \
+                       string:is_empty(\"\"), string:equal(\"a\", \"a\")}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[97,98,99],[[97],[98],[99]],true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/lists_usort_splitwith_mapfoldr_sort_fun",
+            description: "lists:sort/2 through a fun, usort/1, splitwith/2 and mapfoldr/3",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{lists:sort(fun(A, B) -> A >= B end, [1,3,2]), lists:usort([3,1,3,2]), \
+                       lists:usort([a,b,a]), lists:splitwith(fun(X) -> X < 3 end, [1,2,3]), \
+                       lists:mapfoldr(fun(X, A) -> {X, A} end, 0, [1,2])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[3,2,1],[1,2,3],[a,b],{[1,2],[3]},{[1,2],0}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/lists_all_any_flatmap_flatlength",
+            description: "lists:all/2, any/2 (incl. the empty list), flatmap/2 and flatlength/1",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{lists:all(fun(X) -> X > 0 end, [1,2]), \
+                       lists:any(fun(X) -> X > 2 end, [1,2]), \
+                       lists:any(fun(_) -> true end, []), \
+                       lists:flatmap(fun(X) -> [X,X] end, [1,2]), \
+                       lists:flatlength([[1],[2,3]])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,false,false,[1,1,2,2],3}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/lists_zipwith_enumerate",
+            description: "lists:zipwith/3, zipwith3/4 and the 1- and 2-arity enumerate/1,2",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{lists:zipwith(fun(A, B) -> A + B end, [1,2], [3,4]), \
+                       lists:zipwith3(fun(A, B, K) -> A + B + K end, [1], [2], [3]), \
+                       lists:enumerate([a,b]), lists:enumerate(5, [a,b])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[4,6],[6],[{1,a},{2,b}],[{5,a},{6,b}]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/lists_keyreplace_keystore_keytake_keymap",
+            description: "lists:keyreplace/4, keystore/4, keytake/3 and keymap/3 over a tuple list",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{lists:keyreplace(b, 1, [{a,1},{b,2}], {b,9}), \
+                       lists:keystore(b, 1, [{a,1},{b,2}], {b,9}), \
+                       lists:keytake(b, 1, [{a,1},{b,2}]), \
+                       lists:keymap(fun(X) -> X*2 end, 2, [{a,1}]), lists:keyfind(1, 2, [{a,1}])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[{a,1},{b,9}],[{a,1},{b,9}],{value,{b,2},[{a,1}]},[{a,2}],{a,1}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/lists_umerge_and_usort_of_lists",
+            description: "lists:umerge/1 merges sorted sublists and usort/1 orders a list of lists",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{lists:umerge([[1],[2],[1]]), lists:usort([[2],[1]])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[1,2],[[1],[2]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/maps_update_with_remove_merge_from_list",
+            description: "maps:update_with/2,3, remove/2, merge/2 and from_list/1, each rendered sorted",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Every multi-key map result goes through `lists:sort(maps:to_list(M))`; the
+                // `from_list/1` result is only measured with `maps:size/1`.
+                expr: "{lists:sort(maps:to_list(maps:update_with(a, fun(X) -> X+1 end, #{a=>1}))), \
+                       lists:sort(maps:to_list(maps:update_with(z, fun(X) -> X+1 end, 0, #{}))), \
+                       lists:sort(maps:to_list(maps:remove(a, #{a=>1,b=>2}))), \
+                       lists:sort(maps:to_list(maps:merge(#{a=>1}, #{b=>2}))), \
+                       maps:size(maps:from_list([{a,1},{b,2}]))}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[{a,2}],[{z,0}],[{b,2}],[{a,1},{b,2}],2}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/float_to_binary_and_back",
+            description: "float_to_binary/1,2 (decimals/short), binary_to_float/1, list_to_float/1 and float_to_list/1",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `float_to_binary(1.5)` and `float_to_list(1.5)` are the same 26-byte decimal
+                // image (the default `[{scientific,20}]` rendering), pinned byte for byte.
+                expr: "{float_to_binary(1.5), float_to_binary(1.5, [{decimals,2}]), \
+                       float_to_binary(0.1, [short]), binary_to_float(<<\"1.5\">>), \
+                       binary_to_float(<<\"1.5E2\">>), list_to_float(\"1.5\"), float_to_list(1.5)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {<<49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,101,43,48,48>>,\
+                     <<49,46,53,48>>,<<48,46,49>>,1.5,150.0,1.5,\
+                     [49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,101,43,48,48]}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/iolist_bitstring_and_size_bifs",
+            description: "iolist_size/1, iolist_to_binary/1, list_to_bitstring/1, bit_size/1, byte_size/1 and the bitstring type tests",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{iolist_size([1,[2,3]]), iolist_to_binary([<<\"a\">>,[<<\"b\">>]]), \
+                       list_to_bitstring([1,2,<<3:4>>]), bit_size(<<1:3>>), byte_size(<<1:3>>), \
+                       is_bitstring(<<1:1>>), is_binary(<<1:1>>)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {3,<<97,98>>,<<1,2,3:4>>,3,1,true,false}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/apply_and_binary_list_conversions",
+            description: "erlang:apply/2,3 on a module and a fun, split_binary/2, binary_to_list/1 and list_to_binary/1",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{erlang:apply(lists, reverse, [[1,2]]), erlang:apply(fun(X) -> X+1 end, [1]), \
+                       erlang:split_binary(<<1,2,3>>, 2), erlang:binary_to_list(<<1,2>>), \
+                       list_to_binary([1,2])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[2,1],2,{<<1,2>>,<<3>>},[1,2],<<1,2>>}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/io_lib_format_integer_char_string_float",
+            description: "io_lib:format/2 with the ~b/~c/~s/~p integer/char/string/term controls and the ~.2f/~e/~10.3f float controls",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{io_lib:format(\"~b ~c ~s\", [10, 97, \"ab\"]), \
+                       iolist_to_binary(io_lib:format(\"~p\", [{1,2}])), \
+                       io_lib:format(\"~.2f\", [1.5]), iolist_to_binary(io_lib:format(\"~e\", [100.0])), \
+                       iolist_to_binary(io_lib:format(\"~10.3f\", [3.14159]))}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {[49,48,32,97,32,[97,98]],<<123,49,44,50,125>>,[49,46,53,48],\
+                     <<49,46,48,48,48,48,48,101,43,50>>,<<32,32,32,32,32,51,46,49,52,50>>}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/monotonic_and_unique_integer_are_integers",
+            description: "erlang:unique_integer/0,1, system_time/0 and monotonic_time/0 are integers (shape, not value)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A per-VM-start value, so only the shape is pinned: a `[positive]` unique integer
+                // is > 0 and every clock reading is an integer.
+                expr: "{erlang:unique_integer([positive]) > 0, is_integer(erlang:unique_integer()), \
+                       is_integer(erlang:system_time()), is_integer(erlang:monotonic_time())}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,true,true}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
-
 #[cfg(test)]
 mod tests {
     //! Invariants of the A.7 BIF group: every case is a `value` eval case with a
@@ -1360,5 +1665,109 @@ mod tests {
                 "case {id}: a multi-key map must be rendered sorted, got {expr}"
             );
         }
+    }
+
+    /// The second widened block: the `binary:`/`string:`/`lists:`/`maps:`/`float` conversion
+    /// surface and the `erlang` integer/time BIFs. Each golden is the oracle's own single line
+    /// (re-measured with `differential run <id>`).
+    #[test]
+    fn the_second_widened_block_pins_the_oracle_lines() {
+        let golden = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+                .expect("a golden")
+        };
+        for (id, stdout) in [
+            (
+                "bifs/integer_to_list_radix_and_binary_digits",
+                "ok {[70,70],[45,49],<<49,49,49,49,49,49,49,49>>,255}",
+            ),
+            (
+                "bifs/binary_split_match_search",
+                "ok {[<<97>>,<<98,44,99>>],[<<97>>,<<98>>,<<99>>],{2,2},[{2,1},{3,1}],1,1}",
+            ),
+            (
+                "bifs/binary_part_first_last_at_copy",
+                "ok {<<101,108,108>>,<<101,108,108>>,97,98,98,<<97,98,97,98,97,98>>}",
+            ),
+            (
+                "bifs/binary_replace_encode_decode_unsigned",
+                "ok {<<104,101,76,108,111>>,<<104,101,76,76,111>>,<<1,44>>,<<44,1>>,300,300,[97,98],<<1,2>>}",
+            ),
+            (
+                "bifs/string_to_number_substr_and_padding",
+                "ok {{42,[97,98]},{1.5,[97,98]},[101,108,108],3,[97,98,32,32],[48,48,97,98],\
+                 [45,45,97,98,45,45],3,[98]}",
+            ),
+            (
+                "bifs/string_next_grapheme_split_all_is_empty_equal",
+                "ok {[97,98,99],[[97],[98],[99]],true,true}",
+            ),
+            (
+                "bifs/lists_usort_splitwith_mapfoldr_sort_fun",
+                "ok {[3,2,1],[1,2,3],[a,b],{[1,2],[3]},{[1,2],0}}",
+            ),
+            (
+                "bifs/lists_all_any_flatmap_flatlength",
+                "ok {true,false,false,[1,1,2,2],3}",
+            ),
+            (
+                "bifs/lists_zipwith_enumerate",
+                "ok {[4,6],[6],[{1,a},{2,b}],[{5,a},{6,b}]}",
+            ),
+            (
+                "bifs/lists_keyreplace_keystore_keytake_keymap",
+                "ok {[{a,1},{b,9}],[{a,1},{b,9}],{value,{b,2},[{a,1}]},[{a,2}],{a,1}}",
+            ),
+            (
+                "bifs/lists_umerge_and_usort_of_lists",
+                "ok {[1,2],[[1],[2]]}",
+            ),
+            (
+                "bifs/maps_update_with_remove_merge_from_list",
+                "ok {[{a,2}],[{z,0}],[{b,2}],[{a,1},{b,2}],2}",
+            ),
+            (
+                "bifs/float_to_binary_and_back",
+                "ok {<<49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,101,43,48,48>>,\
+                 <<49,46,53,48>>,<<48,46,49>>,1.5,150.0,1.5,\
+                 [49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,101,43,48,48]}",
+            ),
+            (
+                "bifs/iolist_bitstring_and_size_bifs",
+                "ok {3,<<97,98>>,<<1,2,3:4>>,3,1,true,false}",
+            ),
+            (
+                "bifs/apply_and_binary_list_conversions",
+                "ok {[2,1],2,{<<1,2>>,<<3>>},[1,2],<<1,2>>}",
+            ),
+            (
+                "bifs/io_lib_format_integer_char_string_float",
+                "ok {[49,48,32,97,32,[97,98]],<<123,49,44,50,125>>,[49,46,53,48],\
+                 <<49,46,48,48,48,48,48,101,43,50>>,<<32,32,32,32,32,51,46,49,52,50>>}",
+            ),
+            (
+                "bifs/monotonic_and_unique_integer_are_integers",
+                "ok {true,true,true,true}",
+            ),
+        ] {
+            assert_eq!(golden(id), stdout, "case {id}");
+        }
+        // The one new multi-key-map case renders every map result sorted (or measures it with
+        // `maps:size/1`), so no map-internal key order can ever reach its golden.
+        let expr = group()
+            .into_iter()
+            .find(|c| c.id == "bifs/maps_update_with_remove_merge_from_list")
+            .expect("registered")
+            .expr()
+            .expect("eval case");
+        assert!(
+            expr.contains("lists:sort(maps:to_list("),
+            "a multi-key map must be rendered sorted, got {expr}"
+        );
     }
 }

@@ -141,6 +141,16 @@
 //!   (`erl_io_queue.c:268-283`, `io.c:3565-3585`), so a `binv = NULL` vector SIGSEGVs the oracle; an
 //!   all-`NULL` array is the documented "make a binary from the iovec" form the fixtures use.
 //!   Owner: the oracle itself (the Rust hooks read only `iov`).
+//! * **`driver_pushqv/3` with a `binv[0] == NULL` vector on a fresh queue crashes the oracle** —
+//!   the installed OTP 29.1.1 `erts_ioq_pushqv` grew the queue from the head without decrementing
+//!   `q->v_head` first, so `q->b_head` ended one below `q->b_start` and `erts_ioq_clear` freed that
+//!   stale interior pointer at port close (SIGSEGV ~1 run in 10, *after* the correct answer was
+//!   already delivered; upstream OTP 30 fixed it, commit `f4c2a134bc`). Selector `48` therefore
+//!   presents its vector **binary-backed** (`driver_alloc_binary` + `binv[0] = bin`, the shape
+//!   `driver_pushq_bin` builds for itself), which exercises the same skip walk and the same head
+//!   insert at the small array's boundary without reaching the defect. Selector `47`'s tail-side
+//!   twin (`erts_ioq_enqv`) is unaffected and keeps the `binv[0] == NULL` form. Owner: the oracle's
+//!   own runtime version, not `beam_rt`.
 //! * **`driver_pdl_get_refc(NULL)` SIGSEGVs the oracle** (measured), so the PDL family's
 //!   `NULL`/foreign-handle shapes are unpinnable; only the live-handle create/refcount shapes are
 //!   pinned (`22`, `23`, `24`). Owner: the oracle itself.
@@ -1093,25 +1103,49 @@ static int chk_enqv_partial_skip(extra_state *st) {
     return driver_deq(st->port, 3) == 0;
 }
 
-/* The same partial skip for the head-inserting sibling. */
+/* The same partial skip for the head-inserting sibling, over a **binary-backed** vector: the
+ * vector names a real `driver_alloc_binary/1` payload through `binv[0]` and the queue takes a
+ * reference to it — the shape every `driver_pushq`/`driver_pushq_bin` builds for itself
+ * (`io.c:6874-6890`, `driver_pushq` hands `&bin` as the `binv` array), so the skip walk and the
+ * head insert at the small array's boundary are the whole behaviour under test.
+ *
+ * Deliberately **not** the `binv[0] == NULL` "create a binary from the iovec" form here: the
+ * installed oracle (OTP 29.1.1 / erts-17.1) has an `erts_ioq_pushqv` off-by-one in that arm. It
+ * creates the binary and writes its `orig_bytes` through `q->v_head` *before* decrementing
+ * `v_head`, so on a **fresh** queue — where the head sits at the end of `v_small` — the head
+ * insert leaves the binv side one entry below `q->b_start`, and `erts_ioq_clear` then frees that
+ * stale interior pointer at port close: the VM dies of SIGSEGV **after** already producing the
+ * correct observable (~1 run in 10; upstream OTP 30 fixed it, commit `f4c2a134bc` "erts: Fix
+ * erts_ioq_pushqv overwrite" — decrement `v_head` first, then allocate into the decremented slot,
+ * `erl_io_queue.c:315-325`, which is the form this tree's C carries). A runtime-version defect in
+ * the oracle, never a Rust-runtime divergence. See *Known gaps*.
+ *
+ * The queue is drained back to empty before the callback returns (a non-empty private queue at
+ * port close hangs the oracle). */
 static int chk_pushqv_partial_skip(extra_state *st) {
     SysIOVec iov[1];
     ErlDrvBinary *binv[1];
     ErlIOVec ev;
-    char in[5];
-    memcpy(in, "abcde", 5);
-    iov[0].iov_base = in;
+    ErlDrvBinary *bin;
+    int ok;
+
+    bin = driver_alloc_binary(5);
+    if (bin == NULL)
+        return 0;
+    memcpy(bin->orig_bytes, "abcde", 5);
+    iov[0].iov_base = bin->orig_bytes;
     iov[0].iov_len = 5;
-    binv[0] = NULL;
+    binv[0] = bin;
     ev.vsize = 1;
     ev.size = 5;
     ev.iov = iov;
     ev.binv = binv;
-    if (driver_pushqv(st->port, &ev, 2) != 0)
-        return 0;
-    if (driver_sizeq(st->port) != 3)
-        return 0;
-    return driver_deq(st->port, 3) == 0;
+
+    ok = (driver_pushqv(st->port, &ev, 2) == 0)
+        && (driver_sizeq(st->port) == 3)
+        && (driver_deq(st->port, 3) == 0);
+    driver_free_binary(bin);  /* drop our own reference; the queue's was dropped by driver_deq */
+    return ok;
 }
 
 /* `driver_vec_to_buf` with a buffer **longer** than the vector copies the whole vector and reports
