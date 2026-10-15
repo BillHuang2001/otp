@@ -54,9 +54,17 @@ figures are in `PERF.md`).
   own off-heap table once per slice, on every slice outcome (`Process::register_off_heap_binary`, no
   matter whether the slice pre-empted, parked, returned or raised), so a process that has built a
   payload above the on-heap limit comes to *own* it for `erlang:process_info(Pid, binary)`; the
-  registration is dedup-by-`data_ptr`/idempotent, so re-listing the never-cleared reservoir each slice
-  is cheap and its over-report (a payload an earlier reachability sweep pruned) mirrors the oracle,
-  while `Runtime::eval_off_heap` is deliberately left out as the pid-less `-eval` store.
+  population is dedup-by-`data_ptr`/idempotent, so its over-report (a payload an earlier reachability
+  sweep pruned) mirrors the oracle, while `Runtime::eval_off_heap` is deliberately left out as the
+  pid-less `-eval` store.
+  Because that reservoir is **append-only** and never cleared, the seam advances a per-engine cursor —
+  `ProcessEngine::registered_payloads`, the count of reservoir slots already registered — and each slice
+  copies only its **not-yet-registered suffix** (`min`-clamped against the reservoir length), so a
+  payload becomes owned at the end of the first slice that built it and the total registration work over
+  a process's life is linear in the payloads it built, rather than re-walking the whole reservoir (and
+  paying an O(slots) slot scan) on every slice.
+  The cursor rides the `ProcessEngine`, which is removed from and re-inserted into `RunnerState::engines`
+  at every slice boundary, so it survives a pre-emption and a `receive` park.
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetContext`
   declares its own `wants_reduce() == true` (the engine lets a host answer `false` only when its
   `reduce` is provably the no-op default) and implements `reduce` to charge the probe once per
