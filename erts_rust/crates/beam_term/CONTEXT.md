@@ -806,7 +806,10 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   atom whose index is out of range of the passed table falls back to comparing raw indices. Atom
   comparison is only name-faithful when the operands and the passed `AtomTable` share one table — a
   per-module `AtomTable` (as `beam_loader::Module` builds) therefore makes cross-module atom comparisons
-  unreliable.
+  unreliable. The fallback is the `_` arm of `cmp_atoms` (`src/compare.rs:361`); it silently breaks
+  **ordering** only — `is_lt`/`is_ge` then order by index, not name — while equality (`is_eq`) stays
+  faithful, because two distinct atoms always carry distinct indices in one consistent table, so an
+  incomplete table can never make distinct atoms compare `Equal`.
 - **`term_hash` is internal, not compatibility-pinned (`src/hashing/mod.rs`).** It guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
   exact bit values are not part of any contract. Maps hash structurally (their sorted pairs); funs hash
