@@ -257,19 +257,13 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The compatibility gate is `../tools/differential/gate.sh`
-  (root-owned) — it boots the script per case, so an end-to-end `gate.sh` run now takes >14 min; a full-corpus
+  (root-owned) — it boots the script per case, so an end-to-end `gate.sh` run now takes >100 min single-threaded; a full-corpus
   sweep of `differential run <case-id>` is gate-equivalent per case because every `run` verdict already folds in
   the oracle-vs-golden drift check (`tools/differential/src/compare.rs::verdict_with`).
-  **Gate status (full 2580-case sweep): agree=2577, mismatch=2, unsupported=1, skipped=0 — `gate.sh` is RED
-  (exit 1).** `unsupported` is exactly the one capability gap recorded in `known-gaps.txt`,
-  `wire/new_fun_ext_encode` (A.5, unclosable by design — see below). Both `mismatch`es are non-runtime defects
-  owned by root/`tools/`: `boot_extra/init_script_id_names_the_running_otp_release` asserts
-  `init:script_id() =:= {"Erlang/OTP", system_info(otp_release)}`, which holds only when the runtime and its
-  DEFAULT boot script come from the same release — the `-eval`/`run` path now boots the consumed **system
-  install's** OTP-29 `<Root>/bin/start.boot` while `otp_release` is the compile-time repo constant `"30"` (so
-  this case's `known-gaps.txt` entry no longer reproduces as a gap and must be re-scored); and
-  `system_info/emu_type` — this runtime's honest `debug` (a dev build, `cfg!(debug_assertions)`) vs the corpus
-  golden `opt`, which a leftover `target/release/beam_rt` masks because the harness resolves release before debug.
+  **Gate status (full 2608-case sweep): agree=2606, mismatch=0, unsupported=2, skipped=0 — `gate.sh`
+  exits 0 in both the default and the `BEAM_RT_TIER=interpreter` tier.** `unsupported` is exactly the two
+  capability gaps recorded in `known-gaps.txt`: `wire/new_fun_ext_encode` (A.5, unclosable by design — see
+  below) and `boot_extra/init_script_id_names_the_running_otp_release`.
   `wire/new_fun_ext_encode`'s (A.5) gap is unclosable by design: its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
   slot) whose single free variable is erl_eval's internal `Info` tuple holding the clause in `erl_parse`

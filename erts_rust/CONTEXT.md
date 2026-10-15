@@ -132,15 +132,15 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=2580 agree=2578 mismatch=0 unsupported=2
+- **Compatibility gate (`tools/differential`):** `summary: total=2608 agree=2606 mismatch=0 unsupported=2
   skipped=0 allowed=2` → `gate.sh` exits 0 (verified in both the default and the `BEAM_RT_TIER=interpreter` tier). `gate.sh` is authoritative — re-run it for the live
   per-contract split. **No case disagrees**; the two recorded capability gaps (the `known-gaps.txt`
   ratchet allowlist) are `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's
   closure identity needs `erl_eval`/`erl_scan`/`erl_parse`) and
   `boot_extra/init_script_id_names_the_running_otp_release` (A.9 — `init:script_id/0` on a `-eval`/`run`
   path that loads no boot script). The two A.9 `selfhost/*` in-process-compile cases now **agree**.
-- **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 645
-  keys = 556 declared + 89 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
+- **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 648
+  keys = 556 declared + 92 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
   `MemoryHook::memory`, …): **346 are served in-crate** and **210 are seam-backed** (a typed
   `unsupported` until a host installs the hook); the seam union is 240 keys, 30 of them undeclared table
   members. The census is re-derived from code and **pinned by `beam_bifs/tests/roster_audit.rs`**, so it
@@ -162,24 +162,31 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ets_copy` **25.5 %** and `gc_bound churn` **12.7 %**, and removed a per-call BIF dispatch prologue
   (redundant double registry lookup + a length-only hash that made ETS keys a permanent memo miss). The
   current figures, the two-sided ratio labelling and the fresh ranked bottleneck list are in
-  `tools/bench/RESULTS.md` (m11).
-- **Contract A.9 (build/bootstrapping) — boot is NOT complete; no self-hosted build.** `beam_rt`
-  loads the 22 preloaded modules on startup, but its boot-script executor drives the real
-  `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) only to **directive 19 of 22**: the
-  `-boot` CLI exits **3** (`beam_rt: unsupported: opcode: run: process blocked (no message available)`, a
-  `{noproc,{gen_server,call,[application_controller,…]}}` terminal error) and never reaches the final
-  `{progress,started}` (index 21). (Probe form: `-boot bootstrap/bin/start`; appending `.boot` doubles the
-  suffix.) Directive 18 (`kernel`) aborts because `logger_server:call_h/4` relies on the innermost `undef`
-  stacktrace item being `{Module,Function,ArgList,Loc}` while the engine emits an arity-only item — the
-  kernel application is `permanent`, so its crash tears the node down. The `{kernelProcess,…}` servers do
-  survive their short-lived directive process via the unlink in `crates/beam_rt/src/boot/drive.rs`, and
-  the `call_ext` seam is resolve-first / blocking-aware
-  (`crates/beam_engine/src/families/funs/mod.rs`, pinned by `crates/beam_rt/tests/proc_lib_start.rs`).
-  A.9's remaining gaps are fidelity ones: **no self-hosted build** (the Rust runtime does not compile/run
-  itself), and a plain runtime runs **no live** `code_server`/`erl_prim_loader` process, nor — off the
-  `-boot` path — `application_controller` or `logger` (the real `start.boot` leaves `logger_server`
-  registered as `logger`; see `crates/CONTEXT.md`). `code:*`/`init:*`/`application:*` queries are served
-  by a native floor (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
+  `tools/bench/RESULTS.md` (m11). Two mechanisms were then root-caused (evidence in
+  `tools/bench/results/b54-*`): the `foreign` super-linearity is a genuine **Θ(N³)** regression — a
+  per-slice loop re-registers the engine's never-cleared `refc_binaries` reservoir
+  (`crates/beam_rt/src/runner/run.rs`) through an O(slots) `owned_binary_slot` scan; and the
+  loop-workload RSS growth (incl. `ets_copy`) is a general per-op heap retention in `Nursery.retired`,
+  emptied only by a real collection.
+- **Contract A.9 (build/bootstrapping) — boot COMPLETES; no self-hosted build yet.** `beam_rt`
+  loads the 22 preloaded modules on startup, and its boot-script executor drives the real
+  `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 directives) **through the final
+  `{progress,started}` (index 21)** — `beam_rt -noshell -boot bootstrap/bin/start` exits **0** with
+  empty stdout/stderr. (Probe form: `-boot bootstrap/bin/start`; appending `.boot` doubles the
+  suffix.) The kernel directive succeeds because the engine synthesizes the innermost `undef`
+  stacktrace item (`{Module,Function,ArgList,Loc}`) that `logger_server:call_h/4` matches on — the
+  head item rides the raise's own raw-trace word (rooted and relocated by every collection) with two
+  metadata-only flags (`crates/beam_engine/src/families/exceptions/callee.rs`); when no live catch
+  frame or an unreadable arg register/import ref exists the synthesis **declines** rather than
+  fabricating a frame. The `{kernelProcess,…}` servers do survive their short-lived directive process
+  via the unlink in `crates/beam_rt/src/boot/drive.rs`, and the `call_ext` seam is resolve-first /
+  blocking-aware (`crates/beam_engine/src/families/funs/mod.rs`, pinned by
+  `crates/beam_rt/tests/proc_lib_start.rs`). A.9's remaining gap is fidelity: **no self-hosted build**
+  (the Rust runtime does not compile/run itself), and a plain runtime runs **no live**
+  `code_server`/`erl_prim_loader` process, nor — off the `-boot` path — `application_controller` or
+  `logger` (the real `start.boot` leaves `logger_server` registered as `logger`; see `crates/CONTEXT.md`).
+  `code:*`/`init:*`/`application:*` queries are served by a native floor
+  (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
   `crates/CONTEXT.md` (A.9 status) and `crates/beam_rt/src/boot/CONTEXT.md`.
 - **A.9 — in-process compilation WORKS on the no-spawn route; a scheduled-process compile does not
   yet, and there is still no self-hosted build.**

@@ -8,7 +8,63 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
-## 2026-10-14 — Milestone 11: load-time-digest JIT cache identity, in-block `send`/`receive`, a block register allocator, the dirty-heap send fast path, and two `term_to_binary` encoder modes
+## 2026-10-15 — Milestone 12: boot-script completion via synthesized callee-head stacktrace items, atom ordering by name, and O(1) atom-table/term-copy hot paths
+Scope: the milestone that **completes the `bootstrap/bin/start` boot chain** (all 22 directives drive to
+`{progress,started}`; `-boot` exits 0 with empty stdout/stderr) and then removes the remaining
+per-call/per-slice overheads it exposed. The headline **algorithmic/data-structure** changes are (a) the
+execution engine now **synthesizes the innermost `undef` stacktrace item** (`{Module,Function,ArgList,Loc}`)
+that `logger_server:call_h/4` matches on, (b) `AtomTable` gained an **O(1) append-only witness**
+(`generation()`/`snapshot()`/`appended_since()`) that lets a decoder reuse a cached atom namespace instead
+of cloning the table, and (c) the atom term order is now **by name** (`erts_cmp_atoms`) through the
+`ExecutionContext::atoms` namespace seam.
+- **Area:** `erts_rust/crates/beam_engine` (`src/families/exceptions/callee.rs`, `src/machine/mod.rs`, `src/context.rs`)
+- **Change (data structure):** the synthesized callee head item rides **the raise's own raw-trace word
+  `x(2)`**, so it is rooted and relocated by every collection like any other live term — no new
+  `beam_common::StackFrame` field and no root-set change. Two **metadata-only** `Machine` flags
+  (`pending_callee_head`, a one-shot latch set by the failing `call_ext`, and `raise_head_item`, the live
+  state) are cleared in `Machine::reset` and consumed by `throw_with_trace`'s first act. It is gated on
+  `BeamError::Raise(Raise::error(ExitReason::atom("undef")))` and **declines** (today's arity-only behaviour)
+  when no live catch frame exists or the arg register/import ref is unreadable — a frame is never
+  fabricated. Also closed the `-eval` route: `beam_rt`'s own tree-walking evaluator now emits the same head
+  item, and `beam_term/src/compare.rs` orders atoms by name via `ExecutionContext::atoms`.
+- **Area:** `erts_rust/crates/beam_rt` (`src/native/prim_tty.rs`, `src/port/tty.rs`)
+- **Change:** built-in/static NIF-library resolution for `prim_tty`, so a booted node's terminal NIFs
+  resolve without a dlopen'd `.so`.
+- **Area:** `erts_rust/crates/beam_term` (`src/atom.rs`)
+- **Change (data structure):** `AtomTable` is now an **append-only witnessed** namespace: a
+  process-global `AtomicU64` gives each clone a fresh `instance`, a `generation` counter increments on each
+  newly interned name only, and `snapshot()` returns a `Copy` `AtomSnapshot {instance, generation, len}`.
+  `appended_since(snap)` can therefore prove a shared table did **not** change in O(1) (worst case is a
+  conservative false negative); `clone` no longer grows the witness state. The adoption recipe (use in
+  `beam_bifs`'s decode scratch instead of `prefix_matches`) is recorded in the crate `CONTEXT.md`.
+- **Area:** `erts_rust/crates/beam_bifs`, `erts_rust/crates/beam_rt` (`src/nif.rs`, `src/port/driver.rs`)
+- **Change (performance):** the NIF/driver `binary_to_term` entry points each cloned the whole `AtomTable`
+  per call; a shared per-thread `DECODE_SCRATCH` (validated by the new witness) makes them allocation-flat
+  (137 atoms 278 allocs/16 262 B → **2 allocs/64 B**; 4105 atoms 521 allocs → **2**). `CodeServer` gained
+  `intern_pending`, which appends through `Rc::get_mut` when it is the table's only owner (falling back to
+  the copy-on-write `Rc::make_mut` path otherwise), making atom-table commit flat too (2024 atoms
+  4063 allocs/280 KB → **9 allocs/342 B**). `erlang:fun_info/1` is implemented (the OTP-29 10-key walk with
+  every `{K,undefined}` pair dropped) and `fun_info/2` gained its missing `Item::Pid`.
+- **Area:** `erts_rust/crates/beam_bifs` (`src/deflate.rs`, `src/zlib.rs`)
+- **Change (algorithm):** `zlib:gzip/1`/`gunzip/1` implemented over RFC 1952 framing (byte-identical
+  goldens, interop proven both directions, 14 failure classes), and `zlib:uncompress/1`'s artificial
+  32 MiB cap replaced by a bounded `decompress_bounded(bytes, len * 1032)` growth policy. `[deterministic]`
+  is now wired through `term_to_binary/2`'s in-band encoder (`src/binconv.rs::encode_body`); the `[local]`
+  payload stays an **honest typed gap** because its per-node start hash is per-VM random (`external.c:134-200`),
+  so fabricating it would emit an image the oracle rejects.
+- **Area:** `erts_rust/tools/bench`
+- **Change (root-caused mechanisms):** the M11 `foreign` super-linearity is **both** an N-incomparable metric
+  **and** a genuine regression — matched-N interleaved A/B against M10 (`b4593818b3`) shows `enc` N=25 000 at
+  **≈4.6×** and N=60 000 at **≈12.5×**, growth fitting **Θ(N³)** where M10 was flat, and it is
+  **tier-independent**. Root cause: `erts_rust/crates/beam_rt/src/runner/run.rs` registers **every** payload
+  of the engine's never-cleared `refc_binaries` reservoir on **every** slice, through the O(slots) linear
+  `Process::owned_binary_slot` scan. Separately, the loop-workload RSS growth (incl. `ets_copy`) is a general
+  per-op heap retention: `Process::grow_nursery` → `Nursery::grow` pushes the replaced `HeapSpace` onto
+  `Nursery.retired`, which is emptied only by a real collection that these loops never trigger. Evidence:
+  `erts_rust/tools/bench/results/b54-*`.
+- **Area:** `erts_rust/tools/differential`
+- **Change:** corpus 2580 → **2608** cases (`flags` 88→103, new `zlib` group); gate
+  `total=2608 agree=2606 mismatch=0 unsupported=2 skipped=0 allowed=2`, exit 0 on both tiers.: load-time-digest JIT cache identity, in-block `send`/`receive`, a block register allocator, the dirty-heap send fast path, and two `term_to_binary` encoder modes
 Scope: a performance milestone driven by the M10 bottleneck list, plus the honest correction of a
 long-standing boot claim. The headline **algorithmic/data-structure** changes are (a) the JIT code cache
 keyed by the module's **load-time MD5 digest** instead of a per-entry whole-IR hash (removing a
