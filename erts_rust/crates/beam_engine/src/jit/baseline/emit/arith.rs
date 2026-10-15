@@ -20,6 +20,9 @@
 
 //! The baseline JIT's guarded small-int arithmetic fast path — the tier's one
 //! bounded optimisation (the section comment below documents why it is exact).
+//!
+//! It lowers the small-int `erlang:` arithmetic BIFs — `'+'/2`, `'-'/2`, `'*'/2`,
+//! the bitwise `band/2`/`bor/2` and the immediate-count `bsr/2` — and nothing else.
 
 use beam_common::Result;
 use beam_loader::{ImportRef, Instr, Module, Operand};
@@ -61,6 +64,29 @@ use super::{emit_step_and_continue, touch, Allocation};
 //   **untagged** product, because `p * 16` silently wraps for `|p| >= 2^59` and can
 //   land back inside the valid tagged-word interval (a wrong result).
 //
+// ## The bitwise pair and the immediate-count shift
+//
+// `erlang:band/2` and `erlang:bor/2` need **no** untag/retag step: the low nibble of
+// both operands' word is `TAG_IMMED1_SMALL` (`0b1111`) and the tagging is uniform
+// (`make_small(v) == v * 16 + 15`), so a raw tagged-word `and`/`or` is exactly
+// `make_small(va & vb)` / `make_small(va | vb)` — for negative operands too, because
+// `(v << 4)` is a bit-position bijection. The result is therefore always a correctly
+// tagged **small**, so no range check is needed: the `and`/`or` of two words in
+// `[MIN_SMALL_WORD, MAX_SMALL_WORD]` whose low nibble is `0b1111` stays in that
+// window (the `and` is `<=` and the `or` is `>=` its operands, and the low nibble
+// fixes the sign-extension bit).
+//
+// `erlang:bsr/2` is `X >> N` with an **arithmetic** (sign-extending) shift, i.e.
+// floor division by `2^N`; a negative `N` is `bsl`, which can grow to a bignum. The
+// fast path claims only the shape whose count is a **compile-time small-int constant
+// in `0..64`**: the emitter has only the immediate `sar_ri` form (there is no
+// register-count `sar r, cl`), and x86 masks a 64-bit shift count to 6 bits, so a
+// register count, a negative count and a count of `64` or more all deopt to the
+// interpreter, which computes the true value (a raw `sar` would diverge on the last
+// two: `3 bsr 64` is `0`, not `3`, and `3 bsr -1` is `6`). A right shift only shrinks
+// the magnitude, so the untagged range check never rejects here; it is kept so the
+// re-tag cannot wrap for any operand.
+//
 // Everything else (another BIF, another module, an operand that is a static literal,
 // a destination that is a literal or a float register, a register index outside the
 // engine's bound) keeps today's behaviour: one `jit_step_one` call.
@@ -96,8 +122,9 @@ use super::{emit_step_and_continue, touch, Allocation};
 // (`machine.x.len() > bound`), and raising it for a stack slot would wrongly refuse
 // native entry.
 
-/// The three BIFs the fast path lowers — `erlang:'+'/2`, `erlang:'-'/2` and
-/// `erlang:'*'/2`, and nothing else.
+/// The six BIFs the fast path lowers — `erlang:'+'/2`, `erlang:'-'/2`,
+/// `erlang:'*'/2`, `erlang:band/2`, `erlang:bor/2` and `erlang:bsr/2`, and nothing
+/// else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SmallArith {
     /// `erlang:'+'/2`.
@@ -106,6 +133,12 @@ pub(crate) enum SmallArith {
     Sub,
     /// `erlang:'*'/2`.
     Mul,
+    /// `erlang:band/2` — a raw tagged-word `and` (see the section comment).
+    And,
+    /// `erlang:bor/2` — a raw tagged-word `or`.
+    Or,
+    /// `erlang:bsr/2` with a **compile-time** shift count (`FastArith::shift`).
+    Bsr,
 }
 
 /// `TAG_IMMED1_MASK` as an `i64` — the low-nibble mask `is_small` tests with.
@@ -122,6 +155,13 @@ const _: () = assert!(SMALL_MASK == SMALL_TAG);
 
 /// The shift `make_small` applies (`TAG_IMMED1_SIZE`).
 pub(crate) const SMALL_SHIFT: u32 = TAG_IMMED1_SIZE;
+
+/// The width of the word the emitted `sar`/`shl` operate on — the bound a shift
+/// count must be under for x86 to use it verbatim (the hardware masks a 64-bit
+/// shift count to 6 bits, so a count of `64` or more would silently become
+/// `count % 64`, a wrong result). `erlang:bsr/2` is therefore lowered only for a
+/// **compile-time** count in `0..SHIFT_COUNT_LIMIT` and deopts otherwise.
+const SHIFT_COUNT_LIMIT: u32 = 64;
 
 /// The raw word of the smallest small integer (`make_small(MIN_SMALL)`).
 ///
@@ -175,6 +215,11 @@ pub(crate) struct FastArith<'a> {
     pub(crate) b: &'a Operand,
     /// Where the result is written.
     pub(crate) dst: FastDest,
+    /// For [`SmallArith::Bsr`], the **compile-time** shift count — the second
+    /// operand's small-int value, proven at shape time to lie in
+    /// `0..SHIFT_COUNT_LIMIT`. `None` for every other operation (whose second
+    /// operand is an ordinary operand).
+    pub(crate) shift: Option<u32>,
 }
 
 impl FastArith<'_> {
@@ -302,9 +347,13 @@ fn operand_uses_y(operand: &Operand) -> bool {
 /// consults the register allocation, so [`super::regalloc::allocate_registers`] and [`super::emit_block`]
 /// agree on which `gc_bif`s the fast path targets).
 ///
-/// The shape is the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` of `args.len() == 2`
-/// whose every operand is an in-bound x-register, an addressable Y slot or a small-int
-/// constant and whose destination is an in-bound x-register or an addressable Y slot.
+/// The shape is the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2`/`band/2`/`bor/2`/`bsr/2`
+/// of `args.len() == 2` whose every operand is an in-bound x-register, an addressable
+/// Y slot or a small-int constant and whose destination is an in-bound x-register or
+/// an addressable Y slot. `bsr/2` carries the extra, still purely syntactic,
+/// condition that its **count** operand is a small-int constant in
+/// `0..SHIFT_COUNT_LIMIT` (see the section comment): the emitted shift is the
+/// immediate `sar_ri`, and a register or out-of-range count would not be exact.
 pub(crate) fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastArith<'a>> {
     let Instr::GcBif {
         arity, bif, args, dst, ..
@@ -320,18 +369,41 @@ pub(crate) fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastAr
         "+" => SmallArith::Add,
         "-" => SmallArith::Sub,
         "*" => SmallArith::Mul,
+        "band" => SmallArith::And,
+        "bor" => SmallArith::Or,
+        "bsr" => SmallArith::Bsr,
         _ => return None,
     };
     let dst = destination(dst)?;
     if args.iter().any(|operand| !loadable(operand)) {
         return None;
     }
+    // `bsr`'s count must be known at **compile** time and stay inside the width the
+    // emitted shift honours: a register count has no immediate form to emit, a
+    // negative count is `bsl` (which grows, possibly to a bignum) and a count of `64`
+    // or more would be masked by the hardware. All of those deopt.
+    let shift = match op {
+        SmallArith::Bsr => {
+            let count = integer_value(&args[1])?;
+            Some(u32::try_from(count).ok().filter(|c| *c < SHIFT_COUNT_LIMIT)?)
+        }
+        _ => None,
+    };
     Some(FastArith {
         op,
         a: &args[0],
         b: &args[1],
         dst,
+        shift,
     })
+}
+
+/// The `i64` value of a **small-int** constant operand, or `None` for anything else.
+///
+/// The untag is the documented exact arithmetic shift the emission itself uses:
+/// `word == v * 16 + 15` with `15 < 16`, so `word >> 4` is exactly `v`.
+fn integer_value(operand: &Operand) -> Option<i64> {
+    small_constant(operand).map(|word| word >> SMALL_SHIFT)
 }
 
 /// The [`FastDest`] for `operand`, or `None` when it is neither an in-bound
@@ -504,6 +576,21 @@ fn emit_y_store(buffer: &mut CodeBuffer, k: u32, fallback: CodeLabel) -> Result<
 ///   shl  r11, SMALL_SHIFT   ; make_small(p) == p * 16 + 15, safe after the check
 ///   mov  rcx, SMALL_TAG
 ///   or   r11, rcx
+///   ; --- erlang:band/2 and erlang:bor/2: a raw tagged-word and/or, no re-tag ---
+///   mov  r11, rax
+///   and  r11, r8            ; or for 'bor' — the low nibble stays TAG_IMMED1_SMALL,
+///                           ; so the tagged word is exactly make_small(va & vb)
+///   ; --- erlang:bsr/2: untag, arithmetic shift by the compile-time count, re-tag ---
+///   sar  rax, SMALL_SHIFT   ; va
+///   sar  rax, <count>       ; va >> count, sign-extending (count in 0..64, so the
+///                           ; hardware's 6-bit count masking is never reached; the
+///                           ; shift is omitted when the count is 0)
+///   mov  r11, rax
+///   mov  rcx, MIN_SMALL ; cmp r11, rcx ; jl fallback  ; never rejects (a right shift
+///   mov  rcx, MAX_SMALL ; cmp r11, rcx ; jg fallback  ; only shrinks the magnitude)
+///   shl  r11, SMALL_SHIFT
+///   mov  rcx, SMALL_TAG
+///   or   r11, rcx
 ///   mov  <dst>, r11         ; cached destination: its machine register; a
 ///                           ; non-cached one: `mov [rbx + dst*8], r11`; a Y slot:
 ///                           ; the guarded Y store (see `emit_y_store`)
@@ -615,6 +702,45 @@ pub(super) fn try_inline_gc_bif(
 
             // Re-tag: `make_small(p) == p * 16 + 15`, with the shift now provably
             // lossless (`|p| <= 2^59`).
+            buffer.shl_ri(FAST_R, SMALL_SHIFT)?;
+            buffer.mov_ri(FAST_C, SMALL_TAG)?;
+            buffer.or_rr(FAST_R, FAST_C)?;
+        }
+        // `band`/`bor`: the tagged words are `v * 16 + 15`, and `0b1111` is all-ones
+        // in the four low bits, so a raw `and`/`or` of the two words is exactly
+        // `make_small(va & vb)` / `make_small(va | vb)` — for negative operands too.
+        // The result is always a valid tagged small, so there is no untag, no re-tag
+        // and no range check.
+        SmallArith::And | SmallArith::Or => {
+            buffer.mov_rr(FAST_R, FAST_A)?;
+            if fast.op == SmallArith::And {
+                buffer.and_rr(FAST_R, FAST_B)?;
+            } else {
+                buffer.or_rr(FAST_R, FAST_B)?;
+            }
+        }
+        // `bsr`: `X bsr N == X >> N` with an **arithmetic** (sign-extending) shift,
+        // i.e. floor division by `2^N`. The count is a compile-time constant in
+        // `0..64` (`fast_arith` refuses anything else), so the immediate form is
+        // exact and the hardware's 6-bit count masking can never bite.
+        SmallArith::Bsr => {
+            let count = fast
+                .shift
+                .expect("`Bsr` is only built with a compile-time shift count");
+            // Untag (exact for every small, negatives included), then shift.
+            buffer.sar_ri(FAST_A, SMALL_SHIFT)?;
+            if count > 0 {
+                buffer.sar_ri(FAST_A, count)?;
+            }
+            buffer.mov_rr(FAST_R, FAST_A)?;
+            // A right shift only shrinks the magnitude, so this guard never rejects;
+            // it is kept so the re-tag below cannot wrap for any operand.
+            buffer.mov_ri(FAST_C, MIN_SMALL)?;
+            buffer.cmp_rr(FAST_R, FAST_C)?;
+            buffer.jcc(Cond::L, fallback)?;
+            buffer.mov_ri(FAST_C, MAX_SMALL)?;
+            buffer.cmp_rr(FAST_R, FAST_C)?;
+            buffer.jcc(Cond::G, fallback)?;
             buffer.shl_ri(FAST_R, SMALL_SHIFT)?;
             buffer.mov_ri(FAST_C, SMALL_TAG)?;
             buffer.or_rr(FAST_R, FAST_C)?;

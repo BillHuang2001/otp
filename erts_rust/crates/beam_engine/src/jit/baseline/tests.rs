@@ -503,13 +503,17 @@ fn tagged_word_arithmetic_reproduces_make_small() {
 }
 
 #[test]
-fn fast_arith_recognizes_only_the_three_small_int_bifs() {
+fn fast_arith_recognizes_only_the_small_int_bifs() {
     let (module, refs) = module_with_imports(&[
         ("erlang", "+", 2),
         ("erlang", "-", 2),
         ("erlang", "*", 2),
         ("erlang", "+", 3),
         ("lists", "+", 2),
+        ("erlang", "band", 2),
+        ("erlang", "bor", 2),
+        ("erlang", "bsr", 2),
+        ("erlang", "bsl", 2),
     ]);
     let args = vec![Operand::X(0), Operand::Integer(1)];
     for (index, expected) in [
@@ -518,6 +522,10 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
         (2, Some(SmallArith::Mul)),
         (3, None),
         (4, None),
+        (5, Some(SmallArith::And)),
+        (6, Some(SmallArith::Or)),
+        (7, Some(SmallArith::Bsr)),
+        (8, None),
     ] {
         let instr = gc_bif(refs[index], args.clone(), Operand::X(0));
         assert_eq!(
@@ -568,9 +576,40 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
         gc_bif(plus, args.clone(), Operand::X(MAX_REGISTER)),
         gc_bif(plus, args.clone(), Operand::Y(u32::MAX)),
         gc_bif(plus, vec![Operand::X(0), Operand::Y(u32::MAX)], Operand::X(0)),
+        // A constant outside the small range is refused at compile time: the loader
+        // would hold it as a bignum **literal**, which the fast path cannot load (and
+        // the run-time guard would reject anyway).
+        gc_bif(plus, vec![Operand::X(0), Operand::Integer(i64::MAX)], Operand::X(0)),
     ] {
         assert!(fast_arith(&module, &instr).is_none(), "{instr:?}");
     }
+
+    // `bsr` needs a **compile-time** count in `0..64`: the emitted shift is the
+    // immediate `sar_ri`, and x86 masks a 64-bit count to 6 bits. A register count,
+    // a negative count (which is `bsl`, and can grow to a bignum) and a count of
+    // `64` or more are all refused, so the interpreter computes their true value.
+    let bsr = refs[7];
+    for instr in [
+        gc_bif(bsr, vec![Operand::X(0), Operand::X(1)], Operand::X(0)),
+        gc_bif(bsr, vec![Operand::X(0), Operand::Integer(-1)], Operand::X(0)),
+        gc_bif(bsr, vec![Operand::X(0), Operand::Integer(64)], Operand::X(0)),
+        gc_bif(bsr, vec![Operand::X(0), Operand::Integer(1_000_000)], Operand::X(0)),
+    ] {
+        assert!(fast_arith(&module, &instr).is_none(), "{instr:?}");
+    }
+    // …and every in-range count lowers, with the count carried on the shape.
+    for count in [0i64, 1, 4, 59, 63] {
+        let instr = gc_bif(bsr, vec![Operand::X(0), Operand::Integer(count)], Operand::X(0));
+        let fast = fast_arith(&module, &instr).expect("an in-range count lowers");
+        assert_eq!(fast.op, SmallArith::Bsr);
+        assert_eq!(fast.shift, Some(count as u32));
+    }
+    // `band`/`bor` take two ordinary operands, so they carry no shift count.
+    assert_eq!(
+        fast_arith(&module, &gc_bif(refs[5], args.clone(), Operand::X(0)))
+            .map(|fast| fast.shift),
+        Some(None),
+    );
 }
 
 #[test]

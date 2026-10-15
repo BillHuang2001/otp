@@ -18,8 +18,12 @@
 //
 // %CopyrightEnd%
 
-//! Tier-equivalence and structural pins for the three BIF fast paths
-//! (`super::emit::bif`: `erlang:hd/1`, `erlang:element/2`, `erlang:tuple_size/1`).
+//! Tier-equivalence and structural pins for the lowered `Bif`/`GcBif` fast paths:
+//! the three non-collecting `Instr::Bif`s (`super::emit::bif`: `erlang:hd/1`,
+//! `erlang:element/2`, `erlang:tuple_size/1`) and the three collecting
+//! `Instr::GcBif`s (`super::emit::arith`: `erlang:band/2`, `erlang:bor/2`,
+//! `erlang:bsr/2` — each can yield a bignum, so the compiler emits the collecting
+//! form).
 //! A `#[path]` child of `super::tests`, so it shares that module's harness
 //! (`build_module`, `export_atom`, `run_counting`, `assert_same_outcome`).
 //!
@@ -88,8 +92,76 @@ fn bif_host() -> BifHook {
             let arity = tuple_arity(*tuple).map_err(|_| beam_common::BeamError::BadArg)?;
             Ok(make_small(arity as i64))
         }
+        ("erlang", "band", 2) => {
+            let (a, b) = small_pair(args)?;
+            Ok(make_small(a & b))
+        }
+        ("erlang", "bor", 2) => {
+            let (a, b) = small_pair(args)?;
+            Ok(make_small(a | b))
+        }
+        ("erlang", "bsr", 2) => bsr_small(args),
         _ => Err(beam_common::BeamError::BadArg),
     })
+}
+
+/// The small-int domain of `band`/`bor`/`bsr`: both operands must be **small
+/// integers**, and anything else is the `badarith` the real BIF raises (the oracle's
+/// `band(1.0, 2)` and `band(a, 2)` are both `badarith`, `erl_arith.c`'s
+/// `integer`/`badarith`).
+///
+/// A **bignum** operand is outside this host's scope: a `BifHook` receives no
+/// allocator, so it cannot materialize one, and the fixtures cannot build one either.
+/// That is harmless for the property under test — the tier's guards reject *every*
+/// non-small word (`(word & 0xF) != 0xF`), so a bignum and an atom reach the same
+/// compile-time refusal / run-time rejection.
+fn small_pair(args: &[Eterm]) -> Result<(i64, i64)> {
+    let [a, b] = args else {
+        return Err(beam_common::BeamError::BadArith);
+    };
+    if is_small(*a) && is_small(*b) {
+        Ok((signed_value(*a), signed_value(*b)))
+    } else {
+        Err(beam_common::BeamError::BadArith)
+    }
+}
+
+/// `erlang:bsr/2` for the small-int domain — `erts_shift` with `left == false`: `A
+/// bsr N` is `A >> N` sign-extending, a negative `N` is `A bsl -N`, and a right shift
+/// past the word width keeps only the operand's sign (`0`/`-1`).
+///
+/// A `bsl` whose exact result leaves the small range is beyond the hook (it cannot
+/// allocate the bignum), so it reports the typed `system_limit` instead of a
+/// fabricated small; no fixture reaches it.
+fn bsr_small(args: &[Eterm]) -> Result<Eterm> {
+    let (a, n) = small_pair(args)?;
+    let value = if n >= 0 {
+        if n >= 64 {
+            if a < 0 {
+                -1
+            } else {
+                0
+            }
+        } else {
+            a >> (n as u32)
+        }
+    } else {
+        let shift = n.unsigned_abs();
+        if shift >= 64 {
+            // `A bsl <huge>`: `0` for a zero operand, else `system_limit`.
+            if a == 0 {
+                0
+            } else {
+                return Err(beam_common::BeamError::SystemLimit);
+            }
+        } else {
+            // Exact `A bsl shift`; a result outside the small range is a bignum,
+            // which this hook cannot build (see the doc above).
+            i64::try_from(i128::from(a) * (1i128 << shift))
+                .map_err(|_| beam_common::BeamError::SystemLimit)?
+        }
+    };
+    Ok(make_small(value))
 }
 
 /// Run exported `name/0` on both tiers with [`bif_host`] installed and hand the two
@@ -591,6 +663,392 @@ fn the_lowered_bif_fast_paths_record_no_static_deopt() {
             "{label}: `Bif` must be lowered natively, but it deopted {} time(s) at run \
              time; deopts by variant: {:?}",
             snapshot.deopts_by_variant.get("Bif").copied().unwrap_or(0),
+            snapshot.deopts_by_variant,
+        );
+        assert_eq!(
+            snapshot.step_one, 0,
+            "{label}: every instruction of this fixture is lowered, so no interpreter step \
+             may remain; deopts by variant: {:?}",
+            snapshot.deopts_by_variant,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (e) the collecting `gc_bif` fast paths: `erlang:band/2`, `erlang:bor/2`, `erlang:bsr/2`
+// ---------------------------------------------------------------------------
+//
+// These three arrive as **`Instr::GcBif`** (each can yield a bignum, so the compiler
+// emits the collecting form) and are lowered by the arithmetic fast path
+// (`super::emit::arith`: a raw tagged-word `and`/`or` for the bitwise pair, and an
+// untag → arithmetic shift by a compile-time count → re-tag for `bsr`).
+
+/// The non-collecting `{gc_bif,…}` every case in this section ends its body with.
+fn gc_bif_call(args: Vec<Operand>, dst: Operand) -> Instr {
+    Instr::GcBif {
+        arity: args.len() as u8,
+        bif: ImportRef(0),
+        fail: NO_FAIL,
+        live: args.len() as u32,
+        args,
+        dst,
+    }
+}
+
+/// A one-export (`f/0`) module whose single `{gc_bif,…}` calls `erlang:function/2`
+/// with `args`, writing `x(0)`, preceded by `prologue` — the way a fixture puts a
+/// non-small word into a register for the run-time guard.
+fn gc_arith_module(
+    name: &str,
+    function: &str,
+    prologue: Vec<Instr>,
+    args: Vec<Operand>,
+) -> (Module, Atom) {
+    let mut body = vec![Instr::Label(Label(1)), Instr::Label(Label(2))];
+    body.extend(prologue);
+    body.push(gc_bif_call(args, Operand::X(0)));
+    body.push(Instr::Return);
+    bif_module(name, function, 2, body)
+}
+
+/// `erlang:function/2` over the two given operands, with no prologue.
+fn arith_module(name: &str, function: &str, a: Operand, b: Operand) -> (Module, Atom) {
+    gc_arith_module(name, function, Vec::new(), vec![a, b])
+}
+
+/// `function(A, B)` where both operands are registers holding small constants — the
+/// register-operand (non-immediate) shape of the fast path.
+fn arith_registers_module(
+    name: &str,
+    function: &str,
+    a: i64,
+    b: i64,
+) -> (Module, Atom) {
+    gc_arith_module(
+        name,
+        function,
+        vec![
+            Instr::Move {
+                src: Operand::Integer(a),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Integer(b),
+                dst: Operand::X(1),
+            },
+        ],
+        vec![Operand::X(0), Operand::X(1)],
+    )
+}
+
+/// `function(args)` where x-register `slot` holds a **non-small** word: the prologue
+/// move is patched to an atom interned *in this module's own table* (atom ids are per
+/// table), so the shape matches at compile time and the emitted `is_small` guard
+/// rejects at run time — falling back to one interpreter step.
+fn arith_guarded_module(
+    name: &str,
+    function: &str,
+    slot: u32,
+    args: Vec<Operand>,
+) -> (Module, Atom) {
+    let (mut module, export) = gc_arith_module(
+        name,
+        function,
+        vec![Instr::Move {
+            src: Operand::Nil,
+            dst: Operand::X(slot),
+        }],
+        args,
+    );
+    let atom = Operand::Atom(module.atom_table.intern("nope"));
+    *guard_move(&mut module, slot) = Instr::Move {
+        src: atom,
+        dst: Operand::X(slot),
+    };
+    (module, export)
+}
+
+/// `function(atom, B)` — a **non-number constant** operand, refused at compile time
+/// (a constant that is not a small integer is not loadable).
+fn arith_atom_module(name: &str, function: &str, b: Operand) -> (Module, Atom) {
+    let (mut module, export) = arith_module(name, function, Operand::Nil, b);
+    let atom = Operand::Atom(module.atom_table.intern("nope"));
+    match &mut module.functions[0].code[2] {
+        Instr::GcBif { args, .. } => args[0] = atom,
+        other => panic!("the fixture's `gc_bif` must be at code[2]; saw {other:?}"),
+    }
+    (module, export)
+}
+
+/// The `Move { dst: X(slot) }` prologue instruction of a [`gc_arith_module`] fixture.
+fn guard_move(module: &mut Module, slot: u32) -> &mut Instr {
+    module.functions[0]
+        .code
+        .iter_mut()
+        .find(|instr| matches!(instr, Instr::Move { dst: Operand::X(x), .. } if *x == slot))
+        .expect("the prologue move is present")
+}
+
+// -- (e.1) the fast paths produce the BIF's value ---------------------------
+
+/// The fast-path shapes, each asserted to produce the **BIF's own value** on both
+/// tiers: an immediate-operand pair, a negative operand (where the raw tagged-word
+/// `and`/`or` must still be exact), a register-operand pair, and a `. `Y`-slot source
+/// read through the guarded frame window.
+#[test]
+fn the_bitwise_and_shift_gc_bifs_are_lowered_to_the_bifs_value() {
+    // (label, module, expected value)
+    let cases: [(&str, (Module, Atom), i64); 8] = [
+        ("band(12,10)", arith_module("bif_band", "band", Operand::Integer(12), Operand::Integer(10)), 8),
+        ("band(-1,5)", arith_module("bif_band_neg", "band", Operand::Integer(-1), Operand::Integer(5)), 5),
+        ("band(-6,-4)", arith_module("bif_band_neg2", "band", Operand::Integer(-6), Operand::Integer(-4)), -8),
+        ("bor(-1,0)", arith_module("bif_bor", "bor", Operand::Integer(-1), Operand::Integer(0)), -1),
+        ("bor(12,10)", arith_module("bif_bor2", "bor", Operand::Integer(12), Operand::Integer(10)), 14),
+        ("band(X0,X1) registers", arith_registers_module("bif_band_regs", "band", 12, 10), 8),
+        ("bsr(256,4)", arith_module("bif_bsr", "bsr", Operand::Integer(256), Operand::Integer(4)), 16),
+        ("bsr(-256,4)", arith_module("bif_bsr_neg", "bsr", Operand::Integer(-256), Operand::Integer(4)), -16),
+    ];
+    for (label, (module, name), expected) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            let expected = make_small(expected);
+            assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+            assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+
+/// **A `Y`-slot operand of a lowered `gc_bif` is served by the guarded frame
+/// window**: the syntactic gate [`uses_y`] reports the instruction (so the block
+/// publishes the window) and both tiers return the BIF's value.
+#[test]
+fn the_bitwise_gc_bif_y_operand_shape_agrees_across_the_tiers() {
+    let (module, name) = gc_arith_module(
+        "bif_band_y",
+        "band",
+        vec![
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::Integer(10),
+                dst: Operand::Y(0),
+            },
+        ],
+        vec![Operand::Integer(12), Operand::Y(0)],
+    );
+    assert!(
+        uses_y(&module, &module.functions[0].code[4]),
+        "the `gc_bif` of `band(12, Y(0))` reads the frame window, so the block must publish it"
+    );
+    with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+        assert_value("band(12, Y(0)) (interpreter tier)", make_small(8), interpreter);
+        assert_value("band(12, Y(0)) (baseline tier)", make_small(8), baseline);
+        assert_same_outcome("band of a Y slot", interpreter, baseline, &module.atom_table);
+    });
+}
+
+/// `bsr(X, 0)` is the operand unchanged (the emitted shift is omitted) and
+/// `bsr(X, 63)` is a legal, exactly-representable shift — both on both tiers.
+#[test]
+fn the_bsr_count_bounds_are_exact_on_both_tiers() {
+    let cases = [
+        ("bsr(7,0)", arith_module("bif_bsr0", "bsr", Operand::Integer(7), Operand::Integer(0)), 7),
+        ("bsr(-7,0)", arith_module("bif_bsr0n", "bsr", Operand::Integer(-7), Operand::Integer(0)), -7),
+        ("bsr(7,63)", arith_module("bif_bsr63", "bsr", Operand::Integer(7), Operand::Integer(63)), 0),
+        ("bsr(-7,63)", arith_module("bif_bsr63n", "bsr", Operand::Integer(-7), Operand::Integer(63)), -1),
+    ];
+    for (label, (module, name), expected) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            let expected = make_small(expected);
+            assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+            assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+
+// -- (e.2) every declined shape is the interpreter's own outcome -----------
+
+/// The shape equivalence of the raw-tagged-word `and`/`or` is checked over a wide
+/// operand grid against the **real BIF semantics** (the host) on both tiers: the fast
+/// path must never fabricate a value the BIF would not have produced.
+///
+/// The grid spans the interesting smalls (`0`, `±1`, a spread of bit patterns and the
+/// two range ends), and each case asserts the concrete expected value on the
+/// interpreter tier and the baseline tier plus [`assert_same_outcome`].
+#[test]
+fn the_bitwise_fast_path_agrees_with_the_bif_over_a_small_grid() {
+    let values = [0i64, 1, -1, 255, -256, MAX_SMALL, MIN_SMALL];
+    for (index, (a, b)) in values
+        .iter()
+        .flat_map(|a| values.iter().map(move |b| (*a, *b)))
+        .enumerate()
+    {
+        for (function, expected) in [("band", a & b), ("bor", a | b)] {
+            let (module, name) =
+                arith_registers_module(&format!("bif_grid_{function}_{index}"), function, a, b);
+            with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+                let expected = make_small(expected);
+                let label = format!("{function}({a},{b})");
+                assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+                assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+                assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+            });
+        }
+    }
+}
+
+/// The shapes the fast path **declines**, each asserted to be the interpreter's own
+/// outcome on both tiers:
+///
+/// * a **compile-time** refusal — a non-number constant operand (an atom, `nil`), a
+///   wide constant (a bignum at load), and, for `bsr`, a register count, a negative
+///   count (which is `bsl`) or a count of `64`/more (which x86 would mask);
+/// * a **run-time** guard rejection — the operand register holds a non-small word.
+///
+/// Every `badarith` case is the host's own `badarith`; every value case is the BIF's
+/// own value computed by the interpreter (a refused load-time shape is *not*
+/// lowered, so no value is ever fabricated here).
+#[test]
+fn the_declined_bitwise_and_shift_shapes_are_the_interpreters_outcome() {
+    // (a) `badarith`: the operand is a non-number (compile-time refusal for the
+    // constant form, run-time guard rejection for the register form).
+    let badarith = [
+        (
+            "band(atom,5)",
+            arith_atom_module("bif_band_atom", "band", Operand::Integer(5)),
+        ),
+        (
+            "bor(nil,1)",
+            arith_module("bif_bor_nil", "bor", Operand::Nil, Operand::Integer(1)),
+        ),
+        (
+            "band(12,X1=atom)",
+            arith_guarded_module(
+                "bif_band_guard",
+                "band",
+                1,
+                vec![Operand::Integer(12), Operand::X(1)],
+            ),
+        ),
+        (
+            "bsr(X0=atom,4)",
+            arith_guarded_module(
+                "bif_bsr_guard",
+                "bsr",
+                0,
+                vec![Operand::X(0), Operand::Integer(4)],
+            ),
+        ),
+    ];
+    for (label, (module, name)) in badarith {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert!(
+                    matches!(outcome, Err(beam_common::BeamError::BadArith)),
+                    "{label} ({tier}): a declined shape must raise the interpreter's \
+                     `badarith`; saw {outcome:?}"
+                );
+            }
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+
+    // (b) the BIF's own value: `bsr` counts the fast path refuses (a register count,
+    // a negative count = `bsl`, and a count past the word width) reach the
+    // interpreter, whose value the fast path would have got *wrong*.
+    let values = [
+        (
+            "bsr(256,X1=4)",
+            arith_registers_module("bif_bsr_regcount", "bsr", 256, 4),
+            16,
+        ),
+        (
+            "bsr(3,-1)",
+            arith_module("bif_bsr_negcount", "bsr", Operand::Integer(3), Operand::Integer(-1)),
+            6,
+        ),
+        (
+            "bsr(3,64)",
+            arith_module("bif_bsr_wide", "bsr", Operand::Integer(3), Operand::Integer(64)),
+            0,
+        ),
+        (
+            "bsr(-3,64)",
+            arith_module("bif_bsr_wide_neg", "bsr", Operand::Integer(-3), Operand::Integer(64)),
+            -1,
+        ),
+    ];
+    for (label, (module, name), expected) in values {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            let expected = make_small(expected);
+            assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+            assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+
+// -- (e.3) the static deopt is gone ----------------------------------------
+
+/// **The bitwise/shift `gc_bif` fast paths no longer cost a per-instruction
+/// interpreter step** — the structural pin of
+/// [`the_lowered_bif_fast_paths_record_no_static_deopt`], in its same two halves,
+/// for `band`/`bor`/`bsr`.
+///
+/// These arrive as the **collecting** `Instr::GcBif` (each can yield a bignum), whose
+/// `counters::variant_name` is `"GcBif"`.
+#[test]
+fn the_lowered_bitwise_gc_bifs_record_no_static_deopt() {
+    let cases = [
+        (
+            "band/2",
+            arith_module("bif_band_pin", "band", Operand::Integer(12), Operand::Integer(10)),
+        ),
+        (
+            "bor/2",
+            arith_module("bif_bor_pin", "bor", Operand::Integer(12), Operand::Integer(10)),
+        ),
+        (
+            "bsr/2",
+            arith_module("bif_bsr_pin", "bsr", Operand::Integer(256), Operand::Integer(4)),
+        ),
+    ];
+    for (label, (module, name)) in cases {
+        // (1) The emitter's dispatch decision, on a compile that cannot hit the cache.
+        super::counters::reset();
+        super::counters::set_enabled(true);
+        let labels = crate::interpreter::build_label_map(&module);
+        let _function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+        super::counters::set_enabled(false);
+        let emitted = super::counters::snapshot();
+        assert!(
+            emitted.instr_instances.get("GcBif").copied().unwrap_or(0) > 0,
+            "{label}: `GcBif` must have been visited by the emitter, or this pin proves \
+             nothing; instances: {:?}",
+            emitted.instr_instances,
+        );
+        assert_eq!(
+            emitted.instr_deopts.get("GcBif").copied().unwrap_or(0),
+            0,
+            "{label}: `GcBif` is lowered, so it must record zero static deopts; deopts: {:?}",
+            emitted.instr_deopts,
+        );
+
+        // (2) The run: the value arrives natively and no deopt may be attributed to
+        // the `GcBif` (the host here rejects every BIF, so a deopt would raise).
+        let (outcome, snapshot) = run_counting(&module, name, Tier::BaselineJit);
+        assert!(
+            matches!(outcome, Ok(RunOutcome::Returned(_))),
+            "{label}: the lowered fixture must still return the BIF's value; saw {outcome:?}"
+        );
+        assert!(
+            !snapshot.deopts_by_variant.contains_key("GcBif"),
+            "{label}: `GcBif` must be lowered natively, but it deopted {} time(s) at run \
+             time; deopts by variant: {:?}",
+            snapshot.deopts_by_variant.get("GcBif").copied().unwrap_or(0),
             snapshot.deopts_by_variant,
         );
         assert_eq!(
