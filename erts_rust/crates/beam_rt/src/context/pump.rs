@@ -45,7 +45,10 @@ use super::runtime_context::RuntimeContext;
 /// This is the external-call counterpart of the `-eval` evaluator's receive pump
 /// ([`crate::eval`]'s `RECEIVE_PUMP_SLICES`): a bounded step, so a call that blocks has the
 /// child it waits on run and re-scanned, and a pump that reports nothing ran ends the wait
-/// with the honest typed [`beam_engine::blocked`] gap instead of spinning.
+/// with the honest typed [`beam_engine::blocked`] gap instead of spinning. Each round is a
+/// [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) pass — the
+/// **imminent-only** sleep policy — so an idle round whose only pending deadline is far out
+/// yields immediately rather than stalling the caller (see [`RuntimeContext::pump_once`]).
 const RUN_EXPORT_PUMP_SLICES: u64 = 64;
 
 /// The wall-clock safety cap on a nested blocking pump (see [`pump_until_returned`]).
@@ -57,10 +60,19 @@ const RUN_EXPORT_PUMP_SLICES: u64 = 64;
 /// process that stays **runnable forever** reports progress on every round and would spin the
 /// pump without end. This bound is the nested pump's counterpart of the boot drive's
 /// `DRIVE_DEADLINE`: checked between pump rounds, it turns an unbounded pump into a typed
-/// diagnostic instead of a hang. It is deliberately generous — no legitimate
-/// single-pass/`-eval`/boot workload (a `proc_lib` start, a `gen_server` round trip, an
-/// io-device read) comes close — so the cap fires only on a genuine infinite pump.
-pub(super) const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(10);
+/// diagnostic instead of a hang.
+///
+/// It is sized for the heaviest legitimate workload on this route: an **in-process compile** of
+/// a real stdlib module driven by `beam_rt -noshell -eval '<compile:file(…)>'`. Each round is a
+/// [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) pass, so the
+/// pump idles no longer and the compile is purely CPU-bound. Measured on the debug binary
+/// against `lib/stdlib/src/` with `[no_spawn_compiler_process, deterministic, no_docs,
+/// {outdir, …}]`: `ordsets.erl` ≈ 1.5–1.9 s wall / 1.2–1.5 s user, `calendar.erl` ≈ 3.5–6.6 s /
+/// 3.2–5.9 s and `lists.erl` ≈ 17.7–21.4 s / 17.0–20.1 s (the spread is host load). Sixty
+/// seconds is ≈ 3× the largest of those, so the cap clears the heaviest real compile with
+/// headroom for slower hardware while still reporting a genuine infinite pump within a minute
+/// rather than looking like a hang.
+pub(super) const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The longest [`RuntimeContext::pump_once`] sleeps between two scheduler rounds while it
 /// waits a parked `receive … after T` out (see its docs for the whole design).
@@ -345,11 +357,14 @@ impl<'a> RuntimeContext<'a> {
     /// `wait_timeout` carries a statically readable finite delay this method therefore waits it
     /// out:
     ///
-    /// * **Each round** advances the runtime by [`RUN_EXPORT_PUMP_SLICES`] slices. A pump that
-    ///   reported progress means the mailbox may have changed, so the machine is resumed at the
-    ///   address the [`RunOutcome::Wait`] reported: a matching message **wins the race** and its
-    ///   outcome is returned immediately (a message arriving before `T` cancels the deadline,
-    ///   exactly as in the C).
+    /// * **Each round** advances the runtime by [`RUN_EXPORT_PUMP_SLICES`] slices, through
+    ///   [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) — the
+    ///   **imminent-only** sleep policy the boot drives use, so a round whose run queue is empty
+    ///   returns immediately instead of sleeping a full pump slice on a deadline far out (a
+    ///   `gen_server` housekeeping timer, say). A pump that reported progress means the mailbox
+    ///   may have changed, so the machine is resumed at the address the [`RunOutcome::Wait`]
+    ///   reported: a matching message **wins the race** and its outcome is returned immediately
+    ///   (a message arriving before `T` cancels the deadline, exactly as in the C).
     /// * **`ran == 0` does not end this branch.** An empty run queue is the *expected* state
     ///   here — nobody but the timeout can answer the receive — so the bound is the finite
     ///   delay itself, never an unbounded wait and never a busy-spin: each round sleeps
@@ -392,7 +407,7 @@ impl<'a> RuntimeContext<'a> {
         let Some((delay_ms, resume)) = finite else {
             // No deadline: one pump, and a pump that changed nothing ends the drive with the
             // typed gap (the mailbox cannot have changed).
-            let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+            let ran = self.runtime.pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)?;
             if ran == 0 {
                 return Ok(None);
             }
@@ -400,7 +415,7 @@ impl<'a> RuntimeContext<'a> {
         };
         let target = Instant::now() + Duration::from_millis(delay_ms);
         loop {
-            if self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)? > 0 {
+            if self.runtime.pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)? > 0 {
                 let outcome = machine.resume_outcome(module, func, pc, self)?;
                 match outcome {
                     RunOutcome::Returned(_) => return Ok(Some(outcome)),
