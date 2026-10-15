@@ -52,7 +52,7 @@ them.
   None overlaps a cache register, `rbx` or `rsp`.
 
 ## The lowering dispatch (the compile-time inlinable-vs-deopt decision)
-`mod.rs::emit_block` matches each `Instr` of the block (the `match instr { .. }`).
+`block.rs::emit_block` matches each `Instr` of the block (the `match instr { .. }`).
 Each arm calls the group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 emits `emit_deopt`.
 Whole-instruction inlining therefore is a **compile-time, syntactic** decision (never a value test).
