@@ -331,3 +331,72 @@ young policy converges to Copying 4096 / **4185** (9 fullsweeps / 231 minors) an
   relocate, not the per-collection counts measured here.
 * Every deterministic figure above is asserted in its driving test; this file records what those
   tests print, and nothing here is asserted anywhere else.
+
+## Nursery growth retention: the chain is bounded (copy work, retained capacity, latency)
+
+**The question.** `Nursery::grow` is the *no-relocation* growth seam: it never collects and never moves a
+term, so the space it supersedes must stay addressable until a collection evacuates it. What bounds the
+chain — and what happens at a loop workload's heap-admission point when the grown space has room?
+
+**The corpus.** A grow + heap-admission cycle repeated 400 times: the engine's `test_heap` prefix asks
+`should_collect(16)` and collects over its published roots when the answer is true; the op's own un-rooted
+result is a 256-word tuple (exactly one whole mark-region block), allocated through the grow-only seam
+when it does not fit. Driven through **both** mature strategies. Deterministic; timings printed only.
+
+| | chain length (peak, spaces) | retained capacity (peak, words) | peak current nursery (words) |
+|---|---|---|---|
+| **Pre-fix** (`HEAD~1`) | **401** | 401 whole spaces | 752 |
+| **Post-fix** | **2** | 752 (= the largest single space installed) | 752 |
+
+Pre-fix the chain lengthens **once per cycle** — the retention scales with the iteration count, exactly
+the per-op heap retention a loop workload's RSS followed. Post-fix it is **one retired space at most**,
+however many cycles run, and the run converges to a **period-2 plateau** (4 distinct tail states, a fixed
+mature capacity, a fixed pair of nursery capacities). Both strategies reach the same plateau, which is why
+the fix's second half — the *collection-debt* half of `should_collect` — is what makes the retention
+bounded: with only the occupancy half (the pre-fix arithmetic) the chain grows forever, because `collapse`
+runs *only* inside a collection and no collection was ever asked for.
+
+**Cost.** The fix adds **no per-allocation work**: the nursery bump path is untouched (the growth check
+runs only where the allocator already branched to grow), and the only added work is **one collection per
+growth episode** at the *next* heap-admission point — the correct generational cadence, not a new tax. The
+pin test's whole loop, including those collections, runs in **<10 ms** (400 cycles) on the debug-level
+build; the crate's deterministic counts above are the load-invariant evidence and are asserted in
+`tests/nursery_growth_retention.rs`. An external `tools/bench` RSS re-run (`ets_copy`,
+`gc_bound/churn`) was **not** completed within this pass — see Caveats.
+
+**Superseded-space rule, measured directly.** A growth that supersedes a space which never handed the
+mutator a word is dropped rather than retired: `count` unchanged (1), retained capacity 0, and no debt
+reported. The growth that follows a collection (`ensure_capacity`'s collect-then-grow pairing) supersedes
+exactly such an empty space, which is what breaks the collect/grow oscillation — measured: a
+collect→grow→admit sequence leaves `young_space_count() == 1` and `should_collect(0) == false`.
+
+**Pre-existing, NOT caused by this fix: mark-region contiguity.** Driving the same cycle with a
+**100-word** (7-line) tuple at a 2048-word region fails after **43 rounds** with
+`Alloc(AllocFailure { requested: 800, kind: Heap })` while `mature_capacity_words()` still reports 2048.
+Cause: `ImmixSpace::alloc_words` needs a run of the object's 7 lines **inside one 16-line block**
+(`find_run`/`first_hole`), while the promote/reclaim pre-check compares against the region-wide
+`free_lines()`; two 7-line objects fill 14 of a block's 16 lines, so the region reports 8 free lines no
+single run can use and the promotion fails. **Proven independent of this change**: the identical corpus
+reproduces a **byte-identical** failure (same round 43, `mature=1024` variant at round 18) with the
+retention fix reverted to `HEAD~1`, and with an occupancy-only admission signal (chain length 1
+throughout — the retention path not exercised at all). Recorded in `CONTEXT.md` "Known Gaps"; the pin test
+deliberately uses a block-aligned 256-word object so it pins the retention, not this gap.
+
+**Caveats.**
+* **The external `tools/bench` RSS numbers are missing from this entry.** The pre-fix reference is the one
+  already in `../beam_rt/PERF.md` (`ets_copy` peak RSS **94.68 MiB** at N=100000, `VmHWM`-sampled). The
+  post-fix re-run was not completed (tool budget); the in-process pre/post chain measurement above is the
+  load-invariant substitute, and it measures the mechanism directly (retained spaces), which is what the
+  RSS followed. **Treat the post-fix RSS figure as open**, and note that the host was heavily loaded.
+* **Retained *words* are a capacity figure, not RSS.** A retired `HeapSpace` holds a whole backing
+  allocation, so "2 spaces instead of 401" is the RSS-relevant quantity, but the two are not numerically
+  interchangeable (allocator carriering, page granularity, and the rest of the process's footprint sit on
+  top).
+* **Latency was not sampled** (`/usr/bin/time` is absent in the sandbox; the bench harness's own sampler
+  was not driven). The cost argument above is structural (the bump path is untouched, one collection per
+  growth episode) plus the <10 ms in-process loop time.
+* **A pure un-rooted growth loop still grows the chain** — it never reaches a heap-admission point, so
+  nothing claims the debt. That is pinned deliberately by `beam_rt`'s own
+  `alloc_words_grows_the_nursery_and_never_falls_back_to_the_arena` (it asserts `young_space_count() > 1`).
+  Every real Erlang loop reaches an admission point at its `test_heap` prefixes, where the retention is
+  bounded from that point on.
