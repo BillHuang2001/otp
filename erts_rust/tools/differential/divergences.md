@@ -308,8 +308,8 @@ not here.)
   "the consumed install's release" vs "the runtime's compile-time target"). The corpus case
   `boot_extra/init_script_id_names_the_running_otp_release` pins the self-consistency invariant
   `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` and therefore reports a
-  **mismatch** (`ok true` vs `ok false`) now that a plain `-eval` run loads a boot script (before the
-  boot-completion change, `init:script_id/0` raised the typed `unsupported`, so the case was an
-  allowlisted capability gap). It is currently **pinned and failing** (the gate exits 1): the owning
+  **mismatch** (`ok true` vs `ok false`) on a plain `-eval` run, which loads a boot script. It is
+  **pinned and failing** (the gate exits 1), and it is deliberately not in `known-gaps.txt` (a
+  `mismatch` is never allowlistable): the owning
   crate (`beam_rt`) must either make the two values consistent, or the case must be deliberately
   unpinned like the other ledger entries.
