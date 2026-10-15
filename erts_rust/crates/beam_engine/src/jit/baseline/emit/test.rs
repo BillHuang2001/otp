@@ -76,10 +76,17 @@ use crate::jit::baseline::test_helper::{jit_test, TEST_FALSE, TEST_TRUE};
 //   while `cmp_arith` otherwise falls back to the term classes; an atom/`nil`
 //   constant is therefore never inlined for these two.
 //
-// A guard rejection branches to **one** `jit_step_one` call that then continues
-// ([`emit_step_and_continue`]), so a float/bignum/atom operand costs exactly what it
-// did before. A test failure — the word tests *and* every header test, whose
-// predicate is total over live terms — branches to the resolved `fail` label's
+// A rejection — the small-int **guard** for a comparison, or a `Y` source outside the
+// published frame window — never decides anything by itself. For a comparison the
+// rejection continues in the same block through the [`jit_test`] helper
+// ([`emit_test_helper_branch`]), so a float/bignum/atom/boxed operand costs a helper
+// call, never a whole interpreter step: the inline compare is the fast path, the helper
+// the exact fallback, and the two together are `Machine::eval_test`'s answer for every
+// shape. Every other predicate is total over live terms (its guard is always
+// `Guard::None`), so its only rejection is an un-addressable `Y` slot, which does branch
+// to **one** `jit_step_one` call that then continues ([`emit_step_and_continue`]) and
+// reports the interpreter's own faithful judgement. A test failure — the word tests
+// *and* every header test — branches to the resolved `fail` label's
 // `(func, pc)` — a `(spill, return-word, exit)` — while a `NO_FAIL` test (which
 // *raises*), an unresolved label (whose exact `unknown_label` must surface) and an
 // arity operand that is not a plain `{integer,A}` (which the interpreter *raises* on)
@@ -836,6 +843,14 @@ fn emit_is_reference(buffer: &mut CodeBuffer, success: CodeLabel, failed: CodeLa
 /// arity operand, an inexact comparison, a float/literal operand, an un-addressable
 /// `Y` index), so the caller falls back to exactly today's `jit_step_one`. A `Y`
 /// operand **is** lowered, through the shared guarded frame-window read.
+///
+/// A lowered **comparison** never deopts: its small-int guard (and a `Y` source the
+/// published frame window cannot name) branches to the same [`jit_test`] helper
+/// [`emit_test_helper`] uses, so the inline word compare is the fast path and the helper
+/// is the exact fallback for the shapes it cannot decide (two boxed terms, an equal
+/// float vs int, …) — the plan's rejection arm shares the instruction's own resolved
+/// fail exit and continue label, so the two paths are the interpreter's own
+/// `Machine::eval_test` for every shape.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_inline_test(
     buffer: &mut CodeBuffer,
@@ -952,10 +967,35 @@ pub(super) fn try_inline_test(
     buffer.bind(failed)?;
     linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1)?;
 
-    // --- the guard rejected an operand: run the real instruction ------------
+    // --- the lowering rejected an operand -----------------------------------
+    // Two rejections reach this label: the small-int **guard** (a comparison operand
+    // that is not a small integer, so the tagged-word compare would not be the
+    // comparison's answer) and a `Y` source outside the published frame window.
     if let Some(deopt) = deopt {
         buffer.bind(deopt)?;
-        emit_step_and_continue(buffer, done, allocation, func, pc)?;
+        match &plan.pred {
+            // A comparison must **never** be paid as a whole interpreter step: its
+            // inline lowering can only *decide* a shape whose operands are word-exact at
+            // run time, and a rejection is exactly the shape it cannot decide (two boxed
+            // terms, an equal float vs int, a `Y` slot the window cannot name). The
+            // rejection therefore falls through to the same [`jit_test`] helper a shape
+            // the inline subset refused outright uses — the instruction is still
+            // evaluated in-block with `beam_term`'s own comparison, branching to the same
+            // resolved fail label and continuing at the same `after`, exactly as if the
+            // plan had never been formed. The guard is a pure filter: whatever it rejects
+            // the helper decides, so the two together stay interpreter-identical.
+            TestPred::Cmp(_) => {
+                let success: CodeLabel = buffer.label();
+                emit_test_helper_branch(
+                    buffer, allocation, done, func, pc, success, failed, after,
+                )?;
+            }
+            // Every other predicate is a total header/word test this emitter already
+            // decided (its guard is always `Guard::None`), so the only rejection here is
+            // a `Y` slot the frame window cannot address — the interpreter's own step
+            // reports the faithful diagnostic.
+            _ => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+        }
     }
     buffer.bind(after)?;
     Ok(true)
@@ -1041,6 +1081,54 @@ fn emit_test_helper(
     let success: CodeLabel = buffer.label();
     let failed: CodeLabel = buffer.label();
 
+    emit_test_helper_branch(
+        buffer,
+        allocation,
+        done,
+        func,
+        pc,
+        success,
+        failed,
+        after,
+    )?;
+
+    buffer.bind(failed)?;
+    linker.emit_exit(buffer, allocation, done, fail_func, fail_pc)?;
+
+    buffer.bind(after)?;
+    Ok(true)
+}
+
+/// Emit the [`jit_test`] helper call and decode its boolean answer onto two caller-owned
+/// labels — the body [`emit_test_helper`] and the inline comparison lowering
+/// ([`try_inline_test`]'s rejection arm) share.
+///
+/// The emitted shape is
+///
+/// ```text
+///   call jit_test(rt, func, pc)     ; rax = TEST_TRUE | TEST_FALSE | anything else
+///   cmp rax, TEST_TRUE  ; je success
+///   cmp rax, TEST_FALSE ; je failed
+///   jmp done                        ; ERROR / a decline word: the driver decodes it
+/// success:
+///   fill                            ; the helper ran `read_operand` on `machine.x`
+///   <gated jit_refresh_y>           ; only when a later in-block instruction uses Y
+///   jmp after
+/// ```
+///
+/// `success`, `failed` and `after` are **allocated by the caller** and bound by it (the
+/// caller's layout decides where each lands, so a rejection arm can share an existing
+/// fail/continue exit); this function only branches to them.
+fn emit_test_helper_branch(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    success: CodeLabel,
+    failed: CodeLabel,
+    after: CodeLabel,
+) -> Result<()> {
     let helper: StepHelper = jit_test;
     emit_helper_call(
         buffer,
@@ -1069,13 +1157,7 @@ fn emit_test_helper(
     if allocation.refresh_y_after(pc) {
         emit_refresh_y(buffer)?;
     }
-    buffer.jmp(after)?;
-
-    buffer.bind(failed)?;
-    linker.emit_exit(buffer, allocation, done, fail_func, fail_pc)?;
-
-    buffer.bind(after)?;
-    Ok(true)
+    buffer.jmp(after)
 }
 
 #[cfg(test)]

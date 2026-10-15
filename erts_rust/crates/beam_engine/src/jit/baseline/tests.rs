@@ -5474,27 +5474,25 @@ fn the_copy_bound_tier_ab_is_interleaved_and_min_over_n() {
 /// is named explicitly (`Tier::BaselineJit`).
 ///
 /// The probe's receive-match clause heads are **comparison** `test`s (`is_eq_exact`) whose
-/// operand is a `Y` slot, a literal-area term or a boxed-vs-boxed compare, and those are
-/// now lowered in-block through the `jit_test` helper (`super::test_helper`) instead of a
-/// whole interpreter step — so **no** `test` deopt may remain. The counters key a `test` by
-/// its kind (`counters::variant_name` returns `Test(<kind>)`), so the assertion below looks
+/// operand is a `Y` slot or a boxed-vs-boxed compare, and every one of them is lowered
+/// **in-block**: the inline tagged-word compare is the fast path (the sender check, whose
+/// operands are the immediate pid stand-ins this probe uses pass the small-int guard), and
+/// the guard's rejection continues in the same block through the `jit_test` helper
+/// (`super::test_helper`) — the `T2`-vs-`T` match, whose operands are two boxed tuples.
+/// So **no** `test` deopt may remain. The counters key a `test` by its kind
+/// (`counters::variant_name` returns `Test(<kind>)`), so the assertion below looks
 /// for a `Test(`-prefixed key — deliberately **not** `Test`: the distinct `test_heap`
 /// opcode keys as `TestHeap`, a key a `Test(`-prefix lookbehind correctly leaves alone.
-/// The counts moved by exactly that one `test` class: `step_one` fell **1092 → 964**, and
-/// the pre-lowering `deopts_by_variant["Test"] = 128` (2 deopts per round × 64 rounds) is
-/// gone. The only `test` shapes the lowering deliberately declines — a **type** test
+/// The only `test` shapes the lowering deliberately declines — a **type** test
 /// (`Test(IsTuple)`, …) and a `NO_FAIL` form (which *raises*) — are not reachable from this
 /// probe; `a_declined_comparison_test_still_pays_one_jit_step_one_deopt` below is their
 /// positive control.
 ///
-/// The total deopt count is pinned too. The receive/send family accounted for the majority
-/// of the pre-lowering deopts (642 of 1734 per 64 ops — `LoopRec` 257, `RemoveMessage` 128,
-/// `Send` 128, `Wait` 65, `WaitTimeout` 64) and the lowered `test` for another 128; the
-/// **heap / frame-admission** lowerings then removed the probe's `TestHeap` 192 and
-/// `Allocate` 130 deopts as well (the probe runs no `allocate_heap` and no `trim`), so the
-/// total must fall below **700** (the after-value is 642). The remaining deopts are the
-/// structural/metadata opcodes that are still the documented per-instruction deopt
-/// (`PutTuple2` 192, `InitYregs` 130, `Bif` 128, `GetTupleElement` 128, `Call` 64).
+/// The total deopt count is pinned too. The probe's only remaining per-instruction deopt is
+/// `Bif` — the `self()` call each of the two processes makes once per round — keyed by the
+/// plain opcode name, so `step_one` is exactly 128 for the 64 rounds and the reported map
+/// holds no other key: the receive/send family, the lowered comparison `test`, the
+/// heap/frame-admission family and every leaf opcode of the probe are native code.
 #[test]
 fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
     let (bench, bench_atom, worker, worker_atom) = probe_modules();
@@ -5555,11 +5553,28 @@ fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
          deopt may remain; the offending key/count is {offending:?}; deopts by variant: {:?}",
         snapshot.deopts_by_variant,
     );
-    assert!(
-        snapshot.step_one <= 700,
-        "the receive/Send family (642), the lowered comparison `test` (128) and the lowered \
-         heap/frame-admission family (`TestHeap` 192, `Allocate` 130) accounted for 1092 of \
-         the 1734 pre-lowering deopts, so the total must have fallen below 700; saw {} ({:?})",
+    // The probe's every leaf opcode, its receive/send family, every comparison `test` and
+    // its heap/frame-admission family is native code, so the only per-instruction deopt the
+    // probe still pays is `Bif` — the `self()` call each of the two processes makes once
+    // per round. The whole variant map is therefore exactly one `Bif` key.
+    let deopt_variants: Vec<&str> = snapshot
+        .deopts_by_variant
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        deopt_variants,
+        vec!["Bif"],
+        "the probe's only remaining per-instruction deopt must be the once-per-round `self()` \
+         `Bif`, so the whole variant map is exactly one `Bif` key; saw {:?}",
+        snapshot.deopts_by_variant,
+    );
+    assert_eq!(
+        snapshot.step_one,
+        2 * u64::from(PROBE_COUNT_OPS),
+        "one `Bif` deopt per round per process = 2 × {} = {}; saw {} ({:?})",
+        2 * PROBE_COUNT_OPS,
+        2 * u64::from(PROBE_COUNT_OPS),
         snapshot.step_one,
         snapshot.deopts_by_variant,
     );
