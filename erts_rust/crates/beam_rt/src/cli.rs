@@ -50,7 +50,7 @@
 //! | `-M*` / `+MM*` / `+MB*` | ERTS allocator flags (the `+M*` forms are validated; all preserved verbatim) |
 //! | `+JPperf VALUE` | perf support: `true`\|`false`\|`dump`\|`map`\|`fp`\|`no_fp` (contract A.8; see [`crate::perf_map`]) |
 //! | `+JPperfdirectory Dir` | where the perf files are written (default `/tmp`); `ERL_SYM_MAP_FILE` overrides the map's whole path |
-//! | `run File Mod:Func/Arity [Args…]` | load `File`, run the function and print the result |
+//! | `run File Mod:Func/Arity [Args…]` | the non-interactive batch runner: load `File`, run the function, print the result **and nothing else** — it records the `noshell` init argument (so the booted kernel prints no OTP slogan) while still driving the full default boot script |
 //!
 //! # `ERL_*FLAGS`
 //!
@@ -180,7 +180,9 @@ Environment (read by the emulator/launcher; never an init argument):
 
 Actions:
   run FILE MOD:FUNC/ARITY [ARG...]
-                            load FILE, run MOD:FUNC/ARITY and print the result
+                            load FILE, run MOD:FUNC/ARITY and print the result (the
+                            batch action is head-less: it boots the default boot script
+                            and prints nothing but the result)
 
 run arguments (any of):
   42, -3                    a small integer
@@ -935,6 +937,18 @@ fn parse_run_file(args: &[String], index: usize, builder: &mut Builder) -> Resul
         arity,
         args: arguments,
     };
+    // `run` is the runtime's **scripted non-interactive batch runner**: the vertical-slice
+    // CLI and the differential harness drive it and expect no banner, exactly like
+    // `erl -noshell`. The booted kernel's `user`/`user_drv` gates the OTP slogan on
+    // `init:get_argument(noshell)`, so recording `noshell` here makes `run` banner-free
+    // while the full default boot script still runs unchanged — the boot drive is
+    // independent of this init argument and is not skipped. Recording it at the parse
+    // site keeps `RuntimeConfig::init_args` the single source the booted kernel's
+    // `init:get_argument/1` reads. A user-supplied `-noshell` (which `run`'s terminal
+    // argument tail can only precede) is never duplicated.
+    if builder.init_args.get("noshell").is_none() {
+        builder.record("-noshell", Vec::new());
+    }
     Ok(args.len())
 }
 
@@ -1970,6 +1984,28 @@ mod tests {
             }
             other => panic!("expected a run action, got {other:?}"),
         }
+    }
+
+    /// The `run` batch action records a synthetic `-noshell` so it is banner-free (the booted
+    /// kernel's `user_drv` gates the OTP slogan on `init:get_argument(noshell)`), while still
+    /// driving the full default boot script. The recording is **scoped to `run`** and never
+    /// duplicated when the user already supplied one.
+    #[test]
+    fn run_action_records_a_single_scoped_noshell_init_argument() {
+        // `run` records exactly one `-noshell` (no values) alongside the batch action.
+        let config = parsed(&["run", "mod.beam", "m:f/0"]);
+        assert!(matches!(config.action, Action::RunFile { .. }));
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+
+        // A user-supplied `-noshell` before `run` is NOT duplicated: still exactly one.
+        let config = parsed(&["-noshell", "run", "mod.beam", "m:f/0"]);
+        assert!(matches!(config.action, Action::RunFile { .. }));
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+
+        // The synthetic `noshell` is scoped to `run`: the other ERTS-native actions keep their
+        // oracle-faithful banner behaviour and record no `noshell`.
+        assert_eq!(parsed(&["-eval", "2+3"]).init_args.get("noshell"), None);
+        assert_eq!(parsed(&["-s", "mod", "fun"]).init_args.get("noshell"), None);
     }
 
     #[test]
