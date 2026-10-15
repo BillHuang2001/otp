@@ -451,8 +451,9 @@ fn a_malformed_flag_is_rejected_with_exit_one() {
         (&["+JPperf", "MAP"][..], "MAP"),
         // `beam_rt_perf` appends `-eval ok`, so a *trailing* `+JPperf` swallows that `-eval` as
         // its value — a switch reads the next token blindly, exactly as the C does — and the
-        // grammar rejects it. (A `+JPperf` with **no** token at all is the usage error pinned by
-        // [`a_missing_flag_operand_is_a_usage_error`].)
+        // grammar rejects it. (A `+JPperf` with **no** token at all is the launcher's
+        // missing-operand rejection pinned by
+        // [`a_missing_flag_operand_is_rejected_with_exit_one`].)
         (&["+JPperf"][..], "-eval"),
     ] {
         let (_, output) = beam_rt_perf(args, &[]);
@@ -473,22 +474,30 @@ fn a_malformed_flag_is_rejected_with_exit_one() {
 }
 
 /// A `+JPperf`/`+JPperfdirectory` whose operand is genuinely **missing** (nothing follows it)
-/// is this runtime's usage error — exit **2** with the usage text — the documented divergence
-/// from `beam.smp`, which prints `Missing argument(s) for '<switch>'.` and exits 1.
+/// is the **launcher's** diagnostic, matching the oracle's `erlexec`: exit **1** with one
+/// `beam_rt: Missing argument(s) for '<switch>'.` line and **no** `Usage:` block
+/// (`erlexec`'s `NEXT_ARG_CHECK_NAMED`, `erts/etc/common/erlexec.c:414-418` — the switch is
+/// rejected only when it is the last token or the next token is exactly `--`).
 ///
 /// The probe is invoked **without** the `-eval ok` terminator `beam_rt_perf` appends, which
 /// would otherwise be swallowed as the value.
 #[test]
-fn a_missing_flag_operand_is_a_usage_error() {
+fn a_missing_flag_operand_is_rejected_with_exit_one() {
     for switch in ["+JPperf", "+JPperfdirectory"] {
         let (_, output) = run_with_pid(env!("CARGO_BIN_EXE_beam_rt"), &["-noshell", switch], &[]);
-        assert_eq!(output.status.code(), Some(2), "{switch}");
+        assert_eq!(output.status.code(), Some(1), "{switch}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("switch {switch} requires a value")),
-            "{switch}: {stderr}"
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "{switch}: exactly one stderr line: {stderr}"
         );
-        assert!(stderr.contains("Usage:"), "{switch}: {stderr}");
+        assert_eq!(
+            stderr.trim_end(),
+            format!("beam_rt: Missing argument(s) for '{switch}'."),
+            "{switch}"
+        );
+        assert!(!stderr.contains("Usage:"), "{switch}: {stderr}");
     }
 }
 

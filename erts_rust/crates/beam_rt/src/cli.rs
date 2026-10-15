@@ -2057,30 +2057,40 @@ mod tests {
     }
 
     /// Unmodeled flags keep their behaviour when a modelled heap switch sits next to
-    /// them: a `+`-flag is accepted (and, for `+A`, preserved verbatim) but is not an init
-    /// argument, and parsing continues onto the next switch.
+    /// them: a *recognized* `+`-flag is accepted (and, for `+A`, preserved verbatim) but is
+    /// not an init argument, and parsing continues onto the next switch.
     #[test]
     fn unmodeled_flags_are_unaffected_by_the_heap_switches() {
-        let config = parsed(&["+hms", "1000", "+zzz", "1", "2", "+A", "16"]);
+        // `+Weird` is a *recognized* emulator spelling — `erlexec` rewrites it to
+        // `-Weird`, the `-W` warning-map switch (`erlexec.c:1098-1101`) — so it parses
+        // beside a modelled heap switch and leaves the run continuing.
+        let config = parsed(&["+hms", "1000", "+Weird", "1", "2", "+A", "16"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 1598);
-        assert_eq!(config.init_args.get("zzz"), None);
+        assert_eq!(config.init_args.get("Weird"), None);
         assert_eq!(
             config.emulator.extra_emulator_flags,
             vec!["+A".to_string(), "16".to_string()]
         );
         assert_eq!(config.init_args.get("hms"), None);
-        // An unrecognized flag on its own still boots (accepted, not a usage error).
-        assert_eq!(parsed(&["+Weird"]).heap_options(), &HeapOptions::default());
+        // An **unrecognized** `+X` on its own is the emulator's own rejection (`erlexec`
+        // rewrites it to `-X`, and `beam.smp` prints `unknown flag -X` and exits 1,
+        // `erl_init.c:2488-2490`) — never an accepted no-op, never a recorded init argument.
+        let error = parse_args(&["+zzz"]).expect_err("an unrecognized +X is refused");
+        assert_eq!(
+            error::flag_rejected_diagnostic(&error),
+            Some("unknown flag -zzz")
+        );
     }
 
     #[test]
     fn smp_switch_selects_the_scheduler_model() {
-        // `disable` turns SMP off; it is still recorded as an init argument.
-        let config = parsed(&["-smp", "disable"]);
-        assert!(!config.emulator.features.smp, "disable turns SMP off");
+        // The launcher refuses `-smp disable` outright in favour of `+S 1`
+        // (`erlexec.c:511-514`, `usage_notsup`): `Argument '-smp disable' not supported.
+        // Use "+S 1" instead.`, a flag rejection (exit 1), never a recorded init argument.
+        let error = parse_args(&["-smp", "disable"]).expect_err("-smp disable is refused");
         assert_eq!(
-            config.init_args.get("smp"),
-            Some(vec![&["disable".to_string()][..]])
+            error::flag_rejected_diagnostic(&error),
+            Some("Argument '-smp disable' not supported. Use \"+S 1\" instead.")
         );
         // `enable`/`auto` are the default (SMP on).
         assert!(parsed(&["-smp", "enable"]).emulator.features.smp);
@@ -2098,8 +2108,8 @@ mod tests {
         assert!(config.emulator.features.smp);
         assert_eq!(config.init_args.get("smp"), Some(vec![&[][..]]));
         // `-smp` consumes only its value: the following switch still parses.
-        let config = parsed(&["-smp", "disable", "+S", "2"]);
-        assert!(!config.emulator.features.smp);
+        let config = parsed(&["-smp", "enable", "+S", "2"]);
+        assert!(config.emulator.features.smp);
         assert_eq!(config.emulator.schedulers, Some(2));
     }
 
@@ -2341,10 +2351,10 @@ mod tests {
         );
         assert_eq!(config.emulator.schedulers, Some(3));
 
-        // A stray positional argument is still a *usage* error, not a capability gap.
-        let error = parse_args(&["junk"]).expect_err("stray argument");
-        assert!(error.to_string().contains("junk"), "{error}");
-        assert_eq!(error::unsupported_reason(&error), None);
+        // A plain positional argument is **accepted and ignored**, exactly as the oracle's
+        // launcher forwards it to `init` (`erl junk -noshell …` exits 0) — never a usage
+        // error (`erlexec.c`, the default `case`).
+        assert_eq!(parsed(&["junk"]).action, Action::Boot);
     }
 
     /// The A.6 configuration switches (`-setcookie`/`-config`/`-boot`): a `-`-switch, so
