@@ -270,9 +270,70 @@ fn static_core_atom(name: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|known| *known == name)
-}/// A malformed value of a *recognized* switch (e.g. `+P x`).
+}/// The prefix of the reason atom for a switch value the **emulator/launcher** rejects
+/// (`beam_rt_flag:<diagnostic>`).
+///
+/// A malformed value of a recognized emulator switch (`+t`, `+P`, `+Q`, `+S`, `+hms`,
+/// `+hmax`, `+sbt`, …) is neither a CLI usage error nor a capability gap: the oracle's
+/// `beam.smp` prints its own one-line diagnostic plus its 7331-byte usage text and exits
+/// **1**. This runtime reports the same exit status with its own one-line diagnostic
+/// (the `beam.smp` usage block is deliberately not reproduced).
+pub(crate) const FLAG_PREFIX: &str = "beam_rt_flag";
+
+/// The emulator/launcher flag rejection: class `error`, reason atom `beam_rt_flag:<diag>`.
+pub(crate) fn flag_rejected(diagnostic: impl Into<String>) -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom(format!(
+        "{FLAG_PREFIX}:{}",
+        diagnostic.into()
+    ))))
+}
+
+/// The diagnostic carried by an emulator-flag rejection, if `error` is one (the classifier
+/// of [`FLAG_PREFIX`]). [`crate::cli::run`] prints it and exits **1** (no [`USAGE`] block).
+///
+/// [`USAGE`]: crate::cli::USAGE
+pub(crate) fn flag_rejected_diagnostic(error: &BeamError) -> Option<&str> {
+    raise_reason(error)?
+        .strip_prefix(FLAG_PREFIX)?
+        .strip_prefix(':')
+}
+
+/// The prefix of the reason atom for a **boot failure caused by an unreadable `-config`
+/// file** (`beam_rt_config:<resolved path>`).
+///
+/// The oracle's boot starts the node and then fails while `application_controller` reads
+/// the file: it prints `Could not start kernel pid (application_controller) (...)` on
+/// stderr, writes a real crash dump and exits **1**. The resolved path is carried here so
+/// the CLI can reproduce that text byte-for-byte.
+pub(crate) const CONFIG_PREFIX: &str = "beam_rt_config";
+
+/// The unreadable-`-config` boot failure raise.
+pub(crate) fn config_boot_failure(path: &std::path::Path) -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom(format!(
+        "{CONFIG_PREFIX}:{}",
+        path.display()
+    ))))
+}
+
+/// The resolved `-config` path carried by a config boot failure (the classifier of
+/// [`CONFIG_PREFIX`]).
+pub(crate) fn config_failure_path(error: &BeamError) -> Option<&str> {
+    raise_reason(error)?
+        .strip_prefix(CONFIG_PREFIX)?
+        .strip_prefix(':')
+}
+
+/// A malformed value of a *recognized* switch (e.g. `+P x`).
+///
+/// A malformed value of a recognized switch is rejected by the **emulator** (or by the
+/// `erl` launcher, for its own switches such as `-env`/`-emu_flavor`): the oracle prints
+/// its own diagnostic and exits **1**, so this is a [`flag_rejected`] raise — *not* the
+/// CLI's usage status 2. [`crate::cli::run`] classifies it with
+/// [`flag_rejected_diagnostic`] and prints one line, without a [`USAGE`] block.
+///
+/// [`USAGE`]: crate::cli::USAGE
 pub(crate) fn bad_switch_value(switch: &str, value: &str) -> BeamError {
-    message(format!("bad value {value:?} for switch {switch}"))
+    flag_rejected(format!("bad value {value:?} for switch {switch}"))
 }
 
 /// A recognized switch whose required value is missing (e.g. a trailing `-eval`).

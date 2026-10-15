@@ -55,13 +55,17 @@
 //!   `get_arg`s the value; there is **no** validation. `beam_rt` accepts the two
 //!   documented literals instead (a documented divergence).
 //!
-//! # Documented divergences (oracle exit 1 vs `beam_rt` exit 2)
+//! # Malformed values (the oracle's exit 1 — matched)
 //!
-//! The oracle prints `bad …` + its usage text and exits **1** for a malformed
-//! emulator value; `beam_rt` keeps its uniform four-code contract and reports a
-//! **usage** error (exit 2 + [`USAGE`](crate::cli::USAGE)) instead. The C's numeric
-//! laxness (`ErtsStrToSint`, which silently ignores trailing garbage) is not
-//! reproduced either — `+Q 1024abc` is rejected here and accepted by the oracle.
+//! A malformed value of a recognized emulator switch is neither a CLI usage error nor a
+//! capability gap: the oracle's `beam.smp` prints `bad …` plus its own usage text and exits
+//! **1**, so [`error::bad_switch_value`] carries the flag-rejection kind and
+//! [`crate::cli::run`] reports that same exit status with this runtime's one-line
+//! diagnostic (the 7331-byte `beam.smp` usage block is deliberately not reproduced). The
+//! C's numeric laxness (`atoi`/`ErtsStrToSint`, which silently ignores trailing garbage)
+//! **is** reproduced for the switches whose reader is a bare `atoi` (`+A`,
+//! `+hms`/`+hmbs`, `+hmax`, `+e`, `+K`), while the `strtol`-checked ones (`+t`, `+P`,
+//! `+Q`, `+S`, `+sbt`) stay strict.
 //!
 //! `-M*` is a further, deliberate divergence. Through the `erl` wrapper a `-M*` flag
 //! is **not** forwarded to the emulator at all (`erlexec.c:865`: `-M…` falls to
@@ -123,14 +127,12 @@ pub(super) fn parse_max_processes(switch: &str, value: &str) -> Result<Option<us
     }
 }
 
-/// `+K true|false` — the kernel-poll switch. The emulator itself does not validate
-/// the value (`erl_check_io.c:2467`); this runtime accepts the two documented
-/// literals and rejects anything else (a documented divergence, above).
+/// `+K [true|false]` — the kernel-poll switch. The emulator itself does not validate
+/// the value (`erl_check_io.c:2467`): it only `get_arg`s it, so **any** value is accepted
+/// here too (`+K bogus` exits 0 in the oracle) and preserved verbatim.
 pub(super) fn parse_kernel_poll(switch: &str, value: &str) -> Result<()> {
-    match value {
-        "true" | "false" => Ok(()),
-        _ => Err(error::bad_switch_value(switch, value)),
-    }
+    let _ = (switch, value);
+    Ok(())
 }
 
 /// The nine `+sbt` scheduler bind types (`erl_cpu_topology.c:628-647`).
@@ -169,8 +171,8 @@ pub(crate) const MAX_ATOM_TABLE_SIZE: i64 = (1 << 31) - 1;
 /// +t 8192 / +t 1048576 / +t 2000000000 → accepted, and `atom_limit` follows the value
 /// ```
 ///
-/// `beam_rt` reports its uniform malformed-value diagnostic (exit 2 + `USAGE`) instead of
-/// the oracle's exit 1 + usage — the crate's documented emulator-value convention.
+/// `beam_rt` reports the emulator's own exit status (1) with its uniform one-line
+/// malformed-value diagnostic instead of the oracle's `bad atom table size …` + usage.
 pub(super) fn parse_atom_table_size(switch: &str, value: &str) -> Result<()> {
     match value.parse::<i64>() {
         Ok(size) if (MIN_ATOM_TABLE_SIZE..=MAX_ATOM_TABLE_SIZE).contains(&size) => Ok(()),

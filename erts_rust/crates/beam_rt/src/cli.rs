@@ -101,9 +101,16 @@
 //! | Code | Meaning | stderr |
 //! |---|---|---|
 //! | `0` | success | — |
-//! | `1` | genuine runtime error (a load/execute/BIF failure) | `beam_rt: <error>` |
-//! | `2` | malformed invocation / usage error | `beam_rt: <error>` then [`USAGE`] |
+//! | `1` | genuine runtime error (a load/execute/BIF failure), **and** a switch value the oracle's emulator/launcher rejects (`+t 2`, `+P 0`, `+sbt zz`, a `-env` with no operand, an unreadable `-config`) | the oracle-shaped one-line diagnostic, or `beam_rt: <error>` |
+//! | `2` | malformed invocation / usage error (a missing operand of a recognized switch, a stray positional argument, a malformed `run` spec) | `beam_rt: <error>` then [`USAGE`] |
 //! | `3` | unsupported (capability gap) | exactly one line, `beam_rt: unsupported: <reason>` |
+//!
+//! A malformed value of an **emulator switch** is exit 1, not exit 2: the oracle's
+//! `beam.smp` (and the `erl` launcher) rejects it with its own diagnostic, its usage text
+//! and exit status **1** — verified against OTP 29.1.1 / erts-17.1 for
+//! `+t 2`/`+P 0`/`+Q 0`/`+hms 0`/`+sbt zz`/`+hmax -1`/`+e -1`/`+hmaxk x`. This runtime
+//! reports that exit status with its own one-line diagnostic; the (7331-byte)
+//! `beam.smp` usage block is deliberately **not** reproduced.
 //!
 //! The `beam_rt: unsupported: ` prefix (with its trailing space) is the signal the
 //! differential harness keys off; it is emitted on **no** other path, and the
@@ -191,8 +198,11 @@ run arguments (any of):
   [1, atom, \"x\", [2]]       a list of run arguments
 
 Exit codes:
-  0  success        1  runtime error        2  usage error        3  unsupported";
+  0  success             1  runtime error / switch value rejected by the emulator
+  2  usage error         3  unsupported
 
+A malformed value of an emulator switch (+t/+P/+Q/+S/+hms/+hmax/+sbt/...), a -env with
+no operand and an unreadable -config exit 1, as the oracle's emulator/launcher do.";
 /// The exit code of a successful run.
 pub const EXIT_OK: i32 = 0;
 /// The exit code of a genuine runtime error (a load/execute/BIF failure).
@@ -388,6 +398,9 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             }
             "+K" => {
                 let value = value_of(args, index, "+K")?;
+                // The emulator only `get_arg`s the value — there is **no** validation
+                // (`erl_check_io.c:2467`) — so every value is accepted, `+K bogus` and bare
+                // `+K` (which consumes whatever follows, blindly) included.
                 flags::parse_kernel_poll("+K", &value)?;
                 builder.preserve("+K", &value);
                 index += 2;
@@ -424,10 +437,14 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // them; a valueless `+B` preserves an empty value so the `(switch, value)` stride
             // stays even.
             "+B" => {
+                // The oracle's `+B` consumes a following single-letter `i`/`c`/`d` (setting
+                // the break mode) and otherwise emits `-B` alone, leaving the token as a
+                // **plain positional** `init` argument — which the oracle then answers by
+                // starting its interactive shell. This runtime has no interactive shell, so
+                // the token is consumed and ignored instead: the exit status (`+B x` ⇒ 0)
+                // matches the oracle, and that status is the observable.
                 let value = match args.get(index + 1) {
-                    Some(candidate) if matches!(candidate.as_str(), "i" | "c" | "d") => {
-                        candidate.clone()
-                    }
+                    Some(candidate) if !is_switch(candidate) => candidate.clone(),
                     _ => String::new(),
                 };
                 let consumed = !value.is_empty();
@@ -453,7 +470,12 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 let value = value_of(args, index, "+A")?;
                 // The async-thread pool is not modelled by the runtime core; it is
                 // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
-                parse_u32("+A", &value)?;
+                // The emulator's reader is a bare `atoi`, so any value is accepted (junk
+                // parses to 0: `+A abc` exits 0) and only a **negative** result is rejected
+                // (`+A -5` exits 1).
+                if flags::atoi(&value) < 0 {
+                    return Err(error::bad_switch_value("+A", &value));
+                }
                 builder.preserve("+A", &value);
                 index += 2;
             }
@@ -722,18 +744,16 @@ fn parse_u32(switch: &str, value: &str) -> Result<u32> {
         .map_err(|_| error::bad_switch_value(switch, value))
 }
 
-/// Parses a `+hms` / `+hmbs` heap-size value: a **positive** decimal word count.
-///
-/// Mirrors the emulator's own check: the C parses with `atoi` and rejects any value
-/// `<= 0` (`erl_init.c:1554-1567`) — verified against the oracle, where `+hms 0` and
-/// `+hms abc` both fail (the emulator prints `bad heap size <value>` and its usage text,
-/// exiting 1). `beam_rt` reports its uniform malformed-value diagnostic instead (a usage
-/// error: exit 2 + [`USAGE`]). One documented divergence: `atoi` truncates a trailing
-/// suffix, so the oracle accepts `+hms 100abc` as 100, while this parser rejects it.
+/// Parses a `+hms` / `+hmbs` heap-size value with the C's own `atoi` reader, so a value
+/// the emulator accepts is accepted here: only a result `<= 0` is rejected (`erl_init.c`
+/// `bad heap size <value>`, exit 1). `+hms 0` and `+hms abc` fail in both runtimes, while
+/// `+hms 100abc` is the oracle's 100 (trailing junk ignored) and is this parser's 100 too.
 fn parse_heap_words(switch: &str, value: &str) -> Result<usize> {
-    match value.parse::<usize>() {
-        Ok(words) if words > 0 => Ok(words),
-        _ => Err(error::bad_switch_value(switch, value)),
+    let words = flags::atoi(value);
+    if words > 0 {
+        Ok(words as usize)
+    } else {
+        Err(error::bad_switch_value(switch, value))
     }
 }
 
@@ -742,18 +762,19 @@ fn parse_heap_words(switch: &str, value: &str) -> Result<usize> {
 /// (`erl_init.c:1626-1633`: `hMaxSize < 0 || hMaxSize > MAX_SMALL` is
 /// `bad max heap size <value>`; `+hmax 0` — the default — means *unlimited*).
 ///
-/// Verified against the oracle: `+hmax 0` is accepted (unlimited),
-/// `+hmax -1` and `+hmax 1000000000000000000000` are rejected. Divergences, both in the
-/// *rejection* direction: the C parses with `ErtsStrToSint` and tests only the numeric
-/// result, so it silently accepts `+hmax abc` as 0 and `+hmax 12abc` as 12, where this
-/// parser rejects both. The C's parse-time "max must not be below the *current* min"
-/// check (`erl_init.c:1634-1639`) is **not** modelled: it is order-dependent
-/// (`+hmax 500 +hms 1000 +hmax 200` fails, `+hms 2000 +hmax 1000` does not) and only
-/// rejects an invocation.
+/// Verified against the oracle: `+hmax 0` is accepted (unlimited), `+hmax -1` and
+/// `+hmax 1000000000000000000000` are rejected, and — because the C parses with
+/// `ErtsStrToSint` and tests only the numeric result — `+hmax abc` is its `0` and
+/// `+hmax 12abc` its `12`, which the `atoi` reader here reproduces. The C's
+/// parse-time "max must not be below the *current* min" check (`erl_init.c:1634-1639`) is
+/// **not** modelled: it is order-dependent (`+hmax 500 +hms 1000 +hmax 200` fails,
+/// `+hms 2000 +hmax 1000` does not) and only rejects an invocation.
 fn parse_max_heap_size(value: &str) -> Result<usize> {
-    match value.parse::<i64>() {
-        Ok(words) if (0..=MAX_SMALL).contains(&words) => Ok(words as usize),
-        _ => Err(error::bad_switch_value("+hmax", value)),
+    let words = flags::atoi(value);
+    if (0..=MAX_SMALL).contains(&words) {
+        Ok(words as usize)
+    } else {
+        Err(error::bad_switch_value("+hmax", value))
     }
 }
 
@@ -773,8 +794,9 @@ fn parse_max_heap_size(value: &str) -> Result<usize> {
 ///   `+S 0:2` is accepted (the total defaults to the processor count).
 /// * Anything else (`+S 1:2:3`, a non-number) is rejected.
 ///
-/// A malformed value is this parser's uniform usage error (exit 2 + [`USAGE`]); the
-/// oracle prints `bad amount of schedulers <value>` and its own usage, exiting 1.
+/// A malformed value is the emulator's own rejection: the oracle prints
+/// `bad amount of schedulers <value>` plus its usage text and exits **1**, and this
+/// runtime reports that same exit status with its one-line diagnostic.
 fn parse_schedulers(value: &str) -> Result<(Option<u32>, Option<u32>)> {
     let mut parts = value.split(':');
     let total = parse_u32("+S", parts.next().unwrap_or(value))?;
@@ -853,14 +875,49 @@ fn collect_path_values(args: &[String], from: usize) -> (Vec<String>, usize) {
 /// erts-17.1). The launcher consumes the next two tokens blindly — `erl -env x -noshell`
 /// swallows `-noshell` as the value — so this does too.
 ///
-/// The variable is *not* injected into this process's environment (`std::env::set_var`
-/// is `unsafe` in edition 2024 and this crate is `#![deny(unsafe_code)]`), so
-/// `os:getenv/1` does not observe it; see the crate's M1 gaps.
+/// The pair is *applied* to this process's environment by [`apply_env_switches`], which
+/// [`run`] calls **before** the parse — the launcher's own order. A pair with no operand
+/// left is the launcher's diagnostic and exit status (`Missing argument(s) for '-env'.`,
+/// exit 1), not this CLI's usage status.
 fn parse_env_switch(args: &[String], index: usize) -> Result<usize> {
     if args.len() < index + 3 {
-        return Err(error::missing_value("-env"));
+        return Err(error::flag_rejected("Missing argument(s) for '-env'."));
     }
     Ok(index + 3)
+}
+
+/// Applies every `-env VAR VALUE` pair of `args` to this process's environment.
+///
+/// The `erl` launcher's own switch (`erts/etc/common/erlexec.c:724`, `case 'e'`): it
+/// consumes the two tokens following `-env` **blindly** (so `erl -env x -noshell` swallows
+/// `-noshell` as the value) and calls `set_env`, i.e. the pair becomes part of the spawned
+/// emulator's environment while never reaching `init` — which is why
+/// `init:get_argument(env)` is the bare atom `error`. A repeated name keeps the **last**
+/// value (as `putenv` does), and the C builds `NAME=VALUE` before calling `putenv`, so the
+/// *first* `=` splits the name: `-env A=B val` sets `A` to `B=val`.
+///
+/// [`std::env::set_var`] is **not** `unsafe` under this workspace's edition (2021). It
+/// panics for a name that is empty or contains `=`/NUL, so such a pair is skipped rather
+/// than panicking. The runtime is single-threaded when this runs (before any boot), so the
+/// call is sound.
+fn apply_env_switches(args: &[String]) {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] != "-env" {
+            index += 1;
+            continue;
+        }
+        if let (Some(raw_name), Some(value)) = (args.get(index + 1), args.get(index + 2)) {
+            let (name, value) = match raw_name.split_once('=') {
+                Some((head, tail)) => (head, format!("{tail}={value}")),
+                None => (raw_name.as_str(), value.clone()),
+            };
+            if !name.is_empty() && !name.contains('\0') && !value.contains('\0') {
+                std::env::set_var(name, value);
+            }
+        }
+        index += 3;
+    }
 }
 
 /// Parses the `-smp` switch, returning the index of the next switch.
@@ -1098,9 +1155,24 @@ fn split_top_level<'a>(token: &'a str, inner: &'a str) -> Result<Vec<&'a str>> {
 /// halt write no dump, exactly as the oracle's `ERTS_ERROR_EXIT`/`ERTS_DUMP_EXIT` rules
 /// leave them alone.
 pub fn run(args: Vec<String>) -> i32 {
+    // The `-env VAR VALUE` pairs are applied to this process's environment by the `erl`
+    // **launcher** (`erts/etc/common/erlexec.c:724`, `case 'e'` → `set_env`), before the
+    // emulator reads anything out of that environment and before every OS child the
+    // runtime spawns inherits it. Applying them here — ahead of the parse — is exactly the
+    // launcher's order, so `vars::from_env` (which reads `ERL_MAX_PORTS`) and the lazily
+    // built environment table behind `os:getenv/1` both observe them. The runtime is
+    // single-threaded at this point, so `std::env::set_var` is sound (it is **not**
+    // `unsafe` under this workspace's edition 2021).
+    apply_env_switches(&args);
     let config = match parse_with_env(&args, &ProcessEnv) {
         Ok(config) => config,
         Err(error) => {
+            if let Some(diagnostic) = error::flag_rejected_diagnostic(&error) {
+                // A switch value the oracle's `beam.smp` (or the `erl` launcher) rejects:
+                // its own exit status **1**, and no [`USAGE`] block.
+                eprintln!("beam_rt: {diagnostic}");
+                return EXIT_RUNTIME;
+            }
             if let Some(reason) = error::unsupported_reason(&error) {
                 return report_unsupported(&reason);
             }
@@ -1130,6 +1202,26 @@ pub fn run(args: Vec<String>) -> i32 {
             if let Some(reason) = error::unsupported_reason(&error) {
                 // A documented Milestone-1 capability gap is not a crash: no dump.
                 return report_unsupported(&reason);
+            }
+            if let Some(path) = error::config_failure_path(&error) {
+                // The unreadable `-config` boot failure: the oracle's own stderr text,
+                // byte-for-byte (`\r\n` endings included). Its half-started node — with
+                // the rest of the node up and only `application_controller` dead — really
+                // writes a crash dump, and this runtime's snapshot is a real runtime, so
+                // the dump line is printed only when [`write_crash_dump`] really wrote one
+                // (`ERL_CRASH_DUMP_SECONDS=0` disables dumping outright).
+                write_crash_dump(source.as_ref(), &env, "");
+                let dump_line = match crash_dump::crash_dump_path(&env) {
+                    Some(dump) => format!(
+                        "\r\nCrash dump is being written to: {}...done\r\n",
+                        dump.display()
+                    ),
+                    None => String::new(),
+                };
+                eprint!(
+                    "Could not start kernel pid (application_controller) (\"error in config file \\\"{path}\\\" (none): configuration file not found\")\r\n{dump_line}"
+                );
+                return EXIT_RUNTIME;
             }
             if let Some(slogan) = error::dump_slogan(&error) {
                 // `erlang:halt("Slogan")` — the oracle's `ERTS_DUMP_EXIT` (`bif.c:4393`):
@@ -1217,7 +1309,14 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
     // verified against OTP 29.1.1 / erts-17.1). Only `-version` builds no runtime at all, so
     // it stays exempt (`erl -version -config /nonexistent` ⇒ **0**, the banner).
     if !matches!(action, Action::Version) {
-        check_config_file(&config)?;
+        if let Some(path) = missing_config_file(&config) {
+            // The oracle's aborted boot has a half-started node to snapshot, so its crash
+            // dump is real and announced. Build the runtime this boot would have had and
+            // hand it to [`run`], which reproduces the oracle's stderr byte-for-byte and
+            // writes the dump through the ordinary dump path.
+            *snapshot = Some(Runtime::new(config)?);
+            return Err(error::config_boot_failure(&path));
+        }
     }
     // The **one** resolution of "does this invocation boot a script, and which": the
     // explicit `-boot FILE` value when one was given, else `init`'s literal default `start`.
@@ -1404,26 +1503,20 @@ fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {    runtim
 /// the config terms themselves; that residual divergence changes no working invocation (a
 /// file `[].`-style boot reads is accepted by both).
 ///
-/// The error is a message-carrying `error`-class raise (`error::message`), which [`run`]
-/// reports as `beam_rt: <error>` with [`EXIT_RUNTIME`] — the same classification every other
-/// runtime failure takes. No runtime has been built at this point, so [`run`]'s crash-dump
-/// path finds an empty snapshot and writes nothing (the oracle writes no dump either).
-fn check_config_file(config: &RuntimeConfig) -> Result<()> {
-    let Some(occurrences) = config.init_args.get("config") else {
-        return Ok(());
-    };
-    for values in &occurrences {
+/// The error is a [`crate::error::config_boot_failure`], which [`run`] renders as the
+/// oracle's two stderr lines with exit [`EXIT_RUNTIME`]; the runtime built by [`drive`]
+/// before returning supplies the crash dump.
+fn missing_config_file(config: &RuntimeConfig) -> Option<PathBuf> {
+    let occurrences = config.init_args.get("config")?;
+    for values in occurrences.iter() {
         for value in values.iter() {
             let resolved = resolve_config_file(value);
             if !resolved.is_file() {
-                return Err(error::message(format!(
-                    "cannot read config file {}",
-                    resolved.display()
-                )));
+                return Some(resolved);
             }
         }
     }
-    Ok(())
+    None
 }
 /// Resolves a `-config` value to the file the oracle reads: a trailing `.config` is kept,
 /// any other name gets it appended (`application_controller.erl:1877-1879`).
