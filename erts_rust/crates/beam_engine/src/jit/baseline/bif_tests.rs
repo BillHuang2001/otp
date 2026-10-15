@@ -51,17 +51,21 @@
 use super::emit::compile_function;
 use super::*;use crate::context::BifHook;
 use crate::terms::{cons_head, tuple_arity, tuple_element};
-use beam_term::{is_small, make_atom, signed_value};
+use beam_term::{
+    bitstring_size, cdr, is_bitstring, is_list, is_nil, is_small, make_atom, signed_value,
+};
 
 // ---------------------------------------------------------------------------
 // the harness
 // ---------------------------------------------------------------------------
 
-/// The host whose BIF hook implements the three BIFs under test with the real `erlang`
+/// The host whose BIF hook implements the BIFs under test with the real `erlang`
 /// semantics: `hd/1` is the cons head (`badarg` otherwise), `element/2` is the 1-based
-/// tuple element (`badarg` for a non-integer or out-of-range index, or a non-tuple) and
-/// `tuple_size/1` is the tuple's arity (`badarg` otherwise). Every other BIF is rejected,
-/// exactly like [`MinimalContext::new`].
+/// tuple element (`badarg` for a non-integer or out-of-range index, or a non-tuple),
+/// `tuple_size/1` is the tuple's arity (`badarg` otherwise), `byte_size/1` is the bit
+/// size rounded **up** to whole bytes (`badarg` for a non-bitstring) and `length/1` is
+/// the number of cells of a **proper** list (`badarg` for a non-list or an improper
+/// tail). Every other BIF is rejected, exactly like [`MinimalContext::new`].
 fn bif_host() -> BifHook {
     Box::new(|module, function, arity, args| match (module, function, arity) {
         ("erlang", "hd", 1) => {
@@ -101,8 +105,53 @@ fn bif_host() -> BifHook {
             Ok(make_small(a | b))
         }
         ("erlang", "bsr", 2) => bsr_small(args),
+        ("erlang", "byte_size", 1) => {
+            let [source] = args else {
+                return Err(beam_common::BeamError::BadArg);
+            };
+            byte_size_of(*source)
+        }
+        ("erlang", "length", 1) => {
+            let [source] = args else {
+                return Err(beam_common::BeamError::BadArg);
+            };
+            list_length_of(*source)
+        }
         _ => Err(beam_common::BeamError::BadArg),
     })
+}
+
+/// `erlang:byte_size/1` for the interpreter tier: the bit size rounded **up** to whole
+/// bytes (`bits::bit_size` `.div_ceil(8)`), `badarg` for anything that is not a
+/// bitstring — the same ground truth the native helper's `byte_size_value` reproduces.
+fn byte_size_of(term: Eterm) -> Result<Eterm> {
+    // SAFETY: `is_bitstring` dereferences a boxed header only when the word is a boxed
+    // term, so a non-boxed word (an immediate, `NIL`) is a plain word compare.
+    if !unsafe { is_bitstring(term) } {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    // SAFETY: `is_bitstring` just established `term` is a live bitstring whose backing
+    // thing is valid for its size words.
+    let bits = unsafe { bitstring_size(term) };
+    Ok(make_small(bits.div_ceil(8) as i64))
+}
+
+/// `erlang:length/1` for the interpreter tier: the number of cons cells of a **proper**
+/// list (`[]` is `0`), `badarg` for a non-list or an improper tail — the same walk the
+/// native helper's `list_length` performs.
+fn list_length_of(term: Eterm) -> Result<Eterm> {
+    let mut tail = term;
+    let mut count: i64 = 0;
+    while is_list(tail) {
+        // SAFETY: `is_list` just established `tail` is a live non-`NIL` cons cell.
+        tail = unsafe { cdr(tail) };
+        count += 1;
+    }
+    if is_nil(tail) {
+        Ok(make_small(count))
+    } else {
+        Err(beam_common::BeamError::BadArg)
+    }
 }
 
 /// The small-int domain of `band`/`bor`/`bsr`: both operands must be **small
@@ -1049,6 +1098,420 @@ fn the_lowered_bitwise_gc_bifs_record_no_static_deopt() {
             "{label}: `GcBif` must be lowered natively, but it deopted {} time(s) at run \
              time; deopts by variant: {:?}",
             snapshot.deopts_by_variant.get("GcBif").copied().unwrap_or(0),
+            snapshot.deopts_by_variant,
+        );
+        assert_eq!(
+            snapshot.step_one, 0,
+            "{label}: every instruction of this fixture is lowered, so no interpreter step \
+             may remain; deopts by variant: {:?}",
+            snapshot.deopts_by_variant,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (f) the helper-evaluated value accessors: `erlang:byte_size/1`, `erlang:length/1`
+// ---------------------------------------------------------------------------
+//
+// Both arrive as a **non-collecting** `{bif,…}` (`Instr::Bif`) whose value is *not* a plain
+// word read — `byte_size/1` rounds `bit_size` up to whole bytes and `length/1` walks a
+// *proper* list — so the tier lowers them through the native helper
+// `super::bif_helper::jit_bif_value`, which evaluates the value in Rust, writes it through
+// the engine's own `write_operand`, and hands any shape it cannot prove to `jit_step_one`
+// (the interpreter's own step: the oracle's exact value, or its exact typed `badarg`). The
+// interpreter tier always reaches these two through `call_bif`, hence [`bif_host`]'s
+// `byte_size`/`length` arms — the same ground truth the helper reproduces.
+//
+// A bitstring operand must reach a register at run time (the helper's shape gate accepts a
+// `Loc` or a constant word), so the fixtures load one from the module's own literal area
+// with the tier's lowered literal-source `move`.
+
+/// An ETF binary payload holding the `bits`-bit value whose bytes are `bytes` (the last
+/// byte carrying its low bits): `BINARY_EXT` (`109`) for a byte-aligned one, else
+/// `BIT_BINARY_EXT` (`77`) whose "bits" field is the significant-bit count of the **last
+/// byte** (1..=8), exactly as `external.h`/`term_to_binary` write it.
+fn bit_binary(bytes: &[u8], bits: usize) -> Vec<u8> {
+    let mut payload = vec![131];
+    if bits % 8 == 0 {
+        payload.push(109);
+        payload.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    } else {
+        payload.push(77);
+        payload.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        payload.push((bits - (bytes.len() - 1) * 8) as u8);
+    }
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+/// Decode `raw` into `module`'s literal area (`Operand::Literal(idx)` order), exactly as
+/// the loader does — the atoms a payload names land in the module's own table.
+fn set_literals(module: &mut Module, raw: &[Vec<u8>]) {
+    let area = beam_loader::LiteralArea::decode(raw, &mut module.atom_table)
+        .expect("the fixture literal decodes");
+    module.literals = std::sync::Arc::new(area);
+}
+
+/// `byte_size(Literal(0))` where literal `0` is the bitstring `bytes`/`bits`, loaded into
+/// `x(0)` by the lowered literal-source `move` — the fast-path shape.
+fn byte_size_literal_case(name: &str, bytes: &[u8], bits: usize) -> (Module, Atom) {
+    let (mut module, export) = bif_module(
+        name,
+        "byte_size",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Literal(0),
+                dst: Operand::X(0),
+            },
+            bif_call(1, vec![Operand::X(0)], Operand::X(0)),
+            Instr::Return,
+        ],
+    );
+    set_literals(&mut module, &[bit_binary(bytes, bits)]);
+    (module, export)
+}
+
+/// `byte_size(Value)` where the prologue `move` puts the term `value` into `x(0)` — the
+/// shape a declined operand (a non-bitstring) is fed through.
+fn byte_size_value_case(name: &str, value: Operand) -> (Module, Atom) {
+    bif_module(
+        name,
+        "byte_size",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: value,
+                dst: Operand::X(0),
+            },
+            bif_call(1, vec![Operand::X(0)], Operand::X(0)),
+            Instr::Return,
+        ],
+    )
+}
+
+/// `byte_size(X(0))` where `x(0)` holds an atom interned **after** the module was built
+/// (atom ids are per table, so the fixture interns it in its own).
+fn byte_size_atom_case() -> (Module, Atom) {
+    let (mut module, export) = byte_size_value_case("bif_byte_size_atom", Operand::Nil);
+    let atom = Operand::Atom(module.atom_table.intern("nope"));
+    module.functions[0].code[2] = Instr::Move {
+        src: atom,
+        dst: Operand::X(0),
+    };
+    (module, export)
+}
+
+/// `length(Source) -> Dst`, preceded by `prologue` — the general fixture of this section.
+fn length_case(
+    name: &str,
+    prologue: Vec<Instr>,
+    source: Operand,
+    dst: Operand,
+) -> (Module, Atom) {
+    let mut body = vec![Instr::Label(Label(1)), Instr::Label(Label(2))];
+    body.extend(prologue);
+    body.push(bif_call(1, vec![source], dst));
+    body.push(Instr::Return);
+    bif_module(name, "length", 1, body)
+}
+
+/// The `put_list` prologue building `[1, 2, 3]` in `x(0)` (the innermost cell first).
+fn list_123_prologue() -> Vec<Instr> {
+    vec![
+        Instr::PutList {
+            head: Operand::Integer(3),
+            tail: Operand::Nil,
+            dst: Operand::X(1),
+        },
+        Instr::PutList {
+            head: Operand::Integer(2),
+            tail: Operand::X(1),
+            dst: Operand::X(1),
+        },
+        Instr::PutList {
+            head: Operand::Integer(1),
+            tail: Operand::X(1),
+            dst: Operand::X(0),
+        },
+    ]
+}
+
+// -- (f.1) the fast paths produce the BIF's value ---------------------------
+
+/// **`byte_size/1` rounds the bit size up** — the value asserted concretely on both tiers:
+/// the empty binary, a byte-aligned one, and the two non-byte-aligned round-up cases
+/// (`<<1:1>>` is `1`, `<<1:17>>` is `3`).
+#[test]
+fn byte_size_is_lowered_to_the_bit_size_rounded_up() {
+    // (label, module, expected)
+    let cases: [(&str, (Module, Atom), i64); 4] = [
+        (
+            "byte_size(<<>>)",
+            byte_size_literal_case("bif_byte_size_empty", &[], 0),
+            0,
+        ),
+        (
+            "byte_size(<<1,2,3>>)",
+            byte_size_literal_case("bif_byte_size_aligned", &[1, 2, 3], 24),
+            3,
+        ),
+        (
+            "byte_size(<<1:1>>)",
+            byte_size_literal_case("bif_byte_size_one_bit", &[0x80], 1),
+            1,
+        ),
+        (
+            "byte_size(<<1:17>>)",
+            byte_size_literal_case("bif_byte_size_seventeen", &[0x80, 0, 0], 17),
+            3,
+        ),
+    ];
+    for (label, (module, name), expected) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            let expected = make_small(expected);
+            assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+            assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+
+/// **`length/1` counts a proper list's cells** — `[]` is `0` and `[1,2,3]` is `3`, on both
+/// tiers (the `[]` case is a constant operand, the list case a register holding cons cells).
+#[test]
+fn length_is_lowered_to_the_proper_list_walk() {
+    let cases: [(&str, (Module, Atom), i64); 2] = [
+        (
+            "length([])",
+            length_case("bif_length_empty", Vec::new(), Operand::Nil, Operand::X(0)),
+            0,
+        ),
+        (
+            "length([1,2,3])",
+            length_case(
+                "bif_length_three",
+                list_123_prologue(),
+                Operand::X(0),
+                Operand::X(0),
+            ),
+            3,
+        ),
+    ];
+    for (label, (module, name), expected) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            let expected = make_small(expected);
+            assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+            assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+
+/// **A `Y` operand of a lowered value accessor is served by the helper itself**
+/// ([`jit_bif_value`] reads and writes `machine.stack` through the engine's own
+/// `read_operand`/`write_operand`, so the inlined shape deliberately charges no emitted
+/// `Y` window): a `Y` **source** for `length/1` and a `Y` **destination** for
+/// `byte_size/1`, each asserted on both tiers.
+#[test]
+fn the_value_bif_y_operand_shapes_agree_across_the_tiers() {
+    let (length_module, length_name) = length_case(
+        "bif_length_y_source",
+        {
+            let mut prologue = vec![Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 0,
+            }];
+            prologue.extend(list_123_prologue());
+            prologue.push(Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::Y(0),
+            });
+            prologue
+        },
+        Operand::Y(0),
+        Operand::X(0),
+    );
+    with_both_tiers_bif_host(&length_module, length_name, |interpreter, baseline| {
+        assert_value(
+            "length(Y(0)) (interpreter tier)",
+            make_small(3),
+            interpreter,
+        );
+        assert_value("length(Y(0)) (baseline tier)", make_small(3), baseline);
+        assert_same_outcome(
+            "length of a list in a Y slot",
+            interpreter,
+            baseline,
+            &length_module.atom_table,
+        );
+    });
+
+    let (byte_size_module, byte_size_name) = {
+        let (mut module, export) = bif_module(
+            "bif_byte_size_y_dst",
+            "byte_size",
+            1,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Allocate {
+                    stack_need: beam_loader::HeapNeed::Words(1),
+                    live: 0,
+                },
+                Instr::Move {
+                    src: Operand::Literal(0),
+                    dst: Operand::X(0),
+                },
+                bif_call(1, vec![Operand::X(0)], Operand::Y(0)),
+                Instr::Move {
+                    src: Operand::Y(0),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        );
+        set_literals(&mut module, &[bit_binary(&[0x80], 1)]);
+        (module, export)
+    };
+    with_both_tiers_bif_host(&byte_size_module, byte_size_name, |interpreter, baseline| {
+        assert_value(
+            "byte_size(<<1:1>>) -> Y(0) (interpreter tier)",
+            make_small(1),
+            interpreter,
+        );
+        assert_value(
+            "byte_size(<<1:1>>) -> Y(0) (baseline tier)",
+            make_small(1),
+            baseline,
+        );
+        assert_same_outcome(
+            "byte_size into a Y slot",
+            interpreter,
+            baseline,
+            &byte_size_module.atom_table,
+        );
+    });
+}
+
+// -- (f.2) every declined shape is the interpreter's own `badarg` ----------
+
+/// The shapes the native helper **declines** must reach the interpreter's own step and
+/// raise its exact `badarg`, identically on both tiers:
+///
+/// * `byte_size/1` of a non-bitstring (a small integer and an atom);
+/// * `length/1` of a non-list (a small integer) and of an **improper** list.
+///
+/// A fast path that wrongly accepted any of them would return a wrong term (or panic).
+#[test]
+fn the_declined_value_bif_shapes_raise_the_interpreters_badarg() {
+    let cases = [
+        (
+            "byte_size(42)",
+            byte_size_value_case("bif_byte_size_int", Operand::Integer(42)),
+        ),
+        ("byte_size(an_atom)", byte_size_atom_case()),
+        (
+            "length(42)",
+            length_case(
+                "bif_length_int",
+                vec![Instr::Move {
+                    src: Operand::Integer(42),
+                    dst: Operand::X(0),
+                }],
+                Operand::X(0),
+                Operand::X(0),
+            ),
+        ),
+        (
+            "length([1|2])",
+            length_case(
+                "bif_length_improper",
+                vec![Instr::PutList {
+                    head: Operand::Integer(1),
+                    tail: Operand::Integer(2),
+                    dst: Operand::X(0),
+                }],
+                Operand::X(0),
+                Operand::X(0),
+            ),
+        ),
+    ];
+    for (label, (module, name)) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert!(
+                    matches!(outcome, Err(beam_common::BeamError::BadArg)),
+                    "{label} ({tier}): a declined shape must raise the interpreter's \
+                     `badarg`; saw {outcome:?}"
+                );
+            }
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+
+// -- (f.3) the static deopt is gone ----------------------------------------
+
+/// **The value accessors no longer cost a per-instruction interpreter step** — the
+/// structural pin of [`the_lowered_bif_fast_paths_record_no_static_deopt`], in its same two
+/// halves, for `erlang:byte_size/1` and `erlang:length/1` (whose `counters::variant_name`
+/// is `"Bif"`).
+///
+/// The static half is measured on a **cache-free** compile ([`compile_function`]), so a
+/// thread-local `CodeCache` hit cannot make it vacuous; the run-time half drives each
+/// fixture on the baseline tier with the counters recording and requires **zero**
+/// interpreter steps and no `Bif`-keyed deopt — the literal-source `move` and the list
+/// constructors of these fixtures are lowered too.
+#[test]
+fn the_lowered_value_bif_fast_paths_record_no_static_deopt() {
+    let cases = [
+        (
+            "byte_size/1",
+            byte_size_literal_case("bif_byte_size_pin", &[0x80], 1),
+        ),
+        (
+            "length/1",
+            length_case("bif_length_pin", Vec::new(), Operand::Nil, Operand::X(0)),
+        ),
+    ];
+    for (label, (module, name)) in cases {
+        // (1) The emitter's dispatch decision, on a compile that cannot hit the cache.
+        super::counters::reset();
+        super::counters::set_enabled(true);
+        let labels = crate::interpreter::build_label_map(&module);
+        let _function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+        super::counters::set_enabled(false);
+        let emitted = super::counters::snapshot();
+        assert!(
+            emitted.instr_instances.get("Bif").copied().unwrap_or(0) > 0,
+            "{label}: `Bif` must have been visited by the emitter, or this pin proves \
+             nothing; instances: {:?}",
+            emitted.instr_instances,
+        );
+        assert_eq!(
+            emitted.instr_deopts.get("Bif").copied().unwrap_or(0),
+            0,
+            "{label}: `Bif` is lowered, so it must record zero static deopts; deopts: {:?}",
+            emitted.instr_deopts,
+        );
+
+        // (2) The run: the value arrives natively (the host here rejects every BIF, so a
+        // deopt would raise) with no interpreter step left.
+        let (outcome, snapshot) = run_counting(&module, name, Tier::BaselineJit);
+        assert!(
+            matches!(outcome, Ok(RunOutcome::Returned(_))),
+            "{label}: the lowered fixture must still return the BIF's value; saw {outcome:?}"
+        );
+        assert!(
+            !snapshot.deopts_by_variant.contains_key("Bif"),
+            "{label}: `Bif` must be lowered natively, but it deopted {} time(s) at run \
+             time; deopts by variant: {:?}",
+            snapshot.deopts_by_variant.get("Bif").copied().unwrap_or(0),
             snapshot.deopts_by_variant,
         );
         assert_eq!(
