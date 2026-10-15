@@ -6616,3 +6616,113 @@ fn a_live_float_term_in_fr_is_a_scanned_root() {
         "the relocated FR float is intact"
     );
 }
+
+/// The **constant-payload** twin of [`gc_ab_module`]: the `copy_bound/ets_copy` shape exactly
+/// as `tools/bench/src/workloads/copy_bound.rs` writes it — `payload/0` takes **no** argument, so
+/// the compiler folds it into the module's **literal area** and the loop's `test_heap` call site
+/// finds that literal live in `x(0)`.
+///
+/// `gc_ab_module`'s `payload(N)/1` cannot fold (the payload holds the loop counter), so the two
+/// fixtures are the discriminating pair: **the only difference between them is whether the term
+/// the loop leaves live in a register is a literal-area pointer or a young-heap one**.
+fn gc_ab_const_module(module: &str) -> String {
+    format!(
+        r#"-module({module}).
+-export([run/1]).
+payload() ->
+    #{{a => [1,2,3,4,5,6,7,8,9,10],
+      b => {{ok, <<"hello world">>, 3.5}},
+      c => <<1,2,3,4,5,6,7,8,9,10,11,12>>,
+      d => "a char list",
+      e => -42}}.
+run(N) ->
+    Tab = ets:new({module}, [set, public]),
+    R = run(N, Tab, 0),
+    ets:delete(Tab),
+    R.
+run(0, _Tab, Acc) -> Acc;
+run(N, Tab, Acc) ->
+    T = payload(),
+    true = ets:insert(Tab, {{k, T}}),
+    case ets:lookup(Tab, k) of
+        [{{k, T}}] -> run(N - 1, Tab, Acc + 1)
+    end.
+"#
+    )
+}
+/// **The deciding gate for `copy_bound/ets_copy`: an untagged literal-area pointer in a root
+/// declines every collection.**
+///
+/// KNOWN GAP — ESCALATED, NOT A FIX. This test asserts the **current, declined** behaviour so
+/// the gap is visible and cannot silently get worse; when the escalation lands the `const`
+/// assertions below must be **flipped** (see the crate report / the escalation note).
+///
+/// The chain, proven by instrumentation of [`ensure_heap_full`] (see the escalation note):
+///
+/// 1. [`beam_loader`]'s `LiteralArea::decode` lowers the `LitT` chunk into a private immutable
+///    heap and **never calls `beam_term::literal::set_literal_tag`** — the C step
+///    `erts_set_literal_tag` (`erts/emulator/beam/erl_term.c`) that ORs `TAG_LITERAL_PTR` into
+///    every boxed/list literal word. So a literal handed to the engine carries the literal bit
+///    **clear**.
+/// 2. [`super::gc::root_is_unscanned`] classifies a word by the C's own
+///    `erts_is_literal` rule (a bare bit test), so an untagged literal-area map is read as a
+///    **container in a region the collector does not scan** — which is exactly what the valve
+///    must decline.
+/// 3. The loop's `test_heap,3,1`/`test_heap,5,1` therefore declines on **every** iteration
+///    (the payload literal is in `x(0)`), while the only allocation that *creates* retention —
+///    the registered-BIF copy-out's no-relocation `Process::grow_nursery` — keeps retiring a
+///    whole nursery space, so the retired chain grows by 94 words/iteration and nothing ever
+///    collapses it.
+///
+/// The heap-built twin (`payload(N)/1`) has no literal in a register, so its valve passes, its
+/// collection-debt term fires and its `collections` scale with `N`. **The two fixtures differ in
+/// exactly that one way**, so this test is the discriminating pair the escalation rests on.
+///
+/// Instrumented proof of the gate: `PROBE VALVE-DECLINE pid=ProcessId { number: 2, serial: 0 }
+/// x[0]=Eterm(127376308180258) raw=0x73d91b9a1522 lit=false heap=[0x73d91b9a5ae8,0x73d91b9a6450)
+/// in_literal_of="gcab_lit"(true)` — the blocking root is a pointer inside the running module's
+/// own literal area with the literal bit clear, and sweeping every loaded module's literal heap
+/// showed it is inside exactly one of them.
+#[test]
+fn an_untagged_literal_root_declines_the_collection_until_the_loader_tags_literals() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly("gc-literal-root", "erlc was not found beside $ERTS_ORACLE or on $PATH");
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "gc_literal_root",
+        &[
+            ("gclit", &gc_ab_const_module("gclit")),
+            ("gcab_free", &gc_ab_module("gcab_free", "X", "")),
+        ],
+    );
+    // The discriminating pair, at a small and a large loop count.
+    let lit_small = gc_ab_run(&dir.join("gclit.beam"), "run", 1_000);
+    let lit_large = gc_ab_run(&dir.join("gclit.beam"), "run", 40_000);
+    let heap_small = gc_ab_run(&dir.join("gcab_free.beam"), "run", 1_000);
+    let heap_large = gc_ab_run(&dir.join("gcab_free.beam"), "run", 40_000);
+    // Both loops compute the same answer; neither is corrupted — this is a *retention* gap,
+    // never a wrong result.
+    assert_eq!(signed_value(lit_small.value), 1_000);
+    assert_eq!(signed_value(lit_large.value), 40_000);
+    assert_eq!(signed_value(heap_large.value), 40_000);
+    // The control: a heap-built payload leaves no unscanned root, so the debt term fires and
+    // the collections really scale.
+    assert_eq!(heap_small.stats.pinned, 0);
+    assert!(
+        heap_large.stats.collections > heap_small.stats.collections * 4,
+        "the heap-payload twin must collect: small={} large={}",
+        heap_small.stats.collections,
+        heap_large.stats.collections
+    );
+    // The gate. (`valve_trips` stays 0 and `fallbacks` stays 0: a decline on the full-root door
+    // records `foreign_reachable`, never a fallback — which is why `collections` alone is the
+    // discriminator.)
+    assert_eq!(
+        lit_large.stats.pinned, 0,
+        "not the post-slice float pin: the constant-payload loop is float-free",
+    );
+    assert_eq!(lit_large.stats.fallbacks, 0);
+    assert_eq!(lit_large.stats.collections, 0, "KNOWN GAP: flip this once beam_loader sets TAG_LITERAL_PTR on decoded literals (the constant-payload loop never collects, because its live literal root is untagged)");
+}
