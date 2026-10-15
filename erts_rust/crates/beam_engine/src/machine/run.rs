@@ -167,8 +167,9 @@ impl Machine {
     /// * [`Tier::BaselineJit`] — the native baseline backend over the per-thread
     ///   cross-run cache ([`crate::jit::cache`]), resuming through its no-reset
     ///   driver rather than recompiling or resetting.
-    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. Its compiled
-    ///   functions bake in their entry `pc`, so resuming a mid-function `wait`
+    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. A resume is handed
+    ///   **no** compiled artifact and the tier has no path that would compile and
+    ///   bind one at a parked address on demand, so resuming a mid-function `wait`
     ///   address is unserviceable natively: this is a typed
     ///   [`unsupported`](crate::error::unsupported) error (or, with the
     ///   `jit-cranelift` feature off, the same typed error the first-entry Cranelift
@@ -881,9 +882,10 @@ mod tests {
     }
 
     /// A `Tier::Cranelift` resume is the honest typed `unsupported` error: the
-    /// Cranelift tier can only enter a compiled function at its baked-in entry `pc`,
-    /// so a mid-function suspension address is unserviceable — never a silent
-    /// fallback to the interpreter.
+    /// resume path is handed **no** compiled artifact and the tier has no path that
+    /// would compile and bind one at a parked address on demand, so a mid-function
+    /// suspension address is unserviceable — never a silent fallback to the
+    /// interpreter.
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn a_cranelift_tier_resume_is_the_honest_typed_unsupported_error() {

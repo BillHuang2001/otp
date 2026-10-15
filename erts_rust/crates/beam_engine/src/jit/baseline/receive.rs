@@ -22,7 +22,7 @@
 //!
 //! [`jit_receive`] is emitted for the seven opcodes that drive the copy-bound
 //! message-passing path — `send`, `loop_rec`, `loop_rec_end`, `wait`,
-//! `wait_timeout`, `timeout` and `remove_message` (see `../emit/mod.rs`). Left to the
+//! `wait_timeout`, `timeout` and `remove_message` (see `../emit/block.rs`). Left to the
 //! generic per-instruction deopt they each paid a whole interpreter step
 //! ([`jit_step_one`] → [`Machine::step_instruction`](crate::Machine)) on every mailbox
 //! operation, which is the dominant instruction class of a `send`/`receive` loop.

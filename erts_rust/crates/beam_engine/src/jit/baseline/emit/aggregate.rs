@@ -48,7 +48,7 @@ use super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
 // The guarded cons-cell / list readers live in the child `list` module; re-exported
 // here so `emit::aggregate::…` keeps resolving for this directory's callers
-// (`emit/mod.rs`, `bif.rs`, `regalloc.rs`, `arith.rs`) exactly as before.
+// (`emit/block.rs`, `bif.rs`, `regalloc.rs`, `arith.rs`) exactly as before.
 mod list;
 use list::POINTER_MASK;
 pub(super) use list::{

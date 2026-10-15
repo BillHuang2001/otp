@@ -60,7 +60,7 @@
 //!    callee to run in this machine, on **both** tiers, and the callee is never
 //!    dispatched as a BIF.
 //! 5. **The native probe.** The baseline tier probes the seam on its
-//!    `call_only`/`call_last` arms (`src/jit/baseline/emit/mod.rs` →
+//!    `call_only`/`call_last` arms (`src/jit/baseline/emit/block.rs` →
 //!    `jit_local_call`). [`Machine::run_with_tier`] stages the *lazy* artifact
 //!    (one function lowered per entry), where a `call_last` whose target is another
 //!    function is not statically linkable; the *eager* artifact
@@ -797,7 +797,7 @@ fn the_seam_serves_only_the_answered_callee_identity() {
 fn the_eager_baseline_artifact_probes_the_seam_for_local_tail_calls() {
     // The eager artifact lowers **every** function up front, so a `call_last` whose
     // target is another function is statically linkable and the emitter's
-    // `jit_local_call` probe runs (`src/jit/baseline/emit/mod.rs`); a `call_only` is
+    // `jit_local_call` probe runs (`src/jit/baseline/emit/block.rs`); a `call_only` is
     // probed unconditionally. (The lazy artifact behind
     // `Machine::run_with_tier`/`Tier::BaselineJit` lowers one function per entry, so
     // the `call_last` target is not yet compiled when the caller is lowered: there the

@@ -50,12 +50,12 @@ refuses if any label is unbound (`:444-446`). `tests.rs::seal_is_w_xor_x` (`:380
 - Raw primitives (`ensure`/`emit_u8`/`emit_bytes`/`emit_i32`/`emit_i64`/`emit_rex`/`emit_mem_modrm`) are private to `mod.rs`; `emit_mem_modrm` (`:532-541`) emits uniform `mod=10` `disp32` + a `SIB` byte when base is `rsp`/`r12`, sidestepping the `rbp`/`r13` `mod=00` RIP-relative case.
 
 ## How the baseline tier uses it (prologue/epilogue + register save-restore)
-Encoder support is `push_r`/`pop_r` + `lea`/`mov_mr`/`mov_rm`; the tier composes them (`../baseline/emit/mod.rs`):
-- **Prologue** (`baseline/emit/mod.rs:416-429`): `push_r` over `SAVED_REGISTERS = [Rbx,Rbp,R12,R13,R14,R15]` (`:146-147`, 6 pushes keep `rsp` 16-byte aligned), `lea Rsp,[Rsp-24]` reserves the `rt` slot, `mov_mr Rsp,0,Rdi` stores the `rt` pointer, `mov_rm Rbx,Rdi,RUNTIME_XREGS_DISP` loads `rt->x_regs`, then `mov_rm(reg, Rbx, x)` fills each cached x-register.
-- **Register save/restore across a helper call**: `spill` (`baseline/emit/mod.rs:795-800`) = `mov_mr(Rbx, x, reg)` for each cached slot; `fill` (`:810-814`) = `mov_rm(reg, Rbx, x)`. `emit_helper_call` spills first, reloads `rt` into `rdi`, then `mov_ri R11, helper; call_r R11` (`:753-759`).
-- **Epilogue / frame teardown** (`baseline/emit/link.rs:259-265`): `lea Rsp,[Rsp+24]` then `pop_r` over `SAVED_REGISTERS` reversed, then `ret` (`baseline/emit/mod.rs:731-732`). The exact inverse of the prologue; shared by the `done` epilogue and a linked jump so they cannot drift (`link.rs:256-258`).
-`baseline/emit/mod.rs:68-94` documents the register-allocation + spill-across-blocks discipline
-(`CACHE_REGISTERS = [R12,R13,R14,R15,Rbp]` `:156-157`; residency is block-fixed, residents spill at every block exit so a helper/GC sees the interpreter's exact root set).
+Encoder support is `push_r`/`pop_r` + `lea`/`mov_mr`/`mov_rm`; the tier composes them across `../baseline/emit/`:
+- **Prologue** (`block.rs::emit_block`): `push_r` over `SAVED_REGISTERS = [Rbx,Rbp,R12,R13,R14,R15]` (`mod.rs` `SAVED_REGISTERS`, 6 pushes keep `rsp` 16-byte aligned), `lea Rsp,[Rsp-24]` reserves the `rt` slot, `mov_mr Rsp,0,Rdi` stores the `rt` pointer, `mov_rm Rbx,Rdi,RUNTIME_XREGS_DISP` loads `rt->x_regs`, then `mov_rm(reg, Rbx, x)` fills each cached x-register.
+- **Register save/restore across a helper call**: `spill` (`regs.rs::spill`) = `mov_mr(Rbx, x, reg)` for each cached slot; `fill` (`regs.rs::fill`) = `mov_rm(reg, Rbx, x)`. `emit_helper_call` (`mod.rs::emit_helper_call`) spills first, reloads `rt` into `rdi`, then `mov_ri R11, helper; call_r R11`.
+- **Epilogue / frame teardown** (`link.rs::emit_frame_teardown`): `lea Rsp,[Rsp+24]` then `pop_r` over `SAVED_REGISTERS` reversed, then `ret` (the shared `done` epilogue in `block.rs::emit_block`). The exact inverse of the prologue; shared by the `done` epilogue and a linked jump so they cannot drift.
+`baseline/emit/mod.rs`'s module docs document the register-allocation + spill-across-blocks discipline
+(`CACHE_REGISTERS = [R12,R13,R14,R15,Rbp]` in `mod.rs`; residency is block-fixed, residents spill at every block exit so a helper/GC sees the interpreter's exact root set).
 
 ## Constraints
 - **Crate's designated JIT unsafe zone**: module-local `#![allow(unsafe_code)]` (`mod.rs:84`) is the crate's only executable-memory mapping and only raw writes into it; `encode.rs` holds **no** `unsafe`. Every `unsafe` block carries a `// SAFETY:` rationale.
