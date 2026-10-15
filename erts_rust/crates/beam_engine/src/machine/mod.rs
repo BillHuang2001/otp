@@ -280,11 +280,12 @@ pub struct Machine {
     /// the list to the FIRST frame's `A` slot) and the uncaught path
     /// ([`Machine::with_uncaught_frames`]).
     ///
-    /// The term is a machine-held heap term outside the frozen root set
-    /// ([`crate::context::RootSet`]), exactly like
-    /// [`Machine::pending_exception`](crate::machine::Machine)'s reason term: a
-    /// collecting host roots such a parked term the way `beam_rt` roots the pending
-    /// exception.
+    /// The term is a machine-held heap term **outside** the frozen root set
+    /// ([`crate::context::RootSet`]), so [`Machine::with_roots`] closes that window:
+    /// for the duration of the root hand-off the latch rides at the tail of the
+    /// Erlang stack (part of the published root set, rooted in full) and the field is
+    /// **re-seated** from that slot afterwards, so a collecting host relocates the
+    /// term and this field reads the *moved* word back.
     pub(crate) raise_function_clause_args: Option<Eterm>,
     /// A **one-shot latch**: the symbolic [`StackTrace`] an incoming raise
     /// **arrived carrying** (e.g. `erlang:raise/3` whose third argument is a

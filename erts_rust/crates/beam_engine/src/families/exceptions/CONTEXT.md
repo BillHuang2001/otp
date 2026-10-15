@@ -56,8 +56,14 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   whose every frame is skipped — cooks to the **empty list**, the honest answer, unless a
   head item is present. One rooted reservation for the whole node graph
   (`terms::slack`/`terms::sink`); the resolved `Arc<Module>` handles stay alive in a local
-  vector across it, because each item shape borrows its module's `Line` chunk. When `head`
-  is set the cooking exception carries a synthesized **callee head item** as its raw trace
+  vector across it, because each item shape borrows its module's `Line` chunk. The failed clause's
+  argument list rides in the **first** frame's `A` slot through `ItemShape::args` (the list **term**) and
+  `ItemShape::args_len` (its element count): the latch's read half
+  (`Machine::live_raise_function_clause_args`) is consulted *before* the reservation for the length alone
+  (move-invariant), the latch is consumed *after* it (`Machine::take_raise_function_clause_args` — that
+  reservation may have moved the list, which `Machine::with_roots` re-seats), and the list's elements are
+  carved **inside** it by `write_item`. When `head` is set the cooking exception carries a
+  synthesized **callee head item** as its raw trace
   (`callee.rs` above): the reservation is sized **`+2`** for one extra cons cell, and the
   head word is re-read **after** the reservation through `head_operand` (the very register
   `build_stacktrace` read the raw trace from) and consed in front of the carved frames, so a

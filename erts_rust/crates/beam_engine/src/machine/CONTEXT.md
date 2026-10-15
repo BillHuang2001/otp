@@ -62,9 +62,14 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   **engine diagnostic** — a reason atom prefixed `unsupported_opcode: `, the `error::unsupported` sentinel —
   untouched). The funnel's first half runs at the `step_instruction` boundary (`../interpreter/dispatch.rs`),
   its **second half at the `drive` boundary** for a raise that surfaced inside a cross-module callee (`drive.rs`).
-  `Machine::take_raise_function_clause_args()` is the consuming half of the live latch: the two cooked-trace
-  builders call it **exactly once** each, and the loop in `symbolic_stacktrace` hands the list to the first
-  frame's `A` slot (every outer frame keeps its declared arity). `Machine::take_raise_supplied_trace()` is the
+  The live latch splits around `symbolic_stacktrace`'s one rooted reservation: the **read** half
+  `Machine::live_raise_function_clause_args()` yields the list *before* it (the sizing needs only the
+  list's move-invariant **length**) and the **consuming** half `Machine::take_raise_function_clause_args()`
+  (called **exactly once** by each of the two cooked-trace builders) consumes it *after* it — the
+  reservation may have moved the list, and `with_roots` re-seats the field
+  from the slot the host wrote the moved word back through — handing the re-seated list to the first
+  frame's `A` slot (every outer frame keeps its declared arity); the list's elements are carved **inside**
+  the reservation, so no element word is held across a collection. `Machine::take_raise_supplied_trace()` is the
   consuming half of the supplied-trace latch: `symbolic_stacktrace` renders those frames **instead of** the
   snapshot heuristic when it is armed, and an absent/empty supplied trace leaves every path byte-identical.
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
