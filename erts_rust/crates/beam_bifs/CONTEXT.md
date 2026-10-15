@@ -596,10 +596,13 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
   `process_info/2` position items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`/
   `catchlevel`) as typed gaps for a live module-scheduled process; each with a file:line, a fix shape and a repro,
   plus what is **not** a gap and two sibling doc corrections owed.
-- **`ets:foldl/3`/`foldr/3` are unreachable in `beam_rt`:** `beam_rt/src/context/calls.rs` drops the shared
-  `TableRegistry` whenever `reentrancy_capable(args)` is true (any fun arg), so the `FunCaller` fast path answers
-  `beam_rt: unsupported: bif`. **Required change:** exclude the two `ets` folds (the only `FUN_CALLER_BIFS` members
-  that also need `ctx.tables()`) from the drop.
+- **`ets:foldl/3`/`foldr/3` run, but a nested `ets:*` inside the fold's own fun is still a typed gap:**
+  `beam_rt` installs the shared table cell for the two folds (`beam_rt/src/context/dispatch.rs::tables_capable`;
+  `beam_rt/src/context/calls.rs` exempts the two `FUN_CALLER_BIFS` members that also need `ctx.tables()`), so the
+  fold itself reaches the table. The outer borrow still makes a **nested** `ets:*` call inside the fold's fun fail
+  its `try_borrow_mut` and answer `beam_rt: unsupported: bif` (`beam_rt/src/context/calls.rs:326-333`). `FunCaller`
+  exposes only `call_fun` (`src/context.rs`) and `BifContext::with_tables` lends a bare `&mut TableRegistry`, so
+  closing the residual is a cross-node change (the `beam_bifs` table-lending seam shape + `beam_rt`'s cell).
 - **The `FunIdentityBridge` snapshot is rebuilt per BIF call:** `beam_rt/src/context/calls.rs:201` calls
   `FunIdentityBridge::new(...)` per registered-BIF call for the four `LOCAL_FUN_IDENTITY_BIFS` (incl.
   `term_to_binary/1,2`), and `new` (`beam_rt/src/context/fun_identity.rs`) walks `code_server.loaded()` building
