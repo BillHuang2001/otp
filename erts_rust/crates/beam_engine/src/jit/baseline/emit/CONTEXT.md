@@ -3,8 +3,11 @@
 ## Intent
 Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 functions for the
 **baseline** execution tier.
-One file per responsibility: `mod.rs` owns the compiled-block shape (prologue/epilogue,
-`emit_block`'s lowering dispatch, the deopt sequence); `regs.rs` owns the register cache
+One file per responsibility: `mod.rs` owns the shared emitter wiring (the register-file/scratch
+constants, `touch`, the spill/fill traffic, the helper-sequencing layer every arm shares —
+`emit_helper_call`/`emit_step_and_continue`/`emit_continue_check`/`emit_refresh_y` — plus the
+re-exports); `block.rs` owns the compiled-block shape (the prologue/epilogue, the `emit_block`
+lowering dispatch and its helper-sequence arms, the deopt wrapper); `regs.rs` owns the register cache
 (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`); `compile.rs` owns the compilation entry points
 — `compile_module` (the **eager** whole-module layout: one shared `CodeBuffer`, a whole-module block
 map) and `compile_function`/`emit_function` (the **lazy** layout's per-function unit: its own
