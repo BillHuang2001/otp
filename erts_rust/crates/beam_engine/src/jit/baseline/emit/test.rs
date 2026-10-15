@@ -1390,3 +1390,6 @@ mod tests {
         assert!(crate::predicates::is_tuple_arity(zoo.get("tuple2"), 2));
     }
 }
+
+#[cfg(test)]
+mod refusal_census;
