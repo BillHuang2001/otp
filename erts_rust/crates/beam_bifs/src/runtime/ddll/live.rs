@@ -58,8 +58,9 @@
 //!   `{driver_options, …}` and the whole pending-reload state machine. Any other element is `badarg`.
 //! * **Unload is immediate** (not the C's pending state machine). The sibling
 //!   `info/2`/`monitor/2`/`demonitor/1` are real too ([`super::info`], [`super::monitor`]).
-//! * **No statically linked built-ins**: the oracle lists `tcp_inet`/`udp_inet`/`ram_file_drv`;
-//!   this runtime links none, so a fresh registry is empty.
+//! * **The statically linked built-ins are modelled** (`registry::STATIC_DRIVERS`): the emulator's
+//!   `tcp_inet`/`udp_inet`/`ram_file_drv` have no `dlopen` handle, so `try_load`/`try_unload` of one
+//!   answers `{error, linked_in_driver}` and `loaded_drivers/0` lists the three first.
 
 use beam_abi::driver::loader::{load, DriverLoadError};
 use beam_common::Result;
@@ -102,6 +103,12 @@ fn try_load_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let path = pick_list_or_atom(ctx, args[0])?;
     let name = pick_list_or_atom(ctx, args[1])?;
     let (options, kill_ports) = parse_options(ctx, args[2])?;
+    // A statically linked built-in has no `dlopen` handle: the C's single `lookup_driver` finds it
+    // with `handle == NULL` and answers `linked_in_driver` (`erl_bif_ddll.c:281-285`). The static
+    // and dynamic name sets are disjoint, so this precedes the `already_loaded` check.
+    if registry::is_static(&name) {
+        return error_atom_tuple(ctx, "linked_in_driver");
+    }
     if registry::contains(&name) {
         return ok_atom_tuple(ctx, "already_loaded");
     }
@@ -132,6 +139,10 @@ fn try_load_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn try_unload_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let name = pick_list_or_atom(ctx, args[0])?;
     let _options = parse_options(ctx, args[1])?;
+    // A statically linked built-in cannot be unloaded (`erl_bif_ddll.c:545-547`).
+    if registry::is_static(&name) {
+        return error_atom_tuple(ctx, "linked_in_driver");
+    }
     if registry::remove(&name).is_none() {
         return error_atom_tuple(ctx, "not_loaded");
     }
@@ -144,9 +155,15 @@ fn try_unload_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// Propagates a heap-allocation failure from building the result list.
 fn loaded_drivers_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    let names = registry::names();
-    let mut lists = Vec::with_capacity(names.len());
-    for name in &names {
+    // The statically linked built-ins come first (their insertion order), then the `dlopen`ed
+    // drivers in load order — see `registry::STATIC_DRIVERS`.
+    let static_names = registry::static_names();
+    let registry_names = registry::names();
+    let mut lists = Vec::with_capacity(static_names.len() + registry_names.len());
+    for &name in static_names {
+        lists.push(super::charlist(ctx, name)?);
+    }
+    for name in &registry_names {
         lists.push(super::charlist(ctx, name)?);
     }
     let list = ctx.list(&lists)?;
@@ -285,14 +302,22 @@ mod tests {
     use beam_common::BeamError;
     use beam_term::{make_small, NIL};
 
+    /// The `loaded_drivers/0` rendering of the three statically linked built-ins (tcp_inet,
+    /// udp_inet, ram_file_drv) as their byte lists.
+    const STATIC_THREE: &str = "{ok,[[116,99,112,95,105,110,101,116],[117,100,112,95,105,110,101,116],[114,97,109,95,102,105,108,101,95,100,114,118]]}";
+
+    /// [`STATIC_THREE`] followed by the `test_drv` fixture, which loads last.
+    const STATIC_THREE_AND_TEST_DRV: &str = "{ok,[[116,99,112,95,105,110,101,116],[117,100,112,95,105,110,101,116],[114,97,109,95,102,105,108,101,95,100,114,118],[116,101,115,116,95,100,114,118]]}";
+
     #[test]
-    fn loaded_drivers_is_empty_on_a_fresh_registry() {
+    fn loaded_drivers_lists_the_static_builtins_on_a_fresh_registry() {
         clear_registry();
         let mut fx = Fixture::new();
+        // The static set is a constant, so clearing the registry leaves it intact.
         let out = fx
             .call("loaded_drivers", 0, &[])
             .expect("loaded_drivers/0 never fails");
-        assert_eq!(fx.render(out), "{ok,[]}");
+        assert_eq!(fx.render(out), STATIC_THREE);
     }
 
     #[test]
@@ -410,7 +435,7 @@ mod tests {
         let out = fx
             .call("loaded_drivers", 0, &[])
             .expect("loaded_drivers/0 never fails");
-        assert_eq!(fx.render(out), "{ok,[[116,101,115,116,95,100,114,118]]}");
+        assert_eq!(fx.render(out), STATIC_THREE_AND_TEST_DRV);
 
         // --- a second load of the same name ----------------------------------------------------
         let path = fx.charlist(&dir);
@@ -430,13 +455,85 @@ mod tests {
         let out = fx
             .call("loaded_drivers", 0, &[])
             .expect("loaded_drivers/0 never fails");
-        assert_eq!(fx.render(out), "{ok,[]}");
+        assert_eq!(fx.render(out), STATIC_THREE);
 
         // --- unloading again is not_loaded -----------------------------------------------------
         let name = fx.charlist("test_drv");
         let out = fx
             .call("try_unload", 2, &[name, NIL])
             .expect("a repeat unload is a result");
+        assert_eq!(fx.render(out), "{error,not_loaded}");
+    }
+
+    #[test]
+    fn try_load_of_a_static_builtin_is_linked_in_driver() {
+        clear_registry();
+        let mut fx = Fixture::new();
+        // Both the charlist and the atom name form route to the same answer (`pick_list_or_atom`),
+        // regardless of the path (the C never reaches `dlopen` for a static driver).
+        for name in ["tcp_inet", "udp_inet", "ram_file_drv"] {
+            let path = fx.charlist(".");
+            let load_name = fx.charlist(name);
+            let out = fx
+                .call("try_load", 3, &[path, load_name, NIL])
+                .expect("a static load is a result, not an error");
+            assert_eq!(fx.render(out), "{error,linked_in_driver}", "charlist {name}");
+
+            let path = fx.charlist(".");
+            let atom_name = fx.atom(name);
+            let out = fx
+                .call("try_load", 3, &[path, atom_name, NIL])
+                .expect("a static load is a result, not an error");
+            assert_eq!(fx.render(out), "{error,linked_in_driver}", "atom {name}");
+        }
+    }
+
+    #[test]
+    fn try_unload_of_a_static_builtin_is_linked_in_driver() {
+        clear_registry();
+        let mut fx = Fixture::new();
+        for name in ["tcp_inet", "udp_inet", "ram_file_drv"] {
+            let load_name = fx.charlist(name);
+            let out = fx
+                .call("try_unload", 2, &[load_name, NIL])
+                .expect("a static unload is a result, not an error");
+            assert_eq!(fx.render(out), "{error,linked_in_driver}", "charlist {name}");
+
+            let atom_name = fx.atom(name);
+            let out = fx
+                .call("try_unload", 2, &[atom_name, NIL])
+                .expect("a static unload is a result, not an error");
+            assert_eq!(fx.render(out), "{error,linked_in_driver}", "atom {name}");
+        }
+    }
+
+    #[test]
+    fn a_static_name_still_validates_its_options_and_leaves_a_non_static_name_alone() {
+        clear_registry();
+        let mut fx = Fixture::new();
+        // The options are parsed before the static arm (the C parses them first too), so a bad
+        // option on a static name is still `badarg`.
+        let path = fx.charlist(".");
+        let name = fx.charlist("tcp_inet");
+        let bad_options = fx.cons(make_small(1));
+        assert!(matches!(
+            fx.call("try_load", 3, &[path, name, bad_options]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A non-static name keeps the dynamic behaviour: a missing object is the open error and an
+        // unloaded name is `not_loaded`.
+        let path = fx.charlist("/nonexistent/beam_bifs/ddll");
+        let name = fx.charlist("no_such_driver");
+        let out = fx
+            .call("try_load", 3, &[path, name, NIL])
+            .expect("a load failure is a result");
+        assert_eq!(fx.render(out), "{error,{open_error,-10}}");
+
+        let name = fx.charlist("no_such_driver");
+        let out = fx
+            .call("try_unload", 2, &[name, NIL])
+            .expect("an unload failure is a result");
         assert_eq!(fx.render(out), "{error,not_loaded}");
     }
 
