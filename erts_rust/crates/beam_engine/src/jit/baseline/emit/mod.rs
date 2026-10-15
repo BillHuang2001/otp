@@ -112,6 +112,7 @@ use super::runtime::{
     encode_target, ExtCallHelper, PositionHelper, RefreshHelper, StepHelper, EXT_CALL,
     EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_DECLINE, RUNTIME_XREGS_DISP,
 };
+use super::call::{jit_call_store, CALL_STORED};
 use super::receive::jit_receive;
 use super::{jit_ext_call, jit_local_call, jit_set_position, jit_step_one};
 use super::runtime::{jit_publish_y, jit_refresh_y};
@@ -770,6 +771,53 @@ fn emit_block(
                     terminated = true;
                     break;
                 }
+                Err(_) => emit_deopt(buffer, done, allocation, func, pc, instr)?,
+            },
+            // A **frame-preserving local call** (`call Arity Label`) — the one local
+            // call form that needs a continuation. Unlike the two tail forms above it
+            // writes `Continuation::Address { func, pc: pc + 1, context }` into the
+            // **live** frame, Rust-side `Machine` state (`Machine::frames`/`stack`) a
+            // compiled block cannot address, so the store goes through the
+            // `jit_call_store` helper (`super::call`) while the transfer to the callee
+            // reuses the linker's exit exactly as `call_only` does.
+            //
+            // The one helper call covers the store *and* the host's **local-call seam**
+            // (`ExecutionContext::resolve_local_call`) — the interpreter's arm asks the
+            // seam *before* it stores anything, because a served callee's own code never
+            // runs and must not be left a return address. Its answer is the block ABI's
+            // own vocabulary: [`CALL_STORED`] means "the continuation is in place,
+            // transfer now", and every other word (a **served** callee's folded `Step`,
+            // or the interpreter's own typed diagnostic) leaves the block for the driver
+            // — the same probe-then-exit shape the two tail forms use through
+            // [`emit_local_call_probe`].
+            //
+            // The continuation check below is the **frame-only** body of `emit/heap.rs`'s
+            // private `emit_frame_change_continue`, re-implemented here because the word
+            // it compares against differs: a served non-tail local call folds its
+            // `Step::Next` to `encode_target(func, pc + 1)`, so the store needs a
+            // sentinel of its own (see [`CALL_STORED`]). It deliberately does **not**
+            // refill — the helper wrote no x-register on the transfer path, and a `call`
+            // has no x-register operand — and, like the two tail forms, it must not
+            // refill either: the exit below spills first, which is the tier's whole
+            // liveness/root-set model.
+            Instr::Call { target, .. } => match labels.resolve(*target) {
+                Ok((target_func, target_pc)) => {
+                    emit_helper_call(
+                        buffer,
+                        allocation,
+                        jit_call_store as *const (),
+                        &[i64::from(func), i64::from(pc)],
+                    )?;
+                    buffer.mov_ri(Reg::R11, CALL_STORED)?;
+                    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+                    buffer.jcc(Cond::Ne, done)?;
+                    linker.emit_exit(buffer, allocation, done, target_func, target_pc)?;
+                    terminated = true;
+                    break;
+                }
+                // An undefined label keeps the interpreter's exact `unknown_label`
+                // error: hand the call to the interpreter's own step rather than
+                // inventing a target.
                 Err(_) => emit_deopt(buffer, done, allocation, func, pc, instr)?,
             },
             // The **cross-module** calls. Unlike a local `call_*` these enter code
