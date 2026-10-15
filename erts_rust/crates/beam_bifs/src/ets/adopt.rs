@@ -83,7 +83,12 @@
 //!   atom that is not a `named_table` — is `badarg`. The fun is applied through
 //!   [`BifContext::call_fun`], i.e. the optional [`FunCaller`] seam; with no hook
 //!   installed a non-empty fold is the typed `unsupported_bif` gap, never a
-//!   fabricated accumulator.
+//!   fabricated accumulator. The fun itself is ordinary Erlang code and may run
+//!   `ets:*` of its own: [`BifContext::call_fun`] hands the caller's
+//!   [`TableRegistry`](crate::TableRegistry) over for the duration of the nested
+//!   call ([`FunCaller::call_fun_with_tables`]), so those nested `ets:*` resolve
+//!   their tables. The two folds are therefore also the reason `beam_rt` must
+//!   *lend* its shared registry rather than drop it.
 //!
 //! # Honest typed gaps (never a wrong result)
 //!
@@ -408,6 +413,12 @@ fn foldr_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// The body of [`foldl_3`]/[`foldr_3`]: the argument order is `(Fun, Acc0, Tab)`
 /// and `reverse` selects the fold direction.
+///
+/// The table is borrowed (`take_table_gated` → `restore_table`) only while the
+/// objects are collected; the fun is applied afterwards through
+/// [`BifContext::call_fun`], which **lends** the caller's table registry to the
+/// nested call so the fun can run `ets:*` of its own (see
+/// [`FunCaller::call_fun_with_tables`]) without a second live `&mut` borrow.
 fn fold(ctx: &mut BifContext<'_>, args: &[Eterm], reverse: bool) -> Result<Eterm> {
     let fun = args[0];
     let acc0 = args[1];
