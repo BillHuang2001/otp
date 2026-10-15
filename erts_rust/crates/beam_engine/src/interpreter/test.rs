@@ -369,4 +369,92 @@ mod tests {
             MAX_ARITYVAL as i64 + 1
         ));
     }
+
+    /// The oracle's answer for `{module_info,0} < {g,1}` (atom **name** order), or
+    /// `None` when there is no runnable `erl` on `PATH` (the caller skips loudly).
+    ///
+    /// The two atoms sort oppositely by name (`"g" < "module_info"`) and by the id
+    /// order the module's snapshot would imply (`module_info` is interned first) —
+    /// exactly the shape that made `sofs:restrict_n/5` take the wrong clause.
+    fn oracle_tuple_lt() -> Option<bool> {
+        let probe = std::process::Command::new("erl")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok();
+        if !probe {
+            return None;
+        }
+        let eval = "io:format(\"~w\", [{module_info,0} < {g,1}]), halt().";
+        let out = std::process::Command::new("erl")
+            .args(["-noshell", "-eval", eval])
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "the system `erl` exited {} for `{eval}`\n  stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            other => panic!("unexpected oracle output {other:?} for `{eval}`"),
+        }
+    }
+
+    /// A comparison `test` must order atoms by **name**, through the host's shared
+    /// atom namespace — exactly as the `<` BIF does — never by raw atom id through
+    /// the running module's load-time snapshot.
+    ///
+    /// Reproduces the `sofs:restrict_n/5` divergence: a module loaded *before* an
+    /// atom is interned cannot name it, so `{module_info,0} < {G,1}` (with `G`
+    /// interned afterwards and therefore beyond the snapshot) was ordered by atom id
+    /// and took the wrong clause. The engine must consult the namespace
+    /// [`ExecutionContext::atoms`] supplies.
+    #[test]
+    fn comparisons_order_atoms_by_name_through_the_shared_namespace() {
+        let Some(expected) = oracle_tuple_lt() else {
+            eprintln!(
+                "SKIP interpreter::test::comparisons_order_atoms_by_name_through_the_shared_namespace: \
+                 no runnable `erl` on PATH"
+            );
+            return;
+        };
+
+        // The module's **load-time snapshot**: it interns `module_info` but not `g`.
+        let mut module = Module::default();
+        let module_info = module.atom_table.intern("module_info");
+
+        // The **live** shared namespace: the snapshot plus `g`, interned afterwards
+        // so `g`'s global id is HIGHER than `module_info`'s. Raw-id order would then
+        // say `module_info < g`, the opposite of the name order (`"g" < "module_info"`).
+        let mut live = module.atom_table.clone();
+        let g = live.intern("g");
+        assert!(
+            module.atom_name(g).is_none(),
+            "`g` must be beyond the module's load-time snapshot"
+        );
+        assert_eq!(module.atom_name(module_info), Some("module_info"));
+
+        let mut ctx = MinimalContext::with_shared_atoms(live);
+        let mut machine = Machine::new();
+        let lhs = terms::make_tuple(&mut ctx, &[make_atom(module_info), make_small(0)]).unwrap();
+        let rhs = terms::make_tuple(&mut ctx, &[make_atom(g), make_small(1)]).unwrap();
+        machine.x_mut()[0] = lhs;
+        machine.x_mut()[1] = rhs;
+
+        let args = [Operand::X(0), Operand::X(1)];
+        let lt = machine
+            .eval_test(&module, TestKind::IsLt, &args, &mut ctx)
+            .expect("a `{A,B} < {C,D}` guard evaluates");
+
+        assert_eq!(
+            lt, expected,
+            "`{{module_info,0}} < {{g,1}}` must order atoms by NAME (the `<` BIF \
+             answers {expected}); the module's snapshot cannot name `g`, so an \
+             id-ordered fallback flips the clause"
+        );
+    }
 }

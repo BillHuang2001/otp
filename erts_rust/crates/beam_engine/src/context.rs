@@ -129,7 +129,7 @@ use std::sync::Arc;
 use beam_alloc::{GrowOutcome, ReservedHeap};
 use beam_common::Result;
 use beam_loader::{Label, Module};
-use beam_term::{Atom, Eterm};
+use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::machine::Machine;
 
@@ -822,6 +822,32 @@ pub trait ExecutionContext {
         module.atom_name(atom).map(str::to_owned)
     }
 
+    /// The atom **namespace** a comparison must use.
+    ///
+    /// Every term comparison the engine performs on the execution path — the
+    /// `test`/`is_*` comparison kinds and `select_val`, the native baseline tier's
+    /// comparison helper, and the map-key `lookup`/`position` equality — resolves a
+    /// comparison's atom names through this seam. The default body is the running
+    /// module's own **load-time snapshot** ([`Module::atom_table`]), which is
+    /// byte-identical to the pre-seam behaviour.
+    ///
+    /// A host that owns **one** shared, live atom namespace (the runtime) must
+    /// override this so guard/`select_val`/map-key comparisons order atoms by
+    /// **name** exactly as the `<`/`==` BIFs do. The bug it closes: `beam_term`'s
+    /// `erts_cmp_atoms` compares atom *names*, but falls back to the raw atom id when
+    /// a name is unknown to the supplied table — and a module loaded early cannot
+    /// name an atom interned into the shared namespace *afterwards* (its global id is
+    /// beyond the snapshot). A comparison of two such atoms then silently ordered by
+    /// id instead of name, so `{module_info,0} < {G,1}` (with `G` interned later)
+    /// took the wrong clause in `sofs:restrict_n/5`.
+    ///
+    /// The returned reference is borrowed from `self` (and `module`), so a caller
+    /// **must take it after** its operand reads and **never hold it across** a
+    /// `&mut dyn ExecutionContext` call (e.g. the map writers reserve through `ctx`
+    /// and only then read the namespace).
+    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
+        &module.atom_table
+    }
     /// The **per-instruction reduction hook**: charge `n` reductions for the
     /// instruction the engine is about to execute.
     ///
@@ -1192,6 +1218,16 @@ pub struct MinimalContext {
     local_call_resolver: Option<LocalCallResolver>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
+    /// An optional shared atom namespace (the body of
+    /// [`ExecutionContext::atoms`]).
+    ///
+    /// `None` out of the box, so the seam is the trait default (the running
+    /// module's own load-time snapshot), byte-identical to the pre-seam behaviour.
+    /// A test that needs to model the runtime's **live** shared namespace installs
+    /// one through [`with_shared_atoms`](MinimalContext::with_shared_atoms) /
+    /// [`set_shared_atoms`](MinimalContext::set_shared_atoms) — a namespace strictly
+    /// longer than a module's snapshot, exactly as the runtime's is.
+    shared_atoms: Option<AtomTable>,
     /// The pointer-stable heap backing [`ExecutionContext::alloc_words`].
     ///
     /// A [`ContextHeap`]: a list of [`ReservedHeap`] regions that only ever grows.
@@ -1223,6 +1259,7 @@ impl MinimalContext {
             local_fun_resolver: None,
             local_call_resolver: None,
             mailbox: None,
+            shared_atoms: None,
             heap: ContextHeap::new(),
         }
     }
@@ -1306,6 +1343,27 @@ impl MinimalContext {
         self.mailbox = Some(mailbox);
     }
 
+    /// A context with the given shared atom namespace and the default (rejecting)
+    /// BIF hook.
+    ///
+    /// The namespace is what [`ExecutionContext::atoms`] returns, modelling the
+    /// runtime's **live** shared atom table — typically a [`clone`](Clone::clone) of
+    /// a module's load-time snapshot with one or more names interned afterwards, so
+    /// its global ids run past the snapshot's length.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_shared_atoms(atoms: AtomTable) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.shared_atoms = Some(atoms);
+        ctx
+    }
+
+    /// Install (or replace) the shared atom namespace [`ExecutionContext::atoms`]
+    /// answers from. The default (never installed) is the running module's own
+    /// load-time snapshot.
+    pub fn set_shared_atoms(&mut self, atoms: AtomTable) {
+        self.shared_atoms = Some(atoms);
+    }
     /// Forward to the installed mailbox, or return the receive seam's typed
     /// `unsupported` naming `method`.
     ///
@@ -1341,6 +1399,14 @@ impl ExecutionContext for MinimalContext {
         (self.hook)(module, function, arity, args)
     }
 
+    /// Answer from the installed shared namespace, or the trait default (the running
+    /// module's own snapshot) when none was installed.
+    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
+        match &self.shared_atoms {
+            Some(atoms) => atoms,
+            None => &module.atom_table,
+        }
+    }
     fn ensure_heap(
         &mut self,
         _heap_need: u32,
