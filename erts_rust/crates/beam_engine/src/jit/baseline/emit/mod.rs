@@ -573,10 +573,13 @@ fn emit_block(
                 }
                 emit_deopt(buffer, done, allocation, func, pc, instr)?;
             }
-            // The one optimised BIF family: the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2`.
-            // When the guarded fast path is emitted the block keeps going; otherwise
-            // (any other BIF, an un-addressable operand, or a register the budget
-            // could not cache) it is exactly the `_` arm below.
+            // The optimised `{gc_bif,…}` family: the small-int
+            // `erlang:'+'/2`/`'-'/2`/`'*'/2` (and `band`/`bor`/`bsr`), the comparison
+            // BIFs, and the pure value accessors `erlang:byte_size/1`/`length/1` (the
+            // corpus emits both as a collecting `gc_bif`). When one of the guarded fast
+            // paths is emitted the block keeps going; otherwise (any other BIF, an
+            // un-addressable operand, or a register the budget could not cache) it is
+            // exactly the `_` arm below.
             Instr::GcBif { .. } => {
                 let inlined = try_inline_gc_bif(
                     buffer,
@@ -588,6 +591,15 @@ fn emit_block(
                     pc,
                     highest_touched,
                 )? || try_inline_comparison(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? || try_inline_bif(
                     buffer,
                     module,
                     instr,

@@ -1455,10 +1455,230 @@ fn the_declined_value_bif_shapes_raise_the_interpreters_badarg() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// (g) the same value accessors through the collecting `{gc_bif,…}` the corpus emits
+// ---------------------------------------------------------------------------
+//
+// The installed corpus emits `byte_size/1` and `length/1` as the **collecting**
+// `{gc_bif,…}` (`Instr::GcBif`), not the non-collecting `{bif,…}` (`Instr::Bif`) the
+// fixtures above build, so the tier's value lowering must fire on **both** variants or it
+// never fires on a real module. These fixtures are the same shapes with the call variant
+// swapped; a shape the helper cannot prove still declines to the interpreter's own step,
+// whose exact value / typed error and — for a `GcBif` — `fail` label are the
+// interpreter's (the helper never reproduces them itself).
+
+/// `byte_size(Literal(0))` as a **collecting** `{gc_bif,…}` — the corpus shape of
+/// [`byte_size_literal_case`].
+fn gc_byte_size_literal_case(name: &str, bytes: &[u8], bits: usize) -> (Module, Atom) {
+    let (mut module, export) = bif_module(
+        name,
+        "byte_size",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Literal(0),
+                dst: Operand::X(0),
+            },
+            gc_bif_call(vec![Operand::X(0)], Operand::X(0)),
+            Instr::Return,
+        ],
+    );
+    set_literals(&mut module, &[bit_binary(bytes, bits)]);
+    (module, export)
+}
+
+/// `byte_size(Value)` as a **collecting** `{gc_bif,…}` whose prologue `move` puts `value`
+/// into `x(0)` — the corpus shape a *declined* operand is fed through.
+fn gc_byte_size_value_case(name: &str, value: Operand) -> (Module, Atom) {
+    bif_module(
+        name,
+        "byte_size",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: value,
+                dst: Operand::X(0),
+            },
+            gc_bif_call(vec![Operand::X(0)], Operand::X(0)),
+            Instr::Return,
+        ],
+    )
+}
+
+/// `length(Source) -> Dst` as a **collecting** `{gc_bif,…}`, preceded by `prologue` —
+/// the corpus shape of [`length_case`].
+fn gc_length_case(
+    name: &str,
+    prologue: Vec<Instr>,
+    source: Operand,
+    dst: Operand,
+) -> (Module, Atom) {
+    let mut body = vec![Instr::Label(Label(1)), Instr::Label(Label(2))];
+    body.extend(prologue);
+    body.push(gc_bif_call(vec![source], dst));
+    body.push(Instr::Return);
+    bif_module(name, "length", 1, body)
+}
+
+/// **`byte_size/1` and `length/1` are lowered through the collecting `{gc_bif,…}` the
+/// installed corpus actually emits** — the value asserted concretely on both tiers
+/// (`byte_size(<<1:1>>)` = 1, `byte_size(<<>>)` = 0, `length([])` = 0, `length([1,2,3])`
+/// = 3), then the structural pin keyed on the **`GcBif`** counter: the emitter visits the
+/// variant and records **zero** static deopts for it, and the run leaves no interpreter
+/// step (the host here rejects every BIF, so a deopt would raise).
+#[test]
+fn the_collecting_value_bifs_are_lowered_on_both_tiers() {
+    // (a) The concrete value, on both tiers, for the corpus shapes.
+    let value_cases: [(&str, (Module, Atom), i64); 4] = [
+        (
+            "byte_size(<<1:1>>) via gc_bif",
+            gc_byte_size_literal_case("bif_gc_byte_size_one_bit", &[0x80], 1),
+            1,
+        ),
+        (
+            "byte_size(<<>>) via gc_bif",
+            gc_byte_size_literal_case("bif_gc_byte_size_empty", &[], 0),
+            0,
+        ),
+        (
+            "length([]) via gc_bif",
+            gc_length_case(
+                "bif_gc_length_empty",
+                Vec::new(),
+                Operand::Nil,
+                Operand::X(0),
+            ),
+            0,
+        ),
+        (
+            "length([1,2,3]) via gc_bif",
+            gc_length_case(
+                "bif_gc_length_three",
+                list_123_prologue(),
+                Operand::X(0),
+                Operand::X(0),
+            ),
+            3,
+        ),
+    ];
+    for (label, (module, name), expected) in value_cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            let expected = make_small(expected);
+            assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+            assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+
+    // (b) The structural pin, on the two fixture shapes whose body is nothing but the
+    // lowered value accessor (its source `move` included), so any `jit_step_one` left
+    // would be the value accessor's own deopt.
+    let pin_cases = [
+        (
+            "byte_size/1(gc_bif)",
+            gc_byte_size_literal_case("bif_gc_byte_size_pin", &[0x80], 1),
+        ),
+        (
+            "length/1(gc_bif)",
+            gc_length_case(
+                "bif_gc_length_pin",
+                Vec::new(),
+                Operand::Nil,
+                Operand::X(0),
+            ),
+        ),
+    ];
+    for (label, (module, name)) in pin_cases {
+        // (1) The emitter's dispatch decision, on a compile that cannot hit the
+        // thread-local `CodeCache` (a hit would make the static half vacuous).
+        super::counters::reset();
+        super::counters::set_enabled(true);
+        let labels = crate::interpreter::build_label_map(&module);
+        let _function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+        super::counters::set_enabled(false);
+        let emitted = super::counters::snapshot();
+        assert!(
+            emitted.instr_instances.get("GcBif").copied().unwrap_or(0) > 0,
+            "{label}: `GcBif` must have been visited by the emitter, or this pin proves \
+             nothing; instances: {:?}",
+            emitted.instr_instances,
+        );
+        assert_eq!(
+            emitted.instr_deopts.get("GcBif").copied().unwrap_or(0),
+            0,
+            "{label}: the collecting value accessor is lowered, so it must record zero \
+             static deopts; deopts: {:?}",
+            emitted.instr_deopts,
+        );
+
+        // (2) The run: the value arrives natively (the host here rejects every BIF, so a
+        // deopt would raise) with no interpreter step left.
+        let (outcome, snapshot) = run_counting(&module, name, Tier::BaselineJit);
+        assert!(
+            matches!(outcome, Ok(RunOutcome::Returned(_))),
+            "{label}: the lowered fixture must still return the BIF's value; saw {outcome:?}"
+        );
+        assert!(
+            !snapshot.deopts_by_variant.contains_key("GcBif"),
+            "{label}: `GcBif` must be lowered natively, but it deopted {} time(s) at run \
+             time; deopts by variant: {:?}",
+            snapshot.deopts_by_variant.get("GcBif").copied().unwrap_or(0),
+            snapshot.deopts_by_variant,
+        );
+        assert_eq!(
+            snapshot.step_one, 0,
+            "{label}: every instruction of this fixture is lowered, so no interpreter step \
+             may remain; deopts by variant: {:?}",
+            snapshot.deopts_by_variant,
+        );
+    }
+}
+
+/// **A declined shape of the collecting value accessor is still the interpreter's own
+/// `badarg`** — the helper hands the whole `GcBif` (its `fail` label and raise included)
+/// to `jit_step_one`, so `byte_size/1` of a non-bitstring and `length/1` of a non-list
+/// raise identically on both tiers.
+#[test]
+fn the_declined_collecting_value_shapes_raise_the_interpreters_badarg() {
+    let cases = [
+        (
+            "byte_size(42) via gc_bif",
+            gc_byte_size_value_case("bif_gc_byte_size_int", Operand::Integer(42)),
+        ),
+        (
+            "length(42) via gc_bif",
+            gc_length_case(
+                "bif_gc_length_int",
+                vec![Instr::Move {
+                    src: Operand::Integer(42),
+                    dst: Operand::X(0),
+                }],
+                Operand::X(0),
+                Operand::X(0),
+            ),
+        ),
+    ];
+    for (label, (module, name)) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert!(
+                    matches!(outcome, Err(beam_common::BeamError::BadArg)),
+                    "{label} ({tier}): a declined shape must raise the interpreter's \
+                     `badarg`; saw {outcome:?}"
+                );
+            }
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+
 // -- (f.3) the static deopt is gone ----------------------------------------
 
-/// **The value accessors no longer cost a per-instruction interpreter step** — the
-/// structural pin of [`the_lowered_bif_fast_paths_record_no_static_deopt`], in its same two
+/// **The value accessors no longer cost a per-instruction interpreter step** — the/// structural pin of [`the_lowered_bif_fast_paths_record_no_static_deopt`], in its same two
 /// halves, for `erlang:byte_size/1` and `erlang:length/1` (whose `counters::variant_name`
 /// is `"Bif"`).
 ///

@@ -21,8 +21,9 @@
 //! The baseline tier's **pure-accessor BIF helper**: `erlang:byte_size/1` and
 //! `erlang:length/1` evaluated natively instead of deopting to one interpreter step.
 //!
-//! The compiler emits both as a non-collecting `{bif,…}` (`Instr::Bif`) — pure term
-//! accessors with no heap effect — so leaving them to `jit_step_one` costs a helper
+//! The installed corpus emits both as the collecting `{gc_bif,…}` (`Instr::GcBif`), a
+//! pure term accessor with no heap effect (the tier accepts the non-collecting
+//! `Instr::Bif` form too), so leaving them to `jit_step_one` costs a helper
 //! round-trip **plus** a full interpreter dispatch and `Step` decode per call. Unlike
 //! the aggregate readers (`erlang:hd/1`/`element/2`/`tuple_size/1`, lowered raw by
 //! `super::emit::bif`), neither value is a plain word read: `byte_size/1` rounds
@@ -151,11 +152,18 @@ fn evaluate_bif(
         .functions
         .get(func as usize)
         .and_then(|function| function.code.get(pc as usize))?;
-    let Instr::Bif {
-        arity, bif, args, dst, ..
-    } = instr
-    else {
-        return None;
+    // The two BIF-carrying variants share their `arity`/`bif`/`args`/`dst` fields; the
+    // installed corpus emits `byte_size/1`/`length/1` as the collecting `{gc_bif,…}`
+    // (`Instr::GcBif`), whose `fail` label and raise semantics stay the interpreter's —
+    // a declined shape (below) therefore hands the **whole** instruction to `jit_step_one`.
+    let (arity, bif, args, dst) = match instr {
+        Instr::Bif {
+            arity, bif, args, dst, ..
+        } => (arity, bif, args, dst),
+        Instr::GcBif {
+            arity, bif, args, dst, ..
+        } => (arity, bif, args, dst),
+        _ => return None,
     };
     // The same classification the interpreter's dispatch key uses: the import's module
     // name is `erlang`, its arity matches `Instr::Bif`'s, and the argument count is one.

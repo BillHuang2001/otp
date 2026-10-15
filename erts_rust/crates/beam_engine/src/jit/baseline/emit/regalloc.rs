@@ -348,6 +348,8 @@ pub(crate) fn cacheable_touches(
                 touches.extend(fast.registers());
             } else if let Some(plan) = comparison_shape(module, instr) {
                 touches.extend(plan.registers());
+            } else if let Some((shape_touches, _)) = bif_shape(module, instr) {
+                touches.extend(shape_touches);
             }
         }
         // A comparison BIF (`Instr::Bif` is the settled corpus's form) is charged its
@@ -468,6 +470,8 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
                 fast.writes()
             } else if let Some(plan) = comparison_shape(module, instr) {
                 plan.writes()
+            } else if let Some((_, writes)) = bif_shape(module, instr) {
+                writes
             } else {
                 Vec::new()
             }

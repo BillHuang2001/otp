@@ -43,7 +43,9 @@ use beam_term::MAX_ARITYVAL;
 use crate::interpreter::{build_label_map, LabelMap};
 use crate::machine::MAX_REGISTER;
 
-use super::super::arith::import_names;
+use super::super::arith::{fast_arith, import_names};
+use super::super::bif::bif_shape;
+use super::super::compare::comparison_shape;
 use super::super::operands::{constant_word, x_register, Loc};
 use super::{test_plan, test_src};
 
@@ -249,23 +251,28 @@ fn bif_name(module: &Module, bif: beam_loader::ImportRef) -> String {
     }
 }
 
-/// Whether `name` is one of the BIFs the tier already inlines (the eight comparison
-/// ops via `Instr::Bif`/`GcBif`, and `erlang:'+'/2`/`'-'/2`/`'*'/2` via `GcBif`).
-fn already_inlined(name: &str) -> bool {
-    matches!(
-        name,
-        "erlang:+/2"
-            | "erlang:-/2"
-            | "erlang:*/2"
-            | "erlang:=:=/2"
-            | "erlang:=/=/2"
-            | "erlang:==/2"
-            | "erlang:/=/2"
-            | "erlang:</2"
-            | "erlang:=</2"
-            | "erlang:>/2"
-            | "erlang:>=/2"
-    )
+/// Whether the emitter would **not** statically deopt `instr`, i.e. whether one of the
+/// same shape predicates `emit_block` consults claims it.
+///
+/// The census must ask the emitter's own predicates (never a hardcoded BIF-name
+/// allowlist) so the per-name `bif` / `gc_bif` pool self-maintains as the inline set
+/// changes: a BIF that is genuinely lowered drops out of the ranking, and one that is
+/// not stays in it. Only the **shape predicates** are consulted (no emitter is run), and
+/// the `Instr::Bif` order mirrors `emit_block`'s `try_inline_comparison` then
+/// `try_inline_bif`, the `Instr::GcBif` order its
+/// `try_inline_gc_bif`/`try_inline_comparison`/`try_inline_bif`.
+fn already_inlined(module: &Module, instr: &Instr) -> bool {
+    match instr {
+        Instr::Bif { .. } => {
+            comparison_shape(module, instr).is_some() || bif_shape(module, instr).is_some()
+        }
+        Instr::GcBif { .. } => {
+            fast_arith(module, instr).is_some()
+                || comparison_shape(module, instr).is_some()
+                || bif_shape(module, instr).is_some()
+        }
+        _ => false,
+    }
 }
 
 /// Every committed `*.beam` fixture (no hardcoded names).
@@ -391,15 +398,13 @@ fn the_refusal_attribution_census_is_printed() {
                         }
                     }
                     Instr::Bif { bif, .. } => {
-                        let name = bif_name(&module, *bif);
-                        if !already_inlined(&name) {
-                            *bifs.entry(name).or_insert(0) += 1;
+                        if !already_inlined(&module, instr) {
+                            *bifs.entry(bif_name(&module, *bif)).or_insert(0) += 1;
                         }
                     }
                     Instr::GcBif { bif, .. } => {
-                        let name = bif_name(&module, *bif);
-                        if !already_inlined(&name) {
-                            *gcbifs.entry(name).or_insert(0) += 1;
+                        if !already_inlined(&module, instr) {
+                            *gcbifs.entry(bif_name(&module, *bif)).or_insert(0) += 1;
                         }
                     }
                     Instr::Bif0 { bif, .. } => {

@@ -192,28 +192,42 @@ fn value_registers(dst: &Operand) -> (Vec<u32>, Vec<u32>) {
 /// else (another BIF, an unresolved import, a mismatched arity) is `None`, so the
 /// instruction keeps today's `jit_step_one` step.
 fn classify<'a>(module: &Module, instr: &'a Instr) -> Option<(Target<'a>, &'a Operand)> {
-    let Instr::Bif {
-        arity, bif, args, dst, ..
-    } = instr
-    else {
-        return None;
+    // The two BIF-carrying variants share their `arity`/`bif`/`args`/`dst` fields (a
+    // `GcBif` adds only the `fail` label and `live` count, which the interpreter owns —
+    // the helper never reproduces a `GcBif`'s fail label or raise itself). A shape is
+    // still classified **per variant**: the pure accessors below are the non-collecting
+    // `bif` the compiler emits them as, while the helper-evaluated value accessors are
+    // eligible from **either** variant (the installed corpus emits both `byte_size/1`
+    // and `length/1` as `{gc_bif,…}`).
+    let (arity, bif, args, dst, collecting) = match instr {
+        Instr::Bif {
+            arity, bif, args, dst, ..
+        } => (arity, bif, args, dst, false),
+        Instr::GcBif {
+            arity, bif, args, dst, ..
+        } => (arity, bif, args, dst, true),
+        _ => return None,
     };
     let (module_name, function_name, import_arity) = import_names(module, *bif)?;
     if module_name != "erlang" || import_arity != u32::from(*arity) {
         return None;
     }
     match (function_name, args.as_slice()) {
-        ("hd", [source]) => Some((Target::Hd(source), dst)),
-        ("element", [index, tuple]) => Some((
+        // The three pure accessors are `Bif`-only (`collecting` = a `{gc_bif,…}` of the
+        // same name is not a shape this lowering owns).
+        ("hd", [source]) if !collecting => Some((Target::Hd(source), dst)),
+        ("element", [index, tuple]) if !collecting => Some((
             Target::Element {
                 tuple,
                 element: element_index(index)?,
             },
             dst,
         )),
-        ("tuple_size", [source]) => Some((Target::TupleSize(source), dst)),
+        ("tuple_size", [source]) if !collecting => Some((Target::TupleSize(source), dst)),
         // The helper-evaluated value accessors: `byte_size/1` and `length/1`, accepted
-        // only for a shape their Rust body can serve end to end (`value_shape`).
+        // only for a shape their Rust body can serve end to end (`value_shape`), from
+        // either variant — neither has a heap effect, so the helper's value is exact and
+        // any shape it cannot prove still declines to the interpreter's own step.
         ("byte_size" | "length", [source]) if value_shape(source, dst) => {
             Some((Target::Value, dst))
         }
