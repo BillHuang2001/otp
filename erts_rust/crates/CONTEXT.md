@@ -260,10 +260,11 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   (root-owned) — it boots the script per case, so an end-to-end `gate.sh` run now takes >100 min single-threaded; a full-corpus
   sweep of `differential run <case-id>` is gate-equivalent per case because every `run` verdict already folds in
   the oracle-vs-golden drift check (`tools/differential/src/compare.rs::verdict_with`).
-  **Gate status (full 2608-case sweep): agree=2606, mismatch=0, unsupported=2, skipped=0 — `gate.sh`
-  exits 0 in both the default and the `BEAM_RT_TIER=interpreter` tier.** `unsupported` is exactly the two
-  capability gaps recorded in `known-gaps.txt`: `wire/new_fun_ext_encode` (A.5, unclosable by design — see
-  below) and `boot_extra/init_script_id_names_the_running_otp_release`.
+  **Gate status (full 2737-case sweep): agree=2736, mismatch=0, unsupported=1, skipped=0 — `gate.sh`
+  exits 0.** `unsupported` is exactly the single capability gap recorded in `known-gaps.txt`:
+  `wire/new_fun_ext_encode` (A.5, unclosable by design — see below). One A.4 case
+  (`driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail`) has an **oracle-side crash flake**
+  (the system `erl` exits by signal on ~2 of 5 solo runs) — a corpus-harness defect, not a divergence.
   `wire/new_fun_ext_encode`'s (A.5) gap is unclosable by design: its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
   slot) whose single free variable is erl_eval's internal `Info` tuple holding the clause in `erl_parse`

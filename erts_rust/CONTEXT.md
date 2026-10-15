@@ -132,13 +132,20 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=2608 agree=2606 mismatch=0 unsupported=2
-  skipped=0 allowed=2` → `gate.sh` exits 0 (verified in both the default and the `BEAM_RT_TIER=interpreter` tier). `gate.sh` is authoritative — re-run it for the live
-  per-contract split. **No case disagrees**; the two recorded capability gaps (the `known-gaps.txt`
-  ratchet allowlist) are `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's
-  closure identity needs `erl_eval`/`erl_scan`/`erl_parse`) and
-  `boot_extra/init_script_id_names_the_running_otp_release` (A.9 — `init:script_id/0` on a `-eval`/`run`
-  path that loads no boot script). The two A.9 `selfhost/*` in-process-compile cases now **agree**.
+- **Compatibility gate (`tools/differential`):** `summary: total=2737 agree=2736 mismatch=0 unsupported=1
+  skipped=0` → `gate.sh` exits 0. `gate.sh` is authoritative — re-run it for the live
+  per-contract split. **No case disagrees**; the single recorded capability gap (the `known-gaps.txt`
+  ratchet allowlist) is `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's
+  closure identity needs `erl_eval`/`erl_scan`/`erl_parse`). The A.9
+  `boot_extra/init_script_id_names_the_running_otp_release` case now **agrees** (the default CLI route
+  drives this runtime's *own* release's `bootstrap/bin/start.boot`, so `init:script_id/0` and
+  `system_info(otp_release)` are both `"30"`), as do the two `selfhost/*` in-process-compile cases.
+  Caveat: the A.4 case `driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail` exposes an
+  **oracle-side crash flake** (the system `erl` dies by signal on ~2 of 5 solo runs, exit-0 stdout
+  correct otherwise) — it is a corpus-harness defect, not a runtime divergence. The full sweep is also
+  time-boxed: a serial `gate.sh` run boots every CLI case (~2.5 s each, >100 min), so the gate-equivalent
+  per-case route is `differential run <case-id>` at 16-way parallelism (`compare.rs::verdict_with`
+  folds the oracle-vs-golden drift check into every verdict).
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 648
   keys = 556 declared + 92 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
   `MemoryHook::memory`, …): **346 are served in-crate** and **210 are seam-backed** (a typed
@@ -146,28 +153,24 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   members. The census is re-derived from code and **pinned by `beam_bifs/tests/roster_audit.rs`**, so it
   cannot drift again.
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
-  in `tools/bench/results/`) — read it there rather than duplicating numbers. Headlines since M1: the
-  registered-BIF dispatch hot path fell from ~10.6 µs to ~116 ns/call and the registry lookup is now
-  allocation-free; the baseline-JIT default took the
-  `foreign` hot loop to **0.71×–0.84×** *of the Rust interpreter tier* and `gc_bound/churn` to
-  **0.49×** — those are Rust-vs-Rust *tier-effect* ratios, NOT a system-ERTS comparison: against the
-  system ERTS the same loops remained **46.2×–74.2×** and **42.2×** dearer at M9. The registered-BIF
-  hot path is now ~79–96 ns/call. M10 (see `CHANGE.md`) then cut
-  `etf_roundtrip` by **87.3 %** (to 15.09× the oracle), `list_walk` by **70.2 %** (22.1×), `send_recv` by
-  **52.1 %** (54.7×) and the churn loop's peak RSS by **60.3 %**, while startup stays **0.136×** (7.4×
-  faster) and VM memory **44.98×** lower than the oracle. M11 (see `CHANGE.md`) then **closed the
-  baseline-JIT `send_recv` tier regression** (the default tier was 2.15×–3.31× *dearer* than the Rust
-  interpreter tier; it is now **0.97×–1.03× = parity**, achieved by an O(1) load-time-digest cache key
-  plus in-block `send`/`receive` and comparison-test lowering), cut `etf_roundtrip` a further **28.5 %**,
-  `ets_copy` **25.5 %** and `gc_bound churn` **12.7 %**, and removed a per-call BIF dispatch prologue
-  (redundant double registry lookup + a length-only hash that made ETS keys a permanent memo miss). The
-  current figures, the two-sided ratio labelling and the fresh ranked bottleneck list are in
-  `tools/bench/RESULTS.md` (m11). Two mechanisms were then root-caused (evidence in
-  `tools/bench/results/b54-*`): the `foreign` super-linearity is a genuine **Θ(N³)** regression — a
-  per-slice loop re-registers the engine's never-cleared `refc_binaries` reservoir
-  (`crates/beam_rt/src/runner/run.rs`) through an O(slots) `owned_binary_slot` scan; and the
-  loop-workload RSS growth (incl. `ets_copy`) is a general per-op heap retention in `Nursery.retired`,
-  emptied only by a real collection.
+  in `tools/bench/results/`, newest = `m12-*`) — read it there rather than duplicating numbers. Current
+  state (m12, Rust default baseline-JIT tier vs system ERTS 29.1.1/erts-17.1, both sides named in
+  `RESULTS.md`): startup 109 ms (sys) vs **≈ 0.55 s** (rust — the whole-process wall that now boots a
+  script on every CLI action; boot-time fixed waits were removed, `strace -c -f` shows 0
+  `clock_nanosleep`), VM memory **2.28× lower**, `foreign` **48.0×–76.9×** (the Θ(N³) per-slice off-heap
+  re-registration regression is **fixed** — the `foreign` curve is now flat and matches the M10 baseline,
+  where M11 published 60.2×–367.1×), `gc_bound churn` **24.3×**, `copy_bound` **11.1×–…** (the wide
+  `send_recv` figure is the `PORT_POLL_SLICE` defect below, now fixed), `etf_roundtrip` **≈ 15×**.
+  Measurable target projects: `cowboy` **165 489 req/s**, `elixir` compiler **4.4 files/s**, `erlc`
+  **8.8 files/s**, `khepri` (`rebar3 eunit` 77.6 s) and `plb` (dotnet, p50 595 ms) now run;
+  `emqx` skips honestly (its `:ezstd` NIF build needs OTP <30 idioms plus host `automake`/`libtool`/`krb5`).
+  Two performance mechanisms were root-caused and fixed this milestone: the Θ(N³) per-slice
+  registration loop (`crates/beam_rt/src/runner/run.rs` + an O(1) `owned_binary_slot` index), and the
+  ≈ 25 ms `PORT_POLL_SLICE` sleep per blocked scheduler round (an armed-but-idle `os:set_signal/2`
+  self-pipe kept `has_nothing_to_poll()` permanently false — now a non-destructive zero-timeout probe,
+  worth **386×** on `send_recv`). The remaining loop-workload RSS growth is the copy-bound `ets_copy`
+  case: an untagged module-literal root makes the collector decline — the fix is the loader's
+  literal-tagging step (`crates/beam_loader/src/literal.rs`, escalated, see `CHANGE.md`).
 - **Contract A.9 (build/bootstrapping) — boot COMPLETES; no self-hosted build yet.** `beam_rt`
   loads the 22 preloaded modules on startup, and its boot-script executor drives the real
   `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 directives) **through the final
