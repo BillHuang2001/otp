@@ -341,7 +341,14 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   atom yields a typed `unsupported`, never a substituted wrong atom), matching C `i_func_info_IaaI` —
   treating it as a no-op would let a failed head clause fall through to the entry label and loop.
   `beam_rt::boot::CORE_ATOMS` seeds `function_clause`/`exit`/`throw` so a fixture module lacking the
-  atom still resolves it; a call to a missing module/function yields the bare atom `undef`.
+  atom still resolves it; a call to a missing module/function yields the bare atom `undef`, and the raise's
+  **stacktrace HEAD is the synthesized callee item `{TargetModule,TargetFunction,ArgList,[]}`** (`Location`
+  `[]`) — cooked by `beam_engine` for an unresolved `call_ext*`/`apply/3` (identical on the interpreter and the
+  baseline-JIT tier; the item rides the raise's own raw-trace word `x(2)`, so no frozen `RootSet`/`StackFrame`
+  seam changed — `beam_common::StackFrame` stays metadata-only) and, since the `-eval` route is served by
+  `beam_rt`'s own tree-walker rather than the engine, also by `beam_rt/src/eval/`. The head item matches the
+  oracle byte-for-byte on both routes; the oracle's trailing `erl_eval`/`init` frames are not reproducible
+  without an `erl_eval` port and are deliberately not fabricated.
 - **Host seams and BIF-level oracle parity.** The process dictionary is wired end-to-end — `beam_bifs`
   adds a 7th optional `BifContext` seam `DictHook` (`put`/`get`/`erase`/`get_keys`/`get_keys_for_value`)
   backing `erlang:put/2`/`get/1`/`erase/1`/`get_keys/0,1`, and `beam_rt` supplies it
