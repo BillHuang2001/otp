@@ -1238,6 +1238,18 @@ impl Process {
         self.collector.should_collect(need_words)
     }
 
+    /// Whether the collector is **retaining replaced heap spaces** and therefore needs a
+    /// collection even when [`Process::should_collect`]'s occupancy check would not trigger one.
+    ///
+    /// A no-collect, no-relocation nursery growth ([`Process::grow_nursery`]) retires the space it
+    /// replaces instead of freeing it, so the collector can carry that retention (its *collection
+    /// debt*) while the current young space still has room to spare. A host's heap-admission point
+    /// that only consulted the occupancy check would let the retired chain accumulate; consulting
+    /// this accessor as well lets a collection collapse it.
+    pub fn collection_debt(&self) -> bool {
+        self.collector.collection_debt()
+    }
+
     /// The number of words used in the young heap.
     pub fn heap_used_words(&self) -> usize {
         self.collector.young().used_words()
@@ -1841,6 +1853,24 @@ mod tests {
         // ... but a small one does.
         assert!(!process.should_collect(1));
         assert_eq!(process.heap_used_words(), 0);
+    }
+
+    /// [`Process::collection_debt`] forwards to the collector's own debt seam: a fresh nursery
+    /// carries none, a no-collect growth ([`Process::grow_nursery`]) retains the replaced space and
+    /// reports debt even though the current space still has room, and the next collection settles
+    /// it.
+    #[test]
+    fn collection_debt_tracks_the_retained_space_and_is_settled_by_a_collection() {
+        let mut process = Process::new(pid(7)).expect("the default heap allocates");
+        assert!(!process.collection_debt(), "a single space is no debt");
+
+        process.grow_nursery(4096).expect("the default policy grows on demand");
+        assert!(process.collection_debt(), "the retained space is debt");
+        assert_eq!(process.collector().young_space_count(), 2);
+
+        process.collect().expect("the next collection collapses the chain");
+        assert!(!process.collection_debt(), "the debt is settled by the collection");
+        assert_eq!(process.collector().young_space_count(), 1);
     }
 
     #[test]
