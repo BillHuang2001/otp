@@ -36,7 +36,9 @@ use crate::machine::MAX_REGISTER;
 
 use super::arith::{FAST_C, SMALL_MASK};
 use super::link::Linker;
-use super::operands::{small_word, x_offset, x_register};
+use super::operands::{
+    emit_guarded_y_load, small_word, x_offset, x_register, y_addressable, y_register,
+};
 use super::{emit_helper_call, emit_refresh_y, emit_step_and_continue, fill, touch, Allocation, FillSite};
 use crate::jit::baseline::runtime::StepHelper;
 use crate::jit::baseline::test_helper::{jit_test, TEST_FALSE, TEST_TRUE};
@@ -104,7 +106,7 @@ const TEST_B: Reg = Reg::R8;
 /// loaded header word / tuple element of a header test).
 pub(super) const TEST_T: Reg = Reg::R10;
 /// The header test's boxed-pointer scratch ([`load_boxed_header`]).
-const TEST_C: Reg = Reg::R9;
+pub(super) const TEST_C: Reg = Reg::R9;
 /// The header test's staging scratch for the **masked** header value ([`header_matches`]).
 ///
 /// It must not be one of the operand/pointer scratch registers: every caller passes
