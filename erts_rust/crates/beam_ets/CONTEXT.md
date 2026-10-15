@@ -616,26 +616,22 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   store's `blocks` (bounded by the total taken volume) until `store.reset()`
   (`ets:delete_all_objects/1`) or the table is dropped — a checked-out term must stay valid and `take`
   hands back table-owned `Eterm`s.
-- **The match-spec compiler's typed divergences.** The head-**map** pattern, map **guard** and map
-  **body** subset is oracle parity (the `maps` battery group): a head map's keys stay literal at the top
-  level of each key but literal-keyed when nested inside a compound key, its values match structurally,
-  an object carrying extra keys still matches, `#{}` matches any map, and a non-atom key compares
-  exactly (`1` ≠ `1.0`). Typed divergences (never a wrong result): `self/0` resolves through the
-  thread-local `SelfHook` seam (`set_self_hook`) and its default is the typed `badarg` (without a hook a
-  `self/0` guard clause is skipped and a `self/0` body is `badarg`); integer arithmetic whose result
-  leaves the 60-bit small range via `DefaultArithHook` is the typed `unsupported_ets`
-  (`abs`/`bnot`/`trunc`/`round`/`ceil`/`floor` do handle bignums), while `beam_bifs` installs its own
-  arbitrary-precision hook (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF, so
-  a bignum operand yields the oracle's value in the runtime. A match-spec **body** runtime failure
-  yields the atom `EXIT` resolved from the caller's `AtomTable` (`select::exec::exit_term`), so a host
-  running a raising body must pre-intern `EXIT`; an uninterned `EXIT` ⇒ typed `badarg`.
+- **The match-spec compiler's typed divergences.** Head-**map** patterns, map **guards** and map
+  **bodies** are oracle parity (the `maps` battery group: literal top-level keys, structural values,
+  extra keys tolerated, `#{}` matches any map, `1` ≠ `1.0` keys). Typed divergences (never a wrong
+  result): `self/0` resolves through the thread-local `SelfHook` seam, default typed `badarg` (no hook ⇒
+  a `self/0` guard clause is skipped, a `self/0` body is `badarg`); integer arithmetic leaving the 60-bit
+  small range through `DefaultArithHook` is `unsupported_ets`, while `beam_bifs` installs an
+  arbitrary-precision hook (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF so
+  a bignum operand yields the oracle's value in the runtime; a **body** runtime failure yields the atom
+  `EXIT` from the caller's `AtomTable` (a host running a raising body must pre-intern `EXIT`; an
+  uninterned `EXIT` ⇒ `badarg`).
 - **`erlang:match_spec_test/3`'s `trace` dialect is left-open (typed `unsupported`).** The oracle folds
   the trace **run** into the `{ok,Return,Flags,Errors}` shape and needs the trace-only special forms
-  (`get_tcw`/`set_tcw`/`message`/`return_trace`/`exception_trace`/`display`/`set_seq_token`/…), i.e. a
-  runner subsystem — not a lint-only subset. The **`table`** dialect *is* implemented (native structural
-  lint + `beam_ets`'s compiler); `beam_bifs::match_spec` returns the typed `unsupported_bif` for `trace`.
-  C refs: `erl_db_util.c:6042` `match_spec_test_3`, `:1509` `db_match_set_lint`, `:6125`
-  `erts_match_set_run_trace`. Detail in `src/select/CONTEXT.md`.
+  (`get_tcw`/`set_tcw`/`message`/`return_trace`/`exception_trace`/`display`/`set_seq_token`/…) — a runner
+  subsystem, not a lint-only subset. The **`table`** dialect *is* implemented (native structural lint +
+  this crate's compiler); `beam_bifs::match_spec` returns the typed `unsupported_bif` for `trace`. Detail
+  and C refs (`erl_db_util.c:6042/1509/6125`) in `src/select/CONTEXT.md`.
 - **`select_replace/2`'s key check is the C's static syntactic check** (`db_match_keeps_key`): a body
   that is not syntactically `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}` is `badarg` for the
   whole call, even when nothing matches. Two exotic shapes remain approximated (a call-shaped raw tuple
