@@ -56,6 +56,18 @@
 //! * **the port data lock family** — `driver_pdl_create/1` and the `driver_pdl_inc_refc`/
 //!   `driver_pdl_dec_refc`/`driver_pdl_get_refc`/`driver_pdl_lock`/`driver_pdl_unlock` reference
 //!   count shape (`22`, `23`, `24`);
+//! * **the port queue family** — `driver_peekq/2` on an empty queue, the **populated**
+//!   `driver_peekqv/2` (the byte count, the entry count and each entry's own bytes) and the
+//!   **partial-skip** `driver_enqv/3` / `driver_pushqv/3`, each drained back to empty (`45`–`48`);
+//!   plus `driver_vec_to_buf/3` with a buffer longer than the vector (`49`);
+//! * **the busy-message-queue watermarks** — `erl_drv_busy_msgq_limits/3` turning the feature off
+//!   with an `ERL_DRV_BUSY_MSGQ_DISABLED` write and then reading it back disabled (`50`);
+//! * **the dynamic loader** — `driver_dl_sym/2` answering `NULL` for a null handle and an absent
+//!   symbol, without opening or closing anything (`51`);
+//! * **the port-owner output channels** — `driver_output_binary/6` and the three `driver_outputv/5`
+//!   shapes (header + gathered vectors, a header with a skip into the vectors, and a skip covering
+//!   the whole vector), whose observable is the **bytes the owner receives** rather than a status
+//!   byte (`52`–`55`);
 //! * **the built-in driver name resolution** — `open_port({spawn_driver, "tcp_inet"}, Opts)`
 //!   resolves the name the emulator links in statically to a live driver port
 //!   ([`DRIVER_BUILTIN_MODULE_SOURCE`]; no C fixture);
@@ -73,8 +85,12 @@
 //! sends a **one-byte selector** through `port_command/2`; the fixture's `output` callback
 //! dispatches on that byte:
 //!
-//! * selectors `< 100` — the driver runs one ABI check and answers with a single status byte
-//!   (`'1'` pass `= 49`); the module's `classify/1` reads that byte;
+//! * selectors `< 100` other than the four `52`–`55` — the driver runs one ABI check and answers
+//!   with a single status byte (`'1'` pass `= 49`) through `driver_output/3`; the module's
+//!   `classify/1` reads that byte;
+//! * selectors `52`–`55` — the driver emits a **byte payload** through `driver_output_binary/6` or
+//!   `driver_outputv/5` instead of a status byte; `classify/1` still reads the bytes, so the
+//!   observable is the base-256 value of exactly the bytes the owner received;
 //! * selectors `100..=120` — the driver *delivers a decoded term* through `erl_drv_output_term/3`
 //!   and emits **no** byte payload, so the owner's own message is the whole observable; the
 //!   module's `classify_term/1` encodes it as the base-256 value of its canonical
@@ -117,8 +133,14 @@
 //! * **a non-empty driver-private queue at port close hangs the oracle** — `driver_enq` /
 //!   `driver_pushq` leave bytes in `prt->ioq` when the callback returns; measured, the oracle then
 //!   answers the probe but **never exits** (killed after 25 s, exit `137`), so a shape that leaves
-//!   the queue non-empty is unpinnable. Only the round trip that **drains the queue back to empty**
-//!   before returning is pinned (`20`). Owner: the oracle's port-close path, not a runtime gap.
+//!   the queue non-empty is unpinnable. Only the shapes that **drain the queue back to empty**
+//!   before returning are pinned (`20`, `45`–`49`). Owner: the oracle's port-close path, not a
+//!   runtime gap.
+//! * **`driver_enqv/3`'s and `driver_outputv/5`'s binary array must be non-null** — the C walks
+//!   `vec->binv` in lockstep with `vec->iov` and dereferences every entry
+//!   (`erl_io_queue.c:268-283`, `io.c:3565-3585`), so a `binv = NULL` vector SIGSEGVs the oracle; an
+//!   all-`NULL` array is the documented "make a binary from the iovec" form the fixtures use.
+//!   Owner: the oracle itself (the Rust hooks read only `iov`).
 //! * **`driver_pdl_get_refc(NULL)` SIGSEGVs the oracle** (measured), so the PDL family's
 //!   `NULL`/foreign-handle shapes are unpinnable; only the live-handle create/refcount shapes are
 //!   pinned (`22`, `23`, `24`). Owner: the oracle itself.
@@ -145,6 +167,10 @@
 //!   `driver_failure_*` — the async pool, the OS-pid record and the port-closing slots either have
 //!   no Rust hook or terminate the connected process, so no live-port shape can agree (the first
 //!   is already documented by [`super::driver_abi`]). Owner: `beam_rt` / `beam_io`.
+//! * **`driver_async_port_key/1`** — the C answers the port's opaque data word (`erl_async.c:518`,
+//!   the driver's own `ErlDrvData`, i.e. a pointer), while the Rust hook keeps the `DriverHost`
+//!   trait default, so the call answers `0`. A fabricated key is not *the* key, so no value is
+//!   pinnable even once the hook exists. Owner: `beam_rt` (`DriverHost::async_port_key`).
 //!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
@@ -935,6 +961,208 @@ static int chk_cond_wait_wakes(void) {
     return ex_cw_woke;
 }
 
+/* -- the output-family shapes the base group left unpinned ---------------------------------- */
+
+/* `driver_output_binary`'s header bytes go out **before** the requested window
+ * (`io.c:6339`: `deliver_bin_message` → `deliver_vec_message`, which prepends the header,
+ * `io.c:3544-3603`). The three-byte window is `abc`'s offset-2 tail. */
+static void chk_output_binary_header(extra_state *st) {
+    ErlDrvBinary *b = driver_alloc_binary(8);
+    if (b == NULL) {
+        ex_answer(st, 0);
+        return;
+    }
+    memcpy(b->orig_bytes, "abcdefgh", 8);
+    (void) driver_output_binary(st->port, "H", 1, b, 2, 3);
+    driver_free_binary(b);
+}
+
+/* The five-byte two-vector probe the three `driver_outputv` shapes below share: entries of two and
+ * three bytes with an all-`NULL` binary array behind them.
+ *
+ * The array must be **non-null**: `deliver_vec_message` walks `binv` in lockstep with `iov` and, for
+ * every entry past the on-heap limit, dereferences it (`io.c:3565-3585`), so a null array is a null
+ * dereference there. An all-`NULL` array is the documented "make a binary from the iovec" form. */
+static void ex_five_byte_vec(ErlIOVec *ev, SysIOVec *iov, ErlDrvBinary **binv, char *a, char *b) {
+    memcpy(a, "AA", 2);
+    memcpy(b, "BBB", 3);
+    iov[0].iov_base = a;
+    iov[0].iov_len = 2;
+    iov[1].iov_base = b;
+    iov[1].iov_len = 3;
+    binv[0] = NULL;
+    binv[1] = NULL;
+    ev->vsize = 2;
+    ev->size = 5;
+    ev->iov = iov;
+    ev->binv = binv;
+}
+
+/* `driver_outputv`'s header precedes the gathered vectors (`io.c:6501`, the same
+ * `deliver_vec_message` header prepend). */
+static void chk_outputv_header(extra_state *st) {
+    SysIOVec iov[2];
+    ErlDrvBinary *binv[2];
+    ErlIOVec ev;
+    char a[2], b[3];
+    ex_five_byte_vec(&ev, iov, binv, a, b);
+    (void) driver_outputv(st->port, "H", 1, &ev, 0);
+}
+
+/* A `skip` inside the vectors drops that many leading bytes and delivers the tail
+ * (`io.c:6481-6493`): skipping `AA` and `B`'s first byte leaves `BB`. */
+static void chk_outputv_skip(extra_state *st) {
+    SysIOVec iov[2];
+    ErlDrvBinary *binv[2];
+    ErlIOVec ev;
+    char a[2], b[3];
+    ex_five_byte_vec(&ev, iov, binv, a, b);
+    (void) driver_outputv(st->port, NULL, 0, &ev, 3);
+}
+
+/* A `skip` covering the whole vector is the C's early return: the header alone goes out
+ * (`io.c:6463-6464`). */
+static void chk_outputv_skip_all(extra_state *st) {
+    SysIOVec iov[2];
+    ErlDrvBinary *binv[2];
+    ErlIOVec ev;
+    char a[2], b[3];
+    ex_five_byte_vec(&ev, iov, binv, a, b);
+    (void) driver_outputv(st->port, "H", 1, &ev, 5);
+}
+
+/* -- the queue family's remaining shapes ----------------------------------------------------- */
+
+/* `driver_peekq` on an **empty** queue answers `NULL` and reports a zero vector length
+ * (`erl_io_queue.c:405-406`). */
+static int chk_peekq_empty(extra_state *st) {
+    int vlen = -2;
+    return driver_peekq(st->port, &vlen) == NULL && vlen == 0;
+}
+
+/* The **populated** `driver_peekqv`: the returned byte count, `ev.size`, the entry count and each
+ * entry's own bytes (`erl_io_queue.c:379-396`). The queue is drained back to empty before the
+ * callback returns (a non-empty queue at port close hangs the oracle — see *Known gaps*). */
+static int chk_peekqv_populated(extra_state *st) {
+    ErlIOVec ev;
+    ErlDrvSizeT n;
+    if (driver_enq(st->port, "abc", 3) != 0)
+        return 0;
+    if (driver_pushq(st->port, "de", 2) != 0)
+        return 0;
+    memset(&ev, 0, sizeof(ev));
+    n = driver_peekqv(st->port, &ev);
+    if (n != 5 || ev.size != 5 || ev.vsize != 2)
+        return 0;
+    if (ev.iov == NULL)
+        return 0;
+    if (ev.iov[0].iov_len != 2 || ev.iov[1].iov_len != 3)
+        return 0;
+    if (memcmp(ev.iov[0].iov_base, "de", 2) != 0)
+        return 0;
+    if (memcmp(ev.iov[1].iov_base, "abc", 3) != 0)
+        return 0;
+    if (driver_deq(st->port, 5) != 0)
+        return 0;
+    return driver_sizeq(st->port) == 0;
+}
+
+/* A **partial** `driver_enqv` skip appends only the vector's tail (`erl_io_queue.c:233-247`): a
+ * five-byte vector skipped by two leaves three queued bytes.
+ *
+ * The vector must carry a **non-null** `binv` array (the C's enqueue walks it in lockstep with `iov`
+ * and dereferences every entry, `erl_io_queue.c:268-283`; a null array is a null dereference there) —
+ * an all-`NULL` array is the documented "create a binary from the iovec" form. */
+static int chk_enqv_partial_skip(extra_state *st) {
+    SysIOVec iov[1];
+    ErlDrvBinary *binv[1];
+    ErlIOVec ev;
+    char in[5];
+    memcpy(in, "abcde", 5);
+    iov[0].iov_base = in;
+    iov[0].iov_len = 5;
+    binv[0] = NULL;
+    ev.vsize = 1;
+    ev.size = 5;
+    ev.iov = iov;
+    ev.binv = binv;
+    if (driver_enqv(st->port, &ev, 2) != 0)
+        return 0;
+    if (driver_sizeq(st->port) != 3)
+        return 0;
+    return driver_deq(st->port, 3) == 0;
+}
+
+/* The same partial skip for the head-inserting sibling. */
+static int chk_pushqv_partial_skip(extra_state *st) {
+    SysIOVec iov[1];
+    ErlDrvBinary *binv[1];
+    ErlIOVec ev;
+    char in[5];
+    memcpy(in, "abcde", 5);
+    iov[0].iov_base = in;
+    iov[0].iov_len = 5;
+    binv[0] = NULL;
+    ev.vsize = 1;
+    ev.size = 5;
+    ev.iov = iov;
+    ev.binv = binv;
+    if (driver_pushqv(st->port, &ev, 2) != 0)
+        return 0;
+    if (driver_sizeq(st->port) != 3)
+        return 0;
+    return driver_deq(st->port, 3) == 0;
+}
+
+/* `driver_vec_to_buf` with a buffer **longer** than the vector copies the whole vector and reports
+ * the vector's size, not the buffer's (`io.c:6516-6529`'s fall-through return). */
+static int chk_vec_to_buf_longer_buffer(void) {
+    SysIOVec iov[2];
+    ErlIOVec ev;
+    char a[3], b[2], out[8];
+    memcpy(a, "abc", 3);
+    memcpy(b, "de", 2);
+    iov[0].iov_base = a;
+    iov[0].iov_len = 3;
+    iov[1].iov_base = b;
+    iov[1].iov_len = 2;
+    ev.vsize = 2;
+    ev.size = 5;
+    ev.iov = iov;
+    ev.binv = NULL;
+    memset(out, 0, sizeof(out));
+    return driver_vec_to_buf(&ev, out, 8) == 5 && memcmp(out, "abcde", 5) == 0;
+}
+
+/* -- the busy-message-queue watermarks ------------------------------------------------------- */
+
+/* `erl_drv_busy_msgq_limits` is called by drivers either reading or writing the limits: a limit of
+ * `ERL_DRV_BUSY_MSGQ_DISABLED` turns the feature off, and a following read-only query (both bounds
+ * `ERL_DRV_BUSY_MSGQ_READ_ONLY`) then reports the feature disabled — `erl_port_task.c:771-793`'s
+ * `!(bpq = pp->sched.taskq.bpq)` path, because the disable arm NULLs `taskq.bpq`
+ * (`erl_port_task.c:796`). */
+static int chk_busy_msgq_disabled_read(extra_state *st) {
+    ErlDrvSizeT low = ERL_DRV_BUSY_MSGQ_DISABLED;
+    ErlDrvSizeT high = ERL_DRV_BUSY_MSGQ_DISABLED;
+    erl_drv_busy_msgq_limits(st->port, &low, &high);
+    if (low != ERL_DRV_BUSY_MSGQ_DISABLED || high != ERL_DRV_BUSY_MSGQ_DISABLED)
+        return 0;
+    low = ERL_DRV_BUSY_MSGQ_READ_ONLY;
+    high = ERL_DRV_BUSY_MSGQ_READ_ONLY;
+    erl_drv_busy_msgq_limits(st->port, &low, &high);
+    return low == ERL_DRV_BUSY_MSGQ_DISABLED && high == ERL_DRV_BUSY_MSGQ_DISABLED;
+}
+
+/* -- the dynamic-loader symbol lookup -------------------------------------------------------- */
+
+/* `driver_dl_sym/2` on a **null** handle and an absent name answers `NULL`
+ * (`io.c:7399-7417`: `erts_sys_ddll_sym` → `dlsym`, `erl_unix_sys_ddll.c:163-180`). Nothing is
+ * loaded and nothing is closed, so the round trip the doc's *Known gaps* calls unpinnable is not
+ * touched. */
+static int chk_dl_sym_absent(void) {
+    return driver_dl_sym(NULL, "driver_extra_absent_symbol") == NULL;
+}
+
 /* -- the selectors ------------------------------------------------------------------------- */
 
 static void ex_dispatch(extra_state *st, unsigned char sel) {
@@ -988,6 +1216,21 @@ static void ex_dispatch(extra_state *st, unsigned char sel) {
     case 42: ex_answer(st, chk_tryrwlock_refused_while_reader()); break;
     case 43: ex_answer(st, chk_tryrlock_refused_while_writer()); break;
     case 44: ex_answer(st, chk_cond_wait_wakes()); break;
+    /* The output-family shapes the base group left unpinned, the queue family's remaining shapes,
+     * the busy-message-queue watermarks and the dynamic-loader symbol lookup. */
+    case 45: ex_answer(st, chk_peekq_empty(st)); break;
+    case 46: ex_answer(st, chk_peekqv_populated(st)); break;
+    case 47: ex_answer(st, chk_enqv_partial_skip(st)); break;
+    case 48: ex_answer(st, chk_pushqv_partial_skip(st)); break;
+    case 49: ex_answer(st, chk_vec_to_buf_longer_buffer()); break;
+    case 50: ex_answer(st, chk_busy_msgq_disabled_read(st)); break;
+    case 51: ex_answer(st, chk_dl_sym_absent()); break;
+    /* The output-payload selectors: the bytes the owner receives are the observable, so nothing is
+     * answered through the status channel. */
+    case 52: chk_output_binary_header(st); break;
+    case 53: chk_outputv_header(st); break;
+    case 54: chk_outputv_skip(st); break;
+    case 55: chk_outputv_skip_all(st); break;
     /* The delivery family: nothing is answered through the byte channel — the delivered term is
      * the observable. */
     case 100: ex_deliver(st, 0); break;
@@ -1465,6 +1708,73 @@ pub(crate) fn group() -> Vec<Case> {
             &[40],
             "49",
         ),
+        // --- the queue family's remaining shapes, the watermarks and the loader ---------------
+        case(
+            "driver_extra/driver_peekq_on_an_empty_queue_answers_null_and_a_zero_length",
+            "driver_peekq/2 on an empty queue answers NULL and reports a zero vector length",
+            &[45],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_peekqv_fills_a_populated_queue_vector",
+            "driver_peekqv/2 on a two-chunk queue reports the byte count, the entry count and each entry's bytes",
+            &[46],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_enqv_with_a_partial_skip_enqueues_the_tail",
+            "driver_enqv/3 with a skip inside the vector enqueues only the surviving tail bytes",
+            &[47],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail",
+            "driver_pushqv/3 with a skip inside the vector enqueues only the surviving tail bytes",
+            &[48],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_vec_to_buf_with_a_longer_buffer_reports_the_vector_size",
+            "driver_vec_to_buf/3 with a buffer longer than the vector copies the whole vector and reports its size",
+            &[49],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_busy_msgq_limits_disabled_read_reports_the_feature_off",
+            "erl_drv_busy_msgq_limits/3 turns the feature off for a ERL_DRV_BUSY_MSGQ_DISABLED limit and then reads it back disabled",
+            &[50],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_dl_sym_answers_null_for_an_absent_symbol",
+            "driver_dl_sym/2 on a null handle and an absent name answers NULL",
+            &[51],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_output_binary_delivers_a_header_then_the_window",
+            "driver_output_binary/6 delivers its header bytes followed by the requested binary window",
+            &[52],
+            "1214473317",
+        ),
+        case(
+            "driver_extra/driver_outputv_delivers_a_header_then_the_vectors",
+            "driver_outputv/5 delivers its header bytes followed by the gathered vectors",
+            &[53],
+            "79445104935490",
+        ),
+        case(
+            "driver_extra/driver_outputv_delivers_the_vector_tail_after_a_skip",
+            "driver_outputv/5 with a skip inside the vectors delivers only the surviving tail bytes",
+            &[54],
+            "16962",
+        ),
+        case(
+            "driver_extra/driver_outputv_delivers_the_header_alone_when_the_skip_covers_the_vector",
+            "driver_outputv/5 whose skip covers the whole vector delivers the header alone",
+            &[55],
+            "72",
+        ),
         delivery_case(
             "driver_extra/erl_drv_output_term_delivers_a_uint_operand",
             "erl_drv_output_term/3 delivers 42 built from an ERL_DRV_UINT operand",
@@ -1618,6 +1928,11 @@ mod tests {
     /// `driver_output` status byte, and the module entry point it must drive.
     const DELIVERY_SELECTORS: std::ops::RangeInclusive<i64> = 100..=120;
 
+    /// The `driver_output`-**byte payload** family this widening adds: the observable is the
+    /// base-256 value of the bytes the fixture emits, never the status byte, and the module entry
+    /// point is the same `classify/1` the status family uses (the payload arrives on the byte
+    /// channel).
+    const PAYLOAD_SELECTORS: std::ops::RangeInclusive<i64> = 52..=55;
     /// The module name and entry point of the **built-in-driver** sub-family — the cases that open a
     /// driver name the emulator itself links in, so they carry no C fixture.
     const BUILTIN_MODULE: &str = "driver_builtin";
@@ -1730,11 +2045,14 @@ mod tests {
 
     /// The status selectors answer the single status byte `'1'` (integer `49`), so their golden is
     /// `49`; the delivery selectors answer the base-256 value of the delivered term's ETF image —
-    /// never `49`; the built-in-driver cases answer the observed open/resolution shape.
+    /// never `49`; the output-**payload** selectors answer the base-256 value of the bytes the
+    /// fixture emitted on the byte channel — never `49`; the built-in-driver cases answer the
+    /// observed open/resolution shape.
     #[test]
     fn the_goldens_are_the_status_byte_a_delivered_term_value_or_a_builtin_shape() {
         let mut status = 0;
         let mut deliveries = 0;
+        let mut payloads = 0;
         let mut builtin = 0;
         for case in group() {
             let CaseKind::Module(run) = case.kind else { unreachable!() };
@@ -1753,13 +2071,25 @@ mod tests {
                     "case {}: a delivery selector has the delivered term as its payload",
                     case.id
                 );
+            } else if PAYLOAD_SELECTORS.contains(&run.args[0]) {
+                payloads += 1;
+                assert_ne!(
+                    golden, "49",
+                    "case {}: an output-payload selector answers its emitted bytes, not a status",
+                    case.id
+                );
             } else {
                 status += 1;
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
-        assert_eq!(status, 44, "the forty-four status selectors");
+        assert_eq!(status, 51, "the fifty-one status selectors");
         assert_eq!(deliveries, DELIVERY_SELECTORS.count(), "one delivery case per selector");
+        assert_eq!(
+            payloads,
+            PAYLOAD_SELECTORS.count(),
+            "one output-payload case per selector"
+        );
         assert_eq!(builtin, 2, "the two built-in-driver cases");
     }
     /// The delivery family must actually cover the operand tags [`super::driver_abi`] left
