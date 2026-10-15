@@ -170,13 +170,17 @@ points can never drift:
   copying collector's root set can only keep a term alive, never free a live one.
 * **The FR file is published only up to its live leading prefix `fr_mark()`.** The runner reads the
   count **once** per slice (`Machine::fr_mark()`, the engine's exclusive high-water mark of FR writes
-  since the machine's last reset) and reuses it for both the `pin_process` and the
-  `publish_parked_roots(.., fr_count)` call in the same slice; `fr_mark() > 0` also pins the process, so
-  a live FR is always published (a `Yield`-parked process is never exempt, and a delivery-driven
-  collection is not gated by `gc_process_enabled`, so a live FR must still relocate). `fr_mark` is an
+  since the machine's last reset) and reuses it for both the post-slice reaction and the
+  `publish_parked_roots(.., fr_count)` call in the same slice; `fr_mark() > 0` also marks the process
+  **relocation-exempt for the inter-slice window** (`ProcessTable::set_relocation_exempt(pid, true)`,
+  cleared by the next slice entry), so a live FR is always published and the window's collection sites
+  decline the move (a `Yield`-parked process's window is exempt too, and a delivery-driven collection
+  is not gated by `gc_process_enabled`, so a live FR must still relocate). The reaction is **per slice,
+  never a permanent pin**: inside a slice the engine reaches only the full door, which publishes the
+  whole FR file, so a float-using call site collects exactly like a float-free one. `fr_mark` is an
   exact upper bound after a slice — every FR write goes through `Machine::set_fr`, and the baseline JIT
   tier refuses an FR destination (deopting to the interpreter) — and a bound can only err by
-  over-pinning: a slot at or above it is `NIL`, and a `NIL` word roots nothing, so a float-free park
+  over-protecting: a slot at or above it is `NIL`, and a `NIL` word roots nothing, so a float-free park
   publishes **no** FR word instead of the 1024 slots `process.regs` used to carry. The count is stored
   on `ProcessEngine::fr_published` at the park and replayed at the resume, so `scatter_roots_full` never
   sees a length mismatch (which would halt the process's collection).
@@ -194,7 +198,7 @@ points can never drift:
   reason out and writes it into `Machine::pending_exception_mut()`, **clears** the process's extra
   roots (the machine owns the relocated term now), and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
-* The **`Wait` park arm** additionally marks the process **relocation-exempt** for the whole parked window (`ProcessTable::set_relocation_exempt(pid, true)`), and the resume clears it, so a delivery- or signal-driven collection of a waiting (or just-woken, not-yet-resumed) process is declined and the delivery takes the ordinary heap-fragment fallback; the **`Yield`** (pre-emption) arm is *not* exempt. This is **additional** to the installed host collection gate (`../context/gc_walk.rs`'s `RuntimeCollectionGate`, installed on the runtime's table by `Runtime::new`): the gate declines only when an unscanned container is reachable from the receiver's **gathered** roots, while the exemption refuses *any* relocation for the parked window — covering a live term the host holds outside that gathered set, which the walk cannot see. Both park arms call `Runtime::serve_gc_request` (the `erlang:garbage_collect/0,1` request, see the crate node): the `Yield` arm serves it (its roots are just published and its FR prefix is provably empty, `fr_mark() == 0`), the `Wait` arm's request is declined by the exemption.
+* The **`Wait` park arm** additionally marks the process **relocation-exempt** for the whole parked window (`ProcessTable::set_relocation_exempt(pid, true)`), and the resume clears it, so a delivery- or signal-driven collection of a waiting (or just-woken, not-yet-resumed) process is declined and the delivery takes the ordinary heap-fragment fallback. The **`Yield`** (pre-emption) arm is *not* exempt by the park itself, but the post-slice `fr_mark` check opens the same window exemption for **any** slice that ends with a live FR prefix (see the bullet above), and the admission points inside a resumed slice are unaffected because the next slice entry clears the mark. This is **additional** to the installed host collection gate (`../context/gc_walk.rs`'s `RuntimeCollectionGate`, installed on the runtime's table by `Runtime::new`): the gate declines only when an unscanned container is reachable from the receiver's **gathered** roots, while the exemption refuses *any* relocation for the window — covering a live term the host holds outside that gathered set, which the walk cannot see. Both park arms call `Runtime::serve_gc_request` (the `erlang:garbage_collect/0,1` request, see the crate node): the `Yield` arm serves it when the slice ended with a dead FR prefix (`fr_mark() == 0`, so no exemption was opened) and it is declined by the exemption when the prefix was live, while the `Wait` arm's request is declined by the parked-window exemption.
 The runner's raise arm likewise copies the recorded exit reason through
 `Runtime::try_stabilize_escaped_with` — with the copy's `SourcePayloads` built by
 `Runtime::source_payloads` (the **same machine's** `refc_binaries()` unioned with the whole off-heap
@@ -283,7 +287,8 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
   (the `jit_mode` field and the `jit_mode()` accessor).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`, whose `fr_count`
-  argument is the live prefix `Machine::fr_mark()` — the value that also pins the process), the
+  argument is the live prefix `Machine::fr_mark()` — the value that also opens the inter-slice window's
+  relocation exemption), the
   return-value / exit-reason stabilization (whose `SourcePayloads` come from
   `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
   off-heap families).

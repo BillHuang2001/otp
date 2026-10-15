@@ -6368,11 +6368,19 @@ fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
     }
 }
 
-/// **The residual blocker for a float-using long loop is the runner's permanent post-slice
-/// float pin** (`src/runner/run.rs`): a slice that ends with a live FR slot calls
-/// `Runtime::pin_process(pid)` and `Runtime::gc_process_enabled` then refuses **every** later
-/// collection for that pid, so a long loop collects only inside its first slice and its
-/// nursery keeps every space it ever allocated.
+/// **A float-using long loop collects like a float-free one: the post-slice float-register
+/// reaction is scoped to the inter-slice window, never a permanent pin** (`src/runner/run.rs`).
+///
+/// **Regression pin for the removed `post_slice_float_pin` plateau** — the name describes the
+/// defect this case rules out, and the assertions below now pin the fixed behaviour.
+///
+/// The reaction used to be `Runtime::pin_process(pid)` — a **permanent** runtime-level pin — so the
+/// first slice that ended with a live FR slot made `Runtime::gc_process_enabled` answer `false` for
+/// the rest of the process's life: a float-using loop collected only inside its first slice, its
+/// nursery kept every space it ever allocated, and its `collections` **plateaued** however large the
+/// loop got. It is now a **per-slice relocation exemption** — opened at the slice's end when the FR
+/// prefix is live, cleared by the next slice entry — so the process collects again at its own
+/// heap-admission points and `Runtime::gc_stats().pinned` stays **0**.
 ///
 /// This case is the **deterministic** half of the A/B experiment (no RSS involved): the same
 /// three `ets_copy` allocate-and-abandon loops, differing only in the payload's `b` value, are
@@ -6380,19 +6388,24 @@ fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
 /// [`Runtime::gc_stats`] counters compared.
 ///
 /// * `gcab_free` — float-free (`X`).
-/// * `gcab_lit`  — the objective's intended "float-using" twin: `gcab_free` verbatim **plus a
-///   single `3.5` float literal** in the payload. It is **not** float-using in the IR: the
-///   compiler folds a data-structure float literal into the **literal area**
-///   (`{move,{literal,#{...3.5...}},{x,0}}`), so the module contains no float-family
-///   instruction, never writes the FR file, and is never pinned. Its row is the empirical
+/// * `gcab_lit`  — `gcab_free` verbatim **plus a single `3.5` float literal** in the payload. It is
+///   **not** float-using in the IR: the compiler folds a data-structure float literal into the
+///   **literal area** (`{move,{literal,#{...3.5...}},{x,0}}`), so the module contains no float-family
+///   instruction, never writes the FR file, and never opens the exemption. Its row is the empirical
 ///   refutation of "any module with a float literal writes FR slot 0".
-/// * `gcab_flt`  — genuinely float-using: the payload computes `float(X) * 3.5`, so the module
-///   contains `fconv`/`fmul` instructions and every slice ends with `fr_mark() > 0`.
+/// * `gcab_flt`  — genuinely float-using: the payload computes `math:sqrt(float(X))`, so the module
+///   contains `fconv`/`fmul` instructions and its slices end with `fr_mark() > 0`. The float
+///   expression is deliberately **literal-free** (`math:sqrt(float(X))`, *not* `float(X) * 3.5`):
+///   a float **operation** writes the FR file, whereas a float **literal** is folded into the
+///   literal area and — while still live in a register at a `test_heap` call site — is an
+///   **untagged** literal-area root that trips the unscanned-root valve and declines *every*
+///   collection for an unrelated, already-escalated reason
+///   (`an_untagged_literal_root_declines_the_collection_until_the_loader_tags_literals`). That
+///   confound would mask the FR reaction this experiment is about, so the row must not carry it.
 ///
-/// The float-free loops' `collections` therefore **scale with N** and their `pinned` is 0,
-/// while the float-using loop's `collections` **plateaus** — its ~8x larger run adds no
-/// collection at all — with `pinned >= 1`. That plateau is exactly why a float-using
-/// allocation loop retains every replaced heap space and its peak RSS grows with N.
+/// All three rows now **scale with N and pin nothing**: `pinned` is 0 everywhere and each larger
+/// run collects strictly more than its smaller twin — the float-using row included, which is the
+/// property the old permanent pin destroyed.
 ///
 /// A missing `erlc` is a **loud skip**, never a silent pass; the fixtures are compiled from
 /// these in-file sources into `$TMPDIR` (nothing is committed under `tests/fixtures/`).
@@ -6404,7 +6417,7 @@ fn the_post_slice_float_pin_plateaus_a_float_using_loops_collections() {
     };
     let src_a = gc_ab_module("gcab_free", "X", "");
     let src_b = gc_ab_module("gcab_lit", "X", ",\n      f => 3.5");
-    let src_c = gc_ab_module("gcab_flt", "float(X) * 3.5", "");
+    let src_c = gc_ab_module("gcab_flt", "math:sqrt(float(X))", "");
     let dir = compile_fixtures(
         &erlc,
         "gc_ab",
@@ -6415,8 +6428,8 @@ fn the_post_slice_float_pin_plateaus_a_float_using_loops_collections() {
         ],
     );
 
-    // ~8x apart: a float-free loop's collection count scales over the step; a pinned one's
-    // cannot move at all, so the two counts are the same measurement twice.
+    // ~8x apart: every row's collection count must scale over the step. A permanently pinned
+    // float-using loop's could not move at all — the two counts were the same measurement twice.
     const SMALL: i64 = 5_000;
     const LARGE: i64 = 40_000;
 
@@ -6498,33 +6511,33 @@ fn the_post_slice_float_pin_plateaus_a_float_using_loops_collections() {
         b_large.stats.collections
     );
 
-    // C — genuinely float-using: PINNED after its first slice, so its collections PLATEAU.
-    assert!(
-        c_small.stats.pinned >= 1,
-        "the post-slice float-register scan must pin a float-using pid; {:?}",
+    // C — genuinely float-using: the module contains float-family instructions (`fconv`/`fmul`),
+    // and the post-slice reaction is a **per-slice** window exemption (never a permanent pin), so
+    // the row is never pinned and its collections SCALE with N exactly like the float-free rows.
+    // The row that discriminates the *pin* itself is the committed `gc_floats` control below: this
+    // compiled row's float arithmetic completes inside its slices, so it was never pinned even
+    // under the old reaction (`pinned` reads 0 there too).
+    assert_eq!(
+        c_small.stats.pinned, 0,
+        "the float-using loop's post-slice reaction is a per-slice window exemption, never a \
+         permanent pin; {:?}",
         c_small.stats
     );
-    assert_eq!(
-        c_large.stats.collections, c_small.stats.collections,
-        "a pinned pid is refused every collection, so its collections are exactly the first \
-         slice's and cannot scale with N ({SMALL} -> {}, {LARGE} -> {}); {:?}",
-        c_small.stats.collections,
-        c_large.stats.collections,
-        c_large.stats
-    );
     assert!(
-        a_large.stats.collections > c_large.stats.collections,
-        "at the large N the float-free loop must have collected more times than the pinned \
-         float-using one (float-free {}, float-using {})",
-        a_large.stats.collections,
+        c_large.stats.collections > c_small.stats.collections * 4,
+        "the float-using loop must collect MORE as N grows — a permanent pin would plateau it \
+         ({SMALL} -> {}, {LARGE} -> {})",
+        c_small.stats.collections,
         c_large.stats.collections
     );
 
     // The committed float-arithmetic fixture (`tests/fixtures/gc_floats.beam`, `l1/1`
-    // accumulates `math:sqrt(float(N))` in one double) is the **plateau** control: its
-    // collections must be non-zero (its first slice really collected) and then *identical* at
-    // the ~8x larger N, because the pin refuses every later slice. That is the shape the
-    // benchmark's `gc_floats`/`churn` RSS readings could not improve on.
+    // accumulates `math:sqrt(float(N))` in one double) is the control for the committed image —
+    // and the row that actually exercises the post-slice FR reaction: its slices end with a live
+    // FR prefix, so under the old permanent pin it was pinned on **both** runs with *identical*
+    // collections at the ~8x larger N — the plateau this case is named after, and the state this
+    // test fails in should the permanent pin ever return. Scoped to the inter-slice window, it is
+    // never pinned and its collections grow instead.
     let f_small = gc_ab_run(std::path::Path::new(GC_FLOATS_BEAM), "l1", SMALL);
     let f_large = gc_ab_run(std::path::Path::new(GC_FLOATS_BEAM), "l1", LARGE);
     eprintln!(
@@ -6535,13 +6548,14 @@ fn the_post_slice_float_pin_plateaus_a_float_using_loops_collections() {
         f_large.stats.collections,
         f_large.stats.pinned
     );
-    assert!(
-        f_small.stats.pinned >= 1 && f_large.stats.pinned >= 1,
-        "the float-arithmetic fixture pins its pid on both runs"
-    );
     assert_eq!(
-        f_large.stats.collections, f_small.stats.collections,
-        "a pinned pid's collections plateau: the first slice's count and nothing more \
+        f_small.stats.pinned, 0,
+        "a float-using pid is never pinned — the inter-slice window is the whole reaction"
+    );
+    assert_eq!(f_large.stats.pinned, 0, "and the ~8x larger run pins nothing either");
+    assert!(
+        f_large.stats.collections > f_small.stats.collections,
+        "a float-using loop's collections must grow with N, not plateau on a pin \
          ({SMALL} -> {}, {LARGE} -> {})",
         f_small.stats.collections,
         f_large.stats.collections
@@ -6549,16 +6563,16 @@ fn the_post_slice_float_pin_plateaus_a_float_using_loops_collections() {
 }
 
 /// **A live float term in the FR file is a SCANNED root, so this node's unscanned-root valve
-/// does not decline it — a float module's zero-collection plateau is the runner's *pin*.**
+/// does not decline it.**
 ///
 /// The engine materialises an FR slot's float through
 /// [`beam_engine::terms::make_float`]/`make_float_rooted`, which allocates on the **executing
 /// process's own young heap** (this engine's FR model holds *terms*, not raw doubles), so the
 /// word the full door publishes from `fr[0]` is classified as a scanned root by
 /// [`root_is_unscanned`](super::gc::root_is_unscanned). The valve is therefore **not** what
-/// stops a float-using loop from collecting — the runner's permanent post-slice pin is checked
-/// *first* in both doors (`Runtime::gc_process_enabled`) and refuses the pid outright. This
-/// case proves the valve half directly, so the two independent mechanisms cannot be confused.
+/// would stop a float-using loop from collecting — a live FR is an ordinary scanned root at the
+/// full door's FR-safe root set. This case proves the valve half directly, so the valve and the
+/// runner's per-slice float-register reaction cannot be confused.
 #[test]
 fn a_live_float_term_in_fr_is_a_scanned_root() {
     let (mut rt, mut table, pid) = gc_root_set_rig();
