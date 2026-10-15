@@ -390,12 +390,11 @@ is **no self-hosted build** (the Rust runtime does not compile and run itself).
   `-eval` process has the live `kernel_sup`/`timer_server` tree — `timer:apply_after/4` is
   oracle-identical (`false`, exit 0). The differential case
   `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** (not in `tools/differential/known-gaps.txt`).
-- **Cross-node note (tools-owned):** the differential harness `tools/differential` passes `-noshell` to
-  the oracle but **not** to the Rust side (`corpus/mod.rs::rust_argv` emits `run <beam> <mfa>`), so on the
-  now-booting non-`Boot` routes the Rust banner leaks into stdout and the `Module`/`ModuleEnv` cases' stdout
-  no longer matches; the suite also boots per case (~2.2 s startup) so the full gate now exceeds ~14 min.
-  `beam_rt -noshell run <beam> <mfa>` prints no banner and matches the oracle's `-noshell` output exactly,
-  so the one-line fix is on the `tools/` side. Reported to the parent (root-owned).
+- **Cross-node note (tools-owned):** `tools/differential` passes `-noshell` to the oracle but not to the
+  Rust side (`corpus/mod.rs::rust_argv` emits `run <beam> <mfa>`); that is harmless today because
+  `beam_rt <action> run <beam> <mfa>` prints no banner, so its stdout matches the oracle's `-noshell`
+  output exactly. Each case boots (~2.2 s startup), so the full gate exceeds ~14 min — prefer
+  `differential run <case-id>` while iterating.
 - **Remaining A.9 gaps (fidelity, not boot-completion):**
   1. **No self-hosted build.** The Rust runtime does not compile/run itself; the compiler bootstrap
      (Stage 2, `../lib/compiler`) is not wired into `beam_rt`.
