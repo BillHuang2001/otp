@@ -6040,6 +6040,66 @@ fn an_escaping_arm_does_not_rewind_a_partially_used_pool() {
     );
 }
 
+/// **A table-less context's pooled BIF region GROWS instead of exhausting.**
+///
+/// The `-eval`/single-pass route has no scheduled process to move a container result onto
+/// ([`RuntimeContext::move_result_into_process_heap`] answers `None` with no `mailbox_table`), so
+/// the pool is never rewound there: every container a registered BIF builds stays on the region it
+/// was built on for the run's whole life. Without a growth path the bump pointer marches to that
+/// region's fixed capacity and the next allocation becomes `error:system_limit` — the reason the
+/// installed compiler could not compile `string.erl` in-process.
+///
+/// The case drives the table-less shape with a deliberately tiny configured region
+/// ([`RuntimeConfig::with_heap_words`], floored at `MIN_HEAP_WORDS`) and pins both halves:
+/// **every** call returns its container, and the pool really **grew** — an exhausted region
+/// retired beside a wider frontier, with the retired region's live words intact.
+#[test]
+fn a_table_less_context_grows_its_pooled_bif_region_instead_of_exhausting_it() {
+    let mut rt = Runtime::new(RuntimeConfig::new().with_heap_words(1024))
+        .expect("a runtime with a tiny term-construction region");
+    let configured = rt.bif_heap_words;
+    assert_eq!(
+        configured, 1024,
+        "the configured region, floored at MIN_HEAP_WORDS"
+    );
+
+    // `erlang:make_tuple/2` builds a container on the pooled region from immediates alone, so
+    // nothing else has to hold it: 101 words per call over a 1024-word region with a
+    // `capacity()/16` (64-word) headroom threshold is what forces the retirement.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        for round in 0..20 {
+            let tuple = ctx
+                .call_bif("erlang", "make_tuple", 2, &[make_small(100), make_small(0)])
+                .unwrap_or_else(|e| panic!("round {round}: make_tuple(100, 0) must succeed: {e}"));
+            assert_eq!(
+                terms::tuple_arity(tuple).expect("the BIF built a tuple"),
+                100,
+                "round {round}: every call must still return its container"
+            );
+        }
+    }
+
+    let regions: Vec<(usize, usize)> = rt
+        .bif_heaps
+        .iter()
+        .map(|heap| (heap.capacity(), heap.used()))
+        .collect();
+    assert!(
+        rt.bif_heaps.len() > 1,
+        "the exhausted region must be RETIRED and a fresh one added — never rewound, never \
+         relocated: {regions:?}"
+    );
+    assert!(
+        rt.bif_heaps.iter().any(|heap| heap.capacity() > configured),
+        "the new frontier must be wider than the configured region: {regions:?}"
+    );
+    assert!(
+        rt.bif_heaps.iter().any(|heap| heap.used() > 0),
+        "the retired region keeps the words its callers still own: {regions:?}"
+    );
+}
+
 /// **Item #10b — the collection the valve used to decline now RUNS.**
 ///
 /// The same rig as the hole-2 guard

@@ -62,6 +62,7 @@
 use std::rc::Rc;
 
 use beam_abi::nif::loader::NifCallError;
+use beam_alloc::Heap;
 use beam_bifs::{BifContext, BifFn};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessTable;
@@ -82,7 +83,85 @@ use super::process_bridge::ProcessBridge;
 use super::runtime_context::RuntimeContext;
 use super::runtime_hooks::RuntimeHooksBridge;
 
+/// How much free room a pooled BIF heap must still have for a call to use it as its allocation
+/// frontier: less than `capacity() / BIF_HEAP_GROWTH_DIVISOR` free words is "nearly exhausted" and
+/// [`RuntimeContext::take_bif_frontier`] retires the region instead.
+///
+/// The threshold is deliberately a *fraction of the capacity* rather than a word count, so the
+/// same policy applies to the default region and to every region a growth step produced. It also
+/// makes the check a single compare on the hot path — the pool is taken on **every** registered
+/// call.
+const BIF_HEAP_GROWTH_DIVISOR: usize = 16;
+
 impl<'a> RuntimeContext<'a> {
+    /// Takes the pooled BIF heap this call allocates on, **growing the frontier** when the region
+    /// it hands back is (nearly) exhausted.
+    ///
+    /// # Why the pool needs a growth path
+    ///
+    /// A registered BIF's container result is moved onto the running process's own young heap and
+    /// the pooled region is then rewound to this call's `mark` — but only when that rewind is both
+    /// **safe** and **complete**, and the copy-out requires a scheduled process
+    /// ([`Self::move_result_into_process_heap`] answers `None` without a `mailbox_table`). On the
+    /// **table-less** route — the `-eval` evaluator and every single-pass nested run — there is no
+    /// process heap to move a container onto, so nothing rewinds the pool: every container a BIF
+    /// builds stays on the same [`beam_alloc::Heap`] for the run's whole life, the bump pointer
+    /// marches to that region's fixed capacity, and the next allocation there is
+    /// [`AllocKind::Heap`](beam_common::AllocKind) — which
+    /// [`error::enforce_term_heap_limit`] renders as `error:system_limit`. A long in-process
+    /// workload (the installed compiler is the load-bearing one) therefore used to stop for a
+    /// reason unrelated to its live set.
+    ///
+    /// # Retirement, never relocation
+    ///
+    /// Growth is by **region replacement**, exactly as the collector's own growth is: the
+    /// exhausted region goes back to the pool ([`Runtime::put_bif_heap`]) and a fresh, larger one
+    /// becomes this call's frontier. A [`beam_alloc::Heap`] never moves its terms and is never
+    /// freed here, so every word a caller still owns stays valid and at its own address — the
+    /// retired region leaves only the *allocation* rotation. Nothing is retried either: the growth
+    /// happens **before** the call's own work, so the BIF runs exactly once and no side effect can
+    /// be repeated.
+    ///
+    /// # The cap
+    ///
+    /// The new frontier is the old capacity doubled ([`usize::saturating_mul`]), never below
+    /// [`Runtime::bif_heap_words`], and capped by a configured `+hmax`
+    /// ([`crate::config::RuntimeConfig::heap_options`]'s
+    /// [`policy`](crate::config::HeapOptions::policy) `max_heap_words`; `0` is "no cap"). When the
+    /// cap leaves no room (`computed <= capacity()`) the heap is returned **as it is**, so an
+    /// explicit `+hmax` still yields today's `error:system_limit` — a configured limit is never
+    /// widened.
+    ///
+    /// A **nested** call may be handed a region an outer call retired; the same check applies
+    /// there and is safe (the region is never rewound below the words another caller owns: the
+    /// callers' own `mark = used()` rule takes care of that).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the fresh region's allocation failure — raised **before** the BIF has run, so no
+    /// side effect is repeated and no result is fabricated.
+    fn take_bif_frontier(&mut self) -> Result<Heap> {
+        let heap = self.runtime.take_bif_heap()?;
+        if heap.available() >= heap.capacity() / BIF_HEAP_GROWTH_DIVISOR {
+            return Ok(heap);
+        }
+        let doubled = heap
+            .capacity()
+            .saturating_mul(2)
+            .max(self.runtime.bif_heap_words);
+        let max = self.runtime.config().heap_options().policy().max_heap_words;
+        let grown = if max == 0 { doubled } else { doubled.min(max) };
+        if grown <= heap.capacity() {
+            // A configured `+hmax` forbids the growth: keep today's region and today's
+            // `system_limit` for a call that really overflows it.
+            return Ok(heap);
+        }
+        // Retire the exhausted region — never freed, never moved, so the words another caller owns
+        // in it stay valid — and continue the run in a fresh, larger frontier.
+        self.runtime.put_bif_heap(heap);
+        Heap::new(grown)
+    }
+
     /// Dispatches a `beam_bifs`-registered BIF over a [`BifContext`] built from the
     /// runtime's shared state and this context's output sink.
     ///
@@ -145,7 +224,10 @@ impl<'a> RuntimeContext<'a> {
         let atoms = self.runtime.code_server.atoms_handle();
         let tables_handle = Rc::clone(&self.runtime.tables);
         let ports_handle = Rc::clone(&self.runtime.ports);
-        let mut heap = self.runtime.take_bif_heap()?;
+        // The allocation frontier for this call, grown when the pooled region is nearly exhausted
+        // (see [`Self::take_bif_frontier`]). A freshly grown region starts empty, so `mark` read
+        // *after* the helper is this call's true start offset either way.
+        let mut heap = self.take_bif_frontier()?;
         // The offset at which **this** call starts on the pooled heap — the boundary between the
         // words another caller owns and the words this call hands out. The pool is shared: a heap
         // is popped here and pushed back by every other caller too (the native floor's
@@ -856,7 +938,10 @@ impl<'a> RuntimeContext<'a> {
         }
         let atoms = self.runtime.code_server.atoms_handle();
         let mut interner = PendingInterner::new(atoms.len());
-        let heap = self.runtime.take_bif_heap()?;
+        // A NIF result is never copied off the pool (see the method docs), so this route grows the
+        // frontier but never rewinds it: [`Self::take_bif_frontier`] is what keeps a long table-less
+        // run from marching one region to its capacity.
+        let heap = self.take_bif_frontier()?;
         let self_pid = self.mailbox_pid.to_eterm();
         let schedulers = crate::info::schedulers_count(self.runtime) as i32;
         // Clone the registry `Rc` so the call itself does not borrow `self.runtime` — the borrow
