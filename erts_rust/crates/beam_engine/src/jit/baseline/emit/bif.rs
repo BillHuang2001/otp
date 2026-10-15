@@ -59,7 +59,7 @@ use crate::jit::emitter::{CodeBuffer, Label as CodeLabel};
 use super::aggregate::{self, ListShape, TupleReadShape};
 use super::arith::import_names;
 use super::operands::{constant_word, Loc, Y_ADDR_SCRATCH};
-use super::runtime::StepHelper;
+use super::super::runtime::StepHelper;
 use super::{
     emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, MOVE_SCRATCH,
     MOVE_SCRATCH_2,

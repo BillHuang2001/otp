@@ -54,7 +54,7 @@
 
 #![allow(unsafe_code)]
 
-use beam_loader::{Instr, Module, Operand};
+use beam_loader::{ImportRef, Instr, Module, Operand};
 use beam_term::{
     bitstring_size, cdr, is_bitstring, is_list, is_nil, make_small, Eterm, MAX_SMALL,
 };
@@ -63,10 +63,22 @@ use crate::context::ExecutionContext;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
 
-use super::emit::import_names;
 use super::encode_target;
 use super::jit_step_one;
 use super::runtime::JitRuntime;
+
+/// The `(module name, function name, arity)` an import index names, resolved through the
+/// running module's own load-time atom table — the same dispatch key
+/// `super::emit::arith::import_names` (and so `super::emit::bif::classify`) uses.
+///
+/// Local rather than shared because `emit`'s helper is `pub(in emit)`; the lookup is the
+/// three-line `Module` read the seam is, not a behaviour.
+fn import_names(module: &Module, target: ImportRef) -> Option<(&str, &str, u32)> {
+    let import = module.imports.get(target.0 as usize)?;
+    let module_name = module.atom_name(import.module)?;
+    let function_name = module.atom_name(import.function)?;
+    Some((module_name, function_name, import.arity))
+}
 
 /// Evaluate the `erlang:byte_size/1` or `erlang:length/1` at `(func, pc)` natively, or
 /// run the interpreter's own step for it.
