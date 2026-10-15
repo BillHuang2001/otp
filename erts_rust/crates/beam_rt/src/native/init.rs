@@ -424,38 +424,28 @@ impl RuntimeContext<'_> {
         terms::make_tuple(self, &[name, vsn])
     }
 
-    /// `init:fetch_loaded/0`: `[{Module, File}]` for the modules the **boot script** loaded
-    /// and handed over to the code server (contract A.7).
+    /// `init:fetch_loaded/0`: the modules the boot script loaded **and the code server has
+    /// not yet consumed** — always `[]` here (contract A.7).
     ///
-    /// The oracle's `init` process answers this from the `loaded` list it accumulates while
-    /// running the script's `{primLoad, …}` batches and `{ensure_loaded, Module}` requests,
-    /// then clears it (`init.erl:456-458,720-722`) — `code_server:init/3` is its only
-    /// consumer (`lib/kernel/src/code_server.erl:100`), which seeds `?moddb` from it. This
-    /// runtime has no live `init` process (the floor *is* the module — see the module docs),
-    /// so the answer is the boot script's own loading record: every module in the code
-    /// server's cache **except** the 22 preloaded ones, which the oracle keeps in
-    /// `erlang:pre_loaded/0` rather than in `Loaded`, paired with the file it was loaded
-    /// from. A cached module with no recorded source file is not part of that load set and
-    /// is omitted — never paired with a fabricated path.
+    /// The oracle's `init` process accumulates a `loaded` list while it runs the script's
+    /// `{primLoad, …}` batches and `{ensure_loaded, Module}` requests, and clears it the
+    /// moment `code_server:init/3` — its only consumer (`lib/kernel/src/code_server.erl:100`,
+    /// which seeds `?moddb` from it) — fetches it (`init.erl:720-722`, the `{From,fetch_loaded}`
+    /// arm of `boot_loop`: *"Fetch and reset initially loaded modules"*). Every **post-boot**
+    /// fetch therefore answers `[]` (`init.erl:792-795`, the main `loop`'s arm), whatever the
+    /// module set: `code:ensure_loaded/1`, a `-pa` directory and a later `code:load_file/1`
+    /// all go to the code server and never re-enter `init`'s list. Verified against the system
+    /// oracle for the plain, `-pa`-extended and post-`ensure_loaded` cases.
+    ///
+    /// This runtime has no live `init` process (the floor *is* the module — see the module
+    /// docs) and, unlike the oracle's two-step boot, its boot drive hands each `{primLoad, …}`
+    /// module straight to the code server's cache: the consumption `code_server:init/3`
+    /// performs on the oracle is folded into the boot path, so no unconsumed record is ever
+    /// held and the residual this BIF reports is empty — exactly the oracle's post-boot value.
+    /// The code server's own database is a *different* surface, `code:all_loaded/0`, and must
+    /// never be reported here.
     pub(super) fn fetch_loaded(&mut self) -> Result<Eterm> {
-        let mut entries = Vec::new();
-        for name in self.runtime.loaded_modules() {
-            if self.runtime.is_preloaded_loaded(&name) {
-                continue;
-            }
-            let Some(path) = self
-                .runtime
-                .code_server
-                .loaded_path(&name)
-                .map(|path| path.to_string_lossy().into_owned())
-            else {
-                continue;
-            };
-            let module = self.atom(&name)?;
-            let file = self.charlist(&path)?;
-            entries.push(terms::make_tuple(self, &[module, file])?);
-        }
-        terms::make_list(self, &entries)
+        Ok(beam_term::NIL)
     }
 }
 
