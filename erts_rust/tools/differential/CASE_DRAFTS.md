@@ -2,16 +2,33 @@
 
 **Recipes, promotions, corrections.** Each numbered section carries a one-line **Status:** and
 either a ready-to-add `Case` literal for the conformance corpus (`src/corpus/*.rs`) or a
-correction saying why no case is possible. A recipe is added only **after** the owning crate
-closes the gap it names, then `known-gaps.txt`/`GAPS.md` are refreshed in the same change (see
-`../CONTEXT.md` §"Notes for Agents").
+correction saying why no case is possible. A recipe whose gap the owning crate has already closed
+lands in `src/corpus/**`, and `known-gaps.txt`/`GAPS.md` are refreshed in the same change (see
+`../CONTEXT.md` §"Notes for Agents"). A recipe for a gap that is still **open but closable** (the
+shape of §8) stays drafted here and deliberately **not** in `known-gaps.txt` — the allowlist records
+only genuinely unclosable gaps, and recording a closable one would defeat the ratchet.
 
-At a glance: **§1**, **§2**, **§4b**, **§4c**, **§5a**, **§5b** and **§6** are now **landed** — every
+At a glance: **§1**, **§2**, **§4b**, **§4c**, **§5a**, **§5b** and **§6** are **landed** — every
 one agrees in `beam_rt` and is pinned by the `src/corpus/**` groups (`zlib.rs`, `bifs.rs`,
 `system_info.rs`, `flags.rs`, `flags_apply.rs`); **§3** and **§7** record items that were named as
-gaps but are not gaps at all. The only remaining zlib divergences are **§4a** (the repetitive-body
-wrapped size form) and **§4**'s large-body image-choice (the 100-byte raw-DEFLATE `zip/1` stream),
-both unpinnable and recorded in `divergences.md`, not drafts.
+gaps but are not gaps at all; **§8** records the one open, *closable* capability gap (a compiled
+local fun's `erlang:fun_info/1`) together with its ready recipe. The only remaining zlib divergences
+are **§4a** (the repetitive-body wrapped size form) and **§4**'s large-body image-choice (the
+100-byte raw-DEFLATE `zip/1` stream), both unpinnable and recorded in `divergences.md`, not drafts.
+
+Three coverage facts worth knowing while reading §8: the synthesized callee-head `undef` stacktrace
+head item `{Module,Function,ArgList,Location}` is pinned on **both** routes — the `-eval` form
+(`errors/undef_head_item_arg_list_from_apply`, `errors/undef_head_item_shape_from_apply`,
+`errors/undef_head_item_arg_list_from_call_ext`) and compiled code through the three-argument
+`try C:R:St ->` form (`modules/undef_head_item_shape_in_compiled_code`,
+`modules/undef_head_item_identity_in_compiled_code`); `erlang:fun_info/1` is pinned for **external**
+funs (the five-key proplist, `modules/fun_info_external_fun_created_in_compiled_code`, plus the
+`fun_info/external_fun_info_{length,keys}` A.8 cases) while the **local**-fun part is the blocked
+§8; and the `-boot start` route carries four independent boot-completion observations
+(`boot/kernel_processes_registered_under_boot_flag` plus the three `BOOT_COMPLETION_CASES` in
+`src/corpus/boot_prereq.rs`: `boot/init_get_status_boot_progress_is_started_under_boot_flag`,
+`boot/which_applications_includes_kernel_and_stdlib_under_boot_flag`,
+`boot/kernel_sup_children_are_live_under_boot_flag`).
 
 This file is a hand-maintained companion to the generated `GAPS.md` and the hand-written
 `divergences.md`: `divergences.md` records divergences that are **unpinnable**, this file records
@@ -54,6 +71,8 @@ exit `0`.
 * A runtime that signals the gap through its documented convention — exit `3` with
   `beam_rt: unsupported: …`, or a probe-caught `exception … unsupported: …` — is an `unsupported`
   capability gap. The four `process_info/2` position items in §5b were this shape before they landed.
+  §8 is this shape while it stays open: a *closable* gap that is drafted here and deliberately not
+  allowlisted.
 
 ---
 
@@ -406,13 +425,13 @@ of them. (The three `nif_abi/*` ids are current in `src/corpus/nif_abi.rs`.)
 
 | named item | finding | owner |
 |---|---|---|
-| `timer:now_diff/2` | **agrees** — a case could be ADDED (§2), not a gap | — |
+| `timer:now_diff/2` | **agrees** — pinned as `bifs/timer_now_diff_of_two_timestamps` (§2), not a gap | — |
 | `string:concat/1` | `undef` on the **oracle too** — not a usable case; `string:concat/2` and `lists:concat/1` agree (§3) | — |
 | `enif_atom_len` | **not a NIF C ABI symbol at all** — absent from `erl_nif.h` *and* `erl_nif_api_funcs.h` (oracle **and** in-tree `erts/emulator/beam/erl_nif.h`); nothing to export, so no case is possible | — |
 | `enif_make_ref` / `enif_term_to_binary` / `enif_binary_to_term` | declared **and** exported by `beam_rt`; **already closed** — each is covered by an agreeing `nif_abi/*` case (`ref_make_ref_is_a_ref`, `term_to_binary_valid_term`, `binary_to_term_valid_encoding`) | — |
 | `process_info/1` gc key set | the `garbage_collection` proplist has the **same 5 keys** in both runtimes (only volatile values differ) (§5c) | — |
 | `process_info/2` `registered_name`/`links`/`trap_exit` | **agree on a spawned process** (§5a); only the `self()` boot shape diverges | — |
-| `catchlevel` | a genuine typed `unsupported` on the `-eval`/fun-bodied process, **not** a value mismatch (§5b) | `beam_rt` |
+| `catchlevel` | **agrees** — a plain key-atom observation, pinned as `system_info/process_info_catchlevel` (§5b); not a value mismatch | — |
 
 ### The A.3 `enif_*` completeness check (why there is no missing-symbol gap)
 
@@ -432,3 +451,96 @@ comm -23 "$TMPDIR/api.txt" "$TMPDIR/rt.txt"   # empty: 137/137 declared enif_* a
 A NIF `.so` may therefore reference any declared `enif_*` without risking a `{error,{load_failed,…}}`
 on the Rust side; when an owning crate ever *does* stop exporting one, the missing symbol shows up
 as a non-empty `comm` above and must be added back before a NIF case can pin it.
+
+## 8. `erlang:fun_info/1` of a **local** fun — owner `beam_bifs` + `beam_rt`
+
+**Status:** `open` — an honest capability gap (`beam_rt: unsupported: bif`, exit 3) that is
+**closable**, with the ready recipe below; deliberately **not** in `known-gaps.txt` (the allowlist
+records only genuinely unclosable gaps, and recording a closable one would defeat the ratchet).
+
+Measured on the **module-run** route with a compiled `fun(X) -> X + 1 end` (an `-eval` lambda is an
+`erl_eval` fun — different `name`, an `erl_eval` `env` — so it is a different surface):
+
+| form | oracle (OTP 29.1.1 / erts-17.1) | `beam_rt` |
+|---|---|---|
+| `erlang:fun_info(F)` | the whole 10-key list (below) | `beam_rt: unsupported: bif`, exit 3 |
+| `erlang:fun_info(F, module)` | `{module,<the case module>}` | `beam_rt: unsupported: bif`, exit 3 |
+| `erlang:fun_info(F, arity)` / `(F, type)` / `(F, env)` | `{arity,1}` / `{type,local}` / `{env,[]}` | **agree** |
+| `erlang:fun_info(F, function)` | `badarg` (see *The `function` field* below) | — |
+
+The oracle's whole-list walk is the 10-key list `[arity,env,index,module,name,new_index,new_uniq,pid,type,uniq]`
+(key set) with `arity=1`, `type=local`, `module=<the case module>` and `env=[]`. The oracle emits
+those keys in the order `[pid,module,new_index,new_uniq,index,uniq,name,arity,env,type]`, and the
+values are heterogeneous — `index`/`uniq`/`new_index` are integers, `new_uniq` is a 16-byte binary,
+`name` is the enclosing function's lambda atom (`'-go/0-fun-0-'` style) and `pid` is the **creating**
+process — so a pinned golden must `lists:sort` the keys (the `modules.rs` `external_fun_info/0`
+pattern) rather than compare the walk position-by-position.
+
+Why it is **closable**, not unclosable: the whole-list walk needs the local-fun identity seam
+(`BifContext::with_local_fun_identity`, which `beam_rt` does not install) plus the lambda name from
+the loaded module's **fun table**. Owners: **`beam_bifs`** (the seam items) and **`beam_rt`**
+(installing the seam, the fun-table lookup, and the creating-process `pid` item). The
+`arity`/`type`/`env` items need none of that, which is why they agree.
+
+### 8a. Ready recipe — module-run, `modules.rs` integer-golden style
+
+An embedded `erlc`-compiled module (a `DIFF_TRACE_SOURCE`-style source, module name free because the
+probe uses `?MODULE`) reduced to boolean-mask integers so the golden is host- and path-independent:
+
+```erlang
+walk() ->
+    F = fun(X) -> X + 1 end,
+    I = erlang:fun_info(F),
+    Keys = lists:sort([K || {K,_} <- I]),
+    bool2int(Keys =:= [arity, env, index, module, name, new_index, new_uniq, pid, type, uniq])
+        + 2 * bool2int(proplists:get_value(arity, I) =:= 1)
+        + 4 * bool2int(proplists:get_value(type, I) =:= local)
+        + 8 * bool2int(proplists:get_value(module, I) =:= ?MODULE)
+        + 16 * bool2int(proplists:get_value(env, I) =:= [])
+        + 32 * bool2int(is_integer(proplists:get_value(index, I)))
+        + 64 * bool2int(is_integer(proplists:get_value(uniq, I)))
+        + 128 * bool2int(is_integer(proplists:get_value(new_index, I)))
+        + 256 * bool2int(is_binary(proplists:get_value(new_uniq, I)))
+        + 512 * bool2int(is_pid(proplists:get_value(pid, I)))
+        + 1024 * bool2int(is_atom(proplists:get_value(name, I))).
+
+items() ->
+    F = fun(X) -> X + 1 end,
+    bool2int(erlang:fun_info(F, module) =:= {module, ?MODULE})
+        + 2 * bool2int(erlang:fun_info(F, arity) =:= {arity, 1})
+        + 4 * bool2int(erlang:fun_info(F, type) =:= {type, local})
+        + 8 * bool2int(erlang:fun_info(F, env) =:= {env, []}).
+
+arity_type_env() ->
+    F = fun(X) -> X + 1 end,
+    bool2int(erlang:fun_info(F, arity) =:= {arity, 1})
+        + 2 * bool2int(erlang:fun_info(F, type) =:= {type, local})
+        + 4 * bool2int(erlang:fun_info(F, env) =:= {env, []}).
+
+bool2int(true) -> 1;
+bool2int(false) -> 0.
+```
+
+In the corpus that is one `CaseKind::Module(ModuleRun { … module: "<the case module>",
+function: "walk", arity: 0, args: &[], nif: None })` with
+`golden: Golden { stdout: Some("2047"), exit_code: 0 }` (`items/0` ⇒ `"15"`;
+`arity_type_env/0`, the three already-agreeing items only, ⇒ `"7"`). The walk is the gap: it needs
+the seam, so it classifies as `unsupported` (the exit-`3` signal) rather than a `mismatch` — exactly
+the shape check §8 was written against.
+
+* Measured against the live oracle (system `erl`, OTP 29.1.1 / erts-17.1) and the current
+  `beam_rt`: oracle `walk/0` `2047`, `items/0` `15`, `arity_type_env/0` `7`, all exit
+  `0`; `beam_rt run <file.beam> <mod>:walk/0` prints `beam_rt: unsupported: bif` and exits `3` (same
+  for `items/0`), while `arity_type_env/0` prints `7`, exit `0`.
+* repro (both runtimes, module-run route; compile first with `erlc -o "$D" "$D/<mod>.erl"`):
+  ```sh
+  erl     -noshell -pa "$D" -eval 'io:format("~w~n",[<mod>:walk()]),halt().'
+  erts_rust/target/{release,debug}/beam_rt run "$D/<mod>.beam" <mod>:walk/0
+  ```
+
+### 8b. The `function` field — do not pin
+
+The installed OTP-29 oracle's `fun_info/1` key set for a **compiled local** fun does **not** include
+`function`: `erlang:fun_info(F, function)` raises `badarg` there (verified with the same compiled
+probe). The sibling `function`-field work must therefore never appear in a pinned whole-list form —
+an oracle-vs-golden drift that would surface as a `mismatch`.
