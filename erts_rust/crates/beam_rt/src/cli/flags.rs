@@ -727,18 +727,16 @@ mod tests {
         }
     }
 
-    /// `+K true|false`.
+    /// `+K [true|false]` — and, as the oracle does, **any** other value.
     ///
     /// The oracle does **not** validate this value at all (`erl +K bogus -noshell
-    /// -eval 'halt(0).'` exits 0 — `erl_check_io.c:2467` merely `get_arg`s it), so
-    /// rejecting anything else is `beam_rt`'s documented divergence.
+    /// -eval 'halt(0).'` exits 0 — `erl_check_io.c:2467` merely `get_arg`s it, verified
+    /// against OTP 29.1.1 / erts-17.1 for `true`, `false`, `bogus`, `TRUE`, `1`, ``),
+    /// so `parse_kernel_poll` accepts every value and preserves it verbatim.
     #[test]
-    fn kernel_poll_accepts_the_two_literals() {
-        for value in ["true", "false"] {
+    fn kernel_poll_accepts_any_value() {
+        for value in ["true", "false", "bogus", "TRUE", "", "1"] {
             assert!(parse_kernel_poll("+K", value).is_ok(), "{value:?}");
-        }
-        for value in ["bogus", "TRUE", "", "1"] {
-            assert!(parse_kernel_poll("+K", value).is_err(), "{value:?}");
         }
     }
 

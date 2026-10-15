@@ -288,3 +288,314 @@ fn run_keeps_an_atom_reason_a_bare_atom() {
     assert_eq!(message, "beam_rt: error undef\n", "{message}");
     assert!(!message.contains("<structured reason>"), "{message}");
 }
+
+// --- `-env` and the emulator-switch exit-code family -----------------------------------------
+
+/// Whether the oracle `erl` is runnable (`erl -version` prints the banner and exits 0).
+fn erl_available() -> bool {
+    Command::new("erl")
+        .arg("-version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Spawns `program` with `args` after stripping every inherited `ERL_*FLAGS` / dump variable
+/// and then applying `envs` — the same isolation both the built binary and the oracle need.
+fn spawn_env(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(program);
+    for name in [
+        "ERL_AFLAGS",
+        "ERL_FLAGS",
+        "ERL_ZFLAGS",
+        "ERL_CRASH_DUMP",
+        "ERL_CRASH_DUMP_SECONDS",
+        "ERL_MAX_PORTS",
+    ] {
+        command.env_remove(name);
+    }
+    command.env_remove(beam_rt::cli::otp_flags_var());
+    command.args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("spawning {program} {args:?} failed: {error}"))
+}
+
+/// `-env VAR VALUE` is applied to the **child's environment** by the `erl` launcher, before the
+/// emulator starts: `os:getenv/1` observes it, a repeated name keeps the last value, the first
+/// `=` splits the name (`-env A=B v` sets `A` to `B=v`, as `putenv` does), it is **not** an
+/// init argument, and — because it precedes the environment read — `ERL_MAX_PORTS` reaches
+/// `system_info(port_limit)`.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1), the answers this test pins:
+///
+/// ```text
+/// erl -env BEAM_RT_ENV_TEST hello -noshell -eval 'io:format("~s~n",[os:getenv("BEAM_RT_ENV_TEST")]),halt(0).' → hello
+/// erl -env K first -env K second  (the same probe, name K)  → second
+/// erl -env K=tail val             (the same probe, name K)  → tail=val
+/// erl -env FOO bar -noshell -eval 'io:format("~p~n",[init:get_argument(env)]),halt(0).'    → error
+/// erl -env ERL_MAX_PORTS 4096 -noshell -eval 'io:format("~p~n",[erlang:system_info(port_limit)]),halt(0).' → 4096
+/// ```
+#[test]
+fn env_switches_become_part_of_the_childs_environment() {
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "a single pair is visible to os:getenv/1",
+            &[
+                "-env",
+                "BEAM_RT_ENV_TEST",
+                "hello",
+                "-noshell",
+                "-eval",
+                "io:format(\"~s~n\",[os:getenv(\"BEAM_RT_ENV_TEST\")]),halt(0).",
+            ],
+            "hello\n",
+        ),
+        (
+            "a repeated name keeps the last value",
+            &[
+                "-env",
+                "BEAM_RT_ENV_TEST",
+                "first",
+                "-env",
+                "BEAM_RT_ENV_TEST",
+                "second",
+                "-noshell",
+                "-eval",
+                "io:format(\"~s~n\",[os:getenv(\"BEAM_RT_ENV_TEST\")]),halt(0).",
+            ],
+            "second\n",
+        ),
+        (
+            "the first `=` splits the name (as putenv does)",
+            &[
+                "-env",
+                "BEAM_RT_ENV_TEST=tail",
+                "val",
+                "-noshell",
+                "-eval",
+                "io:format(\"~s~n\",[os:getenv(\"BEAM_RT_ENV_TEST\")]),halt(0).",
+            ],
+            "tail=val\n",
+        ),
+        (
+            "`-env` is not an init argument",
+            &[
+                "-env",
+                "BEAM_RT_ENV_TEST",
+                "hello",
+                "-noshell",
+                "-eval",
+                "io:format(\"~p~n\",[init:get_argument(env)]),halt(0).",
+            ],
+            "error\n",
+        ),
+        (
+            "an applied ERL_MAX_PORTS reaches system_info(port_limit)",
+            &[
+                "-env",
+                "ERL_MAX_PORTS",
+                "4096",
+                "-noshell",
+                "-eval",
+                "io:format(\"~p~n\",[erlang:system_info(port_limit)]),halt(0).",
+            ],
+            "4096\n",
+        ),
+    ];
+    let oracle_available = erl_available();
+    if !oracle_available {
+        println!("SKIP cli: `erl` is not runnable — only the beam_rt half is pinned");
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for (description, args, expected) in cases {
+        let rust = spawn_env(env!("CARGO_BIN_EXE_beam_rt"), args, &[]);
+        if rust.status.code() != Some(0) {
+            failures.push(format!(
+                "{description}: beam_rt exited {:?} (stderr {})",
+                rust.status.code(),
+                stderr(&rust)
+            ));
+        }
+        if stdout(&rust) != *expected {
+            failures.push(format!(
+                "{description}: beam_rt printed {:?} != {expected:?}",
+                stdout(&rust)
+            ));
+        }
+        if oracle_available {
+            let oracle = spawn_env("erl", args, &[]);
+            if oracle.status.code() != Some(0) || stdout(&oracle) != *expected {
+                failures.push(format!(
+                    "{description}: the oracle exited {:?} printing {:?}",
+                    oracle.status.code(),
+                    stdout(&oracle)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A trailing `-env` (nothing at all, or a name with no value) is the **launcher**'s
+/// rejection: exit 1 with the one-line `beam_rt: Missing argument(s) for '-env'.` and **no**
+/// usage block. (The oracle's `erl` launcher prints its own short usage text after the same
+/// first line; this runtime reproduces only the diagnostic, like the `beam.smp` usage block.)
+#[test]
+fn a_trailing_env_switch_is_the_launchers_diagnostic() {
+    for args in [
+        &["-env"][..],
+        &["-env", "NAME"][..],
+        &["-noshell", "-env", "NAME"][..],
+    ] {
+        let output = spawn_env(env!("CARGO_BIN_EXE_beam_rt"), args, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: stderr {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            stderr(&output),
+            "beam_rt: Missing argument(s) for '-env'.\n",
+            "{args:?}"
+        );
+        assert!(!stderr(&output).contains("Usage:"), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// A rejected **emulator-switch value** exits **1** like the oracle's `beam.smp`: exactly one
+/// `beam_rt: bad value "…" for switch +X` line on stderr, no usage block, no stdout. This is
+/// the emulator's own rejection, never the CLI's usage status 2.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1) rejects every one of these with exit 1 (its own `bad …`
+/// diagnostic plus its usage text).
+#[test]
+fn a_rejected_emulator_switch_value_exits_one_with_no_usage() {
+    let rejected: &[&[&str]] = &[
+        &["+t", "2"],
+        &["+t", "1000"],
+        &["+t", "abc"],
+        &["+P", "0"],
+        &["+Q", "0"],
+        &["+hms", "0"],
+        &["+sbt", "zz"],
+        &["+e", "-1"],
+        &["+hmax", "-1"],
+        &["+hmaxk", "x"],
+        &["+S", "abc"],
+        &["+S", "4:5"],
+    ];
+    for args in rejected {
+        let mut full: Vec<&str> = args.to_vec();
+        full.extend(["-noshell", "-eval", "halt(0)."]);
+        let output = spawn_env(env!("CARGO_BIN_EXE_beam_rt"), &full, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: stderr {}",
+            stderr(&output)
+        );
+        let message = stderr(&output);
+        assert_eq!(
+            message.lines().count(),
+            1,
+            "{args:?}: exactly one stderr line: {message}"
+        );
+        assert!(
+            message.starts_with("beam_rt: bad value "),
+            "{args:?}: {message}"
+        );
+        assert!(
+            message.contains(&format!("for switch {}", args[0])),
+            "{args:?}: {message}"
+        );
+        assert!(!message.contains("Usage:"), "{args:?}: {message}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// A value the emulator's lax readers accept **runs the action** (exit 0, empty stderr, the
+/// action's own output): the `atoi`-based switches ignore trailing junk (`+hms 100abc` is
+/// 100, `+hmax abc`/`+A abc`/`+e x` are 0) and `+K`/`+B` never validate their value.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1): every one of these exits 0.
+#[test]
+fn an_ignored_emulator_switch_value_still_runs_the_action() {
+    let accepted: &[&[&str]] = &[
+        &["+hmax", "x"],
+        &["+hmax", "abc"],
+        &["+hms", "100abc"],
+        &["+A", "abc"],
+        &["+K", "x"],
+        &["+K", "bogus"],
+        &["+B", "x"],
+        &["+B", "foo"],
+        &["+e", "x"],
+    ];
+    for args in accepted {
+        let mut full: Vec<&str> = args.to_vec();
+        full.extend(["-noshell", "-eval", "io:format(\"ran~n\",[]),halt(0)."]);
+        let output = spawn_env(env!("CARGO_BIN_EXE_beam_rt"), &full, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: stderr {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), "ran\n", "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {}", stderr(&output));
+    }
+}
+
+/// A `-config` the boot cannot read reproduces the oracle's **stderr byte-for-byte** (`\r\n`
+/// endings included) and exits 1, and really writes the crash dump named by `ERL_CRASH_DUMP`:
+///
+/// ```text
+/// Could not start kernel pid (application_controller) ("error in config file \"<p>.config\" (none): configuration file not found")\r\n\r\nCrash dump is being written to: <dump>...done\r\n
+/// ```
+///
+/// The tree is hermetic: `ERL_CRASH_DUMP` points at a scratch file (removed on the way out),
+/// so neither runtime writes into the crate directory.
+#[test]
+fn a_missing_config_file_reproduces_the_oracles_stderr() {
+    let dir = std::env::temp_dir().join(format!("beam_rt_cli_config_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let absent = dir.join("beam_rt_absent");
+    let dump = dir.join("beam_rt_absent.dump");
+    let absent = absent.to_str().expect("a UTF-8 temp path").to_string();
+    let dump_path = dump.to_str().expect("a UTF-8 temp path").to_string();
+
+    let expected = format!(
+        "Could not start kernel pid (application_controller) \
+         (\"error in config file \\\"{absent}.config\\\" (none): configuration file not found\")\
+         \r\n\r\nCrash dump is being written to: {dump_path}...done\r\n"
+    );
+
+    let args = ["-noshell", "-config", absent.as_str(), "-eval", "ok"];
+    let envs = [("ERL_CRASH_DUMP", dump_path.as_str())];
+    let _ = std::fs::remove_file(&dump);
+    let rust = spawn_env(env!("CARGO_BIN_EXE_beam_rt"), &args, &envs);
+    assert_eq!(rust.status.code(), Some(1), "stderr {}", stderr(&rust));
+    assert!(rust.stdout.is_empty(), "stdout {}", stdout(&rust));
+    assert_eq!(stderr(&rust), expected, "beam_rt stderr");
+    assert!(
+        dump.is_file(),
+        "beam_rt must really write the crash dump at {dump_path}"
+    );
+
+    if erl_available() {
+        let _ = std::fs::remove_file(&dump);
+        let oracle = spawn_env("erl", &args, &envs);
+        assert_eq!(oracle.status.code(), Some(1), "the oracle exit status");
+        assert!(oracle.stdout.is_empty(), "the oracle stdout");
+        assert_eq!(stderr(&oracle), expected, "oracle stderr");
+    } else {
+        println!("SKIP cli: `erl` is not runnable — the oracle cross-check is skipped");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

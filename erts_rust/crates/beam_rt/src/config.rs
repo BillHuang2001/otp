@@ -333,8 +333,8 @@ pub enum GcStrategy {
 ///   switching the collector.
 ///
 /// Pure (no environment read), so a test can pin the semantics without mutating the process
-/// environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is `unsafe` in edition
-/// 2024).
+/// environment (`std::env::set_var` is **safe** under this workspace's edition 2021, but a
+/// test that set the real variable would race every other test in the binary).
 pub fn strategy_from_value(value: Option<&str>) -> GcStrategy {
     match value {
         Some(name) if name.eq_ignore_ascii_case("immix") => GcStrategy::Immix,
@@ -973,7 +973,7 @@ mod tests {
 
     /// `BEAM_RT_GC_STRATEGY`'s semantics, pinned **without** touching the process
     /// environment (a test that set the real variable would race every other test in this
-    /// binary, and `set_var` is `unsafe`).
+    /// binary; `std::env::set_var` itself is safe under edition 2021).
     #[test]
     fn gc_strategy_from_value_is_the_single_definition() {
         // Unset, empty, the default strategy named explicitly and any typo all mean "no
