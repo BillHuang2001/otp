@@ -295,7 +295,7 @@ from neither the shim nor this executable, and a wrapper `erl` may live outside 
 Asking `erl` is authoritative, and a path is never fabricated: if neither probe produces a stdlib the
 resolution fails with the typed `cannot locate the system code path: …` error (exit 1). Consequence: a
 normal installation pays **no** `erl` start-up (measured on this host: a bare `-eval` invocation now
-takes ≈2.19 s wall, since it drives the default boot script on every action, where the resident `erl`
+takes ≈0.44 s wall, since it drives the default boot script on every action, where the resident `erl`
 shell-out alone costs ≈0.5 s and is still avoided).
 **The resolved root is the consumed SYSTEM install, not this runtime's own tree.** `native_roots`
 seeds candidate roots with the `erl` on `$PATH` first (canonicalized, never executed), then
