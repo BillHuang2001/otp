@@ -249,6 +249,45 @@ fn write_dump(section: &str, header: &str, body: String) -> Option<PathBuf> {
     }
 }
 
+/// What compiling one corpus cost: how many modules loaded, how many functions the
+/// emitter lowered, and how many it refused.
+#[derive(Default)]
+struct CorpusTally {
+    modules: u64,
+    compiled: u64,
+    skipped: u64,
+}
+
+impl CorpusTally {
+    fn add(&mut self, other: &CorpusTally) {
+        self.modules += other.modules;
+        self.compiled += other.compiled;
+        self.skipped += other.skipped;
+    }
+}
+
+/// Compile every function of every loadable `.beam` in `paths` through the baseline
+/// emitter, tallying modules/functions and skipping (never failing on) a module that
+/// will not load or a function that will not compile.
+fn compile_corpus(paths: &[PathBuf]) -> CorpusTally {
+    let mut tally = CorpusTally::default();
+    for path in paths {
+        let Ok(module) = beam_loader::load_file(path) else {
+            // A module that will not load is not this diagnostic's concern.
+            continue;
+        };
+        tally.modules += 1;
+        let labels = crate::interpreter::build_label_map(&module);
+        for func in 0..module.functions.len() as u32 {
+            match compile_function(&module, &labels, func) {
+                Ok(_) => tally.compiled += 1,
+                Err(_) => tally.skipped += 1,
+            }
+        }
+    }
+    tally
+}
+
 /// The **static** deopt census: which instruction shapes the lowering dispatch refuses,
 /// counted over a corpus of committed fixtures plus sampled OTP modules.
 ///
@@ -262,43 +301,34 @@ fn the_static_deopt_census_over_the_corpus_is_printed() {
 
     let fixtures = fixture_corpus();
     let fixture_count = fixtures.len();
-    let mut paths = fixtures;
+    // The fixture part is the always-present half — a run without `erl` still censuses
+    // it — so it is compiled first and tallied on its own.
+    let fixture_tally = compile_corpus(&fixtures);
 
     let otp = otp_lib_root();
-    let otp_count = match &otp {
+    let (otp_count, otp_tally) = match &otp {
         Some(root) => {
             let beams = otp_corpus(root, OTP_MODULE_CAP);
-            let count = beams.len();
-            paths.extend(beams);
-            count
+            (beams.len(), compile_corpus(&beams))
         }
         None => {
             eprintln!(
                 "deopt census: no usable `erl` on PATH — the OTP corpus is SKIPPED; \
                  only the committed fixtures are censused"
             );
-            0
+            (0, CorpusTally::default())
         }
     };
 
-    let mut modules = 0u64;
-    let mut compiled = 0u64;
-    let mut skipped = 0u64;
-    for path in &paths {
-        let Ok(module) = beam_loader::load_file(path) else {
-            // A module that will not load is not this diagnostic's concern.
-            continue;
-        };
-        modules += 1;
-        let labels = crate::interpreter::build_label_map(&module);
-        for func in 0..module.functions.len() as u32 {
-            match compile_function(&module, &labels, func) {
-                Ok(_) => compiled += 1,
-                Err(_) => skipped += 1,
-            }
-        }
-    }
-
+    let fixture_modules = fixture_tally.modules;
+    let fixture_functions = fixture_tally.compiled;
+    let mut tally = fixture_tally;
+    tally.add(&otp_tally);
+    let CorpusTally {
+        modules,
+        compiled,
+        skipped,
+    } = tally;
     counters::set_enabled(false);
     let snapshot = counters::snapshot();
 
@@ -310,8 +340,9 @@ fn the_static_deopt_census_over_the_corpus_is_printed() {
 
     // --- liveness / consistency (never a threshold) -------------------------
     assert!(
-        compiled > 0,
-        "the fixture corpus must compile at least one function"
+        fixture_functions > 0,
+        "the fixture corpus must compile at least one function \
+         (fixtures={fixture_count} modules={fixture_modules})"
     );
     assert!(
         !by_deopts.is_empty(),
@@ -334,8 +365,13 @@ fn the_static_deopt_census_over_the_corpus_is_printed() {
     // --- the tables ---------------------------------------------------------
     println!("=== baseline-JIT static deopt census ===");
     println!(
-        "corpus: fixtures={fixture_count} otp_modules={otp_count} \
-         modules_loaded={modules} functions_compiled={compiled} functions_skipped={skipped}"
+        "corpus: fixtures={fixture_count} (modules={fixture_modules} functions={fixture_functions}) \
+         otp_modules={otp_count} (erl_found={})",
+        otp.is_some(),
+    );
+    println!(
+        "totals: modules_loaded={modules} functions_compiled={compiled} \
+         functions_skipped={skipped}"
     );
     println!(
         "totals: instances={total_instances} deopts={total_deopts} \
