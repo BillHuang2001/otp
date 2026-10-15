@@ -19,7 +19,9 @@
 // %CopyrightEnd%
 
 //! The [`LocalFunIdentity`] host seam: the `NEW_FUN_EXT` (`112`) identity of a **compiled
-//! module's** local (`make_fun3`) fun, supplied to `beam_bifs`' `term_to_binary`.
+//! module's** local (`make_fun3`) fun — and the lambda **name** of both a local and a decoded
+//! imported (`NEW_FUN_EXT`) fun — supplied to `beam_bifs`' `term_to_binary` and to its
+//! `erlang:fun_info/1,2` introspection.
 //!
 //! A `make_fun3` closure's term inlines only its engine-internal descriptor
 //! (`[uniq: u64][index: u32]`, `beam_term::fun`) — it carries **no** module atom, no
@@ -76,13 +78,17 @@
 //! [`LocalFunIdentity::local_fun_identity`] answers `Ok(None)` — never an error and never a
 //! guessed identity — whenever the answer is genuinely unknown:
 //!
-//! * the term is **not** a local fun — every `term_to_binary` call reaches this hook, so an
-//!   integer/atom/list/binary/`EXPORT_EXT`/imported fun must be a clean no-op;
-//! * the local node atom is unknown (the creator pid's node cannot be built);
+//! * the term is **not** a local or imported fun — every `term_to_binary`/`fun_info` fun
+//!   argument reaches this hook, so an integer/atom/list/binary/`EXPORT_EXT` fun must be a
+//!   clean no-op;
+//! * the local node atom is unknown (the creator pid's node cannot be built) — the `Local`
+//!   arm only, since an `Imported` fun carries its own creator pid;
 //! * **no** loaded module defines a `FunT` entry matching the term's `(uniq, index)` — the
 //!   fun's defining module is not loaded here (this is what keeps the `-eval` evaluator's own
 //!   closures on the typed gap: their `uniq` is [`crate::eval::EVAL_FUN_UNIQ`], far wider
-//!   than any `FunT` entry's `u32`, so it can never match a real module);
+//!   than any `FunT` entry's `u32`, so it can never match a real module; the same `Ok(None)`
+//!   is what an `Imported` fun's **unloaded** defining module yields, where the oracle's
+//!   `fun_info(F, name)` reports `[]`);
 //! * the matching module's `.beam` cannot be read, or its container cannot be hashed.
 //!
 //! `Ok(None)` preserves the codec's typed `unsupported: … local_fun` capability gap, so a
@@ -158,20 +164,35 @@ impl FunIdentityBridge {
 
 impl LocalFunIdentity for FunIdentityBridge {
     fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
-        // This hook is consulted for **every** `term_to_binary` argument. Only a local
-        // (`make_fun3`) fun has an identity to derive — `fun_uniq` rejects a non-fun (as
-        // well as an `EXPORT_EXT`/imported fun) before reading any descriptor word — so
-        // anything else is a clean no-op.
-        if beam_engine::terms::fun_uniq(term).is_err() {
-            return Ok(None);
+        // This hook is consulted for **every** fun argument of `term_to_binary/1,2` and of
+        // the `erlang:fun_info/1,2` introspection pair. Only the two fun kinds whose term
+        // carries (or can be matched to) an `ErlFunEntry` identity are answered here: a
+        // `Local` (`make_fun3`) closure and an `Imported` (`NEW_FUN_EXT`) one. An `External`
+        // (`EXPORT_EXT`) fun needs no seam — its whole identity is the export the term
+        // inlines — and a non-fun is a clean no-op.
+        match beam_codec::term::fun_kind_term(term) {
+            Ok(beam_codec::term::FunKind::Local) => self.local_identity(term),
+            Ok(beam_codec::term::FunKind::Imported) => self.imported_identity(term),
+            Ok(beam_codec::term::FunKind::External) | Err(_) => Ok(None),
         }
-        // The creator pid's node is the one input no loaded module carries: without it the
-        // image cannot be built faithfully, so the codec keeps its typed gap.
+    }
+}
+
+impl FunIdentityBridge {
+    /// The `NEW_FUN_EXT` identity of a `make_fun3` ([`FunKind::Local`]) closure.
+    ///
+    /// A `make_fun3` term inlines only its engine-internal descriptor (`[uniq: u64][index:
+    /// u32]`): it carries no module atom, so the **defining** module is whichever loaded
+    /// module's `FunT` declares this `(uniq, index)`. The creator pid's node is the one input
+    /// no loaded module carries: without it the identity cannot be built faithfully, so the
+    /// answer is the clean `Ok(None)`.
+    ///
+    /// [`FunKind::Local`]: beam_codec::term::FunKind::Local
+    fn local_identity(&self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
         let Some(node) = self.node else {
             return Ok(None);
         };
-        // The term's own identity words, now known to be a local fun's: the defining module
-        // is whichever loaded module's `FunT` declares this `(uniq, index)`.
+        // The term's own identity words, now known to be a local fun's.
         let uniq = beam_engine::terms::fun_uniq(term)?;
         let index = beam_engine::terms::fun_index(term)?;
         // The caller module first (when it is loaded), then every other module in the
@@ -205,6 +226,52 @@ impl LocalFunIdentity for FunIdentityBridge {
         // capability gap, never a guessed identity.
         Ok(None)
     }
+
+    /// The name-bearing identity of an `Imported` (`NEW_FUN_EXT`) fun, whose wire descriptor
+    /// inlines its **whole** identity.
+    ///
+    /// Every field but the lambda's **name** is read straight from the term — the module
+    /// atom, the 16-byte MD5 `uniq`, `index`/`old_index`/`old_uniq` and the creator pid. The
+    /// name is the one field `NEW_FUN_EXT` does not carry, so it is resolved from the fun's
+    /// **defining** module: the loaded module whose name is the term's own `module` atom
+    /// (`Module::name` indexes the shared atom table — see the module docs), and only when
+    /// its `FunT` entry still matches the wire `(old_uniq, index)` `(uniq, index)` pair **at**
+    /// the wire `old_index`. A recompiled module would miss that match, so the answer stays
+    /// the typed `Ok(None)` — the honest gap, never a guessed name.
+    ///
+    /// The defining module is explicit in the wire descriptor, so the scan is the plain
+    /// snapshot order with **no** caller preference (a module re-encoding its own imported fun
+    /// resolves identically either way).
+    fn imported_identity(&self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
+        use beam_codec::term;
+        let module_atom = term::fun_module(term)?;
+        let uniq = term::fun_uniq_bytes(term)?;
+        let index = term::fun_index(term)?;
+        let old_index = term::fun_old_index(term)?;
+        let old_uniq = term::fun_old_uniq(term)?;
+        let creator = term::fun_creator_pid(term)?;
+        for (module, _path) in self.modules.iter() {
+            if module.name != module_atom {
+                continue;
+            }
+            // The wire `(old_uniq, index)` must name this module's `FunT` entry **and** land at
+            // the wire `old_index`: the wire identity is the stubbed `ErlFunEntry`'s own
+            // `(old_uniq, index, old_index)` triple, so a module that has been recompiled
+            // since the fun was encoded no longer matches it.
+            if descriptor_position(module, u64::from(old_uniq), index) != Some(old_index as usize) {
+                return Ok(None);
+            }
+            let descriptor = module.funs()[old_index as usize];
+            return Ok(Some(
+                beam_codec::FunIdentity::new(module_atom, uniq, old_index, old_uniq, creator)
+                    .with_function(descriptor.function),
+            ));
+        }
+        // The defining module is not loaded here: the oracle cannot reach its code either, so
+        // its `fun_info(F, name)` reports `[]` while this hook reports the typed gap — the
+        // honest equivalent, never a fabricated name (see the module docs).
+        Ok(None)
+    }
 }
 
 /// End-to-end proof: a compiled module's local fun encodes through the **real**
@@ -225,7 +292,7 @@ mod tests {
 
     use super::super::test_support::{
         compile_fixture, compile_fixtures, decode_hex, hex, resolve_erlc, resolve_oracle,
-        run_oracle_probe, skip_loudly,
+        run_oracle_probe, run_oracle_probe_exact, skip_loudly,
     };
     use super::FunIdentityBridge;
     use crate::runtime::Runtime;
@@ -459,6 +526,199 @@ encs() -> {term_to_binary(fun() -> ok end), term_to_binary(fun(Y) -> Y + 1 end)}
             printed.matches("<<").count(),
             2,
             "the measured run must produce two encoded funs, got {printed}"
+        );
+    }
+
+    /// The skip banner for the `erlang:fun_info/1,2` proofs (distinct from [`BANNER`] so a
+    /// skipped toolchain is attributed to the right suite).
+    const FUN_INFO_BANNER: &str = "fun_info";
+
+    /// The `erlang:fun_info/1,2` fixture: `all/0` returns, for each fun kind, **both**
+    /// `fun_info(F, name)` and the whole ten-key `fun_info(F)` list, in one container.
+    ///
+    /// The five kinds:
+    ///
+    /// * `ref_local` — `fun helper/1`, a local fun naming a real **local** function;
+    /// * `named` — the **named** lambda `named_fun/0` builds. It recurses (`Fact/1`), which
+    ///   is what makes the compiler keep the name: a named fun whose name is never used is
+    ///   compiled as an anonymous one, so it would not exercise the named path;
+    /// * `anon` — an anonymous lambda, whose name is the compiler's generated
+    ///   `'-all/0-fun-0-'`;
+    /// * `imported` — the **same** `named_fun/0` lambda after a
+    ///   `binary_to_term(term_to_binary(_))` round trip: a decoded `NEW_FUN_EXT`, whose
+    ///   wire image carries the whole identity **except** the name, so it must resolve the
+    ///   defining module's `FunT` entry — and therefore report exactly what `named` does;
+    /// * `ext` — `fun lists:reverse/1`, an `EXPORT_EXT` fun, whose entire identity is
+    ///   inlined in the term and which never consults the seam at all.
+    ///
+    /// `name` is the FunT entry's own function field — there is **no** `function` item
+    /// (`erlang:fun_info(F, function)` is `badarg` on the oracle).
+    const FIFUNS_SRC: &str = "\
+-module(fifuns).
+-export([all/0]).
+
+helper(X) -> X + 1.
+
+named_fun() -> fun Fact(0) -> 1; Fact(N) -> N * Fact(N - 1) end.
+
+pair(F) -> {erlang:fun_info(F, name), erlang:fun_info(F)}.
+
+all() ->
+    RefLocal = fun helper/1,
+    Named = named_fun(),
+    Anon = fun(X) -> X + 1 end,
+    Imported = binary_to_term(term_to_binary(named_fun())),
+    Ext = fun lists:reverse/1,
+    [{ref_local, pair(RefLocal)},
+     {named, pair(Named)},
+     {anon, pair(Anon)},
+     {imported, pair(Imported)},
+     {ext, pair(Ext)}].
+";
+
+    /// The oracle probe: the very render the runtime is asked for (the `run` route prints
+    /// its result with `~w`, so the comparison is `~w` against `~w`).
+    const FIFUNS_ORACLE_EVAL: &str = "io:format(\"~w~n\", [fifuns:all()])";
+
+    /// `erlang:fun_info(F, name)` and the whole `erlang:fun_info(F)` list for every fun
+    /// kind, cross-checked against the system oracle through the **real** dispatch.
+    ///
+    /// The names are the case-sensitive generated atoms of the compiled fixture (that is
+    /// why the probe keeps its case), and the whole ten-key list rides along so a `name`
+    /// reported for the wrong entry — or an identity derived from the wrong module — shows
+    /// up in the `module`/`index`/`uniq` items too. This is the end-to-end proof that
+    /// [`RuntimeContext::uses_fun_identity`](super::super::RuntimeContext::uses_fun_identity)
+    /// installs [`FunIdentityBridge`] on the `fun_info` BIFs (`beam_bifs`' own
+    /// `LOCAL_FUN_IDENTITY_BIFS` roster names only the two encoders) and that both arms —
+    /// the `Local` one and the new `Imported` one — derive an identity the oracle agrees
+    /// with. Skips **loudly** without `erl`/`erlc`.
+    #[test]
+    fn fun_info_name_and_the_whole_list_agree_with_the_oracle_for_every_fun_kind() {
+        let (Some(oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
+            skip_loudly(FUN_INFO_BANNER, "no usable `erl` and/or `erlc`");
+            return;
+        };
+        let dir = compile_fixture(&erlc, "fun_info_kinds", "fifuns", FIFUNS_SRC);
+        let lines = run_oracle_probe_exact(&oracle, dir.path(), FIFUNS_ORACLE_EVAL);
+        assert_eq!(
+            lines.len(),
+            1,
+            "the oracle must print one container, got {lines:?}"
+        );
+        let expected = &lines[0];
+        // A non-vacuity guard: the oracle really rendered five `{Kind, {Name, FullList}}`
+        // triples, i.e. ten `{name, …}` items (one per `fun_info/2` call and one inside
+        // each ten-key list). Both sides rendering garbage would otherwise compare equal.
+        assert_eq!(
+            expected.matches("{name,").count(),
+            10,
+            "the oracle's container must carry ten `name` items, got {expected}"
+        );
+        assert!(
+            expected.contains("{name,'-named_fun/0-Fact/1-0-'}")
+                && expected.contains("{name,helper}")
+                && expected.contains("{name,reverse}"),
+            "the oracle's container must name the named lambda, the local function and \
+             the external fun, got {expected}"
+        );
+
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        let term = runtime
+            .run_function(dir.join("fifuns.beam"), "all", 0, &[])
+            .unwrap_or_else(|e| panic!("fifuns:all/0 did not run: {e:?}"));
+        // `format_term_w` is the runtime's `~w` printer — the same control the oracle probe
+        // used — so the two strings are directly comparable.
+        let printed = runtime
+            .format_term_w(term, None)
+            .unwrap_or_else(|e| panic!("fifuns:all/0's result did not print: {e:?}"));
+        assert_eq!(
+            printed.trim_end(),
+            expected,
+            "\n  ours:   {}\n  oracle: {expected}",
+            printed.trim_end()
+        );
+    }
+
+    /// The defining module of the imported fun the fixture decodes: only [`FISRC_SRC`]
+    /// (below) compiles it, and the test keeps it in a **different** scratch directory, so
+    /// the using module's own directory — and therefore the code path — never holds it.
+    const FISRC_SRC: &str = "\
+-module(fisrc).
+-export([mk/0]).
+mk() -> fun Fact(0) -> 1; Fact(N) -> N * Fact(N - 1) end.
+";
+
+    /// The **using** module: it decodes a `NEW_FUN_EXT` image embedded as a byte literal
+    /// (the oracle produced it from [`FISRC_SRC`]) and reports the fun's `name` and whole
+    /// info list. Embedding the bytes keeps the fun's defining module off this module's
+    /// code path, which is exactly the unloaded-defining-module case.
+    fn fidec_src(image: &[u8]) -> String {
+        let literal: Vec<String> = image.iter().map(u8::to_string).collect();
+        format!(
+            "-module(fidec).\n\
+             -export([name/0]).\n\
+             name() ->\n    \
+             F = binary_to_term(<<{}>>),\n    \
+             {{erlang:fun_info(F, name), erlang:fun_info(F)}}.\n",
+            literal.join(",")
+        )
+    }
+
+    /// An imported fun whose **defining module is not loaded** is the typed capability gap
+    /// here, where the oracle reports `name = []`.
+    ///
+    /// The C resolves `fun_info(F, name)` through the fun's `ErlFunEntry` in the *loaded*
+    /// module (`erl_bif_info.c:4007-4010`, `val = (mfa != NULL) ? mfa->function : NIL;`), so
+    /// a module it cannot load yields `NIL` — rendered `[]`. This runtime's
+    /// [`LocalFunIdentity`](beam_bifs::LocalFunIdentity) seam has no `NIL` to report (its
+    /// contract is "an identity or the typed gap"), so the answer is
+    /// `unsupported_bif` — the honest, never-fabricated equivalent. The test pins BOTH
+    /// sides, so the divergence is recorded rather than hidden.
+    #[test]
+    fn an_imported_funs_unloaded_defining_module_is_the_typed_gap_not_an_empty_name() {
+        let (Some(oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
+            skip_loudly(FUN_INFO_BANNER, "no usable `erl` and/or `erlc`");
+            return;
+        };
+        // The oracle encodes an `fisrc` lambda…
+        let source_dir = compile_fixture(&erlc, "fun_info_unloaded_src", "fisrc", FISRC_SRC);
+        let images = run_oracle_probe_exact(
+            &oracle,
+            source_dir.path(),
+            "io:format(\"~s~n\", [binary:encode_hex(term_to_binary(fisrc:mk()))])",
+        );
+        assert_eq!(
+            images.len(),
+            1,
+            "the oracle must print one image, got {images:?}"
+        );
+        let image = decode_hex(&images[0]);
+        // …and the using module embeds those bytes, so the fun it decodes names a module
+        // that is on no code path in this test (its own directory holds only `fidec`).
+        let use_dir = compile_fixture(&erlc, "fun_info_unloaded_use", "fidec", &fidec_src(&image));
+
+        // The oracle: the module cannot be loaded, so `name` is the empty list.
+        let oracle_lines =
+            run_oracle_probe_exact(&oracle, use_dir.path(), "io:format(\"~w~n\", [fidec:name()])");
+        assert_eq!(oracle_lines.len(), 1, "one container, got {oracle_lines:?}");
+        assert!(
+            oracle_lines[0].contains("{{name,[]},[")
+                && oracle_lines[0].contains("{name,[]}")
+                && oracle_lines[0].contains("{module,fisrc}"),
+            "the oracle must report `name = []` for the unloaded defining module, got {}",
+            oracle_lines[0]
+        );
+
+        // This runtime: the typed capability gap (exit 3 on the CLI), never a fabricated
+        // name and never a wrong one.
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        let error = runtime
+            .run_function(use_dir.join("fidec.beam"), "name", 0, &[])
+            .expect_err("an unloaded defining module must not fabricate a fun name");
+        assert_eq!(
+            crate::error::unsupported_reason(&error).as_deref(),
+            Some("bif"),
+            "the typed gap must be the `unsupported_bif` raise, got {error:?}"
         );
     }
 }

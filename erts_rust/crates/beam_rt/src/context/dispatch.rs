@@ -469,17 +469,38 @@ impl<'a> RuntimeContext<'a> {
     /// Whether `(module, function, arity)` is one of the BIFs that consult the
     /// [`LocalFunIdentity`](beam_bifs::LocalFunIdentity) seam — the **only** consumers of it.
     ///
-    /// `beam_bifs`' `term_to_binary/1,2` and `external_size/1,2` both build the external-term
-    /// image through `binconv::encode_body`, whose first read is
-    /// `ctx.local_fun_identity(term)` (`beam_bifs/src/binconv.rs`); the `NEW_FUN_EXT`
-    /// (`112`) identity of a compiled module's local (`make_fun3`) fun is the only thing that
-    /// read produces. Building the bridge eagerly for *every* registered call copies the
-    /// caller module's `Arc` and allocates its `.beam` path, so it is built only here — the
-    /// hook's absence is otherwise indistinguishable, since no other BIF calls the accessor.
+    /// The seam has two consumer families:
     ///
-    /// The set is [`beam_bifs::LOCAL_FUN_IDENTITY_BIFS`] — `beam_bifs`' own roster of the
-    /// BIFs that read that seam.
+    /// * the two **encoders** `term_to_binary/1,2` and `external_size/1,2`, which build the
+    ///   external-term image through `binconv::encode_body` — its first read is
+    ///   `ctx.local_fun_identity(term)` (`beam_bifs/src/binconv.rs`), and the `NEW_FUN_EXT`
+    ///   (`112`) identity of a compiled module's local (`make_fun3`) fun is the only thing
+    ///   that read produces. These are [`beam_bifs::LOCAL_FUN_IDENTITY_BIFS`];
+    /// * the `erlang:fun_info/1,2` **introspection** pair, whose `name` item (and, for a
+    ///   `Local` fun, its whole identity) is not on the term either: `fun_info` reads
+    ///   `ctx.local_fun_identity(fun)` once per call (`beam_bifs/src/fun_info.rs`) so the
+    ///   lambda's local function atom can be reported as `name`. `beam_bifs`' roster names
+    ///   only the encoders (it documents *that* module's own seam-readers), so this half is
+    ///   declared here — it is the beam_rt side of the same seam and cannot live in the
+    ///   sibling's table.
+    ///
+    /// Building the bridge eagerly for *every* registered call copies the caller module's
+    /// `Arc` and allocates its `.beam` path, so it is built only here — the hook's absence is
+    /// otherwise indistinguishable, since no other BIF calls the accessor.
     pub(super) fn uses_fun_identity(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_local_fun_identity(module, function, arity)
+            || Self::reads_fun_identity_for_introspection(module, function, arity)
+    }
+
+    /// The `erlang:fun_info/1,2` half of [`Self::uses_fun_identity`] — the introspection BIFs
+    /// that read the [`LocalFunIdentity`](beam_bifs::LocalFunIdentity) seam for a fun's `name`
+    /// (and, for a `Local` fun, its whole identity) without being in `beam_bifs`'
+    /// `LOCAL_FUN_IDENTITY_BIFS` roster (which documents the two encoders).
+    ///
+    /// `fun_info_mfa/1` is deliberately absent: it rejects every non-`External` fun with the
+    /// typed gap before reading any seam, so it never calls the accessor.
+    #[must_use]
+    fn reads_fun_identity_for_introspection(module: &str, function: &str, arity: u32) -> bool {
+        module == "erlang" && matches!((function, arity), ("fun_info", 1) | ("fun_info", 2))
     }
 }
