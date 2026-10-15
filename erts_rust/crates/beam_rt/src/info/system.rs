@@ -24,7 +24,8 @@
 //! strings, the word size, the NIF/driver interface versions, the emulator's fixed
 //! feature switches) or is read from the host operating system (`os_type`, `os_version`)
 //! — never from the oracle's printed figures. `emu_flavor`, `smp_support`, `creation` and
-//! `system_logger` are derived from this runtime's own configuration/node/process table.
+//! `system_logger` are read from this runtime's own state (its configuration, its
+//! distribution node and its `system_logger` flag).
 //!
 //! Key shapes (verified against OTP 29.1.1 / erts-17.1):
 //!
@@ -58,7 +59,7 @@
 //! | `kernel_poll` | bool |
 //! | `halt_flush_timeout` | atom, `infinity` |
 //! | `creation` | int |
-//! | `system_logger` | pid — the process registered as `logger`, else the atom `undefined` |
+//! | `system_logger` | atom `logger`/`undefined` or a pid — the `system_logger` flag (atom `logger` until `erlang:system_flag(system_logger, _)` sets it) |
 //!
 //! # The emulator's own build/implementation flags
 //!
@@ -107,6 +108,7 @@ use beam_term::Eterm;
 use super::{os_type, system_architecture, InfoValue};
 use crate::error;
 use crate::runtime::Runtime;
+use crate::seq_trace::SystemLogger;
 
 /// The `system_info/1` value of a `system`-family key, or `None` when `key` is not ours.
 pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
@@ -164,7 +166,8 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         // independent node-global knob whose only writers are
         // `erlang:system_flag(trace_control_word, N)` / `erts_internal:set_tcw`
         // (`erl_db_util.c:1080-1110`), which this runtime does not implement
-        // (`src/seq_trace.rs::system_flag_2` serves only `reset_seq_trace` and is a typed
+        // (`src/seq_trace.rs::system_flag_2` serves only `reset_seq_trace` and
+        // `system_logger`, and is a typed
         // gap for every other flag). Process tracing does **not** change it — the oracle
         // returns `0` before and after `erlang:trace(self(),true,[call])` +
         // `trace_pattern/3` — so `0` is this runtime's truthful live value, not a
@@ -238,39 +241,33 @@ fn creation(rt: &Runtime) -> i64 {
 
 /// `system_info(system_logger)` — the process this runtime's system logger is.
 ///
-/// The oracle's answer is the value of its **`system_logger` flag**
-/// (`erts_get_system_logger`, `erl_bif_info.c:3560-3561` → `erl_trace.c:2480-2483`), which
-/// `logger_proxy` sets to its own pid at start-up with
-/// `erlang:system_flag(system_logger, self())` (`kernel/src/logger_proxy.erl:117`) — a pid
-/// while the proxy runs, the atom `undefined` after
-/// `erlang:system_flag(system_logger, undefined)` (`:147`), and the atom `logger` before
-/// anything has set it (`erl_trace.c:339` emits `am_logger` as the initial value).
+/// The answer is the value of the **`system_logger` flag** — the same slot
+/// `erlang:system_flag(system_logger, _)` exchanges (`src/seq_trace.rs::system_flag_2`), read
+/// here through [`Runtime::seq_trace`]:
 ///
-/// This runtime implements no such flag (no `logger_proxy`, and
-/// `src/seq_trace.rs::system_flag_2` serves only `reset_seq_trace`), so the truthful
-/// answer is the process **this runtime has registered as `logger`** — exactly what
-/// `erlang:whereis(logger)` answers. The real `bootstrap/bin/start.boot` leaves one behind
-/// (instruction 13's `{kernelProcess,logger,{logger_server,start_link,[]}}`, see
-/// `crate::boot` and `../tests/boot.rs`), so a booted runtime answers a pid; a runtime that
-/// never ran a boot script (the preloaded-only `-eval`/`-run` path) has no logger process
-/// and answers the atom `undefined` — one of the two non-pid shapes the oracle itself
-/// produces for this key, never an invented pid.
+/// * the atom `logger` — the C's initial value (`erl_trace.c:339`), reported until something
+///   sets the flag;
+/// * a pid — `logger_proxy` sets it to its own pid at start-up with
+///   `erlang:system_flag(system_logger, self())` (`kernel/src/logger_proxy.erl:117`), so this
+///   is what a booted runtime whose `logger_proxy` started answers;
+/// * the atom `undefined` after `erlang:system_flag(system_logger, undefined)`
+///   (`:147`).
+///
+/// `erl_bif_info.c:3560-3561` is `BIF_RET(erts_get_system_logger())`, i.e. the flag verbatim
+/// (`erl_trace.c:2479-2483`), so reporting anything else — for instance deriving the pid of
+/// the process registered as `logger` — would be a wrong value, not a smaller one. An earlier
+/// iteration of this key did exactly that; the flag is the truth.
 ///
 /// # The caller's own state, not the oracle's
 ///
-/// The oracle's figure is *its* logger proxy's pid, a different process of a different
+/// The oracle's pid figure is *its* logger proxy's pid, a different process of a different
 /// emulator: reporting it would be a lie about this runtime (the same rule `process_count`
-/// and `erlang:ports/0` follow). The value is therefore derived from
-/// [`Runtime::processes`]`().whereis(..)`, never copied.
+/// and `erlang:ports/0` follow).
 fn system_logger(rt: &Runtime) -> InfoValue {
-    // A name the atom table does not hold cannot have any process registered under it, so
-    // the answer is the same `undefined` — no name is interned just to probe it.
-    let Some(name) = rt.atoms().lookup("logger") else {
-        return InfoValue::Atom("undefined");
-    };
-    match rt.processes().whereis(name) {
-        Some(pid) => InfoValue::Pid(pid),
-        None => InfoValue::Atom("undefined"),
+    match rt.seq_trace().system_logger() {
+        SystemLogger::Logger => InfoValue::Atom("logger"),
+        SystemLogger::Undefined => InfoValue::Atom("undefined"),
+        SystemLogger::Pid(pid) => InfoValue::Pid(pid),
     }
 }
 

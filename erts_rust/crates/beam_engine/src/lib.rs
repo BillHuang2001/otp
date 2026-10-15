@@ -102,12 +102,14 @@ pub mod operand;
 #[allow(unsafe_code)]
 mod predicates;
 mod step;
+mod supplied_stacktrace;
 #[allow(unsafe_code)]
 pub mod terms;
 pub use context::{ExecutionContext, Mailbox, MinimalContext, TraceEvent};
 pub use error::{bad_register, blocked, unknown_label, unsupported};
 pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
 pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};
+pub use supplied_stacktrace::encode_supplied_stacktrace;
 pub(crate) use step::Step;
 
 /// The conventional glob-import surface for downstream crates.
@@ -115,10 +117,13 @@ pub(crate) use step::Step;
 /// `use beam_engine::prelude::*;` brings the [`ExecutionContext`] seam (with its
 /// execution-trace hook [`TraceEvent`]) and the mailbox seam [`Mailbox`], the
 /// [`Machine`] core (with its register-file bound [`MAX_REGISTER`] and the
-/// blocking-aware run outcome [`RunOutcome`]) and the execution-tier selector
-/// [`Tier`] (for [`Machine::run_with_tier`]) into scope.
+/// blocking-aware run outcome [`RunOutcome`]), the execution-tier selector
+/// [`Tier`] (for [`Machine::run_with_tier`]) and the public supplied-stacktrace
+/// encoder [`encode_supplied_stacktrace`] (with its
+/// [`Machine::encode_supplied_stacktrace`] twin) into scope.
 pub mod prelude {
     pub use crate::context::{ExecutionContext, Mailbox, MinimalContext, TraceEvent};
     pub use crate::jit::Tier;
     pub use crate::machine::{Machine, RunOutcome, MAX_REGISTER};
+    pub use crate::supplied_stacktrace::encode_supplied_stacktrace;
 }

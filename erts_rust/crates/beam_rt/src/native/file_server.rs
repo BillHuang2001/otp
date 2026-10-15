@@ -23,9 +23,13 @@
 //! The last directive of the real `bootstrap/bin/start.boot` that does real work is
 //! `{apply,{c,erlangrc,[]}}`, and `c:erlangrc/0` (`lib/stdlib/src/c.erl:1049-1083`) reaches
 //! the file system through `file:path_eval/2` → `file:open/2` →
-//! `gen_server:call(file_server_2, {open,Name,ModeList}, infinity)`. The service process
-//! registered under that name is what makes this directive succeed, so the boot script runs
-//! to completion (its final directive is `{progress,started}`). Without that service the call
+//! `gen_server:call(file_server_2, {open,Name,ModeList}, infinity)`. Whichever process owns
+//! the `file_server_2` name answers it: on a route that drives a boot script — every CLI
+//! action but `-version`, because the CLI resolves `init`'s default `start` when no `-boot`
+//! flag was given — that is the booted `kernel_sup`'s own `file_server` child (this module's
+//! service is then spawned **unclaimed**, see `FileServices::start_unclaimed`), and only a
+//! runtime that drives no script at all (a host-built [`Runtime::with_defaults`]) registers
+//! this module's service under the name. With no service registered under that name the call
 //! would die with the oracle-shaped
 //! `{noproc,{gen_server,call,[file_server_2,…]}}` and the boot would stop there.
 //!
@@ -223,11 +227,41 @@ impl FileServices {
         atoms: &mut beam_term::AtomTable,
         policy: HeapPolicy,
     ) -> Result<FileServices> {
-        let server = processes.spawn(policy.clone())?;
+        let services = FileServices::spawn(processes, policy)?;
         let name = atoms.intern("file_server_2");
         processes
-            .register(name, server)
+            .register(name, services.server)
             .map_err(|_| error::message("boot: the `file_server_2` name is already registered"))?;
+        Ok(services)
+    }
+
+    /// Spawns the `file_server_2` service process **without claiming the name**.
+    ///
+    /// This is the route for a runtime driving a **boot script** — the explicit `-boot FILE`
+    /// value, or the CLI's resolved default `start`: every action but `-version` — where the
+    /// booted system owns the name. `bootstrap/bin/start.boot`'s `kernel_sup` starts OTP's own
+    /// `file_server_2` child (`{file_server, start_link, []}`, `kernel.erl`), and an **initial**
+    /// child start that finds the name taken aborts the whole supervisor:
+    /// `supervisor:start_children/2` turns the `{error,{already_started,Pid}}` that `gen:start`
+    /// answers into `{abort,{failed_to_start_child,Id,Reason}}` — the `already_started`
+    /// tolerance exists only for a *later* dynamic `start_child` — and `kernel` is `permanent`,
+    /// so the node tears down. On this route OTP's real child serves every `file_server_2`
+    /// request, and the spawned service is left unregistered and idle. A boot script that
+    /// starts no `file_server_2` of its own therefore has none: the script is authoritative.
+    ///
+    /// # Errors
+    ///
+    /// The process table's allocation diagnostics.
+    pub(crate) fn start_unclaimed(
+        processes: &mut ProcessTable,
+        policy: HeapPolicy,
+    ) -> Result<FileServices> {
+        FileServices::spawn(processes, policy)
+    }
+
+    /// Spawns the (`Runnable`, never-enqueued) service process, claiming nothing.
+    fn spawn(processes: &mut ProcessTable, policy: HeapPolicy) -> Result<FileServices> {
+        let server = processes.spawn(policy.clone())?;
         Ok(FileServices {
             server,
             policy,
@@ -235,7 +269,6 @@ impl FileServices {
             retired: HashSet::new(),
         })
     }
-
     /// The registered `file_server_2` pid.
     pub(crate) const fn server(&self) -> ProcessId {
         self.server
@@ -271,7 +304,7 @@ impl Runtime {
     /// `Runnable` and therefore is **not** moved onto the run queue by the delivery; the
     /// caller resumes through the engine's blocking-aware entry (`RunOutcome::Wait` →
     /// `Machine::resume_outcome`), not through a scheduler slice. Counting the reply into
-    /// the pass's `delivered` total is what tells the boot's drive that its blocked call
+    /// the pass's `delivered` total is what tells a bounded drive that its blocked call
     /// can make progress — a serviced-only pass must never look like "nothing happened".
     ///
     /// # Errors

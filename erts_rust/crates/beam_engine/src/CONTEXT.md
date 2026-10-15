@@ -41,7 +41,20 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   **driver round-trip by design**. Because cross-module landing works, a raise inside a cross-module
   callee (`gen:call`'s `exit(noproc)` inside `gen_server:call/3`'s `catch`, say) is caught and
   unwound exactly as the oracle does; the reason a caller then sees is whatever the callee's own
-  wrapper built (a compound term, carried out in the `Raise` live-reason slot, never reshaped).- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
+  wrapper built (a compound term, carried out in the `Raise` live-reason slot, never reshaped).
+- **The in-machine BIF-dispatch door is latched by BOTH drivers.** `ExecutionContext`'s
+  `wants_bif_in_machine()` probe (default `false`) is latched once per run into `Machine::bif_in_machine_on`
+  — by `Machine::drive` (`machine/drive.rs`) **and** by the native baseline tier's own driver
+  (`jit/baseline/mod.rs`; its deopt helper reaches the same funnel via `jit_step_one` →
+  `step_instruction_with_entry`). Every BIF dispatch funnels through `Machine::dispatch_bif_call`
+  (`interpreter/bif.rs`), which takes `ctx.call_bif_in_machine(self, entry_module, …)` when the gate is set
+  and `ctx.call_bif(…)` otherwise; a host that opts in must be reached on **every** tier, so keep the two
+  drivers latching the same answer (`tests/bif_in_machine.rs` is the tier-parity gate). The run's **entry
+  module** (context `0`, the module `Machine::current_stacktrace`'s `module` parameter expects for a
+  context-0 frame) is threaded from the driver through `step_instruction_with_entry` → `exec_bif` /
+  `call_bif_named` / `dispatch_wide` / `families::dispatch` → `dispatch_bif_call`, and on the native tier
+  through `JitRuntime.entry_module` (a field generated code never reads).
+- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
   `// SAFETY:` rationale, plus the modules carrying a module-local `#![allow(unsafe_code)]` under
   the crate-wide deny (`context.rs` — the `MinimalContext` region heap is the crate's raw
   `beam_alloc::ReservedHeap` bump seam — `families/bitstrings/raw.rs`, `families/records/raw.rs`,
@@ -50,7 +63,9 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `context.rs` → the `ExecutionContext` / `Mailbox` seams, `RootSet`, `MinimalContext` (incl. its
+- `context.rs` → the `ExecutionContext` / `Mailbox` seams (`call_bif` + the defaulted in-machine twin
+  `call_bif_in_machine` behind the `wants_bif_in_machine` probe; the resolver seams
+  `resolve_external_call`/`resolve_local_fun`/`resolve_local_call`/`atom_name`), `RootSet`, `MinimalContext` (incl. its
   `ContextHeap` — a pointer-stable region heap over `beam_alloc::ReservedHeap`: ~4 MiB is reserved up
   front and **grown in place** as terms are built, so an allocation costs its payload only; on
   reservation exhaustion a fresh, larger region starts and **every earlier region is kept alive**, so a
@@ -73,20 +88,22 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
-(`machine/mod.rs:434`), `Machine::alloc_rooted` (`:464`, → `ExecutionContext::alloc_words_rooted`) and
+(`machine/mod.rs:580`), `Machine::alloc_rooted` (`:638`, → `ExecutionContext::alloc_words_rooted`) and
 `Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
-(`machine/frames.rs:289`). Every other engine→host call carries **no** root set, so a host that
+(`machine/frames.rs:283`). Every other engine→host call carries **no** root set, so a host that
 *allocated* inside it would relocate the young heap against unpublished roots. Those calls, with the
 state each holds in a Rust local across the call:
-- `ExecutionContext::resolve_local_fun` (`families/funs/mod.rs:323`) — the `fun` Eterm (from `x(arity)`
+- `ExecutionContext::resolve_local_fun` (`families/funs/mod.rs:325`) — the `fun` Eterm (from `x(arity)`
   or the `call_fun2` operand, `:171-189`) and the `args` copy (`register_args`, `:275-280`).
   `terms::fun_free(fun)` (`terms/fun.rs:247`) then re-reads the term's **raw heap storage** *after* the
   call, so a move in the seam would dangle both.
-- `ExecutionContext::apply_fun` (`:355`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
+- `ExecutionContext::apply_fun` (`:357`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
   here is the host's `with_relocation_exempt`, not publication.
-- `ExecutionContext::call_bif` — the marshalled arguments live in the `EMPTY_ARGS` stack array
-  (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch` (`machine/mod.rs:254`); **neither is
-  in any `RootSet`**.
+- `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments live in the
+  `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch`
+  (`machine/mod.rs:345`); **neither is in any `RootSet`**. The in-machine twin
+  (`ExecutionContext::call_bif_in_machine`, reached through the single `Machine::dispatch_bif_call`
+  funnel) carries the same arguments and the same constraint.
 
 **Verified: no admission point can intervene on the `call_fun`/`call_fun2` path with the shipped host.**
 `BudgetContext::resolve_local_fun` (`beam_rt/src/runner/budget.rs:220`) forwards **without** arming, and
@@ -103,14 +120,15 @@ allocation to reserve, so `with_roots`/`alloc_rooted` do not apply (and cannot: 
 `x(arity)`/the operand and re-collect `args` after the seam call and before `fun_free`, never to
 "publish" (there is no door to publish through).
 
-**The real relocation hazard on this call stack is not at the copy site** — it is engine-held live terms
-absent from the host's *published* root set, on a collection that fires outside the admission hand-off.
-The one named instance is `Machine::pending_exception` (`machine/catch.rs:119`), a live reason `Eterm`
-that `beam_process::Registers::gather_roots` does not carry; the write accessor a collecting host needs
-(`Machine::pending_exception_mut`, `machine/catch.rs:135`) already exists, so the **engine-side half is
-done**. The remaining fix is host-side (`beam_process` extra-root slot + `beam_rt`'s
-`publish_parked_roots`, or `gc::halt_process_gc` on the park/yield arm); it and the other Rust-local
-vectors are recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
+**Engine-held live terms and the published root set.** The two heap-term raise latches
+(`raise_function_clause_args`/`pending_function_clause_args`) are **parked into the published root set**
+by `Machine::with_roots` for the duration of every hand-off and re-seated from their slots afterwards (a
+`with_roots` fast path hands over an unmodified `RootSet` when neither is armed), so a collecting host
+relocates them with no host-side change; the supplied-trace latches are `Vec<StackFrame>` metadata and
+need no rooting. `Machine::pending_exception` (`machine/catch.rs`) is the remaining engine-held live
+reason `Eterm`: it is rooted **host-side** by `beam_rt` via `Registers::extra_roots` (the write accessor a
+collecting host needs, `Machine::pending_exception_mut`, exists). The other Rust-local vectors are
+recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
 
 ## See Also
 - `../CONTEXT.md` → the crate-level FROZEN API surface, execution model, constraints and handoffs.

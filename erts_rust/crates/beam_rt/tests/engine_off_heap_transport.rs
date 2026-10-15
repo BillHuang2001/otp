@@ -366,9 +366,14 @@ fn call(function: &str, args: &[&str]) -> String {
     format!("{MODULE}:{function}({})", args.join(","))
 }
 
-/// Builds the `beam_rt run <beam> <Module>:<Function>/<Arity> [args…]` argv.
+/// Builds the `beam_rt -noshell run <beam> <Module>:<Function>/<Arity> [args…]` argv.
+///
+/// The `run` action drives the **default boot script** (contract A.9), exactly as the oracle's
+/// `init:boot` does, but it is **banner-free by construction** — it records the `noshell` init
+/// argument — so the booted node prints no OTP banner and the asserted stdout is the workload's
+/// own line. `-noshell` is kept to mirror the oracle side, which probes with `erl -noshell …`.
 fn run_argv<'a>(beam: &'a str, spec: &'a str, args: &[&'a str]) -> Vec<&'a str> {
-    let mut argv = vec!["run", beam, spec];
+    let mut argv = vec!["-noshell", "run", beam, spec];
     argv.extend_from_slice(args);
     argv
 }

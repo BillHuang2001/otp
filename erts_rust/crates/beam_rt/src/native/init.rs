@@ -143,6 +143,35 @@ impl RuntimeContext<'_> {
         terms::make_tuple(self, &[ok, values])
     }
 
+    /// `init:code_path_choice/0`: the code server's path-resolution mode, `strict` or
+    /// `relaxed` (`init.erl:1875-1884`).
+    ///
+    /// The oracle's `init` process answers it from the `-code_path_choice` flag with
+    /// `strict` for a `"strict"` value, `relaxed` for a `"relaxed"` value and `strict` for
+    /// anything else — an absent flag, or a malformed one. The runtime reproduces that rule
+    /// from its **own** recorded [`RuntimeConfig::init_args`](crate::config::InitArgs), so an
+    /// unmodeled `-code_path_choice relaxed` on the command line is honoured rather than
+    /// assumed absent.
+    ///
+    /// It is served here — and not entered as the `init.erl` body — because that body reads
+    /// the same flag through a **local** `get_argument/1` call, and `init.erl`'s
+    /// `get_argument/1` is the message-based `request/1` form: entering it in-machine reaches
+    /// a `receive` no process answers (this runtime runs no `init` request loop), which
+    /// deadlocks `code_server:init/3`. `code_path_choice/0` is not a floor key otherwise, so
+    /// the call-site seam cannot refuse it — the floor must own the key.
+    pub(super) fn code_path_choice(&mut self) -> Result<Eterm> {
+        let relaxed = self
+            .runtime
+            .init_args()
+            .get("code_path_choice")
+            .is_some_and(|occurrences| {
+                matches!(
+                    occurrences.as_slice(),
+                    [values] if values.len() == 1 && values[0] == "relaxed"
+                )
+            });
+        self.atom(if relaxed { "relaxed" } else { "strict" })
+    }
     /// `init:get_plain_arguments/0`: the arguments the emulator did not model, each as a
     /// string (contract A.6).
     ///
@@ -365,13 +394,23 @@ impl RuntimeContext<'_> {
     /// any script has been loaded there is no id to report, which is a typed capability
     /// gap — never a fabricated `{"Erlang/OTP", …}` literal.
     ///
-    /// `// documented divergence:` this runtime's release is OTP `30.0-rc0`, so the header
-    /// of the committed `bootstrap/bin/start.boot` it loads is `{"Erlang/OTP","30"}` where
-    /// the OTP-29 oracle reports `{"Erlang/OTP","29"}`. The value is the *real* header of
-    /// the script this runtime loaded, so it tracks the release exactly as the oracle's
-    /// does — the difference is the release, not the mechanism.
+    /// The value is the *real* header of the script this runtime actually loaded
+    /// ([`Runtime::boot_script_id`]), so it tracks the loaded script exactly as the
+    /// oracle's `init:script_id/0` does. On the default route the CLI resolves `start` to
+    /// `<Root>/bin/start.boot`, where `<Root>` is the **consumed** system installation's
+    /// root (`CodeServer::lib_root()`'s parent, via `cli::boot_file_root` /
+    /// `cli::resolve_boot_file`), so on this host the answer is that OTP-29 installation's
+    /// header `{"Erlang/OTP","29"}`. The committed `bootstrap/bin/start.boot`
+    /// (`{"Erlang/OTP","30"}`) is loaded only via an explicit
+    /// `-boot bootstrap/bin/start`.
+    ///
+    /// `// documented divergence:` the compile-time `erlang:system_info(otp_release)`
+    /// reports this runtime's *target* release (`"30"`), so
+    /// `init:script_id() =:= {"Erlang/OTP", otp_release}` is **false** here: the consumed
+    /// installation's release differs from the runtime's target.
     ///
     /// [`Runtime::boot_from_script`]: crate::Runtime::boot_from_script
+    /// [`Runtime::boot_script_id`]: crate::Runtime::boot_script_id
     pub(super) fn script_id_0(&mut self) -> Result<Eterm> {
         let Some((name, vsn)) = self
             .runtime
@@ -385,6 +424,40 @@ impl RuntimeContext<'_> {
         let name = self.charlist(&name)?;
         let vsn = self.charlist(&vsn)?;
         terms::make_tuple(self, &[name, vsn])
+    }
+
+    /// `init:fetch_loaded/0`: `[{Module, File}]` for the modules the **boot script** loaded
+    /// and handed over to the code server (contract A.7).
+    ///
+    /// The oracle's `init` process answers this from the `loaded` list it accumulates while
+    /// running the script's `{primLoad, …}` batches and `{ensure_loaded, Module}` requests,
+    /// then clears it (`init.erl:456-458,720-722`) — `code_server:init/3` is its only
+    /// consumer (`lib/kernel/src/code_server.erl:100`), which seeds `?moddb` from it. This
+    /// runtime has no live `init` process (the floor *is* the module — see the module docs),
+    /// so the answer is the boot script's own loading record: every module in the code
+    /// server's cache **except** the 22 preloaded ones, which the oracle keeps in
+    /// `erlang:pre_loaded/0` rather than in `Loaded`, paired with the file it was loaded
+    /// from. A cached module with no recorded source file is not part of that load set and
+    /// is omitted — never paired with a fabricated path.
+    pub(super) fn fetch_loaded(&mut self) -> Result<Eterm> {
+        let mut entries = Vec::new();
+        for name in self.runtime.loaded_modules() {
+            if self.runtime.is_preloaded_loaded(&name) {
+                continue;
+            }
+            let Some(path) = self
+                .runtime
+                .code_server
+                .loaded_path(&name)
+                .map(|path| path.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let module = self.atom(&name)?;
+            let file = self.charlist(&path)?;
+            entries.push(terms::make_tuple(self, &[module, file])?);
+        }
+        terms::make_list(self, &entries)
     }
 }
 
@@ -598,6 +671,45 @@ mod tests {
         }
     }
 
+    /// A runtime configured **exactly as the CLI configures a `-boot FILE` invocation**, so
+    /// [`Runtime::new`] takes the **boot-script route**: the native `file_server_2` service is
+    /// spawned **unclaimed** and the booted `kernel_sup`'s own `file_server` child owns the
+    /// name. Returns `None` (the caller then skips **loudly**) when no system Erlang install is
+    /// available.
+    ///
+    /// The route is part of the measurement, mirroring [`crate::boot::bootscript`]'s own
+    /// `-boot` system runtime: on the **default** route [`Runtime::new`] *registers* the native
+    /// service, so the initial `{file_server, start_link, []}` child start of the booted
+    /// `kernel_sup` finds the name taken, aborts the supervisor
+    /// (`{failed_to_start_child,file_server_2,{already_started,…}}`) and — `kernel` being
+    /// `permanent` — tears the node down before the script ends.
+    fn boot_script_runtime(script_path: &str) -> Option<Runtime> {
+        let argv: Vec<String> = ["-noshell", "-boot", script_path]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
+        let config = match crate::cli::parse(&argv) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+                return None;
+            }
+        };
+        let mut runtime = match Runtime::new(config) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("SKIP: no system Erlang install ({error})");
+                return None;
+            }
+        };
+        match runtime.code_server.add_system_paths() {
+            Ok(()) => Some(runtime),
+            Err(error) => {
+                eprintln!("SKIP: no system code path ({error})");
+                None
+            }
+        }
+    }
     #[test]
     fn get_arguments_prepends_the_automatic_flags_in_order() {
         // Oracle-verified (`erl -noshell -eval
@@ -834,11 +946,13 @@ mod tests {
         );
         let expected = crate::boot::bootscript::read(std::path::Path::new(script_path))
             .expect("the committed start.boot");
-        let Some(mut runtime) = system_runtime() else {
+        let Some(mut runtime) = boot_script_runtime(script_path) else {
             return;
         };
         runtime.boot().expect("boot");
-        let _ = runtime.boot_from_script_reporting(script_path);
+        runtime
+            .boot_from_script_reporting(script_path)
+            .expect("the committed start.boot boots to completion");
         let answer = call(&mut runtime, "init", "script_id", &[]).expect("script_id/0");
         assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2);
         assert_eq!(

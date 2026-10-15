@@ -237,7 +237,13 @@ fn beam_rt_run(beam: &Path, function: &str, path: &Path) -> Run {
     let spec = format!("siodev:{function}/1");
     let beam = beam.to_str().expect("an ASCII fixture path");
     let path = literal(path);
-    run(Path::new(BINARY), &["run", beam, &spec, &path])
+    run(
+        Path::new(BINARY),
+        // `-noshell`: the `run` action is banner-free by construction (it records the
+        // `noshell` init argument, so the booted kernel prints no OTP slogan); it is kept to
+        // mirror the oracle probe.
+        &["-noshell", "run", beam, &spec, &path],
+    )
 }
 
 /// The oracle's answer for `siodev:<function>(<path>)`, rendered with `~w` so the line

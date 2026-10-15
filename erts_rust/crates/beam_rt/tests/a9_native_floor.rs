@@ -36,7 +36,7 @@
 //! | `application:get_key/1,2` | `undefined` for `/1`; the controller key set + documented defaults for `/2` |
 //! | `application:get_application/0,1` | the module → loaded-application map, the `/0` `undefined`, and the non-atom guard |
 //! | `init:get_argument/1` | the four automatic flags (`root`, `home`, `progname`, `bindir`) and an absent flag |
-//! | `init:script_id/0` | the **loaded** boot script's real header, and the typed gap on the default boot path |
+//! | `init:script_id/0` | the **loaded** boot script's real header on the default boot path, and the typed gap for a runtime that drives no script |
 //! | `code:lib_dir/2` | the app dir joined with any subdir, `{error,bad_name}`, `function_clause` |
 //! | `filelib:is_dir/1, is_file/1, is_regular/1, wildcard/1` | the absent-path answers and the served success path (a real `#file_info{}`) |
 //!
@@ -49,6 +49,17 @@
 //! `~p` drives the registered `io:format/2`, so [`agrees_with_the_oracle`] is a byte comparison of
 //! the two answers, never a hardcoded expectation.
 //!
+//! # The routes these values are measured on
+//!
+//! Every CLI action **but `-version`** drives `init`'s **default boot script** before its own start
+//! instruction (`cli.rs::boot_script_to_drive` + `boot_then`, mirroring `init`'s `bootfile/2` +
+//! `do_boot/3`), so a `-eval`/`-s`/`run` node now carries the booted supervision tree the oracle
+//! has — a live `kernel_sup`, `application_controller`, `logger` and `file_server_2` — rather than
+//! the preloaded-only floor an earlier runtime reported. The in-process
+//! [`Runtime::with_defaults`] route the helpers below use drives **no** script (it boots the
+//! preloaded set only), which is why the few route-sensitive answers are asserted on the route
+//! that really produces them.
+//!
 //! # Where the values diverge **by construction** (never a bug)
 //!
 //! Each is marked `// documented divergence:` where it is asserted, and every one is an answer
@@ -56,20 +67,32 @@
 //!
 //! * **`application:get_all_key/1` / `get_key/2`'s `env`.** The oracle's `kernel` environment
 //!   carries two **runtime-injected** entries (`connect_all`, `logger`) that the resource file
-//!   never declares, in the application controller's own storage order. This runtime has no live
-//!   `application_controller`, so it reports the `.app` resource's `env` **verbatim** — which the
-//!   test proves against the oracle's own `file:consult` of that resource (`stdlib`'s empty
+//!   never declares, in the application controller's own storage order. This runtime's
+//!   `application:*` view is a **native floor over the parsed `.app` resource**, so it reports that
+//!   resource's `env` **verbatim** and never the controller's injections — the floor claims the
+//!   call ahead of the registry on *every* route, live `application_controller` or not. The test
+//!   proves the list against the oracle's own `file:consult` of that resource (`stdlib`'s empty
 //!   environment agrees outright, and the resource file's list is *not* what the oracle's loaded
 //!   controller reports).
 //! * **`application:get_application/1` on a pid.** The oracle has an `is_pid/1` clause answering
-//!   `undefined`; this runtime runs no application-owned process, so a pid names no application
-//!   here either, but it reports the non-atom guard's `function_clause` shape.
-//! * **`init:script_id/0` on the default boot path.** No script is loaded, so there is no id to
-//!   report — the typed capability gap, never a fabricated `{"Erlang/OTP", …}`.
-//! * **`init:script_id/0`'s value under a script.** The committed `bootstrap/bin/start.boot` is
-//!   OTP 30's, so its real header is `{"Erlang/OTP","30"}`; the OTP-29 oracle's own `start.boot`
-//!   carries `"29"`. The release differs, not the mechanism — and the test **derives** the
-//!   expected header from the script through the oracle, so a release bump cannot make it lie.
+//!   `undefined`; this runtime's native floor has no pid clause, so a pid reports the non-atom
+//!   guard's `function_clause` shape instead.
+//! * **`init:script_id/0` on the default boot path.** The default boot script really is loaded, so
+//!   there *is* an id: the **loaded** script's real `{Name, Vsn}` header, never a fabricated one.
+//!   The typed capability gap survives only for a runtime that drives **no** script (the plain
+//!   in-process [`Runtime::with_defaults`] route).
+//! * **`init:script_id/0`'s value is the *loaded script's* header, not this runtime's release.**
+//!   The default route resolves `init`'s `start` against the **installation's** own
+//!   `<Root>/bin/start.boot`, so the id is that file's header (OTP `"29"` on this host); the
+//!   explicit `-boot FILE` route loads the named script (the committed
+//!   `bootstrap/bin/start.boot`, OTP `"30"`). Neither test hardcodes that header: the `-boot FILE`
+//!   test reads it out of the very script the runtime loads, and the default-route test compares
+//!   against the oracle's own `init:script_id/0` — the header of the script *its* installation
+//!   resolves, which is this runtime's `<Root>` too — so a release bump cannot make either lie.
+//!   Note the second consequence: `erlang:system_info(otp_release)` is this runtime's own
+//!   **target** release (`"30"`), deliberately not what the id reports, so
+//!   `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `false` here where
+//!   the oracle's own loaded script and release agree (`true`).
 //! * **`filelib` on an existing path.** The `#file_info{}` `access` slot is `access(2)`-derived
 //!   in the oracle and served here through `beam_io`'s `access(2)` probe, so the success path
 //!   answers the oracle's own value (`filelib:is_dir/1` ⇒ `true`) rather than a typed gap.
@@ -345,7 +368,8 @@ fn get_all_key_is_undefined_for_an_unloaded_or_non_atom_application() {
 /// The `env` key is the one **documented divergence** in the all-key list, and this test proves it
 /// is *not* a parse or ordering bug: the runtime's list is byte-identical to the resource file's
 /// own `env` declaration (as read by the oracle's `file:consult/1`), while the oracle's *loaded*
-/// list additionally carries the `application_controller`'s runtime injections.
+/// list additionally carries the `application_controller`'s runtime injections — which this
+/// runtime's resource-based native view never has, booted controller or not.
 #[test]
 fn the_env_key_is_the_resource_declaration_while_the_oracle_injects_two_entries() {
     // `stdlib` declares no environment at all, so both runtimes agree outright.
@@ -365,8 +389,10 @@ fn the_env_key_is_the_resource_declaration_while_the_oracle_injects_two_entries(
     // `// documented divergence:` the runtime answers the resource file's `env` verbatim — which
     // is exactly what the oracle's own `file:consult` of that file holds. The oracle's *loaded*
     // environment differs because its `application_controller` stores two injected entries (and
-    // keeps its own order); reproducing those needs a live `application_controller`, which this
-    // runtime does not run.
+    // keeps its own order); this runtime's `application:*` view is a **native floor over the
+    // parsed `.app` resource**, claimed ahead of the registry on every route, so it never reflects
+    // the controller's injections — not even on the default route, where the booted `kernel` does
+    // start a live `application_controller`.
     assert_eq!(
         renders("application:get_key(kernel, env)"),
         declared,
@@ -494,9 +520,9 @@ fn get_application_1_reports_the_non_atom_guard_as_function_clause() {
     }
 
     // `// documented divergence:` the oracle's extra `is_pid/1` clause answers `undefined` for a
-    // pid. This runtime runs no application-owned process, so a pid names no application here
-    // either — but it is reported with the non-atom guard's `function_clause` shape rather than
-    // walked as a pid.
+    // pid. This runtime's native `application:get_application/1` floor has no pid clause (it
+    // resolves atom module names only), so a pid takes the non-atom guard's `function_clause`
+    // shape instead of being walked as a pid.
     assert_eq!(
         raise_of("application:get_application(self())")
             .as_atom()
@@ -590,24 +616,64 @@ fn init_get_argument_bindir_is_the_installations_emulator_directory() {
 // 5. init:script_id/0
 // ---------------------------------------------------------------------------------------
 
-/// The exact typed gap `init:script_id/0` reports on the default (no-script) boot path.
+/// The exact typed gap `init:script_id/0` reports when **no boot script has been loaded** — the
+/// plain in-process [`Runtime::with_defaults`] route, which boots the preloaded set only. Every CLI
+/// action but `-version` drives a script, so the gap is not reachable through the CLI any more.
 const SCRIPT_ID_GAP: &str = "init:script_id/0 (no boot script has been loaded)";
 
 /// The real header of the committed `bootstrap/bin/start.boot` (this checkout is OTP 30), as the
 /// `~p` rendering of the `{"Erlang/OTP", Vsn}` 2-tuple.
 const START_BOOT_HEADER: &str = "{\"Erlang/OTP\",\"30\"}";
 
+/// The default boot path — every CLI action but `-version` — drives `init`'s default boot script
+/// (`init.erl:1257-1258`'s `get_flag(boot, Flags, Root ++ "/bin/start")`, resolved from the literal
+/// `start` by `cli.rs::resolve_boot_file`), so `init:script_id/0` answers the **loaded** script's
+/// real `{Name, Vsn}` header: the id of the very script the runtime read and executed, never a
+/// fabricated `{"Erlang/OTP", …}` and no longer the pre-boot capability gap.
 #[test]
-fn script_id_is_a_typed_gap_on_the_default_boot_path() {
-    // `-eval` builds the runtime through `Runtime::boot` only: no boot script is read, so there is
-    // no id to report. The gap is a capability gap — exit 3 and one stable stderr line — never a
-    // fabricated `{"Erlang/OTP", …}`.
+fn script_id_is_the_loaded_boot_scripts_header_on_the_default_boot_path() {
+    // The action's own expression evaluates for its effect only (`cli.rs::drive`), so a silent
+    // `-eval` exits 0 with empty stdout and stderr. A capability gap would instead be exit 3 with
+    // the one-line `beam_rt: unsupported: …` diagnostic this test used to pin — the answer of a
+    // runtime that drove no script.
     let cli = beam_rt_eval("init:script_id().");
-    assert_eq!(cli.code, 3, "a capability gap exits 3 (stderr {:?})", cli.err);
-    assert_eq!(cli.err, format!("beam_rt: unsupported: {SCRIPT_ID_GAP}"));
+    assert_eq!(
+        cli.code, 0,
+        "the default boot path loads a script, so `init:script_id/0` answers (stderr {:?})",
+        cli.err
+    );
     assert!(cli.out.is_empty(), "stdout {:?}", cli.out);
+    assert!(cli.err.is_empty(), "stderr {:?}", cli.err);
 
-    // The same answer in-process.
+    // The id itself, printed by the action's own expression: the default route resolves `init`'s
+    // `start` against the **installation's** own `<Root>/bin/start.boot`, so the answer is that
+    // file's `{Name, Vsn}` header — the same 2-tuple shape the oracle reports.
+    let cli = beam_rt_eval("io:format(\"~p\", [init:script_id()]).");
+    assert_eq!(cli.code, 0, "the observable probe exits 0 (stderr {:?})", cli.err);
+    let ours = cli.out.trim_end();
+    assert!(
+        ours.starts_with("{\"Erlang/OTP\",\"") && ours.ends_with("\"}"),
+        "the id is a `{{\"Erlang/OTP\", Vsn}}` header: {ours:?}"
+    );
+    // `// documented divergence:` the id is the *loaded script's* header, not this runtime's
+    // release. Both runtimes resolve the same `<Root>` (pinned by
+    // `init_get_argument_bindir_is_the_installations_emulator_directory`), so both read that
+    // installation's `bin/start.boot` and the two ids are byte-identical — while
+    // `erlang:system_info(otp_release)` is this runtime's own target release (`"30"`), which is
+    // deliberately *not* what the id reports here:
+    // `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `false` on this
+    // runtime (`"...","29"` vs `"...","30"`) and `true` on the oracle, whose loaded script and
+    // release agree (verified live on this host).
+    if let Some(expected) = oracle_renders("init:script_id()") {
+        assert_eq!(
+            ours, expected,
+            "both runtimes report the header of the boot script their installation loads"
+        );
+    }
+
+    // A runtime that drives **no** script has no id to report: the typed capability gap, never a
+    // fabricated `{"Erlang/OTP", …}`. This is the plain in-process route ([`Runtime::with_defaults`]
+    // boots the preloaded set only) — the gap the pre-boot runtime reported on *every* route.
     assert_eq!(
         beam_rt::error::unsupported_reason(&raise_of("init:script_id()")).as_deref(),
         Some(SCRIPT_ID_GAP)
@@ -644,7 +710,7 @@ fn script_id_is_the_loaded_boot_scripts_real_header() {
     // In-process, through the runtime's own API: the same header, and the proof that the script's
     // `primLoad` batch really loaded a module (`erlang:module_loaded/1` — the boot-set divergence
     // itself is pinned by the sibling `module_loaded.rs` suite).
-    let Some(mut runtime) = booted_runtime() else {
+    let Some(mut runtime) = boot_script_runtime(&probe.script) else {
         return;
     };
     runtime
@@ -667,6 +733,47 @@ fn booted_runtime() -> Option<Runtime> {
         Ok(()) => Some(runtime),
         Err(error) => {
             eprintln!("SKIP a9_native_floor: boot needs the system Erlang install ({error})");
+            None
+        }
+    }
+}
+
+/// A runtime configured **exactly as the CLI configures a `-boot FILE` invocation** for `script`,
+/// or `None` — loudly — when the system Erlang install is unavailable or the invocation does not
+/// parse.
+///
+/// The **route** is part of the measurement, not an implementation detail: on the bare
+/// [`Runtime::with_defaults`] path (an empty command line, hence no `boot` init argument)
+/// [`Runtime::new`](beam_rt::Runtime::new) **registers** the native `file_server_2` service under
+/// that name, so a script that really starts `kernel` aborts its `kernel_sup` with
+/// `{shutdown,{failed_to_start_child,file_server_2,{already_started,_}}}` — and `kernel` is
+/// `permanent`, so the node tears down and the drive stops short of the script's end. A runtime
+/// built through the CLI's **own parser** carries the `-boot` argument
+/// ([`RuntimeConfig::boot_script`](beam_rt::RuntimeConfig::boot_script)), on which
+/// [`Runtime::new`](beam_rt::Runtime::new) spawns that service **unclaimed** so the booted
+/// `kernel_sup`'s own `file_server_2` child claims the name. This mirrors
+/// `tests/boot.rs::boot_cli_runtime` (the same construction, the same reason), so both suites
+/// measure the invocation the CLI really runs.
+fn boot_script_runtime(script: &Path) -> Option<Runtime> {
+    if booted_runtime().is_none() {
+        return None;
+    }
+    let argv = vec![
+        "-noshell".to_string(),
+        "-boot".to_string(),
+        script.to_string_lossy().into_owned(),
+    ];
+    let config = match beam_rt::parse(&argv) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("SKIP a9_native_floor: cannot build the `-boot` invocation's configuration ({error})");
+            return None;
+        }
+    };
+    match Runtime::new(config) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            eprintln!("SKIP a9_native_floor: no system Erlang install ({error})");
             None
         }
     }

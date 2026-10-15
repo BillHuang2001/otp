@@ -176,6 +176,15 @@ impl Peer {
         // The peer connects, then `DOP_REG_SEND`s the greeting to our registered name.
         // `node()` is the peer's own full `node@host` name, which is exactly what the
         // delivered payload carries back.
+        //
+        // The greeting is **re-sent on a bounded schedule**, because the receiving side's
+        // registered name need not exist yet when the peer first connects: a `DOP_REG_SEND`
+        // addressed to a name nothing has registered is dropped silently — by the oracle too
+        // (measured: an `erl` node that registers `echo` a few seconds after start-up never
+        // sees a greeting sent to `{echo, Node}` in between). The CLI node here drives its
+        // whole boot script (≈2 s) before the `run` action starts the fixture, so the
+        // greeting can legitimately land in that window; the first re-send that arrives after
+        // `dist_echo:wait/0` registered the name is the one the fixture returns.
         let eval = format!(
             "Target = list_to_atom(\"{target}\"), \
              Ping = fun F(0) -> io:format(\"CONNFAIL~n\",[]), halt(2); \
@@ -186,7 +195,12 @@ impl Peer {
                     end, \
              Ping(300), \
              io:format(\"CONNECTED ~p~n\", [node()]), \
-             {{echo, Target}} ! {{hello, node()}}, \
+             Greet = fun G(0) -> ok; \
+                        G(N) -> {{echo, Target}} ! {{hello, node()}}, \
+                                timer:sleep(250), \
+                                G(N - 1) \
+                     end, \
+             Greet(120), \
              io:format(\"SENT ~p~n\", [node()]), \
              receive M -> io:format(\"BACK ~p~n\", [M]) after 8000 -> ok end, \
              halt().",
@@ -514,7 +528,9 @@ fn the_cli_node_receives_an_inbound_reg_send_from_a_real_erl_peer() {
     let target = format!("{our_node}@{host}");
 
     // The peer is started first: it polls our node (for up to 30 s) until the CLI node
-    // publishes itself to `epmd`, then sends the greeting.
+    // publishes itself to `epmd`, then re-sends the greeting on a bounded schedule until it
+    // arrives (see `Peer::start`: publication happens during the boot-script drive, so the
+    // first greeting can precede the fixture's `register(echo, self())`).
     let peer = Peer::start(&oracle, &peer_node, &cookie, &target)
         .expect("the real `erl` peer starts");
 

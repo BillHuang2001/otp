@@ -17,7 +17,7 @@ Ground truth (read-only, never modify): `emu/instrs.tab` (`i_make_fun3` :545,
 - `mod.rs:413` `apply_target` — the `fixed_apply` shape (`module=x(arity)`, `function=x(arity+1)`); its host `call_bif` `Err` is routed through `Machine::raise_bif_error` (`mod.rs:464-467`) and returned as `ApplyTarget::Raised`, never a raw error.
 - `mod.rs:369` `enum ApplyTarget { Called(Eterm), Enter{context,func,pc}, Raised(Step) }` — `Raised` covers both a non-atom-target `badarg` and a host BIF error from the applied target.
 - `mod.rs:488` `raise_badarg` — catchable `badarg` raise for a non-atom `apply` target.
-- `mod.rs:507` `atom_name` — atom-index → name via the running module's table (typed `BadArg` otherwise).
+- `mod.rs:528` `atom_name` — resolves a runtime atom **value** through `ExecutionContext::atom_name` (the live-namespace seam, defaulting to the running module's own table); typed `BadArg` for a non-atom or an id the host cannot name.
 - `MakeFun3` (`:135`) builds via `terms::make_fun_rooted`; header arity = `descriptor.arity - num_free`.
 - `CallFun`/`CallFun2` (`:171`/`:181`) route through the in-machine closure-apply seam `ExecutionContext::resolve_local_fun` **first** (see below); `ExecutionContext::apply_fun` is the value-returning fallback when the host declines.
 

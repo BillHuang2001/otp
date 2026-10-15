@@ -104,6 +104,96 @@ pub(crate) fn timer_delay(term: Eterm) -> beam_common::Result<Duration> {
     Ok(delay)
 }
 
+/// `ERTS_MONOTONIC_TIME_START_EXTERNAL` — the lowest absolute Erlang monotonic time an
+/// `{abs, true}` argument may name, in **milliseconds**.
+///
+/// This is the very constant `erlang:system_info(start_time)` answers, in the unit an
+/// absolute timer time is given in: [`crate::info::time::START_TIME`] (nanoseconds) over
+/// `1_000_000`. The two cannot drift — one shared definition — and both are pinned against
+/// the live oracle by `info::time`'s own test.
+const ERTS_MONOTONIC_START_MSEC: i64 = crate::info::time::START_TIME / 1_000_000;
+/// `ERTS_MONOTONIC_TIME_END_EXTERNAL` — the highest one, in milliseconds
+/// (`erlang:system_info(end_time)` over `1_000_000`).
+const ERTS_MONOTONIC_END_MSEC: i64 = crate::info::time::END_TIME / 1_000_000;
+
+/// The delay of an **absolute** timer BIF: an `{abs, true}` time argument is an Erlang
+/// monotonic time in milliseconds, so the delay is what is left of it.
+///
+/// This reproduces the C's absolute arm (`parse_timeout_pos`,
+/// `erts/emulator/beam/erl_hl_timer.c:2517-2529`): the C shifts the external argument into
+/// ERTS's **internal** millisecond base (`t += -1*ERTS_MONOTONIC_OFFSET_MSEC`, i.e.
+/// `internal = t - (START_EXTERNAL - BEGIN)`) and requires it to lie in
+/// `[ERTS_MONOTONIC_TO_MSEC(BEGIN), ERTS_MONOTONIC_TO_MSEC(END)]` (`erl_time.h:235-239`,
+/// `erl_time.h:331-338`). Shifting that window back out of the internal base is exactly
+/// `[ERTS_MONOTONIC_TIME_START_EXTERNAL, ERTS_MONOTONIC_TIME_END_EXTERNAL]`, so this checks
+/// the argument directly against the **external** range, in the same unit — the same
+/// predicate, with the offsets already cancelled. READ-ONLY ground truth:
+/// `erts/emulator/beam/{erl_time.h,erl_hl_timer.c}`.
+///
+/// The remaining time is `t`'s distance from `now_nanos` — the runtime's own monotonic clock,
+/// read from the registered `erlang:monotonic_time/0` by the [`RuntimeHooks`] spawner so that
+/// it is the **same** clock the caller's own value came from (`timer:system_time/0` is
+/// `erlang:monotonic_time(microsecond)` rounded up). The external-to-internal offsets cancel
+/// in that subtraction too, so the remainder is the true delay in either base.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-integer argument, one outside the representable absolute
+/// window, or one whose deadline would overflow the runtime's monotonic clock — the
+/// oracle's `badarg` in each case (which `timer.erl` catches).
+///
+/// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
+/// [`crate::info::time::START_TIME`]: crate::info::time::START_TIME
+pub(crate) fn timer_absolute_delay(term: Eterm, now_nanos: i64) -> beam_common::Result<Duration> {
+    if !is_small(term) {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    let absolute = signed_value(term);
+    if !(ERTS_MONOTONIC_START_MSEC..=ERTS_MONOTONIC_END_MSEC).contains(&absolute) {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    let remaining = absolute.saturating_sub(now_nanos.div_euclid(1_000_000));
+    if remaining <= 0 {
+        // A time that has already passed fires at the next scheduler pass, exactly as the
+        // C's wheel behaves with a deadline in the past.
+        return Ok(Duration::ZERO);
+    }
+    let millis = u64::try_from(remaining).map_err(|_| beam_common::BeamError::BadArg)?;
+    let delay = Duration::from_millis(millis);
+    if Instant::now().checked_add(delay).is_none() {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    Ok(delay)
+}
+
+/// The nanoseconds an `erlang:monotonic_time/0` reading holds.
+///
+/// The runtime's monotonic clock is read through that registered BIF (see
+/// [`RuntimeHooksBridge::monotonic_now_nanos`][hooks]), so its value arrives as a term and has
+/// to be decoded. A reading is a **non-negative integer** in the runtime's native nanosecond
+/// unit: a small integer directly, or — only past `2^59` ns, i.e. after ~18 years of uptime —
+/// a one-limb bignum, which is folded here so a long-lived node's clock keeps working.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a term that is not an integer at all (unreachable from the BIF)
+/// and [`BeamError::SystemLimit`] for a reading this runtime cannot express as an `i64` (past
+/// ~292 years of uptime, or a negative one) — a typed refusal, never a truncated clock.
+///
+/// [hooks]: crate::context::RuntimeHooksBridge
+pub(crate) fn monotonic_nanos(reading: Eterm) -> beam_common::Result<i64> {
+    if is_small(reading) {
+        return Ok(signed_value(reading));
+    }
+    let (negative, digits) = beam_codec::term::big_parts(reading)
+        .map_err(|_| beam_common::BeamError::BadArg)?;
+    // A bignum is normalised — its top `ErtsDigit` (`u64`, least significant first) is
+    // non-zero — so a reading of two or more limbs is already past `i64::MAX`.
+    if negative || digits.len() != 1 {
+        return Err(beam_common::BeamError::SystemLimit);
+    }
+    i64::try_from(digits[0]).map_err(|_| beam_common::BeamError::SystemLimit)
+}
 /// The destination of a timer: a pid (pinned now) or a registered name (resolved when the
 /// timer fires).
 ///
@@ -431,7 +521,8 @@ fn deadline_after(now: Instant, delay: Duration) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beam_term::{make_small, signed_value};
+    use beam_alloc::Heap;
+    use beam_term::{make_small, signed_value, NIL};
 
     fn pid(n: u64) -> ProcessId {
         ProcessId::new(n, 0)
@@ -619,5 +710,128 @@ mod tests {
         let other = timers.schedule_resume(Duration::from_millis(0), pid(6), 0, 4);
         assert_eq!(timers.take_due(Instant::now()).len(), 1, "it fired");
         assert!(!timers.cancel_handle(other), "a fired deadline is not cancellable");
+    }
+
+    /// A bignum term with the given `ErtsDigit`s (least significant first).
+    fn big(heap: &mut Heap, negative: bool, digits: &[u64]) -> Eterm {
+        beam_codec::term::make_big(heap, negative, digits).expect("a bignum term")
+    }
+
+    /// A comparable summary of a timer-time result — the millisecond count on success, the
+    /// BEAM error atom on failure (`BeamError` deliberately has no `PartialEq`).
+    fn delay_ms(result: beam_common::Result<Duration>) -> Result<u64, Option<&'static str>> {
+        result
+            .map(|delay| delay.as_millis() as u64)
+            .map_err(|error| error.as_atom())
+    }
+
+    /// The same summary for a monotonic-clock reading.
+    fn reading(result: beam_common::Result<i64>) -> Result<i64, Option<&'static str>> {
+        result.map_err(|error| error.as_atom())
+    }
+
+    #[test]
+    fn a_small_monotonic_reading_decodes_directly() {
+        assert_eq!(reading(monotonic_nanos(make_small(0))), Ok(0));
+        assert_eq!(
+            reading(monotonic_nanos(make_small(1_234_567_890))),
+            Ok(1_234_567_890)
+        );
+    }
+
+    #[test]
+    fn a_one_limb_bignum_monotonic_reading_is_folded() {
+        // `erlang:monotonic_time/0` crosses the 60-bit small range only after ~18 years of
+        // uptime; the fold keeps a long-lived node's clock usable rather than refusing it.
+        let mut heap = Heap::new(16).expect("a heap");
+        assert_eq!(
+            reading(monotonic_nanos(big(&mut heap, false, &[1 << 60]))),
+            Ok(1 << 60)
+        );
+    }
+
+    #[test]
+    fn a_monotonic_reading_this_clock_cannot_express_is_a_typed_refusal() {
+        let mut heap = Heap::new(16).expect("a heap");
+        // A negative bignum is not a monotonic reading.
+        assert_eq!(
+            reading(monotonic_nanos(big(&mut heap, true, &[1]))),
+            Err(Some("system_limit"))
+        );
+        // Two limbs are already past `i64::MAX`.
+        assert_eq!(
+            reading(monotonic_nanos(big(&mut heap, false, &[u64::MAX, u64::MAX]))),
+            Err(Some("system_limit"))
+        );
+        // A term that is not an integer is the oracle's `badarg`.
+        assert_eq!(reading(monotonic_nanos(NIL)), Err(Some("badarg")));
+    }
+
+    #[test]
+    fn the_absolute_window_is_the_oracles_own_bounds() {
+        // These are exactly `erlang:system_info(start_time)` / `end_time` in milliseconds.
+        // Probed against the live oracle (OTP 29.1.1 / erts-17.1): the first accepted
+        // absolute is -576460752000 and the last is 8646911283000 —
+        // `erl -noshell -eval 'io:format("~p~n",[is_reference(erlang:start_timer(-576460752000, self(), x, [{abs,true}]))]),halt(0).'`
+        // answers `true`, the next value down answers `badarg` (and likewise one above the
+        // top), which is the `parse_timeout_pos` window of `erl_hl_timer.c:2517-2529` —
+        // there expressed in ERTS's internal base, here in the caller's external one.
+        assert_eq!(ERTS_MONOTONIC_START_MSEC, -576_460_752_000);
+        assert_eq!(ERTS_MONOTONIC_END_MSEC, 8_646_911_283_000);
+
+        // Both inclusive bounds are accepted (a clock just below the window leaves a real
+        // — if very long — remainder) ...
+        let before = (ERTS_MONOTONIC_START_MSEC - 1) * 1_000_000;
+        assert!(delay_ms(timer_absolute_delay(make_small(ERTS_MONOTONIC_START_MSEC), before)).is_ok());
+        assert!(delay_ms(timer_absolute_delay(make_small(ERTS_MONOTONIC_END_MSEC), before)).is_ok());
+        // ... and one step beyond either edge is the oracle's `badarg` (which `timer.erl`
+        // catches).
+        assert_eq!(
+            delay_ms(timer_absolute_delay(make_small(ERTS_MONOTONIC_START_MSEC - 1), before)),
+            Err(Some("badarg"))
+        );
+        assert_eq!(
+            delay_ms(timer_absolute_delay(make_small(ERTS_MONOTONIC_END_MSEC + 1), before)),
+            Err(Some("badarg"))
+        );
+    }
+
+    #[test]
+    fn an_absolute_deadline_yields_the_remaining_delay() {
+        // `timer:system_time/0` is `erlang:monotonic_time(microsecond)` rounded to
+        // milliseconds, so a caller's `system_time() + Time` is `now_ms + Time`; the
+        // subtraction hands the caller's own `Time` back.
+        let now_ms = ERTS_MONOTONIC_START_MSEC + 1_000;
+        let now_nanos = now_ms * 1_000_000;
+        assert_eq!(
+            delay_ms(timer_absolute_delay(make_small(now_ms + 50), now_nanos)),
+            Ok(50)
+        );
+        // The sub-millisecond part of `now` is truncated, not rounded, exactly as the C's
+        // `ERTS_MONOTONIC_TO_MSEC` shifts it down.
+        assert_eq!(
+            delay_ms(timer_absolute_delay(make_small(now_ms + 50), now_nanos + 999_999)),
+            Ok(50)
+        );
+        // A deadline that has already passed fires at the next scheduler pass.
+        assert_eq!(
+            delay_ms(timer_absolute_delay(make_small(now_ms), now_nanos + 1_000_000)),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn a_non_integer_or_a_bignum_absolute_is_badarg() {
+        // `erlang:start_timer(9223372036854775807, self(), x, [{abs,true}])` is the
+        // `badarg` end of the CLI probe; it arrives here as a bignum.
+        let mut heap = Heap::new(16).expect("a heap");
+        let huge = big(&mut heap, false, &[u64::MAX, i64::MAX as u64]);
+        for term in [NIL, huge] {
+            assert_eq!(
+                delay_ms(timer_absolute_delay(term, 0)),
+                Err(Some("badarg")),
+                "only a small-integer absolute is a time"
+            );
+        }
     }
 }

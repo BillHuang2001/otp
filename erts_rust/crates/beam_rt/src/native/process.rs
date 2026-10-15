@@ -20,8 +20,27 @@
 
 //! The `erlang:*` process, registry and reference floor: `make_ref/0`, the process/port/
 //! registry queries (`ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`,
-//! `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`) and the spawn family. The
-//! monitors (`monitor/2,3`, `demonitor/1,2`) live in the child [`monitor`] module.
+//! `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`), the `monitor_nodes` forms
+//! of `process_flag/2` and the spawn family. The monitors (`monitor/2,3`, `demonitor/1,2`)
+//! live in the child [`monitor`] module.
+//!
+//! # `erlang:process_flag(monitor_nodes | {monitor_nodes, Opts}, Bool)`
+//!
+//! The bare atom `monitor_nodes` and the two-tuple `{monitor_nodes, Opts}` are the two
+//! **undocumented** first arguments the C's `process_flag/2` intercepts before it delegates
+//! to `process_flag_aux` (`bif.c:2202-2227`) — the flag `net_kernel:monitor_nodes/1,2`
+//! (`lib/kernel/src/net_kernel.erl:673`) sets, and the A.9 boot path's `global:init/1` needs
+//! (`lib/kernel/src/global.erl:800`). The floor must serve them because the `beam_bifs`
+//! `ProcessHook` seam cannot: its `process_flag` takes an **atom** flag, so `process_flag_2`
+//! rejects a tuple first argument with `badarg` *before* the seam is consulted.
+//!
+//! [`RuntimeContext::process_flag_native`] claims **only** those two shapes and answers
+//! `None` for everything else, so an ordinary atom flag (`trap_exit`, `async_dist`,
+//! `priority`, `save_calls`, …) still falls through to the registry and its `ProcessHook`
+//! bridge unchanged. The flag's value is a per-process reference **count** keyed by the
+//! option bitmask the map folds to (`erts_monitor_nodes`, `dist.c:6754-6868`) and lives in
+//! [`Runtime::monitor_nodes_add`](crate::Runtime::monitor_nodes_add) /
+//! [`Runtime::monitor_nodes_remove`](crate::Runtime::monitor_nodes_remove).
 //!
 //! These are BIFs in name only: every one of them reads or writes the **runtime's** own
 //! process table, port registry or module set, so they live on the runtime-native floor
@@ -51,7 +70,7 @@ use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_gc::HeapPolicy;
 use beam_process::{MonitorKind, MonitorRef, Priority, ProcessId, UnaliasMode};
-use beam_term::{atom_val, is_atom, is_small, signed_value, Eterm, NIL};
+use beam_term::{atom_val, is_atom, is_nil, is_small, make_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -807,6 +826,35 @@ impl RuntimeContext<'_> {
         Ok(self.runtime.self_pid.to_eterm())
     }
 
+    // -- erlang:hibernate/0 ---------------------------------------------------
+
+    /// `erlang:hibernate/0`: continue, answering the atom `true`.
+    ///
+    /// `erlang:hibernate/0` is an OTP-30 **instruction**, not a `bif.tab` BIF: the C's
+    /// `erts/emulator/beam/emu/ops.tab:896-898` rewrites `call_ext erlang:hibernate/0` to
+    /// `i_hibernate` (declared at `ops.tab:975`). This runtime's `beam_loader` performs no
+    /// such transform, so the call stays a `call_ext`; `erlang` is a floor namespace
+    /// ([`FLOOR_MODULES`](super::FLOOR_MODULES)), so the engine refuses to enter it
+    /// in-machine and the call reaches this arm.
+    ///
+    /// The C's `erts_hibernate` (`erts/emulator/beam/beam_common.c:1568-1602`) saves the
+    /// argument registers, and — when no signal is pending — shrinks the heap
+    /// (`erts_garbage_collect_hibernate`) and clears the process's ACTIVE flag
+    /// (`ERTS_PSFLG_ACTIVE`), then **returns** and execution continues at the next
+    /// instruction (it never blocks itself; the blocking is done by the `receive` that
+    /// *follows* a hibernate call, e.g. `gen_server:loop_wakeup/4`,
+    /// `lib/stdlib/src/gen_server.erl:2343-2348`). Those effects are memory/scheduling
+    /// optimizations with no result difference for any ordinary caller.
+    ///
+    /// This runtime therefore models "hibernate" as **continue**: it answers `true` and does
+    /// nothing else, because its process heap is a single nursery it cannot shrink in place
+    /// and it models no ACTIVE flag. The caller's own following `receive` blocks the process,
+    /// so the observable behaviour matches. The only OTP callers of `erlang:hibernate/0`
+    /// (`gen_server.erl:2340`, `gen_statem.erl:3587`) both enter a `receive` immediately
+    /// afterwards and use no return value, so no observable result depends on the heap shrink.
+    pub(super) fn hibernate_0(&mut self) -> Result<Eterm> {
+        self.atom("true")
+    }
     // -- whereis/1, register/2, unregister/1, module_loaded/1 -----------------
 
     /// `erlang:whereis(Name)`: the pid registered under `Name`, or the atom `undefined`.
@@ -903,8 +951,131 @@ impl RuntimeContext<'_> {
         self.atom(if loaded { "true" } else { "false" })
     }
 
-    // -- helpers --------------------------------------------------------------
+    // -- erlang:process_flag(monitor_nodes | {monitor_nodes, Opts}, Bool) -----
 
+    /// The `monitor_nodes` forms of `erlang:process_flag/2` — the undocumented flag
+    /// `net_kernel:monitor_nodes/1,2` uses.
+    ///
+    /// The floor owns exactly the two shapes the C's `process_flag/2` intercepts before it
+    /// delegates to `process_flag_aux` (`bif.c:2202-2227`):
+    ///
+    /// * the bare atom `monitor_nodes` ⇒ no option list (`erts_monitor_nodes(c_p, On, NIL)`);
+    /// * a two-tuple `{monitor_nodes, Options}` ⇒ `erts_monitor_nodes(c_p, On, Options)`.
+    ///
+    /// Every other first argument — an ordinary atom flag (`trap_exit`, `async_dist`,
+    /// `priority`, `save_calls`, …) and every other tuple — answers `None`, so the arm falls
+    /// through to the `beam_bifs` registry and its `ProcessHook` bridge unchanged. The
+    /// `ProcessHook` seam cannot express this flag at all: its `process_flag` takes an
+    /// **atom** flag, so `process_flag_2` rejects a tuple first argument with `badarg` before
+    /// the seam is reached — the A.9 boot blocker (see [`crate::native`] and
+    /// [`Runtime::monitor_nodes_add`](crate::Runtime::monitor_nodes_add)).
+    pub(super) fn process_flag_native(&mut self, args: &[Eterm]) -> Option<Result<Eterm>> {
+        // The dispatch arm fixes the arity at 2; guard anyway so a stray caller cannot index out.
+        let flag = *args.first()?;
+        let on = *args.get(1)?;
+        let options = if self.atom_name(flag).as_deref() == Some("monitor_nodes") {
+            NIL
+        } else if matches!(terms::tuple_arity(flag), Ok(2)) {
+            let head = terms::tuple_element(flag, 0).ok()?;
+            if self.atom_name(head).as_deref() == Some("monitor_nodes") {
+                terms::tuple_element(flag, 1).ok()?
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+        Some(self.monitor_nodes(on, options))
+    }
+
+    /// The body of `erts_monitor_nodes` (`dist.c:6754-6868`): validates `On`, folds `Options`
+    /// to the option bitmask, then reads-and-updates the **calling** process's registration,
+    /// answering the previous reference count.
+    ///
+    /// `on == true` creates the entry (count `0`) when absent and increments it; `on == false`
+    /// answers the current count (`0` when absent) and deletes the whole entry regardless of
+    /// the count. `On` must be the atom `true` or `false`, else it is the C's `THE_NON_VALUE`
+    /// ⇒ `badarg`.
+    fn monitor_nodes(&mut self, on: Eterm, options: Eterm) -> Result<Eterm> {
+        let on = match self.atom_name(on).as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(BeamError::BadArg),
+        };
+        let key = self.monitor_nodes_key(options)?;
+        let pid = self.pid();
+        let old = if on {
+            self.runtime.monitor_nodes_add(pid, key)
+        } else {
+            self.runtime.monitor_nodes_remove(pid, key)
+        };
+        Ok(make_small(old as i64))
+    }
+
+    /// Folds the `Options` argument to the C's option bitmask (`dist.c:6758-6825`).
+    ///
+    /// The bit constants are `dist.c:6721-6728`: `TYPE_VISIBLE = 1`, `TYPE_HIDDEN = 2`,
+    /// `DOWN_REASON = 4`, `INFO_MAP = 8`, `CONN_ID = 16` (and `TYPES = TYPE_VISIBLE |
+    /// TYPE_HIDDEN`). The mask starts at `INFO_MAP`; `[]` clears it (⇒ `0`); a map is walked
+    /// key by key — `list => true` clears `INFO_MAP`, `connection_id => true` sets `CONN_ID`
+    /// (`false` is a no-op), `node_type` sets its `visible`/`hidden`/`all` bit(s),
+    /// `nodedown_reason => true` sets `DOWN_REASON` (`false` a no-op). Anything else is the
+    /// C's `THE_NON_VALUE` ⇒ `badarg`: one of the four keys with a wrongly-typed value, an
+    /// **unrecognised** key (the C's `no_opts != erts_map_size(options)` check,
+    /// `dist.c:6821-6822`), and a non-`NIL`, non-map argument (`dist.c:6766-6771`).
+    ///
+    /// The four keys touch four **disjoint** bit groups, so walking the map in any order
+    /// produces the same mask the C's fixed `list`/`connection_id`/`node_type`/
+    /// `nodedown_reason` read order does.
+    fn monitor_nodes_key(&self, options: Eterm) -> Result<u64> {
+        const TYPE_VISIBLE: u64 = 1;
+        const TYPE_HIDDEN: u64 = 2;
+        const DOWN_REASON: u64 = 4;
+        const INFO_MAP: u64 = 8;
+        const CONN_ID: u64 = 16;
+        const TYPES: u64 = TYPE_VISIBLE | TYPE_HIDDEN;
+
+        if is_nil(options) {
+            return Ok(0);
+        }
+        // `map_pairs` rejects a non-map (`TermError::BadMap`, reconciled to `badarg`), which is
+        // exactly the C's `is_not_map(options)` non-THE_NON_VALUE branch.
+        let atoms = self.runtime.code_server.atoms_handle();
+        let pairs = beam_term::map::map_pairs(options, &atoms).map_err(|_| BeamError::BadArg)?;
+        let mut opts = INFO_MAP;
+        for (key, value) in &pairs {
+            match self.atom_name(*key).as_deref() {
+                Some("list") => {
+                    if self.atom_name(*value).as_deref() != Some("true") {
+                        return Err(BeamError::BadArg);
+                    }
+                    opts &= !INFO_MAP;
+                }
+                Some("connection_id") => match self.atom_name(*value).as_deref() {
+                    Some("true") => opts |= CONN_ID,
+                    Some("false") => {}
+                    _ => return Err(BeamError::BadArg),
+                },
+                Some("node_type") => match self.atom_name(*value).as_deref() {
+                    Some("visible") => opts |= TYPE_VISIBLE,
+                    Some("hidden") => opts |= TYPE_HIDDEN,
+                    Some("all") => opts |= TYPES,
+                    _ => return Err(BeamError::BadArg),
+                },
+                Some("nodedown_reason") => match self.atom_name(*value).as_deref() {
+                    Some("true") => opts |= DOWN_REASON,
+                    Some("false") => {}
+                    _ => return Err(BeamError::BadArg),
+                },
+                // An unrecognised key can never satisfy the C's `no_opts ==
+                // erts_map_size(options)` equality, so it is `THE_NON_VALUE`.
+                _ => return Err(BeamError::BadArg),
+            }
+        }
+        Ok(opts)
+    }
+
+    // -- helpers --------------------------------------------------------------
     /// A fresh reference from the runtime's own reference id space: its id and its term.
     ///
     /// The term is built on a pooled BIF heap (see [`Runtime::take_bif_heap`]); that heap
@@ -973,6 +1144,151 @@ mod tests {
         let mut sink = beam_bifs::NullSink;
         let mut context = RuntimeContext::with_output(runtime, &mut sink);
         terms::make_tuple(&mut context, elements).expect("a tuple")
+    }
+
+    /// The map `[{name, value}, …]` built on the process heap by the runtime's own map
+    /// builder; the **atom** keys are interned through the shared table first.
+    fn make_map(runtime: &mut crate::Runtime, pairs: &[(&str, Eterm)]) -> Eterm {
+        let keys: Vec<Eterm> = pairs.iter().map(|(name, _)| atom(runtime, name)).collect();
+        let pairs: Vec<(Eterm, Eterm)> = keys
+            .into_iter()
+            .zip(pairs.iter().map(|(_, value)| *value))
+            .collect();
+        let atoms = runtime.code_server().atoms_handle();
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        terms::make_map(&mut context, &pairs, &atoms).expect("a map")
+    }
+
+    // -- erlang:process_flag(monitor_nodes | {monitor_nodes, Opts}, Bool) -----
+
+    /// The four-step refcount sequence the oracle pins for one and the same option map
+    /// (`dist.c:6827-6865`): `true` answers the previous count, `false` answers the count and
+    /// deletes the whole entry.
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1): `process_flag({monitor_nodes,
+    /// #{list=>true, connection_id=>true}}, true)` ⇒ `0`, again ⇒ `1`, then `false` ⇒ `2`, then
+    /// `false` ⇒ `0`.
+    #[test]
+    fn monitor_nodes_tuple_flag_refcounts_the_registration() {
+        let mut runtime = runtime();
+        let v_true = atom(&mut runtime, "true");
+        let v_false = atom(&mut runtime, "false");
+        let monitor_nodes = atom(&mut runtime, "monitor_nodes");
+        let options = make_map(&mut runtime, &[("list", v_true), ("connection_id", v_true)]);
+        let flag = make_tuple(&mut runtime, &[monitor_nodes, options]);
+
+        let first = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect("the {monitor_nodes, Opts} form is served by the floor");
+        assert_eq!(signed_value(first), 0, "the first `true` answers 0");
+        let second = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect("process_flag/2");
+        assert_eq!(signed_value(second), 1, "the second `true` answers 1");
+        let third = call(&mut runtime, "erlang", "process_flag", &[flag, v_false])
+            .expect("process_flag/2");
+        assert_eq!(signed_value(third), 2, "`false` answers the count 2");
+        let fourth = call(&mut runtime, "erlang", "process_flag", &[flag, v_false])
+            .expect("process_flag/2");
+        assert_eq!(
+            signed_value(fourth),
+            0,
+            "the entry was removed, so `false` answers 0 again"
+        );
+    }
+
+    /// The bare-atom form: `process_flag(monitor_nodes, Bool)` uses the **empty** option list
+    /// (`erts_monitor_nodes(c_p, On, NIL)`, `dist.c:6766-6768`), whose bitmask is `0` — a
+    /// different key from any option map, so a fresh runtime answers `0`.
+    ///
+    /// Oracle: `process_flag(monitor_nodes, true)` ⇒ `0`.
+    #[test]
+    fn monitor_nodes_bare_atom_flag_answers_zero_first() {
+        let mut runtime = runtime();
+        let v_true = atom(&mut runtime, "true");
+        let flag = atom(&mut runtime, "monitor_nodes");
+
+        let first = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect("the bare-atom form is served by the floor");
+        assert_eq!(signed_value(first), 0, "the first `true` answers 0");
+        let second = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect("process_flag/2");
+        assert_eq!(signed_value(second), 1, "the second `true` answers 1");
+    }
+
+    /// The empty option map: `process_flag({monitor_nodes, #{}}, true)` keeps the initial
+    /// `INFO_MAP` bit (`dist.c:6758`, `6825`), so its key is `8` — again a fresh runtime
+    /// answers `0`.
+    ///
+    /// Oracle: `process_flag({monitor_nodes, #{}}, true)` ⇒ `0`.
+    #[test]
+    fn monitor_nodes_empty_option_map_answers_zero() {
+        let mut runtime = runtime();
+        let v_true = atom(&mut runtime, "true");
+        let monitor_nodes = atom(&mut runtime, "monitor_nodes");
+        let options = make_map(&mut runtime, &[]);
+        let flag = make_tuple(&mut runtime, &[monitor_nodes, options]);
+
+        let answer = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect("the empty option map is a valid registration");
+        assert_eq!(signed_value(answer), 0);
+    }
+
+    /// Every malformed `monitor_nodes` form is the C's `THE_NON_VALUE` ⇒ `badarg`
+    /// (`dist.c:6763-6764`, `6769-6770`, `6782-6783`, `6821-6822`).
+    ///
+    /// Oracle: `process_flag({monitor_nodes, #{bogus=>1}}, true)` ⇒ `badarg`.
+    #[test]
+    fn monitor_nodes_rejects_invalid_options_and_a_non_boolean_flag() {
+        let mut runtime = runtime();
+        let v_true = atom(&mut runtime, "true");
+        let monitor_nodes = atom(&mut runtime, "monitor_nodes");
+        let one = make_small(1);
+
+        // An unrecognised option key: the C's `no_opts != erts_map_size(options)` check.
+        let bogus = make_map(&mut runtime, &[("bogus", one)]);
+        let flag = make_tuple(&mut runtime, &[monitor_nodes, bogus]);
+        let error = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect_err("an unknown option key is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+
+        // A recognised key with a wrongly-typed value (`list` must be `true`).
+        let wrong = make_map(&mut runtime, &[("list", one)]);
+        let flag = make_tuple(&mut runtime, &[monitor_nodes, wrong]);
+        let error = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect_err("`list => 1` is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+
+        // A non-map, non-NIL option list.
+        let flag = make_tuple(&mut runtime, &[monitor_nodes, one]);
+        let error = call(&mut runtime, "erlang", "process_flag", &[flag, v_true])
+            .expect_err("a non-map option list is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+
+        // The bare-atom form with a non-boolean `on`.
+        let error = call(&mut runtime, "erlang", "process_flag", &[monitor_nodes, one])
+            .expect_err("`on` must be `true` or `false`");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
+
+    /// The arm answers `None` for every flag it does not own, so an ordinary atom flag still
+    /// reaches the `beam_bifs` registry and its `ProcessHook` bridge unchanged.
+    #[test]
+    fn an_ordinary_atom_flag_still_reaches_the_registry() {
+        let mut runtime = runtime();
+        let trap_exit = atom(&mut runtime, "trap_exit");
+        let v_true = atom(&mut runtime, "true");
+        let v_false = atom(&mut runtime, "false");
+
+        let answer = call(&mut runtime, "erlang", "process_flag", &[trap_exit, v_true])
+            .expect("`trap_exit` is the registry's, not the floor's");
+        assert_eq!(
+            atom_name(&runtime, answer),
+            Some("false"),
+            "the previous value of a fresh process is `false`"
+        );
+        let answer = call(&mut runtime, "erlang", "process_flag", &[trap_exit, v_false])
+            .expect("process_flag/2");
+        assert_eq!(atom_name(&runtime, answer), Some("true"), "the previous value");
     }
 
     #[test]
@@ -1173,6 +1489,23 @@ mod tests {
     }
 
     #[test]
+    fn hibernate_continues_and_answers_true() {
+        // `erlang:hibernate/0` is an OTP-30 instruction modelled here as "continue": it
+        // answers the atom `true` (the C's `erts_hibernate` only shrinks the heap and clears
+        // the ACTIVE flag; the caller's own following `receive` does the blocking).
+        let mut runtime = runtime();
+        let answer = call(&mut runtime, "erlang", "hibernate", &[]).expect("erlang:hibernate/0");
+        assert_eq!(
+            atom_name(&runtime, answer),
+            Some("true"),
+            "hibernate/0 answers true"
+        );
+        // The arity is exact: `hibernate/1` is not a floor arm and falls through.
+        assert!(
+            call(&mut runtime, "erlang", "hibernate", &[NIL]).is_err(),
+            "hibernate/1 is not a floor BIF"
+        );
+    }    #[test]
     fn processes_lists_the_live_pids() {
         let mut runtime = runtime();
         let all = call(&mut runtime, "erlang", "processes", &[]).expect("processes/0");

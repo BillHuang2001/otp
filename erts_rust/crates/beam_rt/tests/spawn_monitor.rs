@@ -269,7 +269,11 @@ fn run_fixture(fixture: &Fixture, function: &str) -> Run {
         .unwrap_or_else(|| panic!("the fixture path is not UTF-8: {}", fixture.beam.display()));
     run_bounded(
         Path::new(env!("CARGO_BIN_EXE_beam_rt")),
-        &["run", beam, &format!("{MODULE}:{function}/0")],
+        // `-noshell`: the `run` action is banner-free by construction (it records the
+        // `noshell` init argument, so the booted kernel prints no OTP slogan) and prints only
+        // its own `~w~n` line — so a capability gap still prints *nothing* on stdout. Kept to
+        // mirror the oracle probe.
+        &["-noshell", "run", beam, &format!("{MODULE}:{function}/0")],
     )
 }
 

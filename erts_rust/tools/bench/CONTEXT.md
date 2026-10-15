@@ -201,10 +201,13 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   (`bench_foreign_driver`), and runs the identical `.beam` under **whatever runtime it is scheduled on**.
   Measurement is **startup-corrected per call**: each case declares a per-runtime loop count `N` and the
   program is run twice per sample — at `N` and at `0` iterations — giving `case_<name>_wall_ms`,
-  `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, and the throughput metric
+  `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, the throughput metric
   `case_<name>_ns_per_call = (mean(wall@N) − mean(wall@0)) / N × 1e6`, emitted only when positive (else an
-  honest note). Every runtime's stdout must equal `N × per_call` (recorded in an `observed stdout:` note); a
-  Rust exit `3` records the capability gap and emits **no** timing. `foreign` peak RSS is **not** a
+  honest note), plus the deterministic, contention-immune companion **`case_<name>_calls = N`** (mirroring
+  `copy_bound`'s `case_<name>_ops`) so the loop count behind every marginal is in the report. Every
+  runtime's stdout must equal `N × per_call` (recorded in an `observed stdout:` note); a Rust exit `3`
+  records the capability gap and emits **no** timing. The Rust row also carries an explicit note that
+  `case_<name>_ns_per_call` is **N-dependent** (see Known Issues). `foreign` peak RSS is **not** a
   like-for-like memory comparison (rust RSS scales with the loop count — see Known Issues); `slice` is.
 - `list_walk`: **the permanent, reproducible per-element dispatch-throughput signal** — an in-tree embedded
   `bench_list_walk` module with a **BIF-free, non-tail-recursive `sum/1`** over a fixed-length list, built
@@ -294,7 +297,11 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   and the `m11-load-record.md`/`m11-tool-targets-notes.md` records); `m10-*`/`m9-*` = the previous runs
   (kept as the regression baseline; the `m9-*` group also holds the post-fix tool-resolution smokes
   `m9-bench-plb-smoke.json` / `m9-bench-plb-smoke-path8.json` / `m9-bench-emqx-smoke.json`), and
-  `m6-*`/`m5-*`/`m4-*` the runs before those.
+  `m6-*`/`m5-*`/`m4-*` the runs before those. The `b54-*` group holds the controlled experiments behind the
+  resolved `foreign`/RSS verdicts: `b54-foreign-ab-m10.json` / `b54-foreign-ab-head.json` (the `--quick`
+  `foreign` A/B with `$BEAM_RT` alternating the m10 (`b4593818b3`) and HEAD binaries at matched `N`; the m10
+  side's program is normalised to `$TMPDIR/m10wt/erts_rust/target/release/beam_rt`) and
+  `b54-foreign-growth-curve.md` (the direct `enc` ladder on both binaries, both tiers).
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
@@ -379,6 +386,12 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `out/` is gitignored by `../../.gitignore` (`/tools/bench/out/`); the standard scratch artifact is
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked** `results/`
   directory (see `RESULTS.md`), which is for committed milestone numbers only.
+- **`foreign`'s `case_<name>_ns_per_call` is N-dependent on the Rust runtime** (the per-call cost grows with
+  `N`, super-linearly), so it is only comparable across runs that used the same `N`; each row emits a
+  `case_<name>_calls` companion and an explicit note. The rows are **not** a clean cross-runtime ratio, and
+  the loop workloads' rust peak RSS grows with `N` too (a general per-op heap retention, not ETS-specific).
+  Both facts, with the owner `file:line`s and the root causes (which live **outside this node**), are in the
+  dedicated *Known Issue* section below — read it before quoting a `foreign` number or a loop-workload RSS.
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests`: `stats` (percentile/mean edge cases), `metrics`/`report`
@@ -477,7 +490,7 @@ regardless of `PATH` order); the rest probe ready, and `khepri` runs once the `r
 
 ## Status
 - The driver is a complete library + binary: 12 workloads, all implemented and tested; `cargo test -p bench`
-  is green (**251 passed / 0 failed** at the m11 commit).
+  is green (**253 passed / 0 failed**: 245 lib unit + 4 integration + 1 oracle smoke + 3 doc).
 - **Current measurement session: `m11` (2026-10-14 05:47–06:57 UTC, commit `ab6f1b5e58835cbf5fcb75257679532c46090a74`).**
   The full cross-runtime pass ran 12/12 rows `ok` (six `Runtimes::Both` workloads × both runtimes); the
   full sys-only external-target pass ran 4/4 `ok` (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`);
@@ -533,10 +546,14 @@ cost: the engine's dispatch arm is itself O(1) and allocation-free per instructi
 behind it are `beam_rt` measurements owned by `../../crates/beam_rt/PERF.md` (the per-call dispatch section)
 and `../../crates/beam_rt/CONTEXT.md`, not `bench` output.
 
-**Caveat (m11).** At this commit the `foreign` `ns_per_call` row is additionally **N-dependent
-(super-linear)**, so its per-call figure is **not a clean marginal at the measured `N`** and the m11-vs-m10
-`foreign` jump is at least partly that effect; it is recorded in `RESULTS.md` §3.4/§8 item 1 and routed
-upward (outside this node — not diagnosed here).
+**The `foreign` per-call row is N-dependent *and* carries a genuine m10→m11 regression at matched `N`** (both
+resolved; the fix owner is **outside this node**). The `ns_per_call` marginal is only valid/comparable at the
+declared `N` (the Rust per-call cost grows super-linearly with `N`; the sys side is ~flat), and the m10→m11
+move measured at *matched* `N` is a real regression — root-caused to commit `e59dd30432`'s per-slice off-heap
+registration loop (`beam_rt`/`beam_process`) ⇒ Θ(N³). Recorded in `RESULTS.md` §3.4/§8 item 1, with the
+committed A/B and growth-curve evidence in `results/b54-foreign-ab-{m10,head}.json` /
+`results/b54-foreign-growth-curve.md`; the detail (with the owner `file:line`s) is in the *Known Issue*
+section below.
 
 **The `beam_rt` execution tier defaults to the native baseline JIT** (`JitMode::Auto` ⇒ `Tier::BaselineJit` on
 a process's first entry, remembered across pre-emptions and suspends; `BEAM_RT_TIER=interpreter` is the only
@@ -572,22 +589,36 @@ whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_
 per-call/per-element/per-op rows are snapshots of the term-copy / per-element dispatch / GC cost and should be
 re-run via the Runbook rather than adjusted.
 
-## Known Issue — rust peak RSS still scales with the loop count `N` on some paths
+## Known Issue — the `foreign` per-call metric is `N`-dependent, and rust peak RSS scales with the loop count `N`
 
-`beam_rt` has a per-process collector at the engine's heap-admission point (`crates/beam_rt/src/runtime/gc.rs`,
-`context/gc.rs`) and the BIF-result copy-out + pooled-heap rewind (`crates/beam_rt/src/context/calls.rs`)
-bounds the **BIF-churn** shape, so `gc_bound`'s and `list_walk`'s rust peak RSS sit **below** the oracle's
-(m11: 15.43 / 15.21 MiB p50 vs sys 66.66 / 66.34 MiB). But the bound is **not** universal:
-- `copy_bound`'s `ets_copy` row still reaches **90.39 MiB** rust at `N` = 100 000 vs sys 66.91 MiB (m10:
-  90.30 — it has *not* fallen), and the two `foreign` `cowboy_bstr` cases still track their `N`
-  (74.5–77.0 MiB rust at `N` = 15 000–20 000 vs sys 66.1–66.6 MiB).
-- **The m10 "ETS-adopt path" explanation for the `ets_copy` growth is REFUTED** (by batch 52's bisection);
-  the growth is real, the mechanism is **unidentified**. Do not restate the ETS-adopt lead as if it were live.
+### `foreign` `case_<name>_ns_per_call` is N-dependent on the Rust runtime
+
+On `beam_rt` the per-call cost **itself grows with `N`** (measured super-linear; committed evidence
+`results/b54-foreign-growth-curve.md`), so `foreign`'s `case_<name>_ns_per_call` is only a clean marginal at
+the declared `N` and is **only comparable across runs that used the same `N`**; the `sys` oracle side is
+~flat over the same range. `RESULTS.md` §3.4 records the resolved verdict (the m10→m11 move is a genuine
+regression at *matched* `N`, root-caused **outside this node** to a per-slice off-heap registration loop in
+`beam_rt`/`beam_process` — commit `e59dd30432`). This workload's job here is honesty, not the fix: every row
+emits the deterministic `case_<name>_calls = N` companion, and the Rust row carries an explicit
+N-dependence note, so a per-call figure is never quoted without the `N` behind it.
+
+### rust peak RSS scales with the loop count `N` on some paths
+
+The growth is a **general per-op heap retention** (~2–3 KiB/iteration), **not** ETS-specific and **not**
+tied to any one workload: the BIF-result copy-out (`crates/beam_rt/src/context/calls.rs`) and the engine's
+unrooted `alloc_words` seam (`crates/beam_rt/src/context/gc.rs`) both call `Process::grow_nursery`
+(`crates/beam_process/src/process.rs`) → `Nursery::grow` (`crates/beam_gc/src/nursery.rs`), which pushes the
+replaced whole `HeapSpace` onto `Nursery.retired`; `retired` is cleared only by a real collection
+(`Nursery::collapse`), which these loops never trigger. So `ets_copy` (largest `N`, **90.39 MiB** at
+`N` = 100 000 vs sys 66.91 MiB) and the two `foreign` `cowboy_bstr` cases (74.5–77.0 MiB at `N` = 15 000–20 000
+vs sys 66.1–66.6 MiB) grow with `N`, while `gc_bound` and `list_walk` rust peak RSS sit **below** the
+oracle's (15.43 / 15.21 MiB p50 vs sys 66.66 / 66.34 MiB). The per-op `.erl` `ByteSize`/`tuple_size` checks
+still make a silently-dropped allocation fail loudly — this is a retention, not a correctness, issue.
 
 So the rust `foreign`/`copy_bound` per-case `case_<name>_peak_rss_bytes` is **not** a like-for-like memory
-comparison, and the loop-length-dependent rust RSS rows are listed in `RESULTS.md` §8 (item 5 onward).
+comparison, and the loop-length-dependent rust RSS rows are listed in `RESULTS.md` §8 (item 5).
 `slice` (one call per process, `N`=1) remains the comparable per-process memory metric. The figures are in
-`RESULTS.md` §3.3/§3.6/§6.7.
+`RESULTS.md` §3.3/§3.6/§6.7 and the direct sweep is in `results/b54-foreign-growth-curve.md`.
 
 ## Honesty audit — measurement-integrity notes (current state)
 

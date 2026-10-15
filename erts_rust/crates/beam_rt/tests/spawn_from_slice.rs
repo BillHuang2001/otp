@@ -264,7 +264,13 @@ fn spawning_from_a_scheduler_slice_reaches_the_children() {
 
     for (label, function, expected) in FLOWS {
         let spec = format!("{MODULE}:{function}/0");
-        let ours = run_bounded(Path::new(env!("CARGO_BIN_EXE_beam_rt")), &["run", beam, &spec]);
+        let ours = run_bounded(
+            Path::new(env!("CARGO_BIN_EXE_beam_rt")),
+            // `-noshell`: the `run` action is banner-free by construction (it records the
+            // `noshell` init argument, so the booted kernel prints no OTP slogan); it is kept
+            // to mirror the oracle probe.
+            &["-noshell", "run", beam, &spec],
+        );
         assert_eq!(
             ours.code, 0,
             "{label}: `beam_rt run {beam} {spec}` exited {}: {}",

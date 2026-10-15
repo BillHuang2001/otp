@@ -219,10 +219,8 @@ impl RuntimeContext<'_> {
             ("allocate", 3) => Some(Err(error::unsupported(
                 "prim_file:allocate/3: needs posix_fallocate(2), which no safe std API exposes",
             ))),
-            ("list_dir", 1) | ("list_dir_all", 1) => Some(Err(error::unsupported(
-                "prim_file:list_dir/1: the answer is raw readdir(3) order, a property of the \
-                 on-disk directory state that cannot be pinned deterministically",
-            ))),
+            ("list_dir", 1) => Some(self.prim_list_dir(args, true)),
+            ("list_dir_all", 1) => Some(self.prim_list_dir(args, false)),
             ("read_line", 1) => Some(Err(error::unsupported(
                 "prim_file:read_line/1: its Erlang body drives the prim_buffer:* resource NIFs, \
                  which this runtime does not model",
@@ -320,8 +318,61 @@ impl RuntimeContext<'_> {
         }
     }
 
-    // -- prim_file:delete/1 ---------------------------------------------------
+    // -- prim_file:list_dir/1, list_dir_all/1 ---------------------------------
 
+    /// `prim_file:list_dir/1` and `prim_file:list_dir_all/1` — the directory entries as
+    /// `{ok, Names}`, or `{error, Reason}` (`prim_file.erl`'s
+    /// `list_dir/1 = list_dir_1(Name, false)` / `list_dir_all/1 = list_dir_1(Name, true)`).
+    ///
+    /// `list_dir_nif/1` answers the **raw** `readdir(3)` names as binaries, and the Erlang
+    /// wrapper folds them through `decode_path/1` **prepending** each decoded name, so the
+    /// result is the reverse of the native listing. A name the native encoding cannot decode
+    /// is *skipped* by `list_dir_all/1` (its `SkipInvalid` is `true`) and kept as its **raw
+    /// binary** by `list_dir/1`. Both are reproduced here; the one documented divergence is
+    /// the native listing itself, whose order is a property of the on-disk directory state
+    /// (`readdir(3)`) that no implementation can pin.
+    ///
+    /// Oracle: `list_dir("/tmp/nope")`⇒`{error,enoent}`; `list_dir("afile")`⇒
+    /// `{error,enotdir}`; `list_dir(<<"/tmp/a",0>>)`/`list_dir(1)`⇒`{error,badarg}`.
+    fn prim_list_dir(&mut self, args: &[Eterm], skip_invalid: bool) -> Result<Eterm> {
+        let Some(path) = self.first_path(args) else {
+            return self.error_tuple("badarg");
+        };
+        let entries = match fs::read_dir(std::ffi::OsStr::from_bytes(&path)) {
+            Ok(entries) => entries,
+            Err(error) => return self.error_tuple_for(&error),
+        };
+        // The wrapper's fold prepends, so the answered order is the reverse of the listing.
+        let mut raw: Vec<std::ffi::OsString> = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => raw.push(entry.file_name()),
+                Err(error) => return self.error_tuple_for(&error),
+            }
+        }
+        raw.reverse();
+        let mut names: Vec<Eterm> = Vec::with_capacity(raw.len());
+        for name in raw {
+            match name.to_str() {
+                Some(text) => {
+                    let name = self.charlist(text)?;
+                    names.push(name);
+                }
+                // A name the native encoding cannot decode: `list_dir_all/1` skips it,
+                // `list_dir/1` keeps it as the raw byte string the C answered.
+                None if skip_invalid => {}
+                None => {
+                    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str());
+                    let name = beam_codec::term::make_binary(self.eval_heap(), bytes)?;
+                    names.push(name);
+                }
+            }
+        }
+        let list = terms::make_list(self, &names)?;
+        self.ok_tuple(list)
+    }
+
+    // -- prim_file:delete/1 ---------------------------------------------------
     /// `prim_file:delete/1` — `del_file_nif/1` → `efile_del_file` → `unlink(2)`
     /// (`prim_file.erl:804-809`, `unix_prim_file.c:991-1002`).
     ///
@@ -3113,8 +3164,6 @@ mod tests {
             ("write_file_info", &three[..]),
             ("advise", &four[..]),
             ("allocate", &three[..]),
-            ("list_dir", &one[..]),
-            ("list_dir_all", &one[..]),
             ("read_line", &one[..]),
             ("file_desc_to_ref", &two[..]),
         ] {

@@ -45,11 +45,12 @@
 //!   for a top-level `COMPRESSED` image stops at the zlib stream's end, so bytes after
 //!   the image are uncounted) and `safe` (which refuses an image that would create an
 //!   atom);
-//! * the two remaining `term_to_binary/2` flags: `deterministic` (byte-exact when no
-//!   map needs its keys re-sorted into atom-name order, a typed `unsupported_bif`
-//!   otherwise) and `local` (always a typed `unsupported_bif` — its `LOCAL_EXT` payload
-//!   is the node-local hash), plus the C's `badarg` for `iovec`/`fragment`, their
-//!   tuples, and the mutually exclusive `local` + `deterministic` pair.
+//! * the two remaining `term_to_binary/2` flags: `deterministic` (a map's pairs are
+//!   re-sorted into full Erlang term order, byte-exactly as the oracle does — see
+//!   `tests/term_to_binary_options.rs` for the live cross-check) and `local` (always a
+//!   typed `unsupported_bif` — its `LOCAL_EXT` payload is the node-local hash), plus
+//!   the C's `badarg` for `iovec`/`fragment`, their tuples, and the mutually exclusive
+//!   `local` + `deterministic` pair.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -886,9 +887,11 @@ const DETERMINISTIC_MAP_AB: &[u8] = &[
     131, 116, 0, 0, 0, 2, 119, 1, 97, 97, 1, 119, 1, 98, 97, 2,
 ];
 
-/// `[deterministic]` is honoured byte-exactly whenever no map needs re-sorting: a
-/// map-free term is unchanged, and a flat map whose stored order already is the
-/// atom-name order is emitted as-is (the codec's map arms keep the stored order).
+/// `[deterministic]` is byte-exact for a term that has nothing to re-sort: a map-free
+/// term is unchanged, and a flat map whose stored order already *is* the atom-name
+/// order is emitted as-is (the re-sort of the flag is then a no-op). The complementary
+/// case — a map that really does need re-sorting — is
+/// [`term_to_binary_deterministic_resorts_a_flat_map_like_the_oracle`].
 #[test]
 fn term_to_binary_deterministic_is_byte_exact_when_no_resort_is_needed() {
     let reg = default_registry();
@@ -956,11 +959,24 @@ fn term_to_binary_deterministic_is_byte_exact_when_no_resort_is_needed() {
 }
 
 /// A map whose storage order differs from the deterministic (`erts_cmp`, i.e. atom
-/// **name**) order needs the re-sort `beam_codec`'s encoder cannot do, so
-/// `[deterministic]` reports the typed `unsupported_bif` — never the wrongly ordered
-/// plain image. Closing it needs `beam_codec::Encoder::with_deterministic()`.
+/// **name**) order is re-sorted by `[deterministic]`
+/// (`beam_codec::Encoder::with_deterministic`) — byte-exactly the oracle's image, never
+/// the wrongly ordered plain one.
 #[test]
-fn term_to_binary_deterministic_reports_a_typed_gap_when_a_map_must_be_resorted() {
+fn term_to_binary_deterministic_resorts_a_flat_map_like_the_oracle() {
+    /// `erl -noshell -eval 'io:format("~p~n",[term_to_binary(#{b=>1,a=>2},
+    /// [deterministic])]),halt().'` ⇒ `<<131,116,0,0,0,2,119,1,97,97,2,119,1,98,97,1>>`
+    /// — the pairs in atom-**name** order (`a` before `b`).
+    const DETERMINISTIC_MAP_BA: &[u8] = &[
+        131, 116, 0, 0, 0, 2, 119, 1, 97, 97, 2, 119, 1, 98, 97, 1,
+    ];
+    /// The store→encode order the *caller* installed, `[b, a]`: `make_flatmap` keeps
+    /// the pairs in the order it is given (canonical ordering is the map constructor's
+    /// job), so the plain image of the same map is `b=>1, a=>2`.
+    const PLAIN_MAP_BA: &[u8] = &[
+        131, 116, 0, 0, 0, 2, 119, 1, 98, 97, 1, 119, 1, 97, 97, 2,
+    ];
+
     let reg = default_registry();
     let mut heap = Heap::new(4096).expect("test heap");
     let atoms = seeded_atoms();
@@ -974,26 +990,53 @@ fn term_to_binary_deterministic_reports_a_typed_gap_when_a_map_must_be_resorted(
     // Storage order `[b, a]` vs the name order `[a, b]`.
     let map = codec_term::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
     let deterministic = option_atom(&mut ctx, "deterministic");
-    let err = reg
-        .call(
-            "erlang",
-            "term_to_binary",
-            2,
-            &mut ctx,
-            &[map, deterministic],
-        )
-        .expect_err("the map needs a re-sort the encoder cannot do");
-    assert!(
-        is_unsupported_bif(&err),
-        "expected the typed unsupported_bif gap, got {err:?}"
+    assert_eq!(
+        bytes_of(
+            reg.call(
+                "erlang",
+                "term_to_binary",
+                2,
+                &mut ctx,
+                &[map, deterministic]
+            )
+            .expect("term_to_binary(#{b=>1,a=>2},[deterministic])")
+        ),
+        DETERMINISTIC_MAP_BA.to_vec()
     );
 
-    // ...and the plain form of the very same map still encodes (the option is the only
-    // difference), so the gap is the re-sort and nothing else.
+    // A map nested in a container is re-sorted too (the flag lives on the encoder, so
+    // every map it reaches is affected) —
+    // erl ... 'term_to_binary({1,#{b=>1,a=>2}},[deterministic])'
+    //   % <<131,104,2,97,1,116,0,0,0,2,119,1,97,97,2,119,1,98,97,1>>
     let map = codec_term::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
-    assert!(reg
-        .call("erlang", "term_to_binary", 1, &mut ctx, &[map])
-        .is_ok());
+    let nested = ctx.tuple(&[one, map]).expect("fits");
+    let deterministic = option_atom(&mut ctx, "deterministic");
+    let mut expected = vec![VERSION_MAGIC, 104, 2, 97, 1];
+    expected.extend_from_slice(&DETERMINISTIC_MAP_BA[1..]);
+    assert_eq!(
+        bytes_of(
+            reg.call(
+                "erlang",
+                "term_to_binary",
+                2,
+                &mut ctx,
+                &[nested, deterministic]
+            )
+            .expect("term_to_binary({1,#{b=>1,a=>2}},[deterministic])")
+        ),
+        expected
+    );
+
+    // The *plain* image of the very same map keeps the stored order: the option is the
+    // only difference, so this also proves the re-sort really happened.
+    let map = codec_term::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 1, &mut ctx, &[map])
+                .expect("term_to_binary(#{b=>1,a=>2})")
+        ),
+        PLAIN_MAP_BA.to_vec()
+    );
 }
 
 /// `binary_to_term/2`'s `[used]` count for a top-level `COMPRESSED` (tag 80) image is

@@ -137,22 +137,33 @@
 //!   only `Id` varies. The oracle's numbers are the same shape.
 //! * **Internal ports** render as `#Port<0.N>` (see [`format_port`]), the oracle's
 //!   `#Port<Channel.Num>` with the local node's channel `0`.
-//! * **External identifiers** (a pid, port or ref naming another node), a **fun** and
-//!   a **native record** are outside the Milestone-1 printable set. The oracle renders
-//!   all of them, but for an external identifier the rendered channel number is
+//! * **External identifiers** (a pid, port or ref naming another node) and a
+//!   **native record** are outside the Milestone-1 printable set. The oracle renders
+//!   both, but for an external identifier the rendered channel number is
 //!   `atom_val(x->sysname)` — the node-name atom's index in the **running VM's** atom
 //!   table, runtime state the frozen external-identifier term does not carry (measured:
 //!   the same wire image printed `#Port<10643.7>` and `#Port<10639.7>` in two runs), so
-//!   no byte-faithful text exists; a fun's module/name is likewise not in a `make_fun3`
-//!   descriptor. Each is rejected with a typed error — the external identifiers with
-//!   `BeamError::UnsupportedBif` (a capability gap), a fun and a native record with
-//!   `BeamError::BadArg` — rather than guessed. A native record's *single-line* form
-//!   (`#rec:r{a = 1,b = 2}`) is derivable from [`beam_term::record`], but the printer
-//!   cannot emit it as a leaf: `~p`/`~P` route a record through the same
-//!   [`render_chunk`] and would then print the flat form where the oracle's
-//!   `io_lib_pretty` **re-flows** a long record (`pp_record`/`rec_indent` in
+//!   no byte-faithful text exists; each is rejected with the typed
+//!   `BeamError::UnsupportedBif` (a capability gap) rather than guessed. A native
+//!   record's *single-line* form (`#rec:r{a = 1,b = 2}`) is derivable from
+//!   [`beam_term::record`], but the printer cannot emit it as a leaf: `~p`/`~P` route a
+//!   record through the same [`render_chunk`] and would then print the flat form where
+//!   the oracle's `io_lib_pretty` **re-flows** a long record (`pp_record`/`rec_indent` in
 //!   `lib/stdlib/src/io_lib_pretty.erl:249-376`), a *silently wrong* result — so the
 //!   whole class stays a typed gap until that template is ported.
+//!
+//! # Funs
+//!
+//! A **fun**'s leaf is `erlang:fun_to_list/1` (`lib/stdlib/src/io_lib.erl:914` for
+//! `~w`/`~p`, and `io_lib_pretty:print_length/7` at `:932-934` splices the same
+//! text), so an `EXPORT_EXT` fun renders `fun Module:Function/Arity` and a
+//! `NEW_FUN_EXT` fun renders `#Fun<Module.OldIndex.OldUniq>` — both byte-faithfully,
+//! via [`crate::fun_info::fun_text_str`], at any nesting depth. Only a runtime-made
+//! `Local` (`make_fun3`) fun stays the typed capability gap
+//! ([`BeamError::UnsupportedBif`](beam_common::BeamError), matching
+//! `erlang:fun_to_list/1`): its inlined descriptor is only `(uniq, index)`, so the
+//! module/name a `#Fun<…>` needs is not in the term and any rendering would be a
+//! *silently wrong* result.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
@@ -616,13 +627,17 @@ fn render_chunk(
     if is_external_pid(term) || is_external_ref(term) {
         return Err(unsupported_bif());
     }
-    // A **fun** cannot be rendered byte-faithfully here. The oracle's leaf is
-    // `erlang:fun_to_list/1` (`io_lib:write1/4` → `fun_to_list`, and `io_lib_pretty`
-    // has no fun clause at all), which prints `#Fun<M.F.A>`/`#Fun<M.N.A>` from the
-    // fun's module/name/arity — data a runtime-made `Local` (`make_fun3`) fun's
-    // inlined descriptor does not carry (see `beam_term::fun`), so the printer would
-    // have to fabricate it. It stays the typed `badarg` below (documented in the
-    // module docs), never a guessed `#Fun<…>`.
+    // A **fun**'s leaf is `erlang:fun_to_list/1` (`io_lib:write1/4` → `fun_to_list`,
+    // and `io_lib_pretty:print_length/7` splices the same `io_lib:write/1` text —
+    // `lib/stdlib/src/io_lib_pretty.erl:932-934`), i.e. the text
+    // `crate::fun_info::fun_text_str` renders: `fun Module:Function/Arity` for an
+    // `EXPORT_EXT` fun, `#Fun<Module.OldIndex.OldUniq>` for a `NEW_FUN_EXT` fun.
+    // Only a runtime-made `Local` (`make_fun3`) fun stays a typed capability gap —
+    // its inlined descriptor carries no module/name, so a `#Fun<…>` here would be a
+    // *silently wrong* result (see the module docs).
+    if is_function(term) {
+        return Ok(Chunk::text(&crate::fun_info::fun_text_str(term, atoms)?));
+    }
     Err(badarg())
 }
 
@@ -1340,6 +1355,17 @@ mod tests {
         f(&mut ctx)
     }
 
+    /// [`with_ctx`] over an atom table additionally seeded with `extra` (the fun
+    /// tests build `lists`/`reverse`/`nonode@nohost` terms the default seed lacks).
+    fn with_ctx_seeded<R>(extra: &[&str], f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
+        let mut heap = Heap::new(1024).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(["true", "false", "ok", "hello", "Hello", "a", "b", "c", "abc", "hi"]);
+        atoms.seed(extra.iter().copied());
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        f(&mut ctx)
+    }
+
     /// Runs `f` on a thread with a deliberately small (256 KiB) stack.
     ///
     /// The three long-container tests below render a flat list/tuple/map with tens of
@@ -2043,12 +2069,16 @@ mod tests {
     /// An **external** pid/ref is the typed [`unsupported_bif`] capability gap, not a
     /// malformed argument: the oracle renders its channel number through
     /// `atom_val(x->sysname)` — the *running* VM's node-atom index, runtime state the
-    /// frozen external-identifier term does not carry (see [`render_chunk`]). A **fun**
-    /// stays `BadArg`: its leaf is `erlang:fun_to_list/1`, and a runtime-made `Local`
-    /// (`make_fun3`) fun's inlined descriptor carries no module/name to render.
+    /// frozen external-identifier term does not carry (see [`render_chunk`]).
+    ///
+    /// A **fun** renders its `erlang:fun_to_list/1` text (the `~w`/`~p` leaf): an
+    /// `EXPORT_EXT` fun as `fun Module:Function/Arity` and a `NEW_FUN_EXT` fun as
+    /// `#Fun<Module.OldIndex.OldUniq>`. Only a `FunKind::Local` (`make_fun3`) fun
+    /// stays the typed capability gap: its inlined `[header, uniq, index]` descriptor
+    /// carries no module/name to render, so any text would be fabricated.
     #[test]
-    fn external_identifiers_are_a_typed_gap_and_funs_stay_badarg() {
-        with_ctx(|ctx| {
+    fn external_identifiers_and_local_funs_are_typed_gaps() {
+        with_ctx_seeded(&["lists", "reverse", "nonode@nohost", "foo"], |ctx| {
             // An external pid and an external ref are both the typed capability gap.
             let node = ctx.atom("hi").expect("seeded");
             let external_pid =
@@ -2066,9 +2096,49 @@ mod tests {
                     if r.reason.as_atom() == Some("unsupported_bif")
             ));
 
-            // A fun stays `BadArg` — the documented structural gap: this `Local`
-            // (`make_fun3`) block's `[header, uniq, index]` descriptor has no
-            // module/name for `fun_to_list/1` to render.
+            // A **fun** now renders faithfully — the `~w`/`~p` leaf is
+            // `erlang:fun_to_list/1`. An `External` (`EXPORT_EXT`) fun is
+            // `fun Module:Function/Arity` ...
+            let lists = atom_val(ctx.atom("lists").expect("seeded"));
+            let reverse = atom_val(ctx.atom("reverse").expect("seeded"));
+            let external = beam_codec::term::make_fun_external(ctx.heap(), 1, lists, reverse)
+                .expect("the external fun fits");
+            assert_eq!(show(ctx, external, false), "fun lists:reverse/1");
+            assert_eq!(show(ctx, external, true), "fun lists:reverse/1");
+            // ... and the C `print_atom_name` quoting applies to the module/function
+            // atoms (`@` forces quotes), unlike `io_lib`'s `write_atom`.
+            let node_atom = atom_val(ctx.atom("nonode@nohost").expect("seeded"));
+            let foo = atom_val(ctx.atom("foo").expect("seeded"));
+            let quoted = beam_codec::term::make_fun_external(ctx.heap(), 1, node_atom, foo)
+                .expect("the external fun fits");
+            assert_eq!(show(ctx, quoted, false), "fun 'nonode@nohost':foo/1");
+
+            // An `Imported` (`NEW_FUN_EXT`) fun takes the printer's local-fun arm:
+            // `#Fun<Module.OldIndex.OldUniq>`, from its descriptor.
+            let creator = beam_term::fun::FunPid {
+                node: node_atom,
+                number: 1,
+                serial: 0,
+                creation: 0,
+            };
+            let imported = beam_codec::term::make_fun_imported(
+                ctx.heap(),
+                1,
+                lists,
+                &[0u8; 16],
+                7,
+                3,
+                1234,
+                creator,
+                &[],
+            )
+            .expect("the imported fun fits");
+            assert_eq!(show(ctx, imported, false), "#Fun<lists.3.1234>");
+            assert_eq!(show(ctx, imported, true), "#Fun<lists.3.1234>");
+
+            // A `Local` (`make_fun3`) fun stays the typed capability gap — the
+            // documented structural gap: this `[header, uniq, index]` descriptor has
+            // no module/name for `fun_to_list/1` to render.
             let words: Box<[Eterm]> = vec![
                 Eterm::from_raw(beam_term::FUN_SUBTAG | (2usize << 8)),
                 Eterm::from_raw(0), // uniq
@@ -2078,7 +2148,8 @@ mod tests {
             let fun = beam_term::make_boxed(words.as_ptr());
             assert!(matches!(
                 format_term(ctx, fun, false),
-                Err(beam_common::BeamError::BadArg)
+                Err(beam_common::BeamError::Raise(ref r))
+                    if r.reason.as_atom() == Some("unsupported_bif")
             ));
 
             // Sanity: the atom itself still renders.

@@ -29,12 +29,14 @@
 //! ([`crate::runner::RunnerState::position_engine_at`]). The runtime's **own** process has no
 //! such engine: a `-eval`/`-s`/`-run` action is driven by a `beam_engine::Machine` created
 //! *inside* [`crate::context::RuntimeContext::run_export`] (for `-s`/`-run`) or by the
-//! `-eval` evaluator ([`crate::eval`]), and both hand that machine to the engine as a
-//! `&mut` local, so nothing can read its live position from here (`beam_engine`'s
-//! [`ExecutionContext`](beam_engine::ExecutionContext) seam carries no position, and this
-//! crate is `#![deny(unsafe_code)]`, so no raw pointer is published). This frame is the
-//! *sourceable* part of the caller's position: the **shape of the root action** that
-//! established the process, from which the oracle's own values for those items follow (see
+//! `-eval` evaluator ([`crate::eval`]). A query the **compiled code** of that run dispatches
+//! reads that machine's live position through the in-machine BIF door
+//! ([`crate::context::position`]); a query driven **outside** it — the `-eval` evaluator's
+//! own tree-walk, or a library caller of
+//! [`ExecutionContext::call_bif`](beam_engine::ExecutionContext::call_bif) — has no machine
+//! to read. This frame is the *sourceable* part of the caller's position in that second
+//! case: the **shape of the root action** that established the process, from which the
+//! oracle's own values for those items follow (see
 //! [`crate::native::memory::RuntimeContext::position_value`] for the oracle evidence).
 //!
 //! # Invariants
@@ -45,9 +47,9 @@
 //!   after the action returned (a nested action restores the frame it replaced).
 //! * It names the runtime's **own** pid ([`Runtime::self_pid`]) — the process `erlang:self/0`
 //!   reports — so a probe of any *other* pid falls through to the engine path unchanged.
-//! * A context that never went through a root action (a library caller driving
+//! * A caller with no frame **and** no machine (a library driving
 //!   [`ExecutionContext::call_bif`](beam_engine::ExecutionContext::call_bif) directly) has no
-//!   frame, and the position items stay the honest typed capability gap there.
+//!   source for a position, and the items stay the honest typed capability gap there.
 
 use beam_process::ProcessId;
 

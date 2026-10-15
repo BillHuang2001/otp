@@ -89,7 +89,10 @@ mod limits;
 mod memory;
 mod schedulers;
 mod system;
-mod time;
+// The ERTS monotonic-time interface constants are shared: `system_info(start_time|end_time)`
+// answers them ([`time::START_TIME`]/[`time::END_TIME`]), and `crate::timers` uses the very
+// same two values as the accepted window of an `{abs, true}` timer time, in milliseconds.
+pub(crate) mod time;
 mod unsupported;
 
 // The host-identity helpers (`os_type`, `system_architecture`) live in their own child
@@ -347,7 +350,10 @@ pub const INFO_ATOMS: &[&str] = &[
     "heap_size",
     "total_heap_size",
     "undefined",
-    // `emu_type` (`opt` for an optimized build, `debug` for a debug build) and the
+    // `system_logger`: the atom the C's `system_logger` flag holds initially
+    // (`erl_trace.c:339`), so it is the value the key reports until
+    // `erlang:system_flag(system_logger, _)` stores a pid or `undefined`.
+    "logger",    // `emu_type` (`opt` for an optimized build, `debug` for a debug build) and the
     // constant atom-valued keys: `dynamic_trace` (`none`), `modified_timing_level`
     // (`undefined`), `update_cpu_info` (`unchanged`), `halt_flush_timeout` (`infinity`),
     // `scheduler_bind_type` (`unbound`), `multi_scheduling` (`enabled`/`disabled`),
@@ -423,10 +429,11 @@ pub enum InfoValue {
     Binary(Vec<u8>),
     /// A **pid**, materialized as the internal-pid immediate the process table holds.
     ///
-    /// The only pid-valued key is `system_logger` (see [`system`]). A [`ProcessId`] encodes
-    /// to its term with no heap at all ([`ProcessId::to_eterm`]), so the value is
-    /// byte-identical to what `erlang:whereis/1` answers for the same process — the
-    /// oracle's own route to `system_logger`'s pid.
+    /// The only pid-valued key is `system_logger` (see [`system`]), and it carries a pid only
+    /// while the `system_logger` flag holds one. A [`ProcessId`] encodes to its term with no
+    /// heap at all ([`ProcessId::to_eterm`]), so the value is byte-identical to what
+    /// `erlang:whereis/1` answers for the same process — the oracle's own route to
+    /// `system_logger`'s pid.
     Pid(ProcessId),
     /// A proper list, in order (materialized element by element, head first).
     List(Vec<InfoValue>),
@@ -990,22 +997,20 @@ mod tests {
     }
 
     #[test]
-    fn system_logger_reports_the_registered_logger_process_or_undefined() {
+    fn system_logger_reports_the_system_logger_flag() {
         let mut rt = runtime();
-        // A runtime that never ran a boot script has no process registered as `logger`, so
-        // the honest answer is the atom `undefined` — one of the two non-pid shapes the
-        // oracle itself produces for this key
-        // (`erlang:system_flag(system_logger, undefined)`, `logger_proxy.erl:147`).
+        // The C initialises the flag to `am_logger` (`erl_trace.c:339`), so a runtime on which
+        // nothing has called `erlang:system_flag(system_logger, _)` answers the atom `logger`
+        // (`erl_bif_info.c:3560-3561` is `BIF_RET(erts_get_system_logger())`).
         assert_eq!(
             system_info_value("system_logger", &rt).expect("system_logger"),
-            InfoValue::Atom("undefined")
+            InfoValue::Atom("logger")
         );
-        // A process registered as `logger` — what the real `start.boot` leaves behind
-        // (instruction 13's `{kernelProcess,logger,{logger_server,start_link,[]}}`) — is
-        // reported as its pid, never a fabricated one.
+        // `logger_proxy:init/1`'s `erlang:system_flag(system_logger, self())`
+        // (`lib/kernel/src/logger_proxy.erl:117`) — the same slot, so the key reports the pid.
         let pid = rt.self_pid();
-        rt.register_boot_process("logger", pid)
-            .expect("`logger` is not yet registered");
+        rt.seq_trace_mut()
+            .set_system_logger(crate::seq_trace::SystemLogger::Pid(pid));
         let value = system_info_value("system_logger", &rt).expect("system_logger");
         assert_eq!(value, InfoValue::Pid(pid));
         let mut heap = Heap::new(64).expect("test heap");
@@ -1015,6 +1020,13 @@ mod tests {
                 .expect("a pid needs no heap or atom"),
             pid.to_eterm(),
             "the value is byte-identical to `erlang:whereis(logger)`"
+        );
+        // `erlang:system_flag(system_logger, undefined)` (`logger_proxy.erl:147`).
+        rt.seq_trace_mut()
+            .set_system_logger(crate::seq_trace::SystemLogger::Undefined);
+        assert_eq!(
+            system_info_value("system_logger", &rt).expect("system_logger"),
+            InfoValue::Atom("undefined")
         );
     }
 

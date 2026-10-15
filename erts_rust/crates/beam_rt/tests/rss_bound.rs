@@ -36,7 +36,10 @@
 //!    than a few MiB to the process's `VmHWM`. The pre-fix commit grew roughly **linearly**
 //!    (the same workload's documented pre-fix curve, `tools/bench/RESULTS.md` §6.7, is
 //!    29 MiB → 227 MiB for a 20× `N` step, i.e. ~+190 MiB for this suite's 10× step): at the
-//!    fix's HEAD the figure is flat at ~19–20 MiB across `N` = 0 … 100 000.
+//!    fix's HEAD the churn payload itself is flat — the 10× step adds **~0.1 MiB**. (The
+//!    absolute `VmHWM`, ≈381 MiB on this host, is the runtime's *fixed boot cost*: every
+//!    action now drives the boot script and eagerly loads its modules, so the *bound* is the
+//!    growth across `N`, not the absolute figure.)
 //! 2. [`the_churn_loop_really_collects`] — the *deterministic* half, with no RSS at all:
 //!    driven through [`Runtime::run_scheduled`], the loop's value is exactly `N` **and**
 //!    [`Runtime::gc_stats`] reports non-zero collections. Before the fix the valve declined
@@ -95,11 +98,11 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The allowed `VmHWM` growth for the 10× `N` step.
 ///
-/// The measured after-fix curve is **flat** (≈19.8–20.1 MiB for `N` = 0 … 100 000: the whole
-/// payload is collected, so nothing accumulates), so this is pure headroom for a loaded
-/// host. For scale: the documented pre-fix curve (`tools/bench/RESULTS.md` §6.7) is 29 MiB →
-/// 227 MiB for a 20× `N` step — a 10× step at this suite's counts therefore added ~190 MiB
-/// pre-fix, ~15× this bound.
+/// The churn payload is collected, so nothing accumulates: the measured 10× step adds
+/// **~0.1 MiB** (the absolute `VmHWM` — ≈381 MiB on this host — is the runtime's fixed boot
+/// cost, not the bound), so this is pure headroom for a loaded host. For scale: the documented
+/// pre-fix curve (`tools/bench/RESULTS.md` §6.7) is 29 MiB → 227 MiB for a 20× `N` step — a
+/// 10× step at this suite's counts therefore added ~190 MiB pre-fix, ~15× this bound.
 const RSS_SLACK_KIB: u64 = 12 * 1024;
 
 /// The looser second bound: even with a pathological allocator the larger run must not reach
@@ -154,7 +157,11 @@ fn loadavg() -> String {
 /// reaped and reported) instead of a hang — the same discipline as `support::run_probe`.
 /// Because `VmHWM` is a monotonic watermark, the largest sample is the process's true peak.
 fn measure_peak_rss(erlang_n: i64) -> Measurement {
+    // `-noshell`: the `run` action is banner-free by construction (it records the `noshell`
+    // init argument, so the booted kernel prints no OTP slogan) and prints only its own `~w~n`
+    // line (the `N` the loop returned); it is kept to mirror the oracle probe.
     let args = [
+        "-noshell".to_string(),
         "run".to_string(),
         FIXTURE.to_string(),
         "churn:run/1".to_string(),

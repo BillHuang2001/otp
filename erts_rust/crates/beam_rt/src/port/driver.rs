@@ -1141,25 +1141,30 @@ impl DriverHost for DriverPort {
     /// Atom handling follows [`DriverHost::intern_atom`] exactly: a name the shared table already
     /// holds keeps its index, and a name it does not is recorded on the pending interner at its
     /// predicted index for [`DriverPort::commit_atoms`] to materialise once the caller's borrow of
-    /// the table is released. The decoder needs `&mut AtomTable`, so the shared table is **cloned**
-    /// (the [`beam_bifs::binconv`] precedent); nothing is ever minted *through* that clone — a fresh
-    /// name goes onto the interner — so this host can never hand out an index the runtime's own
-    /// table cannot see.
+    /// the table is released. The decoder needs `&mut AtomTable`, so it interns into the per-thread
+    /// **scratch image** of the shared table
+    /// ([`crate::nif::with_decode_scratch`] — shared with the NIF host, never a fresh `O(table)`
+    /// clone per call); nothing is ever minted *through* that image — a fresh name goes onto the
+    /// interner — so this host can never hand out an index the runtime's own table cannot see.
     fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
-        let mut local = (*self.atoms).clone();
-        let known = local.len();
-        let term = beam_codec::decode_term(bytes, &mut self.heap, &mut local).ok()?;
-        // Record the names the decoder appended, in order, so the interner predicts the very
-        // indices the cloned table assigned them. `intern` (not `intern_atom`) is load-bearing: the
-        // interner's `base` was fixed when this host was built, so appending mid-sequence would
-        // shift the prediction of every name recorded after it.
-        for index in known..local.len() {
-            let Some(name) = local.name(beam_term::Atom::from_raw(index as u32)) else {
-                continue;
-            };
-            self.interner.intern(name);
-        }
-        Some(term)
+        // Disjoint field borrows: `heap` and `interner` are distinct fields of `self`.
+        let heap = &mut self.heap;
+        let interner = &mut self.interner;
+        crate::nif::with_decode_scratch(&self.atoms, |scratch| {
+            let known = scratch.len();
+            let term = beam_codec::decode_term(bytes, heap, scratch).ok()?;
+            // Record the names the decoder appended, in order, so the interner predicts the very
+            // indices the scratch image assigned them. `intern` (not `intern_atom`) is load-bearing:
+            // the interner's `base` was fixed when this host was built, so appending mid-sequence
+            // would shift the prediction of every name recorded after it.
+            for index in known..scratch.len() {
+                let Some(name) = scratch.name(Atom::from_raw(index as u32)) else {
+                    continue;
+                };
+                let _ = interner.intern(name);
+            }
+            Some(term)
+        })
     }
     /// Records the port's request to watch `event` (`driver_select`); the port lifecycle applies
     /// it as soon as this callback returns (see the module docs).
@@ -2609,8 +2614,8 @@ mod tests {
     }
 
     /// A name the image carries but the shared table does not hold is recorded on the **pending
-    /// interner** at the index the decoder's table clone assigned it — never minted through that
-    /// clone — so `commit_atoms` lands it at exactly that index.
+    /// interner** at the index the decoder's scratch image assigned it — never minted through that
+    /// image — so `commit_atoms` lands it at exactly that index.
     #[test]
     fn an_ext2term_image_predicts_a_new_atoms_index() {
         // The shared table starts **empty**, so the image's atom is the first new name.
@@ -2634,7 +2639,7 @@ mod tests {
             .binary_to_term(&image)
             .expect("a valid external-term image decodes");
         // Not resolvable until committed: the hook never mints through the shared table.
-        assert_eq!(atoms.len(), 0, "the shared table is never written through the clone");
+        assert_eq!(atoms.len(), 0, "the shared table is never written through the scratch image");
 
         // Committing lands `a` at index 0, so re-encoding the decoded term against the committed
         // table reproduces the image byte-for-byte — which it could not if the prediction had

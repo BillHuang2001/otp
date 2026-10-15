@@ -27,6 +27,7 @@
 //! twins reserve the block **before** a reader closure supplies the pairs, so a
 //! moving collector may relocate the operands in between ([`super::slack`]).
 use beam_common::{BeamError, Result};
+use beam_loader::Module;
 use beam_term::{thing, AtomTable, Eterm};
 
 use super::{reserve, Slack, HAMT_ARRAY_SLOTS, HAMT_HEAD_ITEM_OFFSET, HAMT_NODE_ITEM_OFFSET, MAP_SMALL_MAP_LIMIT};
@@ -151,17 +152,25 @@ where
 /// deduplicates its input and writes at most `map_words_capacity(pairs.len())`
 /// words, which the reservation covers because the closure must not exceed
 /// `capacity_pairs` pairs.
+///
+/// The atom **namespace** `write_map` orders/hashes keys with — and the one the
+/// `read` closure must use for its own key equality — is taken from the host through
+/// [`ExecutionContext::atoms`](crate::context::ExecutionContext::atoms) **after** the
+/// reserve (the last `&mut ctx` use), so it is the host's live shared namespace and
+/// not the running module's load-time snapshot. The closure receives it, which is the
+/// only way for a key-equality comparison to see the same namespace (a `&AtomTable`
+/// borrowed from `ctx` cannot be held across the reserve's `&mut ctx`).
 pub fn make_map_rooted<R>(
     machine: &mut Machine,
+    module: &Module,
     ctx: &mut dyn ExecutionContext,
     live: u32,
     capacity_pairs: usize,
     extra: usize,
-    atoms: &AtomTable,
     read: R,
 ) -> Result<Eterm>
 where
-    R: FnOnce(&Machine, &mut Slack) -> Result<Vec<(Eterm, Eterm)>>,
+    R: FnOnce(&Machine, &mut Slack, &AtomTable) -> Result<Vec<(Eterm, Eterm)>>,
 {
     let words = beam_term::map::map_words_capacity(capacity_pairs);
     let hp = reserve(machine, ctx, words + extra, live)?;
@@ -169,7 +178,10 @@ where
     // exclusively-owned, writable words; the `extra`-word tail after the map words is
     // the slack.
     let mut slack = unsafe { Slack::new(hp.add(words), extra) };
-    let pairs = read(machine, &mut slack)?;
+    // Taken after the reserve (its last `&mut ctx` use) and held only across the
+    // closure call and `write_map`, neither of which touches `ctx`.
+    let atoms = ctx.atoms(module);
+    let pairs = read(machine, &mut slack, atoms)?;
     if pairs.len() > capacity_pairs {
         return Err(crate::error::unsupported(
             "make_map: pair count exceeds the reserved capacity",

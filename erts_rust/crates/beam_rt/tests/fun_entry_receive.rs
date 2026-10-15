@@ -291,13 +291,16 @@ fn a_fun_bodied_process_parks_and_answers_the_oracle() {
 
     for (label, function, expected) in AGREE {
         let spec = format!("{MODULE}:{function}/0");
+        // `-noshell`: the `run` action drives the default boot script (A.9) but is banner-free
+        // by construction (it records the `noshell` init argument), so it prints no OTP slogan;
+        // the flag is kept to mirror the oracle probe below, which runs `erl -noshell …`.
         let ours = run_bounded(
             Path::new(env!("CARGO_BIN_EXE_beam_rt")),
-            &["-pa", dir, "run", beam, &spec],
+            &["-noshell", "-pa", dir, "run", beam, &spec],
         );
         assert_eq!(
             ours.code, 0,
-            "{label}: `beam_rt run {beam} {spec}` exited {}: {}",
+            "{label}: `beam_rt -noshell -pa {dir} run {beam} {spec}` exited {}: {}",
             ours.code, ours.err
         );
         assert!(

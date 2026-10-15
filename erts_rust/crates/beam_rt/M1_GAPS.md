@@ -98,9 +98,16 @@ min-heap / `fullsweep_after` / `max_heap_size` is observable. Two `max_heap_size
 the key order here is `kill, error_logger, include_shared_binaries, size` (oracle: `error_logger, include_shared_binaries, kill, size`)
 and the per-map flags are not honoured. ~28 items are answered from this runtime's real state (catalog in
 [`src/native/CONTEXT.md`](src/native/CONTEXT.md)); the four **execution-position**
-items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`) only for a scheduled
-process whose entry is a module export, and any other valid oracle item it cannot answer (`catchlevel`,
-`magic_ref`, `priority_messages`, `binary`, ...) raises the typed `unsupported`. `registered_name`'s
+items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`) are answered for a
+scheduled process (a parked one probed from another process; the executing one for its **own** query
+from compiled code, through the in-machine BIF door) and omitted for a process this runtime gave no
+position (a fun-bodied process with no resolved local target, a never-scheduled pid, a direct/no-machine
+caller); `catchlevel` follows the same rule. Two honest residuals of the door: `initial_call` is the
+machine's **entry MFA**, where the oracle answers `{erlang,apply,2}` for some spawn shapes (a
+fun-valued spawn, a start instruction), and the published slot is runtime-wide, so a **nested**
+fun-applied run inside its window reads the **outer** machine's position for that pid. Any other valid
+oracle item it cannot answer (`magic_ref`, `priority_messages`, ...) raises the typed `unsupported`.
+`registered_name`'s
 wrapping and `process_info/1`'s fixed `pi_1_keys` order are exact; `total_heap_size` is **466** (vs the
 oracle's 233) and `memory`/`reductions`/`group_leader` are this runtime's own figures. A pid not in the
 table is `undefined`; an unknown item or a non-pid is `badarg`.
@@ -231,25 +238,38 @@ needs the port write path and the distributed `{Name, Node}` send is contract A.
 ## Distribution and the node (A.5)
 `-name`/`-sname` make the runtime a distributed node: `DistNode` binds a wildcard listener, publishes to
 `epmd` best-effort (a failure is recorded, never fatal) and completes the server-side `'N'` handshake
-against a real OTP peer (`tests/dist.rs`). Gaps: no `net_kernel` protocol; the inbound
-link/exit/monitor/alias `DOP_*` families stay typed `Unsupported` (no remote-peer seam in
-`beam_process`); `node/0` and the node atom a pid image carries **do** reflect the live
+against a real OTP peer (`tests/dist.rs`). Gaps: no `net_kernel` protocol; the distributed-spawn
+family (`SpawnRequest`/`SpawnReply`), `Delivery::Other(_)` and the ack-owing `UnlinkId` half stay
+typed `Unsupported`; `node/0` and the node atom a pid image carries **do** reflect the live
 `-name`/`-sname` node (`Runtime::local_node()` is stamped on every `call_registered` arm), but the
 `NodeIdentity` reports creation `0` (the placeholder above), so a decoded local id is still external
 (see the `beam_codec`/`beam_bifs` handoff). `DOP_SEND`/`DOP_REG_SEND` already reach
-local mailboxes through `LocalDeliverySink`, gated by `Runtime::allow_inbound_delivery` (default OFF, so
-the differential corpus is byte-identical); a live-peer loop past the handshake needs the
-`FragmentAssembler` receive-buffer coupling.
+local mailboxes through `LocalDeliverySink`, as do the route-free receipt families
+(link/exit/unlink/monitor/demonitor/group-leader) — each emitting no outbound `DOP_*` — gated by
+`Runtime::inbound_delivery` (default **ON**; `Runtime::allow_inbound_delivery` turns it off).
+
+**The Erlang-level distribution subtree is not run** on a `-sname`/`-name` node: the native floor
+answers `erl_distribution:start_link/0,1` with `ignore` (this runtime's distribution is the native
+`DistNode` the CLI binds and publishes to `epmd`), so `kernel_sup` skips `net_sup`. Measured on a
+`-sname` node: `whereis(net_sup)`/`whereis(net_kernel)`/`whereis(auth)` are `undefined` here vs pids on
+the oracle, while `whereis(kernel_sup)`/`whereis(application_controller)`/`whereis(logger)` are pids on
+both, `whereis(timer_server)` is `undefined` on both, and `node()`/`is_alive()` agree. Mechanism:
+[`src/native/CONTEXT.md`](src/native/CONTEXT.md) *The Erlang-level distribution supervisor*.
 
 ## Timers
 `send_after/3` answers a `#Ref<>`; `cancel_timer(Pending)` the remaining ms,
 `cancel_timer(Fired|Cancelled|unknown-ref)` `false`, `cancel_timer(non-ref)`/a bad time or destination
 `badarg`. `send_after/3`/`cancel_timer/1` are **native-floor** capabilities; `send_after/4`,
-`cancel_timer/2`, `start_timer/3,4` (`{abs, false}`; `{abs, true}` is the typed gap),
+`cancel_timer/2`, `start_timer/3,4` (both the relative form and the `{abs, true}` absolute-time form,
+whose delay is computed from the registered `erlang:monotonic_time/0` against the oracle's
+`start_time`/`end_time` millisecond window),
 `function_exported/3`, `link/1`/`unlink/1` and `os:set_signal/2` come from the `RuntimeHooksBridge`.
 Unimplemented: `erlang:system_info/2`, `read_timer/1,2`, and the roster keys this bridge does not serve
 (`delete_module/1`/`purge_module/2`, `port_get_data/1`/`port_set_data/2`, `term_to_iovec/1,2`,
 `erlang:is_builtin/3`, `bump_reductions/1`, `loaded/0`, …); each is the typed `unsupported` gap.
+`timer:apply_after/4` schedules through the booted `timer_server` (a `kernel_sup` child started on demand
+through `timer:do_start/0`) with the `{abs, true}` timer arm, so `is_reference(timer:apply_after(50,erlang,self,[]))`
+prints `false` on both runtimes with exit 0 (the call returns `{ok,Ref}`).
 
 ## Memory and statistics
 `erlang:memory/0,1` (the `MemoryHook` seam) is adopted: `RuntimeMemory` (`src/context/memory_hook.rs`)
@@ -266,7 +286,9 @@ counter bumped at the real reduction charge site), `context_switches` (a real pr
 WordsReclaimed, 0}` from the live collectors' counters), `runtime` (`{Total, SinceLastCall}` user-CPU
 milliseconds from the runtime's one long-lived `beam_io::cpu_time::RuntimeClock`, whose anchor persists
 for the runtime's whole lifetime) and `scheduler_wall_time`/`scheduler_wall_time_all` ⇒ `undefined`
-(never enabled). Gaps: `statistics/0` is not served, and on `statistics/1` the keys naming per-scheduler
+(the switch `erts_internal:scheduler_wall_time/1` records — armed or not — but no per-scheduler wall
+time is sampled, so the tuple list is never fabricated). Gaps: `statistics/0` is not served, and on
+`statistics/1` the keys naming per-scheduler
 state this runtime genuinely lacks (`total_active_tasks`/`total_active_tasks_all`/`active_tasks`/
 `active_tasks_all` — a scheduler's current-process flag — and `microstate_accounting` — no MSACC
 accounting) are the typed `unsupported`; every other `RuntimeHooks` family is unserved too.
@@ -372,77 +394,108 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
 
 ## Cross-node handoff detail
-* **The differential gate.** **No case disagrees** (`mismatch=0`), and every `unsupported` is an honest
-  capability gap recorded in `tools/differential/known-gaps.txt`, never a `mismatch`:
-  `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — `erl_eval` internals,
-  structurally unclosable) and `boot_extra/init_script_id_names_the_running_otp_release` (the `-eval`/`run`
-  path loads no boot script). Both A.9 `selfhost/*` cases agree (the A.9 E0 bullet below).
+* **The differential gate.** Every recorded non-agreeing case is an honest capability gap in
+  `tools/differential/known-gaps.txt`, never a `mismatch`. The one structurally unclosable gap is
+  `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — `erl_eval` internals).
+  `boot_extra/init_script_id_names_the_running_otp_release` is a **live divergence**: the route now
+  answers (no longer `unsupported`), but `init:script_id()` returns the resolved installation script's
+  header (`{"Erlang/OTP","29"}` on this host) while `erlang:system_info(otp_release)` returns this
+  runtime's target release (`"30"`), so its `=:=` assertion is `false` here and `true` on the oracle —
+  the oracle's own loaded script and its release agree, this runtime's do not. Both A.9 `selfhost/*`
+  cases agree (the A.9 E0 bullet below).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
-* **A.7/A.9 boot — stops at 0-based directive index 19 of 22; a cross-crate blocker owned by
-  `erts_rust/crates/beam_engine` (no file in this crate owns the fix).** `Runtime::boot_from_script`
-  runs the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, **22 directives**) past index 18
-  (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`) — the kernel application
-  starts and stays up — and stops at index **19**
-  (`{apply,{application,start_boot,[{application,stdlib,Props},permanent]}}`); the final
-  `{progress,started}` (index 21) is not reached. The CLI `-boot bootstrap/bin/start` and the `run`
-  action exit **1** (not 3); stderr carries
-  `=INFO REPORT==== … application: kernel exited: {bad_return,{{kernel,start,[normal,[]]},{'EXIT',{case_clause,{error,{callback_crashed,{error,undef,[]}}}}}}} type: permanent`,
-  then `=ERROR REPORT==== … logger: callback_crashed process: logger reason: {error,undef,[]}`, then the
-  terminal `beam_rt: error {noproc,{gen_server,call,[application_controller,{load_application,stdlib},infinity]}}`.
-  The in-crate `BootStop` reports `index = 19`. `-boot FILE` drives the walk (`src/cli.rs::drive`), a
-  plain start keeps the preloaded-only floor, directive 13 leaves a live `logger_server` registered as
-  `logger`, and the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
-  **An external fun resolves in-machine (the reason index 18 completes):**
-  `RuntimeContext::resolve_local_fun` (`src/context/execution.rs`) also resolves an EXTERNAL fun
+* **A.7/A.9 boot — the boot script executes all 22 directives to completion;
+  the tail's blockers are served in-node.** `Runtime::boot_from_script` runs the resolved script to
+  completion, ending at the final `{progress,started}` (0-based directive index 21 of 22); the in-crate
+  `BootStop` is `None` (`execute` returns `Ok`). The CLI
+  `-boot bootstrap/bin/start` and the `run` action exit **0** with **empty stdout and empty stderr**
+  (0 bytes each). Every CLI action but `-version` drives the walk
+  (`src/cli.rs::{boot_script_to_drive, boot_then}`: the `-boot FILE` value when given, else the literal
+  default `start` → `<Root>/bin/start.boot`), so a plain `-eval`/`-s`/`-run`/`run`/bare-`-noshell` route
+  runs against a really booted node — measured there: `whereis(kernel_sup)`, `whereis(application_controller)`
+  and `whereis(logger)` are live PIDs, `whereis(timer_server)` is `undefined`. Directive 13 leaves a live
+  `logger_server` registered as `logger`, and the
+  differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees**.
+  **The tail's blockers are served in-node — the native floor (`RuntimeContext::try_native`) or
+  runtime state — with everything else falling through to the registry unchanged:**
+  `process_flag` for the bare `monitor_nodes` atom and the `{monitor_nodes, Opts}` tuple flag
+  (`src/native/process.rs::process_flag_native`; the C's `bif.c:2202-2227` and `erts_monitor_nodes`
+  at `dist.c:6754-6868`), which is what `net_kernel:monitor_nodes/2` (`net_kernel.erl:673`) and
+  `global:init/1` (`global.erl:802`) require; `erlang:nodes/2` (`src/native/net.rs`), which
+  `global:init/1`'s `Known = lists:foldl(…, #{}, nodes(visible, #{connection_id => true}))`
+  (`global.erl:810`) calls; `prim_tty:tty_select/2` over the port poller (`src/native/prim_tty.rs`);
+  `process_flag(message_queue_data, on_heap|off_heap)` (parsed and accepted); and
+  `erlang:system_flag(system_logger, _)` (`src/seq_trace.rs`).
+  `erts_internal:scheduler_wall_time/1` is served by the `RuntimeHooks` bridge
+  (`src/context/runtime_hooks.rs::scheduler_wall_time`), so `kernel_refc`'s
+  `resource(scheduler_wall_time, Enable)` (`lib/kernel/src/kernel_refc.erl:141-142`) completes without a
+  `start_error`; and the `erlang:hibernate/0` OTP-30 instruction (`src/native/process.rs`) answers
+  the atom `true` (the C's `erts_hibernate` shrinks the heap and clears the ACTIVE flag; the caller's
+  own following `receive` does the blocking), so `gen_server:loop_hibernate/4`
+  (`lib/stdlib/src/gen_server.erl:2338`) does not crash `kernel_safe_sup`/`logger_sup`.
+  **An external fun resolves in-machine:**
+  `RuntimeContext::resolve_local_fun` (`src/context/execution.rs`) resolves an EXTERNAL fun
   (`fun M:F/A`, `EXPORT_EXT`) to the callee module's export label through the
   `external_fun_target`/`external_fun_name` helpers (`src/context/apply.rs`), so the engine enters e.g.
   `gen_server`'s callback fun IN-MACHINE instead of falling back to the value-returning `apply_fun`
   (which nested a fresh `Machine` under `may_pump_scheduler() == false` → `src/context/pump.rs` refuses
   → the uncatchable `blocked()`). Pinned by
   `src/context/tests.rs::{an_external_fun_whose_callee_blocks_resumes_on_a_scheduled_slice, resolve_local_fun_declines_the_fun_kinds_it_cannot_claim}`.
-  **The index-19 chain (owned by `beam_engine`):** `kernel:start/2`'s first statement
-  `logger:internal_init_logger()` → `logger:set_handler_config(simple, filters, …)` →
-  `logger_server:call_h/4` (`lib/kernel/src/logger_server.erl:541-551`), which does
-  `try apply(Module,Function,Args) catch C:R:S -> case {C,R,S} of {error,undef,[{Module,Function=changing_config,Args,_}|_]} when length(Args)=:=3 -> …; {error,undef,[{Module,Function,Args,_}|_]} -> DefRet; _ -> …{callback_crashed,…} end`.
-  `logger_simple_h` genuinely has NO `changing_config/3` (oracle:
-  `erlang:function_exported(logger_simple_h,changing_config,3)` → `false`), so OTP relies on the
-  innermost stacktrace frame carrying the **argument list**; this runtime's `undef` carries no
-  innermost `{M,F,Args,Loc}` frame, so the wrong case arm runs → `{callback_crashed,{error,undef,[]}}`
-  → `case_clause` in `kernel:start/2` → the permanent kernel application tears down → directive 19's
-  `{load_application,stdlib}` `gen_server:call` finds no `application_controller` → `{noproc,…}`.
-  Minimal repro (both verified): the same `try apply(logger_simple_h,changing_config,[a,b,c]) catch C:R:S -> …` one-liner under `erl -noshell` (oracle) and `beam_rt -noshell` (ours) gives the oracle
-  `{error,undef,[{logger_simple_h,changing_config,[a,b,c],[]},{erl_eval,do_apply,7,…},…]}` (head = the args
-  item) vs ours `{error,undef,[]}`. **Fix shape:** `beam_engine`'s `undef` raise path must carry the failed
-  callee's MFA **and the argument list** so
-  `families/exceptions/stacktrace.rs::symbolic_stacktrace` can prepend that `{M,F,Args,Loc}` item;
-  `beam_common::StackFrame` (`crates/beam_common/src/error.rs:518-541`, currently
-  `{module, function, arity, location}`) may need an optional argument-list slot; the `undef` raised on
-  this crate's callee path comes from `src/context/calls.rs` and `src/context/pump.rs`.
-  **Why the trace reads `[]` (linchpin):** `logger:filter_stacktrace/2` (`lib/kernel/src/logger.erl:1982-1987`)
-  is a **head-prefix** filter (`filter_stacktrace(Module,[{Module,_,_,_}|_]) -> []`), and our trace's head is
-  the raising `logger_server` frame itself (the callee item is the missing one), so it is wiped to `[]` — the
-  oracle's filtered trace is exactly the single callee item. The defect is therefore *only* the missing
-  innermost callee item, not a generally empty trace: the same probe with the `try` inside a **compiled**
-  module (`apply/3` and a direct `call_ext`), on both the `-eval` and the scheduled `run` routes, yields a
-  non-empty trace with the raising function's own frame (`[{p3,call_h,3,[{file,…},{line,5}]}]`).
-  **Verdict: long-standing engine gap, newly exposed — not a `beam_rt` code regression.**
-  `stacktrace.rs`'s whole history carries no args variant, so `call_h/4`'s first two arms can never have
-  matched at any commit; 2026-10-09's completion (`f8b447c2f4`, `ee14327c11`, `fdcf1d3d91`) held only because
-  the in-machine `call_ext`→`erlang:apply/3` seam was not yet closed (`proc_lib:init_p_do_apply` folded into
-  `blocked()`, so the real `logger_server` never ran), and 2026-10-11 (`58d5dc65e4`, `42c0232d40`,
-  `1d9f287c87`) closed it — directive 13 now starts a **live** `logger_server` (a genuine capability gain
-  matching the oracle), which is exactly what runs the probe.
-  The **8** currently-failing crate tests fail ONLY because each asserts FULL 22-directive completion (a
-  correct contract that must be kept): `--lib boot::` (3:
-  `the_real_start_boot_executes_every_directive_to_progress_started`,
-  `the_real_boot_registers_a_live_logger_process`,
-  `the_real_start_boot_completes_through_execute_reporting`), `--test boot` (4:
-  `the_real_start_boot_runs_to_completion`, `the_cli_runs_the_real_boot_script_to_completion`,
-  `the_boot_chains_kernel_processes_survive_their_directive_processes`,
-  `the_cli_boot_registers_a_live_logger_process`), `--test a9_native_floor` (1:
-  `script_id_is_the_loaded_boot_scripts_real_header`). Mechanism:
-  [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+  **An uncaught raise out of the boot chain renders as the `Display` placeholder.** `src/cli.rs`'s
+  `Action::Boot` arm is the only one that routes the boot-chain result through `reported_reason`, so on
+  the `-eval`/`-s`/`-run`/`run` routes a structured raise reason leaving the boot chain renders as
+  `beam_rt: exit <structured reason>` instead of the real term. The `-eval` action's own raise is
+  unwrapped too; only the `run` route's own `run_scheduled` raise is rendered (`run_file`), and
+  `tests/cli.rs` covers only that action's own raise.
+* **`beam_bifs` — the registered `io:format/2` `~p`/`~w` printer raises `badarg` on any term carrying a
+  fun.** The registered `io:format/2` implementation is `erts_rust/crates/beam_bifs/src/io.rs`, driven by
+  `src/format.rs`, and a fun is not renderable there. Raw evidence, the same command on both runtimes:
+  `beam_rt -noshell -eval 'io:format("~p~n",[fun lists:reverse/1]),halt(0).'` → `beam_rt: badarg`, exit 1,
+  vs the oracle's `fun lists:reverse/1`, exit 0; and
+  `beam_rt -noshell -eval 'io:format("~p~n",[[{k,fun lists:reverse/1}]]),halt(0).'` → `beam_rt: badarg`,
+  exit 1, vs the oracle's `[{k,fun lists:reverse/1}]`, exit 0. The fun itself is sound — `erlang:make_fun/3`
+  and `fun M:F/A` both work, only printing fails, and the failure is catchable
+  (`catch io:format(...)` → `{'EXIT',badarg}`). Owner: `erts_rust/crates/beam_bifs`.
+* **`beam_engine` — a stacktrace's top frame is duplicated (the same `{M,F,A}` at two adjacent lines).**
+  `Machine::throw_with_trace` (`erts_rust/crates/beam_engine/src/machine/catch.rs:318-324`) pushes the
+  raising frame from `Machine::current_code()` and then again from `Machine::resumption_contexts()`
+  (`machine/frames.rs:316-325`), which re-yields that same function with its stale call-site CP; the same
+  duplication is in `Machine::raise_stacktrace` (`machine/catch.rs:480-503`). Raw evidence:
+  `try _ = inner(), erlang:error(badarg) catch error:_R:S2 -> S2 end` → oracle
+  `[{probe,dup,0,[{file,…},{line,15}]}, …]`, engine
+  `[{probe,dup,0,[{file,…},{line,15}]}, {probe,dup,0,[{file,…},{line,14}]}]`; the same duplication also
+  appeared in `proc_lib`/`gen_server` stacktraces from a boot-time crash report —
+  `[{proc_lib,exit_p,3,[{line,355}]},{proc_lib,exit_p,3,[{line,355}]}]` and
+  `[{gen_server,init_it,6,[{line,2272}]},{gen_server,init_it,6,[{line,2271}]}]` — which mis-attributed
+  the `error:badarg` to the re-raise site. Owner: `erts_rust/crates/beam_engine`.
+* **`beam_engine` — `build_stacktrace` drops the run's entry-module frames when the handler lives in a
+  non-zero module context.** `erts_rust/crates/beam_engine/src/families/exceptions/stacktrace.rs:163` plus
+  the `context == 0` heuristic at lines 169-181 (`FrameOwner::Skip` for every context-0 frame when
+  `handler_context != 0`); the same heuristic is in `Machine::current_stacktrace`
+  (`machine/location.rs:238-241,261-268`). Raw evidence: `ent:g/0 -> mid3:run/0 -> callee:h/1 ->
+  erlang:error(badarg)` with the `try … catch error:R:S -> S end` in the callee module → oracle
+  `[{callee,h,…},{mid3,run,0,…},{ent,g,0,…},…]`, engine `[{callee,h,…},{mid3,run,0,…}]` (the
+  `{ent,g,0,…}` entry-module frame is missing). Owner: `erts_rust/crates/beam_engine`.
+* **`beam_engine` — the reported `make_small(arity)` → `NIL` degradation does not reproduce.**
+  `write_item` always emits an integer arity
+  (`erts_rust/crates/beam_engine/src/families/exceptions/stacktrace.rs:377-388`) and
+  `beam_term::make_small` (`erts_rust/crates/beam_term/src/immediate.rs:76`) is total, so
+  `erlang:make_fun/3` works; the `[]` an oracle prints for a 0-arity caller is the **oracle's own** `A`
+  slot (it prints the argument LIST) where this engine prints the integer arity — the separate,
+  already-documented `function_clause` `A`-slot divergence (Int vs ArgList).
+  Owner: `erts_rust/crates/beam_engine`.
+* **`beam_engine`/`beam_rt` — the in-machine execution-position door serves the executing process's own
+  position.** A scheduler pass takes the executing process's engine **out** of `RunnerState` for the whole
+  slice (`erts_rust/crates/beam_rt/src/runner/run.rs`), so the runner-state view cannot see the caller's
+  own machine. `beam_engine`'s defaulted `ExecutionContext::wants_bif_in_machine`/`call_bif_in_machine`
+  seam hands the host the **live `&Machine`** and the run's entry module on every BIF dispatch, and
+  `src/context/position.rs` is the opt-in, so `erlang:process_info(self(), current_stacktrace)` (and the
+  other execution-position items) is answered from the machine's own frames. A non-self query, a nested
+  query while an outer door call is in flight, or a process with no such position still falls through to
+  `RunnerState` (a typed gap where no machine is reachable).
+  Owner: `erts_rust/crates/beam_rt` (`src/context/position.rs` + `src/native/memory/`); the seam lives in
+  `erts_rust/crates/beam_engine`.
 * **A.9 E0 — in-process compilation works, is byte-identical, and the *scheduled* route runs on both
   tiers.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs
   **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp`
@@ -565,24 +618,18 @@ a `{encoding,unicode}` device, which counts **bytes** where the oracle counts **
 ([`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md)).
 
 ### Confirmed failing — root cause and repro
-1. **`logger` / `error_logger` cannot emit a report on a plain runtime.** `logger:warning/1`,`notice/1`,
-   `error/1` and `error_logger:info_msg/1,2`,`error_msg/2` raise `badarg`. Root cause: a plain
-   `run`/`-eval` invocation loads only the preloaded modules — it does not run the boot script, so no
-   `logger` process exists (the boot-script path *does* register one) and the `logger` ETS config table
-   never exists: `ets:whereis(logger)` is `undefined` (oracle: a `#Ref{}`), `logger_config:allow(Level)`
-   defaults the primary level to `notice` and admits a `notice`+ event, then
-   `logger_backend`→`logger_config:get(Tid=undefined, primary)` → `ets:lookup(undefined, primary)` →
-   `badarg` (`etsl:lookup_undefined/0` = `{error,badarg}` in **both** runtimes), so `logger:info/1,2`
-   returns `ok` **only because it is filtered** below the default `notice` level. The residual is the
-   missing native logger ETS floor: `lg:warn/0` → `{'EXIT',badarg}`, `lg:info/0` → `ok`,
-   `lg:elog_info/0` → `{'EXIT',badarg}`.
-2. **`application:start/1,2`, `application:stop/1`, `application:ensure_all_started/1` fail.**
-   On a plain runtime no `application_controller` process exists (it is spawned only on the `-boot`
-   path): `{'EXIT',{noproc,{gen_server,call,[application_controller,{load_application,sasl},infinity]}}}`
-   (scheduled) / `exit <structured reason>` (`-eval`); the oracle answers `ok`/`{ok,[syntax_tools]}`/
-   `{error,{not_started,sasl}}`. The native floor answers only the read-only queries (items in "Works
-   today"); no application's `start/2` runs and no supervision tree becomes live. Repro:
-   `ap:start_sasl/0`, `ap:start_syntax/0`, `ap:ensure_syntax/0`.
+1. **`logger`/`error_logger` reports are emitted but reach no native logger sink.** A booted runtime has
+   a live `logger` process and the `logger` ETS config table exists (`ets:whereis(logger)` is a `#Ref{}`),
+   so `logger:info/1,2`, `warning/1`, `error/1` and `error_logger:info_msg/1,2`, `error_msg/2` all answer
+   `ok`. The residual is that the `lg:*` test helpers still depend on a native logger ETS floor this
+   runtime does not provide.
+2. **`application:start/1,2`, `application:stop/1`, `application:ensure_all_started/1` reach a live
+   controller but only the boot script's own applications are startable.** `application_controller` is a
+   live PID on every CLI route now, so a request is answered rather than failing `noproc`; a start for an
+   application the resolved boot script did not load still fails (measured: `ensure_all_started(crypto)`
+   → `{error,{crypto,{"no such file or directory","crypto.app"}}}` on this host). The native floor answers
+   only the read-only queries (items in "Works today"). Repro: `ap:start_sasl/0`, `ap:start_syntax/0`,
+   `ap:ensure_syntax/0`.
 
 ### The `-eval` vs scheduled asymmetry
 The `-eval` root process **pumps** the scheduler and can suspend a blocking call; a **scheduled**
@@ -715,8 +762,10 @@ mailbox `Queue` payloads are copied in by `copy_struct`.
 ## Cross-node handoffs (crate index)
 A by-owner index of the long forms in `## Cross-node handoff detail` above; the owning doc holds the full detail.
 * **Differential gate** → [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md) (re-run `gate.sh` for the live figure).
-* **A.7/A.9 boot (index 19 stop)** → the bullet above + [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
+* **A.7/A.9 boot (completion)** → the bullet above + [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
 * **A.9 E0 (in-process `compile:file`)** → `tests/compile_file.rs`; mover: [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).
+* **`beam_bifs` — the `io:format/2` `~p`/`~w` fun-printing `badarg`** → the bullet above (`beam_bifs/src/io.rs`).
+* **`beam_engine` — the stacktrace defects** → the duplicated top frame and the dropped entry-module frame (bullets above).
 * **The native `file_server_2` service** → [`src/native/CONTEXT.md`](src/native/CONTEXT.md) + [`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md).
 * **`beam_process` / `beam_message`** → the wake-list drain + `!Send`-friendly `SchedulerPool` (bullet above).
 * **`beam_engine`** → the `MinimalContext` arena accessor (bullet above).

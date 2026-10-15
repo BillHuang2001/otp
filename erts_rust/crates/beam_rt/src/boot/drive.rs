@@ -167,8 +167,8 @@ const APPLY_BLOCK_SLICES: u64 = 256;
 /// `application_controller:start/1`'s `spawn_link`ed `init/2`); a server **traps exits** and
 /// terminates when its parent exits with `normal` (`proc_lib`'s parent-exit semantics). Left
 /// linked, the short-lived directive's ordinary return would therefore tear its own server
-/// down and release the name — the observed `exit noproc` at the real `start.boot`'s first
-/// dependent `{apply, …}`.
+/// down and release the name, so a later dependent `{apply, …}`'s `gen_server:call` to it
+/// would fail with `noproc`.
 ///
 /// The fix is to **unlink** the server from the directive as soon as it has registered its
 /// name, while the directive is still alive (it is blocked in `receive` until the server

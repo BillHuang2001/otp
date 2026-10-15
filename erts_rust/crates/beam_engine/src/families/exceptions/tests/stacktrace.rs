@@ -116,6 +116,7 @@ fn build_stacktrace_cooks_the_raise_snapshot_innermost_first() {
     let step = exec(
         &mut machine,
         &module,
+        &module,
         &no_labels(),
         &Instr::BuildStacktrace,
         0,
@@ -182,7 +183,7 @@ fn build_stacktrace_item_carries_the_source_location() {
     assert!(matches!(err, BeamError::Raise(_)));
     machine.set_x(0, make_small(1)).unwrap(); // a non-NIL raw trace
     let mut ctx = MinimalContext::new();
-    let step = exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 0, &mut ctx)
+    let step = exec(&mut machine, &module, &module, &no_labels(), &Instr::BuildStacktrace, 0, 0, &mut ctx)
         .unwrap();
     assert_eq!(step, Some(Step::Next));
 
@@ -235,7 +236,7 @@ fn build_stacktrace_without_the_file_or_line_atom_is_a_typed_error() {
         machine.set_x(0, make_small(1)).unwrap();
         let mut ctx = MinimalContext::new();
         let err =
-            exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 0, &mut ctx)
+            exec(&mut machine, &module, &module, &no_labels(), &Instr::BuildStacktrace, 0, 0, &mut ctx)
                 .unwrap_err();
         assert!(
             matches!(err, BeamError::Raise(_)),
@@ -261,6 +262,7 @@ fn build_stacktrace_of_an_unknown_function_index_is_a_typed_error() {
     let err = exec(
         &mut machine,
         &module,
+        &module,
         &no_labels(),
         &Instr::BuildStacktrace,
         0,
@@ -274,9 +276,23 @@ fn build_stacktrace_of_an_unknown_function_index_is_a_typed_error() {
 #[test]
 fn build_stacktrace_resolves_a_snapshot_frame_in_its_own_module_context() {
     // A snapshot frame whose context is a registered (non-zero) module context
-    // resolves in **that** module; a context-`0` frame observed from a non-zero
-    // handler context cannot be named (the `module` argument is the *callee's*) and
-    // is skipped.
+    // resolves in **that** module; a context-`0` frame resolves in the run's
+    // **entry** module — the `entry_module` argument — *whatever* module context the
+    // handler cooking the trace executes in.
+    //
+    // ORACLE (verified): `ent:g/0 -> mid3:run/0 -> callee:h/1 -> erlang:error(badarg)`
+    // with the handler inside the CALLEE module and every call non-tail:
+    //   $ erl -noshell -eval 'io:format("~p~n",[ent:g()]), halt().'
+    //   [{callee,h,1,[{file,"callee.erl"},{line,5}]},
+    //    {mid3,run,0,[{file,"mid3.erl"},{line,4}]},
+    //    {ent,g,0,[{file,"ent.erl"},{line,4}]} | <host erl_eval frames>]
+    // — the entry module's frame IS present. The old heuristic (skip a context-`0`
+    // frame whenever the handler is in a non-zero context) dropped it.
+    //
+    // This test's construction: two context-`id` frames (the raising `boom/1` and a
+    // caller returning into the callee — both in the callee), then one context-`0`
+    // frame (the entry module's `run/0`). So the cooked list is
+    // `[{callee,boom,1}, {callee,boom,1}, {m,run,0}]`, innermost first.
     let mut fixture = Fixture::new(&[]);
     let callee_name = fixture.module.atom_table.intern("callee");
     fixture.module.name = callee_name;
@@ -286,14 +302,13 @@ fn build_stacktrace_resolves_a_snapshot_frame_in_its_own_module_context() {
     let boom: u32 = 0;
     let callee = Arc::new(fixture.finish());
 
-    // The run's entry module (context 0): a `run/0` a *skipped* context-0 frame
-    // would otherwise have been named against.
+    // The run's entry module (context 0): a `run/0` the context-0 frame resolves to.
     let mut entry_fixture = Fixture::new(&[]);
     entry_fixture.add_function("run", 0, vec![Instr::Label(Label(1)), Instr::Return]);
     let entry_module = entry_fixture.finish();
 
     let mut machine = Machine::new();
-    // A frame chain holding BOTH a context-`0` frame and a context-`id` frame: the
+    // A frame chain holding BOTH a context-`0` frame and context-`id` frames: the
     // bottom frame, then a frame returning into context 0, then the raising `boom`
     // frame in the callee context.
     machine.push_frame(0).unwrap();
@@ -334,6 +349,7 @@ fn build_stacktrace_resolves_a_snapshot_frame_in_its_own_module_context() {
     let step = exec(
         &mut machine,
         &entry_module,
+        &entry_module,
         &no_labels(),
         &Instr::BuildStacktrace,
         0,
@@ -343,30 +359,32 @@ fn build_stacktrace_resolves_a_snapshot_frame_in_its_own_module_context() {
     .unwrap();
     assert_eq!(step, Some(Step::Next));
 
-    // The cooked trace holds exactly the two callee frames: the context-0 frame was
-    // skipped, so no entry-module (`m`) item appears.
+    // The cooked trace holds all three frames: the two context-`id` frames resolve in
+    // the callee, and the context-`0` frame in the entry module (`m`).
     let callee_atom = callee.atom_table.lookup("callee").unwrap();
     let boom_atom = callee.atom_table.lookup("boom").unwrap();
+    let m_atom = entry_module.atom_table.lookup("m").unwrap();
+    let run_atom = entry_module.atom_table.lookup("run").unwrap();
     let frames = crate::terms::list_elements(machine.x(0).unwrap()).unwrap();
     assert_eq!(
         frames.len(),
-        2,
-        "the skipped context-0 snapshot frame contributes no item"
+        3,
+        "the context-0 snapshot frame is named in the entry module, not skipped"
     );
-    for frame in &frames {
-        assert_eq!(
-            crate::terms::tuple_element(*frame, 0).unwrap(),
-            make_atom(callee_atom),
-            "the frame's module must be the callee"
-        );
-        assert_eq!(
-            crate::terms::tuple_element(*frame, 1).unwrap(),
-            make_atom(boom_atom)
-        );
-        assert_eq!(
-            crate::terms::tuple_element(*frame, 2).unwrap(),
-            make_small(1)
-        );
-        assert_eq!(crate::terms::tuple_element(*frame, 3).unwrap(), NIL);
-    }
+    let item = |ctx: &mut MinimalContext, module: Atom, function: Atom, arity: i64| {
+        terms::make_tuple(
+            ctx,
+            &[make_atom(module), make_atom(function), make_small(arity), NIL],
+        )
+        .unwrap()
+    };
+    let raising_frame = item(&mut ctx, callee_atom, boom_atom, 1);
+    let caller_frame = item(&mut ctx, callee_atom, boom_atom, 1);
+    let entry_frame = item(&mut ctx, m_atom, run_atom, 0);
+    let expected =
+        terms::make_list(&mut ctx, &[raising_frame, caller_frame, entry_frame]).unwrap();
+    assert!(
+        cmp(machine.x(0).unwrap(), expected, &entry_module.atom_table).is_eq(),
+        "the cooked trace must be [{{callee,boom,1,[]}}, {{callee,boom,1,[]}}, {{m,run,0,[]}}]"
+    );
 }

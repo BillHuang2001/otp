@@ -229,14 +229,15 @@ fn pump_events_until_exit(
     while Instant::now() < deadline {
         let mut exited = false;
         for event in registry.pump(Duration::from_millis(50)).expect("pump") {
-            // A signal carries no port and no owner (it is node-global), so it is the one
-            // event that says nothing about which port a round drained.
+            // A signal and a tty-select report carry no port (both are node-global / owner-keyed
+            // rather than port-derived), so they are the events that say nothing about which port
+            // a round drained.
             let source = match &event {
                 PortEvent::Data { port, .. }
                 | PortEvent::Line { port, .. }
                 | PortEvent::Exited { port, .. }
                 | PortEvent::Term { port, .. } => Some(*port),
-                PortEvent::Signal { .. } => None,
+                PortEvent::Signal { .. } | PortEvent::Select { .. } => None,
             };
             if let Some(source) = source {
                 assert_eq!(

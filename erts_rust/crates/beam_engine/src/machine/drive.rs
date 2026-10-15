@@ -80,6 +80,14 @@ impl Machine {
     /// single `bool` load and no event is ever built. See the `Machine::trace_on`
     /// field docs for the mid-run semantics.
     ///
+    /// And latches the **in-machine BIF-dispatch gate**
+    /// ([`Machine::bif_in_machine_on`], the cached
+    /// [`ExecutionContext::wants_bif_in_machine`] answer) so every BIF dispatch in the
+    /// run funnels through [`Machine::dispatch_bif_call`] and the host either sees the
+    /// live machine on each one or keeps the plain `call_bif` path. The native
+    /// baseline tier's own driver latches the same gate, so the door behaves
+    /// identically on both tiers.
+    ///
     /// And charges **one reduction per interpreted instruction, before the
     /// instruction's effect**: the slice's count starts at zero here and is read
     /// back through [`Machine::reductions`], while each charge is also offered to
@@ -107,6 +115,13 @@ impl Machine {
         // vtable crossing entirely, paying one `bool` load instead. The default is
         // conservative `true`, so a pre-empting host keeps every charge.
         self.reduce_on = ctx.wants_reduce();
+        // Latch the per-run in-machine BIF-dispatch gate too (see the
+        // `Machine::bif_in_machine_on` field docs): a host that opts in declares
+        // `wants_bif_in_machine() == true` and then receives the live machine and
+        // the entry module on every BIF dispatch; the default `false` keeps the
+        // plain `call_bif` path byte-identical and pays one `bool` load instead of an
+        // extra vtable crossing.
+        self.bif_in_machine_on = ctx.wants_bif_in_machine();
         // One `drive` call is one scheduling slice, so the reduction counter starts
         // here (the ERTS process counter, `c_p->fcalls`, is likewise reset when a
         // process is scheduled in; the host reads the count when the slice returns).
@@ -167,7 +182,14 @@ impl Machine {
             if self.reduce_on {
                 ctx.reduce(1)?;
             }
-            let step = match self.step_instruction(active_module, active_labels, func, pc, ctx) {
+            let step = match self.step_instruction_with_entry(
+                module,
+                active_module,
+                active_labels,
+                func,
+                pc,
+                ctx,
+            ) {
                 Ok(step) => step,
                 // The uniform raise funnel's second half: `step_instruction` already
                 // attached the frames when the raise happened in the run's **entry**

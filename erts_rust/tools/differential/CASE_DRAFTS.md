@@ -1,10 +1,17 @@
-# Draft corpus cases — outstanding Rust-runtime capability gaps
+# Draft corpus cases — gap recipes, promotions, and corrections
 
-**Drafts, not cases.** Every recipe below is a ready-to-add `Case` literal for the conformance
-corpus (`src/corpus/*.rs`), but **none is in the corpus yet**: each currently makes the
-compatibility gate diverge (a `mismatch`, or an `unsupported` that is not in `known-gaps.txt` ⇒
-gate exit 3). Add a recipe only **after** the owning crate closes the gap named in it, then
-refresh `known-gaps.txt`/`GAPS.md` in the same change (see `../CONTEXT.md` §"Notes for Agents").
+**Recipes, promotions, corrections.** Each numbered section carries a one-line **Status:** and
+either a ready-to-add `Case` literal for the conformance corpus (`src/corpus/*.rs`) or a
+correction saying why no case is possible. A recipe is added only **after** the owning crate
+closes the gap it names, then `known-gaps.txt`/`GAPS.md` are refreshed in the same change (see
+`../CONTEXT.md` §"Notes for Agents").
+
+At a glance: **§1** and **§5b** are live gaps (recipes ready, not yet addable); **§2**, **§5a**
+and **§4**'s tiny-body wrapped recipe already agree and are merely missing from the corpus; **§4**'s
+raw-DEFLATE surface and all of **§6** are faithful in `beam_rt` and are pinned by the
+`src/corpus/**` groups (`zlib.rs`, `flags.rs`, `flags_apply.rs`); **§4**'s gzip pair and its
+repetitive-body wrapped size form are unpinnable divergences recorded in `divergences.md`, not
+drafts; **§3** and **§7** record items that were named as gaps but are not gaps at all.
 
 This file is a hand-maintained companion to the generated `GAPS.md` and the hand-written
 `divergences.md`: `divergences.md` records divergences that are **unpinnable**, this file records
@@ -24,8 +31,8 @@ Then, for an expression recipe:
 erts_rust/target/release/differential compare '<expr>'      # [AGREE] / [MISMATCH] / [UNSUPPORTED]
 ```
 
-For a recipe that needs extra argv (the `-pa`/`+S` cases) run both runtimes by hand with the same
-argv, remembering that `beam_rt` is a drop-in `erl` (contract A.6):
+For a recipe that needs extra argv, run both runtimes by hand with the same argv, remembering that
+`beam_rt` is a drop-in `erl` (contract A.6):
 
 ```sh
 erl     -noshell <extra…> -eval 'io:format("~w~n",[EXPR]),halt().'
@@ -33,22 +40,25 @@ beam_rt -noshell <extra…> -eval 'io:format("~w~n",[EXPR]),halt().'
 ```
 
 Every observable below was produced that way against the live oracle (system `erl`, OTP 29.1.1 /
-erts-17.1) and the release `beam_rt`, not guessed. A `CaseKind::Eval`/`EvalEnv` recipe uses the
-shared argv `["-noshell", <extra…>, "-eval", <probe>]`; `Probe::Value` prints the oracle's `~w`
-rendering as the single golden line (no trailing newline), exit `0`.
+erts-17.1) and the release `beam_rt` it was written against, not guessed. **Re-check the `beam_rt`
+side after any owning-crate change** — a recipe's Rust observation can go stale (§4). A
+`CaseKind::Eval`/`EvalEnv` recipe uses the shared argv `["-noshell", <extra…>, "-eval", <probe>]`;
+`Probe::Value` prints the oracle's `~w` rendering as the single golden line (no trailing newline),
+exit `0`.
 
-## How a recipe will classify until its owner fixes it
+## How an open recipe classifies
 
 * A runtime that returns a **differing observable** (a plain Erlang value or a plain reason such as
-  `exception error undef`) is a `mismatch` — the gate's hard failure. §1, §4 and §6 are this shape
-  today.
+  `exception error undef`) is a `mismatch` — the gate's hard failure. §1 is this shape today.
 * A runtime that signals the gap through its documented convention — exit `3` with
   `beam_rt: unsupported: …`, or a probe-caught `exception … unsupported: …` — is an `unsupported`
-  capability gap. The four `process_info/2` position items in §5 are this shape today.
+  capability gap. The four `process_info/2` position items in §5b are this shape today.
 
 ---
 
 ## 1. `timer` — owner `beam_bifs` (root cause: `erlang:convert_time_unit/3`)
+
+**Status:** `still-a-gap` (inferred from batch context, not re-verified this batch).
 
 `timer` **loads and runs** in `beam_rt` already (`timer:now_diff/2`, `timer:sleep/1`,
 `timer:seconds/1` … all agree; `code:which(timer)` resolves to the stdlib `timer.beam`). The gap is
@@ -111,6 +121,8 @@ Case {
 
 ## 2. `timer:now_diff/2` — **already agrees**; a case could be ADDED
 
+**Status:** `promotable (agrees today, not yet in the corpus)` — not a gap, just a missing case.
+
 ```rust
 Case {
     id: "bifs/timer_now_diff_of_two_timestamps",
@@ -131,6 +143,8 @@ Case {
 
 ## 3. `string:concat` — **not a usable case** (`string:concat/1` is `undef` on the oracle too)
 
+**Status:** `stale-fixed-elsewhere` — not a gap and not a case; nothing to add.
+
 * `string:concat/1` does **not** exist: `differential compare 'string:concat("a")'` → **`[AGREE]`**
   with both sides printing `exception error undef`, exit `1`. It cannot be a `mismatch` and it is
   not a gap; do not add it.
@@ -140,9 +154,17 @@ Case {
 
 ## 4. `zlib` — owner `beam_bifs`
 
+**Status:** the **raw-DEFLATE** surface (`zlib:zip/1` / `zlib:unzip/1`, RFC 1951) is
+`now-agreeing-and-promoted` — its cases are pinned in `src/corpus/zlib.rs`. Of the two
+**zlib-wrapped** recipes below, the repetitive-body size one (4a) is **not a case** (a plain-value
+`mismatch`) and the tiny-body byte-exact one (4b) is `promotable (agrees today, not yet in the
+corpus)`; the `zlib:gzip/1` / `zlib:gunzip/1` pair (4c) is likewise a recorded divergence, not a
+draft.
+
 `code:which(zlib)` is the atom `preloaded` in **both** runtimes, and `beam_rt` lists `zlib` in its
-preloaded set (`crates/beam_rt/src/boot.rs`), but none of its functions are served — every
-`zlib:*` call is `undef`. Two recipes, one volatile and one byte-exact:
+preloaded set (`crates/beam_rt/src/boot.rs`). The two wrapped-surface recipes, kept for reference:
+
+### 4a. `zlib:compress/1` of a repetitive body — **not a case** (plain-value `mismatch`)
 
 ```rust
 Case {
@@ -156,6 +178,18 @@ Case {
     },
     golden: Golden { stdout: Some("ok 17"), exit_code: 0 },
 }
+```
+
+* oracle `ok 17`, `beam_rt` `ok 23` (the two images are `<<120,156,99,96,24,5,163,96,20,140,84,0,
+  0,4,0,0,1>>` and `<<120,156,237,192,1,1,0,0,0,130,32,255,175,110,72,80,192,171,1,4,0,0,1>>`):
+  the wrapped image of a repetitive body is the encoder's own choice — a different block choice, not
+  a codec contract — so the recipe is a plain-value `mismatch` and must **not** be added. Recorded
+  in `divergences.md` §A.7 — zlib.
+* repro: `erts_rust/target/release/differential compare 'byte_size(zlib:compress(<<0:8192>>))'`
+
+### 4b. `zlib:compress/1` of a tiny body — **promotable** (agrees today, not yet in the corpus)
+
+```rust
 Case {
     id: "bifs/zlib_compress_bytes_are_deterministic",
     description: "zlib:compress/1 of a tiny body is a byte-exact, order-stable zlib stream",
@@ -169,15 +203,26 @@ Case {
 }
 ```
 
-* oracle: `ok 17` and the byte string above, both exit `0`. `beam_rt`: `exception error undef`,
-  exit `1` for both → **mismatch**.
-* The exact-bytes form is fully deterministic (zlib level 6 on a 3-byte body is a stored/fixed-huffman
-  stream), so the `<<120,156,…>>` golden is host- and order-stable.
+* oracle and `beam_rt` both print `ok <<120,156,75,76,74,6,0,2,77,1,39>>`, exit `0` → **`[AGREE]`**
+  (zlib level 6 on a 3-byte body is a stored/fixed-huffman stream), so the golden is host- and
+  order-stable; the round trip `zlib:uncompress(zlib:compress(<<"abc">>)) =:= <<"abc">>` agrees too.
 * owner: `beam_bifs` (the `zlib` module's NIF-backed surface); `beam_rt` advertises the module as
   preloaded.
 * repro: `erts_rust/target/release/differential compare 'zlib:compress(<<"abc">>)'`
 
+### 4c. `zlib:gzip/1` / `zlib:gunzip/1` — **not a case** (plain `error:undef`)
+
+* the oracle returns the gzip container (`zlib:gzip(<<"abc">>)` →
+  `<<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>`, and `zlib:gunzip/1` inverts it)
+  while `beam_rt` raises the plain `error:undef`, so any case pinning either one is a plain-value
+  `mismatch`: this pair is a recorded divergence, not a draft. Recorded in `divergences.md`
+  §A.7 — zlib.
+* repro: `erts_rust/target/release/differential compare 'zlib:gzip(<<"abc">>)'`
+
 ## 5. `process_info/2` items — owner `beam_rt`
+
+**Status:** §5a `promotable (agrees today, not yet in the corpus)`; §5b `still-a-gap` (inferred
+from batch context, not re-verified this batch); §5c no gap, no case needed.
 
 The most stable receivable form inspects a **freshly spawned** process, not `self()`: the oracle's
 `-eval` root process has a different boot shape than `beam_rt`'s (registered / links / trap_exit),
@@ -253,17 +298,21 @@ case("system_info/process_info_catchlevel",       "…",
 `minor_gcs` count and the `max_heap_size` map value differ, and both are volatile, so they stay
 unpinned. No gap here.
 
-## 6. `-pa` / `-pz` — owner `beam_rt`
+## 6. `-pa` / `-pz` / `+S N:online` — owner `beam_rt`
 
-`beam_rt`'s CLI (`crates/beam_rt/src/cli.rs`) consumes exactly **one** value per `-pa`/`-pz` and
-adds every `-pa` directory to the code path unconditionally.
+**Status:** `now-agreeing-and-promoted` — all three shapes below are faithful in `beam_rt` and are
+pinned in `src/corpus/flags.rs` (the ids in the literals are the ones that landed).
 
-### 6a. a non-existent `-pa` directory
+`beam_rt`'s CLI (`crates/beam_rt/src/cli.rs`) filters a non-existent `-pa`/`-pz` directory out of
+`code:get_path/0` (as `erl` does), accepts a multi-value `-pa`/`-pz` occurrence, and honours the
+`:N` half of `+S N:N` for `schedulers_online`. The shadowing half of the same surface is 6d.
+
+### 6a. a non-existent `-pa` / `-pz` directory
 
 ```rust
 Case {
     id: "flags/pa_nonexistent_dir_is_not_on_the_code_path",
-    description: "erl filters a non-existent -pa dir out of code:get_path/0; beam_rt adds it",
+    description: "a non-existent -pa dir is filtered out of code:get_path/0",
     contracts: &[Contract::Cli],
     kind: CaseKind::Eval {
         expr: "lists:member(\"/no/such/dir\", code:get_path())",
@@ -274,14 +323,16 @@ Case {
 }
 ```
 
-* oracle: `ok false`, exit `0`. `beam_rt`: `ok true`, exit `0` → **mismatch**.
+* both runtimes: `ok false`, exit `0`. The append-side twin is the landed
+  `flags/pz_nonexistent_dir_is_not_on_the_code_path` (the same body with
+  `extra_argv: &["-pz", "…"]`; the landed switch value is `/nonexistent-differential-dir`).
 * repro: `beam_rt -noshell -pa /no/such/dir -eval 'io:format("~w~n",[lists:member("/no/such/dir", code:get_path())]),halt().'`
 
 ### 6b. multiple values in one occurrence
 
 ```rust
 Case {
-    id: "flags/pa_multiple_values_in_one_occurrence",
+    id: "flags/pa_multiple_values_one_occurrence",
     description: "erl records every following non-switch token as one -pa occurrence's values",
     contracts: &[Contract::Cli],
     kind: CaseKind::Eval {
@@ -293,17 +344,17 @@ Case {
 }
 ```
 
-* oracle: `ok {ok,[[[97],[98]]]}`, exit `0` (one occurrence carrying `["a","b"]`). `beam_rt`:
-  rejects the token with `beam_rt: error unexpected argument "b"` and the usage banner, exit `2`
-  → **mismatch**.
-* `-pz` has the identical single-value limitation (`crates/beam_rt/src/cli.rs`, the `-pz` arm).
+* both runtimes: `ok {ok,[[[97],[98]]]}`, exit `0` (one occurrence carrying `["a","b"]`); the
+  append-side twin is the landed `flags/pz_multiple_values_one_occurrence`
+  (`init:get_argument(pz)` with `["-pz", "a", "b"]`), which has the identical multi-value shape
+  (`crates/beam_rt/src/cli.rs`, the `-pz` arm).
 * repro: `beam_rt -noshell -pa a b -eval 'io:format("~w~n",[init:get_argument(pa)]),halt().'`
 
-### 6c. `+S N:online` — owner `beam_rt`
+### 6c. `+S N:online`
 
 ```rust
 Case {
-    id: "flags/plus_s_online_half_sets_schedulers_online",
+    id: "flags/plus_s_total_online_sets_schedulers_online",
     description: "+S 4:2 sizes the scheduler pool to 4 but puts only 2 online",
     contracts: &[Contract::Cli],
     kind: CaseKind::Eval {
@@ -315,22 +366,34 @@ Case {
 }
 ```
 
-* oracle: `ok 2`, exit `0` (with `erlang:system_info(schedulers)` = `4`). `beam_rt`: `ok 4`,
-  exit `0` → **mismatch**: `parse_schedulers` (`crates/beam_rt/src/cli.rs`) parses the `:2` half but
-  drops it, and `schedulers_online` is reported equal to `schedulers`
-  (`crates/beam_rt/src/info/schedulers.rs`).
+* both runtimes: `ok 2`, exit `0` (with `erlang:system_info(schedulers)` = `4`);
+  `parse_schedulers` (`crates/beam_rt/src/cli.rs`) keeps the `:2` half and
+  `schedulers_online` (`crates/beam_rt/src/info/schedulers.rs`) reports it.
 * repro: `beam_rt -noshell +S 4:2 -eval 'io:format("~w~n",[erlang:system_info(schedulers_online)]),halt().'`
 
+### 6d. a stdlib-module shadow — the `-pz` side only
+
+* The `-pz` non-shadowing check **is** expressible and landed as the `ModuleEnv` case
+  `flags_apply/erl_aflags_pz_does_not_shadow_a_stdlib_module` (`src/corpus/flags_apply.rs`): the
+  `ERL_AFLAGS`-carried directory holds a module *named* like a stdlib module (`proplists`) and
+  reaches the code path only through the environment, and the executed module reduces
+  `code:which(proplists) =:= <shadow beside ?MODULE>` to the integer `0` (the stdlib module still
+  wins) — the raw `code:which/1` answer is an installation-absolute path, so the integer reduction
+  is what makes the check portable at all.
+* The `-pa` side stays unpinnable: `-pa` *prepends*, so the shadow wins and is loaded during the
+  oracle's boot, which crashes it (empty stdout, no comparable golden).
+
 ## 7. Corrections — things named as gaps that are **not** gaps
+
+**Status:** `stale-fixed-elsewhere` — every row below is a non-gap; no case can be derived from any
+of them. (The three `nif_abi/*` ids are current in `src/corpus/nif_abi.rs`.)
 
 | named item | finding | owner |
 |---|---|---|
 | `timer:now_diff/2` | **agrees** — a case could be ADDED (§2), not a gap | — |
 | `string:concat/1` | `undef` on the **oracle too** — not a usable case; `string:concat/2` and `lists:concat/1` agree (§3) | — |
-| `enif_atom_len` | **not a NIF C ABI symbol at all** — absent from `erl_nif.h` *and* `erl_nif_api_funcs.h` (oracle **and** in-tree `erts/emulator/beam/erl_nif.h`); nothing to export. No case possible. | — |
-| `enif_term_to_binary` | declared **and** exported by `beam_rt`; already covered by `nif_abi/term_to_binary_valid_term` (`[AGREE]`) | — |
-| `enif_binary_to_term` | declared **and** exported; covered by `nif_abi/binary_to_term_valid_encoding` (`[AGREE]`) | — |
-| `enif_make_ref` | declared **and** exported; covered by `nif_abi/ref_make_ref_is_a_ref` (`[AGREE]`) | — |
+| `enif_atom_len` | **not a NIF C ABI symbol at all** — absent from `erl_nif.h` *and* `erl_nif_api_funcs.h` (oracle **and** in-tree `erts/emulator/beam/erl_nif.h`); nothing to export, so no case is possible | — |
+| `enif_make_ref` / `enif_term_to_binary` / `enif_binary_to_term` | declared **and** exported by `beam_rt`; **already closed** — each is covered by an agreeing `nif_abi/*` case (`ref_make_ref_is_a_ref`, `term_to_binary_valid_term`, `binary_to_term_valid_encoding`) | — |
 | `process_info/1` gc key set | the `garbage_collection` proplist has the **same 5 keys** in both runtimes (only volatile values differ) (§5c) | — |
 | `process_info/2` `registered_name`/`links`/`trap_exit` | **agree on a spawned process** (§5a); only the `self()` boot shape diverges | — |
 | `catchlevel` | a genuine typed `unsupported` on the `-eval`/fun-bodied process, **not** a value mismatch (§5b) | `beam_rt` |

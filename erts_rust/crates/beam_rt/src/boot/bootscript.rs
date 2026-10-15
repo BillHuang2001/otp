@@ -58,11 +58,10 @@
 //! [`execute`] walks the instructions in order and returns the first error it meets —
 //! loading a module that is not on the code path, spawning a process whose function is not
 //! exported, or applying an MFA the runtime cannot run. This is the honest behaviour: the
-//! real `start.boot` loads every `primLoad` batch and runs all three `kernelProcess`
-//! directives, but the walk still stops at the first directive that needs machinery this
-//! runtime does not have — currently 0-based index 19, the stdlib
-//! `{apply,{application,start_boot,[…]}}` (see `src/boot/CONTEXT.md`) — with its typed error
-//! rather than skipping it, so its final `{progress,started}` is not reached.
+//! real `start.boot` loads every `primLoad` batch, runs all three `kernelProcess`
+//! directives and completes all 22 of them to its final `{progress,started}`, and a script
+//! that needs machinery this runtime does not have would stop at the first such directive
+//! with its typed error rather than skipping it (see `src/boot/CONTEXT.md`).
 //!
 //! # The directives that run processes advance the scheduler
 //!
@@ -1110,8 +1109,10 @@ mod tests {
     fn the_real_start_boot_executes_every_directive_to_progress_started() {
         // The full script loads every `primLoad` batch, spawns (and drives) the three kernel
         // processes, runs the four `apply` directives — the last of them, `{apply,{c,erlangrc,
-        // []}}`, against the runtime-native `file_server_2` service registered by
-        // `Runtime::new` — and ends at the final `{progress,started}`. It **must not** panic
+        // []}}`, against `file_server_2`, which on this (`-boot FILE`) route is the booted
+        // `kernel_sup`'s own `file_server` child because `Runtime::new` spawns the runtime's
+        // native service **unclaimed** when a boot script is configured — and ends at the final
+        // `{progress,started}`. It **must not** panic
         // or hang: every scheduler drive `execute` performs is bounded by its own deadline.
         //
         // Each instruction is executed in isolation here so a regression names the *exact*
@@ -1154,10 +1155,10 @@ mod tests {
     #[test]
     fn a_synthetic_unbootable_directive_reports_a_boot_stop() {
         // The `BootStop`/`execute_reporting` reporting machinery, pinned on a synthetic script
-        // so the report's position and shape are deterministic (the real `start.boot` stops at
-        // 0-based index 19 — see `CONTEXT.md`). The second instruction applies a
-        // non-existent module, so the walk stops at 0-based index 2 with the script's
-        // instruction count, the failing directive and a typed error — never a panic.
+        // so the report's position and shape are deterministic (the real `start.boot` now
+        // completes, so it has no `BootStop` to report — see `CONTEXT.md`). The second
+        // instruction applies a non-existent module, so the walk stops at 0-based index 2 with
+        // the script's instruction count, the failing directive and a typed error — never a panic.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -1211,7 +1212,7 @@ mod tests {
     fn the_real_start_boot_completes_through_execute_reporting() {
         // The **whole** script in one pass: `execute_reporting` returns `Ok(())` — all 22
         // directives run, including the final `{apply,{c,erlangrc,[]}}` at instruction 20
-        // (which needs the native `file_server_2` service) and the closing
+        // (answered by the booted `kernel_sup`'s own `file_server` child) and the closing
         // `{progress,started}` — so there is no `BootStop` to report on this path.
         //
         // The three kernel processes must survive their short-lived directive processes'
@@ -1250,11 +1251,14 @@ mod tests {
             registered(&runtime, "application_controller"),
             "the application_controller server must survive its directive process"
         );
-        // The boot's own file service is a permanent runtime process, registered at
-        // construction and still registered after the script has consumed its replies.
+        // The boot's own file service. On **this** (`-boot FILE`) route `Runtime::new` spawns the
+        // runtime's **native** `file_server_2` service *unclaimed*, so the name belongs to the
+        // booted `kernel_sup`'s own `file_server` child (`lib/kernel/src/kernel.erl` starts it,
+        // `file_server.erl:266-269` registers it) — which must still hold the name after the
+        // script has consumed its replies.
         assert!(
             registered(&runtime, "file_server_2"),
-            "the native file_server_2 service must still be registered after the boot"
+            "the booted kernel's own file_server_2 child must still be registered after the boot"
         );
     }
 

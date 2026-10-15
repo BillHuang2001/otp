@@ -548,6 +548,18 @@ pub struct RuntimeConfig {
     pub max_ports: Option<usize>,
     /// The parsed init arguments (contract A.6; the source of `init:get_argument/1`).
     pub init_args: InitArgs,
+    /// The boot script this invocation drives, as the CLI **resolved** it: the explicit
+    /// `-boot FILE` value when one was given, else `init`'s own default (the literal
+    /// `start`) — for every action but `-version`, which boots nothing.
+    ///
+    /// This is deliberately a field of its own rather than a read of the `boot` init
+    /// argument: `init:get_argument(boot)` must keep reporting what the user actually
+    /// typed and never a synthesized default (contract A.6), while a start instruction
+    /// like `-eval` still boots the default script. It is `None` for a
+    /// [`RuntimeConfig`] a **host** built (`RuntimeConfig::default`,
+    /// [`crate::Runtime::with_defaults`]) — such a runtime drives no script unless it
+    /// named one with `-boot`.
+    pub resolved_boot_script: Option<String>,
     /// The action to perform.
     pub action: Action,
     /// The **perf-map / JIT-dump** surface `+JPperf` selects (contract A.8).
@@ -574,8 +586,8 @@ impl Default for RuntimeConfig {
     /// The defaults of a bare `beam_rt` invocation: a `jit` emulator, an empty code
     /// path (both the `-pa` head and the `-pz` tail), a [`DEFAULT_HEAP_WORDS`]-word heap,
     /// the emulator's heap-size defaults, no init arguments, [`Action::Boot`], no
-    /// port-table request, no explicit online scheduler count and no environment
-    /// variables.
+    /// port-table request, no explicit online scheduler count, no resolved boot script and
+    /// no environment variables.
     fn default() -> Self {
         RuntimeConfig {
             emulator: EmulatorConfig::default(),
@@ -586,6 +598,7 @@ impl Default for RuntimeConfig {
             heap: HeapOptions::default(),
             max_ports: None,
             init_args: InitArgs::default(),
+            resolved_boot_script: None,
             action: Boot,
             perf_map: PerfMapConfig::new(),
             env: ErlEnv::default(),
@@ -708,7 +721,67 @@ impl RuntimeConfig {
         self.action == Version
     }
 
-    /// The **last** value the CLI preserved for the emulator switch `switch`, if any.
+    /// The `-boot FILE` argument of the merged command line, or `None` when the runtime was
+    /// not asked to run a boot script by name.
+    ///
+    /// The value is read from the recorded init arguments rather than from a field of its own
+    /// because that is exactly where `init` reads it: `bootfile/2` resolves `get_flag(boot,
+    /// Flags, Root ++ "/bin/start")` (`erts/preloaded/src/init.erl:1257-1258`), and the `boot`
+    /// flag *is* the init argument `init:get_argument(boot)` reports (contract A.6). The
+    /// **first** occurrence wins (`lists:keyfind/3`, `init.erl:1763`), so `-boot a -boot b`
+    /// boots `a`. A `-boot` with no operand never reaches the parsed config: [`crate::cli`]
+    /// rejects it as a usage error, so a value is always present when there is an occurrence.
+    ///
+    /// This is the **name the user typed**, never `init`'s default — see
+    /// [`resolved_boot_script`](Self::resolved_boot_script) and
+    /// [`boot_script_to_run`](Self::boot_script_to_run) for the script the runtime actually
+    /// drives. Overloading this accessor with `init`'s default would be wrong: the `boot` flag
+    /// *is* the init argument (contract A.6), and the oracle answers
+    /// `init:get_argument(boot)` with `error` (a bare atom) when the user gave no `-boot`, so a
+    /// synthesized default here would fabricate an argument the invocation never carried.
+    /// The resolved script lives in its own field for exactly that reason.
+    pub fn boot_script(&self) -> Option<&str> {
+        let occurrences = self.init_args.get("boot")?;
+        let values = occurrences.first()?;
+        values.first().map(String::as_str)
+    }
+
+    /// The boot script the CLI resolved for this invocation, or `None` when it resolved none.
+    ///
+    /// [`crate::cli`] records the resolved script here **before** it builds the runtime — the
+    /// explicit `-boot FILE` value when one was given, else `init`'s literal default `start` —
+    /// for every action except `-version`, which never boots (`do_boot/3`,
+    /// `erts/preloaded/src/init.erl:1197-1225`). A [`RuntimeConfig`] a host built carries
+    /// `None`.
+    pub fn resolved_boot_script(&self) -> Option<&str> {
+        self.resolved_boot_script.as_deref()
+    }
+
+    /// Records [`resolved_boot_script`](Self::resolved_boot_script).
+    pub fn with_resolved_boot_script(mut self, script: Option<String>) -> Self {
+        self.resolved_boot_script = script;
+        self
+    }
+
+    /// The script this invocation drives, or `None` when it drives none.
+    ///
+    /// The CLI's own resolution ([`resolved_boot_script`](Self::resolved_boot_script)) wins;
+    /// a config that carries none — a host-built one, a test's — falls back to the `-boot`
+    /// init argument, so a caller that hands a parsed `-boot FILE` invocation straight to
+    /// [`Runtime::new`](crate::Runtime::new) still measures the script it named.
+    pub fn boot_script_to_run(&self) -> Option<&str> {
+        self.resolved_boot_script().or_else(|| self.boot_script())
+    }
+
+    /// Whether this invocation drives a boot script at all.
+    ///
+    /// This is the **one** predicate behind both the drive ([`crate::cli`]) and the native
+    /// `file_server_2` name decision ([`Runtime::new`](crate::Runtime::new)): a runtime that
+    /// boots a script leaves the name to the booted `kernel_sup`'s own `file_server` child,
+    /// and one that boots none owns it itself.
+    pub fn drives_a_boot_script(&self) -> bool {
+        self.boot_script_to_run().is_some()
+    }    /// The **last** value the CLI preserved for the emulator switch `switch`, if any.
     ///
     /// Every writer of
     /// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags)

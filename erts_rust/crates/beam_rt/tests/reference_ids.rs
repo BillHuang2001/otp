@@ -518,7 +518,10 @@ fn run_scheduled(fixtures: &Fixtures, function: &str) -> Run {
     let spec = format!("refids:{function}/0");
     run_bounded(
         Path::new(BINARY),
-        &["-pa", fixtures.dir_str(), "run", beam, &spec],
+        // `-noshell`: the `run` action is banner-free by construction (it records the
+        // `noshell` init argument, so the booted kernel prints no OTP slogan); it is kept to
+        // mirror the oracle probe.
+        &["-noshell", "-pa", fixtures.dir_str(), "run", beam, &spec],
     )
 }
 

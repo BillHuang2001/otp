@@ -31,12 +31,14 @@
 //!
 //! Every other [`ExecutionContext`] method — BIF/apply dispatch, the heap, the whole
 //! receive/message seam, the cross-module-call seam
-//! ([`resolve_external_call`](ExecutionContext::resolve_external_call)) **and the
+//! ([`resolve_external_call`](ExecutionContext::resolve_external_call)), the local-call seam
+//! ([`resolve_local_call`](ExecutionContext::resolve_local_call)) **and the
 //! execution-trace seam** ([`trace_enabled`](ExecutionContext::trace_enabled) /
 //! [`trace_event`](ExecutionContext::trace_event)) — is forwarded to the slice's real
 //! [`RuntimeContext`] unchanged, so a scheduled process reports `call`/`return_from`/
-//! `return_to` events exactly as the single-pass `Runtime::run_*` path does and a
-//! `call_ext*` the host can run in-machine is entered in this very slice.
+//! `return_to` events exactly as the single-pass `Runtime::run_*` path does, a
+//! `call_ext*` the host can run in-machine is entered in this very slice, and a local call the
+//! host serves as a BIF (a `prim_tty` NIF stub) is dispatched rather than jumped into.
 //!
 //! # Why charging the per-instruction hook is safe
 //!
@@ -63,9 +65,9 @@ use std::sync::Arc;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::ExecutionContext;
+use beam_engine::{ExecutionContext, Machine};
 use beam_loader::{Label, Module};
-use beam_term::Eterm;
+use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::context::RuntimeContext;
 
@@ -184,6 +186,41 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::call_bif(self.inner, module, function, arity, args)
     }
 
+    /// Forwarded like every other method — and **load-bearing** for the scheduled path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine's once-per-run latch
+    /// ([`Machine::dispatch_bif_call`](beam_engine::Machine)) reads the probe **here**:
+    /// without this override it would see the trait default (`false`), the engine would
+    /// never take the in-machine door, and a scheduled process could not answer its own
+    /// `erlang:process_info(self(), current_stacktrace)` — `gen_server`'s `?STACKTRACE()`.
+    fn wants_bif_in_machine(&self) -> bool {
+        ExecutionContext::wants_bif_in_machine(self.inner)
+    }
+
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path, because the
+    /// slice's machine runs on this wrapper and therefore reaches the entry-aware dispatch
+    /// here, never on the inner context directly.
+    fn call_bif_in_machine(
+        &mut self,
+        machine: &Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        ExecutionContext::call_bif_in_machine(
+            self.inner,
+            machine,
+            entry_module,
+            module,
+            function,
+            arity,
+            args,
+        )
+    }
     /// Forwarded like every other method (the wrapper's own overrides are
     /// [`reduce`](ExecutionContext::reduce)/[`wants_reduce`](ExecutionContext::wants_reduce)
     /// and the two `ensure_heap` doors).
@@ -223,6 +260,55 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         args: &[Eterm],
     ) -> Result<Option<(Arc<Module>, Label)>> {
         ExecutionContext::resolve_local_fun(self.inner, fun, args)
+    }
+
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine's three local-call arms
+    /// (`Call`/`CallOnly`/`CallLast`) and the native baseline tier's `jit_local_call` probe
+    /// consult the local-call seam here: without the forward they would see the trait default
+    /// (`Ok(false)`), always decline, and jump **in-machine** into a non-exported same-module
+    /// callee's own code — which for a built-in/static NIF library stub such as
+    /// `prim_tty:tty_create/1` (body `erlang:nif_error(undef)`) raises `undef` instead of
+    /// reaching the host that serves it. Forwarding reaches
+    /// [`RuntimeContext`]'s own override (`crate::native::prim_tty::serves_local_call`), so the
+    /// served key is dispatched through [`call_bif`](ExecutionContext::call_bif) under the arm's
+    /// frame discipline and every other key stays the unchanged in-machine jump.
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        ExecutionContext::resolve_local_call(self.inner, module, function, arity)
+    }
+
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine resolves a runtime atom value
+    /// (a variable `M`/`F` in `apply(M,F,A)` / `M:F(...)`) here: without the forward the trait
+    /// default would index only the running module's load-time snapshot, so a module loaded
+    /// early could not name an atom interned later. That is exactly the A.9 boot shape —
+    /// `gen_server:init_it/6` evaluates `{ok, Mod:init(Args)}` with a `Mod` interned after
+    /// `gen_server` was loaded — so forwarding reaches
+    /// [`RuntimeContext`]'s own override (the runtime's live shared namespace) and the resolution
+    /// succeeds instead of raising `badarg`.
+    fn atom_name(&self, module: &Module, atom: Atom) -> Option<String> {
+        ExecutionContext::atom_name(self.inner, module, atom)
+    }
+
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path, for the same
+    /// reason as [`atom_name`](ExecutionContext::atom_name): the slice's machine runs on *this*
+    /// wrapper, so the engine's `test`/`select_val`/map-key comparisons take the namespace here.
+    /// Without the forward they would see the trait default (`&module.atom_table`, the module's
+    /// load-time snapshot) and a module loaded early could not name an atom interned later — the
+    /// `sofs:drestriction/2` shape, whose `{module_info,0} < {g,1}` guard was then ordered by raw
+    /// atom id instead of by name and took the wrong `sofs:restrict_n/5` clause. Forwarding
+    /// reaches [`RuntimeContext`]'s own override (the runtime's live shared namespace), so every
+    /// comparison orders atoms by name exactly as the `<`/`==` BIFs do.
+    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
+        ExecutionContext::atoms(self.inner, module)
     }
 
     /// Charge one reduction, then serve the request by delegating — **arming the GC latch**

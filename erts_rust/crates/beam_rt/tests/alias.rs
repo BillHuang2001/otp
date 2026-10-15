@@ -49,9 +49,14 @@
 //! their customary shapes and the two printed lines are compared:
 //!
 //! ```none
-//! beam_rt -pa DIR run DIR/<mod>.beam <mod>:<fun>/0        %% prints the result as `~w~n`
+//! beam_rt -noshell -pa DIR run DIR/<mod>.beam <mod>:<fun>/0   %% prints the result as `~w~n`
 //! erl     -noshell -pa DIR -eval 'io:format("~w~n",[<mod>:<fun>()])' -s init stop
 //! ```
+//!
+//! Both sides pass `-noshell` to line up: the oracle prints its OTP banner without it, and
+//! this runtime's ERTS-native actions (`-eval`/`-s`/`-run`/bare shell) print the same banner
+//! without it, while the `run` action is banner-free by construction (it records the `noshell`
+//! init argument).
 //!
 //! A few cases additionally run on the `-eval` route (`beam_rt -noshell -eval …`), the route
 //! `tests/monitor.rs` and `tests/send.rs` use, so both of this runtime's send entry points are
@@ -527,8 +532,13 @@ fn run_bounded(program: &Path, args: &[&str]) -> Run {
     }
 }
 
-/// `beam_rt -pa DIR run DIR/<mod>.beam <mod>:<fun>/0` — the scheduled-process route, which
-/// prints the result as `~w~n`.
+/// `beam_rt -noshell -pa DIR run DIR/<mod>.beam <mod>:<fun>/0` — the scheduled-process route,
+/// which prints the result as `~w~n`.
+///
+/// The `run` action is banner-free by construction (it records the `noshell` init argument),
+/// so it prints no OTP banner (`Erlang/OTP 30 [erts-17.1] [source] [64-bit]`) and the result
+/// line is directly comparable to the oracle's `erl -noshell …` output without loosening the
+/// assertion; `-noshell` is kept to mirror that probe.
 fn run_scheduled(fixtures: &Fixtures, module: &str, function: &str) -> Run {
     let beam = fixtures.beam(module);
     let beam = beam
@@ -537,7 +547,7 @@ fn run_scheduled(fixtures: &Fixtures, module: &str, function: &str) -> Run {
     let spec = format!("{module}:{function}/0");
     run_bounded(
         Path::new(BINARY),
-        &["-pa", fixtures.dir_str(), "run", beam, &spec],
+        &["-noshell", "-pa", fixtures.dir_str(), "run", beam, &spec],
     )
 }
 

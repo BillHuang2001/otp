@@ -47,7 +47,7 @@
 //! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -298,6 +298,18 @@ pub struct Runtime {
     /// Written **only** by the root-action entries ([`Runtime::eval`]/[`Runtime::run_named`])
     /// and restored on every exit path, so it is never a stale frame.
     pub(crate) executing: Option<executing::ExecutingFrame>,
+    /// The executing process's **execution position**, published by the in-machine BIF door
+    /// for exactly one nested `erlang:process_info/1,2` call (see
+    /// [`crate::context::position`]).
+    ///
+    /// The scheduler takes the executing process's machine **out** of
+    /// [`Runtime::runner_state`] for the whole slice, so the caller's own position has no
+    /// other source; `beam_engine`'s in-machine BIF door hands that live machine to
+    /// [`crate::context::RuntimeContext`], which reads the five machine-sourced item values
+    /// here. Non-`None` only between the door's publication and the return of the one nested
+    /// `call_bif` it wraps — a straight-line assign/clear with no `?` between them — so it is
+    /// never a stale record, and only a read for the **published pid** ever consults it.
+    pub(crate) in_machine: Option<crate::context::InMachinePosition>,
     /// The node-global **cumulative reduction count** — the `Total` behind
     /// `erlang:statistics(reductions)`/`(exact_reductions)`.
     ///
@@ -384,6 +396,38 @@ pub struct Runtime {
     /// bumped when its table slot is reused ([`ProcessTable::take`]), so the stale key names
     /// no process that can ever be observed again.
     pub(crate) group_leaders: HashMap<ProcessId, ProcessId>,
+    /// The pids with `process_flag(async_dist, true)` set — the C's per-process
+    /// `F_ASYNC_DIST` PCB bit (`bif.c:2032-2043`).
+    ///
+    /// `beam_process::ProcessFlags` carries no such bit, so — like
+    /// [`Runtime::group_leaders`] — the runtime keeps the flag in its own per-pid store. It is
+    /// the **one** source of truth every reader shares:
+    /// the `beam_bifs` `process_flag/2` bridge ([`crate::context::process_bridge`]) and
+    /// `erlang:process_info/2`'s `async_dist` item ([`crate::native::memory`]), so they can
+    /// never disagree about the same process. Set membership is the value; a pid absent from it
+    /// has the oracle's fresh-process default `false`.
+    ///
+    /// As with [`Runtime::group_leaders`], a terminated process leaves its entry behind,
+    /// which is harmless: a pid's serial is bumped when its table slot is reused, so the stale
+    /// key names no process that can ever be observed again.
+    pub(crate) async_dist: HashSet<ProcessId>,
+    /// The `{monitor_nodes, Options}` registrations of every process — the C's
+    /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
+    ///
+    /// The undocumented `erlang:process_flag(monitor_nodes, Bool)` /
+    /// `process_flag({monitor_nodes, Opts}, Bool)` forms (`net_kernel:monitor_nodes/1,2` use
+    /// them) keep a per-process monitor entry keyed by the **bitmask** the option list folds to
+    /// (`dist.c:6758-6825`), and the flag's value is that entry's reference **count**.
+    /// `beam_process::ProcessFlags` carries no such store, so — like [`Runtime::async_dist`] —
+    /// the runtime keeps it in its own per-pid map: the outer key is the process, the inner key
+    /// the option bitmask and the inner value the C's `refc` (an absent inner entry is the C's
+    /// "no monitor", whose `old_value` is `0`).
+    ///
+    /// This is the **one** source of truth for the flag: `beam_rt`'s floor serves the tuple/atom
+    /// forms from it (see [`crate::native::process`]). A terminated process leaves its entry
+    /// behind, which is harmless: a pid's serial is bumped when its table slot is reused, so the
+    /// stale key names no process that can ever be observed again.
+    pub(crate) monitor_nodes: HashMap<ProcessId, HashMap<u64, u64>>,
     /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
     ///
     /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
@@ -502,6 +546,14 @@ pub struct Runtime {
     /// live in one thread — a process-global table would let their handles collide. See
     /// [`crate::native::prim_file`].
     open_files: HashMap<u64, std::fs::File>,
+    /// The live `prim_tty` handles (contract A.7) — each entry maps the reference id minted
+    /// by `tty_create/1` (`src/native/prim_tty.rs`) to the output file descriptor it names.
+    ///
+    /// The handle is the oracle's opaque NIF resource (`#Ref<…>`-shaped and unobservable); a
+    /// term whose id is not in this table is the C's `enif_get_resource` failure (`badarg`).
+    /// Owned by the `Runtime` (not a `thread_local!`) because several runtimes can live in one
+    /// thread.
+    prim_tty_handles: HashMap<u64, i32>,
     /// The **native `file_server_2` service** and its live io-devices (contract A.9) — see
     /// [`crate::native::file_server`].
     ///
@@ -632,14 +684,32 @@ impl Runtime {
             .register(init_name, self_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
         // The native **`file_server_2` service** (contract A.9): a `Runnable`, never-enqueued
-        // process that answers the OTP file protocol, so the real `bootstrap/bin/start.boot`'s
-        // final `{apply,{c,erlangrc,[]}}` directive completes instead of dying with
-        // `{noproc,{gen_server,call,[file_server_2,…]}}` (see `src/native/file_server.rs`).
-        let file_services = crate::native::file_server::FileServices::start(
-            &mut processes,
-            code_server.atoms_mut(),
-            config.heap.policy().clone(),
-        )?;
+        // process that answers the OTP file protocol, so a caller like `c:erlangrc/0` finds the
+        // service instead of dying with `{noproc,{gen_server,call,[file_server_2,…]}}` (see
+        // `src/native/file_server.rs`).
+        //
+        // The **boot-script route** — every CLI action but `-version`, which resolves the
+        // explicit `-boot FILE` value or `init`'s default `start` — is the exception, because
+        // there the booted system owns the name: `bootstrap/bin/start.boot`'s `kernel_sup`
+        // starts OTP's own `file_server_2` child (`{file_server, start_link, []}`), and an
+        // **initial** child start that finds the name already taken aborts that supervisor —
+        // `kernel` is `permanent`, so the node tears down. The native service must therefore
+        // leave the name free and let the booted application serve it.
+        // [`RuntimeConfig::drives_a_boot_script`] is that one predicate: it covers both the
+        // CLI's resolved script and a `-boot` init argument a host handed straight to this
+        // constructor, while a config that names no script keeps the name.
+        let file_services = if config.drives_a_boot_script() {
+            crate::native::file_server::FileServices::start_unclaimed(
+                &mut processes,
+                config.heap.policy().clone(),
+            )?
+        } else {
+            crate::native::file_server::FileServices::start(
+                &mut processes,
+                code_server.atoms_mut(),
+                config.heap.policy().clone(),
+            )?
+        };
         // A zero-word heap can hold nothing, so the configured size is floored — and a
         // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
         let heap_words = term_heap_words(&config);
@@ -729,6 +799,7 @@ impl Runtime {
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
             executing: None,
+            in_machine: None,
             reductions: 0,
             reductions_anchor: Cell::new(0),
             exact_reductions_anchor: Cell::new(0),
@@ -742,6 +813,8 @@ impl Runtime {
             refs: RefAllocator::new(),
             references: HashMap::new(),
             group_leaders: HashMap::new(),
+            async_dist: HashSet::new(),
+            monitor_nodes: HashMap::new(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
             timer_resumes: HashMap::new(),
@@ -754,6 +827,7 @@ impl Runtime {
             inbound_delivery: true,
             perf_map,
             open_files: HashMap::new(),
+            prim_tty_handles: HashMap::new(),
             file_services,
             boot_script_id: None,
             boot_script_path: None,
@@ -899,16 +973,19 @@ impl Runtime {
     }
 
     /// The runtime's **sequential-tracing** state (contract A.8) — the per-process trace
-    /// tokens, the serial clock and the system tracer (see [`crate::seq_trace`]).
+    /// tokens, the serial clock, the system tracer and the `system_logger` flag (see
+    /// [`crate::seq_trace`]).
     ///
-    /// Read-only, for the introspection surface: `erlang:seq_trace_info/1` and
-    /// `process_info(Pid, sequential_trace_token)` both answer from it.
+    /// Read-only, for the introspection surface: `erlang:seq_trace_info/1`,
+    /// `process_info(Pid, sequential_trace_token)` and `erlang:system_info(system_logger)`
+    /// all answer from it.
     pub(crate) fn seq_trace(&self) -> &SeqTrace {
         &self.seq_trace
     }
 
     /// The mutable sequential-tracing state — what `erlang:seq_trace/2`,
-    /// `erlang:seq_trace_print/1,2` and `erlang:system_flag(reset_seq_trace, _)` mutate.
+    /// `erlang:seq_trace_print/1,2` and `erlang:system_flag(reset_seq_trace | system_logger,
+    /// _)` mutate.
     pub(crate) fn seq_trace_mut(&mut self) -> &mut SeqTrace {
         &mut self.seq_trace
     }
@@ -1033,6 +1110,15 @@ impl Runtime {
     /// [`crate::native::prim_file`] is the module that mutates it.
     pub(crate) fn open_files_mut(&mut self) -> &mut HashMap<u64, std::fs::File> {
         &mut self.open_files
+    }
+    /// The live `prim_tty` handle table (contract A.7), keyed by the reference id the handle
+    /// term carries.
+    ///
+    /// Both halves of the `prim_tty` floor go through here: `tty_create/1` inserts the minted
+    /// handle's `ofd`, and every other stub looks it up (a miss is `badarg`). See the field's
+    /// own docs and [`crate::native::prim_tty`].
+    pub(crate) fn prim_tty_handles_mut(&mut self) -> &mut HashMap<u64, i32> {
+        &mut self.prim_tty_handles
     }
 
     /// Takes a heap for one BIF call out of the pool.
@@ -1396,6 +1482,71 @@ impl Runtime {
         self.group_leaders.insert(pid, leader);
     }
 
+    /// Whether `pid` has `process_flag(async_dist, true)` set — the C's `F_ASYNC_DIST` bit
+    /// (`bif.c:2033`).
+    ///
+    /// A pid with no entry has the fresh-process default `false`, exactly the oracle's answer
+    /// for a process that never set the flag. This is the **one** source of truth every reader
+    /// shares (the `process_flag/2` bridge and the `process_info/2` `async_dist` item — see
+    /// [`Runtime::async_dist`]).
+    pub(crate) fn is_async_dist(&self, pid: ProcessId) -> bool {
+        self.async_dist.contains(&pid)
+    }
+
+    /// Sets `pid`'s `async_dist` flag (`erlang:process_flag(async_dist, Bool)`).
+    ///
+    /// The flag has no observable effect in this single-threaded runtime (its only purpose is
+    /// C's asynchronous distribution-message delivery), but the flag's **value** is real
+    /// per-process state: `process_flag/2` reports the previous value and `process_info/2`
+    /// reports the current one, both from the same store (see [`Runtime::async_dist`]).
+    pub(crate) fn set_async_dist(&mut self, pid: ProcessId, value: bool) {
+        if value {
+            self.async_dist.insert(pid);
+        } else {
+            self.async_dist.remove(&pid);
+        }
+    }
+
+    /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
+    /// bitmask `key`, answering the **previous** reference count — the C's
+    /// `erts_monitor_nodes` `on == true` arm (`dist.c:6827-6845`).
+    ///
+    /// The entry is created (with a count of `0`) when absent, so the first `true` answers `0`
+    /// and each repeat bumps the count by one — exactly the oracle's sequence
+    /// (`process_flag({monitor_nodes, #{list=>true, connection_id=>true}}, true)` ⇒ `0`, then
+    /// `1`, …). The count is the C's `mdep->u.refc`.
+    pub(crate) fn monitor_nodes_add(&mut self, pid: ProcessId, key: u64) -> u64 {
+        let count = self
+            .monitor_nodes
+            .entry(pid)
+            .or_default()
+            .entry(key)
+            .or_insert(0);
+        let old = *count;
+        *count = old + 1;
+        old
+    }
+
+    /// Removes `pid`'s `{monitor_nodes, Options}` monitor under the option bitmask `key`,
+    /// answering the count it had (`0` when absent) — the C's `erts_monitor_nodes` `on == false`
+    /// arm (`dist.c:6846-6865`).
+    ///
+    /// The C deletes the whole entry **regardless of the count** (`erts_monitor_tree_delete`),
+    /// so the next `true` starts again from `0`; an emptied inner map is pruned so the store
+    /// stays as small as the live registrations.
+    pub(crate) fn monitor_nodes_remove(&mut self, pid: ProcessId, key: u64) -> u64 {
+        let (old, empty) = match self.monitor_nodes.get_mut(&pid) {
+            Some(per_process) => {
+                let old = per_process.remove(&key).unwrap_or(0);
+                (old, per_process.is_empty())
+            }
+            None => return 0,
+        };
+        if empty {
+            self.monitor_nodes.remove(&pid);
+        }
+        old
+    }
     /// Gives a freshly spawned `child` the group leader its `parent` has
     /// (`erl_process.c:12654-12663`).
     ///
@@ -1594,8 +1745,10 @@ impl Runtime {
     /// [`Runtime::restart`]'s re-run (and the file whose header `init:script_id/0` reports).
     ///
     /// `None` until a script has been read through [`Runtime::boot_from_script`] /
-    /// [`Runtime::boot_from_script_reporting`] — in particular on the plain `-eval`/`run`
-    /// path, which boots the preloaded set only.
+    /// [`Runtime::boot_from_script_reporting`] — i.e. on a runtime that only ran
+    /// [`Runtime::boot`] (a host-built [`Runtime::with_defaults`], say). Every CLI action that
+    /// builds a runtime loads one: the CLI resolves the explicit `-boot FILE` value or `init`'s
+    /// default `start` for every action but `-version` (see [`RuntimeConfig::drives_a_boot_script`]).
     pub fn boot_script_path(&self) -> Option<&Path> {
         self.boot_script_path.as_deref()
     }
@@ -2536,8 +2689,8 @@ mod tests {
         //   1. the **root process**, registered as `init` (`erlang:whereis(init)` answers it —
         //      the oracle answers `<0.0.0>`), which every action runs as; and
         //   2. the native **`file_server_2` service** (contract A.9), a `Runnable`,
-        //      never-enqueued process that answers the OTP file protocol the boot script needs
-        //      (`src/native/file_server.rs`).
+        //      never-enqueued process that answers the OTP file protocol on the routes where it
+        //      owns the name (`src/native/file_server.rs`).
         assert_eq!(rt.processes().len(), 2);
         for name in ["init", "file_server_2"] {
             let atom = rt
@@ -2553,6 +2706,57 @@ mod tests {
             rt.system_info_value("process_count").expect("count"),
             InfoValue::Int(2)
         );
+    }
+
+    #[test]
+    fn a_boot_script_runtime_spawns_the_native_service_unregistered() {
+        // A route that drives a boot script is one the native `file_server_2` must NOT claim:
+        // the booted `kernel_sup` starts OTP's own `{file_server, start_link, []}` child, and an
+        // **initial** child start that finds the name taken aborts that `permanent` supervisor
+        // (see `src/native/file_server.rs`). `Runtime::new` therefore gates the registration on
+        // `RuntimeConfig::drives_a_boot_script()` and spawns the service **unclaimed** here.
+        let argv: Vec<String> = ["-noshell", "-boot", "bootstrap/bin/start"]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
+        let config = match crate::cli::parse(&argv) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+                return;
+            }
+        };
+        assert_eq!(config.boot_script(), Some("bootstrap/bin/start"));
+        let booted = match Runtime::new(config) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("SKIP: no system Erlang install ({error})");
+                return;
+            }
+        };
+        // The service process is still spawned — the count is the same as on a route that
+        // drives none — and `init` is still registered; only the `file_server_2` name stays free.
+        assert_eq!(booted.processes().len(), 2);
+        assert_eq!(
+            booted.system_info_value("process_count").expect("count"),
+            InfoValue::Int(2)
+        );
+        let init = booted.atoms().lookup("init").expect("`init` is a core atom");
+        assert!(booted.processes().whereis(init).is_some());
+        if let Some(atom) = booted.atoms().lookup("file_server_2") {
+            assert!(
+                booted.processes().whereis(atom).is_none(),
+                "the boot-script route must leave `file_server_2` for the booted system"
+            );
+        }
+        // A host-built runtime that names no script (`Runtime::with_defaults`: no resolved
+        // script, no `-boot` argument) keeps it registered, so the two routes really do differ.
+        let plain = runtime();
+        let atom = plain
+            .atoms()
+            .lookup("file_server_2")
+            .expect("`file_server_2` is registered on the default route");
+        assert!(plain.processes().whereis(atom).is_some());
     }
 
     #[test]

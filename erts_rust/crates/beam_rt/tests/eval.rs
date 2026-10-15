@@ -372,6 +372,66 @@ fn structured_raise_reasons_and_map_key_order_match_the_oracle() {
         assert_eq!(exit, *expected_exit, "{expr}: exit (stderr {stderr:?})");
     }
 }
+/// `erlang:raise/3` at the CLI boundary: the evaluator does **not** serve it, so the
+/// registered `beam_bifs` BIF validates the class *and* the stacktrace argument.
+///
+/// The distinction that makes it observable is returned-value vs raise: the C ends every
+/// invalid-shape path in `return am_badarg`, so an invalid class (`foo`, `1`) or an invalid
+/// stacktrace (`42`, `x`, `{}`) is the atom `badarg` **returned** by the call — the
+/// corpus probe's `of V` branch prints `ok badarg` and exits `0` — while a valid call
+/// raises. Serving `raise/3` locally used to *raise* `badarg` (a caught
+/// `exception error badarg`, exit 1) and to drop the stacktrace.
+///
+/// Every golden is the system oracle's own line (`erl -noshell`, OTP 29 / erts-17.1),
+/// captured through the **same** probe wrapper and argv the corpus builds:
+///
+/// ```text
+/// try (erlang:raise(error, foo, [42])) of V -> io:format("ok ~w~n",[V]), halt(0)
+///   catch C:R -> io:format("exception ~w ~w~n",[C,R]), halt(1) end
+///   ⇒ ok badarg            (exit 0)   — the BIF *returns* badarg
+/// try (erlang:raise(error, foo, [{bar,baz,0}])) … ⇒ exception error foo (exit 1)
+/// ```
+#[test]
+fn raise_3_matches_the_oracle_at_the_cli_boundary() {
+    let cases: &[(&str, &str, i32)] = &[
+        // A valid trace: `class:reason` is raised (the frames are echoed, not printed).
+        (
+            "erlang:raise(error, foo, [{bar,baz,0}])",
+            "exception error foo",
+            1,
+        ),
+        ("erlang:raise(error, foo, [])", "exception error foo", 1),
+        ("erlang:raise(error, {a,b}, [])", "exception error {a,b}", 1),
+        (
+            "erlang:raise(exit, {shutdown,1}, [])",
+            "exception exit {shutdown,1}",
+            1,
+        ),
+        ("erlang:raise(throw, x, [])", "exception throw x", 1),
+        (
+            "erlang:raise(error, foo, [{m,f,1},{n,g,2}])",
+            "exception error foo",
+            1,
+        ),
+        // An invalid class or stacktrace shape is the *returned* atom `badarg`.
+        ("erlang:raise(foo, foo, [])", "ok badarg", 0),
+        ("erlang:raise(1, foo, [])", "ok badarg", 0),
+        ("erlang:raise(error, foo, [42])", "ok badarg", 0),
+        ("erlang:raise(error, foo, x)", "ok badarg", 0),
+        ("erlang:raise(error, foo, [{}])", "ok badarg", 0),
+        ("erlang:raise(error, foo, [{m,f}])", "ok badarg", 0),
+    ];
+    for (expr, expected, expected_exit) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, *expected_exit, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+    }
+}
 
 /// The two `semantics/*` corpus probes this suite pins — a binary comprehension and
 /// `bit_size/1` of a **non-byte-aligned** bitstring — AGREE with the oracle. Pinned here —
@@ -829,4 +889,192 @@ fn an_eval_lambda_has_no_new_fun_ext_image_and_stays_unsupported() {
         stderr, "beam_rt: unsupported: local_fun\n",
         "the -eval lambda must stay the typed local_fun gap, never an image"
     );
+}
+
+/// Runs the raw `io:format("~p~n",[<expr>]),halt(0).` probe at the CLI boundary and
+/// returns `(trimmed_stdout, exit_code, stderr)`.
+///
+/// This is the *unwrapped* form the differential harness uses for an `-eval` case that
+/// prints its own result (the corpus's `try … catch` wrapper is for an uncaught error);
+/// it exercises the whole parser → evaluator → `~p` printer → CLI path.
+fn raw_probe(expr: &str) -> (String, i32, String) {
+    let probe_expr = format!(r#"io:format("~p~n",[{expr}]),halt(0)."#);
+    let output = Command::new(env!("CARGO_BIN_EXE_beam_rt"))
+        .args(["-noshell", "-eval", probe_expr.as_str()])
+        .output()
+        .unwrap_or_else(|error| panic!("spawning beam_rt for {expr:?} failed: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit = output
+        .status
+        .code()
+        .expect("beam_rt always exits normally (never killed by a signal)");
+    (stdout, exit, stderr)
+}
+
+/// `catch Expr` and `try … catch C:R:S -> … end` render the **supplied** `erlang:raise/3`
+/// stacktrace, matching the system oracle (contract A.1, exception semantics).
+///
+/// The oracle's rule (`lib/stdlib/src/erl_eval.erl`) folds `catch` **by class**: a `throw`
+/// yields the reason, an `exit` yields `{'EXIT', Reason}` (never a trace, even when one was
+/// supplied), and an `error` yields `{'EXIT', {Reason, Stacktrace}}` **always** — including a
+/// non-atom reason, which keeps the trace. A `try` clause's 3rd pattern binds the same
+/// cooked `[{M,F,A,Location}]` list. Each golden below is the oracle's *own* output
+/// (OTP 29 / erts-17.1) and is cross-checked against it live (a loud skip when no `erl` is
+/// available, never a silent pass).
+#[test]
+fn a_caught_raise_renders_its_supplied_stacktrace() {
+    let cases: &[(&str, &str)] = &[
+        // `error` keeps the supplied trace.
+        (
+            "catch erlang:raise(error,r,[{m,f,0}])",
+            "{'EXIT',{r,[{m,f,0,[]}]}}",
+        ),
+        // A located frame keeps its `file`/`line`.
+        (
+            r#"catch erlang:raise(error,r,[{m,f,1,[{file,"m.erl"},{line,7}]}])"#,
+            r#"{'EXIT',{r,[{m,f,1,[{file,"m.erl"},{line,7}]}]}}"#,
+        ),
+        // An empty supplied trace is still a 2-tuple.
+        ("catch erlang:raise(error,r,[])", "{'EXIT',{r,[]}}"),
+        // `exit` drops the trace even when one was supplied.
+        (
+            "catch erlang:raise(exit,{shutdown,1},[{m,f,0}])",
+            "{'EXIT',{shutdown,1}}",
+        ),
+        // The rule is class-based, not reason-shape-based: a non-atom `error` reason keeps it.
+        (
+            "catch erlang:raise(error,{badmatch,1},[{m,f,0}])",
+            "{'EXIT',{{badmatch,1},[{m,f,0,[]}]}}",
+        ),
+        // A `try` clause's stacktrace pattern binds the same cooked list.
+        (
+            "try erlang:raise(error,r,[{m,f,0}]) catch C:R:S -> {C,R,S} end",
+            "{error,r,[{m,f,0,[]}]}",
+        ),
+    ];
+
+    let oracle = support::require_oracle("eval caught-raise stacktrace");
+    for (expr, golden) in cases {
+        let (stdout, exit, stderr) = raw_probe(expr);
+        assert_eq!(stdout, *golden, "{expr}: stdout (stderr {stderr:?})");
+        assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+
+        // Live oracle cross-check: the system `erl` prints the very same line. A missing
+        // oracle (or a probe that cannot answer) is a loud skip, never a silent pass.
+        if let Some(oracle) = &oracle {
+            let probe_expr = format!(r#"io:format("~p~n",[{expr}]),halt(0)."#);
+            match support::oracle_eval(oracle, None, &probe_expr) {
+                Some(oracle_stdout) => assert_eq!(
+                    stdout, oracle_stdout,
+                    "{expr}: the runtime renders the trace the oracle does"
+                ),
+                None => eprintln!(
+                    "SKIP the live-oracle comparison for {expr:?}: the erl probe could not answer"
+                ),
+            }
+        }
+    }
+}
+
+/// Runs `program` with the **identical** argv `-noshell -eval <expr>` and returns
+/// `(stdout, exit, stderr)` untrimmed, so a comparison against the other runtime is
+/// byte-exact. `None` when the probe could not answer within the harness bound.
+fn eval_bytes(program: &std::path::Path, expr: &str) -> Option<(String, i32, String)> {
+    let output = support::run_bounded(program, &["-noshell", "-eval", expr])?;
+    Some((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        output
+            .status
+            .code()
+            .expect("both runtimes exit normally, never killed by a signal"),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+/// An `error:undef` raised by an **unresolved call target** carries the synthesized callee
+/// head item — `{TargetModule, TargetFunction, ArgList, []}`, with the call's **real**
+/// argument list and an **empty** `Location` — as the innermost cooked-trace item, exactly
+/// as the oracle does (contract A.1, exception semantics).
+///
+/// The oracle names a missing callee **only** through the trace (the reason is always the
+/// bare atom `undef`), so both a `try … catch C:R:S` clause's 3rd pattern and the bare
+/// `catch Expr` fold must see it. The `-eval` tree-walker renders **no** `erl_eval`/`init`
+/// frame of its own — there is no `erl_eval` port here and a fabricated frame would be a
+/// wrong term — so each probe reduces the trace to its HEAD item (`hd/1`), the one item
+/// both runtimes have, and the comparison is then byte-exact on stdout, exit **and**
+/// stderr. A missing oracle is a loud skip, never a silent pass.
+#[test]
+fn an_undef_raise_carries_the_callee_head_item_like_the_oracle() {
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_beam_rt"));
+    let cases: &[(&str, &str)] = &[
+        // `try … catch C:R:S`: the 3rd pattern's HEAD item names the callee + its args.
+        (
+            r#"try apply(logger_simple_h, changing_config, [a,b,c]) catch C:R:S -> io:format("~p~n", [{C,R,hd(S)}]) end, halt(0)."#,
+            "{error,undef,{logger_simple_h,changing_config,[a,b,c],[]}}\n",
+        ),
+        // The bare `catch Expr` fold: `error` yields `{'EXIT',{Reason,Trace}}`.
+        (
+            r#"V = (catch apply(logger_simple_h, changing_config, [a,b,c])), {_, {R, S}} = V, io:format("~p~n", [{R,hd(S)}]), halt(0)."#,
+            "{undef,{logger_simple_h,changing_config,[a,b,c],[]}}\n",
+        ),
+        // A missing module.
+        (
+            r#"try nosuchmodule:nosuchfun(1) catch C:R:S -> io:format("~p~n", [{C,R,hd(S)}]) end, halt(0)."#,
+            "{error,undef,{nosuchmodule,nosuchfun,[1],[]}}\n",
+        ),
+        // A missing function of a known module.
+        (
+            r#"try lists:nosuchfun(1) catch C:R:S -> io:format("~p~n", [{C,R,hd(S)}]) end, halt(0)."#,
+            "{error,undef,{lists,nosuchfun,[1],[]}}\n",
+        ),
+        // A known function called with the wrong arity.
+        (
+            r#"try lists:append(1,2,3) catch C:R:S -> io:format("~p~n", [{C,R,hd(S)}]) end, halt(0)."#,
+            "{error,undef,{lists,append,[1,2,3],[]}}\n",
+        ),
+        // `apply/3` whose module and function are bound at run time.
+        (
+            r#"M = logger_simple_h, F = changing_config, try apply(M,F,[a,b,c]) catch C:R:S -> io:format("~p~n", [{C,R,hd(S)}]) end, halt(0)."#,
+            "{error,undef,{logger_simple_h,changing_config,[a,b,c],[]}}\n",
+        ),
+        // `apply/2` of an external `fun m:f/A` whose target does not exist.
+        (
+            r#"try apply(fun nosuchmod:f/1, [1]) catch C:R:S -> io:format("~p~n", [{C,R,hd(S)}]) end, halt(0)."#,
+            "{error,undef,{nosuchmod,f,[1],[]}}\n",
+        ),
+        // An inner `try` that does not match re-raises the item to the outer handler.
+        (
+            r#"try (try apply(logger_simple_h,changing_config,[a,b,c]) catch exit:R -> R end) catch C:R2:S -> io:format("~p~n", [{C,R2,hd(S)}]) end, halt(0)."#,
+            "{error,undef,{logger_simple_h,changing_config,[a,b,c],[]}}\n",
+        ),
+    ];
+
+    let oracle = support::require_oracle("eval undef callee head item");
+    for (expr, golden) in cases {
+        let (stdout, exit, stderr) = eval_bytes(binary, expr)
+            .unwrap_or_else(|| panic!("beam_rt could not answer {expr:?} within the bound"));
+        assert_eq!(stdout, *golden, "{expr}: stdout (stderr {stderr:?})");
+        assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+
+        if let Some(oracle) = &oracle {
+            match eval_bytes(oracle, expr) {
+                Some((oracle_stdout, oracle_exit, oracle_stderr)) => {
+                    assert_eq!(
+                        stdout, oracle_stdout,
+                        "{expr}: the runtime names the callee the oracle does"
+                    );
+                    assert_eq!(exit, oracle_exit, "{expr}: exit code");
+                    assert_eq!(stderr, oracle_stderr, "{expr}: stderr");
+                }
+                None => eprintln!(
+                    "SKIP the live-oracle comparison for {expr:?}: the erl probe could not answer"
+                ),
+            }
+        }
+    }
 }

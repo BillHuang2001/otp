@@ -47,7 +47,17 @@ This is the frozen public-API shape dependents design against; keep it stable.
 - `beam_engine` → the execution loop + an **`ExecutionContext` trait** (BIF dispatch, term alloc,
   process/stack state, trap/signal handling) plus a **`Mailbox` trait** — the receive/message seam
   (`send_message`/`receive_next`/`receive_skip`/`receive_remove`/`receive_reset`/`receive_marker_*`,
-  every method **defaulted** to a typed `unsupported`) — so the engine depends only on
+  every method **defaulted** to a typed `unsupported`). `ExecutionContext` also carries the
+  **defaulted case-lowering seams**: the in-machine module-context switch (`enter_module`), the
+  local-fun resolver (`resolve_local_fun`), the runtime-atom name/VALUE accessors (`atom_name` +
+  `atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable`), the reduction/`reduce` hook,
+  `apply_fun`/`apply_target`, `resolve_external_call` and `current_module`. **`atoms` is the
+  atom-namespace seam every guard/`select_val`/map-key comparison site reads** (trait default =
+  `&module.atom_table`, the module's load-time snapshot), so a host that owns ONE live shared
+  namespace (all of `beam_rt`, via `RuntimeContext` **and** the scheduled path's `BudgetContext`)
+  makes atom ordering name-exact and identical to the comparison BIFs', instead of silently falling
+  back to raw atom-index order when a name is missing from the snapshot
+  (`beam_term/src/compare.rs::cmp_atoms`). The engine therefore depends only on
   `beam_loader`/`beam_alloc` and the concrete context is supplied by `beam_rt` (keeps the
   Stage-1/Stage-5 DAG acyclic). A receive that finds no message suspends through the engine's block
   outcome (`RunOutcome { Returned, Wait }` + `run_export_outcome`/`run_label_outcome`/`resume_outcome`;
@@ -246,13 +256,21 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
-  `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=2580 agree=2578 mismatch=0 unsupported=2 skipped=0 allowed=2` (`../tools/differential/gate.sh`
-  → exit 0); re-run `gate.sh` for the live per-contract split. The two recorded capability gaps (the
-  `known-gaps.txt` ratchet allowlist) are A.9 `wire/new_fun_ext_encode` and
-  `boot_extra/init_script_id_names_the_running_otp_release` (the `-eval`/`run` path loads no boot script).
-  The one unclosable by design is
-  `wire/new_fun_ext_encode` (A.5): its
+  `erlang:port_close/1` returns the oracle's `true`. The compatibility gate is `../tools/differential/gate.sh`
+  (root-owned) — it boots the script per case, so an end-to-end `gate.sh` run now takes >14 min; a full-corpus
+  sweep of `differential run <case-id>` is gate-equivalent per case because every `run` verdict already folds in
+  the oracle-vs-golden drift check (`tools/differential/src/compare.rs::verdict_with`).
+  **Gate status (full 2580-case sweep): agree=2577, mismatch=2, unsupported=1, skipped=0 — `gate.sh` is RED
+  (exit 1).** `unsupported` is exactly the one capability gap recorded in `known-gaps.txt`,
+  `wire/new_fun_ext_encode` (A.5, unclosable by design — see below). Both `mismatch`es are non-runtime defects
+  owned by root/`tools/`: `boot_extra/init_script_id_names_the_running_otp_release` asserts
+  `init:script_id() =:= {"Erlang/OTP", system_info(otp_release)}`, which holds only when the runtime and its
+  DEFAULT boot script come from the same release — the `-eval`/`run` path now boots the consumed **system
+  install's** OTP-29 `<Root>/bin/start.boot` while `otp_release` is the compile-time repo constant `"30"` (so
+  this case's `known-gaps.txt` entry no longer reproduces as a gap and must be re-scored); and
+  `system_info/emu_type` — this runtime's honest `debug` (a dev build, `cfg!(debug_assertions)`) vs the corpus
+  golden `opt`, which a leftover `target/release/beam_rt` masks because the harness resolves release before debug.
+  `wire/new_fun_ext_encode`'s (A.5) gap is unclosable by design: its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
   slot) whose single free variable is erl_eval's internal `Info` tuple holding the clause in `erl_parse`
   abstract format — an identity/env no fun-identity seam can derive faithfully (only a full
@@ -323,7 +341,14 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   atom yields a typed `unsupported`, never a substituted wrong atom), matching C `i_func_info_IaaI` —
   treating it as a no-op would let a failed head clause fall through to the entry label and loop.
   `beam_rt::boot::CORE_ATOMS` seeds `function_clause`/`exit`/`throw` so a fixture module lacking the
-  atom still resolves it; a call to a missing module/function yields the bare atom `undef`.
+  atom still resolves it; a call to a missing module/function yields the bare atom `undef`, and the raise's
+  **stacktrace HEAD is the synthesized callee item `{TargetModule,TargetFunction,ArgList,[]}`** (`Location`
+  `[]`) — cooked by `beam_engine` for an unresolved `call_ext*`/`apply/3` (identical on the interpreter and the
+  baseline-JIT tier; the item rides the raise's own raw-trace word `x(2)`, so no frozen `RootSet`/`StackFrame`
+  seam changed — `beam_common::StackFrame` stays metadata-only) and, since the `-eval` route is served by
+  `beam_rt`'s own tree-walker rather than the engine, also by `beam_rt/src/eval/`. The head item matches the
+  oracle byte-for-byte on both routes; the oracle's trailing `erl_eval`/`init` frames are not reproducible
+  without an `erl_eval` port and are deliberately not fabricated.
 - **Host seams and BIF-level oracle parity.** The process dictionary is wired end-to-end — `beam_bifs`
   adds a 7th optional `BifContext` seam `DictHook` (`put`/`get`/`erase`/`get_keys`/`get_keys_for_value`)
   backing `erlang:put/2`/`get/1`/`erase/1`/`get_keys/0,1`, and `beam_rt` supplies it
@@ -369,16 +394,25 @@ A.9 is the shallowest contract: its only differential coverage is boot/version *
 is **no self-hosted build** (the Rust runtime does not compile and run itself).
 - **Boot path — completes.** `beam_rt`'s boot (`src/boot/`, the boot node: `beam_rt/src/boot/CONTEXT.md`)
   reads and executes the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to
-  completion**, ending at the final `{progress,started}` (index 21). The former stop at instruction 16
-  (`{apply,{application,load,[{application,stdlib,…}]}}`, `exit noproc`) is closed: the `{kernelProcess,…}`
-  servers survive their short-lived directive process via the unlink in `beam_rt/src/boot/drive.rs`, and
-  the final `{apply,{c,erlangrc,[]}}` (index 20) is unblocked by the runtime-native `file_server_2` service
-  (`beam_rt/src/native/file_server.rs`). Pinned by
-  `beam_rt/tests/boot.rs::the_real_start_boot_runs_to_completion`,
-  `beam_rt/src/boot/bootscript.rs::the_real_start_boot_completes_through_execute_reporting`, and the CLI
-  test `beam_rt/tests/boot.rs::the_cli_runs_the_real_boot_script_to_completion` (exit 0, empty
-  stdout/stderr). The differential case `boot/proc_lib_start_link_blocks_the_boot_path` now **agrees** (it
-  is no longer in `tools/differential/known-gaps.txt`).
+  completion**, ending at the final `{progress,started}` (index 21): `beam_rt -noshell -boot
+  bootstrap/bin/start` exits **0 with empty stdout/stderr**. `{kernelProcess,…}` servers survive their
+  short-lived directive process via the unlink in `beam_rt/src/boot/drive.rs`; `{apply,{c,erlangrc,[]}}`
+  (index 20) is served by the runtime-native `file_server_2` service
+  (`beam_rt/src/native/file_server.rs`). Pinned by `beam_rt/tests/boot.rs::{the_real_start_boot_runs_to_completion,
+  the_cli_runs_the_real_boot_script_to_completion}` and
+  `beam_rt/src/boot/bootscript.rs::the_real_start_boot_completes_through_execute_reporting`.
+  `beam_rt`'s `-eval`/`-s`/`-run` actions drive the default boot script too (as the oracle does), so a
+  `-eval` process has the live `kernel_sup`/`timer_server` tree — `timer:apply_after/4` is
+  oracle-identical (`is_reference(timer:apply_after(...))` prints `false` under both runtimes, exit 0). A timer
+  that actually FIRES does not yet deliver its message on the `-eval` route — `timer:apply_after(50,erlang,send,
+  [self(),done])` then `receive` yields `timeout` where the oracle prints `got=done`, while an already-queued
+  `self() ! done` is received on both — a real scheduler/timer-delivery fidelity gap, not a receive-path gap. The differential case
+  `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** (not in `tools/differential/known-gaps.txt`).
+- **Cross-node note (tools-owned):** `tools/differential` passes `-noshell` to the oracle but not to the
+  Rust side (`corpus/mod.rs::rust_argv` emits `run <beam> <mfa>`); that is harmless today because
+  `beam_rt <action> run <beam> <mfa>` prints no banner, so its stdout matches the oracle's `-noshell`
+  output exactly. Each case boots (~2.2 s startup), so the full gate exceeds ~14 min — prefer
+  `differential run <case-id>` while iterating.
 - **Remaining A.9 gaps (fidelity, not boot-completion):**
   1. **No self-hosted build.** The Rust runtime does not compile/run itself; the compiler bootstrap
      (Stage 2, `../lib/compiler`) is not wired into `beam_rt`.

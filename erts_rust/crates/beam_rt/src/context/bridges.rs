@@ -471,6 +471,28 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
                 "NIF library already loaded (reload disallowed since OTP 20).".to_string(),
             ));
         }
+        // The built-in (statically linked) NIF libraries. ERTS resolves `prim_tty` from its
+        // static NIF table (`is_static_nif_module`, `erts/emulator/beam/erl_nif.c`), so
+        // `erlang:load_nif/2` must NOT touch the filesystem for it — the `dlopen` of a
+        // non-existent `prim_tty.so` is what `ok = prim_tty:load()` turns into a
+        // `{case_clause,{error,{load_failed,…}}}`. Answer the oracle's `ok` instead.
+        //
+        // Nothing is inserted into `runtime.nifs`: `NifRegistry::is_loaded("prim_tty")`
+        // must stay `false`, or `resolve_external_call` would refuse to enter the module's
+        // Erlang wrappers (`load/0`, `init/1`, `writer/1`, …) in-machine and route them onto
+        // the non-pumping nested `call_bif` path, where their `receive`s fold into the typed
+        // `blocked()` gap. Every `prim_tty` NIF key is served from the native floor
+        // ([`crate::native::prim_tty`]) instead.
+        //
+        // `load_nif`'s first parameter is the CALLER's module name (the BIF reads
+        // `current_module`), while the library name the oracle resolves is the `Path`
+        // argument; `prim_tty:load/0` passes `atom_to_list(?MODULE)` as `Path`, so check
+        // both — the built-in check is by library name, exactly as ERTS's is.
+        if crate::native::prim_tty::is_builtin_library(module)
+            || crate::native::prim_tty::is_builtin_library(path)
+        {
+            return Ok(());
+        }
         // A dedicated, long-lived host heap: the library's `unload` callback runs against this
         // host long after this call returns, so it may not use a pooled BIF heap.
         let heap = beam_alloc::Heap::new(self.runtime.bif_heap_words).map_err(|error| {

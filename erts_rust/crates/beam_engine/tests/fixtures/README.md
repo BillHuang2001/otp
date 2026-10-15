@@ -420,7 +420,28 @@ A real `try … catch C:R:S -> S` whose `S` is the derived stacktrace (the raise
 |---|---|---|
 | `run/0` | `try erlang:error(badarg) catch C:R:S -> S end.` (inline raise) | the raising frame is the catching frame |
 | `run2/0` | a non-tail call into `raise_badarg/0` under the same `try` | the raising frame first, then the live caller |
+## `catchclasses.beam` (`catchclasses.erl`) — `tests/exceptions.rs`
+The old-style `catch` fold, one export per exception class (the `catch_end` three-way fold: C `emu/instrs.tab:1188-1211` plus `beam_common.c:730-735`).
+| export | Erlang | what it pins |
+|---|---|---|
+| `plain/0` | `catch ok.` | no exception: the value passes through unchanged |
+| `thrown/0` | `catch erlang:raise(throw, ball, []).` | class `throw` ⇒ the thrown value **bare** |
+| `exited/0` | `catch erlang:raise(exit, bye, []).` | class `exit` ⇒ the bare `{'EXIT',bye}`, **no** stacktrace element |
+| `errored/0` | `catch (a = b).` | class `error` ⇒ `{'EXIT',{{badmatch,b},Stacktrace}}` (C's `add_stacktrace`) |
+| `nested/0` | a non-tail call into `deeper/0` under the same `catch` | the raising frame first, then the live caller |
 ## `raise_frames.beam` (`raise_frames.erl`) — `tests/raise_stacktrace.rs`
 The uncaught-raise frames: `outer/1` makes a **non-tail** `call` into `boom/1` (which raises `error:badarg`), so the uncaught `Raise.stacktrace` names `boom/1` then `outer/1`.
 ## `xmod_caller.beam` (`xmod_caller.erl`) / `xmod_callee.beam` (`xmod_callee.erl`) — `tests/raise_stacktrace.rs`
 An in-machine cross-module raise: `xmod_caller:run/1` makes a non-tail `call_ext` into `xmod_callee:boom/1`, which raises — the frames name the callee first, then the caller, each resolved in its own module context. Both built with the neutral-directory recipe above.
+
+## `stacktrace_frames.beam` (`stacktrace_frames.erl`) — `tests/stacktrace_frames.rs`
+
+The **cooked catch-stacktrace** shapes that pin DEFECT 2 (a reported "duplicated top stacktrace frame" that does NOT reproduce — C's `gather_stacktrace` records each continuation pointer once). Each export is a `try … catch _C:_R:S -> S end` that returns its cooked `S`; the leading `stacktrace_frames` frames are the oracle-exact ones the test asserts, the trailing `erl_eval`/`init` frames of the oracle's own `S` live outside the engine's run.
+
+| export | Erlang | oracle `S` (leading `stacktrace_frames` frames) |
+|---|---|---|
+| `t0/0` | `try f() catch _C:_R:S -> S end`; `f() -> erlang:error(boom).` | `[{stacktrace_frames,f,0,{line,4}},{stacktrace_frames,t0,0,{line,3}}]` |
+| `t2/0` | the same shape as `t0/0` with `hh/0` | `[{stacktrace_frames,hh,0,{line,7}},{stacktrace_frames,t2,0,{line,8}}]` |
+| `t3/0` | `try g2() catch _C:_R:S -> S end`; `g2() -> hh2() + 1.`; `hh2() -> erlang:error(boom).` | `[{stacktrace_frames,hh2,0,{line,11}},{stacktrace_frames,t3,0,{line,9}}]` (the tail-called `g2/0` is elided) |
+
+`t3/0`'s `g2/0` is elided because `sys_core_fold` proves `hh2/0` never returns, so `g2/0` compiles to a **tail** call into `hh2/0` (its body is `call_only {f,hh2}`); the tail call reuses the frame, so the oracle never names it. Rebuild with the neutral-directory `erlc +deterministic` recipe above.

@@ -93,14 +93,16 @@
 use core::cmp::Ordering;
 
 use beam_codec::term as codec_term;
-use beam_common::{BeamError, ExceptionClass, Result};
+use beam_common::{AtomName, BeamError, ExceptionClass, Result, SourceLocation, StackFrame, StackTrace};
 use beam_term::compare::cmp_arith;
 use beam_term::{atom_val, is_byte, make_atom, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
 use crate::context::BifContext;
-use crate::error::{badarg, raise_error, raise_exit, raise_term, raise_throw, system_limit};
+use crate::error::{
+    badarg, raise_error, raise_exit, raise_term, raise_throw, system_limit, unsupported_bif,
+};
 use crate::numeric::{
     base_arg, format_scientific, integer_digits, parse_float, parse_float_options, parse_integer,
     render_float, small_arg, DEFAULT_FLOAT_DECIMALS,
@@ -610,6 +612,191 @@ fn is_stacktrace(stacktrace: Eterm) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// raise/3's stacktrace argument → StackTrace
+// ---------------------------------------------------------------------------
+
+/// The name of the atom `term`, as a term-independent [`AtomName`].
+///
+/// # Errors
+///
+/// [`unsupported_bif`] for a non-atom, or for an atom whose index `atoms` does not
+/// name. A name the table lacks cannot be rendered without inventing one, and the
+/// frame would then be a wrong frame.
+fn frame_atom_name(atoms: &AtomTable, term: Eterm) -> Result<AtomName> {
+    if !access::is_atom(term) {
+        return Err(unsupported_bif());
+    }
+    match atoms.name(atom_val(term)) {
+        Some(name) => Ok(AtomName::new(name.to_string())),
+        None => Err(unsupported_bif()),
+    }
+}
+
+/// The value of the `{Key, Value}` pair at the head of a frame location: the pair
+/// must be a 2-tuple whose first element is exactly the atom `key`.
+///
+/// # Errors
+///
+/// [`unsupported_bif`] for anything else — a non-tuple, a wrong arity, a non-atom
+/// key, or a key naming some other atom (the location's keys are `file` and
+/// `line`, and the oracle accepts any term here while a [`SourceLocation`] can only
+/// express those two).
+fn location_pair_value(atoms: &AtomTable, pair: Eterm, key: &str) -> Result<Eterm> {
+    if !access::is_tuple(pair) || access::tuple_size(pair) != 2 {
+        return Err(unsupported_bif());
+    }
+    let tag = access::tuple_element(pair, 0);
+    if !access::is_atom(tag) || atoms.name(atom_val(tag)) != Some(key) {
+        return Err(unsupported_bif());
+    }
+    Ok(access::tuple_element(pair, 1))
+}
+
+/// The [`SourceLocation`] a frame's `Location` term names, or `None` for the empty
+/// list the oracle normalizes an absent location to.
+///
+/// A location is exactly `[{file, FileName}, {line, Line}]` — those two pairs, in
+/// that order — where `FileName` is a **char list** of Unicode scalar values
+/// (`{file,"lists.erl"}`, never an atom) and `Line` an integer in `0..=u32::MAX`.
+///
+/// # Errors
+///
+/// [`unsupported_bif`] for a location that passes [`is_location`] (any list does)
+/// but is not that exact shape: an atom/other file name, a missing or extra pair,
+/// reversed order, a non-integer or out-of-`u32`-range `line`, or a char list
+/// element that is not a Unicode scalar value. The oracle echoes every such shape
+/// verbatim, but a [`SourceLocation`] cannot express it and a truncated or invented
+/// location would be a wrong result.
+fn decode_location(atoms: &AtomTable, location: Eterm) -> Result<Option<SourceLocation>> {
+    if location == NIL {
+        return Ok(None);
+    }
+    let pairs = proper_list(location).ok_or_else(unsupported_bif)?;
+    if pairs.len() != 2 {
+        return Err(unsupported_bif());
+    }
+
+    let name = location_pair_value(atoms, pairs[0], "file")?;
+    let chars = proper_list(name).ok_or_else(unsupported_bif)?;
+    let mut file = String::with_capacity(chars.len());
+    for ch in chars {
+        let code = if access::is_small(ch) { signed_value(ch) } else { -1 };
+        let code = u32::try_from(code)
+            .ok()
+            .and_then(char::from_u32)
+            .ok_or_else(unsupported_bif)?;
+        file.push(code);
+    }
+
+    let line = location_pair_value(atoms, pairs[1], "line")?;
+    let line = if access::is_small(line) {
+        u32::try_from(signed_value(line)).ok()
+    } else {
+        None
+    }
+    .ok_or_else(unsupported_bif)?;
+
+    Ok(Some(SourceLocation {
+        file: AtomName::new(file),
+        line,
+    }))
+}
+
+/// The [`StackFrame`] one validated stacktrace frame names.
+///
+/// Only `{Module, Function, Arity}` and `{Module, Function, Arity, Location}` are
+/// representable: `Module` and `Function` are atoms (their names are read from
+/// `atoms`), the 3rd element is an **integer in `0..=255`** ([`StackFrame`] carries
+/// a `u8` arity, and the loader/engine render an arity, never an argument list) and
+/// the location is exactly what [`decode_location`] accepts.
+///
+/// # Errors
+///
+/// [`unsupported_bif`] for every frame the oracle accepts but a [`StackFrame`]
+/// cannot express — an `erl_eval`-style `{Fun, Args[, Location]}` **call frame**
+/// (it names no module/function), a 3rd element that is an argument list or any
+/// other non-`0..=255` value (`-1`, `256`, a float), an unnameable module/function,
+/// or a location [`decode_location`] rejects. Never a truncated or invented frame.
+fn decode_stacktrace_frame(atoms: &AtomTable, frame: Eterm) -> Result<StackFrame> {
+    // Restates `decode_stacktrace`'s precondition: every frame was accepted by
+    // `is_stacktrace_frame` before this runs, so this is the frame shape guard that
+    // makes the tuple access below safe.
+    if !is_stacktrace_frame(frame) {
+        return Err(unsupported_bif());
+    }
+    let (module_term, function_term, arity_term, location_term) = match access::tuple_size(frame) {
+        3 => {
+            let first = access::tuple_element(frame, 0);
+            if access::is_function(first) {
+                // `{Fun, Args, Location}` — a call frame.
+                return Err(unsupported_bif());
+            }
+            (
+                first,
+                access::tuple_element(frame, 1),
+                access::tuple_element(frame, 2),
+                NIL,
+            )
+        }
+        4 => (
+            access::tuple_element(frame, 0),
+            access::tuple_element(frame, 1),
+            access::tuple_element(frame, 2),
+            access::tuple_element(frame, 3),
+        ),
+        // `{Fun, Args}` — the remaining accepted shape, a call frame too.
+        _ => return Err(unsupported_bif()),
+    };
+    let module = frame_atom_name(atoms, module_term)?;
+    let function = frame_atom_name(atoms, function_term)?;
+    let arity = if access::is_small(arity_term) {
+        u8::try_from(signed_value(arity_term)).ok()
+    } else {
+        None
+    }
+    .ok_or_else(unsupported_bif)?;
+    Ok(StackFrame {
+        module,
+        function,
+        arity,
+        location: decode_location(atoms, location_term)?,
+    })
+}
+
+/// Decodes a **validated** `raise/3` stacktrace argument into the frames the engine
+/// renders verbatim.
+///
+/// The empty list decodes to the **empty** [`StackTrace`], which leaves the engine's
+/// supplied-trace latch unarmed (so `raise(_, _, [])` keeps its derived stacktrace);
+/// every other element must decode, and one that cannot is the typed gap (see
+/// [`decode_stacktrace_frame`]).
+///
+/// # Errors
+///
+/// [`unsupported_bif`] for an unrepresentable frame; the trace itself has already
+/// passed [`is_stacktrace`], so a non-list never reaches the `proper_list` failure.
+fn decode_stacktrace(atoms: &AtomTable, stacktrace: Eterm) -> Result<StackTrace> {
+    let frames = proper_list(stacktrace).ok_or_else(unsupported_bif)?;
+    let mut decoded = StackTrace::new();
+    for frame in frames {
+        decoded.push(decode_stacktrace_frame(atoms, frame)?);
+    }
+    Ok(decoded)
+}
+
+/// Attaches the decoded `stacktrace` to the raise `err` carries.
+///
+/// Both callers in [`raise_3`] pass a raise (`raise_term` and the three `raise_*`
+/// builders always build one), so the [`BeamError::Raise`] arm is the one taken; any
+/// other error is returned unchanged rather than wrapped in a fabricated raise.
+fn attach_stacktrace(err: BeamError, stacktrace: StackTrace) -> BeamError {
+    match err {
+        BeamError::Raise(raise) => BeamError::Raise(raise.with_stacktrace(stacktrace)),
+        other => other,
+    }
+}
+
 /// `raise(Class, Reason, Stacktrace)` (`raise_3`, `bif.c:1549-1696`).
 ///
 /// The reason can be **any term**: an atom reason keeps its exact
@@ -632,6 +819,25 @@ fn is_stacktrace(stacktrace: Eterm) -> bool {
 /// try erlang:raise(error, foo, [42]) catch C:R -> {C,R} end  ⇒ badarg  (*returned*)
 /// try erlang:raise(error, foo, x)    catch C:R -> {C,R} end  ⇒ badarg  (*returned*)
 /// ```
+///
+/// A **valid** trace is decoded into the returned raise's
+/// [`StackTrace`](beam_common::StackTrace) ([`decode_stacktrace`]), which the engine
+/// renders verbatim instead of deriving the frames its raise snapshot would
+/// (`build_stacktrace` returns a supplied trace unchanged). The empty list decodes
+/// to the empty trace, so `raise(_, _, [])` is unchanged. Pinned live (erts-17.1):
+///
+/// ```text
+/// raise(error, foo, [{lists,map,2,[{file,"lists.erl"},{line,1234}]}])
+///   ⇒ the trace is echoed verbatim
+/// raise(error, foo, [{m,f,1}])  /  [{m,f,1,[]}]  ⇒  [{m,f,1,[]}]
+/// ```
+///
+/// A trace element the oracle echoes but a
+/// [`StackFrame`](beam_common::StackFrame) cannot express (an `erl_eval`-style
+/// `{Fun,Args}` **call** frame, an argument list or an out-of-`0..=255` value in the
+/// arity slot, a location that is not exactly `[{file,CharList},{line,Integer}]`) is
+/// raised as [`unsupported_bif`], never as the returned `badarg`: the argument *is*
+/// valid, so it is a capability gap, and an invented frame would be a wrong result.
 fn raise_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // The class is resolved first (`bif.c:1563-1572`), then the stacktrace shape
     // (`bif.c:1580-1624`); either failure is the returned `badarg` atom. The class
@@ -643,21 +849,26 @@ fn raise_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !is_stacktrace(args[2]) {
         return ctx.intern_atom("badarg");
     }
-    if !access::is_atom(args[1]) {
+    // The 3rd argument is a *valid* stacktrace: decode it into the frames the engine
+    // renders verbatim. Encoding stops here for an element no frame can express.
+    let stacktrace = decode_stacktrace(ctx.atoms(), args[2])?;
+    let err = if !access::is_atom(args[1]) {
         // `c_p->fvalue = value` (`bif.c:1564-1571`): a non-atom reason is the
         // argument term itself, whatever the class.
-        return Err(raise_term(class, args[1]));
-    }
-    let reason = exit_reason_from_term(args[1], ctx.atoms());
-    Err(match class {
-        ExceptionClass::Error => raise_error(reason),
-        ExceptionClass::Exit => raise_exit(reason),
-        ExceptionClass::Throw => raise_throw(reason),
-        // `ExceptionClass` is `#[non_exhaustive]`; `exception_class` above only
-        // ever produces the three classes handled here, so this arm is
-        // unreachable (defaulting to `error` keeps it total without a panic).
-        _ => raise_error(reason),
-    })
+        raise_term(class, args[1])
+    } else {
+        let reason = exit_reason_from_term(args[1], ctx.atoms());
+        match class {
+            ExceptionClass::Error => raise_error(reason),
+            ExceptionClass::Exit => raise_exit(reason),
+            ExceptionClass::Throw => raise_throw(reason),
+            // `ExceptionClass` is `#[non_exhaustive]`; `exception_class` above only
+            // ever produces the three classes handled here, so this arm is
+            // unreachable (defaulting to `error` keeps it total without a panic).
+            _ => raise_error(reason),
+        }
+    };
+    Err(attach_stacktrace(err, stacktrace))
 }
 
 /// The atom naming the **local** node — the node every internal pid/port/ref
@@ -1810,6 +2021,313 @@ mod tests {
                     assert!(raise.live_reason().is_none());
                 }
                 other => panic!("expected a raise, got {other:?}"),
+            }
+        });
+    }
+
+    // -- raise/3's stacktrace decoding -------------------------------------
+
+    /// The frame names the stacktrace tests build from: the shared table plus the
+    /// module/function/location names a frame needs (`file`/`line` are the location
+    /// keys).
+    fn trace_atoms() -> AtomTable {
+        let mut atoms = atoms();
+        atoms.seed(["m", "f", "n", "g", "file", "line"]);
+        atoms
+    }
+
+    /// Runs `f` over a fresh context whose table also holds the frame names.
+    fn with_trace_ctx<R>(f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
+        let mut heap = heap();
+        let atoms = trace_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        f(&mut ctx)
+    }
+
+    /// The raise `result` carries.
+    fn trace_raise(result: Result<Eterm>) -> beam_common::Raise {
+        match result {
+            Err(BeamError::Raise(raise)) => raise,
+            other => panic!("expected a raise, got {other:?}"),
+        }
+    }
+
+    /// Asserts `result` is the typed `unsupported_bif` capability gap for a trace
+    /// element the oracle accepts but a frame cannot express — an `error`-class raise
+    /// whose reason is that atom, **never** the returned `badarg` atom (the argument
+    /// is valid, so it is a gap, not an argument error).
+    fn assert_unsupported_bif(result: Result<Eterm>, what: &str) {
+        assert!(
+            !matches!(&result, Err(BeamError::BadArg)),
+            "{what}: a *valid* trace element was reported as the returned badarg"
+        );
+        match result {
+            Err(BeamError::Raise(raise)) => {
+                assert_eq!(raise.class, ExceptionClass::Error, "{what}: the class");
+                assert_eq!(
+                    raise.reason,
+                    beam_common::ExitReason::atom("unsupported_bif"),
+                    "{what}: the typed gap"
+                );
+            }
+            other => panic!("{what}: expected the typed unsupported_bif, got {other:?}"),
+        }
+    }
+
+    /// A `[{file, FileName}, {line, N}]` location with an ASCII `file` char list.
+    fn location_term(ctx: &mut BifContext<'_>, file: &str, line: i64) -> Eterm {
+        let file_key = ctx.atom("file").expect("seeded");
+        let line_key = ctx.atom("line").expect("seeded");
+        let name = bytes(ctx, file);
+        let line = ctx.int(line).expect("fits");
+        let file_pair = ctx.tuple(&[file_key, name]).expect("fits");
+        let line_pair = ctx.tuple(&[line_key, line]).expect("fits");
+        ctx.list(&[file_pair, line_pair]).expect("fits")
+    }
+
+    /// A `{Module, Function, Arity[, Location]}` frame.
+    fn frame_term(
+        ctx: &mut BifContext<'_>,
+        module: &str,
+        function: &str,
+        arity: i64,
+        location: Option<Eterm>,
+    ) -> Eterm {
+        let module = ctx.atom(module).expect("seeded");
+        let function = ctx.atom(function).expect("seeded");
+        let arity = ctx.int(arity).expect("fits");
+        match location {
+            Some(location) => ctx.tuple(&[module, function, arity, location]).expect("fits"),
+            None => ctx.tuple(&[module, function, arity]).expect("fits"),
+        }
+    }
+
+    /// A one-frame trace list.
+    fn trace_of(ctx: &mut BifContext<'_>, frame: Eterm) -> Eterm {
+        ctx.list(&[frame]).expect("fits")
+    }
+
+    /// The full decode: `{M,F,A,[{file,Name},{line,N}]}` and a bare `{M,F,A}`
+    /// (whose absent location decodes to `None`, i.e. the `[]` the oracle
+    /// normalizes to), in the trace's own order.
+    #[test]
+    fn raise_decodes_every_frame_of_a_stacktrace() {
+        with_trace_ctx(|ctx| {
+            let error = ctx.atom("error").expect("seeded");
+            let foo = ctx.atom("foo").expect("seeded");
+            let location = location_term(ctx, "lists.erl", 1234);
+            let first = frame_term(ctx, "m", "f", 2, Some(location));
+            let second = frame_term(ctx, "n", "g", 1, None);
+            let trace = ctx.list(&[first, second]).expect("fits");
+
+            let raise = trace_raise(raise_3(ctx, &[error, foo, trace]));
+            assert_eq!(raise.class, ExceptionClass::Error);
+            assert_eq!(raise.reason, beam_common::ExitReason::atom("foo"));
+            assert_eq!(
+                raise.stacktrace.frames,
+                vec![
+                    StackFrame {
+                        module: AtomName::new("m"),
+                        function: AtomName::new("f"),
+                        arity: 2,
+                        location: Some(SourceLocation {
+                            file: AtomName::new("lists.erl"),
+                            line: 1234,
+                        }),
+                    },
+                    StackFrame {
+                        module: AtomName::new("n"),
+                        function: AtomName::new("g"),
+                        arity: 1,
+                        location: None,
+                    },
+                ]
+            );
+        });
+    }
+
+    /// An absent location and the explicit `[]` are both the absent location (the
+    /// oracle renders both as the `[]` `Location` slot).
+    #[test]
+    fn raise_decodes_an_absent_or_empty_location_as_no_location() {
+        with_trace_ctx(|ctx| {
+            let error = ctx.atom("error").expect("seeded");
+            let foo = ctx.atom("foo").expect("seeded");
+            let empty = ctx.list(&[]).expect("fits");
+            let expected = vec![StackFrame::new(AtomName::new("m"), AtomName::new("f"), 1)];
+            let absent = frame_term(ctx, "m", "f", 1, None);
+            let explicit_empty = frame_term(ctx, "m", "f", 1, Some(empty));
+            for frame in [absent, explicit_empty] {
+                let trace = trace_of(ctx, frame);
+                let raise = trace_raise(raise_3(ctx, &[error, foo, trace]));
+                assert_eq!(raise.stacktrace.frames, expected);
+            }
+        });
+    }
+
+    /// The empty trace decodes to the empty [`StackTrace`], which leaves the
+    /// engine's supplied-trace latch unarmed — today's behaviour, byte for byte.
+    #[test]
+    fn raise_decodes_an_empty_stacktrace_as_empty() {
+        with_trace_ctx(|ctx| {
+            let error = ctx.atom("error").expect("seeded");
+            let foo = ctx.atom("foo").expect("seeded");
+            let empty = ctx.list(&[]).expect("fits");
+            let raise = trace_raise(raise_3(ctx, &[error, foo, empty]));
+            assert!(raise.stacktrace.is_empty());
+            assert_eq!(raise.stacktrace.len(), 0);
+            assert_eq!(raise.stacktrace, StackTrace::new());
+        });
+    }
+
+    /// An **atom** reason keeps its exact [`beam_common::ExitReason`] and carries no
+    /// live slot, and still carries the decoded frames.
+    #[test]
+    fn raise_carries_the_trace_with_an_atom_reason() {
+        with_trace_ctx(|ctx| {
+            let throw = ctx.atom("throw").expect("seeded");
+            let normal = ctx.atom("normal").expect("seeded");
+            let frame = frame_term(ctx, "m", "f", 3, None);
+            let trace = trace_of(ctx, frame);
+            let raise = trace_raise(raise_3(ctx, &[throw, normal, trace]));
+            assert_eq!(raise.class, ExceptionClass::Throw);
+            assert_eq!(raise.reason, beam_common::ExitReason::Normal);
+            assert!(raise.live_reason().is_none(), "an atom reason has no term");
+            assert_eq!(
+                raise.stacktrace.frames,
+                vec![StackFrame::new(AtomName::new("m"), AtomName::new("f"), 3)]
+            );
+        });
+    }
+
+    /// A **non-atom** reason carries the term itself in the live-reason slot *and*
+    /// the decoded frames — the two are orthogonal.
+    #[test]
+    fn raise_carries_the_trace_with_a_non_atom_reason() {
+        with_trace_ctx(|ctx| {
+            let exit = ctx.atom("exit").expect("seeded");
+            let a = ctx.atom("a").expect("seeded");
+            let reason = ctx.tuple(&[a]).expect("fits");
+            let location = location_term(ctx, "m.erl", 7);
+            let frame = frame_term(ctx, "m", "f", 1, Some(location));
+            let trace = trace_of(ctx, frame);
+            let raise = trace_raise(raise_3(ctx, &[exit, reason, trace]));
+            assert_eq!(raise.class, ExceptionClass::Exit);
+            assert_eq!(raise.reason, beam_common::ExitReason::Structured);
+            assert_eq!(
+                raise
+                    .live_reason()
+                    .and_then(|live| live.downcast_ref::<Eterm>().copied()),
+                Some(reason)
+            );
+            assert_eq!(
+                raise.stacktrace.frames,
+                vec![StackFrame {
+                    module: AtomName::new("m"),
+                    function: AtomName::new("f"),
+                    arity: 1,
+                    location: Some(SourceLocation {
+                        file: AtomName::new("m.erl"),
+                        line: 7,
+                    }),
+                }]
+            );
+        });
+    }
+
+    /// Every trace element the oracle echoes verbatim but a [`StackFrame`] cannot
+    /// express is the typed `unsupported_bif` raise — never the returned `badarg`
+    /// (the argument *is* valid) and never a truncated or invented frame. Ground
+    /// truth (erts-17.1, each shape echoed back unchanged by the oracle):
+    ///
+    /// ```text
+    /// [{m,f,[a,b],[]}]                    ⇒ [{m,f,[a,b],[]}]
+    /// [{m,f,256}]   /  [{m,f,-1}]         ⇒ accepted verbatim
+    /// [{fun(X)->X end,[1]}]               ⇒ [{#Fun<..>,[1],[]}]
+    /// [{m,f,1,[{file,m},{line,1}]}]       ⇒ accepted verbatim (atom file name)
+    /// [{m,f,1,[{file,"x"}]}]              ⇒ accepted verbatim (one pair)
+    /// [{m,f,1,[{file,"x"},{line,1},{a,b}]}] ⇒ accepted verbatim (three pairs)
+    /// [{m,f,1,[{line,1},{file,"x"}]}]     ⇒ accepted verbatim (reversed)
+    /// [{m,f,1,[{file,"x"},{line,-1}]}]    ⇒ accepted verbatim
+    /// [{m,f,1,[{file,[1114112]},{line,1}]}] ⇒ accepted verbatim
+    /// ```
+    #[test]
+    fn raise_reports_unrepresentable_trace_elements_as_unsupported_bif() {
+        with_trace_ctx(|ctx| {
+            let error = ctx.atom("error").expect("seeded");
+            let foo = ctx.atom("foo").expect("seeded");
+            let a = ctx.atom("a").expect("seeded");
+            let b = ctx.atom("b").expect("seeded");
+            let m = ctx.atom("m").expect("seeded");
+            let f = ctx.atom("f").expect("seeded");
+            let file = ctx.atom("file").expect("seeded");
+            let line = ctx.atom("line").expect("seeded");
+            let one = ctx.int(1).expect("fits");
+            let args = ctx.list(&[a, b]).expect("fits");
+            let empty = ctx.list(&[]).expect("fits");
+            let file_name = bytes(ctx, "x");
+
+            // A real `EXPORT_EXT` fun, so `{Fun, Args[, Location]}` is a *valid*
+            // frame (the oracle's `erl_eval` call-frame shape).
+            let fun = codec_term::make_fun_external(ctx.heap(), 1, atom_val(f), atom_val(m))
+                .expect("the external fun fits");
+            let call_two = ctx.tuple(&[fun, args]).expect("fits");
+            let call_three = ctx.tuple(&[fun, args, empty]).expect("fits");
+
+            // `[{file, "x"}, {line, 1}]` and the malformed variants of it.
+            let file_pair = ctx.tuple(&[file, file_name]).expect("fits");
+            let line_pair = ctx.tuple(&[line, one]).expect("fits");
+            let other_pair = ctx.tuple(&[a, b]).expect("fits");
+            let bad_key_pair = ctx.tuple(&[ctx.atom("foo").expect("seeded"), file_name]).expect("fits");
+            let atom_name_pair = ctx.tuple(&[file, a]).expect("fits");
+            let non_int_line = ctx.tuple(&[line, a]).expect("fits");
+            let huge_line = ctx.int(4_294_967_296).expect("fits");
+            let huge_line_pair = ctx.tuple(&[line, huge_line]).expect("fits");
+            let huge_code = ctx.int(1_114_112).expect("fits");
+            let huge_code_name = ctx.list(&[huge_code]).expect("fits");
+            let huge_code_pair = ctx.tuple(&[file, huge_code_name]).expect("fits");
+            let float = ctx.make_float(1.0).expect("fits");
+            let two_fifty_six = ctx.int(256).expect("fits");
+            let minus_one = ctx.int(-1).expect("fits");
+
+            // One `{m, f, A, Location}` frame with an already-built location list.
+            let frame = |ctx: &mut BifContext<'_>, arity: Eterm, pairs: &[Eterm]| {
+                let location = ctx.list(pairs).expect("fits");
+                ctx.tuple(&[m, f, arity, location]).expect("fits")
+            };
+            let arity_list = ctx.tuple(&[m, f, args]).expect("fits");
+            let arity_float = ctx.tuple(&[m, f, float]).expect("fits");
+            let arity_256 = ctx.tuple(&[m, f, two_fifty_six]).expect("fits");
+            let arity_negative = ctx.tuple(&[m, f, minus_one]).expect("fits");
+
+            let atom_file = frame(ctx, one, &[atom_name_pair, line_pair]);
+            let one_pair = frame(ctx, one, &[file_pair]);
+            let three_pairs = frame(ctx, one, &[file_pair, line_pair, other_pair]);
+            let reversed = frame(ctx, one, &[line_pair, file_pair]);
+            let non_integer_line = frame(ctx, one, &[file_pair, non_int_line]);
+            let line_above_u32 = frame(ctx, one, &[file_pair, huge_line_pair]);
+            let wrong_key = frame(ctx, one, &[bad_key_pair, line_pair]);
+            let huge_code_point = frame(ctx, one, &[huge_code_pair, line_pair]);
+
+            let traces = [
+                ("{Fun,Args} — an erl_eval call frame", trace_of(ctx, call_two)),
+                ("{Fun,Args,Location} — an erl_eval call frame", trace_of(ctx, call_three)),
+                ("an argument list in the arity slot", trace_of(ctx, arity_list)),
+                ("a float in the arity slot", trace_of(ctx, arity_float)),
+                ("256 in the arity slot", trace_of(ctx, arity_256)),
+                ("-1 in the arity slot", trace_of(ctx, arity_negative)),
+                ("an atom file name", trace_of(ctx, atom_file)),
+                ("a one-pair location", trace_of(ctx, one_pair)),
+                ("a three-pair location", trace_of(ctx, three_pairs)),
+                ("a reversed location", trace_of(ctx, reversed)),
+                ("a non-integer line", trace_of(ctx, non_integer_line)),
+                ("a line above u32::MAX", trace_of(ctx, line_above_u32)),
+                ("a wrong location key", trace_of(ctx, wrong_key)),
+                ("an out-of-range file code point", trace_of(ctx, huge_code_point)),
+            ];
+
+            for (what, trace) in traces {
+                assert_unsupported_bif(raise_3(ctx, &[error, foo, trace]), what);
             }
         });
     }

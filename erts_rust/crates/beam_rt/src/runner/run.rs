@@ -40,7 +40,7 @@ use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
 use super::budget::{BudgetContext, BudgetProbe};
-use super::entry::{ProcessEntry, RunnerState};
+use super::entry::{ProcessEngine, ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::tier::select_entry_tier;
@@ -62,6 +62,38 @@ impl<'a> RuntimeRunner<'a> {
     pub(crate) fn new(runtime: &'a mut Runtime, state: &'a mut RunnerState) -> RuntimeRunner<'a> {
         RuntimeRunner { runtime, state }
     }
+}
+
+/// Resolves a process engine's **current execution site** for the debug trace —
+/// `module:function /arity +pc instr=…` — or `None` when no position is resolvable.
+///
+/// The module is the machine's active module context when the process is inside a
+/// cross-module callee; otherwise it is the process's **entry** module, because
+/// [`Machine::current_module`](beam_engine::Machine::current_module) returns `None` for a
+/// same-module position (the machine *borrows* the entry module rather than owning it). A
+/// parked process is reported at the `(func, pc)` it suspended at; the instruction text is
+/// truncated exactly as the raise trace truncates it, so a huge debug-formatted op cannot
+/// flood the trace.
+fn describe_site(engine: &ProcessEngine) -> Option<String> {
+    let module = match engine.machine.current_module() {
+        Some(module) => module,
+        None => Arc::clone(engine.entry.entry_module()?),
+    };
+    let (func, pc) = engine.machine.current_code().unwrap_or((0, 0));
+    let function = module.functions.get(func as usize);
+    let fname = function.and_then(|f| module.atom_table.name(f.name).map(str::to_owned));
+    let arity = function.map(|f| f.arity);
+    let instr = function
+        .and_then(|f| f.code.get(pc as usize))
+        .map(|i| format!("{i:?}"))
+        .unwrap_or_default();
+    let instr = instr.chars().take(160).collect::<String>();
+    Some(format!(
+        "{}:{} /{} +{pc} instr={instr}",
+        module.atom_table.name(module.name).unwrap_or("?"),
+        fname.unwrap_or_else(|| "?".into()),
+        arity.unwrap_or(0)
+    ))
 }
 
 /// Publishes a **parked** machine's whole live root set into `pid`'s process root set.
@@ -653,6 +685,16 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 Ok(RunOutcome::Exit(normal(self.runtime)))
             }
             Ok(EngineRunOutcome::Wait { func, pc }) => {
+                if crate::debug_trace::enabled() {
+                    let entry = engine
+                        .entry
+                        .entry_module()
+                        .and_then(|m| m.atom_table.name(m.name).map(str::to_owned));
+                    crate::debug_trace::trace(format_args!(
+                        "process {pid:?} blocked (no message): entry={entry:?} parked=+{pc} (func {func}) at={:?}",
+                        describe_site(&engine)
+                    ));
+                }
                 // The runner owns the state transition (the scheduler only takes the
                 // process off the ready queue): a blocked process is `Waiting` until a
                 // delivery wakes it, which is exactly what makes a later send resume it.
@@ -734,8 +776,13 @@ impl ProcessRunner for RuntimeRunner<'_> {
             Err(error) => {
                 let reason = exit_reason(self.runtime, &error);
                 if crate::debug_trace::enabled() {
+                    let entry = engine
+                        .entry
+                        .entry_module()
+                        .and_then(|m| m.atom_table.name(m.name).map(str::to_owned));
                     crate::debug_trace::trace(format_args!(
-                        "process {pid:?} raised: {error:?}"
+                        "process {pid:?} raised: {error:?} entry={entry:?} at={:?}",
+                        describe_site(&engine)
                     ));
                 }
                 // The reason may be a term the failing process built on **its own** heap,

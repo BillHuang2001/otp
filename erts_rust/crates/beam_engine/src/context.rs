@@ -45,7 +45,22 @@
 //! registers, the whole Erlang stack and the whole FR file) and defaulting to
 //! [`alloc_words`] with the roots discarded, so **every existing implementor
 //! compiles and behaves byte-identically**. [`crate::machine::Machine::alloc_rooted`]
-//! is where the engine's own slices are handed over.//!
+//! is where the engine's own slices are handed over.
+//!
+//! ## The in-machine BIF-dispatch door
+//!
+//! [`call_bif`] hands a host only the `module`/`function`/`arity`/`args` of a BIF,
+//! never the process it is running in — so an implementation cannot read the
+//! caller's execution state (the shape `erlang:process_info(self(),
+//! current_stacktrace)` needs). [`wants_bif_in_machine`] + [`call_bif_in_machine`]
+//! close that gap: a host that returns `true` from the probe is handed the live
+//! [`Machine`] and the run's **entry module** on every BIF dispatch. The probe is
+//! latched once per run by **both** the interpreters' driver
+//! ([`crate::machine::Machine::drive`]) and the native baseline tier's, and every
+//! BIF dispatch funnels through [`crate::machine::Machine::dispatch_bif_call`], so
+//! the door behaves identically on every execution tier. The default `false` keeps
+//! the plain [`call_bif`] path byte-identical.
+//!
 //! ## The mailbox / message-receive seam
 //!
 //! The `receive` opcode family ([`crate::families::receive`]) never looks at a
@@ -81,9 +96,23 @@
 //! the engine's side; the host decides *matching*, exactly as the oracle arms
 //! individual functions with `erlang:trace_pattern/3`.
 //!
+//! ## The atom-name resolution seam
+//!
+//! [`Module::atom_name`](beam_loader::Module::atom_name) indexes the module's
+//! **owned load-time snapshot** of the shared atom table, so a module loaded early
+//! cannot name an atom interned into the shared namespace afterwards. The engine
+//! resolves a **runtime atom value** (a variable `M`/`F` in `apply(M,F,A)` /
+//! `M:F(...)`) through [`ExecutionContext::atom_name`], whose default body is that
+//! module-local lookup and whose override lets a host that owns the live shared
+//! namespace answer where the snapshot cannot.
+//!
 //! [`alloc_words`]: ExecutionContext::alloc_words
 //! [`apply`]: ExecutionContext::apply
 //! [`apply_fun`]: ExecutionContext::apply_fun
+//! [`call_bif`]: ExecutionContext::call_bif
+//! [`wants_bif_in_machine`]: ExecutionContext::wants_bif_in_machine
+//! [`call_bif_in_machine`]: ExecutionContext::call_bif_in_machine
+//! [`atom_name`]: ExecutionContext::atom_name
 //!
 //! # `unsafe`
 //!
@@ -100,7 +129,9 @@ use std::sync::Arc;
 use beam_alloc::{GrowOutcome, ReservedHeap};
 use beam_common::Result;
 use beam_loader::{Label, Module};
-use beam_term::Eterm;
+use beam_term::{Atom, AtomTable, Eterm};
+
+use crate::machine::Machine;
 
 /// The mailbox/message-receive seam: the receive opcode family's host interface.
 ///
@@ -308,6 +339,89 @@ pub trait ExecutionContext {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm>;
+
+    /// The probe for the **in-machine** BIF-dispatch door
+    /// ([`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)).
+    ///
+    /// A host that returns `true` receives the *currently executing* [`Machine`]
+    /// and the run's **entry module** alongside every BIF dispatch, so a BIF
+    /// implementation can read the running process's execution state from *inside*
+    /// the call — the shape `erlang:process_info(self(), current_stacktrace)`
+    /// needs when it is reached through `gen_server:handle_common_reply/5`'s
+    /// `?STACKTRACE()`. The machine and the context are distinct objects at the
+    /// dispatch site, so this is the only way a `&mut self` context method can be
+    /// handed a `&Machine`.
+    ///
+    /// **Contract.** A host that returns `true` **must** also override
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine): the engine
+    /// then calls **only** that method, never [`call_bif`](ExecutionContext::call_bif).
+    ///
+    /// The answer is latched **once per run** by the driver that owns the run —
+    /// [`Machine::drive`](crate::machine::Machine::drive) for the interpreter and
+    /// the native baseline tier's own driver for
+    /// [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit) — exactly like
+    /// [`wants_reduce`](ExecutionContext::wants_reduce), so the door is taken on
+    /// **both execution tiers** and a host that leaves the default `false` keeps the
+    /// plain `call_bif` path **byte-identical** and pays a single `bool` load per
+    /// dispatch instead of an extra vtable crossing.
+    ///
+    /// The seam is a **read-only** borrow of the machine and involves no `unsafe`:
+    /// the host can inspect the process state, and the engine's own state machine is
+    /// untouched by the call.
+    fn wants_bif_in_machine(&self) -> bool {
+        false
+    }
+
+    /// The **entry-aware BIF-dispatch door**: the same dispatch as
+    /// [`call_bif`](ExecutionContext::call_bif), with the currently executing
+    /// [`Machine`] and the run's **entry module** handed in.
+    ///
+    /// The engine takes this door only when
+    /// [`wants_bif_in_machine`](ExecutionContext::wants_bif_in_machine) answered
+    /// `true` for the run (so a host that does not opt in never sees this method
+    /// called). `module`/`function`/`arity`/`args` are exactly
+    /// [`call_bif`](ExecutionContext::call_bif)'s; `machine` is the process state
+    /// the BIF is dispatching inside and `entry_module` is the module the run was
+    /// entered at.
+    ///
+    /// `entry_module` is the module [`Machine::drive`](crate::machine::Machine::drive)
+    /// was entered with — the module the **context-0** frames belong to. A
+    /// [`Machine`] borrows context `0` rather than owning it (see
+    /// [`Machine::current_module`](crate::machine::Machine::current_module)), so the
+    /// entry module cannot be recovered from `&Machine` and is threaded here
+    /// instead. It is what the machine's execution-position accessors expect for a
+    /// context-0 frame:
+    ///
+    /// * [`Machine::current_stacktrace`](crate::machine::Machine::current_stacktrace)
+    /// * [`Machine::current_function`](crate::machine::Machine::current_function)
+    /// * [`Machine::current_location`](crate::machine::Machine::current_location)
+    /// * [`Machine::initial_call`](crate::machine::Machine::initial_call)
+    ///
+    /// so a host calls, e.g.,
+    /// `machine.current_stacktrace(entry_module, self)`.
+    ///
+    /// Is called on **both execution tiers**: the interpreter's dispatch loop and
+    /// the native baseline tier's deopt helper both reach the single BIF-dispatch
+    /// funnel ([`Machine::dispatch_bif_call`](crate::machine::Machine)), so the same
+    /// module/context is handed the live machine whichever tier it runs on. The
+    /// machine is borrowed read-only — there is no `unsafe` here, and neither the
+    /// host's call nor the engine's state machine is affected by the inspection.
+    ///
+    /// The default body discards the two extra arguments and forwards to
+    /// [`call_bif`](ExecutionContext::call_bif), so **every existing implementor
+    /// compiles and behaves byte-identically**.
+    fn call_bif_in_machine(
+        &mut self,
+        machine: &Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let _ = (machine, entry_module);
+        self.call_bif(module, function, arity, args)
+    }
 
     /// Ensure `heap_need` heap words are available (for `test_heap`/
     /// `allocate_heap`).
@@ -635,6 +749,105 @@ pub trait ExecutionContext {
         Ok(None)
     }
 
+    /// Serve a **local** (same-module) call as a BIF instead of entering the
+    /// callee's own code — the *local-call* seam.
+    ///
+    /// The OTP compiler emits a **local** `call`/`call_only`/`call_last` for a
+    /// same-module function: a self-qualified call to an *exported* function is a
+    /// `call_ext`, but a call to a non-exported one stays local. A local call
+    /// therefore consults **no** BIF seam today — the engine resolves the label and
+    /// enters that code — so a module's non-exported functions can never reach
+    /// [`call_bif`](ExecutionContext::call_bif). That is exactly the shape ERTS uses
+    /// for a built-in/static NIF library (`lib/kernel/src/prim_tty.erl`: the exported
+    /// Erlang wrappers run in-module and chain **locally** into the non-exported NIF
+    /// stubs `tty_create/1`/`read_nif/3`/…), and this seam is the only way a host can
+    /// serve those stubs: the three local call arms
+    /// (`call`/`call_only`/`call_last`) consult it before jumping, in the interpreter
+    /// **and** on the native baseline tier.
+    ///
+    /// * `Ok(true)` — "I serve this `module:function/arity`": the engine marshals the
+    ///   instruction's own register arguments (`x(0..arity)`) into a
+    ///   [`call_bif`](ExecutionContext::call_bif) call exactly as a `call_ext` would,
+    ///   then applies the arm's own frame discipline to the returned value (a
+    ///   non-tail `call` continues at the next instruction; a tail `call_only`/
+    ///   `call_last` follows the frame's existing continuation, `call_last` popping
+    ///   its `deallocate` frame first). **No callee code runs**, so the host must be
+    ///   able to produce the result from the arguments alone.
+    /// * `Ok(false)` — "enter the callee in this machine": today's behaviour, an
+    ///   in-machine jump to the local label (with the arm's continuation store, its
+    ///   `call_last` frame pop and its contract-A.8 `call` event). **This is the
+    ///   default**, and it is byte-identical to the tier before the seam existed.
+    ///
+    /// The engine recovers `module:function/arity` from the resolved callee's own
+    /// function entry and atom table; when either name cannot be resolved it does not
+    /// call this method at all and takes the in-machine jump, so a host is never
+    /// asked about a fabricated name.
+    ///
+    /// An `Err` propagates out of the run exactly like any other engine failure — the
+    /// raise funnel's frame discipline included, so a raise lands in a live
+    /// `try`/`catch` when there is one.
+    ///
+    /// The default body returns `Ok(false)`, so every existing host compiles and
+    /// behaves byte-identically (it pays only the call).
+    ///
+    /// [`call_bif`]: ExecutionContext::call_bif
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        let _ = (module, function, arity);
+        Ok(false)
+    }
+
+    /// Resolve an interned atom id to its name, preferring the host's **live**
+    /// atom namespace over the running module's load-time snapshot.
+    ///
+    /// [`Module::atom_name`](beam_loader::Module::atom_name) indexes the module's
+    /// *owned load-time snapshot* of the shared atom table, so a module loaded
+    /// early cannot name an atom interned afterwards (its global id is beyond the
+    /// snapshot). The engine resolves a **runtime atom value** (a variable
+    /// `M`/`F` in `apply(M,F,A)` / `M:F(...)`) through this seam, so a host that
+    /// owns the live shared namespace can answer where the module's snapshot
+    /// cannot.
+    ///
+    /// The default body is this module's own table only
+    /// ([`Module::atom_name`](beam_loader::Module::atom_name)), so every existing
+    /// implementor — including every test context — is byte-identical.
+    ///
+    /// The name is returned **owned** so the caller can hold both resolved names
+    /// across subsequent `&mut` host calls (e.g.
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) and
+    /// [`call_bif`](ExecutionContext::call_bif), both of which take
+    /// `&mut dyn ExecutionContext`); a borrowed `&str` tied to `&self` would
+    /// conflict with that mutable borrow. The allocation is only on the
+    /// variable-`apply` path, never a hot path.
+    fn atom_name(&self, module: &Module, atom: Atom) -> Option<String> {
+        module.atom_name(atom).map(str::to_owned)
+    }
+
+    /// The atom **namespace** a comparison must use.
+    ///
+    /// Every term comparison the engine performs on the execution path — the
+    /// `test`/`is_*` comparison kinds and `select_val`, the native baseline tier's
+    /// comparison helper, and the map-key `lookup`/`position` equality — resolves a
+    /// comparison's atom names through this seam. The default body is the running
+    /// module's own **load-time snapshot** ([`Module::atom_table`]), which is
+    /// byte-identical to the pre-seam behaviour.
+    ///
+    /// A host that owns **one** shared, live atom namespace (the runtime) must
+    /// override this so guard/`select_val`/map-key comparisons order atoms by
+    /// **name** exactly as the `<`/`==` BIFs do. The bug it closes: `beam_term`'s
+    /// `erts_cmp_atoms` compares atom *names*, but falls back to the raw atom id when
+    /// a name is unknown to the supplied table — and a module loaded early cannot
+    /// name an atom interned into the shared namespace *afterwards* (its global id is
+    /// beyond the snapshot). A comparison of two such atoms then silently ordered by
+    /// id instead of name, so `{module_info,0} < {G,1}` (with `G` interned later)
+    /// took the wrong clause in `sofs:restrict_n/5`.
+    ///
+    /// The returned reference is borrowed from `self` (and `module`), so a caller
+    /// **must take it after** its operand reads and **never hold it across** a
+    /// `&mut dyn ExecutionContext` call (e.g. the map writers reserve through `ctx`
+    /// and only then read the namespace).
+    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
+        &module.atom_table
+    }
     /// The **per-instruction reduction hook**: charge `n` reductions for the
     /// instruction the engine is about to execute.
     ///
@@ -776,6 +989,17 @@ pub type ExternalResolver =
 /// [`MinimalContext::new`] leaves it unset, so `resolve_local_fun` stays the
 /// trait's `Ok(None)` default.
 pub type LocalFunResolver = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Option<(Arc<Module>, Label)>>>;
+
+/// A local-call resolver: the pluggable body of
+/// [`ExecutionContext::resolve_local_call`].
+///
+/// Answers whether the host serves a **same-module** `call`/`call_only`/`call_last`
+/// target as a BIF instead of letting the engine enter its code: `true` = serve it
+/// (the engine dispatches `(module, function, arity)` through
+/// [`call_bif`](ExecutionContext::call_bif)), `false` = the in-machine jump (the trait
+/// default). [`MinimalContext::new`] leaves it unset, so `resolve_local_call` stays the
+/// trait's `Ok(false)` default.
+pub type LocalCallResolver = Box<dyn FnMut(&str, &str, u32) -> Result<bool>>;
 
 /// The first region's **reservation** in `Eterm` words (4 MiB).
 ///
@@ -989,8 +1213,21 @@ pub struct MinimalContext {
     /// An optional local-closure resolver (the
     /// [`ExecutionContext::resolve_local_fun`] body).
     local_fun_resolver: Option<LocalFunResolver>,
+    /// An optional local-call resolver (the
+    /// [`ExecutionContext::resolve_local_call`] body).
+    local_call_resolver: Option<LocalCallResolver>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
+    /// An optional shared atom namespace (the body of
+    /// [`ExecutionContext::atoms`]).
+    ///
+    /// `None` out of the box, so the seam is the trait default (the running
+    /// module's own load-time snapshot), byte-identical to the pre-seam behaviour.
+    /// A test that needs to model the runtime's **live** shared namespace installs
+    /// one through [`with_shared_atoms`](MinimalContext::with_shared_atoms) /
+    /// [`set_shared_atoms`](MinimalContext::set_shared_atoms) — a namespace strictly
+    /// longer than a module's snapshot, exactly as the runtime's is.
+    shared_atoms: Option<AtomTable>,
     /// The pointer-stable heap backing [`ExecutionContext::alloc_words`].
     ///
     /// A [`ContextHeap`]: a list of [`ReservedHeap`] regions that only ever grows.
@@ -1020,7 +1257,9 @@ impl MinimalContext {
             apply_hook: None,
             external_resolver: None,
             local_fun_resolver: None,
+            local_call_resolver: None,
             mailbox: None,
+            shared_atoms: None,
             heap: ContextHeap::new(),
         }
     }
@@ -1084,11 +1323,47 @@ impl MinimalContext {
         self.local_fun_resolver = Some(resolver);
     }
 
+    /// A context with the given local-call resolver and the default (rejecting) BIF
+    /// hook.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_local_call_resolver(resolver: LocalCallResolver) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.local_call_resolver = Some(resolver);
+        ctx
+    }
+
+    /// Install (or replace) the local-call resolver.
+    pub fn set_local_call_resolver(&mut self, resolver: LocalCallResolver) {
+        self.local_call_resolver = Some(resolver);
+    }
+
     /// Install (or replace) the mailbox.
     pub fn set_mailbox(&mut self, mailbox: Box<dyn Mailbox>) {
         self.mailbox = Some(mailbox);
     }
 
+    /// A context with the given shared atom namespace and the default (rejecting)
+    /// BIF hook.
+    ///
+    /// The namespace is what [`ExecutionContext::atoms`] returns, modelling the
+    /// runtime's **live** shared atom table — typically a [`clone`](Clone::clone) of
+    /// a module's load-time snapshot with one or more names interned afterwards, so
+    /// its global ids run past the snapshot's length.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_shared_atoms(atoms: AtomTable) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.shared_atoms = Some(atoms);
+        ctx
+    }
+
+    /// Install (or replace) the shared atom namespace [`ExecutionContext::atoms`]
+    /// answers from. The default (never installed) is the running module's own
+    /// load-time snapshot.
+    pub fn set_shared_atoms(&mut self, atoms: AtomTable) {
+        self.shared_atoms = Some(atoms);
+    }
     /// Forward to the installed mailbox, or return the receive seam's typed
     /// `unsupported` naming `method`.
     ///
@@ -1124,6 +1399,14 @@ impl ExecutionContext for MinimalContext {
         (self.hook)(module, function, arity, args)
     }
 
+    /// Answer from the installed shared namespace, or the trait default (the running
+    /// module's own snapshot) when none was installed.
+    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
+        match &self.shared_atoms {
+            Some(atoms) => atoms,
+            None => &module.atom_table,
+        }
+    }
     fn ensure_heap(
         &mut self,
         _heap_need: u32,
@@ -1211,6 +1494,18 @@ impl ExecutionContext for MinimalContext {
             None => {
                 let _ = (fun, args);
                 Ok(None)
+            }
+        }
+    }
+
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        // Without an installed resolver the in-machine jump is the only route, so the
+        // three local call arms behave exactly as they did before the seam existed.
+        match self.local_call_resolver.as_mut() {
+            Some(resolver) => resolver(module, function, arity),
+            None => {
+                let _ = (module, function, arity);
+                Ok(false)
             }
         }
     }

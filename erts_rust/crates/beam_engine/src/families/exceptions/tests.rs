@@ -23,8 +23,9 @@
 //! Split by responsibility across submodules: [`handlers`] (the `try`/`catch`
 //! frame push, the handler opcodes and `catch_end`), [`raising`] (the raising
 //! opcodes, the re-raise opcode and `raw_raise`), [`stacktrace`]
-//! (`build_stacktrace`) and [`end_to_end`] (whole synthetic sequences). The
-//! shared fixture scaffolding lives here.
+//! (`build_stacktrace`), [`function_clause`] (the failed clause's argument list in
+//! the cooked `function_clause` item's `A` slot) and [`end_to_end`] (whole
+//! synthetic sequences). The shared fixture scaffolding lives here.
 
 use super::*;
 use crate::context::MinimalContext;
@@ -92,13 +93,30 @@ fn no_labels() -> LabelMap {
 }
 
 /// Run one instruction body with a machine that has a bottom frame.
+///
+/// `module` is both the active module and the run's entry module (context `0`):
+/// these helpers execute a single instruction body in one module, so the two
+/// coincide. A cross-module context is exercised through
+/// [`exec_one_with_entry`].
 fn exec_one(
     module: &Module,
     instr: &Instr,
     machine: &mut Machine,
     ctx: &mut MinimalContext,
 ) -> Result<Option<Step>> {
-    exec(machine, module, &no_labels(), instr, 0, 0, ctx)
+    exec_one_with_entry(module, module, instr, machine, ctx)
+}
+
+/// [`exec_one`] with the run's **entry** module handed in separately from the
+/// **active** module (the callee a non-zero module context is executing).
+fn exec_one_with_entry(
+    entry_module: &Module,
+    module: &Module,
+    instr: &Instr,
+    machine: &mut Machine,
+    ctx: &mut MinimalContext,
+) -> Result<Option<Step>> {
+    exec(machine, entry_module, module, &no_labels(), instr, 0, 0, ctx)
 }
 
 /// Assert that `reason` (an `Eterm`) equals the tuple `[tag, elem]`.
@@ -120,8 +138,12 @@ fn assert_reason_tuple(
     );
 }
 
+mod callee;
 mod cross_module;
+mod encoder;
 mod end_to_end;
+mod function_clause;
 mod handlers;
+mod oracle;
 mod raising;
 mod stacktrace;

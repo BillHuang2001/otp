@@ -40,7 +40,7 @@ use beam_common::Result;
 use beam_engine::context::RootSet;
 use beam_engine::ExecutionContext;
 use beam_loader::{Label, Module};
-use beam_term::Eterm;
+use beam_term::{Atom, AtomTable, Eterm};
 
 use super::apply::{callee_observes_its_call_site, LocalFunTarget};
 use super::gc;
@@ -55,6 +55,72 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// 3. Otherwise an external module call: the module is loaded on demand from the
     ///    code path and run with `self` as the context. `erlang` is the BIF namespace,
     ///    never a loadable module, so an unknown `erlang:*` call is a typed diagnostic.
+    /// The **local**-call half of the host seam: `Ok(true)` when this host serves
+    /// `(module, function, arity)` itself, so the engine marshals `x(0..arity)` through
+    /// [`Self::call_bif`] under the arm's own frame discipline.
+    ///
+    /// The only local keys the runtime serves are the `prim_tty` NIF library's **non-exported**
+    /// stubs (`tty_create/1`, `tty_init/2`, `setlocale/1`, `tty_select/2`,
+    /// `tty_window_size/1`, `tty_encoding/1`, `write_nif/2`, `read_nif/3`, `isprint/1`,
+    /// `wcwidth/1`, `setupterm_nif/0`, `tiget*_nif/1`, `tinfo_nif/0`, `tputs_nif/2` — the
+    /// compiler emits a LOCAL `call`/`call_only` for each, so `call_ext`/`floor_shadows`
+    /// never sees them). ERTS serves that library from its static NIF table; the Rust
+    /// counterpart is [`crate::native::prim_tty`], and the dispatch lands on the SAME
+    /// `try_native` arm the exported stubs use, so there is one implementation.
+    ///
+    /// This is consulted for **every** local call in **every** module, so it must answer
+    /// `Ok(false)` for everything else — [`crate::native::prim_tty::serves_local_call`]
+    /// (a `prim_tty` module check plus a `NIF_KEYS` membership test) does.
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        Ok(crate::native::prim_tty::serves_local_call(
+            module, function, arity,
+        ))
+    }
+
+    /// Resolve an interned atom id to its name from the runtime's **live** shared namespace,
+    /// falling back to the running module's own load-time snapshot
+    /// ([`ExecutionContext::atom_name`]).
+    ///
+    /// [`Module::atom_name`](beam_loader::Module::atom_name) indexes only the module's *owned
+    /// load-time prefix clone* of the shared atom table, so a module loaded early cannot name an
+    /// atom interned later — its global id lies beyond that snapshot. The engine resolves a
+    /// **runtime atom value** (a variable `M`/`F` in `apply(M,F,A)` / `M:F(...)`) through this
+    /// seam, and on the A.9 boot path `gen_server:init_it/6` evaluates `{ok, Mod:init(Args)}`
+    /// with `Mod` = the runtime atom `supervisor_bridge`, whose id exceeds `gen_server`'s
+    /// snapshot — the default body would answer `None` and the call would raise `badarg`.
+    ///
+    /// This host owns the runtime-wide [`AtomTable`](beam_term::AtomTable), so the **live**
+    /// lookup answers first ([`Runtime::atoms`](crate::Runtime::atoms)); the module snapshot is
+    /// kept as the fallback so a term whose atom this runtime did not intern still resolves
+    /// exactly as the default body would.
+    fn atom_name(&self, module: &Module, atom: Atom) -> Option<String> {
+        self.runtime
+            .atoms()
+            .name(atom)
+            .or_else(|| module.atom_name(atom))
+            .map(str::to_owned)
+    }
+
+    /// The atom **namespace** guard/`select_val`/map-key comparisons must use.
+    ///
+    /// The running module's [`Module::atom_table`](beam_loader::Module) is a load-time *clone*
+    /// of this runtime's shared table, taken when the module was loaded
+    /// ([`CodeServer`](crate::CodeServer) — interning only appends, so the module's own atoms
+    /// keep their ids). [`beam_term::compare`]'s `erts_cmp_atoms` compares atom **names** but
+    /// falls back to raw atom-id order when a name is unknown to the supplied table, and a
+    /// module loaded early cannot name an atom interned afterwards — exactly the
+    /// `sofs:drestriction/2` shape: `sofs` (and `erl_lint`) are primLoaded during boot and the
+    /// `-eval` expression then interns `g`, so `{module_info,0} < {g,1}` in `sofs:restrict_n/5`
+    /// was ordered by id and took the wrong clause. The runtime's **live** shared table names
+    /// every atom, so comparisons order by name exactly as the `<`/`==` BIFs do.
+    ///
+    /// The returned reference borrows from `self`, so a caller must take it after its operand
+    /// reads and never hold it across a `&mut` call on the context (see the trait doc on
+    /// [`ExecutionContext::atoms`]).
+    fn atoms<'m>(&'m self, _module: &'m Module) -> &'m AtomTable {
+        self.runtime.atoms()
+    }
+    /// The host's own call into a callee, under the arm's frame discipline.
     fn call_bif(
         &mut self,
         module: &str,
@@ -62,7 +128,31 @@ impl ExecutionContext for RuntimeContext<'_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        let result = self.call_bif_routed(module, function, arity, args)?;
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "ENTER [{:?}] {module}:{function}/{arity}",
+                self.mailbox_pid
+            ));
+        }
+        let result = match self.call_bif_routed(module, function, arity, args) {
+            Ok(result) => result,
+            Err(error) => {
+                if crate::debug_trace::enabled() {
+                    let rendered: Vec<String> = args
+                        .iter()
+                        .map(|arg| match self.atom_name(*arg) {
+                            Some(name) => format!("'{name}'"),
+                            None => format!("{arg:?}"),
+                        })
+                        .collect();
+                    crate::debug_trace::trace(format_args!(
+                        "call_bif [{:?}] {module}:{function}/{arity} {rendered:?} -> {error:?}",
+                        self.mailbox_pid
+                    ));
+                }
+                return Err(error);
+            }
+        };
         self.open_gate_for_foreign_result(result);
         Ok(result)
     }
@@ -107,7 +197,12 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   ([`callee_observes_its_call_site`]) → `Ok(None)`,
     ///   whether it was already cached or loaded on demand by this very call — the guard is
     ///   applied to both paths, so the answer never depends on *when* the module was cached
-    ///   (the seam is idempotent, see the note at the guard);
+    ///   (the seam is idempotent, see the note at the guard). A **built-in NIF library**
+    ///   (contract A.7, [`crate::native::prim_tty::is_builtin_library`]) is the one exemption
+    ///   from that guard, and only from its module-wide `load_nif` half: such a library has no
+    ///   `current_module`-dependent identity to protect, so refusing it would only fold its
+    ///   blocking `receive` into the typed `blocked()` gap (the note at the guard carries the
+    ///   rationale);
     /// * a function atom or export the callee does not have → `Ok(None)`, so the synchronous
     ///   path reports the oracle's `undef` byte for byte.
     ///
@@ -142,6 +237,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         function: &str,
         arity: u32,
     ) -> Result<Option<(Arc<Module>, Label)>> {
+        let trace_pid = self.mailbox_pid;
         // The floor's namespaces: `try_native` serves them for modules that are *also*
         // loadable `.beam`s (`os`, `code`, `init`, `application`, `prim_file`,
         // `erts_internal`, `erlang`, `io`), so entering the module body would shadow the host
@@ -159,7 +255,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         if crate::native::floor_shadows(module, function, arity) {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: floor_shadows"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: floor_shadows"
                 ));
             }
             return Ok(None);
@@ -191,7 +287,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         if self.runtime.nifs.borrow().is_loaded(module) {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: nif-loaded"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: nif-loaded"
                 ));
             }
             return Ok(None);
@@ -202,7 +298,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         if self.runtime.registry.contains(module, function, arity) {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: registry key"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: registry key"
                 ));
             }
             return Ok(None);
@@ -259,15 +355,44 @@ impl ExecutionContext for RuntimeContext<'_> {
         let Some(function_atom) = callee.atom_table.lookup(function) else {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: unknown function atom"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: unknown function atom"
                 ));
             }
             return Ok(None);
         };
-        if callee_observes_its_call_site(&callee, function_atom, arity) {
+        // A **built-in NIF library** is exempt from that guard (see below), so the module-wide
+        // `LoadNif` refusal is skipped for it and only then is the callee's own call-site read
+        // consulted.
+        //
+        // `prim_tty` is ERTS's statically linked NIF library: `erlang:load_nif/2` resolves it
+        // from ERTS's **static NIF table** (`is_static_nif_module`,
+        // `erts/emulator/beam/erl_nif.c`) instead of `dlopen`ing a shared object, and this
+        // runtime's counterpart ([`crate::context::bridges`]'s `NifLoader::load_nif`) answers
+        // the oracle's `ok` without a `dlopen` and **without registering an owning module**.
+        // The identity `load_nif`'s `current_module` argument carries — the module a NIF
+        // library is registered under, which the loader validates the library's own
+        // `ErlNifEntry.name` against, and the `bad_lib` a stale identity would produce — is
+        // therefore *impossible* for such a library: there is no library to register and no
+        // name to validate. Keeping the refusal would buy no correctness at all and would only
+        // route the library's **Erlang wrappers** onto the synchronous non-pumping
+        // [`Self::call_bif`] path, where a blocking `receive` folds into the typed `blocked()`
+        // gap (exit 3) — `prim_tty:init/1` waits for the reader process it just spawned, so the
+        // library's Erlang wrappers are entered in-machine rather than through that route.
+        // Contract A.7's `prim_*` family is served from the floor
+        // ([`crate::native::prim_tty`]), which is what makes the library built-in in the first
+        // place; [`crate::native::prim_tty::is_builtin_library`] is that ONE source of truth.
+        //
+        // The exemption is by **library name** (exactly as ERTS's own resolution is), so it is
+        // a pure function of the callee module name — the seam stays idempotent — and it widens
+        // nothing else: a non-built-in module importing `erlang:load_nif/2` keeps the
+        // module-wide refusal, since its `load_nif` really does register a library under the
+        // module identity.
+        if !crate::native::prim_tty::is_builtin_library(module)
+            && callee_observes_its_call_site(&callee, function_atom, arity)
+        {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
-                    "seam decline {module}:{function}/{arity}: observes its call site"
+                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: observes its call site"
                 ));
             }
             return Ok(None);
@@ -279,7 +404,7 @@ impl ExecutionContext for RuntimeContext<'_> {
             None => {
                 if crate::debug_trace::enabled() {
                     crate::debug_trace::trace(format_args!(
-                        "seam decline {module}:{function}/{arity}: not exported"
+                        "seam decline [{trace_pid:?}] {module}:{function}/{arity}: not exported"
                     ));
                 }
                 Ok(None)
@@ -613,6 +738,39 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// answer to its inner context.
     fn wants_reduce(&self) -> bool {
         false
+    }
+
+    /// The **in-machine BIF door** probe: this host takes it.
+    ///
+    /// `beam_engine` then hands the live [`Machine`] and the run's entry module to
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine) on every BIF dispatch,
+    /// which is the only way a `&mut self` context method can be shown the machine the
+    /// scheduler has taken out of its own runner state. The body
+    /// ([`RuntimeContext::in_machine_probe`], in the sibling `context/position.rs`) is a
+    /// constant `true`; the price is that method's own routing check, and the benefit is
+    /// `erlang:process_info(self(), current_stacktrace)` — `gen_server`'s `?STACKTRACE()` —
+    /// being answerable at all.
+    fn wants_bif_in_machine(&self) -> bool {
+        self.in_machine_probe()
+    }
+
+    /// The **entry-aware BIF dispatch**: answer the executing process's own execution
+    /// position, then dispatch exactly as [`call_bif`](ExecutionContext::call_bif) does.
+    ///
+    /// The body ([`RuntimeContext::dispatch_in_machine`], in the sibling
+    /// `context/position.rs`) publishes the five machine-sourced item values for the one
+    /// nested `call_bif` that needs them — see that module's docs for the routing, the
+    /// published window and why the terms are stable across it.
+    fn call_bif_in_machine(
+        &mut self,
+        machine: &beam_engine::Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.dispatch_in_machine(machine, entry_module, module, function, arity, args)
     }
 
     /// Whether the running process requests the `call`/`return_from`/`return_to` execution

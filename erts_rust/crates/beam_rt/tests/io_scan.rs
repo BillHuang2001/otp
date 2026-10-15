@@ -505,12 +505,16 @@ fn sequence_fixture_or_skip(label: &str) -> Option<(PathBuf, SequenceFixture)> {
     Some((oracle, fixture))
 }
 
-/// `beam_rt run <beam> ioseq:<function>/1 "<data>"` — the **scheduled** process route.
+/// `beam_rt -noshell run <beam> ioseq:<function>/1 "<data>"` — the **scheduled** process route.
+///
+/// `-noshell`: the `run` action drives the default boot script (A.9) but is banner-free by
+/// construction (it records the `noshell` init argument), so it suppresses no banner of ours; it
+/// is kept to mirror the oracle side, which probes with `erl -noshell …`.
 fn beam_rt_run(beam: &Path, function: &str, data: &Path) -> Run {
     let spec = format!("ioseq:{function}/1");
     let beam = beam.to_str().expect("an ASCII fixture path");
     let data = literal(data);
-    run(Path::new(BINARY), &["run", beam, &spec, &data])
+    run(Path::new(BINARY), &["-noshell", "run", beam, &spec, &data])
 }
 
 /// `beam_rt -noshell -pa <dir> -eval <expr>` — the **pumped** `-eval` route, loading the

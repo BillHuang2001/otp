@@ -109,6 +109,7 @@ use beam_term::{atom_val, is_atom, make_atom, Eterm};
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
+use crate::families::exceptions::callee;
 use crate::machine::{Continuation, Machine};
 use crate::operand::{
     operand_slack_words, read_operand, read_operands_slack, write_operand,
@@ -122,6 +123,7 @@ use crate::Step;
 /// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
 pub(crate) fn exec(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     labels: &LabelMap,
     instr: &Instr,
@@ -190,7 +192,7 @@ pub(crate) fn exec(
 
         // `apply Arity` — module = `x(arity)`, function = `x(arity+1)`, arguments
         // in `x(0..arity)` (`fixed_apply`).
-        Instr::Apply { arity } => match apply_target(machine, module, *arity, ctx)? {
+        Instr::Apply { arity } => match apply_target(machine, entry_module, module, *arity, ctx)? {
             ApplyTarget::Called(result) => {
                 machine.set_x(0, result)?;
                 Ok(Some(Step::Next))
@@ -242,7 +244,7 @@ pub(crate) fn exec(
         // `tests/call_ext_apply.rs::a_host_bif_error_from_a_tail_apply_last_lands_in_the_enclosing_try`.
         Instr::ApplyLast { arity, deallocate } => {
             machine.pop_frame_checked(*deallocate)?;
-            match apply_target(machine, module, *arity, ctx)? {
+            match apply_target(machine, entry_module, module, *arity, ctx)? {
                 ApplyTarget::Called(result) => {
                     machine.set_x(0, result)?;
                     // Follow the frame's continuation **context-aware**: this
@@ -412,6 +414,7 @@ pub(crate) enum ApplyTarget {
 /// the recursion into `apply()` computes.
 pub(crate) fn apply_target(
     machine: &mut Machine,
+    entry_module: &Module,
     module: &Module,
     arity: u32,
     ctx: &mut dyn ExecutionContext,
@@ -425,8 +428,8 @@ pub(crate) fn apply_target(
     // `p->freason = BADARG` and return NULL into `handle_error` → `next_catch`, so
     // the `badarg` is a **catchable raise**, not a bare return.
     let (module_name, function_name) = match (
-        atom_name(module, module_term),
-        atom_name(module, function_term),
+        atom_name(ctx, module, module_term),
+        atom_name(ctx, module, function_term),
     ) {
         (Ok(module_name), Ok(function_name)) => (module_name, function_name),
         _ => return raise_badarg(machine, module).map(ApplyTarget::Raised),
@@ -438,7 +441,9 @@ pub(crate) fn apply_target(
     // context and its entry `Label` resolved against the callee's **own** label
     // index — an unknown label is a typed error, never a jump into the wrong
     // module.
-    if let Some((callee, label)) = ctx.resolve_external_call(module_name, function_name, arity)? {
+    if let Some((callee, label)) =
+        ctx.resolve_external_call(&module_name, &function_name, arity)?
+    {
         let context = machine.register_context(&callee);
         let handle = machine
             .module_context(context)
@@ -461,9 +466,29 @@ pub(crate) fn apply_target(
     // [`ApplyTarget`]). Engine-diagnostic `Err`s from *outside* the host BIF call
     // (an out-of-range register, the resolver / label resolution above) keep their
     // `?` and are never wrapped — only the host's own BIF outcome is.
-    match ctx.call_bif(module_name, function_name, arity, &args) {
+    //
+    // An unresolvable target raises `error:undef`, and the oracle's cooked trace
+    // then names the **callee** with its argument list as the innermost item (C's
+    // `erts_build_mfa_item` with the exception's saved args — see
+    // [`callee`]). This site knows the callee (the two atoms checked above, both
+    // immediate terms that cannot move) and its arguments are the instruction's own
+    // `x(0..arity)` registers, so the item is synthesized here: a no-op for any
+    // other error shape and when the raise cannot land.
+    match machine.dispatch_bif_call(
+        entry_module,
+        &module_name,
+        &function_name,
+        arity,
+        &args,
+        ctx,
+    ) {
         Ok(value) => Ok(ApplyTarget::Called(value)),
-        Err(e) => Ok(ApplyTarget::Raised(machine.raise_bif_error(module, e)?)),
+        Err(e) => {
+            let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;
+            Ok(ApplyTarget::Raised(
+                machine.raise_bif_error_with_head(module, e, head)?,
+            ))
+        }
     }
 }
 
@@ -499,16 +524,23 @@ pub(crate) fn raise_badarg(machine: &mut Machine, module: &Module) -> Result<Ste
     machine.throw_error(make_atom(atom))
 }
 
-/// The name of an atom term, resolved through the running module's atom table.
+/// The name of an atom term, resolved through
+/// [`ExecutionContext::atom_name`](crate::ExecutionContext::atom_name).
 ///
-/// A non-atom term, or an atom index absent from the table, is a typed
+/// A runtime atom **value** (a variable `M`/`F`) is looked up through the host
+/// seam, which prefers the host's **live** atom namespace over the running
+/// module's load-time snapshot (a module loaded early cannot name an atom
+/// interned afterwards). The default seam body is the module's own table, so a
+/// host that does not override it behaves exactly as a bare module lookup.
+///
+/// A non-atom term, or an atom id the host cannot name, is a typed
 /// [`BeamError::BadArg`] (the C's `BADARG`); the engine never substitutes a
 /// *different* atom.
-fn atom_name<'a>(module: &'a Module, term: Eterm) -> Result<&'a str> {
+fn atom_name(ctx: &dyn ExecutionContext, module: &Module, term: Eterm) -> Result<String> {
     if !is_atom(term) {
         return Err(BeamError::BadArg);
     }
-    module.atom_name(atom_val(term)).ok_or(BeamError::BadArg)
+    ctx.atom_name(module, atom_val(term)).ok_or(BeamError::BadArg)
 }
 
 #[cfg(test)]

@@ -69,6 +69,47 @@ fn a_bif_builds_an_atom_from_the_shared_table() {
     );
 }
 
+/// **The `atom_name` seam resolves through the runtime's LIVE namespace, not the running
+/// module's load-time snapshot** — the engine-side half of the load-time atom-snapshot gap.
+///
+/// [`Module::atom_name`](beam_loader::Module::atom_name) indexes only the module's **owned
+/// load-time prefix clone** of the shared table (`CodeServer::load_bytes` hands
+/// `lower::build_module` an `atoms().clone()`), so a module loaded *before* a name was interned
+/// cannot name that atom — its id lies beyond the snapshot. The engine resolves a runtime atom
+/// value (the `Mod` in `Mod:init(Args)` / `apply(M,F,A)`) through
+/// [`ExecutionContext::atom_name`], and on the boot path `gen_server:init_it/6` names
+/// `supervisor_bridge` — interned by a later boot-script directive — so the trait default
+/// answered `None` and the call raised `badarg`.
+///
+/// This case interns a fresh name **after** loading a fixture and asserts both halves: the
+/// module's own table still cannot name it (the premise), while the context's seam does (the
+/// override). Removing the override makes the second assertion fail.
+#[test]
+fn the_atom_name_seam_names_an_atom_interned_after_the_module_loaded() {
+    let mut rt = runtime();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the fixture loads into the code server");
+    let module = rt
+        .code_server()
+        .module_handle("gc_floats")
+        .expect("the fixture is cached under its own name");
+
+    // Interned through the shared table, so its id is exactly one past the module's snapshot.
+    let name = "an_atom_interned_after_gc_floats_loaded";
+    let atom = rt.code_server_atoms_mut().intern(name);
+    assert!(
+        module.atom_name(atom).is_none(),
+        "the name is beyond the module's load-time snapshot (the premise of the boot blocker)"
+    );
+
+    let ctx = RuntimeContext::new(&mut rt);
+    assert_eq!(
+        ExecutionContext::atom_name(&ctx, &module, atom).as_deref(),
+        Some(name),
+        "the seam resolves the runtime atom through the live shared namespace"
+    );
+}
+
 #[test]
 fn the_pending_interner_predicts_append_only_indices_and_dedups() {
     let mut interner = PendingInterner::new(10);
@@ -3030,6 +3071,72 @@ fn the_served_statistics_counters_read_the_runtimes_own_state() {
     );
 }
 
+/// `erts_internal:scheduler_wall_time/1` is the C's `atomic_xchg` on the node-global
+/// `sched_wall_time` switch (`erts/emulator/beam/bif.c:5357-5366`): **any** argument is
+/// accepted (only the atom `true` enables — every other term, `false`/`foo`/an integer,
+/// disables, never a `badarg`) and the answer is the state held *before* the call, as the
+/// atom `true`/`false`.
+///
+/// Oracle-verified (OTP 29/`erts-17.1`), one VM, in order —
+/// `scheduler_wall_time(true)` → `false`, `(false)` → `true`, `(true)` → `false`,
+/// `(foo)` → `true`, `(foo)` → `false`; on a fresh VM each of `(true)`/`(false)`/`(foo)`/`(1)`
+/// answers `false` (the switch starts disabled). `kernel_refc`'s
+/// `resource(scheduler_wall_time, Enable)` (`lib/kernel/src/kernel_refc.erl:141-142`) is the
+/// boot-path caller and `kernel_sup` starts it `permanent`, so a raise here tears `kernel_sup`
+/// down with `start_error`.
+///
+/// The switch is **recorded but never sampled**: `erlang:statistics(scheduler_wall_time)`
+/// keeps answering `undefined` even while armed — this runtime measures no per-scheduler wall
+/// time, so a fabricated `{SchedulerId, ActiveTime, TotalTime}` tuple list would be a wrong
+/// result (`tests/runtime_hooks.rs` cross-checks the disabled answer against the live oracle).
+#[test]
+fn the_runtime_hooks_bridge_serves_the_scheduler_wall_time_switch() {
+    let mut rt = runtime();
+    let on = rt.intern("true");
+    let off = rt.intern("false");
+    let other = rt.intern("foo");
+    let undefined = rt.intern("undefined");
+    let statistics_key = rt.intern("scheduler_wall_time");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    let call = |ctx: &mut RuntimeContext<'_>, arg: Eterm| {
+        ctx.call_bif("erts_internal", "scheduler_wall_time", 1, &[arg])
+            .expect("scheduler_wall_time/1 accepts any argument")
+    };
+    let stat = |ctx: &mut RuntimeContext<'_>| {
+        ctx.call_bif("erlang", "statistics", 1, &[statistics_key])
+            .expect("statistics(scheduler_wall_time)")
+    };
+
+    // Force the switch off first so the sequence is independent of any preceding call.
+    let _ = call(&mut ctx, off);
+
+    // The exchange answers the *previous* state: enabling a disabled switch answers `false`,
+    // disabling an enabled one answers `true`.
+    assert_eq!(call(&mut ctx, on), off, "arming answers the previous (disabled) state");
+    assert_eq!(call(&mut ctx, off), on, "disarming answers the previous (armed) state");
+    assert_eq!(call(&mut ctx, on), off);
+
+    // A non-`true` term disables exactly like `false` — never a `badarg`.
+    assert_eq!(call(&mut ctx, other), on, "`foo` disabled the armed switch");
+    assert_eq!(call(&mut ctx, other), off, "and is now the previous, disabled state");
+    // An integer is a disabling request too, not a `badarg`.
+    assert_eq!(call(&mut ctx, make_small(1)), off);
+    assert_eq!(call(&mut ctx, on), off, "re-arming a disabled switch");
+    // Still armed: a second `true` answers the previous (armed) state, which proves the switch
+    // really took the `true` above.
+    assert_eq!(call(&mut ctx, on), on, "the switch really is armed");
+
+    // The switch is recorded but drives no sampling: the statistics reader answers `undefined`
+    // while armed (here) and while disabled (below).
+    assert_eq!(
+        stat(&mut ctx),
+        undefined,
+        "no per-scheduler wall time is measured even while the switch is armed"
+    );
+    let _ = call(&mut ctx, off);
+    assert_eq!(stat(&mut ctx), undefined);
+}
 /// The guarded call-site imports, and the **scope** of the refusal each one forces
 /// ([`callee_observes_its_call_site`]): a module importing `erlang:load_nif/2` keeps **every**
 /// function off the in-machine route (a local call inside the module reaches the loader and a
@@ -3483,6 +3590,147 @@ fn the_call_seam_is_idempotent_for_a_cached_observer_callee() {
             "consultation {consultation} of a non-observer callee must be admitted in-machine"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The cross-module call seam vs a BUILT-IN NIF library (contract A.7's `prim_*` family)
+// ---------------------------------------------------------------------------------------
+
+/// The non-built-in control for the exemption: the **same** `erlang:load_nif/2` import the
+/// built-in library carries, under a name no static NIF table resolves — so the module-wide
+/// refusal must still stand for it.
+const SEAM_NOT_BUILTIN_SRC: &str = "-module(not_builtin_nif).
+-export([init/1]).
+init(Path) -> erlang:load_nif(Path, #{}).
+";
+
+/// **A built-in NIF library is entered in-machine even though it imports `erlang:load_nif/2`.**
+///
+/// `prim_tty` is ERTS's *statically linked* NIF library: `erlang:load_nif/2` resolves it from
+/// ERTS's static NIF table (`is_static_nif_module`, `erts/emulator/beam/erl_nif.c`) instead of
+/// `dlopen`ing a shared object, so this runtime's `NifLoader::load_nif` answers the oracle's
+/// `ok` without a `dlopen` and **without registering an owning module** — no
+/// `current_module`-dependent identity exists for the module-wide guard to protect. Keeping the
+/// refusal would buy nothing and would route the library's Erlang wrappers (`load/0`, `init/1`,
+/// `writer/1`, `reader/1`, …) onto the synchronous non-pumping `call_bif` path, where `init/1`'s
+/// blocking `receive` folds into the typed `blocked()` gap.
+///
+/// Both directions are pinned so the exemption cannot silently widen:
+///
+/// * the **real system** `prim_tty` resolves to its own `init/1` export label — and its loaded
+///   IR is asserted to really carry the guard-arming `erlang:load_nif/2` import, so the case
+///   proves the *exemption* rather than a vanished import;
+/// * a **non-built-in** module with the identical import stays `Ok(None)`, keeping the
+///   synchronous route that sets `current_module` correctly (its `load_nif` really does register
+///   a library under the module identity).
+///
+/// The built-in half needs a system Erlang installation (a bare container skips loudly); the
+/// control half needs `erlc` to compile its fixture.
+#[test]
+fn the_call_seam_enters_a_built_in_nif_library_in_machine() {
+    let mut rt = runtime();
+
+    // A built-in NIF library's Erlang wrappers are entered in-machine rather than through the
+    // synchronous `call_bif` route. A bare container without an
+    // OTP installation skips **loudly**; once the system code path resolves, the module must be
+    // there — so a seam regression below still fails rather than skips.
+    if let Err(error) = rt.code_server.add_system_paths() {
+        skip_builtin_case(
+            "the_call_seam_enters_a_built_in_nif_library_in_machine",
+            &format!("no system code path ({error})"),
+        );
+        return;
+    }
+    assert!(
+        rt.find_module_file("prim_tty").is_some(),
+        "the system code path resolved but carries no `prim_tty.beam`"
+    );
+    // `RuntimeContext` owns a sink handle (and a destructor), so its borrow of the runtime ends
+    // with this block — the control half below re-borrows the same runtime.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        for consultation in 1..=2 {
+            assert!(
+                ctx.resolve_external_call("prim_tty", "init", 1)
+                    .expect("the seam reports a routing, never an error")
+                    .is_some(),
+                "consultation {consultation}: a built-in NIF library's Erlang wrapper is entered \
+                 in-machine — its `erlang:load_nif/2` registers nothing, so its call site cannot \
+                 be read"
+            );
+        }
+        let (module, label) = ctx
+            .resolve_external_call("prim_tty", "init", 1)
+            .expect("the seam reports a routing, never an error")
+            .expect("the built-in library is admitted");
+
+        // The exemption is what admitted it: the guard's own verdict on this very module is
+        // `LoadNif`, i.e. a refusal of **every** function — read straight off the loaded IR, so
+        // the case cannot pass because the import went missing.
+        assert_eq!(
+            call_site_reading_imports(&module),
+            CallSiteReadingImports::LoadNif,
+            "the real `prim_tty` imports `erlang:load_nif/2`, which the guard refuses module-wide"
+        );
+        let init = module
+            .atom_table
+            .lookup("init")
+            .expect("`init` is interned in the module's own table");
+        assert!(
+            callee_observes_its_call_site(&module, init, 1),
+            "the guard itself refuses `prim_tty:init/1` — only the built-in exemption admits it"
+        );
+        // The seam hands back the code server's own handle and the callee's own export label.
+        let cached = ctx
+            .runtime
+            .code_server()
+            .module_handle("prim_tty")
+            .expect("the seam's on-demand load cached the system module");
+        assert!(
+            Arc::ptr_eq(&module, &cached),
+            "the seam hands back the code server's own handle (the engine dedups contexts on it)"
+        );
+        assert_eq!(
+            Some(label),
+            module.export(init, 1),
+            "the resolved label is `prim_tty:init/1`'s own export entry"
+        );
+    }
+
+    // The control direction: the identical import under a name no static NIF table resolves
+    // keeps the module-wide refusal.
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "built-in NIF library exemption",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "builtin_nif_exemption",
+        &[("not_builtin_nif", SEAM_NOT_BUILTIN_SRC)],
+    );
+    rt.add_code_path(dir.path());
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        ctx.resolve_external_call("not_builtin_nif", "init", 1)
+            .expect("the seam reports a routing, never an error")
+            .is_none(),
+        "a non-built-in module importing `erlang:load_nif/2` keeps the module-wide refusal: \
+         its `load_nif` registers a library under the module identity, which an in-machine \
+         callee would run under the caller's"
+    );
+    let control = ctx
+        .runtime
+        .code_server()
+        .module_handle("not_builtin_nif")
+        .expect("the seam's on-demand load cached the control fixture");
+    assert_eq!(
+        call_site_reading_imports(&control),
+        CallSiteReadingImports::LoadNif,
+        "the control carries the very same guarded import as the built-in library"
+    );
 }
 
 // ---------------------------------------------------------------------------------------

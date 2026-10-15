@@ -57,6 +57,22 @@
 //! both sides. It is only emitted when the marginal is positive (otherwise a note
 //! records that the marginal is below timer resolution — never a fabricated number).
 //!
+//! Every case that produced a timing also emits the deterministic, contention-immune
+//! companion metric `case_<name>_calls = N` (mirroring `copy_bound`'s
+//! `case_<name>_ops`), so the loop count behind the marginal is **always in the
+//! report** — a `ns/call` figure can never be read without the `N` that produced it.
+//!
+//! # `ns_per_call` is `N`-dependent on the Rust runtime (read before comparing)
+//!
+//! **On `beam_rt` the per-call cost itself grows with `N`** (measured super-linear;
+//! see `RESULTS.md` §3.4), so `case_<name>_ns_per_call` is only a clean marginal at
+//! the declared `N` and is **only comparable across runs that used the SAME `N`**. The
+//! `sys` (system ERTS) side is ~flat over the same range. The per-runtime `N` values
+//! are unchanged since m10, so the m10↔m11 A/B was taken at **matched `N`** and is a
+//! valid comparison; a run that changes a case's `n_rust` is not. Each Rust row
+//! therefore carries an explicit note stating this, and every row carries the `N` it
+//! used in `case_<name>_calls`.
+//!
 //! # Honest reporting
 //!
 //! * Every runtime's stdout must equal `N * per_call` (the driver accumulates a value
@@ -67,6 +83,8 @@
 //!   ⇒ an honest `skipped(erlc-absent)` / `skipped(sources-missing)`.
 //! * `erlc` *failing* on the sources we did stage (the embedded driver, or a present
 //!   foreign source) ⇒ a real `failed(module-compile-failed)`, never a benign skip.
+//! * The Rust row records, in a note, that its `ns_per_call` figures are `N`-dependent
+//!   (only comparable at the same `N`) — the caveat is never hidden behind the number.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -418,6 +436,30 @@ fn per_call_ns(wall: &[f64], startup: &[f64], n: i64) -> Option<f64> {
     }
 }
 
+/// The deterministic, contention-immune companion metric for a timed case: the loop count
+/// `N` the [`per_call_ns`] marginal was derived from.
+///
+/// It is emitted for **every** case that produced a timing (mirroring `copy_bound`'s
+/// `case_<name>_ops`), so a per-call figure can never be read without the `N` behind it —
+/// which matters because the Rust per-call cost is itself `N`-dependent (see
+/// [`N_DEPENDENCE_NOTE`]).
+fn calls_metric(case: &Case, n: i64) -> Metric {
+    Metric::scalar(format!("case_{}_calls", case.name), "calls", n as f64)
+}
+
+/// The caveat recorded on a Rust `foreign` row: the per-call metric is `N`-dependent, so it
+/// is only comparable across runs that used the same `N`, and the m10↔m11 A/B was taken at
+/// matched `N`.
+///
+/// Recorded verbatim as a report note so the limitation is machine-visible rather than
+/// buried in prose: a `case_<name>_ns_per_call` value from this workload must never be
+/// quoted across runs with a different `N`.
+const N_DEPENDENCE_NOTE: &str = "caveat: on the Rust runtime this per-call metric is \
+     N-DEPENDENT (the measured per-call cost grows with N, super-linearly), so \
+     case_<name>_ns_per_call is only comparable across runs that used the SAME N; the m10 \
+     vs m11 (HEAD) A/B was run at matched N (the case table's n_rust is unchanged). See \
+     RESULTS.md 3.4.";
+
 /// Classifies a non-zero / killed run into a human note.
 fn classify_failure(kind: RuntimeKind, case: &Case, completed: &Completed) -> String {
     let stderr = completed.stderr.trim();
@@ -651,6 +693,9 @@ impl Workload for Foreign {
                         case.name
                     )),
                 }
+                // The deterministic companion: the loop count the marginal above was derived
+                // from, so the N behind every per-call figure is in the report.
+                result.metrics.push(calls_metric(case, outcome.n));
                 if let Some(value) = &outcome.observed {
                     observed_all.push(format!("{}={value}", case.name));
                 }
@@ -670,6 +715,12 @@ impl Workload for Foreign {
         result.peak_memory_bytes = overall_peak;
         if !observed_all.is_empty() {
             result.notes.push(format!("observed stdout: {}", observed_all.join(" ")));
+        }
+        // The N-dependence caveat belongs on the Rust row: the sys oracle's per-call cost is
+        // ~flat over the same N range, while `beam_rt`'s grows with N. Recorded only when the
+        // row actually produced timings, so a skipped/failed row is not annotated as measured.
+        if kind == RuntimeKind::Rust && ok_cases > 0 {
+            result.notes.push(N_DEPENDENCE_NOTE.to_string());
         }
         result.notes.push(
             "method: per-call cost = (mean wall at N iterations - mean wall at 0 iterations) / N; \
@@ -750,6 +801,28 @@ mod tests {
         assert_eq!(per_call_ns(&[1.0], &[0.0], 0), None);
     }
 
+    #[test]
+    fn every_case_has_a_deterministic_calls_companion_metric() {
+        // Each case's loop count must be visible in the report under `case_<name>_calls`,
+        // so a `ns_per_call` figure can never be read without the N that produced it.
+        for case in CASES {
+            let m = calls_metric(case, 12_345);
+            assert_eq!(m.name, format!("case_{}_calls", case.name));
+            assert_eq!(m.unit, "calls");
+            assert_eq!(m.value, Some(12_345.0));
+            assert!(m.is_scalar(), "the loop count is a scalar, not a summary");
+            m.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn n_dependence_note_states_the_caveat_and_matched_n() {
+        // The note must (a) name the N-dependence, (b) say the metric is only comparable at
+        // the same N, and (c) record that the m10↔m11 A/B used matched N.
+        assert!(N_DEPENDENCE_NOTE.contains("N-DEPENDENT"), "{N_DEPENDENCE_NOTE}");
+        assert!(N_DEPENDENCE_NOTE.contains("SAME N"), "{N_DEPENDENCE_NOTE}");
+        assert!(N_DEPENDENCE_NOTE.contains("matched N"), "{N_DEPENDENCE_NOTE}");
+    }
     #[test]
     fn stage_in_a_missing_dir_is_a_compile_failure_flag_not_a_skip() {
         // A non-existent scratch dir makes the driver write fail — a real failure of code

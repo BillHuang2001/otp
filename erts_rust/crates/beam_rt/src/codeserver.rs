@@ -81,6 +81,7 @@ use beam_common::Result;
 use beam_loader::{chunk, container, decode, lower, Atom, Module};
 use beam_term::AtomTable;
 
+use crate::context::PendingInterner;
 use crate::error;
 
 /// The **code server**: the runtime's one shared atom table, its module cache and its
@@ -91,10 +92,13 @@ pub struct CodeServer {
     /// Shared through an [`Rc`] so a BIF call can hand a `BifContext` a table handle that
     /// does **not** borrow the runtime: [`CodeServer::atoms_handle`] clones the `Rc` and
     /// the context borrows the clone's contents, leaving the runtime free for the
-    /// fun-caller bridge (`../beam_rt/src/context.rs`). Interning goes through
-    /// [`CodeServer::atoms_mut`], which is copy-on-write ([`Rc::make_mut`]): while a
-    /// caller still holds a handle (a BIF in flight), a write clones the table instead of
-    /// aliasing it, and the clone keeps every index identical (interning is append-only).
+    /// fun-caller bridge (`../beam_rt/src/context.rs`). A registered BIF's/NIF's newly
+    /// interned names are committed through [`CodeServer::intern_pending`] (append-only,
+    /// and a copy-on-write clone only while another handle really owns one); the runtime's
+    /// own seeding/interning goes through [`CodeServer::atoms_mut`], which is copy-on-write
+    /// ([`Rc::make_mut`]): while a caller still holds a handle, a write clones the table
+    /// instead of aliasing it, and the clone keeps every index identical (interning is
+    /// append-only).
     atoms: Rc<AtomTable>,
     /// Loaded modules, by name — `Arc` so a caller can hold one while the server keeps
     /// loading others (`Module` is `!Send`/`!Sync`, so it is never shared across threads).
@@ -290,6 +294,11 @@ impl CodeServer {
     ///
     /// Copy-on-write: while another holder still has a handle (a BIF in flight), the
     /// write clones the table rather than aliasing it (the clone preserves every index).
+    ///
+    /// A **per-call commit** of newly interned names goes through
+    /// [`CodeServer::intern_pending`] instead: it is the same append-only write, but it takes
+    /// the `Rc::get_mut` fast path so an interning call appends in place whenever this server
+    /// is the table's only owner (see its docs).
     pub fn atoms_mut(&mut self) -> &mut AtomTable {
         Rc::make_mut(&mut self.atoms)
     }
@@ -299,9 +308,49 @@ impl CodeServer {
     /// The handle does not borrow the server, so a caller can keep a `BifContext` over
     /// the table's contents (through the handle's `Deref`) while the runtime itself stays
     /// mutably borrowed by the fun-caller bridge. Interning still goes through
-    /// [`CodeServer::atoms_mut`].
+    /// [`CodeServer::intern_pending`] (a BIF's own names) or [`CodeServer::atoms_mut`] (the
+    /// runtime's own seeding).
     pub(crate) fn atoms_handle(&self) -> Rc<AtomTable> {
         Rc::clone(&self.atoms)
+    }
+
+    /// Appends the names a call recorded on its [`PendingInterner`], **in intern order** —
+    /// the append-only commit route for a BIF/NIF that interned a *new* atom.
+    ///
+    /// This is the write the registered-BIF and NIF call paths take once the BIF/host has
+    /// returned and released its borrow of the table: the interner predicted each name's
+    /// index as `base + <names already recorded>` (interning is append-only and the runtime
+    /// is single-threaded), so appending the names in that same order lands every one at
+    /// exactly the index the BIF/NIF already built into its terms.
+    ///
+    /// # Why the route exists: no clone for the interning call
+    ///
+    /// While this code server is the table's **only** owner it appends in place through
+    /// [`Rc::get_mut`] — no copy. Only when a genuinely outstanding handle still owns a clone
+    /// does it fall back to [`Rc::make_mut`]'s copy-on-write, which is exactly
+    /// [`CodeServer::atoms_mut`]'s behaviour: **correct, merely unoptimized**. It can only
+    /// ever trigger for such an owner — a loaded NIF library's stored host, an open driver
+    /// port, or an enclosing registered call's handle while a nested call commits — and the
+    /// copy preserves every index, so no external observer's view changes.
+    ///
+    /// A **transient** handle must never reach here: a call's own `atoms` binding and the
+    /// per-call `RuntimeMemory` snapshot pin the table at a strong count of 2 or more, so a
+    /// commit taken while either is alive would deep-clone the whole `AtomTable` (thousands
+    /// of atoms) on *every* interning call. `context::calls` therefore drops both before it
+    /// commits, which is what makes the fast path really apply.
+    ///
+    /// An empty interner short-circuits: a call that interned nothing must not borrow the
+    /// table at all (the callers guard on [`PendingInterner::is_empty`] for the same reason,
+    /// and every non-interning call would otherwise pay the fallback clone).
+    pub(crate) fn intern_pending(&mut self, interner: &PendingInterner) {
+        if interner.is_empty() {
+            return;
+        }
+        let table = match Rc::get_mut(&mut self.atoms) {
+            Some(table) => table,
+            None => Rc::make_mut(&mut self.atoms),
+        };
+        interner.commit(table);
     }
 
     /// The code path, in search order.

@@ -63,7 +63,7 @@
 
 use beam_common::Result;
 use beam_loader::{Instr, Module, Operand, TestKind, NO_FAIL};
-use beam_term::{cmp, cmp_arith, AtomTable, Eterm};
+use beam_term::{cmp, cmp_arith, Eterm};
 
 use crate::context::ExecutionContext;
 use crate::machine::Machine;
@@ -163,7 +163,8 @@ pub(crate) extern "C" fn jit_test(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -
 /// The body is `Machine::eval_test`'s, for the six comparison kinds only: read the two
 /// arguments in order through the shared [`read_operand`] (an argument read may
 /// materialize a non-small `Integer`/`Character` as an exact bignum) and apply
-/// `beam_term`'s canonical comparison against the running module's atom table.
+/// `beam_term`'s canonical comparison against the host's atom namespace
+/// ([`ExecutionContext::atoms`], the runtime's live shared table).
 fn evaluate_comparison(
     machine: &Machine,
     module: &Module,
@@ -178,20 +179,28 @@ fn evaluate_comparison(
     if *fail == NO_FAIL || args.len() != 2 {
         return None;
     }
-    let atoms: &AtomTable = &module.atom_table;
-    Some(match kind {
-        TestKind::IsEqExact => read_pair(machine, ctx, args).map(|(a, b)| cmp(a, b, atoms).is_eq()),
+    let result = match kind {
+        TestKind::IsEqExact => {
+            read_pair(machine, ctx, args).map(|(a, b)| cmp(a, b, ctx.atoms(module)).is_eq())
+        }
         TestKind::IsNeExact => {
-            read_pair(machine, ctx, args).map(|(a, b)| !cmp(a, b, atoms).is_eq())
+            read_pair(machine, ctx, args).map(|(a, b)| !cmp(a, b, ctx.atoms(module)).is_eq())
         }
-        TestKind::IsEq => read_pair(machine, ctx, args).map(|(a, b)| cmp_arith(a, b, atoms).is_eq()),
+        TestKind::IsEq => {
+            read_pair(machine, ctx, args).map(|(a, b)| cmp_arith(a, b, ctx.atoms(module)).is_eq())
+        }
         TestKind::IsNe => {
-            read_pair(machine, ctx, args).map(|(a, b)| !cmp_arith(a, b, atoms).is_eq())
+            read_pair(machine, ctx, args).map(|(a, b)| !cmp_arith(a, b, ctx.atoms(module)).is_eq())
         }
-        TestKind::IsLt => read_pair(machine, ctx, args).map(|(a, b)| cmp_arith(a, b, atoms).is_lt()),
-        TestKind::IsGe => read_pair(machine, ctx, args).map(|(a, b)| cmp_arith(a, b, atoms).is_ge()),
+        TestKind::IsLt => {
+            read_pair(machine, ctx, args).map(|(a, b)| cmp_arith(a, b, ctx.atoms(module)).is_lt())
+        }
+        TestKind::IsGe => {
+            read_pair(machine, ctx, args).map(|(a, b)| cmp_arith(a, b, ctx.atoms(module)).is_ge())
+        }
         _ => return None,
-    })
+    };
+    Some(result)
 }
 
 /// Read both operands of a comparison `test`, in order, through the shared

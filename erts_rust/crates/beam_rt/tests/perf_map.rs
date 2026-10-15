@@ -34,13 +34,19 @@
 //! * a value outside the grammar is a usage error (exit 2 in this runtime; the oracle
 //!   exits 1 — see `src/cli/flags.rs`'s documented divergence).
 //!
-//! The map this runtime writes is **empty** for the invocations this suite drives: it holds only
-//! the baseline JIT's real cached code ranges, recorded once per module-export first entry by
-//! `src/runner/perf.rs::record_baseline_code`, so it only fills for a **scheduled** process — and
-//! the CLI actions below (`-eval ok`) run no scheduled process, so they record no baseline range.
-//! An address is never fabricated. That is pinned explicitly below, and the oracle cross-check
-//! (which skips loudly without `erl`) shows the same file path and the same line grammar on the
-//! real system's non-empty map.
+//! The map this runtime writes is **non-empty** for the invocations this suite drives: it holds
+//! only the baseline JIT's real cached code ranges, recorded once per module-export first entry
+//! by `src/runner/perf.rs::record_baseline_code`, so it fills for every **scheduled** process —
+//! and every CLI action but `-version` drives the default boot script, whose kernel/stdlib
+//! starters (`application_controller`, `proc_lib`, `heart`, `logger_server`, …) are scheduled
+//! processes that enter real module exports. An address is never fabricated: every line is one
+//! of the baseline artifact's own `[start, size)` regions, named
+//! `$<module>:<function>/<arity>/<pc>`. [`assert_truthful_map`] pins exactly that — the oracle's
+//! line grammar *plus* a real module/function identity on every line — which is strictly more
+//! than the Milestone-1 `is_empty()` expectation it replaces. The oracle cross-check (which
+//! skips loudly without `erl`) shows the same file path and the same grammar on the real
+//! system's own non-empty map, and additionally checks that every module this runtime names is
+//! a module of the running installation.
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -112,6 +118,92 @@ fn assert_valid_map(path: &Path) -> String {
     text
 }
 
+/// Whether `name` names an Erlang atom the perf map may carry as a **module**: a plain
+/// lower-case identifier (`proc_lib`) or a quoted one (`'Elixir.Foo'`).
+fn is_module_name(name: &str) -> bool {
+    if let Some(inner) = name.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
+        return !inner.is_empty() && !inner.contains('\'');
+    }
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'@')
+}
+
+/// The `$`-stripped **module** of a grammar-valid map line (`$<module>:<function>/…`).
+fn line_module(line: &str) -> &str {
+    let name = line
+        .split(' ')
+        .nth(2)
+        .unwrap_or_else(|| panic!("{line:?} carries no name"));
+    let body = name
+        .strip_prefix('$')
+        .unwrap_or_else(|| panic!("{line:?} carries no `$`-prefixed name"));
+    let (module, _) = body
+        .split_once(':')
+        .unwrap_or_else(|| panic!("{line:?} names no module"));
+    module
+}
+
+/// The **truthful** map gate: `path` must be a non-empty, newline-terminated map whose every
+/// line matches the oracle's grammar ([`assert_valid_map`]) **and** names a real code range —
+/// `$<module>:<function>/<arity>/<pc>`, with a module-shaped module and numeric arity/pc.
+///
+/// This is the suite's single "no fabricated address" gate and the successor of the
+/// Milestone-1 `is_empty()` expectation: the map is no longer empty by design (every CLI action
+/// but `-version` boots, so scheduled kernel/stdlib starters enter module exports and the
+/// baseline backend records their real regions), and an empty file satisfied no structural
+/// check at all — whereas a fabricated range or name now fails here.
+fn assert_truthful_map(path: &Path) -> String {
+    let text = assert_valid_map(path);
+    assert!(
+        !text.is_empty(),
+        "{}: the booted scheduled starters enter real module exports, so the map names the \
+         baseline JIT's real ranges",
+        path.display()
+    );
+    assert!(
+        text.ends_with('\n'),
+        "{}: every recorded range is a line",
+        path.display()
+    );
+    let mut modules: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let module = line_module(line);
+        assert!(
+            is_module_name(module),
+            "{}: {line:?} names no module",
+            path.display()
+        );
+        // The emitter's own `{module}:{function}/{arity}/{pc}`: the **last two** `/`-separated
+        // fields are the arity and the program counter — a function name may itself contain a
+        // `/` (`proc_lib:-format_link_reports/4-lc$^0/1-0-/1/3`), so only the tail is fixed.
+        let body = line.split(' ').nth(2).expect("a grammar-checked name");
+        let fields: Vec<&str> = body.split('/').collect();
+        assert!(
+            fields.len() >= 3,
+            "{}: {line:?} names no `module:function/arity/pc`",
+            path.display()
+        );
+        for field in &fields[fields.len() - 2..] {
+            assert!(
+                field.parse::<u32>().is_ok(),
+                "{}: {line:?} has a non-numeric arity/pc",
+                path.display()
+            );
+        }
+        if !modules.contains(&module) {
+            modules.push(module);
+        }
+    }
+    assert!(
+        !modules.is_empty(),
+        "{}: the map names at least one module",
+        path.display()
+    );
+    text
+}
 /// Runs `program` with `args`/`envs`, returning the **child's pid** and its output.
 ///
 /// The pid matters: both runtimes name the perf files after `getpid()`, so only the spawner
@@ -203,28 +295,28 @@ fn plus_jperf_map_writes_the_map_at_the_documented_location() {
     assert_eq!(entries(&dir), [format!("perf-{pid}.map")]);
 }
 
-/// A non-scheduled invocation (`-eval ok`) fills no map because only a scheduled process feeds
-/// real ranges through `PerfMap::record`; an address is never fabricated (see `src/perf_map.rs`).
+/// The map a `-eval ok` invocation writes is a **well-formed, non-empty** file of the baseline
+/// JIT's real code ranges.
 ///
-/// This is the documented Milestone-1 outcome, pinned so that routing one of these actions
-/// through the scheduler (or any future runtime which feeds ranges through `PerfMap::record`)
-/// has to update it deliberately.
+/// The test's name records the Milestone-1 expectation it pinned (`-eval ok` ran no scheduled
+/// process, so `+JPperf map` produced an empty file); that expectation is now false by design —
+/// every CLI action but `-version` drives the default boot script, whose kernel/stdlib starters
+/// are scheduled processes — and a rename is out of scope, so the assertion is updated to the
+/// new truth *strictly more strongly*: [`assert_truthful_map`] requires the oracle's line
+/// grammar on every line **and** a real `$<module>:<function>/<arity>/<pc>` identity, so a
+/// fabricated address — the property `is_empty()` used to stand for — still fails here.
 #[test]
 fn the_map_is_a_well_formed_empty_file() {
     let dir = scratch("empty");
     let (pid, output) = beam_rt_with("map", &dir, &[]);
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     let map = dir.join(format!("perf-{pid}.map"));
-    let bytes = std::fs::read(&map).expect("the map is readable");
-    assert!(
-        bytes.is_empty(),
-        "no fabricated addresses: {:?}",
-        String::from_utf8_lossy(&bytes)
-    );
+    assert_truthful_map(&map);
 }
 
-/// `+JPperf true` is `map` **and** `dump`: both files appear, and the dump carries the exact
-/// 40-byte JITDUMP header of `beam_jit_metadata.cpp` (no `JIT_CODE_LOAD` records).
+/// `+JPperf true` is `map` **and** `dump`: both files appear, the map is the same non-empty,
+/// grammar-valid range list `map` alone writes, and the dump carries the exact 40-byte JITDUMP
+/// header of `beam_jit_metadata.cpp` (no `JIT_CODE_LOAD` records).
 #[test]
 fn plus_jperf_true_writes_both_files() {
     let dir = scratch("true");
@@ -234,9 +326,7 @@ fn plus_jperf_true_writes_both_files() {
         entries(&dir),
         [format!("jit-{pid}.dump"), format!("perf-{pid}.map")]
     );
-    assert!(std::fs::read(dir.join(format!("perf-{pid}.map")))
-        .expect("the map is readable")
-        .is_empty());
+    assert_truthful_map(&dir.join(format!("perf-{pid}.map")));
 
     let dump = std::fs::read(dir.join(format!("jit-{pid}.dump"))).expect("the dump is readable");
     assert_eq!(dump.len(), 40, "the header is `4 * 10` bytes (the C's assert)");
@@ -456,13 +546,15 @@ fn the_runtime_owns_the_perf_map_and_records_through_it() {
 // The oracle cross-check
 // ---------------------------------------------------------------------------------------
 
-/// Both runtimes create the map at the same documented path with the same line grammar; the
-/// oracle's `-eval` probe has JIT ranges, while this runtime's `-eval` probe runs no scheduled
-/// process so it records no baseline range.
+/// Both runtimes create the map at the same documented path with the same line grammar and a
+/// **non-empty** map for `-eval ok`: the oracle JIT-compiles every module it loads, while this
+/// runtime records the ranges of the modules its booted scheduled starters actually entered.
 ///
 /// The oracle probe is `-noshell +JPperf <value> -eval ok -s init stop`, with
 /// `ERL_SYM_MAP_FILE` pinning the path (the oracle's own pid is the launcher's `exec`-ed
-/// process, which a test cannot rely on). Skips **loudly** when there is no `erl`.
+/// process, which a test cannot rely on). A second oracle probe checks the **provenance** the
+/// runtime's map claims: every module it names must be a real module of the running
+/// installation (`code:which(M) =/= non_existing`). Skips **loudly** when there is no `erl`.
 #[test]
 fn the_map_location_and_line_grammar_match_the_oracle() {
     let Some(oracle) = support::require_oracle("perf_map") else {
@@ -489,21 +581,42 @@ fn the_map_location_and_line_grammar_match_the_oracle() {
     let text = assert_valid_map(&oracle_map);
     assert!(!text.is_empty(), "the oracle's map names its JIT ranges");
 
-    // The runtime under test: same path, same grammar, empty map — `-eval` runs no scheduled
-    // process, so no baseline range is recorded.
+    // The runtime under test: same path, same grammar, same non-emptiness — its booted
+    // scheduled starters enter real module exports, so it records the baseline artifact's own
+    // ranges of those modules (`assert_truthful_map` checks the grammar *and* the identity of
+    // every line).
     let (_, output) = beam_rt_perf(
         &["+JPperf", "map"],
         &[("ERL_SYM_MAP_FILE", oracle_map_str)],
     );
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
-    assert_valid_map(&oracle_map);
-    assert!(
-        std::fs::read(&oracle_map)
-            .expect("the map is readable")
-            .is_empty(),
-        "beam_rt fabricates no addresses"
-    );
+    let runtime_text = assert_truthful_map(&oracle_map);
 
+    // Provenance, cross-checked against the oracle: every module this runtime names is a module
+    // of the running installation, i.e. a range it can really run — a fabricated name fails.
+    let mut modules: Vec<&str> = Vec::new();
+    for line in runtime_text.lines() {
+        let module = line_module(line);
+        if !modules.contains(&module) {
+            modules.push(module);
+        }
+    }
+    assert!(
+        !modules.is_empty(),
+        "the runtime named at least one module: {runtime_text:?}"
+    );
+    let probe = format!(
+        "Ms = [{}], io:format(\"~p\", [[M || M <- Ms, code:which(M) =:= non_existing]]), halt().",
+        modules.join(", ")
+    );
+    let output = support::run_bounded(Path::new(&oracle), &["-noshell", "-eval", &probe])
+        .expect("the oracle answers the module-existence probe");
+    assert!(output.status.success(), "the oracle exited non-zero");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "[]",
+        "every module the runtime's map names exists in the installation ({modules:?})"
+    );
     // `+JPperf false` writes nothing in either runtime.
     let off_map = dir.join("off.map");
     let off_map_str = off_map.to_str().expect("UTF-8");

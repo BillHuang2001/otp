@@ -113,6 +113,20 @@ impl Fixture {
         let plain = self.call("zlib", "unzip", &[term])?;
         Ok(self.bytes_of(plain))
     }
+
+    /// `zlib:gzip(Data)` through the registry.
+    fn gzip(&mut self, data: &[u8]) -> Vec<u8> {
+        let term = self.binary(data);
+        let packed = self.ok("zlib", "gzip", &[term]);
+        self.bytes_of(packed)
+    }
+
+    /// `zlib:gunzip(Data)` through the registry.
+    fn gunzip(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        let term = self.binary(data);
+        let plain = self.call("zlib", "gunzip", &[term])?;
+        Ok(self.bytes_of(plain))
+    }
 }
 
 /// A payload that repeats but is not constant, so the compressor can neither store it
@@ -286,6 +300,123 @@ fn unzip_reports_data_error_wherever_the_inflater_cannot_finish() {
     assert_data_error(fx.unzip(&[203, 72, 205, 201]), "a truncated fixed block");
 }
 
+// ---------------------------------------------------------------------------
+// RFC 1952 (`zlib:gzip/1` / `zlib:gunzip/1`)
+// ---------------------------------------------------------------------------
+
+/// `gzip/1`'s two byte-for-byte oracle goldens, plus the integer-list call shape.
+#[test]
+fn gzip_emits_the_oracle_goldens_byte_for_byte() {
+    let mut fx = Fixture::new();
+    // `zlib:gzip(<<"hello">>)` and `zlib:gzip(<<>>)` under OTP 29.1.1 / erts-17.1: the
+    // fixed 10-byte header (`1f 8b 08 00` — deflate, no flags, no MTIME — then `XFL` 0
+    // for the default level and `OS` 3 for Unix), the raw DEFLATE payload `zip/1` also
+    // emits for this input, then the little-endian CRC-32 and ISIZE of the original.
+    assert_eq!(
+        fx.gzip(b"hello"),
+        vec![
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 7, 0, 134, 166, 16, 54, 5, 0,
+            0, 0
+        ]
+    );
+    assert_eq!(
+        fx.gzip(b""),
+        vec![31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+
+    // `zlib:gzip([1,2,3])` — a plain integer list is iodata, as for `zip/1`.
+    let list = {
+        let items = [make_small(1), make_small(2), make_small(3)];
+        let mut ctx = BifContext::new(&mut fx.heap, &fx.atoms, ProcessId::new(1, 0));
+        ctx.list(&items).expect("the list fits")
+    };
+    let gzipped = fx.ok("zlib", "gzip", &[list]);
+    assert_eq!(
+        fx.bytes_of(gzipped),
+        vec![
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 99, 100, 98, 6, 0, 29, 128, 188, 85, 3, 0, 0, 0
+        ]
+    );
+}
+
+#[test]
+fn gzip_and_gunzip_round_trip_and_gunzip_concatenated_members() {
+    let mut fx = Fixture::new();
+
+    for size in [0usize, 1, 13, 1000, 100_000] {
+        let data = payload(size);
+        let member = fx.gzip(&data);
+        assert_eq!(fx.gunzip(&member).expect("round trip"), data, "size {size}");
+    }
+
+    // Concatenated members are one call's output (the oracle resets at a member
+    // boundary: `zlib:gunzip(<<A/binary, B/binary>>)` is the two payloads joined).
+    let mut both = fx.gzip(b"hello");
+    both.extend_from_slice(&fx.gzip(b"world"));
+    assert_eq!(fx.gunzip(&both).expect("two members"), b"helloworld");
+
+    // Anything left over that is not another complete member is `data_error`, and so
+    // is the empty input (no member is ever completed) — the oracle's own matrix.
+    let mut junk = fx.gzip(b"hello");
+    junk.extend_from_slice(&[99, 99]);
+    assert_data_error(fx.gunzip(&junk), "trailing junk after a member");
+    assert_data_error(fx.gunzip(b""), "the empty input");
+}
+
+#[test]
+fn gunzip_reports_the_oracle_failure_matrix() {
+    let mut fx = Fixture::new();
+
+    let good = fx.gzip(b"hello");
+    let length = good.len();
+
+    // Every one of these is `error:data_error` in the oracle (OTP 29.1.1 / erts-17.1).
+    let mut bad_magic = good.clone();
+    bad_magic[0] = 0;
+    assert_data_error(fx.gunzip(&bad_magic), "a bad magic byte");
+
+    let mut bad_cm = good.clone();
+    bad_cm[2] = 7;
+    assert_data_error(fx.gunzip(&bad_cm), "a bad compression method");
+
+    let mut bad_crc = good.clone();
+    bad_crc[length - 8] ^= 0xff;
+    assert_data_error(fx.gunzip(&bad_crc), "a corrupted CRC-32");
+
+    let mut bad_isize = good.clone();
+    bad_isize[length - 1] ^= 0xff;
+    assert_data_error(fx.gunzip(&bad_isize), "a corrupted ISIZE");
+
+    assert_data_error(fx.gunzip(&good[..length - 1]), "a truncated trailer");
+    assert_data_error(fx.gunzip(&good[..10]), "the bare header");
+
+    // A non-iodata argument is the pair's one `badarg` (the oracle's
+    // `erlang:iolist_to_iovec/1`).
+    let hello = {
+        let index = fx.atoms.lookup("hello").expect("the fixture seeds `hello`");
+        beam_term::make_atom(index)
+    };
+    let improper = {
+        let tail = make_small(3);
+        let mut ctx = BifContext::new(&mut fx.heap, &fx.atoms, ProcessId::new(1, 0));
+        let inner = ctx.cons(make_small(2), tail).expect("fits");
+        ctx.cons(make_small(1), inner).expect("fits")
+    };
+    for (what, bad) in [
+        ("an integer", make_small(42)),
+        ("an atom", hello),
+        ("an improper list", improper),
+    ] {
+        assert!(
+            matches!(fx.call("zlib", "gzip", &[bad]), Err(BeamError::BadArg)),
+            "gzip/1 of {what} must be badarg"
+        );
+        assert!(
+            matches!(fx.call("zlib", "gunzip", &[bad]), Err(BeamError::BadArg)),
+            "gunzip/1 of {what} must be badarg"
+        );
+    }
+}
 // ---------------------------------------------------------------------------
 // Live oracle cross-check
 // ---------------------------------------------------------------------------
@@ -464,4 +595,185 @@ fn unzip_cross_checks_the_live_oracle() {
         2,
         "the oracle's >1 KiB stream must start with a dynamic block"
     );
+}
+
+/// `<<bytes>>` as the Erlang source of a binary literal.
+fn binary_literal(bytes: &[u8]) -> String {
+    let items: Vec<String> = bytes.iter().map(|byte| byte.to_string()).collect();
+    format!("<<{}>>", items.join(","))
+}
+
+/// The observable class of this crate's `gunzip/1` for `data`: `"ok"`, or the raised
+/// reason atom (`"data_error"`, `"badarg"`).
+fn our_gunzip_class(fx: &mut Fixture, data: &[u8]) -> String {
+    match fx.gunzip(data) {
+        Ok(_) => "ok".to_string(),
+        Err(BeamError::Raise(raise)) => raise
+            .reason
+            .as_atom()
+            .unwrap_or("<non-atom reason>")
+            .to_string(),
+        Err(other) => panic!("gunzip of {data:?} raised the non-term class {other:?}"),
+    }
+}
+
+/// Cross-checks `zlib:gzip/1`/`zlib:gunzip/1` against the system oracle in **both**
+/// directions, and the failure-class matrix case by case.
+///
+/// It is **fail-loud**: with no usable `erl` it prints a loud banner and returns (it is
+/// not a pass then), and every step that runs the oracle panics if the oracle errors.
+#[test]
+fn gzip_and_gunzip_cross_check_the_live_oracle() {
+    let Some(oracle) = resolve_oracle() else {
+        eprintln!();
+        eprintln!("=========== beam_bifs zlib gzip: live oracle SKIPPED ===========");
+        eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or not");
+        eprintln!("executable, and no `erl` on $PATH).");
+        eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+        eprintln!("=================================================================");
+        eprintln!();
+        return;
+    };
+
+    let payloads = oracle_payloads();
+
+    // Direction 1: the oracle's own `zlib:gzip/1` members, this crate's `gunzip/1`.
+    let eval = "Ps = [<<\"hello\">>, \
+                list_to_binary(lists:seq(1,100)), \
+                list_to_binary([integer_to_list(I) || I <- lists:seq(1,1000)])], \
+                [io:format(\"~w~n\", [binary_to_list(zlib:gzip(P))]) || P <- Ps], \
+                halt().";
+    let stdout = run_erl(&oracle, &eval);
+    let members = parse_byte_lists(&stdout);
+    assert_eq!(
+        members.len(),
+        payloads.len(),
+        "the oracle printed {} members for {} payloads:\n{stdout}",
+        members.len(),
+        payloads.len()
+    );
+
+    let mut fx = Fixture::new();
+    for (index, (member, data)) in members.iter().zip(&payloads).enumerate() {
+        assert_eq!(
+            &member[..10],
+            &[31, 139, 8, 0, 0, 0, 0, 0, 0, 3],
+            "the oracle's member {index} header"
+        );
+        assert_eq!(
+            fx.gunzip(member)
+                .unwrap_or_else(|e| panic!("gunzip of the oracle's member {index}: {e:?}")),
+            *data,
+            "the oracle's member {index} must inflate to its payload"
+        );
+    }
+
+    // Direction 2: this crate's `gzip/1`, gunzipped by the oracle — the interoperability
+    // the gzip framing exists for. Byte identity of the deflate payload is *not*
+    // asserted (miniz_oxide differs); the oracle's own answer is.
+    let mut ours = Vec::new();
+    for (index, data) in payloads.iter().enumerate() {
+        let member = fx.gzip(data);
+        // The framing is byte-identical to the oracle's, so at least the header and the
+        // trailer's structure can be pinned here as well.
+        assert_eq!(&member[..10], &[31, 139, 8, 0, 0, 0, 0, 0, 0, 3], "header {index}");
+        assert_eq!(
+            u32::from_le_bytes(member[member.len() - 4..].try_into().expect("four bytes")),
+            data.len() as u32,
+            "ISIZE {index}"
+        );
+        ours.push(member);
+    }
+    let mut eval = String::new();
+    for member in &ours {
+        eval.push_str(&format!(
+            "io:format(\"~w~n\", [binary_to_list(zlib:gunzip({}))]),",
+            binary_literal(member)
+        ));
+    }
+    eval.push_str("halt().");
+    let stdout = run_erl(&oracle, &eval);
+    assert_eq!(
+        parse_byte_lists(&stdout),
+        payloads,
+        "the oracle must gunzip this crate's members back to their payloads"
+    );
+
+    // Direction 3: the failure-class matrix, case by case, against the live oracle.
+    let good = ours[0].clone();
+    let length = good.len();
+    let mut bad_magic = good.clone();
+    bad_magic[0] = 0;
+    let mut bad_magic2 = good.clone();
+    bad_magic2[1] = 0;
+    let mut bad_cm = good.clone();
+    bad_cm[2] = 7;
+    let mut reserved = good.clone();
+    reserved[3] = 0x20;
+    let mut bad_crc = good.clone();
+    bad_crc[length - 8] ^= 0xff;
+    let mut bad_isize = good.clone();
+    bad_isize[length - 1] ^= 0xff;
+    let mut junk = good.clone();
+    junk.extend_from_slice(&[99, 99]);
+    let mut lone_magic = good.clone();
+    lone_magic.push(31);
+    let mut bare_header = good.clone();
+    bare_header.extend_from_slice(&[31, 139, 8, 0, 0, 0, 0, 0, 0, 3]);
+    let mut concatenated = good.clone();
+    concatenated.extend_from_slice(&ours[1]);
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("a valid member", good.clone()),
+        ("concatenated members", concatenated),
+        ("the empty input", Vec::new()),
+        ("a bad ID1", bad_magic),
+        ("a bad ID2", bad_magic2),
+        ("a bad CM", bad_cm),
+        ("a reserved FLG bit", reserved),
+        ("a corrupted CRC-32", bad_crc),
+        ("a corrupted ISIZE", bad_isize),
+        ("trailing junk", junk),
+        ("a lone magic byte", lone_magic),
+        ("a bare trailing header", bare_header),
+        ("truncated inside the trailer", good[..length - 1].to_vec()),
+        ("the bare header", good[..10].to_vec()),
+    ];
+
+    // One list comprehension, not one `io:format(...)` per case: the oracle's `-eval`
+    // parser exits 1 **silently** when a second `try … catch error:R -> R end` in the
+    // same string re-binds the catch variable `R` (the first binding leaks out of the
+    // `try`), so the same source text cannot be repeated per case.
+    let mut eval = String::from("Ps = [");
+    for (index, (_, input)) in cases.iter().enumerate() {
+        if index > 0 {
+            eval.push(',');
+        }
+        eval.push_str(&binary_literal(input));
+    }
+    eval.push_str(
+        "], [io:format(\"~p~n\", [try zlib:gunzip(P) of _ -> ok \
+         catch error:R -> R end]) || P <- Ps], halt().",
+    );
+    let stdout = run_erl(&oracle, &eval);
+    let oracle_classes: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        oracle_classes.len(),
+        cases.len(),
+        "the oracle printed {} classifications for {} cases:\n{stdout}",
+        oracle_classes.len(),
+        cases.len()
+    );
+
+    for ((what, input), oracle_class) in cases.iter().zip(&oracle_classes) {
+        assert_eq!(
+            &our_gunzip_class(&mut fx, input),
+            oracle_class,
+            "{what}: this crate must report the oracle's class"
+        );
+    }
 }

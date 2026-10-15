@@ -301,7 +301,10 @@ fn run_scheduled(fixtures: &Fixtures, module: &str, function: &str) -> Run {
     let spec = format!("{module}:{function}/0");
     run_bounded(
         Path::new(BINARY),
-        &["-pa", fixtures.dir_str(), "run", beam, &spec],
+        // `-noshell`: the `run` action is banner-free by construction (it records the
+        // `noshell` init argument, so the booted kernel prints no OTP slogan); it is kept to
+        // mirror the oracle probe.
+        &["-noshell", "-pa", fixtures.dir_str(), "run", beam, &spec],
     )
 }
 
@@ -311,7 +314,9 @@ fn run_eval_route(fixtures: &Fixtures, module: &str, function: &str) -> Run {
     let expr = format!("X = {module}:{function}(), io:format(\"~w~n\",[X]).");
     run_bounded(
         Path::new(BINARY),
-        &["-pa", fixtures.dir_str(), "-eval", &expr],
+        // `-noshell`: this route drives the boot script too, so suppress the banner to keep
+        // stdout exactly the `io:format` line the oracle prints.
+        &["-noshell", "-pa", fixtures.dir_str(), "-eval", &expr],
     )
 }
 
