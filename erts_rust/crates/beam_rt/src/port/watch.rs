@@ -71,10 +71,28 @@
 //! `beam_io::signal`'s coalescing policy). The drain is therefore **unconditional** at each
 //! poll step rather than keyed to the readiness event: a signal delivered while the runtime was
 //! not polling its own descriptor is still reported, exactly as ERTS's bitmask reports it.
+//!
+//! # An armed-but-idle watch is not pending work
+//!
+//! The self-pipe exists so the **pipe byte** answers one question — *has anything been caught?*
+//! — while the bitmask answers *what*: `beam_io`'s trampoline is lock-free and async-signal-safe
+//! and so may only write the ready-made byte, and [`SignalWatch::drain`] clears both the pipe and
+//! the bitmask. That makes readiness a sound, **non-destructive** probe of "a signal was caught
+//! and no drain has consumed it yet" ([`SignalWatch::has_pending_signal`]) — the question the
+//! scheduler's quiescence test asks.
+//!
+//! The distinction matters because an *armed* `handle` disposition whose pipe holds **no bytes**
+//! is an **idle descriptor**: it is not pending work, and a round that blocks on it is pure
+//! sleep. A pipe that **has** bytes is pending work and must still be delivered. The probe never
+//! decides *whether* a signal is delivered: [`crate::port::PortRegistry::pump`] harvests the
+//! facility unconditionally at the top of every round (`take_signals` → [`SignalWatch::drain`]),
+//! so a caught signal is delivered whether or not a round blocked on the pipe. The probe only
+//! decides whether a round needs to run at all, or may block.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::os::fd::RawFd;
+use std::time::Duration;
 
 use beam_common::Result;
 use beam_io::signal::{Disposition, Signal, SignalFacility};
@@ -253,7 +271,9 @@ impl SignalWatch {
         self.token.is_some()
     }
 
-    /// Whether there is anything for a poll round to wait on.
+    /// Whether [`SignalWatch::sync`] has a descriptor to **register** — the poll-set half of the
+    /// watch, *not* the "is there work to wait for?" question (that is
+    /// [`SignalWatch::has_pending_signal`]).
     ///
     /// True when the self-pipe is already registered, **or** when a `handle` disposition is
     /// installed — in which case [`SignalWatch::sync`] will register the descriptor, so a
@@ -262,6 +282,45 @@ impl SignalWatch {
     /// readable.
     pub(crate) fn is_pollable(&self) -> bool {
         self.is_registered() || has_handled_signal()
+    }
+
+    /// Whether the trampoline has **caught** a signal that no [`drain`](Self::drain) has
+    /// consumed yet — a **non-destructive** readiness probe of the self-pipe.
+    ///
+    /// The record of *what* arrived is `beam_io`'s process-global bitmask, which only
+    /// `SignalFacility::drain` reads (and clears); the self-pipe is the record of *whether*
+    /// anything arrived — the lock-free, async-signal-safe trampoline writes it on the signal's
+    /// way in, and [`drain`](Self::drain) clears both. This probe therefore asks the **pipe**
+    /// (a throwaway [`Poller`] registered on the facility's read end and polled with a zero
+    /// timeout, so it neither blocks nor consumes) rather than the bitmask: draining would
+    /// destroy the very evidence the caller needs.
+    ///
+    /// That caller is the scheduler's quiescence test. An **armed but idle** `handle`
+    /// disposition is not pending work (its pipe can only become readable when a signal
+    /// actually arrives), whereas a pipe holding bytes *is* — a caught signal not yet
+    /// delivered. The probe decides only whether a round needs to run, never whether a signal
+    /// is delivered: [`crate::port::PortRegistry::pump`] drains the facility unconditionally at
+    /// the top of every round, so a caught signal is harvested whether or not a round blocked.
+    ///
+    /// `false` when there is no facility (no `os:set_signal/2` has run, so nothing can have been
+    /// caught) or when the throwaway probe cannot be built — the honest "no evidence of a caught
+    /// signal", never a fabricated readiness.
+    pub(crate) fn has_pending_signal(&self) -> bool {
+        let Some(fd) = with_existing_facility(|facility| facility.read_fd()) else {
+            return false;
+        };
+        let Ok(mut poller) = Poller::new() else {
+            return false;
+        };
+        if poller.register(fd, Interest::READABLE, SIGNAL_KEY).is_err() {
+            return false;
+        }
+        match poller.poll(Some(Duration::ZERO)) {
+            // Readiness is reported per registered key, and the sentinel cannot collide with the
+            // poller's own waker (see [`SIGNAL_KEY`]).
+            Ok(events) => events.iter().any(|event| event.key() == SIGNAL_KEY),
+            Err(_) => false,
+        }
     }
 
     /// Registers the facility's self-pipe with `poller` when there is something to observe.
@@ -278,7 +337,10 @@ impl SignalWatch {
     /// `handle` disposition the OS accepted but whose registration then fails is a genuine
     /// failure and is surfaced rather than silently leaving signals undelivered.
     pub(crate) fn sync(&mut self, poller: &mut Poller) -> Result<()> {
-        if self.token.is_some() || !has_handled_signal() {
+        // Nothing to register: either the descriptor is already in the poll set, or no
+        // `handle` disposition has ever been installed, in which case the self-pipe can never
+        // become readable and there is nothing to observe.
+        if !self.is_pollable() || self.is_registered() {
             return Ok(());
         }
         // `has_handled_signal()` can only be true after `install` created the facility, so the
@@ -369,22 +431,12 @@ pub(crate) mod watcher {
     /// [`Poller`] can see the readiness without consuming anything (draining would destroy the
     /// very evidence the test needs). `false` when no facility exists: no `os:set_signal/2` ran,
     /// so nothing can have been caught.
+    ///
+    /// Forwards to the production predicate ([`SignalWatch::has_pending_signal`]) so there is
+    /// one implementation of the probe; the watch it is asked of is stateless (the answer comes
+    /// from the process-global facility), so a fresh one is the same question.
     pub(crate) fn pending() -> bool {
-        let Some(fd) = with_existing_facility(|facility| facility.read_fd()) else {
-            return false;
-        };
-        let Ok(mut poller) = Poller::new() else {
-            return false;
-        };
-        if poller.register(fd, Interest::READABLE, SIGNAL_KEY).is_err() {
-            return false;
-        }
-        match poller.poll(Some(Duration::ZERO)) {
-            // Readiness is reported per registered key, and the sentinel cannot collide with the
-            // poller's own waker (see [`SIGNAL_KEY`]).
-            Ok(events) => events.iter().any(|event| event.key() == SIGNAL_KEY),
-            Err(_) => false,
-        }
+        SignalWatch::new().has_pending_signal()
     }
 
     /// Waits (bounded) for the trampoline to catch a signal [`send_to_self`] sent.
