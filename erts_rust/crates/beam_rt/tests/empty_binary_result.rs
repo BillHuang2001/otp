@@ -182,10 +182,9 @@ fn beam_rt(args: &[&str]) -> Output {
 /// Runs `emptybinres:<function>/<arity>` (with `args`) through the built binary's `run`
 /// action.
 ///
-/// The invocation passes `-noshell`: every CLI action except `-version` drives the default
-/// boot script, so a booted kernel prints the OTP banner to **stdout** without it — exactly
-/// as the oracle (`erl` prints the banner without `-noshell`; `erl -noshell` is silent). The
-/// stdout assertion below stays byte-exact.
+/// The `run` action is banner-free by construction (it records the `noshell` init argument),
+/// so it prints no OTP banner whether or not `-noshell` is given; `-noshell` is kept to mirror
+/// the oracle probe. The stdout assertion below stays byte-exact.
 fn run_fixture(beam: &Path, spec: &str, args: &[&str]) -> Output {
     let beam = beam.to_str().expect("the fixture path is UTF-8");
     let mut argv: Vec<&str> = vec!["-noshell", "run", beam, spec];
