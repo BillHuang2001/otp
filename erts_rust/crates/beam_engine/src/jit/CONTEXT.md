@@ -31,40 +31,50 @@ deopt are the load-bearing contracts.
 - Never RWX: `mmap` RW then `mprotect` RX (`emitter`).
 
 ## Routing Table
-- `baseline/` → the native x86-64 baseline backend: driver + `enter_machine`/`run_native*`/`drive`/`enter_compiled` (`mod.rs`), block ABI + the helpers `jit_step_one`/`jit_ext_call`/`jit_tail_call`/`jit_deallocate`/`jit_return`/`jit_deallocate_return`/`jit_publish_y`/`jit_refresh_y` and the Y window (`runtime.rs`), the two-layout artifact + the `sub_entries` tables (`code.rs`), the native `send`/`receive` family lowering `jit_receive` (`receive.rs`), the comparison-`test` in-block helper `jit_test` (`test_helper.rs`), the `#[cfg(test)]`-only structural counters (`counters.rs`, zero production cost), unit tests (`tests.rs`); `baseline/emit/` → the compilation entry points + continuation sub-blocks (`compile.rs`: `compile_module`/`compile_function`/`emit_function`/`stores_continuation`/`emit_sub_blocks`/`emit_shared_sub_blocks`) and the per-instruction emitters (`mod.rs` + `move/test/select/aggregate/arith/compare/frame/link/operands/regalloc.rs`), the register cache (`regs.rs`: `Allocation` + the partial `spill`/`fill` + `SpillSite`/`FillSite`) and the block-local liveness (`liveness.rs`: `fill_sets`) — the allocator is a **live-interval** x-register selection (`regalloc.rs::allocate_registers`, `cacheable_touches`/`cacheable_writes`: a register's live interval is `[first touch, last touch]`, ranked by descending interval length, ties by ascending register index) with liveness-based partial spill/fill traffic (see its own `CONTEXT.md`).
+- `baseline/` → the native x86-64 baseline backend: driver + `enter_machine`/`run_native*`/`drive`/`enter_compiled` (`mod.rs`), block ABI + the helpers `jit_step_one`/`jit_ext_call`/`jit_tail_call`/`jit_deallocate`/`jit_return`/`jit_deallocate_return`/`jit_publish_y`/`jit_refresh_y`/`jit_allocate`/`jit_allocate_heap`/`jit_test_heap`/`jit_trim` and the Y window (`runtime.rs`), the two-layout artifact + the `sub_entries` tables (`code.rs`), the native `send`/`receive` family lowering `jit_receive` (`receive.rs`), the comparison-`test` in-block helper `jit_test` (`test_helper.rs`), the frame-preserving-`call` continuation store (`call.rs`) and the family-owned arm (`family.rs` → `emit/family.rs`), the value-BIF helper (`bif_helper.rs`), the `#[cfg(test)]`-only structural counters (`counters.rs`, zero production cost) + the test-only censuses/suites (`census.rs`, `*_tests.rs`), unit tests (`tests.rs`); `baseline/emit/` → the compilation entry points + continuation sub-blocks (`compile.rs`: `compile_module`/`compile_function`/`emit_function`/`stores_continuation`/`emit_sub_blocks`/`emit_shared_sub_blocks`) and the per-instruction emitters (`mod.rs` + `move/test/select/aggregate/arith/compare/frame/link/operands/regalloc/heap/family/bif.rs`), the register cache (`regs.rs`: `Allocation` + the partial `spill`/`fill` + `SpillSite`/`FillSite`) and the block-local liveness (`liveness.rs`: `fill_sets`) — the allocator is a **live-interval** x-register selection (`regalloc.rs::allocate_registers`, `cacheable_touches`/`cacheable_writes`: a register's live interval is `[first touch, last touch]`, ranked by descending interval length, ties by ascending register index) with liveness-based partial spill/fill traffic (see its own `CONTEXT.md`).
 - `cranelift/` → the optional Cranelift hot tier (feature-gated); see its own `CONTEXT.md`.
 - `emitter/` → the x86-64 encoder + executable `CodeBuffer`; see its own `CONTEXT.md`.
 - `cache/` → cross-run compiled-block cache (`mod.rs`) + its unit tests (`tests.rs`) + the host code-map entry (`baseline_code_map`) and the entry-path priming API (`remember_module`); `tiering.rs` → tier policy; `mod.rs` → the tier seam.
 - `bench/` → the in-crate tier measurement harness — a **`pub mod bench`** (not `#[cfg(test)]`): a **thirteen**-workload interpreter-vs-baseline tier table (deopted `build`/`map`/`select`/`walk`/`sum` + inlined `fib`/`kernel`/`wide`/`aggr`/`cmp` + the cross-module `cross/2` + the declined-`call_ext` `call_ext/0` + the two-process mailbox `send_recv/2`), the `support.rs` scaffolding shared with `cranelift/bench.rs`, and the per-workload result checks; its `#[test]` entry points live in the thin `tests/jit_bench.rs`. See its own `CONTEXT.md`.
 - **The baseline inlined *shape* set** (a compile-time, purely syntactic decision; every other shape is
-  the `_` arm's per-instruction deopt to `jit_step_one`): `Move`/`Swap` (`Move` over in-bound
-  x-registers **or an addressable `Y` slot on either side**, behind a run-time frame-window guard;
-  `Swap` over two in-bound x-registers), the word-level `Test`s
+  the `_` arm's per-instruction deopt to `jit_step_one`). The **authoritative current list** is
+  `baseline/CONTEXT.md` + `baseline/emit/CONTEXT.md`; the load-bearing facts: every lowering is
+  **interpreter-identical by construction** (it routes through the same `beam_term`/engine helper the
+  interpreter's own arm calls, and any guard rejection falls to exactly one `emit_step_and_continue`
+  deopt); `Move`/`Swap`/`InitYregs` accept in-bound x-registers, an **addressable `Y` slot** (behind the
+  published frame window) or a **literal-area source** (a run-time guard against the driver-published
+  `literals_base`/`literals_end` — no pointer is ever baked into emitted code); the word-level `Test`s
   (`is_nil`/`is_atom`/`is_list`/`is_nonempty_list`/`is_boolean`) plus the **14** boxed-header kinds
   (`is_integer`/`is_number`/`is_float`/`is_tuple`/`is_map`/`is_bitstring`/`is_binary`/`is_function`/
-  `is_function2`/`is_tagged_tuple`/`test_arity`/`is_pid`/`is_port`/`is_reference`), the six
-  **comparison** `Test`s (`is_eq_exact`/`is_ne_exact`/`is_eq`/`is_ne`/`is_lt`/`is_ge`) at exactly two
-  operands with a resolvable non-`NO_FAIL` fail label, lowered **in-block** as a call to the boolean
-  helper `jit_test` (`emit/test.rs::emit_test_helper` + `test_helper.rs`) instead of a `jit_step_one`
-  deopt — interpreter-identical by construction (whatever the operand kinds, it routes through
-  `beam_term`'s `cmp`/`cmp_arith`, and a boxed pointer is never word-compared; `TEST_TRUE` refills the
-  continuation's cached x-registers and continues in-block, `TEST_FALSE` branches to the resolved fail label, any other
-  word — a propagating read error's `ERROR` — goes to the driver); a `NO_FAIL` test, an unresolved fail
-  label, a non-comparison kind and an operand count other than two keep the `jit_step_one` deopt; also
-  inlined are all-immediate
-  `SelectVal`, `SelectTupleArity`, the cons readers `GetList`/`GetHd`/`GetTl`, the tuple *reader*
-  `GetTupleElement`, the tuple *writer* `SetTupleElement`, the small-int `gc_bif` `'+'`/`'-'`/`'*'`
-  over an x-register **or an addressable `Y` slot** operand/destination (the same frame-window guard),
-  the eight comparison BIFs, `Jump`, the local tail calls `CallLast`/`CallOnly`, the receive-control
-  family (`Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage` via
-  `emit::emit_receive` → the `receive.rs::jit_receive` helper — an inlined direct helper call that runs
-  the same family body the interpreter's dispatch does and hands the driver the resulting block-ABI
-  word), and the
-  **frame-discipline trio** `Deallocate`/`Return`/`DeallocateReturn` (`baseline/emit/frame.rs` — an
-  always-lowered direct helper call that runs no interpreter step and hands the driver the helper's
-  block-ABI word; `emit_block` also fuses an adjacent `Deallocate`+`Return` pair into one such call).
-  `CallExt*` is executed natively by `jit_ext_call` but the cross-module *transfer* is a driver
-  round-trip (see above), and `FuncInfo` is deliberately never inlined (it is the failed-clause raise).
+  `is_function2`/`is_tagged_tuple`/`test_arity`/`is_pid`/`is_port`/`is_reference`); the six
+  **comparison** `Test`s (`is_eq_exact`/`is_ne_exact`/`is_eq`/`is_ne`/`is_lt`/`is_ge`) at two operands
+  with a resolvable non-`NO_FAIL` fail label, lowered **in-block** as a call to the boolean helper
+  `jit_test` (`emit/test.rs::emit_test_helper` + `test_helper.rs`) — interpreter-identical by
+  construction (it routes through `beam_term`'s `cmp`/`cmp_arith`, and a boxed pointer is never
+  word-compared; `TEST_TRUE` refills the continuation's cached x-registers and continues in-block,
+  `TEST_FALSE` branches to the resolved fail label, any other word — a propagating read error's `ERROR`
+  — goes to the driver; a *run-time* guard rejection routes to the same helper, never a static deopt); a
+  `NO_FAIL` test, an unresolved fail label and a non-comparison kind keep the `jit_step_one` deopt;
+  `SelectVal`/`SelectTupleArity` (all-immediate **and** `Y`-source); the cons readers
+  `GetList`/`GetHd`/`GetTl`; the tuple *reader* `GetTupleElement`; the tuple *writer* `SetTupleElement`;
+  the small-int `gc_bif` `'+'`/`'-'`/`'*'` and the bitwise `band`/`bor`/`bsr` over an x-register **or an
+  addressable `Y` slot** operand/destination (the same frame-window guard); the eight comparison BIFs;
+  the hot named-BIF fast paths `hd/1`, `element/2` (compile-time small-int index ≥ 1), `tuple_size/1`,
+  `byte_size/1`, `length/1` (`emit/bif.rs` + `bif_helper.rs`); `Jump`; the local tail calls
+  `CallLast`/`CallOnly` (including a **resolved-but-not-compiled** target, `emit/link.rs::
+  emit_tail_exit_to_driver`); `Instr::Call` (the continuation store, with a `CALL_STORED` block-ABI
+  sentinel consumed in-block — `call.rs`); the heap/frame-admission family
+  `Allocate`/`AllocateHeap`/`TestHeap`/`Trim` (`emit/heap.rs`); the receive-control family
+  (`Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage` via
+  `emit::emit_receive` → the `receive.rs::jit_receive` helper); the **frame-discipline trio**
+  `Deallocate`/`Return`/`DeallocateReturn` (`baseline/emit/frame.rs`; `emit_block` fuses an adjacent
+  `Deallocate`+`Return` pair into one call); and the **whole family-owned arm**
+  (`emit/family.rs::emit_family` → `family.rs::jit_family`, which *is* the interpreter's own
+  `families::dispatch`: `put_list`/`put_tuple2`, native records, `make_fun3`, `call_fun`/`call_fun2`/
+  `apply`, try/catch/raise/`badmatch`/`case_end`/`try_*_end`, floats, maps, bitstrings, `recv_marker_*`).
+  `CallExt*` executes natively but the cross-module *transfer* is still a driver round-trip; `FuncInfo`
+  is deliberately never inlined (it is the failed-clause raise), and `self/0`/`node/0`/`map_get/2` are
+  **not** lowered (host-owned seams / an allocating miss).
 - **Y-slot operands are guarded by a published frame window.** A lowering that reads or writes a `Y`
   slot (an inlined `Move`, and the small-int arith fast path) addresses `machine.stack[y_base + k*8]`
   against the current frame's `[y_base, y_end)` held on `JitRuntime` (`RUNTIME_YBASE_DISP`/
