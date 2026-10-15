@@ -31,8 +31,8 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel};
 
 use super::link::Linker;
 use super::operands::constant_word;
-use super::test::{load_test_src, test_src, TestSrc, TEST_A, TEST_T};
-use super::Allocation;
+use super::test::{load_test_src, test_src, TestSrc, TEST_A, TEST_C, TEST_T};
+use super::{emit_step_and_continue, Allocation};
 
 // ---------------------------------------------------------------------------
 // The exact-value switch (`select_val`)
@@ -49,7 +49,9 @@ use super::Allocation;
 // The subset below is lowered natively and mirrors that scan branch for branch:
 //
 // * the scrutinee must be a value the tier can read word-exactly — an x-register
-//   inside `MAX_REGISTER`, or an immediate constant ([`TestSrc`]);
+//   inside `MAX_REGISTER`, an **addressable `Y` slot** (read through the guarded
+//   current-frame window, exactly like the arithmetic fast path's `Y` operand), or an
+//   immediate constant ([`TestSrc`]);
 // * **every** alternative must be an immediate constant — a small int (in the
 //   60-bit range), an atom, or `nil` — because `=:=` over immediates *is* a plain
 //   raw-word compare: distinct immediate classes have disjoint words (a small int's
@@ -76,6 +78,13 @@ pub(super) struct SelectPlan {
     cases: Vec<(i64, (u32, u32))>,
     /// The resolved fail label's `(func, pc)`.
     fail: (u32, u32),
+}
+
+impl SelectPlan {
+    /// Whether the scrutinee is read from an addressable `Y` slot.
+    pub(super) fn uses_y(&self) -> bool {
+        self.scrutinee.is_y()
+    }
 }
 
 /// The inlinable shape of a `select_val`, or `None` for any shape above the subset
@@ -114,7 +123,13 @@ pub(super) fn select_val_plan(
 ///
 /// Returns `false` **without having emitted a byte** for any shape
 /// [`select_val_plan`] refuses, so the caller falls back to exactly today's
-/// `jit_step_one`.
+/// `jit_step_one`. On success the emitted code **always** transfers control (every
+/// match and the no-match path return a `(func, pc)` word), except on the `Y`
+/// scrutinee's guard-rejection path, which runs one interpreter step — and since the
+/// interpreted instruction itself always transfers control, that step too leaves the
+/// block with a word in `rax` (never an in-block continuation), so the caller ends the
+/// block there.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn try_inline_select_val(
     buffer: &mut CodeBuffer,
     labels: &LabelMap,
@@ -122,6 +137,8 @@ pub(super) fn try_inline_select_val(
     instr: &Instr,
     allocation: &Allocation,
     done: CodeLabel,
+    func: u32,
+    pc: u32,
     highest_touched: &mut Option<u32>,
 ) -> Result<bool> {
     let Instr::SelectVal { value, fail, pairs } = instr else {
@@ -131,8 +148,21 @@ pub(super) fn try_inline_select_val(
         return Ok(false);
     };
 
+    // The `Y` scrutinee's frame-window rejection label: a slot outside the published
+    // window (or no live frame) jumps here **before anything is read**, and the block
+    // spends exactly one interpreter step on the instruction at `(func, pc)`.
+    let deopt: Option<CodeLabel> = plan.uses_y().then(|| buffer.label());
+
     // --- the scrutinee ------------------------------------------------------
-    load_test_src(buffer, plan.scrutinee, TEST_A, allocation, highest_touched)?;
+    load_test_src(
+        buffer,
+        plan.scrutinee,
+        TEST_A,
+        TEST_C,
+        deopt,
+        allocation,
+        highest_touched,
+    )?;
 
     // --- one `cmp`/`jcc` per alternative (jump to the match's stub) ---------
     let case_labels: Vec<CodeLabel> = (0..plan.cases.len()).map(|_| buffer.label()).collect();
@@ -149,6 +179,12 @@ pub(super) fn try_inline_select_val(
     for ((_, target), case_label) in plan.cases.iter().zip(&case_labels) {
         buffer.bind(*case_label)?;
         linker.emit_exit(buffer, allocation, done, target.0, target.1)?;
+    }
+
+    // --- the `Y` guard rejected the scrutinee: run the real instruction -----
+    if let Some(deopt) = deopt {
+        buffer.bind(deopt)?;
+        emit_step_and_continue(buffer, done, allocation, func, pc)?;
     }
     Ok(true)
 }

@@ -36,7 +36,9 @@ use crate::machine::MAX_REGISTER;
 
 use super::arith::{FAST_C, SMALL_MASK};
 use super::link::Linker;
-use super::operands::{small_word, x_offset, x_register};
+use super::operands::{
+    emit_guarded_y_load, small_word, x_offset, x_register, y_addressable, y_register,
+};
 use super::{emit_helper_call, emit_refresh_y, emit_step_and_continue, fill, touch, Allocation, FillSite};
 use crate::jit::baseline::runtime::StepHelper;
 use crate::jit::baseline::test_helper::{jit_test, TEST_FALSE, TEST_TRUE};
@@ -104,7 +106,7 @@ const TEST_B: Reg = Reg::R8;
 /// loaded header word / tuple element of a header test).
 pub(super) const TEST_T: Reg = Reg::R10;
 /// The header test's boxed-pointer scratch ([`load_boxed_header`]).
-const TEST_C: Reg = Reg::R9;
+pub(super) const TEST_C: Reg = Reg::R9;
 /// The header test's staging scratch for the **masked** header value ([`header_matches`]).
 ///
 /// It must not be one of the operand/pointer scratch registers: every caller passes
@@ -204,11 +206,30 @@ enum Guard {
 pub(super) enum TestSrc {
     /// An x-register inside the engine's [`MAX_REGISTER`] bound.
     Reg(u32),
+    /// An addressable `Y` slot (the current frame's stack area), read through the
+    /// guarded frame window: the word read is `machine.stack[y_base + k]` — exactly
+    /// the word the interpreter's own `y(k)` resolves.
+    Y(u32),
     /// A small-int constant (`{integer,V}`/`{char,C}` in the 60-bit range) — the only
     /// numeric constant that is word-order exact.
     Small(i64),
     /// An atom or `nil` constant — a **non-numeric** immediate.
     Immediate(i64),
+}
+
+impl TestSrc {
+    /// Whether this source is an addressable `Y` slot — i.e. reading it touches the
+    /// current frame's Y window ([`super::arith::uses_y`]'s per-shape test).
+    pub(super) fn is_y(self) -> bool {
+        matches!(self, TestSrc::Y(_))
+    }
+}
+
+/// Whether `src` is a value the emitted code reads at **run time** (an x-register or a
+/// `Y` slot) rather than a compile-time constant. A run-time operand is the one that
+/// makes a comparison's word compare inexact and needs the small-int guard.
+fn is_runtime(src: TestSrc) -> bool {
+    matches!(src, TestSrc::Reg(_) | TestSrc::Y(_))
 }
 
 /// The predicate of an inlinable `test`; a jump to the success label is taken when it
@@ -293,6 +314,23 @@ pub(super) struct TestPlan {
     pred: TestPred,
     /// The resolved fail label's `(func, pc)`.
     fail: (u32, u32),
+}
+
+impl TestPlan {
+    /// Whether any operand is read from an addressable `Y` slot.
+    pub(super) fn uses_y(&self) -> bool {
+        self.lhs.is_y() || self.rhs.map_or(false, TestSrc::is_y)
+    }
+
+    /// Whether the plan needs the small-int guard block.
+    pub(super) fn emits_guard(&self) -> bool {
+        self.guard != Guard::None
+    }
+
+    /// Whether a rejection label is needed at all (the guard or a `Y` load).
+    pub(super) fn needs_deopt(&self) -> bool {
+        self.emits_guard() || self.uses_y()
+    }
 }
 
 /// The inlinable shape of `instr`, or `None` when the whole instruction must stay on
@@ -425,20 +463,27 @@ fn arity_operand(operand: Option<&Operand>, max: i64) -> Option<i64> {
     }
 }
 
-/// The native source of one operand, or `None` when it needs the helper: a `Y`
-/// register, a float register, a literal, a bignum constant, or an x-register past
-/// the engine's [`MAX_REGISTER`] bound (whose exact `bad_register` must surface).
+/// The native source of one operand, or `None` when it needs the helper: a float
+/// register, a literal, a bignum constant, an un-addressable `Y` index, or an
+/// x-register past the engine's [`MAX_REGISTER`] bound (whose exact `bad_register`
+/// must surface). A `Y` register is read through the guarded frame window
+/// ([`TestSrc::Y`]).
 pub(super) fn test_src(operand: &Operand) -> Option<TestSrc> {
     match x_register(operand) {
         Some(x) if x < MAX_REGISTER => Some(TestSrc::Reg(x)),
         Some(_) => None,
-        None => match operand {
-            Operand::Integer(value) => small_word(*value).map(TestSrc::Small),
-            Operand::Character(c) => small_word(i64::from(*c)).map(TestSrc::Small),
-            Operand::Atom(atom) => Some(TestSrc::Immediate(make_atom(*atom).raw() as i64)),
-            Operand::Nil => Some(TestSrc::Immediate(TEST_NIL)),
-            _ => None,
-        },
+        None => {
+            if let Some(k) = y_register(operand) {
+                return y_addressable(k).then_some(TestSrc::Y(k));
+            }
+            match operand {
+                Operand::Integer(value) => small_word(*value).map(TestSrc::Small),
+                Operand::Character(c) => small_word(i64::from(*c)).map(TestSrc::Small),
+                Operand::Atom(atom) => Some(TestSrc::Immediate(make_atom(*atom).raw() as i64)),
+                Operand::Nil => Some(TestSrc::Immediate(TEST_NIL)),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -455,13 +500,14 @@ fn compare_shape(kind: TestKind, lhs: TestSrc, rhs: TestSrc) -> Option<(Guard, C
                 Cond::Ne
             };
             match (lhs, rhs) {
-                // Two runtime values: guard **both** as small ints, after which a plain
-                // word compare *is* `=:=` — `make_small(v) == v*16 + 15` is injective
-                // and `cmp`'s raw-word fast path is exact. Two distinct boxed terms
-                // (equal floats, bignums, tuples, …) share no word, but neither is a
-                // small, so the guard sends them to the helper (which compares `cmp`'s
-                // own way) rather than fabricating a word-compare answer.
-                (TestSrc::Reg(_), TestSrc::Reg(_)) => Some((Guard::Both, cond)),
+                // Two runtime values (an x-register and/or a `Y` slot): guard **both**
+                // as small ints, after which a plain word compare *is* `=:=` —
+                // `make_small(v) == v*16 + 15` is injective and `cmp`'s raw-word fast
+                // path is exact. Two distinct boxed terms (equal floats, bignums,
+                // tuples, …) share no word, but neither is a small, so the guard sends
+                // them to the helper (which compares `cmp`'s own way) rather than
+                // fabricating a word-compare answer.
+                (l, r) if is_runtime(l) && is_runtime(r) => Some((Guard::Both, cond)),
                 // At least one operand is a constant immediate, which is `=:=` only to
                 // the identical word (see the module comment): a plain word compare is
                 // already exact.
@@ -487,35 +533,50 @@ fn compare_shape(kind: TestKind, lhs: TestSrc, rhs: TestSrc) -> Option<(Guard, C
 /// `==` is the only comparison where an immediate is not self-sufficient: it treats
 /// `1` and `1.0` as equal, so a small-int operand needs its register counterpart
 /// guarded. An atom/`nil` immediate is `==` only to the identical word, so it needs
-/// no guard; two small-int constants need none either.
+/// no guard; two small-int constants need none either. A `Y` slot is a run-time value
+/// exactly like an x-register and is guarded the same way.
 fn arith_guard(lhs: TestSrc, rhs: TestSrc) -> Option<Guard> {
-    match (lhs, rhs) {
-        (TestSrc::Immediate(_), _) | (_, TestSrc::Immediate(_)) => Some(Guard::None),
-        (TestSrc::Small(_), TestSrc::Small(_)) => Some(Guard::None),
-        (TestSrc::Small(_), TestSrc::Reg(_)) => Some(Guard::Rhs),
-        (TestSrc::Reg(_), TestSrc::Small(_)) => Some(Guard::Lhs),
-        (TestSrc::Reg(_), TestSrc::Reg(_)) => Some(Guard::Both),
+    // An atom/`nil` constant is `==` only to the identical word, so it never needs a
+    // guard — and it also makes the *other* operand's guard unnecessary.
+    if matches!(lhs, TestSrc::Immediate(_)) || matches!(rhs, TestSrc::Immediate(_)) {
+        return Some(Guard::None);
     }
+    Some(match (is_runtime(lhs), is_runtime(rhs)) {
+        (true, true) => Guard::Both,
+        (true, false) => Guard::Lhs,
+        (false, true) => Guard::Rhs,
+        (false, false) => Guard::None,
+    })
 }
 
 /// The guard an **ordering** compare (`is_lt`/`is_ge`) needs: only two small-int
 /// words are word-order exact, so an atom/`nil` (or bignum/literal) constant keeps
-/// the instruction on the helper.
+/// the instruction on the helper. A `Y` slot is a run-time value exactly like an
+/// x-register, so it is word-order exact only against a small-int guard.
 fn order_guard(lhs: TestSrc, rhs: TestSrc) -> Option<Guard> {
     match (lhs, rhs) {
         (TestSrc::Small(_), TestSrc::Small(_)) => Some(Guard::None),
-        (TestSrc::Small(_), TestSrc::Reg(_)) => Some(Guard::Rhs),
-        (TestSrc::Reg(_), TestSrc::Small(_)) => Some(Guard::Lhs),
-        (TestSrc::Reg(_), TestSrc::Reg(_)) => Some(Guard::Both),
+        (TestSrc::Small(_), r) if is_runtime(r) => Some(Guard::Rhs),
+        (l, TestSrc::Small(_)) if is_runtime(l) => Some(Guard::Lhs),
+        (l, r) if is_runtime(l) && is_runtime(r) => Some(Guard::Both),
         _ => None,
     }
 }
 
-/// Load a `test` operand into scratch `reg`.
+/// Load a `test` operand into scratch `reg`, or jump to `fallback` when a `Y` source
+/// lies outside the current frame's published Y window.
+///
+/// `end` is the window-bound scratch the guarded `Y` read needs (see
+/// [`emit_guarded_y_load`]) and must differ from `reg`; it is unused for an
+/// x-register or a constant. `fallback` is the rejection label the caller bound to
+/// one `jit_step_one` step: a rejection leaves the machine exactly as the interpreter
+/// will re-run the instruction, and only ever *rejects* — no `Y` word is written.
 pub(super) fn load_test_src(
     buffer: &mut CodeBuffer,
     src: TestSrc,
     reg: Reg,
+    end: Reg,
+    fallback: Option<CodeLabel>,
     allocation: &Allocation,
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
@@ -526,6 +587,19 @@ pub(super) fn load_test_src(
                 touch(highest_touched, x);
                 buffer.mov_rm(reg, Reg::Rbx, x_offset(x))
             }
+        },
+        // The guarded frame-window read: the word lands in `reg` exactly as an
+        // x-register's would, and a slot outside the published window jumps to
+        // `fallback` before anything is written.
+        TestSrc::Y(k) => match fallback {
+            Some(fallback) => emit_guarded_y_load(buffer, reg, end, k, fallback),
+            // Unreachable by construction: `TestPlan::uses_y`/`SelectPlan::uses_y`
+            // make the caller allocate the fallback label exactly when a `Y` source
+            // is present, so a `Y` arm without one is a plan/emitter mismatch — a
+            // typed error, never a wrong result.
+            None => Err(crate::error::unsupported(
+                "jit: a Y-slot test operand needs a rejection label",
+            )),
         },
         TestSrc::Small(word) | TestSrc::Immediate(word) => buffer.mov_ri(reg, word),
     }
@@ -759,8 +833,9 @@ fn emit_is_reference(buffer: &mut CodeBuffer, success: CodeLabel, failed: CodeLa
 ///
 /// Returns `false` **without having emitted a byte** for any shape [`test_plan`]
 /// refuses (a `NO_FAIL` test, an unresolved fail label, a non-integer/out-of-range
-/// arity operand, an inexact comparison, a `Y`/float/literal operand), so the caller
-/// falls back to exactly today's `jit_step_one`.
+/// arity operand, an inexact comparison, a float/literal operand, an un-addressable
+/// `Y` index), so the caller falls back to exactly today's `jit_step_one`. A `Y`
+/// operand **is** lowered, through the shared guarded frame-window read.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_inline_test(
     buffer: &mut CodeBuffer,
@@ -779,7 +854,7 @@ pub(super) fn try_inline_test(
     };
     let Some(plan) = test_plan(module, *kind, *fail, args, labels) else {
         // Not one of the word/header shapes the inline subset can decide: a
-        // comparison `test` (a `Y`/float/literal operand, a boxed-vs-boxed compare) is
+        // comparison `test` (a float/literal operand, a boxed-vs-boxed compare) is
         // lowered through the `jit_test` helper instead; anything else — a `NO_FAIL`
         // form, an unresolved fail label, a type test — keeps today's per-instruction
         // deopt.
@@ -791,12 +866,12 @@ pub(super) fn try_inline_test(
     // exit below: the word tests (and every header test) reach it either by falling
     // through the predicate or by an explicit `jcc`.
     let failed: CodeLabel = buffer.label();
-    let deopt: Option<CodeLabel> = (plan.guard != Guard::None).then(|| buffer.label());
+    let deopt: Option<CodeLabel> = plan.needs_deopt().then(|| buffer.label());
 
     // --- operands -----------------------------------------------------------
-    load_test_src(buffer, plan.lhs, TEST_A, allocation, highest_touched)?;
+    load_test_src(buffer, plan.lhs, TEST_A, TEST_C, deopt, allocation, highest_touched)?;
     if let Some(rhs) = plan.rhs {
-        load_test_src(buffer, rhs, TEST_B, allocation, highest_touched)?;
+        load_test_src(buffer, rhs, TEST_B, TEST_C, deopt, allocation, highest_touched)?;
     }
 
     // --- the small-int guard ------------------------------------------------
