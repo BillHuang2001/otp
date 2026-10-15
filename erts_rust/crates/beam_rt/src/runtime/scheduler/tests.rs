@@ -232,6 +232,106 @@ fn a_timer_wakes_a_receiver_that_blocked_before_it_fired() {
     assert_eq!(rt.timers.pending_count(), 0, "the timer fired exactly once");
 }
 
+/// A pending deadline aimed at **another** process is not work the `run` route has to wait
+/// for: the boot's own hourly `inet_db` cache refresh
+/// (`erlang:send_after(3600000, self(), refresh_timeout)`, a `Deliver` to a kernel process's
+/// pid) is exactly that shape, and it must neither keep a stalled `run` awake nor make a
+/// ready one pay a poll slice per round.
+#[test]
+fn the_run_route_ignores_a_pending_deadline_that_cannot_wake_its_workload() {
+    let mut rt = runtime();
+    rt.load_module(RECV_BEAM).expect("load recv.beam");
+    let receiver = rt
+        .spawn_process("recv", "wait", vec![])
+        .expect("spawn recv:wait/0");
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+    assert_eq!(
+        rt.processes().get(receiver).expect("it stays").state(),
+        ProcessState::Waiting,
+        "the receiver is parked on an empty mailbox"
+    );
+    // A far-off delivery for a **different** process: pending, but nothing the receiver can
+    // ever be woken by.
+    rt.timers_mut().schedule(
+        Duration::from_secs(3600),
+        crate::timers::TimerTarget::Pid(rt.self_pid()),
+        make_small(0),
+        make_small(1),
+        make_small(2),
+    );
+    assert!(rt.timers.next_deadline().is_some(), "the deadline is pending");
+    // With **no** run-route marker the deadline counts as before — every other route keeps
+    // the bare timer-heap test.
+    assert!(!rt.is_quiescent(), "the bare heap still has a deadline");
+    assert!(rt
+        .timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0)
+        .is_some());
+    // With the receiver marked as the route's wait target it does **not**: nothing is queued,
+    // nothing is pollable, and no pending deadline can wake the receiver.
+    assert_eq!(rt.set_run_wake_pid(Some(receiver)), None, "no marker was set");
+    assert!(
+        rt.is_quiescent(),
+        "a deadline for another process cannot wake the workload"
+    );
+    assert_eq!(
+        rt.timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0),
+        None,
+        "the run route does not sleep for a deadline that cannot wake its workload"
+    );
+}
+/// The mirror keeps the deadlines that **can** wake the workload: a delivery aimed at the
+/// receiver's own pid, so the run route still waits (and sleeps) for it.
+#[test]
+fn the_run_route_still_waits_for_a_deadline_that_can_wake_its_workload() {
+    let mut rt = runtime();
+    rt.load_module(RECV_BEAM).expect("load recv.beam");
+    let receiver = rt
+        .spawn_process("recv", "wait", vec![])
+        .expect("spawn recv:wait/0");
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+    rt.timers_mut().schedule(
+        Duration::from_secs(3600),
+        crate::timers::TimerTarget::Pid(receiver),
+        make_small(0),
+        make_small(1),
+        make_small(3),
+    );
+    rt.set_run_wake_pid(Some(receiver));
+    assert!(
+        !rt.is_quiescent(),
+        "a delivery to the workload's pid is work the route must wait for"
+    );
+    assert!(
+        rt.timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0)
+            .is_some(),
+        "the run route sleeps for a deadline that can wake its workload"
+    );
+}
+/// With only an **unrelated** far-off deadline pending, a stalled `run` returns the typed
+/// `blocked` diagnostic **immediately** — never spun out to `RUN_DEADLINE` (60 s).
+#[test]
+fn run_scheduled_reports_the_blocked_stall_with_only_an_unrelated_deadline_pending() {
+    let mut rt = runtime();
+    rt.load_module(RECV_BEAM).expect("load recv.beam");
+    rt.timers_mut().schedule(
+        Duration::from_secs(3600),
+        crate::timers::TimerTarget::Pid(rt.self_pid()),
+        make_small(0),
+        make_small(1),
+        make_small(4),
+    );
+    let started = Instant::now();
+    let error = rt
+        .run_scheduled(RECV_BEAM, "wait", 0, &[])
+        .expect_err("nothing can wake the receiver");
+    assert_eq!(error.to_string(), beam_engine::blocked().to_string(), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a stall with only an unrelated deadline is reported at once, not at the deadline \
+         (took {:?})",
+        started.elapsed()
+    );
+}
 /// A **bounded** step never sleeps on a pending deadline — `run_one_slice` is a step, not
 /// a wait — while the unbounded pass does wait, and the message is then in the target's
 /// mailbox without any process having run.
@@ -590,6 +690,35 @@ fn run_scheduled_reports_a_quiescent_stall_immediately() {
         "a quiescent stall is reported at once, not after the deadline (took {:?})",
         started.elapsed()
     );
+}
+
+#[test]
+fn zz_experiment_boot_deadlines() {
+    let config = crate::cli::parse(&[
+        "-noshell".to_string(),
+        "-boot".to_string(),
+        "bootstrap/bin/start".to_string(),
+    ])
+    .expect("-boot parses");
+    let mut rt = Runtime::new(config).expect("the boot runtime");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../bootstrap/bin/start.boot"
+    );
+    rt.boot_from_script(script).expect("the real boot script runs");
+    let me = rt.self_pid();
+    eprintln!("experiment: self={me:?}");
+    eprintln!(
+        "experiment: pids={:?}",
+        rt.processes().pids().collect::<Vec<_>>()
+    );
+    let all = rt
+        .timers
+        .take_due(Instant::now() + Duration::from_secs(10_000));
+    eprintln!("experiment: {} pending deadlines", all.len());
+    for f in all {
+        eprintln!("experiment: fired {:?}", f.action);
+    }
 }
 
 /// An argument count that disagrees with the named arity is a caller bug, reported rather
