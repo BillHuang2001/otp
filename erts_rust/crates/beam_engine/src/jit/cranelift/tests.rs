@@ -146,6 +146,13 @@ fn the_compiled_function_runs_the_export_natively() {
         ctx: ctx_ptr,
         error: None,
         enter: None,
+        // No literal area is bound for this hand-built runtime block. The tier's
+        // inline set never reads an `Operand::Literal` (a `move` with a literal
+        // source is a shape the inline path declines and deopts to `jit_step_one`),
+        // so a null area is inert here — exactly as the driver's own "null means
+        // reject every access" discipline documents.
+        literals_base: std::ptr::null(),
+        literals_end: std::ptr::null(),
     };
 
     let word = code
