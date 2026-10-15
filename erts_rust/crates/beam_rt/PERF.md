@@ -16,10 +16,11 @@ that cannot produce a Rust-side figure are recorded as `skipped(<reason>)` with 
 ## Current startup regime (read before quoting any `startup_ms` figure)
 
 Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else the literal default `start` resolved to `<Root>/bin/start.boot` (the installation's own script, not this repo's committed `bootstrap/bin/start.boot`).
-A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 2.19 s wall** on this host.
+A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 0.44 s wall** on this host (measured 0.41–0.44 s over 5 runs at 1-min loadavg ≈ 5.5–8.5, so absolute ms are noise here).
 Every `startup_ms` figure below is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band) and its ratio to the oracle is that snapshot's; those numbers do not describe the current whole-process wall.
-The present whole-process wall is dominated by that ≈ 2.19 s boot, so **no startup advantage at a recorded margin survives** — quote the ≈ 2.19 s figure for the current runtime.
-The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 2.19 s boot, so those rows measure the loop against a far larger whole-process wall than the snapshots below record.
+The present whole-process wall is **CPU-bound and carries no fixed waits**: `strace -c -f` shows **0 `clock_nanosleep`** calls and only **zero-timeout** `epoll_wait` calls (12 calls, ≈ 6 µs total), so a blocked round returns instead of sleeping and the residual ≈ 0.44 s is engine work (the oracle's own `erl -noshell -eval 'halt(0).'` boot is ≈ 0.11 s here).
+Because that wall is now this runtime's own CPU cost rather than a fixed sleep, **no startup ratio measured against the oracle was re-recorded at this HEAD** — the committed `startup` ratios belong to the dated snapshots below — so the `startup_ms` metric should be **re-recorded at the next benchmark milestone** before any current startup advantage or loss is quoted.
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 0.44 s boot, so those rows measure the loop against a far larger whole-process wall than the snapshots below record.
 
 # `BEFORE` snapshot — HEAD `3f24c5ec9d`
 
@@ -509,7 +510,7 @@ Both columns are the **min of 3** of the `rust` metric; `< 1×` means the baseli
 **Reading the tier effect.** The baseline JIT is a clear win for **`foreign`** (**0.73×–0.87×**) and
 **`gc_bound churn`** (**0.539×**), and neutral for `baseline`, `list_walk` and most `slice` cases —
 where the whole-process wall is dominated by `beam_rt` startup (this snapshot's preloaded-only slice; the
-current runtime pays the ≈ 2.19 s boot-script drive on every action, see *Current startup regime*), not
+current runtime pays the ≈ 0.44 s boot-script drive on every action, see *Current startup regime*), not
 the interpreted loop. The only real
 regressions are the **module-graph-heavy one-shot** rows, `slice`'s `string_str_length` (**1.295×**),
 `queue_from_size` (**1.217×**) and `copy_bound`'s `send_recv` (**1.456×**): the first-entry compile cost
@@ -674,7 +675,7 @@ Result — `A/B > 1` ⇒ charge ON is dearer; the variant removed `Δ = A − B`
 Which rows could show it at all:
 
 - **Process-startup-dominated — cannot show it.** `baseline` `startup_ms` (≈ 13.7 ms of process boot —
-  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 2.19 s boot-script drive,
+  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 0.44 s boot-script drive,
   see *Current startup regime*) and every `slice` row (whole-process wall for one call per OS process,
   13.9–27.4 ms), of which the interpreted work is a small fraction.
 - **Interpreted-work marginals — the rows that *can* show it.** `foreign` (per `cowboy_bstr` /
