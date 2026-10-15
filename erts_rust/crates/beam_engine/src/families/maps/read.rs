@@ -67,7 +67,10 @@ pub(super) fn get_map_elements(
     let entries = terms::map_entries(map)?;
     for (key_operand, dst_operand) in pairs {
         let key = read_operand(machine, ctx, key_operand)?;
-        match lookup(&entries, key, &module.atom_table) {
+        // The namespace is taken AFTER the operand read (it borrows `*ctx`
+        // immutably, so it must not be held across `read_operand`'s `&mut`).
+        let found = lookup(&entries, key, ctx.atoms(module));
+        match found {
             Some(value) => write_operand(machine, dst_operand, value)?,
             None => {
                 return fail_or_function_clause(machine, module, labels, fail);
@@ -95,7 +98,7 @@ pub(super) fn has_map_fields(
     let entries = terms::map_entries(map)?;
     for key_operand in keys {
         let key = read_operand(machine, ctx, key_operand)?;
-        if lookup(&entries, key, &module.atom_table).is_none() {
+        if lookup(&entries, key, ctx.atoms(module)).is_none() {
             return fail_or_function_clause(machine, module, labels, fail);
         }
     }

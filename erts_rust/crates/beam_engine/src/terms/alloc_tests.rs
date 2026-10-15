@@ -60,8 +60,9 @@
 #![allow(unsafe_code)]
 
 use beam_common::Result;
+use beam_loader::Module;
 use beam_term::{big_parts, boxed_val, is_boxed_term, is_list, make_atom, make_small, Atom};
-use beam_term::{AtomTable, Eterm, TAG_PTR_MASK};
+use beam_term::{Eterm, TAG_PTR_MASK};
 
 use super::{
     float_value, list_elements, make_float_rooted, make_list_rooted, make_map_rooted,
@@ -484,7 +485,7 @@ impl ExecutionContext for MovingContext {
 fn workload_iteration(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
-    atoms: &AtomTable,
+    module: &Module,
     k1: Atom,
     k2: Atom,
     i: i64,
@@ -495,12 +496,20 @@ fn workload_iteration(
     let list = make_list_rooted(machine, ctx, RootSet::ALL_LIVE, 3, 0, |_, _| {
         Ok(vec![make_small(i), make_small(i + 1), make_small(i + 2)])
     })?;
-    let map = make_map_rooted(machine, ctx, RootSet::ALL_LIVE, 2, 0, atoms, |_, _| {
-        Ok(vec![
-            (make_atom(k1), make_small(i)),
-            (make_atom(k2), make_small(i + 1)),
-        ])
-    })?;
+    let map = make_map_rooted(
+        machine,
+        module,
+        ctx,
+        RootSet::ALL_LIVE,
+        2,
+        0,
+        |_, _, _| {
+            Ok(vec![
+                (make_atom(k1), make_small(i)),
+                (make_atom(k2), make_small(i + 1)),
+            ])
+        },
+    )?;
     // `tuple`/`list` are built and immediately garbage; only the map is rooted.
     let _ = (tuple, list);
     machine.set_x(0, map)?;
@@ -508,21 +517,21 @@ fn workload_iteration(
 }
 
 /// The cumulative words the non-collecting arena handed out for `n` iterations.
-fn unrooted_peak_words(n: usize, atoms: &AtomTable, k1: Atom, k2: Atom) -> usize {
+fn unrooted_peak_words(n: usize, module: &Module, k1: Atom, k2: Atom) -> usize {
     let mut machine = Machine::new();
     let mut ctx = CountingContext::new();
     for i in 0..n {
-        workload_iteration(&mut machine, &mut ctx, atoms, k1, k2, i as i64).expect("workload");
+        workload_iteration(&mut machine, &mut ctx, module, k1, k2, i as i64).expect("workload");
     }
     ctx.words
 }
 
 /// The collector's peak **live** words and its collection count for `n` iterations.
-fn rooted_peak_live_words(n: usize, atoms: &AtomTable, k1: Atom, k2: Atom) -> (usize, usize) {
+fn rooted_peak_live_words(n: usize, module: &Module, k1: Atom, k2: Atom) -> (usize, usize) {
     let mut machine = Machine::new();
     let mut ctx = MovingContext::new();
     for i in 0..n {
-        workload_iteration(&mut machine, &mut ctx, atoms, k1, k2, i as i64).expect("workload");
+        workload_iteration(&mut machine, &mut ctx, module, k1, k2, i as i64).expect("workload");
     }
     (ctx.peak_live_words, ctx.collections)
 }
@@ -539,14 +548,15 @@ fn rooted_peak_live_words(n: usize, atoms: &AtomTable, k1: Atom, k2: Atom) -> (u
 /// allocation count before the reroute, and the rooted count was `0`).
 #[test]
 fn the_builders_route_every_allocation_through_the_rooted_seam() {
-    let mut atoms = AtomTable::new();
-    let (k1, k2) = (atoms.intern("a"), atoms.intern("b"));
+    let mut module = Module::default();
+    let k1 = module.atom_table.intern("a");
+    let k2 = module.atom_table.intern("b");
     let mut machine = Machine::new();
     let mut ctx = CountingContext::new();
 
     const N: usize = 1_000;
     for i in 0..N {
-        workload_iteration(&mut machine, &mut ctx, &atoms, k1, k2, i as i64).expect("workload");
+        workload_iteration(&mut machine, &mut ctx, &module, k1, k2, i as i64).expect("workload");
     }
 
     assert_eq!(
@@ -765,8 +775,9 @@ const PEAK_TABLE_LENGTHS: [usize; 4] = [1_000, 5_000, 20_000, 50_000];
 ///   loop runs (the live set is the map rooted at `x(0)` plus the blocks in flight).
 #[test]
 fn the_rooted_seam_bounds_peak_live_words_as_the_loop_grows() {
-    let mut atoms = AtomTable::new();
-    let (k1, k2) = (atoms.intern("a"), atoms.intern("b"));
+    let mut module = Module::default();
+    let k1 = module.atom_table.intern("a");
+    let k2 = module.atom_table.intern("b");
 
     println!(
         "{:>6} | {:>35} | {:>29} | {:>11}",
@@ -775,8 +786,8 @@ fn the_rooted_seam_bounds_peak_live_words_as_the_loop_grows() {
     let mut unrooted = Vec::new();
     let mut rooted = Vec::new();
     for n in PEAK_TABLE_LENGTHS {
-        let before = unrooted_peak_words(n, &atoms, k1, k2);
-        let (live, collections) = rooted_peak_live_words(n, &atoms, k1, k2);
+        let before = unrooted_peak_words(n, &module, k1, k2);
+        let (live, collections) = rooted_peak_live_words(n, &module, k1, k2);
         println!("{n:>6} | {before:>35} | {live:>29} | {collections:>11}");
 
         // Every iteration's three builders reserve once each through the rooted seam,
