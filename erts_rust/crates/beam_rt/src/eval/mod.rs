@@ -75,8 +75,13 @@
 //!   is a typed `unsupported` (there is no host timer to block on); a bare `receive` inside a
 //!   spawned process is too, because that context runs *inside* a scheduler slice and must
 //!   not re-enter the scheduler.
-//! * `catch Expr` yields `{'EXIT', Reason}` for the `error`/`exit` classes (the
-//!   oracle appends a stacktrace); M1 evaluates without one.
+//! * `catch Expr` folds **by class**, exactly like `erl_eval`: a `throw` yields the
+//!   reason, an `exit` yields `{'EXIT', Reason}`, and an `error` yields
+//!   `{'EXIT', {Reason, Stacktrace}}`. The supplied `erlang:raise/3` trace is rendered
+//!   for the `error` class, and the trace is always a list (never dropped).
+//!   The residual limitation: a raise carrying **no** supplied trace (`erlang:error/1`,
+//!   an arithmetic error) renders an **empty** trace, because the `-eval` tree-walker
+//!   gathers none (the oracle's trace is its own `erl_eval` call chain).
 //!
 //! A `fun` built here **can** escape into a loaded module: the closure bodies live on
 //! the [`Runtime`](crate::runtime::Runtime) (not on the evaluator), so a higher-order
@@ -1098,8 +1103,10 @@ impl Evaluator<'_, '_> {
             }
             Err(Flow::Fatal(err)) => Err(Flow::Fatal(err)),
             Err(Flow::Raise {
-                class, reason, ..
-            }) => self.catch_clauses(&try_block.catches, class, reason, env),
+                class,
+                reason,
+                origin,
+            }) => self.catch_clauses(&try_block.catches, class, reason, origin, env),
         };
         if !try_block.after.is_empty() {
             let mut after_env = env.clone();
@@ -1109,14 +1116,23 @@ impl Evaluator<'_, '_> {
     }
 
     /// Matches an exception against a `try`'s catch clauses.
+    ///
+    /// The 3rd (stacktrace) pattern of a clause is matched against the **cooked** trace,
+    /// exactly as the oracle's `try … catch C:R:S -> … end` binds it: the supplied
+    /// `erlang:raise/3` frames, rendered `[{M,F,A,Location}]` (see
+    /// [`Evaluator::cook_supplied_trace`]). The trace is computed **lazily**, at most
+    /// once, and only when some clause actually carries a stacktrace pattern, so a
+    /// `catch C:R -> …` clause pays nothing.
     fn catch_clauses(
         &mut self,
         clauses: &[CatchClause],
         class: ExceptionClass,
         reason: Eterm,
+        origin: Option<BeamError>,
         env: &Env,
     ) -> EResult<Eterm> {
         let class_term = self.atom(class.as_str());
+        let mut cooked_trace: Option<Eterm> = None;
         for clause in clauses {
             let mut clause_env = env.clone();
             let mut matched = true;
@@ -1128,7 +1144,11 @@ impl Evaluator<'_, '_> {
             }
             if matched {
                 if let Some(pattern) = &clause.stacktrace {
-                    matched = self.match_pattern(pattern, NIL, &mut clause_env)?;
+                    if cooked_trace.is_none() {
+                        cooked_trace = Some(self.cook_supplied_trace(&origin)?);
+                    }
+                    let trace = cooked_trace.expect("the cooked trace was just computed");
+                    matched = self.match_pattern(pattern, trace, &mut clause_env)?;
                 }
             }
             if !matched {
@@ -1139,10 +1159,12 @@ impl Evaluator<'_, '_> {
             }
             return self.exprs(&clause.body, &mut clause_env);
         }
+        // No clause matched: re-raise the **same** exception, `origin` included, so an
+        // outer `catch`/`try` still sees the supplied stacktrace.
         Err(Flow::Raise {
             class,
             reason,
-            origin: None,
+            origin,
         })
     }
 
@@ -1310,18 +1332,64 @@ impl Evaluator<'_, '_> {
     }
 
     /// `catch Expr`.
+    ///
+    /// Folds **by class**, the literal `erl_eval` rule (`lib/stdlib/src/erl_eval.erl`):
+    /// a `throw` yields the reason, an `exit` yields `{'EXIT', Reason}` (never a trace,
+    /// even if one was supplied), and an `error` yields `{'EXIT', {Reason, Trace}}`
+    /// **always** — a 2-tuple whose trace is the raise's supplied `erlang:raise/3`
+    /// frames (or `[]`).
     fn catch_expr(&mut self, inner: &Expr, env: &mut Env) -> EResult<Eterm> {
         match self.expr(inner, env) {
             Ok(value) => Ok(value),
             Err(Flow::Fatal(err)) => Err(Flow::Fatal(err)),
-            Err(Flow::Raise { class, reason, .. }) => {
-                if class == ExceptionClass::Throw {
-                    return Ok(reason);
+            Err(Flow::Raise {
+                class,
+                reason,
+                origin,
+            }) => match class {
+                ExceptionClass::Throw => Ok(reason),
+                ExceptionClass::Error => {
+                    let trace = self.cook_supplied_trace(&origin)?;
+                    let tag = self.atom("EXIT");
+                    let reason = heap!(terms::make_tuple(self.ctx, &[reason, trace]));
+                    Ok(heap!(terms::make_tuple(self.ctx, &[tag, reason])))
                 }
-                let tag = self.atom("EXIT");
-                Ok(heap!(terms::make_tuple(self.ctx, &[tag, reason])))
-            }
+                _ => {
+                    let tag = self.atom("EXIT");
+                    Ok(heap!(terms::make_tuple(self.ctx, &[tag, reason])))
+                }
+            },
         }
+    }
+
+    /// Cooks a raise's supplied stacktrace into the oracle's `[{M,F,A,Location}]` list.
+    ///
+    /// The trace is the frames an `erlang:raise/3` **supplied** (`raise.stacktrace`),
+    /// rendered by the engine's public
+    /// [`encode_supplied_stacktrace`](beam_engine::encode_supplied_stacktrace) exactly as
+    /// the oracle renders it (innermost first). A raise that carries no
+    /// [`BeamError::Raise`] (e.g. `erlang:error/1`, an arithmetic error — the tree-walker
+    /// gathers no frames) cooks to [`NIL`], the empty trace.
+    ///
+    /// The `module` argument is an **atom source only** — resolved by lookup, nothing is
+    /// interned — so it carries a **clone** of the runtime's shared atom table (built
+    /// after the raise's frame names were already interned by the `-eval` expression), and
+    /// a name the table cannot resolve surfaces as the typed `error::unsupported(...)`,
+    /// never a substituted atom.
+    fn cook_supplied_trace(&mut self, origin: &Option<BeamError>) -> EResult<Eterm> {
+        let Some(BeamError::Raise(raise)) = origin else {
+            return Ok(NIL);
+        };
+        let module = beam_loader::Module {
+            atom_table: self.ctx.runtime.code_server.atoms().clone(),
+            ..beam_loader::Module::default()
+        };
+        let ctx: &mut dyn ExecutionContext = &mut *self.ctx;
+        Ok(heap!(beam_engine::encode_supplied_stacktrace(
+            &module,
+            ctx,
+            &raise.stacktrace
+        )))
     }
 
     /// `fun Name/Arity` / `fun Mod:Name/Arity` — a local `fun f/A` is `erlang:f/A`.

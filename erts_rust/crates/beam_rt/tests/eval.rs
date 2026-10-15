@@ -890,3 +890,92 @@ fn an_eval_lambda_has_no_new_fun_ext_image_and_stays_unsupported() {
         "the -eval lambda must stay the typed local_fun gap, never an image"
     );
 }
+
+/// Runs the raw `io:format("~p~n",[<expr>]),halt(0).` probe at the CLI boundary and
+/// returns `(trimmed_stdout, exit_code, stderr)`.
+///
+/// This is the *unwrapped* form the differential harness uses for an `-eval` case that
+/// prints its own result (the corpus's `try … catch` wrapper is for an uncaught error);
+/// it exercises the whole parser → evaluator → `~p` printer → CLI path.
+fn raw_probe(expr: &str) -> (String, i32, String) {
+    let probe_expr = format!(r#"io:format("~p~n",[{expr}]),halt(0)."#);
+    let output = Command::new(env!("CARGO_BIN_EXE_beam_rt"))
+        .args(["-noshell", "-eval", probe_expr.as_str()])
+        .output()
+        .unwrap_or_else(|error| panic!("spawning beam_rt for {expr:?} failed: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit = output
+        .status
+        .code()
+        .expect("beam_rt always exits normally (never killed by a signal)");
+    (stdout, exit, stderr)
+}
+
+/// `catch Expr` and `try … catch C:R:S -> … end` render the **supplied** `erlang:raise/3`
+/// stacktrace, matching the system oracle (contract A.1, exception semantics).
+///
+/// The oracle's rule (`lib/stdlib/src/erl_eval.erl`) folds `catch` **by class**: a `throw`
+/// yields the reason, an `exit` yields `{'EXIT', Reason}` (never a trace, even when one was
+/// supplied), and an `error` yields `{'EXIT', {Reason, Stacktrace}}` **always** — including a
+/// non-atom reason, which keeps the trace. A `try` clause's 3rd pattern binds the same
+/// cooked `[{M,F,A,Location}]` list. Each golden below is the oracle's *own* output
+/// (OTP 29 / erts-17.1) and is cross-checked against it live (a loud skip when no `erl` is
+/// available, never a silent pass).
+#[test]
+fn a_caught_raise_renders_its_supplied_stacktrace() {
+    let cases: &[(&str, &str)] = &[
+        // `error` keeps the supplied trace.
+        (
+            "catch erlang:raise(error,r,[{m,f,0}])",
+            "{'EXIT',{r,[{m,f,0,[]}]}}",
+        ),
+        // A located frame keeps its `file`/`line`.
+        (
+            r#"catch erlang:raise(error,r,[{m,f,1,[{file,"m.erl"},{line,7}]}])"#,
+            r#"{'EXIT',{r,[{m,f,1,[{file,"m.erl"},{line,7}]}]}}"#,
+        ),
+        // An empty supplied trace is still a 2-tuple.
+        ("catch erlang:raise(error,r,[])", "{'EXIT',{r,[]}}"),
+        // `exit` drops the trace even when one was supplied.
+        (
+            "catch erlang:raise(exit,{shutdown,1},[{m,f,0}])",
+            "{'EXIT',{shutdown,1}}",
+        ),
+        // The rule is class-based, not reason-shape-based: a non-atom `error` reason keeps it.
+        (
+            "catch erlang:raise(error,{badmatch,1},[{m,f,0}])",
+            "{'EXIT',{{badmatch,1},[{m,f,0,[]}]}}",
+        ),
+        // A `try` clause's stacktrace pattern binds the same cooked list.
+        (
+            "try erlang:raise(error,r,[{m,f,0}]) catch C:R:S -> {C,R,S} end",
+            "{error,r,[{m,f,0,[]}]}",
+        ),
+    ];
+
+    let oracle = support::require_oracle("eval caught-raise stacktrace");
+    for (expr, golden) in cases {
+        let (stdout, exit, stderr) = raw_probe(expr);
+        assert_eq!(stdout, *golden, "{expr}: stdout (stderr {stderr:?})");
+        assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+
+        // Live oracle cross-check: the system `erl` prints the very same line. A missing
+        // oracle (or a probe that cannot answer) is a loud skip, never a silent pass.
+        if let Some(oracle) = &oracle {
+            let probe_expr = format!(r#"io:format("~p~n",[{expr}]),halt(0)."#);
+            match support::oracle_eval(oracle, None, &probe_expr) {
+                Some(oracle_stdout) => assert_eq!(
+                    stdout, oracle_stdout,
+                    "{expr}: the runtime renders the trace the oracle does"
+                ),
+                None => eprintln!(
+                    "SKIP the live-oracle comparison for {expr:?}: the erl probe could not answer"
+                ),
+            }
+        }
+    }
+}

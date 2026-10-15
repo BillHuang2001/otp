@@ -457,18 +457,6 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   exit 1, vs the oracle's `[{k,fun lists:reverse/1}]`, exit 0. The fun itself is sound — `erlang:make_fun/3`
   and `fun M:F/A` both work, only printing fails, and the failure is catchable
   (`catch io:format(...)` → `{'EXIT',badarg}`). Owner: `erts_rust/crates/beam_bifs`.
-* **`beam_engine` — `catch Expr` drops the `{Reason, Stacktrace}` pair ERTS appends to a class-`error`
-  exception.** ERTS' `catch_end` (`erts/emulator/beam/emu/instrs.tab`, `add_stacktrace`) appends the
-  stacktrace to an `error` reason and skips the append only for `exit`; the `Instr::CatchEnd` arm's `else`
-  branch (`erts_rust/crates/beam_engine/src/families/exceptions/mod.rs:207-248`, lines 221-245) builds
-  `{'EXIT',Reason}` for **both** classes and never calls the stacktrace builder. Raw evidence on the
-  scheduled `run` route: `(catch erlang:error(ereason))` → runtime `{'EXIT',ereason}`, oracle
-  `{'EXIT',{ereason,[{cls,run,0,[{file,…},{line,4}]},…]}}`; `catch throw(_)`, `catch exit(_)` and
-  `catch erlang:raise(exit,…)` all agree. A `try … catch C:R:S` binds the right `S` (that path uses
-  `Instr::BuildStacktrace`), so the divergence is specific to `catch Expr`. It is the documented M1 omission
-  in `beam_engine/src/families/exceptions/CONTEXT.md` and is pinned by
-  `beam_engine/tests/exceptions.rs::old_style_catch_builds_the_exit_tuple_without_a_stacktrace`.
-  Owner: `erts_rust/crates/beam_engine`.
 * **`beam_engine` — a stacktrace's top frame is duplicated (the same `{M,F,A}` at two adjacent lines).**
   `Machine::throw_with_trace` (`erts_rust/crates/beam_engine/src/machine/catch.rs:318-324`) pushes the
   raising frame from `Machine::current_code()` and then again from `Machine::resumption_contexts()`
@@ -666,21 +654,6 @@ the async-completion shape for a **live, blocked** target is pinned only on the 
 (`tests/garbage_collect.rs`). Owner: `src/eval/mod.rs`'s `receive` — the `after T` deadline must
 actually be waited out (or a spawned `-eval` child otherwise kept alive).
 
-**The `-eval` route carries an `erlang:raise/3` stacktrace but never delivers it to a `catch`.** The call
-falls through to the registered `beam_bifs::convert::raise_3` BIF, so the class and the trace **are**
-validated (a bad shape is the returned `badarg`) and the trace **is** decoded onto the raise
-(`Raise::stacktrace`, pinned by
-`src/eval/mod.rs::raise_is_served_by_the_registry_bif_carrying_the_decoded_stacktrace`). What is missing
-is observation: the evaluator's `catch_clauses` (`src/eval/mod.rs`) matches a clause's third pattern
-against `NIL`, so `try erlang:raise(error,R,[{m,f,0}]) catch C:R:S -> … end` binds `S` to `[]` and
-`catch erlang:raise(error,R,[{m,f,0}])` renders `{'EXIT',R}` — the oracle binds `[{m,f,0,[]}]` and renders
-`{'EXIT',{R,[{m,f,0,[]}]}}`. Closing it needs a `StackTrace → Eterm` encoder this crate does not have:
-`beam_engine`'s own is `carve_supplied_frames`
-(`beam_engine/src/families/exceptions/stacktrace.rs`, `pub(crate)`), so it needs a public `beam_engine`
-API (a duplicated encoder would break the no-duplication contract). The engine's **compiled**
-`try … catch C:R:S` does bind the right `S` (`Instr::BuildStacktrace`), so this is `-eval`-specific.
-Owner: `src/eval/mod.rs`'s `catch_clauses` + a `beam_engine` API.
-
 ## GC-relocation hazards (what a MOVING engine heap would invalidate)
 The engine's `alloc_words` seam prefers the running process's own **young heap** (a capacity refusal
 is met by a no-relocation `Process::grow_nursery` and one retry) and falls back to the
@@ -792,7 +765,7 @@ A by-owner index of the long forms in `## Cross-node handoff detail` above; the 
 * **A.7/A.9 boot (completion)** → the bullet above + [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
 * **A.9 E0 (in-process `compile:file`)** → `tests/compile_file.rs`; mover: [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).
 * **`beam_bifs` — the `io:format/2` `~p`/`~w` fun-printing `badarg`** → the bullet above (`beam_bifs/src/io.rs`).
-* **`beam_engine` — the stacktrace defects** → `catch Expr`'s dropped stacktrace, the duplicated top frame and the dropped entry-module frame (bullets above).
+* **`beam_engine` — the stacktrace defects** → the duplicated top frame and the dropped entry-module frame (bullets above).
 * **The native `file_server_2` service** → [`src/native/CONTEXT.md`](src/native/CONTEXT.md) + [`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md).
 * **`beam_process` / `beam_message`** → the wake-list drain + `!Send`-friendly `SchedulerPool` (bullet above).
 * **`beam_engine`** → the `MinimalContext` arena accessor (bullet above).
