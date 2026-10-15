@@ -148,6 +148,12 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `terms(&self) -> &[Eterm]`, `heap(&self) -> Option<&beam_alloc::Heap>`.
   Decoding goes through `beam_codec::decode_term` into a private `beam_alloc::Heap`; an exhausted decode
   is retried (bounded) on a larger arena, a malformed payload is a typed `BeamError`.
+  **`decode` literal-tags the decoded arena** before publishing it: `beam_term::literal::tag_literal_area`
+  (the safe form of the C load-time `erts_set_literal_tag`, `../../erts/emulator/beam/erl_term.c`) is run
+  over `heap.used_words_mut()` and the `terms` roots, so the BOXED/LIST words carry `TAG_LITERAL_PTR` (an
+  off-heap literal region the collector leaves alone). Tagging is at the `decode` call site only — the
+  shared `decode_terms`/`decode_terms_at_capacity` helpers stay untagged for `attributes.rs`'s
+  `AttributeTable`, whose terms are ordinary heap terms.
   `pub type SharedLiteralArea = Arc<LiteralArea>;` — the type of `Module.literals`.
   `LiteralArea` is **not `Send`/`Sync`** (it owns a raw-pointer `Heap`), and therefore neither is a loaded `Module`.
 ### The instruction vocabulary (`src/instr.rs`, re-exported by `ir.rs`)
