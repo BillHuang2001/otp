@@ -88,15 +88,14 @@ pub(super) fn put_map_assoc(
     // may run under), then re-read the source and every key/value operand from the
     // post-collection state and merge into a pair list that is only ever read.
     let extra = merge_slack_words(source, pairs);
-    let atoms = &module.atom_table;
     let result = terms::make_map_rooted(
         machine,
+        module,
         ctx,
         RootSet::ALL_LIVE,
         capacity,
         extra,
-        atoms,
-        |m, slack| {
+        |m, slack, atoms| {
             let map = read_operand_slack(m, source, slack)?;
             let mut merged = terms::map_entries(map)?;
             for (key_operand, value_operand) in pairs {
@@ -137,7 +136,9 @@ pub(super) fn put_map_exact(
     let existing = terms::map_entries(map)?;
     for (key_operand, _) in pairs {
         let key = read_operand(machine, ctx, key_operand)?;
-        if position(&existing, key, &module.atom_table).is_none() {
+        // The namespace is taken AFTER the operand read (it borrows `*ctx`
+        // immutably, so it must not be held across `read_operand`'s `&mut`).
+        if position(&existing, key, ctx.atoms(module)).is_none() {
             return fail_or_raise(machine, module, labels, ctx, fail, "badkey", key_operand);
         }
     }
@@ -145,15 +146,14 @@ pub(super) fn put_map_exact(
     // Phase B: reserve, then re-read and merge (the pre-validated keys are re-read so
     // the merge uses the post-collection terms).
     let extra = merge_slack_words(source, pairs);
-    let atoms = &module.atom_table;
     let result = terms::make_map_rooted(
         machine,
+        module,
         ctx,
         RootSet::ALL_LIVE,
         capacity,
         extra,
-        atoms,
-        |m, slack| {
+        |m, slack, atoms| {
             let map = read_operand_slack(m, source, slack)?;
             let mut merged = terms::map_entries(map)?;
             for (key_operand, value_operand) in pairs {

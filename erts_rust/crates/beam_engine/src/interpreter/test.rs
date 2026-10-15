@@ -49,31 +49,30 @@ impl Machine {
         args: &[Operand],
         ctx: &mut dyn ExecutionContext,
     ) -> Result<bool> {
-        let atoms = &module.atom_table;
         match kind {
             TestKind::IsLt => {
                 let (a, b) = self.test_pair(args, ctx)?;
-                Ok(cmp_arith(a, b, atoms).is_lt())
+                Ok(cmp_arith(a, b, ctx.atoms(module)).is_lt())
             }
             TestKind::IsGe => {
                 let (a, b) = self.test_pair(args, ctx)?;
-                Ok(cmp_arith(a, b, atoms).is_ge())
+                Ok(cmp_arith(a, b, ctx.atoms(module)).is_ge())
             }
             TestKind::IsEq => {
                 let (a, b) = self.test_pair(args, ctx)?;
-                Ok(cmp_arith(a, b, atoms).is_eq())
+                Ok(cmp_arith(a, b, ctx.atoms(module)).is_eq())
             }
             TestKind::IsNe => {
                 let (a, b) = self.test_pair(args, ctx)?;
-                Ok(!cmp_arith(a, b, atoms).is_eq())
+                Ok(!cmp_arith(a, b, ctx.atoms(module)).is_eq())
             }
             TestKind::IsEqExact => {
                 let (a, b) = self.test_pair(args, ctx)?;
-                Ok(cmp(a, b, atoms).is_eq())
+                Ok(cmp(a, b, ctx.atoms(module)).is_eq())
             }
             TestKind::IsNeExact => {
                 let (a, b) = self.test_pair(args, ctx)?;
-                Ok(!cmp(a, b, atoms).is_eq())
+                Ok(!cmp(a, b, ctx.atoms(module)).is_eq())
             }
             TestKind::IsInteger => Ok(predicates::is_integer(self.test_arg(args, 0, ctx)?)),
             TestKind::IsFloat => Ok(predicates::is_float(self.test_arg(args, 0, ctx)?)),
@@ -105,12 +104,13 @@ impl Machine {
             TestKind::IsBoolean => {
                 // `is_boolean Fail Src` (`emu/instrs.tab:933`): `Src` is the atom
                 // `true` or `false`. Both are ordinary atoms, so compare against the
-                // module's atom table; a name absent from the table can never be the
+                // host's atom namespace; a name absent from it can never be the
                 // value, so a missing name is `false` (not an error).
                 let v = self.test_arg(args, 0, ctx)?;
                 if !is_atom(v) {
                     return Ok(false);
                 }
+                let atoms = ctx.atoms(module);
                 let is_true = atoms
                     .lookup("true")
                     .map(|a| v == make_atom(a))

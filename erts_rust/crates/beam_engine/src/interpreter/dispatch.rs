@@ -313,7 +313,7 @@ impl Machine {
                 let mut target = None;
                 for (candidate, label) in pairs {
                     let candidate_value = read_operand(self, ctx, candidate)?;
-                    if cmp(scrutinee, candidate_value, &module.atom_table).is_eq() {
+                    if cmp(scrutinee, candidate_value, ctx.atoms(module)).is_eq() {
                         target = Some(*label);
                         break;
                     }
