@@ -562,20 +562,17 @@ The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `
 `application_controller`'s `ets:new(ac_tab, …)` and name-resolved `ets:insert/lookup` work; the normalized
 `write_concurrency` lock count lives in the `TableProfile` sidecar). There is **no self-hosted build** yet, and the
 `ets:foldl/3`/`foldr/3` blocker is in Handoffs.
-- **The other A.9 compile blocker — `sofs:drestriction/2` mis-executing (`beam_rt/src/CONTEXT.md`) — is NOT a
-  BIF defect; do not re-audit this crate for it.** Every BIF on the `restrict_n/5`/`diff_restrict_n/5` path is
-  C-faithful (`erlang:element/2` `src/term_ops.rs:66-102` vs `bif.c:2944-2957`; `lists:{reverse/1,reverse/2,
-  keysort/2,sort/1,usort/1}` `src/lists.rs`), and this crate's `erlang` comparison BIFs compare by atom *name*
-  over the runtime's one **shared** `AtomTable` (`src/compare.rs:84-121` via `ctx.atoms()`; `beam_rt/src/
-  context/calls.rs:42-47`), so they are correct. The wrong branch is in the **guard/`test`** lowering:
-  `beam_engine`'s `eval_test` (`beam_engine/src/interpreter/test.rs:52`) evaluates `is_lt`/`is_ge`/`is_eq`/… with
-  `module.atom_table` — the running module's **load-time snapshot** of the shared table (`beam_rt/src/
-  codeserver.rs:573` clones it) — and `beam_term::cmp_atoms` (`beam_term/src/compare.rs:356-363`) falls back to
-  raw **atom-index** order when a name is absent (the table-relative-`Atom` limitation `beam_term/CONTEXT.md`
-  already records). `sofs`'s `diff_restrict_n/5` guard `K < Key` (`../../lib/stdlib/src/sofs.erl:3702-3709`)
-  compares the caller's `{module_info,0}` against `{g,1}`; `g` is not in `sofs.beam`'s atom table, so the
-  index-order fallback reports `{module_info,0} < {g,1}` `true` and the restriction is returned instead of the
-  difference. Fix owns to `beam_engine`/`beam_term` (compare against a live/name-resolvable table), not here.
+- **This crate's `erlang` comparison BIFs are the reference for atom ordering — do not re-audit them.**
+  `src/compare.rs:84-121` compares by atom *name* over the runtime's one **shared** `AtomTable`
+  (`ctx.atoms()`; `beam_rt/src/context/calls.rs:42-47`), and every BIF on the `sofs`
+  `restrict_n/5`/`diff_restrict_n/5` path is C-faithful (`erlang:element/2` `src/term_ops.rs:66-102` vs
+  `bif.c:2944-2957`; `lists:{reverse/1,reverse/2,keysort/2,sort/1,usort/1}` `src/lists.rs`). The engine's
+  guard/`test` path now resolves through the same namespace via the defaulted
+  `ExecutionContext::atoms` seam (`beam_engine/src/interpreter/test.rs`), which `beam_rt` overrides with the
+  live table, so a guard and the equivalent `<` BIF order terms identically. A name absent from whatever
+  table a caller supplies still makes `beam_term::cmp_atoms` (`beam_term/src/compare.rs:356-363`) fall back to
+  raw **atom-index** order (the table-relative-`Atom` limitation `beam_term/CONTEXT.md` records), so any new
+  comparison site must be handed the shared table, not a per-module snapshot.
 
 ## Handoffs (sibling nodes)
 ### Required from `beam_rt` (exact locations)
