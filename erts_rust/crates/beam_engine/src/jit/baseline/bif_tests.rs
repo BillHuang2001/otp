@@ -317,6 +317,127 @@ fn tuple_size_cons_case() -> (Module, Atom) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// (d) the Y-operand shapes keep the published frame window
+// ---------------------------------------------------------------------------
+
+/// `hd(Y(0))` where `Y(0)` holds the cons cell — the lowered `Bif`'s **`Y` source**
+/// operand, read through the guarded frame window.
+fn hd_y_source_case() -> (Module, Atom) {
+    bif_module(
+        "bif_hd_y_source",
+        "hd",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::PutList {
+                head: Operand::Integer(8),
+                tail: Operand::Nil,
+                dst: Operand::X(1),
+            },
+            Instr::PutList {
+                head: Operand::Integer(7),
+                tail: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::Y(0),
+            },
+            bif_call(1, vec![Operand::Y(0)], Operand::X(0)),
+            Instr::Return,
+        ],
+    )
+}
+
+/// `tuple_size({a, b})` with the destination in `Y(0)` — the lowered `Bif`'s **`Y`
+/// destination**, whose frame-window guard is emitted before the value is computed.
+fn tuple_size_y_destination_case() -> (Module, Atom) {
+    let (mut module, export) = bif_module(
+        "bif_tuple_size_y",
+        "tuple_size",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 1,
+            },
+            // Patched by `with_interned_tuple` below.
+            Instr::PutTuple2 {
+                dst: Operand::X(0),
+                elements: Vec::new(),
+            },
+            bif_call(1, vec![Operand::X(0)], Operand::Y(0)),
+            Instr::Move {
+                src: Operand::Y(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    with_interned_tuple(&mut module, 3, &["a", "b"]);
+    (module, export)
+}
+
+/// **A `Y` operand of a lowered `Bif` is served by the guarded frame window**, not by a
+/// stale `X` slot: the syntactic gate [`uses_y`] reports the instruction (so the block
+/// publishes/refreshes the window), and both tiers return the BIF's value on **both**
+/// operand sides — a `Y` source for `hd/1` and a `Y` destination for `tuple_size/1`.
+///
+/// A lowering that ignored `Y` would read/write the wrong slot (or a null window) and
+/// diverge from the interpreter; the `Y`-destination case additionally pins that the
+/// value is stored into the slot the following instruction reads, i.e. that the
+/// destination guard is emitted before the value is computed.
+#[test]
+fn the_y_operand_shapes_are_lowered_and_agree_across_the_tiers() {
+    let (hd_module, hd_name) = hd_y_source_case();
+    let (size_module, size_name) = tuple_size_y_destination_case();
+    assert!(
+        uses_y(&hd_module, &hd_module.functions[0].code[6]),
+        "the `Bif` of `hd(Y(0))` reads the frame window, so the block must publish it"
+    );
+    assert!(
+        uses_y(&size_module, &size_module.functions[0].code[4]),
+        "the `Bif` of `tuple_size(T) -> Y(0)` writes the frame window, so the block must \
+         publish it"
+    );
+
+    with_both_tiers_bif_host(&hd_module, hd_name, |interpreter, baseline| {
+        assert_value("hd(Y(0)) (interpreter tier)", make_small(7), interpreter);
+        assert_value("hd(Y(0)) (baseline tier)", make_small(7), baseline);
+        assert_same_outcome(
+            "hd of a cons in a Y slot",
+            interpreter,
+            baseline,
+            &hd_module.atom_table,
+        );
+    });
+    with_both_tiers_bif_host(&size_module, size_name, |interpreter, baseline| {
+        assert_value(
+            "tuple_size(T) into Y(0) (interpreter tier)",
+            make_small(2),
+            interpreter,
+        );
+        assert_value(
+            "tuple_size(T) into Y(0) (baseline tier)",
+            make_small(2),
+            baseline,
+        );
+        assert_same_outcome(
+            "tuple_size into a Y slot",
+            interpreter,
+            baseline,
+            &size_module.atom_table,
+        );
+    });
+}
 /// Assert both tiers returned `expected`, then that they agree.
 fn assert_value(label: &str, expected: Eterm, outcome: &Result<RunOutcome>) {
     assert_eq!(
