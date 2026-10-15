@@ -394,13 +394,23 @@ impl RuntimeContext<'_> {
     /// any script has been loaded there is no id to report, which is a typed capability
     /// gap — never a fabricated `{"Erlang/OTP", …}` literal.
     ///
-    /// `// documented divergence:` this runtime's release is OTP `30.0-rc0`, so the header
-    /// of the committed `bootstrap/bin/start.boot` it loads is `{"Erlang/OTP","30"}` where
-    /// the OTP-29 oracle reports `{"Erlang/OTP","29"}`. The value is the *real* header of
-    /// the script this runtime loaded, so it tracks the release exactly as the oracle's
-    /// does — the difference is the release, not the mechanism.
+    /// The value is the *real* header of the script this runtime actually loaded
+    /// ([`Runtime::boot_script_id`]), so it tracks the loaded script exactly as the
+    /// oracle's `init:script_id/0` does. On the default route the CLI resolves `start` to
+    /// `<Root>/bin/start.boot`, where `<Root>` is the **consumed** system installation's
+    /// root (`CodeServer::lib_root()`'s parent, via `cli::boot_file_root` /
+    /// `cli::resolve_boot_file`), so on this host the answer is that OTP-29 installation's
+    /// header `{"Erlang/OTP","29"}`. The committed `bootstrap/bin/start.boot`
+    /// (`{"Erlang/OTP","30"}`) is loaded only via an explicit
+    /// `-boot bootstrap/bin/start`.
+    ///
+    /// `// documented divergence:` the compile-time `erlang:system_info(otp_release)`
+    /// reports this runtime's *target* release (`"30"`), so
+    /// `init:script_id() =:= {"Erlang/OTP", otp_release}` is **false** here: the consumed
+    /// installation's release differs from the runtime's target.
     ///
     /// [`Runtime::boot_from_script`]: crate::Runtime::boot_from_script
+    /// [`Runtime::boot_script_id`]: crate::Runtime::boot_script_id
     pub(super) fn script_id_0(&mut self) -> Result<Eterm> {
         let Some((name, vsn)) = self
             .runtime
