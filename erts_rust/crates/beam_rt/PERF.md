@@ -15,7 +15,7 @@ that cannot produce a Rust-side figure are recorded as `skipped(<reason>)` with 
 
 ## Current startup regime (read before quoting any `startup_ms` figure)
 
-Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else the literal default `start` resolved to `<Root>/bin/start.boot` (the installation's own script, not this repo's committed `bootstrap/bin/start.boot`).
+Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else **this runtime's own** release's committed `bootstrap/bin/start.boot` (`CodeServer::own_bootstrap_boot_script`; the literal `start` resolved to `<Root>/bin/start.boot` only when that is undiscoverable).
 A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 2.19 s wall** on this host.
 Every `startup_ms` figure below is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band) and its ratio to the oracle is that snapshot's; those numbers do not describe the current whole-process wall.
 The present whole-process wall is dominated by that ≈ 2.19 s boot, so **no startup advantage at a recorded margin survives** — quote the ≈ 2.19 s figure for the current runtime.
@@ -835,10 +835,10 @@ It also produced a negative result: with copy-out forced off, `perf_call`'s path
 `erts_rust/tools/differential/gate.sh` on this tree: `differential gate: total=2497 agree=2495
 mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)** at that HEAD;
 the recorded capability gap is `wire/new_fun_ext_encode` (A.5). The A.9
-`boot_extra/init_script_id_names_the_running_otp_release` case is a **live divergence**, not a recorded
-gap: `init:script_id()` answers the resolved installation script's `{"Erlang/OTP","29"}` while
-`erlang:system_info(otp_release)` answers this runtime's target `"30"`, so its `=:=` assertion is `false`
-here and `true` on the oracle. A dispatch change is
+`boot_extra/init_script_id_names_the_running_otp_release` case **agrees** on the current tree: with no
+`-boot` the default route drives this runtime's own release's script
+(`CodeServer::own_bootstrap_boot_script`), so `init:script_id()` answers `{"Erlang/OTP","30"}`,
+matching `erlang:system_info(otp_release)` (`"30"`). A dispatch change is
 behaviour-adjacent, so this is the authoritative check that no result moved.
 ## Caveats that invalidate a comparison (`DISPATCH-CUT`)
 - The three windows have different host load (22.13 / 25.72 / 2.51 1-min); only per-row ratios and
@@ -988,10 +988,9 @@ supporting API) and is **reported, not hacked around**: this node owns only the 
 `erts_rust/tools/differential/gate.sh` on the AFTER tree: `differential gate: total=2497 agree=2495
 mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)**, against a
 real oracle (`erl` present on `$PATH`). The recorded capability gap is `wire/new_fun_ext_encode` (A.5);
-the A.9 `boot_extra/init_script_id_names_the_running_otp_release` case is a **live divergence**, not a
-recorded gap: `init:script_id()` answers the resolved installation script's `{"Erlang/OTP","29"}` while
-`erlang:system_info(otp_release)` answers this runtime's target `"30"`, so its `=:=` assertion is `false`
-here and `true` on the oracle.
+the A.9 `boot_extra/init_script_id_names_the_running_otp_release` case **agrees** on the current tree:
+with no `-boot` the default route drives this runtime's own release's script, so `init:script_id()`
+answers `{"Erlang/OTP","30"}`, matching `erlang:system_info(otp_release)` (`"30"`).
 A copy-out change moves terms between heaps, so this is the authoritative check that no result moved.
 
 ### Caveats that invalidate a comparison (`COPY-OUT-CUT`)

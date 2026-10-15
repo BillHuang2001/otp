@@ -809,7 +809,11 @@ pub(super) fn descriptor_of(
 /// * `old_uniq` — the `FunT` entry's `old_uniq` field ([`FunDescriptor::uniq`]), which is
 ///   the very word the compiler stores in the fun term's own `uniq` slot;
 /// * `creator` — **always** the init process, `erts_init_process_id` (`<0.0.0>`;
-///   `external.c:3989` writes it unconditionally), never the fun's creating process.
+///   `external.c:3989` writes it unconditionally), never the fun's creating process;
+/// * `function` — the `FunT` entry's local function atom ([`FunDescriptor::function`]),
+///   attached through [`FunIdentity::with_function`](beam_codec::FunIdentity::with_function)
+///   as the **introspection-only** name `erlang:fun_info(F, name)` reports. It is not part
+///   of the `NEW_FUN_EXT` image, so the encoded bytes are unchanged.
 ///
 /// The other two inputs are not derivable from the `Module` IR alone and are therefore
 /// caller-supplied, so this function needs no I/O and no `.beam` reader of its own:
@@ -846,20 +850,28 @@ pub(super) fn local_fun_identity(
     };
     // `FunT` is a `Vec` of descriptors, so its length fits a `u32` (the wire field's width).
     let old_index = u32::try_from(position).map_err(|_| BeamError::SystemLimit)?;
-    let old_uniq = module.funs()[position].uniq;
-    Ok(Some(beam_codec::FunIdentity::new(
-        module_atom,
-        md5,
-        old_index,
-        old_uniq,
-        // `erts_init_process_id` — the fixed `<0.0.0>`: number 0, serial 0, creation 0.
-        beam_codec::FunPid {
-            node,
-            number: 0,
-            serial: 0,
-            creation: 0,
-        },
-    )))
+    let descriptor = module.funs()[position];
+    Ok(Some(
+        beam_codec::FunIdentity::new(
+            module_atom,
+            md5,
+            old_index,
+            descriptor.uniq,
+            // `erts_init_process_id` — the fixed `<0.0.0>`: number 0, serial 0, creation 0.
+            beam_codec::FunPid {
+                node,
+                number: 0,
+                serial: 0,
+                creation: 0,
+            },
+        )
+        // The `FunT` entry also carries the lambda's local function name
+        // (`FunDescriptor::function`) — the atom `erlang:fun_info(F, name)` reports
+        // (`erl_bif_info.c:4007-4010`'s `mfa->function`). It is introspection-only: the
+        // `NEW_FUN_EXT` wire image has no function-name field, so attaching it leaves the
+        // encoded bytes byte-identical.
+        .with_function(descriptor.function),
+    ))
 }
 
 /// The module **checksum** — the 16-byte MD5 a `NEW_FUN_EXT` fun identity carries as

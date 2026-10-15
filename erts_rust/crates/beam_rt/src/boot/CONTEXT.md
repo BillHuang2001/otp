@@ -46,8 +46,16 @@ submodules and their docs; do not look for `boot.rs` here.
   script's `{Name,Vsn}`** (set by `boot_from_script`/`boot_from_script_reporting`, read by the
   `init:script_id/0` floor entry) so the script's identity survives the call. **The CLI really runs a
   boot script on every action but `-version`**: `../cli.rs`'s `boot_script_to_drive` resolves the script
-  (the explicit `-boot FILE` value, else the default `start`) and `boot_then` boots the 22 preloaded
-  `.beam`s and then executes it.
+  (the explicit `-boot FILE` value, else this runtime's **own** release's
+  `bootstrap/bin/start.boot` — see below) and `boot_then` boots the 22 preloaded `.beam`s and then
+  executes it.
+  With the default route loading **this runtime's own** release's script, `Runtime::boot_script_id`
+  and `erlang:system_info(otp_release)` agree (`{"Erlang/OTP","30"}` / `"30"`), so the differential
+  case `boot_extra/init_script_id_names_the_running_otp_release` **agrees**. The `{path, …}` sink
+  (`../boot/bootscript.rs`'s `Instruction::Path` arm) appends a directory **only when it really
+  exists** — `code:add_patha/1` answers `{error,bad_directory}` for an absent one — so the primary
+  bootstrap's *source-tree* `$ROOT/lib/kernel/ebin` does not land on `code:get_path/0` as a dangling
+  entry when `$ROOT` is a versioned installation's root.
 - `code:which/1` / `code:all_loaded/0` / `code:is_loaded/1` render `preloaded` from the **name registry**
   (`../native/code.rs`), not from this cache; `code:all_loaded/0` explicitly filters preloaded names out
   of the cache so it does not list them twice.
@@ -291,16 +299,19 @@ takes ≈2.19 s wall, since it drives the default boot script on every action, w
 shell-out alone costs ≈0.5 s and is still avoided).
 **The resolved root is the consumed SYSTEM install, not this runtime's own tree.** `native_roots`
 seeds candidate roots with the `erl` on `$PATH` first (canonicalized, never executed), then
-`current_exe()` ancestors, `$ERL_TOP` and the standard prefixes; `bootstrap/` is never a candidate
-root and never on the code path. So `CodeServer::lib_root()` is the *system* install's `<lib>` and
-`../cli.rs::boot_file_root` (its parent) is the system install root. The default `-boot start`
-therefore resolves (`../cli.rs::resolve_boot_file`) to `<systemRoot>/bin/start.boot` — the
-*consumed install's* script (header `{"Erlang/OTP","29"}` for an OTP-29 host), **not** the repo's
-committed `bootstrap/bin/start.boot` (header `{"Erlang/OTP","30"}`), which is reachable only through
-an explicit CWD-relative `-boot bootstrap/bin/start`. Consequence: `init:script_id/0` reports the
-*consumed install's* release (`../native/init.rs::script_id_0` ← `Runtime::boot_script_id`) while
-`erlang:system_info(otp_release)` reports the runtime's compile-time target
-(`../../beam_common/src/version.rs::OTP_VERSION`, `"30"`).
+`current_exe()` ancestors, `$ERL_TOP` and the standard prefixes; `bootstrap/` is never a code-path
+candidate root (it holds the primary bootstrap, not an app layout). So `CodeServer::lib_root()` is the
+*system* install's `<lib>` and
+`../cli.rs::boot_file_root` (its parent) is the system install root — used for an explicit `-boot`
+value and for a boot script's `$ROOT` expansion, exactly as before.
+The **default** route (no `-boot`) does *not* go through it: `../cli.rs::boot_script_to_drive` prefers
+`CodeServer::own_bootstrap_boot_script()` — the committed `bootstrap/bin/start.boot` of the source tree
+the binary runs from — and only falls back to `-boot start` (resolved to `<systemRoot>/bin/start.boot`)
+when no source tree is reachable. The default route therefore drives the repo's OTP-30 script (header
+`{"Erlang/OTP","30"}`), so `init:script_id/0` (`../native/init.rs::script_id_0` ←
+`Runtime::boot_script_id`) agrees with `erlang:system_info(otp_release)`
+(`../../beam_common/src/version.rs::OTP_VERSION`, `"30"`). An explicit `-boot FILE` still drives *that*
+script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"}` on this host).
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing

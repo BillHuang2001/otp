@@ -388,6 +388,40 @@ impl CodeServer {
             .find_map(|path| ebin_lib_root(path))
     }
 
+    /// This runtime's **own** release's boot script — `<source tree>/bootstrap/bin/start.boot`
+    /// — or `None` when no source tree is reachable from the binary (an installed
+    /// deployment).
+    ///
+    /// The committed primary bootstrap is the script of the release this runtime *is*
+    /// ([`beam_common::otp_version`]), so driving it is what makes `init:script_id/0` and
+    /// `erlang:system_info(otp_release)` self-consistent (contract A.9) — where the consumed
+    /// installation's own `<Root>/bin/start.boot` belongs to whatever release happens to be
+    /// installed (measured `{"Erlang/OTP","29"}` against this host's OTP-29 toolchain, while
+    /// this runtime reports `"30"`). [`crate::cli`] falls back to `init`'s literal default
+    /// `start` when this answers `None`, so an installed deployment keeps working.
+    ///
+    /// # Discovery
+    ///
+    /// The candidate roots are resolved **at runtime**, most specific first, the way the
+    /// installation roots are ([`native_roots`]): this executable's ancestors (a
+    /// `erts_rust/target/<profile>/beam_rt` below the source tree), then `$ERL_TOP` (a build
+    /// tree). **No build-time path is baked in** — `env!("CARGO_MANIFEST_DIR")` would embed
+    /// the build host's absolute path, which a relocated or copied binary could not honour —
+    /// so a deployed runtime with no `bootstrap/` above it answers the honest `None`.
+    pub fn own_bootstrap_boot_script() -> Option<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(current) = env::current_exe() {
+            roots.extend(ancestors(current.parent().unwrap_or_else(|| Path::new(".")), 8));
+        }
+        if let Some(top) = env::var_os("ERL_TOP") {
+            roots.push(PathBuf::from(top));
+        }
+        roots.into_iter().find_map(|root| {
+            let candidate = root.join("bootstrap").join("bin").join("start.boot");
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
     /// The application directory `<lib>/<app>-<vsn>` of the application `app`, if it is
     /// installed.
     ///

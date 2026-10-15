@@ -27,21 +27,27 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   (`native_system_ebins:644-646`, `system_ebins_under:693-713`, `SYSTEM_APPS:825`). `bootstrap/` is
   never a candidate root nor on the resolved code path. So with an `erl` on `$PATH`, the consumed
   root is ALWAYS that system install's root (`CodeServer::lib_root` at `codeserver.rs:335-340`).
-- **The default `-boot` therefore resolves to the SYSTEM install's script.** `DEFAULT_BOOT_SCRIPT =
-  "start"` (`cli.rs:1292`) → `resolve_boot_file` (`cli.rs:1469-1498`): candidate `<value>.boot`
-  (CWD-relative), else the `<Root>/bin/<value>.boot` string-concat fallback (line 1489) →
-  `<systemRoot>/bin/start.boot`. On this host that is the Nix OTP-29 install's script
-  (header `{"Erlang/OTP","29"}`), NOT the repo's `bootstrap/bin/start.boot` (header
-  `{"Erlang/OTP","30"}`). This is why `init:script_id/0` reports `{"Erlang/OTP","29"}` while
-  `otp_release` reports the compile-time `"30"`.
-- **`init:script_id/0`** (`native/init.rs:404-417`) reads `Runtime::boot_script_id`, set from the
-  loaded `BootScript`'s `{Name,Vsn}` header at `runtime.rs:1698` (`boot_from_script`) and
-  `runtime.rs:1739` (`boot_from_script_reporting`); accessor `runtime.rs:885-887`. With no loaded
+- **The default route loads THIS runtime's own release's boot script.** With no `-boot`,
+  `cli.rs`'s `boot_script_to_drive` prefers `CodeServer::own_bootstrap_boot_script()` — the committed
+  `bootstrap/bin/start.boot` of the source tree the binary runs from — so the default route drives the
+  OTP-30 primary bootstrap (header `{"Erlang/OTP","30"}`) and `init:script_id/0` agrees with
+  `erlang:system_info(otp_release)` (`"30"`). Only when no source tree is reachable (an installed
+  deployment) does it fall back to `DEFAULT_BOOT_SCRIPT = "start"` → `resolve_boot_file` (candidate
+  `<value>.boot`, else the `<Root>/bin/<value>.boot` string-concat fallback) → `<systemRoot>/bin/start.boot`.
+  An **explicit** `-boot FILE` is untouched and still resolves exactly as `init`'s `get_boot/2` does.
+- **`init:script_id/0`** (`native/init.rs`) reads `Runtime::boot_script_id`, set from the
+  loaded `BootScript`'s `{Name,Vsn}` header at `runtime.rs` (`boot_from_script`) and
+  `runtime.rs` (`boot_from_script_reporting`). With no loaded
   script it is the typed `unsupported: init:script_id/0 (no boot script has been loaded)` gap.
-- **The runtime does not know where its own repo `bootstrap/` is at runtime.** An explicit
-  `-boot bootstrap/bin/start` resolves **CWD-relative** (`cli.rs:1480`), so it only finds the
-  committed script when the process CWD is the repo root. Only tests hardcode the repo path
-  (`boot/bootscript.rs:736`, via `env!("CARGO_MANIFEST_DIR")`).
+- **`CodeServer::lib_root()` stays the consumed SYSTEM install's `<lib>`** (it feeds
+  `bindir`/`app_dir`/system-ebin resolution/`$ROOT` expansion), so it is never repointed at the source
+  tree: `own_bootstrap_boot_script` is a **separate** discovery used only to pick the default script.
+- **The runtime DOES know where its own source tree is at runtime**, without a build-time absolute path:
+  `CodeServer::own_bootstrap_boot_script` walks `current_exe()`'s ancestors (bounded, exactly as
+  `native_roots` does) and then `$ERL_TOP`, checking each for `bootstrap/bin/start.boot`. Tests still use
+  an explicit repo path (`env!("CARGO_MANIFEST_DIR")`), which a relocated binary could not report
+  truthfully. An explicit `-boot bootstrap/bin/start` stays **CWD-relative** (as on the oracle), so it
+  only finds the committed script when the process CWD is the repo root.
 - **Consumers of the resolved root** all yield the system install's paths (never this runtime's own
   tree): `codeserver.rs::app_dir:349-371` (`code:lib_dir/1,2`), `codeserver.rs::bindir:385-400`
   (`init:get_argument(bindir)` = `<root>/erts-<vsn>/bin`), `native/code.rs::code_lib_dir_0:426-434`

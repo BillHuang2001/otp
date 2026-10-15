@@ -396,18 +396,16 @@ impl RuntimeContext<'_> {
     ///
     /// The value is the *real* header of the script this runtime actually loaded
     /// ([`Runtime::boot_script_id`]), so it tracks the loaded script exactly as the
-    /// oracle's `init:script_id/0` does. On the default route the CLI resolves `start` to
-    /// `<Root>/bin/start.boot`, where `<Root>` is the **consumed** system installation's
-    /// root (`CodeServer::lib_root()`'s parent, via `cli::boot_file_root` /
-    /// `cli::resolve_boot_file`), so on this host the answer is that OTP-29 installation's
-    /// header `{"Erlang/OTP","29"}`. The committed `bootstrap/bin/start.boot`
-    /// (`{"Erlang/OTP","30"}`) is loaded only via an explicit
-    /// `-boot bootstrap/bin/start`.
-    ///
-    /// `// documented divergence:` the compile-time `erlang:system_info(otp_release)`
-    /// reports this runtime's *target* release (`"30"`), so
-    /// `init:script_id() =:= {"Erlang/OTP", otp_release}` is **false** here: the consumed
-    /// installation's release differs from the runtime's target.
+    /// oracle's `init:script_id/0` does. With no `-boot` the CLI drives this runtime's
+    /// **own** release's script — the committed `bootstrap/bin/start.boot`, discovered from
+    /// the binary's source tree by `CodeServer::own_bootstrap_boot_script` and handed to
+    /// `cli`'s one boot-script resolution (`cli::boot_script_to_drive`) — so its header
+    /// `{"Erlang/OTP","30"}` agrees with the compile-time
+    /// `erlang:system_info(otp_release)` (`"30"`):
+    /// `init:script_id() =:= {"Erlang/OTP", otp_release}` is **true**, self-consistent
+    /// exactly as on the oracle. An explicit `-boot FILE` still wins and reports *that*
+    /// script's own header (e.g. the consumed OTP-29 installation's `{"Erlang/OTP","29"}`
+    /// when it is named).
     ///
     /// [`Runtime::boot_from_script`]: crate::Runtime::boot_from_script
     /// [`Runtime::boot_script_id`]: crate::Runtime::boot_script_id

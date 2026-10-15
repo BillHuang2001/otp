@@ -535,6 +535,10 @@ fn a_memoized_hook_roster_mirrors_the_beam_bifs_predicates_field_for_field() {
             beam_bifs::needs_runtime_hooks(module, function, arity),
             "{module}:{function}/{arity} runtime-hooks arm"
         );
+        // No probe key is `erlang:fun_info/1,2` — the gate's introspection half — so the
+        // field-for-field comparison against the encoders' roster holds for this set (see
+        // `the_fun_identity_gate_selects_the_image_and_introspection_bifs` for the
+        // divergence the roster itself does not carry).
         assert_eq!(
             hooks.fun_identity,
             beam_bifs::needs_local_fun_identity(module, function, arity),
@@ -1920,22 +1924,37 @@ fn the_memory_hook_gate_selects_only_the_two_memory_bifs() {
 }
 
 #[test]
-fn the_fun_identity_gate_selects_only_the_external_image_bifs() {
-    // The `LocalFunIdentity` seam is read by exactly one `beam_bifs` code path
-    // (`binconv::encode_body`'s first statement), which `term_to_binary/1,2` reaches
-    // directly and `external_size/1,2` reaches through `plain_image_of`. Every other
-    // registered BIF must skip the `Arc` clone + `PathBuf` allocation the bridge does.
+fn the_fun_identity_gate_selects_the_image_and_introspection_bifs() {
+    // The `LocalFunIdentity` seam has two consumer families. The **encoders**: the two
+    // `beam_bifs` code paths that reach `binconv::encode_body`'s first statement —
+    // `term_to_binary/1,2` directly and `external_size/1,2` through `plain_image_of`. And
+    // the **introspection** pair `erlang:fun_info/1,2`, which reads the seam for a fun's
+    // `name`. Every other registered BIF must skip the `Arc` clone + `PathBuf` allocation
+    // the bridge does.
     for (function, arity) in [
         ("term_to_binary", 1),
         ("term_to_binary", 2),
         ("external_size", 1),
         ("external_size", 2),
+        ("fun_info", 1),
+        ("fun_info", 2),
     ] {
         assert!(
             RuntimeContext::uses_fun_identity("erlang", function, arity),
             "erlang:{function}/{arity}"
         );
     }
+    // The introspection half is *wider* than `beam_bifs`' own roster, which documents that
+    // crate's seam-readers (the two encoders) only: the gate is the beam_rt side of the
+    // seam, so a `fun_info` call still gets the bridge installed. That divergence is the
+    // contract, not a drift — the roster test below compares the gate to the roster's
+    // predicate only on the roster's own keys.
+    assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info", 1));
+    assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info", 2));
+    // The widened gate is what the dispatch memo records, so the bridge really is installed
+    // on the introspection arm (`DispatchHooks::of` reads the gate, not the roster).
+    assert!(DispatchHooks::of("erlang", "fun_info", 1).fun_identity);
+    assert!(DispatchHooks::of("erlang", "fun_info", 2).fun_identity);
     for (module, function, arity) in [
         ("erlang", "term_to_binary", 0),
         ("erlang", "term_to_binary", 3),
@@ -1944,6 +1963,14 @@ fn the_fun_identity_gate_selects_only_the_external_image_bifs() {
         ("erlang", "binary_to_term", 1),
         ("erlang", "-", 2),
         ("lists", "term_to_binary", 1),
+        // `fun_info/2` is the only arity pair the introspection half claims, and it is
+        // `erlang`'s alone. `fun_info_mfa/1` is deliberately not claimed: it rejects every
+        // non-`External` fun before reading any seam, so it never calls the accessor.
+        ("erlang", "fun_info", 0),
+        ("erlang", "fun_info", 3),
+        ("erlang", "fun_info_mfa", 1),
+        ("erts_internal", "fun_info", 1),
+        ("lists", "fun_info", 1),
     ] {
         assert!(
             !RuntimeContext::uses_fun_identity(module, function, arity),
@@ -2352,10 +2379,14 @@ fn the_rt_gates_delegate_to_the_exported_hook_predicates() {
                 roster.name
             );
         }
-        // The `beam_rt` gate answers **exactly** like the exported predicate, on its own
-        // keys and on every other roster's — the delegation is what keeps the two from
-        // drifting (`beam_bifs`' own `hook_sets` tests pin the tables themselves against
-        // each module's `register`).
+        // The `beam_rt` gate agrees with the exported predicate on every key any roster
+        // names — so a gate can neither claim a key `beam_bifs` does not route through its
+        // seam nor drop one it does (`beam_bifs`' own `hook_sets` tests pin the tables
+        // themselves against each module's `register`). A gate may still be **wider** than
+        // its roster outside this key universe: the `local-fun-identity` gate also covers
+        // `erlang:fun_info/1,2`, which the roster does not list — see
+        // `the_fun_identity_gate_selects_the_image_and_introspection_bifs`. (`fun_info/1,2`
+        // is in no roster, so the comparison below never meets it.)
         let Some(gate) = roster.gate else { continue };
         for key in &keys {
             let (module, function, arity) = *key;
