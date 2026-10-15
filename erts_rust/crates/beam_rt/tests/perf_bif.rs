@@ -48,10 +48,10 @@ const SLICE_BEAM: &str = concat!(
 
 /// Runs the built `beam_rt` binary with `args` and captures its output.
 fn run(args: &[&str]) -> Output {
-    // `-noshell` before the action: every non-`-version` invocation now drives the default
-    // boot script, which (like the oracle's `erl` without `-noshell`) prints the OTP banner
-    // (`Erlang/OTP 30 [erts-17.1] [source] [64-bit]`) to stdout. `-noshell` suppresses it so
-    // stdout is only the `run` action's own `~w~n` line — byte-identical to `erl -noshell`.
+    // `-noshell` before the action: the `run` action drives the default boot script, but it is
+    // banner-free by construction (it records the `noshell` init argument, so the booted kernel
+    // prints no OTP slogan) and stdout is only the `run` action's own `~w~n` line —
+    // byte-identical to `erl -noshell`. The flag is kept to mirror the oracle probe.
     Command::new(env!("CARGO_BIN_EXE_beam_rt"))
         .arg("-noshell")
         .args(args)

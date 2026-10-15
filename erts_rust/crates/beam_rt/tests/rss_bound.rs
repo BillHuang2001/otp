@@ -157,9 +157,9 @@ fn loadavg() -> String {
 /// reaped and reported) instead of a hang — the same discipline as `support::run_probe`.
 /// Because `VmHWM` is a monotonic watermark, the largest sample is the process's true peak.
 fn measure_peak_rss(erlang_n: i64) -> Measurement {
-    // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
-    // invocation (the oracle's `erl` does the same), so suppress it and keep stdout exactly
-    // the `run` action's `~w~n` line (the `N` the loop returned).
+    // `-noshell`: the `run` action is banner-free by construction (it records the `noshell`
+    // init argument, so the booted kernel prints no OTP slogan) and prints only its own `~w~n`
+    // line (the `N` the loop returned); it is kept to mirror the oracle probe.
     let args = [
         "-noshell".to_string(),
         "run".to_string(),

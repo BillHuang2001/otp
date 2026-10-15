@@ -291,9 +291,9 @@ fn a_fun_bodied_process_parks_and_answers_the_oracle() {
 
     for (label, function, expected) in AGREE {
         let spec = format!("{MODULE}:{function}/0");
-        // `-noshell`: every non-`-version` action now drives the default boot script (A.9), so a
-        // booted node prints the OTP banner to stdout unless it is head-less — and the oracle
-        // side below probes with `erl -noshell …`.
+        // `-noshell`: the `run` action drives the default boot script (A.9) but is banner-free
+        // by construction (it records the `noshell` init argument), so it prints no OTP slogan;
+        // the flag is kept to mirror the oracle probe below, which runs `erl -noshell …`.
         let ours = run_bounded(
             Path::new(env!("CARGO_BIN_EXE_beam_rt")),
             &["-noshell", "-pa", dir, "run", beam, &spec],

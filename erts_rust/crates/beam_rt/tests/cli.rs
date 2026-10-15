@@ -33,13 +33,16 @@
 //!
 //! # Why a stdout-asserting invocation passes `-noshell`
 //!
-//! Every CLI action except `-version` drives the default boot script, so a booted kernel
-//! prints the OTP banner (`Erlang/OTP 30 [erts-17.1] [source] [64-bit]`) to **stdout** on
-//! any invocation **without** `-noshell` — byte-faithful to the oracle, which also prints
-//! the banner without `-noshell` and is silent with it
+//! The ERTS-native actions (`-eval`, `-s`, `-run` and a bare shell) drive the default boot
+//! script, so a booted kernel prints the OTP banner (`Erlang/OTP 30 [erts-17.1] [source]
+//! [64-bit]`) to **stdout** on any such invocation **without** `-noshell` — byte-faithful to
+//! the oracle, which also prints the banner without `-noshell` and is silent with it
 //! (`erl -noshell -eval 'io:format("x~n"), halt(0).'` → `x\n`; the same without `-noshell`
-//! prepends the banner). A test that asserts an **exact** stdout therefore invokes the
-//! binary with `-noshell`, exactly as the oracle side of every cross-check does.
+//! prepends the banner). The `run File Mod:Func/Arity` action is **banner-free by
+//! construction** (it records the `noshell` init argument), so a `run`-action assertion needs
+//! no `-noshell`. A test that asserts an **exact** stdout therefore invokes the binary with
+//! `-noshell` on the banner-printing routes, exactly as the oracle side of every cross-check
+//! does.
 use std::path::Path;
 use std::process::{Command, Output};
 

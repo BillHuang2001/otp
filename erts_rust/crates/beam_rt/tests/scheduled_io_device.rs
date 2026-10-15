@@ -239,9 +239,9 @@ fn beam_rt_run(beam: &Path, function: &str, path: &Path) -> Run {
     let path = literal(path);
     run(
         Path::new(BINARY),
-        // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
-        // invocation (the oracle's `erl` does the same), so suppress it to keep stdout
-        // byte-identical to the oracle probe's.
+        // `-noshell`: the `run` action is banner-free by construction (it records the
+        // `noshell` init argument, so the booted kernel prints no OTP slogan); it is kept to
+        // mirror the oracle probe.
         &["-noshell", "run", beam, &spec, &path],
     )
 }

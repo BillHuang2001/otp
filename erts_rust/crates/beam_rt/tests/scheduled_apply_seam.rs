@@ -301,9 +301,9 @@ fn run_scheduled(fixtures: &Fixtures, module: &str, function: &str) -> Run {
     let spec = format!("{module}:{function}/0");
     run_bounded(
         Path::new(BINARY),
-        // `-noshell`: the boot-script drive now prints the OTP banner to stdout on a bare
-        // invocation (the oracle's `erl` does the same), so suppress it to keep stdout
-        // byte-identical to the oracle probe's.
+        // `-noshell`: the `run` action is banner-free by construction (it records the
+        // `noshell` init argument, so the booted kernel prints no OTP slogan); it is kept to
+        // mirror the oracle probe.
         &["-noshell", "-pa", fixtures.dir_str(), "run", beam, &spec],
     )
 }
