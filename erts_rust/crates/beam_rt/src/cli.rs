@@ -296,9 +296,12 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 /// # Errors
 ///
 /// A message-carrying [`beam_common::BeamError`] naming the offending switch or
-/// argument. A **missing operand of a recognized switch**, a **malformed value**, a
-/// **malformed `run` spec/argument** and a **stray positional argument** are genuine
-/// usage errors (reported with [`USAGE`], exit code [`EXIT_USAGE`]). A malformed
+/// argument. A **missing operand of a recognized switch**, a **malformed `run`
+/// spec/argument** and a **stray positional argument** are genuine usage errors
+/// (reported with [`USAGE`], exit code [`EXIT_USAGE`]). A **rejected emulator switch
+/// value** is *not* a usage error: [`error::bad_switch_value`] returns the
+/// flag-rejection kind ([`error::flag_rejected_diagnostic`]) and [`run`] reports it as
+/// exit 1 with a single diagnostic line and no [`USAGE`] block, matching the oracle. A malformed
 /// `-eval` expression is *not* decided here — it is a capability gap detected when the
 /// expression is evaluated (exit code [`EXIT_UNSUPPORTED`], see [`crate::eval`]).
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
