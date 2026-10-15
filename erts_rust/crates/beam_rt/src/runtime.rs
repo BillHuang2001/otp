@@ -1592,7 +1592,27 @@ impl Runtime {
     }
 
     /// Finds `<module>.beam` in the configured code path (then the system paths).
+    ///
+    /// A module the code server has **already loaded from a file** is answered from its own
+    /// recorded `.beam` path ([`CodeServer::loaded_path`]) instead of a fresh code-path
+    /// search. Two reasons make that the honest, cheaper answer:
+    ///
+    /// * **It cannot change what is loaded.** Every candidate the search would test is a
+    ///   filesystem `stat`, so an already-resolved module made this lookup — which sits on the
+    ///   hot external-call/boot path — re-walk the whole code path thousands of times per
+    ///   start-up for an answer the code server already holds. [`CodeServer::load`] returns
+    ///   the **cached** module for a loaded name, so the path returned here never decides
+    ///   which image is loaded; it only describes the module that is already live.
+    /// * **It is the same record `code:which/1` reports** (`native::code::module_file`), so
+    ///   the two answers cannot disagree.
+    ///
+    /// Only a module with **no** recorded file falls through to the search: one that has not
+    /// been loaded yet, and one supplied in memory by `load_bytes` (which has no file at all).
+    /// The lazy `add_system_paths` seeding is unchanged for those.
     pub fn find_module_file(&mut self, module: &str) -> Option<PathBuf> {
+        if let Some(path) = self.code_server.loaded_path(module) {
+            return Some(path.to_path_buf());
+        }
         if let Some(found) = self.code_server.find_file(module) {
             return Some(found);
         }
@@ -3263,4 +3283,102 @@ mod tests {
         assert_eq!(rt.find_module_file("slice"), Some(PathBuf::from(SLICE_BEAM)));
     }
 
+    /// A unique scratch directory under [`std::env::temp_dir`].
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("beam_rt_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+        dir
+    }
+
+    /// A module the code server has **loaded from a file** is answered from its own recorded
+    /// `.beam` path, not by re-walking the code path.
+    ///
+    /// The proof is the direction of the difference: the copy lives in a scratch directory
+    /// that is on **no** code-path entry, so the search this lookup used to run would have to
+    /// answer `None` — while the new answer reports the file the module really came from, and
+    /// keeps answering the same on a repeat. (Had the search still run, it could only ever
+    /// have returned `None` or a *different*, code-path copy.)
+    #[test]
+    fn a_loaded_module_resolves_from_its_recorded_path_without_a_search() {
+        let dir = scratch_dir("fmf_loaded");
+        let copy = dir.join("slice.beam");
+        std::fs::copy(SLICE_BEAM, &copy).expect("the fixture copies");
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        assert_eq!(
+            rt.code_server.loaded_path("slice"),
+            None,
+            "nothing is loaded yet"
+        );
+        rt.load_module(&copy).expect("the copy loads");
+        assert_eq!(
+            rt.code_server.loaded_path("slice"),
+            Some(copy.as_path()),
+            "the load recorded the file it read"
+        );
+
+        // The control: with the system directories seeded (when the host has an install) the
+        // full code path the search would walk still cannot place `slice` — so the answer
+        // below cannot have come from a search.
+        let _ = rt.code_server.add_system_paths();
+        assert_eq!(
+            rt.code_server.find_file("slice"),
+            None,
+            "no code-path entry holds `slice.beam`"
+        );
+
+        for _ in 0..3 {
+            assert_eq!(
+                rt.find_module_file("slice"),
+                Some(copy.clone()),
+                "an already-loaded module answers from its recorded path"
+            );
+        }
+    }
+
+    /// An **unloaded** module still takes the code-path search — and, because nothing is
+    /// memoized, a code-path change is visible to the very next lookup (no stale answer can
+    /// survive it).
+    #[test]
+    fn an_unloaded_module_still_searches_the_code_path_and_follows_a_path_change() {
+        let dir = scratch_dir("fmf_path");
+        let copy = dir.join("slice.beam");
+        std::fs::copy(SLICE_BEAM, &copy).expect("the fixture copies");
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        assert_eq!(
+            rt.find_module_file("slice"),
+            None,
+            "an unloaded module that is on no code-path entry is honestly absent"
+        );
+        rt.add_code_path(&dir);
+        assert_eq!(
+            rt.find_module_file("slice"),
+            Some(copy),
+            "the appended directory is searched by the next lookup"
+        );
+    }
+
+    /// The search route keeps its **side effect**: it seeds the system library directories,
+    /// which is what the boot and external-call paths rely on (`boot/preloaded.rs`'s
+    /// `load_preloaded`, `context::calls`'s load pair) to resolve a real stdlib module.
+    #[test]
+    fn a_lookup_for_an_unloaded_module_still_seeds_the_system_directories() {
+        // Probe for a system install first: without one there is nothing to seed, so skip
+        // loudly rather than assert a host property.
+        let mut probe = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        if let Err(error) = probe.code_server.add_system_paths() {
+            eprintln!("SKIP: no system Erlang install ({error})");
+            return;
+        }
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        assert_eq!(rt.code_server.find_file("lists"), None, "not seeded yet");
+        let _ = rt.find_module_file("lists");
+        assert!(
+            rt.code_server.find_file("lists").is_some(),
+            "the search route seeded the system `ebin` directories"
+        );
+    }
 }
