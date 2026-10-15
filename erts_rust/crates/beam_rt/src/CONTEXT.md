@@ -54,6 +54,27 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   what happens on a host with an `erl` on `$PATH` — the resolved default is the system install's
   script (see above).
 
+## Known Issues
+- **The two A.9 `selfhost/*` differential cases currently MISMATCH** (the workspace/`tools` docs
+  still claim they agree). `selfhost/in_process_compile_file_no_spawn_deterministic` prints `3`
+  (rust) vs `1` (oracle), exit 0 both; `selfhost/scheduled_process_compile_file_deterministic`
+  prints `""` (rust, exit 1, `beam_rt: error {badmatch,error}`) vs `1` (oracle, exit 0).
+  **Both share one root cause**: `compile:file/2` returns the bare atom `error` because `erl_lint`
+  emits three spurious `{undefined_function, …}` errors for its pseudolocals
+  (`module_info/0`, `module_info/1`, `record_info/2`), driven by a wrong result from
+  `sofs:drestriction/2` (called through `erl_lint:check_undefined_functions/2`). Reproduced
+  standalone via a `run`-action module calling `sofs:drestriction` on in-memory data: the Rust
+  runtime returns the restriction instead of the difference for a subset of inputs (e.g.
+  `sofs:drestriction(sofs:relation([{{module_info,0},0}],[{func,location}]), sofs:from_external([{g,1},{module_info,0}],[func]))`
+  → rust `[{{module_info,0},0}]`, oracle `[]`), on BOTH execution tiers (not a JIT issue). A
+  verbatim structural replica of `sofs`'s `diff_restrict_n`-based merge in a test module produces
+  the CORRECT result, so it is a narrow mis-execution of the real `sofs` code path (engine/loader
+  lowering or a BIF), NOT a generic term-comparison/merge bug. Not caused by the boot-per-action
+  change: the repro uses no file I/O and no kernel/logger/timer_server/file_server_2, that commit
+  touched only `cli.rs`/`config.rs`/`runtime.rs` (no engine/BIF code), and the trigger is unchanged
+  after interning 20 000 extra atoms (so the boot's atom-table growth is not the trigger).
+  The fix belongs to `../../beam_engine` (interpreter/loader lowering), not this crate.
+
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the
   boot-script reader/executor and the system code-path resolution (`boot/CONTEXT.md`).
