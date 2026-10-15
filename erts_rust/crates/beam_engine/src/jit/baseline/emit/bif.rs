@@ -284,7 +284,7 @@ fn shape(module: &Module, instr: &Instr) -> Option<Inlined> {
 }
 
 /// The `(touches, writes)` x-register sets of the `Bif`'s native lowering, or `None` when
-/// the instruction is not one of the three lowered BIFs in an inlinable shape.
+/// the instruction is not one of the five lowered BIFs in an inlinable shape.
 ///
 /// Purely syntactic, so [`super::regalloc::allocate_registers`] caches exactly the
 /// registers the emitter reads and — load-bearing — **writes** ([`Inlined::writes`]: a
@@ -308,7 +308,7 @@ pub(super) fn bif_uses_y(module: &Module, instr: &Instr) -> bool {
 ///
 /// Returns `true` when the whole guarded sequence was emitted, leaving the BIF's value in
 /// `dst` and letting the block continue with the next instruction. Returns `false`
-/// **without having emitted a byte** when `instr` is not one of the three lowered BIFs or
+/// **without having emitted a byte** when `instr` is not one of the five lowered BIFs or
 /// its operands are not an inlinable shape ([`shape`]), so the caller emits exactly today's
 /// `jit_step_one` step.
 #[allow(clippy::too_many_arguments)]
