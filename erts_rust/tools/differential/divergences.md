@@ -285,10 +285,6 @@ not here.)
   rather than through the `-eval` literal parser.
 
 ## A.7 — zlib (owner: `beam_bifs`)
-- `zlib:gzip/1` / `zlib:gunzip/1` are not implemented: the oracle returns the gzip container
-  (`zlib:gzip(<<"abc">>)` is `<<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>`, and
-  `zlib:gunzip/1` inverts it), the Rust runtime raises the plain `error:undef`. A case pinning
-  either is a plain-value `mismatch`, so neither is in `src/corpus/zlib.rs`.
 - `zlib:zip/1`'s **compressed image is the encoder's own choice**: for the 100-byte body
   `list_to_binary(lists:seq(1,100))` the oracle's stream is 102 bytes and the Rust runtime's 105
   (both valid DEFLATE — a different block choice), so `byte_size(zlib:zip(…))` is unpinnable and
@@ -301,4 +297,19 @@ not here.)
   streams, so `byte_size(zlib:compress(<<0:8192>>))` (`ok 17` vs `ok 23`) is a plain-value
   `mismatch` and stays unpinned. The tiny body is byte-identical
   (`zlib:compress(<<"abc">>)` → `<<120,156,75,76,74,6,0,2,77,1,39>>` on both), so that form and the
-  `uncompress(compress(B)) =:= B` round trip remain pinnable.
+  `uncompress(compress(B)) =:= B` round trip are now pinned in `src/corpus/zlib.rs`.
+
+## A.9 — boot/init (owner: beam_rt)
+
+- `init:script_id/0` and `erlang:system_info(otp_release)` disagree: the runtime's `init:script_id/0`
+  reports the **consumed boot script's** header (`{"Erlang/OTP","29"}` — the oracle install's script)
+  while `system_info(otp_release)` reports the runtime's **compile-time target** (`"30"`); the oracle is
+  self-consistent (both `"29"`). This is documented runtime behaviour (`../crates/beam_rt/src/boot/CONTEXT.md`,
+  "the consumed install's release" vs "the runtime's compile-time target"). The corpus case
+  `boot_extra/init_script_id_names_the_running_otp_release` pins the self-consistency invariant
+  `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` and therefore reports a
+  **mismatch** (`ok true` vs `ok false`) now that a plain `-eval` run loads a boot script (before the
+  boot-completion change, `init:script_id/0` raised the typed `unsupported`, so the case was an
+  allowlisted capability gap). It is currently **pinned and failing** (the gate exits 1): the owning
+  crate (`beam_rt`) must either make the two values consistent, or the case must be deliberately
+  unpinned like the other ledger entries.
