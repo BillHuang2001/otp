@@ -40,7 +40,7 @@ use beam_common::Result;
 use beam_engine::context::RootSet;
 use beam_engine::ExecutionContext;
 use beam_loader::{Label, Module};
-use beam_term::{Atom, Eterm};
+use beam_term::{Atom, AtomTable, Eterm};
 
 use super::apply::{callee_observes_its_call_site, LocalFunTarget};
 use super::gc;
@@ -101,6 +101,25 @@ impl ExecutionContext for RuntimeContext<'_> {
             .map(str::to_owned)
     }
 
+    /// The atom **namespace** guard/`select_val`/map-key comparisons must use.
+    ///
+    /// The running module's [`Module::atom_table`](beam_loader::Module) is a load-time *clone*
+    /// of this runtime's shared table, taken when the module was loaded
+    /// ([`CodeServer`](crate::CodeServer) — interning only appends, so the module's own atoms
+    /// keep their ids). [`beam_term::compare`]'s `erts_cmp_atoms` compares atom **names** but
+    /// falls back to raw atom-id order when a name is unknown to the supplied table, and a
+    /// module loaded early cannot name an atom interned afterwards — exactly the
+    /// `sofs:drestriction/2` shape: `sofs` (and `erl_lint`) are primLoaded during boot and the
+    /// `-eval` expression then interns `g`, so `{module_info,0} < {g,1}` in `sofs:restrict_n/5`
+    /// was ordered by id and took the wrong clause. The runtime's **live** shared table names
+    /// every atom, so comparisons order by name exactly as the `<`/`==` BIFs do.
+    ///
+    /// The returned reference borrows from `self`, so a caller must take it after its operand
+    /// reads and never hold it across a `&mut` call on the context (see the trait doc on
+    /// [`ExecutionContext::atoms`]).
+    fn atoms<'m>(&'m self, _module: &'m Module) -> &'m AtomTable {
+        self.runtime.atoms()
+    }
     /// The host's own call into a callee, under the arm's frame discipline.
     fn call_bif(
         &mut self,

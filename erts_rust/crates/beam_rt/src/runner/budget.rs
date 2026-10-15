@@ -67,7 +67,7 @@ use beam_common::Result;
 use beam_engine::context::RootSet;
 use beam_engine::{ExecutionContext, Machine};
 use beam_loader::{Label, Module};
-use beam_term::{Atom, Eterm};
+use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::context::RuntimeContext;
 
@@ -294,7 +294,24 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     /// succeeds instead of raising `badarg`.
     fn atom_name(&self, module: &Module, atom: Atom) -> Option<String> {
         ExecutionContext::atom_name(self.inner, module, atom)
-    }    /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
+    }
+
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path, for the same
+    /// reason as [`atom_name`](ExecutionContext::atom_name): the slice's machine runs on *this*
+    /// wrapper, so the engine's `test`/`select_val`/map-key comparisons take the namespace here.
+    /// Without the forward they would see the trait default (`&module.atom_table`, the module's
+    /// load-time snapshot) and a module loaded early could not name an atom interned later — the
+    /// `sofs:drestriction/2` shape, whose `{module_info,0} < {g,1}` guard was then ordered by raw
+    /// atom id instead of by name and took the wrong `sofs:restrict_n/5` clause. Forwarding
+    /// reaches [`RuntimeContext`]'s own override (the runtime's live shared namespace), so every
+    /// comparison orders atoms by name exactly as the `<`/`==` BIFs do.
+    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
+        ExecutionContext::atoms(self.inner, module)
+    }
+
+    /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
     /// for that one admission point first.
     ///
     /// This wrapper's [`ensure_heap`](ExecutionContext::ensure_heap) is reached by the
