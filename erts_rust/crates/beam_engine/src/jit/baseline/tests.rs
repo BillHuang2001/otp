@@ -5472,22 +5472,23 @@ fn the_copy_bound_tier_ab_is_interleaved_and_min_over_n() {
 /// now lowered in-block through the `jit_test` helper (`super::test_helper`) instead of a
 /// whole interpreter step — so **no** `test` deopt may remain. The counters key a `test` by
 /// its kind (`counters::variant_name` returns `Test(<kind>)`), so the assertion below looks
-/// for a `Test(`-prefixed key — deliberately **not** `Test`: the distinct `test_heap` opcode
-/// keys as `TestHeap` and still deopts legitimately. The counts moved by exactly that one
-/// `test` class: `step_one` fell **1092 → 964**, and the pre-lowering
-/// `deopts_by_variant["Test"] = 128` (2 deopts per round × 64 rounds) is gone. The only
-/// `test` shapes the lowering deliberately declines — a **type** test (`Test(IsTuple)`, …)
-/// and a `NO_FAIL` form (which *raises*) — are not reachable from this probe;
-/// `a_declined_comparison_test_still_pays_one_jit_step_one_deopt` below is their positive
-/// control.
+/// for a `Test(`-prefixed key — deliberately **not** `Test`: the distinct `test_heap`
+/// opcode keys as `TestHeap`, a key a `Test(`-prefix lookbehind correctly leaves alone.
+/// The counts moved by exactly that one `test` class: `step_one` fell **1092 → 964**, and
+/// the pre-lowering `deopts_by_variant["Test"] = 128` (2 deopts per round × 64 rounds) is
+/// gone. The only `test` shapes the lowering deliberately declines — a **type** test
+/// (`Test(IsTuple)`, …) and a `NO_FAIL` form (which *raises*) — are not reachable from this
+/// probe; `a_declined_comparison_test_still_pays_one_jit_step_one_deopt` below is their
+/// positive control.
 ///
-/// The total deopt count is pinned too: the family accounted for the majority of the
-/// pre-lowering deopts (642 of 1734 per 64 ops — `LoopRec` 257, `RemoveMessage` 128,
-/// `Send` 128, `Wait` 65, `WaitTimeout` 64) and the lowered `test` for another 128, so the
-/// total must fall below **1000** (the after-value is 964). The remaining deopts are the
-/// structural/metadata opcodes (`PutTuple2` 192, `TestHeap` 192, `Allocate` 130,
-/// `InitYregs` 130, `Bif` 128, `GetTupleElement` 128, `Call` 64 — all unchanged by the
-/// `test` lowering) that are still the documented per-instruction deopt.
+/// The total deopt count is pinned too. The receive/send family accounted for the majority
+/// of the pre-lowering deopts (642 of 1734 per 64 ops — `LoopRec` 257, `RemoveMessage` 128,
+/// `Send` 128, `Wait` 65, `WaitTimeout` 64) and the lowered `test` for another 128; the
+/// **heap / frame-admission** lowerings then removed the probe's `TestHeap` 192 and
+/// `Allocate` 130 deopts as well (the probe runs no `allocate_heap` and no `trim`), so the
+/// total must fall below **700** (the after-value is 642). The remaining deopts are the
+/// structural/metadata opcodes that are still the documented per-instruction deopt
+/// (`PutTuple2` 192, `InitYregs` 130, `Bif` 128, `GetTupleElement` 128, `Call` 64).
 #[test]
 fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
     let (bench, bench_atom, worker, worker_atom) = probe_modules();
@@ -5532,9 +5533,8 @@ fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
     // The comparison `test` is lowered through the `jit_test` helper and the variant name
     // is keyed by its kind, i.e. `Test(<kind>)` (`counters::variant_name`), so any
     // regression leaves a `Test(`-prefixed key. The prefix is `Test(`, NOT `Test`: the
-    // distinct `test_heap` opcode's key is `TestHeap`, which legitimately deopts (it is one
-    // of the structural opcodes listed above) and is not a `test`. Report the offending
-    // key/count and the whole map on failure.
+    // distinct `test_heap` opcode's key is `TestHeap` (also lowered — see the loop above),
+    // which is not a `test`. Report the offending key/count and the whole map on failure.
     let offending: Option<(&String, u64)> = snapshot
         .deopts_by_variant
         .iter()
@@ -5550,10 +5550,10 @@ fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
         snapshot.deopts_by_variant,
     );
     assert!(
-        snapshot.step_one <= 1000,
-        "the receive/Send family (642) plus the lowered comparison `test` (128) accounted \
-         for 770 of the 1734 pre-lowering deopts, so the total must have fallen below 1000; \
-         saw {} ({:?})",
+        snapshot.step_one <= 700,
+        "the receive/Send family (642), the lowered comparison `test` (128) and the lowered \
+         heap/frame-admission family (`TestHeap` 192, `Allocate` 130) accounted for 1092 of \
+         the 1734 pre-lowering deopts, so the total must have fallen below 700; saw {} ({:?})",
         snapshot.step_one,
         snapshot.deopts_by_variant,
     );

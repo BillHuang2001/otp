@@ -121,6 +121,7 @@ mod arith;
 mod compare;
 mod compile;
 mod frame;
+mod heap;
 mod link;
 mod liveness;
 mod r#move;
@@ -137,6 +138,7 @@ use aggregate::{
 use arith::try_inline_gc_bif;
 use compare::try_inline_comparison;
 use frame::{emit_deallocate, emit_deallocate_return, emit_return};
+use heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
 use link::{emit_frame_teardown, Linker};
 use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
@@ -560,7 +562,57 @@ fn emit_block(
                 terminated = true;
                 break;
             }
-            Instr::Jump { target } => match labels.resolve(*target) {
+            // The **heap / frame-admission family** (`allocate`, `allocate_heap`,
+            // `test_heap`, `trim`) — the frame-management and heap-admission
+            // instructions every allocating function body carries. Like the
+            // frame-discipline trio above, what a compiled block cannot do itself is
+            // touch the interpreter's Rust-side `Machine` state: `push_frame`/`trim`
+            // resize and renumber the `Vec`-backed frame stack, and `ensure_heap`/
+            // `ensure_heap_full` runs the host's heap-admission door (the GC root-set
+            // hand-off). So each goes through its own dedicated helper (the [`heap`]
+            // submodule), which makes exactly the interpreter's own call (`push_frame`,
+            // `trim`, or `ensure_heap`, in the interpreter's order) and answers "the
+            // next instruction" on success or `ERROR` (the call's typed diagnostic)
+            // otherwise. None of them transfers control, so each continues in-block on
+            // success — with **no** x-register refill for the two frame-only ones (they
+            // touch no x-register) and the shared partial refill for the two
+            // heap-admitting ones (a collecting host may have relocated the cached
+            // heap terms during `ensure_heap`).
+            //
+            // `allocate Ns` pushes a frame of `Ns` Y slots. It deliberately performs
+            // **no** heap admission: C's `allocate Ns Live` is `$AH(Ns,0,Live)` (a heap
+            // check) but this engine's `Instr::Allocate` is a bare `push_frame` (see the
+            // crate `CONTEXT.md`), and the interpreter's own arm is `push_frame` then
+            // `Step::Next`.
+            Instr::Allocate { stack_need, .. } => {
+                emit_allocate(buffer, allocation, done, func, pc, stack_need.words())?
+            }
+            // `allocate_heap Ns Nh Live` admits heap FIRST, then pushes the frame (the
+            // interpreter's order — a failed admission must leave no frame behind).
+            Instr::AllocateHeap {
+                stack_need,
+                heap_need,
+                live,
+            } => emit_allocate_heap(
+                buffer,
+                allocation,
+                done,
+                func,
+                pc,
+                stack_need.words(),
+                heap_need.words(),
+                *live,
+            )?,
+            // `test_heap Nh Live` — the bare heap admission, which reaches the host's
+            // `ExecutionContext::ensure_heap_full` door exactly once (with the full root
+            // set: the block spilled its cached x-registers first).
+            Instr::TestHeap { heap_need, live } => {
+                emit_test_heap(buffer, allocation, done, func, pc, heap_need.words(), *live)?
+            }
+            // `trim N Remaining` shrinks the current frame to `N` Y slots; a frame-size
+            // mismatch (no live frame, or `N` past the frame) stays the interpreter's own
+            // typed error.
+            Instr::Trim { n, .. } => emit_trim(buffer, allocation, done, func, pc, *n)?,            Instr::Jump { target } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
                     // A compiled successor is entered **directly** (the linker tears
                     // this block's frame down and jumps to its entry); anything else
