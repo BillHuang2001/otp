@@ -305,6 +305,25 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // The same `-boot start` chain, observed one step further on: the boot script's
+        // `{kernelProcess, …}` directives leave these three kernel processes registered, so a
+        // booted system answers `is_pid(whereis(Name))` for each. The value is deliberately a
+        // tuple of booleans over `is_pid/1`: the pids themselves are per-VM-start identities
+        // and are never pinned.
+        Case {
+            id: "boot/kernel_processes_registered_under_boot_flag",
+            description: "under `-boot start` the boot script's kernel processes are registered (init, kernel_sup, application_controller)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "{is_pid(whereis(kernel_sup)), is_pid(whereis(application_controller)), is_pid(whereis(init))}",
+                extra_argv: &["-boot", "start"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,true}"),
+                exit_code: 0,
+            },
+        },
         Case {
             id: "boot/no_boot_flag_is_badarg",
             description: "with no `-boot`, init:get_argument/1 has no `boot` argument (element(1,_) raises badarg)",
@@ -724,6 +743,11 @@ mod tests {
     /// The one case here that takes **extra argv**: the `-boot start` CLI flag (contract A.6).
     const BOOT_FLAG_CASES: &[&str] = &["boot/boot_flag_is_recorded_as_init_argument"];
 
+    /// The second `-boot start` case: the same boot chain observed at the registered kernel
+    /// processes. It shares the flag argv but asserts the *booted* process surface, so it is
+    /// kept in its own list (its golden is a boolean tuple, not the flag-argument shape).
+    const BOOT_KERNEL_PROCESS_CASES: &[&str] =
+        &["boot/kernel_processes_registered_under_boot_flag"];
     /// The boot chain's `proc_lib:start_link/4` wait: its cross-module `proc_lib:sync_start/2`
     /// receive completes in both runtimes, so this is an ordinary `agree` case.
     const BOOT_CHAIN_CASES: &[&str] = &["boot/proc_lib_start_link_blocks_the_boot_path"];
@@ -818,7 +842,11 @@ mod tests {
     fn boot_prerequisite_cases_never_pin_a_volatile_value() {
         let cases = group();
         let cases = cases.as_slice();
-        for id in BOOT_PREREQUISITE_CASES.iter().chain(BOOT_FLAG_CASES) {
+        for id in BOOT_PREREQUISITE_CASES
+            .iter()
+            .chain(BOOT_FLAG_CASES)
+            .chain(BOOT_KERNEL_PROCESS_CASES)
+        {
             let golden = case(cases, id)
                 .golden
                 .stdout
@@ -849,6 +877,45 @@ mod tests {
             expr.contains("init:get_argument(boot)"),
             "the -boot case must observe the `boot` init argument: {expr:?}"
         );
+    }
+
+    #[test]
+    fn kernel_process_case_observes_the_booted_registered_processes() {
+        let cases = group();
+        let cases = cases.as_slice();
+        let case = case(cases, BOOT_KERNEL_PROCESS_CASES[0]);
+        assert_eq!(
+            case.contracts,
+            &[Contract::Build],
+            "the kernel-process case"
+        );
+        assert_eq!(
+            case.extra_argv(),
+            &["-boot", "start"],
+            "the kernel-process case must pass `-boot start` (the boot chain that registers them)"
+        );
+        let CaseKind::Eval { expr, probe, .. } = case.kind else {
+            panic!("the kernel-process case must be an Eval case");
+        };
+        assert_eq!(probe, Probe::Value, "the kernel-process case");
+        // The three boot-script kernel processes, and nothing pinned but their pid-ness.
+        for name in [
+            "whereis(kernel_sup)",
+            "whereis(application_controller)",
+            "whereis(init)",
+        ] {
+            assert!(
+                expr.contains(name),
+                "the kernel-process case must observe {name}: {expr:?}"
+            );
+        }
+        assert!(
+            !expr.contains("<0."),
+            "the kernel-process case must not pin a pid: {expr:?}"
+        );
+        // The golden is the boolean tuple over `is_pid/1`, the oracle's own line.
+        assert_eq!(case.golden.stdout, Some("ok {true,true,true}"));
+        assert_eq!(case.golden.exit_code, 0);
     }
 
     #[test]
