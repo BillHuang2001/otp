@@ -694,7 +694,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups)
 - `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace vs the live oracle (`#[ignore]`d; run with `--ignored`)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
-- `PERF.md` → the crate's measured memory/perf figures (both sides of every ratio + `/proc/loadavg`)
+- `PERF.md` → the crate's measured memory/perf figures (§3 the `ordered_set` B+-tree-vs-sorted-`Vec` comparison across key orders; §1 the `ets_copy` peak-RSS attribution; §2 per-object reclamation) — both sides of every ratio + `/proc/loadavg`
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
 
 ## See Also
