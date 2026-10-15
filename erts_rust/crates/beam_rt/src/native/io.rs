@@ -74,7 +74,7 @@
 //! [`RuntimeContext::io_stream`]: RuntimeContext
 
 use beam_common::{BeamError, Result};
-use beam_engine::terms;
+use beam_engine::{terms, ExecutionContext};
 use beam_process::ProcessId;
 use beam_term::{atom_val, is_atom, Eterm, NIL};
 
@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(runtime.atom_name_of(result.expect("fwrite/1")), Some("ok"));
         assert_eq!(out, "x\n");
 
-        let mut runtime = runtime();
+        let mut runtime = crate::native::test_support::runtime();
         let format = chars(&mut runtime, "~p~n");
         let data = {
             let mut sink = beam_bifs::NullSink;
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(runtime.atom_name_of(result.expect("write/1")), Some("ok"));
         assert_eq!(out, "[97,98,99]");
 
-        let mut runtime = runtime();
+        let mut runtime = crate::native::test_support::runtime();
         let quoted = atom(&mut runtime, "hello world");
         let (result, out) = call_capturing(&mut runtime, "write", &[quoted]);
         assert_eq!(runtime.atom_name_of(result.expect("write/1")), Some("ok"));
