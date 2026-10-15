@@ -114,7 +114,9 @@ exercisable there).
 Fixed-capacity bump arena over a carrier-provided block; **never reallocates** (handed-out pointers
 stay valid; growth is a new heap + copy by `beam_gc`). `new(capacity_words)`,
 `with_allocator(alloc, capacity_words)`, `capacity`, `used`, `available`, `peak_used`, `reset`,
-`reset_to(used) -> Result<()>`, `hp`, `hend`, `allocator`, `unsafe alloc_words`,
+`reset_to(used) -> Result<()>`, `hp`, `hend`, `used_words_mut(&mut self) -> &mut [Eterm]` (the
+**safe** view over exactly the `[0, used)` initialised prefix — never the uninitialised tail; empty
+for a zero-used heap), `allocator`, `unsafe alloc_words`,
 `unsafe alloc_tuple`, `cons`, `tuple`, `Drop`
 returns the block. Exhaustion ⇒ `BeamError::Alloc(AllocKind::Heap)` (= "collect", not fatal OOM).
 `reset()` rewinds to empty and `reset_to(used)` to a **mark** (the exact inverse of allocating `used`
