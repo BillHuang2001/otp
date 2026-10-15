@@ -289,6 +289,18 @@ resolution fails with the typed `cannot locate the system code path: …` error 
 normal installation pays **no** `erl` start-up (measured on this host: a bare `-eval` invocation now
 takes ≈2.19 s wall, since it drives the default boot script on every action, where the resident `erl`
 shell-out alone costs ≈0.5 s and is still avoided).
+**The resolved root is the consumed SYSTEM install, not this runtime's own tree.** `native_roots`
+seeds candidate roots with the `erl` on `$PATH` first (canonicalized, never executed), then
+`current_exe()` ancestors, `$ERL_TOP` and the standard prefixes; `bootstrap/` is never a candidate
+root and never on the code path. So `CodeServer::lib_root()` is the *system* install's `<lib>` and
+`../cli.rs::boot_file_root` (its parent) is the system install root. The default `-boot start`
+therefore resolves (`../cli.rs::resolve_boot_file`) to `<systemRoot>/bin/start.boot` — the
+*consumed install's* script (header `{"Erlang/OTP","29"}` for an OTP-29 host), **not** the repo's
+committed `bootstrap/bin/start.boot` (header `{"Erlang/OTP","30"}`), which is reachable only through
+an explicit CWD-relative `-boot bootstrap/bin/start`. Consequence: `init:script_id/0` reports the
+*consumed install's* release (`../native/init.rs::script_id_0` ← `Runtime::boot_script_id`) while
+`erlang:system_info(otp_release)` reports the runtime's compile-time target
+(`../../beam_common/src/version.rs::OTP_VERSION`, `"30"`).
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
