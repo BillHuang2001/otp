@@ -1514,6 +1514,28 @@ impl PortRegistry {
         dropped
     }
 
+    /// Whether any live port's driver has a name awaiting a commit into the shared
+    /// [`AtomTable`] — the cheap predicate a round consults **before** it borrows that table.
+    ///
+    /// [`DriverAtoms::is_empty`] is the guard `commit_driver_atoms`' own contract asks for, and
+    /// it has to be applied at the **site that owns the table borrow**, not inside the commit
+    /// loop: the table is reached through
+    /// [`CodeServer::atoms_mut`](crate::codeserver::CodeServer::atoms_mut), which is
+    /// `Rc::make_mut`. Merely *reaching* it while any other holder is alive — a
+    /// `{spawn_driver, Name}` port's host (which holds one for the port's whole life), a loaded
+    /// NIF library's stored host, a port open in flight — deep-clones the entire shared table
+    /// (thousands of names, and their `String`s, plus the index map) for a round that interns
+    /// nothing. A round with nothing pending must therefore not reach it at all.
+    ///
+    /// The scan is one pass over the live ports — orders of magnitude below the clone it
+    /// avoids, and the same pass `commit_driver_atoms` would make anyway.
+    pub fn has_pending_driver_atoms(&self) -> bool {
+        self.meta.values().any(|meta| {
+            meta.driver_atoms
+                .as_ref()
+                .is_some_and(|pending| !pending.is_empty())
+        })
+    }
     /// The terms the **C driver** ports have emitted (`erl_drv_output_term`/`erl_drv_send_term`).
     ///
     /// A driver's callback decodes its term-data spec on the host's arena and queues the resulting
@@ -2552,14 +2574,20 @@ impl Runtime {
                 .ports
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
-            for (port, name) in registry.commit_driver_atoms(self.code_server.atoms_mut()) {
-                // Never silent: the term the driver built already carries an index that now names
-                // a different atom, which no later commit can repair.
-                eprintln!(
-                    "beam_rt: driver port {} interned the atom `{name}` at an index the atom \
-                     table had already moved past; the name is not resolvable",
-                    port.number()
-                );
+            // The `is_empty` guard, taken **before** the table borrow: `code_server.atoms_mut()`
+            // is `Rc::make_mut`, so reaching it with another holder alive (a driver port's host,
+            // a loaded NIF library) deep-clones the whole table for a round that interns
+            // nothing. See [`PortRegistry::has_pending_driver_atoms`].
+            if registry.has_pending_driver_atoms() {
+                for (port, name) in registry.commit_driver_atoms(self.code_server.atoms_mut()) {
+                    // Never silent: the term the driver built already carries an index that now
+                    // names a different atom, which no later commit can repair.
+                    eprintln!(
+                        "beam_rt: driver port {} interned the atom `{name}` at an index the atom \
+                         table had already moved past; the name is not resolvable",
+                        port.number()
+                    );
+                }
             }
         }
         // The name `os:set_signal/2`'s notifications are addressed to, resolved **once** and by

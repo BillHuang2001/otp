@@ -42,7 +42,8 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `-smp enable\|disable\|auto` | scheduler model; only `disable` changes behaviour |
 | `-name N` / `-sname N` | node name → `emulator.node_name`; makes the runtime a distributed node (A.5 phase 1) |
 | `-setcookie C` | distribution cookie → `emulator.cookie` (also the init argument `setcookie`) |
-| `-config F` | config file, recorded as the init argument `config` |
+| `-env VAR VALUE` | the **launcher**'s environment switch: the pair is consumed blindly (its value may look like a switch) and applied to the child's environment **before** `parse_with_env`, so `os:getenv/1`, every inherited OS child and `vars::from_env` (`ERL_MAX_PORTS`) all observe it — and it is **never** an init argument (`init:get_argument(env)` is the bare atom `error`). A trailing `-env` (no name/value) is the launcher's diagnostic: exit 1 with `beam_rt: Missing argument(s) for '-env'.` and no usage block |
+| `-config F` | config file, recorded as the init argument `config`; an **unreadable** one fails the boot with the oracle's byte-exact `Could not start kernel pid (application_controller) …` stderr (CRLF, the resolved `<F>.config` named) and exit 1, really writing the crash dump |
 | `-boot F` | boot script: recorded as the init argument `boot` **and** the script the runtime drives (the explicit value, else the default `start`) through the A.7 boot-script executor **before** the action's own start instruction (every action but `-version`) |
 | `-emu_flavor emu\|jit\|smp` | emulator flavor → `emulator.flavor` + `FeatureFlags` |
 | `+A N` | async-thread pool size, preserved verbatim |
@@ -52,7 +53,7 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `+sbt TYPE` | scheduler bind type (`u`/`db`/`s`/`ps`/`ts`/`tnnps`/`nnps`/`nnts`/`ns`), preserved verbatim |
 | `+M*` / `+MM*` / `+MB*` | ERTS allocator flags: `+M*` is an emulator flag — validated against the `erl_alloc.c` grammar and then **discarded** (`../cli.rs`'s allocator arm calls only `flags::parse_allocator`; it does **not** call `Builder::preserve`, so nothing reaches `extra_emulator_flags`, and no init argument is recorded); a user `-M*` is an ordinary unknown `-flag` (recorded as `init:get_argument(NAME)`, its value consumed) |
 | `+hms N` / `+hmbs N` / `+hmax N` / `+hmaxk\|el\|ib B` | GC heap policy (`beam_gc::HeapPolicy`), rounded through the growth table; visible in `garbage_collection` |
-| `+JPperf VALUE` | perf support (`true`/`false`/`dump`/`map`/`fp`/`no_fp`) → `PerfMapConfig` (validated, preserved verbatim; a bad value is a usage error) |
+| `+JPperf VALUE` | perf support (`true`/`false`/`dump`/`map`/`fp`/`no_fp`) → `PerfMapConfig` (validated, preserved verbatim; a rejected value exits 1 like the other emulator flags, one `beam_rt: bad value …` line and no `USAGE`) |
 | `+JPperfdirectory Dir` | where the perf files are written (default `/tmp`; `ERL_SYM_MAP_FILE` overrides the map file's whole path) → `PerfMapConfig` (preserved verbatim) |
 | `run <file.beam> <mod>:<func>/<arity> [arg…]` | the vertical slice and the runtime's **banner-free non-interactive batch runner**: load the file, run, print the result — and nothing else, because the action records the `noshell` init argument. It still drives the default boot script (see *The boot-script drive*) |
 An unmodeled `-FLAG`/`+FLAG` is **data, not a usage error** (it is preserved, and a `-`-flag is recorded); only a **stray positional argument** (outside `run`) is a usage error (exit 2).
@@ -124,19 +125,23 @@ The oracle additionally reports its own `root`/`bindir`/`progname`/`home` entrie
 | Code | Meaning | stderr |
 |---|---|---|
 | `0` (`EXIT_OK`) | success | — |
-| `1` (`EXIT_RUNTIME`) | genuine runtime error (a load/execute/BIF failure, e.g. a missing `.beam`, an `undef`, BIF `system_limit`) | `beam_rt: <error>` |
-| `2` (`EXIT_USAGE`) | malformed invocation / usage error (a missing operand of a recognized switch, a malformed value, a malformed `run` spec/argument, a stray positional argument) | `beam_rt: <error>` then `USAGE` |
+| `1` (`EXIT_RUNTIME`) | a genuine failure: a load/execute/BIF error (a missing `.beam`, an `undef`, BIF `system_limit`), a switch value the emulator/launcher **rejects**, an unreadable `-config` file, and the launcher's trailing-`-env` diagnostic | `beam_rt: <error>` for the runtime and single-line cases; the oracle's byte-exact two-line boot-failure text for `-config` |
+| `2` (`EXIT_USAGE`) | usage error: a missing operand of a recognized switch, a malformed `run` spec/argument, a stray positional argument | `beam_rt: <error>` then `USAGE` |
 | `3` (`EXIT_UNSUPPORTED`) | **unsupported** — a Milestone-1 capability gap | exactly one line: `beam_rt: unsupported: <reason>` (no `USAGE`) |
+A **rejected emulator switch value** is exit 1 with **one** stderr line — `beam_rt: bad value "<v>" for switch <flag>` — and **no** `USAGE` block, matching `beam.smp` (`+t 2`, `+P 0`, `+Q 0`, `+hms 0`, `+sbt zz`, `+e -1`, `+hmax -1`, `+hmaxk x`, `+A -5`, `+S abc`, `+S 4:5`). The classifier is `error::flag_rejected` (reason-atom prefix `beam_rt_flag:`), pinned by [`../../tests/cli.rs`] and [`../../tests/cli_flags.rs`]; the missing-operand case stays exit 2 (see *Documented divergences*).
 A malformed `-eval` expression is **not** decided by the parser — it is a capability gap detected when the expression is evaluated (exit 3).
 A runtime **halt** the program requests is neither: it exits with the requested status printing nothing.
 
 ## Documented divergences
-* **Malformed emulator value: exit 2 vs the oracle's 1.** The oracle prints `bad …` + its usage text and exits **1**; `beam_rt` keeps its uniform four-code contract and reports a **usage** error (exit 2 + `USAGE`).
-* **No `ErtsStrToSint` trailing-garbage laxness.** The C's numeric parse silently ignores trailing text (`+Q 1024abc` ⇒ 1024, `+hms 100abc` ⇒ 100); `beam_rt` rejects it.
+* **Unknown `+X` flags are not diagnosed.** The oracle's `beam.smp` prints `unknown flag -k` (on its own stderr) and exits **1** for an unmodelled `+`-flag (`+k x`); `beam_rt` accepts an unmodeled `+FLAG` as data and exits **0**.
+* **A missing operand of a `+`-switch stays exit 2.** The oracle exits **1** with `Missing argument(s) for '+Q'.`; `beam_rt` reports its own `beam_rt: error switch +Q requires a value` + `USAGE` (exit 2). A missing operand of a `-`-switch agrees (exit 2 in both).
+* **A bare `+K`/`+A` swallows the following token.** The launcher consumes the pair blindly, so `+K -eval Expr` loses the action — the same blind consumption the C does, but with no diagnostic.
+* **`+K` accepts any value.** The emulator only `get_arg`s the value and `beam_rt` mirrors that (any token, including the empty string); it previously accepted only `true`/`false`.
+* **`+hms`/`+hmbs` accept trailing garbage.** `+hms 100abc` parses as `+hms 100` (the C `strtol` behaviour); the strict `str::parse` family still governs `+Q`/`+P`/`+e`/`+S`.
+* **The `beam.smp` usage block is not reproduced.** The oracle prints its own leading diagnostic wording followed by a 7331-byte usage dump; `beam_rt` prints one `beam_rt: …` line and no `USAGE` for an exit-1 case (its own `USAGE` appears only on a usage error, exit 2).
 * **`-emu_flavor` is broader than `erlexec`.** The oracle's `erlexec` accepts only `smp` and rejects `emu`/`jit` (`erlexec: Invalid emulator type or flavor…`, exit 1); `beam_rt` accepts `emu`/`jit`/`smp` so `Flavor::Emu` is reachable.
-* **`+K` is validated; the oracle does not.** The emulator only `get_arg`s the value; `beam_rt` accepts the two literals `true`/`false` and rejects anything else.
 * **`-M*` vs `+M*`.** Through the `erl` wrapper a `-M*` flag is **not** forwarded to the emulator (`erlexec.c:865`, it falls to `add_arg`), so the oracle never validates it; only `+M*` is rewritten to `-M*` and validated. `beam_rt` recognizes the whole family but validates only `+M*` (oracle parity for `-M*`).
-* **`-smp disable` is accepted.** The oracle rejects it outright (`Argument '-smp disable' not supported. Use "+S 1" instead.` — verified OTP 29.1.1 / erts-17.1, exit 1); `beam_rt` accepts it as the honest "SMP off" request (the A.6 adoption mandate). Unlike `+K bogus` and `-emu_flavor emu`, this divergence is pinned only by a unit test (`../cli.rs`), **not** against the oracle in `../../tests/cli_flags.rs` (it is absent from `DIVERGENT_CASES`).
+* **`-smp disable` is accepted.** The oracle rejects it outright (`Argument '-smp disable' not supported. Use "+S 1" instead.` — verified OTP 29.1.1 / erts-17.1, exit 1); `beam_rt` accepts it as the honest "SMP off" request (the A.6 adoption mandate). Unlike `-emu_flavor emu`, this divergence is pinned only by a unit test (`../cli.rs`), **not** against the oracle in `../../tests/cli_flags.rs` (it is absent from `DIVERGENT_CASES`).
 * **`-eval`/`-s`/`-run` are documented subsets.** Supported: the expression subset, the **send operator**, a bare `receive` driving a spawned sender, the spawn probes and a bounded scheduler pump. Gaps (typed errors in `../eval/mod.rs`): a `receive` that never receives, a `receive` inside a spawned process, `after infinity`; real `erl` start-script processing / `-init_debug` are absent.
 
 ## Known Issues (verified against the code, not just the docs)

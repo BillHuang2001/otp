@@ -886,6 +886,21 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "bifs/lists_concat",
+            description:
+                "lists:concat/1 flattens a mixed list of strings/atoms/integers to a byte list",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:concat([\"a\",\"b\",1])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [97,98,49]"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "bifs/string_case_trim_split_join",
             description: "string:uppercase/1, lowercase/1, trim/1, split/2 and join/2",
             contracts: &[Contract::OtpApps],
@@ -933,6 +948,20 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok {[[55],32,32],[[48,48],[55]],[[97],[98]],[[97],[98]],[97,98],5}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/string_concat_two",
+            description: "string:concat/2 concatenates two byte strings",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "string:concat(\"a\",\"b\")",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [97,98]"),
                 exit_code: 0,
             },
         },
@@ -1002,6 +1031,48 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok {ok,1000,120000,3600000}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/timer_now_diff_of_two_timestamps",
+            description: "timer:now_diff/2 is the microsecond difference of two timestamp tuples",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "timer:now_diff({0,0,0},{1,2,3})",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok -1000002000003"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/timer_tc_returns_the_fun_value",
+            description: "timer:tc/1 returns {Time, Value}; element 2 is the fun's value",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "element(2, timer:tc(fun () -> 42 end))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 42"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/timer_apply_after_first_element_is_ok",
+            description: "timer:apply_after/4 returns {ok, {once, Ref}} (element 1 is the atom ok)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "element(1, timer:apply_after(50, erlang, self, []))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok ok"),
                 exit_code: 0,
             },
         },
@@ -1250,6 +1321,11 @@ mod tests {
                 "ok {{1,#{b => 2}},{ok,1},default,#{a => 9},#{a => 9},[{a,1},{b,2}],[a],0}",
             ),
             ("bifs/timer_arithmetic_and_sleep", "ok {ok,1000,120000,3600000}"),
+            ("bifs/timer_now_diff_of_two_timestamps", "ok -1000002000003"),
+            ("bifs/timer_tc_returns_the_fun_value", "ok 42"),
+            ("bifs/timer_apply_after_first_element_is_ok", "ok ok"),
+            ("bifs/lists_concat", "ok [97,98,49]"),
+            ("bifs/string_concat_two", "ok [97,98]"),
             (
                 "bifs/integer_radix_conversions",
                 "ok {<<70,70>>,<<45,55,51>>,255,255,100000000000000000000000,badarg}",

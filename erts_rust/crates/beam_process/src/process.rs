@@ -37,7 +37,7 @@ use beam_common::{AllocKind, BeamError, Result};
 use beam_gc::{AnyCollector, Collection, HeapPolicy, OffHeap, OffHeapEntry, ReachableObject};
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::{Eterm, HEADER_BIN_REF};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::dict::Dict;
 use crate::error;
@@ -48,6 +48,32 @@ use crate::pid::ProcessId;
 use crate::registers::Registers;
 use crate::run_queue::Priority;
 use crate::signal_queue::SignalQueue;
+
+// A test-only probe counting [`Process::owned_binary_slot`] resolutions — one unit of work per
+// `data_ptr → slot` lookup, i.e. one per [`Process::register_off_heap_binary`] call.
+//
+// It is a **thread-local** cell so a test's count is deterministic even though cargo runs tests in
+// parallel on separate threads: a registration another test performs on its own thread cannot
+// appear in this thread's count. Kept `#[cfg(test)]` so it costs production nothing, and a
+// thread-local rather than a `Process` field because the frozen field shape is constructible by
+// struct literal in test builds too.
+#[cfg(test)]
+thread_local! {
+    static REGISTRATION_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bumps the test-only registration probe (see `REGISTRATION_PROBES` below): one unit per
+/// `data_ptr → slot` resolution in [`Process::owned_binary_slot`].
+#[cfg(test)]
+fn probe_registration() {
+    REGISTRATION_PROBES.with(|counter| counter.set(counter.get() + 1));
+}
+
+/// The calling thread's current registration-probe count (see `REGISTRATION_PROBES` below).
+#[cfg(test)]
+fn registration_probes() -> u64 {
+    REGISTRATION_PROBES.with(std::cell::Cell::get)
+}
 
 /// The scheduler-visible state of a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -315,13 +341,22 @@ pub struct Process {
     /// with a copied message/fragment), so no handle is ever owned twice — never register the same
     /// payload in both.
     owned_binaries: OffHeap,
+    /// The index over the **live** entries of `owned_binaries`: a payload pointer
+    /// ([`RefcBinary::data_ptr`] as `usize`, the frozen `BinRef.val` contract) → its slot.
+    ///
+    /// This is what makes [`Process::register_off_heap_binary`]'s dedup an **O(1)** lookup instead
+    /// of a scan of the whole slot space: the map holds one entry per **live** payload, written on a
+    /// fresh insert and pruned when a sweep releases an entry ([`Process::retain_off_heap_binaries`],
+    /// the one release funnel), so it can never map a `data_ptr` to a released slot.
+    owned_binary_index: HashMap<usize, usize>,
     /// The number of slots `owned_binaries` has ever handed out — i.e. the next fresh slot index.
     ///
-    /// `beam_gc::OffHeap` exposes no "slot count" accessor and `iter()` skips released slots, so
-    /// the container cannot enumerate its own slot space; this mirror (maintained only by
-    /// [`Process::register_off_heap_binary`], the only operation that appends a slot) is what lets
-    /// [`Process::owned_binary_slot`] scan every slot — live *and* released — by index. A sweep
-    /// only marks slots released, so it never changes this count.
+    /// `beam_gc::OffHeap` exposes no "slot count" accessor, so this mirror (maintained only by
+    /// [`Process::register_off_heap_binary`], the only operation that appends a slot) records the
+    /// size of the slot space across sweeps: a sweep only marks slots released, so it never changes
+    /// this count. Dedup resolves through [`Process::owned_binary_index`], not a scan over this
+    /// count, so the mirror is now purely the slot space's size — the `next fresh slot` value a
+    /// fresh insert is checked against (a `debug_assert!` in `register_off_heap_binary`).
     owned_binary_slots: usize,
     /// The payload pointers (`RefcBinary::data_ptr`) of the owned binaries the caller has
     /// **declared dead**: the reclamation worklist [`Process::sweep_off_heap_binaries`] consumes.
@@ -449,6 +484,7 @@ impl Process {
             relocation_exempt: false,
             off_heap: OffHeapTable::new(),
             owned_binaries: OffHeap::new(),
+            owned_binary_index: HashMap::new(),
             owned_binary_slots: 0,
             dead_binaries: Vec::new(),
             mailbox: Queue::new(),
@@ -713,6 +749,16 @@ impl Process {
             Some(slot) => slot,
             None => {
                 let slot = self.owned_binaries.insert(OffHeapEntry::Binary(binary));
+                // `beam_gc::OffHeap` is append-only and marks a released slot in place (it never
+                // removes or reorders entries), so `entries.len() - 1` — the slot a fresh insert
+                // hands out — is exactly the slot space's next index, i.e. the mirror's value
+                // **before** this insert bumps it. Compare against that pre-insert mirror, not
+                // against the value just written below.
+                debug_assert_eq!(
+                    slot, self.owned_binary_slots,
+                    "a fresh insert hands out the slot space's next index"
+                );
+                self.owned_binary_index.insert(data_ptr, slot);
                 self.owned_binary_slots = slot + 1;
                 slot
             }
@@ -911,27 +957,41 @@ impl Process {
     where
         F: FnMut(&RefcBinary) -> bool,
     {
-        self.owned_binaries.sweep(|entry| match entry.as_binary() {
-            Some(binary) => is_live(binary),
+        // Record the payload pointer of every entry this sweep releases, so the live index can be
+        // pruned of exactly those — and only those — after the sweep returns.
+        let mut released: Vec<usize> = Vec::new();
+        let count = self.owned_binaries.sweep(|entry| match entry.as_binary() {
+            Some(binary) => {
+                let live = is_live(binary);
+                if !live {
+                    released.push(binary.data_ptr() as usize);
+                }
+                live
+            }
             // This list only ever registers binaries; an MSO entry is foreign here — retain it.
             None => true,
-        })
+        });
+        // The index holds live entries only: drop the released payload pointers, so a released slot
+        // can never resolve and a later re-registration of the same payload takes a fresh slot.
+        for data_ptr in released {
+            self.owned_binary_index.remove(&data_ptr);
+        }
+        count
     }
 
     /// The slot of the live owned binary whose payload starts at `data_ptr`, or `None`.
     ///
-    /// The [`RefcBinary::data_ptr`] identity (the frozen `BinRef.val` contract: the *first payload
-    /// byte*) is what makes the list's slot↔payload association a bijection, so a declared-dead
-    /// payload names exactly one slot. Slots are scanned **by index** over the whole slot space
-    /// (a released slot is skipped by `get`, so it can never match).
+    /// This is an **O(1)** lookup in the live index [`Process::owned_binary_index`] — never a scan
+    /// of the slot space, so registration cost is independent of how many slots the list has ever
+    /// handed out. The [`RefcBinary::data_ptr`] identity (the frozen `BinRef.val` contract: the
+    /// *first payload byte*) is what makes the list's slot↔payload association a bijection, so a
+    /// declared-dead payload names exactly one slot. The index holds **live** entries only, pruned
+    /// when a sweep releases one, so a released slot can never resolve.
     fn owned_binary_slot(&self, data_ptr: usize) -> Option<usize> {
-        (0..self.owned_binary_slots).find(|&slot| {
-            self.owned_binaries
-                .get(slot)
-                .and_then(OffHeapEntry::as_binary)
-                .map(|binary| binary.data_ptr() as usize)
-                == Some(data_ptr)
-        })
+        // One probe unit per resolution: the whole of this function's work.
+        #[cfg(test)]
+        probe_registration();
+        self.owned_binary_index.get(&data_ptr).copied()
     }
 
     /// The process's young (mutator) heap **and** its off-heap (MSO) table, as two disjoint
@@ -2192,6 +2252,100 @@ mod tests {
             process.off_heap_binary(unrooted_slot).is_none(),
             "an unrelated boxed shape is not an off-heap handle, so its spoofed payload word retained nothing"
         );
+        Ok(())
+    }
+
+    /// Registration is **O(1) amortized**: its work is independent of how many slots the owned list
+    /// has ever handed out (live *or* released), so re-registering a set of payloads costs exactly
+    /// what registering them the first time cost.
+    ///
+    /// The `registration_probes` counter records the **per-call work of one `data_ptr → slot`
+    /// resolution** inside [`Process::register_off_heap_binary`] — in the index path exactly one
+    /// unit per call, because a resolution is a single keyed lookup in
+    /// `Process::owned_binary_index` and therefore considers exactly one slot candidate. The
+    /// **old** implementation resolved through `owned_binary_slot`'s
+    /// `(0..owned_binary_slots).find(...)`, whose per-call work is one candidate examined per slot
+    /// in the space, so the honest per-candidate count for a call over `S` slots (`S` = that call's
+    /// pre-insert mirror: the slot space grows monotonically with successful registrations) is
+    /// `O(S)`. Counting the old code that way would make batch 1 (each call a miss over an
+    /// ever-larger space) probe `0 + 1 + … + (N-1)` units and batch 2 — all `N` slots live — probe
+    /// an `O(N)` prefix per call (≈`N²/2`), so `batch2` would be far larger than `batch1`; that is
+    /// exactly the inequality the `batch2 == batch1` assertion rejects. With the index every call
+    /// probes exactly once, so both batches probe `N`.
+    #[test]
+    fn off_heap_binary_registration_work_is_independent_of_slot_count() {
+        const N: usize = 1000;
+        let mut process = Process::new(pid(41)).expect("the default heap allocates");
+        // One stable handle per payload keeps every payload alive across both batches, so no address
+        // is freed and reused (a reused address would alias two distinct "payloads") and the process
+        // slot is only one of the payload's two owners.
+        let payloads: Vec<RefcBinary> = (0..N)
+            .map(|i| RefcBinary::new(&[i as u8; 8]).expect("allocate"))
+            .collect();
+
+        // Batch 1: every payload is new — each call is a miss followed by a fresh insert.
+        let before = registration_probes();
+        for binary in &payloads {
+            process.register_off_heap_binary(binary.clone());
+        }
+        let batch1 = registration_probes() - before;
+        assert_eq!(batch1, N as u64, "one probe per registration call — no scan");
+        assert_eq!(process.off_heap_binary_count(), N, "every distinct payload got a slot");
+
+        // Batch 2: the same payloads are re-registered; each is a dedup hit, still one probe. If
+        // resolution scanned the slot space, this batch would probe O(N) candidates per call and the
+        // two counts could not be equal.
+        let before = registration_probes();
+        for binary in &payloads {
+            process.register_off_heap_binary(binary.clone());
+        }
+        let batch2 = registration_probes() - before;
+        assert_eq!(
+            batch2, batch1,
+            "re-registering N payloads over N live slots costs the same as the first registration"
+        );
+    }
+
+    /// A swept-released slot is pruned from the live index, so it never resolves again and
+    /// re-registering the same payload takes a **fresh** slot.
+    #[test]
+    fn off_heap_binary_release_prunes_the_index_and_a_fresh_registration_gets_a_new_slot() -> Result<()>
+    {
+        let mut process = Process::new(pid(42)).expect("the default heap allocates");
+        // A stable handle keeps the payload alive after the process's slot is released, so its
+        // address stays valid and cannot be silently reused by a later allocation.
+        let payload = RefcBinary::new(b"release-cleanup").expect("allocate");
+        let data_ptr = payload.data_ptr();
+
+        let released_slot = process.register_off_heap_binary(payload.clone());
+        assert_eq!(
+            process.off_heap_binary(released_slot).map(RefcBinary::data_ptr),
+            Some(data_ptr),
+            "the payload is registered at its slot"
+        );
+
+        // Declare it dead and sweep: the release funnel must prune the index for it.
+        assert!(process.declare_off_heap_binary_dead(released_slot));
+        assert_eq!(
+            process.sweep_off_heap_binaries(),
+            1,
+            "the declared-dead slot is released"
+        );
+        assert!(
+            process.off_heap_binary(released_slot).is_none(),
+            "a released slot no longer resolves"
+        );
+
+        // Re-registering the same payload — still alive through the caller's handle — gets a fresh
+        // slot, never the released one: proof the index no longer maps `data_ptr` to the old slot.
+        let fresh_slot = process.register_off_heap_binary(payload.clone());
+        assert_ne!(fresh_slot, released_slot, "a released slot is never reused");
+        assert_eq!(
+            process.off_heap_binary(fresh_slot).map(RefcBinary::data_ptr),
+            Some(data_ptr),
+            "the fresh slot names the same payload"
+        );
+        assert!(process.off_heap_binary(released_slot).is_none());
         Ok(())
     }
 }

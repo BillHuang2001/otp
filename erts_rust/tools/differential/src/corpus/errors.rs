@@ -526,6 +526,56 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- The innermost `undef` stacktrace item (a callee-head frame) -------------------
+        // A `catch` cannot bind the stacktrace directly (the runtime's `-eval` evaluator does
+        // not support the three-argument `try C:R:Stacktrace ->` pattern), but the caught
+        // `undef` reason is `{undef, Stacktrace}`, so the stacktrace — and its innermost item —
+        // is reached through `element(2, element(2, (catch EXPR)))`. These cases pin that the
+        // head item is `{Module, Function, ArgList, Location}`: the *third* element is the real
+        // argument LIST (not an arity), which is what the engine now synthesizes for a
+        // `call_ext` / `apply/3` raise.
+        Case {
+            id: "errors/undef_head_item_arg_list_from_apply",
+            description: "an undef raised by apply/3 carries the innermost stacktrace item {Module,Function,ArgList,Location}",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "element(3, hd(element(2, element(2, (catch apply(nonexistent_mod_xyz, foo, [1,2]))))))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [1,2]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "errors/undef_head_item_shape_from_apply",
+            description: "the innermost undef stacktrace item has an atom Module, atom Function, list ArgList and list Location",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin St = element(2, element(2, (catch apply(nonexistent_mod_xyz, foo, [1,2])))), {is_atom(element(1,hd(St))), is_atom(element(2,hd(St))), is_list(element(3,hd(St))), element(3,hd(St))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,true,[1,2]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "errors/undef_head_item_arg_list_from_call_ext",
+            description: "an undef raised by a cross-module call carries the innermost stacktrace item with the real argument list",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "element(3, hd(element(2, element(2, (catch lists:no_such_fn_xyz(1))))))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [1]"),
+                exit_code: 0,
+            },
+        },
         // --- The remaining structured `error` reasons --------------------------------------
         Case {
             id: "errors/badmap_reason",

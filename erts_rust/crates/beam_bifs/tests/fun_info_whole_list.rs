@@ -18,8 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! Oracle cross-check for `erlang:fun_info/1` (the whole-list form) and for the
-//! `make_fun3` local-fun identity items of `erlang:fun_info/2`, driven through
+//! Oracle cross-check for `erlang:fun_info/1` (the whole-list form), for
+//! `erlang:fun_info(F, name)`, and for the `make_fun3` local-fun identity items of
+//! `erlang:fun_info/2`, driven through
 //! [`BifRegistry::call`](beam_bifs::BifRegistry::call) (the crate's public seam).
 //!
 //! **This file is FAIL-LOUD**: it panics when no system `erl`/`erlc` oracle can be
@@ -27,28 +28,31 @@
 //! an executable, else `erl` on `$PATH` (the same resolution `tools/differential`
 //! uses); `erlc` is taken from the same directory, else from `$PATH`.
 //!
-//! * **Case A (fully closed).** `erlang:fun_info(fun lists:map/2)` is run in the
+//! * **Case A (external funs).** `erlang:fun_info(fun lists:map/2)` is run in the
 //!   oracle and the pinned five-item string
 //!   `[{module,lists},{name,map},{arity,2},{env,[]},{type,external}]` is asserted;
 //!   the identical `EXPORT_EXT` fun is then built here and its `/1` result compared
 //!   **structurally** (`beam_term::compare::eq`, i.e. the oracle's `=:=`) against the
-//!   same list. `fun_info(F, pid)` is `{pid,undefined}` for an external fun.
-//! * **Case B (compiled local fun — the residual gap).** A scratch `fiprobe`
-//!   module (`mk(X) -> fun(Y) -> X + Y end`) is compiled with `erlc`; the oracle
-//!   prints one machine-parseable `key=value` line per `fun_info` item for
-//!   `F = fiprobe:mk(73)`. The equivalent `make_fun3` fun is then built here with a
-//!   stub `LocalFunIdentity` supplying the oracle's `module`/MD5/`old_index`/
-//!   `old_uniq`/creator, and every item is asserted to match the oracle line for
-//!   line.
-//!
-//! // NOTE: `name` is the one residual cross-crate gap. The oracle's `fun_info(F,
-//! // name)` (and therefore its whole 10-item `fun_info/1` list) answers the loaded
-//! // module's lambda-table function atom (`'-mk/1-fun-0-'`), which neither the
-//! // frozen `make_fun3` descriptor nor `beam_codec::FunIdentity` carries — the
-//! // identity holds only `module`/`uniq`/`old_index`/`old_uniq`/`creator`, so the
-//! // lambda `function` field is unreachable here. `fun_info(F, name)` and hence
-//! // `fun_info/1` of a non-external fun are therefore the **typed**
-//! // `unsupported_bif` gap (a raise), never a short list or a fabricated atom.
+//!   same list. `fun_info(F, pid)` is `{pid,undefined}` for an external fun. An
+//!   external *BIF* fun (`fun erlang:length/1`) is checked the same way.
+//! * **Case B (compiled local funs).** A scratch `fiprobe` module
+//!   (`mk/1`, `named/0`, `anon/0`) is compiled with `erlc`; the oracle prints the
+//!   whole `fun_info/1` key list plus one machine-parseable `key=value` line per
+//!   `fun_info` item for each closure. The equivalent `make_fun3` funs are then built
+//!   here with a stub `LocalFunIdentity` supplying the oracle's `module`/MD5/
+//!   `old_index`/`old_uniq`/creator **and** the lambda's local function atom (the
+//!   `name` item), and every item — `name` and the full `/1` list included — is
+//!   asserted to match the oracle line for line.
+//! * **Case C (imported fun).** The oracle's
+//!   `binary_to_term(term_to_binary(fiprobe:mk(73)))` is an `Imported`
+//!   (`NEW_FUN_EXT`) fun; the same term is rebuilt here with
+//!   `beam_codec::term::make_fun_imported` and its `name` (from the identity seam,
+//!   since `NEW_FUN_EXT` carries no name) and full `/1` list are compared against the
+//!   oracle.
+//! * **The typed-gap path.** A stub `LocalFunIdentity` that answers `None` (the
+//!   defining module is not loaded here) leaves `fun_info(F, name)` — and therefore
+//!   the whole-list `fun_info/1` — the **typed** `unsupported_bif` gap (a raise),
+//!   never a short list or a fabricated atom.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -218,12 +222,25 @@ fn parse_byte_list(text: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Parses the `keys=` line — the oracle's `fun_info/1` key names in order, printed
+/// by `~w` as `[pid,module,…]` (every key is a lowercase atom, so no quoting).
+fn parse_keys(text: &str) -> Vec<String> {
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("{text} is not a list rendering"));
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner.split(',').map(|k| k.trim().to_string()).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Term helpers (the registry seam, exactly as `beam_rt` drives it)
 // ---------------------------------------------------------------------------
 
 /// The atoms every case below resolves: the ten `fun_info/1` keys, the produced
-/// values and the module/node names.
+/// values, the module/node names and the lambda function names the oracle reports.
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     atoms.seed([
@@ -236,6 +253,8 @@ fn seeded_atoms() -> AtomTable {
         "lists",
         "map",
         "reverse",
+        "length",
+        "erlang",
         "fiprobe",
         "nonode@nohost",
         "pid",
@@ -248,6 +267,10 @@ fn seeded_atoms() -> AtomTable {
         "arity",
         "env",
         "type",
+        // The lambda names the compiled `fiprobe` closures report.
+        "-mk/1-fun-0-",
+        "mk",
+        "-anon/0-fun-0-",
     ]);
     atoms
 }
@@ -290,6 +313,50 @@ fn assert_unsupported_bif(result: beam_common::Result<Eterm>, what: &str) {
     }
 }
 
+/// The `(key, value)` pairs of a `fun_info/1` result, in list order.
+fn list_pairs(reg: &BifRegistry, ctx: &mut BifContext<'_>, list: Eterm) -> Vec<(Eterm, Eterm)> {
+    let mut out = Vec::new();
+    let mut cur = list;
+    while cur != NIL {
+        let pair = reg
+            .call("erlang", "hd", 1, ctx, &[cur])
+            .expect("hd/1 of a proper list");
+        out.push((elem(reg, ctx, pair, 1), elem(reg, ctx, pair, 2)));
+        cur = reg.call("erlang", "tl", 1, ctx, &[cur]).expect("tl/1");
+    }
+    out
+}
+
+/// Asserts the whole-list `fun_info/1` of `fun` has exactly the oracle's `keys=`
+/// sequence (so the order and the set of surviving pairs are the oracle's) and that
+/// every pair agrees with `fun_info/2` for that key — whose value each case pins
+/// against the oracle's own per-item line.
+fn assert_whole_list_matches(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    atoms: &AtomTable,
+    fun: Eterm,
+    oracle_keys: &[String],
+) {
+    let list = call(reg, ctx, "fun_info", &[fun]).expect("fun_info/1");
+    let pairs = list_pairs(reg, ctx, list);
+    let got_keys: Vec<String> = pairs
+        .iter()
+        .map(|(key, _)| atom_name(atoms, *key).to_string())
+        .collect();
+    assert_eq!(got_keys.as_slice(), oracle_keys, "the /1 key sequence");
+    for (key, value) in pairs {
+        let two = call(reg, ctx, "fun_info", &[fun, key]).expect("fun_info/2");
+        // Structural equality (`=:=`): `/1` and `/2` each build fresh boxed terms
+        // (`new_uniq`'s binary, the `env` list), so raw word identity would differ.
+        assert!(
+            beam_term::compare::eq(value, elem(reg, ctx, two, 2), atoms),
+            "`{}` disagrees between /1 and /2",
+            atom_name(atoms, key)
+        );
+    }
+}
+
 /// Asserts the proper list `list` equals `expected` element for element.
 fn assert_list(reg: &BifRegistry, ctx: &mut BifContext<'_>, list: Eterm, expected: &[i64]) {
     let mut cur = list;
@@ -315,6 +382,45 @@ impl beam_bifs::LocalFunIdentity for StubIdentity {
     ) -> beam_common::Result<Option<beam_codec::FunIdentity>> {
         Ok(Some(self.0))
     }
+}
+
+/// A `LocalFunIdentity` stub answering `None` — the defining module is not loaded
+/// here, so the identity is genuinely unknown (the `-eval` template-closure case).
+struct StubNone;
+
+impl beam_bifs::LocalFunIdentity for StubNone {
+    fn local_fun_identity(
+        &mut self,
+        _term: Eterm,
+    ) -> beam_common::Result<Option<beam_codec::FunIdentity>> {
+        Ok(None)
+    }
+}
+
+/// The `fiprobe` identity a stub supplies for the *bare module*: the module atom
+/// and a this-node creator, with the oracle's MD5/`old_index`/`old_uniq` **and** the
+/// oracle's lambda `function` atom.
+#[allow(clippy::too_many_arguments)]
+fn fiprobe_identity(
+    atoms: &AtomTable,
+    md5: [u8; 16],
+    old_index: u32,
+    old_uniq: u32,
+    function: &str,
+) -> beam_codec::FunIdentity {
+    beam_codec::FunIdentity::named(
+        atoms.lookup("fiprobe").expect("seeded module"),
+        md5,
+        old_index,
+        old_uniq,
+        FunPid {
+            node: atoms.lookup("nonode@nohost").expect("seeded node"),
+            number: 0,
+            serial: 0,
+            creation: 0,
+        },
+        atoms.lookup(function).expect("seeded function atom"),
+    )
 }
 
 /// A `make_fun3` (`FunKind::Local`) fun term plus the storage owning its words
@@ -394,35 +500,45 @@ fn an_external_fun_is_the_oracle_five_item_list() {
 }
 
 // ---------------------------------------------------------------------------
-// Case B — a compiled local fun (the residual `name` gap)
+// Case B/C — compiled local funs and an imported fun
 // ---------------------------------------------------------------------------
 
 /// The fixture source, written into a scratch directory and compiled with `erlc`.
 const FIPROBE_ERL: &str = r#"%% Generated by `beam_bifs/tests/fun_info_whole_list.rs` (never committed).
 -module(fiprobe).
--export([mk/1]).
+-export([mk/1, named/0, anon/0]).
 
 mk(X) -> fun(Y) -> X + Y end.
+named() -> fun mk/1.
+anon() -> fun(_) -> ok end.
 "#;
 
-/// One `key=value` line per `fun_info` item for `F = fiprobe:mk(73)`.
+/// The oracle script for one fun expression `fun_expr`: the whole `fun_info/1` key
+/// sequence plus one `key=value` line per item.
 ///
-/// `~w` (not `~p`) so the values never get pretty-printed across line breaks, and
-/// `env` is rendered through `list_to_tuple/1` so a printable list (`[73]`, which
-/// `~w` would print as the string `"I"`) stays machine-parseable.
-const PROBE: &str = r#"
-F = fiprobe:mk(73),
+/// `~w` (not `~p`) so the values never get pretty-printed across line breaks; `env`
+/// is rendered through `list_to_tuple/1` so a printable list (`[73]`, which `~w`
+/// would print as the string `"I"`) stays machine-parseable; and `name` through
+/// `atom_to_list/1` so the lambda atom is captured **unquoted**.
+fn probe(fun_expr: &str) -> String {
+    format!(
+        r#"
+F = {fun_expr},
+io:format("keys=~w~n", [[element(1, P) || P <- erlang:fun_info(F)]]),
 io:format("module=~w~n", [element(2, erlang:fun_info(F, module))]),
 io:format("new_index=~w~n", [element(2, erlang:fun_info(F, new_index))]),
 io:format("new_uniq=~w~n", [list_to_tuple(binary_to_list(element(2, erlang:fun_info(F, new_uniq))))]),
 io:format("index=~w~n", [element(2, erlang:fun_info(F, index))]),
 io:format("uniq=~w~n", [element(2, erlang:fun_info(F, uniq))]),
+io:format("name=~s~n", [atom_to_list(element(2, erlang:fun_info(F, name)))]),
 io:format("arity=~w~n", [element(2, erlang:fun_info(F, arity))]),
 io:format("env=~w~n", [list_to_tuple(element(2, erlang:fun_info(F, env)))]),
 io:format("type=~w~n", [element(2, erlang:fun_info(F, type))]),
 io:format("pid=~w~n", [element(2, erlang:fun_info(F, pid))]),
 halt().
-"#;
+"#
+    )
+}
 
 /// A compiled fixture in its own scratch directory.
 struct Fixture {
@@ -441,10 +557,12 @@ impl Fixture {
     }
 }
 
-/// Compiles the `fiprobe` fixture. **Panics** on any failure: `erl` is required
-/// anyway, so a broken toolchain must not look like a pass.
-fn build_fixture() -> Fixture {
-    let dir = std::env::temp_dir().join(format!("beam_bifs_fun_info_{}", std::process::id()));
+/// Compiles the `fiprobe` fixture into a scratch directory unique to `tag` (the
+/// cases run in parallel in one process, so they must not share a directory).
+/// **Panics** on any failure: `erl` is required anyway, so a broken toolchain must
+/// not look like a pass.
+fn build_fixture(tag: &str) -> Fixture {
+    let dir = std::env::temp_dir().join(format!("beam_bifs_fun_info_{}_{tag}", std::process::id()));
     std::fs::create_dir_all(&dir)
         .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
     let source = dir.join("fiprobe.erl");
@@ -470,119 +588,355 @@ fn build_fixture() -> Fixture {
     Fixture { dir }
 }
 
-/// Every `fun_info/2` item of the oracle's `fiprobe:mk(73)` closure matches, line
-/// for line, the identity-driven `make_fun3` fun built here — and `name` (hence
-/// `fun_info/1`) is the documented typed gap.
-#[test]
-fn a_compiled_local_fun_matches_the_oracle_item_for_item() {
-    let fixture = build_fixture();
-    let output = run_erl_with_code_path(&fixture.dir, PROBE);
+/// The parsed `key=value` fields of one oracle `probe` run for a non-external fun.
+struct OracleLocal {
+    keys: Vec<String>,
+    module: String,
+    new_index: i64,
+    new_uniq: Vec<u8>,
+    index: i64,
+    uniq: i64,
+    name: String,
+    arity: i64,
+    env: Vec<i64>,
+    type_: String,
+}
 
-    // --- the oracle's own values -------------------------------------------
-    let oracle_module = parse_field(&output, "module").to_string();
-    let oracle_new_index: i64 = parse_field(&output, "new_index")
-        .parse()
-        .expect("new_index is an integer");
-    let oracle_new_uniq = parse_byte_list(parse_field(&output, "new_uniq"));
-    let oracle_index: i64 = parse_field(&output, "index")
-        .parse()
-        .expect("index is an integer");
-    let oracle_uniq: i64 = parse_field(&output, "uniq")
-        .parse()
-        .expect("uniq is an integer");
-    let oracle_arity: i64 = parse_field(&output, "arity")
-        .parse()
-        .expect("arity is an integer");
-    let oracle_env = parse_tuple_int_list(parse_field(&output, "env"));
-    let oracle_type = parse_field(&output, "type").to_string();
-    let oracle_pid = parse_field(&output, "pid").to_string();
+/// Parses the oracle `probe` output for a fun whose identity items are all defined
+/// (every `make_fun3` closure and the `Imported` fun).
+fn oracle_local(output: &str) -> OracleLocal {
+    OracleLocal {
+        keys: parse_keys(parse_field(output, "keys")),
+        module: parse_field(output, "module").to_string(),
+        new_index: parse_field(output, "new_index")
+            .parse()
+            .expect("new_index is an integer"),
+        new_uniq: parse_byte_list(parse_field(output, "new_uniq")),
+        index: parse_field(output, "index")
+            .parse()
+            .expect("index is an integer"),
+        uniq: parse_field(output, "uniq")
+            .parse()
+            .expect("uniq is an integer"),
+        name: parse_field(output, "name").to_string(),
+        arity: parse_field(output, "arity")
+            .parse()
+            .expect("arity is an integer"),
+        env: parse_tuple_int_list(parse_field(output, "env")),
+        type_: parse_field(output, "type").to_string(),
+    }
+}
 
-    assert_eq!(oracle_module, "fiprobe");
-    assert_eq!(oracle_type, "local");
-    assert_eq!(oracle_new_uniq.len(), 16, "new_uniq is the 16-byte module MD5");
-    assert_eq!(oracle_pid, "<0.0.0>");
+/// Asserts every `fun_info/2` item — `name` included — and the whole-list
+/// `fun_info/1` of a built `make_fun3`/`Imported` fun match the oracle's `probe`
+/// fields for the same closure.
+fn assert_identity_fun_matches_oracle(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    atoms: &AtomTable,
+    fun: Eterm,
+    oracle: &OracleLocal,
+) {
+    assert_eq!(oracle.module, "fiprobe", "the fixture module");
+    assert_eq!(oracle.type_, "local", "a compiled/imported fun is local");
+    assert_eq!(oracle.new_uniq.len(), 16, "new_uniq is the 16-byte module MD5");
 
-    // --- the equivalent Rust fun, with a stub identity ----------------------
-    let reg = default_registry();
-    let atoms = seeded_atoms();
-    let mut heap = Heap::new(4096).expect("test heap");
-    let mut md5 = [0u8; 16];
-    md5.copy_from_slice(&oracle_new_uniq);
-    let identity = beam_codec::FunIdentity {
-        module: atoms.lookup("fiprobe").expect("seeded module"),
-        uniq: md5,
-        old_index: oracle_index as u32,
-        old_uniq: oracle_uniq as u32,
-        creator: FunPid {
-            node: atoms.lookup("nonode@nohost").expect("seeded node"),
-            number: 0,
-            serial: 0,
-            creation: 0,
-        },
-    };
-    let mut stub = StubIdentity(identity);
-    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut stub);
-    let env: Vec<Eterm> = oracle_env
-        .iter()
-        .map(|v| ctx.int(*v).expect("env value fits"))
-        .collect();
-    let (_storage, fun) = local_fun(oracle_arity as u32, 0x1234_5678_9AB0, oracle_new_index as u32, &env);
-
-    // --- item for item ------------------------------------------------------
     assert_eq!(
-        atom_name(&atoms, fun_info_item(&reg, &mut ctx, fun, "module")),
-        oracle_module
+        atom_name(atoms, fun_info_item(reg, ctx, fun, "module")),
+        oracle.module
     );
     assert_eq!(
-        signed_value(fun_info_item(&reg, &mut ctx, fun, "new_index")),
-        oracle_new_index
+        signed_value(fun_info_item(reg, ctx, fun, "new_index")),
+        oracle.new_index
     );
 
-    let new_uniq = fun_info_item(&reg, &mut ctx, fun, "new_uniq");
+    let new_uniq = fun_info_item(reg, ctx, fun, "new_uniq");
     let (bytes, offset_bits, size_bits) =
         beam_codec::term::bitstring_bytes(new_uniq).expect("new_uniq is a binary");
     assert_eq!((offset_bits, size_bits), (0, 128));
-    assert_eq!(bytes, &oracle_new_uniq[..], "new_uniq bytes");
+    assert_eq!(bytes, &oracle.new_uniq[..], "new_uniq bytes");
 
     assert_eq!(
-        signed_value(fun_info_item(&reg, &mut ctx, fun, "index")),
-        oracle_index
+        signed_value(fun_info_item(reg, ctx, fun, "index")),
+        oracle.index
     );
     assert_eq!(
-        signed_value(fun_info_item(&reg, &mut ctx, fun, "uniq")),
-        oracle_uniq
+        signed_value(fun_info_item(reg, ctx, fun, "uniq")),
+        oracle.uniq
     );
     assert_eq!(
-        signed_value(fun_info_item(&reg, &mut ctx, fun, "arity")),
-        oracle_arity
+        atom_name(atoms, fun_info_item(reg, ctx, fun, "name")),
+        oracle.name,
+        "the lambda's local function name"
+    );
+    assert_eq!(
+        signed_value(fun_info_item(reg, ctx, fun, "arity")),
+        oracle.arity
     );
 
-    let env_value = fun_info_item(&reg, &mut ctx, fun, "env");
-    assert_list(&reg, &mut ctx, env_value, &oracle_env);
+    let env_value = fun_info_item(reg, ctx, fun, "env");
+    assert_list(reg, ctx, env_value, &oracle.env);
 
     assert_eq!(
-        atom_name(&atoms, fun_info_item(&reg, &mut ctx, fun, "type")),
-        oracle_type
+        atom_name(atoms, fun_info_item(reg, ctx, fun, "type")),
+        oracle.type_
     );
 
     // The creator pid is this node's own (the stub identity's `(nonode@nohost, 0)`
     // creator), i.e. the internal `<0.0.0>` immediate — matching the oracle.
     assert_eq!(
-        fun_info_item(&reg, &mut ctx, fun, "pid"),
+        fun_info_item(reg, ctx, fun, "pid"),
         ProcessId::new(0, 0).to_eterm()
     );
 
-    // --- the residual gap ---------------------------------------------------
+    assert_whole_list_matches(reg, ctx, atoms, fun, &oracle.keys);
+}
+
+/// `fiprobe:mk(73)` — an anonymous local closure. Every item, its `name`
+/// (`'-mk/1-fun-0-'`) and the whole-list `fun_info/1` match the oracle.
+#[test]
+fn the_mk_closure_matches_the_oracle_item_for_item() {
+    let fixture = build_fixture("mk");
+    let output = run_erl_with_code_path(&fixture.dir, &probe("fiprobe:mk(73)"));
+    let oracle = oracle_local(&output);
+    assert_eq!(oracle.name, "-mk/1-fun-0-");
+
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut md5 = [0u8; 16];
+    md5.copy_from_slice(&oracle.new_uniq);
+    let identity = fiprobe_identity(
+        &atoms,
+        md5,
+        oracle.index as u32,
+        oracle.uniq as u32,
+        &oracle.name,
+    );
+    let mut stub = StubIdentity(identity);
+    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut stub);
+    let env: Vec<Eterm> = oracle
+        .env
+        .iter()
+        .map(|v| ctx.int(*v).expect("env value fits"))
+        .collect();
+    let (_storage, fun) = local_fun(
+        oracle.arity as u32,
+        0x1234_5678_9AB0,
+        oracle.new_index as u32,
+        &env,
+    );
+
+    assert_identity_fun_matches_oracle(&reg, &mut ctx, &atoms, fun, &oracle);
+    fixture.cleanup();
+}
+
+/// `fiprobe:named()` — a **named** local fun (`fun mk/1`), whose `name` is the plain
+/// atom `mk` (not a generated `-…-fun-…-`).
+#[test]
+fn the_named_local_fun_matches_the_oracle_item_for_item() {
+    let fixture = build_fixture("named");
+    let output = run_erl_with_code_path(&fixture.dir, &probe("fiprobe:named()"));
+    let oracle = oracle_local(&output);
+    assert_eq!(oracle.name, "mk");
+
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut md5 = [0u8; 16];
+    md5.copy_from_slice(&oracle.new_uniq);
+    let identity = fiprobe_identity(
+        &atoms,
+        md5,
+        oracle.index as u32,
+        oracle.uniq as u32,
+        &oracle.name,
+    );
+    let mut stub = StubIdentity(identity);
+    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut stub);
+    let env: Vec<Eterm> = oracle
+        .env
+        .iter()
+        .map(|v| ctx.int(*v).expect("env value fits"))
+        .collect();
+    let (_storage, fun) = local_fun(
+        oracle.arity as u32,
+        0x0BAD_C0DE,
+        oracle.new_index as u32,
+        &env,
+    );
+
+    assert_identity_fun_matches_oracle(&reg, &mut ctx, &atoms, fun, &oracle);
+    fixture.cleanup();
+}
+
+/// `fiprobe:anon()` — an anonymous local closure with no captures; `name` is the
+/// generated `'-anon/0-fun-0-'`.
+#[test]
+fn the_anon_closure_matches_the_oracle_item_for_item() {
+    let fixture = build_fixture("anon");
+    let output = run_erl_with_code_path(&fixture.dir, &probe("fiprobe:anon()"));
+    let oracle = oracle_local(&output);
+    assert_eq!(oracle.name, "-anon/0-fun-0-");
+
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut md5 = [0u8; 16];
+    md5.copy_from_slice(&oracle.new_uniq);
+    let identity = fiprobe_identity(
+        &atoms,
+        md5,
+        oracle.index as u32,
+        oracle.uniq as u32,
+        &oracle.name,
+    );
+    let mut stub = StubIdentity(identity);
+    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut stub);
+    let env: Vec<Eterm> = oracle
+        .env
+        .iter()
+        .map(|v| ctx.int(*v).expect("env value fits"))
+        .collect();
+    let (_storage, fun) = local_fun(
+        oracle.arity as u32,
+        0xFEED_FACE,
+        oracle.new_index as u32,
+        &env,
+    );
+
+    assert_identity_fun_matches_oracle(&reg, &mut ctx, &atoms, fun, &oracle);
+    fixture.cleanup();
+}
+
+/// The oracle's `binary_to_term(term_to_binary(fiprobe:mk(73)))` — an `Imported`
+/// (`NEW_FUN_EXT`) fun. Its identity items come from the inlined wire descriptor;
+/// its `name` (`'-mk/1-fun-0-'`) from the identity seam, because the wire image
+/// carries no function-name field.
+#[test]
+fn an_imported_fun_matches_the_oracle_item_for_item() {
+    let fixture = build_fixture("imported");
+    let output = run_erl_with_code_path(
+        &fixture.dir,
+        &probe("binary_to_term(term_to_binary(fiprobe:mk(73)))"),
+    );
+    let oracle = oracle_local(&output);
+    assert_eq!(oracle.name, "-mk/1-fun-0-");
+
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut md5 = [0u8; 16];
+    md5.copy_from_slice(&oracle.new_uniq);
+    let identity = fiprobe_identity(
+        &atoms,
+        md5,
+        oracle.index as u32,
+        oracle.uniq as u32,
+        &oracle.name,
+    );
+    let mut stub = StubIdentity(identity);
+    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut stub);
+    let env: Vec<Eterm> = oracle
+        .env
+        .iter()
+        .map(|v| ctx.int(*v).expect("env value fits"))
+        .collect();
+    let fun = beam_codec::term::make_fun_imported(
+        ctx.heap(),
+        oracle.arity as usize,
+        atoms.lookup("fiprobe").expect("seeded module"),
+        &md5,
+        oracle.new_index as u32,
+        oracle.index as u32,
+        oracle.uniq as u32,
+        FunPid {
+            node: atoms.lookup("nonode@nohost").expect("seeded node"),
+            number: 0,
+            serial: 0,
+            creation: 0,
+        },
+        &env,
+    )
+    .expect("the imported fun fits");
+
+    assert_identity_fun_matches_oracle(&reg, &mut ctx, &atoms, fun, &oracle);
+    fixture.cleanup();
+}
+
+/// External funs — `fun lists:reverse/1` and the BIF `fun erlang:length/1` — report
+/// the oracle's `{name,_}` and its five-item `fun_info/1` list.
+#[test]
+fn external_funs_report_the_oracle_name_and_five_item_list() {
+    let cases = [
+        (
+            "fun lists:reverse/1",
+            "lists",
+            "reverse",
+            "[{module,lists},{name,reverse},{arity,1},{env,[]},{type,external}]",
+        ),
+        (
+            "fun erlang:length/1",
+            "erlang",
+            "length",
+            "[{module,erlang},{name,length},{arity,1},{env,[]},{type,external}]",
+        ),
+    ];
+    for (expr, module, function, pinned) in cases {
+        // --- the oracle ---------------------------------------------------------
+        let stdout = run_erl(&format!(
+            r#"io:format("~p~n",[erlang:fun_info({expr})]), halt()."#
+        ));
+        assert_eq!(stdout.trim_end(), pinned, "oracle fun_info/1 for {expr}");
+
+        // --- the same fun, built here -------------------------------------------
+        let reg = default_registry();
+        let atoms = seeded_atoms();
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut ctx = make_ctx(&mut heap, &atoms);
+        let module_atom = ctx.atom(module).expect("seeded module");
+        let function_atom = ctx.atom(function).expect("seeded function");
+        let fun = beam_codec::term::make_fun_external(
+            ctx.heap(),
+            1,
+            atom_val(module_atom),
+            atom_val(function_atom),
+        )
+        .expect("the external fun fits");
+
+        assert_eq!(
+            atom_name(&atoms, fun_info_item(&reg, &mut ctx, fun, "name")),
+            function,
+            "the name of {expr}"
+        );
+        let keys: Vec<String> = ["module", "name", "arity", "env", "type"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_whole_list_matches(&reg, &mut ctx, &atoms, fun, &keys);
+    }
+}
+
+/// With no identity (the defining module is not loaded here) `fun_info(F, name)` and
+/// the whole-list `fun_info/1` of a `make_fun3` fun are the typed `unsupported_bif`
+/// gap — a raise, never a short list or a fabricated atom.
+#[test]
+fn an_unresolved_local_fun_is_the_typed_gap() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut stub = StubNone;
+    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut stub);
+    let (_storage, fun) = local_fun(1, 0x1234_5678, 3, &[]);
+
     assert_unsupported_bif(
         fun_info_item_result(&reg, &mut ctx, fun, "name"),
-        "fun_info(F, name) of a compiled local fun",
+        "fun_info(F, name) of an unresolved local fun",
     );
     assert_unsupported_bif(
         call(&reg, &mut ctx, "fun_info", &[fun]),
-        "fun_info/1 of a compiled local fun (the oracle returns the full 10-item list)",
+        "fun_info/1 of an unresolved local fun",
     );
-
-    fixture.cleanup();
 }
 
 /// Like [`fun_info_item`] but without unwrapping, so a caller can assert the typed

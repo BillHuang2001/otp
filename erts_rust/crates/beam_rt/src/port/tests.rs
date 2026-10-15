@@ -1683,6 +1683,83 @@ fn a_driver_interned_name_lands_in_the_live_atom_table_at_the_port_boundary() {
     assert!(pending.is_empty(), "a dropped name leaves the window");
 }
 
+/// A port round that commits **nothing** must not reach the shared atom table at all.
+///
+/// `Runtime::deliver_port_messages` handed the commit the table through `code_server.atoms_mut()`,
+/// which is `Rc::make_mut`: with any other holder alive — and a `{spawn_driver, Name}` port's host
+/// holds one for the port's **whole life** — that deep-cloned the entire shared table (every name
+/// `String`, plus the index map) on **every** round, even a round with nothing to land.
+/// `DriverAtoms::is_empty` is the guard [`DriverAtoms`]'s own contract asks for;
+/// [`PortRegistry::has_pending_driver_atoms`] applies it at the site that owns the borrow.
+///
+/// The clone is observable directly, with no allocation instrumentation: `Rc::make_mut` replaces
+/// the code server's `Rc` with a **fresh allocation**, so a handle taken before the round stops
+/// sharing an allocation with the server's. Pointer identity *is* the work the guard removes —
+/// deterministic and load-independent (the alternative, a counting `#[global_allocator]`, needs
+/// `unsafe impl GlobalAlloc`, which this crate's `#![deny(unsafe_code)]` forbids; the
+/// allocation figure of the avoided clone is measured by
+/// `tests/atom_table_commit_alloc.rs`'s clone control).
+#[test]
+fn an_idle_port_round_does_not_clone_the_shared_atom_table() {
+    use beam_abi::DriverHost;
+
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+    let owner = table.spawn_default().expect("the port's owner");
+
+    // The host holds a handle for the port's whole life, exactly as a `{spawn_driver, Name}`
+    // port's real host does, and shares its pending window with the port's metadata.
+    let atoms = rt.code_server().atoms_handle();
+    let (mut host, meta) = driver_term_host(&atoms, owner);
+    let pending = meta.driver_atoms.clone().expect("the pending handle");
+    rt.ports
+        .borrow_mut()
+        .register(
+            Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+            meta,
+        )
+        .expect("a registered driver port");
+
+    // The round really runs the commit site: a registered port is pollable, so
+    // `deliver_port_messages` cannot take its "nothing to poll" early return.
+    assert!(
+        !rt.ports.borrow().has_nothing_to_poll(),
+        "the round must not bail out before the commit site"
+    );
+
+    // (1) Nothing pending ⇒ the shared table is not even borrowed, let alone cloned.
+    assert!(pending.is_empty(), "nothing is pending for this round");
+    let before = Rc::as_ptr(&rt.code_server().atoms_handle());
+    rt.deliver_port_messages(&mut table, Duration::from_millis(1))
+        .expect("the round runs");
+    let after = Rc::as_ptr(&rt.code_server().atoms_handle());
+    assert_eq!(
+        before, after,
+        "an idle port round must not replace the shared AtomTable with a clone of itself"
+    );
+
+    // (2) ...and a round **with** a pending name still lands it, at exactly the predicted index:
+    // the guard skips the borrow, never the commit.
+    let fresh = host
+        .intern_atom("driver_round_fresh")
+        .expect("interning always answers");
+    let predicted = atom_val(fresh);
+    assert!(!pending.is_empty(), "the fresh name awaits its commit");
+    assert_eq!(
+        rt.atoms().lookup("driver_round_fresh"),
+        None,
+        "unresolvable before the round"
+    );
+    rt.deliver_port_messages(&mut table, Duration::from_millis(1))
+        .expect("the round runs");
+    assert_eq!(
+        rt.atoms().name(predicted),
+        Some("driver_round_fresh"),
+        "the round lands the predicted name in the shared table"
+    );
+    assert!(pending.is_empty(), "the commit empties the window");
+}
+
 /// A driver-emitted term is delivered into its recipient's mailbox by
 /// [`Runtime::deliver_port_messages`]: the term itself (never a `{Port, Term}` wrapper), to the
 /// port's owner for `erl_drv_output_term` and to the named pid for `erl_drv_send_term`.

@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1792058307701,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "rust",
+      "program": "erts_rust/target/release/beam_rt",
+      "version": "30",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "foreign",
+      "runtime": "rust",
+      "category": "compute",
+      "description": "real Cowboy/EMQX modules run under each runtime (per-call cost + wall latency)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_bstr_to_lower_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2418.2741760000004,
+            "max": 2611.643387,
+            "mean": 2483.184126666667,
+            "p50": 2419.634817,
+            "p90": 2573.241673,
+            "p99": 2607.8032156
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 459591680.0,
+            "max": 460075008.0,
+            "mean": 459870208.0,
+            "p50": 459943936.0,
+            "p90": 460048793.6,
+            "p99": 460072386.56
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2059.802777,
+            "max": 2130.7291689999997,
+            "mean": 2093.4445643333333,
+            "p50": 2089.801747,
+            "p90": 2122.5436846,
+            "p99": 2129.9106205599996
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_ns_per_call",
+          "unit": "ns",
+          "value": 19486.978116666683
+        },
+        {
+          "name": "case_bstr_to_lower_calls",
+          "unit": "calls",
+          "value": 20000.0
+        },
+        {
+          "name": "case_bstr_capitalize_token_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2567.7622229999997,
+            "max": 2689.972359,
+            "mean": 2613.0501679999998,
+            "p50": 2581.415922,
+            "p90": 2668.2610716,
+            "p99": 2687.80123026
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 462884864.0,
+            "max": 463040512.0,
+            "mean": 462936746.6666667,
+            "p50": 462884864.0,
+            "p90": 463009382.4,
+            "p99": 463037399.04
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2069.927299,
+            "max": 2173.941725,
+            "mean": 2115.986532333334,
+            "p50": 2104.090573,
+            "p90": 2159.9714946,
+            "p99": 2172.54470196
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_ns_per_call",
+          "unit": "ns",
+          "value": 33137.57571111106
+        },
+        {
+          "name": "case_bstr_capitalize_token_calls",
+          "unit": "calls",
+          "value": 15000.0
+        },
+        {
+          "name": "case_emqx_base62_encode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2726.133145,
+            "max": 2793.877793,
+            "mean": 2752.9908286666664,
+            "p50": 2738.9615479999998,
+            "p90": 2782.894544,
+            "p99": 2792.7794681
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 448385024.0,
+            "max": 448892928.0,
+            "mean": 448559786.6666667,
+            "p50": 448401408.0,
+            "p90": 448794624.0,
+            "p99": 448883097.6
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2155.6852790000003,
+            "max": 2192.1762870000002,
+            "mean": 2171.1243630000004,
+            "p50": 2165.511523,
+            "p90": 2186.8433342000003,
+            "p99": 2191.6429917200003
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_ns_per_call",
+          "unit": "ns",
+          "value": 23274.65862666664
+        },
+        {
+          "name": "case_emqx_base62_encode_calls",
+          "unit": "calls",
+          "value": 25000.0
+        },
+        {
+          "name": "case_emqx_base62_decode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2482.0278789999998,
+            "max": 2516.155169,
+            "mean": 2497.791789333333,
+            "p50": 2495.19232,
+            "p90": 2511.9625992,
+            "p99": 2515.73591202
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 448565248.0,
+            "max": 448991232.0,
+            "mean": 448843776.0,
+            "p50": 448974848.0,
+            "p90": 448987955.2,
+            "p99": 448990904.32
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 2171.7043409999997,
+            "max": 2241.0876540000004,
+            "mean": 2205.945313,
+            "p50": 2205.043944,
+            "p90": 2233.878912,
+            "p99": 2240.3667798000006
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_ns_per_call",
+          "unit": "ns",
+          "value": 19456.431755555514
+        },
+        {
+          "name": "case_emqx_base62_decode_calls",
+          "unit": "calls",
+          "value": 15000.0
+        }
+      ],
+      "peak_memory_bytes": 463040512,
+      "notes": [
+        "staged 4 foreign case(s) from 2 distinct source file(s)",
+        "case bstr_to_lower: N=20000 (rust), sources=cowboy/src/cowboy_bstr.erl",
+        "case bstr_capitalize_token: N=15000 (rust), sources=cowboy/src/cowboy_bstr.erl",
+        "case emqx_base62_encode: N=25000 (rust), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "case emqx_base62_decode: N=15000 (rust), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "observed stdout: bstr_to_lower=600000 bstr_capitalize_token=450000 emqx_base62_encode=400000 emqx_base62_decode=165000",
+        "caveat: on the Rust runtime this per-call metric is N-DEPENDENT (the measured per-call cost grows with N, super-linearly), so case_<name>_ns_per_call is only comparable across runs that used the SAME N; the m10 vs m11 (HEAD) A/B was run at matched N (the case table's n_rust is unchanged). See RESULTS.md 3.4.",
+        "method: per-call cost = (mean wall at N iterations - mean wall at 0 iterations) / N; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides",
+        "cases: 4 ok, 0 unsupported (of 4)"
+      ]
+    }
+  ]
+}

@@ -43,17 +43,18 @@
 //!   *non-iodata* argument (`42`) is `error:badarg` on both `zip/1` and `unzip/1` — and so is
 //!   an improper list (`[1,2|3]`), whose `zip/1` would have to walk a non-list tail.
 //!
+//! The **zlib-wrapped** siblings `zlib:compress/1` / `zlib:uncompress/1` (a 2-byte zlib header
+//! + Adler-32) and `zlib:gzip/1` / `zlib:gunzip/1` (the gzip container) are pinned too:
+//! byte-exact tiny-body goldens (`<<"abc">>`), the encoder/inflater round trips, and the bare
+//! `error:data_error` failure class — a non-stream or non-gzip argument carries no length arm
+//! and raises `data_error`, never `badarg`.
+//!
 //! Not pinned here (and why):
 //!
-//! * The **zlib-wrapped** siblings `zlib:compress/1` / `zlib:uncompress/1` and
-//!   `zlib:gzip/1` / `zlib:gunzip/1` are a different framing (a 2-byte zlib header + Adler-32,
-//!   and the gzip container). `compress/1`/`uncompress/1` currently agree with the oracle
-//!   byte-exactly, but `gzip/1`/`gunzip/1` do **not**: the Rust runtime raises a plain
-//!   `error:undef` where the oracle returns the gzip stream, so a case pinning either one
-//!   would be a `mismatch`, not a legitimate case. Neither pair is part of this group.
-//! * The compressed bytes of **any other body**: the encoder is free to choose stored, fixed
-//!   or dynamic Huffman blocks, so only bodies whose image the oracle has been *observed* to
-//!   reproduce byte-for-byte (the three above) carry a byte-exact golden.
+//! * The compressed **image** of a larger or repetitive body: the encoder is free to choose
+//!   stored, fixed or dynamic Huffman blocks, so `zlib:compress(<<0:8192>>)` resolves to a
+//!   different — but equally valid — stream than the oracle's 17 bytes. Only bodies whose
+//!   image the oracle reproduces byte for byte carry a byte-exact golden.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.7 `zlib` raw-DEFLATE cases.
@@ -237,6 +238,112 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // -- the zlib-wrapped pair: compress/uncompress + gzip/gunzip -----------------------
+        Case {
+            id: "zlib/compress_bytes_are_deterministic",
+            description: "zlib:compress/1 of a tiny body is a byte-exact, order-stable zlib stream",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A tiny body, so the encoder's block choice is stable across the runtimes —
+                // pinned byte-exactly (see the module doc for why a larger body is not).
+                expr: "zlib:compress(<<\"abc\">>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<120,156,75,76,74,6,0,2,77,1,39>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "zlib/gzip_bytes_are_deterministic",
+            description: "zlib:gzip/1 of a tiny body is a byte-exact gzip container",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "zlib:gzip(<<\"abc\">>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "zlib/uncompress_compress_roundtrip_tiny",
+            description: "zlib:uncompress/1 inverts zlib:compress/1 for a tiny body",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "zlib:uncompress(zlib:compress(<<\"abc\">>)) =:= <<\"abc\">>",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "zlib/uncompress_compress_roundtrip_100_bytes_is_identity",
+            description: "zlib:uncompress/1 inverts zlib:compress/1 for a 100-byte body (the \
+                          compressed image itself is the encoder's choice)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The `=:=` compares the *body*, so the case stays valid whatever block type
+                // the encoder chose (its compressed image is not pinned byte-exactly).
+                expr: "zlib:uncompress(zlib:compress(list_to_binary(lists:seq(1,100)))) \
+                       =:= list_to_binary(lists:seq(1,100))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "zlib/gunzip_gzip_roundtrip_tiny",
+            description: "zlib:gunzip/1 inverts zlib:gzip/1 for a tiny body",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "zlib:gunzip(zlib:gzip(<<\"abc\">>)) =:= <<\"abc\">>",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "zlib/uncompress_three_bytes_is_data_error",
+            description: "zlib:uncompress/1 of a 3-byte non-stream is the bare data_error (no \
+                          length arm)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "zlib:uncompress(<<0,1,2>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error data_error"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "zlib/gunzip_non_gzip_is_data_error",
+            description: "zlib:gunzip/1 of a non-gzip stream is the bare data_error",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "zlib:gunzip(<<\"abc\">>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error data_error"),
+                exit_code: 1,
+            },
+        },
     ]
 }
 
@@ -267,6 +374,16 @@ mod tests {
                 "zlib:zip(<<3,4,5>>)",
                 "ok <<99,102,97,5,0>>",
             ),
+            (
+                "zlib/compress_bytes_are_deterministic",
+                "zlib:compress(<<\"abc\">>)",
+                "ok <<120,156,75,76,74,6,0,2,77,1,39>>",
+            ),
+            (
+                "zlib/gzip_bytes_are_deterministic",
+                "zlib:gzip(<<\"abc\">>)",
+                "ok <<31,139,8,0,0,0,0,0,0,3,75,76,74,6,0,194,65,36,53,3,0,0,0>>",
+            ),
         ] {
             let case = find(id);
             assert_eq!(case.contracts, &[Contract::OtpApps], "{id}");
@@ -288,6 +405,12 @@ mod tests {
             ),
             ("zlib/unzip_zip_roundtrip_empty", "ok <<>>"),
             ("zlib/unzip_zip_roundtrip_100_bytes_is_identity", "ok true"),
+            ("zlib/uncompress_compress_roundtrip_tiny", "ok true"),
+            (
+                "zlib/uncompress_compress_roundtrip_100_bytes_is_identity",
+                "ok true",
+            ),
+            ("zlib/gunzip_gzip_roundtrip_tiny", "ok true"),
         ] {
             let case = find(id);
             assert_eq!(case.contracts, &[Contract::OtpApps], "{id}");
@@ -326,6 +449,8 @@ mod tests {
             [
                 "zlib/unzip_empty_is_data_error",
                 "zlib/unzip_three_bytes_is_data_error",
+                "zlib/uncompress_three_bytes_is_data_error",
+                "zlib/gunzip_non_gzip_is_data_error",
             ]
         );
         let badarg: Vec<&str> = cases

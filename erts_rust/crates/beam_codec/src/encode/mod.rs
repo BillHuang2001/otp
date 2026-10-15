@@ -158,6 +158,15 @@ enum AtomFlavour {
 /// legacy lambda identity, and `creator` is the pid the C encoder writes — for a
 /// local fun that is always `erts_init_process_id` (the `init` process), **not** the
 /// fun's own creator (`external.c:3989`).
+///
+/// `function` is **introspection-only**: it is the lambda's local function name (the
+/// `FunT` chunk entry's function atom, `ErlFunEntry.function` / `beam_asm`'s
+/// `function` field) and exists solely to answer `erlang:fun_info/2`'s `name` item.
+/// The External Term Format has **no** function-name field in its `NEW_FUN_EXT`
+/// (`112`) image, so `function` must **never** reach the wire — the encoder ignores
+/// it (see [`Encoder::with_fun_identity`]). [`FunIdentity::new`] leaves it `None`
+/// because the wire fields alone carry no name; a caller that has the running
+/// module's lambda table attaches it via [`FunIdentity::with_function`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FunIdentity {
     /// The module the closure was compiled in (`ErlFunEntry.module`).
@@ -170,10 +179,21 @@ pub struct FunIdentity {
     pub old_uniq: u32,
     /// The creator pid written to the wire — `erts_init_process_id` for a local fun.
     pub creator: FunPid,
+    /// The lambda's local function name (`ErlFunEntry.function`, the `FunT` chunk
+    /// entry's function atom), used **only** for `erlang:fun_info/2`'s `name` item.
+    /// It is **not** part of the External Term Format — `NEW_FUN_EXT` (`112`) has no
+    /// function-name field — so it is never encoded. `None` until a caller supplies
+    /// it via [`FunIdentity::with_function`].
+    pub function: Option<Atom>,
 }
 
 impl FunIdentity {
-    /// Builds a fun identity from its five wire fields.
+    /// Builds a fun identity from its five wire fields, leaving the introspection-only
+    /// [`function`](FunIdentity::function) name `None`.
+    ///
+    /// The five wire fields are exactly the ones `NEW_FUN_EXT` needs; the function
+    /// name is not on the wire (see [`FunIdentity`]), so it is set separately through
+    /// [`FunIdentity::with_function`].
     pub fn new(
         module: Atom,
         uniq: [u8; 16],
@@ -187,7 +207,35 @@ impl FunIdentity {
             old_index,
             old_uniq,
             creator,
+            function: None,
         }
+    }
+
+    /// Builds a fun identity from its five wire fields **and** the lambda's local
+    /// function name (the `name` item `erlang:fun_info/2` reports).
+    ///
+    /// Equivalent to [`FunIdentity::new`] followed by [`FunIdentity::with_function`].
+    pub fn named(
+        module: Atom,
+        uniq: [u8; 16],
+        old_index: u32,
+        old_uniq: u32,
+        creator: FunPid,
+        function: Atom,
+    ) -> FunIdentity {
+        FunIdentity::new(module, uniq, old_index, old_uniq, creator).with_function(function)
+    }
+
+    /// Attaches the lambda's local function name (`ErlFunEntry.function`, the `FunT`
+    /// chunk entry's function atom), i.e. the atom `erlang:fun_info(F, name)`
+    /// reports.
+    ///
+    /// This is an **introspection-only** input: the encoder ignores it, since
+    /// `NEW_FUN_EXT` has no function-name field, so the encoded bytes are identical
+    /// with or without it.
+    pub fn with_function(mut self, function: Atom) -> Self {
+        self.function = Some(function);
+        self
     }
 }
 
@@ -423,7 +471,9 @@ impl<'a> Encoder<'a> {
     /// encoder emits a **faithful** `NEW_FUN_EXT` built from the *term's*
     /// arity/index/`num_free`/environment plus the *supplied* module/`uniq`/
     /// `old_index`/`old_uniq`/creator — byte-identical to the C encoder's local-fun
-    /// path (`external.c:3966-3993`). Without it a local fun stays
+    /// path (`external.c:3966-3993`). The identity's introspection-only
+    /// [`function`](FunIdentity::function) name is **ignored** here: the wire format
+    /// has no function-name field. Without an identity a local fun stays
     /// [`crate::error::unsupported_local_fun`] (never a wrong image).
     ///
     /// The default is `None`, so every existing signature and every un-flavoured

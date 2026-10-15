@@ -305,6 +305,54 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // The same `-boot start` chain, observed one step further on: the boot script's
+        // `{kernelProcess, …}` directives leave these three kernel processes registered, so a
+        // booted system answers `is_pid(whereis(Name))` for each. The value is deliberately a
+        // tuple of booleans over `is_pid/1`: the pids themselves are per-VM-start identities
+        // and are never pinned.
+        Case {
+            id: "boot/kernel_processes_registered_under_boot_flag",
+            description: "under `-boot start` the boot script's kernel processes are registered (init, kernel_sup, application_controller)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "{is_pid(whereis(kernel_sup)), is_pid(whereis(application_controller)), is_pid(whereis(init))}",
+                extra_argv: &["-boot", "start"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,true}"),
+                exit_code: 0,
+            },
+        },
+        // --- Independent boot-**completion** observations under the same `-boot start` argv ---
+        //
+        // The `-boot start` argv is the shape a booted system runs under, so beyond the flag's
+        // own recording and the registered kernel processes above, these cases observe that the
+        // boot script *completed* through three **independent** surfaces: `init`'s own
+        // boot-progress marker, the application set the boot script's start directives left
+        // applied, and the kernel supervision tree those directives populated. Every observation
+        // is reduced to a scalar or a tuple of scalars — never a raw list, a pid, or a `~w` map.
+        eval_with_argv(
+            "boot/init_get_status_boot_progress_is_started_under_boot_flag",
+            "under `-boot start` init's boot-progress provided-status reached `started` (init's internal `starting` phase with the boot script run to completion)",
+            "{tuple_size(init:get_status()), element(1, init:get_status()), element(2, init:get_status())}",
+            &["-boot", "start"],
+            "ok {2,starting,started}",
+        ),
+        eval_with_argv(
+            "boot/which_applications_includes_kernel_and_stdlib_under_boot_flag",
+            "under `-boot start` the boot script's application-start directives left both kernel and stdlib started (the started-application count is reduced to an integer)",
+            "length([A || {A, _, _} <- application:which_applications(), A =:= kernel orelse A =:= stdlib])",
+            &["-boot", "start"],
+            "ok 2",
+        ),
+        eval_with_argv(
+            "boot/kernel_sup_children_are_live_under_boot_flag",
+            "under `-boot start` the boot script's kernel supervision tree is populated: the boot-started code_server and file_server_2 are live kernel_sup children",
+            "begin Ids = [I || {I, _, _, _} <- supervisor:which_children(kernel_sup)], lists:member(code_server, Ids) andalso lists:member(file_server_2, Ids) end",
+            &["-boot", "start"],
+            "ok true",
+        ),
         Case {
             id: "boot/no_boot_flag_is_badarg",
             description: "with no `-boot`, init:get_argument/1 has no `boot` argument (element(1,_) raises badarg)",
@@ -724,6 +772,21 @@ mod tests {
     /// The one case here that takes **extra argv**: the `-boot start` CLI flag (contract A.6).
     const BOOT_FLAG_CASES: &[&str] = &["boot/boot_flag_is_recorded_as_init_argument"];
 
+    /// The second `-boot start` case: the same boot chain observed at the registered kernel
+    /// processes. It shares the flag argv but asserts the *booted* process surface, so it is
+    /// kept in its own list (its golden is a boolean tuple, not the flag-argument shape).
+    const BOOT_KERNEL_PROCESS_CASES: &[&str] =
+        &["boot/kernel_processes_registered_under_boot_flag"];
+    /// The `-boot start` boot-**completion** cases: the same flag argv as `BOOT_FLAG_CASES` /
+    /// `BOOT_KERNEL_PROCESS_CASES`, but each observes a *different* independent signal that the
+    /// boot script ran to completion (`init`'s boot-progress marker, the started application set,
+    /// the populated kernel supervision tree). Collected in one list so a new case cannot
+    /// silently escape review.
+    const BOOT_COMPLETION_CASES: &[&str] = &[
+        "boot/init_get_status_boot_progress_is_started_under_boot_flag",
+        "boot/which_applications_includes_kernel_and_stdlib_under_boot_flag",
+        "boot/kernel_sup_children_are_live_under_boot_flag",
+    ];
     /// The boot chain's `proc_lib:start_link/4` wait: its cross-module `proc_lib:sync_start/2`
     /// receive completes in both runtimes, so this is an ordinary `agree` case.
     const BOOT_CHAIN_CASES: &[&str] = &["boot/proc_lib_start_link_blocks_the_boot_path"];
@@ -818,7 +881,12 @@ mod tests {
     fn boot_prerequisite_cases_never_pin_a_volatile_value() {
         let cases = group();
         let cases = cases.as_slice();
-        for id in BOOT_PREREQUISITE_CASES.iter().chain(BOOT_FLAG_CASES) {
+        for id in BOOT_PREREQUISITE_CASES
+            .iter()
+            .chain(BOOT_FLAG_CASES)
+            .chain(BOOT_KERNEL_PROCESS_CASES)
+            .chain(BOOT_COMPLETION_CASES)
+        {
             let golden = case(cases, id)
                 .golden
                 .stdout
@@ -849,6 +917,45 @@ mod tests {
             expr.contains("init:get_argument(boot)"),
             "the -boot case must observe the `boot` init argument: {expr:?}"
         );
+    }
+
+    #[test]
+    fn kernel_process_case_observes_the_booted_registered_processes() {
+        let cases = group();
+        let cases = cases.as_slice();
+        let case = case(cases, BOOT_KERNEL_PROCESS_CASES[0]);
+        assert_eq!(
+            case.contracts,
+            &[Contract::Build],
+            "the kernel-process case"
+        );
+        assert_eq!(
+            case.extra_argv(),
+            &["-boot", "start"],
+            "the kernel-process case must pass `-boot start` (the boot chain that registers them)"
+        );
+        let CaseKind::Eval { expr, probe, .. } = case.kind else {
+            panic!("the kernel-process case must be an Eval case");
+        };
+        assert_eq!(probe, Probe::Value, "the kernel-process case");
+        // The three boot-script kernel processes, and nothing pinned but their pid-ness.
+        for name in [
+            "whereis(kernel_sup)",
+            "whereis(application_controller)",
+            "whereis(init)",
+        ] {
+            assert!(
+                expr.contains(name),
+                "the kernel-process case must observe {name}: {expr:?}"
+            );
+        }
+        assert!(
+            !expr.contains("<0."),
+            "the kernel-process case must not pin a pid: {expr:?}"
+        );
+        // The golden is the boolean tuple over `is_pid/1`, the oracle's own line.
+        assert_eq!(case.golden.stdout, Some("ok {true,true,true}"));
+        assert_eq!(case.golden.exit_code, 0);
     }
 
     #[test]
@@ -943,6 +1050,53 @@ mod tests {
     }
 
     #[test]
+    fn boot_completion_cases_observe_the_booted_system_under_the_boot_flag() {
+        use std::collections::HashSet;
+        let cases = group();
+        let cases = cases.as_slice();
+        let mut exprs: HashSet<&str> = HashSet::new();
+        for id in BOOT_COMPLETION_CASES {
+            let case = case(cases, id);
+            assert_eq!(case.contracts, &[Contract::Build], "case {id}");
+            assert!(
+                matches!(case.kind, CaseKind::Eval { .. }),
+                "case {id} must be an Eval case"
+            );
+            assert_eq!(
+                case.extra_argv(),
+                &["-boot", "start"],
+                "case {id} must observe the booted system under `-boot start`"
+            );
+            assert!(case.env().is_empty(), "case {id} pins no environment");
+            assert!(
+                !case.description.is_empty(),
+                "case {id} has no description"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id} exits 0");
+            let golden = case
+                .golden
+                .stdout
+                .unwrap_or_else(|| panic!("case {id} asserts stdout"));
+            assert!(
+                golden.starts_with("ok "),
+                "case {id}: a Probe::Value golden is an `ok <value>` line, got {golden:?}"
+            );
+            // No volatile rendering may be baked into a golden: no pid/ref/port (`<`), no
+            // filesystem path (`/`), no map (`#{`).
+            for unstable in ["<", "/", "#{"] {
+                assert!(
+                    !golden.contains(unstable),
+                    "case {id}: the golden pins an unstable rendering: {golden:?}"
+                );
+            }
+            // The cases must observe three *different* surfaces, so a copy-paste cannot turn
+            // them into a disguised repeat of one signal.
+            let expr = case.expr().expect("an Eval case has an expr");
+            assert!(exprs.insert(expr), "case {id}: duplicate expression {expr:?}");
+        }
+    }
+
+    #[test]
     fn boot_pa_case_carries_the_pa_argument() {
         let cases = group();
         let cases = cases.as_slice();
@@ -976,7 +1130,11 @@ mod tests {
     fn boot_observability_expressions_do_not_shadow_the_probe_variables() {
         let cases = group();
         let cases = cases.as_slice();
-        for id in BOOT_OBSERVABILITY_CASES.iter().chain(BOOT_PA_CASES) {
+        for id in BOOT_OBSERVABILITY_CASES
+            .iter()
+            .chain(BOOT_PA_CASES)
+            .chain(BOOT_COMPLETION_CASES)
+        {
             let expr = case(cases, id).expr().expect("an Eval case has an expr");
             for reserved in [" V ", " C ", " R ", "V =", "C =", "R ="] {
                 assert!(

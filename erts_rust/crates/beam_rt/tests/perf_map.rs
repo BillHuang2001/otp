@@ -31,8 +31,11 @@
 //! * `+JPperf true` additionally creates `<directory>/jit-<pid>.dump`;
 //! * `+JPperf false` (and `fp`/`no_fp`, which select no file) creates nothing;
 //! * `ERL_SYM_MAP_FILE` replaces the map file's whole path;
-//! * a value outside the grammar is a usage error (exit 2 in this runtime; the oracle
-//!   exits 1 — see `src/cli/flags.rs`'s documented divergence).
+//! * a value outside the grammar is rejected the way the oracle's **emulator** rejects it —
+//!   exit 1 with one `beam_rt: bad value "…" for switch +JPperf` line and no usage block
+//!   (the `beam.smp` usage dump is deliberately not reproduced); only a *genuinely missing*
+//!   operand stays this runtime's usage error (exit 2 + the usage text) — a documented
+//!   divergence from `beam.smp`, which exits 1 for both.
 //!
 //! The map this runtime writes is **non-empty** for the invocations this suite drives: it holds
 //! only the baseline JIT's real cached code ranges, recorded once per module-export first entry
@@ -432,23 +435,69 @@ fn the_sym_map_file_variable_selects_nothing_on_its_own() {
     assert!(entries(&dir).is_empty(), "{:?}", entries(&dir));
 }
 
-/// A value outside the grammar — and a missing value — is this runtime's **usage** error
-/// (exit 2 + the usage text), never a silent default and never an accepted no-op.
+/// A `+JPperf` value outside the grammar is rejected by the **emulator**, exactly as the
+/// oracle's `beam.smp` rejects it: exit **1**, one `beam_rt: bad value "<v>" for switch
+/// +JPperf` line and **no** `USAGE` block (the 7331-byte `beam.smp` usage dump is deliberately
+/// not reproduced). Never a silent default, never an accepted no-op and never the CLI's usage
+/// status 2.
+///
+/// Oracle (`erl -noshell +JPperf bogus -eval 'ok'` → exit 1, diagnostic + its usage dump);
+/// this runtime → exit 1, the single diagnostic line.
 #[test]
-fn a_malformed_flag_is_a_usage_error() {
-    for args in [
-        &["+JPperf", "bogus"][..],
-        &["+JPperf"][..],
-        &["+JPperfdirectory"][..],
-        &["+JPperf", "MAP"][..],
+fn a_malformed_flag_is_rejected_with_exit_one() {
+    for (args, value) in [
+        (&["+JPperf", "bogus"][..], "bogus"),
+        // The grammar is case-sensitive (`PerfFlag::parse`), as in the C.
+        (&["+JPperf", "MAP"][..], "MAP"),
+        // `beam_rt_perf` appends `-eval ok`, so a *trailing* `+JPperf` swallows that `-eval` as
+        // its value — a switch reads the next token blindly, exactly as the C does — and the
+        // grammar rejects it. (A `+JPperf` with **no** token at all is the usage error pinned by
+        // [`a_missing_flag_operand_is_a_usage_error`].)
+        (&["+JPperf"][..], "-eval"),
     ] {
         let (_, output) = beam_rt_perf(args, &[]);
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("Usage:"), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "{args:?}: exactly one stderr line: {stderr}"
+        );
+        assert_eq!(
+            stderr.trim_end(),
+            format!("beam_rt: bad value {value:?} for switch +JPperf"),
+            "{args:?}"
+        );
+        assert!(!stderr.contains("Usage:"), "{args:?}: {stderr}");
     }
-    // A directory that cannot be created is **not** a usage error: the runtime records it and
-    // carries on, exactly as the oracle logs it and exits 0.
+}
+
+/// A `+JPperf`/`+JPperfdirectory` whose operand is genuinely **missing** (nothing follows it)
+/// is this runtime's usage error — exit **2** with the usage text — the documented divergence
+/// from `beam.smp`, which prints `Missing argument(s) for '<switch>'.` and exits 1.
+///
+/// The probe is invoked **without** the `-eval ok` terminator `beam_rt_perf` appends, which
+/// would otherwise be swallowed as the value.
+#[test]
+fn a_missing_flag_operand_is_a_usage_error() {
+    for switch in ["+JPperf", "+JPperfdirectory"] {
+        let (_, output) = run_with_pid(env!("CARGO_BIN_EXE_beam_rt"), &["-noshell", switch], &[]);
+        assert_eq!(output.status.code(), Some(2), "{switch}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("switch {switch} requires a value")),
+            "{switch}: {stderr}"
+        );
+        assert!(stderr.contains("Usage:"), "{switch}: {stderr}");
+    }
+}
+
+/// `+JPperfdirectory` takes the **next token verbatim** and validates nothing: a directory the
+/// runtime cannot create is *not* a rejection (it records the failure and carries on, exactly as
+/// the oracle logs it and exits 0), and a token that merely *looks* like a switch is consumed as
+/// the directory like any other.
+#[test]
+fn the_perf_directory_value_is_taken_verbatim() {
     let missing = scratch("missing").join("no_such_subdirectory");
     let (_, output) = beam_rt_perf(
         &["+JPperf", "map", "+JPperfdirectory", missing.to_str().expect("UTF-8")],
@@ -456,6 +505,15 @@ fn a_malformed_flag_is_a_usage_error() {
     );
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     assert!(!missing.exists());
+
+    // With the appended `-eval ok`, `+JPperfdirectory` swallows the `-eval` as its directory; the
+    // gratuitous `ok` left behind is then the **only** complaint (a stray positional argument,
+    // exit 2) — the directory value itself is never rejected.
+    let (_, output) = beam_rt_perf(&["+JPperfdirectory"], &[]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+    assert!(stderr.contains("Usage:"), "{stderr}");
 }
 
 // ---------------------------------------------------------------------------------------

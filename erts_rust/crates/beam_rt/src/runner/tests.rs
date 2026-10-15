@@ -41,7 +41,9 @@ use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
-use super::run::{publish_parked_roots, RuntimeRunner};
+use super::run::{
+    publish_parked_roots, registered_payload_total, reset_registered_payload_total, RuntimeRunner,
+};
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
 use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
@@ -1006,6 +1008,139 @@ build_and_park(N) ->
             .off_heap_binary_count()
             >= 1,
         "the runner registers the machine's reservoir onto the process's own off-heap table"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **The per-slice registration walks only the not-yet-registered suffix of the machine's
+/// reservoir, so a multi-slice process registers each distinct payload exactly ONCE.**
+///
+/// This is the deterministic regression pin for the Θ(N³) `foreign`/`enc` blow-up. The old seam
+/// re-offered the **whole** append-only `Machine::refc_binaries` reservoir on *every* slice, so a
+/// long-lived process paid `Σ_k |reservoir_k|` registration calls — quadratic-to-cubic in the
+/// payloads it built — while each call also paid an O(slots) `owned_binary_slot` scan inside
+/// `Process::register_off_heap_binary`. The cursor reduces that to `|reservoir|` (linear).
+///
+/// The pin drives a tail loop that builds a fresh runtime-sized (off-heap) binary per iteration
+/// across several slices and reads a **per-thread** count of the payloads the runner actually
+/// registered ([`registered_payload_total`]), then asserts that total never exceeds the number of
+/// distinct payloads the reservoir holds (`≤`, with equality the cursor's signature — the counts
+/// telescope to `|reservoir|`). Under the old walk the total is `Σ_k |reservoir_k|`, which
+/// exceeds the reservoir on any multi-slice run whose reservoir is non-empty, so this fails
+/// loudly there.
+///
+/// The pin cannot pass vacuously:
+///   * the loop is long and the reduction budget tiny (`JitMode::Interpreter` charges **every**
+///     instruction), so the process really pre-empts and the test **asserts** several slices ran;
+///   * the fixture builds the binary from a **variable** size (`<<0:Size/unit:8>>`, `Size = 256`,
+///     passed as an argument), so the compiler cannot fold it to a literal and every iteration
+///     really reaches `alloc_refc_binary`; the reservoir is asserted to hold **≥ 2** payloads and
+///     its growth **across** slices is asserted, so an inert fixture (no off-heap build) fails
+///     rather than passing trivially.
+#[test]
+fn a_process_registers_each_off_heap_payload_exactly_once_across_slices() {
+    let source = "\
+-module(ohb_loop).
+-export([loop/2]).
+loop(N, Size) -> loop(N, Size, 0).
+loop(0, _Size, Acc) -> Acc;
+loop(N, Size, Acc) ->
+    Bin = <<0:Size/unit:8>>,
+    loop(N - 1, Size, Acc + byte_size(Bin)).
+";
+    let Some(dir) = compile_modules("offheap_cursor", &[("ohb_loop", source)]) else {
+        eprintln!("SKIP: no system `erlc` on PATH -- the registration-cursor pin is skipped");
+        return;
+    };
+
+    let mut rt = runtime();
+    rt.add_code_path(&dir);
+    let mut state = RunnerState::default();
+    // The interpreter tier charges **every** instruction, so the tiny budget below pre-empts
+    // deterministically and the loop genuinely spans several slices.
+    state.jit_mode = Some(JitMode::Interpreter);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(
+        beam_loader::load_file(dir.join("ohb_loop.beam")).expect("load the compiled module"),
+    );
+    let loop_fun = module.atom_table.lookup("loop").expect("loop/2 is interned");
+    // 50 iterations, each building a 256-byte (off-heap) binary: far more than the slices driven
+    // below can finish, so the process is still pre-empting when the test stops.
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function: loop_fun,
+            arity: 2,
+        },
+        vec![make_small(50), make_small(256)],
+    );
+
+    reset_registered_payload_total();
+
+    // Drive ten small slices; each must pre-empt (the loop is far from done).
+    const SLICES: usize = 10;
+    const SLICE_BUDGET: u32 = 8;
+    let mut reservoir = 0;
+    let mut first_slice_reservoir = 0;
+    for slice in 0..SLICES {
+        let outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner
+                .run(pid, &mut table, SLICE_BUDGET)
+                .expect("a small slice runs")
+        };
+        assert_eq!(
+            outcome,
+            ProcOutcome::Yield,
+            "the tiny budget pre-empts the loop long before its 50 iterations finish"
+        );
+        let engine = state
+            .engines
+            .get(&pid)
+            .expect("the pre-empted engine is parked");
+        reservoir = engine.machine.refc_binaries().len();
+        // The cursor round-trips: the engine taken out at the top of the slice and re-inserted at
+        // the park arm is the **same** value, so its cursor is advanced to the reservoir length
+        // and observed here from a *later* slice — a cursor reset to `0` per slice would make the
+        // registration total exceed the reservoir below.
+        assert_eq!(
+            engine.registered_payloads, reservoir,
+            "the cursor advances to the whole reservoir by the end of every slice"
+        );
+        if slice == 0 {
+            first_slice_reservoir = reservoir;
+        }
+    }
+
+    let registered = registered_payload_total();
+
+    // Non-vacuity: the fixture really built off-heap payloads, and built MORE of them by the end
+    // than it owned after the first slice (so the reservoir grew across slices and a
+    // whole-reservoir re-walk has something real to re-walk).
+    assert!(
+        reservoir >= 2,
+        "the fixture must build multiple off-heap binaries across the slices (got {reservoir})"
+    );
+    assert!(
+        reservoir > first_slice_reservoir,
+        "the reservoir must GROW across slices (first slice {first_slice_reservoir}, final \
+         {reservoir}) so a whole-reservoir re-walk would re-register already-owned payloads"
+    );
+
+    // The cursor's signature: each distinct payload is registered once, so the total number of
+    // registration calls over the process's life never exceeds the reservoir size. The old
+    // whole-reservoir walk gives `Σ_k |reservoir_k|` over `SLICES` slices, which is ≫ `reservoir`.
+    assert!(
+        registered <= reservoir,
+        "each payload is registered once: {registered} registration calls for {reservoir} \
+         payloads over {SLICES} slices (a whole-reservoir re-walk would give several times this)"
+    );
+    assert!(
+        registered > 0,
+        "the seam really ran: at least one payload was registered"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

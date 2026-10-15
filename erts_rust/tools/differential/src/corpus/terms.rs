@@ -73,6 +73,34 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "terms/atom_order_is_by_name",
+            description: "atoms sort by code point across case: 'AA' < 'B' < a < bb < z",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "lists:sort([z,a,'B','AA',bb])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok ['AA','B',a,bb,z]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "terms/atom_order_is_not_by_length",
+            description: "atom comparison is by name, not by length ('zzz' < 'AAA' is false)",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "'zzz' < 'AAA'",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "errors/error_boom",
             description: "erlang:error/1 surfaces as class error with the given reason",
             contracts: &[Contract::LanguageSemantics],

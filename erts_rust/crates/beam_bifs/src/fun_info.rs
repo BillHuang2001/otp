@@ -111,6 +111,12 @@
 //! fun_to_list(F)         => "#Fun<Module.OldIndex.OldUniq>"
 //! ```
 //!
+//! The one identity item the wire image cannot answer is `name`: `NEW_FUN_EXT`
+//! (`112`) carries no function-name field, so it resolves from the same
+//! [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam field a `Local` fun
+//! uses (`FunIdentity.function`, the stubbed entry's function atom), and is the
+//! typed gap when the seam cannot name it.
+//!
 //! `index`/`old_index`/`old_uniq` are `int` fields in C (`erl_fun.h:31-59`) and are
 //! read back sign-extended, so a wire value above `2^31 - 1` renders negative
 //! (oracle-verified: a wire `old_uniq` of `0xFFFFFFFF` ⇒ `{uniq,-1}` and
@@ -131,6 +137,7 @@
 //! fun_info(F, uniq)      => FunIdentity.old_uniq      (fe->old_uniq)
 //! fun_info(F, new_uniq)  => FunIdentity.uniq, binary  (fe->uniq, the module MD5)
 //! fun_info(F, pid)       => FunIdentity.creator       (funp->creator)
+//! fun_info(F, name)      => FunIdentity.function      (mfa->function, the FunT entry's function atom)
 //! fun_info(F, new_index) => the term's own index word  (fe->index)
 //! ```
 //!
@@ -143,7 +150,9 @@
 //! When the seam answers `Ok(None)` — the defining module is not loaded here, so the
 //! identity is genuinely unknown (the `-eval` evaluator's template closures are the
 //! standing example) — every seam-backed item is the typed capacity gap, never a
-//! guessed value.
+//! guessed value. An identity that resolves but whose
+//! [`function`](beam_codec::FunIdentity::function) is `None` leaves `name` the typed
+//! gap on its own.
 //!
 //! The seam is consulted **at most once per `fun_info` call**: a runtime
 //! implementation scans the loaded modules and hashes a `.beam`, so the ten-key
@@ -155,18 +164,13 @@
 //! Two things stay out of reach and are the typed
 //! [`crate::error::unsupported_bif`] rather than a guess:
 //!
-//! * **`name`** — and therefore `fun_info_mfa/1`'s *function* element — needs the
-//!   **loaded module's** fun table (`erts_get_fun_mfa`, `erl_bif_info.c:3944-3947`):
-//!   the lambda name is the `FunT` entry's `function` atom, which **neither** the
-//!   term descriptor **nor** the `LocalFunIdentity` seam carries (the seam's
-//!   [`beam_codec::FunIdentity`] is exactly `module`/`uniq`/`old_index`/`old_uniq`/
-//!   `creator`). `fun_info/1` of a `Local` fun reaches that item, so its whole-list
-//!   form is the typed gap too — it raises instead of returning a list with the pair
-//!   silently missing, which would be a wrong (short) list.
-//! * **`fun_info_mfa/1` / `fun_to_list/1` of a `FunKind::Local` (`make_fun3`)
-//!   fun** — both need the resolved MFA (the MFA's *function* atom, and
-//!   `#Fun<Module.OldIndex.OldUniq>`, `erl_printf_term.c:680-694`), i.e. the same
-//!   missing lambda name.
+//! * **`fun_info_mfa/1` of a `FunKind::Local`/`FunKind::Imported` fun** — it needs
+//!   the resolved MFA *and* the lambda's **true code arity**, which no seam supplies
+//!   (the seam's [`beam_codec::FunIdentity`] carries the lambda `function` atom but
+//!   not the arity the MFA needs).
+//! * **`fun_to_list/1` of a `FunKind::Local` (`make_fun3`) fun** — it needs
+//!   `#Fun<Module.OldIndex.OldUniq>` (`erl_printf_term.c:680-694`), i.e. the
+//!   resolved MFA a `Local` term cannot supply.
 //!
 //! # Produced atoms are interned on demand
 //!
@@ -272,11 +276,13 @@ fn fun_info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(error::badarg());
     }
     let kind = beam_codec::term::fun_kind_term(fun)?;
-    // One seam consultation for the whole walk: a `make_fun3` fun's identity costs a
+    // One seam consultation for the whole walk: a closure's identity costs a
     // loaded-module scan (plus a `.beam` read and MD5) in the runtime, so the ten
-    // keys must not each pay for it. `item_value` reports the typed gap for the
-    // items a `None` identity cannot serve.
-    let identity = if kind == FunKind::Local {
+    // keys must not each pay for it. Consulted for every non-external fun — a
+    // `make_fun3` fun for its identity items, an `Imported` (`NEW_FUN_EXT`) fun for
+    // its `name`. `item_value` reports the typed gap for the items a `None`
+    // identity (or one without a `function`) cannot serve.
+    let identity = if kind != FunKind::External {
         ctx.local_fun_identity(fun)?
     } else {
         None
@@ -301,9 +307,11 @@ fn fun_info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// A non-fun first argument, a non-atom second argument, or an item atom outside
 /// the supported set is `badarg`; every value is oracle-pinned (see the module
 /// docs). An `Imported` (`NEW_FUN_EXT`) fun answers its five identity items from
-/// the inlined wire descriptor; a `Local` (`make_fun3`) fun answers them from the
-/// [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam where it can, and
-/// `name` is the documented typed gap.
+/// the inlined wire descriptor and its `name` from the
+/// [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam; a `Local`
+/// (`make_fun3`) fun answers them from that seam where it can. An item whose seam
+/// identity (or whose identity's `function`) cannot be resolved is the documented
+/// typed gap.
 fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     // C checks the fun first, so `fun_info(42, [type])` is `badarg` too.
@@ -324,9 +332,9 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let kind = beam_codec::term::fun_kind_term(fun)?;
 
     // One seam consultation, and only for an item that needs it: a `make_fun3`
-    // fun's identity costs a loaded-module scan in the runtime, and `Item::Other`
-    // must stay a pure `badarg`.
-    let identity = if kind == FunKind::Local && item.needs_local_identity() {
+    // fun's identity costs a loaded-module scan in the runtime, an `Imported` fun
+    // needs the seam for `name` alone, and `Item::Other` must stay a pure `badarg`.
+    let identity = if item.needs_identity(kind) {
         ctx.local_fun_identity(fun)?
     } else {
         None
@@ -351,15 +359,18 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// this one function, so they cannot disagree.
 ///
 /// `identity` is the [`LocalFunIdentity`](crate::context::LocalFunIdentity) answer
-/// for a [`FunKind::Local`] fun, resolved once per call by the caller (`None` for
-/// every other kind, and for a `Local` fun whose item does not need it).
+/// for the fun, resolved once per call by the caller (`None` for a
+/// [`FunKind::External`] fun, and for any item that does not need it). For a
+/// [`FunKind::Imported`] fun only `name` reads it — every other identity item comes
+/// from the inlined wire descriptor.
 ///
 /// # Errors
 ///
-/// [`Item::Other`] is the C `default` arm ⇒ `badarg`. A `Local` fun whose identity
-/// the seam cannot resolve (`identity == None`) is the typed
-/// [`crate::error::unsupported_bif`] gap for every item the seam covers — never a
-/// fabricated value.
+/// [`Item::Other`] is the C `default` arm ⇒ `badarg`. A `Local` or `Imported` fun
+/// whose seam identity cannot be resolved (`identity == None`), or whose identity
+/// carries no [`function`](beam_codec::FunIdentity::function), is the typed
+/// [`crate::error::unsupported_bif`] gap for the `name` item — never a fabricated
+/// value; a `Local` fun with no identity likewise for every seam-backed item.
 fn item_value(
     ctx: &mut BifContext<'_>,
     fun: Eterm,
@@ -483,15 +494,25 @@ fn item_value(
             },
         },
         // `am_name`: the export's function atom for an external fun; for a local fun
-        // it is `mfa->function` — the *loaded module's* fun table, which neither the
-        // descriptor nor the identity seam carries (an unloaded fun even yields
-        // `[]`). The documented typed gap.
+        // it is `mfa->function` — the *loaded module's* fun table's lambda name,
+        // which the `LocalFunIdentity` seam supplies as
+        // [`FunIdentity.function`](beam_codec::FunIdentity::function). A decoded
+        // `NEW_FUN_EXT` is a local fun there too, and its `name` likewise comes from
+        // that seam field (its wire image carries no name). When the seam cannot
+        // answer — `identity == None`, or an identity whose `function` is `None` —
+        // this stays the typed gap, never a fabricated atom.
         Item::Name => match kind {
             FunKind::External => {
                 let name = atom_term_name(ctx.atoms(), fun_function(fun)?)?;
                 Some(ctx.atom(&name)?)
             }
-            FunKind::Local | FunKind::Imported => return Err(error::unsupported_bif()),
+            FunKind::Local | FunKind::Imported => match identity.and_then(|id| id.function) {
+                Some(atom) => {
+                    let name = atom_term_name(ctx.atoms(), atom)?;
+                    Some(ctx.atom(&name)?)
+                }
+                None => return Err(error::unsupported_bif()),
+            },
         },
         // Every other item atom (`function`, `md5`, `nargs`, …) is `badarg`.
         Item::Other => return Err(error::badarg()),
@@ -573,21 +594,40 @@ enum Item {
 }
 
 impl Item {
-    /// Whether this item's value for a [`FunKind::Local`] (`make_fun3`) fun needs
-    /// the [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam.
+    /// Whether this item's value for a fun of `kind` needs the
+    /// [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam.
     ///
-    /// `new_index` does not (the term's descriptor word 2 *is* `fe->index`), and
-    /// `name` does not either (no seam can supply the lambda name — it is the typed
-    /// gap for every kind).
+    /// * [`FunKind::External`] — never: the function name comes from the export
+    ///   (`fun_function`) and every other identity item is `undefined`.
+    /// * [`FunKind::Imported`] — only [`Item::Name`]: a decoded `NEW_FUN_EXT`
+    ///   carries its **whole** identity (`module`/MD5 `uniq`/`index`/`old_index`/
+    ///   `old_uniq`/creator) on the wire, so every other identity item reads the
+    ///   inlined descriptor with **no** seam; the lambda's *name* is the one field
+    ///   the wire image lacks. (A host bridge answers `Ok(None)` for a non-`Local`
+    ///   term, so consulting the seam for an `Imported` item is only meaningful for
+    ///   `name` anyway.)
+    /// * [`FunKind::Local`] — every item an opaque `make_fun3` descriptor cannot
+    ///   answer: `pid`/`new_uniq`/`index`/`uniq`/`module`/`name`. `new_index` is
+    ///   excluded (the term's descriptor word 2 *is* `fe->index`).
     ///
-    /// Used by `fun_info/2` to resolve the seam **once**, and only for an item that
-    /// needs it: the runtime's implementation scans the loaded modules and hashes a
-    /// `.beam`, so an item answered from the term alone must not pay for it.
-    fn needs_local_identity(self) -> bool {
-        matches!(
-            self,
-            Item::Pid | Item::NewUniq | Item::Index | Item::Uniq | Item::Module
-        )
+    /// Used by `fun_info/2` and `fun_info/1` to resolve the seam **once**, and only
+    /// for an item that needs it: the runtime's implementation scans the loaded
+    /// modules and hashes a `.beam`, so an item answered from the term alone must
+    /// not pay for it.
+    fn needs_identity(self, kind: FunKind) -> bool {
+        match kind {
+            FunKind::External => false,
+            FunKind::Imported => matches!(self, Item::Name),
+            FunKind::Local => matches!(
+                self,
+                Item::Pid
+                    | Item::NewUniq
+                    | Item::Index
+                    | Item::Uniq
+                    | Item::Module
+                    | Item::Name
+            ),
+        }
     }
 }
 
@@ -619,9 +659,10 @@ fn item_of(ctx: &BifContext<'_>, what: Eterm) -> Item {
 /// `erlang:fun_info_mfa/1` (`erl_bif_info.c:4020`).
 ///
 /// `{Module, Function, Arity}` for an external fun; a non-fun is `badarg`. A
-/// local/imported fun needs the resolved MFA's *function* atom — the loaded
-/// module's fun table (`erts_get_fun_mfa`) — which the inlined descriptor does not
-/// carry, so both remain the documented typed gap.
+/// local/imported fun needs the resolved MFA's *function* atom **and** the lambda's
+/// true code arity — the loaded module's fun table (`erts_get_fun_mfa`) — neither of
+/// which the inlined descriptor nor the `LocalFunIdentity` seam carries, so both
+/// remain the documented typed gap.
 fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     if !access::is_function(fun) {
@@ -899,6 +940,8 @@ mod tests {
             "fiprobe",
             "nonode@nohost",
             "foo",
+            "-mk/1-fun-0-",
+            "mk",
         ]);
         atoms
     }
@@ -1094,20 +1137,36 @@ mod tests {
 
     /// A `beam_codec::FunIdentity` with `fiprobe`/`nonode@nohost` resolved from
     /// `atoms` and a this-node creator — the shape a runtime seam would answer for a
-    /// `make_fun3` closure of a loaded module.
+    /// `make_fun3` closure of a loaded module. Its
+    /// [`function`](beam_codec::FunIdentity::function) is `None`, the wire-field-only
+    /// answer; [`named_stub_identity`] attaches the lambda name.
     fn stub_identity(atoms: &AtomTable, md5: [u8; 16], old_index: u32, old_uniq: u32) -> beam_codec::FunIdentity {
-        beam_codec::FunIdentity {
-            module: atoms.lookup("fiprobe").expect("seeded module"),
-            uniq: md5,
+        beam_codec::FunIdentity::new(
+            atoms.lookup("fiprobe").expect("seeded module"),
+            md5,
             old_index,
             old_uniq,
-            creator: FunPid {
+            FunPid {
                 node: atoms.lookup("nonode@nohost").expect("seeded node"),
                 number: 0,
                 serial: 0,
                 creation: 0,
             },
-        }
+        )
+    }
+
+    /// As [`stub_identity`] but with the lambda's local function atom attached — what
+    /// a seam supplies so `fun_info(F, name)` (and the whole-list `fun_info/1`) can
+    /// answer the `FunT` entry's function name.
+    fn named_stub_identity(
+        atoms: &AtomTable,
+        md5: [u8; 16],
+        old_index: u32,
+        old_uniq: u32,
+        function: &str,
+    ) -> beam_codec::FunIdentity {
+        stub_identity(atoms, md5, old_index, old_uniq)
+            .with_function(atoms.lookup(function).expect("seeded function atom"))
     }
 
     /// `fun_info/1` of an **external** fun is exactly the oracle's five-item list
@@ -1285,12 +1344,13 @@ mod tests {
         assert_eq!(beam_term::signed_value(access::tuple_element(info, 1)), 7);
     }
 
-    /// `fun_info/1` of a `make_fun3` fun is the typed gap **even with** a seam
-    /// identity: the walk reaches `name`, whose lambda name lives in the loaded
-    /// module's fun table, so the whole-list form raises rather than silently
-    /// dropping the pair (which would be a wrong, short list).
+    /// `fun_info/1` of a `make_fun3` fun whose seam identity carries **no**
+    /// [`function`](beam_codec::FunIdentity::function) is the typed gap: the walk
+    /// reaches `name`, which the identity cannot answer, so the whole-list form
+    /// raises rather than silently dropping the pair (which would be a wrong, short
+    /// list).
     #[test]
-    fn fun_info_1_of_a_local_fun_is_the_typed_gap_even_with_an_identity() {
+    fn fun_info_1_of_a_local_fun_without_a_function_atom_is_the_typed_gap() {
         let mut heap = Heap::new(4096).expect("test heap");
         let atoms = item_atoms();
         let identity = stub_identity(&atoms, [0u8; 16], 0, 0);
@@ -1300,5 +1360,81 @@ mod tests {
         let (_storage, fun) = local_fun(1, 0x1234, 1);
 
         assert_unsupported(fun_info_1(&mut ctx, &[fun]), "fun_info/1 of a Local fun");
+    }
+
+    /// `fun_info(F, name)` of a `make_fun3` closure is the seam identity's
+    /// `function` atom — the `FunT` entry's lambda name (oracle:
+    /// `'-mk/1-fun-0-'`).
+    #[test]
+    fn fun_info_name_item_local_uses_the_seam_function() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let identity = named_stub_identity(&atoms, [0u8; 16], 0, 0, "-mk/1-fun-0-");
+        let mut stub = StubIdentity(Some(identity));
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut stub);
+        let (_storage, fun) = local_fun(1, 0x1234, 1);
+
+        assert_eq!(
+            atoms
+                .name(atom_val(fun_info_item_local(&mut ctx, fun, "name")))
+                .as_deref(),
+            Some("-mk/1-fun-0-")
+        );
+    }
+
+    /// Without a seam, `fun_info(F, name)` of a `make_fun3` closure is the typed gap —
+    /// no loaded module can attribute it.
+    #[test]
+    fn fun_info_name_item_local_without_a_seam_is_the_typed_gap() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let (_storage, fun) = local_fun(1, 0x1234, 1);
+
+        let item = ctx.atom("name").expect("seeded item");
+        assert_unsupported(fun_info_2(&mut ctx, &[fun, item]), "fun_info(Local, name)");
+    }
+
+    /// `fun_info/1` of a `make_fun3` fun **whose seam identity names its function** is
+    /// the full 10-item Oracle-29 list: the walk now resolves `name` from the
+    /// identity, so no pair is dropped and nothing is fabricated.
+    #[test]
+    fn fun_info_1_of_a_named_local_fun_is_the_ten_item_list() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let identity = named_stub_identity(&atoms, [0u8; 16], 3, 85002344, "-mk/1-fun-0-");
+        let mut stub = StubIdentity(Some(identity));
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut stub)
+            .with_atom_interner(&mut interner);
+        let (_storage, fun) = local_fun(1, 0x1234, 7);
+
+        let list = fun_info_1(&mut ctx, &[fun]).expect("fun_info/1");
+        let pairs = walk_pairs(&atoms, list);
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "pid", "module", "new_index", "new_uniq", "index", "uniq", "name", "arity",
+                "env", "type"
+            ]
+        );
+        assert_eq!(atoms.name(atom_val(pairs[1].1)).as_deref(), Some("fiprobe"));
+        assert_eq!(beam_term::signed_value(pairs[2].1), 7);
+        assert_eq!(beam_term::signed_value(pairs[4].1), 3);
+        assert_eq!(beam_term::signed_value(pairs[5].1), 85002344);
+        assert_eq!(atoms.name(atom_val(pairs[6].1)).as_deref(), Some("-mk/1-fun-0-"));
+        assert_eq!(pairs[8].1, NIL);
+        assert_eq!(interned_name(&interner, pairs[9].1).as_deref(), Some("local"));
+    }
+
+    /// `fun_info(F, Item)` of a `Local` fun, unwrapped to the value — a local helper
+    /// for the cases above (the module-level `fun_info_2` needs the item atom).
+    fn fun_info_item_local(ctx: &mut BifContext<'_>, fun: Eterm, item: &str) -> Eterm {
+        let item_atom = ctx.atom(item).expect("seeded item");
+        let info = fun_info_2(ctx, &[fun, item_atom]).expect(item);
+        access::tuple_element(info, 1)
     }
 }

@@ -213,14 +213,14 @@ impl PerfMapConfig {
 
     /// Applies one `+JPperf <value>` occurrence, accumulating exactly as the C does.
     ///
-    /// A value outside the grammar is a usage error ([`crate::error`]'s
-    /// `bad_switch_value`), which [`crate::cli`] reports as exit 2 — the crate's uniform
-    /// contract for a malformed emulator value (the oracle prints `bad +JPperf support flag
-    /// <value>` and exits 1).
+    /// A value outside the grammar is refused by [`crate::error`]'s `bad_switch_value`, which
+    /// [`crate::cli`] reports as exit 1 with the one-line `beam_rt: bad value "<value>" for
+    /// switch +JPperf` diagnostic and no usage block — the same exit status the oracle gives
+    /// (`bad +JPperf support flag <value>` + the `beam.smp` usage block).
     ///
     /// # Errors
     ///
-    /// The usage error above.
+    /// The refusal above.
     pub fn set_flag(&mut self, value: &str) -> Result<()> {
         let flag =
             PerfFlag::parse(value).ok_or_else(|| error::bad_switch_value("+JPperf", value))?;
@@ -570,11 +570,17 @@ mod tests {
         assert_eq!(config(&["map", "false", "dump"]), (false, true, false));
     }
 
-    /// A value outside the grammar is the crate's usage error, never a silent default.
+    /// A value outside the grammar is rejected with the **emulator's own** flag-rejection
+    /// diagnostic ([`crate::error`]'s `bad_switch_value`, which the CLI prints as one line and
+    /// exits **1** for — `beam.smp`'s contract), never a silent default.
     #[test]
     fn a_malformed_value_is_rejected() {
         let mut config = PerfMapConfig::new();
-        assert!(config.set_flag("bogus").is_err());
+        let error = config.set_flag("bogus").expect_err("the grammar rejects it");
+        assert_eq!(
+            error::flag_rejected_diagnostic(&error),
+            Some("bad value \"bogus\" for switch +JPperf")
+        );
         assert!(!config.map_enabled() && !config.dump_enabled());
         assert_eq!(PerfMapConfig::new(), config);
     }

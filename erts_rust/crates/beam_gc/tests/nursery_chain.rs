@@ -457,6 +457,11 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     // What matters is that the cycle is **bounded** — a fixed period over a fixed, finite set
     // of states, each capacity pinned — not that it is a single value. A creep would show as a
     // third (or drifting) state, which the exact-set assertion below rejects.
+    //
+    // The grown capacity is the curated size the request resolves to (`987` = the smallest
+    // growth-table entry covering `STEADY_NEED`) plus the capacity of the space the growth
+    // superseded (`90`): a superseded space is retained until a collection evacuates it, and
+    // the collapse that follows sizes the single remaining space from the whole chain.
     const PERIOD: usize = 2;
     let tail = &recorded[ROUNDS - 50..];
     assert!(

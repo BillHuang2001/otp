@@ -135,11 +135,32 @@ impl Collector {
     /// current space is the correct one for an allocation-admission signal. A *collection*
     /// must instead cover the whole chain, which is why [`collect`](Self::collect) compares
     /// the mature's room against the chain-wide [`Nursery::used_words`].
+    ///
+    /// The chain's [collection debt](Self::collection_debt) is deliberately **not** folded in —
+    /// see that method for the opt-in seam a host consults alongside this one.
     pub fn should_collect(&self, need_words: usize) -> bool {
         self.nursery.current().available_words() < need_words
     }
 
-    /// Runs a collection, picking minor vs major by policy and escalating a
+    /// Whether the nursery chain carries a space a [growth](Self::grow_nursery) retired — the
+    /// chain's **collection debt**.
+    ///
+    /// A growth never collects and never moves a term, so the only thing that reclaims a
+    /// retired space is a [collection](Self::collect) (which collapses the chain). A `true`
+    /// answer therefore means **a collection is required to reclaim the chain: a
+    /// heap-admission door should treat it like a full nursery** and collect, even when the
+    /// current space still has room for the request.
+    ///
+    /// This is an **opt-in** seam, not part of [`should_collect`](Self::should_collect): a
+    /// caller that ignores it pays nothing for it (one `Vec::is_empty`). `beam_rt`'s
+    /// heap-admission doors (`src/context/gc.rs::ensure_heap` / `ensure_heap_full`) must OR it
+    /// into their `should_collect` decision once they unconditionally admit the collection —
+    /// see the handoff in the crate `CONTEXT.md`. Without that, a host suppresses the very
+    /// collection that clears the chain and the spent capacity of every growth accumulates for
+    /// as long as the nursery keeps being enlarged.
+    pub fn collection_debt(&self) -> bool {
+        self.nursery.retains_old_spaces()
+    }    /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         let kind = if self.policy.fullsweep_due(self.minor_since_major)

@@ -21,6 +21,10 @@ Sections:
   plus three shapes.
 * [Heap-sizing measurements](#heap-sizing-measurements) — why the fresh mature space is sized from
   the exact live set and the nursery from the surviving set.
+* [The debt signal and the bounded chain](#nursery-growth-retention-the-debt-signal-the-bounded-chain-and-the-blocked-end-to-end-fix)
+  — why the chain is bounded only when the debt is claimed, and by how much.
+* [End-to-end RSS and latency](#end-to-end-rss-and-latency-ets_copy-a-b-in-this-worktree) — the debt
+  accessor measured on a real `ets_copy` loop, and the runtime door that still blocks it.
 
 ## The allocation-heavy workload
 
@@ -331,3 +335,161 @@ young policy converges to Copying 4096 / **4185** (9 fullsweeps / 231 minors) an
   relocate, not the per-collection counts measured here.
 * Every deterministic figure above is asserted in its driving test; this file records what those
   tests print, and nothing here is asserted anywhere else.
+
+## Nursery growth retention: the debt signal, the bounded chain, and the blocked end-to-end fix
+
+**The question.** `Nursery::grow` is the *no-relocation* growth seam: it never collects and never moves a
+term, so the space it supersedes must stay addressable until a collection evacuates it — nothing in
+`beam_gc` frees a retired space outside a collection's `Nursery::collapse`, and it never will: a
+superseded space may hold live words (they were handed to the mutator) and only a collection proves them
+dead. Since `collapse` runs **only** inside a collection, the chain is bounded **iff** something asks for a
+collection after a growth. `should_collect(need_words)` reports **occupancy only** (the current space's
+free words), so the claiming signal is exposed separately and **opt-in**:
+`collection_debt()` on `Collector` / `GenImmixCollector` / `AnyCollector`, `true` while the chain carries a
+retired space. A `true` answer means *a collection is required to reclaim the chain — a heap-admission door
+should treat it like a full nursery*. It costs a caller that ignores it nothing (one `Vec::is_empty`).
+
+**The corpus (in-crate, load-invariant).** A grow + heap-admission cycle repeated 400 times: the engine's
+`test_heap` prefix asks the admission question and collects over its published roots when the answer is
+true; the op's own un-rooted result is a 256-word tuple (exactly one whole mark-region block), allocated
+through the grow-only seam when it does not fit. Driven through **both** mature strategies by
+`tests/nursery_growth_retention.rs`. Deterministic; the whole 5-test file reports **0.01 s** (the 400-cycle
+loop for both strategies is well under 10 ms), and no timing is asserted.
+
+| admission signal | chain length (peak, spaces) | retained capacity (peak, words) | peak current nursery (words) | platform |
+|---|---|---|---|---|
+| occupancy only (no debt claimed) | **401** | 401 whole spaces | 752 | Copying |
+| **`should_collect(HINT) \|\| collection_debt()`** | **2** | **932** (= the largest single space installed) | 932 | Copying |
+| **`should_collect(HINT) \|\| collection_debt()`** | **2** | **932** | 932 | Immix |
+
+Occupancy-only admission lengthens the chain **once per cycle** — the retention scales with the iteration
+count, exactly the per-op heap retention a loop workload's RSS followed (401 spaces over 400 rounds). With
+the debt claimed the chain is **one retired space at most**, however many cycles run, and the run converges
+to a bounded plateau: 9 distinct tail states, both strategies identical, the mature capacity a constant, the
+nursery capacity confined to `{376, 466, 752, 932}` (never above `8 × OP_WORDS`). A collection always
+collapses the chain back to **one** space (`tests/nursery_growth_retention.rs` pins this over 400 explicit
+grow + collect cycles as well).
+
+**Cost.** The debt query itself adds **no per-allocation work**: the nursery bump path is untouched (the
+growth check runs only where the allocator already branched to grow), and the only added work is **one
+collection per growth episode** at the *next* heap-admission point — the correct generational cadence, not a
+new tax. Folding the debt into `should_collect` instead taxes **every** admission: measured end to end below
+(**+1 205 ms at N = 100 000** on the `ets_copy` loop) while the runtime's door still declined the collection,
+which is why the debt is an opt-in seam and `should_collect` is back to occupancy-only.
+
+**Superseded spaces are never freed outside a collection (deliberate).** A growth retains its superseded
+space whatever its occupancy, including one that never handed the mutator a word — dropping that
+provably-empty case would be sound but changes `young_space_count()`, so it is deliberately not done.
+Pinned by `a_superseded_space_is_retained_and_never_freed_by_a_growth` and by `tests/nursery_chain.rs`.
+
+**Pre-existing, NOT related to this work: mark-region contiguity.** Driving the same cycle with a
+**100-word** (7-line) tuple at a 2048-word region fails after **43 rounds** with
+`Alloc(AllocFailure { requested: 800, kind: Heap })` while `mature_capacity_words()` still reports 2048.
+Cause: `ImmixSpace::alloc_words` needs a run of the object's 7 lines **inside one 16-line block**
+(`find_run`/`first_hole`), while the promote/reclaim pre-check compares against the region-wide
+`free_lines()`; two 7-line objects fill 14 of a block's 16 lines, so the region reports 8 free lines no
+single run can use and the promotion fails. It reproduces with an occupancy-only admission signal (chain
+length 1 throughout — the retention path not exercised at all). Recorded in `CONTEXT.md` "Known Gaps"; the
+pin test deliberately uses a block-aligned 256-word object so it pins the retention, not this gap.
+
+**Caveats.**
+* **The external RSS/latency figures are in [the end-to-end section below](#end-to-end-rss-and-latency-ets_copy-a-b-in-this-worktree).**
+  They show the `beam_gc` half is **ready but not sufficient**: on a real `ets_copy` loop the process RSS is
+  **unchanged**, because the runtime's heap-admission *door* declines the collection that would `collapse`
+  the chain. The in-crate table above is the load-invariant evidence for the mechanism; the two are not
+  interchangeable.
+* **Retained *words* are a capacity figure, not RSS.** A retired `HeapSpace` holds a whole backing
+  allocation, so "2 spaces instead of 401" is the RSS-relevant quantity, but the two are not numerically
+  interchangeable (allocator carriering, page granularity, and the rest of the process's footprint sit on
+  top).
+* **A pure un-rooted growth loop still grows the chain** — it never reaches a heap-admission point, so
+  nothing claims the debt. That is pinned deliberately by `beam_rt`'s own
+  `alloc_words_grows_the_nursery_and_never_falls_back_to_the_arena` (it asserts `young_space_count() > 1`).
+  Every real Erlang loop reaches an admission point at its `test_heap` prefixes; the remaining work is that
+  the runtime's door there must actually adopt the debt (see the end-to-end section).
+## End-to-end RSS and latency (`ets_copy`, A/B in this worktree)
+**What was run.** The real runtime binary (`erts_rust/target/release/beam_rt`, release, one scheduler) on
+`tools/bench`'s own `copy_bound` loop body, reconstructed and cross-checked against the bench tool:
+`beam_rt -pa bin run bin/bench_copy_bound.beam bench_copy_bound:ets_copy/1 <N>` (the `/1` arity suffix is
+required). Peak-granularity `VmHWM` plus a ~4 ms `VmRSS` series sampled from `/proc/<pid>/status` by hand
+(`/usr/bin/time` is absent); wall-clock around the child. A/B: the same binary built twice — **AFTER** =
+`beam_gc` at `5109182990`, **BEFORE** = `beam_gc` at `0f5e2130ca` (`git checkout <sha> -- .../beam_gc/src
+.../beam_gc/tests`, build, restore; no `git stash`).
+| N | VmHWM kB AFTER (2 reps) | VmHWM kB BEFORE (2 reps) | wall ms AFTER | wall ms BEFORE |
+|---|---|---|---|---|
+| 0 | 385604 / 385644 | 385512 / 385576 | 2280 / 2349 / 2590 | 2111 / 2134 / 2153 |
+| 1 000 | 386352 / 386352 | 386376 / 386292 | 2237 / 2220 | 2222 / 2083 |
+| 10 000 | 393200 / 393212 | 393076 / 393216 | 2265 / 2258 | 2488 / 2114 |
+| 25 000 | 404044 / 404148 | 404092 / 403876 | 2430 / 2421 / 2468 | 2215 / 2245 / 2155 |
+| 50 000 | 422864 / 423132 | 422776 / 422964 | 2533 / 2476 | 2264 / 2247 |
+| 100 000 | **461012 / 460856** | **460868 / 460628** | 3747 / 4015 / 3580 / 3874 | 2788 / 2548 / 2476 / 2582 |
+**Verdict: the RSS is NOT bounded by anything `beam_gc` can do alone, and the before/after curves are
+identical** (within run-to-run noise) — ≈ **376.5 MiB fixed baseline** at N=0, **+≈750 B (~94 words) per
+iteration**, ≈ **450 MiB** at N=100 000. "AFTER" here is the widened signal (the debt folded into
+`should_collect`, since reverted); "BEFORE" is the occupancy-only signal. The bench tool's own figure
+matches: `case_ets_copy_peak_rss_bytes` mean **450.1 MiB** (471 926 101 B), `ns_per_op` 4717.8, `wall_ms`
+2599, `startup_ms` 2127; the same tool's `gc_bound/churn` control reads **376.6 MiB** — i.e. the
+*baseline only*, ~0 marginal growth where the loop is GC-bounded. So this workload is **not** GC-bounded,
+and the retention: `process_info(self(), memory)` grows 3 728 B → **75 203 768 B** at N=100 000 with
+**`minor_gcs = 0`** throughout, while the same loop with the container result not copied out
+(`ets_copy_nogc`, and a named-table variant alike) stays at **5 624 B**. The blocker is therefore
+downstream of `beam_gc`: `beam_rt`'s heap-admission door declines **every** collection for this process
+(`src/context/gc.rs`'s unscanned-root valve `any_root_is_unscanned` / the pointer-stable arena escape of
+`move_result_into_process_heap`; the caller-module float guard `module_may_be_collected` is **not** the
+mover — the module has no float ops). No `beam_gc`-side change can reclaim the retained spaces soundly
+(they may hold live words; only a collection frees them), so the remaining fix is the runtime's door.
+**Cost of the widened signal: material at high N — which is why it is reverted.** Interleaved reps on a
+heavily loaded host (`/proc/loadavg` 84–128, `nproc` 14; the RSS sweep itself ran at load 10–34) show the
+widened `should_collect` consistently dearer: **+1 205 ms at N = 100 000** (4/4 reps), ≈ +235 ms at
+N = 25 000, and within the ±250 ms noise floor at N = 0 (no loop work). That is a marginal ≈ **5 µs/op
+before vs ≈ 18 µs/op after** (slope between N = 25 000 and N = 100 000) — consistent with the
+now-attempted collections whose *checks* run and then decline (no `minor_gcs` increments), i.e. the same
+blocker, not a new per-allocation tax on the bump path. `should_collect` therefore reports occupancy only
+again, and the debt is the opt-in `collection_debt()` seam a door adopts **once the door admits
+collections**.
+**Caveats.** Reconstructed harness (the sibling `tools/bench` N is a compile-time constant and is
+read-only here); `VmRSS_first` is unusable (pure sample-timing noise, 2.4–9.1 MB while `VmHWM` was already
+385 MB); the ~376.5 MiB boot/`VmSize` baseline (peak `VmSize` 1 000 812 kB) dominates at these N; no
+`/usr/bin/time`; raw series/artifacts were kept outside the repository.
+
+## A forced `garbage_collect()` collects nothing on the `run` path (probe, N = 0 … 20 000)
+Source: `$TMPDIR`-built probe modules (`probe.erl` / `probe2.erl` / `probe3.erl`), run as
+`erts_rust/target/debug/beam_rt run <probe.beam> <mod>:go/1 <N>` (debug build; `/proc/loadavg` 2.8–6.7 at
+the slope runs, `nproc` 14). The sibling `tools/bench` module's N is a compile-time constant and is
+read-only here, so the probes replicate its `ets_copy` shape. Each `go/1` runs its loop, then reads
+`process_info(self(), memory)` and `process_info(self(), garbage_collection)`, calls
+`erlang:garbage_collect()`, and re-reads both.
+
+| probe (body) | N | memory before → after `garbage_collect()` | `minor_gcs` |
+|---|---|---|---|
+| `probe` — `ets:new`/`ets:insert`/`ets:lookup` round trip, `3.5` float in the payload | 0 | 5 592 → 5 592 | 0 → 0 |
+| `probe` | 100 | 78 928 → 81 936 | 0 → 0 |
+| `probe` | 5 000 | 3 763 800 → 3 766 808 | 0 → 0 |
+| `probe` | 20 000 | 15 043 800 → 15 046 808 | 0 → 0 |
+| `probe2` — same loop, float replaced by an integer | 2 000 / 20 000 | 1 209 936 → 1 510 736 / 12 038 808 | 0 → 0 |
+| `probe3` — **no ETS** (`lists:reverse/1` only), **no float** | 0 / 5 000 / 20 000 | 5 592 / 3 763 784 / 15 043 784 | 0 → 0 |
+
+**Retention slope** (memory delta ÷ N ÷ `size_of::<Eterm>()`, in words per iteration): `probe` (100 →
+20 000) **94.0**, `probe2` (5 000 → 20 000) **75.2**, `probe3` (5 000 → 20 000) **94.0** — linear in N for
+every body. 94.0 = `HeapPolicy::next_words(256, 0)` = **376** words — the fresh space a copy-out's
+`needed.max(256)` grow installs (`move_result_into_process_heap` / `alloc_words`) — ÷ 4 iterations per grow.
+The retained bytes are therefore the `Nursery.retired` chain, one whole superseded space per growth.
+
+**What this settles.** (1) `erlang:garbage_collect/0` sets the *forced* flag, so its non-collection is
+**not** the occupancy-only `should_collect` — the occupancy short-circuit is refuted as the blocker.
+(2) It is not the caller-module float guard and not the ETS bridge: `probe3` has neither ETS nor a float
+and behaves like `probe`. (3) A `run` process's collection is thus refused — or never reached — *above* the
+occupancy check: `gc_process_enabled` (pinned / halted / the global escape-store valve),
+`is_relocation_exempt()`, the unscanned-root valve, or the doors not being armed on this path.
+`gc_stats()`'s `collections`/`fallbacks`/`pinned`/`halted`/`disabled` discriminate those and are
+runtime-internal, so that last step belongs to `beam_rt`. (4) Growth itself adds no per-allocation cost —
+the retention is the retired chain, not a bump-path tax.
+
+## Runtime-shaped dispatch (the break-even through the runtime's own GC doors)
+Source: `../beam_rt/tests/gc_immix_payload.rs` and `../beam_rt/tests/gc_strategy.rs` (crate `beam_rt`,
+outside this crate's own test tree). The same workload driven through `beam_rt`'s own GC doors with a
+runtime-spawned process reproduces the small-object/high-churn verdict exactly at the break-even: with
+`initial_mature_words` **2047** (Copying) vs **2048** (Immix), Immix moves **1.146×** the words for
+**6.57×** the mature occupancy. That is why the automatic rule's default stays Copying and
+`MatureKind::Immix` remains an opt-in — `BEAM_RT_GC_STRATEGY=immix` raises the spawned policy's mature
+generation past the break-even. Load-invariant counts only; timings are not asserted.

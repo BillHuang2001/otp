@@ -231,7 +231,9 @@ impl AnyCollector {
     ///
     /// Both strategies answer this from the **shared** young nursery (an exact-fit allocation
     /// still fits), so the answer is strategy-independent — a caller that switches the mature
-    /// generation gets the same admission decisions.
+    /// generation gets the same admission decisions. The chain's
+    /// [collection debt](Self::collection_debt) is deliberately **not** folded in; see that
+    /// method for the opt-in seam a host consults alongside this one.
     pub fn should_collect(&self, need_words: usize) -> bool {
         match self {
             AnyCollector::Copying(c) => c.should_collect(need_words),
@@ -239,6 +241,28 @@ impl AnyCollector {
         }
     }
 
+    /// Whether the nursery chain carries a space a [growth](Self::grow_nursery) retired — the
+    /// chain's **collection debt** — forwarded to whichever strategy is selected
+    /// ([`Collector::collection_debt`] / [`GenImmixCollector::collection_debt`]), the same way
+    /// [`should_collect`](Self::should_collect) is.
+    ///
+    /// A growth never collects and never moves a term, so only a
+    /// [collection](Self::collect) reclaims a retired space (it collapses the chain). A `true`
+    /// answer therefore means **a collection is required to reclaim the chain: a
+    /// heap-admission door should treat it like a full nursery** and collect, even when the
+    /// current space still has room for the request.
+    ///
+    /// This is an **opt-in** seam, not part of [`should_collect`](Self::should_collect): a
+    /// caller that ignores it pays nothing for it. `beam_rt`'s heap-admission doors
+    /// (`src/context/gc.rs::ensure_heap` / `ensure_heap_full`) must OR it into their
+    /// `should_collect` decision once they unconditionally admit the collection — see the
+    /// handoff in the crate `CONTEXT.md`.
+    pub fn collection_debt(&self) -> bool {
+        match self {
+            AnyCollector::Copying(c) => c.collection_debt(),
+            AnyCollector::Immix(c) => c.collection_debt(),
+        }
+    }
     /// Runs a collection on the selected strategy.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         match self {
