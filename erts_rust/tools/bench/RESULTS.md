@@ -1,17 +1,18 @@
-# Rust-ERTS benchmark results — current measurement run (m11)
+# Rust-ERTS benchmark results — current measurement run (m12)
 
 Reproducible numbers for the Rust-ERTS rewrite (`erts_rust/`) measured against the target projects, produced by the `bench` driver (`erts_rust/tools/bench`).
 Everything below is **measured, never modelled**.
 A workload that could not run is reported with a *verified* reason and **no number** — never an estimate.
 
-Measured on the host in §1 on **2026-10-14 05:47–06:57 UTC** (= 2026-10-14 13:47–14:57 +0800) at commit **`ab6f1b5e58835cbf5fcb75257679532c46090a74`** (`ab6f1b5e58`, "bench(copy_bound): add send_recv_plain delivery-only attribution case"), with the driver and `beam_rt` both built from this tree (`--release -p beam_rt -p bench`).
-Raw harness JSON is committed under `results/` as `m11-*`; the previous runs are kept as `m10-*` (2026-10-13), `m9-*` (2026-10-13), `m6-*` (2026-10-11), `m5-*` (2026-10-09) and `m4-*` (2026-10-08) and are the regression baselines for the delta section (§7).
-**BATCH-54 additions (this revision):** the two M11 open questions are now **resolved** and the supporting controlled experiments are committed alongside the m11 record — `results/b54-foreign-ab-{m10,head}.json` and `results/b54-foreign-growth-curve.md`. (1) the `foreign` per-call metric is **N-dependent** *and* carries a **genuine m10→m11 regression at matched `N`**, now **root-caused** (commit `e59dd30432`, a per-slice off-heap registration loop ⇒ Θ(N³); owned by `beam_rt`/`beam_process`, **outside this node**) — §3.4, §8 item 1; (2) the loop workloads' rust peak-RSS growth (incl. `ets_copy`) is a **general per-op heap retention** through the copy-out/`alloc_words` → `grow_nursery` → `Nursery.retired` chain, **not** ETS-specific and **not** an m11 regression — §6.7, §8 item 5. No metric value is changed by this revision.
+Measured on the host in §1 on **2026-10-15 14:00–15:03 UTC** (= 2026-10-15 22:00–23:03 +0800) from the tree **`ee3e426db0`**, with the driver and `beam_rt` both built from that tree (`--release -p beam_rt -p bench`); the m12 measurement artifacts were committed as **`bdadd02333`**, the milestone narrative as **`a63099d43f`**.
+Raw harness JSON is committed under `results/` as `m12-*`; the previous runs are kept as `m11-*` (2026-10-14), `m10-*` (2026-10-13), `m9-*` (2026-10-13), `m6-*` (2026-10-11), `m5-*` (2026-10-09) and `m4-*` (2026-10-08) and are the regression baselines for the delta section (§7).
 
-> **Naming both sides of every ratio (read this before quoting a number).** `sys` = the **system ERTS** (OTP 29.1.1, the oracle `erl`, a 14-scheduler SMP VM). `rust` = **`beam_rt`**, the Rust runtime, at its **default execution tier** (the native baseline JIT). A third, distinct column exists — **`rust` with `BEAM_RT_TIER=interpreter`** — and it is a **Rust-vs-Rust tier effect, NOT a system-ERTS comparison** (§3.9, §7). The m9 record once published a `foreign` figure of **0.71×–0.84×** as "of the system ERTS" when it was actually that Rust-vs-Rust tier effect; against the system ERTS the same loop was **46.2×–74.2×** dearer. **Every ratio in this document names both sides.**
+**What is new at m12 (the deliverable of this milestone).** (1) The **Θ(N³) `foreign` per-call regression is FIXED** (commits `07a5720639` + `7d84b12b44`, owned by `beam_rt`/`beam_process`, **outside this node**): the corrected cross-runtime `foreign` band is **38.9×–66.9×** (m11: 60.2×–367.1×), and the correction is re-derived here from a fresh interleaved A/B against the m10 binary — `results/m12-foreign-regression.md`, `results/m12-foreign-ab-{head,m10}.json` (§3.4). (2) The `run` action now **drives the full `bootstrap/bin/start` boot script** (commit `85ee33b2f8`), so **boot completes** — `beam_rt -boot bootstrap/bin/start` **exits 0** (m11 recorded exit 3 / "directive 18 of 22") — but that same change leaves an **OPEN** `run`-route latency defect: **≈2.1 s fixed startup** on every `run`/`-eval`/`-boot` action, a **~25.5 ms per-blocked-round** scheduler cost (the booted kernel's `os:set_signal/2` self-pipe keeps `PortRegistry::has_nothing_to_poll()` false, so every blocked round sleeps the full `PORT_POLL_SLICE` = 25 ms), and a **Θ(atom-table) `binary_to_term`** inflation. Both are `beam_rt` defects, **not** target-project defects — `results/m12-run-route-latency.md` (§3.9, §3.10, §8 item 1). (3) `khepri` and `plb` **now measure** (`ok`); `emqx` still **skips honestly**.
+
+> **Naming both sides of every ratio (read this before quoting a number).** `sys` = the **system ERTS** (OTP **29.1.1** / erts-17.1, the oracle `erl`, a 14-scheduler SMP VM). `rust` = **`beam_rt`**, the Rust runtime, at its **default execution tier** (the native baseline JIT). A third, distinct column exists — **`rust` with `BEAM_RT_TIER=interpreter`** — and it is a **Rust-vs-Rust tier effect, NOT a system-ERTS comparison** (§3.9, §7). The m9 record once published a `foreign` figure of **0.71×–0.84×** as "of the system ERTS" when it was actually that Rust-vs-Rust tier effect; against the system ERTS the same loop was **46.2×–74.2×** dearer. **Every ratio in this document names both sides.**
 > **The target applications are NOT run by the Rust runtime.** `cowboy`, `khepri`, `plb`, `erlc_compiler`, `elixir_compiler` and `emqx` are executed by their **own system-ERTS / system-toolchain** (`erlc`, `elixirc`, the Cowboy release on the oracle `erl`, `rebar3`'s Erlang, the `.NET` tool). They are **reference** figures for the sys-only surfaces (§4), never Rust-runtime results.
 
-> **This is a shared, usually-loaded host** (§1, §6.1): absolute latencies/throughputs move several-fold with load, so **ratios are the signal** and a single contended sample is never a constant. The m11 passes ran at 1-min loads `6.04 → 2.98` (cross-runtime), `1.81 → 2.59` (interpreter-tier control, `--quick`) and `1.36 → 2.36` (external targets); the cross-runtime pass **fell** during the run, so its later (`rust`) side ran under a *lighter* load.
+> **This is a shared, usually-loaded host** (§1, §6.1): absolute latencies/throughputs move several-fold with load, so **ratios are the signal** and a single contended sample is never a constant. The m12 passes ran at 1-min loads `65.28 → 6.93` (cross-runtime, `--full`), `3.91 → 11.69` (both tier controls, `--quick`), `10.91 → 9.34` (external targets), `9.34 → 7.85` (PLB), `7.85 → 7.54` (EMQX), `10.26 → 8.86` (the run-route probes) and `6.72 → 5.73` (the `foreign` A/B). The cross-runtime pass **fell** during the run, so its later (`rust`) side ran under a *lighter* load; the `rust` absolute walls are additionally **boot-dominated at m12** (§3.9), which is why only the per-op/per-element/per-call marginals and the deterministic counters are read as cross-runtime signal.
 
 ## Verdict
 
@@ -19,575 +20,412 @@ Raw harness JSON is committed under `results/` as `m11-*`; the previous runs are
 
 | target project | runs? | executed by | result / verified reason |
 |---|---|---|---|
-| `khepri` (tree DB) | **runs** | `rebar3`'s Erlang (OTP 28 escript; §4.2) | `ok` — `rebar3 eunit` wall 83 402.90 ms |
-| `cowboy` (HTTP server) | **runs** | the oracle `erl` release | `ok` — 190 626.72 req/s, p50 0.0787 ms / p99 0.2234 ms |
-| `erlc_compiler` (Erlang compiler) | **runs** | system `erlc` (OTP 29) | `ok` — 7.589 files/s over the stdlib+Elixir corpus |
-| `elixir_compiler` (Elixir compiler) | **runs** | installed `elixirc` 1.20.4 | `ok` — 4.678 files/s over 105 sources / 223 `.beam` |
-| `plb` (Benchmarks Game kernels, .NET) | **runs** | the `.NET` tool (`dotnet` 9.0.318) | `ok` — wall 68 318.69 ms; `test_time_ms` p50 559.98 / p99 3 355.48 (n=10) |
+| `khepri` (tree DB) | **runs** | `rebar3`'s Erlang (OTP 28 escript; §4.2) | `ok` — `rebar3 eunit` wall 77 564.34 ms |
+| `cowboy` (HTTP server) | **runs** | the oracle `erl` release | `ok` — 165 489.21 req/s, p50 0.0779 ms / p99 0.7424 ms |
+| `erlc_compiler` (Erlang compiler) | **runs** | system `erlc` (OTP 29) | `ok` — 8.769 files/s over the stdlib+Elixir corpus |
+| `elixir_compiler` (Elixir compiler) | **runs** | installed `elixirc` 1.20.4 | `ok` — 4.433 files/s over 105 sources / 223 `.beam` |
+| `plb` (Benchmarks Game kernels, .NET) | **runs** | the `.NET` tool (`dotnet` 9.0.318) | `ok` — wall 70 648.46 ms; `test_time_ms` p50 595.13 / p99 3 565.99 (n=10) |
 | `emqx` (MQTT broker) | **skips** | — | `skipped(emqx-requires-otp-28)` — EMQX pins OTP **28.5.0.7-2** (`env.sh:3`/`.tool-versions:1`), the host `erl` is OTP 29.1.1 / erts-17.1; not satisfiable without a full OTP-28 toolchain swap (§4.3, §5) |
 
 The six workloads the Rust runtime itself can host (`Runtimes::Both`) — `baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound` — all ran: **12/12 rows `ok`** (0 skipped, 0 unsupported, 0 failed). Every other workload is `SysOnly` and would report `skipped(runtime-unsupported)` under `rust` (§5).
 
-**(c) Ratio to the system-ERTS oracle, per cross-runtime workload.** `rust/sys` is the **Rust default tier** cost as a multiple of the **system-ERTS** cost (`<1` ⇒ Rust cheaper, `>1` ⇒ Rust dearer). Values are the m11 `xrun` (§3, `--full`, 1-min load 6.04 → 2.98).
+**(c) Ratio to the system-ERTS oracle, per cross-runtime workload.** `rust/sys` is the **Rust default tier** cost as a multiple of the **system-ERTS** cost (`<1` ⇒ Rust cheaper, `>1` ⇒ Rust dearer). Values are the m12 `xrun` (§3, `--full`, 1-min load 65.28 → 6.93).
 
-| workload | surface | headline metric | sys (system ERTS) | rust (`beam_rt`, default tier) | rust/sys | reading |
+| workload | surface | headline metric | sys (system ERTS 29.1.1) | rust (`beam_rt`, default tier) | rust/sys | reading |
 |---|---|---|---|---|---|---|
-| `baseline` | startup / CLI | `startup_ms` (mean, whole process) | 112.8126 ms | 15.2122 ms | **0.135×** | Rust **7.42× faster** per process |
-| `slice` (9 programs) | compute | `case_*_wall_ms` (mean, per case) | 118.79–122.52 ms | 15.35–37.85 ms | **0.127×–0.311×** | Rust **3.21×–7.86× faster** |
-| `foreign` (Cowboy/EMQX source) | compute / `.beam` | `case_*_ns_per_call` | 210.23–344.97 ns | 19 306.39–77 167.32 ns | **60.2×–367.1×** | Rust **60.2×–367.1× dearer** per call |
-| `list_walk` | dispatch | `case_list_walk_ns_per_element` | 2.4194 ns | 45.9731 ns | **19.0×** | Rust **19.0× dearer** per element |
-| `copy_bound` (ETF / ETS / send-recv, **4 cases**) | Msg / copy | `case_*_ns_per_op` | 236.93–1 453.37 ns | 2 435.07–21 522.24 ns | **10.3×–30.7×** | Rust **10.3×–30.7× dearer** per op |
-| `gc_bound` (allocation churn) | GC | `case_churn_ns_per_op` | 4 270.13 ns | 128 524.45 ns | **30.1×** | Rust **30.1× dearer** per op |
+| `baseline` | startup / CLI | `startup_ms` (mean, whole process) | 120.6697 ms | 2 298.6279 ms | **19.05×** | Rust dearer — **the OPEN `run`-route boot (~2.1 s fixed)**; m11 was 0.135× |
+| `baseline` | VM memory | `vm_memory_total_bytes` | 36 211 168 B | 15 892 346 B | **0.439×** | Rust **2.28× lower** VM memory |
+| `slice` (9 programs) | compute | `case_*_wall_ms` (mean, per case) | 132.08–152.71 ms | 2 097.64–2 366.64 ms | **13.7×–17.5×** | Rust dearer — whole-process wall, **boot-dominated** (one process per call) |
+| `foreign` (4 cases) | compute | `case_*_ns_per_call` | 231.62–419.77 ns | 14 919.34–23 429.88 ns | **38.9×–66.9×** | Rust dearer — **the Θ(N³) fix** (m11: 60.2×–367.1×) |
+| `list_walk` | compute | `case_list_walk_ns_per_element` | 7.6021 ns | 110.2061 ns | **14.50×** | Rust dearer (per-element dispatch) |
+| `copy_bound` (4 cases) | messaging | `case_*_ns_per_op` | 289.51–1 584.36 ns | 2 883.75–25 632 422.23 ns | **9.96×–16 178.4×** | `send_recv`'s ratio is the **~25.5 ms blocked-round defect**; `send_recv_plain` rust **timed out** |
+| `gc_bound` | gc | `case_churn_ns_per_op` | 4 658.7133 ns | 184 398.8576 ns | **39.58×** | Rust dearer (allocate-and-abandon churn) |
 
-- **The two directions are both real and answer different questions.** Rust's *whole-process cost* is far lower (a `beam_rt` process starts in ~15.2 ms vs the oracle's ~113 ms), while the *per-unit execution cost* of Erlang code under `beam_rt` is far higher (**10.3×–367.1×**, §3.8). Startup / whole-process cost is the trustworthy whole-process comparison; the startup-cancelled marginals are the per-unit execution-throughput signal.
-- **The stable per-unit band narrowed again since m10** — the `copy_bound` per-op band fell **13.6×–54.7× → 10.3×–30.7×**, `list_walk` **22.1× → 19.0×**, `gc_bound churn` **33.7× → 30.1×**; `foreign` moved the *other* way (**52.4×–78.7× → 60.2×–367.1×**) — a **genuine regression at matched `N`**, now **root-caused** (commit `e59dd30432`, `beam_rt`/`beam_process`, outside this node; §3.4 / §8 item 1) — and its `ns_per_call` row is **N-dependent**, so only comparable across runs that used the same `N`.
-- **Peak RSS is a like-for-like cross-runtime comparison only for `slice`** (one call per process). For `foreign` / `list_walk` / `copy_bound` / `gc_bound` rust peak RSS grows with the per-runtime loop count `N` (a general per-op heap retention; mechanism identified — §6.7) and is **not** comparable — though `list_walk` and `gc_bound` sit **below** the oracle (§7).
-- **Load caveat (read before quoting any absolute number).** The m11 passes ran at 1-min `/proc/loadavg` `6.04 → 2.98` (cross-runtime), `1.81 → 2.59` (interpreter-tier control, `--quick`) and `1.36 → 2.36` (external targets); the host is shared and absolute latencies are **not comparable across runs**. Prefer the ratios above, the startup-cancelled marginals and the deterministic counters.
+**(d) Tier effect (Rust vs Rust — never a system-ERTS comparison).** Read from the matched-form `--quick` pair (`m12-compare-tier-effect-quick.txt`, `a` = interpreter, `b` = default): `gc_bound churn` **2.07× cheaper** on the baseline JIT; `foreign` 1.03×–1.80× cheaper; `send_recv` **0.999× = parity**; `etf`/`ets`/`startup`/`vm_memory` parity; `slice` 0.95×–1.06× (boot-dominated); `list_walk`'s default-tier marginal was below timer resolution in the `--quick` form (§3.9). **The m11 interpreter pathology on `foreign` is gone** (m11 interpreter up to 4 178 832 ns/call; m12 interpreter 21 458–37 786 ns/call) — it was the *same* shared `beam_rt`/`beam_process` Θ(N³) defect, not an interpreter-tier defect.
 
 ## Coverage — workload ↔ rewrite surface
 
-The driver exercises the messaging/copy, ETF, ETS and GC surfaces named in the top-level `ERTS_RUST_REWRITE_TEST_PROJECTS.md` coverage matrix, **under both runtimes**, via the workloads `copy_bound` / `gc_bound`; the I/O, compute and compiler surfaces are covered too (the I/O and compiler ones only on the system runtime).
-
-| workload | category | rewrite surface exercised (TEST_PROJECTS matrix) | runtime |
-|---|---|---|---|
-| `baseline` | startup | startup / p99 tail; CLI (A.6); boot (A.7) | **both** |
-| `slice` | compute | JIT/compute (calls real `calendar`/`queue`/`gb_trees`/`base64`/`ordsets`/`string` code); boot (A.7) | **both** |
-| `foreign` | compute | JIT/compute on **real Cowboy + EMQX source**, compiled by `erlc` (`.beam` A.2) | **both** |
-| `list_walk` | compute | JIT/compute — a BIF-free body-recursive walk (per-element dispatch) | **both** |
-| `copy_bound` | messaging | **Msg/copy + Distrib/ETF + ETS** — `term_to_binary`/`binary_to_term`, `ets:insert`+`ets:lookup`, two-process send/receive (with and without the ETF leg in the receiver) | **both** |
-| `gc_bound` | gc | **GC** — allocate-and-abandon churn | **both** |
-| `cowboy` | io | I/O — Ranch/`epoll` socket path, `cowlib` HTTP parse, per-request process spawn | system-only |
-| `khepri` | gc | ETS/`ordered_set`, GC pressure, disk I/O | system-only |
-| `plb` | compute | JIT/compute — Benchmarks-Game kernels (Erlang/Elixir) | system-only |
-| `erlc_compiler` | compiler | compiler throughput (`erl_parse`/`erl_lint`/`beam_ssa_*`), file I/O | system-only |
-| `elixir_compiler` | compiler | compiler throughput (Elixir toolchain) | system-only |
-| `emqx` | messaging | Msg/copy, Distrib/ETF, NIF ABI (`ssl`/`crypto`) | system-only (**skipped**, §4.3) |
-
-> **Boot / contract A.7 status at this commit — NOT complete.** `baseline` and `slice` are both registered against A.7 (process boot / `-boot`), but **no boot completion is demonstrated by this driver**. At the measured commit, `erts_rust/target/release/beam_rt -boot bootstrap/bin/start` exits **3** with the single stderr line `beam_rt: unsupported: opcode: run: process blocked (no message available)` — the real `bootstrap/bin/start.boot` stops at **directive 18 of 22** (the driver itself only exercises the plain per-process `-eval`/`run` startup path, which does complete). Recorded as fact; see §6.8.
-
-**Surfaces still uncovered by this driver:** the **NIF C ABI** (A.3) and **driver C ABI** (A.4), the **hot-upgrade** surface, and the **live distribution wire** — `copy_bound`'s `etf_roundtrip` case covers the **ETF codec** (A.5) as a single-process round trip, not a two-node handshake / `DOP_*` loopback. Those surfaces are covered by the differential gate (`tools/differential`, contracts A.3/A.4), not by `bench`.
+| workload | category | contracts | runtimes | what it exercises |
+|---|---|---|---|---|
+| `baseline` | startup | A.6, A.7 | both | CLI/`-eval` path, startup latency, `erlang:memory/0,1`, fixed compute loop |
+| `slice` | compute | A.1, A.2 | both | real `erlc`-compiled `.beam` execution, stdlib calls (`calendar`/`queue`/`gb_trees`/`base64`/`ordsets`/`string`) |
+| `foreign` | compute | A.1, A.2 | both | real Cowboy (`cowboy_bstr`) + EMQX (`emqx_base62`) modules, per-call dispatch |
+| `list_walk` | compute | A.1, A.2 | both | BIF-free recursive list walk — per-element dispatch/return |
+| `copy_bound` | messaging | A.1, A.5 | both | ETF wire codec, ETS copy boundary, two-process send/receive (with and without the codec) |
+| `gc_bound` | gc | A.1 | both | allocate-and-abandon garbage churn |
+| `erlc_compiler` | compiler | A.9 | sys-only | system `erlc` throughput |
+| `elixir_compiler` | compiler | A.1, A.9 | sys-only | installed `elixirc` throughput |
+| `plb` | compute | — | sys-only | Benchmarks-Game kernels through the `.NET` tool |
+| `cowboy` | io | — | sys-only | Cowboy `hello_world` release + HTTP/1.1 load |
+| `khepri` | gc | — | sys-only | Khepri `rebar3 eunit` |
+| `emqx` | messaging | — | sys-only | EMQX umbrella build (`make`/`mix`) |
 
 ## Host contention (read before quoting any absolute number)
 
-> The benchmark host is a **shared 14-core machine** and was loaded throughout m11.
-> The primary (**full**) passes were taken at `/proc/loadavg` 1-min **6.04 → 2.98** (cross-runtime), **1.36 → 2.36** (external targets) and **1.81 → 2.59** (interpreter-tier control, `--quick`); the PLB pass ran `2.36 → 1.97`, EMQX `1.97 → 1.97` (`results/m11-load-record.md` records the exact sequence, and the session 1-min value ranged **1.12 → 7.18**).
-> Every *absolute* latency / wall / throughput below is still inflated by CPU contention and is **not comparable across runs**. Prefer **ratios**, the **startup-cancelled per-op / per-call / per-element marginals** (`*_ns_per_op`, `*_ns_per_call`, `*_ns_per_element`) and the **deterministic counters** (`*_ops`, `*_elements`).
-> `/proc/loadavg` is host-wide and a weak proxy — it does **not** move monotonically with the measured figures (§7) — so record it, but never infer a slowdown from it alone.
-> The load was recorded **before and after every run** (§1/`results/m11-load-record.md`) — mandatory here.
-> **The BATCH-54 experiments were taken at a much higher load** (the host sat at 1-min `15–49` for the whole pass — `results/b54-foreign-growth-curve.md` records the `/proc/loadavg` at each point). That inflates the *absolute* walls of both sides of the A/B roughly together; the **ratios** (the m10-vs-HEAD A/B and the per-call growth trend) are the signal, and they are robust across the two windows.
+`/proc/loadavg` is **host-wide** and this machine is shared: across the m12 session the 1-min value ran from `3.91` to `65.28`. The cross-runtime pass started at `65.28` (the batch's start bracket) and ended at `6.93`; the external-target pass sat at `10.91 → 9.34`; PLB `9.34 → 7.85`; the `foreign` A/B `6.72 → 5.73`. Absolute latencies/walls/throughputs are therefore **inflated** and must not be read as machine-speed constants; the load-robust signals are the **per-op / per-element / per-call marginals** and the **deterministic counters** (`*_ops`, `*_elements`, `*_calls`). At m12 the `rust` **whole-process walls** are additionally dominated by the OPEN ~2.1 s boot, so `startup_ms`/`slice wall_ms` are *not* execution-throughput measures at this commit. Full before/after record: `results/m12-load-record.md` §3.
 
 ## 1. Environment (recorded with the run)
 
-| item | value |
-|---|---|
-| Date (UTC) | 2026-10-14 05:47–06:57 UTC (= 2026-10-14 13:47–14:57 +0800) |
-| Commit measured | `ab6f1b5e58835cbf5fcb75257679532c46090a74` |
-| Host / kernel | Linux 7.2.9 (`x86_64`), NixOS 26.11 (Zokor, build `26.11.20261003.a7868a7`) |
-| CPU | Intel(R) Core(TM) Ultra 7 356H — `nproc` = **14** |
-| RAM | `MemTotal` = 65 317 432 kB (62.29 GiB) |
-| Host load (1-min `/proc/loadavg`) | full cross-runtime `xrun` **6.04 → 2.98**; full external targets **1.36 → 2.36**; interpreter-tier control (**`--quick`**) **1.81 → 2.59**; matched default-tier control (**`--quick`**) **2.38 → 2.16**; PLB **2.36 → 1.97**, EMQX **1.97 → 1.97** (per-run table in `results/m11-load-record.md`) |
-| Toolchain | `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.0` |
-| Oracle (`sys`) | system `erl` at `/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl`, **OTP 29.1.1 / erts-17.1** (`otp_release` = `"29"`) |
-| Rust runtime (`rust`) | `erts_rust/target/release/beam_rt` (release), `erlang:system_info(otp_release)` = `"30"` |
-| `erlc` | OTP 29.1.1 (on `PATH`) |
-| `elixirc` / `mix` | **Elixir 1.20.4** (compiled with Erlang/OTP 29) |
-| `rebar3` | **3.27.1**, resolved from the Nix store by the driver's **store scan** (**not** on `PATH`); its shebang runs it under **Erlang/OTP 28** — see §4.2 |
-| `dotnet` | **9.0.318, on `PATH`** (`/run/current-system/sw/bin/dotnet`). The store also holds two 8.0.425 SDKs; the version-aware resolver rejects them for `plb` (declared min `9`) and records each rejection (§4.1) |
-| `clang` | **21.1.8**, on `PATH` |
-| `$BENCH_TRY_NIX` / `$BENCH_TOOL_PATH` | **unset** for the m11 runs — the store scan resolves `rebar3` locally (§4.2) |
-| `$HOME` | read-only (`touch` fails with `Read-only file system`) — relevant to `plb` |
-| `/usr/bin/time` | **absent** — the driver's own timers and `/proc/<pid>` `VmHWM` polling are used |
-
-Both runtimes resolve and pass the harness self-check (`supported: true`).
-
-Per-run `/proc/loadavg` (1-min value first; the full sequence, with the exact commands, is in `results/m11-load-record.md`):
-
-| run | before | after |
-|---|---|---|
-| **FULL cross-runtime pass** (`m11-bench-xrun.json`, wall 2m54s) | `6.04` | `2.98` |
-| (unarchived interpreter diagnostics; §3.1) | `3.53` | `2.07` |
-| **FULL external-target pass** (`m11-bench-external.json`, wall 3m11s) | `1.36` | `2.36` |
-| PLB quick pass (`m11-bench-plb.json`, wall 1m33s) | `2.36` | `1.97` |
-| EMQX quick pass (`m11-bench-emqx.json`, skips immediately, wall 0.7s) | `1.97` | `1.97` |
-| interpreter-tier control, **`--quick`** (`m11-bench-xrun-interp.json`, rust-only, wall 12m27s) | `1.81` | `2.59` |
-| matched default-tier control, `--quick` (`m11-bench-xrun-quick.json`, rust-only, wall 17s) | `2.38` | `2.16` |
+- **Commit measured:** runtime+driver tree `ee3e426db0`; artifacts committed as `bdadd02333`; milestone narrative `a63099d43f`. The m10-baseline binary used in §3.4 is `beam_rt` from `b4593818b3`.
+- **Oracle (`sys`):** system `erl` — **OTP 29.1.1** (`erlang:system_info(version)` = `17.1`) at `/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl`.
+- **Rust (`rust`):** `erts_rust/target/release/beam_rt`, `erlang:system_info(otp_release)` = `30`, **default (baseline-JIT) tier**, self-check passing. Both runtimes report `supported: true` in every report.
+- **Host:** NixOS 26.11 (Zokor), Linux 7.2.9 `x86_64`; Intel(R) Core(TM) Ultra 7 356H, `nproc` = **14**, `MemTotal` = 65 317 432 kB (~62.3 GiB).
+- **Toolchain:** `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.0`; `clang` **21.1.8**; `erlc` = the oracle's; `elixirc`/`mix` **1.20.4** ("compiled with Erlang/OTP 29").
+- **Tools:** `dotnet` **9.0.318** on `PATH` (`/run/current-system/sw/bin/dotnet`; two 8.0.425 store SDKs are rejected by `command_for_min`'s min-`9` rule for `plb`); `rebar3` **not on `PATH`** — resolved from the Nix store by the driver's version-ranked scan (`rebar3-3.27.1`) ⇒ `khepri` runs; **`/usr/bin/time` absent** (the driver's own timers + `/proc/<pid>` `VmHWM` polling are used); network available (`cowboy`'s build fetches cowlib/ranch).
+- **Env vars:** `$HOME` read-only; `$BENCH_TRY_NIX`/`$BENCH_TOOL_PATH` unset; `$ERTS_ORACLE`/`$BEAM_RT`/`$BEAM_RT_TIER` unset for every run except the interpreter control (`BEAM_RT_TIER=interpreter`) and the `foreign` A/B (`BEAM_RT`).
+- `erts_rust/target/release/bench list --json`: **all 12 workloads `probe_ready: true`, 0 probe reasons.**
 
 ## 2. Exact commands
 
-Build the driver and the runtime:
 ```sh
+# build (once; the wrapper supplies a writable CARGO_HOME — $HOME is read-only)
 erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt -p bench
-```
-Probe status:
-```sh
-erts_rust/target/release/bench list --json       # all 12 workloads probe_ready: true, 0 skip reasons
-```
-The **focused cross-runtime run** — all six `Runtimes::Both` workloads, `--full`, both runtimes → `results/m11-bench-xrun.json` (wall 2m54s):
-```sh
-erts_rust/target/release/bench run --full --runtime all \
-    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/out/m11-bench-xrun.json --verbose
-```
-The **tier-effect control** — the same workloads, `rust` only, interpreter pinned → `results/m11-bench-xrun-interp.json` (wall 12m27s). **This run is `--quick`, not `--full`**: at this commit the interpreter tier is pathologically slow (and super-linear in `N`) on the `foreign` cross-module cases (§3.9), so a `--full` pass would need ≈50 min. A **supplementary matched-form default-tier `--quick` control** → `results/m11-bench-xrun-quick.json` (wall 17s) exists so the tier table can be read off two `--quick` runs instead of pairing a `--quick` run against the `--full` `m11-bench-xrun.json`:
-```sh
-BEAM_RT_TIER=interpreter erts_rust/target/release/bench run --quick --runtime rust \
-    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/out/m11-bench-xrun-interp.json --verbose
-erts_rust/target/release/bench run --quick --runtime rust \
-    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/out/m11-bench-xrun-quick.json
-```
-Cross-runtime diff, the as-specified tier diff and the **matched-form** tier diff (archived as text artifacts; the tool diffs the **mean**):
-```sh
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-xrun.json \
-    > erts_rust/tools/bench/results/m11-compare-cross-runtime.txt
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-xrun-interp.json \
-    erts_rust/tools/bench/results/m11-bench-xrun.json \
-    > erts_rust/tools/bench/results/m11-compare-tier-effect.txt       # a=quick, b=full (form mismatch)
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-xrun-interp.json \
-    erts_rust/tools/bench/results/m11-bench-xrun-quick.json \
-    > erts_rust/tools/bench/results/m11-compare-tier-effect-quick.txt  # matched-form quick<->quick
-```
-The **full sys-only external-target run** (one report, four workloads; wall 3m11s) and the two remaining single-target runs:
-```sh
-erts_rust/target/release/bench run --full  --runtime sys --workloads erlc_compiler,elixir_compiler,cowboy,khepri \
-    --out-file erts_rust/tools/bench/out/m11-bench-external.json --verbose
-erts_rust/target/release/bench run --quick --runtime sys --workloads plb  --out-file erts_rust/tools/bench/out/m11-bench-plb.json  --verbose
-erts_rust/target/release/bench run --quick --runtime sys --workloads emqx --out-file erts_rust/tools/bench/out/m11-bench-emqx.json --verbose
-```
-The runtime's boot status at this commit (a factual probe, not a workload):
-```sh
-erts_rust/target/release/beam_rt -boot bootstrap/bin/start     # exit 3; §6.8
-```
-The **BATCH-54 controlled A/B** (`$BEAM_RT` overrides the resolved Rust runtime; the m10 binary comes from a scratch `git worktree add --detach $TMPDIR/m10wt b4593818b3` built with the committed wrapper). The two passes were interleaved; each is `--quick` and matched-`N` (§3.4):
-```sh
-BEAM_RT=$TMPDIR/m10wt/erts_rust/target/release/beam_rt \
-    erts_rust/target/release/bench run --quick --runtime rust --workloads foreign \
-    --out-file erts_rust/tools/bench/out/b54-ab-m10-raw.json
-BEAM_RT=erts_rust/target/release/beam_rt \
-    erts_rust/target/release/bench run --quick --runtime rust --workloads foreign \
-    --out-file erts_rust/tools/bench/out/b54-ab-head-raw.json
-```
-(The raw copies are archived as `results/b54-foreign-ab-{m10,head}.json` with only the mechanical `runtimes[].program` path normalisation — the m10 side's program becomes `$TMPDIR/m10wt/erts_rust/target/release/beam_rt`. The direct `enc` growth curve on both binaries, both tiers, is `results/b54-foreign-growth-curve.md`.)
-Crate tests: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p bench` (**253 passed / 0 failed** at this commit: 245 lib unit + 4 integration + 1 oracle smoke + 3 doc).
 
-Profile semantics: `--full` ⇒ `baseline` 50 startup samples / 5 compute samples, `slice` 25 timed runs/case, `foreign`/`list_walk`/`copy_bound`/`gc_bound` 10 samples/case, `cowboy` 16 connections × 5 s, `elixir_compiler` up to 200 files.
-`--quick` ⇒ `baseline` 10 / 5, `slice` 5, `foreign`/`list_walk`/`copy_bound`/`gc_bound` 3, `cowboy` 8 connections × 2 s.
-The per-runtime loop count `N` in the `foreign`/`list_walk`/`copy_bound`/`gc_bound` cases is **fixed per case** (not profile-dependent), so the `--full` sample counts only widen the estimate, never the loop length (§3.4–3.7).
-**Run order is runtime-major**: all `sys` rows execute first, then all `rust` rows — under a *drifting* host load the two sides are measured in different windows (§6.1).
+# probe status
+erts_rust/target/release/bench list --json
+
+# A. FULL cross-runtime run — the six Runtimes::Both workloads, --full, both runtimes (wall 1795 s)
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --full --runtime all --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
+    --out-file erts_rust/tools/bench/results/m12-bench-xrun.json --verbose
+
+# B. tier controls — same six workloads, rust only (wall 391 s interpreter / 488 s default)
+BEAM_RT_TIER=interpreter erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
+    --out-file erts_rust/tools/bench/results/m12-bench-xrun-interp.json
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
+    --out-file erts_rust/tools/bench/results/m12-bench-xrun-quick.json
+
+# C. FULL sys-only external targets (one report; wall 184 s) — khepri now MEASURES
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --full --runtime sys --workloads erlc_compiler,elixir_compiler,cowboy,khepri \
+    --out-file erts_rust/tools/bench/results/m12-bench-external.json --verbose
+
+# D. PLB (quick, wall 95 s, ok)   E. EMQX (quick, skips immediately, wall 1 s)
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime sys --workloads plb  --out-file erts_rust/tools/bench/results/m12-bench-plb.json  --verbose
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime sys --workloads emqx --out-file erts_rust/tools/bench/results/m12-bench-emqx.json --verbose
+
+# F. §3.10/§3.9 run-route latency probes — direct beam_rt CLI (HEAD vs the m10 binary vs HEAD-with-empty-boot;
+#    send_recv / send_recv_plain / etf / ets / -boot / -version); NOT a report — see results/m12-run-route-latency.md
+# G. §3.4 foreign A/B + growth ladder — direct beam_rt run on bench_foreign_driver:enc/1, interleaved 5 passes
+#    at N=5000/10000/25000/60000 bracketed by two N=0 runs per pass, head vs $TMPDIR/m10wt (b4593818b3);
+#    plus the b54/b55-shape driver A/B pair — see results/m12-foreign-regression.md
+
+# H. compare artifacts (the tool diffs the mean)
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m12-bench-xrun.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m12-bench-xrun-interp.json \
+    erts_rust/tools/bench/results/m12-bench-xrun.json            # as-specified tier diff (form mismatch)
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m12-bench-xrun-interp.json \
+    erts_rust/tools/bench/results/m12-bench-xrun-quick.json      # MATCHED-form quick <-> quick
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-xrun.json \
+    erts_rust/tools/bench/results/m12-bench-xrun.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-external.json \
+    erts_rust/tools/bench/results/m12-bench-external.json
+```
+
+Each diff's stdout was written to the correspondingly named `results/m12-compare-*.txt`. Workloads were run **serially** — one benchmark process at a time (A → B → C → D → E → F → G). Archived copies carry only the two mechanical normalisations (`runtimes[].program` worktree prefix → `erts_rust/target/release/beam_rt`; a scratch `$TMPDIR` prefix in `notes` → `$TMPDIR/`). **No metric value was altered.**
 
 ## 3. Cross-runtime results (system ERTS vs Rust ERTS)
 
-`sys` = **system ERTS**, OTP 29.1.1 with the JIT. `rust` = **`beam_rt`**, release, at its **default execution tier**: a working runtime whose per-process tier **defaults to the native baseline JIT** (`JitMode::Auto` ⇒ `Tier::BaselineJit` on the process's first entry, remembered across pre-emptions and suspends; `BEAM_RT_TIER=interpreter` is the only kill switch), with anything outside the modelled `genop.tab` surface returning a typed `unsupported`/`BeamError` rather than a wrong result. Its runtime path compiles **per function, lazily** on a function's first entry (`../../crates/beam_engine/src/jit/baseline/code.rs`) — never whole-module; the tier effect and the one-shot cold start are in §3.9.
-All tables in this section come from the **focused `xrun`** (`results/m11-bench-xrun.json`, `--full --runtime all`, 1-min load 6.04 → 2.98), which runs the six cross-runtime workloads back to back: **12/12 rows `ok`**.
+Source: `m12-bench-xrun.json` (`--full --runtime all`, six `Runtimes::Both` workloads, both runtimes, **12/12 rows `ok`**, wall 1 795 s, load 65.28 → 6.93). The marginals (`*_ns_*`) are the load-robust signal; the `rust` walls are boot-dominated (§3.9/§3.10).
 
 ### 3.1 Startup latency — `baseline` (n = 50, ms)
 
-| stat | sys (system ERTS) | rust (`beam_rt`, default tier) | rust/sys |
+| statistic | sys (system ERTS) | rust (`beam_rt`, default tier) | rust/sys |
 |---|---|---|---|
-| min | 95.28 | 14.65 | 0.154× |
-| **mean** | **112.81** | **15.21** | **0.135× (rust 7.42× faster)** |
-| p50 | 113.06 | 15.20 | 0.134× |
-| p90 | 122.78 | 15.59 | 0.127× |
-| **p99** | **137.51** | **15.92** | **0.116× (rust 8.64× faster)** |
-| max | 143.52 | 16.11 | 0.112× |
+| mean | 120.6697 | 2 298.6279 | **19.05×** |
+| p50 | 116.3115 | 2 281.1683 | — |
+| p99 | 177.8934 | 2 741.1984 | — |
 
-Rust startup is both lower **and far flatter** (14.7–16.1 ms across 50 samples). This is not bare interpreter boot against a like start: the oracle is a 14-scheduler SMP VM whose boot loses much more to the contended/oversubscribed host, while a `beam_rt` process is a small single-threaded binary that resolves its code path **natively from the filesystem**, with no `erl` spawn (§6.2). The whole-process figures are therefore the trustworthy cross-runtime startup comparison.
+**This row is reversed from m11 (0.135×) and the single largest m12 move**: the `run`-route boot now drives the full `bootstrap/bin/start` script, adding **~2.1 s fixed** to every rust process (§3.10). It is **boot, not execution** — the per-op marginals below cancel it (§3.8) — and it is **OPEN** (`beam_rt`).
 
 ### 3.2 Fixed compute loop + VM memory — `baseline` (n = 5)
 
-| metric | sys (system ERTS) | rust (`beam_rt`) | rust/sys |
+| metric | sys | rust | ratio |
 |---|---|---|---|
-| `compute_loop_ms` p50 | 175.51 | 56.95 | 0.325× |
-| `compute_ops_per_sec` | 5 675 957 | 17 049 597 | 3.00× (rust faster) |
-| `vm_memory_total_bytes` (`erlang:memory(total)`) | 36 221 440 B (34.55 MiB) | **805 458 B (786.6 KiB)** | **44.97× lower** |
-| peak RSS (`VmHWM`, whole workload) | 135 761 920 B (129.5 MiB) | 31 793 152 B (30.3 MiB) | 4.27× lower |
+| `compute_loop_ms` (mean) | 181.7306 | 2 272.2808 | 12.50× (boot-dominated) |
+| `compute_ops_per_sec` | 5 502 651.77 | 440 086.45 | rust **0.080×** |
+| `vm_memory_total_bytes` | 36 211 168 B | 15 892 346 B | rust **2.28× lower** |
+| `peak_memory_bytes` (process RSS) | 134 971 392 B (128.7 MiB) | 408 072 192 B (389.2 MiB) | rust 3.02× higher |
 
-The loop is `-eval 'S = lists:sum(lists:seq(1,1000000)), io:format("~p~n",[S]), halt().'` and runs under **both** runtimes.
-**Caveat — read this loop as the native floor, not interpreter throughput.** It is dominated by the natively-served `lists:seq/2` + `lists:sum/1`; the execution-bound signal is §3.4–3.7.
-`vm_memory_total_bytes` is a **separate** metric from the OS `peak_memory_bytes` (§6.5) and is never conflated with it: `beam_rt` serves `erlang:memory/0,1` through the `MemoryHook` seam, and the two runtimes are not reporting the same quantity (OTP's `total` includes allocator arenas and preloaded code; `beam_rt`'s is its much smaller in-process heap).
+The compute loop is dominated by the natively-served `lists:seq/2` + `lists:sum/1` **inside an ~2.1 s boot**; read it as the native floor plus boot, not as execution throughput (that is `list_walk`/`foreign`). `vm_memory_total_bytes` is the runtime's *own* view (`erlang:memory(total)`; `beam_rt` serves it through its `MemoryHook` seam) and stays **2.28× lower** than the oracle's.
 
 ### 3.3 `slice` — the same nine compiled programs under both runtimes (n = 25/case)
 
-Every case printed the **same** stdout under both runtimes (the report's `observed stdout:` note: `add=5 fib=6765 pick=2 calendar_last_day=29 queue_from_size=3 gb_trees_size=5 base64_encode_size=8 ordsets_from_size=3 string_str_length=5`).
+`case_<name>_wall_ms` mean (one process per case, so the whole wall includes the rust boot):
 
-Wall time, **mean** (ms); per-case peak RSS, **p50** (MiB, base 2):
+| case | sys | rust | rust/sys | sys RSS p50 (MiB) | rust RSS p50 (MiB) |
+|---|---|---|---|---|---|
+| `add` | 141.6530 | 2 270.3911 | 16.03× | 66.08 | 376.25 |
+| `fib` | 134.3435 | 2 356.7838 | 17.54× | 66.32 | 376.27 |
+| `pick` | 141.0300 | 2 366.6399 | 16.78× | 66.32 | 376.27 |
+| `calendar_last_day` | 137.1116 | 2 290.9699 | 16.71× | 66.30 | 376.25 |
+| `queue_from_size` | 132.3285 | 2 175.5374 | 16.44× | 66.65 | 376.33 |
+| `gb_trees_size` | 132.0817 | 2 148.8423 | 16.27× | 66.38 | 376.26 |
+| `base64_encode_size` | 136.3259 | 2 140.5912 | 15.70× | 66.40 | 377.30 |
+| `ordsets_from_size` | 135.4466 | 2 101.3880 | 15.51× | 66.21 | 376.25 |
+| `string_str_length` | 152.7097 | 2 097.6393 | 13.74× | 66.49 | 376.68 |
 
-| case | sys (system ERTS) wall | rust (`beam_rt`) wall | rust/sys wall | sys RSS | rust RSS | sys/rust RSS |
-|---|---|---|---|---|---|---|
-| `add` (fixture) | 120.66 | 15.35 | 0.127× | 66.39 | 14.50 | 4.58× |
-| `fib` (fixture, n=20) | 118.85 | 15.63 | 0.132× | 66.49 | 15.20 | 4.38× |
-| `pick` (fixture) | 118.79 | 15.46 | 0.130× | 66.11 | 15.16 | 4.36× |
-| `calendar_last_day` | 121.84 | 16.34 | 0.134× | 66.44 | 16.04 | 4.14× |
-| `queue_from_size` | 120.53 | 21.02 | 0.174× | 66.46 | 17.99 | 3.69× |
-| `gb_trees_size` | 119.78 | 16.56 | 0.138× | 66.34 | 16.01 | 4.14× |
-| `base64_encode_size` | 120.58 | 17.23 | 0.143× | 66.27 | 17.20 | 3.85× |
-| `ordsets_from_size` | 122.52 | 15.96 | 0.130× | 66.22 | 15.75 | 4.21× |
-| `string_str_length` | 121.60 | 37.85 | **0.311×** | 66.36 | 26.30 | 2.52× |
-
-Whole-workload peak RSS: sys **71 741 440 B (68.4 MiB)** / rust **27 758 592 B (26.5 MiB)** (2.58× lower).
-
-**Read the wall column as *whole-process*, not *execution*.** Each case is a single call per process, so the wall time is dominated by process boot; six of the nine also call a *system* module. Per-case `rust` peak RSS **is** the like-for-like per-process memory comparison (one call per process, no loop accumulation): rust **14.5–26.3 MiB** vs sys **66.1–66.5 MiB** (2.52×–4.58× lower).
-The `string_str_length` row is the family's **one-shot cold-start** case — the first entry pulls in a large Erlang module graph — and it is the one row well above the ~15–16 ms boot floor (§3.9). **The m10 system-module regression is gone:** m10 rust walls 15.38–48.12 ms → m11 15.35–37.85 ms (`gb_trees_size` 25.12→16.56, `base64_encode_size` 26.68→17.23, `ordsets_from_size` 26.15→15.96, `queue_from_size` 26.00→21.02, `string_str_length` 48.12→37.85; §7.2 and §8 item 7).
+Whole-workload `peak_memory_bytes`: sys 72 368 128 B (69.0 MiB) → rust 395 730 944 B (377.4 MiB). **Every rust wall is ~2.1 s + ~0–0.3 s**: the spread across the nine cases (2 097–2 367 ms) is the *execution* cost and is small, while the constant is the boot (§3.10). The rust RSS is the boot's resident preloaded-module set. `slice`'s 9/9 `ok` on both sides confirms every case's stdout (recorded in `observed stdout:` notes).
 
 ### 3.4 `foreign` — real Cowboy / EMQX modules, per-call cost under both runtimes
 
-The workload that measures the Rust runtime on *real target-project source* (`cowboy/src/cowboy_bstr.erl`, `apps/emqx/src/emqx_base62.erl`), compiled **once** with the system `erlc` and executed under both runtimes.
-`ns/call` is the startup-cancelled marginal `(mean wall@N − mean wall@0) / N` (n = 10 samples each); `N` is per runtime so both marginals clear the timer noise. `wall_ms` is **not** comparable across runtimes (different `N`); `startup_ms` is. **The rust `ns/call` cells below are inflated by the N-dependence resolved underneath.**
+Each case is startup-cancelled: `ns_per_call = (mean wall@N − mean wall@0)/N × 1e6` over `--full` (n = 10 samples/case; `N` per case per runtime, recorded as `case_*_calls`).
 
-| case (real function) | N sys / rust | sys ns/call | rust ns/call | rust/sys | startup p50 sys / rust (ms) | RSS p50 sys / rust (MiB) |
+| case | sys ns/call | rust ns/call | **rust/sys** | calls sys / rust | sys RSS p50 | rust RSS p50 |
 |---|---|---|---|---|---|---|
-| `cowboy_bstr:to_lower/1` | 1 500 000 / 20 000 | 344.97 | 23 751.07 | **68.85×** | 118.62 / 22.99 | 66.64 / 74.53 |
-| `cowboy_bstr:capitalize_token/1` | 1 500 000 / 15 000 | 325.00 | 28 757.00 | **88.48×** | 118.70 / 15.42 | 66.12 / 76.95 |
-| `emqx_base62:encode/1` | 3 000 000 / 25 000 | 210.23 | 77 167.32 | **367.06×** | 114.42 / 15.33 | 66.28 / 62.68 |
-| `emqx_base62:decode/1` | 3 000 000 / 15 000 | 320.82 | 19 306.39 | **60.18×** | 123.04 / 15.13 | 66.49 / 63.51 |
+| `bstr_to_lower` | 419.7725 | 23 429.8831 | **55.82×** | 1 500 000 / 20 000 | 66.34 MiB | 438.46 MiB |
+| `bstr_capitalize_token` | 361.5712 | 22 901.0619 | **63.34×** | 1 500 000 / 15 000 | 66.18 MiB | 441.27 MiB |
+| `emqx_base62_encode` | 231.6157 | 15 502.6789 | **66.93×** | 3 000 000 / 25 000 | 66.34 MiB | 427.41 MiB |
+| `emqx_base62_decode` | 383.9592 | 14 919.3416 | **38.86×** | 3 000 000 / 15 000 | 66.38 MiB | 427.98 MiB |
 
-All four cases ran under both runtimes (`4 ok, 0 unsupported`) and produced the same stdout (`sys`: `bstr_to_lower=45000000 bstr_capitalize_token=45000000 emqx_base62_encode=48000000 emqx_base62_decode=33000000`; `rust`: `600000 / 450000 / 400000 / 165000` = `N × per_call`).
+**The Θ(N³) regression is FIXED and the band is corrected to 38.9×–66.9×** (m11 published 60.2×–367.1×). Two independent instruments agree:
 
-**This is the execution-bound result.** Startup is comparable while the *per-call* cost of a real foreign function is **~60×–367×** higher under `beam_rt`. The gap is a **real runtime cost, not a harness artifact**: the startup-cancelled marginal reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>`. It is a `beam_rt` per-call host-context cost, not the engine's per-instruction dispatch (§3.8).
+- **The driver `--quick` pair re-derived this milestone** (`m12-foreign-ab-{head,m10}.json`, b54/b55 shape, matched `N`): `bstr_to_lower` 18 525.83 vs 18 820.20 (**0.98×**), `bstr_capitalize_token` 22 245.98 vs 24 798.49 (**0.90×**), `emqx_base62_encode` 16 628.83 vs 18 286.00 (**0.91×**), `emqx_base62_decode` 15 341.64 vs 17 587.02 (**0.87×**) — i.e. **head ≈ 0.87×–0.98× of the m10 binary**, flat, no super-linearity.
+- **The direct `bench_foreign_driver:enc/1` ladder** (interleaved 5 passes, head vs `$TMPDIR/m10wt`, each pass bracketed by two `N=0` startup runs so startup cancels; load `6.72 → 5.73`) gives startup-cancelled µs/call at `N` = 5 000 / 10 000 / 25 000 / 60 000: **m10** 13.64 / 12.46 / 17.31 / 28.44 (mean) vs **head** 16.20 / 14.72 / 17.15 / 28.23 ⇒ **head/m10 = 1.19 / 1.18 / 0.99 / 0.99** (median **0.99** at both 25 000 and 60 000); sub-cases at `N` = 25 000: `cap` 22.64 vs 24.36 µs (**0.93×**), `dec` 15.19 vs 17.00 µs (**0.87×**). At m11 the same head showed ≈729 µs/call at `N` = 25 000 — a **~30× collapse**.
 
-> **RESOLVED at b54 — the `ns_per_call` row is `N`-dependent *and* carries a genuine regression (root-caused, owned outside this node).**
->
-> **(i) The metric is N-dependent.** On the Rust runtime the per-call cost *itself* grows with `N` (measured super-linear), so `case_<name>_ns_per_call` is only a clean marginal at the declared `N` and is **only comparable across runs that used the same `N`**. The `sys` oracle rows are ~flat over the same range (210.23–344.97 ns/call), so this is not oracle drift. The workload now records the `N` behind every marginal — `case_<name>_calls = N`, mirroring `copy_bound`'s `case_<name>_ops` — and the Rust row carries an explicit N-dependence note, so the caveat is machine-visible and never hidden behind the number.
-> **(ii) The m10→m11 headline is a GENUINE regression at matched `N`.** The case table's `n_rust` (20 000 / 15 000 / 25 000 / 15 000) is **unchanged since m10**, so the m11 A/B was taken at **matched `N`** — it is *not* an `N`-mismatch artifact. A controlled **interleaved A/B** on this host (identical program, identical `N`, alternating the m10 (`b4593818b3`) and HEAD `beam_rt` binaries; loadavg 13.4–13.7 during the enc/lower rounds) measured: `enc` at `N` = 25 000 → HEAD 2105 / 2288 / 2105 ms vs m10 467 / 462 / 463 ms ⇒ **≈4.6× slower**; `enc` at `N` = 60 000 → HEAD 23 381 / 26 064 ms vs m10 1 876 / 2 039 ms ⇒ **≈12.5× slower**; `lower` ≈**1.25×**; `dec` ≈**1.35×**; `cap` **parity**. The committed `--quick` driver A/B (`results/b54-foreign-ab-{m10,head}.json`) reproduces the `enc` effect at the declared `N`: `enc` 84 873.04 vs 16 964.14 ns/call (**5.00×**), `lower` 24 240.25 vs 19 546.41 (1.24×), `cap` 28 326.86 vs 23 289.89 (1.22×), `dec` 21 046.50 vs 17 147.75 (1.23×). **Load-noise caveat:** the two `--quick` reports were taken as separate `bench run` invocations (not per-case interleaved), so its three minor-case deltas (~1.2–1.24×) sit inside the host-load band and are **not** individually load-independent — indeed the per-case interleaved A/B above reads `cap` at **parity**, not 1.22×. The load-independent signature is the `enc` delta, which grows monotonically with `N` in the interleaved curve (2.1×@N=2 000 → 3.8×@20 000 → 8.7×@50 000), and that is what the root cause predicts. Cite the minor cases only as "≈1.2×, within noise", never as firm per-case regressions. The direct `enc` growth curve (`results/b54-foreign-growth-curve.md`) shows HEAD ≈12.5 µs@N=2 000 → 21.9@10 000 → 77.1@25 000 → 260.8@50 000 → 1090@100 000 µs/call (total ≈ `N³`), while m10 stays ~flat (13–33 µs) across the same range.
-> **(iii) Root cause (owner OUTSIDE this node — `beam_rt`/`beam_process`, reported upward).** Commit **`e59dd30432`** ("beam_rt/runner: register a process's engine-built off-heap refc binaries onto its own off-heap table", 2026-10-14 07:49, after m10, in HEAD) adds a **per-slice** loop at `erts_rust/crates/beam_rt/src/runner/run.rs:581-585` that registers **every** payload of the engine's never-cleared `refc_binaries` reservoir (`erts_rust/crates/beam_engine/src/machine/mod.rs:241`) on **every** slice. `Process::register_off_heap_binary` → `owned_binary_slot` (`erts_rust/crates/beam_process/src/process.rs:927-935`) is an O(slots) linear scan and the slot space grows monotonically with those registrations ⇒ **Θ(N³)**. It fits the default-tier curve and the interpreter series `c·N³` (`c≈1.05e-8 ms`: `N`=4 000 → 672 ms predicted vs 711 measured; `N`=20 000 → 84 000 vs 84 088 measured). At m10 the reservoir was consumed only on the `Returned`/`Err` arms (once per process life) ⇒ linear. **Fix shape (owner's call):** a per-engine registration **cursor** (register only newly-added payloads) and/or an O(1) slot lookup.
-> **(iv) Tier-independent.** The `BEAM_RT_TIER=interpreter` tier is **also** super-linear at HEAD (`enc` ≈30/60/172 µs/call at `N` = 1 000/2 000/4 000) while m10-interpreter is ~flat ⇒ the culprit is shared by both tiers, **not** the baseline-JIT emitter. Evidence: `results/b54-foreign-growth-curve.md`.
->
-> **Framing preserved:** the `foreign` **60.2×–367.1×** band in this section is **inflated by this effect** and is *not* a clean cross-runtime ratio; the clean per-unit execution-throughput band is `copy_bound` / `list_walk` / `gc_bound` (§3.8). Evidence it is not a workload-program change: the foreign sources are unchanged (cowboy HEAD `c965d1a`, emqx HEAD `02eaa91831`; both `.erl` files dated 2026-10-05).
-**`foreign` peak RSS is not a like-for-like memory comparison — see §6.7.**
+The residual `rust` cost is now **flat in `N`** (the fix) and consists of the per-call Rust host-context cost (the `beam_rt` per-call dispatch, owned by `../../crates/beam_rt/PERF.md`), not a per-slice registration loop. **Caveat kept:** `ns_per_call` is a snapshot at the declared `N`, and the rust peak RSS (~427–441 MiB) is **boot-dominated**, not a like-for-like memory comparison (§6.7). Full narrative: `results/m12-foreign-regression.md`.
 
 ### 3.5 `list_walk` — the per-element dispatch-throughput metric (n = 10/case)
 
-A **BIF-free** body-recursive walk (`walk(N)` sums a 1000-element list `N` times; `build/2` makes the list once per process) runs under both runtimes; the reported figure is the startup-cancelled **ns per walked element**.
+| metric | sys | rust | rust/sys |
+|---|---|---|---|
+| `case_list_walk_ns_per_element` | 7.6021 | 110.2061 | **14.50×** |
+| `case_list_walk_elements` (deterministic) | 100 000 000 | 1 000 000 | per-runtime `N` |
+| `case_list_walk_peak_rss_bytes` p50 | 65.74 MiB | 376.48 MiB | boot-inflated |
 
-| runtime | `N` (walks) | elements walked | `ns_per_element` | `wall_ms` mean | `startup_ms` mean | peak RSS p50 |
-|---|---|---|---|---|---|---|
-| `sys` (system ERTS) | 100 000 | 100 000 000 | **2.4194** | 360.64 | 118.70 | 66.34 MiB |
-| `rust` (`beam_rt`) | 1 000 | 1 000 000 | **45.9731** | 61.41 | 15.44 | 15.21 MiB |
-
-`case_list_walk_elements` (the deterministic, contention-immune companion metric) is `1×10⁸` for sys and `1×10⁶` for rust; each run printed the deterministic constant `N × 500 500` (`rust`: `list_walk=N*500500=500500000`, `sys`: `…=50050000000`).
-`ns/element` gives a **19.00×** rust/sys ratio — the narrowest it has ever been (**65.5×** in m9, **22.1×** in m10): the m10 baseline-JIT Y-slot arithmetic + continuation sub-blocks cut the Rust per-element cost **158.83 → 47.39 ns** and m11 shaved it again to **45.97 ns** (−2.99 %, §7.1).
+A BIF-free, non-tail-recursive `sum/1` over a 1000-element list (~7 dispatched instructions per element). The rust marginal **rose** vs m11 (45.97 → 110.21 ns/element, +139.72 %) although the loop's per-element path did not change at this commit: the startup-cancelled subtraction now removes an **~2.1 s, high-jitter** startup from a short wall, so a few ms of jitter dominate at `--full`'s sample count — an instrument-side inflation of the **OPEN** boot defect, not a dispatch regression (the interp tier control measured 235.05 ns/element under the same subtraction).
 
 ### 3.6 `copy_bound` — the copy boundary: ETF, ETS and process send/receive (**four** cases, n = 10/case)
 
-**Four** copy-boundary cases under both runtimes, each validating its own round-trip with a bound-variable pattern: an **ETF** `term_to_binary`/`binary_to_term` round trip, an **ETS** `ets:insert` + `ets:lookup` round trip, a **two-process send/receive** copy (`send_recv`), and the **delivery-only** variant (`send_recv_plain`, the payload replied directly with **no** ETF leg in the receiver — new at m11). All four are startup-cancelled `ns/op`; the `ops` counter is deterministic.
+| case | sys ns/op | rust ns/op | **rust/sys** | ops sys / rust | sys RSS p50 | rust RSS p50 |
+|---|---|---|---|---|---|---|
+| `etf_roundtrip` | 738.6382 | 35 369.2113 | **47.88×** | 1 500 000 / 5 000 | 66.32 MiB | 382.61 MiB |
+| `ets_copy` | 289.5147 | 2 883.7548 | **9.96×** | 2 000 000 / 100 000 | 66.28 MiB | 450.01 MiB |
+| `send_recv` | 1 584.3631 | 25 632 422.2283 | **16 178.4×** | 500 000 / 2 000 | 66.37 MiB | 384.32 MiB |
+| `send_recv_plain` | 662.1843 | **— (failed: 60 s `RUN_DEADLINE`)** | — | 1 000 000 / — | 66.43 MiB | — |
 
-| case | op | sys ns/op | rust ns/op | rust/sys | ops sys / rust | sys RSS p50 (MiB) | rust RSS p50 (MiB) |
-|---|---|---|---|---|---|---|---|
-| `etf_roundtrip` | `term_to_binary` / `binary_to_term` | 650.4860 | 7 033.39 | **10.81×** | 1 500 000 / 5 000 | 66.21 | 19.25 |
-| `ets_copy` | `ets:insert` + `ets:lookup` | 236.9251 | 2 435.07 | **10.28×** | 2 000 000 / 100 000 | 66.91 | 90.39 |
-| `send_recv` | two-process send/receive copy (with the ETF leg) | 1 453.3740 | 21 522.24 | **14.81×** | 500 000 / 2 000 | 66.57 | 21.05 |
-| `send_recv_plain` | two-process delivery only (no ETF leg) | 653.7492 | 20 075.24 | **30.71×** | 1 000 000 / 2 000 | 66.64 | 21.16 |
+Whole-workload `peak_memory_bytes`: sys 71 745 536 B (68.4 MiB) → rust 472 117 248 B (450.2 MiB). The row is `ok` with **3 ok, 0 unsupported (of 4)** on the rust side and 4/4 on the sys side; `send_recv_plain`'s rust case is recorded as a **failure** (verified 60 s deadline), so **no metric is fabricated**. Its wall in the probe ladder was 77 586 ms with exit 1 and empty stdout.
 
-All four ran under both runtimes (`4 ok, 0 unsupported`) with identical stdout (`sys`: `etf_roundtrip=1500000 ets_copy=2000000 send_recv=500000 send_recv_plain=1000000`; `rust`: `5000 / 100000 / 2000 / 2000` = `N × 1`).
-`ets_copy` is the cheapest boundary for the oracle, and its rust/sys ratio (10.3×) is **the narrowest in the whole suite together with `etf_roundtrip` (10.8×)**; `etf_roundtrip` fell **15.1× → 10.8×** vs m10 (−28.51 % rust ns/op, a code-attributable move, §7.2) and is now the narrowest copy ratio. **Two-process delivery is now the dearest rust copy boundary**: `send_recv_plain` (the delivery-only case) is **30.71×** the oracle, and `send_recv` (which also runs the ETF leg) is **14.81×** — on rust the whole delivery *is* the cost (the ETF leg adds only ≈1.4 µs/op on rust, 21 522 − 20 075, vs ≈0.80 µs/op on sys, 1 453.37 − 653.75; §8 item 4). `send_recv`'s rust cost fell **72.93 %** vs m10 (79 518.12 → 21 522.24 ns/op), closing the m10 baseline-JIT message-passing imbalance (§7.2).
-**`copy_bound` rust peak RSS still grows with `N` — the `ets_copy` row (N = 100 000) reaches 90.39 MiB vs sys 66.91 MiB (§6.7, §8 item 5).** Whole-workload peak RSS: sys **71 970 816 B (68.6 MiB)** / rust **94 973 952 B (90.6 MiB)** (1.32× *higher* for rust).
+`send_recv`'s 25.6 ms/op is the **~25.5 ms per-blocked-round** boot effect, and `etf_roundtrip`'s +402.88 % vs m11 is the **Θ(atom-table) `binary_to_term`** boot effect (the atom table grows ~70 → ~4 100) — both **OPEN**, both `beam_rt` (§3.10). `ets_copy` (9.96×) is the only copy case that is *not* boot-limited; its rust RSS (450 MiB, the largest) is the `Nursery.retired` per-op retention (§6.7).
 
 ### 3.7 `gc_bound` — allocate-and-abandon churn (n = 10/case)
 
-`churn(N)` allocates and immediately abandons a 256-element list, a 256-byte binary and a 256-element tuple, `N` times; the reported figure is the startup-cancelled `ns/op`.
+| metric | sys | rust | rust/sys |
+|---|---|---|---|
+| `case_churn_ns_per_op` | 4 658.7133 | 184 398.8576 | **39.58×** |
+| `case_churn_ops` (deterministic) | 200 000 | 2 000 | per-runtime `N` |
+| `case_churn_peak_rss_bytes` p50 | 66.54 MiB | 376.53 MiB | boot-inflated |
 
-| runtime | `N` (churns) | `churn_ns_per_op` | `wall_ms` mean | `startup_ms` mean | peak RSS p50 |
-|---|---|---|---|---|---|
-| `sys` (system ERTS) | 200 000 | **4 270.1253** | 977.40 | 123.37 | 66.66 MiB |
-| `rust` (`beam_rt`) | 2 000 | **128 524.4542** | 272.60 | 15.55 | **15.43 MiB** |
-
-`case_churn_ops` (deterministic) is `200 000` (sys) / `2 000` (rust); each run printed `churn=N*1` (matching its `N`).
-The rust/sys ratio is **30.10×**. This row measures the allocate-and-abandon **wall time**; whether a runtime's collector actually runs during the loop is its own admission policy and is **not claimed here** (the report's own note says the same).
-The rust peak RSS stays **below** the oracle's (15.43 vs 66.66 MiB p50) and the per-op cost fell a further **12.68 %** vs m10 (147 194.37 → 128 524.45, §7.2).
+Each iteration builds and abandons three 256-element structures (a pure-Erlang list, a 256-byte binary, a tuple) and checks the two O(1)-checkable sizes — a silently dropped allocation fails loudly. The row measures **allocate-and-abandon wall time and claims no collection count**.
 
 ### 3.8 Reading the cross-runtime numbers
 
-- **Startup / whole-process cost is the trustworthy cross-runtime comparison** (§3.1, §3.3): rust is 7.42× faster at `baseline` startup (mean) and 3.21×–7.86× faster per `slice` case, with 2.58× lower per-process peak RSS. A `beam_rt` process starts in ~15.2 ms.
-- **The startup-cancelled marginals are the per-unit execution-throughput signal** (§3.4–3.7), and they point the other way: rust costs **10.3×–367.1×** more per op/call/element. `copy_bound` **10.3×–30.7×**, `list_walk` **19.0×**, `gc_bound` **30.1×** are the stable band (narrower than m10); `foreign` **60.2×–367.1×** is inflated by the N-dependent effect above (§3.4, §8 item 1). That residual is a `beam_rt` per-call runtime cost, not the engine's per-instruction dispatch (next bullet).
-- **Only `slice` gives a like-for-like peak-RSS comparison** (§6.7). `foreign` / `list_walk` / `copy_bound` / `gc_bound` rust peak RSS still grows with the per-runtime loop count `N`.
-- The gap is a **`beam_rt` per-call host-context cost**, not `beam_engine` instruction dispatch: the engine's own side of a BIF call is `~11–12 ns` (`../../crates/beam_engine/tests/bif_cost.rs`), i.e. **≲0.15 %** of the runtime's per-call figure, so **~99.85 % is HOST-side** (`beam_rt`'s `ExecutionContext::call_bif`, `../../crates/beam_rt/src/context/calls.rs`). The runtime-side figures are owned by `../../crates/beam_rt/PERF.md` and `../../crates/beam_rt/CONTEXT.md`, not `bench` output.
-- **The `slice` whole-process column includes a one-shot cold start, and that cold start is bounded** (§3.9): the runtime path lowers a function on its first entry, so a process that enters a large Erlang module graph pays the first-entry compile cost rather than a whole-module compile.
+- **The marginals are the cross-runtime signal.** `foreign`/`list_walk`/`copy_bound`/`gc_bound` are startup-cancelled per-unit costs, so the ~2.1 s rust boot cancels on both sides *by construction*; that is why they remain the only clean rust-vs-sys comparison at this commit.
+- **The `rust` whole-process walls are boot-dominated** (`baseline startup_ms`, `slice wall_ms`): read them as "boot + execution", not execution. At m11 the same rows read 0.135×/0.127×–0.311×; the change is entirely the OPEN boot defect (§3.10), not a slowdown of the workload programs.
+- **`vm_memory_total_bytes` is the runtime's own accounting** and is not comparable with `peak_memory_bytes` (external `VmHWM`): the first is 2.28× *lower* for rust, the second 3.02× *higher* (boot's resident set).
+- **Deterministic counters** (contention-immune): `copy_bound ops` = 1 500 000 / 2 000 000 / 500 000 / 1 000 000 (sys) and 5 000 / 100 000 / 2 000 (rust); `foreign calls` = 1 500 000 / 1 500 000 / 3 000 000 / 3 000 000 (sys) and 20 000 / 15 000 / 25 000 / 15 000 (rust); `list_walk elements` = 1e8 (sys) / 1e6 (rust); `churn ops` = 200 000 (sys) / 2 000 (rust). Per-runtime `N` differs by design (the rust loop count is chosen so the run stays affordable).
 
-### 3.9 One-shot cold start, and the **tier effect** (what the JIT default does and does not improve)
+### 3.9 The **tier effect** — what the JIT default does and does not improve (Rust vs Rust)
 
-Every `slice` case is a single call in a **fresh** `beam_rt` OS process (§3.3), so that wall column carries the cost of entering a system module for the first time. That cost is bounded by construction: the **runtime path** stages a **lazy** native artifact — one sealed mapping per function, lowered on that function's first entry of a `(func, pc)` (`../../crates/beam_engine/src/jit/baseline/code.rs`) — so a fresh process pays only for the functions it actually enters. The **eager** whole-module layout (`JitBackend::compile` / `CodeCache::get_or_compile`) exists for the whole-module introspection surface and for the `jit_bench` harness; it is **not** the runtime path. The module-graph-heavy `string_str_length` row is the family's visible cold-start case (rust 37.85 ms mean vs the ~15–16 ms boot floor, §3.3).
+Two `--quick` runs, same six workloads, `--runtime rust` only, read like-for-like
+(`m12-compare-tier-effect-quick.txt`; `a` = interpreter, `b` = default). **No `sys` rows exist in either file** — this is a tier effect, never a system-ERTS comparison.
 
-**The tier effect is a Rust-vs-Rust comparison — it is NOT a comparison against the system ERTS.** The default `beam_rt` tier is the native baseline JIT; `BEAM_RT_TIER=interpreter` forces the interpreter. The delta between those two *Rust* columns is the **tier effect** (the JIT making the *Rust* runtime's own interpreter work cheaper, or occasionally dearer). At m11 the control was run as a **matched-form `--quick` pair** — `results/m11-bench-xrun-interp.json` (interpreter) vs `results/m11-bench-xrun-quick.json` (default), archived as `results/m11-compare-tier-effect-quick.txt`:
-
-| workload | metric | rust `BEAM_RT_TIER=interpreter` | rust default (baseline JIT) | interp/default |
+| workload | metric | interpreter | default (baseline JIT) | interp/default |
 |---|---|---|---|---|
-| `baseline` | `startup_ms` | 17.3247 | 37.5050 | 0.462× (default dearer — see note) |
-| `baseline` | `compute_loop_ms` | 63.6089 | 99.0786 | 0.642× (noise; native `lists:seq/sum` floor) |
-| `list_walk` | `ns_per_element` | 159.6008 | 47.4465 | **3.36×** (default cheaper) |
-| `gc_bound` | `churn` ns/op | 243 176.0348 | 123 688.7103 | **1.97×** (default cheaper) |
-| `copy_bound` | `etf_roundtrip` ns/op | 6 759.9803 | 7 496.9099 | 0.90× (interpreter marginally cheaper) |
-| `copy_bound` | `ets_copy` ns/op | 3 313.9438 | 2 344.7269 | **1.41×** (default cheaper) |
-| `copy_bound` | **`send_recv` ns/op** | 22 654.6925 | **22 054.4402** | **1.03× — parity** |
-| `copy_bound` | **`send_recv_plain` ns/op** | 18 662.4402 | **19 330.4250** | **0.97× — parity** |
-| `foreign` | 4 cases ns/call | 2 832 121–4 178 832 | 19 191–76 967 | **50×–177×** (default cheaper — **interpreter pathology, see below**) |
-| `slice` | 9 cases wall_ms | 20.5–33.8 | 17.1–42.1 | 0.79×–1.49× (mixed; startup noise, no stable tier effect) |
+| `baseline` | `startup_ms` | 1 959.5795 | 2 086.4559 | 0.939× |
+| `baseline` | `compute_loop_ms` | 1 991.3159 | 2 137.2065 | 0.932× (native floor; noise) |
+| `baseline` | `vm_memory_total_bytes` | 15 895 354 | 15 892 346 | **1.000× (parity)** |
+| `list_walk` | `ns_per_element` | 235.0513 | **absent** (note: `marginal below timer resolution`) | — |
+| `gc_bound` | `churn` ns/op | 308 835.7985 | **148 964.3747** | **2.07× (default cheaper)** |
+| `copy_bound` | `etf_roundtrip` ns/op | 44 170.6459 | 44 687.5942 | 0.988× (parity) |
+| `copy_bound` | `ets_copy` ns/op | 2 996.3663 | 3 014.0485 | 0.994× (parity) |
+| `copy_bound` | **`send_recv` ns/op** | 25 516 698.9983 | 25 537 116.8888 | **0.999× — parity** |
+| `copy_bound` | `send_recv_plain` ns/op | **timed out (60 s)** | **timed out (60 s)** | — (no metric, either tier) |
+| `foreign` | 4 cases ns/call | 21 458–37 786 | 15 449–21 014 | 1.03×–1.80× (default cheaper) |
+| `slice` | 9 cases wall_ms | 2 021–2 104 | 2 101–2 165 | 0.95×–1.06× (boot-dominated) |
 
-**The requested `copy_bound` rows, with direction:**
-- **`send_recv`** (`a` = interpreter): **22 654.6925 → 22 054.4402 ns/op, Δ = −600.25 (−2.65 %)** — the default tier is now marginally *cheaper*; the two tiers are at **parity**.
-- **`send_recv_plain`**: **18 662.4402 → 19 330.4250 ns/op, Δ = +667.98 (+3.58 %)** — the default tier is marginally *dearer*; again **parity** (the two cases differ by ~3.6 % in *both* directions, i.e. within run-to-run scatter).
+Three facts to carry forward:
 
-These two cases are the ones with a genuinely matched, same-tier sample count, so the parity reading is solid. The other matched marginals agree on the default tier's direction: `list_walk` `ns_per_element` 159.6008 → 47.4465 (**−70.3 %**, default 3.36× cheaper), `gc_bound` churn 243 176.0348 → 123 688.7103 (**−49.1 %**, default 1.97× cheaper), `copy_bound` `ets_copy` −29.3 % and `etf_roundtrip` **+10.9 %** (the one metric where the interpreter is marginally cheaper). `slice` shows **no stable tier effect**: its per-case `wall_ms` includes a whole process startup per case, and in the matched pair 2 of 9 cases are 32–33 % cheaper under the default tier while 2 are ~25–26 % *dearer*, with the rest inside ±10 % — that spread tracks the per-process startup noise of the two `--quick` runs, not the tier.
+1. **`list_walk`'s default-tier `--quick` marginal is absent** — the honest note `case list_walk: marginal below timer resolution; no ns_per_element metric` is emitted (the marginal is swamped by the ~2.1 s boot's jitter at only 3 quick samples). The interpreter measured **235.05 ns/element** in the same form, and the `--full` default run measured **110.21** (§3.5): the direction (default cheaper) is established from those, not from a matched pair.
+2. **`send_recv_plain` timed out in both tiers** (the same 60 s deadline), so no tier pair exists for it (§3.10).
+3. **The m11 interpreter pathology is GONE.** At m11 the interpreter tier was super-linear on the `foreign` cross-module cases (up to 4 178 832 ns/call; a `--full` pass ≈50 min, hence m11's `--quick` control). At m12 the interpreter `foreign` rows are 21 458–37 786 ns/call and the whole interpreter `--quick` control finished in **391 s** — consistent with the Θ(N³) registration defect having been **fixed**: the m11 interpreter pathology was the *same* shared `beam_rt`/`beam_process` defect, not an interpreter-tier defect. The as-specified `m12-compare-tier-effect.txt` (interpreter `--quick` vs default `--full`) shows the same directions (`send_recv` +0.45 %, `list_walk` −53.11 %, `gc_bound` −40.29 %, `foreign` −19.9 % to −51.9 %, `etf_roundtrip` −19.93 %) and labels the `sys` rows `only-in-b` by construction.
 
-> **The m10 "inverted" row is GONE — the `send_recv` tier regression is CLOSED.** At m10 the same matched comparison had `send_recv` at **36 969.39 → 79 518.12 ns/op (default 2.15× *dearer*)**, a repeatable baseline-JIT message-passing cost; a focused `--quick` re-run even reproduced it at **3.31×**. At m11 it is **22 054 vs 22 655 ns/op — parity**. This is a **Rust-vs-Rust tier observation only** — the Rust-vs-system ratios live in the Verdict (c) table, §3.4 and §3.6, and are never the tier numbers. The m10→m11 window's `beam_engine` baseline-JIT **lowered `Send` and the receive-control family natively**, with `beam_message`'s dirty-heap send fast path and `beam_process`'s quiet-queue `service_signals` fast path (`CHANGE.md`, batch 52). **No Rust-vs-system-ERTS win is claimed here** — the `send_recv` rust/sys ratio is still **14.81×** (§3.6).
-> **Read the `baseline` rows of this table with care:** the matched `--quick` control happened to sample `startup_ms` (37.5 ms) far above the `--full` cross-runtime run's 15.2 ms and the interpreter run's 17.3 ms, i.e. that row is dominated by one noisy sample set on a shared host, *not* by a tier effect. `compute_loop_ms`'s spread is the same story (the loop is served natively on both sides).
-> **`foreign`'s 50×–177× rows are not a "JIT win"** — they are the plain-JIT baseline against the pathological interpreter described next; do not read them as a normal tier effect.
+### 3.10 `beam_rt`'s boot status and the **OPEN** `run`-route latency defect at this commit
 
-**Why the interpreter control is `--quick` (a measured at-this-commit fact).** At this commit the interpreter tier is **pathologically slow on the `foreign` cross-module calls**, and the cost is **super-linear in `N`**, not a constant multiplier. Direct `beam_rt -pa <scratch> run <drv.beam> <fn>/1 <N>` probes of the case-1 loop give: interpreter N=500 → 102 ms, N=1 000 → 158 ms, N=2 000 → 219 ms, N=4 000 → 711 ms, N=20 000 → **84 088 ms**; default tier N=500 → 35 ms, N=2 000 → 64 ms, N=20 000 → 514 ms. The m10 record's interpreter pass measured this case at **21 959 ns/call** and completed the whole six-workload `--full` tier control in **41 s**; m11 records **4 178 832 ns/call** at N=20 000 (`results/m11-bench-xrun-interp.json`), a **~190×** interpreter regression on this shape, and a `--full` interpreter pass would need **~50 min** of wall time on this host alone. The `--quick` form (3 samples/case) was therefore used for the interpreter control, and the matched-form default-tier run (`m11-bench-xrun-quick.json`) keeps the tier comparison like-for-like. The interpreter tier is **not** on `beam_rt`'s default path (`BEAM_RT_TIER=interpreter` is the only kill switch); this is recorded as a measurement fact. Its super-linear shape is the **same `beam_rt`/`beam_process` regression as §3.4/§8 item 1** (commit `e59dd30432`) — i.e. it is a shared-machinery defect, not an interpreter-tier defect (both tiers are measured super-linear in `b54-foreign-growth-curve.md`).
+Factual probe (full narrative, evidence and reproduction: `results/m12-run-route-latency.md`, **OPEN**):
 
-The **as-specified** artifact `results/m11-compare-tier-effect.txt` (interpreter `--quick` vs the default `--full` `m11-bench-xrun.json`) gives the same directions: `send_recv` 22 654.6925 → 21 522.2389 (−5.00 %), `send_recv_plain` 18 662.4402 → 20 075.2422 (+7.57 %), `list_walk` −71.19 %, `gc_bound` −47.15 %, `foreign` −98.0 % to −99.4 %, and the `sys` rows `only-in-b` by construction.
+```
+$ erts_rust/target/release/beam_rt -boot bootstrap/bin/start
+exit_code=0        wall ≈2.07–2.09 s
+Erlang/OTP 30 [erts-17.1] [source] [64-bit]
+```
 
-**Caveat — `jit_bench` pins the hot path, not this path.** The engine's `jit_bench` micro-benchmark drives the **eager** whole-module artifact only, so its interpreter → baseline-JIT speed-ups (`../../crates/beam_engine/MEASURED.md`) describe the hot path with the compile amortised away, and say nothing about the lazy runtime path's per-entry compile cost.
-The cited documents are **current-state** records — re-run their own commands for the live figures rather than quoting this summary. And the host-load caveat applies to them exactly as it does here (§6.1).
-
-### 3.10 `beam_rt`'s boot status at this commit (contract A.7)
-
-A factual probe, not a workload: at the measured commit **`erts_rust/target/release/beam_rt -boot bootstrap/bin/start` exits 3** and prints the single stderr line **`beam_rt: unsupported: opcode: run: process blocked (no message available)`**. The real `bootstrap/bin/start.boot` therefore stops at **directive 18 of 22** — **boot is NOT complete** and this document claims no boot completion anywhere. See §6.8.
+- **Boot COMPLETES** — exit **0**. (m11 recorded exit **3** on `opcode: run: process blocked (no message available)` at directive 18 of 22; **that m11 fact is obsolete**.)
+- **Fixed `run`-route startup ≈2.07–2.13 s** on HEAD (measured 2 111 / 2 101 / 2 084 ms for `run … 0`) vs **17–19 ms** on the m10 binary vs **18 ms** on HEAD with a synthetic empty boot script; `-version` still costs 2 ms. The delta is the boot script drive (commit `85ee33b2f8`).
+- **~25.5 ms per blocked round** at ~2 % CPU: `send_recv/1` N=0/200/400/2000 → 2 098 / 7 164 / 12 274 / 53 141 ms (user CPU 1.249 s at N=2 000), i.e. ≈25.5 ms per round; the m10 binary gave 19/50/80/248 ms. The booted kernel's `os:set_signal/2` self-pipe keeps `PortRegistry::has_nothing_to_poll()` false, so every blocked round sleeps the full `PORT_POLL_SLICE` = 25 ms (`crates/beam_rt/src/runtime/scheduler.rs`, `port.rs`). **This is what pushes `copy_bound send_recv` to 25.6 ms/op and `send_recv_plain` past its 60 s deadline** (§3.6).
+- **Θ(atom-table) ETF decode:** boot grows the atom table ~70 → ~4 100, so `binary_to_term`'s `prefix_matches` validation becomes Θ(table) — `copy_bound etf/1` N=5 000 took 2 404 ms on HEAD (0.642 s CPU) vs 56 ms with the empty boot and 79 ms on m10. This is the `etf_roundtrip` +402.88 % move (§7.1).
+- **Attribution:** root-caused to commit **`85ee33b2f8`** (boot drive) in `beam_rt`; already documented at `erts_rust/crates/beam_rt/src/runtime/CONTEXT.md:150` and `results/b55-foreign-regression-fix.md`. It is being fixed in parallel by another agent. **NOT attributable to any target project.**
 
 ## 4. System-ERTS target-project results (sys-only workloads)
 
-These are measurements of the **system ERTS / system toolchain** on the target projects.
-The Rust runtime cannot be scheduled on any of them (`Runtimes::SysOnly`, §5), so there is no Rust column — and **none of these numbers is a Rust-runtime result**; they are **reference** figures for the sys-only surfaces.
-All absolute values in this section are inflated by the varied host load (§1) and are **not comparable across runs**; §7 states each move explicitly.
+Source: `m12-bench-external.json` (`--full`, `erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`; **4/4 `ok`**), `m12-bench-plb.json` (`ok`), `m12-bench-emqx.json` (`skipped`). Per-target notes: `results/m12-tool-targets-notes.md`.
 
 ### 4.1 `plb` — Programming-Language-Benchmarks (dotnet)
 
-| metric | value |
-|---|---|
-| status | **`ok`** (the version-aware tool resolution picks `dotnet` 9.0.318) |
-| `wall_ms` (two-stage `--task build` + `--task bench`) | 68 318.69 |
-| build stage | 23 035 ms |
-| `test_time_ms` (n = 10, PLB's own per-test time) | min 0 / mean 1 170.95 / p50 559.98 / p90 3 014.48 / p99 3 355.48 |
-| `test_mem_bytes` | 95 862 784 B |
-| peak RSS (external `VmHWM` of the `.NET` tool) | 169 824 256 B |
-| provenance notes | `resolved dotnet 9.0.318 at /run/current-system/sw/bin/dotnet (PATH)`; `rejected dotnet 8.0.425 … (nix-store): requires >= 9` ×2 |
+`ok`: `wall_ms=70 648.460241` (two stages: `--task build` 23 330 ms + `--task bench`), `test_time_ms` n=10 min `0.0` mean `1 245.27` p50 `595.13` p90 `3 408.24` p99 `3 565.99` max `3 583.52`, `test_mem_bytes=94 777 344`, `peak_memory_bytes=171 573 248`. `--quick`; `test_time_ms` is PLB's own per-test time across its 10 elixir kernels and `wall_ms` is dominated by building their escripts. Versus m11 wall 68 318.69 → 70 648.46 ms (**+3.41 %**, read manually — no tool diff archived for `plb`): flat within the host band. **Tool resolution re-verified in the row's notes:** `resolved dotnet 9.0.318 at /run/current-system/sw/bin/dotnet (PATH)` with `rejected dotnet 8.0.425 … (nix-store): requires >= 9` twice.
 
-The version-aware resolver (`tool::command_for_min(TOOL, TOOL_NIX_ATTR, MIN_DOTNET_SDK)` with `MIN_DOTNET_SDK = &[9]`) selects the **greatest** satisfying `dotnet` across `PATH` + `$BENCH_TOOL_PATH` + the store and records every rejection, so a too-old `dotnet` on `PATH` can no longer shadow a newer SDK. The m9 post-fix smoke already proved the defect condition (an 8.0.425 SDK forced first on `PATH`) still resolves 9.0.318; m11's `PATH` resolves ≥ 9 directly.
-Read these as **`--quick` observations on a shared host**, not milestone figures: `wall_ms` is dominated by building the kernels' escripts and `test_time_ms` is PLB's own per-kernel time (`min` 0 = a sub-millisecond kernel). They say "PLB builds and runs on this host".
+### 4.2 `khepri` — Khepri `rebar3 eunit`
 
-### 4.2 `khepri` — Khepri `rebar3 eunit` (GC / data-structure bound)
+`ok`: `wall_ms=77 564.335456`, `peak_memory_bytes=374 722 560` (m11 83 402.90 ms / 357 818 368 B ⇒ **−7.00 %**). **Caveat:** the store `rebar3` is an escript whose shebang points at an Erlang/OTP 28 `escript`, so the suite runs under **OTP 28** while this `SysOnly` row's `runtimes[]` entry describes the driver's oracle (`erl` on `PATH`, OTP 29). The wall time is real; the reported runtime version describes the driver's runtime, not necessarily the Erlang the tool chose.
 
-`rebar3` 3.27.1 is resolved from the Nix store by the driver's **store scan** — no `PATH` prefix and no env-var opt-in are needed (`rebar3` is not on `PATH`). It runs under **Erlang/OTP 28** (its escript shebang), while the report's `runtimes[]` entry describes the driver's oracle.
+### 4.3 `emqx` — EMQX umbrella build (`make`/`mix` through `env.sh`) — **`skipped(emqx-requires-otp-28)`**
 
-| metric | value |
-|---|---|
-| `rebar3 eunit` wall | 83 402.90 ms |
-| peak RSS | 357 818 368 B (341.2 MiB) |
-
-### 4.3 `emqx` — EMQX umbrella build (`make emqx-enterprise-compile`)
-
-`emqx` **does not run**: `skipped(emqx-requires-otp-28)`, with no number fabricated. The blocker is a genuine, mechanical toolchain constraint — **the checkout's exactly-declared pin vs the host's actual runtime**, verified first-hand:
-
-* **The exact pin (required).** `28.5.0.7-2` — `/home/bill/Source/emqx/.tool-versions:1` → `erlang 28.5.0.7-2`, and `/home/bill/Source/emqx/env.sh:3` → `export OTP_VSN=28.5.0.7-2`. The gate reads only these declared pins (via `required_otp`/`OtpPin` in `src/workloads/emqx.rs`); it never assumes checkout layout.
-* **The exact available runtime.** `erl -noshell -eval 'io:format("~s ~s~n",[erlang:system_info(otp_release), erlang:system_info(version)]), halt().'` → `29 17.1`, resolved at `/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl` (the driver reports both the major and the erts version in the note).
-* **The mechanism (why a major-version mismatch is fatal here).** The umbrella build aborts in the `:ezstd` dependency's NIF makefile, which regenerates its `env.mk` with the idiom `erl -noshell -s init stop -eval '…'`. On OTP 29 `init stop` halts **before** the `-eval` runs, so the idiom writes nothing — demonstrated directly on this host: it exits `0` with **no output at all** (on OTP 28 it prints the line). `mix compile` then fails with `No rule to make target '…/env.mk'`. EMQX documents the same constraint in its own `scripts/ensure-rebar3.sh`, whose `case ${OTP_VSN}` accepts only `25*`/`26*`/`27*`/`28*`.
-* **Why not "just override the pin".** The only OTP-28 binding in the store (`erlang-28.5.0.7`) cannot be paired with the OTP-29-built **Elixir 1.20.4** / `mix` that the umbrella build's `mix` stage needs, and the pin lives in the **read-only** target checkout (editing the pinned version would be changing the project under test — not an honest measurement). Swapping the whole toolchain is out of this crate's scope.
-
-Recorded in `results/m11-bench-emqx.json` (the skip is immediate, before any build work).
+Unchanged from m9/m10/m11 and re-verified this pass (immediate skip, 1 s wall, **no number**). The checkout pins OTP 28 (`/home/bill/Source/emqx/.tool-versions:1` → `erlang 28.5.0.7-2`; `env.sh:3` → `export OTP_VSN=28.5.0.7-2`) while the host `erl` is OTP 29.1.1 / erts-17.1. The umbrella build aborts in `:ezstd`'s NIF makefile, which generates `env.mk` with `erl -noshell -s init stop -eval '…'`; on OTP 29 `init stop` halts **before** the `-eval` (verified: exit 0, no output), so `mix compile` fails with `No rule to make target '…/env.mk'`. The OTP-28 store `erl` cannot be paired with the OTP-29-built Elixir 1.20.4/`mix` the build needs, and the pin lives in the read-only target — not satisfiable without a full toolchain swap (out of scope).
 
 ### 4.4 `cowboy` — hello_world HTTP (in-process HTTP/1.1 load generator, 16 connections × 5 s — `--full`)
 
-`copy_tree`s the checkout into a `ScratchDir`, `make`s `examples/hello_world` (erlang.mk git-fetches cowlib/ranch), starts the release and drives it with the in-process keep-alive loader.
-
-| metric | value |
-|---|---|
-| build (`erlang.mk` + git fetch of cowlib/ranch) | 45 207.25 ms |
-| requests | 953 510 |
-| **throughput** | **190 626.72 req/s** |
-| errors | 0 |
-| latency min / p50 / p90 | 0.026328 / 0.078693 / 0.112260 ms |
-| **latency p99** | **0.223380 ms** |
-| latency max | 2.872852 ms (n = 20 000) |
-| peak RSS | 158 814 208 B (151.5 MiB) |
-
-**vs m10** (also `--full`, 16 conns × 5 s): p50 rose (0.063634 → 0.078693 ms) while **p99 fell** (0.301994 → 0.223380 ms) and throughput fell −9.3 % (210 250 → 190 627 req/s). The in-process loader and the server share one contended machine and nothing about the release build or the loader changed, so this is **host-load variation, not a server change** (§7.3). (`m6-bench-cowboy.json` is a `--quick` run, not comparable.)
+`ok`: `build_ms=42 527.108981` (relx release; network fetch of cowlib/ranch), `requests=827 888`, `errors=0`, `requests_per_sec=165 489.213469`, `latency_ms` n=20 000 min `0.023990` mean `0.105668` p50 `0.077852` p90 `0.137818` p99 `0.742380` max `3.268676`, `peak_memory_bytes=166 875 136`. Versus m11: throughput 190 626.72 → 165 489.21 req/s (**−13.19 %**), mean latency **+24.34 %**, p99 0.223380 → 0.742380 ms — the shared host's load (pass bracketed by loadavg 10.91 → 9.34), not a server change.
 
 ### 4.5 `erlc_compiler` — `erlc` over the stdlib + Elixir corpus slice
 
-| metric | value |
-|---|---|
-| wall | 7 905.65 ms |
-| files compiled | 60 (30 OTP `lib/stdlib/src` + 30 Elixir `lib/elixir/src`) |
-| **throughput** | **7.589 files/s** (**5 882.25 LOC/s**) |
-| peak RSS | 135 045 120 B (128.8 MiB) |
-| notes | `corpus: 60 files (46503 LOC) attempted from stdlib+elixir; 60 produced .beam (46503 LOC)` |
-
-The `files_per_sec`/`loc_per_sec` rates are computed from the files/LOC `erlc` actually **produced**, not from what was attempted — so a partial run cannot overstate them. Here all 60 attempted files produced a `.beam`, so produced = attempted. The rate is ~14 % below m10's (8.842 files/s) with the **same 60/60 files and the unmodified system `erlc`**, so the move is host-load-attributable (§7.3).
+`ok`: `wall_ms=6 842.177446`, `files_compiled=60`, `files_per_sec=8.769138`, `loc_per_sec=6 796.520606`, `peak_memory_bytes=134 492 160`, note `corpus: 60 files (46503 LOC) attempted from stdlib+elixir; 60 produced .beam (46503 LOC)`. The rates are computed from the **produced** `.beam`/LOC counts, so a partial run cannot overstate them. Versus m11: wall 7 905.65 → 6 842.18 ms (**−13.45 %**), files/s 7.589 → 8.769 (**+15.54 %**) — a host-load move with the same unmodified system `erlc`, not a compiler change.
 
 ### 4.6 `elixir_compiler` — installed system `elixirc` over the checkout's `.ex` corpus
 
-Measures the **installed** `elixirc` (the in-repo checkout is unbuilt and read-only) over a staged `.ex` corpus (`--full` ⇒ up to 200 files).
+`ok`: `wall_ms=50 304.338719`, `files_attempted=105`, `files_compiled=223`, `files_per_sec=4.433017`, `loc_per_sec=2 225.732469`, `compiler_startup_ms=297.643093`, `peak_memory_bytes=211 509 248`. Notes: `batch compile failed; per-file fallback (version skew)`; `compiler: Elixir 1.20.4 (compiled with Erlang/OTP 29)`; `97/105 compiled; 223 .beam produced`; `223 .beam file(s) produced from 105 source file(s) (an Elixir source may define several modules)`. **`files_compiled` (223) exceeding `files_attempted` (105) is expected and documented by the workload itself**; the throughput rate uses the produced count. Versus m11: wall 47 667.62 → 50 304.34 ms (+5.53 %), files/s −5.24 %, compiler startup **−8.23 %**.
 
-| metric | value |
-|---|---|
-| wall | 47 667.62 ms |
-| files attempted / `.beam` produced | 105 / **223** (97/105 compiled) |
-| **throughput** | **4.678 files/s** (**2 348.85 LOC/s**) |
-| compiler startup | 324.33 ms |
-| peak RSS | 205 479 936 B (196.0 MiB) |
-| notes | `batch compile failed; per-file fallback (version skew)`; `compiler: Elixir 1.20.4 (compiled with Erlang/OTP 29)`; `223 .beam file(s) produced from 105 source file(s) (an Elixir source may define several modules)` |
+## 5. Workloads that did **not** run in the m12 measurement run — verified reasons
 
-**`files_attempted` (105) < `files_compiled` (223) is expected, not a bug:** one Elixir source may define several modules, so the produced `.beam` count can exceed the source count. The throughput rate uses the produced count.
-
-## 5. Workloads that did **not** run in the m11 measurement run — verified reasons
-
-| workload | status | verified reason |
+| workload | status | exact reason |
 |---|---|---|
-| `emqx` | `skipped(emqx-requires-otp-28)` | EMQX pins OTP **28.5.0.7-2** (`env.sh:3`/`.tool-versions:1`) while the host `erl` is OTP 29.1.1 / erts-17.1; the `:ezstd` `env.mk` make-target's `erl -noshell -s init stop -eval …` idiom produces nothing under OTP 29, so `mix compile` aborts. Not satisfiable without a full OTP-28 toolchain swap (§4.3). No number is fabricated. |
-| every `SysOnly` workload scheduled under `rust` | `skipped(runtime-unsupported)` | The Rust runtime is not an OTP release host: it cannot run `rebar3`/bootstrap an OTP release, act as `erlc`/`elixirc`, or boot the Cowboy release. `Runtimes::SysOnly` in the harness gates this before any probe. (Not exercised as a row in m11 — the m11 sys-only runs used `--runtime sys` — but it is the harness behaviour.) |
+| `emqx` | `skipped(emqx-requires-otp-28)` | the checkout pins OTP 28.5.0.7-2 while the host `erl` is OTP 29.1.1 (§4.3) — the only non-`ok` row in the whole milestone |
+| `copy_bound` / `send_recv_plain` (**rust case only**) | recorded as a **failure** inside an `ok` row | hit the driver's 60 s `RUN_DEADLINE` — the OPEN ~25.5 ms blocked-round defect (§3.10); the **sys** case ran normally (662.18 ns/op), and **no rust number is fabricated** (row summary: `3 ok, 0 unsupported (of 4)`) |
+
+Nothing else skipped: `bench list --json` reports all 12 workloads `probe_ready: true`, and the six `Runtimes::Both` workloads produced 12/12 `ok` rows.
 
 ## 6. Reproducibility, stability and known measurement caveats
 
 ### 6.1 The host is shared and loaded, and the two runtimes are measured in different windows
-The 1-min `/proc/loadavg` across the m11 session ran from **1.12 to 7.18** against a 14-core host (§1, `results/m11-load-record.md`); the cross-runtime pass started at 6.04 and **fell** to 2.98, so its later (`rust`) side ran under a *lighter* load, while the external-target and tier-control passes ran at the quieter end (1.36 → 2.36 and 1.81 → 2.59). The runner is **runtime-major** (`sys` rows first, then `rust` rows), so under a drifting load the two sides see different conditions. Loadavg is host-wide and does **not** move monotonically with the measured figures (§7), so prefer ratios, prefer the startup-cancelled rows, and always record `/proc/loadavg` alongside an absolute figure.
+The runner is runtime-major (all `sys` rows, then all `rust` rows), so a drifting load biases a cross-runtime comparison. The m12 cross-runtime pass **fell** 65.28 → 6.93, i.e. the `rust` side ran under a lighter load. Read ratios, and prefer the load-robust marginals. Re-measure on a quiet host before quoting absolutes; `results/m12-load-record.md` §3 has the before/after record.
 
 ### 6.2 `beam_rt` resolves its code path natively from the filesystem
-The runtime locates its system `ebin` directories (stdlib, kernel, erts) with a **native filesystem probe** (`crates/beam_rt/src/codeserver.rs`: `$ERTS_STDLIB_DIR` when set, else the standard OTP installation layout under the `erl` on `$PATH` — *resolved to a path, never executed* — then this executable's ancestors, `$ERL_TOP`, and standard prefixes). The system `erl` is only *run* as a last resort, for an installation that layout cannot see. That is why rust startup is ~15 ms per process. Setting `$ERTS_STDLIB_DIR` still short-circuits the probe; `bench` never sets it (the harness is a pure driver/observer and never mutates the runtime's environment beyond argv). The per-element/per-call metrics cancel whatever startup cost remains by construction.
+`crates/beam_rt/src/codeserver.rs` probes (`$ERTS_STDLIB_DIR` → the OTP layout under the `erl` on `$PATH`, *resolved not executed* → this executable's ancestors → `$ERL_TOP` → standard prefixes); the system `erl` is only *run* as a last resort. `bench` never sets `$ERTS_STDLIB_DIR` — it is a pure driver/observer.
 
 ### 6.3 `elixir_compiler` measures the installed `elixirc` 1.20.4
-against the unbuilt, read-only 1.21.0-dev checkout's sources, so the batch path fails and the per-file fallback runs; the note is in the artifact.
+The in-repo checkout is unbuilt and read-only, so a version skew with the checkout is expected and the per-file fallback runs (§4.6).
 
 ### 6.4 `cowboy` re-fetches cowlib/ranch in a fresh scratch copy on every run (network)
-which is why its `build_ms` (~45.2 s) dominates the workload.
+The build is therefore host/network-dependent (42.5 s at m12 vs 45.2 s at m11 vs 39.5 s at m10) and is excluded from the latency figures (which come from the load phase only).
 
 ### 6.5 Peak memory is Linux `VmHWM` polling of the child (`peak_memory_bytes`)
-Erlang's own `erlang:memory(total)` is a **separate** metric (§3.2) and is never conflated with it.
+Unreadable ⇒ `null` + a note; never fabricated. It is never conflated with `vm_memory_total_bytes` (`erlang:memory(total)`, §3.2/§3.8).
 
 ### 6.6 `foreign` / `list_walk` / `copy_bound` / `gc_bound` `wall_ms` are not comparable across runtimes
-Each side runs a different `N`. Compare the startup-cancelled marginals (`ns_per_call`, `ns_per_element`, `ns_per_op`) and `startup_ms`. The `foreign` `ns_per_call` row is **additionally N-dependent on the Rust runtime (super-linear)** and is therefore only comparable across runs that used the **same `N`** (§3.4, §8 item 1).
+They loop `N` ops **per process** at a per-runtime `N`; only the startup-cancelled per-unit marginals and the deterministic counters are cross-runtime comparable. At m12 both sides also carry their own startup offset — which the marginal cancels **by construction**, which is precisely why the marginal is the right instrument under the OPEN boot defect (§3.10).
 
-### 6.7 The rust peak RSS of `foreign` / `list_walk` / `copy_bound` / `gc_bound` grows with the loop count `N` — it is **not** a like-for-like memory comparison (**mechanism identified**)
-`beam_rt` has a process-heap collector driven from `crates/beam_rt/src/context/gc.rs` at the scheduled-slice heap-admission point, and the BIF-result copy-out + pooled-heap rewind (`crates/beam_rt/src/context/calls.rs`) bounds the **BIF-churn** shape — `gc_bound`'s rust peak RSS is **15.43 MiB p50** (m10: 15.40) and `list_walk`'s **15.21 MiB**. But the **`copy_bound` `ets_copy`** row still reaches **90.39 MiB** at N = 100 000 vs sys 66.91 MiB (m10: 90.30 MiB — it has *not* fallen), and `foreign`'s rust RSS (74.5–77.0 MiB for the two `cowboy_bstr` cases) still tracks its N.
+### 6.7 The rust peak RSS of the loop workloads is **boot-dominated** at this commit (and was `N`-dependent before)
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` rust peak RSS rows (~376–450 MiB) are now dominated by the **~2.1 s boot's resident preloaded-module set** rather than the loop count: `list_walk` (N = 1 000) and `gc_bound` (N = 2 000) and `ets_copy` (N = 100 000) all sit at ≈376 / 376 / 450 MiB, i.e. the growth with `N` documented at m11 is now masked by a ≈370 MiB constant. The underlying per-op retention mechanism (BIF-result copy-out → `Process::grow_nursery` → `Nursery::grow` → `Nursery.retired`, cleared only by a real collection) is unchanged and still owned by `beam_rt`/`beam_process`/`beam_gc` — the **memory row is not a like-for-like comparison**, and `slice` (one call per process) is equally boot-dominated at m12. `vm_memory_total_bytes` (§3.2) remains the clean rust-vs-sys memory comparison (**2.28× lower**).
 
-**RESOLVED — the mechanism is identified, and it is neither ETS-specific nor an m11 regression.** Every per-op loop retains heap **linearly**: a direct `VmHWM` sweep of `foreign` `enc` measures ≈**2.0 KiB/iteration** (13.9 MiB@N=0 → 25.4@5 000 → 35.1@10 000 → 53.8@20 000 → 62.8@25 000) and `lower` ≈**2.9 KiB/iteration** (15.5 → 88.4@25 000 → 304.8 MiB@100 000); the **identical sweep at m10** gives 11.7→25.0→32.4→51.7→62.1 and 14.9→301.0 ⇒ **pre-existing, m10-invariant**. `ets_copy` simply has the largest `N`. The retention chain is the BIF-result copy-out (`crates/beam_rt/src/context/calls.rs:737` `move_result_into_process_heap`, ~line 780 `process.grow_nursery(needed.max(256))`) and the engine's unrooted `alloc_words` seam (`crates/beam_rt/src/context/gc.rs:815`, ~line 837) → `Process::grow_nursery` (`crates/beam_process/src/process.rs:1356`) → `Nursery::grow` (`crates/beam_gc/src/nursery.rs:134-150`), which pushes the **replaced whole `HeapSpace`** onto `Nursery.retired: Vec<HeapSpace>`; `retired` is emptied **only** by `Nursery::collapse` (a real collection), and these loops never collect, so one whole `HeapSpace` is retained per growth. (The m10 "ETS-adopt path" lead stays refuted; this chain is the owner — `beam_rt`/`beam_process`/`beam_gc`, **outside this node**; fix shape: collapse/shrink the retired chain when it is safe to do so.) Raw numbers: `results/b54-foreign-growth-curve.md` (its RSS column is identical on the m10 and HEAD binaries — the retention is *not* what drives the timing divergence of §3.4).
-**Consequence:** use `slice` (§3.3, one call per process, `N`=1) as the comparable per-process metric, and treat the loop workloads' rust RSS as loop-length-dependent (§8 item 5).
+### 6.8 Contract A.7 — the `beam_rt` boot status at this commit **COMPLETES**, with an OPEN latency defect
+`beam_rt -boot bootstrap/bin/start` now **exits 0** (m11: exit 3 at directive 18 of 22). What remains is **fidelity and latency**, not completion: **no self-hosted build**, no live `code_server`/`erl_prim_loader` process in a plain runtime, and the OPEN `run`-route boot/blocked-round/ETF-decode defect of §3.10 (owner `beam_rt`, being fixed in parallel). No boot-completion claim beyond the above is made anywhere.
 
-### 6.8 Contract A.7 — the `beam_rt` boot status at this commit is **incomplete**
-At the measured commit `erts_rust/target/release/beam_rt -boot bootstrap/bin/start` **exits 3** and emits exactly one stderr line:
-```
-beam_rt: unsupported: opcode: run: process blocked (no message available)
-```
-The real `bootstrap/bin/start.boot` therefore **stops at directive 18 of 22** — the run does **not** reach the final `{progress,started}`. No part of this document claims a completed boot. `bench`'s own workloads exercise only the plain per-process `-eval`/`run` startup path (which does complete); contract A.7's boot completion is tracked in the differential gate, not here.
+## 7. Deltas vs the previous run (`m11`; `m10`/`m9`/`m6`/`m5`/`m4` earlier)
 
-## 7. Deltas vs the previous run (`m10`, and `m9`/`m6`/`m5`)
+Source: `m12-compare-vs-m11-xrun.txt`, `m12-compare-vs-m11-external.txt` (the tool diffs the **mean**; `a` = m11, `b` = m12).
 
-Every figure below is quoted from the committed artifacts: `m11-*` (2026-10-14 05:47–06:57 UTC, commit `ab6f1b5e58`, full-pass load 6.04 → 2.98 / 1.36 → 2.36 / 1.81 → 2.59), `m10-*` (2026-10-13 23:06–23:15 UTC, load 5.43 → 7.59 / 7.94 → 8.03 / 21.12 → 10.30), `m9-*` (2026-10-13 13:25–14:10 UTC, load 11.01 → 6.02 / 4.68 → 4.43), `m6-*` (2026-10-11, cross-runtime load ≈414–440), `m5-*` (2026-10-09, load ≈90–153) and `m4-*` (2026-10-08, load 4.77 → 11.59). **The runs sit at very different — and non-monotonic — host loads.**
-The tool-generated two-file diffs are archived: `results/m11-compare-vs-m10-xrun.txt` and `results/m11-compare-vs-m10-external.txt`.
+### 7.1 m12 vs m11 — the cross-runtime marginals (rust side)
 
-**Cross-run comparability.** Only the **load-invariant** rows are safe to compare across runs: the startup-cancelled marginals and, above all, the **deterministic counters** (`*_ops`, `*_elements`). The absolute wall / startup / throughput rows are **not** cross-run comparable — they moved in *both* directions between runs — which is why `/proc/loadavg` is treated as a weak proxy throughout this document.
-
-### 7.1 m11 vs m10 — the cross-runtime marginals (rust side)
-
-Rust `beam_rt` cells, m10 → m11 (mean; bigger-is-better negative deltas are improvements):
-
-| metric (mean) | m10 | m11 | move |
+| (workload, metric) | m11 | m12 | Δ |
 |---|---|---|---|
-| `copy_bound` `send_recv` `ns_per_op` | 79 518.1199 | **21 522.2389** | **−72.93 %** |
-| `copy_bound` `send_recv` `wall_ms` | 175.8221 | **58.4826** | −66.74 % |
-| `copy_bound` `etf_roundtrip` `ns_per_op` | 9 838.0045 | **7 033.3943** | **−28.51 %** |
-| `copy_bound` `ets_copy` `ns_per_op` | 3 267.8549 | **2 435.0664** | −25.48 % |
-| `gc_bound` `churn` `ns_per_op` | 147 194.3719 | **128 524.4542** | −12.68 % |
-| `list_walk` `ns_per_element` | 47.3880 | **45.9731** | −2.99 % |
-| `foreign` `bstr_to_lower` `ns_per_call` | 17 789.3946 | **23 751.0676** | **+33.51 % (worse)** |
-| `foreign` `bstr_capitalize_token` `ns_per_call` | 22 566.6138 | **28 757.0043** | **+27.43 % (worse)** |
-| `foreign` `emqx_base62_decode` `ns_per_call` | 16 325.9957 | **19 306.3883** | **+18.26 % (worse)** |
-| `foreign` `emqx_base62_encode` `ns_per_call` | 16 601.0457 | **77 167.3229** | **+364.83 % (worse)** |
-| `baseline` `startup_ms` | 15.5243 | **15.2122** | −2.01 % |
-| `baseline` `vm_memory_total_bytes` | 805 458 | 805 458 | unchanged |
-| `copy_bound` `send_recv_plain` (all rows) | — | — | `metric-only-in-b` (the new case) |
+| `foreign` `emqx_base62_encode` ns/call **rust** | 77 167.3229 | **15 502.6789** | **−79.91 %** (the Θ(N³) fix) |
+| `foreign` `emqx_base62_decode` ns/call **rust** | 19 306.3883 | **14 919.3416** | −22.72 % |
+| `foreign` `bstr_capitalize_token` ns/call **rust** | 28 757.0043 | **22 901.0619** | −20.36 % |
+| `foreign` `bstr_to_lower` ns/call **rust** | 23 751.0676 | **23 429.8831** | −1.35 % |
+| `baseline` `startup_ms` **rust** | 15.2122 | **2 298.6279** | **+15 010 %** (the fixed boot; §3.10) |
+| `baseline` `compute_loop_ms` **rust** | 58.6524 | **2 272.2808** | +3 774 % (boot) |
+| `baseline` `vm_memory_total_bytes` **rust** | 805 458 | **15 892 346** | +1 873 % (boot's resident set) |
+| `copy_bound` `send_recv` ns/op **rust** | 21 522.2389 | **25 632 422.2283** | **+118 997 %** (blocked-round defect; §3.10) |
+| `copy_bound` `etf_roundtrip` ns/op **rust** | 7 033.3943 | **35 369.2113** | +402.88 % (Θ(atom-table) decode; §3.10) |
+| `copy_bound` `ets_copy` ns/op **rust** | 2 435.0664 | **2 883.7548** | +18.43 % |
+| `copy_bound` `send_recv_plain` (rust rows) | present | **failed (60 s deadline)** | rust metrics dropped |
+| `gc_bound` `churn` ns/op **rust** | 128 524.4542 | **184 398.8576** | +43.47 % |
+| `list_walk` ns/element **rust** | 45.9731 | **110.2061** | +139.72 % (boot-subtraction jitter; §3.5) |
+| `slice` rust walls | 15.35–37.85 ms | **2 097.64–2 366.64 ms** | the fixed boot (one process per case) |
 
-The **sys (system ERTS)** side is unchanged within load: `baseline` `startup_ms` 114.3603 → 112.8126 (−1.35 %), `foreign` `ns_per_call` 210.88–339.42 → 210.23–344.97, `list_walk` `ns_per_element` 2.1431 → 2.4194, `copy_bound` `ns_per_op` 240.47–1 453.98 → 236.93–1 453.37, `gc_bound` `churn` 4 364.91 → 4 270.13. That flatness is the cross-check that the interesting rust moves are not oracle drift.
-**The four `foreign` rust rows in the table are a *valid* flat-`N` comparison** (the case table's `n_rust` is unchanged since m10) and the move is the confirmed regression of §3.4/§7.2 — root-caused, not the `N`-dependence effect. The `foreign` **absolute** `ns_per_call` value, however, is `N`-specific and its ratio band (§3.8) is inflated by that effect.
+The `sys` side moved only with the host (`startup_ms` +6.96 %; `foreign` ns/call +10.2 % to +21.7 %; `copy_bound` ns/op −1.5 % to +22.2 %; `gc_bound` churn +9.10 %; `list_walk` +214 % because the sys startup row 118.70 → 157.33 ms is subtracted from a ~360–918 ms wall) — that flatness ± load is the cross-check that the rust moves are not oracle drift.
 
-### 7.2 Real, code-attributable changes since m10
+### 7.2 Real, code-attributable changes since m11 (owners **outside this node**)
 
-* **`foreign`'s four rust rows rose — a GENUINE regression at matched `N`, root-caused (owned outside this node).** The case table's `n_rust` is unchanged since m10, so the comparison is flat-`N` and valid: `emqx_base62_encode` **+364.83 %** (16 601.05 → 77 167.32 ns/call), `bstr_to_lower` **+33.51 %**, `bstr_capitalize_token` **+27.43 %**, `emqx_base62_decode` **+18.26 %** — while every `sys` oracle row stayed flat (210.88–339.42 → 210.23–344.97). A controlled interleaved A/B at matched `N` (m10 `b4593818b3` vs HEAD) measured `enc` **≈4.6× slower** at `N` = 25 000 and **≈12.5×** at `N` = 60 000 (`lower` ≈1.25×, `dec` ≈1.35×, `cap` parity); the committed `--quick` driver A/B reproduces it (`results/b54-foreign-ab-{m10,head}.json`, §3.4). The cause is commit **`e59dd30432`** (a per-slice loop at `erts_rust/crates/beam_rt/src/runner/run.rs:581-585` registering the engine's never-cleared `refc_binaries` reservoir through `beam_process/src/process.rs:927-935`'s O(slots) scan ⇒ **Θ(N³)**) — the `beam_rt`/`beam_process` owners' fix, **not** this crate's. **The flat-`N` comparison is valid; only the absolute `ns_per_call` value is `N`-specific.**
-* **`copy_bound send_recv` fell 72.93 % on the rust side** (79 518.12 → 21 522.24 ns/op, and 3.7× cheaper) — this **closes the m10 baseline-JIT message-passing imbalance (§3.9)**: the baseline tier at this commit **lowers `Send` and the receive-control family natively**, and `beam_message`'s dirty-heap send fast path and `beam_process`'s quiet-queue `service_signals` fast path (`CHANGE.md`, batch 52) back it. The same change drives the new `send_recv_plain` case (20 075.24 ns/op) into the same band.
-* **`copy_bound etf_roundtrip` fell 28.51 %** (9 838.00 → 7 033.39 ns/op) and `ets_copy` **−25.48 %** (3 267.85 → 2 435.07) — the same window's cut of the registered-BIF dispatch prologue + BIF-result copy-out (`beam_rt`).
-* **`gc_bound` churn `ns_per_op` fell 12.68 %** (147 194.37 → 128 524.45) with the churn rust peak RSS flat/low (15.43 MiB p50) — the BIF-result copy-out + pooled-heap rewind (`beam_rt`; `context/calls.rs`).
-* **`slice`'s system-module per-process cost recovered** (m10 rust walls 15.38–48.12 ms → m11 15.35–37.85 ms): `gb_trees_size` 25.12 → 16.56, `base64_encode_size` 26.68 → 17.23, `ordsets_from_size` 26.15 → 15.96, `queue_from_size` 26.00 → 21.02, `string_str_length` 48.12 → 37.85. The m10 item-6 regression is therefore **closed**.
-* **`list_walk` per-element `ns_per_element` fell a further 2.99 %** (47.39 → 45.97 ns) — the m10 baseline-JIT Y-slot arithmetic + continuation sub-blocks; the tier table (§3.9) shows the default tier still **3.36× cheaper** than the interpreter on this shape.
-* **`beam_process` / `beam_engine` call seams** continue to move (single-resolution `call_ext` seam, fingerprint+address memo, in-block `Send`/receive lowering); the bench-visible expression is the `copy_bound`/`send_recv_plain` band above. In-crate figures live in `crates/beam_engine/MEASURED.md`.
+1. **`foreign` Θ(N³) fix** (commits `07a5720639` + `7d84b12b44`) — the rust `ns_per_call` rows fell (encode −79.91 %) and the cross-runtime band narrowed to **38.9×–66.9×** from 60.2×–367.1×; independently confirmed by the A/B at **0.87×–0.99×** of the m10 binary (§3.4).
+2. **The `run`-route boot** (commit `85ee33b2f8`) — boot now **completes** (exit 0) and `beam_rt -boot …` prints `Erlang/OTP 30 [erts-17.1]`, but every `run`/`-eval`/`-boot` action pays **~2.1 s fixed** startup, **~25.5 ms per blocked round**, and a **Θ(atom-table) `binary_to_term`**; that is the whole of the `startup_ms`/`slice`/`send_recv`/`etf_roundtrip` m11→m12 moves — **OPEN** (§3.10).
 
 ### 7.3 Load-attributable / not comparable
-
-* **`baseline` startup, `sys` side.** m10 mean 114.36 ms → m11 mean 112.81 ms — essentially flat, host variation, not a code change.
-* **`sys`-side marginals.** `foreign` ns/call +4.2 % / −0.3 % / +9.2 % / +1.6 %; `list_walk` ns/element +12.9 %; `gc_bound` churn −2.2 %; `copy_bound` ns/op −1.5 % to −0.0 % — the cross-runtime pass started at load 6.04 and fell to 2.98, so these small moves are within host variation.
-* **Cowboy.** p50 +23.66 % (0.063634 → 0.078693) but p99 −26.03 % (0.301994 → 0.223380) and throughput −9.33 % (210 250.49 → 190 626.72) — host load, per §4.4 (a rising p50 with a *falling* p99 reads as contention, not a server change).
-* **Compiler throughput / `khepri`/`plb` wall.** `erlc_compiler` −14.17 % (8.8424 → 7.5895 files/s, same 60/60 files), `elixir_compiler` +0.29 % (4.6646 → 4.6782 files/s, same 105/223, though `compiler_startup_ms` +23.77 %), `khepri` +5.89 % (78 762.66 → 83 402.90 ms), `plb` −3.56 % (70 841.43 → 68 318.69 ms). All ran the unmodified system toolchain, so these moves are not code-attributable.
+External targets: `erlc_compiler` wall −13.45 % (files/s +15.54 %); `elixir_compiler` wall +5.53 % (files/s −5.24 %, startup −8.23 %); `cowboy` req/s −13.19 %, mean latency +24.34 %; `khepri` wall −7.00 %; `plb` wall +3.41 %. All on the shared host, none a like-for-like quiet-host comparison. The `strip` of `list_walk`'s rust marginal and part of `gc_bound`'s +43.47 % are startup-subtraction jitter amplified by the ~2.1 s boot, not execution changes.
 
 ### 7.4 Unchanged / still-open
+- `ets_copy`'s remainder and `gc_bound`'s churn marginal remain real rust execution costs (term-copy / allocate-and-abandon), independent of the boot.
+- The per-op retention mechanism behind the loop workloads' rust RSS (§6.7) is unchanged (owner outside this node).
+- No Rust-runtime row exists for the six `SysOnly` targets (§4, §5); `emqx` is the one exact mechanical skip.
 
-* **`baseline` `vm_memory_total_bytes` (rust)** — m10 805 458 B → m11 805 458 B (the two runtimes still report different quantities, §3.2).
-* **`foreign` peak RSS scales with `N`** (general per-op heap retention, mechanism identified — §6.7), and `copy_bound`'s `ets_copy` row reads **90.39 MiB** (m10: 90.30) at N = 100 000 (§6.7, §8 item 5).
-* **`list_walk` and `gc_bound` rust peak RSS are *below* the oracle's** (15.21/15.43 MiB vs 66.34/66.66 MiB), but they are still loop-length-dependent rows, not like-for-like.
-* **The per-unit execution-throughput gap is the stable cross-runtime story** — but its `foreign` slice is inflated by the N-dependent regression of §3.4 (confirmed root cause, not a formula artifact). `copy_bound` `etf_roundtrip`: `m9` 118.5× → `m10` 15.1× → `m11` **10.81×**; `copy_bound` `send_recv`: `m9` 114.4× → `m10` 54.7× → `m11` **14.81×**; `copy_bound` `ets_copy`: `m10` 13.6× → `m11` **10.28×**. `list_walk`: `m5` 66.6× → `m6` 108.7× → `m9` 65.5× → `m10` 22.1× → `m11` **19.0×**. `gc_bound churn`: `m9` 42.2× → `m10` 33.7× → `m11` **30.1×**. `foreign`: `m4` (quiet) 53.8×–72.0× → `m5` 53.1×–96.0× → `m6` 74.9×–131.4× → `m9` 46.2×–74.2× → `m10` 52.4×–78.7× → `m11` **60.2×–367.1×** (the last band is inflated by the N-dependent regression and is **not** a clean ratio; §3.4).
+## 8. Fresh ranked bottleneck list (from the m12 data)
 
-## 8. Fresh ranked bottleneck list (from the m11 data)
+Ranked by `(rust/sys)` magnitude × how load-robust the measurement is, with the m12 evidence and the owner.
 
-Derived from the m11 measurements above (each item: measured m11 cost → where to look → expected win). Each ratio names **both sides**: `rust` = `beam_rt` (default baseline-JIT tier) vs `sys` = system ERTS, unless the row is explicitly a Rust-vs-Rust tier row.
-Two of the m10 items are **closed** and are recorded as such: **m10 item 2 (the baseline-JIT `send_recv` tier regression) is CLOSED** (§3.9 — the default tier is now at parity, 0.97×–1.03×), and **m10 item 6 (the `slice` system-module per-process cost) RECOVERED** (§3.3, §7.2) — so neither is open any more, contrary to what one might assume from the m10 list. Items 1 and 5 are now **root-caused** (owner `file:line` + fix shape below); the rest are open. Ranked by measured headroom:
-
-1. **`foreign` `ns_per_call`: N-dependent (super-linear) in BOTH tiers *and* a genuine m10→m11 regression at matched `N` — ROOT-CAUSED (owner outside this node; reported upward).**
-   Rust `foreign` `ns_per_call` is **19 306.39–77 167.32** ns/call at m11 vs **16 325.996–22 566.614** at m10, while the `sys` oracle rows are **flat** (210.23–344.97 vs 210.88–339.42) ⇒ not oracle drift. `emqx_base62:encode` **+364.83 %** (16 601.05 → 77 167.32); `bstr_to_lower` **+33.51 %**; `bstr_capitalize_token` **+27.43 %**; `emqx_base62_decode` **+18.26 %**.
-   **Root cause.** Commit **`e59dd30432`** (after m10, in HEAD) adds a **per-slice** loop at `erts_rust/crates/beam_rt/src/runner/run.rs:581-585` registering **every** payload of the engine's never-cleared `refc_binaries` reservoir (`erts_rust/crates/beam_engine/src/machine/mod.rs:241`) on every slice; `Process::register_off_heap_binary` → `owned_binary_slot` (`erts_rust/crates/beam_process/src/process.rs:927-935`) is an O(slots) linear scan whose slot space grows with the registrations ⇒ **Θ(N³)**. It fits the default-tier curve and the interpreter series `c·N³` (`c≈1.05e-8 ms`: `N`=4 000 → 672 ms predicted vs 711 measured; `N`=20 000 → 84 000 vs 84 088 measured); at m10 the reservoir was consumed only on the `Returned`/`Err` arms (once per process life) ⇒ linear.
-   **Fix shape (owner's call):** a per-engine registration **cursor** (register only newly-added payloads) and/or an O(1) slot lookup. `beam_rt`/`beam_process`.
-   **Evidence:** the direct `enc` curve is super-linear at HEAD (≈12.5 µs@N=2 000 → 21.9@10 000 → 77.1@25 000 → 260.8@50 000 → 1090@100 000 µs/call, total ≈ `N³`) and ~flat at m10 (13–33 µs); the interleaved A/B at matched `N` is ≈4.6× (N=25 000) / ≈12.5× (N=60 000) for `enc`, 1.25× `lower`, 1.35× `dec`, parity `cap`; the `--quick` driver A/B (`b54-foreign-ab-{m10,head}.json`) and both tier ladders (`b54-foreign-growth-curve.md`) reproduce it. The interpreter tier is **also** super-linear at HEAD (≈30/60/172 µs/call at `N`=1 000/2 000/4 000) while m10-interpreter is ~flat ⇒ **tier-independent** (not the baseline-JIT emitter); this is *why* the m11 tier control had to run `--quick` (a `--full` pass ≈ 50 min).
-   *Consequence for reading m11:* the `foreign` `ns_per_call` **absolute** value is `N`-specific (only comparable at the same `N`), its **ratio band is inflated** by this regression, and the m11-vs-m10 jump is this regression (confirmed, at matched `N` — not a formula artifact).
-   *Evidence it is not a workload-program change:* the foreign sources are unchanged (cowboy HEAD `c965d1a`, emqx HEAD `02eaa91831`; both `.erl` files dated 2026-10-05).
-2. **Per-unit Erlang execution throughput — the stable gap vs system ERTS (10.3×–30.7× on the clean rows).** `copy_bound` **2 435.07–21 522.24** vs **236.93–1 453.37** ns/op (**10.28×–30.71×**), `list_walk` **45.9731** vs **2.4194** ns/element (**19.00×**), `gc_bound` churn **128 524.45** vs **4 270.13** ns/op (**30.10×**). This is **narrower than m10's 13.6×–54.7× / 22.1× / 33.7×**. (`foreign`'s 60.2×–367.1× belongs to item 1, not here.)
-   *Lead:* the engine step loop (`erts_rust/crates/beam_engine/src/machine/drive.rs`) and baseline-JIT block coverage (`erts_rust/crates/beam_engine/src/jit/baseline/emit/`), plus the host BIF seam (`erts_rust/crates/beam_rt/src/context/calls.rs::call_registered`, ~line 122) — the engine's own side is only ~11–12 ns of the per-call cost, so ~99.85 % is **host-side** (`crates/beam_engine/tests/bif_cost.rs`).
-   *Expected win:* the largest single lever in the suite; the m10/m11 JIT work already took `list_walk` from 65.5× (m9) to 19.0×.
-3. **`gc_bound` churn is still 30.10× dearer (128 524.45 ns/op) — the memory half is flat/low, the allocation wall cost is the residual.** m11 rust peak RSS is **15.43 MiB** p50 (m10: 15.40) and the per-op churn cost fell **12.68 %**.
-   *Lead (unchanged):* the copy-out + rewind seam (`erts_rust/crates/beam_rt/src/context/calls.rs::move_result_into_process_heap`, ~line 674; the rewind guard in `call_registered`) — every `churn` iteration builds three containers and each container-returning BIF result is copied into the process heap.
-   *Expected win:* a cheaper copy-out (bulk word copy, avoiding a re-walk) applies to *every* container-returning BIF, so it should show up on `churn`, `ets_copy` and the module-call cases together.
-4. **Two-process delivery is the dearest rust copy boundary.** The **new** `send_recv_plain` case is **20 075.24 ns/op** (**30.71×** the sys 653.75) while `send_recv` (which also runs the ETF leg) is **21 522.24 ns/op** (**14.81×** the sys 1 453.37). On rust the whole delivery *is* the cost — the ETF leg adds only **≈1.4 µs/op** (21 522 − 20 075) versus **≈0.80 µs/op** on sys (1 453.37 − 653.75).
-   *Lead:* `erts_rust/crates/beam_message`'s copy engine + `erts_rust/crates/beam_process`'s signal delivery / scheduler wake, reached through the engine's `send`/`receive` seams.
-   *Expected win:* bring the delivery cost toward the oracle's; the m10→m11 window already showed this surface is responsive (the tier's `send_recv` fell 72.93 %, §7.2).
-5. **`ets_copy` rust peak RSS grows with `N`: rust 90.39 MiB at N = 100 000 vs sys 66.91 MiB** (m10: 90.30 MiB — it did **not** fall) — **ROOT-CAUSED: a general per-op heap retention, not ETS and not an m11 regression.**
-   *Mechanism:* the BIF-result copy-out (`erts_rust/crates/beam_rt/src/context/calls.rs:737` `move_result_into_process_heap`, ~line 780 `process.grow_nursery(needed.max(256))`) and the engine's unrooted `alloc_words` seam (`erts_rust/crates/beam_rt/src/context/gc.rs:815`, ~line 837) both call `Process::grow_nursery` (`erts_rust/crates/beam_process/src/process.rs:1356`) → `Nursery::grow` (`erts_rust/crates/beam_gc/src/nursery.rs:134-150`), which pushes the **replaced whole `HeapSpace`** onto `Nursery.retired: Vec<HeapSpace>`; `retired` is cleared **only** by `Nursery::collapse` (a real collection), and these loops never collect ⇒ one whole `HeapSpace` retained per growth (~**2–3 KiB/iteration**; `foreign` `enc` ≈2.0, `lower` ≈2.9). `ets_copy` just has the largest `N`. **Not ETS-specific** (§3.6) and **m10-invariant** (the identical sweep at m10 gives the same RSS curve — `b54-foreign-growth-curve.md`).
-   *Fix shape (owner's call):* collapse/shrink the retired chain when it is safe to do so. `beam_rt`/`beam_process`/`beam_gc`.
-   *Expected win:* make `ets_copy`'s per-op memory flat like `gc_bound`'s; it is the last loop whose peak RSS *rises* above the oracle's.
-6. **`copy_bound etf_roundtrip` improved 28.51 % (9 838.00 → 7 033.39 ns/op) and is now the narrowest copy ratio (10.81× vs sys 650.49)** — de-prioritised; it is in the stable band together with `ets_copy` (10.28×).
-7. **m10's item-6 `slice` system-module per-process regression is CLOSED.** m10 rust walls 15.38–48.12 ms → m11 **15.35–37.85 ms** (`gb_trees_size` 25.12→16.56, `base64_encode_size` 26.68→17.23, `ordsets_from_size` 26.15→15.96, `queue_from_size` 26.00→21.02, `string_str_length` 48.12→37.85). `string_str_length` remains the single cold-start case (lazy per-function compile, rust 37.85 ms mean vs the ~15–16 ms floor) — a **low-priority refinement, not a hole**.
-8. **External sys-only targets remain reference-only** — no Rust-runtime row exists for them (§4, §5); `emqx` is the one exact mechanical skip (`emqx-requires-otp-28`).
+1. **`copy_bound send_recv` = 16 178.4× (25.6 ms/op) and `send_recv_plain` past its 60 s deadline — the OPEN ~25.5 ms blocked-round defect.** *Evidence:* `send_recv` N=0/200/400/2000 → 2 098 / 7 164 / 12 274 / 53 141 ms (≈25.5 ms/round, ~2 % CPU); the same shape in both tiers. *Cause:* the booted kernel's `os:set_signal/2` self-pipe keeps `PortRegistry::has_nothing_to_poll()` false, so each blocked round sleeps `PORT_POLL_SLICE` = 25 ms. *Owner:* `beam_rt` (`crates/beam_rt/src/runtime/scheduler.rs`, `port.rs`), commit `85ee33b2f8`; **being fixed in parallel**. *This is the single largest number in the record and it is a scheduler defect, not a messaging-cost measurement.*
+2. **Every rust whole-process wall (`baseline startup_ms` 19.05×, `slice` 13.7×–17.5×) — the OPEN ~2.1 s `run`-route boot.** *Evidence:* 2 084–2 111 ms for `run … 0` on HEAD vs 17–19 ms on m10 vs 18 ms with an empty boot script; boot script drive at commit `85ee33b2f8` (m11 measured 0.135× on the same row). *Owner:* `beam_rt`. *Fix shape:* make the boot drive's cost proportional to what it actually needs (or lazy/optional on the bare `run` action).
+3. **`foreign` — the residual per-call cost is now flat in `N`; the rust/sys gap is 38.9×–66.9×.** The Θ(N³) growth is **CLOSED** (A/B 0.87×–0.99× of m10; `enc` ladder 473→28.44 µs at N=25 000 vs 729 µs at m11). What remains is the flat Rust per-call host-context cost, owned by `../../crates/beam_rt/PERF.md` (the registered-BIF dispatch path), **not** by this node.
+4. **`copy_bound etf_roundtrip` = 47.88× — now the Θ(atom-table) `binary_to_term` boot effect.** *Evidence:* `etf/1` N=5 000 → 2 404 ms HEAD (0.642 s CPU) vs 56 ms empty-boot vs 79 ms m10; the atom table grows ~70 → ~4 100 during boot, so `prefix_matches` validation is Θ(table). *Owner:* `beam_rt` (codec/atom table). *Fix shape:* an atom-table-aware lookup index for decode validation. **Highest-value non-scheduler fix** (it is 4× the m11 `etf` figure).
+5. **`gc_bound churn` = 39.58× (184.40 µs/op) — the allocate-and-abandon execution cost, plus the unchanged retired-heap retention behind the loop workloads' rust RSS.** The **default JIT is 2.07× cheaper than the interpreter** on the same loop (a Rust-vs-Rust tier effect), so the tier is doing its job; the residual is execution + retention. *Owner:* `beam_rt`/`beam_gc` (`Nursery.retired` collapsed only by a real collection; §6.7).
+6. **`list_walk` = 14.50× (110.21 ns/element) — partly an instrument artefact.** *Evidence:* the marginal **rose** 139.72 % while the loop code did not change; the startup-cancelled subtraction now removes a high-jitter ~2.1 s boot. *Owner:* `beam_rt` (boot); the **dispatch signal itself is unchanged in shape** (§3.5). **Re-measure after the boot fix** before treating 110.21 ns as the per-element cost.
+7. **`baseline compute_loop_ms` 12.50× / `compute_ops_per_sec` 0.080×** — dominated by the boot wrapping the natively-served `lists:seq/2`+`lists:sum/1`; falls with item 2. **`vm_memory_total_bytes` stays 2.28× LOWER than the oracle** — the one cross-runtime memory comparison that is clean at m12.
+8. **`ets_copy` = 9.96× — the narrowest copy ratio and the only one that is not boot-limited** (289.51 → 2 883.75 ns/op). De-prioritised: it is the stable term-copy-band member (cf. m11's 10.28×).
+9. **Contract A.9 / self-hosted build** — `beam_rt` still does not compile or run itself, and no compiler workload is executed by `beam_rt` (§4.5/§4.6 are system-toolchain reference rows). The `run`-route boot fix (item 2) is a prerequisite for making an in-VM compile loop affordable.
+10. **External sys-only targets remain reference-only** — no Rust-runtime row exists for them (§4, §5); `emqx` is the one exact mechanical skip (`emqx-requires-otp-28`).
 
 ## Honesty audit — measurement-integrity notes
 
 No workload returns a hard-coded or estimated metric; a workload that fails to build/run is always `failed`/`skipped`, never a number (verified across `src/workloads/*.rs`, `src/compare.rs`, `src/report.rs`, `src/runtime.rs`). No `todo!`/`unimplemented!`/non-doc `unreachable!`, no `#[ignore]`.
 
-- **`foreign` classifies a staging failure honestly** (`src/workloads/foreign.rs`: `StageError` + `stage_outcome`): a checkout whose foreign `.erl` sources are genuinely absent ⇒ `skipped(sources-missing)`, while a failure to compile the sources we *did* stage (the embedded driver or a present foreign source) ⇒ `failed(module-compile-failed)` — matching the workloads whose sources are ours (`list_walk`/`copy_bound`/`gc_bound`). `slice` treats a failed fixture rebuild as `skipped(fixture-missing)`.
-- **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` are computed from the *produced* counts**, so a partial `erlc` run cannot overstate throughput next to `files_compiled`. `elixir_compiler` likewise uses the produced count.
-- **A version-constrained tool is resolved by version, and the choice is auditable.** `plb` calls `tool::command_for_min(TOOL, TOOL_NIX_ATTR, MIN_DOTNET_SDK)` (min `9`), which probes every candidate's `--version` and selects the greatest satisfying one. The resolved binary + version + source and every rejected candidate's reason are recorded in the row's `notes` — in **both** the success and the build-failure branch (§4.1). `khepri`'s `runtimes[]` version describes the driver's oracle, not necessarily the Erlang the store `rebar3` escript chose (§4.2).
+- **The `send_recv_plain` rust case is reported as a failure, not a number.** The `copy_bound` row stays `ok` (3 ok / 0 unsupported of 4) and carries the deadline failure; the sys side of the same case ran and produced 662.18 ns/op. The failure is attributed to `beam_rt`'s blocked-round defect (§3.10) with the probe evidence, so it is a deadline/defect record — not a claim about the target program.
+- **`foreign` classifies a staging failure honestly** (`src/workloads/foreign.rs`: `StageError` + `stage_outcome`): genuinely absent foreign `.erl` sources ⇒ `skipped(sources-missing)`; a failure to compile sources we *did* stage (the embedded driver or a present foreign source) ⇒ `failed(module-compile-failed)` — matching `list_walk`/`copy_bound`/`gc_bound`. `slice` treats a failed fixture rebuild as `skipped(fixture-missing)`.
+- **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` are computed from the *produced* counts**, so a partial `erlc` run cannot overstate throughput next to `files_compiled`. `elixir_compiler` likewise uses the produced count (§4.6).
+- **A version-constrained tool is resolved by version, and the choice is auditable.** `plb` calls `tool::command_for_min(TOOL, TOOL_NIX_ATTR, MIN_DOTNET_SDK)` (min `9`), which probes every candidate's `--version` and selects the greatest satisfying one; the resolved binary + version + source and every rejected candidate's reason are in the row's `notes` (§4.1). `khepri`'s `runtimes[]` version describes the driver's oracle, not necessarily the Erlang the store `rebar3` escript chose (§4.2).
 - `proc.rs`'s drain-thread join (`h.join().unwrap_or_default()`) is infallible **by construction** — the drain threads run only `read_to_end` + a lossy UTF-8 conversion, neither of which can panic — so the `unwrap_or_default` masks nothing real; the invariant is documented at the call site.
 - `baseline.rs`'s docs correctly state that both runtimes serve `erlang:memory/0,1` (`beam_rt` via its `MemoryHook` seam), recording a real `vm_memory_total_bytes` for `rust`; `is_capability_gap` survives only as a fallback classifier.
-- The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as this document states (startup-cancelled `(mean wall@N − mean wall@0) / N`). The `foreign` workload additionally emits the deterministic `case_<name>_calls = N` companion (mirroring `copy_bound`'s `case_<name>_ops`) and records the **N-dependence caveat** as an explicit Rust-row note, so a `ns_per_call` figure is never quoted without its `N` and the `N`-specificity is machine-visible (§3.4). The runtime-side hot-path figures (registered-BIF dispatch ≈ 79–96 ns/call; `pb:tr/2`'s `trunc/1` ≈ 76 ns/iter) are `beam_rt` measurements (`../../crates/beam_rt/PERF.md`, `../../crates/beam_rt/TRACE_AND_PERF.md`), **not** produced here.
-- **Boot status is recorded as fact, not as a metric:** `beam_rt -boot bootstrap/bin/start` exits `3` on `opcode: run: process blocked (no message available)` at directive 18 of 22 (§3.10, §6.8). No boot completion is claimed anywhere.
-- **The m11 tier control is a `--quick` run**, and its `foreign` rows are the pathological interpreter (§3.9); the **matched-form** default-tier `--quick` control (`m11-bench-xrun-quick.json`) exists precisely so the tier comparison is like-for-like, and the mismatched `m11-compare-tier-effect.txt` is labelled a form mismatch. Every tier table is labelled **Rust-vs-Rust**; every cross-runtime ratio names `sys` (system ERTS) and `rust` (`beam_rt` default tier) explicitly.
-- **`m11` pass integrity:** the driver and `beam_rt` were built from commit `ab6f1b5e58835cbf5fcb75257679532c46090a74`; every run's stdout was checked against the deterministic constant on both sides; the tier control is a separate artefact (`m11-bench-xrun-interp.json`, plus the matched `m11-bench-xrun-quick.json`) so the Rust tiers cannot be conflated with the `sys` column; all committed artifact paths are normalised (`runtimes[].program` → `erts_rust/target/release/beam_rt`; a scratch `$TMPDIR` prefix in `notes` → `$TMPDIR/`).
+- The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as this document states (startup-cancelled `(mean wall@N − mean wall@0) / N`), and each of those workloads emits its deterministic companion (`case_*_ops` / `*_calls` / `*_elements`) so the loop count behind every marginal is machine-visible. The runtime-side hot-path figures (registered-BIF dispatch ≈79–96 ns/call; `pb:tr/2`'s `trunc/1` ≈76 ns/iter) are `beam_rt` measurements (`../../crates/beam_rt/PERF.md`, `../../crates/beam_rt/TRACE_AND_PERF.md`), **not** produced here.
+- **Boot status is recorded as fact, not as a metric:** `beam_rt -boot bootstrap/bin/start` exits **0** (wall ≈2.07–2.09 s) and `run … 0` costs ≈2.1 s (§3.10). The OPEN defect is labelled OPEN and attributed to `beam_rt`; no fix is claimed.
+- **The two m12 tier controls are both `--quick`** (matched form), and the as-specified `m12-compare-tier-effect.txt` (interpreter `--quick` vs default `--full`) is labelled a form mismatch and accompanied by `m12-compare-tier-effect-quick.txt`. Every tier table is labelled **Rust-vs-Rust**; every cross-runtime ratio names `sys` (system ERTS 29.1.1 / erts-17.1) and `rust` (`beam_rt` default tier) explicitly.
+- **`m12` pass integrity:** the driver and `beam_rt` were built from the tree `ee3e426db0`; every run's stdout was checked against the deterministic constant on both sides; the tier control is separate artifacts so the Rust tiers cannot be conflated with the `sys` column; the `foreign` A/B used an **interleaved** head/m10 schedule (each pass bracketed by its own `N=0` startups) so the comparison is drift-resistant; all committed artifact paths are normalised (`runtimes[].program` → `erts_rust/target/release/beam_rt`; a scratch `$TMPDIR` prefix in `notes` → `$TMPDIR/`). **No metric value was altered.**
 
-**Reproducibility note (PLB / tool resolution).** `plb`'s outcome is *tool- and environment* state, not repository state. The resolver picks the **greatest `dotnet` ≥ 9.0** across `PATH` + `$BENCH_TOOL_PATH` + the Nix store, so `plb` runs wherever any 9.x+ SDK is reachable — even with an older `dotnet` first on `PATH`. `khepri` needs only the `rebar3` store entry and runs as-is.
+**Reproducibility note (PLB / tool resolution).** `plb`'s outcome is *tool- and environment* state, not repository state. The resolver picks the **greatest `dotnet` ≥ 9.0** across `PATH` + `$BENCH_TOOL_PATH` + the Nix store, so `plb` runs wherever any 9.x+ SDK is reachable — even with an older `dotnet` first on `PATH`. `khepri` needs only the `rebar3` store entry and runs as-is. `emqx` remains a genuine toolchain skip on any host without an OTP-28 Erlang that can pair with the Elixir/`mix` the umbrella build uses.
 
 ## Archived artifacts
 
 | file | contents |
 |---|---|
-| `results/m11-bench-xrun.json` | **current cross-runtime run**: `--full --runtime all`, the six `Runtimes::Both` workloads × both runtimes, 12/12 rows `ok` (load 6.04 → 2.98, wall 2m54s) — the source of §3 |
-| `results/m11-bench-xrun-interp.json` | **the tier-effect control**: the same six workloads, `rust` only, `BEAM_RT_TIER=interpreter`, 6/6 rows `ok` — **profile `quick`** (the interpreter tier is pathological on `foreign` at this commit; §3.9), load 1.81 → 2.59, wall 12m27s. **Rust-vs-Rust only; no `sys` rows.** |
-| `results/m11-bench-xrun-quick.json` | **supplementary matched-form default-tier control**: the same six workloads, `rust` only, default (baseline-JIT) tier, `--quick` — the same form as the interpreter control, so the tier table is read off two `--quick` runs (load 2.38 → 2.16, wall 17s). **Rust-vs-Rust only.** |
-| `results/m11-compare-cross-runtime.txt` | `bench compare` — sys vs rust inside `m11-bench-xrun.json` (74 numeric rows; the tool diffs the **mean**) |
-| `results/m11-compare-tier-effect.txt` | `bench compare m11-bench-xrun-interp.json m11-bench-xrun.json` — Rust interpreter (`--quick`) → Rust default (`--full`); **form mismatch** (`a` = interpreter) |
-| `results/m11-compare-tier-effect-quick.txt` | `bench compare m11-bench-xrun-interp.json m11-bench-xrun-quick.json` — the **matched-form** `--quick` ↔ `--quick` tier control (§3.9) |
-| `results/m11-compare-vs-m10-xrun.txt` / `results/m11-compare-vs-m10-external.txt` | the tool's two-file diffs against the m10 record — the source of §7 |
-| `results/m11-bench-external.json` | the external sys-only targets in one `--full` report: `erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri` (§4.2, §4.4–§4.6; load 1.36 → 2.36, wall 3m11s) |
-| `results/m11-bench-plb.json` | `plb` → `ok`, `wall_ms` 68 318.69, `dotnet` 9.0.318 resolved from `PATH` (§4.1) |
-| `results/m11-bench-emqx.json` | EMQX → `skipped(emqx-requires-otp-28)` (§4.3) |
-| `results/m11-load-record.md` | the m11 pass: commit measured, exact commands, the `/proc/loadavg` before/after each run, per-workload status, per-case detail, the tier-effect table and the boot-status probe |
-| `results/m11-tool-targets-notes.md` | the factual per-target status/blocker notes and the environment findings |
-| `results/b54-foreign-ab-m10.json` | **BATCH-54 controlled A/B (m10 side)**: `bench run --quick --runtime rust --workloads foreign` with `$BEAM_RT` = the m10 (`b4593818b3`) `beam_rt`; matched `N` against the HEAD artifact below (§3.4) |
-| `results/b54-foreign-ab-head.json` | **BATCH-54 controlled A/B (HEAD side)**: the same command with `$BEAM_RT` = the HEAD `beam_rt` — `enc` **84 873.04 vs 16 964.14** ns/call = **5.00×**, `lower` 1.24×, `cap` 1.22×, `dec` 1.23× (§3.4) |
-| `results/b54-foreign-growth-curve.md` | **BATCH-54 growth-curve record**: the direct `enc` ladder on both binaries (default **and** interpreter tiers), wall ms + peak `VmHWM`, `/proc/loadavg` around each pass, and the exact reproduction commands (§3.4, §6.7, §8 items 1 and 5) |
-| `results/m10-*` | the **previous** run (2026-10-13 23:06–23:15 UTC): the cross-runtime report + `BEAM_RT_TIER=interpreter` control, the per-target reports, the cross-runtime/tier/vs-m9 diffs, and the `m10-load-record.md`/`m10-tool-targets-notes.md` records — **regression baseline for §7** |
-| `results/m9-*` / `results/m6-*` / `results/m5-*` / `results/m4-*` | the runs before that (2026-10-13 / 2026-10-11 / 2026-10-09 / 2026-10-08), kept as earlier regression baselines |
+| `results/m12-bench-xrun.json` | **current cross-runtime run**: `--full --runtime all`, the six `Runtimes::Both` workloads × both runtimes, **12/12 rows `ok`** (load 65.28 → 6.93, wall 1 795 s) — the source of §3 |
+| `results/m12-bench-xrun-interp.json` | **the tier control (interpreter)**: the same six workloads, `rust` only, `BEAM_RT_TIER=interpreter`, 6/6 rows `ok`, **profile `quick`** (wall 391 s). **Rust-vs-Rust only; no `sys` rows.** |
+| `results/m12-bench-xrun-quick.json` | **the matched-form default-tier control**: the same six workloads, `rust` only, default (baseline-JIT) tier, `--quick` (wall 488 s) — so the tier table is read off two `--quick` runs. **Rust-vs-Rust only.** |
+| `results/m12-compare-cross-runtime.txt` | `bench compare` — sys vs rust inside `m12-bench-xrun.json` (the tool diffs the **mean**) |
+| `results/m12-compare-tier-effect.txt` | `bench compare m12-bench-xrun-interp.json m12-bench-xrun.json` — the as-specified interpreter(`--quick`) → default(`--full`) pair; **form mismatch** |
+| `results/m12-compare-tier-effect-quick.txt` | `bench compare m12-bench-xrun-interp.json m12-bench-xrun-quick.json` — the **matched-form** `--quick` ↔ `--quick` tier control (§3.9) |
+| `results/m12-compare-vs-m11-xrun.txt` / `results/m12-compare-vs-m11-external.txt` | the tool's two-file diffs against the m11 record — the source of §7 |
+| `results/m12-bench-external.json` | the external sys-only targets in one `--full` report: `erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri` (**4/4 `ok`**; §4.2, §4.4–§4.6) |
+| `results/m12-bench-plb.json` | `plb` → `ok`, `wall_ms` 70 648.46, `dotnet` 9.0.318 resolved from `PATH` (§4.1) |
+| `results/m12-bench-emqx.json` | EMQX → `skipped(emqx-requires-otp-28)` (§4.3) |
+| `results/m12-foreign-ab-head.json` | the **re-derived** `foreign` A/B (HEAD side): `bench run --quick --runtime rust --workloads foreign` with `$BEAM_RT` = the HEAD `beam_rt` — matched `N` against the m10 artifact below (§3.4) |
+| `results/m12-foreign-ab-m10.json` | the A/B m10 side: the same command with `$BEAM_RT` = the m10 (`b4593818b3`) `beam_rt` (program normalised to `$TMPDIR/m10wt/erts_rust/target/release/beam_rt`) |
+| `results/m12-foreign-regression.md` | the `foreign` **Θ(N³) fix** record: the interleaved 5-pass `enc/1` ladder (head vs m10, µs/call at N = 5 000…60 000, both tiers), the sub-case ladders, the driver A/B pair, and the corrected cross-runtime band |
+| `results/m12-run-route-latency.md` | the **OPEN** `run`-route record: the ≈2.1 s fixed startup, the ~25.5 ms blocked round, the Θ(atom-table) decode, the `-boot` exit-0 fact, and the root cause (`85ee33b2f8`) |
+| `results/m12-load-record.md` | the m12 pass: commit measured, exact commands, the `/proc/loadavg` before/after each run, per-workload status, per-case detail, the tier table and the boot probe |
+| `results/m12-tool-targets-notes.md` | the factual per-target status/blocker notes and the environment findings |
+| `results/m11-*` | the **previous** run (2026-10-14 05:47–06:57 UTC): the cross-runtime report, the interpreter + matched-quick controls, the per-target reports, the cross-runtime/tier/vs-m10 diffs, and the `m11-load-record.md`/`m11-tool-targets-notes.md` records — **regression baseline for §7** |
+| `results/b55-foreign-regression-fix.md` + `results/b55-foreign-ab-{head,m10}.json` | the fixing agent's committed evidence for the Θ(N³) fix (superseded by the m12 re-derivation above; kept as history) |
+| `results/b54-foreign-ab-{m10,head}.json` + `results/b54-foreign-growth-curve.md` | the batch-54 controlled experiments that root-caused the Θ(N³) regression (kept as history) |
+| `results/m10-*` / `results/m9-*` / `results/m6-*` / `results/m5-*` / `results/m4-*` | earlier runs (2026-10-13 / 2026-10-13 / 2026-10-11 / 2026-10-09 / 2026-10-08), kept as earlier regression baselines |
 
 The archived copies are the harness output except for two mechanical normalisations that strip environment-specific absolute paths: the run-host worktree prefix in `runtimes[].program` is replaced with the workspace-relative `erts_rust/target/release/beam_rt`, and a scratch `$TMPDIR` prefix in `notes` is replaced with `$TMPDIR/`. **No metric value is altered.**
