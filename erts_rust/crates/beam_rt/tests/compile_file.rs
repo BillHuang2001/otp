@@ -684,6 +684,143 @@ fn a_scheduled_process_compiles_a_source_file_in_process_like_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Test 5: a REAL stdlib module — the A.9 chain's compile half, byte for byte
+// ---------------------------------------------------------------------------------------
+
+/// The repository root: `$ERL_TOP` when set, else three levels up from this crate's manifest
+/// directory (`<root>/erts_rust/crates/beam_rt`) — the same discovery the in-crate
+/// `src/context/pump.rs` suite uses.
+fn source_root() -> PathBuf {
+    match std::env::var_os("ERL_TOP") {
+        Some(value) => PathBuf::from(value),
+        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."),
+    }
+}
+
+/// `compile:file(Source, [no_spawn_compiler_process, deterministic, no_docs, {outdir, Dir}])`
+/// — the *identical* option list both runtimes are given for a real module.
+///
+/// `no_docs` is what makes a real module's artifact comparable at all: a stdlib `.beam` carries
+/// a compressed `Docs` chunk, and its bytes are the one part of the artifact a rebuild may
+/// legitimately vary. With the chunk suppressed (on **both** sides), the remaining bytes are a
+/// function of the source and the option list alone — the same argument the end-to-end test
+/// above makes for its `Dbgi` comparison.
+fn stdlib_probe(src: &Path, outdir: &Path) -> String {
+    format!(
+        "R = compile:file({}, [no_spawn_compiler_process, deterministic, no_docs, {{outdir, {}}}]),\n\
+         io:format(\"RET ~p~n\", [R]),\n\
+         halt(0).",
+        literal(src),
+        literal(outdir)
+    )
+}
+
+/// **The real-module byte-identity.** `lib/stdlib/src/ordsets.erl` is compiled in process under
+/// the Rust runtime and under the system `erl` with the **identical** option list
+/// ([`stdlib_probe`]), each into its own output directory, and the two `.beam` artifacts must be
+/// **byte-identical**.
+///
+/// This is the compile half of the A.9 self-hosted chain: the two tests above prove the
+/// in-process route on a hand-written fixture (and on the scheduled route), and this one proves
+/// it scales to a real OTP module — one whose source imports other modules, uses records,
+/// binaries and comprehensions, and is 13 kB rather than four forms. Its consumer, the sibling
+/// `selfhost_chain.rs` suite, additionally puts exactly this artifact's directory on the code
+/// path and loads and runs modules from it in one invocation.
+///
+/// # Cost
+///
+/// `ordsets.erl` is the cheap end of the real-module range: ~1.4–2.2 s for the whole test on
+/// this host (the runtime's in-process compile plus the oracle's; host load moves the figure).
+/// The heavier real-module compiles —
+/// `calendar.erl` ≈ 6.6 s and `lists.erl` ≈ 21 s — are deliberately **not** here; they are
+/// covered by the in-crate `src/context/pump.rs` test
+/// (`a_real_stdlib_module_compiles_in_process_like_the_oracle`, which byte-compares both of
+/// them).
+///
+/// A missing oracle — or a checkout with no source tree (an installed-only or relocated build,
+/// where `lib/stdlib/src/ordsets.erl` does not exist) — is a **loud skip**, never a silent pass.
+#[test]
+fn a_real_stdlib_module_artifact_is_byte_identical_to_the_oracles() {
+    let Some(oracle) = support::require_oracle("compile_file") else {
+        return;
+    };
+    let src = source_root().join("lib/stdlib/src/ordsets.erl");
+    if !src.is_file() {
+        support::skip_loudly(
+            "compile_file",
+            &format!("no real stdlib source to compile at {}", src.display()),
+        );
+        return;
+    }
+
+    let dir = TempDir::new("stdlib");
+    let rust_out = dir.0.join("rust_out");
+    let oracle_out = dir.0.join("oracle_out");
+    // `compile` does not create the output directory.
+    for out in [&rust_out, &oracle_out] {
+        fs::create_dir_all(out).expect("the output directory");
+    }
+
+    // ---- the oracle's artifact (identical option list) ----
+    let theirs = oracle_eval(&oracle, &stdlib_probe(&src, &oracle_out));
+    assert_eq!(
+        theirs.code, 0,
+        "the oracle must compile ordsets.erl: exit {} — {}",
+        theirs.code, theirs.err
+    );
+    let oracle_artifact = oracle_out.join("ordsets.beam");
+    assert!(
+        oracle_artifact.is_file(),
+        "the oracle wrote no artifact: {}",
+        oracle_artifact.display()
+    );
+
+    // ---- the Rust runtime's artifact (its own output directory) ----
+    let ours = beam_rt_eval(&stdlib_probe(&src, &rust_out));
+    assert_eq!(
+        ours.code, 0,
+        "the in-process compile of a real stdlib module must complete: exit {} — {}",
+        ours.code, ours.err
+    );
+    eprintln!("compile:file/2 of ordsets.erl under beam_rt: {}", ours.out);
+    let rust_artifact = rust_out.join("ordsets.beam");
+
+    // ---- byte-for-byte ----
+    let mine = fs::read(&rust_artifact).unwrap_or_else(|error| {
+        panic!(
+            "the runtime reported {:?} but wrote no {}: {error}",
+            ours.out,
+            rust_artifact.display()
+        )
+    });
+    let reference = fs::read(&oracle_artifact).expect("the oracle artifact");
+    if mine != reference {
+        let at = mine
+            .iter()
+            .zip(reference.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| mine.len().min(reference.len()));
+        eprintln!(
+            "MISMATCH: rust {} bytes vs oracle {} bytes — first difference at byte {at}: {:?} vs {:?}",
+            mine.len(),
+            reference.len(),
+            mine.get(at),
+            reference.get(at)
+        );
+    }
+    assert_eq!(
+        mine,
+        reference,
+        "the in-process artifact of a real stdlib module must be byte-identical to the \
+         oracle's (identical option list)"
+    );
+    eprintln!(
+        "ordsets.erl: in-process compile byte-identical to the oracle ({} bytes)",
+        mine.len()
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // Current state
 // ---------------------------------------------------------------------------------------
 //
