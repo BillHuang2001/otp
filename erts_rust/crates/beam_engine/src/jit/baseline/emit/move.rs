@@ -24,15 +24,18 @@
 
 use beam_common::Result;
 use beam_loader::Operand;
+use beam_term::Eterm;
 
-use crate::jit::emitter::{CodeBuffer, Label as CodeLabel, Reg};
+use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
 use super::operands::{
     constant_word, emit_guarded_y_load, emit_guarded_y_store, x_offset, x_register, y_addressable,
     y_register, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2,
 };
+use super::super::runtime::{RUNTIME_LITERALS_DISP, RUNTIME_LITERALS_END_DISP, RUNTIME_SLOT_DISP};
 use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
+use std::mem;
 
 /// The third caller-saved scratch a Y-operand `move` needs.
 ///
@@ -66,6 +69,12 @@ enum MoveValue {
     Y(u32),
     /// A constant operand, materialised as its raw `Eterm` word.
     Constant(i64),
+    /// A static literal, by index into the module's literal area
+    /// (`Operand::Literal(n)`): loaded **at run time** from the base the driver
+    /// publishes ([`super::super::runtime::JitRuntime::refresh_literals`]) — never
+    /// baked into the emitted code as an immediate (a cached artifact outlives the
+    /// particular `Arc<Module>` it was compiled for; see the field docs).
+    Literal(u32),
 }
 
 /// Where a `move`'s value is written, syntactically.
@@ -167,6 +176,18 @@ pub(crate) fn move_shape(src: &Operand, dst: &Operand) -> Option<MoveShape> {
             return None;
         }
         MoveValue::Y(k)
+    } else if let Operand::Literal(index) = src {
+        // A **literal-area** source. Unlike the other three kinds, whether it is
+        // inlinable does not depend on the *module* at all: the word is loaded from
+        // the area the driver publishes at run time, and an absent area (or an index
+        // out of it) is a **run-time guard rejection**, not a compile-time refusal —
+        // which keeps `move_shape` module-independent, exactly as
+        // `super::regalloc::cacheable_touches` needs it to be. The one compile-time
+        // refusal left is the `disp32` the load's addressing carries.
+        if !literal_addressable(*index) {
+            return None;
+        }
+        MoveValue::Literal(*index)
     } else {
         MoveValue::Constant(constant_word(src)?)
     };
@@ -225,6 +246,24 @@ pub(super) fn try_inline_move(
         return Ok(false);
     };
 
+    // A literal-area source: the word is loaded at run time from the area the driver
+    // published (see [`emit_move_literal`]) behind the literal guard. This comes first
+    // because it handles **both** destination kinds — an in-bound x-register and an
+    // addressable `Y` slot — through the machinery the other lowerings already use.
+    if let MoveValue::Literal(index) = shape.source {
+        emit_move_literal(
+            buffer,
+            &shape,
+            index,
+            allocation,
+            done,
+            func,
+            pc,
+            highest_touched,
+        )?;
+        return Ok(true);
+    }
+
     if shape.uses_y() {
         emit_move_y(
             buffer,
@@ -250,7 +289,10 @@ pub(super) fn try_inline_move(
             None => MoveSource::Memory(src_x),
         },
         MoveValue::Constant(word) => MoveSource::Constant(word),
-        MoveValue::Y(_) => return Ok(false),
+        // Unreachable: a literal source is lowered by `emit_move_literal` before this
+        // arm is reached (it handles both destination kinds). Kept as a refusal rather
+        // than a panic so a hypothetical future path deopts instead of mis-emitting.
+        MoveValue::Y(_) | MoveValue::Literal(_) => return Ok(false),
     };
 
     match (allocation.slot(dst_x), source) {
@@ -330,6 +372,17 @@ fn emit_move_y(
             }
         },
         MoveValue::Y(k) => emit_guarded_y_load(buffer, MOVE_SCRATCH, Y_SCRATCH, k, fallback)?,
+        // Unreachable from `try_inline_move` (a literal source takes `emit_move_literal`),
+        // but emitted in full rather than refused: the load is the same guarded read into
+        // the value scratch, so this arm is correct even if a future path reaches it.
+        MoveValue::Literal(index) => emit_guarded_literal_load(
+            buffer,
+            MOVE_SCRATCH,
+            MOVE_SCRATCH_2,
+            Y_SCRATCH,
+            index,
+            fallback,
+        )?,
         MoveValue::Constant(word) => buffer.mov_ri(MOVE_SCRATCH, word)?,
     }
 
@@ -343,6 +396,138 @@ fn emit_move_y(
                 touch(highest_touched, dst_x);
             }
         },
+        MoveDest::Y(k) => {
+            emit_guarded_y_store(buffer, MOVE_SCRATCH, MOVE_SCRATCH_2, Y_SCRATCH, k, fallback)?
+        }
+    }
+    buffer.jmp(fast_done)?;
+
+    // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
+    Ok(())
+}
+
+/// Whether a literal index is addressable as the `disp32` of the emitted load.
+///
+/// `y_addressable`'s twin for the literal area: a `disp32` cannot carry an offset past
+/// `i32::MAX`, so an index whose byte offset would not fit is refused at **compile**
+/// time (a deopt is always correct — the interpreter runs the instruction). Reachable
+/// only for a malformed module: `LitT`'s payloads are bounded by the chunk size, so a
+/// real literal index is orders of magnitude below the bound.
+fn literal_addressable(index: u32) -> bool {
+    (index as u64)
+        .checked_mul(mem::size_of::<Eterm>() as u64)
+        .is_some_and(|offset| offset <= i32::MAX as u64)
+}
+
+/// The byte offset of literal `index` inside the published area — the displacement the
+/// emitted `lea [base + index*8]` carries. `index` must satisfy [`literal_addressable`].
+fn literal_offset(index: u32) -> i32 {
+    (index as i32) * (mem::size_of::<Eterm>() as i32)
+}
+
+/// Emit the **guarded** load of literal `index` into `value`, jumping to `fallback`
+/// when the index lies outside the literal area the driver published.
+///
+/// This is the literal-area twin of [`emit_guarded_y_address`], in the identical
+/// shape and with the identical "null means reject every access" discipline:
+///
+/// ```text
+///   mov  addr, [rsp + RUNTIME_SLOT_DISP]        ; rt (the block's own stack slot)
+///   mov  end,  [addr + RUNTIME_LITERALS_END_DISP]
+///   mov  addr, [addr + RUNTIME_LITERALS_DISP]   ; the area's base
+///   lea  addr, [addr + index*8]                 ; &area[index]
+///   cmp  addr, end
+///   jae  fallback                               ; no area, or index >= len
+///   mov  value, [addr]                          ; the literal word, untouched
+/// ```
+///
+/// The guard can only ever **reject**, so an absent area (base and end both null, which
+/// makes `index*8 >= 0` true for every index) or an out-of-area index costs exactly the
+/// `jit_step_one` step it cost before this lowering existed — and the interpreter then
+/// reports its own exact result, including its faithful out-of-range behaviour. The
+/// loaded word is copied verbatim: it stays a pointer into the shared, read-only literal
+/// area, never rebuilt and never copied.
+///
+/// `value`, `addr` and `end` must be three distinct caller-saved scratch registers that
+/// are dead at the access; none may be a cache register ([`super::CACHE_REGISTERS`]) or
+/// the block's reserved `rbx`/`rsp`.
+fn emit_guarded_literal_load(
+    buffer: &mut CodeBuffer,
+    value: Reg,
+    addr: Reg,
+    end: Reg,
+    index: u32,
+    fallback: CodeLabel,
+) -> Result<()> {
+    buffer.mov_rm(addr, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    buffer.mov_rm(end, addr, RUNTIME_LITERALS_END_DISP)?;
+    buffer.mov_rm(addr, addr, RUNTIME_LITERALS_DISP)?;
+    buffer.lea(addr, addr, literal_offset(index))?;
+    buffer.cmp_rr(addr, end)?;
+    buffer.jcc(Cond::Ae, fallback)?;
+    buffer.mov_rm(value, addr, 0)
+}
+
+/// Lower a `move` whose **source is a literal-area index** (see [`try_inline_move`]).
+/// The emitted shape:
+///
+/// ```text
+///   <the guarded literal load into MOVE_SCRATCH>   ; [base + index*8], behind the
+///                                                  ;   area guard (MOVE_SCRATCH_2 =
+///                                                  ;   the address, Y_SCRATCH = the
+///                                                  ;   published area end)
+///   <store MOVE_SCRATCH into the destination>
+///     ; an x-register: its cache register, or `mov [rbx + x*8], MOVE_SCRATCH`
+///     ; a Y slot:      the guarded Y store (see `emit_move_y`)
+///   jmp  fast_done
+/// fallback:
+///   <the `emit_step_and_continue` sequence: spend one `jit_step_one` on the
+///    instruction — which either advances and lets the block carry on at
+///    `pc + 1`, or exits to the driver with the helper's word>
+/// fast_done:
+///   <emit the rest of the block>
+/// ```
+///
+/// Nothing is committed before a guard can reject (the word lives only in
+/// `MOVE_SCRATCH`), so a rejection leaves the machine exactly as the interpreter will
+/// re-run it. `MOVE_SCRATCH_2`/`Y_SCRATCH` are dead after the load, so the Y store
+/// below reuses them as its own address/bound scratch. A `Y` destination is never
+/// charged to `highest_touched` (it is not an x-register); an x-register destination is,
+/// exactly as [`MoveShape::registers`] lists it.
+#[allow(clippy::too_many_arguments)]
+fn emit_move_literal(
+    buffer: &mut CodeBuffer,
+    shape: &MoveShape,
+    index: u32,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    let fallback: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+
+    emit_guarded_literal_load(
+        buffer,
+        MOVE_SCRATCH,
+        MOVE_SCRATCH_2,
+        Y_SCRATCH,
+        index,
+        fallback,
+    )?;
+
+    match shape.destination {
+        MoveDest::X(dst_x) => {
+            match allocation.slot(dst_x) {
+                Some(reg) => buffer.mov_rr(reg, MOVE_SCRATCH)?,
+                None => buffer.mov_mr(Reg::Rbx, x_offset(dst_x), MOVE_SCRATCH)?,
+            }
+            touch(highest_touched, dst_x);
+        }
         MoveDest::Y(k) => {
             emit_guarded_y_store(buffer, MOVE_SCRATCH, MOVE_SCRATCH_2, Y_SCRATCH, k, fallback)?
         }

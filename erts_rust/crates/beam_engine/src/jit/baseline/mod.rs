@@ -925,7 +925,19 @@ fn drive(
         enter: None,
         y_base: std::ptr::null_mut(),
         y_end: std::ptr::null_mut(),
+        literals_base: std::ptr::null(),
+        literals_end: std::ptr::null(),
     };
+    // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
+    // a `move` with an `Operand::Literal` source loads its word from this base at run
+    // time instead of carrying it as an immediate. The driver publishes at **every**
+    // point it can change the machine's active module — this construction (after any
+    // `start_context` switch above) and each `Step::Enter` arm below — which is
+    // exhaustive because a compiled block can never switch module context itself: a
+    // transfer always leaves the block as the `ENTER` block-ABI word
+    // (`Machine::switch_context` is called from `Machine::drive` and `switch_into`
+    // only), so every rebind of `rt.module` is a driver site.
+    rt.refresh_literals();
 
     loop {
         // Native entry for the ACTIVE module: the caller-owned artifact in context
@@ -993,7 +1005,9 @@ fn drive(
                 )?;
                 rt.module = state.module;
                 rt.labels = state.labels;
-                func = target_func;
+                // The active module changed, so the published literal area did too
+                // (see the publication note at the `JitRuntime` construction above).
+                rt.refresh_literals();                func = target_func;
                 pc = target_pc;
                 continue;
             }
@@ -1082,7 +1096,9 @@ fn drive(
                 )?;
                 rt.module = state.module;
                 rt.labels = state.labels;
-                func = target_func;
+                // The active module changed, so the published literal area did too
+                // (see the publication note at the `JitRuntime` construction above).
+                rt.refresh_literals();                func = target_func;
                 pc = target_pc;
             }
             Step::Done => {

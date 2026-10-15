@@ -129,9 +129,14 @@ pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
 /// A `#[repr(C)]` bag of raw pointers at the live driver-owned objects (valid for
 /// the whole driver call, never aliased while a `&mut` derived from a field is
 /// alive) plus the slot a helper stores a propagating [`BeamError`] in. Generated
-/// code touches **only offsets 0, 8, 16 and 24** ([`RUNTIME_MACHINE_DISP`],
-/// [`RUNTIME_XREGS_DISP`], [`RUNTIME_YBASE_DISP`], [`RUNTIME_YEND_DISP`]); the
-/// remaining fields are read by the Rust-side [`jit_step_one`] helper.
+/// code touches **only the offsets named by the `RUNTIME_*_DISP` constants**
+/// ([`RUNTIME_MACHINE_DISP`], [`RUNTIME_XREGS_DISP`], [`RUNTIME_YBASE_DISP`],
+/// [`RUNTIME_YEND_DISP`], [`RUNTIME_LITERALS_DISP`], [`RUNTIME_LITERALS_END_DISP`]);
+/// the remaining fields are read by Rust only (the driver and the
+/// [`jit_step_one`] helper).
+///
+/// The two literal-area fields are appended **after** [`Self::enter`] so every
+/// pre-existing `#[repr(C)]` offset is untouched.
 ///
 /// `machine` is the [`Machine`] itself (what the helper needs); `x_regs` is the base
 /// of its **x-register array** (`machine.x.as_ptr()`), which is what a block indexes.
@@ -191,9 +196,37 @@ pub(crate) struct JitRuntime<'a> {
     /// The `(context, func, pc)` of a module-context transfer a helper reported with
     /// the [`ENTER`] word; the driver takes it, switches context and re-enters there.
     ///
-    /// Read and written **only by Rust** (the driver and [`jit_step_one`]); the
-    /// generated code loads no field past [`RUNTIME_YEND_DISP`].
+    /// Read and written **only by Rust** (the driver and [`jit_step_one`]).
     pub(crate) enter: Option<(u32, u32, u32)>,
+    /// The base of the **literal area** the machine currently has bound — the first
+    /// word of `Module::literals.terms()` for the active module.
+    ///
+    /// A compiled block loads `Operand::Literal(n)` through this field
+    /// (`[literals_base + n*8]`, behind the guard below) instead of materialising the
+    /// literal as an immediate. That is a **correctness** requirement, not an
+    /// optimisation: a compiled artifact is cached under a key derived from the
+    /// module's **content** (`Module::checksum` / the decoded-IR fingerprint), so a
+    /// cached block can outlive the particular `Arc<Module>` it was compiled for and
+    /// be reused for a re-loaded, byte-identical module — whose literal area is a
+    /// *different* allocation. A baked-in literal-area pointer (or a baked-in literal
+    /// word, which is a pointer into that area) could therefore dangle. Loading from
+    /// the live binding is what makes the tier exact.
+    ///
+    /// Null when no area is bound; [`Self::literals_end`] is null too then, which
+    /// makes every emitted literal access reject (see the literal guard in
+    /// [`super::emit`]) — the same "null means reject every access" discipline the
+    /// Y window uses. Read by generated code at [`RUNTIME_LITERALS_DISP`].
+    pub(crate) literals_base: *const Eterm,
+    /// One past the last word of the bound literal area
+    /// (`literals_base + terms().len()`), or null when none is bound.
+    ///
+    /// Read by generated code at [`RUNTIME_LITERALS_END_DISP`]: the emitted guard is
+    /// `lea addr, [base + n*8]; cmp addr, end; jae reject`, so it rejects both an
+    /// absent area (null base ⇒ `n*8 >= 0 == end`) and an index at/past the area's
+    /// length — the runtime twin of the interpreter's
+    /// [`Machine::literal`](crate::Machine::literal) bounds check, in the exact shape
+    /// of the Y-window guard.
+    pub(crate) literals_end: *const Eterm,
 }
 impl JitRuntime<'_> {
     /// Re-publish the current top frame's Y window into [`Self::y_base`]/[`Self::y_end`].
@@ -241,6 +274,63 @@ impl JitRuntime<'_> {
             }
         }
     }
+
+    /// Re-publish the literal area the machine has bound into
+    /// [`Self::literals_base`]/[`Self::literals_end`].
+    ///
+    /// Read from the machine's **own** binding (context `0`'s entry area, else the
+    /// registered context's module area) rather than from a driver-held module
+    /// pointer, so the published bytes are exactly what
+    /// [`Machine::literal`](crate::Machine::literal) — and therefore the
+    /// interpreter's `read_operand(Operand::Literal(n))` — would yield. The two are
+    /// bound together by `Machine::set_literals` (from `Machine::enter_run` at a
+    /// slice start and from `Machine::switch_context`/`switch_into` at a module
+    /// transfer) and are **never mutated mid-run** by anything else, so a single
+    /// publish at a driver entry point stays correct for every block the driver then
+    /// enters.
+    ///
+    /// `#[inline]`: the body is a handful of loads off the machine and it sits on the
+    /// per-slice entry path, so the call overhead would otherwise be a measurable
+    /// share of a cheap entry.
+    #[inline]
+    pub(crate) fn refresh_literals(&mut self) {
+        // SAFETY: `rt.machine` is a non-null pointer to the driver's live `Machine`;
+        // no other `&mut Machine` exists while this Rust-side helper runs (either the
+        // driver is between blocks, or it is blocked in the block call that reached us).
+        let machine = unsafe { &*self.machine };
+        let (base, end) = match machine.current_context() {
+            // Context `0` is the run's entry module, which the machine does not own:
+            // its area is the one `Machine::enter_run` recorded.
+            0 => match machine.entry_literals.as_ref() {
+                Some(area) => literal_bounds(area),
+                None => (std::ptr::null(), std::ptr::null()),
+            },
+            // A registered callee context: its own module's area, exactly what
+            // `Machine::switch_context` binds.
+            id => match machine.module_context(id) {
+                Some(handle) => literal_bounds(&handle.module.literals),
+                None => (std::ptr::null(), std::ptr::null()),
+            },
+        };
+        self.literals_base = base;
+        self.literals_end = end;
+    }
+}
+
+/// The `(base, end)` pair a literal area publishes: the first literal word and one
+/// past the last.
+///
+/// An area with no literals publishes `end == base`, which rejects **every** index
+/// (the guard is `addr >= end`), so an empty area is as inert as an absent one — the
+/// same discipline as a null Y window.
+fn literal_bounds(area: &beam_loader::LiteralArea) -> (*const Eterm, *const Eterm) {
+    let terms = area.terms();
+    let base = terms.as_ptr();
+    // `wrapping_add` (never `add`): a slice whose length is 0 may carry a dangling
+    // (merely aligned) base, for which `add(0)` would be as valid but `wrapping_add`
+    // states the intent — no dereference ever happens through these pointers unless
+    // the emitted guard has already proven `base + n*8 < end`.
+    (base, base.wrapping_add(terms.len()))
 }
 /// A compiled block's native signature.
 pub(crate) type NativeBlock = for<'a> extern "C" fn(*mut JitRuntime<'a>) -> i64;
@@ -310,6 +400,22 @@ pub(crate) const RUNTIME_YBASE_DISP: i32 = RUNTIME_XREGS_DISP + mem::size_of::<*
 /// The byte offset of [`JitRuntime::y_end`] (one past the current frame's last Y slot)
 /// — the bound the emitted Y-window guard compares a Y slot's address against.
 pub(crate) const RUNTIME_YEND_DISP: i32 = RUNTIME_YBASE_DISP + mem::size_of::<*const u8>() as i32;
+
+/// The byte offset of [`JitRuntime::literals_base`] (the base of the bound literal
+/// area) — a field generated code loads indirectly for an `Operand::Literal(n)`
+/// `move`'s source word.
+///
+/// Computed with [`mem::offset_of!`] rather than by arithmetic on the preceding field:
+/// `error: Option<BeamError>` and `enter: Option<(u32, u32, u32)>` sit between it and
+/// the Y window, and neither has a size the emitter should have to know.
+pub(crate) const RUNTIME_LITERALS_DISP: i32 =
+    mem::offset_of!(JitRuntime<'static>, literals_base) as i32;
+
+/// The byte offset of [`JitRuntime::literals_end`] (one past the bound literal area's
+/// last word) — the bound the emitted literal guard compares a literal's address
+/// against, and the reason an absent area rejects every index.
+pub(crate) const RUNTIME_LITERALS_END_DISP: i32 =
+    RUNTIME_LITERALS_DISP + mem::size_of::<*const Eterm>() as i32;
 
 // ---------------------------------------------------------------------------
 // The helper
