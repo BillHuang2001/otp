@@ -211,10 +211,20 @@ tier still fails to lower — the evidence a widening of the inline set is chose
   `crate::jit::bench::assert_tier_agreement()` with recording on and dumps the per-variant
   `Counters::deopts_by_variant` the executed blocks produced — which un-lowered opcodes
   dominate the **hot** shapes.
-Both write a machine-readable TSV to `std::env::temp_dir()` and assert only liveness/consistency
+- **Emitted byte size** (`census.rs::the_per_kind_emitted_code_size_table_is_printed`): for the
+  in-block lowerings already present (`Move` incl. the literal-area source, the Y-operand
+  `test`/`select_val`/`select_tuple_arity` shapes, `Call`, the unlinked `CallLast` tail exit, the
+  family arm, the named-BIF accessors) it compiles each shape as a single-IR-block function through
+  `emit::compile_function` (counters on) and prints its whole-block emitted byte length against a
+  one-`func_info`-block **deopt reference** (199 B whole block; the `2N − N` marginal isolates the
+  60 B per-occurrence deopt sequence). Per-kind attribution is exact because each shape compiles as
+  its own single-block function; it also prints the whole-artifact `code_len` of the committed
+  fixtures.
+All three write a machine-readable TSV to `std::env::temp_dir()` and assert only liveness/consistency
 (never a threshold), so the printed rankings are the evidence and the tests pass as the inline set
 changes. Run the static census with
-`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_static_deopt_census_over_the_corpus_is_printed -- --nocapture`.
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_static_deopt_census_over_the_corpus_is_printed -- --nocapture`
+and the emitted-byte table with the same command and `--lib the_per_kind_emitted_code_size_table_is_printed`.
 
 ## Routing Table
 - `code.rs` → the artifact in its two layouts (`CompiledModule`/`CompiledFunction` [`entries` + `sub_entries`]/`EagerLayout::sub_entries`/`Summary`) + the compile-on-entry point.
