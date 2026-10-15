@@ -261,6 +261,22 @@ pub(crate) type FrameExitHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32
 /// `(func, pc)`); a bare `return` pops nothing, so it carries no frame size.
 pub(crate) type ReturnHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32) -> i64;
 
+/// The `jit_allocate`/`jit_trim` helpers' native signature (the block ABI plus the
+/// instruction's own `(func, pc)` and the single frame-size word the instruction
+/// carries — the `allocate` frame's Y-slot count, or the `trim`'s pop count).
+pub(crate) type FrameSizeHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32) -> i64;
+
+/// The `jit_test_heap` helper's native signature (the block ABI plus the instruction's
+/// own `(func, pc)`, the heap-word need and the live x-register count).
+pub(crate) type HeapNeedHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32) -> i64;
+
+/// The `jit_allocate_heap` helper's native signature (the block ABI plus the
+/// instruction's own `(func, pc)`, the frame's Y-slot count, the heap-word need and the
+/// live x-register count).
+pub(crate) type AllocateHeapHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32, u32) -> i64;
+
 /// The `jit_ext_call` helper's native signature (the block ABI plus the
 /// instruction's own `(func, pc)`, the `ImportRef` index, the [`EXT_CALL`]-family
 /// kind and — for `call_ext_last` — the frame size to pop).
@@ -1031,7 +1047,9 @@ pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, dea
 // keeps the two paths identical if an error class ever widens.
 
 /// Record `err` in the runtime's error slot and answer [`ERROR`] — the one failure
-/// path of the three frame-discipline helpers.
+/// path of every in-block helper that can fail (the frame-discipline trio and the
+/// heap/frame-admission family: [`jit_allocate`]/[`jit_allocate_heap`]/
+/// [`jit_test_heap`]/[`jit_trim`]).
 ///
 /// The uncaught-raise funnel is applied for the run's **entry** context only, exactly
 /// as [`Machine::step_instruction`] applies it: in context `0` the active module *is*
@@ -1197,6 +1215,163 @@ pub(crate) extern "C" fn jit_deallocate_return(
     };
     match outcome {
         Ok(continuation) => return_word(runtime, continuation),
+        Err(err) => report_frame_error(runtime, func, pc, err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The heap / frame-admission family
+// ---------------------------------------------------------------------------
+
+/// The **`allocate`** helper: push a stack frame with the interpreter's exact
+/// `Instr::Allocate` semantics.
+///
+/// The interpreter's arm is `Machine::push_frame(stack_need)` and nothing else — it
+/// deliberately **skips** C's heap check (C's `allocate Ns Live` is `$AH(Ns,0,Live)`,
+/// but this engine's `Instr::Allocate` only pushes the frame; the admission point is
+/// `Instr::AllocateHeap`/`Instr::TestHeap`), so this helper makes exactly that call and
+/// never admits a heap need.
+///
+/// This is the *non-terminating* member of the family: the interpreter's arm returns
+/// `Step::Next`, so the block continues in-block at `pc + 1` on success (and leaves with
+/// [`ERROR`] otherwise — `push_frame` cannot fail today, but the funnel is shared).
+/// `push_frame` touches no x-register, so the block refills nothing — but it **is** a
+/// frame change, so the Y window is re-published on the continue arm when a later
+/// instruction of the block still accesses a Y slot.
+pub(crate) extern "C" fn jit_allocate(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    stack_need: u32,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
+    // holds points at an object the driver owns and keeps alive for the whole loop.
+    let runtime = unsafe { &mut *rt };
+    let framed = {
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // The same position store `Machine::step_instruction` makes at entry.
+        machine.set_current_code(func, pc);
+        machine.push_frame(stack_need)
+    };
+    match framed {
+        Ok(()) => encode_target(func, pc + 1),
+        Err(err) => report_frame_error(runtime, func, pc, err),
+    }
+}
+
+/// The **`allocate_heap`** helper: admit the heap need, **then** push the frame — the
+/// interpreter's `Instr::AllocateHeap` order (`ensure_heap` first, `push_frame` after).
+///
+/// It is the one instruction of the family that reaches the host's heap-admission door
+/// ([`ExecutionContext::ensure_heap_full`] through [`Machine::ensure_heap`]), passing the
+/// interpreter's own `heap_need`/`live` operands, so a collecting host sees **exactly
+/// one** admission point per execution with the interpreter's full root set (the block
+/// has spilled its cached x-registers first, so `machine.x` is authoritative). Because a
+/// collecting host rewrites `machine.x` in place, the block **must** reload its cached
+/// registers on the continue arm (see [`super::emit::heap`]).
+///
+/// The non-terminating shape: the interpreter returns `Step::Next`, so the block
+/// continues in-block at `pc + 1`; anything else (a heap-admission failure) leaves with
+/// [`ERROR`].
+pub(crate) extern "C" fn jit_allocate_heap(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    stack_need: u32,
+    heap_need: u32,
+    live: u32,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
+    // holds points at an object the driver owns and keeps alive for the whole loop.
+    let runtime = unsafe { &mut *rt };
+    let framed = {
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
+        // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
+        let ctx = unsafe { &mut *runtime.ctx };
+        // The same position store `Machine::step_instruction` makes at entry.
+        machine.set_current_code(func, pc);
+        // The interpreter's own order: admit (`ensure_heap`), then push the frame.
+        machine
+            .ensure_heap(heap_need, live, ctx)
+            .and_then(|()| machine.push_frame(stack_need))
+    };
+    match framed {
+        Ok(()) => encode_target(func, pc + 1),
+        Err(err) => report_frame_error(runtime, func, pc, err),
+    }
+}
+
+/// The **`test_heap`** helper: admit the heap need with the interpreter's exact
+/// `Instr::TestHeap` semantics.
+///
+/// Like [`jit_allocate_heap`]'s first half it reaches the host's heap-admission door
+/// exactly once per execution with the interpreter's own `heap_need`/`live` operands,
+/// and the collecting host may relocate the cached x-registers — so the block reloads
+/// them on the continue arm. The instruction is otherwise the non-terminating shape.
+pub(crate) extern "C" fn jit_test_heap(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    heap_need: u32,
+    live: u32,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
+    // holds points at an object the driver owns and keeps alive for the whole loop.
+    let runtime = unsafe { &mut *rt };
+    let admitted = {
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
+        // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
+        let ctx = unsafe { &mut *runtime.ctx };
+        // The same position store `Machine::step_instruction` makes at entry.
+        machine.set_current_code(func, pc);
+        machine.ensure_heap(heap_need, live, ctx)
+    };
+    match admitted {
+        Ok(()) => encode_target(func, pc + 1),
+        Err(err) => report_frame_error(runtime, func, pc, err),
+    }
+}
+
+/// The **`trim`** helper: shrink the current frame with the interpreter's exact
+/// `Instr::Trim` semantics ([`Machine::trim`], the interpreter's own call), so an
+/// over-trim raises the same typed error the interpreter's arm does.
+///
+/// The non-terminating shape: the interpreter returns `Step::Next`, so the block
+/// continues in-block at `pc + 1`. `trim` touches no x-register (it shifts
+/// `machine.stack` and renumbers the frame's Y slots), so the block refills nothing —
+/// but it changes the frame, so the Y window is re-published on the continue arm when a
+/// later instruction of the block still accesses a Y slot.
+pub(crate) extern "C" fn jit_trim(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    n: u32,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
+    // holds points at an object the driver owns and keeps alive for the whole loop.
+    let runtime = unsafe { &mut *rt };
+    let trimmed = {
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // The same position store `Machine::step_instruction` makes at entry.
+        machine.set_current_code(func, pc);
+        machine.trim(n)
+    };
+    match trimmed {
+        Ok(()) => encode_target(func, pc + 1),
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
