@@ -412,8 +412,10 @@ const HEADER_DISP: i32 = 0;
 /// be folded into the word being tested.
 ///
 /// It is caller-saved and used strictly inside one instruction's guard, so it never
-/// survives a helper call; the block's cache registers are untouched.
-const GUARD_SCRATCH: Reg = Reg::R8;
+/// survives a helper call; the block's cache registers are untouched. It is the register
+/// a caller outside this module reads a guarded tuple's header word out of
+/// (`super::bif`'s `tuple_size` lowering).
+pub(super) const GUARD_SCRATCH: Reg = Reg::R8;
 
 /// The arityval header word of a tuple of arity `n` — `beam_term::make_arityval`
 /// (`(n << HEADER_ARITY_OFFS) + ARITYVAL_SUBTAG`). It is both the bound of a tuple
@@ -436,9 +438,9 @@ fn element_disp(element: u32) -> Option<i32> {
 pub(super) struct TupleReadShape {
     /// The `source` operand's location (an in-bound x-register or an addressable `Y`
     /// slot).
-    source: Loc,
+    pub(super) source: Loc,
     /// The `dst` operand's location.
-    dst: Loc,
+    pub(super) dst: Loc,
     /// The byte offset of the read element from the header word.
     element_disp: i32,
 }
@@ -650,7 +652,7 @@ pub(super) fn try_inline_select_tuple_arity(
 /// above). It can only ever *reject*: `fallback` runs one interpreter step, whose
 /// typed error is the ground truth. `source` may be an addressable `Y` slot, in which
 /// case its two reads are the guarded frame-window reads ([`Loc::load`]).
-fn emit_tuple_header_guard(
+pub(super) fn emit_tuple_header_guard(
     buffer: &mut CodeBuffer,
     source: Loc,
     allocation: &Allocation,

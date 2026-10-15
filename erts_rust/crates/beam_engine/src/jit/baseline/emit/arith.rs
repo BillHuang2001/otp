@@ -283,6 +283,11 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
         Instr::Test { args, .. } => args.iter().any(|operand| operand_uses_y(operand)),
         Instr::SelectVal { value, .. } => operand_uses_y(value),
         Instr::SelectTupleArity { tuple, .. } => operand_uses_y(tuple),
+        // The three `Bif`s the tier lowers (`erlang:hd/1`/`element/2`/`tuple_size/1`)
+        // read their source and write their destination through the same guarded
+        // frame window the aggregate readers use, so a `Y` operand of one makes the
+        // block publish it ([`super::bif::bif_uses_y`], purely syntactic).
+        Instr::Bif { .. } => super::bif::bif_uses_y(module, instr),
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }

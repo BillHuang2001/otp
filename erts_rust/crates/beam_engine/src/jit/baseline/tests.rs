@@ -6200,3 +6200,7 @@ mod family_tests;
 #[cfg(test)]
 #[path = "operand_tests.rs"]
 mod operand_tests;
+
+#[cfg(test)]
+#[path = "bif_tests.rs"]
+mod bif_tests;

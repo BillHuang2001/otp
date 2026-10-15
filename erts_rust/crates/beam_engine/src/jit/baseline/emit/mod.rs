@@ -101,8 +101,9 @@
 //! computation, [`operands`] the operand/constant readers,
 //! [`r#move`] the inline `move`/`swap`, [`test`] the word-level `test` subset,
 //! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path,
-//! [`link`] the direct block-to-block linker and [`aggregate`] the guarded cons-cell
-//! and tuple readers.
+//! [`link`] the direct block-to-block linker, [`compare`] the comparison BIFs,
+//! [`bif`] the `erlang:hd/1`/`element/2`/`tuple_size/1` accessors, and [`aggregate`]
+//! the guarded cons-cell and tuple readers.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -124,6 +125,7 @@ use super::runtime::{jit_publish_y, jit_refresh_y};
 
 mod aggregate;
 mod arith;
+mod bif;
 mod compare;
 mod compile;
 mod family;
@@ -143,6 +145,7 @@ use aggregate::{
     try_inline_select_tuple_arity, try_inline_set_tuple_element,
 };
 use arith::try_inline_gc_bif;
+use bif::try_inline_bif;
 use compare::try_inline_comparison;
 use frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
@@ -599,11 +602,13 @@ fn emit_block(
                 }
             }
             // The comparison BIFs (`erlang`'s `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`),
-            // which the compiler emits as a **non-collecting** `bif` (see [`compare`]).
+            // which the compiler emits as a **non-collecting** `bif` (see [`compare`]),
+            // plus the three pure term accessors [`bif`] lowers — `erlang:hd/1`,
+            // `erlang:element/2` (an immediate index) and `erlang:tuple_size/1`.
             // Any other BIF, an un-addressable operand, or a module without both
             // `true`/`false` interned is the `_` arm below.
             Instr::Bif { .. } => {
-                if !try_inline_comparison(
+                if !(try_inline_comparison(
                     buffer,
                     module,
                     instr,
@@ -612,7 +617,16 @@ fn emit_block(
                     func,
                     pc,
                     highest_touched,
-                )? {
+                )? || try_inline_bif(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )?) {
                     emit_deopt(buffer, done, allocation, func, pc, instr)?;
                 }
             }

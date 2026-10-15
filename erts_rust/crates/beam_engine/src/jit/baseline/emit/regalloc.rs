@@ -44,6 +44,7 @@ use super::aggregate::{
     set_tuple_element_shape,
 };
 use super::arith::{fast_arith, uses_y};
+use super::bif::bif_shape;
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
 use super::select::select_val_plan;
@@ -353,10 +354,14 @@ pub(crate) fn cacheable_touches(
         // operand registers and its destination, and only when
         // [`comparison_shape`] claims it (another BIF, an un-addressable operand, or a
         // module without both `true`/`false` interned keeps the whole instruction on
-        // the helper, which contributes no native touch).
+        // the helper, which contributes no native touch). The other three `Bif`s the
+        // tier lowers ([`bif_shape`]: `erlang:hd/1`/`element/2`/`tuple_size/1`) are
+        // charged the same way, from their own shape's operand set.
         Instr::Bif { .. } => {
             if let Some(plan) = comparison_shape(module, instr) {
                 touches.extend(plan.registers());
+            } else if let Some((shape_touches, _)) = bif_shape(module, instr) {
+                touches.extend(shape_touches);
             }
         }
         Instr::Test { kind, fail, args } => {
@@ -467,9 +472,15 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
                 Vec::new()
             }
         }
-        Instr::Bif { .. } => comparison_shape(module, instr)
-            .map(|plan| plan.writes())
-            .unwrap_or_default(),
+        Instr::Bif { .. } => {
+            if let Some(plan) = comparison_shape(module, instr) {
+                plan.writes()
+            } else if let Some((_, writes)) = bif_shape(module, instr) {
+                writes
+            } else {
+                Vec::new()
+            }
+        }
         // `Test`/`SelectVal` branch but write no x-register; everything else deopts.
         _ => Vec::new(),
     }
