@@ -5813,3 +5813,354 @@ fn the_lowered_comparison_test_agrees_with_the_interpreter_on_a_y_operand() {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// the heap / frame-admission family
+//
+// `allocate`, `allocate_heap`, `test_heap` and `trim` touch the two pieces of
+// `Machine` state a compiled block cannot address itself: the **call-frame
+// stack** (`machine.frames`/`stack`, Rust-side `Vec`s with no layout a block
+// could compute an offset into) and the **process heap** (the host's
+// `ExecutionContext::ensure_heap_full` admission door, which may run a
+// collection). Each is lowered as a **direct helper call** (`emit/heap.rs`) that
+// makes the interpreter's own `Machine` calls and reports its outcome as a
+// block-ABI word, exactly like the frame-discipline trio
+// (`deallocate`/`return`/`deallocate_return`). These tests pin (1) tier
+// agreement for every member, (2) the exactly-once admission the two
+// heap-admitting members must reach, and (3) the structural claim that none of
+// the four pays a per-instruction `jit_step_one` deopt any more.
+// ---------------------------------------------------------------------------
+
+/// `allocate StackNeed Live` — push a 3-Y-slot frame, then `return` the small
+/// int `7`.
+fn allocate_words_module() -> (Module, Atom) {
+    body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(3),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ])
+}
+
+/// The same `allocate`, but with the operand in its **`z,3` allocation-list**
+/// encoding (two entries whose word counts sum to 6) — the other half of
+/// `HeapNeed`. The helper takes `.words()`, so both encodings lower identically.
+fn allocate_alloc_list_module() -> (Module, Atom) {
+    body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Alloc(vec![
+                beam_loader::AllocKind {
+                    kind: 1,
+                    number: 2,
+                    words: 4,
+                },
+                beam_loader::AllocKind {
+                    kind: 2,
+                    number: 1,
+                    words: 2,
+                },
+            ]),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(8),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ])
+}
+
+/// `allocate_heap StackNeed HeapNeed Live` — admit the heap need (8 words), push
+/// a 2-Y-slot frame, then `return` the small int `21`.
+fn allocate_heap_module() -> (Module, Atom) {
+    body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::AllocateHeap {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            heap_need: beam_loader::HeapNeed::Words(8),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(21),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ])
+}
+
+/// `test_heap HeapNeed Live` — the bare heap admission (8 words, no frame), then
+/// `return` the small int `22`.
+fn test_heap_module() -> (Module, Atom) {
+    body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::TestHeap {
+            heap_need: beam_loader::HeapNeed::Words(8),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(22),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ])
+}
+
+/// `trim N Remaining` — push a 3-Y-slot frame and trim 2 of it (leaving one), then
+/// `return` the small int `33`. The `Remaining` operand is not read by
+/// `Machine::trim` (the interpreter's own arm passes only `N`), so this is a
+/// **valid** trim on both tiers.
+fn trim_module() -> (Module, Atom) {
+    body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(3),
+            live: 0,
+        },
+        Instr::Trim { n: 2, remaining: 1 },
+        Instr::Move {
+            src: Operand::Integer(33),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ])
+}
+
+/// **Tier agreement for the whole heap / frame-admission family.** Each member is
+/// driven through both tiers and must produce the interpreter's exact result —
+/// the lowered path makes the interpreter's own `Machine` calls, so the pin is
+/// that the helper wrapper (the emitted argument marshalling, the
+/// `encode_target(func, pc + 1)` continue check and the frame-only vs
+/// heap-admitting continue arms) introduced no divergence.
+///
+/// `allocate` and `trim` touch no x-register; `allocate_heap` and `test_heap`
+/// reach the admission door. All four must still *return* `x(0)` unchanged, so
+/// the baseline tier is also pinned to the expected small int (a `Result`
+/// comparison is not available — `BeamError` is not `PartialEq` — so the outcome
+/// is unwrapped first).
+#[test]
+fn the_heap_and_frame_admission_family_agrees_across_tiers() {
+    let cases: Vec<(&str, (Module, Atom), i64)> = vec![
+        ("allocate (word count)", allocate_words_module(), 7),
+        (
+            "allocate (`z,3` allocation list)",
+            allocate_alloc_list_module(),
+            8,
+        ),
+        ("allocate_heap", allocate_heap_module(), 21),
+        ("test_heap", test_heap_module(), 22),
+        ("trim (valid)", trim_module(), 33),
+    ];
+    for (label, (module, name), expected) in cases {
+        with_both_tiers(&module, name, |interpreter, baseline| {
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+            assert_eq!(
+                baseline.as_ref().expect("the baseline tier returns"),
+                &RunOutcome::Returned(make_small(expected)),
+                "{label}: the baseline tier must return {expected}"
+            );
+        });
+    }
+}
+
+/// **A `trim` that over-trims raises on both tiers.** `Machine::trim` rejects
+/// `N > y_count` with its own typed diagnostic, which the helper reports as the
+/// block's [`ERROR`] word (the driver decodes `rt.error`), while the interpreter
+/// raises the same error from its own arm — the two must agree, reason included.
+///
+/// The second module has **no `allocate` at all**: the run's bottom frame (which
+/// `Machine::run_label_outcome` pushes) has zero Y slots, so this is the
+/// frame-less variant of the same rejection. There the required property is tier
+/// equality, whatever the frame-less diagnostic turns out to be.
+#[test]
+fn a_trim_that_over_trims_raises_the_same_typed_error_on_both_tiers() {
+    // A 2-Y-slot frame trimmed by 5: an over-trim of a live frame.
+    let (over, over_atom) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::Trim { n: 5, remaining: 0 },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+    let expected = error_reason(&crate::error::unsupported("trim: n exceeds frame size"));
+    with_both_tiers(&over, over_atom, |interpreter, baseline| {
+        assert_same_outcome("over-trim", interpreter, baseline, &over.atom_table);
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            let err = outcome.as_ref().expect_err("an over-trim raises");
+            assert_eq!(
+                error_reason(err),
+                expected,
+                "{tier}: the over-trim must raise the interpreter's own typed diagnostic"
+            );
+        }
+    });
+
+    // No frame at all: the bottom frame has `y_count == 0`, so a 1-slot trim is an
+    // over-trim of an empty frame. Only tier *equality* is claimed here.
+    let (frameless, frameless_atom) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Trim { n: 1, remaining: 0 },
+        Instr::Return,
+    ]);
+    with_both_tiers(&frameless, frameless_atom, |interpreter, baseline| {
+        assert_same_outcome(
+            "frameless trim",
+            interpreter,
+            baseline,
+            &frameless.atom_table,
+        );
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            outcome
+                .as_ref()
+                .expect_err(&format!("{tier}: a frameless trim raises"));
+        }
+    });
+}
+
+/// **The heap-admitting lowerings reach the admission door exactly once per
+/// tier.** `allocate_heap` and `test_heap` are the two members that call
+/// `Machine::ensure_heap`, so this is the pin that the lowered path performs
+/// exactly the interpreter's single admission with exactly the interpreter's own
+/// operands (`heap_need` and `live`) — a double admission or a swapped operand
+/// would be visible here.
+///
+/// [`RootProbeCtx`] records every `(heap_need, live, x_regs)` it is handed at the
+/// narrow door; both tiers must hand it one identical record per run.
+#[test]
+fn the_heap_admitting_lowerings_reach_the_admission_door_exactly_once_per_tier() {
+    let cases: Vec<(&str, (Module, Atom), i64)> = vec![
+        ("allocate_heap", allocate_heap_module(), 21),
+        ("test_heap", test_heap_module(), 22),
+    ];
+    for (label, (module, name), expected) in cases {
+        let mut per_tier: Vec<(&str, Vec<u32>, Vec<u32>)> = Vec::new();
+        for tier in [Tier::Interpreter, Tier::BaselineJit] {
+            let mut machine = Machine::new();
+            let mut ctx = RootProbeCtx::new();
+            let outcome = machine
+                .run_export_outcome_with_tier(&module, name, 0, &[], &mut ctx, tier)
+                .expect("the run completes");
+            assert_eq!(
+                outcome,
+                RunOutcome::Returned(make_small(expected)),
+                "{label} on the {} tier must return {expected}",
+                tier.name()
+            );
+            assert_eq!(
+                ctx.needs,
+                vec![8],
+                "{label} on the {} tier: the instruction's own heap need",
+                tier.name()
+            );
+            assert_eq!(
+                ctx.lives,
+                vec![0],
+                "{label} on the {} tier: the instruction's own live count",
+                tier.name()
+            );
+            assert_eq!(
+                ctx.x_slices.len(),
+                1,
+                "{label} on the {} tier: the admission door is reached exactly once",
+                tier.name()
+            );
+            per_tier.push((tier.name(), ctx.needs, ctx.lives));
+        }
+        assert_eq!(
+            per_tier[0].1, per_tier[1].1,
+            "{label}: the two tiers must hand the host the same heap needs"
+        );
+        assert_eq!(
+            per_tier[0].2, per_tier[1].2,
+            "{label}: the two tiers must hand the host the same live counts"
+        );
+    }
+}
+
+/// **The heap / frame-admission family is lowered without a per-instruction
+/// `jit_step_one` deopt** — the structural pin. One module executes all four
+/// members in one body block (so a single `emit_block` visit covers each), and
+/// the recorded counters must show each one **visited** (the pin is not vacuous)
+/// yet **never** deopted, statically (`instr_deopts`, the emitter's own decision)
+/// or at run time (`deopts_by_variant`).
+///
+/// Every other instruction in this module (`label`, `move`, `return`) is
+/// lowered too, so the whole run must pay **zero** interpreter steps.
+#[test]
+fn the_heap_and_frame_admission_family_is_lowered_without_a_jit_step_one_deopt() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::TestHeap {
+            heap_need: beam_loader::HeapNeed::Words(4),
+            live: 0,
+        },
+        Instr::AllocateHeap {
+            stack_need: beam_loader::HeapNeed::Words(1),
+            heap_need: beam_loader::HeapNeed::Words(4),
+            live: 0,
+        },
+        Instr::Trim { n: 1, remaining: 0 },
+        Instr::Move {
+            src: Operand::Integer(9),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+    let (outcome, snapshot) = run_counting(&module, name, Tier::BaselineJit);
+    assert_eq!(
+        outcome.expect("the run completes"),
+        RunOutcome::Returned(make_small(9)),
+        "the four admissions in sequence must leave `x(0)` unchanged"
+    );
+    for opcode in ["Allocate", "AllocateHeap", "TestHeap", "Trim"] {
+        assert!(
+            snapshot.instr_instances.get(opcode).copied().unwrap_or(0) > 0,
+            "`{opcode}` must have been visited by the emitter, or this pin proves \
+             nothing; instances: {:?}",
+            snapshot.instr_instances,
+        );
+        assert_eq!(
+            snapshot.instr_deopts.get(opcode).copied().unwrap_or(0),
+            0,
+            "`{opcode}` is lowered, so it must record zero static deopts; deopts: {:?}",
+            snapshot.instr_deopts,
+        );
+        assert!(
+            !snapshot.deopts_by_variant.contains_key(opcode),
+            "`{opcode}` must be lowered natively, but it deopted {} time(s); \
+             deopts by variant: {:?}",
+            snapshot.deopts_by_variant.get(opcode).copied().unwrap_or(0),
+            snapshot.deopts_by_variant,
+        );
+    }
+    assert_eq!(
+        snapshot.step_one, 0,
+        "every instruction of this module is lowered, so no interpreter step may \
+         remain; deopts by variant: {:?}",
+        snapshot.deopts_by_variant,
+    );
+}

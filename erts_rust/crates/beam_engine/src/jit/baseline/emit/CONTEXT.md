@@ -12,10 +12,12 @@ sub-blocks and the code-size estimates; `regalloc.rs` picks the
 cached x-registers; `operands.rs` reads operand shapes;
 `r#move.rs`/`test.rs`/`select.rs`/`arith.rs`/`compare.rs`/`aggregate.rs` each lower one instruction
 group; `frame.rs` lowers the frame-discipline trio that ends a function body
-(`deallocate`/`return`/`deallocate_return`); `link.rs` owns the direct block-to-block jump and the
+(`deallocate`/`return`/`deallocate_return`); `heap.rs` lowers the heap / frame-admission family
+(`allocate`/`allocate_heap`/`test_heap`/`trim`); `link.rs` owns the direct block-to-block jump and the
 linked local tail call.
 The driver, block ABI and the helpers (`jit_step_one`, `jit_ext_call`, `jit_tail_call`,
-`jit_deallocate`, `jit_return`, `jit_deallocate_return`, `jit_publish_y`, `jit_refresh_y`) live one
+`jit_deallocate`, `jit_return`, `jit_deallocate_return`, `jit_allocate`, `jit_allocate_heap`,
+`jit_test_heap`, `jit_trim`, `jit_publish_y`, `jit_refresh_y`) live one
 level up in `../mod.rs` / `../runtime.rs`; this node only *emits calls* to them.
 
 ## Core model (do not break)
@@ -59,6 +61,10 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 | Frame pop | `Deallocate` | `frame.rs::emit_deallocate` (an `emit_helper_call` to `jit_deallocate`) | always lowered (the instruction's own outcome is the helper's block-ABI word): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
 | Return | `Return` | `frame.rs::emit_return` (an `emit_helper_call` to `jit_return`) | always lowered — a `return` always transfers control, so the block leaves via `emit_word_exit` |
 | Fused frame pop + return | `DeallocateReturn` | `frame.rs::emit_deallocate_return` (an `emit_helper_call` to `jit_deallocate_return`); `emit_block` also fuses a separate adjacent `Deallocate`+`Return` pair into one such call | always lowered — always transfers control, leaves via `emit_word_exit` |
+| Frame push | `Allocate` | `heap.rs::emit_allocate` (an `emit_helper_call` to `jit_allocate`) | always lowered (the helper's `Machine::push_frame`; `allocate` deliberately skips C's `$AH` heap check, so no admission): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
+| Frame push + heap admission | `AllocateHeap` | `heap.rs::emit_allocate_heap` (an `emit_helper_call` to `jit_allocate_heap`) | always lowered — one helper round-trip does the interpreter's two calls in order (`ensure_heap` **then** `push_frame`); continues in-block via the shared `emit_continue_check` (partial refill + gated Y refresh) |
+| Heap admission | `TestHeap` | `heap.rs::emit_test_heap` (an `emit_helper_call` to `jit_test_heap`) | always lowered — reaches the host's admission door exactly once with the instruction's own `heap_need`/`live`; continues in-block via `emit_continue_check` |
+| Frame trim | `Trim` | `heap.rs::emit_trim` (an `emit_helper_call` to `jit_trim`) | always lowered — an over-trim / frameless trim is the helper's `ERROR`; continues in-block on `encode_target(func, pc+1)` |
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label **in the block map** -> linked; otherwise return-to-driver (the target's function is compiled on entry) |
 | Local tail call | `CallLast` | `link.rs::Linker::emit_tail_exit` | `Linker::is_compiled` |
 | Local tail call (no pop) | `CallOnly` | `link.rs::Linker::emit_exit` (lowers like `Jump`) | resolved label |
@@ -137,13 +143,17 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
    path's Y access (`arith.rs::emit_y_load`/`emit_y_store`, whose frame-window guard is the same pure
    rejection). `select_val` has no fallback (all-immediate alternatives are total).
 3. **Direct-helper exit (not a deopt at all)**: the frame-discipline arms (`frame.rs` —
-   `Deallocate`/`Return`/`DeallocateReturn`) are lowered as a plain `emit_helper_call` to a dedicated
+   `Deallocate`/`Return`/`DeallocateReturn`) and the heap / frame-admission family (`heap.rs` —
+   `Allocate`/`AllocateHeap`/`TestHeap`/`Trim`) are lowered as a plain `emit_helper_call` to a dedicated
    helper that performs exactly this instruction's `Machine` work and hands the driver a block-ABI word,
-   so **no interpreter step runs**: `emit_deallocate` continues in-block on the
-   `encode_target(func, pc+1)` word (branching to `done` otherwise), while `emit_return`/
-   `emit_deallocate_return` always transfer control and leave via `emit_word_exit`. There are no guards
-   to emit: every operand shape is lowered (a `Deallocate` frame size is a `u32`, a `return` has no
-   operand), and the only failure is a `CodeBuffer` that cannot hold the bytes — the shared typed
+   so **no interpreter step runs**: `emit_deallocate` and `heap.rs::emit_allocate`/`emit_trim` continue
+   in-block on the `encode_target(func, pc+1)` word (branching to `done` otherwise), while
+   `emit_return`/`emit_deallocate_return` always transfer control and leave via `emit_word_exit` and
+   `heap.rs::emit_allocate_heap`/`emit_test_heap` continue through the shared `emit_continue_check` (a
+   collecting host's admission rewrites `machine.x`, so the cache is refilled before the block resumes).
+   There are no guards to emit: every operand shape is lowered (a frame size / heap need / live count is
+   a `u32` the helper takes as an argument, `trim`'s `n` likewise, and a `return` has no operand), and
+   the only failure is a `CodeBuffer` that cannot hold the bytes — the shared typed
    `SystemLimit`.
 `emit_step_and_continue` (`mod.rs`) = one `jit_step_one` call + `emit_continue_check`: `rax` is compared
 against `encode_target(func, pc+1)`; equal -> `fill` and fall through natively at `pc+1`; any other word
@@ -158,6 +168,41 @@ cross-module transfer, which the driver decodes into the context switch.
 materialises the return word in `rax`, and jumps to `done`; the **driver** then looks the target up in the
 active artifact — for a lazy artifact a branch to another function is simply absent from that function's
 block map, so the driver compiles the target's function on entry — or takes one interpreter step.
+
+## heap / frame-admission lowerings (`heap.rs`)
+
+`heap.rs` lowers the four instructions that touch the two pieces of `Machine` state a compiled block
+cannot address itself — the **call-frame stack** (`Machine::frames`/`stack`, Rust-side `Vec`s with no
+layout a block could compute an offset into) and the **process heap** (the host's
+`ExecutionContext::ensure_heap_full` admission door, which may run a Stage-4 collection): `allocate`,
+`allocate_heap`, `test_heap`, `trim`. It models `frame.rs` — the same `emit_helper_call` + block-ABI-word
+pattern as the frame-discipline trio — and one helper (`jit_allocate`, `jit_allocate_heap`,
+`jit_test_heap`, `jit_trim` in `../runtime.rs`) performs exactly the instruction's own `Machine` calls in
+the interpreter's own order, so **no interpreter step runs**: the instruction costs one helper call,
+never a `jit_step_one` deopt.
+
+All four are **non-terminating** (the interpreter's arm returns `Step::Next`): the emitted code compares
+the helper's word with `encode_target(func, pc+1)` and continues in-block on a match, or branches to
+`done` with the word in `rax` on anything else (always the `ERROR` of a failed admission / a failed
+trim). The four split into **two shapes**, by whether the helper can touch `machine.x`:
+
+- **frame-only** — `allocate`/`trim` (`emit_allocate`/`emit_trim`) push/shrink the frame and touch **no**
+  x-register, so, like `frame.rs::emit_deallocate`, they emit **no** register refill (the block's cached
+  registers still hold exactly what `machine.x` does); because they *are* frame changes they re-publish
+  the Y window on the continue arm — the private `emit_frame_change_continue` (the shared
+  compare-and-branch **without** a refill), gated on `Allocation::refresh_y_after(pc)`.
+- **heap-admitting** — `allocate_heap`/`test_heap` (`emit_allocate_heap`/`emit_test_heap`) reach the
+  host's admission door, and a **collecting** host relocates the young heap and rewrites every root **in
+  place** (including `machine.x`), so the block's cached x-registers are stale the instant the helper
+  returns: both continue through the shared `emit_continue_check`, whose partial refill *is* the
+  post-admission contract, and whose gated Y refresh covers the frame change. `allocate_heap`'s single
+  round-trip does the interpreter's two calls in order (`ensure_heap` **then** `push_frame`).
+
+**There are no guards to emit** — every operand shape is lowered (each of `stack_need`/`heap_need`/`live`
+is a `u32` the helper takes as an argument, computed at compile time by `HeapNeed::words()`, and `trim`'s
+`n` likewise) — so the only failure is a `CodeBuffer` that cannot hold the emitted bytes, the shared typed
+`SystemLimit`. The two heap-admitting lowerings reach the host's admission door **exactly once** with the
+instruction's own operands.
 
 ## Spill/fill discipline
 - Prologue (`mod.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
@@ -218,8 +263,8 @@ must not refuse native entry (the driver's bound is `machine.x.len() > bound`).
 
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder; nothing here
-  dereferences a raw pointer itself. `frame.rs` is in that same JIT zone: it emits bytes and forms
-  helper function pointers, never dereferencing a raw pointer itself.
+  dereferences a raw pointer itself. `frame.rs` and `heap.rs` are in that same JIT zone: they emit bytes
+  and form helper function pointers, never dereferencing a raw pointer themselves.
 - `emit_block` accumulates `highest_native_register` (direct `machine.x` accesses) via `touch`; the driver
   refuses native entry to a machine whose register file does not cover the bound the artifact's layout
   requires. `emit_function` records `highest_cached_register` / `cached_registers` and
@@ -278,8 +323,15 @@ must not refuse native entry (the driver's bound is `machine.x.len() > bound`).
 - `frame.rs` -> `emit_deallocate`, `emit_return`, `emit_deallocate_return`, `emit_word_exit` (the three
   end-of-body lowerings + the shared `jmp done` exit), plus its unit tests (the frame-discipline bytes
   and the emitter-side `Deallocate`+`Return` fusion).
+- `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
+  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
+  `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
+  `encode_target(func, pc+1)` then the gated Y refresh, no register refill), plus its unit tests (the
+  spill-first call order, the frame-only-vs-heap-admitting refill split, and the Y-window refresh
+  gating).
 - `../runtime.rs` -> `jit_step_one` / `jit_tail_call` / `jit_deallocate` / `jit_return` /
-  `jit_deallocate_return` / `jit_publish_y` / `jit_refresh_y` / `JitRuntime` (`y_base`/`y_end`) / the
+  `jit_deallocate_return` / `jit_allocate` / `jit_allocate_heap` / `jit_test_heap` / `jit_trim` /
+  `jit_publish_y` / `jit_refresh_y` / `JitRuntime` (`y_base`/`y_end`) / the
   `encode_target`/`encode_wait` codec (the helpers these emitters call).
 
 ## Notes for Agents
