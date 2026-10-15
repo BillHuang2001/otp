@@ -77,11 +77,13 @@
 //!   not re-enter the scheduler.
 //! * `catch Expr` folds **by class**, exactly like `erl_eval`: a `throw` yields the
 //!   reason, an `exit` yields `{'EXIT', Reason}`, and an `error` yields
-//!   `{'EXIT', {Reason, Stacktrace}}`. The supplied `erlang:raise/3` trace is rendered
-//!   for the `error` class, and the trace is always a list (never dropped).
-//!   The residual limitation: a raise carrying **no** supplied trace (`erlang:error/1`,
-//!   an arithmetic error) renders an **empty** trace, because the `-eval` tree-walker
-//!   gathers none (the oracle's trace is its own `erl_eval` call chain).
+//!   `{'EXIT', {Reason, Stacktrace}}`. The trace is always a list (never dropped): it is
+//!   the raise's synthesized **callee head item** — `{TargetModule, TargetFunction,
+//!   ArgList, []}`, built at the failing call site of an `undef` — followed by any
+//!   supplied `erlang:raise/3` frames.
+//!   The residual limitation: a raise with neither (`erlang:error/1`, an arithmetic
+//!   error) renders an **empty** trace, because the `-eval` tree-walker gathers no
+//!   `erl_eval`/`init` frame of its own (a fabricated frame would be a wrong term).
 //!
 //! A `fun` built here **can** escape into a loaded module: the closure bodies live on
 //! the [`Runtime`](crate::runtime::Runtime) (not on the evaluator), so a higher-order
