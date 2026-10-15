@@ -43,6 +43,10 @@ Verified directly and independently: `erl -noshell -s init stop -eval 'io:format
 with **no output**; putting `-eval` first makes the same expression print. (This is the mechanism the
 `emqx` gate detects cheaply; `otp_gate_note` names it as blocker 1.)
 
+> The literal, reproducible patch for this one-line idiom change is committed as
+> `results/m12-emqx-ezstd-env-mk.patch` — a real unified diff (with the exact source tag/line, the
+> apply-after-`mix deps.get` note and the "insufficient alone" warning in its header).
+
 **2. Patching that one idiom: the build then fails in `:jq`.**
 Reordering the `ezstd` idiom to `erl -noshell -eval …` gets past `:ezstd`; the build then fails while
 building `:jq`, whose NIF runs `autoreconf -fi`:
