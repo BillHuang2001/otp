@@ -561,8 +561,15 @@ matches the oracle's class. Entries marked *divergence* are honest but not byte-
 - **Arithmetic widens even small ints to a heap `Big`:** `erlang:'-'/2` of two small ints does ~4 small `Vec`
   allocations (a `Big::from_i64` per operand, then `sub`/`add`/`neg`) with no checked-`i64` fast path.
 - **The `AtomTable` deep clone is copy-on-write** (`beam_rt`'s `CodeServer::atoms_mut`, `codeserver.rs:240`): only a
-  call that actually **interns** pays it, and `prefix_matches`'s O(table) revalidation cannot be made O(1) without a
-  table *identity* signal (see Handoffs).
+  call that actually **interns** pays it.
+- **`binary_to_term`'s steady-state cost is `prefix_matches`'s Θ(table) walk, not a clone** (`binconv.rs:1027-1033`,
+  invoked at `:1048`): the memo is a *hit* (zero allocation) but the **validation** scans every interned atom on
+  every decode, so its latency scales with the shared `AtomTable`'s **length** while being independent of the
+  payload (`term_to_binary/1` does not pay it — encode makes no table walk — hence the encode/decode asymmetry).
+  `beam_term`'s O(1) append-only witness (`AtomTable::snapshot` / `appended_since`, `../beam_term/src/atom.rs`)
+  **is** the identity signal this check needs — its own bench names `appended_since` "what a memoized table image
+  checks on every decode" — but neither decode site (`binconv.rs:1048`, `../beam_rt/src/nif.rs:514`) adopts it yet,
+  so the walk is still Θ(number of interned atoms) per call.
 ## A.9 blockers (self-hosted build: booting kernel, running lib/compiler)
 The `ets` link is closed (`src/ets/resolve.rs::parse_options` accepts the full `ets:new/2` option matrix, so
 `application_controller`'s `ets:new(ac_tab, …)` and name-resolved `ets:insert/lookup` work; the normalized
