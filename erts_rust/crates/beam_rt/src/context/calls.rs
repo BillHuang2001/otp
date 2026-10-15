@@ -104,9 +104,11 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A **nested** call (inside a fun a BIF applied) re-enters here through the bridge:
     /// it takes its own heap, shares the atom table through another `Rc` handle and shares
-    /// the caller's sink through a [`SharedSink`] clone, and — because the outer call did
-    /// **not** take the ETS cell (see [`Self::reentrancy_capable`]) — borrows the shared
-    /// tables and reaches the outer tables' `ets:*` operations.
+    /// the caller's sink through a [`SharedSink`] clone, and — because the outer call left
+    /// the ETS cell free (it installed no tables; see `install_tables` and
+    /// [`Self::tables_capable`]) — borrows the shared tables and reaches the outer tables'
+    /// `ets:*` operations. (An outer call that *does* read the seam, such as `ets:foldl/3`,
+    /// holds the cell, so a nested `ets:*` from its own fun is the documented residual.)
     ///
     /// # The process-dictionary seam
     ///
@@ -257,6 +259,22 @@ impl<'a> RuntimeContext<'a> {
         // [`Self::reentrancy_capable`]). Hoisted out of the dispatch block below because the
         // result-rewind gate needs it too.
         let reentrant = Self::reentrancy_capable(args);
+        // Whether this call must **hold the shared `TableRegistry` cell** for its whole
+        // duration. This is deliberately a *separate* predicate from `reentrant` (which keeps
+        // its own meaning for the `safe_to_rewind` gate below): a reentrant call no longer
+        // implies "leave the cell free".
+        //
+        // A reentrant call (a fun-applying BIF such as `lists:map/2`) normally does **not** take
+        // the cell, so the fun it applies can re-enter the runtime and reach `ets:*` (see the
+        // comment at the borrow site). But a call that *itself* reads the `TableRegistry` seam
+        // cannot run without it: with no cell installed the BIF's `ctx.tables()` is `None` and it
+        // raises the typed `unsupported_bif`. The two `ets` fun-folds (`ets:foldl/3`,
+        // `ets:foldr/3`) are exactly that case — they take the table out of the registry, collect
+        // its objects, restore it, and only *then* apply the fun — so they must hold the cell
+        // despite being reentrant. [`Self::tables_capable`] names the seam's consumers (from
+        // `beam_bifs`) rather than blanket-enabling every reentrant call, which would break
+        // `lists:map(fun(X) -> ets:lookup(T, X) end, L)` by blocking that nested call.
+        let install_tables = !reentrant || Self::tables_capable(module, function, arity);
         // Whether the BIF's result may be **moved out of the pooled BIF heap onto the running
         // process's own young heap** and the pooled heap then **rewound** — the tail of this
         // method (see [`Self::move_result_into_process_heap`]).
@@ -297,21 +315,27 @@ impl<'a> RuntimeContext<'a> {
                 gc_armed: _,
                 dispatch_memo: _,
             } = self;
-            // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
-            // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
-            // reach `ets:*`. Borrowing the shared `TableRegistry` for the whole call would
-            // leave its `RefCell` taken, so the nested `ets:*` could not borrow it. When an
-            // argument is a fun, therefore, do **not** install the tables — the cell stays
-            // free for the nested call. Nothing is lost: a BIF that takes a fun scans it
-            // with `lists`/`maps` logic and does not touch ETS itself (no M1 BIF both needs
-            // ETS *and* applies a fun argument). `reentrant` was computed above the block (the
-            // result-rewind gate needs it there too).
-            let mut tables = if reentrant {
-                None
-            } else {
+            // The ETS cell is held exactly when this call needs it (`install_tables`, computed
+            // above): a plain call, or a reentrant call that itself reads the `TableRegistry`
+            // seam — the two `ets` fun-folds. A reentrant call that does **not** read the seam
+            // leaves the cell free, so the fun it applies can re-enter the runtime and reach
+            // `ets:*` itself (that is why `lists:map(fun(X) -> ets:lookup(T, X) end, L)` keeps
+            // working: the outer `lists:map/2` installs nothing).
+            //
+            // RESIDUAL: holding the cell across an `ets:foldl/3`/`ets:foldr/3` blocks a *nested*
+            // ETS access made by that call's own fun — the outer `RefMut` makes the nested
+            // `try_borrow_mut` fail, so such a nested `ets:*` still answers `unsupported_bif` (see
+            // [`Self::tables_capable`]). Closing it would need `BifContext::with_tables` to lend
+            // the shared cell rather than a bare `&mut TableRegistry` (`beam_bifs`), which is
+            // outside this crate's write scope. Nothing that works today is lost: with no cell the
+            // outer fold fails outright with `unsupported: bif`, so an outer fold that *does* run
+            // (with a fun that touches no ETS) is a strict gain.
+            let mut tables = if install_tables {
                 // `try_borrow_mut` (never `borrow_mut`): an unexpected outer borrow must
                 // degrade to "no ETS", never panic.
                 tables_handle.try_borrow_mut().ok()
+            } else {
+                None
             };
             // The port provider is a cheap handle shared by both branches: it holds the
             // shared `Rc` port registry and a clone of the shared atom-table handle, so
