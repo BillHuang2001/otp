@@ -56,6 +56,13 @@
 //! * the result is a **binary** — the whole zlib stream (2-byte header, deflate
 //!   data, Adler-32 trailer), so `zlib:compress(<<>>)` is 8 bytes.
 //!
+//! The stream is **byte-identical to the oracle's for a short body** (one fixed-Huffman
+//! block in both encoders: `<<>>`, `<<"a">>`, `<<"abc">>`, `<<"hello">>`, `<<"world">>`,
+//! `<<"abcdefgh">>` are goldens in `tests/zlib.rs`) but not for a repetitive one, where
+//! the encoder's block-type choice differs — see "`compress/1`'s byte-size divergence on
+//! repetitive bodies" below. The framing, the Adler-32 and the round trip are the
+//! oracle's in every case.
+//!
 //! # `zlib:uncompress/1`
 //!
 //! `zlib.erl:699-720` decides in two steps, and both decide the error:
@@ -144,6 +151,40 @@
 //! conforming inflater — the oracle's included — decodes what this module emits, and
 //! this module decodes what the oracle emits: `tests/zlib.rs` cross-checks both
 //! directions against streams the system `erl` produced.
+//!
+//! ## `compress/1`'s byte-size divergence on repetitive bodies (documented, closed as a gap)
+//!
+//! The two encoders choose different **block types** for a repetitive body, so
+//! `byte_size(zlib:compress(B))` is the encoder's own answer and not the oracle's.
+//! The measured witness is `zlib:compress(<<0:8192>>)` — note `<<0:8192>>` is 8192
+//! *bits*, i.e. 1024 zero bytes:
+//!
+//! | | bytes | deflate body |
+//! |---|---|---|
+//! | oracle (real libz, `deflate_slow`, level 6) | **17** | a **fixed-Huffman** block (`<<99,96,24,5,163,96,20,140,84,0,0>>`) |
+//! | this module (miniz_oxide, level 6) | **23** | a **dynamic-Huffman** block (`<<237,192,1,1,0,0,0,130,32,255,175,110,72,80,192,171,1>>`) |
+//!
+//! Both streams carry the same 2-byte header `<<120,156>>` and the same Adler-32
+//! trailer `<<4,0,0,1>>`, and both inflate to the same 1024 bytes, so only the
+//! *size* (and the body) differ. `erts/emulator/beam/erl_zlib.c:62,152` initialises
+//! the stream with `deflateInit(streamp, level)`, which is `deflateInit2(…, MAX_WBITS
+//! = 15, DEF_MEM_LEVEL = 8, Z_DEFAULT_STRATEGY)`, and `flate2`'s `rust_backend` exposes
+//! **only** `Compression` (a level) — no `strategy` and no `memLevel` — so the choice is
+//! miniz_oxide's own. The whole level range was swept for this body: level 0 stores
+//! (1035 bytes), level 1 is 26 bytes, and levels 2..=9 are all 23 bytes — **no level
+//! reproduces the oracle's 17**, because miniz never emits the fixed-Huffman block
+//! zlib's `deflate_slow` picks for a long zero run (its lazy-match/`num_probes` search
+//! differs independently as well). Closing the gap would need either the real libz (a new
+//! dependency edge, deliberately out of scope) or a faithful zlib `deflate_slow` port;
+//! special-casing an input pattern is forbidden. The same divergence shows on the medium
+//! body `list_to_binary(lists:seq(1,100))` (oracle 108 bytes, here 111), which is why
+//! `tests/zlib.rs` pins that body's round trip and not its size.
+//!
+//! **Short bodies are unaffected** — a body small enough to be one fixed-Huffman block in
+//! both encoders is byte-identical (`zlib:compress(<<>>)`, `<<"a">>`, `<<"abc">>`,
+//! `<<"hello">>`, `<<"world">>` and `<<"abcdefgh">>` are byte-exact goldens in
+//! `tests/zlib.rs`), which is also why `uncompress(compress(B)) =:= B` and the `abc`
+//! golden are the shapes the differential corpus pins.
 //!
 //! # Documented limits (never a silently wrong result)
 //!
@@ -235,6 +276,13 @@ const GZIP_FLAG_FCOMMENT: u8 = 0x10;
 /// data and the 4-byte `ISIZE` (§2.3.1), both little-endian.
 const GZIP_TRAILER_LENGTH: usize = 8;
 /// `zlib:compress(Data)` — `Data` (iodata) compressed into one zlib stream.
+///
+/// The deflate payload is [`zlib_compress`]'s (miniz_oxide's, not zlib's), so the
+/// stream is byte-identical to the oracle's only where both encoders pick the same
+/// blocks — a short body, e.g. `<<"abc">>`; a repetitive body's **size** differs
+/// (the module doc's byte-identity section). The 2-byte header, the Adler-32 trailer
+/// and the round trip are the oracle's in every case, and this function never
+/// special-cases an input pattern.
 ///
 /// # Errors
 ///
@@ -578,17 +626,16 @@ mod tests {
         let plain = binary(&mut ctx, b"hello");
         let compressed = compress_1(&mut ctx, &[plain]).expect("compress/1");
 
-        // `zlib:compress(<<"hello">>)` is a 13-byte binary in the oracle
-        // (OTP 29.1.1 / erts-17.1, zlib 1.3): `<<120,156,203,72,205,201,201,7,0,6,44,2,21>>`.
-        // The deflate payload is miniz_oxide's, not zlib's, so only the framing (a
-        // 2-byte header and a 4-byte Adler trailer) and a same-order size are pinned.
+        // `zlib:compress(<<"hello">>)` is the 13-byte
+        // `<<120,156,203,72,205,201,201,7,0,6,44,2,21>>` under OTP 29.1.1 / erts-17.1,
+        // and miniz_oxide emits those very bytes: a short body is one fixed-Huffman
+        // block in both encoders, so the whole stream is byte-identical (the
+        // repetitive-body divergence the module doc records does not apply).
         let stream = bytes_of(compressed);
-        assert_eq!(stream[0], 120, "the zlib header's first byte");
-        assert_eq!(stream[1], 156, "the zlib header's second byte (level 6)");
         assert_eq!(
-            stream.len(),
-            13,
-            "miniz_oxide's stream for `<<\"hello\">>` is the oracle's 13 bytes"
+            stream,
+            vec![120, 156, 203, 72, 205, 201, 201, 7, 0, 6, 44, 2, 21],
+            "miniz_oxide's stream for `<<\"hello\">>` is the oracle's byte for byte"
         );
 
         let back = uncompress_1(&mut ctx, &[compressed]).expect("uncompress/1");
