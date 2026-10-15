@@ -148,8 +148,13 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 ### `literal.rs` — off-heap literal areas (`TAG_LITERAL_PTR`)
 - `make_literal(Eterm) -> Eterm`; `is_literal(Eterm) -> bool`; `clear_literal(Eterm) -> Eterm`.
 - `unsafe fn set_literal_tag(term: *mut Eterm, hp_start: *mut Eterm, hsz: usize)` — the
-  `erts_set_literal_tag` graph walk (ORs `TAG_LITERAL_PTR` into every BOXED/LIST word + the root).
-- `pub struct LiteralArea` — a bump-allocated, frozen term block (`start`/`end`/`off_heap`), with
+  `erts_set_literal_tag` graph walk (ORs `TAG_LITERAL_PTR` into every BOXED/LIST word + the root);
+  a thin raw-pointer shim over `tag_literal_area`.
+- `tag_literal_area(area: &mut [Eterm], roots: &mut [Eterm])` — the **safe, slice-based** form of the
+  same walk (no raw pointers/`unsafe`): tags every BOXED/LIST word of the contiguous `area` (stepping
+  over HEADER bodies, with the `HEADER_SUB_BITS` `orig` special case, and leaving IMMED1 words
+  untouched), then tags each `roots` word that `is_boxed`/`is_list`. Both share the private
+  `tag_words` index walk.- `pub struct LiteralArea` — a bump-allocated, frozen term block (`start`/`end`/`off_heap`), with
   `alloc_words`, `contains(ptr)`, `is_literal(ptr)` (pointer-range test).
 
 ### `ops.rs` — cross-cutting classifiers
@@ -737,7 +742,7 @@ runtime that wants novel atoms to be free too should hold a single stable instan
   C-layout reader `internal_ref_numbers`
 - `src/tuple.rs` → tuple construction/size/element access
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
-- `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
+- `src/literal.rs` → `TAG_LITERAL_PTR` tagging (`is_literal`/`make_literal`/`clear_literal`) + the literal-area graph walk (`tag_literal_area` slice API + its `set_literal_tag` raw-pointer shim) + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
 - `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port: full-class structural arms (incl. external pid/port/ref and native records) + the residual deterministic fallbacks; `src/compare/numbers.rs` → the exact `mixed_types` numeric compare (`cmp_numbers`) + the private `double_to_big`
 - `src/hashing/mod.rs` → module root: docs + the internal structural hash `term_hash` (+ tests); re-exports the public ERTS-hash API
