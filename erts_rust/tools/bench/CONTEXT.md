@@ -403,10 +403,10 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked** `results/`
   directory (see `RESULTS.md`), which is for committed milestone numbers only.
 - **`foreign`'s `case_<name>_ns_per_call` is N-dependent on the Rust runtime** (the per-call cost drifts with
-  `N`, a common-mode per-op heap retention shared with the m10 baseline — the Θ(N³) defect stays fixed), so it is
+  `N`, a common-mode per-op heap retention shared with the m10 baseline), so it is
   only comparable across runs that used the same `N`; each row emits a `case_<name>_calls` companion and an
   explicit note. The rows are **not** a clean cross-runtime ratio, and the loop workloads' rust peak RSS is
-  **boot-dominated** at m13 (a general per-op heap retention beneath it, not ETS-specific).
+  **boot-dominated** (a general per-op heap retention beneath it, not ETS-specific).
   Both facts, with the owner `file:line`s and the root causes (which live **outside this node**), are in the
   dedicated *Known Issue* section below — read it before quoting a `foreign` number or a loop-workload RSS.
 - **OPEN (this node) — driver measurement gap at the declared rust `N`.** At m13 the rust boot got ~2.9×
@@ -516,7 +516,7 @@ erts_rust/target/release/bench compare erts_rust/tools/bench/results/m12-bench-x
     erts_rust/tools/bench/results/m13-bench-xrun.json       # record vs record, cross-load -> m13-compare-vs-m12-xrun.txt
 
 # 6. the factual boot-status probe at this commit (contract A.7; RESULTS.md §3.10/§6.8)
-erts_rust/target/release/beam_rt -boot bootstrap/bin/start   # exits 0; the CLI route boots this runtime's OWN release's bootstrap/bin/start.boot, ≈0.72 s (was ≈2.1 s at m12)
+erts_rust/target/release/beam_rt -boot bootstrap/bin/start   # exits 0; the CLI route boots this runtime's OWN release's bootstrap/bin/start.boot, ≈0.72 s
 ```
 
 Archive the `out/` copies into `results/` with only the two mechanical path normalisations
@@ -551,21 +551,19 @@ regardless of `PATH` order); the rest probe ready, and `khepri` runs once the `r
   `elixir_compiler`, `cowboy`, `khepri`); `plb` → `ok` (version-aware tool resolution picks `dotnet`
   9.0.318); the only honest non-`ok` row in the whole milestone is `emqx` → `skipped(emqx-requires-otp-28)`.
   It ran on a **loaded** host (loadavg 72.46–135.80, median 113.13).
-- **The `run`-route startup/blocked-round latency defect is CLOSED** (owner `beam_rt`, outside this node):
-  whole-process startup fell from ~2.1 s at m12 to ≈0.72 s (the fixed `clock_nanosleep`/`epoll_wait` waits
-  removed — `TimerWait::ImminentWithin` + a non-destructive zero-timeout signal probe replacing the 25 ms
-  `PORT_POLL_SLICE` sleep); the matched A/B re-derives it at **3.16×–3.46× faster than the m12 binary**
-  (`RESULTS.md` §3.8). `copy_bound: send_recv` fell from ~25.4 ms/op to tens of µs/op and `send_recv_plain`
-  (a recorded 60 s-deadline failure at m12) now measures — the blocked-round defect is CLOSED.
-- **The Θ(N³) `foreign` per-slice off-heap registration regression stays FIXED** (owner outside this node;
-  commits `07a5720639` + `7d84b12b44`), **re-derived** from the fresh interleaved A/B (not copied). **A new
-  rust regression appeared, however, in the `foreign: emqx_base62:encode` sub-case** (head 3.2×–3.8× dearer
-  than the m10 binary; **OPEN**, owner `beam_rt`, outside this node — see *Known Issues* above).
+- **Whole-process startup is ≈0.72 s per CLI action** (bare `-noshell -eval` 721 ms and the scripted
+  `-boot bootstrap/bin/start` 733 ms are within ~2% of each other; the `-version` fast path is ~3 ms), i.e.
+  the cost is process init, not boot-script work (`RESULTS.md` §3.8/§3.10, `results/m13-cli-probe.csv`). On
+  the rust side `copy_bound: send_recv`/`send_recv_plain` measure tens of µs/op (load-sensitive: a
+  28–217 µs/op band — `RESULTS.md` §8 item 4).
+- **The `foreign` per-call cost is flat in `N`** (the interleaved A/B re-derives it: `decode` 0.55×–0.70× and
+  `capitalize` 0.75×–0.98× of the m10 binary), and **`emqx_base62:encode` is the OPEN outlier** (head
+  3.2×–3.8× dearer than the m10 binary; owner `beam_rt`, outside this node — see *Known Issues* above).
 - **Both m13 tier-effect controls are `--quick` runs** (`results/m13-bench-xrun-interp.json`,
   `results/m13-bench-xrun-quick.json`): the tier table is read off two matched-form `--quick` runs (the
   as-specified `m13-compare-tier-effect.txt` is a form mismatch; `m13-compare-tier-effect-quick.txt` is the
-  matched one). The `churn` tier effect **reversed** (m12: default 2.07× cheaper; m13: default 1.191×
-  *dearer*) — a Rust-vs-Rust observation on a load-sensitive marginal. Every tier table is **Rust-vs-Rust
+  matched one). The interpreter is cheaper on `churn` (the default tier reads 1.191× *dearer*) — a
+  Rust-vs-Rust observation on a load-sensitive marginal. Every tier table is **Rust-vs-Rust
   only** (no `sys` rows) and is never a system-ERTS comparison.
 - Read the figures from `RESULTS.md` / `results/` (`m13-*` current;
   `m12-*`/`m11-*`/`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` the regression baselines) — this file deliberately
@@ -616,14 +614,13 @@ cost: the engine's dispatch arm is itself O(1) and allocation-free per instructi
 behind it are `beam_rt` measurements owned by `../../crates/beam_rt/PERF.md` (the per-call dispatch section)
 and `../../crates/beam_rt/CONTEXT.md`, not `bench` output.
 
-**The `foreign` per-call row is mildly N-dependent, and it carries the (now-fixed) m10→m11 regression**
-(owner **outside this node**). The `ns_per_call` marginal is only valid/comparable at the declared `N` (the
-Rust per-call cost drifts with `N` — a **common-mode per-op heap retention shared with the m10 baseline**,
-not the Θ(N³) defect; the sys side is ~flat). The **Θ(N³) m10→m11 regression is FIXED** (commits
-`07a5720639` + `7d84b12b44`) and **re-derived at m13** from the fresh interleaved A/B: the per-call cost is
-flat in `N`, `decode` and `capitalize` are at-or-better than the m10 binary, and `lower` is within band
+**The `foreign` per-call row is N-dependent on the rust side** (owner **outside this node**). The
+`ns_per_call` marginal is only valid/comparable at the declared `N` (the Rust per-call cost drifts with `N`
+— a **common-mode per-op heap retention shared with the m10 baseline**; the sys side is ~flat). The
+per-call cost is **flat in `N`** (re-derived from the fresh interleaved A/B):
+`decode` and `capitalize` are at-or-better than the m10 binary, and `lower` is within band
 (`lower` reads dearer in the A/B but at-or-better in the ladder — the one instrument-dependent sub-case).
-**Only `emqx_base62:encode` regressed** (the new OPEN item, *Known Issues* above). Recorded in
+**`emqx_base62:encode` is the OPEN outlier** (*Known Issues* above). Recorded in
 `RESULTS.md` §3.3/§8, with the re-derived A/B evidence in `results/m13-ab-*` +
 `results/m13-foreign-ladder.csv` (the m12 re-derivation `results/m12-foreign-regression.md`, history
 `results/b54-foreign-growth-curve.md`, `results/b55-foreign-regression-fix.md`); the detail (with the owner
@@ -650,17 +647,15 @@ Structural facts to carry forward:
 - **Both controls are `--quick`**, so the tier table is read like-for-like (two `--quick` runs, never a
   `--quick`-vs-`--full` pair).
 - The baseline JIT is cheaper on `ets_copy` (1.386×), `send_recv` (1.564×) and the `foreign` non-`lower` cases,
-  and neutral on `startup`/`compute`/`vm_memory`; it is now **dearer** on `gc_bound churn` (0.840× — the
-  effect **reversed** from m12's 2.07× default advantage). The `etf_roundtrip` tier cell sits inside the
+  and neutral on `startup`/`compute`/`vm_memory`; the interpreter is cheaper on `gc_bound churn`
+  (0.840×). The `etf_roundtrip` tier cell sits inside the
   42–245 µs/op noise band, and `bstr_to_lower`'s 3.449× is partly load drift (the default side's 0-iteration
   mean 1 101.75 ms vs the interpreter side's 728.44 ms — `RESULTS.md` §3.9).
 - **`list_walk` resolves only under the interpreter** (419.64 ns/element at rust `N` = 1 000; the default tier
   emits no `ns_per_element`), and **`send_recv_plain` resolves only under the interpreter** (19 878.30 ns/op).
   Both are consequences of the **measurement gap at the declared rust `N`** (*Known Issues* above), not tier
   regressions.
-- **The m11 interpreter pathology is gone** (the control no longer runs super-linearly on `foreign`),
-  consistent with the Θ(N³) registration defect having been fixed. Every tier table here is a **Rust-vs-Rust
-  observation, NOT a system-ERTS comparison**.
+- Every tier table here is a **Rust-vs-Rust observation, NOT a system-ERTS comparison**.
 
 Consequence for reading results: startup latency is the trustworthy cross-runtime comparison for
 whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_bound`/`gc_bound`
@@ -672,18 +667,17 @@ re-run via the Runbook rather than adjusted.
 ### `foreign` `case_<name>_ns_per_call` is N-dependent on the Rust runtime
 
 On `beam_rt` the per-call cost still drifts with `N` — a **common-mode per-op heap retention shared with the
-m10 baseline**, *not* the super-linear Θ(N³) defect (which is **FIXED**, owner outside this node) — so
-`foreign`'s `case_<name>_ns_per_call` remains only a clean marginal at the declared `N` and is **only
-comparable across runs that used the same `N`**; the `sys` oracle side is ~flat over the same range.
-`RESULTS.md` §3.3 records the verdict; the re-derived at-m13 evidence is `results/m13-ab-*` +
+m10 baseline** — so `foreign`'s `case_<name>_ns_per_call` remains only a clean marginal at the declared `N`
+and is **only comparable across runs that used the same `N`**; the `sys` oracle side is ~flat over the same
+range. `RESULTS.md` §3.3 records the verdict; the at-`N` evidence is `results/m13-ab-*` +
 `results/m13-foreign-ladder.csv` (the m12 re-derivation `results/m12-foreign-regression.md`, history
 `results/b54-foreign-growth-curve.md`). This workload's job here is honesty, not any fix: every row emits the
 deterministic `case_<name>_calls = N` companion, and the Rust row carries an explicit N-dependence note, so a
 per-call figure is never quoted without the `N` behind it.
 
-### the loop workloads' rust peak RSS is boot-dominated (and was `N`-dependent before)
+### the loop workloads' rust peak RSS is boot-dominated
 
-At m13 the loop workloads' rust peak RSS is **boot-dominated** — the resident preloaded-module set of the
+The loop workloads' rust peak RSS is **boot-dominated** — the resident preloaded-module set of the
 booted `start.boot` dwarfs the loop's own footprint, so those rows read far above the oracle's and are **not**
 a like-for-like memory comparison (`RESULTS.md` §6.7; the top-level boot status, §3.10). Beneath it the same
 **general per-op heap retention** remains the underlying mechanism: the BIF-result copy-out
