@@ -452,6 +452,39 @@ read-only here); `VmRSS_first` is unusable (pure sample-timing noise, 2.4–9.1 
 385 MB); the ~376.5 MiB boot/`VmSize` baseline (peak `VmSize` 1 000 812 kB) dominates at these N; no
 `/usr/bin/time`; raw series/artifacts were kept outside the repository.
 
+## A forced `garbage_collect()` collects nothing on the `run` path (probe, N = 0 … 20 000)
+Source: `$TMPDIR`-built probe modules (`probe.erl` / `probe2.erl` / `probe3.erl`), run as
+`erts_rust/target/debug/beam_rt run <probe.beam> <mod>:go/1 <N>` (debug build; `/proc/loadavg` 2.8–6.7 at
+the slope runs, `nproc` 14). The sibling `tools/bench` module's N is a compile-time constant and is
+read-only here, so the probes replicate its `ets_copy` shape. Each `go/1` runs its loop, then reads
+`process_info(self(), memory)` and `process_info(self(), garbage_collection)`, calls
+`erlang:garbage_collect()`, and re-reads both.
+
+| probe (body) | N | memory before → after `garbage_collect()` | `minor_gcs` |
+|---|---|---|---|
+| `probe` — `ets:new`/`ets:insert`/`ets:lookup` round trip, `3.5` float in the payload | 0 | 5 592 → 5 592 | 0 → 0 |
+| `probe` | 100 | 78 928 → 81 936 | 0 → 0 |
+| `probe` | 5 000 | 3 763 800 → 3 766 808 | 0 → 0 |
+| `probe` | 20 000 | 15 043 800 → 15 046 808 | 0 → 0 |
+| `probe2` — same loop, float replaced by an integer | 2 000 / 20 000 | 1 209 936 → 1 510 736 / 12 038 808 | 0 → 0 |
+| `probe3` — **no ETS** (`lists:reverse/1` only), **no float** | 0 / 5 000 / 20 000 | 5 592 / 3 763 784 / 15 043 784 | 0 → 0 |
+
+**Retention slope** (memory delta ÷ N ÷ `size_of::<Eterm>()`, in words per iteration): `probe` (100 →
+20 000) **94.0**, `probe2` (5 000 → 20 000) **75.2**, `probe3` (5 000 → 20 000) **94.0** — linear in N for
+every body. 94.0 = `HeapPolicy::next_words(256, 0)` = **376** words — the fresh space a copy-out's
+`needed.max(256)` grow installs (`move_result_into_process_heap` / `alloc_words`) — ÷ 4 iterations per grow.
+The retained bytes are therefore the `Nursery.retired` chain, one whole superseded space per growth.
+
+**What this settles.** (1) `erlang:garbage_collect/0` sets the *forced* flag, so its non-collection is
+**not** the occupancy-only `should_collect` — the occupancy short-circuit is refuted as the blocker.
+(2) It is not the caller-module float guard and not the ETS bridge: `probe3` has neither ETS nor a float
+and behaves like `probe`. (3) A `run` process's collection is thus refused — or never reached — *above* the
+occupancy check: `gc_process_enabled` (pinned / halted / the global escape-store valve),
+`is_relocation_exempt()`, the unscanned-root valve, or the doors not being armed on this path.
+`gc_stats()`'s `collections`/`fallbacks`/`pinned`/`halted`/`disabled` discriminate those and are
+runtime-internal, so that last step belongs to `beam_rt`. (4) Growth itself adds no per-allocation cost —
+the retention is the retired chain, not a bump-path tax.
+
 ## Runtime-shaped dispatch (the break-even through the runtime's own GC doors)
 Source: `../beam_rt/tests/gc_immix_payload.rs` and `../beam_rt/tests/gc_strategy.rs` (crate `beam_rt`,
 outside this crate's own test tree). The same workload driven through `beam_rt`'s own GC doors with a
