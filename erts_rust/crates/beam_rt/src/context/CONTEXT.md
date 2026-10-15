@@ -143,12 +143,32 @@ Oracle answers below are from the system `erl` (OTP 29.1.1 / erts-17.1).
   `let debt = process.collection_debt();` and collect when `forced || process.should_collect(need)
   || debt`. [`Process::should_collect`] stays the **occupancy test alone** (pinned as such by its
   own unit tests); the debt is the growth seam's separate signal.
-* **Residual blocker (out of this node): the runner's post-slice float pin.** A slice that ends
-  with a live FR slot (`Machine::fr_mark() > 0`) pins the process **permanently**
-  (`src/runner/run.rs:586-589` → `Runtime::pin_process`), so a float-using module collects
-  *inside* its first slice and is then refused by that pin from its second slice on
-  (`gc_stats()` shows `collections > 0, pinned: 1`). Closing it needs a `src/runner/**` change (a
-  per-slice fr_mark reset/react rather than a permanent pin) — escalated, not papered over here.
+* **Residual blocker (out of this node): the runner's post-slice float pin — not this node's valve — is what stops a float-using loop.**
+  A slice that ends with a live FR slot (`Machine::fr_mark() > 0`) calls `Runtime::pin_process`
+  *permanently* (`src/runner/run.rs:586-589`), and `Runtime::gc_process_enabled` answers `false`
+  for a pinned/halted pid — checked **first** by both doors, which then early-return with
+  `take_gc_request` and collect **nothing** (which is why a pinned pid's `collections` never move,
+  and why no `fallbacks` is counted: only `alloc_words`/`alloc_words_rooted` call `note_gc_fallback`).
+  This node's unscanned-root valve does **not** decline a float root: this engine's FR model holds
+  *terms* built on the executing process's own young heap ([`alloc_words`](gc) → `beam_term::thing::write_float`),
+  so `fr[0]` is a **scanned** root (`root_is_unscanned` false; pinned by
+  `tests.rs::a_live_float_term_in_fr_is_a_scanned_root`).
+  Measured (fixtures compiled into `$TMPDIR`; the deterministic rig
+  `tests.rs::the_post_slice_float_pin_plateaus_a_float_using_loops_collections`): a float-free
+  `ets_copy` allocate-and-abandon loop's `collections` **scale** with N (5 000→40 000: 1 666→13 333,
+  `pinned 0`); a payload float **literal** folds into the **literal area**
+  (`{move,{literal,#{…3.5…}},{x,0}}`), so it adds **no** float-family instruction, never writes FR,
+  and behaves exactly like the float-free twin (1 666→13 333, `pinned 0`) — "any module with a float
+  literal writes FR slot 0" is **false**; only genuine float *operations* (`fconv`/`fmul`) do. A
+  genuinely float-using loop (`float(X) * 3.5`) is `pinned 1` and its `collections` **plateau**
+  (0→0 across the same 8× step; the committed `gc_floats:l1/1` fixture plateaus at 102→102), and its
+  peak RSS grows with N (+75.6 MiB from N=20 000 to 100 000) while the two float-free twins stay flat
+  (±0.6 MiB). Closing it needs a `src/runner/**` change (a per-slice `fr_mark` high-water handling
+  that publishes/scatters the live FR prefix each slice instead of a sticky `pin_process`) —
+  escalated, not papered over here.
+  The same evidence also corrects the older wording: the pin is armed at the end of *every* slice, so
+  a float-using loop need not collect "inside its first slice" — when slice 1 itself arms no
+  collection the whole run's `collections` is exactly `0` (`gcab_flt`).
 * **A scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks in a `receive` is the typed `blocked()` gap.** A cross-module call the engine cannot enter in-machine goes through `call_bif` → `run_export` → `run_export_blocking` (a fresh `Machine` on the same pid under a `for_process*` context, so `may_pump_scheduler()` is `false`) and `pump_once` returns `Ok(None)` **on its first line**, folding the parked callee into `beam_engine::blocked()` (an uncatchable capability gap) whether or not its `receive` carries an `after T` — the refusal is per `callee_observes_its_call_site`. Nothing here is a wrong result.
 * **`erlang:fun_info/1,2` reads the `LocalFunIdentity` seam, and its `name` item comes from two wiring sites here.** `bridges.rs::local_fun_identity` attaches the `FunT` entry's `function` to the `FunIdentity` it derives for a compiled `make_fun3` fun (`with_function`; introspection-only, so the `term_to_binary` bytes are unchanged); `fun_identity.rs::imported_identity` resolves a decoded `NEW_FUN_EXT` fun's `name` from the loaded module named by the term's own `module` atom, requiring `descriptor_position(module, old_uniq, index) == Some(old_index)`. Both reachable only on the `uses_fun_identity` arm, which `dispatch.rs::reads_fun_identity_for_introspection` extends to the `erlang:fun_info/1,2` pair (`beam_bifs`' `LOCAL_FUN_IDENTITY_BIFS` roster names only the two encoders).
   The one residual: an imported fun whose **defining module is not loaded** (`descriptor_position` finds no matching module) is the typed `unsupported_bif` gap, where the oracle reports `{name,[]}` (C `mfa == NULL ⇒ NIL`, `erl_bif_info.c:4007-4010`) — the seam has no `NIL` to hand over. Pinned by `fun_identity.rs`'s `an_imported_funs_unloaded_defining_module_is_the_typed_gap_not_an_empty_name`; never a fabricated name.

@@ -89,10 +89,15 @@
 //! safe because it runs under the caller's machine and that machine's collection goes through
 //! the full door. A float register still live when a slice ends is caught out of band by the
 //! runner's post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, which pins
-//! the process permanently ([`Runtime::pin_process`](crate::runtime::gc)) — so a float-using
-//! process collects *inside* its first slice and is refused by that pin from its second slice
-//! on. An unresolvable call site (a fun entry or the `-eval` evaluator, which have no
-//! `current_module`) is not collected over either — conservative, never wrong.
+//! the process permanently ([`Runtime::pin_process`](crate::runtime::gc)); `Runtime::gc_process_enabled`
+//! is checked **first** by both doors and refuses a pinned pid outright, so a float-using loop
+//! collects only within a slice that armed a collection before the pin was set — often not even
+//! its first, leaving the whole run at `collections == 0` (`tests.rs::the_post_slice_float_pin_plateaus_a_float_using_loops_collections`).
+//! Note the pin is triggered by float **operations** that write the FR file (`fconv`/`fmul`), not
+//! by a float *literal* in a data structure, which the compiler folds into the literal area and
+//! which therefore never writes FR. An unresolvable call site (a fun entry or the `-eval`
+//! evaluator, which have no `current_module`) is not collected over either — conservative,
+//! never wrong.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};

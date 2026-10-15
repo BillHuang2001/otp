@@ -30,6 +30,7 @@ use crate::context::test_support::{
     compile_fixtures, find_on_path, resolve_erlc, skip_loudly,
 };
 use crate::native::test_support::remote_pid;
+use crate::runtime::GcStatsSnapshot;
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("the default runtime")
 }
@@ -5911,7 +5912,9 @@ fn a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected() {
             );
         }
     }
-}/// **The full door collects over a float-using call site.** The full door publishes the
+}
+
+/// **The full door collects over a float-using call site.** The full door publishes the
 /// machine's **whole FR file** ([`super::gc::publish_roots_full`]), so a live float register is
 /// relocated like any x register or stack word and the caller-module float guard would only be
 /// a redundant conservative extra: the door applies **no** float guard at all. A float-using
@@ -6109,5 +6112,317 @@ fn the_collection_debt_forces_a_collection_the_occupancy_test_would_not() {
     assert!(
         !table.get(pid).expect("the process").collection_debt(),
         "the collection collapsed the chain and settled the debt"
+    );
+}
+
+/// The Erlang source of the `ets_copy` **allocate-and-abandon** loop the A/B/C fixtures share,
+/// mirroring `tools/bench/src/workloads/copy_bound.rs`'s `ets_copy` case (`payload/0` +
+/// `ets:insert/2` + `ets:lookup/2`, one table and one key per process so the table never
+/// grows).
+///
+/// The bound-variable pattern `[{k, T}]` is a real equality test — a corrupted copy raises —
+/// and each validated round-trip adds 1, so `run(N)` returns exactly `N` on both runtimes.
+/// `value_expr` is the payload's `b` value and `extra_key` an optional additional map entry:
+/// they are the **only** differences between the three fixtures, so a divergence in GC
+/// behaviour can only come from the term the payload holds.
+fn gc_ab_module(module: &str, value_expr: &str, extra_key: &str) -> String {
+    format!(
+        r#"-module({module}).
+-export([run/1]).
+
+payload(X) ->
+    #{{a => [1,2,3,4,5,6,7,8,9,10],
+      b => {{ok, <<"hello world">>, {value_expr}}},
+      c => <<1,2,3,4,5,6,7,8,9,10,11,12>>,
+      d => "a char list",
+      e => -42{extra_key}}}.
+
+run(N) ->
+    Tab = ets:new({module}, [set, public]),
+    R = run(N, Tab, 0),
+    ets:delete(Tab),
+    R.
+
+run(0, _Tab, Acc) -> Acc;
+run(N, Tab, Acc) ->
+    T = payload(N),
+    true = ets:insert(Tab, {{k, T}}),
+    case ets:lookup(Tab, k) of
+        [{{k, T}}] -> run(N - 1, Tab, Acc + 1)
+    end.
+"#
+    )
+}
+
+/// One fixture run at one loop count: the loop's value and the runtime's GC counters
+/// afterwards.
+struct GcAbRun {
+    /// The value the loop returned.
+    value: Eterm,
+    /// The runtime's GC counters at the end of the run.
+    stats: GcStatsSnapshot,
+}
+
+/// Runs `<path>:<function>/1` at `n` on a **fresh** runtime through the scheduled route
+/// ([`Runtime::with_defaults`] + [`Runtime::run_scheduled`], the same shape as
+/// `tests/rss_bound.rs::the_churn_loop_really_collects`) and returns the value plus the GC
+/// counters, so a run's `collections`/`pinned` can be compared across loop counts.
+fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    let value = rt
+        .run_scheduled(path, function, 1, &[make_small(n)])
+        .expect("the loop runs to completion on the scheduled path");
+    GcAbRun {
+        value,
+        stats: rt.gc_stats(),
+    }
+}
+
+/// **The residual blocker for a float-using long loop is the runner's permanent post-slice
+/// float pin** (`src/runner/run.rs`): a slice that ends with a live FR slot calls
+/// `Runtime::pin_process(pid)` and `Runtime::gc_process_enabled` then refuses **every** later
+/// collection for that pid, so a long loop collects only inside its first slice and its
+/// nursery keeps every space it ever allocated.
+///
+/// This case is the **deterministic** half of the A/B experiment (no RSS involved): the same
+/// three `ets_copy` allocate-and-abandon loops, differing only in the payload's `b` value, are
+/// driven at two loop counts ~8x apart on the scheduled route and their
+/// [`Runtime::gc_stats`] counters compared.
+///
+/// * `gcab_free` — float-free (`X`).
+/// * `gcab_lit`  — the objective's intended "float-using" twin: `gcab_free` verbatim **plus a
+///   single `3.5` float literal** in the payload. It is **not** float-using in the IR: the
+///   compiler folds a data-structure float literal into the **literal area**
+///   (`{move,{literal,#{...3.5...}},{x,0}}`), so the module contains no float-family
+///   instruction, never writes the FR file, and is never pinned. Its row is the empirical
+///   refutation of "any module with a float literal writes FR slot 0".
+/// * `gcab_flt`  — genuinely float-using: the payload computes `float(X) * 3.5`, so the module
+///   contains `fconv`/`fmul` instructions and every slice ends with `fr_mark() > 0`.
+///
+/// The float-free loops' `collections` therefore **scale with N** and their `pinned` is 0,
+/// while the float-using loop's `collections` **plateaus** — its ~8x larger run adds no
+/// collection at all — with `pinned >= 1`. That plateau is exactly why a float-using
+/// allocation loop retains every replaced heap space and its peak RSS grows with N.
+///
+/// A missing `erlc` is a **loud skip**, never a silent pass; the fixtures are compiled from
+/// these in-file sources into `$TMPDIR` (nothing is committed under `tests/fixtures/`).
+#[test]
+fn the_post_slice_float_pin_plateaus_a_float_using_loops_collections() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly("gc-ab", "erlc was not found beside $ERTS_ORACLE or on $PATH");
+        return;
+    };
+    let src_a = gc_ab_module("gcab_free", "X", "");
+    let src_b = gc_ab_module("gcab_lit", "X", ",\n      f => 3.5");
+    let src_c = gc_ab_module("gcab_flt", "float(X) * 3.5", "");
+    let dir = compile_fixtures(
+        &erlc,
+        "gc_ab",
+        &[
+            ("gcab_free", src_a.as_str()),
+            ("gcab_lit", src_b.as_str()),
+            ("gcab_flt", src_c.as_str()),
+        ],
+    );
+
+    // ~8x apart: a float-free loop's collection count scales over the step; a pinned one's
+    // cannot move at all, so the two counts are the same measurement twice.
+    const SMALL: i64 = 5_000;
+    const LARGE: i64 = 40_000;
+
+    let mut rows: Vec<(&str, GcAbRun, GcAbRun)> = Vec::new();
+    for module in ["gcab_free", "gcab_lit", "gcab_flt"] {
+        let path = dir.join(&format!("{module}.beam"));
+        let small = gc_ab_run(&path, "run", SMALL);
+        let large = gc_ab_run(&path, "run", LARGE);
+        assert!(
+            is_small(small.value) && is_small(large.value),
+            "{module}: run/1 returns a small integer"
+        );
+        eprintln!(
+            "gc-ab {module}: N={SMALL} -> value {} collections {} major {} pinned {} \
+             fallbacks {} | N={LARGE} -> value {} collections {} major {} pinned {} fallbacks {}",
+            signed_value(small.value),
+            small.stats.collections,
+            small.stats.major,
+            small.stats.pinned,
+            small.stats.fallbacks,
+            signed_value(large.value),
+            large.stats.collections,
+            large.stats.major,
+            large.stats.pinned,
+            large.stats.fallbacks,
+        );
+        rows.push((module, small, large));
+    }
+    let row = |name: &str| -> &(&str, GcAbRun, GcAbRun) {
+        rows.iter()
+            .find(|(module, _, _)| *module == name)
+            .unwrap_or_else(|| panic!("the {name} row was measured"))
+    };
+    let (_, a_small, a_large) = row("gcab_free");
+    let (_, b_small, b_large) = row("gcab_lit");
+    let (_, c_small, c_large) = row("gcab_flt");
+
+    // Determinism first: a run cannot have silently done less work (which would make every
+    // comparison below meaningless).
+    for (module, small, large) in &rows {
+        assert_eq!(
+            signed_value(small.value),
+            SMALL,
+            "{module}: run({SMALL}) == {SMALL}"
+        );
+        assert_eq!(
+            signed_value(large.value),
+            LARGE,
+            "{module}: run({LARGE}) == {LARGE}"
+        );
+    }
+
+    // A — float-free: never pinned, and its collections SCALE with the loop count.
+    assert_eq!(
+        a_small.stats.pinned, 0,
+        "a float-free module's slice never ends with a live FR slot; {:?}",
+        a_small.stats
+    );
+    assert!(
+        a_large.stats.collections > a_small.stats.collections * 4,
+        "the float-free loop's collections must scale with N ({SMALL} -> {}, {LARGE} -> {})",
+        a_small.stats.collections,
+        a_large.stats.collections
+    );
+
+    // B — the literal-only payload: float-FREE in the IR, so it behaves exactly like A. This
+    // is the empirical refutation of the "a float literal writes FR slot 0" premise.
+    assert_eq!(
+        b_small.stats.pinned, 0,
+        "a payload float LITERAL folds into the literal area — the module is float-free, so \
+         it is never pinned; {:?}",
+        b_small.stats
+    );
+    assert!(
+        b_large.stats.collections > b_small.stats.collections * 4,
+        "the literal-float loop is float-free and collects across its whole run \
+         ({SMALL} -> {}, {LARGE} -> {})",
+        b_small.stats.collections,
+        b_large.stats.collections
+    );
+
+    // C — genuinely float-using: PINNED after its first slice, so its collections PLATEAU.
+    assert!(
+        c_small.stats.pinned >= 1,
+        "the post-slice float-register scan must pin a float-using pid; {:?}",
+        c_small.stats
+    );
+    assert_eq!(
+        c_large.stats.collections, c_small.stats.collections,
+        "a pinned pid is refused every collection, so its collections are exactly the first \
+         slice's and cannot scale with N ({SMALL} -> {}, {LARGE} -> {}); {:?}",
+        c_small.stats.collections,
+        c_large.stats.collections,
+        c_large.stats
+    );
+    assert!(
+        a_large.stats.collections > c_large.stats.collections,
+        "at the large N the float-free loop must have collected more times than the pinned \
+         float-using one (float-free {}, float-using {})",
+        a_large.stats.collections,
+        c_large.stats.collections
+    );
+
+    // The committed float-arithmetic fixture (`tests/fixtures/gc_floats.beam`, `l1/1`
+    // accumulates `math:sqrt(float(N))` in one double) is the **plateau** control: its
+    // collections must be non-zero (its first slice really collected) and then *identical* at
+    // the ~8x larger N, because the pin refuses every later slice. That is the shape the
+    // benchmark's `gc_floats`/`churn` RSS readings could not improve on.
+    let f_small = gc_ab_run(std::path::Path::new(GC_FLOATS_BEAM), "l1", SMALL);
+    let f_large = gc_ab_run(std::path::Path::new(GC_FLOATS_BEAM), "l1", LARGE);
+    eprintln!(
+        "gc-ab gc_floats:l1/1: N={SMALL} -> collections {} pinned {} | N={LARGE} -> \
+         collections {} pinned {}",
+        f_small.stats.collections,
+        f_small.stats.pinned,
+        f_large.stats.collections,
+        f_large.stats.pinned
+    );
+    assert!(
+        f_small.stats.pinned >= 1 && f_large.stats.pinned >= 1,
+        "the float-arithmetic fixture pins its pid on both runs"
+    );
+    assert_eq!(
+        f_large.stats.collections, f_small.stats.collections,
+        "a pinned pid's collections plateau: the first slice's count and nothing more \
+         ({SMALL} -> {}, {LARGE} -> {})",
+        f_small.stats.collections,
+        f_large.stats.collections
+    );
+}
+
+/// **A live float term in the FR file is a SCANNED root, so this node's unscanned-root valve
+/// does not decline it — a float module's zero-collection plateau is the runner's *pin*.**
+///
+/// The engine materialises an FR slot's float through
+/// [`beam_engine::terms::make_float`]/`make_float_rooted`, which allocates on the **executing
+/// process's own young heap** (this engine's FR model holds *terms*, not raw doubles), so the
+/// word the full door publishes from `fr[0]` is classified as a scanned root by
+/// [`root_is_unscanned`](super::gc::root_is_unscanned). The valve is therefore **not** what
+/// stops a float-using loop from collecting — the runner's permanent post-slice pin is checked
+/// *first* in both doors (`Runtime::gc_process_enabled`) and refuses the pid outright. This
+/// case proves the valve half directly, so the two independent mechanisms cannot be confused.
+#[test]
+fn a_live_float_term_in_fr_is_a_scanned_root() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    assert!(
+        !rt.module_is_float_free(
+            "gc_floats",
+            &rt.code_server()
+                .module_handle("gc_floats")
+                .expect("cached under its own name")
+        ),
+        "the fixture really is float-using, so the case would be vacuous otherwise"
+    );
+
+    // Build the float on the process's OWN young heap, exactly as the engine's FR writers do.
+    let float = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        beam_engine::terms::make_float(&mut ctx, 3.5).expect("the float term is built")
+    };
+    assert_eq!(
+        beam_engine::terms::float_value(float).expect("a boxed float term"),
+        3.5
+    );
+    assert!(
+        !super::gc::root_is_unscanned(table.get(pid).expect("the process"), float),
+        "an FR float lives on the process's own heap, so it is a scanned root — never a \
+         foreign container the valve would decline"
+    );
+
+    // And the full door really collects with it published from `fr[0]`.
+    let mut x = [make_small(0), NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [float];
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some("gc_floats".to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "a float-using call site with a live FR float is collected over at the full door; \
+         {after:?}"
+    );
+    assert_ne!(fr[0], float, "the collection relocated the FR float");
+    assert_eq!(
+        beam_engine::terms::float_value(fr[0]).expect("still a boxed float term"),
+        3.5,
+        "the relocated FR float is intact"
     );
 }
