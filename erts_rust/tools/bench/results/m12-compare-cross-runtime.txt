@@ -1,0 +1,81 @@
+cross-runtime compare m12-bench-xrun.json — 6 workload(s), 73 numeric row(s)
+workload           metric                   unit               sys           rust          delta      delta%  speedup
+--------------------------------------------------------------------------------------------------------------------
+baseline           compute_loop_ms          ms            181.7306      2272.2808     +2090.5503   +1150.36%   0.0800
+baseline           compute_ops_per_sec      ops/s     5502651.7714    440086.4479  -5062565.3234     -92.00%  12.5036
+baseline           startup_ms               ms            120.6697      2298.6279     +2177.9582   +1804.89%   0.0525
+baseline           vm_memory_total_bytes    bytes    36211168.0000  15892346.0000 -20318822.0000     -56.11%   2.2785
+baseline           peak_memory_bytes        bytes   134971392.0000 408072192.0000 +273100800.0000    +202.34%   0.3308
+copy_bound         case_etf_roundtrip_ns_per_op ns            738.6382     35369.2113    +34630.5731   +4688.44%   0.0209
+copy_bound         case_etf_roundtrip_ops   ops       1500000.0000      5000.0000  -1495000.0000     -99.67% 300.0000
+copy_bound         case_etf_roundtrip_peak_rss_bytes bytes    69999820.8000 401195827.2000 +331196006.4000    +473.14%   0.1745
+copy_bound         case_etf_roundtrip_startup_ms ms            149.8355      2134.3011     +1984.4656   +1324.43%   0.0702
+copy_bound         case_etf_roundtrip_wall_ms ms           1257.7927      2311.1471     +1053.3544     +83.75%   0.5442
+copy_bound         case_ets_copy_ns_per_op  ns            289.5147      2883.7548     +2594.2401    +896.06%   0.1004
+copy_bound         case_ets_copy_ops        ops       2000000.0000    100000.0000  -1900000.0000     -95.00%  20.0000
+copy_bound         case_ets_copy_peak_rss_bytes bytes    69531648.0000 471872307.2000 +402340659.2000    +578.64%   0.1474
+copy_bound         case_ets_copy_startup_ms ms            145.1114      2139.3187     +1994.2073   +1374.26%   0.0678
+copy_bound         case_ets_copy_wall_ms    ms            724.1408      2427.6942     +1703.5534    +235.25%   0.2983
+copy_bound         case_send_recv_ns_per_op ns           1584.3631  25632422.2283 +25630837.8652 +1617737.64%   0.0001
+copy_bound         case_send_recv_ops       ops        500000.0000      2000.0000   -498000.0000     -99.60% 250.0000
+copy_bound         case_send_recv_peak_rss_bytes bytes    69557043.2000 402984550.4000 +333427507.2000    +479.36%   0.1726
+copy_bound         case_send_recv_plain_ns_per_op ns            662.1843              - note=only-sys
+copy_bound         case_send_recv_plain_ops ops       1000000.0000              - note=only-sys
+copy_bound         case_send_recv_plain_peak_rss_bytes bytes    69655347.2000              - note=only-sys
+copy_bound         case_send_recv_plain_startup_ms ms            128.9086              - note=only-sys
+copy_bound         case_send_recv_plain_wall_ms ms            791.0929              - note=only-sys
+copy_bound         case_send_recv_startup_ms ms            129.6753      2086.0290     +1956.3537   +1508.66%   0.0622
+copy_bound         case_send_recv_wall_ms   ms            921.8569     53350.8735    +52429.0166   +5687.33%   0.0173
+copy_bound         peak_memory_bytes        bytes    71745536.0000 472117248.0000 +400371712.0000    +558.04%   0.1520
+foreign            case_bstr_capitalize_token_calls calls     1500000.0000     15000.0000  -1485000.0000     -99.00% 100.0000
+foreign            case_bstr_capitalize_token_ns_per_call ns            361.5712     22901.0619    +22539.4907   +6233.76%   0.0158
+foreign            case_bstr_capitalize_token_peak_rss_bytes bytes    69456281.6000 462696857.6000 +393240576.0000    +566.17%   0.1501
+foreign            case_bstr_capitalize_token_startup_ms ms            132.9430      2078.5823     +1945.6393   +1463.51%   0.0640
+foreign            case_bstr_capitalize_token_wall_ms ms            675.2999      2422.0982     +1746.7984    +258.67%   0.2788
+foreign            case_bstr_to_lower_calls calls     1500000.0000     20000.0000  -1480000.0000     -98.67%  75.0000
+foreign            case_bstr_to_lower_ns_per_call ns            419.7725     23429.8831    +23010.1106   +5481.57%   0.0179
+foreign            case_bstr_to_lower_peak_rss_bytes bytes    69612339.2000 459696128.0000 +390083788.8000    +560.37%   0.1514
+foreign            case_bstr_to_lower_startup_ms ms            132.4784      2113.9207     +1981.4423   +1495.67%   0.0627
+foreign            case_bstr_to_lower_wall_ms ms            762.1371      2582.5183     +1820.3812    +238.85%   0.2951
+foreign            case_emqx_base62_decode_calls calls     3000000.0000     15000.0000  -2985000.0000     -99.50% 200.0000
+foreign            case_emqx_base62_decode_ns_per_call ns            383.9592     14919.3416    +14535.3824   +3785.66%   0.0257
+foreign            case_emqx_base62_decode_peak_rss_bytes bytes    69668044.8000 448731136.0000 +379063091.2000    +544.10%   0.1553
+foreign            case_emqx_base62_decode_startup_ms ms            177.6427      2090.5873     +1912.9447   +1076.85%   0.0850
+foreign            case_emqx_base62_decode_wall_ms ms           1329.5203      2314.3775      +984.8571     +74.08%   0.5745
+foreign            case_emqx_base62_encode_calls calls     3000000.0000     25000.0000  -2975000.0000     -99.17% 120.0000
+foreign            case_emqx_base62_encode_ns_per_call ns            231.6157     15502.6789    +15271.0632   +6593.28%   0.0149
+foreign            case_emqx_base62_encode_peak_rss_bytes bytes    69583257.6000 448165068.8000 +378581811.2000    +544.07%   0.1553
+foreign            case_emqx_base62_encode_startup_ms ms            135.7227      2113.6856     +1977.9629   +1457.36%   0.0642
+foreign            case_emqx_base62_encode_wall_ms ms            830.5698      2501.2526     +1670.6827    +201.15%   0.3321
+foreign            peak_memory_bytes        bytes    71602176.0000 462831616.0000 +391229440.0000    +546.39%   0.1547
+gc_bound           case_churn_ns_per_op     ns           4658.7133    184398.8576   +179740.1443   +3858.15%   0.0253
+gc_bound           case_churn_ops           ops        200000.0000      2000.0000   -198000.0000     -99.00% 100.0000
+gc_bound           case_churn_peak_rss_bytes bytes    69920358.4000 394793779.2000 +324873420.8000    +464.63%   0.1771
+gc_bound           case_churn_startup_ms    ms            325.6552      2136.6292     +1810.9740    +556.10%   0.1524
+gc_bound           case_churn_wall_ms       ms           1257.3979      2505.4269     +1248.0290     +99.25%   0.5019
+gc_bound           peak_memory_bytes        bytes    71172096.0000 394907648.0000 +323735552.0000    +454.86%   0.1802
+list_walk          case_list_walk_elements  elements 100000000.0000   1000000.0000 -99000000.0000     -99.00% 100.0000
+list_walk          case_list_walk_ns_per_element ns              7.6021       110.2061      +102.6040   +1349.68%   0.0690
+list_walk          case_list_walk_peak_rss_bytes bytes    69128192.0000 394747904.0000 +325619712.0000    +471.04%   0.1751
+list_walk          case_list_walk_startup_ms ms            157.3315      2098.3353     +1941.0038   +1233.70%   0.0750
+list_walk          case_list_walk_wall_ms   ms            917.5420      2208.5414     +1290.9994    +140.70%   0.4155
+list_walk          peak_memory_bytes        bytes    70119424.0000 394899456.0000 +324780032.0000    +463.18%   0.1776
+slice              case_add_peak_rss_bytes  bytes    69544673.2800 394526883.8400 +324982210.5600    +467.30%   0.1763
+slice              case_add_wall_ms         ms            141.6530      2270.3911     +2128.7381   +1502.78%   0.0624
+slice              case_base64_encode_size_peak_rss_bytes bytes    69845647.3600 395614781.4400 +325769134.0800    +466.41%   0.1765
+slice              case_base64_encode_size_wall_ms ms            136.3259      2140.5912     +2004.2653   +1470.20%   0.0637
+slice              case_calendar_last_day_peak_rss_bytes bytes    69716377.6000 394551951.3600 +324835573.7600    +465.94%   0.1767
+slice              case_calendar_last_day_wall_ms ms            137.1116      2290.9699     +2153.8583   +1570.88%   0.0598
+slice              case_fib_peak_rss_bytes  bytes    69628067.8400 394553098.2400 +324925030.4000    +466.66%   0.1765
+slice              case_fib_wall_ms         ms            134.3435      2356.7838     +2222.4403   +1654.30%   0.0570
+slice              case_gb_trees_size_peak_rss_bytes bytes    69678530.5600 394549166.0800 +324870635.5200    +466.24%   0.1766
+slice              case_gb_trees_size_wall_ms ms            132.0817      2148.8423     +2016.7607   +1526.90%   0.0615
+slice              case_ordsets_from_size_peak_rss_bytes bytes    69542543.3600 394522296.3200 +324979752.9600    +467.31%   0.1763
+slice              case_ordsets_from_size_wall_ms ms            135.4466      2101.3880     +1965.9414   +1451.45%   0.0645
+slice              case_pick_peak_rss_bytes bytes    69534679.0400 394519511.0400 +324984832.0000    +467.37%   0.1763
+slice              case_pick_wall_ms        ms            141.0300      2366.6399     +2225.6100   +1578.11%   0.0596
+slice              case_queue_from_size_peak_rss_bytes bytes    69859901.4400 394606018.5600 +324746117.1200    +464.85%   0.1770
+slice              case_queue_from_size_wall_ms ms            132.3285      2175.5374     +2043.2090   +1544.04%   0.0608
+slice              case_string_str_length_peak_rss_bytes bytes    69928058.8800 394989240.3200 +325061181.4400    +464.85%   0.1770
+slice              case_string_str_length_wall_ms ms            152.7097      2097.6393     +1944.9296   +1273.61%   0.0728
+slice              peak_memory_bytes        bytes    72368128.0000 395730944.0000 +323362816.0000    +446.83%   0.1829

@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1792075798666,
+  "profile": "full",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "erlc_compiler",
+      "runtime": "sys",
+      "category": "compiler",
+      "description": "erlc throughput over bounded OTP stdlib + Elixir compiler corpus slices",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 6842.177446
+        },
+        {
+          "name": "files_compiled",
+          "unit": "files",
+          "value": 60.0
+        },
+        {
+          "name": "files_per_sec",
+          "unit": "files/s",
+          "value": 8.76913825657599
+        },
+        {
+          "name": "loc_per_sec",
+          "unit": "loc/s",
+          "value": 6796.520605759221
+        }
+      ],
+      "peak_memory_bytes": 134492160,
+      "notes": [
+        "corpus: 60 files (46503 LOC) attempted from stdlib+elixir; 60 produced .beam (46503 LOC)"
+      ]
+    },
+    {
+      "workload": "elixir_compiler",
+      "runtime": "sys",
+      "category": "compiler",
+      "description": "installed system Elixir compiler (elixirc) throughput over the checkout's stdlib corpus",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 50304.33871899999
+        },
+        {
+          "name": "files_attempted",
+          "unit": "files",
+          "value": 105.0
+        },
+        {
+          "name": "files_compiled",
+          "unit": "files",
+          "value": 223.0
+        },
+        {
+          "name": "files_per_sec",
+          "unit": "files/s",
+          "value": 4.433017224332833
+        },
+        {
+          "name": "loc_per_sec",
+          "unit": "loc/s",
+          "value": 2225.7324686331895
+        },
+        {
+          "name": "compiler_startup_ms",
+          "unit": "ms",
+          "value": 297.643093
+        }
+      ],
+      "peak_memory_bytes": 211509248,
+      "notes": [
+        "batch compile failed; per-file fallback (version skew)",
+        "compiler: Elixir 1.20.4 (compiled with Erlang/OTP 29)",
+        "corpus = the checkout's unbuilt, read-only .ex sources staged into $TMPDIR; compiler = the installed system elixirc, so a version skew with the checkout is expected",
+        "97/105 compiled; 223 .beam produced",
+        "223 .beam file(s) produced from 105 source file(s) (an Elixir source may define several modules)"
+      ]
+    },
+    {
+      "workload": "cowboy",
+      "runtime": "sys",
+      "category": "io",
+      "description": "Cowboy hello_world HTTP server driven by the in-process HTTP/1.1 load generator",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "build_ms",
+          "unit": "ms",
+          "value": 42527.108981
+        },
+        {
+          "name": "requests",
+          "unit": "count",
+          "value": 827888.0
+        },
+        {
+          "name": "errors",
+          "unit": "count",
+          "value": 0.0
+        },
+        {
+          "name": "requests_per_sec",
+          "unit": "req/s",
+          "value": 165489.21346880432
+        },
+        {
+          "name": "latency_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 20000,
+            "min": 0.023989999999999997,
+            "max": 3.2686759999999997,
+            "mean": 0.10566751745000025,
+            "p50": 0.077852,
+            "p90": 0.13781800000000008,
+            "p99": 0.7423802999999974
+          }
+        }
+      ],
+      "peak_memory_bytes": 166875136,
+      "notes": []
+    },
+    {
+      "workload": "khepri",
+      "runtime": "sys",
+      "category": "gc",
+      "description": "Khepri test suite (rebar3 eunit) — GC/data-structure bound",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 77564.335456
+        }
+      ],
+      "peak_memory_bytes": 374722560,
+      "notes": []
+    }
+  ]
+}
