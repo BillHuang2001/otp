@@ -112,7 +112,7 @@ use std::fs;
 use std::time::Duration;
 
 use beam_common::BeamError;
-use beam_ets::{compile, MatchSpec, OrderedInterior, Table, TableKind};
+use beam_ets::{compile, key_of, MatchSpec, OrderedInterior, Table, TableKind};
 use beam_term::prelude::*;
 use common::oracle;
 use common::*;
@@ -274,6 +274,16 @@ fn binary(heap: &mut Heap, bytes: &[u8]) -> Eterm {
     }
 }
 
+/// Element `pos` (1-based) of a `{Key, Value}` object, read through the crate's
+/// **safe** object accessor ([`key_of`]).
+///
+/// Every object this trace observes was built by `step` as a two-word
+/// `{Key, Value}` tuple, so the accessor's validation always succeeds; going
+/// through it keeps the trace's term reads out of `unsafe`.
+fn element(object: Eterm, pos: usize) -> Eterm {
+    key_of(object, pos).expect("every trace object is a {Key, Value} tuple")
+}
+
 /// `[{{'_','_'},[],[true]}]` — the whole-object clause with a `true` body, the
 /// spec `ets:select_count/2` is driven with.
 fn all_true_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
@@ -329,10 +339,7 @@ impl Trace<'_> {
 
     /// One stored `{Key, Value}` object as `{<key index>,<value>}`.
     fn object(&self, object: Eterm) -> String {
-        // SAFETY: every object the trace inserts is a `{Key, Value}` two-word
-        // tuple built by `step`; both reads address live elements of that tuple.
-        let (key, value) =
-            unsafe { (tuple_element(object, 0), signed_value(tuple_element(object, 1))) };
+        let (key, value) = (element(object, 1), signed_value(element(object, 2)));
         format!("{{{},{}}}", self.key(key), value)
     }
 
@@ -365,8 +372,7 @@ impl Trace<'_> {
     /// operations reuse it (`{2, value - COUNTER_BIAS}` for the counter, the value
     /// itself for the element/default), keeping every operand an immediate.
     fn value_of(&self, object: Eterm) -> i64 {
-        // SAFETY: every object the trace builds is a `{Key, Value}` two-word tuple.
-        signed_value(unsafe { tuple_element(object, 1) })
+        signed_value(element(object, 2))
     }
 
     /// Drive one step and return the operation's rendered result.
@@ -500,8 +506,7 @@ fn failure(op: u64, error: BeamError) -> String {
 fn foldl_keys(table: &Table) -> Vec<Eterm> {
     let mut acc = Vec::new();
     for object in table.tab2list() {
-        // SAFETY: every object the trace inserts is a `{Key, Value}` two-word tuple.
-        acc.insert(0, unsafe { tuple_element(object, 0) });
+        acc.insert(0, element(object, 1));
     }
     acc
 }
@@ -516,8 +521,7 @@ fn foldl_keys(table: &Table) -> Vec<Eterm> {
 fn foldr_keys(table: &Table) -> Vec<Eterm> {
     let mut acc = Vec::new();
     for object in table.tab2list().into_iter().rev() {
-        // SAFETY: every object the trace inserts is a `{Key, Value}` two-word tuple.
-        acc.insert(0, unsafe { tuple_element(object, 0) });
+        acc.insert(0, element(object, 1));
     }
     acc
 }
