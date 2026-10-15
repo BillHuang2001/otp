@@ -64,22 +64,24 @@
 //! `run_export`, a fun applied by a bridge, the `-eval` evaluator — is a plain
 //! [`RuntimeContext`] whose latch is therefore never set, so it can never collect.
 //!
-//! # The float guard
+//! # The float guard — the narrow door's alone
 //!
-//! Both doors refuse to collect when the **call site's** module contains a float-family
-//! instruction ([`module_uses_floats`], cached per module name — see
-//! [`module_may_be_collected`]). The two doors do **not** need it equally:
+//! The **narrow** door ([`ensure_heap`]) receives only an x-register prefix and the stack and
+//! can never see the machine's FR file, so a collection it drove could dangle a live float
+//! register. Its caller-module guard ([`module_may_be_collected`] — the call site's module must
+//! be loaded **and** free of any float-family instruction, cached per module name) is therefore
+//! load-bearing and is the only thing that keeps that door sound for float code. The engine
+//! reaches only the **full** door (`Machine::ensure_heap`/`test_heap`/`allocate_heap` →
+//! [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full)), so
+//! the narrow form is not on the engine's path today.
 //!
-//! * the **full** door ([`ensure_heap_full`], and [`alloc_words_rooted`]) hands the machine's
-//!   whole [`RootSet`] over, FR file included ([`publish_roots_full`]), so a collection over it
-//!   is FR-safe for **any** module — its copy of the guard is a conservative *extra*, not what
-//!   makes a float-using module collectable;
-//! * the **narrow** door ([`ensure_heap`]) receives only the x-register prefix and the stack and
-//!   can never see the machine's FR file, so for that door the caller-module guard is
-//!   load-bearing: without it a live float register could dangle across the move. The engine
-//!   reaches only the full door (`Machine::ensure_heap`/`test_heap`/`allocate_heap` →
-//!   [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full)),
-//!   so this narrow form is not on the engine's path today.
+//! The **full** doors ([`ensure_heap_full`] and [`alloc_words_rooted`]) hand the machine's whole
+//! [`RootSet`] over, FR file included ([`publish_roots_full`]), so a collection over them is
+//! FR-safe for **any** module: a live float register is relocated exactly like an x register or
+//! a stack word. They therefore apply **no** float guard at all — [`module_uses_floats`] is not
+//! consulted there — and a float-using call site collects like any other. What they do keep is
+//! the "no caller module" refusal (a fun entry, the `-eval` evaluator): such a run has no
+//! machine to name, and is left un-collected rather than guessed at.
 //!
 //! The **cross-module call seam**
 //! ([`RuntimeContext::resolve_external_call`](crate::RuntimeContext)) does not consult this
@@ -87,10 +89,15 @@
 //! safe because it runs under the caller's machine and that machine's collection goes through
 //! the full door. A float register still live when a slice ends is caught out of band by the
 //! runner's post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, which pins
-//! the process permanently ([`Runtime::pin_process`](crate::runtime::gc)).
-//!
-//! An unresolvable call site (a fun entry or the `-eval` evaluator, which have no
-//! `current_module`) is not collected over either — conservative, never wrong.
+//! the process permanently ([`Runtime::pin_process`](crate::runtime::gc)); `Runtime::gc_process_enabled`
+//! is checked **first** by both doors and refuses a pinned pid outright, so a float-using loop
+//! collects only within a slice that armed a collection before the pin was set — often not even
+//! its first, leaving the whole run at `collections == 0` (`tests.rs::the_post_slice_float_pin_plateaus_a_float_using_loops_collections`).
+//! Note the pin is triggered by float **operations** that write the FR file (`fconv`/`fmul`), not
+//! by a float *literal* in a data structure, which the compiler folds into the literal area and
+//! which therefore never writes FR. An unresolvable call site (a fun entry or the `-eval`
+//! evaluator, which have no `current_module`) is not collected over either — conservative,
+//! never wrong.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
@@ -462,7 +469,9 @@ fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> 
 
 /// The engine's heap-admission point for a scheduled slice: collect the running process's
 /// own heap when it cannot satisfy `heap_need` more words — **growing** it when the
-/// request is larger than the nursery — or when a `garbage_collect` BIF asked for one.
+/// request is larger than the nursery — when a `garbage_collect` BIF asked for one, or when
+/// the nursery carries a growth's **collection debt** (a retired-space chain only a collection
+/// can evacuate, [`Process::collection_debt`]).
 ///
 /// `armed` is the slice latch (see the module docs). When it is not set, when the running
 /// process is not collectable, or when the call site's module is not known to be float-free,
@@ -473,10 +482,12 @@ fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> 
 /// This door is handed only the x-register prefix and the stack, so it can never see the
 /// machine's FR file and a collection here **would** dangle a live float register. The
 /// [`module_may_be_collected`] test on the call site's module is therefore the only thing that
-/// keeps this door sound for float code — unlike the full door
-/// ([`ensure_heap_full`]), whose copy of the same test is a conservative extra because it
-/// publishes the FR file itself ([`publish_roots_full`]). The engine reaches only the full
-/// door, so this narrow form is not on the engine's path today.///
+/// keeps this door sound for float code — and it is this door's **alone**: the full doors
+/// ([`ensure_heap_full`], [`alloc_words_rooted`]) publish the FR file itself
+/// ([`publish_roots_full`]) and apply no float guard at all (see the module docs' float-guard
+/// section). The engine reaches only the full door, so this narrow form is not on the engine's
+/// path today.
+///
 /// # Growth
 ///
 /// The collection this runs is the collector's on-demand growth seam
@@ -534,9 +545,11 @@ pub(crate) fn ensure_heap(
         ctx.runtime.take_gc_request(pid);
         return Ok(());
     }
-    // The float guard: only a call site whose module is known to be float-free may be
-    // collected over. An unknown call site (a fun entry, the `-eval` evaluator) is skipped,
-    // never guessed at.
+    // The float guard — **this door's alone** (see the module docs' float-guard section): it
+    // receives only an x prefix and the stack, so it cannot see the machine's FR file and a
+    // collection it drove could dangle a live float register. Only a call site whose module is
+    // known to be float-free may therefore be collected over. An unknown call site (a fun
+    // entry, the `-eval` evaluator) is skipped, never guessed at.
     let Some(name) = ctx.current_module.clone() else {
         return Ok(());
     };
@@ -559,7 +572,11 @@ pub(crate) fn ensure_heap(
     let Some(process) = table.get_mut(pid) else {
         return Ok(());
     };
-    if !forced && !process.should_collect(heap_need as usize) {
+    // The **occupancy** test, plus the collector's **collection debt** (see
+    // [`ensure_heap_full`]): a nursery chain a no-collect growth retained forces the collection
+    // even when the current space still has room.
+    let debt = process.collection_debt();
+    if !forced && !process.should_collect(heap_need as usize) && !debt {
         return Ok(());
     }
     // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root in a region the
@@ -640,15 +657,20 @@ pub(crate) fn ensure_heap(
 /// This is the full-root twin of [`ensure_heap`], reached by
 /// `Machine::ensure_heap`/`test_heap`/`allocate_heap` through
 /// [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full).
-/// The **gate order is identical** to the narrow door's — the latch, the forced-collection
-/// request, the collectability test, the caller-module float guard, the table/process lookup,
-/// the occupancy test and the "committed" request consume — and only the root hand-off differs:
-/// it publishes and scatters `roots` (every x slot, the whole stack, the whole FR file)
+/// The gate order is the narrow door's — the latch, the forced-collection request, the
+/// collectability test, the "this door has a caller module" test, the table/process lookup, the
+/// occupancy-or-debt test and the "committed" request consume — and only the root hand-off
+/// differs: it publishes and scatters `roots` (every x slot, the whole stack, the whole FR file)
 /// through [`publish_roots_full`]/[`scatter_roots_full`] instead of a `live`-bounded x prefix.
-/// Because the FR file is published, this door is **FR-safe for any module**: a live float
-/// register is relocated like any other root, so the [`module_may_be_collected`] test it keeps
-/// is a conservative extra rather than the thing that makes float code collectable (see the
-/// module docs' float-guard section).///
+/// It applies **no caller-module float guard**: because the FR file is published, this door is
+/// **FR-safe for any module** — a live float register is relocated like any other root — so a
+/// float-using call site collects here exactly like a float-free one (see the module docs'
+/// float-guard section).
+///
+/// The occupancy test is OR-ed with the collector's **collection debt**
+/// ([`Process::collection_debt`]): a nursery chain a no-collect [`Process::grow_nursery`]
+/// growth retained is treated like a full nursery, because only a collection can evacuate it.
+///
 /// # Growth
 ///
 /// This door takes the **same action** as the narrow one ([`collect_or_grow`]): the
@@ -687,13 +709,14 @@ pub(crate) fn ensure_heap_full(
         ctx.runtime.take_gc_request(pid);
         return Ok(());
     }
-    let Some(name) = ctx.current_module.clone() else {
-        return Ok(());
-    };
-    if !module_may_be_collected(ctx.runtime, &name) {
+    // The door needs a caller module to name at all — a fun entry, or the `-eval` evaluator,
+    // has none — and is otherwise left alone. This is **not** a float guard: this door
+    // publishes the machine's whole FR file ([`publish_roots_full`]), so a live float register
+    // is relocated like any other root and a float-using call site collects exactly like a
+    // float-free one (see the module docs' float-guard section).
+    if ctx.current_module.is_none() {
         return Ok(());
     }
-
     let RuntimeContext {
         runtime,
         mailbox_table,
@@ -706,7 +729,17 @@ pub(crate) fn ensure_heap_full(
     let Some(process) = table.get_mut(pid) else {
         return Ok(());
     };
-    if !forced && !process.should_collect(heap_need as usize) {
+    // The **occupancy** test, plus the collector's **collection debt**. The debt term is what a
+    // no-collect [`Process::grow_nursery`] growth leaves behind: it retires the young space it
+    // replaces instead of freeing it, so the nursery becomes a chain holding everything the
+    // earlier spaces ever allocated until a real collection evacuates it. A retained chain
+    // therefore forces the collection even when the *current* space still has room — without
+    // the term, a growth-shaped workload keeps its whole allocation history resident.
+    //
+    // The two terms stay disjoint: [`Process::should_collect`] is the occupancy test alone
+    // (pinned as such), and the debt is the growth seam's own signal.
+    let debt = process.collection_debt();
+    if !forced && !process.should_collect(heap_need as usize) && !debt {
         return Ok(());
     }
     // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root in
@@ -864,14 +897,31 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 ///   serve the young heap or fall back to the arena, and never collect. The machine that owns
 ///   a nested run's roots is not the one this context was armed for, so collecting there would
 ///   relocate a heap against the wrong root set.
-/// * **The latch is set** (the slice's own machine): prefer the young heap exactly as
-///   [`alloc_words`] does, and only when that bump **fails** run one collection over the
-///   handed-in roots and retry the bump. A collection or scatter failure halts collection for
-///   that process ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the
-///   arena. The caller-module float guard and the `current_module` requirement both apply,
-///   exactly as in [`ensure_heap_full`] — the test is conservative here too: this door
-///   publishes the machine's **whole FR file** ([`publish_roots_full`]), so a live float
-///   register is relocated, not corrupted.///
+/// * **The latch is set** (the slice's own machine): serve the young heap exactly as
+///   [`alloc_words`] does, and run one collection over the handed-in roots and retry the bump
+///   when that bump **fails** — or immediately, when a **forced** collection has been
+///   requested (below). A collection or scatter failure halts collection for that process
+///   ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the arena. This door
+///   applies **no** caller-module float guard — it publishes the machine's **whole FR file**
+///   ([`publish_roots_full`]), so a live float register is relocated, not corrupted (see the
+///   module docs' float-guard section) — and it requires only that the run has a caller module
+///   to name at all, exactly as in [`ensure_heap_full`].
+///
+/// # Forced collections
+///
+/// A forced request ([`Runtime::request_gc`](crate::runtime::Runtime),
+/// `erlang:garbage_collect/0,1` and `erts_internal:garbage_collect/1`) is honoured here
+/// **before** the young-heap attempt, so this door's gate order matches
+/// [`ensure_heap_full`]'s: latch → forced request → valves → caller-module test →
+/// commit-once → collect. `ensure_heap_full` needs the peek because a forced request must
+/// bypass its *occupancy* test; this door needs it because the bump **is** its test — a
+/// request armed before an allocation the young heap can serve would otherwise be carried,
+/// unserved, to the pass boundary and pruned. When the request is armed the bump is
+/// bypassed, the whole root set is published, one collection runs and the request is
+/// consumed exactly once; every refusal (the valves, the missing caller module, the
+/// unscanned-root valve) leaves the request armed, so the runner's park arm
+/// ([`Runtime::serve_gc_request`](crate::runtime::gc)) may still serve it.
+///
 /// # Errors
 ///
 /// Propagates the arena's allocation failure only — never a collection failure.
@@ -882,13 +932,17 @@ pub(crate) fn alloc_words_rooted(
     armed: bool,
 ) -> Result<*mut Eterm> {
     let pid = ctx.mailbox_pid;
-    // Read the call site's module *before* the context is destructured: the float guard below
-    // needs it, and it is only meaningful when this is the slice's own machine.
-    let current_module = if armed {
-        ctx.current_module.clone()
-    } else {
-        None
-    };
+    // The latch is not set: every nested run — a cross-module callee's second machine, a fun
+    // the engine applied, the `-eval` evaluator — keeps `alloc_words`' arena fallback, byte
+    // for byte, and never collects, and it consumes **no** forced request: the machine that
+    // owns a nested run's roots is not the one this context was armed for.
+    if !armed {
+        let RuntimeContext { runtime, .. } = ctx;
+        return runtime.alloc_words(n);
+    }
+    // A fun entry or the `-eval` evaluator has no call site at all (`current_module`), and is
+    // equally left alone: the door has no machine to name.
+    let call_site_known = ctx.current_module.is_some();
     let RuntimeContext {
         runtime,
         mailbox_table,
@@ -897,23 +951,40 @@ pub(crate) fn alloc_words_rooted(
     let Some(table) = mailbox_table else {
         return runtime.alloc_words(n);
     };
+    // A **forced** collection request (see [`Runtime::request_gc`](crate::runtime::Runtime))
+    // is peeked here, *before* the young-heap attempt — this door's analog of
+    // [`ensure_heap_full`]'s occupancy test, which a forced request bypasses. The two
+    // full-root doors therefore honour the request in the same order: latch → request →
+    // valves → caller module → commit-once. The peek is gated on the call site for the same
+    // reason the collection is: a run with no module to collect for must not consume a
+    // request it can never serve.
+    let forced = call_site_known && runtime.gc_request_pending(pid);
     if !runtime.gc_process_enabled(pid) {
+        // The valves refuse the pid outright (a post-slice float pin, a halt from an earlier
+        // failure, or the runtime-wide escape-store valve): the request can never be served,
+        // so it is dropped rather than left armed for a valve that may never open again —
+        // exactly as the two `ensure_heap` doors drop it — and the block comes from the
+        // pointer-stable arena, byte for byte as before.
+        runtime.take_gc_request(pid);
         return runtime.alloc_words(n);
     }
-    // The same attempt `alloc_words` makes: the running process's own young heap.
-    if let Some(process) = table.get_mut(pid) {
-        let fill = runtime.gc_scratch(n.saturating_sub(1));
-        if let Ok(block) = bump(process.heap_mut(), n, fill) {
-            return Ok(block);
+    // The same attempt `alloc_words` makes: the running process's own young heap. A forced
+    // request **bypasses** it: the block is the collection's to serve, and a bump taken first
+    // would end this call with the request still armed — the exact way a
+    // `erlang:garbage_collect()` from a process whose only allocation goes through this seam
+    // used to be carried, silently, to the pass boundary.
+    if !forced {
+        if let Some(process) = table.get_mut(pid) {
+            let fill = runtime.gc_scratch(n.saturating_sub(1));
+            if let Ok(block) = bump(process.heap_mut(), n, fill) {
+                return Ok(block);
+            }
         }
     }
-    // The young heap refused. Only the slice's own machine may collect over the roots it
-    // handed in; every other context keeps `alloc_words`' arena fallback, byte for byte.
-    let Some(name) = current_module else {
-        runtime.note_gc_fallback(pid);
-        return runtime.alloc_words(n);
-    };
-    if !module_may_be_collected(runtime, &name) {
+    // The young heap refused (or a forced request bypassed it). Only the slice's own machine
+    // may collect over the roots it handed in; every other context keeps `alloc_words`' arena
+    // fallback, byte for byte.
+    if !call_site_known {
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
@@ -926,7 +997,8 @@ pub(crate) fn alloc_words_rooted(
     // words it reaches without updating it, so this collection is declined and the block comes
     // from the pointer-stable arena — the same honest fallback every other refusal path takes.
     // The descent is gated on `pid`'s foreign-reachability bit and a hit opens it permanently,
-    // exactly as in [`ensure_heap`].
+    // exactly as in [`ensure_heap`]. A declined collection leaves a forced request **armed**,
+    // exactly as at [`ensure_heap_full`], so the runner's park arm may still serve it.
     let descend = runtime.foreign_reachable(pid);
     if any_root_is_unscanned(
         runtime.walk_scratch(),
@@ -941,6 +1013,13 @@ pub(crate) fn alloc_words_rooted(
         runtime.note_foreign_reachable(pid);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
+    }
+    // From here the collection is committed to, so a pending forced request is consumed
+    // **once**, at the commit point — the single `take_gc_request` [`ensure_heap_full`]
+    // performs. A refusal above leaves it armed; every path below has already collected (or
+    // halted), so the request is spent either way.
+    if forced {
+        runtime.take_gc_request(pid);
     }
     // This door publishes the **whole** FR file: it hands the machine's root set over while
     // the machine is running, so it cannot bound the live prefix — the count is the file's own

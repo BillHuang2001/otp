@@ -1154,27 +1154,31 @@ impl PortRegistry {
     /// Whether no port is open.
     ///
     /// This counts **ports only**. It is deliberately *not* the "is there anything to poll?"
-    /// question — a registered signal watch is pollable with zero ports — so a caller deciding
-    /// whether a blocked process can still be woken asks [`PortRegistry::has_nothing_to_poll`].
+    /// question — a signal self-pipe or an armed `tty_select/2` interest can be waited on with
+    /// zero ports — so a caller deciding whether a blocked process can still be woken asks
+    /// [`PortRegistry::has_nothing_to_poll`].
     pub fn is_empty(&self) -> bool {
         self.meta.is_empty()
     }
 
-    /// Whether there is nothing for [`PortRegistry::pump`] to wait on: no live port **and** no
-    /// registered signal watch (`os:set_signal/2`'s self-pipe — see [`watch`]).
+    /// Whether there is nothing a poll round must **wait on**, and nothing left that could wake
+    /// a blocked process: no live port, no armed `tty_select/2` interest, and no **fired**
+    /// `os:set_signal/2` self-pipe (see [`watch`]).
     ///
-    /// This is the "nothing pollable" predicate. It is what tells a caller that a blocked
-    /// process can no longer be woken and that a poll round is pure sleep: a live port can
-    /// deliver `{Port, {data, …}}`, a registered signal watch can deliver
-    /// `{notify, Signal}`, and an armed `tty_select/2` can deliver
-    /// `{select, Handle, Ref, ready_input}` — any one of them keeps the runtime awake.
+    /// This is the "nothing pending" predicate. It is what tells a caller that a blocked process
+    /// can no longer be woken and that a poll round is pure sleep: a live port can deliver
+    /// `{Port, {data, …}}`, an armed `tty_select/2` can deliver
+    /// `{select, Handle, Ref, ready_input}`, and a self-pipe **holding bytes** can deliver
+    /// `{notify, Signal}` — any one of them keeps the runtime awake.
     ///
-    /// It is *false* as soon as a `handle` disposition is installed, even before the
-    /// descriptor is registered, because [`watch::SignalWatch::sync`] will register it on the
-    /// very next poll round (the facility is created by `os:set_signal/2`, so it cannot exist
-    /// when the registry is built).
+    /// An **armed but idle** `handle` disposition is deliberately **not** counted
+    /// ([`watch::SignalWatch::has_pending_signal`], not `is_pollable`): its descriptor is idle
+    /// and can only become readable when a signal actually arrives, so a round that blocked on
+    /// it would be waiting for nothing. A signal that *has* been caught makes the pipe readable
+    /// and so is pending work — and it is delivered either way, because
+    /// [`PortRegistry::pump`] drains the facility unconditionally at the top of every round.
     pub fn has_nothing_to_poll(&self) -> bool {
-        self.meta.is_empty() && !self.watch.is_pollable() && !self.tty.is_armed()
+        self.meta.is_empty() && !self.tty.is_armed() && !self.watch.has_pending_signal()
     }
     /// The ids of the **live** ports, in port-number order.
     ///
@@ -1241,9 +1245,12 @@ impl PortRegistry {
     /// tasks, a due `TIMEOUT` task is serviced immediately — no busy loop, and the slice's
     /// other work is unchanged.
     ///
-    /// Nothing at all is polled when there is nothing pollable — no live port and no registered
-    /// signal watch (see [`PortRegistry::has_nothing_to_poll`]) — so a runtime that never opened
-    /// a port and never handled a signal never sleeps here.
+    /// A round never blocks when there is nothing that could become ready — no live port and no
+    /// armed `tty_select/2` interest (see [`PortRegistry::has_nothing_to_poll`]): an armed but
+    /// **idle** signal self-pipe is not a wake source, so a runtime that only handles a signal
+    /// and never opened a port never sleeps here. Any signal that *has* been caught was already
+    /// harvested into the returned events above this guard, so it is never stranded by the
+    /// early return.
     ///
     /// # Errors
     ///
@@ -1265,7 +1272,13 @@ impl PortRegistry {
         // recorded in the facility's own bitmask, so it is drained unconditionally rather than
         // keyed to the readiness event.
         events.extend(self.take_signals());
-        if self.registry.is_empty() && !self.watch.is_pollable() && !self.tty.is_armed() {
+        // Only a *live* wake source is worth blocking on. The signal self-pipe is deliberately
+        // excluded even though it is registered: `take_signals` above has already harvested any
+        // signal that was caught, so a *pending* one must return at once rather than poll a
+        // now-drained pipe, and an *idle* one can only become readable when a signal arrives —
+        // blocking on it would be waiting for nothing. A live port or an armed `tty_select/2`
+        // interest is real async I/O and is still waited on.
+        if self.registry.is_empty() && !self.tty.is_armed() {
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -2526,10 +2539,12 @@ impl Runtime {
     /// process there is no recipient and the notification is dropped — the C's own behaviour,
     /// never an error and never a message to a name that has no live process.
     ///
-    /// Nothing is polled when no port is live **and** no signal watch is pollable (see
-    /// [`PortRegistry::has_nothing_to_poll`]), so a runtime that never opened a port pays
-    /// nothing; a message whose owner is no longer in `table` is skipped rather than
-    /// treated as an error.
+    /// Nothing is polled when no port is live, no `tty_select/2` interest is armed **and** no
+    /// signal self-pipe holds an undelivered notification (see
+    /// [`PortRegistry::has_nothing_to_poll`]), so a runtime that never opened a port and never
+    /// caught a signal pays nothing — an armed but idle `handle` disposition does not make this
+    /// round sleep, which is what keeps a blocked `run`-route workload off a fixed 25 ms round;
+    /// a message whose owner is no longer in `table` is skipped rather than treated as an error.
     ///
     /// # Errors
     ///
@@ -2541,8 +2556,8 @@ impl Runtime {
         table: &mut ProcessTable,
         timeout: Duration,
     ) -> Result<usize> {
-        // Nothing pollable ⇒ nothing to wait for: never sleep. A registered signal watch keeps
-        // this false even with zero ports, because a caught signal must still be delivered.
+        // Nothing pending ⇒ nothing to wait for: never sleep. A *caught* signal keeps this false
+        // even with zero ports, because it must still be delivered.
         {
             let registry = self
                 .ports

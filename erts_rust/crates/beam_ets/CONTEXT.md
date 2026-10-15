@@ -25,6 +25,8 @@ the table footprint `Table::memory`/`TermStore::words` vs process RSS — plus t
 one-time warm-up step in process RSS. The `copy_bound/ets_copy` bench loop's rust-vs-oracle peak-RSS
 growth is therefore **sibling-side**: `beam_rt/src/context/calls.rs`'s nursery growth
 (`move_result_into_process_heap` + a one-shot `Process::grow_nursery`, nothing shrinking it back).
+**§3** records the `ordered_set` interior itself — the B+-tree vs the sorted `Vec` at several sizes and
+key orders, both sides of every ratio plus the run's `/proc/loadavg`.
 
 ## Position & dependencies
 Crate-layer **wave 1** (`../CONTEXT.md`). Depends only on `beam_common` (errors), `beam_term` (terms +
@@ -477,8 +479,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   selectors, and pins the `cmp`→`cmp_arith` arithmetic-key behaviour.
 - **Microbenchmarks** (`interior_bench.rs`): chained vs CHAMP and B+-tree vs sorted `Vec`, with in-line
   correctness assertions. Run with `… -p beam_ets --lib interior_microbenchmark -- --nocapture` (or
-  `ordered_interior_microbenchmark`); sizes/shapes via `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`.
-  The measured outcomes, and every memory figure quoted in this file, live in `PERF.md`.
+  `ordered_interior_microbenchmark`); sizes/shapes via `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`,
+  plus the ordered interior's **key-order** dimension via
+  `BEAM_ETS_BENCH_ORDER=shuffled|ascending|descending|all` (default `shuffled`) — the order is
+  irrelevant to the B+-tree and decisive for the sorted `Vec`, so both interiors' best *and* worst cases
+  get measured. The measured outcomes live in `PERF.md` (§3 for the ordered interior).
 - Crate-level integration over the **public API**: `tests/ets_*.rs`, `tests/select.rs`,
   `tests/match_spec_run.rs`, helpers from `tests/common/` and the live-`erl` plumbing in
   `tests/common/oracle.rs`. Reclamation/accounting files:
@@ -520,11 +525,14 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   default** — a genuinely absent `erl` FAILS the cross-check rather than skipping it
   (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces it).
 - **Randomised `ordered_set` differential** (`tests/ets_ordered_oracle.rs`, `#[ignore]`d by default):
-  a 73-term mixed-type key pool driven by a SplitMix64-finalised LCG through 40 op slots (the whole op
-  surface incl. navigation/select/`foldl`), rendering every observed key as its pool index and comparing
+  a 73-term mixed-type key pool driven by a SplitMix64-finalised LCG through a **55-slot** op space
+  (34 `insert` slots plus one slot each for `insert_new`, `delete`, `delete_object`, `take`,
+  `delete_all_objects`, `lookup`, `member`, `first`, `last`, `next`, `prev`, `select`, `select_count`,
+  `match_object`, `select_reverse`, `foldl`, `update_counter`, `update_element`, `foldr`,
+  `lookup_element/3`, `lookup_element/4`), rendering every observed key as its pool index and comparing
   `{size, in-order tab2list, op result}` after every step against the live oracle — 1800 steps / 3 seeds
-  agree. Run it with `--ignored`; it exercises the split/merge churn (max ~48–54 live keys, past
-  `ORDER = 32`) the fixed battery cannot.
+  agree, **zero divergence**. Run it with `--ignored`; it crosses `ORDER = 32` (peak **49–63** live keys
+  — the test asserts its own peak) so it exercises the split/merge churn the fixed battery cannot.
 - **`tests/ets_continuation.rs` / `ets_continuation_direction.rs`** cross-check the continuation cursor
   against the live oracle **including a mutation between chunks**: an `ordered_set` resume survives a
   delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not shift the next
@@ -608,26 +616,22 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   store's `blocks` (bounded by the total taken volume) until `store.reset()`
   (`ets:delete_all_objects/1`) or the table is dropped — a checked-out term must stay valid and `take`
   hands back table-owned `Eterm`s.
-- **The match-spec compiler's typed divergences.** The head-**map** pattern, map **guard** and map
-  **body** subset is oracle parity (the `maps` battery group): a head map's keys stay literal at the top
-  level of each key but literal-keyed when nested inside a compound key, its values match structurally,
-  an object carrying extra keys still matches, `#{}` matches any map, and a non-atom key compares
-  exactly (`1` ≠ `1.0`). Typed divergences (never a wrong result): `self/0` resolves through the
-  thread-local `SelfHook` seam (`set_self_hook`) and its default is the typed `badarg` (without a hook a
-  `self/0` guard clause is skipped and a `self/0` body is `badarg`); integer arithmetic whose result
-  leaves the 60-bit small range via `DefaultArithHook` is the typed `unsupported_ets`
-  (`abs`/`bnot`/`trunc`/`round`/`ceil`/`floor` do handle bignums), while `beam_bifs` installs its own
-  arbitrary-precision hook (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF, so
-  a bignum operand yields the oracle's value in the runtime. A match-spec **body** runtime failure
-  yields the atom `EXIT` resolved from the caller's `AtomTable` (`select::exec::exit_term`), so a host
-  running a raising body must pre-intern `EXIT`; an uninterned `EXIT` ⇒ typed `badarg`.
+- **The match-spec compiler's typed divergences.** Head-**map** patterns, map **guards** and map
+  **bodies** are oracle parity (the `maps` battery group: literal top-level keys, structural values,
+  extra keys tolerated, `#{}` matches any map, `1` ≠ `1.0` keys). Typed divergences (never a wrong
+  result): `self/0` resolves through the thread-local `SelfHook` seam, default typed `badarg` (no hook ⇒
+  a `self/0` guard clause is skipped, a `self/0` body is `badarg`); integer arithmetic leaving the 60-bit
+  small range through `DefaultArithHook` is `unsupported_ets`, while `beam_bifs` installs an
+  arbitrary-precision hook (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF so
+  a bignum operand yields the oracle's value in the runtime; a **body** runtime failure yields the atom
+  `EXIT` from the caller's `AtomTable` (a host running a raising body must pre-intern `EXIT`; an
+  uninterned `EXIT` ⇒ `badarg`).
 - **`erlang:match_spec_test/3`'s `trace` dialect is left-open (typed `unsupported`).** The oracle folds
   the trace **run** into the `{ok,Return,Flags,Errors}` shape and needs the trace-only special forms
-  (`get_tcw`/`set_tcw`/`message`/`return_trace`/`exception_trace`/`display`/`set_seq_token`/…), i.e. a
-  runner subsystem — not a lint-only subset. The **`table`** dialect *is* implemented (native structural
-  lint + `beam_ets`'s compiler); `beam_bifs::match_spec` returns the typed `unsupported_bif` for `trace`.
-  C refs: `erl_db_util.c:6042` `match_spec_test_3`, `:1509` `db_match_set_lint`, `:6125`
-  `erts_match_set_run_trace`. Detail in `src/select/CONTEXT.md`.
+  (`get_tcw`/`set_tcw`/`message`/`return_trace`/`exception_trace`/`display`/`set_seq_token`/…) — a runner
+  subsystem, not a lint-only subset. The **`table`** dialect *is* implemented (native structural lint +
+  this crate's compiler); `beam_bifs::match_spec` returns the typed `unsupported_bif` for `trace`. Detail
+  and C refs (`erl_db_util.c:6042/1509/6125`) in `src/select/CONTEXT.md`.
 - **`select_replace/2`'s key check is the C's static syntactic check** (`db_match_keeps_key`): a body
   that is not syntactically `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}` is `badarg` for the
   whole call, even when nothing matches. Two exotic shapes remain approximated (a call-shaped raw tuple
@@ -639,29 +643,25 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   integer/float pair is exact.
 
 ## Handoffs (to other nodes — NOT adopted here)
-- **`beam_bifs` — adopt the new `{protection, Access}` setter.** This crate exposes the post-creation
-  protection change (`SetOpt::Access(Access)` + the owner-gated `Table::setopts(caller, SetOpt)` + the
-  primitive `Table::set_access` + the enforcing `TableAccess::set_access`).
-  `beam_bifs::ets::adopt::setopts_2` still answers the typed `unsupported_bif` for **any**
-  `{protection, _}`. The adoption is: after the existing owner check, map the parsed protection onto
-  `SetOpt::Access` and call `table.as_requester(Some(caller)).setopts(opt)` — the parse-level
-  `{protection, bogus}` `badarg` stays `beam_bifs`'s (`parse_setopts`).
-- **`beam_bifs` — the `auto` / `{debug_hash_fixed_number_of_locks, Nlocks}` rendering stays host-side**
-  (`TableInfo::write_concurrency` is a `bool`), and the hash-kind `last`/`prev` workaround can now go:
-  `beam_bifs/src/ets.rs` still special-cases the hash kinds in `last_1`/`prev_2`, but `Table::last`/
-  `Table::prev` are C-faithful now, so both BIFs could call them unconditionally (the ordered-kind
-  `'$end_of_table'` anchor rejection stays).
-- **`beam_bifs` — adopt `ets:slot/2`.** Call the **read**-gated `TableAccess::slot` (the oracle's
-  `erl_db.c:3744` `ets_slot_2` takes a `DB_READ` gate); a non-integer or bignum slot is the BIF layer's
-  `badarg`, an out-of-range/negative slot is the crate's `Err(BeamError::BadArg)`, `Ok(None)` is
-  `'$end_of_table'`. `beam_bifs::runtime::other` still answers the typed `unsupported_bif`.
-- **`beam_bifs/src/match_spec.rs` still refuses ANY head pattern mentioning a map.** `test_table`'s
-  `head_mentions_a_map`/`term_mentions_a_map`, its doc block and the test
-  `beam_bifs/tests/match_spec.rs::a_head_pattern_with_a_map_is_a_typed_gap` are stale: `beam_ets`
-  implements head maps and the oracle's **`table`** dialect accepts them (verified against the live
-  oracle for a map head with literal and with `'$N'` values). Delegate to `beam_ets::select::compile`
-  instead of refusing a map head. The `trace` dialect stays typed `unsupported` until the trace runner
-  subsystem exists; the exact `{ok,…}`/`{error,…}` shapes and lint strings are in `src/select/CONTEXT.md`.
+- **`beam_bifs` — adopt the `{protection, Access}` setter and `ets:slot/2`.** This crate exposes the
+  post-creation protection change (`SetOpt::Access(Access)` + the owner-gated
+  `Table::setopts(caller, SetOpt)` + the enforcing `TableAccess::set_access`) and the **read**-gated
+  `TableAccess::slot`. `beam_bifs::ets::adopt::setopts_2` still answers the typed `unsupported_bif` for
+  any `{protection, _}` (the parse-level `{protection, bogus}` `badarg` stays its own) and
+  `beam_bifs::runtime::other` still refuses `ets:slot/2`; adopting either is a call-through (the
+  oracle's `erl_db.c:3744` slot takes a `DB_READ` gate; a non-integer/bignum slot is the BIF layer's
+  `badarg`, an out-of-range slot the crate's `Err(BeamError::BadArg)`, `Ok(None)` is `'$end_of_table'`).
+- **`beam_bifs` — the hash-kind `last`/`prev` workaround can go.** `Table::last`/`Table::prev` are
+  C-faithful now, so `beam_bifs/src/ets.rs`'s `last_1`/`prev_2` need no hash-kind special case (the
+  ordered-kind `'$end_of_table'` anchor rejection stays). The `auto` /
+  `{debug_hash_fixed_number_of_locks, Nlocks}` `write_concurrency` rendering stays host-side
+  (`TableInfo::write_concurrency` is a `bool`).
+- **`beam_bifs/src/match_spec.rs` still refuses ANY head pattern mentioning a map.** Its
+  `head_mentions_a_map`/`term_mentions_a_map`, doc block and the
+  `a_head_pattern_with_a_map_is_a_typed_gap` test are stale: `beam_ets` implements head maps and the
+  oracle's **`table`** dialect accepts them (verified live, for a map head with literal and with `'$N'`
+  values). Delegate to `beam_ets::select::compile`. The `trace` dialect stays typed `unsupported` until
+  a trace-runner subsystem exists (exact shapes/lint strings in `src/select/CONTEXT.md`).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; tests in `src/kind/tests.rs`
@@ -690,12 +690,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups)
 - `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace vs the live oracle (`#[ignore]`d; run with `--ignored`)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
-- `PERF.md` → the crate's measured memory/perf figures (both sides of every ratio + `/proc/loadavg`)
+- `PERF.md` → the crate's measured memory/perf figures (§3 the `ordered_set` B+-tree-vs-sorted-`Vec` comparison across key orders; §1 the `ets_copy` peak-RSS attribution; §2 per-object reclamation) — both sides of every ratio + `/proc/loadavg`
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
 
 ## See Also
 - `ETS_SURFACE.md` → coverage census: every `ets:*` operation mapped to this crate / `beam_bifs` / missing, the oracle-probed facts, and the runtime-level gaps with the exact API each needs.
-- `PERF.md` → the crate's measured memory/perf figures (the `ets_copy` peak-RSS attribution, per-object reclamation vs the oracle, both sides of every ratio + `/proc/loadavg`).
+- `PERF.md` → the crate's measured memory/perf figures (§3: the `ordered_set` B+-tree-vs-sorted-`Vec` comparison at several sizes and key orders; §1: the `ets_copy` peak-RSS attribution; §2: per-object reclamation vs the oracle) — both sides of every ratio + `/proc/loadavg`.
 - `../CONTEXT.md` → crate-layer contracts, the `Table` seam, dependency waves, milestone scope.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1/A.8, §2 frozen term layout, §3 error strategy, §7).
 - `../beam_term/CONTEXT.md` → the frozen term API + the shared `compare`/`hashing` utilities.

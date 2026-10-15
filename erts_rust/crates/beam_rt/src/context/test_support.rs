@@ -183,6 +183,16 @@ pub(super) fn compile_fixtures(
 /// Runs `eval` under the oracle with `code_dir` prepended to the code path and returns its
 /// stdout, one trimmed, lowercased, non-empty line at a time.
 pub(super) fn run_oracle_probe(oracle: &Path, code_dir: &Path, eval: &str) -> Vec<String> {
+    run_oracle_probe_exact(oracle, code_dir, eval)
+        .into_iter()
+        .map(|line| line.to_lowercase())
+        .collect()
+}
+
+/// Like [`run_oracle_probe`], but returns each stdout line **trimmed only** — the letter case
+/// is preserved, so a comparison can tell `'-all/0-Fact/1-0-'` from a lowercased spelling
+/// (a lambda's generated name, which `fun_info(F, name)` reports verbatim).
+pub(super) fn run_oracle_probe_exact(oracle: &Path, code_dir: &Path, eval: &str) -> Vec<String> {
     let output = Command::new(oracle)
         .arg("-noshell")
         .arg("-pa")
@@ -206,8 +216,9 @@ pub(super) fn run_oracle_probe(oracle: &Path, code_dir: &Path, eval: &str) -> Ve
         .unwrap_or_else(|e| panic!("the oracle printed non-UTF-8 to stdout: {e}"));
     stdout
         .lines()
-        .map(|line| line.trim().to_lowercase())
+        .map(|line| line.trim())
         .filter(|line| !line.is_empty())
+        .map(str::to_string)
         .collect()
 }
 

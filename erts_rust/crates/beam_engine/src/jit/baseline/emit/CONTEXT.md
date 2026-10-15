@@ -3,8 +3,11 @@
 ## Intent
 Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 functions for the
 **baseline** execution tier.
-One file per responsibility: `mod.rs` owns the compiled-block shape (prologue/epilogue,
-`emit_block`'s lowering dispatch, the deopt sequence); `regs.rs` owns the register cache
+One file per responsibility: `mod.rs` owns the shared emitter wiring (the register-file/scratch
+constants, `touch`, the spill/fill traffic, the helper-sequencing layer every arm shares —
+`emit_helper_call`/`emit_step_and_continue`/`emit_continue_check`/`emit_refresh_y` — plus the
+re-exports); `block.rs` owns the compiled-block shape (the prologue/epilogue, the `emit_block`
+lowering dispatch and its helper-sequence arms, the deopt wrapper); `regs.rs` owns the register cache
 (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`); `compile.rs` owns the compilation entry points
 — `compile_module` (the **eager** whole-module layout: one shared `CodeBuffer`, a whole-module block
 map) and `compile_function`/`emit_function` (the **lazy** layout's per-function unit: its own
@@ -38,7 +41,8 @@ them.
   `Allocation::fill_slots(pc)` — the registers the continuation can still observe, the block-local
   liveness of `liveness.rs::fill_sets` unioned with the write set, `(live ∪ written) ∩ slots` — except
   the prologue load, which is always the whole cache.
-  The cache itself lives in `regs.rs` (`Allocation`/`spill`/`fill`); the call sites are in `mod.rs`.
+  The cache itself lives in `regs.rs` (`Allocation`/`spill`/`fill`); the call sites are in `mod.rs`
+  (`emit_helper_call`) and the block/link emitters.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
   `MOVE_SCRATCH_2`=`r10` (`mod.rs`); `Y_SCRATCH`=`r9` and `SWAP_END`=`rax` (`r#move.rs`);
   `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10`, `FAST_R`=`r11` (`arith.rs`);
@@ -48,7 +52,7 @@ them.
   None overlaps a cache register, `rbx` or `rsp`.
 
 ## The lowering dispatch (the compile-time inlinable-vs-deopt decision)
-`mod.rs::emit_block` matches each `Instr` of the block (the `match instr { .. }`).
+`block.rs::emit_block` matches each `Instr` of the block (the `match instr { .. }`).
 Each arm calls the group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 emits `emit_deopt`.
 Whole-instruction inlining therefore is a **compile-time, syntactic** decision (never a value test).
@@ -56,13 +60,13 @@ Logical groups:
 
 | Group | Instr(s) | Lowering entry | Shape/guard predicate |
 |---|---|---|---|
-| Metadata no-ops | `Label`,`Line`,`IntCodeEnd`,`ExecutableLine`,`DebugLine` | `mod.rs` empty arm (no bytes) | n/a |
+| Metadata no-ops | `Label`,`Line`,`IntCodeEnd`,`ExecutableLine`,`DebugLine` | `block.rs` empty arm (no bytes) | n/a |
 | Move / swap | `Move`, `Swap` | `r#move.rs::try_inline_move`, `::try_inline_swap` | `r#move.rs::move_shape`: source = in-bound `X(n)`, in-bound **`Y` slot**, a constant word or a **literal-area** term (`MoveValue::Literal`); destination = in-bound `X(n)` or an in-bound **`Y` slot** (a `Y` side and a literal source each carry a run-time guard). `swap_shape` accepts two `Loc` operands and lowers a `Y` side via `emit_swap_y` |
-| Y initialization | `InitYregs` | `mod.rs::try_inline_init_yregs` | `operands.rs::locate_all` — every listed operand an in-bound `X(n)` or an addressable `Y` slot |
+| Y initialization | `InitYregs` | `block.rs::try_inline_init_yregs` | `operands.rs::locate_all` — every listed operand an in-bound `X(n)` or an addressable `Y` slot |
 | Test (word + boxed header) | `Test` | `test.rs::try_inline_test` | `test.rs::test_plan` (a `TestSrc::Y` operand carries a run-time guard) |
 | Switch | `SelectVal` | `select.rs::try_inline_select_val` | `select.rs::select_val_plan` (a `TestSrc::Y` scrutinee carries a run-time guard) |
 | Arity switch | `SelectTupleArity` | `aggregate.rs::try_inline_select_tuple_arity` | `aggregate.rs::select_tuple_arity_plan` (the tuple operand is a `Loc`) |
-| Cons readers | `GetList`,`GetHd`,`GetTl` | `aggregate.rs::try_inline_get_{list,hd,tl}` via `emit_list_read` | `get_{list,hd,tl}_shape` -> `shape`; source and every destination are a `Loc` |
+| Cons readers | `GetList`,`GetHd`,`GetTl` | `aggregate/list.rs::try_inline_get_{list,hd,tl}` via `emit_list_read` | `aggregate/list.rs::get_{list,hd,tl}_shape` -> `shape`; source and every destination are a `Loc` |
 | Tuple read | `GetTupleElement` | `aggregate.rs::try_inline_get_tuple_element` via `emit_tuple_read` | `get_tuple_element_shape` (source and destination are a `Loc`) |
 | Tuple write | `SetTupleElement` | `aggregate.rs::try_inline_set_tuple_element` via `emit_tuple_write` | `set_tuple_element_shape` (the tuple is a `Loc`) |
 | Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` (x-register **or Y-slot** operand/destination; a Y access carries a run-time frame-window guard). `band`/`bor`/`bsr` are lowered by the same entry (`GcBif` only — the corpus never emits them as `Bif`) |
@@ -77,11 +81,11 @@ Logical groups:
 | Heap admission | `TestHeap` | `heap.rs::emit_test_heap` (an `emit_helper_call` to `jit_test_heap`) | always lowered — reaches the host's admission door exactly once with the instruction's own `heap_need`/`live`; continues in-block via `emit_continue_check` |
 | Frame trim | `Trim` | `heap.rs::emit_trim` (an `emit_helper_call` to `jit_trim`) | always lowered — an over-trim / frameless trim is the helper's `ERROR`; continues in-block on `encode_target(func, pc+1)` |
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label **in the block map** -> linked; otherwise return-to-driver (the target's function is compiled on entry) |
-| Local tail call | `CallLast` | `mod.rs::emit_local_call_probe` then `link.rs::Linker::emit_tail_exit` (compiled successor) or `::emit_tail_exit_to_driver` (resolved but uncompiled successor) | `Linker::is_compiled`; an undefined label keeps the `emit_deopt` `unknown_label` |
-| Local tail call (no pop) | `CallOnly` | `mod.rs::emit_local_call_probe` then `link.rs::Linker::emit_exit` | resolved label |
-| Local frame-preserving call | `Call` | `mod.rs` `emit_helper_call(jit_call_store)` + a `CALL_STORED` compare, then `link.rs::Linker::emit_exit` | resolved label; the helper stores the continuation *and* consults the local-call seam |
-| Cross-module call | `CallExt`,`CallExtOnly`,`CallExtLast` | `mod.rs::emit_ext_call` (an `emit_helper_call` to `jit_ext_call`) | n/a — the helper resolves the import and reports `ENTER` |
-| Receive/send control | `Send`,`LoopRec`,`LoopRecEnd`,`Wait`,`WaitTimeout`,`Timeout`,`RemoveMessage` | `mod.rs::emit_receive` (an `emit_helper_call` to `jit_receive`) | n/a — the helper runs the family body and reports the block-ABI word |
+| Local tail call | `CallLast` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_tail_exit` (compiled successor) or `::emit_tail_exit_to_driver` (resolved but uncompiled successor) | `Linker::is_compiled`; an undefined label keeps the `emit_deopt` `unknown_label` |
+| Local tail call (no pop) | `CallOnly` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_exit` | resolved label |
+| Local frame-preserving call | `Call` | `block.rs` `emit_helper_call(jit_call_store)` + a `CALL_STORED` compare, then `link.rs::Linker::emit_exit` | resolved label; the helper stores the continuation *and* consults the local-call seam |
+| Cross-module call | `CallExt`,`CallExtOnly`,`CallExtLast` | `block.rs::emit_ext_call` (an `emit_helper_call` to `jit_ext_call`) | n/a — the helper resolves the import and reports `ENTER` |
+| Receive/send control | `Send`,`LoopRec`,`LoopRecEnd`,`Wait`,`WaitTimeout`,`Timeout`,`RemoveMessage` | `block.rs::emit_receive` (an `emit_helper_call` to `jit_receive`) | n/a — the helper runs the family body and reports the block-ABI word |
 | Family-owned surface | `PutList`,`PutTuple2`, the native-record set, `MakeFun3`,`CallFun`,`CallFun2`,`Apply`,`ApplyLast`, the try/catch/raise set, the float set, the map set, the bitstring set, `RecvMarker*` | `family.rs::emit_family` (an `emit_helper_call` to `jit_family`) | n/a — the helper runs the owning family's own body and reports the block-ABI word |
 | Everything else | -- | `_` arm -> `emit_deopt` | -- (`FuncInfo` is deliberately here, never a no-op) |
 
@@ -142,7 +146,7 @@ accessors are claimed from either variant and the three pure accessors from `Bif
   a Y scrutinee emits a frame-window guard whose rejection runs one `emit_step_and_continue`.
 - **`select_tuple_arity`** (`aggregate.rs`): `NO_FAIL`/unresolved label -> `None`; the tuple operand
   must be a `Loc`; every alternative must be a non-negative `Operand::Integer`.
-- **Cons/tuple readers** (`aggregate.rs`): the source and every destination must be a `Loc` (an
+- **Cons/tuple readers** (`aggregate/list.rs` for the cons readers `get_list`/`get_hd`/`get_tl`, `aggregate.rs` for the tuple readers): the source and every destination must be a `Loc` (an
   in-bound x-register or an addressable `Y` slot); the guard is `is_list` / `is_tuple` and can only
   ever *reject* (a non-cons/non-tuple source, or an out-of-range element, branches to the helper,
   whose interpreter step raises the exact `{badmatch,Source}` or the typed `unsupported`). An
@@ -195,12 +199,12 @@ accessors are claimed from either variant and the three pure accessors from `Bif
 
 ## Deopt mechanism (three levels)
 1. **Compile-time shape refusal**: a `try_inline_*` returns `Ok(false)` **without emitting a byte**, and
-   the dispatch arm emits `mod.rs::emit_deopt` in its place; the `_` arm does the same for any unclaimed
+   the dispatch arm emits `block.rs::emit_deopt` in its place; the `_` arm does the same for any unclaimed
    `Instr`. `emit_deopt` records the static-census deopt, then runs `emit_step_and_continue`.
 2. **Run-time guard rejection**: an inlined sequence that passed the shape test but whose *runtime* guard
    fails branches to a local `fallback` label that runs `emit_step_and_continue` and then falls through
    to the rest of the block (`fast_done`). Present in `arith.rs`, `compare.rs`, `bif.rs`, `test.rs`,
-   `aggregate.rs` (`emit_list_read`/`emit_tuple_read`/`try_inline_select_tuple_arity`), `select.rs`, and
+   `aggregate/list.rs` (`emit_list_read`), `aggregate.rs` (`emit_tuple_read`/`try_inline_select_tuple_arity`), `select.rs`, and
    every guarded Y access (`operands.rs::emit_guarded_y_address`/`_load`/`_store`). `select_val`
    has no fallback (all-immediate alternatives are total).
 3. **Direct-helper exit (not a deopt at all)**: the frame-discipline arms (`frame.rs` —
@@ -223,7 +227,7 @@ accessors are claimed from either variant and the three pure accessors from `Bif
 against `encode_target(func, pc+1)`; equal -> `fill` and fall through natively at `pc+1`; any other word
 (`Goto`/`HALT`/`ERROR`/`ENTER`/`Wait`) -> `jmp done`, the shared epilogue, which `ret`s to the driver with
 the word in `rax`. So a non-`Next` helper outcome and the return-to-driver deopt share one epilogue.
-`emit_ext_call` (`mod.rs`, the `CallExt*` arm) is the **second** caller of that same check: it emits an
+`emit_ext_call` (`block.rs`, the `CallExt*` arm) is the **second** caller of that same check: it emits an
 `emit_helper_call` to `jit_ext_call` for the instruction itself — import resolution plus the variant's
 frame discipline, no interpreter step — and then `emit_continue_check`. Its `Next` case is the helper's
 `jit_step_one` fallback (the synchronous `call_bif` path); its other word is the `ENTER` of a resolved
@@ -273,7 +277,7 @@ is a `u32` the helper takes as an argument, computed at compile time by `HeapNee
 instruction's own operands.
 
 ## Spill/fill discipline
-- Prologue (`mod.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
+- Prologue (`block.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
   slot, `rbx = rt->x_regs`, then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
   position store — emitted before the cached loads, because `rbx` is callee-saved and no cached register
   may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
@@ -299,7 +303,7 @@ instruction's own operands.
   a helper that leaves the block to the driver pays nothing (the next block's prologue publishes).
 - `link.rs::emit_exit` and `link.rs::emit_tail_exit` spill (the written set) on **both** the linked and
   the deopt paths.
-- The epilogue (`mod.rs`: `done` -> `emit_frame_teardown` -> `ret`) does **not** spill: every path reaching
+- The epilogue (`block.rs`: `done` -> `emit_frame_teardown` -> `ret`) does **not** spill: every path reaching
   it has already spilled. The inline fast paths (`move`/`arith`/`compare`/`test`/`select`/`aggregate`) do
   **not** spill themselves — a result lands in a cache register or straight in `machine.x` (the very slot
   the exit spill writes), and the next helper call or block exit spills it (its destination register is in
@@ -385,13 +389,16 @@ the driver's decoder.
   enforced).
 
 ## Routing Table
-- `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`,
-  `emit_block` (the dispatch), `try_inline_init_yregs`, `emit_position_store`/`emit_publish_y`/
-  `emit_prologue_helper`/`emit_refresh_y` (the Y-window prologue publish / gated post-helper refresh),
-  `emit_helper_call`, `emit_step_and_continue`, `emit_deopt`, `emit_local_call_probe`, `emit_ext_call`,
-  `emit_receive`, `emit_continue_check`; re-exports `regs::{Allocation, SpillSite, FillSite}` and
-  `compile_module`/`compile_function` (keeping those item paths stable for `baseline/mod.rs` and
-  `baseline/code.rs`) plus the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`.
+- `mod.rs` -> the shared emitter wiring: the register-file/scratch constants (`SAVED_REGISTERS`/
+  `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/`MOVE_SCRATCH_2`), `touch`, `emit_refresh_y`,
+  `emit_helper_call`, `emit_step_and_continue`, `emit_continue_check`; re-exports
+  `regs::{Allocation, SpillSite, FillSite}` and `pub(crate) use block::emit_block`, `compile_module`/
+  `compile_function` (keeping every item path stable for `baseline/mod.rs`, `baseline/code.rs`, the
+  sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`).
+- `block.rs` -> the compiled-block shape and per-instruction lowering dispatch: `emit_block` (the
+  `match instr` dispatch), `try_inline_init_yregs`, `emit_position_store`/`emit_publish_y`/
+  `emit_prologue_helper` (the prologue position store / Y-window publish), `emit_deopt`,
+  `emit_local_call_probe`, `emit_ext_call`, `emit_receive`.
 - `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`y_last`/`block_start`/
   `fill_sets`, `slot`/`is_written`/`spill_slots`/`fill_slots`/`refresh_y_after`), `spill` (stores only
   `written`), `fill` (loads only `fill_slots(pc)`, else the whole cache at the prologue), and the
@@ -417,11 +424,16 @@ the driver's decoder.
   behind the literal guard; `swap` over two `Loc` operands via `emit_swap_y`), `MoveShape`/`move_shape`/
   `MoveValue`/`MoveDest`/`MoveSource`, `SwapShape`/`swap_shape`, `emit_move_literal`/
   `emit_guarded_literal_load` (the literal-area guard), and the `Y_SCRATCH`/`SWAP_END` scratches.
-- `test.rs` -> `TestSrc`/`TestPred`/`TestPlan`/`Guard`, `test_plan`, `test_src`, `is_runtime`,
-  `compare_shape`, `arith_guard`, `order_guard`, `load_test_src`, `guard_small`, `arity_operand`,
-  `try_inline_test` (incl. its `emit_test_helper` comparison fallback), `emit_test_helper` (also
-  `TEST_A`/`TEST_T` reused by `select.rs`); `test/refusal_census.rs` -> the test-only refusal
-  attribution.
+- `test.rs` -> the word-level `test` subset: the mask/tag constants, `TestSrc`/`TestPred`/`TestPlan`/
+  `Guard`, `test_plan`, `test_src`, `is_runtime`, `compare_shape`, `arith_guard`, `order_guard`,
+  `load_test_src`, `guard_small`, `arity_operand`, `try_inline_test` (incl. its `emit_test_helper`
+  comparison fallback), `emit_test_helper` (also `TEST_A`/`TEST_T` reused by `select.rs`).
+- `test/header.rs` -> the boxed-term header predicate emitters (`emit_is_integer`/`_number`/`_float`/
+  `_binary`/`_arity`/`_fun_arity`/`_tagged_tuple`/`_pid`/`_port`/`_reference`) + the shared
+  `load_boxed_header`/`header_matches`/`jump_if_small`/`jump_if_immediate` helpers; it reads the masks
+  from `test.rs` via `use super::{…}` (they are not duplicated).
+- `test/tests.rs` -> the module's inline unit tests (`#[cfg(test)] mod tests;` in `test.rs`).
+- `test/refusal_census.rs` -> the test-only refusal attribution.
 - `select.rs` -> `SelectPlan`, `select_val_plan`, `try_inline_select_val`.
 - `arith.rs` -> `SmallArith` (`{Add,Sub,Mul,And,Or,Bsr}`), `fast_arith`, `FastArith`/`FastDest`/
   `FastSource`, `FastArith::shift`, `SHIFT_COUNT_LIMIT`, `integer_value`, `uses_y`, `import_names` (the
@@ -435,11 +447,15 @@ the driver's decoder.
   derivation from a tuple header). The helper-evaluated `Value` route emits
   `emit_helper_call(jit_bif_value)` + `emit_continue_check`, so it needs no reference-counted operand
   model of its own.
-- `aggregate.rs` -> `ListShape`/`get_*_shape`/`emit_list_read`, `TupleReadShape`/
+- `aggregate.rs` -> the tuple read / arity switch / tuple write: `TupleReadShape`/
   `get_tuple_element_shape`/`emit_tuple_read`, `TupleWriteShape`/`TupleWriteValue`/
   `set_tuple_element_shape`/`emit_tuple_write`/`try_inline_set_tuple_element`,
   `AritySwitchPlan`/`select_tuple_arity_plan`/`try_inline_select_tuple_arity`,
-  `emit_tuple_header_guard`.
+  `emit_tuple_header_guard`; it re-exports the cons-cell readers from `aggregate/list.rs` via
+  `pub(super) use list::{…}` so `aggregate::get_*_shape`/`try_inline_get_*` keep resolving.
+- `aggregate/list.rs` -> the cons-cell/list readers: `NOT_LIST_MASK`/`POINTER_MASK`/`CAR_DISP`/
+  `CDR_DISP`, `Half`, `ListShape` + impl, `get_list_shape`/`get_hd_shape`/`get_tl_shape`, `shape`,
+  `try_inline_get_list`/`try_inline_get_hd`/`try_inline_get_tl`, `emit_list_read`.
 - `link.rs` -> `Linker` (`is_compiled`, `emit_exit`, `emit_tail_exit`, `emit_tail_exit_to_driver`),
   `emit_frame_teardown`, and the byte-level linker unit tests (alongside `test.rs`'s own unit tests).
 - `frame.rs` -> `emit_deallocate`, `emit_return`, `emit_deallocate_return`, `emit_word_exit` (the three
@@ -469,11 +485,22 @@ the driver's decoder.
   syntactic* and mirrored in `regalloc.rs::cacheable_touches`, or regalloc and `emit_block` disagree;
   (b) a run-time guard may only ever *reject* (branching to `emit_step_and_continue`), never fabricate a
   result; (c) any value left in a cache register is covered by `spill` at the next helper call / block exit.
-- `baseline/tests.rs` glob-imports `emit`; `mod.rs` re-exports some items under `#[cfg(test)]` so splitting
-  the emitter into files keeps every item path stable. Keep that in mind when renaming items used by tests.
-- `mod.rs` is the node's largest file (well past the ~1000-line guidance) and is the next split candidate;
-  the natural seams are the deopt/continue helpers and the per-arm inline predicates, which already have
-  their own submodules.
+- `baseline/tests.rs` glob-imports `emit`; `mod.rs` re-exports some items under `#[cfg(test)]` and
+  `pub(crate) use block::emit_block;`/`pub(super) use list::{…};` re-exports keep every `emit::X` path
+  stable across the splits. Keep that in mind when renaming items.
+
+## Known Issues
+- **`block.rs` (1073 lines) is deliberately above the ~1000-line guidance.** It holds the single
+  per-instruction lowering dispatch (`emit_block`, a `match instr` with one arm per instruction group)
+  plus its prologue/epilogue, position-store/Y-publish, deopt wrapper and the three helper-sequence
+  arms. The `match` is what makes the file cohesive — each arm is one `try_inline_*` call plus an
+  `emit_deopt` fallback — so splitting it would either scatter one decision across files or require
+  inventing a visitor/table abstraction the emitter does not need. The other files are all under the
+  guidance (`mod.rs` 351, `test.rs` 963, `aggregate.rs` 720, …).
+- **`test.rs` (963) and `aggregate.rs` (720) are under the guidance but still large**: `test.rs` keeps
+  the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
+  `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers
+  live in `aggregate/list.rs`.
 
 ## Continuation sub-blocks (both layouts)
 

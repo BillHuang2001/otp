@@ -68,7 +68,7 @@ success and the failure branch, so the recorded outcome is auditable.
 `$BENCH_TRY_NIX` is also verified to work here (it fetches `rebar3` 3.27.1 + Erlang/OTP 28 from `cache.nixos.org`; the network is available), but it stays the last resort described above.
 `dotnet` is **store state, not repo state**: PLB needs a ≥ 9.0 SDK, and `command_for_min` finds it wherever it lives (a store entry realized with `nix build --no-link nixpkgs#dotnet-sdk_9`, or a ≥ 9.0 `dotnet` on `PATH`). If no such SDK is reachable, `plb` is either `skipped(dotnet-absent)` or — when an older `dotnet` resolves but none is ≥ 9 — a genuine `failed(plb-build-failed)` with the rejected-candidate notes attached, recorded honestly, never papered over.
 **Flake NOTE (do NOT edit `../../flake.nix`):** it lists `rebar3` in `oracleDeps` but no .NET SDK; adding one there would make `plb` reproducible.
-The sandbox record of what each tool-driven target actually does here is `results/m9-tool-targets-notes.md`.
+The sandbox record of what each tool-driven target actually does here is `results/m12-tool-targets-notes.md`.
 
 ### `beam_rt` is a REAL runtime (self-checked)
 `beam_rt` is a working Rust runtime (real `-eval` evaluator, a global-atom `code:*`/`init:*` floor, native
@@ -127,7 +127,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 | `plb` | compute | `/home/bill/Source/Programming-Language-Benchmarks` (dotnet tool, build+bench; needs a ≥ 9.0 SDK, resolved by `command_for_min`) | **runs** (sys) | `dotnet-absent`, `repo-missing`, `plb-build-failed`, `plb-tool-failed`, `plb-no-results` |
 | `cowboy` | io | `/home/bill/Source/cowboy` hello_world built in a scratch copy, driven by the in-process loader | **runs** (sys) | `repo-missing`, `make-absent`, `deps-unavailable` |
 | `khepri` | gc | `/home/bill/Source/khepri` (`rebar3 eunit`, in a scratch copy) | **runs** (sys) | `rebar3-absent`, `repo-missing` |
-| `emqx` | messaging | `/home/bill/Source/emqx` (real `make`/`mix` build, in a scratch copy) | **runs** on an OTP-28 host; `skipped(emqx-requires-otp-28)` on this OTP-29 host (checkout pins OTP **28.5.0.7-2** at `env.sh:3`/`.tool-versions:1`) | `mix-absent`, `make-absent`, `repo-missing`, `not-an-emqx-project`, `emqx-requires-otp-28`, `emqx-build-failed` |
+| `emqx` | messaging | `/home/bill/Source/emqx` (real `make`/`mix` build, in a scratch copy) | **runs** on an OTP-28 host; `skipped(emqx-requires-otp-28)` on this OTP-29 host (checkout pins OTP **28.5.0.7-2** at `env.sh:3`/`.tool-versions:1`; two verified blockers: the `:ezstd` `env.mk` `-s init stop -eval` idiom under OTP ≥ 29 **and** host build tooling/libs absent here — `automake`/`libtool`/`cmake`/`krb5`; full ladder in `results/m12-emqx-enablement-attempt.md`) | `mix-absent`, `make-absent`, `repo-missing`, `not-an-emqx-project`, `emqx-requires-otp-28`, `emqx-build-failed` |
 | `slice` | compute | committed `slice.beam` fixture + stdlib wrapper modules, run under **each scheduled runtime** | **runs** (sys+rust) | `erlc-absent`, `fixture-missing`, `runtime-unsupported` |
 | `foreign` | compute | **real Cowboy + EMQX modules** (`cowboy_bstr.erl`, `emqx_base62.erl`) compiled with the system `erlc`, run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `sources-missing`, `runtime-unsupported` |
 | `list_walk` | compute | in-tree embedded `bench_list_walk` module (BIF-free recursive `sum/1` list walk), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent` |
@@ -166,8 +166,13 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   `HEX_HOME` redirected into the scratch so the read-only checkout and developer home are untouched. A
   toolchain-matching host yields a real wall time; a mismatched one records the **precise** blocker rather
   than a fabricated number (this host is OTP 29.1.1 / erts-17.1 while EMQX pins **28.5.0.7-2** at
-  `env.sh:3`/`.tool-versions:1` ⇒ `skipped(emqx-requires-otp-28)`, the `:ezstd` `env.mk` make-target being
-  the mechanism). `mix`/`make` absent ⇒ `mix-absent`/`make-absent`;
+  `env.sh:3`/`.tool-versions:1` ⇒ `skipped(emqx-requires-otp-28)`). Two verified blockers: the
+  `:ezstd` `env.mk` make-target (generated via `erl -noshell -s init stop -eval …`, which OTP ≥ 29
+  halts before evaluating) **and**, even with that idiom patched, host build tooling/libs absent here
+  (the `:jq` NIF needs `automake`+`libtool`+`cmake`, `:sasl_auth` needs Kerberos headers — `krb5.h`);
+  the full enablement ladder is `results/m12-emqx-enablement-attempt.md`, the one-line idiom patch is
+  `results/m12-emqx-ezstd-env-mk.patch` (a fetched dep ⇒ apply after `mix deps.get`; **insufficient
+  alone**), and the note names both blockers. `mix`/`make` absent ⇒ `mix-absent`/`make-absent`;
   a checkout that is not an EMQX project ⇒ `not-an-emqx-project`.
 - `plb`: stages the checkout into a `ScratchDir` and drives the dotnet tool in **two stages**:
   `--task build --langs elixir --no-docker` (copies sources + templates, runs the env's `build:` command,
@@ -291,17 +296,22 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `copy_bound` Messaging·A.1+A.5, `gc_bound` Gc·A.1).
 - `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
 - `RESULTS.md` → the definitive results summary (tables, commands, verified skips, host-load record, caveats).
-- `results/` → committed raw `Report` JSON + `bench compare` diffs: `m11-*` = the **current** run (the full
-  cross-runtime report, the `--quick` interpreter-tier control, the matched-form `--quick` default-tier
-  control, the full external-target report, the PLB/EMQX observations, the cross-runtime/tier/vs-m10 diffs,
-  and the `m11-load-record.md`/`m11-tool-targets-notes.md` records); `m10-*`/`m9-*` = the previous runs
-  (kept as the regression baseline; the `m9-*` group also holds the post-fix tool-resolution smokes
+- `results/` → committed raw `Report` JSON + `bench compare` diffs: `m12-*` = the **current** run (the full
+  cross-runtime report `m12-bench-xrun.json` plus the archived load-biased first pass
+  `m12-bench-xrun-contended.json`, the two `--quick` tier controls, the full external-target report, the
+  PLB/EMQX rows, the `foreign` A/B pair + `m12-foreign-regression.md`, `m12-run-route-latency.md`,
+  `m12-load-record.md`, `m12-tool-targets-notes.md`, `m12-emqx-enablement-attempt.md`/`m12-emqx-ezstd-env-mk.patch`
+  and the `m12-compare-*.txt` diffs); `m11-*`/`m10-*`/`m9-*` = the previous runs (kept as regression
+  baselines; the `m9-*` group also holds the post-fix tool-resolution smokes
   `m9-bench-plb-smoke.json` / `m9-bench-plb-smoke-path8.json` / `m9-bench-emqx-smoke.json`), and
   `m6-*`/`m5-*`/`m4-*` the runs before those. The `b54-*` group holds the controlled experiments behind the
-  resolved `foreign`/RSS verdicts: `b54-foreign-ab-m10.json` / `b54-foreign-ab-head.json` (the `--quick`
+  `foreign`/RSS verdicts: `b54-foreign-ab-m10.json` / `b54-foreign-ab-head.json` (the `--quick`
   `foreign` A/B with `$BEAM_RT` alternating the m10 (`b4593818b3`) and HEAD binaries at matched `N`; the m10
   side's program is normalised to `$TMPDIR/m10wt/erts_rust/target/release/beam_rt`) and
-  `b54-foreign-growth-curve.md` (the direct `enc` ladder on both binaries, both tiers).
+  `b54-foreign-growth-curve.md` (the direct `enc` ladder on both binaries, both tiers). The committed
+  prose records live beside the JSON: `b54-foreign-growth-curve.md`, `b55-foreign-regression-fix.md`,
+  `m12-foreign-regression.md` (the Θ(N³) fix re-derivation), `m12-run-route-latency.md` (the OPEN
+  `run`-route defect) and `m12-emqx-enablement-attempt.md` (the verified ladder behind `emqx`'s honest skip).
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
@@ -338,16 +348,21 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - **`$BENCH_TOOL_PATH`** (colon-separated `bin` dirs, searched before the store scan) is the documented way
   to force a specific tool build; **`$BENCH_TRY_NIX`** (opt-in, default off) is the last-resort
   `nix shell nixpkgs#<attr> --command <tool>` fallback. Neither is required for the default path.
-- **`emqx` needs an OTP-28 toolchain.** It drives EMQX's real `make`/`mix` build, but the checkout pins OTP
-  **28.5.0.7-2** (`erlang 28.5.0.7-2` at `.tool-versions:1`, `export OTP_VSN=28.5.0.7-2` at `env.sh:3`) while
-  the host `erl` is OTP 29.1.1 / erts-17.1, so `:ezstd`'s `env.mk` make-target (generated via
-  `erl -noshell -s init stop -eval …`, an idiom that produces no output under OTP 29 because `init stop` halts
-  before the `-eval` — verified on this host) writes nothing and `mix compile` aborts with
-  `No rule to make target '…/env.mk'` ⇒ `skipped(emqx-requires-otp-28)`. The gate reads ONLY these declared
-  pins (no checkout-layout assumptions) and the note records the pin, its file:line, and the exact host
-  `erl` + versions. It is not satisfiable by a version override: the only OTP-28 binding in the store cannot
-  be paired with the OTP-29-built Elixir/`mix` the umbrella build needs, and the pin lives in the read-only
-  target. Swapping the whole toolchain is out of the driver's scope.
+- **`emqx` needs an OTP-28 toolchain, and that is not its only blocker.** It drives EMQX's real
+  `make`/`mix` build, but the checkout pins OTP **28.5.0.7-2** (`erlang 28.5.0.7-2` at `.tool-versions:1`,
+  `export OTP_VSN=28.5.0.7-2` at `env.sh:3`) while the host `erl` is OTP 29.1.1 / erts-17.1. Two
+  **verified** blockers (full ladder + exact failing output lines in
+  `results/m12-emqx-enablement-attempt.md`): (1) `:ezstd`'s `env.mk` make-target is generated via
+  `erl -noshell -s init stop -eval …`, an idiom that produces no output under OTP 29 because `init stop`
+  halts before the `-eval` — verified on this host — so it writes nothing and `mix compile` aborts with
+  `No rule to make target '…/env.mk'`; and (2) **even once that idiom is patched**, the umbrella build
+  additionally needs host build tooling/system libraries this sandbox lacks (`:jq`'s `autoreconf`/
+  `configure` needs `automake`+`libtool`+`cmake`, and `:sasl_auth` fails on `krb5.h`) — the checkout's own
+  CI builds it in a prepared image, not on a bare host. Hence `skipped(emqx-requires-otp-28)`, with a note
+  naming the pin, its file:line, the exact host `erl` + versions, and **both** blockers. The gate reads
+  ONLY these declared pins (no checkout-layout assumptions) and runs cheaply up front. Not satisfiable by
+  a version override: the checkout pin lives in the read-only target and the host tooling gaps are
+  independent of it. Swapping in a prepared toolchain/image is out of the driver's scope.
 - **`khepri`'s suite may run under an Erlang other than the reported oracle.** The store `rebar3` is an
   escript whose shebang points at an Erlang/OTP 28 `escript`, so it runs the Khepri suite under OTP 28 while a
   `SysOnly` tool-driven row's `runtimes[]` version describes the driver's resolved oracle (`erl` on `PATH`,
@@ -386,10 +401,11 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `out/` is gitignored by `../../.gitignore` (`/tools/bench/out/`); the standard scratch artifact is
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked** `results/`
   directory (see `RESULTS.md`), which is for committed milestone numbers only.
-- **`foreign`'s `case_<name>_ns_per_call` is N-dependent on the Rust runtime** (the per-call cost grows with
-  `N`, super-linearly), so it is only comparable across runs that used the same `N`; each row emits a
-  `case_<name>_calls` companion and an explicit note. The rows are **not** a clean cross-runtime ratio, and
-  the loop workloads' rust peak RSS grows with `N` too (a general per-op heap retention, not ETS-specific).
+- **`foreign`'s `case_<name>_ns_per_call` is N-dependent on the Rust runtime** (the per-call cost drifts with
+  `N`, a common-mode per-op heap retention shared with the m10 baseline — the Θ(N³) defect is fixed), so it is
+  only comparable across runs that used the same `N`; each row emits a `case_<name>_calls` companion and an
+  explicit note. The rows are **not** a clean cross-runtime ratio, and the loop workloads' rust peak RSS is
+  **boot-dominated** at m12 (a general per-op heap retention beneath it, not ETS-specific).
   Both facts, with the owner `file:line`s and the root causes (which live **outside this node**), are in the
   dedicated *Known Issue* section below — read it before quoting a `foreign` number or a loop-workload RSS.
 
@@ -403,7 +419,11 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `workloads::plb` (a run with no result JSON is a
   *failed* row, never `ok`), `workloads::foreign`, `workloads::list_walk`, `workloads::copy_bound` and
   `workloads::gc_bound` (case tables, per-side argv, the startup-cancelling per-op/per-call/per-element
-  math, deterministic stdout).
+  math, deterministic stdout). The tool-driven targets' **enable/skip decisions** are pinned so a
+  future environment change cannot silently turn a real measurement into a skip — `khepri` probes
+  `Ready` and its resolved `rebar3` exists on disk when the checkout + tool resolve; `plb` probes
+  `Ready` and its version-resolved `dotnet` satisfies `MIN_DOTNET_SDK`; `emqx` gates a pinned checkout
+  on a newer host. Each early-returns when its prerequisite is absent, so CI stays green.
 - Library integration test: build a synthetic in-memory `Report`, serialize, reload, and compare —
   hermetic, no oracle needed; plus the `Runtimes::Both` regression guard for `foreign`, `list_walk`,
   `copy_bound` and `gc_bound`.
@@ -427,46 +447,47 @@ erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release 
 
 # 2. the FULL cross-runtime report — the reliable source for sys-vs-rust tables:
 #    only the six Runtimes::Both workloads, so both sides see the same machine conditions
+#    (RE-TAKEN on a quiet host; the archived load-biased first pass is m12-bench-xrun-contended.json)
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --full --runtime all --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/results/m11-bench-xrun.json --verbose
+    --out-file erts_rust/tools/bench/results/m12-bench-xrun.json --verbose
 
 # 2b. the SAME workloads with the interpreter pinned — the Rust-vs-Rust tier-effect control
 #     (rust only: it has NO sys rows, so it is never a system-ERTS comparison)
-#     PROFILE quick: at this commit the interpreter tier is pathological on the `foreign` cases,
-#     so the --full form is unaffordable (≈50 min); see RESULTS.md §3.9
+#     PROFILE quick: both m12 tier controls are --quick, so the tier table is read like-for-like;
+#     the interpreter control is NOT --full (see RESULTS.md §3.9)
 BEAM_RT_TIER=interpreter erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/results/m11-bench-xrun-interp.json
+    --out-file erts_rust/tools/bench/results/m12-bench-xrun-interp.json
 
-# 2c. supplementary MATCHED-form default-tier control (same six workloads, rust only, quick)
+# 2c. MATCHED-form default-tier control (same six workloads, rust only, quick)
 #     so the tier table is read off two --quick runs (like-for-like)
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file erts_rust/tools/bench/results/m11-bench-xrun-quick.json
+    --out-file erts_rust/tools/bench/results/m12-bench-xrun-quick.json
 
 # 3. the FULL sys-only external targets (erlc/elixirc/cowboy/khepri) in one report
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --full --runtime sys --workloads erlc_compiler,elixir_compiler,cowboy,khepri \
-    --out-file erts_rust/tools/bench/results/m11-bench-external.json --verbose
+    --out-file erts_rust/tools/bench/results/m12-bench-external.json --verbose
 
 # 4. the tool-driven targets (plb runs; emqx skips on this OTP-29 host)
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --quick --runtime sys --workloads plb  --out-file erts_rust/tools/bench/results/m11-bench-plb.json  --verbose
+    run --quick --runtime sys --workloads plb  --out-file erts_rust/tools/bench/results/m12-bench-plb.json  --verbose
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --quick --runtime sys --workloads emqx --out-file erts_rust/tools/bench/results/m11-bench-emqx.json --verbose
+    run --quick --runtime sys --workloads emqx --out-file erts_rust/tools/bench/results/m12-bench-emqx.json --verbose
 # (plb resolves the greatest dotnet >= 9.0 by version, so it runs even with an older dotnet on PATH; §4.1 of RESULTS.md)
 # (emqx needs an OTP-28 host — here it reports skipped(emqx-requires-otp-28))
 
 # 5. compare (cross-runtime inside one report, or two files)
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-xrun.json
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-xrun-interp.json \
-    erts_rust/tools/bench/results/m11-bench-xrun.json       # as-specified tier diff: interp(--quick) -> default(--full)
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m11-bench-xrun-interp.json \
-    erts_rust/tools/bench/results/m11-bench-xrun-quick.json # MATCHED-form tier diff: quick <-> quick
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m12-bench-xrun.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m12-bench-xrun-interp.json \
+    erts_rust/tools/bench/results/m12-bench-xrun.json       # as-specified tier diff: interp(--quick) -> default(--full), a form mismatch
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m12-bench-xrun-interp.json \
+    erts_rust/tools/bench/results/m12-bench-xrun-quick.json # MATCHED-form tier diff: quick <-> quick
 
 # 6. the factual boot-status probe at this commit (contract A.7; RESULTS.md §3.10/§6.8)
-erts_rust/target/release/beam_rt -boot bootstrap/bin/start   # exits 3 (boot stops at directive 18 of 22)
+erts_rust/target/release/beam_rt -boot bootstrap/bin/start   # exits 0 (boot completes) but pays a ~2.1 s fixed cost; the OPEN `run`-route latency defect is results/m12-run-route-latency.md
 ```
 
 Archive the `out/` copies into `results/` with only the two mechanical path normalisations
@@ -490,31 +511,36 @@ regardless of `PATH` order); the rest probe ready, and `khepri` runs once the `r
 
 ## Status
 - The driver is a complete library + binary: 12 workloads, all implemented and tested; `cargo test -p bench`
-  is green (**253 passed / 0 failed**: 245 lib unit + 4 integration + 1 oracle smoke + 3 doc).
-- **Current measurement session: `m11` (2026-10-14 05:47–06:57 UTC, commit `ab6f1b5e58835cbf5fcb75257679532c46090a74`).**
-  The full cross-runtime pass ran 12/12 rows `ok` (six `Runtimes::Both` workloads × both runtimes); the
-  full sys-only external-target pass ran 4/4 `ok` (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`);
-  `plb` → `ok` (version-aware tool resolution picks `dotnet` 9.0.318); the only honest non-`ok` row is
-  `emqx` → `skipped(emqx-requires-otp-28)`. `copy_bound` gained its fourth case (`send_recv_plain`, the
-  delivery-only attribution case) in the measured commit.
-- **The m11 tier-effect control is a `--quick` run** (`results/m11-bench-xrun-interp.json`): at this commit
-  the interpreter tier is pathologically slow on the `foreign` cross-module cases (super-linear in `N`; a
-  `--full` pass would need ≈50 min), so a supplementary **matched-form `--quick` default-tier control**
-  (`results/m11-bench-xrun-quick.json`) exists to keep the tier comparison like-for-like. Every tier table is
-  **Rust-vs-Rust only** (no `sys` rows) and is never a system-ERTS comparison.
-- Read the figures from `RESULTS.md` / `results/` (`m11-*` current; `m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` the
-  regression baselines) — this file deliberately restates none of them.
+  is green (**257 passed / 0 failed**: 249 lib unit + 4 integration + 1 oracle smoke + 3 doc).
+- **Current measurement session: `m12` (2026-10-15, measured tree `ee3e426db0`, artifacts committed as
+  `bdadd02333`, quiet re-take `e429fa78b5`).** The full cross-runtime pass ran 12/12 rows `ok` (six
+  `Runtimes::Both` workloads × both runtimes); the full sys-only external-target pass ran 4/4 `ok`
+  (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`); `plb` → `ok` (version-aware tool resolution
+  picks `dotnet` 9.0.318); the only honest non-`ok` row is `emqx` → `skipped(emqx-requires-otp-28)`.
+  `khepri` and `plb` now measure (both `ok`).
+- **The Θ(N³) `foreign` per-call regression is FIXED** (owner outside this node; commits `07a5720639` +
+  `7d84b12b44`): the fixed runtime's per-call marginal tracks the m10 pre-regression baseline
+  (`results/m12-foreign-regression.md`). **The `run`-route startup/blocked-round latency defect is OPEN**
+  (being fixed in parallel by the `beam_rt` owner): a fixed ≈2.1 s startup on every `run`/`-eval`/`-boot`
+  action plus a ~25.5 ms per-blocked-round scheduler cost (`results/m12-run-route-latency.md`).
+- **Both m12 tier-effect controls are `--quick` runs** (`results/m12-bench-xrun-interp.json`,
+  `results/m12-bench-xrun-quick.json`): the tier table is read off two matched-form `--quick` runs (the
+  as-specified `m12-compare-tier-effect.txt` is a form mismatch; `m12-compare-tier-effect-quick.txt` is the
+  matched one). Every tier table is **Rust-vs-Rust only** (no `sys` rows) and is never a system-ERTS comparison.
+- Read the figures from `RESULTS.md` / `results/` (`m12-*` current; `m11-*`/`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*`
+  the regression baselines) — this file deliberately restates none of them.
 
 ## Measured — where the numbers live
 
 **`RESULTS.md` is the authoritative source for every measured number** (one table per workload category,
 the environment record, the exact reproduction commands, the `/proc/loadavg` record, the stability bounds,
-the m11-vs-m10 delta section and the ranked bottleneck list). The raw harness JSON behind it is committed
-under `results/`: `m11-*` = the **current** run (the full cross-runtime report, the `--quick`
-interpreter-tier control, the matched-form `--quick` default-tier control, the full external-target report,
-the PLB/EMQX observations, the cross-runtime/tier/vs-m10 diffs, and the
-`m11-load-record.md`/`m11-tool-targets-notes.md` records);
-`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` = the previous runs, kept as the regression baseline.
+the m12-vs-m11 delta section and the ranked bottleneck list). The raw harness JSON behind it is committed
+under `results/`: `m12-*` = the **current** run (the full cross-runtime report `m12-bench-xrun.json` plus
+the archived `m12-bench-xrun-contended.json` load-biased first pass, the two `--quick` tier controls, the
+full external-target report, the PLB/EMQX rows, the `foreign` A/B pair + `m12-foreign-regression.md`,
+`m12-run-route-latency.md`, `m12-load-record.md`, `m12-tool-targets-notes.md`,
+`m12-emqx-enablement-attempt.md` and the `m12-compare-*.txt` diffs);
+`m11-*`/`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` = the previous runs, kept as the regression baselines.
 This file deliberately restates none of those numbers — read them there, and regenerate with the Runbook
 above rather than quoting a stale copy.
 
@@ -546,14 +572,15 @@ cost: the engine's dispatch arm is itself O(1) and allocation-free per instructi
 behind it are `beam_rt` measurements owned by `../../crates/beam_rt/PERF.md` (the per-call dispatch section)
 and `../../crates/beam_rt/CONTEXT.md`, not `bench` output.
 
-**The `foreign` per-call row is N-dependent *and* carries a genuine m10→m11 regression at matched `N`** (both
-resolved; the fix owner is **outside this node**). The `ns_per_call` marginal is only valid/comparable at the
-declared `N` (the Rust per-call cost grows super-linearly with `N`; the sys side is ~flat), and the m10→m11
-move measured at *matched* `N` is a real regression — root-caused to commit `e59dd30432`'s per-slice off-heap
-registration loop (`beam_rt`/`beam_process`) ⇒ Θ(N³). Recorded in `RESULTS.md` §3.4/§8 item 1, with the
-committed A/B and growth-curve evidence in `results/b54-foreign-ab-{m10,head}.json` /
-`results/b54-foreign-growth-curve.md`; the detail (with the owner `file:line`s) is in the *Known Issue*
-section below.
+**The `foreign` per-call row is mildly N-dependent, and it carries the (now-fixed) m10→m11 regression**
+(owner **outside this node**). The `ns_per_call` marginal is only valid/comparable at the declared `N` (the
+Rust per-call cost drifts with `N` — a **common-mode per-op heap retention shared with the m10 baseline**,
+not the Θ(N³) defect; the sys side is ~flat). The **Θ(N³) m10→m11 regression is FIXED** at m12 (commits
+`07a5720639` + `7d84b12b44`): the fixed runtime's marginal now tracks the m10 pre-regression baseline.
+Recorded in `RESULTS.md` §3.4/§8 item 3, with the re-derived A/B and growth-curve evidence in
+`results/m12-foreign-regression.md` + `results/m12-foreign-ab-{head,m10}.json` (history:
+`results/b54-foreign-growth-curve.md`, `results/b55-foreign-regression-fix.md`); the detail (with the owner
+`file:line`s) is in the *Known Issue* section below.
 
 **The `beam_rt` execution tier defaults to the native baseline JIT** (`JitMode::Auto` ⇒ `Tier::BaselineJit` on
 a process's first entry, remembered across pre-emptions and suspends; `BEAM_RT_TIER=interpreter` is the only
@@ -565,60 +592,60 @@ not the lazy runtime path's per-entry cost. The one-shot cold-start characterisa
 `slice` case at **~1.2–1.3×** the interpreter tier) lives in `../../crates/beam_engine/MEASURED.md` and
 `../../crates/beam_rt/PERF.md`.
 
-**The tier effect is now also measured here**, as `results/m11-bench-xrun-interp.json` (the same six workloads,
-`--runtime rust` only, with `BEAM_RT_TIER=interpreter` exported — `bench` spawns the runtime with an inherited
-environment, so the switch reaches every child). It is a **Rust-vs-Rust** control with **no `sys` rows**: never
-read it against the system-ERTS column. `RESULTS.md` §3.9 tabulates it. Three facts to carry forward:
-- **The m11 interpreter control had to run `--quick`** — at this commit the interpreter tier is pathological on
-  the `foreign` cross-module cases (super-linear in `N`; ≈190× the m10 figure at the same `N`, and a `--full`
-  pass ≈ 50 min), so a supplementary **matched-form `--quick` default-tier control**
-  (`results/m11-bench-xrun-quick.json`) exists to keep the comparison like-for-like: read the tier table off
-  two `--quick` runs, not off a `--quick`-vs-`--full` pair.
-- The baseline JIT is a clear win for `list_walk` (default **3.36× cheaper**) and `gc_bound churn`
-  (**1.97×**); it is neutral on `startup`/`compute` and near-neutral on `etf`/`ets`.
-- **The m10 "inverted row" is gone.** The two-process `send_recv` loop is now at **parity** between the tiers
-  (matched `--quick`: 22 654.69 → 22 054.44 ns/op ≈ 0.97×/1.03×), and the new `send_recv_plain` case is at
-  parity too (18 662.44 → 19 330.43, +3.58 %). The m10→m11 window's baseline-JIT **lowered `Send` and the
-  receive-control family natively** (`beam_engine`), backed by `beam_message`'s dirty-heap send fast path and
-  `beam_process`'s quiet-queue `service_signals` fast path (`CHANGE.md`, batch 52). This is a **Rust-vs-Rust
-  tier observation, NOT a system-ERTS comparison** — the `send_recv` rust/sys ratio is still **14.81×**
-  (`RESULTS.md` §3.6), so no Rust-vs-system-ERTS win is claimed here.
+**The tier effect is also measured here**, as the two `--quick` controls
+`results/m12-bench-xrun-interp.json` (interpreter) and `results/m12-bench-xrun-quick.json` (default baseline
+JIT) — the same six workloads, `--runtime rust` only, with `BEAM_RT_TIER` exported (`bench` spawns the runtime
+with an inherited environment, so the switch reaches every child). They are **Rust-vs-Rust** controls with **no
+`sys` rows**: never read them against the system-ERTS column. `RESULTS.md` §3.9 tabulates them off the
+matched-form `--quick` pair (`results/m12-compare-tier-effect-quick.txt`); the as-specified
+`results/m12-compare-tier-effect.txt` (interpreter `--quick` vs default `--full`) is a **form mismatch**.
+Structural facts to carry forward:
+- **Both controls are `--quick`**, so the tier table is read like-for-like (two `--quick` runs, never a
+  `--quick`-vs-`--full` pair).
+- The baseline JIT is a clear win for `gc_bound churn`; it is at parity on `etf`/`ets`/`send_recv` and neutral
+  on `startup`/`compute`.
+- **`list_walk`'s default-tier marginal is absent in both forms** — the short loop is swamped by the ~2.0 s
+  boot's jitter, so the workload emits no `ns_per_element` on the rust side (§3.5); `send_recv_plain` timed
+  out in both tiers (the same 60 s deadline, §3.10). Both are consequences of the **OPEN** boot defect, not
+  tier regressions.
+- **The m11 interpreter pathology is gone** (the control no longer runs super-linearly on `foreign`),
+  consistent with the Θ(N³) registration defect having been fixed. Every tier table here is a **Rust-vs-Rust
+  observation, NOT a system-ERTS comparison**.
 
 Consequence for reading results: startup latency is the trustworthy cross-runtime comparison for
 whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_bound`/`gc_bound`
 per-call/per-element/per-op rows are snapshots of the term-copy / per-element dispatch / GC cost and should be
 re-run via the Runbook rather than adjusted.
 
-## Known Issue — the `foreign` per-call metric is `N`-dependent, and rust peak RSS scales with the loop count `N`
+## Known Issue — the `foreign` per-call metric is `N`-dependent, and the loop workloads' rust peak RSS is boot-dominated
 
 ### `foreign` `case_<name>_ns_per_call` is N-dependent on the Rust runtime
 
-On `beam_rt` the per-call cost **itself grows with `N`** (measured super-linear; committed evidence
-`results/b54-foreign-growth-curve.md`), so `foreign`'s `case_<name>_ns_per_call` is only a clean marginal at
-the declared `N` and is **only comparable across runs that used the same `N`**; the `sys` oracle side is
-~flat over the same range. `RESULTS.md` §3.4 records the resolved verdict (the m10→m11 move is a genuine
-regression at *matched* `N`, root-caused **outside this node** to a per-slice off-heap registration loop in
-`beam_rt`/`beam_process` — commit `e59dd30432`). This workload's job here is honesty, not the fix: every row
-emits the deterministic `case_<name>_calls = N` companion, and the Rust row carries an explicit
-N-dependence note, so a per-call figure is never quoted without the `N` behind it.
+On `beam_rt` the per-call cost still drifts with `N` — a **common-mode per-op heap retention shared with the
+m10 baseline**, *not* the super-linear Θ(N³) defect (which is **FIXED** at m12, owner outside this node) — so
+`foreign`'s `case_<name>_ns_per_call` remains only a clean marginal at the declared `N` and is **only
+comparable across runs that used the same `N`**; the `sys` oracle side is ~flat over the same range.
+`RESULTS.md` §3.4 records the verdict; the re-derived evidence is `results/m12-foreign-regression.md` (+
+`results/m12-foreign-ab-{head,m10}.json`), history `results/b54-foreign-growth-curve.md`. This workload's job
+here is honesty, not any fix: every row emits the deterministic `case_<name>_calls = N` companion, and the
+Rust row carries an explicit N-dependence note, so a per-call figure is never quoted without the `N` behind it.
 
-### rust peak RSS scales with the loop count `N` on some paths
+### the loop workloads' rust peak RSS is boot-dominated (and was `N`-dependent before)
 
-The growth is a **general per-op heap retention** (~2–3 KiB/iteration), **not** ETS-specific and **not**
-tied to any one workload: the BIF-result copy-out (`crates/beam_rt/src/context/calls.rs`) and the engine's
-unrooted `alloc_words` seam (`crates/beam_rt/src/context/gc.rs`) both call `Process::grow_nursery`
+At m12 the loop workloads' rust peak RSS is **boot-dominated** — the resident preloaded-module set of the
+booted `start.boot` dwarfs the loop's own footprint, so those rows read far above the oracle's and are **not**
+a like-for-like memory comparison (`RESULTS.md` §6.7; the OPEN boot defect, §3.10). Beneath it the same
+**general per-op heap retention** remains the underlying mechanism: the BIF-result copy-out
+(`crates/beam_rt/src/context/calls.rs`) and the engine's unrooted `alloc_words` seam
+(`crates/beam_rt/src/context/gc.rs`) both call `Process::grow_nursery`
 (`crates/beam_process/src/process.rs`) → `Nursery::grow` (`crates/beam_gc/src/nursery.rs`), which pushes the
 replaced whole `HeapSpace` onto `Nursery.retired`; `retired` is cleared only by a real collection
-(`Nursery::collapse`), which these loops never trigger. So `ets_copy` (largest `N`, **90.39 MiB** at
-`N` = 100 000 vs sys 66.91 MiB) and the two `foreign` `cowboy_bstr` cases (74.5–77.0 MiB at `N` = 15 000–20 000
-vs sys 66.1–66.6 MiB) grow with `N`, while `gc_bound` and `list_walk` rust peak RSS sit **below** the
-oracle's (15.43 / 15.21 MiB p50 vs sys 66.66 / 66.34 MiB). The per-op `.erl` `ByteSize`/`tuple_size` checks
-still make a silently-dropped allocation fail loudly — this is a retention, not a correctness, issue.
+(`Nursery::collapse`), which these loops never trigger. The per-op `.erl` `ByteSize`/`tuple_size` checks still
+make a silently-dropped allocation fail loudly — this is a retention, not a correctness, issue.
 
 So the rust `foreign`/`copy_bound` per-case `case_<name>_peak_rss_bytes` is **not** a like-for-like memory
-comparison, and the loop-length-dependent rust RSS rows are listed in `RESULTS.md` §8 (item 5).
-`slice` (one call per process, `N`=1) remains the comparable per-process memory metric. The figures are in
-`RESULTS.md` §3.3/§3.6/§6.7 and the direct sweep is in `results/b54-foreign-growth-curve.md`.
+comparison (loop-length- **and** boot-dependent, `RESULTS.md` §8 item 5); `slice` (one call per process,
+`N`=1) remains the comparable per-process memory metric. The figures are in `RESULTS.md` §3.3/§3.6/§6.7.
 
 ## Honesty audit — measurement-integrity notes (current state)
 
@@ -655,7 +682,15 @@ is **not** produced here; it is a `beam_rt` measurement.
 - `RESULTS.md` → the current results summary (one table per workload category, exact reproduction
   commands, verified skip reasons, host-load record, stability, and "what these numbers mean").
 - `results/` → the raw harness JSON behind `RESULTS.md` (committed, so the numbers stay reviewable)
-  plus the `bench compare` diffs (`m11-*` current, `m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` previous).
+  plus the `bench compare` diffs (`m12-*` current, `m11-*`/`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` previous) and
+  the prose records (`m12-foreign-regression.md`, `m12-run-route-latency.md`,
+  `b54-foreign-growth-curve.md`, `b55-foreign-regression-fix.md`, `m12-emqx-enablement-attempt.md`).
+- `results/m12-emqx-ezstd-env-mk.patch` → the literal, reproducible `:ezstd` `env.mk` idiom patch (a
+  *fetched* dep, applied after `mix deps.get`; **insufficient alone** — the build then needs missing host
+  `automake`/`libtool`/`cmake`/`krb5`), which is why the driver applies no patch and keeps its honest skip.
+- `results/m12-emqx-enablement-attempt.md` → the verified, bounded `emqx` enablement attempt (exact
+  commands, each blocker's exact failing output) establishing that EMQX-enterprise is unbuildable here:
+  the `:ezstd` OTP-29 idiom **plus** missing host build tooling/libs ⇒ the driver's `emqx` skip is honest.
 - `../CONTEXT.md` → the `tools/` node's binding shared conventions (runtime resolution, exit codes, JSON, `out/`).
 - `../../CONTEXT.md` §6/§7 → test strategy, the differential gate, staging.
 - `../../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` → the concrete target workloads + build/bench entry points.

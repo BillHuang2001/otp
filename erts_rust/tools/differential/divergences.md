@@ -34,7 +34,41 @@ not here.)
   (`enif_compare_monitors` ordering two equal payloads, `enif_make_monitor_term`'s not-a-ref
   answer).
 
+- `enif_dynamic_resource_call(env, module, name, term, call_data)` compares the resource type's
+  **name** only in the Rust runtime where the oracle requires the **(module, name)** pair
+  (`crates/beam_abi/src/nif/enif/resources.rs`, the documented "substitution 4" — the env carries no
+  module identity): a wrong-**module** call the oracle refuses with `1` the Rust name match accepts
+  with `0`. The `nif_extra` widening therefore passes the **matching** module atom; a wrong-module
+  probe would be a `mismatch`.
+- `enif_monitor_process(env, res, pid, &mon)` with a **live** pid creates a real monitor in the
+  oracle (`0`, the monitor stored) while the Rust runtime answers `1` unless a host installs the
+  `monitor_process` hook, which `beam_rt` does not (`crates/beam_rt/src/nif.rs`). Only the
+  `enif_set_pid_undefined` target — which both answer `MONITOR_TARGET_DEAD` — is pinned.
+- `enif_thread_name(tid)` for the **scheduler** thread answers `"unknown"` in the oracle
+  (`dtid->name == NULL` ⇒ the no-name form) but `NULL` in the Rust runtime; telling that apart from a
+  NIF-created unnamed thread needs a longer-running aux thread, so neither shape is pinned.
+- `enif_term_size` of an **off-heap/refc** binary (above `ERL_ONHEAP_BINARY_LIMIT`) reports the 8-word
+  refc pair in the oracle and the runtime's own counted size in the Rust implementation
+  (`crates/beam_abi/src/nif/enif/mem.rs`); only on-heap sizes are pinned.
+- `enif_free_iovec` is a **probe hazard**: the only safe shape needs the *internal*
+  `ERL_NIF_IOVEC_FLAGS_PREALLOC` (absent from the public `erl_nif.h`), and the freeing form of an
+  env-attached vector is UB on the oracle — deliberately not pinned.
+
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
+- `driver_async_port_key(port)` answers the port's opaque `ErlDrvData`/pointer word in the oracle while
+  the Rust runtime's `DriverPort` keeps the `DriverHost` trait default (`0`,
+  `crates/beam_abi/src/driver/drv/lifecycle.rs`); even with the hook installed the value is
+  pointer-derived, so no equality is pinnable. Owner: `crates/beam_rt` (`DriverHost::async_port_key`).
+- The **failure** family — `driver_failure` / `driver_failure_atom` / `_posix` / `_eof`, `driver_exit/2`,
+  `erl_drv_set_os_pid/2`, `erl_drv_init_ack/2` — terminates/closes the port in the oracle (the module
+  then sees a linked-port exit signal / the `-1` sentinel) while the Rust runtime answers via
+  `DriverHost` defaults; the close reason is a linked-port signal, not a VM-stable observable, so none
+  is pinned. Owner: `crates/beam_rt` / `crates/beam_io`.
+- `driver_dl_open` + `driver_dl_close` round trip is an **oracle-side hazard** — the system `erl`
+  core-dumps on the close (the refusal half is pinned by the `driver_abi` selector 49), so the round
+  trip is deliberately not pinned (a harness artifact, never a runtime difference).
+- (`erl_drv_binary_to_term` is **not** a symbol in `erts/emulator/beam/erl_driver.h` nor in the Rust
+  exports, and `driver_async_cancel` does not exist anywhere in OTP — neither can be a corpus case.)
 - The `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` / `driver_send_term`
   forms' exact **success code** differs (oracle `1` for a queued delivery, rust `0` — the frozen
   `DriverHost::send_term` "accepted" code), so the return value is not pinned; the accept/refuse
@@ -71,6 +105,13 @@ not here.)
   `driver_dl_sym` SIGSEGVs the oracle.
 
 ## A.5 — distribution wire / ETF (owner: `beam_codec`, `beam_rt`)
+- `term_to_binary(Term, [local])` (the `LOCAL_EXT` wrapper) is a **closable** capability gap: the oracle
+  emits a `COMPRESSED`-wrapped `LOCAL_EXT` image (`<<131,109,…,…,121,…>>`, the 4-byte node hash differs
+  per VM start) while `beam_rt` raises its documented `beam_rt: unsupported: bif` (exit `3`).
+  `crates/beam_codec` already models `LOCAL_EXT`, so wiring the option into the `term_to_binary/2` BIF
+  in `crates/beam_rt` closes it. Deliberately kept out of `known-gaps.txt` (the allowlist is for
+  genuinely unclosable gaps): it stays unpinned until then, and the per-VM hash makes a byte golden
+  unpinnable even afterwards (assert the tag/shape).
 - A `[compressed]` image is byte-identical only for a term whose image compresses to a single
   stored block (e.g. `term_to_binary({ok,42}, [compressed])` matches exactly); beyond that the
   framing (`131,80`), the 32-bit uncompressed size and the trailing Adler-32 still match but the

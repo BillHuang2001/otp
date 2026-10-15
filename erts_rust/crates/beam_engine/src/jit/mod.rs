@@ -435,10 +435,9 @@ pub(crate) fn run_cranelift_label_outcome(
 ///
 /// Backs
 /// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
-/// for [`Tier::Cranelift`]: with the **`jit-cranelift`** feature enabled the tier's
-/// compiled functions bake in their entry `pc`, so a mid-function suspension address
-/// is unserviceable and the tier reports the honest typed
-/// [`unsupported`](crate::error::unsupported) error (see
+/// for [`Tier::Cranelift`]: a resume is handed **no** compiled artifact and the tier
+/// has no path that would compile and bind one at a parked address on demand, so it
+/// reports the honest typed [`unsupported`](crate::error::unsupported) error (see
 /// [`cranelift::run_resume_outcome`]). Without the feature the backend is not
 /// compiled in at all, so this is the same typed `unsupported` error the first-entry
 /// Cranelift path reports — never a panic and never a silent fallback to another

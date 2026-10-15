@@ -46,8 +46,16 @@ submodules and their docs; do not look for `boot.rs` here.
   script's `{Name,Vsn}`** (set by `boot_from_script`/`boot_from_script_reporting`, read by the
   `init:script_id/0` floor entry) so the script's identity survives the call. **The CLI really runs a
   boot script on every action but `-version`**: `../cli.rs`'s `boot_script_to_drive` resolves the script
-  (the explicit `-boot FILE` value, else the default `start`) and `boot_then` boots the 22 preloaded
-  `.beam`s and then executes it.
+  (the explicit `-boot FILE` value, else this runtime's **own** release's
+  `bootstrap/bin/start.boot` — see below) and `boot_then` boots the 22 preloaded `.beam`s and then
+  executes it.
+  With the default route loading **this runtime's own** release's script, `Runtime::boot_script_id`
+  and `erlang:system_info(otp_release)` agree (`{"Erlang/OTP","30"}` / `"30"`), so the differential
+  case `boot_extra/init_script_id_names_the_running_otp_release` **agrees**. The `{path, …}` sink
+  (`../boot/bootscript.rs`'s `Instruction::Path` arm) appends a directory **only when it really
+  exists** — `code:add_patha/1` answers `{error,bad_directory}` for an absent one — so the primary
+  bootstrap's *source-tree* `$ROOT/lib/kernel/ebin` does not land on `code:get_path/0` as a dangling
+  entry when `$ROOT` is a versioned installation's root.
 - `code:which/1` / `code:all_loaded/0` / `code:is_loaded/1` render `preloaded` from the **name registry**
   (`../native/code.rs`), not from this cache; `code:all_loaded/0` explicitly filters preloaded names out
   of the cache so it does not list them twice.
@@ -85,12 +93,20 @@ these eight directives, the full modelled set:
   (matching `init`, which never checks — the failure surfaces at the next dependent directive). An
   `{apply, …}` runs the export through the engine's blocking-aware entries and drives the scheduler
   whenever the call suspends, resuming it once a boot-spawned process answers. Both drives go through
-  `drive_scheduler` over the crate-internal `Runtime::pump_scheduler`, with per-call slice budgets
+  `drive_scheduler` over the crate-internal `Runtime::pump_scheduler_boot`, with per-call slice budgets
   between deadline checks and **one** wall-clock `DRIVE_DEADLINE` (10 s) shared by the whole `execute`
   pass, plus a 1 s `KERNEL_BURST_DEADLINE` cap per burst. An exhausted deadline is a typed
   `error::message`; a blocked apply whose drive ran nothing is the engine's typed `error::blocked()`; a
-  drive stops as soon as a `pump_scheduler` call reports `0`.
+  drive stops as soon as a `pump_scheduler_boot` call reports `0`.
   A capability gap stays an `error::unsupported` raise.
+  `pump_scheduler_boot` is `pump_scheduler` with an **imminent-only** sleep policy
+  (`TimerWait::ImminentWithin(TIMER_PUMP_SLICE)`): a step sleeps the remaining time to the earliest
+  pending deadline **only when that deadline is within one pump slice (100 ms)** and returns `0` at once
+  otherwise, so a boot-armed timer a second (or an hour) away — the `gen_server` `WaitTimeout`s the
+  boot's parked processes hold — costs the drive nothing. Every already-due timer still fires
+  (`fire_due_timers` runs before the wait), and a boot-spawned process parked on a short
+  `receive … after T` (T ≤ the window) is still slept to and resumed. The boot's blocking calls are
+  `infinity` receives, so nothing a directive synchronously awaits lies beyond a slice.
 
 ### Surviving a `{kernelProcess, …}`'s directive exit (the unlink)
 This runtime runs a `{kernelProcess, …}` MFA in a **short-lived** process that exits when the MFA
@@ -287,20 +303,23 @@ from neither the shim nor this executable, and a wrapper `erl` may live outside 
 Asking `erl` is authoritative, and a path is never fabricated: if neither probe produces a stdlib the
 resolution fails with the typed `cannot locate the system code path: …` error (exit 1). Consequence: a
 normal installation pays **no** `erl` start-up (measured on this host: a bare `-eval` invocation now
-takes ≈2.19 s wall, since it drives the default boot script on every action, where the resident `erl`
+takes ≈0.44 s wall, since it drives the default boot script on every action, where the resident `erl`
 shell-out alone costs ≈0.5 s and is still avoided).
 **The resolved root is the consumed SYSTEM install, not this runtime's own tree.** `native_roots`
 seeds candidate roots with the `erl` on `$PATH` first (canonicalized, never executed), then
-`current_exe()` ancestors, `$ERL_TOP` and the standard prefixes; `bootstrap/` is never a candidate
-root and never on the code path. So `CodeServer::lib_root()` is the *system* install's `<lib>` and
-`../cli.rs::boot_file_root` (its parent) is the system install root. The default `-boot start`
-therefore resolves (`../cli.rs::resolve_boot_file`) to `<systemRoot>/bin/start.boot` — the
-*consumed install's* script (header `{"Erlang/OTP","29"}` for an OTP-29 host), **not** the repo's
-committed `bootstrap/bin/start.boot` (header `{"Erlang/OTP","30"}`), which is reachable only through
-an explicit CWD-relative `-boot bootstrap/bin/start`. Consequence: `init:script_id/0` reports the
-*consumed install's* release (`../native/init.rs::script_id_0` ← `Runtime::boot_script_id`) while
-`erlang:system_info(otp_release)` reports the runtime's compile-time target
-(`../../beam_common/src/version.rs::OTP_VERSION`, `"30"`).
+`current_exe()` ancestors, `$ERL_TOP` and the standard prefixes; `bootstrap/` is never a code-path
+candidate root (it holds the primary bootstrap, not an app layout). So `CodeServer::lib_root()` is the
+*system* install's `<lib>` and
+`../cli.rs::boot_file_root` (its parent) is the system install root — used for an explicit `-boot`
+value and for a boot script's `$ROOT` expansion, exactly as before.
+The **default** route (no `-boot`) does *not* go through it: `../cli.rs::boot_script_to_drive` prefers
+`CodeServer::own_bootstrap_boot_script()` — the committed `bootstrap/bin/start.boot` of the source tree
+the binary runs from — and only falls back to `-boot start` (resolved to `<systemRoot>/bin/start.boot`)
+when no source tree is reachable. The default route therefore drives the repo's OTP-30 script (header
+`{"Erlang/OTP","30"}`), so `init:script_id/0` (`../native/init.rs::script_id_0` ←
+`Runtime::boot_script_id`) agrees with `erlang:system_info(otp_release)`
+(`../../beam_common/src/version.rs::OTP_VERSION`, `"30"`). An explicit `-boot FILE` still drives *that*
+script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"}` on this host).
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
@@ -336,7 +355,7 @@ an explicit CWD-relative `-boot bootstrap/bin/start`. Consequence: `init:script_
   rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
   `../context/CONTEXT.md`.
 - `bootscript.rs` is ~1855 lines (production lines 1–724, the rest its oracle test module) — the
-  crate's documented long-file precedent; `drive.rs` is ~391 lines. Both are `#![deny(unsafe_code)]`;
+  crate's documented long-file precedent; `drive.rs` is ~423 lines. Both are `#![deny(unsafe_code)]`;
   no `unwrap()` on runtime data.
 
 ## Test Strategy
@@ -385,6 +404,13 @@ an explicit CWD-relative `-boot bootstrap/bin/start`. Consequence: `init:script_
   (`a_boot_spawned_process_answers_a_blocked_apply`, `a_kernel_process_registers_its_own_directive_name`,
   `a_kernel_process_burst_waits_for_the_directive_to_return`, `registering_a_live_boot_name_is_badarg`)
   and by `../tests/boot.rs` (`the_boot_chains_kernel_processes_survive_their_directive_processes`).
+  The **imminent-only wait policy** the drives now use is pinned in `../runtime/scheduler/tests.rs`:
+  `the_imminent_only_wait_policy_sleeps_for_an_imminent_deadline_only` (the `TimerWait::ImminentWithin`
+  unit: no deadline → `None`; an hour out → `None`; 20 ms out → the remaining time, clamped to the
+  window; one wait per pass), `a_boot_drive_step_does_not_sleep_on_a_far_future_deadline` (a
+  `pump_scheduler_boot` step with a 1 h timer returns `0` in well under 100 ms, timer untouched) and
+  `a_boot_drive_step_sleeps_to_an_imminent_deadline_and_fires_it` (a 5 ms timer is slept to, the parked
+  receiver is resumed and the message delivered).
 - In-file `#[test]` counts: `bootscript.rs` **12** (lines 725–1855), `preloaded.rs` **3** (lines 75–143),
   `drive.rs` **0** — directory total **15**; the module root `../boot.rs` adds **9** (its own
   `#[cfg(test)] mod tests`).

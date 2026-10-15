@@ -140,8 +140,9 @@ impl TtyWatch {
     }
 
     /// Whether any read interest is armed — the "something for the poll round to wait on" half
-    /// [`super::PortRegistry::has_nothing_to_poll`] needs, alongside the live ports and the signal
-    /// self-pipe.
+    /// [`super::PortRegistry::has_nothing_to_poll`] needs, alongside the live ports and a signal
+    /// self-pipe that **holds** an undelivered notification (an armed but idle `handle`
+    /// disposition is not pending work).
     pub(crate) fn is_armed(&self) -> bool {
         !self.registrations.is_empty()
     }

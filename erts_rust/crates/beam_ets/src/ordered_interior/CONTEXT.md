@@ -46,6 +46,13 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
   changes only at the root, which collapses when it drops to a single child.
 - A same-`cmp_arith`-key insert replaces **both** the object and the stored key term (the oracle's
   key-follows-object rule; probed against OTP 29).
+- **The evidence suite is tuned to hit the split/merge boundary, and says so.** The randomised trace
+  spends 34 of its 55 op slots on `insert` precisely so the live-key count crosses `ORDER = 32` (it
+  reaches 49–63), and it asserts that peak, so diluting the insert share fails the test instead of
+  quietly reducing the trace to a small-table walk. The benchmark likewise drives each interior in
+  three key orders rather than one, because a single order measures the sorted `Vec`'s best case
+  (ascending inserts) or its worst case (ascending deletes) and never both — the two interiors'
+  crossover is only visible when both are in the same run.
 
 ## Complexity (as implemented)
 Per-operation node visits, `O(K)` work per node (`Vec::insert`/`remove` in a `K`-sized node) and
@@ -88,8 +95,22 @@ case, replace/`insert_new`/`delete_object`, mixed key classes, present/absent/bo
 replace-key-term rule, and memory monotonicity; both interiors are driven through the `Interior` seam
 by shared helpers. `../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical
 observable traces. End-to-end `ordered_set` behaviour is oracle-differential-tested in
-`../tests/differential/` (navigation, 10 001-key, matchspec, ...). No `#[ignore]`; no self-comparison
-tautologies.
+`../tests/differential/` (navigation, 10 001-key, matchspec, ...). No `#[ignore]` in `tests.rs` or
+`interior_parity.rs`, and no self-comparison tautologies.
+
+`../tests/ets_ordered_oracle.rs` is the **randomised** differential trace against the live oracle —
+the one `#[ignore]`d test here (it needs the system Erlang and a few seconds of wall clock; run it
+with `--ignored --nocapture`, and it **skips loudly** rather than passing vacuously when no oracle is
+found). A 73-term mixed-type key pool is driven by a SplitMix64-finalised LCG through a **55-slot** op
+space: 34 `insert` slots plus one slot each for `insert_new`, `delete`, `delete_object`, `take`,
+`delete_all_objects`, `lookup`, `member`, `first`, `last`, `next`, `prev`, `select`, `select_count`,
+`match_object`, `select_reverse`, `foldl`, `update_counter`, `update_element`, `foldr`,
+`lookup_element/3` and `lookup_element/4`. Every key the table yields renders as its pool index, and
+`{size, in-order tab2list, op result}` is asserted against the oracle after **every** step; the
+counter/element ops target element position 2 (an object is `{K, V}`), the slot both sides agree on.
+3 seeds × 600 steps = **1800 compared steps**, zero divergence, peak **49–63** live keys — the trace
+is required to cross `ORDER = 32` (the test asserts its own peak) so a future op-mix change cannot
+silently stop exercising node splits and the merge-on-delete churn below the split threshold.
 
 `../interior_bench.rs::ordered_interior_microbenchmark` is the reproducible B+-tree-vs-sorted-`Vec`
 comparison (it asserts every measurement, so a wrong-but-fast index fails the run):
@@ -99,12 +120,19 @@ erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets
 ```
 Use `BEAM_ETS_BENCH_SIZES=1000,100000 BEAM_ETS_BENCH_REPEATS=5` for stable figures (each cell is the
 per-metric **minimum** over the passes) and `BEAM_ETS_BENCH_INDEX=bplus|sorted` to run one interior.
+`BEAM_ETS_BENCH_ORDER=shuffled|ascending|descending|all` adds the **key-order** dimension (default
+`shuffled`, the single-order behaviour earlier runs used): the order is irrelevant to the tree and
+decisive for the sorted `Vec`, whose ascending inserts are its append fast path while its ascending
+deletes are the whole-tail-shift worst case — so both interiors' best *and* worst cases get measured.
 Absolute ns are meaningless on a shared host — read the printed `sorted/tree` ratio column. On such a
-run the B+-tree wins exactly where a `Vec`'s tail shift bites: at n = 1e5 the sorted `Vec` is
-9.6–36.0× slower inserting and 10.3–29.8× slower deleting, while it stays ahead on the
-comparison-light work — 0.27–0.33× the iteration time and 0.63–1.18× / 0.90–1.56× on hit/miss
-lookup — and its index footprint is the smaller one (16.4–21.0 vs 28.7–29.6 bytes/entry, the price of
-the internal nodes that buy the `O(log n)` mutation).
+run the B+-tree wins exactly where a `Vec`'s tail shift bites: at n = 1e5 the sorted `Vec` is 7.3–97.5×
+slower inserting and 21.5–119.7× slower deleting across the four key shapes and three orders, while
+it stays ahead only on the comparison-light, traversal-shaped work — 0.21–0.45× the iteration time
+(one contiguous array walk versus the leaf chain) — and is a wash on hit/miss lookup (0.59–1.42× /
+0.77–1.44×). Its index footprint is the smaller one: **16.4–21.0** vs the tree's **20.1–42.6**
+bytes/entry, though the tree's figure is *arena capacity* and varies with the driven order (ascending
+inserts split leaves at ~50 % occupancy). The full measured table, the sizes/orders run and each
+run's `/proc/loadavg` are in `../../PERF.md` §3.
 
 ## Known Issues / Notes
 - `next_from`/`prev_from` with `inclusive = true` has no production consumer yet: only `Tree::next`/

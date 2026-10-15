@@ -2618,7 +2618,7 @@ fn a_suspension_inside_a_cross_module_callee_resumes_on_the_baseline_tier() {
 // the native `call_ext*` arm: `jit_ext_call` (resolution + frame discipline)
 //
 // `baseline/runtime.rs::jit_ext_call` — over the pure-Rust `resolve_ext_entry` —
-// is the helper the `baseline/emit/mod.rs::emit_ext_call` arm wires into every
+// is the helper the `baseline/emit/block.rs::emit_ext_call` arm wires into every
 // compiled block's `call_ext*` lowering, so those instructions no longer deopt
 // unconditionally. For an import the host resolves through
 // `ExecutionContext::resolve_external_call`, the helper returns the [`ENTER`]

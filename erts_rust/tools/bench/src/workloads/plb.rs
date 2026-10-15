@@ -574,6 +574,43 @@ mod tests {
         }
     }
 
+    /// When a `dotnet` SDK is reachable the workload must be *ready*, and the version-aware
+    /// resolution must actually satisfy the project's declared minimum ([`MIN_DOTNET_SDK`]) —
+    /// the newly-enabled target must not silently regress to `skipped(dotnet-absent)` or settle
+    /// for a too-old SDK. Early-returns when no `dotnet` resolves, so CI (no `dotnet`) stays green.
+    #[test]
+    fn probe_is_ready_and_the_sdk_satisfies_min_version_when_dotnet_resolves() {
+        if !tool::available(TOOL) {
+            return;
+        }
+        let Some(resolved) = tool::command_for_min(TOOL, TOOL_NIX_ATTR, MIN_DOTNET_SDK) else {
+            return;
+        };
+        let program = std::path::PathBuf::from(resolved.command.get_program());
+        assert!(
+            program.is_file(),
+            "the resolved {TOOL} ({}) must exist on disk",
+            program.display()
+        );
+        // Only a real `dotnet` binary reports the SDK version: under the opt-in `$BENCH_TRY_NIX`
+        // fallback the resolved program is the `nix` shim, whose `--version` is not the SDK's.
+        if program.file_name().is_some_and(|name| name == TOOL) {
+            let version = tool::probe_tool_version(&program)
+                .expect("the resolved dotnet must report a version");
+            assert!(
+                version.as_slice() >= MIN_DOTNET_SDK,
+                "resolved {TOOL} {version:?} must satisfy >= {MIN_DOTNET_SDK:?}"
+            );
+        }
+        if repo().is_dir() {
+            assert_eq!(
+                Plb.probe(),
+                Probe::Ready,
+                "a present checkout + dotnet must probe ready"
+            );
+        }
+    }
+
     /// The tool needs a build stage *and* a bench stage, in that order, and both must be
     /// told the language and to stay out of docker.
     #[test]

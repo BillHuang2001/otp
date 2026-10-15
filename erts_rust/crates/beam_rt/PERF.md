@@ -15,11 +15,12 @@ that cannot produce a Rust-side figure are recorded as `skipped(<reason>)` with 
 
 ## Current startup regime (read before quoting any `startup_ms` figure)
 
-Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else the literal default `start` resolved to `<Root>/bin/start.boot` (the installation's own script, not this repo's committed `bootstrap/bin/start.boot`).
-A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 2.19 s wall** on this host.
+Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else **this runtime's own** release's committed `bootstrap/bin/start.boot` (`CodeServer::own_bootstrap_boot_script`; the literal `start` resolves to `<Root>/bin/start.boot` only when the repo bootstrap is undiscoverable, e.g. an installed deployment).
+A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 0.55 s wall** on this host (555/557/563/643 ms over 5 runs at 1-min loadavg ≈ 1.1, so absolute ms are host-dependent).
 Every `startup_ms` figure below is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band) and its ratio to the oracle is that snapshot's; those numbers do not describe the current whole-process wall.
-The present whole-process wall is dominated by that ≈ 2.19 s boot, so **no startup advantage at a recorded margin survives** — quote the ≈ 2.19 s figure for the current runtime.
-The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 2.19 s boot, so those rows measure the loop against a far larger whole-process wall than the snapshots below record.
+The present whole-process wall is **CPU-bound and carries no fixed waits**: `strace -c -f` shows **0 `clock_nanosleep`** calls and only **zero-timeout** `epoll_wait` calls (12 calls, ≈ 6 µs total), so a blocked round returns instead of sleeping and the residual ≈ 0.55 s is engine work (the oracle's own `erl -noshell -eval 'halt(0).'` boot is ≈ 0.12–0.15 s here).
+Because that wall is now this runtime's own CPU cost rather than a fixed sleep, **no startup ratio measured against the oracle was re-recorded at this HEAD** — the committed `startup` ratios belong to the dated snapshots below — so the `startup_ms` metric should be **re-recorded at the next benchmark milestone** before any current startup advantage or loss is quoted.
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 0.55 s boot, so those rows measure the loop against a far larger whole-process wall than the snapshots below record.
 
 # `BEFORE` snapshot — HEAD `3f24c5ec9d`
 
@@ -509,7 +510,7 @@ Both columns are the **min of 3** of the `rust` metric; `< 1×` means the baseli
 **Reading the tier effect.** The baseline JIT is a clear win for **`foreign`** (**0.73×–0.87×**) and
 **`gc_bound churn`** (**0.539×**), and neutral for `baseline`, `list_walk` and most `slice` cases —
 where the whole-process wall is dominated by `beam_rt` startup (this snapshot's preloaded-only slice; the
-current runtime pays the ≈ 2.19 s boot-script drive on every action, see *Current startup regime*), not
+current runtime pays the ≈ 0.55 s boot-script drive on every action, see *Current startup regime*), not
 the interpreted loop. The only real
 regressions are the **module-graph-heavy one-shot** rows, `slice`'s `string_str_length` (**1.295×**),
 `queue_from_size` (**1.217×**) and `copy_bound`'s `send_recv` (**1.456×**): the first-entry compile cost
@@ -674,7 +675,7 @@ Result — `A/B > 1` ⇒ charge ON is dearer; the variant removed `Δ = A − B`
 Which rows could show it at all:
 
 - **Process-startup-dominated — cannot show it.** `baseline` `startup_ms` (≈ 13.7 ms of process boot —
-  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 2.19 s boot-script drive,
+  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 0.55 s boot-script drive,
   see *Current startup regime*) and every `slice` row (whole-process wall for one call per OS process,
   13.9–27.4 ms), of which the interpreted work is a small fraction.
 - **Interpreted-work marginals — the rows that *can* show it.** `foreign` (per `cowboy_bstr` /
@@ -835,10 +836,10 @@ It also produced a negative result: with copy-out forced off, `perf_call`'s path
 `erts_rust/tools/differential/gate.sh` on this tree: `differential gate: total=2497 agree=2495
 mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)** at that HEAD;
 the recorded capability gap is `wire/new_fun_ext_encode` (A.5). The A.9
-`boot_extra/init_script_id_names_the_running_otp_release` case is a **live divergence**, not a recorded
-gap: `init:script_id()` answers the resolved installation script's `{"Erlang/OTP","29"}` while
-`erlang:system_info(otp_release)` answers this runtime's target `"30"`, so its `=:=` assertion is `false`
-here and `true` on the oracle. A dispatch change is
+`boot_extra/init_script_id_names_the_running_otp_release` case **agrees** on the current tree: with no
+`-boot` the default route drives this runtime's own release's script
+(`CodeServer::own_bootstrap_boot_script`), so `init:script_id()` answers `{"Erlang/OTP","30"}`,
+matching `erlang:system_info(otp_release)` (`"30"`). A dispatch change is
 behaviour-adjacent, so this is the authoritative check that no result moved.
 ## Caveats that invalidate a comparison (`DISPATCH-CUT`)
 - The three windows have different host load (22.13 / 25.72 / 2.51 1-min); only per-row ratios and
@@ -988,10 +989,9 @@ supporting API) and is **reported, not hacked around**: this node owns only the 
 `erts_rust/tools/differential/gate.sh` on the AFTER tree: `differential gate: total=2497 agree=2495
 mismatch=0 unsupported=2 skipped=0 allowed=2 unauthorized=0 stale=0` → **PASS (exit 0)**, against a
 real oracle (`erl` present on `$PATH`). The recorded capability gap is `wire/new_fun_ext_encode` (A.5);
-the A.9 `boot_extra/init_script_id_names_the_running_otp_release` case is a **live divergence**, not a
-recorded gap: `init:script_id()` answers the resolved installation script's `{"Erlang/OTP","29"}` while
-`erlang:system_info(otp_release)` answers this runtime's target `"30"`, so its `=:=` assertion is `false`
-here and `true` on the oracle.
+the A.9 `boot_extra/init_script_id_names_the_running_otp_release` case **agrees** on the current tree:
+with no `-boot` the default route drives this runtime's own release's script, so `init:script_id()`
+answers `{"Erlang/OTP","30"}`, matching `erlang:system_info(otp_release)` (`"30"`).
 A copy-out change moves terms between heaps, so this is the authoritative check that no result moved.
 
 ### Caveats that invalidate a comparison (`COPY-OUT-CUT`)

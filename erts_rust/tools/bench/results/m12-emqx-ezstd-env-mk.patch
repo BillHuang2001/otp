@@ -1,0 +1,32 @@
+# m12 — the one-line `:ezstd` NIF-makefile patch, recorded literally for reproducibility.
+#
+# This is the *only* source change the bounded m12 `emqx` enablement attempt needed to get past the
+# OTP-29 `env.mk` blocker. It is committed here as a real patch (not prose) so the fix is reproducible,
+# but the driver deliberately does NOT apply it: the patch ALONE is INSUFFICIENT — the umbrella build
+# then fails on missing host build tooling/system libraries (`automake`/`libtool`/`cmake` for `:jq`,
+# `krb5` headers for `:sasl_auth`), so the `emqx` workload keeps its honest `skipped(emqx-requires-otp-28)`.
+# Full verified ladder + each blocker's exact failing output: results/m12-emqx-enablement-attempt.md.
+#
+# Source:   emqx/ezstd, tag `v1.0.5-emqx1`, file `c_src/nif.mk`, line 19 (the `GEN_ENV ?= $(shell erl …)` line).
+#           A *fetched* git dependency (pulled into `deps/ezstd/` by `mix deps.get`), NOT part of the EMQX
+#           checkout — so it must be applied AFTER `mix deps.get` and BEFORE `mix compile`.
+# Change:   `erl -noshell -s init stop -eval`  ->  `erl -noshell -eval`  (rest of the expression byte-identical).
+# Why:      under OTP >= 29 the `-s init stop` halts the VM *before* the `-eval` runs, so the generated
+#           `env.mk` is never written and `mix compile` aborts with `No rule to make target '…/env.mk'`.
+#           Verified on this host: `erl -noshell -eval '…'` writes the file; `erl -noshell -s init stop -eval '…'`
+#           exits 0 with no output (so it writes nothing).
+# Apply:    in the EMQX umbrella root, after `mix deps.get` and before `mix compile`:
+#               patch -p1 < results/m12-emqx-ezstd-env-mk.patch      # or: git apply -p1 results/m12-emqx-ezstd-env-mk.patch
+#
+diff --git a/deps/ezstd/c_src/nif.mk b/deps/ezstd/c_src/nif.mk
+--- a/deps/ezstd/c_src/nif.mk
++++ b/deps/ezstd/c_src/nif.mk
+@@ -16,7 +16,7 @@
+ 
+ #regenerate all the time the env.mk
+ ifneq ($(wildcard $(C_SRC_DIR)),)
+-	GEN_ENV ?= $(shell erl -noshell -s init stop -eval "file:write_file(\"$(C_SRC_ENV)\", \
++	GEN_ENV ?= $(shell erl -noshell -eval "file:write_file(\"$(C_SRC_ENV)\", \
+ 		io_lib:format( \
+ 			\"ERTS_INCLUDE_DIR ?= ~s/erts-~s/include/~n\" \
+ 			\"ERL_INTERFACE_INCLUDE_DIR ?= ~s~n\" \

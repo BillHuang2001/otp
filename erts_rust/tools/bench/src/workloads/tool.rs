@@ -418,8 +418,9 @@ fn versioned_candidates(tool: &str) -> Vec<Candidate> {
 
 /// Runs `<path> --version` and parses the version it reports. `None` when the probe cannot
 /// run, exits non-zero, or prints no dotted-numeric version — so an unusable executable is
-/// never *assumed* to satisfy a requirement.
-fn probe_tool_version(path: &Path) -> Option<Vec<u64>> {
+/// never *assumed* to satisfy a requirement. Crate-visible so a workload's own test can assert
+/// that the SDK it resolved really satisfies its declared minimum.
+pub(crate) fn probe_tool_version(path: &Path) -> Option<Vec<u64>> {
     let mut cmd = Command::new(path);
     cmd.arg("--version");
     let out = proc::run(&mut cmd).ok()?;

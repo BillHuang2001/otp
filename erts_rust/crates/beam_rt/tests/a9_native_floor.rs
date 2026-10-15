@@ -51,9 +51,11 @@
 //!
 //! # The routes these values are measured on
 //!
-//! Every CLI action **but `-version`** drives `init`'s **default boot script** before its own start
-//! instruction (`cli.rs::boot_script_to_drive` + `boot_then`, mirroring `init`'s `bootfile/2` +
-//! `do_boot/3`), so a `-eval`/`-s`/`run` node now carries the booted supervision tree the oracle
+//! Every CLI action **but `-version`** drives a boot script before its own start instruction
+//! (`cli.rs::boot_script_to_drive` + `boot_then`, mirroring `init`'s `bootfile/2` + `do_boot/3`)
+//! — the explicit `-boot FILE` value when one was given, else this runtime's **own** release's
+//! committed `bootstrap/bin/start.boot` — so a `-eval`/`-s`/`run` node now carries the booted
+//! supervision tree the oracle
 //! has — a live `kernel_sup`, `application_controller`, `logger` and `file_server_2` — rather than
 //! the preloaded-only floor an earlier runtime reported. The in-process
 //! [`Runtime::with_defaults`] route the helpers below use drives **no** script (it boots the
@@ -81,18 +83,18 @@
 //!   there *is* an id: the **loaded** script's real `{Name, Vsn}` header, never a fabricated one.
 //!   The typed capability gap survives only for a runtime that drives **no** script (the plain
 //!   in-process [`Runtime::with_defaults`] route).
-//! * **`init:script_id/0`'s value is the *loaded script's* header, not this runtime's release.**
-//!   The default route resolves `init`'s `start` against the **installation's** own
-//!   `<Root>/bin/start.boot`, so the id is that file's header (OTP `"29"` on this host); the
-//!   explicit `-boot FILE` route loads the named script (the committed
-//!   `bootstrap/bin/start.boot`, OTP `"30"`). Neither test hardcodes that header: the `-boot FILE`
-//!   test reads it out of the very script the runtime loads, and the default-route test compares
-//!   against the oracle's own `init:script_id/0` — the header of the script *its* installation
-//!   resolves, which is this runtime's `<Root>` too — so a release bump cannot make either lie.
-//!   Note the second consequence: `erlang:system_info(otp_release)` is this runtime's own
-//!   **target** release (`"30"`), deliberately not what the id reports, so
-//!   `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `false` here where
-//!   the oracle's own loaded script and release agree (`true`).
+//! * **`init:script_id/0`'s value is the *loaded script's* header.** With no `-boot`, the default
+//!   route loads **this runtime's own** release's script — the committed
+//!   `bootstrap/bin/start.boot`, discovered from the binary's source tree by
+//!   `CodeServer::own_bootstrap_boot_script` — so the id is that file's `{Name, Vsn}` header
+//!   (`{"Erlang/OTP","30"}`), matching the compile-time `erlang:system_info(otp_release)` (`"30"`).
+//!   An explicit `-boot FILE` loads the named script instead. Neither test hardcodes the header:
+//!   the `-boot FILE` test reads it out of the very script the runtime loads, and the default-route
+//!   test compares against this checkout's committed bootstrap header plus the self-consistency
+//!   predicate the differential case pins. Note that this is *our* id: the oracle's own default
+//!   route loads *its* installation's script (`{"Erlang/OTP","29"}` on this host), so the two ids
+//!   are **not** compared byte-for-byte — the invariant both sides satisfy is
+//!   `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}`.
 //! * **`filelib` on an existing path.** The `#file_info{}` `access` slot is `access(2)`-derived
 //!   in the oracle and served here through `beam_io`'s `access(2)` probe, so the success path
 //!   answers the oracle's own value (`filelib:is_dir/1` ⇒ `true`) rather than a typed gap.
@@ -625,11 +627,13 @@ const SCRIPT_ID_GAP: &str = "init:script_id/0 (no boot script has been loaded)";
 /// `~p` rendering of the `{"Erlang/OTP", Vsn}` 2-tuple.
 const START_BOOT_HEADER: &str = "{\"Erlang/OTP\",\"30\"}";
 
-/// The default boot path — every CLI action but `-version` — drives `init`'s default boot script
-/// (`init.erl:1257-1258`'s `get_flag(boot, Flags, Root ++ "/bin/start")`, resolved from the literal
-/// `start` by `cli.rs::resolve_boot_file`), so `init:script_id/0` answers the **loaded** script's
-/// real `{Name, Vsn}` header: the id of the very script the runtime read and executed, never a
-/// fabricated `{"Erlang/OTP", …}` and no longer the pre-boot capability gap.
+/// The default boot path — every CLI action but `-version` — drives **this runtime's own**
+/// release's boot script: the committed `bootstrap/bin/start.boot` of the source tree the binary
+/// runs from (`cli.rs::boot_script_to_drive` via `CodeServer::own_bootstrap_boot_script`), so
+/// `init:script_id/0` answers the **loaded** script's real `{Name, Vsn}` header — the id of the
+/// very script the runtime read and executed, never a fabricated `{"Erlang/OTP", …}` and no
+/// longer the pre-boot capability gap. An explicit `-boot FILE` still wins (see
+/// [`script_id_is_the_loaded_boot_scripts_real_header`]).
 #[test]
 fn script_id_is_the_loaded_boot_scripts_header_on_the_default_boot_path() {
     // The action's own expression evaluates for its effect only (`cli.rs::drive`), so a silent
@@ -645,30 +649,30 @@ fn script_id_is_the_loaded_boot_scripts_header_on_the_default_boot_path() {
     assert!(cli.out.is_empty(), "stdout {:?}", cli.out);
     assert!(cli.err.is_empty(), "stderr {:?}", cli.err);
 
-    // The id itself, printed by the action's own expression: the default route resolves `init`'s
-    // `start` against the **installation's** own `<Root>/bin/start.boot`, so the answer is that
-    // file's `{Name, Vsn}` header — the same 2-tuple shape the oracle reports.
+    // The id itself, printed by the action's own expression: **this checkout's** committed
+    // `bootstrap/bin/start.boot` header — the script of the release this runtime *is*. (Before
+    // the default route preferred the own bootstrap it resolved `init`'s literal `start` against
+    // the *consumed* installation, so it answered that installation's header instead.)
     let cli = beam_rt_eval("io:format(\"~p\", [init:script_id()]).");
     assert_eq!(cli.code, 0, "the observable probe exits 0 (stderr {:?})", cli.err);
     let ours = cli.out.trim_end();
-    assert!(
-        ours.starts_with("{\"Erlang/OTP\",\"") && ours.ends_with("\"}"),
-        "the id is a `{{\"Erlang/OTP\", Vsn}}` header: {ours:?}"
+    assert_eq!(
+        ours, START_BOOT_HEADER,
+        "the default route reports this runtime's own release's boot-script header"
     );
-    // `// documented divergence:` the id is the *loaded script's* header, not this runtime's
-    // release. Both runtimes resolve the same `<Root>` (pinned by
-    // `init_get_argument_bindir_is_the_installations_emulator_directory`), so both read that
-    // installation's `bin/start.boot` and the two ids are byte-identical — while
-    // `erlang:system_info(otp_release)` is this runtime's own target release (`"30"`), which is
-    // deliberately *not* what the id reports here:
-    // `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `false` on this
-    // runtime (`"...","29"` vs `"...","30"`) and `true` on the oracle, whose loaded script and
-    // release agree (verified live on this host).
-    if let Some(expected) = oracle_renders("init:script_id()") {
-        assert_eq!(
-            ours, expected,
-            "both runtimes report the header of the boot script their installation loads"
-        );
+
+    // The self-consistency invariant the differential case pins: with the loaded script being
+    // this runtime's **own** release's, its header agrees with the compile-time
+    // `erlang:system_info(otp_release)` — so
+    // `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `true`, exactly
+    // as on the oracle (whose own loaded script and release agree). The oracle's *id* is its
+    // installation's, never ours, so this compares the **predicate**, not the two ids.
+    let consistent = "init:script_id() =:= {\"Erlang/OTP\", erlang:system_info(otp_release)}";
+    let cli = beam_rt_eval(&format!("io:format(\"~p\", [{consistent}])."));
+    assert_eq!(cli.code, 0, "the consistency probe exits 0 (stderr {:?})", cli.err);
+    assert_eq!(cli.out.trim_end(), "true", "`{consistent}` is true on this runtime");
+    if let Some(expected) = oracle_renders(consistent) {
+        assert_eq!(expected, "true", "the oracle's own id and release agree too");
     }
 
     // A runtime that drives **no** script has no id to report: the typed capability gap, never a

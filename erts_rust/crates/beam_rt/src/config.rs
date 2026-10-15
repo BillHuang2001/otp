@@ -749,10 +749,16 @@ impl RuntimeConfig {
     /// The boot script the CLI resolved for this invocation, or `None` when it resolved none.
     ///
     /// [`crate::cli`] records the resolved script here **before** it builds the runtime — the
-    /// explicit `-boot FILE` value when one was given, else `init`'s literal default `start` —
+    /// explicit `-boot FILE` value when one was given, else this runtime's own release's
+    /// `bootstrap/bin/start.boot` (only `init`'s literal default `start` when even that is
+    /// undiscoverable) —
     /// for every action except `-version`, which never boots (`do_boot/3`,
     /// `erts/preloaded/src/init.erl:1197-1225`). A [`RuntimeConfig`] a host built carries
     /// `None`.
+    ///
+    /// Its **only** consumer is [`drives_a_boot_script`](Self::drives_a_boot_script), an
+    /// `is_some()` predicate, so the value's *content* has no other observable effect —
+    /// `init:get_argument(boot)` reads the parsed command line, never this field.
     pub fn resolved_boot_script(&self) -> Option<&str> {
         self.resolved_boot_script.as_deref()
     }

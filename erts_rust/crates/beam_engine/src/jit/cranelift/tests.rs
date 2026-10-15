@@ -25,13 +25,22 @@ use super::*;
 use crate::jit::baseline::HALT;
 use crate::{Machine, MinimalContext};
 use beam_common::BeamError;
-use beam_loader::load_file;
+use beam_loader::{load_file, Instr};
 use beam_term::{is_small, make_small, signed_value};
 
 /// The `beam_loader` oracle fixture (reused, never copied).
 const SLICE_BEAM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../beam_loader/tests/fixtures/slice.beam"
+);
+
+/// A second oracle fixture whose functions contain a **non-tail local call** (e.g.
+/// `apply_adder/2` calls `make_adder/1` before applying the closure), so the
+/// continuation pc `call_site + 1` is exercisable — `slice.beam`'s own calls are all
+/// tail calls.
+const COVERAGE_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../beam_loader/tests/fixtures/coverage.beam"
 );
 
 /// The slice BIF hook: `erlang:'+'/2` and `erlang:'-'/2` over small integers.
@@ -146,6 +155,13 @@ fn the_compiled_function_runs_the_export_natively() {
         ctx: ctx_ptr,
         error: None,
         enter: None,
+        // No literal area is bound for this hand-built runtime block. The tier's
+        // inline set never reads an `Operand::Literal` (a `move` with a literal
+        // source is a shape the inline path declines and deopts to `jit_step_one`),
+        // so a null area is inert here — exactly as the driver's own "null means
+        // reject every access" discipline documents.
+        literals_base: std::ptr::null(),
+        literals_end: std::ptr::null(),
     };
 
     let word = code
@@ -171,4 +187,94 @@ fn inlined_moves_are_reported_as_touched_registers() {
         compiled.highest_native_register().is_some(),
         "the fixture must inline at least one move"
     );
+}
+
+/// The pcs a compiled function is expected to be natively enterable at — the
+/// independent test-side oracle for [`CompiledFunctions::is_enterable`]: the IR block
+/// starts (label positions) plus every non-tail-call continuation `call_site + 1`,
+/// each restricted to an address that holds a real instruction.
+fn expected_enter_pcs(function: &beam_loader::Function) -> std::collections::BTreeSet<u32> {
+    let mut pcs: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for &pc in function.labels.values() {
+        pcs.insert(pc as u32);
+    }
+    for (index, instr) in function.code.iter().enumerate() {
+        let stores_continuation = matches!(
+            instr,
+            Instr::Call { .. }
+                | Instr::CallExt { .. }
+                | Instr::CallFun { .. }
+                | Instr::CallFun2 { .. }
+                | Instr::Apply { .. }
+        );
+        if stores_continuation {
+            pcs.insert(index as u32 + 1);
+        }
+    }
+    pcs.retain(|&pc| (pc as usize) < function.code.len());
+    pcs
+}
+
+#[test]
+fn a_compiled_function_is_enterable_at_every_block_start_and_call_continuation() {
+    // The pc-entry contract: a compiled function may be natively entered at its entry
+    // `pc`, at every other IR block start, and at every non-tail-call continuation
+    // `call_site + 1` — but at no interior pc that no boundary names.
+    let module = load_file(COVERAGE_BEAM).expect("load coverage.beam");
+    let compiled = CraneliftJit::new()
+        .compile(&module)
+        .expect("compile coverage.beam");
+
+    let mut saw_continuation = false;
+    let mut saw_unrelated = false;
+    for (index, function) in module.functions.iter().enumerate() {
+        let Some(&entry_pc) = function.labels.get(&function.entry_label) else {
+            continue;
+        };
+        let func = index as u32;
+        // The entry `pc` is always enterable (the pre-existing behaviour).
+        assert!(
+            compiled.is_enterable(func, entry_pc as u32),
+            "the entry pc of function {func} must be enterable"
+        );
+
+        // Every non-tail local call's continuation is enterable — the capability this
+        // pc-entry dispatch adds (before it, only the entry pc was).
+        for (pc, instr) in function.code.iter().enumerate() {
+            if matches!(instr, Instr::Call { .. }) && pc + 1 < function.code.len() {
+                assert!(
+                    compiled.is_enterable(func, pc as u32 + 1),
+                    "the continuation after the call at {pc} in function {func} must be enterable"
+                );
+                saw_continuation = true;
+            }
+        }
+
+        // The enterable set is exactly the derived boundary set: an interior pc that no
+        // label or call continuation names is not enterable.
+        let expected = expected_enter_pcs(function);
+        for pc in 0..function.code.len() as u32 {
+            assert_eq!(
+                compiled.is_enterable(func, pc),
+                expected.contains(&pc),
+                "is_enterable(func={func}, pc={pc}) must match the derived boundary set"
+            );
+            if !expected.contains(&pc) {
+                saw_unrelated = true;
+            }
+        }
+    }
+
+    assert!(
+        saw_continuation,
+        "the fixture must contain a non-tail local call"
+    );
+    assert!(
+        saw_unrelated,
+        "the fixture must contain an interior pc no boundary names"
+    );
+
+    // An uncompiled function index and an out-of-range pc are never enterable.
+    assert!(!compiled.is_enterable(u32::MAX, 0));
+    assert!(!compiled.is_enterable(0, u32::MAX));
 }

@@ -68,7 +68,7 @@
 //! The two directives that involve a process — [`Instruction::KernelProcess`] and
 //! [`Instruction::Apply`] — are what make `init`'s sequence more than a list of loads, and
 //! this executor really drives the runtime's **scheduler**
-//! ([`Runtime::pump_scheduler`](crate::runtime::Runtime::pump_scheduler)) for them:
+//! ([`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot)) for them:
 //!
 //! * a `{kernelProcess, …}` spawns its process and then drives a **bounded burst** of
 //!   scheduler slices, so a long-lived kernel server (`heart`, `logger_server`,
@@ -87,12 +87,13 @@
 //!   runtime-native floor, a registered `beam_bifs` BIF — is *not* a module export and is
 //!   dispatched there instead (see [`apply_boot_call`](super::drive::apply_boot_call)).
 //!
-//! Every drive is **bounded**: a per-`pump_scheduler` slice budget between deadline checks
+//! Every drive is **bounded**: a per-`pump_scheduler_boot` slice budget between deadline checks
 //! and one wall-clock [`DRIVE_DEADLINE`](super::drive::DRIVE_DEADLINE) per [`execute`], so the
 //! boot can never hang. When
 //! the deadline expires the drive reports a typed [`error::message`] rather than waiting
 //! forever; when a blocked apply has nothing left that could wake it, the engine's own
-//! typed [`beam_engine::blocked`] is reported.
+//! typed [`beam_engine::blocked`] is reported. A drive **sleeps only on an imminent timer
+//! deadline** (within one pump slice), so a boot-armed timer a second away costs it nothing.
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -392,7 +393,18 @@ fn execute_instruction(
         Instruction::Path(directories) => {
             for directory in directories {
                 let expanded = expand_root(runtime, directory)?;
-                runtime.add_code_path(expanded);
+                // The code server keeps only **real** directories: `code:add_patha/1`
+                // answers `{error,bad_directory}` for an absent one and `strip_path/2`
+                // runs over `check_path/1`, so a dangling entry never lands on the path
+                // (verified against OTP 29.1.1 / erts-17.1). A `{path, …}` directive can
+                // name a directory the running installation does not have — the committed
+                // `bootstrap/bin/start.boot` is a *source tree*'s primary bootstrap, so its
+                // `$ROOT/lib/kernel/ebin` is unversioned and need not exist under the
+                // consumed installation's `<Root>` — and appending it would put a
+                // non-existent directory on `code:get_path/0` where the oracle has none.
+                if expanded.is_dir() {
+                    runtime.add_code_path(expanded);
+                }
             }
             Ok(())
         }

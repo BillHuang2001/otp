@@ -30,6 +30,7 @@ use crate::context::test_support::{
     compile_fixtures, find_on_path, resolve_erlc, skip_loudly,
 };
 use crate::native::test_support::remote_pid;
+use crate::runtime::GcStatsSnapshot;
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("the default runtime")
 }
@@ -535,6 +536,10 @@ fn a_memoized_hook_roster_mirrors_the_beam_bifs_predicates_field_for_field() {
             beam_bifs::needs_runtime_hooks(module, function, arity),
             "{module}:{function}/{arity} runtime-hooks arm"
         );
+        // No probe key is `erlang:fun_info/1,2` — the gate's introspection half — so the
+        // field-for-field comparison against the encoders' roster holds for this set (see
+        // `the_fun_identity_gate_selects_the_image_and_introspection_bifs` for the
+        // divergence the roster itself does not carry).
         assert_eq!(
             hooks.fun_identity,
             beam_bifs::needs_local_fun_identity(module, function, arity),
@@ -1920,22 +1925,37 @@ fn the_memory_hook_gate_selects_only_the_two_memory_bifs() {
 }
 
 #[test]
-fn the_fun_identity_gate_selects_only_the_external_image_bifs() {
-    // The `LocalFunIdentity` seam is read by exactly one `beam_bifs` code path
-    // (`binconv::encode_body`'s first statement), which `term_to_binary/1,2` reaches
-    // directly and `external_size/1,2` reaches through `plain_image_of`. Every other
-    // registered BIF must skip the `Arc` clone + `PathBuf` allocation the bridge does.
+fn the_fun_identity_gate_selects_the_image_and_introspection_bifs() {
+    // The `LocalFunIdentity` seam has two consumer families. The **encoders**: the two
+    // `beam_bifs` code paths that reach `binconv::encode_body`'s first statement —
+    // `term_to_binary/1,2` directly and `external_size/1,2` through `plain_image_of`. And
+    // the **introspection** pair `erlang:fun_info/1,2`, which reads the seam for a fun's
+    // `name`. Every other registered BIF must skip the `Arc` clone + `PathBuf` allocation
+    // the bridge does.
     for (function, arity) in [
         ("term_to_binary", 1),
         ("term_to_binary", 2),
         ("external_size", 1),
         ("external_size", 2),
+        ("fun_info", 1),
+        ("fun_info", 2),
     ] {
         assert!(
             RuntimeContext::uses_fun_identity("erlang", function, arity),
             "erlang:{function}/{arity}"
         );
     }
+    // The introspection half is *wider* than `beam_bifs`' own roster, which documents that
+    // crate's seam-readers (the two encoders) only: the gate is the beam_rt side of the
+    // seam, so a `fun_info` call still gets the bridge installed. That divergence is the
+    // contract, not a drift — the roster test below compares the gate to the roster's
+    // predicate only on the roster's own keys.
+    assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info", 1));
+    assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info", 2));
+    // The widened gate is what the dispatch memo records, so the bridge really is installed
+    // on the introspection arm (`DispatchHooks::of` reads the gate, not the roster).
+    assert!(DispatchHooks::of("erlang", "fun_info", 1).fun_identity);
+    assert!(DispatchHooks::of("erlang", "fun_info", 2).fun_identity);
     for (module, function, arity) in [
         ("erlang", "term_to_binary", 0),
         ("erlang", "term_to_binary", 3),
@@ -1944,6 +1964,14 @@ fn the_fun_identity_gate_selects_only_the_external_image_bifs() {
         ("erlang", "binary_to_term", 1),
         ("erlang", "-", 2),
         ("lists", "term_to_binary", 1),
+        // `fun_info/2` is the only arity pair the introspection half claims, and it is
+        // `erlang`'s alone. `fun_info_mfa/1` is deliberately not claimed: it rejects every
+        // non-`External` fun before reading any seam, so it never calls the accessor.
+        ("erlang", "fun_info", 0),
+        ("erlang", "fun_info", 3),
+        ("erlang", "fun_info_mfa", 1),
+        ("erts_internal", "fun_info", 1),
+        ("lists", "fun_info", 1),
     ] {
         assert!(
             !RuntimeContext::uses_fun_identity(module, function, arity),
@@ -2352,10 +2380,14 @@ fn the_rt_gates_delegate_to_the_exported_hook_predicates() {
                 roster.name
             );
         }
-        // The `beam_rt` gate answers **exactly** like the exported predicate, on its own
-        // keys and on every other roster's — the delegation is what keeps the two from
-        // drifting (`beam_bifs`' own `hook_sets` tests pin the tables themselves against
-        // each module's `register`).
+        // The `beam_rt` gate agrees with the exported predicate on every key any roster
+        // names — so a gate can neither claim a key `beam_bifs` does not route through its
+        // seam nor drop one it does (`beam_bifs`' own `hook_sets` tests pin the tables
+        // themselves against each module's `register`). A gate may still be **wider** than
+        // its roster outside this key universe: the `local-fun-identity` gate also covers
+        // `erlang:fun_info/1,2`, which the roster does not list — see
+        // `the_fun_identity_gate_selects_the_image_and_introspection_bifs`. (`fun_info/1,2`
+        // is in no roster, so the comparison below never meets it.)
         let Some(gate) = roster.gate else { continue };
         for key in &keys {
             let (module, function, arity) = *key;
@@ -3556,9 +3588,11 @@ const GC_FLOATS_BEAM: &str = concat!(
 /// root (`crate::context::gc::publish_roots_full`), so a collection over a callee that left a
 /// float register live relocates it instead of dangling it — for any module.
 ///
-/// The GC doors keep their own copy of the caller-module test (the narrow
-/// [`ExecutionContext::ensure_heap`] door cannot see the FR file), so the module is still *not*
-/// float-free — the check that makes the resolution below meaningful.
+/// The GC doors keep a caller-module float test of their own; only the **narrow**
+/// [`ExecutionContext::ensure_heap`] door still refuses on it (that door cannot see the FR
+/// file). The full doors apply none. The module is therefore still *not* float-free — the
+/// property this case needs — and its narrow-door refusal is pinned by
+/// [`the_narrow_door_still_refuses_a_float_using_call_site`].
 #[test]
 fn the_call_seam_enters_a_float_using_module_in_machine() {
     let mut rt = runtime();
@@ -5210,6 +5244,196 @@ fn a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region
     );
 }
 
+/// **The collecting allocation seam serves a forced `garbage_collect` request that a bump would
+/// have answered on its own.**
+///
+/// `erlang:garbage_collect/0,1` (`erts_internal:garbage_collect/1`) answers the oracle's `true`
+/// but performs no collection itself: it records **one** request (`Runtime::request_gc`) and the
+/// process's own root set is collected over at the sites that hold it. [`alloc_words_rooted`] is
+/// one of them, and for a process whose only allocation goes through this seam it is the *only*
+/// one — before the fix the request was carried, silently, all the way to the pass boundary,
+/// where the runner's park arm no longer had the machine to collect over.
+///
+/// The nursery is deliberately **not** filled: the bump this call would reach succeeds on its
+/// own, so a collection here can only be the forced request's. The block still comes back from
+/// the process's own young heap (the collection emptied the nursery and then served the retry),
+/// and both roots really moved.
+#[test]
+fn the_collecting_allocation_seam_serves_a_forced_request_a_bump_would_have_answered() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    assert!(
+        !rt.gc_request_pending(pid),
+        "the rig starts with no request armed; {before:?}"
+    );
+    rt.request_gc(pid);
+    let block = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(4, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("a rooted allocation")
+    };
+    let after = rt.gc_stats();
+
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the forced request really ran a collection, though the young bump would have succeeded; \
+         {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "{after:?}");
+    assert!(
+        !rt.gc_request_pending(pid),
+        "the committed collection consumed the forced request; {after:?}"
+    );
+    assert_eq!(
+        after.fallbacks, before.fallbacks,
+        "the collection emptied the nursery, so the retry was served from the young heap (no arena \
+         fallback); {after:?}"
+    );
+    assert!(!block.is_null(), "a block was really handed out");
+    assert!(
+        table
+            .get(pid)
+            .expect("the process is still in the table")
+            .collector()
+            .young_contains(block as *const Eterm),
+        "the retried block is served from the process's own young nursery — an arena block would \
+         fail this region check"
+    );
+
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (beyond the `live` hint)");
+    assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
+}
+
+/// **The forced request is consumed EXACTLY once: a second allocation on the same rig does not
+/// collect.**
+///
+/// The first call answered the pending `garbage_collect`, so the second must take the ordinary
+/// path — the nursery's bump, which the now-empty nursery can serve — and leave `collections`
+/// alone. A seam that peeked the request without consuming it (or re-armed it) would collect on
+/// every allocation while the flag stayed set, the opposite failure of the one the fix closes.
+#[test]
+fn the_collecting_allocation_seam_consumes_the_forced_request_exactly_once() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(4, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the first rooted allocation");
+    }
+    let after_first = rt.gc_stats();
+    assert_eq!(
+        after_first.collections,
+        before.collections + 1,
+        "the first call served the forced request; {after_first:?}"
+    );
+
+    // The same rig, a second call: the request is spent, so this is an ordinary young-heap bump.
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(4, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the second rooted allocation");
+    }
+    let after_second = rt.gc_stats();
+    assert_eq!(
+        after_second.collections, after_first.collections,
+        "the request was already spent, so the second call takes the ordinary young-heap bump and \
+         does not collect; {after_second:?}"
+    );
+    assert_eq!(
+        after_second.fallbacks, after_first.fallbacks,
+        "the second call is a plain bump, so it takes no arena fallback either; {after_second:?}"
+    );
+}
+
+/// **A forced request the valve DECLINES stays armed for the runner's park arm.**
+///
+/// The collecting allocation seam is exactly the site the runner's park arm falls back on, so a
+/// request refused here — an unscanned root would make the move unsound — must NOT be consumed:
+/// the park arm serves it later, where the machine's root set is provably at rest. The nursery is
+/// filled with unreachable tuples so the ordinary (non-forced) refusal path is exercised too, but
+/// here the request **bypasses** the bump and it is the valve that declines.
+#[test]
+fn the_collecting_allocation_seam_leaves_a_declined_forced_request_armed() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (foreign, _child) = foreign_root_aliasing_a_young_child(&mut rt, &mut table, pid);
+
+    // Fill the nursery with unreachable tuples so a 16-word bump cannot be served — the shape the
+    // ordinary refusal takes, so the case would exercise the same decline without the request.
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+    }
+
+    let mut x = [foreign, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        let block = ctx
+            .alloc_words_rooted(16, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the declined collection falls back to the arena, which never errors");
+        assert!(!block.is_null(), "a block was really handed out");
+    }
+    let after = rt.gc_stats();
+
+    assert_eq!(
+        after.collections, before.collections,
+        "the valve must decline the forced collection while a live root is a container in a \
+         region the collector does not scan; {after:?}"
+    );
+    assert_eq!(
+        after.fallbacks,
+        before.fallbacks + 1,
+        "the declined collection takes the pointer-stable arena fallback; {after:?}"
+    );
+    assert!(
+        rt.gc_request_pending(pid),
+        "a declined forced request must stay armed: the runner's park arm is where it can still be \
+         served, and consuming it here would silently drop the caller's `garbage_collect`"
+    );
+    assert_eq!(
+        x[0], foreign,
+        "the arena fallback moved nothing, so the unscanned root is unchanged"
+    );
+    let head = terms::cons_head(x[0]).expect("the root is still the cons cell");
+    assert_eq!(
+        terms::tuple_element(head, 0).expect("in range"),
+        make_small(7),
+        "the aliased young child is still intact"
+    );
+}
+
 /// The nested blocking pump ([`super::pump_until_returned`], the engine of
 /// [`RuntimeContext::run_export_blocking`]/[`run_label_blocking`]) must not spin without end
 /// when a process stays **runnable forever**: its `ran == 0` exit never triggers, so only the
@@ -5878,4 +6102,627 @@ fn a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected() {
             );
         }
     }
+}
+
+/// **The full door collects over a float-using call site.** The full door publishes the
+/// machine's **whole FR file** ([`super::gc::publish_roots_full`]), so a live float register is
+/// relocated like any x register or stack word and the caller-module float guard would only be
+/// a redundant conservative extra: the door applies **no** float guard at all. A float-using
+/// call site therefore collects exactly like a float-free one, and the FR-only root comes back
+/// relocated.
+#[test]
+fn the_full_door_collects_over_a_float_using_call_site() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    assert!(
+        !rt.module_is_float_free(
+            "gc_floats",
+            &rt.code_server()
+                .module_handle("gc_floats")
+                .expect("cached under its own name")
+        ),
+        "the fixture really is float-using, so the test would be vacuous otherwise"
+    );
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some("gc_floats".to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "a float-using call site is collected over at the full door; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "the scatter completed; {after:?}");
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (float-using call site)");
+    assert_relocated_tuple(
+        fr[0],
+        fr_only,
+        [9, 10],
+        "fr[0] — the FR word the full door publishes",
+    );
+}
+
+/// **A run with no caller module is still refused at the full door.** A fun entry and the
+/// `-eval` evaluator have no `current_module`; the door has no machine to name, so it leaves
+/// the heap alone rather than guessing. Nothing about the float guard is involved: this refusal
+/// survives the guard's removal.
+#[test]
+fn the_full_door_still_refuses_a_run_with_no_caller_module() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let mut x = [NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        assert!(ctx.current_module.is_none(), "no caller module is set");
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections,
+        "an unnamed call site is never collected over"
+    );
+}
+
+/// **The narrow door still refuses a float-using call site — and collects over a float-free
+/// one.**
+///
+/// The narrow [`ExecutionContext::ensure_heap`] door receives only an x prefix and the stack,
+/// so it can never see the machine's FR file: the caller-module float guard is load-bearing
+/// there and must survive the full doors' removal of it. The second half drives the **same**
+/// door with the same (still-armed) forced request and a float-free call site, so the refusal
+/// above is about the float guard and not about the door being inert.
+#[test]
+fn the_narrow_door_still_refuses_a_float_using_call_site() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    let mut x = [NIL, NIL];
+    let mut stack = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some("gc_floats".to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap(0, 1, &mut x, &mut stack)
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections,
+        "the narrow door must not collect over a float-using call site"
+    );
+    assert!(
+        rt.gc_request_pending(pid),
+        "the refused forced request stays armed for the runner's park arm"
+    );
+
+    // The same door, the same armed request, a float-free call site: it collects.
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap(0, 1, &mut x, &mut stack)
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections + 1,
+        "the narrow door does collect over a float-free call site"
+    );
+}
+
+/// **The collection debt forces the collection the occupancy test would not.**
+///
+/// [`Process::grow_nursery`] is the no-relocation growth seam: it retires the young space it
+/// replaces instead of freeing it, so the nursery becomes a chain only a collection can
+/// evacuate. With `heap_need = 0` the occupancy test can never fire on a fresh nursery
+/// (`available_words() < 0` is false), so without the debt term the door would return and the
+/// chain would grow for as long as the load keeps enlarging it. The case drives the full door
+/// with `heap_need = 0` on a process whose nursery really carries a retired space.
+#[test]
+fn the_collection_debt_forces_a_collection_the_occupancy_test_would_not() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let mut x = [NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    // The door with no debt: an occupancy test of zero words is never a trigger, and no
+    // request is pending, so this is a no-op.
+    let before = rt.gc_stats();
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    assert_eq!(
+        rt.gc_stats().collections,
+        before.collections,
+        "an empty nursery with no debt is not collected over"
+    );
+    assert!(
+        !table.get(pid).expect("the process").should_collect(0),
+        "the occupancy test alone says there is room, so the debt term is what decides"
+    );
+
+    // Create the debt through the real growth seam, then re-drive the same door with the same
+    // zero-word request. The request must exceed the current space, or `grow_nursery` is a
+    // no-op by construction.
+    let over = table
+        .get(pid)
+        .expect("the process")
+        .collector()
+        .young()
+        .capacity_words()
+        + 64;
+    table
+        .get_mut(pid)
+        .expect("the process")
+        .grow_nursery(over)
+        .expect("the nursery grows");
+    assert!(
+        table.get(pid).expect("the process").collection_debt(),
+        "the growth retired a space, which is the debt"
+    );
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the retired-space chain forces the collection; {after:?}"
+    );
+    assert!(
+        !table.get(pid).expect("the process").collection_debt(),
+        "the collection collapsed the chain and settled the debt"
+    );
+}
+
+/// The Erlang source of the `ets_copy` **allocate-and-abandon** loop the A/B/C fixtures share,
+/// mirroring `tools/bench/src/workloads/copy_bound.rs`'s `ets_copy` case (`payload/0` +
+/// `ets:insert/2` + `ets:lookup/2`, one table and one key per process so the table never
+/// grows).
+///
+/// The bound-variable pattern `[{k, T}]` is a real equality test — a corrupted copy raises —
+/// and each validated round-trip adds 1, so `run(N)` returns exactly `N` on both runtimes.
+/// `value_expr` is the payload's `b` value and `extra_key` an optional additional map entry:
+/// they are the **only** differences between the three fixtures, so a divergence in GC
+/// behaviour can only come from the term the payload holds.
+fn gc_ab_module(module: &str, value_expr: &str, extra_key: &str) -> String {
+    format!(
+        r#"-module({module}).
+-export([run/1]).
+
+payload(X) ->
+    #{{a => [1,2,3,4,5,6,7,8,9,10],
+      b => {{ok, <<"hello world">>, {value_expr}}},
+      c => <<1,2,3,4,5,6,7,8,9,10,11,12>>,
+      d => "a char list",
+      e => -42{extra_key}}}.
+
+run(N) ->
+    Tab = ets:new({module}, [set, public]),
+    R = run(N, Tab, 0),
+    ets:delete(Tab),
+    R.
+
+run(0, _Tab, Acc) -> Acc;
+run(N, Tab, Acc) ->
+    T = payload(N),
+    true = ets:insert(Tab, {{k, T}}),
+    case ets:lookup(Tab, k) of
+        [{{k, T}}] -> run(N - 1, Tab, Acc + 1)
+    end.
+"#
+    )
+}
+
+/// One fixture run at one loop count: the loop's value and the runtime's GC counters
+/// afterwards.
+struct GcAbRun {
+    /// The value the loop returned.
+    value: Eterm,
+    /// The runtime's GC counters at the end of the run.
+    stats: GcStatsSnapshot,
+}
+
+/// Runs `<path>:<function>/1` at `n` on a **fresh** runtime through the scheduled route
+/// ([`Runtime::with_defaults`] + [`Runtime::run_scheduled`], the same shape as
+/// `tests/rss_bound.rs::the_churn_loop_really_collects`) and returns the value plus the GC
+/// counters, so a run's `collections`/`pinned` can be compared across loop counts.
+fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    let value = rt
+        .run_scheduled(path, function, 1, &[make_small(n)])
+        .expect("the loop runs to completion on the scheduled path");
+    GcAbRun {
+        value,
+        stats: rt.gc_stats(),
+    }
+}
+
+/// **The residual blocker for a float-using long loop is the runner's permanent post-slice
+/// float pin** (`src/runner/run.rs`): a slice that ends with a live FR slot calls
+/// `Runtime::pin_process(pid)` and `Runtime::gc_process_enabled` then refuses **every** later
+/// collection for that pid, so a long loop collects only inside its first slice and its
+/// nursery keeps every space it ever allocated.
+///
+/// This case is the **deterministic** half of the A/B experiment (no RSS involved): the same
+/// three `ets_copy` allocate-and-abandon loops, differing only in the payload's `b` value, are
+/// driven at two loop counts ~8x apart on the scheduled route and their
+/// [`Runtime::gc_stats`] counters compared.
+///
+/// * `gcab_free` — float-free (`X`).
+/// * `gcab_lit`  — the objective's intended "float-using" twin: `gcab_free` verbatim **plus a
+///   single `3.5` float literal** in the payload. It is **not** float-using in the IR: the
+///   compiler folds a data-structure float literal into the **literal area**
+///   (`{move,{literal,#{...3.5...}},{x,0}}`), so the module contains no float-family
+///   instruction, never writes the FR file, and is never pinned. Its row is the empirical
+///   refutation of "any module with a float literal writes FR slot 0".
+/// * `gcab_flt`  — genuinely float-using: the payload computes `float(X) * 3.5`, so the module
+///   contains `fconv`/`fmul` instructions and every slice ends with `fr_mark() > 0`.
+///
+/// The float-free loops' `collections` therefore **scale with N** and their `pinned` is 0,
+/// while the float-using loop's `collections` **plateaus** — its ~8x larger run adds no
+/// collection at all — with `pinned >= 1`. That plateau is exactly why a float-using
+/// allocation loop retains every replaced heap space and its peak RSS grows with N.
+///
+/// A missing `erlc` is a **loud skip**, never a silent pass; the fixtures are compiled from
+/// these in-file sources into `$TMPDIR` (nothing is committed under `tests/fixtures/`).
+#[test]
+fn the_post_slice_float_pin_plateaus_a_float_using_loops_collections() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly("gc-ab", "erlc was not found beside $ERTS_ORACLE or on $PATH");
+        return;
+    };
+    let src_a = gc_ab_module("gcab_free", "X", "");
+    let src_b = gc_ab_module("gcab_lit", "X", ",\n      f => 3.5");
+    let src_c = gc_ab_module("gcab_flt", "float(X) * 3.5", "");
+    let dir = compile_fixtures(
+        &erlc,
+        "gc_ab",
+        &[
+            ("gcab_free", src_a.as_str()),
+            ("gcab_lit", src_b.as_str()),
+            ("gcab_flt", src_c.as_str()),
+        ],
+    );
+
+    // ~8x apart: a float-free loop's collection count scales over the step; a pinned one's
+    // cannot move at all, so the two counts are the same measurement twice.
+    const SMALL: i64 = 5_000;
+    const LARGE: i64 = 40_000;
+
+    let mut rows: Vec<(&str, GcAbRun, GcAbRun)> = Vec::new();
+    for module in ["gcab_free", "gcab_lit", "gcab_flt"] {
+        let path = dir.join(&format!("{module}.beam"));
+        let small = gc_ab_run(&path, "run", SMALL);
+        let large = gc_ab_run(&path, "run", LARGE);
+        assert!(
+            is_small(small.value) && is_small(large.value),
+            "{module}: run/1 returns a small integer"
+        );
+        eprintln!(
+            "gc-ab {module}: N={SMALL} -> value {} collections {} major {} pinned {} \
+             fallbacks {} | N={LARGE} -> value {} collections {} major {} pinned {} fallbacks {}",
+            signed_value(small.value),
+            small.stats.collections,
+            small.stats.major,
+            small.stats.pinned,
+            small.stats.fallbacks,
+            signed_value(large.value),
+            large.stats.collections,
+            large.stats.major,
+            large.stats.pinned,
+            large.stats.fallbacks,
+        );
+        rows.push((module, small, large));
+    }
+    let row = |name: &str| -> &(&str, GcAbRun, GcAbRun) {
+        rows.iter()
+            .find(|(module, _, _)| *module == name)
+            .unwrap_or_else(|| panic!("the {name} row was measured"))
+    };
+    let (_, a_small, a_large) = row("gcab_free");
+    let (_, b_small, b_large) = row("gcab_lit");
+    let (_, c_small, c_large) = row("gcab_flt");
+
+    // Determinism first: a run cannot have silently done less work (which would make every
+    // comparison below meaningless).
+    for (module, small, large) in &rows {
+        assert_eq!(
+            signed_value(small.value),
+            SMALL,
+            "{module}: run({SMALL}) == {SMALL}"
+        );
+        assert_eq!(
+            signed_value(large.value),
+            LARGE,
+            "{module}: run({LARGE}) == {LARGE}"
+        );
+    }
+
+    // A — float-free: never pinned, and its collections SCALE with the loop count.
+    assert_eq!(
+        a_small.stats.pinned, 0,
+        "a float-free module's slice never ends with a live FR slot; {:?}",
+        a_small.stats
+    );
+    assert!(
+        a_large.stats.collections > a_small.stats.collections * 4,
+        "the float-free loop's collections must scale with N ({SMALL} -> {}, {LARGE} -> {})",
+        a_small.stats.collections,
+        a_large.stats.collections
+    );
+
+    // B — the literal-only payload: float-FREE in the IR, so it behaves exactly like A. This
+    // is the empirical refutation of the "a float literal writes FR slot 0" premise.
+    assert_eq!(
+        b_small.stats.pinned, 0,
+        "a payload float LITERAL folds into the literal area — the module is float-free, so \
+         it is never pinned; {:?}",
+        b_small.stats
+    );
+    assert!(
+        b_large.stats.collections > b_small.stats.collections * 4,
+        "the literal-float loop is float-free and collects across its whole run \
+         ({SMALL} -> {}, {LARGE} -> {})",
+        b_small.stats.collections,
+        b_large.stats.collections
+    );
+
+    // C — genuinely float-using: PINNED after its first slice, so its collections PLATEAU.
+    assert!(
+        c_small.stats.pinned >= 1,
+        "the post-slice float-register scan must pin a float-using pid; {:?}",
+        c_small.stats
+    );
+    assert_eq!(
+        c_large.stats.collections, c_small.stats.collections,
+        "a pinned pid is refused every collection, so its collections are exactly the first \
+         slice's and cannot scale with N ({SMALL} -> {}, {LARGE} -> {}); {:?}",
+        c_small.stats.collections,
+        c_large.stats.collections,
+        c_large.stats
+    );
+    assert!(
+        a_large.stats.collections > c_large.stats.collections,
+        "at the large N the float-free loop must have collected more times than the pinned \
+         float-using one (float-free {}, float-using {})",
+        a_large.stats.collections,
+        c_large.stats.collections
+    );
+
+    // The committed float-arithmetic fixture (`tests/fixtures/gc_floats.beam`, `l1/1`
+    // accumulates `math:sqrt(float(N))` in one double) is the **plateau** control: its
+    // collections must be non-zero (its first slice really collected) and then *identical* at
+    // the ~8x larger N, because the pin refuses every later slice. That is the shape the
+    // benchmark's `gc_floats`/`churn` RSS readings could not improve on.
+    let f_small = gc_ab_run(std::path::Path::new(GC_FLOATS_BEAM), "l1", SMALL);
+    let f_large = gc_ab_run(std::path::Path::new(GC_FLOATS_BEAM), "l1", LARGE);
+    eprintln!(
+        "gc-ab gc_floats:l1/1: N={SMALL} -> collections {} pinned {} | N={LARGE} -> \
+         collections {} pinned {}",
+        f_small.stats.collections,
+        f_small.stats.pinned,
+        f_large.stats.collections,
+        f_large.stats.pinned
+    );
+    assert!(
+        f_small.stats.pinned >= 1 && f_large.stats.pinned >= 1,
+        "the float-arithmetic fixture pins its pid on both runs"
+    );
+    assert_eq!(
+        f_large.stats.collections, f_small.stats.collections,
+        "a pinned pid's collections plateau: the first slice's count and nothing more \
+         ({SMALL} -> {}, {LARGE} -> {})",
+        f_small.stats.collections,
+        f_large.stats.collections
+    );
+}
+
+/// **A live float term in the FR file is a SCANNED root, so this node's unscanned-root valve
+/// does not decline it — a float module's zero-collection plateau is the runner's *pin*.**
+///
+/// The engine materialises an FR slot's float through
+/// [`beam_engine::terms::make_float`]/`make_float_rooted`, which allocates on the **executing
+/// process's own young heap** (this engine's FR model holds *terms*, not raw doubles), so the
+/// word the full door publishes from `fr[0]` is classified as a scanned root by
+/// [`root_is_unscanned`](super::gc::root_is_unscanned). The valve is therefore **not** what
+/// stops a float-using loop from collecting — the runner's permanent post-slice pin is checked
+/// *first* in both doors (`Runtime::gc_process_enabled`) and refuses the pid outright. This
+/// case proves the valve half directly, so the two independent mechanisms cannot be confused.
+#[test]
+fn a_live_float_term_in_fr_is_a_scanned_root() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    assert!(
+        !rt.module_is_float_free(
+            "gc_floats",
+            &rt.code_server()
+                .module_handle("gc_floats")
+                .expect("cached under its own name")
+        ),
+        "the fixture really is float-using, so the case would be vacuous otherwise"
+    );
+
+    // Build the float on the process's OWN young heap, exactly as the engine's FR writers do.
+    let float = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        beam_engine::terms::make_float(&mut ctx, 3.5).expect("the float term is built")
+    };
+    assert_eq!(
+        beam_engine::terms::float_value(float).expect("a boxed float term"),
+        3.5
+    );
+    assert!(
+        !super::gc::root_is_unscanned(table.get(pid).expect("the process"), float),
+        "an FR float lives on the process's own heap, so it is a scanned root — never a \
+         foreign container the valve would decline"
+    );
+
+    // And the full door really collects with it published from `fr[0]`.
+    let mut x = [make_small(0), NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [float];
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some("gc_floats".to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "a float-using call site with a live FR float is collected over at the full door; \
+         {after:?}"
+    );
+    assert_ne!(fr[0], float, "the collection relocated the FR float");
+    assert_eq!(
+        beam_engine::terms::float_value(fr[0]).expect("still a boxed float term"),
+        3.5,
+        "the relocated FR float is intact"
+    );
+}
+
+/// The **constant-payload** twin of [`gc_ab_module`]: the `copy_bound/ets_copy` shape exactly
+/// as `tools/bench/src/workloads/copy_bound.rs` writes it — `payload/0` takes **no** argument, so
+/// the compiler folds it into the module's **literal area** and the loop's `test_heap` call site
+/// finds that literal live in `x(0)`.
+///
+/// `gc_ab_module`'s `payload(N)/1` cannot fold (the payload holds the loop counter), so the two
+/// fixtures are the discriminating pair: **the only difference between them is whether the term
+/// the loop leaves live in a register is a literal-area pointer or a young-heap one**.
+fn gc_ab_const_module(module: &str) -> String {
+    format!(
+        r#"-module({module}).
+-export([run/1]).
+payload() ->
+    #{{a => [1,2,3,4,5,6,7,8,9,10],
+      b => {{ok, <<"hello world">>, 3.5}},
+      c => <<1,2,3,4,5,6,7,8,9,10,11,12>>,
+      d => "a char list",
+      e => -42}}.
+run(N) ->
+    Tab = ets:new({module}, [set, public]),
+    R = run(N, Tab, 0),
+    ets:delete(Tab),
+    R.
+run(0, _Tab, Acc) -> Acc;
+run(N, Tab, Acc) ->
+    T = payload(),
+    true = ets:insert(Tab, {{k, T}}),
+    case ets:lookup(Tab, k) of
+        [{{k, T}}] -> run(N - 1, Tab, Acc + 1)
+    end.
+"#
+    )
+}
+/// **The deciding gate for `copy_bound/ets_copy`: an untagged literal-area pointer in a root
+/// declines every collection.**
+///
+/// KNOWN GAP — ESCALATED, NOT A FIX. This test asserts the **current, declined** behaviour so
+/// the gap is visible and cannot silently get worse; when the escalation lands the `const`
+/// assertions below must be **flipped** (see the crate report / the escalation note).
+///
+/// The chain, proven by instrumentation of [`ensure_heap_full`] (see the escalation note):
+///
+/// 1. [`beam_loader`]'s `LiteralArea::decode` lowers the `LitT` chunk into a private immutable
+///    heap and **never calls `beam_term::literal::set_literal_tag`** — the C step
+///    `erts_set_literal_tag` (`erts/emulator/beam/erl_term.c`) that ORs `TAG_LITERAL_PTR` into
+///    every boxed/list literal word. So a literal handed to the engine carries the literal bit
+///    **clear**.
+/// 2. [`super::gc::root_is_unscanned`] classifies a word by the C's own
+///    `erts_is_literal` rule (a bare bit test), so an untagged literal-area map is read as a
+///    **container in a region the collector does not scan** — which is exactly what the valve
+///    must decline.
+/// 3. The loop's `test_heap,3,1`/`test_heap,5,1` therefore declines on **every** iteration
+///    (the payload literal is in `x(0)`), while the only allocation that *creates* retention —
+///    the registered-BIF copy-out's no-relocation `Process::grow_nursery` — keeps retiring a
+///    whole nursery space, so the retired chain grows by 94 words/iteration and nothing ever
+///    collapses it.
+///
+/// The heap-built twin (`payload(N)/1`) has no literal in a register, so its valve passes, its
+/// collection-debt term fires and its `collections` scale with `N`. **The two fixtures differ in
+/// exactly that one way**, so this test is the discriminating pair the escalation rests on.
+///
+/// Instrumented proof of the gate: `PROBE VALVE-DECLINE pid=ProcessId { number: 2, serial: 0 }
+/// x[0]=Eterm(127376308180258) raw=0x73d91b9a1522 lit=false heap=[0x73d91b9a5ae8,0x73d91b9a6450)
+/// in_literal_of="gcab_lit"(true)` — the blocking root is a pointer inside the running module's
+/// own literal area with the literal bit clear, and sweeping every loaded module's literal heap
+/// showed it is inside exactly one of them.
+#[test]
+fn an_untagged_literal_root_declines_the_collection_until_the_loader_tags_literals() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly("gc-literal-root", "erlc was not found beside $ERTS_ORACLE or on $PATH");
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "gc_literal_root",
+        &[
+            ("gclit", &gc_ab_const_module("gclit")),
+            ("gcab_free", &gc_ab_module("gcab_free", "X", "")),
+        ],
+    );
+    // The discriminating pair, at a small and a large loop count.
+    let lit_small = gc_ab_run(&dir.join("gclit.beam"), "run", 1_000);
+    let lit_large = gc_ab_run(&dir.join("gclit.beam"), "run", 40_000);
+    let heap_small = gc_ab_run(&dir.join("gcab_free.beam"), "run", 1_000);
+    let heap_large = gc_ab_run(&dir.join("gcab_free.beam"), "run", 40_000);
+    // Both loops compute the same answer; neither is corrupted — this is a *retention* gap,
+    // never a wrong result.
+    assert_eq!(signed_value(lit_small.value), 1_000);
+    assert_eq!(signed_value(lit_large.value), 40_000);
+    assert_eq!(signed_value(heap_large.value), 40_000);
+    // The control: a heap-built payload leaves no unscanned root, so the debt term fires and
+    // the collections really scale.
+    assert_eq!(heap_small.stats.pinned, 0);
+    assert!(
+        heap_large.stats.collections > heap_small.stats.collections * 4,
+        "the heap-payload twin must collect: small={} large={}",
+        heap_small.stats.collections,
+        heap_large.stats.collections
+    );
+    // The gate. (`valve_trips` stays 0 and `fallbacks` stays 0: a decline on the full-root door
+    // records `foreign_reachable`, never a fallback — which is why `collections` alone is the
+    // discriminator.)
+    assert_eq!(
+        lit_large.stats.pinned, 0,
+        "not the post-slice float pin: the constant-payload loop is float-free",
+    );
+    assert_eq!(lit_large.stats.fallbacks, 0);
+    assert_eq!(lit_large.stats.collections, 0, "KNOWN GAP: flip this once beam_loader sets TAG_LITERAL_PTR on decoded literals (the constant-payload loop never collects, because its live literal root is untagged)");
 }
