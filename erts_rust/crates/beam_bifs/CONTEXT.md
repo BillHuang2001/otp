@@ -111,7 +111,12 @@ inspection**: `lists` raises the bare `error:function_clause` for a non-fun or w
   fabricated hash. `[local,compressed]` deflates the *local body* (wrapper included), as `erts_term_to_binary_simple`
   does; `[deterministic,local]`/unknown ⇒ `badarg`; `/3` does not exist (oracle `undef`). `binary_to_term/2` takes
   `safe`/`used` (the count includes the `131` byte); on a top-level `COMPRESSED` image `[used]` is the compressed
-  image's own length (trailing bytes ignored *and* uncounted).
+  image's own length (trailing bytes ignored *and* uncounted). `[safe]` is the **codec's** flag, fed in as
+  `DecodeOptions{ safe, local_node, local_hash: None }` through `decode_term_with_options_used`: a wire atom **name**
+  not already interned is `badarg` raised by the codec **before** any interning (C `erts_atom_get`), so nothing
+  reaches the receiver's atom table; the flag-free path is unchanged and still commits the names the decoder appends
+  via `AtomInterner`. The one remaining `[safe]` half is the C's `EXPORT_EXT` **active-export** check
+  (`external.c:5032-5036`), which stays in `beam_rt` (it owns the code server's loaded-module registry).
 - **The local-node identity is installed on BOTH directions** (`LocalNode`; `(nonode@nohost, 0)` fallback): encoding
   yields a byte-exact `NEW_PID_EXT`/`V4_PORT_EXT`/`NEWER_REFERENCE_EXT`, and decoding demotes such a wire id to the
   INTERNAL form when it fits the M1 slot, so `binary_to_term(term_to_binary(self())) =:= self()` and the `make_ref()`
