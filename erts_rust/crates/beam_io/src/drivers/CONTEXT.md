@@ -115,6 +115,7 @@ through a real `DriverContext`, plus a hard-coded matrix of the exact reply byte
 through a raw `open_port({spawn,"ram_file_drv"},[binary])` and compares **77 replies byte-for-byte**,
 the other pins the high-level `ram_file:*` API shapes (`get_size`/`get_file`/`position`/`read`/
 `pread`/`pwrite`/`truncate`/`sync`/`datasync`/`advise`/`allocate`/`ipread_s32bu_p32bu`/`close`).
+The crate-level integration suites for this node are the sibling `../../tests/` ones: `inet.rs` (8), `udp_inet.rs` (5) and `ram_file.rs` (12).
 
 ## Routing Table
 - `fd.rs` → `FdDriver` + `set_nonblocking` (the shared non-blocking wrapper)
