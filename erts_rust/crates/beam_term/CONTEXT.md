@@ -237,7 +237,7 @@ Public surface: `RECORD_INST_FIXED_WORDS = 2` / `RECORD_DEF_FIXED_WORDS = 6` / `
 - `src/size.rs` → `size_object` + bounded, cycle-safe `size_object_bounded`
 - `src/layout.rs` → `object_words` + `for_each_sizing_child_slot`/`for_each_child_slot` (the single layout source of truth)
 - `src/thing.rs` → heap-agnostic float/bignum/flatmap/external-pid/port/ref blocks (the codec forwards here)
-- `src/fun.rs` → the on-heap fun/export layout (`FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_words`/`fun_block_words`, `write_fun_{local,external,imported}`, the `fun_*` accessors)
+- `src/fun.rs` → the on-heap fun/export layout (`FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_words`/`fun_block_words`, `write_fun_{local,external,imported}`, the `fun_*` accessors) — a `Local` fun's `NEW_FUN_EXT` `old_index`/`old_uniq` are **not in the term** (its descriptor is `[uniq:u64][index:u32]` by the frozen C layout); the `beam_bifs::LocalFunIdentity` / `beam_codec::FunIdentity` seam supplies them from the defining module's `FunT` table (descriptor position ⇒ `old_index`, entry `uniq` ⇒ `old_uniq`), and the residual gap is a fun whose defining module cannot supply them (the `-eval` `erl_eval` template closure)
 - `src/map.rs` → the Erlang map (flat-map/HAMT builder `write_map`, readers/lookups, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity`)
 - `src/record.rs` → native records (size fns, `write_record`, the `record_*`/`record_definition_*` readers)
 - `src/number.rs` → `big_to_f64` + `number_as_f64`
