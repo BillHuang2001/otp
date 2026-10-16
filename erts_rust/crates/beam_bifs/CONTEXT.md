@@ -158,6 +158,9 @@ inspection**: `lists` raises the bare `error:function_clause` for a non-fun or w
   qualify); several probes need a **compiled module** (`erlc` on a fixture) — e.g. `erts_debug:flat_size/1` and
   `lists:sort/2`'s degenerate comparator. Most "matches the oracle" unit tests are pinned-golden self-checks; the
   integration files that shell out to system `erl` are **fail-loud**.
+- **The recorded `erlang:list_to_existing_atom/1` divergence is NOT this crate's** — `../../tools/differential/divergences.md` attributes it here, but `list_to_existing_atom_1` is a pure `BifContext::atom` lookup that never interns.
+  On the `-eval` route the queried name (e.g. `"hello"`) is already in the runtime's ONE shared `AtomTable` because `beam_rt` eagerly loads every `{primLoad,…}` name of `bootstrap/bin/start.boot` (202 vs the oracle's 87) and a loaded module's `Atoms` chunk is interned (`../beam_rt/src/codeserver.rs`, `../beam_rt/src/boot/bootscript.rs`); the oracle behaves identically once `code:ensure_loaded(auth)` interns `hello`.
+  Owner: `beam_rt` (recorded in `../beam_rt/src/boot/CONTEXT.md`); the divergence list's attribution is owed a correction by the corpus owner.
 - **CI:** `.github/workflows/erts_rust.yml` (path-triggered on `erts_rust/**`) builds the workspace (`--all-targets`),
   runs `cargo test --workspace --no-fail-fast`, a non-blocking clippy, and the differential gate
   `../../tools/differential/gate.sh` against an installed Erlang/OTP oracle. A `build --workspace` must stay warning-free.
