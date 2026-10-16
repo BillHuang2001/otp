@@ -204,8 +204,8 @@
 //!   (honouring it needs per-process storage in `beam_process::Process` — outside this crate),
 //!   so such a process reports `on_heap` where the oracle would report `off_heap`.
 //! * `registered_name` is the truth of the **queried** process: the name is looked up by the pid
-//!   argument (see [`RuntimeContext::snapshot`]), so asking about another process reports that
-//!   process's name while the caller's own item keeps its own.
+//!   argument, never by the caller, so asking about another process reports that process's name
+//!   while the caller's own item keeps its own.
 //!   The `-eval`/`-s`/`-run` action routes therefore answer `{registered_name,init}` for the
 //!   caller's own `process_info(self(), registered_name)` where the oracle answers `[]`, because
 //!   `beam_rt` runs those actions in its root process — which is registered as `init` — while the
