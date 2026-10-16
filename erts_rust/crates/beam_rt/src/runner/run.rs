@@ -484,29 +484,37 @@ impl ProcessRunner for RuntimeRunner<'_> {
             //
             // The narrow predicate, **not** `resolve_external_call`: that seam's `Ok(None)` is
             // overloaded (it is equally its answer for a module it cannot load, a function atom
-            // the callee's table lacks, and an export the callee does not have), and a
-            // `ProcessEntry::Export` names a module whose `Arc<Module>` the caller already
-            // holds. Reading that `Ok(None)` as "host-served" sends a resolvable module's
-            // export to `call_bif`, which cannot resolve it there and raises `undef` — where
-            // the original route ran the export. Computed here, before the `budget_ctx` borrow
-            // below, on the outer `ctx`; both atoms come from the module's **own** atom table
-            // (never the runtime's shared namespace), and a name it cannot resolve leaves the
-            // original route rather than substituting one.
-            let entry_is_host_served = match &engine.entry {
-                ProcessEntry::Export {
-                    module,
-                    function,
-                    arity,
-                } => match (
-                    module.atom_table.name(module.name),
-                    module.atom_table.name(*function),
-                ) {
-                    (Some(module_name), Some(function_name)) => {
-                        ctx.host_serves(module_name, function_name, *arity)
-                    }
+            // the callee's table lacks, an export the callee does not have, and a callee whose
+            // own body observes its call site), and a `ProcessEntry::Export` names a module
+            // whose `Arc<Module>` the caller already holds. Reading that `Ok(None)` as
+            // "host-served" sends a resolvable module's export to `call_bif`, whose nested
+            // **non-pumping** `run_export` cannot park a blocking callee, so the process's
+            // `receive` folds into the typed `blocked()` gap instead of suspending. Computed
+            // here, before the `budget_ctx` borrow below, on the outer `ctx`; both atoms come
+            // from the module's **own** atom table (never the runtime's shared namespace), and
+            // a name it cannot resolve leaves the original route rather than substituting one.
+            //
+            // Gated on the first entry (`engine.parked.is_none()`): a resume takes the parked
+            // arm above and never reads this, so a resumed slice pays nothing for it.
+            let entry_is_host_served = if engine.parked.is_some() {
+                false
+            } else {
+                match &engine.entry {
+                    ProcessEntry::Export {
+                        module,
+                        function,
+                        arity,
+                    } => match (
+                        module.atom_table.name(module.name),
+                        module.atom_table.name(*function),
+                    ) {
+                        (Some(module_name), Some(function_name)) => {
+                            ctx.host_serves(module_name, function_name, *arity)
+                        }
+                        _ => false,
+                    },
                     _ => false,
-                },
-                _ => false,
+                }
             };
             // A resume continues a machine an earlier slice parked. While it was parked a
             // delivery-driven collection may have relocated this process's heap, so re-sync
