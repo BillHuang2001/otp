@@ -125,9 +125,12 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `for_each_reachable_object(roots, visit)` — the mark-region sibling of `Collector`'s (same whole-heap
     walk); its only difference is the mature range, the whole `base .. base + capacity` region (with its free
     lines — over-inclusive yet harmless, as in `live_full`); `for_each_reachable_object_view` mirrors it.
-  - A fullsweep that cannot fit its promotion grows the region (`grow_major`); a `max_heap_words` cap the
-    promotion cannot fit returns the typed `heap_exhausted` **before any copy** (Known Gaps; coverage
-    `src/immix_collector/grow_tests.rs`).
+  - A fullsweep that cannot fit its promotion grows the region (`grow_major`, which also rebuilds a fresh
+    region of the **current** capacity when a ceiling forbids growing); only a `max_heap_words` cap that
+    cannot hold the live set in any layout returns the typed `heap_exhausted`, and still **before any copy**
+    (Known Gaps; coverage `src/immix_collector/grow_tests.rs`, `tests/immix_major_growth.rs`).
+  - `collect` escalates a **would-not-fit minor** to a fullsweep and `run_major` falls back to `grow_major`
+    on the same outcome — the promotion itself is atomic, so a refusal is a no-op to retry (Known Gaps).
 
 ### `any_collector.rs` — the strategy-dispatching seam
 - `pub enum AnyCollector { Copying(Collector), Immix(GenImmixCollector) }` — a **complete drop-in for the
