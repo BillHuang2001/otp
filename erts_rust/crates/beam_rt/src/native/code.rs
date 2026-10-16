@@ -43,6 +43,7 @@ use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_term::{is_atom, is_list, is_nil, is_small, signed_value, Eterm};
 
+use crate::codeserver::RecordedName;
 use crate::context::RuntimeContext;
 use crate::error;
 
@@ -440,6 +441,101 @@ impl RuntimeContext<'_> {
         }
     }
 
+    /// `code:load_binary(Mod, File, Bin)`: load `Mod` from the `.beam` **image** `Bin`,
+    /// recording `File` as the module's filename.
+    ///
+    /// The oracle's `code.erl:667-688` is reproduced clause for clause:
+    ///
+    /// 1. the guard `is_atom(Mod), (is_list(File) orelse is_atom(File)), is_binary(Bin)` — a
+    ///    failure is the **bare-atom `function_clause`** raise (the oracle's own reason for
+    ///    `load_binary/3`, since the guard lives in the module body this floor replaces);
+    /// 2. `modp(File)` — an atom is accepted; a **proper** list whose elements are not all
+    ///    integers is `{error, badarg}`; an **improper** list runs off the end of
+    ///    `int_list/1` and raises the same `function_clause`;
+    /// 3. `erlang:prepare_loading/2` — the image must be a well-formed `.beam` whose own
+    ///    module name is `Mod`, else `{error, badfile}` (an empty image, garbage, or another
+    ///    module's image);
+    /// 4. the code server's sticky check — a preloaded module, or one resolving under a
+    ///    [`STICKY_APPS`] directory, is `{error, sticky_directory}` (checked **after** the
+    ///    image validates, exactly as the oracle does);
+    /// 5. otherwise the image is registered under `Mod` with `File` as its recorded filename,
+    ///    and the answer is `{module, Mod}`.
+    ///
+    /// Oracle-verified (OTP 29.1.1 / erts-17.1) for every class, including the atom filename
+    /// (`load_binary(M, cover_compiled, Bin)` ⇒ `code:which/1` reports the **atom**), the
+    /// empty filename (`[]` ⇒ `code:which/1` is `[]`), and the name mismatch.
+    ///
+    /// A **non-byte-aligned bitstring** is not a binary, so it fails the guard exactly as
+    /// `is_binary/1` does.
+    pub(super) fn code_load_binary(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let mod_term = *args.first().ok_or(BeamError::BadArg)?;
+        let file_term = *args.get(1).ok_or(BeamError::BadArg)?;
+        let bin_term = *args.get(2).ok_or(BeamError::BadArg)?;
+
+        // Guard `is_atom(Mod)`.
+        let Some(name) = self.atom_name(mod_term) else {
+            return Err(super::prim::function_clause());
+        };
+        // Guard `(is_list(File) orelse is_atom(File))`; a non-list/non-atom `File` — and any
+        // other guard failure — is the same bare-atom raise. The oracle's `is_list/1` accepts
+        // the **empty** list (`NIL`), which `beam_term::is_list` does not (`is_nil` covers it).
+        let file_is_atom = is_atom(file_term);
+        if !file_is_atom && !is_list(file_term) && !is_nil(file_term) {
+            return Err(super::prim::function_clause());
+        }
+        // Guard `is_binary(Bin)`.
+        let Ok(bytes) = terms::binary_bytes(bin_term).map(<[u8]>::to_vec) else {
+            return Err(super::prim::function_clause());
+        };
+
+        // `modp(File)`.
+        if !file_is_atom {
+            match terms::list_elements(file_term) {
+                Ok(elements) => {
+                    if !elements.iter().all(|element| is_small(*element)) {
+                        return self.error_pair("badarg");
+                    }
+                }
+                // An improper list leaves `int_list/1` with no matching clause.
+                Err(_) => return Err(super::prim::function_clause()),
+            }
+        }
+
+        // `erlang:prepare_loading/2`: a well-formed image whose own module name is `Mod`.
+        let module = match self.runtime.code_server.load_bytes(&bytes) {
+            Ok(module) => module,
+            Err(_) => return self.error_pair("badfile"),
+        };
+        if module.atom_name(module.name) != Some(name.as_str()) {
+            return self.error_pair("badfile");
+        }
+        // The code server's sticky check, after the image has validated.
+        if self.is_sticky(&name) {
+            return self.error_pair("sticky_directory");
+        }
+
+        // The caller's filename, recorded verbatim: an atom, or a charlist (the empty list is
+        // the empty string, which `code:which/1` renders as `[]`).
+        let recorded = if file_is_atom {
+            match self.atom_name(file_term) {
+                Some(atom) => RecordedName::Atom(atom),
+                None => return Err(super::prim::function_clause()),
+            }
+        } else {
+            // `modp/1` already proved `file_term` is a proper list of small integers; a value
+            // outside the byte range has no charlist rendering, so the recorded filename
+            // degrades to the empty list rather than fabricating one.
+            match self.charlist_string(file_term) {
+                Some(string) => RecordedName::Str(string),
+                None => RecordedName::Str(String::new()),
+            }
+        };
+        self.runtime
+            .code_server
+            .insert_loaded(&name, module, recorded);
+        self.module_pair(&name)
+    }
+
     /// The `{module, Module}` pair [`Self::code_ensure_loaded`] answers with.
     fn module_pair(&mut self, name: &str) -> Result<Eterm> {
         let module = self.atom("module")?;
@@ -480,28 +576,36 @@ impl RuntimeContext<'_> {
     }
 
     /// The `Beam` half of a `{Module, Beam}` / `{file, Beam}` pair: the atom `preloaded`
-    /// for a preloaded module, its recorded `.beam` path (a string) for one that is loaded
-    /// or on the code path, the **empty string** for one loaded from memory, and `None` when
-    /// the module is nowhere to be found.
+    /// for a preloaded module, the filename a memory load was given ([`RecordedName`], i.e.
+    /// `code:load_binary/3`'s `File`) or a loaded module's recorded `.beam` path (a string),
+    /// and `None` when the module is nowhere to be found.
     ///
-    /// The empty string is the oracle's own value, not an invention: `code_server` stores
-    /// the filename a module was loaded with, and a module loaded from bytes (the runtime's
-    /// [`CodeServer::load_bytes`], i.e. OTP's `load_binary/3` with no filename) has none.
-    /// Oracle-verified (OTP 29/erts-17.1) for
-    /// `code:load_binary(M, "", Bin)`: `code:which(M)` ⇒ `[]`, `code:is_loaded(M)` ⇒
-    /// `{file,[]}` and `code:all_loaded/0` ⇒ `[{M,[]}]`. This runtime has no
-    /// `load_binary/3` surface, so a memory-loaded module never carries a non-empty
-    /// filename — `[]` is the only honest value, and reporting the atom `preloaded` (which
-    /// means "a preloaded OTP module") would be wrong.
+    /// The recorded filename is the oracle's own value, not an invention: `code_server`
+    /// stores the filename a module was loaded with verbatim, so `code:which/1` reports an
+    /// atom filename as the **atom** and `code:load_binary(M, "", Bin)`'s empty list as `[]`.
+    /// Oracle-verified (OTP 29/erts-17.1) for `code:load_binary(M, "", Bin)`:
+    /// `code:which(M)` ⇒ `[]`, `code:is_loaded(M)` ⇒ `{file,[]}` and `code:all_loaded/0` ⇒
+    /// `[{M,[]}]`; for `code:load_binary(M, cover_compiled, Bin)` ⇒ `code:which(M)` is the
+    /// atom `cover_compiled`.
     ///
     /// [`CodeServer::load_bytes`]: crate::CodeServer::load_bytes
     fn beam_location(&mut self, name: &str) -> Result<Option<Eterm>> {
         if self.runtime.preloaded().is_preloaded(name) {
             return Ok(Some(self.atom("preloaded")?));
         }
-        // Loaded, but with no recorded path: a module loaded from memory (checked before the
-        // code-path search, because the loaded filename is what the oracle reports even when
-        // a `.beam` of the same name is *also* findable on the path).
+        // A module loaded **from memory** (`code:load_binary/3`) reports the filename the load
+        // was given, verbatim: an atom, a charlist, or the empty list. Taken before the
+        // code-path search because the recorded filename is what the oracle reports even when
+        // a `.beam` of the same name is *also* findable on the path.
+        let recorded = self.runtime.code_server.recorded_name(name).cloned();
+        if let Some(recorded) = recorded {
+            return Ok(Some(match recorded {
+                RecordedName::Str(string) => self.charlist(&string)?,
+                RecordedName::Atom(atom) => self.atom(&atom)?,
+            }));
+        }
+        // Loaded from a file with no recorded path (a `CodeServer::load_bytes` module that was
+        // registered without a location): the empty string.
         if self.runtime.code_server.loaded_path(name).is_none()
             && self.runtime.code_server.is_loaded(name)
         {
@@ -2217,6 +2321,272 @@ mod tests {
             "a loaded module's beam is a path string, got {beam:?}"
         );
         assert!(string_of(beam).ends_with("lists.beam"));
+    }
+
+    // -- load_binary/3 --------------------------------------------------------
+
+    /// `bytes` as an Erlang **binary** on the runtime's pointer-stable arena — the same
+    /// `beam_codec::term::make_binary` the `prim_file` suite uses, so an image longer than
+    /// the 64-byte on-heap limit is still representable.
+    fn binary(runtime: &mut crate::Runtime, bytes: &[u8]) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = crate::context::RuntimeContext::with_output(runtime, &mut sink);
+        beam_codec::term::make_binary(context.eval_heap(), bytes).expect("a binary")
+    }
+
+    /// The bytes of the committed vertical-slice fixture (`slice.beam`, built by the system
+    /// `erlc`) — a well-formed image whose own module name is `slice`.
+    fn slice_image() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_loader/tests/fixtures/slice.beam"
+        ))
+        .expect("the slice fixture is committed")
+    }
+
+    /// Drives `code_load_binary/3` directly — its `try_native` arm is a registration in
+    /// `src/native.rs`, outside this node — so a value-shape assertion does not depend on the
+    /// dispatcher.
+    fn load_binary(runtime: &mut crate::Runtime, args: &[Eterm]) -> Result<Eterm> {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = crate::context::RuntimeContext::with_output(runtime, &mut sink);
+        context.code_load_binary(args)
+    }
+
+    /// `[head | tail]` — an improper list (`int_list/1` has no clause for it).
+    fn improper_list(runtime: &mut crate::Runtime, head: &str, tail: &str) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = crate::context::RuntimeContext::with_output(runtime, &mut sink);
+        let head = context.atom(head).expect("the head atom");
+        let tail = context.atom(tail).expect("the tail atom");
+        terms::make_cons(&mut context, head, tail).expect("an improper list")
+    }
+
+    /// The value of one element of a two-tuple `answer`, or a panic naming the shape it is.
+    fn pair_element(answer: Eterm, index: usize) -> Eterm {
+        assert_eq!(terms::tuple_arity(answer).expect("a pair"), 2, "{answer:?}");
+        terms::tuple_element(answer, index).expect("the pair element")
+    }
+
+    #[test]
+    fn code_load_binary_maps_an_unloadable_image_to_badfile() {
+        // An empty or garbage image fails `erlang:prepare_loading/2` — the oracle's
+        // `{error,badfile}` (a value, never a raise) — and must not enter the module cache.
+        let mut runtime = runtime();
+        for bytes in [&b""[..], &b"garbage-not-a-beam"[..]] {
+            let module = module_atom(&mut runtime, "tb_mod");
+            let file = chars(&mut runtime, "/x/tb_mod.beam");
+            let image = binary(&mut runtime, bytes);
+            let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+            assert_eq!(error_reason(&mut runtime, answer), "badfile", "{bytes:?}");
+            assert!(
+                !runtime.code_server.is_loaded("tb_mod"),
+                "a malformed image must not enter the code server's cache"
+            );
+        }
+    }
+
+    #[test]
+    fn code_load_binary_rejects_an_image_for_another_module() {
+        // `prepare_loading` validates that the image's own module name is `Mod`; a
+        // well-formed image for a *different* module is the same `{error,badfile}`.
+        let mut runtime = runtime();
+        let module = module_atom(&mut runtime, "not_slice");
+        let file = chars(&mut runtime, "");
+        let image = binary(&mut runtime, &slice_image());
+        let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+        assert_eq!(error_reason(&mut runtime, answer), "badfile");
+        assert!(!runtime.code_server.is_loaded("not_slice"));
+    }
+
+    #[test]
+    fn code_load_binary_loads_a_valid_image_and_reports_its_recorded_name() {
+        let mut runtime = runtime();
+
+        // The empty filename: the answer is `{module, Mod}` and the recorded name is the
+        // empty list — the oracle's `code:which(Mod)` ⇒ `[]`, `code:is_loaded(Mod)` ⇒
+        // `{file,[]}` and `code:all_loaded()` entry `{Mod,[]}`.
+        let module = module_atom(&mut runtime, "slice");
+        let file = chars(&mut runtime, "");
+        let image = binary(&mut runtime, &slice_image());
+        let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+        assert_eq!(
+            runtime.atom_name_of(pair_element(answer, 0)),
+            Some("module")
+        );
+        assert_eq!(
+            runtime.atom_name_of(pair_element(answer, 1)),
+            Some("slice")
+        );
+        assert!(runtime.code_server.is_loaded("slice"));
+
+        let slice = module_atom(&mut runtime, "slice");
+        let which = call(&mut runtime, "code", "which", &[slice]).expect("which/1");
+        assert_eq!(
+            terms::list_elements(which).expect("a list").len(),
+            0,
+            "an empty filename is reported as `[]`, got {which:?}"
+        );
+        let loaded = call(&mut runtime, "code", "is_loaded", &[slice]).expect("is_loaded/1");
+        assert_eq!(
+            runtime.atom_name_of(pair_element(loaded, 0)),
+            Some("file")
+        );
+        assert_eq!(
+            terms::list_elements(pair_element(loaded, 1))
+                .expect("a list")
+                .len(),
+            0
+        );
+        let all = call(&mut runtime, "code", "all_loaded", &[]).expect("all_loaded/0");
+        let entry = terms::list_elements(all)
+            .expect("a list")
+            .into_iter()
+            .find(|entry| runtime.atom_name_of(terms::tuple_element(*entry, 0).unwrap()) == Some("slice"))
+            .expect("slice is in all_loaded/0");
+        assert_eq!(
+            terms::list_elements(pair_element(entry, 1))
+                .expect("a list")
+                .len(),
+            0
+        );
+
+        // Re-loading under a **non-empty** filename records the caller's string verbatim:
+        // `code:which/1` reports the path the load was given.
+        let module = module_atom(&mut runtime, "slice");
+        let file = chars(&mut runtime, "/x/slice.beam");
+        let image = binary(&mut runtime, &slice_image());
+        let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+        assert_eq!(
+            runtime.atom_name_of(pair_element(answer, 1)),
+            Some("slice")
+        );
+        let which = call(&mut runtime, "code", "which", &[slice]).expect("which/1");
+        assert_eq!(string_of(which), "/x/slice.beam");
+    }
+
+    #[test]
+    fn code_load_binary_records_an_atom_filename_as_an_atom() {
+        // `code_server` stores the filename verbatim, so an **atom** filename is reported as
+        // the atom (`code:load_binary(M, cover_compiled, Bin)` ⇒ `code:which(M)` is the atom
+        // `cover_compiled`), never a string.
+        let mut runtime = runtime();
+        let module = module_atom(&mut runtime, "slice");
+        let file = atom(&mut runtime, "cover_compiled");
+        let image = binary(&mut runtime, &slice_image());
+        let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+        assert_eq!(
+            runtime.atom_name_of(pair_element(answer, 1)),
+            Some("slice")
+        );
+        let slice = module_atom(&mut runtime, "slice");
+        let which = call(&mut runtime, "code", "which", &[slice]).expect("which/1");
+        assert!(is_atom(which), "an atom filename is an atom, got {which:?}");
+        assert_eq!(runtime.atom_name_of(which), Some("cover_compiled"));
+    }
+
+    #[test]
+    fn code_load_binary_rejects_a_non_integer_list_filename_with_badarg() {
+        // `modp(File)` accepts any atom and any proper list of integers; a proper list with a
+        // **non-integer** element is the oracle's `{error,badarg}` (checked *before* the image).
+        let mut runtime = runtime();
+        let module = module_atom(&mut runtime, "tb_mod");
+        let file = atom_list(&mut runtime, &["a", "b"]);
+        let image = binary(&mut runtime, b"");
+        let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+        assert_eq!(error_reason(&mut runtime, answer), "badarg");
+        assert!(!runtime.code_server.is_loaded("tb_mod"));
+    }
+
+    #[test]
+    fn code_load_binary_raises_function_clause_for_every_guard_failure() {
+        // The oracle's `load_binary/3` head guard is
+        // `is_atom(Mod), (is_list(File) orelse is_atom(File)), is_binary(Bin)`, and an
+        // **improper** list runs off `int_list/1` — each a **bare-atom `function_clause`**
+        // raise (never `badarg`, never a capability gap).
+        let mut runtime = runtime();
+        let module = module_atom(&mut runtime, "tb_mod");
+        let file = chars(&mut runtime, "/x/tb_mod.beam");
+        let image = binary(&mut runtime, b"");
+
+        let cases: [(Eterm, Eterm, Eterm, &str); 4] = [
+            (make_small(7), file, image, "a non-atom module"),
+            (module, make_small(7), image, "a non-list/non-atom filename"),
+            (module, improper_list(&mut runtime, "x", "tail"), image, "an improper list"),
+            (module, file, make_small(7), "a non-binary image"),
+        ];
+        for (mod_term, file_term, bin_term, what) in cases {
+            let error =
+                load_binary(&mut runtime, &[mod_term, file_term, bin_term]).expect_err(what);
+            assert_eq!(error.as_atom(), Some("function_clause"), "{error} for {what}");
+            assert!(
+                crate::error::unsupported_reason(&error).is_none(),
+                "a function_clause raise is a genuine error, not a capability gap: {error}"
+            );
+        }
+        assert!(!runtime.code_server.is_loaded("tb_mod"));
+    }
+
+    #[test]
+    fn code_load_binary_shapes_agree_with_the_live_oracle() {
+        // The oracle's refusal paths **also log** (`beam_load.c`'s `corrupt file header` report)
+        // asynchronously on **stdout**, so its answer is matched **within** its stdout rather
+        // than as the whole of it — those reports are not part of `load_binary/3`'s value.
+        let Some((stdout, code)) =
+            oracle_run("io:format(\"~p~n\",[code:load_binary(tb_mod,\"/x/tb_mod.beam\",<<>>)])")
+        else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(code, Some(0), "the oracle answers, it does not raise: {stdout}");
+        assert!(
+            stdout.contains("{error,badfile}"),
+            "the oracle's own answer for an unloadable image was {stdout}"
+        );
+
+        let Some((stdout, code)) =
+            oracle_run("io:format(\"~p~n\",[code:load_binary(tb_mod,[a,b],<<>>)])")
+        else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(code, Some(0), "the oracle answers, it does not raise: {stdout}");
+        assert!(
+            stdout.contains("{error,badarg}"),
+            "the oracle's own answer for a non-integer list filename was {stdout}"
+        );
+
+        let Some((stdout, code)) = oracle_run(
+            "try code:load_binary(7,\"/x/tb_mod.beam\",<<>>) \
+             catch C:R -> io:format(\"~p~n\",[{C,R}]) end",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(code, Some(0), "the guard failure is caught here: {stdout}");
+        assert!(
+            stdout.contains("{error,function_clause}"),
+            "the oracle's own raise for a guard failure was {stdout}"
+        );
+
+        // The same three shapes through the floor: identical values, one bare-atom raise.
+        let mut runtime = runtime();
+        let module = module_atom(&mut runtime, "tb_mod");
+        let file = chars(&mut runtime, "/x/tb_mod.beam");
+        let image = binary(&mut runtime, b"");
+        let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+        assert_eq!(error_reason(&mut runtime, answer), "badfile");
+
+        let module = module_atom(&mut runtime, "tb_mod");
+        let file = atom_list(&mut runtime, &["a", "b"]);
+        let image = binary(&mut runtime, b"");
+        let answer = load_binary(&mut runtime, &[module, file, image]).expect("a pair");
+        assert_eq!(error_reason(&mut runtime, answer), "badarg");
+
+        let file = chars(&mut runtime, "/x/tb_mod.beam");
+        let image = binary(&mut runtime, b"");
+        let error = load_binary(&mut runtime, &[make_small(7), file, image]).expect_err("guard");
+        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
     }
 
     // -- get_mode/0 -----------------------------------------------------------

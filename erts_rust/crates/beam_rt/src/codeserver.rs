@@ -84,6 +84,21 @@ use beam_term::AtomTable;
 use crate::context::PendingInterner;
 use crate::error;
 
+/// The filename a module loaded **from memory** was registered with — `code:load_binary/3`'s
+/// `File` argument.
+///
+/// The oracle's `code.erl:667` guard accepts the filename as either an atom or a list, and
+/// `code_server` stores it verbatim, so `code:which/1`/`code:is_loaded/1` report whichever
+/// form the caller gave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordedName {
+    /// A filename given as a list (a charlist); the empty list — `code:load_binary(M, "", B)`
+    /// — is `Str(String::new())`, which `code:which/1` reports as `[]`.
+    Str(String),
+    /// A filename given as an atom, e.g. `cover_compiled`.
+    Atom(String),
+}
+
 /// The **code server**: the runtime's one shared atom table, its module cache and its
 /// ordered code path.
 pub struct CodeServer {
@@ -106,6 +121,11 @@ pub struct CodeServer {
     /// The `.beam` file each cached module was loaded from (see
     /// [`CodeServer::loaded_path`]); absent for a module supplied in memory.
     module_paths: HashMap<String, PathBuf>,
+    /// The filename each module loaded **from memory** was registered with (see
+    /// [`CodeServer::recorded_name`]) — `code:load_binary/3`'s `File` argument, stored
+    /// verbatim because the oracle's `code:which/1`/`code:is_loaded/1` report it as given.
+    /// Absent for a module loaded from a `.beam` file (its location is `module_paths`).
+    module_files: HashMap<String, RecordedName>,
     /// A **generation** for the loaded-module set, bumped every time the module cache above
     /// changes — the invalidation trigger for the cached fun-resolution snapshot
     /// ([`CodeServer::fun_module_snapshot`]).
@@ -165,6 +185,7 @@ impl CodeServer {
             atoms: Rc::new(AtomTable::new()),
             modules: HashMap::new(),
             module_paths: HashMap::new(),
+            module_files: HashMap::new(),
             loaded_generation: 0,
             fun_modules: RefCell::new(None),
             #[cfg(test)]
@@ -437,6 +458,14 @@ impl CodeServer {
         self.module_paths.get(name).map(PathBuf::as_path)
     }
 
+    /// The filename a module loaded **from memory** was registered with, if it was —
+    /// `code:load_binary/3`'s `File` argument, kept verbatim.
+    ///
+    /// `None` for a module that has not been loaded and for one loaded from a `.beam` file
+    /// (whose location is [`CodeServer::loaded_path`]).
+    pub fn recorded_name(&self, name: &str) -> Option<&RecordedName> {
+        self.module_files.get(name)
+    }
     /// The system library root (`<lib>`) the code-path `ebin` directories live under.
     ///
     /// It is the **consumed system installation's** `<lib>`, taken from the directories
@@ -694,6 +723,28 @@ impl CodeServer {
         // cached fun-resolution snapshot is invalidated (see `fun_module_snapshot`).
         self.loaded_generation += 1;
         Ok(module)
+    }
+
+    /// Registers an already-decoded module image under `name`, recording `recorded` as the
+    /// filename `code:which/1`/`code:is_loaded/1` report — `code:load_binary/3`'s load.
+    ///
+    /// No `.beam` path is recorded (the image came from memory), so a stale path from an
+    /// earlier file load of the same name is dropped: `code:load_binary/3` supersedes the
+    /// previous location. The loaded-module generation is bumped so the cached
+    /// fun-resolution snapshot is invalidated (a memory-loaded module has no `.beam` path,
+    /// so it contributes no fun identity — see [`CodeServer::fun_module_snapshot`]).
+    pub fn insert_loaded(
+        &mut self,
+        name: &str,
+        module: Module,
+        recorded: RecordedName,
+    ) -> Arc<Module> {
+        let module = Arc::new(module);
+        self.modules.insert(name.to_string(), module.clone());
+        self.module_paths.remove(name);
+        self.module_files.insert(name.to_string(), recorded);
+        self.loaded_generation += 1;
+        module
     }
 
     /// Loads a `.beam` image out of memory into the shared atom table.

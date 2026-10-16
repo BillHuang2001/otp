@@ -300,6 +300,7 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             // REPORTs) where the oracle answers `{error,[{Name,nofile}]}`.
             ("ensure_modules_loaded", 1),
             ("load_file", 1),
+            ("load_binary", 3),
             ("lib_dir", 0),
             ("lib_dir", 1),
             ("lib_dir", 2),
@@ -408,6 +409,7 @@ impl RuntimeContext<'_> {
             ("code", "ensure_loaded", 1) => Some(self.code_ensure_loaded(args)),
             ("code", "ensure_modules_loaded", 1) => Some(self.code_ensure_modules_loaded(args)),
             ("code", "load_file", 1) => Some(self.code_load_file(args)),
+            ("code", "load_binary", 3) => Some(self.code_load_binary(args)),
             ("code", "lib_dir", 0) => Some(self.code_lib_dir_0()),
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),
             ("code", "root_dir", 0) => Some(self.code_root_dir()),
