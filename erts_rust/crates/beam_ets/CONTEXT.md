@@ -544,7 +544,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not shift the next
   chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  -p beam_ets --no-fail-fast` is green — **611 passed / 0 failed / 1 ignored across all binaries
+  -p beam_ets --no-fail-fast` is green — **615 passed / 0 failed / 1 ignored across all binaries
   (incl. 10 doctests, 6 of them `compile_fail`)**. The ignored test is the randomised `ordered_set`
   differential, which passes under `--ignored`. With the oracle required, the battery emits and compares
   all **191** cases. Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 … --test differential`.
