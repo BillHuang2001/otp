@@ -29,6 +29,10 @@
 //! * **line-aware allocation** — sequential line placement, whole-line consumption, a
 //!   request larger than a block claiming a block run, exhaustion, and the **reuse of a
 //!   hole a collection created**;
+//! * **releasing a reservation** — the `release_words`/`release_lines` inverse of `claim`
+//!   (the promotion-rollback primitive): a released run becomes free and allocatable again at
+//!   its original address, a block whose last line is released returns to `Free`, a
+//!   multi-block run returns whole blocks, and a zero-length release is a no-op;
 //! * **marking** — a nested tuple/cons/boxed graph is marked line by line from a flat
 //!   root slice, and the `promoted` incoming set is treated as additional roots;
 //! * **block classification** — `Free` / `Partial` / `AllMarked` from the marks;
@@ -294,6 +298,109 @@ fn reset_releases_every_line_and_rereadies_the_allocator() {
 
     let p = unsafe { s.alloc_words(1).unwrap() };
     assert_eq!(p, s.base());
+}
+
+// ---------------------------------------------------------------------------
+// Releasing a reservation (the promotion-rollback primitive)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn release_un_claims_a_run_and_makes_it_allocatable_again() {
+    let mut s = space(BLOCK_WORDS);
+    let base = s.base();
+
+    // A 100-word (7-line) object at line 0 and a second at line 7: the block's two-line
+    // tail is left free, and no 7-line run remains anywhere in the block.
+    let first = unsafe { s.alloc_words(100).unwrap() };
+    let second = unsafe { s.alloc_words(100).unwrap() };
+    assert_eq!(first, base);
+    assert_eq!(second, base.wrapping_add(7 * LINE_WORDS));
+    assert_eq!(s.used_lines(), 14);
+    assert_eq!(s.free_lines(), 2);
+    assert!(!s.can_reserve(100), "the two-line tail cannot hold a 7-line object");
+    assert!(unsafe { s.alloc_words(100) }.is_err(), "no run exists");
+
+    // Un-claim the first run: the block keeps its second object and the whole first run is
+    // free again — exactly the 7-line hole the failed request above could not find.
+    s.release_words(first, 100);
+    assert_eq!(s.used_lines(), 7);
+    assert_eq!(s.free_lines(), 9);
+    assert!(s.can_reserve(100));
+    assert_eq!(s.counters().lines_allocated(), 7);
+    assert_eq!(s.counters().blocks_partial, 1, "the block is still occupied");
+
+    // The released lines are handed out again, at their original address.
+    let reused = unsafe { s.alloc_words(100).unwrap() };
+    assert_eq!(reused, base, "the released run is allocatable again");
+    assert_eq!(s.used_lines(), 14);
+    assert_eq!(s.free_lines(), 2);
+}
+
+#[test]
+fn release_restores_a_whole_block_to_free() {
+    let mut s = space(2 * BLOCK_WORDS);
+    let base = s.base();
+
+    // Fill block 0 with sixteen one-line cells; block 1 stays empty.
+    let mut cells = Vec::new();
+    for _ in 0..LINES_PER_BLOCK {
+        cells.push(unsafe { s.alloc_words(1).unwrap() });
+    }
+    assert_eq!(s.used_lines(), LINES_PER_BLOCK);
+    assert_eq!(s.counters().blocks_partial, 1);
+    assert_eq!(s.counters().blocks_free, 1);
+
+    // Un-claim every one of them: the block is empty again, i.e. `Free`, the state `claim`
+    // found it in.
+    for (i, p) in cells.iter().enumerate() {
+        assert_eq!(*p, base.wrapping_add(i * LINE_WORDS), "cell {i} is at its own line");
+        s.release_words(*p, 1);
+    }
+    assert_eq!(s.used_lines(), 0);
+    assert_eq!(s.free_lines(), 2 * LINES_PER_BLOCK);
+    assert_eq!(s.counters().blocks_partial, 0);
+    assert_eq!(s.counters().blocks_free, 2);
+
+    // A whole block's worth of lines is allocatable again, from the block's first line.
+    let p = unsafe { s.alloc_words(BLOCK_WORDS) }.unwrap();
+    assert_eq!(p, base);
+    assert_eq!(s.used_lines(), LINES_PER_BLOCK);
+}
+
+#[test]
+fn release_returns_a_multi_block_run_to_free_blocks() {
+    let mut s = space(3 * BLOCK_WORDS);
+    let base = s.base();
+
+    // A 257-word (17-line) object: block 0 whole plus block 1's first line.
+    let big = unsafe { s.alloc_words(BLOCK_WORDS + 1).unwrap() };
+    assert_eq!(big, base);
+    assert_eq!(s.used_lines(), LINES_PER_BLOCK + 1);
+    assert_eq!(s.counters().blocks_free, 1, "block 2 stays free");
+
+    s.release_words(big, BLOCK_WORDS + 1);
+    assert_eq!(s.used_lines(), 0);
+    assert_eq!(s.free_lines(), 3 * LINES_PER_BLOCK);
+    assert_eq!(s.counters().blocks_partial, 0);
+    assert_eq!(s.counters().blocks_free, 3, "every block is free again");
+
+    // The whole region — block 0 plus block 1 — is allocatable again.
+    let again = unsafe { s.alloc_words(BLOCK_WORDS + 1).unwrap() };
+    assert_eq!(again, base);
+}
+
+#[test]
+fn releasing_nothing_is_a_no_op() {
+    let mut s = space(BLOCK_WORDS);
+    let p = unsafe { s.alloc_words(100).unwrap() };
+    assert_eq!(s.used_lines(), 7);
+
+    // Both zero forms claim and release nothing.
+    s.release_words(p, 0);
+    s.release_lines(0, 0);
+    assert_eq!(s.used_lines(), 7);
+    assert_eq!(s.free_lines(), LINES_PER_BLOCK - 7);
+    assert_eq!(s.counters().blocks_partial, 1);
 }
 
 // ---------------------------------------------------------------------------

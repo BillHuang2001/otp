@@ -617,6 +617,86 @@ impl ImmixSpace {
     }
 
     // -----------------------------------------------------------------------
+    // Releasing a reservation (the inverse of `claim`)
+    // -----------------------------------------------------------------------
+
+    /// Un-claims the run of whole lines a previous [`alloc_words`](ImmixSpace::alloc_words)
+    /// (or [`cons`](ImmixSpace::cons)/[`tuple`](ImmixSpace::tuple)) handed out at `ptr` for an
+    /// object of `words` term words — the exact inverse of the private `claim`.
+    ///
+    /// It exists so a **promotion's own** reservations can be undone when a later object of
+    /// the same promotion finds no contiguous run: after [`release_lines`](Self::release_lines)
+    /// the space's `allocated` bitmap and block states are exactly what they were before the
+    /// reservation, so the attempt leaves no trace and can be retried against a differently
+    /// built region.
+    ///
+    /// A `ptr` that does not name a line-aligned address of this region was never handed out
+    /// here, so there is nothing to release and the call does nothing (the mismatch is a
+    /// `debug_assert!`). This is a **safe** method: it reads and writes only this space's own
+    /// metadata and never dereferences `ptr`'s memory.
+    #[inline]
+    pub fn release_words(&mut self, ptr: *mut Eterm, words: usize) {
+        let need = lines_for(words);
+        if need == 0 {
+            return;
+        }
+        let addr = ptr as usize;
+        let base = self.base() as usize;
+        let bytes_per_line = LINE_WORDS * size_of::<Eterm>();
+        debug_assert!(
+            self.contains(ptr as *const Eterm),
+            "a released run lies inside this space"
+        );
+        debug_assert_eq!(
+            addr.wrapping_sub(base) % bytes_per_line,
+            0,
+            "a released run starts a line (alloc_words returns line-aligned words)"
+        );
+        if addr < base || (addr - base) % bytes_per_line != 0 {
+            return;
+        }
+        self.release_lines((addr - base) / bytes_per_line, need);
+    }
+
+    /// Un-claims `need` lines from the global line `start_g` — the inverse of the private
+    /// `claim` for a run this space itself reserved.
+    ///
+    /// The `allocated` bits of `[start_g, start_g + need)` are cleared, and a block whose
+    /// `allocated` bitmap becomes empty is put back to [`BlockState::Free`] (the state `claim`
+    /// found it in); every other touched block keeps its `Partial` classification. The
+    /// `marked`/`kept` bitmaps are deliberately untouched: this is only valid to undo a run
+    /// **no collection is running on** — a promotion's own reservation — which is also why
+    /// [`alloc_words`](ImmixSpace::alloc_words) never writes them. The allocation cursor and
+    /// `current` block are only hints (every search falls back to a full scan, which still
+    /// finds the released hole), so they are left as they are.
+    ///
+    /// A run that is not wholly inside the region is clamped to it (a `debug_assert!` reports
+    /// the mistake in a debug build).
+    pub fn release_lines(&mut self, start_g: usize, need: usize) {
+        if need == 0 {
+            return;
+        }
+        debug_assert!(
+            start_g + need <= self.line_count(),
+            "a released run stays inside the region"
+        );
+        let end = start_g.saturating_add(need).min(self.line_count());
+        let mut g = start_g;
+        while g < end {
+            let b = g / LINES_PER_BLOCK;
+            let l = g % LINES_PER_BLOCK;
+            let take = (LINES_PER_BLOCK - l).min(end - g);
+            let block = &self.blocks[b];
+            let remaining = block.allocated.get() & !line_mask(l, take);
+            block.allocated.set(remaining);
+            if remaining == 0 {
+                // The block holds no line any more: back to the state `claim` found it in.
+                block.state.set(BlockState::Free);
+            }
+            g += take;
+        }
+    }
+    // -----------------------------------------------------------------------
     // Line queries (`&self`, backed by the per-block `Cell`s)
     // -----------------------------------------------------------------------
 

@@ -56,7 +56,7 @@
 //! **into the mature space** (aligned `(slot, term)` pairs).
 //!
 //! * **Minor** ([`GenImmixCollector::run_minor`]): if `mature.free_lines() >= needed` the
-//!   nursery is promoted with [`promote`] and reset. `needed` is the exact line count, so
+//!   nursery is [promoted](promote::promote) and reset. `needed` is the exact line count, so
 //!   the check is never optimistic about the *total* room a promotion needs.
 //! * **Major** ([`GenImmixCollector::run_major`]):
 //!   1. **Reclaim mature in place.** The `(slot, term)` pairs are passed as `promoted`
@@ -70,34 +70,38 @@
 //!      updated term). From here the nursery holds only final mature addresses.
 //!   3. **Promote the nursery.** Now that the nursery's mature references are final, the
 //!      promotion leaves them verbatim (`Foreign`) and cannot create a stale pointer.
-//!   4. **Grow instead of failing.** Should the reclaimed region still not hold the
-//!      promotion (`free_lines() < needed`), the fullsweep grows the mature generation —
-//!      it is relocated wholesale into a larger fresh mark-region space
-//!      ([`GenImmixCollector::grow_major`]), so a growable heap never turns a working
-//!      program into a failing one. Only a [`HeapPolicy::max_heap_words`] ceiling that
-//!      cannot reach the larger size reports the typed heap-exhaustion
-//!      [`BeamError`](beam_common::BeamError), and always *before* anything is promoted:
-//!      never a panic and never a half-forwarded heap.
+//!   4. **Grow instead of failing.** Should the promotion not fit the reclaimed region —
+//!      either for want of total room (`free_lines() < needed`) or for want of a
+//!      *contiguous run* inside one block, the line-granular failure
+//!      [`promote::PromoteOutcome::WouldNotFit`] reports — the fullsweep leaves room
+//!      another way: it is relocated wholesale into a fresh mark-region space
+//!      ([`GenImmixCollector::grow_major`]), which packs monotonically from empty. A
+//!      [minor](GenImmixCollector::run_minor) that is refused is *escalated* to exactly
+//!      that fullsweep by [`GenImmixCollector::collect`], so a growable heap never turns a
+//!      working program into a failing one. Only a
+//!      [`HeapPolicy::max_heap_words`] ceiling that cannot reach a region holding the live
+//!      set reports the typed heap-exhaustion [`BeamError`](beam_common::BeamError), and
+//!      always *before* anything is promoted: never a panic and never a half-forwarded
+//!      heap.
 //!
 //! # Sharing with the copying engine
 //!
-//! [`promote`] is driven entirely by [`crate::copy`]'s `pub(crate)` primitives: object
-//! sizing is [`move_size`](crate::copy::move_size), reference enumeration is
-//! [`for_each_ref`](crate::copy::for_each_ref), and the whole in-place marker protocol is
-//! [`forward_slot`](crate::copy::forward_slot) over the [`EvacDest`](crate::copy::EvacDest)
-//! seam. The *one* decision that differs from a copying collection — *which* objects
-//! move — is this module's [`PromoteDest`]: it evacuates exactly the references that fall
-//! inside the nursery's [`FromSet`] and puts the copies in the mature Immix space.
+//! [`promote`](promote::promote) is driven entirely by [`crate::copy`]'s `pub(crate)`
+//! primitives: object sizing is [`move_size`](crate::copy::move_size), reference enumeration
+//! is [`for_each_ref`](crate::copy::for_each_ref), and the word-level marker scheme it writes
+//! (the forwarding marker, the `copy_nonoverlapping`, the `Target::Forwarded` follow) is the
+//! one [`forward_slot`](crate::copy::forward_slot) implements — the promotion re-implements
+//! it in two phases to make it *atomic* (see the [`promote`] module), while the copying
+//! collector and the mark-region in-place reclaim keep driving `forward_slot` directly.
 
 use std::collections::HashSet;
 
 use beam_alloc::AllocRef;
-use beam_common::Result;
-use beam_term::prelude::{is_boxed, is_header, is_list, is_non_value, ptr_val, Eterm};
+use beam_common::Result;use beam_term::prelude::{is_boxed, is_header, is_list, ptr_val, Eterm};
 
 use crate::collector::{Collection, CollectionKind};
 use crate::config::GcConfig;
-use crate::copy::{for_each_ref, forward_slot, move_size, EvacDest, Target};
+use crate::copy::{for_each_ref, move_size};
 use crate::error::heap_exhausted;
 use crate::heap_info::HeapObservable;
 use crate::immix::{lines_for, ImmixSpace, ImmixStats, LINE_WORDS};
@@ -107,133 +111,12 @@ use crate::reachable::ReachableObject;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
 
-/// The from-space of a promotion: the copying nursery, plus — when a fullsweep is also
-/// **relocating** the mature generation into a differently-sized region — the old
-/// mark-region mature space. A reference into neither is [`Target::Foreign`], left verbatim.
-struct PromoteFrom<'a> {
-    nursery: FromSet,
-    mature: Option<&'a ImmixSpace>,
-}
-
-impl PromoteFrom<'_> {
-    /// Whether `ptr` names an object a promotion must copy, i.e. one that lives in a space
-    /// this collection is abandoning.
-    fn contains(&self, ptr: *const Eterm) -> bool {
-        self.nursery.contains(ptr) || self.mature.is_some_and(|m| m.contains(ptr))
-    }
-}
-
-/// The [`EvacDest`] decision for a **promotion**: evacuate exactly the references into the
-/// [`PromoteFrom`] set and place the copies in the mark-region mature space.
-///
-/// A reference that is already inside the mature space (or a literal, or off-heap) is
-/// [`Target::Foreign`] and is left verbatim — the mature object is already in its final
-/// position (the nursery's mature references are resolved *before* a promotion ever runs).
-struct PromoteDest<'a> {
-    from: &'a PromoteFrom<'a>,
-    to: &'a mut ImmixSpace,
-}
-impl EvacDest for PromoteDest<'_> {
-    unsafe fn classify_boxed(&self, ptr: *const Eterm) -> Target {
-        if !self.from.contains(ptr) {
-            // A mature object, a literal, off-heap memory or any other out-of-nursery
-            // address: never moved by a promotion.
-            return Target::Foreign;
-        }
-        // SAFETY: `ptr` is inside a live nursery object, so its header word is readable.
-        if is_header(unsafe { *ptr }) {
-            Target::Live
-        } else {
-            // `IS_MOVED_BOXED`: the header was overwritten with the new BOXED pointer.
-            Target::Forwarded
-        }
-    }
-
-    unsafe fn classify_cons(&self, ptr: *const Eterm) -> Target {
-        if !self.from.contains(ptr) {
-            return Target::Foreign;
-        }
-        // SAFETY: `ptr` is inside a live nursery cons cell, so its car word is readable.
-        if is_non_value(unsafe { *ptr }) {
-            Target::Forwarded
-        } else {
-            Target::Live
-        }
-    }
-
-    fn can_reserve(&self, words: usize) -> bool {
-        self.to.can_reserve(words)
-    }
-
-    unsafe fn reserve(&mut self, words: usize) -> Result<*mut Eterm> {
-        // SAFETY: the caller guarantees `words` fit (`can_reserve` just held); the Immix
-        // allocator hands out `words` exclusively-owned, line-aligned words. `kept` is not
-        // set because no mark-region collection is running while a promotion is in flight.
-        unsafe { self.to.alloc_words(words) }
-    }
-}
-
-/// Evacuates every live object reachable from `roots` out of `from` into `to`, updating
-/// `roots` in place, and returns the copy statistics.
-///
-/// The traversal is the Cheney worklist of the mark-region space's own evacuation: copying
-/// an object queues the addresses of its reference words, and each queued word is
-/// forwarded once, so a shared object is copied once and followed by a marker afterwards.
-/// Object sizes and reference enumeration come from the shared `copy` primitives.
-fn promote(from: &PromoteFrom<'_>, to: &mut ImmixSpace, roots: &mut [Eterm]) -> Result<GcStats> {
-    let mut dest = PromoteDest { from, to };    let mut stats = GcStats::default();
-    let mut work: Vec<*mut Eterm> = Vec::new();
-
-    for root in roots.iter_mut() {
-        // SAFETY: `root` is a live, exclusively-borrowed term word of the caller's roots.
-        let copied = unsafe { forward_slot(&mut dest, root as *mut Eterm)? };
-        if copied > 0 {
-            stats.objects_copied += 1;
-            stats.words_copied += copied;
-            // SAFETY: `forward_slot` rewrote `root` to name the fresh copy of `copied`
-            // words it made in the mature space.
-            unsafe { enqueue_refs(&mut work, *root, copied)? };
-        }
-    }
-
-    while let Some(slot) = work.pop() {
-        // SAFETY: every queued address is a reference word inside a live nursery object
-        // (or inside a copy this promotion made); `forward_slot` reads it, copies the
-        // referenced nursery object and rewrites the word in place.
-        let copied = unsafe { forward_slot(&mut dest, slot)? };
-        if copied > 0 {
-            stats.objects_copied += 1;
-            stats.words_copied += copied;
-            // SAFETY: `slot` now names the copy of `copied` words just written.
-            unsafe { enqueue_refs(&mut work, *slot, copied)? };
-        }
-    }
-
-    Ok(stats)
-}
-
-/// Queues the address of every reference word of the live object `term` (of `total` words)
-/// for forwarding.
-///
-/// # Safety
-///
-/// `term` must be a BOXED or LIST term naming a live object of exactly `total` words, all
-/// readable. A cons cell has no header, but [`for_each_ref`] steps both of its words as
-/// terms, so the same primitive covers a cons cell (`total == 2`) and any boxed object.
-unsafe fn enqueue_refs(work: &mut Vec<*mut Eterm>, term: Eterm, total: usize) -> Result<()> {
-    // SAFETY: forwarded to the caller's guarantee.
-    unsafe {
-        for_each_ref(ptr_val(term), total, &mut |slot| {
-            work.push(slot);
-            Ok(())
-        })
-    }
-}
+mod promote;
+use promote::{promote, PromoteFrom, PromoteOutcome};
 
 /// The result of a nursery scan: the Immix lines a promotion needs, and every nursery
 /// reference word that points into the mature space (`(slot, term)` order-aligned).
 type YoungScan = (usize, Vec<(*mut Eterm, Eterm)>);
-
 /// Walks the live nursery graph reachable from `roots`, without copying anything.
 ///
 /// Reports the number of Immix **lines** a promotion of that graph will occupy (`needed`)
@@ -430,13 +313,20 @@ impl GenImmixCollector {
     pub fn collection_debt(&self) -> bool {
         self.nursery.retains_old_spaces()
     }
+
     /// Runs a collection, picking minor vs major by policy and escalating a would-not-fit
     /// minor to a major.
     ///
     /// A major is chosen when the fullsweep cadence is due *or* when a promotion of the
-    /// live nursery (`needed` lines) would not fit the mature space's free lines — the
+    /// live nursery (`needed` lines) plainly exceeds the mature space's free lines — the
     /// escalation makes the major's in-place reclaim, rather than a doomed copy, the way
-    /// room is found.
+    /// room is found. The chosen minor can still be **refused** by the destination
+    /// ([`PromoteOutcome::WouldNotFit`]): `free_lines()` counts the region's free lines in
+    /// total, while a line-granular reservation needs a *contiguous run* inside one block, so
+    /// a fragmented region can satisfy the first and not the second. Because the promotion is
+    /// atomic, that refusal leaves the nursery and the mature region exactly as they were, and
+    /// this method runs the major the plain check would have chosen had it seen the
+    /// fragmentation.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         let (needed, refs) = scan_young(roots, &self.nursery, &self.mature)?;
         let tight = self.mature.free_lines() < needed;
@@ -444,9 +334,22 @@ impl GenImmixCollector {
             CollectionKind::Major
         } else {
             CollectionKind::Minor
-        };        let stats = match kind {
-            CollectionKind::Minor => self.run_minor(roots)?,
-            CollectionKind::Major => self.run_major(roots, needed, refs)?,
+        };
+        let (kind, stats) = match kind {
+            CollectionKind::Minor => match self.run_minor(roots)? {
+                PromoteOutcome::Done(stats) => (CollectionKind::Minor, stats),
+                // The region has the free lines but not the run an object of the promotion
+                // needs: the atomic attempt left nothing behind, so the same `needed`/`refs`
+                // drive the escalation the check above could not see.
+                PromoteOutcome::WouldNotFit => (
+                    CollectionKind::Major,
+                    self.run_major(roots, needed, refs)?,
+                ),
+            },
+            CollectionKind::Major => (
+                CollectionKind::Major,
+                self.run_major(roots, needed, refs)?,
+            ),
         };
         self.accumulate(&stats, kind);
         Ok(Collection { kind, stats })
@@ -456,15 +359,25 @@ impl GenImmixCollector {
     ///
     /// Checks up front that the mature space's free lines cover the promotion, so a
     /// too-large minor is a typed heap exhaustion *before* a single word is copied (never a
-    /// half-forwarded heap); [`collect`](Self::collect) escalates to a major instead.
+    /// half-forwarded heap); [`collect`](Self::collect) escalates to a major instead. The
+    /// promotion itself is atomic, so a region whose free lines are too *fragmented* for the
+    /// promotion reports the same typed exhaustion — equally with the nursery byte-identical
+    /// and the mature region untouched — rather than a half-forwarded heap.
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let (needed, _refs) = scan_young(roots, &self.nursery, &self.mature)?;
         if self.mature.free_lines() < needed {
             return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
         }
-        let stats = self.run_minor(roots)?;
-        self.accumulate(&stats, CollectionKind::Minor);
-        Ok(stats)
+        match self.run_minor(roots)? {
+            PromoteOutcome::Done(stats) => {
+                self.accumulate(&stats, CollectionKind::Minor);
+                Ok(stats)
+            }
+            // As above: the region's free lines exist but no contiguous run of them can hold
+            // an object of the promotion. Nothing was copied and nothing rewritten, so the
+            // typed exhaustion is exactly the one the up-front check raises.
+            PromoteOutcome::WouldNotFit => Err(heap_exhausted(needed.saturating_mul(LINE_WORDS))),
+        }
     }
 
     /// Runs a **major** collection: reclaim the mature generation in place, then promote
@@ -595,19 +508,18 @@ impl GenImmixCollector {
     /// Promotes the nursery's live terms into the mature space and resets the nursery.
     ///
     /// The caller has already checked that `mature.free_lines()` covers the promotion's
-    /// `needed` lines, so this never has to roll a half-finished copy back. Every space of a
-    /// chained nursery is promoted out of, and the chain is then
+    /// `needed` lines. That check is region-wide, though, so the promotion itself can still be
+    /// refused by a fragmented region (no contiguous run for an object); the attempt is then
+    /// [`PromoteOutcome::WouldNotFit`] — the nursery and the mature region exactly as they
+    /// were, no marker written, no root rewritten, no counter advanced — which
+    /// [`collect`](Self::collect) escalates to a fullsweep. Every space of a chained nursery
+    /// is promoted out of, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
-    fn run_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let from = PromoteFrom {
-            nursery: {
-                let mut set = FromSet::new();
-                self.nursery.add_to_from_set(&mut set);
-                set
-            },
-            mature: None,
+    fn run_minor(&mut self, roots: &mut [Eterm]) -> Result<PromoteOutcome> {
+        let from = PromoteFrom::new(&self.nursery, None);
+        let PromoteOutcome::Done(mut stats) = promote(&from, &mut self.mature, roots)? else {
+            return Ok(PromoteOutcome::WouldNotFit);
         };
-        let mut stats = promote(&from, &mut self.mature, roots)?;
         let used = self.nursery.used_words();
         // The nursery words that were not promoted were garbage: promotion is the whole of
         // a minor's reclamation.
@@ -616,9 +528,8 @@ impl GenImmixCollector {
         // What the minor left in the nursery is exactly what it promoted (see
         // `HeapPolicy::young_after_collection`), never the pre-collection fill.
         self.nursery.collapse(&self.policy, stats.words_copied)?;
-        Ok(stats)
+        Ok(PromoteOutcome::Done(stats))
     }
-
     /// Reclaims the mature generation in place, then promotes the nursery into it.
     ///
     /// `needed` and `refs` come from the [`scan_young`] the caller ran before choosing the
@@ -677,54 +588,63 @@ impl GenImmixCollector {
             return self.grow_major(roots, needed, live.lines);
         }
 
-        let from = PromoteFrom {
-            nursery: {
-                let mut set = FromSet::new();
-                self.nursery.add_to_from_set(&mut set);
-                set
-            },
-            mature: None,
-        };
+        // Attempt the promotion atomically. A line-granular destination can refuse it even
+        // with room in total (`free_lines()` counts the whole region, `find_run` needs one
+        // block), and the refusal leaves both spaces exactly as they are — the in-place
+        // reclaim's work is intact and the nursery is un-forwarded — so the same fallback
+        // answers it.
         let used = self.nursery.used_words();
-        let mut stats = promote(&from, &mut self.mature, roots)?;
-        let nursery_garbage = used.saturating_sub(stats.words_copied);
-        // Total words reclaimed: the mature generation's in-place reclaim plus the nursery
-        // words that died (they were never promoted).
-        stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
-        self.minor_since_major = 0;
-        // The fullsweep promoted the nursery's live words into the mature region, so the
-        // nursery's surviving occupancy is zero and the resize can only shrink it.
-        self.nursery.collapse(&self.policy, 0)?;
-        Ok(stats)
+        match promote(&PromoteFrom::new(&self.nursery, None), &mut self.mature, roots)? {
+            PromoteOutcome::Done(mut stats) => {
+                let nursery_garbage = used.saturating_sub(stats.words_copied);
+                // Total words reclaimed: the mature generation's in-place reclaim plus the
+                // nursery words that died (they were never promoted).
+                stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
+                self.minor_since_major = 0;
+                // The fullsweep promoted the nursery's live words into the mature region, so
+                // the nursery's surviving occupancy is zero and the resize can only shrink it.
+                self.nursery.collapse(&self.policy, 0)?;
+                Ok(stats)
+            }
+            PromoteOutcome::WouldNotFit => self.grow_major(roots, needed, live.lines),
+        }
     }
-
-    /// The **growth fallback** for a fullsweep whose **in-place** reclaim left fewer free
-    /// lines than the nursery's promotion needs (`needed`).
+    /// The **growth fallback** for a fullsweep whose **in-place** reclaim could not take the
+    /// nursery's promotion (`needed` lines) — either for want of total room
+    /// (`free_lines() < needed`) or for want of a contiguous run inside one block.
     ///
     /// The in-place reclaim ([`ImmixSpace::collect`]) has already run when this is reached,
     /// and the nursery's mature-reference slots have already been rewritten to their final
     /// in-place addresses, so the ordering the major prescribes (reclaim mature in place →
     /// resolve the nursery's references → promote the nursery) is preserved: this only
-    /// replaces the *promotion* target with a larger, freshly-built mark-region space. The
-    /// whole live set — the nursery's graph *and* the just-reclaimed mature generation — is
-    /// copied into it by the ordinary promotion protocol of
-    /// [`relocate_major`](Self::relocate_major), so the old region's garbage (including
-    /// whatever the in-place reclaim could not return) is abandoned wholesale.
+    /// replaces the *promotion* target with a freshly-built mark-region space. The whole live
+    /// set — the nursery's graph *and* the just-reclaimed mature generation — is copied into
+    /// it by the ordinary promotion protocol of [`relocate_major`](Self::relocate_major), so
+    /// the old region's garbage (including whatever the in-place reclaim could not return) is
+    /// abandoned wholesale.
     ///
-    /// A growable heap therefore never turns a working program into a failing one. The
-    /// growth is still bounded by [`HeapPolicy::max_heap_words`]: when the policy's ceiling
-    /// cannot reach a region larger than the current one the typed, retryable heap
-    /// exhaustion is returned instead, and — exactly as before — **before any word is
-    /// promoted**. The nursery is left un-forwarded throughout (nothing here writes to it),
-    /// and on that error path the current mature region is left in place, so the
-    /// already-reclaimed mature generation is still fully addressable from every reference.
+    /// Two targets answer two different shortfalls:
     ///
-    /// (Under the current selection rule this fallback is defensive: a policy that *keeps*
-    /// the mature capacity only does so when it already has room for the promotion plus the
-    /// reserve, so the in-place shortfall this answers can only be reached when
-    /// `max_heap_words` clamps the region to its current capacity — i.e. precisely when
-    /// growing is forbidden. It exists so that a future selection rule, or a policy that
-    /// keeps a capacity it should have grown, can never fail a collection it could satisfy.)
+    /// * a **larger** region (the policy's `next_words` target) when the ceiling permits
+    ///   growing; and
+    /// * a **fresh region of the current capacity** when it does not — a fresh region packs
+    ///   monotonically from its first line, so the run the fragmented in-place region could
+    ///   not produce is exactly what it has. The live set simply has to fit the region's line
+    ///   count (`live_lines <= line_count`, which is what the capacity being a whole number of
+    ///   blocks makes exact).
+    ///
+    /// So a growable heap never turns a working program into a failing one, and a capped one
+    /// still collects whenever *any* layout of the current region could hold the live set.
+    /// Only a [`HeapPolicy::max_heap_words`] ceiling that forbids growth **and** a live set
+    /// no fresh region of the current capacity can hold reports the typed, retryable heap
+    /// exhaustion — and always **before any word is promoted**. The nursery is left
+    /// un-forwarded throughout (nothing here writes to it), and on that error path the current
+    /// mature region is left in place, so the already-reclaimed mature generation is still
+    /// fully addressable from every reference.
+    ///
+    /// (Under the current selection rule the larger-region arm is defensive: a policy that
+    /// *keeps* the mature capacity only does so when it already has room for the promotion
+    /// plus the reserve. The fresh-region arm is the one a fragmented region reaches.)
     fn grow_major(
         &mut self,
         roots: &mut [Eterm],
@@ -742,10 +662,18 @@ impl GenImmixCollector {
         // target that is not strictly larger than the current capacity means the ceiling
         // (or the growth table's own ceiling) forbids growing at all.
         let target = self.policy.next_words(want, 0);
-        if target <= capacity {
-            return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
+        if target > capacity {
+            return self.relocate_major(roots, target, live_lines);
         }
-        self.relocate_major(roots, target, live_lines)
+        if live_lines <= self.mature.line_count() {
+            // Growth is forbidden, but the *in-place* region's fragmentation is not the last
+            // word: a fresh region of the same capacity is empty and packs monotonically, so
+            // the promotion that found no run gets one. The capacity is a whole number of
+            // blocks, so `line_count() * LINE_WORDS == capacity` and the target needs no
+            // raising (and would be clamped back to the ceiling if it were raised).
+            return self.relocate_major(roots, capacity, live_lines);
+        }
+        Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)))
     }
 
     /// A fullsweep that also **relocates** the mature generation into a differently-sized
@@ -766,6 +694,11 @@ impl GenImmixCollector {
     /// never run out of lines halfway — an explicit
     /// [`max_heap_words`](HeapPolicy::max_heap_words) ceiling that forbids the raise is the
     /// typed heap exhaustion instead, and the from-space is never left half-forwarded.
+    ///
+    /// The promotion itself is [atomic](\`promote\`), so a fresh region whose *run* layout
+    /// cannot place the graph is refused with the same typed exposure and **nothing
+    /// installed**: the trial region is dropped, the from-space keeps every live word at its
+    /// original address, and `mature()` is still the region the caller had.
     fn relocate_major(
         &mut self,
         roots: &mut [Eterm],
@@ -785,8 +718,7 @@ impl GenImmixCollector {
         } else {
             target
         };
-        let fresh = ImmixSpace::with_allocator(alloc, target)?;
-        let mut fresh = fresh;
+        let mut fresh = ImmixSpace::with_allocator(alloc, target)?;
         if fresh.free_lines() < live_lines {
             return Err(heap_exhausted(live_lines.saturating_mul(LINE_WORDS)));
         }
@@ -794,18 +726,22 @@ impl GenImmixCollector {
         // borrows (`root` via `from`, `fresh` via `to`) are disjoint, and the immutable
         // borrow of `self.mature` ends with the block below, before the field is replaced.
         let mut stats = {
-            let from = PromoteFrom {
-                nursery: {
-                    let mut set = FromSet::new();
-                    self.nursery.add_to_from_set(&mut set);
-                    set
-                },
-                mature: Some(&self.mature),
-            };
-            let stats = promote(&from, &mut fresh, roots)?;
-            drop(from);
-            self.mature = fresh;
-            stats
+            let from = PromoteFrom::new(&self.nursery, Some(&self.mature));
+            match promote(&from, &mut fresh, roots)? {
+                PromoteOutcome::Done(stats) => {
+                    drop(from);
+                    self.mature = fresh;
+                    stats
+                }
+                // The fresh region has the lines but not a contiguous run for one of the
+                // objects (first-fit packing can waste a block's tail): the trial region is
+                // dropped — never installed — and the from-space and the current region are
+                // exactly as they were, so this is the same typed exhaustion the pre-check
+                // above raises.
+                PromoteOutcome::WouldNotFit => {
+                    return Err(heap_exhausted(live_lines.saturating_mul(LINE_WORDS)));
+                }
+            }
         };
         stats.words_reclaimed = before.saturating_sub(stats.words_copied);
         self.minor_since_major = 0;

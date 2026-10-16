@@ -382,15 +382,46 @@ space whatever its occupancy, including one that never handed the mutator a word
 provably-empty case would be sound but changes `young_space_count()`, so it is deliberately not done.
 Pinned by `a_superseded_space_is_retained_and_never_freed_by_a_growth` and by `tests/nursery_chain.rs`.
 
-**Pre-existing, NOT related to this work: mark-region contiguity.** Driving the same cycle with a
-**100-word** (7-line) tuple at a 2048-word region fails after **43 rounds** with
-`Alloc(AllocFailure { requested: 800, kind: Heap })` while `mature_capacity_words()` still reports 2048.
+**Mark-region contiguity: promotion is now ATOMIC and the collector RECOVERS.** Driving the same cycle
+with a **100-word** (7-line) tuple at a 2048-word region used to fail after **43 rounds** with
+`Alloc(AllocFailure { requested: 800, kind: Heap })` while `mature_capacity_words()` still reported 2048.
 Cause: `ImmixSpace::alloc_words` needs a run of the object's 7 lines **inside one 16-line block**
-(`find_run`/`first_hole`), while the promote/reclaim pre-check compares against the region-wide
-`free_lines()`; two 7-line objects fill 14 of a block's 16 lines, so the region reports 8 free lines no
-single run can use and the promotion fails. It reproduces with an occupancy-only admission signal (chain
-length 1 throughout — the retention path not exercised at all). Recorded in `CONTEXT.md` "Known Gaps"; the
-pin test deliberately uses a block-aligned 256-word object so it pins the retention, not this gap.
+(`find_run`/`first_hole`), while the promote/reclaim pre-check compared against the region-wide
+`free_lines()`; two 7-line objects fill 14 of a block's 16 lines, so the region reports free lines no
+single run can use. The promotion used the shared `forward_slot` marker protocol and therefore failed
+**mid-copy** — a half-forwarded heap surfaced as a spurious allocation error.
+
+Both halves are now closed, deterministically:
+
+* **Atomic.** `immix_collector::promote` runs in two phases: a **reserve** phase that copies and marks but
+  rewrites no reference word, and a **rewrite** phase applied only once every object of the traversal has
+  been placed. A reservation that finds no run ends phase R, each source is restored from its own copy
+  (`copy_nonoverlapping(dst, src)`) and each reservation un-claimed through the new
+  `ImmixSpace::release_words` (the documented inverse of `claim`: clear the `allocated` bits, take a block
+  whose bitmap emptied back to `BlockState::Free`), so the from-space is **byte-identical** afterwards —
+  no marker, no rewritten root, no counter advanced. Measured: with the region packed to
+  **112 used / 16 free lines** (8 blocks x 14 lines, `can_reserve(100) == false`) a `collect_minor` of two
+  fresh 7-line tuples reports the typed `Alloc` error with `used_words()`, `used_lines()` (112),
+  `free_lines()` (16) and the full nursery word image unchanged, and a second attempt reproduces it
+  exactly (`tests/immix_fragmentation.rs::a_refused_promotion_leaves_both_spaces_byte_identical`).
+* **Recovering.** `GenImmixCollector::collect` escalates a refused minor to a **fullsweep** (reusing the
+  `needed`/`refs` its single `scan_young` already produced); `run_major` falls back to `grow_major` on a
+  refusal as well as on `free_lines() < needed`; and `grow_major` now also rebuilds a **fresh region of the
+  current capacity** when a `max_heap_words` ceiling forbids growing — an empty region packs monotonically,
+  so the run the fragmented in-place region could not produce is exactly what it has. So the failure is
+  simply gone: 64 rounds of two 7-line tuples at a 2048-word region reach a steady state of
+  **capacity 1024 words / peak 112 used lines / 14 fullsweeps / 50 minors**, and 48 rounds of 129-word
+  (**9-line**, one object per block) tuples reach **capacity 2048 / peak 72 used lines / 11 fullsweeps** —
+  identical on both the concrete collector and the `AnyCollector` seam, with every root
+  `beam_term::compare`-equal to an independently built witness after every round. The same counts are
+  deterministic round to round (no timing is asserted anywhere).
+
+**Residual sharp edge (honest).** Only a policy that *forbids* growth **and** a live set no fresh region of
+the current capacity can hold (`live_lines > line_count`) still reports the typed heap exhaustion — and
+then still **before any word is copied**. That is genuinely unsatisfiable, not a fragmentation artefact, and
+is what `tests/immix_major_growth.rs` (cap 256 on a one-block region with 20 live lines) and
+`src/immix_collector/grow_tests.rs` pin unchanged. `collect_minor`'s **own** public contract also still
+reports the typed error for a fragmented region rather than escalating — escalation is `collect`'s job.
 
 **Caveats.**
 * **The external RSS/latency figures are in [the end-to-end section below](#end-to-end-rss-and-latency-ets_copy-a-b-in-this-worktree).**
