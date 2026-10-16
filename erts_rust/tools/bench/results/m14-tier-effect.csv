@@ -1,0 +1,11 @@
+case,interp_ns,default_jit_ns,interp_over_default
+case_bstr_capitalize_token_ns_per_call,73225.10931111114,54545.37711111108,1.342
+case_bstr_to_lower_ns_per_call,70927.11621666666,63492.36928333332,1.117
+case_churn_ns_per_op,391058.51153333334,229110.82120000006,1.707
+case_emqx_base62_decode_ns_per_call,91591.5125111111,44499.36931111109,2.058
+case_emqx_base62_encode_ns_per_call,52767.83202666668,39281.50814666666,1.343
+case_etf_roundtrip_ns_per_op,127562.34458333332,111020.9228583333,1.149
+case_ets_copy_ns_per_op,13686.08831666667,9329.73893,1.467
+case_list_walk_ns_per_element,248.41195733333336,36.20797436666667,6.861
+case_send_recv_ns_per_op,135702.99386666663,210373.3945,0.645
+case_send_recv_plain_ns_per_op,69273.26231111115,67696.9152,1.023
