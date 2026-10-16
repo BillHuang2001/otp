@@ -64,6 +64,7 @@
 //! | [`dist`] | A.5 — the live two-node distribution loopback (handshake / node visibility / term delivery / non-Latin-1 atom round trip) via the external `dist_probe` helper (`CaseKind::Command`) |
 //! | [`flags`] | A.6 — CLI / configuration (incl. the `+hmax`/`+hmaxk`/`+hmaxel`/`+hmaxib`/`+hms`/`+hmbs` max-heap family) |
 //! | [`bifs`] | A.7 — BIF / OTP app surface (incl. the timer, process-control and code-loading families, `erts_debug:size/1`, `erts_internal:cmp_term/2`) |
+//! | [`maps`] | A.7 — the `maps` fun-taking BIFs (`fold`/`map`/`filter`/`foreach`) over a map *or* a `maps` iterator, and the `{badmap, _}` / `badarg` contract |
 //! | [`phash`] | A.7 — `phash/2` and `phash2/1,2` (the externally-observable legacy hashes) |
 //! | [`binmatch`] | A.7 — `binary:compile_pattern/1` + the compiled match/matches/split family |
 //! | [`math_bifs`] | A.7 — the `math` module: bit-exact values + the `badarith` failure surface |
@@ -71,6 +72,7 @@
 //! | [`ets`] | A.7 — ETS tables: the `ets:*` BIF surface the runtime serves |
 //! | [`ets_access`] | A.7 — the ETS access-control matrix (`public`/`protected`/`private` × owner/non-owner) |
 //! | [`ets_spec`] | A.7 — the `ets` match-spec / `select` family + the `info/1,2` fields + the `ordered_set` arithmetic-key rule |
+//! | [`ordered_walk`] | A.1 — the Erlang term-order walk over an `ordered_set` (`first`/`next` + `last`/`prev` across the `ORDER` = 32 node split, under mutation, and the absent-key anchor) |
 //! | [`proc_signals`] | A.7 — the group leader, the `dt_*` switches, `erlang:statistics/1`, `spawn_monitor`/`monitor` |
 //! | [`proc_control`] | A.7 — `monitor`/`demonitor`, the `exit/1,2` taxonomy, `register`/`unregister`/`whereis`, the run-queue priorities |
 //! | [`gc`] | A.1/A.7 — the per-process collector observed through the values it must preserve (forced collections, collector-stressing programs, the `garbage_collect`/`process_info` BIF surface) |
@@ -114,6 +116,7 @@ mod flags;
 mod flags_apply;
 mod format_limit;
 mod gc;
+mod maps;
 mod math_bifs;
 mod mexec;
 mod mexec_extra;
@@ -123,6 +126,7 @@ mod nif_abi;
 mod nif_abi_extra;
 mod nif_res;
 mod nif_so;
+mod ordered_walk;
 mod phash;
 mod printing;
 mod proc_control;
@@ -588,6 +592,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(ddll::group());
     cases.extend(decode_packet::group());
     cases.extend(bifs::group());
+    cases.extend(maps::group());
     cases.extend(phash::group());
     cases.extend(binmatch::group());
     cases.extend(math_bifs::group());
@@ -595,6 +600,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(ets::group());
     cases.extend(ets_access::group());
     cases.extend(ets_spec::group());
+    cases.extend(ordered_walk::group());
     cases.extend(proc_signals::group());
     cases.extend(re::group());
     cases.extend(proc_control::group());
