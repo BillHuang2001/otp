@@ -23,8 +23,10 @@
 //! Decoding is **allocation-aware**: the decoded term is materialized in the
 //! caller-supplied [`beam_alloc::Heap`] (production heap, not the `beam_term`
 //! test arena) and every atom is interned into the caller's [`AtomTable`] in wire
-//! order. The same code path therefore serves `binary_to_term`, distribution
-//! payloads and ETS blobs.
+//! order — unless the `binary_to_term/2 [safe]` flag is installed
+//! ([`Decoder::with_safe`]), in which case a wire atom *name* must already be in the
+//! table and a miss is `BeamError::BadArg`. The same code path therefore serves
+//! `binary_to_term`, distribution payloads and ETS blobs.
 //!
 //! This module is safe Rust; the raw heap writes it needs live in
 //! [`crate::term`]. The fun/export tag arms' helpers live in the child [`fun`]
@@ -44,6 +46,7 @@
 
 mod fun;
 mod local_node;
+mod options;
 mod record;
 
 use core::mem::size_of;
@@ -63,6 +66,8 @@ use crate::error::{bad_arg, system_limit};
 use crate::off_heap::OffHeapBinaries;
 use crate::reader::Reader;
 use crate::tag::{Tag, COMPRESSED_EXT, NIL_EXT, VERSION_MAGIC};
+
+pub use options::{decode_term_with_options, decode_term_with_options_used, DecodeOptions};
 
 /// The OTP atom-length ceiling, in **characters** (`erts/emulator/beam/erl_term.h`):
 /// a longer name is a `SystemLimit`, never a truncated atom.
@@ -147,6 +152,16 @@ pub struct Decoder<'a> {
     /// path (see `decode`), so it tracks the live recursion depth, not the number of
     /// terms decoded.
     depth: usize,
+    /// The C's `ERTS_DIST_EXT_BTT_SAFE` flag: the `binary_to_term/2 [safe]` option.
+    ///
+    /// With it set, an atom **name** on the wire is resolved by *lookup only*
+    /// (`erts_atom_get`) and a miss is `BadArg` instead of being interned
+    /// (`erts_atom_put`): `external.c:4529-4539` (`dec_term`), `:3073-3082`
+    /// (`dec_atom`) and `:2170-2171` (the option parse). Index-carrying forms
+    /// (`ATOM_CACHE_REF`, `ATOM_INTERNAL_REF2`/`3`) are unaffected — they name an
+    /// *existing* atom, so no lookup happens. `false` — the default — reproduces
+    /// today's bytes exactly; see [`Decoder::with_safe`] and [`DecodeOptions`].
+    safe: bool,
 }
 
 impl<'a> Decoder<'a> {
@@ -167,6 +182,7 @@ impl<'a> Decoder<'a> {
             local_hash: None,
             internal_node: false,
             depth: 0,
+            safe: false,
         })
     }
 
@@ -180,6 +196,7 @@ impl<'a> Decoder<'a> {
             local_hash: None,
             internal_node: false,
             depth: 0,
+            safe: false,
         }
     }
 
@@ -215,6 +232,11 @@ impl<'a> Decoder<'a> {
     /// `BeamError::SystemLimit`; heap exhaustion propagates from the heap as
     /// `BeamError::Alloc`. Every recognized tag is implemented, so this decoder never
     /// reports [`crate::error::unsupported`].
+    ///
+    /// With the `binary_to_term/2 [safe]` flag installed ([`Decoder::with_safe`]) an
+    /// atom *name* that is not already in `atoms` is also `BeamError::BadArg` — the C
+    /// resolves it by lookup only (`erts_atom_get`, `external.c:4529-4539`) instead of
+    /// interning it.
     ///
     /// [`Tag::Local`] is **not a term tag**: it is the `term_to_binary/2 [local]`
     /// wrapper `[VERSION_MAGIC][LOCAL_EXT][node-hash:4 BE][<term>]`. As the C does
@@ -361,28 +383,48 @@ impl<'a> Decoder<'a> {
             Tag::Atom => {
                 let len = usize::from(self.reader.u16be()?);
                 let bytes = self.reader.bytes(len)?;
-                Self::atom_term(&latin1_to_string(bytes), atoms)
+                self.atom_term(&latin1_to_string(bytes), atoms)
             }
             Tag::SmallAtom => {
                 let len = usize::from(self.reader.u8()?);
                 let bytes = self.reader.bytes(len)?;
-                Self::atom_term(&latin1_to_string(bytes), atoms)
+                self.atom_term(&latin1_to_string(bytes), atoms)
             }
             Tag::AtomUtf8 => {
                 let len = usize::from(self.reader.u16be()?);
                 let bytes = self.reader.bytes(len)?;
-                Self::atom_term(str::from_utf8(bytes).map_err(|_| bad_arg())?, atoms)
+                self.atom_term(str::from_utf8(bytes).map_err(|_| bad_arg())?, atoms)
             }
             Tag::SmallAtomUtf8 => {
                 let len = usize::from(self.reader.u8()?);
                 let bytes = self.reader.bytes(len)?;
-                Self::atom_term(str::from_utf8(bytes).map_err(|_| bad_arg())?, atoms)
+                self.atom_term(str::from_utf8(bytes).map_err(|_| bad_arg())?, atoms)
             }
             Tag::AtomCacheRef => {
                 let index = self.reader.u8()?;
                 let cache = self.cache.ok_or_else(bad_arg)?;
                 let atom = cache.get(index).ok_or_else(bad_arg)?;
                 Ok(make_atom(atom))
+            }
+            // `ATOM_INTERNAL_REF2` (`'I'`, 73) / `ATOM_INTERNAL_REF3` (`'K'`, 75): an
+            // atom named by an atom-table **index** (`external.c:5177-5192` in
+            // `dec_term`, `:3085-3100` in `dec_atom`). Unlike the other
+            // internal-ref tags these arms carry **no** `internal_tags` gate
+            // (`external.c:6413-6434`), so the oracle accepts them unconditionally:
+            // `binary_to_term(<<131,73,0,5>>)` → the atom at index 5, while an index
+            // past the table (`<<131,73,255,255>>`) is `badarg` — exactly
+            // `erts_is_atom_index_ok` (`ix < erts_atom_table.entries`, `atom.h:123-135`),
+            // which here is `index < atoms.len()`. Because the index names an *existing*
+            // atom there is no lookup and nothing to intern, so the `safe` flag does
+            // **not** apply (verified: `binary_to_term(<<131,73,0,5>>, [safe])` → the
+            // atom, not `badarg`).
+            Tag::AtomInternalRef2 => {
+                let index = u32::from(self.reader.u16be()?);
+                Self::indexed_atom(index, atoms)
+            }
+            Tag::AtomInternalRef3 => {
+                let index = self.reader.u24be()?;
+                Self::indexed_atom(index, atoms)
             }
 
             // ---------------------------------------------------------------
@@ -804,17 +846,47 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Interns `name` and returns the atom term.
+    /// Resolves an atom **name** off the wire: the one materialization site for every
+    /// named atom (`dec_term`'s four atom arms, `external.c:4529-4539`, and the C
+    /// `dec_atom` used for identifier node atoms, fun/export module+function atoms and
+    /// record module/name/key atoms — all of which reach the generic walker here).
     ///
     /// A name longer than `MAX_ATOM_CHARS` *characters* is malformed input
-    /// (`badarg`): C rejects such a name in `erts_atom_put`/`erts_atom_get`
-    /// (`atom.c:258-274`, `atom.c:392-418`) and `dec_term` turns that into
-    /// `goto error` (`external.c:4529-4539`).
-    fn atom_term(name: &str, atoms: &mut AtomTable) -> Result<Eterm> {
+    /// (`badarg`): both C resolution paths reject such a name up front
+    /// (`erts_atom_put`/`erts_atom_get`, `atom.c:258-274` / `:392-418`) and `dec_term`
+    /// turns that into `goto error` (`external.c:4529-4539`). The length check runs
+    /// **before** either branch, exactly as the C's two functions check it first
+    /// (`atom.c:392-394`).
+    ///
+    /// Under the `[safe]` flag ([`Decoder::with_safe`]) the name is resolved by
+    /// **lookup only** (`erts_atom_get`) and a miss is `BadArg`; without it the name
+    /// is interned (`erts_atom_put`). This is the C's own split
+    /// (`external.c:4530-4539`).
+    fn atom_term(&self, name: &str, atoms: &mut AtomTable) -> Result<Eterm> {
         if name.chars().count() > MAX_ATOM_CHARS {
             return Err(bad_arg());
         }
+        if self.safe {
+            let atom = atoms.lookup(name).ok_or_else(bad_arg)?;
+            return Ok(make_atom(atom));
+        }
         Ok(make_atom(atoms.intern(name)))
+    }
+
+    /// Materializes the atom an `ATOM_INTERNAL_REF2` (`73`) / `ATOM_INTERNAL_REF3`
+    /// (`75`) index names.
+    ///
+    /// The gate is exactly C `erts_is_atom_index_ok` (`ix < erts_atom_table.entries`,
+    /// `atom.h:123-135`): an index at or past the table's length is `badarg`, never a
+    /// fabricated atom. `AtomTable` is append-only with dense `0..len` indices, so
+    /// `index < atoms.len()` is that predicate word for word. The atom is built from
+    /// the raw index with no lookup and no interning, so the `safe` flag does not
+    /// apply — an index names an atom that already exists.
+    fn indexed_atom(index: u32, atoms: &AtomTable) -> Result<Eterm> {
+        if (index as usize) >= atoms.len() {
+            return Err(bad_arg());
+        }
+        Ok(make_atom(Atom::from_raw(index)))
     }
 
     /// Decodes a nested term and requires it to be an atom (the node field of an
