@@ -75,9 +75,9 @@ Dispatched before `call_registered`, those four keys **shadow** `beam_bifs`'s sa
 | BIF | Oracle answer |
 |---|---|
 | `erl_ddll:loaded_drivers/0` | `{ok, [Name, …]}` — each name a charlist: the three **statically linked** built-ins first (`tcp_inet`, `udp_inet`, `ram_file_drv`, that order), then the dynamically loaded names in load order |
-| `erl_ddll:try_load/3` | `{ok,loaded}` / `{ok,already_loaded}` / `{error,{open_error,-10}}` / `{error,Reason}` |
-| `erl_ddll:try_unload/2` | `ok` / `{error,not_loaded}` |
-| `erl_ddll:info/2` | the item value of a **loaded** name; `badarg` for an unknown name or item |
+| `erl_ddll:try_load/3` | `{ok,loaded}` / `{ok,already_loaded}` / `{error,{open_error,-10}}` / `{error,Reason}`; a statically linked name → `{error,linked_in_driver}` |
+| `erl_ddll:try_unload/2` | `ok` / `{error,not_loaded}`; a statically linked name → `{error,linked_in_driver}` |
+| `erl_ddll:info/2` | the item value of a **known** name (a statically linked one takes the `handle == NULL` branch below); `badarg` for an unknown name or item |
 **Error mapping** (mirroring `beam_bifs`'s `load_error_tuple`): a `DriverLoadError` whose reason is a fixed `errcode_tab` code becomes the **bare reason atom**; a failed `dlopen` becomes `{open_error, -10}` (`ERL_DE_DYNAMIC_ERROR_OFFSET`); a malformed argument or option is `badarg`, never a fabricated result.
 **The three statically linked built-ins are modelled** as a pure constant `STATIC_DRIVERS` = `tcp_inet`/`udp_inet`/`ram_file_drv` (the C `driver_list` entries with `handle == NULL`): they are listed FIRST by `loaded_drivers/0`, a static name's `try_load/3`/`try_unload/2` answers `{error,linked_in_driver}` (`erl_bif_ddll.c:281-285`, `:545-547`), and its `info/2` takes the C's `handle == NULL` item branch (`erl_bif_ddll.c:728,743,752,775`) — `linked_in_driver` → `true`, `permanent` → `false`, and `port_count`/`driver_options`/`processes`/`awaiting_load`/`awaiting_unload` → the ATOM `linked_in_driver` (any other item `badarg`).
 `beam_bifs`' `runtime::ddll::registry::STATIC_DRIVERS` mirrors that set but is `pub(crate)` there, so the floor restates it locally rather than taking a new dependency edge; a **dynamically** loaded driver's answers are unchanged (load order, `linked_in_driver` → `false`, `port_count` → `0`, `processes` → `[{Pid,1}]`).
