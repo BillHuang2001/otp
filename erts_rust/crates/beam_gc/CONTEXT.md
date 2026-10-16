@@ -65,14 +65,14 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   are built on, so their per-object sizing and child enumeration cannot drift.
 - `pub(crate) struct Visited` — the walk's one-bit-per-range visited set: a range is resolved per address by
   `Visited::index(ptr, from)`, which **delegates to `FromSet::locate`** (the one place the range geometry is
-  decided), so the walk classifies an address as from-space in `O(log #ranges)` and exactly the same way
+  decided), so the walk classifies an address as from-space in `O(log #ranges)`, exactly as
   `FromSet::contains` does.
 - `pub(crate) fn for_each_reachable_view(...)` / `for_each_reachable(...)` — the shared body and the raw
   `(header, ptr)` form of the enumeration: every reachable **boxed object** exactly once; a cons cell is
-  traversed (so the objects behind it are reached) but not reported; **layout-agnostic** (reports *which*
-  objects are reachable, never what they contain). All are read-only (no forwarding marker), iterative (a
-  50 000-chain does not recurse), dedup by first-word address, and skip every reference outside `from`
-  (literal, foreign space, off-heap pointer — `Target::Foreign`); the word-level `unsafe` lives here.
+  traversed (so the objects behind it are reached) but not reported; **layout-agnostic**. All are read-only
+  (no forwarding marker), iterative (a 50 000-chain does not recurse), dedup by first-word address, and skip
+  every reference outside `from` (literal, foreign space, off-heap pointer — `Target::Foreign`); the
+  word-level `unsafe` lives here.
 
 ### `collector.rs` — the two-generation collector
 - `pub enum CollectionKind { Minor, Major }`; `pub struct Collection { pub kind, pub stats: GcStats }`
@@ -96,8 +96,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     read-only reachability enumeration** (the off-heap liveness scan's marking half): every reachable **boxed
     object** across the **whole heap** (every nursery space + the mature generation's live region `[base,
     top)`), each once, as `(header_word, *const Eterm)`; `for_each_reachable_object_view(...)` is the
-    **no-caller-`unsafe`** sibling (same walk, safe `ReachableObject` callback). Walk semantics (iterative,
-    cycle-safe, layout-agnostic, cons cells traversed not reported): `reachable.rs` above. Both mirrored.
+    **no-caller-`unsafe`** sibling (safe `ReachableObject` callback). Both mirrored.
   - After **every** collection the chain is collapsed to one space via `Nursery::collapse`, which re-sizes
     that space via `young_after_collection` from the round's **surviving** words, and a fullsweep sizes the
     fresh mature space from `live.rs`'s exact live count plus the **young heap's occupancy** — never the
@@ -221,14 +220,11 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   `push` (slot-discarding append), `insert -> usize` (append returning the slot — the index an on-heap
   off-heap reference stores in its `val` word), `get(slot) -> Option<&OffHeapEntry>` (`None` also for a
   **released** slot), `iter()` (the **live** entries in slot order), `len()`/`is_empty()`/`overhead_bytes()`
-  (**live** entries only; `overhead_bytes` sums payload bytes, not the `Vec` capacity), and
-  `sweep<F: FnMut(&OffHeapEntry) -> bool>(is_live) -> usize` — releases the dead entries **in place**
-  (dropping each exactly once: a `RefcBinary` frees its payload at zero refcount, an `Mso` runs its
-  destructor), returning how many were released; the caller supplies the liveness predicate. A released slot
-  is kept in place (as `None`), so `sweep` never shifts, reorders, compacts or reuses a slot and a later
-  `insert` appends at a fresh index — required because an on-heap off-heap reference stores the slot index in
-  its `val` word (`beam_message::layout::make_off_heap_container` / `off_heap_slot`), which a compacting
-  sweep would silently invalidate. Deliberate trade-off: memory is bounded by total inserts, not live objects.
+  (**live** entries only), and `sweep<F: FnMut(&OffHeapEntry) -> bool>(is_live) -> usize` — releases the dead
+  entries **in place** (dropping each exactly once), returning how many were released; the caller supplies
+  the liveness predicate. A released slot is kept in place (as `None`), so `sweep` never shifts, reorders,
+  compacts or reuses a slot — required because an on-heap off-heap reference stores the slot index in its
+  `val` word (`beam_message::layout::make_off_heap_container` / `off_heap_slot`).
 
 ### `stats.rs` / `error.rs`
 `GcStats` — `words_copied`, `words_reclaimed`, `objects_copied`, `minor_collections`, `major_collections`
@@ -305,10 +301,13 @@ constructors only (no new error enum).
   `Collector`/`GenImmixCollector` own a `Nursery` — a **current** space plus the spaces a growth **retired**
   — rather than a single `HeapSpace`. `HeapSpace` never reallocates, so growing by *replacement* would strand
   every live word; `Nursery::grow` instead **retains** the old space and points the allocator at a fresh one,
-  so every live word keeps its **original address** and nothing is moved. The step is at least a **doubling**:
-  `Nursery::grow` requests `need_words.max(2 * capacity)` and installs `policy.next_words(request, 0)`, so a
-  caller that grows repeatedly at a **constant** request climbs the growth table geometrically — each call
-  retires a space at least twice the one before — so the chain stays `O(log(heap))` long.
+  so every live word keeps its **original address** and nothing is moved. The step is the plain one-step
+  `next_words(need_words, 0)` whenever that already enlarges the space (a genuinely larger request is
+  unchanged), and only **at least** `next_words(2 * capacity, 0)` when the one-step target would install a
+  space no larger than the one it replaces, so a caller that grows repeatedly at a **constant** request
+  climbs the growth table geometrically — each call retires a genuinely larger space, and the doubling
+  branch fires on every call whose predecessor did not already enlarge past the request — so the chain stays
+  `O(log(heap))` long.
   **Containment over the chain is indexed, not scanned.** `Nursery::contains` answers from an ordered index
   of the retired spaces' live regions plus one direct test of the current space
   (`retired_regions: BTreeMap<base, top>`), so it is `O(log #spaces)` rather than a walk over every space.
@@ -384,13 +383,11 @@ constructors only (no new error enum).
 
 ### Measured (every figure, table and caveat is in `MEASURED.md`)
 - Folding the **young heap's occupancy** into the fullsweep's size request is what makes the mature
-  generation reachable at the default policy — the copying default runs **147 minors : 73 fullsweeps** (young
-  233 / mature **376**, total 609) instead of escalating every collection to a fullsweep.
+  generation reachable at the default policy — the copying default runs **147 minors : 73 fullsweeps**.
 - GenImmix wins **copy work on long-lived data** but pays footprint and pause on the small-heap/high-churn
   shape, so **`MatureKind::Copying` remains the default** and Immix is a size-/latency-tolerant option
-  auto-selected at ≥ `IMMIX_BREAK_EVEN_WORDS` (2048 = 8 whole blocks, read from the construction-time
-  `initial_mature_words`) or by an explicit pin (`BEAM_RT_GC_STRATEGY=immix`; the break-even reproduces
-  through `beam_rt`'s own GC doors in `../beam_rt/tests/gc_{immix_payload,strategy}.rs`).
+  auto-selected at ≥ `IMMIX_BREAK_EVEN_WORDS` (2048, from the construction-time `initial_mature_words`) or
+  by an explicit pin (`BEAM_RT_GC_STRATEGY=immix`; `../beam_rt/tests/gc_{immix_payload,strategy}.rs`).
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
@@ -413,102 +410,72 @@ constructors only (no new error enum).
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` live in `space`, `policy`, `mso`, `heap_info`, `config`, `selection`,
-  `any_collector`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`), `immix/tests.rs` and `live`;
-  `live`'s module proves `live`/`live_full` equal a real collection's `words_copied`/line need, incl. the
-  mature generation (a relocating major; a refc binary counted on-heap only). **`copy.rs` and `collector.rs`
+  `any_collector`, `nursery`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`), `immix/tests.rs`
+  and `live`; `live`'s module proves `live`/`live_full` equal a real collection's `words_copied`/line need, incl.
+  the mature generation (a relocating major; a refc binary counted on-heap only). **`copy.rs` and `collector.rs`
   carry no in-module tests** — the copier is pinned by `tests/copy_correctness.rs`, the driver by
   `tests/generations.rs` / `tests/gc_pressure*.rs`.
-- `tests/copy_correctness.rs` → structure preserved, roots relocated, exactly the live size retained,
-  off-from-space refs verbatim.
-- `tests/generations.rs` → minors + a major: `CollectionKind`, survival, empty nursery, escalation.
-- `tests/map_copy.rs` / `tests/refc_binary_copy.rs` → the map forms and the 8-word refc pair survive, sized
-  to an independently measured footprint.
-- `tests/fun_copy.rs` → all three fun kinds, exact `1 + desc_words + num_free` sizing, the >255-arity
-  External descriptor, descriptor opacity.
-- `tests/subtag_copy.rs` → bignum, native-record instance, `ErlSubBits` match context, external port/ref,
-  HAMT head node — each with its exact independent footprint.
-- `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` + `tests/gen_immix_collector.rs`
-  → geometry/allocation/mark/pin/evacuation/accounting and the hard major cases; one corpus through both
-  strategies behind one structural walker; a multi-block object.
-- `tests/immix_fragmentation.rs` → the atomic promotion: a refused promotion leaves both spaces
-  byte-identical (same roots, no marker, counters unchanged, identical on retry), and the 7-line/100-word and
-  9-line fragmentation shapes now reach a bounded steady state under both strategies with the live set
-  `compare`-equal to a witness after every round (deterministic counts asserted, no timing).
-- `tests/immix_break_even.rs` → a geometry `Law` asserted at every point; the 8-block constant pinned (NOT
-  one line below); pause printed only.
-- `tests/immix_selection_curve.rs` → the two-axis curve, "moved words are object-size- and
-  occupancy-invariant" asserted; pauses printed only.
-- `tests/immix_workloads.rs` / `tests/allocation_heavy_workload.rs` → the two measurements behind
-  `MEASURED.md`; deterministic counts asserted, pause printed only.
-- `tests/mature_selection.rs` → the rule + the explicit override both ways + a threshold-crossing corpus with
-  `compare::eq`-equal roots.
-- `tests/production_dispatch.rs` → one process-shaped workload through both strategies in **lockstep**
-  (identical kinds, structurally equal roots); the accessors agree with the concrete spaces; the mark-region
-  range test is the over-inclusive one; `from_config(default)` → Copying, `>= IMMIX_BREAK_EVEN_WORDS` → Immix.
-- `tests/heap_sizing.rs` → growth/shrink bounds, clamping, `from_spawn_opts`, the `fullsweep_after` counter
-  (incl. 0), the relocating Immix fullsweep, `HeapInfo` order, a system-`erl` cross-check (SKIPS LOUDLY).
-- `tests/gc_pressure.rs` / `_structures` / `_offheap` → many minors/majors (nursery empty + roots intact
-  after *each* collection), HAMT promotion, shared/cyclic graphs, off-heap binaries freed once.
-- `tests/heap_growth.rs` → the mature generation grows while the nursery stays bounded; a too-small cap
-  returns typed with **nothing copied**; `ensure_capacity` grows or errors typed.
-- `tests/nursery_bounded.rs` → a growing load plateaus the nursery + total heap; a garbage-heavy collection
-  shrinks it; a larger request grows it via `ensure_capacity`.
-- `tests/nursery_chain.rs` → `grow_nursery` preserves every live term **at its original address** and runs no
-  collection (the chained-nursery no-relocation seam); a graph spanning the growth boundary still collects
-  under BOTH strategies; `young_contains` covers every nursery space (false for a foreign address) and the
-  chain collapses to one space after a collection; a request the policy ceiling cannot reach returns the
-  typed `heap_exhausted` and leaves the collector untouched; a grow-then-collect loop plateaus.
-- `tests/containment_index.rs` → the nursery chain's indexed range test: a chain of 1 200 retired spaces
-  answers `contains` exactly (the current space included, a foreign address rejected); both concrete
-  collectors agree on the predicate at chain lengths 1/2/3/8/64/RETIRED and keep the predicate identical at
-  every length; a long chain claims only its own live regions.
-- `tests/nursery_growth_retention.rs` → a superseded space is retained (never freed by a growth) and is debt
-  whatever its occupancy; `collection_debt()` is true while a space is retained and false after a collection;
-  `should_collect` stays **occupancy-only**; 400 grow + "debt ⇒ collect" admission cycles keep the chain at
-  one retired space with a bounded plateau.
-- `tests/memory_overhead.rs` → per-object overhead `< 1` word (measured 0) + an RSS/word-count plateau
-  (skipped loudly off-Linux).
-- `tests/reachable_objects.rs` → the public enumeration: a live graph spanning young + mature + a **chained**
-  nursery yields exactly the reachable boxed objects, once each, no garbage (read-only); a live refc binary's
-  `BinRef` handle reported (its `val` names the payload), an unreachable one not; a 50 000-object chain and a
-  three-tuple ring (cons cells traversed, not reported); `AnyCollector` forwards. The reached range geometry
-  is pinned in-module by `reachable.rs`'s `the_visited_bit_index_partitions_the_ranges_exactly` /
-  `the_visited_bit_is_set_once_per_address`, and the indexed range test itself by `space.rs`'s
-  `from_set_contains_is_exact_over_many_disjoint_ranges` /
-  `from_set_contains_handles_the_same_range_added_more_than_once` and `nursery.rs`'s
-  `the_containment_index_mirrors_the_chain_and_answers_exactly`.
-- `tests/stress_cross_generation.rs` → one mixed graph through 6 minors + 2 majors under both strategies:
-  structural equality after *each* collection, sharing, cycle closure, dropped garbage.
-- `tests/collector_adversarial.rs` → break-attempts through both strategies + the primitive path (deep
-  nesting proves the copier **iterative**; an exact-capacity boundary; off-heap frees exactly once).
-- `tests/cyclic_safety.rs` → `size_object_bounded`'s typed `TermGraphCyclic` (never a hang) + each cyclic
-  object copied once.
-- `tests/fill_barrier.rs` → a too-small destination returns typed **before any copy** (counters
-  byte-identical, identical on retry); `ensure_capacity` fails fast under a cap; no half-forward observable.
-- `tests/retained_vs_live.rs` → copying hits `mature_used == live` (0 surplus), Immix ≤4x live (1.778x);
-  constant capacities; RSS plateau ≤1.5x.
-- `tests/immix_invariants.rs` → mutation-verified: the `run_major` ordering, line-bitmap consistency, no
-  double-free, idempotent repeated collections.
-- `tests/immix_stress.rs` → multi-block promotion, fragmentation/reuse, repeated-minor promotion, a mixed
-  workload equal under both strategies, an asserted live-set-bounded accounting.
-- `tests/steady_state.rs` → the DEFAULT-cadence steady state: nursery + mature converge to a constant
-  (233/**376** Copying, 233/512 Immix), the occupancy cycle pinned per strategy.
-- `tests/generational_cadence.rs` → the mature-generation room-policy gate: at the default policy a churn
-  workload runs **minors**, `minor_gcs()` advances on a minor and resets on a fullsweep, survivors stay
-  resident and structurally intact in the mature generation after every collection, dead data is reclaimed,
-  both capacities converge — both strategies.
-- `tests/offheap_liveness.rs` → an off-heap handle inside a moved container: refcount stable, payload
-  verbatim, handle relocated, freed once when the container dies.
-- `tests/offheap_slot_stability.rs` → a simulated on-heap `val`-slot container still resolves after a
-  **middle** sweep; released slots answer `None` and are never reused; a released `RefcBinary` payload is
-  freed exactly once.
-- `tests/offheap_steady_state.rs` → exact `live`/`live_full` agreement with a real `collect_major` in place
-  and on relocation; `.lines` load-bearing (`used_lines == 20` where `lines_for(104) == 7`); off-heap-heavy
-  graphs counted on-heap only, an `Mso` payload never as heap; a 240-round bounded default-cadence steady
-  state.
-- `tests/mature_capacity_convergence.rs` → the fullsweep mature capacity converges (no unbounded growth).
-- `tests/immix_major_growth.rs` → a growable heap grows the region instead of erroring; a `max_heap_words`
-  cap yields the typed `heap_exhausted` before any copy.
+- **Copy correctness**: `tests/copy_correctness.rs` (structure preserved, roots relocated, exactly the live size
+  retained, off-from-space refs verbatim); `tests/map_copy.rs` / `tests/refc_binary_copy.rs` (the map forms and
+  the 8-word refc pair, sized to an independently measured footprint); `tests/fun_copy.rs` (all three fun kinds,
+  exact `1 + desc_words + num_free` sizing, the >255-arity External descriptor, descriptor opacity);
+  `tests/subtag_copy.rs` (bignum, native-record instance, `ErlSubBits` match context, external port/ref, HAMT
+  head node — each with its exact independent footprint).
+- **Generations, cadence and sizing**: `tests/generations.rs` (`CollectionKind`, survival, empty nursery,
+  escalation); `tests/steady_state.rs` (nursery + mature converge — 233/**376** Copying, 233/512 Immix);
+  `tests/generational_cadence.rs` (the room-policy gate: the default policy's churn workload runs **minors**,
+  `minor_gcs()` advances/resets, survivors stay intact in mature, both capacities converge — both strategies);
+  `tests/mature_capacity_convergence.rs`; `tests/heap_sizing.rs` (growth/shrink bounds, clamping,
+  `from_spawn_opts`, `fullsweep_after` incl. 0, the relocating Immix fullsweep, `HeapInfo` order, a system-`erl`
+  cross-check that SKIPS LOUDLY); `tests/memory_overhead.rs` (per-object overhead `< 1` word, measured 0, plus an
+  RSS/word-count plateau, skipped loudly off-Linux).
+- **Nursery growth**: `tests/nursery_chain.rs` (`grow_nursery` preserves live terms **at their original
+  address** and runs no collection; a graph spanning the growth boundary still collects under BOTH strategies;
+  `young_contains` covers every space and the chain collapses after a collection; a ceiling it cannot reach
+  returns the typed `heap_exhausted` and leaves the collector untouched; a grow-then-collect loop plateaus);
+  `tests/containment_index.rs` (the indexed range test: 1 200 retired spaces answered exactly, both concrete
+  collectors agreeing at chain lengths 1/2/3/8/64/RETIRED, a long chain claiming only its own live regions);
+  `tests/nursery_growth_retention.rs` (a superseded space is retained, never freed by a growth, and is debt
+  whatever its occupancy; `collection_debt()` true while a space is retained and false after a collection;
+  `should_collect` stays **occupancy-only**; 400 grow + "debt ⇒ collect" cycles hold the chain at one retired
+  space with a bounded plateau); `tests/nursery_bounded.rs` (a growing load plateaus the nursery + total heap; a
+  garbage-heavy collection shrinks it; a larger request grows it via `ensure_capacity`);
+  `tests/heap_growth.rs` (the mature generation grows while the nursery stays bounded; a too-small cap returns
+  typed with **nothing copied**); `tests/reachable_objects.rs` (the enumeration over young + mature + a
+  **chained** nursery, each object once, no garbage; a live refc binary's `BinRef` reported and an unreachable
+  one not; a 50 000-object chain, a three-tuple ring, `AnyCollector` forwarding, and the safe view — the reached
+  range geometry pinned in-module by `reachable.rs`/`space.rs`/`nursery.rs`).
+- **Immix**: `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` +
+  `tests/gen_immix_collector.rs` (geometry/allocation/mark/pin/evacuation/accounting and the hard major cases;
+  one corpus through both strategies behind one structural walker; a multi-block object);
+  `tests/immix_fragmentation.rs` (the atomic promotion: a refused promotion leaves both spaces byte-identical —
+  same roots, no marker, counters unchanged, identical on retry — and the 7-line/100-word and 9-line shapes reach
+  a bounded steady state under both strategies with the live set `compare`-equal to a witness every round);
+  `tests/immix_break_even.rs` (a geometry `Law` at every point; the 8-block constant pinned NOT one line below);
+  `tests/immix_selection_curve.rs` ("moved words are object-size- and occupancy-invariant" asserted);
+  `tests/immix_workloads.rs` / `tests/allocation_heavy_workload.rs` (the measurements behind `MEASURED.md`);
+  `tests/immix_invariants.rs` (mutation-verified `run_major` ordering, line-bitmap consistency, no double-free,
+  idempotent repeats); `tests/immix_stress.rs` (multi-block promotion, fragmentation/reuse, repeated-minor
+  promotion, a mixed workload equal under both strategies); `tests/immix_major_growth.rs` (a growable heap grows
+  the region instead of erroring; a `max_heap_words` cap yields the typed `heap_exhausted` before any copy);
+  `tests/mature_selection.rs` (the rule + the explicit override both ways + a threshold-crossing corpus);
+  `tests/production_dispatch.rs` (one process-shaped workload through both strategies in **lockstep** — identical
+  kinds, structurally equal roots — with the accessors agreeing with the concrete spaces and the mark-region
+  range test the over-inclusive one). Pauses are printed only, never asserted.
+- **Barriers, adversarial cases and off-heap**: `tests/fill_barrier.rs` (a too-small destination returns typed
+  **before any copy**, counters byte-identical and identical on retry; `ensure_capacity` fails fast under a cap);
+  `tests/collector_adversarial.rs` (break-attempts through both strategies + the primitive path: deep nesting
+  proves the copier **iterative**, an exact-capacity boundary, off-heap frees exactly once);
+  `tests/cyclic_safety.rs` (`size_object_bounded`'s typed `TermGraphCyclic`, never a hang, + each cyclic object
+  copied once); `tests/retained_vs_live.rs` (copying hits `mature_used == live`, Immix ≤4x live, RSS plateau
+  ≤1.5x); `tests/stress_cross_generation.rs` (one mixed graph through 6 minors + 2 majors under both strategies:
+  structural equality after *each* collection, sharing, cycle closure, dropped garbage);
+  `tests/gc_pressure.rs` / `_structures` / `_offheap` (many minors/majors with the nursery empty and the roots
+  intact after *each* collection, HAMT promotion, shared/cyclic graphs, off-heap binaries freed once);
+  `tests/offheap_liveness.rs` (an off-heap handle inside a moved container: refcount stable, payload verbatim,
+  handle relocated, freed once); `tests/offheap_slot_stability.rs` (a `val`-slot container still resolves after a
+  **middle** sweep, released slots answer `None` and are never reused); `tests/offheap_steady_state.rs` (exact
+  `live`/`live_full` agreement with a real `collect_major` in place and on relocation, `.lines` load-bearing).
 - **Per-shape copy coverage.** Sizing/walk is `../beam_term`'s `layout::{object_words, for_each_child_slot}`;
   direct evidence exists for every shape (cons/tuples, flat + HAMT maps, the refc pair, all three fun kinds,
   bignums, a native-record instance, an `ErlSubBits` match context, external ports/refs, a HAMT head node, a
@@ -546,9 +513,7 @@ constructors only (no new error enum).
   provably-empty (`used_words() == 0`) case would be sound but changes `young_space_count()`, so it is
   deliberately not done. The **only** thing that frees a retired space is `Nursery::collapse`
   (`retired.clear()`, run at the end of every `collect_minor`/`collect_major`), because the collection's
-  from-set covers every space (`Nursery::spaces`) and has copied everything reachable out. Nothing else frees
-  a retired space, and the chain needs no cap: `Nursery::grow` installs at least a doubling, so the chain is
-  `O(log(heap))` long and the retained words are the ladder's geometric sum, not a function of the call count.
+  from-set covers every space (`Nursery::spaces`) and has copied everything reachable out.
 - **The chain's *collection debt* is an opt-in seam; `should_collect` stays occupancy-only.**
   `Nursery::retains_old_spaces` is the chain's debt query, exported on `Collector`, `GenImmixCollector` and
   `AnyCollector` (forwarding) as `collection_debt() -> bool`. A `true` answer means *a collection is required
@@ -586,14 +551,11 @@ constructors only (no new error enum).
   sweeps it as the last step of every rooted collection, in **two halves**: a **reachability-driven** half
   (`sweep_off_heap_binaries_reachable` — enumerate the whole heap through `for_each_reachable_object`, record
   each reachable `BinRef` payload pointer, release every owned payload no reachable `BinRef` names; it
-  **declines** — retains everything — for a process with `has_unpublished_roots()`, and skips the O(heap)
-  walk when it owns no binaries) and a **conservative** half (`sweep_off_heap_binaries`, releasing exactly
-  the entries the caller declared dead; always runs, so a declared death is honoured regardless;
-  `retain_off_heap_binaries(is_live)` is the caller-predicate form). **This crate's half — the marking walk —
-  is public and layout-agnostic:** `for_each_reachable_object` (+ its `GenImmixCollector`/`AnyCollector`
-  siblings and the view forms) reports *which* objects are reachable, never what they contain, so the caller
-  applies its own `ErlSubBits`/`BinRef` subtag test and reads the payload pointer word, and this crate takes
-  no dependency on `beam_message`'s container interior.
+  **declines** — retains everything — for a process with `has_unpublished_roots()`) and a **conservative**
+  half (`sweep_off_heap_binaries`, releasing exactly the entries the caller declared dead). **This crate's
+  half — the marking walk — is public and layout-agnostic:** it reports *which* objects are reachable, never
+  what they contain, so the caller applies its own `ErlSubBits`/`BinRef` subtag test and reads the payload
+  pointer word, and this crate takes no dependency on `beam_message`'s container interior.
 
 ## Handoffs (owned by other nodes)
 - **The strategy switch is adopted; the residual is an explicit pin on the process-construction path.**
@@ -616,12 +578,12 @@ constructors only (no new error enum).
   `error:system_limit`. `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap".
 - **A `run` process collects at its own heap admissions; the retained chain is reachable only through the
   un-rooted allocation seam.** A `$TMPDIR`-built probe under `beam_rt run` (an `ets:insert`/`ets:lookup` loop
-  over a 5-field payload map) shows `minor_gcs` advancing ≈ `N/3` on **both** the pre-fix and fixed binaries
-  and a `process_info(memory)` **flat** in N (identical bytes at N = 100 and N = 20 000), so nothing retains
-  per iteration on that route and an explicit `erlang:garbage_collect()` adds no collection of its own. A
-  chain therefore only builds up on the paths that never reach a heap-admission point (the un-rooted
-  `alloc_words` growth seam, a declined valve, a `relocation_exempt`/halted/disabled process), where the door
-  may consult `collection_debt()` before it can collect at all. Owner of the door: `beam_rt`.
+  over a 5-field payload map) shows `minor_gcs` advancing ≈ `N/3` and a `process_info(memory)` **flat** in N
+  (identical bytes at N = 100 and N = 20 000), so nothing retains per iteration on that route and an explicit
+  `erlang:garbage_collect()` adds no collection of its own. A chain therefore only builds up on the paths
+  that never reach a heap-admission point (the un-rooted `alloc_words` growth seam, a declined valve, a
+  `relocation_exempt`/halted/disabled process), where the door may consult `collection_debt()` before it can
+  collect at all. Owner of the door: `beam_rt`.
 - **Test-id / MSO / `compare` caveats (cross-crate).** A pid is a heap term via
   `beam_term::thing::write_external_pid` (4 words) **and** `beam_term::compare::eq` orders it
   **structurally through its parts** (field order per the C `erts_cmp`), with `external_pid_parts` available
@@ -642,7 +604,7 @@ constructors only (no new error enum).
 - **Address-level membership is public; enumeration of the nursery chain is NOT.** From outside the crate a caller reaches only the **current** nursery space (`young() -> &HeapSpace`), a space **count** (`young_space_count()`) and a membership test over **every** space (`young_contains(ptr)`); the `Nursery` chain itself (`spaces()`, the retired spaces' base/top) is `pub(crate)`, so a grown chain's individual ranges cannot be enumerated externally. The mature side is fully addressable (`mature_base`/`mature_capacity_words`/`mature_used_words`/`mature_contains` on `AnyCollector`; `Collector::mature() -> &HeapSpace` / `GenImmixCollector::mature() -> &ImmixSpace`).
 - **There is no public from-space/"retired spaces"/epoch accessor.** `FromSet` is public and constructible (`new`/`add(&HeapSpace)`/`contains`/`words`) but `ranges()` is `pub(crate)` and the collector builds its from-set internally; a major **drops** the old mature space (`self.mature = fresh`) — so a collection's from-space ranges must be captured from `young()`/`mature_base()` **before** it runs, never queried after.
 - **The single-object size helper is `beam_term::layout::object_words(header, ptr) -> usize` (`pub unsafe`, in `beam_term::prelude`), not `beam_gc::copy::move_size`.** `move_size` is `pub(crate)` and equals `object_words` except for the `ErlSubBits` override (5 vs 8 — Design Decisions). `beam_term::size::size_object(Eterm)` is the whole-graph (public) size; the per-object reference walk `for_each_ref` is likewise `pub(crate)`, and the public enumerator is `beam_term::layout::for_each_child_slot(header, ptr, visit)`.
-- **The nursery chain is monotonic *between collections* — it only ever shrinks inside a collection.** `Nursery::grow` retires the space it replaces (the sole `retired.push`) and `Nursery::collapse` (the sole `retired.clear()` + `retired_regions.clear()`) is called **only** from `collect_minor`/`collect_major`. So an allocation loop that never collects — the un-rooted `alloc_words` growth seam (`beam_rt/src/context/gc.rs`), a declined valve (`beam_rt/src/context/gc_walk.rs`), a `relocation_exempt`/halted/disabled process (`beam_rt/src/runtime/gc.rs`) — keeps growing `retired`, though at least by a doubling step each time (chain `O(log(heap))`, retained words the ladder's geometric sum), while a loop whose admission point consults `collection_debt()` (`src/collector.rs`) collapses it back to exactly one space each round.
+- **The nursery chain is monotonic *between collections*.** `Nursery::grow` holds the sole `retired.push` and `Nursery::collapse` (the sole `retired.clear()` + `retired_regions.clear()`) runs **only** from `collect_minor`/`collect_major`, so a loop that never reaches a heap-admission point keeps growing `retired` while a loop whose admission door consults `collection_debt()` collapses it back to exactly one space each round.
 - **`ensure_capacity` keeps *both* spaces.** It collects first (which collapses the chain to 1) and then `Nursery::grow` retires that just-created space (chain back to 2); the retired space is freed only by the next collection's `collapse`. `grow_nursery` is the no-collect, no-relocation form with **no** relocation-exempt guard, and it reports that retention through `collection_debt()`. The runtime pairs the two (`beam_rt`'s `collect_or_grow` / `Process::deliver`), so `young_space_count` oscillates ≈`1`→`2`→`1` rather than accumulating.
 
 ## Routing Table
@@ -681,7 +643,7 @@ constructors only (no new error enum).
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/
   `do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
-- `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`)
+- `../../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`)
   (read-only)
 
 ## See Also

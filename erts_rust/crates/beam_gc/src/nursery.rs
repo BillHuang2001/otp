@@ -35,10 +35,12 @@
 //!   range test a host's *unscanned-root* valve runs at every heap admission — answers from
 //!   an ordered index of the retired spaces' live regions plus one direct test of the current
 //!   space, so it is `O(log #spaces)` rather than a walk over every space.
-//! * **The chain is bounded.** [`grow`](Nursery::grow) never installs a space no larger than
-//!   the one it replaces (at minimum a doubling), so a growth loop that keeps enlarging an
-//!   equally-full space climbs the growth table geometrically: the chain is `O(log(heap))`
-//!   long instead of gaining one ≈same-size space per call.
+//! * **The chain is bounded.** [`grow`](Nursery::grow) takes the plain one-step next size
+//!   whenever that already enlarges the space, and only falls back to at least a **doubling**
+//!   when the one-step target would install a space no larger than the one it replaces, so a
+//!   growth loop that keeps enlarging an equally-full space climbs the growth table
+//!   geometrically: the chain is `O(log(heap))` long instead of gaining one ≈same-size space
+//!   per call.
 //!
 //! Every superseded space is **retained until a collection evacuates it**, never freed by the
 //! growth itself: it may hold live words (they were handed to the mutator) and only a
@@ -196,33 +198,41 @@ impl Nursery {
     /// space outside `collapse`. Dropping a provably empty (`used_words() == 0`) superseded
     /// space would be sound, but it changes `space_count`, so it is deliberately not done.
     ///
-    /// The fresh space is the smallest size the policy allows that covers the request **and
-    /// never a space no larger than the one it replaces**: the request
-    /// (`policy.next_words(need_words, 0)`), the **doubling** of the current capacity
-    /// (`policy.next_words(2 * capacity, 0)`), whichever is larger, floored by the current
-    /// capacity — all bounded by [`min_heap_words`](HeapPolicy::min_heap_words) and
+    /// The fresh space is the **one-step** size the policy allows —
+    /// `policy.next_words(need_words, 0)` floored by the current capacity — whenever that
+    /// already enlarges the space (a genuinely larger request: unchanged from the plain
+    /// next-size rule). Only when the one-step target would install a space **no larger than
+    /// the one it replaces** does the rule take at least a **doubling**
+    /// (`policy.next_words(2 * capacity, 0)`), so a growth loop that keeps enlarging an
+    /// equally-full space climbs the growth table geometrically and the chain of retired
+    /// spaces stays `O(log(heap))` long, instead of gaining one ≈same-size space — and one
+    /// whole retained capacity — per call. Every size is bounded by
+    /// [`min_heap_words`](HeapPolicy::min_heap_words) and
     /// [`max_heap_words`](HeapPolicy::max_heap_words) through
-    /// [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling. A `grow` only
-    /// runs when the current space is (nearly) full, so the ladder is a doubling one: a growth
-    /// loop that keeps enlarging an equally-full space walks the growth table geometrically
-    /// and the chain of retired spaces stays `O(log(heap))` long, instead of gaining one
-    /// ≈same-size space — and one whole retained capacity — per call.
+    /// [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling.
     ///
     /// When the current space already has room the call is a no-op. A
     /// [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling that cannot
     /// reach the request yields the typed [`BeamError::Alloc`](beam_common::BeamError::Alloc)
     /// and leaves the nursery untouched — the current space is not replaced and nothing is
-    /// retired. (A ceiling that can cover the request but forbids the doubling step installs
-    /// the largest space it allows, which is the only size left to it.)
+    /// retired. (A ceiling that can cover the request but forbids a larger step installs the
+    /// largest space it allows, which is the only size left to it.)
     pub(crate) fn grow(&mut self, policy: &HeapPolicy, need_words: usize) -> Result<()> {
         if self.current.available_words() >= need_words {
             return Ok(());
         }
         let capacity = self.current.capacity_words();
-        // At minimum a doubling: a growth replaces a (nearly full) space, so never handing
-        // back a space of the same size is what bounds the chain logarithmically.
-        let request = need_words.max(capacity.saturating_mul(2));
-        let target = policy.next_words(request, 0).max(capacity);
+        // The plain next-size rule, floored by the capacity it must not undercut.
+        let one_step = policy.next_words(need_words, 0).max(capacity);
+        // Only a request that would hand back a space no larger than the one it replaces
+        // needs the doubling: it is what bounds the chain logarithmically.
+        let target = if one_step > capacity {
+            one_step
+        } else {
+            policy
+                .next_words(capacity.saturating_mul(2), 0)
+                .max(one_step)
+        };
         if target < need_words {
             return Err(heap_exhausted(need_words));
         }
@@ -259,10 +269,11 @@ impl Nursery {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the nursery chain's three invariants: the containment index mirrors the
+    //! Unit tests for the nursery chain's invariants: the containment index mirrors the
     //! retired spaces **exactly**, the range test it answers is exactly
-    //! `spaces().any(|space| space.contains(ptr))`, and a growth neither collects, moves nor
-    //! frees anything. The index is what keeps the range test independent of the chain's
+    //! `spaces().any(|space| space.contains(ptr))`, a growth neither collects, moves nor
+    //! frees anything, and the growth rule takes the one-step size unless that would not
+    //! enlarge the space. The index is what keeps the range test independent of the chain's
     //! length, so it is pinned over a chain far longer than any hand-written case would build.
 
     use beam_alloc::registry::default_allocator;
@@ -273,7 +284,7 @@ mod tests {
     /// The capacity of **every** space of the test chain, in term words — and the policy's
     /// `max_heap_words` ceiling, so a growth is clamped to a space of exactly the size it
     /// replaces: the one shape a caller can use to make the chain arbitrarily long through the
-    /// growth seam alone (a real heap's doubling ladder tops out at the growth table's
+    /// growth seam alone (a real heap's growth ladder tops out at the growth table's
     /// ceiling).
     const CAP: usize = 90;
 
@@ -431,8 +442,9 @@ mod tests {
         );
 
         // The growth is bounded by the ceiling: every space it installs is `CAP` words, so the
-        // chain's capacity is the chain's length times `CAP` (the capped shape of the
-        // doubling rule's `O(log(heap))` ladder).
+        // chain's capacity is the chain's length times `CAP` (the capped shape of the growth
+        // rule: a ceiling that forbids a larger step installs the largest space it allows, the
+        // only size left to it).
         assert_eq!(nursery.capacity_words(), 2 * CAP);
 
         // A request the ceiling cannot reach is the typed refusal, and the nursery is as it was.
@@ -444,5 +456,96 @@ mod tests {
             spaces_before,
             "a refused growth retires nothing"
         );
+    }
+
+    /// Fills a space so that at most a few words are still available — the shape a growth is
+    /// called in (the mutator has outgrown the space). Leaves a margin, so the tuple always fits.
+    fn fill(space: &mut HeapSpace) {
+        let elems: Vec<Eterm> = (0..space.available_words().saturating_sub(4))
+            .map(|i| make_small(i as i64))
+            .collect();
+        space
+            .heap_mut()
+            .tuple(&elems)
+            .expect("the filler fits the space");
+    }
+
+    #[test]
+    fn a_growth_takes_the_one_step_size_unless_it_would_not_enlarge_the_space() {
+        let policy = HeapPolicy::default();
+
+        // (a) A 233-word space with a 234-word request: the plain one-step rule already hands
+        // back a **larger** space (`next_words(234, 0) = 376`), so the doubling does not fire —
+        // the request gets exactly the smallest curated size that covers it. This is the shape a
+        // request-driven growth has, and the geometry the sibling crates pin
+        // (`beam_process`'s `next_heap_size(payload_words, 0)` expectations).
+        let mut nursery = Nursery::new(default_allocator().clone(), 233).expect("nursery");
+        assert_eq!(nursery.current().capacity_words(), 233);
+        assert!(
+            nursery.current().available_words() < 234,
+            "the 234-word request outgrows the space"
+        );
+        nursery.grow(&policy, 234).expect("the one-step growth");
+        assert_eq!(nursery.current().capacity_words(), 376);
+        assert_eq!(nursery.current().capacity_words(), policy.next_words(234, 0));
+
+        // (b) The same nursery, now 376 words, and a request the space **already covers**: the
+        // one-step rule would hand back the very space it replaces, so the rule takes at least a
+        // doubling — `next_words(2 * 376, 0) = 987`.
+        fill(nursery.current_mut());
+        assert!(
+            nursery.current().available_words() < 376,
+            "the space is nearly full again"
+        );
+        nursery.grow(&policy, 376).expect("the doubling growth");
+        assert_eq!(nursery.current().capacity_words(), 987);
+        assert_eq!(nursery.current().capacity_words(), policy.next_words(752, 0));
+        assert!(
+            nursery.current().capacity_words() >= 2 * 376,
+            "the doubling branch really doubles"
+        );
+
+        // (c) A growth loop repeating a **constant** request can therefore never retire one
+        // ≈same-size space per call: each call either installs a genuinely larger request size
+        // or doubles, so the capacity at least doubles every **two** calls and the chain stays
+        // `O(log(heap))` long. The pathological shape this replaces (`grow` handing back a space
+        // of the size it replaces) is only reachable through a `max_heap_words` ceiling, which
+        // no step can enlarge past (the long-chain tests build their chain that way).
+        const REQUEST: usize = 234;
+        const THRESHOLD: usize = 1 << 16;
+        let mut looped = Nursery::new(default_allocator().clone(), 233).expect("nursery");
+        let mut caps = vec![looped.current().capacity_words()];
+        while *caps.last().expect("a capacity") < THRESHOLD {
+            fill(looped.current_mut());
+            looped.grow(&policy, REQUEST).expect("the loop's growth");
+            caps.push(looped.current().capacity_words());
+        }
+        // Every space is strictly larger than the one it replaced ...
+        assert!(
+            caps.windows(2).all(|w| w[0] < w[1]),
+            "every growth enlarged the space: {caps:?}"
+        );
+        // ... and the ladder doubles at least every two calls, so its length is logarithmic in
+        // the threshold (from 233, ~2 * log2(65536 / 233) ≈ 18 calls).
+        for i in 2..caps.len() {
+            assert!(
+                caps[i] >= 2 * caps[i - 2],
+                "the capacity must at least double every two calls: {caps:?}"
+            );
+        }
+        assert!(
+            caps.len() <= 24,
+            "the chain must stay logarithmic, got {} spaces: {caps:?}",
+            caps.len()
+        );
+
+        // (d) A request the current space already has room for is still a **no-op**: nothing is
+        // retired and the capacity is untouched.
+        let spaces_before = looped.space_count();
+        let cap_before = looped.current().capacity_words();
+        let fit = looped.current().available_words();
+        looped.grow(&policy, fit).expect("an exact fit is a no-op");
+        assert_eq!(looped.space_count(), spaces_before, "nothing retired");
+        assert_eq!(looped.current().capacity_words(), cap_before);
     }
 }

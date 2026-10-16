@@ -387,18 +387,19 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
         // be the linear leak this pins against).
         //
         // The multiple is the growth rule's, not a constant of the workload: `grow_nursery`
-        // never installs a space no larger than the one it replaces (at minimum a doubling), so
-        // the ladder of *retained* capacities is `376 → 987 → 2586` — at most two doublings
-        // above the size a collection settles on — and the collection's own `young_after_collection`
-        // shrink rule (`capacity > 4 × live`) pulls it back down at the next admission. The
-        // bound below is therefore an order-of-magnitude guard (`16 × 256 = 4096`), not a pinned
-        // geometry: it fails only for a capacity that scales with the iteration count.
+        // takes the smallest curated size covering the request and, only when that would not
+        // enlarge the space, at least a doubling — so the ladder of *retained* capacities is a
+        // geometric one, a few growth-table steps above the size a collection settles on — and
+        // the collection's own `young_after_collection` shrink rule (`capacity > 4 × live`)
+        // pulls it back down at the next admission. The bound below is therefore an
+        // order-of-magnitude guard (`16 × 256 = 4096`), not a pinned geometry: it fails only for
+        // a capacity that scales with the iteration count.
         assert!(
             peak_young <= 16 * OP_WORDS,
             "{kind:?}: the nursery must stay a small multiple of the op's object, got {peak_young}"
         );
         // The peaks are *bounded*, but the run's global high-water marks need not be the
-        // plateau's: the doubling ladder can install one larger space while the cadence is still
+        // plateau's: the growth ladder can install one larger space while the cadence is still
         // settling, and the next collection's `young_after_collection` shrink brings it back
         // down. What the converged cycle must show is that the chain stays one retired space,
         // that no capacity scales with the iteration count, and that the retention never exceeds

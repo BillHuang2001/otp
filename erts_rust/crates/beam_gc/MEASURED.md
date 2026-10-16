@@ -21,8 +21,8 @@ Sections:
   plus three shapes.
 * [Heap-sizing measurements](#heap-sizing-measurements) — why the fresh mature space is sized from
   the exact live set and the nursery from the surviving set.
-* [The nursery chain: indexed containment and the doubling ladder](#the-nursery-chain-indexed-containment-and-the-doubling-ladder)
-  — the `O(log #spaces)` range test, the doubled growth step, and the measured `compile:file/2` curve.
+* [The nursery chain: indexed containment and the one-step-then-doubling growth rule](#the-nursery-chain-indexed-containment-and-the-one-step-then-doubling-growth-rule)
+  — the `O(log #spaces)` range test, the growth step, and the measured `compile:file/2` curve.
 * [The debt signal and the collection](#the-debt-signal-and-the-collection) — why only a collection
   reclaims the chain, and why the debt is an opt-in signal.
 * [End-to-end RSS and latency](#end-to-end-rss-and-latency-ets_copy-a-b-at-this-commit) — the same A/B
@@ -338,7 +338,7 @@ young policy converges to Copying 4096 / **4185** (9 fullsweeps / 231 minors) an
 * Every deterministic figure above is asserted in its driving test; this file records what those
   tests print, and nothing here is asserted anywhere else.
 
-## The nursery chain: indexed containment and the doubling ladder
+## The nursery chain: indexed containment and the one-step-then-doubling growth rule
 
 **Containment is indexed, not scanned.** `Nursery::contains` — the predicate a host's *unscanned-root* valve
 evaluates **per reference word and per heap admission** — answers from an ordered index of the retired
@@ -350,10 +350,8 @@ pairwise disjoint; the greatest base at or below the probe is the only candidate
 An entry never goes stale: nothing is ever allocated in a retired space, so its `top` is **frozen** from the
 moment it is retired until `collapse` drops it (and clears the index with it); the current space is the only
 one whose `top` moves, and it is tested directly instead of being indexed.
-**Growth installs at least a doubling.** `Nursery::grow` takes `request = need_words.max(2 * capacity)` and
-installs `policy.next_words(request, 0).max(capacity)`, so a growth loop repeating a **constant** request
-climbs the growth table geometrically and the chain stays `O(log(heap))` long rather than gaining one space
-per call.
+**Growth is the one-step size unless that would not enlarge the space, then at least a doubling.** `Nursery::grow` takes `one_step = policy.next_words(need_words, 0).max(capacity)` and installs it whenever it is **larger** than the capacity it replaces; only when `one_step == capacity` (a request the space already covers, so the one-step rule would hand back the space it replaces) does it take at least `policy.next_words(2 * capacity, 0)`.
+So a growth a genuinely larger request drives is **unchanged** from the plain next-size rule, and the chain of retired spaces is still `O(log(heap))` long rather than gaining one space per call.
 **The two other per-reference range scans were narrowed with it.** `FromSet` keeps its ranges base-sorted
 with one binary-search `locate`, and `reachable::Visited::index` delegates to it, so neither is a linear scan
 over the ranges.
@@ -362,27 +360,29 @@ over the ranges.
 `erlc`) whose `go/0` calls `compile:file(Source, [no_spawn_compiler_process, deterministic, {outdir, Dir}])`
 with `Source`/`Dir` baked into the probe source (the `run <mfa>` route takes integer args only), staged per
 module and run as `erts_rust/target/debug/beam_rt run probe.beam probe:go/0`; GNU `time -v` for the wall
-clock, CPU% and max RSS. Real `lib/stdlib/src/` modules. **BEFORE** is the pre-fix baseline measured in a
-sibling worktree on this host with the same probe route (`beam_gc` at `0bb28ed31c`); **AFTER** is
-`beam_gc` at `29fee9aef1`. Host: 14 cores, `/proc/loadavg` 116–237 during the runs (recorded per row), so
-the absolute wall clocks are upper bounds and only the ratios carry information.
+clock, CPU% and max RSS. Real `lib/stdlib/src/` modules. **BEFORE** is the pre-fix (linear `Nursery::contains`)
+baseline measured in a sibling worktree on this host with the same probe route (`beam_gc` at `0bb28ed31c`);
+**NOW** is the indexed-containment tree with the growth rule above. The shared host load differs sharply
+between the two columns — `/proc/loadavg` **116–237** for BEFORE, **6–27** for NOW — so the BEFORE wall clocks
+are inflated and only the shape, the retained words and the byte-identity carry across; every wall clock is an
+upper bound.
 
-| module | lines | wall BEFORE | wall AFTER | loadavg (BEFORE → AFTER) | CPU% AFTER | max RSS AFTER | `Code` chunk (md5, unchanged?) |
-|---|---|---|---|---|---|---|---|
-| `erl_abstract_code` | 53 | 45.50 s (31.81 s on a quieter run) | **8.22 s** | 130 → 130 | 70 % | 314 520 kB | 403 B `14b1f6140d1b98f4b59f5db63dc70669` **yes** |
-| `erl_posix_msg` | 178 | 36.85 s | **13.16 s** | 130 → 129 | 93 % | 539 984 kB | 1943 B `d1cfaed899a8201687c3602f866f775f` **yes** |
-| `pool` | 300 | 144.93 s | **15.90 s** | 129 → 137 | 83 % | 365 356 kB | 2016 B `edc120b021cc583a0908b6ddaa2989a2` **yes** |
-| `ordsets` | 581 | 254.25 s | **19.63 s / 24.68 s** | 145 → 154 (2nd rep 154 → 154) | 84 % / 78 % | 333 672 kB | 1219 B `4f86664f52128d47d5eed339d27c4263` **yes** |
-| `timer` | 1017 | **DNF** — `timeout 600` killed it at 600 s (RSS 469 MB, climbing) | **108.83 s / 130.35 s** | 154 → 133 (2nd rep 195 → 205) | 85 % | 746 016 kB / 746 776 kB | 5386 B `12f604e7d31c5e0df585026772f67647` **yes** |
+| module | lines | wall BEFORE (load 116–237) | wall NOW (load 6–27, 1st / 2nd rep) | CPU% NOW | max RSS NOW (kB) | `Code` chunk (md5, unchanged?) |
+|---|---|---|---|---|---|---|
+| `pool` | 300 | 144.93 s | **10.01 s** | 99 % | 366 236 | 2016 B `edc120b021cc583a0908b6ddaa2989a2` **yes** |
+| `ordsets` | 581 | 254.25 s | **13.99 s / 11.55 s** | 98–99 % | 334 748 / 334 664 | 1219 B `4f86664f52128d47d5eed339d27c4263` **yes** |
+| `timer` | 1017 | **DNF** — `timeout 600` killed it at 600 s (RSS 469 MB, climbing) | **65.32 s** | 99 % | 747 044 | 5386 B `12f604e7d31c5e0df585026772f67647` **yes** |
 
-Speedups: **×5.5 / ×2.8 / ×9.1 / ×12.9 / >×5.5** (`timer` bounded below by the 600 s timeout).
-`ordsets` was re-run for a noise band: 19.63 s and 24.68 s (the host load is shared; both reps are reported).
-**Point-to-point ratios of the AFTER wall clock** — the scaling shape: 53→178 lines (×3.36 lines) ⇒ **×1.60**;
-178→300 (×1.69) ⇒ **×1.21**; 300→581 (×1.94) ⇒ **×1.23**; 581→1017 (×1.75) ⇒ **×5.54**.
-So the containment fix removes the **quadratic** term module size used to buy (581 lines 254 s ⇒ 20 s, and the
-1017-line case that never terminated now completes in ~110 s), and the small modules are now dominated by a
-fixed ~7 s floor.
-What is **left is not linear** — the last ratio is ×5.54 for ×1.75 lines; the remaining superlinear term is
+(The two smallest modules the pre-fix curve also recorded — `erl_abstract_code` 8.22 s, `erl_posix_msg`
+13.16 s — were not re-measured here; both the containment fix and the growth rule act on the same default
+nursery policy, and the large-module shape below is the load-bearing one.)
+Speedups vs BEFORE: **×14.5 / ×18.2 / >×9.2** (`timer` bounded below by the 600 s timeout).
+`ordsets` was re-run for a noise band: 13.99 s and 11.55 s (the host load is shared; both reps are reported).
+**Point-to-point ratios of the NOW wall clock** — the scaling shape: 300→581 lines (×1.94) ⇒ **×1.40**;
+581→1017 (×1.75) ⇒ **×4.67**. So the containment fix removes the **quadratic** term module size used to buy
+(581 lines 254 s ⇒ ~13 s, and the 1017-line case that never terminated now completes in ~65 s), and the small
+modules are now dominated by a fixed ~7 s floor.
+What is **left is not linear** — the last ratio is ×4.67 for ×1.75 lines; the remaining superlinear term is
 **not** the nursery (see the profile below) but `beam_rt`'s own whole-graph unscanned-root descent.
 
 **Byte-identity is unchanged.** Every produced `.beam`'s `Code` chunk equals the system `erlc +deterministic`
@@ -415,27 +415,30 @@ It is `beam_rt`'s to bound; nothing in `beam_gc` bounds a whole-graph walk.
 Caveat (unchanged from the baseline): the perf map is empty, so JIT frames show as raw addresses in both
 profiles — every frame above is native Rust, and raw addresses appear only inside the inlined closures.
 
-**The chain's retained words (same-commit A/B on the runtime's no-collection route).**
-The compiler's `run` process is **never collected** (`minor_gcs = 0` throughout, `fullsweep_after` 65535), so
-this column is the nursery chain's retained capacity plus the (never-grown, 233-word) mature space, read as
-`process_info(P, memory)`:
+**The chain's retained words (the same probe route; `minor_gcs = 0` throughout).**
+The compiler's `run` process is **never collected** (`minor_gcs = 0`, `fullsweep_after` 65535), so nothing
+collapses the chain, and this column is every space the run ever installed plus the (never-grown, 233-word)
+mature space, read as `process_info(P, memory)` at the end of `go/0`:
 
-| module | lines | `memory` BEFORE | `memory` AFTER | `heap_size` AFTER (words) | max RSS BEFORE → AFTER |
-|---|---|---|---|---|---|
-| `pool` | 300 | 61 680 376 B | 77 423 712 B | 9 677 698 | 366 056 kB → 365 092 kB |
-| `ordsets` | 581 | 37 899 552 B | 77 423 704 B | 9 677 704 | 331 156 kB → 333 852 kB |
-| `timer` | 1017 | DNF (>600 s) | 708 313 928 B | 88 538 974 | — → 746 776 kB |
+| module | lines | `memory` BEFORE (pre-fix rule) | `memory` NOW (this rule) | `heap_size` NOW (words) |
+|---|---|---|---|---|
+| `pool` | 300 | 61 680 376 B | 112 677 312 B | 14 084 398 |
+| `ordsets` | 581 | 37 899 552 B | 53 258 688 B | 6 657 070 |
+| `timer` | 1017 | DNF (>600 s) | 491 376 904 B | 61 421 847 |
 
-Read this as **what the doubling rule does and does not buy**, honestly. The retained total is a *geometric*
-function of the requirement — ≈ twice the last installed space, so `O(requirement)` and independent of the
-workload at a given requirement (`pool` and `ordsets` land on the same 9.68 M words) — whereas the pre-fix
-rule (one growth-table step, ≈ ×1.618) retained 7.71 M and 4.74 M words for those two. So the doubling's
-dividend is the chain's **length** (`O(log(heap))`, which is exactly what `contains` pays, and which bounds a
-constant-request growth loop's chain length too) and **not** a smaller retained byte total: at these sizes the
-doubling retains **up to 2.0× more words**, and the peak RSS is
-unchanged within noise (331→334 MB, 366→365 MB — the ~300 MB VM/arena baseline dominates). The 2× is the
-ladder's overshoot: a doubling space is installed to cover a request it does not shrink back to without a
-collection, and nothing collects on this route.
+Read this as **what this rule's retained total is**, honestly. The retained total is the *geometric sum of the
+whole ladder* the compile installs, so it is `O(the largest space the compile forces)` and never a function of
+the iteration count — but its multiplier is the ladder's, not a constant 2.
+This rule installs a **one-step** rung wherever the request is only just above the space (growth-table ratio
+≈ ×1.618, so its chain sums to ≈ ×2.618 of the final rung) and a **doubling** rung only when the request
+already fits the space it replaces (ratio ≈ ×2.618, summing to ≈ ×1.618 of a coarser rung).
+So a finer ladder lands on a **lower final rung** (a smaller workload hands back a smaller space) while its
+longer geometric tail sums to a larger multiple; which dominates is workload-dependent — measured here as
+**more** than the pre-fix one-step rule for all three (`pool` 112.7 M vs 61.7 M B; `ordsets` 53.3 M vs 37.9 M B;
+`timer` 491.4 M B, no pre-fix figure).
+The peak RSS is unchanged within noise (335 / 366 / 747 MB — the ~300 MB VM/arena baseline dominates) and
+**nothing collects on this route**, so the retained total is bounded only by the requirement, never by the
+iteration count.
 
 ## The debt signal and the collection
 
@@ -464,11 +467,11 @@ asserted.
 | current nursery (words, peak) | 932 | `peak_young <= 16 × OP_WORDS` (= 4 096, against the 400 × 256 = 102 400 an iteration-linear leak shows) |
 | mature capacity | one constant over the whole tail | identical on Copying and on Immix |
 
-**The chain's LENGTH is the bounded quantity, not a per-call step.** `grow_nursery` installs at least a
-**doubling** (the mechanism above), so a growth loop repeating a **constant** request climbs a geometric
-ladder: the chain is `O(log(heap))` long and the retained words are the ladder's geometric sum, never a
-function of the iteration count. Only a collection's `collapse` frees a retired space, and it collapses the
-chain to **exactly one** space.
+**The chain's LENGTH is the bounded quantity, not a per-call step.** `grow_nursery` takes the one-step size
+when it enlarges the space and at least a **doubling** when it would not (the mechanism above), so a growth
+loop repeating a **constant** request still climbs a geometric ladder: the chain is `O(log(heap))` long and
+the retained words are the ladder's geometric sum, never a function of the iteration count. Only a
+collection's `collapse` frees a retired space, and it collapses the chain to **exactly one** space.
 `tests/nursery_growth_retention.rs::a_repeated_grow_and_collect_cycle_never_accumulates_spaces` pins that over
 400 explicit grow + collect cycles, and `tests/nursery_chain.rs::a_grow_then_collect_loop_reaches_a_bounded_steady_state`
 pins the plateau.
