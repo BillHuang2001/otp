@@ -60,17 +60,14 @@ Success ⇒ one line `ok <repr>`, exit `0`; failure ⇒ `exception <class> <reas
   non-agreeing case is the allowlisted `wire/new_fun_ext_encode`.
 - **Deterministic:** the former A.4 oracle-side crash flake is fixed (see *Known Issues*); the corpus
   no longer depends on an oracle crash.
-- **Last deepening round (this state):** A.6 (+20 — the `+k`/`+K`, `+sbt`, `-smp` and `-pa/-pz …/ebin`
-  flag families, `-env`/`-s`/`-eval`/`-boot` argument ingestion); A.7 (+30 — the `maps:iterator/1,2` +
-  `maps:next/1` family with the fun-taking `maps` fast paths over flat/HAMT maps, and bignum-into-narrow
-  bit-string segment construction/little-big/signed/derived sizing); A.2 (+15 — the `term_to_binary/2`
-  compressed/minor-version option matrix, the `local` gap's neighbours, the built-in `tcp_inet` port
-  surface and the A.9 self-hosting chain); A.4 (+6 — the built-in `tcp_inet` driver namespace observed
-  through a live port); A.5 (+6 — the distribution handshake name/status/challenge/reply message
-  encodings); A.8 (+6, the dual-contract `+`-flag cases); A.9 (+3 — a byte-identical in-process
-  `compile:file/2` of a real stdlib module, a dependent pair compiled in one run, and
-  `code:add_patha/1` + `init:fetch_loaded/0` shapes).
-- **Tests:** `cargo.sh test -p differential --lib` → 337 passed (was 325).
+- **Coverage emphasis (current):** the `+k`/`+K`/`+sbt`/`-smp` and `-pa`/`-pz …/ebin` flag families plus
+  the `-env`/`-s`/`-eval`/`-boot` argument ingestion (A.6); the `maps:iterator/1,2` + `maps:next/1` family
+  and the fun-taking `maps` fast paths over flat/HAMT maps, and bignum-into-narrow bit-string segment
+  construction (little/big, signed/unsigned, derived sizing) (A.7); the `term_to_binary/2`
+  compressed/minor-version option matrix, the built-in `tcp_inet` port surface, the distribution handshake
+  name/status/challenge/reply message encodings, and the A.9 self-hosting chain (a byte-level-equality
+  in-process compile of a real stdlib module, a dependent pair, `code:add_patha/1` + `init:fetch_loaded/0`).
+- **Tests:** `cargo.sh test -p differential --lib` → 337 passed.
 
 ## Constraints
 - **Honest reporting:** a side that cannot run is `unsupported`/`skipped(<reason>)` — never `pass`; oracle observations are never fabricated. Loud failures (stderr + nonzero exit), never a silent swallow. Machine-readable JSON (`differential/1`), written under the gitignored `out/` (or `--out`).
