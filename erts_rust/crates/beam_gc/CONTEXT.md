@@ -644,9 +644,10 @@ constructors only (no new error enum).
 - `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, `ImmixStats`/
   `ImmixCounters`
 - `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
-- `src/immix_collector.rs` → `GenImmixCollector`: `PromoteDest`, `promote`, `scan_young`, fullsweep sizing
-  via `live_full`, `grow_major`/`relocate_major`, `ensure_capacity`
-- `src/immix_collector/grow_tests.rs` → `GenImmixCollector`'s in-module `grow_major` fallback tests
+- `src/immix_collector.rs` → `GenImmixCollector`: `scan_young`, fullsweep sizing via `live_full`,
+  `grow_major`/`relocate_major`, `ensure_capacity`, the collect/collect_minor/collect_major driver
+- `src/immix_collector/promote.rs` → the ATOMIC two-phase promotion driver (`promote`, `PromoteOutcome`)
+- `src/immix_collector/{tests,grow_tests}.rs` → `GenImmixCollector`'s in-module promotion + `grow_major` tests
 - `src/any_collector.rs` → `AnyCollector`: the `Copying`/`Immix` dispatch over one API — the drop-in for the
   concrete `Collector` incl. the mature geometry accessors
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`, `from_spawn_opts`/
