@@ -263,9 +263,12 @@ impl BitBuf {
     ///
     /// A **big-endian** segment (`little == false`) emits the words most significant
     /// first, the top word truncated to its `n_bits % 64` bits. A **little-endian** segment
-    /// emits the least significant byte of the value first and then the first `n_bits` bits
-    /// of that byte sequence (`<<255:12/little>>` is `<<255,0:4>>`), the inverse of
-    /// [`read_bits_le`].
+    /// is laid out **byte**-wise ([`bits::integer_le_image`]): the value's whole bytes follow
+    /// least significant first, and a width that is not a whole number of bytes leaves the
+    /// low `n_bits % 8` bits of the next byte as the final partial field, in the high bits of
+    /// the last byte — `<<255:12/little>>` is `<<255,0:4>>` and `<<-300:12/little>>` is
+    /// `<<212,14:4>>`, exactly the bit stream the oracle emits (and the one a matching
+    /// `little` integer segment reads back).
     fn push_integer_bits(
         &mut self,
         magnitude: &[u64],
@@ -289,11 +292,13 @@ impl BitBuf {
         }
         let top_bits = n_bits - 64 * (words_count - 1);
         if little {
-            let mut bytes = Vec::with_capacity(words_count * 8);
-            for word in &words {
-                bytes.extend_from_slice(&word.to_le_bytes());
+            let (bytes, tail, rem) = bits::integer_le_image(&words, n_bits);
+            for byte in bytes {
+                self.push_byte(byte);
             }
-            self.push_bit_slice(&bytes, 0, n_bits);
+            if rem != 0 {
+                self.push_bits(tail, rem);
+            }
         } else {
             self.push_bits(words[words_count - 1] & mask_bits(top_bits), top_bits);
             for index in (0..words_count - 1).rev() {
@@ -570,7 +575,14 @@ impl Evaluator<'_, '_> {
     fn append_segment(&mut self, segment: &Seg, env: &mut Env, out: &mut BitBuf) -> EResult<()> {
         let value = self.expr(&segment.value, env)?;
         match segment.kind {
-            Some(SegKind::Utf8) => return self.push_utf8(value, out),
+            Some(SegKind::Utf8) => {
+                // A utf-type segment with an explicit width is a *syntax* error on the
+                // oracle, so it is a typed `badarg` here, never a fabricated encoding.
+                if bits::utf_segment_has_width(segment) {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                }
+                return self.push_utf8(value, out);
+            }
             Some(SegKind::Binary)
             | Some(SegKind::Bytes)
             | Some(SegKind::Bitstring)
@@ -578,10 +590,63 @@ impl Evaluator<'_, '_> {
                 return self.push_bitstring_segment(segment, value, env, out)
             }
             Some(SegKind::Float) => {
-                return Err(Flow::Fatal(error::unsupported("float binary segments")))
+                // A float segment is an IEEE 754 field whose size defaults to 64 bits and is
+                // one of `:16`/`:32`/`:64` (binary16/32/64); any other resolved width is the
+                // oracle's `badarg` (`<<1.5:8/float>>`, `<<1.5:24/float>>`). The value may be
+                // a float **or** an integer (small or bignum: `<<(1 bsl 64):64/float>>` is
+                // `<<67,240,0,0,0,0,0,0>>`), and a non-number is `badarg`. `signed` is
+                // meaningless here and ignored; `little`/`native` reverse the field's bytes.
+                let bits = match self.segment_size_bits(segment, env, 1)? {
+                    Some(bits) => bits,
+                    None => 64,
+                };
+                let number = match terms::float_value(value) {
+                    Ok(number) => number,
+                    Err(_) => {
+                        let (negative, limbs) = self.integer_magnitude(value)?;
+                        bits::integer_limbs_to_f64(negative, &limbs)
+                    }
+                };
+                let Some(bytes) =
+                    bits::float_bytes(number, bits, integer_segment_is_little(segment))
+                else {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                };
+                for byte in bytes {
+                    out.push_byte(byte);
+                }
+                return Ok(());
             }
             Some(SegKind::Utf16) | Some(SegKind::Utf32) => {
-                return Err(Flow::Fatal(error::unsupported("utf16/utf32 binary segments")))
+                // A utf-type segment with an explicit width is a *syntax* error on the
+                // oracle, so it is a typed `badarg` here, never a fabricated encoding.
+                if bits::utf_segment_has_width(segment) {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                }
+                // A code point is a small integer; the encoders reject (with `None` ⇒
+                // `badarg`) exactly what the oracle rejects: a non-integer, a lone surrogate
+                // or anything above `16#10FFFF`.
+                let (utf16, little) = (
+                    segment.kind == Some(SegKind::Utf16),
+                    integer_segment_is_little(segment),
+                );
+                let code = if is_small(value) {
+                    Some(signed_value(value))
+                } else {
+                    None
+                };
+                let bytes = match code {
+                    Some(code) if utf16 => bits::utf16_bytes(code, little),
+                    Some(code) => bits::utf32_bytes(code, little),
+                    None => None,
+                };
+                let Some(bytes) = bytes else {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                };
+                for byte in bytes {
+                    out.push_byte(byte);
+                }
+                return Ok(());
             }
             Some(SegKind::Integer) | None => {}
         }
