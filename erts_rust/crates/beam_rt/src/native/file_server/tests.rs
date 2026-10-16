@@ -1310,23 +1310,26 @@ fn resolve_oracle() -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-/// The oracle's `~w` rendering of `probe` — `erl -noshell -eval 'io:format("~w",[…])'
-/// -s init stop`, **bounded** by [`ORACLE_TIMEOUT`] so a probe can never hang the suite.
-/// `None` (loudly) when the oracle is absent or cannot answer.
-fn oracle_render(oracle: &Path, probe: &str) -> Option<String> {
+/// Runs `expression` under the oracle —
+/// `erl -noshell -eval <expression> -s init stop` — **bounded** by [`ORACLE_TIMEOUT`] so a
+/// probe can never hang the suite. `None` (loudly) when the oracle cannot be spawned, cannot
+/// be polled or its output cannot be collected; the caller decides what the *exit status*
+/// means (`oracle_render` treats a failure as no answer, the `epp` probe asserts success).
+fn oracle_eval(oracle: &Path, expression: &str) -> Option<std::process::Output> {
     use std::process::{Command, Stdio};
 
-    let mut command = Command::new(oracle);    command
+    let mut child = match Command::new(oracle)
         .arg("-noshell")
         .arg("-eval")
-        .arg(format!("io:format(\"~w\", [{probe}])"))
+        .arg(expression)
         .arg("-s")
         .arg("init")
         .arg("stop")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
+        .stderr(Stdio::piped())
+        .spawn()
+    {
         Ok(child) => child,
         Err(error) => {
             eprintln!(
@@ -1358,24 +1361,28 @@ fn oracle_render(oracle: &Path, probe: &str) -> Option<String> {
         }
     }
     match child.wait_with_output() {
-        Ok(output) if output.status.success() => Some(
-            String::from_utf8_lossy(&output.stdout)
-                .trim_end()
-                .to_string(),
-        ),
-        Ok(output) => {
-            eprintln!(
-                "warning: the oracle exited with {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            None
-        }
+        Ok(output) => Some(output),
         Err(error) => {
             eprintln!("warning: cannot collect the oracle output: {error}");
             None
         }
     }
+}
+
+/// The oracle's `~w` rendering of `probe` — `erl -noshell -eval 'io:format("~w",[…])'
+/// -s init stop`, **bounded** by [`ORACLE_TIMEOUT`] so a probe can never hang the suite.
+/// `None` (loudly) when the oracle is absent or cannot answer.
+fn oracle_render(oracle: &Path, probe: &str) -> Option<String> {
+    let output = oracle_eval(oracle, &format!("io:format(\"~w\", [{probe}])"))?;
+    if output.status.success() {
+        return Some(String::from_utf8_lossy(&output.stdout).trim_end().to_string());
+    }
+    eprintln!(
+        "warning: the oracle exited with {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    None
 }
 
 /// Renders `call` under the runtime's own `-eval` (`~w`).
@@ -1654,6 +1661,310 @@ fn the_buffered_read_answers_match_the_live_oracle() {
         rendered,
         "{{ok,<<108,105,110,101,49,10>>},{ok,<<108,105,110,101,50,10>>},{ok,<<114,101,115,116>>}}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- `{read_handle_info, Opts}`: `file:read_file_info/2` on an io-device pid -----------------
+
+/// `{read_handle_info, Opts}` — the request `file:read_file_info/2` sends for an
+/// **io-device** pid (`file.erl:788-789`), which `file_io_server:file_request/2` forwards as
+/// `?CALL_FD(Handle, read_handle_info, [Opts])` (`file_io_server.erl:335-342`). It is what
+/// `epp`'s `-moduledoc({file, …})` reader drives (`epp.erl:1435-1437`).
+fn read_handle_info_request(runtime: &mut Runtime, opts: Eterm) -> Eterm {
+    build(runtime, |ctx| {
+        let command = ctx.atom("read_handle_info").expect("an atom");
+        terms::make_tuple(ctx, &[command, opts]).expect("a tuple")
+    })
+}
+
+/// The `Opts` list holding one `{time, Value}` option.
+fn time_opts(runtime: &mut Runtime, value: &str) -> Eterm {
+    let pair = opts_pair(runtime, "time", value);
+    opts_list(runtime, &[pair])
+}
+
+/// The integer value of a `#file_info{}` field term.
+fn number(term: Eterm) -> i64 {
+    assert!(is_small(term), "an integer field");
+    beam_term::signed_value(term)
+}
+
+/// The 14 fields of the `#file_info{}` in an `{ok, #file_info{}}` reply.
+fn ok_file_info(runtime: &mut Runtime, reply: Eterm) -> Vec<Eterm> {
+    let rendered = render(runtime, reply);
+    let fields = tuple_fields(reply).expect("an `{ok, #file_info{}}` tuple");
+    assert_eq!(
+        runtime.atom_name(fields[0]).as_deref(),
+        Some("ok"),
+        "expected the real `{{ok, #file_info{{}}}}`, got {rendered}"
+    );
+    let info = tuple_fields(fields[1]).expect("a `#file_info{}` tuple");
+    assert_eq!(info.len(), 14, "the `#file_info{{}}` arity of {rendered}");
+    assert_eq!(runtime.atom_name(info[0]).as_deref(), Some("file_info"));
+    info
+}
+
+/// The request answers the **device's own** file: an `fstat(2)` of the very handle the
+/// device opened, whose `access` slot is `check_access/1`'s — the file's own `st_mode`
+/// against the process's effective credentials (`unix_prim_file.c:771-801`), never an
+/// `access(2)` probe. The record's fields are read back from the same `stat(2)`.
+#[test]
+fn read_handle_info_answers_the_devices_own_file() {
+    use std::os::unix::fs::MetadataExt;
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("read_handle_info");
+    std::fs::write(file.path(), b"handle info").expect("a fixture file");
+    let metadata = std::fs::metadata(file.path()).expect("a stat");
+    let modes = mode_list(&mut runtime, &["read", "binary"]);
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+
+    let empty = build(&mut runtime, |ctx| terms::make_list(ctx, &[]).expect("a list"));
+    let request = read_handle_info_request(&mut runtime, empty);
+    let (reply, retire) = device_request(&mut runtime, device, request);
+    assert!(!retire, "a `read_handle_info` never retires the device");
+    let info = ok_file_info(&mut runtime, reply);
+    // `size` (`enif_make_uint64`) is the fstat'ed handle's own length.
+    assert_eq!(number(info[1]), metadata.len() as i64);
+    assert_eq!(runtime.atom_name(info[2]).as_deref(), Some("regular"));
+    // The device's file is this process's own 0644 temporary file, so `check_access/1`'s
+    // owner triple answers `read_write`.
+    assert_eq!(runtime.atom_name(info[3]).as_deref(), Some("read_write"));
+    // The default `Opts` time type is `local`, i.e. a `{{Y,M,D},{H,M,S}}` triple
+    // (`prim_file.erl:669-670` + `adjust_times/2`).
+    for when in &info[4..7] {
+        let triple = tuple_fields(*when).expect("a `{{Y,M,D},{H,M,S}}` triple");
+        assert_eq!(triple.len(), 2, "the date/time pair");
+        assert_eq!(tuple_fields(triple[0]).expect("a date").len(), 3);
+        assert_eq!(tuple_fields(triple[1]).expect("a time").len(), 3);
+    }
+    // The seven `enif_make_uint` fields, truncated to 32 bits exactly as
+    // `build_file_info/2` emits them (`?PRIM_FILE_NIF:996-1017`).
+    assert_eq!(number(info[7]), i64::from(metadata.mode()));
+    assert_eq!(number(info[8]), i64::from(metadata.nlink() as u32));
+    assert_eq!(number(info[9]), i64::from(metadata.dev() as u32));
+    assert_eq!(number(info[10]), i64::from(metadata.rdev() as u32));
+    assert_eq!(number(info[11]), i64::from(metadata.ino() as u32));
+    assert_eq!(number(info[12]), i64::from(metadata.uid()));
+    assert_eq!(number(info[13]), i64::from(metadata.gid()));
+
+    // A second request on the same device answers the same record: the device was neither
+    // retired nor disturbed (`{reply, Reply, State}`, `file_io_server.erl:340-341`).
+    let request = read_handle_info_request(&mut runtime, empty);
+    let (reply, retire) = device_request(&mut runtime, device, request);
+    assert!(!retire, "still no retirement on the second request");
+    let again = ok_file_info(&mut runtime, reply);
+    assert_eq!(number(again[1]), metadata.len() as i64);
+    assert_eq!(number(again[11]), number(info[11]), "the same inode");
+}
+
+/// `[{time, posix}]` is carried through to `adjust_times/2` — the raw POSIX seconds, with no
+/// clock conversion at all — while an unrecognised time type is the wrapper's **value**
+/// `{error, badarg}` (`prim_file.erl:663-665`), never a record.
+#[test]
+fn read_handle_info_honours_the_time_option() {
+    use std::os::unix::fs::MetadataExt;
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("read_handle_info_time");
+    std::fs::write(file.path(), b"x").expect("a fixture file");
+    let metadata = std::fs::metadata(file.path()).expect("a stat");
+    let modes = mode_list(&mut runtime, &["read"]);
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+
+    let opts = time_opts(&mut runtime, "posix");
+    let request = read_handle_info_request(&mut runtime, opts);
+    let (reply, _) = device_request(&mut runtime, device, request);
+    let info = ok_file_info(&mut runtime, reply);
+    for (slot, seconds) in [
+        (4, metadata.atime()),
+        (5, metadata.mtime()),
+        (6, metadata.ctime()),
+    ] {
+        assert_eq!(number(info[slot]), seconds, "the raw POSIX seconds");
+    }
+
+    let opts = time_opts(&mut runtime, "bogus");
+    let request = read_handle_info_request(&mut runtime, opts);
+    let (reply, _) = device_request(&mut runtime, device, request);
+    assert_eq!(render(&mut runtime, reply), "{error,badarg}");
+}
+
+/// A non-list `Opts` is `proplist_get_value/3`'s **uncaught** `function_clause` raise:
+/// `read_handle_info/2` evaluates it before `read_handle_info_1/2`'s body
+/// (`prim_file.erl:669-670`), so it is the bare reason atom, never the wrapper's
+/// `{error, badarg}` value the same `Opts` shape produces for the path forms.
+#[test]
+fn read_handle_info_raises_function_clause_on_a_non_list_opts() {
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("read_handle_info_opts");
+    std::fs::write(file.path(), b"x").expect("a fixture file");
+    let modes = mode_list(&mut runtime, &["read"]);
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+
+    let opts = build(&mut runtime, |ctx| ctx.atom("foo").expect("an atom"));
+    let request = read_handle_info_request(&mut runtime, opts);
+    let error = runtime
+        .serve_device_request(device, request)
+        .expect_err("a non-list `Opts` must raise");
+    assert_eq!(
+        error.as_atom(),
+        Some("function_clause"),
+        "the bare reason atom, not the wrapper's `{{error, badarg}}` value"
+    );
+}
+
+/// The request cross-checked against the **live** oracle, driven exactly as `epp` drives it:
+/// a source file whose `-moduledoc({file, "doc.md"})` makes `epp` open the sibling through
+/// `file:open/2` — a *non-raw* open, so the reply is an **io-device pid** — and then ask it
+/// for its `#file_info{}` (`epp.erl:1435-1437`). Skips **loudly** when no oracle is installed.
+///
+/// The comparison needs **no** time tolerance, unlike the sibling `prim::tests` cross-check:
+/// the record is read off a file that nothing traverses between the two runs, so its
+/// `st_atime`/`st_mtime`/`st_ctime` are the stored values on both sides. The three times are
+/// compared as raw POSIX seconds (`[{time, posix}]`, no clock conversion), and the default
+/// `local` option is compared field by field with the three times left out — their
+/// `{{Y,M,D},{H,M,S}}` shape is pinned by `read_handle_info_answers_the_devices_own_file`
+/// above and their `local`/`universal` values by
+/// `prim::tests::the_file_info_family_agrees_with_the_oracle`.
+#[test]
+fn the_read_handle_info_request_matches_the_live_oracle() {
+    let Some(oracle) = resolve_oracle() else {
+        eprintln!();
+        eprintln!("========== beam_rt file_server read_handle_info oracle SKIPPED ==========");
+        eprintln!("no `erl` on $PATH (and no executable $ERTS_ORACLE): the oracle");
+        eprintln!("comparison cannot run. Set $ERTS_ORACLE (or install Erlang/OTP)");
+        eprintln!("and re-run. NOT a pass.");
+        eprintln!("=========================================================================");
+        eprintln!();
+        return;
+    };
+    let dir = unique_path("oracle_read_handle_info");
+    std::fs::create_dir_all(&dir).expect("a private temporary directory");
+    let source = dir.join("doc_mod.erl");
+    std::fs::write(
+        &source,
+        b"-module(doc_mod).\n-moduledoc({file, \"doc.md\"}).\n-export([f/0]).\nf() -> ok.\n",
+    )
+    .expect("the epp fixture");
+    let doc = dir.join("doc.md");
+    std::fs::write(&doc, b"The documentation.\n").expect("the doc fixture");
+
+    // (a) The fixture really drives the request. Under the oracle the parse yields the
+    // `moduledoc` attribute carrying the doc file's own content, which the reader can only do
+    // once `file:read_file_info(NewF)` answered `{ok, #file_info{size = Sz}}`; a failed read
+    // would instead reply `{error, {Loc, epp, {Doc, file, DocFilename}}}` (`epp.erl:1453-1456`).
+    let expression = format!(
+        "R = epp:parse_file(\"{}\", []), io:format(\"~p~n\", [R]), halt(0).",
+        source.to_str().expect("a UTF-8 temporary path")
+    );
+    let Some(output) = oracle_eval(&oracle, &expression) else {
+        eprintln!("warning: the oracle could not run the `epp` probe — skipped");
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "the oracle's `epp:parse_file` probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed = String::from_utf8_lossy(&output.stdout).into_owned();
+    // The parse must have succeeded: the doc file's own text is inlined as a non-empty
+    // string (`{attribute,1,moduledoc,"The documentation.\n"}`). A failed
+    // `file:read_file_info(NewF)` instead drops the content and emits the
+    // `{warning,{Loc,epp,{moduledoc,file,DocFilename}}}` + `{attribute,Loc,moduledoc,[]}`
+    // shape (`epp.erl:1453-1456`), so keying on the *inlined content* — rather than on the
+    // absence of the substring `epp`, which the doc-file path could itself contain — makes
+    // the discriminator honest.
+    assert!(
+        parsed.contains(r#""The documentation.\n""#),
+        "the doc file's content must be inlined (its `read_file_info` succeeded): {parsed}"
+    );
+    assert!(
+        !parsed.contains("moduledoc,[]"),
+        "the doc file must not have failed to read: {parsed}"
+    );
+
+    // (a2) The same end-to-end drive under **this** runtime: `epp:parse_file/2` runs the
+    // installed `epp.beam`, opens the doc file through this runtime's own `file_server_2`
+    // service (a *non-raw* `file:open/2`, so an io-device pid) and reads that device's
+    // `#file_info{}` through the new `{read_handle_info, Opts}` arm. The inlined doc content
+    // appears only once that read succeeded, so a result carrying the doc file's own text is
+    // proof the request is served here too. (`~w`, the runtime's renderer, prints a string as
+    // its code points, so `"The documentation.\n"` is the charlist below.)
+    let mut runtime = runtime();
+    let eval = format!(
+        "epp:parse_file(\"{}\", [])",
+        source.to_str().expect("a UTF-8 temporary path")
+    );
+    let parsed = runtime
+        .eval(&eval)
+        .unwrap_or_else(|error| panic!("this runtime's own `{eval}` failed: {error:?}"));
+    let rendered = render(&mut runtime, parsed);
+    assert!(
+        rendered.contains(
+            "moduledoc,[84,104,101,32,100,111,99,117,109,101,110,116,97,116,105,111,110,46,10]"
+        ),
+        "the doc file's content must be inlined under this runtime too: {rendered}"
+    );
+    assert!(
+        !rendered.contains("moduledoc,[]"),
+        "the doc file's `read_file_info` must not have failed here: {rendered}"
+    );
+    // (b) The observable. `[{time, posix}]` renders the three times as their stored POSIX
+    // seconds, so the whole 14-tuple is compared byte for byte against an expectation
+    // re-derived from the same `stat(2)`.
+    let Some(shared) = compare_with_oracle(
+        &oracle,
+        "begin {ok,F}=file:open(\"{p}\",[read,binary]), R=file:read_file_info(F,[{time,posix}]), file:close(F), R end",
+        &doc,
+    ) else {
+        return;
+    };
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(&doc).expect("a stat");
+    let info = format!(
+        "{{file_info,{size},regular,read_write,{atime},{mtime},{ctime},{mode},{links},{major},{minor},{inode},{uid},{gid}}}",
+        size = metadata.len(),
+        atime = metadata.atime(),
+        mtime = metadata.mtime(),
+        ctime = metadata.ctime(),
+        mode = metadata.mode(),
+        links = metadata.nlink() as u32,
+        major = metadata.dev() as u32,
+        minor = metadata.rdev() as u32,
+        inode = metadata.ino() as u32,
+        uid = metadata.uid(),
+        gid = metadata.gid(),
+    );
+    assert_eq!(
+        shared,
+        format!("{{ok,{info}}}"),
+        "the `#file_info{{}}` of the device's handle"
+    );
+
+    // The default `Opts` (`local`) on the same file: every field except the three time
+    // fields, byte for byte on both sides.
+    let Some(shared) = compare_with_oracle(
+        &oracle,
+        "begin {ok,F}=file:open(\"{p}\",[read,binary]), {ok,I}=file:read_file_info(F), file:close(F), {element(2,I),element(3,I),element(4,I),element(8,I),element(9,I),element(10,I),element(11,I),element(12,I),element(13,I),element(14,I)} end",
+        &doc,
+    ) else {
+        return;
+    };
+    let expected = format!(
+        "{{{size},regular,read_write,{mode},{links},{major},{minor},{inode},{uid},{gid}}}",
+        size = metadata.len(),
+        mode = metadata.mode(),
+        links = metadata.nlink() as u32,
+        major = metadata.dev() as u32,
+        minor = metadata.rdev() as u32,
+        inode = metadata.ino() as u32,
+        uid = metadata.uid(),
+        gid = metadata.gid(),
+    );
+    assert_eq!(shared, expected, "the non-time fields of the default record");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
