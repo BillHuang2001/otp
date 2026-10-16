@@ -29,19 +29,49 @@
 //! **sound module identity** to the [`CompiledModule`] compiled for it, so an identical
 //! second run reuses the artifact with **no recompile**.
 //!
-//! # Identity: the load-time MD5 digest (O(1)), with a content-hash fallback
+//! # Identity: the load-time MD5 digest (O(1)) **plus the atom-namespace witness**
 //!
 //! A cache key must never confuse two different modules. A raw pointer to the `Module`
 //! is **not** a valid key — a freed `Module`'s address can be reused by a differently
 //! loaded module, and the cache would then hand back the *wrong* compiled code (a silent
-//! miscompilation). The key is therefore
+//! miscompilation). The key is therefore **two-part**
 //!
 //! ```text
+//! struct CacheKey {
+//!     module: ModuleKey,    // the module's own identity
+//!     atoms: AtomSnapshot,  // the atom namespace the artifact was compiled against
+//! }
+//!
 //! enum ModuleKey {
 //!     Digest([u8; 16]),                            // a real `.beam`: read in O(1)
 //!     Content { name: String, fingerprint: u64 },  // a synthetic module: content hash
 //! }
 //! ```
+//!
+//! `atoms` is [`Module::atom_table`]'s [`AtomSnapshot`](beam_term::AtomSnapshot) — an
+//! O(1), allocation-free witness of the table's *identity*, its append generation and its
+//! length. It is load-bearing because the native baseline tier **bakes atom indices into
+//! the emitted code**: an IR `Operand::Atom(a)` is lowered to the `Eterm` atom immediate
+//! `make_atom(a)` (see `src/jit/baseline/emit/operands.rs`), so a block that compares an
+//! atom clause head (`is_eq_exact`/`select_val`) holds the *index* the module's own atom
+//! table assigned. The module's MD5 says nothing about that index: the very same `.beam`
+//! loaded against a different namespace (a second runtime in the same thread with its
+//! own atom table — `beam_rt`'s code server loads every `.beam` against its shared table)
+//! assigns every name a different index, so reusing the first runtime's artifact would
+//! compare against the wrong atom — a silently wrong result, not a crash. Witnessing the
+//! namespace makes that a **miss**.
+//!
+//! ## The trade, and why it is the right one
+//!
+//! Adding the witness costs at worst a **recompile**: two loads of one `.beam` — or even
+//! a `Module` clone, since `AtomTable::clone` deliberately takes a *fresh* identity — no
+//! longer share an entry, because each carries its own atom table instance. A stale entry
+//! (an older generation of the same table) is likewise a recompile. What it can never
+//! cause is a wrong answer: equal snapshots imply the same index → name mapping over
+//! every index the artifact can embed, and reading one is O(1) (three scalars), so the
+//! hit path stays hash-free and allocation-free for a real `.beam`.
+//!
+//! ## The module half
 //!
 //! * `Digest` is the module's **load-time MD5** — [`Module::checksum`], the same digest
 //!   the C reader stores in `beam->checksum` and `beam_lib:md5/1` reports, computed
@@ -55,10 +85,10 @@
 //!   and `fingerprint` is [`module_fingerprint`], a deterministic hash of the module's
 //!   **decoded IR content**.
 //!
-//! Two separately loaded copies of the same `.beam` carry the same digest, hence the
-//! same key and a **cache hit**; two modules with the same name but different content
-//! have different digests (or different fingerprints on the fallback) and **cannot
-//! collide**.
+//! Two modules with the same name but different content have different digests (or
+//! different fingerprints on the fallback) and **cannot collide**; two loads of the very
+//! same `.beam` collide on the module half alone and are separated by the namespace half
+//! (see the trade above).
 //!
 //! ## Why the digest implies artifact-equivalence
 //!
@@ -68,21 +98,25 @@
 //! `Line` / `LocT` / `Attr` / `CInf` / `Type` / `Docs` / `Dbgi` chunks
 //! (`beam_loader::checksum`, the `only_the_significant_chunks_are_digested` test).
 //! Everything a [`CompiledModule`] is derived from — the module name (wire index 1 of
-//! `AtU8`), the atom table, the export and import tables, `functions` (the `Code`
-//! chunk), `funs`, `records`, `code_version` and the literals — lies inside that
-//! subset, and no code under `src/jit/` reads an excluded field: `module.strings`,
-//! `module.line` and `module.types` are read from the **live** module by the
-//! interpreter families and `machine/catch.rs` at run time, never by the compiled
-//! artifact (`strings`/`StrT` is digested anyway). So equal digests imply
-//! artifact-equivalence, and the digest is strictly stronger than the 64-bit content
-//! hash it replaces on this path. An all-zero digest is not a real `.beam` — it is the
-//! `Module::default()` sentinel, which is exactly what selects the fallback.
+//! `AtU8`), the export and import tables, `functions` (the `Code` chunk), `funs`,
+//! `records`, `code_version` and the literals — lies inside that subset, and no code
+//! under `src/jit/` reads an excluded field: `module.strings`, `module.line` and
+//! `module.types` are read from the **live** module by the interpreter families and
+//! `machine/catch.rs` at run time, never by the compiled artifact (`strings`/`StrT` is
+//! digested anyway). So equal digests imply artifact-equivalence **for every operand
+//! whose meaning is namespace-independent**, and the digest is strictly stronger than
+//! the 64-bit content hash it replaces on this path. The one digested field whose
+//! meaning *is* namespace-dependent — the `AtU8` atom table — is exactly what the
+//! `atoms` half of the [`CacheKey`] witnesses. An all-zero digest is not a real
+//! `.beam`: it is the `Module::default()` sentinel, which is exactly what selects the
+//! fallback.
 //!
 //! Neither variant ever weakens identity against the pre-existing behaviour: two
 //! modules the content hash separated are still separated by the digest, and the two
-//! variants can never key one module to the other (the enum discriminants differ). A
-//! digest-keyed module and a synthetic module with the same logical content are at
-//! worst two entries for one artifact — a wasted duplicate, never a wrong result.
+//! variants can never key one module to the other (the enum discriminants differ). Two
+//! entries for one artifact (a same-content module in a second namespace, a
+//! digest-keyed and a synthetic module with the same logical content) are at worst a
+//! wasted duplicate compile — never a wrong result.
 //!
 //! `beam_loader::Module` does **not** retain the original `.beam` bytes, so the
 //! fallback fingerprint is computed from the decoded IR. Most IR types derive `Debug`
@@ -103,16 +137,18 @@
 //!
 //! # Cache miss vs. cache hit
 //!
-//! The authoritative key is the load-time digest (the content hash only for a
-//! zero-checksum synthetic module) — two same-named but differently-bodied real modules
-//! must never collide — and a **miss** derives it, which for a synthetic module means
-//! hashing the module's whole decoded IR. A **hit** costs one 16-byte digest read plus a
+//! The authoritative key is the [`CacheKey`]: the load-time digest (the content hash only
+//! for a zero-checksum synthetic module) plus the [`AtomSnapshot`](beam_term::AtomSnapshot)
+//! of the module's atom namespace. A **miss** derives it — which for a synthetic module
+//! means hashing the module's whole decoded IR, and for every module means reading the
+//! three-scalar snapshot. A **hit** costs one 16-byte digest read, one snapshot read, a
 //! [`CodeCache::memo`] `usize` probe and the owning map probe, with no re-hash of the IR
 //! and no allocation. The memo is a *hint* only — it is trusted solely while a
-//! `Weak<Module>` proves the module is still alive at that address, and the key it
-//! yields is still verified against the authoritative entry map; with no memo — or a
-//! dead one — the lookup falls back to the digest (O(1)) or, for a synthetic module, the
-//! content hash. No unbounded work is added to the run path.
+//! `Weak<Module>` proves the module is still alive at that address **and** the module's
+//! current snapshot still witnesses the namespace the memoized key names, and the key it
+//! yields is then still verified against the authoritative entry map; with no memo — or a
+//! dead/stale one — the lookup falls back to the digest (O(1)) or, for a synthetic
+//! module, the content hash. No unbounded work is added to the run path.
 //!
 //! Filling the memo needs the module's `Arc` (the [`Weak`] liveness proof), so the
 //! cross-module callee route ([`cached_module_blocks`]) fills it for a callee and
@@ -121,6 +157,7 @@
 //! bare `&Module`. Since the digest key is itself O(1), the memo is a redundant
 //! micro-optimisation for a real `.beam` (see [`CodeCache::memo`]) and is
 //! load-bearing only for a synthetic module.
+//!
 //! # Two artifact layouts (eager / lazy)
 //!
 //! The cache stores [`CompiledModule`]s in both of the layouts the baseline tier
@@ -144,8 +181,7 @@ use std::sync::{Arc, Weak};
 
 use beam_common::Result;
 use beam_loader::{Atom, Label, Module};
-use beam_term::Eterm;
-
+use beam_term::{AtomSnapshot, Eterm};
 use crate::context::ExecutionContext;
 use crate::jit::baseline::{self, CompiledModule};
 use crate::jit::CodeRegion;
@@ -186,7 +222,7 @@ impl<H: Hasher> std::fmt::Write for HashWriter<'_, H> {
 /// memory — so two independently loaded copies of the same `.beam` fingerprint equally,
 /// and two modules that differ in name, atom content, imports/exports, function bodies,
 /// literals or the raw attribute/compile-info/string blobs fingerprint differently. It is
-/// the **fallback** half of the [`CodeCache`] key: a real `.beam` keys on its load-time
+/// the **fallback** half of the module's identity: a real `.beam` keys on its load-time
 /// MD5 digest ([`ModuleKey::Digest`]) and only a module with an all-zero checksum (the
 /// [`Module::default()`] sentinel of a hand-built/synthetic module) reaches this hash —
 /// which is what keeps a synthetic module's identity exactly as it was before the digest
@@ -250,6 +286,9 @@ pub fn module_fingerprint(module: &Module) -> u64 {
 /// The **sound identity** of a loaded module: its load-time digest, or — for a synthetic
 /// module with an all-zero checksum — its name plus a content fingerprint.
 ///
+/// This is only the *module* half of the [`CacheKey`]: it says which container the
+/// artifact was derived from, not which atom namespace its baked atom indices refer to.
+///
 /// Not a pointer: the digest is the container's own MD5 (see the module docs) and the
 /// fallback is derived from the IR content. Derives `Hash`/`Eq` so it can key the
 /// [`CodeCache`]'s map; the two variants hash their discriminant too, so a digest-keyed
@@ -259,7 +298,8 @@ enum ModuleKey {
     /// A real `.beam`: the 16-byte MD5 computed once at load time
     /// ([`Module::checksum`]), read here as a plain `Copy` — O(1), no hash, no
     /// allocation. Everything a [`CompiledModule`] is derived from is digested, so
-    /// equal digests imply artifact-equivalence (see the module docs).
+    /// equal digests imply artifact-equivalence over everything except the indices the
+    /// artifact bakes — which is what the [`CacheKey`]'s namespace half covers.
     Digest([u8; 16]),
 
     /// A synthetic/hand-built module ([`Module::default`] carries an all-zero checksum,
@@ -274,7 +314,8 @@ enum ModuleKey {
 }
 
 impl ModuleKey {
-    /// The key of `module`: its load-time digest when it has one, else its content hash.
+    /// The module half of `module`'s key: its load-time digest when it has one, else its
+    /// content hash.
     fn of(module: &Module) -> ModuleKey {
         match digest_of(module) {
             Some(digest) => ModuleKey::Digest(digest),
@@ -287,7 +328,7 @@ impl ModuleKey {
         }
     }
 
-    /// The key of `module` whose **content fingerprint is already known**.
+    /// The module half of `module`'s key whose **content fingerprint is already known**.
     ///
     /// The digest wins when the module has one (the passed `fingerprint` is then ignored
     /// — it is the artifact's own one-time cold-staging hash, redundant with the O(1)
@@ -301,6 +342,63 @@ impl ModuleKey {
                 name: module_name(module),
                 fingerprint,
             },
+        }
+    }
+}
+
+/// The **complete cache key**: which module, **and** which atom namespace its compiled
+/// code was lowered against.
+///
+/// The namespace half is load-bearing, not belt-and-braces: the native baseline tier
+/// bakes atom *indices* into the emitted code (an IR `Operand::Atom(a)` becomes the
+/// `Eterm` immediate `make_atom(a)`), and a module's MD5 says nothing about the indices
+/// its atom table assigned. The very same `.beam` loaded against a second namespace —
+/// another runtime in this thread with its own [`AtomTable`](beam_term::AtomTable), which
+/// is exactly how `beam_rt`'s code server loads every module — numbers every name
+/// differently, so the first runtime's artifact would compare a clause head against the
+/// *wrong* atom. Witnessing the namespace turns that into a miss (see the module docs for
+/// the trade).
+///
+/// Both halves come from [`CacheKey::of`]/[`CacheKey::with_fingerprint`] — the **single**
+/// derivation every entry in [`CodeCache::entries`] and every [`MemoEntry`] goes through,
+/// so the two maps can never disagree about a module's identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CacheKey {
+    /// The module's own identity (the digest, or the synthetic content hash).
+    module: ModuleKey,
+    /// The atom-namespace witness the artifact was compiled against.
+    ///
+    /// [`Module::atom_table`]'s [`AtomSnapshot`](beam_term::AtomSnapshot) — three scalars
+    /// (the table's identity, its append generation, its length), read in O(1) with no
+    /// allocation. `AtomTable::clone` deliberately takes a **fresh** identity, so two
+    /// loads of one `.beam` never share a snapshot; equal snapshots therefore imply the
+    /// same index → name mapping over every index the artifact can embed.
+    atoms: AtomSnapshot,
+}
+
+impl CacheKey {
+    /// The key of `module`, deriving the content fingerprint when it has no digest.
+    ///
+    /// The **only** way a key is derived from a bare [`Module`] (the `contains`/
+    /// `get_or_compile`/`compiled_handle` paths).
+    fn of(module: &Module) -> CacheKey {
+        CacheKey {
+            module: ModuleKey::of(module),
+            atoms: module.atom_table.snapshot(),
+        }
+    }
+
+    /// The key of `module` whose **content fingerprint is already known**
+    /// ([`CompiledModule::fingerprint`]).
+    ///
+    /// The single derivation the artifact-holding paths use
+    /// ([`CodeCache::prime`]/[`CodeCache::remember`]): the stored fingerprint is reused
+    /// instead of re-hashing the IR, so a synthetic module is keyed without a second hash
+    /// while a real `.beam` still keys on its O(1) digest.
+    fn with_fingerprint(module: &Module, fingerprint: u64) -> CacheKey {
+        CacheKey {
+            module: ModuleKey::with_fingerprint(module, fingerprint),
+            atoms: module.atom_table.snapshot(),
         }
     }
 }
@@ -332,7 +430,7 @@ fn module_address(module: &Module) -> usize {
     module as *const Module as usize
 }
 
-/// A cache of compiled baseline-JIT artifacts, keyed by [`ModuleKey`].
+/// A cache of compiled baseline-JIT artifacts, keyed by [`CacheKey`].
 ///
 /// Compile-once / run-many across separate [`Machine`]s: [`get_or_compile`](CodeCache::get_or_compile)
 /// compiles a module the first time it is seen and hands back the stored artifact on every
@@ -343,14 +441,15 @@ fn module_address(module: &Module) -> usize {
 /// long as the cache lives. Because a [`CompiledModule`] is neither `Send` nor `Sync`, so
 /// is a `CodeCache`: it is confined to the thread that created it.
 pub struct CodeCache {
-    /// Compiled artifacts by module identity; each entry owns its executable mapping.
+    /// Compiled artifacts by module **and** atom-namespace identity; each entry owns its
+    /// executable mapping.
     ///
     /// Held behind an [`Rc`] so a caller can take a cheap **handle** to an artifact
     /// ([`CodeCache::compiled_handle`]) and keep it alive — with its executable mapping —
     /// after the cache borrow is released (even across [`CodeCache::clear`]). The native
     /// driver needs exactly that: a cross-module callee's blocks stay mapped and unmoved
     /// while the driver runs in another module and may touch the cache again.
-    entries: HashMap<ModuleKey, Rc<CompiledModule>>,
+    entries: HashMap<CacheKey, Rc<CompiledModule>>,
     /// An **address-keyed resolution memo**: a module's address → the key it was last
     /// resolved under, so a repeat lookup costs one `HashMap` probe on a `usize` instead
     /// of re-deriving the key (a 16-byte digest read for a real `.beam`, a full re-hash
@@ -364,15 +463,17 @@ pub struct CodeCache {
     ///
     /// A pointer key is only trustworthy while the pointed-to `Module` is provably
     /// alive, so every entry carries a [`Weak`] to the module it was created from and is
-    /// **only** honoured while [`Weak::upgrade`] succeeds. That proves the module is
-    /// still allocated *at that address* (a live `Module` cannot move out of its `Arc`,
-    /// and no other object can occupy the address while it lives), so a hit can never
-    /// name a different module — the failure mode a bare pointer key would have after a
-    /// module is dropped and its address recycled. When the module does die the upgrade
-    /// fails, the entry is ignored, and the lookup falls back to the honest content hash.
+    /// **only** honoured while [`Weak::upgrade`] succeeds **and** the module's current
+    /// [`AtomSnapshot`](beam_term::AtomSnapshot) still equals the one in the memoized
+    /// [`CacheKey`]. That proves the module is still allocated *at that address* (a live
+    /// `Module` cannot move out of its `Arc`, and no other object can occupy the address
+    /// while it lives) *and* that the namespace the memoized key names is still this
+    /// module's namespace — so a hit can never name a different module, nor an artifact
+    /// compiled against a namespace this module no longer has. When either check fails,
+    /// the entry is ignored and the lookup falls back to [`CacheKey::of`].
     ///
     /// The memo is therefore a *hint*: it never decides identity on its own — a hit still
-    /// has to find the [`ModuleKey`] in [`CodeCache::entries`], which stays the
+    /// has to find the [`CacheKey`] in [`CodeCache::entries`], which stays the
     /// authority. It is filled only where an `Arc<Module>` is available to downgrade,
     /// which is the cross-module callee route ([`cached_module_blocks`]) and the
     /// host-driven [`remember_module`].
@@ -386,10 +487,10 @@ struct MemoEntry {
     /// Liveness proof for the address key: the memo entry is honoured only while this
     /// upgrades (see [`CodeCache::memo`]).
     module: Weak<Module>,
-    /// The key `module` resolved to, so a hit needs no hashing and no allocation.
-    key: ModuleKey,
+    /// The key `module` resolved to — module identity **and** the namespace witness it was
+    /// derived under — so a hit needs no hashing and no allocation.
+    key: CacheKey,
 }
-
 impl CodeCache {
     /// An empty cache.
     pub fn new() -> CodeCache {
@@ -420,9 +521,8 @@ impl CodeCache {
 
     /// Whether `module` is already cached (a key probe, no compilation).
     pub fn contains(&self, module: &Module) -> bool {
-        self.entries.contains_key(&ModuleKey::of(module))
+        self.entries.contains_key(&CacheKey::of(module))
     }
-
     /// Drop every cached artifact (freeing its executable mapping) and reset the
     /// compile counter and the resolution memo.
     pub fn clear(&mut self) {
@@ -433,10 +533,11 @@ impl CodeCache {
 
     /// The compiled artifact for `module`, compiling it on first sight.
     ///
-    /// A **cache hit** (an equal [`ModuleKey`]) returns the already-compiled artifact and
+    /// A **cache hit** (an equal [`CacheKey`]) returns the already-compiled artifact and
     /// performs no compilation; a **cache miss** compiles it once with
     /// [`baseline::compile_module`] and stores the result. Compilation is bounded (exactly
-    /// the cost the one-shot entry paid) and happens at most once per distinct module.
+    /// the cost the one-shot entry paid) and happens at most once per distinct module
+    /// **and atom namespace**.
     ///
     /// The returned reference borrows the cache; a caller that must keep the artifact
     /// alive after releasing that borrow (the native driver holding a cross-module
@@ -446,8 +547,7 @@ impl CodeCache {
     /// backend returns for an unlowerable construct) is propagated without inserting a
     /// partial entry, so a later call retries rather than caching a failure.
     pub fn get_or_compile(&mut self, module: &Module) -> Result<&CompiledModule> {
-        match self.entries.entry(ModuleKey::of(module)) {
-            std::collections::hash_map::Entry::Occupied(entry) => Ok(&**entry.into_mut()),
+        match self.entries.entry(CacheKey::of(module)) {            std::collections::hash_map::Entry::Occupied(entry) => Ok(&**entry.into_mut()),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let compiled = baseline::compile_module(module)?;
                 self.compiles += 1;
@@ -473,23 +573,25 @@ impl CodeCache {
     ///
     /// # The lookup is O(1) on a hit
     ///
-    /// The identity is the module's **load-time MD5 digest** ([`Module::checksum`],
-    /// read here as a 16-byte `Copy`), or — for a synthetic module with an all-zero
-    /// checksum — `(module name, content fingerprint)`, where the fingerprint is a hash
-    /// of the whole decoded IR. The digest path costs no hashing and no allocation at
-    /// all, which is what makes a slice entry/resume cheap; a synthetic module still
-    /// pays its content hash. In addition, a module whose address this cache has already
-    /// resolved is looked up through the address-keyed [`CodeCache::memo`], which yields
-    /// the key the module resolved to last time — sound because the memo only answers
-    /// while a [`Weak<Module>`] proves the module is still alive at that address — and
-    /// the memoized key is then verified against the authoritative
-    /// [`CodeCache::entries`] map. The memo is now a **redundant micro-optimisation** on
-    /// top of the O(1) digest (it saves a 16-byte read and one map probe, and it is the
-    /// only thing that helps a synthetic module avoid its content hash), but it is kept:
-    /// it is a hint that can only ever be *verified*, never trusted blindly. A memo miss
-    /// (a first sight of this address, a module that has since died, or an entry dropped
-    /// by [`CodeCache::clear`]) falls back to the digest — or, for a synthetic module,
-    /// the honest content hash.
+    /// The identity is the [`CacheKey`]: the module's **load-time MD5 digest**
+    /// ([`Module::checksum`], read here as a 16-byte `Copy`), or — for a synthetic module
+    /// with an all-zero checksum — `(module name, content fingerprint)`, where the
+    /// fingerprint is a hash of the whole decoded IR; **plus** the module's atom-namespace
+    /// [`AtomSnapshot`](beam_term::AtomSnapshot) (three scalars, O(1), allocation-free).
+    /// The digest and snapshot paths cost no hashing and no allocation at all, which is
+    /// what makes a slice entry/resume cheap; a synthetic module still pays its content
+    /// hash. In addition, a module whose address this cache has already resolved is looked
+    /// up through the address-keyed [`CodeCache::memo`], which yields the key the module
+    /// resolved to last time — sound because the memo only answers while a
+    /// [`Weak<Module>`] proves the module is still alive at that address *and* the
+    /// module's current snapshot still equals the memoized key's — and the memoized key is
+    /// then verified against the authoritative [`CodeCache::entries`] map. The memo is a
+    /// **redundant micro-optimisation** on top of the O(1) digest (it saves a 16-byte read
+    /// and one map probe, and it is the only thing that helps a synthetic module avoid its
+    /// content hash), but it is kept: it is a hint that can only ever be *verified*, never
+    /// trusted blindly. A memo miss (a first sight of this address, a module that has
+    /// since died, a namespace that moved on, or an entry dropped by [`CodeCache::clear`])
+    /// falls back to the digest — or, for a synthetic module, the honest content hash.
     pub(crate) fn compiled_handle(&mut self, module: &Module) -> Result<Rc<CompiledModule>> {
         // Fast path: the address memo proves the identity of this very module and the
         // artifact it names is still cached. No hashing, no allocation.
@@ -498,10 +600,11 @@ impl CodeCache {
                 return Ok(Rc::clone(existing));
             }
         }
-        // Slow path: derive the key from the module's identity (the O(1) digest, or the
-        // content hash for a synthetic module — the only sound ways), then either reuse
-        // the artifact of an identically-loaded copy or stage a fresh lazy one.
-        let key = ModuleKey::of(module);
+        // Slow path: derive the key from the module's identity and atom namespace (the
+        // O(1) digest + snapshot, or the content hash for a synthetic module — the only
+        // sound ways), then either reuse the artifact of an identically-keyed module or
+        // stage a fresh lazy one.
+        let key = CacheKey::of(module);
         if let Some(existing) = self.entries.get(&key) {
             return Ok(Rc::clone(existing));
         }
@@ -516,37 +619,41 @@ impl CodeCache {
     /// module (see [`CodeCache::memo`]).
     ///
     /// A `None` here is not an error: it means "derive the identity" — the caller falls
-    /// back to [`ModuleKey::of`] (the O(1) digest, or the content hash for a synthetic
-    /// module).
-    fn memoized_key(&self, module: &Module) -> Option<&ModuleKey> {
+    /// back to [`CacheKey::of`] (the O(1) digest + snapshot, or the content hash for a
+    /// synthetic module).
+    fn memoized_key(&self, module: &Module) -> Option<&CacheKey> {
         let entry = self.memo.get(&module_address(module))?;
         // A live module cannot have been replaced at this address, so `upgrade`
         // succeeding is exactly the proof the pointer key needs; the upgraded `Arc` is
-        // dropped immediately (the entry holds only a `Weak`).
-        entry.module.upgrade().is_some().then_some(&entry.key)
+        // dropped immediately (the entry holds only a `Weak`). The snapshot check is the
+        // second half: the memoized key names the namespace this module had when it was
+        // recorded, and a key whose namespace this module no longer has must never be
+        // handed to the entry map (an appended-to table is a *miss*, never a stale hit).
+        (entry.module.upgrade().is_some() && entry.key.atoms == module.atom_table.snapshot())
+            .then_some(&entry.key)
     }
 
     /// Warm this cache for `module`: stage its lazy artifact (unless an artifact for
     /// that content is already cached) and memoize its identity under its address.
     ///
     /// The body of [`remember_module`], which carries the whole rationale. Both halves
-    /// are idempotent: an address already memoized for a live module is left alone (a
-    /// live `Module` cannot be replaced at its address, so that entry already names
-    /// this very module), and an artifact already cached for the content is **never**
-    /// replaced — a lazily-staged artifact must not displace an eagerly compiled one.
+    /// are idempotent: an address already memoized for a live module **whose current
+    /// namespace is the memoized key's** is left alone (a live `Module` cannot be replaced
+    /// at its address, so that entry already names this very module), and an artifact
+    /// already cached for the content is **never** replaced — a lazily-staged artifact
+    /// must not displace an eagerly compiled one.
     ///
     /// The key is derived from the lazy artifact's own stored fingerprint
     /// ([`CompiledModule::fingerprint`], computed once at its creation) — which a real
     /// `.beam`'s O(1) digest supersedes, so priming one costs **nothing** beyond the
     /// artifact it stages; only a synthetic (zero-checksum) module keeps the content
-    /// key, and then the artifact's fingerprint is exactly the one [`ModuleKey::of`]
+    /// key, and then the artifact's fingerprint is exactly the one [`CacheKey::of`]
     /// would derive.
-    fn prime(&mut self, module: &Arc<Module>) {
-        if self.memoized_key(module).is_some() {
+    fn prime(&mut self, module: &Arc<Module>) {        if self.memoized_key(module).is_some() {
             return;
         }
         let staged = CompiledModule::lazy(module);
-        let key = ModuleKey::with_fingerprint(module, staged.fingerprint());
+        let key = CacheKey::with_fingerprint(module, staged.fingerprint());
         if !self.entries.contains_key(&key) {
             self.compiles += 1;
             self.entries.insert(key.clone(), Rc::new(staged));
@@ -558,18 +665,18 @@ impl CodeCache {
     ///
     /// The single write site of a [`MemoEntry`], shared by the memo's two fill paths —
     /// the cross-module [`CodeCache::remember`] and the entry-path
-    /// [`CodeCache::prime`] — so the address key, the [`Weak`] liveness proof and the
-    /// already-live short-circuit cannot drift apart.
+    /// [`CodeCache::prime`] — so the address key, the [`Weak`] liveness proof, the
+    /// namespace witness and the already-live short-circuit cannot drift apart.
     ///
     /// Recording is a no-op (and allocates nothing) when the address is **already**
-    /// memoized for a live module: a live module cannot be replaced at its address, so
-    /// that entry already names this very module. [`CodeCache::remember`] calls it on
-    /// every [`cached_module_blocks`] lookup — hit or miss — so the hot path must stay
-    /// cheap.
-    fn memoize(&mut self, module: &Arc<Module>, key: ModuleKey) {
+    /// memoized for a live module **whose current namespace is the key's**: a live module
+    /// cannot be replaced at its address, so that entry already names this very module
+    /// under this very namespace. [`CodeCache::remember`] calls it on every
+    /// [`cached_module_blocks`] lookup — hit or miss — so the hot path must stay cheap.
+    fn memoize(&mut self, module: &Arc<Module>, key: CacheKey) {
         let address = module_address(module);
         if let Some(entry) = self.memo.get(&address) {
-            if entry.module.upgrade().is_some() {
+            if entry.module.upgrade().is_some() && entry.key.atoms == module.atom_table.snapshot() {
                 return;
             }
         }
@@ -588,14 +695,14 @@ impl CodeCache {
     /// is why the memo is filled from the two `Arc`-holding paths — the cross-module
     /// [`cached_module_blocks`], where the driver hands the callee's shared `Arc`, and
     /// the host-driven [`remember_module`] — rather than from the `&Module`-only
-    /// entries. The key is the module's O(1) load-time digest (the artifact's stored
-    /// fingerprint only stands in for the content-hash fallback of a synthetic module),
-    /// so memoizing never re-hashes the IR of a real `.beam`.
+    /// entries. The key is the module's O(1) load-time digest plus its atom-namespace
+    /// snapshot (the artifact's stored fingerprint only stands in for the content-hash
+    /// fallback of a synthetic module), so memoizing never re-hashes the IR of a real
+    /// `.beam`.
     fn remember(&mut self, module: &Arc<Module>, compiled: &CompiledModule) {
-        let key = ModuleKey::with_fingerprint(module, compiled.fingerprint());
+        let key = CacheKey::with_fingerprint(module, compiled.fingerprint());
         self.memoize(module, key);
     }
-
     /// Run exported `function/arity` against `module`'s cached artifact; yields `x(0)`.
     ///
     /// Does exactly what [`JitBackend::run_compiled`](crate::jit::JitBackend::run_compiled)
@@ -761,16 +868,16 @@ pub(crate) fn cached_module_blocks(module: &Arc<Module>) -> Option<Rc<CompiledMo
 ///
 /// # Why this exists
 ///
-/// The entry path resolves a module through [`ModuleKey`], which for a real `.beam` is
-/// the module's **load-time MD5 digest** ([`Module::checksum`]) — O(1), already. This
-/// call remains useful for the one case the digest cannot serve: a **synthetic**
-/// (zero-checksum) module, whose key is the content hash of its whole decoded IR. It is
-/// also what fills the [`CodeCache::memo`] for the module a host is about to **enter**,
-/// which saves the 16-byte digest read plus one map probe per slice on the redundant
-/// micro-optimisation described in [`CodeCache`].
+/// The entry path resolves a module through [`CacheKey`], whose module half for a real
+/// `.beam` is the module's **load-time MD5 digest** ([`Module::checksum`]) — O(1),
+/// already. This call remains useful for the one case the digest cannot serve: a
+/// **synthetic** (zero-checksum) module, whose key is the content hash of its whole
+/// decoded IR. It is also what fills the [`CodeCache::memo`] for the module a host is
+/// about to **enter**, which saves the 16-byte digest read plus one map probe per slice on
+/// the redundant micro-optimisation described in [`CodeCache`].
 ///
 /// Historically this call existed because the *entry* module fell to
-/// [`ModuleKey::of`] → [`module_fingerprint`] (a full `Debug`-render hash of the whole
+/// [`CacheKey::of`] → [`module_fingerprint`] (a full `Debug`-render hash of the whole
 /// decoded IR) **once per slice**, the dominant baseline-tier cost on a message-passing
 /// shape. The digest key removed that cost for real modules; the API is kept because a
 /// host that owns its modules as `Arc<Module>` — the runtime's code server does — still
