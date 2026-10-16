@@ -1619,6 +1619,22 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "maps/next_of_none_is_none",
+            description: "maps:next/1 accepts the documented terminal `none` and answers `none`",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The documented iterator type is `iterator() | none`, so `none` is a legal input
+                // (it ends the walk) while any other non-iterator term is a `badarg`.
+                expr: "maps:next(none)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok none"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "maps/iterator_ordered_walk_of_a_hamt_is_term_ordered",
             description: "an `ordered` walk of a 40-key (HAMT-backed) map is exactly the term-ordered keys",
             contracts: &[Contract::OtpApps],
