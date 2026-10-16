@@ -230,7 +230,7 @@ Public surface: `RECORD_INST_FIXED_WORDS = 2` / `RECORD_DEF_FIXED_WORDS = 6` / `
 - `src/heap.rs` → minimal bump term arena
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + `tag_literal_area`/`set_literal_tag`/`LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
-- `src/compare.rs` → `cmp`/`eq`/`cmp_arith` (the `erts_cmp` port + deterministic fallbacks); `src/compare/numbers.rs` → exact `mixed_types` compare + private `double_to_big`
+- `src/compare.rs` → `cmp`/`eq`/`cmp_arith` (the `erts_cmp` port + deterministic fallbacks); `src/compare/numbers.rs` → exact `mixed_types` compare + private `double_to_big`; `src/compare/maps.rs` → the `MAP_SUBTAG` arm (`cmp_maps`: the allocation-free flat-vs-flat fast path over `thing::flatmap_parts` + the collecting `map_pairs_flatmap_order` fallback, gated by the O(n) `cmp_flatmap_keys` sortedness precondition)
 - `src/hashing/mod.rs` → internal structural hash `term_hash`; `src/hashing/common.rs` → shared ERTS-hash primitives; `src/hashing/make_hash2.rs` → bit-exact `make_hash2` + `compute_record_definition_hash`; `src/hashing/make_hash.rs` → bit-exact `make_hash` + `hash_binary_bytes`
 - `src/ihash.rs` → bit-exact `erts_map_hash`/`make_internal_hash` + `swizzle_map_hash`/`hashmap_nibble`
 - `src/size.rs` → `size_object` + bounded, cycle-safe `size_object_bounded`
