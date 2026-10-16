@@ -525,14 +525,20 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   default** — a genuinely absent `erl` FAILS the cross-check rather than skipping it
   (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces it).
 - **Randomised `ordered_set` differential** (`tests/ets_ordered_oracle.rs`, `#[ignore]`d by default):
-  a 73-term mixed-type key pool driven by a SplitMix64-finalised LCG through a **55-slot** op space
-  (34 `insert` slots plus one slot each for `insert_new`, `delete`, `delete_object`, `take`,
+  a 73-term mixed-type key pool driven by a SplitMix64-finalised LCG through a **60-slot** op space
+  (34 `insert` slots, one slot each for `insert_new`, `delete`, `delete_object`, `take`,
   `delete_all_objects`, `lookup`, `member`, `first`, `last`, `next`, `prev`, `select`, `select_count`,
   `match_object`, `select_reverse`, `foldl`, `update_counter`, `update_element`, `foldr`,
-  `lookup_element/3`, `lookup_element/4`), rendering every observed key as its pool index and comparing
+  `lookup_element/3`, `lookup_element/4`, plus a **`next`/`prev` walk** dimension — a full chain and a
+  chain from the `aux` key (usually absent, i.e. a range bound) — and a **key-boundary** slot
+  `insert_block` inserting a fresh contiguous ascending integer block longer than `ORDER = 32`, so every
+  firing forces a split), rendering every observed key as its pool index and comparing
   `{size, in-order tab2list, op result}` after every step against the live oracle — 1800 steps / 3 seeds
-  agree, **zero divergence**. Run it with `--ignored`; it crosses `ORDER = 32` (peak **49–63** live keys
-  — the test asserts its own peak) so it exercises the split/merge churn the fixed battery cannot.
+  agree, **zero divergence** (peak **68** live keys, longest single walk **67** keys). Run it with
+  `--ignored`; the test asserts its own peak and that every new slot fired, so a future op-mix change
+  cannot silently stop exercising node splits, the merge-on-delete churn, or a walk across a split
+  boundary. A deterministic, always-on counterpart (a `first`+`next`/`last`+`prev` chain over 100 keys
+  interleaved with mutation, plus an absent-key anchor across the split) lives in `tests/ets_fixtable.rs`.
 - **`tests/ets_continuation.rs` / `ets_continuation_direction.rs`** cross-check the continuation cursor
   against the live oracle **including a mutation between chunks**: an `ordered_set` resume survives a
   delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not shift the next
