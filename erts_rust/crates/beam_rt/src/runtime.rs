@@ -650,6 +650,31 @@ impl Runtime {
     /// Propagates heap/process allocation failures and an out-of-range `+P`-style
     /// limit.
     pub fn new(config: RuntimeConfig) -> Result<Runtime> {
+        // A fresh `Runtime` is a fresh **atom namespace**: `CodeServer::new` below builds
+        // its own `AtomTable` and every module it loads maps its `AtU8` names into *that*
+        // table's indices, so the same name can sit at a different index here than it did
+        // in a runtime this thread built earlier (a module the boot loads **on demand**
+        // lands wherever this boot's load order puts it).
+        //
+        // The native baseline tier's compiled-block cache, by contrast, is **per thread**
+        // and survives a `Runtime` (`beam_engine::jit::cache::CODE_CACHE`), while its key is
+        // the module's content digest alone. A compiled block is not namespace-free: a BEAM
+        // atom *is* its raw index, so a block embeds the `Eterm`s of the namespace it was
+        // compiled against — an artifact compiled by an earlier runtime on this thread would
+        // name that runtime's atoms here, where the identical index may hold a different
+        // name. (Measured before this call existed: a second in-process boot resolved
+        // `inet`'s `Mod:translate_ip/1` to `inet_udp:add_acc/1`, an atom no module in the
+        // release even defines, because the first boot had interned `translate_ip` at the
+        // very index the second boot gives `add_acc`.)
+        //
+        // So the cache's real validity domain is one emulator instance — its documented
+        // "compile once, run many" reuse is *within* a runtime (every process entry and
+        // slice of the same node), and a runtime is what ERTS scopes its code area to.
+        // Emptying it here restores that domain: a second boot in one OS process starts
+        // exactly as a second OS process would, rather than inheriting another namespace's
+        // code. An `init:restart/0` reboot ([`Runtime::restart`]) keeps this runtime — and
+        // therefore its atom table — so it deliberately does not come through here.
+        beam_engine::jit::cache::clear_baseline_cache();
         // The GC-strategy opt-in (see the method docs): the runtime cannot pin a
         // `MatureSelection` — `ProcessTable::spawn` takes only a `HeapPolicy` — so the
         // request is expressed as a size here and resolved by `beam_gc`'s automatic rule.
