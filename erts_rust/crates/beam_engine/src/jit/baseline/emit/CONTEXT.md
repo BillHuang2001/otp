@@ -547,14 +547,14 @@ by construction).
   stable across the splits. Keep that in mind when renaming items.
 
 ## Known Issues
-- **`block.rs` (1086 lines) is deliberately above the ~1000-line guidance.** It holds the single
+- **`block.rs` (1093 lines) is deliberately above the ~1000-line guidance.** It holds the single
   per-instruction lowering dispatch (`emit_block`, a `match instr` with one arm per instruction group)
   plus its prologue/epilogue, position-store/Y-publish, deopt wrapper and the three helper-sequence
   arms. The `match` is what makes the file cohesive — each arm is one `try_inline_*` call plus an
   `emit_deopt` fallback — so splitting it would either scatter one decision across files or require
   inventing a visitor/table abstraction the emitter does not need. The other files are all under the
-  guidance (`mod.rs` 351, `test.rs` 963, `aggregate.rs` 720, …).
-- **`test.rs` (963) and `aggregate.rs` (720) are under the guidance but still large**: `test.rs` keeps
+  guidance (`mod.rs` 400, `test.rs` 963, `aggregate.rs` 744, …).
+- **`test.rs` (963) and `aggregate.rs` (744) are under the guidance but still large**: `test.rs` keeps
   the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
   `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers
   live in `aggregate/list.rs`.
