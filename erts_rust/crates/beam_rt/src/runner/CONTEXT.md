@@ -242,6 +242,32 @@ shapes `peak_young_spaces == 2` and the young capacity plateaus (376 / 610 words
 retired-nursery chain the `collection_debt` trigger protects is bounded rather than N-dependent, and
 `yields == slices − 1` with `waits == 0` throughout (neither loop ever parks).
 
+**The recorded `foreign` / `emqx_base62:encode` regression is measurable as CLOSED, and the module-literal
+tagging is why.** Interleaved matched-N A/B through the bench harness (`--quick --runtime rust
+--workloads foreign`, `$BEAM_RT` per variant, N = 25 000, 3 rounds per side, host loadavg 23–61):
+`case_emqx_base62_encode_ns_per_call` HEAD `75ee31bef3` 17 730 / 17 277 / 22 217 ns vs the m10 baseline
+`b4593818b3` 16 381 / 22 797 / 18 697 ns — **ratio of medians 0.95×**, mean of the three round ratios
+1.01×; two independent quiet-host replications (loadavg 2.5–4 and 0.96–1.40, 3 rounds each) give
+**1.06×** and **1.07×**, i.e. parity within the run-to-run spread. The m13 tree `a141d6878c`, which
+reproduces the recorded regression on this host at **3.91×–3.97×** m10, shows the comparison is
+discriminating.
+Startup-cancelled per-call marginals (`N = 0 / 5 000 / 25 000 / 60 000`): HEAD 9.4 / 16.6 / 24.4 µs, m10
+13.2 / 16.8 / 27.5 µs → **head/m10 0.71 / 0.99 / 0.89, flat in N** with no superlinear residual, while
+m13 climbs 36.3 / 68.1 / 126.9 µs (5.2× HEAD at N = 60 000).
+Deterministic counters (`erlang:statistics(garbage_collection)` + `process_info(self(), heap_size)` over
+the same driver): HEAD collects `{667,155964,0}` / `{16667,3899977,0}` / `{40000,9359864,0}` at
+N = 1 000 / 25 000 / 60 000 with `heap_size` flat at 466 words, whereas m10 **and** m13 run **zero**
+collections with a linearly growing nursery (m10 147 249 / 3 756 849 / 9 020 849 ≈ 150.4 words/call, m13
+the same shape).
+The mechanism is the one the previous pass recorded, and it is off the path now: `Nursery::grow` retires
+the old space into `retired` and only `Nursery::collapse` — reached at a collection — clears it, so a
+runtime that never collects walks an ever-longer `spaces()` = `retired.chain(current)` through
+`root_is_unscanned` → `Nursery::contains` on every admission; HEAD tags the decoded literal area
+(ancestor `98d65f2fd3`, `crates/beam_loader/src/literal.rs` — `tag_literal_area`, the safe form of the C
+load-time `erts_set_literal_tag`), so the walk recognizes the driver's constant literal-area binary as an
+off-heap literal rather than an unscanned container, the valve no longer fires, a collection runs about
+every 1.5 calls and the retired chain stays collapsed.
+
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.
 * The tier is resolved **before** the `RuntimeContext` borrow (the selection happens in the slice's
@@ -287,6 +313,14 @@ retired-nursery chain the `collection_debt` trigger protects is bounded rather t
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
 
 ## Known Issues / Handoffs
+* **A matched-N `ns_per_call` comparison against the m10/m13 trees is not like-for-like on an
+  allocation-shaped loop.** They run **zero** collections on the `foreign` loops — the admission declined
+  and the heap grew instead (m10's `enc` nursery is 147 249 words at N = 1 000, 3 756 849 at N = 25 000
+  and 9 020 849 at N = 60 000) — whereas HEAD collects about once per call, so `bstr_to_lower`,
+  `bstr_capitalize_token` and `emqx_base62_decode` read 1.25×–1.60× dearer on HEAD at matched N on both
+  the default and the interpreter tier. The difference is the memory management HEAD performs and the
+  unbounded heap the old trees retained, not dispatch or tier; `emqx_base62_encode` — the case the
+  regression was recorded on — is at parity.
 * **A natively executed compiled block is charged only at a deopt / heap-admission boundary.** The
   per-instruction charge belongs to the interpreter's loop; the engine's baseline driver runs compiled
   blocks and only deopts (or reaches `ensure_heap` through the host), so a natively linked tail loop that
