@@ -888,6 +888,51 @@ pub(crate) fn group() -> Vec<Case> {
             "code:lib_dir(stdlib, ebin) =/= code:lib_dir(stdlib)",
             "ok true",
         ),
+        // `code:lib_dir/2`'s `priv` sub-directory and `code:priv_dir/1` are how the boot chain
+        // reaches an application's private data; both resolve to a *relation* to the application
+        // directory (never a path by value), and an unknown application is refused with the
+        // frozen `bad_name` atom.
+        eval(
+            "boot/code_lib_dir_2_priv_extends_the_application_dir",
+            "an application's `priv` subdirectory extends its application directory (code:lib_dir/2)",
+            "lists:prefix(code:lib_dir(kernel), code:lib_dir(kernel, priv))",
+            "ok true",
+        ),
+        eval(
+            "boot/code_priv_dir_kernel_is_a_string",
+            "code:priv_dir/1 resolves kernel's private directory to a string (never a path by value)",
+            "is_list(code:priv_dir(kernel))",
+            "ok true",
+        ),
+        eval(
+            "boot/code_priv_dir_missing_app_is_bad_name",
+            "code:priv_dir/1 reports the frozen {error,bad_name} for an unknown application",
+            "code:priv_dir(no_such_application_xyz)",
+            "ok {error,bad_name}",
+        ),
+        // --- The code path's own composition (the boot chain's resolution order) -----------
+        //
+        // The booted code path is installation-specific, so only its *composition* is pinned:
+        // every entry is a string (above), the appended current-directory entry is present and
+        // last, and the first entry is an absolute directory. No path is asserted by value.
+        eval(
+            "boot/code_path_contains_the_current_directory_entry",
+            "the booted code path carries the current-directory entry \".\"",
+            "lists:member(\".\", code:get_path())",
+            "ok true",
+        ),
+        eval(
+            "boot/code_path_last_entry_is_the_current_directory",
+            "the current-directory entry is the code path's appended last entry",
+            "lists:last(code:get_path()) =:= \".\"",
+            "ok true",
+        ),
+        eval(
+            "boot/code_path_head_entry_is_absolute",
+            "the code path's first entry is an absolute directory (never asserted by value)",
+            "filename:pathtype(hd(code:get_path())) =:= absolute",
+            "ok true",
+        ),
         eval(
             "boot/code_ensure_loaded_stdlib_floor",
             "the code path resolves every module of the booted stdlib floor to {module,Module}",
@@ -1130,6 +1175,12 @@ mod tests {
         "boot/code_lib_dir_2_ebin_is_a_string",
         "boot/code_lib_dir_2_is_under_the_application_dir",
         "boot/code_lib_dir_2_differs_from_the_application_dir",
+        "boot/code_lib_dir_2_priv_extends_the_application_dir",
+        "boot/code_priv_dir_kernel_is_a_string",
+        "boot/code_priv_dir_missing_app_is_bad_name",
+        "boot/code_path_contains_the_current_directory_entry",
+        "boot/code_path_last_entry_is_the_current_directory",
+        "boot/code_path_head_entry_is_absolute",
         "boot/code_ensure_loaded_stdlib_floor",
         "boot/ensure_loaded_preloaded_module_is_module",
         "boot/ensure_loaded_preloaded_zlib_is_module",
@@ -1202,6 +1253,7 @@ mod tests {
         "ok error",
         "ok {module,erlang}",
         "ok {module,zlib}",
+        "ok {error,bad_name}",
         "exception error badarg",
     ];
 

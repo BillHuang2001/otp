@@ -6,9 +6,9 @@ oracle that the expanded corpus found. None is a capability gap the runtime sign
 one hard failure. Each is therefore **deliberately not pinned** as a corpus case; the owning
 crate below must close the gap, after which a case can be added to the corpus.
 
-(The honest capability gaps — the runtime *does* signal them via its documented
-`beam_rt: unsupported: …` / exit-3 convention — are recorded in the allowlist table above,
-not here.)
+(The honest capability gaps a *case* pins — the runtime signals them via its documented
+`beam_rt: unsupported: …` / exit-3 convention — are recorded in the allowlist table above. A few
+exit-3 gaps that no case pins are noted below alongside the divergences, for completeness.)
 ## A.3 — NIF C ABI (owner: `beam_abi` / `beam_rt` NifHost)
 - `enif_make_unique_integer` values differ by design (crate counters vs emulator state);
   only the property shapes (`positive` / `monotonic` / default negative) are pinned.
@@ -67,6 +67,21 @@ not here.)
 - `driver_dl_open` + `driver_dl_close` round trip is an **oracle-side hazard** — the system `erl`
   core-dumps on the close (the refusal half is pinned by the `driver_abi` selector 49), so the round
   trip is deliberately not pinned (a harness artifact, never a runtime difference).
+- `erts_ioq_pushqv`'s stale `b_start` on the installed oracle (OTP 29.1.1 / erts-17.1) — also an
+  **oracle-side hazard**, not a runtime difference. A `binv[0] == NULL` "create a binary from the
+  iovec" vector pushed with `driver_pushqv` onto a **fresh** queue makes the installed oracle write
+  `q->v_head->iov_base` *before* decrementing `q->v_head`
+  (`erts/emulator/beam/erl_io_queue.c:317`), so the head insert leaves `q->b_head` one entry below
+  `q->b_start`; at port close `erts_ioq_clear` frees that stale interior pointer and the VM dies of
+  SIGSEGV *after* producing the correct observable (measured ≈1 run in 10; backtrace
+  `erts_alcu_free_thr_pref ← erts_ioq_clear ← terminate_port`). Upstream OTP 30 fixed it (commit
+  `f4c2a134bc`, "erts: Fix erts_ioq_pushqv overwrite" — decrement `v_head` first, then allocate into
+  the decremented slot), which is the form this repo's reference C already carries. The corpus case
+  `driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail` therefore presents its vector
+  **binary-backed** (`driver_alloc_binary` + `binv[0] = bin`, the shape `driver_pushq_bin` builds for
+  itself, `io.c:6874-6890`), which exercises the same skip walk and head insert without reaching the
+  defect. A 20-rep sweep of every pinned selector of `driver_extra` and `driver_abi` (3 320 direct
+  oracle VMs) plus 5× every `driver/*` and `driver_c/*` case found no other oracle crash or hang.
 - (`erl_drv_binary_to_term` is **not** a symbol in `erts/emulator/beam/erl_driver.h` nor in the Rust
   exports, and `driver_async_cancel` does not exist anywhere in OTP — neither can be a corpus case.)
 - The `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` / `driver_send_term`
@@ -143,8 +158,14 @@ not here.)
 ## A.7 — program result / CLI (owner: `beam_rt` / `beam_engine`, `beam_bifs`)
 - A bare (unqualified) name in the `-eval` path resolves differently: `phash2(T)` is `error:undef`
   under the oracle's `-eval` (a local call) but `ok …` under the rust runtime (it resolves the
-  `erlang:phash2/1` BIF). The `erlang:phash2/1`-qualified shapes agree and are pinned in
-  `phash.rs`. Owner: `beam_rt` (`-eval` evaluator).
+  `erlang:phash2/1` BIF); `make_tuple(1,2)` behaves the same way. The `erlang:phash2/1`-qualified
+  shapes agree and are pinned in `phash.rs`. Owner: `beam_rt` (`-eval` evaluator).
+- `erlang:list_to_existing_atom("hello")` raises `error:badarg` in the oracle (the atom does not
+  exist yet) but returns `ok hello` in the rust runtime, whose route creates the atom instead of
+  refusing. Owner: `beam_bifs` (`list_to_existing_atom/1`).
+- A **quoted atom as a call argument** — `seq_trace:set_token('receive', true)` — is not parseable
+  by the rust `-eval` evaluator (`… unexpected Punct(",")`, exit 3) where the oracle evaluates it
+  (`ok false`). Owner: `beam_rt` (`-eval` evaluator).
 
 ## A.9 — preloaded / boot (owner: `beam_rt`, `beam_bifs`)
 - `application:get_all_key/1` / `application:get_key(App, env)`'s **`env` member** differs: the
@@ -163,12 +184,17 @@ not here.)
   Owner: `beam_rt`.
 - `erlang:module_info(exports)` → oracle the export table, rust `undef`
   (`lists:module_info(exports)` works but with a different entry order).
-- `whereis(code_server|erl_prim_loader|kernel_sup)` → oracle a pid, rust `undefined`.
-- Further surfaces found while probing: `code:get_path/0` (differing path lists — and every entry
-  is absolute in the rust path list (`filename:absname(S) =:= S` holds for all of them) but not in
-  the oracle's),
-  `init:script_id/0` (rust `beam_rt: unsupported: init:script_id/0 (no boot script has been
-  loaded)`, exit 3; the oracle `{"Erlang/OTP","29"}`),
+- `whereis(erl_prim_loader)` → oracle a pid, rust `undefined`. The other kernel names
+  (`code_server`, `kernel_sup`, `application_controller`, `logger`, `user`, `standard_error`) ARE
+  live registered pids in both and are pinned (`boot_extra/whereis_*_is_registered`).
+- Further surfaces found while probing: `code:get_path/0` (differing path lists and **ordering** —
+  `hd(code:get_path())` is the kernel `ebin` in the oracle and the stdlib `ebin` in the rust
+  runtime, and every rust entry is absolute (`filename:absname(S) =:= S` holds for all) while the
+  oracle's are not),
+  `init:script_id/0` (a **release-tag** difference like `otp_release`: both answer
+  `{"Erlang/OTP", <release>}`, the oracle `"29"` and the rust runtime `"30"`; the self-consistency
+  invariant `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` AGREES and is
+  pinned by `boot_extra/init_script_id_names_the_running_otp_release`),
   `erl_prim_loader:get_path/0` (`badarg` vs `{ok,Paths}` — the oracle's `erl_prim_loader` is a
   test-only module with no `get_path/0`, while the runtime serves it),
   `erlang:system_info(logical_processors)` (16 vs 14),
@@ -207,6 +233,31 @@ not here.)
 - The preloaded ∩ registered intersection
   (`[M || M <- erlang:pre_loaded(), lists:member(M, registered())]`) differs — the rust runtime
   registers far fewer names.
+
+## A.8 — introspection (owner: `beam_rt` / `beam_bifs`)
+- `erlang:process_info(self(), registered_name)` answers the bare empty list `[]` in the oracle for
+  an unregistered process where the rust runtime answers `{registered_name,init}` (its `-eval` root
+  process is registered as `init`). Only the **spawned**-process forms (bare `[]`,
+  `{trap_exit,false}`, `links` length 0) are pinned. Owner: `beam_rt`.
+- `erlang:process_info(P, Item)` for a **spawned** `P` and the position items `catchlevel`,
+  `initial_call`, `current_function` and `current_stacktrace` are answered by the oracle but raise
+  `beam_rt: unsupported: process_info: <item>` (exit 3) in the rust runtime, whose native floor
+  serves them only for `self()` — an honest capability gap, not a mismatch.
+- `erlang:system_monitor/0` (oracle `undefined`) and `erlang:system_monitor/1` (oracle
+  `error:badarg`) raise `erlang:system_monitor/N is a known BIF that is not implemented` (exit 3) in
+  the rust runtime — honest capability gaps, not mismatches.
+- `erlang:system_info(check_io)` (oracle a poll-set list) and `erlang:system_info(loaded)` (oracle
+  `true`) are exit-3 capability gaps in the rust runtime, as are `build_type` (oracle `opt`) and
+  `tolerant_timeofday` (oracle `false`).
+- `code:ensure_modules_loaded([lists, <missing>])` — the oracle answers
+  `{error,[{<missing>,nofile}]}` (exit 0). The rust runtime's `code_server` raises
+  `{case_clause,{error,enoent}}`, `kernel_sup` reaches `reached_max_restart_intensity` and dies
+  (supervisor reports on stderr), and the call then raises `error:badarg` (exit 1). A genuine
+  runtime defect (owner: `beam_rt`, the native `code:*` floor / code server), not a capability gap:
+  a case pinning it would be a `mismatch`.
+- `erlang:fun_info/1` of a **local** fun (and its `module`/`name`/`index`/`uniq`/`new_index`/
+  `new_uniq`/`pid` items) is exit-3 (`beam_rt: unsupported: bif`) — the closable gap with its recipe
+  in `CASE_DRAFTS.md` §8; the `arity`/`type`/`env` items agree.
 
 ## A.1 — terms, records, exceptions (owner: `beam_engine`, `beam_bifs` / `beam_rt`)
 - Calling a non-fun (`5(1)`) raises `{badfun,5}` in the oracle vs `badarg` in the rust runtime.
@@ -280,8 +331,13 @@ not here.)
   modules. The affected corpus cases (`bifs/module_loaded_lists_shape`,
   `boot_extra/code_is_loaded_lists_is_a_file_pair`, `boot_extra/code_is_loaded_kernel_is_file`) are
   therefore ensure-load-explicit and pin the loaded answer. Owner: `beam_rt`.
-- `erlang:trace_info/2`: the `all`/`traced` selectors differ (`badarg` vs a value list); only
-  `flags`/`tracer` agree.
+- `erlang:trace_info/2`: the `all`/`traced`/`match_spec` selectors differ (`error:badarg` in the
+  oracle vs a value in the rust runtime); only `flags`/`tracer` agree.
+- `erlang:trace(self(), true, [call, {tracer, self()}])` is `ok 1` in the oracle but `error:badarg`
+  in the rust runtime (the `{tracer, Pid}` option is not accepted). Owner: `beam_rt`
+  (`erlang:trace/3`).
+- `erlang:statistics(runtime)`'s two counters are per-VM, so their **values** differ by construction
+  (e.g. `{338,338}` vs `{491,491}`); only the 2-tuple shape is pinned, never the values.
 - `erlang:exit(self(), normal)`: the oracle ignores it (`true`), the rust runtime raises `exit:normal`.
 - `erlang:memory/0,1` is pinned **structurally** (A.8): the 9-key order/count,
   `is_integer(memory(total))`, the selection shape and the unknown-key `badarg`; the volatile byte
@@ -342,15 +398,7 @@ not here.)
 
 ## A.9 — boot/init (owner: beam_rt)
 
-- `init:script_id/0` and `erlang:system_info(otp_release)` disagree: the runtime's `init:script_id/0`
-  reports the **consumed boot script's** header (`{"Erlang/OTP","29"}` — the oracle install's script)
-  while `system_info(otp_release)` reports the runtime's **compile-time target** (`"30"`); the oracle is
-  self-consistent (both `"29"`). This is documented runtime behaviour (`../crates/beam_rt/src/boot/CONTEXT.md`,
-  "the consumed install's release" vs "the runtime's compile-time target"). The corpus case
-  `boot_extra/init_script_id_names_the_running_otp_release` pins the self-consistency invariant
-  `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` and therefore reports a
-  **mismatch** (`ok true` vs `ok false`) on a plain `-eval` run, which loads a boot script. It is
-  **pinned and failing** (the gate exits 1), and it is deliberately not in `known-gaps.txt` (a
-  `mismatch` is never allowlistable): the owning
-  crate (`beam_rt`) must either make the two values consistent, or the case must be deliberately
-  unpinned like the other ledger entries.
+- The runtime drives a real boot chain, so `init:script_id/0`, `whereis/1`, `application:*`,
+  `code:*` and the registered-name manifest are observed live rather than stubbed; the remaining
+  boot/init divergences are recorded with the other introspection entries above (A.8 / A.9
+  "preloaded / boot").

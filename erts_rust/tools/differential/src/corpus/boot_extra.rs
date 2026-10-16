@@ -99,7 +99,7 @@
 //! | `erl_prim_loader:get_path/0` | `{ok,Paths}` | raises `badarg` |
 //! | `erlang:system_info(logical_processors)` | 16 | 14 |
 //! | `erlang:system_info(heap_sizes)` | the sizing list | a list with one extra entry |
-//! | `whereis(code_server\|erl_prim_loader\|kernel_sup)` | a pid | the atom `undefined` |
+//! | `whereis(erl_prim_loader)` | a pid | the atom `undefined` |
 //! | `erlang:function_exported/3` on `kernel` / `code` | `true` | `false` |
 //! | `erlang:system_info(schedulers\|dirty_cpu_schedulers\|dirty_io_schedulers)` | the host's scheduler counts | different counts |
 //! | `persistent_term:info/0` | the live `count`/`memory` counters | zero-valued counters |
@@ -1534,6 +1534,27 @@ pub(crate) fn group() -> Vec<Case> {
             "code:root_dir() =/= code:lib_dir()",
             "ok true",
         ),
+        // The installation roots are *absolute* directories by construction — a relation that
+        // survives on any host, unlike the path values themselves. The resolved object file of a
+        // boot-loaded module must likewise live under the installation root.
+        eval(
+            "boot_extra/code_root_dir_pathtype_is_absolute",
+            "the installation root (code:root_dir/0) is an absolute path (filename:pathtype/1)",
+            "filename:pathtype(code:root_dir())",
+            "ok absolute",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_pathtype_is_absolute",
+            "the library root (code:lib_dir/0) is an absolute path (filename:pathtype/1)",
+            "filename:pathtype(code:lib_dir())",
+            "ok absolute",
+        ),
+        eval(
+            "boot_extra/code_root_dir_prefixes_a_resolved_object_file",
+            "a boot-loaded module's resolved object file lives under the installation root (code:root_dir/0)",
+            "lists:prefix(code:root_dir(), code:which(lists))",
+            "ok true",
+        ),
         // --- The application resources the boot chain reads, by value shape ----------------
         // `application:get_key/2` reads the parsed `.app` resource of a started application;
         // its string-valued members are release-varying, so only their *non-emptiness* is
@@ -1751,6 +1772,21 @@ pub(crate) fn group() -> Vec<Case> {
             "code:is_sticky(erlang)",
             "ok true",
         ),
+        // The code server's own module and OTP's `application` controller module are boot-loaded
+        // kernel modules (not preloaded), and the code server marks them sticky once the boot
+        // script has loaded them — a boot-completion observable, not a path/pid.
+        eval(
+            "boot_extra/code_is_sticky_code_is_true",
+            "the code server's own module (`code`) is sticky once the boot script has loaded it",
+            "code:is_sticky(code)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_is_sticky_application_is_true",
+            "OTP's application controller module (`application`) is sticky once the boot script has loaded it",
+            "code:is_sticky(application)",
+            "ok true",
+        ),
         eval(
             "boot_extra/pre_loaded_every_module_can_be_ensure_loaded",
             "code:ensure_loaded/1 answers {module,Module} for every member of erlang:pre_loaded/0",
@@ -1763,11 +1799,59 @@ pub(crate) fn group() -> Vec<Case> {
             "length([M || M <- erlang:pre_loaded(), code:which(M) =:= preloaded]) =:= 22",
             "ok true",
         ),
+        // The two directions of the preloaded floor's membership: every module the code server
+        // reports as `preloaded` is in `erlang:pre_loaded/0` and vice versa, and a module that is
+        // merely on the code path (`lists`) is not preloaded.
+        eval(
+            "boot_extra/pre_loaded_is_exactly_the_preloaded_object_paths",
+            "erlang:pre_loaded/0 is exactly the set of loaded modules the code server reports as `preloaded`",
+            "lists:sort(erlang:pre_loaded()) =:= lists:sort([M || {M,_} <- code:all_loaded(), code:which(M) =:= preloaded])",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_omits_lists",
+            "the code-path module `lists` is not a member of erlang:pre_loaded/0",
+            "lists:member(lists, erlang:pre_loaded())",
+            "ok false",
+        ),
         // --- The kernel processes the boot chain registered --------------------------------
+        // The boot script's `{kernelProcess, …}` directives leave these servers registered, so a
+        // booted system resolves each name to a live pid. Each case asserts only the *pid-ness*
+        // of the lookup — the pids are per-VM-start identities and are never pinned.
         eval(
             "boot_extra/whereis_file_server_2_is_registered",
             "the boot chain's file server is a live registered process (whereis(file_server_2) is a pid)",
             "is_pid(whereis(file_server_2))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/whereis_code_server_is_registered",
+            "the boot chain's code server is a live registered process (whereis(code_server) is a pid)",
+            "is_pid(whereis(code_server))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/whereis_kernel_sup_is_registered",
+            "the boot chain's kernel supervisor is a live registered process (whereis(kernel_sup) is a pid)",
+            "is_pid(whereis(kernel_sup))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/whereis_application_controller_is_registered",
+            "the boot chain's application controller is a live registered process (whereis(application_controller) is a pid)",
+            "is_pid(whereis(application_controller))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/whereis_logger_is_registered",
+            "the boot chain's logger server is a live registered process (whereis(logger) is a pid)",
+            "is_pid(whereis(logger))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/whereis_standard_error_is_registered",
+            "the boot chain's standard-error I/O server is a live registered process (whereis(standard_error) is a pid)",
+            "is_pid(whereis(standard_error))",
             "ok true",
         ),
         // --- The booted system's builtin/export floor --------------------------------------
@@ -1864,6 +1948,14 @@ pub(crate) fn group() -> Vec<Case> {
             "boot_extra/system_info_endian_is_little_or_big",
             "erlang:system_info(endian) is one of the two frozen byte orders",
             "lists:member(erlang:system_info(endian), [little, big])",
+            "ok true",
+        ),
+        // The emulator's own start timestamp is the booted system's own boot-time observable; its
+        // *value* varies per VM start, so only its integer shape is pinned.
+        eval(
+            "boot_extra/system_info_start_time_is_integer",
+            "erlang:system_info(start_time) is the emulator's boot timestamp (an integer, value never pinned)",
+            "is_integer(erlang:system_info(start_time))",
             "ok true",
         ),
     ]
@@ -2011,6 +2103,7 @@ mod tests {
         "ok {error,nofile}",
         "ok {starting,started}",
         "ok {a,b}",
+        "ok absolute",
         "ok 17",
     ];
 
