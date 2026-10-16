@@ -101,16 +101,26 @@ observable traces. End-to-end `ordered_set` behaviour is oracle-differential-tes
 `../tests/ets_ordered_oracle.rs` is the **randomised** differential trace against the live oracle —
 the one `#[ignore]`d test here (it needs the system Erlang and a few seconds of wall clock; run it
 with `--ignored --nocapture`, and it **skips loudly** rather than passing vacuously when no oracle is
-found). A 73-term mixed-type key pool is driven by a SplitMix64-finalised LCG through a **55-slot** op
-space: 34 `insert` slots plus one slot each for `insert_new`, `delete`, `delete_object`, `take`,
+found). A 73-term mixed-type key pool is driven by a SplitMix64-finalised LCG through a **60-slot** op
+space: 34 `insert` slots, one slot each for `insert_new`, `delete`, `delete_object`, `take`,
 `delete_all_objects`, `lookup`, `member`, `first`, `last`, `next`, `prev`, `select`, `select_count`,
 `match_object`, `select_reverse`, `foldl`, `update_counter`, `update_element`, `foldr`,
-`lookup_element/3` and `lookup_element/4`. Every key the table yields renders as its pool index, and
-`{size, in-order tab2list, op result}` is asserted against the oracle after **every** step; the
-counter/element ops target element position 2 (an object is `{K, V}`), the slot both sides agree on.
-3 seeds × 600 steps = **1800 compared steps**, zero divergence, peak **49–63** live keys — the trace
-is required to cross `ORDER = 32` (the test asserts its own peak) so a future op-mix change cannot
-silently stop exercising node splits and the merge-on-delete churn below the split threshold.
+`lookup_element/3` and `lookup_element/4`, plus a **`next`/`prev` walk** dimension (a full `first`+`next`
+/ `last`+`prev` chain, and a chain starting from the `aux` pool key — usually an absent key, i.e. a
+range bound) and a **key-boundary** slot `insert_block` (a fresh ascending contiguous integer block
+longer than `ORDER = 32`, forcing a split every time it fires). Every key the table yields renders as
+its pool index, and `{size, in-order tab2list, op result}` is asserted against the oracle after
+**every** step; the counter/element ops target element position 2 (an object is `{K, V}`), the slot both
+sides agree on. 3 seeds × 600 steps = **1800 compared steps**, zero divergence, peak **68** live keys,
+longest single walk **67** keys — the trace is required to cross `ORDER = 32` and to record a walk
+longer than `ORDER` (the test asserts its own peak and that every new slot fired) so a future op-mix
+change cannot silently stop exercising node splits, the merge-on-delete churn, or a `next`/`prev` walk
+across a split boundary.
+
+A deterministic, always-on counterpart lives in `../tests/ets_fixtable.rs`: a `first`+`next` /
+`last`+`prev` chain over 100 keys (strictly > 2 × `ORDER`) interleaved with inserts/deletes — including
+each visited anchor's own deletion under fixation — asserting every key is visited exactly once in
+order, plus an absent-key anchor walked across the split boundary in both directions. No `#[ignore]`.
 
 `../interior_bench.rs::ordered_interior_microbenchmark` is the reproducible B+-tree-vs-sorted-`Vec`
 comparison (it asserts every measurement, so a wrong-but-fast index fails the run):
