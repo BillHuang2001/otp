@@ -877,8 +877,9 @@ call in the scheduler shape (path B): a **failed** copier preflight walk, then
 one. `copy_struct`'s refusal is a preflight: it refuses **before** writing any destination word, so the
 first attempt is an entire wasted walk. The new body sources the growth hint from the refusal the
 copier itself already produced (`AllocFailure::requested / size_of::<Eterm>()`, the `beam_message::error`
-contract's exact flat word count — no second traversal), shares **one** `OffHeapTable`/`CopyContext`
-across both attempts, and gates the retry on `beam_message::is_message_heap_exhaustion` so a refusal
+contract's exact flat word count — no second traversal), gives each attempt its own **fresh**
+`OffHeapTable` destination (which is what keeps the copier's fast path eligible), and gates the retry on
+`beam_message::is_message_heap_exhaustion` so a refusal
 growing the destination cannot fix (above all the malformed-graph `badarg`) no longer grows a whole
 space and fails identically. Nothing in the frozen precondition set was weakened: the rewind still
 requires an empty source `OffHeapTable`, `!reentrant`, an `Ok` result, a scheduled process
