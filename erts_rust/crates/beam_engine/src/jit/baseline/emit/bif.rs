@@ -407,7 +407,7 @@ fn try_inline_bif_value(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)?;
     Ok(true)
 }

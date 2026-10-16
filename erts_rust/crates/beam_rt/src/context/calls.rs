@@ -63,7 +63,7 @@ use std::rc::Rc;
 
 use beam_abi::nif::loader::NifCallError;
 use beam_alloc::Heap;
-use beam_bifs::{BifContext, BifFn};
+use beam_bifs::{BifContext, BifFn, TableRegistry};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessTable;
 use beam_term::Eterm;
@@ -183,11 +183,12 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A **nested** call (inside a fun a BIF applied) re-enters here through the bridge:
     /// it takes its own heap, shares the atom table through another `Rc` handle and shares
-    /// the caller's sink through a [`SharedSink`] clone, and — because the outer call left
-    /// the ETS cell free (it installed no tables; see `install_tables` and
-    /// [`Self::tables_capable`]) — borrows the shared tables and reaches the outer tables'
-    /// `ets:*` operations. (An outer call that *does* read the seam, such as `ets:foldl/3`,
-    /// holds the cell, so a nested `ets:*` from its own fun is the documented residual.)
+    /// the caller's sink through a [`SharedSink`] clone. A nested call made by a BIF that
+    /// installed **no** tables itself (`lists:map/2`) borrows the free ETS cell and reaches
+    /// the shared `ets:*` operations. A nested call made by one that **did** hold the cell
+    /// (`ets:foldl/3`/`ets:foldr/3`) receives the outer call's registry **lent** through the
+    /// fun-caller bridge ([`RuntimeContext::lent_tables`]) and installs it, so an `ets:*`
+    /// inside the fold's own fun resolves exactly as at the top level.
     ///
     /// # The process-dictionary seam
     ///
@@ -397,28 +398,37 @@ impl<'a> RuntimeContext<'a> {
                 engines,
                 gc_armed: _,
                 dispatch_memo: _,
+                lent_tables,
             } = self;
-            // The ETS cell is held exactly when this call needs it (`install_tables`, computed
-            // above): a plain call, or a reentrant call that itself reads the `TableRegistry`
-            // seam — the two `ets` fun-folds. A reentrant call that does **not** read the seam
-            // leaves the cell free, so the fun it applies can re-enter the runtime and reach
-            // `ets:*` itself (that is why `lists:map(fun(X) -> ets:lookup(T, X) end, L)` keeps
-            // working: the outer `lists:map/2` installs nothing).
+            // The ETS registry this call installs. Two sources, in precedence order:
             //
-            // RESIDUAL: holding the cell across an `ets:foldl/3`/`ets:foldr/3` blocks a *nested*
-            // ETS access made by that call's own fun — the outer `RefMut` makes the nested
-            // `try_borrow_mut` fail, so such a nested `ets:*` still answers `unsupported_bif` (see
-            // [`Self::tables_capable`]). Closing it would need `BifContext::with_tables` to lend
-            // the shared cell rather than a bare `&mut TableRegistry` (`beam_bifs`), which is
-            // outside this crate's write scope. Nothing that works today is lost: with no cell the
-            // outer fold fails outright with `unsupported: bif`, so an outer fold that *does* run
-            // (with a fun that touches no ETS) is a strict gain.
-            let mut tables = if install_tables {
-                // `try_borrow_mut` (never `borrow_mut`): an unexpected outer borrow must
-                // degrade to "no ETS", never panic.
+            // * a **lent** registry (`lent_tables`) — the one live `&mut TableRegistry` an outer
+            //   `BifContext::call_fun` handed the fun-caller bridge for the duration of a nested
+            //   call (`ets:foldl/3`/`ets:foldr/3`). The outer fold holds the shared `RefCell`
+            //   for its whole duration, so the cell **must not be consulted at all** on this
+            //   path; the lent `&mut` is exclusive by construction, so installing it cannot
+            //   alias. It is installed for **every** nested call, not only a reentrant one, so it
+            //   propagates through an intermediate that installs no cell of its own
+            //   (`ets:foldl` fun → `lists:map` fun → `ets:lookup`).
+            // * otherwise the shared cell, held exactly when this call needs it
+            //   (`install_tables`, computed above): a plain call, or a reentrant call that itself
+            //   reads the `TableRegistry` seam — the two `ets` fun-folds. A reentrant call that
+            //   does **not** read the seam leaves the cell free, so the fun it applies can
+            //   re-enter the runtime and reach `ets:*` itself (that is why
+            //   `lists:map(fun(X) -> ets:lookup(T, X) end, L)` keeps working: the outer
+            //   `lists:map/2` installs nothing).
+            //
+            // `try_borrow_mut` (never `borrow_mut`): an unexpected outer borrow must degrade to
+            // "no ETS", never panic.
+            let mut held_tables = if lent_tables.is_none() && install_tables {
                 tables_handle.try_borrow_mut().ok()
             } else {
                 None
+            };
+            // `held_tables` must outlive `tables` (it owns the cell borrow the latter reborrows).
+            let mut tables: Option<&mut TableRegistry> = match lent_tables.as_deref_mut() {
+                Some(lent) => Some(lent),
+                None => held_tables.as_deref_mut(),
             };
             // The port provider is a cheap handle shared by both branches: it holds the
             // shared `Rc` port registry and a clone of the shared atom-table handle, so

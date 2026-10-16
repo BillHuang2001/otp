@@ -346,6 +346,72 @@ fn tables_capable_names_exactly_the_table_registry_seam_consumers() {
     assert!(!RuntimeContext::tables_capable("erts_internal", "ets_raw_next", 1));
 }
 
+/// **The nested-`ets:*`-inside-a-fold residual is closed**: the fold holds the shared
+/// `TableRegistry` cell for its whole duration, so it **lends** the one live `&mut` through
+/// `BifContext::call_fun_with_tables` and the nested `ets:lookup/2` resolves.
+///
+/// Oracle (`erl -noshell -eval '…' -s init stop`): the same expression prints `10`, exit 0.
+/// Before the lend, the nested lookup failed its `try_borrow_mut` and raised
+/// `unsupported: bif` (exit 3) — a typed capability gap, never a wrong result.
+#[test]
+fn ets_lookup_inside_an_ets_foldl_fun_reaches_the_folded_table() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X}) || X <- [1,2,3,4]], \
+             ets:foldl(fun(X, A) -> \
+                 A + element(2, hd(ets:lookup(T, element(1, X)))) end, 0, T) end",
+        )
+        .expect("an ets:lookup/2 inside the fun ets:foldl/3 applies");
+    assert_eq!(signed_value(term), 10, "1+2+3+4, each read back from T");
+}
+
+#[test]
+fn ets_lookup_inside_an_ets_foldr_fun_reaches_the_folded_table() {
+    let mut rt = runtime();
+    // The right-to-left twin: the accumulated list is built from the nested lookups.
+    // Oracle (`erl -noshell -eval '…' -s init stop`, the identical expression): prints
+    // `[1,2,3,4]`, exit 0.
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X}) || X <- [1,2,3,4]], \
+             ets:foldr(fun(X, A) -> \
+                 [element(2, hd(ets:lookup(T, element(1, X)))) | A] end, [], T) end",
+        )
+        .expect("an ets:lookup/2 inside the fun ets:foldr/3 applies");
+    let printed = rt.format_term(term, None).expect("~p renders the folded list");
+    assert_eq!(printed.trim_end(), "[1,2,3,4]");
+}
+
+/// **A lent registry is installed for *every* nested call, not only a reentrant one**, which is
+/// what carries it through an intermediate that installs no cell of its own: the `lists:map/2`
+/// inside a fold's fun (deliberately *not* on [`RuntimeContext::tables_capable`]) applies a
+/// second fun whose `ets:lookup/2` must still resolve.
+///
+/// The innermost lookup is keyed on `element(1, X)`: `ets:foldl/3` hands its fun the stored
+/// **object** (the whole tuple), and looking a tuple up as a key finds nothing, so `hd([])`
+/// would raise `badarg` on **this** runtime and on the oracle alike.
+///
+/// Oracle (`erl -noshell -eval '…' -s init stop`, the identical expression): prints `100`,
+/// exit 0 — so the shape crosses the `-eval` evaluator's fun-inside-a-fun boundary on both
+/// runtimes and the assertion below is a real oracle cross-check.
+#[test]
+fn ets_lookup_survives_a_fold_fun_through_a_lists_map_fun() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X * 10}) || X <- [1,2,3,4]], \
+             ets:foldl(fun(X, A) -> \
+                 A + lists:sum(lists:map(fun(Y) -> \
+                     element(2, hd(ets:lookup(T, Y))) end, [element(1, X)])) end, 0, T) end",
+        )
+        .expect("ets:lookup through a fold fun and a lists:map fun");
+    assert_eq!(signed_value(term), 100, "(1+2+3+4)*10");
+}
+
 #[test]
 fn the_arena_is_unbounded_in_milestone_one() {
     let mut rt = runtime();
@@ -2014,6 +2080,89 @@ fn term_to_binary_of_an_internal_pid_is_a_new_pid_ext() {
     assert_eq!(signed_value(tag), 88);
 }
 
+/// The `LOCAL_EXT` (`121`) image: `term_to_binary(Term, [local])` is live on every arm, because
+/// [`NodeIdentity`] now answers [`LocalNode::local_node_hash`].
+///
+/// Oracle (`erl -noshell -eval 'B = term_to_binary({ok,17},[local]),
+/// io:format("~p~n",[{binary:at(B,0),binary:at(B,1),binary_to_term(B)}])' -s init stop`):
+/// prints `{131,121,{ok,17}}`, exit 0; a second call of the same expression is `=:=` the first.
+/// Before the change `binary:at(B, 1)` raised the typed `unsupported_bif` gap (exit 3),
+/// because the seam's default `local_node_hash` was `None`.
+#[test]
+fn term_to_binary_local_is_a_real_image_end_to_end() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin B = term_to_binary({ok, 17}, [local]), \
+             {binary:at(B, 0), binary:at(B, 1), binary_to_term(B), \
+              B =:= term_to_binary({ok, 17}, [local])} end",
+        )
+        .expect("term_to_binary({ok,17},[local])");
+    let printed = rt.format_term(term, None).expect("~p renders the probe tuple");
+    assert_eq!(printed.trim_end(), "{131,121,{ok,17},true}");
+}
+
+/// The hash is stable for the whole OS process, so two **separate** `rt.eval` calls render the
+/// same `~p` string (the [`super::node_hash::node_hash`] `OnceLock` pin).
+#[test]
+fn a_local_image_is_stable_across_two_evaluations() {
+    let mut rt = runtime();
+    let first = rt
+        .eval("term_to_binary({ok, 17}, [local])")
+        .expect("the first [local] image");
+    let second = rt
+        .eval("term_to_binary({ok, 17}, [local])")
+        .expect("the second [local] image");
+    assert_eq!(
+        rt.format_term(first, None).expect("~p renders the first image"),
+        rt.format_term(second, None).expect("~p renders the second image"),
+        "the per-OS-process hash must not drift between calls"
+    );
+}
+
+/// `LOCAL_EXT` replaces the internal node atom with `NIL_EXT`, and the decoder demotes it back to
+/// the internal id — so an internal pid survives the local round trip.
+///
+/// Oracle: `binary_to_term(term_to_binary(self(),[local])) =:= self()` prints `true`.
+#[test]
+fn a_local_image_round_trips_an_internal_pid() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin P = term_to_binary(self(), [local]), \
+             {binary:at(P, 0), binary:at(P, 1), binary_to_term(P) =:= self()} end",
+        )
+        .expect("term_to_binary(self(),[local])");
+    let printed = rt.format_term(term, None).expect("~p renders the probe tuple");
+    assert_eq!(printed.trim_end(), "{131,121,true}");
+}
+
+/// [`super::node_hash::block_hash`] is a real mixing function: deterministic for the same
+/// `(bytes, seed)` and different for a different input or a different seed.
+#[test]
+fn block_hash_is_deterministic_and_genuinely_mixing() {
+    let seed = 0x1234_5678;
+    assert_eq!(node_hash::block_hash(b"hostname42", seed), node_hash::block_hash(b"hostname42", seed));
+    assert_ne!(node_hash::block_hash(b"hostname42", seed), node_hash::block_hash(b"hostname43", seed));
+    assert_ne!(node_hash::block_hash(b"hostname42", seed), node_hash::block_hash(b"hostname42", seed ^ 1));
+    assert_ne!(node_hash::block_hash(b"", 7), node_hash::block_hash(b"", 8));
+}
+
+/// [`super::node_hash::node_hash`] answers the SAME value on repeated calls and across two
+/// independent runtimes in one OS process — the per-process `OnceLock`.
+#[test]
+fn node_hash_is_stable_within_an_os_process() {
+    let first = node_hash::node_hash();
+    assert_eq!(first, node_hash::node_hash(), "the same value on a repeat call");
+    let rt = runtime();
+    assert_eq!(node_hash::node_hash(), first, "a second runtime reports the same hash");
+    assert_eq!(
+        NodeIdentity { node: rt.atoms().lookup("nonode@nohost") }
+            .local_node_hash(),
+        Some(first),
+        "the LocalNode seam answers the same per-process hash"
+    );
+}
 #[test]
 fn the_local_fun_identity_hook_is_a_clean_miss_when_the_answer_is_unknown() {
     let mut rt = runtime();
@@ -2967,9 +3116,10 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
         "never enabled, so `undefined` is exact"
     );
 
-    // `garbage_collection` is the C's `{GCs, WordsReclaimed, 0}` shape, summed from this
-    // runtime's own collector counters. A fresh runtime has run no collection yet — the
-    // real-counter direction (a collection that really ran) is pinned by
+    // `garbage_collection` is the C's `{GCs, WordsReclaimed, 0}` shape, read from this
+    // runtime's own node-global GC counters. A fresh runtime has run no collection yet — the
+    // real-counter direction (a collection that really ran, and the words it reclaimed) is
+    // pinned by
     // `statistics_garbage_collection_reads_the_runtimes_own_collector_counters`.
     let value = ctx
         .call_bif("erlang", "statistics", 1, &[garbage_collection])
@@ -3063,67 +3213,85 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
     // `badarg`. These two are asserted above, next to the served statistics arms.
 }
 
-/// `statistics(garbage_collection)` reads the runtime's **own real** collector counters: a
-/// process that has really collected over its own young heap is reported, and the two figures
-/// are the collector's own cumulative ones (not a placeholder).
+/// `statistics(garbage_collection)` reads the runtime's **node-global** GC counters
+/// ([`Runtime::gc_stats`]), read through the **real dispatch** (the
+/// [`RuntimeHooksBridge`](crate::context) arm) as `(GCs, WordsReclaimed, Reserved)`.
+///
+/// A fresh runtime has run no collection at all — the C's own `{0, 0, 0}` shape — and a
+/// collection that really ran through [`Runtime::serve_gc_request`] moves **both** served
+/// figures by its own outcome: the cumulative collection count and the words that collection
+/// really reclaimed. It is deliberately **not** read from the live processes' collectors (which
+/// are empty of collections precisely when the workload's collections are the interesting
+/// ones); the runtime keeps the node-global totals itself. The same contract is pinned at the
+/// runtime level by `src/runtime/gc.rs`'s
+/// `statistics_garbage_collection_reads_the_node_global_collection_counters`.
+///
+/// No oracle comparison here: the crate's test strategy forbids comparing live GC counters
+/// against the oracle, so every figure below is this runtime's own.
 #[test]
 fn statistics_garbage_collection_reads_the_runtimes_own_collector_counters() {
     let mut rt = runtime();
-    // A live process whose own collector really runs: put a scratch tuple on its young heap
-    // (unrooted, so it is garbage) and collect.
-    let pid = rt.processes.spawn_default().expect("a spawned process");
-    {
-        let process = rt.processes.get_mut(pid).expect("the process is live");
-        process
-            .heap_mut()
-            .tuple(&[make_small(1), make_small(2), make_small(3)])
-            .expect("a scratch tuple on the young heap");
-    }
-    let collection = rt
-        .processes
+    let garbage_collection = rt.intern("garbage_collection");
+
+    // The served key, through the one real dispatch, as a 3-tuple of small integers.
+    let read = |rt: &mut Runtime| -> (Eterm, Eterm, Eterm) {
+        let mut ctx = RuntimeContext::new(rt);
+        let value = ctx
+            .call_bif("erlang", "statistics", 1, &[garbage_collection])
+            .expect("statistics(garbage_collection) is a served key");
+        assert_eq!(terms::tuple_arity(value).expect("a 3-tuple"), 3);
+        (
+            terms::tuple_element(value, 0).expect("GCs"),
+            terms::tuple_element(value, 1).expect("WordsReclaimed"),
+            terms::tuple_element(value, 2).expect("the reserved third element"),
+        )
+    };
+
+    // A fresh runtime has collected nothing: all three elements are real zeros.
+    let (gcs, words, reserved) = read(&mut rt);
+    assert_eq!(gcs, make_small(0), "a fresh runtime has collected nothing");
+    assert_eq!(words, make_small(0), "and so reclaimed nothing");
+    assert_eq!(reserved, make_small(0), "the C's reserved third element");
+
+    // A real collection through the forced-GC latch: `serve_gc_request` takes a **standalone**
+    // `ProcessTable` and collects the live process's own young heap. The heap carries an
+    // unrooted (garbage) tuple, which the collection frees rather than copies.
+    let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+        &mut AtomTable::new(),
+    ));
+    let pid = table.spawn_default().expect("a process");
+    table
         .get_mut(pid)
         .expect("the process is live")
-        .collect()
-        .expect("a process-heap collection");
+        .heap_mut()
+        .tuple(&[make_small(1), make_small(2), make_small(3)])
+        .expect("a scratch tuple on the young heap");
+    rt.request_gc(pid);
     assert!(
-        collection.stats.words_reclaimed > 0,
-        "the unrooted tuple was garbage the collector reclaimed"
+        rt.serve_gc_request(&mut table, pid),
+        "the forced collection really ran"
     );
 
-    // The expected answer is exactly what the live processes' collectors say now.
-    let expected: (i64, i64) = rt
-        .processes()
-        .pids()
-        .filter_map(|live| rt.processes().get(live))
-        .fold((0, 0), |(collections, reclaimed), process| {
-            let stats = process.collector().stats();
-            (
-                collections + (stats.minor_collections + stats.major_collections) as i64,
-                reclaimed + stats.words_reclaimed as i64,
-            )
-        });
-    assert!(expected.0 > 0, "a collection really ran");
+    let stats = rt.gc_stats();
+    assert!(stats.collections >= 1, "a collection really ran: {stats:?}");
+    assert!(
+        stats.reclaimed > 0,
+        "the unrooted tuple was garbage the collector reclaimed: {stats:?}"
+    );
 
-    let garbage_collection = rt.intern("garbage_collection");
-    let mut ctx = RuntimeContext::new(&mut rt);
-    let value = ctx
-        .call_bif("erlang", "statistics", 1, &[garbage_collection])
-        .expect("statistics(garbage_collection)");
-    assert_eq!(terms::tuple_arity(value).expect("a 3-tuple"), 3);
+    // The served answer is exactly the runtime's own cumulative counters.
+    let (gcs, words, reserved) = read(&mut rt);
     assert_eq!(
-        signed_value(terms::tuple_element(value, 0).expect("GCs")),
-        expected.0,
-        "the collections the live collectors really ran"
+        signed_value(gcs),
+        i64::try_from(stats.collections).expect("a small collection count"),
+        "the runtime's own cumulative collection count"
     );
     assert_eq!(
-        signed_value(terms::tuple_element(value, 1).expect("WordsReclaimed")),
-        expected.1,
+        signed_value(words),
+        i64::try_from(stats.reclaimed).expect("a small reclaimed-word count"),
         "the words those collections really reclaimed"
     );
-    assert_eq!(
-        terms::tuple_element(value, 2).expect("the reserved third element"),
-        make_small(0)
-    );
+    assert_eq!(reserved, make_small(0), "the C's reserved third element");
 }
 
 /// The counters this runtime keeps for `erlang:statistics/1` are read from its **own real
@@ -6143,6 +6311,11 @@ fn a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected() {
             "round {round}: the forced collection must RUN — the BIF result is on the scanned \
              heap, so the unscanned-root valve has nothing to decline; {after:?}"
         );
+        assert!(
+            after.reclaimed > before.reclaimed,
+            "round {round}: the collection really reclaimed the dead list words, counted from the \
+             collection's own outcome at the door site; {after:?}"
+        );
         assert_eq!(
             after.halted, before.halted,
             "round {round}: nothing failed; {after:?}"
@@ -6434,13 +6607,15 @@ fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
 /// **Regression pin for the removed `post_slice_float_pin` plateau** — the name describes the
 /// defect this case rules out, and the assertions below now pin the fixed behaviour.
 ///
-/// The reaction used to be `Runtime::pin_process(pid)` — a **permanent** runtime-level pin — so the
-/// first slice that ended with a live FR slot made `Runtime::gc_process_enabled` answer `false` for
-/// the rest of the process's life: a float-using loop collected only inside its first slice, its
-/// nursery kept every space it ever allocated, and its `collections` **plateaued** however large the
-/// loop got. It is now a **per-slice relocation exemption** — opened at the slice's end when the FR
-/// prefix is live, cleared by the next slice entry — so the process collects again at its own
-/// heap-admission points and `Runtime::gc_stats().pinned` stays **0**.
+/// The reaction used to be a **permanent** runtime-level process pin, applied through a
+/// `Runtime::pin_process/1` entry this crate no longer has (the superseded reaction this case
+/// rules out) — so the first slice that ended with a live FR slot made
+/// `Runtime::gc_process_enabled` answer `false` for the rest of the process's life: a float-using
+/// loop collected only inside its first slice, its nursery kept every space it ever allocated, and
+/// its `collections` **plateaued** however large the loop got. The reaction is now the **per-slice
+/// relocation exemption** the runner applies (`Process::set_relocation_exempt`, opened at the
+/// slice's end when the FR prefix is live and cleared by the next slice entry) — so the process
+/// collects again at its own heap-admission points and `Runtime::gc_stats().pinned` stays **0**.
 ///
 /// This case is the **deterministic** half of the A/B experiment (no RSS involved): the same
 /// three `ets_copy` allocate-and-abandon loops, differing only in the payload's `b` value, are
@@ -6457,11 +6632,11 @@ fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
 ///   contains `fconv`/`fmul` instructions and its slices end with `fr_mark() > 0`. The float
 ///   expression is deliberately **literal-free** (`math:sqrt(float(X))`, *not* `float(X) * 3.5`):
 ///   a float **operation** writes the FR file, whereas a float **literal** is folded into the
-///   literal area and — while still live in a register at a `test_heap` call site — is an
-///   **untagged** literal-area root that trips the unscanned-root valve and declines *every*
-///   collection for an unrelated, already-escalated reason
-///   (`an_untagged_literal_root_declines_the_collection_until_the_loader_tags_literals`). That
-///   confound would mask the FR reaction this experiment is about, so the row must not carry it.
+///   literal area and never writes FR. That literal-area shape is no longer a collection confound
+///   in its own right — `beam_loader`'s literal-area decode now tags the area at load time
+///   (`beam_term::literal::tag_literal_area`), so a live literal root is a scanned literal rather
+///   than an untagged container the unscanned-root valve would decline — but keeping the row
+///   literal-free anyway leaves the experiment's variable exactly one: the FR reaction.
 ///
 /// All three rows now **scale with N and pin nothing**: `pinned` is 0 everywhere and each larger
 /// run collects strictly more than its smaller twin — the float-using row included, which is the

@@ -38,7 +38,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   primitive young-generation entry over a single from-space.
 - The shared `pub(crate)` evacuation primitives: `Target` (`Foreign`/`Live`/`Forwarded`), the `EvacDest`
   trait (`classify_boxed`/`classify_cons`/`can_reserve`/`reserve`), `forward_slot<D: EvacDest>`, `move_size`,
-  `for_each_ref` — consumed by `Copier`, `immix/`, `PromoteDest` and `live.rs`. The per-object layout is
+  `for_each_ref` — consumed by `Copier`, `immix/`, the atomic promotion and `live.rs`. The per-object layout is
   **not** this crate's (Design Decisions).
 
 ### `live.rs` — the exact-live counter
@@ -104,7 +104,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `new(capacity_words)`/`with_allocator(alloc, capacity_words)`; `base`/`contains`/`contains_term`;
     `capacity_words`/`block_count`/`line_count`/`used_lines`/`free_lines`/`used_words`/`available_words`;
     `counters() -> ImmixCounters`; `reset()`; `unsafe alloc_words(words) -> Result<*mut Eterm>` (line-aligned);
-    `cons`/`tuple`; `can_reserve(words)`.
+    `cons`/`tuple`; `can_reserve(words)`; `release_words(ptr, words)`/`release_lines(start_g, need)` — the
+    inverse of the private `claim` (clear the `allocated` bits, a block whose bitmap empties back to `Free`),
+    documented for undoing a *promotion's own* reservations only; `marked`/`kept`/cursors are left untouched.
   - `mark(roots, promoted) -> Result<()>`; `collect(&mut self, roots: &mut [Eterm], promoted: &mut [Eterm])
     -> Result<ImmixStats>` — mark, classify, release, evacuate `Partial` blocks, pin `AllMarked`, finalize;
     `impl EvacDest for ImmixSpace` (so the shared `copy.rs` protocol can evacuate *into* it).
@@ -123,9 +125,12 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `for_each_reachable_object(roots, visit)` — the mark-region sibling of `Collector`'s (same whole-heap
     walk); its only difference is the mature range, the whole `base .. base + capacity` region (with its free
     lines — over-inclusive yet harmless, as in `live_full`); `for_each_reachable_object_view` mirrors it.
-  - A fullsweep that cannot fit its promotion grows the region (`grow_major`); a `max_heap_words` cap the
-    promotion cannot fit returns the typed `heap_exhausted` **before any copy** (Known Gaps; coverage
-    `src/immix_collector/grow_tests.rs`).
+  - A fullsweep that cannot fit its promotion grows the region (`grow_major`, which also rebuilds a fresh
+    region of the **current** capacity when a ceiling forbids growing); only a `max_heap_words` cap that
+    cannot hold the live set in any layout returns the typed `heap_exhausted`, and still **before any copy**
+    (Known Gaps; coverage `src/immix_collector/grow_tests.rs`, `tests/immix_major_growth.rs`).
+  - `collect` escalates a **would-not-fit minor** to a fullsweep and `run_major` falls back to `grow_major`
+    on the same outcome — the promotion itself is atomic, so a refusal is a no-op to retry (Known Gaps).
 
 ### `any_collector.rs` — the strategy-dispatching seam
 - `pub enum AnyCollector { Copying(Collector), Immix(GenImmixCollector) }` — a **complete drop-in for the
@@ -248,10 +253,13 @@ constructors only (no new error enum).
   `tests/generational_cadence.rs`, `tests/steady_state.rs`, `tests/mature_capacity_convergence.rs`;
   `MEASURED.md`.
 - **`GenImmixCollector` = the same copying nursery + a mark-region mature space; its major reclaims the
-  mature generation *first*.** A **minor** promotes the nursery's live terms into the `ImmixSpace` through
-  the shared `copy.rs` forwarding protocol over a private `PromoteDest` (`EvacDest` classifying against the
-  nursery's `FromSet`, reserving from `ImmixSpace::alloc_words`) — the barrier-free invariant holds because
-  promotion only ever moves young objects *into* mature. A **major** is the prescribed
+  mature generation *first*.** A **minor** promotes the nursery's live terms into the `ImmixSpace` through an
+  **atomic two-phase driver** (`src/immix_collector/promote.rs`, `Result<PromoteOutcome>`): phase R reserves
+  each first-time live object (`ImmixSpace::alloc_words`), copies its words and writes the forwarding marker,
+  but rewrites **no** reference word; phase C rewrites the recorded slots and roots only once every object of
+  the traversal has been placed — the barrier-free invariant holds because promotion only ever moves young
+  objects *into* mature, and a reservation that finds no run rolls both spaces back byte-for-byte
+  (`PromoteOutcome::WouldNotFit`) instead of leaving a half-forwarded heap. A **major** is the prescribed
   `ImmixSpace::collect`-then-promote order, made sound for the young→mature edge an in-place reclaim cannot
   ignore: a read-only `scan_young` reports the promotion's exact **line** count and every nursery reference
   word pointing into mature (`(slot, term)` pairs); `ImmixSpace::collect` takes those terms as its
@@ -363,14 +371,11 @@ constructors only (no new error enum).
 - Folding the **young heap's occupancy** into the fullsweep's size request is what makes the mature
   generation reachable at the default policy — the copying default runs **147 minors : 73 fullsweeps** (young
   233 / mature **376**, total 609) instead of escalating every collection to a fullsweep.
-- GenImmix wins **copy work on long-lived data**, but every win pairs with a footprint/pause loss and an
-  outright loss on the small-heap/high-churn shape; both strategies find the **same** live set. So
-  **`MatureKind::Copying` remains the default**, and Immix is a size-/latency-tolerant option auto-selected
-  at ≥ `IMMIX_BREAK_EVEN_WORDS` (2048 = **8 whole blocks**, read once from the **construction-time**
-  `initial_mature_words` via `mature_words_of(policy)`) or by an explicit pin. The default 233-word mature
-  generation stays on the copying path, and through the runtime's own GC doors the break-even reproduces
-  (`../beam_rt/tests/gc_immix_payload.rs`, `../beam_rt/tests/gc_strategy.rs`; `BEAM_RT_GC_STRATEGY=immix` is
-  the opt-in).
+- GenImmix wins **copy work on long-lived data** but pays footprint and pause on the small-heap/high-churn
+  shape, so **`MatureKind::Copying` remains the default** and Immix is a size-/latency-tolerant option
+  auto-selected at ≥ `IMMIX_BREAK_EVEN_WORDS` (2048 = 8 whole blocks, read from the construction-time
+  `initial_mature_words`) or by an explicit pin (`BEAM_RT_GC_STRATEGY=immix`; the break-even reproduces
+  through `beam_rt`'s own GC doors in `../beam_rt/tests/gc_{immix_payload,strategy}.rs`).
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
@@ -393,7 +398,7 @@ constructors only (no new error enum).
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` live in `space`, `policy`, `mso`, `heap_info`, `config`, `selection`,
-  `any_collector`, `immix_collector` (+ `src/immix_collector/grow_tests.rs`), `immix/tests.rs` and `live`;
+  `any_collector`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`), `immix/tests.rs` and `live`;
   `live`'s module proves `live`/`live_full` equal a real collection's `words_copied`/line need, incl. the
   mature generation (a relocating major; a refc binary counted on-heap only). **`copy.rs` and `collector.rs`
   carry no in-module tests** — the copier is pinned by `tests/copy_correctness.rs`, the driver by
@@ -410,6 +415,10 @@ constructors only (no new error enum).
 - `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` + `tests/gen_immix_collector.rs`
   → geometry/allocation/mark/pin/evacuation/accounting and the hard major cases; one corpus through both
   strategies behind one structural walker; a multi-block object.
+- `tests/immix_fragmentation.rs` → the atomic promotion: a refused promotion leaves both spaces
+  byte-identical (same roots, no marker, counters unchanged, identical on retry), and the 7-line/100-word and
+  9-line fragmentation shapes now reach a bounded steady state under both strategies with the live set
+  `compare`-equal to a witness after every round (deterministic counts asserted, no timing).
 - `tests/immix_break_even.rs` → a geometry `Law` asserted at every point; the 8-block constant pinned (NOT
   one line below); pause printed only.
 - `tests/immix_selection_curve.rs` → the two-axis curve, "moved words are object-size- and
@@ -526,17 +535,16 @@ constructors only (no new error enum).
   however many cycles run (measured: 400 grow+admit cycles, occupancy-only admission → peak chain **401**
   spaces; debt claimed → peak chain **2** with **932** words retained = the largest single space installed;
   `MEASURED.md`); the cost that makes it opt-in: Handoffs.
-- **Promotion atomicity is guaranteed only on the *total* line budget.** A minor promotes only when
-  `mature.free_lines() >= needed` (the exact line count of the live nursery graph), and a major checks the
-  same after reclaiming — but line-granular allocation needs a *contiguous* run **inside one 16-line block**
-  (`ImmixSpace::find_run`/`first_hole`), while `free_lines()` counts the whole region. So a fragmented mature
-  space can fail a per-object reservation mid-promotion with the typed `heap_exhausted` even though the total
-  budget reported room. A request whose line count leaves a per-block hole (e.g. 7 lines in a 16-line block:
-  two objects fill 14 of 16 lines) reaches this on an ordinary workload, not only a pathological one —
-  measured on the mark-region strategy at a 2048-word region after 43 promote/reclaim rounds (`MEASURED.md`);
-  it reproduces with an occupancy-only admission signal (chain length 1 throughout), so it is independent of
-  the retention path. A caller-visible symptom is a promotion that fails while `mature_available_words()`
-  looks sufficient.
+- **A refused promotion is ATOMIC; `collect` recovers, `collect_minor` does not.** Line-granular allocation
+  needs a *contiguous* run inside one 16-line block (`find_run`/`first_hole`), so a fragmented region can
+  refuse an object although region-wide `free_lines()` reports room; the promotion driver
+  (`src/immix_collector/promote.rs`) then rolls BOTH spaces back byte-for-byte (each source restored from its
+  own copy, each reservation un-claimed via `ImmixSpace::release_words`) and reports `PromoteOutcome::
+  WouldNotFit` — no marker, no rewritten root, no counter advanced. `collect` escalates that to a fullsweep
+  and `grow_major` rebuilds a fresh region (fragmentation-free by monotone packing), even at the *current*
+  capacity when a ceiling forbids growing; only a ceiling that cannot hold the live set in ANY layout reports
+  the typed heap exhaustion, and still before any word is copied. `collect_minor`'s own public contract
+  reports the typed error rather than escalating — escalation is `collect`'s job.
 - **The C `high_water` single-block layout, per-object tenuring (`GEN_GCS`/`MAX_GEN_GCS`) and the
   `F_NEED_FULLSWEEP` flag protocol** — replaced by the simpler two-space young/mature scheme above.
 - **Dirty-scheduler escape for long collections** (`ERTS_POTENTIALLY_LONG_GC_HSIZE`).
@@ -637,12 +645,13 @@ constructors only (no new error enum).
 - `src/config.rs` → `GcConfig`, `MatureKind`, `MatureSelection`, `mature()`/`mature_choice()`, `growable`
 - `src/selection.rs` → the automatic rule: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`,
   `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice`
-- `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, `ImmixStats`/
-  `ImmixCounters`
+- `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, the `release_*`
+  rollback primitives, `ImmixStats`/`ImmixCounters`
 - `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
-- `src/immix_collector.rs` → `GenImmixCollector`: `PromoteDest`, `promote`, `scan_young`, fullsweep sizing
-  via `live_full`, `grow_major`/`relocate_major`, `ensure_capacity`
-- `src/immix_collector/grow_tests.rs` → `GenImmixCollector`'s in-module `grow_major` fallback tests
+- `src/immix_collector.rs` → `GenImmixCollector`: `scan_young`, fullsweep sizing via `live_full`,
+  `grow_major`/`relocate_major`, `ensure_capacity`, the collect/collect_minor/collect_major driver
+- `src/immix_collector/promote.rs` → the ATOMIC two-phase promotion driver (`promote`, `PromoteOutcome`)
+- `src/immix_collector/{tests,grow_tests}.rs` → `GenImmixCollector`'s in-module promotion + `grow_major` tests
 - `src/any_collector.rs` → `AnyCollector`: the `Copying`/`Immix` dispatch over one API — the drop-in for the
   concrete `Collector` incl. the mature geometry accessors
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`, `from_spawn_opts`/

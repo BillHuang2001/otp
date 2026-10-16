@@ -201,6 +201,7 @@ fn help_is_usable_on_every_subcommand_and_exits_0() {
         vec!["run", "--help"],
         vec!["compare", "--help"],
         vec!["suite", "--help"],
+        vec!["merge", "--help"],
         vec!["list", "--help"],
     ] {
         let invocation = invoke(&args, &[]);
@@ -225,6 +226,7 @@ fn usage_errors_exit_2() {
         (vec!["frobnicate"], "unknown subcommand"),
         (vec!["run"], "'run' requires a <case-id>"),
         (vec!["run", "no/such-case"], "unknown case id"),
+        (vec!["merge"], "'merge' requires a --from <dir>"),
         (vec!["suite", "--nope"], "unknown option"),
         (vec!["list", "--out"], "requires a directory argument"),
     ] {
@@ -1004,6 +1006,214 @@ fn an_allowlist_without_strict_is_a_usage_error() {
         "{}",
         invocation.describe()
     );
+}
+
+/// `run --out-file <path>` writes a single-case report to **exactly** that path, and
+/// `merge --from <dir>` folds a directory of such reports back into one suite-shaped report
+/// and regenerates the same `GAPS.md` the (slow) serial `suite --gaps` sweep would have
+/// written — the cheap regeneration route.
+#[cfg(unix)]
+#[test]
+fn merge_folds_run_out_file_reports_into_a_generated_gaps_document() {
+    if !oracle_available() {
+        eprintln!("SKIP: oracle erl not available");
+        return;
+    }
+    if !rust_runtime_available() {
+        eprintln!("SKIP: no fresh Rust runtime (target/debug/beam_rt) — nothing to compare");
+        return;
+    }
+    let scratch = Scratch::new("merge");
+    let reports = scratch.0.join("reports");
+    std::fs::create_dir_all(&reports).expect("create the reports dir");
+
+    // (1) an AGREEING case under the real (fresh) runtime.
+    let fresh = common::fresh_rust_runtime();
+    let env = fresh_beam_rt_env(&fresh);
+    let agree_path = reports.join("agree.json");
+    let agree = invoke(
+        &[
+            "run",
+            "etf/term_to_binary_tuple",
+            "--out-file",
+            &agree_path.display().to_string(),
+        ],
+        &env,
+    );
+    assert_eq!(agree.code, Some(0), "{}", agree.describe());
+    let agree_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&agree_path).expect("read the agree report"))
+            .expect("the --out-file report parses");
+    assert_eq!(
+        agree_json["cases"][0]["verdict"], "agree",
+        "{}",
+        agree.describe()
+    );
+    assert!(
+        !reports.join("report.json").exists(),
+        "--out-file must not also write <dir>/report.json"
+    );
+
+    // (2) a CAPABILITY GAP: a fake exit-3 runtime signals `unsupported` honestly.
+    let fake = fake_runtime(
+        &scratch,
+        "beam_rt-fake",
+        "echo 'beam_rt: unsupported: fixture' 1>&2\nexit 3",
+    );
+    let fake = fake.to_str().expect("utf-8 path");
+    let gap_path = reports.join("gap.json");
+    let gap = invoke(
+        &[
+            "run",
+            "etf/term_to_binary_atom",
+            "--out-file",
+            &gap_path.display().to_string(),
+        ],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(
+        gap.code,
+        Some(0),
+        "a lone unsupported case is not fatal: {}",
+        gap.describe()
+    );
+    let gap_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&gap_path).expect("read the gap report"))
+            .expect("the gap report parses");
+    assert_eq!(
+        gap_json["cases"][0]["verdict"], "unsupported",
+        "{}",
+        gap.describe()
+    );
+
+    // Fold the two reports: the allowlist records the one gap, so the ratchet is clean
+    // (exit 0). A bogus `$BEAM_DIST_PROBE` proves `merge` never resolves/spawns the helper.
+    let list = scratch.0.join("known-gaps.txt");
+    write_allowlist(&list, &["etf/term_to_binary_atom"]);
+    let gaps_path = scratch.0.join("GAPS.md");
+    let merged_path = scratch.0.join("merged.json");
+    let mut merge_env = env.clone();
+    merge_env.push(("BEAM_DIST_PROBE", "/nonexistent/dist_probe"));
+    let merged = invoke(
+        &[
+            "merge",
+            "--from",
+            &reports.display().to_string(),
+            "--allowlist",
+            &list.display().to_string(),
+            "--gaps",
+            &gaps_path.display().to_string(),
+            "--json",
+            "--out-file",
+            &merged_path.display().to_string(),
+        ],
+        &merge_env,
+    );
+    assert_eq!(merged.code, Some(0), "{}", merged.describe());
+
+    let json: serde_json::Value =
+        serde_json::from_str(&merged.stdout).expect("the merged report parses");
+    assert_eq!(json["mode"], "merge");
+    assert_eq!(json["schema"], "differential/1");
+    assert_eq!(json["summary"]["total"], 2);
+    assert_eq!(json["summary"]["agree"], 1);
+    assert_eq!(json["summary"]["unsupported"], 1);
+    assert_eq!(json["summary"]["mismatch"], 0);
+    assert_eq!(json["ratchet"]["allowed"], 1);
+    assert_eq!(json["ratchet"]["unauthorized"], 0);
+    assert_eq!(json["ratchet"]["stale"], 0);
+    // Cases are ordered by id, deterministic regardless of file order.
+    assert_eq!(json["cases"][0]["case_id"], "etf/term_to_binary_atom");
+    assert_eq!(json["cases"][1]["case_id"], "etf/term_to_binary_tuple");
+
+    // The merged report was written to EXACTLY the requested `--out-file` path.
+    assert!(merged_path.is_file(), "the merged report is written");
+    assert!(
+        merged.stderr.contains("merged.json"),
+        "the writer names the path: {}",
+        merged.describe()
+    );
+
+    // The generated document is the same shape `suite --gaps` writes: the run line and the
+    // gap table row, with the reason from the runtime and the owning crate from the allowlist.
+    let markdown = std::fs::read_to_string(&gaps_path).expect("the generated GAPS.md");
+    assert!(
+        markdown.contains("Run: total=2 agree=1 mismatch=0 unsupported=1 skipped=0"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains(
+            "| etf/term_to_binary_atom | unsupported | beam_bifs | allowed | beam_rt: unsupported: fixture |"
+        ),
+        "{markdown}"
+    );
+    assert!(
+        !markdown.contains("| etf/term_to_binary_tuple |"),
+        "only gaps are listed: {markdown}"
+    );
+}
+
+/// `merge` is a pure report-folding command: a missing/unknown `--from`, an empty directory
+/// and a malformed `*.json` are all loud usage errors (exit 2) that name the offender.
+#[cfg(unix)]
+#[test]
+fn merge_reports_loud_usage_errors_for_bad_input() {
+    // A missing `--from` names the requirement and shows the merge help.
+    let missing_from = invoke(&["merge", "--json"], &[]);
+    assert_eq!(missing_from.code, Some(2), "{}", missing_from.describe());
+    assert!(
+        missing_from.stderr.contains("--from <dir>"),
+        "{}",
+        missing_from.describe()
+    );
+    assert!(
+        missing_from.stderr.contains("differential merge"),
+        "{}",
+        missing_from.describe()
+    );
+
+    let scratch = Scratch::new("merge-bad-from");
+    std::fs::create_dir_all(&scratch.0).expect("create scratch");
+
+    // A `--from` that is not a directory.
+    let not_a_dir = scratch.0.join("file.txt");
+    std::fs::write(&not_a_dir, "x").expect("write the file");
+    let bad_dir = invoke(&["merge", "--from", &not_a_dir.display().to_string()], &[]);
+    assert_eq!(bad_dir.code, Some(2), "{}", bad_dir.describe());
+    assert!(
+        bad_dir.stderr.contains("not a readable directory"),
+        "{}",
+        bad_dir.describe()
+    );
+
+    // An empty directory (no `*.json` reports).
+    let empty = scratch.0.join("empty");
+    std::fs::create_dir_all(&empty).expect("create the empty dir");
+    let none = invoke(&["merge", "--from", &empty.display().to_string()], &[]);
+    assert_eq!(none.code, Some(2), "{}", none.describe());
+    assert!(
+        none.stderr.contains("no *.json reports"),
+        "{}",
+        none.describe()
+    );
+
+    // A malformed `*.json` is a loud error naming the file (never silently skipped).
+    let dir = scratch.0.join("bogus");
+    std::fs::create_dir_all(&dir).expect("create the bogus dir");
+    let bogus = dir.join("bogus.json");
+    std::fs::write(&bogus, "{ not json").expect("write the bogus report");
+    let bad_json = invoke(&["merge", "--from", &dir.display().to_string()], &[]);
+    assert_eq!(bad_json.code, Some(2), "{}", bad_json.describe());
+    assert!(
+        bad_json.stderr.contains("bogus.json"),
+        "{}",
+        bad_json.describe()
+    );
+
+    // `merge --help` succeeds without touching a runtime.
+    let help = invoke(&["merge", "--help"], &[]);
+    assert_eq!(help.code, Some(0), "{}", help.describe());
+    assert!(help.stdout.contains("--from <dir>"), "{}", help.describe());
 }
 
 /// `gate.sh` resolves its allowlist from its arguments: an explicit `--allowlist <file>` is

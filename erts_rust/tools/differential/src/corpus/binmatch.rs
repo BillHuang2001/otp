@@ -34,6 +34,13 @@
 //! non-byte-aligned bitstring, an improper list, and any element that is not a byte-aligned
 //! binary (including an integer — bytes are not accepted here).
 //!
+//! Also pinned here: **bignum values in bit-string construction** (`bs_create_bin`/`bs_init`
+//! segments). An explicit-width integer segment takes the value's low `Size` bits, so a bignum
+//! is *truncated* rather than rejected (`<<(2 bsl 64):8>>` is `<<0>>`; even `<<256>>` is
+//! `<<0>>`), in the signed/unsigned and big-/little-endian forms. Derived sizing goes through
+//! `bit_size(binary:encode_unsigned(N))` (`size/1` rejects an integer), and the
+//! `binary:decode_unsigned/1,2` counterparts close the round trip.
+//!
 //! Also here: `iolist_size/1` of a size that outgrows the 60-bit small range. That branch is
 //! **not expressible through an observable program** and is deliberately not pinned — see
 //! the note below.
@@ -286,6 +293,202 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok [badarg,badarg,badarg,badarg,badarg,badarg]"),
+                exit_code: 0,
+            },
+        },
+        // --- bignum values in bit-string construction (`bs_create_bin`/`bs_init` segments) ---
+        // An integer segment of an explicit width takes the value's **low `Size` bits** — the
+        // oracle truncates rather than raising, even for a bignum far outside the segment and
+        // even for `unsigned` with a negative value (`<<256>>` is `<<0>>`). The only
+        // `badarg`s here come from an invalid *size* (negative), a non-byte-aligned
+        // `decode_unsigned/1` subject and a negative `encode_unsigned/1` value; the
+        // `binary/bignum_segment_size_badarg` case pins those. `size/1` cannot size such a
+        // segment — it rejects an integer (`size(1 bsl 100)` is `badarg`, which escapes the
+        // construction as `badarg`; see `binary/bignum_segment_sized_by_size_is_badarg`), so the
+        // derived sizing uses `bit_size(binary:encode_unsigned(N))` instead.
+        Case {
+            id: "binary/bignum_truncated_into_byte_segment",
+            description: "a bignum value truncates to the low 8 bits of an 8-bit segment (2 bsl 64 lands as 0)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin <<X:8>> = <<(2 bsl 64):8>>, X end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 0"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_truncated_into_word_segment",
+            description: "a bignum value truncates to the low 32 bits of a 32-bit segment (5 bsl 100 lands as 0)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin <<X:32>> = <<(5 bsl 100):32>>, X end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 0"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_little_endian_truncation",
+            description: "a bignum in a 16-bit little-endian segment keeps only the low 16 bits, least-significant byte first",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "<<(256 bsl 200):16/little>>",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<0,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_little_endian_low_bits_kept",
+            description: "the low 16 bits of a bignum survive a little-endian segment (0xABCD -> <<205,171>>)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "<<((256 bsl 200) bor 16#ABCD):16/little>>",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<205,171>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/negative_and_bignum_signed_unsigned_bytes",
+            description: "signed/unsigned 8-bit segments fed by -1 and by big-shifted bignums all reduce to a single byte",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{<<(-1):8/signed>>, <<(255 bsl 64):8/unsigned>>, <<(-(1 bsl 100)):8/signed>>}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<255>>,<<0>>,<<0>>}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/negative_bignum_signed_little_segment",
+            description: "a negative bignum in a signed little-endian 16-bit segment decodes back to -1",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin <<X:16/signed-little>> = <<(-(1 bsl 100)-1):16/signed-little>>, X end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok -1"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_into_wide_segment",
+            description: "an in-range bignum fills a 72-bit segment exactly, and decode_unsigned/1 recovers it",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{<<(2 bsl 64):72>>, binary:decode_unsigned(<<(2 bsl 64):72>>)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<2,0,0,0,0,0,0,0,0>>,36893488147419103232}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_segment_sized_by_derived_bit_size",
+            description: "a segment sized by bit_size(binary:encode_unsigned(N)) of a 101-bit bignum holds N byte-for-byte",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin N = 1 bsl 100, {<<N:(bit_size(binary:encode_unsigned(N)))>>, binary:encode_unsigned(N)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<16,0,0,0,0,0,0,0,0,0,0,0,0>>,<<16,0,0,0,0,0,0,0,0,0,0,0,0>>}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_truncated_to_sub_byte_segments",
+            description: "a bignum truncated to one bit, a 65-bit segment sized by a bignum, and an unsized 256 all agree",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{<<(2 bsl 64):1>>, bit_size(<<(1 bsl 100):65>>), <<256>>}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {<<0:1>>,65,<<0>>}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_masked_segment_roundtrip",
+            description: "a bignum OR-ed with a 32-bit mask in a 64-bit segment round trips big- and little-endian",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin B = <<((2 bsl 64) bor 16#DEADBEEF):64>>, {binary:decode_unsigned(B), binary:decode_unsigned(B, little)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {3735928559,17275436389634146304}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/decode_unsigned_of_bignum_derived_binaries",
+            description: "decode_unsigned/1,2 of a 64-bit all-ones image and of binary:encode_unsigned/1 of a 101-bit bignum",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:decode_unsigned(<<(-1):64/signed-little>>), binary:decode_unsigned(<<(-1):64/signed-little>>, little), binary:decode_unsigned(binary:encode_unsigned(1 bsl 100))}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {18446744073709551615,18446744073709551615,1267650600228229401496703205376}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_segment_size_badarg",
+            description: "a negative segment size, a non-byte-aligned decode_unsigned subject and a negative encode_unsigned value are badarg",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Only the **reason** is observed for each call (a bare `catch` would embed a
+                // volatile stack trace).
+                expr: "[begin try <<(1 bsl 100):(-1)>> catch error:ReasonA -> ReasonA end end, begin try binary:decode_unsigned(<<1:1>>) catch error:ReasonB -> ReasonB end end, begin try binary:encode_unsigned(-1) catch error:ReasonC -> ReasonC end end]",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [badarg,badarg,badarg]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_segment_sized_by_size_is_badarg",
+            description: "sizing a segment with size/1 of a bignum raises badarg, since size/1 rejects an integer",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The segment-size expression is evaluated as part of the construction, so
+                // `size/1`'s own badarg escapes as the construction's badarg.
+                expr: "begin try <<(1 bsl 100):(size(1 bsl 100))>> catch error:ReasonA -> ReasonA end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok badarg"),
                 exit_code: 0,
             },
         },

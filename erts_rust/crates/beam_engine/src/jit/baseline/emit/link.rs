@@ -179,10 +179,10 @@ impl<'a> Linker<'a> {
         done: CodeLabel,
         func: u32,
         pc: u32,
-    ) -> Result<()> {
+    store_pc: u32) -> Result<()> {
         match self.entries.get(&(func, pc)) {
             Some(&target) => {
-                spill(buffer, allocation, SpillSite::Exit)?;
+                spill(buffer, allocation, SpillSite::Exit, store_pc)?;
                 // `rt` for the successor's prologue: it stores `rdi` into *its* `rt`
                 // slot and loads `rbx` from it. `rdi` is not one of the registers the
                 // teardown pops, so the reloaded value survives the teardown and the
@@ -192,7 +192,7 @@ impl<'a> Linker<'a> {
                 buffer.jmp(target)
             }
             None => {
-                spill(buffer, allocation, SpillSite::Exit)?;
+                spill(buffer, allocation, SpillSite::Exit, store_pc)?;
                 buffer.mov_ri(Reg::Rax, encode_target(func, pc))?;
                 buffer.jmp(done)
             }
@@ -223,7 +223,7 @@ impl<'a> Linker<'a> {
         func: u32,
         pc: u32,
         deallocate: u32,
-    ) -> Result<()> {
+    store_pc: u32) -> Result<()> {
         let &target = self.entries.get(&(func, pc)).ok_or_else(|| {
             crate::error::unsupported("jit: tail-call target has no compiled block")
         })?;
@@ -233,7 +233,7 @@ impl<'a> Linker<'a> {
         // pop returns to a driver that owns the same root set. `jit_tail_call` reads no
         // x-register, so the spill order relative to the call is free — this one keeps
         // the exit shaped like every other exit in the tier.
-        spill(buffer, allocation, SpillSite::Exit)?;
+        spill(buffer, allocation, SpillSite::Exit, store_pc)?;
         // `rt` (the helper's first argument), the already-resolved successor and the
         // frame size the pop must match.
         buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
@@ -284,13 +284,13 @@ impl<'a> Linker<'a> {
         func: u32,
         pc: u32,
         deallocate: u32,
-    ) -> Result<()> {
+    store_pc: u32) -> Result<()> {
         let word = encode_target(func, pc);
 
         // The root set first (the exit's contract, see [`super::spill`]), then `rt` and
         // the helper's two value arguments: the resolved successor word and the frame
         // size the pop must match.
-        spill(buffer, allocation, SpillSite::Exit)?;
+        spill(buffer, allocation, SpillSite::Exit, store_pc)?;
         buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
         buffer.mov_ri(Reg::Rsi, word)?;
         buffer.mov_ri(Reg::Rdx, i64::from(deallocate))?;
@@ -365,7 +365,7 @@ mod tests {
 
     /// `spill` of `allocation` (its **written** cache), as emitted.
     fn spill_bytes(allocation: &Allocation) -> Vec<u8> {
-        encoded(|buffer| spill(buffer, allocation, SpillSite::Exit).unwrap())
+        encoded(|buffer| spill(buffer, allocation, SpillSite::Exit, 0).unwrap())
     }
 
     /// The linked exit's `mov rdi, [rsp + RUNTIME_SLOT_DISP]` — the reload that
@@ -394,7 +394,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the successor's entry, so the
@@ -459,7 +459,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
             .unwrap();
         let exit_len = buffer.len();
         buffer.bind(target).unwrap();
@@ -504,7 +504,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
             .unwrap();
         let exit_len = buffer.len();
         buffer.bind(done).unwrap();
@@ -569,7 +569,7 @@ mod tests {
             let linker = Linker::new(&entries);
 
             linker
-                .emit_exit(&mut buffer, &allocation, done, func, pc)
+                .emit_exit(&mut buffer, &allocation, done, func, pc, pc)
                 .unwrap();
             let exit_len = buffer.len();
             buffer.bind(target).unwrap();
@@ -629,7 +629,7 @@ mod tests {
         };
 
         linker
-            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3)
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the successor's entry, so the jump's
@@ -700,7 +700,7 @@ mod tests {
         let linker = Linker::new(&entries);
         let allocation = Allocation::default();
         let err = linker
-            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3)
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0)
             .expect_err("an unlinkable tail target is the documented typed error");
         assert!(
             format!("{err:?}").contains("no compiled block"),
@@ -743,7 +743,7 @@ mod tests {
         };
 
         linker
-            .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3)
+            .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3, 0)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the epilogue, so the trailing jump's

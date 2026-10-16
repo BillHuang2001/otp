@@ -2397,6 +2397,51 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_keyword_atom_evaluates_as_an_atom() {
+        // Every expectation below is the system Erlang oracle's own stdout for the same
+        // expression: a quoted atom whose text spells an Erlang keyword is an ordinary atom,
+        // never the reserved word (`erl_scan:string("'case'")` → `{atom,1,'case'}`), in every
+        // position — and a quoted atom is never a keyword terminator or an infix operator.
+        assert_eq!(printed(r#"io:format("~p", ['when'])"#), "'when'");
+        assert_eq!(printed(r#"io:format("~p", [{'when','of'}])"#), "{'when','of'}");
+        assert_eq!(printed(r#"io:format("~p", [#{'case' => 1}])"#), "#{'case' => 1}");
+        assert_eq!(printed(r#"io:format("~p", [is_atom('case')])"#), "true");
+        assert_eq!(
+            printed(r#"io:format("~p", [atom_to_list('receive')])"#),
+            "\"receive\""
+        );
+        assert_eq!(
+            printed(r#"io:format("~p", [map_get('when', #{'when' => 1})])"#),
+            "1"
+        );
+        assert_eq!(
+            printed(r#"io:format("~p", [[V || V <- ['when','of']]])"#),
+            "['when','of']"
+        );
+        assert_eq!(
+            printed(r#"io:format("~p", [try throw('when') catch 'when' -> caught end])"#),
+            "caught"
+        );
+        assert_eq!(
+            printed(r#"io:format("~p", [fun('when') -> 'of' end('when')])"#),
+            "'of'"
+        );
+        assert_eq!(printed(r#"io:format("~p", ['when' = 'when'])"#), "'when'");
+        // `'end'`/`'of'` do not close a `case`/`begin`: they are plain terms there.
+        assert_eq!(
+            printed(r#"io:format("~p", [case 'of' of 'end' -> 1; _ -> other end])"#),
+            "other"
+        );
+        assert_eq!(printed(r#"io:format("~p", [begin 'end' end])"#), "'end'");
+        // A quoted call head is a function call: `'abs'(-1)` is `erlang:abs(-1)`.
+        assert_eq!(printed(r#"io:format("~p", ['abs'(-1)])"#), "1");
+        assert_eq!(
+            printed(r#"io:format("~p", ['lists':reverse([1,2])])"#),
+            "[2,1]"
+        );
+    }
+
+    #[test]
     fn bit_operators_go_through_the_registry() {
         // The six bit operators are dispatched to `beam_bifs`' arbitrary-precision
         // `erlang` BIFs (not computed locally), so a small-int result must still be

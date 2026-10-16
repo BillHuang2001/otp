@@ -225,6 +225,87 @@ fn registered_name_is_wrapped_when_registered_and_bare_empty_when_unregistered()
     assert_eq!(value, NIL);
 }
 
+/// `registered_name` is the truth of the **queried** process, never the caller's: the name is
+/// looked up by the pid argument, so asking about a *second* process registered under another
+/// name reports that name while the caller's own item keeps its own.
+///
+/// Oracle probe (OTP 29.1.1 / erts-17.1), the very sequence this test mirrors — run as
+/// `erl -noshell -eval '…'`, stdout shown verbatim:
+///
+/// ```text
+/// A     = process_info(whereis(init), registered_name)  => {registered_name,init}
+/// P     = spawn(fun() -> receive stop -> ok end end),
+/// register(probe_reg, P),
+/// B     = process_info(P, registered_name)             => {registered_name,probe_reg}
+/// Blist = process_info(P, [registered_name])           => [{registered_name,probe_reg}]
+/// unregister(probe_reg),
+/// C     = process_info(P, registered_name)             => []
+/// Clist = process_info(P, [registered_name])           => [{registered_name,[]}]
+/// ```
+///
+/// The one route where this runtime answers differently for *its own* process is the
+/// `-eval`/`-s`/`-run` action routes (see the module docs): those run the action in the root
+/// process, which is registered as `init`.
+#[test]
+fn registered_name_is_the_queried_processes_name_not_the_callers() {
+    let mut runtime = runtime();
+    let query = atom(&mut runtime, "registered_name");
+
+    // A: `whereis(init)` resolves this runtime's root process, and its item is `init`.
+    let init_name = atom(&mut runtime, "init");
+    let init_pid = call(&mut runtime, "erlang", "whereis", &[init_name]).expect("whereis/1");
+    assert_eq!(
+        init_pid,
+        root_pid(&mut runtime),
+        "the root process is registered as `init`"
+    );
+    let (key, value) = pair(
+        call(&mut runtime, "erlang", "process_info", &[init_pid, query]).expect("process_info/2"),
+    );
+    assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
+    assert_eq!(runtime.atom_name_of(value), Some("init"));
+
+    // A **second**, distinct live process (never the caller), registered under another name.
+    let other = runtime.processes.spawn_default().expect("a fresh process");
+    let other_pid = other.to_eterm();
+    assert_ne!(other_pid, init_pid, "a distinct pid");
+    let probe = atom(&mut runtime, "probe_reg");
+    let answer =
+        call(&mut runtime, "erlang", "register", &[probe, other_pid]).expect("register/2");
+    assert_eq!(runtime.atom_name_of(answer), Some("true"));
+
+    // B: the queried process's name — NOT the caller's (`init`).
+    let (key, value) = pair(info(&mut runtime, other_pid, "registered_name").expect("B"));
+    assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
+    assert_eq!(runtime.atom_name_of(value), Some("probe_reg"));
+    // ... while the caller's own item still answers `init`.
+    let (_, own) = pair(info(&mut runtime, init_pid, "registered_name").expect("caller item"));
+    assert_eq!(runtime.atom_name_of(own), Some("init"));
+    // Blist: the list form wraps the name too.
+    let list = make_list(&mut runtime, &[query]);
+    let reply =
+        call(&mut runtime, "erlang", "process_info", &[other_pid, list]).expect("process_info/2");
+    let (key, value) = pair(terms::list_elements(reply).expect("a list")[0]);
+    assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
+    assert_eq!(runtime.atom_name_of(value), Some("probe_reg"));
+
+    // C/Clist: a live but **unregistered** process — the single-atom form is the bare `[]`, the
+    // list form wraps it (`{registered_name, []}`), the oracle's `always_wrap` split.
+    let answer = call(&mut runtime, "erlang", "unregister", &[probe]).expect("unregister/1");
+    assert_eq!(runtime.atom_name_of(answer), Some("true"));
+    assert_eq!(
+        info(&mut runtime, other_pid, "registered_name").expect("C"),
+        NIL,
+        "the single-atom form is the bare []"
+    );
+    let list = make_list(&mut runtime, &[query]);
+    let reply =
+        call(&mut runtime, "erlang", "process_info", &[other_pid, list]).expect("process_info/2");
+    let (key, value) = pair(terms::list_elements(reply).expect("a list")[0]);
+    assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
+    assert_eq!(value, NIL, "the list form wraps the []");
+}
+
 #[test]
 fn the_dictionary_tuple_form_echoes_the_key_and_answers_undefined_when_absent() {
     let mut runtime = runtime();

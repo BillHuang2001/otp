@@ -35,7 +35,7 @@ use std::rc::Rc;
 
 use beam_bifs::{
     AtomInterner, DictHook, FunCaller, LocalNode, OutputSink, RecordDefinitionView,
-    RecordFieldView, RecordSource, SendHook,
+    RecordFieldView, RecordSource, SendHook, TableRegistry,
 };
 use beam_common::{BeamError, Result};
 use beam_engine::ExecutionContext;
@@ -110,11 +110,14 @@ impl OutputSink for SharedSink<'_> {
 /// through `Machine::run_label` — exactly the semantics a direct `call_fun` opcode has.
 ///
 /// It carries a clone of the caller's [`SharedSink`], so a nested `io:format` reaches the
-/// caller's sink rather than stdout. It carries **no** [`TableRegistry`] of its own: the
-/// outer call intentionally did not take the shared cell (see
-/// [`RuntimeContext::reentrancy_capable`]), so the nested context's own
-/// [`RuntimeContext::call_registered`] borrows it normally and `ets:*` inside the applied
-/// fun reaches the runtime's tables.
+/// caller's sink rather than stdout. It installs **no** [`TableRegistry`] cell of its own: an
+/// outer call that took no cell (`lists:map/2` — see
+/// [`RuntimeContext::reentrancy_capable`]) leaves the shared cell free, so the nested context's
+/// own [`RuntimeContext::call_registered`] borrows it normally and `ets:*` inside the applied
+/// fun reaches the runtime's tables. An outer call that **did** hold the cell and lent it
+/// (`ets:foldl/3`/`ets:foldr/3`) passes it to
+/// [`FunCaller::call_fun_with_tables`](beam_bifs::FunCaller::call_fun_with_tables), which this
+/// bridge installs into the nested context verbatim — the cell is never consulted on that path.
 pub(super) struct FunBridge<'a> {
     /// The runtime the fun runs on.
     pub(super) runtime: &'a mut Runtime,
@@ -139,13 +142,45 @@ pub(super) struct FunBridge<'a> {
 
 impl FunCaller for FunBridge<'_> {
     fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        // A fresh nested context over the same runtime, sharing the caller's output sink
-        // so a nested `io:format` reaches it. The ETS cell is left free by the outer call
-        // (it is re-entrancy-capable), so the nested `call_registered` borrows it normally.
-        // The mailbox identity (pid + table) is inherited, so a `receive` in the fun
-        // scans the same process's mailbox as the outer call, and the scheduler-pump
-        // permission is inherited with it.
-        let mut ctx = RuntimeContext {
+        // No registry lent by the outer call: the nested context's own `call_registered`
+        // borrows the shared ETS cell (free, because the outer call is re-entrancy-capable).
+        let mut ctx = self.nested(None);
+        ctx.apply_fun(fun, args)
+    }
+
+    /// The `ets:foldl/3`/`ets:foldr/3` shape: the outer fold holds the shared ETS cell for its
+    /// whole duration, so it **lends** the one live `&mut TableRegistry` instead. Installing it
+    /// unconditionally (not only when the nested call itself reads the seam) is what propagates
+    /// the registry through a reentrant intermediate that installs no cell
+    /// (`ets:foldl` fun → `lists:map` fun → `ets:lookup`).
+    fn call_fun_with_tables(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+        tables: Option<&mut TableRegistry>,
+    ) -> Result<Eterm> {
+        let mut ctx = self.nested(tables);
+        ctx.apply_fun(fun, args)
+    }
+}
+
+impl<'a> FunBridge<'a> {
+    /// Builds the nested context the applied fun runs on, installing `lent_tables` verbatim
+    /// (see [`FunCaller::call_fun_with_tables`]).
+    ///
+    /// Shared by [`FunCaller::call_fun`] (`lent_tables` = `None`) and
+    /// [`FunCaller::call_fun_with_tables`], so the two entry points cannot drift. The mailbox
+    /// identity (pid + table) is inherited, so a `receive` in the fun scans the same process's
+    /// mailbox as the outer call; the scheduler-pump permission and the executing-module name
+    /// come with it.
+    ///
+    /// `'b` is the shorter of the borrow of `self` and the lend; [`RuntimeContext`] is covariant
+    /// in its lifetime, so the nested context is built over that shorter borrow.
+    fn nested<'b>(
+        &'b mut self,
+        lent_tables: Option<&'b mut TableRegistry>,
+    ) -> RuntimeContext<'b> {
+        RuntimeContext {
             runtime: self.runtime,
             output: self.output.clone(),
             mailbox_pid: self.mailbox_pid,
@@ -156,10 +191,10 @@ impl FunCaller for FunBridge<'_> {
             // A **nested** run: it must never collect the process heap, because the root set
             // the machine would hand out belongs to the outer machine (see `context::gc`).
             gc_armed: false,
-                // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
-                dispatch_memo: super::DispatchMemo::default(),
-        };
-        ctx.apply_fun(fun, args)
+            // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
+            dispatch_memo: super::DispatchMemo::default(),
+            lent_tables,
+        }
     }
 }
 
@@ -351,6 +386,8 @@ impl SendHook for SendBridge<'_> {
                         gc_armed: false,
                         // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
                         dispatch_memo: super::DispatchMemo::default(),
+                        // A delivery applies no fun and reads no `TableRegistry`.
+                        lent_tables: None,
                     };
                     match ctx.send_message(target.to_eterm(), term) {
                         // No process for the pid: the C drops the message and reports success
@@ -386,6 +423,8 @@ impl SendHook for SendBridge<'_> {
                     engines: self.engines,
                     gc_armed: false,
                     dispatch_memo: super::DispatchMemo::default(),
+                    // A remote transmission applies no fun and reads no `TableRegistry`.
+                    lent_tables: None,
                 };
                 ctx.deliver_remote(remote, to, term)
             }
@@ -610,6 +649,11 @@ impl RecordSource for RecordBridge<'_> {
 /// The atom is `Copy` (resolved once, before the context borrows the shared table), so the
 /// hook needs **no** runtime borrow and can be installed in every
 /// [`RuntimeContext::call_registered`] arm.
+///
+/// The `[local]` direction is the seam's second half: `local_node_hash` answers a real
+/// per-OS-process Bob-Jenkins hash over this host's name, pid and clock (see
+/// [`super::node_hash`]), which is what makes `term_to_binary(Term, [local])` a real image
+/// rather than the typed `unsupported_bif` gap.
 pub(super) struct NodeIdentity {
     /// The runtime's node-name atom, taken from [`Runtime::local_node`] at the start of the
     /// call; always `Some` for a live runtime (the atom is interned at construction).
@@ -628,6 +672,19 @@ impl LocalNode for NodeIdentity {
         // installs it on its `beam_codec` decoder, so a decoded local identifier is demoted
         // back to the internal id and `binary_to_term(term_to_binary(self())) =:= self()`.
         self.node.map(|node| (node, 0))
+    }
+
+    /// The node's `LOCAL_EXT` (`121`) hash, which makes `term_to_binary(Term, [local])` a real
+    /// image instead of the typed `unsupported_bif` gap.
+    ///
+    /// The value comes from [`super::node_hash::node_hash`] and is computed **once** per OS
+    /// process, so it is stable for the whole runtime's lifetime and differs from any other
+    /// VM start — exactly the C's node-local `local_node_hash`. Two runtimes of the same
+    /// process therefore report the same hash (a `[local]` image built by one decodes in the
+    /// other), while the oracle's own hash differs per run; a differential case must therefore
+    /// **mask** the four hash bytes and compare the rest of the image.
+    fn local_node_hash(&mut self) -> Option<u32> {
+        Some(super::node_hash::node_hash())
     }
 }
 

@@ -25,7 +25,7 @@
 //! Everything else about the context lives in this module's siblings — [`crate::context`]
 //! maps them.
 
-use beam_bifs::OutputSink;
+use beam_bifs::{OutputSink, TableRegistry};
 use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::Machine;
@@ -120,6 +120,26 @@ pub struct RuntimeContext<'a> {
     /// The memo of [`RuntimeContext::dispatch`] answers, so a hot call site pays the dispatch
     /// prologue once instead of once per call (see [`DispatchMemo`] for the soundness argument).
     pub(super) dispatch_memo: DispatchMemo,
+    /// A [`TableRegistry`] an **outer** [`BifContext`](beam_bifs::BifContext) lent for the
+    /// duration of a nested call, which must be installed into every nested
+    /// [`BifContext`](beam_bifs::BifContext) this context builds — in preference to
+    /// `runtime.tables`' `RefCell`.
+    ///
+    /// The `fun`-taking `ets` folds (`ets:foldl/3`/`ets:foldr/3`) are the reason it exists:
+    /// they read the `TableRegistry` seam, so the **outer** call holds that cell for its whole
+    /// duration, and they apply their fun through
+    /// [`BifContext::call_fun`](beam_bifs::BifContext::call_fun), which **lends** the one live
+    /// `&mut TableRegistry` to the callee ([`FunCaller::call_fun_with_tables`](beam_bifs::FunCaller)).
+    /// The bridge carries that lend here, so the nested `call_registered` installs it instead
+    /// of consulting the `RefCell` (whose cell the outer call still holds) — that is what makes
+    /// an `ets:lookup/2` inside a fold's fun resolve instead of raising `unsupported_bif`.
+    ///
+    /// It is `None` for every ordinary context. The lent `&mut` is exclusive by construction,
+    /// so installing it can never alias; the `RefCell` is simply not consulted on that path.
+    /// A lent registry is installed for **every** nested call (not only one that itself reads
+    /// the seam), because it must propagate through a reentrant intermediate that installs no
+    /// cell (`ets:foldl` fun → `lists:map` fun → `ets:lookup`).
+    pub(super) lent_tables: Option<&'a mut TableRegistry>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -137,6 +157,7 @@ impl<'a> RuntimeContext<'a> {
             engines: None,
             gc_armed: false,
             dispatch_memo: DispatchMemo::default(),
+            lent_tables: None,
         }
     }
 
@@ -153,6 +174,7 @@ impl<'a> RuntimeContext<'a> {
             engines: None,
             gc_armed: false,
             dispatch_memo: DispatchMemo::default(),
+            lent_tables: None,
         }
     }
 
@@ -186,6 +208,7 @@ impl<'a> RuntimeContext<'a> {
             engines: None,
             gc_armed: false,
             dispatch_memo: DispatchMemo::default(),
+            lent_tables: None,
         }
     }
 

@@ -38,8 +38,9 @@
 //! # Scope
 //!
 //! Implemented: `integer` (any width, big- or little-endian, the value masked into
-//! the field — up to 64 bits through the machine-word path, wider fields through the
-//! bignum path [`super::push_wide_int`]), `binary` (byte-aligned or not, `all` or an
+//! the field — a **small** value up to 64 bits through the machine-word path, any
+//! value at a wider field *or* a **bignum** at any width through the bignum path
+//! [`super::push_wide_int`]), `binary` (byte-aligned or not, `all` or an
 //! explicit bit count), `string` constants from the `StrT` table, `float` (16/32/64
 //! bits, big- or little-endian), `utf8`/`utf16`/`utf32`, an
 //! `append`/`private_append` segment in **any** position (its source's bits are
@@ -212,24 +213,24 @@ fn assemble(
                     Err(reason) => return fail_seg(machine, module, labels, fail, reason),
                 };
                 let value = read_value(machine, module, ctx, value_op)?;
-                if nbits > 64 {
-                    // `fmt_big_be`/`fmt_big_le` (`erl_bits.c:724`/`:811`): a wide
-                    // field of a small *or* a bignum value, both taken modulo
-                    // `2^nbits` (a negative value becomes its nbits-bit two's
-                    // complement, `SUBc` on the build side).
+                // `fmt_big_be`/`fmt_big_le` (`erl_bits.c:724`/`:811`) take the value
+                // **modulo `2^nbits`** for a wide field of a small *or* a bignum value
+                // (a negative value becomes its nbits-bit two's complement, `SUBc` on
+                // the build side). `erts_bs_put_integer_*` masks a **narrow** field the
+                // same way, so a bignum into a `<= 64`-bit field routes here too.
+                if nbits > 64 || raw::big_parts_safe(value).is_some() {
                     push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0)?;
-                } else {
-                    let Some(raw_value) = small_value(value) else {
-                        // `erts_bs_put_integer_*` rejects a non-integer value
-                        // (`erl_bits.c:926`) -> `BADARG`.
-                        return fail_seg(machine, module, labels, fail, SegReason::BadArg);
-                    };
+                } else if let Some(raw_value) = small_value(value) {
                     if flags & BSF_LITTLE != 0 {
                         writer.push_uint_le(raw_value as u64, nbits);
                     } else {
                         // `erts_bs_put_integer_*` masks the value into the field width.
                         writer.push_uint(raw_value as u64, nbits);
                     }
+                } else {
+                    // `erts_bs_put_integer_*` rejects a genuine non-integer value
+                    // (a float, atom, …) (`erl_bits.c:926`) -> `BADARG`.
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
             }
             // `binary Unit Fs Value Size` — append a bitstring operand's bytes.
@@ -405,3 +406,5 @@ fn read_value(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wide_tests;

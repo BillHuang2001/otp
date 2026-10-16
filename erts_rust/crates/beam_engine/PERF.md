@@ -4,6 +4,61 @@ Current-state record of execution-tier performance investigations (the default *
 Detailed current measured figures and execution-coverage evidence live in `MEASURED.md`; this file owns the *tier-regression* narrative (what was slower than what, why, and what changed).
 **The sandbox is heavily oversubscribed**, so every figure here is wall-clock with no CPU pinning: a single sample is meaningless — read the explicitly two-sided **ratio** and the `/proc/loadavg` recorded with it, never an absolute number.
 
+## Batch 54 — block register cache: dirty-set (already-clean-aware) spill stores
+### What changed
+- **Dirty-set spill stores** (`src/jit/baseline/emit/regalloc.rs` + `src/jit/baseline/emit/regs.rs`): the allocation pass already walked the block once to derive `written`/`y_last`; that same forward walk now maintains the **dirty set** — the cached x-registers written since their last store — for every instruction index, recorded as `Allocation::spill_sets` (indexed by pc, including the exit pc) and read back through `Allocation::spill_slots_at(pc)`.
+  `spill(buffer, allocation, site, pc)` therefore stores exactly the registers dirty **at that instruction's own pc** (`mov [rbx + x_offset(x)], reg`) instead of the static write set `written`.
+  Membership is untouched — a block still caches the same fixed, live-interval-ranked set of ≤5 x-registers — and `fill` is unchanged.
+  The rule is a compile-time table lookup, so the emitted block's *shape* is identical to the written-set model; only the number of stores differs.
+- **Soundness rules** (each one-directional — a modelling mistake can only store *more*, never drop a live value): dirty ⊆ written and ∅ at block start (the prologue loads the whole cache, so nothing resident is unsynced); an instruction lowered **in part** in-block (an inline whose run-time guard can reject) **unions** its `cacheable_writes`; an instruction sent **entirely** to a helper (a full `emit_deopt` — the family arm, the receive/`call_ext`/frame-trio/heap families, the `_` arm) **resets** dirty to ∅, because its pre-call spill has just synced the whole cache through the helper; an **inlined** instruction that writes nothing must **not** reset.
+  `is_inlined` mirrors the emitter's dispatch and is biased toward "inlined" (a wrong `true` costs one redundant store; only a wrong `false` could drop a value, and the "certain reset" list is explicit).
+  An `Allocation` with no dirty table (a hand-built synthetic) falls back to storing the whole `written` set, exactly as `fill_slots` falls back to the whole cache.
+  `fill` deliberately stays `(live ∪ written) ∩ slots` — that is what keeps `written ⊆ fill_slots`, i.e. what makes the reset rule sound.
+- **Fused-`deallocate N; return` store-pc fix** (`src/jit/baseline/emit/{block,frame}.rs`): `emit_block` fuses an adjacent `deallocate N; return` into a single `emit_deallocate_return`, but passed the *second* instruction's pc as the spill's `store_pc` — whose dirty entry the forward walk had already reset — so the pre-call spill stored nothing and left `machine.x` stale for the helper.
+  `emit_deallocate_return` now takes `store_pc` (the pair's first instruction) separately from `position_pc`.
+  Signature of the defect: `--lib` 683 passed / 11 failed, every failure a Y-operand tier-agreement assertion; an isolation experiment (forcing `spill_slots_at` back to the whole `written` set) went green, proving it was confined to that one call site.
+  Pinned by `src/jit/baseline/emit/spill_tests.rs`.
+### Design source
+"Classic handwritten-JIT register-cache store elimination", argued from `../ERTS_RUST_REWRITE_DEEPDIVE.md` §F (the baseline/hot split and its correctness-first register cache) and the read-only legacy reference `../../erts/emulator/beam/jit/x86/beam_asm*.cpp` with `../../erts/emulator/beam/jit/beam_jit_register_cache.hpp`.
+That reference is a **position-keyed whole-cache** cache (`consolidate(offset)`/`validAt(offset)` evict the whole cache when the emit position moves) with **no** per-register dirty bit, so this rule is the tier's own design, not a port.
+Full design note: `src/jit/baseline/emit/regalloc.rs` module docs + `src/jit/baseline/emit/regs/CONTEXT.md` §"The soundness contract".
+### Structural counters (test-only, `src/jit/baseline/counters.rs`) — one recorded pass, all three models
+`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed` (32 committed `erlc` fixtures + a 1321-module installed-OTP sample = 103 008 functions / 597 333 blocks / 3 585 490 IR instructions).
+The counters compute the **replaced** models alongside the shipped one **in the same run**, so the store-count comparison is a single measurement — the counterfactual columns are exactly the before/after:
+
+| model | spill stores | note |
+|---|---|---|
+| whole cache (naive) | 5 578 219 | up to 5 stores per spill site |
+| written set (Batch 53) | 4 678 655 | the replaced model |
+| **dirty set (shipped)** | **1 594 678** | **−65.9 %** vs written-set |
+
+3 083 977 redundant already-clean stores removed; emitted bytes **341 653 629 → 320 065 790 (−6.32 %)**, exactly 7 B × the removed store count.
+Fixtures only (32 modules / 351 functions / 960 blocks / 3 650 IR instrs): spill stores 342 dirty / 1 035 written / 1 473 full-cache; `code_len` **253 272 → 248 288 B**.
+`fill` is **unchanged** by this batch: 3 695 119 liveness-restricted loads vs 3 950 215 whole-cache.
+The static deopt census is **unchanged** — 3 113 483 instances / 119 840 deopts over 8 deopting variants (FuncInfo 103 008, Bif 10 014, GcBif 3 282, Bif0 3 204, NifStart 300, Test(IsBoolean) 17, Test(IsFunction2) 9, OnLoad 6) — because the batch changes only *how many stores a spill emits*, never which instruction deopts.
+Two-process copy-bound probe (`src/jit/baseline/tests.rs::the_two_process_copy_bound_shape_is_measured_on_both_tiers`; 14 blocks / 70 IR instrs / 12 cached slots):
+
+| counter | before (written-set) | after (dirty-set) |
+|---|---|---|
+| spill stores | 82 (`Helper` 58, `Exit` 24) | **18** (`Helper` 14, `Exit` 4) |
+| — whole-cache model | 102 | 102 |
+| emitted bytes | 8 266 | 7 818 |
+| fill loads | 69 | 69 |
+### Wall-clock — both sides named, load recorded
+`src/jit/bench` (13 workloads) + the copy-bound probe, `/proc/loadavg` **42 → 57 → 47** over the windows, on **14 cores** (heavily oversubscribed: a single sample is meaningless).
+`jit_bench --ignored`, speed-up of baseline-jit over interpreter (ratio = 1/speed-up): `cmp/2` 8.40× (0.119), `wide/2` 7.93× (0.126), `kernel/2` 7.62× (0.131), `aggr/2` 6.67× (0.150), `walk/2` 2.23× (0.448), `slice:fib/1` 2.23× (0.448), `send_recv/2` 1.99× (0.503), `sum/1` 1.97× (0.508), `select/1` 1.51× (0.662), `call_ext/0` 1.31× (0.763), `map/2` 1.20× (0.833), `cross/2` 1.16× (0.862), `build/0` 0.82× (**1.22 = slower than the interpreter**).
+**The spread across run-sets exceeds any effect the batch could have**: minutes apart, the same binary read `wide/2` **7.45×** (0.134) and then **7.93×**, and `cross/2` **1.05×** (0.952) and then **1.16×**.
+The copy-bound probe is likewise load-sensitive and multi-modal (baseline 12 295 vs interpreter 1 395 ns/op in one window, 129 recorded `WAIT`s) and is structurally neutral to the cache policy (Batch 53).
+- **Verdict: no attributable wall-clock movement.** The dirty-set rule removes *stores*, not instructions, and a store is a small fraction of a slice; nothing to revert — a large, sound reduction in emitted store traffic shipped, without a load-bearing speedup. The structural counters are the honest evidence.
+### Rejected levers (with the numbers that rejected them)
+1. **Per-helper clobber sets to shrink `fill`.** The entire `fill` refinement's headroom — liveness-restricted vs whole-cache — is only 3 950 215 → 3 695 119 loads (~6.5 %) corpus-wide, and **no sound target set exists**: the heap-admission family (`test_heap`/`allocate_heap`/`allocate` ⇒ `ensure_heap_full`/`alloc_words_rooted`) may be a **collecting** host that rewrites *every* published root in `machine.x`, and the value helpers can allocate through `read_operand`. A clobber set narrower than "the whole cache" would need a per-host promise the engine cannot make, so the liveness set is the correct conservative choice.
+2. **`CACHE_REGISTERS` budget / a better ranking criterion.** The 5-slot budget and the live-interval-descending ranking are the Batches-52/53 design; the counters expose `block_cache_slots`/`block_written_slots`/`live_candidates`/`live_total`/`live_max` so saturation is visible per block, and no per-register benefit counter exists to rank on beyond the interval — nothing to change without a new measurement basis.
+### Pins
+New: `src/jit/baseline/emit/spill_tests.rs` (the `spill_slots_at` model, a dirty store at a second helper call, no reset on an inlined no-write instruction, the fused-`deallocate+return` store site, the whole-`written` fallback) and `src/jit/baseline/census.rs`'s corpus register-cache census (all three models into one TSV; asserts liveness/consistency only, never a threshold).
+No previously pinned counter value changed except the dirty-set store counts themselves.
+The tier's **default did not change** (baseline-jit for every `beam_rt` process entry; `BEAM_RT_TIER=interpreter` the only kill switch); the **Cranelift verdict did not change** (still default-OFF, still slower on most shapes).
+Independent end-to-end confirmation: `BEAM_RT_TIER=baseline` per-case differential, **25/25 tier-reachable cases agree, 0 mismatch**, against the OTP 29.1.1 / erts-17.1 oracle.
+
 ## Batch 53 — block register allocator (liveness-based partial spill/fill) + the sub-block O(n²) fix
 
 ### What changed

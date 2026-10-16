@@ -1950,7 +1950,7 @@ fn a_collecting_helper_does_not_leave_a_cached_heap_term_stale() {
 }
 
 // ---------------------------------------------------------------------------
-// the written-set exit spill must leave an un-written cached register alone
+// the dirty-set exit spill must leave an un-written cached register alone
 // ---------------------------------------------------------------------------
 
 /// The sentinel the probe BIF's host answer carries — the value the *helper* (the
@@ -2002,10 +2002,11 @@ impl ExecutionContext for SentinelBifCtx {
     }
 }
 
-/// **The written-set exit-spill soundness pin.** A cached x-register that no inline
+/// **The dirty-set exit-spill soundness pin.** A cached x-register that no inline
 /// lowering of the block writes still holds exactly its `machine.x` value at every
 /// program point, so a block exit's [`spill`](super::emit::regs::spill) — which stores
-/// only [`Allocation::written`](super::emit::Allocation) — may skip it. It also
+/// only [`Allocation::spill_slots_at(pc)`](super::emit::Allocation::spill_slots_at), the
+/// cached registers dirty at its own pc — may skip it. It also
 /// **must**: a helper *is* the interpreter and writes `machine.x` directly, so storing a
 /// stale cached register over the helper's fresh word would clobber it. This test proves
 /// the invariant the whole partial-spill/partial-fill model rests on.
@@ -2022,7 +2023,7 @@ impl ExecutionContext for SentinelBifCtx {
 ///   `machine.x[1]`;
 /// * nothing later reads x1, so x1 is dead after the helper and is left out of the
 ///   post-helper fill set at that pc;
-/// * the inlined `return`'s pre-helper spill stores the write set `{x0}` only.
+/// * the inlined `return`'s pre-helper spill stores the dirty set `{x0}` only.
 ///
 /// So `machine.x[1]` keeps the helper's sentinel. Under a full-cache exit-spill model the
 /// block would store its stale cached x1 (the `22` argument) over it — which is exactly
@@ -2030,7 +2031,7 @@ impl ExecutionContext for SentinelBifCtx {
 /// [`super::emit::liveness`] IS this model: a cached register left out of the fill set is
 /// only ever overwritten, never read.
 #[test]
-fn the_written_set_exit_spill_leaves_an_unwritten_cached_register_untouched() {
+fn the_dirty_set_exit_spill_leaves_an_unwritten_cached_register_untouched() {
     let module = build_module(
         "written_set_spill",
         &[("probe", "mark", 1)],
@@ -2099,7 +2100,7 @@ fn the_written_set_exit_spill_leaves_an_unwritten_cached_register_untouched() {
     // (c) the outcome is the interpreter's: the inlined `move x1 -> x0` leaves x0 = 22,
     // and the BIF's write to x1 is not what `return` yields.
     assert_same_outcome(
-        "written-set exit spill",
+        "dirty-set exit spill",
         &interpreter_outcome,
         &baseline_outcome,
         &module.atom_table,
@@ -2111,7 +2112,7 @@ fn the_written_set_exit_spill_leaves_an_unwritten_cached_register_untouched() {
     );
 
     // (b) the helper's write to `machine.x[1]` survived the block's exit spill: the exit
-    // spill stores only the write set (`{x0}`), so the stale cached x1 is never stored
+    // spill stores only the dirty set (`{x0}`), so the stale cached x1 is never stored
     // over it. A full-cache spill would clobber it with the cached `22`.
     assert_eq!(
         machine.x(1),
@@ -4946,7 +4947,7 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.block_live_candidates, counters.block_live_total, counters.block_live_max,
     );
     println!(
-        "  spill stores: written-set={} (by site {:?}) vs full-cache={} (by site {:?}); \
+        "  spill stores: dirty-set={} (by site {:?}) vs full-cache={} (by site {:?}); \
          spill calls={:?}",
         counters.spill_stores,
         counters.spill_stores_by_site,

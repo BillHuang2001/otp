@@ -525,20 +525,26 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   default** — a genuinely absent `erl` FAILS the cross-check rather than skipping it
   (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces it).
 - **Randomised `ordered_set` differential** (`tests/ets_ordered_oracle.rs`, `#[ignore]`d by default):
-  a 73-term mixed-type key pool driven by a SplitMix64-finalised LCG through a **55-slot** op space
-  (34 `insert` slots plus one slot each for `insert_new`, `delete`, `delete_object`, `take`,
+  a 73-term mixed-type key pool driven by a SplitMix64-finalised LCG through a **60-slot** op space
+  (34 `insert` slots, one slot each for `insert_new`, `delete`, `delete_object`, `take`,
   `delete_all_objects`, `lookup`, `member`, `first`, `last`, `next`, `prev`, `select`, `select_count`,
   `match_object`, `select_reverse`, `foldl`, `update_counter`, `update_element`, `foldr`,
-  `lookup_element/3`, `lookup_element/4`), rendering every observed key as its pool index and comparing
+  `lookup_element/3`, `lookup_element/4`, plus a **`next`/`prev` walk** dimension — a full chain and a
+  chain from the `aux` key (usually absent, i.e. a range bound) — and a **key-boundary** slot
+  `insert_block` inserting a fresh contiguous ascending integer block longer than `ORDER = 32`, so every
+  firing forces a split), rendering every observed key as its pool index and comparing
   `{size, in-order tab2list, op result}` after every step against the live oracle — 1800 steps / 3 seeds
-  agree, **zero divergence**. Run it with `--ignored`; it crosses `ORDER = 32` (peak **49–63** live keys
-  — the test asserts its own peak) so it exercises the split/merge churn the fixed battery cannot.
+  agree, **zero divergence** (peak **68** live keys, longest single walk **67** keys). Run it with
+  `--ignored`; the test asserts its own peak and that every new slot fired, so a future op-mix change
+  cannot silently stop exercising node splits, the merge-on-delete churn, or a walk across a split
+  boundary. A deterministic, always-on counterpart (a `first`+`next`/`last`+`prev` chain over 100 keys
+  interleaved with mutation, plus an absent-key anchor across the split) lives in `tests/ets_fixtable.rs`.
 - **`tests/ets_continuation.rs` / `ets_continuation_direction.rs`** cross-check the continuation cursor
   against the live oracle **including a mutation between chunks**: an `ordered_set` resume survives a
   delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not shift the next
   chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  -p beam_ets --no-fail-fast` is green — **611 passed / 0 failed / 1 ignored across all binaries
+  -p beam_ets --no-fail-fast` is green — **615 passed / 0 failed / 1 ignored across all binaries
   (incl. 10 doctests, 6 of them `compile_fail`)**. The ignored test is the randomised `ordered_set`
   differential, which passes under `--ignored`. With the oracle required, the battery emits and compares
   all **191** cases. Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 … --test differential`.
@@ -642,26 +648,18 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `beam_term` gap): `number_as_f64` rounds an out-of-range bignum to `±inf`; every representable
   integer/float pair is exact.
 
-## Handoffs (to other nodes — NOT adopted here)
-- **`beam_bifs` — adopt the `{protection, Access}` setter and `ets:slot/2`.** This crate exposes the
-  post-creation protection change (`SetOpt::Access(Access)` + the owner-gated
-  `Table::setopts(caller, SetOpt)` + the enforcing `TableAccess::set_access`) and the **read**-gated
-  `TableAccess::slot`. `beam_bifs::ets::adopt::setopts_2` still answers the typed `unsupported_bif` for
-  any `{protection, _}` (the parse-level `{protection, bogus}` `badarg` stays its own) and
-  `beam_bifs::runtime::other` still refuses `ets:slot/2`; adopting either is a call-through (the
-  oracle's `erl_db.c:3744` slot takes a `DB_READ` gate; a non-integer/bignum slot is the BIF layer's
-  `badarg`, an out-of-range slot the crate's `Err(BeamError::BadArg)`, `Ok(None)` is `'$end_of_table'`).
-- **`beam_bifs` — the hash-kind `last`/`prev` workaround can go.** `Table::last`/`Table::prev` are
-  C-faithful now, so `beam_bifs/src/ets.rs`'s `last_1`/`prev_2` need no hash-kind special case (the
-  ordered-kind `'$end_of_table'` anchor rejection stays). The `auto` /
-  `{debug_hash_fixed_number_of_locks, Nlocks}` `write_concurrency` rendering stays host-side
-  (`TableInfo::write_concurrency` is a `bool`).
-- **`beam_bifs/src/match_spec.rs` still refuses ANY head pattern mentioning a map.** Its
-  `head_mentions_a_map`/`term_mentions_a_map`, doc block and the
-  `a_head_pattern_with_a_map_is_a_typed_gap` test are stale: `beam_ets` implements head maps and the
-  oracle's **`table`** dialect accepts them (verified live, for a map head with literal and with `'$N'`
-  values). Delegate to `beam_ets::select::compile`. The `trace` dialect stays typed `unsupported` until
-  a trace-runner subsystem exists (exact shapes/lint strings in `src/select/CONTEXT.md`).
+## Handoffs (to other nodes)
+Adopted by the `beam_bifs` bridge (verified): the owner-gated `{protection, Access}` setter
+(`Table::setopts`/`SetOpt::Access`) and the read-gated `ets:slot/2` primitive; the C-faithful hash-kind
+`last`/`prev` (no BIF-side kind branch); and match-spec head maps (the `table` dialect delegates to
+`beam_ets::select::compile`). The `auto`/`{debug_hash_fixed_number_of_locks, N}` `write_concurrency`
+rendering stays host-side (`TableInfo::write_concurrency` is a `bool`).
+- **`beam_bifs` (open):** install `select::expr::set_self_hook` — no crate does, so `self/0` in a spec
+  silently under-matches (a guard skips its clause, a body yields `EXIT`) where the oracle returns the
+  pid; `BifContext` already carries `self_pid` (see `src/select/CONTEXT.md`).
+- **`beam_bifs` (open):** reject `[]` in `ets:match_spec_compile/1` (the oracle `badarg`s; the select
+  family legitimately accepts `[]`) and retain/deliver the `ets:give_away/3` gift term
+  (`{'ETS-TRANSFER', Tid, FromPid, GiftData}`).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; tests in `src/kind/tests.rs`
@@ -688,7 +686,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
 - `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/access_audit/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/reclamation_oracle/memory/copy_oracle/concurrency/slot/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups)
-- `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace vs the live oracle (`#[ignore]`d; run with `--ignored`)
+- `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace (60-slot op space incl. a `next`/`prev` walk + key-boundary dimension) vs the live oracle (`#[ignore]`d; run with `--ignored`)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `PERF.md` → the crate's measured memory/perf figures (§3 the `ordered_set` B+-tree-vs-sorted-`Vec` comparison across key orders; §1 the `ets_copy` peak-RSS attribution; §2 per-object reclamation) — both sides of every ratio + `/proc/loadavg`
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)

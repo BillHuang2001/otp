@@ -33,7 +33,7 @@
 //! and `$DIFFERENTIAL_NO_BUILD` (any non-empty value) switches it off. A failed build is never
 //! fatal: the affected cases stay a loud `skipped` naming cargo's diagnosis.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use differential::cli::{self, Command};
 use differential::corpus::{self, CaseKind, CommandProgram};
@@ -85,7 +85,12 @@ fn dispatch(command: Command) -> Result<i32> {
             emit_list(&list, json, out)?;
             Ok(0)
         }
-        Command::Run { case_id, json, out } => {
+        Command::Run {
+            case_id,
+            json,
+            out,
+            out_file,
+        } => {
             let case = corpus::find_case(&case_id).ok_or_else(|| {
                 Error::usage(format!(
                     "unknown case id '{case_id}' (see `differential list` for the corpus)"
@@ -96,6 +101,7 @@ fn dispatch(command: Command) -> Result<i32> {
                 &RunReport::from_case("run", &outcome),
                 json,
                 out,
+                out_file,
             )?;
             Ok(outcome.exit_code())
         }
@@ -106,7 +112,7 @@ fn dispatch(command: Command) -> Result<i32> {
             out,
         } => {
             let outcome = harness::compare_expr(&expr, &pa)?;
-            emit_report(&RunReport::from_case("compare", &outcome), json, out)?;
+            emit_report(&RunReport::from_case("compare", &outcome), json, out, None)?;
             Ok(outcome.exit_code())
         }
         Command::Suite {
@@ -127,7 +133,7 @@ fn dispatch(command: Command) -> Result<i32> {
                 Some(list) => ratchet::report_from_suite(&suite, list),
                 None => RunReport::from_suite(&suite),
             };
-            emit_report(&report, json, out)?;
+            emit_report(&report, json, out, None)?;
             if let Some(gaps_path) = &gaps {
                 let empty = Allowlist::empty();
                 let list = list.as_ref().unwrap_or(&empty);
@@ -136,7 +142,78 @@ fn dispatch(command: Command) -> Result<i32> {
             }
             Ok(ratchet::suite_exit_code(&report, strict))
         }
+        Command::Merge {
+            from,
+            allowlist,
+            gaps,
+            json,
+            out,
+            out_file,
+        } => {
+            // Fold the per-case `run --out-file` reports into ONE suite-shaped report, then
+            // classify the gaps and (optionally) regenerate `GAPS.md` with the SAME renderer
+            // `suite --gaps` uses, so the generated document is identical. This never runs a
+            // case, so it is the cheap route to regenerate the document.
+            let reports = read_reports(&from)?;
+            let list = match &allowlist {
+                Some(path) => Some(Allowlist::load(path)?),
+                None => None,
+            };
+            let report = RunReport::merge(reports, list.as_ref())?;
+            emit_report(&report, json, out, out_file)?;
+            if let Some(gaps_path) = &gaps {
+                let empty = Allowlist::empty();
+                let list = list.as_ref().unwrap_or(&empty);
+                ratchet::write_gaps(gaps_path, &report, list)?;
+                eprintln!("differential: wrote {}", gaps_path.display());
+            }
+            Ok(ratchet::suite_exit_code(&report, true))
+        }
     }
+}
+
+/// Read every `*.json` report directly under `dir` and parse each as a run report.
+///
+/// Files are visited in sorted path order so the fold is deterministic. A `--from` that is
+/// not a readable directory, an empty directory, or a `*.json` file that does not parse as a
+/// `differential/1` report is a loud usage error (exit 2) naming the offender — never a
+/// silently skipped file.
+fn read_reports(dir: &Path) -> Result<Vec<RunReport>> {
+    let entries = std::fs::read_dir(dir).map_err(|source| {
+        Error::usage(format!(
+            "--from '{}' is not a readable directory: {source}",
+            dir.display()
+        ))
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            Error::usage(format!(
+                "reading the directory '{}': {source}",
+                dir.display()
+            ))
+        })?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            && path.is_file()
+        {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Err(Error::usage(format!(
+            "no *.json reports found under '{}' (write them with `run <case-id> --out-file <path>`)",
+            dir.display()
+        )));
+    }
+    paths.sort();
+    let mut reports = Vec::with_capacity(paths.len());
+    for path in paths {
+        reports.push(RunReport::read_json(&path)?);
+    }
+    Ok(reports)
 }
 
 /// Make the live-distribution helper (`dist_probe`) available when the command can need it.
@@ -183,7 +260,9 @@ fn needs_helper(command: &Command) -> bool {
     match command {
         Command::Run { case_id, .. } => corpus::find_case(case_id).is_some_and(case_needs_helper),
         Command::Suite { .. } => corpus::cases().iter().any(case_needs_helper),
-        Command::Compare { .. } | Command::List { .. } | Command::Help { .. } => false,
+        Command::Compare { .. } | Command::List { .. } | Command::Merge { .. } | Command::Help { .. } => {
+            false
+        }
     }
 }
 
@@ -199,11 +278,22 @@ fn case_needs_helper(case: &corpus::Case) -> bool {
 
 /// Write the report and print it (`--json` or human text).
 ///
-/// The report file is always written — `<dir>/report.json` with `--out <dir>`, and the
-/// crate's gitignored `out/report.json` otherwise (the documented `--out` default).
-fn emit_report(report: &RunReport, json: bool, out: Option<PathBuf>) -> Result<()> {
-    let dir = out.unwrap_or_else(report::default_out_dir);
-    let path = report::write_json(report, Some(&dir))?;
+/// The report file is always written — `<dir>/report.json` with `--out <dir>` (or, with
+/// `--out-file <path>`, **exactly** that path), and the crate's gitignored `out/report.json`
+/// otherwise (the documented `--out` default).
+fn emit_report(
+    report: &RunReport,
+    json: bool,
+    out: Option<PathBuf>,
+    out_file: Option<PathBuf>,
+) -> Result<()> {
+    let path = match out_file {
+        Some(path) => report.write_json_to(&path)?,
+        None => {
+            let dir = out.unwrap_or_else(report::default_out_dir);
+            report::write_json(report, Some(&dir))?
+        }
+    };
     eprintln!("differential: wrote {}", path.display());
     if json {
         println!("{}", report.to_json_string()?);
@@ -254,6 +344,7 @@ mod tests {
             case_id: case_id.to_string(),
             json: false,
             out: None,
+            out_file: None,
         }
     }
 
@@ -264,6 +355,18 @@ mod tests {
             gaps: None,
             json: false,
             out: None,
+        }
+    }
+
+    /// A `merge` command (a pure report-folding command: it never spawns a runtime).
+    fn merge() -> Command {
+        Command::Merge {
+            from: std::path::PathBuf::from("reports"),
+            allowlist: None,
+            gaps: None,
+            json: false,
+            out: None,
+            out_file: None,
         }
     }
 
@@ -309,5 +412,9 @@ mod tests {
             json: false,
             out: None,
         }));
+        assert!(
+            !needs_helper(&merge()),
+            "`merge` only folds reports: it can never spawn the helper"
+        );
     }
 }

@@ -20,16 +20,18 @@
 
 //! The report data model: the serde structs and their constructors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::allowlist::Allowlist;
 use crate::compare::{FieldDiff, SideResult, Verdict};
 use crate::corpus::{self, Case, Contract};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::harness::{CaseOutcome, SuiteOutcome};
 use crate::ratchet::RatchetReport;
-use crate::runtime::{RuntimeId, RuntimeSpec};
+use crate::runtime::{RuntimeId, RuntimeSource, RuntimeSpec};
 
 use super::json::{to_json_string, LIST_SCHEMA, SCHEMA};
 
@@ -38,7 +40,7 @@ use super::json::{to_json_string, LIST_SCHEMA, SCHEMA};
 pub struct RunReport {
     /// Always [`SCHEMA`].
     pub schema: &'static str,
-    /// `"run"`, `"compare"` or `"suite"`.
+    /// `"run"`, `"compare"`, `"suite"` or `"merge"`.
     pub mode: &'static str,
     /// The oracle runtime that was used.
     pub oracle: RuntimeReport,
@@ -47,8 +49,8 @@ pub struct RunReport {
     /// Verdict counts over `cases`.
     pub summary: Summary,
     /// The known-gaps ratchet classification. Present only when an allowlist drove the run
-    /// (`suite --allowlist`); omitted from the JSON otherwise, so a run without one is
-    /// byte-for-byte unchanged.
+    /// (`suite --allowlist`, `merge --allowlist`); omitted from the JSON otherwise, so a run
+    /// without one is byte-for-byte unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ratchet: Option<RatchetReport>,
     /// Verdict counts rolled up per compatibility contract, keyed by the stable contract id
@@ -56,6 +58,9 @@ pub struct RunReport {
     /// declares, so these totals need not sum to [`Summary::total`]. Only contracts that
     /// appear in the run are present (an empty object for a corpus-free run, e.g. an ad-hoc
     /// `compare`).
+    ///
+    /// It is recomputed on every construction (including by [`RunReport::merge`] and the
+    /// deserializer), so a rollup read back from JSON is never trusted over the cases.
     pub by_contract: BTreeMap<&'static str, Summary>,
     /// One entry per executed case, in execution order.
     pub cases: Vec<CaseReport>,
@@ -118,6 +123,65 @@ impl RunReport {
     pub fn to_json_string(&self) -> Result<String> {
         to_json_string(self)
     }
+
+    /// Write this report to **exactly** `path`, creating its parent directory (the
+    /// `--out-file` writer, used by `run --out-file`).
+    pub fn write_json_to(&self, path: &Path) -> Result<std::path::PathBuf> {
+        super::json::write_json_to(self, path)
+    }
+
+    /// Read a `differential/1` run report back from a JSON file (the `merge` command).
+    ///
+    /// A missing/unreadable file, or a JSON body that is not a report of the expected
+    /// schema, is a loud [`Error`] naming the file — never silently skipped.
+    pub fn read_json(path: &Path) -> Result<RunReport> {
+        super::json::read_report_file(path)
+    }
+
+    /// Fold per-case reports into one suite-shaped report (the `merge` command).
+    ///
+    /// The merged report takes its runtime identity from the **first** constituent report
+    /// (they are identical across one sweep), dedupes the cases by `case_id` (first
+    /// occurrence wins, so re-running a case is harmless) and orders them by `case_id` so
+    /// the merged document is deterministic regardless of file order. The summary and the
+    /// per-contract rollup are recomputed from the merged cases, and — when an allowlist is
+    /// given — the ratchet is classified exactly as the `suite` gate does, so the generated
+    /// `GAPS.md` is identical to the one the serial gate would have written.
+    ///
+    /// An empty input is a loud [`Error::Usage`] (there is nothing to merge).
+    pub fn merge(reports: Vec<RunReport>, allowlist: Option<&Allowlist>) -> Result<RunReport> {
+        let mut oracle = None;
+        let mut rust = None;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut cases: Vec<CaseReport> = Vec::new();
+        for report in reports {
+            if oracle.is_none() {
+                oracle = Some(report.oracle);
+            }
+            if rust.is_none() {
+                rust = Some(report.rust);
+            }
+            for case in report.cases {
+                if seen.insert(case.case_id.clone()) {
+                    cases.push(case);
+                }
+            }
+        }
+        let oracle = oracle.ok_or_else(|| Error::usage("merge: no report to fold"))?;
+        let rust = rust.ok_or_else(|| Error::usage("merge: no report to fold"))?;
+        cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+        let ratchet = allowlist.map(|list| RatchetReport::classify(&cases, list));
+        Ok(RunReport {
+            schema: SCHEMA,
+            mode: "merge",
+            oracle,
+            rust,
+            summary: Summary::of(&cases),
+            ratchet,
+            by_contract: by_contract_summary(&cases),
+            cases,
+        })
+    }
 }
 
 /// One runtime's identity and availability.
@@ -153,7 +217,7 @@ impl RuntimeReport {
 }
 
 /// Verdict counts over a set of case reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     /// Number of cases in the report.
     pub total: usize,
@@ -220,7 +284,7 @@ fn by_contract_summary(cases: &[CaseReport]) -> BTreeMap<&'static str, Summary> 
 }
 
 /// One case's report entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseReport {
     /// The case id.
     pub case_id: String,
@@ -262,7 +326,7 @@ impl CaseReport {
 }
 
 /// One side's observation, as reported.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SideReport {
     /// Whether the side ran at all.
     pub available: bool,
@@ -301,6 +365,177 @@ impl SideReport {
                 matched_golden: None,
             },
         }
+    }
+}
+
+/// Map a reported runtime id string onto its `'static` spelling.
+fn runtime_id_static(id: &str) -> Option<&'static str> {
+    match id {
+        "oracle" => Some(RuntimeId::Oracle.id()),
+        "rust" => Some(RuntimeId::Rust.id()),
+        _ => None,
+    }
+}
+
+/// Map a reported runtime source string onto its `'static` spelling.
+///
+/// Only the sources the harness itself emits are accepted; an unknown one is a loud parse
+/// error, so a report that was not written by this harness can never be silently folded.
+fn runtime_source_static(source: &str) -> Option<&'static str> {
+    match source {
+        "$PATH" => Some(RuntimeSource::Path.as_str()),
+        "workspace-default" => Some(RuntimeSource::WorkspaceDefault.as_str()),
+        "$ERTS_ORACLE" => Some(RuntimeSource::Env("$ERTS_ORACLE").as_str()),
+        "$BEAM_RT" => Some(RuntimeSource::Env("$BEAM_RT").as_str()),
+        "$BEAM_DIST_PROBE" => Some(RuntimeSource::Env("$BEAM_DIST_PROBE").as_str()),
+        _ => None,
+    }
+}
+
+/// Map a reported mode string onto its `'static` spelling.
+fn mode_static(mode: &str) -> Option<&'static str> {
+    match mode {
+        "run" => Some("run"),
+        "compare" => Some("compare"),
+        "suite" => Some("suite"),
+        "merge" => Some("merge"),
+        _ => None,
+    }
+}
+
+/// The frozen term layout is keyed on `&'static str` report fields, so a `Deserialize`
+/// derive would add a `'de: 'static` bound (unusable with a borrowed JSON body). These two
+/// manual impls read an owned shape and validate the string fields back into their `'static`
+/// spellings instead.
+impl<'de> Deserialize<'de> for RuntimeReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<RuntimeReport, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            id: String,
+            available: bool,
+            #[serde(default)]
+            program: Option<String>,
+            #[serde(default)]
+            source: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let id = runtime_id_static(&raw.id)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown runtime id '{}'", raw.id)))?;
+        let source = match raw.source {
+            Some(source) => Some(runtime_source_static(&source).ok_or_else(|| {
+                serde::de::Error::custom(format!("unknown runtime source '{source}'"))
+            })?),
+            None => None,
+        };
+        Ok(RuntimeReport {
+            id,
+            available: raw.available,
+            program: raw.program,
+            source,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RunReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<RunReport, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            schema: String,
+            mode: String,
+            oracle: RuntimeReport,
+            rust: RuntimeReport,
+            summary: Summary,
+            #[serde(default)]
+            ratchet: Option<RatchetReport>,
+            cases: Vec<CaseReport>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.schema != SCHEMA {
+            return Err(serde::de::Error::custom(format!(
+                "unexpected report schema '{}', expected '{SCHEMA}'",
+                raw.schema
+            )));
+        }
+        let mode = mode_static(&raw.mode).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown report mode '{}'", raw.mode))
+        })?;
+        Ok(RunReport {
+            schema: SCHEMA,
+            mode,
+            oracle: raw.oracle,
+            rust: raw.rust,
+            summary: raw.summary,
+            ratchet: raw.ratchet,
+            by_contract: by_contract_summary(&raw.cases),
+            cases: raw.cases,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Contract {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Contract, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "A.1" => Ok(Contract::LanguageSemantics),
+            "A.2" => Ok(Contract::BeamAsm),
+            "A.3" => Ok(Contract::NifAbi),
+            "A.4" => Ok(Contract::DriverAbi),
+            "A.5" => Ok(Contract::Distribution),
+            "A.6" => Ok(Contract::Cli),
+            "A.7" => Ok(Contract::OtpApps),
+            "A.8" => Ok(Contract::Introspection),
+            "A.9" => Ok(Contract::Build),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown compatibility contract id '{other}'"
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Verdict {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Verdict, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "agree" => Ok(Verdict::Agree),
+            "mismatch" => Ok(Verdict::Mismatch),
+            "unsupported" => Ok(Verdict::Unsupported),
+            "skipped" => Ok(Verdict::Skipped),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown verdict '{other}'"
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FieldDiff {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<FieldDiff, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            field: String,
+            oracle: String,
+            rust: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(FieldDiff {
+            field: raw.field,
+            oracle: raw.oracle,
+            rust: raw.rust,
+        })
     }
 }
 

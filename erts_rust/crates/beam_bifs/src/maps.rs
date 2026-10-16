@@ -59,23 +59,35 @@
 //! installed they raise `unsupported_bif`, and a fun's own failures propagate
 //! verbatim.
 //!
-//! * `map(Fun, Map)` calls `Fun(Key, Value)` and stores the result — the keys are
-//!   unchanged, the values are the fun's results, in the map's stored order.
-//! * `fold(Fun, Init, Map)` is `Acc = Fun(Key, Value, Acc)`; `filter(Pred, Map)`
-//!   keeps the pairs whose predicate returns `true`; `foreach(Fun, Map)` is called
-//!   for its side effects and returns `ok`.
+//! Their second/third argument is a **map _or_ a `maps` iterator** (`MapOrIter` in
+//! `maps.erl`'s specs, `:836-846`, `:887-897`, `:932-944`): a map is walked in its
+//! **stored** order (`map_pairs_storage_order`), and any other value is walked as an
+//! iterator exactly as `maps:next/1` would. Both routes are the one
+//! [`walk_map_or_iter`], so `maps:fold(F, 0, maps:iterator(M, ordered))` —
+//! `beam_ssa_recv:plan_clears/2`'s shape — traverses exactly what `M` itself does.
+//!
+//! * `map(Fun, MapOrIter)` calls `Fun(Key, Value)` and stores the result — the keys
+//!   are unchanged, the values are the fun's results, in the map's stored order.
+//! * `fold(Fun, Init, MapOrIter)` is `Acc = Fun(Key, Value, Acc)`;
+//!   `filter(Pred, MapOrIter)` keeps the pairs whose predicate returns `true`;
+//!   `foreach(Fun, MapOrIter)` is called for its side effects and returns `ok`.
 //! * A predicate result that is not a `true`/`false` atom is the oracle's
 //!   `error:{case_clause, Value}` (see the structured-reason section below).
-//! * The traversal order is the map's **stored** order (`map_pairs_storage_order`),
-//!   so a `fold` that accumulates into a list sees the oracle's pair sequence.
+//! * The fun for pair *i* runs **before** the `next/1` that yields pair *i+1*
+//!   (`maps.erl:948`'s `[{K, Fun(K, V)} | map_1(Fun, try_next(Iter, Tag), Tag)]`), so
+//!   the fun sees the pairs before an abandoned walk and a `Fun` that raises aborts at
+//!   the oracle's own pair.
+//! * The atom `none` is a valid `MapOrIter` and simply holds no pair (`fold` answers
+//!   `Init`, `map`/`filter` `#{}`, `foreach` `ok`); `[]` is not (`error:{badmap, []}`).
 //!
 //! Every one of them first applies the oracle's `is_function(Fun, Arity)`
 //! clause-head guard ([`require_fun`]). `maps.erl`'s fallback clause raises the
 //! **plain atom** `badarg` — not the `function_clause` `lists.erl`'s guards raise —
 //! and the guard fires before the map argument is inspected or walked, so a non-fun
 //! (or a fun of the wrong arity) is `badarg` even for an empty map or a non-map
-//! second argument. A **valid** fun paired with a non-map argument is instead the
-//! structured `error:{badmap, Term}` from [`map_pairs`].
+//! second argument. A **valid** fun paired with an argument that is neither a map nor
+//! a walkable iterator is instead the structured `error:{badmap, Term}` from
+//! [`walk_map_or_iter`], naming the original argument.
 //!
 //! # Key identity is exact (`=:=`)
 //!
@@ -108,10 +120,11 @@
 //! `maps:iterator(Map)` is `[0 | Map]` — an improper cons whose head is the
 //! **path** into the map and whose tail is the map itself (`maps.erl:1062`) —
 //! *not* a `{Key, Value}` pair list. `maps:next(Iter)` returns the look-ahead form
-//! `{Key, Value, NextIter}`. `maps:to_list/1` accepts **either** a map (its stored
-//! order) **or** an iterator (the walk), and reports a bad iterator as the
-//! structured `error:{badmap, Iter}` (`maps.erl:531-543`). Oracle-pinned (OTP 29 /
-//! erts-17.1):
+//! `{Key, Value, NextIter}`. `maps:to_list/1` and the four `fun`-taking BIFs all
+//! accept **either** a map (its stored order) **or** an iterator (the walk) through
+//! the one [`walk_map_or_iter`], and report a bad iterator as the structured
+//! `error:{badmap, Iter}` naming the **original** argument (`maps.erl:531-543`,
+//! `:1326-1335`). Oracle-pinned (OTP 29 / erts-17.1):
 //!
 //! * `maps:iterator(#{a=>1,b=>2,c=>3})` ⇒ `[0 | #{a=>1,b=>2,c=>3}]`.
 //! * `maps:next([0 | #{c=>3,b=>2,a=>1}])` ⇒ `{c,3,{b,2,{a,1,none}}}` — a flat map's
@@ -193,6 +206,59 @@ fn map_pairs(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Vec<(Eterm, Eterm)
     access::map_pairs_storage_order(term)
 }
 
+/// Walks a **map _or_ a `maps` iterator** argument — the single traversal shared by
+/// the `fun`-taking BIFs and `maps:to_list/1`.
+///
+/// A bare map is walked in its **stored** order
+/// ([`crate::access::map_pairs_storage_order`]); every other `arg` is walked as an
+/// iterator through [`next_1`], exactly as `maps.erl` walks it (the `iter` clauses of
+/// `map/2`/`fold/3`/`filter/2`/`foreach/2`, `maps.erl:836-846`, `:887-897`,
+/// `:932-944`, and `to_list/1`'s own catch, `:531-543`). `step(key, value)` is called
+/// for the look-ahead pair **before** the `next_1` that yields the following pair —
+/// `maps.erl:948`'s `[{K, Fun(K, V)} | map_1(Fun, try_next(Iter, Tag), Tag)]` — so a
+/// walk cut short by a bad iterator has already applied `step` to the pairs before the
+/// failure, and a `step` failure aborts at the oracle's own pair. The walk terminates
+/// at the atom `none`.
+///
+/// # Errors
+///
+/// The oracle's structured `error:{badmap, Arg}` — naming the **original** argument,
+/// never the sub-iterator the failing `next/1` ran on (`maps.erl:1332-1335`'s
+/// `try_next/2` re-raised by the clause's `catch error:ErrorTag`) — for every way the
+/// argument fails to be a map or a walkable iterator: a `next_1` failure, or a
+/// look-ahead that is neither a `{Key, Value, Iter}` tuple nor `none`. `[]` is *not*
+/// an iterator (only `none` terminates). A failure of `step` itself (the fun's own
+/// error, or `filter/2`'s `{case_clause, Value}`) is propagated **unchanged**.
+fn walk_map_or_iter<S>(ctx: &mut BifContext<'_>, arg: Eterm, mut step: S) -> Result<()>
+where
+    S: FnMut(&mut BifContext<'_>, Eterm, Eterm) -> Result<()>,
+{
+    if access::is_map(arg) {
+        for (key, value) in access::map_pairs_storage_order(arg)? {
+            step(ctx, key, value)?;
+        }
+        return Ok(());
+    }
+    let mut cur = match next_1(ctx, &[arg]) {
+        Ok(cur) => cur,
+        Err(_) => return Err(structured_error(ctx, "badmap", &[arg])?),
+    };
+    loop {
+        if is_atom_named(ctx, cur, "none") {
+            return Ok(());
+        }
+        if !access::is_tuple(cur) || access::tuple_size(cur) != 3 {
+            return Err(structured_error(ctx, "badmap", &[arg])?);
+        }
+        let next_iter = access::tuple_element(cur, 2);
+        step(ctx, access::tuple_element(cur, 0), access::tuple_element(cur, 1))?;
+        cur = match next_1(ctx, &[next_iter]) {
+            Ok(cur) => cur,
+            Err(_) => return Err(structured_error(ctx, "badmap", &[arg])?),
+        };
+    }
+}
+
 /// Erlang's `is_list/1`: a cons cell **or** `NIL`.
 ///
 /// The raw [`crate::access::is_list`] mirrors erts' cons-only `is_list`, so the guard
@@ -245,15 +311,6 @@ fn build(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
     access::make_map(ctx.heap(), pairs)
 }
 
-/// Builds the proper list of `{Key, Value}` pair tuples for `pairs`.
-fn pair_list(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
-    let mut out = Vec::with_capacity(pairs.len());
-    for &(k, v) in pairs {
-        out.push(ctx.tuple(&[k, v])?);
-    }
-    ctx.list(&out)
-}
-
 /// Whether `term` is exactly the atom `name`.
 fn is_atom_named(ctx: &BifContext<'_>, term: Eterm, name: &str) -> bool {
     access::is_atom(term) && ctx.atoms().name(atom_val(term)) == Some(name)
@@ -292,6 +349,9 @@ fn from_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `maps:to_list/1` — the `{Key, Value}` pairs of a **map** (stored order) or of an
 /// **iterator** (the walk).
 ///
+/// Both routes are [`walk_map_or_iter`], so a map and its own `maps:iterator/1` yield
+/// the same list.
+///
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Iter}` when the argument is neither a map
@@ -301,37 +361,14 @@ fn from_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `maps:to_list({a,b,c})` ⇒ `error:{badmap,{a,b,c}}` (its third element `c` is not an
 /// iterator), `maps:to_list([])` ⇒ `error:{badmap,[]}`.
 fn to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let arg = args[0];
-    if access::is_map(arg) {
-        let pairs = access::map_pairs_storage_order(arg)?;
-        return pair_list(ctx, &pairs);
-    }
-    // Iterator path: `to_list_from_iterator(next(Iter))`.
-    let badmap = |ctx: &mut BifContext<'_>| structured_error(ctx, "badmap", &[arg]).map(Err);
     let mut acc: Vec<Eterm> = Vec::new();
-    let mut cur = match next_1(ctx, &[arg]) {
-        Ok(v) => v,
-        Err(_) => return badmap(ctx)?,
-    };
-    loop {
-        if is_atom_named(ctx, cur, "none") {
-            break;
-        }
-        if !(access::is_tuple(cur) && access::tuple_size(cur) == 3) {
-            return badmap(ctx)?;
-        }
-        let key = access::tuple_element(cur, 0);
-        let value = access::tuple_element(cur, 1);
-        let next_iter = access::tuple_element(cur, 2);
-        acc.push(ctx.tuple(&[key, value])?);
-        cur = match next_1(ctx, &[next_iter]) {
-            Ok(v) => v,
-            Err(_) => return badmap(ctx)?,
-        };
-    }
+    walk_map_or_iter(ctx, args[0], |ctx, key, value| {
+        let pair = ctx.tuple(&[key, value])?;
+        acc.push(pair);
+        Ok(())
+    })?;
     ctx.list(&acc)
 }
-
 /// `maps:get/2` and `erlang:map_get/2` — the value for `Key`.
 ///
 /// # Errors
@@ -844,83 +881,90 @@ fn require_fun(fun: Eterm, arity: u32) -> Result<()> {
     }
 }
 
-/// `maps:map(Fun, Map)` — `Fun(Key, Value)` supplies each value.
+/// `maps:map(Fun, MapOrIter)` — `Fun(Key, Value)` supplies each value.
 ///
 /// The keys and their order are unchanged; only the values are the fun's results.
 ///
 /// # Errors
 ///
 /// The plain `error:badarg` for a bad `Fun` ([`require_fun`]), the structured
-/// `error:{badmap, Map}` for a non-map second argument, or whatever `Fun` raises.
+/// `error:{badmap, MapOrIter}` for an argument that is neither a map nor a walkable
+/// iterator, or whatever `Fun` raises.
 fn map_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    // `map(Fun, Map) when is_map(Map), is_function(Fun, 2)` … else `badarg`.
+    // `map(Fun, Map) when is_map(Map), is_function(Fun, 2)` … else `badarg`, then the
+    // `map(Fun, Iter)` clause walks a non-map through `try_next/2`.
     require_fun(fun, 2)?;
-    let pairs = map_pairs(ctx, args[1])?;
-    let mut out: Vec<(Eterm, Eterm)> = Vec::with_capacity(pairs.len());
-    for (key, value) in pairs {
+    let mut out: Vec<(Eterm, Eterm)> = Vec::new();
+    walk_map_or_iter(ctx, args[1], |ctx, key, value| {
         let mapped = ctx.call_fun(fun, &[key, value])?;
         out.push((key, mapped));
-    }
+        Ok(())
+    })?;
     build(ctx, &out)
 }
 
-/// `maps:fold(Fun, Init, Map)` — `Acc = Fun(Key, Value, Acc)` over every pair.
+/// `maps:fold(Fun, Init, MapOrIter)` — `Acc = Fun(Key, Value, Acc)` over every pair.
 ///
 /// # Errors
 ///
 /// The plain `error:badarg` for a bad `Fun` ([`require_fun`]) — checked before
-/// `Init`/`Map` are looked at — the structured `error:{badmap, Map}` for a non-map
-/// third argument, or whatever `Fun` raises.
+/// `Init`/`MapOrIter` are looked at — the structured `error:{badmap, MapOrIter}` for
+/// an argument that is neither a map nor a walkable iterator, or whatever `Fun`
+/// raises.
 fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    // `fold(Fun, Init, Map) when is_map(Map), is_function(Fun, 3)` … else `badarg`.
+    // `fold(Fun, Init, Map) when is_map(Map), is_function(Fun, 3)` … else `badarg`,
+    // then the `fold(Fun, Init, Iter)` clause walks a non-map through `try_next/2`.
     require_fun(fun, 3)?;
     let mut acc = args[1];
-    let pairs = map_pairs(ctx, args[2])?;
-    for (key, value) in pairs {
+    walk_map_or_iter(ctx, args[2], |ctx, key, value| {
         acc = ctx.call_fun(fun, &[key, value, acc])?;
-    }
+        Ok(())
+    })?;
     Ok(acc)
 }
 
-/// `maps:filter(Pred, Map)` — the `{Key, Value}` pairs whose predicate is `true`.
+/// `maps:filter(Pred, MapOrIter)` — the `{Key, Value}` pairs whose predicate is `true`.
 ///
 /// # Errors
 ///
 /// The plain `error:badarg` for a bad `Pred` ([`require_fun`]), the structured
-/// `error:{badmap, Map}` for a non-map second argument, the structured
-/// `error:{case_clause, Value}` for a non-boolean predicate result, or whatever
-/// `Pred` raises.
+/// `error:{badmap, MapOrIter}` for an argument that is neither a map nor a walkable
+/// iterator, the structured `error:{case_clause, Value}` for a non-boolean predicate
+/// result, or whatever `Pred` raises.
 fn filter_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    // `filter(Pred, Map) when is_map(Map), is_function(Pred, 2)` … else `badarg`.
+    // `filter(Pred, Map) when is_map(Map), is_function(Pred, 2)` … else `badarg`,
+    // then the `filter(Pred, Iter)` clause walks a non-map through `try_next/2`.
     require_fun(fun, 2)?;
-    let pairs = map_pairs(ctx, args[1])?;
     let mut out: Vec<(Eterm, Eterm)> = Vec::new();
-    for (key, value) in pairs {
+    walk_map_or_iter(ctx, args[1], |ctx, key, value| {
         let result = ctx.call_fun(fun, &[key, value])?;
         if predicate_holds(ctx, result)? {
             out.push((key, value));
         }
-    }
+        Ok(())
+    })?;
     build(ctx, &out)
 }
 
-/// `maps:foreach(Fun, Map)` — `Fun(Key, Value)` for its side effects; `ok`.
+/// `maps:foreach(Fun, MapOrIter)` — `Fun(Key, Value)` for its side effects; `ok`.
 ///
 /// # Errors
 ///
 /// The plain `error:badarg` for a bad `Fun` ([`require_fun`]), the structured
-/// `error:{badmap, Map}` for a non-map second argument, or whatever `Fun` raises.
+/// `error:{badmap, MapOrIter}` for an argument that is neither a map nor a walkable
+/// iterator, or whatever `Fun` raises.
 fn foreach_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    // `foreach(Fun, Map) when is_map(Map), is_function(Fun, 2)` … else `badarg`.
+    // `foreach(Fun, Map) when is_map(Map), is_function(Fun, 2)` … else `badarg`, then
+    // the `foreach(Fun, Iter)` clause walks a non-map through `try_next/2`.
     require_fun(fun, 2)?;
-    let pairs = map_pairs(ctx, args[1])?;
-    for (key, value) in pairs {
+    walk_map_or_iter(ctx, args[1], |ctx, key, value| {
         ctx.call_fun(fun, &[key, value])?;
-    }
+        Ok(())
+    })?;
     ctx.ok()
 }
 

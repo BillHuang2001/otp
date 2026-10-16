@@ -291,6 +291,14 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("is_sticky", 1),
             ("is_sticky", 2),
             ("ensure_loaded", 1),
+            // `ensure_modules_loaded/1` is the list-taking sibling of `ensure_loaded/1`
+            // (`code.erl:1319-1358`), served from the same `code_ensure_modules_loaded` body
+            // (which shares `module_file` and `CodeServer::load` with `ensure_loaded/1`) — so it
+            // must be refused here too: entering its `code.erl` body reaches the *live*
+            // `code_server` process and its second, incoherent path store, and a list naming a
+            // module that is nowhere on that store crashes that server (`kernel_sup` SUPERVISOR
+            // REPORTs) where the oracle answers `{error,[{Name,nofile}]}`.
+            ("ensure_modules_loaded", 1),
             ("load_file", 1),
             ("lib_dir", 0),
             ("lib_dir", 1),
@@ -398,6 +406,7 @@ impl RuntimeContext<'_> {
             ("code", "is_sticky", 1) => Some(self.code_is_sticky_1(args)),
             ("code", "is_sticky", 2) => Some(self.code_is_sticky_2()),
             ("code", "ensure_loaded", 1) => Some(self.code_ensure_loaded(args)),
+            ("code", "ensure_modules_loaded", 1) => Some(self.code_ensure_modules_loaded(args)),
             ("code", "load_file", 1) => Some(self.code_load_file(args)),
             ("code", "lib_dir", 0) => Some(self.code_lib_dir_0()),
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),
@@ -1179,107 +1188,254 @@ mod tests {
         }
     }
 
-    /// **Drift guard for the `io` exception to the floor exclusion.**
+    /// The floor namespaces whose `try_native` arms name **single keys**, so [`floor_keys`]
+    /// enumerates exactly the keys the host owns and every unlisted name of the namespace stays
+    /// an enterable `.beam` body.
     ///
-    /// [`floor_shadows`] refuses a whole namespace for ten of the eleven floor modules but
-    /// `io` only for the keys the floor really serves (`io:put_chars/1,2`); every other
-    /// `io:*` must be entered in-machine, or a scheduled process's io-device `receive` folds
-    /// into the typed `blocked()` capability gap. This parses the `("io", "FUNC", ARITY)`
-    /// arms out of `try_native`'s own source and pins the exception against them, so adding
-    /// or removing a floor `io` arm without updating [`floor_shadows`] fails here rather than
-    /// silently mis-routing an `io:*` call.
-    #[test]
-    fn the_floor_shadows_io_exception_matches_the_floors_io_arms() {
+    /// A namespace belongs here only when the floor really owns an enumerated key set; a new
+    /// `try_native` arm for one of them must be reflected in [`floor_keys`], which the drift
+    /// guard above pins key by key.
+    const KEY_GRANULAR_NAMESPACES: [&str; 6] = [
+        "application",
+        "code",
+        "erl_distribution",
+        "init",
+        "io",
+        "prim_tty",
+    ];
+
+    /// The floor namespaces refused **wholesale** — `floor_keys(module)` is `None`, so
+    /// [`floor_shadows`] refuses every key of the namespace.
+    ///
+    /// Four of them (`erts_internal`, `prim_file`, `erl_ddll`, `erl_prim_loader`) are served
+    /// through a `("module", _, _)` wildcard whose per-function dispatch lives in the module's own
+    /// file; `erlang` carries too many explicit arms to mirror here; and `os`/`net_adm`/
+    /// `net_kernel` are NIF/BIF stub namespaces with nothing enterable in their `.beam`.
+    ///
+    /// A new `try_native` namespace must be classified in **one** of these two tables.
+    const MODULE_WIDE_NAMESPACES: [&str; 8] = [
+        "erl_ddll",
+        "erl_prim_loader",
+        "erlang",
+        "erts_internal",
+        "net_adm",
+        "net_kernel",
+        "os",
+        "prim_file",
+    ];
+
+    /// One `try_native` match arm, parsed out of the floor's own dispatch source.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FloorArm {
+        /// `("module", "function", arity)` — one owned key (a `|`-group expands to one of these
+        /// per function/arity combination).
+        Key(&'static str, &'static str, u32),
+        /// `("module", _, _)` — the per-function dispatch lives in that module's own file, so the
+        /// arm's key set cannot be read off the arm.
+        Wildcard(&'static str),
+    }
+
+    /// Parses [`RuntimeContext::try_native`]'s match arms out of this file's own source.
+    ///
+    /// The scan is deliberately **strict**: an arm line it cannot parse — a new arm shape, a
+    /// `|`-group written differently, a pattern continued on another line — **panics**, so the
+    /// drift guard below can never silently stop covering an arm.
+    fn try_native_arms() -> Vec<FloorArm> {
         let source = include_str!("native.rs");
-        let match_start = source
+        let start = source
             .find("fn try_native(")
             .expect("`try_native` is the floor's dispatch entry point");
-        let match_end = match_start
-            + source[match_start..]
+        let end = start
+            + source[start..]
                 .find("\n            _ => None,")
                 .expect("`try_native`'s match ends in the `_ => None` fall-through");
-        // Every `("io", "FUNC", ARITY)` arm, taken from the arm lines themselves.
-        let mut io_keys: Vec<(String, u32)> = source[match_start..match_end]
-            .lines()
-            .filter_map(|line| line.trim_start().strip_prefix("(\"io\", \""))
-            .filter_map(|rest| rest.split_once("\", "))
-            .map(|(function, tail)| {
-                let arity = tail
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .and_then(|digits| digits.parse::<u32>().ok())
-                    .unwrap_or_else(|| panic!("`io` arm `{function}` has no arity literal: {tail:?}"));
-                (function.to_string(), arity)
-            })
-            .collect();
-        io_keys.sort();
+        let mut arms = Vec::new();
+        for line in source[start..end].lines() {
+            if line.contains(") =>") && !line.trim_start().starts_with("(\"") {
+                panic!("`try_native` arm not understood (the pattern must start the line): {line:?}");
+            }
+            let Some(pattern) = line.trim_start().strip_prefix('(') else {
+                continue;
+            };
+            let Some((pattern, _)) = pattern.split_once(") =>") else {
+                panic!("`try_native` arm not understood (no `) =>` on its own line): {line:?}");
+            };
+            // The fields are `"module"`, `"function" | "function"` and `arity | arity`: the three
+            // fields are separated by `, ` (a comma and a space) and the in-group separator is
+            // ` | `, so no atom/function name may contain either. The surrounding `"`s are
+            // stripped from each piece below.
+            let fields: Vec<&'static str> = pattern.split(", ").collect();
+            assert_eq!(
+                fields.len(),
+                3,
+                "`try_native` arm with an unexpected pattern shape: {line:?}"
+            );
+            let module = fields[0].trim_matches('"');
+            match (fields[1], fields[2]) {
+                ("_", "_") => arms.push(FloorArm::Wildcard(module)),
+                ("_", _) | (_, "_") => {
+                    panic!("`try_native` arm mixes a wildcard and a literal key: {line:?}")
+                }
+                (functions, arities) => {
+                    for function in functions.split(" | ").map(|f| f.trim_matches('"')) {
+                        for arity in arities.split(" | ") {
+                            let arity: u32 = arity.parse().unwrap_or_else(|_| {
+                                panic!("`try_native` arm has a non-numeric arity: {line:?}")
+                            });
+                            arms.push(FloorArm::Key(module, function, arity));
+                        }
+                    }
+                }
+            }
+        }
         assert!(
-            !io_keys.is_empty(),
-            "the arm scan found no `io` arms — the source layout changed"
+            !arms.is_empty(),
+            "the arm scan found no arms — the source layout changed"
         );
-        assert_eq!(
-            io_keys,
-            vec![
-                ("format".to_string(), 3),
-                ("fwrite".to_string(), 1),
-                ("fwrite".to_string(), 2),
-                ("fwrite".to_string(), 3),
-                ("nl".to_string(), 0),
-                ("nl".to_string(), 1),
-                ("put_chars".to_string(), 1),
-                ("put_chars".to_string(), 2),
-                ("write".to_string(), 1),
-                ("write".to_string(), 2),
-            ],
-            "the floor serves the `io` device surface for the `io` namespace — `floor_shadows` \
-             must be updated alongside any new/removed floor `io` arm"
-        );
-        // The floor's `io` keys are refused ...
-        for (function, arity) in &io_keys {
-            assert!(
-                floor_shadows("io", function, *arity),
-                "the floor owns `io:{function}/{arity}`, so `floor_shadows` must refuse it"
-            );
+        arms
+    }
+
+    /// **Drift guard for the cross-module-call seam's key-granular exclusion.**
+    ///
+    /// [`floor_shadows`] decides whether
+    /// [`RuntimeContext::resolve_external_call`](crate::context::RuntimeContext) must refuse to
+    /// enter `(module, function, arity)` **in-machine**. Both failure directions are pinned here,
+    /// against `try_native`'s own source and the two namespace tables above:
+    ///
+    /// * **A served key the shadow is missing** — the miss this guard was generalised for: a
+    ///   `try_native` arm in a key-granular namespace that [`floor_keys`] does not list is entered
+    ///   as the module's `.beam` body *instead of* the host implementation. For
+    ///   `code:ensure_modules_loaded/1` that body talks to the **live** `code_server` process and
+    ///   its second path store, where a module that is nowhere on that store crashes the server
+    ///   (2× `kernel_sup` SUPERVISOR REPORT + `badarg`, exit 1) while the oracle answers
+    ///   `{error,[{Name,nofile}]}`.
+    /// * **A listed key with no arm** — a [`floor_keys`] entry `try_native` does not serve would
+    ///   be refused and then never answered on the `call_bif` path.
+    ///
+    /// Every namespace `try_native` serves must therefore be classified in exactly one of
+    /// [`KEY_GRANULAR_NAMESPACES`] and [`MODULE_WIDE_NAMESPACES`], and every key-granular
+    /// namespace's [`floor_keys`] list must be **exactly** its parsed arm keys. A new `try_native`
+    /// arm, or a new floor namespace, must be reflected in those tables (and, for a key-granular
+    /// one, in [`floor_keys`]) — the guard is loud, never silently skippable.
+    ///
+    /// `prim_tty` is the one key-granular namespace whose arm is a `_, _` wildcard, so its key set
+    /// is checked against `floor_shadows` rather than against the parsed arms (its
+    /// [`prim_tty::NIF_KEYS`] list is the curated `-nifs` surface).
+    #[test]
+    fn every_floor_arm_key_is_refused_and_every_key_granular_list_is_exact() {
+        let arms = try_native_arms();
+        // The keys of `module`'s explicit arms, sorted and deduplicated.
+        let arm_keys = |module: &str| -> Vec<(&'static str, u32)> {
+            let mut keys: Vec<(&'static str, u32)> = arms
+                .iter()
+                .filter_map(|arm| match arm {
+                    FloorArm::Key(name, function, arity) if *name == module => {
+                        Some((*function, *arity))
+                    }
+                    _ => None,
+                })
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        };
+        let has_wildcard_arm = |module: &str| {
+            arms.iter()
+                .any(|arm| matches!(arm, FloorArm::Wildcard(name) if *name == module))
+        };
+        // (1) Every arm that names a single key must be refused by `floor_shadows` — otherwise
+        //     the seam enters that module's `.beam` body instead of the host implementation.
+        for arm in &arms {
+            if let FloorArm::Key(module, function, arity) = arm {
+                assert!(
+                    floor_shadows(module, function, *arity),
+                    "`try_native` serves `{module}:{function}/{arity}` but `floor_shadows` would \
+                     let the call be entered in-machine as that module's `.beam` body"
+                );
+            }
         }
-        // ... and every other `io` key is entered in-machine.
-        for (function, arity) in [
-            ("getopts", 1u32),
-            ("setopts", 2),
-            ("request", 2),
-            ("scan_erl_form", 4),
-            ("format", 2),
-        ] {
-            assert!(
-                !floor_shadows("io", function, arity),
-                "`io:{function}/{arity}` is a real `io.erl` body, not a floor key: \
-                 `floor_shadows` must let it be entered in-machine"
-            );
-        }
-        // A namespace whose floor arms name single keys stays **key-granular**: every
-        // listed key is refused and an unlisted one is entered in-machine. Every other
-        // namespace stays refused wholesale.
+
+        // (2) Every namespace the floor serves is classified, and the classification agrees with
+        //     `floor_keys`: a key-granular namespace owns exactly its listed keys, a module-wide
+        //     one owns every key.
         for module in FLOOR_MODULES {
-            match floor_keys(module) {
-                Some(keys) => {
+            let granular = KEY_GRANULAR_NAMESPACES.contains(&module);
+            let wide = MODULE_WIDE_NAMESPACES.contains(&module);
+            assert!(
+                granular ^ wide,
+                "`{module}` must be classified in exactly one of `KEY_GRANULAR_NAMESPACES` and \
+                 `MODULE_WIDE_NAMESPACES`"
+            );
+            let unlisted = "definitely_not_a_floor_key_xyz";
+            match (granular, floor_keys(module)) {
+                (true, Some(keys)) => {
                     for (function, arity) in keys {
                         assert!(
                             floor_shadows(module, function, *arity),
-                            "the floor owns `{module}:{function}/{arity}`"
+                            "the floor owns `{module}:{function}/{arity}`, so `floor_shadows` \
+                             must refuse it"
                         );
                     }
                     assert!(
-                        !floor_shadows(module, "anything", 9),
-                        "`{module}` is key-granular: an unlisted key must be entered in-machine"
+                        !floor_shadows(module, unlisted, 9),
+                        "`{module}` is key-granular: an unlisted key is a real `{module}.erl` \
+                         body and must be entered in-machine"
                     );
+                    let mut listed = keys.to_vec();
+                    listed.sort_unstable();
+                    listed.dedup();
+                    let parsed = arm_keys(module);
+                    if has_wildcard_arm(module) {
+                        // `prim_tty`: the arm dispatches per function into `prim_tty_call`, so
+                        // `NIF_KEYS` — not the arms — is the curated key set.
+                        assert!(
+                            parsed.is_empty(),
+                            "`{module}` has both a `_, _` wildcard arm and explicit arms"
+                        );
+                    } else {
+                        assert_eq!(
+                            parsed, listed,
+                            "`floor_keys(\"{module}\")` must enumerate exactly the keys \
+                             `try_native` serves for it — a new arm must be added there, or the \
+                             call is entered in-machine as the module's `.beam` body"
+                        );
+                    }
                 }
-                None => assert!(
-                    floor_shadows(module, "anything", 9),
-                    "`{module}` is a floor namespace: every key must be refused"
+                (true, None) => panic!(
+                    "`{module}` is key-granular in this guard but `floor_keys` refuses the whole \
+                     namespace"
                 ),
+                (false, Some(_)) => panic!(
+                    "`{module}` is module-wide in this guard but `floor_keys` enumerates keys — a \
+                     wildcard-served namespace must make `floor_keys` answer `None`"
+                ),
+                (false, None) => {
+                    assert!(
+                        floor_shadows(module, unlisted, 9),
+                        "`{module}` is a module-wide floor namespace: `floor_shadows` must refuse \
+                         every key, not only the floor's own arms"
+                    );
+                    assert!(
+                        has_wildcard_arm(module) || !arm_keys(module).is_empty(),
+                        "`{module}` is classified module-wide but `try_native` has no arm for it"
+                    );
+                    for (function, arity) in arm_keys(module) {
+                        assert!(
+                            floor_shadows(module, function, arity),
+                            "the floor owns `{module}:{function}/{arity}`"
+                        );
+                    }
+                }
             }
         }
+        // (3) ... and the two tables together name only real floor namespaces.
+        for module in KEY_GRANULAR_NAMESPACES.iter().chain(&MODULE_WIDE_NAMESPACES) {
+            assert!(
+                FLOOR_MODULES.contains(module),
+                "`{module}` is classified here but is not a `FLOOR_MODULES` namespace"
+            );
+        }
     }
-
     /// A tuple built on the runtime's term arena (the `halt/2` argument shape).
     fn tuple(runtime: &mut crate::runtime::Runtime, elements: &[Eterm]) -> Eterm {
         let mut sink = beam_bifs::NullSink;

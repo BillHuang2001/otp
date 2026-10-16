@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use beam_common::{BeamError, ExceptionClass, ExitReason};
 use beam_engine::context::RootSet;
@@ -42,7 +43,8 @@ use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::run::{
-    publish_parked_roots, registered_payload_total, reset_registered_payload_total, RuntimeRunner,
+    publish_parked_roots, registered_payload_total, reset_registered_payload_total,
+    reset_run_slice_counters, run_slice_counters, RuntimeRunner,
 };
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
 use crate::context::RuntimeContext;
@@ -2450,8 +2452,8 @@ fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
 /// **The live-FR window exemption is per slice: a `Yield` window opens it, the next slice entry
 /// clears it, and nothing is ever pinned.**
 ///
-/// This is the defect's regression pin. The pre-slice guard used to be a **runtime-level,
-/// permanent** pin (`Runtime::pin_process`), so the first slice that ended with a live FR prefix
+/// This is the defect's regression pin. The pre-slice guard used to mark the pid **permanently**
+/// un-collectable at the runtime level, so the first slice that ended with a live FR prefix
 /// made `Runtime::gc_process_enabled` answer `false` for the rest of the process's life and
 /// `Runtime::gc_stats().pinned` never came back down. The window exemption is scoped instead:
 /// a slice that ends with `fr_mark() > 0` marks the pid relocation-exempt for the window that
@@ -2460,7 +2462,7 @@ fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
 /// observable from outside a slice (`is_relocation_exempt` is only readable *between* slices,
 /// where a live FR prefix re-opens the exemption); its **effect** — a float-using loop collecting
 /// *more* as N grows instead of plateauing — is the property pinned in `tests/gc_collect.rs` and
-/// `../context/tests.rs`, and it is impossible while the pid is permanently pinned.
+/// `../context/tests.rs`, and it is impossible while the pid carries a permanent un-collectable mark.
 ///
 /// `preempt:spin/1` is the non-allocating tail loop: a tiny budget pre-empts it
 /// (`ProcOutcome::Yield`) so the slice ends while the process is still runnable — the *only* park
@@ -2678,4 +2680,310 @@ fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
         .get_fr(0)
         .expect("slot 0 is in the FR file");
     assert_tuple_relocated(resumed, original, [7, 8], "the published FR slot");
+}
+
+// -- deterministic per-call counters on a growth-shaped workload -----------
+//
+// The `foreign` benchmark's `emqx_base62:encode` sub-case is recorded as **3.2×–3.8× dearer**
+// on the current binary than on the m10 one, and the excess is **N-dependent** (it rises with
+// the loop count). This host is shared and loaded, so wall-clock cannot decide whether that is
+// a real per-call work increase or a measurement artefact: only **deterministic counters** can.
+//
+// The counters below are all structural facts of the runner / runtime, never timings:
+//
+// * the runner's own slice/park accounting (`RUN_SLICE_COUNTERS`, a per-thread mirror of
+//   `REGISTERED_PAYLOAD_TOTAL`);
+// * the runtime's GC accounting (`Runtime::gc_stats()`);
+// * the process's own nursery geometry (`Process::collection_debt` /
+//   `AnyCollector::young_space_count` / `mature_capacity_words` / `mature_used_words`), sampled
+//   at every slice boundary — the only window a live process's collector is readable from
+//   outside the runner, and therefore the reason each measured workload's iteration counts are
+//   chosen so that **every** run spans several slices.
+//
+// The question they answer is exactly the one the regression raises: **does the per-call work
+// grow with N** (collections/call, slices/call), or is it flat? A flat per-call counter with a
+// rising wall clock is a measurement artefact; a counter that grows with N is the real signal.
+
+/// The allocate-and-abandon **churn** fixture: `run(N)` builds a 256-element list, binary and
+/// tuple per iteration (abandoning each), asserts the two `O(1)`-checkable ones and returns `N`.
+///
+/// It is the closest existing fixture to the `foreign` `emqx_base62:encode` loop — a constant
+/// live set with one allocation-heavy call per iteration — and every binary/tuple it keeps comes
+/// from a **registered BIF** (`list_to_binary/1`, `list_to_tuple/1`), so it drives the
+/// BIF-result copy-out path (`RuntimeContext::move_result_into_process_heap`, whose retry grows
+/// the nursery through the no-relocation [`Process::grow_nursery`]).
+fn churn_fixture() -> &'static str {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/churn.beam")
+}
+
+/// The **growth** fixture: `run(N)` repeats a single 401-word `test_heap` allocation N times,
+/// discarding each tuple — an engine-native growth shape with no BIF-result copy-out at all.
+fn heap_growth_fixture() -> &'static str {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/heap_growth.beam")
+}
+
+/// A generous wall-clock safety net for one measured run (the loops are pure interpreter work
+/// and finish well inside it; this only bounds a pathological hang, it is never measured).
+const COUNTER_RUN_DEADLINE: Duration = Duration::from_secs(300);
+
+/// The **deterministic** cost of one scheduled run of a growth-shaped workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrowthCounters {
+    /// The loop's returned value (it must equal the iteration count `N`).
+    value: i64,
+    /// `RuntimeRunner::run` calls — one reduction slice each.
+    slices: usize,
+    /// Slices that ended at the `Yield` (reduction-budget pre-emption) arm.
+    yields: usize,
+    /// Slices that ended at the `receive` `Wait` arm.
+    waits: usize,
+    /// Process-heap collections the runtime ran during this run.
+    collections: u64,
+    /// How many of [`GrowthCounters::collections`] were fullsweeps.
+    major: u64,
+    /// Engine allocations that fell back to the pointer-stable arena.
+    fallbacks: u64,
+    /// Collections that failed.
+    errors: u64,
+    /// The largest retired-nursery chain length observed at a slice boundary.
+    peak_young_spaces: usize,
+    /// The largest young-nursery capacity (words) observed at a slice boundary.
+    peak_young_capacity: usize,
+    /// The largest mature-generation capacity (words) observed at a slice boundary.
+    peak_mature_capacity: usize,
+    /// The largest mature-generation occupancy (words) observed at a slice boundary.
+    peak_mature_used: usize,
+    /// How many slice boundaries observed an un-settled collection debt.
+    debt_boundaries: usize,
+}
+
+/// Runs `module:run/1` with argument `n` as a **scheduled process** on `rt`, counting every
+/// deterministic counter the runner and the runtime expose.
+///
+/// The nursery geometry is sampled at every slice boundary (between `run_one_slice` calls),
+/// which is the only window a process's collector is readable from outside: a terminated
+/// process is removed from the table, so the peak over the run can only be observed *during* it.
+fn run_growth_counted(rt: &mut Runtime, module: &str, n: i64) -> GrowthCounters {
+    let before = rt.gc_stats();
+    reset_run_slice_counters();
+    let pid = rt
+        .spawn_process(module, "run", vec![make_small(n)])
+        .unwrap_or_else(|err| panic!("{module}:run/1 must spawn: {err}"));
+    let mut peak_young_spaces = 0usize;
+    let mut peak_young_capacity = 0usize;
+    let mut peak_mature_capacity = 0usize;
+    let mut peak_mature_used = 0usize;
+    let mut debt_boundaries = 0usize;
+    let deadline = Instant::now() + COUNTER_RUN_DEADLINE;
+    while rt.process_result(pid).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "{module}:run/1 with N={n} did not terminate within {}s",
+            COUNTER_RUN_DEADLINE.as_secs()
+        );
+        rt.run_one_slice().expect("a scheduler slice runs");
+        if let Some(process) = rt.processes().get(pid) {
+            let collector = process.collector();
+            peak_young_spaces = peak_young_spaces.max(collector.young_space_count());
+            peak_young_capacity = peak_young_capacity.max(collector.young().capacity_words());
+            peak_mature_capacity = peak_mature_capacity.max(collector.mature_capacity_words());
+            peak_mature_used = peak_mature_used.max(collector.mature_used_words());
+            if process.collection_debt() {
+                debt_boundaries += 1;
+            }
+        }
+    }
+    let counters = run_slice_counters();
+    let after = rt.gc_stats();
+    GrowthCounters {
+        value: signed_value(rt.process_result(pid).expect("the loop returned a value")),
+        slices: counters.slices,
+        yields: counters.yields,
+        waits: counters.waits,
+        collections: after.collections - before.collections,
+        major: after.major - before.major,
+        fallbacks: after.fallbacks - before.fallbacks,
+        errors: after.errors - before.errors,
+        peak_young_spaces,
+        peak_young_capacity,
+        peak_mature_capacity,
+        peak_mature_used,
+        debt_boundaries,
+    }
+}
+
+/// A fresh runtime with `fixture` loaded into its code server, ready to `spawn_process` from.
+///
+/// The runtime is **booted and drained** before it is handed back: `Runtime::spawn_process`
+/// boots on demand (`Runtime::boot_if_needed`), and the boot script's own processes would
+/// otherwise contend with the measured loop for slices — so the measurement must start from a
+/// quiescent run queue. The drain runs boundedly until the queue is empty (the booted
+/// `{kernelProcess,…}` servers are `Waiting`, so the first empty pass ends it).
+fn growth_runtime(fixture: &str) -> Runtime {
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.boot().expect("the boot sequence runs");
+    let mut guard = 0u32;
+    while rt.run_one_slice().expect("a boot-drain slice runs") > 0 {
+        guard += 1;
+        assert!(guard < 100_000, "the boot process tree never quiesced");
+    }
+    rt.load_module(fixture).expect("the growth fixture loads");
+    rt
+}
+
+/// Runs one growth-shaped workload at three increasing iteration counts and prints the counter
+/// table; every counter is reported so a caller can read it without the test source.
+fn counter_table(fixture: &str, module: &str, counts: [i64; 3]) -> [(i64, GrowthCounters); 3] {
+    let rows = counts.map(|n| {
+        let mut rt = growth_runtime(fixture);
+        let row = run_growth_counted(&mut rt, module, n);
+        assert_eq!(row.value, n, "{module}:run({n}) must return its argument");
+        assert_eq!(row.errors, 0, "no collection may fail: N={n} {row:?}");
+        assert_eq!(row.waits, 0, "{module}:run/1 never parks in a receive: {row:?}");
+        (n, row)
+    });
+    eprintln!(
+        "counter_table {module} (N : slices yields waits collections major fallbacks \
+         peak_spaces peak_cap peak_mature_cap peak_mature_used debt_bounds | \
+         slices/call collections/call)"
+    );
+    for (n, row) in &rows {
+        let calls = (*n as f64) + 1.0;
+        eprintln!(
+            "counter_table {module} N={n} : slices={} yields={} waits={} collections={} \
+             major={} fallbacks={} peak_spaces={} peak_cap={} peak_mature_cap={} \
+             peak_mature_used={} debt_bounds={} | \
+             slices/call={:.6} collections/call={:.6}",
+            row.slices,
+            row.yields,
+            row.waits,
+            row.collections,
+            row.major,
+            row.fallbacks,
+            row.peak_young_spaces,
+            row.peak_young_capacity,
+            row.peak_mature_capacity,
+            row.peak_mature_used,
+            row.debt_boundaries,
+            row.slices as f64 / calls,
+            row.collections as f64 / calls,
+        );
+    }
+    rows
+}
+
+/// **The headline evidence: on a growth-shaped workload the per-call counters are FLAT in N.**
+///
+/// `churn:run/1` is driven at three increasing iteration counts on a fresh runtime each time, so
+/// its counters are per-run. The `foreign` regression claims the per-call cost *grows* with N;
+/// if that were a real per-call work increase rather than a measurement artefact, then at least
+/// one of these deterministic counters — collections per call, or slices per call — would grow
+/// with N too. This test pins the truth for the churn shape: both stay flat, so on this shape
+/// the excess wall clock is **not** extra per-call GC/runner work.
+#[test]
+fn the_churn_workloads_per_call_counters_are_flat_in_n() {
+    let rows = counter_table(churn_fixture(), "churn", [2_000, 10_000, 40_000]);
+    let [(n1, r1), (_, r2), (n3, r3)] = rows;
+
+    // The collector really ran (the loop is allocation-heavy), so a flat ratio is a measured
+    // fact, not the vacuous "nothing happens" of a declined collection.
+    assert!(r1.collections > 0, "churn must collect: {r1:?}");
+    assert!(r3.collections > r1.collections, "more iterations ⇒ more collections: {r3:?}");
+
+    // The per-call ratios must be flat: the widest run's per-call counters may not exceed the
+    // narrowest's by more than a small slack (the nursery grows once at the start, which is a
+    // fixed cost amortized away by the wider run — so the ratio only ever *falls*).
+    let collections_per_call_ratio =
+        (r3.collections as f64 / (n3 + 1) as f64) / (r1.collections as f64 / (n1 + 1) as f64);
+    assert!(
+        collections_per_call_ratio <= 1.5,
+        "collections/call must not grow with N (it is flat or falling): \
+         N={n1} {:.6}/call, N={n3} {:.6}/call, ratio {collections_per_call_ratio:.3}",
+        r1.collections as f64 / (n1 + 1) as f64,
+        r3.collections as f64 / (n3 + 1) as f64,
+    );
+    let slices_per_call_ratio =
+        (r3.slices as f64 / (n3 + 1) as f64) / (r1.slices as f64 / (n1 + 1) as f64);
+    assert!(
+        slices_per_call_ratio <= 1.5,
+        "slices/call must not grow with N (it is flat or falling): \
+         N={n1} {:.6}/call, N={n3} {:.6}/call, ratio {slices_per_call_ratio:.3}",
+        r1.slices as f64 / (n1 + 1) as f64,
+        r3.slices as f64 / (n3 + 1) as f64,
+    );
+    // The second run's ratios must sit between the two (no non-monotonic blow-up either).
+    let mid = r2.collections as f64 / (10_000 + 1) as f64;
+    assert!(
+        mid <= 1.5 * r1.collections as f64 / (n1 + 1) as f64,
+        "the middle N must not blow up either: {mid:.6}/call"
+    );
+}
+
+/// **The mechanism control: the engine-native growth shape enters the nursery-growth path and
+/// still has flat per-call counters.**
+///
+/// `heap_growth:run/1` repeats a single 401-word `test_heap` allocation — far above a fresh
+/// process's nursery — so it *must* reach the engine's full heap-admission door
+/// (`RuntimeContext::ensure_heap_full` → `Context::collect_or_grow`) on **every** iteration,
+/// with **no** registered-BIF result copy-out involved. That makes it the control for the
+/// `churn` shape: `churn` drives the BIF-result copy path, `heap_growth` drives the pure
+/// engine-allocation growth path, and if the collection-debt / retired-nursery mechanism were
+/// the source of an N-dependent per-call cost, this shape is where it would show.
+///
+/// Its iteration counts are chosen so that **every** run spans several reduction slices (the
+/// only window a live process's collector is readable from outside the runner), unlike a small
+/// run that the native baseline tier completes inside a single slice.
+///
+/// The test pins three structural facts:
+///
+/// * **every iteration reaches the collection/growth door** (`collections >= N`), so the
+///   mechanism is genuinely exercised — not declined away;
+/// * **the retired-nursery chain really grows** (`peak_young_spaces >= 2`), so the
+///   no-relocation growth seam (`Process::grow_nursery`) and its collection debt are live;
+/// * the per-call counters nonetheless stay flat in N (`collections/call` and `slices/call`
+///   ratios bounded), so the per-call work is constant on this shape too.
+#[test]
+fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
+    const COUNTS: [i64; 3] = [10_000, 25_000, 50_000];
+    let rows = counter_table(heap_growth_fixture(), "heap_growth", COUNTS);
+    let [(n1, r1), (_, r2), (n3, r3)] = rows;
+
+    // The 401-word request cannot fit a fresh nursery: the growth/collection door is reached
+    // once per iteration (or more), and the no-relocation growth seam retires the space it
+    // replaces, so the retired chain is longer than one space.
+    assert!(
+        r1.collections >= n1 as u64,
+        "every iteration must reach the collection door: N={n1} collections={}: {r1:?}",
+        r1.collections
+    );
+    assert!(r3.collections > r1.collections, "more iterations ⇒ more collections: {r3:?}");
+    assert!(
+        r1.peak_young_spaces >= 2,
+        "the growth shape must retire a nursery (peak_young_spaces={}): {r1:?}",
+        r1.peak_young_spaces
+    );
+
+    let collections_per_call_ratio =
+        (r3.collections as f64 / (n3 + 1) as f64) / (r1.collections as f64 / (n1 + 1) as f64);
+    assert!(
+        collections_per_call_ratio <= 1.5,
+        "collections/call must not grow with N: N={n1} {:.6}/call, N={n3} {:.6}/call, ratio \
+         {collections_per_call_ratio:.3}",
+        r1.collections as f64 / (n1 + 1) as f64,
+        r3.collections as f64 / (n3 + 1) as f64,
+    );
+    let slices_per_call_ratio =
+        (r3.slices as f64 / (n3 + 1) as f64) / (r1.slices as f64 / (n1 + 1) as f64);
+    assert!(
+        slices_per_call_ratio <= 1.5,
+        "slices/call must not grow with N: N={n1} {:.6}/call, N={n3} {:.6}/call, ratio \
+         {slices_per_call_ratio:.3}",
+        r1.slices as f64 / (n1 + 1) as f64,
+        r3.slices as f64 / (n3 + 1) as f64,
+    );
+    let mid = r2.collections as f64 / (25_000 + 1) as f64;
+    assert!(
+        mid <= 1.5 * r1.collections as f64 / (n1 + 1) as f64,
+        "the middle N must not blow up either: {mid:.6}/call"
+    );
 }

@@ -58,24 +58,36 @@
 //!   the allocator's live-range statistics — candidate-register count and the selected
 //!   intervals' total/max length — and native byte length).
 //!
-//! # One run, both register-cache models
+//! # One run, three register-cache spill models (and two fill models)
 //!
-//! Both directions of the cache are now **partial** — `spill` stores the block's
-//! **written** set (`Allocation::written`, a subset of the cache) and `fill` reloads
-//! the registers the continuation can still observe (`Allocation::fill_slots`, its
-//! block-local liveness unioned with the write set) — so a single measured run has to
-//! yield *both* the count that model produces **and** the count the previous
-//! full-cache model would have produced. Each `record_*` sees only its own partial
-//! count (that is all `spill`/`fill` know per call), so it records the **new** count and
-//! queues the site; [`record_block`] — which is handed the whole `Allocation` — then
-//! attributes `cache_size` to each of the block's queued sites. From one run:
+//! Both directions of the cache are **partial** — `spill` stores a subset of the block's
+//! cache and `fill` reloads the registers the continuation can still observe
+//! (`Allocation::fill_slots`, its block-local liveness unioned with the write set) — so a
+//! single measured run has to yield *every* model's count at once. Each `record_*` sees
+//! only the count it was handed (that is all `spill`/`fill` know per call), so it records
+//! that count and queues the site; [`record_block`] — which is handed the whole
+//! `Allocation` — then attributes the two models only the block can see to each of the
+//! block's queued sites. From one run, **three** spill models:
 //!
-//! * **new** spill stores `= Σ_sites written.len()` = [`Counters::spill_stores`];
-//! * **old** (full-cache) spill stores `= Σ_sites slots.len()` =
+//! * **dirty-set** `= Σ_sites spill_slots_at(pc).len()` = [`Counters::spill_stores`] — the
+//!   cached registers **dirty at the site's own pc** ([`Allocation::spill_slots_at`], the
+//!   forward dirty walk [`super::emit::regalloc`] computes into `Allocation::spill_sets`),
+//!   which is what [`spill`](super::emit::regs::spill) actually stores. An **empty**
+//!   `spill_sets` table (a synthetic `Allocation` a unit test built directly) falls back
+//!   to the whole [`Allocation::written`] set.
+//! * **written-set** `= Σ_sites written.len()` = [`Counters::spill_stores_written`] — the
+//!   whole-block model [`record_block`] derives: every cache register the block may have
+//!   written ([`Allocation::written`], a subset of the cache), which still counts a cached
+//!   register the block wrote and then left holding its old `machine.x` value. The
+//!   redundant ("clean") stores the dirty set removes are exactly
+//!   `spill_stores_written − spill_stores`.
+//! * **full-cache** (the model before the partial spill) `= Σ_sites slots.len()` =
 //!   [`Counters::spill_stores_full`];
-//! * **new** fill loads `= Σ_sites fill_slots(pc).len()` = [`Counters::fill_registers`];
-//! * **old** (full-cache) fill loads `= Σ_sites slots.len()` =
-//!   [`Counters::fill_registers_full`].
+//!
+//! and **two** fill models:
+//!
+//! * **liveness** `= Σ_sites fill_slots(pc).len()` = [`Counters::fill_registers`];
+//! * **full-cache** `= Σ_sites slots.len()` = [`Counters::fill_registers_full`].
 //!
 //! # Two-phase use (timing vs counting)
 //!
@@ -99,8 +111,10 @@ thread_local! {
     /// This thread's counter block.
     static COUNTERS: RefCell<Counters> = RefCell::new(Counters::default());
     /// The spill sites emitted since the last [`record_block`], so the block that
-    /// emitted them can attribute the **old** (full-cache) store count it alone can
-    /// see (it owns the cache size). Drained by [`record_block`].
+    /// emitted them can attribute the two models it alone can see to them — the
+    /// **written-set** store count (Σ `written.len()`) and the **full-cache** store count
+    /// (Σ `slots.len()`), both of which need the block's `Allocation`. Drained by
+    /// [`record_block`].
     static PENDING_SPILLS: RefCell<Vec<SpillSite>> = const { RefCell::new(Vec::new()) };
     /// The fill sites emitted since the last [`record_block`] — the same trick as
     /// [`PENDING_SPILLS`], for the **full-cache** reload count the previous `fill` model
@@ -203,13 +217,26 @@ pub(crate) struct Counters {
     pub(crate) blocks_by_cache_slots: BTreeMap<u64, u64>,
     /// Spill sites by kind ([`SpillSite`]) — the number of `spill` calls.
     pub(crate) spill_calls_by_site: BTreeMap<SpillSite, u64>,
-    /// Spill **stores** by kind under the written-set model: Σ `written.len()`.
+    /// Spill **stores** by kind under the **dirty-set** model
+    /// (Σ `spill_slots_at(pc).len()`): the cached registers **dirty at the site's own pc**,
+    /// the count [`record_spill`] was handed for the stores
+    /// [`spill`](super::emit::regs::spill) emits.
     pub(crate) spill_stores_by_site: BTreeMap<SpillSite, u64>,
-    /// Spill **stores** by kind under the previous full-cache model: Σ `slots.len()`.
+    /// Spill **stores** by kind under the **written-set** model (Σ `written.len()`).
+    pub(crate) spill_stores_written_by_site: BTreeMap<SpillSite, u64>,
+    /// Spill **stores** by kind under the **full-cache** model: Σ `slots.len()`.
     pub(crate) spill_stores_by_site_full: BTreeMap<SpillSite, u64>,
-    /// Total spill stores under the written-set model (Σ `written.len()`).
+    /// Total spill stores under the **dirty-set** model (Σ `spill_slots_at(pc).len()`, the
+    /// counts [`spill`](super::emit::regs::spill) hands [`record_spill`]): the cached
+    /// registers **dirty at each site's own pc**. The empty-`spill_sets`-table fallback is
+    /// the whole [`Allocation::written`] set.
     pub(crate) spill_stores: u64,
-    /// Total spill stores under the previous full-cache model (Σ `slots.len()`).
+    /// Total spill stores under the whole-block **written-set** model (Σ
+    /// `allocation.written.len()` per site, derived by [`record_block`]; the empty-table
+    /// fallback of the dirty-set model). `spill_stores_written − spill_stores` is the
+    /// redundant ("clean") stores the dirty set removes.
+    pub(crate) spill_stores_written: u64,
+    /// Total spill stores under the **full-cache** model (Σ `slots.len()`).
     pub(crate) spill_stores_full: u64,
     /// Fill sites by kind ([`FillSite`]) — the number of `fill` calls.
     pub(crate) fill_calls_by_site: BTreeMap<FillSite, u64>,
@@ -420,17 +447,18 @@ pub(crate) fn record_instr_deopt(name: &str) {
     with(|c| *c.instr_deopts.entry(name.to_string()).or_insert(0) += 1);
 }
 
-/// One `spill` call: `written_len` cached x-registers are stored back into
-/// `machine.x`, at `site`.
+/// One `spill` call: `n` cached x-registers are stored back into `machine.x`, at `site`.
 ///
-/// `spill` stores only the block's **written** set, so this is the **new** store
-/// count; the **old** (full-cache) count is `slots.len()`, which only the enclosing
-/// block knows — the site is queued for [`record_block`] to attribute it.
-pub(crate) fn record_spill(site: SpillSite, written_len: u64) {
+/// `n` is what [`spill`](super::emit::regs::spill) emits — the **dirty-set** model
+/// [`Counters::spill_stores`] reports (Σ `spill_slots_at(pc).len()`, or the whole
+/// `written` set on the empty-`spill_sets`-table fallback). The **written-set** and
+/// **full-cache** store counts need the block's `Allocation`, which only the enclosing
+/// block has, so the site is queued for [`record_block`] to attribute them.
+pub(crate) fn record_spill(site: SpillSite, n: u64) {
     if with(|c| {
         *c.spill_calls_by_site.entry(site).or_insert(0) += 1;
-        *c.spill_stores_by_site.entry(site).or_insert(0) += written_len;
-        c.spill_stores += written_len;
+        *c.spill_stores_by_site.entry(site).or_insert(0) += n;
+        c.spill_stores += n;
     })
     .is_none()
     {
@@ -464,10 +492,11 @@ pub(crate) fn record_fill(site: FillSite, n: u64) {
 /// and the native `bytes` it produced.
 ///
 /// Besides the per-block sums/histograms, this **drains** the block's queued spill
-/// sites ([`record_spill`]) and adds the block's cache size to each, which is exactly
-/// the count the previous full-cache `spill` model would have stored there — so one
-/// recorded run yields both the old and the new spill-store totals (see the module
-/// docs).
+/// sites ([`record_spill`]) and adds the block's **write-set size** (the written-set
+/// model) and its **cache size** (the full-cache model) to each, so one recorded run
+/// yields all three spill-store totals — the **dirty-set** count
+/// [`spill`](super::emit::regs::spill) itself emitted, the written-set count and the
+/// full-cache count (see the module docs).
 ///
 /// It also folds in the allocation's **live-range statistics**
 /// ([`Allocation::live_candidates`]/[`live_total`](Allocation::live_total)/
@@ -500,6 +529,8 @@ pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
         *c.blocks_by_cache_slots.entry(cache_slots).or_insert(0) += 1;
         *c.blocks_by_written_slots.entry(written_slots).or_insert(0) += 1;
         for site in pending {
+            *c.spill_stores_written_by_site.entry(site).or_insert(0) += written_slots;
+            c.spill_stores_written += written_slots;
             *c.spill_stores_by_site_full.entry(site).or_insert(0) += cache_slots;
             c.spill_stores_full += cache_slots;
         }
@@ -589,9 +620,12 @@ mod tests {
         assert_eq!(snapshot(), Counters::default());
     }
 
-    /// One recorded run yields **both** spill models: the written-set stores (`spill`)
-    /// and the full-cache stores the previous model would have emitted (attributed by
-    /// the enclosing `record_block`, which owns the cache size).
+    /// One recorded run yields **all three** spill models: the dirty-set stores
+    /// [`spill`](super::emit::regs::spill) emits (the whole `written` set here, since this
+    /// test builds an `Allocation` with an empty `spill_sets` table — the fallback), the
+    /// written-set stores (`Allocation::written`) and the full-cache stores — the latter
+    /// two attributed by the enclosing `record_block`, which owns the cache and write-set
+    /// sizes.
     #[test]
     fn one_run_yields_both_the_written_and_the_full_cache_spill_counts() {
         use crate::jit::emitter::Reg;
@@ -619,15 +653,38 @@ mod tests {
         record_block(6, &allocation, 128);
 
         let snap = snapshot();
-        // New model: 2 + 2 written stores.
-        assert_eq!(snap.spill_stores, 4, "new: Σ written.len() over spill sites");
+        // Dirty-set model: 2 + 2 stores — this test hands `record_spill` the written-set
+        // length directly, which is exactly the empty-`spill_sets`-table fallback.
+        assert_eq!(snap.spill_stores, 4, "Σ the counts spill passed, per site");
         assert_eq!(snap.spill_calls_by_site.get(&SpillSite::Helper), Some(&1));
         assert_eq!(snap.spill_stores_by_site.get(&SpillSite::Helper), Some(&2));
         assert_eq!(snap.spill_stores_by_site.get(&SpillSite::Exit), Some(&2));
-        // Old model: 2 spill sites × a 4-register cache = 8 stores.
+        // Written-set model: 2 + 2 = 4 (derived by `record_block` from written.len()).
+        assert_eq!(
+            snap.spill_stores_written, 4,
+            "written-set: Σ written.len() over spill sites"
+        );
+        assert_eq!(
+            snap.spill_stores_written_by_site.get(&SpillSite::Helper),
+            Some(&2)
+        );
+        assert_eq!(
+            snap.spill_stores_written_by_site.get(&SpillSite::Exit),
+            Some(&2)
+        );
+        // On the empty-`spill_sets` fallback `spill` stores the whole written set, so the
+        // two models coincide here; in production `spill` stores the **dirty** set, and
+        // `spill_stores_written − spill_stores` is then the redundant clean stores removed.
+        assert_eq!(snap.spill_stores, snap.spill_stores_written);
+        assert_eq!(
+            snap.spill_stores_written - snap.spill_stores,
+            0,
+            "the empty-table fallback makes the dirty-set and written-set models coincide"
+        );
+        // Full-cache model: 2 spill sites × a 4-register cache = 8 stores.
         assert_eq!(
             snap.spill_stores_full, 8,
-            "old: Σ slots.len() over spill sites"
+            "full-cache: Σ slots.len() over spill sites"
         );
         assert_eq!(snap.spill_stores_by_site_full.get(&SpillSite::Helper), Some(&4));
         assert_eq!(snap.spill_stores_by_site_full.get(&SpillSite::Exit), Some(&4));

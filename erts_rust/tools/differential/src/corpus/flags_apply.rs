@@ -61,6 +61,12 @@
 //! `ERL_ZFLAGS` (the last merge source, sized by the same round-up rule), `-pa` through
 //! `ERL_ZFLAGS` (the code path), `ERL_MAX_PORTS` at a request that is *not* already a power of
 //! two, and a single `ERL_FLAGS` value carrying **two** emulator switches at once (both applied).
+//!
+//! The final block applies the switch families the *recording* half widened: the `-smp` model
+//! switch through the first (`ERL_AFLAGS`) and the last (`ERL_ZFLAGS`) merge source, the
+//! unvalidated `+K` value flag (`+K false` still reports kernel poll as on), and a `+Q` request
+//! that is not already a power of two (`5000` → the 8192-port table) — so a runtime that
+//! recorded the merged argv without applying it could not pass them.
 use super::{
     Case, CaseKind, Contract, EmbeddedModule, Golden, ModuleRun, Probe,
 };
@@ -419,6 +425,73 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the remaining merge sources for the `-smp`/`+K`/`+Q` families ------------------
+        // `-smp` is a `-`-switch and `+K` an emulator flag: both are consumed (or recorded)
+        // before `init` from *any* merged source, so carrying them in `ERL_AFLAGS`/`ERL_ZFLAGS`
+        // must apply exactly as the command-line spelling does. `+Q` goes through the same
+        // port-table round-up rule as its command-line form (`5000` → the 8192-port table).
+        // Every golden is the oracle's own output, verified with `differential run <id>`.
+        Case {
+            id: "flags_apply/erl_aflags_smp_auto_is_recorded",
+            description: "an ERL_AFLAGS-carried -smp auto is recorded as the smp argument",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(smp)",
+                extra_argv: &[],
+                env: &[("ERL_AFLAGS", "-smp auto")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,117,116,111]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_zflags_smp_auto_is_recorded",
+            description: "an ERL_ZFLAGS-carried -smp auto is recorded as the smp argument",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                // The last merge source (`ERL_ZFLAGS`) applies the same switch as the first.
+                expr: "init:get_argument(smp)",
+                extra_argv: &[],
+                env: &[("ERL_ZFLAGS", "-smp auto")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,117,116,111]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_aflags_plus_k_false_keeps_kernel_poll_on",
+            description: "an ERL_AFLAGS-carried +K false is applied and kernel poll stays observable",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(kernel_poll)",
+                extra_argv: &[],
+                env: &[("ERL_AFLAGS", "+K false")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_aflags_plus_q_5000_rounds_up_to_8192",
+            description: "an ERL_AFLAGS-carried +Q 5000 is sized up to the 8192-port table",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &[],
+                env: &[("ERL_AFLAGS", "+Q 5000")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 8192"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -538,6 +611,50 @@ mod tests {
             find("flags_apply/erl_flags_plus_hmax_bounded_allocation").expr(),
             Some("length(lists:seq(1,1000))")
         );
+    }
+
+    /// The `-smp`/`+K`/`+Q` family carried by a merge source: each case pins its own
+    /// `ERL_*FLAGS` variable *and* the effect observable, so a runtime that recorded the merged
+    /// argv without applying it cannot pass them.
+    #[test]
+    fn the_smp_kernel_poll_and_port_table_families_are_applied_from_the_merge_sources() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+        for (id, env, expr, golden) in [
+            (
+                "flags_apply/erl_aflags_smp_auto_is_recorded",
+                &[("ERL_AFLAGS", "-smp auto")][..],
+                "init:get_argument(smp)",
+                "ok {ok,[[[97,117,116,111]]]}",
+            ),
+            (
+                "flags_apply/erl_zflags_smp_auto_is_recorded",
+                &[("ERL_ZFLAGS", "-smp auto")][..],
+                "init:get_argument(smp)",
+                "ok {ok,[[[97,117,116,111]]]}",
+            ),
+            (
+                "flags_apply/erl_aflags_plus_k_false_keeps_kernel_poll_on",
+                &[("ERL_AFLAGS", "+K false")][..],
+                "erlang:system_info(kernel_poll)",
+                "ok true",
+            ),
+            (
+                "flags_apply/erl_aflags_plus_q_5000_rounds_up_to_8192",
+                &[("ERL_AFLAGS", "+Q 5000")][..],
+                "erlang:system_info(port_limit)",
+                "ok 8192",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli], "case {id}");
+            assert_eq!(case.env(), env, "case {id}: the merge source");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert!(
+                case.extra_argv().is_empty(),
+                "case {id}: the switch reaches the argv through the environment only"
+            );
+        }
     }
 
     /// The append-side `-pz` case: a shadow of a stdlib module in the `-pz` directory must not

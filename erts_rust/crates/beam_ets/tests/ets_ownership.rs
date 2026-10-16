@@ -130,13 +130,64 @@ fn give_away_badarg_cases_leave_the_owner_unchanged() {
     ));
     assert_eq!(t.owner(), Some(owner));
 
-    // An ownerless table: nobody can give it away.
+    // An ownerless table: a `Some` caller is not the (absent) owner, so it is
+    // `badarg`. (A `None` caller, by contrast, *is* the owner here — the two
+    // `None`s are equal; pinned by
+    // `give_away_from_an_identityless_caller_follows_owner_identity`.)
     let mut t = new_table(TableKind::Set);
     assert!(matches!(
         t.give_away(Some(other), Some(other)),
         Err(BeamError::BadArg)
     ));
     assert_eq!(t.owner(), None);
+}
+
+/// The pid-gap model, pinned exactly. There is no pid term and no
+/// process-liveness concept here: an [`OwnerId`] is an opaque `u64` and both the
+/// caller and the recorded owner are `Option<OwnerId>`. `None` means **"no
+/// requester identity"** for the caller and **"no recorded owner"** for the
+/// table, and the owner gate is a plain `caller == owner` identity test
+/// (`src/table/mod.rs` `give_away`, mirroring the C `ets_give_away_3`) — so two
+/// `None`s are equal and an identity-less caller may give away an ownerless
+/// table. This branch is **unreachable through the BIF surface** (the runtime
+/// always records an owner at `ets:new/2`, so a real table never has
+/// `owner == None`); it is pinned here because the crate models the rule, not
+/// the BIF.
+#[test]
+fn give_away_from_an_identityless_caller_follows_owner_identity() {
+    // (i) A `None` caller on an OWNERLESS table *is* the owner (`None == None`),
+    // so the transfer succeeds and records the target.
+    let mut t = new_table(TableKind::Set);
+    let target = OwnerId::new(7);
+    assert_eq!(t.owner(), None, "a fresh table has no recorded owner");
+    t.give_away(None, Some(target))
+        .expect("an identity-less caller owns an ownerless table");
+    assert_eq!(t.owner(), Some(target), "the transfer recorded the target");
+
+    // The target is now a real owner, so the same identity-less caller can no
+    // longer take it away: the equality that allowed (i) now fails the gate.
+    assert!(matches!(
+        t.give_away(None, Some(OwnerId::new(8))),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(t.owner(), Some(target), "owner unchanged after a denied call");
+
+    // (ii) On an OWNED table the identity-less caller is not the owner, so the
+    // call is `badarg` and the table is left untouched — the same as any other
+    // non-owner `Some` caller.
+    let owner = OwnerId::new(1);
+    let mut t = table_with_owner(owner);
+    assert!(matches!(
+        t.give_away(None, Some(OwnerId::new(2))),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(t.owner(), Some(owner), "owner unchanged after a denied call");
+
+    assert!(matches!(
+        t.give_away(Some(OwnerId::new(3)), Some(OwnerId::new(2))),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(t.owner(), Some(owner), "owner unchanged after a denied call");
 }
 
 /// `ets:setopts/2` installs and clears the heir, and requires the owner.

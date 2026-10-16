@@ -133,6 +133,12 @@
 //!   `DOP_PAYLOAD_SEND` (29) — all-atom byte goldens where the shape carries no id, and
 //!   shape/tag predicates where it carries a pid; plus `erlang:node/1` of a remote
 //!   `NEW_PID_EXT` (88) and the legacy `REFERENCE_EXT` → `NEWER_REFERENCE_EXT` re-encode.
+//! * the **handshake control messages** themselves — the DFLAG-carrying name message
+//!   `{node(), Flags}` (a zero and a full 32-bit `DFLAG_*` word), the five status atoms
+//!   (`ok`/`nok`/`alive`/`not_alive`/`ok_simultaneous`), the bare `challenge` integer
+//!   (`INTEGER_EXT` 98) and the `{ok, Challenge}` / `{ok, Our, Peer, PeerName}` reply
+//!   tuples — each a byte golden, since every shape is an ordinary ETF term that carries
+//!   no per-VM-start id.
 //!
 //! A live handshake and the on-wire `DOP_*`/`DFLAG_*` negotiation are **not**
 //! expressible through a single CLI process (they need two connected nodes) — an
@@ -463,6 +469,20 @@ pub(crate) fn group() -> Vec<Case> {
         verr("wire_extra/set_cookie_other_node_binary_cookie_badarg", "erlang:set_cookie/2 on a remote-looking node with a binary cookie is badarg (a cookie must be an atom)", "erlang:set_cookie('someother@node', <<\"cookie\">>)"),
         t("wire_extra/hs_ok_node_bytes", "a handshake-shaped {ok, Node} reply tuple encodes the local-node atom", "{ok, node()}", "ok <<131,104,2,119,2,111,107,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116>>"),
         t("wire_extra/hs_error_distribution_not_started_bytes", "a handshake-shaped {error, Reason} reply tuple encodes the distribution_not_started atom", "{error, distribution_not_started}", "ok <<131,104,2,119,5,101,114,114,111,114,119,24,100,105,115,116,114,105,98,117,116,105,111,110,95,110,111,116,95,115,116,97,114,116,101,100>>"),
+        // -- the handshake control messages themselves (the DFLAG-carrying name message,
+        // the status atoms and the challenge/reply integers) --------------------------
+        // The `send_name` / `recv_name` message is the 2-tuple `{Name, Flags}` whose
+        // `Flags` word is the OR of the handshake's `DFLAG_*` bits; the status message is
+        // one of five atoms; the challenge and its replies are integers / small tuples.
+        // Each is *just an ETF term*, so its payload shape is reachable through one CLI
+        // process and pinned as a byte golden (the all-atom / all-integer shapes carry no
+        // per-VM-start id, so they are VM-stable).
+        t("wire_extra/hs_name_message_zero_flags_bytes", "the handshake name message {node(), 0} encodes the node atom and a zero DFLAG word", "{node(), 0}", "ok <<131,104,2,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116,97,0>>"),
+        t("wire_extra/hs_name_message_full_flags_bytes", "the handshake name message carries a full 32-bit DFLAG word (a SMALL_BIG_EXT above 2^31-1)", "{node(), 16#ffffffff}", "ok <<131,104,2,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116,110,4,0,255,255,255,255>>"),
+        t("wire_extra/hs_status_atoms_bytes", "the five handshake status atoms (ok/nok/alive/not_alive/ok_simultaneous) encode as SMALL_ATOM_UTF8_EXT", "[ok, nok, alive, not_alive, ok_simultaneous]", "ok <<131,108,0,0,0,5,119,2,111,107,119,3,110,111,107,119,5,97,108,105,118,101,119,9,110,111,116,95,97,108,105,118,101,119,15,111,107,95,115,105,109,117,108,116,97,110,101,111,117,115,106>>"),
+        t("wire_extra/hs_challenge_int_bytes", "the handshake challenge is a bare integer, encoding as INTEGER_EXT (98)", "123456789", "ok <<131,98,7,91,205,21>>"),
+        t("wire_extra/hs_challenge_reply_ok_bytes", "the handshake challenge_reply {ok, Challenge} encodes both fields", "{ok, 123456789}", "ok <<131,104,2,119,2,111,107,98,7,91,205,21>>"),
+        t("wire_extra/hs_challenge_reply_full_peer_bytes", "the handshake challenge_reply {ok, OurChallenge, PeerChallenge, PeerName} encodes the peer node atom", "{ok, 123456789, 987654321, peer@host}", "ok <<131,104,4,119,2,111,107,98,7,91,205,21,98,58,222,104,177,119,9,112,101,101,114,64,104,111,115,116>>"),
         // -- evaluation limits: regression-pinned `-eval` literal/parser shapes -------------
         // Each golden is the oracle's own `ok …` line and the Rust runtime now reproduces it,
         // so each case `agree`s. They were once honest capability gaps (`beam_rt: unsupported:

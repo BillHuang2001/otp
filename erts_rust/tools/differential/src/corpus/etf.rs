@@ -55,6 +55,16 @@
 //! compressor output), so no case pins the compressed payload — only the `binary_to_term`
 //! round trip is asserted. Exposing only the first two bytes (`<<131,80>>`) stays safe and is
 //! pinned in `super::wire_extra`'s `co_prefix_two_value`.
+//!
+//! ## The `term_to_binary/2` option matrix
+//! The last block pins the option *shapes* the encoding is driven through, each as the oracle's
+//! own stable line: `[compressed]` on a body below the compressor's threshold is a no-op, so its
+//! image is **byte-identical** to the plain one (a small tuple and the two-byte empty list), and
+//! a compressible body's COMPRESSED (80) header carries a 32-bit big-endian uncompressed-size
+//! field (pinned as the raw 4-byte field, never the zlib middle); the bare atom option
+//! `minor_version` (no `{minor_version, N}` value) is `badarg` in both runtimes; `{minor_version,1}`
+//! renders an atom as the legacy `ATOM_EXT` (100) inside a compound term; and `{minor_version,2}`
+//! keeps `BIT_BINARY_EXT` (77) for a non-byte-aligned bitstring.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -1049,6 +1059,92 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok <<131,108,0,0,0,1,119,1,97,119,1,98>>"),
+                exit_code: 0,
+            },
+        },
+        // -- the `term_to_binary/2` option matrix: `compressed` on a small body and the
+        // `minor_version` dialect: every golden below is the oracle's own line --------
+        Case {
+            id: "etf/term_to_binary_compressed_small_tuple_is_verbatim",
+            description: "the `compressed` option leaves a small tuple uncompressed (no COMPRESSED wrapper is emitted)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary({1,2}, [compressed])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,7,131,104,2,97,1,97,2>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_compressed_nil_is_verbatim",
+            description: "the `compressed` option leaves the two-byte empty list uncompressed",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary([], [compressed])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,2,131,106>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_compressed_declared_size_field",
+            description: "the COMPRESSED (80) header's 32-bit big-endian uncompressed-size field for a compressible 3000-byte string body",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary:part(term_to_binary(lists:duplicate(3000,$a), [compressed]), 2, 4)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,4,0,0,11,187>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_bare_minor_version_is_badarg",
+            description: "the bare atom option `minor_version` (no `{minor_version, N}` value) is badarg",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(hello, [minor_version])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_minor_version_1_tuple_legacy_atom",
+            description: "a {minor_version,1} compound term encodes its atom as the legacy ATOM_EXT (100)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary({hello, 1}, [{minor_version, 1}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,13,131,104,2,100,0,5,104,101,108,108,111,97,1>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_minor_version_2_bit_binary_tag",
+            description: "a {minor_version,2} non-byte-aligned bitstring keeps BIT_BINARY_EXT (77) with its unused-bit count",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(<<5:3>>, [{minor_version, 2}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,8,131,77,0,0,0,1,3,160>>"),
                 exit_code: 0,
             },
         },
