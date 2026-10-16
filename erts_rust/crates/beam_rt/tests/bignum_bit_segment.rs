@@ -67,15 +67,22 @@
 //!
 //! # The `run`-route entry point: a string token, not an integer token
 //!
-//! `beam_rt run <beam> <m>:<f>/<a> <arg…>` cannot carry a bignum integer: its integer tokens are
-//! materialized with `beam_term::make_small` (`src/runtime.rs::materialize`, reached from
-//! `src/cli.rs::parse_arg_term`'s `i64` arm), and a value above `MAX_SMALL` (`2^59 - 1`) trips
-//! that function's `debug_assert` and aborts the process instead of building a bignum. Both files
-//! are outside this suite's carve-out, so the fixture additionally exports the **string** entry
-//! points `mk64s/1` / `mk80s/1` ([`FIXTURE_SRC`]): they rebuild the same integer in the engine
-//! with `list_to_integer/1` and then construct the segment — the *identical* `bs_create_bin`
-//! call site, reached through a token the CLI can carry. The bare-integer entry point `mk64/1` is
-//! exercised too, on the control value that fits a small int.
+//! `beam_rt run <beam> <m>:<f>/<a> <arg…>` cannot carry a bignum **integer**: its integer tokens
+//! are materialized with `beam_term::make_small` (`src/runtime.rs::materialize`, reached from
+//! `src/cli.rs::parse_arg_term`'s `i64` arm — both outside this suite's carve-out), and a value
+//! above `MAX_SMALL` (`2^59 - 1`) is **not rejected**: the `debug_assert` in `make_small` aborts
+//! the process in a debug build (`beam_rt run bm.beam bm:mk64/1 576460752303423488` → a panic at
+//! `beam_term/src/immediate.rs:77`, exit 101), and in a **release** build that assert is compiled
+//! out and the token is silently truncated to a wrong small int
+//! (`… bm:mk64/1 576460752303423488` → `<<248,0,0,0,0,0,0,0>>` where the oracle prints
+//! `<<8,0,0,0,0,0,0,0>>`). Neither outcome is one of the two this suite may accept, and the
+//! range check belongs in the two out-of-scope files above, so that path is **not** probed here.
+//!
+//! The fixture therefore also exports the **string** entry points `mk64s/1` / `mk80s/1`
+//! ([`FIXTURE_SRC`]): they rebuild the same integer in the engine with `list_to_integer/1` and
+//! then construct the segment — the *identical* `bs_create_bin` call site, reached through a
+//! token the CLI can carry. The bare-integer entry point `mk64/1` is exercised too, on the
+//! control value that fits a small int.
 //!
 //! # The compile-route half
 //!
