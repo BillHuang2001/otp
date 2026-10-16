@@ -676,7 +676,7 @@ rendering stays host-side (`TableInfo::write_concurrency` is a `bool`).
   `Table::give_away_with_gift`; the remaining work is the BIF `beam_bifs::ets::adopt::give_away_3` — read
   `args[2]`, call it, and deliver `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the new owner through its
   `SendHook` (the `Tid`/`FromPid` terms are the host's; there is no pid/ref term here). Differential case
-  to add: `ets_extra/give_away_carries_the_gift_to_the_new_owner` (A.1).
+  to add: `ets/give_away_gift_data_reaches_the_new_owner` (A.1).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; tests in `src/kind/tests.rs`
