@@ -59,16 +59,15 @@ use beam_gc::prelude::{
 };
 use beam_term::compare;
 use beam_term::prelude::{
-    arityval, bin_ref_parts, bit_count_to_bytes, bitstring_parts, boxed_val,
-    external_pid_parts, external_pid_size_words, fun_arity, fun_creator_pid, fun_env,
-    fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free, fun_uniq, fun_uniq_bytes,
-    fun_words,
+    arityval, bin_ref_parts, bit_count_to_bytes, bitstring_parts, boxed_val, external_pid_parts,
+    external_pid_size_words, fun_arity, fun_creator_pid, fun_env, fun_function, fun_index,
+    fun_kind_of_header, fun_module, fun_num_free, fun_uniq, fun_uniq_bytes, fun_words,
     heap_bits_size_words, is_arity_value, is_atom, is_bitstring_header, is_boxed, is_external_pid,
     is_external_pid_header, is_fun_header, is_list, is_map_header, is_refc_binary, is_small,
-    list_val, make_atom, make_list, make_small, map_pairs, map_words_capacity,
-    refc_bytes, refc_size, signed_value, sub_bits_parts, write_external_pid, write_fun_external,
+    list_val, make_atom, make_list, make_small, map_pairs, map_words_capacity, refc_bytes,
+    refc_size, signed_value, sub_bits_parts, write_external_pid, write_fun_external,
     write_fun_imported, write_fun_local, write_heap_bits, write_map, write_refc_binary, Atom,
-    AtomTable, Eterm, FunKind, FunPid, NIL, ERL_REFC_BITS_SIZE,
+    AtomTable, Eterm, FunKind, FunPid, ERL_REFC_BITS_SIZE, NIL,
 };
 
 // Corpus geometry (deterministic; no timing, no randomness)
@@ -285,7 +284,9 @@ fn write_pid(heap: &mut Heap, node: Atom, number: u32, serial: u32, creation: u3
     // SAFETY: `external_pid_size_words()` (4) exclusively-owned words are reserved and all of
     // them are written by `write_external_pid`; the `node` slot holds a live atom term.
     unsafe {
-        let hp = heap.alloc_words(external_pid_size_words()).expect("reserve pid");
+        let hp = heap
+            .alloc_words(external_pid_size_words())
+            .expect("reserve pid");
         write_external_pid(hp, make_atom(node), number, serial, creation)
     }
 }
@@ -361,7 +362,13 @@ fn build_round0(heap: &mut Heap, ctx: &Ctx) -> Round0 {
         serial: 5,
         creation: 6,
     };
-    roots.push(write_imported(heap, 1, ctx.module, creator, &[imported_env]));
+    roots.push(write_imported(
+        heap,
+        1,
+        ctx.module,
+        creator,
+        &[imported_env],
+    ));
     kinds.push(RootKind::Eq);
 
     // (10) an external pid (the shape no other test exercises).
@@ -570,7 +577,12 @@ fn walk_fun(term: Eterm, header: Eterm, atoms: &AtomTable, out: &mut String, pat
                     fun_creator_pid(term).expect("fun pid"),
                 )
             };
-            out.push_str(&format!(",mod{},uniq{:?},idx{index},pid{:?}", m.raw(), u, pid));
+            out.push_str(&format!(
+                ",mod{},uniq{:?},idx{index},pid{:?}",
+                m.raw(),
+                u,
+                pid
+            ));
         }
     }
     // SAFETY: `term` is a live fun, so its environment words are readable.
@@ -915,10 +927,19 @@ fn rich_corpus_survives_cross_generation_collections_under_both_strategies() {
     let last = copying.snapshots.last().expect("at least one snapshot");
     assert!(last.contains("map{"), "the flat/HAMT maps are in the graph");
     assert!(last.contains("fun(Local"), "the local fun is in the graph");
-    assert!(last.contains("fun(External"), "the external fun is in the graph");
-    assert!(last.contains("fun(Imported"), "the imported fun is in the graph");
+    assert!(
+        last.contains("fun(External"),
+        "the external fun is in the graph"
+    );
+    assert!(
+        last.contains("fun(Imported"),
+        "the imported fun is in the graph"
+    );
     assert!(last.contains("refc["), "the refc binary is in the graph");
-    assert!(last.contains("bin["), "the on-heap binary/bitstring is in the graph");
+    assert!(
+        last.contains("bin["),
+        "the on-heap binary/bitstring is in the graph"
+    );
     assert!(last.contains("pid{"), "the external pid is in the graph");
     assert!(last.contains("<cycle>"), "the cyclic graph is in the graph");
     assert!(
@@ -1008,7 +1029,11 @@ fn an_off_heap_mso_is_untouched_by_every_collection() {
             c.collect(&mut roots).expect("collect");
             assert_eq!(mso.refcount(), 2, "{kind:?}: round {round}: refcount");
             assert_eq!(off_heap.len(), 2, "{kind:?}: round {round}: entries");
-            assert_eq!(off_heap.sweep(|_| true), 0, "{kind:?}: round {round}: sweep");
+            assert_eq!(
+                off_heap.sweep(|_| true),
+                0,
+                "{kind:?}: round {round}: sweep"
+            );
             assert_mso_holder(roots[1], &off_heap, slot);
             assert_eq!(
                 refc_val_word(roots[0]),

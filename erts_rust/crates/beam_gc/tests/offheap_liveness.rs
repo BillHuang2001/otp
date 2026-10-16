@@ -71,9 +71,9 @@ use beam_gc::prelude::{
     AnyCollector, GcConfig, HeapPolicy, MatureKind, Mso, OffHeap, OffHeapEntry,
 };
 use beam_term::prelude::{
-    arityval, bin_ref_parts, boxed_val, is_arity_value, is_atom, is_boxed, is_list,
-    is_refc_binary, is_small, list_val, make_small, refc_bytes, refc_size, signed_value,
-    write_refc_binary, Eterm, NIL, ERL_REFC_BITS_SIZE,
+    arityval, bin_ref_parts, boxed_val, is_arity_value, is_atom, is_boxed, is_list, is_refc_binary,
+    is_small, list_val, make_small, refc_bytes, refc_size, signed_value, write_refc_binary, Eterm,
+    ERL_REFC_BITS_SIZE, NIL,
 };
 
 /// The off-heap payload of the refc binary in case A.
@@ -95,7 +95,12 @@ const BOTH: [MatureKind; 2] = [MatureKind::Copying, MatureKind::Immix];
 /// The mark-region space rounds every object up to a whole 16-word line, so it needs a larger
 /// *word* budget for the same graph than the copying space does. `min_heap_words` is the
 /// nursery size, so the nursery is never shrunk below it by the bounded re-size rule.
-fn policy_for(kind: MatureKind, young: usize, copying_mature: usize, immix_mature: usize) -> HeapPolicy {
+fn policy_for(
+    kind: MatureKind,
+    young: usize,
+    copying_mature: usize,
+    immix_mature: usize,
+) -> HeapPolicy {
     let mature = match kind {
         MatureKind::Copying => copying_mature,
         MatureKind::Immix => immix_mature,
@@ -116,7 +121,11 @@ fn collector(kind: MatureKind, policy: &HeapPolicy) -> AnyCollector {
         MatureKind::Immix => GcConfig::immix(policy.clone()),
     };
     let c = AnyCollector::from_config(&config).expect("collector construction");
-    assert_eq!(c.kind(), kind, "the explicit pin must select the requested strategy");
+    assert_eq!(
+        c.kind(),
+        kind,
+        "the explicit pin must select the requested strategy"
+    );
     c
 }
 
@@ -260,7 +269,10 @@ fn container_with(heap: &mut Heap, handle: Eterm) -> Eterm {
 fn container_handle(container: Eterm) -> Eterm {
     // SAFETY: `container` is a live boxed term the caller built; its header word is readable.
     let header = unsafe { *boxed_val(container) };
-    assert!(is_arity_value(header), "the root must be our container tuple");
+    assert!(
+        is_arity_value(header),
+        "the root must be our container tuple"
+    );
     assert_eq!(arityval(header), 3, "the container is a 3-tuple");
     // SAFETY: element 0 lies inside the live 3-element tuple just validated.
     unsafe { *boxed_val(container).add(1) }
@@ -275,19 +287,32 @@ fn assert_container_shape(container: Eterm, ctx: &str) {
 
     // SAFETY: element 1 lies inside the live 3-element tuple just validated.
     let scalar = unsafe { *boxed_val(container).add(2) };
-    assert!(is_small(scalar), "{ctx}: element 1 must stay a small integer");
-    assert_eq!(signed_value(scalar), 42, "{ctx}: element 1 must be preserved");
+    assert!(
+        is_small(scalar),
+        "{ctx}: element 1 must stay a small integer"
+    );
+    assert_eq!(
+        signed_value(scalar),
+        42,
+        "{ctx}: element 1 must be preserved"
+    );
 
     // SAFETY: element 2 lies inside the live 3-element tuple just validated.
     let nested = unsafe { *boxed_val(container).add(3) };
-    assert!(is_boxed(nested), "{ctx}: element 2 must stay the nested tuple");
+    assert!(
+        is_boxed(nested),
+        "{ctx}: element 2 must stay the nested tuple"
+    );
     // SAFETY: `nested` is a live boxed term.
     let nh = unsafe { *boxed_val(nested) };
     assert!(is_arity_value(nh), "{ctx}: element 2 must stay a tuple");
     assert_eq!(arityval(nh), 2, "{ctx}: the nested tuple is a 2-tuple");
     // SAFETY: elements 0 and 1 lie inside the live 2-element tuple just validated.
     let (n0, n1) = unsafe { (*boxed_val(nested).add(1), *boxed_val(nested).add(2)) };
-    assert!(is_small(n0) && is_small(n1), "{ctx}: the nested elements are small integers");
+    assert!(
+        is_small(n0) && is_small(n1),
+        "{ctx}: the nested elements are small integers"
+    );
     assert_eq!(
         (signed_value(n0), signed_value(n1)),
         (7, 8),
@@ -335,16 +360,30 @@ fn assert_moved_handle_intact(
     // It is still a refc binary describing the same payload window and bytes.
     // SAFETY: `handle` is the live, copied `ErlSubBits`.
     unsafe {
-        assert!(is_refc_binary(handle), "{ctx}: the handle is still a refc binary");
-        assert_eq!(refc_size(handle), payload.len() * 8, "{ctx}: the window size is preserved");
-        assert_eq!(refc_bytes(handle), REFC_BYTES, "{ctx}: the payload bytes are untouched");
+        assert!(
+            is_refc_binary(handle),
+            "{ctx}: the handle is still a refc binary"
+        );
+        assert_eq!(
+            refc_size(handle),
+            payload.len() * 8,
+            "{ctx}: the window size is preserved"
+        );
+        assert_eq!(
+            refc_bytes(handle),
+            REFC_BYTES,
+            "{ctx}: the payload bytes are untouched"
+        );
     }
 
     // The `orig` BinRef was forwarded too, and its off-heap pointer word is **byte-identical**:
     // a collection never moves or rewrites the payload reference.
     // SAFETY: `handle` is the live copied `ErlSubBits`, so word 4 is in-bounds.
     let orig = unsafe { *boxed_val(handle).add(4) };
-    assert!(in_mature(c, orig), "{ctx}: the BinRef must be forwarded as well");
+    assert!(
+        in_mature(c, orig),
+        "{ctx}: the BinRef must be forwarded as well"
+    );
     // SAFETY: `orig` is the live forwarded `BinRef`, so words 1 and 2 are in-bounds.
     let (val, next) = unsafe { bin_ref_parts(orig) };
     assert_eq!(
@@ -353,14 +392,12 @@ fn assert_moved_handle_intact(
         "{ctx}: the off-heap pointer must be left byte-identical"
     );
     assert_eq!(
-        val as usize,
-        val_word_before,
+        val as usize, val_word_before,
         "{ctx}: the `BinRef.val` word the collection carried over must be bit-for-bit the one \
          written in the nursery"
     );
     assert_eq!(
-        next as usize,
-        0,
+        next as usize, 0,
         "{ctx}: the (empty) off-heap chain link must be left byte-identical"
     );
 }
@@ -446,7 +483,11 @@ fn a_refc_binary_handle_inside_a_moved_object_is_reclaimed_exactly_once() {
                 0,
                 "{ctx}: a live handle keeps the off-heap entry"
             );
-            assert_eq!(payload.refcount(), 2, "{ctx}: the refcount is stable across the move");
+            assert_eq!(
+                payload.refcount(),
+                2,
+                "{ctx}: the refcount is stable across the move"
+            );
         }
 
         // A major (fullsweep) through both strategies: the container and its handle are
@@ -479,7 +520,10 @@ fn a_refc_binary_handle_inside_a_moved_object_is_reclaimed_exactly_once() {
         c.collect_major(&mut none).expect("major");
         assert_eq!(c.young().used_words(), 0, "{kind:?}: the nursery is empty");
         let live = live_payloads(&none);
-        assert!(live.is_empty(), "{kind:?}: no reachable handle names the payload any more");
+        assert!(
+            live.is_empty(),
+            "{kind:?}: no reachable handle names the payload any more"
+        );
         assert_eq!(
             off_heap.sweep(|e| binary_is_live(e, &live)),
             1,
@@ -492,7 +536,11 @@ fn a_refc_binary_handle_inside_a_moved_object_is_reclaimed_exactly_once() {
             "{kind:?}: the release decremented the count exactly once"
         );
         // The payload is still readable through the surviving test handle: no use-after-free.
-        assert_eq!(payload.as_bytes(), REFC_BYTES, "{kind:?}: the payload bytes are intact");
+        assert_eq!(
+            payload.as_bytes(),
+            REFC_BYTES,
+            "{kind:?}: the payload bytes are intact"
+        );
 
         // Dropping the last reference frees the buffer exactly once — a leak would leave a live
         // block, a double free would trip the allocator's plausibility check.
@@ -500,7 +548,10 @@ fn a_refc_binary_handle_inside_a_moved_object_is_reclaimed_exactly_once() {
         assert_eq!(before.live_blocks, 1, "{kind:?}");
         drop(payload);
         let after = alloc.stats();
-        assert_eq!(after.live_blocks, 0, "{kind:?}: the payload's buffer was freed");
+        assert_eq!(
+            after.live_blocks, 0,
+            "{kind:?}: the payload's buffer was freed"
+        );
         assert_eq!(
             after.free_calls,
             before.free_calls + 1,
@@ -566,7 +617,10 @@ fn assert_moved_mso_slot_intact(
     assert_eq!(arityval(header), 2, "{ctx}: the container is a 2-tuple");
     // SAFETY: elements 0 and 1 lie inside the live 2-element tuple just validated.
     let (e0, e1) = unsafe { (*boxed_val(container).add(1), *boxed_val(container).add(2)) };
-    assert!(is_small(e0) && is_small(e1), "{ctx}: both elements are small integers");
+    assert!(
+        is_small(e0) && is_small(e1),
+        "{ctx}: both elements are small integers"
+    );
     assert_eq!(
         (signed_value(e0), signed_value(e1)),
         (slot as i64, 7),
@@ -574,14 +628,26 @@ fn assert_moved_mso_slot_intact(
     );
 
     // The slot still resolves and the payload is intact — nothing was dropped or released.
-    assert_eq!(drops.load(Ordering::SeqCst), 0, "{ctx}: nothing must be dropped yet");
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "{ctx}: nothing must be dropped yet"
+    );
     let entry = off_heap.get(slot).expect("the slot still resolves");
     let mso = entry.as_mso().expect("still an MSO entry");
-    assert_eq!(mso.refcount(), 1, "{ctx}: the refcount is stable across the move");
+    assert_eq!(
+        mso.refcount(),
+        1,
+        "{ctx}: the refcount is stable across the move"
+    );
     assert_eq!(mso.apparent_size(), MSO_APPARENT, "{ctx}");
     let payload = mso.downcast_ref::<DropPayload>().expect("the payload type");
     assert_eq!(payload.tag, 0xABCD, "{ctx}: the payload is intact");
-    assert_eq!(payload.words, vec![10, 20, 30, 40], "{ctx}: the payload is intact");
+    assert_eq!(
+        payload.words,
+        vec![10, 20, 30, 40],
+        "{ctx}: the payload is intact"
+    );
 }
 
 /// An off-heap MSO referenced only through the slot index carried **inside a moved container
@@ -631,7 +697,15 @@ fn an_mso_slot_inside_a_moved_object_releases_the_payload_exactly_once() {
         for round in 0..MINORS {
             c.collect_minor(&mut roots).expect("minor");
             let ctx = format!("{kind:?} minor {round}");
-            assert_moved_mso_slot_intact(&c, &roots, container_before, slot, &off_heap, &drops, &ctx);
+            assert_moved_mso_slot_intact(
+                &c,
+                &roots,
+                container_before,
+                slot,
+                &off_heap,
+                &drops,
+                &ctx,
+            );
         }
         c.collect_major(&mut roots).expect("major");
         let ctx = format!("{kind:?} major");
@@ -639,14 +713,22 @@ fn an_mso_slot_inside_a_moved_object_releases_the_payload_exactly_once() {
 
         // Swept dead: exactly one release, the destructor runs exactly once, and nothing runs
         // it again.
-        assert_eq!(off_heap.sweep(|_| false), 1, "{kind:?}: exactly one entry released");
+        assert_eq!(
+            off_heap.sweep(|_| false),
+            1,
+            "{kind:?}: exactly one entry released"
+        );
         assert!(off_heap.is_empty(), "{kind:?}");
         assert_eq!(
             drops.load(Ordering::SeqCst),
             1,
             "{kind:?}: the destructor must run exactly once"
         );
-        assert_eq!(off_heap.sweep(|_| false), 0, "{kind:?}: nothing left to sweep");
+        assert_eq!(
+            off_heap.sweep(|_| false),
+            0,
+            "{kind:?}: nothing left to sweep"
+        );
         drop(off_heap);
         assert_eq!(
             drops.load(Ordering::SeqCst),

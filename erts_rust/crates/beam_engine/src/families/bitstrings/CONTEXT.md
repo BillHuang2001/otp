@@ -146,7 +146,7 @@ Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
 --lib families::bitstrings` (green: 104 tests) and the whole crate
-`... -p beam_engine --no-fail-fast` (1587 passed / 0 failed across 74 targets); the build
+`... -p beam_engine --no-fail-fast` (1595 passed / 0 failed across 74 targets); the build
 `... -p beam_engine --all-targets` is warning-free. Re-run these for the live counts.
 **Differential evidence:** the project gate `erts_rust/tools/differential` was run
 per-case over the whole `binary/` group plus every bitstring/binary-shaped corpus id

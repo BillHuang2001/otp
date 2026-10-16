@@ -53,7 +53,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use beam_alloc::{default_allocator, AllocRef, AllocatorConfig, CarrierAllocator, Heap, RefcBinary};
+use beam_alloc::{
+    default_allocator, AllocRef, AllocatorConfig, CarrierAllocator, Heap, RefcBinary,
+};
 use beam_common::BeamError;
 use beam_gc::prelude::{
     collect, AnyCollector, GcConfig, HeapPolicy, HeapSpace, MatureKind, Mso, OffHeap, OffHeapEntry,
@@ -64,7 +66,7 @@ use beam_term::prelude::{
     is_arity_value, is_atom, is_boxed, is_fun_header, is_list, is_refc_binary, is_small, list_val,
     make_small, map_get, map_pairs, map_size, map_words_capacity, refc_bytes, refc_size,
     signed_value, write_fun_external, write_fun_imported, write_fun_local, write_map,
-    write_refc_binary, Atom, AtomTable, Eterm, FunKind, FunPid, NIL, ERL_REFC_BITS_SIZE,
+    write_refc_binary, Atom, AtomTable, Eterm, FunKind, FunPid, ERL_REFC_BITS_SIZE, NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -124,7 +126,11 @@ fn collector(kind: MatureKind, policy: &HeapPolicy) -> AnyCollector {
         MatureKind::Immix => GcConfig::immix(policy.clone()),
     };
     let c = AnyCollector::from_config(&config).expect("collector construction");
-    assert_eq!(c.kind(), kind, "the explicit pin must select the requested strategy");
+    assert_eq!(
+        c.kind(),
+        kind,
+        "the explicit pin must select the requested strategy"
+    );
     c
 }
 
@@ -398,7 +404,11 @@ fn deeply_nested_terms_are_copied_iteratively_and_intact() {
     let mut from = space(live);
     let list = build_deep_list(from.heap_mut(), DEEP_CELLS);
     let chain = build_deep_tuple_chain(from.heap_mut(), DEEP_CHAIN);
-    assert_eq!(from.used_words(), live, "the deep graph is exactly the space");
+    assert_eq!(
+        from.used_words(),
+        live,
+        "the deep graph is exactly the space"
+    );
     assert_eq!(from.used_words(), from.capacity_words());
 
     let mut to = space(live);
@@ -428,14 +438,22 @@ fn deeply_nested_terms_are_copied_iteratively_and_intact() {
         let heap = c.young_mut().heap_mut();
         let list = build_deep_list(heap, DEEP_CELLS);
         let chain = build_deep_tuple_chain(heap, DEEP_CHAIN);
-        assert_eq!(c.young().used_words(), live, "{kind:?}: the graph is the nursery");
+        assert_eq!(
+            c.young().used_words(),
+            live,
+            "{kind:?}: the graph is the nursery"
+        );
 
         let mut roots = vec![list, chain];
         c.collect_minor(&mut roots).expect("minor");
         assert_collected_no_leak(&c, &roots, "deep minor");
 
         let values = walk_list_smalls(roots[0]);
-        assert_eq!(values.len(), DEEP_CELLS, "{kind:?}: the list survived the minor");
+        assert_eq!(
+            values.len(),
+            DEEP_CELLS,
+            "{kind:?}: the list survived the minor"
+        );
         assert!(
             values.iter().enumerate().all(|(i, &v)| v == i as i64),
             "{kind:?}: the copied deep list must hold `0..{DEEP_CELLS}` in order"
@@ -456,7 +474,10 @@ fn deeply_nested_terms_are_copied_iteratively_and_intact() {
         );
         assert!(values.iter().enumerate().all(|(i, &v)| v == i as i64));
         let (depth, leaf) = walk_tuple_chain(roots[1]);
-        assert_eq!(depth, DEEP_CHAIN, "{kind:?}: the chain survived the fullsweep");
+        assert_eq!(
+            depth, DEEP_CHAIN,
+            "{kind:?}: the chain survived the fullsweep"
+        );
         assert_eq!(leaf, -1);
     }
 }
@@ -494,7 +515,11 @@ fn a_live_graph_ending_exactly_at_capacity_is_collected() {
     let mut roots = [root];
     let stats = collect(&from, &mut to, &mut roots).expect("collect");
     assert_eq!(stats.words_copied, CAP);
-    assert_eq!(to.used_words(), CAP, "the to-space ends exactly at capacity");
+    assert_eq!(
+        to.used_words(),
+        CAP,
+        "the to-space ends exactly at capacity"
+    );
     assert!(to.contains_term(roots[0]));
     assert!(!from.contains_term(roots[0]));
     let elems = walk_tuple_smalls(roots[0]);
@@ -510,7 +535,11 @@ fn a_live_graph_ending_exactly_at_capacity_is_collected() {
     let err = collect(&from_short, &mut to_short, &mut roots_short).expect_err("must not fit");
     assert!(matches!(err, BeamError::Alloc(_)), "got {err:?}");
     assert_eq!(to_short.used_words(), 0, "nothing was copied");
-    assert_eq!(roots_short[0].raw(), root_short.raw(), "the root is untouched");
+    assert_eq!(
+        roots_short[0].raw(),
+        root_short.raw(),
+        "the root is untouched"
+    );
 
     // ---- both strategies -------------------------------------------------------------
     for kind in BOTH {
@@ -601,8 +630,7 @@ fn an_off_heap_refc_binary_root_survives_and_is_freed_exactly_once() {
             "{kind:?}: the off-heap pointer must be left verbatim"
         );
         assert_eq!(
-            next as usize,
-            0,
+            next as usize, 0,
             "{kind:?}: the (empty) chain link is left verbatim"
         );
 
@@ -635,14 +663,21 @@ fn an_off_heap_refc_binary_root_survives_and_is_freed_exactly_once() {
         c.collect_major(&mut none).expect("major");
         assert_eq!(c.young().used_words(), 0, "{kind:?}: the nursery is empty");
         let live = live_payloads(&none);
-        assert!(live.is_empty(), "{kind:?}: no reachable handle names the payload");
+        assert!(
+            live.is_empty(),
+            "{kind:?}: no reachable handle names the payload"
+        );
         assert_eq!(
             off_heap.sweep(|e| binary_is_live(e, &live)),
             1,
             "{kind:?}: the dead handle releases exactly one entry"
         );
         assert!(off_heap.is_empty(), "{kind:?}");
-        assert_eq!(payload.refcount(), 1, "{kind:?}: exactly one reference released");
+        assert_eq!(
+            payload.refcount(),
+            1,
+            "{kind:?}: exactly one reference released"
+        );
 
         // The final reference frees the buffer exactly once (a leak would leave a live
         // block; a double free would trip the allocator's plausibility check).
@@ -731,13 +766,21 @@ fn funs_with_boxed_free_variables_round_trip_across_collections() {
 
         let heap = c.young_mut().heap_mut();
         // Compound free variables that must themselves be relocated by the fun's scan.
-        let free_tuple = heap.tuple(&[make_small(1), make_small(2)]).expect("free tuple");
+        let free_tuple = heap
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("free tuple");
         let free_cons = heap.cons(make_small(3), NIL).expect("free cons");
         let imported_env = heap
             .tuple(&[make_small(6), make_small(7), make_small(8)])
             .expect("imported env");
         // A `Local` fun: env = [free_tuple, free_cons, 5].
-        let local = write_local(heap, 3, 0xDEAD_BEEF, 11, &[free_tuple, free_cons, make_small(5)]);
+        let local = write_local(
+            heap,
+            3,
+            0xDEAD_BEEF,
+            11,
+            &[free_tuple, free_cons, make_small(5)],
+        );
         // An `External` fun: no environment.
         let external = write_external(heap, 2, module, function);
         // An `Imported` fun: env = [imported_env].
@@ -785,9 +828,19 @@ fn assert_funs_intact(
     // SAFETY: `local` is the live, copied 6-word local fun.
     let env = unsafe { fun_env(local) }.expect("local env");
     assert_eq!(env.len(), 3, "{ctx}");
-    assert!(in_mature(c, env[0]), "{ctx}: the boxed tuple must be relocated");
-    assert!(in_mature(c, env[1]), "{ctx}: the boxed cons must be relocated");
-    assert_eq!(env[2], make_small(5), "{ctx}: the immediate free variable is unchanged");
+    assert!(
+        in_mature(c, env[0]),
+        "{ctx}: the boxed tuple must be relocated"
+    );
+    assert!(
+        in_mature(c, env[1]),
+        "{ctx}: the boxed cons must be relocated"
+    );
+    assert_eq!(
+        env[2],
+        make_small(5),
+        "{ctx}: the immediate free variable is unchanged"
+    );
     assert_eq!(
         walk_tuple_smalls(env[0]),
         vec![1, 2],
@@ -800,7 +853,11 @@ fn assert_funs_intact(
     );
 
     let external = roots[1];
-    assert_eq!(fun_kind_of_header(header(external)), FunKind::External, "{ctx}");
+    assert_eq!(
+        fun_kind_of_header(header(external)),
+        FunKind::External,
+        "{ctx}"
+    );
     assert_eq!(fun_arity(header(external)), 2, "{ctx}");
     assert_eq!(fun_num_free(header(external)), 0, "{ctx}");
     // SAFETY: `external` is the live, copied external fun.
@@ -810,7 +867,11 @@ fn assert_funs_intact(
     }
 
     let imported = roots[2];
-    assert_eq!(fun_kind_of_header(header(imported)), FunKind::Imported, "{ctx}");
+    assert_eq!(
+        fun_kind_of_header(header(imported)),
+        FunKind::Imported,
+        "{ctx}"
+    );
     assert_eq!(fun_arity(header(imported)), 1, "{ctx}");
     assert_eq!(fun_num_free(header(imported)), 1, "{ctx}");
     // SAFETY: `imported` is the live, copied imported fun.
@@ -831,7 +892,10 @@ fn assert_funs_intact(
     // SAFETY: `imported` is the live, copied imported fun.
     let env = unsafe { fun_env(imported) }.expect("imported env");
     assert_eq!(env.len(), 1, "{ctx}");
-    assert!(in_mature(c, env[0]), "{ctx}: the imported env must be relocated");
+    assert!(
+        in_mature(c, env[0]),
+        "{ctx}: the imported env must be relocated"
+    );
     assert_eq!(walk_tuple_smalls(env[0]), vec![6, 7, 8], "{ctx}");
 }
 
@@ -964,7 +1028,11 @@ fn an_off_heap_mso_is_untouched_and_its_destructor_runs_exactly_once() {
         assert_collected_no_leak(&c, &roots, "mso major");
 
         // The slot still resolves, the payload is intact and the refcount never moved.
-        assert_eq!(drops.load(Ordering::SeqCst), 0, "{kind:?}: nothing was dropped");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "{kind:?}: nothing was dropped"
+        );
         let entry = off_heap.get(slot).expect("the slot still resolves");
         let mso = entry.as_mso().expect("still an MSO entry");
         assert_eq!(mso.refcount(), 1, "{kind:?}: the refcount is stable");

@@ -26,16 +26,20 @@ Detailed current measured figures and execution-coverage evidence live in `MEASU
 | liveness-restricted `fill` loads | 3 695 119 | 3 291 024 | −11.0 % |
 | spill stores (dirty set) | 1 594 678 | 1 594 678 | untouched |
 
-`blocks`/`cache_slots`/`written_slots` are unchanged (neither lever changes register allocation).
+`blocks`/`cache_slots`/`written_slots` are unchanged (neither lever changes register allocation): `cache_slots` **756 632**, `written_slots` **621 058**.
+The census is deterministic and load-independent (it compiles modules directly, never through `CodeCache`), and its other recorded models are: whole-cache fill **3 950 215**, written-set spill stores **4 678 655**, whole-cache spill stores **5 578 219**; the static deopt census is **3 113 483** instances / **119 840** deopts (FuncInfo 103 008 · Bif 10 014 · GcBif 3 282 · Bif0 3 204 · NifStart 300 · Test(IsBoolean) 17 · Test(IsFunction2) 9 · OnLoad 6).
 Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_register_cache_traffic_census_over_the_corpus_is_printed -- --nocapture`.
 ### Wall-clock — HONEST NEGATIVE
 9 **paired** rounds (`bench run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound`, **at most one benchmark process at a time**, the order reversed between rounds, `/proc/loadavg` **8 → 123** recorded at every run): every case's paired after/before ratio flips sign across rounds and each side's own run-to-run spread is **1.5–5.2×**, so no case clears the spread (the min-over-N ratios 0.86–1.98 are confounded — the two minima come from different rounds).
 - **Verdict: a ≲2 % wall-clock effect, below this host's resolution — no attributable movement.** The evidence is the deterministic count/byte reduction, not a measured speedup; do not re-run this A/B expecting signal on a loaded host.
 - The tier-ratio instrument itself *is* stable (default JIT ÷ `BEAM_RT_TIER=interpreter`): `list_walk` reads **6.87×** here, reproducing `tools/bench/RESULTS.md` §5's **6.86×**; the default tier is the cheaper side on 9 of 10 cases.
 ### Gate
-- `-p beam_engine`: **74 suites, 1593 passed / 0 failed / 2 ignored**; with `--features jit-cranelift`: **74 suites, 1646 passed / 0 failed / 3 ignored**.
-- Independent end-to-end confirmation: a **52**-case per-case differential slice, **0** mismatch, against the OTP 29.1.1 / erts-17.1 oracle.
-- The **Cranelift verdict is unchanged**: `default = []`, no `cranelift*` crate in `cargo tree` without the feature, and the feature still compiles and tests green — nothing reversed.
+- `-p beam_engine`: **74 suites, 1595 passed / 0 failed / 2 ignored**; with `--features jit-cranelift`: **74 suites, 1648 passed / 0 failed / 3 ignored**.
+- Independent end-to-end confirmation: a **40**-case default-tier per-case differential subset (groups `errors`/`records`/`selfhost`/`boot`/`mexec`/`modules`/`lists`/`maps`/`semantics`) reports `total 40 / agree 40 / mismatch 0 / unsupported 0 / skipped 0` across contracts A.1/A.2/A.7/A.9 against the OTP 29.1.1 / erts-17.1 oracle, and `beam_rt --test boot_repeat` is 2/2.
+- The **Cranelift verdict stands, still default-OFF**: `default = []`, no `cranelift*` crate in `cargo tree` without the feature, the feature still compiles and tests green, and the tier is still not reachable end-to-end through `beam_rt`.
+- The tier ratios on this host (**14** CPUs, `/proc/loadavg` **≈140–175**, position-balanced, one timing process at a time): Cranelift beats the baseline only on the list walk (`walk/2` **0.31–0.54×**, mean **≈0.46×**), is a tie on `aggr`/`fib`/`call_ext`/`build`/`map`/`select`, and loses on comparison streams (`cmp` **1.13–1.31×**, `kernel` **1.09–1.25×**, `wide` **1.29–1.96×**), non-tail recursion (`sum` **2.52–3.07×**), the mailbox (`send_recv` **2.02–2.12×**) and cross-module (`cross` **1.27–1.54×**); its codegen cost is **≈7–114×** the baseline's.
+  ABBA paired means over three independent runs: `aggr` **0.969–1.036×**, `arith` **1.502–1.573×**, `cmp` **1.225–1.323×**.
+  Full detail: `src/jit/cranelift/CONTEXT.md` §"Measured verdict".
 ### Pins
 `src/jit/baseline/emit/prologue.rs` (the moved prologue) + `src/jit/baseline/census.rs`'s byte-identical grand total; no previously pinned counter value changed except the frame/fill counts in the table above.
 

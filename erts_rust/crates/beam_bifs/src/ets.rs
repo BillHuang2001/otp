@@ -646,6 +646,22 @@ impl TableRegistry {
             .collect()
     }
 
+    /// The `named_table` name atom of the table stored under `handle`, if any — the
+    /// inverse of [`TableRegistry::lookup_name`].
+    ///
+    /// The name registry's membership **is** the oracle's rule for rendering a tid
+    /// as its name atom rather than its handle reference (see
+    /// [`TableRegistry::all_tids`]), so this is the lookup an `ets:give_away/3`
+    /// `{'ETS-TRANSFER', Tid, …}` needs: a `named_table` gets its name atom as the
+    /// tid even when the caller passed the table by its **handle reference**, and an
+    /// unnamed table (or an unknown handle) answers `None`.
+    pub(super) fn name_of(&self, handle: u64) -> Option<Atom> {
+        self.names
+            .iter()
+            .find(|(_, registered)| **registered == handle)
+            .map(|(name, _)| *name)
+    }
+
     /// Every live table handle owned by `owner`, **ascending by handle** — the
     /// owner→handle roster the runtime reclaims through on a process death
     /// (`beam_ets::Table::owner_died`).

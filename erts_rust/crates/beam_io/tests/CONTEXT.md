@@ -62,7 +62,7 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 19 suites, 180
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 21 suites, 197
 passing; the full crate total is in the parent node's *Test Strategy*.
 
 ## Known Issues / Notes for Agents
@@ -88,6 +88,11 @@ passing; the full crate total is in the parent node's *Test Strategy*.
   scheduling, the driver-declared timer/port-exit seams
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
+- `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
+  (`DriverRegistry::with_builtins` + `PortRegistry` + `Poller`): a loopback UDP datagram round trip
+  (`udp_inet`) and the packed opcode/`control` command grammar (`ram_file_drv`), each with an
+  `erl`-oracle cross-check over the reply bytes that skips loudly without `erl`
+  (`udp_inet` also records the documented `recv` divergence from the oracle's async code-60 path)
 - `signal.rs`, `cpu_time.rs`, `ddll.rs` → the OS-signal facility, the CPU-time facility, `dlopen`
 - `fixture_builds.rs` → builds + loads every `fixtures/*.c` (a broken fixture is a hard failure)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers

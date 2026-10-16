@@ -52,9 +52,9 @@ use beam_gc::prelude::{
     collect, AnyCollector, CollectionKind, Collector, GcConfig, HeapPolicy, HeapSpace, MatureKind,
 };
 use beam_term::prelude::{
-    boxed_val, is_list, list_val, make_arityval, make_boxed, make_list, make_map_header, make_small,
-    map_get, map_pairs, map_size, map_words_capacity, signed_value, write_map, AtomTable, Eterm,
-    MAP_HEADER_TAG_HAMT_HEAD_BITMAP, MAP_SMALL_MAP_LIMIT, NIL,
+    boxed_val, is_list, list_val, make_arityval, make_boxed, make_list, make_map_header,
+    make_small, map_get, map_pairs, map_size, map_words_capacity, signed_value, write_map,
+    AtomTable, Eterm, MAP_HEADER_TAG_HAMT_HEAD_BITMAP, MAP_SMALL_MAP_LIMIT, NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -164,11 +164,18 @@ fn hamt_map_survives_a_promotion_then_a_fullsweep() {
     let atoms = AtomTable::new();
     let mut collector = Collector::new(policy(1, 8192, 16384)).expect("collector");
     let map = build_hamt(collector.young_mut().heap_mut(), &atoms, N);
-    assert!(collector.young().contains_term(map), "the map starts in the nursery");
+    assert!(
+        collector.young().contains_term(map),
+        "the map starts in the nursery"
+    );
 
     let mut roots = [map];
     let first = collector.collect(&mut roots).expect("collect");
-    assert_eq!(first.kind, CollectionKind::Minor, "the first collect promotes the map");
+    assert_eq!(
+        first.kind,
+        CollectionKind::Minor,
+        "the first collect promotes the map"
+    );
     assert!(
         collector.mature().contains_term(roots[0]) && !collector.young().contains_term(roots[0]),
         "the map is promoted out of the nursery into the mature space"
@@ -178,7 +185,11 @@ fn hamt_map_survives_a_promotion_then_a_fullsweep() {
     // A fullsweep evacuates the mature space into a fresh one: the head node and every
     // inner/collision node move again and must be re-linked.
     let second = collector.collect(&mut roots).expect("collect");
-    assert_eq!(second.kind, CollectionKind::Major, "the second collect is a fullsweep");
+    assert_eq!(
+        second.kind,
+        CollectionKind::Major,
+        "the second collect is a fullsweep"
+    );
     assert!(collector.mature().contains_term(roots[0]));
     assert_pairs(roots[0], N, &atoms);
     assert_eq!(collector.young().used_words(), 0);
@@ -279,7 +290,10 @@ fn collision_node_survives_a_promotion_then_a_fullsweep() {
     );
     assert_eq!(unsafe { *head.add(1) }.raw(), 2);
     let slot = unsafe { *head.add(2) };
-    assert!(collector.mature().contains_term(slot), "the collision tuple moved");
+    assert!(
+        collector.mature().contains_term(slot),
+        "the collision tuple moved"
+    );
     // SAFETY: `slot` is the live, copied collision tuple (a transparent arityval tuple).
     let coll = boxed_val(slot);
     assert_eq!(unsafe { *coll }, make_arityval(2));
@@ -358,7 +372,10 @@ fn hamt_maps_survive_every_collection_on_both_strategies() {
                 "{kind:?}: nursery empty after round {round}"
             );
             for (root, &n) in roots.iter().zip(&ns) {
-                assert!(in_mature(&collector, *root), "{kind:?}: map moved into mature");
+                assert!(
+                    in_mature(&collector, *root),
+                    "{kind:?}: map moved into mature"
+                );
                 assert_pairs(*root, n, &atoms);
             }
         }
@@ -383,7 +400,11 @@ fn a_shared_subterm_is_copied_exactly_once() {
     let b = from.heap_mut().tuple(&[s, make_small(20)]).expect("B");
     let tail = from.heap_mut().cons(b, NIL).expect("tail");
     let root = from.heap_mut().cons(a, tail).expect("root");
-    assert_eq!(from.used_words(), 13, "S(3) + A(3) + B(3) + two cons cells(4)");
+    assert_eq!(
+        from.used_words(),
+        13,
+        "S(3) + A(3) + B(3) + two cons cells(4)"
+    );
 
     let mut to = space(13);
     let mut roots = [root];
@@ -394,13 +415,20 @@ fn a_shared_subterm_is_copied_exactly_once() {
         "S must be copied once (it is reachable through both A and B)"
     );
     assert_eq!(stats.words_copied, 13);
-    assert_eq!(to.used_words(), 13, "the to-space holds the whole live graph once");
+    assert_eq!(
+        to.used_words(),
+        13,
+        "the to-space holds the whole live graph once"
+    );
     assert_eq!(stats.words_reclaimed, 0, "the whole from-space was live");
     assert!(to.contains_term(roots[0]));
 
     let (sa, sb, va, vb) = shared_subterm_views(roots[0]);
     assert_eq!(sa, sb, "the shared subterm must be a single copied object");
-    assert!(to.contains_term(sa), "the shared subterm moved into the to-space");
+    assert!(
+        to.contains_term(sa),
+        "the shared subterm moved into the to-space"
+    );
     assert_eq!((va, vb), (10, 20), "the two paths keep their own values");
     // SAFETY: `sa` is the live, copied shared `{7,8}` tuple.
     assert_eq!(unsafe { *boxed_val(sa) }, make_arityval(2));
@@ -423,7 +451,10 @@ fn a_three_way_diamond_copies_the_shared_leaf_once() {
     let mut roots = [root];
     let stats = collect(&from, &mut to, &mut roots).expect("collect");
 
-    assert_eq!(stats.objects_copied, 2, "S is copied once for all three references");
+    assert_eq!(
+        stats.objects_copied, 2,
+        "S is copied once for all three references"
+    );
     assert_eq!(stats.words_copied, 6);
     assert_eq!(to.used_words(), 6);
 
@@ -461,7 +492,10 @@ fn a_self_referential_cons_cycle_is_copied_without_corruption() {
     let mut roots = [root];
     let stats = collect(&from, &mut to, &mut roots).expect("collect");
 
-    assert_eq!(stats.objects_copied, 1, "the cell is copied once, not repeatedly");
+    assert_eq!(
+        stats.objects_copied, 1,
+        "the cell is copied once, not repeatedly"
+    );
     assert_eq!(stats.words_copied, 2);
     let copied = roots[0];
     assert!(to.contains_term(copied) && !from.contains_term(copied));
@@ -469,7 +503,11 @@ fn a_self_referential_cons_cycle_is_copied_without_corruption() {
     // SAFETY: `copied` is the live, copied cons cell.
     let cell = list_val(copied);
     assert_eq!(unsafe { *cell }, make_small(1));
-    assert_eq!(unsafe { *cell.add(1) }, copied, "the cycle closes on the copy");
+    assert_eq!(
+        unsafe { *cell.add(1) },
+        copied,
+        "the cycle closes on the copy"
+    );
 }
 
 /// A **two-cell cycle** (`X -> Y -> X`) is copied without corruption: both cells are copied
@@ -507,7 +545,11 @@ fn a_two_cell_cons_cycle_is_copied_without_corruption() {
     // SAFETY: `cy` is the live, copied second cell.
     let py = list_val(cy);
     assert_eq!(unsafe { *py }, make_small(2));
-    assert_eq!(unsafe { *py.add(1) }, cx, "the two-cycle closes on the copies");
+    assert_eq!(
+        unsafe { *py.add(1) },
+        cx,
+        "the two-cycle closes on the copies"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -529,8 +571,15 @@ fn assert_corpus(root: Eterm, corpus: Corpus) {
     match corpus {
         Corpus::Shared(base) => {
             let (sa, sb, va, vb) = shared_subterm_views(root);
-            assert_eq!(sa, sb, "base {base}: the shared subterm stays a single object");
-            assert_eq!((va, vb), (base + 10, base + 20), "base {base}: path values intact");
+            assert_eq!(
+                sa, sb,
+                "base {base}: the shared subterm stays a single object"
+            );
+            assert_eq!(
+                (va, vb),
+                (base + 10, base + 20),
+                "base {base}: path values intact"
+            );
             // SAFETY: `sa` is the live, copied shared `{base, base+1}` tuple.
             assert_eq!(unsafe { *boxed_val(sa).add(1) }, make_small(base));
             assert_eq!(unsafe { *boxed_val(sa).add(2) }, make_small(base + 1));
@@ -603,7 +652,10 @@ fn shared_and_cyclic_graphs_survive_both_strategies() {
                 "{kind:?}: nursery empty after round {round}"
             );
             for (root, corpus) in roots.iter().zip(&corpora) {
-                assert!(in_mature(&collector, *root), "{kind:?}: root moved into mature");
+                assert!(
+                    in_mature(&collector, *root),
+                    "{kind:?}: root moved into mature"
+                );
                 assert_corpus(*root, *corpus);
             }
         }

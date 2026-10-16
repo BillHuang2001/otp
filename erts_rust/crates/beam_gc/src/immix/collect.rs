@@ -45,8 +45,8 @@
 
 use beam_common::Result;
 use beam_term::prelude::{
-    boxed_val, is_header, is_non_value, list_val, make_boxed, make_list, primary_tag, ptr_val, Eterm,
-    PrimaryTag,
+    boxed_val, is_header, is_non_value, list_val, make_boxed, make_list, primary_tag, ptr_val,
+    Eterm, PrimaryTag,
 };
 
 use crate::copy::{for_each_ref, forward_slot, move_size, EvacDest, Target};
@@ -318,11 +318,7 @@ impl ImmixSpace {
     /// **release** the unmarked lines, **evacuate** the `Partial` blocks (pinning every
     /// object whose block is full or that no hole can hold) and **finalize**. `roots` and
     /// `promoted` are rewritten in place, exactly like the copying collector's roots.
-    pub fn collect(
-        &mut self,
-        roots: &mut [Eterm],
-        promoted: &mut [Eterm],
-    ) -> Result<ImmixStats> {
+    pub fn collect(&mut self, roots: &mut [Eterm], promoted: &mut [Eterm]) -> Result<ImmixStats> {
         self.mark(roots, promoted)?;
 
         let lines_before = self.used_lines();
@@ -350,11 +346,7 @@ impl ImmixSpace {
     /// shared marker protocol (`forward_slot`), whose `Live` decision comes from this
     /// type's [`EvacDest`] implementation. References *inside* a copy or a pinned object
     /// are queued on a worklist and forwarded after the walk.
-    fn evacuate(
-        &mut self,
-        roots: &mut [Eterm],
-        promoted: &mut [Eterm],
-    ) -> Result<ImmixStats> {
+    fn evacuate(&mut self, roots: &mut [Eterm], promoted: &mut [Eterm]) -> Result<ImmixStats> {
         let mut stats = ImmixStats::default();
         let mut work: Vec<*mut Eterm> = Vec::new();
         let n_lines = self.line_count();
@@ -382,8 +374,7 @@ impl ImmixSpace {
                 (total, lines_for(total).min(n_lines - g).max(1))
             };
             debug_assert!(
-                span <= super::LINES_PER_BLOCK - l
-                    || self.block_state(b) == BlockState::AllMarked,
+                span <= super::LINES_PER_BLOCK - l || self.block_state(b) == BlockState::AllMarked,
                 "an object that spans blocks must start in a block it fills completely"
             );
 

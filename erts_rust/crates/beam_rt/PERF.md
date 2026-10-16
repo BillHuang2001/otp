@@ -877,8 +877,9 @@ call in the scheduler shape (path B): a **failed** copier preflight walk, then
 one. `copy_struct`'s refusal is a preflight: it refuses **before** writing any destination word, so the
 first attempt is an entire wasted walk. The new body sources the growth hint from the refusal the
 copier itself already produced (`AllocFailure::requested / size_of::<Eterm>()`, the `beam_message::error`
-contract's exact flat word count — no second traversal), shares **one** `OffHeapTable`/`CopyContext`
-across both attempts, and gates the retry on `beam_message::is_message_heap_exhaustion` so a refusal
+contract's exact flat word count — no second traversal), gives each attempt its own **fresh**
+`OffHeapTable` destination (which is what keeps the copier's fast path eligible), and gates the retry on
+`beam_message::is_message_heap_exhaustion` so a refusal
 growing the destination cannot fix (above all the malformed-graph `badarg`) no longer grows a whole
 space and fails identically. Nothing in the frozen precondition set was weakened: the rewind still
 requires an empty source `OffHeapTable`, `!reentrant`, an `Ok` result, a scheduled process
@@ -972,18 +973,17 @@ unchanged and the call answers `None`) and its positive control
 `an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies` (an oversized `lists:seq(1, 2000)`
 result still grows the nursery and is copied on the retry).
 
-### The ceiling that is NOT reachable from this node
-The real remaining cost is that the copy-out's destination, `Process::heap_mut()`, is **never clean**:
-`beam_message::copy::is_clean_destination` requires `to.used() == 0`, so the copier's allocation-free
-optimistic single-pass path (`try_copy_fast`) is **bypassed on every copy-out** and every copy pays a
-full `preflight_words` walk before writing a word. Relaxing that guard (it already rolls its own
-off-heap pushes back via `OffHeapTable::rollback`, and `Heap::reset` rewinds the trial bump pointer, so
-dropping the `to.used() == 0` half would be safe **for this call site**, whose destination is a
-`Process` young heap the caller owns) would eliminate one of the two remaining walks *and* the growth
-entirely — which is also the item-4 RSS mechanism below. That is a **sibling-crate** change
-(`erts_rust/crates/beam_message/src/copy.rs::is_clean_destination`, with
-`beam_message/src/off_heap.rs::{is_fully_empty, rollback}` and `beam_process::Process::heap_mut` as the
-supporting API) and is **reported, not hacked around**: this node owns only the call site.
+### The copy-out destination is always fast-path-eligible
+`beam_message`'s copier takes its allocation-free single-traversal path (`try_copy_fast`) exactly when
+`copy.rs::is_fast_path_eligible` holds, i.e. when the destination's `OffHeapTable` is fully empty in all
+three of its lists — the destination **heap**'s `used` is deliberately not part of that gate.
+`src/context/calls.rs::copy_result_fresh` builds a **fresh** `beam_message::OffHeapTable::new()` for each
+copy attempt, so the gate is true every time and every copy-out is served by the one traversal, with no
+`preflight_words` walk before the first word is written.
+The `grow_nursery` retry gets its **own** fresh table, so a partial attempt's registrations can never
+reach it.
+On success the local table's off-heap references are adopted into `Runtime::eval_off_heap`; on a refusal
+nothing is adopted and the dropped table releases the node references the abandoned attempt took.
 
 ### Gate
 `erts_rust/tools/differential/gate.sh` on the AFTER tree: `differential gate: total=2497 agree=2495

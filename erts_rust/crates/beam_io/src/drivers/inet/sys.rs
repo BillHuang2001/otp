@@ -40,6 +40,7 @@ use std::os::unix::io::RawFd;
 
 use beam_common::Result;
 
+use super::wire::InetAddr;
 use crate::drivers::fd::set_nonblocking;
 use crate::error;
 
@@ -292,4 +293,171 @@ pub(super) fn close_fd(fd: RawFd) {
 /// the socket is AF_INET, so the kernel filled in exactly that structure.
 fn addr_ptr_as_sockaddr_in(addr: &libc::sockaddr_storage) -> *const libc::sockaddr_in {
     std::ptr::from_ref(addr).cast()
+}
+
+// ---------------------------------------------------------------------------
+// Datagram (`udp_inet`) syscalls
+// ---------------------------------------------------------------------------
+
+/// Creates a non-blocking IPv4 UDP socket (`SOCK_DGRAM`), the `udp_inet` counterpart of
+/// [`socket_fd`].
+///
+/// # Errors
+///
+/// `BeamError::Io` when `socket(2)` or the non-blocking `fcntl(2)` fails.
+pub(super) fn dgram_socket_fd() -> Result<RawFd> {
+    // SAFETY: `socket(2)` takes three integers and needs no pointer arguments.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    match set_nonblocking(fd) {
+        Ok(()) => Ok(fd),
+        Err(err) => {
+            close_fd(fd);
+            Err(err)
+        }
+    }
+}
+
+/// Binds `fd` to the endpoint `address` names (`bind(2)`).
+///
+/// The single `bind(2)` call site, shared by the TCP and UDP `bind` verbs (the C's `sock_bind`).
+///
+/// # Errors
+///
+/// The raw `bind(2)` failure.
+pub(super) fn bind_socket(fd: RawFd, address: &InetAddr) -> std::io::Result<()> {
+    let sa = address.sockaddr_in();
+    // SAFETY: `fd` is an open socket owned by this driver and `sa` is a fully initialized
+    // `sockaddr_in`, so the kernel reads at most `size_of::<sockaddr_in>()` bytes of it and
+    // never retains the pointer.
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            std::ptr::addr_of!(sa).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Associates `fd` with the default peer `address` (`connect(2)` on a datagram socket).
+///
+/// A UDP `connect(2)` is synchronous: it only records a default destination and installs a
+/// filter, so a `0` return means "connected" (the C's `sock_connect` on the UDP branch,
+/// `inet_drv.c:14802`).
+///
+/// # Errors
+///
+/// The raw `connect(2)` failure.
+pub(super) fn connect_socket(fd: RawFd, address: &InetAddr) -> std::io::Result<()> {
+    let sa = address.sockaddr_in();
+    // SAFETY: `fd` is an open socket owned by this driver and `sa` is a fully initialized
+    // `sockaddr_in`, so the kernel reads at most `size_of::<sockaddr_in>()` bytes of it and
+    // never retains the pointer.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            std::ptr::addr_of!(sa).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Sends one datagram from `fd` to `address` (`sendto(2)`, the C's `sock_sendto`).
+///
+/// # Errors
+///
+/// The raw `sendto(2)` failure (`EMSGSIZE` for an over-long datagram).
+pub(super) fn send_to(fd: RawFd, buf: &[u8], address: &InetAddr) -> std::io::Result<usize> {
+    let sa = address.sockaddr_in();
+    // SAFETY: `fd` is an open socket owned by this driver, `buf` points to `buf.len()`
+    // initialized bytes the kernel only reads, and `sa` is a fully initialized `sockaddr_in`,
+    // so the kernel reads at most `size_of::<sockaddr_in>()` bytes of it and never retains the
+    // pointer. `MSG_NOSIGNAL` keeps a vanished peer a return value, not a fatal signal.
+    let n = unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr().cast(),
+            buf.len(),
+            libc::MSG_NOSIGNAL,
+            std::ptr::addr_of!(sa).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+/// Sends one datagram on the connected socket `fd` (`send(2)`, the C's `sock_send`).
+///
+/// # Errors
+///
+/// The raw `send(2)` failure.
+pub(super) fn send_connected(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: `fd` is an open socket owned by this driver and `buf` points to `buf.len()`
+    // initialized bytes the kernel only reads and never retains. `MSG_NOSIGNAL` keeps a
+    // vanished peer a return value rather than a process-killing `SIGPIPE`.
+    let n = unsafe {
+        libc::send(
+            fd,
+            buf.as_ptr().cast(),
+            buf.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+/// Receives one datagram from `fd` into `buf`, decoding the source endpoint
+/// (`recvfrom(2)`, the C's `sock_recvfrom`).
+///
+/// Returns `(bytes_received, source)`; the source is decoded for an AF_INET peer.
+///
+/// # Errors
+///
+/// The raw `recvfrom(2)` failure (`EAGAIN` when nothing is pending).
+pub(super) fn recv_from(fd: RawFd, buf: &mut [u8]) -> std::io::Result<(usize, InetAddr)> {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid value of that type and is exactly the
+    // out-parameter `recvfrom(2)` expects; `len` starts as its size and the kernel may shrink
+    // it.
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `fd` is an open socket owned by this driver, `buf` is a writable array of
+    // `buf.len()` bytes, and `addr`/`len` are a valid address buffer and its length, so the
+    // kernel writes at most `buf.len()` bytes into `buf` and at most `len` bytes into `addr`.
+    let n = unsafe {
+        libc::recvfrom(
+            fd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            std::ptr::addr_of_mut!(addr).cast(),
+            &mut len,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the socket is AF_INET, so the kernel filled in a `sockaddr_in` at the start of
+    // the `sockaddr_storage`, which is at least as large and at least as aligned as it.
+    let sin: libc::sockaddr_in = unsafe { std::ptr::read(addr_ptr_as_sockaddr_in(&addr)) };
+    let source = InetAddr {
+        port: u16::from_be(sin.sin_port),
+        addr: sin.sin_addr.s_addr.to_ne_bytes(),
+    };
+    Ok((n as usize, source))
 }

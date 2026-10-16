@@ -80,6 +80,18 @@
 //! `min_bin_vheap_size`, `os_type`, `endian`). Every path is pinned only by a *relation* or a
 //! *shape*; no host path, release string or live counter is ever asserted by value.
 //!
+//! The same block completes the code server's **load surface**: `code:load_binary/3`'s two
+//! distinguishable refusals — a corrupt image ⇒ the frozen `{error,badfile}`, a *valid* image for
+//! a module loaded from a sticky directory ⇒ `{error,sticky_directory}` (the image is validated
+//! *before* the sticky check) — and the **boot-time loaded set**'s atom consequence: the
+//! `{primLoad, …}` batches *after* `{kernel_load_completed}` are not loaded eagerly, so the
+//! modules they name are not loaded at boot and the atoms only their images carry do not exist
+//! (`erlang:list_to_existing_atom("hello")`, which rides `auth.beam`, is a `badarg`).
+//! `code:load_binary/3`'s refusal paths also **log** asynchronously on the oracle's stdout
+//! (`beam_load.c`'s report), which would race with the compared stdout, so that one case runs both
+//! runtimes with the documented `-kernel logger_level none` kill switch (see [`eval_with_argv`])
+//! and pins the return value alone.
+//!
 //! The surfaces deliberately **not** pinned here are plain differing observables — genuine
 //! divergences that would be a `mismatch`, not a capability gap — and are handoffs to `beam_rt`
 //! (the oracle value state, verified against the live system ERTS, is what the runtime should
@@ -124,13 +136,31 @@ fn eval(
     expr: &'static str,
     golden: &'static str,
 ) -> Case {
+    eval_with_argv(id, description, expr, &[], golden)
+}
+
+/// The same, for the one case that needs an **extra flag** — still the *identical* argv for both
+/// runtimes (`-noshell`, the flag, `-eval`). `boot_extra/code_load_binary_shapes` uses it to run
+/// the emulator's documented `-kernel logger_level none` kill switch: the oracle's refusal paths
+/// for `code:load_binary/3` **log** asynchronously to stdout (`beam_load.c`'s
+/// `corrupt file header` / "resides in sticky dir" report), which races with the probe's own
+/// output and is not part of the BIF's return value — the harness compares stdout exactly, so the
+/// report must not be produced at all. (The sibling oracle harnesses suppress it the same way,
+/// e.g. `crates/beam_process/tests/common/mod.rs`.)
+fn eval_with_argv(
+    id: &'static str,
+    description: &'static str,
+    expr: &'static str,
+    extra_argv: &'static [&'static str],
+    golden: &'static str,
+) -> Case {
     Case {
         id,
         description,
         contracts: &[Contract::Build],
         kind: CaseKind::Eval {
             expr,
-            extra_argv: &[],
+            extra_argv,
             probe: Probe::Value,
         },
         golden: Golden {
@@ -1597,6 +1627,40 @@ pub(crate) fn group() -> Vec<Case> {
             "code:ensure_loaded(no_such_module_xyz)",
             "ok {error,nofile}",
         ),
+        // --- `code:load_binary/3`'s shapes -------------------------------------------------
+        // A memory load *prepares* the image and only then consults the code server's sticky
+        // check, so the two refusals are distinguishable: a corrupt image is the frozen
+        // `{error,badfile}` (the image never validates) while a valid image for a module that is
+        // loaded from a sticky directory is `{error,sticky_directory}` (it validated first).
+        // Both refusal paths also **log** asynchronously on the oracle's stdout, so this case
+        // runs both runtimes with `-kernel logger_level none` (see `eval_with_argv`) and pins
+        // the return value alone.
+        eval_with_argv(
+            "boot_extra/code_load_binary_shapes",
+            "code:load_binary/3 refuses a valid image of a sticky-loaded module with the frozen \
+             {error,sticky_directory} (the image validated first) and a corrupt image with \
+             {error,badfile}",
+            "begin {Mod, Bin, _} = code:get_object_code(lists), {code:load_binary(Mod, \
+             \"lists.beam\", Bin), code:load_binary(mymod, \"/x/mymod.beam\", <<>>)} end",
+            &["-kernel", "logger_level", "none"],
+            "ok {{error,sticky_directory},{error,badfile}}",
+        ),
+        // --- The boot-time loaded set: the post-`{kernel_load_completed}` primLoad batches --
+        // `bootstrap/bin/start.boot` carries three `{primLoad, …}` batches; `init` loads only the
+        // one **before** `{kernel_load_completed}` eagerly outside embedded mode (the default),
+        // so the modules of the later batches are not loaded at boot — and, because loading a
+        // module is what interns its whole `Atoms` chunk, neither are the atoms only they carry:
+        // `hello` rides `auth.beam` and `world` rides `net_adm.beam`, both post-marker names.
+        eval(
+            "boot_extra/prim_load_batches_after_kernel_load_completed_are_not_loaded",
+            "the modules of the `{primLoad, …}` batches after `{kernel_load_completed}` (auth, \
+             net_adm) are not loaded at boot, so the atom only their images carry (hello, from \
+             auth.beam) does not exist",
+            "begin Auth = code:is_loaded(auth), NetAdm = code:is_loaded(net_adm), Missing = try \
+             erlang:list_to_existing_atom(\"hello\") catch error:Reason -> Reason end, \
+             {Auth, NetAdm, Missing} end",
+            "ok {false,false,badarg}",
+        ),
         // --- The preloaded `atomics` runtime floor -----------------------------------------
         // `atomics` is preloaded (see the membership cases above); its observable floor is live
         // with no application started. The whole put/get family is pinned by value: the
@@ -2054,6 +2118,19 @@ mod tests {
             );
         }
     }
+
+    /// The one case here that carries an extra argv: `code_load_binary_shapes` silences the
+    /// oracle's asynchronous refusal *report* on stdout (`beam_load.c`'s `corrupt file header` /
+    /// "resides in sticky dir" log, which races with the probe's own output and is not part of
+    /// `code:load_binary/3`'s return value) with the documented `-kernel logger_level none` kill
+    /// switch — the same suppression the sibling oracle harnesses use
+    /// (`crates/beam_process/tests/common/mod.rs`). Both runtimes still receive the **identical**
+    /// argv (only the program path differs), like every other case in this group.
+    const EXTRA_ARGV_CASES: &[(&str, &[&str])] = &[(
+        "boot_extra/code_load_binary_shapes",
+        &["-kernel", "logger_level", "none"],
+    )];
+
     #[test]
     fn only_the_environment_case_carries_an_environment() {
         for case in group() {
@@ -2064,14 +2141,29 @@ mod tests {
                 "case {}: env case/non-env case mismatch",
                 case.id
             );
-            // Every case that does *not* pinn the environment takes no extra argv either.
+            // A case that does not pin the environment takes no extra argv either — except the
+            // reviewed `EXTRA_ARGV_CASES` above, whose flag both runtimes receive identically.
             if case.env().is_empty() {
-                assert!(
-                    case.extra_argv().is_empty(),
-                    "case {}: takes no extra argv",
+                let expected = EXTRA_ARGV_CASES
+                    .iter()
+                    .find(|(id, _)| *id == case.id)
+                    .map(|(_, argv)| *argv)
+                    .unwrap_or(&[]);
+                assert_eq!(
+                    case.extra_argv(),
+                    expected,
+                    "case {}: unexpected extra argv",
                     case.id
                 );
             }
+        }
+        // A reviewed exception that no longer names a case here would otherwise go unnoticed.
+        for (id, argv) in EXTRA_ARGV_CASES {
+            let case = group()
+                .into_iter()
+                .find(|c| c.id == *id)
+                .unwrap_or_else(|| panic!("the extra-argv set lists a missing case: {id}"));
+            assert_eq!(case.extra_argv(), *argv, "case {id}");
         }
         // The environment case pins `ERL_AFLAGS` (the documented variable) and nothing else.
         for id in ENV_CASES {
@@ -2109,6 +2201,8 @@ mod tests {
         "ok {module,lists}",
         "ok {error,bad_name}",
         "ok {error,nofile}",
+        "ok {{error,sticky_directory},{error,badfile}}",
+        "ok {false,false,badarg}",
         "ok {starting,started}",
         "ok {a,b}",
         "ok absolute",

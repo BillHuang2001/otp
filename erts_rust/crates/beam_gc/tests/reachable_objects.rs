@@ -220,7 +220,10 @@ fn a_live_off_heap_binary_handle_is_found_and_an_unreachable_one_is_not() {
         }
     }
 
-    assert!(saw_sub_bits, "the live `ErlSubBits` handle must be enumerated");
+    assert!(
+        saw_sub_bits,
+        "the live `ErlSubBits` handle must be enumerated"
+    );
     assert!(
         named.contains(&(live_payload.data_ptr() as usize)),
         "the live `BinRef` must name the live off-heap payload"
@@ -288,8 +291,16 @@ fn a_cyclic_graph_visits_each_object_once_and_terminates() {
 
     // A cons-cell **ring** is traversed (so the boxed object it names is reached) but its cells
     // are not reported — they carry no header word.
-    let cell_a = c.young_mut().heap_mut().cons(make_small(1), NIL).expect("cell a");
-    let cell_b = c.young_mut().heap_mut().cons(make_small(2), cell_a).expect("cell b");
+    let cell_a = c
+        .young_mut()
+        .heap_mut()
+        .cons(make_small(1), NIL)
+        .expect("cell a");
+    let cell_b = c
+        .young_mut()
+        .heap_mut()
+        .cons(make_small(2), cell_a)
+        .expect("cell b");
     let leaf = tuple_in(c.young_mut(), &[make_small(7)]);
     // SAFETY: `cell_a` is a live 2-word cons cell; word 0 is the car and word 1 the cdr, and
     // both writes stay inside the cell.
@@ -319,8 +330,8 @@ fn any_collector_forwards_the_enumeration_for_both_strategies() {
             initial_mature_words: 512,
             ..HeapPolicy::default()
         };
-        let mut c = AnyCollector::from_config(&GcConfig::new(policy).with_mature(kind))
-            .expect("collector");
+        let mut c =
+            AnyCollector::from_config(&GcConfig::new(policy).with_mature(kind)).expect("collector");
         assert_eq!(c.kind(), kind, "{kind:?}: the strategy was pinned");
 
         // `m` is promoted (mature-resident) by a fullsweep.
@@ -395,7 +406,10 @@ fn the_safe_view_finds_a_live_off_heap_binary_with_no_unsafe() {
     })
     .expect("the reachability walk never fails");
 
-    assert!(saw_sub_bits, "the live `ErlSubBits` handle must be enumerated");
+    assert!(
+        saw_sub_bits,
+        "the live `ErlSubBits` handle must be enumerated"
+    );
     assert!(
         named.contains(&(live_payload.data_ptr() as usize)),
         "the live `BinRef` must name the live off-heap payload"
@@ -433,7 +447,9 @@ fn the_safe_view_reports_exactly_the_raw_walks_objects() {
 
     let roots = vec![m, y, z];
 
-    let raw = addresses(&enumerate(|visit| c.for_each_reachable_object(&roots, visit)));
+    let raw = addresses(&enumerate(|visit| {
+        c.for_each_reachable_object(&roots, visit)
+    }));
     let view = addresses(&enumerate_view(|visit| {
         c.for_each_reachable_object_view(&roots, visit)
     }));
@@ -506,8 +522,8 @@ fn any_collector_forwards_the_safe_view_for_both_strategies() {
             initial_mature_words: 512,
             ..HeapPolicy::default()
         };
-        let mut c = AnyCollector::from_config(&GcConfig::new(policy).with_mature(kind))
-            .expect("collector");
+        let mut c =
+            AnyCollector::from_config(&GcConfig::new(policy).with_mature(kind)).expect("collector");
 
         let m = tuple_in(c.young_mut(), &[make_small(1), make_small(2)]);
         let mut roots = vec![m];
@@ -521,7 +537,9 @@ fn any_collector_forwards_the_safe_view_for_both_strategies() {
         let view = addresses(&enumerate_view(|visit| {
             c.for_each_reachable_object_view(&roots, visit)
         }));
-        let raw = addresses(&enumerate(|visit| c.for_each_reachable_object(&roots, visit)));
+        let raw = addresses(&enumerate(|visit| {
+            c.for_each_reachable_object(&roots, visit)
+        }));
 
         assert_eq!(
             view,
@@ -544,7 +562,10 @@ fn the_view_accessors_are_exact_for_a_known_object() {
     let mut c = Collector::new(policy).expect("collector");
 
     // A 3-element tuple: `[header, e0, e1, e2]`.
-    let t = tuple_in(c.young_mut(), &[make_small(1), make_small(2), make_small(3)]);
+    let t = tuple_in(
+        c.young_mut(),
+        &[make_small(1), make_small(2), make_small(3)],
+    );
     let roots = vec![t];
 
     let mut visited = 0usize;
@@ -556,7 +577,11 @@ fn the_view_accessors_are_exact_for_a_known_object() {
         assert_eq!(obj.word(0), Some(obj.header()));
         assert_eq!(obj.words()[0], obj.header());
         assert_eq!(obj.address(), obj.words().as_ptr() as usize);
-        assert_eq!(obj.address(), ptr_val(t) as usize, "the view's identity is the header address");
+        assert_eq!(
+            obj.address(),
+            ptr_val(t) as usize,
+            "the view's identity is the header address"
+        );
         assert_eq!(obj.word(1), Some(make_small(1)));
         assert_eq!(obj.word(2), Some(make_small(2)));
         assert_eq!(obj.word(3), Some(make_small(3)));

@@ -84,8 +84,9 @@
 //!   includes the `131` version byte; for a top-level `COMPRESSED` image it stops at
 //!   the zlib stream's end, so bytes after the image are *not* counted — the count
 //!   comes straight from `beam_codec`'s
-//!   [`decode_term_used`]/[`decode_term_with_local_node_used`]). `safe` refuses a
-//!   term that would create an atom.
+//!   [`decode_term_with_options_used`]). Under `safe` the codec itself refuses a
+//!   wire atom name that is not already interned — a `badarg` raised **before** any
+//!   interning, so nothing reaches the receiving node's atom table.
 //!
 //! # The `term_to_binary/2` options
 //!
@@ -213,7 +214,7 @@ use std::cell::RefCell;
 
 use beam_codec::compress::compress as zlib_compress;
 use beam_codec::{
-    decode_term_used, decode_term_with_local_node_used, Encoder, MinorVersion, COMPRESSED_EXT,
+    decode_term_with_options_used, DecodeOptions, Encoder, MinorVersion, COMPRESSED_EXT,
     VERSION_MAGIC,
 };
 use beam_common::Result;
@@ -1069,51 +1070,400 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // Building that copy per call is `O(table)` **allocations** — ~127 us for the
 // ~3000-atom table of a booted runtime, which is the whole cost of
 // `binary_to_term/1,2` (the term itself decodes in ~1 us). The copy is therefore
-// memoized per thread and **verified** against the live table index by index before it
-// is reused: comparing is allocation-free and ~25x cheaper than rebuilding.
+// memoized per thread: it is kept **exact** (the decoder's appends are copied back in)
+// and validated against the live table through an O(1) *witness*
+// ([`beam_term::AtomSnapshot`] + [`AtomTable::appended_since`]) held beside it, so the
+// steady state reads no atom name at all. The index-by-index comparison survives only as
+// the fallback for a table the witness cannot vouch for (see [`with_decode_scratch`]).
 //
 // This is a *cache of the caller's own immutable input*, carrying no cross-call
 // semantics; it retains one table image per thread while the process lives.
 thread_local! {
-    static DECODE_SCRATCH: RefCell<Option<AtomTable>> = const { RefCell::new(None) };
+    static DECODE_SCRATCH: RefCell<Option<DecodeScratch>> = const { RefCell::new(None) };
 }
+
+/// The per-thread decode memo: the scratch image plus the O(1) witness that proves it is
+/// still an image of the *shared* table it was taken from.
+struct DecodeScratch {
+    /// The decoder's mutable scratch. It names the same atom as `witness`'s table at
+    /// every index below `witness.len()` (the decoder may append beyond that).
+    memo: AtomTable,
+    /// A snapshot of the **shared** table — never of `memo`, which is a clone and so
+    /// carries a fresh identity that can never satisfy
+    /// [`AtomTable::appended_since`] — taken at the last moment `memo` was known to be
+    /// index-identical to it over `0..witness.len()`.
+    witness: beam_term::AtomSnapshot,
+}
+
+// Test-only scratch-machinery metrics for this thread: `(name_comparisons, rebuilds)`.
+//
+// `name_comparisons` counts the `AtomTable::name` reads the scratch machinery performs
+// (one per index compared by [`prefix_matches`], one per index copied by the extend
+// loop); `rebuilds` counts the full `AtomTable::clone` rebuilds. Both are read by
+// `mod scratch_pins` and are a no-op in a production build (see [`bump_name_comparisons`]
+// and [`bump_rebuild`]) — no production behaviour depends on them.
+#[cfg(test)]
+thread_local! {
+    static DECODE_SCRATCH_METRICS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Adds `n` to this thread's scratch-machinery name-read count (see
+/// [`DECODE_SCRATCH_METRICS`]).
+#[cfg(test)]
+fn bump_name_comparisons(n: usize) {
+    DECODE_SCRATCH_METRICS.with(|metrics| {
+        let (comparisons, rebuilds) = metrics.get();
+        metrics.set((comparisons + n, rebuilds));
+    });
+}
+
+/// Production build: the name-read count is not instrumented.
+#[cfg(not(test))]
+#[inline(always)]
+fn bump_name_comparisons(_n: usize) {}
+
+/// Counts one scratch rebuild — a full `AtomTable::clone` of the shared table — on this
+/// thread (see [`DECODE_SCRATCH_METRICS`]).
+#[cfg(test)]
+fn bump_rebuild() {
+    DECODE_SCRATCH_METRICS.with(|metrics| {
+        let (comparisons, rebuilds) = metrics.get();
+        metrics.set((comparisons, rebuilds + 1));
+    });
+}
+
+/// Production build: the rebuild count is not instrumented.
+#[cfg(not(test))]
+#[inline(always)]
+fn bump_rebuild() {}
 
 /// Whether `memo` names the same atom as `shared` at every index `memo` holds.
 ///
 /// `memo.len() > shared.len()` is `false` by definition: such a memo cannot stand in
-/// for `shared` (its novel-atom prediction would be off by the difference).
+/// for `shared` (its novel-atom prediction would be off by the difference), which is
+/// also why the check never touches a name in that case.
+///
+/// This is the Θ(table) **fallback** of [`with_decode_scratch`] (allocation-free, but
+/// one name read per index); the steady state is proven in O(1) by that function's
+/// witness instead.
 fn prefix_matches(memo: &AtomTable, shared: &AtomTable) -> bool {
-    memo.len() <= shared.len()
-        && (0..memo.len()).all(|index| {
-            let atom = Atom::from_raw(index as u32);
-            memo.name(atom) == shared.name(atom)
-        })
+    if memo.len() > shared.len() {
+        return false;
+    }
+    (0..memo.len()).all(|index| {
+        bump_name_comparisons(1);
+        let atom = Atom::from_raw(index as u32);
+        memo.name(atom) == shared.name(atom)
+    })
 }
 
-/// Runs `f` on an exact image of `shared`, rebuilding or extending the per-thread memo
-/// as needed (see [`DECODE_SCRATCH`]).
+/// Runs `f` on an exact image of `shared`, reusing/extending/rebuilding the per-thread
+/// memo as needed (see [`DECODE_SCRATCH`]).
 ///
 /// `f` receives a table that is index-identical to `shared`, and may extend it (that is
 /// what the decoder does with a novel atom); the memo is *not* required to stay an
 /// image of `shared` afterwards, so the next call revalidates. A re-entrant call (which
 /// the decode path cannot produce — decoding never dispatches a BIF) falls back to a
 /// private copy rather than panicking.
+///
+/// # The witness protocol
+///
+/// The memo carries a [`beam_term::AtomSnapshot`] of the **shared** table, taken from
+/// `shared` itself — never from the memo, which is a clone and therefore has a fresh
+/// identity that can never satisfy [`AtomTable::appended_since`] — at the last moment the
+/// memo was known to name the same atom as `shared` at every index below the witness's
+/// length. The invariant maintained across calls is exactly that: over
+/// `0..min(memo.len(), witness.len())` the memo and the shared table agree index for
+/// index (`AtomTable` has no reorder/remove API, so the decoder's own appends cannot
+/// break it).
+///
+/// Under that invariant the **fast path** is O(1) + O(delta) and reads no atom name:
+/// `memo.len() == witness.len()` together with `shared.appended_since(witness)` proves
+/// that `shared` still names the same atom at every index the memo covers (same instance,
+/// and every mutation since the witness was a pure append), so the memo may simply be
+/// extended with `shared`'s names at `witness.len()..shared.len()` — normally none, and
+/// never more than the table has actually grown.
+///
+/// Every other shape falls back to the index-by-index [`prefix_matches`]: a different or
+/// replaced table, a clone (what a copy-on-write replacement of `shared` presents), a
+/// shrunken table, or a memo left **longer** than `shared` by an earlier failed/`safe`
+/// decode (whose novel-atom prediction would be off by the difference — such a memo is
+/// rejected by a length check alone, without reading a name). A memo that fails that scan
+/// is discarded and rebuilt from `shared`.
+///
+/// Either way the memo ends up exactly `shared`, so the witness is refreshed from
+/// `shared` before `f` runs; a decode that appends to the memo merely leaves it longer
+/// than the witness, which the next call's fast-path guard refuses.
 fn with_decode_scratch<R>(shared: &AtomTable, f: impl FnOnce(&mut AtomTable) -> R) -> R {
     DECODE_SCRATCH.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             return f(&mut shared.clone());
         };
-        if slot.as_ref().is_none_or(|memo| !prefix_matches(memo, shared)) {
-            *slot = Some(shared.clone());
+        let usable = slot.as_ref().is_some_and(|scratch| {
+            // O(1): same instance as the witness, pure appends since, and the memo is
+            // exactly as long as the witness vouches for.
+            (scratch.memo.len() == scratch.witness.len()
+                && shared.appended_since(scratch.witness))
+                // Θ(table) fallback: the memo names the same atom as `shared` index for
+                // index, and is no longer than it.
+                || prefix_matches(&scratch.memo, shared)
+        });
+        if !usable {
+            bump_rebuild();
+            *slot = Some(DecodeScratch {
+                memo: shared.clone(),
+                witness: shared.snapshot(),
+            });
         }
         let scratch = slot.as_mut().expect("installed above");
-        for index in scratch.len()..shared.len() {
+        // Extend to an exact image of `shared`: the memo already agrees with it over
+        // `memo.len()`, and the names at `memo.len()..shared.len()` are `shared`'s own.
+        for index in scratch.memo.len()..shared.len() {
+            bump_name_comparisons(1);
             if let Some(name) = shared.name(Atom::from_raw(index as u32)) {
-                scratch.intern(name);
+                scratch.memo.intern(name);
             }
         }
-        f(scratch)
+        // The memo now names exactly what `shared` holds, so witness it: that is what
+        // lets the next call prove index-identity in O(1) instead of scanning.
+        scratch.witness = shared.snapshot();
+        f(&mut scratch.memo)
     })
+}
+
+/// Deterministic pins on the **O(1)** witness-guarded decode scratch: how many
+/// `AtomTable::name` reads (and full rebuilds) the scratch machinery performs per call,
+/// counted with the test-only metrics above — never wall-clock time.
+///
+/// The counters are thread-local and every `#[test]` runs on its own thread, so each case
+/// starts from a cold memo unless it deliberately warms one. Each case also asserts the
+/// atom index the decoded term resolves to, so no pin can be satisfied by a memo that is
+/// fast *and wrong*. The shapes a blind reuse would corrupt (a moved name, a shrunken
+/// table, a memo left ahead by a failed/`safe` decode) are also pinned by
+/// `tests/decode_scratch.rs`, which carries them across calls on the public BIF surface.
+#[cfg(test)]
+mod scratch_pins {
+    use super::*;
+    use crate::registry::{default_registry, BifRegistry};
+    use beam_alloc::Heap;
+    use beam_process::ProcessId;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// `binary_to_term(<<131,119,3,102,111,111>>)` — the atom `foo`.
+    const FOO_BLOB: &[u8] = &[131, 119, 3, 102, 111, 111];
+
+    /// `binary_to_term(<<131,116,0,0,0,1,119,1,97,97,1>>)` — the map `#{a => 1}`, whose
+    /// key is an already-interned atom (so this image interns nothing).
+    const MAP_A_BLOB: &[u8] = &[131, 116, 0, 0, 0, 1, 119, 1, 97, 97, 1];
+
+    /// The names every pin table is seeded with, in this order, so index 0 is `a` and
+    /// index 3 is `foo`.
+    const NAMES: &[&str] = &["a", "b", "c", "foo"];
+
+    /// An [`AtomInterner`](crate::context::AtomInterner) over a *clone* of the context's
+    /// table — the shape `beam_rt`'s pending interner takes (it predicts the context
+    /// table's next indices and commits them in order).
+    struct Interner {
+        table: Rc<RefCell<AtomTable>>,
+    }
+
+    impl crate::context::AtomInterner for Interner {
+        fn intern(&mut self, name: &str) -> Atom {
+            self.table.borrow_mut().intern(name)
+        }
+    }
+
+    fn table(names: &[&str]) -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed(names.iter().copied());
+        atoms
+    }
+
+    fn heap() -> Heap {
+        Heap::new(1 << 16).expect("test heap")
+    }
+
+    /// `(name comparisons, rebuilds)` the scratch machinery performed on this thread.
+    fn metrics() -> (usize, usize) {
+        DECODE_SCRATCH_METRICS.with(std::cell::Cell::get)
+    }
+
+    /// Zeroes this thread's scratch-machinery counters.
+    fn reset_metrics() {
+        DECODE_SCRATCH_METRICS.with(|metrics| metrics.set((0, 0)));
+    }
+
+    /// Decodes `blob` under a context borrowing `atoms` (with an interner over a clone of
+    /// it, so a novel name is committed at the index the decoder wrote), returning the
+    /// decoded term and the interner's table.
+    fn decode(
+        reg: &BifRegistry,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+        blob: &[u8],
+    ) -> beam_common::Result<(Eterm, Rc<RefCell<AtomTable>>)> {
+        let shared = Rc::new(RefCell::new(atoms.clone()));
+        let mut interner = Interner {
+            table: Rc::clone(&shared),
+        };
+        let mut ctx =
+            BifContext::new(heap, atoms, ProcessId::new(1, 0)).with_atom_interner(&mut interner);
+        let binary = bits::make_binary(ctx.heap(), blob).expect("the blob fits");
+        let term = reg.call("erlang", "binary_to_term", 1, &mut ctx, &[binary])?;
+        Ok((term, shared))
+    }
+
+    /// Decodes `FOO_BLOB` and returns the raw atom index the term resolves to.
+    fn decode_foo(reg: &BifRegistry, atoms: &AtomTable, heap: &mut Heap) -> u32 {
+        let (term, _interner_table) = decode(reg, atoms, heap, FOO_BLOB).expect("it decodes");
+        assert!(beam_term::is_atom(term), "the decode yields an atom");
+        atom_val(term).raw()
+    }
+
+    #[test]
+    fn the_cold_call_witnesses_a_fresh_memo_and_the_steady_state_reads_no_name() {
+        let reg = default_registry();
+        let atoms = table(NAMES);
+        let mut heap = heap();
+
+        // Cold: no memo yet, so it is built by one `AtomTable::clone` — Θ(table)
+        // *allocations* — and not one name is read.
+        reset_metrics();
+        assert_eq!(decode_foo(&reg, &atoms, &mut heap), 3, "`foo` is index 3");
+        assert_eq!(
+            metrics(),
+            (0, 1),
+            "the cold call rebuilds (clones) without reading a name"
+        );
+
+        // Steady state: the same shared table, so the witness proves index-identity in
+        // O(1) — no name read, no rebuild.
+        reset_metrics();
+        assert_eq!(decode_foo(&reg, &atoms, &mut heap), 3);
+        assert_eq!(metrics(), (0, 0), "the steady state must be O(1)");
+    }
+
+    #[test]
+    fn a_replaced_table_instance_costs_one_theta_table_scan_and_heals() {
+        let reg = default_registry();
+        let first = table(NAMES);
+        let mut heap = heap();
+        assert_eq!(decode_foo(&reg, &first, &mut heap), 3);
+
+        // The same names in the same order but a **different instance** — exactly what a
+        // copy-on-write replacement of the runtime's shared table presents. A clone has a
+        // fresh identity by design, so the witness cannot vouch for it and the Θ(table)
+        // fallback runs, comparing every index exactly once (`(0, 1)` or `(0, 0)` would
+        // mean the witness had vouched for a table it never saw).
+        let second = first.clone();
+        reset_metrics();
+        assert_eq!(decode_foo(&reg, &second, &mut heap), 3);
+        assert_eq!(
+            metrics(),
+            (second.len(), 0),
+            "the fallback compares every index exactly once and needs no rebuild"
+        );
+
+        // That fallback re-witnessed the memo for `second`, so the next call is O(1).
+        reset_metrics();
+        assert_eq!(decode_foo(&reg, &second, &mut heap), 3);
+        assert_eq!(metrics(), (0, 0), "the fallback self-heals");
+    }
+
+    #[test]
+    fn an_appended_table_is_extended_by_reading_only_the_appended_names() {
+        let reg = default_registry();
+        let mut atoms = table(NAMES);
+        let mut heap = heap();
+        assert_eq!(decode_foo(&reg, &atoms, &mut heap), 3);
+
+        // The **same** table instance, grown in place by two appends: `appended_since`
+        // holds, so the memo stays valid over its whole existing prefix and only the two
+        // appended names are copied.
+        atoms.seed(["g1", "g2"]);
+        reset_metrics();
+        assert_eq!(decode_foo(&reg, &atoms, &mut heap), 3, "`foo` stays at 3");
+        assert_eq!(
+            metrics(),
+            (2, 0),
+            "exactly the appended names are read — nothing is rebuilt"
+        );
+    }
+
+    #[test]
+    fn a_table_that_moves_a_name_forces_the_fallback_and_a_rebuild() {
+        let reg = default_registry();
+        let first = table(NAMES); // foo @3
+        let mut heap = heap();
+        assert_eq!(decode_foo(&reg, &first, &mut heap), 3);
+
+        // A table naming `foo` at index 5 instead (index 3 is `d` there). A blind reuse
+        // would resolve the decoded term to `d`; the fallback must reject the memo at the
+        // first differing index and rebuild it from the new table.
+        let moved = table(&["a", "b", "c", "d", "e", "foo"]);
+        reset_metrics();
+        assert_eq!(decode_foo(&reg, &moved, &mut heap), 5, "`foo` is index 5 there");
+        assert_eq!(
+            metrics(),
+            (4, 1),
+            "the scan stops at the first differing index (3: `foo` vs `d`) and rebuilds"
+        );
+    }
+
+    #[test]
+    fn a_memo_left_longer_than_the_live_table_is_rebuilt_without_a_name_read() {
+        let reg = default_registry();
+        let atoms = table(&["a", "b", "c"]); // no `foo`
+        let mut heap = heap();
+
+        // `foo` is absent, so the decoder appends it to the scratch and the interner
+        // commits it to the interner's table at exactly `atoms.len()`; the context's own
+        // table is untouched, which leaves the memo one name longer than `shared`.
+        let (term, interner_table) = decode(&reg, &atoms, &mut heap, FOO_BLOB).expect("it decodes");
+        assert_eq!(atom_val(term).raw(), 3, "the fresh atom lands at atoms.len()");
+        assert_eq!(interner_table.borrow().len(), 4, "committed at index 3");
+        assert_eq!(atoms.len(), 3, "the context's table is untouched");
+
+        // A memo that is *longer* than `shared` cannot stand in for it (its novel-atom
+        // prediction would be off by the difference), so it is rejected by the length
+        // check alone — no name read — and rebuilt.
+        reset_metrics();
+        assert_eq!(decode_foo(&reg, &atoms, &mut heap), 3, "still `atoms.len()`");
+        assert_eq!(
+            metrics(),
+            (0, 1),
+            "the too-long memo is rebuilt, with no name read to reject it"
+        );
+    }
+
+    #[test]
+    fn an_unknown_then_known_atom_sequence_keeps_the_written_indices() {
+        let reg = default_registry();
+        let atoms = table(&["a", "b", "c"]); // no `foo`, `a` present
+        let mut heap = heap();
+
+        // Unknown: `foo` is appended at `atoms.len()` and committed there.
+        let (fresh, table) = decode(&reg, &atoms, &mut heap, FOO_BLOB).expect("it decodes");
+        assert_eq!(atom_val(fresh).raw(), 3);
+        assert_eq!(table.borrow().name(Atom::from_raw(3)), Some("foo"));
+
+        // Known: the very next decode interns nothing, and the memo it rebuilds from the
+        // (unchanged) shared table still resolves `a` at index 0 — the fresh name did not
+        // shift or alias any existing index.
+        reset_metrics();
+        let (map, _table) = decode(&reg, &atoms, &mut heap, MAP_A_BLOB).expect("it decodes");
+        let pairs = beam_term::map::map_pairs(map, &atoms).expect("a flat map");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(atom_val(pairs[0].0).raw(), 0, "`a` is index 0");
+        assert_eq!(pairs[0].1, beam_term::make_small(1));
+        assert_eq!(
+            metrics(),
+            (0, 1),
+            "the too-long memo was rebuilt, reading no name"
+        );
+    }
 }
 
 /// Decodes an external term image (see the module docs for the atom-index
@@ -1125,6 +1475,13 @@ fn with_decode_scratch<R>(shared: &AtomTable, f: impl FnOnce(&mut AtomTable) -> 
 /// image reports its own length, so bytes after the zlib stream are ignored *and*
 /// uncounted (`external.c:1797-1801`), while a plain image reports the term's own end
 /// and tolerates trailing bytes, like the oracle.
+///
+/// The `[safe]` flag is fed into the codec through its [`DecodeOptions`] seam: with it
+/// set a wire atom **name** that is not already interned in the context's table is
+/// `BadArg` **from the codec**, raised **before** anything is interned (C
+/// `erts_atom_get` instead of `erts_atom_put`, `external.c:4530-4539`), so the shared
+/// atom table cannot grow. The flag-free path is unchanged: the names the decoder
+/// appends to the scratch are still committed to the shared table afterwards.
 ///
 /// The context's local node identity ([`BifContext::local_node`]) is installed on the
 /// decoder, so a wire pid/port/reference whose node atom and creation name this node
@@ -1141,8 +1498,8 @@ fn with_decode_scratch<R>(shared: &AtomTable, f: impl FnOnce(&mut AtomTable) -> 
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary, a
-/// malformed/truncated image, an unknown option, or `safe` with an image that
-/// would create an atom; the codec's `unsupported_external_term` raise for a tag
+/// malformed/truncated image, an unknown option, or `safe` with a wire atom name that
+/// is not already interned; the codec's `unsupported_external_term` raise for a tag
 /// it cannot build (funs, exports, records, `LOCAL`). A local reference id that
 /// does not fit the M1 internal-ref block's 60-bit slot is not an error: the
 /// decoder keeps the faithful external reference form for it.
@@ -1155,9 +1512,20 @@ fn decode_term_bif(
     let data = bytes_arg(input)?;
     // Read the local node identity *before* `ctx.heap()` — the accessor takes
     // `&mut self`, so it cannot be called while the heap is borrowed. It is installed
-    // on the decoder below so an incoming identifier that names this node demotes to
-    // the internal form (see the docs above); `None` leaves the decode unchanged.
+    // on the decoder through the codec's option seam so an incoming identifier that
+    // names this node demotes to the internal form (see the docs above); `None` leaves
+    // the decode unchanged. `local_hash` stays `None`: the 4-byte `LOCAL_EXT` node hash
+    // is runtime state with no seam in this crate (see the docs above).
     let identity = ctx.local_node();
+    // Feed `[safe]` (and the resolved identity) into the codec: under `safe` a wire atom
+    // **name** that is not already interned is `BadArg` *from the codec* and **nothing is
+    // interned** (C `erts_atom_get`), so the fresh-name commit below is unreachable under
+    // `safe` — it stays as the flag-free path's commit.
+    let options = DecodeOptions {
+        safe,
+        local_node: identity,
+        local_hash: None,
+    };
     // Decode into the scratch image and collect the names it appended, before the
     // scratch is released — they are exactly the names that must reach the shared
     // table, at exactly the indices the decoder wrote into the term.
@@ -1165,18 +1533,13 @@ fn decode_term_bif(
         let (shared, heap) = ctx.atom_and_heap();
         with_decode_scratch(shared, |scratch| {
             let known = scratch.len();
-            // The codec's `[used]` entry points own the `COMPRESSED` wrapper handling and
-            // the consumed-source-byte count (the zlib stream end for a compressed image,
-            // `Decoder::position` otherwise) — and, unlike the `finish()`-ing
-            // `decode_term` pair, they tolerate trailing bytes, matching the oracle's
-            // `binary_to_term/2`. The identity-aware twin installs the identity on both
-            // paths.
-            let decoded = match identity {
-                Some((node, creation)) => {
-                    decode_term_with_local_node_used(&data, heap, scratch, node, creation, None)
-                }
-                None => decode_term_used(&data, heap, scratch),
-            };
+            // The codec's option-aware `[used]` entry point owns the `COMPRESSED` wrapper
+            // handling, the consumed-source-byte count (the zlib stream end for a compressed
+            // image, `Decoder::position` otherwise), the local-node identity install and the
+            // `[safe]` refusal — and, unlike the `finish()`-ing `decode_term` pair, it
+            // tolerates trailing bytes, matching the oracle's `binary_to_term/2`. With
+            // `safe` false its decode is byte-for-byte the flag-free/identity-aware twins'.
+            let decoded = decode_term_with_options_used(&data, heap, scratch, &options);
             // A failed decode leaves the scratch possibly ahead of the shared table (the
             // next call's `prefix_matches` rebuilds it); nothing is committed.
             let fresh: Vec<String> = if decoded.is_ok() {
@@ -1195,8 +1558,10 @@ fn decode_term_bif(
     };
     let (term, position) = decoded?;
     if !fresh.is_empty() {
+        // Unreachable under `[safe]` (the codec refuses an unknown name and interns
+        // nothing, so `fresh` is empty), kept as a guard should a future codec change
+        // ever append a name under `safe`.
         if safe {
-            // `safe` forbids creating atoms; nothing has been created yet.
             return Err(badarg());
         }
         for name in &fresh {
@@ -2951,31 +3316,125 @@ halt()."#;
         });
     }
 
+    /// `<<131,119,8,"tjenixen">>` — the oracle's `[safe]` example: a **new** atom.
+    const NEW_ATOM_IMAGE: &[u8] = &[131, 119, 8, 116, 106, 101, 110, 105, 120, 101, 110];
+
+    /// `ATOM_EXT` (`100`) for `hello`, an atom every seeded test table holds.
+    const KNOWN_ATOM_IMAGE: &[u8] = &[131, 100, 0, 5, 104, 101, 108, 108, 111];
+
     #[test]
     fn binary_to_term_safe_rejects_new_atoms_and_interns_them_otherwise() {
-        // `<<131,119,8,"tjenixen">>` — the oracle's `[safe]` example: a *new* atom.
-        const NEW_ATOM: &[u8] = &[131, 119, 8, 116, 106, 101, 110, 105, 120, 101, 110];
         // Without `safe` the atom is created through the interner, at the index the
         // cloned table assigned it.
         with_interner(|ctx, interned| {
-            let term = binary_to_term_1(ctx, &[bin(NEW_ATOM)]).unwrap();
+            let term = binary_to_term_1(ctx, &[bin(NEW_ATOM_IMAGE)]).unwrap();
             assert!(access::is_atom(term));
             assert_eq!(interned.borrow().name(atom_val(term)), Some("tjenixen"));
-            // The `safe` form consults the runtime table (`ctx.atoms()`), which this
-            // harness keeps distinct from the interner's clone — so the name the
-            // interner just created is still unknown here and the decode is refused.
-            // In the runtime the interner mutates that very table, so the atom then
-            // exists and `safe` accepts it (the oracle's behaviour).
+            // The `[safe]` refusal consults `ctx.atoms()` (the decode scratch is an image
+            // of it), which this harness keeps distinct from the interner's clone — so the
+            // name the interner just created is still unknown here and the codec refuses.
+            // In the runtime the interner mutates that very table, so the atom then exists
+            // and `safe` accepts it (the oracle's behaviour).
             let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
-            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM), safe]));
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe]));
             assert!(interned.borrow().lookup("tjenixen").is_some());
         });
-        // With `safe` and an unknown atom the decode is `badarg` — and *creates*
-        // nothing.
+        // With `safe` and an unknown atom the decode is `badarg` — raised **by the codec**
+        // before any interning, so nothing reaches either table.
         with_interner(|ctx, interned| {
             let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
-            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM), safe]));
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe]));
+            // Nothing was interned anywhere: the receiving node's table is untouched…
+            assert_eq!(ctx.atoms().len(), NAMES.len(), "the shared table grew");
+            assert!(ctx.atoms().lookup("tjenixen").is_none());
+            // …and neither is the interner's clone.
+            assert_eq!(interned.borrow().len(), NAMES.len(), "the interner's table grew");
             assert!(interned.borrow().lookup("tjenixen").is_none());
+        });
+    }
+
+    #[test]
+    fn binary_to_term_safe_accepts_an_atom_already_interned() {
+        with_ctx(|ctx| {
+            let before = ctx.atoms().len();
+            let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
+            let term = binary_to_term_2(ctx, &[bin(KNOWN_ATOM_IMAGE), safe])
+                .expect("an already-interned atom is accepted under [safe]");
+            assert_eq!(term, ctx.atom("hello").expect("seeded"));
+            assert_eq!(ctx.atoms().len(), before, "a known atom was interned anew");
+        });
+    }
+
+    #[test]
+    fn binary_to_term_safe_with_used_reports_the_consumed_count() {
+        with_ctx(|ctx| {
+            // `[safe, used]` on an already-interned atom reports the same count `[used]`
+            // alone does — the codec's option-aware `_used` entry point owns the rule.
+            let safe_used = atom_options(ctx, "safe", "used");
+            let wrapped = binary_to_term_2(ctx, &[bin(KNOWN_ATOM_IMAGE), safe_used]).unwrap();
+            assert!(access::is_tuple(wrapped));
+            assert_eq!(
+                access::tuple_element(wrapped, 0),
+                ctx.atom("hello").expect("seeded")
+            );
+            assert_eq!(
+                int_of(access::tuple_element(wrapped, 1)),
+                KNOWN_ATOM_IMAGE.len() as i64
+            );
+            let used = used_option(ctx);
+            let wrapped = binary_to_term_2(ctx, &[bin(KNOWN_ATOM_IMAGE), used]).unwrap();
+            assert_eq!(
+                int_of(access::tuple_element(wrapped, 1)),
+                KNOWN_ATOM_IMAGE.len() as i64
+            );
+            // `[safe, used]` on an unknown atom is still `badarg`, not a `{Term,N}` tuple.
+            let safe_used = atom_options(ctx, "safe", "used");
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe_used]));
+            assert_eq!(ctx.atoms().len(), NAMES.len(), "the shared table grew");
+        });
+    }
+
+    /// The live-oracle cross-check for `[safe]`: the oracle raises `badarg` for a safe
+    /// decode of an unknown atom and accepts the same image without `safe`, creating the
+    /// atom — the split this crate reproduces.
+    #[test]
+    fn binary_to_term_safe_matches_the_live_oracle() {
+        // A raw string keeps the Erlang source readable — every `"` below is the Erlang
+        // character, not a Rust escape. A `try`/`catch` (not the `catch` operator, which
+        // the `-eval` route wraps differently) reports the exception class and reason.
+        let eval = r#"A = <<131,119,8,116,106,101,110,105,120,101,110>>,
+io:format("~p~n", [try binary_to_term(A,[safe]) catch C:R -> {C,R} end]),
+io:format("~p~n", [binary_to_term(A)]),
+halt()."#;
+        let Some(lines) = oracle_stdout(eval) else {
+            eprintln!();
+            eprintln!("=========== beam_bifs binconv: live oracle SKIPPED ===========");
+            eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or");
+            eprintln!("not executable, and no `erl` on $PATH).");
+            eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+            eprintln!("=============================================================");
+            eprintln!();
+            return;
+        };
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("{error,badarg}"),
+            "the oracle's `[safe]` verdict changed: {lines:?}"
+        );
+        assert_eq!(
+            lines.get(1).map(String::as_str),
+            Some("tjenixen"),
+            "the oracle's flag-free decode changed: {lines:?}"
+        );
+        // The Rust side agrees on both arms.
+        with_interner(|ctx, interned| {
+            let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe]));
+            assert_eq!(ctx.atoms().len(), NAMES.len(), "the shared table grew");
+            assert!(ctx.atoms().lookup("tjenixen").is_none());
+            let term = binary_to_term_1(ctx, &[bin(NEW_ATOM_IMAGE)]).unwrap();
+            assert!(access::is_atom(term));
+            assert_eq!(interned.borrow().name(atom_val(term)), Some("tjenixen"));
         });
     }
 

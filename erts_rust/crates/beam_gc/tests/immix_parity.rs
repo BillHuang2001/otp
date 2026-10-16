@@ -49,9 +49,9 @@ use beam_term::prelude::{
     arityval, boxed_val, fun_arity, fun_creator_pid, fun_env, fun_function, fun_index,
     fun_kind_of_header, fun_module, fun_num_free, fun_uniq, fun_uniq_bytes, fun_words,
     is_arity_value, is_atom, is_boxed, is_fun_header, is_list, is_map_header, is_refc_binary,
-    is_small, list_val, make_atom, make_small, map_pairs, map_words_capacity, refc_bytes, refc_size,
-    signed_value, write_fun_external, write_fun_imported, write_fun_local, write_map,
-    write_refc_binary, Atom, AtomTable, Eterm, FunKind, FunPid, NIL, ERL_REFC_BITS_SIZE,
+    is_small, list_val, make_atom, make_small, map_pairs, map_words_capacity, refc_bytes,
+    refc_size, signed_value, write_fun_external, write_fun_imported, write_fun_local, write_map,
+    write_refc_binary, Atom, AtomTable, Eterm, FunKind, FunPid, ERL_REFC_BITS_SIZE, NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -237,9 +237,7 @@ fn build_round(
 
         // (6) deliberate garbage that no root reaches.
         for i in 0..8i64 {
-            let _ = heap
-                .tuple(&[make_small(900 + i)])
-                .expect("garbage tuple");
+            let _ = heap.tuple(&[make_small(900 + i)]).expect("garbage tuple");
         }
     } else {
         // A light graph: a tuple, a two-cell list and a `Local` fun holding both.
@@ -373,7 +371,12 @@ fn walk_fun(term: Eterm, header: Eterm, atoms: &AtomTable, out: &mut String) {
                     fun_creator_pid(term).expect("fun pid"),
                 )
             };
-            out.push_str(&format!(",mod{},uniq{:?},idx{index},pid{:?}", m.raw(), u, pid));
+            out.push_str(&format!(
+                ",mod{},uniq{:?},idx{index},pid{:?}",
+                m.raw(),
+                u,
+                pid
+            ));
         }
     }
     // SAFETY: `term` is a live fun, so its environment words are readable.
@@ -507,8 +510,14 @@ fn both_strategies_produce_identical_observable_results() {
     let last = copying.snapshots.last().expect("at least one snapshot");
     assert!(last.contains("map{"), "the flat/HAMT maps are in the graph");
     assert!(last.contains("fun(Local"), "the local fun is in the graph");
-    assert!(last.contains("fun(External"), "the external fun is in the graph");
-    assert!(last.contains("fun(Imported"), "the imported fun is in the graph");
+    assert!(
+        last.contains("fun(External"),
+        "the external fun is in the graph"
+    );
+    assert!(
+        last.contains("fun(Imported"),
+        "the imported fun is in the graph"
+    );
     assert!(last.contains("refc["), "the refc binary is in the graph");
     assert!(
         !last.contains("i900"),

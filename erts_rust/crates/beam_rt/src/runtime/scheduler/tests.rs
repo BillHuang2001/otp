@@ -34,6 +34,7 @@ use beam_term::{make_atom, make_small, signed_value, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::info::InfoValue;
+use crate::port::PORT_POLL_SLICE;
 use crate::runtime::{PendingSpawn, Runtime};
 
 use super::super::tests::SLICE_BEAM;
@@ -265,7 +266,7 @@ fn the_run_route_ignores_a_pending_deadline_that_cannot_wake_its_workload() {
     // the bare timer-heap test.
     assert!(!rt.is_quiescent(), "the bare heap still has a deadline");
     assert!(rt
-        .timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0)
+        .timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0, false)
         .is_some());
     // With the receiver marked as the route's wait target it does **not**: nothing is queued,
     // nothing is pollable, and no pending deadline can wake the receiver.
@@ -275,7 +276,7 @@ fn the_run_route_ignores_a_pending_deadline_that_cannot_wake_its_workload() {
         "a deadline for another process cannot wake the workload"
     );
     assert_eq!(
-        rt.timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0),
+        rt.timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0, false),
         None,
         "the run route does not sleep for a deadline that cannot wake its workload"
     );
@@ -303,7 +304,7 @@ fn the_run_route_still_waits_for_a_deadline_that_can_wake_its_workload() {
         "a delivery to the workload's pid is work the route must wait for"
     );
     assert!(
-        rt.timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0)
+        rt.timer_wait(super::TimerWait::AtMost(Duration::from_millis(25)), 0, false)
             .is_some(),
         "the run route sleeps for a deadline that can wake its workload"
     );
@@ -557,7 +558,10 @@ fn the_imminent_only_wait_policy_sleeps_for_an_imminent_deadline_only() {
     let me = rt.self_pid();
 
     // Nothing pending at all: no wait.
-    assert_eq!(rt.timer_wait(TimerWait::ImminentWithin(window), 0), None);
+    assert_eq!(
+        rt.timer_wait(TimerWait::ImminentWithin(window), 0, false),
+        None
+    );
 
     // The policy allows one wait per pass — the same bound as `AtMost` — so an already-spent
     // pass never waits again.
@@ -567,7 +571,7 @@ fn the_imminent_only_wait_policy_sleeps_for_an_imminent_deadline_only() {
     // A deadline an hour away is **not** slept on: the pass yields instead.
     let far = send_after(&mut rt, 3_600_000, me.to_eterm(), make_small(1));
     assert_eq!(
-        rt.timer_wait(TimerWait::ImminentWithin(window), 0),
+        rt.timer_wait(TimerWait::ImminentWithin(window), 0, false),
         None,
         "a deadline beyond the window must not stall the pass"
     );
@@ -580,7 +584,7 @@ fn the_imminent_only_wait_policy_sleeps_for_an_imminent_deadline_only() {
     );
     let _soon = send_after(&mut rt, 20, me.to_eterm(), make_small(2));
     let wait = rt
-        .timer_wait(TimerWait::ImminentWithin(window), 0)
+        .timer_wait(TimerWait::ImminentWithin(window), 0, false)
         .expect("an imminent deadline is slept to");
     assert!(wait <= window, "the wait is clamped to the window: {wait:?}");
     assert!(!wait.is_zero(), "the wait is the remaining time, not zero");
@@ -1041,5 +1045,129 @@ fn the_outbound_distribution_client_is_wired_and_driven_by_the_runtime() {
     assert_eq!(
         delivered, 1,
         "the decoded DOP_SEND reached the addressed local process's mailbox"
+    );
+}
+
+// -- the run route's progress-aware wait ----------------------------------
+
+// The CLI's `run` action drives every pass with
+// `TimerWait::AtMostWhenIdle(`[`PORT_POLL_SLICE`]`)` (see [`Runtime::pump_run_to_completion`]):
+// a pass that still has slices to hand must go round again instead of sleeping a poll
+// slice first. The three tests below pin the policy, the **per-round** wiring of the
+// decision and the *unchanged* anti-spin half. The sleep changes no observable state, so
+// the pins read the test-only pass-sleep counter (see [`super::pass_sleeps`]) rather than a
+// wall clock: a spin is exactly a run in which the pass still had a deadline to reach yet
+// never slept.
+
+/// The policy decision at the boundary [`Runtime::timer_wait`] exposes: a round that ran
+/// slices never sleeps, an idle round still sleeps the poll slice, and the per-pass bound
+/// is `AtMost`'s (one wait, then the pass yields).
+#[test]
+fn the_idle_only_wait_policy_skips_the_wait_when_the_round_ran_slices() {
+    let mut rt = runtime();
+    let me = rt.self_pid();
+
+    // No deadline at all: neither form waits.
+    assert_eq!(
+        rt.timer_wait(TimerWait::AtMostWhenIdle(PORT_POLL_SLICE), 0, false),
+        None
+    );
+
+    // A deadline that can wake the route's own target (`can_wake`): the idle form sleeps a
+    // poll slice for it, and the progress form does not.
+    let _ = send_after(&mut rt, 3_600_000, me.to_eterm(), make_small(1));
+    rt.set_run_wake_pid(Some(me));
+    assert_eq!(
+        rt.timer_wait(TimerWait::AtMostWhenIdle(PORT_POLL_SLICE), 0, true),
+        None,
+        "a round that ran slices must go round again, not sleep"
+    );
+    assert_eq!(
+        rt.timer_wait(TimerWait::AtMostWhenIdle(PORT_POLL_SLICE), 0, false),
+        Some(PORT_POLL_SLICE),
+        "an idle round still sleeps the poll slice — the anti-spin half"
+    );
+    assert!(TimerWait::AtMostWhenIdle(PORT_POLL_SLICE).allows(0));
+    assert!(!TimerWait::AtMostWhenIdle(PORT_POLL_SLICE).allows(1));
+    rt.set_run_wake_pid(None);
+}
+
+/// The **wiring** of that decision through the real pass family. With a run target parked on
+/// a long `receive … after T` (so a sleep is possible *and* the route's wait marker holds)
+/// and work still on the run queue, the same round sleeps **nothing** under the `run`
+/// route's policy while the pre-fix `TimerWait::AtMost` policy slept a full poll slice for
+/// it — the measured waste this change removes.
+#[test]
+fn the_run_route_never_sleeps_a_poll_slice_while_it_still_has_slices_to_run() {
+    let mut rt = runtime();
+    // The run route's wait target: `recv_after:after2000/0` parks on
+    // `receive X -> X after 2000`, so `can_wake(target)` holds for the next two seconds.
+    let target = spawn_recv_after(&mut rt, "after2000");
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1, "the target parks");
+    assert_eq!(
+        rt.processes().get(target).expect("still in the table").state(),
+        ProcessState::Waiting
+    );
+    assert_eq!(rt.run_queue_len(), 0, "nothing is runnable");
+    rt.set_run_wake_pid(Some(target));
+
+    // Work the pass still has to hand: a **yielding** allocating loop, so the round runs
+    // slices and the pass ends with the run queue non-empty.
+    rt.load_module(PREEMPT_BEAM).expect("load preempt.beam");
+    rt.spawn_process("preempt", "alloc_loop", vec![make_small(1_000_000)])
+        .expect("preempt:alloc_loop/1 is exported");
+
+    // The pre-fix policy slept a poll slice although the round had just run one.
+    reset_pass_sleeps();
+    let (ran, delivered) = rt
+        .scheduler_pass(Some(1), false, TimerWait::AtMost(PORT_POLL_SLICE))
+        .expect("a pass");
+    assert_eq!((ran, delivered), (1, 0), "one slice ran, nothing was delivered");
+    assert!(
+        pass_sleeps() >= 1,
+        "the pre-fix policy slept after running a slice"
+    );
+    assert_eq!(rt.timers.pending_count(), 1, "the target's deadline is still armed");
+
+    // ... and the `run` route's policy does not: for this round the sleep was pure waste.
+    reset_pass_sleeps();
+    let (ran, delivered) = rt
+        .scheduler_pass(Some(1), false, TimerWait::AtMostWhenIdle(PORT_POLL_SLICE))
+        .expect("a pass");
+    assert_eq!((ran, delivered), (1, 0), "one slice ran, nothing was delivered");
+    assert_eq!(
+        pass_sleeps(),
+        0,
+        "the run route never sleeps a poll slice while it still has slices to run"
+    );
+    assert_eq!(rt.timers.pending_count(), 1, "the target's deadline is still armed");
+    rt.set_run_wake_pid(None);
+}
+
+/// The **anti-spin half is unchanged**, end to end on the `run` route: a target parked on a
+/// finite `receive … after T` with nothing else to do still *sleeps* to its deadline (the
+/// pass-sleep counter proves it slept rather than spinning, which would reach the same
+/// deadline with **no** sleep at all) and still resumes on the timed-out path.
+#[test]
+fn the_run_route_still_sleeps_to_a_parked_receive_timeout() {
+    let mut rt = runtime();
+    reset_pass_sleeps();
+    let started = Instant::now();
+    let value = rt
+        .run_scheduled(RECV_AFTER_BEAM, "after20", 0, &[])
+        .expect("the parked receive times out");
+    assert_eq!(
+        rt.atom_name_of(value).as_deref(),
+        Some("timeout"),
+        "the after clause ran"
+    );
+    assert!(
+        pass_sleeps() >= 1,
+        "a pass with nothing to run sleeps to the deadline instead of spinning"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the 20 ms deadline is reached in about its own time (took {:?})",
+        started.elapsed()
     );
 }

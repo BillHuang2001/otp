@@ -283,7 +283,11 @@ fn a_garbage_heavy_collection_shrinks_the_nursery() {
         }
 
         c.collect(&mut roots).expect("collect");
-        assert_eq!(c.young().used_words(), 0, "{kind:?}: the nursery is emptied");
+        assert_eq!(
+            c.young().used_words(),
+            0,
+            "{kind:?}: the nursery is emptied"
+        );
 
         assert_eq!(
             c.young().capacity_words(),

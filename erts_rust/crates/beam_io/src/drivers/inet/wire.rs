@@ -53,11 +53,19 @@ pub const INET_AF_LOOPBACK: u8 = 4;
 /// The stream socket type (`INET_TYPE_STREAM`, `inet_drv.c:766`).
 pub const INET_TYPE_STREAM: u8 = 1;
 
+/// The datagram socket type (`INET_TYPE_DGRAM`, `inet_drv.c:767`) — the type the `udp_inet`
+/// driver's `open` verb requires.
+pub const INET_TYPE_DGRAM: u8 = 2;
+
 /// The default TCP protocol (`INET_PROTO_DEFAULT`, `inet_drv.c:771`).
 pub const INET_PROTO_DEFAULT: u8 = 0;
 
 /// The explicit TCP protocol (`INET_PROTO_TCP`, `inet_drv.c:772`).
 pub const INET_PROTO_TCP: u8 = 1;
+
+/// The explicit UDP protocol (`INET_PROTO_UDP`, `inet_drv.c:773`) — the only provisional
+/// protocol the `udp_inet` driver's `open` verb accepts besides [`INET_PROTO_DEFAULT`].
+pub const INET_PROTO_UDP: u8 = 2;
 
 /// `shutdown(sock, SHUT_RD)` (`TCP_SHUT_RD`, `inet_drv.c:684`).
 pub const TCP_SHUT_RD: u8 = 0;
@@ -199,4 +207,40 @@ pub(super) fn parse_address(arg: &[u8]) -> Result<InetAddr> {
         }
         _ => Err(error::badarg()),
     }
+}
+
+/// Encodes an IPv4 endpoint into the C's packed address, the `INET_AF_INET` 7-byte form
+/// `[INET_AF_INET, port_hi, port_lo, a, b, c, d]`.
+///
+/// This is the inverse of [`parse_address`] (the C's `inet_get_address`, `inet_drv.c:4626`) and
+/// the **single** source of truth for the byte layout the `udp_inet` driver's `recv` reply uses
+/// to report a datagram's source address.
+pub(super) fn pack_address(port: u16, addr: [u8; 4]) -> Vec<u8> {
+    let [hi, lo] = port.to_be_bytes();
+    vec![INET_AF_INET, hi, lo, addr[0], addr[1], addr[2], addr[3]]
+}
+
+/// Splits a leading packed address off `arg`, returning it with the bytes that follow.
+///
+/// The `udp_inet` `send` verb's argument is `[address][data]` (the C's
+/// `[address][anc_len:32][data]` without the ancillary-data length, which is out of scope), so
+/// the address has to be consumed before the payload can be taken. Both this and
+/// [`parse_address`] derive the address length from the family tag, so the layout stays
+/// single-sourced.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] for a truncated argument or an unserved family tag, as in
+/// [`parse_address`].
+pub(super) fn split_address(arg: &[u8]) -> Result<(InetAddr, &[u8])> {
+    let consumed = match arg.first() {
+        Some(&INET_AF_INET) => 7,
+        Some(&INET_AF_ANY) | Some(&INET_AF_LOOPBACK) => 3,
+        _ => return Err(error::badarg()),
+    };
+    if arg.len() < consumed {
+        return Err(error::badarg());
+    }
+    let address = parse_address(&arg[..consumed])?;
+    Ok((address, &arg[consumed..]))
 }

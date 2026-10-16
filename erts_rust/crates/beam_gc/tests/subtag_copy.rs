@@ -59,15 +59,15 @@ use beam_term::prelude::{
     heap_bits_size_words, is_bignum_header, is_bitstring, is_bitstring_header,
     is_external_port_header, is_external_ref_header, is_flatmap_header, is_map_header,
     is_record_header, make_arityval, make_atom, make_map_header, make_record_header, make_small,
-    map_get, map_header_type, map_header_val, map_pairs, map_size, map_words_capacity, object_words,
-    record_block_words, record_declaration_keys, record_definition, record_definition_field_order,
-    record_definition_hash, record_definition_is_exported, record_definition_keys,
-    record_definition_module, record_definition_name, record_field_count, record_get, record_values,
-    signed_value, size_object, sub_bits_parts, write_big, write_external_port, write_external_ref,
-    write_heap_bits, write_map, write_record, write_sub_bits, AtomTable, Eterm, AM_TRUE,
-    BIG_SIGN_BIT, ERL_HEAP_BITS_SIZE, ERL_SUB_BITS_FLAG_MASK, ERL_SUB_BITS_FLAG_MUTABLE,
-    ERL_SUB_BITS_SIZE, HAMT_SUBTAG_HEAD_ARRAY, HEADER_SUB_BITS, MAP_HEADER_TAG_HAMT_HEAD_ARRAY,
-    MAP_SMALL_MAP_LIMIT,
+    map_get, map_header_type, map_header_val, map_pairs, map_size, map_words_capacity,
+    object_words, record_block_words, record_declaration_keys, record_definition,
+    record_definition_field_order, record_definition_hash, record_definition_is_exported,
+    record_definition_keys, record_definition_module, record_definition_name, record_field_count,
+    record_get, record_values, signed_value, size_object, sub_bits_parts, write_big,
+    write_external_port, write_external_ref, write_heap_bits, write_map, write_record,
+    write_sub_bits, AtomTable, Eterm, AM_TRUE, BIG_SIGN_BIT, ERL_HEAP_BITS_SIZE,
+    ERL_SUB_BITS_FLAG_MASK, ERL_SUB_BITS_FLAG_MUTABLE, ERL_SUB_BITS_SIZE, HAMT_SUBTAG_HEAD_ARRAY,
+    HEADER_SUB_BITS, MAP_HEADER_TAG_HAMT_HEAD_ARRAY, MAP_SMALL_MAP_LIMIT,
 };
 
 /// Allocates an empty `words`-word semi-space over the default allocator.
@@ -142,7 +142,10 @@ fn bignums_of_both_signs_are_copied_as_exactly_sized_leaves() {
         // are reserved at `hp`; `write_big` writes all of them, `digits` is non-empty and
         // the block stays live in `from`.
         let big = unsafe {
-            let hp = from.heap_mut().alloc_words(words).expect("the bignum block");
+            let hp = from
+                .heap_mut()
+                .alloc_words(words)
+                .expect("the bignum block");
             write_big(hp, negative, &digits)
         };
         assert_eq!(from.used_words(), words);
@@ -306,11 +309,7 @@ fn native_record_instance_is_copied_with_every_field_relocated() {
     }
     // SAFETY: `def` is a validated, live definition.
     let keys = unsafe { record_definition_keys(def) }.expect("keys");
-    let expected_keys = [
-        make_atom(alpha),
-        make_atom(beta),
-        make_atom(gamma),
-    ];
+    let expected_keys = [make_atom(alpha), make_atom(beta), make_atom(gamma)];
     assert_eq!(
         keys,
         expected_keys.as_slice(),

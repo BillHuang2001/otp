@@ -63,7 +63,9 @@ impl AnyCollector {
     /// ([`crate::selection`]).
     pub fn from_config(config: &GcConfig) -> Result<AnyCollector> {
         match config.mature() {
-            MatureKind::Copying => Ok(AnyCollector::Copying(Collector::new(config.policy().clone())?)),
+            MatureKind::Copying => Ok(AnyCollector::Copying(Collector::new(
+                config.policy().clone(),
+            )?)),
             MatureKind::Immix => Ok(AnyCollector::Immix(GenImmixCollector::with_config(config)?)),
         }
     }

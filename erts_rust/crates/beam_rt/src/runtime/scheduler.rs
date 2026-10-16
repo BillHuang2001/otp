@@ -115,6 +115,21 @@ enum TimerWait {
     /// Sleep at most this long, once per pass — the bounded `-eval` pump
     /// ([`Runtime::pump_scheduler`], see [`TIMER_PUMP_SLICE`]).
     AtMost(Duration),
+    /// Sleep at most this long, once per pass, and **only when the pass has nothing left to
+    /// do** — the blocking [`Runtime::run_scheduled`] (the CLI's `run` action).
+    ///
+    /// "Nothing left to do" is [`Runtime::timer_wait`]'s `progressed` argument: the round
+    /// that just ended **ran at least one slice**. Run queue work is the only thing a
+    /// single-threaded pass can act on, so a round that ran a slice has work still to hand —
+    /// going round again is what runs it, and nothing can happen during the sleep that would
+    /// not have happened anyway: sleeping a poll slice first is pure waste. It is not merely
+    /// relocated either: the pass's own slice budget is what usually stopped that round, so
+    /// the next visit would only end the pass.
+    ///
+    /// The anti-spin half is unchanged: a round that ran **no** slice still sleeps (clamped
+    /// to the earliest live deadline that could wake the run route's target), so a workload
+    /// parked on a `receive … after T` reaches its timeout and a live port is still polled.
+    AtMostWhenIdle(Duration),
     /// Sleep **once per pass**, and only when the earliest pending deadline is already
     /// **imminent** — within this window. The pass sleeps exactly the remaining time when
     /// `remaining <= window` and returns **without sleeping** otherwise, so a deadline far
@@ -135,9 +150,37 @@ impl TimerWait {
         match self {
             TimerWait::Never => false,
             TimerWait::Deadline => true,
-            TimerWait::AtMost(_) | TimerWait::ImminentWithin(_) => waits == 0,
+            TimerWait::AtMost(_) | TimerWait::AtMostWhenIdle(_) | TimerWait::ImminentWithin(_) => {
+                waits == 0
+            }
         }
     }
+}
+
+// **Test-only** count of the poll slices scheduler passes have slept on this thread; read
+// through [`pass_sleeps`], reset through [`reset_pass_sleeps`].
+#[cfg(test)]
+thread_local! {
+    static PASS_SLEEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many poll slices this thread's scheduler passes have slept (test instrumentation).
+///
+/// The pass's sleep changes no observable state, so nothing outside can tell whether it
+/// happened — this counter is what lets a test pin the `run` route's "never sleep while there
+/// is work to do" rule **structurally**, instead of by wall clock. It is per **thread** and a
+/// pass runs to completion on the thread that entered it, so tests running in parallel cannot
+/// see each other's count; a test resets it immediately before the call it measures
+/// (see [`reset_pass_sleeps`]).
+#[cfg(test)]
+fn pass_sleeps() -> u64 {
+    PASS_SLEEPS.with(std::cell::Cell::get)
+}
+
+/// Resets this thread's test-only sleep counter.
+#[cfg(test)]
+fn reset_pass_sleeps() {
+    PASS_SLEEPS.with(|count| count.set(0));
 }
 
 impl Runtime {
@@ -364,7 +407,7 @@ impl Runtime {
             let (ran, delivered) = self.scheduler_pass(
                 Some(RUN_STEP_SLICES),
                 false,
-                TimerWait::AtMost(crate::port::PORT_POLL_SLICE),
+                TimerWait::AtMostWhenIdle(crate::port::PORT_POLL_SLICE),
             )?;
             // Nothing ran, nothing was delivered and nothing is left that could produce a
             // wake: stop with the same honest diagnostic the single-pass path reports rather
@@ -641,7 +684,7 @@ impl Runtime {
                         .collect::<Vec<_>>()
                 ));
             }
-            match slices {
+            let round_slices = match slices {
                 Ok(executed) => {
                     ran += executed;
                     // Each executed slice is one process the scheduler switched to: credit it to
@@ -649,9 +692,13 @@ impl Runtime {
                     // `erlang:statistics(context_switches)` (see
                     // `Runtime::note_context_switches`).
                     self.note_context_switches(executed);
+                    // This round's own count, which is what the `run` route's sleep decision
+                    // is based on — `ran` is cumulative across the whole pass and would keep
+                    // the pass awake forever once a single slice had run.
+                    executed
                 }
                 Err(err) => break Err(err),
-            }
+            };
             // A `garbage_collect` request (see `Runtime::request_gc`) whose process
             // terminated in the slices just run can never be served — its heap is gone — so
             // the request set is pruned to the pass's live processes here, where the table
@@ -811,10 +858,18 @@ impl Runtime {
             if woke > 0 {
                 continue;
             }
-            match self.timer_wait(wait, waits) {
+            // The `run` route's policy is **progress-aware** (see
+            // [`TimerWait::AtMostWhenIdle`]): a round that ran slices is work — going round
+            // again is what runs the rest, and this single-threaded pass can gain nothing by
+            // sleeping a poll slice first. A round that ran **nothing** still sleeps, so a
+            // parked `receive … after T` is still reached without spinning.
+            let progressed = round_slices > 0;
+            match self.timer_wait(wait, waits, progressed) {
                 Some(wait_for) => {
                     waits += 1;
                     if !wait_for.is_zero() {
+                        #[cfg(test)]
+                        PASS_SLEEPS.with(|count| count.set(count.get() + 1));
                         std::thread::sleep(wait_for);
                     }
                     continue;
@@ -1032,9 +1087,14 @@ impl Runtime {
     /// How long this pass may sleep waiting for the next timer deadline, or `None` when it
     /// must not (or cannot) wait — see [`TimerWait`].
     ///
+    /// `progressed` reports whether the round that just ended left the pass **work to do**:
+    /// it ran at least one slice (see [`Runtime::scheduler_pass`]). Only
+    /// [`TimerWait::AtMostWhenIdle`] — the `run` route's policy — consults it; every other
+    /// policy waits exactly as it did before.
+    ///
     /// The wait is clamped to the earliest *live* deadline (cancelled tombstones are pruned
     /// on the way), so the pass never sleeps past the work it is waiting for.
-    fn timer_wait(&mut self, policy: TimerWait, waits: u32) -> Option<Duration> {
+    fn timer_wait(&mut self, policy: TimerWait, waits: u32, progressed: bool) -> Option<Duration> {
         if !policy.allows(waits) {
             return None;
         }
@@ -1052,6 +1112,10 @@ impl Runtime {
             TimerWait::Never => None,
             TimerWait::Deadline => Some(remaining),
             TimerWait::AtMost(max) => Some(remaining.min(max)),
+            // The `run` route: never sleep while the pass has work to do — a round that ran
+            // slices makes progress by going round again, and this single-threaded pass can
+            // gain nothing by sleeping first.
+            TimerWait::AtMostWhenIdle(max) => (!progressed).then(|| remaining.min(max)),
             // Sleep only when the deadline is already imminent; a window's worth of slack
             // beyond it is not this pass's business (see `TimerWait::ImminentWithin`).
             TimerWait::ImminentWithin(window) => (remaining <= window).then_some(remaining),

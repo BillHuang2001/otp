@@ -808,17 +808,41 @@ impl<'a> Parser<'a> {
         if self.eat_punct(">>") {
             return Ok(Expr::Binary(segs));
         }
-        segs.push(self.parse_segment()?);
+        segs.extend(self.parse_segment_expanded()?);
         if self.eat_punct("||") {
             let quals = self.parse_quals()?;
             self.expect_punct(">>")?;
             return Ok(Expr::BinComp(segs, quals));
         }
         while self.eat_punct(",") {
-            segs.push(self.parse_segment()?);
+            segs.extend(self.parse_segment_expanded()?);
         }
         self.expect_punct(">>")?;
         Ok(Expr::Binary(segs))
+    }
+
+    /// One binary segment, expanded to the segments Erlang's bit syntax implies.
+    ///
+    /// A **literal string** is one segment **per character**, each carrying the same
+    /// specifiers — that is the oracle's own rule for `-eval` (`eval_bits.erl` builds a
+    /// string bin element as `<< <<Char/Type-Spec>> || Char <- String >>`), so
+    /// `<<"abc":16>>` is three 16-bit segments and `<<"abc"/utf16>>` three utf16 ones.
+    /// Expanding here, at the one place a `<<…>>` segment list is assembled, keeps
+    /// construction, pattern matching and the comprehensions on the same shape. A
+    /// **non-literal** string value is left alone (`S = "abc", <<S/utf16>>` stays the
+    /// oracle's `badarg`), and anything else is exactly one segment.
+    fn parse_segment_expanded(&mut self) -> Result<Vec<Seg>> {
+        let segment = self.parse_segment()?;
+        let Expr::Str(text) = &segment.value else {
+            return Ok(vec![segment]);
+        };
+        Ok(text
+            .chars()
+            .map(|character| Seg {
+                value: Expr::Int(i128::from(u32::from(character))),
+                ..segment.clone()
+            })
+            .collect())
     }
 
     /// One binary segment.

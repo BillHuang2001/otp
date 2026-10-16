@@ -87,7 +87,7 @@ pub struct CompiledModule {
     ///
     /// The artifact *is* the cache's sound identity for a module — its content never
     /// changes — so keeping the fingerprint next to the code removes the per-lookup
-    /// re-hash of the whole decoded IR that a [`ModuleKey`](crate::jit::cache) built
+    /// re-hash of the whole decoded IR that a [`CacheKey`](crate::jit::cache) built
     /// from the `Module` alone would pay (see
     /// [`CodeCache::compiled_handle`](crate::jit::cache::CodeCache::compiled_handle)).
     fingerprint: u64,

@@ -18,6 +18,8 @@
 //
 // %CopyrightEnd%
 
+use std::rc::Rc;
+
 use beam_bifs::bif_tab::BifTab;
 use beam_bifs::{AtomInterner, BifFn, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
 use beam_engine::RunOutcome;
@@ -5880,6 +5882,153 @@ fn the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable
         r.mailbox().len(),
         1,
         "the signal is delivered onto the receiver's own (grown) heap"
+    );
+}
+
+/// The seam call the latch cases below drive, spelled once: whether `gate` declines relocating
+/// `pid`'s heap, asked through the same trait entry point a `beam_process` signal site uses.
+fn gate_declines(
+    gate: &mut super::gc_walk::RuntimeCollectionGate,
+    table: &ProcessTable,
+    pid: ProcessId,
+) -> bool {
+    let process = table.get(pid).expect("the receiver is live");
+    <super::gc_walk::RuntimeCollectionGate as beam_process::CollectionGate>::declines_relocation(
+        gate, process,
+    )
+}
+
+/// Pushes the depth-≥2 foreign shape below `pid`'s **own** scanned layers into the roots
+/// `Process::collect` gathers (`registers_mut().extra_roots_mut()`), so a gate over `pid`
+/// is asked about exactly the graph only the descent can classify.
+fn make_receiver_foreign_reachable(
+    rt: &mut Runtime,
+    table: &mut ProcessTable,
+    pid: ProcessId,
+) -> Eterm {
+    let (root, _leaf) = nested_foreign_root(rt, table, pid, 2);
+    table
+        .get_mut(pid)
+        .expect("the receiver is live")
+        .registers_mut()
+        .extra_roots_mut()
+        .push(root);
+    root
+}
+
+/// **The gate is `O(1)` while the pid's descent latch is clear: it answers `false` WITHOUT
+/// descending.**
+///
+/// The receiver carries the same shape the installed-gate case uses — a pooled-BIF-heap container
+/// two scanned young-heap levels below its gathered extra roots, which the cheap per-word phase
+/// cannot see. Two answers are compared over the **identical** graph, differing only by the latch
+/// bit:
+///
+/// * a **clear** shared cell returns `false` and the gate's descent counter does **not** move, so
+///   the answer came from the `O(1)` bit test rather than from a walk that happened to find
+///   nothing; and
+/// * with the pid's bit **set** (`latch.borrow_mut().insert(pid)`, what
+///   `Runtime::note_foreign_reachable` does) the very same receiver answers `true` after exactly
+///   one descent — proving the descent *would* have found the hit, i.e. the clear-latch answer
+///   really was a skipped descent.
+#[test]
+fn the_gate_skips_the_descent_while_the_latch_is_clear() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let _root = make_receiver_foreign_reachable(&mut rt, &mut table, pid);
+
+    // --- a CLEAR latch: `false`, with no descent at all. ---
+    let latch = super::gc_walk::ForeignLatch::default();
+    let mut gate = super::gc_walk::RuntimeCollectionGate::from(Rc::clone(&latch));
+    assert!(
+        !gate_declines(&mut gate, &table, pid),
+        "a clear latch means no container from an unscanned region ever entered this process's \
+         reachable graph, so the gate must answer `false`"
+    );
+    assert_eq!(
+        gate.descents(),
+        0,
+        "the clear latch must skip the descent outright — a `false` that came from a walk would \
+         be a different (and arbitrarily expensive) claim"
+    );
+
+    // --- the SAME receiver, with the bit SET: the descent runs and reaches the hit. ---
+    latch.borrow_mut().insert(pid);
+    assert!(
+        gate_declines(&mut gate, &table, pid),
+        "with the bit open the descent runs over the identical graph and reaches the \
+         pooled-BIF-heap container, so the gate must decline"
+    );
+    assert_eq!(
+        gate.descents(),
+        1,
+        "the open latch really descended exactly once"
+    );
+}
+
+/// **The gate reads the host's LIVE latch cell, never a snapshot taken at construction.**
+///
+/// The gate is built over a clone of one shared cell, and a host mutates it through a handle the
+/// gate does not own — exactly the shape `Runtime::note_foreign_reachable` produces. The same gate
+/// instance must therefore change its answer when the cell changes underneath it: `false` with no
+/// descent while the bit is clear, then `true` after one descent once the bit is set.
+#[test]
+fn the_gates_latch_is_the_shared_cell_a_host_mutates() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let _root = make_receiver_foreign_reachable(&mut rt, &mut table, pid);
+
+    let latch = super::gc_walk::ForeignLatch::default();
+    let mut gate = super::gc_walk::RuntimeCollectionGate::from(Rc::clone(&latch));
+    assert!(
+        !gate_declines(&mut gate, &table, pid),
+        "the latch starts clear, so the gate cannot descend"
+    );
+    assert_eq!(gate.descents(), 0, "no descent ran for the clear bit");
+
+    // The host's mutation, through the handle the gate only holds a clone of.
+    latch.borrow_mut().insert(pid);
+
+    assert!(
+        gate_declines(&mut gate, &table, pid),
+        "the same gate instance must see the host's mutation and descend"
+    );
+    assert_eq!(
+        gate.descents(),
+        1,
+        "the gate consulted the live shared cell and ran the descent once"
+    );
+}
+
+/// **The non-firing twin: an OPEN latch is not an unconditional decline.**
+///
+/// The change must not be read as "a latched gate always declines". With the pid's bit set over a
+/// **fully-scanned** nested graph (every layer on the receiver's own young heap, in the gathered
+/// extra roots), the gate really descends — its counter moves — and finds nothing foreign, so a
+/// relocation is allowed. This pins the one-way soundness argument: the bit gates only whether the
+/// descent *runs*, never what it answers.
+#[test]
+fn the_latched_gate_still_allows_a_fully_scanned_receiver() {
+    let (_rt, mut table, pid) = gc_root_set_rig();
+    let (root, _leaf) = nested_scanned_root(&mut table, pid, 2);
+    table
+        .get_mut(pid)
+        .expect("the receiver is live")
+        .registers_mut()
+        .extra_roots_mut()
+        .push(root);
+
+    let latch = super::gc_walk::ForeignLatch::default();
+    latch.borrow_mut().insert(pid);
+    let mut gate = super::gc_walk::RuntimeCollectionGate::from(Rc::clone(&latch));
+
+    assert!(
+        !gate_declines(&mut gate, &table, pid),
+        "an open latch over a fully-scanned graph must still allow the relocation"
+    );
+    assert_eq!(
+        gate.descents(),
+        1,
+        "the open latch really ran the descent — the `false` is the descent's own answer, not a \
+         skipped one"
     );
 }
 

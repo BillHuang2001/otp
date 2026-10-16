@@ -92,13 +92,16 @@
 //! closure at all: it is the real `EXPORT_EXT` term, applied through the host's dispatch.
 
 mod ast;
+mod bits;
+mod bits_decode;
+mod bits_match;
 mod parse;
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use beam_common::{BeamError, ExceptionClass, Raise, Result};
+use beam_common::{BeamError, ExceptionClass, LiveReason, Raise, Result};
 use beam_engine::{terms, ExecutionContext};
 use beam_term::{
     atom_val, is_atom, is_list, is_nil, is_small, make_atom, make_small, signed_value,
@@ -261,9 +264,12 @@ impl BitBuf {
     ///
     /// A **big-endian** segment (`little == false`) emits the words most significant
     /// first, the top word truncated to its `n_bits % 64` bits. A **little-endian** segment
-    /// emits the least significant byte of the value first and then the first `n_bits` bits
-    /// of that byte sequence (`<<255:12/little>>` is `<<255,0:4>>`), the inverse of
-    /// [`read_bits_le`].
+    /// is laid out **byte**-wise ([`bits::integer_le_image`]): the value's whole bytes follow
+    /// least significant first, and a width that is not a whole number of bytes leaves the
+    /// low `n_bits % 8` bits of the next byte as the final partial field, in the high bits of
+    /// the last byte — `<<255:12/little>>` is `<<255,0:4>>` and `<<-300:12/little>>` is
+    /// `<<212,14:4>>`, exactly the bit stream the oracle emits (and the one a matching
+    /// `little` integer segment reads back).
     fn push_integer_bits(
         &mut self,
         magnitude: &[u64],
@@ -287,11 +293,13 @@ impl BitBuf {
         }
         let top_bits = n_bits - 64 * (words_count - 1);
         if little {
-            let mut bytes = Vec::with_capacity(words_count * 8);
-            for word in &words {
-                bytes.extend_from_slice(&word.to_le_bytes());
+            let (bytes, tail, rem) = bits::integer_le_image(&words, n_bits);
+            for byte in bytes {
+                self.push_byte(byte);
             }
-            self.push_bit_slice(&bytes, 0, n_bits);
+            if rem != 0 {
+                self.push_bits(tail, rem);
+            }
         } else {
             self.push_bits(words[words_count - 1] & mask_bits(top_bits), top_bits);
             for index in (0..words_count - 1).rev() {
@@ -359,6 +367,30 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
 /// A [`Flow::Fatal`] is returned unchanged. A [`Flow::Raise`] that came from a BIF
 /// (`origin`) is returned unchanged too; one the evaluator produced itself is
 /// re-built as a [`BeamError::Raise`] from its live reason term.
+///
+/// # The structured reason
+///
+/// The evaluator's own raises (`{case_clause, Subject}`, `{badmatch, Value}`,
+/// `{bad_generator, X}`, …) are **terms**, but [`ExitReason`](beam_common::ExitReason)
+/// holds no term: [`beam_bifs::exit_reason_from_term`] maps a non-atom to
+/// [`ExitReason::Structured`](beam_common::ExitReason::Structured). The term is therefore
+/// attached to the raise's opaque
+/// [`live_reason`](beam_common::Raise::live_reason) slot — the same convention
+/// `beam_bifs` uses — so a **consumer** of the raise renders the real reason
+/// (`error {case_clause,1}`) instead of the `<structured reason>` placeholder. The
+/// consumers are the one recovery point [`crate::error::live_reason_term`] and everything
+/// built on it: `cli.rs`'s `reported_reason` (the boot and `run`-file routes),
+/// [`crate::runner`](crate::runner)'s `exit_reason` for a process that dies of the raise,
+/// and this module's own [`Evaluator::flow_from_error`] when the raise re-enters the
+/// evaluator. An action arm that prints a raise with `BeamError`'s `Display` instead of
+/// going through that recovery point cannot show the term — the slot is what makes the
+/// term *available*, not the CLI's rendering.
+///
+/// An **atom** reason gets no slot: the atom is the authoritative reason, so a term
+/// attached next to one must never shadow it ([`crate::error::live_reason_term`]
+/// refuses such a raise anyway, and the `unsupported`/`halt` classification reads the
+/// atom). This is the **only** terminal conversion of an evaluator `Flow::Raise`, so
+/// the one arm covers every raise site in this module it is called from.
 fn finish(result: EResult<Eterm>, ctx: &RuntimeContext<'_>) -> Result<Eterm> {
     match result {
         Ok(value) => Ok(value),
@@ -374,11 +406,21 @@ fn finish(result: EResult<Eterm>, ctx: &RuntimeContext<'_>) -> Result<Eterm> {
         }) => match origin {
             Some(err) => Err(err),
             None => {
-                let reason = beam_bifs::exit_reason_from_term(
+                let exit_reason = beam_bifs::exit_reason_from_term(
                     reason,
                     ctx.runtime.code_server.atoms(),
                 );
-                Err(BeamError::Raise(Raise::new(class, reason)))
+                let raise = Raise::new(class, exit_reason);
+                // `ExitReason::as_atom` is the gate (not `BeamError::as_atom`): it answers
+                // `None` for exactly the `Structured` reason whose term would otherwise be
+                // lost, and `Some(..)` for every atom reason — which must keep behaving
+                // exactly as it does today.
+                let raise = if raise.reason.as_atom().is_some() {
+                    raise
+                } else {
+                    raise.with_live_reason(LiveReason::new(reason))
+                };
+                Err(BeamError::Raise(raise))
             }
         },
     }
@@ -568,7 +610,14 @@ impl Evaluator<'_, '_> {
     fn append_segment(&mut self, segment: &Seg, env: &mut Env, out: &mut BitBuf) -> EResult<()> {
         let value = self.expr(&segment.value, env)?;
         match segment.kind {
-            Some(SegKind::Utf8) => return self.push_utf8(value, out),
+            Some(SegKind::Utf8) => {
+                // A utf-type segment with an explicit width is a *syntax* error on the
+                // oracle, so it is a typed `badarg` here, never a fabricated encoding.
+                if bits::utf_segment_has_width(segment) {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                }
+                return self.push_utf8(value, out);
+            }
             Some(SegKind::Binary)
             | Some(SegKind::Bytes)
             | Some(SegKind::Bitstring)
@@ -576,10 +625,63 @@ impl Evaluator<'_, '_> {
                 return self.push_bitstring_segment(segment, value, env, out)
             }
             Some(SegKind::Float) => {
-                return Err(Flow::Fatal(error::unsupported("float binary segments")))
+                // A float segment is an IEEE 754 field whose size defaults to 64 bits and is
+                // one of `:16`/`:32`/`:64` (binary16/32/64); any other resolved width is the
+                // oracle's `badarg` (`<<1.5:8/float>>`, `<<1.5:24/float>>`). The value may be
+                // a float **or** an integer (small or bignum: `<<(1 bsl 64):64/float>>` is
+                // `<<67,240,0,0,0,0,0,0>>`), and a non-number is `badarg`. `signed` is
+                // meaningless here and ignored; `little`/`native` reverse the field's bytes.
+                let bits = match self.segment_size_bits(segment, env, 1)? {
+                    Some(bits) => bits,
+                    None => 64,
+                };
+                let number = match terms::float_value(value) {
+                    Ok(number) => number,
+                    Err(_) => {
+                        let (negative, limbs) = self.integer_magnitude(value)?;
+                        bits::integer_limbs_to_f64(negative, &limbs)
+                    }
+                };
+                let Some(bytes) =
+                    bits::float_bytes(number, bits, integer_segment_is_little(segment))
+                else {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                };
+                for byte in bytes {
+                    out.push_byte(byte);
+                }
+                return Ok(());
             }
             Some(SegKind::Utf16) | Some(SegKind::Utf32) => {
-                return Err(Flow::Fatal(error::unsupported("utf16/utf32 binary segments")))
+                // A utf-type segment with an explicit width is a *syntax* error on the
+                // oracle, so it is a typed `badarg` here, never a fabricated encoding.
+                if bits::utf_segment_has_width(segment) {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                }
+                // A code point is a small integer; the encoders reject (with `None` ⇒
+                // `badarg`) exactly what the oracle rejects: a non-integer, a lone surrogate
+                // or anything above `16#10FFFF`.
+                let (utf16, little) = (
+                    segment.kind == Some(SegKind::Utf16),
+                    integer_segment_is_little(segment),
+                );
+                let code = if is_small(value) {
+                    Some(signed_value(value))
+                } else {
+                    None
+                };
+                let bytes = match code {
+                    Some(code) if utf16 => bits::utf16_bytes(code, little),
+                    Some(code) => bits::utf32_bytes(code, little),
+                    None => None,
+                };
+                let Some(bytes) = bytes else {
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                };
+                for byte in bytes {
+                    out.push_byte(byte);
+                }
+                return Ok(());
             }
             Some(SegKind::Integer) | None => {}
         }
@@ -1778,9 +1880,12 @@ impl Evaluator<'_, '_> {
     ///
     /// Returns the number of bits the pattern consumed, or `None` when a segment does
     /// not match (including when not enough bits remain) — an Erlang pattern-match
-    /// failure, never an exception. Sized integer and `binary`/`bytes`/`bitstring`/
-    /// `bits` segments are supported; an unsized `binary`/`bitstring` segment takes the
-    /// remaining bits and must be last.
+    /// failure, never an exception. Every segment type is supported: an integer of any
+    /// width, a `float` field of 16/32/64 bits, a `binary`/`bytes`/`bitstring`/`bits`
+    /// slice, and `utf8`/`utf16`/`utf32` (an unsized `binary`/`bitstring` segment takes the
+    /// remaining bits and must be last). A segment the oracle itself rejects — a `float`
+    /// width other than 16/32/64, a malformed or truncated UTF sequence, a value it does not
+    /// accept — is a match failure too ([`bits_decode`]), never a raise.
     fn match_binary_segments(
         &mut self,
         segments: &[Seg],
@@ -1798,15 +1903,74 @@ impl Evaluator<'_, '_> {
                         Some(bits) => bits,
                         None => 8,
                     };
-                    if bits > 64 {
-                        return Err(Flow::Fatal(error::unsupported(
-                            "an integer binary pattern segment wider than 64 bits",
-                        )));
-                    }
                     if bits > remaining {
                         return Ok(None);
                     }
                     let term = self.integer_segment_term(bytes, offset_bits + consumed, bits, segment)?;
+                    if !self.match_pattern(&segment.value, term, env)? {
+                        return Ok(None);
+                    }
+                    consumed += bits;
+                }
+                Some(SegKind::Float) => {
+                    // An IEEE 754 field: `:16`/`:32`/`:64` (binary16/32/64) or, with no
+                    // `:Size`, the default 64 bits. `signed` is meaningless for a float and
+                    // ignored; `little`/`native` reverse the field's whole byte image.
+                    let bits = match self.segment_size_bits(segment, env, 1)? {
+                        Some(bits) => bits,
+                        None => 64,
+                    };
+                    if bits > remaining {
+                        return Ok(None);
+                    }
+                    // A width the oracle does not accept (`<<F:24/float>>`) fails the match
+                    // (`erts_bs_get_float_2`), rather than raising.
+                    let Some(value) = bits_decode::decode_float(
+                        bytes,
+                        offset_bits + consumed,
+                        bits,
+                        integer_segment_is_little(segment),
+                    ) else {
+                        return Ok(None);
+                    };
+                    let term = heap!(terms::make_float(self.ctx, value));
+                    if !self.match_pattern(&segment.value, term, env)? {
+                        return Ok(None);
+                    }
+                    consumed += bits;
+                }
+                Some(SegKind::Utf8) | Some(SegKind::Utf16) | Some(SegKind::Utf32) => {
+                    // A utf-type pattern segment with an explicit `:Size` or `unit:` does not
+                    // even parse on the oracle (`<<C:8/utf8>>` is a syntax error), so no
+                    // differential case can exist for one: report the typed capability gap
+                    // rather than fabricate a width.
+                    if bits::utf_segment_has_width(segment) {
+                        return Err(Flow::Fatal(error::unsupported(
+                            "a utf binary pattern segment with an explicit size or unit",
+                        )));
+                    }
+                    let little = integer_segment_is_little(segment);
+                    let decoded = match segment.kind {
+                        Some(SegKind::Utf8) => {
+                            bits_decode::decode_utf8(bytes, offset_bits + consumed)
+                        }
+                        Some(SegKind::Utf16) => {
+                            bits_decode::decode_utf16(bytes, offset_bits + consumed, little)
+                        }
+                        _ => bits_decode::decode_utf32(bytes, offset_bits + consumed, little),
+                    };
+                    // An overlong encoding, a surrogate, a code point past `16#10FFFF`, a
+                    // stray continuation byte or a truncated sequence does not match.
+                    let Some((code, bits)) = decoded else {
+                        return Ok(None);
+                    };
+                    // The decoder may look past the value's own window (the payload's last
+                    // byte can carry bits that are not part of it), so the sequence it read
+                    // must still fit in the bits that remain.
+                    if bits > remaining {
+                        return Ok(None);
+                    }
+                    let term = self.small(i64::from(code))?;
                     if !self.match_pattern(&segment.value, term, env)? {
                         return Ok(None);
                     }
@@ -1838,11 +2002,6 @@ impl Evaluator<'_, '_> {
                     }
                     consumed += bits;
                 }
-                _ => {
-                    return Err(Flow::Fatal(error::unsupported(
-                        "this binary pattern segment type",
-                    )))
-                }
             }
         }
         Ok(Some(consumed))
@@ -1850,9 +2009,20 @@ impl Evaluator<'_, '_> {
 
     /// The integer term an integer pattern segment of `bits` bits denotes.
     ///
-    /// Truncation/extension follows the segment's `signed`/endianness specifiers; a
-    /// value beyond the small-integer range is a documented Milestone-1 gap (a bignum is
-    /// not built), reported as `system_limit` rather than a wrong term.
+    /// The field is read in the segment's own endianness (`little`/`native` versus
+    /// `big`, [`integer_segment_is_little`]) and is exact for **any** width — one that is
+    /// neither a multiple of 8 nor of 64 included — so `<<A:65>>`, `<<A:72>>`,
+    /// `<<A:120>>`, `<<A:2/unit:8>>` and a `signed` field wider than 64 bits all match
+    /// exactly as the oracle does. A width of `0` is the integer `0`.
+    ///
+    /// `signed` reinterprets the field as a two's-complement integer of exactly `bits`
+    /// bits (`erts_bs_get_integer_2`'s sign extension, applied over the segment's own
+    /// width rather than over 64 bits): a set top bit makes the value `-(2^bits - raw)`.
+    ///
+    /// The value is materialised as a small int, a one-limb bignum or an exact multi-limb
+    /// bignum ([`terms::make_integer`], else [`beam_codec::term::make_big`]) — **never** a
+    /// `system_limit` raise and never a wrong term, because a `<<A:60>>`-shaped segment is
+    /// a bignum in OTP too.
     fn integer_segment_term(
         &mut self,
         bytes: &[u8],
@@ -1860,18 +2030,81 @@ impl Evaluator<'_, '_> {
         bits: usize,
         segment: &Seg,
     ) -> EResult<Eterm> {
-        let raw = if integer_segment_is_little(segment) {
-            read_bits_le(bytes, start, bits)
+        // A zero-width field (`<<A:0>>`) has no bits to read: it is the integer `0`.
+        if bits == 0 {
+            return Ok(heap!(terms::make_integer(self.ctx, 0)));
+        }
+        let little = integer_segment_is_little(segment);
+        let signed = segment.signed == Some(true);
+        // A field of at most one word — the overwhelmingly common case — is read straight
+        // into a `u64`: `read_bits_be` is bit-exact at any width, and the byte-wise
+        // `read_bits_le` at a whole number of bytes. Elsewhere — a width past a word, or a
+        // little-endian width whose trailing *partial* byte holds the field's high bits —
+        // [`bits_decode::read_integer_limbs`] supplies the magnitude limbs, and it is exact
+        // for every width.
+        let (magnitude, negative) = if bits <= 64 && (!little || bits % 8 == 0) {
+            let raw = if little {
+                read_bits_le(bytes, start, bits)
+            } else {
+                read_bits_be(bytes, start, bits)
+            };
+            if signed {
+                let value = sign_extend(raw, bits);
+                (vec![value.unsigned_abs()], value < 0)
+            } else {
+                // An unsigned 64-bit field with its top bit set is a one-limb bignum, which
+                // the materialisation below builds from this very magnitude.
+                (vec![raw], false)
+            }
         } else {
-            read_bits_be(bytes, start, bits)
+            let mut limbs = bits_decode::read_integer_limbs(bytes, start, bits, little);
+            // A `signed` segment whose top (bit `bits - 1`) bit is set denotes the negative
+            // of its two's-complement magnitude: negate within the field's own width.
+            let negative = signed && (limbs[(bits - 1) / 64] >> ((bits - 1) % 64)) & 1 == 1;
+            if negative {
+                for limb in &mut limbs {
+                    *limb = !*limb;
+                }
+                if bits % 64 != 0 {
+                    // The top limb is partial: drop the bits above the field before adding.
+                    let mask = (1u64 << (bits % 64)) - 1;
+                    if let Some(top) = limbs.last_mut() {
+                        *top &= mask;
+                    }
+                }
+                let mut carry = true;
+                for limb in &mut limbs {
+                    if !carry {
+                        break;
+                    }
+                    let (sum, overflow) = limb.overflowing_add(1);
+                    *limb = sum;
+                    carry = overflow;
+                }
+            }
+            (limbs, negative)
         };
-        if segment.signed == Some(true) {
-            return self.small(sign_extend(raw, bits));
+        let digits = trim_digits(&magnitude);
+        // A one-limb magnitude in `i64` range is exactly what `make_integer` materialises
+        // (a small int, or the oracle's one-limb bignum past the 60-bit small range).
+        if digits.len() == 1 {
+            let magnitude = digits[0];
+            let limit = if negative {
+                1u64 << 63
+            } else {
+                i64::MAX as u64
+            };
+            if magnitude <= limit {
+                let value = if negative {
+                    (magnitude as i64).wrapping_neg()
+                } else {
+                    magnitude as i64
+                };
+                return Ok(heap!(terms::make_integer(self.ctx, value)));
+            }
         }
-        match i64::try_from(raw) {
-            Ok(value) => self.small(value),
-            Err(_) => Err(self.raise(ExceptionClass::Error, "system_limit")),
-        }
+        let heap = self.ctx.eval_heap();
+        Ok(heap!(beam_codec::term::make_big(heap, negative, digits)))
     }
 
     /// The bitstring term for `bits` bits of `bytes` starting at `start`.
@@ -2265,23 +2498,21 @@ fn read_bits_be(bytes: &[u8], start: usize, n: usize) -> u64 {
 }
 
 /// Reads `n` bits (`n <= 64`) starting at bit `start` as a **little-endian** unsigned
-/// integer: the bits are gathered MSB-first into `ceil(n / 8)` bytes, and those bytes
-/// are then interpreted least-significant byte first (the inverse of
-/// [`BitBuf::push_integer_bits`] with `little = true`).
+/// integer: the bits are gathered MSB-first into `ceil(n / 8)` bytes, and those whole
+/// bytes are then interpreted least-significant byte first — the exact inverse of
+/// [`BitBuf::push_integer_bits`] with `little = true`.
+///
+/// A width that is not a whole number of bytes leaves a final **partial** byte, and its
+/// `n % 8` bits are the value's next byte (they were pushed into the *high* bits of the
+/// last byte), so they enter the value *above* the whole bytes rather than through the
+/// byte reversal: `<<212,14:4>>` read as `<<A:12/little>>` is `16#0E bsl 8 bor 16#D4` =
+/// 3796, and the byte-aligned `<<0,1>>` as `<<A:16/little>>` is still 256. A width of at
+/// most 8 bits is unaffected by `little` (its single partial field *is* the whole value),
+/// exactly as the oracle's own reader treats it.
 fn read_bits_le(bytes: &[u8], start: usize, n: usize) -> u64 {
-    let n_bytes = n.div_ceil(8);
-    let mut gathered = [0u8; 8];
-    for i in 0..n {
-        let bit = bytes[(start + i) / 8] & (0x80 >> ((start + i) % 8)) != 0;
-        if bit {
-            gathered[i / 8] |= 0x80 >> (i % 8);
-        }
-    }
-    let mut value = 0u64;
-    for &byte in gathered[..n_bytes].iter().rev() {
-        value = (value << 8) | u64::from(byte);
-    }
-    value
+    // The byte-wise reader itself lives in the `bits_match` module, next to the oracle
+    // table that pins it; this entry point stays the one the integer pattern path calls.
+    bits_match::read_little_endian_bits(bytes, start, n)
 }
 
 /// Sign-extends the low `n` bits (`n <= 64`) of `value`.
@@ -2801,6 +3032,183 @@ mod tests {
         .expect("the compound reason survives the raise");
         let printed = ctx.runtime.format_term(reason, None).expect("~p renders it");
         assert_eq!(printed.trim_end(), "{nif_not_loaded,m,f,0}");
+    }
+
+    /// The `{case_clause, V}`/`if_clause` raises the evaluator itself produces are converted
+    /// to a [`BeamError`] by [`finish`] — the module's **only** terminal conversion of a
+    /// [`Flow::Raise`] (both call sites, [`eval`] and [`apply_eval_closure`], go through it).
+    ///
+    /// A **structured** reason (`{case_clause, Subject}`, …) is a term the term-free
+    /// [`ExitReason`](beam_common::ExitReason) cannot hold, so [`finish`] attaches it to the
+    /// raise's live-reason slot: [`crate::error::live_reason_term`] — the runtime's single
+    /// recovery point, and what every rendering route consumes — must find it. Before the
+    /// slot was attached the reason rendered as the `<structured reason>` placeholder.
+    ///
+    /// Every expectation is the system oracle's own `~w` text for that reason, verified live
+    /// by [`the_uncaught_reason_text_is_the_oracles`] below.
+    #[test]
+    fn an_uncaught_structured_reason_carries_its_live_term() {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        for (expr, expected) in [
+            ("case 1 of 2 -> ok end", "{case_clause,1}"),
+            ("case [a,b,c] of [x] -> y end", "{case_clause,[a,b,c]}"),
+            ("case <<1,2>> of <<3,4>> -> ok end", "{case_clause,<<1,2>>}"),
+        ] {
+            let error = eval(&mut ctx, expr).expect_err(expr);
+            let BeamError::Raise(raise) = &error else {
+                panic!("{expr}: expected a raise, got {error:?}");
+            };
+            assert_eq!(raise.class, ExceptionClass::Error, "{expr}");
+            assert_eq!(
+                raise.reason.as_atom(),
+                None,
+                "{expr}: a structured reason names no atom"
+            );
+            let reason = error::live_reason_term(&error)
+                .unwrap_or_else(|| panic!("{expr}: the reason term must be live"));
+            let printed = ctx
+                .runtime
+                .format_term_w(reason, None)
+                .expect("~w renders it");
+            assert_eq!(printed.trim_end(), expected, "{expr}");
+        }
+    }
+
+    /// An evaluator-produced **atom** reason is unchanged: the atom is the authoritative
+    /// reason, so [`finish`] attaches no term next to it and
+    /// [`crate::error::live_reason_term`] keeps answering `None` (an atom reason must never be
+    /// shadowed by a term — see its own doc).
+    ///
+    /// `if` with no matching clause raises the **bare atom** `if_clause` (the oracle prints
+    /// `exc error if_clause`), which is an evaluator raise with `origin: None` — i.e. exactly
+    /// the arm [`finish`] rewrites.
+    #[test]
+    fn an_uncaught_atom_reason_is_not_shadowed_by_a_live_term() {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let error = eval(&mut ctx, "if false -> ok end").expect_err("an unmet `if`");
+        let BeamError::Raise(raise) = &error else {
+            panic!("expected a raise, got {error:?}");
+        };
+        assert_eq!(raise.class, ExceptionClass::Error);
+        // The atom is still the reason, and it still *names* the reason.
+        assert_eq!(raise.reason.as_atom(), Some("if_clause"));
+        assert_eq!(raise.reason.to_string(), "if_clause");
+        assert!(
+            raise.live_reason().is_none(),
+            "an atom reason must not carry a live term"
+        );
+        assert_eq!(error::live_reason_term(&error), None);
+    }
+
+    /// The system `erl`'s stdout for `expression`, or `None` — with a **loud** skip on stderr
+    /// — when no `erl` is on `PATH`, or when the probe outlived `ORACLE_TIMEOUT`.
+    ///
+    /// The bound is not optional: a bare `erl -noshell` never exits, so every probe here ends
+    /// in `halt/0` and a hung `erl` is killed rather than allowed to wedge the suite.
+    fn oracle_stdout(expression: &str) -> Option<String> {
+        const ORACLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut child = match std::process::Command::new("erl")
+            .args(["-noshell", "-eval", expression])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIP: no erl on PATH — the uncaught `-eval` raise reason text is not \
+                     cross-checked against the system Erlang"
+                );
+                return None;
+            }
+            Err(error) => panic!("running the erl oracle: {error}"),
+        };
+        let deadline = std::time::Instant::now() + ORACLE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "SKIP: the erl probe did not exit within {ORACLE_TIMEOUT:?} — the \
+                         uncaught `-eval` raise reason text is not cross-checked"
+                    );
+                    return None;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => panic!("polling the erl oracle: {error}"),
+            }
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take()?, &mut text).expect("oracle stdout");
+        Some(text)
+    }
+
+    /// The reason **text** an uncaught `-eval` raise renders is the oracle's own.
+    ///
+    /// Each expression is run under the system `erl` inside the mandatory self-terminating
+    /// wrapper, so the oracle prints `exc error <Reason>` (its `~w` rendering of the reason)
+    /// and exits 1; this runtime must render the identical `~w` text from its raise — through
+    /// [`crate::error::live_reason_term`] for a structured reason and through the atom itself
+    /// otherwise, which is exactly what `cli.rs`'s `reported_reason` does for a route that
+    /// consumes the slot. This is the live cross-check that keeps the hardcoded
+    /// expectations above honest.
+    #[test]
+    fn the_uncaught_reason_text_is_the_oracles() {
+        // The four reasons below in one `erl` invocation (the oracle is spawned once, not
+        // four times): `W/1` is the mandatory wrapper, applied to each expression in turn.
+        const PROBE: &str = r#"W = fun(E) -> try (fun() -> E() end)() of V -> io:format("ok ~w~n", [V]), ok catch C:R -> io:format("exc ~w ~w~n", [C, R]), ok end end, [W(E) || E <- [fun() -> case 1 of 2 -> ok end end, fun() -> case [a,b,c] of [x] -> y end end, fun() -> case <<1,2>> of <<3,4>> -> ok end end, fun() -> if false -> ok end end]], halt(0)."#;
+        let Some(stdout) = oracle_stdout(PROBE) else {
+            return;
+        };
+        let cases = [
+            ("case 1 of 2 -> ok end", "{case_clause,1}"),
+            ("case [a,b,c] of [x] -> y end", "{case_clause,[a,b,c]}"),
+            ("case <<1,2>> of <<3,4>> -> ok end", "{case_clause,<<1,2>>}"),
+            ("if false -> ok end", "if_clause"),
+        ];
+        let oracle_lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            oracle_lines.len(),
+            cases.len(),
+            "the oracle probe printed {oracle_lines:?}"
+        );
+
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        for (index, (expr, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                oracle_lines[index],
+                format!("exc error {expected}"),
+                "{expr} under the oracle"
+            );
+            let error = eval(&mut ctx, expr).expect_err(expr);
+            let rendered = match error::live_reason_term(&error) {
+                Some(term) => ctx
+                    .runtime
+                    .format_term_w(term, None)
+                    .expect("~w renders the reason")
+                    .trim_end()
+                    .to_string(),
+                None => {
+                    let BeamError::Raise(raise) = &error else {
+                        panic!("{expr}: expected a raise, got {error:?}");
+                    };
+                    raise.reason.to_string()
+                }
+            };
+            assert_eq!(
+                format!("exc error {rendered}"),
+                oracle_lines[index],
+                "{expr}: this runtime's reason text"
+            );
+        }
     }
 
     /// `erlang:raise/3` is **not** served by the evaluator: it falls through to the

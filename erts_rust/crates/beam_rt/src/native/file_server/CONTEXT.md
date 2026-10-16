@@ -89,7 +89,9 @@ A request is either a **bare command atom** or a tuple whose head is the command
 integer is `file.erl`'s `{N,bof}` shorthand), `{get_chars,Enc,Prompt,N}` (shaped `binary`/`list`
 from the open mode), `{put_chars,Enc,Chars}`, `{get_until,Enc,Prompt,Mod,Func,XtraArgs}` (plus
 the legacy 4-tuple form, whose encoding defaults to `latin1`), `{get_line,Enc,_Prompt}` (plus
-the legacy 2-tuple form, encoding defaulted to `latin1` — `file:read_line/1`'s request), and the
+the legacy 2-tuple form, encoding defaulted to `latin1` — `file:read_line/1`'s request),
+`{read_handle_info, Opts}` (the **open device's own** `#file_info{}`, `file_io_server.erl:335-342`),
+and the
 **read-mode surface** `getopts` / `{setopts, Opts}` ([`setopts.rs`](setopts.rs)). Two requests run
 Erlang code and own their read loop ([`get_until.rs`](get_until.rs), [`get_line.rs`](get_line.rs)).
 Every other request is the typed `unsupported` gap.
@@ -154,8 +156,15 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
   SELECTS a `utf16`/`utf32` encoding is a typed `unsupported` gap rather than a fabricated `ok`.
   A `{setopts,…}` `{binary, V}` whose `V` is neither `true` nor `false` is likewise a typed gap
   (the oracle crashes the device's `case`).
+* **`{read_handle_info, Opts}` is served** by `../file_server.rs`'s `reply_read_handle_info`: the
+  time option is resolved first (`read_handle_info_1(Fd, proplist_get_value(time, Opts, local))`,
+  `prim_file.erl:669-670` — a non-list `Opts` is the bare `function_clause`), then the **open
+  device's own** `Metadata` is rendered through the shared `#file_info{}` builder
+  (`prim::file_info_reply`, `prim::status_access_bits`, `beam_io::process_credentials`) as the
+  oracle's 14-tuple, or the builder's `{error, Reason}`. This is the request `file:path_open/3`'s
+  non-`raw` device and `epp:parse_file/2`'s `-moduledoc({file, Path})` read send.
 * **Other io-device requests stay the typed `unsupported` gap** — `pread`/`pwrite`/`advise`/
-  `allocate`/`read_handle_info`, the legacy `put_chars` arities, and a non-`latin1`
+  `allocate`, the legacy `put_chars` arities, and a non-`latin1`
   `put_chars` encoding.
 * **A `{get_chars,…}` on a `unicode` **stream** counts BYTES, where the oracle counts
   CHARACTERS.** `reply_get_chars` moves `N` raw bytes; the oracle's
@@ -249,7 +258,8 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 ## Routing Table
 - `../file_server.rs` → the `FileServices` service process, its `Device` io-devices, the
   request/reply wire, the write path (`{write_file,…}` + the delegating `{open,…}`), the decode
-  helpers and the errno→atom table
+  helpers, the `{read_handle_info, Opts}` io-device reader (`reply_read_handle_info`, over
+  `../prim.rs`'s shared `#file_info{}` builder) and the errno→atom table
 - `setopts.rs` → the io-device read-mode surface: `getopts` + `{setopts, Opts}` and the
   `expand_encoding`/`substitute_negations`/`unfold`/`check_valid_opts`/`valid_enc` reproduction
 - `tests.rs` → the colocated unit suite for `../file_server.rs` + the shared `runtime()`/`build()`

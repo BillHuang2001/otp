@@ -77,9 +77,7 @@ use std::process::Command;
 
 use beam_alloc::{AllocRef, AllocatorConfig, CarrierAllocator, RefcBinary};
 use beam_codec::encode_term;
-use beam_gc::prelude::{
-    AnyCollector, GcConfig, GcStats, HeapPolicy, MatureKind, OffHeap,
-};
+use beam_gc::prelude::{AnyCollector, GcConfig, GcStats, HeapPolicy, MatureKind, OffHeap};
 use beam_term::prelude::{
     big_size_words, bin_ref_parts, boxed_val, is_arity_value, is_boxed, is_list, is_refc_binary,
     make_atom, make_small, map_words_capacity, ptr_val, refc_bytes, write_big, write_map,
@@ -181,7 +179,11 @@ fn collector(kind: MatureKind) -> AnyCollector {
         MatureKind::Immix => GcConfig::immix(policy_for(kind)),
     };
     let c = AnyCollector::from_config(&config).expect("collector construction");
-    assert_eq!(c.kind(), kind, "the explicit pin must select the requested strategy");
+    assert_eq!(
+        c.kind(),
+        kind,
+        "the explicit pin must select the requested strategy"
+    );
     c
 }
 
@@ -297,7 +299,9 @@ fn build_shape(
 
 /// Interns the corpus atoms and looks one up (the table is the test's own, so a miss is a bug).
 fn lookup<'a>(atoms: &'a AtomTable, name: &str) -> beam_term::Atom {
-    atoms.lookup(name).unwrap_or_else(|| panic!("atom {name} must be interned"))
+    atoms
+        .lookup(name)
+        .unwrap_or_else(|| panic!("atom {name} must be interned"))
 }
 
 /// Writes the `n`-pair `i -> i * mult` integer-keyed map at the nursery top and returns its
@@ -325,7 +329,12 @@ fn build_map(c: &mut AnyCollector, atoms: &AtomTable, n: usize, mult: i64) -> Et
 
 /// Writes the 8-word `[BinRef][ErlSubBits]` pair for `payload` (window `offset_bits..+size_bits`)
 /// at the nursery top and returns its root (the `ErlSubBits`).
-fn write_refc_pair(c: &mut AnyCollector, payload: &RefcBinary, offset_bits: usize, size_bits: usize) -> Eterm {
+fn write_refc_pair(
+    c: &mut AnyCollector,
+    payload: &RefcBinary,
+    offset_bits: usize,
+    size_bits: usize,
+) -> Eterm {
     // SAFETY: exactly `ERL_REFC_BITS_SIZE` (8) exclusively-owned words are reserved at `hp`;
     // `payload.data_ptr()` is a live, word-aligned pointer to `payload.len()` bytes of
     // off-heap storage kept alive by the caller's `keepalive` for the whole test, the window
@@ -376,13 +385,18 @@ fn churn(c: &mut AnyCollector, roots: &mut [Eterm], rounds: usize) -> GcStats {
                 .expect("a garbage cons fits while should_collect(2) is false");
             filler += 1;
             guard += 1;
-            assert!(guard < 1 << 22, "the nursery never filled: should_collect is stuck");
+            assert!(
+                guard < 1 << 22,
+                "the nursery never filled: should_collect is stuck"
+            );
         }
 
         if round % 8 == 7 {
-            c.collect_major(roots).expect("the fullsweep fits the live set");
+            c.collect_major(roots)
+                .expect("the fullsweep fits the live set");
         } else {
-            c.collect(roots).expect("the policy-driven collection fits the live set");
+            c.collect(roots)
+                .expect("the policy-driven collection fits the live set");
         }
     }
     c.stats()
@@ -465,13 +479,13 @@ fn erl_eval(oracle: &Path, expr: &str) -> Option<String> {
 /// and parsed back here. A run that cannot be executed or whose output is not valid hex is a
 /// **hard failure** (the oracle was resolved, so it must answer).
 fn oracle_term_bytes(oracle: &Path, expr: &str) -> Vec<u8> {
-    let program = format!(
-        "B = term_to_binary({expr}), io:format(\"~s~n\", [binary:encode_hex(B)]), halt()."
-    );
+    let program =
+        format!("B = term_to_binary({expr}), io:format(\"~s~n\", [binary:encode_hex(B)]), halt().");
     let stdout = erl_eval(oracle, &program)
         .unwrap_or_else(|| panic!("the oracle failed to evaluate `{expr}`"));
     let hex = stdout.trim();
-    parse_hex(hex).unwrap_or_else(|| panic!("the oracle emitted non-hex output for `{expr}`: {stdout:?}"))
+    parse_hex(hex)
+        .unwrap_or_else(|| panic!("the oracle emitted non-hex output for `{expr}`: {stdout:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -729,7 +743,10 @@ fn container_handle(container: Eterm) -> Eterm {
     // SAFETY: `container` is a live boxed 2-tuple this test built, so its header word and
     // element 0 are readable.
     let header = unsafe { *boxed_val(container) };
-    assert!(is_arity_value(header), "the root must be the container tuple");
+    assert!(
+        is_arity_value(header),
+        "the root must be the container tuple"
+    );
     assert_eq!(beam_term::arityval(header), 2, "the container is a 2-tuple");
     // SAFETY: element 0 lies inside the live 2-element tuple just validated.
     unsafe { *boxed_val(container).add(1) }
@@ -812,14 +829,21 @@ fn an_offheap_refc_binary_is_byte_preserved_and_freed_exactly_once() {
             }
             // SAFETY: `container_after` is the live, copied `ErlSubBits`.
             unsafe {
-                assert!(is_refc_binary(container_after), "{ctx}: still a refc binary");
+                assert!(
+                    is_refc_binary(container_after),
+                    "{ctx}: still a refc binary"
+                );
                 assert_eq!(
                     refc_bytes(container_after),
                     REFC_BYTES,
                     "{ctx}: the off-heap payload bytes are byte-preserved"
                 );
             }
-            assert_eq!(payload.refcount(), 2, "{ctx}: a collection never touches the refcount");
+            assert_eq!(
+                payload.refcount(),
+                2,
+                "{ctx}: a collection never touches the refcount"
+            );
             assert_eq!(off_heap.overhead_bytes(), REFC_BYTES.len(), "{ctx}");
         }
 
@@ -840,8 +864,16 @@ fn an_offheap_refc_binary_is_byte_preserved_and_freed_exactly_once() {
             "{kind:?}: the release decremented the count exactly once"
         );
         // The payload is still readable through the surviving test handle: no use-after-free.
-        assert_eq!(payload.as_bytes(), REFC_BYTES, "{kind:?}: the payload bytes are intact");
-        assert_eq!(off_heap.sweep(|_| false), 0, "{kind:?}: nothing left to sweep");
+        assert_eq!(
+            payload.as_bytes(),
+            REFC_BYTES,
+            "{kind:?}: the payload bytes are intact"
+        );
+        assert_eq!(
+            off_heap.sweep(|_| false),
+            0,
+            "{kind:?}: nothing left to sweep"
+        );
 
         // Dropping the last reference frees the buffer exactly once — a leak would leave a live
         // block, a double free would trip the allocator's plausibility check.
@@ -849,7 +881,10 @@ fn an_offheap_refc_binary_is_byte_preserved_and_freed_exactly_once() {
         assert_eq!(before.live_blocks, 1, "{kind:?}");
         drop(payload);
         let after = alloc.stats();
-        assert_eq!(after.live_blocks, 0, "{kind:?}: the payload's buffer was freed");
+        assert_eq!(
+            after.live_blocks, 0,
+            "{kind:?}: the payload's buffer was freed"
+        );
         assert_eq!(
             after.free_calls,
             before.free_calls + 1,
@@ -868,7 +903,8 @@ fn an_offheap_refc_binary_is_byte_preserved_and_freed_exactly_once() {
 #[test]
 fn the_offheap_pointer_word_is_left_verbatim_by_a_move() {
     let alloc = test_allocator(MatureKind::Copying);
-    let payload = RefcBinary::with_allocator(alloc, b"pointer-word probe payload").expect("payload");
+    let payload =
+        RefcBinary::with_allocator(alloc, b"pointer-word probe payload").expect("payload");
 
     let mut c = collector(MatureKind::Copying);
     let (container, handle) = container_with_refc(&mut c, &payload);
@@ -901,5 +937,8 @@ fn the_offheap_pointer_word_is_left_verbatim_by_a_move() {
         payload.data_ptr() as usize,
         "the off-heap pointer word must be byte-identical after a move"
     );
-    assert_eq!(next as usize, 0, "the (empty) chain link must be left byte-identical");
+    assert_eq!(
+        next as usize, 0,
+        "the (empty) chain link must be left byte-identical"
+    );
 }

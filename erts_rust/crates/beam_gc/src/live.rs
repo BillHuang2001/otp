@@ -224,15 +224,24 @@ mod tests {
             .tuple(&[make_small(1), make_small(2)])
             .expect("shared 3-word tuple");
         // Two tuples that both reference `shared`: a DAG, not a tree.
-        let left = space.heap_mut().tuple(&[shared, make_small(3)]).expect("left");
-        let right = space.heap_mut().tuple(&[shared, make_small(4)]).expect("right");
+        let left = space
+            .heap_mut()
+            .tuple(&[shared, make_small(3)])
+            .expect("left");
+        let right = space
+            .heap_mut()
+            .tuple(&[shared, make_small(4)])
+            .expect("right");
         let mut roots = [left, right];
 
         let mut from = FromSet::new();
         from.add(&space);
         let counted = live(&from, &roots);
         // 3 (left) + 3 (right) + 3 (shared, once) = 9, not 12.
-        assert_eq!(counted.words, 9, "the shared tuple contributes its words once");
+        assert_eq!(
+            counted.words, 9,
+            "the shared tuple contributes its words once"
+        );
 
         let mut to = HeapSpace::new(64).expect("to-space");
         let stats = Copier::new(&from, &mut to).run(&mut roots).expect("copy");
@@ -526,8 +535,16 @@ mod tests {
         }
 
         let counted = live_full(c.nursery(), c.mature(), &roots);
-        assert_eq!(counted.words, 12 * 3 + 4 * 17, "twelve 3-word and four 17-word tuples");
-        assert_eq!(counted.lines, 12 + 4 * 2, "one line each, two for the 17-word tuples");
+        assert_eq!(
+            counted.words,
+            12 * 3 + 4 * 17,
+            "twelve 3-word and four 17-word tuples"
+        );
+        assert_eq!(
+            counted.lines,
+            12 + 4 * 2,
+            "one line each, two for the 17-word tuples"
+        );
         assert_eq!(
             counted.words,
             roots.iter().map(|&t| size_object(t)).sum::<usize>(),
@@ -568,8 +585,16 @@ mod tests {
             .heap_mut()
             .tuple(&[shared, make_small(4)])
             .expect("right");
-        let a = c.young_mut().heap_mut().cons(make_small(5), NIL).expect("cell a");
-        let b = c.young_mut().heap_mut().cons(make_small(6), a).expect("cell b");
+        let a = c
+            .young_mut()
+            .heap_mut()
+            .cons(make_small(5), NIL)
+            .expect("cell a");
+        let b = c
+            .young_mut()
+            .heap_mut()
+            .cons(make_small(6), a)
+            .expect("cell b");
         // Close the cycle with a raw write (no allocator API makes a cycle).
         // SAFETY: `a` names a live 2-word cons cell this test allocated in the nursery, and
         // word 1 is its cdr slot; the write stays inside the cell.
@@ -703,8 +728,16 @@ mod tests {
         );
 
         let counted = live_full(c.nursery(), c.mature(), &roots);
-        assert_eq!(counted.words, 6 * 8 + 3, "six 8-word handles plus a 3-word tuple");
-        assert_eq!(counted.lines, 6 * 2 + 1, "two lines per pair, one for the holder");
+        assert_eq!(
+            counted.words,
+            6 * 8 + 3,
+            "six 8-word handles plus a 3-word tuple"
+        );
+        assert_eq!(
+            counted.lines,
+            6 * 2 + 1,
+            "two lines per pair, one for the holder"
+        );
 
         assert_major_matches(&mut c, counted, &mut roots);
 
@@ -715,7 +748,11 @@ mod tests {
             // payload `payloads[i]` is alive for the whole test.
             unsafe {
                 assert!(is_refc_binary(*root), "pair {i}");
-                assert_eq!(refc_size(*root), payloads[i].len() * 8, "pair {i}: the window");
+                assert_eq!(
+                    refc_size(*root),
+                    payloads[i].len() * 8,
+                    "pair {i}: the window"
+                );
                 assert_eq!(
                     refc_bytes(*root),
                     payloads[i].as_bytes(),
@@ -754,13 +791,22 @@ mod tests {
             let mut from = FromSet::new();
             from.add(&space);
             let counted = live(&from, &roots);
-            assert_eq!(counted.words, 8, "len = {len}: only the on-heap pair is counted");
+            assert_eq!(
+                counted.words, 8,
+                "len = {len}: only the on-heap pair is counted"
+            );
             assert_eq!(counted.lines, 2, "len = {len}: one line per pair object");
 
             let mut to = HeapSpace::new(8).expect("to-space");
             let stats = Copier::new(&from, &mut to).run(&mut roots).expect("copy");
-            assert_eq!(stats.words_copied, counted.words, "len = {len}: the copier agrees");
-            assert_eq!(stats.objects_copied, 2, "len = {len}: the SubBits and its BinRef");
+            assert_eq!(
+                stats.words_copied, counted.words,
+                "len = {len}: the copier agrees"
+            );
+            assert_eq!(
+                stats.objects_copied, 2,
+                "len = {len}: the SubBits and its BinRef"
+            );
         }
     }
 
@@ -788,20 +834,14 @@ mod tests {
             .heap_mut()
             .tuple(&[make_small(1), make_small(2)])
             .expect("a1");
-        let a2 = space
-            .heap_mut()
-            .tuple(&[a1, make_small(3)])
-            .expect("a2");
+        let a2 = space.heap_mut().tuple(&[a1, make_small(3)]).expect("a2");
         (a1, a2)
     }
 
     /// Builds `b1 = {a2, 4}` (a reference back across the growth boundary) and `b2 = [5]` in
     /// `space` — the terms in the fresh space a growth installed.
     fn build_b(space: &mut HeapSpace, a2: Eterm) -> (Eterm, Eterm) {
-        let b1 = space
-            .heap_mut()
-            .tuple(&[a2, make_small(4)])
-            .expect("b1");
+        let b1 = space.heap_mut().tuple(&[a2, make_small(4)]).expect("b1");
         let b2 = space.heap_mut().cons(make_small(5), NIL).expect("b2");
         (b1, b2)
     }
@@ -834,7 +874,11 @@ mod tests {
             counted.words, stats.words_copied,
             "the counter must equal the fullsweep's copy on a chained nursery"
         );
-        assert_eq!(c.young_space_count(), 1, "the fullsweep collapses the chain");
+        assert_eq!(
+            c.young_space_count(),
+            1,
+            "the fullsweep collapses the chain"
+        );
     }
 
     /// The mark-region counter ([`live_full`]) over a **chained** nursery equals a real
@@ -867,6 +911,10 @@ mod tests {
             c.mature().used_lines(),
             "the promotion must occupy exactly the counted lines"
         );
-        assert_eq!(c.young_space_count(), 1, "the fullsweep collapses the chain");
+        assert_eq!(
+            c.young_space_count(),
+            1,
+            "the fullsweep collapses the chain"
+        );
     }
 }

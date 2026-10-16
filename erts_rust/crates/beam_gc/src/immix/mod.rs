@@ -123,7 +123,9 @@ use core::mem::size_of;
 
 use beam_alloc::{AllocRef, Heap};
 use beam_common::Result;
-use beam_term::prelude::{is_boxed, is_list, make_list, make_tuple, ptr_val, try_make_arityval, Eterm};
+use beam_term::prelude::{
+    is_boxed, is_list, make_list, make_tuple, ptr_val, try_make_arityval, Eterm,
+};
 
 use crate::error::heap_exhausted;
 

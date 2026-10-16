@@ -353,7 +353,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use beam_alloc::{AllocatorConfig, AllocRef, CarrierAllocator};
+    use beam_alloc::{AllocRef, AllocatorConfig, CarrierAllocator};
 
     /// A payload that counts how many times it has been dropped.
     struct DropCounter {
@@ -533,7 +533,12 @@ mod tests {
         // (and its payload) alive.
         drop(handle);
         assert_eq!(
-            off_heap.get(0).expect("slot 0").as_mso().expect("an MSO entry").refcount(),
+            off_heap
+                .get(0)
+                .expect("slot 0")
+                .as_mso()
+                .expect("an MSO entry")
+                .refcount(),
             1
         );
         assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -544,7 +549,11 @@ mod tests {
         two.push(shared.clone());
         two.push(shared);
         assert_eq!(
-            two.get(0).expect("slot 0").as_mso().expect("an MSO entry").refcount(),
+            two.get(0)
+                .expect("slot 0")
+                .as_mso()
+                .expect("an MSO entry")
+                .refcount(),
             2
         );
         assert_eq!(two.sweep(|_| false), 2);
@@ -625,7 +634,11 @@ mod tests {
         // Keep the binary, release the MSO.
         let released = off_heap.sweep(|entry| entry.as_binary().is_some());
         assert_eq!(released, 1);
-        assert_eq!(drops.load(Ordering::SeqCst), 1, "the MSO payload was destroyed");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the MSO payload was destroyed"
+        );
         assert_eq!(off_heap.len(), 1);
         assert_eq!(off_heap.overhead_bytes(), binary_observer.len());
         // The MSO (slot 0) was released in place; the binary survives at its **original** slot 1
@@ -650,7 +663,11 @@ mod tests {
         assert_eq!(off_heap.sweep(|entry| entry.as_mso().is_some()), 1);
         assert!(off_heap.is_empty());
         assert_eq!(off_heap.overhead_bytes(), 0);
-        assert_eq!(binary_observer.refcount(), 1, "the list released the binary");
+        assert_eq!(
+            binary_observer.refcount(),
+            1,
+            "the list released the binary"
+        );
         assert_eq!(
             alloc.stats().live_blocks,
             1,
@@ -660,7 +677,11 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1, "no further MSO destructor");
 
         drop(binary_observer);
-        assert_eq!(alloc.stats().live_blocks, 0, "the last handle freed the payload");
+        assert_eq!(
+            alloc.stats().live_blocks,
+            0,
+            "the last handle freed the payload"
+        );
         assert_eq!(alloc.stats().live_bytes, 0);
     }
 
@@ -729,7 +750,11 @@ mod tests {
         off_heap.push(Mso::new(counter(&drops, 4), 50));
 
         let sizes: Vec<usize> = off_heap.iter().map(OffHeapEntry::overhead_bytes).collect();
-        assert_eq!(sizes, vec![10, 20, 30, 40, 50], "slot order is insertion order");
+        assert_eq!(
+            sizes,
+            vec![10, 20, 30, 40, 50],
+            "slot order is insertion order"
+        );
         assert_eq!(off_heap.iter().count(), off_heap.len());
     }
 
@@ -740,8 +765,8 @@ mod tests {
 
         let mut off_heap = OffHeap::new();
         let mso_slot = off_heap.insert(Mso::new(counter(&drops, 5), 32));
-        let binary_slot = off_heap
-            .insert(RefcBinary::with_allocator(alloc, b"slot binary").expect("allocate"));
+        let binary_slot =
+            off_heap.insert(RefcBinary::with_allocator(alloc, b"slot binary").expect("allocate"));
         assert_eq!((mso_slot, binary_slot), (0, 1));
 
         // Each slot resolves to the entry of the kind that was inserted there.
@@ -762,7 +787,11 @@ mod tests {
                 .map(RefcBinary::as_bytes),
             Some(&b"slot binary"[..])
         );
-        assert!(off_heap.get(binary_slot).expect("present").as_mso().is_none());
+        assert!(off_heap
+            .get(binary_slot)
+            .expect("present")
+            .as_mso()
+            .is_none());
 
         // `iter` walks both kinds in slot order.
         let is_mso: Vec<bool> = off_heap.iter().map(|e| e.as_mso().is_some()).collect();
@@ -848,7 +877,11 @@ mod tests {
         assert_eq!(off_heap.len(), 3);
         assert!(!off_heap.is_empty());
         let live_sizes: Vec<usize> = off_heap.iter().map(OffHeapEntry::overhead_bytes).collect();
-        assert_eq!(live_sizes, vec![10, 30, 50], "only the survivors, in slot order");
+        assert_eq!(
+            live_sizes,
+            vec![10, 30, 50],
+            "only the survivors, in slot order"
+        );
         assert_eq!(off_heap.iter().count(), off_heap.len());
         assert_eq!(off_heap.overhead_bytes(), 90);
 

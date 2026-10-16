@@ -178,7 +178,11 @@ impl MatureChoice {
                 "{:?} (automatic rule: mature generation {} words {} break-even {} words)",
                 self.kind,
                 self.mature_words,
-                if self.kind == MatureKind::Immix { ">=" } else { "<" },
+                if self.kind == MatureKind::Immix {
+                    ">="
+                } else {
+                    "<"
+                },
                 self.break_even_words
             ),
             MatureSource::Explicit if self.kind == self.rule_kind() => format!(
@@ -264,7 +268,10 @@ mod tests {
         assert_eq!(select_mature(0), MatureKind::Copying);
         assert_eq!(select_mature(1), MatureKind::Copying);
         assert_eq!(select_mature(BLOCK_WORDS), MatureKind::Copying);
-        assert_eq!(select_mature(IMMIX_BREAK_EVEN_WORDS - 1), MatureKind::Copying);
+        assert_eq!(
+            select_mature(IMMIX_BREAK_EVEN_WORDS - 1),
+            MatureKind::Copying
+        );
         assert_eq!(select_mature(IMMIX_BREAK_EVEN_WORDS), MatureKind::Immix);
         assert_eq!(select_mature(IMMIX_BREAK_EVEN_WORDS + 1), MatureKind::Immix);
         assert_eq!(select_mature(usize::MAX), MatureKind::Immix);
@@ -298,7 +305,10 @@ mod tests {
 
         let pinned_copying = GcConfig::auto(big.clone()).with_mature(MatureKind::Copying);
         assert_eq!(pinned_copying.mature(), MatureKind::Copying);
-        assert_eq!(pinned_copying.mature_choice().source, MatureSource::Explicit);
+        assert_eq!(
+            pinned_copying.mature_choice().source,
+            MatureSource::Explicit
+        );
         assert!(pinned_copying.mature_choice().is_override());
 
         let pinned_immix = GcConfig::auto(small.clone()).with_mature(MatureKind::Immix);

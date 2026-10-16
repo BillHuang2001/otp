@@ -62,13 +62,13 @@
 
 use beam_alloc::RefcBinary;
 use beam_gc::prelude::{
-    lines_for, AnyCollector, CollectionKind, GenImmixCollector, GcConfig, HeapPolicy, MatureKind,
+    lines_for, AnyCollector, CollectionKind, GcConfig, GenImmixCollector, HeapPolicy, MatureKind,
     Mso, OffHeap, LINE_WORDS,
 };
 use beam_term::prelude::{
     boxed_val, fun_words, is_refc_binary, make_small, map_words_capacity, ptr_val, refc_bytes,
-    refc_size, size_object, write_fun_external, write_fun_local, write_map, write_refc_binary, Atom,
-    AtomTable, Eterm, FunKind, NIL, ERL_REFC_BITS_SIZE,
+    refc_size, size_object, write_fun_external, write_fun_local, write_map, write_refc_binary,
+    Atom, AtomTable, Eterm, FunKind, ERL_REFC_BITS_SIZE, NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -192,8 +192,16 @@ fn build_shared_and_cycle(c: &mut GenImmixCollector) -> Vec<Eterm> {
         .heap_mut()
         .tuple(&[shared, make_small(4)])
         .expect("right");
-    let a = c.young_mut().heap_mut().cons(make_small(5), NIL).expect("cell a");
-    let b = c.young_mut().heap_mut().cons(make_small(6), a).expect("cell b");
+    let a = c
+        .young_mut()
+        .heap_mut()
+        .cons(make_small(5), NIL)
+        .expect("cell a");
+    let b = c
+        .young_mut()
+        .heap_mut()
+        .cons(make_small(6), a)
+        .expect("cell b");
     // Close the cycle with a raw write (no allocator API makes a cycle).
     // SAFETY: `a` names a live 2-word cons cell this test allocated in the nursery, and word 1
     // is its cdr slot; the write stays inside the cell.
@@ -343,7 +351,11 @@ fn run_one(
             "{ctx}: the destination must cover at least `lines_for(words)` lines"
         );
     }
-    assert_eq!(c.young().used_words(), 0, "{ctx}: the nursery is empty after the fullsweep");
+    assert_eq!(
+        c.young().used_words(),
+        0,
+        "{ctx}: the nursery is empty after the fullsweep"
+    );
     if corpus.size_object_agrees {
         assert_eq!(
             roots.iter().map(|&t| size_object(t)).sum::<usize>(),
@@ -457,7 +469,10 @@ fn an_offheap_heavy_graph_counts_only_its_on_heap_words() {
         let mso = Mso::new(vec![1u8, 2, 3, 4], 4096);
         let slot = off_heap.insert(mso.clone());
         drop(mso); // the list now owns the only reference
-        assert_eq!(slot, PAIRS, "{kind:?}: the MSO took the slot after the binaries");
+        assert_eq!(
+            slot, PAIRS,
+            "{kind:?}: the MSO took the slot after the binaries"
+        );
         assert_eq!(off_heap.len(), PAIRS + 1, "{kind:?}");
         assert_eq!(
             off_heap.overhead_bytes(),
@@ -514,13 +529,23 @@ fn an_offheap_heavy_graph_counts_only_its_on_heap_words() {
         // byte the one written in the nursery.
         for (i, root) in roots.iter().take(PAIRS).enumerate() {
             let ctx = format!("{kind:?} handle {i}");
-            assert!(!c.young().contains_term(*root), "{ctx}: the handle must leave the nursery");
-            assert!(in_mature(&c, *root), "{ctx}: the handle must be relocated into mature");
+            assert!(
+                !c.young().contains_term(*root),
+                "{ctx}: the handle must leave the nursery"
+            );
+            assert!(
+                in_mature(&c, *root),
+                "{ctx}: the handle must be relocated into mature"
+            );
             // SAFETY: `*root` is the live, promoted `ErlSubBits` of pair `i`, whose off-heap
             // payload `payloads[i]` is alive for the whole test.
             unsafe {
                 assert!(is_refc_binary(*root), "{ctx}");
-                assert_eq!(refc_size(*root), PAYLOAD_BYTES * 8, "{ctx}: the window is preserved");
+                assert_eq!(
+                    refc_size(*root),
+                    PAYLOAD_BYTES * 8,
+                    "{ctx}: the window is preserved"
+                );
                 assert_eq!(
                     refc_bytes(*root),
                     payloads[i].as_bytes(),
@@ -550,7 +575,11 @@ fn an_offheap_heavy_graph_counts_only_its_on_heap_words() {
         // The MSO — reached by no heap term at all — is untouched: same refcount, payload intact.
         let entry = off_heap.get(slot).expect("the MSO slot resolves");
         let m = entry.as_mso().expect("an MSO entry");
-        assert_eq!(m.refcount(), 1, "{kind:?}: the MSO refcount is stable across the move");
+        assert_eq!(
+            m.refcount(),
+            1,
+            "{kind:?}: the MSO refcount is stable across the move"
+        );
         assert_eq!(m.apparent_size(), 4096, "{kind:?}");
         assert_eq!(
             m.downcast_ref::<Vec<u8>>().expect("the payload").as_slice(),
@@ -737,16 +766,38 @@ fn run_steady_state(label: &str, kind: MatureKind) {
     let total: Vec<usize> = half.iter().map(|s| s.total_heap_size).collect();
     let lines: Vec<usize> = half.iter().filter_map(|s| s.immix_lines).collect();
 
-    let min_max = |v: &[usize]| (*v.iter().min().expect("non-empty"), *v.iter().max().expect("non-empty"));
+    let min_max = |v: &[usize]| {
+        (
+            *v.iter().min().expect("non-empty"),
+            *v.iter().max().expect("non-empty"),
+        )
+    };
     let (y_lo, y_hi) = min_max(&young);
     let (m_lo, m_hi) = min_max(&mature);
     let (t_lo, t_hi) = min_max(&total);
-    assert_eq!(y_lo, y_hi, "{label}: the nursery capacity must be constant, got {young:?}");
-    assert_eq!(m_lo, m_hi, "{label}: the mature capacity must be constant, got {mature:?}");
-    assert_eq!(t_lo, t_hi, "{label}: the total heap must be constant, got {total:?}");
-    assert_eq!(t_lo, y_lo + m_lo, "{label}: the total is the nursery plus the mature capacity");
+    assert_eq!(
+        y_lo, y_hi,
+        "{label}: the nursery capacity must be constant, got {young:?}"
+    );
+    assert_eq!(
+        m_lo, m_hi,
+        "{label}: the mature capacity must be constant, got {mature:?}"
+    );
+    assert_eq!(
+        t_lo, t_hi,
+        "{label}: the total heap must be constant, got {total:?}"
+    );
+    assert_eq!(
+        t_lo,
+        y_lo + m_lo,
+        "{label}: the total is the nursery plus the mature capacity"
+    );
     if kind == MatureKind::Immix {
-        assert_eq!(lines.len(), half.len(), "{label}: every round exposes the line count");
+        assert_eq!(
+            lines.len(),
+            half.len(),
+            "{label}: every round exposes the line count"
+        );
         let (l_lo, l_hi) = min_max(&lines);
         // The region is reclaimed **in place** by a fullsweep and then promoted into until it
         // has no free line left, so — unlike the capacities above, which are all constant — the
@@ -775,7 +826,11 @@ fn run_steady_state(label: &str, kind: MatureKind) {
         "[{label}] {ROUNDS} rounds at the default cadence over a {ON_HEAP_WORDS}-word \
          off-heap-heavy live set: nursery {y_lo} words, mature {m_lo} words, total {t_lo} words \
          — all constant across the second half{}{} ({majors} fullsweeps, the counter-sized path)",
-        if kind == MatureKind::Immix { ", resident lines " } else { "" },
+        if kind == MatureKind::Immix {
+            ", resident lines "
+        } else {
+            ""
+        },
         match kind {
             MatureKind::Immix => format!("{}..{}", min_max(&lines).0, min_max(&lines).1),
             MatureKind::Copying => String::new(),

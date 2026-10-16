@@ -145,7 +145,10 @@ fn assert_multi_block(space: &ImmixSpace, root: Eterm, arity: usize) {
 
 /// Asserts the live cons cell `root` is resident in `space` and holds `[value, NIL]`.
 fn assert_small_cell(space: &ImmixSpace, root: Eterm, value: i64) {
-    assert!(space.contains_term(root), "the cell is resident in the space");
+    assert!(
+        space.contains_term(root),
+        "the cell is resident in the space"
+    );
     let cell = list_val(root);
     // SAFETY: `root` is a live cons cell (validated by `contains_term`/`list_val`).
     assert_eq!(signed_value(unsafe { *cell }), value);
@@ -224,7 +227,9 @@ fn promote_two_runs(c: &mut GenImmixCollector) -> Vec<Eterm> {
             .expect("garbage cell");
     }
 
-    let minor = c.collect_minor(&mut roots).expect("the two runs fit the mature region");
+    let minor = c
+        .collect_minor(&mut roots)
+        .expect("the two runs fit the mature region");
     assert_eq!(
         minor.objects_copied,
         2 + SMALL_LIVE,
@@ -241,7 +246,11 @@ fn promote_two_runs(c: &mut GenImmixCollector) -> Vec<Eterm> {
     // block boundaries and the small cells take the remaining holes.
     assert_eq!(run_blocks(LARGE_WORDS), 2);
     assert_eq!(run_blocks(WIDE_WORDS), 3);
-    assert_eq!(block_offset(c.mature(), roots[0]), 0, "the first run starts at the region base");
+    assert_eq!(
+        block_offset(c.mature(), roots[0]),
+        0,
+        "the first run starts at the region base"
+    );
     assert_eq!(
         block_offset(c.mature(), roots[1]),
         2 * BLOCK_WORDS,
@@ -254,8 +263,7 @@ fn promote_two_runs(c: &mut GenImmixCollector) -> Vec<Eterm> {
     }
 
     // Mature lines: 17 for the two-block run + 33 for the three-block run + one per cell.
-    let expected_lines =
-        lines_for(LARGE_WORDS) + lines_for(WIDE_WORDS) + SMALL_LIVE;
+    let expected_lines = lines_for(LARGE_WORDS) + lines_for(WIDE_WORDS) + SMALL_LIVE;
     assert_eq!(expected_lines, 56);
     assert_eq!(
         c.mature().used_lines(),
@@ -271,15 +279,24 @@ fn promote_two_runs(c: &mut GenImmixCollector) -> Vec<Eterm> {
 #[test]
 fn large_objects_promote_into_block_runs_and_a_major_pins_them() {
     let mut c = GenImmixCollector::from_policy(large_policy()).expect("collector");
-    assert_eq!(c.mature().block_count(), 8, "the mature region is whole blocks");
+    assert_eq!(
+        c.mature().block_count(),
+        8,
+        "the mature region is whole blocks"
+    );
 
     let mut roots = promote_two_runs(&mut c);
     let before: Vec<Eterm> = roots.clone();
     let lines_before = c.mature().used_lines();
 
     // Nothing new in the nursery, so the fullsweep only reclaims the mature generation.
-    let major = c.collect_major(&mut roots).expect("the fullsweep keeps both runs");
-    assert_eq!(major.objects_copied, 0, "the nursery had nothing to promote");
+    let major = c
+        .collect_major(&mut roots)
+        .expect("the fullsweep keeps both runs");
+    assert_eq!(
+        major.objects_copied, 0,
+        "the nursery had nothing to promote"
+    );
 
     // Both runs are pinned: their start blocks are fully covered by their own marks.
     assert_eq!(
@@ -296,16 +313,29 @@ fn large_objects_promote_into_block_runs_and_a_major_pins_them() {
     assert_multi_block(c.mature(), roots[1], WIDE_ARITY);
 
     let immix = c.last_immix_stats().expect("the in-place reclaim ran");
-    assert_eq!(immix.objects_pinned, 2, "both runs are pinned, neither is evacuated");
-    assert_eq!(immix.objects_evacuated, SMALL_LIVE, "the one-line cells moved");
+    assert_eq!(
+        immix.objects_pinned, 2,
+        "both runs are pinned, neither is evacuated"
+    );
+    assert_eq!(
+        immix.objects_evacuated, SMALL_LIVE,
+        "the one-line cells moved"
+    );
     assert_eq!(
         immix.lines_pinned,
         lines_for(LARGE_WORDS) + lines_for(WIDE_WORDS)
     );
     assert_eq!(immix.words_pinned, LARGE_WORDS + WIDE_WORDS);
-    assert_eq!(immix.blocks_reclaimed, 0, "every block still holds live data");
+    assert_eq!(
+        immix.blocks_reclaimed, 0,
+        "every block still holds live data"
+    );
     assert_eq!(major.words_reclaimed, 0, "nothing died");
-    assert_eq!(c.mature().used_lines(), lines_before, "the live set is unchanged");
+    assert_eq!(
+        c.mature().used_lines(),
+        lines_before,
+        "the live set is unchanged"
+    );
 
     // The runs' start blocks (and the second block of the three-block run) are all fully
     // marked — the "first block is AllMarked" pinning rule, observed through the counters.
@@ -359,7 +389,9 @@ fn a_major_reclaims_a_dead_large_object_and_pins_the_live_one() {
         );
     }
 
-    let major = c.collect_major(&mut roots).expect("the fullsweep keeps every live object");
+    let major = c
+        .collect_major(&mut roots)
+        .expect("the fullsweep keeps every live object");
     assert_eq!(major.objects_copied, 2, "the two fresh cells were promoted");
 
     // The live run is pinned; the dropped run's blocks are reclaimed.
@@ -440,7 +472,8 @@ fn repeated_collections_reuse_freed_lines() {
     for round in 0..6usize {
         // (1) Reclaim: only the anchors are live, so every transient/dead line from the
         //     previous round is freed. `used_lines` settles to exactly the anchor count.
-        s.collect(&mut anchor_roots, &mut promoted).expect("reclaim");
+        s.collect(&mut anchor_roots, &mut promoted)
+            .expect("reclaim");
         assert_eq!(
             s.used_lines(),
             anchors,
@@ -517,7 +550,8 @@ fn repeated_collections_reuse_freed_lines() {
 
     // A final, empty-collection sweep leaves the space reusable from scratch.
     anchor_roots.clear();
-    s.collect(&mut anchor_roots, &mut promoted).expect("final sweep");
+    s.collect(&mut anchor_roots, &mut promoted)
+        .expect("final sweep");
     assert_eq!(s.used_lines(), 0, "an empty live set retains nothing");
     assert_eq!(s.free_lines(), s.line_count());
 }
@@ -587,7 +621,9 @@ fn a_minor_promotion_survives_repeated_minors_until_a_major_reclaims_it() {
             .cons(make_small(700 + i), NIL)
             .expect("nursery garbage");
     }
-    let minor = c.collect_minor(&mut roots).expect("minor with an empty live set");
+    let minor = c
+        .collect_minor(&mut roots)
+        .expect("minor with an empty live set");
     assert_eq!(minor.objects_copied, 0, "nothing was live in the nursery");
     assert_eq!(
         c.mature().used_lines(),
@@ -637,8 +673,13 @@ fn a_minor_promotion_survives_repeated_minors_until_a_major_reclaims_it() {
     // The fullsweep now reclaims everything unreachable: the round-0 graph (dropped in
     // round 1) and the nursery garbage; the run and the three cells survive.
     let lines_before_major = c.mature().used_lines();
-    let major = c.collect_major(&mut roots).expect("the fullsweep keeps the live set");
-    assert_eq!(major.objects_copied, 0, "the nursery was empty of live terms");
+    let major = c
+        .collect_major(&mut roots)
+        .expect("the fullsweep keeps the live set");
+    assert_eq!(
+        major.objects_copied, 0,
+        "the nursery was empty of live terms"
+    );
     assert_eq!(
         roots[0].raw(),
         large_mature.raw(),
@@ -646,7 +687,10 @@ fn a_minor_promotion_survives_repeated_minors_until_a_major_reclaims_it() {
     );
     assert_multi_block(c.mature(), roots[0], LARGE_ARITY);
     let immix = c.last_immix_stats().expect("the in-place reclaim ran");
-    assert_eq!(immix.objects_pinned, 1, "only the multi-block run is pinned");
+    assert_eq!(
+        immix.objects_pinned, 1,
+        "only the multi-block run is pinned"
+    );
     assert_eq!(immix.lines_pinned, lines_for(LARGE_WORDS));
     assert_eq!(immix.objects_evacuated, 3, "the three fresh cells moved");
     assert_eq!(
@@ -740,7 +784,13 @@ fn write_external(heap: &mut Heap, arity: usize, module: Atom, function: Atom) -
 }
 
 /// Writes an `Imported` fun (the whole `NEW_FUN_EXT` descriptor).
-fn write_imported(heap: &mut Heap, arity: usize, module: Atom, creator: FunPid, env: &[Eterm]) -> Eterm {
+fn write_imported(
+    heap: &mut Heap,
+    arity: usize,
+    module: Atom,
+    creator: FunPid,
+    env: &[Eterm],
+) -> Eterm {
     let words = fun_words(FunKind::Imported, env.len());
     let uniq = [
         0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
@@ -766,8 +816,13 @@ fn build_mixed(heap: &mut Heap, atoms: &AtomTable, round: usize) -> Vec<Eterm> {
         roots.push(build_small_graph(heap));
 
         // (b) a shared subterm and (c) a HAMT map.
-        let shared = heap.tuple(&[make_small(41), make_small(42)]).expect("shared");
-        roots.push(heap.tuple(&[shared, make_small(10)]).expect("tupled shared"));
+        let shared = heap
+            .tuple(&[make_small(41), make_small(42)])
+            .expect("shared");
+        roots.push(
+            heap.tuple(&[shared, make_small(10)])
+                .expect("tupled shared"),
+        );
         roots.push(write_map_n(heap, atoms, HAMT_KEYS));
 
         // (d) an on-heap binary and a non-byte-aligned bitstring.
@@ -777,7 +832,9 @@ fn build_mixed(heap: &mut Heap, atoms: &AtomTable, round: usize) -> Vec<Eterm> {
         // (e) all three fun kinds, with compound free variables.
         let module = Atom::from_raw(1);
         let function = Atom::from_raw(2);
-        let free_tuple = heap.tuple(&[make_small(1), make_small(2)]).expect("free tuple");
+        let free_tuple = heap
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("free tuple");
         let free_cons = heap.cons(make_small(3), NIL).expect("free cons");
         roots.push(write_local(
             heap,
@@ -806,7 +863,9 @@ fn build_mixed(heap: &mut Heap, atoms: &AtomTable, round: usize) -> Vec<Eterm> {
     }
 
     let r = round as i64;
-    let t = heap.tuple(&[make_small(r), make_small(100 + r)]).expect("round tuple");
+    let t = heap
+        .tuple(&[make_small(r), make_small(100 + r)])
+        .expect("round tuple");
     let list = heap.cons(t, NIL).expect("round list");
     let f = write_local(heap, 1, round as u64, round as u32, &[t, list]);
     let _ = heap.tuple(&[make_small(500 + r)]).expect("garbage");
@@ -841,7 +900,11 @@ fn run_mixed(kind: MatureKind, atoms: &AtomTable, baseline: &[Eterm]) -> MixedRu
         let collection = c.collect(&mut roots).expect("collect");
         kinds.push(collection.kind);
 
-        assert_eq!(c.young().used_words(), 0, "{kind:?}: round {round}: nursery emptied");
+        assert_eq!(
+            c.young().used_words(),
+            0,
+            "{kind:?}: round {round}: nursery emptied"
+        );
         // Every root must be relocated into the mature generation and structurally unchanged.
         for (i, root) in roots.iter().enumerate() {
             assert!(
@@ -929,7 +992,11 @@ fn retained_footprint_tracks_the_live_set() {
     // size is exact and the footprint assertions are tight.
     let mut s = ImmixSpace::new(4 * BLOCK_WORDS).expect("immix space");
     const TWO_ELEM_WORDS: usize = 3;
-    assert_eq!(lines_for(TWO_ELEM_WORDS), 1, "a 2-element tuple is one line");
+    assert_eq!(
+        lines_for(TWO_ELEM_WORDS),
+        1,
+        "a 2-element tuple is one line"
+    );
     assert_eq!(lines_for(2), 1, "a 1-element tuple is one line");
 
     let live = 40usize;
@@ -942,13 +1009,21 @@ fn retained_footprint_tracks_the_live_set() {
     for i in 0..20i64 {
         let _ = s.tuple(&[make_small(5000 + i)]).expect("dead object");
     }
-    assert_eq!(s.used_lines(), live + 20, "everything is allocated before the collection");
+    assert_eq!(
+        s.used_lines(),
+        live + 20,
+        "everything is allocated before the collection"
+    );
     let mut promoted: [Eterm; 0] = [];
 
     s.collect(&mut roots, &mut promoted).expect("collect");
 
     // Exact accounting: one line per live object, no garbage retained.
-    assert_eq!(s.used_lines(), live, "the footprint is exactly the live line count");
+    assert_eq!(
+        s.used_lines(),
+        live,
+        "the footprint is exactly the live line count"
+    );
     let retained = s.used_words();
     let live_words = live * TWO_ELEM_WORDS;
     assert_eq!(retained, live * LINE_WORDS);
@@ -987,7 +1062,11 @@ fn retained_footprint_tracks_the_live_set() {
     let before = s.used_lines();
     roots.truncate(8);
     s.collect(&mut roots, &mut promoted).expect("collect");
-    assert_eq!(s.used_lines(), 8, "only the eight remaining live objects keep lines");
+    assert_eq!(
+        s.used_lines(),
+        8,
+        "only the eight remaining live objects keep lines"
+    );
     assert!(s.used_lines() < before);
 
     // The surviving objects are intact (indices 0..8 of the original live set).

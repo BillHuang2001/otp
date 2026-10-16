@@ -170,10 +170,7 @@ pub(super) fn promote(
         let Some(slot) = plan.work.pop() else {
             break;
         };
-        if matches!(
-            reserve_step(from, to, slot, &mut plan)?,
-            Step::WouldNotFit
-        ) {
+        if matches!(reserve_step(from, to, slot, &mut plan)?, Step::WouldNotFit) {
             refused = true;
         }
     }

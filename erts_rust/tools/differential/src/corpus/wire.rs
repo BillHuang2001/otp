@@ -53,6 +53,13 @@
 //!   directions, including its declared uncompressed-size bound), and `{minor_version, 0|1|2}`;
 //! * `ATOM_CACHE_REF` (82) — a blob carrying one is decoded with **no** atom-cache context,
 //!   which both runtimes refuse identically.
+//! * `ATOM_INTERNAL_REF2` (73) / `ATOM_INTERNAL_REF3` (75) — an atom named by its
+//!   **atom-table index** rather than its name: an in-range index materializes the atom
+//!   (asserted only as `is_atom/1`, never by name, because the index→atom mapping depends
+//!   on the node's atom-table bootstrap order), an index past the table is `badarg`, and
+//!   the `[safe]` option does not apply to the index forms (the atom already exists).
+//! * the `erlang:binary_to_term/2` `[safe]` option — a fresh atom *name* is refused with
+//!   `badarg`, while a genuinely `compressed` (80) image is accepted and decoded.
 //!
 //! The live handshake / a node-to-node loopback and the `DOP_*` control-message framing are
 //! **not** expressible through a single CLI process (they need two connected nodes and the
@@ -703,6 +710,129 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // -- ATOM_INTERNAL_REF2 (73) / ATOM_INTERNAL_REF3 (75) ----------------------
+        // An atom named by its **atom-table index** rather than by its name
+        // (`external.c:5177-5192`, `:3085-3100`); the index names an *existing* atom,
+        // so the image carries no name and the `[safe]` flag does not apply (the
+        // internal-ref arms have no `internal_tags` gate either — `external.c:6405-6412`).
+        // The atom a given index resolves to depends on the node's atom-table bootstrap
+        // order, so every assertion here is **index-seeding-independent**: a valid index
+        // is pinned only as `is_atom/1`, an index past the table only as `badarg`.
+        Case {
+            id: "wire/atom_internal_ref2_materializes_the_indexed_atom",
+            description: "an in-range ATOM_INTERNAL_REF2 (73) index decodes to the atom it names",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "is_atom(binary_to_term(<<131,73,0,5>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/atom_internal_ref3_materializes_the_indexed_atom",
+            description: "an in-range ATOM_INTERNAL_REF3 (75) index decodes to the atom it names",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "is_atom(binary_to_term(<<131,75,0,0,5>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/atom_internal_ref2_index_out_of_range",
+            description: "an ATOM_INTERNAL_REF2 (73) index at the 16-bit ceiling is past the atom table and badarg",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,73,255,255>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "wire/atom_internal_ref3_index_out_of_range",
+            description: "an ATOM_INTERNAL_REF3 (75) index at the 24-bit ceiling is past the atom table and badarg",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,75,255,255,255>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "wire/atom_internal_ref_bad_index_is_badarg",
+            description: "an ATOM_INTERNAL_REF3 (75) index just past the 16-bit range is still past the atom table and badarg",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,75,1,0,0>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "wire/atom_internal_ref2_under_safe",
+            description: "[safe] accepts an ATOM_INTERNAL_REF2 (73) image: the index names an existing atom, so nothing is interned",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "is_atom(binary_to_term(<<131,73,0,5>>, [safe]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        // -- the `binary_to_term/2` `[safe]` surface (A.5) --------------------------
+        // `[safe]` refuses only an image that would introduce a *new atom name*; the
+        // `COMPRESSED` (80) framing and the index forms above are unaffected.
+        Case {
+            id: "wire/bin2term_safe_rejects_an_unknown_atom",
+            description: "[safe] refuses an image whose SMALL_ATOM_UTF8_EXT (119) names a fresh atom",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,119,9,122,122,110,101,119,97,116,111,109>>, [safe])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "wire/bin2term_safe_compressed",
+            description: "[safe] accepts a genuinely COMPRESSED (80) image and decodes it back to the term",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "begin B = term_to_binary(lists:duplicate(300, ok), [compressed]), {binary:at(B,1), binary_to_term(B,[safe]) =:= lists:duplicate(300,ok)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {80,true}"),
+                exit_code: 0,
+            },
+        },
         // -- NEW_REFERENCE_EXT (114): the compact reference form --------------------
         Case {
             id: "wire/new_reference_ext_is_reference",
@@ -1152,6 +1282,10 @@ mod tests {
             "wire/map_ext_canonical_key_order_float_list_binary",
             "wire/map_ext_binary_key_order",
             "wire/compressed_declared_size_bound",
+            "wire/atom_internal_ref2_materializes_the_indexed_atom",
+            "wire/atom_internal_ref3_materializes_the_indexed_atom",
+            "wire/atom_internal_ref2_under_safe",
+            "wire/bin2term_safe_compressed",
         ] {
             let case = cases.iter().find(|c| c.id == id).expect("registered");
             assert_eq!(case.contracts, &[Contract::Distribution], "{id}");
@@ -1165,6 +1299,10 @@ mod tests {
         for id in [
             "wire/map_ext_duplicate_key_badarg",
             "wire/compressed_declared_size_mismatch_badarg",
+            "wire/atom_internal_ref2_index_out_of_range",
+            "wire/atom_internal_ref3_index_out_of_range",
+            "wire/atom_internal_ref_bad_index_is_badarg",
+            "wire/bin2term_safe_rejects_an_unknown_atom",
         ] {
             let case = cases.iter().find(|c| c.id == id).expect("registered");
             assert_eq!(case.contracts, &[Contract::Distribution], "{id}");

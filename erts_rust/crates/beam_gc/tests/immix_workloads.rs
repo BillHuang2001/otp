@@ -104,7 +104,7 @@ use beam_gc::prelude::{
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{
     fun_words, make_small, map_words_capacity, refc_bytes, refc_size, write_fun_local, write_map,
-    write_refc_binary, AtomTable, Eterm, FunKind, NIL, ERL_REFC_BITS_SIZE,
+    write_refc_binary, AtomTable, Eterm, FunKind, ERL_REFC_BITS_SIZE, NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,7 +125,9 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Takes the measurement lock for the rest of a test.
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// **Workload 1** — the shared long-lived tuple: 254 elements ⇒ 255 words, which is exactly
@@ -261,7 +263,9 @@ fn write_refc(heap: &mut Heap, payload: &RefcBinary) -> Eterm {
     // storage kept alive by `payload` (held by the caller for the whole run), and `null` is
     // the (empty) off-heap chain link.
     unsafe {
-        let hp = heap.alloc_words(ERL_REFC_BITS_SIZE).expect("8 words for the pair");
+        let hp = heap
+            .alloc_words(ERL_REFC_BITS_SIZE)
+            .expect("8 words for the pair");
         write_refc_binary(
             hp,
             payload.data_ptr() as *mut Eterm,
@@ -417,7 +421,11 @@ impl WorkloadRun {
 /// the same work (the corpus is deterministic; only the timing may vary).
 fn measure_reps(kind: MatureKind, run: impl Fn(MatureKind) -> WorkloadRun) -> WorkloadRun {
     let mut last = run(kind);
-    assert_eq!(last.kind(), kind, "the config selected the requested strategy");
+    assert_eq!(
+        last.kind(),
+        kind,
+        "the config selected the requested strategy"
+    );
     let mut samples: Vec<u64> = Vec::with_capacity(REPS);
     samples.push(last.measurement.pause_us);
     for rep in 1..REPS {
@@ -606,7 +614,10 @@ fn long_lived_shared_the_mark_region_pins_the_whole_live_set() {
     assert_eq!(immix_stats.lines_pinned, live_lines);
     assert_eq!(immix_stats.words_pinned, live_words);
     assert_eq!(immix_stats.blocks_reclaimed, 0, "every block stays live");
-    assert_eq!(immix.measurement.stats.objects_copied, 0, "nothing to promote");
+    assert_eq!(
+        immix.measurement.stats.objects_copied, 0,
+        "nothing to promote"
+    );
     assert_eq!(immix.measurement.objects_moved(), 0);
 
     // --- the comparison the decision rests on ------------------------------------------
@@ -622,7 +633,8 @@ fn long_lived_shared_the_mark_region_pins_the_whole_live_set() {
         "both strategies reclaim the same garbage"
     );
     assert_eq!(
-        immix.measurement.nursery_garbage, copying.measurement.nursery_garbage
+        immix.measurement.nursery_garbage,
+        copying.measurement.nursery_garbage
     );
 
     // --- the honest caveat: line-granular allocation over-states the footprint ----------
@@ -719,7 +731,10 @@ fn garbage_heavy_the_mark_region_pays_its_line_rounding_for_nothing() {
         "the live set is in a partial block: nothing is pinned"
     );
     assert_eq!(immix_stats.lines_evacuated, live_lines);
-    assert_eq!(immix.measurement.stats.objects_copied, 0, "nothing to promote");
+    assert_eq!(
+        immix.measurement.stats.objects_copied, 0,
+        "nothing to promote"
+    );
     assert_eq!(
         immix_stats.objects_evacuated + immix_stats.objects_pinned,
         copying.measurement.stats.objects_copied,
@@ -757,7 +772,8 @@ fn garbage_heavy_the_mark_region_pays_its_line_rounding_for_nothing() {
         "both strategies reclaim the same 6 000 words of nursery garbage"
     );
     assert_eq!(
-        immix.measurement.nursery_garbage, copying.measurement.nursery_garbage
+        immix.measurement.nursery_garbage,
+        copying.measurement.nursery_garbage
     );
 }
 
@@ -870,7 +886,10 @@ fn large_heap_many_objects_pins_the_live_blocks_and_still_promotes() {
     let immix_stats = immix.measurement.immix.expect("an immix fullsweep");
     assert_eq!(immix_stats.objects_evacuated, 0, "every block is full");
     assert_eq!(immix_stats.objects_pinned, LIVE_C);
-    assert_eq!(immix_stats.lines_pinned, LIVE_C, "one line per long-lived tuple");
+    assert_eq!(
+        immix_stats.lines_pinned, LIVE_C,
+        "one line per long-lived tuple"
+    );
     assert_eq!(immix_stats.words_pinned, live_words);
     assert_eq!(immix_stats.blocks_reclaimed, 0);
 
@@ -886,7 +905,10 @@ fn large_heap_many_objects_pins_the_live_blocks_and_still_promotes() {
         copying_stats.words_copied,
         "and it is the same volume of live words"
     );
-    assert!(immix.measurement.stats.objects_copied > 0, "promotion pressure is real");
+    assert!(
+        immix.measurement.stats.objects_copied > 0,
+        "promotion pressure is real"
+    );
 
     // --- the comparison the decision rests on ------------------------------------------
     assert!(
@@ -900,7 +922,8 @@ fn large_heap_many_objects_pins_the_live_blocks_and_still_promotes() {
         "both strategies reclaim the same garbage"
     );
     assert_eq!(
-        immix.measurement.nursery_garbage, copying.measurement.nursery_garbage
+        immix.measurement.nursery_garbage,
+        copying.measurement.nursery_garbage
     );
 
     // --- the footprint trade -------------------------------------------------------------
@@ -918,7 +941,11 @@ fn large_heap_many_objects_pins_the_live_blocks_and_still_promotes() {
         "line-granular allocation can only over-state the live words"
     );
     assert!(
-        immix.measurement.mature_lines.expect("an immix mature space") > LIVE_C,
+        immix
+            .measurement
+            .mature_lines
+            .expect("an immix mature space")
+            > LIVE_C,
         "the 512 pinned lines plus the promotion's lines are resident"
     );
 }

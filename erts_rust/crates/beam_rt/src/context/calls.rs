@@ -848,7 +848,31 @@ impl<'a> RuntimeContext<'a> {
     /// its own docs declare legal and correct for a host holding an incomplete or unpublished root
     /// set — exactly this situation.
     ///
-    /// # The EMPTY source table is load-bearing
+    /// # A FRESH, EMPTY destination off-heap table per attempt
+    ///
+    /// The copy's destination off-heap table is a **local** [`OffHeapTable`](beam_message::OffHeapTable)
+    /// built fresh for each attempt — never [`Runtime::eval_off_heap`], the runtime-lifetime store
+    /// that also receives entries from transport copies ([`Runtime::stabilize_term_with`]) and
+    /// [`Runtime::adopt_escaped_binaries`]. `beam_message`'s copier takes its single-traversal fast
+    /// path (`try_copy_fast`) only when the destination table is *fully empty*
+    /// (`copy.rs`'s `is_fast_path_eligible`), so pointing it at the shared runtime store would force
+    /// **every** copy-out onto the two-traversal `preflight_words` route (and, for a graph too big
+    /// for the nursery, an extra `bounded_words` + acyclicity-`HashSet` sizing pass) from the moment
+    /// any unrelated runtime event registered one entry there — a **permanent** poisoning. The
+    /// retry gets its **own** fresh table too: a partial attempt may have left registrations in the
+    /// first, and it must not re-poison the retry.
+    ///
+    /// On a **successful** copy the local table's off-heap references are **adopted** into
+    /// [`Runtime::eval_off_heap`] — the runtime-lifetime owner the copied term resolves them
+    /// through — and only then is the copy returned; a **refusal** adopts nothing (the local table
+    /// is dropped, its `Drop` releasing the node references the abandoned attempt registered). The
+    /// copied term resolves a refc binary by payload **data pointer**
+    /// ([`binary_by_data_ptr`](beam_message::OffHeapTable::binary_by_data_ptr)) and a node by
+    /// **identity**, never by destination slot index, so the adoption is transparent: each drained
+    /// node entry is pushed once per counted reference, so the store's `push_node` dedup restores
+    /// exactly the count the local table held.
+    ///
+    /// # The EMPTY source table is load-bearing (and is what makes the adoption sound)
     ///
     /// The copy's source [`OffHeapTable`](beam_message::OffHeapTable) is empty because the BIF
     /// heap owns no off-heap handle. `beam_message`'s copier resolves a refc binary's payload
@@ -857,9 +881,11 @@ impl<'a> RuntimeContext<'a> {
     /// registered in the destination table, no refcount to lose. An off-heap **MSO** reference
     /// with no resolvable owner is the copier's typed `bad_term` instead, so this function returns
     /// `None` (the caller then does not rewind the pool) — never a dangling payload. The empty
-    /// source table can therefore only ever produce a *complete* copy, and the destination
-    /// (`Runtime::eval_off_heap`) grows by at most one entry per distinct node an external
-    /// pid/port/reference names.
+    /// source table can therefore only ever produce a *complete* copy, and it is also *why the
+    /// adoption is sound*: no off-heap **MSO container** can be copied (its source slot never
+    /// resolves — `clone_slot` is `None` ⇒ `bad_term`), so the local table's MSO list is provably
+    /// empty on every success and `drain_handles` can never re-slot a container whose on-heap
+    /// `val` word would then name the wrong slot.
     fn move_result_into_process_heap(&mut self, term: Eterm) -> Option<Eterm> {
         // `ProcessId` is `Copy`, so read it before the destructure (match ergonomics, as the
         // dispatch block above does).
@@ -873,15 +899,10 @@ impl<'a> RuntimeContext<'a> {
         // for byte (the result stays on the pooled heap, which is then not rewound).
         let table = mailbox_table.as_deref_mut()?;
         let process = table.get_mut(pid)?;
-        // **One** source table and **one** `CopyContext`, shared by the (at most two) attempts
-        // below. Neither construction allocates, and a refused attempt leaves both the
-        // destination heap and the off-heap table exactly as they were — the copier's optimistic
-        // single-pass attempt rolls its own off-heap pushes back before the preflight path
-        // re-derives the outcome, and the preflight path refuses *before* writing a destination
-        // word — so a retry needs no fresh pair.
-        let src = beam_message::OffHeapTable::new();
-        let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
-        let needed = match beam_message::copy_struct(term, process.heap_mut(), &mut ctx) {
+        // One fresh destination table per attempt (see the docs above): a refused attempt's
+        // partial state is never rolled into the retry, so both attempts hand the copier an
+        // empty destination and take the single-traversal fast path.
+        let needed = match copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term) {
             Ok(copied) => return Some(copied),
             Err(error) if !beam_message::is_message_heap_exhaustion(&error) => {
                 // A refusal that is **not** the destination running out of room — above all the
@@ -903,8 +924,10 @@ impl<'a> RuntimeContext<'a> {
         // and moves no live term, so the copy can simply be re-attempted from the fresh space's
         // base — `needed` is the copier's exact flat word count, so the retry fits. The floor of
         // 256 keeps a small result from landing exactly on the new space's edge.
+        #[cfg(test)]
+        notes::note_grow();
         process.grow_nursery(needed.max(256)).ok()?;
-        beam_message::copy_struct(term, process.heap_mut(), &mut ctx).ok()
+        copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term).ok()
     }
 
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
@@ -1143,6 +1166,65 @@ impl RuntimeContext<'_> {
     }
 }
 
+/// Runs **one** copy-out attempt of `term` onto `heap` through a **fresh, empty** local destination
+/// off-heap table, adopting that table's off-heap references into `store` on success.
+///
+/// The fresh table is the whole point: `beam_message`'s copier takes its single-traversal fast path
+/// (`copy.rs`'s `try_copy_fast`) only for a destination whose three off-heap lists are empty, and
+/// `store` ([`Runtime::eval_off_heap`]) is routinely non-empty because transport copies
+/// ([`Runtime::stabilize_term_with`]) and nested runs
+/// ([`Runtime::adopt_escaped_binaries`]) register entries there. Handing the copier a local table
+/// keeps the copy-out on that fast path no matter what the shared store holds; the adoption below
+/// then hands the references back to the runtime before the (now dead) local table drops them.
+///
+/// On **success** the local table's MSO handles, refc binaries and per-reference node entries move
+/// into `store`; on **failure** nothing is adopted — the local table is dropped, its `Drop`
+/// releasing the node references the abandoned attempt took. Because every attempt calls this with
+/// its own new table, no partial state can be carried into a retry.
+///
+/// The SOURCE table is empty and stays empty: the pooled BIF heap owns no off-heap handle, so a
+/// refc binary whose payload no source handle owns is **flattened** into an on-heap bitstring (the
+/// copier's fallback) and an off-heap MSO container has no resolvable source slot at all
+/// (`clone_slot` is `None` ⇒ the copier's `bad_term`). That is why the adopted MSO list is
+/// provably empty on success — `push` can never re-slot a container whose on-heap `val` word would
+/// then name the wrong slot. See [`RuntimeContext::move_result_into_process_heap`].
+fn copy_result_fresh(
+    heap: &mut Heap,
+    store: &mut beam_message::OffHeapTable,
+    term: Eterm,
+) -> Result<Eterm> {
+    let src = beam_message::OffHeapTable::new();
+    let mut local = beam_message::OffHeapTable::new();
+    #[cfg(test)]
+    notes::note_attempt(&local);
+    let outcome = {
+        let mut ctx = beam_message::CopyContext::new(&src, &mut local);
+        beam_message::copy_struct(term, heap, &mut ctx)
+    };
+    if outcome.is_ok() {
+        // Adopt the local table's off-heap references into the runtime-lifetime store. The copied
+        // term resolves them by payload **data pointer** (refc binaries) and by node **identity**,
+        // never by destination slot index, so re-registering each drained entry there is
+        // transparent. (`push` is a no-op on the empty MSO list success guarantees; the guard on
+        // the outcome is what makes the node adoption release-correct on the refusal path.)
+        for handle in local.drain_handles() {
+            store.push(handle);
+        }
+        for binary in local.drain_binaries() {
+            store.push_binary(binary);
+        }
+        for entry in local.drain_nodes() {
+            // One reference per count, faithfully: the local table dedups by identity and counts
+            // references, so replaying `push_node` once per counted reference restores exactly that
+            // count in the store (which dedups the same way).
+            for _ in 0..entry.refcount() {
+                store.push_node(beam_message::NodeEntry::new(entry.node(), entry.creation()));
+            }
+        }
+    }
+    outcome
+}
+
 /// The flat word count a refused copy reported it could not fit.
 ///
 /// [`beam_message`]'s **message-heap exhaustion** ([`beam_message::is_message_heap_exhaustion`])
@@ -1188,125 +1270,60 @@ fn invoke_registered(
     }
     bif(context, args)
 }
+/// Test-only structural counters for the copy-out (`RuntimeContext::move_result_into_process_heap`).
+///
+/// **Thread-local**, so a test that drives the copy-out reads only the counts *it* produced and the
+/// crate's parallel unit tests cannot perturb them (each `cargo test` case runs on its own thread).
+///
+/// * `copy_attempts` — one per [`beam_message::copy_struct`] call (a copy-out that exhausts the
+///   nursery and retries charges two).
+/// * `grow_retries` — one per `Process::grow_nursery` call.
+/// * `empty_destination_attempts` — one per attempt whose destination table was **fully empty** as
+///   handed to the copier, i.e. the copier's single-traversal fast path was eligible. Computed from
+///   the table's **public** API (the same three-list test `is_fast_path_eligible` makes).
 #[cfg(test)]
-mod tests {
-    //! Units for the copy-out's **retry policy** (see
-    //! [`RuntimeContext::move_result_into_process_heap`]): the growth hint recovered from the
-    //! copier's own refusal, and the gate that keeps a *permanent* refusal from growing the
-    //! destination at all. The copy itself is exercised end to end by `tests/perf_call.rs`
-    //! (path B copies a container result on every iteration) and the `src/context/tests.rs`
-    //! registered-BIF suites.
+mod notes {
+    use core::cell::Cell;
 
-    use beam_common::{AllocFailure, AllocKind};
-    use beam_process::SignalAtoms;
-    use beam_term::make_small;
-    use beam_term::prelude::make_header;
-    use super::*;
-
-    /// The number of `Eterm`s a byte figure converts back to.
-    const WORD: usize = core::mem::size_of::<Eterm>();
-
-    /// A `runtime` + a caller-owned `ProcessTable` holding one default process, plus the pid —
-    /// the `for_process` shape, i.e. the one where the copy-out (and its retry) is ON.
-    fn process_table(rt: &mut crate::runtime::Runtime) -> (ProcessTable, beam_process::ProcessId) {
-        let signals = SignalAtoms::from_table(rt.code_server_atoms_mut());
-        let mut table = ProcessTable::new(signals);
-        let pid = table.spawn_default().expect("a default process");
-        (table, pid)
+    thread_local! {
+        static COPY_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static GROW_RETRIES: Cell<usize> = const { Cell::new(0) };
+        static EMPTY_DESTINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
     }
 
-    #[test]
-    fn the_growth_hint_is_the_copiers_own_shortfall_in_words() {
-        // `beam_message`'s exhaustion error carries `words * size_of::<Eterm>()` in
-        // `AllocFailure::requested` (its documented contract), so dividing recovers exactly the
-        // flat word count the refused copy wanted — with no second traversal of the graph.
-        let exhaustion = BeamError::Alloc(AllocFailure::new(AllocKind::Message, 37 * WORD));
-        assert_eq!(
-            copy_shortfall_words(&exhaustion),
-            37,
-            "the copier's own word count is recovered verbatim"
-        );
-        // A refusal of any other class reports no room request: the conservative `0` (the
-        // caller's `max(256)` floor turns it into a legal growth hint).
-        assert_eq!(copy_shortfall_words(&BeamError::BadArg), 0);
-        assert_eq!(copy_shortfall_words(&BeamError::BadArity), 0);
-        assert_eq!(
-            copy_shortfall_words(&BeamError::Alloc(AllocFailure::new(AllocKind::Heap, 9 * WORD))),
-            9,
-            "any `Alloc` refusal carries its own requested byte count"
-        );
+    /// Records one copy attempt against the destination table `destination`, classifying it as an
+    /// "empty destination" attempt when all three of that table's lists are empty.
+    pub(super) fn note_attempt(destination: &beam_message::OffHeapTable) {
+        COPY_ATTEMPTS.with(|c| c.set(c.get() + 1));
+        if destination.is_empty()
+            && destination.binaries().is_empty()
+            && destination.nodes().is_empty()
+        {
+            EMPTY_DESTINATION_ATTEMPTS.with(|c| c.set(c.get() + 1));
+        }
     }
 
-    #[test]
-    fn a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing() {
-        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
-            .expect("the default runtime");
-        let (mut table, pid) = process_table(&mut rt);
-        let spaces_before = table
-            .get(pid)
-            .expect("the spawned process")
-            .collector()
-            .young_space_count();
-        let used_before = table.get(pid).expect("the spawned process").heap().used();
-        let copy = {
-            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-            // A bare header word is not a standing term at all (`make_header(0, 0)` is the C
-            // ABI's `THE_NON_VALUE`): `copy_struct` answers the copier's typed malformed-graph
-            // `badarg` — `BeamError::BadArg`, **not** a message-heap exhaustion. Growing the
-            // destination cannot make it succeed, so the retry must not run: no space is
-            // retired, no word is written, and the caller gets `None` (so `call_registered`
-            // leaves both the result and the pooled BIF heap exactly as they were).
-            ctx.move_result_into_process_heap(make_header(0, 0))
-        };
-        assert!(
-            copy.is_none(),
-            "a malformed graph cannot be re-homed; the caller must leave the result untouched"
-        );
-        let process = table.get(pid).expect("the spawned process");
-        assert_eq!(
-            process.collector().young_space_count(),
-            spaces_before,
-            "a permanent refusal must not retire a nursery space (the item-4 growth is per-call)"
-        );
-        assert_eq!(
-            process.heap().used(),
-            used_before,
-            "a refused copy writes no destination word"
-        );
+    /// Records one `grow_nursery` call.
+    pub(super) fn note_grow() {
+        GROW_RETRIES.with(|c| c.set(c.get() + 1));
     }
 
-    #[test]
-    fn an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies() {
-        // The positive control for the gate above: a **valid** container the nursery cannot hold
-        // still grows the destination by the copier's own word count and is copied on the retry.
-        // `lists:seq/2`'s 4000-odd-word result does not fit the default 233-word nursery.
-        use beam_engine::ExecutionContext;
+    /// Zeroes this thread's counters, so a test measures only its own work.
+    pub(super) fn reset() {
+        COPY_ATTEMPTS.with(|c| c.set(0));
+        GROW_RETRIES.with(|c| c.set(0));
+        EMPTY_DESTINATION_ATTEMPTS.with(|c| c.set(0));
+    }
 
-        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
-            .expect("the default runtime");
-        let (mut table, pid) = process_table(&mut rt);
-        let spaces_before = table
-            .get(pid)
-            .expect("the spawned process")
-            .collector()
-            .young_space_count();
-        let copied = {
-            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-            ctx.call_bif("lists", "seq", 2, &[make_small(1), make_small(2000)])
-                .expect("lists:seq(1, 2000)")
-        };
-        assert!(
-            beam_term::prelude::is_list(copied) && !beam_term::literal::is_literal(copied),
-            "the result is a real list built on the process's own heap"
-        );
-        assert!(
-            table
-                .get(pid)
-                .expect("the spawned process")
-                .collector()
-                .young_space_count()
-                > spaces_before,
-            "an exhaustion refusal grows the destination (the retry then fits)"
-        );
+    /// This thread's `(copy_attempts, grow_retries, empty_destination_attempts)`.
+    pub(super) fn snapshot() -> (usize, usize, usize) {
+        (
+            COPY_ATTEMPTS.with(Cell::get),
+            GROW_RETRIES.with(Cell::get),
+            EMPTY_DESTINATION_ATTEMPTS.with(Cell::get),
+        )
     }
 }
+
+#[cfg(test)]
+mod tests;

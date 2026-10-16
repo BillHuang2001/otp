@@ -402,7 +402,11 @@ fn run_loop(label: &str, config: &GcConfig, kind: MatureKind) {
         }
 
         if cycle >= WARMUP {
-            snap.rss = if rss_available { read_rss_bytes() } else { None };
+            snap.rss = if rss_available {
+                read_rss_bytes()
+            } else {
+                None
+            };
             samples.push(snap);
         }
     }

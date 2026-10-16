@@ -41,9 +41,10 @@
 //!   *genuinely* cannot be copied is **not** a valve case: it is reported honestly (the
 //!   emulator's `error:system_limit`).
 //!
-//! Everything here is counters plus two small hash sets, deliberately: the runtime is
-//! single-threaded and these are read on the dispatch path, not the hot path (the GC point
-//! is only armed inside `runner::budget::BudgetContext::ensure_heap`).
+//! Everything here is counters plus a few small hash sets and one shared per-pid descent latch
+//! cell, deliberately: the runtime is single-threaded and these are read on the dispatch path,
+//! not the hot path (the GC point is only armed inside
+//! `runner::budget::BudgetContext::ensure_heap`).
 //!
 //! # Wiring
 //!
@@ -53,6 +54,8 @@
 //! exit-reason stabilization included — goes through [`Runtime::try_stabilize_escaped`]. See
 //! those call sites for the details.
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
@@ -63,7 +66,7 @@ use beam_term::{make_atom, Eterm};
 
 use super::{Runtime, SourcePayloads};
 
-use crate::context::gc_walk::WalkScratch;
+use crate::context::gc_walk::{ForeignLatch, WalkScratch};
 use crate::context::RuntimeContext;
 
 /// A snapshot of this runtime's process-heap collection activity.
@@ -148,6 +151,11 @@ pub(crate) struct GcState {
     /// The **descent gate**: the pids that have ever had a container from a region their
     /// collector does not scan enter their reachable term graph.
     ///
+    /// This is a **shared** per-pid latch cell (`Rc<RefCell<…>>`): the installed
+    /// [`RuntimeCollectionGate`](crate::context::gc_walk::RuntimeCollectionGate) holds a clone
+    /// of it, so an admission point here and a `beam_process` signal site read and write the
+    /// **same** bits. [`Runtime::foreign_latch`] hands out one more clone of it.
+    ///
     /// [`any_root_is_unscanned`](crate::context::gc_walk) is `O(live objects)` when it
     /// descends, so the descent is skipped unless this per-process bit is set — see that
     /// module's "descent gate" section for the soundness argument. In one line: the walk's
@@ -161,7 +169,7 @@ pub(crate) struct GcState {
     /// The bit is **sticky and add-only**: it is set, never cleared while the process lives (a
     /// gate observed open at one collection stays open at every later one), and the entry is
     /// dropped only when the pid is gone ([`Runtime::prune_gc_requests`]).
-    foreign: HashSet<ProcessId>,
+    foreign: ForeignLatch,
     /// The reachability walk's **reused** scratch (its worklist and its visited set), so a
     /// collection never allocates the descent's structures (see
     /// [`WalkScratch`](crate::context::gc_walk::WalkScratch)).
@@ -201,7 +209,7 @@ impl GcState {
             halted: HashSet::new(),
             requested: HashSet::new(),
             async_completions: Vec::new(),
-            foreign: HashSet::new(),
+            foreign: ForeignLatch::default(),
             walk: WalkScratch::default(),
             disabled: false,
             disabled_reason: None,
@@ -213,6 +221,16 @@ impl GcState {
             errors: 0,
             scratch: Vec::new(),
         }
+    }
+
+    /// A fresh state that observes `latch` as its descent gate — the form the runtime's install
+    /// site builds, so this state and the installed
+    /// [`RuntimeCollectionGate`](crate::context::gc_walk::RuntimeCollectionGate) read and write
+    /// the **one** shared per-pid cell ([`Runtime::foreign_latch`] hands out one more clone).
+    pub(crate) fn with_latch(latch: ForeignLatch) -> GcState {
+        let mut state = GcState::new();
+        state.foreign = latch;
+        state
     }
 }
 
@@ -515,8 +533,8 @@ impl Runtime {
         if !self.gc.requested.is_empty() {
             self.gc.requested.retain(|pid| table.contains(*pid));
         }
-        if !self.gc.foreign.is_empty() {
-            self.gc.foreign.retain(|pid| table.contains(*pid));
+        if !self.gc.foreign.borrow().is_empty() {
+            self.gc.foreign.borrow_mut().retain(|pid| table.contains(*pid));
         }
     }
 
@@ -556,7 +574,7 @@ impl Runtime {
     /// recorded the same way, so the gate can never be closed while such a block is reachable.
     pub(crate) fn note_gc_fallback(&mut self, pid: ProcessId) {
         self.gc.fallbacks += 1;
-        self.gc.foreign.insert(pid);
+        self.gc.foreign.borrow_mut().insert(pid);
     }
 
     /// Opens `pid`'s **descent gate** ([`GcState::foreign`]): from now on the unscanned-root
@@ -570,14 +588,29 @@ impl Runtime {
     /// closing it again would let a later collection move a heap under a term the process still
     /// holds, which is the corruption the valve exists to prevent.
     pub(crate) fn note_foreign_reachable(&mut self, pid: ProcessId) {
-        self.gc.foreign.insert(pid);
+        self.gc.foreign.borrow_mut().insert(pid);
     }
 
     /// Whether `pid`'s descent gate is open (see [`GcState::foreign`]) — i.e. whether the
     /// unscanned-root valve must descend through `pid`'s scanned graph rather than run only its
     /// per-word root phase.
     pub(crate) fn foreign_reachable(&self, pid: ProcessId) -> bool {
-        self.gc.foreign.contains(&pid)
+        self.gc.foreign.borrow().contains(&pid)
+    }
+
+    /// The runtime's **one** shared per-pid descent latch cell (see [`GcState::foreign`]).
+    ///
+    /// It is the same cell the installed
+    /// [`RuntimeCollectionGate`](crate::context::gc_walk::RuntimeCollectionGate) reads, so
+    /// [`Runtime::note_foreign_reachable`] opening a pid's bit is exactly what makes a
+    /// `beam_process` signal site decide in `O(1)` for that pid.
+    ///
+    /// Test-only: production code always reaches the cell as `GcState::foreign`'s own field
+    /// (the mutators) or through the gate that holds a clone of it, so this is a witness for
+    /// the unit suite rather than a production entry point.
+    #[cfg(test)]
+    pub(crate) fn foreign_latch(&self) -> ForeignLatch {
+        Rc::clone(&self.gc.foreign)
     }
 
     /// The unscanned-root valve's **reused** scratch (its worklist and its visited set).

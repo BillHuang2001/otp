@@ -325,7 +325,8 @@ impl HeapPolicy {
             // The nursery turned out to be about right: keep it.
             capacity_words
         }
-    }}
+    }
+}
 
 impl Default for HeapPolicy {
     fn default() -> Self {
@@ -468,7 +469,10 @@ mod tests {
         );
         // `DEFAULT_MIN_HEAP_WORDS` is itself a fixed point of the table.
         assert_eq!(DEFAULT_MIN_HEAP_WORDS, 233);
-        assert_eq!(next_heap_size(DEFAULT_MIN_HEAP_WORDS, 0), DEFAULT_MIN_HEAP_WORDS);
+        assert_eq!(
+            next_heap_size(DEFAULT_MIN_HEAP_WORDS, 0),
+            DEFAULT_MIN_HEAP_WORDS
+        );
     }
 
     #[test]
@@ -493,8 +497,14 @@ mod tests {
         assert_eq!(HeapPolicy::from_spawn_opts(233, 0, 7).min_heap_words, 233);
         assert_eq!(HeapPolicy::from_spawn_opts(234, 0, 7).min_heap_words, 376);
         assert_eq!(HeapPolicy::from_spawn_opts(377, 0, 7).min_heap_words, 610);
-        assert_eq!(HeapPolicy::from_spawn_opts(46_422, 0, 7).min_heap_words, 46_422);
-        assert_eq!(HeapPolicy::from_spawn_opts(46_423, 0, 7).min_heap_words, 75113);
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(46_422, 0, 7).min_heap_words,
+            46_422
+        );
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(46_423, 0, 7).min_heap_words,
+            75113
+        );
 
         for request in [233usize, 234, 376, 377, 1_000, 46_422, 100_000] {
             let policy = HeapPolicy::from_spawn_opts(request, request, 0);
@@ -677,7 +687,7 @@ mod tests {
         };
         assert_eq!(capped.mature_after_fullsweep(12, 400, 0), 512);
         // A would-be shrink is clamped by the maximum but is still strictly smaller.
-        assert_eq!(capped.mature_after_fullsweep(100_000, 400, 0), 512);        // The fullsweep always sees the byte-accounted reserve on top of the live set.
+        assert_eq!(capped.mature_after_fullsweep(100_000, 400, 0), 512); // The fullsweep always sees the byte-accounted reserve on top of the live set.
         let default = HeapPolicy::default();
         assert_eq!(
             default.mature_after_fullsweep(12, 100, 100),

@@ -170,10 +170,7 @@ fn assert_and_report_overhead(rows: &[Overhead]) {
             overhead, 0,
             "{}: {} words of overhead over {} objects ({} per object) -- the bump allocator \
              must not pad a word-aligned term",
-            row.label,
-            overhead,
-            row.count,
-            per_object
+            row.label, overhead, row.count, per_object
         );
 
         total_objects += row.count;
@@ -293,7 +290,11 @@ fn per_object_overhead_is_bounded() {
             flatmap_size_words(MAP_PAIRS),
             "a small map is a flat map sized exactly by the frozen formula"
         );
-        assert_eq!(cap, 4 + 2 * MAP_PAIRS, "the frozen flat-map formula is 4 + 2n");
+        assert_eq!(
+            cap,
+            4 + 2 * MAP_PAIRS,
+            "the frozen flat-map formula is 4 + 2n"
+        );
 
         let mut heap = space(cap * N + 8);
         let mut roots = Vec::with_capacity(N);
@@ -430,7 +431,11 @@ fn rss_and_word_accounting_plateau_across_cycles() {
 
         if cycle >= RSS_WARMUP {
             samples.push(CycleSample {
-                rss: if rss_available { read_rss_bytes() } else { None },
+                rss: if rss_available {
+                    read_rss_bytes()
+                } else {
+                    None
+                },
                 mature_used: collector.mature().used_words(),
                 mature_capacity: collector.mature().capacity_words(),
                 young_capacity: collector.young().capacity_words(),

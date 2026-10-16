@@ -32,6 +32,7 @@
 //! (zero-checksum) module, which is what the fallback assertions pin.
 
 use super::*;
+use super::key::ModuleKey;
 use beam_loader::{load_file, Block, Instr, Label, Operand};
 use beam_term::{make_atom, make_small};
 
@@ -94,31 +95,73 @@ fn fingerprint_distinguishes_a_mutated_copy_with_the_same_name() {
 }
 
 #[test]
-fn get_or_compile_reuses_the_artifact_for_reloaded_content() {
-    let m1 = slice_module();
-    let m2 = slice_module();
+fn get_or_compile_reuses_the_artifact_for_the_same_module() {
+    let module = slice_module();
     let mut cache = CodeCache::new();
     assert!(cache.is_empty());
 
     let range1 = cache
-        .get_or_compile(&m1)
-        .expect("compile m1")
+        .get_or_compile(&module)
+        .expect("compile")
         .code_address_range();
     assert_eq!(cache.compiles(), 1);
     assert_eq!(cache.len(), 1);
 
     let range2 = cache
-        .get_or_compile(&m2)
-        .expect("compile m2")
+        .get_or_compile(&module)
+        .expect("reuse")
         .code_address_range();
-    // Same content (separately loaded) => same key => the *same* artifact.
+    // The same module object => the same key (identity **and** namespace) => the same
+    // artifact.
     assert_eq!(cache.compiles(), 1, "a cache hit must not recompile");
     assert_eq!(cache.len(), 1);
     assert_eq!(range1, range2);
-    assert!(cache.contains(&m1));
-    assert!(cache.contains(&m2));
+    assert!(cache.contains(&module));
 }
 
+/// Two separately loaded copies of one `.beam` share the **module half** of the key (the
+/// container's MD5) but not the **namespace half**: each load carries its own
+/// [`AtomTable`](beam_term::AtomTable) instance (`beam_loader::load` interns into a fresh
+/// one and `AtomTable::clone` deliberately takes a fresh identity), so each stages its own
+/// artifact. That is the documented trade — an extra compile, never a wrong answer: the
+/// baseline tier bakes atom *indices* into its code, and two namespaces number the same
+/// name differently.
+#[test]
+fn two_loads_of_one_beam_are_two_namespaces_and_two_entries() {
+    let m1 = slice_module();
+    let m2 = slice_module();
+    assert_eq!(m1.checksum(), m2.checksum(), "one `.beam` is one digest");
+    assert_ne!(
+        m1.atom_table.snapshot(),
+        m2.atom_table.snapshot(),
+        "a separate load is a separate atom namespace"
+    );
+
+    let mut cache = CodeCache::new();
+    let range1 = cache
+        .get_or_compile(&m1)
+        .expect("compile m1")
+        .code_address_range();
+    assert_eq!(cache.compiles(), 1);
+
+    let range2 = cache
+        .get_or_compile(&m2)
+        .expect("compile m2")
+        .code_address_range();
+    assert_eq!(
+        cache.compiles(),
+        2,
+        "a second namespace must not be handed the first's atom-indexed code"
+    );
+    assert_eq!(cache.len(), 2, "one entry per (module, namespace)");
+    assert_ne!(range1, range2, "two artifacts, two mappings");
+
+    // Each is still a hit for its own module.
+    cache.get_or_compile(&m1).expect("m1 still hits");
+    cache.get_or_compile(&m2).expect("m2 still hits");
+    assert_eq!(cache.compiles(), 2, "both are cached; neither recompiles");
+    assert_eq!(cache.len(), 2);
+}
 #[test]
 fn different_content_with_the_same_name_does_not_collide() {
     // A **synthetic** module has no load-time digest, so its identity falls back to the
@@ -144,39 +187,58 @@ fn different_content_with_the_same_name_does_not_collide() {
     assert_eq!(cache.len(), 2, "distinct keys must not collide");
 }
 
-/// A **real** `.beam` keys on its **load-time** MD5 digest, which — unlike the content
-/// hash — is a property of the container, computed once by `beam_loader` at the single
-/// `Module` construction site. So two copies of one `.beam` share a key even if one of
-/// them has been edited *after* the load (the decoded IR `Debug`-differs, the digest does
-/// not), and the cache hands both the same artifact.
+/// The **module half** of a real `.beam`'s key is its **load-time** MD5 digest, which —
+/// unlike the content hash — is a property of the container, computed once by
+/// `beam_loader` at the single `Module` construction site. So a post-load edit of the
+/// decoded IR does not move it (the decoded IR `Debug`-differs, the digest does not).
 ///
-/// This is the documented contract of the digest key, not an accident: everything a
-/// `CompiledModule` is derived from is inside the digested chunk subset, so a post-load
-/// mutation of the decoded IR is outside the cache's identity contract (and is not
-/// something a host does — see the crate's post-load-mutation sweep in the cache
-/// `CONTEXT.md`). The synthetic-module fallback above is how an edited-in-place module is
-/// meant to be keyed.
+/// The **namespace half** is what the clone below does move: `Module::clone` clones its
+/// atom table, and `AtomTable::clone` deliberately takes a **fresh** identity (the two
+/// tables may later diverge by independent appends), so the clone is a second namespace
+/// and therefore a second entry. That is the documented namespace trade — an extra
+/// compile for a re-loaded module, never a wrong answer. A post-load mutation of the
+/// decoded IR is outside the cache's identity contract either way (and is not something a
+/// host does — see the crate's post-load-mutation sweep in the cache `CONTEXT.md`); the
+/// synthetic-module fallback above is how an edited-in-place module is meant to be keyed.
 #[test]
-fn the_key_of_a_real_beam_is_its_load_time_digest() {
+fn the_module_half_of_a_real_beams_key_is_its_load_time_digest() {
     let a = slice_module();
     assert_ne!(a.checksum(), [0u8; 16], "a real `.beam` carries an MD5");
     let mut b = a.clone();
     b.functions[0].code.push(Instr::NifStart);
     // The decoded content differs (the hash sees it)...
     assert_ne!(module_fingerprint(&a), module_fingerprint(&b));
-    // ...but the load-time digest is the same, so both resolve to one artifact.
+    // ...but the module half is the container's digest: the edit does not move it, and
+    // it is exactly `Digest(checksum)`.
     assert_eq!(ModuleKey::of(&a), ModuleKey::of(&b));
     assert_eq!(ModuleKey::of(&a), ModuleKey::Digest(a.checksum()));
+    // The namespace half separates the clone: a fresh atom-table identity, so a
+    // distinct key.
+    assert_ne!(
+        CacheKey::of(&a),
+        CacheKey::of(&b),
+        "a cloned module is a fresh atom namespace"
+    );
 
     let mut cache = CodeCache::new();
     let first = cache.compiled_handle(&a).expect("stage a");
-    let second = cache.compiled_handle(&b).expect("resolve b");
-    assert!(Rc::ptr_eq(&first, &second), "one digest => one artifact");
-    assert_eq!(cache.compiles(), 1);
-    assert_eq!(cache.len(), 1);
+    let second = cache.compiled_handle(&b).expect("stage b");
+    assert!(
+        !Rc::ptr_eq(&first, &second),
+        "a fresh namespace gets its own atom-indexed artifact"
+    );
+    assert_eq!(cache.compiles(), 2);
+    assert_eq!(cache.len(), 2);
     assert!(cache.contains(&a) && cache.contains(&b));
-}
 
+    // ...and each is still a hit for its own module.
+    assert!(Rc::ptr_eq(
+        &first,
+        &cache.compiled_handle(&a).expect("a still hits")
+    ));
+    assert_eq!(cache.compiles(), 2, "neither recompiles");
+    assert_eq!(cache.len(), 2);
+}
 #[test]
 fn clear_drops_entries_and_resets_the_counter() {
     let module = slice_module();
@@ -237,18 +299,23 @@ fn a_dead_memo_entry_is_ignored_and_falls_back_to_the_content_hash() {
     // Resolve a **synthetic** (zero-checksum) module — the shape that has no digest to
     // fall back on, so the lookup really must go through the content hash — and memoize
     // it under its address, then **drop** it: the memo entry now outlives its module, so
-    // it must never be trusted again.
-    let first = {
+    // it must never be trusted again. Its atom table is carried over to the fresh module
+    // below, so that the only thing the second lookup can key on is the content hash.
+    let (first, table) = {
         let module = Arc::new(synthetic_module("dead_probe"));
         let handle = cache.compiled_handle(&module).expect("stage the artifact");
         cache.remember(&module, &handle);
-        handle
+        let unwrapped = Arc::try_unwrap(module)
+            .expect("the cache holds only a Weak<Module>, so this is the last strong ref");
+        (handle, unwrapped.atom_table)
     };
 
-    // A separately built copy of the same content: its address may or may not reuse
-    // the dead module's, but either way the lookup must fall back to the content hash
-    // and land on the identical-content entry (never a stale pointer-keyed guess).
-    let fresh = synthetic_module("dead_probe");
+    // A separately built copy of the same content **in the same namespace**: its address
+    // may or may not reuse the dead module's, but either way the lookup must ignore the
+    // dead memo entry, fall back to the content hash and land on the identical-content
+    // entry (never a stale pointer-keyed guess).
+    let mut fresh = synthetic_module("dead_probe");
+    fresh.atom_table = table;
     let before = fingerprint_calls();
     let second = cache.compiled_handle(&fresh).expect("content lookup");
     assert_eq!(
@@ -258,7 +325,7 @@ fn a_dead_memo_entry_is_ignored_and_falls_back_to_the_content_hash() {
     );
     assert!(
         Rc::ptr_eq(&first, &second),
-        "identical content resolves to the same artifact"
+        "identical content in one namespace resolves to the same artifact"
     );
     assert_eq!(cache.compiles(), 1, "the content hit must not recompile");
     assert_eq!(
@@ -267,7 +334,6 @@ fn a_dead_memo_entry_is_ignored_and_falls_back_to_the_content_hash() {
         "no stale pointer key may add a second entry"
     );
 }
-
 #[test]
 fn cached_module_blocks_reuses_the_memo_across_resolutions() {
     // The real cross-module path (the thread-local cache the native driver consults).
@@ -594,46 +660,57 @@ fn remember_module_is_idempotent_and_keeps_the_cached_artifact() {
 }
 
 // ---------------------------------------------------------------------------
-// The digest key (real `.beam`) and its content-hash fallback (synthetic module)
+// The two-part key (real `.beam`) and its content-hash fallback (synthetic module)
 //
-// A real `.beam` carries a load-time MD5 (`Module::checksum`), read in O(1): two loads of
-// one container share a key and therefore one artifact, and no slice entry/resume ever
-// hashes the decoded IR. A synthetic module (`Module::default()`, checksum all-zero) has
-// no digest, so its identity stays exactly what it was — `(name, content fingerprint)`.
+// A real `.beam` carries a load-time MD5 (`Module::checksum`), read in O(1), so no slice
+// entry/resume ever hashes the decoded IR. A synthetic module (`Module::default()`,
+// checksum all-zero) has no digest, so its identity keeps the `(name, content
+// fingerprint)` module half it always had. In both cases the key also carries the atom
+// namespace the artifact was lowered against: the tier bakes atom *indices* into its
+// code, so two namespaces (every separate load is one) are two entries — an extra
+// compile, never a wrong answer.
 // ---------------------------------------------------------------------------
 
-/// Two independently loaded copies of one `.beam` carry the same load-time digest, so
-/// they share **one** artifact and resolve to the very same `Rc`.
+/// Two independently loaded copies of one `.beam` carry the same load-time digest — the
+/// **module** half of their key — but each load has its own atom namespace, so they stage
+/// **two** artifacts and resolve to two distinct `Rc`s. The digest alone is no longer the
+/// key (see [`a_second_atom_namespace_is_never_handed_the_first_namespaces_artifact`] for
+/// the wrong-answer this prevents).
 #[test]
-fn two_loads_of_the_same_beam_share_one_digest_keyed_artifact() {
+fn two_loads_of_the_same_beam_share_the_digest_half_but_not_the_namespace_half() {
     let a = slice_module();
     let b = slice_module();
     assert_ne!(a.checksum(), [0u8; 16], "a real `.beam` carries an MD5");
     assert_eq!(a.checksum(), b.checksum(), "the digest is the container's");
-    assert_eq!(ModuleKey::of(&a), ModuleKey::of(&b));
+    assert_eq!(ModuleKey::of(&a), ModuleKey::of(&b), "the module half collides");
+    assert_ne!(
+        CacheKey::of(&a),
+        CacheKey::of(&b),
+        "the namespace half does not"
+    );
 
     let mut cache = CodeCache::new();
     let first = cache.compiled_handle(&a).expect("stage a");
-    let second = cache.compiled_handle(&b).expect("resolve b");
+    let second = cache.compiled_handle(&b).expect("stage b");
     assert!(
-        Rc::ptr_eq(&first, &second),
-        "one digest => one artifact for both loads"
+        !Rc::ptr_eq(&first, &second),
+        "a separate load is a separate namespace => its own artifact"
     );
     assert_eq!(
         cache.compiles(),
-        1,
-        "the second load must not stage a second artifact"
+        2,
+        "the second load stages its own atom-indexed artifact"
     );
-    assert_eq!(cache.len(), 1, "one digest => one entry");
+    assert_eq!(cache.len(), 2, "one entry per (module, namespace)");
     assert!(cache.contains(&a) && cache.contains(&b));
 }
-
-/// **The fallback pin**: a synthetic (zero-checksum) module has no digest, so its key is
-/// the content hash of its decoded IR — each lookup pays it, and two synthetic modules
-/// key on their own contents (a same-named, same-content rebuild keys identically).
+/// **The fallback pin**: a synthetic (zero-checksum) module has no digest, so its *module*
+/// half is the content hash of its decoded IR — each lookup pays it, and two synthetic
+/// modules key on their own contents (a same-named, same-content rebuild **in the same
+/// namespace** keys identically).
 #[test]
 fn two_synthetic_modules_still_key_on_the_content_hash() {
-    let a = synthetic_module("synthetic_a");
+    let mut a = synthetic_module("synthetic_a");
     let b = synthetic_module("synthetic_b");
     assert_eq!(a.checksum(), [0u8; 16]);
     assert_eq!(b.checksum(), [0u8; 16]);
@@ -656,8 +733,11 @@ fn two_synthetic_modules_still_key_on_the_content_hash() {
     assert_eq!(cache.len(), 2);
 
     // A rebuild of `a`'s content keys identically — one content hash per lookup, and the
-    // artifact it lands on is `a`'s.
-    let rebuilt = synthetic_module("synthetic_a");
+    // artifact it lands on is `a`'s. The rebuild has to be in `a`'s atom namespace for the
+    // key to match (a fresh namespace would be, correctly, a third entry), so `a`'s table
+    // is moved across.
+    let mut rebuilt = synthetic_module("synthetic_a");
+    rebuilt.atom_table = std::mem::replace(&mut a.atom_table, beam_term::AtomTable::new());
     let before = fingerprint_calls();
     let again = cache.compiled_handle(&rebuilt).expect("content hit");
     assert_eq!(
@@ -668,6 +748,151 @@ fn two_synthetic_modules_still_key_on_the_content_hash() {
     assert!(Rc::ptr_eq(&first, &again));
     assert_eq!(cache.compiles(), 2, "a content hit must not recompile");
     assert_eq!(cache.len(), 2);
+}
+/// **The namespace pin — the second half of the key's reason to exist.**
+///
+/// The native baseline tier bakes atom **indices** into the emitted code: an IR
+/// `Operand::Atom(a)` becomes the `Eterm` immediate `make_atom(a)`, and a block that
+/// decides `pick(a) -> …; pick(_) -> …` compares that baked word against the argument.
+/// A module's MD5 says nothing about those indices, so a cache keyed on the module alone
+/// hands the second runtime in a thread the first runtime's atom-indexed code.
+///
+/// This test builds exactly that: **one thread**, one `.beam`'s bytes, two atom
+/// namespaces. Module B's table has an extra name interned *first*, so every wire name
+/// shifts by one — the shape `beam_rt`'s code server creates for every module it loads
+/// (it interns into its shared table, then hands a clone to `lower::build_module`).
+///
+/// The program is the committed `slice.beam` fixture's `pick/1`
+/// (`pick(a) -> 1; pick(_) -> 2.`), driven with the argument `a` **as the running
+/// module's own table numbers it** — precisely the term the loader would produce. Run A
+/// first (so A's artifact — and A's lowered `pick/1` block — is cached), then B:
+///
+/// * with the namespace in the key, B is a miss, compiles against B's table, and the
+///   clause head matches: **1**, identical to B's interpreter-tier result;
+/// * without it, B is a hit on A's artifact, whose baked atom is A's index for `a`, so
+///   the head clause misses and the wildcard arm returns **2** — a silent wrong answer.
+#[test]
+fn a_second_atom_namespace_is_never_handed_the_first_namespaces_artifact() {
+    clear_baseline_cache();
+
+    let bytes = std::fs::read(SLICE_BEAM).expect("read slice.beam");
+    let module_a = load_in_namespace(&bytes, None);
+    let module_b = load_in_namespace(&bytes, Some("namespace_probe"));
+
+    // The module half of the key collides: the very same `.beam`, hence the very same
+    // container MD5.
+    assert_ne!(module_a.checksum(), [0u8; 16], "a real `.beam` carries an MD5");
+    assert_eq!(
+        module_a.checksum(),
+        module_b.checksum(),
+        "the module half of the key is the container's digest, identical for both"
+    );
+
+    // The namespace half does not: the probe name occupies index 0, so every wire name
+    // is one index higher in B.
+    let a_in_a = module_a.atom_table.lookup("a").expect("A interns `a`");
+    let a_in_b = module_b.atom_table.lookup("a").expect("B interns `a`");
+    assert_eq!(
+        module_b.atom_table.lookup("namespace_probe"),
+        Some(Atom::from_raw(0)),
+        "the probe name is interned first, so it takes index 0"
+    );
+    assert_eq!(
+        a_in_b.raw(),
+        a_in_a.raw() + 1,
+        "the probe shifts every wire name's index by one"
+    );
+    assert_ne!(
+        module_a.atom_table.snapshot(),
+        module_b.atom_table.snapshot(),
+        "two namespaces"
+    );
+
+    let pick_a = module_a.atom_table.lookup("pick").expect("A interns `pick`");
+    let pick_b = module_b.atom_table.lookup("pick").expect("B interns `pick`");
+    // The argument is the atom `a` **as the running module's own table numbers it**.
+    let arg_a = make_atom(a_in_a);
+    let arg_b = make_atom(a_in_b);
+
+    // The interpreter is the reference on each side: both match the atom head clause.
+    let mut reference = Machine::new();
+    let mut reference_ctx = MinimalContext::new();
+    let expected_a = reference
+        .run_export(&module_a, pick_a, 1, &[arg_a], &mut reference_ctx)
+        .expect("the interpreter runs A's pick/1");
+    let expected_b = reference
+        .run_export(&module_b, pick_b, 1, &[arg_b], &mut reference_ctx)
+        .expect("the interpreter runs B's pick/1");
+    assert_eq!(
+        (expected_a, expected_b),
+        (make_small(1), make_small(1)),
+        "each namespace's own `a` matches the `pick(a)` head clause"
+    );
+
+    // A runs first: its artifact is staged and its `pick/1` block lowered out of A's
+    // module, baking A's index for `a`.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let got_a = run_baseline_cached(&mut machine, &module_a, pick_a, 1, &[arg_a], &mut ctx)
+        .expect("A's baseline run");
+    assert_eq!(got_a, expected_a, "A matches its own baked atom");
+    assert_eq!(baseline_compile_count(), 1, "A stages its own artifact");
+    assert_eq!(baseline_cache_len(), 1);
+
+    // B runs the same way. Reusing A's artifact would compare B's argument against A's
+    // baked index and take the wildcard arm.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let got_b = run_baseline_cached(&mut machine, &module_b, pick_b, 1, &[arg_b], &mut ctx)
+        .expect("B's baseline run");
+    assert_eq!(
+        got_b, expected_b,
+        "B must be compiled against B's own atom namespace: reusing A's artifact compares \
+         B's `a` against A's baked index for `a` and returns the wildcard clause"
+    );
+    assert_eq!(
+        baseline_compile_count(),
+        2,
+        "B's namespace is a second key, so B stages its own artifact"
+    );
+    assert_eq!(baseline_cache_len(), 2);
+
+    clear_baseline_cache();
+}
+
+/// Load `bytes` through the `beam_loader` public pipeline the way the runtime's code
+/// server does — container → chunks → wire atom map → instruction decode → lowering — but
+/// into a **caller-owned** namespace, with an optional `probe` name interned *first* so
+/// every wire name's index shifts by one.
+///
+/// This is `beam_loader::load` with the one degree of freedom the cache key must witness:
+/// the atom table. `build_module` re-interns the wire names idempotently, so the shifts
+/// survive lowering.
+fn load_in_namespace(bytes: &[u8], probe: Option<&str>) -> Module {
+    let container = beam_loader::container::parse(bytes).expect("the container parses");
+    let chunks = beam_loader::chunk::parse(&container).expect("the chunks parse");
+
+    let mut table = beam_term::AtomTable::new();
+    if let Some(probe) = probe {
+        table.intern(probe);
+    }
+    // `atoms[0]` is the NIL placeholder, `atoms[1]` the module name — the same layout
+    // `beam_loader::load` builds.
+    let mut wire: Vec<Atom> = Vec::with_capacity(chunks.atoms.len());
+    wire.push(Atom::MAX);
+    for name in &chunks.atoms[1..] {
+        wire.push(table.intern(name));
+    }
+
+    let raw = beam_loader::decode::decode_stream(
+        chunks.code_stream,
+        &wire,
+        &chunks.code_version,
+        &chunks.types,
+    )
+    .expect("the instruction stream decodes");
+
+    beam_loader::lower::build_module(&chunks, &raw, table).expect("the module lowers")
 }
 
 /// **The digest key pin (real `.beam`), end to end**: once a real module's artifact is

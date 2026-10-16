@@ -267,7 +267,11 @@ fn collect_minor_reports_typed_heap_exhaustion_before_any_copy() {
     let again = collector
         .collect_minor(&mut roots)
         .expect_err("still cannot hold the nursery");
-    assert_eq!(format!("{again:?}"), format!("{err:?}"), "the error is repeatable");
+    assert_eq!(
+        format!("{again:?}"),
+        format!("{err:?}"),
+        "the error is repeatable"
+    );
     assert_eq!(copying_state(&collector), state, "still untouched");
     assert_roots_untouched(&roots, collector.young(), &before);
     assert_tuples_intact(&roots, &expected);
@@ -529,7 +533,10 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
 
     // `unbounded()` and a large `from_min_max` cap both admit the request, and the curated
     // growth table covers it in either case.
-    for policy in [HeapPolicy::unbounded(), HeapPolicy::from_min_max(0, 100_000)] {
+    for policy in [
+        HeapPolicy::unbounded(),
+        HeapPolicy::from_min_max(0, 100_000),
+    ] {
         assert!(
             policy.next_words(need, 0) >= need,
             "the curated table covers the request"
@@ -552,7 +559,11 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
         assert_eq!(collection.kind, CollectionKind::Minor);
         assert!(collector.young().available_words() >= need);
         assert!(collector.young().capacity_words() >= need);
-        assert_eq!(collector.stats().minor_collections, 1, "exactly one collection ran");
+        assert_eq!(
+            collector.stats().minor_collections,
+            1,
+            "exactly one collection ran"
+        );
         assert_eq!(collector.stats().major_collections, 0);
         assert!(
             roots.iter().all(|r| collector.mature().contains_term(*r)),
@@ -573,7 +584,11 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
             .expect("growth is reachable");
         assert_eq!(collection.kind, CollectionKind::Minor);
         assert!(collector.young().available_words() >= need);
-        assert_eq!(collector.stats().minor_collections, 1, "exactly one collection ran");
+        assert_eq!(
+            collector.stats().minor_collections,
+            1,
+            "exactly one collection ran"
+        );
         assert_eq!(collector.stats().major_collections, 0);
         assert!(
             roots.iter().all(|r| collector.mature().contains_term(*r)),
@@ -642,7 +657,10 @@ fn an_exact_fit_allocation_still_fits_and_one_word_over_does_not() {
     }
     let available = collector.young().available_words();
     assert_eq!(available, 20);
-    assert!(!collector.should_collect(0), "a zero-word request always fits");
+    assert!(
+        !collector.should_collect(0),
+        "a zero-word request always fits"
+    );
     assert!(
         !collector.should_collect(available),
         "an exact-fit request still fits"
@@ -735,8 +753,15 @@ fn grown_nursery_filled_to_its_exact_boundary(kind: MatureKind) {
     assert!(c.young().available_words() >= need, "{kind:?}");
     assert_eq!(c.policy().next_words(need, 0), 1598, "{kind:?}");
     let capacity = c.young().capacity_words();
-    assert_eq!(capacity, 1598, "{kind:?}: the curated size covering 1206 words");
-    assert_eq!(capacity % 2, 0, "the grown nursery divides into 2-word cons cells");
+    assert_eq!(
+        capacity, 1598,
+        "{kind:?}: the curated size covering 1206 words"
+    );
+    assert_eq!(
+        capacity % 2,
+        0,
+        "the grown nursery divides into 2-word cons cells"
+    );
 
     // Fill the grown nursery to its exact boundary.
     let mut cons_expected = Vec::new();
@@ -760,7 +785,11 @@ fn grown_nursery_filled_to_its_exact_boundary(kind: MatureKind) {
     // The collection of a nursery with zero words to spare still succeeds.
     let collection = c.collect(&mut roots).expect("collect the full nursery");
     assert_eq!(collection.kind, CollectionKind::Major, "{kind:?}");
-    assert_eq!(c.young().used_words(), 0, "{kind:?}: the nursery is emptied");
+    assert_eq!(
+        c.young().used_words(),
+        0,
+        "{kind:?}: the nursery is emptied"
+    );
     assert!(
         roots.iter().all(|r| in_mature(&c, *r)),
         "{kind:?}: every root was relocated into the mature generation"
@@ -818,7 +847,11 @@ fn a_term_written_in_the_window_survives(kind: MatureKind) {
     // The next collection keeps both the new term and the pre-existing live set.
     let collection = c.collect(&mut roots).expect("collect after the window");
     assert_eq!(collection.kind, CollectionKind::Minor, "{kind:?}");
-    assert_eq!(c.young().used_words(), 0, "{kind:?}: the nursery is emptied");
+    assert_eq!(
+        c.young().used_words(),
+        0,
+        "{kind:?}: the nursery is emptied"
+    );
     assert!(
         roots.iter().all(|r| in_mature(&c, *r)),
         "{kind:?}: the new term and the old live set are both in mature"

@@ -39,8 +39,11 @@
 //! Phases (all ns/op):
 //! * `clone`  — one `AtomTable::clone()` of that table, i.e. the decode path's per-call
 //!   rebuild measured in isolation;
+//! * `verify` — the index-by-index revalidation of a memoized table image, isolated;
 //! * `encode` — `erlang:term_to_binary/1` on the payload term;
-//! * `decode` — `erlang:binary_to_term/1` of the image;
+//! * `memo`   — `binary_to_term/1` the way it ran *before* the O(1) witness guard: a
+//!   memoized image of the live table revalidated one name at a time on every call;
+//! * `decode` — `erlang:binary_to_term/1` of the image (memo + O(1) witness);
 //! * `round`  — both, back to back (the `etf_roundtrip` shape).
 //!
 //! Every destination heap is `reset()` between iterations, so a metric is the crate's own
@@ -257,6 +260,27 @@ fn main() {
             .expect("binary_to_term/1");
         black_box(term);
     });
+    // --- memoized decode: the previous `with_decode_scratch` shape ---------------------
+    // The per-thread *image* of the live table was reused, but every call compared it
+    // against that table one name at a time (`prefix_matches`) before decoding into it.
+    // The payload interns nothing, so the image stays exact and all `n` comparisons run —
+    // this is the cost the O(1) witness guard removes.
+    let mut memo = atoms.clone();
+    let memo_ns = bench(iters, || {
+        dst_heap.reset();
+        let mut same = memo.len() == atoms.len();
+        for i in 0..memo.len() {
+            let a = Atom::from_raw(i as u32);
+            if memo.name(a) != atoms.name(a) {
+                same = false;
+                break;
+            }
+        }
+        black_box(same);
+        let term = beam_codec::decode_term_used(&canonical, &mut dst_heap, &mut memo)
+            .expect("binary_to_term/1");
+        black_box(term);
+    });
     // --- round -----------------------------------------------------------------------
     let round_ns = bench(iters, || {
         enc_heap.reset();
@@ -281,8 +305,15 @@ fn main() {
     println!("verify  {verify_ns:>10.1} ns/op");
     println!("encode  {encode_ns:>10.1} ns/op");
     println!("legacy  {legacy_ns:>10.1} ns/op  (pre-fix decode: full clone + decode)");
-    println!("decode  {decode_ns:>10.1} ns/op  (post-fix decode: memoized scratch)");
+    println!("memo    {memo_ns:>10.1} ns/op  (previous decode: memoized image, index-by-index)");
+    println!("decode  {decode_ns:>10.1} ns/op  (current decode: memoized image + O(1) witness)");
     println!("round   {round_ns:>10.1} ns/op  = {:.3} us/op", round_ns / 1000.0);
+    println!(
+        "witness speedup {:.1}x  (previous decode {:.3} us/op -> {:.3} us/op)",
+        memo_ns / decode_ns,
+        memo_ns / 1000.0,
+        decode_ns / 1000.0
+    );
     println!(
         "decode speedup {:.1}x   (old round ~ encode+legacy = {:.3} us/op -> {:.1}x)",
         legacy_ns / decode_ns,

@@ -59,16 +59,17 @@
 //!   *guard* failure instead drops the match; an arithmetic opcode failure raises out of
 //!   `select`). The case below pins that: `element(2, a)` on the atom `a` fails.
 //!
-//! # Match-spec pivots deliberately *not* pinned here
+//! # The two `specs/` pivots pinned below
 //!
-//! `match_spec_compile/1` rejects an **empty** spec: the empty binary `<<>>` raises
-//! `error:badarg`, pinned by the `specs/` case below (the empty *list* `[]` raises the same
-//! reason in the oracle but is accepted by the Rust runtime, so a `[]` case would pin a
-//! divergence rather than a contract). Likewise a body element written as the 1-tuple `{self}`
-//! is a builtin call yielding the *calling pid* in the oracle, while the Rust runtime answers
-//! it with the `'EXIT'` body-failure sentinel — the `beam_ets` `SelfHook` seam is installed by
-//! no crate — so the `self`-as-a-pid behaviour is not pinned either. Only the literal-atom
-//! spelling (`self` alone in a body, which is *not* a call) is a shared observation.
+//! * `match_spec_compile/1` rejects an **empty** spec: the empty binary `<<>>` raises
+//!   `error:badarg`, pinned by `specs/match_spec_compile_empty_spec_is_badarg` (the empty
+//!   *list* `[]` raises the same reason in the oracle but is accepted by the Rust runtime, so a
+//!   `[]` case would pin a divergence rather than a contract).
+//! * a body element written as the 1-tuple `{self}` is the grammar's builtin *call* form, so it
+//!   yields the **calling pid** — pinned by
+//!   `specs/match_spec_run_self_body_returns_the_calling_pid`, which asserts the relation
+//!   `=:= [self()]` (plus the pid shape) because a pid is per-VM. The literal-atom spelling
+//!   (`self` alone in a body, which is *not* a call) is a shared observation.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -604,7 +605,7 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
-        // --- `specs/`: the empty-spec pivot -------------------------------------------------
+        // --- `specs/`: the empty-spec pivot and the matcher's `self/0` ----------------------
         Case {
             id: "specs/match_spec_compile_empty_spec_is_badarg",
             description: "match_spec_compile/1 rejects the empty binary spec with badarg",
@@ -620,6 +621,26 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok badarg"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "specs/match_spec_run_self_body_returns_the_calling_pid",
+            description: "a `{self}` body element is the matcher's self/0 call and yields the calling pid",
+            contracts: &[Contract::LanguageSemantics, Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `{self}` (the 1-tuple) is the match-spec grammar's builtin *call* form, so the
+                // body element yields the calling pid -- not the literal atom `self` (that is the
+                // un-tupled spelling). A pid is per-VM, so the result is asserted as the relation
+                // `=:= [self()]` evaluated in the same expression (plus the pid shape and the
+                // single-match arity), never as a pid literal.
+                expr: "begin M = ets:match_spec_run([{a}], ets:match_spec_compile([{'_',[],[{self}]}])), \
+                       {M =:= [self()], is_pid(hd(M)), length(M)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,1}"),
                 exit_code: 0,
             },
         },

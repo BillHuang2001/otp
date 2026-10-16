@@ -169,7 +169,11 @@ fn entry_is_live(entry: &OffHeapEntry, live: &[*mut u8]) -> bool {
 fn a_refc_binary_whose_onheap_handle_becomes_garbage_is_released_exactly_once() {
     let alloc = test_allocator("gc-pressure-refc-dies");
     let payload = RefcBinary::with_allocator(alloc.clone(), DIES_BYTES).expect("payload");
-    assert_eq!(alloc.stats().live_blocks, 1, "the payload's buffer is one live block");
+    assert_eq!(
+        alloc.stats().live_blocks,
+        1,
+        "the payload's buffer is one live block"
+    );
     assert_eq!(payload.refcount(), 1);
 
     // Register a clone: the off-heap list owns one reference and the test keeps another, so
@@ -192,22 +196,37 @@ fn a_refc_binary_whose_onheap_handle_becomes_garbage_is_released_exactly_once() 
     // SAFETY: the copied handle is still a live refc binary describing `payload`.
     assert!(unsafe { is_refc_binary(roots[0]) });
     let live = live_payloads(&roots);
-    assert_eq!(live, vec![payload.data_ptr()], "the walk finds the live handle");
+    assert_eq!(
+        live,
+        vec![payload.data_ptr()],
+        "the walk finds the live handle"
+    );
     assert_eq!(
         off_heap.sweep(|e| entry_is_live(e, &live)),
         0,
         "a live handle keeps the off-heap entry"
     );
     assert_eq!(off_heap.len(), 1);
-    assert_eq!(payload.refcount(), 2, "the retained entry still holds its reference");
+    assert_eq!(
+        payload.refcount(),
+        2,
+        "the retained entry still holds its reference"
+    );
 
     // Phase 2: the handle is dropped from the roots, so the fullsweep reclaims the on-heap
     // pair; the now-unreachable off-heap entry is swept exactly once.
     let mut no_roots: [Eterm; 0] = [];
     let second = collector.collect(&mut no_roots).expect("collect");
-    assert_eq!(second.kind, CollectionKind::Major, "a fullsweep reclaims the pair");
+    assert_eq!(
+        second.kind,
+        CollectionKind::Major,
+        "a fullsweep reclaims the pair"
+    );
     let live = live_payloads(&no_roots);
-    assert!(live.is_empty(), "no reachable handle references the payload any more");
+    assert!(
+        live.is_empty(),
+        "no reachable handle references the payload any more"
+    );
     assert_eq!(
         off_heap.sweep(|e| entry_is_live(e, &live)),
         1,
@@ -220,7 +239,11 @@ fn a_refc_binary_whose_onheap_handle_becomes_garbage_is_released_exactly_once() 
         "the release decremented the count exactly once"
     );
     // The payload is still readable through the surviving test handle: no use-after-free.
-    assert_eq!(payload.as_bytes(), DIES_BYTES, "the payload bytes are intact");
+    assert_eq!(
+        payload.as_bytes(),
+        DIES_BYTES,
+        "the payload bytes are intact"
+    );
 
     // Dropping the last reference frees the buffer exactly once — a leak would leave a live
     // block, and a double free would be caught by the allocator's plausibility check.
@@ -269,8 +292,16 @@ fn a_sweep_releases_only_the_garbage_binary_and_keeps_the_live_one() {
         "exactly the garbage binary is released"
     );
     assert_eq!(off_heap.len(), 1);
-    assert_eq!(live_payload.refcount(), 2, "the live entry keeps its reference");
-    assert_eq!(dead_payload.refcount(), 1, "the dead entry released its reference");
+    assert_eq!(
+        live_payload.refcount(),
+        2,
+        "the live entry keeps its reference"
+    );
+    assert_eq!(
+        dead_payload.refcount(),
+        1,
+        "the dead entry released its reference"
+    );
 
     // Dropping the dead payload now frees its buffer exactly once; the live one remains.
     let before = alloc.stats();
@@ -341,7 +372,10 @@ fn a_fun_holding_a_refc_binary_keeps_it_alive_and_releases_it_when_the_fun_dies(
     let env = unsafe { fun_env(copied) }.expect("fun env");
     assert_eq!(env.len(), 2);
     // SAFETY: `env[0]` is a live term of the copied fun's environment.
-    assert!(unsafe { is_refc_binary(env[0]) }, "the refc binary term survived");
+    assert!(
+        unsafe { is_refc_binary(env[0]) },
+        "the refc binary term survived"
+    );
     // SAFETY: `env[0]` is a live refc binary whose off-heap payload `payload` keeps alive.
     assert_eq!(unsafe { refc_bytes(env[0]) }, FUN_REFC_BYTES);
 
@@ -356,14 +390,22 @@ fn a_fun_holding_a_refc_binary_keeps_it_alive_and_releases_it_when_the_fun_dies(
         0,
         "the live fun keeps the off-heap entry"
     );
-    assert_eq!(payload.refcount(), 2, "the retained entry still holds its reference");
+    assert_eq!(
+        payload.refcount(),
+        2,
+        "the retained entry still holds its reference"
+    );
 
     // Once the fun is garbage a fullsweep reclaims it (and the refc pair with it); the
     // off-heap binary is then released exactly once.
     let mut no_roots: [Eterm; 0] = [];
     let second = collector.collect(&mut no_roots).expect("collect");
     assert_eq!(second.kind, CollectionKind::Major);
-    assert_eq!(collector.mature().used_words(), 0, "the fun graph is reclaimed");
+    assert_eq!(
+        collector.mature().used_words(),
+        0,
+        "the fun graph is reclaimed"
+    );
     let live = live_payloads(&no_roots);
     assert!(live.is_empty(), "the fun no longer references the binary");
     assert_eq!(
@@ -378,5 +420,9 @@ fn a_fun_holding_a_refc_binary_keeps_it_alive_and_releases_it_when_the_fun_dies(
     let before = alloc.stats();
     assert_eq!(before.live_blocks, 1);
     drop(payload);
-    assert_eq!(alloc.stats().live_blocks, 0, "the payload's buffer was freed");
+    assert_eq!(
+        alloc.stats().live_blocks,
+        0,
+        "the payload's buffer was freed"
+    );
 }

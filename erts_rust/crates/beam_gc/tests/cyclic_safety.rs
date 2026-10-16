@@ -216,11 +216,7 @@ fn assert_shape(root: Eterm, shape: Shape, resident: impl Fn(Eterm) -> bool) {
             // in-bounds and initialised.
             unsafe {
                 assert_eq!(*cell, make_small(1), "the self-loop cell's car");
-                assert_eq!(
-                    *cell.add(1),
-                    root,
-                    "the self-loop must close on the copy"
-                );
+                assert_eq!(*cell.add(1), root, "the self-loop must close on the copy");
             }
         }
         Shape::TwoCycle => {
@@ -352,7 +348,10 @@ fn bounded_sizer_distinguishes_too_large_from_cyclic_on_acyclic_graphs() {
     let mut space = space(4096);
     let mut list = NIL;
     for i in 0..1_000i64 {
-        list = space.heap_mut().cons(make_small(i), list).expect("cons cell");
+        list = space
+            .heap_mut()
+            .cons(make_small(i), list)
+            .expect("cons cell");
     }
 
     let exact = size_object(list);
@@ -501,7 +500,11 @@ fn cyclic_graphs_collect_through_the_primitive_entry() {
         "each object is copied exactly once"
     );
     assert_eq!(stats.words_copied, CORPUS_WORDS);
-    assert_eq!(to.used_words(), CORPUS_WORDS, "the to-space holds exactly the live words");
+    assert_eq!(
+        to.used_words(),
+        CORPUS_WORDS,
+        "the to-space holds exactly the live words"
+    );
 
     // Every root points into the to-space and nowhere in the from-space.
     for root in &roots {

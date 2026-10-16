@@ -137,7 +137,19 @@ impl HeapSpace {
 /// One range for a minor collection (the nursery); two — nursery plus mature — for a
 /// fullsweep collection. A reference that falls outside every range is left verbatim
 /// by the copier (the C `erts_is_literal`/area-test rule).
+///
+/// The ranges are stored **sorted by `lo`**, so the per-reference membership test
+/// ([`contains`](FromSet::contains)) and the reachability walk's bit-index lookup
+/// ([`locate`](FromSet::locate)) narrow to the single candidate range by binary search instead
+/// of scanning every range — both are per-reference hot paths, and a chained nursery or a
+/// partition into many ranges must not make a reference word cost more than one reference word.
+///
+/// Insertion (`add`/`add_range`) pays the `O(#ranges)` shift of an insertion into a sorted
+/// `Vec`, which is negligible: a from-set holds one range per non-empty space of the
+/// collection's heap ([`HeapSpace`] never replicates its allocation), not one per object.
 pub struct FromSet {
+    /// The evacuated ranges, half-open byte-address pairs `[lo, hi)`, kept **sorted by `lo`**
+    /// (a later `add` of a smaller `lo` is inserted before an earlier one).
     ranges: Vec<(usize, usize)>,
 }
 
@@ -149,8 +161,7 @@ impl FromSet {
 
     /// Adds the live region of `space` as a range this set evacuates.
     pub fn add(&mut self, space: &HeapSpace) {
-        self.ranges
-            .push((space.base() as usize, space.top() as usize));
+        self.insert(space.base() as usize, space.top() as usize);
     }
 
     /// Adds an explicit half-open byte-address range `[lo, hi)` this set evacuates.
@@ -159,17 +170,50 @@ impl FromSet {
     /// mature space is one contiguous region whose free lines are inside it too, so a
     /// [`FromSet`] over it is `base .. base + capacity`.
     pub(crate) fn add_range(&mut self, lo: usize, hi: usize) {
-        self.ranges.push((lo, hi));
+        self.insert(lo, hi);
     }
 
-    /// The evacuated ranges, as half-open byte-address pairs.
+    /// Inserts the range `[lo, hi)` at its `lo`-sorted position — the single insertion point,
+    /// so `ranges`' sorted-by-`lo` invariant can never be bypassed.
+    fn insert(&mut self, lo: usize, hi: usize) {
+        let at = self.ranges.partition_point(|&(existing, _)| existing <= lo);
+        self.ranges.insert(at, (lo, hi));
+    }
+
+    /// The evacuated ranges, as half-open byte-address pairs, **sorted by `lo`**.
     pub(crate) fn ranges(&self) -> &[(usize, usize)] {
         &self.ranges
     }
+
     /// Whether `ptr` falls inside any evacuated range.
     pub fn contains(&self, ptr: *const Eterm) -> bool {
-        let addr = ptr as usize;
-        self.ranges.iter().any(|&(lo, hi)| lo <= addr && addr < hi)
+        self.locate(ptr as usize).is_some()
+    }
+
+    /// The index in [`ranges`](FromSet::ranges) of a range covering `addr`, or `None`.
+    ///
+    /// This is the **single** place the range geometry is interpreted, so `contains` and the
+    /// reachability walk's bit index can never disagree about which range (and therefore which
+    /// word) an address belongs to. Ranges are sorted by `lo`, so the last one with
+    /// `lo <= addr` is the only candidate: the others start after `addr`, and a covering range
+    /// starting before the candidate's `lo` cannot exist because the ranges of a from-set are
+    /// pairwise **disjoint** (they are the live regions of distinct, simultaneously live
+    /// allocations). The walk back over ranges sharing that `lo` keeps the answer well defined
+    /// even for a caller that added the very same range twice.
+    pub(crate) fn locate(&self, addr: usize) -> Option<usize> {
+        let end = self.ranges.partition_point(|&(lo, _)| lo <= addr);
+        if end == 0 {
+            return None;
+        }
+        let candidate_lo = self.ranges[end - 1].0;
+        let mut index = end;
+        while index > 0 && self.ranges[index - 1].0 == candidate_lo {
+            index -= 1;
+            if addr < self.ranges[index].1 {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// The total number of words covered by this set's ranges.
@@ -432,5 +476,104 @@ mod tests {
         assert!(!set.contains(young.base().wrapping_sub(1) as *const Eterm));
         let local: Eterm = make_small(9);
         assert!(!set.contains(addr_of!(local)));
+    }
+
+    #[test]
+    fn from_set_contains_is_exact_over_many_disjoint_ranges() {
+        /// More ranges than any hand-written case would add, and enough that a linear scan per
+        /// reference word is the cost the sorted index removes.
+        const RANGES: usize = 1200;
+        let word = size_of::<Eterm>();
+
+        // `RANGES` disjoint ranges with varying widths and varying holes between them.
+        let mut expected: Vec<(usize, usize)> = Vec::with_capacity(RANGES);
+        let mut next = 0x10_000usize;
+        for i in 0..RANGES {
+            let lo = next;
+            let hi = lo + (1 + i % 7) * word;
+            expected.push((lo, hi));
+            next = hi + (i % 3) * word;
+        }
+
+        // Inserted in a scrambled order, so the sorted insertion is exercised too: 137 is
+        // coprime with 1200, so `(i * 137) % RANGES` is a permutation of `0..RANGES`.
+        let mut set = FromSet::new();
+        for i in 0..RANGES {
+            let (lo, hi) = expected[(i * 137) % RANGES];
+            set.add_range(lo, hi);
+        }
+
+        // The stored ranges are exactly the added ones, in `lo` order (the shape the binary
+        // search relies on), and `words()` still sums their spans.
+        let mut sorted = expected.clone();
+        sorted.sort_unstable();
+        assert_eq!(set.ranges(), sorted.as_slice());
+        let total_words: usize = expected.iter().map(|&(lo, hi)| (hi - lo) / word).sum();
+        assert_eq!(set.words(), total_words);
+
+        // The membership test is exactly the linear scan over the added ranges — word by word
+        // inside every range, plus the words straddling both of its boundaries — and `locate`
+        // agrees with it and names a range that really covers the address. `locate` is the one
+        // place the geometry is interpreted (the reachability walk's bit index goes through it),
+        // so the two can never disagree.
+        let mut inside = 0usize;
+        for &(lo, hi) in &expected {
+            let mut addr = lo - 2 * word;
+            while addr <= hi + 2 * word {
+                let want = expected.iter().any(|&(l, h)| l <= addr && addr < h);
+                assert_eq!(
+                    set.contains(addr as *const Eterm),
+                    want,
+                    "contains({addr:#x}) must equal the scan"
+                );
+                match set.locate(addr) {
+                    Some(index) => {
+                        let (l, h) = set.ranges()[index];
+                        assert!(l <= addr && addr < h, "locate names a covering range");
+                    }
+                    None => assert!(!want, "locate must find every covered address"),
+                }
+                inside += usize::from(want);
+                addr += word;
+            }
+        }
+        assert!(
+            inside >= RANGES,
+            "the sweep really lands inside the ranges, got {inside}"
+        );
+
+        // An address below the first range and one above the last are outside every range.
+        assert!(!set.contains((expected[0].0 - word) as *const Eterm));
+        let last = expected.iter().map(|&(_, hi)| hi).max().expect("a range");
+        assert!(
+            !set.contains(last as *const Eterm),
+            "the last range is half-open"
+        );
+    }
+
+    #[test]
+    fn from_set_contains_handles_the_same_range_added_more_than_once() {
+        let word = size_of::<Eterm>();
+        let mut set = FromSet::new();
+        set.add_range(0x100, 0x100 + 3 * word);
+        set.add_range(0x100, 0x100 + 3 * word); // the identical range again
+        set.add_range(0x100, 0x100 + word); // and a shorter one sharing its `lo`
+
+        // Every word of the widest entry is covered, however many entries name it, and the
+        // predicate is still half-open at the widest `hi`.
+        for addr in [0x100, 0x100 + word, 0x100 + 2 * word] {
+            assert!(
+                set.contains(addr as *const Eterm),
+                "the widest entry covers {addr:#x}"
+            );
+            let index = set.locate(addr).expect("a covering entry");
+            let (lo, hi) = set.ranges()[index];
+            assert!(lo <= addr && addr < hi, "locate names a covering entry");
+        }
+        assert!(
+            !set.contains((0x100 + 3 * word) as *const Eterm),
+            "the widest range is half-open"
+        );
+        assert_eq!(set.locate(0x100 - 1), None, "below every entry");
     }
 }
