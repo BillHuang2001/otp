@@ -72,7 +72,13 @@ full-cache stores from one recorded run. The emitted bytes themselves are pinned
 `a_tail_exit_spills_pops_the_frame_and_then_jumps_to_the_successor`,
 `a_deallocate_spills_before_calling_the_helper`), which assert against the **dirty-set** store
 count. Tier-equivalence is proven by the crate's `tests/jit*.rs` real-module gates (interpreter-identical
-by construction).
+by construction). The **corpus-wide** evidence is
+`../census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed`, which prints one run's
+three spill **models** (the dirty set `spill` emits, the whole-block written set, the full cache),
+both fill models, the calls/blocks by site and size, and the **redundant-clean-store difference**
+(`written − dirty`, the exact size of the store-elimination opportunity) for the committed fixtures
+and the installed-OTP corpus; like the other censuses it asserts liveness/consistency only, never a
+threshold.
 
 ## See Also
 - `CONTEXT.md` (this directory) -> the spill/fill discipline in `emit_block` and the call sites.
