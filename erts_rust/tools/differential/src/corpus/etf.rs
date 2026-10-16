@@ -65,6 +65,26 @@
 //! `minor_version` (no `{minor_version, N}` value) is `badarg` in both runtimes; `{minor_version,1}`
 //! renders an atom as the legacy `ATOM_EXT` (100) inside a compound term; and `{minor_version,2}`
 //! keeps `BIT_BINARY_EXT` (77) for a non-byte-aligned bitstring.
+//!
+//! ## The `local` option: the node hash is masked, the rest of the image is pinned
+//! `term_to_binary(Term, [local])` wraps the image in `VERSION_MAGIC` (131) + `LOCAL_EXT` (121)
+//! followed by a **4-byte** payload — the node's `local_node_hash` — and then the ordinary term
+//! body **without** its own version byte: `term_to_binary(1, [local])` is
+//! `<<131,121,H,H,H,H,97,1>>` (8 bytes). The hash is derived per **VM start** (seeded from the
+//! hostname/pid/time-offset and the monotonic clock), so on *both* runtimes two runs of the same
+//! expression print different bytes there — a raw byte golden would drift the oracle's own output.
+//! `etf/term_to_binary_local_masks_the_node_hash` therefore masks exactly those four bytes (and
+//! reports the image's `byte_size/1`, which is hash-independent) and compares the remaining image
+//! — the `LOCAL_EXT` prologue plus the whole body, captured through `binary_to_term` as well as
+//! byte-for-byte — against the oracle's. The per-VM hash bytes themselves are never asserted.
+//! The same rule marks an **internal id's node atom**: `term_to_binary(self(), [local])` carries
+//! `NIL_EXT` (106) in the `NEW_PID_EXT`'s node position (the local node, spelled without its
+//! name), so its image length is node-name-independent — pinned, with the hash masked, by
+//! `etf/term_to_binary_local_replaces_the_local_node_atom`, which also pins that the plain and
+//! the `[safe]` `binary_to_term/2` both decode the image back to the very same pid.
+//! (A **foreign** hash — a `LOCAL_EXT` image whose four payload bytes are not this VM's — is
+//! deliberately *not* a case: the oracle rejects it and this runtime decodes it, so pinning it
+//! would be a mismatch-fixing exercise, not an A.2 encoding claim.)
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -1148,6 +1168,54 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- the `local` option: the 4-byte node hash is per-VM-start, so it is masked and the
+        // rest of the LOCAL_EXT image is pinned byte-for-byte (see the module docs) --------
+        Case {
+            id: "etf/term_to_binary_local_masks_the_node_hash",
+            description: "term_to_binary/2 with `local` emits VERSION_MAGIC + LOCAL_EXT (121) + a \
+                          4-byte per-VM-start node hash + the body: the hash is masked, the image \
+                          length and every other byte (and the decode round trip) are pinned for \
+                          an integer, a compound term and a 40-element list",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin F = fun(T) -> B = term_to_binary(T, [local]), \
+                       <<Pfx:2/binary, _Hash:4/binary, Tail/binary>> = B, \
+                       {byte_size(B), <<Pfx/binary, 0:32, Tail/binary>>, binary_to_term(B) =:= T} \
+                       end, [F(1), F({a,\"hello\",[1,2,3]}), F(lists:seq(1,40))] end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok [{8,<<131,121,0,0,0,0,97,1>>,true},{25,<<131,121,0,0,0,0,104,3,119,1,97,\
+                     107,0,5,104,101,108,108,111,107,0,3,1,2,3>>,true},{49,<<131,121,0,0,0,0,107,\
+                     0,40,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,\
+                     27,28,29,30,31,32,33,34,35,36,37,38,39,40>>,true}]",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_local_replaces_the_local_node_atom",
+            description: "term_to_binary/2 with `local` marks an internal id's node atom as \
+                          NIL_EXT (106): the image length, the masked LOCAL_EXT + NEW_PID_EXT + \
+                          NIL_EXT prologue and the plain and `[safe]` decode round trips are \
+                          pinned, while the node hash and the pid's own id bytes are not",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin B = term_to_binary(self(), [local]), \
+                       <<Pfx:2/binary, _Hash:4/binary, Tail/binary>> = B, \
+                       M = <<Pfx/binary, 0:32, Tail/binary>>, \
+                       {byte_size(B), binary:part(M, 0, 8), binary_to_term(B) =:= self(), \
+                        binary_to_term(B, [safe]) =:= self()} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {20,<<131,121,0,0,0,0,88,106>>,true,true}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1452,5 +1520,94 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// The `local` option case (A.2): the image is pinned with the four per-VM-start node-hash
+    /// bytes **masked**, so the golden must (a) be a `value`-probe line, (b) name the three
+    /// `LOCAL_EXT` images by their hash-independent `byte_size/1`, and (c) carry no unique node
+    /// hash — only the zeroed stand-in at every `LOCAL_EXT` position.
+    #[test]
+    fn the_local_option_case_masks_the_node_hash_and_pins_the_rest() {
+        let cases = group();
+        let case = cases
+            .iter()
+            .find(|c| c.id == "etf/term_to_binary_local_masks_the_node_hash")
+            .expect("registered");
+        assert_eq!(case.contracts, &[Contract::BeamAsm]);
+        assert_eq!(case.kind_label(), "value");
+        assert_eq!(case.golden.exit_code, 0);
+
+        let expr = case.expr().expect("an expression case");
+        // The mask itself: skip VERSION_MAGIC + LOCAL_EXT (2 bytes), drop exactly the 4 hash
+        // bytes, and splice a zeroed 32-bit field back in their place.
+        assert!(
+            expr.contains(
+                "<<Pfx:2/binary, _Hash:4/binary, Tail/binary>> = B, \
+                 {byte_size(B), <<Pfx/binary, 0:32, Tail/binary>>"
+            ),
+            "the expression masks exactly the 4 node-hash bytes"
+        );
+        // The three bodies cover a small int, a compound term (atom + string + list) and a
+        // >32-element list, so the inner image length varies.
+        for needle in ["F(1)", "F({a,\"hello\",[1,2,3]})", "F(lists:seq(1,40))"] {
+            assert!(expr.contains(needle), "the expression covers {needle}");
+        }
+        // The round trip is asserted inside the expression (the real image decodes back).
+        assert!(expr.contains("binary_to_term(B) =:= T"));
+        // The expression must not bind a variable the probe wrapper binds (`V`, `C`, `R`).
+        assert!(
+            !expr.contains("R/") && !expr.contains("V =") && !expr.contains("C ="),
+            "the expression must not shadow the probe wrapper's own bindings"
+        );
+
+        let golden = case.golden.stdout.expect("golden");
+        assert!(golden.starts_with("ok ["), "{golden}");
+        // Every LOCAL_EXT position carries the zeroed stand-in `<<131,121,0,0,0,0,`.
+        let local = "<<131,121,0,0,0,0,";
+        assert_eq!(
+            golden.matches(local).count(),
+            3,
+            "one masked LOCAL_EXT image per covered term: {golden}"
+        );
+        // …and no other LOCAL_EXT prologue (i.e. an unmasked, unique hash) appears.
+        assert_eq!(golden.matches("<<131,121,").count(), 3, "{golden}");
+        for size in ["{8,", "{25,", "{49,"] {
+            assert!(golden.contains(size), "the image length {size} is pinned: {golden}");
+        }
+    }
+
+    /// The `local`-marked internal id case (A.2): the node atom of a local pid is `NIL_EXT`, so
+    /// the golden pins the masked prologue and the node-name-independent image length, and never
+    /// the pid's own id bytes.
+    #[test]
+    fn the_local_option_marks_a_local_pids_node_atom_as_nil_ext() {
+        let cases = group();
+        let case = cases
+            .iter()
+            .find(|c| c.id == "etf/term_to_binary_local_replaces_the_local_node_atom")
+            .expect("registered");
+        assert_eq!(case.contracts, &[Contract::BeamAsm]);
+        assert_eq!(case.kind_label(), "value");
+
+        let expr = case.expr().expect("an expression case");
+        for needle in [
+            "term_to_binary(self(), [local])",
+            "<<Pfx:2/binary, _Hash:4/binary, Tail/binary>> = B",
+            "<<Pfx/binary, 0:32, Tail/binary>>",
+            "binary:part(M, 0, 8)",
+            "binary_to_term(B) =:= self()",
+            "binary_to_term(B, [safe]) =:= self()",
+        ] {
+            assert!(expr.contains(needle), "the expression needs {needle:?}");
+        }
+        // The observable is the masked prologue, the length and the two round trips — never the
+        // pid's per-VM-start id/serial/creation bytes and never the node hash.
+        assert_eq!(
+            case.golden,
+            Golden {
+                stdout: Some("ok {20,<<131,121,0,0,0,0,88,106>>,true,true}"),
+                exit_code: 0,
+            }
+        );
     }
 }
