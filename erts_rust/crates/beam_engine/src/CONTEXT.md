@@ -93,11 +93,12 @@ The engine hands a host its root set through **exactly three** doors: `Machine::
 (`machine/frames.rs:283`). Every other engine→host call carries **no** root set, so a host that
 *allocated* inside it would relocate the young heap against unpublished roots. Those calls, with the
 state each holds in a Rust local across the call:
-- `ExecutionContext::resolve_local_fun` (`families/funs/mod.rs:325`) — the `fun` Eterm (from `x(arity)`
-  or the `call_fun2` operand, `:171-189`) and the `args` copy (`register_args`, `:275-280`).
+- `ExecutionContext::resolve_local_fun` (`families/funs/mod.rs` `fn call_fun`, the seam call at `:526`)
+  — the `fun` Eterm (read by `FunSource::read`, `:513`, from `x(arity)` or the `call_fun2` operand) and
+  the `args` copy (`fn register_args`, `:301`).
   `terms::fun_free(fun)` (`terms/fun.rs:247`) then re-reads the term's **raw heap storage** *after* the
   call, so a move in the seam would dangle both.
-- `ExecutionContext::apply_fun` (`:357`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
+- `ExecutionContext::apply_fun` (`:558`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
   here is the host's `with_relocation_exempt`, not publication.
 - `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments live in the
   `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch`
