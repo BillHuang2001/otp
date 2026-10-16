@@ -217,8 +217,8 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// ([`publish_roots_full`](crate::context::gc)) — so a collection over that machine
     /// relocates a live float register instead of dangling it, for *any* module. A float
     /// register left live at the end of a slice is additionally caught by the runner's
-    /// post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, which pins the
-    /// process permanently
+    /// post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, which opens a
+    /// per-slice relocation exemption cleared at the next slice entry — never a permanent pin
     /// ([`crate::runner`]). The guard the two GC doors still keep
     /// ([`module_may_be_collected`](crate::context::gc)) keys on the **caller's** module, so
     /// refusing here would refuse a float-using callee on account of a register file the full
