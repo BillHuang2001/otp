@@ -26,7 +26,6 @@
 //! holds the machine that runs it, and [`RunnerState`] is the whole table plus the
 //! outcomes every process recorded.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use beam_common::BeamError;
@@ -36,6 +35,7 @@ use beam_process::ProcessId;
 use beam_term::{Atom, Eterm};
 
 use crate::context::LocalFunTarget;
+use crate::hasher::FastHashMap;
 use crate::timers::TimerHandle;
 
 /// The entry point of one runtime-scheduled process: what to run, with which arguments.
@@ -205,11 +205,16 @@ pub(super) struct ProcessEngine {
 #[derive(Default)]
 pub(crate) struct RunnerState {
     /// The live engines, keyed by pid.
-    pub(super) engines: HashMap<ProcessId, ProcessEngine>,
+    ///
+    /// A [`FastHashMap`] (not `RandomState`'s SipHash): the map is only ever probed by pid
+    /// (`get`/`insert`/`remove` in this module, `runner/run.rs` and `runtime/scheduler.rs`), never
+    /// iterated for an observable order, and the keys are the runtime's own dense pids — see
+    /// [`crate::hasher`].
+    pub(super) engines: FastHashMap<ProcessId, ProcessEngine>,
     /// The `x(0)` of every process that ran to its `return`.
-    pub(super) results: HashMap<ProcessId, Eterm>,
+    pub(super) results: FastHashMap<ProcessId, Eterm>,
     /// The exit reason term of every process that finished by raising.
-    pub(super) exits: HashMap<ProcessId, Eterm>,
+    pub(super) exits: FastHashMap<ProcessId, Eterm>,
     /// The **original** [`BeamError`] of every process that finished by raising.
     ///
     /// [`RunnerState::exits`] keeps only the reason *term* — what the process table
@@ -219,7 +224,7 @@ pub(crate) struct RunnerState {
     /// `run` action recovers it with
     /// [`Runtime::take_process_error`](crate::runtime::Runtime::take_process_error), which
     /// makes the pumped, scheduler-driven path classify exactly like the single-pass one.
-    pub(super) errors: HashMap<ProcessId, BeamError>,
+    pub(super) errors: FastHashMap<ProcessId, BeamError>,
     /// The execution-tier selection mode, or `None` to use the environment default.
     ///
     /// `None` (the derived default) means "read `BEAM_RT_TIER` once" — see
@@ -356,5 +361,89 @@ impl RunnerState {
     /// docs). Taking consumes it: the first caller gets it, later ones get `None`.
     pub(crate) fn take_error(&mut self, pid: ProcessId) -> Option<BeamError> {
         self.errors.remove(&pid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use beam_term::{make_small, NIL};
+
+    use super::*;
+
+    /// The type pin for [`RunnerState::engines`]: the field really is the crate's fast-hashed map.
+    /// This stops compiling if it ever reverts to `RandomState`'s `HashMap`.
+    fn assert_fast_hashed(map: &FastHashMap<ProcessId, ProcessEngine>) -> usize {
+        map.len()
+    }
+
+    /// The same pin for the three outcome maps.
+    fn assert_fast_hashed_results(map: &FastHashMap<ProcessId, Eterm>) -> usize {
+        map.len()
+    }
+
+    /// The same pin for [`RunnerState::exits`].
+    fn assert_fast_hashed_exits(map: &FastHashMap<ProcessId, Eterm>) -> usize {
+        map.len()
+    }
+
+    /// The same pin for [`RunnerState::errors`].
+    fn assert_fast_hashed_errors(map: &FastHashMap<ProcessId, BeamError>) -> usize {
+        map.len()
+    }
+
+    /// `RunnerState`'s four `ProcessId`-keyed maps are over [`crate::hasher::FastHashMap`], not
+    /// `RandomState`'s SipHash.
+    ///
+    /// The soundness argument is what is pinned here, never a clock: every use of these four maps
+    /// is a keyed `get`/`get_mut`/`insert`/`remove`/`contains_key` — this module's own accessors,
+    /// `runner/run.rs`'s take/put of the executing engine and its recorded outcomes, and
+    /// `runtime/scheduler.rs`'s `take_error` — with no iteration whose order is observable. So a
+    /// cheaper hasher may change the probe cost and the (unobserved) order, and nothing else.
+    #[test]
+    fn the_runner_state_maps_are_fast_hashed() {
+        // A mixed corpus: two pids differing in the serial alone, plus boundary shapes.
+        let corpus = [
+            ProcessId::new(0, 0),
+            ProcessId::new(0, 1),
+            ProcessId::new(1, 0),
+            ProcessId::new(u64::MAX, u64::MAX),
+        ];
+        let mut state = RunnerState::default();
+        let mut reference: HashMap<ProcessId, ()> = HashMap::new();
+        for pid in corpus {
+            state.spawn_fun(pid, make_small(0), Vec::new());
+            reference.insert(pid, ());
+        }
+        state.results.insert(corpus[0], make_small(41));
+        state.exits.insert(corpus[1], NIL);
+        state.errors.insert(corpus[2], BeamError::BadArg);
+
+        // The maps hold exactly what was inserted (and each field is the pinned concrete type).
+        assert_eq!(assert_fast_hashed(&state.engines), reference.len());
+        assert_eq!(assert_fast_hashed_results(&state.results), 1);
+        assert_eq!(assert_fast_hashed_exits(&state.exits), 1);
+        assert_eq!(assert_fast_hashed_errors(&state.errors), 1);
+
+        // The verdicts agree with a default-hasher map: only the probe order is unobserved.
+        for pid in corpus {
+            assert_eq!(
+                state.contains(pid),
+                reference.contains_key(&pid),
+                "the engine membership verdict agrees for {pid:?}"
+            );
+        }
+        assert!(
+            !state.contains(ProcessId::new(7, 7)),
+            "a pid nobody spawned an engine for has none"
+        );
+        assert_eq!(state.result(corpus[0]), Some(make_small(41)));
+        assert_eq!(state.exit(corpus[1]), Some(NIL));
+        assert!(state.take_error(corpus[2]).is_some(), "the error is kept");
+        assert!(
+            state.take_error(corpus[2]).is_none(),
+            "and taking consumes it"
+        );
     }
 }
