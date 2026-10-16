@@ -121,7 +121,10 @@ fn contains_covers_exactly_the_region() {
     let base = s.base();
     assert!(s.contains(base));
     assert!(s.contains(base.wrapping_add(BLOCK_WORDS - 1)));
-    assert!(!s.contains(base.wrapping_add(BLOCK_WORDS)), "one past the end");
+    assert!(
+        !s.contains(base.wrapping_add(BLOCK_WORDS)),
+        "one past the end"
+    );
     assert!(!s.contains(base.wrapping_sub(1)), "one before the base");
     // `contains_term` only accepts boxed/list terms that land inside.
     assert!(!s.contains_term(make_small(1)));
@@ -273,7 +276,10 @@ fn a_collection_creates_a_reusable_hole() {
 
     assert_eq!(stats.objects_evacuated, 1);
     assert_eq!(stats.objects_pinned, 0);
-    assert_eq!(stats.blocks_reclaimed, 0, "the block still holds a live line");
+    assert_eq!(
+        stats.blocks_reclaimed, 0,
+        "the block still holds a live line"
+    );
     assert_eq!(stats.words_reclaimed, LINE_WORDS, "the garbage line");
     assert_eq!(s.used_lines(), 1);
 
@@ -317,7 +323,10 @@ fn release_un_claims_a_run_and_makes_it_allocatable_again() {
     assert_eq!(second, base.wrapping_add(7 * LINE_WORDS));
     assert_eq!(s.used_lines(), 14);
     assert_eq!(s.free_lines(), 2);
-    assert!(!s.can_reserve(100), "the two-line tail cannot hold a 7-line object");
+    assert!(
+        !s.can_reserve(100),
+        "the two-line tail cannot hold a 7-line object"
+    );
     assert!(unsafe { s.alloc_words(100) }.is_err(), "no run exists");
 
     // Un-claim the first run: the block keeps its second object and the whole first run is
@@ -327,7 +336,11 @@ fn release_un_claims_a_run_and_makes_it_allocatable_again() {
     assert_eq!(s.free_lines(), 9);
     assert!(s.can_reserve(100));
     assert_eq!(s.counters().lines_allocated(), 7);
-    assert_eq!(s.counters().blocks_partial, 1, "the block is still occupied");
+    assert_eq!(
+        s.counters().blocks_partial,
+        1,
+        "the block is still occupied"
+    );
 
     // The released lines are handed out again, at their original address.
     let reused = unsafe { s.alloc_words(100).unwrap() };
@@ -353,7 +366,11 @@ fn release_restores_a_whole_block_to_free() {
     // Un-claim every one of them: the block is empty again, i.e. `Free`, the state `claim`
     // found it in.
     for (i, p) in cells.iter().enumerate() {
-        assert_eq!(*p, base.wrapping_add(i * LINE_WORDS), "cell {i} is at its own line");
+        assert_eq!(
+            *p,
+            base.wrapping_add(i * LINE_WORDS),
+            "cell {i} is at its own line"
+        );
         s.release_words(*p, 1);
     }
     assert_eq!(s.used_lines(), 0);
@@ -550,11 +567,7 @@ fn out_of_space_references_are_left_verbatim() {
     let foreign = other.cons(make_small(9), make_small(8)).unwrap();
 
     // A boxed literal that lives outside every space, with the literal pointer bit set.
-    let external = [
-        make_arityval(2),
-        make_small(11),
-        make_small(22),
-    ];
+    let external = [make_arityval(2), make_small(11), make_small(22)];
     let literal = Eterm::from_raw(make_boxed(external.as_ptr()).raw() | TAG_LITERAL_PTR);
 
     let mut roots = [foreign, literal];

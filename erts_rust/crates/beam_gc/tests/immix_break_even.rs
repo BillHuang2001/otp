@@ -149,7 +149,9 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Takes the measurement lock for the rest of a test.
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The long-lived object shape (see the module docs).
@@ -332,8 +334,22 @@ struct Run {
 }
 
 /// The parts of a run that must be identical across repetitions (everything but the timing).
-fn count_signature(r: &Run) -> (MatureKind, GcStats, Option<ImmixStats>, usize, Option<usize>) {
-    (r.kind, r.stats, r.immix, r.footprint_words, r.footprint_lines)
+fn count_signature(
+    r: &Run,
+) -> (
+    MatureKind,
+    GcStats,
+    Option<ImmixStats>,
+    usize,
+    Option<usize>,
+) {
+    (
+        r.kind,
+        r.stats,
+        r.immix,
+        r.footprint_words,
+        r.footprint_lines,
+    )
 }
 
 /// Builds an `objects`-object long-lived corpus of `shape`, promotes it, offers the nursery
@@ -436,7 +452,10 @@ fn nanos(d: Duration) -> u64 {
 /// and returns the last run with its pause replaced by the **fastest** sample.
 fn measure(shape: Shape, objects: usize, kind: MatureKind) -> Run {
     let mut last = run_once(shape, objects, kind);
-    assert_eq!(last.kind, kind, "the config selected the requested strategy");
+    assert_eq!(
+        last.kind, kind,
+        "the config selected the requested strategy"
+    );
     let mut samples = Vec::with_capacity(REPS);
     samples.push(last.pause_ns);
     for rep in 1..REPS {
@@ -471,8 +490,7 @@ fn assert_size_point(shape: Shape, objects: usize, copying: &Run, immix: &Run) {
     // -- the copying path re-copies the whole live set, word for word ---------------------
     assert_eq!(copying.kind, MatureKind::Copying, "{label}");
     assert_eq!(
-        copying.moved_objects,
-        objects,
+        copying.moved_objects, objects,
         "{label}: the copying path copies every live object"
     );
     assert_eq!(
@@ -486,7 +504,10 @@ fn assert_size_point(shape: Shape, objects: usize, copying: &Run, immix: &Run) {
         objects * shape.words(),
         "{label}: the copying footprint is the exact live word count"
     );
-    assert_eq!(copying.footprint_lines, None, "{label}: not a line-granular space");
+    assert_eq!(
+        copying.footprint_lines, None,
+        "{label}: not a line-granular space"
+    );
 
     // -- the mark-region path promotes nothing: the nursery holds only garbage -----------
     assert_eq!(immix.kind, MatureKind::Immix, "{label}");
@@ -533,8 +554,7 @@ fn assert_size_point(shape: Shape, objects: usize, copying: &Run, immix: &Run) {
         "{label}: nothing in the mature generation is garbage"
     );
     assert_eq!(
-        immix.moved_objects,
-        law.evacuated_objects,
+        immix.moved_objects, law.evacuated_objects,
         "{label}: only the evacuated objects move"
     );
     assert_eq!(
@@ -556,7 +576,10 @@ fn assert_size_point(shape: Shape, objects: usize, copying: &Run, immix: &Run) {
 
     if law.full_blocks == 0 {
         // -- below one whole block nothing can be pinned ----------------------------------
-        assert_eq!(law.pinned_objects, 0, "{label}: no whole block, nothing to pin");
+        assert_eq!(
+            law.pinned_objects, 0,
+            "{label}: no whole block, nothing to pin"
+        );
         if shape.line_waste() > 0 {
             // Line rounding makes the mark-region path strictly dominated, not merely equal.
             assert!(
@@ -656,7 +679,10 @@ fn assert_rule_against_the_sweep(shape: Shape, points: &[(usize, Run, Run)]) {
                 law.lines * LINE_WORDS < IMMIX_BREAK_EVEN_WORDS,
                 "{shape:?} {objects}: a sub-block point must be below the break-even"
             );
-            assert_eq!(law.pinned_objects, 0, "{shape:?} {objects}: nothing is pinned");
+            assert_eq!(
+                law.pinned_objects, 0,
+                "{shape:?} {objects}: nothing is pinned"
+            );
         } else if law.remainder_lines == 0 {
             whole_block_points += 1;
             // The whole-block points carry the rule's positive half: the mark-region path

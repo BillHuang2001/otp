@@ -319,7 +319,11 @@ fn a_pinned_object_s_reference_is_evacuated_follows_the_copy() {
     assert_eq!(stats.objects_evacuated, 1);
     assert_eq!(stats.objects_pinned, LINES_PER_BLOCK);
     assert_eq!(stats.lines_pinned, LINES_PER_BLOCK);
-    assert_eq!(stats.words_pinned, 2 + 15 * 3, "one cons cell + fifteen tuples");
+    assert_eq!(
+        stats.words_pinned,
+        2 + 15 * 3,
+        "one cons cell + fifteen tuples"
+    );
     assert_eq!(stats.blocks_reclaimed, 1, "the wholly dead block");
     // ... and the pinned holder's word now names the copy, not the vacated address.
     // SAFETY: `roots[1]` is a live cons cell in this space.
@@ -332,7 +336,11 @@ fn a_pinned_object_s_reference_is_evacuated_follows_the_copy() {
         assert_eq!(*list_val(roots[1]).add(1), NIL);
     }
     for (i, root) in rest.iter().enumerate() {
-        assert_eq!(root.raw(), before[2 + i].raw(), "pinned object {i} stayed put");
+        assert_eq!(
+            root.raw(),
+            before[2 + i].raw(),
+            "pinned object {i} stayed put"
+        );
     }
     // 48 - 17 = 31 lines were freed: block 0's fifteen dead lines and the whole dead block,
     // plus the line the evacuated target left behind.

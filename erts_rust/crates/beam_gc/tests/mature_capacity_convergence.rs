@@ -150,7 +150,12 @@ unsafe fn tuple_pair(t: Eterm) -> (i64, i64) {
     assert_eq!(unsafe { tuple_size(t) }, 2, "the term is a 2-tuple");
     // SAFETY: `t` is a live 2-tuple, so elements 0 and 1 are within it (per this function's
     // contract); both are small integers the caller built with `tuple`.
-    unsafe { (signed_value(tuple_element(t, 0)), signed_value(tuple_element(t, 1))) }
+    unsafe {
+        (
+            signed_value(tuple_element(t, 0)),
+            signed_value(tuple_element(t, 1)),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +238,8 @@ fn the_mature_capacity_converges_under_the_default_cadence() {
         // ---- the converged constant: min == max for every sizing observable ----
         let (cap_min, cap_max) = min_max(&mature_caps);
         assert_eq!(
-            cap_min, cap_max,
+            cap_min,
+            cap_max,
             "{kind:?}: the mature capacity must converge to a constant under the default \
              cadence, got min {cap_min} != max {cap_max} (first/last: {} -> {}); the capacity \
              series is {mature_caps:?}",

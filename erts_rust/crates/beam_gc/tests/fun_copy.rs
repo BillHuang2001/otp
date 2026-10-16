@@ -509,7 +509,10 @@ fn external_fun_descriptor_arity_word_survives_a_copy() {
 
     // The root moved into the to-space, out of the from-space.
     let copied = roots[0];
-    assert!(to.contains_term(copied), "root must point into the to-space");
+    assert!(
+        to.contains_term(copied),
+        "root must point into the to-space"
+    );
     assert!(
         !from.contains_term(copied),
         "root must no longer point into the from-space"

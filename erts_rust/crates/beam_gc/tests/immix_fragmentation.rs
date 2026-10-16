@@ -47,8 +47,8 @@
 
 use beam_common::BeamError;
 use beam_gc::prelude::{
-    AnyCollector, CollectionKind, GcConfig, GenImmixCollector, HeapPolicy, HeapSpace, LINE_WORDS,
-    LINES_PER_BLOCK,
+    AnyCollector, CollectionKind, GcConfig, GenImmixCollector, HeapPolicy, HeapSpace,
+    LINES_PER_BLOCK, LINE_WORDS,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{make_small, AtomTable, Eterm};
@@ -89,7 +89,9 @@ fn policy(initial_mature_words: usize) -> HeapPolicy {
 /// Allocates an `elems`-element tuple whose elements are `tag * 1000 + i` in the nursery of
 /// `c`.
 fn tuple_for(c: &mut GenImmixCollector, elems: usize, tag: i64) -> Eterm {
-    let values: Vec<Eterm> = (0..elems as i64).map(|i| make_small(tag * 1000 + i)).collect();
+    let values: Vec<Eterm> = (0..elems as i64)
+        .map(|i| make_small(tag * 1000 + i))
+        .collect();
     c.young_mut()
         .heap_mut()
         .tuple(&values)
@@ -183,7 +185,8 @@ fn drive<C>(
     };
     for round in 0..rounds {
         let mut roots = build(c, elems, round);
-        let collection = collect(c, &mut roots).unwrap_or_else(|err| panic!("round {round}: {err:?}"));
+        let collection =
+            collect(c, &mut roots).unwrap_or_else(|err| panic!("round {round}: {err:?}"));
         if collection == CollectionKind::Major {
             state.majors += 1;
         }
@@ -191,7 +194,9 @@ fn drive<C>(
             let tag = round * 100 + i as i64;
             assert_tuple(*root, elems, tag);
             witness.reset();
-            let expected: Vec<Eterm> = (0..elems as i64).map(|j| make_small(tag * 1000 + j)).collect();
+            let expected: Vec<Eterm> = (0..elems as i64)
+                .map(|j| make_small(tag * 1000 + j))
+                .collect();
             let w = witness.tuple(&expected).expect("witness tuple");
             assert!(term_eq(*root, w, &atoms), "round {round}: root {i}");
         }
@@ -269,7 +274,11 @@ fn a_refused_promotion_leaves_both_spaces_byte_identical() {
         "the nursery is byte-identical: no forwarding marker, no rewritten slot"
     );
     assert_eq!(c.mature().used_words(), mature_words_before);
-    assert_eq!(c.mature().used_lines(), 112, "the mature region is untouched");
+    assert_eq!(
+        c.mature().used_lines(),
+        112,
+        "the mature region is untouched"
+    );
     assert_eq!(c.mature().free_lines(), 16);
     assert_eq!(c.stats().minor_collections, minors_before, "not counted");
     assert!(
@@ -326,7 +335,10 @@ fn a_promote_reclaim_cycle_reaches_a_bounded_steady_state() {
         state.peak_used_lines, 112,
         "the peak occupancy is the packed 2048-word region's 8 x 14 lines"
     );
-    assert_eq!(state.majors, 14, "the fragmented rounds escalated to fullsweeps");
+    assert_eq!(
+        state.majors, 14,
+        "the fragmented rounds escalated to fullsweeps"
+    );
     assert_eq!(c.stats().minor_collections, 50, "the rest stayed minors");
     println!(
         "steady state: capacity={} peak_used_lines={} majors={} minors={}",
@@ -369,7 +381,10 @@ fn larger_objects_reach_the_same_bounded_steady_state() {
         state.peak_used_lines, 72,
         "the peak occupancy is the packed 2048-word region's 8 x 9 lines"
     );
-    assert_eq!(state.majors, 11, "the fragmented rounds escalated to fullsweeps");
+    assert_eq!(
+        state.majors, 11,
+        "the fragmented rounds escalated to fullsweeps"
+    );
     println!(
         "large-object steady state: capacity={} peak_used_lines={} majors={}",
         state.capacity_words, state.peak_used_lines, state.majors
@@ -383,8 +398,8 @@ fn larger_objects_reach_the_same_bounded_steady_state() {
 #[test]
 fn the_strategy_seam_reaches_the_same_steady_state() {
     for (elems, rounds) in [(ELEMS, 64i64), (BIG_ELEMS, 48i64)] {
-        let mut c =
-            AnyCollector::from_config(&GcConfig::immix(policy(REGION_WORDS))).expect("immix collector");
+        let mut c = AnyCollector::from_config(&GcConfig::immix(policy(REGION_WORDS)))
+            .expect("immix collector");
         let state = drive(
             &mut c,
             elems,
@@ -393,8 +408,9 @@ fn the_strategy_seam_reaches_the_same_steady_state() {
                 (0..LIVE as i64)
                     .map(|i| {
                         let tag = round * 100 + i;
-                        let values: Vec<Eterm> =
-                            (0..elems as i64).map(|j| make_small(tag * 1000 + j)).collect();
+                        let values: Vec<Eterm> = (0..elems as i64)
+                            .map(|j| make_small(tag * 1000 + j))
+                            .collect();
                         c.young_mut()
                             .heap_mut()
                             .tuple(&values)

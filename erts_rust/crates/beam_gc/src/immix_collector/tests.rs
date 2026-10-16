@@ -112,8 +112,14 @@ fn minor_promotes_into_immix_and_empties_the_nursery() {
 
     assert_eq!(collection.kind, CollectionKind::Minor);
     assert_eq!(c.young().used_words(), 0, "the nursery is emptied");
-    assert_eq!(collection.stats.words_copied, 13, "only the live words move");
-    assert_eq!(collection.stats.objects_copied, 5, "outer + inner + 3 cells");
+    assert_eq!(
+        collection.stats.words_copied, 13,
+        "only the live words move"
+    );
+    assert_eq!(
+        collection.stats.objects_copied, 5,
+        "outer + inner + 3 cells"
+    );
     assert_eq!(c.stats().minor_collections, 1);
     assert_eq!(c.stats().major_collections, 0);
 
@@ -192,7 +198,11 @@ fn a_major_reclaims_dead_mature_objects() {
     let mut roots = [leaf];
     let collection = c.collect(&mut roots).expect("major");
 
-    assert_eq!(collection.kind, CollectionKind::Major, "fullsweep_after = 1");
+    assert_eq!(
+        collection.kind,
+        CollectionKind::Major,
+        "fullsweep_after = 1"
+    );
     // The old 5-object graph is gone; only the new leaf survives.
     assert!(c.mature().contains_term(roots[0]));
     assert_eq!(
@@ -200,7 +210,11 @@ fn a_major_reclaims_dead_mature_objects() {
         1,
         "the dead mature graph was reclaimed in place"
     );
-    assert_eq!(c.mature().free_lines(), 15, "the reclaimed lines are reusable");
+    assert_eq!(
+        c.mature().free_lines(),
+        15,
+        "the reclaimed lines are reusable"
+    );
 }
 
 #[test]
@@ -235,7 +249,11 @@ fn a_minor_that_would_not_fit_escalates_to_a_major() {
     let mut roots = live.clone();
     let second = c.collect(&mut roots).expect("escalated major");
 
-    assert_eq!(second.kind, CollectionKind::Major, "would-not-fit minor escalates");
+    assert_eq!(
+        second.kind,
+        CollectionKind::Major,
+        "would-not-fit minor escalates"
+    );
     assert_eq!(c.stats().major_collections, 1);
     for root in roots {
         assert!(c.mature().contains_term(root));
@@ -277,7 +295,11 @@ fn nursery_references_to_mature_objects_survive_a_major() {
     let mut roots = [holder];
     let collection = c.collect(&mut roots).expect("major");
 
-    assert_eq!(collection.kind, CollectionKind::Major, "fullsweep_after = 1");
+    assert_eq!(
+        collection.kind,
+        CollectionKind::Major,
+        "fullsweep_after = 1"
+    );
     let holder = roots[0];
     assert!(c.mature().contains_term(holder), "the holder was promoted");
 
@@ -348,6 +370,10 @@ fn collect_minor_reports_exhaustion_before_copying_anything() {
     let err = c.collect_minor(&mut roots).expect_err("must not fit");
     assert!(matches!(err, BeamError::Alloc(_)), "got {err:?}");
     assert_eq!(c.mature().used_lines(), 12, "nothing was copied");
-    assert_eq!(c.stats().minor_collections, 1, "the failed minor is not counted");
+    assert_eq!(
+        c.stats().minor_collections,
+        1,
+        "the failed minor is not counted"
+    );
     assert!(roots.iter().all(|r| c.young().contains_term(*r)));
 }

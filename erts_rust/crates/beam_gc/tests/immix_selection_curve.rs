@@ -88,7 +88,9 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Takes the measurement lock for the rest of a test.
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Nanoseconds of a pause (µs resolution is too coarse: most of these collections are well under
@@ -134,7 +136,8 @@ impl Obj {
                 .cons(make_small(id), make_small(2 * id + 1))
                 .expect("a cons cell"),
             Obj::Tuple(arity) => {
-                let elems: Vec<Eterm> = (0..arity).map(|k| make_small(id * 64 + k as i64)).collect();
+                let elems: Vec<Eterm> =
+                    (0..arity).map(|k| make_small(id * 64 + k as i64)).collect();
                 heap.tuple(&elems).expect("a tuple")
             }
         }
@@ -218,7 +221,16 @@ struct Run {
 
 /// The parts of a run that must be identical across repetitions of the same point (everything
 /// but the timing).
-fn count_signature(r: &Run) -> (MatureKind, GcStats, Option<ImmixStats>, usize, usize, Option<usize>) {
+fn count_signature(
+    r: &Run,
+) -> (
+    MatureKind,
+    GcStats,
+    Option<ImmixStats>,
+    usize,
+    usize,
+    Option<usize>,
+) {
     (
         r.kind,
         r.stats,
@@ -308,12 +320,19 @@ fn run_once(corpus: &Corpus, policy: &HeapPolicy, kind: MatureKind) -> (Run, Opt
         MatureKind::Copying => None,
         MatureKind::Immix => Some(promote_immix.is_some()),
     };
-    assert_eq!(roots.len(), corpus.objects(), "the roots survived promotion");
+    assert_eq!(
+        roots.len(),
+        corpus.objects(),
+        "the roots survived promotion"
+    );
     if let (MatureKind::Immix, Some(false)) = (kind, promote_in_place) {
         // A relocation still copies the whole live set — never a half-forwarded heap; the fresh
         // region is a real, non-empty space that now holds every live object.
         let (used, capacity, _lines) = mature_view(&c);
-        assert!(capacity > 0, "a relocated region is a fresh, non-empty space");
+        assert!(
+            capacity > 0,
+            "a relocated region is a fresh, non-empty space"
+        );
         assert!(used > 0, "the relocated region holds the promoted live set");
     }
 
@@ -347,7 +366,10 @@ fn run_once(corpus: &Corpus, policy: &HeapPolicy, kind: MatureKind) -> (Run, Opt
 /// the last run with its pause replaced by the **fastest** sample.
 fn measure(corpus: &Corpus, policy: &HeapPolicy, kind: MatureKind) -> (Run, Option<bool>) {
     let (mut last, promote_in_place) = run_once(corpus, policy, kind);
-    assert_eq!(last.kind, kind, "the config selected the requested strategy");
+    assert_eq!(
+        last.kind, kind,
+        "the config selected the requested strategy"
+    );
     let mut samples = Vec::with_capacity(REPS);
     samples.push(last.pause_ns);
     for rep in 1..REPS {
@@ -373,7 +395,10 @@ fn assert_same_graph(copying: &Run, immix: &Run) {
     let atoms = AtomTable::new();
     assert_eq!(copying.roots.len(), immix.roots.len(), "root count");
     for (i, (a, b)) in copying.roots.iter().zip(&immix.roots).enumerate() {
-        assert!(term_eq(*a, *b, &atoms), "root {i} differs across strategies");
+        assert!(
+            term_eq(*a, *b, &atoms),
+            "root {i} differs across strategies"
+        );
     }
 }
 
@@ -439,7 +464,13 @@ enum Dist {
 
 impl Dist {
     /// Every distribution the sweep covers.
-    const ALL: [Dist; 5] = [Dist::Cons, Dist::Small, Dist::Line, Dist::Multi, Dist::Mixed];
+    const ALL: [Dist; 5] = [
+        Dist::Cons,
+        Dist::Small,
+        Dist::Line,
+        Dist::Multi,
+        Dist::Mixed,
+    ];
 
     /// The object plan of [`AXIS1_LINES`] lines for this distribution.
     fn plan(self) -> Vec<Obj> {
@@ -494,7 +525,10 @@ impl Dist {
                     plan.push(obj);
                     lines += obj.lines();
                 }
-                assert_eq!(lines, AXIS1_LINES, "the mixed plan fills the live set exactly");
+                assert_eq!(
+                    lines, AXIS1_LINES,
+                    "the mixed plan fills the live set exactly"
+                );
                 plan
             }
         }
@@ -595,26 +629,39 @@ fn assert_axis1_point(dist: Dist, copying: &Run, immix: &Run) {
 
     // -- the copying path re-copies the whole live set, word for word -----------------------
     assert_eq!(copying.kind, MatureKind::Copying, "{label}");
-    assert_eq!(copying.moved_objects, corpus.objects(), "{label}: copies every live object");
+    assert_eq!(
+        copying.moved_objects,
+        corpus.objects(),
+        "{label}: copies every live object"
+    );
     assert_eq!(
         copying.moved_words,
         corpus.useful_words(),
         "{label}: copies the exact live word count"
     );
     assert_eq!(copying.pinned_objects, 0, "{label}: copying pins nothing");
-    assert_eq!(copying.used_words, corpus.useful_words(), "{label}: footprint = live words");
+    assert_eq!(
+        copying.used_words,
+        corpus.useful_words(),
+        "{label}: footprint = live words"
+    );
 
     // -- the mark-region path pins whole blocks and evacuates the trailing partial one ------
     assert_eq!(immix.kind, MatureKind::Immix, "{label}");
-    assert_eq!(immix.stats.objects_copied, 0, "{label}: the nursery held only garbage");
+    assert_eq!(
+        immix.stats.objects_copied, 0,
+        "{label}: the nursery held only garbage"
+    );
     assert_eq!(immix.stats.words_copied, 0, "{label}: nothing was promoted");
     let stats = immix
         .immix
         .unwrap_or_else(|| panic!("{label}: the fullsweep must reclaim in place"));
-    assert_eq!(stats.objects_pinned, law.pinned_objects, "{label}: whole blocks are pinned");
     assert_eq!(
-        stats.objects_evacuated,
-        law.evacuated_objects,
+        stats.objects_pinned, law.pinned_objects,
+        "{label}: whole blocks are pinned"
+    );
+    assert_eq!(
+        stats.objects_evacuated, law.evacuated_objects,
         "{label}: the trailing partial block is evacuated"
     );
     assert_eq!(
@@ -627,13 +674,21 @@ fn assert_axis1_point(dist: Dist, copying: &Run, immix: &Run) {
         law.full_blocks * LINES_PER_BLOCK,
         "{label}: pinned lines"
     );
-    assert_eq!(stats.lines_evacuated, law.remainder_lines, "{label}: evacuated lines");
-    assert_eq!(stats.words_pinned, law.pinned_words, "{label}: pinned words");
-    assert_eq!(stats.words_reclaimed, 0, "{label}: nothing in the mature generation is garbage");
+    assert_eq!(
+        stats.lines_evacuated, law.remainder_lines,
+        "{label}: evacuated lines"
+    );
+    assert_eq!(
+        stats.words_pinned, law.pinned_words,
+        "{label}: pinned words"
+    );
+    assert_eq!(
+        stats.words_reclaimed, 0,
+        "{label}: nothing in the mature generation is garbage"
+    );
     assert_eq!(stats.blocks_reclaimed, 0, "{label}: the live set is a root");
     assert_eq!(
-        immix.moved_objects,
-        law.evacuated_objects,
+        immix.moved_objects, law.evacuated_objects,
         "{label}: only the partial block's objects move"
     );
     // Moved work is measured in whole LINES — the same count for every object-size distribution.
@@ -645,8 +700,16 @@ fn assert_axis1_point(dist: Dist, copying: &Run, immix: &Run) {
     assert_eq!(immix.pinned_objects, law.pinned_objects, "{label}");
 
     // -- the mark-region footprint is the line-rounded occupancy ----------------------------
-    assert_eq!(immix.used_words, corpus.resident_line_words(), "{label}: resident line-words");
-    assert_eq!(immix.used_lines, Some(corpus.lines()), "{label}: resident lines");
+    assert_eq!(
+        immix.used_words,
+        corpus.resident_line_words(),
+        "{label}: resident line-words"
+    );
+    assert_eq!(
+        immix.used_lines,
+        Some(corpus.lines()),
+        "{label}: resident lines"
+    );
     assert!(
         immix.used_words >= copying.used_words,
         "{label}: line rounding can only over-state the live words"
@@ -655,7 +718,11 @@ fn assert_axis1_point(dist: Dist, copying: &Run, immix: &Run) {
 
 /// The axis-1 sweep: every distribution at the fixed, in-place mature size.
 fn sweep_axis1() {
-    assert_eq!(AXIS1_MATURE_WORDS % BLOCK_WORDS, 0, "the axis-1 capacity is whole blocks");
+    assert_eq!(
+        AXIS1_MATURE_WORDS % BLOCK_WORDS,
+        0,
+        "the axis-1 capacity is whole blocks"
+    );
     let policy = axis1_policy();
     assert_eq!(
         policy.mature_after_fullsweep(AXIS1_MATURE_WORDS, AXIS1_LINES * LINE_WORDS, 0),
@@ -690,7 +757,10 @@ fn sweep_axis1() {
         let moved_ratio = if immix.moved_words == 0 {
             "immix moved 0 words".to_string()
         } else {
-            format!("{:.2}×", copying.moved_words as f64 / immix.moved_words as f64)
+            format!(
+                "{:.2}×",
+                copying.moved_words as f64 / immix.moved_words as f64
+            )
         };
         println!(
             "    ratio: moved words copying/immix = {moved_ratio} | resident immix/copying = {:.2}× \
@@ -760,7 +830,10 @@ fn assert_axis2_immix(corpus: &Corpus, configured_words: usize, run: &Run) {
 
     match run.immix {
         Some(stats) => {
-            assert_eq!(run.stats.objects_copied, 0, "{label}: nursery held only garbage");
+            assert_eq!(
+                run.stats.objects_copied, 0,
+                "{label}: nursery held only garbage"
+            );
             assert_eq!(run.stats.words_copied, 0, "{label}: nothing was promoted");
             assert_eq!(
                 stats.objects_pinned,
@@ -768,8 +841,7 @@ fn assert_axis2_immix(corpus: &Corpus, configured_words: usize, run: &Run) {
                 "{label}: whole blocks are pinned"
             );
             assert_eq!(
-                stats.objects_evacuated,
-                remainder,
+                stats.objects_evacuated, remainder,
                 "{label}: the trailing partial block is evacuated"
             );
             assert_eq!(
@@ -777,7 +849,11 @@ fn assert_axis2_immix(corpus: &Corpus, configured_words: usize, run: &Run) {
                 corpus.objects(),
                 "{label}: every live object is accounted for exactly once"
             );
-            assert_eq!(stats.lines_pinned, full_blocks * LINES_PER_BLOCK, "{label}: pinned lines");
+            assert_eq!(
+                stats.lines_pinned,
+                full_blocks * LINES_PER_BLOCK,
+                "{label}: pinned lines"
+            );
             assert_eq!(stats.lines_evacuated, remainder, "{label}: evacuated lines");
             assert_eq!(stats.words_reclaimed, 0, "{label}: the live set is a root");
             assert_eq!(stats.blocks_reclaimed, 0, "{label}: the live set is a root");
@@ -787,7 +863,11 @@ fn assert_axis2_immix(corpus: &Corpus, configured_words: usize, run: &Run) {
                 "{label}: only the partial block is moved, line-rounded"
             );
             assert_eq!(run.moved_objects, remainder, "{label}");
-            assert_eq!(run.pinned_objects, full_blocks * objects_per_block, "{label}");
+            assert_eq!(
+                run.pinned_objects,
+                full_blocks * objects_per_block,
+                "{label}"
+            );
             assert_eq!(run.used_words, corpus.resident_line_words(), "{label}");
             assert_eq!(run.used_lines, Some(corpus.lines()), "{label}");
         }
@@ -914,7 +994,10 @@ fn break_even_verdict() {
 
     // The pure rule, in both directions.
     assert_eq!(select_mature(233), MatureKind::Copying);
-    assert_eq!(select_mature(IMMIX_BREAK_EVEN_WORDS - 1), MatureKind::Copying);
+    assert_eq!(
+        select_mature(IMMIX_BREAK_EVEN_WORDS - 1),
+        MatureKind::Copying
+    );
     assert_eq!(select_mature(IMMIX_BREAK_EVEN_WORDS), MatureKind::Immix);
 
     // The default configuration therefore resolves to the copying path, automatically.

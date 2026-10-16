@@ -92,7 +92,11 @@ fn assert_full_block_tuple(term: Eterm, base: i64) {
     // SAFETY: `term` is a live tuple this test (or a collection) built.
     let header = unsafe { *boxed_val(term) };
     assert!(is_arity_value(header), "not a tuple header");
-    assert_eq!(arityval(header), FULL_BLOCK_ARITY, "the tuple fills a block");
+    assert_eq!(
+        arityval(header),
+        FULL_BLOCK_ARITY,
+        "the tuple fills a block"
+    );
     for i in 0..FULL_BLOCK_ARITY {
         // SAFETY: elements 0..arity follow the validated header of a live tuple.
         let e = unsafe { *boxed_val(term).add(1 + i) };
@@ -142,8 +146,15 @@ fn a_nursery_reference_to_an_evacuated_mature_object_follows_it() {
     let minor = c.collect_minor(&mut roots).expect("the minor fits");
     assert_eq!(minor.objects_copied, 1);
     let m = roots[0];
-    assert!(c.mature().contains_term(m), "m was promoted into the mature space");
-    assert_eq!(c.mature().used_lines(), 1, "a Partial block: 1 of 16 lines live");
+    assert!(
+        c.mature().contains_term(m),
+        "m was promoted into the mature space"
+    );
+    assert_eq!(
+        c.mature().used_lines(),
+        1,
+        "a Partial block: 1 of 16 lines live"
+    );
     assert_eq!(c.mature().counters().blocks_partial, 1);
 
     // Step 2: a nursery holder whose element names the mature object — the young->mature
@@ -155,8 +166,14 @@ fn a_nursery_reference_to_an_evacuated_mature_object_follows_it() {
     c.collect_major(&mut roots).expect("the major fits");
 
     let (promoted, m_after) = (roots[0], roots[1]);
-    assert!(c.mature().contains_term(promoted), "the holder was promoted");
-    assert!(c.mature().contains_term(m_after), "the mature target survived");
+    assert!(
+        c.mature().contains_term(promoted),
+        "the holder was promoted"
+    );
+    assert!(
+        c.mature().contains_term(m_after),
+        "the mature target survived"
+    );
     assert_ne!(
         m_after.raw(),
         m.raw(),
@@ -170,10 +187,17 @@ fn a_nursery_reference_to_an_evacuated_mature_object_follows_it() {
         element, m_after,
         "the nursery slot was rewritten to the mature object's final address"
     );
-    assert_eq!(small_tuple_value(element), 42, "the target kept its content");
+    assert_eq!(
+        small_tuple_value(element),
+        42,
+        "the target kept its content"
+    );
 
     let immix = c.last_immix_stats().expect("the in-place reclaim ran");
-    assert_eq!(immix.objects_evacuated, 1, "the target was the one evacuated object");
+    assert_eq!(
+        immix.objects_evacuated, 1,
+        "the target was the one evacuated object"
+    );
     assert_eq!(c.mature().counters().lines_marked, 0, "marked is reset");
 }
 
@@ -201,31 +225,50 @@ fn several_nursery_slots_referencing_one_mature_object_are_all_rewritten() {
     let mut roots = [pair, single, cell, m];
     c.collect_major(&mut roots).expect("major");
 
-    let (pair_after, single_after, cell_after, m_after) =
-        (roots[0], roots[1], roots[2], roots[3]);
+    let (pair_after, single_after, cell_after, m_after) = (roots[0], roots[1], roots[2], roots[3]);
     assert!(c.mature().contains_term(pair_after));
     assert!(c.mature().contains_term(single_after));
     assert!(c.mature().contains_term(cell_after));
-    assert_ne!(m_after.raw(), m.raw(), "the shared target was evacuated once");
+    assert_ne!(
+        m_after.raw(),
+        m.raw(),
+        "the shared target was evacuated once"
+    );
 
     // SAFETY: `pair_after` is a live two-element tuple in the mature space.
     let (e0, e1) = unsafe { (*boxed_val(pair_after).add(1), *boxed_val(pair_after).add(2)) };
     assert_eq!(e0, m_after, "the pair's first slot names the final address");
-    assert_eq!(e1, m_after, "the pair's second slot names the same final address");
+    assert_eq!(
+        e1, m_after,
+        "the pair's second slot names the same final address"
+    );
     // SAFETY: `single_after` is a live one-element tuple in the mature space.
     let e2 = unsafe { *boxed_val(single_after).add(1) };
-    assert_eq!(e2, m_after, "the second holder's slot names the same final address");
+    assert_eq!(
+        e2, m_after,
+        "the second holder's slot names the same final address"
+    );
     // SAFETY: `cell_after` is a live cons cell in the mature space.
     assert!(is_list(cell_after), "the cons holder is LIST-tagged");
     let car = unsafe { *list_val(cell_after) };
-    assert_eq!(car, m_after, "the cons cell's car was rewritten to the same final address");
+    assert_eq!(
+        car, m_after,
+        "the cons cell's car was rewritten to the same final address"
+    );
     // SAFETY: the second word of the read cons cell is its cdr.
     assert_eq!(unsafe { *list_val(cell_after).add(1) }, NIL);
 
     // The shared target was evacuated exactly once, not once per referencing slot.
     let immix = c.last_immix_stats().expect("the in-place reclaim ran");
-    assert_eq!(immix.objects_evacuated, 1, "copied once, shared by every slot");
-    assert_eq!(small_tuple_value(m_after), 7, "the shared target kept its content");
+    assert_eq!(
+        immix.objects_evacuated, 1,
+        "copied once, shared by every slot"
+    );
+    assert_eq!(
+        small_tuple_value(m_after),
+        7,
+        "the shared target kept its content"
+    );
 }
 
 /// (c) The reference is **nested several levels deep** in the nursery graph: only the deepest
@@ -285,23 +328,35 @@ fn a_nursery_reference_to_a_pinned_mature_object_is_left_verbatim() {
         .heap_mut()
         .tuple(&elems)
         .expect("the fixture fits the nursery");
-    assert_eq!(c.young().used_words(), FULL_BLOCK_WORDS, "only the fixture is live");
+    assert_eq!(
+        c.young().used_words(),
+        FULL_BLOCK_WORDS,
+        "only the fixture is live"
+    );
 
     let mut roots = [big];
     let minor = c.collect_minor(&mut roots).expect("the block run fits");
     assert_eq!(minor.objects_copied, 1);
     let big = roots[0];
     assert!(c.mature().contains_term(big));
-    assert_eq!(c.mature().used_lines(), LINES_PER_BLOCK, "the whole block is live");
+    assert_eq!(
+        c.mature().used_lines(),
+        LINES_PER_BLOCK,
+        "the whole block is live"
+    );
 
     // A nursery holder naming the pinned mature object.
     let holder = c.young_mut().heap_mut().tuple(&[big]).expect("holder");
 
     let mut roots = [holder, big];
-    c.collect_major(&mut roots).expect("the major keeps the fixture");
+    c.collect_major(&mut roots)
+        .expect("the major keeps the fixture");
 
     let (holder_after, big_after) = (roots[0], roots[1]);
-    assert!(c.mature().contains_term(holder_after), "the holder was promoted");
+    assert!(
+        c.mature().contains_term(holder_after),
+        "the holder was promoted"
+    );
     assert_eq!(
         big_after.raw(),
         big.raw(),
@@ -309,7 +364,10 @@ fn a_nursery_reference_to_a_pinned_mature_object_is_left_verbatim() {
     );
 
     let immix = c.last_immix_stats().expect("the in-place reclaim ran");
-    assert_eq!(immix.objects_pinned, 1, "the fixture is pinned, not evacuated");
+    assert_eq!(
+        immix.objects_pinned, 1,
+        "the fixture is pinned, not evacuated"
+    );
     assert_eq!(immix.objects_evacuated, 0);
     assert_eq!(c.mature().counters().blocks_all_marked, 1);
 
@@ -347,7 +405,8 @@ fn a_nursery_reference_survives_a_relocating_fullsweep() {
     let holder = c.young_mut().heap_mut().tuple(&[m]).expect("holder");
 
     let mut roots = [holder, m];
-    c.collect_major(&mut roots).expect("the relocating fullsweep keeps the live set");
+    c.collect_major(&mut roots)
+        .expect("the relocating fullsweep keeps the live set");
 
     // The mature region was replaced, not reclaimed in place.
     assert_ne!(
@@ -366,15 +425,25 @@ fn a_nursery_reference_survives_a_relocating_fullsweep() {
     );
 
     let (holder_after, m_after) = (roots[0], roots[1]);
-    assert!(c.mature().contains_term(holder_after), "the holder is in the new region");
-    assert!(c.mature().contains_term(m_after), "the target is in the new region");
+    assert!(
+        c.mature().contains_term(holder_after),
+        "the holder is in the new region"
+    );
+    assert!(
+        c.mature().contains_term(m_after),
+        "the target is in the new region"
+    );
     // SAFETY: `holder_after` is a live one-element tuple in the new mature region.
     let element = unsafe { *boxed_val(holder_after).add(1) };
     assert_eq!(
         element, m_after,
         "the nursery reference resolves in the new region, not a stale one"
     );
-    assert_eq!(small_tuple_value(element), 21, "the target kept its content");
+    assert_eq!(
+        small_tuple_value(element),
+        21,
+        "the target kept its content"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +474,11 @@ fn line_bitmaps_are_consistent_and_freed_lines_are_reusable() {
     for i in 0..LINES_PER_BLOCK as i64 {
         let _ = s.tuple(&[make_small(700 + i)]).expect("garbage tuple");
     }
-    assert_eq!(s.used_lines(), 3 * LINES_PER_BLOCK, "every line is occupied");
+    assert_eq!(
+        s.used_lines(),
+        3 * LINES_PER_BLOCK,
+        "every line is occupied"
+    );
 
     let mut roots: Vec<Eterm> = Vec::with_capacity(1 + live.len());
     roots.push(big);
@@ -417,12 +490,31 @@ fn line_bitmaps_are_consistent_and_freed_lines_are_reusable() {
 
     // `marked` and `kept` are reset; `used_lines()` is the allocated popcount.
     let after = s.counters();
-    assert_eq!(after.lines_marked, 0, "the mark bitmap is reset after a collection");
+    assert_eq!(
+        after.lines_marked, 0,
+        "the mark bitmap is reset after a collection"
+    );
     let used_after = s.used_lines();
-    assert_eq!(used_after, LINES_PER_BLOCK + live.len(), "kept == live lines");
-    assert_eq!(used_after + s.free_lines(), s.line_count(), "used + free == total");
-    assert_eq!(after.lines_total - after.lines_free, used_after, "lines_free agrees");
-    assert_eq!(after.used_words, used_after * LINE_WORDS, "words == lines * LINE_WORDS");
+    assert_eq!(
+        used_after,
+        LINES_PER_BLOCK + live.len(),
+        "kept == live lines"
+    );
+    assert_eq!(
+        used_after + s.free_lines(),
+        s.line_count(),
+        "used + free == total"
+    );
+    assert_eq!(
+        after.lines_total - after.lines_free,
+        used_after,
+        "lines_free agrees"
+    );
+    assert_eq!(
+        after.used_words,
+        used_after * LINE_WORDS,
+        "words == lines * LINE_WORDS"
+    );
     assert_eq!(
         after.blocks_total,
         after.blocks_free + after.blocks_partial + after.blocks_all_marked,
@@ -455,10 +547,16 @@ fn line_bitmaps_are_consistent_and_freed_lines_are_reusable() {
     // lines. No survivor may be clobbered.
     let holes = s.free_lines();
     for i in 0..holes {
-        let _ = s.tuple(&[make_small(5_000 + i as i64)]).expect("a hole holds a line");
+        let _ = s
+            .tuple(&[make_small(5_000 + i as i64)])
+            .expect("a hole holds a line");
     }
     assert_eq!(s.free_lines(), 0, "every hole was handed back out");
-    assert_eq!(s.used_lines(), s.line_count(), "the space is completely full");
+    assert_eq!(
+        s.used_lines(),
+        s.line_count(),
+        "the space is completely full"
+    );
 
     // The survivors are byte-intact: the pinned block and every evacuated live tuple.
     assert_full_block_tuple(roots[0], 0);
@@ -503,19 +601,31 @@ fn a_pinned_block_is_released_by_neither_reclaim_nor_block_counting() {
     assert_full_block_tuple(roots[0], 0);
 
     let immix_after = s.counters();
-    assert_eq!(immix_after.blocks_all_marked, 1, "the pinned block is still fully live");
-    assert_eq!(immix_after.blocks_free, 2, "the dead block and the untouched block are free");
+    assert_eq!(
+        immix_after.blocks_all_marked, 1,
+        "the pinned block is still fully live"
+    );
+    assert_eq!(
+        immix_after.blocks_free, 2,
+        "the dead block and the untouched block are free"
+    );
 
     // Exactly one block was reclaimed — the wholly dead one, never the block holding the
     // pinned object.
-    assert_eq!(stats.blocks_reclaimed, 1, "only the wholly dead block is reclaimed");
+    assert_eq!(
+        stats.blocks_reclaimed, 1,
+        "only the wholly dead block is reclaimed"
+    );
     assert_eq!(stats.objects_evacuated, 0, "nothing was evacuated");
     assert_eq!(stats.objects_pinned, 1, "the whole-block object is pinned");
     assert_eq!(stats.lines_pinned, LINES_PER_BLOCK);
     assert_eq!(stats.words_pinned, FULL_BLOCK_WORDS);
 
     let after_used = s.used_lines();
-    assert_eq!(after_used, LINES_PER_BLOCK, "only the pinned block's lines survive");
+    assert_eq!(
+        after_used, LINES_PER_BLOCK,
+        "only the pinned block's lines survive"
+    );
     assert_eq!(
         after_used,
         before_used - LINES_PER_BLOCK,
@@ -531,7 +641,9 @@ fn a_pinned_block_is_released_by_neither_reclaim_nor_block_counting() {
     let holes = s.free_lines();
     assert_eq!(holes, 2 * LINES_PER_BLOCK);
     for i in 0..holes {
-        let _ = s.tuple(&[make_small(3_000 + i as i64)]).expect("a free line");
+        let _ = s
+            .tuple(&[make_small(3_000 + i as i64)])
+            .expect("a free line");
     }
     assert_eq!(s.free_lines(), 0, "every freed line is reusable");
     assert_full_block_tuple(roots[0], 0);
@@ -547,7 +659,11 @@ fn repeated_collections_over_an_unchanged_live_set_are_idempotent() {
     // Two whole-block objects, one per block: both blocks are fully live, so both pin.
     let a = s.tuple(&full_block_elems(0)).expect("a");
     let b = s.tuple(&full_block_elems(1_000)).expect("b");
-    assert_eq!(s.used_lines(), 2 * LINES_PER_BLOCK, "the space is entirely live");
+    assert_eq!(
+        s.used_lines(),
+        2 * LINES_PER_BLOCK,
+        "the space is entirely live"
+    );
 
     let mut roots = [a, b];
     let mut promoted: [Eterm; 0] = [];
@@ -555,16 +671,42 @@ fn repeated_collections_over_an_unchanged_live_set_are_idempotent() {
     let mut previous: Option<ImmixStats> = None;
     for round in 0..3 {
         let stats = s.collect(&mut roots, &mut promoted).expect("collect");
-        assert_eq!(roots[0].raw(), a.raw(), "pinned object a kept its address in round {round}");
-        assert_eq!(roots[1].raw(), b.raw(), "pinned object b kept its address in round {round}");
+        assert_eq!(
+            roots[0].raw(),
+            a.raw(),
+            "pinned object a kept its address in round {round}"
+        );
+        assert_eq!(
+            roots[1].raw(),
+            b.raw(),
+            "pinned object b kept its address in round {round}"
+        );
         assert_eq!(stats.objects_pinned, 2, "round {round}: both blocks pin");
         assert_eq!(stats.objects_evacuated, 0, "round {round}: nothing moves");
         assert_eq!(stats.lines_pinned, 2 * LINES_PER_BLOCK, "round {round}");
-        assert_eq!(stats.blocks_reclaimed, 0, "round {round}: nothing is reclaimed");
-        assert_eq!(stats.words_reclaimed, 0, "round {round}: no line is released");
-        assert_eq!(s.used_lines(), 2 * LINES_PER_BLOCK, "round {round}: occupancy unchanged");
-        assert_eq!(s.counters().blocks_all_marked, 2, "round {round}: both blocks pinned");
-        assert_eq!(s.counters().lines_marked, 0, "round {round}: marked is reset");
+        assert_eq!(
+            stats.blocks_reclaimed, 0,
+            "round {round}: nothing is reclaimed"
+        );
+        assert_eq!(
+            stats.words_reclaimed, 0,
+            "round {round}: no line is released"
+        );
+        assert_eq!(
+            s.used_lines(),
+            2 * LINES_PER_BLOCK,
+            "round {round}: occupancy unchanged"
+        );
+        assert_eq!(
+            s.counters().blocks_all_marked,
+            2,
+            "round {round}: both blocks pinned"
+        );
+        assert_eq!(
+            s.counters().lines_marked,
+            0,
+            "round {round}: marked is reset"
+        );
         if let Some(prev) = previous {
             assert_eq!(prev, stats, "round {round}: the collection is idempotent");
         }

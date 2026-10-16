@@ -160,7 +160,8 @@ impl Collector {
     /// as long as the nursery keeps being enlarged.
     pub fn collection_debt(&self) -> bool {
         self.nursery.retains_old_spaces()
-    }    /// Runs a collection, picking minor vs major by policy and escalating a
+    }
+    /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         let kind = if self.policy.fullsweep_due(self.minor_since_major)
@@ -250,11 +251,9 @@ impl Collector {
         let young_occupancy = self.nursery.used_words();
         // Grow, shrink or keep the current mature capacity
         // (`HeapPolicy::mature_after_fullsweep`, the C `adjust_after_fullsweep`).
-        let size = self.policy.mature_after_fullsweep(
-            self.mature.capacity_words(),
-            live,
-            young_occupancy,
-        );
+        let size =
+            self.policy
+                .mature_after_fullsweep(self.mature.capacity_words(), live, young_occupancy);
         let alloc = self.nursery().current().allocator().clone();
         // Sized up front so the copy always fits — a collection never leaves the
         // from-space half-forwarded. With `live` exact, this is an exact fit test rather

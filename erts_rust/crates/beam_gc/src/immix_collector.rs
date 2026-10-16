@@ -97,7 +97,8 @@
 use std::collections::HashSet;
 
 use beam_alloc::AllocRef;
-use beam_common::Result;use beam_term::prelude::{is_boxed, is_header, is_list, ptr_val, Eterm};
+use beam_common::Result;
+use beam_term::prelude::{is_boxed, is_header, is_list, ptr_val, Eterm};
 
 use crate::collector::{Collection, CollectionKind};
 use crate::config::GcConfig;
@@ -169,12 +170,7 @@ fn scan_young(roots: &[Eterm], young: &Nursery, mature: &ImmixSpace) -> Result<Y
 }
 
 /// Seeds the worklist with `term` when it is a live nursery-chained object.
-fn seed_young(
-    term: Eterm,
-    young: &Nursery,
-    seen: &mut HashSet<usize>,
-    work: &mut Vec<*mut Eterm>,
-) {
+fn seed_young(term: Eterm, young: &Nursery, seen: &mut HashSet<usize>, work: &mut Vec<*mut Eterm>) {
     if is_boxed(term) || is_list(term) {
         let ptr = ptr_val(term) as *const Eterm;
         if young.contains(ptr) && seen.insert(ptr as usize) {
@@ -341,15 +337,11 @@ impl GenImmixCollector {
                 // The region has the free lines but not the run an object of the promotion
                 // needs: the atomic attempt left nothing behind, so the same `needed`/`refs`
                 // drive the escalation the check above could not see.
-                PromoteOutcome::WouldNotFit => (
-                    CollectionKind::Major,
-                    self.run_major(roots, needed, refs)?,
-                ),
+                PromoteOutcome::WouldNotFit => {
+                    (CollectionKind::Major, self.run_major(roots, needed, refs)?)
+                }
             },
-            CollectionKind::Major => (
-                CollectionKind::Major,
-                self.run_major(roots, needed, refs)?,
-            ),
+            CollectionKind::Major => (CollectionKind::Major, self.run_major(roots, needed, refs)?),
         };
         self.accumulate(&stats, kind);
         Ok(Collection { kind, stats })
@@ -466,7 +458,10 @@ impl GenImmixCollector {
         let mut from = FromSet::new();
         self.nursery.add_to_from_set(&mut from); // every space of the chain
         let base = self.mature.base() as usize;
-        from.add_range(base, base + self.mature.capacity_words() * core::mem::size_of::<Eterm>());
+        from.add_range(
+            base,
+            base + self.mature.capacity_words() * core::mem::size_of::<Eterm>(),
+        );
         crate::reachable::for_each_reachable(&from, roots, visit)
     }
 
@@ -490,7 +485,10 @@ impl GenImmixCollector {
         let mut from = FromSet::new();
         self.nursery.add_to_from_set(&mut from); // every space of the chain
         let base = self.mature.base() as usize;
-        from.add_range(base, base + self.mature.capacity_words() * core::mem::size_of::<Eterm>());
+        from.add_range(
+            base,
+            base + self.mature.capacity_words() * core::mem::size_of::<Eterm>(),
+        );
         crate::reachable::for_each_reachable_view(&from, roots, visit)
     }
 
@@ -594,7 +592,11 @@ impl GenImmixCollector {
         // reclaim's work is intact and the nursery is un-forwarded — so the same fallback
         // answers it.
         let used = self.nursery.used_words();
-        match promote(&PromoteFrom::new(&self.nursery, None), &mut self.mature, roots)? {
+        match promote(
+            &PromoteFrom::new(&self.nursery, None),
+            &mut self.mature,
+            roots,
+        )? {
             PromoteOutcome::Done(mut stats) => {
                 let nursery_garbage = used.saturating_sub(stats.words_copied);
                 // Total words reclaimed: the mature generation's in-place reclaim plus the

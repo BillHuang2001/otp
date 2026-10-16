@@ -178,7 +178,10 @@ fn fragmented(m: usize, k: usize, cap: usize) -> Case {
 fn a_capped_region_reports_a_typed_heap_exhaustion_and_promotes_nothing() {
     let mut case = fragmented(12, 8, ONE_BLOCK_WORDS);
     let region = case.collector.mature().capacity_words();
-    assert_eq!(region, ONE_BLOCK_WORDS, "the cap keeps the one-block region");
+    assert_eq!(
+        region, ONE_BLOCK_WORDS,
+        "the cap keeps the one-block region"
+    );
     assert_eq!(case.collector.mature().free_lines(), LINES_PER_REGION - 12);
 
     let nursery_before = case.roots[case.mature_roots..].to_vec();
@@ -254,12 +257,19 @@ fn the_identical_corpus_succeeds_once_the_policy_may_grow() {
         0,
         "the nursery was evacuated"
     );
-    assert_eq!(case.collector.minor_gcs(), 0, "the fullsweep resets the counter");
+    assert_eq!(
+        case.collector.minor_gcs(),
+        0,
+        "the fullsweep resets the counter"
+    );
     assert!(
         case.collector.last_immix_stats().is_none(),
         "the region was relocated, so no in-place reclaim ran"
     );
-    assert_eq!(stats.objects_copied, 20, "12 mature + 8 nursery tuples moved");
+    assert_eq!(
+        stats.objects_copied, 20,
+        "12 mature + 8 nursery tuples moved"
+    );
     assert_eq!(
         case.collector.stats().major_collections,
         1,
@@ -367,9 +377,7 @@ fn an_unbounded_policy_never_fails_a_garbage_free_fullsweep() {
 ///
 /// Returns the kind of the **second** fullsweep — the one whose promotion cannot fit the
 /// capped one-block region — after the first promoted the 12-tuple base.
-fn two_full_sweeps_through_the_seam(
-    cap: usize,
-) -> std::result::Result<CollectionKind, BeamError> {
+fn two_full_sweeps_through_the_seam(cap: usize) -> std::result::Result<CollectionKind, BeamError> {
     use beam_gc::prelude::{AnyCollector, GcConfig, MatureKind};
 
     let policy = HeapPolicy {
@@ -396,7 +404,11 @@ fn two_full_sweeps_through_the_seam(
     }
     let second = c.collect(&mut roots)?;
 
-    assert_eq!(c.young().used_words(), 0, "the fullsweep emptied the nursery");
+    assert_eq!(
+        c.young().used_words(),
+        0,
+        "the fullsweep emptied the nursery"
+    );
     assert_pairs_intact(&roots, &expected);
     Ok(second.kind)
 }

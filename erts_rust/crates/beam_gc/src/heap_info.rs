@@ -151,7 +151,13 @@ impl HeapInfo {
     pub fn items(&self) -> [(&'static str, usize); 5] {
         let values = self.values();
         let [a, b, c, d, e] = GARBAGE_COLLECTION_KEYS;
-        [(a, values[0]), (b, values[1]), (c, values[2]), (d, values[3]), (e, values[4])]
+        [
+            (a, values[0]),
+            (b, values[1]),
+            (c, values[2]),
+            (d, values[3]),
+            (e, values[4]),
+        ]
     }
 }
 #[cfg(test)]

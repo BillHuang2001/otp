@@ -114,7 +114,11 @@ fn growth_preserves_live_terms_at_their_original_address_without_collecting() {
         let minor_before = c.minor_gcs();
         let cap_before = c.young().capacity_words();
         assert!(used_before > 0, "{kind:?}: the graph is live");
-        assert_eq!(c.young_space_count(), 1, "{kind:?}: a single space to begin with");
+        assert_eq!(
+            c.young_space_count(),
+            1,
+            "{kind:?}: a single space to begin with"
+        );
 
         let need = 4096usize;
         assert!(
@@ -283,7 +287,10 @@ fn the_chain_collapses_to_one_space_and_young_contains_covers_every_space() {
         // ... and neither a foreign (stack) address nor an out-of-space address.
         let local = make_small(0);
         let foreign = core::ptr::addr_of!(local) as *const Eterm;
-        assert!(!c.young_contains(foreign), "{kind:?}: a foreign address is not");
+        assert!(
+            !c.young_contains(foreign),
+            "{kind:?}: a foreign address is not"
+        );
         let just_outside = c.young().limit() as *const Eterm;
         assert!(
             !c.young_contains(just_outside),
@@ -320,8 +327,14 @@ fn the_chain_collapses_to_one_space_and_young_contains_covers_every_space() {
 
         // `should_collect(need)` is exactly "the current space cannot satisfy `need`".
         let avail = c.young().available_words();
-        assert!(c.should_collect(avail + 1), "{kind:?}: one more word does not fit");
-        assert!(!c.should_collect(avail), "{kind:?}: an exact fit still fits");
+        assert!(
+            c.should_collect(avail + 1),
+            "{kind:?}: one more word does not fit"
+        );
+        assert!(
+            !c.should_collect(avail),
+            "{kind:?}: an exact fit still fits"
+        );
         assert!(!c.should_collect(0), "{kind:?}: zero words always fit");
     }
 }
@@ -358,7 +371,11 @@ fn grow_nursery_leaves_the_collector_untouched_when_the_ceiling_cannot_reach() {
             spaces_before,
             "{kind:?}: nothing was retired"
         );
-        assert_eq!(c.young().used_words(), used_before, "{kind:?}: nothing allocated");
+        assert_eq!(
+            c.young().used_words(),
+            used_before,
+            "{kind:?}: nothing allocated"
+        );
         assert_eq!(c.stats(), stats_before, "{kind:?}: nothing collected");
 
         // The live term is untouched.
@@ -422,7 +439,9 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
         }
 
         // A `need`-word tuple: `need - 1` element words plus the header.
-        let elems: Vec<Eterm> = (0..need - 1).map(|i| make_small((i % 1000) as i64)).collect();
+        let elems: Vec<Eterm> = (0..need - 1)
+            .map(|i| make_small((i % 1000) as i64))
+            .collect();
         let tuple = tuple_in(c.young_mut(), &elems);
 
         let mut roots = vec![tuple];

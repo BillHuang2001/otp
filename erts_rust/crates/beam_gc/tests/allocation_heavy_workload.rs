@@ -325,9 +325,9 @@ struct Run {
 impl Run {
     /// Objects and words the run copied, over every collection.
     fn moved(&self) -> (usize, usize) {
-        self.samples
-            .iter()
-            .fold((0, 0), |(o, w), s| (o + s.objects_copied, w + s.words_copied))
+        self.samples.iter().fold((0, 0), |(o, w), s| {
+            (o + s.objects_copied, w + s.words_copied)
+        })
     }
 
     /// Words the run reclaimed, over every collection.
@@ -695,7 +695,10 @@ fn assert_cross_strategy(copying: &Run, immix: &Run, atoms: &AtomTable) {
     assert_eq!(copying.long_lived.len(), LONG_LIVED);
     assert_eq!(immix.long_lived.len(), LONG_LIVED);
     for (i, (a, b)) in copying.long_lived.iter().zip(&immix.long_lived).enumerate() {
-        assert!(term_eq(*a, *b, atoms), "long-lived root {i} differs across strategies");
+        assert!(
+            term_eq(*a, *b, atoms),
+            "long-lived root {i} differs across strategies"
+        );
     }
     let words: usize = copying.long_lived.iter().map(|&t| size_object(t)).sum();
     assert_eq!(
@@ -703,7 +706,11 @@ fn assert_cross_strategy(copying: &Run, immix: &Run, atoms: &AtomTable) {
         "the independently measured footprint of the surviving set"
     );
     for (i, &root) in immix.long_lived.iter().enumerate() {
-        assert_eq!(size_object(root), LONG_LIVED_ARITY + 1, "root {i} is one line");
+        assert_eq!(
+            size_object(root),
+            LONG_LIVED_ARITY + 1,
+            "root {i} is one line"
+        );
         let base = (i as i64) * LONG_LIVED_ARITY as i64;
         assert_eq!(tuple_element(root, 0), base, "root {i}: first element");
         assert_eq!(

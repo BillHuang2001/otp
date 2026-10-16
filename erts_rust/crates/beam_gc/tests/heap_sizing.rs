@@ -46,12 +46,10 @@
 use std::process::Command;
 
 use beam_gc::prelude::{
-    heap_sizes, next_heap_size, AnyCollector, CollectionKind, GARBAGE_COLLECTION_KEYS, GcConfig,
-    HeapInfo, HeapPolicy, MatureKind, DEFAULT_MIN_HEAP_WORDS,
+    heap_sizes, next_heap_size, AnyCollector, CollectionKind, GcConfig, HeapInfo, HeapPolicy,
+    MatureKind, DEFAULT_MIN_HEAP_WORDS, GARBAGE_COLLECTION_KEYS,
 };
-use beam_term::prelude::{
-    arityval, boxed_val, is_arity_value, make_small, signed_value, Eterm,
-};
+use beam_term::prelude::{arityval, boxed_val, is_arity_value, make_small, signed_value, Eterm};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -90,7 +88,9 @@ fn read_tuple(term: Eterm) -> Vec<Eterm> {
     assert!(is_arity_value(header), "not a tuple header");
     let n = arityval(header);
     // SAFETY: elements `1..=n` lie inside the `n`-element tuple just validated.
-    (0..n).map(|i| unsafe { *boxed_val(term).add(1 + i) }).collect()
+    (0..n)
+        .map(|i| unsafe { *boxed_val(term).add(1 + i) })
+        .collect()
 }
 
 /// The small-integer values of a tuple of smalls.
@@ -155,7 +155,10 @@ fn curated_growth_table_and_spawn_rounding_via_the_public_api() {
     // `ASSERT(p->min_heap_size == erts_next_heap_size(p->min_heap_size, 0))`).
     for request in [0usize, 233, 234, 500, 1_000, 46_422, 100_000] {
         let policy = HeapPolicy::from_spawn_opts(request, request, 0);
-        assert_eq!(policy.min_heap_words, next_heap_size(policy.min_heap_words, 0));
+        assert_eq!(
+            policy.min_heap_words,
+            next_heap_size(policy.min_heap_words, 0)
+        );
         assert_eq!(
             policy.min_bin_vheap_words,
             next_heap_size(policy.min_bin_vheap_words, 0)
@@ -310,7 +313,11 @@ fn the_minimum_floors_and_the_maximum_clamps_a_real_resize() {
     let t = build_tuple(&mut c, &[make_small(1)]);
     let mut roots = vec![t];
     c.collect(&mut roots).expect("collect");
-    assert_eq!(mature_capacity(&c), 376, "the minimum floors the grown target");
+    assert_eq!(
+        mature_capacity(&c),
+        376,
+        "the minimum floors the grown target"
+    );
 
     // `max_heap_words` clamps a would-be grow (41 live + 64 reserve needs 105 -> curated
     // 142, capped to 100).
@@ -325,7 +332,11 @@ fn the_minimum_floors_and_the_maximum_clamps_a_real_resize() {
     let t = build_tuple(&mut c, &elems);
     let mut roots = vec![t];
     c.collect(&mut roots).expect("collect");
-    assert_eq!(mature_capacity(&c), 100, "the maximum clamps the grown target");
+    assert_eq!(
+        mature_capacity(&c),
+        100,
+        "the maximum clamps the grown target"
+    );
     assert_eq!(tuple_smalls(roots[0]), (0..40i64).collect::<Vec<_>>());
 }
 

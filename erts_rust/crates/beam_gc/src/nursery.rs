@@ -29,6 +29,17 @@
 //! the allocator at a fresh, larger one: live words stay addressable at their original
 //! address and nothing is moved.
 //!
+//! Two properties keep the chain from becoming a cost:
+//!
+//! * **Containment is indexed, not scanned.** [`contains`](Nursery::contains) — the per-word
+//!   range test a host's *unscanned-root* valve runs at every heap admission — answers from
+//!   an ordered index of the retired spaces' live regions plus one direct test of the current
+//!   space, so it is `O(log #spaces)` rather than a walk over every space.
+//! * **The chain is bounded.** [`grow`](Nursery::grow) never installs a space no larger than
+//!   the one it replaces (at minimum a doubling), so a growth loop that keeps enlarging an
+//!   equally-full space climbs the growth table geometrically: the chain is `O(log(heap))`
+//!   long instead of gaining one ≈same-size space per call.
+//!
 //! Every superseded space is **retained until a collection evacuates it**, never freed by the
 //! growth itself: it may hold live words (they were handed to the mutator) and only a
 //! [collection](Nursery::collapse) proves them dead. Nothing in this module ever frees a
@@ -41,12 +52,15 @@
 //! [`Nursery::collapse`] drops the retired spaces and re-sizes the single remaining current
 //! space — the chain is exactly one space before any mutator allocates again. While a chain
 //! is live, every space is part of the nursery: [`spaces`](Nursery::spaces) enumerates them
-//! all, [`contains`](Nursery::contains) tests every one, and
+//! all, [`contains`](Nursery::contains) covers every one — the current space directly and the
+//! retired ones through its ordered index — and
 //! [`add_to_from_set`](Nursery::add_to_from_set) adds every live region to a collection's
 //! from-set, so a collection evacuates a chained nursery whole.
 //!
 //! This module is safe Rust — it only manipulates [`HeapSpace`] values; `unsafe` stays
 //! confined to the word-level modules of the crate.
+
+use std::collections::BTreeMap;
 
 use beam_alloc::AllocRef;
 use beam_common::Result;
@@ -64,6 +78,24 @@ pub(crate) struct Nursery {
     /// The spaces a growth retired, oldest first. Their live words are still addressable and
     /// are still part of the nursery (a collection evacuates them; a range test covers them).
     retired: Vec<HeapSpace>,
+    /// The retired spaces' live regions `[base, top)`, keyed by **base byte address** — the
+    /// containment index [`contains`](Nursery::contains) consults.
+    ///
+    /// *Why it is exact:* every space is a **distinct live allocation**, so the intervals
+    /// `[base, top)` are pairwise **disjoint**; sorted by base they are therefore
+    /// non-overlapping, and the greatest base `<= addr` is the only candidate — `addr < top`
+    /// decides it exactly, with the same half-open semantics as
+    /// [`HeapSpace::contains`] (`top` is exclusive).
+    ///
+    /// *Why an entry never goes stale:* nothing is ever allocated in a retired space, so its
+    /// `top` is **frozen** from the moment it is retired until [`collapse`](Nursery::collapse)
+    /// drops it (and clears this map with it). The current space is the only one whose `top`
+    /// moves, and it is tested directly instead of being indexed.
+    ///
+    /// The map mirrors `retired` exactly (all live spaces default to a real allocation and
+    /// therefore distinct bases); a same-`base` insert could only come from a zero-capacity
+    /// space — an empty live region for which both entries answer `false` identically.
+    retired_regions: BTreeMap<usize, usize>,
 }
 
 impl Nursery {
@@ -73,6 +105,7 @@ impl Nursery {
         Ok(Nursery {
             current: HeapSpace::with_allocator(alloc, capacity_words)?,
             retired: Vec::new(),
+            retired_regions: BTreeMap::new(),
         })
     }
 
@@ -122,8 +155,23 @@ impl Nursery {
 
     /// Whether `ptr` addresses a word of **any** nursery space — current or a retired space a
     /// growth retained.
+    ///
+    /// This is the range test a host's unscanned-root valve evaluates **per reference word
+    /// and per heap admission**, so it is answered in `O(log #spaces)`: the current space
+    /// directly (it is the only one whose `top` moves) and the retired spaces from the
+    /// ordered [`retired_regions`](Nursery::retired_regions) index. It is **exactly** the
+    /// predicate `spaces().any(|space| space.contains(ptr))` for every address — the retired
+    /// regions are disjoint, so the greatest base at or below the address is the only
+    /// candidate ([`retired_regions`](Nursery::retired_regions)).
     pub(crate) fn contains(&self, ptr: *const Eterm) -> bool {
-        self.spaces().any(|space| space.contains(ptr))
+        if self.current.contains(ptr) {
+            return true;
+        }
+        let addr = ptr as usize;
+        self.retired_regions
+            .range(..=addr)
+            .next_back()
+            .is_some_and(|(&_base, &top)| addr < top)
     }
 
     /// Adds the live region of **every** nursery space to `from`, so a collection evacuates the
@@ -148,40 +196,57 @@ impl Nursery {
     /// space outside `collapse`. Dropping a provably empty (`used_words() == 0`) superseded
     /// space would be sound, but it changes `space_count`, so it is deliberately not done.
     ///
-    /// The fresh space is the smallest size the policy allows that covers the request
-    /// (`policy.next_words(need_words, 0)`, never smaller than the space it replaces); when the
-    /// current space already has room the call is a no-op. The growth is **bounded to one
-    /// step**, and a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
-    /// that cannot reach the request yields the typed
-    /// [`BeamError::Alloc`](beam_common::BeamError::Alloc) and leaves the nursery untouched —
-    /// the current space is not replaced and nothing is retired.
+    /// The fresh space is the smallest size the policy allows that covers the request **and
+    /// never a space no larger than the one it replaces**: the request
+    /// (`policy.next_words(need_words, 0)`), the **doubling** of the current capacity
+    /// (`policy.next_words(2 * capacity, 0)`), whichever is larger, floored by the current
+    /// capacity — all bounded by [`min_heap_words`](HeapPolicy::min_heap_words) and
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) through
+    /// [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling. A `grow` only
+    /// runs when the current space is (nearly) full, so the ladder is a doubling one: a growth
+    /// loop that keeps enlarging an equally-full space walks the growth table geometrically
+    /// and the chain of retired spaces stays `O(log(heap))` long, instead of gaining one
+    /// ≈same-size space — and one whole retained capacity — per call.
+    ///
+    /// When the current space already has room the call is a no-op. A
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling that cannot
+    /// reach the request yields the typed [`BeamError::Alloc`](beam_common::BeamError::Alloc)
+    /// and leaves the nursery untouched — the current space is not replaced and nothing is
+    /// retired. (A ceiling that can cover the request but forbids the doubling step installs
+    /// the largest space it allows, which is the only size left to it.)
     pub(crate) fn grow(&mut self, policy: &HeapPolicy, need_words: usize) -> Result<()> {
         if self.current.available_words() >= need_words {
             return Ok(());
         }
-        let target = policy
-            .next_words(need_words, 0)
-            .max(self.current.capacity_words());
+        let capacity = self.current.capacity_words();
+        // At minimum a doubling: a growth replaces a (nearly full) space, so never handing
+        // back a space of the same size is what bounds the chain logarithmically.
+        let request = need_words.max(capacity.saturating_mul(2));
+        let target = policy.next_words(request, 0).max(capacity);
         if target < need_words {
             return Err(heap_exhausted(need_words));
         }
         let fresh = HeapSpace::with_allocator(self.current.allocator().clone(), target)?;
         let old = core::mem::replace(&mut self.current, fresh);
+        self.retired_regions
+            .insert(old.base() as usize, old.top() as usize);
         self.retired.push(old);
         Ok(())
     }
     /// Collapses the chain back to **exactly one** space, after a collection has evacuated
     /// every space.
     ///
-    /// It drops the retired spaces and re-sizes the single remaining current space from the
-    /// heap-size policy ([`HeapPolicy::young_after_collection`]) over the capacity the chain
-    /// held when it was collected, where `live_words` is what the collection left in the
-    /// nursery (the promoted words for a minor, `0` after a fullsweep). The space is only
-    /// replaced when the target differs; otherwise its bump pointer is merely rewound.
+    /// It drops the retired spaces (and their containment index) and re-sizes the single
+    /// remaining current space from the heap-size policy
+    /// ([`HeapPolicy::young_after_collection`]) over the capacity the chain held when it was
+    /// collected, where `live_words` is what the collection left in the nursery (the promoted
+    /// words for a minor, `0` after a fullsweep). The space is only replaced when the target
+    /// differs; otherwise its bump pointer is merely rewound.
     pub(crate) fn collapse(&mut self, policy: &HeapPolicy, live_words: usize) -> Result<()> {
         let collected_capacity = self.capacity_words();
         let target = policy.young_after_collection(collected_capacity, live_words);
         self.retired.clear();
+        self.retired_regions.clear();
         if self.current.capacity_words() == target {
             self.current.reset();
         } else {
@@ -189,5 +254,195 @@ impl Nursery {
             self.current = HeapSpace::with_allocator(alloc, target)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the nursery chain's three invariants: the containment index mirrors the
+    //! retired spaces **exactly**, the range test it answers is exactly
+    //! `spaces().any(|space| space.contains(ptr))`, and a growth neither collects, moves nor
+    //! frees anything. The index is what keeps the range test independent of the chain's
+    //! length, so it is pinned over a chain far longer than any hand-written case would build.
+
+    use beam_alloc::registry::default_allocator;
+    use beam_term::prelude::{make_small, ptr_val};
+
+    use super::*;
+
+    /// The capacity of **every** space of the test chain, in term words — and the policy's
+    /// `max_heap_words` ceiling, so a growth is clamped to a space of exactly the size it
+    /// replaces: the one shape a caller can use to make the chain arbitrarily long through the
+    /// growth seam alone (a real heap's doubling ladder tops out at the growth table's
+    /// ceiling).
+    const CAP: usize = 90;
+
+    /// Retired spaces the test builds before it samples the range test.
+    const RETIRED: usize = 1024;
+
+    /// A policy whose growth ceiling pins every space to [`CAP`] words.
+    fn capped() -> HeapPolicy {
+        HeapPolicy {
+            max_heap_words: CAP,
+            initial_young_words: CAP,
+            ..HeapPolicy::default()
+        }
+    }
+
+    /// Grows the chain by [`RETIRED`] retired spaces, reporting each retired space's live region
+    /// `[base, top)` as it stood immediately before the growth that retired it.
+    fn build_chain(nursery: &mut Nursery) -> Vec<(usize, usize)> {
+        let policy = capped();
+        let mut regions = Vec::with_capacity(RETIRED);
+        for i in 0..RETIRED {
+            // Hand the mutator `1 + i % 4` words, so the retired regions' live extents (and
+            // therefore their `top`s) differ — the range test must read each one's own `top`.
+            let elems: Vec<Eterm> = (0..(i % 4)).map(|k| make_small(k as i64)).collect();
+            nursery
+                .current_mut()
+                .heap_mut()
+                .tuple(&elems)
+                .unwrap_or_else(|e| panic!("round {i}: the tuple fits the space: {e:?}"));
+            regions.push((
+                nursery.current().base() as usize,
+                nursery.current().top() as usize,
+            ));
+            nursery
+                .grow(&policy, CAP)
+                .unwrap_or_else(|e| panic!("round {i}: the capped growth: {e:?}"));
+        }
+        regions
+    }
+
+    /// Probes the whole neighbourhood of every region of `regions`: every word of its live
+    /// region plus the words straddling both of its boundaries.
+    fn region_probes(regions: &[(usize, usize)]) -> Vec<usize> {
+        let word = core::mem::size_of::<Eterm>();
+        let mut probes = Vec::new();
+        for &(lo, hi) in regions {
+            probes.push(lo);
+            let mut addr = lo;
+            while addr < hi {
+                probes.push(addr);
+                addr += word;
+            }
+            probes.push(hi.saturating_sub(1));
+            probes.push(hi);
+            probes.push(lo.saturating_sub(1));
+            probes.push(lo.saturating_sub(word));
+            probes.push(hi.saturating_add(word));
+        }
+        probes
+    }
+
+    #[test]
+    fn the_containment_index_mirrors_the_chain_and_answers_exactly() {
+        let mut nursery = Nursery::new(default_allocator().clone(), CAP).expect("nursery");
+        let retired = build_chain(&mut nursery);
+
+        // A growth retires a space, never frees it: the chain holds every superseded space.
+        assert_eq!(nursery.space_count(), RETIRED + 1);
+        assert_eq!(nursery.retired.len(), RETIRED);
+
+        // The index mirrors the chain **exactly** — one entry per retired space, naming that
+        // space's own frozen live region. This is the invariant the range test's exactness
+        // rests on: with the bases distinct (every space is its own allocation) the indexed
+        // intervals are disjoint, so the greatest base at or below an address is its only
+        // candidate, and a missing or stale entry would be a wrong answer.
+        assert_eq!(nursery.retired_regions.len(), nursery.retired.len());
+        for space in &nursery.retired {
+            assert_eq!(
+                nursery.retired_regions.get(&(space.base() as usize)),
+                Some(&(space.top() as usize)),
+                "the index names every retired space's live region"
+            );
+        }
+
+        // The range test is exactly the reference predicate over `spaces()` — for the retired
+        // regions *and* for the current space, whose live region the index deliberately does not
+        // hold (it is the only one whose `top` moves).
+        let mut regions = retired;
+        regions.push((
+            nursery.current().base() as usize,
+            nursery.current().top() as usize,
+        ));
+        let probes = region_probes(&regions);
+        let mut inside = 0usize;
+        for &addr in &probes {
+            let want = nursery
+                .spaces()
+                .any(|space| space.contains(addr as *const Eterm));
+            assert_eq!(
+                nursery.contains(addr as *const Eterm),
+                want,
+                "contains({addr:#x}) must equal the scan over `spaces()`"
+            );
+            inside += usize::from(want);
+        }
+        // The corpus is not vacuous: it really probes inside the chain (≥ one word per region).
+        assert!(
+            inside >= RETIRED,
+            "the probes must reach inside the chain, got {inside}"
+        );
+
+        // ... and a below-the-first and an above-the-last address are outside every space.
+        let lowest = nursery
+            .spaces()
+            .map(|s| s.base() as usize)
+            .min()
+            .expect("a space");
+        let highest = nursery
+            .spaces()
+            .map(|s| s.top() as usize)
+            .max()
+            .expect("a space");
+        assert!(!nursery.contains(lowest.saturating_sub(8) as *const Eterm));
+        assert!(!nursery.contains(highest.saturating_add(8) as *const Eterm));
+    }
+
+    #[test]
+    fn a_capped_growth_retires_but_never_collects_moves_or_frees() {
+        let mut nursery = Nursery::new(default_allocator().clone(), CAP).expect("nursery");
+        let policy = capped();
+
+        // A live term in the space the growth will retire, at a known address.
+        let live = nursery
+            .current_mut()
+            .heap_mut()
+            .tuple(&[make_small(11), make_small(12)])
+            .expect("tuple");
+        let base = nursery.current().base();
+        let used = nursery.current().used_words();
+
+        nursery.grow(&policy, CAP).expect("the capped growth");
+
+        // Nothing was freed (the superseded allocation is still the chain's, untouched), nothing
+        // moved (the term is at its original address and reads back inside the chain), and the
+        // chain's summed occupancy is unchanged.
+        assert_eq!(nursery.space_count(), 2);
+        assert!(nursery.contains(ptr_val(live) as *const Eterm));
+        assert_eq!(nursery.retired.len(), 1);
+        assert_eq!(nursery.retired[0].base(), base);
+        assert_eq!(nursery.retired[0].used_words(), used);
+        assert_eq!(nursery.used_words(), used, "the live words are still there");
+        assert!(
+            nursery.retains_old_spaces(),
+            "the retention is the chain's collection debt"
+        );
+
+        // The growth is bounded by the ceiling: every space it installs is `CAP` words, so the
+        // chain's capacity is the chain's length times `CAP` (the capped shape of the
+        // doubling rule's `O(log(heap))` ladder).
+        assert_eq!(nursery.capacity_words(), 2 * CAP);
+
+        // A request the ceiling cannot reach is the typed refusal, and the nursery is as it was.
+        let spaces_before = nursery.space_count();
+        let err = nursery.grow(&policy, CAP + 1).expect_err("capped");
+        assert_eq!(err.as_atom(), Some("out_of_memory"));
+        assert_eq!(
+            nursery.space_count(),
+            spaces_before,
+            "a refused growth retires nothing"
+        );
     }
 }

@@ -92,7 +92,10 @@ fn assert_graph(c: &AnyCollector, root: Eterm, atom: Eterm) {
     assert!(in_mature(c, e1), "the list must be resident in mature");
     assert_eq!(list_to_smalls(e1), vec![1, 2, 3]);
 
-    assert!(in_mature(c, e2), "the inner tuple must be resident in mature");
+    assert!(
+        in_mature(c, e2),
+        "the inner tuple must be resident in mature"
+    );
     // SAFETY: `e2` is a live 2-element tuple.
     let inner_header = unsafe { *boxed_val(e2) };
     assert!(is_arity_value(inner_header));
@@ -159,7 +162,10 @@ fn the_same_corpus_stays_intact_under_both_strategies() {
             CollectionKind::Major
         ]
     );
-    assert_eq!(copying, immix, "both strategies pick the same collection kinds");
+    assert_eq!(
+        copying, immix,
+        "both strategies pick the same collection kinds"
+    );
 }
 
 #[test]
@@ -267,14 +273,24 @@ fn assert_small_cell(c: &GenImmixCollector, root: Eterm, value: i64) {
 
 #[test]
 fn a_multi_block_object_promotes_through_a_minor_and_survives_a_major() {
-    assert_eq!(run_blocks(LARGE_WORDS), 2, "the fixture needs a two-block run");
+    assert_eq!(
+        run_blocks(LARGE_WORDS),
+        2,
+        "the fixture needs a two-block run"
+    );
     let mut c = GenImmixCollector::from_policy(large_policy()).expect("collector");
 
     let large = build_tuple(&mut c, LARGE_ARITY);
-    assert_eq!(c.young().used_words(), LARGE_WORDS, "only the fixture is live");
+    assert_eq!(
+        c.young().used_words(),
+        LARGE_WORDS,
+        "only the fixture is live"
+    );
 
     let mut roots = [large];
-    let minor = c.collect_minor(&mut roots).expect("the run fits the mature region");
+    let minor = c
+        .collect_minor(&mut roots)
+        .expect("the run fits the mature region");
 
     // One object of exactly `LARGE_WORDS` words was promoted, into a line-rounded run.
     assert_eq!(minor.objects_copied, 1);
@@ -288,7 +304,9 @@ fn a_multi_block_object_promotes_through_a_minor_and_survives_a_major() {
     // The following fullsweep reclaims the mature generation in place. The fixture's start
     // block is wholly covered by its own marks, so it is `AllMarked`: pinned in its run,
     // never evacuated, and its root keeps its address.
-    let major = c.collect_major(&mut roots).expect("the fullsweep keeps the fixture");
+    let major = c
+        .collect_major(&mut roots)
+        .expect("the fullsweep keeps the fixture");
     assert_eq!(
         roots[0].raw(),
         promoted.raw(),
@@ -298,11 +316,17 @@ fn a_multi_block_object_promotes_through_a_minor_and_survives_a_major() {
     assert_eq!(c.mature().used_lines(), lines_for(LARGE_WORDS));
 
     let immix = c.last_immix_stats().expect("the in-place reclaim ran");
-    assert_eq!(immix.objects_pinned, 1, "the fixture is pinned, not evacuated");
+    assert_eq!(
+        immix.objects_pinned, 1,
+        "the fixture is pinned, not evacuated"
+    );
     assert_eq!(immix.objects_evacuated, 0);
     assert_eq!(immix.lines_pinned, lines_for(LARGE_WORDS));
     assert_eq!(immix.words_pinned, LARGE_WORDS);
-    assert_eq!(major.words_reclaimed, 0, "every line of the run is retained");
+    assert_eq!(
+        major.words_reclaimed, 0,
+        "every line of the run is retained"
+    );
 }
 
 #[test]
@@ -323,7 +347,11 @@ fn a_multi_block_object_promotes_directly_in_a_major() {
     let mut roots = [large];
 
     let collection = c.collect(&mut roots).expect("the fullsweep promotes it");
-    assert_eq!(collection.kind, CollectionKind::Major, "fullsweep_after = 0");
+    assert_eq!(
+        collection.kind,
+        CollectionKind::Major,
+        "fullsweep_after = 0"
+    );
     assert_eq!(collection.stats.objects_copied, 1);
     assert_eq!(collection.stats.words_copied, LARGE_WORDS);
     assert_eq!(c.young().used_words(), 0, "the nursery is emptied");
@@ -331,7 +359,8 @@ fn a_multi_block_object_promotes_directly_in_a_major() {
 
     // And the following fullsweep keeps it in place.
     let pinned = roots[0];
-    c.collect_major(&mut roots).expect("the fullsweep keeps the fixture");
+    c.collect_major(&mut roots)
+        .expect("the fullsweep keeps the fixture");
     assert_eq!(roots[0].raw(), pinned.raw());
     assert_multi_block(&c, roots[0], LARGE_ARITY);
 }
@@ -359,7 +388,10 @@ fn a_multi_block_object_survives_alongside_small_objects_and_garbage() {
     }
 
     let minor = c.collect_minor(&mut roots).expect("the promotion fits");
-    assert_eq!(minor.objects_copied, 21, "the fixture plus the 20 live cells");
+    assert_eq!(
+        minor.objects_copied, 21,
+        "the fixture plus the 20 live cells"
+    );
     assert_eq!(minor.words_copied, LARGE_WORDS + 20 * 2);
     assert_eq!(
         c.mature().used_lines(),
@@ -386,9 +418,18 @@ fn a_multi_block_object_survives_alongside_small_objects_and_garbage() {
         .expect("garbage cell");
     roots.push(extra);
 
-    let major = c.collect_major(&mut roots).expect("the fullsweep keeps every live object");
-    assert_eq!(major.objects_copied, 1, "the fresh round's live cell is promoted");
-    assert_eq!(roots[0].raw(), promoted.raw(), "the pinned fixture keeps its address");
+    let major = c
+        .collect_major(&mut roots)
+        .expect("the fullsweep keeps every live object");
+    assert_eq!(
+        major.objects_copied, 1,
+        "the fresh round's live cell is promoted"
+    );
+    assert_eq!(
+        roots[0].raw(),
+        promoted.raw(),
+        "the pinned fixture keeps its address"
+    );
     assert_multi_block(&c, roots[0], LARGE_ARITY);
     for (i, &cell) in roots[1..21].iter().enumerate() {
         assert_small_cell(&c, cell, i as i64);
@@ -461,7 +502,8 @@ fn two_multi_block_objects_of_different_run_sizes_share_the_run_allocator() {
     // neither fixture moves and both keep their content; the small cells are reclaimed
     // around them.
     let before: Vec<Eterm> = roots.clone();
-    c.collect_major(&mut roots).expect("the fullsweep keeps both runs");
+    c.collect_major(&mut roots)
+        .expect("the fullsweep keeps both runs");
     assert_eq!(roots[1].raw(), before[1].raw());
     assert_eq!(roots[2].raw(), before[2].raw());
     assert_multi_block(&c, roots[1], LARGE_ARITY);

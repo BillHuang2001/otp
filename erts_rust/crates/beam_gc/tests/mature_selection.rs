@@ -82,14 +82,24 @@ fn the_rule_selects_copying_below_and_immix_at_or_above_the_break_even() {
     assert_eq!(IMMIX_BREAK_EVEN_BLOCKS, 8);
     assert_eq!(IMMIX_BREAK_EVEN_WORDS, 8 * BLOCK_WORDS);
 
-    for words in [0, 1, BLOCK_WORDS, IMMIX_BREAK_EVEN_WORDS / 2, IMMIX_BREAK_EVEN_WORDS - 1] {
+    for words in [
+        0,
+        1,
+        BLOCK_WORDS,
+        IMMIX_BREAK_EVEN_WORDS / 2,
+        IMMIX_BREAK_EVEN_WORDS - 1,
+    ] {
         assert_eq!(
             select_mature(words),
             MatureKind::Copying,
             "{words} words is below the break-even and must keep the copying path"
         );
     }
-    for words in [IMMIX_BREAK_EVEN_WORDS, IMMIX_BREAK_EVEN_WORDS + 1, 4 * IMMIX_BREAK_EVEN_WORDS] {
+    for words in [
+        IMMIX_BREAK_EVEN_WORDS,
+        IMMIX_BREAK_EVEN_WORDS + 1,
+        4 * IMMIX_BREAK_EVEN_WORDS,
+    ] {
         assert_eq!(
             select_mature(words),
             MatureKind::Immix,
@@ -130,13 +140,17 @@ fn from_config_follows_the_rule_for_a_real_collector() {
 #[test]
 fn an_explicit_override_beats_the_rule_in_both_directions() {
     // A large mature generation the rule would give to Immix — pinned back to Copying.
-    let pinned_copying = GcConfig::auto(policy(4 * IMMIX_BREAK_EVEN_WORDS))
-        .with_mature(MatureKind::Copying);
+    let pinned_copying =
+        GcConfig::auto(policy(4 * IMMIX_BREAK_EVEN_WORDS)).with_mature(MatureKind::Copying);
     assert_eq!(pinned_copying.mature(), MatureKind::Copying);
     let choice = pinned_copying.mature_choice();
     assert_eq!(choice.source, MatureSource::Explicit);
     assert!(choice.is_override());
-    assert_eq!(choice.rule_kind(), MatureKind::Immix, "the rule wanted Immix here");
+    assert_eq!(
+        choice.rule_kind(),
+        MatureKind::Immix,
+        "the rule wanted Immix here"
+    );
     let any = AnyCollector::from_config(&pinned_copying).expect("collector");
     assert_eq!(any.kind(), MatureKind::Copying);
     assert!(any.mature_choice().is_override());
@@ -147,13 +161,20 @@ fn an_explicit_override_beats_the_rule_in_both_directions() {
     let choice = pinned_immix.mature_choice();
     assert_eq!(choice.source, MatureSource::Explicit);
     assert!(choice.is_override());
-    assert_eq!(choice.rule_kind(), MatureKind::Copying, "the rule wanted Copying here");
+    assert_eq!(
+        choice.rule_kind(),
+        MatureKind::Copying,
+        "the rule wanted Copying here"
+    );
     let any = AnyCollector::from_config(&pinned_immix).expect("collector");
     assert_eq!(any.kind(), MatureKind::Immix);
     assert!(any.mature_choice().is_override());
 
     // The constructor shortcuts are just explicit pins.
-    assert_eq!(GcConfig::copying(policy(1_000_000)).mature(), MatureKind::Copying);
+    assert_eq!(
+        GcConfig::copying(policy(1_000_000)).mature(),
+        MatureKind::Copying
+    );
     assert_eq!(GcConfig::immix(policy(1)).mature(), MatureKind::Immix);
 }
 
@@ -203,7 +224,9 @@ fn drive(config: &GcConfig) -> (AnyCollector, Vec<Eterm>, Vec<CollectionKind>) {
         let heap = c.young_mut().heap_mut();
         roots.push(heap.tuple(&[roots[0], make_small(7)]).expect("a holder"));
         for i in 0..64i64 {
-            let _ = heap.tuple(&[make_small(i), make_small(2 * i)]).expect("garbage");
+            let _ = heap
+                .tuple(&[make_small(i), make_small(2 * i)])
+                .expect("garbage");
         }
     }
     kinds.push(c.collect(&mut roots).expect("second collection").kind);
@@ -212,7 +235,9 @@ fn drive(config: &GcConfig) -> (AnyCollector, Vec<Eterm>, Vec<CollectionKind>) {
     for round in 0..3i64 {
         {
             let heap = c.young_mut().heap_mut();
-            let _ = heap.tuple(&[make_small(round), make_small(round + 1)]).expect("garbage");
+            let _ = heap
+                .tuple(&[make_small(round), make_small(round + 1)])
+                .expect("garbage");
         }
         kinds.push(c.collect(&mut roots).expect("later collection").kind);
     }
@@ -263,7 +288,10 @@ fn both_collectors_produce_the_same_reachable_objects_across_the_threshold() {
     }
 
     // The long-lived set really is the whole break-even generation, not a truncated corpus.
-    assert_eq!(auto_roots.len(), IMMIX_BREAK_EVEN_BLOCKS * LINES_PER_BLOCK + 2);
+    assert_eq!(
+        auto_roots.len(),
+        IMMIX_BREAK_EVEN_BLOCKS * LINES_PER_BLOCK + 2
+    );
 }
 
 #[test]
@@ -276,12 +304,18 @@ fn the_strategy_choice_does_not_change_the_collectors_observables() {
     let (copying, _, _) = drive(&GcConfig::copying(config.clone()));
     let a = auto.mature_choice();
     let c = copying.mature_choice();
-    assert_eq!(a.mature_words, c.mature_words, "same mature baseline the rule read");
+    assert_eq!(
+        a.mature_words, c.mature_words,
+        "same mature baseline the rule read"
+    );
     assert_eq!(a.break_even_words, c.break_even_words);
     assert_eq!(auto.kind(), MatureKind::Immix);
     assert_eq!(copying.kind(), MatureKind::Copying);
     assert_eq!(auto.minor_gcs(), copying.minor_gcs());
-    assert_eq!(auto.young().capacity_words(), copying.young().capacity_words());
+    assert_eq!(
+        auto.young().capacity_words(),
+        copying.young().capacity_words()
+    );
     // Both descriptions name a decision; the automatic one names the rule.
     assert!(a.describe().contains("automatic"));
     assert!(c.describe().contains("explicit"));

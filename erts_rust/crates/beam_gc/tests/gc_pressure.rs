@@ -203,7 +203,11 @@ fn fullsweep_after_two_runs_a_minor_then_a_major_every_third_collection() {
 #[test]
 fn default_cadence_escalates_to_major_when_the_mature_space_fills() {
     let kinds = run_copying_cadence(HeapPolicy::default().fullsweep_after, 64, 40);
-    assert_eq!(kinds[0], CollectionKind::Minor, "the first collection is a minor");
+    assert_eq!(
+        kinds[0],
+        CollectionKind::Minor,
+        "the first collection is a minor"
+    );
     assert!(
         kinds.contains(&CollectionKind::Minor),
         "minors must run under the default cadence"
@@ -222,7 +226,10 @@ fn should_collect_is_true_only_past_the_remaining_capacity() {
     let _ = build_round_graph(collector.young_mut().heap_mut(), 0);
 
     let available = collector.young().available_words();
-    assert!(!collector.should_collect(available), "an exact fit still fits");
+    assert!(
+        !collector.should_collect(available),
+        "an exact fit still fits"
+    );
     assert!(
         collector.should_collect(available + 1),
         "one word past the capacity must collect"
@@ -239,7 +246,11 @@ fn should_collect_is_true_only_past_the_remaining_capacity() {
 fn run_any_cadence(kind: MatureKind, cadence: u32, rounds: usize) -> Vec<CollectionKind> {
     let config = GcConfig::copying(policy(cadence, 2048, 8192)).with_mature(kind);
     let mut collector = AnyCollector::from_config(&config).expect("collector");
-    assert_eq!(collector.kind(), kind, "the config selected the requested strategy");
+    assert_eq!(
+        collector.kind(),
+        kind,
+        "the config selected the requested strategy"
+    );
 
     let mut roots: Vec<Eterm> = Vec::new();
     let mut kinds = Vec::new();

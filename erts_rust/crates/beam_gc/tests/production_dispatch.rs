@@ -53,8 +53,8 @@
 //! count or a structural comparison, and **no timing is ever asserted**.
 
 use beam_gc::prelude::{
-    AnyCollector, CollectionKind, GcConfig, GcStats, HeapInfo, HeapPolicy, MatureKind, MatureSource,
-    IMMIX_BREAK_EVEN_WORDS,
+    AnyCollector, CollectionKind, GcConfig, GcStats, HeapInfo, HeapPolicy, MatureKind,
+    MatureSource, IMMIX_BREAK_EVEN_WORDS,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
@@ -148,8 +148,16 @@ fn alloc_pair(
             .expect("the collection fits the fixed geometry")
             .kind;
         assert_eq!(kc, ki, "the two strategies must run the same collection");
-        assert_eq!(copying.young().used_words(), 0, "a collection empties the nursery");
-        assert_eq!(immix.young().used_words(), 0, "a collection empties the nursery");
+        assert_eq!(
+            copying.young().used_words(),
+            0,
+            "a collection empties the nursery"
+        );
+        assert_eq!(
+            immix.young().used_words(),
+            0,
+            "a collection empties the nursery"
+        );
         assert_roots_equal(roots_c, roots_i, atoms, "after a collection");
         Some(kc)
     } else {
@@ -179,8 +187,16 @@ fn run_lockstep() -> Lockstep {
         AnyCollector::from_config(&GcConfig::copying(workload_policy())).expect("collector");
     let mut immix =
         AnyCollector::from_config(&GcConfig::immix(workload_policy())).expect("collector");
-    assert_eq!(copying.kind(), MatureKind::Copying, "the copy run is pinned");
-    assert_eq!(immix.kind(), MatureKind::Immix, "the mark-region run is pinned");
+    assert_eq!(
+        copying.kind(),
+        MatureKind::Copying,
+        "the copy run is pinned"
+    );
+    assert_eq!(
+        immix.kind(),
+        MatureKind::Immix,
+        "the mark-region run is pinned"
+    );
 
     let mut kinds = Vec::new();
     let mut asked = Vec::new();
@@ -190,7 +206,14 @@ fn run_lockstep() -> Lockstep {
     // The process's long-lived terms, written before the workload starts.
     for i in 0..3i64 {
         let (tc, ti, a, kind) = alloc_pair(
-            &mut copying, &mut roots_c, &mut immix, &mut roots_i, &atoms, i, i + 1, i + 2,
+            &mut copying,
+            &mut roots_c,
+            &mut immix,
+            &mut roots_i,
+            &atoms,
+            i,
+            i + 1,
+            i + 2,
         );
         asked.push(a);
         if let Some(k) = kind {
@@ -257,7 +280,10 @@ fn run_lockstep() -> Lockstep {
 
     // A final collection, so the run ends on a collection boundary with the last round's
     // garbage reclaimed.
-    let kc = copying.collect(&mut roots_c).expect("final collection").kind;
+    let kc = copying
+        .collect(&mut roots_c)
+        .expect("final collection")
+        .kind;
     let ki = immix.collect(&mut roots_i).expect("final collection").kind;
     assert_eq!(kc, ki, "the final collection must be the same kind");
     kinds.push(kc);
@@ -303,7 +329,12 @@ fn underlying_should_collect(c: &AnyCollector, need_words: usize) -> bool {
 #[test]
 fn both_strategies_run_the_same_collection_sequence_on_a_process_shaped_workload() {
     let run = run_lockstep();
-    let Lockstep { copying, immix, kinds, asked } = run;
+    let Lockstep {
+        copying,
+        immix,
+        kinds,
+        asked,
+    } = run;
 
     // The workload is a real one: many collections, and the cadence exercises both kinds.
     assert!(kinds.len() >= 8, "got {kinds:?}");
@@ -325,7 +356,12 @@ fn both_strategies_run_the_same_collection_sequence_on_a_process_shaped_workload
 
 #[test]
 fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
-    let Lockstep { copying, immix, kinds, .. } = run_lockstep();
+    let Lockstep {
+        copying,
+        immix,
+        kinds,
+        ..
+    } = run_lockstep();
 
     // Both variants really ran.
     assert!(matches!(copying, AnyCollector::Copying(_)));
@@ -361,7 +397,10 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
     // Both mature generations are at the configured capacity, and both retained the live roots.
     assert_eq!(copying.mature_capacity_words(), MATURE_WORDS);
     assert_eq!(immix.mature_capacity_words(), MATURE_WORDS);
-    assert!(copying.mature_used_words() > 0, "the live roots were promoted");
+    assert!(
+        copying.mature_used_words() > 0,
+        "the live roots were promoted"
+    );
     assert!(
         immix.mature_used_words() >= copying.mature_used_words(),
         "the mark-region space accounts in whole lines, never in fewer words than it holds"
@@ -403,7 +442,8 @@ fn the_automatic_rule_reaches_both_strategies_through_the_production_seam() {
         initial_mature_words: IMMIX_BREAK_EVEN_WORDS,
         ..HeapPolicy::default()
     };
-    let auto = AnyCollector::from_config(&GcConfig::auto(at_break_even.clone())).expect("collector");
+    let auto =
+        AnyCollector::from_config(&GcConfig::auto(at_break_even.clone())).expect("collector");
     assert_eq!(auto.kind(), MatureKind::Immix);
     assert!(matches!(auto, AnyCollector::Immix(_)));
     let choice = auto.mature_choice();
@@ -411,7 +451,9 @@ fn the_automatic_rule_reaches_both_strategies_through_the_production_seam() {
     assert_eq!(choice.mature_words, IMMIX_BREAK_EVEN_WORDS);
     assert_eq!(auto.mature_capacity_words(), IMMIX_BREAK_EVEN_WORDS);
     assert_eq!(
-        AnyCollector::new(at_break_even.clone()).expect("collector").kind(),
+        AnyCollector::new(at_break_even.clone())
+            .expect("collector")
+            .kind(),
         MatureKind::Immix
     );
 
@@ -477,7 +519,10 @@ fn the_mature_accessors_forward_to_the_selected_strategy() {
         assert_eq!(c.mature_capacity_words(), capacity, "{kind:?} capacity");
         assert_eq!(c.mature_used_words(), used, "{kind:?} used");
         assert_eq!(c.mature_available_words(), available, "{kind:?} available");
-        assert!(used >= 3, "{kind:?}: the promoted tuple is resident in mature");
+        assert!(
+            used >= 3,
+            "{kind:?}: the promoted tuple is resident in mature"
+        );
         assert_eq!(
             used + available,
             capacity,
@@ -578,11 +623,19 @@ fn the_mature_membership_predicate_agrees_with_the_concrete_space() {
     for kind in [MatureKind::Copying, MatureKind::Immix] {
         let config = GcConfig::copying(workload_policy()).with_mature(kind);
         let mut c = AnyCollector::from_config(&config).expect("collector");
-        assert_eq!(c.kind(), kind, "the variant under test is the one that runs");
+        assert_eq!(
+            c.kind(),
+            kind,
+            "the variant under test is the one that runs"
+        );
 
         // The workload's geometry is fixed, so the mature capacity is exactly the configured
         // one on both paths (a whole number of mark-region blocks).
-        assert_eq!(c.mature_capacity_words(), MATURE_WORDS, "{kind:?}: capacity");
+        assert_eq!(
+            c.mature_capacity_words(),
+            MATURE_WORDS,
+            "{kind:?}: capacity"
+        );
 
         // Promote one live 3-word tuple into the mature generation.
         let term = c

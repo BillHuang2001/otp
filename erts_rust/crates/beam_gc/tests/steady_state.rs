@@ -75,7 +75,7 @@
 //! `-- --nocapture` for a human reader only.
 
 use beam_gc::prelude::{AnyCollector, CollectionKind, GcConfig, HeapPolicy, MatureKind};
-use beam_term::prelude::{make_small, size_object, signed_value, tuple_element, tuple_size, Eterm};
+use beam_term::prelude::{make_small, signed_value, size_object, tuple_element, tuple_size, Eterm};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -123,7 +123,12 @@ unsafe fn tuple_pair(t: Eterm) -> (i64, i64) {
     assert_eq!(unsafe { tuple_size(t) }, 2, "the term is a 2-tuple");
     // SAFETY: `t` is a live 2-tuple, so elements 0 and 1 are within it (per this function's
     // contract); both are small integers the caller built with `tuple`.
-    unsafe { (signed_value(tuple_element(t, 0)), signed_value(tuple_element(t, 1))) }
+    unsafe {
+        (
+            signed_value(tuple_element(t, 0)),
+            signed_value(tuple_element(t, 1)),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +301,11 @@ fn the_quiescent_heap_converges_to_a_constant() {
             }
         }
 
-        assert_eq!(samples.len(), MEASURED, "{kind:?}: one sample per measured round");
+        assert_eq!(
+            samples.len(),
+            MEASURED,
+            "{kind:?}: one sample per measured round"
+        );
 
         // ---- the default cadence really exercised both collection kinds ----
         // The capacity converges only because the default cadence *does* escalate to a

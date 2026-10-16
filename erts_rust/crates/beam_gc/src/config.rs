@@ -257,7 +257,10 @@ mod tests {
         let policy = HeapPolicy::from_min_max(100, 1_000);
         let immix = GcConfig::immix(policy.clone());
         assert_eq!(immix.mature(), MatureKind::Immix);
-        assert_eq!(immix.selection(), MatureSelection::Explicit(MatureKind::Immix));
+        assert_eq!(
+            immix.selection(),
+            MatureSelection::Explicit(MatureKind::Immix)
+        );
 
         // The builder converts either starting point; only the selection changes.
         let upgraded = GcConfig::copying(policy.clone()).with_mature(MatureKind::Immix);
@@ -274,7 +277,8 @@ mod tests {
             ..HeapPolicy::default()
         };
         // The rule would pick Immix; pinning Copying must win, and be reported as an override.
-        let pinned = GcConfig::auto(big).with_selection(MatureSelection::Explicit(MatureKind::Copying));
+        let pinned =
+            GcConfig::auto(big).with_selection(MatureSelection::Explicit(MatureKind::Copying));
         assert_eq!(pinned.mature(), MatureKind::Copying);
         assert!(pinned.mature_choice().is_override());
         // Going back to automatic restores the rule's verdict.

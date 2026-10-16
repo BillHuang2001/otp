@@ -129,7 +129,11 @@ fn the_growth_fallback_grows_the_region_instead_of_failing() {
 
     let (needed, live_lines) = reach_the_in_place_shortfall(&mut c, &mut roots);
     assert_eq!(needed, 8, "one line per nursery object");
-    assert_eq!(c.mature().used_lines(), 12, "the reclaim kept the live lines");
+    assert_eq!(
+        c.mature().used_lines(),
+        12,
+        "the reclaim kept the live lines"
+    );
     assert!(
         c.mature().free_lines() < needed,
         "the in-place region cannot hold the promotion"
@@ -150,7 +154,10 @@ fn the_growth_fallback_grows_the_region_instead_of_failing() {
         c.last_immix_stats().is_none(),
         "the fallback relocates, so no in-place reclaim is reported"
     );
-    assert_eq!(stats.objects_copied, 20, "12 mature tuples + 8 nursery cells");
+    assert_eq!(
+        stats.objects_copied, 20,
+        "12 mature tuples + 8 nursery cells"
+    );
     assert_eq!(
         stats.words_copied,
         12 * 3 + 8 * 2,
@@ -159,7 +166,10 @@ fn the_growth_fallback_grows_the_region_instead_of_failing() {
 
     // The 12 mature tuples round-trip, relocated into the grown region.
     for (i, root) in roots[..12].iter().enumerate() {
-        assert!(c.mature().contains_term(*root), "mature root {i} was relocated");
+        assert!(
+            c.mature().contains_term(*root),
+            "mature root {i} was relocated"
+        );
         // SAFETY: `root` is a live 2-element tuple in the mature region.
         let elements = unsafe { boxed_val(*root).add(1) };
         assert_eq!(signed_value(unsafe { *elements }), i as i64);
@@ -228,13 +238,29 @@ fn the_growth_fallback_is_capped_by_max_heap_words_and_promotes_nothing() {
 
     // Nothing was moved: no larger region was built, the mature region is untouched, the
     // nursery is un-forwarded and not one root word was rewritten.
-    assert_eq!(c.mature().capacity_words(), 256, "no fresh region was created");
-    assert_eq!(c.mature().used_lines(), mature_lines, "the region is unchanged");
-    assert_eq!(c.young().used_words(), young_used, "the nursery is unchanged");
+    assert_eq!(
+        c.mature().capacity_words(),
+        256,
+        "no fresh region was created"
+    );
+    assert_eq!(
+        c.mature().used_lines(),
+        mature_lines,
+        "the region is unchanged"
+    );
+    assert_eq!(
+        c.young().used_words(),
+        young_used,
+        "the nursery is unchanged"
+    );
     assert_eq!(roots, before, "no root word was rewritten");
     assert!(
         roots[12..].iter().all(|r| c.young().contains_term(*r)),
         "the nursery objects were not promoted"
     );
-    assert_eq!(c.minor_gcs(), minor_gcs, "the failed fallback resets nothing");
+    assert_eq!(
+        c.minor_gcs(),
+        minor_gcs,
+        "the failed fallback resets nothing"
+    );
 }

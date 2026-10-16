@@ -89,7 +89,7 @@ where
     let mut work: Vec<*mut Eterm> = Vec::new();
 
     for &root in roots {
-        seed(root, &mut visited, &mut work);
+        seed(root, from, &mut visited, &mut work);
     }
 
     // A worklist, so the traversal depth is bounded by the heap and not by the real stack:
@@ -120,7 +120,7 @@ where
             for_each_ref(obj, total, &mut |slot| {
                 let term = *slot;
                 if matches!(primary_tag(term), PrimaryTag::Boxed | PrimaryTag::List) {
-                    admit(ptr_val(term) as *const Eterm, &mut visited, &mut work);
+                    admit(ptr_val(term) as *const Eterm, from, &mut visited, &mut work);
                 }
                 Ok(())
             })
@@ -202,7 +202,11 @@ impl<'a> ReachableObject<'a> {
 /// [`ReachableObject`] instead of a raw pointer, so an inspection-only caller needs no
 /// `unsafe`. A cons cell is *traversed* (so the boxed objects behind it are reached) but is
 /// **not** reported — it carries no header word.
-pub(crate) fn for_each_reachable_view<F>(from: &FromSet, roots: &[Eterm], mut visit: F) -> Result<()>
+pub(crate) fn for_each_reachable_view<F>(
+    from: &FromSet,
+    roots: &[Eterm],
+    mut visit: F,
+) -> Result<()>
 where
     F: FnMut(ReachableObject<'_>),
 {
@@ -246,8 +250,8 @@ where
 /// visited yet — a reference outside every range (a literal, a foreign space, an off-heap
 /// pointer) is skipped, exactly as the copier's forwarding switch leaves its
 /// `Target::Foreign` alone.
-fn admit(ptr: *const Eterm, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
-    if let Some(index) = visited.index(ptr) {
+fn admit(ptr: *const Eterm, from: &FromSet, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
+    if let Some(index) = visited.index(ptr, from) {
         if visited.test_and_set(index) {
             work.push(ptr as *mut Eterm);
         }
@@ -255,9 +259,9 @@ fn admit(ptr: *const Eterm, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
 }
 
 /// Seeds the worklist with `term` when it is a reference into a from-space range.
-fn seed(term: Eterm, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
+fn seed(term: Eterm, from: &FromSet, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
     if matches!(primary_tag(term), PrimaryTag::Boxed | PrimaryTag::List) {
-        admit(ptr_val(term) as *const Eterm, visited, work);
+        admit(ptr_val(term) as *const Eterm, from, visited, work);
     }
 }
 
@@ -266,9 +270,10 @@ fn seed(term: Eterm, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
 /// object's first word is the same identity the copier's in-place forwarding marker uses, so
 /// the two dedup in lockstep.
 struct Visited {
-    /// `(lo, hi, first_bit)` per range, `lo`/`hi` in byte addresses and `first_bit` the bit
-    /// index the range starts at — the ranges are packed into one bit vector.
-    ranges: Vec<(usize, usize, usize)>,
+    /// `first[k]` is the bit index range `from.ranges()[k]` starts at — the ranges (in
+    /// [`FromSet::ranges`]'s order) are packed into one bit vector, so a range's `lo`/`hi` are
+    /// read from the from-set itself and never copied here.
+    first: Vec<usize>,
     bits: Vec<u64>,
 }
 
@@ -277,24 +282,30 @@ impl Visited {
     /// space's live region spans a whole number of term words).
     fn new(from: &FromSet) -> Visited {
         let word = size_of::<Eterm>();
-        let mut ranges = Vec::with_capacity(from.ranges().len());
+        let mut first = Vec::with_capacity(from.ranges().len());
         let mut total = 0usize;
         for &(lo, hi) in from.ranges() {
-            ranges.push((lo, hi, total));
+            first.push(total);
             total += (hi - lo) / word;
         }
         Visited {
-            ranges,
+            first,
             bits: vec![0; total.div_ceil(64)],
         }
     }
 
     /// The bit index of the word `ptr` addresses, or `None` when it lies outside every range.
-    fn index(&self, ptr: *const Eterm) -> Option<usize> {
+    ///
+    /// The range is resolved by [`FromSet::locate`] — the one place the range geometry is
+    /// interpreted — so the walk's dedup admits exactly the addresses the copier's
+    /// [`FromSet::contains`] classifies as from-space, in `O(log #ranges)` (this runs per
+    /// reference word).
+    fn index(&self, ptr: *const Eterm, from: &FromSet) -> Option<usize> {
         let addr = ptr as usize;
-        self.ranges.iter().find_map(|&(lo, hi, first)| {
-            (lo <= addr && addr < hi).then(|| first + (addr - lo) / size_of::<Eterm>())
-        })
+        let range = from.locate(addr)?;
+        let lo = from.ranges()[range].0;
+        debug_assert!(addr >= lo, "a located range starts at or below the address");
+        Some(self.first[range] + (addr - lo) / size_of::<Eterm>())
     }
 
     /// Sets the bit at `index`, reporting whether it was previously clear (a newly seen
@@ -305,5 +316,121 @@ impl Visited {
         let newly_seen = self.bits[word] & mask == 0;
         self.bits[word] |= mask;
         newly_seen
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the walk's visited set: the bit index a range's word resolves to, which is
+    //! the one per-reference-word computation of the traversal. It must partition the from-set's
+    //! ranges **exactly** (no two addresses sharing a bit, no address without one), because a
+    //! shared bit would silently drop an object a collection keeps alive and a missing bit would
+    //! visit one twice.
+
+    use super::*;
+    use beam_term::prelude::make_small;
+
+    /// Ranges the test indexes — far more than a hand-written case would build, so the bit index
+    /// is exercised across many ranges and many bit-vector words.
+    const RANGES: usize = 1200;
+
+    #[test]
+    fn the_visited_bit_index_partitions_the_ranges_exactly() {
+        let word = size_of::<Eterm>();
+
+        // `RANGES` disjoint ranges of 1..=4 words, each separated from the next by a one-word
+        // hole (so the holes are addresses the walk must refuse).
+        let mut from = FromSet::new();
+        let mut ranges = Vec::with_capacity(RANGES);
+        let mut next = 0x10_000usize;
+        for i in 0..RANGES {
+            let lo = next;
+            let hi = lo + (1 + i % 4) * word;
+            from.add_range(lo, hi);
+            ranges.push((lo, hi));
+            next = hi + word;
+        }
+
+        let visited = Visited::new(&from);
+        assert_eq!(visited.first.len(), RANGES, "one bit offset per range");
+        let total_words: usize = ranges.iter().map(|&(lo, hi)| (hi - lo) / word).sum();
+        assert_eq!(
+            visited.bits.len(),
+            total_words.div_ceil(64),
+            "the bit vector is exactly as long as the ranges need"
+        );
+
+        // Every word of every range resolves to its own bit — the offsets are the ranges' prefix
+        // sums, so no two words share a bit and the last word's bit is the vector's last bit.
+        let mut first = 0usize;
+        let mut seen = std::collections::BTreeSet::new();
+        for &(lo, hi) in &ranges {
+            let mut addr = lo;
+            let mut offset = 0usize;
+            while addr < hi {
+                let index = visited
+                    .index(addr as *const Eterm, &from)
+                    .unwrap_or_else(|| panic!("{addr:#x} is inside [{lo:#x}, {hi:#x})"));
+                assert_eq!(index, first + offset, "{addr:#x} resolves to its own bit");
+                assert!(seen.insert(index), "the bit {index} was not used yet");
+                addr += word;
+                offset += 1;
+            }
+            first += (hi - lo) / word;
+        }
+        assert_eq!(seen.len(), total_words, "exactly one bit per covered word");
+
+        // An address in a hole between ranges, at a range's exclusive `hi`, below the first range
+        // and a foreign address all resolve to no bit — the walk skips them, exactly as the
+        // copier leaves a `Target::Foreign` alone.
+        let mut outside = Vec::new();
+        for &(lo, hi) in &ranges {
+            outside.push(lo - word); // the hole before the range
+            outside.push(hi); // the range's exclusive end
+        }
+        outside.push(0);
+        outside.push(0x10_000usize - word);
+        let local: Eterm = make_small(1);
+        outside.push(core::ptr::addr_of!(local) as usize);
+        for addr in outside {
+            assert_eq!(
+                visited.index(addr as *const Eterm, &from),
+                None,
+                "{addr:#x} must resolve to no bit"
+            );
+        }
+    }
+
+    #[test]
+    fn the_visited_bit_is_set_once_per_address() {
+        let word = size_of::<Eterm>();
+        let mut from = FromSet::new();
+        from.add_range(0x1000, 0x1000 + 4 * word);
+        from.add_range(0x2000, 0x2000 + 2 * word);
+        let mut visited = Visited::new(&from);
+
+        // The first sighting of an address is new, every later one is not — the dedup the
+        // traversal's "each object exactly once" rests on.
+        let addr = (0x1000 + 2 * word) as *const Eterm;
+        let index = visited.index(addr, &from).expect("covered");
+        assert!(visited.test_and_set(index), "the first sighting is new");
+        assert!(!visited.test_and_set(index), "the second is not");
+        // A different word of the same range has its own, still-clear bit.
+        let other = visited
+            .index(0x1000 as *const Eterm, &from)
+            .expect("covered");
+        assert_ne!(other, index);
+        assert!(visited.test_and_set(other));
+        // So does a word of the other range — the second range starts where the first's
+        // allocation left off, not at bit 0.
+        let second = visited
+            .index((0x2000 + word) as *const Eterm, &from)
+            .expect("covered");
+        assert_eq!(
+            second,
+            4 + 1,
+            "the second range starts past the first's words"
+        );
+        assert!(visited.test_and_set(second));
     }
 }
