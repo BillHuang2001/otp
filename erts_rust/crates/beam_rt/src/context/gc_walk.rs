@@ -393,7 +393,8 @@ struct Walk<'a> {
 #[derive(Default)]
 struct Visited {
     /// The table's slots, each a key and the generation that wrote it.
-    slots: Vec<Slot>,    /// The generation of the walk in progress.
+    slots: Vec<Slot>,
+    /// The generation of the walk in progress.
     generation: u32,
     /// How many slots the current generation occupies.
     len: usize,
@@ -420,7 +421,7 @@ struct Slot {
 /// of objects stays at, and the floor every later table is a multiple of.
 const INITIAL_SLOTS: usize = 1024;
 
-/// The **odd** 64-bit multiplicative constant of the Fibonacci hash —— the integer nearest
+/// The **odd** 64-bit multiplicative constant of the Fibonacci hash — the integer nearest
 /// `2^64 / phi`, so consecutive multiples of it walk the whole word uniformly. Multiplying by an
 /// odd constant is invertible modulo `2^64`, so no address bit is discarded by the multiply.
 const FIBONACCI_HASH: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -448,7 +449,7 @@ impl Visited {
         self.len = 0;
     }
 
-/// Records `key`; answers whether it is **newly** recorded (`false` when the walk in
+    /// Records `key`; answers whether it is **newly** recorded (`false` when the walk in
     /// progress already holds it — which is what makes a shared or cyclic graph terminate).
     fn insert(&mut self, key: usize) -> bool {
         if self.slots.is_empty() {
@@ -953,7 +954,11 @@ mod tests {
             assert!(visited.insert(key));
             assert!(!visited.insert(key));
             assert_eq!(recorded(&visited), BTreeSet::from([key]));
-            assert_eq!(visited.slots.len(), slots, "a shallow walk resized the table");
+            assert_eq!(
+                visited.slots.len(),
+                slots,
+                "a shallow walk resized the table"
+            );
             assert_eq!(visited.grows, grows, "a shallow walk rebuilt the table");
         }
     }
