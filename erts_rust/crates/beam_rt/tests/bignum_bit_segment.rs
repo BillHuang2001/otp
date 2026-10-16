@@ -449,7 +449,11 @@ fn a_narrow_segment_bignum_is_either_the_oracles_bytes_or_a_typed_gap() {
         let spec = format!("bm:{}/1", probe.function);
 
         // The oracle: the same call, resolved through the fixture directory on its code path.
-        let probe_expr = format!("io:format(\"~p~n\",[{call}]), halt(0).");
+        // `~w`, not `~p`: the `run` route prints its result with `~w` (`src/format.rs::
+        // term_to_string_w`), and on a *printable* binary the two controls differ — OTP prints
+        // `<<"linkpath">>` under `~p` but `<<108,105,110,107,112,97,116,104>>` under `~w`. The
+        // comparison below is about the bytes, so both sides must use the same control.
+        let probe_expr = format!("io:format(\"~w~n\",[{call}]), halt(0).");
         let theirs = oracle_pa_eval(&oracle, &dir.0, &probe_expr);
         assert_eq!(
             theirs.code, 0,
