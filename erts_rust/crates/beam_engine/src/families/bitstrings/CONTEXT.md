@@ -64,7 +64,7 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   the crate-wide `#![deny(unsafe_code)]`), mirroring `big_parts_safe`.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/
-    `bs_match_string`/`bs_test_tail2` opcodes + the decoder unit tests.
+    `bs_match_string`/`bs_test_tail2` opcodes.
   - `match_ctx.rs` → match entry (`enter_match`, the `reuse` path, `resolve_match4_fail`),
     the context operand readers (`read_ctx`/`reread_ctx`) and `bs_set_position`
     (`position_of`).
@@ -78,6 +78,10 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     endianness flags (`BsGetUtf32`/`BsSkipUtf32`, and the raw-`BSF_NATIVE`
     float/integer/utf16 reads), oracle-derived.
   - `rooted.rs` → `#[cfg(test)]` rooted-allocation tests for the match path.
+  - `tests.rs` → `#[cfg(test)]` unit tests for the pure decoders the `bs_*` match opcodes
+    call (`decode_utf8`/`utf16`/`utf32`, `read_float_field`) plus the instruction-level
+    regressions for the empty-binary match, `bs_match_string` and the off-heap refc
+    results.
 - `create/` → the construction side:
   - `mod.rs` → `exec` (`bs_init_writable`, `bs_create_bin`) and `assemble` (the flat
     six-operand segment walk). A non-integer value is the bare `badarg` at **every**
@@ -127,16 +131,17 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
 - Every **match result** binary (`bs_get_tail`, `bs_get_binary2`, the `bs_match`
   `binary`/`get_tail` commands) is built through `raw::make_binary`, so a result of any
   size gets the frozen representation the limits prescribe.
-- Files ~1000 lines; split by responsibility. `matching/mod.rs` legitimately stays over
-  the guideline: it is the family's opcode dispatch table plus per-opcode arms and their
-  decoder-level tests, and it cannot be split without scattering one `match` arm per file;
-  new test cases go to `matching/utf_tests.rs` / `matching/rooted.rs` instead.
+- Files ~1000 lines; split by responsibility. `matching/mod.rs` holds only the family's
+  opcode dispatch table plus the per-opcode arms; its unit tests live in
+  `matching/tests.rs`, and new test cases go to `matching/tests.rs` /
+  `matching/utf_tests.rs` / `matching/rooted.rs`.
 
 ## Test Strategy
 Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder calls (`raw.rs`,
-`mod.rs`, each of the `create/*_tests.rs` and `matching/*_tests.rs` modules above), an
-end-to-end suite in `run_tests.rs` through `Machine::run_label`/`run_export`, and live
-`erlc`/`erl` oracle cross-checks (which skip loudly when the toolchain is absent).
+`mod.rs`, `matching/tests.rs`, each of the `create/*_tests.rs` and `matching/*_tests.rs`
+modules above), an end-to-end suite in `run_tests.rs` through `Machine::run_label`/
+`run_export`, and live `erlc`/`erl` oracle cross-checks (which skip loudly when the
+toolchain is absent).
 Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
