@@ -89,6 +89,12 @@ pub(super) const BSF_LITTLE: u32 = 2;
 /// `BSF_SIGNED` (`erl_bits.h:463`): the field is signed.
 pub(super) const BSF_SIGNED: u32 = 4;
 /// `BSF_NATIVE` (`erl_bits.h:465`): the field is in native endianness.
+///
+/// Kept for completeness of the frozen `erl_bits.h` flag table (`:461-465`). No
+/// decoded segment operand ever carries it: [`flag_bit`] resolves `native` to the
+/// machine endianness exactly as the C loader's `NativeEndian` does, so this bit
+/// only ever appears in a flag *set*, never in a decoded one.
+#[allow(dead_code)]
 pub(super) const BSF_NATIVE: u32 = 16;
 
 /// Execute a bitstring-family instruction.
@@ -228,7 +234,18 @@ fn flag_bit(module: &Module, elem: Eterm) -> Result<u32> {
         return Ok(BSF_SIGNED);
     }
     if named("native") {
-        return Ok(BSF_NATIVE);
+        // The C loader collapses the `native` flag at load time (`NativeEndian`,
+        // `erts/emulator/beam/generators.tab:43-55`): on a little-endian machine
+        // `BSF_NATIVE` is cleared and `BSF_LITTLE` set, on a big-endian machine both
+        // are cleared (`native` is the `big` default there). Every consumer in this
+        // family tests `BSF_LITTLE` alone, so normalise here rather than leaking a
+        // bit no consumer honours (which would encode/decode a `native` segment with
+        // the wrong endianness on every target).
+        return Ok(if cfg!(target_endian = "little") {
+            BSF_LITTLE
+        } else {
+            0
+        });
     }
     if named("big") || named("unsigned") {
         return Ok(0);
@@ -551,5 +568,57 @@ impl BitWriter {
     /// The assembled bytes and the exact bit count.
     pub(super) fn finish(self) -> (Vec<u8>, usize) {
         (self.bytes, self.nbits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_loader::Module;
+
+    /// Decode a single flag atom of `module` through [`flag_bit`].
+    fn bit_of(module: &Module, name: &str) -> u32 {
+        let atom = module
+            .atom_table
+            .lookup(name)
+            .unwrap_or_else(|| panic!("the test module defines the {name:?} atom"));
+        flag_bit(module, make_atom(atom)).expect("a known flag atom decodes")
+    }
+
+    /// `native` decodes to the **machine's** endianness, not to a distinct bit.
+    ///
+    /// The C loader collapses the flag at load time (`NativeEndian`,
+    /// `erts/emulator/beam/generators.tab:43-55`): on a little-endian machine
+    /// `BSF_NATIVE` is cleared and `BSF_LITTLE` set; on a big-endian machine both are
+    /// cleared (`native` is the `big` default there). Every consumer in this family
+    /// tests `BSF_LITTLE` alone, so a `native` segment must never keep `BSF_NATIVE` —
+    /// on this little-endian target such a segment would otherwise be written and read
+    /// **big-endian**, exactly backwards (`<<16#0102:16/native>>` is `<<2,1>>` in the
+    /// oracle, `<<1,2>>` for the big-endian default).
+    #[test]
+    fn the_native_flag_is_the_machine_endianness() {
+        let mut module = Module::default();
+        for name in ["native", "little", "signed"] {
+            module.atom_table.intern(name);
+        }
+
+        let expected = if cfg!(target_endian = "little") {
+            BSF_LITTLE
+        } else {
+            0
+        };
+        assert_eq!(
+            bit_of(&module, "native"),
+            expected,
+            "`native` must resolve to the machine endianness (BSF_LITTLE on a LE target)"
+        );
+        assert_eq!(
+            bit_of(&module, "native") & BSF_NATIVE,
+            0,
+            "`native` must never survive as BSF_NATIVE: every consumer tests BSF_LITTLE"
+        );
+        // The explicit flags keep their own bits, unaffected.
+        assert_eq!(bit_of(&module, "little"), BSF_LITTLE);
+        assert_eq!(bit_of(&module, "signed"), BSF_SIGNED);
     }
 }
