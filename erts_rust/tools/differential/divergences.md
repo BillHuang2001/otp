@@ -157,9 +157,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   under the oracle's `-eval` (a local call) but `ok …` under the rust runtime (it resolves the
   `erlang:phash2/1` BIF); `make_tuple(1,2)` behaves the same way. The `erlang:phash2/1`-qualified
   shapes agree and are pinned in `phash.rs`. Owner: `beam_rt` (`-eval` evaluator).
-- `erlang:list_to_existing_atom("hello")` raises `error:badarg` in the oracle (the atom does not
-  exist yet) but returns `ok hello` in the rust runtime, whose route creates the atom instead of
-  refusing. Owner: `beam_bifs` (`list_to_existing_atom/1`).
 
 ## A.9 — preloaded / boot (owner: `beam_rt`, `beam_bifs`)
 - `application:get_all_key/1` / `application:get_key(App, env)`'s **`env` member** differs: the
@@ -267,9 +264,28 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   where the oracle refuses it.
 
 ## A.4 — port/driver observable grammar (owner: `beam_rt` / `beam_io`)
-- The `{fd,…}` port grammar is disjoint; `{line,N}` returns raw bytes; `eof` is never delivered;
-  a non-iodata `port_command/2` is accepted; `port_info(P,registered_name)` is `badarg`; only the
-  oracle writes a missing-`{spawn,Cmd}` shell stderr line.
+- The `{fd,…}` port grammar is disjoint; `eof` is never delivered; a non-iodata `port_command/2`
+  is accepted; `port_info(P,registered_name)` is `badarg`; only the oracle writes a
+  missing-`{spawn,Cmd}` shell stderr line.
+- The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
+  exactly — the `{eol, Line}` / `{noeol, Line}` frames, the split at exactly N bytes with no EOL, the
+  512-byte default `line` boundary and the EOF no-EOL flush (the CR payload included)
+  (`driver/line_option_matrix`, `driver/line_frames_exact_n_noeol_split`,
+  `driver/line_full_line_noeol_flush`, `driver/line_default_512_boundary`,
+  `driver/line_frame_term_bytes`, `driver/line_eof_noeol_flush_precedes_exit_status`,
+  `driver/line_eof_noeol_flush_then_exit_status_payloads` — the two `…flush…` ids name the consuming
+  sequence of a selective receive, **not** a mailbox order: with a non-selective receive both
+  runtimes deliver `[{exit_status,0},{data,…}]`).
+- Two further line/EOF-ordering findings are unpinned because they are plain observables (a case
+  pinning one would be a `mismatch`):
+  - the **`eof`** option: `printf abc` under `[binary,line,eof,exit_status]` ⇒ oracle
+    `[{exit_status,0},{data,{noeol,<<"abc">>}},eof]` vs the Rust runtime the same **without** the
+    `{Port, eof}` (the receive times out — no `eof` is delivered);
+  - the **`spawn_executable`** path: a child that closes both fds before sleeping
+    (`{spawn_executable,"/bin/sh"}` + `{args,["-c","printf abc; exec 1>&- 2>&-; sleep 1"]}`,
+    `[binary,line,exit_status]`) ⇒ oracle `[{exit_status,0},{data,{noeol,<<"abc">>}}]` vs Rust
+    `[{data,{noeol,<<"abc">>}},{exit_status,0}]` (the flush leads). The same command under
+    `{spawn, …}` agrees, so it is confined to `spawn_executable`.
 
 ## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
 - `-extra foo`: the oracle prints a SIGTERM info report and **hangs** (no exit within a 20 s timeout);
@@ -343,18 +359,20 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - ETS query surface: `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a
   bare single-use ref where the oracle answers its own opaque `{Ref, _, _, Ref, _, _}` handle (so
   only the `{Matches, continuation}` split and the ref-ness are pinned).
-- The match-spec matcher's `self/0`: a body element written as the 1-tuple `{self}` must yield the
-  **calling pid** — the oracle's
-  `ets:match_spec_run([{a}], ets:match_spec_compile([{'_',[],[{self}]}]))` is `[<0.10.0>]` where the
-  Rust runtime answers `['EXIT']` (the body-failure sentinel), so
-  `specs/match_spec_run_self_body_returns_the_calling_pid` is **not** in the corpus. The literal-atom
-  half (`[self]`) agrees. Cause: the `beam_ets` `SelfHook` seam
-  (`select/expr/guard.rs::self_term`), which **no crate installs** (`set_self_hook` has no caller), so
-  its default typed `badarg` degrades to `'EXIT'`. Owner: `beam_bifs` (install the hook from the same
-  scoped guard that installs `PrecisionArith`).
 - `ets:match_spec_compile/1`: the empty **binary** `<<>>` is `badarg` on both (pinned by
   `specs/match_spec_compile_empty_spec_is_badarg`), but the empty **list** `[]` is `badarg` in the
   oracle and a compiled handle (`#Ref<…>`) in the Rust runtime. Owner: `beam_bifs`.
+- `ets:give_away/3` returns `true` on both, but the Rust runtime **never delivers the transfer
+  message** to the new owner, so the gift data is unobservable there. Measured with the new owner as
+  a child that replies:
+  `begin Parent=self(), T=ets:new(ets_give_away,[set]), ets:insert(T,{a,1}), P=spawn(fun() -> receive {'ETS-TRANSFER',_Tab,_From,Gift} -> Parent ! {gift,Gift} end end), ets:give_away(T,P,my_gift), receive {gift,Gift} -> Gift end end`
+  ⇒ oracle `my_gift`, exit `0`; Rust no stdout, stderr
+  `beam_rt: unsupported: receive: no matching message arrived`, **exit 3**. A child that forwards
+  *any* message (`receive Msg -> Parent ! {got,Msg} after 2000 -> Parent ! timeout end`) ⇒ oracle the
+  transfer `{true, Tab, From, my_gift}` (the `{'ETS-TRANSFER', Tab, From, Gift}` body) vs Rust
+  `{true,timeout}` — i.e. no message is sent at all. An honest exit-3 capability gap, so no case pins
+  it; the requested corpus id `ets/give_away_gift_data_reaches_the_new_owner` was therefore **not**
+  added. Owner: `beam_ets` / `beam_bifs`.
 - ETS access control: the mode set at `ets:new/2` **is** enforced — a non-owner `ets:lookup/2` of a
   `private` table and a non-owner `ets:insert/2` of a `private`/`protected` table raise
   `error:badarg` in both runtimes — but the raised **reason shape** differs: the rust runtime raises
@@ -445,27 +463,29 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   "preloaded / boot").
 
 ## A.9 — code server (owner: `beam_rt`)
-- `code:load_binary(Mod, Path, Binary)` raises `error:undef` in the Rust runtime (the BIF is not
-  implemented) where the oracle answers `{module, Mod}` for a valid image and `{error, badfile}` for a
-  bad one — measured `code:load_binary(mymod, "/x/mymod.beam", <<>>)`: oracle `{error,badfile}` exit `0`,
-  Rust `exception error undef` exit `1`. A plain reason, so a case pinning it would be a `mismatch`;
-  it stays unpinned until the BIF lands.
-- `code:fetch_loaded/1` is **not exported** by the Rust `code` module
-  (`erlang:function_exported(code, fetch_loaded, 1)` is `false` there); the `init:fetch_loaded/0` form
-  IS served and agrees.
+- **Sticky rule.** `code:load_binary/3` is served, and its refusal shapes agree (a corrupt image is
+  the frozen `{error,badfile}`; a valid image of a module already *loaded from* a sticky directory is
+  `{error,sticky_directory}` — both pinned by `boot_extra/code_load_binary_shapes`). The divergence is
+  the **not-yet-loaded** rule: for a module that merely **resolves under** the installation the oracle
+  loads the image while the Rust runtime refuses it —
+  `begin {Mod,Bin,_}=code:get_object_code(base64), {Mod, code:load_binary(Mod,"base64.beam",Bin)} end`
+  ⇒ oracle `{base64,{module,base64}}` (exit `0`), Rust `{base64,{error,sticky_directory}}` (exit `0`):
+  the Rust rule refuses a module *resolving under* a sticky dir where the oracle refuses only a module
+  *already loaded from* one. Needs `-kernel logger_level none` to be deterministic (the oracle's
+  `beam_load.c` "resides in sticky dir" report races onto stdout).
 
 ## A.9 — in-process compile of a large stdlib module (owner: `beam_gc` / `beam_rt`)
 - `selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator` (an in-process
-  `compile:file/2` of `lib/stdlib/src/timer.erl`, 1016 source lines) is **not** in the corpus: the
-  oracle answers `{ok,timer,Bin}` in ~1 s, while the Rust runtime did not finish — three runs were
-  still CPU-bound at ~98 % of one core after 25–30 min, with no output, no wrong answer and no
-  deadlock, so it cannot be shown to agree. A trivial call in the same loaded module returns in 1.7 s
-  and a compile-only variant reproduces the stall, so the in-process compile itself is the cost.
-  `perf` attributes **94.9 %** of the cycles to `beam_gc::nursery::Nursery::contains`
-  (`spaces().any(|s| s.contains(ptr))` — an O(#spaces) walk run per heap admission), and the cost is
-  superlinear in heap growth: the sibling `ordsets` compile (579 lines) finishes in 304 s with the
-  same 92.8 % hotspot, so 1.75× the source costs >5.9× the time. Closing that scan makes the case
-  landable.
+  `compile:file/2` of `lib/stdlib/src/timer.erl`, 1016 source lines) is **still not** in the corpus:
+  the Rust side now **completes and agrees** (one measured run `[AGREE]`: rust stdout `1`, exit `0`,
+  no stderr) but takes **≈ 615 s** against the oracle's ~0.7 s, and a >100-min serial gate cannot
+  carry a ~10-minute case. `perf` shows the hotspot is **unchanged**:
+  `beam_rt::context::gc_walk::Walk::seed` ≈ 72 % (it inlines
+  `beam_gc::nursery::Nursery::contains` via `root_is_unscanned` — the
+  `spaces().any(|s| s.contains(ptr))` O(#spaces) walk run per heap admission), with
+  `Walk::Visited::insert` the next cost. The sibling landed `ordsets` compile (579 lines) improved
+  from 304 s to **≈ 108 s**, so the fix helped ~2.8× yet the cost stays superlinear (~cubic) in module
+  source size. Closing that scan makes the case landable.
 
 ## A.2 — term/ETF image (owner: `beam_bifs`)
 - `term_to_binary(Term, [local])` is served: the image is `131`, `LOCAL_EXT` (121), a 4-byte local
