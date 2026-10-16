@@ -2452,8 +2452,8 @@ fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
 /// **The live-FR window exemption is per slice: a `Yield` window opens it, the next slice entry
 /// clears it, and nothing is ever pinned.**
 ///
-/// This is the defect's regression pin. The pre-slice guard used to be a **runtime-level,
-/// permanent** pin (`Runtime::pin_process`), so the first slice that ended with a live FR prefix
+/// This is the defect's regression pin. The pre-slice guard used to mark the pid **permanently**
+/// un-collectable at the runtime level, so the first slice that ended with a live FR prefix
 /// made `Runtime::gc_process_enabled` answer `false` for the rest of the process's life and
 /// `Runtime::gc_stats().pinned` never came back down. The window exemption is scoped instead:
 /// a slice that ends with `fr_mark() > 0` marks the pid relocation-exempt for the window that
@@ -2462,7 +2462,7 @@ fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
 /// observable from outside a slice (`is_relocation_exempt` is only readable *between* slices,
 /// where a live FR prefix re-opens the exemption); its **effect** — a float-using loop collecting
 /// *more* as N grows instead of plateauing — is the property pinned in `tests/gc_collect.rs` and
-/// `../context/tests.rs`, and it is impossible while the pid is permanently pinned.
+/// `../context/tests.rs`, and it is impossible while the pid carries a permanent un-collectable mark.
 ///
 /// `preempt:spin/1` is the non-allocating tail loop: a tiny budget pre-empts it
 /// (`ProcOutcome::Yield`) so the slice ends while the process is still runnable — the *only* park
