@@ -363,7 +363,7 @@ fn spill_sets(
 /// fall to `false` **only** when the emitter is known to fully helper it; an unmodelled
 /// variant that *might* inline is not distinguishable here, so the match keeps the
 /// certain-reset list explicit and treats everything else as inlined.
-fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> bool {
+pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> bool {
     match instr {
         // Metadata no-ops emit no bytes and write nothing.
         Instr::Label(_)
