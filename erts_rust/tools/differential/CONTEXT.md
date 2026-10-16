@@ -123,7 +123,7 @@ Success ⇒ one line `ok <repr>`, exit `0`; failure ⇒ `exception <class> <reas
 Non-corpus modules:
 - `src/lib.rs` → crate docs, module wiring, public re-exports.
 - `src/error.rs` → `Error` (`Usage`/`Env`/`Io`, all → exit 2) + `Result`.
-- `src/cli.rs` → `Command` (`Run{case_id}`, `Compare{expr}`, `Suite{strict,allowlist,gaps}`, `List{by_contract}`, `Help`), hand-rolled `parse`, `usage`.
+- `src/cli.rs` → `Command` (`Run{case_id,out_file}`, `Compare{expr}`, `Suite{strict,allowlist,gaps}`, `Merge{from,allowlist,gaps}`, `List{by_contract}`, `Help`), hand-rolled `parse`/`parse_merge`/`consume_out_file`, `usage`.
 - `src/runtime.rs` → resolution (`$ERTS_ORACLE`/`$BEAM_RT`/`$ERLC`/`$BEAM_DIST_PROBE`/`$CC`; `resolve_oracle`/`resolve_rust`/`resolve_rust_from`/`resolve_helper`/`resolve_helper_from`/`helper_unsupported_reason`, `ensure_helper`/`HelperStatus`/`NO_BUILD_ENV`/`helper_plan`, release-before-debug), `UNSUPPORTED_EXIT_CODE`, `RuntimeId`/`RuntimeSource`/`RuntimeSpec`/`Observation`, `eval_argv`, `run`/`run_with_env`/`own_env`, `output_with_retry`.
 - `src/module_build.rs` → the **Erlang** half: `erlc` resolution, embedded-module compile into a temp dir (`CompiledModule`, removed on drop), `compile_extra_into`, the process-local `erlc` cache; re-exports the C/NIF build surface (`build`/`Build`/`NifFixture`/`resolve_cc`/`resolve_erl_include`).
 - `src/nif_build.rs` → the **C/NIF** half (crate-private): `$CC`/`cc` resolution, the `erl_nif.h` locator (`resolve_erl_include`), `NifFixture::{CompiledLibrary,TextFileSo}`, `build(source,module,nif) -> Result<Build>`.
