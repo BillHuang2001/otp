@@ -141,8 +141,8 @@ pub const HEAP_WORDS: usize = 1024;
 
 /// Builds the payload term exactly as `payload/0` describes it.
 ///
-/// All ten of its atoms end up interned in `atoms`, so the returned term encodes
-/// without any further interning.
+/// All six of its atoms (the five keys plus `ok`) end up interned in `atoms`, so the
+/// returned term encodes without any further interning.
 pub fn build_payload(heap: &mut Heap, atoms: &mut AtomTable) -> Eterm {
     let list = {
         let mut tail = NIL;
