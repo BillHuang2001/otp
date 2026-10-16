@@ -138,6 +138,62 @@ fn note_slice_parked(preempted: bool) {
     });
 }
 
+// The runner's **park publication** accounting for this thread, for the **deterministic**
+// structural pin on the exempt-window short-circuit (see `super::tests`).
+//
+// A park either writes the machine's whole root set (`x` file + stack + live FR prefix) into the
+// process's `Registers` — the hand-off a collection that *can* relocate the heap needs — or
+// skips it, which is only sound when the parked window is **relocation-exempt**, i.e. when every
+// relocation site refuses the move for as long as the window lasts (see [`park_machine`]). The
+// two counts are therefore a structural fact of the runner, never a timing: a `receive` park
+// always skips (its window is exempt), a `Yield` park publishes exactly when its slice ended
+// with a dead FR prefix.
+//
+// Like `RUN_SLICE_COUNTERS` this is per thread (a `thread_local!`, not a shared static), so a
+// concurrently running unit test's parks cannot perturb this test's counts.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ParkPublishCounters {
+    /// Park arms that wrote the machine's root set into the process's `Registers`.
+    pub(crate) published: usize,
+    /// Park arms that **skipped** it — a relocation-exempt window, where the machine stays the
+    /// authoritative root set.
+    pub(crate) skipped: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARK_PUBLISH_COUNTERS: std::cell::Cell<ParkPublishCounters> =
+        const { std::cell::Cell::new(ParkPublishCounters { published: 0, skipped: 0 }) };
+}
+
+/// This thread's park publish/skip counters since the last [`reset_park_publish_counters`].
+#[cfg(test)]
+pub(crate) fn park_publish_counters() -> ParkPublishCounters {
+    PARK_PUBLISH_COUNTERS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's park publish/skip counters (a measurement's "before" reading).
+#[cfg(test)]
+pub(crate) fn reset_park_publish_counters() {
+    PARK_PUBLISH_COUNTERS.with(|counter| counter.set(ParkPublishCounters::default()));
+}
+
+/// Records one park: `published` when the arm wrote the machine's root set into the process,
+/// `skipped` when the window was relocation-exempt and it did not.
+#[cfg(test)]
+fn note_park_publish(published: bool) {
+    PARK_PUBLISH_COUNTERS.with(|counter| {
+        let mut value = counter.get();
+        if published {
+            value.published += 1;
+        } else {
+            value.skipped += 1;
+        }
+        counter.set(value);
+    });
+}
+
 /// The `beam_process::ProcessRunner` the runtime hands to the scheduler.
 ///
 /// It borrows the runtime (for BIF dispatch, atoms and heaps) and the
@@ -196,13 +252,16 @@ fn describe_site(engine: &ProcessEngine) -> Option<String> {
 /// [`Process::deliver`](beam_process::Process::deliver)'s exit cascade and the `beam_process`
 /// signal builders are **not** gated by
 /// [`Runtime::gc_process_enabled`](crate::runtime::Runtime) — relocates the process's heap
-/// against its own `regs`, so the parked machine must have published them first; otherwise
-/// such a collection would run against a partial root set and leave a stale word in the
-/// machine's `x` ([`crate::context::gc`] documents the hand-off). The **Wait** park arm
-/// additionally marks the process relocation-exempt for the parked window (cleared when the
-/// process is resumed), so a delivery or signal to a *waiting* receiver is declined rather
-/// than collected; the publication is what the **`Yield`** (pre-emption) arm — never marked
-/// exempt — and the resume's re-sync rely on.
+/// against its own `regs`, so a parked machine whose window a collection *can* enter must have
+/// published them first; otherwise such a collection would run against a partial root set and
+/// leave a stale word in the machine's `x` ([`crate::context::gc`] documents the hand-off).
+///
+/// [`park_machine`] is the production caller and decides whether the hand-off is needed at all: a
+/// **relocation-exempt** window (every `receive` park, and a `Yield` park whose slice ended with a
+/// live FR prefix) refuses every relocation site for the window's whole duration, so the machine
+/// stays authoritative and both this publication and the resume's matching re-sync are skipped.
+/// This is what a **`Yield`** park with a dead FR prefix relies on — the one park window a
+/// collection may relocate over.
 ///
 /// The machine's **whole** root set is published — every x register, the whole Erlang stack,
 /// and the machine's **live leading float-register (FR) prefix**
@@ -259,11 +318,11 @@ fn describe_site(engine: &ProcessEngine) -> Option<String> {
 /// hand-off, whose scatter relocates the FR slots **in place** (indices preserved, `NIL` left
 /// `NIL`), so a collection can never create a non-`NIL` slot beyond `fr_mark` either.
 ///
-/// (And any process whose FR *is* live — `fr_mark() > 0` — additionally carries the inter-slice
+/// (And a process whose FR *is* live — `fr_mark() > 0` — additionally carries the inter-slice
 /// window's relocation exemption, which the post-slice `fr_mark` check in [`RuntimeRunner::run`]
-/// sets and the next slice entry clears: the window's own collection sites decline the move,
-/// while **this** publication is what makes a collection that does run relocate the FR words
-/// instead of leaving them on the abandoned from-space.)
+/// sets and the next slice entry clears: the window's own collection sites decline the move, so
+/// the FR words stay exactly where the machine holds them and neither a publication nor a re-sync
+/// is needed for that window at all.)
 pub(super) fn publish_parked_roots(
     table: &mut ProcessTable,
     pid: ProcessId,
@@ -291,13 +350,14 @@ pub(super) fn publish_parked_roots(
 /// Re-syncs a machine about to **resume** from the process's authoritative root set.
 ///
 /// The twin of [`publish_parked_roots`]: while the machine was out of the runner — a `Yield`
-/// pre-emption, which is never marked relocation-exempt — a collection may have relocated the
-/// process's heap and rewritten the process's `regs` in place, leaving the parked machine's own
-/// `x`/`stack` pointing into the abandoned space. The process's root set — not the machine's
-/// stale copy — is therefore the truth a resume must run from; the context method reconciles
-/// them (including reading the relocated pending-exception reason back into the machine and
-/// consuming the process's extra roots) and halts the process's collection if their slices no
-/// longer match (see [`RuntimeContext::resync_parked_roots`]).
+/// pre-emption with a **dead** FR prefix (`fr_count == 0`), the one park window that is not
+/// marked relocation-exempt — a collection may have relocated the process's heap and rewritten
+/// the process's `regs` in place, leaving the parked machine's own `x`/`stack` pointing into the
+/// abandoned space. The process's root set — not the machine's stale copy — is therefore the
+/// truth a resume must run from; the context method reconciles them (including reading the
+/// relocated pending-exception reason back into the machine and consuming the process's extra
+/// roots) and halts the process's collection if their slices no longer match (see
+/// [`RuntimeContext::resync_parked_roots`]).
 ///
 /// `fr_count` is the count the matching park published the FR prefix with (the engine's
 /// `ProcessEngine::fr_published`); the resume must pass **the same** count so the relocated
@@ -310,6 +370,84 @@ pub(super) fn resume_from_process_roots(
     fr_count: usize,
 ) {
     ctx.resync_parked_roots(pid, machine, fr_count);
+}
+
+/// Parks `engine`'s machine for a window: publishes its root set into `pid`'s process root set
+/// **unless the window is relocation-exempt**, where the parked machine stays authoritative.
+///
+/// `exempt` is the caller's answer to "can anything relocate `pid`'s heap while it is parked?" —
+/// `true` for the `receive` park (whose arm marks the process relocation-exempt for the whole
+/// window) and for a `Yield` park whose slice ended with a **live** FR prefix (the arm marks it
+/// exactly as the post-slice `fr_mark` check does); `false` for a `Yield` park with a dead FR
+/// prefix, which is the one window a delivery-driven collection may relocate over.
+///
+/// `fr_count` is the machine's live FR prefix
+/// ([`Machine::fr_mark`](beam_engine::Machine::fr_mark)), recorded on the engine either way so the
+/// matching resume replays exactly the region the park appended.
+///
+/// Returns whether the publication happened (the engine's `parked_published`, mirrored into the
+/// deterministic park counters under `cfg(test)`).
+///
+/// # Why an exempt window skips a copy that a plain window cannot
+///
+/// The publication is an **identity round-trip** for an exempt window: nothing can move the
+/// heap, so `publish_parked_roots` writes the machine's whole x file
+/// ([`RootSet::ALL_LIVE`], 1024 words), its Erlang stack and its live FR prefix into the process's
+/// [`Registers`](beam_process::Registers), and the resume's
+/// [`resync_parked_roots`](crate::context::RuntimeContext::resync_parked_roots) copies the very
+/// same words back — the machine's own root set *is* the truth throughout. Skipping it is sound
+/// because **every** site that could relocate a parked process's heap is refused for the window:
+///
+/// * [`Process::collect`](beam_process::Process::collect) /
+///   [`Process::ensure_capacity`](beam_process::Process::ensure_capacity) refuse with the typed
+///   `relocation_exempt` raise, and
+///   [`Process::collect_if_needed`](beam_process::Process::collect_if_needed) answers `false`
+///   without collecting, so the process's own admission doors cannot move it;
+/// * [`Process::deliver`](beam_process::Process::deliver) surfaces the raw
+///   `AllocKind::Heap`/`Message` refusal — the caller's heap-fragment key — instead of
+///   collecting or growing, because [`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots)
+///   is `true` for a relocation-exempt process (it is `relocation_exempt || Running`, and a parked
+///   process is never `Running`);
+/// * every `beam_process` **signal** site OR-s that same test into its refusal
+///   (`ProcessTable::declines_signal_collection` supplies only the host gate's answer on top);
+/// * the host's **forced** request is consumed and dropped by
+///   [`Runtime::serve_gc_request`](crate::runtime::Runtime::serve_gc_request), which returns
+///   before collecting for a relocation-exempt pid;
+/// * the host collection gate
+///   ([`context::gc_walk`](crate::context::gc_walk)) is a *strictly more conservative* valve:
+///   it declines on an unscanned container reachable from the roots it gathers, and an
+///   un-published process root set is a subset of the published one, so a gate that declined for
+///   the published roots declines for these too;
+/// * [`Process::grow_nursery`](beam_process::Process::grow_nursery) — the one growth path that is
+///   deliberately **not** gated on the exemption — relocates nothing (it retires the old space
+///   onto a chain the next collection collapses).
+///
+/// The pending-exception reason is carried by the machine itself
+/// ([`Machine::with_roots`](beam_engine::Machine::with_roots) parks the function-clause latches on
+/// the machine's own stack), so the extra-root half of the hand-off is not needed either: with no
+/// publication there is no extra root to set, and the resume's clear is a no-op that leaves the
+/// process's `extra_roots` exactly as empty as it was.
+pub(super) fn park_machine(
+    table: &mut ProcessTable,
+    pid: ProcessId,
+    engine: &mut ProcessEngine,
+    fr_count: usize,
+    exempt: bool,
+) -> bool {
+    engine.fr_published = fr_count;
+    if exempt {
+        // The parked machine remains the authoritative root set: nothing can relocate the heap
+        // for as long as the window lasts, so the hand-off would be an identity round-trip.
+        engine.parked_published = false;
+        #[cfg(test)]
+        note_park_publish(false);
+        return false;
+    }
+    engine.parked_published = true;
+    publish_parked_roots(table, pid, &mut engine.machine, fr_count);
+    #[cfg(test)]
+    note_park_publish(true);
+    true
 }
 
 impl ProcessRunner for RuntimeRunner<'_> {
@@ -474,19 +612,33 @@ impl ProcessRunner for RuntimeRunner<'_> {
             if let Some(module) = engine.entry.entry_module() {
                 ctx.enter_module(module);
             }
-            // A resume continues a machine an earlier slice parked. While it was parked a
-            // delivery-driven collection may have relocated this process's heap, so re-sync
-            // the machine from the process's authoritative root set before running it (see
-            // `resume_from_process_roots`).
+            // A resume continues a machine an earlier slice parked. **Only** a window whose park
+            // actually published the machine's root set can have had its heap relocated under
+            // it: such a window is not relocation-exempt, so a collection driven while the
+            // machine sat in `RunnerState.engines` may have moved the heap and rewritten the
+            // process's `regs`, leaving the machine's own `x`/`stack` pointing into the abandoned
+            // space — re-sync it from the process's authoritative root set
+            // (`resume_from_process_roots`). A window that **skipped** the publication opened a
+            // relocation-exempt one instead, where every relocation site refuses the move for the
+            // window's whole duration, so the machine's own root set is still the truth and
+            // copying it back would be an identity round-trip over the whole x file (see
+            // `park_machine`).
             if engine.parked.is_some() {
-                // The FR prefix is scattered back only as far as the park published it
-                // (`ProcessEngine::fr_published`), so the relocated stack region is split
-                // exactly as the park appended it.
-                let fr_count = engine.fr_published;
-                resume_from_process_roots(&mut ctx, pid, &mut engine.machine, fr_count);
+                if engine.parked_published {
+                    // The FR prefix is scattered back only as far as the park published it
+                    // (`ProcessEngine::fr_published`), so the relocated stack region is split
+                    // exactly as the park appended it.
+                    let fr_count = engine.fr_published;
+                    resume_from_process_roots(&mut ctx, pid, &mut engine.machine, fr_count);
+                }
+                // The window is over however it published: clear the flag so a later park's
+                // answer is the one the next resume reads (a stale `true` would re-sync against
+                // registers an earlier window published).
+                engine.parked_published = false;
                 // The parked window is over: clear the park arm's relocation exemption so
                 // the running slice below can collect this process normally. (A process
-                // resumed from a pre-emption was never marked; clearing is a no-op there.)
+                // resumed from a pre-emption that published was never marked; clearing is a
+                // no-op there.)
                 ctx.process_table_mut()
                     .set_relocation_exempt(pid, false)?;
             }
@@ -609,11 +761,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // set by *another* module's code (a callee) while this process runs float-free code.
         //
         // The live prefix is read **once** per slice and its count (`fr_count`) is reused for
-        // both reactions below: how much of the FR file the park publishes into the process
-        // stack (`publish_parked_roots`), and how long this process must stay un-collectable
-        // outside a slice. The two are two halves of one fact — a process with a live FR has
-        // terms that must be relocated **and** must not be left exposed between slices — so they
-        // are derived from one read, never read twice.
+        // both reactions below: how long this process must stay un-collectable outside a slice,
+        // and what the park records as the live FR prefix (see `park_machine`). The two are two
+        // halves of one fact — a process with a live FR has terms that must not be left exposed
+        // between slices — so they are derived from one read, never read twice.
         //
         // # Why the reaction is scoped to the inter-slice window, never to the process's life
         //
@@ -630,12 +781,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
         //     marked the process permanently un-collectable — would refuse **every** later
         //     collection, so a float-operation loop could never collect and its nursery would grow
         //     with the program's whole allocation history instead.
-        //   * **across the inter-slice window** the park published the live FR prefix onto the
-        //     process stack (`publish_parked_roots`, with the same `fr_count`) and the matching
-        //     resume scatters that region back into the machine's FR slots
-        //     (`resume_from_process_roots`), so a collection that does run in the window relocates
-        //     every live FR word rather than leaving it on the abandoned from-space (pinned by
-        //     `super::tests::the_published_fr_prefix_round_trips_through_a_moving_collection`).
+        //   * **across the inter-slice window** a live FR prefix *is* the window's exemption: the
+        //     park skips its root publication entirely (`park_machine`), the machine keeps its FR
+        //     slots as they are, and every collection site declines the move for the window — so a
+        //     live FR word is never left on an abandoned from-space and never needs relocating
+        //     while the machine is parked.
         //
         // The guard is therefore **per slice**: a process whose FR prefix is live when a slice ends
         // is marked **relocation-exempt** for the window that follows, and the **next slice entry**
@@ -677,10 +827,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
         let fr_count = engine.machine.fr_mark() as usize;
         if fr_count > 0 {
             // The machine still holds live FR terms and is about to leave the runner for the
-            // inter-slice window: the park below publishes them (`publish_parked_roots`) and this
-            // mark declines any relocation those window sites would otherwise drive before the
-            // resume re-syncs them. The next slice entry clears it (see above), so the guard never
-            // outlives the window in which the FR prefix is actually live.
+            // inter-slice window: this mark declines every relocation those window sites would
+            // otherwise drive, so the parked machine keeps its own FR slots and the park below
+            // skips its root publication entirely (see `park_machine`). The next slice entry
+            // clears it (see above), so the guard never outlives the window in which the FR
+            // prefix is actually live.
             if let Some(process) = table.get_mut(pid) {
                 process.set_relocation_exempt(true);
             }
@@ -795,24 +946,26 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // A parked receive's deadline was settled above; a yield has no deadline of its
             // own, so nothing is left armed here (a stale one would fire mid-run later).
             engine.parked_timeout = None;
-            // Publish the machine's roots before the engine is parked: a collection driven
-            // while this process sits in `RunnerState.engines` must be able to relocate the
-            // heap against the machine's live terms (see `publish_parked_roots`). The FR prefix
-            // is published exactly as far as `fr_mark` measured it live; the same count is
-            // stored on the engine so the resume scatters exactly this region back. A **live**
-            // prefix also carries the inter-slice window's relocation exemption (the post-slice
-            // `fr_mark` check above), so the window's own collection sites decline the move
-            // while this publication is what keeps the FR words relocatable.
-            engine.fr_published = fr_count;
-            publish_parked_roots(table, pid, &mut engine.machine, fr_count);
+            // Park the machine and hand it over to the pre-empted window: a window whose slice
+            // ended with a **live** FR prefix carries the relocation exemption the post-slice
+            // `fr_mark` check above opened, so no collection can move its heap and the machine
+            // itself stays the authoritative root set — `park_machine` skips the publication
+            // there. A window with a **dead** FR prefix is not exempt (`fr_count == 0`), so a
+            // collection driven while this process sits in `RunnerState.engines` really can
+            // relocate the heap and the machine's whole root set is published for it. The FR
+            // prefix is published exactly as far as `fr_mark` measured it live; the same count is
+            // stored on the engine so the resume scatters exactly this region back (see
+            // `park_machine`).
+            park_machine(table, pid, &mut engine, fr_count, fr_count > 0);
             // A `garbage_collect` request (see `Runtime::request_gc`) that no heap-admission
-            // point served is honoured **here**: the parked machine's whole root set was just
-            // published — the live FR prefix included — so the collector relocates exactly what
-            // is live. A process whose FR prefix was *live* at this slice's end carries the
-            // window's relocation exemption (set by the post-slice `fr_mark` check), so this
-            // request is declined and dropped by the exemption valve like any other
-            // valve-refused one; the process's own next heap-admission point — after the resume
-            // has cleared the mark — serves it.
+            // point served is honoured **here**: in a publishing window the parked machine's
+            // whole root set was just published — the live FR prefix included — so the collector
+            // relocates exactly what is live. A process whose FR prefix was *live* at this slice's
+            // end carries the window's relocation exemption (set by the post-slice `fr_mark`
+            // check), so this request is declined and dropped by the exemption valve like any
+            // other valve-refused one; the process's own next heap-admission point — after the
+            // resume has cleared the mark — serves it. (An exempt window publishes nothing and
+            // collects nothing, so both halves agree: nothing moved.)
             self.runtime.serve_gc_request(table, pid);
             self.state.engines.insert(pid, engine);
             // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended at
@@ -897,41 +1050,44 @@ impl ProcessRunner for RuntimeRunner<'_> {
                     // Keep the parked process **relocation-exempt** for the whole parked
                     // window. While it waits, a delivery or signal can drive a collection of
                     // its heap (`Process::deliver`'s exit cascade is not gated by
-                    // `gc_process_enabled`) against the *published* root snapshot.
+                    // `gc_process_enabled`) against the *machine's own* root set, which is the
+                    // only snapshot there is: the exemption is what makes every one of those
+                    // sites refuse the move (see `park_machine`).
                     //
-                    // That snapshot is not the whole truth, and the two protections are **not**
-                    // equivalent. The installed host collection gate
-                    // (`crate::context::gc_walk::RuntimeCollectionGate`) declines only when an
-                    // **unscanned container is reachable from the receiver's GATHERED roots**
-                    // (`seed_process_roots`); this exemption refuses *any* relocation for the
-                    // parked window. The gap it covers is a live term the host holds **outside**
-                    // that gathered set — the runner's own entry terms (`ProcessEngine::args`,
-                    // `ProcessEntry::Fun::fun`, `LocalFunTarget::args`) and any live `Eterm` in
-                    // the host's Rust state — which the walk cannot see, plus
-                    // `Runtime::serve_gc_request`, which gates its descent on the per-pid latch
-                    // (`foreign_reachable`) rather than always descending, so it can miss a
-                    // depth-≥2 foreign container the gate's unconditional descent would catch.
-                    // Exempting is **decline-only**: such a delivery takes the ordinary
-                    // heap-fragment fallback (`Process::deliver`'s raw refusal), and the
-                    // process's own next admission point — after it is resumed, where the
-                    // exemption is cleared above — collects as usual, so nothing grows
-                    // unboundedly. Pinned by
+                    // That machine-local root set is not the whole truth of what the host holds,
+                    // and the two protections are **not** equivalent. The installed host
+                    // collection gate (`crate::context::gc_walk::RuntimeCollectionGate`)
+                    // declines only when an **unscanned container is reachable from the
+                    // receiver's GATHERED roots** (`seed_process_roots`); this exemption refuses
+                    // *any* relocation for the parked window. The gap it covers is a live term
+                    // the host holds **outside** that gathered set — the runner's own entry terms
+                    // (`ProcessEngine::args`, `ProcessEntry::Fun::fun`,
+                    // `LocalFunTarget::args`) and any live `Eterm` in the host's Rust state —
+                    // which the walk cannot see, plus `Runtime::serve_gc_request`, which gates
+                    // its descent on the per-pid latch (`foreign_reachable`) rather than always
+                    // descending, so it can miss a depth-≥2 foreign container the gate's
+                    // unconditional descent would catch. Exempting is **decline-only**: such a
+                    // delivery takes the ordinary heap-fragment fallback (`Process::deliver`'s
+                    // raw refusal), and the process's own next admission point — after it is
+                    // resumed, where the exemption is cleared above — collects as usual, so
+                    // nothing grows unboundedly. Pinned by
                     // `super::tests::a_parked_process_stays_relocation_exempt_for_its_parked_window`.
                     process.set_relocation_exempt(true);
                 }
-                // Publish the machine's roots before the engine is parked. The parked process
-                // is relocation-exempt (set above), so the parked window itself is not
-                // collected over; the publication is what the resume's re-sync relies on (see
-                // `publish_parked_roots`). The FR prefix is published exactly as far as
-                // `fr_mark` measured it live, and the same count is stored on the engine for the
-                // resume to replay.
-                engine.fr_published = fr_count;
-                publish_parked_roots(table, pid, &mut engine.machine, fr_count);
+                // Park the machine. This window is relocation-exempt for its whole duration (set
+                // just above), so no collection can move this process's heap and the machine is
+                // still the authoritative root set: `park_machine` therefore skips the
+                // publication, and the resume skips the matching re-sync (an identity
+                // round-trip over the whole x file, the stack and the live FR prefix, twice per
+                // message on a two-process ping-pong). The FR prefix bookkeeping is recorded all
+                // the same.
+                park_machine(table, pid, &mut engine, fr_count, true);
                 // A pending `garbage_collect` request (see `Runtime::request_gc`) is **not**
                 // served here: the exemption set above declines it — `serve_gc_request`
                 // consults `Process::is_relocation_exempt` before committing to a collection —
                 // so the request is consumed and dropped like any other valve-refused one.
-                // The admission points and the `Yield` arm are the sites that serve it.
+                // The admission points and a publishing `Yield` window are the sites that serve
+                // it.
                 self.runtime.serve_gc_request(table, pid);
                 self.state.engines.insert(pid, engine);
                 // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended
