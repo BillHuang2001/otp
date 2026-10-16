@@ -427,7 +427,7 @@ pub(super) fn resume_from_process_roots(
 /// the machine's own stack), so the extra-root half of the hand-off is not needed either: with no
 /// publication there is no extra root to set, and the resume's clear is a no-op that leaves the
 /// process's `extra_roots` exactly as empty as it was.
-fn park_machine(
+pub(super) fn park_machine(
     table: &mut ProcessTable,
     pid: ProcessId,
     engine: &mut ProcessEngine,

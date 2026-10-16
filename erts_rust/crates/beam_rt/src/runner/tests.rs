@@ -43,8 +43,8 @@ use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::run::{
-    publish_parked_roots, registered_payload_total, reset_registered_payload_total,
-    reset_run_slice_counters, run_slice_counters, RuntimeRunner,
+    park_publish_counters, publish_parked_roots, registered_payload_total,
+    reset_registered_payload_total, reset_run_slice_counters, run_slice_counters, RuntimeRunner,
 };
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
 use crate::context::RuntimeContext;
@@ -2315,8 +2315,20 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
         .stack()
         .len();
     assert_eq!(
-        published, machine_stack_len,
-        "a float-free park publishes only the machine's Erlang stack, never any FR word"
+        published, 0,
+        "a float-free `receive` park opens a **relocation-exempt** window, so it publishes \
+         nothing at all: the parked machine (whose own Erlang stack is {machine_stack_len} words) \
+         stays the authoritative root set"
+    );
+    assert_eq!(
+        park_publish_counters().skipped,
+        1,
+        "the structural counter records the skipped publication"
+    );
+    assert_eq!(
+        park_publish_counters().published,
+        0,
+        "an exempt park publishes no machine root set"
     );
     assert_eq!(
         state
@@ -2325,7 +2337,7 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
             .expect("the parked engine")
             .fr_published,
         0,
-        "the park published a zero-length FR prefix and recorded that count for the resume"
+        "the park still records a zero-length FR prefix on the engine"
     );
     assert_eq!(
         rt.gc_stats().pinned,
@@ -2359,7 +2371,7 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
 /// the **one**-word live prefix, not the 1024-slot file, and `ProcessEngine::fr_published`
 /// records that same count for the resume — without needing compiled float code.
 #[test]
-fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
+fn a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption() {
     let mut rt = runtime();
     let mut state = RunnerState::default();
     let mut table = table();
@@ -2432,10 +2444,21 @@ fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
         .stack()
         .len();
     assert_eq!(
-        published,
-        machine_stack_len + 1,
-        "a live-FR park publishes the machine's stack plus exactly the live FR prefix \
-         (fr_mark = {fr_mark}), never the whole 1024-slot file"
+        published, 0,
+        "a live-FR park opens a **relocation-exempt** window, so it hands nothing over at all: \
+         the parked machine (whose stack is {machine_stack_len} words plus the live FR prefix \
+         fr_mark = {fr_mark}) stays the authoritative root set, and neither the machine's stack \
+         nor the 1024-slot FR file is copied"
+    );
+    assert_eq!(
+        park_publish_counters().skipped,
+        1,
+        "the structural counter records the skipped publication"
+    );
+    assert_eq!(
+        park_publish_counters().published,
+        0,
+        "an exempt park publishes no machine root set"
     );
     assert_eq!(
         state
@@ -2444,8 +2467,7 @@ fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
             .expect("the parked engine")
             .fr_published,
         fr_mark as usize,
-        "the engine records the published prefix length, so the resume scatters exactly the region \
-         the park published"
+        "the engine still records the live prefix length for the resume's bookkeeping"
     );
 }
 
@@ -2575,7 +2597,7 @@ fn the_live_fr_window_exemption_is_opened_per_slice_and_never_pinned() {
 /// scatter that lost the FR word would leave the machine's slot on a dead from-space word (a
 /// **wrong** term, not merely a stale one).
 ///
-/// The park publishes one FR word (`fr_mark() == 1`), the collection moves the tuple, and the
+/// The hand-off appends one FR word (`fr_mark() == 1`), the collection moves the tuple, and the
 /// resume scatters the relocated word back into FR slot 0.
 #[test]
 fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
@@ -2625,8 +2647,11 @@ fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
         tuple
     };
 
-    // Slice 2: resume (scattering slice 1's empty prefix), then park again — this time with the
-    // one live FR word published onto the process stack.
+    // Slice 2: resume, then park again — an exempt window again (the live FR prefix pins it), so
+    // the park itself hands nothing over. Publish the one live FR word **by hand** instead: that
+    // is exactly what a park of a window a collection *can* enter does, i.e. `park_machine` with
+    // `exempt == false` (a `Yield` park whose slice ended with a dead FR prefix), and it is the
+    // hand-off this test pins.
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
         runner
@@ -2634,15 +2659,19 @@ fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
             .expect("the resume slice runs")
     };
     assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks again");
-    assert_eq!(
-        state
-            .engines
-            .get(&pid)
-            .expect("the parked engine")
-            .fr_published,
-        1,
-        "the park published the one live FR slot"
-    );
+    {
+        let engine = state.engines.get_mut(&pid).expect("the parked engine");
+        assert_eq!(
+            engine.fr_published, 1,
+            "the park recorded the one live FR slot for the resume"
+        );
+        assert!(
+            !engine.parked_published,
+            "the exempt park handed nothing over: the machine is still authoritative"
+        );
+        publish_parked_roots(&mut table, pid, &mut engine.machine, 1);
+        engine.parked_published = true;
+    }
 
     // A genuine MOVING collection over the parked process: it gathers the process's stack
     // (which holds the published FR word at its end) and scatters the relocated words back.
