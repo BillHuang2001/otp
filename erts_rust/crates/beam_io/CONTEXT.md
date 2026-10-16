@@ -7,7 +7,7 @@ Hosts nine subsystems: the `mio`-backed **poller/reactor**, the **`Port`** (a pr
 The API Surface below carries the frozen detail, and the Routing Table names one file per subsystem.
 
 `beam_rt` is the only consumer: it owns the poll loop, the port run queues and the scheduler thread, drives one long-lived `Poller` + `PortRegistry` plus a `SpawnDriver` built from its decoded `open_port/2` terms, and turns `PortNotification`s and the once-only `take_exit_status`/`take_eof` into `{Port,{data,…}}`/`{Port,{exit_status,…}}`/`{Port,eof}` for the owning process (waking a blocked receiver through `beam_process`); `beam_process` observes ports by id (the peer of pids in `ptab`).
-Only `SpawnDriver` is on that path — `tcp_inet`, signal, CPU-time, ddll and the io-device request layer are **not** adopted yet (*Handoffs*).
+Only `SpawnDriver` is on that path — `tcp_inet`/`udp_inet`/`ram_file_drv`, signal, CPU-time, ddll and the io-device request layer are **not** adopted yet (*Handoffs*).
 
 Legacy C ground truth (read-only): `erl_poll.c` + `erl_check_io.c` (poll loop, one-shot re-armed readiness, self-pipe wakeup), `io.c` (the `ioq` queue + the driver callback call sites), `erl_port_task.{c,h}`, `inet_drv.c` + `packet_parser.{c,h}`, `erl_child_setup.c`, `erl_bif_ddll.c` + `erl_unix_sys_ddll.c`, `sys.c`, `erl_time_sup.c` + `erl_bif_info.c` — full paths in the Routing Table and the two child docs.
 
