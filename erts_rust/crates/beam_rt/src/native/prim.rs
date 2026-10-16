@@ -3501,6 +3501,11 @@ halt(0).
                 runtime
                     .format_term(answer, None)
                     .expect("a printable answer")
+                    // Symmetric with the oracle half's `lines()` normalisation: both printers
+                    // terminate each answer (`~p~n`), so the trailing newline is layout, not
+                    // part of the answer, and the comparison is over one rendering per answer.
+                    .trim_end()
+                    .to_string()
             })
             .collect()
     }
@@ -3512,8 +3517,17 @@ halt(0).
     ///
     /// The probe is bounded (`erl -noshell` never exits on its own, so `-s init stop` is
     /// mandatory) and a missing or unanswerable oracle is a **loud skip**, never a silent
-    /// pass. The whole comparison runs under [`with_cwd_restored`], because `set_cwd/1`
-    /// changes the process-wide working directory.
+    /// pass.
+    ///
+    /// **The cwd rule this cross-check depends on.** `prim_file:set_cwd/1` changes the
+    /// process-wide working directory, so the runtime half — and *only* the runtime half — runs
+    /// under [`with_cwd_restored`], which restores the directory it started in. The cwd is
+    /// therefore already valid again before [`prepare_oracle_tree`] re-creates the tree (it
+    /// `remove_dir_all`s the very directory the runtime half chdir'd into) and long before any
+    /// child process is spawned. That ordering is load-bearing: a child inheriting a deleted
+    /// directory cannot resolve its own cwd, so `erl` dies at boot with `getcwd: cannot access
+    /// parent directories` and this comparison silently degrades to a permanent skip instead of
+    /// actually comparing.
     #[test]
     fn the_closed_prim_file_families_agree_with_the_erl_oracle() {
         let Some(oracle) = resolve_oracle() else {
@@ -3523,38 +3537,39 @@ halt(0).
         let dir = scratch_dir("oracle");
         let dir_text = dir.to_str().expect("a UTF-8 path").to_string();
 
-        with_cwd_restored(|| {
-            // This runtime's answers on the fresh tree.
-            prepare_oracle_tree(&dir);
-            let ours = runtime_answers(&dir);
+        // This runtime's answers on the fresh tree. `runtime_answers` ends by chdir'ing into
+        // `dir` (the `set_cwd` case), so it is the guarded half; the guard is *not* nested.
+        prepare_oracle_tree(&dir);
+        let ours = with_cwd_restored(|| runtime_answers(&dir));
 
-            // The oracle's answers on the same fresh tree.
-            prepare_oracle_tree(&dir);
-            let expression = oracle_expression(&dir_text);
-            let args = ["-noshell", "-eval", expression.as_str(), "-s", "init", "stop"];
-            let Some(output) = run_oracle(&oracle, &args) else {
-                skip_oracle_loudly("the oracle probe could not answer within the bound");
-                return;
-            };
-            if !output.status.success() {
-                eprintln!(
-                    "warning: the oracle exited with {:?}\n--- stderr ---\n{}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                skip_oracle_loudly("the oracle probe exited with a failure");
-                return;
-            }
-            let theirs: Vec<String> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| line.trim().to_string())
-                .filter(|line| !line.is_empty())
-                .collect();
-            assert_eq!(
-                theirs, ours,
-                "the prim_file families closed here must agree with the oracle"
+        // The oracle's answers on the same fresh tree, with the cwd already restored: the
+        // re-prepare below unlinks and recreates `dir`, and the probe (below) inherits this
+        // process's cwd.
+        prepare_oracle_tree(&dir);
+        let expression = oracle_expression(&dir_text);
+        let args = ["-noshell", "-eval", expression.as_str(), "-s", "init", "stop"];
+        let Some(output) = run_oracle(&oracle, &args) else {
+            skip_oracle_loudly("the oracle probe could not answer within the bound");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!(
+                "warning: the oracle exited with {:?}\n--- stderr ---\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
             );
-        });
+            skip_oracle_loudly("the oracle probe exited with a failure");
+            return;
+        }
+        let theirs: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            theirs, ours,
+            "the prim_file families closed here must agree with the oracle"
+        );
     }
 
     // -- the `#file_info{}` family cross-check --------------------------------
