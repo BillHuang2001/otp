@@ -368,14 +368,11 @@ constructors only (no new error enum).
 - Folding the **young heap's occupancy** into the fullsweep's size request is what makes the mature
   generation reachable at the default policy — the copying default runs **147 minors : 73 fullsweeps** (young
   233 / mature **376**, total 609) instead of escalating every collection to a fullsweep.
-- GenImmix wins **copy work on long-lived data**, but every win pairs with a footprint/pause loss and an
-  outright loss on the small-heap/high-churn shape; both strategies find the **same** live set. So
-  **`MatureKind::Copying` remains the default**, and Immix is a size-/latency-tolerant option auto-selected
-  at ≥ `IMMIX_BREAK_EVEN_WORDS` (2048 = **8 whole blocks**, read once from the **construction-time**
-  `initial_mature_words` via `mature_words_of(policy)`) or by an explicit pin. The default 233-word mature
-  generation stays on the copying path, and through the runtime's own GC doors the break-even reproduces
-  (`../beam_rt/tests/gc_immix_payload.rs`, `../beam_rt/tests/gc_strategy.rs`; `BEAM_RT_GC_STRATEGY=immix` is
-  the opt-in).
+- GenImmix wins **copy work on long-lived data** but pays footprint and pause on the small-heap/high-churn
+  shape, so **`MatureKind::Copying` remains the default** and Immix is a size-/latency-tolerant option
+  auto-selected at ≥ `IMMIX_BREAK_EVEN_WORDS` (2048 = 8 whole blocks, read from the construction-time
+  `initial_mature_words`) or by an explicit pin (`BEAM_RT_GC_STRATEGY=immix`; the break-even reproduces
+  through `beam_rt`'s own GC doors in `../beam_rt/tests/gc_{immix_payload,strategy}.rs`).
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
