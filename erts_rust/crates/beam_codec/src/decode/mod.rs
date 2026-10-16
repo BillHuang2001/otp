@@ -116,6 +116,19 @@ const MAX_REFERENCE: u32 = 1 << 18;
 /// and a 100,000-element tuple still decode — this constant bounds nesting alone.
 const MAX_DECODE_DEPTH: usize = 1500;
 
+/// The largest element count a decoder container buffer is **pre-sized** from.
+///
+/// A tuple's, a list's and a map's element buffer is allocated with
+/// `wire_count.min(CONTAINER_PREALLOC_CAP)` slots. The containers a real payload
+/// carries (a flat map ≤ 32 pairs, a small tuple, a list spine) are inside the
+/// cap, so a normal decode spends **one** allocation per container instead of a
+/// chain of `Vec` growths — while a count the wire only *claims* still cannot
+/// drive a blind length-proportional allocation: **the cap is the bound**. A
+/// genuinely larger (but valid) container simply grows its buffer on demand as
+/// elements arrive, and a truncated read still fails on the first short read,
+/// because the reserved slots are never trusted as decoded elements.
+const CONTAINER_PREALLOC_CAP: usize = 64;
+
 /// Incremental external term format decoder.
 ///
 /// `new` requires and consumes the leading version byte `131`; `new_body`
@@ -658,10 +671,14 @@ impl<'a> Decoder<'a> {
                     }
                     arity
                 };
-                // Left empty on purpose: a length field is attacker-controlled, so
-                // the allocation must not be sized from it before the bytes that
-                // back the elements have been shown to exist.
-                let mut elems = Vec::new();
+                // Pre-sized from the wire arity but clamped to
+                // `CONTAINER_PREALLOC_CAP`: a normal tuple spends one allocation
+                // instead of a chain of `Vec` growths, while an attacker-controlled
+                // arity still cannot drive an unbounded allocation (the cap is the
+                // bound, and an arity above it just grows the buffer on demand).
+                // The reserved slots are never trusted as decoded elements, so a
+                // truncated read still fails on the first short read.
+                let mut elems = Vec::with_capacity(arity.min(CONTAINER_PREALLOC_CAP));
                 for _ in 0..arity {
                     elems.push(self.decode(heap, atoms)?);
                 }
@@ -680,7 +697,11 @@ impl<'a> Decoder<'a> {
             }
             Tag::List => {
                 let len = self.reader.u32be()? as usize;
-                let mut elems = Vec::new();
+                // Pre-sized like a tuple (see `CONTAINER_PREALLOC_CAP`): bounded by
+                // the cap, so a claimed length can over-reserve at most that much
+                // and the elements still come from the wire one short read at a
+                // time.
+                let mut elems = Vec::with_capacity(len.min(CONTAINER_PREALLOC_CAP));
                 for _ in 0..len {
                     elems.push(self.decode(heap, atoms)?);
                 }
@@ -701,12 +722,12 @@ impl<'a> Decoder<'a> {
                 if (count >> 31) != 0 {
                     return Err(bad_arg());
                 }
-                // The pair count is attacker-controlled, so the pairs vector grows
-                // as pairs are read rather than being pre-sized from `count`; a
-                // count that overruns the wire fails on the first truncated read
-                // (below), never with a blind length-driven allocation. The wire
-                // order is interleaved `K1,V1,…,Kn,Vn`.
-                let mut pairs = Vec::new();
+                // Pre-sized like a tuple (see `CONTAINER_PREALLOC_CAP`): the pair
+                // buffer gets one allocation for a normal map instead of a chain of
+                // `Vec` growths, while a count the wire only claims can over-reserve
+                // at most the cap and a truncated stream still fails on the first
+                // short read. The wire order is interleaved `K1,V1,…,Kn,Vn`.
+                let mut pairs = Vec::with_capacity(count.min(CONTAINER_PREALLOC_CAP));
                 for _ in 0..count {
                     let key = self.decode(heap, atoms)?;
                     let value = self.decode(heap, atoms)?;

@@ -67,6 +67,12 @@ map for the source subtree and the notes the child nodes inherit.
   slot is a `beam_term` layout decision (**owner: `beam_term`**). This is a documented,
   honest limitation, not a bug.
 
+- **Two source files sit over the ~1000-line target:** `decode/mod.rs` (~1438) and
+  `encode/mod.rs` (~1376). Each is a single state machine — the whole `match tag`
+  dispatch plus its per-tag emitters — and neither has accrued a second
+  responsibility. A future split should move arms by tag family into `decode/`/
+  `encode/` submodules, leaving `Decoder`/`Encoder` as the only state.
+
 ## Routing Table
 - `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] mod term;`
 - `ref_wire.rs` → internal-reference `id` ↔ wire-number mapping (`REF_MASK`/`REF1_NUM_MASK`, pack/unpack)

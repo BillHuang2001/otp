@@ -202,9 +202,13 @@ fn main() {
         "  codec share of one Erlang-level round trip (encode+decode, warm): {:.1} ns",
         encode_ns + decode_ns
     );
+    // The `109917.8` figure is the m14 *published* whole-op marginal: it is inflated by the
+    // bench harness's non-interleaved N-op / 0-op passes (see `ETF_COST.md` §1), and the fair
+    // whole-op baseline is ~1546 ns. Only what is *measured* above is the codec's own share.
     println!(
-        "  whole-op baseline from tools/bench/RESULTS.md (m14, rust): 109917.8 ns; \
-         the rest is the runtime's payload/0, BIF dispatch and the match"
+        "  published whole-op marginal from tools/bench/RESULTS.md (m14, rust): 109917.8 ns \
+         (a non-interleaved-harness artifact — the fair whole-op baseline is ~1546 ns, \
+         see ETF_COST.md); the rest is the runtime's payload/0, BIF dispatch and the match"
     );
 
     // The measurements above must not be optimised away; touch them once more.
