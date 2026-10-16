@@ -113,6 +113,63 @@ shared catch-aware `raise_bif_error`.
   eight comparison BIFs have baseline-JIT inline paths (see `../jit/baseline/emit/`), everything else deopts to
   `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction`.
 
+## Typed-error inventory (interpreter core) — no fixable "oracle-succeeds but we bail" site
+Every typed error this core (and the `machine/` machinery it drives) can return is one of three classes; a real
+`erl`-compiled `.beam` never hits classes 1 or 2 as a *divergence* — class 1 is malformed-bytecode robustness and
+class 2 is a capability gap owned by another node.
+- **Class 1 — malformed/hand-built-bytecode robustness (NOT reachable from valid `.beam`, so never a divergence).**
+  These mirror C's own `ASSERT`/unchecked invariants; C would move `E`/index and hit UB, this core returns a typed
+  error instead.
+  - `run: pc out of range` (`dispatch.rs:232`) and `run: function index out of range` (`dispatch.rs:234`) — the
+    dispatch loop's `func`/`pc` bounds; the loader bounds both for a real image.
+  - Every `error::bad_register(n)` (`operand.rs:68/71/73/157/159/161/203/204`, `machine/registers.rs:201/223`,
+    `machine/frames.rs:132/135/142/182`, `interpreter/bif.rs:239/261`, `dispatch.rs:804/805/806/933/934`) — the
+    loader's decoder rejects a register index `>= MAX_REG = 1024` (`beam_loader/src/decode.rs:66`), so only a
+    caller-side clamp (`Machine::with_max_register`) or a test reaches it.
+  - `error::unknown_label(..)` → `BadArg` (`mod.rs:201/208/209`) and `call: import out of range` (`mod.rs:242/419`)
+    — a label/import id the module does not define; the loader resolves these for a real image.
+  - Frame guards `run: no current frame` (`frames.rs:163/175`), `pop_frame: no frame` (`:213`),
+    `deallocate: no frame` / `deallocate: frame size mismatch` (`:225/228`), `trim: no frame` /
+    `trim: n exceeds frame size` / `trim: stack underflow` (`:249/252/256`) — C's `deallocate` is
+    `E = ADD_BYTE_OFFSET(E, N)` and `i_trim` is `E += N` (`emu/instrs.tab:66-69`, `:593-594`), both unchecked.
+  - Catch guards `exceptions: stale catch frame` (`catch.rs:239/278`) and `exceptions: catch frame stack underflow`
+    (`:282`), and `run: unknown module context` (`mod.rs:673`, `drive.rs:149/222`) — internal frame/context
+    bookkeeping; only a bug in this crate or a malformed image reaches them.
+  - `run_export: export not found` (`run.rs:116`), `process_info: function index out of range` (`location.rs:426`),
+    the `operand: …` arms (`operand.rs:82/83/165/167/169/194/195`), `test: missing argument` (`test.rs:229`), the
+    `*: arity operand` arms (`test.rs:147/166/210`) — all "the IR/operand is not shaped as this arm requires".
+- **Class 2 — capability gaps owned OUTSIDE this node** (a typed error here is honest; the fix lives in the owner).
+  - `Instr::Generic` sentinel → `Err(error::unsupported(op.name()))` (`generic.rs:44`): the loader emitted no typed
+    variant. **0 corpus occurrences** (the whole-OTP census loads 1366 `.beam` / 2,888,257 instructions with zero
+    residual `Generic`). Owner: `beam_loader` (add the typed variant).
+  - `call: import module atom` / `call: import function atom` (`mod.rs:422/425`): the module's load-time atom table
+    cannot name the import's atom. Owner: `beam_rt` (the shared live atom namespace) / the loader.
+  - `operand: literal` (`operand.rs:82/165`): the index is past the module's `LitT`. Owner: `beam_loader`/`beam_codec`.
+- **Class 3 — the one arguable FIXABLE-IN-NODE candidate: `function_clause`/class-atom resolution.**
+  `function_clause_raise` (`dispatch.rs:1305-1323`) resolves the `function_clause` reason atom (and installs the
+  `error` class atom, `:1318`) **only** from the running module's own atom table (`:1311`), and returns
+  `error::unsupported("<what>: no 'function_clause' atom in the module")` when absent; the class-atom twin
+  `class_atom` (`machine/catch.rs:259-269`) returns `exceptions: no atom for the '<class>' exception class …` when
+  absent.
+  C resolves these **globally** and unconditionally: `i_func_info_IaaI` sets `c_p->freason = EXC_FUNCTION_CLAUSE`
+  and `goto handle_error` with no module lookup (`emu/beam_emu.c:578-583`), the reason comes from the global
+  `error_atom[]` table (`beam_common.c:382-406`, `EXC_FUNCTION_CLAUSE` → `am_function_clause`), and the class atom
+  is `exception_tag[GET_EXC_CLASS(...)]` (`beam_common.c:544`).
+  An oracle probe confirmed a real module image (`fc.beam`, a failed head clause) has **no** `function_clause`
+  atom while `erl` still raises it — so the gap is real but **masked in production**: `beam_rt` seeds the shared
+  `CORE_ATOMS` prefix with `function_clause`/`error`/`exit`/`throw` (`beam_rt/src/boot.rs:127/161-163`), so the
+  module's post-load snapshot resolves it and `beam_rt` never observes this error.
+  A non-seeding host (`MinimalContext`, a bare embedder) can hit it; the sound in-node fix is a name-resolution
+  seam (a host-supplied global atom namespace), **not** a substituted index — the same shape as the already-adopted
+  `ExecutionContext::atom_name`/`atoms` seams. It is therefore a narrow, host-compensated item, not a divergence
+  through the shipped runtime.
+
+**Headline:** the interpreter core has **no fixable fallback gap** that the shipped runtime actually hits — every
+typed error here is malformed-bytecode robustness (class 1) or an owner-outside-this-node capability gap (class 2);
+the only arguable in-node item (class 3, `function_clause`) is already compensated by `beam_rt`'s `CORE_ATOMS`.
+`error::blocked()` (`run.rs:74`) is **not** a gap — the blocking-aware entries report `RunOutcome::Wait`; the
+non-blocking `run_export`/`run_label` fold it (Handoff #1, owner `beam_rt`).
+
 ## Routing Table
 - `dispatch.rs` → the dispatcher + run entries; `Machine::step_instruction` is the JIT helper's deopt target, and
   `Machine::call_ext_dispatch` + `ImportFrame` are the shared `call_ext*` body a tier drives.
