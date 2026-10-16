@@ -247,8 +247,10 @@ tagging is why.** Interleaved matched-N A/B through the bench harness (`--quick 
 --workloads foreign`, `$BEAM_RT` per variant, N = 25 000, 3 rounds per side, host loadavg 23–61):
 `case_emqx_base62_encode_ns_per_call` HEAD `75ee31bef3` 17 730 / 17 277 / 22 217 ns vs the m10 baseline
 `b4593818b3` 16 381 / 22 797 / 18 697 ns — **ratio of medians 0.95×**, mean of the three round ratios
-1.01× (a quiet-host replication at loadavg 2.5–4 gives a median 1.06×); the m13 tree `a141d6878c`, which
-reproduces the recorded regression on this host at **3.91×** m10, shows the comparison is discriminating.
+1.01×; two independent quiet-host replications (loadavg 2.5–4 and 0.96–1.40, 3 rounds each) give
+**1.06×** and **1.07×**, i.e. parity within the run-to-run spread. The m13 tree `a141d6878c`, which
+reproduces the recorded regression on this host at **3.91×–3.97×** m10, shows the comparison is
+discriminating.
 Startup-cancelled per-call marginals (`N = 0 / 5 000 / 25 000 / 60 000`): HEAD 9.4 / 16.6 / 24.4 µs, m10
 13.2 / 16.8 / 27.5 µs → **head/m10 0.71 / 0.99 / 0.89, flat in N** with no superlinear residual, while
 m13 climbs 36.3 / 68.1 / 126.9 µs (5.2× HEAD at N = 60 000).
