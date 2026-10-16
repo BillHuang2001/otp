@@ -98,6 +98,10 @@ fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     atoms.seed(["true", "false", "ok", "case_clause", "mock"]);
     atoms.seed(MOCK_FUNS.iter().map(|(_, _, name)| *name));
+    // The map-or-iterator walk resolves `none` (its terminal marker) and the
+    // structured `badmap` reason tag through the table, and the bad-iterator probes
+    // use two more atoms as an unreadable path head/tail.
+    atoms.seed(["none", "badmap", "foo", "bar"]);
     atoms
 }
 
@@ -448,4 +452,367 @@ fn without_a_fun_caller_the_maps_fun_bifs_are_a_typed_unsupported() {
         .call("maps", "fold", 3, &mut ctx, &[fun, make_small(41), empty])
         .expect("maps:fold/3");
     assert_eq!(number(acc), 41);
+}
+
+// ---------------------------------------------------------------------------
+// `MapOrIter`: a map OR a `maps` iterator
+// ---------------------------------------------------------------------------
+//
+// `maps.erl` gives each of these four functions a `map(Fun, Map) when is_map(Map)`
+// clause and a `map(Fun, Iter) when is_function(Fun, 2)` clause that walks anything
+// else through `try_next/2` — so a `maps:iterator/1,2` result is a first-class
+// argument (`beam_ssa_recv:plan_clears/2` relies on it:
+// `maps:fold(F, #{}, maps:iterator(UsageMap, ordered))`). A bad iterator is the
+// structured `error:{badmap, Iter}` naming the **original** argument, and `none` is a
+// valid empty iterator while `[]` is not.
+
+/// The shapes a `MapOrIter` argument can take.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    /// The map term itself (the `is_map(Map)` clause).
+    Map,
+    /// `maps:iterator/1` — `[0 | Map]`.
+    Path,
+    /// The `maps:iterator(Map, ordered)` shape — `[Keys | Map]`.
+    Ordered,
+    /// The `{Key, Value, NextIter}` look-ahead `maps:next/1` returns, which is itself
+    /// a valid iterator (`try_next/2`'s first clause).
+    Next,
+}
+
+/// `maps:iterator(M)` through the registry — the `[0 | M]` improper cons.
+fn iterator(reg: &BifRegistry, ctx: &mut BifContext<'_>, map: Eterm) -> Eterm {
+    reg.call("maps", "iterator", 1, ctx, &[map]).expect("maps:iterator/1")
+}
+
+/// `maps:next(maps:iterator(M))` — the `{Key, Value, NextIter}` look-ahead.
+fn look_ahead(reg: &BifRegistry, ctx: &mut BifContext<'_>, map: Eterm) -> Eterm {
+    let iter = iterator(reg, ctx, map);
+    reg.call("maps", "next", 1, ctx, &[iter]).expect("maps:next/1")
+}
+
+/// `map` in the requested shape: the map, its `[0 | M]` iterator, a `[Keys | M]`
+/// ordered iterator over the map's own stored-order keys, or the `{K,V,Iter}`
+/// look-ahead.
+fn shaped(reg: &BifRegistry, ctx: &mut BifContext<'_>, shape: Shape, map: Eterm) -> Eterm {
+    match shape {
+        Shape::Map => map,
+        Shape::Path => iterator(reg, ctx, map),
+        Shape::Ordered => {
+            // `maps:iterator(M, ordered)` is `[KeysOf(M) | M]`: the walk order is then
+            // the map's own stored order, so all four shapes must agree exactly.
+            let keys = reg.call("maps", "keys", 1, ctx, &[map]).expect("maps:keys/1");
+            ctx.cons(keys, map).expect("fits")
+        }
+        Shape::Next => look_ahead(reg, ctx, map),
+    }
+}
+
+/// Runs `maps:<function>` with `fun` and `arg` (`init` is `fold/3`'s accumulator).
+fn run_fun_bif(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    function: &str,
+    fun: Eterm,
+    init: i64,
+    arg: Eterm,
+) -> Result<Eterm> {
+    match function {
+        "fold" => reg.call("maps", "fold", 3, ctx, &[fun, make_small(init), arg]),
+        other => reg.call("maps", other, 2, ctx, &[fun, arg]),
+    }
+}
+
+/// The `(Key, Value)` pairs the mock was called with, in **visit** order.
+fn visited_in_order(calls: &[(i64, Vec<Eterm>)]) -> Vec<(i64, i64)> {
+    calls
+        .iter()
+        .map(|(_, args)| (number(args[0]), number(args[1])))
+        .collect()
+}
+
+/// The `{Key, Value}` pairs of a map **or an iterator** as small integers, in **visit**
+/// order (`maps:to_list/1` accepts both, so it is the order-sensitive view).
+fn pairs_in_order(reg: &BifRegistry, ctx: &mut BifContext<'_>, arg: Eterm) -> Vec<(i64, i64)> {
+    let list = reg.call("maps", "to_list", 1, ctx, &[arg]).expect("maps:to_list/1");
+    elements(list)
+        .into_iter()
+        .map(|pair| {
+            (
+                number(tuple_element(pair, 0).expect("a key")),
+                number(tuple_element(pair, 1).expect("a value")),
+            )
+        })
+        .collect()
+}
+
+/// Every one of the four `fun`-taking BIFs walks a map, a `[0 | M]` iterator, a
+/// `[Keys | M]` ordered iterator and a `{K,V,Iter}` look-ahead **identically** —
+/// same result, same pairs, and the same visit order (the map's own stored order).
+#[test]
+fn every_fun_bif_walks_a_map_and_every_iterator_shape_alike() {
+    for shape in [Shape::Map, Shape::Path, Shape::Ordered, Shape::Next] {
+        let ((stored, mapped, mapped_size, total, kept, kept_size, ok), calls) =
+            with_mock(|reg, ctx| {
+                let map = int_map(reg, ctx, &[(1, 10), (2, 20), (3, 30)]);
+                let stored = pairs_in_order(reg, ctx, map);
+                let arg = shaped(reg, ctx, shape, map);
+                let add = mock_fun(ctx, KEY_PLUS_VALUE);
+                let acc = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+                let gt = mock_fun(ctx, VALUE_GT_15);
+                let mapped = run_fun_bif(reg, ctx, "map", add, 0, arg).expect("maps:map/2");
+                let total = run_fun_bif(reg, ctx, "fold", acc, 0, arg).expect("maps:fold/3");
+                let kept = run_fun_bif(reg, ctx, "filter", gt, 0, arg).expect("maps:filter/2");
+                let ok = run_fun_bif(reg, ctx, "foreach", add, 0, arg).expect("maps:foreach/2");
+                (
+                    stored,
+                    pairs(reg, ctx, mapped),
+                    size(reg, ctx, mapped),
+                    number(total),
+                    pairs(reg, ctx, kept),
+                    size(reg, ctx, kept),
+                    ok,
+                )
+            });
+        // Oracle: maps:map(fun(K,V) -> K+V end, #{1=>10,2=>20,3=>30}) => #{1=>11,2=>22,3=>33};
+        // maps:fold(fun(K,V,Acc) -> Acc+K*V end, 0, …) => 140;
+        // maps:filter(fun(_K,V) -> V > 15 end, …) => #{2=>20,3=>30}.
+        assert_eq!(mapped, vec![(1, 11), (2, 22), (3, 33)], "map/2 via {shape:?}");
+        assert_eq!(mapped_size, 3, "map/2 via {shape:?}");
+        assert_eq!(total, 140, "fold/3 via {shape:?}");
+        assert_eq!(kept, vec![(2, 20), (3, 30)], "filter/2 via {shape:?}");
+        assert_eq!(kept_size, 2, "filter/2 via {shape:?}");
+        assert_eq!(
+            ok,
+            make_atom(seeded_atoms().lookup("ok").expect("seeded")),
+            "foreach/2 via {shape:?}"
+        );
+        // Each of the four traversals visited every pair once, in the map's stored
+        // order — `filter`'s rejected pair included (`maps.erl:747`).
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            expected.extend_from_slice(&stored);
+        }
+        assert_eq!(visited_in_order(&calls), expected, "visit order via {shape:?}");
+    }
+}
+
+/// The **path** — not the map's storage order — decides the walk order: `[Keys | M]`
+/// visits `Keys` in the path's own order, exactly as the oracle's
+/// `maps:iterator(M, ordered)` / `(M, reversed)` / `(M, CmpFun)` do.
+#[test]
+fn the_ordered_path_decides_the_walk_order() {
+    let ((), calls) = with_mock(|reg, ctx| {
+        let map = int_map(reg, ctx, &[(1, 10), (2, 20), (3, 30)]);
+        let acc = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+        for keys in [[1i64, 2, 3], [3, 2, 1]] {
+            let path: Vec<Eterm> = keys.iter().map(|&k| make_small(k)).collect();
+            let path = ctx.list(&path).expect("fits");
+            let arg = ctx.cons(path, map).expect("fits");
+            let total = run_fun_bif(reg, ctx, "fold", acc, 0, arg).expect("maps:fold/3");
+            assert_eq!(number(total), 140);
+        }
+    });
+    // Oracle: maps:iterator(M, ordered) visits 1,2,3 and maps:iterator(M, reversed)
+    // visits 3,2,1 — the two paths are the reverse of each other here.
+    assert_eq!(
+        visited_in_order(&calls),
+        vec![(1, 10), (2, 20), (3, 30), (3, 30), (2, 20), (1, 10)]
+    );
+}
+
+/// The atom `none` is a valid `MapOrIter` holding no pair: `fold` answers `Init`,
+/// `map`/`filter` `#{}`, `foreach` `ok` — and the fun is never called.
+#[test]
+fn none_is_a_valid_empty_iterator_for_every_fun_bif() {
+    let ((mapped, mapped_size, total, kept, kept_size, ok), calls) = with_mock(|reg, ctx| {
+        let none = ctx.atom("none").expect("seeded");
+        let add = mock_fun(ctx, KEY_PLUS_VALUE);
+        let acc = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+        let gt = mock_fun(ctx, VALUE_GT_15);
+        let mapped = run_fun_bif(reg, ctx, "map", add, 0, none).expect("maps:map/2");
+        let total = run_fun_bif(reg, ctx, "fold", acc, 41, none).expect("maps:fold/3");
+        let kept = run_fun_bif(reg, ctx, "filter", gt, 0, none).expect("maps:filter/2");
+        let ok = run_fun_bif(reg, ctx, "foreach", add, 0, none).expect("maps:foreach/2");
+        (
+            pairs(reg, ctx, mapped),
+            size(reg, ctx, mapped),
+            number(total),
+            pairs(reg, ctx, kept),
+            size(reg, ctx, kept),
+            ok,
+        )
+    });
+    // Oracle: maps:map(_Fun, none) => #{}; maps:fold(_Fun, 41, none) => 41;
+    // maps:filter(_Pred, none) => #{}; maps:foreach(_Fun, none) => ok.
+    assert!(mapped.is_empty());
+    assert_eq!(mapped_size, 0);
+    assert_eq!(total, 41);
+    assert!(kept.is_empty());
+    assert_eq!(kept_size, 0);
+    assert_eq!(ok, make_atom(seeded_atoms().lookup("ok").expect("seeded")));
+    assert!(calls.is_empty(), "`none` holds no pair to visit");
+}
+
+/// `maps:iterator(#{}` is likewise a valid empty iterator (its chain terminates at
+/// `none` immediately).
+#[test]
+fn the_empty_maps_iterator_is_a_valid_empty_iterator() {
+    let (total, calls) = with_mock(|reg, ctx| {
+        let empty = reg.call("maps", "new", 0, ctx, &[]).expect("maps:new/0");
+        let arg = iterator(reg, ctx, empty);
+        let acc = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+        let total = run_fun_bif(reg, ctx, "fold", acc, 9, arg).expect("maps:fold/3");
+        number(total)
+    });
+    // Oracle: maps:fold(_Fun, 9, maps:iterator(#{})) => 9.
+    assert_eq!(total, 9);
+    assert!(calls.is_empty());
+}
+
+/// An argument that is neither a map nor a walkable iterator is the structured
+/// `error:{badmap, Arg}` naming the **original** argument — never a sub-iterator and
+/// never a fabricated empty result. `[]` is not an iterator: only `none` terminates.
+#[test]
+fn a_non_iterator_argument_is_the_structured_badmap_naming_the_original() {
+    let ((), _) = with_mock(|reg, ctx| {
+        let map = int_map(reg, ctx, &[(1, 10)]);
+        let empty_list = ctx.list(&[]).expect("fits"); // `[]`
+        let five = make_small(5); // `5`
+        let foo = ctx.atom("foo").expect("seeded");
+        let atom_path = ctx.cons(foo, map).expect("fits"); // `[foo | Map]`
+        let bad_tail = ctx.cons(make_small(1), five).expect("fits"); // `[1 | 5]`
+        let badmap = ctx.atom("badmap").expect("seeded");
+        for arg in [empty_list, five, atom_path, bad_tail] {
+            let reason = ctx.tuple(&[badmap, arg]).expect("fits");
+            for (function, operation) in [
+                ("map", KEY_PLUS_VALUE),
+                ("fold", ACC_KEY_TIMES_VALUE),
+                ("filter", VALUE_GT_15),
+                ("foreach", KEY_PLUS_VALUE),
+            ] {
+                let fun = mock_fun(ctx, operation);
+                assert_structured(run_fun_bif(reg, ctx, function, fun, 0, arg), ctx, reason);
+            }
+        }
+    });
+}
+
+/// An **improper** ordered path tail (`[[foo | bar] | Map]`) is the same structured
+/// `{badmap, Arg}` (`ordered_badarg` in the C, `maps.erl`'s `next/1` `badarg`).
+#[test]
+fn an_improper_ordered_path_is_the_structured_badmap_naming_the_original() {
+    let ((), _) = with_mock(|reg, ctx| {
+        let map = int_map(reg, ctx, &[(1, 10), (2, 20)]);
+        let foo = ctx.atom("foo").expect("seeded");
+        let bar = ctx.atom("bar").expect("seeded");
+        let path = ctx.cons(foo, bar).expect("fits"); // `[foo | bar]`
+        let arg = ctx.cons(path, map).expect("fits");
+        let reason = ctx
+            .tuple(&[ctx.atom("badmap").expect("seeded"), arg])
+            .expect("fits");
+        for (function, operation) in [
+            ("map", KEY_PLUS_VALUE),
+            ("fold", ACC_KEY_TIMES_VALUE),
+            ("filter", VALUE_GT_15),
+            ("foreach", KEY_PLUS_VALUE),
+        ] {
+            let fun = mock_fun(ctx, operation);
+            assert_structured(run_fun_bif(reg, ctx, function, fun, 0, arg), ctx, reason);
+        }
+    });
+}
+
+/// The `is_function(Fun, Arity)` clause-head guard still fires **before** the
+/// `MapOrIter` argument is looked at, so a bad fun is the plain `error:badarg` even
+/// when the second argument is not a map or an iterator either
+/// (oracle: `maps:fold(5, 0, not_a_map)` ⇒ `error:badarg`).
+#[test]
+fn a_bad_fun_still_wins_over_a_bad_iterator_argument() {
+    let ((), _) = with_mock(|reg, ctx| {
+        let not_an_iterator = make_small(7);
+        for function in ["map", "fold", "filter", "foreach"] {
+            match run_fun_bif(reg, ctx, function, make_small(5), 0, not_an_iterator) {
+                Err(BeamError::BadArg) => {}
+                other => panic!("maps:{function} with a non-fun must be badarg, got {other:?}"),
+            }
+        }
+    });
+}
+
+/// The fun for a pair runs **before** the `next/1` that yields the following pair
+/// (`maps.erl:948`'s `[{K, Fun(K, V)} | map_1(Fun, try_next(Iter, Tag), Tag)]`), so a
+/// fun that raises wins over a continuation that cannot be read — and the fun was
+/// applied to the pairs before the failure.
+#[test]
+fn the_fun_runs_before_the_next_walk_step() {
+    // A look-ahead `{1, 10, [foo | Map]}` whose continuation is not walkable.
+    let ((), calls) = with_mock(|reg, ctx| {
+        let map = int_map(reg, ctx, &[(1, 10)]);
+        let bogus = ctx.cons(ctx.atom("foo").expect("seeded"), map).expect("fits");
+        let iter = ctx
+            .tuple(&[make_small(1), make_small(10), bogus])
+            .expect("fits");
+        let raises = mock_fun(ctx, RAISES);
+        match run_fun_bif(reg, ctx, "map", raises, 0, iter) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("the fun's own raise must win, got {other:?}"),
+        }
+    });
+    assert_eq!(
+        calls.len(),
+        1,
+        "the fun ran for the first pair before the unreadable continuation was walked"
+    );
+
+    // The same interleaving witness through `filter/2`'s non-boolean predicate result:
+    // the reason is the fun's `{case_clause, 1}`, not the unreadable continuation's
+    // `{badmap, _}`.
+    let ((), calls) = with_mock(|reg, ctx| {
+        let map = int_map(reg, ctx, &[(1, 10)]);
+        let bogus = ctx.cons(ctx.atom("foo").expect("seeded"), map).expect("fits");
+        let iter = ctx
+            .tuple(&[make_small(1), make_small(10), bogus])
+            .expect("fits");
+        let key = mock_fun(ctx, KEY);
+        let expected = ctx
+            .tuple(&[ctx.atom("case_clause").expect("seeded"), make_small(1)])
+            .expect("fits");
+        assert_structured(run_fun_bif(reg, ctx, "filter", key, 0, iter), ctx, expected);
+    });
+    assert_eq!(calls.len(), 1);
+}
+
+/// A >32-key HAMT iterator round trip: `fold/3` over `maps:iterator/1` of a 40-pair
+/// map visits every pair exactly once (the 32-pair first chunk plus its tail), and
+/// `map/2` over the iterator rebuilds the same map as `map/2` over the map itself.
+#[test]
+fn fold_over_a_hamt_iterator_visits_every_pair_once() {
+    let (total, calls) = with_mock(|reg, ctx| {
+        let many: Vec<(i64, i64)> = (1..=40).map(|n| (n, n)).collect();
+        let hamt = int_map(reg, ctx, &many);
+        let arg = iterator(reg, ctx, hamt);
+        let acc = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+        let total = run_fun_bif(reg, ctx, "fold", acc, 0, arg).expect("maps:fold/3");
+        number(total)
+    });
+    // Oracle: maps:fold(fun(K,V,Acc) -> Acc + K*V end, 0, maps:iterator(M)) with
+    // M = maps:from_list([{N,N} || N <- lists:seq(1,40)]) => lists:sum([N*N || N <-
+    // lists:seq(1,40)]) = 22140.
+    assert_eq!(total, 22140);
+    assert_eq!(calls.len(), 40, "every pair exactly once");
+    assert_eq!(observed(&calls), (1..=40).map(|n| (n, n)).collect::<Vec<_>>());
+
+    let ((via_iter, via_map), _) = with_mock(|reg, ctx| {
+        let many: Vec<(i64, i64)> = (1..=40).map(|n| (n, n)).collect();
+        let hamt = int_map(reg, ctx, &many);
+        let arg = iterator(reg, ctx, hamt);
+        let add = mock_fun(ctx, KEY_PLUS_VALUE);
+        let mapped_iter = run_fun_bif(reg, ctx, "map", add, 0, arg).expect("maps:map/2");
+        let mapped_map = run_fun_bif(reg, ctx, "map", add, 0, hamt).expect("maps:map/2");
+        (pairs(reg, ctx, mapped_iter), pairs(reg, ctx, mapped_map))
+    });
+    assert_eq!(via_iter, via_map, "the iterator must rebuild the same map");
+    assert_eq!(via_iter.len(), 40);
+    assert_eq!(via_iter[0], (1, 2));
 }
