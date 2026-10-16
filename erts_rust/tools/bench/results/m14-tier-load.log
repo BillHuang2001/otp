@@ -1,0 +1,4 @@
+interp before: 74.70 62.27 68.29 120/1560 3
+interp exit=0 after: 43.32 61.16 67.42 20/992 821
+default before: 43.32 61.16 67.42 20/992 822
+default exit=0 after: 40.66 52.14 62.46 32/1056 1640
