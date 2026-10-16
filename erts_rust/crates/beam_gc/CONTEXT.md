@@ -642,8 +642,8 @@ constructors only (no new error enum).
 - `src/config.rs` → `GcConfig`, `MatureKind`, `MatureSelection`, `mature()`/`mature_choice()`, `growable`
 - `src/selection.rs` → the automatic rule: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`,
   `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice`
-- `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, `ImmixStats`/
-  `ImmixCounters`
+- `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, the `release_*`
+  rollback primitives, `ImmixStats`/`ImmixCounters`
 - `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
 - `src/immix_collector.rs` → `GenImmixCollector`: `scan_young`, fullsweep sizing via `live_full`,
   `grow_major`/`relocate_major`, `ensure_capacity`, the collect/collect_minor/collect_major driver
