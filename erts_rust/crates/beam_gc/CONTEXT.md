@@ -248,10 +248,13 @@ constructors only (no new error enum).
   `tests/generational_cadence.rs`, `tests/steady_state.rs`, `tests/mature_capacity_convergence.rs`;
   `MEASURED.md`.
 - **`GenImmixCollector` = the same copying nursery + a mark-region mature space; its major reclaims the
-  mature generation *first*.** A **minor** promotes the nursery's live terms into the `ImmixSpace` through
-  the shared `copy.rs` forwarding protocol over a private `PromoteDest` (`EvacDest` classifying against the
-  nursery's `FromSet`, reserving from `ImmixSpace::alloc_words`) — the barrier-free invariant holds because
-  promotion only ever moves young objects *into* mature. A **major** is the prescribed
+  mature generation *first*.** A **minor** promotes the nursery's live terms into the `ImmixSpace` through an
+  **atomic two-phase driver** (`src/immix_collector/promote.rs`, `Result<PromoteOutcome>`): phase R reserves
+  each first-time live object (`ImmixSpace::alloc_words`), copies its words and writes the forwarding marker,
+  but rewrites **no** reference word; phase C rewrites the recorded slots and roots only once every object of
+  the traversal has been placed — the barrier-free invariant holds because promotion only ever moves young
+  objects *into* mature, and a reservation that finds no run rolls both spaces back byte-for-byte
+  (`PromoteOutcome::WouldNotFit`) instead of leaving a half-forwarded heap. A **major** is the prescribed
   `ImmixSpace::collect`-then-promote order, made sound for the young→mature edge an in-place reclaim cannot
   ignore: a read-only `scan_young` reports the promotion's exact **line** count and every nursery reference
   word pointing into mature (`(slot, term)` pairs); `ImmixSpace::collect` takes those terms as its
