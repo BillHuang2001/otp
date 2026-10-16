@@ -37,9 +37,25 @@ use crate::Step;
 
 use super::super::{
     extract_bits, fail_step, le_bytes_to_digits, make_int, raw, read_uint_be, read_uint_le,
-    sign_extend, twos_complement_bits, BSF_LITTLE, BSF_SIGNED,
+    sign_extend, twos_complement_bits, BSF_LITTLE, BSF_NATIVE, BSF_SIGNED,
 };
 use super::match_ctx::read_ctx;
+/// True when a field's decoded `BSF_*` flags select **little-endian** byte order.
+///
+/// `BSF_LITTLE` asks for little-endian directly. `BSF_NATIVE` is the C loader's
+/// `native` flag: `beam_asm:flag_to_bit/1` encodes `native` as `16#10`
+/// (`emu/generators.tab`'s `$NativeEndian` then collapses it to the *target's* own
+/// order at load time), so on a little-endian target `native` reads exactly as
+/// `BSF_LITTLE` and on a big-endian target as the big-endian default. A field's flags
+/// reach a reader either as a **raw `u32`** operand (the standalone
+/// `bs_get_integer2`/`bs_get_float2`/`bs_get_utf8,16,32`/`bs_skip_utf*` opcodes, whose
+/// flags the loader decodes with `as_u32`) or through [`super::super::decode_flags`]
+/// (the `bs_match` commands and `bs_create_bin` segments, which already normalise
+/// `native` through `flag_bit`), so a reader must resolve the pair here instead of
+/// testing `BSF_LITTLE` alone.
+pub(crate) fn field_is_little(flags: u32) -> bool {
+    flags & BSF_LITTLE != 0 || (flags & BSF_NATIVE != 0 && cfg!(target_endian = "little"))
+}
 /// Run a UTF skip: advance the position by the decoded length, or fail.
 pub(crate) fn skip_utf(
     machine: &mut Machine,
@@ -85,7 +101,7 @@ pub(crate) fn read_integer_field(
     nbits: usize,
     flags: u32,
 ) -> Result<Eterm> {
-    let little = flags & BSF_LITTLE != 0;
+    let little = field_is_little(flags);
     // A byte-aligned little-endian field is the only one `read_uint_le` handles;
     // every other little-endian field takes the general bit-level path (C's
     // `erts_copy_bits_fwd` + `*MSB >>= 8 - BIT_OFFSET(num_bits)`,
@@ -140,7 +156,7 @@ pub(crate) fn read_wide_integer_field(
     // The field's bits, MSB-first, left-aligned in `num_bytes` bytes.
     let field = extract_bits(bytes, start, nbits)?;
     let mut value = vec![0u8; num_bytes];
-    if flags & BSF_LITTLE != 0 {
+    if field_is_little(flags) {
         let rem = nbits % 8;
         for (j, out) in value.iter_mut().enumerate() {
             *out = if j + 1 == num_bytes && rem != 0 {
@@ -220,7 +236,7 @@ pub(crate) fn read_float_field(
     if nbits == 0 {
         return Ok(0.0);
     }
-    let little = flags & BSF_LITTLE != 0;
+    let little = field_is_little(flags);
     let raw = if little {
         read_uint_le_bits(bytes, start, nbits)?
     } else {
@@ -342,7 +358,7 @@ pub(crate) fn decode_utf16(
     end: usize,
     flags: u32,
 ) -> Option<(u32, usize)> {
-    let little = flags & BSF_LITTLE != 0;
+    let little = field_is_little(flags);
     if end < start + 16 {
         return None;
     }
@@ -361,15 +377,60 @@ pub(crate) fn decode_utf16(
     Some((((w1 & 0x3FF) << 10 | (w2 & 0x3FF)) + 0x10000, 32))
 }
 /// Decode one UTF-32 scalar from bit `start` (`i_bs_validate_unicode_retract`): a
-/// 32-bit big-endian read that must be a valid Unicode scalar
-/// (≤ U+10FFFF, not a surrogate).
-pub(crate) fn decode_utf32(bytes: &[u8], start: usize, end: usize) -> Option<(u32, usize)> {
+/// 32-bit read whose byte order follows the field flags (`big` is the default,
+/// `little`/`native` are resolved by [`field_is_little`]) that must be a valid
+/// Unicode scalar (≤ U+10FFFF, not a surrogate).
+///
+/// C rewrites `bs_get_utf32` into `bs_get_integer2 … 32 1 <Flags>` plus
+/// `i_bs_validate_unicode_retract` (`emu/ops.tab:1296-1307`), so the 32-bit field is
+/// read through the same endianness handling `erts_bs_get_integer_2` uses and the
+/// `-little`/`-native` flags **are** honoured.
+pub(crate) fn decode_utf32(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    flags: u32,
+) -> Option<(u32, usize)> {
     if end < start + 32 {
         return None;
     }
-    let value = read_uint_be(bytes, start, 32).ok()? as u32;
+    let raw = if field_is_little(flags) {
+        read_uint_le_bits(bytes, start, 32)
+    } else {
+        read_uint_be(bytes, start, 32)
+    };
+    let value = raw.ok()? as u32;
     if value > 0x10FFFF || (0xD800..=0xDFFF).contains(&value) {
         return None;
     }
     Some((value, 32))
+}
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the field readers over raw bit patterns; every expected value is
+    //! the system `erl` oracle's answer for the same bits.
+    use super::*;
+    use crate::context::MinimalContext;
+    /// A little-endian integer field whose width is **not** a whole number of bytes is
+    /// read bit-granularly — neither rejected nor mis-read as big-endian.
+    ///
+    /// [`read_uint_le`] only accepts whole bytes, so such a field takes the general
+    /// wide path ([`read_wide_integer_field`], C's `fmt_big_le` trailing
+    /// `*buf <<= 8 - offs` adjustment). The oracle's `<<16#0102:12/little>>` is
+    /// `<<2,1:4>>` (`BitWriter::push_uint_le` in `../mod.rs`), so reading that payload
+    /// back as a 12-bit little-endian field must yield `16#0102`: the first 8-bit group
+    /// is the least-significant byte and the final 4-bit group is the value's high
+    /// nibble. A naive MSB-first read of the same bits would give `16#021`.
+    #[test]
+    fn read_integer_field_accepts_a_non_byte_multiple_little_endian_field() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let term = read_integer_field(&mut machine, &mut ctx, &[0x02, 0x10], 0, 12, BSF_LITTLE)
+            .expect("a 12-bit little-endian field reads bit-granularly");
+        assert!(
+            beam_term::is_small(term),
+            "16#102 fits a small integer, so no bignum is built"
+        );
+        assert_eq!(beam_term::signed_value(term), 0x102);
+    }
 }
