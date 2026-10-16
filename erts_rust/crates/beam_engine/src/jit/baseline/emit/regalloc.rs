@@ -39,8 +39,11 @@
 //! `machine.x` slot since the last event that synced the two. There are exactly two
 //! syncing events:
 //!
-//! * the **prologue**, which loads the whole cache *from* `machine.x`, so every cached
-//!   register starts the block clean; and
+//! * the **prologue**, which loads the block's **live-in** cache slots *from*
+//!   `machine.x` — a cached register the block writes before it first reads is never
+//!   loaded, and the rule is self-containment (each block and continuation sub-block
+//!   loads its own cache) — so every register the block reads before it writes starts
+//!   the block clean; and
 //! * **any helper call's spill** (a [`super::emit_helper_call`] begins with a
 //!   [`super::regs::spill`]) followed by the helper running: the spill writes the dirty
 //!   registers out, so afterwards every cached register equals its `machine.x` slot — and

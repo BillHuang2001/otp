@@ -253,7 +253,7 @@ impl Allocation {
     /// entry ([`Allocation::entry_fill`]).
     ///
     /// A table that does not exist (a synthetic allocation from a unit test)
-    /// conservatively loads the whole cache, the pre-live-in model.
+    /// carries no live-in set, so it conservatively loads the whole cache.
     pub(crate) fn entry_loads(&self, x: u32) -> bool {
         match &self.entry_fill {
             Some(set) => set.contains(&x),
