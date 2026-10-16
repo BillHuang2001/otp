@@ -262,9 +262,11 @@ the same shape).
 The mechanism is the one the previous pass recorded, and it is off the path now: `Nursery::grow` retires
 the old space into `retired` and only `Nursery::collapse` — reached at a collection — clears it, so a
 runtime that never collects walks an ever-longer `spaces()` = `retired.chain(current)` through
-`root_is_unscanned` → `Nursery::contains` on every admission; HEAD tags the driver's constant
-literal-area binary (ancestor `98d65f2fd3`, `crates/beam_loader/src/literal.rs`), the root is scanned, the
-valve no longer fires, a collection runs about every 1.5 calls and the chain stays collapsed.
+`root_is_unscanned` → `Nursery::contains` on every admission; HEAD tags the decoded literal area
+(ancestor `98d65f2fd3`, `crates/beam_loader/src/literal.rs` — `tag_literal_area`, the safe form of the C
+load-time `erts_set_literal_tag`), so the walk recognizes the driver's constant literal-area binary as an
+off-heap literal rather than an unscanned container, the valve no longer fires, a collection runs about
+every 1.5 calls and the retired chain stays collapsed.
 
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.
