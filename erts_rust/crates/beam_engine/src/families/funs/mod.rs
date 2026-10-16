@@ -461,6 +461,17 @@ fn raise_badarity(
 /// with `f(5)` ⇒ `{error,{badfun,5}}`, and a 2-ary closure called with one argument
 /// ⇒ `{error,{badarity,{Fun,[one]}}}`).
 ///
+/// **The classification is gated on the running module naming the reason tag.** C's
+/// global `error_atom` table always names `badfun`/`badarity`, so C always raises the
+/// structured reason; this engine's atoms are module-local indices, so a module that
+/// cannot name the tag declines to the host *closure-apply* seam
+/// ([`ExecutionContext::resolve_local_fun`] ⇒ [`ExecutionContext::apply_fun`], which
+/// owns a live namespace and produces the faithful reason) rather than fabricating or
+/// substituting an atom — the same "never substitute a wrong atom" convention
+/// [`reason_atom`] follows. A module that *does* name the tag (every `beam_rt`
+/// process, whose core-atom set seeds `badfun`/`badarity`) takes the structured-reason
+/// path unchanged.
+///
 /// A well-formed target then proceeds unchanged: the host is consulted through
 /// [`ExecutionContext::resolve_local_fun`], and a host that owns the closure's
 /// defining module answers `Some((callee_module, lambda_entry_label))` so the engine
@@ -501,9 +512,14 @@ fn call_fun(
 ) -> Result<Option<Step>> {
     let fun = source.read(machine, ctx)?;
     if !terms::is_fun(fun) {
-        return raise_badfun(machine, module, &source, ctx).map(Some);
-    }
-    if terms::fun_arity(fun)? != arity {
+        // Only raise the structured reason when the running module can actually
+        // name the tag; otherwise fall through to the seam below (see the doc
+        // comment: `beam_rt` seeds `badfun`, so the real runtime always takes this
+        // path, while an atom-poor test module reaches the `apply_fun` fallback).
+        if module.atom_table.lookup("badfun").is_some() {
+            return raise_badfun(machine, module, &source, ctx).map(Some);
+        }
+    } else if terms::fun_arity(fun)? != arity && module.atom_table.lookup("badarity").is_some() {
         return raise_badarity(machine, module, &source, arity, ctx).map(Some);
     }
     let args = register_args(machine, arity)?;

@@ -596,10 +596,14 @@ fn call_fun_with_a_matching_arity_still_reaches_the_apply_fun_fallback() {
 }
 
 #[test]
-fn call_fun_without_the_badfun_atom_is_the_typed_unsupported() {
+fn call_fun_without_the_badfun_atom_declines_to_the_apply_fun_fallback() {
     // The engine's atom-independence convention: a running module that cannot name
-    // the reason atom yields the typed `unsupported` rather than substituting a
-    // different atom (the same convention `EXIT`/`badfield`/`{badmap,_}` follow).
+    // the reason atom never substitutes a different atom. There is no structured
+    // reason to raise, so the target-shape classification declines and the call
+    // falls through to the host closure-apply seam exactly as before the shape
+    // check existed — a non-fun target over a `MinimalContext` (no hook) therefore
+    // reaches the trait-default `apply_fun` ⇒ the typed `unsupported_opcode:
+    // apply_fun`.
     let mut fixture = Fixture::new();
     let entry = call_fun_caller(&mut fixture);
     let module = fixture.finish();
@@ -621,7 +625,7 @@ fn call_fun_without_the_badfun_atom_is_the_typed_unsupported() {
         0,
         &mut ctx,
     )
-    .expect_err("the module cannot name `badfun`");
+    .expect_err("the module cannot name `badfun`, so the fallback is consulted");
     let got = match err {
         BeamError::Raise(raise) => raise
             .reason
@@ -631,8 +635,8 @@ fn call_fun_without_the_badfun_atom_is_the_typed_unsupported() {
         other => panic!("expected the typed unsupported, got {other:?}"),
     };
     assert_eq!(
-        got, "unsupported_opcode: call_fun: no 'badfun' atom in the module",
-        "a missing reason atom must never be substituted"
+        got, "unsupported_opcode: apply_fun",
+        "an unnameable reason tag declines to the `apply_fun` fallback"
     );
     assert_eq!(machine.catch_frame_depth(), 1, "the handler was not used");
     let _ = entry;
