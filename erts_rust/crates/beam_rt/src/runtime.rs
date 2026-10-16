@@ -2690,24 +2690,43 @@ impl Runtime {
     ///    `Ok`, an ordinary `Err`, and `erlang:halt/0,1`'s (a raise like any other) alike. That
     ///    is why the swap is captured and restored around the call instead of living in a
     ///    `Drop`: the restore is one line, and an error path can never leak the child's pid.
-    /// 5. The child is then **removed from the process table**, so an action leaves no entry
-    ///    behind: `erlang:processes/0`, `system_info(process_count)` and the `+JPperf` map must
-    ///    describe the node the action left, not the action's own scaffolding. (The oracle's
-    ///    action process terminates when the action is over, for the same reason.)
+    /// 5. An `Ok` result is **copied onto the runtime's pointer-stable store** before the child is
+    ///    ended, because the term `body` built lives on the *child's* heap, which ends with it —
+    ///    the same move, for the same reason, the runner makes for `x(0)` of a scheduled process
+    ///    (`crate::runner`: "copy it onto the runtime's pointer-stable arena (so it outlives the
+    ///    process, whose own heap dies with it)"). Without it the caller holds a dangling `Eterm`:
+    ///    reading it back is a use-after-free (observed as a term whose tuple header is garbage).
+    ///    The restore in step 4 happens first so the escape-store gate is latched for the pid that
+    ///    will read the term back — the runtime's own ([`Runtime::self_pid`]) — not for the child
+    ///    whose death drops the mark.
+    /// 6. The child is then **ended the way this runtime ends every process that returns**: a
+    ///    normal exit through [`ProcessTable::terminate`], not a silent removal from the table.
+    ///    That is what the oracle's action process does when the action is over (it exits
+    ///    `normal`), and it is what makes the observable end state right — `erlang:processes/0`,
+    ///    `system_info(process_count)` and the `+JPperf` map describe the node the action left,
+    ///    while the death *itself* still runs (the exit observer, i.e. the ETS-owner drain, plus
+    ///    the link/monitor/name teardown every other dying process gets). `ProcessTable::remove`
+    ///    would skip all of that.
     ///
     /// Nothing else about the node moves: `whereis(init)`, `process_info(init, …)`,
     /// `which_applications/0`, `init:get_status/0`, the boot script and the `run <file.beam>`
     /// action (which runs its own scheduled process) all keep answering the root process,
     /// because only the *action's own identity* changes.
     ///
+    /// The child is spawned **bare** ([`ProcessTable::spawn`] links nothing and registers no
+    /// monitor), so its normal exit propagates to nobody — in particular it does not signal the
+    /// root process.
+    ///
     /// # Errors
     ///
-    /// The process table's allocation failure when the child cannot be spawned; anything
-    /// `body` returns otherwise.
-    fn as_action_process<T>(
+    /// The process table's allocation failure when the child cannot be spawned, the arena's
+    /// `error:system_limit` when the result genuinely does not fit the pointer-stable store, and
+    /// anything `body` returns otherwise. The child is ended on **every** path, including the
+    /// failing ones.
+    fn as_action_process(
         &mut self,
-        body: impl FnOnce(&mut Runtime) -> Result<T>,
-    ) -> Result<T> {
+        body: impl FnOnce(&mut Runtime) -> Result<Eterm>,
+    ) -> Result<Eterm> {
         let root_pid = self.self_pid;
         let action_pid = self.processes.spawn(self.default_spawn_policy())?;
         let leader = self.group_leader_of(root_pid);
@@ -2715,7 +2734,21 @@ impl Runtime {
         let previous = std::mem::replace(&mut self.self_pid, action_pid);
         let result = body(self);
         self.self_pid = previous;
-        // SCRATCH: self.processes.remove(action_pid);
+        // Step 5: the result escapes the child's heap *before* the child is ended. A payload the
+        // action built off-heap (or received in a message) is resolved through the child's own
+        // scan state and the runtime's escaped-payload store, exactly as the runner resolves a
+        // scheduled process's `x(0)` (`Runtime::source_payloads`).
+        let result = match result {
+            Ok(term) => {
+                let payloads = self.source_payloads(action_pid, &[]);
+                self.stabilize_term_with(term, &payloads)
+            }
+            Err(err) => Err(err),
+        };
+        // Step 6: the child exits `normal` — the reason a process that returns exits with — so a
+        // normal end-of-action is not an abnormal one for anything watching the node.
+        let reason = self.intern("normal");
+        self.processes.terminate(action_pid, reason)?;
         result
     }
 
