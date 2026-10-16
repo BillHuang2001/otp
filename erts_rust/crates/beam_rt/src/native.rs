@@ -398,6 +398,7 @@ impl RuntimeContext<'_> {
             ("code", "is_sticky", 1) => Some(self.code_is_sticky_1(args)),
             ("code", "is_sticky", 2) => Some(self.code_is_sticky_2()),
             ("code", "ensure_loaded", 1) => Some(self.code_ensure_loaded(args)),
+            ("code", "ensure_modules_loaded", 1) => Some(self.code_ensure_modules_loaded(args)),
             ("code", "load_file", 1) => Some(self.code_load_file(args)),
             ("code", "lib_dir", 0) => Some(self.code_lib_dir_0()),
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),

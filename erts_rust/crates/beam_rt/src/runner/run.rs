@@ -626,10 +626,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
         //     (`context::gc::ensure_heap_full`, from `test_heap`/`allocate_heap`), which publishes
         //     the machine's **whole** root set — the FR file included — so a live float register is
         //     relocated exactly like an x register and a float-using call site collects exactly
-        //     like a float-free one. Declining *that* door (the previous shape of this valve, a
-        //     permanent [`Runtime::pin_process`](crate::runtime::Runtime)) refuses **every** later
-        //     collection, so a float-operation loop can never collect and its nursery grows with
-        //     the program's whole allocation history instead.
+        //     like a float-free one. Declining *that* door — an earlier shape of this valve, which
+        //     marked the process permanently un-collectable — would refuse **every** later
+        //     collection, so a float-operation loop could never collect and its nursery would grow
+        //     with the program's whole allocation history instead.
         //   * **across the inter-slice window** the park published the live FR prefix onto the
         //     process stack (`publish_parked_roots`, with the same `fr_count`) and the matching
         //     resume scatters that region back into the machine's FR slots
