@@ -206,9 +206,10 @@ Current: **677 passing / 0 failing / 2 ignored** — **477** lib in-module (`#[c
   `beam_rt` mitigates by notifying the port owner before closing.
 - **A multi-fd driver's readiness is not per-fd.** `DriverState::fd_armed` always hands `ready_input`/`ready_output` the first `BTreeMap`-ordered fd matching the direction, so a port with ≥2 fds selected the same way would starve the others; correcting it needs the fired fd reported through the poller/`DriverContext` (a frozen-seam change).
   Harmless for every current driver (one fd each).
-- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1978, `src/registry.rs` 1955, `src/drivers/inet/tests.rs` 1602, `src/drivers/efile.rs` 1404, `src/drivers/inet/mod.rs` 1331, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1193, `src/signal.rs` 1105, `src/abi/port.rs` 1038, `src/port.rs` 1024 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
-  `src/abi/host.rs` is **941** with its in-module suite split out into `src/abi/host_tests.rs` (808); all other modules are under 1000 (`src/port_task.rs` 889, `src/fs_access.rs` 645, `src/drivers/line_buffer.rs` 609).
-  If a source half grows, split its test module into a sibling `tests/` file (as `src/drivers/inet/` and `src/abi/` already do).
+- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1978, `src/registry.rs` 1955, `src/drivers/inet/tests.rs` 1602, `src/drivers/efile.rs` 1404, `src/drivers/inet/mod.rs` 1331, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1193, `src/drivers/ram_file_tests.rs` 1144, `src/signal.rs` 1105, `src/abi/port.rs` 1038, `src/port.rs` 1024 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
+  At the 1000-line baseline: `tests/ram_file.rs` 1000.
+  `src/abi/host.rs` is **941** with its in-module suite split out into `src/abi/host_tests.rs` (808); all other modules are under 1000 (`src/port_task.rs` 889, `src/fs_access.rs` 645, `src/drivers/line_buffer.rs` 609, `src/drivers/inet/udp.rs` 709, `src/drivers/ram_file.rs` 540, `tests/udp_inet.rs` 898).
+  If a source half grows, split its test module into a sibling file (as `src/drivers/inet/udp/`, `src/drivers/ram_file_tests.rs` and `src/abi/` already do).
 
 ## Handoff to beam_rt — the CPU-time facility
 `beam_rt` owns the `erlang:statistics(runtime)` BIF and must adopt `src/cpu_time.rs`:
