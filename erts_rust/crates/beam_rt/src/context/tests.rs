@@ -371,6 +371,8 @@ fn ets_lookup_inside_an_ets_foldl_fun_reaches_the_folded_table() {
 fn ets_lookup_inside_an_ets_foldr_fun_reaches_the_folded_table() {
     let mut rt = runtime();
     // The right-to-left twin: the accumulated list is built from the nested lookups.
+    // Oracle (`erl -noshell -eval '…' -s init stop`, the identical expression): prints
+    // `[1,2,3,4]`, exit 0.
     let term = rt
         .eval(
             "begin T = ets:new(t, [ordered_set]), \
@@ -388,10 +390,13 @@ fn ets_lookup_inside_an_ets_foldr_fun_reaches_the_folded_table() {
 /// inside a fold's fun (deliberately *not* on [`RuntimeContext::tables_capable`]) applies a
 /// second fun whose `ets:lookup/2` must still resolve.
 ///
-/// The shape is driven through the native floor rather than `-eval` because the oracle's own
-/// `-eval` route cannot express a fun nested inside a fun (it exits 1 for
-/// `ets:foldl(fun(X,A) -> A + lists:sum([X]) end, 0, T)` too), so there is no oracle stdout to
-/// compare against; the assertion is the runtime's own answer.
+/// The innermost lookup is keyed on `element(1, X)`: `ets:foldl/3` hands its fun the stored
+/// **object** (the whole tuple), and looking a tuple up as a key finds nothing, so `hd([])`
+/// would raise `badarg` on **this** runtime and on the oracle alike.
+///
+/// Oracle (`erl -noshell -eval '…' -s init stop`, the identical expression): prints `100`,
+/// exit 0 — so the shape crosses the `-eval` evaluator's fun-inside-a-fun boundary on both
+/// runtimes and the assertion below is a real oracle cross-check.
 #[test]
 fn ets_lookup_survives_a_fold_fun_through_a_lists_map_fun() {
     let mut rt = runtime();
@@ -401,11 +406,13 @@ fn ets_lookup_survives_a_fold_fun_through_a_lists_map_fun() {
              [ets:insert(T, {X, X * 10}) || X <- [1,2,3,4]], \
              ets:foldl(fun(X, A) -> \
                  A + lists:sum(lists:map(fun(Y) -> \
-                     element(2, hd(ets:lookup(T, Y))) end, [X])) end, 0, T) end",
+                     element(2, hd(ets:lookup(T, Y))) end, [element(1, X)])) end, 0, T) end",
         )
         .expect("ets:lookup through a fold fun and a lists:map fun");
     assert_eq!(signed_value(term), 100, "(1+2+3+4)*10");
-}#[test]
+}
+
+#[test]
 fn the_arena_is_unbounded_in_milestone_one() {
     let mut rt = runtime();
     let mut ctx = RuntimeContext::new(&mut rt);
