@@ -210,10 +210,10 @@ fn match_spec_test_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> 
 
 /// The `table` dialect: lint, then compile and run through `beam_ets`.
 fn test_table(ctx: &mut BifContext<'_>, against: Eterm, spec: Eterm) -> Result<Eterm> {
-    // The spec's guards/bodies may compute arithmetic; install this crate's
-    // arbitrary-precision `ArithHook` over `beam_ets` for the run (the same scoped
-    // install every `ets:*` select-family BIF opens — `crate::ets::arith_hook`).
-    let _arith = crate::ets::arith_hook::PrecisionArith::install();
+    // The spec's guards/bodies may compute arithmetic and may read `self/0`; install
+    // this crate's two match-spec seams over `beam_ets` for the run (the same scoped
+    // aggregate every `ets:*` select-family BIF opens — `crate::ets::self_hook`).
+    let _eval = crate::ets::self_hook::SpecEval::install(ctx.self_pid());
     if let Some(message) = structural_lint(spec) {
         return lint_error(ctx, message);
     }

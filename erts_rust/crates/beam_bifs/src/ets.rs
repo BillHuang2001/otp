@@ -220,6 +220,10 @@ mod matches;
 /// backed by [`crate::arith`]'s arbitrary-precision operators, plus the scoped
 /// install guard every match-spec-evaluating BIF opens (see `./arith_hook.rs`).
 pub(crate) mod arith_hook;
+/// The match-spec `self/0` `SelfHook` this crate installs over `beam_ets` (the
+/// calling process's pid) and [`self_hook::SpecEval`], the aggregate scoped guard
+/// that opens **both** match-spec seams at once (see `./self_hook.rs`).
+pub(crate) mod self_hook;
 /// The compiled match-spec family (`ets:match_spec_compile/1`,
 /// `ets:match_spec_run/2`): the opaque compiled-spec handle and its registry.
 ///
@@ -1356,10 +1360,11 @@ fn parse_updates(spec: Eterm) -> Result<Vec<(usize, Eterm)>> {
 /// `MatchSpec` is a raw match-spec list compiled by [`beam_ets::compile`]; a spec
 /// outside the supported subset is `badarg`.
 fn select_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    // A match-spec guard/body may compute arithmetic (bignums included); install this
-    // crate's arbitrary-precision `ArithHook` over `beam_ets` for the evaluation
-    // (`arith_hook`), restoring the seam's default when the guard drops.
-    let _arith = arith_hook::PrecisionArith::install();
+    // A match-spec guard/body may compute arithmetic (bignums included) and may
+    // read `self/0`; install this crate's arbitrary-precision `ArithHook` **and**
+    // `SelfHook` over `beam_ets` for the evaluation (`self_hook::SpecEval`),
+    // restoring each seam's default when the guard drops.
+    let _eval = self_hook::SpecEval::install(ctx.self_pid());
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
 
@@ -1383,7 +1388,7 @@ fn select_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// that finishes first yields the results with no continuation. `Limit` is a
 /// non-negative integer and `0` is `badarg` (the oracle raises it).
 fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let _arith = arith_hook::PrecisionArith::install();
+    let _eval = self_hook::SpecEval::install(ctx.self_pid());
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     // A non-integer or a negative limit is `badarg` here; `0` is rejected by
@@ -1464,8 +1469,8 @@ pub(super) fn resume_continuation(
     resume: impl FnOnce(&Table, &MatchContinuation, bool, &AtomTable, &mut Heap) -> Result<Traversal>,
 ) -> Result<Eterm> {
     // A resumed traversal re-evaluates the stored compiled spec (guards/bodies), so
-    // the arbitrary-precision `ArithHook` must be live here too (`arith_hook`).
-    let _arith = arith_hook::PrecisionArith::install();
+    // both match-spec seams must be live here too (`self_hook::SpecEval`).
+    let _eval = self_hook::SpecEval::install(ctx.self_pid());
     let handle = ref_thing_id(cont_term)?;
     let owner = Some(resolve::caller_owner(ctx));
     {
