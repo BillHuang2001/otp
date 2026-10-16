@@ -230,15 +230,16 @@ the oracle's class. Entries marked *divergence* are honest but not byte-identica
   nothing.
 - **Arithmetic widens even small ints to a heap `Big`:** `erlang:'-'/2` of two small ints does ~4 small `Vec`
   allocations (a `Big::from_i64` per operand, then `sub`/`add`/`neg`) with no checked-`i64` fast path.
-- **The `AtomTable` deep clone is copy-on-write** (`beam_rt`'s `CodeServer::atoms_mut`): only a call that actually
-  **interns** pays it. Independent of that clone, `with_decode_scratch`/`prefix_matches` (`src/binconv.rs:1085-1091`,
-  called from `:1101-1117`) revalidate the decode-scratch image by walking **every** memo index on **every**
-  `binary_to_term` call — Θ(atom-table) `name` lookups + `&str` compares (~4100 atoms after boot) whether or not any
-  atom is novel; only the *allocation* count is table-size-independent (`tests/decode_hot_path.rs`). This is the
-  hotspot the `copy_bound/etf_roundtrip` benchmark's ~110 µs/op (vs sys 0.81 µs) reflects. The O(1) replacement
-  already exists upstream (`beam_term::AtomTable::snapshot()` + `appended_since`, an `{instance, generation, len}`
-  witness — `beam_term/src/atom.rs:212`/`:250`) but is **unadopted** here and in `beam_rt/src/nif.rs` (see Handoffs).
-  Fix direction: store the shared table's `AtomSnapshot` beside the memo and validate with `appended_since`.
+- **The `AtomTable` deep clone is copy-on-write** (`beam_rt`'s `CodeServer::atoms_mut`): only an interning call pays it.
+- **The decode scratch revalidates in O(1) in the steady state:** the per-thread *exact image* of the caller's table
+  (`DECODE_SCRATCH`'s `memo`) carries a `beam_term::AtomSnapshot` witness **taken from the shared table itself**
+  (`DecodeScratch::witness`; a clone's fresh identity can never satisfy it), so `memo.len() == witness.len()` plus
+  `shared.appended_since(witness)` proves index-identity with **zero** name reads — only names appended since are copied.
+- **`prefix_matches` is the fallback, not the hot path:** its Θ(atom-table) `name` reads run only for a replaced or
+  shrunk instance, or a memo left **longer** than the shared table by a failed/`safe` decode (rejected by that length
+  check alone); a rejected memo is rebuilt with one `AtomTable::clone` and the witness refreshes either way.
+- **`beam_rt/src/nif.rs` still revalidates its own decode memo index by index** (a private `prefix_matches`): the O(1)
+  witness is **unadopted** there (Handoffs).
 - **`term_to_binary/1` and `binary_to_term/1` allocation inventory** (one 5-key-map round trip): encode = 2 `Vec<u8>`
   (the `Encoder`'s 128-byte `Writer` + `plain_image`'s `body.len()+1` image) + the on-heap binary block
   (`beam_alloc` bump, O(size)); decode = 1 `Vec<u8>` (`access::binary_bytes`'s `to_vec`) + 1 `Vec<(Eterm,Eterm)>`
