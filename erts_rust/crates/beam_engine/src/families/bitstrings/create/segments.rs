@@ -96,13 +96,29 @@ pub(super) fn string_source<'a>(
         .ok_or_else(|| error::unsupported("bs_create_bin: string segment outside the StrT table"))
 }
 
-/// The `f64` a float-segment value denotes: an Erlang float, or a small integer
-/// (a bignum would need `big_to_double`, which is not available).
+/// The `f64` a float-segment value denotes: an Erlang float, a small integer, or a
+/// **bignum** (its nearest finite double).
+///
+/// C's `erts_bs_put_float` (`erl_bits.c:1341`) has three accepted value shapes — a
+/// float, a small integer, and a **bignum** via `is_big(arg)` -> `big_to_double`
+/// (`:1371` for the 64-bit arm and `:1404` for the 32-bit arm). `big_to_double`'s
+/// `< 0` return — a magnitude too large for a finite double — sets
+/// `c_p->fvalue = am_no_float` and returns the arg, which the construct loop raises
+/// as the bare `badarg`; that is the `None` arm here.
+///
+/// [`beam_term::number::big_to_f64`] is the faithful `big_to_double` port (the same
+/// helper `families/floats/convert.rs` uses), so a bignum is **encoded** rather than
+/// wrongly rejected, and only an out-of-range magnitude still fails.
 pub(super) fn float_source(value: Eterm) -> Option<f64> {
     if let Some(f) = crate::terms::float_value(value).ok() {
         return Some(f);
     }
-    small_value(value).map(|n| n as f64)
+    if let Some(n) = small_value(value) {
+        return Some(n as f64);
+    }
+    // A small integer takes the arm above; a bignum here. A non-number (or a
+    // magnitude that overflows a finite double) yields `None` -> `badarg`.
+    beam_term::number::big_to_f64(value)
 }
 
 // ---------------------------------------------------------------------------
