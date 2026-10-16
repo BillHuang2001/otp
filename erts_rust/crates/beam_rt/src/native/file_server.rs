@@ -67,7 +67,7 @@
 //! * **The io-device.** A successful `{open,Name,ModeList}` returns `{ok, IoPid}`
 //!   (`file_io_server:start_link/3`, `file_io_server.erl:57-96`). `IoPid` speaks the
 //!   `{file_request,From,ReplyAs,Request}` → `{file_reply,ReplyAs,Reply}` protocol for
-//!   `close`/`{position,At}`/`sync`/`truncate` and the
+//!   `close`/`{position,At}`/`sync`/`truncate`/`{read_handle_info,Opts}` and the
 //!   `{io_request,From,ReplyAs,Request}` → `{io_reply,ReplyAs,Reply}` protocol for
 //!   `{get_chars,Enc,_Prompt,N}`/`{put_chars,…}` (`file_io_server.erl:199-233`).
 //!
@@ -107,18 +107,26 @@
 //! readers use, so a mode change is visible to the next read exactly as it is on the oracle.
 //! The child's docs carry the wire-level notes.
 //!
+//! # The `#file_info{}` readers
+//!
+//! `{read_file_info, Name [, Opts]}`, `{read_link_info, Name [, Opts]}` and
+//! `{read_handle_info, Opts}` are the `#file_info{}` readers. The first two are the
+//! [`file_info`] child's: a `stat(2)`/`lstat(2)` on the path (with `access` from two
+//! `access(2)` probes). The third is this module's `reply_read_handle_info` — an
+//! `fstat(2)` (the device's own `Metadata`) with `access` from `check_access/1` against the
+//! process's effective credentials — rendered through the same `#file_info{}` builder
+//! `prim.rs` shares. A failed stat is the oracle's `{error, Reason}` verbatim
+//! and a successful one the real `{ok, #file_info{}}` — the child's docs carry the
+//! wire-level argument.
+//!
 //! # Honest capability gaps (never a fabricated term)
 //!
-//! * `{read_file_info, Name}` and `{read_link_info, Name}` are **partly** served by the
-//!   [`file_info`] child: the `stat(2)`/`lstat(2)` failure is the oracle's `{error, Reason}`
-//!   verbatim, while a *successful* stat — whose reply would need the `#file_info{}` `access`
-//!   slot — stays the typed capability gap (the child's docs carry the full argument).
 //! * A `{setopts, …}` encoding with no counterpart here is the typed gap, never a fabricated
 //!   `ok` (the [`setopts`] child carries the exact rule, and the *open-time* equivalent keeps
 //!   its documented `latin1` divergence).
 //! * Every *other* request this module does not serve is reported as the typed
 //!   [`crate::error::unsupported`] gap rather than a plausible-looking wrong answer
-//!   (`pread`/`pwrite`, `advise`, `allocate`, `read_handle_info`, the legacy `put_chars`
+//!   (`pread`/`pwrite`, `advise`, `allocate`, the legacy `put_chars`
 //!   arities, a tuple encoding).
 //! * An unknown `file_server` `handle_call` request is **answered** here with the typed
 //!   `{error, unsupported}` rather than the oracle's silent `{noreply, State}`: a
@@ -155,6 +163,7 @@ use beam_term::prelude::*;
 
 use crate::context::RuntimeContext;
 use crate::error;
+use crate::native::prim;
 use crate::native::prim_file::take_open_file;
 use crate::runtime::Runtime;
 
@@ -752,6 +761,10 @@ impl Runtime {
                 let reply = self.tuple(&[ok, value])?;
                 Ok((reply, false))
             }
+            // `{read_handle_info, Opts}` (`file_io_server.erl:335-342`), the request
+            // `file:read_file_info/2` sends for an **io-device** pid (`file.erl:788-789`) —
+            // what `epp`'s `-moduledoc({file, …})` reader drives (`epp.erl:1437`).
+            ("read_handle_info", 1) => self.reply_read_handle_info(service, args[0]),
             // -- io_request --------------------------------------------------------------
             ("get_chars", 3) => self.reply_get_chars(service, args),
             ("put_chars", 2) => self.reply_put_chars(service, args),
@@ -774,6 +787,52 @@ impl Runtime {
                 args.len()
             ))),
         }
+    }
+
+    /// `{read_handle_info, Opts}` → `{ok, #file_info{}}` | `{error, Reason}`
+    /// (`file_io_server.erl:335-342`).
+    ///
+    /// The `?CALL_FD(Handle, read_handle_info, [Opts])` body is `prim_file`'s
+    /// `read_handle_info_1(Fd, TimeType)` (`erts/preloaded/src/prim_file.erl:672-681`): an
+    /// `fstat(2)` on the **device's own** handle, whose `access` slot comes from
+    /// `check_access/1` — the file's own `st_mode` against the process's **effective**
+    /// credentials (`unix_prim_file.c:771-801`), never an `access(2)` probe — reshaped into
+    /// the 14-tuple `build_file_info/2` emits.
+    ///
+    /// The time option is resolved **first**, because `read_handle_info/2` reads it on the way
+    /// in (`read_handle_info_1(Fd, proplist_get_value(time, Opts, local))`, `:669-670`): an
+    /// `Opts` that is not a proper list is that helper's **uncaught** `function_clause` raise
+    /// (`prim::function_clause`), never the wrapper's `{error, badarg}` value.
+    ///
+    /// An `fstat(2)` failure is the oracle's own `{error, Reason}` (the same syscall, so the
+    /// same errno). The request never retires the device — the `Reply` clause of
+    /// `file_io_server:file_request/2` answers `{reply, Reply, State}` (`:340-341`).
+    fn reply_read_handle_info(&mut self, service: ProcessId, opts: Eterm) -> Result<(Eterm, bool)> {
+        // `read_handle_info(Fd, Opts) -> read_handle_info_1(Fd, proplist_get_value(time,
+        // Opts, local))` (`prim_file.erl:669-670`): the option is read first, so a non-list
+        // `Opts` raises before any `fstat(2)`.
+        let time = {
+            let ctx = RuntimeContext::new(&mut *self);
+            match ctx.file_info_time(Some(opts)) {
+                Some(time) => time,
+                None => return Err(prim::function_clause()),
+            }
+        };
+        // The `Metadata` is owned, so the `&mut File` borrow ends before the reply borrows
+        // `self` again (`self.device_file`'s borrow is confined to this statement).
+        let stat = self.device_file(service)?.metadata();
+        let metadata = match stat {
+            Ok(metadata) => metadata,
+            Err(failure) => {
+                let reply = self.error_tuple_for(&failure)?;
+                return Ok((reply, false));
+            }
+        };
+        let (euid, egid) = beam_io::process_credentials()?;
+        let access = prim::status_access_bits(&metadata, euid, egid);
+        let mut ctx = RuntimeContext::new(&mut *self);
+        let reply = ctx.file_info_reply(&metadata, access, time)?;
+        Ok((reply, false))
     }
 
     /// `{get_chars, Enc, _Prompt, N}` → `Data | eof` (`file_io_server.erl:506-535`).

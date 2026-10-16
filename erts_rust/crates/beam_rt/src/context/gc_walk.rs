@@ -87,11 +87,10 @@
 //! The valve's host call sites — the three heap-admission points in [`super::gc`] and the
 //! runner's park arm — all hold a [`Runtime`](crate::runtime::Runtime), so they can consult
 //! [`any_root_is_unscanned`] directly and gate the descent on the per-pid latch. The
-//! `beam_process` **signal** sites cannot: a monitor `'DOWN'`, an exit propagation and an
-//! applied trap reason all run inside [`ProcessTable`](beam_process::ProcessTable) with only
-//! `&mut ProcessTable` available, so they can reach neither the runtime's scratch nor its
-//! per-pid latch, and the rust-level `Process` they *can* reach exposes only the crate's own
-//! [`Process::has_unpublished_roots`] test (relocation-exempt, or
+//! `beam_process` **signal** sites — a monitor `'DOWN'`, an exit propagation and an applied
+//! trap reason — run inside [`ProcessTable`](beam_process::ProcessTable) with only
+//! `&mut ProcessTable` available, and the rust-level `Process` they *can* reach exposes only the
+//! crate's own [`Process::has_unpublished_roots`] test (relocation-exempt, or
 //! [`Running`](beam_process::ProcessState::Running)). A relocating `ensure_capacity` on a
 //! **waiting** receiver — the woken-but-not-yet-resumed shape the A.9 `selfhost/*` corruption
 //! went through — is therefore neither exempt nor `Running`, and moved a heap this valve would
@@ -100,7 +99,11 @@
 //! The crate's [`beam_process::CollectionGate`] seam is the host's half of that decision:
 //! [`RuntimeCollectionGate`] implements it by running **this very walk** over the receiver's
 //! gathered roots, and [`Runtime::new`](crate::runtime::Runtime::new) installs one on the
-//! runtime's process table. Because the gate is a *table* field, it travels with the table into
+//! runtime's process table. The gate keeps its **own** scratch — never the runtime's
+//! admission-point one, because a signal site may run while a machine is mid-collection — and
+//! it is built over the host's **one** per-pid latch cell ([`ForeignLatch`]), so a signal site
+//! decides exactly as an admission point does and costs `O(1)` while the pid's bit is clear.
+//! Because the gate is a *table* field, it travels with the table into
 //! every scheduler pass ([`Runtime::take_processes`](crate::runtime::Runtime)) and covers every
 //! process the table holds — including one spawned from inside a pass — so all signal sites
 //! (`ptab.rs`'s `declines_signal_collection`) and
@@ -138,7 +141,11 @@
 
 #![allow(unsafe_code)]
 
-use beam_process::Process;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
+
+use beam_process::{Process, ProcessId};
 use beam_term::layout::for_each_child_slot;
 use beam_term::list::ptr_val;
 use beam_term::literal::is_literal;
@@ -210,6 +217,16 @@ pub(crate) fn process_roots_are_unscanned(
     any_root_is_unscanned(scratch, process, std::iter::empty::<&Eterm>(), descend)
 }
 
+/// The **one** per-runtime cell holding the pids whose descent latch is open.
+///
+/// The latch is the host's sticky, add-only per-process bit: it is set by every event that can
+/// put a container from a region the process's collector does not scan into that process's
+/// reachable term graph, and set again (never cleared) by the valve itself on a root hit. The
+/// runtime owns the one cell and shares it by cloning the `Rc` at the collection gate's install
+/// site, so a `beam_process` signal site decides exactly as an admission point does and never
+/// pays the `O(live objects)` descent for a pid whose bit is clear.
+pub(crate) type ForeignLatch = Rc<RefCell<HashSet<ProcessId>>>;
+
 /// The host side of the [`beam_process::CollectionGate`] seam: it answers a signal site's
 /// "may this receiver's heap be relocated?" question with **this module's** reachability walk,
 /// so a signal-driven relocation and an admission-point one decide identically.
@@ -223,43 +240,62 @@ pub(crate) fn process_roots_are_unscanned(
 /// The gate is owned by the [`ProcessTable`](beam_process::ProcessTable), and a signal site
 /// holds nothing but `&mut ProcessTable`, so the gate must be self-sufficient: it **owns its own
 /// [`WalkScratch`]** and drives it through `&mut self` in
-/// [`declines_relocation`](beam_process::CollectionGate::declines_relocation). No shared handle
-/// (`Rc<RefCell<…>>`, `thread_local!`) and no `unsafe` is needed or used; the crate stays
-/// `#![deny(unsafe_code)]` (this module's narrow, documented `#![allow(unsafe_code)]` covers
-/// only the raw object read in [`Walk::expand`]). The scratch is a plain struct of two `Vec`s
-/// that only ever grow, so after warm-up a decision allocates nothing.
+/// [`declines_relocation`](beam_process::CollectionGate::declines_relocation). The scratch is a
+/// plain struct of two `Vec`s that only ever grow, so after warm-up a decision allocates
+/// nothing. The gate's **only** shared handle is the host's per-pid latch cell
+/// ([`ForeignLatch`]) — an `Rc<RefCell<…>>` the gate holds a clone of, never a handle into the
+/// runtime's own state — and no `unsafe` is used; the crate stays `#![deny(unsafe_code)]`
+/// (this module's narrow, documented `#![allow(unsafe_code)]` covers only the raw object read
+/// in [`Walk::expand`]).
 ///
-/// This is a **second, independent** scratch instance — never the runtime's admission-point one
+/// The scratch is a **second, independent** instance — never the runtime's admission-point one
 /// ([`GcState::walk`](crate::runtime::gc::GcState)): a signal site runs from a different borrow
 /// than an admission point and may even run while a machine is mid-collection, so aliasing the
 /// two would be a borrow violation. Two instances cost one extra `Vec` pair and no correctness.
 ///
-/// # Why the descent always runs (`descend = true`)
+/// # The descent gate on a signal site
 ///
 /// A signal site has **no in-flight machine**: the receiver is not the running process, so there
-/// is no machine root set to publish and the rule that lets an admission point skip the descent
-/// while the per-pid latch is closed cannot be evaluated here (the latch lives on the runtime,
-/// which the table cannot reach). Passing `true` is both **correct** and **conservative**:
+/// is no machine root set to publish and the only roots the walk sees are the ones
+/// [`Process::collect`] gathers. The gate therefore holds a clone of the runtime's **one** latch
+/// cell and applies the **same one-way rule** the four admission doors and `send.rs`'s
+/// `delivery_collection_is_unsound` apply:
 ///
-/// * *correct* — the shape the descent exists to catch is a foreign container at depth ≥ 2 (a
-///   scanned mailbox/dict container holding a pooled-BIF-heap container holding a nursery word),
-///   which the cheap per-word phase alone cannot see; skipping the descent would let a signal
-///   site move a heap this valve must refuse.
-/// * *conservative* — declining a relocation is never wrong: the notification is still delivered,
-///   through the heap-fragment route the `Running`/relocation-exempt receiver already takes (a
-///   byte-faithful copy), so over-declining can only route a delivery to a fragment, never lose
-///   it or fabricate a value.
+/// * a **clear** bit means no container from an unscanned region has ever entered this process's
+///   reachable graph, so the descent can find nothing: the gate answers `false` **without
+///   descending** — `O(1)` per signal;
+/// * an **open** bit descends, and a hit declines the relocation.
+///
+/// Being *conservative* is what makes the `false` answer sound, and the argument is one
+/// paragraph: the walk's per-word phase always runs, so a foreign container reachable at depth 1
+/// is still caught; for the descent to matter a foreign container must be a child of a *scanned*
+/// container, and such a pointer can only be written by code that holds that foreign container —
+/// every way of holding one (an arena fallback, a BIF/floor/NIF result outside the process heap,
+/// a delivered or received fragment, a spawn argument, the escape store) opens the bit. So a
+/// clear bit cannot hide one. And declining a relocation is never wrong: the notification is
+/// still delivered, through the heap-fragment route the `Running`/relocation-exempt receiver
+/// already takes (a byte-faithful copy), so over-declining can only route a delivery to a
+/// fragment, never lose it or fabricate a value.
+///
+/// A gate built with [`RuntimeCollectionGate::new`] holds **no** latch — there is no host cell to
+/// consult — so it always descends. That is the conservative form for a context with no host
+/// latch (and it is what the unit suites exercise).
 pub(crate) struct RuntimeCollectionGate {
     /// The descent scratch this gate owns; never shared with the runtime's admission-point
     /// scratch (see the type docs).
     scratch: WalkScratch,
+    /// The host's shared per-pid descent latch, when this gate was built over one; `None` for a
+    /// gate with no host latch to consult (see the type docs).
+    latch: Option<ForeignLatch>,
 }
 
 impl RuntimeCollectionGate {
-    /// A gate with an empty (allocated lazily, on the first decision) descent scratch.
+    /// A gate with an empty (allocated lazily, on the first decision) descent scratch and **no**
+    /// host latch, so every decision descends unconditionally.
     pub(crate) fn new() -> RuntimeCollectionGate {
         RuntimeCollectionGate {
             scratch: WalkScratch::default(),
+            latch: None,
         }
     }
 }
@@ -270,12 +306,44 @@ impl Default for RuntimeCollectionGate {
     }
 }
 
+impl From<ForeignLatch> for RuntimeCollectionGate {
+    /// A gate that reads the host's shared per-pid latch cell — the form the runtime's install
+    /// site builds, so a signal site's decision is `O(1)` while the pid's bit is clear.
+    fn from(latch: ForeignLatch) -> RuntimeCollectionGate {
+        RuntimeCollectionGate {
+            scratch: WalkScratch::default(),
+            latch: Some(latch),
+        }
+    }
+}
+
 impl beam_process::CollectionGate for RuntimeCollectionGate {
     /// `true` when the receiver's gathered roots reach a container in a region its collector
-    /// does not scan — exactly [`process_roots_are_unscanned`] with the unconditional descent
-    /// the type docs justify.
+    /// does not scan — [`process_roots_are_unscanned`], reached only for a pid whose descent latch
+    /// is open (see the type docs).
     fn declines_relocation(&mut self, receiver: &Process) -> bool {
+        // The pid's bit is the O(1) fast path: a CLEAR bit means no container from an unscanned
+        // region has ever entered this process's reachable graph, so the descent can find nothing
+        // and is skipped outright. The walk's always-run per-word phase still classifies every
+        // root, so a foreign container reachable at depth 1 is caught exactly as before.
+        let descend = match &self.latch {
+            Some(latch) => latch.borrow().contains(&receiver.pid()),
+            None => true,
+        };
+        if !descend {
+            return false;
+        }
         process_roots_are_unscanned(&mut self.scratch, receiver, true)
+    }
+}
+
+#[cfg(test)]
+impl RuntimeCollectionGate {
+    /// How many descents this gate has run — a test-only witness (the reused scratch's walk
+    /// generation), so a case can prove a closed latch skipped the descent rather than merely
+    /// observing a `false` answer.
+    pub(super) fn descents(&self) -> u32 {
+        self.scratch.visited.generation
     }
 }
 
