@@ -70,7 +70,7 @@ these eight directives, the full modelled set:
 | `{preLoaded,[Mod]}` (2) | `PreLoaded` | load each name from the code path (already loaded by `boot()` ⇒ a memoized no-op) |
 | `{progress,Atom}` (2) | `Progress` | informational marker; never fails |
 | `{path,[DirString]}` (2) | `Path` | expand a leading `$ROOT`, then append each dir to the code path |
-| `{primLoad,[Mod]}` (2) | `PrimLoad` | load each name from the code path |
+| `{primLoad,[Mod]}` (2) | `PrimLoad` | load each name from the code path — only while `prim_load` is set (before `{kernel_load_completed}`; afterwards only in `-mode embedded`) |
 | `{kernel_load_completed}` (1) | `KernelLoadCompleted` | informational marker; never fails |
 | `{module,Mod}` (2) | `Module` | load one name from the code path |
 | `{kernelProcess,Name,{M,F,A}}` (3) | `KernelProcess` | materialize args, spawn, then drive a bounded burst until the **directive's MFA has returned** (its server has registered, acked and entered its loop; a run-queue drain or the burst deadline ends it too) so a later directive finds the server answering; then **unlink** it from the short-lived directive process |
@@ -108,25 +108,26 @@ these eight directives, the full modelled set:
   `receive … after T` (T ≤ the window) is still slept to and resumed. The boot's blocking calls are
   `infinity` receives, so nothing a directive synchronously awaits lies beyond a slice.
 
-### `{primLoad, …}` is eager here, and each load interns a whole atom chunk
-`execute` (`bootscript.rs:384-388`) loads **every** name in every `{primLoad, […]}` batch
-(`Runtime::load_code_module` → `CodeServer::load`), and `CodeServer::load_bytes`
-(`../codeserver.rs:707-740`) interns the loaded module's **entire `Atoms` chunk** into the runtime's
-single shared `Rc<AtomTable>` — correct ERTS semantics (a real ERTS load interns the module's atoms
-into the global table too: `code:ensure_loaded(auth)` alone makes `erlang:list_to_existing_atom("hello")`
-succeed under the oracle).
-The committed `bootstrap/bin/start.boot` names **202** `primLoad` modules (batches 29/86/87), so atoms
-that belong only to modules the oracle does not load at boot exist in this runtime's table.
-Measured consequence: `erlang:list_to_existing_atom("hello")` answers `hello` here (the atom rides
-`auth.beam`, one of the 202; `world` rides `net_adm.beam`, `foo`/`bar` ride `shell`/`qlc`/`sofs`/
-`dets_v9`/…), where a fresh `erl -noshell -eval` raises `error:badarg`. The installed OTP-29
-`bin/start.boot` names the **same** 202 modules, yet that oracle process holds only **87** of them
-(`code:all_loaded()` = 109; `auth`, `dets_v9`, `array`, `base64`, `calendar`, … stay unloaded), i.e.
-real `init` does not eagerly load every `{primLoad, …}` name while this `execute` does. The divergence
-is this **loaded-module set** (A.9 boot fidelity), never `erlang:list_to_existing_atom/1`: `beam_bifs`'
-`list_to_existing_atom_1` is lookup-only and refuses an absent name correctly
-(`list_to_existing_atom("zzz_absent_zzz")` ⇒ `badarg`).
-
+### `{primLoad, …}` is gated by `prim_load`, exactly as `init` gates it
+`execute_reporting` threads a `prim_load` flag (seeded `true`, `init`'s `#es{prim_load=true}`,
+`erts/preloaded/src/init.erl:1206-1216`) into `execute_instruction`; `{kernel_load_completed}`
+resets it to `(Mode == embedded)` (`init.erl:1337-1338`) via `bootscript.rs::boot_wants_embedded_mode`
+(the `-mode` init-argument rule, default `interactive`), and a `{primLoad, […]}` batch is loaded
+**only while it is set** — after the marker it is the documented no-op that leaves the load to the
+code server's on-demand lookup, never an error (`init.erl:1339-1348`). `{preLoaded, […]}` precedes
+the marker and stays unconditional.
+The committed `bootstrap/bin/start.boot` names **202** `primLoad` modules (batches 29/86/87), so this
+runtime now loads the **29** of the pre-marker batch and defers the 173 post-marker names, matching
+real `init`'s loaded-module set (`length(code:all_loaded())` = 97 here vs 109 under the installed
+oracle; the membership of `auth`, `dets_v9`, `array`, `base64`, `calendar` is unloaded under both).
+Loading a module still interns that module's **entire `Atoms` chunk** into the runtime's single
+shared `Rc<AtomTable>` (`../codeserver.rs:707-740`) — correct ERTS semantics — so the gate is what
+decides whether a post-marker batch's atoms **exist**: `erlang:list_to_existing_atom("hello")` (the
+atom rides `auth.beam`) and `("world")` (`net_adm.beam`) raise `badarg` here exactly as they do under
+a fresh `erl -noshell -eval`, while `("error_handler")` (pre-marker) answers. Pinned by
+`tests/prim_load_atoms.rs` (oracle-cross-checked) and
+`bootscript.rs::the_real_start_boot_prefix_loads_only_the_pre_marker_batch` /
+`::the_post_marker_batches_load_in_embedded_mode`.
 ### Surviving a `{kernelProcess, …}`'s directive exit (the unlink)
 This runtime runs a `{kernelProcess, …}` MFA in a **short-lived** process that exits when the MFA
 returns, whereas a real `init` runs it in the **one** long-lived `init` process

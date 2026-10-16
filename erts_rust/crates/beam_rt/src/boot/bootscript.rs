@@ -44,8 +44,8 @@
 //! | `{preLoaded, [Mod]}` | the modules already in the emulator image |
 //! | `{progress, Atom}` | an informational progress marker |
 //! | `{path, [DirString]}` | prepend code-path directories (a leading `$ROOT` is expanded) |
-//! | `{primLoad, [Mod]}` | load a batch of modules from the code path |
-//! | `{kernel_load_completed}` | the kernel's initial load finished |
+//! | `{primLoad, [Mod]}` | load a batch of modules from the code path — **only** while `prim_load` is set (see below) |
+//! | `{kernel_load_completed}` | the kernel's initial load finished (resets `prim_load`) |
 //! | `{module, Mod}` | load one module |
 //! | `{kernelProcess, Name, {M,F,A}}` | spawn a kernel process (it registers `Name` itself) |
 //! | `{apply, {M,F,A}}` | call `M:F(A...)` |
@@ -53,12 +53,24 @@
 //! An instruction outside this set is a typed **capability gap** ([`crate::error::unsupported`]),
 //! never a silent skip; a malformed image is a typed [`BeamError`](beam_common::BeamError).
 //!
+//! # `{primLoad, …}` is gated by `prim_load`, exactly as `init` gates it
+//!
+//! `init` seeds `#es{prim_load=true}` (`erts/preloaded/src/init.erl:1206-1216`), so a
+//! `{primLoad, …}` batch **before** the `{kernel_load_completed}` marker really loads.
+//! `eval_script([{kernel_load_completed}|T], …)` then resets `prim_load` to
+//! `(Mode == embedded)` (`init.erl:1337-1338`), so every batch **after** the marker is a
+//! documented **no-op** in `interactive` mode — "Do not load now, code_server does that
+//! dynamically!" (`init.erl:1339-1348`). The committed `bootstrap/bin/start.boot` has one
+//! batch before the marker (29 names) and two after it (86 + 87), so a real `init` loads the
+//! first and lets the code server load the rest **on demand** as the boot calls into them.
+//! Skipping a batch is therefore not an error and never ends the walk.
+//!
 //! # Execution stops at the first directive that cannot run
 //!
 //! [`execute`] walks the instructions in order and returns the first error it meets —
 //! loading a module that is not on the code path, spawning a process whose function is not
 //! exported, or applying an MFA the runtime cannot run. This is the honest behaviour: the
-//! real `start.boot` loads every `primLoad` batch, runs all three `kernelProcess`
+//! real `start.boot` loads its first `primLoad` batch, runs all three `kernelProcess`
 //! directives and completes all 22 of them to its final `{progress,started}`, and a script
 //! that needs machinery this runtime does not have would stop at the first such directive
 //! with its typed error rather than skipping it (see `src/boot/CONTEXT.md`).
@@ -225,9 +237,12 @@ pub fn read(path: &Path) -> Result<BootScript> {
 ///   a silent skip;
 /// * a `$ROOT` in a `{path, ...}` entry is expanded from the runtime's resolved Erlang root;
 /// * a [`Value::Other`] argument is a typed capability gap (it cannot be rebuilt faithfully);
-/// * [`Instruction::Progress`]/[`Instruction::KernelLoadCompleted`] are informational and
-///   never fail;
-/// * a `{kernelProcess, …}` spawns its process and then drives a bounded scheduler burst,
+/// * [`Instruction::Progress`] is informational and never fails, and
+///   [`Instruction::KernelLoadCompleted`] never fails either — it resets the pass's `prim_load`
+///   gate to `(Mode == embedded)`;
+/// * a `{primLoad, …}` batch **before** that marker is loaded, while every batch after it is a
+///   no-op in `interactive` mode (the default) — `init` leaves those to the code server's
+///   on-demand loading, so skipping one is neither an error nor the end of the walk;/// * a `{kernelProcess, …}` spawns its process and then drives a bounded scheduler burst,
 ///   which ends as soon as the process has registered `name` itself (the executor never
 ///   registers it — `init` does not either); a `{apply, …}` runs `M:F(A...)` as this
 ///   runtime's own process and drives the scheduler whenever it suspends in a `receive`;
@@ -356,8 +371,12 @@ pub fn execute_reporting(
     // One deadline for the whole pass: every scheduler drive below shares it, so the boot's
     // wall-clock bound does not multiply by the number of process directives.
     let deadline = Instant::now() + drive::DRIVE_DEADLINE;
+    // `init`'s `#es{prim_load=true}` seed (`erts/preloaded/src/init.erl:1206-1216`). The
+    // `{kernel_load_completed}` directive below resets it, so a `{primLoad, …}` batch is
+    // loaded only while it is still `true` (see the module docs).
+    let mut prim_load = true;
     for (index, instruction) in script.instructions.iter().enumerate() {
-        if let Err(error) = execute_instruction(runtime, instruction, deadline) {
+        if let Err(error) = execute_instruction(runtime, instruction, &mut prim_load, deadline) {
             return Err(BootStop {
                 index: Some(index),
                 total,
@@ -369,28 +388,74 @@ pub fn execute_reporting(
     Ok(())
 }
 
+/// Whether this node booted in `embedded` mode — the `-mode` init argument.
+///
+/// This is `init`'s `LoadMode = b2a(get_flag(mode, Flags, interactive))`
+/// (`erts/preloaded/src/init.erl:1206-1216`) and therefore the value
+/// `{kernel_load_completed}` resets `prim_load` to (`init.erl:1337-1338`). The rule is
+/// `code.erl`'s `start_get_mode/0`: the **first** occurrence of `-mode` must be the **single**
+/// string `"embedded"`, everything else is `interactive`.
+///
+/// The same rule is expressed by the private `wants_embedded_mode` in `../native/code.rs`
+/// (this node may not edit that file). **The two must stay in step**; they should converge
+/// into one `Runtime` accessor later — see `src/boot/CONTEXT.md` *Notes for Agents*.
+fn boot_wants_embedded_mode(runtime: &Runtime) -> bool {
+    let Some(first) = runtime
+        .init_args()
+        .get("mode")
+        .and_then(|occurrences| occurrences.first().copied())
+    else {
+        return false;
+    };
+    first.len() == 1 && first[0] == "embedded"
+}
+
 /// Executes one directive (the [`execute`] loop body).
+///
+/// `prim_load` is the pass's `init`-equivalent `#es{prim_load}` gate: `{primLoad, …}` loads its
+/// batch only while it is set, and `{kernel_load_completed}` clears it in `interactive` mode
+/// (see the module docs).
 ///
 /// `deadline` is the [`execute`] pass's shared scheduler-drive deadline (see
 /// [`drive_scheduler`](super::drive::drive_scheduler)).
 fn execute_instruction(
     runtime: &mut Runtime,
     instruction: &Instruction,
+    prim_load: &mut bool,
     deadline: Instant,
 ) -> Result<()> {
     match instruction {
         // `preLoaded` names are already in the cache after `Runtime::boot`; loading again
         // is a memoized no-op. A name the runtime does not ship is still a typed error.
-        Instruction::PreLoaded(modules) | Instruction::PrimLoad(modules) => {
+        // This directive precedes the `{kernel_load_completed}` marker, so it is never gated.
+        Instruction::PreLoaded(modules) => {
+            for name in modules {
+                runtime.load_code_module(name)?;
+            }
+            Ok(())
+        }
+        // After the marker `prim_load` is `(Mode == embedded)`, and outside embedded mode
+        // `init` leaves the batch to the code server's on-demand loading: a no-op, **not** an
+        // error, and the walk continues (`erts/preloaded/src/init.erl:1339-1348`).
+        Instruction::PrimLoad(modules) => {
+            if !*prim_load {
+                return Ok(());
+            }
             for name in modules {
                 runtime.load_code_module(name)?;
             }
             Ok(())
         }
         Instruction::Module(name) => runtime.load_code_module(name),
-        // Informational markers `init` uses for synchronisation; nothing to do.
-        Instruction::Progress(_) | Instruction::KernelLoadCompleted => Ok(()),
-        Instruction::Path(directories) => {
+        // `{kernel_load_completed}` is the marker that ends the eager phase: `init` sets
+        // `prim_load = (Mode == embedded)` on it, so in `interactive` mode (the default) every
+        // later `{primLoad, …}` is a no-op.
+        Instruction::KernelLoadCompleted => {
+            *prim_load = boot_wants_embedded_mode(runtime);
+            Ok(())
+        }
+        // An informational progress marker; nothing to do.
+        Instruction::Progress(_) => Ok(()),        Instruction::Path(directories) => {
             for directory in directories {
                 let expanded = expand_root(runtime, directory)?;
                 // The code server keeps only **real** directories: `code:add_patha/1`
@@ -806,8 +871,33 @@ mod tests {
         }
     }
 
-    /// Whether `name` resolves to a **live** registered process in `runtime`.
-    ///
+    /// [`system_runtime`] with an **extra** command-line suffix, so a test can model a
+    /// different `init` argument list (e.g. `-mode embedded`) without leaving the CLI's own
+    /// parser. `-mode` is an unmodeled switch, so it lands in the recorded init arguments
+    /// exactly as `erlexec` forwards it (`../cli.rs`'s `record_unmodeled`).
+    fn system_runtime_with(extra: &[&str]) -> Option<Runtime> {
+        if !have_system_erlang() {
+            return None;
+        }
+        let mut argv = boot_argv();
+        argv.extend(extra.iter().map(|argument| (*argument).to_string()));
+        let config = match crate::cli::parse(&argv) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the invocation's configuration ({error})");
+                return None;
+            }
+        };
+        match Runtime::new(config) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                eprintln!("SKIP: no system Erlang install ({error})");
+                None
+            }
+        }
+    }
+
+    /// Whether `name` resolves to a **live** registered process in `runtime`.    ///
     /// This is the observation `erlang:whereis/1` performs — the shared atom table plus the
     /// process table's name registry — read directly so the boot tests do not depend on the
     /// evaluator. A name the runtime's atom table has never interned is a miss.
@@ -1079,9 +1169,14 @@ mod tests {
     }
 
     #[test]
-    fn the_real_start_boot_prefix_loads_its_prim_load_batches() {
-        // The bounded check: executing only the instructions *before* the first `apply`
-        // must succeed and must have loaded every module the script names.
+    fn the_real_start_boot_prefix_loads_only_the_pre_marker_batch() {
+        // `init` seeds `#es{prim_load=true}` and `eval_script([{kernel_load_completed}|T], …)`
+        // resets it to `(Mode == embedded)` (`erts/preloaded/src/init.erl:1206-1216,1337-1338`),
+        // so in the default `interactive` mode the `{primLoad, …}` batch **before** the marker
+        // is loaded and the two after it are documented no-ops that the code server serves on
+        // demand (`init.erl:1339-1348`). The bounded check: executing only the instructions
+        // *before* the first `apply` must succeed, must have loaded the pre-marker batch, and
+        // must **not** have loaded a post-marker one.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -1099,36 +1194,86 @@ mod tests {
         let mut prefix = script.clone();
         prefix.instructions.truncate(first_apply);
         execute(&mut runtime, &prefix).expect("the primLoad prefix executes");
+        // The 29 names of the pre-marker batch really loaded — `init`'s eager phase.
         for module in [
             "application",
             "application_controller",
             "code_server",
             "lists",
             "supervisor",
-            "application_starter",
             "gen_server",
-            "argparse",
-            "zstd",
         ] {
             assert!(
                 runtime.module(module).is_some(),
-                "{module} must have been loaded by the script"
+                "{module} must have been loaded by the pre-marker batch"
+            );
+        }
+        // The post-marker batches (instructions 7 and 9 — 86 + 87 names) were **skipped**, so
+        // a name only they carry is not cached. The `auth`/`dets_v9`/`wrap_log_reader` atoms
+        // *are* interned anyway — a loaded module mentions them as an external reference — so
+        // the atom-table half of the check uses the two names the objective measured against
+        // the oracle: `hello` rides `auth.beam` and `world` rides `net_adm.beam`, both
+        // post-marker batches, and the oracle answers `badarg` for either.
+        for module in ["argparse", "zstd", "wrap_log_reader", "auth", "dets_v9"] {
+            assert!(
+                runtime.module(module).is_none(),
+                "{module} is only in a post-marker batch and must not have been loaded"
+            );
+        }
+        for atom in ["hello", "world"] {
+            assert!(
+                runtime.atoms().lookup(atom).is_none(),
+                "the atom {atom} must not have been interned: post-marker batches do not load"
+            );
+        }
+    }
+    #[test]
+    fn the_post_marker_batches_load_in_embedded_mode() {
+        // The other half of the gate: `{kernel_load_completed}` sets
+        // `prim_load = (Mode == embedded)`, so with `-mode embedded` the post-marker batches
+        // **do** load — the same script, the same executor, one init argument apart.
+        let Some(mut runtime) = system_runtime_with(&["-mode", "embedded"]) else {
+            return;
+        };
+        let path = Path::new(START_BOOT);
+        if !path.is_file() {
+            eprintln!("SKIP: {START_BOOT} is absent");
+            return;
+        }
+        let script = read(path).expect("the real start.boot parses");
+        let first_apply = script
+            .instructions
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Apply { .. }))
+            .expect("the script applies something");
+        let mut prefix = script.clone();
+        prefix.instructions.truncate(first_apply);
+        execute(&mut runtime, &prefix).expect("the primLoad prefix executes");
+        for module in ["argparse", "zstd", "wrap_log_reader"] {
+            assert!(
+                runtime.module(module).is_some(),
+                "{module} must have been loaded by the post-marker batch in embedded mode"
             );
         }
     }
 
     #[test]
     fn the_real_start_boot_executes_every_directive_to_progress_started() {
-        // The full script loads every `primLoad` batch, spawns (and drives) the three kernel
-        // processes, runs the four `apply` directives — the last of them, `{apply,{c,erlangrc,
+        // The full script spawns (and drives) the three kernel processes, runs the four
+        // `apply` directives — the last of them, `{apply,{c,erlangrc,
         // []}}`, against `file_server_2`, which on this (`-boot FILE`) route is the booted
         // `kernel_sup`'s own `file_server` child because `Runtime::new` spawns the runtime's
         // native service **unclaimed** when a boot script is configured — and ends at the final
-        // `{progress,started}`. It **must not** panic
+        // `{progress,started}`; every directive it names must therefore *execute*, either
+        // eagerly or — for a post-marker `{primLoad, …}` batch — as the documented no-op that
+        // leaves the load to the code server (see the module docs). It **must not** panic
         // or hang: every scheduler drive `execute` performs is bounded by its own deadline.
         //
         // Each instruction is executed in isolation here so a regression names the *exact*
         // directive it broke (the single-pass form is pinned by the companion test below).
+        // Isolation also means each `{primLoad, …}` batch is walked as its own script, whose
+        // `prim_load` seed is still `true` — which is why the batch assertions below hold;
+        // the real single-pass gating is pinned by the prefix test above.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -1155,7 +1300,7 @@ mod tests {
             Some(&Instruction::Progress("started".to_string())),
             "the completed boot ends at the final `{{progress,started}}`"
         );
-        // The `primLoad` batches really loaded.
+        // The `primLoad` directives really loaded (each as its own one-instruction script).
         for module in ["lists", "gen_server", "application_starter", "argparse", "zstd"] {
             assert!(
                 runtime.module(module).is_some(),
