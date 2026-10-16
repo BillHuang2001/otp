@@ -72,8 +72,8 @@ use super::super::runtime::{
 use super::super::{jit_ext_call, jit_local_call, jit_set_position};
 use super::test::try_inline_test;
 use super::{
-    emit_continue_check, emit_helper_call, emit_step_and_continue, touch, Allocation, MOVE_SCRATCH,
-    RUNTIME_SLOT_DISP, SAVED_REGISTERS,
+    emit_continue_check, emit_helper_call, emit_step_and_continue, frame_slot_len,
+    native_frame_regs, touch, Allocation, MOVE_SCRATCH, RUNTIME_SLOT_DISP,
 };
 #[cfg(test)]
 use super::FillSite;
@@ -163,12 +163,17 @@ pub(crate) fn emit_block(
     // --- prologue -----------------------------------------------------------
     #[cfg(test)]
     let block_start_bytes = buffer.len();
-    for reg in SAVED_REGISTERS {
-        buffer.push_r(reg)?;
+    // Save only the registers this block actually uses: `rbx` (the `machine.x` base)
+    // plus the machine registers it holds as cache slots. A block that caches fewer
+    // registers pushes fewer (see [`native_frame_regs`]); the `rt`-slot reservation below
+    // compensates so `rsp` is 16-byte aligned at every helper call site.
+    let frame = native_frame_regs(allocation);
+    for reg in &frame {
+        buffer.push_r(*reg)?;
     }
-    // Reserve the `rt` slot. `lea rsp, [rsp - 24]` is `sub rsp, 24` and keeps `rsp`
-    // 16-byte aligned at the helper call site (see `SAVED_REGISTERS`).
-    buffer.lea(Reg::Rsp, Reg::Rsp, -24)?;
+    // Reserve the `rt` slot. `lea rsp, [rsp - slot]` is `sub rsp, slot` and keeps `rsp`
+    // 16-byte aligned at the helper call site (see [`frame_slot_len`]).
+    buffer.lea(Reg::Rsp, Reg::Rsp, -frame_slot_len(frame.len()))?;
     buffer.mov_mr(Reg::Rsp, RUNTIME_SLOT_DISP, Reg::Rdi)?;
     // rbx = rt->x_regs, the base of `machine.x` the cached slots are indexed from.
     // Loaded **before** the position store below: `rbx` is callee-saved, so the helper
@@ -883,7 +888,7 @@ pub(crate) fn emit_block(
     // already spilled the cached x-registers, so the epilogue only leaves the
     // frame — the exact inverse of the prologue.
     buffer.bind(done)?;
-    emit_frame_teardown(buffer)?;
+    emit_frame_teardown(buffer, allocation)?;
     buffer.ret()?;
     // Structural counter: this block's IR size, cache size, write set (the spill's
     // store count on every exit) and emitted native byte length.
@@ -905,7 +910,7 @@ pub(crate) fn emit_block(
 /// the call; every cached x-register and `rbx` live in callee-saved registers, which
 /// the helper preserves ([`emit_block`] emits this before loading the cached
 /// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
-/// (see [`SAVED_REGISTERS`]). The helper returns nothing — a position store cannot
+/// (see [`frame_slot_len`]). The helper returns nothing — a position store cannot
 /// fail — so `rax` is not consulted.
 fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
     let helper: PositionHelper = jit_set_position;
@@ -935,7 +940,7 @@ fn emit_publish_y(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
 /// the call; every cached x-register and `rbx` live in callee-saved registers, which
 /// the helper preserves ([`emit_block`] emits this before loading the cached
 /// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
-/// (see [`SAVED_REGISTERS`]). Neither helper returns a value, so `rax` is not consulted.
+/// (see [`frame_slot_len`]). Neither helper returns a value, so `rax` is not consulted.
 fn emit_prologue_helper(buffer: &mut CodeBuffer, func: u32, pc: u32, helper: *const ()) -> Result<()> {
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     buffer.mov_ri(Reg::Rsi, i64::from(func))?;

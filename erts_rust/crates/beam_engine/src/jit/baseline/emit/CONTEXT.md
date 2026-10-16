@@ -279,8 +279,11 @@ is a `u32` the helper takes as an argument, computed at compile time by `HeapNee
 instruction's own operands.
 
 ## Spill/fill discipline
-- Prologue (`block.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
-  slot, `rbx = rt->x_regs`, then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
+- Prologue (`block.rs::emit_block`): push the block's own frame register set
+  (`native_frame_regs` — `rbx` plus the machine registers the block holds as cache slots),
+  reserve the `frame_slot_len(k)`-byte `rt` slot (`8` when `k = 1 + slots.len()` is even,
+  `16` when odd, so `rsp` stays 16-byte aligned at every helper call), `rbx = rt->x_regs`,
+  then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
   position store — emitted before the cached loads, because `rbx` is callee-saved and no cached register
   may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
   (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
@@ -423,10 +426,11 @@ Tier-equivalence is proven by the crate's `tests/jit*.rs` real-module gates (int
 by construction).
 
 ## Routing Table
-- `mod.rs` -> the shared emitter wiring: the register-file/scratch constants (`SAVED_REGISTERS`/
-  `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/`MOVE_SCRATCH_2`), `touch`, `emit_refresh_y`,
-  `emit_helper_call` (which takes the instruction's own `pc` as the store pc), `emit_step_and_continue`,
-  `emit_continue_check`; re-exports
+- `mod.rs` -> the shared emitter wiring: the register-file/scratch constants (`SAVED_REGISTERS`
+  — the canonical full callee-saved set — `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/
+  `MOVE_SCRATCH_2`), the variable-frame helpers `native_frame_regs`/`frame_slot_len`, `touch`,
+  `emit_refresh_y`, `emit_helper_call` (which takes the instruction's own `pc` as the store pc),
+  `emit_step_and_continue`, `emit_continue_check`; re-exports
   `regs::{Allocation, SpillSite, FillSite}` and `pub(crate) use block::emit_block`, `compile_module`/
   `compile_function` (keeping every item path stable for `baseline/mod.rs`, `baseline/code.rs`, the
   sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`), plus

@@ -183,19 +183,59 @@ pub(crate) use block::emit_block;
 // Compilation
 // ---------------------------------------------------------------------------
 
-/// The callee-saved machine registers a block preserves across its prologue and
-/// epilogue (the Rust ABI requires them to survive the call).
+/// The **canonical** full callee-saved register set the block ABI may touch (the Rust
+/// ABI requires them to survive the call), in prologue push order.
 ///
-/// Six registers keep `rsp` 16-byte aligned at the helper call site: the entry
-/// `rsp ≡ 8 (mod 16)` (`call` pushed the return address), six 8-byte pushes (48
-/// bytes, a multiple of 16) leave it at `8 (mod 16)`, and the 24-byte `rt` slot the
-/// prologue reserves by `lea` — a further `24 ≡ 8 (mod 16)` bytes — brings it to
-/// `0 (mod 16)`. (`rbp` is released from its conventional frame-pointer role to
-/// enlarge the cache below; the emitted addressing is uniformly `mod=10` `disp32`,
-/// so `rbp` is usable as a memory base with no RIP-relative special case — see
-/// [`crate::jit::emitter`].)
+/// A block does **not** save all six: it saves only the subset [`native_frame_regs`]
+/// returns — `rbx` (always, the `machine.x` base) plus the machine registers it actually
+/// holds as cache slots. The other registers are used **only** as cache registers and as
+/// caller-saved scratch (`r9`/`r8`/`r11`/`r10`/`rax`/`rcx`), so a block with no slot for
+/// one never writes it and needs no save. `rsp` stays 16-byte aligned at the helper call
+/// site because the prologue reserves [`frame_slot_len`]`(k)` bytes for the `rt` slot,
+/// which compensates the `k` pushes a block actually makes.
+/// (`rbp` is released from its conventional frame-pointer role to enlarge the cache; the
+/// emitted addressing is uniformly `mod=10` `disp32`, so `rbp` is usable as a memory base
+/// with no RIP-relative special case — see [`crate::jit::emitter`].)
 pub(crate) const SAVED_REGISTERS: [Reg; 6] =
     [Reg::Rbx, Reg::Rbp, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+
+/// The machine registers a block actually saves in its prologue and restores in its
+/// teardown.
+///
+/// `rbx` (the `machine.x` base, always loaded in the prologue) followed by exactly the
+/// machine registers the block holds as cache slots ([`Allocation::slots`], in slot order).
+/// The single source of truth for **both** directions of the frame, so the prologue and
+/// the teardown can never drift apart.
+pub(super) fn native_frame_regs(allocation: &Allocation) -> Vec<Reg> {
+    let mut regs = Vec::with_capacity(1 + allocation.slots.len());
+    regs.push(Reg::Rbx);
+    regs.extend(allocation.slots.iter().map(|(_, reg)| *reg));
+    // Every register saved must be one of the canonical callee-saved set the block ABI may
+    // touch: saving a caller-saved scratch register would be pointless, and (worse) would
+    // clamp a value the helper needs. This pins the invariant the prologue/teardown rely on.
+    debug_assert!(
+        regs.iter().all(|reg| SAVED_REGISTERS.contains(reg)),
+        "a saved frame register must be callee-saved"
+    );
+    regs
+}
+
+/// The number of bytes the prologue reserves for the `rt` slot, chosen so `rsp` is
+/// 16-byte aligned at every helper call site given that the block pushes
+/// `k = native_frame_regs(allocation).len()` 8-byte registers.
+///
+/// A block entry always has `rsp ≡ 8 (mod 16)` (the driver's `call` — or a linked
+/// predecessor's `jmp` — left the original return address on the stack) and the pushes
+/// leave it at `8 − 8k (mod 16)`; the reservation `slot` must then satisfy
+/// `8 − 8k − slot ≡ 0 (mod 16)` with `slot ≥ 8`, i.e. `slot = 8` when `k` is even and `16`
+/// when `k` is odd.
+pub(super) fn frame_slot_len(k: usize) -> i32 {
+    if k % 2 == 0 {
+        8
+    } else {
+        16
+    }
+}
 
 /// The machine registers a block caches x-registers in — `rbx` is reserved for the
 /// machine base pointer, so five x-registers fit (`rbp` included).

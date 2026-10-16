@@ -596,8 +596,9 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + TUPLE_PATH_BYTES * tuple_paths
 }
 /// The code-size budget reserved for one compiled block (see
-/// [`code_capacity_estimate`]): the prologue (six callee-saved pushes, the 24-byte
-/// `rt`-slot reservation, the `rbx` load, the [`emit_position_store`](super::emit_position_store) helper call)
+/// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
+/// `frame_slot_len`-byte `rt`-slot reservation, the `rbx` load, the
+/// [`emit_position_store`](super::emit_position_store) helper call)
 /// and the epilogue (the frame teardown and `ret`) plus their padding.
 const BLOCK_BYTES: usize = 192;
 

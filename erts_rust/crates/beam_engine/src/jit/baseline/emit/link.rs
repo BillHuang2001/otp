@@ -37,9 +37,9 @@
 //!                     ; liveness / root-set model, so a linked exit must never
 //!                     ; skip it (see [`super::spill`])
 //!   mov rdi, [rsp+RUNTIME_SLOT_DISP]  ; `rt` for the successor's prologue
-//!   lea rsp, [rsp+24] ; drop the `rt` slot
-//!   pop rbx ; pop rbp ; pop r12 … pop r15   ; leave the frame, restoring the
-//!                                           ; caller's callee-saved registers
+//!   lea rsp, [rsp+slot] ; drop the `rt` slot (`slot` = the prologue's own reservation)
+//!   pop … ; leave the frame, restoring exactly the registers the prologue pushed
+//!         ; (`rbx` plus the block's cache slots — see [`native_frame_regs`])
 //!   jmp <successor entry>   ; the successor's own prologue rebuilds its frame; the
 //!                           ; original return address is untouched, so *its* `ret`
 //!                           ; returns to the driver
@@ -79,7 +79,7 @@
 //!   cmp rax, <resolved successor word>
 //!   jne <done>                   ; a failed pop: back to the driver with `ERROR`
 //!   mov rdi, [rsp+RUNTIME_SLOT_DISP]  ; …and `rt` again for the successor's prologue
-//!   lea rsp, [rsp+24] ; pop rbx … pop r15   ; leave the frame
+//!   lea rsp, [rsp+slot] ; pop the saved set   ; leave the frame
 //!   jmp <successor entry>        ; the successor's prologue rebuilds its own frame
 //! ```
 //!
@@ -131,7 +131,7 @@ use beam_common::Result;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::runtime::{encode_target, jit_tail_call, TailHelper};
-use super::{spill, Allocation, SpillSite, RUNTIME_SLOT_DISP, SAVED_REGISTERS};
+use super::{native_frame_regs, frame_slot_len, spill, Allocation, SpillSite, RUNTIME_SLOT_DISP};
 
 /// The compiled blocks a branch may jump to directly, keyed by `(func, block
 /// start)` — the same key the driver's entry table uses.
@@ -188,7 +188,7 @@ impl<'a> Linker<'a> {
                 // teardown pops, so the reloaded value survives the teardown and the
                 // jump.
                 buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-                emit_frame_teardown(buffer)?;
+                emit_frame_teardown(buffer, allocation)?;
                 buffer.jmp(target)
             }
             None => {
@@ -252,7 +252,7 @@ impl<'a> Linker<'a> {
         // successor, which is entered by a `jmp` and so gets no `call` to set the `rdi`
         // its prologue stores as its `rt` (see the module docs).
         buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-        emit_frame_teardown(buffer)?;
+        emit_frame_teardown(buffer, allocation)?;
         buffer.jmp(target)
     }
 
@@ -310,17 +310,19 @@ impl<'a> Linker<'a> {
     }
 }
 
-/// Drop the block's stack frame: release the `rt` slot and restore every
-/// callee-saved register the prologue pushed, leaving `rsp` on the **original
-/// return address** (so a following `ret` — or a linked jump into a successor whose
-/// own `ret` does it — returns to the driver).
+/// Drop the block's stack frame: release the `rt` slot and restore every callee-saved
+/// register the prologue pushed, leaving `rsp` on the **original return address** (so a
+/// following `ret` — or a linked jump into a successor whose own `ret` does it — returns
+/// to the driver).
 ///
-/// The exact inverse of [`super::emit_block`]'s prologue, defined once so the two
-/// exits that need it (the shared `done` epilogue and a linked jump) can never
-/// drift apart.
-pub(super) fn emit_frame_teardown(buffer: &mut CodeBuffer) -> Result<()> {
-    buffer.lea(Reg::Rsp, Reg::Rsp, 24)?;
-    for reg in SAVED_REGISTERS.iter().rev() {
+/// The exact inverse of [`super::emit_block`]'s prologue, defined once so the two exits
+/// that need it (the shared `done` epilogue and a linked jump) can never drift apart: the
+/// saved set is exactly [`native_frame_regs`]`(allocation)` and the `rt` slot reservation
+/// exactly [`frame_slot_len`]`(saved.len())`.
+pub(super) fn emit_frame_teardown(buffer: &mut CodeBuffer, allocation: &Allocation) -> Result<()> {
+    let frame = native_frame_regs(allocation);
+    buffer.lea(Reg::Rsp, Reg::Rsp, frame_slot_len(frame.len()))?;
+    for reg in frame.iter().rev() {
         buffer.pop_r(*reg)?;
     }
     Ok(())
@@ -378,9 +380,9 @@ mod tests {
         })
     }
 
-    /// `emit_frame_teardown`, as emitted.
-    fn teardown_bytes() -> Vec<u8> {
-        encoded(|buffer| emit_frame_teardown(buffer).unwrap())
+    /// `emit_frame_teardown` of `allocation`, as emitted.
+    fn teardown_bytes(allocation: &Allocation) -> Vec<u8> {
+        encoded(|buffer| emit_frame_teardown(buffer, allocation).unwrap())
     }
 
     #[test]
@@ -425,7 +427,7 @@ mod tests {
             !reload_bytes().is_empty(),
             "the reload is what the fix adds"
         );
-        expected.extend(teardown_bytes());
+        expected.extend(teardown_bytes(&allocation));
         assert_eq!(
             &exit[..expected.len()],
             &expected[..],
@@ -477,7 +479,7 @@ mod tests {
             .windows(reload.len())
             .position(|window| window == reload.as_slice())
             .expect("the linked exit must reload `rdi` from the block's `rt` slot");
-        let teardown = teardown_bytes();
+        let teardown = teardown_bytes(&allocation);
         let teardown_at = exit
             .windows(teardown.len())
             .position(|window| window == teardown.as_slice())
@@ -595,7 +597,7 @@ mod tests {
             rest += middle.len();
             if linkable {
                 // … and on the linked path the teardown follows the reload.
-                let teardown = teardown_bytes();
+                let teardown = teardown_bytes(&allocation);
                 assert_eq!(
                     &exit[rest..rest + teardown.len()],
                     &teardown[..],
@@ -662,7 +664,7 @@ mod tests {
 
         // The transfer comes *after* the pop: the frame teardown (and the jump) follow
         // the helper's arguments.
-        let teardown = teardown_bytes();
+        let teardown = teardown_bytes(&allocation);
         let teardown_at = exit
             .windows(teardown.len())
             .position(|window| window == teardown.as_slice())
@@ -797,7 +799,7 @@ mod tests {
 
         // (c) the exit does not leave this block's frame: a linked exit, by contrast,
         // tears the frame down and jumps straight into the successor's entry.
-        let teardown = teardown_bytes();
+        let teardown = teardown_bytes(&allocation);
         assert!(
             !exit.windows(teardown.len()).any(|w| w == teardown.as_slice()),
             "an unlinked tail exit must leave the frame teardown to the shared epilogue"
@@ -813,8 +815,9 @@ mod tests {
             landing, successor_at as i64,
             "the exit must not jump into the successor's compiled entry"
         );
-        // The frame window is untouched: no `lea rsp, [rsp+24]` either.
-        let lea_release = encoded(|buffer| buffer.lea(Reg::Rsp, Reg::Rsp, 24).unwrap());
+        // The frame window is untouched: no release of its own `rt` slot either.
+        let slot = frame_slot_len(native_frame_regs(&allocation).len());
+        let lea_release = encoded(|buffer| buffer.lea(Reg::Rsp, Reg::Rsp, slot).unwrap());
         assert!(
             !exit.windows(lea_release.len()).any(|w| w == lea_release.as_slice()),
             "an unlinked tail exit must not release its own `rt` slot"
