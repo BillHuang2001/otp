@@ -316,7 +316,12 @@ pub(super) fn is_refc_binary(t: Eterm) -> bool {
 }
 
 /// Build an **on-heap-only** bitstring of exactly `nbits` bits from the leading bits
-/// of `bytes` (MSB-first), zeroing the unused trailing bits of the final byte.
+/// of `bytes` (MSB-first).
+///
+/// The produced `ErlHeapBits` never carries the heap's previous contents: the whole
+/// data region is zeroed before the payload is copied in (so the trailing padding
+/// bytes of the last data word are zero — the `beam_term::bitstring::write_heap_bits`
+/// invariant) and the unused low bits of the final payload byte are cleared.
 ///
 /// This is the on-heap `ErlHeapBits` builder and nothing more: it is the branch
 /// [`make_binary`] takes at/below the frozen limit, and it refuses a larger result
@@ -347,11 +352,18 @@ pub(super) fn make_bits(
     // exclusively-owned, writable words. Word 0 takes the heap-bits header, word 1
     // the bit count, and the data region at word 2 has room for `num_bytes` bytes.
     // (`bytes` is a Rust-owned buffer — never a live term's storage — so the reserve
-    // cannot invalidate it.)
+    // cannot invalidate it.) The write sequence is `beam_term::bitstring::write_heap_bits`'s,
+    // exactly: the **whole** data region is zeroed before the payload copy, so the
+    // trailing padding bytes of the last data word never carry whatever the heap held
+    // (they are observable after heap reuse, and a GC word-copy of the block would
+    // propagate them), and the unused low bits of the final payload byte are then
+    // masked away.
     unsafe {
         *hp = beam_term::make_header(num_words - 1, beam_term::HEAP_BITS_SUBTAG);
         *hp.add(1) = Eterm::from_raw(nbits);
         let data = hp.add(HEAP_BITS_HEAD_WORDS).cast::<u8>();
+        let data_bytes = (num_words - HEAP_BITS_HEAD_WORDS) * WORD_BYTES;
+        core::ptr::write_bytes(data, 0, data_bytes);
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, num_bytes);
         if num_bytes != 0 && nbits % 8 != 0 {
             // The source's trailing bits in the final partial byte are unspecified
@@ -471,7 +483,7 @@ pub(super) fn make_writable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::MinimalContext;
+    use crate::context::{ExecutionContext, MinimalContext};
 
     /// `make_binary` picks the frozen representation: an on-heap `ErlHeapBits` at
     /// the 64-byte limit, an off-heap refc binary above it — and the read path
@@ -675,5 +687,102 @@ mod tests {
 
         assert_eq!(handle.len(), 65);
         assert_eq!(handle.as_bytes(), vec![0u8; 65].as_slice());
+    }
+
+    /// A test context whose heap is **one pre-filled block**: every allocation returns
+    /// the same `words`-word buffer, every byte of which already holds `0xFF`.
+    ///
+    /// A build then writes into memory that is *dirty* everywhere — the only way to
+    /// observe the padding a builder must zero, because a fresh arena is zero-filled
+    /// by construction and would hide the omission.
+    struct DirtyHeap {
+        block: Vec<Eterm>,
+    }
+
+    impl DirtyHeap {
+        fn new(words: usize) -> Self {
+            Self {
+                block: vec![Eterm::from_raw(usize::MAX); words],
+            }
+        }
+    }
+
+    impl ExecutionContext for DirtyHeap {
+        fn call_bif(
+            &mut self,
+            module: &str,
+            function: &str,
+            arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Err(error::unsupported(&format!(
+                "dirty heap: no BIF {module}:{function}/{arity}"
+            )))
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn alloc_words(&mut self, _n: usize) -> Result<*mut Eterm> {
+            Ok(self.block.as_mut_ptr())
+        }
+    }
+
+    /// `make_bits` initialises the **whole** data region of the `ErlHeapBits` block it
+    /// builds — including the padding bytes of the last data word, which are not part
+    /// of the payload.
+    ///
+    /// That is the invariant the LCA writer (`beam_term::bitstring::write_heap_bits`)
+    /// establishes by zeroing the data region before the payload copy. A builder that
+    /// copied only the payload bytes would leave whatever the heap held there: the
+    /// context's block is pre-filled with `0xFF`, so the omission is observable, and a
+    /// GC word-copy of the block would propagate the garbage.
+    #[test]
+    fn make_bits_zeroes_the_padding_of_the_last_data_word() {
+        // A 1-bit and a 5-bit result both occupy one payload byte of a one-word data
+        // region, so 7 of the data word's 8 bytes are padding.
+        for nbits in [1usize, 5] {
+            let num_bytes = nbits.div_ceil(8);
+            let num_words = HEAP_BITS_HEAD_WORDS + num_bytes.div_ceil(WORD_BYTES);
+            assert_eq!(num_words, 3, "the payload fits one data word");
+            let mut ctx = DirtyHeap::new(num_words);
+            let mut machine = Machine::new();
+            // All-ones source: only the trailing-bit mask decides the payload byte, so
+            // the payload assertion cannot pass by accident.
+            let source = [0xFFu8];
+            let term = make_bits(&mut machine, &mut ctx, &source, nbits).unwrap();
+
+            // SAFETY: `term` is the live boxed `ErlHeapBits` `make_bits` just built in
+            // `ctx`'s block, whose data region starts at word `HEAP_BITS_HEAD_WORDS` and
+            // is `num_words - HEAP_BITS_HEAD_WORDS` words wide.
+            let data = unsafe { boxed_val(term).add(HEAP_BITS_HEAD_WORDS).cast::<u8>() };
+            let data_bytes = (num_words - HEAP_BITS_HEAD_WORDS) * WORD_BYTES;
+
+            // The payload byte keeps exactly the leading `nbits` bits ...
+            // SAFETY: byte 0 of the freshly built `num_bytes`-byte payload.
+            let payload = unsafe { *data };
+            assert_eq!(
+                payload,
+                0xFFu8 << (8 - nbits),
+                "the unused low bits of the final payload byte are cleared (nbits = {nbits})"
+            );
+            // ... and every trailing padding byte of the data word is zero.
+            for i in num_bytes..data_bytes {
+                // SAFETY: `i < data_bytes`, so the byte is inside the freshly built
+                // data region.
+                let padding = unsafe { *data.add(i) };
+                assert_eq!(
+                    padding, 0,
+                    "padding byte {i} of the data word must be zero (nbits = {nbits})"
+                );
+            }
+        }
     }
 }
