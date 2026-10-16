@@ -219,3 +219,28 @@ pub(super) fn pack_address(port: u16, addr: [u8; 4]) -> Vec<u8> {
     let [hi, lo] = port.to_be_bytes();
     vec![INET_AF_INET, hi, lo, addr[0], addr[1], addr[2], addr[3]]
 }
+
+/// Splits a leading packed address off `arg`, returning it with the bytes that follow.
+///
+/// The `udp_inet` `send` verb's argument is `[address][data]` (the C's
+/// `[address][anc_len:32][data]` without the ancillary-data length, which is out of scope), so
+/// the address has to be consumed before the payload can be taken. Both this and
+/// [`parse_address`] derive the address length from the family tag, so the layout stays
+/// single-sourced.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] for a truncated argument or an unserved family tag, as in
+/// [`parse_address`].
+pub(super) fn split_address(arg: &[u8]) -> Result<(InetAddr, &[u8])> {
+    let consumed = match arg.first() {
+        Some(&INET_AF_INET) => 7,
+        Some(&INET_AF_ANY) | Some(&INET_AF_LOOPBACK) => 3,
+        _ => return Err(error::badarg()),
+    };
+    if arg.len() < consumed {
+        return Err(error::badarg());
+    }
+    let address = parse_address(&arg[..consumed])?;
+    Ok((address, &arg[consumed..]))
+}
