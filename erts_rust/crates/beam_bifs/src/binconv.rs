@@ -84,8 +84,9 @@
 //!   includes the `131` version byte; for a top-level `COMPRESSED` image it stops at
 //!   the zlib stream's end, so bytes after the image are *not* counted — the count
 //!   comes straight from `beam_codec`'s
-//!   [`decode_term_used`]/[`decode_term_with_local_node_used`]). `safe` refuses a
-//!   term that would create an atom.
+//!   [`decode_term_with_options_used`]). Under `safe` the codec itself refuses a
+//!   wire atom name that is not already interned — a `badarg` raised **before** any
+//!   interning, so nothing reaches the receiving node's atom table.
 //!
 //! # The `term_to_binary/2` options
 //!
@@ -213,7 +214,7 @@ use std::cell::RefCell;
 
 use beam_codec::compress::compress as zlib_compress;
 use beam_codec::{
-    decode_term_used, decode_term_with_local_node_used, Encoder, MinorVersion, COMPRESSED_EXT,
+    decode_term_with_options_used, DecodeOptions, Encoder, MinorVersion, COMPRESSED_EXT,
     VERSION_MAGIC,
 };
 use beam_common::Result;
@@ -1475,6 +1476,13 @@ mod scratch_pins {
 /// uncounted (`external.c:1797-1801`), while a plain image reports the term's own end
 /// and tolerates trailing bytes, like the oracle.
 ///
+/// The `[safe]` flag is fed into the codec through its [`DecodeOptions`] seam: with it
+/// set a wire atom **name** that is not already interned in the context's table is
+/// `BadArg` **from the codec**, raised **before** anything is interned (C
+/// `erts_atom_get` instead of `erts_atom_put`, `external.c:4530-4539`), so the shared
+/// atom table cannot grow. The flag-free path is unchanged: the names the decoder
+/// appends to the scratch are still committed to the shared table afterwards.
+///
 /// The context's local node identity ([`BifContext::local_node`]) is installed on the
 /// decoder, so a wire pid/port/reference whose node atom and creation name this node
 /// materializes as this runtime's **internal** form — the C's `dec_is_this_node`
@@ -1490,8 +1498,8 @@ mod scratch_pins {
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary, a
-/// malformed/truncated image, an unknown option, or `safe` with an image that
-/// would create an atom; the codec's `unsupported_external_term` raise for a tag
+/// malformed/truncated image, an unknown option, or `safe` with a wire atom name that
+/// is not already interned; the codec's `unsupported_external_term` raise for a tag
 /// it cannot build (funs, exports, records, `LOCAL`). A local reference id that
 /// does not fit the M1 internal-ref block's 60-bit slot is not an error: the
 /// decoder keeps the faithful external reference form for it.
@@ -1504,9 +1512,20 @@ fn decode_term_bif(
     let data = bytes_arg(input)?;
     // Read the local node identity *before* `ctx.heap()` — the accessor takes
     // `&mut self`, so it cannot be called while the heap is borrowed. It is installed
-    // on the decoder below so an incoming identifier that names this node demotes to
-    // the internal form (see the docs above); `None` leaves the decode unchanged.
+    // on the decoder through the codec's option seam so an incoming identifier that
+    // names this node demotes to the internal form (see the docs above); `None` leaves
+    // the decode unchanged. `local_hash` stays `None`: the 4-byte `LOCAL_EXT` node hash
+    // is runtime state with no seam in this crate (see the docs above).
     let identity = ctx.local_node();
+    // Feed `[safe]` (and the resolved identity) into the codec: under `safe` a wire atom
+    // **name** that is not already interned is `BadArg` *from the codec* and **nothing is
+    // interned** (C `erts_atom_get`), so the fresh-name commit below is unreachable under
+    // `safe` — it stays as the flag-free path's commit.
+    let options = DecodeOptions {
+        safe,
+        local_node: identity,
+        local_hash: None,
+    };
     // Decode into the scratch image and collect the names it appended, before the
     // scratch is released — they are exactly the names that must reach the shared
     // table, at exactly the indices the decoder wrote into the term.
@@ -1514,18 +1533,13 @@ fn decode_term_bif(
         let (shared, heap) = ctx.atom_and_heap();
         with_decode_scratch(shared, |scratch| {
             let known = scratch.len();
-            // The codec's `[used]` entry points own the `COMPRESSED` wrapper handling and
-            // the consumed-source-byte count (the zlib stream end for a compressed image,
-            // `Decoder::position` otherwise) — and, unlike the `finish()`-ing
-            // `decode_term` pair, they tolerate trailing bytes, matching the oracle's
-            // `binary_to_term/2`. The identity-aware twin installs the identity on both
-            // paths.
-            let decoded = match identity {
-                Some((node, creation)) => {
-                    decode_term_with_local_node_used(&data, heap, scratch, node, creation, None)
-                }
-                None => decode_term_used(&data, heap, scratch),
-            };
+            // The codec's option-aware `[used]` entry point owns the `COMPRESSED` wrapper
+            // handling, the consumed-source-byte count (the zlib stream end for a compressed
+            // image, `Decoder::position` otherwise), the local-node identity install and the
+            // `[safe]` refusal — and, unlike the `finish()`-ing `decode_term` pair, it
+            // tolerates trailing bytes, matching the oracle's `binary_to_term/2`. With
+            // `safe` false its decode is byte-for-byte the flag-free/identity-aware twins'.
+            let decoded = decode_term_with_options_used(&data, heap, scratch, &options);
             // A failed decode leaves the scratch possibly ahead of the shared table (the
             // next call's `prefix_matches` rebuilds it); nothing is committed.
             let fresh: Vec<String> = if decoded.is_ok() {
@@ -1544,8 +1558,10 @@ fn decode_term_bif(
     };
     let (term, position) = decoded?;
     if !fresh.is_empty() {
+        // Unreachable under `[safe]` (the codec refuses an unknown name and interns
+        // nothing, so `fresh` is empty), kept as a guard should a future codec change
+        // ever append a name under `safe`.
         if safe {
-            // `safe` forbids creating atoms; nothing has been created yet.
             return Err(badarg());
         }
         for name in &fresh {
@@ -3300,31 +3316,125 @@ halt()."#;
         });
     }
 
+    /// `<<131,119,8,"tjenixen">>` — the oracle's `[safe]` example: a **new** atom.
+    const NEW_ATOM_IMAGE: &[u8] = &[131, 119, 8, 116, 106, 101, 110, 105, 120, 101, 110];
+
+    /// `ATOM_EXT` (`100`) for `hello`, an atom every seeded test table holds.
+    const KNOWN_ATOM_IMAGE: &[u8] = &[131, 100, 0, 5, 104, 101, 108, 108, 111];
+
     #[test]
     fn binary_to_term_safe_rejects_new_atoms_and_interns_them_otherwise() {
-        // `<<131,119,8,"tjenixen">>` — the oracle's `[safe]` example: a *new* atom.
-        const NEW_ATOM: &[u8] = &[131, 119, 8, 116, 106, 101, 110, 105, 120, 101, 110];
         // Without `safe` the atom is created through the interner, at the index the
         // cloned table assigned it.
         with_interner(|ctx, interned| {
-            let term = binary_to_term_1(ctx, &[bin(NEW_ATOM)]).unwrap();
+            let term = binary_to_term_1(ctx, &[bin(NEW_ATOM_IMAGE)]).unwrap();
             assert!(access::is_atom(term));
             assert_eq!(interned.borrow().name(atom_val(term)), Some("tjenixen"));
-            // The `safe` form consults the runtime table (`ctx.atoms()`), which this
-            // harness keeps distinct from the interner's clone — so the name the
-            // interner just created is still unknown here and the decode is refused.
-            // In the runtime the interner mutates that very table, so the atom then
-            // exists and `safe` accepts it (the oracle's behaviour).
+            // The `[safe]` refusal consults `ctx.atoms()` (the decode scratch is an image
+            // of it), which this harness keeps distinct from the interner's clone — so the
+            // name the interner just created is still unknown here and the codec refuses.
+            // In the runtime the interner mutates that very table, so the atom then exists
+            // and `safe` accepts it (the oracle's behaviour).
             let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
-            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM), safe]));
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe]));
             assert!(interned.borrow().lookup("tjenixen").is_some());
         });
-        // With `safe` and an unknown atom the decode is `badarg` — and *creates*
-        // nothing.
+        // With `safe` and an unknown atom the decode is `badarg` — raised **by the codec**
+        // before any interning, so nothing reaches either table.
         with_interner(|ctx, interned| {
             let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
-            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM), safe]));
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe]));
+            // Nothing was interned anywhere: the receiving node's table is untouched…
+            assert_eq!(ctx.atoms().len(), NAMES.len(), "the shared table grew");
+            assert!(ctx.atoms().lookup("tjenixen").is_none());
+            // …and neither is the interner's clone.
+            assert_eq!(interned.borrow().len(), NAMES.len(), "the interner's table grew");
             assert!(interned.borrow().lookup("tjenixen").is_none());
+        });
+    }
+
+    #[test]
+    fn binary_to_term_safe_accepts_an_atom_already_interned() {
+        with_ctx(|ctx| {
+            let before = ctx.atoms().len();
+            let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
+            let term = binary_to_term_2(ctx, &[bin(KNOWN_ATOM_IMAGE), safe])
+                .expect("an already-interned atom is accepted under [safe]");
+            assert_eq!(term, ctx.atom("hello").expect("seeded"));
+            assert_eq!(ctx.atoms().len(), before, "a known atom was interned anew");
+        });
+    }
+
+    #[test]
+    fn binary_to_term_safe_with_used_reports_the_consumed_count() {
+        with_ctx(|ctx| {
+            // `[safe, used]` on an already-interned atom reports the same count `[used]`
+            // alone does — the codec's option-aware `_used` entry point owns the rule.
+            let safe_used = atom_options(ctx, "safe", "used");
+            let wrapped = binary_to_term_2(ctx, &[bin(KNOWN_ATOM_IMAGE), safe_used]).unwrap();
+            assert!(access::is_tuple(wrapped));
+            assert_eq!(
+                access::tuple_element(wrapped, 0),
+                ctx.atom("hello").expect("seeded")
+            );
+            assert_eq!(
+                int_of(access::tuple_element(wrapped, 1)),
+                KNOWN_ATOM_IMAGE.len() as i64
+            );
+            let used = used_option(ctx);
+            let wrapped = binary_to_term_2(ctx, &[bin(KNOWN_ATOM_IMAGE), used]).unwrap();
+            assert_eq!(
+                int_of(access::tuple_element(wrapped, 1)),
+                KNOWN_ATOM_IMAGE.len() as i64
+            );
+            // `[safe, used]` on an unknown atom is still `badarg`, not a `{Term,N}` tuple.
+            let safe_used = atom_options(ctx, "safe", "used");
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe_used]));
+            assert_eq!(ctx.atoms().len(), NAMES.len(), "the shared table grew");
+        });
+    }
+
+    /// The live-oracle cross-check for `[safe]`: the oracle raises `badarg` for a safe
+    /// decode of an unknown atom and accepts the same image without `safe`, creating the
+    /// atom — the split this crate reproduces.
+    #[test]
+    fn binary_to_term_safe_matches_the_live_oracle() {
+        // A raw string keeps the Erlang source readable — every `"` below is the Erlang
+        // character, not a Rust escape. A `try`/`catch` (not the `catch` operator, which
+        // the `-eval` route wraps differently) reports the exception class and reason.
+        let eval = r#"A = <<131,119,8,116,106,101,110,105,120,101,110>>,
+io:format("~p~n", [try binary_to_term(A,[safe]) catch C:R -> {C,R} end]),
+io:format("~p~n", [binary_to_term(A)]),
+halt()."#;
+        let Some(lines) = oracle_stdout(eval) else {
+            eprintln!();
+            eprintln!("=========== beam_bifs binconv: live oracle SKIPPED ===========");
+            eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or");
+            eprintln!("not executable, and no `erl` on $PATH).");
+            eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+            eprintln!("=============================================================");
+            eprintln!();
+            return;
+        };
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("{error,badarg}"),
+            "the oracle's `[safe]` verdict changed: {lines:?}"
+        );
+        assert_eq!(
+            lines.get(1).map(String::as_str),
+            Some("tjenixen"),
+            "the oracle's flag-free decode changed: {lines:?}"
+        );
+        // The Rust side agrees on both arms.
+        with_interner(|ctx, interned| {
+            let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
+            assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe]));
+            assert_eq!(ctx.atoms().len(), NAMES.len(), "the shared table grew");
+            assert!(ctx.atoms().lookup("tjenixen").is_none());
+            let term = binary_to_term_1(ctx, &[bin(NEW_ATOM_IMAGE)]).unwrap();
+            assert!(access::is_atom(term));
+            assert_eq!(interned.borrow().name(atom_val(term)), Some("tjenixen"));
         });
     }
 
