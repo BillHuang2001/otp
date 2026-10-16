@@ -343,6 +343,34 @@
     }
 
     #[test]
+    fn an_improper_tail_that_is_itself_a_byte_still_uses_list_ext() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        // `[1, 2 | 3]`: every element *and* the tail is a byte, but the spine is
+        // improper, so the optimistic `STRING_EXT` walk must rewind and the tail
+        // must still be encoded as a term.
+        let tail = heap.cons(make_small(2), make_small(3)).unwrap();
+        let list = heap.cons(make_small(1), tail).unwrap();
+        assert_eq!(
+            encode_term_body(list, &atoms).unwrap(),
+            vec![108, 0, 0, 0, 2, 97, 1, 97, 2, 97, 3]
+        );
+    }
+
+    #[test]
+    fn a_non_byte_at_the_end_of_the_spine_rewinds_the_optimistic_string_ext() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        // The first three elements are bytes, so the optimistic walk has already
+        // emitted `STRING_EXT` + its placeholder + three payload bytes when it
+        // reaches 256: the rewind must leave no residue of any of them.
+        let list = build_list(&mut heap, &[1, 2, 3, 256]);
+        assert_eq!(
+            encode_term_body(list, &atoms).unwrap(),
+            vec![108, 0, 0, 0, 4, 97, 1, 97, 2, 97, 3, 98, 0, 0, 1, 0, 106]
+        );
+    }
+    #[test]
     fn tuple_arity_255_and_256_pick_the_right_tag() {
         let atoms = AtomTable::new();
         let mut heap = new_heap(1024);
