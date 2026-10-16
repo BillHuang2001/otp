@@ -10,8 +10,10 @@ crate-level `CONTEXT.md` owns the deep A.1 copy-boundary narrative; this node ow
 API and its honest limits.
 
 ## API Surface (one file = one concern)
-- `mod.rs` — `Table` (constructors incl. explicit-interior variants, write ops, `give_away`/`setopts`,
-  `info`, `select_all`, `check_read`/`check_write`), `TableId`, `OwnerId`; `NEXT_TABLE_ID`.
+- `mod.rs` — `Table` (constructors incl. explicit-interior variants, write ops,
+  `give_away`/`give_away_with_gift`/`setopts`, `info`, `select_all`, `check_read`/`check_write`),
+  `TableId`, `OwnerId`, the private `transfer_target` (the shared `ets:give_away/3` check order);
+  `NEXT_TABLE_ID`.
   The `pub(crate)` `replace_key(key, &[object])` is the storage-faithful key rebuild behind a
   `duplicate_bag` `select_replace/2`: it validates and deep-copies the whole new list **before**
   removing the key's old objects, so a rebuild reclaims what it replaces instead of checking it out
@@ -25,9 +27,9 @@ API and its honest limits.
   `try_into_inner`; a poisoned lock is the typed `unsupported_ets: table lock poisoned`.
 - `access.rs` — `TableAccess` (rechecks `can_read`/`can_write` per op; `badarg` on violation).
   `size`/`is_empty` are the **ungated** `ets:info(T, size)` projection (the oracle admits a
-  non-owner of a `private` table); `give_away` has no protection check and `setopts`/`set_access`
-  are owner-gated, exactly as in `ets:*`.
-- `ownership.rs` — `Heir`/`SetOpt`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`.
+  non-owner of a `private` table); `give_away`/`give_away_with_gift` have no protection check and
+  `setopts`/`set_access` are owner-gated, exactly as in `ets:*`.
+- `ownership.rs` — `Heir`/`SetOpt`/`Transfer`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`.
 - `lifecycle.rs` — `OwnerDeath` + `Table::owner_died` (the owner-death transition).
 - `element.rs` — `Table::update_counter(+_with)`/`update_element` and `relocate_rebuilt_object`.
 - `update.rs` — counter/element operand machinery (incl. an exact small/bignum add).
@@ -75,8 +77,10 @@ advisory only (throughput, never results) — see the crate `CONTEXT.md`.
 
 ## Notes for Agents
 - The owner-death transition, heir semantics and `give_away`/`setopts` are **real** oracle-matched
-  semantics, not placeholders; only the *delivery* of `{'ETS-TRANSFER',…}` / the table drop is the
-  runtime's job (this crate has no pid/liveness concept — `OwnerId` is an opaque `u64`).
+  semantics, not placeholders. `give_away_with_gift` deep-copies the gift and surfaces the
+  `{'ETS-TRANSFER', Tid, FromPid, GiftData}` obligation as a `Transfer`; only the actual message
+  *delivery* (and the table drop) is the runtime's job (this crate has no pid/liveness concept —
+  `OwnerId` is an opaque `u64`).
 - `update_counter`/`update_element` arithmetic is **exact** (small↔bignum promotion, no truncation);
   it is the one corner of the crate where bignum math exists (the match-spec `ArithHook` default is
   small-int only). No `beam_term` LCA exposes big add/sub/compare, so it stays crate-local.
@@ -90,7 +94,7 @@ advisory only (throughput, never results) — see the crate `CONTEXT.md`.
 - `rename.rs` → `Table::rename` (`ets:rename/2`)
 - `shared.rs` → `SharedTable` (the lock handle)
 - `access.rs` → `TableAccess` (access-enforcing view)
-- `ownership.rs` → `Heir`/`SetOpt`/`install_heir`/`replace_heir`
+- `ownership.rs` → `Heir`/`SetOpt`/`Transfer`/`install_heir`/`replace_heir`
 - `lifecycle.rs` → `OwnerDeath`/`owner_died`
 - `element.rs` → `update_counter`/`update_element`
 - `update.rs` → counter/element operand machinery
