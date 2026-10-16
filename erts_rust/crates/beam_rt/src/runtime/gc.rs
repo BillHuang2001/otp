@@ -268,7 +268,13 @@ impl Runtime {
     /// Whether `pid`'s own process heap may be moved (it is not pinned, not halted, and the
     /// global valve is closed).
     pub(crate) fn gc_process_enabled(&self, pid: ProcessId) -> bool {
-        self.gc_enabled() && !self.gc.pinned.contains(&pid) && !self.gc.halted.contains(&pid)
+        // The per-pid valves are read on **every** heap-admission point, before the occupancy
+        // short-circuit, and in a normal workload both sets are empty — so answer the empty
+        // case with a length compare instead of a (SipHash) probe that can only miss. The
+        // verdicts are byte-for-byte the ones `!set.contains(&pid)` gives for every input.
+        self.gc_enabled()
+            && (self.gc.pinned.is_empty() || !self.gc.pinned.contains(&pid))
+            && (self.gc.halted.is_empty() || !self.gc.halted.contains(&pid))
     }
 
     /// Records a **forced-GC request** for `pid` — the on-demand collection behind
@@ -434,7 +440,8 @@ impl Runtime {
 
     /// Whether `pid` has an **unserved** forced-GC request (see [`Runtime::request_gc`]).
     pub(crate) fn gc_request_pending(&self, pid: ProcessId) -> bool {
-        self.gc.requested.contains(&pid)
+        // Empty case (the common one) == a length compare; see `gc_process_enabled`.
+        !self.gc.requested.is_empty() && self.gc.requested.contains(&pid)
     }
 
     /// Consumes `pid`'s forced-GC request, answering whether there was one.
@@ -625,7 +632,11 @@ impl Runtime {
     /// unscanned-root valve must descend through `pid`'s scanned graph rather than run only its
     /// per-word root phase.
     pub(crate) fn foreign_reachable(&self, pid: ProcessId) -> bool {
-        self.gc.foreign.borrow().contains(&pid)
+        // The `RefCell` borrow guard is itself per-call cost, and the cell is empty in a
+        // normal workload — so borrow **once**, answer the empty case with a length compare,
+        // and probe only when the bit could really be there. `contains`'s verdict, unchanged.
+        let foreign = self.gc.foreign.borrow();
+        !foreign.is_empty() && foreign.contains(&pid)
     }
 
     /// The runtime's **one** shared per-pid descent latch cell (see [`GcState::foreign`]).
@@ -1198,5 +1209,76 @@ mod tests {
         );
         assert_ne!(copied, arg, "the copy lives on the destination heap");
         assert!(!rt.gc_stats().disabled, "a successful store trips no valve");
+    }
+
+    /// **The valve accessors answer identically whether their set is empty or populated** — the
+    /// empty-set short circuit only *skips* the (SipHash) probe, it never changes a verdict.
+    ///
+    /// [`Runtime::gc_process_enabled`] and [`Runtime::gc_request_pending`] run on **every**
+    /// engine heap-admission point ([`crate::context::gc::ensure_heap`]), *before* the
+    /// occupancy short-circuit, and [`Runtime::foreign_reachable`] gates the descent on the
+    /// delivery path; in a normal workload all four sets (pinned, halted, requested, foreign)
+    /// are empty, so each verdict must cost a length compare instead of a hash that can only
+    /// miss. Every verdict below is pinned for the empty state, for the populated state, and
+    /// for an unaffected neighbouring pid.
+    #[test]
+    fn the_valve_accessors_answer_the_same_for_an_empty_and_a_populated_set() {
+        let mut rt = small_runtime();
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let a = table.spawn_default().expect("a process");
+        let b = table.spawn_default().expect("another process");
+
+        // -- the empty state: every set is empty, so every accessor short-circuits --
+        assert!(rt.gc_enabled(), "a fresh runtime's global valve is closed");
+        assert!(rt.gc_process_enabled(a), "nothing pins or halts a fresh pid");
+        assert!(rt.gc_process_enabled(b), "and another pid is enabled too");
+        assert!(!rt.gc_request_pending(a), "no request is pending");
+        assert!(!rt.gc_request_pending(b), "nor for another pid");
+        assert!(!rt.foreign_reachable(a), "no descent bit is set");
+        assert!(!rt.foreign_reachable(b), "nor for another pid");
+
+        // -- `requested`: a populated set still answers per-pid .. --
+        rt.request_gc(a);
+        assert!(rt.gc_request_pending(a), "a's request is now pending");
+        assert!(!rt.gc_request_pending(b), "b's is not");
+        assert!(rt.take_gc_request(a), "the request is consumed");
+        assert!(!rt.take_gc_request(a), "and there was only one");
+        assert!(!rt.gc_request_pending(a), "so the set is empty again");
+
+        // -- .. and the `foreign` descent bit is per-pid and add-only --
+        rt.note_foreign_reachable(a);
+        assert!(rt.foreign_reachable(a), "a's descent gate is open");
+        assert!(!rt.foreign_reachable(b), "b's is untouched");
+
+        // -- `halted`: reached through the production halt site --
+        rt.halt_process_gc(b);
+        assert!(!rt.gc_process_enabled(b), "a halted pid stays put");
+        assert!(
+            rt.gc_process_enabled(a),
+            "halting one pid does not halt another"
+        );
+        assert_eq!(rt.gc_stats().halted, 1, "the halt is recorded");
+
+        // -- `pinned`: no `Runtime` setter exists (as
+        // `a_forbidden_collection_is_refused_without_pretending` also establishes), so the
+        // valve is driven through its own field --
+        rt.gc.pinned.insert(a);
+        assert!(!rt.gc_process_enabled(a), "a pinned pid stays put");
+        assert!(
+            rt.gc_enabled(),
+            "a per-pid valve never closes the global one"
+        );
+
+        // None of the above collected, halted or faked anything beyond what it recorded.
+        let stats = rt.gc_stats();
+        assert_eq!(stats.collections, 0, "no collection was pretended");
+        assert_eq!(
+            stats.errors, 1,
+            "exactly the one recorded halt (its site counts the failure)"
+        );
+        assert_eq!(stats.halted, 1, "exactly the one halt above");
+        assert_eq!(stats.pinned, 1, "exactly the one pin above");
     }
 }
