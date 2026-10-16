@@ -33,7 +33,8 @@
 //! pattern).
 
 use beam_common::{BeamError, Result as BResult};
-use beam_loader::{Instr, Module, Operand, NO_FAIL};
+use beam_loader::{BsGetArgs, Instr, Module, Operand, NO_FAIL};
+use beam_term::Eterm;
 
 use crate::context::MinimalContext;
 use crate::families::bitstrings::{exec as family_exec, raw, BSF_LITTLE, BSF_NATIVE};
@@ -135,6 +136,148 @@ fn skip_utf32(bytes: &[u8], flags: u32) -> (BResult<()>, usize) {
         assert_eq!(step, Some(Step::Next), "bs_skip_utf32 is claimed");
     });
     (result, position(&machine))
+}
+
+/// Drive one bitstring-matching read instruction over the match context at `x(1)`,
+/// returning the value it bound to `x(0)` (`Err` when the read failed the match) and
+/// the context's position afterwards.
+fn read_field(instr: &Instr, bytes: &[u8]) -> (BResult<Eterm>, usize) {
+    let module = module();
+    let (mut machine, mut ctx) = enter(&module, bytes);
+    let result = family_exec(
+        &mut machine,
+        &module,
+        &LabelMap::new(),
+        instr,
+        0,
+        0,
+        &mut ctx,
+    )
+    .map(|step| {
+        assert_eq!(step, Some(Step::Next), "the read instruction is claimed");
+        machine.x(0).expect("the read result")
+    });
+    (result, position(&machine))
+}
+
+/// The `BsGetArgs` of a `size * unit`-bit field read at the context (`x(1)`) into
+/// `x(0)` with the given **raw** flags mask.
+fn read_args(size: i64, unit: u32, flags: u32) -> BsGetArgs {
+    BsGetArgs {
+        fail: NO_FAIL,
+        ctx: Operand::X(1),
+        live: 2,
+        size: Operand::Integer(size),
+        unit,
+        flags,
+        dst: Operand::X(0),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The raw-`BSF_NATIVE` flags operand of the standalone reads
+//
+// `bs_get_integer2`/`bs_get_float2`/`bs_get_utf16` take their flags as a raw `u32`
+// (`lower/instr.rs` decodes it with `as_u32`; `beam_disasm:resolve_inst` shows the
+// operand as `{u, Flags}` and `decode_field_flags/1` only accepts an integer), so a
+// `-native` field really does carry `BSF_NATIVE` (`16#10`) into the readers. C
+// collapses it to the target's order at load time (`$NativeEndian`,
+// `emu/generators.tab`), so it reads **little**-endian on this host — before the
+// `field_is_little` fix the readers tested `BSF_LITTLE` alone and read it
+// big-endian, a silently wrong value.
+// ---------------------------------------------------------------------------
+
+/// Oracle: `<<X:32/float-native>> = <<63,192,0,0>>` ⇒ `6.896490392174587e-41` (the
+/// little-endian read of the bytes); the big-endian read would be `1.5`.
+#[test]
+fn float_native_flag_reads_little_endian() {
+    let subject = [63u8, 192, 0, 0];
+    let (native, pos) = read_field(
+        &Instr::BsGetFloat2(Box::new(read_args(32, 1, BSF_NATIVE))),
+        &subject,
+    );
+    assert_eq!(
+        crate::terms::float_value(native.expect("a valid native float")).expect("a float term"),
+        6.896_490_392_174_587e-41
+    );
+    assert_eq!(pos, 32, "the read consumes 32 bits");
+    // Byte-identical to the `-little` read, and distinct from the big default.
+    let (little, _) = read_field(
+        &Instr::BsGetFloat2(Box::new(read_args(32, 1, BSF_LITTLE))),
+        &subject,
+    );
+    assert_eq!(
+        crate::terms::float_value(little.expect("a valid little-endian float"))
+            .expect("a float term"),
+        6.896_490_392_174_587e-41
+    );
+    let (big, _) = read_field(&Instr::BsGetFloat2(Box::new(read_args(32, 1, 0))), &subject);
+    assert_eq!(
+        crate::terms::float_value(big.expect("a valid big-endian float")).expect("a float term"),
+        1.5
+    );
+}
+
+/// Oracle: `<<X:32/integer-native>> = <<1,2,3,4>>` ⇒ `67305985` (`16#04030201`, the
+/// little-endian read); the big-endian read would be `16909060` (`16#01020304`).
+#[test]
+fn integer_native_flag_reads_little_endian() {
+    let subject = [1u8, 2, 3, 4];
+    let (native, pos) = read_field(
+        &Instr::BsGetInteger2(Box::new(read_args(32, 1, BSF_NATIVE))),
+        &subject,
+    );
+    assert_eq!(
+        beam_term::signed_value(native.expect("a valid native integer")),
+        67_305_985
+    );
+    assert_eq!(pos, 32, "the read consumes 32 bits");
+    let (little, _) = read_field(
+        &Instr::BsGetInteger2(Box::new(read_args(32, 1, BSF_LITTLE))),
+        &subject,
+    );
+    assert_eq!(
+        beam_term::signed_value(little.expect("a valid little-endian integer")),
+        67_305_985
+    );
+    let (big, _) = read_field(
+        &Instr::BsGetInteger2(Box::new(read_args(32, 1, 0))),
+        &subject,
+    );
+    assert_eq!(
+        beam_term::signed_value(big.expect("a valid big-endian integer")),
+        16_909_060
+    );
+}
+
+/// Oracle: `<<X/utf16-native>> = <<32,172>>` ⇒ `44064` (`16#AC20`, the
+/// little-endian word); the big-endian read would be `8364` (`16#20AC`).
+#[test]
+fn utf16_native_flag_reads_little_endian() {
+    let utf16 = |flags| Instr::BsGetUtf16 {
+        fail: NO_FAIL,
+        ctx: Operand::X(1),
+        live: 2,
+        flags,
+        dst: Operand::X(0),
+    };
+    let subject = [32u8, 172];
+    let (native, pos) = read_field(&utf16(BSF_NATIVE), &subject);
+    assert_eq!(
+        beam_term::signed_value(native.expect("a valid native scalar")),
+        44_064
+    );
+    assert_eq!(pos, 16, "the read consumes 16 bits");
+    let (little, _) = read_field(&utf16(BSF_LITTLE), &subject);
+    assert_eq!(
+        beam_term::signed_value(little.expect("a valid little-endian scalar")),
+        44_064
+    );
+    let (big, _) = read_field(&utf16(0), &subject);
+    assert_eq!(
+        beam_term::signed_value(big.expect("a valid big-endian scalar")),
+        0x20AC
+    );
 }
 
 /// A match failure is the `{badmatch, Subject}` raise `fail_step` builds, never a

@@ -101,7 +101,7 @@ pub(crate) fn read_integer_field(
     nbits: usize,
     flags: u32,
 ) -> Result<Eterm> {
-    let little = flags & BSF_LITTLE != 0;
+    let little = field_is_little(flags);
     // A byte-aligned little-endian field is the only one `read_uint_le` handles;
     // every other little-endian field takes the general bit-level path (C's
     // `erts_copy_bits_fwd` + `*MSB >>= 8 - BIT_OFFSET(num_bits)`,
@@ -156,7 +156,7 @@ pub(crate) fn read_wide_integer_field(
     // The field's bits, MSB-first, left-aligned in `num_bytes` bytes.
     let field = extract_bits(bytes, start, nbits)?;
     let mut value = vec![0u8; num_bytes];
-    if flags & BSF_LITTLE != 0 {
+    if field_is_little(flags) {
         let rem = nbits % 8;
         for (j, out) in value.iter_mut().enumerate() {
             *out = if j + 1 == num_bytes && rem != 0 {
@@ -236,7 +236,7 @@ pub(crate) fn read_float_field(
     if nbits == 0 {
         return Ok(0.0);
     }
-    let little = flags & BSF_LITTLE != 0;
+    let little = field_is_little(flags);
     let raw = if little {
         read_uint_le_bits(bytes, start, nbits)?
     } else {
@@ -358,7 +358,7 @@ pub(crate) fn decode_utf16(
     end: usize,
     flags: u32,
 ) -> Option<(u32, usize)> {
-    let little = flags & BSF_LITTLE != 0;
+    let little = field_is_little(flags);
     if end < start + 16 {
         return None;
     }
