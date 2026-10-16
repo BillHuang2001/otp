@@ -761,50 +761,66 @@ impl<'a> Encoder<'a> {
     /// Encodes a cons list: a proper list of bytes (length ≤ 65535) becomes
     /// `STRING_EXT`, everything else (including an improper list) becomes
     /// `LIST_EXT`.
+    ///
+    /// The common case — a proper list whose elements are all bytes — is written
+    /// **optimistically and in one walk**: `STRING_EXT` with a zero 16-bit length
+    /// placeholder, then one byte per cons cell, then the count patched in. The
+    /// first element that is not a byte, an improper tail, or a length past the
+    /// 16-bit field rewinds the sink to the representation byte (`Writer::truncate`)
+    /// and falls back to `LIST_EXT` with a zero 32-bit element-count placeholder
+    /// patched at the end. That leaves ONE further walk for the general case and no
+    /// scratch buffer anywhere, so the encode path stays at one allocation.
     fn encode_list(&mut self, term: Eterm) -> Result<()> {
+        // Where the representation byte goes: the rewind point of the fallback.
+        let start = self.buf.len();
+        self.buf.u8(STRING_EXT);
+        self.buf.u16be(0); // patched with the byte count on success
+        let count_pos = start + 1;
+
         let mut count: u32 = 0;
-        let mut all_bytes = true;
         let mut cursor = term;
-        // Walk the spine once to measure it and decide the representation.
-        let proper = loop {
+        loop {
+            // Checked *before* the terminator: exactly 65536 bytes would still fit
+            // the walk but not the 16-bit length field, so it must fall back too.
+            if count > u32::from(u16::MAX) {
+                break;
+            }
             if is_nil(cursor) {
-                break true;
+                self.buf.patch_u16be(count_pos, count as u16)?;
+                return Ok(());
             }
             if !is_list(cursor) {
                 // An improper list: the tail is a non-nil, non-cons term.
-                break false;
+                break;
             }
             let head = cons_head(cursor)?;
             if !(is_small(head) && (0..=255).contains(&signed_value(head))) {
-                all_bytes = false;
+                break;
             }
-            count = count.checked_add(1).ok_or_else(error::system_limit)?;
+            self.buf.u8(signed_value(head) as u8);
+            count += 1;
             cursor = cons_tail(cursor)?;
-        };
-
-        if proper && all_bytes && count <= u32::from(u16::MAX) {
-            self.buf.u8(STRING_EXT);
-            self.buf.u16be(count as u16);
-            // Second walk: emit the (byte-valued) elements.
-            let mut cursor = term;
-            for _ in 0..count {
-                let head = cons_head(cursor)?;
-                self.buf.u8(signed_value(head) as u8);
-                cursor = cons_tail(cursor)?;
-            }
-            return Ok(());
         }
 
+        // Not a 16-bit `STRING_EXT`: drop the optimistic bytes and emit `LIST_EXT`.
+        self.buf.truncate(start)?;
         self.buf.u8(LIST_EXT);
-        self.buf.u32be(count);
+        let count_pos = self.buf.len();
+        self.buf.u32be(0); // patched with the cons-cell count at the end
+        let mut count: u32 = 0;
         let mut cursor = term;
-        for _ in 0..count {
+        loop {
+            if !is_list(cursor) {
+                // `NIL` for a proper list, otherwise the improper tail.
+                self.encode(cursor)?;
+                break;
+            }
             let head = cons_head(cursor)?;
             self.encode(head)?;
+            count = count.checked_add(1).ok_or_else(error::system_limit)?;
             cursor = cons_tail(cursor)?;
         }
-        // The tail term: `NIL_EXT` for a proper list, otherwise the improper tail.
-        self.encode(cursor)?;
+        self.buf.patch_u32be(count_pos, count)?;
         Ok(())
     }
 

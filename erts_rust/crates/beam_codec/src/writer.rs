@@ -30,8 +30,12 @@ use crate::error;
 
 /// A growable sink for network-order bytes.
 ///
-/// The writer appends; nothing is ever rewritten, so `as_slice` stays stable
-/// across appends only for the bytes already written (callers re-borrow).
+/// The writer appends; the only in-place writes are the backward ones a
+/// length-prefixed block needs when its size is known only after its body has
+/// been emitted ([`Writer::patch_u16be`], [`Writer::patch_u32be`],
+/// [`Writer::mask_last_byte`]) plus the [`Writer::truncate`] undo. `as_slice`
+/// therefore stays stable across appends only for the bytes already written
+/// (callers re-borrow).
 pub struct Writer {
     /// The bytes written so far.
     buf: Vec<u8>,
@@ -100,6 +104,26 @@ impl Writer {
         self.buf.clear();
     }
 
+    /// Rolls the sink back to `len` bytes, discarding everything written after it
+    /// while keeping the allocated capacity.
+    ///
+    /// This is the counterpart of [`Writer::patch_u32be`] on the *undo* side: the
+    /// list encoder optimistically emits the `STRING_EXT` form, and when the spine
+    /// turns out not to be a byte list it rewinds the sink to the recorded start
+    /// position and re-emits `LIST_EXT` in its place, so no scratch buffer is ever
+    /// needed.
+    ///
+    /// **Internal invariant:** `len` is a position the caller recorded earlier (so
+    /// `len <= self.len()`). A forward position would silently *extend* the image
+    /// with garbage, so it is rejected — as is a `len` that cannot be a length —
+    /// with `BeamError::BadArg` rather than a panic or a corrupt image.
+    pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
+        if len > self.buf.len() {
+            return Err(error::bad_arg());
+        }
+        self.buf.truncate(len);
+        Ok(())
+    }
     /// Applies `mask` to the byte most recently written, leaving every other byte
     /// untouched.
     ///
@@ -127,6 +151,27 @@ impl Writer {
     pub(crate) fn patch_u32be(&mut self, pos: usize, value: u32) -> Result<()> {
         let end = pos
             .checked_add(core::mem::size_of::<u32>())
+            .ok_or_else(error::bad_arg)?;
+        let slot = self.buf.get_mut(pos..end).ok_or_else(error::bad_arg)?;
+        slot.copy_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
+
+    /// Overwrites the two bytes starting at `pos` with the big-endian encoding of
+    /// `value`, leaving every other byte untouched.
+    ///
+    /// The 16-bit twin of [`Writer::patch_u32be`], for a length-prefixed block whose
+    /// size is only known once its body has been emitted: the `STRING_EXT` element
+    /// count (the list encoder writes a zero placeholder, appends the bytes, then
+    /// patches the count in).
+    ///
+    /// **Internal invariant:** the caller has already written the two bytes at
+    /// `pos` (typically the placeholder), so `pos + 2 <= len`. A `pos` that is out
+    /// of range — or `pos + 2` overflowing `usize` — yields `BeamError::BadArg`
+    /// rather than a panic or a silent short write.
+    pub(crate) fn patch_u16be(&mut self, pos: usize, value: u16) -> Result<()> {
+        let end = pos
+            .checked_add(core::mem::size_of::<u16>())
             .ok_or_else(error::bad_arg)?;
         let slot = self.buf.get_mut(pos..end).ok_or_else(error::bad_arg)?;
         slot.copy_from_slice(&value.to_be_bytes());
@@ -273,5 +318,61 @@ mod tests {
         ));
         // The rejected calls left the buffer untouched.
         assert_eq!(writer.as_slice(), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn patch_u16be_overwrites_only_the_two_addressed_bytes() {
+        let mut writer = Writer::new();
+        writer.bytes(&[0xAA, 0, 0, 0xCC]);
+        writer.patch_u16be(1, 0xBEEF).unwrap();
+        assert_eq!(writer.as_slice(), &[0xAA, 0xBE, 0xEF, 0xCC]);
+
+        // The patched region may be the whole buffer, and values are network-order.
+        let mut tail = Writer::new();
+        tail.u16be(0);
+        tail.patch_u16be(0, 1).unwrap();
+        assert_eq!(tail.as_slice(), &[0, 1]);
+        tail.patch_u16be(0, u16::MAX).unwrap();
+        assert_eq!(tail.as_slice(), &[0xFF; 2]);
+    }
+
+    #[test]
+    fn patch_u16be_rejects_an_out_of_range_position() {
+        let mut writer = Writer::new();
+        writer.u16be(0);
+        // Past the end, the end itself, and a `pos` that cannot hold two bytes.
+        assert!(matches!(writer.patch_u16be(1, 1), Err(BeamError::BadArg)));
+        assert!(matches!(writer.patch_u16be(2, 1), Err(BeamError::BadArg)));
+        assert!(matches!(
+            writer.patch_u16be(usize::MAX, 1),
+            Err(BeamError::BadArg)
+        ));
+        // The rejected calls left the buffer untouched.
+        assert_eq!(writer.as_slice(), &[0, 0]);
+    }
+
+    #[test]
+    fn truncate_drops_bytes_after_the_position_and_keeps_the_rest() {
+        let mut writer = Writer::with_capacity(64);
+        writer.bytes(&[1, 2, 3, 4]);
+        writer.truncate(2).unwrap();
+        assert_eq!(writer.as_slice(), &[1, 2]);
+        assert_eq!(writer.len(), 2);
+        // Truncating to the current length, and to zero, are both no-ops/clears.
+        writer.truncate(2).unwrap();
+        assert_eq!(writer.as_slice(), &[1, 2]);
+        writer.truncate(0).unwrap();
+        assert!(writer.is_empty());
+        // The allocation survives, so a rewind costs no allocation.
+        assert!(writer.into_vec().capacity() >= 64);
+    }
+
+    #[test]
+    fn truncate_rejects_a_forward_position() {
+        let mut writer = Writer::new();
+        writer.bytes(&[1, 2]);
+        // A position past the end would *extend* the image with garbage.
+        assert!(matches!(writer.truncate(3), Err(BeamError::BadArg)));
+        assert_eq!(writer.as_slice(), &[1, 2]);
     }
 }
