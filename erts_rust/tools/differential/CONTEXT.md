@@ -129,7 +129,7 @@ Non-corpus modules:
 - `src/nif_build.rs` → the **C/NIF** half (crate-private): `$CC`/`cc` resolution, the `erl_nif.h` locator (`resolve_erl_include`), `NifFixture::{CompiledLibrary,TextFileSo}`, `build(source,module,nif) -> Result<Build>`.
 - `src/compare.rs` → `Observables`, classified stderr (`is_runtime_banner_line`/`significant_stderr`), `FieldDiff`, `GoldenCheck`, `Verdict`, `compare_observations*`/`verdict*`/`check_golden`/`normalize_probe_stdout`.
 - `src/allowlist.rs` → `AllowEntry`, `Allowlist::parse`/`load`/`empty`, `get`/`contains`/`entries`/`path`.
-- `src/ratchet.rs` → `RatchetReport::classify`, `has_mismatch`, `report_from_suite`, `suite_exit_code`, `gaps_markdown`/`write_markdown`.
+- `src/ratchet.rs` → `RatchetReport::classify`, `has_mismatch`, `report_from_suite`, `suite_exit_code`, `gaps_markdown`/`write_markdown`/`write_gaps` (the one writer `suite --gaps` **and** `merge --gaps` both call).
 - `src/harness.rs` → `RuntimeContext`/`resolve_context`, `run_case`/`run_case_in`/`compare_expr`/`run_suite`, per-side argv planning, env/module/command routing (`run_module_case`, `run_command_case`/`skipped_command_outcome`, `RunPlan.rust_spec` — the Rust side may be `beam_rt` or `dist_probe`), exit-3 classification + exit-code derivation.
 - `src/report/` → `mod.rs`/`model.rs`/`json.rs`/`render.rs`: the serde model + the `summary`/`by_contract`/`ratchet` rollups, the `differential/1` schema + `write_json`, `render_human`/`render_list_grouped`.
 - `src/main.rs` → thin binary: parse → dispatch → `process::exit`.
