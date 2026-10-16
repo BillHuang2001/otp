@@ -2333,23 +2333,21 @@ fn read_bits_be(bytes: &[u8], start: usize, n: usize) -> u64 {
 }
 
 /// Reads `n` bits (`n <= 64`) starting at bit `start` as a **little-endian** unsigned
-/// integer: the bits are gathered MSB-first into `ceil(n / 8)` bytes, and those bytes
-/// are then interpreted least-significant byte first (the inverse of
-/// [`BitBuf::push_integer_bits`] with `little = true`).
+/// integer: the bits are gathered MSB-first into `ceil(n / 8)` bytes, and those whole
+/// bytes are then interpreted least-significant byte first — the exact inverse of
+/// [`BitBuf::push_integer_bits`] with `little = true`.
+///
+/// A width that is not a whole number of bytes leaves a final **partial** byte, and its
+/// `n % 8` bits are the value's next byte (they were pushed into the *high* bits of the
+/// last byte), so they enter the value *above* the whole bytes rather than through the
+/// byte reversal: `<<212,14:4>>` read as `<<A:12/little>>` is `16#0E bsl 8 bor 16#D4` =
+/// 3796, and the byte-aligned `<<0,1>>` as `<<A:16/little>>` is still 256. A width of at
+/// most 8 bits is unaffected by `little` (its single partial field *is* the whole value),
+/// exactly as the oracle's own reader treats it.
 fn read_bits_le(bytes: &[u8], start: usize, n: usize) -> u64 {
-    let n_bytes = n.div_ceil(8);
-    let mut gathered = [0u8; 8];
-    for i in 0..n {
-        let bit = bytes[(start + i) / 8] & (0x80 >> ((start + i) % 8)) != 0;
-        if bit {
-            gathered[i / 8] |= 0x80 >> (i % 8);
-        }
-    }
-    let mut value = 0u64;
-    for &byte in gathered[..n_bytes].iter().rev() {
-        value = (value << 8) | u64::from(byte);
-    }
-    value
+    // The byte-wise reader itself lives in the `bits_match` module, next to the oracle
+    // table that pins it; this entry point stays the one the integer pattern path calls.
+    bits_match::read_little_endian_bits(bytes, start, n)
 }
 
 /// Sign-extends the low `n` bits (`n <= 64`) of `value`.
