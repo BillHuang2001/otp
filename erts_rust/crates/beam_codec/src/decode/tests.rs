@@ -33,6 +33,8 @@
         pid_serial, port_number, signed_value,
     };
 
+    use crate::tag::{ATOM_INTERNAL_REF2_EXT, ATOM_INTERNAL_REF3_EXT};
+
     use crate::term::{
         big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
         external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity,
@@ -1502,7 +1504,7 @@
     // -----------------------------------------------------------------------
 
     /// `[VERSION_MAGIC][SMALL_ATOM_UTF8_EXT][len]["xyz"]` — an atom **name** on the wire.
-    const ATOM_XYZ: [u8; 7] = [131, 119, 3, b'x', b'y', b'z'];
+    const ATOM_XYZ: [u8; 6] = [131, 119, 3, b'x', b'y', b'z'];
 
     #[test]
     fn safe_rejects_an_unknown_atom_name_and_interns_nothing() {
