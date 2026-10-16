@@ -57,9 +57,9 @@
 //! * **Unload is immediate.** The C's `try_unload` is a *pending* state machine (a reload/unload is
 //!   staged and completed by the scheduler); here the entry is removed at once and the
 //!   `DriverLibrary` drops synchronously.
-//! * **Single-process bookkeeping only.** The C's entry also tracks reload state, monitor lists and
-//!   the loading process for `not_loaded_by_this_process`; this registry records the loading pid but
-//!   does not yet enforce it.
+//! * **Single-process bookkeeping only.** The C's entry also tracks reload state and monitor lists;
+//!   this registry records the loading pid and its outstanding-load count ([`Loaded::loads`]) but
+//!   does not yet enforce `not_loaded_by_this_process`.
 
 // Several fields (`path`, `options`, `kill_ports`, `loader`) are recorded for the host bridge /
 // diagnostics and read by this module's tests and by a future `monitor/2`/`info/2` implementation;
@@ -108,6 +108,16 @@ pub(crate) struct Loaded {
     pub(crate) kill_ports: bool,
     /// The process that performed the load (the C's `loader` pid).
     pub(crate) loader: ProcessId,
+    /// How many `try_load` calls by [`loader`](Self::loader) are outstanding.
+    ///
+    /// The C appends a fresh `ERL_DE_PROC_LOADED` entry on **every** successful
+    /// `try_load` — including the `already_loaded` arm (`add_proc_loaded`,
+    /// `erl_bif_ddll.c:1389`) — and `try_unload` drops exactly one. `num_procs(dh,
+    /// ERL_DE_PROC_LOADED) > 0` then makes `try_unload` answer `pending_process`
+    /// instead of `pending_driver` (`:583-587`), and `info(Name, processes)` reports
+    /// the count (`build_proc_info`, `:1770`). This runtime has a single loading
+    /// process today (`ctx.self_pid()`), so one counter reproduces both.
+    pub(crate) loads: u32,
 }
 
 thread_local! {
@@ -137,6 +147,45 @@ pub(crate) fn remove(name: &str) -> Option<Loaded> {
         let mut drivers = drivers.borrow_mut();
         let index = drivers.iter().position(|(key, _)| key == name)?;
         Some(drivers.remove(index).1)
+    })
+}
+
+/// Records one more outstanding load of `name` (the C's `add_proc_loaded`), answering whether the
+/// driver is in the registry.
+///
+/// The C appends a fresh `ERL_DE_PROC_LOADED` entry on **every** successful `try_load`, the
+/// `already_loaded` arm included, so a repeat load of a live driver raises its outstanding count.
+pub(crate) fn increment_loads(name: &str) -> bool {
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        match drivers.iter_mut().find(|(key, _)| key == name) {
+            Some((_, loaded)) => {
+                loaded.loads += 1;
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Drops one outstanding load of `name`, removing the entry — and dropping its `DriverLibrary`,
+/// which runs the driver's `finish` callback and `dlclose`s the object — when it was the last.
+///
+/// `None` when `name` is not loaded at all (the caller's `{error, not_loaded}` arm);
+/// `Some(outstanding)` otherwise, `outstanding` being `true` while another load remains (the C's
+/// `num_procs(dh, ERL_DE_PROC_LOADED) > 0`, `erl_bif_ddll.c:583`).
+pub(crate) fn decrement_loads(name: &str) -> Option<bool> {
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        let index = drivers.iter().position(|(key, _)| key == name)?;
+        let entry = &mut drivers[index].1;
+        entry.loads = entry.loads.saturating_sub(1);
+        if entry.loads > 0 {
+            return Some(true);
+        }
+        let (_, loaded) = drivers.remove(index);
+        drop(loaded);
+        Some(false)
     })
 }
 

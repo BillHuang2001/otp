@@ -180,6 +180,22 @@ fn demonitor_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.intern_atom("true")
 }
 
+/// Mints a fresh driver-event reference on `ctx`'s heap — the C's `add_monitor`.
+///
+/// `erl_ddll:try_unload/2`'s `{monitor, _}` option makes the result the 3-tuple
+/// `{ok, Status, Ref}` (`erl_bif_ddll.c:611-620`), and the reference comes from this same
+/// [`NEXT_MONITOR_ID`] space so it can never collide with a [`monitor_2`] handle. The eventual
+/// message is a typed no-op here (see the module docs), so the reference names no registry entry —
+/// [`demonitor_1`] answers `true` for it all the same.
+///
+/// # Errors
+///
+/// Propagates a heap-allocation failure from building the reference term.
+pub(super) fn mint_ref(ctx: &mut BifContext<'_>) -> Result<Eterm> {
+    let id = NEXT_MONITOR_ID.fetch_add(1, Ordering::Relaxed);
+    access::make_ref_thing(ctx.heap(), id)
+}
+
 /// Registers `erl_ddll:monitor/2` and `erl_ddll:demonitor/1`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erl_ddll", "demonitor", 1, demonitor_1);
