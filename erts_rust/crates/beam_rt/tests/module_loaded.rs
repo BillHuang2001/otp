@@ -41,45 +41,38 @@
 //!   `nonexistent_xyz` answer `false` in both.
 //! * **A non-atom argument is `badarg`.** Both runtimes reject it (exit code 1).
 //!
-//! # The boot set: this runtime runs the boot script too, but loads it **eagerly**
+//! # The boot set: this runtime runs the boot script too, with `init`'s own gating
 //!
 //! Every CLI action but `-version` now drives the default boot script
-//! (`bootstrap/bin/start.boot`), exactly as `init` does, so the **first** `primLoad` batch
-//! (`lists`, `kernel`, …) is loaded before the `-eval` program runs - matching the oracle
-//! (`erlang:module_loaded(lists)` is `true` in both).
-//!
-//! The remaining, by-construction divergence is **how much** of the script's `primLoad`
-//! batches is loaded eagerly. The oracle's `init` runs in *interactive* (non-embedded) mode:
-//! once it sees `{kernel_load_completed}` it sets `prim_load = false`
-//! (`erts/preloaded/src/init.erl:1337`) and lets the code server load the later batches
-//! **on demand**, so its table holds ~109 modules and `digraph`/`dets`/`epp`/… are still
-//! `false`. This runtime's executor loads **every** batch, so its table holds ~224 modules
-//! and those names are `true`. That is the same class of divergence as `erlang:processes/0` /
-//! `system_info(port_count)`: an answer that reads **this** runtime's own state and is
-//! *truthful* about it, not a bug to paper over.
-//! [`the_boot_set_divergence_is_exactly_the_boot_scripts_module_loads`] measures it in one
-//! oracle-cross-checked probe (a name in the eagerly-loaded first batch agrees; a name the
-//! oracle defers to an on-demand load diverges; an *available* module and an unknown one
-//! agree on `false`), [`the_loaded_set_is_self_consistent_in_both`] pins that this runtime
-//! agrees with its own `code:all_loaded/0`, and
+//! (`bootstrap/bin/start.boot`), exactly as `init` does: the **first** `primLoad` batch
+//! (`lists`, `kernel`, …) is loaded before the `-eval` program runs, while the batches after
+//! `{kernel_load_completed}` are deferred to the code server's on-demand loading — the
+//! `interactive`-mode rule `init` applies (`erts/preloaded/src/init.erl:1206-1216,1337-1348`).
+//! This runtime's loaded set therefore has the oracle's **shape**: the first-batch names are
+//! `true` in both, and a later-batch name (`digraph`) is `false` in both until something
+//! loads it.
+//! [`the_boot_set_agrees_with_the_live_oracle`] measures exactly that in one
+//! oracle-cross-checked probe (two names the first batch loads, one the oracle defers to an
+//! on-demand load, and an unknown one), [`the_loaded_set_is_self_consistent_in_both`] pins
+//! that this runtime agrees with its own `code:all_loaded/0`, and
 //! [`the_two_boot_script_names_flip_when_this_runtime_loads_them`] (plus
-//! [`the_boot_set_divergence_is_this_runtimes_own_truthful_loaded_set`]) proves the answer is
+//! [`the_boot_set_is_this_runtimes_own_truthful_loaded_set`]) proves the answer is
 //! this runtime's own loaded state - a real load is reflected, exactly as in the oracle.
 //!
 //! The hard constraint this suite guards: the answer must **never** come from a
 //! `find_file(...).is_some()` ("is on the code path") shortcut, which would wrongly answer
 //! `true` for `xmerl_scan`/`dialyzer` —
 //! [`an_absent_or_unloaded_name_is_false_in_both`] and
-//! [`the_boot_set_divergence_is_exactly_the_boot_scripts_module_loads`] are the guards.
+//! [`the_boot_set_agrees_with_the_live_oracle`] are the guards.
 //!
 //! # The on-demand reflection
 //!
 //! The suites below measure the load reflection through a **genuine** external call
 //! (`compile:env_compiler_options/0`) and through `code:ensure_loaded/1` (`compile`) - a
-//! module neither runtime has loaded at boot, unlike `digraph`, which this runtime now loads
-//! eagerly. (A `lists:reverse/1` probe would measure nothing at all: `lists:reverse/1` is one
-//! of `beam_bifs`'s registry fast paths (`beam_bifs/src/lists.rs`), so the call never reaches
-//! the code server - not a load path escaping the cache, just a served-fast-path call.)
+//! module neither runtime has loaded at boot. (A `lists:reverse/1` probe would measure
+//! nothing at all: `lists:reverse/1` is one of `beam_bifs`'s registry fast paths
+//! (`beam_bifs/src/lists.rs`), so the call never reaches the code server - not a load path
+//! escaping the cache, just a served-fast-path call.)
 //!
 //! # Toolchain
 //!
@@ -194,8 +187,7 @@ const ABSENT_EXPECTED: &str = "{false,false,false}";
 
 /// A module becomes loaded on demand through `code:ensure_loaded/1`: `false` before, `true`
 /// after - the reflection of the code server's own cache, in both runtimes. `compile` is on
-/// both runtimes' code path and loaded by neither at boot (`digraph` would not do: this
-/// runtime's eager `primLoad` has already loaded it).
+/// both runtimes' code path and loaded by neither at boot.
 const EXPR_ENSURE_LOADED: &str = "\
 Before = erlang:module_loaded(compile), \
 code:ensure_loaded(compile), \
@@ -240,24 +232,19 @@ const EXPR_BADARG: &str = "erlang:module_loaded(42).";
 const EXPR_BADARG_CAUGHT: &str = "\
 try erlang:module_loaded(42) catch error:badarg -> io:format(\"badarg~n\") end, halt(0).";
 
-/// The boot-set divergence in **one** probe: two names the oracle's node start-up eagerly
-/// loads (the first `primLoad` batch of `bootstrap/bin/start.boot`) and two it does not.
-/// `digraph` is in a *later* `primLoad` batch that the oracle's interactive `init` defers to an
-/// on-demand load (`code:which/1` still resolves it), and `nonexistent_xyz` does not exist at
-/// all, so the oracle answers `false` for both.
+/// The boot set in **one** probe: two names the boot script eagerly loads (its first
+/// `primLoad` batch, before the `{kernel_load_completed}` marker) and two it does not.
+/// `digraph` is in a *later* `primLoad` batch that `init` defers to an on-demand load outside
+/// embedded mode (`code:which/1` still resolves it), and `nonexistent_xyz` does not exist at
+/// all, so both runtimes answer `false` for both.
 const EXPR_BOOT_SET: &str = "\
 io:format(\"~p~n\", [{erlang:module_loaded(lists), erlang:module_loaded(kernel), \
 erlang:module_loaded(digraph), erlang:module_loaded(nonexistent_xyz)}]), halt(0).";
 
-/// This runtime's own answer for [`EXPR_BOOT_SET`]: its boot script loads the first `primLoad`
-/// batch (`lists`, `kernel`) **and** every later batch eagerly, so `lists`, `kernel` and
-/// `digraph` are all loaded here.
-const BOOT_SET_OURS: &str = "{true,true,true,false}";
-
-/// The live oracle's answer for [`EXPR_BOOT_SET`] (OTP 29.1.1 / erts-17.1): `lists` and
-/// `kernel` are in its code table before `-eval` runs; `digraph`/`nonexistent_xyz` are not.
-const BOOT_SET_ORACLE: &str = "{true,true,false,false}";
-
+/// The boot-set answer for [`EXPR_BOOT_SET`] (OTP 29.1.1 / erts-17.1): `lists` and `kernel`
+/// are in the code table before `-eval` runs (the first `primLoad` batch, which both runtimes
+/// load eagerly); `digraph`/`nonexistent_xyz` are not. **Both** runtimes produce this value.
+const BOOT_SET: &str = "{true,true,false,false}";
 /// This runtime's loaded set checked against **its own** `code:all_loaded/0`: `D` (the
 /// modules that listing disagrees with `erlang:module_loaded/1` about) must be none, and the
 /// two first-batch boot-script names are loaded here.
@@ -368,7 +355,7 @@ fn a_module_becomes_loaded_on_demand_in_both() {
 /// **recorded**, not pinned, because the whole point is that each runtime reports its own
 /// loaded set - a future OTP whose boot set changes must not fail this suite.
 #[test]
-fn the_boot_set_divergence_is_this_runtimes_own_truthful_loaded_set() {
+fn the_boot_set_is_this_runtimes_own_truthful_loaded_set() {
     let ours = beam_rt_eval(EXPR_LISTS);
     assert_eq!(ours.code, 0, "beam_rt: exit {} stderr {}", ours.code, ours.err);
     assert_eq!(
@@ -433,21 +420,20 @@ fn a_non_atom_argument_is_badarg_in_both() {
     );
 }
 
-/// The boot-set divergence, in a single oracle-cross-checked probe: of `lists` (eagerly loaded
-/// by both runtimes' boot scripts), `kernel` (likewise), `digraph` (in a later `primLoad` batch
-/// the oracle's interactive `init` defers but this runtime loads eagerly) and an unknown name,
-/// the `lists`/`kernel` positions agree and `digraph` diverges. Both runtimes agree that
-/// "resolvable on the code path" (`code:which/1` resolves `digraph` even in the oracle) and
-/// "unknown" are **not** "loaded", which is the guard against closing this gap with a
-/// code-path shortcut.
+/// The boot set, in a single oracle-cross-checked probe: of `lists` and `kernel` (eagerly
+/// loaded by both runtimes' boot scripts), `digraph` (in a later `primLoad` batch that
+/// `interactive` `init` defers to an on-demand load) and an unknown name, both runtimes answer
+/// `{true,true,false,false}`. Both also agree that "resolvable on the code path"
+/// (`code:which/1` resolves `digraph` in both) and "unknown" are **not** "loaded", which is
+/// the guard against closing a boot-set gap with a code-path shortcut.
 #[test]
-fn the_boot_set_divergence_is_exactly_the_boot_scripts_module_loads() {
+fn the_boot_set_agrees_with_the_live_oracle() {
     let ours = beam_rt_eval(EXPR_BOOT_SET);
     assert_eq!(ours.code, 0, "beam_rt: exit {} stderr {}", ours.code, ours.err);
     assert_eq!(
-        ours.out, BOOT_SET_OURS,
-        "this runtime's boot loads its first primLoad batch eagerly, so `lists` and `kernel` \
-         are loaded here - and, unlike the oracle, it also loads the later batches (`digraph`)"
+        ours.out, BOOT_SET,
+        "this runtime's boot loads its first primLoad batch (`lists`, `kernel`) and defers \
+         the later ones (`digraph`) to the code server, exactly as `interactive` `init` does"
     );
 
     let Some(oracle) = support::require_oracle("module_loaded") else {
@@ -456,18 +442,17 @@ fn the_boot_set_divergence_is_exactly_the_boot_scripts_module_loads() {
     let theirs = oracle_eval(&oracle, EXPR_BOOT_SET);
     assert_eq!(theirs.code, 0, "the oracle failed: stderr {}", theirs.err);
     assert_eq!(
-        theirs.out, BOOT_SET_ORACLE,
+        theirs.out, BOOT_SET,
         "the recorded value must be the live oracle's answer"
     );
     eprintln!(
         "module_loaded(lists|kernel|digraph|nonexistent_xyz): beam_rt={} oracle={} \
-         (the first two are in the first `start.boot` primLoad batch, eagerly loaded by both; \
-         `digraph` is in a later batch this runtime loads eagerly but the oracle defers; \
+         (the first two are in the first `start.boot` primLoad batch, loaded by both; \
+         `digraph` is in a later batch both runtimes defer to the code server; \
          `nonexistent_xyz` is loaded in neither)",
         ours.out, theirs.out
     );
 }
-
 /// This runtime's own loaded set is **self-consistent**: every module its `code:all_loaded/0`
 /// lists answers `true`, and `lists`/`kernel` - the boot script's first `primLoad` batch - are
 /// loaded. The oracle is self-consistent too and has both names loaded, so the two answers now

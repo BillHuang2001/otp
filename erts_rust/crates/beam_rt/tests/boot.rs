@@ -307,9 +307,9 @@ fn the_real_start_boot_runs_to_completion() {
     }
 
     // The real `start.boot` now runs to completion: `boot_from_script` walks every directive
-    // in order — loading each `primLoad` batch, running all three `kernelProcess` directives
-    // (whose servers really register) and then `{apply,{c,erlangrc,[]}}`, whose file consult
-    // reaches `file_server_2`. On a route that drives a boot script — this `-boot FILE` one,
+    // in order — loading the pre-marker `primLoad` batch, skipping the post-marker ones as
+    // `init` does outside embedded mode, running all three `kernelProcess` directives
+    // (whose servers really register) and then `{apply,{c,erlangrc,[]}}`, whose file consult    // reaches `file_server_2`. On a route that drives a boot script — this `-boot FILE` one,
     // and every other CLI action but `-version` — the name is the booted `kernel_sup`'s own
     // `file_server_2` child (`lib/kernel/src/kernel.erl` starts `{file_server, start_link, []}`,
     // which registers the name — `file_server.erl:266-269`), because `Runtime::new` spawns the
@@ -354,20 +354,35 @@ fn the_real_start_boot_runs_to_completion() {
         script.instructions.get(20)
     );
 
-    // The `primLoad` batches really loaded, and they are **not** preloaded modules — so this
-    // is a genuine script-driven load.
-    for module in ["lists", "gen_server", "application_starter", "argparse", "zstd"] {
+    // The `primLoad` batch **before** the `{kernel_load_completed}` marker really loaded
+    // (`init`'s eager phase), and those names are **not** preloaded modules — so this is a
+    // genuine script-driven load. The batches **after** the marker are the documented no-op
+    // outside embedded mode, so their names are neither cached nor interned: that is the
+    // oracle's own loaded-set shape, where `erlang:list_to_existing_atom("hello")` (the atom
+    // rides `auth.beam`, a post-marker kernel batch name) is `badarg`.
+    for module in ["lists", "gen_server", "supervisor"] {
         assert!(
             rt.module(module).is_some(),
-            "{module} must have been loaded by the script"
+            "{module} must have been loaded by the pre-marker batch"
         );
         assert!(
             !rt.is_preloaded_loaded(module),
             "{module} is not a preloaded module, so the load came from the script"
         );
     }
+    for module in ["application_starter", "argparse", "zstd"] {
+        assert!(
+            rt.module(module).is_none(),
+            "{module} is only in a post-marker batch, which `interactive` mode must not load"
+        );
+    }
+    for atom in ["hello", "world"] {
+        assert!(
+            rt.atoms().lookup(atom).is_none(),
+            "the atom {atom} must not have been interned by the post-marker batches"
+        );
+    }
 }
-
 // ---------------------------------------------------------------------------
 // 5. A synthetic boot script, executed end to end
 // ---------------------------------------------------------------------------
