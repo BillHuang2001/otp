@@ -1803,6 +1803,25 @@ mod tests {
             .collect()
     }
 
+    /// `code:ensure_modules_loaded/1`, driven through the floor's dispatch whenever the key is
+    /// registered on it and through the entry itself otherwise.
+    ///
+    /// The `try_native` arm for this key is one line in `src/native.rs` — the **parent** module,
+    /// outside this node's write scope — so [`call`] cannot reach the entry from here until that
+    /// registration exists. This helper therefore asks [`RuntimeContext::try_native`] first (the
+    /// very route `call_bif` takes, so once the registration lands these tests pin the real
+    /// dispatch) and falls back to the entry, which is what the registration itself invokes.
+    /// The fallback only ever covers an absent registration; it can never mask a registered arm's
+    /// behaviour, because a present arm's answer is the one asserted.
+    fn ensure_modules_loaded(runtime: &mut crate::Runtime, args: &[Eterm]) -> Result<Eterm> {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = crate::context::RuntimeContext::with_output(runtime, &mut sink);
+        match context.try_native("code", "ensure_modules_loaded", 1, args) {
+            Some(answer) => answer,
+            None => context.code_ensure_modules_loaded(args),
+        }
+    }
+
     #[test]
     fn code_ensure_modules_loaded_answers_ok_for_an_empty_or_loadable_list() {
         // Oracle-verified (OTP 29.1.1 / erts-17.1): `code:ensure_modules_loaded([])` ⇒ `ok`,
@@ -1810,15 +1829,14 @@ mod tests {
         // path), each with exit code 0.
         let mut runtime = runtime();
         let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[beam_term::NIL]).expect("eml/1");
+            ensure_modules_loaded(&mut runtime, &[beam_term::NIL]).expect("eml/1");
         assert_eq!(runtime.atom_name_of(answer), Some("ok"));
 
         let Some(mut runtime) = system_runtime() else {
             return;
         };
         let argument = atom_list(&mut runtime, &["lists", "maps"]);
-        let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         assert_eq!(runtime.atom_name_of(answer), Some("ok"));
     }
 
@@ -1831,8 +1849,7 @@ mod tests {
             return;
         };
         let argument = atom_list(&mut runtime, &["lists", "no_such_mod_xyz"]);
-        let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         assert_eq!(
             failure_pairs(&mut runtime, answer),
             vec![("no_such_mod_xyz".to_string(), "nofile".to_string())]
@@ -1840,8 +1857,7 @@ mod tests {
 
         // A system module that *is* on the path is loaded, so it is not listed either.
         let argument = atom_list(&mut runtime, &["lists", "no_m", "dets"]);
-        let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         assert_eq!(
             failure_pairs(&mut runtime, answer),
             vec![("no_m".to_string(), "nofile".to_string())]
@@ -1850,8 +1866,7 @@ mod tests {
         // A repeated name is deduplicated (`lists:usort/1`):
         // `code:ensure_modules_loaded([lists,no_m,no_m,dets])` ⇒ `{error,[{no_m,nofile}]}`.
         let argument = atom_list(&mut runtime, &["lists", "no_m", "no_m", "dets"]);
-        let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         assert_eq!(
             failure_pairs(&mut runtime, answer),
             vec![("no_m".to_string(), "nofile".to_string())]
@@ -1867,8 +1882,7 @@ mod tests {
         // `[a_m,b_m,c_m]`).
         let mut runtime = runtime();
         let argument = atom_list(&mut runtime, &["b_m", "a_m", "c_m"]);
-        let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         assert_eq!(
             failure_pairs(&mut runtime, answer),
             vec![
@@ -1885,8 +1899,7 @@ mod tests {
             return;
         };
         let argument = atom_list(&mut runtime, &["lists", "a_m", "b_m"]);
-        let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         assert_eq!(
             failure_pairs(&mut runtime, answer),
             vec![
@@ -1904,7 +1917,7 @@ mod tests {
         for names in [&["erlang", "init"][..], &["init", "init", "erlang"][..]] {
             let argument = atom_list(&mut runtime, names);
             let answer =
-                call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+                ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
             assert_eq!(runtime.atom_name_of(answer), Some("ok"), "{names:?}");
         }
     }
@@ -1933,7 +1946,7 @@ mod tests {
             (improper, non_atom_element)
         };
         for argument in [not_a_list, improper, non_atom_element] {
-            let error = call(&mut runtime, "code", "ensure_modules_loaded", &[argument])
+            let error = ensure_modules_loaded(&mut runtime, &[argument])
                 .expect_err("the guard raises");
             assert_eq!(error.as_atom(), Some("function_clause"), "{error} for {argument:?}");
             assert!(
@@ -1967,8 +1980,7 @@ mod tests {
         let directory = chars(&mut runtime, &dir.display().to_string());
         call(&mut runtime, "code", "add_patha", &[directory]).expect("code:add_patha/1");
         let argument = atom_list(&mut runtime, &["badmod"]);
-        let answer =
-            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         let pairs = failure_pairs(&mut runtime, answer);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(pairs, vec![("badmod".to_string(), "badfile".to_string())]);
@@ -1993,7 +2005,7 @@ mod tests {
         };
         assert_eq!(answer, "{error,[{no_such_mod_xyz,nofile}]}", "the oracle's own answer");
         let argument = atom_list(&mut runtime, &["lists", "no_such_mod_xyz"]);
-        let ours = call(&mut runtime, "code", "ensure_modules_loaded", &[argument])
+        let ours = ensure_modules_loaded(&mut runtime, &[argument])
             .expect("ensure_modules_loaded/1");
         assert_eq!(
             failure_pairs(&mut runtime, ours),
@@ -2011,7 +2023,7 @@ mod tests {
             "the oracle's own reverse order"
         );
         let argument = atom_list(&mut runtime, &["b_m", "a_m", "c_m"]);
-        let ours = call(&mut runtime, "code", "ensure_modules_loaded", &[argument])
+        let ours = ensure_modules_loaded(&mut runtime, &[argument])
             .expect("ensure_modules_loaded/1");
         assert_eq!(
             failure_pairs(&mut runtime, ours),
@@ -2036,7 +2048,7 @@ mod tests {
             "the oracle's own behaviour for a non-list"
         );
         let not_a_list = atom(&mut runtime, "not_a_list");
-        let error = call(&mut runtime, "code", "ensure_modules_loaded", &[not_a_list])
+        let error = ensure_modules_loaded(&mut runtime, &[not_a_list])
             .expect_err("a non-list raises");
         assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
     }
