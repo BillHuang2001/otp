@@ -73,6 +73,71 @@ pub(crate) fn reset_registered_payload_total() {
     REGISTERED_PAYLOAD_TOTAL.with(|counter| counter.set(0));
 }
 
+// The slice/park accounting for this thread's runner, for the **deterministic** counter pin on
+// a growth-shaped workload (see `super::tests`).
+//
+// Like `REGISTERED_PAYLOAD_TOTAL`, these are **per thread** (a `thread_local!`, not a shared
+// static) so a concurrently running unit test's slices cannot perturb this test's counts. They
+// are **structural** facts of the runner — one *slice* is one `RuntimeRunner::run` call, a
+// *park* is a slice that handed the machine back to the scheduler (the `Yield` pre-emption arm
+// or the `receive` `Wait` arm) — never timings, so a per-call ratio derived from them is
+// deterministic on a loaded host. The `ctx/gc` debt pin's sibling
+// (`beam_process::Process::collection_debt`) is the other half: together they say whether the
+// per-call work of a workload is **flat** or **N-dependent**.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunSliceCounters {
+    /// `RuntimeRunner::run` calls (one reduction slice each).
+    pub(crate) slices: usize,
+    /// Slices that ended at the `Yield` (reduction-budget pre-emption) arm.
+    pub(crate) yields: usize,
+    /// Slices that ended at the `receive` `Wait` arm.
+    pub(crate) waits: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RUN_SLICE_COUNTERS: std::cell::Cell<RunSliceCounters> =
+        const { std::cell::Cell::new(RunSliceCounters { slices: 0, yields: 0, waits: 0 }) };
+}
+
+/// This thread's slice/park counters since the last [`reset_run_slice_counters`].
+#[cfg(test)]
+pub(crate) fn run_slice_counters() -> RunSliceCounters {
+    RUN_SLICE_COUNTERS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's slice/park counters (a measurement's "before" reading).
+#[cfg(test)]
+pub(crate) fn reset_run_slice_counters() {
+    RUN_SLICE_COUNTERS.with(|counter| counter.set(RunSliceCounters::default()));
+}
+
+/// Records one entered slice (`RuntimeRunner::run`).
+#[cfg(test)]
+fn note_slice_entered() {
+    RUN_SLICE_COUNTERS.with(|counter| {
+        let mut value = counter.get();
+        value.slices += 1;
+        counter.set(value);
+    });
+}
+
+/// Records one slice that handed the machine back to the scheduler: a `Yield` pre-emption
+/// (`preempted == true`) or a `receive` `Wait` park.
+#[cfg(test)]
+fn note_slice_parked(preempted: bool) {
+    RUN_SLICE_COUNTERS.with(|counter| {
+        let mut value = counter.get();
+        if preempted {
+            value.yields += 1;
+        } else {
+            value.waits += 1;
+        }
+        counter.set(value);
+    });
+}
+
 /// The `beam_process::ProcessRunner` the runtime hands to the scheduler.
 ///
 /// It borrows the runtime (for BIF dispatch, atoms and heaps) and the
@@ -307,6 +372,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
     /// [`RunOutcome::Exit`] carrying the raised reason, exactly as the BEAM terminates a
     /// process with the reason it raised.
     fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, budget: u32) -> Result<RunOutcome> {
+        // The deterministic slice counter (see `RUN_SLICE_COUNTERS`): one `run` call is one
+        // reduction slice, whatever the machine does inside it.
+        #[cfg(test)]
+        note_slice_entered();
         // Take the engine out of the map: it is borrowed mutably for the whole slice while
         // `self.runtime` is borrowed by the context, and a `HashMap` cannot hand out a
         // `&mut` value while its own container is still reachable. It goes back in below
@@ -746,6 +815,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // has cleared the mark — serves it.
             self.runtime.serve_gc_request(table, pid);
             self.state.engines.insert(pid, engine);
+            // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended at
+            // the `Yield` (pre-emption) arm.
+            #[cfg(test)]
+            note_slice_parked(true);
             return Ok(RunOutcome::Yield);
         }
 
@@ -861,6 +934,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // The admission points and the `Yield` arm are the sites that serve it.
                 self.runtime.serve_gc_request(table, pid);
                 self.state.engines.insert(pid, engine);
+                // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended
+                // at the `receive` `Wait` arm.
+                #[cfg(test)]
+                note_slice_parked(false);
                 Ok(RunOutcome::Wait)
             }
             Err(error) => {
