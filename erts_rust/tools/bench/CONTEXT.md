@@ -607,7 +607,9 @@ current** spaces — so it is the retained-capacity signal.) The measured values
 ## Honesty audit — measurement-integrity notes (current state)
 No workload returns a hard-coded or estimated metric; a workload that fails to build/run is always
 `failed`/`skipped`, never a number (verified across `src/workloads/*.rs`, `src/compare.rs`,
-`src/report.rs`, `src/runtime.rs`). No `todo!`/`unimplemented!`/non-doc `unreachable!`, no `#[ignore]`.
+`src/report.rs`, `src/runtime.rs`). No `todo!`/`unimplemented!`, no `#[ignore]`; the only `unreachable!`s
+(three in `src/compare.rs`) are invariant assertions that carry an explanatory message (an index-union /
+impossibility guard), not silent error handling.
 
 - **`foreign` classifies a staging failure honestly** (`src/workloads/foreign.rs`: `StageError` +
   `stage_outcome`): a checkout whose foreign `.erl` sources are genuinely absent ⇒
