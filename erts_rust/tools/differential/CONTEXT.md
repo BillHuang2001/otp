@@ -55,18 +55,22 @@ Success ⇒ one line `ok <repr>`, exit `0`; failure ⇒ `exception <class> <reas
 **Invariant:** a capability gap (`unsupported`/`skipped`) is **never** a mismatch — it can only cause exit `3` (not allowlisted) or `0` (allowlisted). The `1`-vs-`3` split is read **solely** from the top-level `summary`/`ratchet`; the per-contract `by_contract` rollup (which repeats `mismatch` keys at a deeper indent) is deliberately ignored. The gate's unauthorized/stale id lists are restricted to genuine gaps, so a `mismatch` can never be recorded as "allowed". The binary's own codes are unchanged (`0/1/2`).
 
 ## Status
-- **Corpus:** 2854 cases covering all nine contracts; live sweep `total=2854 agree=2853 mismatch=0
-  unsupported=1 skipped=0` (four consecutive identical 16-way `differential run` passes). The single
+- **Corpus:** 2925 cases covering all nine contracts; live sweep `total=2925 agree=2924 mismatch=0
+  unsupported=1 skipped=0 errors=0` (consecutive identical 16-way `differential run` passes). The single
   non-agreeing case is the allowlisted `wire/new_fun_ext_encode`.
 - **Deterministic:** the former A.4 oracle-side crash flake is fixed (see *Known Issues*); the corpus
   no longer depends on an oracle crash.
-- **Deepened this pass:** A.2 (19 cases — ETF small-big/dialect images, string/normalization round
-  trips, newer-reference + node-atom images), A.7 (17 BIF/OTP-app result shapes), A.8 (54
-  introspection cases — build/impl identity keys, `memory/0,1` structure, spawned-process
-  `process_info` items, `statistics/1` shapes, `fun_info/2`, the tracing and `seq_trace` surfaces)
-  and A.9 (27 boot/init cases — code-path/installation relations, `init:get_argument/1` depth, the
-  plain-boot loaded-app set and the `-boot start` io-server/argument observations).
-- **Tests:** `cargo.sh test -p differential --lib` → 325 passed (was 320).
+- **Last deepening round (this state):** A.6 (+20 — the `+k`/`+K`, `+sbt`, `-smp` and `-pa/-pz …/ebin`
+  flag families, `-env`/`-s`/`-eval`/`-boot` argument ingestion); A.7 (+30 — the `maps:iterator/1,2` +
+  `maps:next/1` family with the fun-taking `maps` fast paths over flat/HAMT maps, and bignum-into-narrow
+  bit-string segment construction/little-big/signed/derived sizing); A.2 (+15 — the `term_to_binary/2`
+  compressed/minor-version option matrix, the `local` gap's neighbours, the built-in `tcp_inet` port
+  surface and the A.9 self-hosting chain); A.4 (+6 — the built-in `tcp_inet` driver namespace observed
+  through a live port); A.5 (+6 — the distribution handshake name/status/challenge/reply message
+  encodings); A.8 (+6, the dual-contract `+`-flag cases); A.9 (+3 — a byte-identical in-process
+  `compile:file/2` of a real stdlib module, a dependent pair compiled in one run, and
+  `code:add_patha/1` + `init:fetch_loaded/0` shapes).
+- **Tests:** `cargo.sh test -p differential --lib` → 337 passed (was 325).
 
 ## Constraints
 - **Honest reporting:** a side that cannot run is `unsupported`/`skipped(<reason>)` — never `pass`; oracle observations are never fabricated. Loud failures (stderr + nonzero exit), never a silent swallow. Machine-readable JSON (`differential/1`), written under the gitignored `out/` (or `--out`).
