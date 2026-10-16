@@ -81,9 +81,21 @@
 //! `+sbt db` (`thread_no_node_processor_spread`, beside the pre-existing `+sbt u` case); the
 //! `-env VAR VALUE` launcher switch, which is consumed before `init` and therefore recorded
 //! **neither** under its own name nor under the variable's (its *effect* — the variable being
-//! set in the child's environment — is a divergence and is deliberately not pinned); the
+//! set in the child's environment — is pinned separately, through `os:getenv/1`); the
 //! implied `.` entry of the default code path; a multi-value `-setcookie`/`-pa`/`-pz`
 //! occurrence; and a non-existent `-pa`/`-pz` directory (dropped rather than stored).
+//!
+//! The final block widens that tail: the remaining `+sbt <mode>` binding-mode spellings
+//! (`ns`/`ts`/`ps`/`tnnps` → their `scheduler_bind_type` atoms), the unvalidated `+K` *value*
+//! surface (`+K false` and an arbitrary `+K bogus` are accepted, kernel poll stays on, and the
+//! switch is still not an `init` argument), the other `-smp` occurrences (`auto`, and the bare
+//! valueless form), the **effect** of `-env VAR VALUE` (the variable really is set in the
+//! child — observed through `os:getenv/1` — while an unrelated variable stays `false`), a
+//! `-pa`/`-pz` entry ending in `/ebin` (recorded verbatim: never re-split, never absolutized),
+//! a repeated `-boot` (two occurrences), and the two Start-instruction shapes that must not
+//! leak their expression into `init:get_plain_arguments/0` (a `-s Mod Func Arg` and a second
+//! `-eval`). `-smp disable` is *not* pinnable: the launcher rejects it before the emulator
+//! starts, so no probe observable exists (see `divergences.md`).
 //!
 //! **Why no `-pz`-shadowing case lives in this file.** `-pz D` must *append* `D`, so a
 //! `proplists.beam` living in `D` must not shadow the stdlib module: `code:which(proplists)`
@@ -1711,6 +1723,271 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the `+K` value surface, the `-smp` model switch, and the launcher switches -----
+        // `+K [true|false]` is *not validated* by either runtime: any value is consumed by the
+        // emulator before `init` sees the argv, and `erlang:system_info(kernel_poll)` reports
+        // the same `true` for `+K true` (the pre-existing `flags/plus_k_sets_kernel_poll`),
+        // `+K false` and an arbitrary `+K bogus`. The switch is likewise never recorded by
+        // `init`, so `init:get_argument('K')` stays the atom `error` for every value.
+        Case {
+            id: "flags/plus_k_false_keeps_kernel_poll_on",
+            description: "the +K false emulator flag is accepted and kernel poll stays observable",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(kernel_poll)",
+                extra_argv: &["+K", "false"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_k_unrecognized_value_is_accepted",
+            description: "an arbitrary +K value is accepted verbatim rather than rejected",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(kernel_poll)",
+                extra_argv: &["+K", "bogus"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_k_false_is_not_an_init_argument",
+            description: "the +K false switch is consumed by the emulator and not recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // The `+K true` half of the same rule is `flags/plus_k_is_not_an_init_argument`.
+                expr: "init:get_argument('K')",
+                extra_argv: &["+K", "false"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        // `-smp` is the (historically named) scheduler-model switch. Every accepted value is
+        // recorded verbatim as its own occurrence -- including the valueless occurrence `[]`,
+        // exactly like any other bare `-`-switch. `-smp disable` is *not* one of them: the
+        // launcher rejects it outright ("Argument '-smp disable' not supported. Use \"+S 1\"
+        // instead.") so no probe observable exists for it.
+        Case {
+            id: "flags/smp_auto_switch_value",
+            description: "the alternative -smp auto scheduler-model value is recorded verbatim",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(smp)",
+                extra_argv: &["-smp", "auto"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,117,116,111]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/smp_bare_is_a_valueless_occurrence",
+            description: "a bare -smp with no value is recorded as the empty occurrence",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(smp)",
+                extra_argv: &["-smp"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[]]}"),
+                exit_code: 0,
+            },
+        },
+        // The remaining `+sbt <mode>` binding-mode spellings, each through its own
+        // `system_info(scheduler_bind_type)` answer. `u` and `db` are pinned by
+        // `flags/plus_sbt_sets_scheduler_bind_type` / `flags/plus_sbt_db_sets_scheduler_bind_type`;
+        // these are the other modes the switch documents.
+        Case {
+            id: "flags/plus_sbt_no_spread_sets_scheduler_bind_type",
+            description: "the +sbt ns emulator flag selects no_spread",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(scheduler_bind_type)",
+                extra_argv: &["+sbt", "ns"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok no_spread"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_sbt_thread_spread_sets_scheduler_bind_type",
+            description: "the +sbt ts emulator flag selects thread_spread",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(scheduler_bind_type)",
+                extra_argv: &["+sbt", "ts"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok thread_spread"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_sbt_processor_spread_sets_scheduler_bind_type",
+            description: "the +sbt ps emulator flag selects processor_spread",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(scheduler_bind_type)",
+                extra_argv: &["+sbt", "ps"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok processor_spread"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_sbt_thread_no_node_processor_spread_sets_scheduler_bind_type",
+            description: "the +sbt tnnps emulator flag selects thread_no_node_processor_spread",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(scheduler_bind_type)",
+                extra_argv: &["+sbt", "tnnps"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok thread_no_node_processor_spread"),
+                exit_code: 0,
+            },
+        },
+        // The `-env VAR VALUE` launcher switch is consumed before `init` (see the two
+        // `flags/env_switch_*` recording cases) **and applied**: the variable really exists in
+        // the child's environment, so `os:getenv/1` answers the value (a string, whose `~w`
+        // image is a byte list) — and an unrelated variable stays `false`, so the case cannot
+        // pass by a runtime that leaks the raw argv into the environment.
+        Case {
+            id: "flags/env_variable_switch_sets_the_variable",
+            description: "the -env VAR VALUE launcher switch really sets the variable in the child",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "os:getenv(\"differential_env_var\")",
+                extra_argv: &["-env", "differential_env_var", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [104,101,108,108,111]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_variable_switch_leaves_other_variables_unset",
+            description: "a variable the -env switch did not name stays unset",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "os:getenv(\"differential_env_absent\")",
+                extra_argv: &["-env", "differential_env_var", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        // A `-pa`/`-pz` code-path entry that ends in an `/ebin` suffix is recorded verbatim,
+        // component for component -- the switch's value is not normalized (no `ebin`
+        // stripping, no absolutization) by either runtime.
+        Case {
+            id: "flags/pa_dir_ending_in_ebin_is_recorded",
+            description: "a -pa directory ending in /ebin is recorded verbatim, unsplit",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pa)",
+                extra_argv: &["-pa", "/differential/xyz/ebin"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {ok,[[[47,100,105,102,102,101,114,101,110,116,105,97,108,47,120,121,\
+                     122,47,101,98,105,110]]]}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/pz_dir_ending_in_ebin_is_recorded",
+            description: "a -pz directory ending in /ebin is recorded verbatim, unsplit",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pz)",
+                extra_argv: &["-pz", "/differential/xyz/ebin"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {ok,[[[47,100,105,102,102,101,114,101,110,116,105,97,108,47,120,121,\
+                     122,47,101,98,105,110]]]}",
+                ),
+                exit_code: 0,
+            },
+        },
+        // A repeated `-boot` is two occurrences, each carrying its own start-script name (the
+        // switch is an ordinary recorded one, unlike the `+`-flags and the Start
+        // instructions), and a Start instruction's *arguments* are consumed with it: neither
+        // `-s Mod Func Arg` nor a second `-eval` leaks its expression into
+        // `init:get_plain_arguments/0`.
+        Case {
+            id: "flags/boot_switch_twice_is_two_occurrences",
+            description: "a -boot switch given twice is two occurrences, in argv order",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(boot)",
+                extra_argv: &["-boot", "start_clean", "-boot", "start_clean"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {ok,[[[115,116,97,114,116,95,99,108,101,97,110]],[[115,116,97,114,116,\
+                     95,99,108,101,97,110]]]}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/s_instruction_values_are_not_plain_arguments",
+            description: "the -s Start instruction's arguments are consumed with the instruction",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_plain_arguments()",
+                extra_argv: &["-s", "init", "get_argument", "ok"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok []"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/eval_instruction_expression_is_not_a_plain_argument",
+            description: "a preceding -eval instruction's expression is consumed, not a plain argument",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // The harness appends the probe as a second `-eval`, so the argv here is
+                // `-noshell -eval ok -eval <probe>`: the first instruction's expression must be
+                // consumed with the instruction on both sides.
+                expr: "init:get_plain_arguments()",
+                extra_argv: &["-eval", "ok"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok []"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1775,22 +2052,33 @@ mod tests {
                     // The `BEAM_RT_GC_STRATEGY` host opt-in has no `init`/`system_info`
                     // observable either, so it too is pinned by acceptance — with an
                     // allocation big enough to grow the heap (see `flags/env_gc_strategy_*`).
-                    || expr == "length(lists:seq(1,100000))",
+                    || expr == "length(lists:seq(1,100000))"
+                    // `-env VAR VALUE` is the one launcher switch whose *effect* is observable
+                    // in the child: `os:getenv/1` answers the value it set (and `false` for a
+                    // variable it did not name).
+                    || expr.starts_with("os:getenv("),
                 "case {}: A.6 is observed through init:get_argument/1, get_plain_arguments/0, \
-                 (for a +-flag) erlang:system_info/1, a code-path membership probe, or (for an \
-                 argv flag with no other observable) the bounded-allocation acceptance probe, \
-                 got {expr}",
+                 (for a +-flag) erlang:system_info/1, a code-path membership probe, the \
+                 os:getenv/1 effect of -env, or (for an argv flag with no other observable) the \
+                 bounded-allocation acceptance probe, got {expr}",
                 case.id
             );
             // The golden is the valueless `-noshell` occurrence `[]`, the error atom, a
             // list of per-occurrence value lists, the (always empty) plain-argument list, a
-            // code-path membership boolean, or (for a `+`-flag / `ERL_MAX_PORTS` request) an
+            // code-path membership boolean, the byte-list `~w` image of an `os:getenv/1`
+            // answer (the `-env` effect), or (for a `+`-flag / `ERL_MAX_PORTS` request) an
             // integer `system_info/1` value.
             let golden = case.golden.stdout.expect("every case pins a golden");
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
             let is_int_value = golden
                 .strip_prefix("ok ")
                 .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
+            let is_byte_list = golden
+                .strip_prefix("ok [")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .is_some_and(|rest| {
+                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == ',')
+                });
             assert!(
                 golden.starts_with("ok {ok,[")
                     || golden == "ok error"
@@ -1798,9 +2086,14 @@ mod tests {
                     || golden == "ok true"
                     || golden == "ok false"
                     || golden == "ok unbound"
-                    // The `+sbt` binding-mode atoms.
+                    // The remaining `+sbt` binding-mode atoms.
+                    || golden == "ok no_spread"
+                    || golden == "ok thread_spread"
+                    || golden == "ok processor_spread"
+                    || golden == "ok spread"
                     || golden == "ok thread_no_node_processor_spread"
-                    || is_int_value,
+                    || is_int_value
+                    || is_byte_list,
                 "case {}: unexpected golden {golden:?}",
                 case.id
             );
@@ -2494,5 +2787,151 @@ mod tests {
             assert_eq!(case.extra_argv(), argv, "case {id}: the code-path argv");
             assert_eq!(case.expr(), Some(expr), "case {id}");
         }
+    }
+
+    /// The `+K` value surface, the `-smp` model switch, the `-env` *effect*, and the
+    /// `-pa`/`-pz`/`-boot`/Start-instruction shapes added by the final block: each case pins the
+    /// live oracle's answer for its own argv, so the value-acceptance rule, the valueless
+    /// occurrence, the verbatim code-path value and the consumed Start-instruction arguments are
+    /// each anchored individually.
+    #[test]
+    fn the_plus_flag_values_and_launcher_switches_pin_the_oracle_answers() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+
+        // The `+`-flag observables: `+K` is accepted with *any* value (both `false` and a
+        // nonsense value leave kernel poll reported as on), and each `+sbt` mode selects its
+        // own `scheduler_bind_type` atom.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/plus_k_false_keeps_kernel_poll_on",
+                &["+K", "false"][..],
+                "erlang:system_info(kernel_poll)",
+                "ok true",
+            ),
+            (
+                "flags/plus_k_unrecognized_value_is_accepted",
+                &["+K", "bogus"][..],
+                "erlang:system_info(kernel_poll)",
+                "ok true",
+            ),
+            (
+                "flags/plus_sbt_no_spread_sets_scheduler_bind_type",
+                &["+sbt", "ns"][..],
+                "erlang:system_info(scheduler_bind_type)",
+                "ok no_spread",
+            ),
+            (
+                "flags/plus_sbt_thread_spread_sets_scheduler_bind_type",
+                &["+sbt", "ts"][..],
+                "erlang:system_info(scheduler_bind_type)",
+                "ok thread_spread",
+            ),
+            (
+                "flags/plus_sbt_processor_spread_sets_scheduler_bind_type",
+                &["+sbt", "ps"][..],
+                "erlang:system_info(scheduler_bind_type)",
+                "ok processor_spread",
+            ),
+            (
+                "flags/plus_sbt_thread_no_node_processor_spread_sets_scheduler_bind_type",
+                &["+sbt", "tnnps"][..],
+                "erlang:system_info(scheduler_bind_type)",
+                "ok thread_no_node_processor_spread",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(
+                case.contracts,
+                &[Contract::Cli, Contract::Introspection],
+                "{id}"
+            );
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the emulator flag");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+        }
+        // The recording family: the `+K` switch is never an `init` argument whatever its value,
+        // `-smp` records each accepted value (including the bare, valueless occurrence), a
+        // code-path entry ending in `/ebin` is stored verbatim, and a repeated `-boot` is two
+        // occurrences.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/plus_k_false_is_not_an_init_argument",
+                &["+K", "false"][..],
+                "init:get_argument('K')",
+                "ok error",
+            ),
+            (
+                "flags/smp_auto_switch_value",
+                &["-smp", "auto"][..],
+                "init:get_argument(smp)",
+                "ok {ok,[[[97,117,116,111]]]}",
+            ),
+            (
+                "flags/smp_bare_is_a_valueless_occurrence",
+                &["-smp"][..],
+                "init:get_argument(smp)",
+                "ok {ok,[[]]}",
+            ),
+            (
+                "flags/pa_dir_ending_in_ebin_is_recorded",
+                &["-pa", "/differential/xyz/ebin"][..],
+                "init:get_argument(pa)",
+                "ok {ok,[[[47,100,105,102,102,101,114,101,110,116,105,97,108,47,120,121,122,47,\
+                 101,98,105,110]]]}",
+            ),
+            (
+                "flags/pz_dir_ending_in_ebin_is_recorded",
+                &["-pz", "/differential/xyz/ebin"][..],
+                "init:get_argument(pz)",
+                "ok {ok,[[[47,100,105,102,102,101,114,101,110,116,105,97,108,47,120,121,122,47,\
+                 101,98,105,110]]]}",
+            ),
+            (
+                "flags/boot_switch_twice_is_two_occurrences",
+                &["-boot", "start_clean", "-boot", "start_clean"][..],
+                "init:get_argument(boot)",
+                "ok {ok,[[[115,116,97,114,116,95,99,108,101,97,110]],[[115,116,97,114,116,95,99,\
+                 108,101,97,110]]]}",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli], "{id}");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the recorded argv");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(case.env().is_empty(), "case {id}: a command-line switch");
+        }
+
+        // The Start instructions: their arguments are consumed with the instruction, so the
+        // plain-argument list stays empty on both sides.
+        for (id, argv) in [
+            (
+                "flags/s_instruction_values_are_not_plain_arguments",
+                &["-s", "init", "get_argument", "ok"][..],
+            ),
+            (
+                "flags/eval_instruction_expression_is_not_a_plain_argument",
+                &["-eval", "ok"][..],
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli], "{id}");
+            assert_eq!(case.golden.stdout, Some("ok []"), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the Start instruction");
+            assert_eq!(case.expr(), Some("init:get_plain_arguments()"), "case {id}");
+        }
+
+        // The `-env` *effect*: the named variable really is set in the child (observed through
+        // `os:getenv/1`, whose `~w` image is the value's byte list) and no other variable is.
+        let env_argv = &["-env", "differential_env_var", "hello"][..];
+        let set = find("flags/env_variable_switch_sets_the_variable");
+        assert_eq!(set.contracts, &[Contract::Cli]);
+        assert_eq!(set.extra_argv(), env_argv, "the -env argv");
+        assert_eq!(set.expr(), Some("os:getenv(\"differential_env_var\")"));
+        assert_eq!(set.golden.stdout, Some("ok [104,101,108,108,111]"));
+        let unset = find("flags/env_variable_switch_leaves_other_variables_unset");
+        assert_eq!(unset.extra_argv(), env_argv, "the -env argv");
+        assert_eq!(unset.expr(), Some("os:getenv(\"differential_env_absent\")"));
+        assert_eq!(unset.golden.stdout, Some("ok false"));
     }
 }
