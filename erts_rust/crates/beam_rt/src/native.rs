@@ -30,7 +30,7 @@
 //! | `erlang:halt/0,1,2` | terminates the runtime: it must travel out of the running code as a raise and become the process exit status |
 //! | `erl_ddll:loaded_drivers/0`, `erl_ddll:try_load/3`, `erl_ddll:try_unload/2`, `erl_ddll:info/2` | the loaded-driver **list** an `open_port({spawn_driver, Name}, …)` resolves the name against: it is the runtime's own `dlopen`/port registry (`crate::port::driver`), not `beam_bifs`'s separate one |
 //! | `erlang:display/1` | writes to the *process's* output sink |
-//! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
+//! | `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3` | the `io` **device** surface: the `io.erl` request wrappers' own `{io_request, …}` round trip against the caller's group leader (itself) answers `calling_self`, so the runtime resolves the device and writes to the process's output sink or its standard error itself (see [`io`]) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
 //! | `erlang:process_info/2` | reads a **process's** heap/GC observables out of this runtime's own process table (`beam_gc`'s `HeapInfo`; contract A.8) |
@@ -99,6 +99,7 @@ mod erts_internal;
 pub(crate) mod file_server;
 mod group_leader;
 mod init;
+mod io;
 mod loader;
 pub(crate) mod memory;
 mod net;
@@ -163,8 +164,9 @@ pub(crate) const FLOOR_MODULES: [&str; 14] = [
 /// [`floor_keys`] list is instead **key-granular**: only those keys are refused and every
 /// other name is an ordinary `.beam` body.
 ///
-/// `io` is the sharpest case. The floor serves only `io:put_chars/1,2` for that
-/// namespace ([`try_native`]'s `("io", "put_chars", 1 | 2)` arms); every *other* `io:*`
+/// `io` is the sharpest case. The floor serves only the device surface
+/// (`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3`)
+/// for that namespace ([`floor_keys`]'s `io` arm); every *other* `io:*`
 /// (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an ordinary
 /// body in `lib/stdlib/src/io.erl`, and **refusing** it here routes it onto the synchronous
 /// non-pumping [`RuntimeContext::call_bif`] path instead.
@@ -183,9 +185,10 @@ pub(crate) const FLOOR_MODULES: [&str; 14] = [
 /// `io:getopts/1` and `epp:parse_file/2` calls `io:scan_erl_form/4`, both of which stopped
 /// a scheduled process here.
 ///
-/// `io:put_chars/1,2` must therefore stay **refused** (the floor owns them). `io:format/2`
-/// and `io:printable_range/0` are `beam_bifs` registry BIFs and are still excluded, but by
-/// the registry check that `resolve_external_call` applies *after* this one.
+/// The device surface ([`floor_keys`]'s `io` arm) must therefore stay **refused** (the floor
+/// owns it). `io:format/1,2` and `io:printable_range/0` are `beam_bifs` registry BIFs and are
+/// still excluded, but by the registry check that `resolve_external_call` applies *after* this
+/// one.
 ///
 /// [`try_native`]: RuntimeContext::try_native
 /// [`RuntimeContext::resolve_external_call`]: crate::context::RuntimeContext
@@ -207,10 +210,26 @@ pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
 /// mirror here (`erlang`); those keep the module-wide exclusion.
 fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
     match module {
-        // The floor serves only `io:put_chars/1,2` for this namespace; every *other* `io:*`
-        // (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an
-        // ordinary body in `lib/stdlib/src/io.erl`.
-        "io" => Some(&[("put_chars", 1), ("put_chars", 2)]),
+        // The `io` **device** surface: `put_chars/1,2` plus the `io.erl` request wrappers
+        // `nl/0,1`, `fwrite/1,2,3`, `write/1,2` and `format/3`, which this runtime serves
+        // natively because `io.erl`'s own `{io_request, …}`/`{io_reply, …}` round trip
+        // against the caller's group leader (itself) answers `calling_self` (see [`io`]).
+        // Every arm resolves its device through the one model in that module.
+        // Every *other* `io:*` (`io:getopts/1`, `io:setopts/2`, `io:request/2`,
+        // `io:scan_erl_form/4`, `io:format/1,2`, `io:printable_range/0`, …) is an ordinary
+        // body in `lib/stdlib/src/io.erl` or a `beam_bifs` registry BIF.
+        "io" => Some(&[
+            ("put_chars", 1),
+            ("put_chars", 2),
+            ("nl", 0),
+            ("nl", 1),
+            ("fwrite", 1),
+            ("fwrite", 2),
+            ("fwrite", 3),
+            ("write", 1),
+            ("write", 2),
+            ("format", 3),
+        ]),
         // `prim_tty` is a NIF library served whole from the floor: its `NIF_KEYS` list is
         // exactly the `-nifs` surface of `lib/kernel/src/prim_tty.erl`, so the stubs are
         // refused (→ `call_bif` → `try_native`) while the module's Erlang wrappers are
@@ -232,9 +251,19 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("loaded_applications", 0),
             ("which_applications", 0),
         ]),
-        // `code` is the same shape: the floor answers the *queries* below and the
-        // `lib/kernel/src/code.erl` bodies (`start_link/0`, `add_path/1`, `stick_dir/1`, …)
-        // delegate to the code server.
+        // `code` is the same shape: the floor answers the *queries* below **and** the
+        // path-mutating entries (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`,
+        // `del_path/1`). Entering the `lib/kernel/src/code.erl` bodies instead would reach the
+        // *live* `code_server` process, whose path store is a **second, incoherent** one: this
+        // runtime's `code:get_path/0`, `code:load_file/1`, `code:which/1`,
+        // `code:get_object_code/1`, `code:ensure_loaded/1` and `code:where_is_file/1` all read
+        // [`CodeServer`](crate::CodeServer)'s path, so a directory added through the module
+        // body landed only in the code server's own copy —
+        // `code:add_patha(Dir), code:load_file(M)` answered `{error,nofile}` while
+        // `lists:member(Dir, code:get_path())` (answered by that same process) said `true`.
+        // The floor owns the **one** authoritative store instead. Every *other* `code:*`
+        // (`stick_dir/1`, `set_path/1,2`, `add_paths/1`, `del_paths/1`, `unstick_dir/1`, …)
+        // stays an ordinary `lib/kernel/src/code.erl` body.
         // `init` is the same shape as `io`/`application`/`code`: the floor answers the
         // queries below and every other `init:*` is a `lib/kernel/src/init.erl` body
         // (`code_path_choice/0`, …). Refusing it wholesale routed `code_server`'s
@@ -270,6 +299,18 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("get_mode", 0),
             ("priv_dir", 1),
             ("where_is_file", 1),
+            // The **path-mutating** half of `code` — see the note on [`floor_keys`]'s `code`
+            // arm. The floor owns these so the path this runtime *searches* and the path
+            // `code:get_path/0` *reports* are the one [`CodeServer`](crate::CodeServer) store;
+            // entering the `code.erl` bodies would talk to the live `code_server` process and
+            // its separate copy. The bodies live in [`native::code::path`].
+            ("add_patha", 1),
+            ("add_patha", 2),
+            ("add_pathz", 1),
+            ("add_pathz", 2),
+            ("add_path", 1),
+            ("add_path", 2),
+            ("del_path", 1),
         ]),
         // The Erlang-level distribution supervisor entry. `kernel_sup`'s `net_sup` child is
         // `{erl_distribution, start_link, []}` (`lib/kernel/src/kernel.erl:264`) and
@@ -305,8 +346,22 @@ impl RuntimeContext<'_> {
             ("erlang", "halt", 1) => Some(self.halt_1(args)),
             ("erlang", "halt", 2) => Some(self.halt_2(args)),
             ("erlang", "display", 1) => Some(self.display(args)),
-            ("io", "put_chars", 1) => Some(self.put_chars(args, 1)),
-            ("io", "put_chars", 2) => Some(self.put_chars(args, 2)),
+            ("io", "put_chars", 1) => Some(self.io_put_chars(args, 1)),
+            ("io", "put_chars", 2) => Some(self.io_put_chars(args, 2)),
+            // The rest of the `io` **device** surface — the `io.erl` wrappers over
+            // `o_request/2`/`execute_request/3`, which this runtime cannot complete against
+            // itself (its own root process's group leader is itself, so `io.erl` answers
+            // `{ErrorTag, calling_self}`). Serving them here removes `io.erl` from the path
+            // and answers the device question natively; the rendering still goes through the
+            // registered `io_lib:format/2` BIF. See [`io`].
+            ("io", "nl", 0) => Some(self.io_nl(args, 0)),
+            ("io", "nl", 1) => Some(self.io_nl(args, 1)),
+            ("io", "fwrite", 1) => Some(self.io_fwrite(args, 1)),
+            ("io", "fwrite", 2) => Some(self.io_fwrite(args, 2)),
+            ("io", "fwrite", 3) => Some(self.io_fwrite(args, 3)),
+            ("io", "write", 1) => Some(self.io_write(args, 1)),
+            ("io", "write", 2) => Some(self.io_write(args, 2)),
+            ("io", "format", 3) => Some(self.io_format_3(args)),
             ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
@@ -355,6 +410,15 @@ impl RuntimeContext<'_> {
             // path-based and needs no loaded module, so the floor serves it (see
             // [`code`](crate::native::code)).
             ("code", "where_is_file", 1) => Some(self.code_where_is_file(args)),
+            // The **path-mutating** `code:*` entries (see [`floor_keys`]): the floor owns them
+            // so this runtime's [`CodeServer`](crate::CodeServer) is the ONE code path — both
+            // the store `code:get_path/0` reports and the one `code:load_file/1`,
+            // `code:which/1` and every module lookup search. `add_path/1,2` folds into
+            // `add_pathz` exactly as `code.erl:1075-1077` does.
+            ("code", "add_patha", 1 | 2) => Some(self.code_add_patha(args)),
+            ("code", "add_pathz", 1 | 2) => Some(self.code_add_pathz(args)),
+            ("code", "add_path", 1 | 2) => Some(self.code_add_pathz(args)),
+            ("code", "del_path", 1) => Some(self.code_del_path(args)),
             ("application", "get_env", 1) => Some(self.application_get_env_1()),
             ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
             ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
@@ -638,7 +702,7 @@ impl RuntimeContext<'_> {
     fn record_halt(&mut self, status: i32) -> BeamError {
         self.runtime.halt = Some(status);
         error::halt(status)
-    }    // -- erlang:display/1 and io:put_chars/1,2 --------------------------------
+    }    // -- erlang:display/1 ------------------------------------------------------
 
     /// `erlang:display/1`: print the term on the process's output (`~p` plus a
     /// newline, as the oracle does) and return `true`.
@@ -648,22 +712,6 @@ impl RuntimeContext<'_> {
         self.write_output(&text)?;
         let true_atom = self.atom("true")?;
         Ok(true_atom)
-    }
-
-    /// `io:put_chars(Chars)` / `io:put_chars(Device, Chars)`: write the characters and
-    /// return `ok`.
-    ///
-    /// The device argument of the `/2` form is accepted and ignored (Milestone-1 has
-    /// one output stream).
-    fn put_chars(&mut self, args: &[Eterm], which: usize) -> Result<Eterm> {
-        let chars = match which {
-            1 => *args.first().ok_or(BeamError::BadArg)?,
-            2 => *args.get(1).ok_or(BeamError::BadArg)?,
-            _ => return Err(BeamError::BadArg),
-        };
-        let text = self.chars_to_string(chars)?;
-        self.write_output(&text)?;
-        self.atom("ok")
     }
 
     // -- erlang:apply/2,3 -----------------------------------------------------
@@ -1171,8 +1219,19 @@ mod tests {
         );
         assert_eq!(
             io_keys,
-            vec![("put_chars".to_string(), 1), ("put_chars".to_string(), 2)],
-            "the floor serves only `io:put_chars/1,2` for the `io` namespace — `floor_shadows` \
+            vec![
+                ("format".to_string(), 3),
+                ("fwrite".to_string(), 1),
+                ("fwrite".to_string(), 2),
+                ("fwrite".to_string(), 3),
+                ("nl".to_string(), 0),
+                ("nl".to_string(), 1),
+                ("put_chars".to_string(), 1),
+                ("put_chars".to_string(), 2),
+                ("write".to_string(), 1),
+                ("write".to_string(), 2),
+            ],
+            "the floor serves the `io` device surface for the `io` namespace — `floor_shadows` \
              must be updated alongside any new/removed floor `io` arm"
         );
         // The floor's `io` keys are refused ...
@@ -1402,36 +1461,6 @@ mod tests {
         };
         assert_eq!(runtime.atom_name_of(displayed), Some("true"));
         assert_eq!(sink.as_str(), "42\n");
-    }
-
-    #[test]
-    fn put_chars_writes_char_lists_and_binaries() {
-        let mut runtime = runtime();
-        let mut sink = beam_bifs::BytesSink::new();
-        let text = {
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            let chars = terms::make_list(&mut context, &[make_small(104), make_small(105)])
-                .expect("a char list");
-            context
-                .call_bif("io", "put_chars", 1, &[chars])
-                .expect("put_chars/1")
-        };
-        assert_eq!(runtime.atom_name_of(text), Some("ok"));
-        assert_eq!(sink.as_str(), "hi");
-        // The `/2` form takes the device first and ignores it.
-        let mut sink = beam_bifs::BytesSink::new();
-        {
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            // Milestone-1 has one output stream, so the device is accepted and ignored:
-            // a plain small integer stands in for a device handle.
-            let device = make_small(1);
-            let chars =
-                terms::make_list(&mut context, &[make_small(121)]).expect("a char list");
-            context
-                .call_bif("io", "put_chars", 2, &[device, chars])
-                .expect("put_chars/2");
-        }
-        assert_eq!(sink.as_str(), "y");
     }
 
     #[test]

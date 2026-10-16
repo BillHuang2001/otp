@@ -142,6 +142,22 @@ pub(super) fn compile_fixture(
     compile_fixtures(erlc, label, &[(module, source)])
 }
 
+/// A fresh, **empty** scratch directory that removes itself on drop.
+///
+/// Same per-call uniqueness (label/pid/atomic counter) and same self-removal contract as
+/// [`compile_fixture`], for a test that needs a directory of its own rather than compiled
+/// fixtures — e.g. the `{outdir, Dir}` of an in-process `compile:file/2` (the compiler does
+/// not create it) or a scratch `-pa` for the oracle.
+pub(super) fn scratch_dir(label: &str) -> FixtureDir {
+    let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "beam_rt_scratch_{label}_{}_{seq}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("the test temp dir is writable");
+    FixtureDir { path: dir }
+}
+
 /// Compiles several `(module, source)` pairs with `erlc` into **one** scratch directory, so a
 /// test can load (or let the oracle load) modules that call into each other — e.g. a fun built
 /// in one module and encoded from another.
@@ -153,18 +169,13 @@ pub(super) fn compile_fixtures(
     label: &str,
     modules: &[(&str, &str)],
 ) -> FixtureDir {
-    let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "beam_rt_local_fun_{label}_{}_{seq}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("the test temp dir is writable");
+    let dir = scratch_dir(label);
     for (module, source) in modules {
-        let src = dir.join(format!("{module}.erl"));
+        let src = dir.path.join(format!("{module}.erl"));
         std::fs::write(&src, source).expect("the fixture source is writable");
         let output = Command::new(erlc)
             .arg("-o")
-            .arg(&dir)
+            .arg(&dir.path)
             .arg(&src)
             .stdin(Stdio::null())
             .output()
@@ -177,7 +188,7 @@ pub(super) fn compile_fixtures(
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    FixtureDir { path: dir }
+    dir
 }
 
 /// Runs `eval` under the oracle with `code_dir` prepended to the code path and returns its

@@ -2255,7 +2255,11 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
 /// that follows it. The runner bounds that to the machine's **live leading prefix**, read once
 /// per slice from `Machine::fr_mark()`. For a process whose FR is entirely `NIL` (the
 /// overwhelming majority: it never touched a float) `fr_mark() == 0`, so the park appends no FR
-/// word at all and the same count pins nothing.
+/// word at all: the FR reaction contributes **nothing** — no FR word published, no exemption
+/// *of its own*, no pin. (The parked process *is* relocation-exempt, but from the `Wait` arm's
+/// **parked-window** protection, which is set unconditionally for every parked process and has
+/// nothing to do with the FR prefix — the FR-specific signals are the zero `fr_published` and
+/// `gc_stats().pinned == 0` asserted below.)
 ///
 /// `recv_after.beam`'s `wait_forever/0` is `receive X -> X after infinity end` — no local
 /// variables, so its Erlang stack is shorter than the FR file — and it leaves no float register
@@ -2326,16 +2330,24 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
         0,
         "a process whose FR prefix is empty is not pinned"
     );
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "the parked process is relocation-exempt — but from the `Wait` arm's **parked-window** \
+         protection, which is set unconditionally for every parked process, never from the FR \
+         reaction: a dead FR prefix contributes nothing of its own (the zero `fr_published` \
+         above and `gc_stats().pinned == 0` are the FR-specific signals)"
+    );
 }
 
-/// **A park whose FR *is* live publishes exactly the live prefix (`fr_mark`) and pins the
-/// process.**
+/// **A park whose FR *is* live publishes exactly the live prefix (`fr_mark`) and opens the
+/// inter-slice window's relocation exemption — never a permanent pin.**
 ///
-/// The bounded-FR path must not weaken the live case: a process whose FR holds a term is
-/// pinned (its FR can point into the heap, so its heap must never move) **and** its live FR
-/// prefix must ride the process stack so a collection that does run — a `Yield`-window one, or
-/// a delivery-driven one, neither gated by the pin — relocates it rather than leaving it on the
-/// abandoned from-space.
+/// The bounded-FR path must not weaken the live case: a process whose FR holds a term **and**
+/// whose live FR prefix must ride the process stack so a collection that does run — a
+/// `Yield`-window one, or a delivery-driven one — relocates it rather than leaving it on the
+/// abandoned from-space. The window is protected by the **relocation exemption** the post-slice
+/// `fr_mark` check opens (and the next slice's resume clears), not by a permanent runtime-level
+/// pin: a float-using process must still be collectable at its own heap-admission points.
 ///
 /// A parked machine is not reset on resume, so an FR slot written through the engine's own
 /// `Machine::set_fr` seam while the process is parked survives into the next slice and raises
@@ -2345,7 +2357,7 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
 /// the **one**-word live prefix, not the 1024-slot file, and `ProcessEngine::fr_published`
 /// records that same count for the resume — without needing compiled float code.
 #[test]
-fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
+fn a_live_fr_is_published_by_the_park_and_opens_the_window_exemption() {
     let mut rt = runtime();
     let mut state = RunnerState::default();
     let mut table = table();
@@ -2397,8 +2409,13 @@ fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
 
     assert_eq!(
         rt.gc_stats().pinned,
-        1,
-        "a live FR pins the process, so its heap is never moved again"
+        0,
+        "a live FR no longer pins the process for the rest of its life"
+    );
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a slice that ends with a live FR prefix opens the inter-slice window's relocation \
+         exemption, so the window's own collection sites decline the move"
     );
     let (machine_stack_len, fr_mark) = {
         let engine = state.engines.get_mut(&pid).expect("the parked engine");
@@ -2427,6 +2444,123 @@ fn a_live_fr_is_published_by_the_park_and_pins_the_process() {
         fr_mark as usize,
         "the engine records the published prefix length, so the resume scatters exactly the region \
          the park published"
+    );
+}
+
+/// **The live-FR window exemption is per slice: a `Yield` window opens it, the next slice entry
+/// clears it, and nothing is ever pinned.**
+///
+/// This is the defect's regression pin. The pre-slice guard used to be a **runtime-level,
+/// permanent** pin (`Runtime::pin_process`), so the first slice that ended with a live FR prefix
+/// made `Runtime::gc_process_enabled` answer `false` for the rest of the process's life and
+/// `Runtime::gc_stats().pinned` never came back down. The window exemption is scoped instead:
+/// a slice that ends with `fr_mark() > 0` marks the pid relocation-exempt for the window that
+/// follows **and nothing else**, and the very next slice's entry clears it (the resume arm) — so
+/// a float-using process still collects at its own heap-admission points. That clear is not
+/// observable from outside a slice (`is_relocation_exempt` is only readable *between* slices,
+/// where a live FR prefix re-opens the exemption); its **effect** — a float-using loop collecting
+/// *more* as N grows instead of plateauing — is the property pinned in `tests/gc_collect.rs` and
+/// `../context/tests.rs`, and it is impossible while the pid is permanently pinned.
+///
+/// `preempt:spin/1` is the non-allocating tail loop: a tiny budget pre-empts it
+/// (`ProcOutcome::Yield`) so the slice ends while the process is still runnable — the *only* park
+/// arm whose exemption is not already set for other reasons (the `Wait` arm marks its parked
+/// process unconditionally). FR slot 0 is written through the engine's own `Machine::set_fr`
+/// seam between the slices, standing in for a float computation that left a register live.
+#[test]
+fn the_live_fr_window_exemption_is_opened_per_slice_and_never_pinned() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Interpreter);
+    let mut table = table();
+    let module = load_module(&mut rt, preempt_fixture(), "preempt");
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_non_allocating_loop(&mut state, pid, module, NON_ALLOCATING_N);
+
+    // Slice 1: a dead FR prefix — the pre-empted process is NOT exempt and NOT pinned.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 10)
+            .expect("the loop's first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the tiny budget pre-empts the loop");
+    assert!(
+        !table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a dead FR prefix opens no exemption"
+    );
+    assert_eq!(rt.gc_stats().pinned, 0, "and pins nothing");
+
+    // A live FR slot on the parked machine (a resume does not reset the FR file).
+    state
+        .engines
+        .get_mut(&pid)
+        .expect("the parked engine")
+        .machine
+        .set_fr(0, make_small(42))
+        .expect("slot 0 is in the FR file");
+
+    // Slice 2: the same tiny budget pre-empts the loop again, this time with FR slot 0 live —
+    // the post-slice `fr_mark` check opens the inter-slice window's exemption.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 10)
+            .expect("the loop's second slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the budget pre-empts it again");
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a slice that ends with a live FR prefix opens the window's relocation exemption"
+    );
+    assert_eq!(
+        rt.gc_stats().pinned,
+        0,
+        "the window is scoped by the exemption, not by a permanent runtime-level pin"
+    );
+    assert_eq!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .fr_published,
+        1,
+        "the park published exactly the one live FR slot the resume must scatter back"
+    );
+
+    // Slice 3: the resume clears the exemption at entry (the parked window is over and only a
+    // window's collection sites are declined), so the running slice is not exempt and can collect
+    // at its own heap-admission points. Drive the loop to completion and check nothing is pinned.
+    //
+    // The exemption left armed at the end of the *terminating* slice is that slice's own
+    // re-derivation: FR slot 0 is still live when it ends (a resume never resets the machine and
+    // `set_fr` only ever raises the mark), so the post-slice `fr_mark` check re-opens it for a
+    // window no further slice ever opens. In production that is inert — `slice_end`'s
+    // `ProcessTable::terminate` drops the mark with the dead process — and the runner cannot
+    // observe the mid-slice clear directly, so the property asserted here is the one the defect
+    // was about: **nothing is ever pinned**.
+    let mut outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+            .expect("the resume slice runs")
+    };
+    while outcome == ProcOutcome::Yield {
+        outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner
+                .run(pid, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+                .expect("a further slice runs")
+        };
+    }
+    assert!(
+        matches!(outcome, ProcOutcome::Exit(_)),
+        "the loop finished, so the process terminated; got {outcome:?}"
+    );
+    assert_eq!(
+        rt.gc_stats().pinned,
+        0,
+        "nothing was ever pinned — the defect this test pins"
     );
 }
 
@@ -2511,11 +2645,13 @@ fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
     // A genuine MOVING collection over the parked process: it gathers the process's stack
     // (which holds the published FR word at its end) and scatters the relocated words back.
     //
-    // The `Wait` park arm left the process relocation-exempt for its parked window, and
-    // `Process::collect` refuses an exempt process with the typed `relocation_exempt` raise — so
-    // clear it first. That is exactly the `Yield` (pre-emption) window's situation: a pre-empted
-    // process is *not* exempt, so its published FR prefix is the only thing that keeps a live
-    // FR term across a collection taken while it sits in `RunnerState.engines`.
+    // The `Wait` park arm left the process relocation-exempt for its parked window (and the
+    // live FR prefix this slice ended with would in any case have opened the same exemption),
+    // and `Process::collect` refuses an exempt process with the typed `relocation_exempt` raise
+    // — so clear it first. That is exactly the `Yield` (pre-emption) window's situation once the
+    // exemption is cleared: a pre-empted process is not holding its roots unpublished, so its
+    // published FR prefix is the only thing that keeps a live FR term across a collection taken
+    // while it sits in `RunnerState.engines`.
     table
         .set_relocation_exempt(pid, false)
         .expect("the pid has a process");

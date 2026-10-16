@@ -144,6 +144,14 @@ pub struct CodeServer {
     /// a later [`CodeServer::add_path`] appends on top is deliberately *not* in it, so
     /// [`CodeServer::reset_paths_to_defaults`] can drop those again.
     default_paths: Vec<PathBuf>,
+    /// The `<lib>` directory of the **resolved system installation** ([`CodeServer::lib_root`]).
+    ///
+    /// Recorded by [`CodeServer::add_system_paths`] from the directories that resolution
+    /// *proved* — each one is an `ebin` holding a probe module, so the root is derived from
+    /// trusted input and never sniffed off the code path, which also carries the user's
+    /// `-pa`/`-pz` directories. It therefore stays the consumed installation's `<lib>` even
+    /// when a user directory is shaped like one.
+    system_lib_root: Option<PathBuf>,
 }
 
 impl CodeServer {
@@ -164,6 +172,7 @@ impl CodeServer {
             paths: Vec::new(),
             tail_paths: Vec::new(),
             default_paths: Vec::new(),
+            system_lib_root: None,
         }
     }
 
@@ -185,18 +194,31 @@ impl CodeServer {
     ///   `[…, <system lib ebins>, ".", <-pz dirs>]` (verified against OTP 29.1.1 /
     ///   erts-17.1 with and without `-pa`/`-pz`); it is installed by
     ///   [`CodeServer::add_system_paths`], which is where the group order is decided;
+    /// * each directory is first reduced to its **normalised** spelling by the same rule the
+    ///   oracle's code server applies (`filename:join([Dir])` in `do_add/6`), so `-pa <D>/`
+    ///   puts `<D>` — not `<D>/` — on the path (verified against OTP 29.1.1 / erts-17.1);
+    ///   `init:get_argument(pa)` still reports the raw command-line spelling;
     /// * a directory that does not exist is filtered **out of the code path**
     ///   (`strip_path/2` over `check_path/1`) while `init:get_argument(pa|pz)` keeps it —
     ///   which is why the filtering is here and not in the parser: `erl -pa /no/such/dir …`
     ///   reports `false` for `lists:member("/no/such/dir", code:get_path())`.
-    pub fn set_configured_paths(&mut self, pa: &[PathBuf], pz: &[PathBuf]) {        for dir in pa.iter().rev() {
+    pub fn set_configured_paths(&mut self, pa: &[PathBuf], pz: &[PathBuf]) {
+        // Every configured directory is normalised exactly as the oracle's `code_server`
+        // normalises one (`code_server.erl`'s `do_add/6` calls `filename:join([Dir])`), so
+        // `-pa <D>/` reports `<D>` — the same string `code:get_path/0` answers for `-pa <D>`
+        // — while `init:get_argument(pa)` keeps the raw command-line spelling. The
+        // normalisation is applied **before** the `is_dir()` filter (it cannot change which
+        // directory is meant, only how it is spelled).
+        for dir in pa.iter().rev() {
+            let dir = normalize_dir_path(dir);
             if dir.is_dir() {
-                self.add_default_path(dir.clone());
+                self.add_default_path(dir);
             }
         }
         for dir in pz {
-            if dir.is_dir() && !self.tail_paths.contains(dir) {
-                self.tail_paths.push(dir.clone());
+            let dir = normalize_dir_path(dir);
+            if dir.is_dir() && !self.tail_paths.contains(&dir) {
+                self.tail_paths.push(dir);
             }
         }
     }
@@ -208,6 +230,39 @@ impl CodeServer {
         let dir = dir.into();
         if !self.paths.contains(&dir) {
             self.paths.push(dir);
+        }
+    }
+
+    /// **Prepends** `dir` to the code path — `code:add_patha/1,2` and the `first` form of the
+    /// oracle's code-server `do_add/6` (`code_server.erl:745-754`).
+    ///
+    /// A directory already present is **moved** to the head, never duplicated: the oracle's
+    /// `lists:keytake(Dir, 1, Path0)` drops the old entry before the new one is consed on.
+    ///
+    /// Like [`CodeServer::add_path`] — and unlike [`CodeServer::add_default_path`] — the entry
+    /// is **not** part of the boot-time default, so [`CodeServer::reset_paths_to_defaults`]
+    /// drops it again; that is what makes `init:restart/0` forget a `code:add_patha/1`.
+    pub fn add_path_first(&mut self, dir: impl Into<PathBuf>) {
+        let dir = dir.into();
+        self.paths.retain(|entry| entry != &dir);
+        self.paths.insert(0, dir);
+    }
+
+    /// Removes the **first** code-path entry `matches` accepts, answering whether one was
+    /// removed.
+    ///
+    /// The `default_paths` bookkeeping is untouched: an entry removed here is gone from the
+    /// path but a later [`CodeServer::reset_paths_to_defaults`] re-establishes it if it was a
+    /// default — which is what the oracle's restart does too (the boot script's own
+    /// `{path, …}` directives re-add it). This is the removal half of `code:del_path/1`
+    /// (`code_server.erl:884-912`); the *matching* rule lives with the caller.
+    pub fn remove_path_where(&mut self, mut matches: impl FnMut(&Path) -> bool) -> bool {
+        match self.paths.iter().position(|entry| matches(entry)) {
+            Some(index) => {
+                self.paths.remove(index);
+                true
+            }
+            None => false,
         }
     }
 
@@ -255,7 +310,9 @@ impl CodeServer {
     /// (a path is never fabricated).
     ///
     /// They are *boot-time default* entries ([`CodeServer::add_default_path`]), so a later
-    /// [`CodeServer::reset_paths_to_defaults`] keeps them.
+    /// [`CodeServer::reset_paths_to_defaults`] keeps them, and the base directories are the
+    /// input [`CodeServer::lib_root`] records the installation's `<lib>` from
+    /// ([`resolved_lib_root`]).
     ///
     /// # Errors
     ///
@@ -263,6 +320,11 @@ impl CodeServer {
     /// `erl` invocation that failed.
     pub fn add_system_paths(&mut self) -> Result<()> {
         let base = system_ebins()?;
+        // The installation's `<lib>` root, derived from the directories the resolution just
+        // *proved* (each holds its probe module). Recording it here is what keeps
+        // [`CodeServer::lib_root`] the consumed installation's root: the code path itself also
+        // carries the user's `-pa`/`-pz` directories, which must never repoint it.
+        self.system_lib_root = resolved_lib_root(&base);
         for dir in &base {
             self.add_default_path(dir.clone());
         }
@@ -271,7 +333,7 @@ impl CodeServer {
         // requirement), so root acceptance is unchanged; the extras are located from the
         // *resolved* base directories, whatever their source (`native_system_ebins` or the
         // `erl` fallback).
-        for dir in extra_app_ebins(&base) {
+        for dir in extra_app_ebins(self.system_lib_root.as_deref()) {
             self.add_default_path(dir);
         }
         // The **current directory** `"."`, which the oracle's code path carries between the
@@ -377,15 +439,28 @@ impl CodeServer {
 
     /// The system library root (`<lib>`) the code-path `ebin` directories live under.
     ///
-    /// Derived from a code-path entry shaped `<lib>/<app>-<vsn>/ebin` — the shape
-    /// [`CodeServer::add_system_paths`] installs — so it is `None` until the system
-    /// directories have been added, and for a runtime that only has explicit
-    /// `-pa`/`-pz` directories.
+    /// It is the **consumed system installation's** `<lib>`, taken from the directories
+    /// [`CodeServer::add_system_paths`] resolved and recorded ([`resolved_lib_root`]). The
+    /// record wins, so nothing else on the code path can repoint it — the code path also
+    /// carries the user's `-pa`/`-pz` directories, and a user directory is free to *look* like
+    /// a library entry (`-pa <X>/ebin` merely ends in `ebin`; nothing stops a `<X>/<app>-<vsn>`
+    /// either). Consumers derived from it — [`CodeServer::app_dir`]'s installed-application
+    /// search, [`CodeServer::bindir`], the boot script's `$ROOT`, `code:root_dir/0` — therefore
+    /// always describe the installation this runtime runs against.
+    ///
+    /// A server whose path was assembled **without** that resolution (no system directories
+    /// installed, so only explicit `-pa`/`-pz` directories) falls back to the first entry that
+    /// really carries the installed shape `<lib>/<app>-<vsn>/ebin`: the versioned application
+    /// directory is the entry's own evidence that it belongs to a library root, and the source
+    /// tree's unversioned `<lib>/<app>/ebin` — like a bare `<X>/ebin` — provides none, so it is
+    /// recognised only through the recorded root above.
+    ///
+    /// `None` for a runtime that has neither.
     pub fn lib_root(&self) -> Option<PathBuf> {
-        self.paths
-            .iter()
-            .filter(|path| is_ebin(path))
-            .find_map(|path| ebin_lib_root(path))
+        if let Some(root) = &self.system_lib_root {
+            return Some(root.clone());
+        }
+        self.paths.iter().find_map(|path| installed_ebin_lib_root(path))
     }
 
     /// This runtime's **own** release's boot script — `<source tree>/bootstrap/bin/start.boot`
@@ -679,6 +754,64 @@ impl Default for CodeServer {
     /// Same as [`CodeServer::new`].
     fn default() -> CodeServer {
         CodeServer::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Normalising a code-path directory
+// ---------------------------------------------------------------------------
+
+/// [`normalize_dir`] applied to a filesystem path.
+///
+/// The conversion is lossless for the shapes a code-path directory has: the normalisation
+/// only removes redundant separators and a trailing one, so the result still names the very
+/// same directory on disk.
+pub(crate) fn normalize_dir_path(dir: &Path) -> PathBuf {
+    PathBuf::from(normalize_dir(&dir.to_string_lossy()))
+}
+
+/// The **normal form** of the code-path directory `name` — the oracle's
+/// `filename:join([Name])`, which `code_server.erl:730` applies to every directory before it
+/// lands on the code path.
+///
+/// This is Erlang's `filename:join/1` on its **list-of-one** input, for the `unix` path type
+/// (`major_os_type/0`; the runtime's other path handling — [`crate::native::code`]'s
+/// `where_is_file/1` candidate join, `absolute_path/1` — is likewise unix-shaped). Splitting
+/// the name the way `filename:split/1` does gives three rules:
+///
+/// 1. repeated separators collapse to one, and a trailing separator is removed (`/x/` ⇒ `/x`,
+///    `//x//` ⇒ `/x`);
+/// 2. a `.` segment **between** separators is swallowed (`/./x` ⇒ `/x`, `/a/./b/` ⇒ `/a/b`)
+///    — but the first segment of a **relative** name is kept (`./x` ⇒ `./x`) and a lone `.`
+///    is kept (`/.` ⇒ `/.`, `./` ⇒ `.`, `.` ⇒ `.`);
+/// 3. an all-separator name is the root `/` (`//` ⇒ `/`).
+///
+/// Oracle-verified (OTP 29.1.1 / erts-17.1, `[filename:join([X]) || X <- …]`): `/x/` ⇒ `/x`,
+/// `//` ⇒ `/`, `//x//` ⇒ `/x`, `/a//b` ⇒ `/a/b`, `/a/./b/` ⇒ `/a/b`, `/./x` ⇒ `/x`, `x/` ⇒ `x`,
+/// `a//` ⇒ `a`, `./x` ⇒ `./x`, `.//x` ⇒ `./x`, `./` ⇒ `.`, `.` ⇒ `.`, `/.` ⇒ `/.`, `..` ⇒ `..`,
+/// `a/..` ⇒ `a/..`, `/` ⇒ `/`, `/tmp/x/../y` ⇒ unchanged, and `""` ⇒ `""`.
+pub(crate) fn normalize_dir(name: &str) -> String {
+    let absolute = name.starts_with('/');
+    // `filename:split/1`'s segments, with the empty ones (repeated separators) dropped.
+    let segments: Vec<&str> = name.split('/').filter(|part| !part.is_empty()).collect();
+
+    // Rule 2, applied in one pass: a `.` is dropped only when something follows it and it is
+    // not the leading component of a relative name.
+    let last = segments.len().saturating_sub(1);
+    let kept: Vec<&str> = segments
+        .iter()
+        .enumerate()
+        .filter(|(index, segment)| {
+            **segment != "." || *index == last || (*index == 0 && !absolute)
+        })
+        .map(|(_, segment)| *segment)
+        .collect();
+
+    let joined = kept.join("/");
+    match (absolute, joined.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{joined}"),
+        (false, _) => joined,
     }
 }
 
@@ -979,6 +1112,52 @@ fn ebin_lib_root(ebin: &Path) -> Option<PathBuf> {
     ebin.parent()?.parent().map(Path::to_path_buf)
 }
 
+/// Whether `dir`'s name has an **installed application directory**'s `<app>-<vsn>` shape: an
+/// application name, a `-`, and a version that starts with a digit (`stdlib-6.0.2`,
+/// `erts-17.1`).
+///
+/// The version suffix is what a *user* directory does not carry: a rebar3/`erlc` output tree
+/// holds `<app>/ebin` or a hand-named `<X>/ebin`, neither of which is an installed
+/// application's versioned directory.
+fn is_versioned_app_dir(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((app, vsn)) = name.rsplit_once('-') else {
+        return false;
+    };
+    !app.is_empty() && vsn.as_bytes().first().is_some_and(u8::is_ascii_digit)
+}
+
+/// The `<lib>` directory an `…/<lib>/<app>-<vsn>/ebin` **installed library** entry belongs to,
+/// or `None` when `ebin` is not one.
+///
+/// The versioned parent [`is_versioned_app_dir`] is the shape's proof, so an `ebin` directory
+/// that is *not* an installed application's — the source tree's unversioned
+/// `<lib>/<app>/ebin`, or a user code-path directory such as `-pa <X>/ebin` — is refused, and
+/// can never be read as a library entry of its own.
+fn installed_ebin_lib_root(ebin: &Path) -> Option<PathBuf> {
+    if !is_ebin(ebin) {
+        return None;
+    }
+    let app_dir = ebin.parent()?;
+    if !is_versioned_app_dir(app_dir) {
+        return None;
+    }
+    app_dir.parent().map(Path::to_path_buf)
+}
+
+/// The `<lib>` root of the `ebin` directories a **system** resolution returned
+/// ([`system_ebins`]) — the installation's own `<lib>`, from entries that were accepted only
+/// because they hold their probe module.
+///
+/// `None` when those directories carry no `/ebin` entry at all, which no resolution this
+/// runtime accepts produces (see [`stdlib_dir_override`]).
+fn resolved_lib_root(base: &[PathBuf]) -> Option<PathBuf> {
+    base.iter()
+        .filter(|path| is_ebin(path))
+        .find_map(|path| ebin_lib_root(path))
+}
 /// The `ebin` directory of the `<prefix>-<vsn>` directory under `lib_root` that holds
 /// `<module>.beam`, if any (the lexicographically first match).
 fn find_sibling_ebin(lib_root: &Path, prefix: &str, module: &str) -> Option<PathBuf> {
@@ -1000,30 +1179,25 @@ fn find_sibling_ebin(lib_root: &Path, prefix: &str, module: &str) -> Option<Path
 }
 
 /// The `ebin` directories of the [`EXTRA_CODE_PATH_APPS`] applications, located from the
-/// **resolved** base `ebin` directories.
+/// **resolved** installation's `<lib>` root ([`resolved_lib_root`] over the base `ebin`
+/// directories, i.e. the same root [`CodeServer::lib_root`] records).
 ///
-/// The `<lib>` root is derived exactly the way [`CodeServer::lib_root`] derives it — from an
-/// `…/<lib>/<app>-<vsn>/ebin` base entry — and each extra application is then looked up
-/// first in the versioned installed layout (`<lib>/<app>-<vsn>/ebin`, via
-/// [`find_sibling_ebin`]) and then in the source-tree unversioned layout
-/// (`<lib>/<app>/ebin`, via [`app_ebin`]).
+/// Each extra application is looked up first in the versioned installed layout
+/// (`<lib>/<app>-<vsn>/ebin`, via [`find_sibling_ebin`]) and then in the source-tree
+/// unversioned layout (`<lib>/<app>/ebin`, via [`app_ebin`]).
 ///
 /// A directory is returned only when it really holds the application's probe module, so a
 /// path is **never fabricated**; the result is empty when the base directories carry no lib
 /// root (an `$ERTS_STDLIB_DIR` pointing straight at an `ebin`, a runtime with only explicit
 /// `-pa` directories) or when the host does not have the application installed.
-fn extra_app_ebins(base: &[PathBuf]) -> Vec<PathBuf> {
-    let Some(root) = base
-        .iter()
-        .filter(|path| is_ebin(path))
-        .find_map(|path| ebin_lib_root(path))
-    else {
+fn extra_app_ebins(lib_root: Option<&Path>) -> Vec<PathBuf> {
+    let Some(root) = lib_root else {
         return Vec::new();
     };
     EXTRA_CODE_PATH_APPS
         .iter()
         .filter_map(|(app, module)| {
-            find_sibling_ebin(&root, app, module).or_else(|| app_ebin(&root.join(app), module))
+            find_sibling_ebin(root, app, module).or_else(|| app_ebin(&root.join(app), module))
         })
         .collect()
 }
@@ -1453,5 +1627,128 @@ mod tests {
         assert_eq!(server.lib_root(), Some(PathBuf::from("/libs")));
         // Nothing under the (non-existent) root is found, honestly.
         assert_eq!(server.app_dir("otp"), None);
+    }
+
+    /// Only a real `<lib>/<app>-<vsn>/ebin` entry names a library root: the **versioned**
+    /// application directory is the evidence that an `ebin` belongs to an installed library.
+    ///
+    /// A user code-path directory that merely *ends in* `ebin` (`-pa <X>/ebin`) carries none,
+    /// so it can never be read as `<lib>/<app>-<vsn>/ebin` with `<X>`'s parent as the root;
+    /// the source tree's **unversioned** `<lib>/<app>/ebin` carries none either (it is
+    /// recognised through the recorded system root instead, see
+    /// [`CodeServer::lib_root`]).
+    #[test]
+    fn only_the_versioned_installed_shape_names_a_library_root() {
+        let mut server = CodeServer::new();
+        server.add_path("/home/user/apps/ebin");
+        assert_eq!(
+            server.lib_root(),
+            None,
+            "a bare `<X>/ebin` is an ordinary code-path directory"
+        );
+        server.add_path("/home/user/otp/lib/stdlib/ebin");
+        assert_eq!(
+            server.lib_root(),
+            None,
+            "an unversioned `<lib>/<app>/ebin` is not the installed shape"
+        );
+        server.add_path("/home/user/otp/lib/stdlib-6.0.2/ebin");
+        assert_eq!(
+            server.lib_root(),
+            Some(PathBuf::from("/home/user/otp/lib")),
+            "the versioned entry names the root"
+        );
+        // The refused directories stay on the code path: they are ordinary code-path
+        // directories, searched like any other — they just say nothing about where the
+        // installation lives.
+        assert_eq!(server.paths().len(), 3);
+    }
+
+    /// A user directory shaped like an installed library entry cannot repoint
+    /// [`CodeServer::lib_root`]: the root recorded by [`CodeServer::add_system_paths`] — the
+    /// directories the **system resolution** proved — is the installation's.
+    ///
+    /// `Runtime::new` seeds the configured `-pa` directories and *then* adds the system
+    /// directories, so the user directory really does precede them on the code path here, and
+    /// it even carries the `<…>/lib/not_an_otp_app-1.0/ebin` shape.
+    #[test]
+    fn the_resolved_system_root_wins_over_a_library_shaped_user_directory() {
+        let scratch = scratch("hijack");
+        let user = scratch.join("lib").join("not_an_otp_app-1.0").join("ebin");
+        std::fs::create_dir_all(&user).expect("a user code-path directory");
+        let mut server = CodeServer::new();
+        server.set_configured_paths(std::slice::from_ref(&user), &[]);
+        if let Err(error) = server.add_system_paths() {
+            eprintln!("SKIP: no system code path ({error})");
+            return;
+        }
+        assert_eq!(
+            server.paths()[0],
+            user,
+            "the configured `-pa` directory heads the code path"
+        );
+
+        // The resolved stdlib `ebin` (`<lib>/<app>-<vsn>/ebin`, or `<lib>/<app>/ebin` for a
+        // source tree) names the installation's `<lib>` — and it is not the user directory's.
+        let lists = server.find_file("lists").expect("stdlib is on the code path");
+        let lib = lists
+            .parent()
+            .expect("the stdlib ebin")
+            .parent()
+            .expect("the stdlib application directory")
+            .parent()
+            .expect("the <lib> root");
+        assert_eq!(
+            server.lib_root().as_deref(),
+            Some(lib),
+            "the resolved installation's <lib> is the root"
+        );
+        assert_ne!(
+            server.lib_root().as_deref(),
+            Some(scratch.as_path()),
+            "the user directory's parent must not become the root"
+        );
+        // Consumers follow: the install's own application is found under the resolved root.
+        let kernel = server.app_dir("kernel").expect("kernel is installed");
+        assert!(
+            kernel.starts_with(lib),
+            "{} is not under {}",
+            kernel.display(),
+            lib.display()
+        );
+    }
+
+    /// The source tree's **unversioned** `<lib>/<app>/ebin` layout still names its `<lib>`
+    /// root: it is derived from the directories a **system resolution** proved
+    /// ([`resolved_lib_root`]) — never from a code-path entry, which cannot tell it apart from
+    /// a user directory.
+    #[test]
+    fn the_unversioned_source_tree_layout_still_names_its_lib_root() {
+        let root = scratch("source_tree");
+        let lib = root.join("lib");
+        let stdlib = lib.join("stdlib").join("ebin");
+        touch(&stdlib, "lists");
+
+        // No code-path proof (no version), but the resolved root is exact.
+        assert_eq!(installed_ebin_lib_root(&stdlib), None, "an unversioned entry proves nothing");
+        assert_eq!(
+            resolved_lib_root(std::slice::from_ref(&stdlib)),
+            Some(lib.clone())
+        );
+        // A directory that is not an `ebin` at all names no root, and no base at all names none.
+        assert_eq!(resolved_lib_root(&[root.clone()]), None);
+        assert_eq!(resolved_lib_root(&[]), None);
+
+        // `compiler` is located under that root in the unversioned layout, and the versioned
+        // installed layout wins where both exist.
+        let unversioned = lib.join("compiler").join("ebin");
+        touch(&unversioned, "compile");
+        assert_eq!(extra_app_ebins(Some(&lib)), vec![unversioned.clone()]);
+        let versioned = installed_ebin(&root, "compiler");
+        touch(&versioned, "compile");
+        assert_eq!(extra_app_ebins(Some(&lib)), vec![versioned]);
+        // With no root (an `$ERTS_STDLIB_DIR` pointing straight at an `ebin`): nothing is
+        // fabricated.
+        assert!(extra_app_ebins(None).is_empty());
     }
 }

@@ -47,9 +47,10 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 ### Files (one responsibility each; per-entry ground truth/oracle probes are in each module's rustdoc)
 | Module | Serves |
 |---|---|
-| `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
-| `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
-| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1` |
+| `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` (the whole `io` **device** surface is [`io.rs`](io.rs)) |
+| `io.rs` | the **`io` device floor**: `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` — the `io.erl` wrappers over `o_request/2`, served natively because this runtime cannot complete the `{io_request,…}`/`{io_reply,…}` round trip against its own group leader (see *The `io` device floor*) + its unit tests |
+| `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `fetch_loaded/0`, `stop/0,1`, `restart/0`, `boot/1` |
+| `code.rs` (+ `code/path.rs`) | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1`; the path mutators `add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`, `del_path/1` in `code/path.rs` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; `hibernate/0` (the OTP-30 instruction, modelled as **continue**); the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
 | `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`, `erl_distribution:start_link/0,1` (the last answered `ignore` — see *The Erlang-level distribution supervisor*) |
@@ -74,7 +75,12 @@ it once was: the real boot script boots all 22 directives to completion under th
 those four entries (`root`, `bindir`, `progname`, `home`, each `{Flag,[[Value]]}`, an unavailable
 value omitting its entry — the oracle's own shape) before the command-line flags (boot-chain
 consequence: [`../boot/CONTEXT.md`](../boot/CONTEXT.md)). `init:script_id/0` is the **loaded** boot
-script's `{Name,Vsn}`, or the typed gap when none is loaded. `init:stop/0` records halt status 0 and
+script's `{Name,Vsn}`, or the typed gap when none is loaded. `init:fetch_loaded/0` answers `[]`, the
+oracle's post-boot value: `init` holds the loader's module list only until `code_server:init/3`
+consumes it, and that consume path (`code_server.erl` `init/2`'s `{loaded,Mods}` clause →
+`init:fetch_loaded()`) immediately clears `State#state.loaded` (`init.erl:718-722`), so the list is
+observable only in the window before the code server starts — which no CLI route reaches, so `[]` is
+what every oracle run of the probe reports too (`tests/fetch_loaded.rs`). `init:stop/0` records halt status 0 and
 answers `ok` (the running expression is not interrupted; `cli::run` applies the recorded status
 after the action completes); `stop/1` answers `ok` for a non-negative integer status (recorded),
 raises the `erlang:halt/1` crash-dump slogan for a byte list (incl. `[]`) and `badarg` for anything
@@ -103,8 +109,9 @@ raises the bare-atom `function_clause`, the same class `priv_dir/1` reports.`cod
 `stat`ed (the code server rewrites `{priv_dir,App}` into `{lib_dir,App,priv}`,
 `code_server.erl:1058-1059`), with the guard's atom/string forms accepted and `{error,bad_name}`
 for a name the code server does not know (`code.erl:978-980`).
-**`code:*` is the native floor, not a live `code_server`** — OTP's real `code_server.beam` needs
-facilities outside this crate, so `code.rs`'s behaviour must not change (see `../CONTEXT.md`).
+**`code:*` is the native floor, and the floor's [`CodeServer`](crate::CodeServer) is the ONE authoritative code path** — `code.rs`'s behaviour must not change (see `../CONTEXT.md`).
+A live `code_server` process really does run on every boot-driven route (the booted `kernel_sup` starts it), but it keeps a **second** path store of its own, so the floor serves both the path **readers** and the migrated **mutators** (`code/path.rs`) out of `CodeServer` — the store this runtime actually searches — and the two can no longer disagree.
+Only the mutators still **not** migrated (`set_path/1,2`, `add_paths/1,2`, `add_pathsz/1,2`, `add_pathsa/1,2`, `del_paths/1`, `stick_dir/1`, `unstick_dir/1`) stay ordinary `code.erl` bodies editing that second store, so their edits are invisible to `code:get_path/0`.
 `code:which/1` is **path**-based, exactly as the oracle's `code.erl:1782-1789` is: it answers the
 **load state** first (the recorded file, or the atom `preloaded` from the registry) and then falls
 back to a code-path search, so an unloaded-but-findable module (`dets`) still has a path.
@@ -581,6 +588,31 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
 `file:read_line/1` and `io:getopts/1`/`io:setopts/2` round-trip to disk. **Full detail:
 [`file_server/CONTEXT.md`](file_server/CONTEXT.md).**
 
+### The `io` device floor (`io.rs`) — the request wrappers, served natively
+`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` are `io.erl`
+wrappers over
+`o_request/2` (`io.erl:160-207`), which resolves the request's **device** — the caller's
+`group_leader()` — posts `{io_request, self(), Mref, Request}` to it and blocks for
+`{io_reply, …}`. This runtime's own root process **is** its own group leader, so
+`execute_request/3` answers `{error, calling_self}` and every such call raises
+`error:calling_self`; that is what replaced the installed **compiler**'s `catch`-handler
+diagnostic (`io:fwrite("Function: ~w/~w\n", …)`, `beam_ssa_opt.erl:197`,
+`beam_ssa_bool.erl:149`, `beam_core_to_ssa.erl:276`, …) with the atom `calling_self`.
+The floor answers the device question itself (`RuntimeContext::io_device`/`io_stream`) and
+renders through the **registered** `io_lib:format/2` — the implementation `io.erl`'s own
+server calls for a `{format, …}` request — so `io.erl` leaves the path and the request never
+leaves the runtime.
+The device rules (probed against the oracle, OTP 29.1.1 / erts-17.1), shared by **every**
+device-taking arm — `io:put_chars/1,2` included: omitted / `standard_io`
+(`request/3` rewrites it to `group_leader()`) / `user` / the caller's **own** group-leader pid
+⇒ the process's output stream; `standard_error` (or its registered pid) ⇒ **fd 2**; another
+**live registered** device pid ⇒ the typed `unsupported` (a BIF may not block on the round
+trip); an **unregistered** atom ⇒ `error:badarg`; a non-atom/non-pid ⇒ the bare
+`function_clause`. The device is resolved **before** the character/format payload is read.
+Pinned end to end against the live oracle by `../../tests/io_device.rs` (the device
+differential) and `../../tests/io_diagnostic_unmask.rs` (the compiler diagnostic is no longer
+`calling_self`).
+
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
   read only through `beam_engine::terms` (heap-seam builders/readers), `beam_codec::term`
@@ -597,8 +629,11 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   `erl_ddll` reports stay a single view (see the `erl_ddll:*` section). The `erlang`-namespace
   fallback classifies a known-unimplemented name as the capability gap (`unsupported: …`, CLI exit 3)
   and anything else as the bare `error:undef`.
-- **`code:*` is the native floor, not a live `code_server`** — `code.rs`'s behaviour must not
-  change (see `../CONTEXT.md`; OTP's real `code_server.beam` needs facilities outside this crate).
+- **`code:*` is the native floor, and the floor's `CodeServer` owns the ONE authoritative code path**
+  — `code.rs`'s behaviour must not change (see `../CONTEXT.md`; a live `code_server` process does run on
+  the boot-driven routes, but it keeps a second path store, so the floor serves the path readers **and**
+  the `code/path.rs` mutators out of `CodeServer` — the store this runtime really searches — and only the
+  un-migrated `code.erl` mutators still edit that second store).
 - **Files ~1000 lines of production code.** Pre-existing oversize (single-responsibility, kept
   whole because the routing table names them): `application.rs` (~953 production / 1661 total),
   `process.rs` (~934 production / 1417 total); `prim.rs` (~1088 production / 3942 total) is mostly
@@ -680,9 +715,13 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   cross-checking the live oracle (skipping **loudly** without the toolchain).
 
 ## Routing Table
-- `../native.rs` → the dispatch table (`try_native`, `FLOOR_MODULES`) + the `erlang`-core,
-  `io:put_chars`, `seq_trace*` and `trace*` arms and the shared helpers (read for the served set;
-  edit there to add an arm)
+- `../native.rs` → the dispatch table (`try_native`, `FLOOR_MODULES`, `floor_keys`) + the
+  `erlang`-core, `seq_trace*` and `trace*` arms and the shared helpers (read for
+  the served set; edit there to add an arm)
+- `io.rs` → the `io` **device** floor (`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`,
+  `io:write/1,2`, `io:format/3`): the `o_request/2` device model every arm shares, the
+  `unsupported` gap for a live non-stdio device, and its unit tests; the oracle-cross-checked
+  suites are `../../tests/io_device.rs` and `../../tests/io_diagnostic_unmask.rs`
 - `memory/` → `erlang:process_info/1,2` + `memory/tests.rs` + `memory/binary_e2e.rs` (the
   end-to-end `binary`-item case against the live oracle over a test-time-compiled `.beam`)
 - `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`): `term_type/1`,
@@ -712,10 +751,10 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   `{get_until,…}`/`{get_line,…}` readers and the `getopts`/`setopts` read-mode surface
   ([`file_server/CONTEXT.md`](file_server/CONTEXT.md)); the pass step is
   `Runtime::service_file_requests` (owned by `../runtime/scheduler.rs`)
-- `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the
-  `init` automatic flags (`root`/`home`/`progname`/`bindir`) + `init:script_id/0` + the
-  termination/reboot family, the code server's `get_mode/0`, `lib_dir/2` and `priv_dir/1`, and the
-  `application`
+- `init.rs` / `code.rs` (+ `code/path.rs`) / `application.rs` → the preloaded-module surfaces (contract
+  A.7) — the `init` automatic flags (`root`/`home`/`progname`/`bindir`) + `init:script_id/0` + the
+  termination/reboot family, the code server's `get_mode/0`, `lib_dir/2`, `priv_dir/1` and the path
+  mutators (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`, `del_path/1`), and the `application`
   config view (`get_key/1,2`, `get_all_key/1`, `get_application/0,1`)
 - `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl.
   `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling

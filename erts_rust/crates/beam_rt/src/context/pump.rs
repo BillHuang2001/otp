@@ -45,7 +45,10 @@ use super::runtime_context::RuntimeContext;
 /// This is the external-call counterpart of the `-eval` evaluator's receive pump
 /// ([`crate::eval`]'s `RECEIVE_PUMP_SLICES`): a bounded step, so a call that blocks has the
 /// child it waits on run and re-scanned, and a pump that reports nothing ran ends the wait
-/// with the honest typed [`beam_engine::blocked`] gap instead of spinning.
+/// with the honest typed [`beam_engine::blocked`] gap instead of spinning. Each round is a
+/// [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) pass — the
+/// **imminent-only** sleep policy — so an idle round whose only pending deadline is far out
+/// yields immediately rather than stalling the caller (see [`RuntimeContext::pump_once`]).
 const RUN_EXPORT_PUMP_SLICES: u64 = 64;
 
 /// The wall-clock safety cap on a nested blocking pump (see [`pump_until_returned`]).
@@ -57,10 +60,20 @@ const RUN_EXPORT_PUMP_SLICES: u64 = 64;
 /// process that stays **runnable forever** reports progress on every round and would spin the
 /// pump without end. This bound is the nested pump's counterpart of the boot drive's
 /// `DRIVE_DEADLINE`: checked between pump rounds, it turns an unbounded pump into a typed
-/// diagnostic instead of a hang. It is deliberately generous — no legitimate
-/// single-pass/`-eval`/boot workload (a `proc_lib` start, a `gen_server` round trip, an
-/// io-device read) comes close — so the cap fires only on a genuine infinite pump.
-pub(super) const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(10);
+/// diagnostic instead of a hang.
+///
+/// It is sized for the heaviest legitimate workload on this route: an **in-process compile** of
+/// a real stdlib module driven by `beam_rt -noshell -eval '<compile:file(…)>'`. Each round is a
+/// [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) pass, so an idle
+/// round issues no scheduler sleep and the compile is purely CPU-bound. Measured on the debug
+/// binary against `lib/stdlib/src/` with `[no_spawn_compiler_process, deterministic, no_docs,
+/// {outdir, …}]`: `ordsets.erl` ≈ 1.5–1.9 s wall / 1.2–1.5 s user, `calendar.erl` ≈ 3.5–6.6 s /
+/// 3.2–5.9 s and `lists.erl` ≈ 17.7–24.3 s / 17.0–20.1 s (the spread is host load; the
+/// `in_process_compile` test prints its own per-module wall-clock figure). Sixty
+/// seconds is ≈ 2.5–3× the largest of those, so the cap clears the heaviest real compile with
+/// headroom for slower hardware while still reporting a genuine infinite pump within a minute
+/// rather than looking like a hang.
+pub(super) const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The longest [`RuntimeContext::pump_once`] sleeps between two scheduler rounds while it
 /// waits a parked `receive … after T` out (see its docs for the whole design).
@@ -345,11 +358,14 @@ impl<'a> RuntimeContext<'a> {
     /// `wait_timeout` carries a statically readable finite delay this method therefore waits it
     /// out:
     ///
-    /// * **Each round** advances the runtime by [`RUN_EXPORT_PUMP_SLICES`] slices. A pump that
-    ///   reported progress means the mailbox may have changed, so the machine is resumed at the
-    ///   address the [`RunOutcome::Wait`] reported: a matching message **wins the race** and its
-    ///   outcome is returned immediately (a message arriving before `T` cancels the deadline,
-    ///   exactly as in the C).
+    /// * **Each round** advances the runtime by [`RUN_EXPORT_PUMP_SLICES`] slices, through
+    ///   [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) — the
+    ///   **imminent-only** sleep policy the boot drives use, so a round whose run queue is empty
+    ///   returns immediately instead of sleeping a full pump slice on a deadline far out (a
+    ///   `gen_server` housekeeping timer, say). A pump that reported progress means the mailbox
+    ///   may have changed, so the machine is resumed at the address the [`RunOutcome::Wait`]
+    ///   reported: a matching message **wins the race** and its outcome is returned immediately
+    ///   (a message arriving before `T` cancels the deadline, exactly as in the C).
     /// * **`ran == 0` does not end this branch.** An empty run queue is the *expected* state
     ///   here — nobody but the timeout can answer the receive — so the bound is the finite
     ///   delay itself, never an unbounded wait and never a busy-spin: each round sleeps
@@ -392,7 +408,7 @@ impl<'a> RuntimeContext<'a> {
         let Some((delay_ms, resume)) = finite else {
             // No deadline: one pump, and a pump that changed nothing ends the drive with the
             // typed gap (the mailbox cannot have changed).
-            let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+            let ran = self.runtime.pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)?;
             if ran == 0 {
                 return Ok(None);
             }
@@ -400,7 +416,7 @@ impl<'a> RuntimeContext<'a> {
         };
         let target = Instant::now() + Duration::from_millis(delay_ms);
         loop {
-            if self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)? > 0 {
+            if self.runtime.pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)? > 0 {
                 let outcome = machine.resume_outcome(module, func, pc, self)?;
                 match outcome {
                     RunOutcome::Returned(_) => return Ok(Some(outcome)),
@@ -575,5 +591,188 @@ call(F) -> F().
             beam_engine::blocked().to_string(),
             "a context that may not pump reports the typed `blocked` gap, never a value"
         );
+    }
+}
+
+/// Pins the nested pump's **sleep policy** through its observable consequence: real stdlib
+/// modules must compile in-process on the pumping `-eval` route, byte-identically to the oracle.
+///
+/// # What this pins
+///
+/// `compile:file/2` is driven through [`Runtime::eval`] — the `-eval` evaluator's
+/// `Mod:Func(Args)` route, whose module call reaches
+/// [`ExecutionContext::call_bif`](beam_engine::ExecutionContext::call_bif) and so
+/// [`RuntimeContext::run_export`] → [`RuntimeContext::run_export_blocking`] →
+/// [`pump_until_returned`] → [`RuntimeContext::pump_once`]. Each pump round is a
+/// [`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) pass, whose
+/// **imminent-only** sleep policy leaves a round unslept when its only pending deadline is far
+/// out — and a compile does leave one pending (a `gen_server`/`time` timer an hour away). A
+/// round that slept in that situation instead (the `TimerWait::AtMost` policy, a full pump slice
+/// of 100 ms, roughly once per compiler top-level form) leaves the pump too little of
+/// [`BLOCKING_PUMP_DEADLINE`] to finish a large module, so `lists.erl` overran it and produced no
+/// artifact at all.
+///
+/// # Cost, and why two modules
+///
+/// The compile is purely CPU-bound under the debug runtime: measured on this host (already
+/// loaded), `ordsets.erl` ≈ 1.5–1.9 s and `lists.erl` ≈ 18–21 s of wall clock. The test
+/// therefore deliberately compiles one small module and the large module that weighs the most on
+/// this route, and byte-compares **both** artifacts with the oracle's identical-option run — so a
+/// pump-policy regression surfaces as a missing/garbled artifact or the typed `blocking pump`
+/// diagnostic, never as a silent pass.
+#[cfg(test)]
+mod in_process_compile {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    use crate::context::test_support::{resolve_oracle, scratch_dir, skip_loudly};
+    use crate::runtime::Runtime;
+
+    /// The modules compiled, smallest first: `ordsets` is the ordinary case and `lists` the
+    /// heaviest compile observed on this route (≈ 18–21 s of wall clock under the debug runtime).
+    const MODULES: [&str; 2] = ["ordsets", "lists"];
+    /// The **Erlang string literal** for `path`: the temporary names here are ASCII, which Rust's
+    /// `Debug` and Erlang's string syntax quote identically.
+    fn literal(path: &Path) -> String {
+        format!("{:?}", path.to_str().expect("an ASCII temporary path"))
+    }
+
+    /// The repository root: `$ERL_TOP` when set, else three levels up from this crate's manifest
+    /// directory (`<root>/erts_rust/crates/beam_rt`).
+    fn source_root() -> PathBuf {
+        match std::env::var_os("ERL_TOP") {
+            Some(value) => PathBuf::from(value),
+            None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."),
+        }
+    }
+
+    /// The `compile:file/2` expression both runtimes are asked for, with the option list the
+    /// byte comparison needs: `no_docs` keeps the compressed `Docs` chunk out of the artifact, so
+    /// the bytes are directly comparable (`{outdir, D}` is not recorded in `Dbgi`, and the
+    /// compiler does not create `D` — the caller does).
+    fn compile_expr(src: &Path, outdir: &Path) -> String {
+        format!(
+            "compile:file({}, [no_spawn_compiler_process, deterministic, no_docs, \
+             {{outdir, {}}}])",
+            literal(src),
+            literal(outdir)
+        )
+    }
+
+    /// Compiles [`MODULES`] in-process and byte-compares each artifact with the oracle's
+    /// identical-option run. A missing `erl` or a missing stdlib source is a **loud skip**
+    /// (`skip_loudly`), never a silent pass or a panic.
+    #[test]
+    fn a_real_stdlib_module_compiles_in_process_like_the_oracle() {
+        const BANNER: &str = "in-process stdlib compile";
+        let Some(oracle) = resolve_oracle() else {
+            skip_loudly(BANNER, "no `erl` on $PATH (and no executable $ERTS_ORACLE)");
+            return;
+        };
+        let root = source_root();
+        let sources: Vec<(&str, PathBuf)> = MODULES
+            .iter()
+            .map(|module| {
+                (
+                    *module,
+                    root.join("lib/stdlib/src").join(format!("{module}.erl")),
+                )
+            })
+            .collect();
+        // An installed-only tree (or a relocated build) has no `lib/stdlib/src`: that is a
+        // missing prerequisite, not a failure of this runtime.
+        for (module, src) in &sources {
+            if !src.is_file() {
+                let why = format!(
+                    "no real stdlib source to compile at {} for `{module}`",
+                    src.display()
+                );
+                skip_loudly(BANNER, &why);
+                return;
+            }
+        }
+
+        // One runtime for both modules: the boot sequence is idempotent, and a default config
+        // drives **no** boot script, so the runtime's own native `file_server_2` service owns the
+        // name the compiler's `epp`/`save_binary` round trips address.
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        runtime.boot().expect("the boot sequence");
+
+        for (module, src) in &sources {
+            let rust_out = scratch_dir(&format!("{module}_rust_out"));
+            let oracle_out = scratch_dir(&format!("{module}_oracle_out"));
+
+            // ---- the runtime's artifact ----
+            let expr = compile_expr(src, rust_out.path());
+            let started = Instant::now();
+            let result = runtime.eval(&expr).unwrap_or_else(|error| {
+                panic!("the in-process compile of `{module}` must complete: {error}")
+            });
+            let rendered = runtime.format_term_w(result, None).unwrap_or_else(|error| {
+                panic!("the `{module}` compile result must be printable: {error}")
+            });
+            assert_eq!(
+                rendered.trim(),
+                format!("{{ok,{module}}}"),
+                "the in-process compile of `{module}` must answer the oracle's `{{ok,{module}}}`"
+            );
+            let rust_artifact = rust_out.join(&format!("{module}.beam"));
+            let mine = fs::read(&rust_artifact).unwrap_or_else(|error| {
+                panic!(
+                    "the in-process compile of `{module}` reported {} but wrote no {}: {error}",
+                    rendered.trim(),
+                    rust_artifact.display()
+                )
+            });
+
+            // ---- the oracle's artifact, on the identical option list ----
+            let oracle_expr = format!("{}, halt(0).", compile_expr(src, oracle_out.path()));
+            let output = Command::new(&oracle)
+                .arg("-noshell")
+                .arg("-eval")
+                .arg(&oracle_expr)
+                .arg("-s")
+                .arg("init")
+                .arg("stop")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap_or_else(|error| {
+                    panic!("failed to spawn the oracle '{}': {error}", oracle.display())
+                });
+            assert!(
+                output.status.success(),
+                "the oracle '{}' must compile `{module}`: {:?}\n--- stderr ---\n{}",
+                oracle.display(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let oracle_artifact = oracle_out.join(&format!("{module}.beam"));
+            let reference = fs::read(&oracle_artifact).unwrap_or_else(|error| {
+                panic!("the oracle wrote no {}: {error}", oracle_artifact.display())
+            });
+
+            // ---- byte-for-byte ----
+            let at = mine
+                .iter()
+                .zip(reference.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| mine.len().min(reference.len()));
+            assert_eq!(
+                mine,
+                reference,
+                "the in-process `{module}` artifact must be byte-identical to the oracle's \
+                 (identical option list); first difference at byte {at} of {} vs {} bytes",
+                mine.len(),
+                reference.len()
+            );
+            eprintln!(
+                "{module}.erl: in-process compile in {:.3} s, {} bytes, byte-identical to the \
+                 oracle",
+                started.elapsed().as_secs_f64(),
+                mine.len()
+            );
+        }
     }
 }

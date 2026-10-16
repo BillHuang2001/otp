@@ -121,6 +121,20 @@ accepted-and-ignored, so such a process still reports `on_heap` (per-process sto
 is a cross-crate handoff).
 
 ## Printing
+The `io` **device** request wrappers are served by the native floor (`src/native/io.rs`): `io:nl/0,1`,
+`io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3` and the pre-existing `io:put_chars/1,2`. Each is an
+`io.erl` wrapper over `o_request/2` that posts `{io_request, …}` to the request's **device** — the
+caller's `group_leader()`, i.e. itself for this runtime's own root process — and blocks for
+`{io_reply, …}`; `execute_request/3` answers `{error, calling_self}` for that self-device, so every such
+call used to raise `error:calling_self`, which **replaced** the installed compiler's `catch`-handler
+diagnostic (`io:fwrite("Function: ~w/~w\n", …)`). The floor answers the device question itself and
+renders through the **registered** `io_lib:format/2`, so those calls write and the compiler's real reason
+propagates. Device rules and per-key detail: [`src/native/CONTEXT.md`](src/native/CONTEXT.md) *The `io`
+device floor*; the stdout/stderr/exit-code differential is `tests/io_device.rs`, and the in-process
+compile diagnostic probe is `tests/io_diagnostic_unmask.rs`.
+Two residuals: a **live non-stdio device** pid is the typed `unsupported` (a BIF cannot block on the
+`{io_request, …}` round trip), and `io:put_chars/1,2` still **accepts and ignores** its device, so
+`io:put_chars(standard_error, …)` lands on stdout where the oracle writes fd 2.
 The registered `beam_bifs` `io:format` `~w`/`~p` printer rejects a non-byte-aligned bitstring (or a
 container past ~80 columns) with `badarg`; the corpus reads such values via `bit_size/1`/`is_list`. A
 segment wider than 64 bits is *unsupported*; a bignum is `system_limit`.
@@ -323,10 +337,14 @@ the allocation falls back to the arena). `Process::deliver` grows the nursery th
 message copy; the refusal is what reproduces the raw `AllocKind::Message` that `deliver_message` keys its
 heap-fragment fallback on. A **relocation-exempt** receiver skips the retry entirely. The
 **registered-BIF result** is the one allocation that really leaves its pooled heap (the copy-out
-subsection below). Allocation **outside** the admission point still raises `error::system_limit`: BIFs
-(and the floor) build *intermediate* terms on a `beam_alloc::Heap` (`BifContext::heap()`) caching raw
-`hp`, so the live set is invisible to `roots`, and the bounded heaps
-(`Runtime::bif_heaps`/`eval_heap`) never move.
+subsection below). Allocation **outside** the admission point uses bounded `beam_alloc::Heap` arenas that **never move**
+(`BifContext::heap()`, `Runtime::eval_heap`), so a BIF's *intermediate* terms are invisible to `roots`
+and cannot be collected; a call that really overflows such a heap still raises `error::system_limit`.
+The one growth seam outside the admission point is the **pooled BIF-heap frontier**: on the table-less
+(`-eval`/nested) route — where no process heap exists to move a container result onto —
+`RuntimeContext::take_bif_frontier` retires a near-full region and continues in a larger one (capped only
+by an explicit `+hmax`), so a long table-less compilation grows its result store instead of hitting the
+fixed `DEFAULT_HEAP_WORDS` cap (see the copy-out subsection below).
 
 ### The BIF-result copy-out — a registered BIF's container result moves onto the process's scanned heap
 A registered BIF builds its result on the runtime's pooled 16 MiB `Runtime::bif_heaps`
@@ -361,8 +379,10 @@ process to move onto), a **container** result (`result_is_foreign_container`; an
 a literal lives in the frozen literal area, so such a result rewinds with **no** copy), and a move that
 succeeded.
 **Residuals.** A **NIF** result is **not** copied out (a deliberate M1 residual), so it stays on the
-pooled heap and keeps declining a collection while live; the `-eval`/no-scheduled-process shape, an
-escaping arm and an error result also leave their container on the pooled (`Target::Foreign`) heap; a
+pooled heap and keeps declining a collection while live; an escaping `DispatchHooks` arm and an error
+result also leave their container on the pooled (`Target::Foreign`) heap; on the
+`-eval`/no-scheduled-process shape there is no process to move onto, so the pooled **frontier** instead
+grows (`RuntimeContext::take_bif_frontier`, capped only by an explicit `+hmax`); a
 **nested** cross-module run (`RuntimeContext::run_export`) never reaches a collection point. Pinned by
 `src/context/tests.rs` (`a_bif_container_result_is_moved_onto_the_process_heap_and_the_pool_is_rewound`,
 `an_immediate_result_rewinds_the_pool_without_a_copy`,
@@ -392,6 +412,18 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
 ## Heap switches
 `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → 1598),
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
+## CLI `run` argument tokens
+`beam_rt run <beam> <m>:<f>/<a> <arg…>` materializes an integer token with
+`beam_term::make_small` (`src/runtime.rs::materialize`, reached from `src/cli.rs::parse_arg_term`'s
+`i64` arm) **without a range check**: a token above `MAX_SMALL` (`2^59 - 1`) aborts on the
+`debug_assert` in a debug build (`beam_term/src/immediate.rs:77`, exit 101) and is **silently
+truncated to a wrong small int in a release build** — `… bm:mk64/1 576460752303423488` prints
+`<<248,0,0,0,0,0,0,0>>` where the oracle prints `<<8,0,0,0,0,0,0,0>>`, a **wrong result**, the one
+class the runtime forbids. The fix belongs in those two files: range-check the parse and build a
+bignum (or reject the token), via `beam_term::try_make_small` + the bignum writer — the same range
+check `src/cli.rs` already applies to `+hmax` (`src/cli.rs:778`). `tests/bignum_bit_segment.rs`
+documents the hazard and reaches the same segment through a string token instead; the `-eval` route
+is unaffected (its integer literals are exact bignums).
 
 ## Cross-node handoff detail
 * **The differential gate.** Every recorded non-agreeing case is an honest capability gap in
@@ -509,7 +541,40 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   **per-function** (`erlang:term_to_binary/1,2` / `erlang:external_size/1,2` are guarded only in the
   function that issues the call; the module-wide `erlang:load_nif/2` is unchanged), so a `compile:*`
   function whose own body issues no fun-image BIF is admitted in-machine and its blocking `receive`
-  suspends through the ordinary `RunOutcome::Wait` path. The hazard class both cases run through — the
+  suspends through the ordinary `RunOutcome::Wait` path. The compile route reaches the compiler's own
+  `catch`-handler diagnostics **without** an io-server workaround: the `io` device floor serves
+  `io:fwrite/2` (`tests/io_diagnostic_unmask.rs` pins a pair of real stdlib modules spanning both
+  outcomes — a clean compile and a compiler-pass failure — to never report `calling_self`, to report a
+  real result, and, only on a failing module, to carry a `Function: ` line), so a genuine compiler crash reports its real
+  reason. The route completes for **72 of the 86** oracle-compilable `lib/stdlib/src/*.erl` with
+  byte-identical `.beam`; the 14 failures are heap-independent compiler-runtime defects, **none
+  io-related**, and split into exactly two root causes. **13** — `c`, `dets`, `epp`, `erl_lint`,
+  `ets`, `io`, `peer`, `qlc`, `shell`, `slave`, `sys`, `timer`, `win32reg` — are the `beam_bifs`
+  `maps:*` iterator-term defect: `map/2`/`fold/3`/`filter/2`/`foreach/2` mis-reject a valid
+  `maps:iterator/1,2` term, so those modules raise
+  `{crash,beam_ssa_recv,{badmap, Iterator}, …}` from `beam_ssa_recv:plan_clears/2` or — `erl_lint` —
+  the same `{badmap, Iterator}` from `beam_ssa_opt:phase/4` (owning crate
+  `erts_rust/crates/beam_bifs`; detail in
+  [`../beam_bifs/CONTEXT.md`](../beam_bifs/CONTEXT.md)). This is the **largest remaining bucket** —
+  13 of the 14. The remaining **1** is a `beam_engine` defect: `<<Int:Size>>` (BEAM `bs_create_bin`)
+  wrongly rejects a **bignum** in a field of `Size <= 64`, so `erl_tar` fails at
+  `Function: do_merge_pax/2` raising
+  `{crash,beam_core_to_ssa,badarg, …}` where the oracle masks the bignum into the field width
+  (reproducer: a compiled `f(X) -> <<X:64>>` reached with a bignum `X` — e.g. the `bm:mk64s/1`
+  string entry that rebuilds it with `list_to_integer/1`, since a bare `run` integer token above
+  `2^59 - 1` is a separate hazard of its own, see `src/runtime.rs::materialize`; a narrow segment
+  with a small int works and `<<X:80>>` works via the wide-integer
+  path; tier-independent, and the `-eval` route is unaffected).
+  [`tests/bignum_bit_segment.rs`](../crates/beam_rt/tests/bignum_bit_segment.rs) pins the oracle's
+  masking ground truth and the typed-gap invariant. The bignum arm's fix is
+  **out-of-scope for this crate** (owner `erts_rust/crates/beam_engine`): in
+  `crates/beam_engine/src/families/bitstrings/create/mod.rs`, the `"integer"` arm of `bs_create_bin`
+  (~lines 215-233) must accept a bignum for `nbits <= 64` through the existing magnitude machinery
+  (`integer_magnitude_bytes` / the `push_wide_int`-style byte+bit writer, which already handles smalls
+  **and** bignums) and mask the value to `nbits`, matching C `erts_bs_put_integer_*` / `fmt_big_be` /
+  `fmt_big_le` (`erts/emulator/beam/erl_bits.c`), instead of requiring `small_value` and returning
+  `fail_seg(machine, module, labels, fail, SegReason::BadArg)`; `BadArg` stays for a genuinely
+  non-integer value only. The hazard class both cases run through — the
   monitor-DOWN branch of `beam_process`'s termination cascade relocating a **woken** monitor watcher's
   heap — is declined in this crate by the host collection gate plus the park exemption (the A.9 class in
   *GC-relocation hazards* below); mechanism:
