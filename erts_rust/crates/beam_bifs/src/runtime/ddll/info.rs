@@ -30,7 +30,8 @@
 //!
 //! # The observable contract (verified against the live oracle, OTP 29.1.1 / erts-17.1)
 //!
-//! * `Name` is a **charlist** or an **atom** (the C `pick_list_or_atom`); `Item` must
+//! * `Name` is an **atom** or an **iodata** name (the C `pick_list_or_atom`, so a
+//!   charlist, a nested io list or a byte-aligned binary all work); `Item` must
 //!   be an **atom**. An unknown driver name *or* an unknown item is the plain
 //!   `error:badarg`.
 //! * For a statically linked built-in (`tcp_inet`, `udp_inet`, `ram_file_drv` — the
@@ -42,17 +43,19 @@
 //!   `linked_in_driver` -> `false` (it is dynamically loaded, not a statically linked
 //!   built-in); `permanent` -> `false`; `port_count` -> `0` (no ports are opened here);
 //!   `driver_options` -> `[kill_ports]` iff the driver was loaded with that option,
-//!   else `[]`; `processes` -> `[{LoaderPid, 1}]` (the single loading process, one
-//!   reference each — the oracle reports `[{<0.10.0>,1}]` for a driver loaded by one
-//!   process); `awaiting_load`/`awaiting_unload` -> `[]`.
+//!   else `[]`; `processes` -> `[{LoaderPid, N}]` (the single loading process and its
+//!   outstanding-load count — the oracle reports `[{<0.10.0>,1}]` for a driver loaded
+//!   once and `2` after a second `try_load`); `awaiting_load`/`awaiting_unload` -> `[]`.
 //!
 //! # Honest divergences
 //!
-//! * **`processes` counts only the loading process.** The C tracks every process that
-//!   has loaded the driver and its per-process reference count; here the registry
-//!   records the single loader ([`super::registry::Loaded::loader`]) with count `1`.
+//! * **`processes` names only the loading process.** The C tracks every process that
+//!   has loaded the driver; this runtime's registry records the single loader
+//!   ([`super::registry::Loaded::loader`]) and its load count
+//!   ([`super::registry::Loaded::loads`]), which is the same answer while one process
+//!   drives every load.
 //! * **`driver_options` reports only the `kill_ports` flag** — the registry records
-//!   no other option ([`super::live::parse_options`]).
+//!   no other option (see `super::live`'s option grammar).
 
 use beam_term::{Eterm, NIL};
 
@@ -99,8 +102,8 @@ fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             _ => Err(badarg()),
         };
     }
-    let Some((kill_ports, loader)) =
-        registry::get(&name, |loaded| (loaded.kill_ports, loaded.loader))
+    let Some((kill_ports, loader, loads)) =
+        registry::get(&name, |loaded| (loaded.kill_ports, loaded.loader, loaded.loads))
     else {
         return Err(badarg());
     };
@@ -120,10 +123,12 @@ fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             }
         }
         "processes" => {
-            // `[{LoaderPid, 1}]` — the loading process with its single reference count.
+            // `[{LoaderPid, N}]` — the loading process with its outstanding-load count (the C's
+            // per-process reference count; `N` is `1` after a single `try_load` and grows on each
+            // repeat load — `erl_bif_ddll.c:1389`).
             let pid = loader.to_eterm();
-            let one = ctx.int(1)?;
-            let pair = ctx.tuple(&[pid, one])?;
+            let count = ctx.int(i64::from(loads))?;
+            let pair = ctx.tuple(&[pid, count])?;
             ctx.list(&[pair])
         }
         "awaiting_load" | "awaiting_unload" => Ok(NIL),
@@ -194,7 +199,7 @@ mod tests {
         assert_eq!(info(&mut fx, "test_drv", "processes"), expected);
     }
 
-    /// A load with the `kill_ports` option reports it in `driver_options`.
+    /// A load with the `kill_ports` driver option reports it in `driver_options`.
     #[test]
     fn the_driver_options_reflect_the_kill_ports_option() {
         clear_registry();
@@ -205,7 +210,10 @@ mod tests {
         let path = fx.charlist(&dir);
         let name = fx.charlist("test_drv");
         let kill_ports = fx.atom("kill_ports");
-        let options = fx.cons(kill_ports);
+        let payload = fx.cons(kill_ports);
+        let tag = fx.atom("driver_options");
+        let dopt = fx.tuple(&[tag, payload]);
+        let options = fx.cons(dopt);
         let loaded = fx
             .call("try_load", 3, &[path, name, options])
             .expect("a first load is a result");

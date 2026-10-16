@@ -418,10 +418,10 @@ fn internal_delete_all_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Ete
 /// `badarg`. Verified: three objects and
 /// `[{{1, '$1'}, [], [true]}]` ⇒ `1` with `{1, a}` gone, and re-running it ⇒ `0`.
 fn internal_select_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    // The spec's guards/bodies may compute arithmetic; install this crate's
-    // arbitrary-precision `ArithHook` over `beam_ets` for the traversal
-    // (`super::arith_hook`).
-    let _arith = super::arith_hook::PrecisionArith::install();
+    // The spec's guards/bodies may compute arithmetic and may read `self/0`; install
+    // this crate's two match-spec seams over `beam_ets` for the traversal
+    // (`super::self_hook::SpecEval`).
+    let _eval = super::self_hook::SpecEval::install(ctx.self_pid());
     let handle = resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     let mut table = take_table_gated(ctx, handle, Gate::Write)?;

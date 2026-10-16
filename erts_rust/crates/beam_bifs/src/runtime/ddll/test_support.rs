@@ -39,7 +39,7 @@ use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
 /// The atoms the tests build or route by name.
-pub(crate) const SEEDED: [&str; 30] = [
+pub(crate) const SEEDED: [&str; 34] = [
     // The loading keys' atoms.
     "ok",
     "error",
@@ -55,6 +55,11 @@ pub(crate) const SEEDED: [&str; 30] = [
     "driver_incorrect_version",
     "symbol_not_found",
     "unspecified_error",
+    // The option and pending-status atoms (`erl_bif_ddll.c:198-249,583-595`).
+    "reload",
+    "pending",
+    "pending_driver",
+    "pending_process",
     // `info/2`'s item atoms and the `monitor/2` argument/item atoms.
     "driver",
     "unloaded",
@@ -113,6 +118,11 @@ impl Fixture {
                 .expect("the charlist fits");
         }
         tail
+    }
+
+    /// A binary of `bytes` on the fixture heap (the `pick_list_or_atom` iolist arm's shape).
+    pub(crate) fn binary(&mut self, bytes: &[u8]) -> Eterm {
+        beam_codec::term::make_binary(&mut self.heap, bytes).expect("a binary fits")
     }
 
     /// `[term]` — a cons cell over a fresh tail.
