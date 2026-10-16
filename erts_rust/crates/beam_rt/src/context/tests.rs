@@ -6607,13 +6607,15 @@ fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
 /// **Regression pin for the removed `post_slice_float_pin` plateau** — the name describes the
 /// defect this case rules out, and the assertions below now pin the fixed behaviour.
 ///
-/// The reaction used to be `Runtime::pin_process(pid)` — a **permanent** runtime-level pin — so the
-/// first slice that ended with a live FR slot made `Runtime::gc_process_enabled` answer `false` for
-/// the rest of the process's life: a float-using loop collected only inside its first slice, its
-/// nursery kept every space it ever allocated, and its `collections` **plateaued** however large the
-/// loop got. It is now a **per-slice relocation exemption** — opened at the slice's end when the FR
-/// prefix is live, cleared by the next slice entry — so the process collects again at its own
-/// heap-admission points and `Runtime::gc_stats().pinned` stays **0**.
+/// The reaction used to be a **permanent** runtime-level process pin, applied through a
+/// `Runtime::pin_process/1` entry this crate no longer has (the superseded reaction this case
+/// rules out) — so the first slice that ended with a live FR slot made
+/// `Runtime::gc_process_enabled` answer `false` for the rest of the process's life: a float-using
+/// loop collected only inside its first slice, its nursery kept every space it ever allocated, and
+/// its `collections` **plateaued** however large the loop got. The reaction is now the **per-slice
+/// relocation exemption** the runner applies (`Process::set_relocation_exempt`, opened at the
+/// slice's end when the FR prefix is live and cleared by the next slice entry) — so the process
+/// collects again at its own heap-admission points and `Runtime::gc_stats().pinned` stays **0**.
 ///
 /// This case is the **deterministic** half of the A/B experiment (no RSS involved): the same
 /// three `ets_copy` allocate-and-abandon loops, differing only in the payload's `b` value, are
