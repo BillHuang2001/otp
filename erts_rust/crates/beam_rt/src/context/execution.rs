@@ -252,14 +252,6 @@ impl ExecutionContext for RuntimeContext<'_> {
         // replies. The key list is [`crate::native::floor_shadows`], whose `io` exception a
         // unit test below pins against `try_native`'s source so it can never drift out of the
         // host's dispatch.
-        if crate::native::floor_shadows(module, function, arity) {
-            if crate::debug_trace::enabled() {
-                crate::debug_trace::trace(format_args!(
-                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: floor_shadows"
-                ));
-            }
-            return Ok(None);
-        }
         // A module with a loaded NIF library is **never** entered here, for two reasons.
         //
         // * A NIF replaces the Erlang stub of the same `{module, function, arity}` at dispatch
@@ -284,23 +276,17 @@ impl ExecutionContext for RuntimeContext<'_> {
         // refused here — the library is registered by then.)
         //
         // [`NifRegistry::lookup`]: crate::nif::NifRegistry
-        if self.runtime.nifs.borrow().is_loaded(module) {
-            if crate::debug_trace::enabled() {
-                crate::debug_trace::trace(format_args!(
-                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: nif-loaded"
-                ));
-            }
-            return Ok(None);
-        }
         // A registered `beam_bifs` BIF (the `bif.tab` surface, including the stdlib fast
         // paths and `ets:*`) is the implementation `call_bif` serves; it is never a `.beam`
         // body here.
-        if self.runtime.registry.contains(module, function, arity) {
-            if crate::debug_trace::enabled() {
-                crate::debug_trace::trace(format_args!(
-                    "seam decline [{trace_pid:?}] {module}:{function}/{arity}: registry key"
-                ));
-            }
+        //
+        // The three host-served families above are the **one** predicate
+        // [`Self::host_serves`] — the single source of truth the runner's process-entry arm
+        // asks directly (see that method for why this seam's own `Ok(None)` cannot be reused
+        // there: it is overloaded with the module-unresolvable/missing-export cases). A
+        // host-served MFA is not a `.beam` body here, so the seam declines and leaves the
+        // synchronous `call_bif` route (NIF → runtime-native floor → registry) untouched.
+        if self.host_serves(module, function, arity) {
             return Ok(None);
         }
         // Resolve the callee's module handle. A module that is **already cached** is used as
@@ -792,5 +778,42 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// event rather than failing the traced program.
     fn trace_event(&mut self, event: beam_engine::TraceEvent<'_>) {
         self.execution_trace_event(event);
+    }
+}
+
+impl RuntimeContext<'_> {
+    /// Whether the runtime's **host dispatch chain** serves this MFA — a runtime-native-floor
+    /// name, a NIF-loaded module, or a registered `beam_bifs` key.
+    ///
+    /// This is exactly the `Ok(None)`-for-host-served half of
+    /// [`Self::resolve_external_call`], and the **single** source of truth for it: the seam's
+    /// first refusal *is* this call, and the runner's process-entry arm
+    /// ([`crate::runner`]) asks it directly.
+    ///
+    /// Why the entry arm cannot ask [`Self::resolve_external_call`] instead: that method's
+    /// `Ok(None)` is **overloaded** — besides "the host serves this MFA" it also answers it for
+    /// "this module cannot be loaded" (an on-demand load failure), "the callee's atom table
+    /// lacks the function atom" and "the export is missing", all of which are the synchronous
+    /// path's `undef` *inside* a `call_ext`. A process entry, by contrast, is handed a module
+    /// the caller already holds (a test-constructed `ProcessEntry::Export` names a loaded
+    /// `Arc<Module>` the code server has never seen), so reading the overloaded `Ok(None)` as
+    /// "host-served" sends a perfectly resolvable module's export to `call_bif`, which cannot
+    /// resolve it and raises `undef`. Asking the narrow predicate and keeping the original
+    /// `module.export` route otherwise restores that entry route for every non-host-served
+    /// entry — including one whose atoms the module's own table cannot name.
+    ///
+    /// The debug trace rides here so the condition is written once; it is a diagnostic only
+    /// (`BEAM_RT_BOOT_TRACE`), and it fires for whichever site asks.
+    pub(crate) fn host_serves(&self, module: &str, function: &str, arity: u32) -> bool {
+        let served = crate::native::floor_shadows(module, function, arity)
+            || self.runtime.nifs.borrow().is_loaded(module)
+            || self.runtime.registry.contains(module, function, arity);
+        if served && crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "host-served [{:?}] {module}:{function}/{arity}",
+                self.mailbox_pid
+            ));
+        }
+        served
     }
 }
