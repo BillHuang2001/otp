@@ -289,6 +289,7 @@ pub(crate) struct RuntimeCollectionGate {
     latch: Option<ForeignLatch>,
 }
 
+#[cfg(test)]
 impl RuntimeCollectionGate {
     /// A gate with an empty (allocated lazily, on the first decision) descent scratch and **no**
     /// host latch, so every decision descends unconditionally.
@@ -300,6 +301,7 @@ impl RuntimeCollectionGate {
     }
 }
 
+#[cfg(test)]
 impl Default for RuntimeCollectionGate {
     fn default() -> RuntimeCollectionGate {
         RuntimeCollectionGate::new()
