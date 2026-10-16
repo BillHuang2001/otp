@@ -229,8 +229,16 @@ the oracle's class. Entries marked *divergence* are honest but not byte-identica
 - **Arithmetic widens even small ints to a heap `Big`:** `erlang:'-'/2` of two small ints does ~4 small `Vec`
   allocations (a `Big::from_i64` per operand, then `sub`/`add`/`neg`) with no checked-`i64` fast path.
 - **The `AtomTable` deep clone is copy-on-write** (`beam_rt`'s `CodeServer::atoms_mut`): only a call that actually
-  **interns** pays it, and `prefix_matches`'s O(table) revalidation cannot be made O(1) without a table *identity*
-  signal (see Handoffs).
+  **interns** pays it. Independent of that clone, `with_decode_scratch`/`prefix_matches` (`src/binconv.rs`) revalidate
+  the decode-scratch image by walking **every** memo index on **every** `binary_to_term` call — Θ(atom-table) `name`
+  lookups + `&str` compares (~4100 atoms after boot) whether or not any atom is novel; only the *allocation* count is
+  table-size-independent (`tests/decode_hot_path.rs`). The O(1) replacement already exists upstream
+  (`beam_term::AtomTable::snapshot()` + `appended_since`, an `{instance, generation, len}` witness) but is **unadopted**
+  here and in `beam_rt/src/nif.rs` (see Handoffs). The encode path (`term_to_binary`) is unaffected.
+- **`term_to_binary/1` and `binary_to_term/1` allocation inventory** (one 5-key-map round trip): encode = 2 `Vec<u8>`
+  (the `Encoder`'s 128-byte `Writer` + `plain_image`'s `body.len()+1` image) + the on-heap binary block
+  (`beam_alloc` bump, O(size)); decode = 1 `Vec<u8>` (`access::binary_bytes`'s `to_vec`) + 1 `Vec<(Eterm,Eterm)>`
+  (the codec's map `pairs`) + the map block on the context heap; **no** per-call `HashMap`/`HashSet`/`String`/`format!`.
 
 ## A.9 blockers (self-hosted build: booting kernel, running lib/compiler)
 There is **no self-hosted build** yet (the `ets:new/2` link is closed — `./src/ets/CONTEXT.md`; the `ets:foldl/3`/`foldr/3` blocker is in Handoffs).
