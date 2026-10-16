@@ -38,7 +38,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   primitive young-generation entry over a single from-space.
 - The shared `pub(crate)` evacuation primitives: `Target` (`Foreign`/`Live`/`Forwarded`), the `EvacDest`
   trait (`classify_boxed`/`classify_cons`/`can_reserve`/`reserve`), `forward_slot<D: EvacDest>`, `move_size`,
-  `for_each_ref` — consumed by `Copier`, `immix/`, `PromoteDest` and `live.rs`. The per-object layout is
+  `for_each_ref` — consumed by `Copier`, `immix/`, the atomic promotion and `live.rs`. The per-object layout is
   **not** this crate's (Design Decisions).
 
 ### `live.rs` — the exact-live counter
