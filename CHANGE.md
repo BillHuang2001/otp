@@ -8,6 +8,110 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-16 — Milestone 14: the A.9 in-process-compile sweep reaching 86/86, the `Nursery::contains` O(#spaces) admission walk, a durable compiled-block cache key, two more built-in drivers, and the `eval` bit-string closure
+Scope: the milestone that finished the A.9 in-process-compiler route (every `lib/stdlib/src/*.erl` the
+oracle can compile in-process now compiles here **byte-identically**), and then removed the runtime-wide
+overheads that route exposed. The headline **algorithmic/data-structure** changes are (a) `Nursery`'s
+membership test became a keyed lookup instead of a scan over the retired chain, (b) heap growth became
+one-step-then-doubling, (c) the compiled-block cache key became a two-part `(ModuleKey, AtomSnapshot)`,
+(d) `beam_term`'s `AtomTable` interning became `Arc<str>`-shared (one allocation per name, not two), and
+(e) `ETS` per-table ownership transfer now carries gift data. Run `tools/differential/gate.sh` (or the
+16-way per-case sweep) for the live figure; the recorded state is `total=2967 agree=2966 mismatch=0
+unsupported=1 skipped=0` with the single allowlisted gap `wire/new_fun_ext_encode` (A.5).
+- **Area:** `erts_rust/crates/beam_gc` (`src/nursery.rs`) — **algorithmic, the A.9 scalability blocker**
+- **Change:** `Nursery::contains` was an **O(#spaces) walk of the retired chain**, run on **every** heap
+  admission (every `grow_nursery`/retire and every door test), so the in-process compile's cost grew
+  super-linearly in the number of retired spaces (**60.9 % of self time**; +88.5 % including its inlined
+  accessors). It is now a `BTreeMap<base, top>` range lookup in `O(log n)`. The map is sound because live
+  `[base, top)` regions are **pairwise disjoint** and a retired space's `top` is frozen when it is retired.
+  The from-set's ranges are likewise kept **base-sorted** so `locate` is one search rather than a filter.
+  Growth is now **one-step-then-doubling** (bounded retires, no blast radius into `beam_process`). Measured:
+  `ordsets` 254 s → ≈12 s; `timer.erl` DNF → 65 s; every artifact's `Code` chunk md5 now equals the
+  oracle's. Pinned by `tests/nursery_growth_retention.rs`. Handoff from `beam_rt`'s compile profiles.
+- **Area:** `erts_rust/crates/beam_gc` (`src/immix_collector/promote.rs`) — **atomicity fix**
+- **Change:** a refused line-granular promotion left half-forwarded state. The promotion driver now rolls
+  **both** spaces back byte-for-byte (each source restored from its own copy; each reservation un-claimed
+  via the new `ImmixSpace::release_words`/`release_lines`) and reports `PromoteOutcome::WouldNotFit` — no
+  marker, no rewritten root, no counter advanced; `collect` escalates to a fullsweep, `grow_major` rebuilds
+  a fresh fragmentation-free region.
+- **Area:** `erts_rust/crates/beam_engine` (`src/jit/cache/key.rs`, `src/jit/baseline/**`) — **durable fix**
+- **Change:** the compiled-block cache was keyed on a module identity that did not include the **atom
+  table**, so a JIT block compiled in one in-process runtime could be served to a **second** runtime with a
+  different atom namespace — a silently-wrong result. The key is now the two-part
+  `CacheKey { module: ModuleKey, atoms: beam_term::AtomSnapshot }`, using the O(1) append-only atom witness
+  (`AtomSnapshot` invalidates on any newly interned name). Also: a **dirty-set spill store** pass (spill
+  stores 4 678 655 → **1 594 678**, −65.9 %, over a 103 008-function corpus; emitted bytes −6.32 %), a
+  **variable-length native frame**, and **live-in prologue fill** (emitted bytes 320 065 790 → 306 024 443;
+  prologue push/pop 7 167 996 → 2 707 930) — all three **honest negatives** on throughput, recorded as such.
+  The Cranelift tier was re-measured and **stays default-OFF** (only `list_walk` wins, 0.46×; the rest
+  1.09–3.07×). Also closed interpreter bit-string coverage: `-native` reads had returned a **wrong
+  big-endian value**.
+- **Area:** `erts_rust/crates/beam_io` (`src/drivers/inet/udp.rs`, `src/drivers/ram_file.rs`) — **new drivers**
+- **Change:** `udp_inet` and `ram_file_drv` are implemented and registered, so
+  `DriverRegistry::with_builtins()` now serves five names (previously three). `udp_inet` matches ≈80 % of
+  the oracle probe surface; `ram_file_drv` matches **77/77** reply encodings. `beam_rt`'s `erl_ddll` floor
+  now prepends the three static names (`{ok,[tcp_inet,udp_inet,ram_file_drv]}`) and gained the
+  `read_handle_info/1` file-server arm (`epp`'s `-moduledoc({file,…})` now works, live-oracle-cross-checked).
+- **Area:** `erts_rust/crates/beam_rt` (`src/context/{pump,calls,dispatch,nif}.rs`, `src/native/file_server.rs`) — **A.9**
+- **Change:** the in-process-compile sweep reached **86/86** and is now **byte-identical** to the oracle for
+  every artifact. The three blockers closed here: the pump deadline was smaller than the legitimate CPU cost
+  of a large compile (`BLOCKING_PUMP_DEADLINE` 60 s → 900 s — the cap was the whole "scheduled compile does
+  not finish" story); the loader/lowering literal-area and `bs_create_bin` narrow-segment-bignum bugs
+  (closed by `beam_engine`, `erl_tar.erl` now compiles byte-identically); and the `maps` iterator-protocol
+  acceptance (closed by `beam_bifs`, a shared `walk_map_or_iter` backing
+  `map/2`/`fold/3`/`filter/2`/`foreach/2`/`to_list/1` — the 13-module acceptance blocker). `code:load_binary/3`
+  is implemented clause-for-clause. `{primLoad,…}` boot seeding is now faithful to `init.erl`'s
+  `kernel_load_completed` flag, so `list_to_existing_atom("hello")` is `badarg` like the oracle's. Action
+  routes (`-eval`/`-s`/`-run`) now evaluate in a **spawned unregistered child**, matching the oracle.
+  Collateral defects found and fixed: a JIT cache poisoned across in-process runtimes (above) and a
+  **use-after-free** on `ProcessTable::remove` (the heap holding the returned `Eterm` was freed).
+  The `move_result_into_process_heap` copy-out is now a **single graph walk** via a fresh per-attempt
+  `OffHeapTable`, and the per-delivery relocation refusal is an **O(1) `ForeignLatch`**.
+- **Area:** `erts_rust/crates/beam_rt/src/eval` (`bits.rs`, `bits_decode.rs`, `bits_match.rs`) — **new modules**
+- **Change:** the `-eval` tree-walker's bit-string support was re-derived from scratch (the inherited gap
+  list was **incomplete and partly wrong** — a wide integer pattern yields a real bignum, not
+  `system_limit`), closing 7 defects and reaching **142/145** oracle agreement (the 3 remaining are oracle
+  syntax errors). Extracted into three new modules so the 3461-line walker does not grow further.
+- **Area:** `erts_rust/crates/beam_term` (`src/atom.rs`, `src/compare.rs`) — **data structure / allocation**
+- **Change:** `AtomTable::intern` allocated twice per new name (`String` + `Arc`); it is now one `Arc<str>`
+  shared by both containers — `seed(3000)` **6022 → 3002** allocations, one per name. `cmp_maps` no longer
+  double-sorts (2 allocs/1024 B → **0/0**), and `write_map` is 2/1280 B → 1/512 B. Two reported fidelity
+  items (the 60-bit ref-id slot; the `NEW_FUN_EXT` encode stub) were investigated and proven **not genuine
+  defects**.
+- **Area:** `erts_rust/crates/beam_ets` (`src/table/ownership.rs`) — **ETS ownership transfer**
+- **Change:** `ets:give_away/3` now **reads `args[2]` and delivers `{'ETS-TRANSFER', Tid, FromPid, GiftData}`**
+  (a new `Transfer{to,from,data}`), driven by `beam_bifs/src/ets/adopt.rs`. `ordered_set` navigation was
+  extended to a 60-slot op space (1800 compared steps, **divergence 0**), and the already-correct
+  access/ownership enforcement and per-object reclamation were re-verified with counters.
+- **Area:** `erts_rust/crates/beam_bifs` (`src/ets/self_hook.rs`) — **correctness**
+- **Change:** the `self/0` **match-spec hook had zero callers**, so a `self/0` body silently returned
+  `'EXIT'` and a `self/0` guard silently skipped its clause — a wrong result reachable from **every**
+  spec-running BIF. `SpecEval::install(pid)` is now wired at 12 sites. Also: `ets:match_spec_compile([])` is
+  now `badarg`; `binary_to_term` is no longer Θ(atom-table) (a witness-guarded memo, **0 comparisons** in
+  steady state, 9.3× faster).
+- **Area:** `erts_rust/tools/differential`
+- **Change:** corpus 2737 → **2967** cases (the `m14` additions: the `{minor_version,N}`/tag-set effects, the
+  `term_to_binary/2` option matrix, the `binary_to_term/1,2` inverse, the remaining `DOP_*` control tags, the
+  `udp/*`+`ram_file/*` driver shapes, the `bits/` group, the `epp`/`-moduledoc` case, the A.6 flag cases, the
+  A.5 `ATOM_INTERNAL_REF2/3` tags). The `system_info/emu_type` case no longer pins an oracle-only literal
+  (it braces `[opt, debug]` plus the `debug_compiled` invariant, so a debug-only tree cannot red CI). New:
+  `differential merge --from <dir> --gaps GAPS.md` regenerates the tracked `GAPS.md` in seconds.
+- **Area:** `erts_rust/crates/beam_message`
+- **Change:** the copy boundary was established with deterministic counters: `copy_struct` is **already
+  single-traversal** on the real send path (the whole `send` allocates 2 blocks / 192 B; the copy+send share
+  of `send_recv_plain` is ≈0.4 %). An allocation-free work-stack was implemented, measured to **regress**,
+  and **reverted** (recorded in `PERF.md` §6). A reported constant 25 ms sleep was investigated and
+  **partly refuted**; the residual was hardened in `beam_rt` (`TimerWait::AtMostWhenIdle`, 0 `nanosleep`
+  calls after the fix).
+- **Area:** `erts_rust/tools/bench`
+- **Change:** loop counts recalibrated (`list_walk` 1 000 → 50 000, `etf_roundtrip` 5 000 → 40 000, …) so
+  every marginal stands clear of the runtime's own boot jitter: **43/43 repeated runs resolved**, no
+  `marginal below timer resolution`. Record `m14` (`RESULTS.md`, `results/m14-*`) supersedes `m12`.
+- **Still escalated (owned by other nodes):** the legacy C tree under `../erts/` remains (the differential
+  oracle + `FLAVOR=emu` fallback) and is removed only as Rust parity is proven per file
+  (`../erts/emulator/beam/CONTEXT.md`); a full **self-hosted build** (the runtime compiling/running itself)
+  is still not achieved, though 86/86 stdlib sources now compile in-process byte-identically.
+
 ## 2026-10-15 — Milestone 13: the per-slice Θ(N³) registration and the constant 25 ms round latency, collection-debt admission, the self-hosted boot script, a widened baseline-JIT inline set, and the Cranelift verdict
 Scope: the milestone that fixed the two defects M12 root-caused (learning from `CHANGE.md`'s own M12 entry)
 and then pushed on the execution engine. The headline **algorithmic/data-structure** changes are (a) the
@@ -30,8 +134,6 @@ undrained signal, and (c) heap admission can now see the collector's **collectio
 - **Change:** two more target projects now measure — `khepri` (via the version-ranked Nix-store `rebar3` resolution: `eunit` 77.6 s) and `Programming-Language-Benchmarks` (via the version-aware `dotnet` 9.0.318 resolution: p50 595 ms) — and `emqx`'s skip is now **proven** rather than assumed (its `:ezstd` NIF build needs pre-OTP-29 idioms *plus* host `automake`/`libtool`/`krb5` that the sandbox lacks; the one-line patch is recorded but deliberately not applied). The m12 record (`results/m12-*`, `RESULTS.md`) carries the corrected `foreign` band (**48.0×–76.9×**, was 60.2×–367.1×), both-sides ratio labelling with `/proc/loadavg`, and the exhaustion note for the two OPEN defects above.
 - **Area:** `erts_rust/crates/beam_ets` (`ordered_set` evidence)
 - **Change:** the K-ary B+-tree interior's evidence suite was completed. The randomized oracle differential now drives the full `ordered_set` op surface over a **55-slot** op space (adding `update_counter`, `update_element`, `foldr`, `lookup_element/3,4`) on a 73-term mixed-type key pool for 3 seeds × 600 steps (1800 compared steps, **zero divergence**), and asserts its own peak live-key count crosses `ORDER = 32` so a future op-mix change cannot silently stop exercising splits and merge churn. The interior benchmark gained a key-**order** dimension (`BEAM_ETS_BENCH_ORDER`), because one order measures the old sorted `Vec`'s best case (ascending insert) and its worst case (ascending delete) but never both. Recorded in that crate's `PERF.md` §3: at n = 1e5 the sorted `Vec` was 7.3–97.5× slower inserting and 21.5–119.7× slower deleting, at 16.4–21.0 vs the tree's 20.1–42.6 bytes/entry.
-- **Escalated, still open (owned by other nodes):** (1) **literal tagging in the loader** — `beam_loader`'s literal decode never calls `beam_term::literal::set_literal_tag`, so an untagged module-literal root makes `root_is_unscanned` decline and the copy-bound `ets_copy` loop still cannot collect (byte-for-byte what C's `move_literal_entries` does, zero runtime cost); it also removes a shared-literal corruption hazard. (2) a **permanent float pin** at `beam_rt/src/runner/run.rs` (`fr_mark() > 0` ⇒ `pin_process` for the engine's whole lifetime) so a float-operation loop never collects — the pin should be per-slice.
-
 ## 2026-10-15 — Milestone 12: boot-script completion via synthesized callee-head stacktrace items, atom ordering by name, and O(1) atom-table/term-copy hot paths
 Scope: the milestone that **completes the `bootstrap/bin/start` boot chain** (all 22 directives drive to
 `{progress,started}`; `-boot` exits 0 with empty stdout/stderr) and then removes the remaining

@@ -132,20 +132,18 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=2737 agree=2736 mismatch=0 unsupported=1
-  skipped=0` → `gate.sh` exits 0. `gate.sh` is authoritative — re-run it for the live
-  per-contract split. **No case disagrees**; the single recorded capability gap (the `known-gaps.txt`
-  ratchet allowlist) is `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's
-  closure identity needs `erl_eval`/`erl_scan`/`erl_parse`). The A.9
-  `boot_extra/init_script_id_names_the_running_otp_release` case now **agrees** (the default CLI route
-  drives this runtime's *own* release's `bootstrap/bin/start.boot`, so `init:script_id/0` and
-  `system_info(otp_release)` are both `"30"`), as do the two `selfhost/*` in-process-compile cases.
+- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=2967 agree=2966 mismatch=0
+  unsupported=1 skipped=0`** → `gate.sh` exits 0. **No case disagrees.** The single recorded
+  capability gap (`known-gaps.txt`, the ratchet allowlist) is `wire/new_fun_ext_encode` (A.5, an
+  `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`). `gate.sh` is
+  authoritative for the live per-contract split; it always passes `--strict` and defaults its
+  allowlist to `tools/differential/known-gaps.txt`.
   Caveat: the A.4 case `driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail` exposes an
-  **oracle-side crash flake** (the system `erl` dies by signal on ~2 of 5 solo runs, exit-0 stdout
-  correct otherwise) — it is a corpus-harness defect, not a runtime divergence. The full sweep is also
-  time-boxed: a serial `gate.sh` run boots every CLI case (~2.5 s each, >100 min), so the gate-equivalent
-  per-case route is `differential run <case-id>` at 16-way parallelism (`compare.rs::verdict_with`
-  folds the oracle-vs-golden drift check into every verdict).
+  **oracle-side crash flake** (the system `erl` dies by signal on ~2 of 5 solo runs; the Rust side is
+  correct) — an OTP 29.1.1 upstream defect, a corpus-harness issue, not a runtime divergence.
+  The full sweep is time-boxed: a serial `gate.sh` boots every CLI case (~2.5 s each, >100 min), so
+  the gate-equivalent route is `differential run <case-id>` at 16-way parallelism
+  (`compare.rs::verdict_with` folds the oracle-vs-golden drift check into every verdict).
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 648
   keys = 556 declared + 92 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
   `MemoryHook::memory`, …): **346 are served in-crate** and **210 are seam-backed** (a typed
@@ -154,23 +152,25 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   cannot drift again.
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
   in `tools/bench/results/`, newest = `m12-*`) — read it there rather than duplicating numbers. Current
-  state (m12, Rust default baseline-JIT tier vs system ERTS 29.1.1/erts-17.1, both sides named in
-  `RESULTS.md`): startup 109 ms (sys) vs **≈ 0.55 s** (rust — the whole-process wall that now boots a
-  script on every CLI action; boot-time fixed waits were removed, `strace -c -f` shows 0
-  `clock_nanosleep`), VM memory **2.28× lower**, `foreign` **48.0×–76.9×** (the Θ(N³) per-slice off-heap
-  re-registration regression is **fixed** — the `foreign` curve is now flat and matches the M10 baseline,
-  where M11 published 60.2×–367.1×), `gc_bound churn` **24.3×**, `copy_bound` **11.1×–…** (the wide
-  `send_recv` figure is the `PORT_POLL_SLICE` defect below, now fixed), `etf_roundtrip` **≈ 15×**.
-  Measurable target projects: `cowboy` **165 489 req/s**, `elixir` compiler **4.4 files/s**, `erlc`
-  **8.8 files/s**, `khepri` (`rebar3 eunit` 77.6 s) and `plb` (dotnet, p50 595 ms) now run;
-  `emqx` skips honestly (its `:ezstd` NIF build needs OTP <30 idioms plus host `automake`/`libtool`/`krb5`).
-  Two performance mechanisms were root-caused and fixed this milestone: the Θ(N³) per-slice
-  registration loop (`crates/beam_rt/src/runner/run.rs` + an O(1) `owned_binary_slot` index), and the
-  ≈ 25 ms `PORT_POLL_SLICE` sleep per blocked scheduler round (an armed-but-idle `os:set_signal/2`
-  self-pipe kept `has_nothing_to_poll()` permanently false — now a non-destructive zero-timeout probe,
-  worth **386×** on `send_recv`). The remaining loop-workload RSS growth is the copy-bound `ets_copy`
-  case: an untagged module-literal root makes the collector decline — the fix is the loader's
-  literal-tagging step (`crates/beam_loader/src/literal.rs`, escalated, see `CHANGE.md`).
+- **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
+  in `tools/bench/results/`, newest = `m14-*`) — read it there rather than duplicating numbers. The
+  current record is **m14** and names both sides (sys = OTP 29.1.1/erts-17.1; rust = `beam_rt` at its
+  default baseline-JIT tier). Headline rust/sys ratios: `list_walk` **5.3×**, `gc_bound churn`
+  **30.4×**, `ets_copy` **27.4×**, `send_recv` **105.4×**, `send_recv_plain` **111.9×**,
+  `etf_roundtrip` **136.3×** (a measurement artifact — the fair ratio is ≈65–75×), `foreign`
+  **54.5×–79.6×**, `slice` ≈**2.11×**; `erlang:memory(total)` is **2.48× lower** on rust.
+  Measurable target projects: `cowboy` **30 690 req/s** (p99 3.41 ms), `elixir` compiler
+  **1.825 files/s**, `erlc` **6.038 files/s**, `khepri` (`rebar3 eunit` 97.5 s) and `plb` (dotnet 9
+  via the driver's version-aware scan, wall 113.9 s) now run; `emqx` skips honestly
+  (`skipped(emqx-requires-otp-28)` — the checkout pins OTP 28, the host is OTP 29.1.1). Load is
+  recorded before/after every run: **the host is shared and was heavily loaded** in m14, so read the
+  ratios and the deterministic `case_*_ops/calls/elements` counters, never the absolute wall times.
+  `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 directives) **through the final
+  `{progress,started}` (index 21)** — `beam_rt -noshell -boot bootstrap/bin/start` exits **0** with
+  empty stdout/stderr. (Probe form: `-boot bootstrap/bin/start`; appending `.boot` doubles the
+  suffix.) The kernel directive succeeds because the engine synthesizes the innermost `undef`
+  stacktrace item (`{Module,Function,ArgList,Loc}`) that `logger_server:call_h/4` matches on — the
+  head item rides the raise's own raw-trace word (rooted and relocated by every collection) with two
 - **Contract A.9 (build/bootstrapping) — boot COMPLETES; no self-hosted build yet.** `beam_rt`
   loads the 22 preloaded modules on startup, and its boot-script executor drives the real
   `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 directives) **through the final
@@ -191,47 +191,37 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `code:*`/`init:*`/`application:*` queries are served by a native floor
   (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
   `crates/CONTEXT.md` (A.9 status) and `crates/beam_rt/src/boot/CONTEXT.md`.
-- **A.9 — in-process compilation WORKS on the no-spawn route; a scheduled-process compile does not
-  yet, and there is still no self-hosted build.**
-  The native `file_server_2` (`crates/beam_rt/src/native/file_server.rs`) now serves the
-  `{write_file,…}` / write-mode `{open,…}` / device `getopts`/`{setopts,…}` requests, and the `compiler`
-  ebin is on the default code path (`crates/beam_rt/src/codeserver.rs` `EXTRA_CODE_PATH_APPS`). The A.9
-  E0 route — `compile:file(F,[no_spawn_compiler_process,deterministic,{outdir,Dir}])` — therefore runs
-  **in-process** in the calling (pumping) process and produces a `.beam` byte-identical to the oracle's
-  identical-option run (two `+deterministic` compilations of one source are byte-identical: the
-  path-bearing `CInf`/`Line` fields are stripped and the `Code` chunk matches). OTP's default
-  `compile:file/2` path reaches only `kernel` + `stdlib` (`epp` as an io-device-only client,
-  `erl_features`, `erl_scan`/`erl_parse`/`erl_lint`/`erl_expand_records`, the `v3_core` → `beam_*`
-  passes, and `save_binary`'s file writes) — not `logger`/`error_logger`, a live `code_server`,
-  `open_port`, `crypto`/`zlib`/`beam_lib`/`ets`/`persistent_term`/`re`, or `syntax_tools`. What remains is
-  fidelity: both `selfhost/*` corpus cases (`selfhost/in_process_compile_file_no_spawn_deterministic`,
-  which drives the compile as a scheduled `run` process, and `selfhost/scheduled_process_compile_file_deterministic`,
-  the default `compile:file/2` shape) now **agree** with the oracle. The engine call seams
-  this needed (`call_ext`-encoded `erlang:apply/3`, `call_fun`/`call_fun2` for a scheduled process,
-  `resolve_local_fun`) are all closed, and the bitstring-match operand-order bug (`bs_get_binary2`/
-  `bs_get_integer2`/`bs_get_float2` writing `Dst` before committing the match context when `dst == ctx`)
-  is fixed. **No self-hosted build** yet (the runtime does not compile/run itself).
-- **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
-  default-OFF and not on `beam_rt`'s path — the native baseline tier is the default for every process
-  entry, compiled lazily per function, with `BEAM_RT_TIER=interpreter` the only kill switch); full
-  match-spec compiler; ETS concurrency; `put_record/6`'s create form for a **foreign** module's record
-  id (the running module's own records are supported); several structured-raise-reason degradations;
-  depth of live distribution interop. All return typed errors, never wrong results.
-
-## Future workstreams
+- **A.9 — in-process compilation: 86/86 stdlib sources, `.beam` byte-identical to the oracle's.**
+  Every `lib/stdlib/src/*.erl` that the oracle itself can compile in-process now compiles in-process
+  here and produces a **byte-identical** `.beam` (the `Code` chunk md5 equals the oracle's for every
+  artifact). The route is OTP's default `compile:file/2` shape. The last two blockers were fixed: the
+  `maps` iterator-protocol acceptance (a shared `walk_map_or_iter` now backs
+  `map/2`/`fold/3`/`filter/2`/`foreach/2`/`to_list/1`), and the `bs_create_bin`
+  bignum-into-narrow-segment write (`erl_tar.erl` now compiles byte-identically). The pump deadline
+  that previously truncated long compiles was raised to the legitimate CPU cost
+  (`BLOCKING_PUMP_DEADLINE` 60 s → 900 s). Two native floors make the route work: the native
+  `file_server_2` (`crates/beam_rt/src/native/file_server.rs`, incl. `read_handle_info/1` and the
+  `{write_file,…}`/write-mode-`{open,…}`/`getopts` requests, which is what `epp`'s
+  `-moduledoc({file,…})` needs), and `code:load_binary/3`. The 10 remaining stdlib sources `-include`
+  a header outside their own directory and fail on the oracle too. **No self-hosted build** (the
+  runtime still does not compile/run *itself*).
 - **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
   (`../lib/compiler`), per Part II §E/§H. Language-agnostic (Erlang/Elixir/LFE). Not part of the Rust
   runtime rewrite; the Rust runtime must ultimately run the compiler (contract A.9, self-hosted build)
   — that is future work.
 - **Stage 4 adoption:** the copying collector IS driven by `beam_rt` at the engine heap-admission
   point (`beam_rt/src/context/gc.rs`), conservatively gated (a process is pinned once a live float
-  register is seen, halted on a collection error, and a global valve disables collection once an escaped
-  runtime store holds an off-heap term). `beam_process::Process` holds the strategy-agnostic
-  `AnyCollector` (not a concrete `Collector`), so the mature generation is whichever strategy the policy's
-  configuration resolved to — the copying default, or GenImmix above the `IMMIX_BREAK_EVEN_WORDS`
-  auto-selection rule (`beam_gc/MEASURED.md`). The production fragment model is `beam_message`'s;
-  `beam_gc::OffHeap` is the MSO slot store and its `sweep` is slot-stable.
-- **Stage 6 (Level-2 clean-room VM):** new ISA + full toolchain — research track with an explicit exit
+- **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
+  default-OFF and not on `beam_rt`'s path — the native baseline tier is the default for every process
+  entry, compiled lazily per function, with `BEAM_RT_TIER=interpreter` the only kill switch); the
+  match-spec compiler beyond the core spec forms; `put_record/6`'s create form for a **foreign**
+  module's record id (the running module's own records are supported); several
+  structured-raise-reason degradations; depth of live distribution interop. All return typed errors,
+  never wrong results.
+- **Registered built-in drivers:** `DriverRegistry::with_builtins()` registers five names —
+  `tcp_inet`, `udp_inet`, `ram_file_drv`, plus two further in-tree drivers
+  (`crates/beam_io/src/drivers/`). `udp_inet` matches ≈80 % of the oracle's option/reply surface;
+  `ram_file_drv` matches 77/77 reply encodings.
   criterion (Part II §H).
 - **Legacy-C removal:** delete the corresponding C under `../erts/` module-by-module as each Rust crate
   reaches differential parity. Every surviving `.c` is referenced by an explicit object list in a build

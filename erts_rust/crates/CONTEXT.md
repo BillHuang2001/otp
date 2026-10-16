@@ -260,7 +260,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   (root-owned) — it boots the script per case, so an end-to-end `gate.sh` run now takes >100 min single-threaded; a full-corpus
   sweep of `differential run <case-id>` is gate-equivalent per case because every `run` verdict already folds in
   the oracle-vs-golden drift check (`tools/differential/src/compare.rs::verdict_with`).
-  **Gate status (full 2737-case sweep): agree=2736, mismatch=0, unsupported=1, skipped=0 — `gate.sh`
+  **Gate status (full 2967-case sweep): agree=2966, mismatch=0, unsupported=1, skipped=0 — `gate.sh`
   exits 0.** `unsupported` is exactly the single capability gap recorded in `known-gaps.txt`:
   `wire/new_fun_ext_encode` (A.5, unclosable by design — see below). One A.4 case
   (`driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail`) has an **oracle-side crash flake**
@@ -385,8 +385,15 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   tuple/list building. `term_to_binary`/`binary_to_term`/`make_ref` remain defaulted `None` in `NifHostImpl`.
 
 ## Contract A.9 (build/bootstrapping) — status
-A.9 is the shallowest contract: its only differential coverage is boot/version **observability** — there
-is **no self-hosted build** (the Rust runtime does not compile and run itself).
+A.9 is the shallowest contract: its differential coverage is boot/version **observability** plus the
+in-process compiler route.
+- **In-process compilation — 86/86 stdlib sources, `.beam` byte-identical to the oracle's.** Every
+  `lib/stdlib/src/*.erl` the oracle can itself compile in-process now compiles here through the
+  runtime's native floors and produces the oracle's bytes (the `Code` chunk md5 matches for every
+  artifact); the 10 sources that `-include` a header outside their own directory fail on the oracle
+  too. The sweep is `beam_rt/src/context/pump.rs`'s `#[ignore]`d
+  `every_stdlib_source_compiles_in_process_like_the_oracle`. There is still **no self-hosted build**
+  (the Rust runtime does not compile and run itself).
 - **Boot path — completes.** `beam_rt`'s boot (`src/boot/`, the boot node: `beam_rt/src/boot/CONTEXT.md`)
   reads and executes the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to
   completion**, ending at the final `{progress,started}` (index 21): `beam_rt -noshell -boot
