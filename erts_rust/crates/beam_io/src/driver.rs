@@ -491,16 +491,21 @@ impl DriverRegistry {
 
     /// A registry pre-populated with this crate's built-in drivers.
     ///
-    /// Milestone-1 registers three built-ins: `"fd"` ([`crate::drivers::FdDriver`], a byte-stream
+    /// Milestone-1 registers five built-ins: `"fd"` ([`crate::drivers::FdDriver`], a byte-stream
     /// driver over a pipe/fd), `"efile"` ([`crate::drivers::EfileDriver`], the file driver —
-    /// an `FdDriver` plus the `efile` control family), and `"tcp_inet"`
+    /// an `FdDriver` plus the `efile` control family), `"tcp_inet"`
     /// ([`crate::drivers::TcpInetDriver`], the TCP socket driver — the name the oracle reports
-    /// from `port_info(Port, name)` for a TCP port and the name `prim_inet` opens).
+    /// from `port_info(Port, name)` for a TCP port and the name `prim_inet` opens), `"udp_inet"`
+    /// ([`crate::drivers::UdpInetDriver`], the UDP datagram socket driver — the name the oracle
+    /// reports for a `gen_udp` socket), and `"ram_file_drv"`
+    /// ([`crate::drivers::RamFileDriver`], the in-memory file driver `ram_file.erl` talks to).
     pub fn with_builtins() -> DriverRegistry {
         let mut registry = DriverRegistry::new();
         registry.register("fd", make_fd);
         registry.register("efile", crate::drivers::make_efile);
         registry.register("tcp_inet", crate::drivers::make_tcp_inet);
+        registry.register("udp_inet", crate::drivers::make_udp_inet);
+        registry.register("ram_file_drv", crate::drivers::make_ram_file);
         registry
     }
 
@@ -572,7 +577,12 @@ mod tests {
         assert!(registry.contains("fd"));
         assert!(registry.contains("efile"));
         assert!(registry.contains("tcp_inet"));
-        assert_eq!(registry.names(), vec!["efile", "fd", "tcp_inet"]);
+        assert!(registry.contains("udp_inet"));
+        assert!(registry.contains("ram_file_drv"));
+        assert_eq!(
+            registry.names(),
+            vec!["efile", "fd", "ram_file_drv", "tcp_inet", "udp_inet"]
+        );
 
         let driver = registry.create("fd").expect("the fd driver exists");
         assert_eq!(driver.name(), "fd");
@@ -583,6 +593,14 @@ mod tests {
             .create("tcp_inet")
             .expect("the tcp_inet driver exists");
         assert_eq!(inet.name(), "tcp_inet");
+        let udp = registry
+            .create("udp_inet")
+            .expect("the udp_inet driver exists");
+        assert_eq!(udp.name(), "udp_inet");
+        let ram_file = registry
+            .create("ram_file_drv")
+            .expect("the ram_file_drv driver exists");
+        assert_eq!(ram_file.name(), "ram_file_drv");
         assert!(matches!(registry.create("nope"), Err(BeamError::BadArg)));
     }
 
