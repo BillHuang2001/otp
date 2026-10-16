@@ -158,3 +158,54 @@ instrument the `{SR}` case to time `term_to_binary`/`binary_to_term` separately 
 round-trip so the `beam_codec` and `beam_process`/`beam_rt` shares can be split. A `beam_process`
 micro-benchmark mirroring `tests/send_perf.rs` (a payload sent to a second process and back, without
 the ETF round-trip) would isolate the delivery/scheduler cost from this crate's copy cost.
+
+## 6. Measured and reverted: the allocation-free fix-up work-stack
+
+The copy path's worklist is the per-call `Vec<Fixup>` in `src/copy.rs`. An allocation-free replacement
+— a `WorkStack` (`[MaybeUninit<Fixup>; WORK_INLINE = 32]` inline + a `Vec` spill, one `push`/`pop`
+compare on the inline half) — was implemented, measured, and **reverted**: it removed the worklist's
+heap allocations (counted deterministically: the copy path went from 2 allocation events per
+`copy_struct` on every standard shape — 4 on the 64-key HAMT — to **0**), but it measured *slower* on
+the crate's own list-shaped copies, and no cheap variant of it removed that.
+
+**Controlled A/B.** Two pre-built test binaries per side, one process at a time, `taskset -c 3` pinned
+(this host is heterogeneous: cpu0–3 are 4.7 GHz P-cores, cpu4–15 are 3.3–3.7 GHz E-cores, so
+unpinned runs land on different core types — that is what made the first readings look noisy).
+Sides: `base` = the `Vec<Fixup>` worklist (predecessor of the work-stack commit); `#[cold]` = the
+merged `WorkStack` with `#[cold]` spill arms; `ship` = the same with the `#[cold]` attributes dropped;
+`w1` / `w3` = `WORK_INLINE = 8` / an initialised inline array. Dev profile (`opt-level = 1`, the
+profile `tests/perf.rs` runs under), 5 rotated rounds per side, `--test-threads=1`,
+`/proc/loadavg` 11.96–13.14 throughout, `best_ns` (mean of the 5 rounds; the per-round values do not
+overlap between `base` and any `WorkStack` side):
+
+| shape (test) | `base` | `ship` | `#[cold]` | `w1` (cap 8) | `w3` (init arr) |
+|---|---|---|---|---|---|
+| deep list, 2000 cons cells (`perf`) | **10 919** | 13 676 | 23 226 | 13 596 | 13 540 |
+| HAMT map, 64 keys (`perf`) | **877** | 977 | — | 1 039 | 970 |
+| flat map, 8 keys (`perf`) | **83.2** | 86.8 | — | 87.2 | 96.2 |
+| small tuple, 4 words (`perf`) | **25.4** | 27.8 | — | 25.8 | 41.2 |
+| 10-int list (`send_perf`) | **98.6** | 104.4 | — | 103.8 | 119.2 |
+| HAMT map, 64 keys (`send_perf`) | **890** | 949 | — | 988 | 957 |
+| send_recv payload (`send_perf`) | **304** | 312 | — | 310 | 318 |
+| 8 × 32-byte binaries (`send_perf`) | 240 | **208** | — | 210 | 213 |
+| 64-key HAMT, first allocating arity | 32/33 boundary | 32/33 | 32/33 | 8/9 | 32/33 |
+
+The deep-list regression is **real and reproducible in this profile** (`base` 10 619–11 371 over the 5
+rounds vs `ship` 13 327–14 299, plus a separate 15-round unpinned `base`-vs-`#[cold]` run at 10.4–17.0 µs
+vs 20.3–24.6 µs): ≈ **+25 %** on the deep list, ≈ +11 % on the 64-key HAMT, ≈ +1–6 % on the rest, with
+only the `8 × 32-byte binaries` shape faster (−13 %). It is a **dev-codegen** effect, not algorithmic:
+the shape takes the **single-pass `try_copy_fast`** path (empty off-heap table — `Path::SinglePass` in
+`tests/perf.rs`), so no preflight/sizing walk is involved; with `#[cold]` the inlined `pop` round-trips
+the popped fix-up through a stack slot, and dropping it restores the register form but leaves the
+residual. `w1` (a 128 B frame instead of 512 B) and `w3` do not help either, and `w3` additionally
+regresses the small-tuple and flat-map shapes — so the residual is not frame size and not the
+`MaybeUninit` initialisation.
+
+At `--release` (`opt-level = 3`, `lto = "thin"`) the picture inverts: the deep list is a wash against
+`base`, and the real message payloads are faster with the work-stack (`HAMT` and `send_recv` payload
+−14 % to −22 %, `8 × 32-byte binaries` −15 %; those runs were taken at a higher `loadavg`, 34–58, so
+treat the magnitudes as indicative). A future pass that wants the allocation-free worklist must
+therefore justify it against **that** profile (where the crate ships) with release-profile evidence,
+not against the dev-profile figures this file records — and must keep the `Vec<Fixup>` baseline in the
+same A/B. Until then the `Vec<Fixup>` worklist ships: it is non-regressive in every measured shape and
+profile except the release payloads above, and this crate's benchmarked numbers are the dev ones.
