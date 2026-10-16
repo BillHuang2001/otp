@@ -68,7 +68,7 @@ use crate::boot::bootscript::{self, BootScript, BootStop};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{strategy_env_default, ArgTerm, InitArgs, RuntimeConfig};
-use crate::context::gc_walk::RuntimeCollectionGate;
+use crate::context::gc_walk::{ForeignLatch, RuntimeCollectionGate};
 use crate::context::{PersistentTermStore, RuntimeContext};
 use crate::dist::{resolve_cookie, DistNode, NONODE_NAME};
 use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
@@ -696,7 +696,14 @@ impl Runtime {
         // would move a heap the valve must refuse — the hole the A.9 `selfhost/*` corruption
         // went through. The gate is a *table* field, so it travels with the table into every
         // scheduler pass and covers every process the table holds.
-        processes.set_collection_gate(Box::new(RuntimeCollectionGate::new()));
+        //
+        // The gate and `GcState` observe the **same** per-pid descent latch cell: the gate
+        // holds a clone of `foreign_latch` and `GcState` takes the other clone
+        // (`GcState::with_latch`), so `Runtime::note_foreign_reachable` opens the very bit the
+        // gate reads. A signal site therefore decides in `O(1)` while the pid's bit is clear
+        // and descends only when it is open.
+        let foreign_latch = ForeignLatch::default();
+        processes.set_collection_gate(Box::new(RuntimeCollectionGate::from(foreign_latch.clone())));
         // The ETS owner-death index and the observer that fills it: a process death records the
         // pid here and nothing else, and the runtime drains the obligations at a scheduler
         // boundary where the ETS registry is free (see [`crate::runtime::ets_owner`]). The
@@ -854,7 +861,7 @@ impl Runtime {
             scheduler: Scheduler::new(),
             runner_state: RunnerState::default(),
             arena: MinimalContext::new(),
-            gc: GcState::new(),
+            gc: GcState::with_latch(foreign_latch),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
             eval_off_heap: beam_message::OffHeapTable::new(),
@@ -2848,6 +2855,25 @@ mod tests {
 
     fn runtime() -> Runtime {
         Runtime::with_defaults().expect("the default runtime")
+    }
+
+    /// `foreign_latch()` hands out the **very** cell `note_foreign_reachable` opens — the one the
+    /// installed `RuntimeCollectionGate` reads — so a signal site's decision and an admission
+    /// point's decision can never disagree about a pid's bit.
+    #[test]
+    fn the_latch_accessor_returns_the_cell_note_foreign_reachable_opens() {
+        let mut rt = runtime();
+        let cell = rt.foreign_latch();
+        assert!(
+            cell.borrow().is_empty(),
+            "a fresh runtime's descent latch is clear"
+        );
+        let pid = rt.self_pid();
+        rt.note_foreign_reachable(pid);
+        assert!(
+            cell.borrow().contains(&pid),
+            "foreign_latch() is the very cell note_foreign_reachable opens"
+        );
     }
 
     #[test]

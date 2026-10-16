@@ -44,15 +44,15 @@
 //!
 //! # The observed answers (the oracle's own shapes)
 //!
-//! * `erl_ddll:loaded_drivers/0` ⇒ `{ok, [Name, …]}`, each name a charlist, in load order;
+//! * `erl_ddll:loaded_drivers/0` ⇒ `{ok, [Name, …]}`, each name a charlist: the three statically
+//!   linked built-ins (`tcp_inet`/`udp_inet`/`ram_file_drv`) first, then the dynamically loaded names
+//!   in load order;
 //! * `erl_ddll:try_load/3` ⇒ `{ok, loaded}` then `{ok, already_loaded}`;
 //! * `erl_ddll:info/2` ⇒ the item value of a **listed** name, `badarg` for an unknown name or item;
 //! * `erl_ddll:try_unload/2` ⇒ `ok`, then `{error, not_loaded}`.
 //!
 //! # Documented divergences (asserted, not closed)
 //!
-//! * a fresh `loaded_drivers/0` is `{ok, []}` here, where the oracle lists its statically linked
-//!   `tcp_inet`/`udp_inet`/`ram_file_drv` (the runtime links no built-in drivers);
 //! * `open_port({spawn_driver, Name}, …)` for an **unloaded** name auto-`dlopen`s here (a
 //!   `/`-containing name is the object path, the driver name being its file stem), where the oracle
 //!   answers `badarg` for a name it has not loaded — which is exactly what makes direction (ii)
@@ -434,6 +434,19 @@ fn loaded_names(runtime: &mut Runtime) -> Vec<String> {
         .collect()
 }
 
+/// The three statically linked built-in drivers every `loaded_drivers/0` answer starts with,
+/// in the oracle's order (`erl_bif_ddll.c:728`; the C `driver_list` entries with `handle == NULL`).
+const STATIC_DRIVERS: [&str; 3] = ["tcp_inet", "udp_inet", "ram_file_drv"];
+
+/// `loaded_drivers/0`'s expected value: the three statics first, then `dynamic` in load order.
+fn expect_loaded(dynamic: &[&str]) -> Vec<String> {
+    STATIC_DRIVERS
+        .iter()
+        .chain(dynamic.iter())
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Direction (ii): a driver opened by a port is listed
 // ---------------------------------------------------------------------------------------------
@@ -442,12 +455,11 @@ fn loaded_names(runtime: &mut Runtime) -> Vec<String> {
 /// `driver_name` (the object's file stem) in the loaded-driver list `erl_ddll:loaded_drivers/0`
 /// reports — the name was never `try_load`ed, so before the unification the two views disagreed.
 ///
-/// Discriminates: a fresh list is `{ok, []}` here (asserted first), so the name appearing afterwards
-/// can only have come from the port's own `dlopen`.
+/// Discriminates: a fresh list is the three statically linked built-ins (asserted first), so the name
+/// appearing afterwards can only have come from the port's own `dlopen`.
 ///
-/// The oracle (OTP 29.1.1 / erts-17.1, measured) differs on both counts and the differences are
-/// asserted rather than closed: its fresh list is
-/// `{ok, ["tcp_inet","udp_inet","ram_file_drv"]}` (its statically linked drivers), and
+/// The oracle (OTP 29.1.1 / erts-17.1, measured) agrees on the fresh list — its three statically
+/// linked drivers `tcp_inet`/`udp_inet`/`ram_file_drv` — and differs on the open-name rule:
 /// `open_port({spawn_driver, "no_such_driver_xyz"}, [])` for a name it has not loaded is `badarg`
 /// (`io.c:599-628` looks the name up in its loaded list), where this runtime auto-`dlopen`s the path.
 #[test]
@@ -456,11 +468,11 @@ fn an_open_port_spawn_driver_is_listed_by_erl_ddll_loaded_drivers() {
         return;
     };
     let mut runtime = runtime();
-    // Divergence: the runtime links no built-in drivers, so a fresh list is empty (the oracle lists
-    // its statically linked `tcp_inet`/`udp_inet`/`ram_file_drv`).
-    assert!(
-        loaded_names(&mut runtime).is_empty(),
-        "a fresh loaded-driver list is empty here"
+    // A fresh list is the three statically linked built-ins, matching the oracle.
+    assert_eq!(
+        loaded_names(&mut runtime),
+        expect_loaded(&[]),
+        "a fresh loaded-driver list is the three statically linked built-ins"
     );
 
     // The **path form**: a `/`-containing name *is* the object path, and `driver_lookup` derives the
@@ -473,7 +485,7 @@ fn an_open_port_spawn_driver_is_listed_by_erl_ddll_loaded_drivers() {
 
     assert_eq!(
         loaded_names(&mut runtime),
-        vec![fixture.name.clone()],
+        expect_loaded(&[fixture.name.as_str()]),
         "the port-opened driver's declared driver_name is now listed"
     );
 
@@ -513,7 +525,7 @@ fn a_try_loaded_driver_is_listed_and_opens_by_name() {
 
     assert_eq!(
         loaded_names(&mut runtime),
-        vec![fixture.name.clone()],
+        expect_loaded(&[fixture.name.as_str()]),
         "the try_loaded name is listed exactly once"
     );
 
@@ -525,7 +537,7 @@ fn a_try_loaded_driver_is_listed_and_opens_by_name() {
     );
     assert_eq!(
         loaded_names(&mut runtime),
-        vec![fixture.name.clone()],
+        expect_loaded(&[fixture.name.as_str()]),
         "opening by name keeps the single recorded entry"
     );
 
@@ -607,14 +619,18 @@ fn try_unload_removes_the_name_and_a_repeat_is_not_loaded() {
     let mut runtime = runtime();
     let out = try_load(&mut runtime, &fixture.dir_path(), &fixture.name);
     assert_eq!(atom_text(&mut runtime, tuple_of(out, 2)[1]), "loaded");
-    assert_eq!(loaded_names(&mut runtime), vec![fixture.name.clone()]);
+    assert_eq!(
+        loaded_names(&mut runtime),
+        expect_loaded(&[fixture.name.as_str()])
+    );
 
     let name = charlist(&mut runtime, &fixture.name);
     let out = call(&mut runtime, "erl_ddll", "try_unload", &[name, NIL]).expect("an unload result");
     assert_eq!(atom_text(&mut runtime, out), "ok");
-    assert!(
-        loaded_names(&mut runtime).is_empty(),
-        "the unloaded name leaves the list"
+    assert_eq!(
+        loaded_names(&mut runtime),
+        expect_loaded(&[]),
+        "the unloaded name leaves the list, leaving only the three statics"
     );
 
     let name = charlist(&mut runtime, &fixture.name);
