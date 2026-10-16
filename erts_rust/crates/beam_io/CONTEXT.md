@@ -270,9 +270,10 @@ Current: **677 passing / 0 failing / 2 ignored** — **477** lib in-module (`#[c
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `src/drivers/binary_io.rs` → `Phase`, `PhaseChange`
 - `src/drivers/efile.rs` → `EfileDriver`, `make_efile`, `FileDataMode`
 - `src/drivers/spawn.rs` → `SpawnDriver`, `SpawnSpec`/`SpawnOptions`/`StreamOptions`/`SpawnStream`, `build_command`
-- `src/drivers/inet/` → the `tcp_inet` driver + `{packet, N}` framing (read + send paths) (child node `src/drivers/inet/CONTEXT.md`)
+- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers + `{packet, N}` framing (read + send paths) (child node `src/drivers/inet/CONTEXT.md`)
+- `src/drivers/ram_file.rs` → the `ram_file_drv` in-memory file driver (`RamFileDriver`/`make_ram_file`)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
-- `src/drivers/CONTEXT.md` → the built-in-drivers node doc (`fd`/`efile`/`spawn`/`tcp_inet` + the `{line,N}`/phase framing) (child node)
+- `src/drivers/CONTEXT.md` → the built-in-drivers node doc (`fd`/`efile`/`spawn`/`tcp_inet`/`udp_inet`/`ram_file_drv` + the `{line,N}`/phase framing) (child node)
 - `src/abi/` → the driver C-ABI host layer (child node `src/abi/CONTEXT.md`)
 - `src/io_device/` → the io-device request layer (`{get_until, Enc, Prompt, Mod, Func, XtraArgs}`): `IoDevice`/`Encoding`/`ByteSource`/`SliceSource`/`EmptySource` + the `Continuation` seam (`ContData`/`Applied`/`Leftover`/`NoEngineContinuation`)/`read_size`; sub-files `mod.rs`/`device.rs`/`encoding.rs`/`source.rs`/`continuation.rs`/`tests.rs`
 - `src/io_device/CONTEXT.md` → the io-device request-layer node doc (child node)
