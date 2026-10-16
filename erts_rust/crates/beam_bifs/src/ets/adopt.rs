@@ -64,7 +64,18 @@
 //! * **`ets:give_away/3`** — transfers ownership to a live, *different* pid and
 //!   returns `true`; `badarg` for a non-pid, a dead pid, the caller's own pid, a
 //!   non-owner caller, or a table argument that names no table (`ets_give_away_3`,
-//!   `erl_db.c:3092`). `ets:info(T, owner)` reports the new pid afterwards.
+//!   `erl_db.c:3092`). `ets:info(T, owner)` reports the new pid afterwards. The
+//!   third argument `GiftData` is **not discarded**: it is deep-copied into
+//!   table-owned storage through
+//!   [`TableAccess::give_away_with_gift`](beam_ets::TableAccess::give_away_with_gift)
+//!   (checked out, so it is no longer counted by `ets:info(T, memory)`; the copy
+//!   happens *before* the owner moves, so an uncopyable gift is the typed `badarg`
+//!   with the owner untouched), and the BIF then **delivers**
+//!   `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the new owner through this node's
+//!   [`SendHook`](crate::context::SendHook) — `Tid` the name atom of a
+//!   `named_table` (resolved from the registry, so a named table passed by its
+//!   handle reference still gets its name) else the handle reference, `FromPid` the
+//!   calling pid.
 //! * **`ets:foldl/3`** / **`ets:foldr/3`** — stdlib `ets.erl` functions (not
 //!   `bif.tab` entries). The argument order is `(Fun, Acc0, Tab)` and the
 //!   accumulator is the fun's **last** argument. The oracle walks *keys*
@@ -118,18 +129,26 @@
 //!   this scheduler's *fan-in reference* (`#Ref<…>`), an implementation-specific
 //!   value, not part of the documented API. (`internal_delete_all/2` and
 //!   `internal_select_delete/2` are implemented in [`super::extra`].)
+//! * **`ets:give_away/3` with no [`SendHook`](crate::context::SendHook)** — the
+//!   `{'ETS-TRANSFER', …}` delivery to the new owner is this BIF's obligation (see
+//!   [`give_away_3`]), so with no hook installed the call is the typed
+//!   `unsupported_bif` gap rather than a transfer with a silently dropped gift. The
+//!   check runs **before** the table is taken, so a missing hook never leaves a
+//!   half-done transfer. `beam_rt` installs the hook, so the runtime is exact.
 //!
 //! # Runtime handoffs (not this crate's to do)
 //!
-//! * **`{'ETS-TRANSFER', Tid, FromPid, GiftData}`** — the oracle's
-//!   `ets:give_away/3` and an **heir stepping in on the owner's death** both
-//!   **deliver** this message to the new owner (`send_ets_transfer_message`,
-//!   `erl_db.c:4943`). It is sent **only** when the heir was installed by the
-//!   arity-3 `{heir, Pid, Data}` form; an arity-2 `{heir, Pid}` heir inherits in
-//!   **silence**. This crate performs the observable ownership transfer and stores
-//!   the gift (`Heir::data`, the table-owned copy `Table::install_heir` made); the
-//!   delivery itself is a message-passing concern (`beam_rt`) and is deliberately
-//!   **not** fabricated here.
+//! * **An heir stepping in on the owner's death** — the oracle's
+//!   `send_ets_transfer_message` (`erl_db.c:4943`) delivers
+//!   `{'ETS-TRANSFER', Tid, FromPid, Data}` to the **heir** when the owner dies, and
+//!   **only** when the heir was installed by the arity-3 `{heir, Pid, Data}` form;
+//!   an arity-2 `{heir, Pid}` heir inherits in **silence**. This crate stores the
+//!   gift (`Heir::data`, the table-owned copy `Table::install_heir` made) and
+//!   performs the observable transfer; the *delivery* is a process-death
+//!   message-passing concern owned by `beam_rt`
+//!   (`beam_rt/src/runtime/ets_owner.rs`) and is deliberately **not** fabricated
+//!   here. The `ets:give_away/3` half of the same message **is** delivered by this
+//!   module (see [`give_away_3`]); only the owner-death half stays a handoff.
 //! * **Process liveness** — the C's `give_away`/`set_heir` resolve the target with
 //!   `erts_pid2proc`/`erts_proc_lookup`, so a dead pid is `badarg` for
 //!   `give_away/3` and clears the heir for `setopts/2`. Liveness is asked of the
@@ -377,24 +396,103 @@ fn parse_setopts(atoms: &AtomTable, options: Eterm) -> Result<(Option<HeirOpt>, 
 /// (`give_away` is an ownership operation, not a read/write one) — the write gate
 /// plus the owner check reproduce the C's `DB_WRITE` acquisition + owner test.
 ///
-/// The `{'ETS-TRANSFER', Tid, FromPid, GiftData}` delivery to the new owner is a
-/// runtime concern and is deliberately not fabricated here (see the module docs).
+/// # The gift and the `{'ETS-TRANSFER', …}` delivery
+///
+/// `GiftData` is handed to
+/// [`TableAccess::give_away_with_gift`](beam_ets::TableAccess::give_away_with_gift),
+/// which **deep-copies** it into table-owned storage (the A.1 copy boundary), checks
+/// it out (so it no longer counts toward `ets:info(T, memory)`) and only then moves
+/// the owner — a gift outside the store's copyable subset is its typed `badarg`
+/// with the owner untouched. The returned [`Transfer`](beam_ets::Transfer) is this
+/// BIF's obligation to deliver, so the delivery **happens here**: the
+/// `{'ETS-TRANSFER', Tid, FromPid, GiftData}` tuple is built on the caller's heap
+/// (`Tid` = the name atom of a `named_table`, else the table's handle reference —
+/// the same thing `ets:all/0` builds — and `FromPid` the calling pid) and sent to
+/// the target through this node's [`SendHook`](crate::context::SendHook).
+///
+/// With **no `SendHook` installed** the delivery cannot be made, so the call is the
+/// typed `unsupported_bif` gap — checked *before* the table is taken, so a missing
+/// hook never leaves a half-done ownership transfer. `beam_rt` installs a
+/// `SendHook`, so the real runtime path is exact.
 fn give_away_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve_handle(ctx, args[0])?;
-    let target = pid_arg(args[1])?;
+    let target = args[1];
+    let gift = args[2];
+    let target_pid = pid_arg(target)?;
     // The C resolves the target with `erts_pid2proc`, which is NULL for a dead
     // process; liveness is only answerable with a `ProcessHook` installed.
-    if pid_liveness(ctx, target)? == Some(false) {
+    if pid_liveness(ctx, target_pid)? == Some(false) {
         return Err(badarg());
+    }
+    // The delivery is this BIF's (see above), so without a `SendHook` the call is a
+    // typed capability gap — reported before the table is taken, so the transfer is
+    // never half-done.
+    if ctx.sender().is_none() {
+        return Err(unsupported_bif());
     }
     let caller = caller_owner(ctx);
     let mut table = take_table_gated(ctx, handle, Gate::Write)?;
     let outcome = table
         .as_requester(Some(caller))
-        .give_away(Some(owner_of(target)));
+        .give_away_with_gift(Some(owner_of(target_pid)), gift);
+    let transfer = match outcome {
+        Ok(transfer) => transfer,
+        Err(err) => {
+            restore_table(ctx, handle, table)?;
+            return Err(err);
+        }
+    };
     restore_table(ctx, handle, table)?;
-    outcome?;
+    // The registry borrow is released by the `restore_table` above, so the name atom
+    // can be resolved now (the tid is the name of a `named_table` — a table the
+    // caller passed by its *handle reference* still gets its name atom — and the
+    // handle reference otherwise).
+    let tid = table_tid(ctx, handle)?;
+    let from = ctx.self_pid().to_eterm();
+    let message = transfer_message(ctx, tid, from, transfer.data)?;
+    let hook = ctx.sender().ok_or_else(unsupported_bif)?;
+    hook.send(target, message)?;
     ctx.boolean(true)
+}
+
+/// The **tid** term an `ets:give_away/3` `{'ETS-TRANSFER', Tid, …}` names: the
+/// name atom of a table created with the `named_table` option, else the table's
+/// handle reference ([`crate::access::make_ref_thing`], the same thing `ets:all/0`
+/// and `ets:info(T, id)` build).
+///
+/// The name comes from the registry ([`TableRegistry::name_of`]), not from the
+/// *shape* of the table argument, so a `named_table` the caller named by its handle
+/// reference is still rendered as its name atom — exactly as the oracle does.
+fn table_tid(ctx: &mut BifContext<'_>, handle: u64) -> Result<Eterm> {
+    let name = {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        tables.name_of(handle)
+    };
+    match name {
+        Some(name) => Ok(make_atom(name)),
+        None => make_ref_thing(ctx.heap(), handle),
+    }
+}
+
+/// Builds the `{'ETS-TRANSFER', Tid, FromPid, GiftData}` tuple the new owner
+/// receives.
+///
+/// The tag is the **bare** atom name: [`BifContext::intern_atom`] takes the atom's
+/// characters, not an Erlang source literal (`'ETS-TRANSFER'` here would intern an
+/// atom whose name literally contains quotes) — the runtime's owner-death path
+/// interns the same bare name. `gift` is the table-owned checked-out copy
+/// [`Transfer::data`](beam_ets::Transfer::data) hands back, stored in the tuple
+/// **verbatim**: the tuple is built on the caller's heap and the delivery copies
+/// the message into the receiver's mailbox, exactly as the runtime's owner-death
+/// path does.
+fn transfer_message(
+    ctx: &mut BifContext<'_>,
+    tid: Eterm,
+    from: Eterm,
+    gift: Eterm,
+) -> Result<Eterm> {
+    let tag = ctx.intern_atom("ETS-TRANSFER")?;
+    ctx.tuple(&[tag, tid, from, gift])
 }
 
 // ------------------------------------------------------------ foldl/3 foldr/3

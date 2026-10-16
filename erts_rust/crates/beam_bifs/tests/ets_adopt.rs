@@ -64,15 +64,19 @@
 //!                                                       % each key's objects
 //! ```
 
+use std::cell::RefCell;
 use std::process::Command;
+use std::rc::Rc;
 
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller, TableRegistry};
+use beam_bifs::{
+    default_registry, BifContext, BifRegistry, FunCaller, SendHook, TableRegistry,
+};
 use beam_codec::term::{cons_head, cons_tail, tuple_element};
 use beam_common::{BeamError, ExitReason, Result as BmResult};
 use beam_process::ProcessId;
 use beam_term::{
-    atom_val, is_list, is_nil, is_small, signed_value, AtomTable, Eterm, NIL,
+    atom_val, is_list, is_nil, is_small, make_header, signed_value, AtomTable, Eterm, NIL,
 };
 
 /// The atom names these tests need.
@@ -99,6 +103,13 @@ fn seeded_atoms() -> AtomTable {
         "k",
         "a",
         "notfun",
+        // The `ets:give_away/3` transfer message and the `ets:info/2` items the
+        // transfer tests read (`id`/`size`/`memory`), plus a gift's own tag atom.
+        "ETS-TRANSFER",
+        "id",
+        "size",
+        "memory",
+        "complex",
     ]);
     atoms
 }
@@ -106,6 +117,43 @@ fn seeded_atoms() -> AtomTable {
 /// The pid `ets:new/2` records as the owner of a table this suite creates.
 fn self_pid() -> ProcessId {
     ProcessId::new(1, 0)
+}
+
+/// The shared delivery journal a [`RecordingSend`] double appends to: a test keeps
+/// this handle so it can inspect what was delivered **while** the context still
+/// borrows the hook.
+type Journal = Rc<RefCell<Vec<(Eterm, Eterm)>>>;
+
+/// A recording [`SendHook`] double: `ets:give_away/3`'s delivery appends each
+/// `(to, message)` pair to a **shared** cell, so a test can inspect what was
+/// delivered while the context still borrows the hook.
+#[derive(Clone, Default)]
+struct RecordingSend {
+    sent: Journal,
+}
+
+impl RecordingSend {
+    /// A handle on the (shared) delivery journal, usable alongside the hook.
+    fn journal(&self) -> Journal {
+        Rc::clone(&self.sent)
+    }
+}
+
+impl SendHook for RecordingSend {
+    fn send(&mut self, to: Eterm, term: Eterm) -> BmResult<()> {
+        self.sent.borrow_mut().push((to, term));
+        Ok(())
+    }
+}
+
+/// The `index`-th element of the 4-tuple `message` a [`RecordingSend`] recorded.
+fn elem(message: Eterm, index: usize) -> Eterm {
+    tuple_element(message, index).expect("a message element")
+}
+
+/// Every `(to, message)` pair recorded in `journal`, in delivery order.
+fn recorded(journal: &Journal) -> Vec<(Eterm, Eterm)> {
+    journal.borrow().clone()
 }
 
 /// `ets:new(Name, Options)` through the registry (`Options` a list of atom names).
@@ -145,6 +193,16 @@ fn info(bifs: &BifRegistry, ctx: &mut BifContext<'_>, table: Eterm, item: Eterm)
 fn assert_atom(ctx: &BifContext<'_>, term: Eterm, expected: &str) {
     assert_eq!(
         ctx.atoms().name(atom_val(term)),
+        Some(expected),
+        "expected the atom {expected}, got {term:?}"
+    );
+}
+
+/// As [`assert_atom`], but read through the shared table — usable after the context
+/// that built the term has been dropped.
+fn assert_atom_name(atoms: &AtomTable, term: Eterm, expected: &str) {
+    assert_eq!(
+        atoms.name(atom_val(term)),
         Some(expected),
         "expected the atom {expected}, got {term:?}"
     );
@@ -496,7 +554,11 @@ fn setopts_requires_the_owner() {
     let mut heap = Heap::new(1 << 16).expect("test heap");
     let atoms = seeded_atoms();
     let mut tables = TableRegistry::new();
-    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+    let mut hook = RecordingSend::default();
+    let journal = hook.journal();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid())
+        .with_tables(&mut tables)
+        .with_sender(&mut hook);
 
     let table = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
     let heir_key = atom(&mut ctx, "heir");
@@ -508,6 +570,11 @@ fn setopts_requires_the_owner() {
         .call("ets", "give_away", 3, &mut ctx, &[table, target, gift])
         .expect("ets:give_away");
     assert_true(&ctx, ret);
+    assert_eq!(
+        recorded(&journal).len(),
+        1,
+        "the transfer delivered its gift"
+    );
 
     let opts = opt_list(&mut ctx, &[heir_key, none]);
     let err = bifs
@@ -519,44 +586,85 @@ fn setopts_requires_the_owner() {
 // -------------------------------------------------------------- give_away/3
 
 /// `ets:give_away/3` transfers ownership to a live different pid and returns
-/// `true`; `ets:info(T, owner)` reports the new owner (probe 10).
+/// `true`; `ets:info(T, owner)` reports the new owner (probe 10) and the delivery
+/// is the `{'ETS-TRANSFER', Tid, FromPid, GiftData}` message, with an **unnamed**
+/// table's tid a reference that names the very table that moved.
 #[test]
 fn give_away_transfers_ownership() {
     let bifs = default_registry();
     let mut heap = Heap::new(1 << 16).expect("test heap");
     let atoms = seeded_atoms();
     let mut tables = TableRegistry::new();
+    let mut hook = RecordingSend::default();
+    let journal = hook.journal();
+
+    let (target, gift) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid())
+            .with_tables(&mut tables)
+            .with_sender(&mut hook);
+
+        let table = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
+        let owner_key = atom(&mut ctx, "owner");
+        let gift = atom(&mut ctx, "a");
+        let target = ProcessId::new(9, 0).to_eterm();
+
+        let owner_now = info(&bifs, &mut ctx, table, owner_key);
+        assert_eq!(owner_now, self_pid().to_eterm(), "the creator owns the table");
+
+        let ret = bifs
+            .call("ets", "give_away", 3, &mut ctx, &[table, target, gift])
+            .expect("ets:give_away");
+        assert_true(&ctx, ret);
+        let owner_now = info(&bifs, &mut ctx, table, owner_key);
+        assert_eq!(owner_now, target, "the new owner is the target pid");
+        (target, gift)
+    };
+
+    // The delivery: one `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the new owner.
+    let (to, message) = {
+        let recorded = recorded(&journal);
+        assert_eq!(recorded.len(), 1, "exactly one transfer message");
+        recorded[0]
+    };
+    assert_eq!(to, target, "delivered to the new owner");
+    assert_atom_name(&atoms, elem(message, 0), "ETS-TRANSFER");
+    assert_eq!(
+        elem(message, 2),
+        self_pid().to_eterm(),
+        "FromPid is the calling (former owner) pid"
+    );
+    assert_eq!(elem(message, 3), gift, "GiftData is carried verbatim");
+
+    // An unnamed table's tid is a **reference** — and it resolves back to the very
+    // table that moved, so it is not a fabricated handle.
     let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
-
-    let table = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
-    let owner_key = atom(&mut ctx, "owner");
-    let gift = atom(&mut ctx, "a");
-    let target = ProcessId::new(9, 0).to_eterm();
-
-    let info = bifs
-        .call("ets", "info", 2, &mut ctx, &[table, owner_key])
-        .expect("ets:info");
-    assert_eq!(info, self_pid().to_eterm(), "the creator owns the table");
-
-    let ret = bifs
-        .call("ets", "give_away", 3, &mut ctx, &[table, target, gift])
-        .expect("ets:give_away");
-    assert_true(&ctx, ret);
-    let info = bifs
-        .call("ets", "info", 2, &mut ctx, &[table, owner_key])
-        .expect("ets:info");
-    assert_eq!(info, target, "the new owner is the target pid");
+    let tid = elem(message, 1);
+    let is_ref = bifs
+        .call("erlang", "is_reference", 1, &mut ctx, &[tid])
+        .expect("erlang:is_reference/1");
+    assert_true(&ctx, is_ref);
+    let size_key = atom(&mut ctx, "size");
+    let size = info(&bifs, &mut ctx, tid, size_key);
+    assert_eq!(
+        size,
+        ctx.int(0).expect("small int"),
+        "the tid names the transferred table"
+    );
 }
 
 /// The self-gift, a non-pid target, a non-owner caller and an unknown table are
-/// each `badarg` (probes 9, 11).
+/// each `badarg` (probes 9, 11), and a rejected call delivers nothing.
 #[test]
 fn give_away_rejects_self_bad_pids_and_non_owners() {
     let bifs = default_registry();
     let mut heap = Heap::new(1 << 16).expect("test heap");
     let atoms = seeded_atoms();
     let mut tables = TableRegistry::new();
-    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+    let mut hook = RecordingSend::default();
+    let journal = hook.journal();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid())
+        .with_tables(&mut tables)
+        .with_sender(&mut hook);
 
     let table = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
     let gift = atom(&mut ctx, "a");
@@ -580,6 +688,10 @@ fn give_away_rejects_self_bad_pids_and_non_owners() {
         .call("ets", "give_away", 3, &mut ctx, &[unknown, target, gift])
         .expect_err("badarg");
     assert_badarg(err);
+    assert!(
+        recorded(&journal).is_empty(),
+        "a rejected call delivers no transfer message"
+    );
 
     // After the transfer the former owner is denied.
     let ret = bifs
@@ -591,6 +703,169 @@ fn give_away_rejects_self_bad_pids_and_non_owners() {
         .call("ets", "give_away", 3, &mut ctx, &[table, third, gift])
         .expect_err("badarg");
     assert_badarg(err);
+    assert_eq!(
+        recorded(&journal).len(),
+        1,
+        "only the successful transfer delivered"
+    );
+}
+
+/// The requested case `ets/give_away_gift_data_reaches_the_new_owner` (A.1): the
+/// `GiftData` argument survives the transfer — an arbitrary term is carried intact
+/// to the new owner, the giver is the calling pid, and for a `named_table` the tid
+/// is its **name atom** even when the caller passed the table by its *handle
+/// reference* (so the tid comes from the registry, not from the argument's shape).
+///
+/// The gift owns no counted storage after the transfer: `give_away_with_gift`
+/// checks it out (`relinquish`), so `ets:info(T, memory)` is unchanged.
+///
+/// The second half pins the honest gap: with **no `SendHook`** the delivery cannot
+/// happen, so the call is the typed `unsupported_bif` and the owner never moves.
+#[test]
+fn give_away_gift_data_reaches_the_new_owner() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut hook = RecordingSend::default();
+    let journal = hook.journal();
+
+    let (named, tid_ref, target, gift, memory_before) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid())
+            .with_tables(&mut tables)
+            .with_sender(&mut hook);
+
+        let named = new_table(&bifs, &mut ctx, "ntab", &["named_table", "set"]).expect("ets:new");
+        assert_eq!(
+            named,
+            atom(&mut ctx, "ntab"),
+            "a named table's handle is its name"
+        );
+        let id_key = atom(&mut ctx, "id");
+        let memory_key = atom(&mut ctx, "memory");
+        let memory_before = info(&bifs, &mut ctx, named, memory_key);
+        // The named table's **handle reference** (`ets:info(T, id)`), so the transfer
+        // is driven by a ref even though the table *is* a `named_table`.
+        let tid_ref = info(&bifs, &mut ctx, named, id_key);
+        assert_ne!(tid_ref, named, "the id is the reference, not the name atom");
+
+        // A gift with real structure: `{complex, [1,2,3], <caller>}`.
+        let complex = atom(&mut ctx, "complex");
+        let body = ctx
+            .list(&[
+                ctx.int(1).expect("small int"),
+                ctx.int(2).expect("small int"),
+                ctx.int(3).expect("small int"),
+            ])
+            .expect("list");
+        let gift = ctx
+            .tuple(&[complex, body, self_pid().to_eterm()])
+            .expect("gift tuple");
+        let target = ProcessId::new(9, 0).to_eterm();
+
+        let ret = bifs
+            .call("ets", "give_away", 3, &mut ctx, &[tid_ref, target, gift])
+            .expect("ets:give_away");
+        assert_true(&ctx, ret);
+        (named, tid_ref, target, gift, memory_before)
+    };
+
+    let (to, message) = {
+        let recorded = recorded(&journal);
+        assert_eq!(recorded.len(), 1, "exactly one transfer message");
+        recorded[0]
+    };
+    assert_eq!(to, target, "delivered to the new owner");
+    assert_atom_name(&atoms, elem(message, 0), "ETS-TRANSFER");
+
+    {
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+        // The tid is the registry's name atom, not the reference the caller passed.
+        assert_eq!(
+            elem(message, 1),
+            named,
+            "the tid is the named_table's name atom"
+        );
+        assert_eq!(
+            elem(message, 2),
+            self_pid().to_eterm(),
+            "FromPid is the calling pid"
+        );
+        // The gift arrives intact (the copy is structural, so it is not the caller's
+        // own word — `=:=` is).
+        let same = bifs
+            .call("erlang", "=:=", 2, &mut ctx, &[elem(message, 3), gift])
+            .expect("erlang:'=:='/2");
+        assert_true(&ctx, same);
+        // The gift is relinquished: the transfer does not count it.
+        let memory_key = atom(&mut ctx, "memory");
+        let memory_after = info(&bifs, &mut ctx, tid_ref, memory_key);
+        assert_eq!(
+            memory_after, memory_before,
+            "the gift is relinquished, never counted by ets:info(T, memory)"
+        );
+    }
+
+    // The typed gap: with no `SendHook` the delivery cannot happen, so the call is
+    // `unsupported_bif` and nothing moves.
+    {
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+        let owner_key = atom(&mut ctx, "owner");
+        let plain = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
+        let third = ProcessId::new(11, 0).to_eterm();
+        let plain_gift = atom(&mut ctx, "a");
+        let err = bifs
+            .call("ets", "give_away", 3, &mut ctx, &[plain, third, plain_gift])
+            .expect_err("unsupported_bif without a SendHook");
+        assert_unsupported(err);
+        let info_after = info(&bifs, &mut ctx, plain, owner_key);
+        assert_eq!(
+            info_after,
+            self_pid().to_eterm(),
+            "without a SendHook the owner never moves"
+        );
+    }
+    assert_eq!(
+        recorded(&journal).len(),
+        1,
+        "the hook-free call delivered nothing"
+    );
+}
+
+/// An **uncopyable** gift (a bare header word — not a term at all) is the store's
+/// typed `badarg`, and because `give_away_with_gift` copies **before** the owner
+/// moves, the owner is left unchanged and nothing is delivered.
+#[test]
+fn give_away_with_an_uncopyable_gift_leaves_the_owner_unchanged() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut hook = RecordingSend::default();
+    let journal = hook.journal();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid())
+        .with_tables(&mut tables)
+        .with_sender(&mut hook);
+
+    let table = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
+    let owner_key = atom(&mut ctx, "owner");
+    let target = ProcessId::new(9, 0).to_eterm();
+
+    let bare_header = make_header(1, 0);
+    let err = bifs
+        .call("ets", "give_away", 3, &mut ctx, &[table, target, bare_header])
+        .expect_err("badarg");
+    assert_badarg(err);
+    let info_after = info(&bifs, &mut ctx, table, owner_key);
+    assert_eq!(
+        info_after,
+        self_pid().to_eterm(),
+        "the copy-before-move order leaves the owner on a rejected gift"
+    );
+    assert!(
+        recorded(&journal).is_empty(),
+        "a rejected transfer delivers nothing"
+    );
 }
 
 // ------------------------------------------------------------ foldl/3 foldr/3
@@ -1010,7 +1285,41 @@ fn the_fold_traversals_agree_with_the_live_oracle() {
     );
 }
 
+/// The live cross-check for the gift-carrying transfer: the oracle delivers
+/// `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the new owner with the gift
+/// intact and the giver the calling pid, and for a `named_table` the message's tid
+/// is the **name atom** (an unnamed table's is a reference). `~w` (not `~p`) keeps
+/// the oracle from line-wrapping, and no pid is printed, so the golden is stable.
+#[test]
+fn the_gift_carrying_transfer_agrees_with_the_live_oracle() {
+    let statement = concat!(
+        "Self = self(), ",
+        "Pn = spawn(fun() -> receive M -> Self ! M end end), ",
+        "Pu = spawn(fun() -> receive M -> Self ! M end end), ",
+        "N = ets:new(ga_n, [named_table, set]), ",
+        "ets:give_away(N, Pn, {complex, [1,2,3]}), ",
+        "Rn = receive Xn -> Xn end, ",
+        "U = ets:new(ga_u, [set]), ",
+        "ets:give_away(U, Pu, 42), ",
+        "Ru = receive Xu -> Xu end, ",
+        "io:format(\"~w~n\", [{element(1, Rn), element(2, Rn), ",
+        "element(3, Rn) =:= Self, element(4, Rn), tuple_size(Rn)}, ",
+        "{element(1, Ru), is_reference(element(2, Ru)), ",
+        "element(3, Ru) =:= Self, element(4, Ru)}])"
+    );
+    let Some(actual) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        actual,
+        "{{'ETS-TRANSFER',ga_n,true,{complex,[1,2,3]},4},\
+         {'ETS-TRANSFER',true,true,42}}",
+        "the live oracle disagrees with the pinned give_away/3 goldens"
+    );
+}
+
 // -------------------------------------------------------- owner→handle roster
+
 /// The runtime's reclamation seam, reached through the **public** registry API: a
 /// dead owner's tables are enumerated with `handles_owned_by` (keyed by
 /// `owner_of`, the lossless pid→owner bridge) and dropped through the existing
