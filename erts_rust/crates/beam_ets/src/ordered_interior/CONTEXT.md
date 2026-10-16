@@ -47,8 +47,8 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
 - A same-`cmp_arith`-key insert replaces **both** the object and the stored key term (the oracle's
   key-follows-object rule; probed against OTP 29).
 - **The evidence suite is tuned to hit the split/merge boundary, and says so.** The randomised trace
-  spends 34 of its 55 op slots on `insert` precisely so the live-key count crosses `ORDER = 32` (it
-  reaches 49–63), and it asserts that peak, so diluting the insert share fails the test instead of
+  spends 34 of its 60 op slots on `insert` precisely so the live-key count crosses `ORDER = 32` (it
+  reaches 68), and it asserts that peak, so diluting the insert share fails the test instead of
   quietly reducing the trace to a small-table walk. The benchmark likewise drives each interior in
   three key orders rather than one, because a single order measures the sorted `Vec`'s best case
   (ascending inserts) or its worst case (ascending deletes) and never both — the two interiors'
