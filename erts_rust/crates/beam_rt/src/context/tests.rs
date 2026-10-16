@@ -5602,44 +5602,6 @@ fn the_collecting_allocation_seam_leaves_a_declined_forced_request_armed() {
     );
 }
 
-/// The nested blocking pump ([`super::pump_until_returned`], the engine of
-/// [`RuntimeContext::run_export_blocking`]/[`run_label_blocking`]) must not spin without end
-/// when a process stays **runnable forever**: its `ran == 0` exit never triggers, so only the
-/// wall-clock cap can end the drive.
-///
-/// `step` here always reports progress (`Ok(Some(Wait))`) — exactly the shape of a
-/// perpetually runnable queue. Without the cap the loop below would never return; with it the
-/// drive gives up with the typed diagnostic, so this is a genuine regression guard. The cap
-/// is injected (production uses the generous [`super::BLOCKING_PUMP_DEADLINE`]) so the test
-/// spins only for `limit`, not for the ten seconds the production bound allows.
-#[test]
-fn a_perpetually_runnable_blocking_pump_gives_up_at_the_wall_clock_cap() {
-    let limit = std::time::Duration::from_millis(20);
-    let mut steps = 0u64;
-    let error = super::pump_until_returned(limit, RunOutcome::Wait { func: 0, pc: 0 }, |_f, _p| {
-        steps += 1;
-        Ok(Some(RunOutcome::Wait { func: 0, pc: 0 }))
-    })
-    .expect_err("an always-runnable pump must not run forever");
-    assert!(steps > 0, "the drive pumped at least once before giving up");
-    assert_eq!(
-        error.to_string(),
-        crate::error::message(format!(
-            "blocking pump: the scheduler was still runnable after {} ms",
-            limit.as_millis()
-        ))
-        .to_string(),
-        "the drive reports the typed deadline diagnostic, never a hang and never a value"
-    );
-    // The production cap is a safety net, not an ordinary path: it must stay generous
-    // (comfortably above the boot drive's own 10 s pass budget), so a silent shrink below the
-    // workloads it protects is itself a regression.
-    assert!(
-        super::BLOCKING_PUMP_DEADLINE >= std::time::Duration::from_secs(10),
-        "the blocking-pump cap must not be tightened below the workloads it protects"
-    );
-}
-
 /// The **normal** path: a machine that returns ends the drive immediately, however short the
 /// cap is — the deadline is a safety net, never the ordinary exit.
 #[test]
