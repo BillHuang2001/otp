@@ -288,6 +288,12 @@ instruction's own operands.
   may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
   (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
   re-publishes the current frame's Y window in one call — then load each cached register from `machine.x`.
+  The frame is **variable-length**: `k = native_frame_regs(allocation).len()` is the block's own push count,
+  so the reservation and the teardown's matching `lea rsp,[rsp+frame_slot_len(k)]` always agree
+  (`emit/link.rs::emit_frame_teardown` derives both sides from the same `native_frame_regs`). Corpus
+  counters (grand total over the generically-discovered installed-OTP corpus): 597 333 blocks /
+  756 632 cache slots, push/pop ops 7 167 996 → 2 707 930 (−62.2 %), emitted bytes
+  320 065 790 → 308 853 108 (−3.50 %), with every per-block cache/write set and IR size unchanged.
 - `regs.rs::spill` / `regs.rs::fill`: `spill(buffer, allocation, site, pc)` stores exactly
   `Allocation::spill_slots_at(pc)` — the cached x-registers **dirty at that pc** (`Allocation::spill_sets`,
   the `regalloc.rs` forward dirty walk) — falling back to the whole `Allocation::written` set when the
@@ -535,7 +541,7 @@ by construction).
   stable across the splits. Keep that in mind when renaming items.
 
 ## Known Issues
-- **`block.rs` (1073 lines) is deliberately above the ~1000-line guidance.** It holds the single
+- **`block.rs` (1086 lines) is deliberately above the ~1000-line guidance.** It holds the single
   per-instruction lowering dispatch (`emit_block`, a `match instr` with one arm per instruction group)
   plus its prologue/epilogue, position-store/Y-publish, deopt wrapper and the three helper-sequence
   arms. The `match` is what makes the file cohesive — each arm is one `try_inline_*` call plus an
