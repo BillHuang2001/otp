@@ -228,6 +228,20 @@ rather than transcribed here.
 `BEAM_RT_TIER=interpreter` is the always-correct reference tier and the **only** kill switch: the
 default (`Auto`, and its `baseline` alias) puts every process on the native tier.
 
+**The per-call work of a growth-shaped loop is FLAT in N — deterministic counters, never wall clock.**
+`the_churn_workloads_per_call_counters_are_flat_in_n` and
+`the_heap_growth_workloads_per_call_counters_are_flat_in_n` each drive their fixture at three
+increasing iteration counts and print a `counter_table`: N vs slices / yields / waits / collections /
+major / fallbacks / peak young-nursery geometry / debt boundaries, plus the derived per-call ratios.
+Measured (release): `churn` collections/call 6.996002 / 6.999200 / 6.999800 and slices/call
+0.191904 / 0.191981 / 0.191995 at N=2 000 / 10 000 / 40 000 — flat to within 0.06 %, with
+`collections == 7N − 1` exactly at every N; `heap_growth` collections/call 0.999900 / 0.999960 /
+0.999980 and slices/call 0.000300 / 0.000280 / 0.000260 at N=10 000 / 25 000 / 50 000 — one
+collection per iteration throughout, since the 401-word request cannot fit a fresh nursery. In both
+shapes `peak_young_spaces == 2` and the young capacity plateaus (376 / 610 words) at every N, so the
+retired-nursery chain the `collection_debt` trigger protects is bounded rather than N-dependent, and
+`yields == slices − 1` with `waits == 0` throughout (neither loop ever parks).
+
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.
 * The tier is resolved **before** the `RuntimeContext` borrow (the selection happens in the slice's
