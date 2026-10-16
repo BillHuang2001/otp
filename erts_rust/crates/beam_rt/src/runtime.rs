@@ -2665,6 +2665,10 @@ impl Runtime {
     ///    `Ok`, an ordinary `Err`, and `erlang:halt/0,1`'s (a raise like any other) alike. That
     ///    is why the swap is captured and restored around the call instead of living in a
     ///    `Drop`: the restore is one line, and an error path can never leak the child's pid.
+    /// 5. The child is then **removed from the process table**, so an action leaves no entry
+    ///    behind: `erlang:processes/0`, `system_info(process_count)` and the `+JPperf` map must
+    ///    describe the node the action left, not the action's own scaffolding. (The oracle's
+    ///    action process terminates when the action is over, for the same reason.)
     ///
     /// Nothing else about the node moves: `whereis(init)`, `process_info(init, …)`,
     /// `which_applications/0`, `init:get_status/0`, the boot script and the `run <file.beam>`
@@ -2686,6 +2690,7 @@ impl Runtime {
         let previous = std::mem::replace(&mut self.self_pid, action_pid);
         let result = body(self);
         self.self_pid = previous;
+        self.processes.remove(action_pid);
         result
     }
 
