@@ -110,10 +110,12 @@
 //! # The `#file_info{}` readers
 //!
 //! `{read_file_info, Name [, Opts]}`, `{read_link_info, Name [, Opts]}` and
-//! `{read_handle_info, Opts}` are all served by the [`file_info`] child: the first two are a
-//! `stat(2)`/`lstat(2)` on the path (with `access` from two `access(2)` probes), the third an
-//! `fstat(2)` on the **device's own** handle (with `access` from `check_access/1` against the
-//! process's effective credentials). A failed stat is the oracle's `{error, Reason}` verbatim
+//! `{read_handle_info, Opts}` are the `#file_info{}` readers. The first two are the
+//! [`file_info`] child's: a `stat(2)`/`lstat(2)` on the path (with `access` from two
+//! `access(2)` probes). The third is this module's `reply_read_handle_info` — an
+//! `fstat(2)` (the device's own `Metadata`) with `access` from `check_access/1` against the
+//! process's effective credentials — rendered through the same `#file_info{}` builder
+//! `prim.rs` shares. A failed stat is the oracle's `{error, Reason}` verbatim
 //! and a successful one the real `{ok, #file_info{}}` — the child's docs carry the
 //! wire-level argument.
 //!
