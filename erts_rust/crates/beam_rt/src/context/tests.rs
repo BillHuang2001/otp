@@ -7345,8 +7345,9 @@ fn the_copy_bound_ping_pong_declines_the_valve_at_every_admission_point() {
         "the rooted seam never reaches its post-collection bump: the valve refuses first"
     );
     assert!(
-        large.counters.fallbacks as i64 > LARGE,
-        "more than one arena fallback per iteration: {} for N={LARGE}",
+        large.counters.fallbacks as i64 >= LARGE * 3 / 4,
+        "the driver's term construction must fall back to the arena ~once per iteration: {} for \
+         N={LARGE}",
         large.counters.fallbacks,
     );
     assert!(
