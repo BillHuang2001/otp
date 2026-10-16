@@ -268,7 +268,8 @@ impl DictHook for DictBridge<'_> {
     }
 }
 
-/// The `beam_bifs` message-delivery seam: `erlang:send/2` and `erlang:'!'/2`.
+/// The `beam_bifs` message-delivery seam — the `beam_bifs::SEND_HOOK_BIFS` roster:
+/// `erlang:send/2` (with its option-taking `erlang:send/3` form) and `erlang:'!'/2`.
 ///
 /// `erlang:send/2` is a plain Rust function that cannot reach the destination process's
 /// mailbox itself, so it routes every delivery through the [`SendHook`] — this is the concrete

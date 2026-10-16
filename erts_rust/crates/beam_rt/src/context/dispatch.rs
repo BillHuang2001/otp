@@ -347,9 +347,10 @@ impl<'a> RuntimeContext<'a> {
     /// Whether `(module, function, arity)` is a message-sending BIF that must run against the
     /// [`SendBridge`] (the delivery seam).
     ///
-    /// `erlang:send/2` and `erlang:'!'/2` are the *same* `beam_bifs` implementation, which
-    /// delivers through the [`SendHook`](beam_bifs::SendHook) (`beam_bifs/src/proc.rs`) — it
-    /// cannot reach a mailbox itself (workspace `CONTEXT.md` §3: an uninstalled hook raises
+    /// `erlang:send/2` and `erlang:'!'/2` are the *same* `beam_bifs` implementation, joined by
+    /// its option-taking `erlang:send/3` form; all three deliver through the
+    /// [`SendHook`](beam_bifs::SendHook) (`beam_bifs/src/proc.rs`) and cannot reach a mailbox
+    /// themselves (workspace `CONTEXT.md` §3: an uninstalled hook raises
     /// `unsupported_bif` rather than dropping the message). The bridge borrows the whole
     /// `Runtime` (it delegates to [`RuntimeContext::send_message`]), so it cannot co-exist with
     /// [`FunBridge`]'s borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
