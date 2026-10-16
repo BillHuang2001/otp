@@ -84,7 +84,8 @@ use crate::Step;
 /// branch on it either — the byte alignment a little-endian field needs is enforced
 /// structurally by the byte-wise read/write helpers instead.
 #[allow(dead_code)]
-pub(super) const BSF_ALIGNED: u32 = 1;/// `BSF_LITTLE` (`erl_bits.h:462`): the field is little-endian.
+pub(super) const BSF_ALIGNED: u32 = 1;
+/// `BSF_LITTLE` (`erl_bits.h:462`): the field is little-endian.
 pub(super) const BSF_LITTLE: u32 = 2;
 /// `BSF_SIGNED` (`erl_bits.h:463`): the field is signed.
 pub(super) const BSF_SIGNED: u32 = 4;
