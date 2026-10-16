@@ -343,10 +343,10 @@ impl UdpInetDriver {
         let mut written = 0usize;
         loop {
             let front = ctx.output().front();
-            if front.is_empty() {
+            let len = front.len();
+            if len == 0 {
                 break;
             }
-            let len = front.len();
             match send_connected(fd, front) {
                 Ok(n) => {
                     // A datagram send is all-or-nothing, so `n` is the whole `len`; consuming it

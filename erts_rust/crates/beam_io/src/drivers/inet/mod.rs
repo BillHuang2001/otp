@@ -1336,5 +1336,3 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
 mod frame_tests;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod udp_tests;

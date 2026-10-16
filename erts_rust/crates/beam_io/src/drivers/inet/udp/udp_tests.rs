@@ -162,7 +162,7 @@ fn the_registered_name_is_udp_inet() {
 #[test]
 fn open_bind_and_close_round_trip() {
     let mut rig = Rig::new();
-    assert_eq!(rig.control("open", &open_arg()).expect("open"), ctl_ok());
+    // `bind_ephemeral` performs the `open` and asserts its `[1]` reply.
     let port = rig.bind_ephemeral();
     // A bound socket reports its own port; the ephemeral one must be non-zero.
     assert_ne!(port, 0, "the kernel assigned a port");
@@ -363,9 +363,9 @@ fn the_datagram_syscall_options_round_trip() {
     let mut rig = Rig::new();
     rig.open();
     for (code, value) in [
-        (INET_OPT_REUSEADDR, 1),
-        (INET_OPT_BROADCAST, 1),
-        (INET_OPT_TTL, 42),
+        (INET_OPT_REUSEADDR, 1i32),
+        (INET_OPT_BROADCAST, 1i32),
+        (INET_OPT_TTL, 42i32),
     ] {
         let mut set = vec![code];
         set.extend_from_slice(&value.to_be_bytes());
@@ -427,9 +427,13 @@ fn read_packets_is_dropped_before_a_socket_exists() {
 // The `erl` oracle cross-check
 // ---------------------------------------------------------------------------
 
-/// Runs `expr` under the system `erl`, returning its stdout, or `None` when `erl` is absent or
-/// the run does not finish inside [`ERL_TIMEOUT`] (the caller then **skips loudly**).
-fn erl_stdout(expr: &str) -> Option<String> {
+/// Runs `expr` under the system `erl`, returning its **raw stdout bytes**, or `None` when `erl`
+/// is absent or the run does not finish inside [`ERL_TIMEOUT`] (the caller then **skips loudly**).
+///
+/// The bytes are handed over untouched: the dump is the driver's own reply bytes, and a
+/// `String::from_utf8_lossy` would replace every byte above `127` with `U+FFFD` — which the
+/// ephemeral port a `bind` reply carries routinely are.
+fn erl_stdout(expr: &str) -> Option<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     let script = format!("{expr}, halt(0).");
     thread::spawn(move || {
@@ -439,14 +443,19 @@ fn erl_stdout(expr: &str) -> Option<String> {
         let _ = tx.send(out);
     });
     match rx.recv_timeout(ERL_TIMEOUT) {
-        Ok(Ok(out)) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(Ok(out)) => Some(out.stdout),
         Ok(Err(_)) | Err(_) => None,
     }
 }
 
 /// The `erl` expression driving an oracle `udp_inet` port: open the driver port, run `calls`
-/// (each `(request code, argument bytes)`) through `port_control`, and print the replies as a
-/// comma-separated `A,B,C|…` of the lowercase names the driver answers.
+/// (each `(request code, argument bytes)`) through `port_control`, and print the raw reply bytes
+/// joined by `|` so the caller can compare them byte for byte.
+///
+/// `standard_io` is switched to `latin1` first: with the default (`unicode`) encoding,
+/// `io:format("~s", …)` would UTF-8-encode any byte above `127` — and a `bind` reply carries the
+/// kernel-assigned ephemeral port, whose bytes routinely are — so the oracle's dump would no
+/// longer be the driver's raw reply bytes.
 fn oracle_expression(calls: &[(u32, Vec<u8>)]) -> String {
     let mut body = String::new();
     for (code, arg) in calls {
@@ -460,16 +469,18 @@ fn oracle_expression(calls: &[(u32, Vec<u8>)]) -> String {
         ));
     }
     format!(
-        "P = open_port({{spawn_driver, \"udp_inet\"}}, [binary]), {body}\"\", \
+        "P = open_port({{spawn_driver, \"udp_inet\"}}, [binary]), \
+         io:setopts(standard_io, [{{encoding, latin1}}]), \
+         io:format(\"~s\", [{body}\"\"]), \
          erlang:port_close(P)"
     )
 }
 
-/// Splits the oracle's `A|B|C` dump into the raw reply byte strings.
-fn oracle_replies(dump: &str) -> Vec<Vec<u8>> {
-    dump.split('|')
+/// Splits the oracle's `A|B|C` raw-byte dump into the reply byte strings.
+fn oracle_replies(dump: &[u8]) -> Vec<Vec<u8>> {
+    dump.split(|b| *b == b'|')
         .filter(|part| !part.is_empty())
-        .map(|part| part.as_bytes().to_vec())
+        .map(|part| part.to_vec())
         .collect()
 }
 
@@ -511,11 +522,13 @@ fn the_control_replies_agree_with_the_erl_oracle() {
 #[test]
 fn the_oracle_reports_the_registered_driver_name() {
     let expr = "P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
-                erlang:port_info(P, name), erlang:port_close(P)";
+                io:format(\"~p\", [erlang:port_info(P, name)]), \
+                erlang:port_close(P)";
     let Some(dump) = erl_stdout(expr) else {
         eprintln!("SKIP: no `erl` on PATH — skipping the udp_inet driver-name oracle check");
         return;
     };
+    let dump = String::from_utf8_lossy(&dump);
     assert!(
         dump.contains("udp_inet"),
         "the oracle's udp_inet port reports its name: {dump:?}",
