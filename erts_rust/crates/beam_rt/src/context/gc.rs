@@ -578,9 +578,18 @@ pub(crate) fn ensure_heap(
     // [`ensure_heap_full`]): a nursery chain a no-collect growth retained forces the collection
     // even when the current space still has room.
     let debt = process.collection_debt();
-    if !forced && !process.should_collect(heap_need as usize) && !debt {
+    let occupancy = process.should_collect(heap_need as usize);
+    if !forced && !occupancy && !debt {
         return Ok(());
     }
+    #[cfg(test)]
+    valve_counters::note_reached(
+        valve_counters::Door::EnsureHeap,
+        occupancy,
+        debt,
+        forced,
+        x_regs.len() + stack.len(),
+    );
     // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root in a region the
     // collector does not scan would be left pointing at young words this move relocates, so the
     // move is **declined** — the heap keeps its terms, the unscanned root stays valid and the
@@ -595,12 +604,26 @@ pub(crate) fn ensure_heap(
     // held one (see the valve's module docs). A **hit** opens the gate permanently: a foreign
     // container really did reach a live root, which is the event the gate records.
     let descend = runtime.foreign_reachable(pid);
-    if any_root_is_unscanned(
+    let declined = any_root_is_unscanned(
         runtime.walk_scratch(),
         process,
         x_regs.iter().chain(stack.iter()),
         descend,
-    ) {
+    );
+    #[cfg(test)]
+    valve_counters::note_valve(valve_counters::Door::EnsureHeap, descend, declined);
+    #[cfg(test)]
+    if declined {
+        valve_counters::note_decline(
+            valve_counters::Door::EnsureHeap,
+            valve_counters::classify_decline(
+                runtime.walk_scratch(),
+                process,
+                x_regs.iter().chain(stack.iter()),
+            ),
+        );
+    }
+    if declined {
         runtime.note_foreign_reachable(pid);
         return Ok(());
     }
@@ -636,6 +659,8 @@ pub(crate) fn ensure_heap(
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
+            #[cfg(test)]
+            valve_counters::note_collected(valve_counters::Door::EnsureHeap);
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
@@ -742,9 +767,18 @@ pub(crate) fn ensure_heap_full(
     // The two terms stay disjoint: [`Process::should_collect`] is the occupancy test alone
     // (pinned as such), and the debt is the growth seam's own signal.
     let debt = process.collection_debt();
-    if !forced && !process.should_collect(heap_need as usize) && !debt {
+    let occupancy = process.should_collect(heap_need as usize);
+    if !forced && !occupancy && !debt {
         return Ok(());
     }
+    #[cfg(test)]
+    valve_counters::note_reached(
+        valve_counters::Door::EnsureHeapFull,
+        occupancy,
+        debt,
+        forced,
+        roots.x.len() + roots.stack.len() + roots.fr.len(),
+    );
     // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root in
     // a region the collector does not scan declines the move (see [`root_is_unscanned`]), so the
     // heap keeps its terms and the unscanned root stays valid. Tested after the occupancy
@@ -752,7 +786,7 @@ pub(crate) fn ensure_heap_full(
     // armed for the runner's park arm. The descent is gated on `pid`'s foreign-reachability bit
     // and a hit opens it permanently, exactly as in [`ensure_heap`].
     let descend = runtime.foreign_reachable(pid);
-    if any_root_is_unscanned(
+    let declined = any_root_is_unscanned(
         runtime.walk_scratch(),
         process,
         roots
@@ -761,7 +795,25 @@ pub(crate) fn ensure_heap_full(
             .chain(roots.stack.iter())
             .chain(roots.fr.iter()),
         descend,
-    ) {
+    );
+    #[cfg(test)]
+    valve_counters::note_valve(valve_counters::Door::EnsureHeapFull, descend, declined);
+    #[cfg(test)]
+    if declined {
+        valve_counters::note_decline(
+            valve_counters::Door::EnsureHeapFull,
+            valve_counters::classify_decline(
+                runtime.walk_scratch(),
+                process,
+                roots
+                    .x
+                    .iter()
+                    .chain(roots.stack.iter())
+                    .chain(roots.fr.iter()),
+            ),
+        );
+    }
+    if declined {
         runtime.note_foreign_reachable(pid);
         return Ok(());
     }
@@ -785,6 +837,8 @@ pub(crate) fn ensure_heap_full(
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
+            #[cfg(test)]
+            valve_counters::note_collected(valve_counters::Door::EnsureHeapFull);
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
@@ -882,6 +936,8 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
                     Err(_) => {}
                 }
             }
+            #[cfg(test)]
+            valve_counters::note_fallback_at(valve_counters::FallbackSite::UnrootedSeam);
             runtime.note_gc_fallback(*mailbox_pid);
         }
     }
@@ -989,10 +1045,14 @@ pub(crate) fn alloc_words_rooted(
     // may collect over the roots it handed in; every other context keeps `alloc_words`' arena
     // fallback, byte for byte.
     if !call_site_known {
+        #[cfg(test)]
+        valve_counters::note_fallback_at(valve_counters::FallbackSite::NoCallSite);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
     let Some(process) = table.get_mut(pid) else {
+        #[cfg(test)]
+        valve_counters::note_fallback_at(valve_counters::FallbackSite::NoCallSite);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     };
@@ -1004,7 +1064,15 @@ pub(crate) fn alloc_words_rooted(
     // exactly as in [`ensure_heap`]. A declined collection leaves a forced request **armed**,
     // exactly as at [`ensure_heap_full`], so the runner's park arm may still serve it.
     let descend = runtime.foreign_reachable(pid);
-    if any_root_is_unscanned(
+    #[cfg(test)]
+    valve_counters::note_reached(
+        valve_counters::Door::AllocWordsRooted,
+        false,
+        false,
+        forced,
+        roots.x.len() + roots.stack.len() + roots.fr.len(),
+    );
+    let declined = any_root_is_unscanned(
         runtime.walk_scratch(),
         process,
         roots
@@ -1013,8 +1081,28 @@ pub(crate) fn alloc_words_rooted(
             .chain(roots.stack.iter())
             .chain(roots.fr.iter()),
         descend,
-    ) {
+    );
+    #[cfg(test)]
+    valve_counters::note_valve(valve_counters::Door::AllocWordsRooted, descend, declined);
+    #[cfg(test)]
+    if declined {
+        valve_counters::note_decline(
+            valve_counters::Door::AllocWordsRooted,
+            valve_counters::classify_decline(
+                runtime.walk_scratch(),
+                process,
+                roots
+                    .x
+                    .iter()
+                    .chain(roots.stack.iter())
+                    .chain(roots.fr.iter()),
+            ),
+        );
+    }
+    if declined {
         runtime.note_foreign_reachable(pid);
+        #[cfg(test)]
+        valve_counters::note_fallback_at(valve_counters::FallbackSite::ValveDeclined);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
@@ -1031,6 +1119,8 @@ pub(crate) fn alloc_words_rooted(
     let fr_count = roots.fr.len();
     if !publish_roots_full(process, &roots, fr_count) {
         runtime.halt_process_gc(pid);
+        #[cfg(test)]
+        valve_counters::note_fallback_at(valve_counters::FallbackSite::Other);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
@@ -1038,15 +1128,21 @@ pub(crate) fn alloc_words_rooted(
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
+            #[cfg(test)]
+            valve_counters::note_collected(valve_counters::Door::AllocWordsRooted);
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
+            #[cfg(test)]
+            valve_counters::note_fallback_at(valve_counters::FallbackSite::Other);
             runtime.note_gc_fallback(pid);
             return runtime.alloc_words(n);
         }
     }
     if !scatter_roots_full(process, &mut roots, fr_count) {
         runtime.halt_process_gc(pid);
+        #[cfg(test)]
+        valve_counters::note_fallback_at(valve_counters::FallbackSite::Other);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
@@ -1055,8 +1151,342 @@ pub(crate) fn alloc_words_rooted(
     if let Ok(block) = bump(process.heap_mut(), n, fill) {
         return Ok(block);
     }
+    #[cfg(test)]
+    valve_counters::note_fallback_at(valve_counters::FallbackSite::PostCollection);
     runtime.note_gc_fallback(pid);
     runtime.alloc_words(n)
+}
+
+/// **Test-only** deterministic tallies for the unscanned-root valve's four doors.
+///
+/// The valve's per-word classification phase ([`Walk::seed`](crate::context::gc_walk) over the
+/// caller's machine roots plus `Walk::seed_process_roots`) runs on **every** candidate
+/// collection; the occupancy short-circuit in front of it is the only thing that keeps an
+/// ordinary admission point off it (see [`ensure_heap`] and `gc_walk`'s module docs). Whether
+/// that phase dominates a workload is therefore a question about two structural facts — **how
+/// often a door is reached** and **how many root words each reach classifies** — never about
+/// timings. These counters answer exactly those two questions, per door, so a test can pin the
+/// mechanism rather than a wall clock.
+///
+/// They follow the crate's counter convention (`src/runner/run.rs`'s `RUN_SLICE_COUNTERS`,
+/// `src/runtime/scheduler.rs`'s `PASS_SLEEPS`): a `#[cfg(test)] thread_local!` `Cell` with a
+/// reset/read accessor, so the tallies exist **only in test builds** (a release binary pays
+/// nothing) and a test reads its own thread's tally between a reset and the load it measures.
+#[cfg(test)]
+pub(crate) mod valve_counters {
+    use std::cell::Cell;
+
+    use beam_term::Eterm;
+    /// The four valve doors, so a tally can name the one it came from.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Door {
+        /// [`super::ensure_heap`] — the narrow admission point (no engine call site today).
+        EnsureHeap,
+        /// [`super::ensure_heap_full`] — the engine's `test_heap`/`allocate_heap` door.
+        EnsureHeapFull,
+        /// [`super::alloc_words_rooted`] — the engine's rooted term-construction seam.
+        AllocWordsRooted,
+        /// [`crate::runtime::gc::Runtime::serve_gc_request`] — the runner's park arm.
+        ServeGcRequest,
+    }
+
+    /// One door's tallies.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct DoorCounts {
+        /// Valve calls reached — the door is past its own pre-valve gates (the occupancy
+        /// short-circuit for the admission doors, the young-heap bump for
+        /// [`super::alloc_words_rooted`], the relocation-exempt test for the park arm).
+        pub(crate) reached: usize,
+        /// How many of those had `should_collect(heap_need)` true (occupancy alone).
+        pub(crate) occupancy: usize,
+        /// How many had the collector's **collection debt** (`Process::collection_debt`).
+        pub(crate) debt: usize,
+        /// How many had a forced-GC request pending.
+        pub(crate) forced: usize,
+        /// How many ran with `pid`'s descent latch **open**.
+        pub(crate) latch_open: usize,
+        /// How many the valve **declined** (its `note_foreign_reachable` arm).
+        pub(crate) hits: usize,
+        /// Declines attributable to a **machine root word** — an x register, a stack slot or an
+        /// FR slot that is itself a container from a region the collector does not scan. This is
+        /// the engine *holding* an arena/BIF-heap/fragment term, and it is the shape the arena
+        /// fallback creates (the engine writes the block it was handed into a register).
+        pub(crate) machine_root_hits: usize,
+        /// Declines where the machine roots were clean but a **process root** (a register the
+        /// process's own root set holds, a mailbox payload/from/token, a dictionary entry, a
+        /// saved argument or a pending signal) is itself an unscanned container — a phase-1 hit
+        /// needing no descent.
+        pub(crate) process_root_hits: usize,
+        /// Declines only the `O(live objects)` **descent** found — the nested shape the gate
+        /// exists for.
+        pub(crate) descent_hits: usize,
+        /// How many ran the `O(live objects)` descent (latch open and no phase-1 hit).
+        pub(crate) descents: usize,
+        /// How many ran a real collection.
+        pub(crate) collections: usize,
+        /// The **machine root words** handed to the valve at those calls — the exact size of
+        /// phase 1's `Walk::seed` loop over the caller's own root set (the whole x-register
+        /// file, the whole Erlang stack and the whole FR file for the full-root doors).
+        pub(crate) machine_words: usize,
+    }
+
+    impl DoorCounts {
+        /// All-zero tallies (the `const` form the thread-local's initialiser needs).
+        const ZERO: DoorCounts = DoorCounts {
+            reached: 0,
+            occupancy: 0,
+            debt: 0,
+            forced: 0,
+            latch_open: 0,
+            hits: 0,
+            machine_root_hits: 0,
+            process_root_hits: 0,
+            descent_hits: 0,
+            descents: 0,
+            collections: 0,
+            machine_words: 0,
+        };
+    }
+
+    /// Which refusal sent an allocation to the pointer-stable arena.
+    ///
+    /// The **entry point** of the valve's self-sustaining decline circle is one of these: an arena
+    /// block is a container in a region the collector does not scan, so once the engine writes one
+    /// into a machine register the *next* admission point's phase 1 finds it as a root and declines
+    /// — which sends the next allocation to the arena in turn. Naming the first site is what says
+    /// whether the circle can be broken from the allocation seam.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FallbackSite {
+        /// The **unrooted** seam ([`super::alloc_words`]): the young heap refused and the
+        /// no-relocation growth could not reach the request.
+        UnrootedSeam,
+        /// The rooted seam has no call site / no process table / no pid to collect for.
+        NoCallSite,
+        /// The rooted seam's **valve declined** the collection.
+        ValveDeclined,
+        /// The rooted seam collected but the post-collection bump still did not fit.
+        PostCollection,
+        /// The rooted seam's publish/collect/scatter refused.
+        Other,
+    }
+
+    impl FallbackSite {
+        /// Every site, for a fixed-order report.
+        pub(crate) const ALL: [FallbackSite; 5] = [
+            FallbackSite::UnrootedSeam,
+            FallbackSite::NoCallSite,
+            FallbackSite::ValveDeclined,
+            FallbackSite::PostCollection,
+            FallbackSite::Other,
+        ];
+
+        /// This site's slot in [`ValveCounters::fallbacks_by_site`].
+        fn index(self) -> usize {
+            match self {
+                FallbackSite::UnrootedSeam => 0,
+                FallbackSite::NoCallSite => 1,
+                FallbackSite::ValveDeclined => 2,
+                FallbackSite::PostCollection => 3,
+                FallbackSite::Other => 4,
+            }
+        }
+    }
+
+    /// Every door's tallies plus the runtime-wide witnesses.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct ValveCounters {
+        /// The narrow admission point ([`super::ensure_heap`]).
+        pub(crate) ensure_heap: DoorCounts,
+        /// The engine's full-root admission point ([`super::ensure_heap_full`]).
+        pub(crate) ensure_heap_full: DoorCounts,
+        /// The engine's rooted allocation seam ([`super::alloc_words_rooted`]).
+        pub(crate) alloc_words_rooted: DoorCounts,
+        /// The runner's park arm (`Runtime::serve_gc_request`).
+        pub(crate) serve_gc_request: DoorCounts,
+        /// Arena fallbacks ([`Runtime::note_gc_fallback`](crate::runtime::gc)) — the allocations
+        /// the collector did not serve, each of which also **opens** the pid's descent latch.
+        /// This is the authoritative total: it counts every call site, including the ones outside
+        /// this module (`src/context/calls.rs`).
+        pub(crate) fallbacks: usize,
+        /// The same fallbacks, attributed to the **in-lane** refusal that caused them
+        /// ([`FallbackSite`]). The two tally only where a site can name itself, so
+        /// `fallbacks_at(..)` summed over every site is **at most** [`Self::fallbacks`].
+        pub(crate) fallbacks_by_site: [usize; 5],
+    }
+
+    impl ValveCounters {
+        /// The all-zero tally.
+        const ZERO: ValveCounters = ValveCounters {
+            ensure_heap: DoorCounts::ZERO,
+            ensure_heap_full: DoorCounts::ZERO,
+            alloc_words_rooted: DoorCounts::ZERO,
+            serve_gc_request: DoorCounts::ZERO,
+            fallbacks: 0,
+            fallbacks_by_site: [0; 5],
+        };
+
+        /// How many of the attributed fallbacks came from `site`.
+        pub(crate) fn fallbacks_at(&self, site: FallbackSite) -> usize {
+            self.fallbacks_by_site[site.index()]
+        }
+        /// This door's tallies, mutably.
+        fn door_mut(&mut self, door: Door) -> &mut DoorCounts {
+            match door {
+                Door::EnsureHeap => &mut self.ensure_heap,
+                Door::EnsureHeapFull => &mut self.ensure_heap_full,
+                Door::AllocWordsRooted => &mut self.alloc_words_rooted,
+                Door::ServeGcRequest => &mut self.serve_gc_request,
+            }
+        }
+
+        /// Every door's tallies, in a fixed order.
+        pub(crate) fn doors(&self) -> [(Door, DoorCounts); 4] {
+            [
+                (Door::EnsureHeap, self.ensure_heap),
+                (Door::EnsureHeapFull, self.ensure_heap_full),
+                (Door::AllocWordsRooted, self.alloc_words_rooted),
+                (Door::ServeGcRequest, self.serve_gc_request),
+            ]
+        }
+    }
+
+    thread_local! {
+        /// This thread's tallies since the last [`reset`].
+        static COUNTERS: Cell<ValveCounters> =
+            const { Cell::new(ValveCounters::ZERO) };
+    }
+
+    /// This thread's tallies since the last [`reset`].
+    pub(crate) fn snapshot() -> ValveCounters {
+        COUNTERS.with(Cell::get)
+    }
+
+    /// Zeroes this thread's tallies (a measurement's "before" reading).
+    pub(crate) fn reset() {
+        COUNTERS.with(|counters| counters.set(ValveCounters::ZERO));
+    }
+
+    /// Records that `door` reached its valve call, with the verdict that got it there and the
+    /// number of machine root words the call is about to classify.
+    pub(crate) fn note_reached(
+        door: Door,
+        occupancy: bool,
+        debt: bool,
+        forced: bool,
+        machine_words: usize,
+    ) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            let tally = value.door_mut(door);
+            tally.reached += 1;
+            tally.occupancy += usize::from(occupancy);
+            tally.debt += usize::from(debt);
+            tally.forced += usize::from(forced);
+            tally.machine_words += machine_words;
+            counters.set(value);
+        });
+    }
+
+    /// Records one valve answer: whether the descent latch was open and whether the valve
+    /// declined.
+    pub(crate) fn note_valve(door: Door, descend: bool, declined: bool) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            let tally = value.door_mut(door);
+            tally.latch_open += usize::from(descend);
+            tally.hits += usize::from(declined);
+            tally.descents += usize::from(descend && !declined);
+            counters.set(value);
+        });
+    }
+
+    /// Where the unscanned container a decline was caused by was found.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum DeclineCause {
+        /// A machine root word (phase 1 over the caller's x/stack/FR slices).
+        MachineRoot,
+        /// A process root word (phase 1 over `Walk::seed_process_roots`).
+        ProcessRoot,
+        /// Only the descent (a nested shape).
+        Descent,
+    }
+
+    /// Classifies a decline the valve already reported: **which root family** held the unscanned
+    /// container the decline is attributable to?
+    ///
+    /// This is a test-only *re-derivation* of the walk's own phases, in the same order, so the
+    /// attribution cannot disagree with the decline itself: the machine roots are classified
+    /// first (the walk seeds them first and returns on the first hit), then the process roots
+    /// alone with `descend == false` (which is exactly `Walk::seed_process_roots`'s per-word
+    /// phase), and everything the descent had to find falls through to [`DeclineCause::Descent`].
+    /// It costs one extra phase 1 in a test build; a release build has no counters at all.
+    pub(crate) fn classify_decline<'a, I>(
+        scratch: &mut super::super::gc_walk::WalkScratch,
+        process: &beam_process::Process,
+        machine_roots: I,
+    ) -> DeclineCause
+    where
+        I: IntoIterator<Item = &'a Eterm>,
+    {
+        if machine_roots
+            .into_iter()
+            .any(|&word| super::root_is_unscanned(process, word))
+        {
+            return DeclineCause::MachineRoot;
+        }
+        if super::super::gc_walk::process_roots_are_unscanned(scratch, process, false) {
+            return DeclineCause::ProcessRoot;
+        }
+        DeclineCause::Descent
+    }
+
+    /// Records which root family caused one decline (see [`classify_decline`]).
+    pub(crate) fn note_decline(door: Door, cause: DeclineCause) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            let tally = value.door_mut(door);
+            match cause {
+                DeclineCause::MachineRoot => tally.machine_root_hits += 1,
+                DeclineCause::ProcessRoot => tally.process_root_hits += 1,
+                DeclineCause::Descent => tally.descent_hits += 1,
+            }
+            counters.set(value);
+        });
+    }
+
+    /// Records that `door` ran a real collection.
+    pub(crate) fn note_collected(door: Door) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.door_mut(door).collections += 1;
+            counters.set(value);
+        });
+    }
+
+    /// Records one arena fallback (`Runtime::note_gc_fallback`) and, with it, one latch
+    /// **opening** event.
+    ///
+    /// This is the total, called from `Runtime::note_gc_fallback` itself, so it counts every
+    /// caller — including the out-of-lane ones — and is the figure `Runtime::gc_stats().fallbacks`
+    /// reports. [`note_fallback_at`] adds the in-lane attribution alongside it.
+    pub(crate) fn note_fallback() {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.fallbacks += 1;
+            counters.set(value);
+        });
+    }
+
+    /// Attributes one arena fallback to the **in-lane refusal** that caused it
+    /// ([`FallbackSite`]) — called next to `Runtime::note_gc_fallback` at the sites in this
+    /// module that can name one.
+    pub(crate) fn note_fallback_at(site: FallbackSite) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.fallbacks_by_site[site.index()] += 1;
+            counters.set(value);
+        });
+    }
 }
 
 #[cfg(test)]

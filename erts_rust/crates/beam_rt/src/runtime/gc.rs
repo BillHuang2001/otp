@@ -497,8 +497,26 @@ impl Runtime {
         // of this process, which is exactly the event the gate records (it can only ever make a
         // later valve more conservative). See [`Runtime::walk_scratch`].
         let pid_foreign = self.foreign_reachable(pid);
-        if crate::context::gc_walk::process_roots_are_unscanned(self.walk_scratch(), process, pid_foreign)
-        {
+        #[cfg(test)]
+        crate::context::gc::valve_counters::note_reached(
+            crate::context::gc::valve_counters::Door::ServeGcRequest,
+            false,
+            false,
+            false,
+            0,
+        );
+        let declined = crate::context::gc_walk::process_roots_are_unscanned(
+            self.walk_scratch(),
+            process,
+            pid_foreign,
+        );
+        #[cfg(test)]
+        crate::context::gc::valve_counters::note_valve(
+            crate::context::gc::valve_counters::Door::ServeGcRequest,
+            pid_foreign,
+            declined,
+        );
+        if declined {
             self.note_foreign_reachable(pid);
             return false;
         }
@@ -506,6 +524,10 @@ impl Runtime {
             Ok(collection) => {
                 self.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
                 self.note_gc_reclaimed(collection.stats.words_reclaimed);
+                #[cfg(test)]
+                crate::context::gc::valve_counters::note_collected(
+                    crate::context::gc::valve_counters::Door::ServeGcRequest,
+                );
                 true
             }
             Err(_) => {
@@ -575,6 +597,8 @@ impl Runtime {
     pub(crate) fn note_gc_fallback(&mut self, pid: ProcessId) {
         self.gc.fallbacks += 1;
         self.gc.foreign.borrow_mut().insert(pid);
+        #[cfg(test)]
+        crate::context::gc::valve_counters::note_fallback();
     }
 
     /// Opens `pid`'s **descent gate** ([`GcState::foreign`]): from now on the unscanned-root

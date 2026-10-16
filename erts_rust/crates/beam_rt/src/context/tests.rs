@@ -7094,3 +7094,316 @@ fn a_tagged_literal_root_is_scanned_and_the_loop_collects() {
         heap_large.stats.collections,
     );
 }
+
+/// The **copy-bound two-process ping-pong** (`srprof`): a worker echoes the payload back and the
+/// driver compares it, `N` times.
+///
+/// It is the workload whose profile the valve's per-word phase dominates, and it differs from the
+/// `ets_copy` fixtures above in exactly the way that matters: every iteration **sends** the
+/// payload to the worker and **receives** it back, so the delivery path (not just a local heap
+/// build) is in the loop. Its result is the iteration count.
+const SRPROF_SOURCE: &str = r#"-module(srprof).
+-export([plain/1]).
+payload() ->
+    #{a => [1,2,3,4,5,6,7,8,9,10],
+      b => {ok, <<"hello world">>, 3.5},
+      c => <<1,2,3,4,5,6,7,8,9,10,11,12>>,
+      d => "a char list",
+      e => -42}.
+plain(N) ->
+    W = spawn(fun() -> worker() end),
+    R = plain(N, W, 0),
+    W ! stop, R.
+plain(0, _W, Acc) -> Acc;
+plain(N, W, Acc) ->
+    T = payload(),
+    W ! {self(), T},
+    receive
+        {W, T2} -> case T2 of T -> plain(N - 1, W, Acc + 1) end
+    after 30000 -> exit(message_timeout)
+    end.
+worker() ->
+    receive
+        {From, T} -> From ! {self(), T}, worker();
+        stop -> ok
+    end.
+"#;
+
+/// One ping-pong measurement: the result, the runtime's own GC counters and the valve's tallies.
+struct PingPongRun {
+    /// The iteration count the workload returned.
+    value: i64,
+    /// The runtime's own collection counters at the end of the run.
+    stats: GcStatsSnapshot,
+    /// The unscanned-root valve's per-door tallies over the run.
+    counters: gc::valve_counters::ValveCounters,
+}
+
+/// Runs `srprof:plain/1` at `n` on a **fresh** runtime through the scheduled route, with the
+/// valve's test-only tallies zeroed immediately before the run.
+fn ping_pong_run(path: &std::path::Path, n: i64) -> PingPongRun {
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    gc::valve_counters::reset();
+    let value = rt
+        .run_scheduled(path, "plain", 1, &[make_small(n)])
+        .expect("the ping-pong runs to completion on the scheduled path");
+    PingPongRun {
+        value: signed_value(value),
+        stats: rt.gc_stats(),
+        counters: gc::valve_counters::snapshot(),
+    }
+}
+
+/// Renders one door's tallies for the test's diagnostic line.
+fn door_line(door: gc::valve_counters::Door, counts: &gc::valve_counters::DoorCounts) -> String {
+    format!(
+        "{door:?}: reached={} occupancy={} debt={} forced={} latch_open={} hits={} \
+         [machine_root={} process_root={} descent={}] descents={} collections={} machine_words={}",
+        counts.reached,
+        counts.occupancy,
+        counts.debt,
+        counts.forced,
+        counts.latch_open,
+        counts.hits,
+        counts.machine_root_hits,
+        counts.process_root_hits,
+        counts.descent_hits,
+        counts.descents,
+        counts.collections,
+        counts.machine_words,
+    )
+}
+
+/// Renders the arena-fallback attribution for the test's diagnostic line.
+fn fallback_line(counters: &gc::valve_counters::ValveCounters) -> String {
+    use gc::valve_counters::FallbackSite;
+    let sites: Vec<String> = FallbackSite::ALL
+        .iter()
+        .map(|site| format!("{site:?}={}", counters.fallbacks_at(*site)))
+        .collect();
+    format!("fallbacks={} [{}]", counters.fallbacks, sites.join(" "))
+}
+
+/// **The copy-bound ping-pong's per-iteration cost is the valve's per-word classification phase,
+/// and the counters say why it runs at every heap-admission point: the driver's nursery is full
+/// and never drains (no collection is ever taken at its door), so the occupancy short-circuit in
+/// front of the valve never fires, and the valve then *declines* the collection at (essentially)
+/// every reach — always on the same side, a **machine root word** that lies outside every region
+/// the collector scans.**
+///
+/// This is a **structural, deterministic** pin (never a timing): it drives the workload `perf`
+/// profiles at a small and a large iteration count and reads [`gc::valve_counters`], whose tallies
+/// are counts of calls and of root words — facts about the runtime, identical on an idle and on a
+/// loaded host.
+///
+/// The measured chain, in the order the counters establish it:
+///
+/// 1. the engine reaches exactly **two** valve doors per iteration — the `test_heap`/
+///    `allocate_heap` admission point ([`gc::valve_counters::Door::EnsureHeapFull`]) and, when the
+///    young-heap bump cannot serve a term construction, the rooted allocation seam
+///    ([`gc::valve_counters::Door::AllocWordsRooted`]). The narrow door and the runner's park arm
+///    have no call site for this workload (all-zero tallies);
+/// 2. the full-root door is reached **exactly** when its occupancy test says the nursery is full
+///    (`reached == occupancy`, `debt == 0`, `forced == 0`) — the driver's nursery is full from
+///    early on and nothing ever drains it, so the short-circuit can never keep the valve off;
+/// 3. the valve **declines** nearly every call (`hits ≈ reached`), and the decline is attributed
+///    to a **machine root** at essentially every zero-collection call (`process_root_hits == 0`,
+///    `descent_hits == 0`): the engine holds a term from a region the collector does not scan
+///    (the pointer-stable arena [`Runtime::alloc_words`](crate::runtime::Runtime) hands out) in
+///    one of the ~1024 published x-file slots;
+/// 4. the rooted door therefore **never** collects (`collections == 0`) and the driver's term
+///    constructions fall back to that arena — once per iteration, exactly the allocation whose
+///    hand-out keeps the machine root in a register alive: the decline circle is self-sustaining
+///    (`fallbacks` grows with `N`, all of it attributed to
+///    [`gc::valve_counters::FallbackSite::ValveDeclined`]);
+/// 5. each reach classifies the **whole** machine root set — the whole x-register file plus the
+///    whole FR file ([`publish_roots_full`] appends the FR file after the stack) — ~2 Ki words per
+///    reach, so the per-word phase costs ~4 Ki words **per iteration**: the figure that makes it
+///    the dominant term of this workload's profile.
+///
+/// The collections the runtime *does* run (`stats.collections`) are the **worker's**: its received
+/// copies leave no arena term in a register (`descents` > 0), so its own door commits. They are a
+/// small fraction of the iterations — a driver that never collects is the asymmetry under test.
+///
+/// A missing `erlc` is a **loud skip**, never a silent pass.
+#[test]
+fn the_copy_bound_ping_pong_declines_the_valve_at_every_admission_point() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly("srprof-valve", "erlc was not found beside $ERTS_ORACLE or on $PATH");
+        return;
+    };
+    let dir = compile_fixtures(&erlc, "srprof_valve", &[("srprof", SRPROF_SOURCE)]);
+    let path = dir.join("srprof.beam");
+
+    const SMALL: i64 = 200;
+    const MID: i64 = 15_000;
+    const LARGE: i64 = 30_000;
+    let small = ping_pong_run(&path, SMALL);
+    let mid = ping_pong_run(&path, MID);
+    let large = ping_pong_run(&path, LARGE);
+
+    // Determinism first: the workload really ran both counts, so every ratio below is a
+    // statement about work done, not about a run that stopped early.
+    assert_eq!(small.value, SMALL, "the small run returned its iteration count");
+    assert_eq!(mid.value, MID, "the mid run returned its iteration count");
+    assert_eq!(large.value, LARGE, "the large run returned its iteration count");
+
+    for (label, n, run) in [("small", SMALL, &small), ("mid", MID, &mid), ("large", LARGE, &large)] {
+        eprintln!(
+            "srprof-valve {label} (N={n}): value={} collections={} major={} fallbacks={} \
+             pinned={} halted={} {}",
+            run.value,
+            run.stats.collections,
+            run.stats.major,
+            run.stats.fallbacks,
+            run.stats.pinned,
+            run.stats.halted,
+            fallback_line(&run.counters),
+        );
+        for (door, counts) in run.counters.doors() {
+            eprintln!("srprof-valve {label}: {}", door_line(door, &counts));
+        }
+    }
+
+    let full = &large.counters.ensure_heap_full;
+    let rooted = &large.counters.alloc_words_rooted;
+    let reached = full.reached + rooted.reached;
+
+    // (1) The two engine doors are the only ones reached, and the valve is reached many times per
+    //     iteration: the occupancy test passes again and again because the nursery never drains.
+    //     The bound is deliberately loose (a factor of 2 below the measured rate) so the pin states
+    //     the mechanism, not a fragile exact count.
+    let other = large.counters.ensure_heap.reached + large.counters.serve_gc_request.reached;
+    assert_eq!(other, 0, "the engine reaches only the two full-root doors ({other} others)");
+    assert!(
+        reached as i64 > LARGE * 2,
+        "the valve must be reached many times per iteration: reached={reached} for N={LARGE} \
+         (full={} rooted={})",
+        full.reached,
+        rooted.reached,
+    );
+    // (2) Every one of those reaches had the occupancy test pass: nothing is reached "for free",
+    //     and the collection debt (a no-collect growth) never forces the door.
+    assert_eq!(
+        full.reached, full.occupancy,
+        "the full-root door is reached exactly when its occupancy test says the nursery is full"
+    );
+    assert_eq!(full.debt, 0, "no growth leaves collection debt at the full-root door");
+    assert_eq!(full.forced, 0, "the workload requests no collection");
+    // (3) The valve declines essentially every call, and the decline is a **machine root**: the
+    //     engine holds an unscanned term in a published x-file slot. A process root or a descent
+    //     hit would mean a different mechanism entirely.
+    assert!(
+        full.hits as i64 > LARGE * 3 / 4,
+        "the full-root door must decline at (almost) every admission point: hits={} for N={LARGE}",
+        full.hits,
+    );
+    assert_eq!(
+        full.machine_root_hits, full.hits,
+        "every full-root decline is attributable to a machine root word"
+    );
+    assert_eq!(
+        full.process_root_hits, 0,
+        "no decline comes from a process root (the mailbox/dictionary/signal roots are clean)"
+    );
+    assert_eq!(
+        full.descent_hits, 0,
+        "no decline needed the O(live objects) descent: phase 1 finds the unscanned root itself"
+    );
+    // (4) The rooted allocation seam is reached exactly once per iteration, and it never gets past
+    //     the valve: it never collects, so the driver's payload build always lands on the arena.
+    assert!(
+        rooted.reached == rooted.hits && rooted.collections == 0 && rooted.descents == 0,
+        "every rooted reach must decline without a collection: reached={} hits={} collections={} \
+         descents={}",
+        rooted.reached,
+        rooted.hits,
+        rooted.collections,
+        rooted.descents,
+    );
+    assert!(
+        rooted.reached as i64 >= LARGE * 3 / 4,
+        "the rooted seam is reached ~once per iteration: reached={} for N={LARGE}",
+        rooted.reached,
+    );
+    // The arena fallbacks are the rooted door's declines, and they are the runtime's own total: an
+    // allocation per iteration that the collector never reclaims.
+    use gc::valve_counters::FallbackSite;
+    assert_eq!(
+        large.counters.fallbacks,
+        large.stats.fallbacks as usize,
+        "the tally must agree with the runtime's own arena-fallback counter"
+    );
+    assert_eq!(
+        large.counters.fallbacks_at(FallbackSite::ValveDeclined),
+        rooted.reached,
+        "every rooted decline sends its allocation to the arena"
+    );
+    assert_eq!(
+        large.counters.fallbacks_at(FallbackSite::PostCollection),
+        0,
+        "the rooted seam never reaches its post-collection bump: the valve refuses first"
+    );
+    assert!(
+        large.counters.fallbacks as i64 > LARGE,
+        "more than one arena fallback per iteration: {} for N={LARGE}",
+        large.counters.fallbacks,
+    );
+    assert!(
+        large.counters.fallbacks > small.counters.fallbacks,
+        "the arena fallbacks must scale with the iteration count: small={} large={}",
+        small.counters.fallbacks,
+        large.counters.fallbacks,
+    );
+    // The collections the runtime runs are not the driver's declines: they are a small fraction of
+    // the iterations (the worker's, whose roots are clean), never one per admission point.
+    assert!(
+        large.stats.collections * 16 < LARGE as u64,
+        "collections must stay rare next to the iterations: {} for N={LARGE}",
+        large.stats.collections,
+    );
+    // (5) The per-word phase is the *whole* machine root set per call, not the live prefix: the
+    //     full-root doors classify the whole x file (1024) plus the whole FR file (1024) plus the
+    //     Erlang stack, so the classification work is ~2 Ki words per reach and ~4 Ki per
+    //     iteration — the numbers that make the per-word phase this workload's dominant term.
+    const MIN_WORDS_PER_REACH: usize = 2_000;
+    assert!(
+        full.machine_words >= full.reached * MIN_WORDS_PER_REACH
+            && rooted.machine_words >= rooted.reached * MIN_WORDS_PER_REACH,
+        "each reach must classify the whole x + FR file: \
+         full={}/{} rooted={}/{}",
+        full.machine_words,
+        full.reached,
+        rooted.machine_words,
+        rooted.reached,
+    );
+    let total_words = full.machine_words + rooted.machine_words;
+    assert!(
+        total_words >= (LARGE as usize) * 4_000,
+        "the per-word phase must classify ~4 Ki words per iteration: {total_words} for N={LARGE}"
+    );
+    // ...and the classification workload therefore scales with the door's own reach count, which
+    // itself scales with the iterations.
+    let small_reached =
+        small.counters.ensure_heap_full.reached + small.counters.alloc_words_rooted.reached;
+    assert!(
+        reached > small_reached * 10,
+        "the valve's reach count must scale with the iteration count: small={small_reached} \
+         large={reached}",
+    );
+    // The reach count is *linear* in the iteration count (a fixed number of reaches per
+    // iteration), which is what makes the per-word phase's total cost scale with `N`:
+    let mid_reached = mid.counters.ensure_heap_full.reached + mid.counters.alloc_words_rooted.reached;
+    assert!(
+        reached > mid_reached && reached < mid_reached * 3,
+        "the valve's reach count must be linear in the iteration count: mid={mid_reached} \
+         large={reached} for {MID} -> {LARGE}",
+    );
+    eprintln!(
+        "srprof-valve totals: reached={reached} (~{:.1}/iteration) machine_words={total_words} \
+         (~{:.0} words/iteration) fallbacks={}",
+        reached as f64 / LARGE as f64,
+        total_words as f64 / LARGE as f64,
+        large.counters.fallbacks,
+    );
+}
