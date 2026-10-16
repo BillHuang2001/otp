@@ -92,6 +92,8 @@
 //! closure at all: it is the real `EXPORT_EXT` term, applied through the host's dispatch.
 
 mod ast;
+mod bits;
+mod bits_match;
 mod parse;
 
 use std::collections::HashMap;
