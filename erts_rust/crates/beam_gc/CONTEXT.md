@@ -526,17 +526,16 @@ constructors only (no new error enum).
   however many cycles run (measured: 400 grow+admit cycles, occupancy-only admission → peak chain **401**
   spaces; debt claimed → peak chain **2** with **932** words retained = the largest single space installed;
   `MEASURED.md`); the cost that makes it opt-in: Handoffs.
-- **Promotion atomicity is guaranteed only on the *total* line budget.** A minor promotes only when
-  `mature.free_lines() >= needed` (the exact line count of the live nursery graph), and a major checks the
-  same after reclaiming — but line-granular allocation needs a *contiguous* run **inside one 16-line block**
-  (`ImmixSpace::find_run`/`first_hole`), while `free_lines()` counts the whole region. So a fragmented mature
-  space can fail a per-object reservation mid-promotion with the typed `heap_exhausted` even though the total
-  budget reported room. A request whose line count leaves a per-block hole (e.g. 7 lines in a 16-line block:
-  two objects fill 14 of 16 lines) reaches this on an ordinary workload, not only a pathological one —
-  measured on the mark-region strategy at a 2048-word region after 43 promote/reclaim rounds (`MEASURED.md`);
-  it reproduces with an occupancy-only admission signal (chain length 1 throughout), so it is independent of
-  the retention path. A caller-visible symptom is a promotion that fails while `mature_available_words()`
-  looks sufficient.
+- **A refused promotion is ATOMIC; `collect` recovers, `collect_minor` does not.** Line-granular allocation
+  needs a *contiguous* run inside one 16-line block (`find_run`/`first_hole`), so a fragmented region can
+  refuse an object although region-wide `free_lines()` reports room; the promotion driver
+  (`src/immix_collector/promote.rs`) then rolls BOTH spaces back byte-for-byte (each source restored from its
+  own copy, each reservation un-claimed via `ImmixSpace::release_words`) and reports `PromoteOutcome::
+  WouldNotFit` — no marker, no rewritten root, no counter advanced. `collect` escalates that to a fullsweep
+  and `grow_major` rebuilds a fresh region (fragmentation-free by monotone packing), even at the *current*
+  capacity when a ceiling forbids growing; only a ceiling that cannot hold the live set in ANY layout reports
+  the typed heap exhaustion, and still before any word is copied. `collect_minor`'s own public contract
+  reports the typed error rather than escalating — escalation is `collect`'s job.
 - **The C `high_water` single-block layout, per-object tenuring (`GEN_GCS`/`MAX_GEN_GCS`) and the
   `F_NEED_FULLSWEEP` flag protocol** — replaced by the simpler two-space young/mature scheme above.
 - **Dirty-scheduler escape for long collections** (`ERTS_POTENTIALLY_LONG_GC_HSIZE`).
