@@ -531,8 +531,9 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   function whose own body issues no fun-image BIF is admitted in-machine and its blocking `receive`
   suspends through the ordinary `RunOutcome::Wait` path. The compile route reaches the compiler's own
   `catch`-handler diagnostics **without** an io-server workaround: the `io` device floor serves
-  `io:fwrite/2` (`tests/io_diagnostic_unmask.rs` pins a real stdlib module's in-process compile to print
-  a `Function: ` line and never report `calling_self`), so a genuine compiler crash reports its real
+  `io:fwrite/2` (`tests/io_diagnostic_unmask.rs` pins a pair of real stdlib modules spanning both
+  outcomes — a clean compile and a compiler-pass failure — to never report `calling_self`, to report a
+  real result, and, only on a failing module, to carry a `Function: ` line), so a genuine compiler crash reports its real
   reason. The route completes for **72 of the 86** oracle-compilable `lib/stdlib/src/*.erl` with
   byte-identical `.beam`; the 14 failures are heap-independent compiler-runtime defects (12 —
   `c`, `dets`, `epp`, `ets`, `io`, `peer`, `qlc`, `shell`, `slave`, `sys`, `timer`, `win32reg` — raise

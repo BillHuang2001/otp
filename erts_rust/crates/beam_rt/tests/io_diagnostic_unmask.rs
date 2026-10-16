@@ -41,35 +41,57 @@
 //! as `calling_self`. The `io` floor (`src/native/io.rs`) serves `io:fwrite/2` directly, so
 //! the `Function: <name>/<arity>` line is printed and the real reason propagates.
 //!
-//! # What is asserted
+//! # What is asserted: the invariant, not the outcome
 //!
-//! A real stdlib module is compiled **in process** under the built `beam_rt` binary
-//! ([`CARGO_BIN_EXE_beam_rt`]) with
+//! A small set of real stdlib modules is compiled **in process** under the built `beam_rt`
+//! binary ([`CARGO_BIN_EXE_beam_rt`]) with
 //! `[no_spawn_compiler_process,deterministic,no_docs,return_errors,return_warnings,{outdir,D}]`,
-//! and the probe's output must (i) contain a `Function: ` line — the compiler's own
-//! diagnostic print — and (ii) contain **no** `calling_self` anywhere. It is also asserted
-//! against the live oracle that the **source** is compilable, so the rust-side failure is
-//! demonstrably a residual rather than a broken input.
+//! and **for every module** the probe asserts the invariant this suite exists to pin:
 //!
-//! # The deliberate coupling to an out-of-scope residual
+//! 1. **the combined stdout+stderr contains no `calling_self`** — the io-device failure is
+//!    exactly what used to replace the compiler's real reason, so its presence anywhere in a
+//!    compiler run is the regression. This is the one thing that must **never** appear;
+//! 2. the run rode a real in-process compile to a **reported** outcome — the probe's own
+//!    `RETSAW` line names either `{ok, Module, …}` or `{error, …}` (see
+//!    [`reported_outcome`]) — so the "no `calling_self`" claim is about a compile that
+//!    actually ran rather than a probe that died early;
+//! 3. **conditionally on that outcome being `{error, …}`**, a `Function: ` diagnostic line
+//!    was printed. Only a *failing* compile has a `catch` handler to report, so this evidence
+//!    is deliberately conditional: a module compiling cleanly prints no diagnostic and the
+//!    check is simply skipped for it.
 //!
-//! The module compiles to `{ok, Module, []}` on the oracle, but **not** yet under this
-//! runtime: `lib/stdlib/src/erl_tar.erl` crashes in `beam_core_to_ssa:function/2`
-//! (`{crash,core_to_ssa,badarg,…}`) and `lib/stdlib/src/erl_lint.erl` crashes in
-//! `beam_ssa_opt:phase/4` (`{crash,beam_ssa_opt,{badmap,…}}`) — both are **separate,
-//! out-of-scope defects** in the compiler-runtime surface (a `maps:*` iteration-term
-//! mis-rejection owned by `crates/beam_bifs`), *not* io defects. This probe therefore
-//! **depends** on one of them still being present: the `Function: ` line only exists
-//! because a compiler pass catches a crash. It deliberately does **not** assert that the
-//! module compiles. If that residual is ever fixed, this probe must be re-pointed at a
-//! module that still crashes a compiler pass; the failure message says so.
+//! Each module's source is also compiled by the **live oracle**, and the oracle must report
+//! `{ok, Module, …}`: the inputs are demonstrably compilable, so a rust-side `{error, …}` is a
+//! residual of this runtime rather than a broken input. A missing `erl` is a **loud** skip,
+//! never a silent pass, and the oracle is discovered by filesystem only
+//! (`tests/support/mod.rs`).
 //!
-//! `erl_tar.erl` is probed rather than `erl_lint.erl` (the other stdlib module that reaches
-//! the diagnostic) purely for the probe budget: its in-process compile takes ~5 s against a
-//! shared `PROBE_TIMEOUT` of 30 s, where `erl_lint.erl` takes ~23 s — a margin too thin for a
-//! loaded CI host.
+//! # Why an invariant and not a fixed outcome
 //!
-//! A missing `erl` is a **loud** skip, never a silent pass (`tests/support/mod.rs`).
+//! Both outcomes are legitimate here, because this runtime's in-process compile is *not* yet
+//! oracle-complete: `lib/stdlib/src/erl_tar.erl` currently fails in
+//! `beam_core_to_ssa:function/2` (`{crash,core_to_ssa,badarg,…}`) — a **separate,
+//! out-of-scope defect** in the compiler-runtime surface (a `maps:*` iteration-term
+//! mis-rejection owned by `crates/beam_bifs`), *not* an io defect. An earlier version of this
+//! probe asserted the `Function: ` line **unconditionally**, i.e. it depended on that foreign
+//! defect still being present and would have started failing the moment it was fixed —
+//! blocking the agent fixing it. The assertion is therefore re-pointed at the invariant the
+//! `io` floor is responsible for, over a set that **spans both outcomes** today
+//! ([`PROBED`]): at least one module that compiles cleanly on both runtimes, and at least one
+//! that currently fails here. Whichever way the out-of-scope residual moves — closed entirely
+//! (both modules compile), partially (one of each), or with the failure re-appearing elsewhere
+//! — this probe keeps pinning "the compiler's diagnostics are not replaced by
+//! `calling_self`" without constraining the outcome.
+//!
+//! # The probe budget
+//!
+//! A single in-process compile must stay well inside the shared
+//! `support::PROBE_TIMEOUT` (30 s), because a probe killed at the bound is a test failure.
+//! Measured on this host against a debug `beam_rt`: `math.erl` ≈ 0.9 s, `ordsets.erl` ≈ 1.2 s,
+//! `erl_tar.erl` ≈ 4.8 s — whereas `string.erl` takes ≈ 20 s and `erl_lint.erl` ≈ 23 s, i.e.
+//! margins too thin for a loaded CI host (they carry the same invariant but are not worth the
+//! risk). The compilable module in [`PROBED`] is therefore one of the small ones, not
+//! `string.erl`/`json.erl`.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape
@@ -84,6 +106,53 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The executable under test, exactly as the other contract suites drive it.
 const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
+
+/// The probe's own marker, so the outcome assertion cannot be satisfied by an unrelated line.
+const MARKER: &str = "RETSAW";
+
+/// The diagnostic every crashing compiler pass prints from its `catch` handler
+/// (`io:fwrite("Function: ~w/~w\n", [Name, Arity])`).
+const DIAGNOSTIC: &str = "Function: ";
+
+/// The io-device failure the `io` floor removed: the compiler's diagnostic call used to raise
+/// it and thereby *replace* the pass's real reason. Its appearance anywhere in a compiler run
+/// is the regression this suite pins.
+const MASKING_REASON: &str = "calling_self";
+
+// ---------------------------------------------------------------------------------------
+// The probed modules
+// ---------------------------------------------------------------------------------------
+
+/// One probed stdlib module, with the reason it belongs to the set.
+struct Probed {
+    /// The source path relative to `$ERL_TOP`.
+    source: &'static str,
+    /// The module name `compile:file/2` reports in its result tuple.
+    module: &'static str,
+    /// What is known about this module's outcome today.
+    today: &'static str,
+}
+
+/// **The probed set — at least one module per outcome.** It must span a module that compiles
+/// cleanly on both runtimes *and* a module that currently fails here, so the invariant holds
+/// whichever way the out-of-scope `maps:*` residual moves (see the module docs).
+const PROBED: &[Probed] = &[
+    Probed {
+        source: "lib/stdlib/src/ordsets.erl",
+        module: "ordsets",
+        today: "compiles cleanly under both runtimes today (~1.2 s in process here) — its job is \
+                to show the probe rides the compiler to a real reported result with no diagnostic \
+                to print",
+    },
+    Probed {
+        source: "lib/stdlib/src/erl_tar.erl",
+        module: "erl_tar",
+        today: "compiles on the oracle but NOT yet under this runtime (~4.8 s in process here; it \
+                crashes in `beam_core_to_ssa:function/2` because of the separate, out-of-scope \
+                `maps:*` iterator-term defect in `crates/beam_bifs`) — its job is to show a \
+                compiler pass's own `Function: <name>/<arity>` diagnostic reaches the output",
+    },
+];
 
 // ---------------------------------------------------------------------------------------
 // The bounded child runner
@@ -181,98 +250,163 @@ fn source_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------------------
-// The probe
+// The probe and its outcome
 // ---------------------------------------------------------------------------------------
 
 /// `compile:file(Source, [no_spawn_compiler_process, deterministic, no_docs, return_errors,
 /// return_warnings, {outdir, Dir}])`, then the result — the same option list the oracle is
 /// given, so the only difference between the two runs is the runtime.
 ///
-/// `RETSAW` is the probe's own marker so the assertion cannot be satisfied by an unrelated
-/// line. `no_docs` keeps a real module's artifact independent of the `Docs` chunk and
+/// `MARKER` is the probe's own marker so the outcome assertion cannot be satisfied by an
+/// unrelated line. `no_docs` keeps a real module's artifact independent of the `Docs` chunk and
 /// `return_errors`/`return_warnings` make the compiler **return** the failure instead of
 /// exiting, so the probe always reaches its `halt(0)`.
 fn compile_probe(src: &Path, outdir: &Path) -> String {
     format!(
         "R = compile:file({}, [no_spawn_compiler_process, deterministic, no_docs, \
          return_errors, return_warnings, {{outdir, {}}}]),\n\
-         io:format(\"RETSAW ~p~n\", [R]),\n\
+         io:format(\"{MARKER} ~p~n\", [R]),\n\
          halt(0).",
         literal(src),
         literal(outdir)
     )
 }
 
-/// **The diagnostic-unmasking probe.** See the module docs for what is compared and why the
-/// `Function: ` line is coupled to an out-of-scope residual.
+/// How the in-process compile ended, as reported by the probe's own `MARKER` line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome {
+    /// `{ok, Module, …}` — the module compiled (with or without warnings).
+    Compiled,
+    /// `{error, …}` — the compiler reported a failure (the real reason, not a masked one).
+    Errored,
+}
+
+/// Classifies the probe's result line for `module`, or `None` when the probe never reported
+/// one — the case in which the "no `calling_self`" claim would be vacuous and the probe must
+/// fail loudly instead.
+///
+/// Both outcomes are accepted **by design** (see the module docs): only the `calling_self`
+/// invariant is fixed.
+fn reported_outcome(text: &str, module: &str) -> Option<Outcome> {
+    if text.contains(&format!("{MARKER} {{ok,{module},")) {
+        Some(Outcome::Compiled)
+    } else if text.contains(&format!("{MARKER} {{error")) {
+        Some(Outcome::Errored)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The probe
+// ---------------------------------------------------------------------------------------
+
+/// **The diagnostic-unmasking probe.** For every module in [`PROBED`] — a set spanning a
+/// cleanly-compiling module and one that currently fails here — the oracle must compile it,
+/// and this runtime's in-process compile must report a real outcome while **never** producing
+/// `calling_self`. See the module docs for why the invariant, not the outcome, is asserted.
 #[test]
 fn the_compilers_own_diagnostic_is_not_masked_as_calling_self() {
     let Some(oracle) = support::require_oracle("io_diagnostic") else {
         return;
     };
-    let src = source_root().join("lib/stdlib/src/erl_tar.erl");
-    if !src.is_file() {
-        support::skip_loudly(
-            "io_diagnostic",
-            &format!("no real stdlib source to compile at {}", src.display()),
-        );
-        return;
+    let root = source_root();
+
+    // Discover every probed source up front: a missing one is a **loud** skip, never a silent
+    // pass (and never a mid-set partial run presented as a success).
+    let sources: Vec<PathBuf> = PROBED.iter().map(|probe| root.join(probe.source)).collect();
+    for (probe, src) in PROBED.iter().zip(&sources) {
+        if !src.is_file() {
+            support::skip_loudly(
+                "io_diagnostic",
+                &format!(
+                    "no real stdlib source to compile at {} — this module is in the probed set \
+                     because it {}",
+                    src.display(),
+                    probe.today
+                ),
+            );
+            return;
+        }
     }
 
     let dir = TempDir::new();
-    let rust_out = dir.0.join("rust_out");
-    let oracle_out = dir.0.join("oracle_out");
-    // `compile` does not create the output directory.
-    for out in [&rust_out, &oracle_out] {
-        fs::create_dir_all(out).expect("the output directory");
+    for (probe, src) in PROBED.iter().zip(&sources) {
+        let rust_out = dir.0.join(format!("rust_{}", probe.module));
+        let oracle_out = dir.0.join(format!("oracle_{}", probe.module));
+        // `compile` does not create the output directory.
+        for out in [&rust_out, &oracle_out] {
+            fs::create_dir_all(out).expect("the output directory");
+        }
+
+        // ---- the oracle: the source really is compilable ----
+        let theirs = oracle_eval(&oracle, &compile_probe(src, &oracle_out));
+        assert_eq!(
+            theirs.code, 0,
+            "{}: the oracle must complete the probe: exit {} — {}",
+            probe.source,
+            theirs.code,
+            theirs.combined()
+        );
+        assert!(
+            theirs
+                .out_str()
+                .starts_with(&format!("{MARKER} {{ok,{},", probe.module)),
+            "{}: the source must be compilable on the oracle, so a rust-side `{{error, …}}` is a \
+             residual of this runtime rather than a broken input — the oracle printed {:?}",
+            probe.source,
+            theirs.out_str()
+        );
+
+        // ---- this runtime: the probe must reach a reported outcome, with no masked reason ----
+        let ours = beam_rt_eval(&compile_probe(src, &rust_out));
+        assert_eq!(
+            ours.code, 0,
+            "{}: the probe must reach its own halt(0) — exit {} — {}",
+            probe.source,
+            ours.code,
+            ours.combined()
+        );
+        let combined = ours.combined();
+        eprintln!(
+            "in-process compile of {} under beam_rt printed:\n{combined}",
+            probe.source
+        );
+
+        // (1) THE INVARIANT. `calling_self` is exactly what the compiler's diagnostic call
+        // used to raise, replacing the pass's real reason with its own.
+        assert!(
+            !combined.contains(MASKING_REASON),
+            "{}: the compiler's diagnostic call must not raise `{MASKING_REASON}` — the io \
+             device floor serves `io:fwrite/2` natively, so a compiler pass's diagnostic print \
+             reaches the output and its real reason propagates. Captured output: {:?}",
+            probe.source,
+            combined
+        );
+
+        // (2) The run really rode a compile to a reported result — either outcome is fine, but
+        // a run that reported neither would make the invariant above vacuous. `today`: {}.
+        let Some(outcome) = reported_outcome(&combined, probe.module) else {
+            panic!(
+                "{}: the in-process compile must report `{MARKER} {{ok,{},…}}` or \
+                 `{MARKER} {{error, …}}` so the `{MASKING_REASON}` check is not vacuous — it \
+                 reported neither, which means `compile:file/2` never produced a result here. \
+                 Captured output: {:?}",
+                probe.source, probe.module, combined
+            );
+        };
+
+        // (3) CONDITIONAL on a failure: the compiler's own `Function: <name>/<arity>` line
+        // must have been printed. A cleanly compiling module has no crash for a pass's `catch`
+        // handler to report, so nothing is required of it (and nothing is asserted).
+        if outcome == Outcome::Errored {
+            assert!(
+                combined.contains(DIAGNOSTIC),
+                "{}: the compile failed, so a compiler pass's own `{DIAGNOSTIC}<name>/<arity>` \
+                 diagnostic must reach the output — it did not. Captured output: {:?}",
+                probe.source,
+                combined
+            );
+        }
     }
-
-    // ---- the oracle: the source really is compilable ----
-    let theirs = oracle_eval(&oracle, &compile_probe(&src, &oracle_out));
-    assert_eq!(
-        theirs.code, 0,
-        "the oracle must complete the probe: exit {} — {}",
-        theirs.code,
-        theirs.combined()
-    );
-    assert!(
-        theirs.out_str().starts_with("RETSAW {ok,erl_tar,"),
-        "the source must be compilable on the oracle (so the rust-side failure is a residual, \
-         not a broken input) — the oracle printed {:?}",
-        theirs.out_str()
-    );
-
-    // ---- this runtime: the compiler's own diagnostic must survive ----
-    let ours = beam_rt_eval(&compile_probe(&src, &rust_out));
-    assert_eq!(
-        ours.code, 0,
-        "the probe must reach its own halt(0) — exit {} — {}",
-        ours.code,
-        ours.combined()
-    );
-    eprintln!(
-        "in-process compile of erl_tar.erl under beam_rt printed:\n{}",
-        ours.combined()
-    );
-
-    // (ii) the reason must not be the io-device failure. `calling_self` is exactly what the
-    // compiler's diagnostic call used to raise, replacing its real reason with its own.
-    assert!(
-        !ours.combined().contains("calling_self"),
-        "the compiler's diagnostic call must not raise `calling_self` — the io device floor \
-         serves `io:fwrite/2` natively. Captured output: {:?}",
-        ours.combined()
-    );
-
-    // (i) the compiler's own `Function: <name>/<arity>` line must have been printed. This
-    // line only exists because a compiler pass catches a crash, so the probe is deliberately
-    // coupled to that (separate) residual — see the module docs.
-    assert!(
-        ours.combined().contains("Function: "),
-        "the compiler's own `Function: <name>/<arity>` diagnostic must reach the output. If \
-         the in-process compile now SUCCEEDS (the `beam_core_to_ssa`/`maps:*` residual was \
-         fixed) there is no crash for the handler to report and this probe must be re-pointed \
-         at a module that still crashes a compiler pass. Captured output: {:?}",
-        ours.combined()
-    );
 }
