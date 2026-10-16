@@ -172,7 +172,8 @@ pub(crate) struct WalkScratch {
 /// the collector does not scan is reachable from one it does.
 ///
 /// `machine_roots` are the words the caller is about to publish (the engine's x registers, the
-/// whole Erlang stack and the whole FR file); the process's **own** root-set containers are
+/// whole Erlang stack, and each register file at its own **pointer-bearing prefix** — the FR file
+/// reaches this walk up to `fr_count`, not whole); the process's **own** root-set containers are
 /// always included, because [`Process::collect`] gathers them on every collection. Passing an
 /// over-approximation of the roots is always allowed: a spurious hit only **declines** a
 /// collection that might have been sound (the allocation then falls back to the pointer-stable

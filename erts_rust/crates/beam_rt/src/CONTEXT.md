@@ -79,8 +79,10 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
 - `dist.rs` + `dist/` + `dist_client.rs` → the distributed node, accepting and connecting halves
   (`dist/CONTEXT.md`).
 - `eval/` → the `-eval` evaluator (AST/parser/`Flow`) (`eval/CONTEXT.md`).
-- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `timers.rs`, `nif.rs`, the
-  observability modules and `main.rs` → documented in `../CONTEXT.md` (the crate routing table).
+- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `timers.rs`, `nif.rs`, `hasher.rs`
+  (the crate's one deterministic non-cryptographic `BuildHasher` — `FastHasher`/`FastBuildHasher`/
+  `FastHashSet`/`FastHashMap` — used by the per-pid verdict-only structures, never a keyed-by-`Arc<str>`
+  or security-sensitive map), the observability modules and `main.rs` → documented in `../CONTEXT.md` (the crate routing table).
 
 ## See Also
 - `../CONTEXT.md` → the crate-level API surface, CLI table, exit codes, `system_info` keys and gaps.
