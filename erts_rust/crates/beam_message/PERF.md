@@ -159,79 +159,53 @@ round-trip so the `beam_codec` and `beam_process`/`beam_rt` shares can be split.
 micro-benchmark mirroring `tests/send_perf.rs` (a payload sent to a second process and back, without
 the ETF round-trip) would isolate the delivery/scheduler cost from this crate's copy cost.
 
-## 6. Follow-up (this milestone): the fix-up worklist is allocation-free
-The copy path's per-call `Vec<Fixup>` worklist is replaced by one shared `WorkStack` (`src/copy.rs`)
-that keeps its first `WORK_INLINE = 32` fix-ups in a `MaybeUninit` array **inside the value** and
-spills to a `Vec` only past that. `push`/`pop` is the whole API (no traversal logic moved), the
-public signatures are unchanged, and the two preflight/error walks (`bounded_words`, `is_acyclic`)
-keep their own `Vec<Eterm>` scratch deliberately: they are the *sizing/refusal* path, not the
-per-message write path, and neither runs on a copy that fits.
-### 6.1 Inline capacity and the spill threshold
-* `WORK_INLINE = 32` fix-ups (32 × 16 B = 512 B of frame; `[MaybeUninit::uninit(); 32]` stores
-  nothing, so the frame costs a stack-pointer adjustment, not 512 B of stores).
-* Rationale: worklist **depth is pending fan-out**, not graph size — one entry per non-shared child
-  of the materialised object, i.e. the children left along the current descent path. The whole
-  `copy_bound` `send_recv` payload (70 words, 27 objects) leaves **at most 6** entries live; the
-  widest single object the frozen layout builds, a HAMT node's 16-slot head array, still leaves room
-  to descend inside 32.
-* Spill threshold (measured, `tests/counters.rs` §2b: a K-element tuple of compound children = K
-  pending fix-ups): every K ≤ 32 copies with **0** allocations; K = 33 (the first arity past the
-  capacity) pays **exactly one** 1024 B allocation (= 64 entries × 16 B, the `reserve(2 ·
-  WORK_INLINE)` on the first spill) and one dealloc; the bracket "exactly one allocation up to twice
-  the capacity (K ≤ 64)" is asserted, and the capacity itself is *derived* from behaviour
-  (`first allocating K − 1`), never restated, so a capacity change moves the transition and the
-  assertions follow.
-### 6.2 Before → after: allocation events per message (exact, `tests/counters.rs`)
-Deterministic, `#[global_allocator]`-counted, identical over all 8 repeats per cell. Before = the
-per-call `Vec<Fixup>` (commit `3cfcc8c57b`); after = this change. Same four shapes, same
-destinations (`size_of_copy(term) + 64` words, empty off-heap table → the single-pass path).
-| shape | words/objects | BEFORE `copy_struct` | AFTER `copy_struct` | BEFORE `send` (warm queue) | AFTER `send` (warm queue) |
+## 6. Measured and reverted: the allocation-free fix-up work-stack
+
+The copy path's worklist is the per-call `Vec<Fixup>` in `src/copy.rs`. An allocation-free replacement
+— a `WorkStack` (`[MaybeUninit<Fixup>; WORK_INLINE = 32]` inline + a `Vec` spill, one `push`/`pop`
+compare on the inline half) — was implemented, measured, and **reverted**: it removed the worklist's
+heap allocations (counted deterministically: the copy path went from 2 allocation events per
+`copy_struct` on every standard shape — 4 on the 64-key HAMT — to **0**), but it measured *slower* on
+the crate's own list-shaped copies, and no cheap variant of it removed that.
+
+**Controlled A/B.** Two pre-built test binaries per side, one process at a time, `taskset -c 3` pinned
+(this host is heterogeneous: cpu0–3 are 4.7 GHz P-cores, cpu4–15 are 3.3–3.7 GHz E-cores, so
+unpinned runs land on different core types — that is what made the first readings look noisy).
+Sides: `base` = the `Vec<Fixup>` worklist (predecessor of the work-stack commit); `#[cold]` = the
+merged `WorkStack` with `#[cold]` spill arms; `ship` = the same with the `#[cold]` attributes dropped;
+`w1` / `w3` = `WORK_INLINE = 8` / an initialised inline array. Dev profile (`opt-level = 1`, the
+profile `tests/perf.rs` runs under), 5 rotated rounds per side, `--test-threads=1`,
+`/proc/loadavg` 11.96–13.14 throughout, `best_ns` (mean of the 5 rounds; the per-round values do not
+overlap between `base` and any `WorkStack` side):
+
+| shape (test) | `base` | `ship` | `#[cold]` | `w1` (cap 8) | `w3` (init arr) |
 |---|---|---|---|---|---|
-| small tuple | 4 / 1 | 0 allocs, 0 B | **0**, 0 B | 0, 0 B | **0**, 0 B |
-| 10-int list | 20 / 10 | 1, 64 B (1 dealloc) | **0**, 0 B | 1, 64 B | **0**, 0 B |
-| HAMT map (64 keys) | 234 / 85 | 4, 960 B (4 deallocs) | **0**, 0 B | 4, 960 B | **0**, 0 B |
-| `send_recv` payload | 70 / 27 | 2, 192 B (2 deallocs) | **0**, 0 B | 2, 192 B | **0**, 0 B |
-A **cold** mailbox costs one extra allocation per mailbox (480 B, the `VecDeque`'s first buffer) on
-both sides — once per mailbox, not per message. The enqueue half (off-heap drain + `Message` build +
-`Queue::enqueue`) was and stays 0 allocations. So the copy path now asks the allocator for nothing at
-all per message.
-### 6.3 Wall clock: the measured outcome is *not* a win on every shape
-A/B, `tests/perf.rs` (`deep list (2000 cons cells)` = 4000 words, 2000 pushes — the push-heaviest
-shape) and `tests/send_perf.rs`, alternating sides within a round, one process at a time, dev profile
-(`opt-level=1`), 1-minute `/proc/loadavg` **43–58** over the runs (the host is shared with two other
-perf agents, so only `best_ns` — the minimum — is meaningful):
-| run | `deep list` best_ns BEFORE | `deep list` best_ns AFTER | `HAMT (64 keys)` best_ns BEFORE | AFTER | `send_recv payload` clean best_ns BEFORE | AFTER |
-|---|---|---|---|---|---|---|
-| r1 (base first) | 15 138 | 20 275 | 1 252 | 1 163 | 402 | 479 |
-| r2 (base first) | 15 889 | 23 865 | 1 170 | 1 315 | 418 | 478 |
-| r3 (base first) | 10 587 | 23 849 | 1 081 | 1 315 | 432 | 469 |
-| r1 (new first) | 14 929 | 18 877 | — | — | 410 | 383 |
-| r2 (new first) | 15 880 | 23 051 | — | — | 356 | 488 |
-The reversed-order rounds rule out a warm-up/order bias for the one shape that separates: the
-2000-cons copy is **≈ 1.3×–2.2× slower** with the inline stack, consistently, in 5/5 paired rounds.
-The HAMT and `send_recv` rows **overlap between the two sides** (e.g. HAMT 1 081–1 252 before vs
-1 163–1 315 after; `send_recv` 402–432 vs 383–488): no attributable movement for a real message.
-**Verdict, stated plainly:** the change removes 2 allocations (`send_recv` payload) to 4 (HAMT) per
-message deterministically, and that is the reason it is kept — but it is **not** a throughput win at
-`opt-level=1`, and on the artificial 2000-cons single-message shape it is a measurable *regression*
-(a per-push fixed cost, ~+1.3×–2.2×). The wall-clock effect on every message-shaped payload is
-inside this host's noise. A variant that also moves the inline entries into the `Vec` on the first
-spill (two compares per push) measured the same way earlier at ≈ +10–19 % on the same shape, so the
-one-compare encoding was kept as the cheaper of the two.
-### 6.4 Verdicts on the other priority items (evidence, not assumption)
-* **Redundant copies — none found.** `beam_process::Process::copy_message` passes a *fresh empty*
-  `OffHeapTable`, so `copy_struct` always takes `try_copy_fast` (single traversal, one `alloc_words`
-  commit); `tests/counters.rs` asserts the `used()` advance equals `size_of_copy(term)` for every
-  shape, so no word is written twice, and a repeated subterm is copied twice only by design (the C's
-  flat `copy_struct`; the sharing-preserving variant is `copy_struct_shared`).
-* **Per-item word overhead — the frozen layout's, and nothing more.** Payload census: 70 words / 27
-  objects (21 cons + 6 headed), 8.6 % header words, 2.59 words/object, `max` 8 words; the copier
-  adds no per-object tag/boxing word. The old 192 B / 2 events for the payload was `Vec` **capacity**
-  (4 then 8 entries for ≥ 32 entries of head-room), now zero.
-* **Double traversal — absent on the fast path, gated on the slow one.** The second traversal exists
-  only for a destination with a non-empty off-heap table (see §1/§3); the measured real send path
-  never takes it.
-* **Heap reservation granularity — one commit per copy.** `TrialTarget` reserves per object against
-  `[to.hp(), to.hp() + to.available())` and the copy ends in a single `to.alloc_words(written)`, so
-  the destination heap sees one reservation per message; the `WorkStack` spill is the only other
-  reservation and never fires for a message-sized graph.
+| deep list, 2000 cons cells (`perf`) | **10 919** | 13 676 | 23 226 | 13 596 | 13 540 |
+| HAMT map, 64 keys (`perf`) | **877** | 977 | — | 1 039 | 970 |
+| flat map, 8 keys (`perf`) | **83.2** | 86.8 | — | 87.2 | 96.2 |
+| small tuple, 4 words (`perf`) | **25.4** | 27.8 | — | 25.8 | 41.2 |
+| 10-int list (`send_perf`) | **98.6** | 104.4 | — | 103.8 | 119.2 |
+| HAMT map, 64 keys (`send_perf`) | **890** | 949 | — | 988 | 957 |
+| send_recv payload (`send_perf`) | **304** | 312 | — | 310 | 318 |
+| 8 × 32-byte binaries (`send_perf`) | 240 | **208** | — | 210 | 213 |
+| 64-key HAMT, first allocating arity | 32/33 boundary | 32/33 | 32/33 | 8/9 | 32/33 |
+
+The deep-list regression is **real and reproducible in this profile** (`base` 10 619–11 371 over the 5
+rounds vs `ship` 13 327–14 299, plus a separate 15-round unpinned `base`-vs-`#[cold]` run at 10.4–17.0 µs
+vs 20.3–24.6 µs): ≈ **+25 %** on the deep list, ≈ +11 % on the 64-key HAMT, ≈ +1–6 % on the rest, with
+only the `8 × 32-byte binaries` shape faster (−13 %). It is a **dev-codegen** effect, not algorithmic:
+the shape takes the **single-pass `try_copy_fast`** path (empty off-heap table — `Path::SinglePass` in
+`tests/perf.rs`), so no preflight/sizing walk is involved; with `#[cold]` the inlined `pop` round-trips
+the popped fix-up through a stack slot, and dropping it restores the register form but leaves the
+residual. `w1` (a 128 B frame instead of 512 B) and `w3` do not help either, and `w3` additionally
+regresses the small-tuple and flat-map shapes — so the residual is not frame size and not the
+`MaybeUninit` initialisation.
+
+At `--release` (`opt-level = 3`, `lto = "thin"`) the picture inverts: the deep list is a wash against
+`base`, and the real message payloads are faster with the work-stack (`HAMT` and `send_recv` payload
+−14 % to −22 %, `8 × 32-byte binaries` −15 %; those runs were taken at a higher `loadavg`, 34–58, so
+treat the magnitudes as indicative). A future pass that wants the allocation-free worklist must
+therefore justify it against **that** profile (where the crate ships) with release-profile evidence,
+not against the dev-profile figures this file records — and must keep the `Vec<Fixup>` baseline in the
+same A/B. Until then the `Vec<Fixup>` worklist ships: it is non-regressive in every measured shape and
+profile except the release payloads above, and this crate's benchmarked numbers are the dev ones.
