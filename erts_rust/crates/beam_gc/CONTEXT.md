@@ -415,6 +415,10 @@ constructors only (no new error enum).
 - `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` + `tests/gen_immix_collector.rs`
   → geometry/allocation/mark/pin/evacuation/accounting and the hard major cases; one corpus through both
   strategies behind one structural walker; a multi-block object.
+- `tests/immix_fragmentation.rs` → the atomic promotion: a refused promotion leaves both spaces
+  byte-identical (same roots, no marker, counters unchanged, identical on retry), and the 7-line/100-word and
+  9-line fragmentation shapes now reach a bounded steady state under both strategies with the live set
+  `compare`-equal to a witness after every round (deterministic counts asserted, no timing).
 - `tests/immix_break_even.rs` → a geometry `Law` asserted at every point; the 8-block constant pinned (NOT
   one line below); pause printed only.
 - `tests/immix_selection_curve.rs` → the two-axis curve, "moved words are object-size- and
