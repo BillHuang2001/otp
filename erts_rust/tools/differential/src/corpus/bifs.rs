@@ -25,7 +25,8 @@
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
-/// The A.7 cases: core BIFs and a `lists` function.
+/// The A.7 cases: core BIFs plus the `lists` and `maps` stdlib surface (the `bifs/`, `lists/` and
+/// `maps/` id prefixes).
 pub(crate) fn group() -> Vec<Case> {
     vec![
         Case {
@@ -1510,6 +1511,313 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok {true,true,true,true}"),
+                exit_code: 0,
+            },
+        },
+        // ---------------------------------------------------------------------------------
+        // The `maps/` prefix: the `maps:iterator/1,2` + `maps:next/1` family and the
+        // fun-taking `maps` fast paths (`map/2`, `fold/3`, `filter/2`, `foreach/2`,
+        // `update_with/3,4`, `merge_with/3`, `intersect_with/3`, `filtermap/2`).
+        //
+        // Iterator semantics pinned here (probed against the oracle before pinning):
+        //   * `maps:iterator/1` is a **list** `[Order|Map]` (`is_list/1` is `true`), *not* an
+        //     `{ok, Iterator}` pair, so the iterator term is passed straight to `maps:next/1`;
+        //   * `maps:iterator(M, ordered)` walks the keys in term order (numbers before atoms);
+        //     `maps:iterator(M, undefined)` (== `maps:iterator/1`) visits the same key set in
+        //     an *undefined* order, so an unordered walk is only observed through `lists:sort/1`;
+        //   * `maps:next/1` answers a three-tuple `{Key, Value, NextIterator}` and `none` at the
+        //     end of the iterator (an empty map's iterator answers `none` immediately).
+        //
+        // Golden discipline: the iterator term itself (`[Order|Map]`) and any multi-key map are
+        // runtime-internal renderings, so every case below projects them — `maps:next/1` is
+        // destructured down to `{Key, Value}`, every multi-key map goes through
+        // `lists:sort(maps:to_list(M))` / `maps:size(M)`, and a full walk is compared with
+        // `=:=` against `lists:seq/2` (a single `true`/`false`).
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "maps/iterator_next_of_a_single_key_map",
+            description: "maps:next/1 of a maps:iterator/1 answers the {Key, Value, NextIterator} triple",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A single-key map keeps the rendering stable; only `{K, Val}` is observed, never
+                // the iterator term itself.
+                expr: "begin {K,Val,_}=maps:next(maps:iterator(#{a=>1})), {K,Val} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {a,1}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/iterator_ordered_next_is_the_smallest_key",
+            description: "maps:iterator/2 with `ordered` starts at the smallest key in term order",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin {K,Val,_}=maps:next(maps:iterator(#{c=>3,a=>1,b=>2}, ordered)), {K,Val} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {a,1}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/iterator_walks_every_key_in_term_order",
+            description: "an `ordered` iterator walks every key/pair in term order (numbers before atoms)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The complete walk is itself an observable, so the accumulated list is compared
+                // as-is: `ordered` is documented to visit the keys in term order, and the second
+                // walk's mixed-type keys (integer 1 before the atoms a/b) pin that ordering.
+                expr: "begin Walk=fun W(It,Acc) -> case maps:next(It) of \
+                       none -> lists:reverse(Acc); {K,Val,N} -> W(N,[{K,Val}|Acc]) end end, \
+                       {Walk(maps:iterator(#{c=>3,a=>1,b=>2}, ordered), []), \
+                       Walk(maps:iterator(#{b=>2, 1=>x, a=>3}, ordered), [])} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[{a,1},{b,2},{c,3}],[{1,x},{a,3},{b,2}]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/iterator_undefined_order_visits_the_same_key_set",
+            description: "maps:iterator/1 (undefined order) visits the same key set as the ordered walk",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The *visit order* of an unordered iterator is not a portable observable, so the
+                // walk is sorted first — the pinned fact is the key set (and the pairs).
+                expr: "begin Walk=fun W(It,Acc) -> case maps:next(It) of \
+                       none -> lists:reverse(Acc); {K,Val,N} -> W(N,[{K,Val}|Acc]) end end, \
+                       lists:sort(Walk(maps:iterator(#{c=>3,a=>1,b=>2}), [])) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{a,1},{b,2},{c,3}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/iterator_exhausted_and_empty_maps_answer_none",
+            description: "maps:next/1 answers `none` past the end of an iterator and for an empty map",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin {_,_,I1}=maps:next(maps:iterator(#{a=>1})), \
+                       {maps:next(I1), maps:next(maps:iterator(#{})), \
+                       maps:next(maps:iterator(#{}, ordered))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {none,none,none}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/iterator_ordered_walk_of_a_hamt_is_term_ordered",
+            description: "an `ordered` walk of a 40-key (HAMT-backed) map is exactly the term-ordered keys",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // 40 keys crosses the flatmap/`HAMT` boundary, so this exercises the iterator over
+                // the non-flatmap representation. The walked key list is compared with `=:=` to
+                // `lists:seq(1,40)` (one `true`), plus its length/ends, to keep the golden short.
+                expr: "begin M=maps:from_list([{I,I} || I <- lists:seq(1,40)]), \
+                       Walk=fun W(It,Acc) -> case maps:next(It) of \
+                       none -> lists:reverse(Acc); {K,_,N} -> W(N,[K|Acc]) end end, \
+                       Ks=Walk(maps:iterator(M, ordered), []), \
+                       {length(Ks), hd(Ks), lists:last(Ks), Ks =:= lists:seq(1,40)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {40,1,40,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/iterator_and_next_error_shapes",
+            description: "maps:iterator/2 and maps:next/1 refuse a bad order, a non-map and a non-iterator",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Every refusal is caught inside the expression and reduced to its reason, so the
+                // case pins the fault classes: `badarg` for an unknown order atom and for a
+                // `maps:next/1` argument that is not an iterator, and `{badmap,Term}` for a
+                // `maps:iterator/1` argument that is not a map.
+                expr: "{try maps:iterator(#{a=>1}, bogus) of _ -> no_raise catch error:Reason1 -> {error,Reason1} end, \
+                       try maps:iterator([{a,1}]) of _ -> no_raise catch error:Reason2 -> {error,Reason2} end, \
+                       try maps:next(foo) of _ -> no_raise catch error:Reason3 -> {error,Reason3} end}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {{error,badarg},{error,{badmap,[{a,1}]}},{error,badarg}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/map_fold_filter_foreach_result_shape",
+            description: "maps:map/2, maps:fold/3, maps:filter/2 and maps:foreach/2 apply a fun",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin {maps:foreach(fun(_,_) -> ok end, #{a=>1}), \
+                       lists:sort(maps:to_list(maps:map(fun(_,N) -> N*2 end, #{a=>1,b=>2}))), \
+                       lists:sort(maps:fold(fun(K,N,A) -> [{K,N}|A] end, [], #{a=>1,b=>2})), \
+                       lists:sort(maps:to_list(maps:filter(fun(K,_) -> K =:= a end, #{a=>1,b=>2})))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[{a,2},{b,4}],[{a,1},{b,2}],[{a,1}]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/iteration_over_an_empty_map",
+            description: "the fun-taking maps fast paths on an empty map (foreach/2 answers `ok`)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `maps:foreach/2` returns `ok` (not a map), so its result is observed directly;
+                // the map-valued results are measured with `maps:size/1`.
+                expr: "begin {maps:size(maps:map(fun(_,N) -> N*2 end, #{})), \
+                       maps:fold(fun(_,_,A) -> A+1 end, 0, #{}), \
+                       maps:foreach(fun(_,_) -> ok end, #{}), \
+                       maps:size(maps:filter(fun(_,_) -> true end, #{}))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {0,0,ok,0}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/keys_values_to_list_and_from_list",
+            description: "maps:from_list/1 (last binding wins), maps:keys/1, values/1, to_list/1 and size/1",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin M=maps:from_list([{a,1},{b,2},{a,9}]), \
+                       {maps:size(M), maps:get(a,M), lists:sort(maps:to_list(M)), \
+                       lists:sort(maps:keys(M)), lists:sort(maps:values(M))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {2,9,[{a,9},{b,2}],[a,b],[2,9]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/get_2_and_3_on_present_and_absent_keys",
+            description: "maps:get/2 and maps:get/3 with the `{badkey,Key}` error of a missing key",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{maps:get(a, #{a=>1}), maps:get(z, #{a=>1}, default), \
+                       try maps:get(z, #{a=>1}) of _ -> no_raise \
+                       catch error:Reason -> {error,Reason} end}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {1,default,{error,{badkey,z}}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/update_with_arity_3_and_4",
+            description: "maps:update_with/3,4 update-or-insert, and /3 faults on an absent key",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{maps:get(a, maps:update_with(a, fun(X) -> X+1 end, #{a=>1})), \
+                       maps:get(z, maps:update_with(z, fun(X) -> X+1 end, 0, #{})), \
+                       try maps:update_with(z, fun(X) -> X end, #{a=>1}) of _ -> no_raise \
+                       catch error:Reason -> {error,Reason} end}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {2,0,{error,{badkey,z}}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/with_without_take_intersect",
+            description: "maps:with/2, maps:without/2, maps:take/2 (hit and miss) and maps:intersect/2",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `maps:take/2` on a hit is a one-key map (a stable rendering); on a miss it is the
+                // bare atom `error`.
+                expr: "begin {lists:sort(maps:to_list(maps:with([a,c], #{a=>1,b=>2}))), \
+                       lists:sort(maps:to_list(maps:without([b], #{a=>1,b=>2}))), \
+                       maps:take(a, #{a=>1,b=>2}), maps:take(z, #{a=>1}), \
+                       lists:sort(maps:to_list(maps:intersect(#{a=>1,b=>2}, #{b=>3,c=>4})))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[{a,1}],[{a,1}],{1,#{b => 2}},error,[{b,3}]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/merge_merge_with_intersect_with",
+            description: "maps:merge/2, maps:merge_with/3 and maps:intersect_with/3 with a combining fun",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin {lists:sort(maps:to_list(maps:merge(#{a=>1,b=>2}, #{b=>9}))), \
+                       lists:sort(maps:to_list(maps:merge_with(fun(_,X,Y) -> X+Y end, #{a=>1,b=>2}, #{b=>3}))), \
+                       lists:sort(maps:to_list(maps:intersect_with(fun(_,X,Y) -> X+Y end, \
+                       #{a=>1,b=>2}, #{b=>3,c=>4})))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[{a,1},{b,9}],[{a,1},{b,5}],[{b,5}]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/groups_from_list_and_filtermap",
+            description: "maps:groups_from_list/2,3 (grouping keeps insertion order) and maps:filtermap/2",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `groups_from_list/3` is `(KeyFun, ValueFun, List)`; the value lists inside each
+                // group are in input order (`lists:sort/1` sorts the outer `{Key, List}` pairs only).
+                expr: "begin {lists:sort(maps:to_list(maps:groups_from_list(fun(X) -> X rem 2 end, [1,2,3,4]))), \
+                       lists:sort(maps:to_list(maps:groups_from_list(fun(X) -> X rem 2 end, \
+                       fun(X) -> X*10 end, [1,2,3]))), \
+                       lists:sort(maps:to_list(maps:filtermap(fun(_K,N) -> \
+                       if N > 1 -> {true,N*2}; true -> false end end, #{a=>1,b=>2}))), \
+                       maps:size(maps:filtermap(fun(_,_) -> false end, #{a=>1,b=>2}))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[{0,[2,4]},{1,[1,3]}],[{0,[20]},{1,[10,30]}],[{b,4}],0}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "maps/fun_taking_fast_paths_on_a_hamt_map",
+            description: "maps:map/2, fold/3, filter/2 and foreach/2 over a 40-key (HAMT) map",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A 40-key map is HAMT-backed, so these exercise the fun-taking fast paths away
+                // from the flatmap representation; the sums/sizes are order-independent.
+                expr: "begin M=maps:from_list([{I,I} || I <- lists:seq(1,40)]), \
+                       {lists:sum(maps:values(maps:map(fun(_,N) -> N*2 end, M))), \
+                       maps:fold(fun(_,N,A) -> N+A end, 0, M), \
+                       maps:size(maps:filter(fun(_,N) -> N > 10 end, M)), \
+                       maps:foreach(fun(_,_) -> ok end, M)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {1640,820,30,ok}"),
                 exit_code: 0,
             },
         },
