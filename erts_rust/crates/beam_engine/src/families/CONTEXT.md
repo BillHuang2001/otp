@@ -122,6 +122,11 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   a `#[cfg(test)]` module. This is a genuinely rigorous result.
 
 ## Known Issues
+- **`funs/`: a non-fun / wrong-arity `call_fun` target raises the WRONG reason (oracle-verified divergence; fixable in this subtree).**
+  `Instr::CallFun`/`CallFun2` hand the target to `ctx.resolve_local_fun`, whose `beam_rt` body (`context/apply.rs::local_fun_target`) answers `Err(BeamError::BadArg)` for a non-fun and `Err(BeamError::BadArity)` for a wrong-arity fun; `call_fun` then maps that `Err` through `Machine::raise_bif_error`, so the engine raises the **bare atoms** `badarg`/`badarity`.
+  The oracle instead raises a **structured** reason: `5(1)` ⇒ `error:{badfun,5}` and `(fun(X)->X end)(one)`, i.e. `F(one)` with a 2-ary fun, ⇒ `error:{badarity,{Fun,[one]}}` (both verified with `erl` on OTP 29.1.1; legacy C `beam_common.c:1617-1622` `EXC_BADFUN` + `expand_error_value` `:754-768`).
+  `5(1)` is documented as an existing divergence in `../../../tools/differential/divergences.md` §A.1; the `{badarity,…}` shape is not yet recorded there.
+  Fix is entirely inside `funs/mod.rs::call_fun`: test `terms::is_fun(fun)` (and the descriptor arity vs `args.len()`) BEFORE consulting the seam and raise `{badfun,Fun}` / `{badarity,{Fun,Args}}` through the rooted builders (`badfun`/`badarity` are seeded by `beam_rt::boot::CORE_ATOMS`).
 - **Stale docs (parent, not this node):** `../CONTEXT.md` and `../../../crates/CONTEXT.md` claim
   `put_record/6`'s **create** form is a typed `unsupported`. It is **implemented** for the running module's
   own records (`records/mod.rs:643-732`); only the **foreign-module** id is a typed `unsupported` (`:756-758`).
