@@ -44,6 +44,7 @@ use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::run::{
     park_publish_counters, publish_parked_roots, registered_payload_total,
+    reset_park_publish_counters,
     reset_registered_payload_total, reset_run_slice_counters, run_slice_counters, RuntimeRunner,
 };
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
@@ -2413,6 +2414,9 @@ fn a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption() {
         .expect("slot 0 is in the FR file");
 
     // Slice 2: resuming with an empty mailbox parks again — now with one live FR slot.
+    // The structural counter is per-park, so it is zeroed before the measured slice (slice 1
+    // above is itself an exempt `Wait` park and would otherwise be counted too).
+    reset_park_publish_counters();
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
         runner
