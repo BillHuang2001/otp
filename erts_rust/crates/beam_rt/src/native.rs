@@ -31,6 +31,7 @@
 //! | `erl_ddll:loaded_drivers/0`, `erl_ddll:try_load/3`, `erl_ddll:try_unload/2`, `erl_ddll:info/2` | the loaded-driver **list** an `open_port({spawn_driver, Name}, …)` resolves the name against: it is the runtime's own `dlopen`/port registry (`crate::port::driver`), not `beam_bifs`'s separate one |
 //! | `erlang:display/1` | writes to the *process's* output sink |
 //! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
+//! | `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3` | the `io.erl` **device** request wrappers: `io.erl`'s own `{io_request, …}` round trip against the caller's group leader (itself) answers `calling_self`, so the runtime answers the device question natively (see [`io`]) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
 //! | `erlang:process_info/2` | reads a **process's** heap/GC observables out of this runtime's own process table (`beam_gc`'s `HeapInfo`; contract A.8) |
@@ -99,6 +100,7 @@ mod erts_internal;
 pub(crate) mod file_server;
 mod group_leader;
 mod init;
+mod io;
 mod loader;
 pub(crate) mod memory;
 mod net;
@@ -163,8 +165,9 @@ pub(crate) const FLOOR_MODULES: [&str; 14] = [
 /// [`floor_keys`] list is instead **key-granular**: only those keys are refused and every
 /// other name is an ordinary `.beam` body.
 ///
-/// `io` is the sharpest case. The floor serves only `io:put_chars/1,2` for that
-/// namespace ([`try_native`]'s `("io", "put_chars", 1 | 2)` arms); every *other* `io:*`
+/// `io` is the sharpest case. The floor serves only the device surface
+/// (`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3`)
+/// for that namespace ([`floor_keys`]'s `io` arm); every *other* `io:*`
 /// (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an ordinary
 /// body in `lib/stdlib/src/io.erl`, and **refusing** it here routes it onto the synchronous
 /// non-pumping [`RuntimeContext::call_bif`] path instead.
@@ -183,9 +186,10 @@ pub(crate) const FLOOR_MODULES: [&str; 14] = [
 /// `io:getopts/1` and `epp:parse_file/2` calls `io:scan_erl_form/4`, both of which stopped
 /// a scheduled process here.
 ///
-/// `io:put_chars/1,2` must therefore stay **refused** (the floor owns them). `io:format/2`
-/// and `io:printable_range/0` are `beam_bifs` registry BIFs and are still excluded, but by
-/// the registry check that `resolve_external_call` applies *after* this one.
+/// The device surface ([`floor_keys`]'s `io` arm) must therefore stay **refused** (the floor
+/// owns it). `io:format/1,2` and `io:printable_range/0` are `beam_bifs` registry BIFs and are
+/// still excluded, but by the registry check that `resolve_external_call` applies *after* this
+/// one.
 ///
 /// [`try_native`]: RuntimeContext::try_native
 /// [`RuntimeContext::resolve_external_call`]: crate::context::RuntimeContext
@@ -207,10 +211,26 @@ pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
 /// mirror here (`erlang`); those keep the module-wide exclusion.
 fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
     match module {
-        // The floor serves only `io:put_chars/1,2` for this namespace; every *other* `io:*`
-        // (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an
-        // ordinary body in `lib/stdlib/src/io.erl`.
-        "io" => Some(&[("put_chars", 1), ("put_chars", 2)]),
+        // The `io` **device** surface: `put_chars/1,2`, whose device argument is accepted
+        // and ignored (Milestone-1 has one output stream), plus the `io.erl` request
+        // wrappers `nl/0,1`, `fwrite/1,2,3`, `write/1,2` and `format/3`, which this runtime
+        // serves natively because `io.erl`'s own `{io_request, …}`/`{io_reply, …}` round trip
+        // against the caller's group leader (itself) answers `calling_self` (see [`io`]).
+        // Every *other* `io:*` (`io:getopts/1`, `io:setopts/2`, `io:request/2`,
+        // `io:scan_erl_form/4`, `io:format/1,2`, `io:printable_range/0`, …) is an ordinary
+        // body in `lib/stdlib/src/io.erl` or a `beam_bifs` registry BIF.
+        "io" => Some(&[
+            ("put_chars", 1),
+            ("put_chars", 2),
+            ("nl", 0),
+            ("nl", 1),
+            ("fwrite", 1),
+            ("fwrite", 2),
+            ("fwrite", 3),
+            ("write", 1),
+            ("write", 2),
+            ("format", 3),
+        ]),
         // `prim_tty` is a NIF library served whole from the floor: its `NIF_KEYS` list is
         // exactly the `-nifs` surface of `lib/kernel/src/prim_tty.erl`, so the stubs are
         // refused (→ `call_bif` → `try_native`) while the module's Erlang wrappers are
@@ -329,6 +349,20 @@ impl RuntimeContext<'_> {
             ("erlang", "display", 1) => Some(self.display(args)),
             ("io", "put_chars", 1) => Some(self.put_chars(args, 1)),
             ("io", "put_chars", 2) => Some(self.put_chars(args, 2)),
+            // The rest of the `io` **device** surface — the `io.erl` wrappers over
+            // `o_request/2`/`execute_request/3`, which this runtime cannot complete against
+            // itself (its own root process's group leader is itself, so `io.erl` answers
+            // `{ErrorTag, calling_self}`). Serving them here removes `io.erl` from the path
+            // and answers the device question natively; the rendering still goes through the
+            // registered `io_lib:format/2` BIF. See [`io`].
+            ("io", "nl", 0) => Some(self.io_nl(args, 0)),
+            ("io", "nl", 1) => Some(self.io_nl(args, 1)),
+            ("io", "fwrite", 1) => Some(self.io_fwrite(args, 1)),
+            ("io", "fwrite", 2) => Some(self.io_fwrite(args, 2)),
+            ("io", "fwrite", 3) => Some(self.io_fwrite(args, 3)),
+            ("io", "write", 1) => Some(self.io_write(args, 1)),
+            ("io", "write", 2) => Some(self.io_write(args, 2)),
+            ("io", "format", 3) => Some(self.io_format_3(args)),
             ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
@@ -1202,8 +1236,19 @@ mod tests {
         );
         assert_eq!(
             io_keys,
-            vec![("put_chars".to_string(), 1), ("put_chars".to_string(), 2)],
-            "the floor serves only `io:put_chars/1,2` for the `io` namespace — `floor_shadows` \
+            vec![
+                ("format".to_string(), 3),
+                ("fwrite".to_string(), 1),
+                ("fwrite".to_string(), 2),
+                ("fwrite".to_string(), 3),
+                ("nl".to_string(), 0),
+                ("nl".to_string(), 1),
+                ("put_chars".to_string(), 1),
+                ("put_chars".to_string(), 2),
+                ("write".to_string(), 1),
+                ("write".to_string(), 2),
+            ],
+            "the floor serves the `io` device surface for the `io` namespace — `floor_shadows` \
              must be updated alongside any new/removed floor `io` arm"
         );
         // The floor's `io` keys are refused ...
