@@ -528,43 +528,90 @@ impl ProcessRunner for RuntimeRunner<'_> {
                             module,
                             function,
                             arity,
-                        } => match module.export(*function, *arity) {
-                            // Entered at the export's own label on the tier chosen above
-                            // (`Tier::BaselineJit` under the default mode, `Tier::Interpreter`
-                            // under the `BEAM_RT_TIER=interpreter` kill switch). The baseline
-                            // driver handles the in-machine module-context switch itself: a
-                            // `call_ext*` the host resolves through
-                            // `ExecutionContext::resolve_external_call` (see
-                            // `src/context/mod.rs`) is entered in this same machine as a
-                            // `Step::Enter` — the `ENTER` block-ABI word, resolved and
-                            // re-entered in native code (see
-                            // `crates/beam_engine/src/jit/CONTEXT.md`). The tier is therefore
-                            // sound for any module and needs no per-module inspection; the
-                            // selection and its soundness argument live in `super::tier`. The
-                            // resume path above re-enters on the tier this process was selected
-                            // for (remembered in `ProcessEngine::tier`), so both halves of a
-                            // parked-and-resumed process stay tier-equivalent.
+                        } => {
+                            // A process entry that names an MFA the **host serves** must be
+                            // dispatched to the host, never entered as the module's own code:
+                            // `erlang.beam`'s `send/2` (for `spawn(erlang, send, [Pid, Msg])` —
+                            // which is what `timer_server`'s `do_apply/2` runs for a
+                            // `timer:apply_after/4` MFA) is
+                            // `func_info; move undefined->x0; call_ext_only erlang:nif_error/1`,
+                            // so entering it raises the bare atom `undefined` and the message is
+                            // never delivered. Real ERTS installs a BIF trampoline at such an
+                            // export. The cross-module-call seam already classifies exactly this
+                            // question — a floor name, a NIF-loaded module, a `beam_bifs`
+                            // registry key (where `erlang:send/2` and `erlang:abs/1` live) —
+                            // so the entry asks it the same thing a `call_ext*` does (see
+                            // `RuntimeContext::resolve_external_call`): `Some((_, label))` is
+                            // the route to code, `None` the route to `call_bif`'s dispatch
+                            // order (`try_call_nif` → `try_native` → `call_registered`). The
+                            // entered module stays the **entry's own** `Arc<Module>` — the one
+                            // the code server caches — so the engine's `Arc::ptr_eq`
+                            // module-context dedup is unaffected.
                             //
-                            // The label entry stays the equivalence-preserving route to the
-                            // export: `run_label_outcome_with_tier` calls `Machine::enter_run`,
-                            // so the run's `initial_call`/`current_function` are recorded and
-                            // `process_info/2`'s execution-position items can be answered.
-                            Some(label) => engine.machine.run_label_outcome_with_tier(
-                                module,
-                                label,
-                                *arity,
-                                &engine.args,
-                                &mut budget_ctx,
-                                tier,
-                            ),
-                            // An export the module does not define stays the engine's own typed
-                            // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable
-                            // for a spawned entry (`Runtime::spawn_process` resolves the export
-                            // first), and never a fabricated result.
-                            None => Err(crate::error::unsupported(
-                                "run_export: export not found",
-                            )),
-                        },
+                            // Both atoms are resolved from the module's **own** atom table
+                            // (never the runtime's shared namespace), and a missing one is the
+                            // honest typed gap rather than a substituted name — the entry module
+                            // and its export were resolved from this very table by
+                            // `Runtime::resolve_export_entry`.
+                            let names = module
+                                .atom_table
+                                .name(module.name)
+                                .zip(module.atom_table.name(*function));
+                            match names {
+                                Some((module_name, function_name)) => {
+                                    match budget_ctx.resolve_external_call(
+                                        module_name,
+                                        function_name,
+                                        *arity,
+                                    ) {
+                                        // Entered at the export's own label on the tier chosen
+                                        // above (`Tier::BaselineJit` under the default mode,
+                                        // `Tier::Interpreter` under the `BEAM_RT_TIER=interpreter`
+                                        // kill switch). The label entry is the
+                                        // equivalence-preserving route to the export — it calls
+                                        // `Machine::enter_run`, so the run's
+                                        // `initial_call`/`current_function` are recorded and
+                                        // `process_info/2`'s execution-position items can be
+                                        // answered exactly as they were before this seam was
+                                        // consulted. It is the `Arc<Module>` the code server
+                                        // caches (the entry's own), so the engine's `Arc::ptr_eq`
+                                        // module-context dedup still holds.
+                                        Ok(Some((_, label))) => engine
+                                            .machine
+                                            .run_label_outcome_with_tier(
+                                                module,
+                                                label,
+                                                *arity,
+                                                &engine.args,
+                                                &mut budget_ctx,
+                                                tier,
+                                            ),
+                                        // The host serves this MFA: dispatch it exactly as a
+                                        // `call_ext` would (`call_bif` applies the NIF → the
+                                        // runtime-native floor → the `beam_bifs` registry), and
+                                        // the returned value is the process's `x(0)`, recording
+                                        // like any other return — so `spawn(erlang, abs, [-3])`
+                                        // yields `3`. A fun entry with no local label takes the
+                                        // same shape below
+                                        // (`apply_fun(..).map(EngineRunOutcome::Returned)`). The
+                                        // resolution is idempotent, so it cannot disagree with
+                                        // the answer the synchronous path would have given.
+                                        Ok(None) => budget_ctx
+                                            .call_bif(
+                                                module_name,
+                                                function_name,
+                                                *arity,
+                                                &engine.args,
+                                            )
+                                            .map(EngineRunOutcome::Returned),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                None => Err(crate::error::unsupported(
+                                    "run_export: the entry module/function atom has no name",
+                                )),
+                            }
+                        }
                         // A fun entry: a resolved **local** closure is entered at its own label
                         // on this process's machine — the same entry an export takes, so its
                         // `receive` can park the process (see above). A fun with no local label

@@ -1326,12 +1326,16 @@ impl Evaluator<'_, '_> {
     /// That is what makes `spawn(fun() -> Self ! hello end), receive M -> M after 1000 -> …`
     /// work end to end.
     ///
-    /// * **with `after T`** — the mailbox is scanned, then the scheduler pumped, then — with
-    ///   nothing runnable — the port poller waited on for the remaining time (the shape
-    ///   `open_port({spawn, …}, …)` output arrives through). The `after` body runs once the
-    ///   deadline passes with no match. The wait is bounded by a single deadline, so the case
-    ///   with nothing to run and no port output cannot busy-spin.
-    /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
+    /// * **with `after T`** — the mailbox is scanned, then the scheduler pumped, then the
+    ///   remaining time is spent on the two *other* message sources: the port poller (the
+    ///   shape `open_port({spawn, …}, …)` output arrives through) and the runtime's own
+    ///   **timer heap** ([`Runtime::wait_for_timer`], the shape `erlang:send_after/3` and
+    ///   `timer:apply_after/4` messages arrive through). The `after` body runs once the
+    ///   deadline passes with no match. The whole wait is bounded by that one deadline — a
+    ///   window with no pending deadline is slept out, so `receive _ -> ok after 300 -> ok
+    ///   end` takes the oracle's 300 ms rather than returning at once — and the loop is
+    ///   driven by real deadlines only, so the case with nothing to run, no port output and
+    ///   no timer cannot busy-spin.    /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
     ///   runnable and then reports the typed capability gap `receive: no matching message
     ///   arrived` rather than hanging (there is no host timer to block on in Milestone 1).
     fn receive(&mut self, receive: &ast::Receive, env: &mut Env) -> EResult<Eterm> {
@@ -1361,7 +1365,8 @@ impl Evaluator<'_, '_> {
                     }
                     // The port poller owns the *other* message source (see the module docs of
                     // `crate::context`): its messages are produced, matched and discarded, not
-                    // enqueued, so a non-matching one is not left behind.
+                    // enqueued, so a non-matching one is not left behind. With a live port it
+                    // waits out the remaining time; with none it returns at once.
                     let messages = match self.ctx.poll_port_messages(remaining) {
                         Ok(messages) => messages,
                         Err(err) => return Err(Flow::Fatal(err)),
@@ -1371,12 +1376,26 @@ impl Evaluator<'_, '_> {
                             return Ok(result);
                         }
                     }
-                    // Nothing runnable and no matching port output. The poller waited the
-                    // remaining time, so a second round could only repeat it: run the `after`
-                    // body rather than spinning.
-                    break;
-                }
-                let mut body_env = env.clone();
+                    // The **third** source is the runtime's own timer heap, and only a
+                    // scheduler pass fires it: `timer:apply_after/4` (a `timer_server` arming
+                    // `erlang:start_timer/3`) and `erlang:send_after/3` deliver through it.
+                    // Waiting for the earliest pending deadline — or, with none, for the rest
+                    // of this window — and then pumping is what makes
+                    // `timer:apply_after(300, erlang, send, [Self, done]), receive M -> M
+                    // after 1500 -> timeout end` answer `done` here exactly as the oracle
+                    // does, and what makes a bare `receive _ -> ok after 300 -> ok end` take
+                    // its 300 ms instead of returning immediately. A context that must not
+                    // pump (the evaluator running *inside* a scheduler slice) keeps the old
+                    // immediate `after`: it may not re-enter the scheduler.
+                    if !self.ctx.may_pump_scheduler() {
+                        break;
+                    }
+                    if !heap!(self.ctx.runtime.wait_for_timer(deadline, RECEIVE_PUMP_SLICES)) {
+                        // Nothing was pending inside the window and nothing became due: the
+                        // window itself has elapsed, so run the `after` body.
+                        break;
+                    }
+                }                let mut body_env = env.clone();
                 self.exprs(body, &mut body_env)
             }
             None => loop {
