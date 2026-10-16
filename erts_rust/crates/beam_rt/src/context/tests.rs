@@ -3116,9 +3116,10 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
         "never enabled, so `undefined` is exact"
     );
 
-    // `garbage_collection` is the C's `{GCs, WordsReclaimed, 0}` shape, summed from this
-    // runtime's own collector counters. A fresh runtime has run no collection yet — the
-    // real-counter direction (a collection that really ran) is pinned by
+    // `garbage_collection` is the C's `{GCs, WordsReclaimed, 0}` shape, read from this
+    // runtime's own node-global GC counters. A fresh runtime has run no collection yet — the
+    // real-counter direction (a collection that really ran, and the words it reclaimed) is
+    // pinned by
     // `statistics_garbage_collection_reads_the_runtimes_own_collector_counters`.
     let value = ctx
         .call_bif("erlang", "statistics", 1, &[garbage_collection])
@@ -3212,67 +3213,85 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
     // `badarg`. These two are asserted above, next to the served statistics arms.
 }
 
-/// `statistics(garbage_collection)` reads the runtime's **own real** collector counters: a
-/// process that has really collected over its own young heap is reported, and the two figures
-/// are the collector's own cumulative ones (not a placeholder).
+/// `statistics(garbage_collection)` reads the runtime's **node-global** GC counters
+/// ([`Runtime::gc_stats`]), read through the **real dispatch** (the
+/// [`RuntimeHooksBridge`](crate::context) arm) as `(GCs, WordsReclaimed, Reserved)`.
+///
+/// A fresh runtime has run no collection at all — the C's own `{0, 0, 0}` shape — and a
+/// collection that really ran through [`Runtime::serve_gc_request`] moves **both** served
+/// figures by its own outcome: the cumulative collection count and the words that collection
+/// really reclaimed. It is deliberately **not** read from the live processes' collectors (which
+/// are empty of collections precisely when the workload's collections are the interesting
+/// ones); the runtime keeps the node-global totals itself. The same contract is pinned at the
+/// runtime level by `src/runtime/gc.rs`'s
+/// `statistics_garbage_collection_reads_the_node_global_collection_counters`.
+///
+/// No oracle comparison here: the crate's test strategy forbids comparing live GC counters
+/// against the oracle, so every figure below is this runtime's own.
 #[test]
 fn statistics_garbage_collection_reads_the_runtimes_own_collector_counters() {
     let mut rt = runtime();
-    // A live process whose own collector really runs: put a scratch tuple on its young heap
-    // (unrooted, so it is garbage) and collect.
-    let pid = rt.processes.spawn_default().expect("a spawned process");
-    {
-        let process = rt.processes.get_mut(pid).expect("the process is live");
-        process
-            .heap_mut()
-            .tuple(&[make_small(1), make_small(2), make_small(3)])
-            .expect("a scratch tuple on the young heap");
-    }
-    let collection = rt
-        .processes
+    let garbage_collection = rt.intern("garbage_collection");
+
+    // The served key, through the one real dispatch, as a 3-tuple of small integers.
+    let read = |rt: &mut Runtime| -> (Eterm, Eterm, Eterm) {
+        let mut ctx = RuntimeContext::new(rt);
+        let value = ctx
+            .call_bif("erlang", "statistics", 1, &[garbage_collection])
+            .expect("statistics(garbage_collection) is a served key");
+        assert_eq!(terms::tuple_arity(value).expect("a 3-tuple"), 3);
+        (
+            terms::tuple_element(value, 0).expect("GCs"),
+            terms::tuple_element(value, 1).expect("WordsReclaimed"),
+            terms::tuple_element(value, 2).expect("the reserved third element"),
+        )
+    };
+
+    // A fresh runtime has collected nothing: all three elements are real zeros.
+    let (gcs, words, reserved) = read(&mut rt);
+    assert_eq!(gcs, make_small(0), "a fresh runtime has collected nothing");
+    assert_eq!(words, make_small(0), "and so reclaimed nothing");
+    assert_eq!(reserved, make_small(0), "the C's reserved third element");
+
+    // A real collection through the forced-GC latch: `serve_gc_request` takes a **standalone**
+    // `ProcessTable` and collects the live process's own young heap. The heap carries an
+    // unrooted (garbage) tuple, which the collection frees rather than copies.
+    let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+        &mut AtomTable::new(),
+    ));
+    let pid = table.spawn_default().expect("a process");
+    table
         .get_mut(pid)
         .expect("the process is live")
-        .collect()
-        .expect("a process-heap collection");
+        .heap_mut()
+        .tuple(&[make_small(1), make_small(2), make_small(3)])
+        .expect("a scratch tuple on the young heap");
+    rt.request_gc(pid);
     assert!(
-        collection.stats.words_reclaimed > 0,
-        "the unrooted tuple was garbage the collector reclaimed"
+        rt.serve_gc_request(&mut table, pid),
+        "the forced collection really ran"
     );
 
-    // The expected answer is exactly what the live processes' collectors say now.
-    let expected: (i64, i64) = rt
-        .processes()
-        .pids()
-        .filter_map(|live| rt.processes().get(live))
-        .fold((0, 0), |(collections, reclaimed), process| {
-            let stats = process.collector().stats();
-            (
-                collections + (stats.minor_collections + stats.major_collections) as i64,
-                reclaimed + stats.words_reclaimed as i64,
-            )
-        });
-    assert!(expected.0 > 0, "a collection really ran");
+    let stats = rt.gc_stats();
+    assert!(stats.collections >= 1, "a collection really ran: {stats:?}");
+    assert!(
+        stats.reclaimed > 0,
+        "the unrooted tuple was garbage the collector reclaimed: {stats:?}"
+    );
 
-    let garbage_collection = rt.intern("garbage_collection");
-    let mut ctx = RuntimeContext::new(&mut rt);
-    let value = ctx
-        .call_bif("erlang", "statistics", 1, &[garbage_collection])
-        .expect("statistics(garbage_collection)");
-    assert_eq!(terms::tuple_arity(value).expect("a 3-tuple"), 3);
+    // The served answer is exactly the runtime's own cumulative counters.
+    let (gcs, words, reserved) = read(&mut rt);
     assert_eq!(
-        signed_value(terms::tuple_element(value, 0).expect("GCs")),
-        expected.0,
-        "the collections the live collectors really ran"
+        signed_value(gcs),
+        i64::try_from(stats.collections).expect("a small collection count"),
+        "the runtime's own cumulative collection count"
     );
     assert_eq!(
-        signed_value(terms::tuple_element(value, 1).expect("WordsReclaimed")),
-        expected.1,
+        signed_value(words),
+        i64::try_from(stats.reclaimed).expect("a small reclaimed-word count"),
         "the words those collections really reclaimed"
     );
-    assert_eq!(
-        terms::tuple_element(value, 2).expect("the reserved third element"),
-        make_small(0)
-    );
+    assert_eq!(reserved, make_small(0), "the C's reserved third element");
 }
 
 /// The counters this runtime keeps for `erlang:statistics/1` are read from its **own real
@@ -6292,6 +6311,11 @@ fn a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected() {
             "round {round}: the forced collection must RUN — the BIF result is on the scanned \
              heap, so the unscanned-root valve has nothing to decline; {after:?}"
         );
+        assert!(
+            after.reclaimed > before.reclaimed,
+            "round {round}: the collection really reclaimed the dead list words, counted from the \
+             collection's own outcome at the door site; {after:?}"
+        );
         assert_eq!(
             after.halted, before.halted,
             "round {round}: nothing failed; {after:?}"
@@ -6606,11 +6630,11 @@ fn gc_ab_run(path: &std::path::Path, function: &str, n: i64) -> GcAbRun {
 ///   contains `fconv`/`fmul` instructions and its slices end with `fr_mark() > 0`. The float
 ///   expression is deliberately **literal-free** (`math:sqrt(float(X))`, *not* `float(X) * 3.5`):
 ///   a float **operation** writes the FR file, whereas a float **literal** is folded into the
-///   literal area and — while still live in a register at a `test_heap` call site — is an
-///   **untagged** literal-area root that trips the unscanned-root valve and declines *every*
-///   collection for an unrelated, already-escalated reason
-///   (`an_untagged_literal_root_declines_the_collection_until_the_loader_tags_literals`). That
-///   confound would mask the FR reaction this experiment is about, so the row must not carry it.
+///   literal area and never writes FR. That literal-area shape is no longer a collection confound
+///   in its own right — `beam_loader`'s literal-area decode now tags the area at load time
+///   (`beam_term::literal::tag_literal_area`), so a live literal root is a scanned literal rather
+///   than an untagged container the unscanned-root valve would decline — but keeping the row
+///   literal-free anyway leaves the experiment's variable exactly one: the FR reaction.
 ///
 /// All three rows now **scale with N and pin nothing**: `pinned` is 0 everywhere and each larger
 /// run collects strictly more than its smaller twin — the float-using row included, which is the
