@@ -62,7 +62,7 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 19 suites, 180
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 21 suites, 197
 passing; the full crate total is in the parent node's *Test Strategy*.
 
 ## Known Issues / Notes for Agents
