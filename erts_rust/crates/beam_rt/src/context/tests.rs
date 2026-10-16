@@ -346,6 +346,72 @@ fn tables_capable_names_exactly_the_table_registry_seam_consumers() {
     assert!(!RuntimeContext::tables_capable("erts_internal", "ets_raw_next", 1));
 }
 
+/// **The nested-`ets:*`-inside-a-fold residual is closed**: the fold holds the shared
+/// `TableRegistry` cell for its whole duration, so it **lends** the one live `&mut` through
+/// `BifContext::call_fun_with_tables` and the nested `ets:lookup/2` resolves.
+///
+/// Oracle (`erl -noshell -eval '…' -s init stop`): the same expression prints `10`, exit 0.
+/// Before the lend, the nested lookup failed its `try_borrow_mut` and raised
+/// `unsupported: bif` (exit 3) — a typed capability gap, never a wrong result.
+#[test]
+fn ets_lookup_inside_an_ets_foldl_fun_reaches_the_folded_table() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X}) || X <- [1,2,3,4]], \
+             ets:foldl(fun(X, A) -> \
+                 A + element(2, hd(ets:lookup(T, element(1, X)))) end, 0, T) end",
+        )
+        .expect("an ets:lookup/2 inside the fun ets:foldl/3 applies");
+    assert_eq!(signed_value(term), 10, "1+2+3+4, each read back from T");
+}
+
+#[test]
+fn ets_lookup_inside_an_ets_foldr_fun_reaches_the_folded_table() {
+    let mut rt = runtime();
+    // The right-to-left twin: the accumulated list is built from the nested lookups.
+    // Oracle (`erl -noshell -eval '…' -s init stop`, the identical expression): prints
+    // `[1,2,3,4]`, exit 0.
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X}) || X <- [1,2,3,4]], \
+             ets:foldr(fun(X, A) -> \
+                 [element(2, hd(ets:lookup(T, element(1, X)))) | A] end, [], T) end",
+        )
+        .expect("an ets:lookup/2 inside the fun ets:foldr/3 applies");
+    let printed = rt.format_term(term, None).expect("~p renders the folded list");
+    assert_eq!(printed.trim_end(), "[1,2,3,4]");
+}
+
+/// **A lent registry is installed for *every* nested call, not only a reentrant one**, which is
+/// what carries it through an intermediate that installs no cell of its own: the `lists:map/2`
+/// inside a fold's fun (deliberately *not* on [`RuntimeContext::tables_capable`]) applies a
+/// second fun whose `ets:lookup/2` must still resolve.
+///
+/// The innermost lookup is keyed on `element(1, X)`: `ets:foldl/3` hands its fun the stored
+/// **object** (the whole tuple), and looking a tuple up as a key finds nothing, so `hd([])`
+/// would raise `badarg` on **this** runtime and on the oracle alike.
+///
+/// Oracle (`erl -noshell -eval '…' -s init stop`, the identical expression): prints `100`,
+/// exit 0 — so the shape crosses the `-eval` evaluator's fun-inside-a-fun boundary on both
+/// runtimes and the assertion below is a real oracle cross-check.
+#[test]
+fn ets_lookup_survives_a_fold_fun_through_a_lists_map_fun() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin T = ets:new(t, [ordered_set]), \
+             [ets:insert(T, {X, X * 10}) || X <- [1,2,3,4]], \
+             ets:foldl(fun(X, A) -> \
+                 A + lists:sum(lists:map(fun(Y) -> \
+                     element(2, hd(ets:lookup(T, Y))) end, [element(1, X)])) end, 0, T) end",
+        )
+        .expect("ets:lookup through a fold fun and a lists:map fun");
+    assert_eq!(signed_value(term), 100, "(1+2+3+4)*10");
+}
+
 #[test]
 fn the_arena_is_unbounded_in_milestone_one() {
     let mut rt = runtime();
@@ -2014,6 +2080,89 @@ fn term_to_binary_of_an_internal_pid_is_a_new_pid_ext() {
     assert_eq!(signed_value(tag), 88);
 }
 
+/// The `LOCAL_EXT` (`121`) image: `term_to_binary(Term, [local])` is live on every arm, because
+/// [`NodeIdentity`] now answers [`LocalNode::local_node_hash`].
+///
+/// Oracle (`erl -noshell -eval 'B = term_to_binary({ok,17},[local]),
+/// io:format("~p~n",[{binary:at(B,0),binary:at(B,1),binary_to_term(B)}])' -s init stop`):
+/// prints `{131,121,{ok,17}}`, exit 0; a second call of the same expression is `=:=` the first.
+/// Before the change `binary:at(B, 1)` raised the typed `unsupported_bif` gap (exit 3),
+/// because the seam's default `local_node_hash` was `None`.
+#[test]
+fn term_to_binary_local_is_a_real_image_end_to_end() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin B = term_to_binary({ok, 17}, [local]), \
+             {binary:at(B, 0), binary:at(B, 1), binary_to_term(B), \
+              B =:= term_to_binary({ok, 17}, [local])} end",
+        )
+        .expect("term_to_binary({ok,17},[local])");
+    let printed = rt.format_term(term, None).expect("~p renders the probe tuple");
+    assert_eq!(printed.trim_end(), "{131,121,{ok,17},true}");
+}
+
+/// The hash is stable for the whole OS process, so two **separate** `rt.eval` calls render the
+/// same `~p` string (the [`super::node_hash::node_hash`] `OnceLock` pin).
+#[test]
+fn a_local_image_is_stable_across_two_evaluations() {
+    let mut rt = runtime();
+    let first = rt
+        .eval("term_to_binary({ok, 17}, [local])")
+        .expect("the first [local] image");
+    let second = rt
+        .eval("term_to_binary({ok, 17}, [local])")
+        .expect("the second [local] image");
+    assert_eq!(
+        rt.format_term(first, None).expect("~p renders the first image"),
+        rt.format_term(second, None).expect("~p renders the second image"),
+        "the per-OS-process hash must not drift between calls"
+    );
+}
+
+/// `LOCAL_EXT` replaces the internal node atom with `NIL_EXT`, and the decoder demotes it back to
+/// the internal id — so an internal pid survives the local round trip.
+///
+/// Oracle: `binary_to_term(term_to_binary(self(),[local])) =:= self()` prints `true`.
+#[test]
+fn a_local_image_round_trips_an_internal_pid() {
+    let mut rt = runtime();
+    let term = rt
+        .eval(
+            "begin P = term_to_binary(self(), [local]), \
+             {binary:at(P, 0), binary:at(P, 1), binary_to_term(P) =:= self()} end",
+        )
+        .expect("term_to_binary(self(),[local])");
+    let printed = rt.format_term(term, None).expect("~p renders the probe tuple");
+    assert_eq!(printed.trim_end(), "{131,121,true}");
+}
+
+/// [`super::node_hash::block_hash`] is a real mixing function: deterministic for the same
+/// `(bytes, seed)` and different for a different input or a different seed.
+#[test]
+fn block_hash_is_deterministic_and_genuinely_mixing() {
+    let seed = 0x1234_5678;
+    assert_eq!(node_hash::block_hash(b"hostname42", seed), node_hash::block_hash(b"hostname42", seed));
+    assert_ne!(node_hash::block_hash(b"hostname42", seed), node_hash::block_hash(b"hostname43", seed));
+    assert_ne!(node_hash::block_hash(b"hostname42", seed), node_hash::block_hash(b"hostname42", seed ^ 1));
+    assert_ne!(node_hash::block_hash(b"", 7), node_hash::block_hash(b"", 8));
+}
+
+/// [`super::node_hash::node_hash`] answers the SAME value on repeated calls and across two
+/// independent runtimes in one OS process — the per-process `OnceLock`.
+#[test]
+fn node_hash_is_stable_within_an_os_process() {
+    let first = node_hash::node_hash();
+    assert_eq!(first, node_hash::node_hash(), "the same value on a repeat call");
+    let rt = runtime();
+    assert_eq!(node_hash::node_hash(), first, "a second runtime reports the same hash");
+    assert_eq!(
+        NodeIdentity { node: rt.atoms().lookup("nonode@nohost") }
+            .local_node_hash(),
+        Some(first),
+        "the LocalNode seam answers the same per-process hash"
+    );
+}
 #[test]
 fn the_local_fun_identity_hook_is_a_clean_miss_when_the_answer_is_unknown() {
     let mut rt = runtime();

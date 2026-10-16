@@ -57,9 +57,9 @@
 //! * [`gc`]/[`gc_walk`] — the heap-admission point and the unscanned-root valve.
 //! * [`position`] — the **in-machine** BIF door that answers `erlang:process_info/1,2`'s
 //!   execution-position items for the process that is executing the query.
-//! * [`bridges`]/[`fun_identity`]/[`memory_hook`]/[`module_info`]/[`persistent_term`]/
-//!   [`process_bridge`]/[`runtime_hooks`]/[`signal`]/[`trace`]/[`alias`] — the host-seam
-//!   bridges and the runtime-level facilities they wrap.
+//! * [`bridges`]/[`fun_identity`]/[`memory_hook`]/[`module_info`]/[`node_hash`]/
+//!   [`persistent_term`]/[`process_bridge`]/[`runtime_hooks`]/[`signal`]/[`trace`]/[`alias`] —
+//!   the host-seam bridges and the runtime-level facilities they wrap.
 
 mod alias;
 mod apply;
@@ -72,6 +72,7 @@ pub(crate) mod gc;
 pub(crate) mod gc_walk;
 mod memory_hook;
 mod module_info;
+mod node_hash;
 mod persistent_term;
 mod position;
 mod process_bridge;

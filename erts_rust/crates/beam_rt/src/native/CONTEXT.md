@@ -1,1007 +1,162 @@
 # `beam_rt/src/native/` — the runtime-native BIF floor
-
 ## Intent
-The BIFs that are really **runtime** operations: they read/write this runtime's own state
-(process table, port registry, code server, atom table, application view, parsed command line,
-timer heap, the module container loader) and are therefore served *before* the `beam_bifs`
-registry is consulted. They exist because `beam_bifs` owns the static `bif.tab` surface
-(arithmetic, comparison, term ops, `lists`/`maps`/`binary`, `io:format`, `ets`, `records`, …)
-while a handful of names need the host — and because
-`init:*`/`code:*`/`application:*`/`erts_internal:*` are **preloaded-module surface** (contract
-A.7) whose real `.beam` implementations are written against process/message machinery
-Milestone-1 does not run.
-
-The floor is a *fall-through* layer: every entry returns `Option<Result<Eterm>>`; `None` means
-"not a native BIF", and the caller (`RuntimeContext::call_bif`, `../context/mod.rs`) then tries
-the registry (or loads the module). Nothing here duplicates a registry BIF, and a call the floor
-does not claim is never answered with a fabricated value.
-
+The BIFs that are really **runtime** operations: they read/write this runtime's own state (process table, port registry, code server, atom table, application view, parsed command line, timer heap, module container loader), served *before* the `beam_bifs` registry, which owns only the static `bif.tab` surface (term ops, `lists`/`maps`/`binary`, `io:format`, `ets`, …).
+`init:*`/`code:*`/`application:*`/`erts_internal:*` are **preloaded-module surface** (contract A.7) whose real `.beam` bodies want process/message machinery this runtime does not run.
+The floor is a *fall-through* layer: every entry returns `Option<Result<Eterm>>`, `None` meaning "not a native BIF", after which `RuntimeContext::call_bif` (`../context/mod.rs`) tries the registry (or loads the module); nothing here duplicates a registry BIF, and no unclaimed call is answered with a fabricated value.
 ## API Surface
 ### The dispatch (source of truth: `../native.rs`)
-`RuntimeContext::try_native(module, function, arity, args) -> Option<Result<Eterm>>` — **one match
-arm per native call**, plus exactly one arm for the whole `erts_internal` namespace
-(`("erts_internal", _, _) => self.erts_internal_call(…)`) and one for `prim_file`
-(`prim_file_call`), whose per-function dispatch lives in the child modules. The arms are the
-source of truth for what is native; each submodule owns its per-function bodies.
-
-`call_bif`'s dispatch order: **loaded NIF → floor (`try_native`) → `beam_bifs` registry →
-on-demand external-module load**. A key in the `erlang` namespace that none of those claims is
-classified as the capability gap (`unsupported: …`, CLI exit 3) or the bare `error:undef`
-(`../error.rs`).
-
-`FLOOR_MODULES: [&str; 14]` (`native.rs:133`) = `application`, `code`, `erl_ddll`,
-`erl_distribution`, `erl_prim_loader`, `erlang`, `erts_internal`, `init`, `io`, `net_adm`, `net_kernel`, `os`, `prim_file`,
-`prim_tty`. Every one is a module the code server can **also**
-load as a `.beam`, so it gates `RuntimeContext::resolve_external_call`, which must answer `Ok(None)`
-for all of them — entering the body would run it *instead of* the host implementation. It does **not**
-gate `call_bif`'s dispatch: a `beam_bifs` registry key in a floor namespace the floor has no arm
-for still reaches the registry (`os:env/0` is `beam_bifs`'s; the floor owns only `os:cmd/1`).
-Membership is the **namespace** set; whether a whole namespace is refused or only the keys
-`floor_keys` enumerates is decided there, so `io`/`prim_tty`/`application`/`code`/`init`/`erl_distribution`
-are key-granular.
-Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm` (⇔ the
-`try_native` arms) and by `../error.rs`'s
-`known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry` /
-`the_effective_gap_set_never_shadows_the_registry`.
-
-### Files (one responsibility each; per-entry ground truth/oracle probes are in each module's rustdoc)
-| Module | Serves |
-|---|---|
-| `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` (the whole `io` **device** surface is [`io.rs`](io.rs)) |
-| `io.rs` | the **`io` device floor**: `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` — the `io.erl` wrappers over `o_request/2`, served natively because this runtime cannot complete the `{io_request,…}`/`{io_reply,…}` round trip against its own group leader (see *The `io` device floor*) + its unit tests |
-| `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `fetch_loaded/0`, `stop/0,1`, `restart/0`, `boot/1` |
-| `code.rs` (+ `code/path.rs`) | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1`; the path mutators `add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`, `del_path/1` in `code/path.rs` |
-| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; `hibernate/0` (the OTP-30 instruction, modelled as **continue**); the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
-| `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
-| `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`, `erl_distribution:start_link/0,1` (the last answered `ignore` — see *The Erlang-level distribution supervisor*) |
-| `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs` and the end-to-end `memory/binary_e2e.rs` oracle case) |
-| `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` |
-| `port.rs` | `erlang:port_command/2,3`, `erlang:port_control/3` (the driver's `control` callback, with the oracle's list-vs-binary reply rule) and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
-| `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
-| `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`) **plus the `erlang:garbage_collect/0,1,2` bodies** it hosts |
-| `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3`/`trace_pattern/2,3` call them) + their pattern/target helpers, over `crate::trace` (no colocated tests — `../tests/trace*.rs`) |
-| `prim.rs` | the **path** half of the `prim_file` floor (`prim_file_call`) + the path contract, the `errno`→atom table and their unit tests |
-| `prim_file.rs` | the **whole-file-descriptor** half of the `prim_file` floor + its unit tests |
-| `prim_tty.rs` | the built-in `prim_tty` NIF-library floor: `is_builtin_library` (the resolution half) + `NIF_KEYS`/`prim_tty_call` (the whole `prim_tty.erl` `-nifs` surface, both the exported and the local route) + its unit tests |
-| `ddll.rs` | the `erl_ddll:*` loaded-driver list (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `info/2`) over `crate::port::driver`'s **one** name-keyed registry — the list `open_port({spawn_driver, Name})` resolves against; `monitor/2`/`demonitor/1`/`format_error/1` deliberately fall through to `beam_bifs` |
-| `file_server.rs` (+ `file_server/`) | the native **`file_server_2` service** (contract A.9) — see [`file_server/CONTEXT.md`](file_server/CONTEXT.md) |
-| `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
-
+`RuntimeContext::try_native(module, function, arity, args) -> Option<Result<Eterm>>` — **one match arm per native call**, plus one arm for the whole `erts_internal` namespace (`erts_internal_call`) and one for `prim_file` (`prim_file_call`).
+`call_bif`'s order: **loaded NIF → floor (`try_native`) → `beam_bifs` registry → on-demand external-module load**; a key in the `erlang` namespace none of those claims is the capability gap (`unsupported: …`, CLI exit 3) or the bare `error:undef` (`../error.rs`).
+`FLOOR_MODULES: [&str; 14]` (`native.rs:140`) = `application`, `code`, `erl_ddll`, `erl_distribution`, `erl_prim_loader`, `erlang`, `erts_internal`, `init`, `io`, `net_adm`, `net_kernel`, `os`, `prim_file`, `prim_tty` — each a module the code server can **also** load as a `.beam`, so the list gates `RuntimeContext::resolve_external_call`, which must answer `Ok(None)` for all of them (entering the body would run it *instead of* the host).
+It does **not** gate `call_bif`'s dispatch: a `beam_bifs` registry key in a floor namespace the floor has no arm for still reaches the registry (`os:env/0` is `beam_bifs`'s; the floor owns only `os:cmd/1`), since membership is the **namespace** set and `floor_keys` decides whether a whole namespace is refused or only the keys it enumerates (`io`/`prim_tty`/`application`/`code`/`init`/`erl_distribution` key-granular).
+Drift guards: `native.rs::tests::every_floor_module_is_a_real_try_native_arm` and `../error.rs`'s `never_shadow_the_registry` pair.
 ### The preloaded-module surfaces (contract A.7)
-**`init`** (`init.rs`). `init:get_argument/1` serves the four **automatic** flags — `root` (the
-code root dir), `home` (`$HOME`), `progname` (`$PROGNAME` else the compile-time `"erl"`, the C rule
-`erlexec.c:1702-1705`) and `bindir` (`<root>/erts-<vsn>/bin`) — so it is *not* the boot determinant
-it once was: the real boot script boots all 22 directives to completion under the CLI-equivalent configuration and under a `RuntimeConfig`-default runtime alike. `init:get_arguments/0` **prepends**
-those four entries (`root`, `bindir`, `progname`, `home`, each `{Flag,[[Value]]}`, an unavailable
-value omitting its entry — the oracle's own shape) before the command-line flags (boot-chain
-consequence: [`../boot/CONTEXT.md`](../boot/CONTEXT.md)). `init:script_id/0` is the **loaded** boot
-script's `{Name,Vsn}`, or the typed gap when none is loaded. `init:fetch_loaded/0` answers `[]`, the
-oracle's post-boot value: `init` holds the loader's module list only until `code_server:init/3`
-consumes it, and that consume path (`code_server.erl` `init/2`'s `{loaded,Mods}` clause →
-`init:fetch_loaded()`) immediately clears `State#state.loaded` (`init.erl:718-722`), so the list is
-observable only in the window before the code server starts — which no CLI route reaches, so `[]` is
-what every oracle run of the probe reports too (`tests/fetch_loaded.rs`). `init:stop/0` records halt status 0 and
-answers `ok` (the running expression is not interrupted; `cli::run` applies the recorded status
-after the action completes); `stop/1` answers `ok` for a non-negative integer status (recorded),
-raises the `erlang:halt/1` crash-dump slogan for a byte list (incl. `[]`) and `badarg` for anything
-else (incl. the atom `normal`). `init:restart/0` is a real **in-process reboot** —
-`Runtime::restart` resets the code path to its boot-time default (`CodeServer::default_paths`: the
-configured `-pa`/`-pz` dirs plus the system ebin dirs), re-runs the boot sequence with the `booted`
-flag cleared and re-executes the recorded boot script — then answers `ok`. `init:boot/1` parses the
-`[binary()]` BootArgs, takes the `-boot <Script>` value (default `$ROOT/start`,
-`init.erl:1257-1258`), resolves it through the CLI's own rule (`cli::resolve_boot_file_for`) and
-executes it, then answers `ok`. Fidelity limits: no live `init` process, so the oracle's
-clear-system teardown is approximated by the re-boot; the real `boot/1` never returns (it enters
-init's receive loop) whereas this one returns after booting.
-
-**`code`** (`code.rs`). All entries read the code server's own path/load state.
-`code:where_is_file/1` is the code server's own **non-module** search (`code_server.erl:1469-1486`),
-the one `application_controller:make_appl/1` uses to locate an application resource such as
-`kernel.app`. The code path is walked in order, each candidate is `filename:append(Dir, File)` — the
-literal `Dir ++ "/" ++ File`, never normalized and never treated as absolute — and the first candidate
-that **exists** (any file type, not only a regular file or a `.beam`) answers the full path as a
-string; an exhausted path answers the atom `non_existing`.
-`code.erl:1807` guards `is_list(File)`: a non-list leaves the wrapper with no matching clause and
-raises the bare-atom `function_clause`, the same class `priv_dir/1` reports.`code:load_file/1` really loads (`{module,M}` from `CodeServer::load`) with the oracle's
-`{error,sticky_directory|nofile|badfile}` vocabulary. `code:get_mode/0` reads the code server's
-`interactive`/`embedded` mode from the `-mode` init argument (`code.erl:1741-1765`).
-`code:priv_dir/1` is `lib_dir(App, priv)` — the application directory **joined** with `priv`, never
-`stat`ed (the code server rewrites `{priv_dir,App}` into `{lib_dir,App,priv}`,
-`code_server.erl:1058-1059`), with the guard's atom/string forms accepted and `{error,bad_name}`
-for a name the code server does not know (`code.erl:978-980`).
-**`code:*` is the native floor, and the floor's [`CodeServer`](crate::CodeServer) is the ONE authoritative code path** — `code.rs`'s behaviour must not change (see `../CONTEXT.md`).
-A live `code_server` process really does run on every boot-driven route (the booted `kernel_sup` starts it), but it keeps a **second** path store of its own, so the floor serves both the path **readers** and the migrated **mutators** (`code/path.rs`) out of `CodeServer` — the store this runtime actually searches — and the two can no longer disagree.
-Only the mutators still **not** migrated (`set_path/1,2`, `add_paths/1,2`, `add_pathsz/1,2`, `add_pathsa/1,2`, `del_paths/1`, `stick_dir/1`, `unstick_dir/1`) stay ordinary `code.erl` bodies editing that second store, so their edits are invisible to `code:get_path/0`.
-`code:which/1` is **path**-based, exactly as the oracle's `code.erl:1782-1789` is: it answers the
-**load state** first (the recorded file, or the atom `preloaded` from the registry) and then falls
-back to a code-path search, so an unloaded-but-findable module (`dets`) still has a path.
-`code:is_loaded/1` is **load-state**-based, exactly as the oracle's `code.erl:755` is: `false`
-unless the module is preloaded or really loaded here, and `{file, Beam}` (the `beam_location` shape)
-otherwise. The two therefore differ on an unloaded-but-findable module (`which(dets)` ⇒ a path,
-`is_loaded(dets)` ⇒ `false`), which is a real divergence from the oracle only for a module the
-oracle's *boot* loaded and this runtime has not — `code:ensure_loaded/1` closes it.
-`code:get_object_code/1` is served and **path**-based like the oracle's (it never consults the load
-state, so `get_object_code(dets)` works while `dets` is unloaded), answering
-`{Module, Binary, Filename}` with `Filename` a char list made absolute when the code path entry is
-relative, and the atom `error` for a module (or a non-basename name) no code-path directory holds.
-**`application`** (`application.rs`). A minimal native `.app` view: `get_env/1,2,3`,
-`get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`,
-`which_applications/0`. `get_application/0` is always `undefined`; `/1` maps a module to its
-loaded application. `app_env_props` reads the `.app` resource's `env` list **verbatim**, so
-kernel's start-time `logger`/`connect_all` injections are absent ⇒
-`application:get_env(kernel,connect_all)` is `undefined` here vs `{ok,true}` on the oracle.
-`get_application/1` on a non-atom that is not a pid leaves the function with no clause
-(`function_clause`, the oracle's own shape); the oracle's extra `is_pid/1` clause answers
-`undefined` for a pid — a documented divergence, since this runtime runs no application-owned
-process.
-
+Every entry reads the runtime's own state; the crate-level A.9 view (the automatic `get_argument/1` flags, `script_id/0`, the `stop`/`restart`/`boot` family, `lib_dir/2`, the `application` view) is `../CONTEXT.md`'s and each module's per-entry ground truth its own rustdoc (`init.rs`/`code.rs`/`application.rs`).
+Kept here: `fetch_loaded/0` ⇒ `[]` (the oracle's post-boot value, the loader's list observable only before the code server consumes it, `init.erl:718-722`); `init:stop/1` ⇒ `ok` for a non-negative integer status, the `erlang:halt/1` crash-dump slogan for a byte list (incl. `[]`), `badarg` otherwise (incl. `normal`); `init:boot/1` resolves its BootArgs' `-boot <Script>` (default `$ROOT/start`, `init.erl:1257-1258`) through `cli::resolve_boot_file_for` and executes it, answering `ok` where the real one never returns.
+`code`'s lookups rest on different bases: `where_is_file/1` is the code server's **non-module** path search (`code_server.erl:1469-1486`), `which/1`/`get_object_code/1` are **path**-based (load state first — the recorded file, or `preloaded` — then a code-path search, so an unloaded-but-findable module such as `dets` still has one; `get_object_code/1` ⇒ `{Module,Binary,Filename}`, else the atom `error`), and `is_loaded/1` is **load-state**-based (`false` unless preloaded or really loaded here, else `{file,Beam}`) — `code:ensure_loaded/1` closes the difference.
+`load_file/1` really loads (`{module,M}`) with the oracle's `{error,sticky_directory|nofile|badfile}` vocabulary; `get_mode/0` reads `interactive`/`embedded` from the `-mode` init argument; `priv_dir/1` = `lib_dir(App, priv)` (the app directory **joined** with `priv`, never `stat`ed; the guard's atom/string forms; `{error,bad_name}` for an unknown name); a non-list `File` raises the bare-atom `function_clause`.
+`ensure_modules_loaded/1` is the whole-list form: `prepare_ensure/2` demands a **proper list of atoms** (a non-list, an improper list or a non-atom element raises the bare-atom `function_clause`, never this floor's usual `badarg`); the names neither preloaded nor already loaded are `lists:usort`-ed (ascending, deduplicated), each located by the same `module_file` lookup and loaded through `CodeServer::load`; only failures are listed — `ok`, else `{error,[{Name,nofile|badfile}]}` in **reverse** of the sorted order (the oracle's `do_par_recv/3` prepends each result as it arrives); `badfile` is a `.beam` found on the path that fails to load. **Accepted residual:** for a corrupt image the oracle also logs an `=ERROR REPORT==== … corrupt file header` line; this runtime emits only the value.
+**`application`** (`application.rs`) — a minimal native `.app` view (`get_env/1,2,3`, `get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`, `which_applications/0`): `get_application/0` is always `undefined`; `/1`'s non-pid non-atom argument is the bare `function_clause` where the oracle's `is_pid/1` clause answers `undefined` for a pid; `app_env_props` reads the `.app` resource's `env` list **verbatim**, so kernel's start-time `logger`/`connect_all` injections are absent (`application:get_env(kernel,connect_all)` is `undefined` here vs `{ok,true}` on the oracle).
 ### The process-control families (route through `beam_process`) — `process.rs` + `process/`
-`monitor/2,3` and `demonitor/1,2` use `ProcessTable::{monitor, monitor_named, demonitor,
-demonitor_flush}`: `[flush]` removes a queued `'DOWN'` from the caller's mailbox and `[info]`
-answers the **real** "was a monitor on record and got removed" boolean (a second
-`demonitor(Ref, [info])` is `false`). Only a term that is **not a reference at all** is the
-oracle's `badarg` (the C's structural `is_not_internal_ref`, `bif.c:443-450`); a reference that
-backs no recorded monitor — a bare `make_ref/0`, or an `erlang:send_after/3` timer reference the
-timer heap owns — is the "nothing was removed" answer (`demonitor/1` ⇒ `true`, `demonitor/2`'s
-`[info]` ⇒ `false`), leaving the timer pending.
-The **reference-alias** family (`alias/0,1`, `unalias/1`) rides the same table: `alias(Opts)` mints
-a fresh standalone reference alias owned by the caller and `unalias/1` clears one the caller holds,
-answering whether it did. `alias/0` is the `erlang.erl` wrapper over `alias([])`
-(`erlang.erl:2130-2133`) and, because `erlang` is a floor namespace, the wrapper is un-enterable —
-the floor owns the name and hands the shared `/1` implementation the empty option list, so both
-arities cannot drift. `Opts` is `[explicit_unalias | reply | priority]` (the C's `alias_1`,
-`bif.c:5903-5930`); anything else (a tuple included, or a non-list) is `badarg`. An alias is **not**
-a monitor, so `demonitor/1` of one answers `true` and leaves it in place.
-`exit/2,3` signals another process through `ProcessTable::send_exit`, but a **self**-directed exit
-is raised directly (non-trapping caller, or the untrappable `kill`) or delivered as `{'EXIT',
-self(), R}` via `RuntimeContext::deliver_message` (trapping caller and `Reason != kill`) — because
-the sibling scheduler defers a self-directed signal that arrives while the pid is `Running`, which
-it is inside a slice. `exit/3` accepts ONLY the bare atom `priority` as an option (`[{priority,
-high}]` is `badarg`). The node surface is split: `node.rs` reads the runtime's `DistNode`/cookie/local-node state — `get_cookie/0` is the atom `nocookie` while the node is not alive, `set_cookie/2` raises
-`badarg` for a non-atom node/cookie (and for this runtime's own node name on a non-alive VM) and
-`distribution_not_started` for a well-typed remote pair — and `net.rs` answers the node set and the connector entry points (`nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`).
-
-**`erlang:process_flag(monitor_nodes | {monitor_nodes, Opts}, Bool)` — the node-monitor flag
-(contract A.5/A.9).** Served by `process.rs::process_flag_native`, which claims **only** the two
-undocumented first-argument shapes the C's `process_flag/2` intercepts before delegating to
-`process_flag_aux` (`bif.c:2202-2227`): the bare atom `monitor_nodes` (⇒ the empty option list) and
-the two-tuple `{monitor_nodes, Opts}`. Every other first argument — every ordinary atom flag
-(`trap_exit`, `async_dist`, `priority`, `save_calls`, …) and every other tuple — answers `None`, so
-the arm falls through to the registry and its `ProcessHook` bridge unchanged. The floor must serve
-these two forms because the `beam_bifs` `ProcessHook` seam cannot carry a tuple flag (its
-`process_flag` takes `flag: Atom`, so `process_flag_2` rejects the tuple with `badarg` *before* the
-seam is consulted) — the A.9 constraint `net_kernel:monitor_nodes/2` (`net_kernel.erl:673`) and
-`global:init/1` (`global.erl:802`) run into. `process_flag_native`'s body mirrors
-`erts_monitor_nodes` (`dist.c:6754-6868`): `On` must be the atom `true` or `false` (else `badarg`);
-`Opts` is `[]` (mask `0`) or a **map** whose keys must all be recognised — `list => true` clears
-`INFO_MAP` (8), `connection_id => true` sets `CONN_ID` (16) (`false` a no-op), `node_type =>
-visible|hidden|all` sets `TYPE_VISIBLE`(1)/`TYPE_HIDDEN`(2)/both, `nodedown_reason => true` sets
-`DOWN_REASON` (4) (`false` a no-op) — with any wrongly-typed value, any **unrecognised** key (the
-C's `no_opts != erts_map_size(options)` check, `dist.c:6821-6822`) and any non-`[]`, non-map argument
-`badarg`; the folded mask is the key. `true` answers the previous reference **count** of the calling
-process's `(pid, key)` entry (creating it at `0`) and increments it; `false` answers the current
-count (`0` when absent) and deletes the whole entry, pruning an emptied per-pid map. The store is
-[`Runtime::monitor_nodes`](../../runtime.rs)'s `HashMap<ProcessId, HashMap<u64, u64>>`, shared
-through `Runtime::monitor_nodes_add`/`Runtime::monitor_nodes_remove` — the per-pid counterpart of the
-`async_dist` store. Oracle-pinned (OTP 29.1.1 / erts-17.1):
-`process_flag({monitor_nodes, #{list=>true, connection_id=>true}}, true)` ⇒ `0`, again ⇒ `1`, then
-`false` ⇒ `2`, then `false` ⇒ `0`; `process_flag(monitor_nodes, true)` ⇒ `0`;
-`process_flag({monitor_nodes, #{}}, true)` ⇒ `0`; `process_flag({monitor_nodes, #{bogus=>1}}, true)`
-⇒ `error:badarg`. Unit tests in `process.rs`.
-
-**`erlang:hibernate/0` is an OTP-30 instruction, modelled as "continue" (contract A.9). Served by
-`process.rs::hibernate_0`, which answers the atom `true` and does nothing else.** `erlang:hibernate/0`
-is not a `bif.tab` BIF: the C's `erts/emulator/beam/emu/ops.tab:896-898` rewrites
-`call_ext erlang:hibernate/0` to the `i_hibernate` instruction (`ops.tab:975`). This runtime's
-`beam_loader` performs no such transform, so the call stays a `call_ext`; `erlang` is a floor
-namespace, so the engine refuses to enter it in-machine and the call reaches the floor. The C's
-`erts_hibernate` (`beam_common.c:1568-1602`) saves the argument registers and — when no signal is
-pending — shrinks the heap (`erts_garbage_collect_hibernate`) and clears the process's ACTIVE flag
-(`ERTS_PSFLG_ACTIVE`), then **returns** and execution continues at the next instruction: it never
-blocks itself, and its effects are memory/scheduling optimizations with no result difference for an
-ordinary caller. This runtime's process heap is a single nursery it cannot shrink in place and it
-models no ACTIVE flag, so "hibernate" is modelled as **continue** — the caller's own following
-`receive` does the blocking, so the observable behaviour matches. The only OTP callers of
-`erlang:hibernate/0` (`lib/stdlib/src/gen_server.erl:2340`, `gen_statem.erl:3587`) both enter a
-`receive` immediately afterwards and use no return value, so no observable result depends on the
-heap shrink. Unit test in `process.rs` (`hibernate_continues_and_answers_true`).
-
-**`spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the
-child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the
-policy-aware `Runtime::spawn_*_with_policy`.
-
-**The spawn family works from *inside* a scheduler slice too.** `RuntimeContext::owns_process_table`
-picks the target: a context that owns the table (the `-eval` evaluator) spawns through
-`Runtime::spawn_process_with_policy`/`spawn_fun_process_with_policy`, while one built by
-`for_process` — a slice of a pass that has **moved** the runtime's table out — goes through
-`RuntimeContext::spawn_in_pass`: the child's pid is allocated in the **pass** table with its heap
-policy and priority (the same `ProcessTable::spawn` + `set_priority` the direct path uses), the
-entry point is resolved by `Runtime::resolve_export_entry` (shared wording, so module
-resolution/`undef` are identical), and the record is handed to the pass
-(`Runtime::note_pending_spawn`). `Runtime::absorb_pending_spawns` then registers the engine entry in
-the pass's runner state and enqueues the pid **at its own priority**, so the child really runs —
-`spawn_link`/`spawn_opt`'s `link`/`monitor` go through the same table via
-`link_to_child`/`apply_spawn_options`. Proven by `../tests/spawn_from_slice.rs` (all five forms incl.
-a nested spawn, oracle-cross-checked) and by the two `runtime::scheduler::tests` cases over
-`absorb_pending_spawns`.
-
-### `erlang:garbage_collect/0,1,2` (contract A.7) — the on-demand collection
-Bodies in `erts_internal.rs`, arms in `../native.rs::try_native`. `erlang` is a floor namespace, so
-its `.beam` wrappers are un-enterable and the floor owns both names: `/0` (`erlang.erl:3051-3053`,
-whose body is `erts_internal:garbage_collect(major)`) and `/1` (`erlang.erl:3055-3066`, the wrapper
-`erlang:garbage_collect(Pid, [])`, whose `self()` clause reaches that same preloaded BIF).
-
-**No BIF may collect.** The root set a collection relocates is the **executing machine's**
-`x[0..live)` plus its Erlang stack, and a BIF runs *inside* the engine, owning neither — so a
-servable call records a **request** through the one latch (`Runtime::request_gc`) and answers the
-oracle's `true`. The request is served at the two sites that *do* own that root set: the engine's
-heap-admission point (`../../src/context/gc.rs::ensure_heap`, where a pending request bypasses only
-the occupancy test, never the safety valves) and the runner's park arms (`../../src/runner/run.rs` →
-`Runtime::serve_gc_request`, after each `publish_parked_roots`); a request still pending when its
-process terminates is pruned at the pass boundary
-(`../../src/runtime/scheduler.rs::scheduler_pass` → `prune_gc_requests`). A request is recorded
-**only** for a **scheduled slice** — a context that does not own the process table
-(`RuntimeContext::owns_process_table`); every other context (`-eval`, a single-pass `run_*`)
-allocates on the pointer-stable runtime arena, which no collection ever moves, so it answers the
-oracle's `true` and records nothing. `Runtime::gc_stats().collections` therefore moves only when a
-collection really ran; a request the valves refuse (a pinned or halted pid, a **relocation-exempt**
-process, the global escape-store valve) is dropped honestly with the counters untouched, never
-re-armed.
-
-`/1`'s argument contract is the oracle's (`erl` probes, and the C's own test in
-`erl_process.c:11309-11324`): a **live local pid** ⇒ `true` and a request recorded for *that* pid; a
-well-formed internal pid the process table does not hold ⇒ `false`, with nothing recorded; anything
-that is not an internal pid — including an **external**/wire pid, which this runtime has no
-distribution link to and so can never honour ⇒ `badarg`. `/2` (`erlang.erl:3073-3157`) is the same
-contract extended by the wrapper's own option grammar (`get_gc_opts/2`, `erlang.erl:3150-3157`):
-every list element must be a 2-tuple `{async, _}` or `{type, _}` (a later option overrides an
-earlier; default `major`), anything else is the wrapper's `throw(bad_option)` ⇒ `badarg`, and the
-`{type, _}` value is validated by the C's `switch` **before** any liveness decision, so
-`garbage_collect(DeadPid, [{type, foo}])` is `badarg` and never `false`. The synchronous form is the
-oracle's `true` for a live local pid and `false` for one the table does not hold; the `{async,
-ReqId}` form is the atom `async` for a live **and** a dead target alike, and records the same request
-for a live one. **The async form's follow-up `{garbage_collect, ReqId, GCResult}` message is the one
-part this runtime cannot reproduce** — the oracle's request is a cross-process system task
-(`erts_internal:request_system_task/3`, `erl_process.c:11309-11461`) whose reply arrives when the
-target reaches its *next* serving point, and this runtime has no system-task protocol; the return
-value is the oracle's exactly and the notification is simply never sent, never faked. Observable
-evidence:
-[`../../tests/garbage_collect.rs`](../../tests/garbage_collect.rs) — the return values are
-oracle-cross-checked, and a scheduled `ask/1` really moves the `collections` counter where the
-identical `plain/1` workload moves it by zero.
-
+The monitor/alias/reference bookkeeping (`monitor/2,3`, `demonitor/1,2`, `alias/0,1`, `unalias/1`), `exit/2,3`, the `node.rs`/`net.rs` node surface and the spawn family route through `beam_process`'s tables, with the per-family oracle contracts in `process.rs`/`process/monitor.rs`/`process/exit.rs`'s rustdocs plus `../M1_GAPS.md` *Process-control families*.
+The loads kept here: a bare-`make_ref/0`/timer reference removes nothing and a structural non-reference is the `badarg`, with `[flush]`/`[info]` answering the real "was a monitor removed" boolean; `exit/3` takes only the bare `priority` atom, and a self-directed exit is raised directly or delivered as `{'EXIT', self(), R}` to a trapping caller; `spawn_opt` validates EVERY option before the child exists and runs from a normal context **or inside a scheduler slice** (`RuntimeContext::spawn_in_pass` + `Runtime::absorb_pending_spawns`, `../tests/spawn_from_slice.rs`).
+**`erlang:process_flag(monitor_nodes | {monitor_nodes, Opts}, Bool)` (A.5/A.9)** is claimed **only** for the bare `monitor_nodes` atom and the `{monitor_nodes, Opts}` tuple the C's `process_flag/2` intercepts (`bif.c:2202-2227`) — the registry's `ProcessHook::process_flag` takes an `Atom` and cannot carry a tuple flag; `erts_monitor_nodes` (`dist.c:6754-6868`)'s `On`-boolean rule, `[]`-or-map `Opts` grammar (`list`/`connection_id`/`node_type`/`nodedown_reason`; anything unrecognised `badarg`) and per-pid reference counts (`0`/`1`/`2`/`0`) are `process.rs`'s rustdoc/unit tests, over the `Runtime::monitor_nodes` store.
+**`erlang:hibernate/0`** is an OTP-30 instruction modelled as "continue": `process.rs::hibernate_0` answers `true` because the C's `i_hibernate` rewrite (`emu/ops.tab:896-898`, `:975`) does not happen here and `erts_hibernate` (`beam_common.c:1568-1602`) never blocks — so the caller's own following `receive` blocks, the only thing the OTP callers (`gen_server.erl`, `gen_statem.erl`) rely on.
+### `erlang:garbage_collect/0,1,2` (A.7) — the on-demand collection
+Bodies in `erts_internal.rs`, arms in `../native.rs::try_native`; `erlang` is a floor namespace, so its `.beam` wrappers are un-enterable and the floor owns all three arities (`/0` `erlang.erl:3051-3053`, `/1` `:3055-3066`, `/2` the `get_gc_opts/2` grammar `:3073-3157`), with the per-argument oracle probe table in `erts_internal.rs`'s rustdoc.
+**No BIF may collect** — the root set a collection relocates is the **executing machine's** `x[0..live)` plus its Erlang stack, which a BIF running *inside* the engine does not own — so a servable call records a **request** via `Runtime::request_gc` and answers the oracle's `true`; it is served only where that root set is owned (the engine's heap-admission point `../../src/context/gc.rs::ensure_heap`, which bypasses only the occupancy test and never the safety valves, and the runner's park arms `../../src/runner/run.rs` → `Runtime::serve_gc_request`) and pruned at the pass boundary for a process that terminates first (`../../src/runtime/scheduler.rs::prune_gc_requests`).
+A request is recorded **only** for a **scheduled slice** (a `-eval` or single-pass `run_*` context allocates on the pointer-stable runtime arena no collection moves, so it answers `true` and records nothing), so `Runtime::gc_stats().collections` moves only when a collection really ran, and a request the valves refuse (a pinned or halted pid, a **relocation-exempt** process, the global escape-store valve) is dropped honestly.
+The argument contracts (`erl_process.c:11309-11324`): a **live local pid** ⇒ `true` plus a request for *that* pid, a well-formed internal pid the table does not hold ⇒ `false`, anything else — including an **external**/wire pid, which this runtime can never honour ⇒ `badarg`; `/2`'s options are the 2-tuples `{async,_}`/`{type,_}` (a later overriding an earlier; default `major`; anything else `badarg`), the `{type,_}` value validated **before** any liveness decision (`garbage_collect(DeadPid, [{type, foo}])` is `badarg`, never `false`), and `{async, ReqId}` answering `async` for a live and a dead target alike.
+**The async form's follow-up `{garbage_collect, ReqId, GCResult}` message is the one part this runtime cannot reproduce** — the oracle's request is a cross-process system task (`erts_internal:request_system_task/3`) with no system-task protocol here — so the return value is the oracle's exactly and the notification is never sent, never faked (`../../tests/garbage_collect.rs`).
 ### `erlang:spawn_monitor/1,2,3,4` — an `erlang.erl` wrapper, not a `bif.tab` BIF
-The four arities (`erlang.erl:10667`/`:10686`/`:10706`/`:10874`) are `erlang:spawn_opt(…,
-[monitor])` behind `erlang.erl`'s own guards — `is_function(F, 0)` for `/1` and `/2`, plus
-`is_atom(Node)`, `is_atom(M)`, `is_atom(F)`, `is_list(A)` — so no registry entry (and nothing in the
-known-unimplemented list) claims them and the floor owns the whole family. A guard violation is the
-oracle's `badarg`; the `Node` forms on a node **other** than this runtime's own are the typed
-capability gap, because the oracle routes that clause through a distributed
-`erlang:spawn_request/5` (contract A.5) and this runtime has no send path for a spawn — never a
-locally fabricated child. The `Node` test is `process/monitor.rs`'s `pub(super)` `is_local_node`, one
-definition shared with `monitor/2,3`'s `{Name, Node}` target. The monitor is installed by the private
-`attach_monitor` (shared with `spawn_opt`'s `monitor` option, so the `{Pid, Ref}` shape and the
-reference → monitor bookkeeping cannot drift), and it is on record **before the child's first
-schedulable moment**: the child is only a run-queue entry (or a pass `PendingSpawn`) when the BIF
-returns and the runtime is single-threaded, so a child that exits immediately still delivers its
-`{'DOWN', …, normal}`. Proven by `../tests/spawn_monitor.rs`.
-
-### `erlang:process_info/1,2` (contract A.8) — `memory/mod.rs` (+ `memory/tests.rs`, `memory/binary_e2e.rs`)
-A **runtime** operation: the answer is read out of this runtime's own `beam_process` table
-(`Process::state/mailbox/links/monitors/monitored_by/dict/registers/collector/off_heap`), served
-before the registry. `memory/mod.rs`'s rustdoc carries the full per-item table and oracle probes;
-the essentials:
-
-* **Reply shapes** (oracle-verified, OTP 29.1.1 / erts-17.1). `/2` with an item **atom** or
-  `{dictionary, Key}` → `{Item, Value}` — **except** `registered_name`, whose value is the **bare**
-  name atom, and the bare `[]` when the process is unregistered (the C's `always_wrap =
-  !is_atom(opt)`). `/2` with a **list** → `[{Item, Value}, …]` in the requested order, duplicates
-  repeated, `registered_name` **wrapped** (`{registered_name, Name}` / `{registered_name, []}`). `/2`
-  with `{dictionary, Key}` → `{{dictionary, Key}, Value | undefined}`. `/1` → the fixed
-  `PI_1_KEYS` set (C `pi_1_keys[]`, `erl_bif_info.c:1008-1026`), in order: `registered_name,
-  current_function, initial_call, status, message_queue_len, links, dictionary, trap_exit,
-  error_handler, priority, group_leader, total_heap_size, heap_size, stack_size, reductions,
-  garbage_collection, suspending`. A **registered** process emits all 17 (`{registered_name, Name}`
-  first); an **unregistered** one **omits** `registered_name` (and emits the remaining 16).
-* **Failure modes.** A non-atom / non-list / non-`{dictionary,_}` second argument ⇒ `error:badarg`;
-  an unknown item name (also **inside** a list, or an improper list) ⇒ `error:badarg`, **even** for a
-  non-live pid; a non-internal-pid first argument ⇒ `error:badarg`; a **valid** item with a
-  live-but-absent pid ⇒ the atom `undefined` (all three forms; the list form of a dead pid is
-  `undefined`, *not* `[]`).
-* **Implemented items** (~28, each a real value from this runtime's state):
-  `registered_name` (the one special item), the engine-derived `current_function`/`initial_call`/
-  `current_location`/`current_stacktrace`/`catchlevel`, `status`, `message_queue_len`/`messages`,
-  `links`/`monitors`/`monitored_by`, `dictionary`/`{dictionary, Key}`,
-  `trap_exit`/`error_handler`/`priority`/`group_leader`,
-  `heap_size`/`total_heap_size`/`stack_size`, `reductions`, `garbage_collection` (the 5-item
-  proplist `[{max_heap_size,Map},{min_bin_vheap_size,N},{min_heap_size,N},{fullsweep_after,N},
-  {minor_gcs,N}]`, `beam_gc::GARBAGE_COLLECTION_KEYS` order) and its three
-  `min_heap_size`/`min_bin_vheap_size`/`fullsweep_after` components, `max_heap_size` (the flag
-  **map**), `message_queue_data`, `trace`, `sequential_trace_token`, `suspending`, `last_calls`,
-  `memory`, `binary` (the process's **live owned** off-heap refc binaries —
-  `Process::off_heap_binaries`, released slots skipped — as a list of `{Ptr, Size, Refc}`
-  3-tuples: the payload pointer as an integer, its byte length and its total refcount; the empty
-  list `[]` when it owns none).
-* **The execution-position items** (`current_function`/`initial_call`/`current_location`/
-  `current_stacktrace`) and `catchlevel` are read from the process's saved instruction pointer
-  through the engine's read-only accessors (`beam_engine::Machine::current_function`/`initial_call`/
-  `current_location`/`current_stacktrace`/`catch_frame_depth`, builders shared with the exception
-  family's `build_stacktrace`). `RuntimeContext::position_value`/`catchlevel_value` try three
-  sources in order: the runtime's **root execution frame** (`../src/runtime/executing.rs`, for the
-  runtime's own `-eval`/`-s`/`-run` process), the **in-machine BIF door**'s published slot
-  (`../src/context/position.rs`, for the **executing** process's own query from compiled code — the
-  scheduler moves that process's `Machine` out of the runner state for the whole slice, so no other
-  source can name it), then `RunnerState::position_engine_at(pid)`. They are answerable only
-  **conditionally**: the pid must be in the process table (`RuntimeContext::process_table` — the
-  **pass** table inside a scheduler slice, which has *moved* it out of the runtime, else the
-  runtime's own) **and** have a readable position from one of those three sources — a **fun-bodied**
-  process with no resolved local target has no module to name `M`/`F` from, a never-scheduled pid
-  has none, and a **direct/no-machine** caller (one that reached `call_bif` without a `Machine`, so
-  no door is open and no root frame exists) has none. Those report `Ok(None)` — the item is
-  **omitted** by `/1` and is the typed `unsupported` gap by `/2`.
-  Honest residuals of the door: its `initial_call` is the process's **entry MFA**, where the oracle
-  answers `{erlang,apply,2}` for some spawn shapes; and the published slot is runtime-wide, so a
-  **nested** fun-applied run inside the window reads the **outer** machine's position for that pid.
-  End-to-end proof: `../tests/position.rs` — `recv:wait/0` parks in a `receive` (fixture
-  `../tests/fixtures/recv.erl`, clause head on line 12) and a second process (`recv:probe_b/1`)
-  probes it; `recv:main/0` (= `probe_b(self())`) runs inside the scheduled `pos_self:go/1` and
-  reports its **own** position back through message passing. Both answers are compared line-for-line
-  with the live system `erl` oracle.
-* **Honest typed `unsupported` items** (valid oracle names, gap reason names the missing
-  accessor/hook): `backtrace` (no raw/binary stack-dump accessor — only the cooked stacktrace),
-  `magic_ref` (the NIF resource API is unbound, so no resource is bound into a process),
-  `parent`/`label` (no such PCB field), `priority_messages` (no such
-  `beam_process::ProcessFlags`), `garbage_collection_info` (`beam_gc::HeapInfo` measures no
-  per-generation block sizes). An item this runtime cannot answer is **omitted** by `/1` (the
-  C's own mechanism for an unregistered `registered_name`).
-* **Documented divergences** (correct-but-different-by-construction — do NOT "fix" to a hardcoded
-  figure): `/1` emits 15 (registered) / 14 (unregistered) items where the oracle emits 17/16 for a
-  process with no readable execution position (the two engine keys); `heap_size` agrees with the
-  oracle's 233 (the 233-word nursery) but `total_heap_size` is the real **466** (a 233-word mature
-  generation is pre-allocated) — reporting the real figure is deliberate; `memory` is this
-  runtime's own byte total (smaller, because the heap is); `status` is `running` for the calling
-  process (single-threaded runtime) and the process's own `ProcessState`
-  (`runnable`/`waiting`/`suspended`/`exiting`) otherwise; `group_leader` is the process's own
-  (`Runtime::group_leader_of`, default the root pid, set by `erlang:group_leader/2`, inherited on
-  spawn) — this runtime's real pid, not the oracle's `<0.70.0>` io process; `reductions` is this
-  process's real counter; `binary`'s `Ptr`/`Refc` are this runtime's own payload addresses and
-  reference counts (only the `{Ptr, Size, Refc}` shape is shared with the oracle); `error_handler` (the atom `error_handler`) and `suspending` (`[]`) are
-  unchanging runtime defaults whose reported facts are true of this runtime;
-  `message_queue_data` is `on_heap` — this runtime's real current placement
-  (`beam_message::Queue` is heap-resident) — and the one divergence is an **explicit**
-  `process_flag(message_queue_data, off_heap)`, accepted-and-ignored (honouring it needs per-process
-  storage in `beam_process::Process`); `trace` is the **live** per-process ERTS tracee-flag
-  **bitmask** as an integer (`0` while untraced), never `trace_info(P, flags)`'s atom list —
-  `crate::trace::flags_to_atoms` mapped through `ERTS_TRACE_FLAG_BITS` (`1 << (3 + n)`; the 21 rows
-  sum to the oracle's `[all]` exactly), the two flags with no canonical atom (`return_from`,
-  `cpu_timestamp`) deliberately unmapped. **`last_calls` is the one real divergence**: hard-coded
-  `false` while `Process::save_calls()` holds a real flag (`memory/mod.rs:803`).
-
-### `erts_internal:*` (contract A.7) — `erts_internal.rs` (+ `erts_internal/trace.rs`)
-`RuntimeContext::erts_internal_call(function, arity, args) -> Option<Result<Eterm>>`. `beam_bifs`
-owns exactly **one** `erts_internal` BIF (`cmp_term/2`), which this module deliberately does not
-claim so it falls through to the registry. `erts_internal.rs`'s rustdoc carries the per-BIF oracle
-probes; the **served set** is: `term_type/1`, `get_dflags/0`, `beamfile_chunk/2`,
-`beamfile_module_md5/1`, `map_to_tuple_keys/1`, `binary_to_integer/2`, `list_to_integer/2`,
-`time_unit/0`, `perf_counter_unit/0`, `get_creation/0`, `is_process_alive/1,2`, `process_flag/3`,
-`group_leader/2,3`, `no_aux_work_threads/0`, `processes_next/1`, `term_to_string/1,2`, `trace/3`,
-`trace_pattern/3`, `garbage_collect/1`.
-
-Key contracts / invariants:
-* `get_dflags/0` emits the fixed record `{erts_dflags,468283523004,17230663572,468283523004,8396866,
-  8192}` — identical on a non-distributed and a `-sname` node; its five flag words are
-  `beam_dist::flags`'s constants (the single source of truth) narrowed to `i64` at the emit site
-  (no local duplicate), and the term's `term_to_binary/1` image is byte-exact to the oracle's.
-* `beamfile_chunk/2` (`beam_bif_load.c:165-201`) returns a named `.beam` chunk's payload as a
-  **binary**; `undefined` for an absent or zero-length chunk or an unparseable container (a
-  duplicate tag resolves to the **last** occurrence); `badarg` for a non-binary first arg or a name
-  that is not a list of small ints. Chunk ids are the 4-byte ASCII tags, **case-sensitive**; the
-  read goes through the public `beam_loader::container`, never hand-rolled parsing.
-* `beamfile_module_md5/1` (`beam_bif_load.c:203-229`) returns the module checksum as a **bare
-  16-byte binary** — the C's `erts_new_binary_from_data(sizeof beam.checksum, beam.checksum)`,
-  **not** `beam_lib:md5/1`'s `{ok,{Module,Md5}}` wrapper (the Erlang-side shape). `undefined` for an
-  image `beamfile_read` cannot parse (a malformed container, or a `FunT` chunk that is not
-  `4 + 24n` bytes); `badarg` for a non-binary argument. The digest is
-  `crate::context::module_md5` — the same chunk-layout digest the `NEW_FUN_EXT` identity uses, read
-  from the argument binary, never a stored value.
-* `map_to_tuple_keys/1` (`erl_map.c:3318-3328`): a **flat** map's keys tuple (atom keys in
-  atom-index order); a hashmap ⇒ `badarg`; a non-map ⇒ `error:{badmap,Term}` (structured, live
-  reason term). `binary_to_integer/2` (`big.c:4186-4232`) returns the C's *value* atoms; a small
-  int, `big`, or `badarg`. `list_to_integer/2` returns `{Value, Rest}`, or
-  `no_integer`/`not_a_list`/`badarg`/`big`. `time_unit/0` and `perf_counter_unit/0` are both
-  `1000000000`; `get_creation/0` is `undefined` on a non-distributed node, else the creation
-  integer.
-* `is_process_alive/1` (`erl_bif_info.c:4069`): `true`/`false` for an internal pid, `badarg`
-  otherwise. `is_process_alive/2` (`erl_bif_info.c:4058-4067`) is the reference-carrying variant
-  Erlang's `/1` wrapper builds on: `(Pid, Ref)` ⇒ `ok` for a **live and a dead** pid (an argument
-  test plus a signal send, never a table lookup); `badarg` for a non-pid / a non-runtime-reference.
-  The signalling side is a typed gap this arm does not need.
-* `process_flag/3` (`bif.c:2262-2297`, `process_flag_aux:1896-2022`) is the bare `process_flag_aux`
-  surface for the **calling** process, implementing exactly the one flag the C helper does,
-  `save_calls`: `(self(), save_calls, N)` ⇒ the previous length (`0`, then `7`, `4`, …); a
-  non-small/out-of-range value or the `trap_exit` flag ⇒ `error:badarg`; a non-pid target ⇒ the
-  **value** `badtype`; another process ⇒ the typed async-RPC gap. Deliberately **not**
-  `erlang:process_flag/2`.
-* `no_aux_work_threads/0` (`erl_process.c:9234-9237`) is this runtime's scheduler count `+ 1` (no
-  dirty-allocator instances are modelled). **Divergence:** the count is *this* runtime's own
-  (`crate::info::schedulers_count` — `+S N` else the logical-processor count), oracle-exact for
-  every explicit `+S N` and different by construction otherwise, exactly like
-  `system_info(schedulers)`.
-* `processes_next/1` (`bif.c:4111-4120`) answers `{NextIndex, [Pid]}` / `{Limit, []}`, `badarg`
-  past the limit. **Divergence:** index-addressed over *this* table, one pid per call (the C ptab
-  is paginated).
-* `term_to_string/1` (`bif.c:4160-4189`) is the `~w` rendering as a string, one line, no newline;
-  `term_to_string/2`'s `undefined` limit form is exact, a **numeric** limit is a typed
-  `unsupported` (the `~P` depth directive is not exposed by `../format.rs`), and a limit `<= 1` or a
-  non-integer/non-`undefined` limit is `badarg`.
-* `trace/3` (`erl_bif_trace.c`) is the body of `erlang:trace/2,3`: `PidSpec` selects the tracees (a
-  pid the table holds, or the group atoms `all`/`existing`/`existing_processes`/`processes`), `How`
-  sets/clears their flags, `FlagList` is the flag set, and the **caller** becomes the tracer; it
-  returns the tracee count. `trace_pattern/3` installs/removes a per-function pattern over `MFA`
-  (each of module/function/arity a name or the `'_'` wildcard) via `crate::trace`'s `PatternTable`.
-  The port/`new`-style `PidSpec`s and a non-`true`/`false` `How` are the typed/`badarg` paths.
-* **Divergences:** `term_type/1` reports every byte-aligned binary as `sub_binary` — the real
-  `heap_binary`/`sub_binary`/`refc_binary` split is the boxed header subtag (`erl_map.c:3368-3376`),
-  readable only through the `unsafe` `beam_term::boxed` this crate's `deny(unsafe_code)` forbids; a
-  typed `unsupported` stays for the boxed families the safe API cannot name (an internal
-  `reference`, a non-byte-aligned bitstring). `no_aux_work_threads/0` and `processes_next/1` derive
-  from *this* runtime's own state (see above).
-
-### `prim_file:*` (contract A.7) — `prim.rs` (path half) + `prim_file.rs` (fd half)
-`RuntimeContext::prim_file_call(function, arity, args) -> Option<Result<Eterm>>`. `prim_file` is a
-**preloaded** module whose BIFs are the C `prim_file_nif.c` NIFs; the floor claims the subset whose
-whole observable contract is pinned byte-for-byte against the oracle, backed by the host's own file
-system (`std::fs`/`std::env`) — "primitive" is exactly what this layer is for. Everything else
-returns `None`, so the call falls through to the preloaded `.beam` (an honest
-`erlang:nif_error(undef)`).
-
-**Served (33 entries; per-entry ground truth/probes in each module's own rustdoc table):**
-* **path half** (`prim.rs`): `get_cwd/0,1`, `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`,
-  `del_dir/1`, `read_link/1`, `make_link/2`, `make_symlink/2`, `altname/1`, `read_file_info/1,2`,
-  `read_link_info/1,2`.
-* **fd half** (`prim_file.rs`): `open/2`, `read/2`, `write/2`, `close/1`, `position/2`,
-  `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
-  `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`.
-
-**Invariants:** every path-only entry is a direct NIF call wrapped by `try … catch error:badarg ->
-{error,badarg}` in `prim_file.erl`, so a **bad path is always the value `{error,badarg}`, never a
-raise**; the C's errno REMAPs are reproduced explicitly (`unlink` `EISDIR`→`EPERM`; `rename`
-`ENOTEMPTY`→`EEXIST` and an old path of exactly `/`→`EINVAL`; `rmdir` `ENOTEMPTY`→`EEXIST` and,
-when that names the process's own non-empty cwd by ino/dev, `EINVAL`) — an omitted remap is a real
-divergence. The path contract (from `encode_path/1`): a **binary** (its bytes verbatim; a NUL ⇒
-badarg) or an **iolist** of code points (nested lists flattened; a nested **binary** ⇒ badarg; a
-NUL, a non-scalar code point, a non-integer element or an improper tail ⇒ badarg) encoded as UTF-8;
-the walk is iterative with an explicit stack, so nesting depth cannot exhaust the Rust stack. The
-`errno`→atom map is the C's (the POSIX name lower-cased, with the C's own `errno_<n>` form outside
-the table). `open/2` hands out the oracle's `{file_descriptor, prim_file, Data}` map shape and
-follows the C's flag derivation (`read`→`O_RDONLY`; `write` alone→`O_TRUNC|O_WRONLY|O_CREAT`;
-read+write→`O_RDWR|O_CREAT`; `append`→`O_APPEND` and no `O_TRUNC`; plus `exclusive`, `sync`,
-`{read_ahead,S}`); every unmodelled option is silently ignored, exactly as the C does; a
-`directory`-mode open is **served** (a real `O_DIRECTORY` plus the post-open type checks, with
-`skip_type_check` skipping them).
-
-**Divergences:** `read/2` does **not** reproduce read-ahead (`prim_buffer` is never called — its
-only export is `on_load/0`); `get_handle/1`'s fd *number* is this runtime's own; a path built from a
-file's raw bytes goes through `beam_codec::term::make_binary` on the pointer-stable `eval_heap` (no
-64-byte limit, unlike `beam_engine::terms::make_heap_binary`).
-
-**Typed gaps** (explicit `unsupported`, never a silent wrong value): `write_file_info/2,3`,
-`advise/4`, `allocate/3`,
-`list_dir/1`/`list_dir_all/1` (raw `readdir(3)` order, unpinnable), `read_line/1` (its Erlang body
-drives the `prim_buffer:*` resource NIFs, all `undef`), `file_desc_to_ref/2`. **Deliberately
-unclaimed** because the oracle answers the same: `copy/2`, `write_file/3`, `delayed_close/1`
-(unexported ⇒ `error:undef`), `sendfile/8` (`{error,enotsup}`/`badarg`), and
-`internal_get_nif_resource/1` (no NIF-resource model). `copy/3` works (pure Erlang).
-
-### `prim_tty:*` (contract A.7) — the built-in NIF library — `prim_tty.rs`
-ERTS serves `prim_tty` from its **static NIF table** (`erts/emulator/nifs/common/prim_tty_nif.c`,
-resolved by `is_static_nif_module`, `erts/emulator/beam/erl_nif.c`), so
-`erlang:load_nif("prim_tty", …)` never `dlopen`s a shared object. This runtime mirrors that:
-`prim_tty.rs::is_builtin_library` is the ONE resolution source `crate::context::NifBridge`'s
-`NifLoader::load_nif` consults **before** touching the filesystem (`../context/bridges.rs`), so
-`prim_tty:load/0` answers `ok` here exactly as it does on the oracle and nothing is inserted into the NIF
-registry (`NifRegistry::is_loaded("prim_tty")` stays `false`, so the module's Erlang wrappers stay
-enterable in-machine).
-
-**Routing — two routes, one implementation.** `prim_tty.rs::NIF_KEYS` (20 keys) is the whole `-nifs`
-surface of `lib/kernel/src/prim_tty.erl`. The **exported** stubs (`isatty/1`, `write_nif/2`,
-`read_nif/3`, … — reached by `call_ext`) travel `floor_keys("prim_tty")` → `call_bif` → `try_native` →
-`RuntimeContext::prim_tty_call`; the **non-exported LOCAL stubs** (`tty_create/1`, `tty_init/2`, … — the
-compiler emits a LOCAL `call`/`call_only` for each) reach the SAME implementation through
-`ExecutionContext::resolve_local_call` (`../context/execution.rs`, delegating to
-`prim_tty::serves_local_call`), so there is one implementation and no drift.
-
-**Served faithfully:** `isatty/1` (a real `IsTerminal` probe of the std stream), `tty_create/1` (an
-opaque round-trippable `#Ref<…>` handle recorded in `Runtime::prim_tty_handles`; `stdin`, a non-std atom
-and an unknown handle are `badarg`), `tty_init/2` (a non-terminal ofd answers the C's `{error,enotsup}`
-for a `raw` request and `ok` otherwise), `tty_encoding/1` → `utf8`, `setlocale/1` → `primitive`,
-`sizeof_wchar/0` → `4`, `tty_window_size/1` and `tty_is_open/2` (a `/proc/self/fd/N` liveness probe on
-Linux, an honest `true` elsewhere), `write_nif/2` and `read_nif/3` (real stdout/stderr writes and a
-bounded, 1024-byte-capped stdin read), and the no-`HAVE_TERMCAP` family `setupterm_nif/0`, `tinfo_nif/0`,
-`tigetnum_nif/1`, `tigetflag_nif/1`, `tigetstr_nif/1`, `tputs_nif/2` → `{error,enotsup}`.
-
-**Typed capability gaps** (never a fabricated value): `isprint/1`, `wcwidth/1`, `wcswidth/1` (libc's
-locale/Unicode width tables have no faithful safe-std equivalent — `libc::wcwidth` is `unsafe` and this
-crate is `#![deny(unsafe_code)]`); `tty_select/2` (arming an async `enif_select` read is not modelled);
-the **terminal-present** arm of `tty_window_size/1` (`TIOCGWINSZ` is unavailable in safe std) and the
-**raw-mode** arm of `tty_init/2` (no safe-std termios interface).
-
-**Fidelity deviation, recorded honestly — not oracle parity.** The system oracle is built **with**
-termcap, so its `prim_tty:tinfo()` returns a full terminfo map, `tigetnum($k)` → `-1`, `tigetflag` →
-`false`, `tigetstr` → `{'EXIT',{badarg,…}}` and `tputs` → `{ok,<<"clear">>}`. This runtime deliberately
-answers the C's no-`HAVE_TERMCAP` arm (`{error,enotsup}`, which the C returns *before* inspecting any
-argument) for that whole family: ncurses terminfo state is not reproducible from safe Rust, and the arm
-is non-raising, which `prim_tty:init/1`'s `setupterm() =:= ok` check requires.
-
-### `erl_ddll:*` — one loaded-driver list (contract A.4) — `ddll.rs`
-`RuntimeContext::ddll_call(function, arity, args) -> Option<Result<Eterm>>`. `beam_bifs` registers six
-`erl_ddll` keys over its **own** loaded-driver registry, which this crate's port machinery never reads;
-the floor therefore serves the four list/load/unload/report keys from the **one** name-keyed registry
-the ports really use ([`crate::port::driver`](port/driver.rs)'s `LOADED_DRIVERS`, filled by
-`record_driver_loaded` from an `erl_ddll:try_load/3` and by `note_driver_opened` from an
-`open_port({spawn_driver, …})`), so `erl_ddll:loaded_drivers/0` **is** the list
-`open_port({spawn_driver, Name})` resolves a name against. Being dispatched before `call_registered`,
-these four keys **shadow** `beam_bifs`'s registry keys of the same name; `monitor/2`, `demonitor/1`
-and `format_error/1` deliberately return `None` and stay with `beam_bifs` — claiming them would
-duplicate its `errint`→text table and mint monitor references against a driver list the monitor
-machinery does not read.
-
+The four arities (`erlang.erl:10667`/`:10686`/`:10706`/`:10874`) are `erlang:spawn_opt(…, [monitor])` behind `erlang.erl`'s own guards (`is_function(F,0)` for `/1` and `/2`, plus `is_atom(Node)`, `is_atom(M)`, `is_atom(F)`, `is_list(A)`), so no registry entry — and nothing in the known-unimplemented list — claims them and the floor owns the whole family; a guard violation is the oracle's `badarg`, and the `Node` forms on a node **other** than this runtime's own are the typed capability gap (the oracle routes that clause through a distributed `erlang:spawn_request/5`, A.5), never a locally fabricated child.
+The monitor is installed by the private `attach_monitor` (shared with `spawn_opt`'s `monitor` option, so the `{Pid, Ref}` shape and the reference → monitor bookkeeping cannot drift), on record **before the child's first schedulable moment** (`../tests/spawn_monitor.rs`).
+### `erlang:process_info/1,2` (A.8) — `memory/mod.rs` (+ `memory/tests.rs`, `memory/binary_e2e.rs`)
+A **runtime** operation served before the registry, read out of this runtime's own `beam_process` table; [`memory/mod.rs`](memory/mod.rs)'s module docs are the authoritative per-item table (every served item, each typed `unsupported` item's reason, the divergences, the oracle probes), and the contracts below are the load-bearing summary.
+* **Reply shapes** (oracle OTP 29.1.1 / erts-17.1). `/2` with an item **atom** → `{Item, Value}`, **except** `registered_name`, whose value is the **bare** name atom (the bare `[]` when unregistered — the C's `always_wrap = !is_atom(opt)`); `/2` with `{dictionary, Key}` → `{{dictionary, Key}, Value | undefined}`; `/2` with a **list** → `[{Item, Value}, …]` in the requested order, duplicates repeated, `registered_name` **wrapped** (`{registered_name, Name}` / `{registered_name, []}`).
+  `/1` → the fixed `PI_1_KEYS` set (C `pi_1_keys[]`, `erl_bif_info.c:1008-1026`), in order `registered_name, current_function, initial_call, status, message_queue_len, links, dictionary, trap_exit, error_handler, priority, group_leader, total_heap_size, heap_size, stack_size, reductions, garbage_collection, suspending`; a **registered** process emits all 17 (`{registered_name, Name}` first), an **unregistered** one **omits** that key and emits the remaining 16.
+* **Failure modes.** A non-atom / non-list / non-`{dictionary,_}` second argument ⇒ `error:badarg`; an unknown item name (also **inside** a list, or an improper list) ⇒ `error:badarg`, **even** for a non-live pid; a non-internal-pid first argument ⇒ `error:badarg`; a **valid** item with a live-but-absent pid ⇒ the atom `undefined` (all three forms; the list form of a dead pid is `undefined`, *not* `[]`).
+* **`binary`** is the **live owned** `Process::off_heap_binaries` (released slots skipped) as `{Ptr, Size, Refc}` 3-tuples, `[]` when none; **`garbage_collection`** is the 5-item proplist `[{max_heap_size,Map},{min_bin_vheap_size,N},{min_heap_size,N},{fullsweep_after,N},{minor_gcs,N}]` in `beam_gc::GARBAGE_COLLECTION_KEYS` order (a **map** for `max_heap_size`, unlike `system_info`'s bare integer).
+* **Execution-position items** (`current_function`/`initial_call`/`current_location`/`current_stacktrace`) and `catchlevel` come from the engine's read-only accessors via `RuntimeContext::position_value`/`catchlevel_value`, sourced in order from the runtime's **root execution frame** (`../src/runtime/executing.rs`), the **in-machine BIF door**'s published slot (`../src/context/position.rs`, the executing process's own query from compiled code), then `RunnerState::position_engine_at(pid)`; a **fun-bodied** process with no resolved local target, a never-scheduled pid and a **direct/no-machine** caller report `Ok(None)`, so `/1` **omits** the item and `/2` answers the typed `unsupported`.
+  Residuals: the door's `initial_call` is the process's **entry MFA** where the oracle answers `{erlang,apply,2}` for some spawn shapes, and the slot is runtime-wide, so a **nested** fun-applied run reads the **outer** machine's position (`../tests/position.rs`).
+* **Honest typed `unsupported` items** (valid oracle names; the gap reason names the missing accessor/hook): `backtrace` (no raw/binary stack-dump accessor), `magic_ref` (the NIF resource API is unbound), `parent`/`label` (no such PCB field), `priority_messages` (no such `beam_process::ProcessFlags`), `garbage_collection_info` (`beam_gc::HeapInfo` measures no per-generation block sizes).
+* **Documented divergences** (correct-but-different-by-construction): `/1` emits 15 (registered) / 14 (unregistered) items where the oracle emits 17/16 when no execution position is readable; `heap_size` is the oracle's 233 (the nursery) while `total_heap_size` is the real **466** (a pre-allocated 233-word mature generation); `memory`, `reductions`, `group_leader` (`Runtime::group_leader_of`'s real pid — the root pid by default, set by `erlang:group_leader/2`, inherited on spawn), `binary`'s `Ptr`/`Refc`, `error_handler` (the atom) and `suspending` (`[]`) are this runtime's own values; `status` is `running` for the caller (single-threaded), else the process's `ProcessState`; `message_queue_data` is `on_heap` (the queue is heap-resident), with an **explicit** `process_flag(message_queue_data, off_heap)` accepted-and-ignored; `trace` is the **live** tracee-flag **bitmask** integer (`0` while untraced), never `trace_info(P, flags)`'s atom list; the one outright divergence is **`last_calls`** — hard-coded `false` while `Process::save_calls()` holds a real flag (`memory/mod.rs:803`).
+* **`registered_name`** is the truth of the **queried** process (resolved by pid, never the caller's), so on the `-eval`/`-s`/`-run` action routes the caller's own `process_info(self(), registered_name)` answers `{registered_name,init}` where the oracle answers `[]` — those routes run the action in `beam_rt`'s root process (registered as `init`) while the oracle runs it in an unregistered child of `init`; closing that gap belongs to `src/eval/`/`src/cli.rs`/`src/runtime.rs`, not to this floor.
+### `erts_internal:*` (A.7) — `erts_internal.rs` (+ `erts_internal/trace.rs`)
+`RuntimeContext::erts_internal_call(function, arity, args) -> Option<Result<Eterm>>`; `beam_bifs` owns exactly **one** `erts_internal` BIF (`cmp_term/2`), left to the registry on purpose. The **served set** (per-BIF oracle probes in `erts_internal.rs`'s rustdoc): `term_type/1`, `get_dflags/0`, `beamfile_chunk/2`, `beamfile_module_md5/1`, `map_to_tuple_keys/1`, `binary_to_integer/2`, `list_to_integer/2`, `time_unit/0`, `perf_counter_unit/0`, `get_creation/0`, `is_process_alive/1,2`, `process_flag/3`, `group_leader/2,3`, `no_aux_work_threads/0`, `processes_next/1`, `term_to_string/1,2`, `trace/3`, `trace_pattern/3`, `garbage_collect/1`.
+* `get_dflags/0` ⇒ the fixed record `{erts_dflags,468283523004,17230663572,468283523004,8396866, 8192}` on a non-distributed and a `-sname` node alike (`beam_dist::flags`'s constants narrowed to `i64` at the emit site), its `term_to_binary/1` image byte-exact to the oracle's.
+* `beamfile_chunk/2` (`beam_bif_load.c:165-201`) ⇒ a named chunk's payload as a **binary**, `undefined` for an absent/zero-length chunk or an unparseable container (a duplicate tag resolving to the **last** occurrence), `badarg` for a non-binary first arg / a name that is not a list of small ints; chunk ids are the 4-byte ASCII tags (**case-sensitive**), read through the public `beam_loader::container`.
+* `beamfile_module_md5/1` (`beam_bif_load.c:203-229`) ⇒ the module checksum as a **bare 16-byte binary**, **not** `beam_lib:md5/1`'s `{ok,{Module,Md5}}` wrapper; `undefined` for an image `beamfile_read` cannot parse (a malformed container, or a `FunT` chunk that is not `4 + 24n` bytes), `badarg` for a non-binary argument; the digest is `crate::context::module_md5` read from the argument binary, never a stored value.
+* `map_to_tuple_keys/1` ⇒ a **flat** map's keys tuple (atom keys in atom-index order), `badarg` for a hashmap, `error:{badmap,Term}` (structured live reason) for a non-map.
+* `binary_to_integer/2` ⇒ a small int, `big` or `badarg`; `list_to_integer/2` ⇒ `{Value, Rest}`, else `no_integer`/`not_a_list`/`badarg`/`big`; `time_unit/0` and `perf_counter_unit/0` are both `1000000000`; `get_creation/0` ⇒ `undefined` on a non-distributed node, else the creation integer.
+* `is_process_alive/1` ⇒ `true`/`false` for an internal pid, `badarg` otherwise; `/2`, the reference-carrying variant Erlang's `/1` wrapper builds on, ⇒ `ok` for a **live and a dead** pid (an argument test plus a signal send, never a table lookup), `badarg` for a non-pid / a non-runtime-reference.
+* `process_flag/3` (`bif.c:2262-2297`, `process_flag_aux:1896-2022`) is the bare `process_flag_aux` surface for the **calling** process, implementing exactly the `save_calls` flag: `(self(), save_calls, N)` ⇒ the previous length (`0`, `7`, `4`, …); a non-small/out-of-range value or the `trap_exit` flag ⇒ `error:badarg`; a non-pid target ⇒ the value `badtype`; another process ⇒ the typed async-RPC gap (deliberately **not** `erlang:process_flag/2`).
+* `no_aux_work_threads/0` = this runtime's scheduler count `+ 1` (no dirty-allocator instances modelled), **diverging** by being *this* runtime's own count (`crate::info::schedulers_count`) — oracle-exact for every explicit `+S N`. `processes_next/1` ⇒ `{NextIndex, [Pid]}` / `{Limit, []}`, `badarg` past the limit, **diverging** by being index-addressed over *this* table, one pid per call (the C ptab is paginated).
+* `term_to_string/1` is the `~w` rendering as a string, one line, no newline; `/2`'s `undefined` limit form is exact, a **numeric** limit is a typed `unsupported` (the `~P` depth directive is not exposed by `../format.rs`), a limit `<= 1` or a non-integer/non-`undefined` limit is `badarg`.
+* `trace/3` is the body of `erlang:trace/2,3`: `PidSpec` selects the tracees (a pid the table holds, or the group atoms `all`/`existing`/`existing_processes`/`processes`), `How` sets/clears their flags, `FlagList` is the flag set, the **caller** becomes the tracer, and the tracee count is returned; `trace_pattern/3` installs/removes a per-function pattern over `MFA` (each part a name or the `'_'` wildcard) via `crate::trace`'s `PatternTable`; the port/`new`-style `PidSpec`s and a non-`true`/`false` `How` are the typed/`badarg` paths.
+* **Divergence:** `term_type/1` reports every byte-aligned binary as `sub_binary` — the real `heap_binary`/`sub_binary`/`refc_binary` split is the boxed header subtag (`erl_map.c:3368-3376`), readable only through the `unsafe` `beam_term::boxed` this crate's `deny(unsafe_code)` forbids; a typed `unsupported` stays for the boxed families the safe API cannot name (an internal `reference`, a non-byte-aligned bitstring).
+### `prim_file:*` (A.7) — `prim.rs` (path half) + `prim_file.rs` (fd half)
+`RuntimeContext::prim_file_call(function, arity, args) -> Option<Result<Eterm>>`; `prim_file` is a **preloaded** module whose BIFs are the C `prim_file_nif.c` NIFs, and the floor claims the subset whose whole observable contract is pinned byte-for-byte against the oracle, over the host file system (`std::fs`/`std::env`); everything else returns `None`, falling through to the preloaded `.beam` (an honest `erlang:nif_error(undef)`). **Served (33 entries; per-entry ground truth in each module's rustdoc):** the **path half** (`prim.rs`) `get_cwd/0,1`, `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`, `make_symlink/2`, `altname/1`, `read_file_info/1,2`, `read_link_info/1,2`; the **fd half** (`prim_file.rs`) `open/2`, `read/2`, `write/2`, `close/1`, `position/2`, `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`, `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`.
+**Invariants.** Every path-only entry is a direct NIF call wrapped by `try … catch error:badarg -> {error,badarg}` in `prim_file.erl`, so a **bad path is always the value `{error,badarg}`, never a raise**; the C's errno REMAPs are reproduced explicitly (`unlink` `EISDIR`→`EPERM`; `rename` `ENOTEMPTY`→`EEXIST` and an old path of exactly `/`→`EINVAL`; `rmdir` `ENOTEMPTY`→`EEXIST` and, when that names the process's own non-empty cwd by ino/dev, `EINVAL`).
+The path contract (from `encode_path/1`): a **binary** (its bytes verbatim; a NUL ⇒ badarg) or an **iolist** of code points (nested lists flattened; a nested **binary** ⇒ badarg; a NUL, a non-scalar code point, a non-integer element or an improper tail ⇒ badarg) encoded as UTF-8 and walked iteratively with an explicit stack, so nesting depth cannot exhaust the Rust stack; the `errno`→atom map is the C's (the POSIX name lower-cased, with the C's own `errno_<n>` form outside the table).
+`open/2` hands out the oracle's `{file_descriptor, prim_file, Data}` map shape and follows the C's flag derivation (`read`→`O_RDONLY`; `write` alone→`O_TRUNC|O_WRONLY|O_CREAT`; read+write→`O_RDWR|O_CREAT`; `append`→`O_APPEND` and no `O_TRUNC`; plus `exclusive`, `sync`, `{read_ahead,S}`); every unmodelled option is silently ignored, exactly as the C does; a `directory`-mode open is **served** (a real `O_DIRECTORY` plus the post-open type checks, with `skip_type_check` skipping them).
+**Divergences:** `read/2` does **not** reproduce read-ahead (`prim_buffer` is never called — its only export is `on_load/0`); `get_handle/1`'s fd *number* is this runtime's own; a path built from a file's raw bytes goes through `beam_codec::term::make_binary` on the pointer-stable `eval_heap` (no 64-byte limit, unlike `beam_engine::terms::make_heap_binary`).
+**Typed gaps** (explicit `unsupported`, never a silent wrong value): `write_file_info/2,3`, `advise/4`, `allocate/3`, `list_dir/1`/`list_dir_all/1` (raw `readdir(3)` order, unpinnable), `read_line/1` (its Erlang body drives the `prim_buffer:*` resource NIFs, all `undef`), `file_desc_to_ref/2`. **Deliberately unclaimed** because the oracle answers the same (an arm would *create* a divergence): `copy/2`, `write_file/3`, `delayed_close/1` (unexported ⇒ `error:undef`), `sendfile/8` (`{error,enotsup}`/`badarg`), `internal_get_nif_resource/1` (no NIF-resource model); `copy/3` works (pure Erlang).
+### `prim_tty:*` (A.7) — the built-in NIF library — `prim_tty.rs`
+ERTS serves `prim_tty` from its **static NIF table** (`erts/emulator/nifs/common/prim_tty_nif.c`, `is_static_nif_module`, `erts/emulator/beam/erl_nif.c`), so `erlang:load_nif("prim_tty", …)` never `dlopen`s a shared object; this runtime mirrors that — `prim_tty.rs::is_builtin_library` is the ONE resolution source `crate::context::NifBridge`'s `NifLoader::load_nif` consults **before** touching the filesystem (`../context/bridges.rs`), so `prim_tty:load/0` answers `ok` and nothing enters the NIF registry (`NifRegistry::is_loaded("prim_tty")` stays `false`, so the module's Erlang wrappers stay enterable in-machine).
+**Two routes, one implementation.** `prim_tty.rs::NIF_KEYS` (20 keys) is the whole `-nifs` surface of `lib/kernel/src/prim_tty.erl`: the **exported** stubs (`isatty/1`, `write_nif/2`, `read_nif/3`, … — reached by `call_ext`) travel `floor_keys("prim_tty")` → `call_bif` → `try_native` → `RuntimeContext::prim_tty_call`, while the **non-exported LOCAL stubs** (`tty_create/1`, `tty_init/2`, … — the compiler emits a LOCAL `call`/`call_only` for each) reach the SAME implementation through `ExecutionContext::resolve_local_call` (`../context/execution.rs`, delegating to `prim_tty::serves_local_call`).
+**Served faithfully:** `isatty/1` (a real `IsTerminal` probe of the std stream); `tty_create/1` (an opaque round-trippable `#Ref<…>` handle in `Runtime::prim_tty_handles`; `stdin`, a non-std atom and an unknown handle are `badarg`); `tty_init/2` (a non-terminal ofd answers the C's `{error,enotsup}` for a `raw` request, `ok` otherwise); `tty_encoding/1` → `utf8`; `setlocale/1` → `primitive`; `sizeof_wchar/0` → `4`; `tty_window_size/1` and `tty_is_open/2` (a `/proc/self/fd/N` liveness probe on Linux, `true` elsewhere); `write_nif/2` and `read_nif/3` (real stdout/stderr writes, a bounded 1024-byte-capped stdin read); the no-`HAVE_TERMCAP` family `setupterm_nif/0`, `tinfo_nif/0`, `tigetnum_nif/1`, `tigetflag_nif/1`, `tigetstr_nif/1`, `tputs_nif/2` → `{error,enotsup}`.
+**Typed capability gaps** (never a fabricated value): `isprint/1`, `wcwidth/1`, `wcswidth/1` (libc's locale/Unicode width tables have no faithful safe-std equivalent — `libc::wcwidth` is `unsafe`); `tty_select/2` (arming an async `enif_select` read is not modelled); the **terminal-present** arm of `tty_window_size/1` (`TIOCGWINSZ` unavailable in safe std) and the **raw-mode** arm of `tty_init/2` (no safe-std termios).
+**Fidelity deviation, recorded honestly — not oracle parity.** The system oracle is built **with** termcap (its `tinfo()` a full terminfo map, `tigetnum($k)` → `-1`, `tigetflag` → `false`, `tigetstr` → `{'EXIT',{badarg,…}}`, `tputs` → `{ok,<<"clear">>}`), where this runtime answers the C's no-`HAVE_TERMCAP` arm (`{error,enotsup}`, returned *before* inspecting any argument) for that whole family: ncurses terminfo state is not reproducible from safe Rust, and the arm is non-raising, which `prim_tty:init/1`'s `setupterm() =:= ok` check requires.
+### `erl_ddll:*` — one loaded-driver list (A.4) — `ddll.rs`
+`RuntimeContext::ddll_call(function, arity, args) -> Option<Result<Eterm>>`; `beam_bifs` registers six `erl_ddll` keys over its **own** loaded-driver registry, which this crate's port machinery never reads, so the floor serves the four list/load/unload/report keys from the **one** name-keyed registry the ports really use ([`crate::port::driver`](port/driver.rs)'s `LOADED_DRIVERS`, filled by `record_driver_loaded` from an `erl_ddll:try_load/3` and by `note_driver_opened` from an `open_port({spawn_driver, …})`) — `erl_ddll:loaded_drivers/0` **is** the list `open_port({spawn_driver, Name})` resolves a name against.
+Dispatched before `call_registered`, those four keys **shadow** `beam_bifs`'s same-named registry keys; `monitor/2`, `demonitor/1` and `format_error/1` deliberately return `None` and stay with `beam_bifs` — claiming them would duplicate its `errint`→text table and mint monitor references against a driver list the monitor machinery does not read.
 | BIF | Oracle answer |
 |---|---|
 | `erl_ddll:loaded_drivers/0` | `{ok, [Name, …]}` — each name a charlist, in load order |
 | `erl_ddll:try_load/3` | `{ok,loaded}` / `{ok,already_loaded}` / `{error,{open_error,-10}}` / `{error,Reason}` |
 | `erl_ddll:try_unload/2` | `ok` / `{error,not_loaded}` |
 | `erl_ddll:info/2` | the item value of a **loaded** name; `badarg` for an unknown name or item |
-
-**Error mapping** (the mirror of `beam_bifs`'s `load_error_tuple`): a `DriverLoadError` whose reason is
-a fixed `errcode_tab` code becomes the **bare reason atom**; a failed `dlopen` becomes the 2-tuple
-`{open_error, -10}` (`ERL_DE_DYNAMIC_ERROR_OFFSET`); a malformed argument or option is `badarg`, never
-a fabricated result.
-
-**Divergences** (own-state, never a fabricated value): a fresh `loaded_drivers/0` is `{ok,[]}` here
-where the oracle reports its statically linked `tcp_inet`/`udp_inet`/`ram_file_drv`;
-`open_port({spawn_driver, Name})` auto-`dlopen`s an unloaded name (a `/`-containing name is the object
-path, driver name = its file stem) where the oracle answers `badarg`; `try_unload/2` is an immediate
-`ok`, not the C's `{ok,pending_process}`/`{ok,pending_driver}` state machine (forgetting an entry only
-drops it from the list — a live port keeps its driver working); opening a `try_load`ed driver
-re-`dlopen`s the object (the port owns its own handle), so the entry's `init` runs once per open rather
-than once per load; and a loaded driver's monitor subscription is not delivered (`monitor/2` stays with
-`beam_bifs`).
-
-### `file_server_2` — the native file service (contract A.9)
-`file_server.rs` + `file_server/` own the runtime-native **file service**: the `file_server_2`
-service process (never enqueued, drained by the scheduler-pass step), its per-`open` native
-io-devices, the `gen_server`/`file`/`io` request/reply wire, and the `{get_until,…}`/`{get_line,…}`
-readers. `Runtime::new` consults `RuntimeConfig::drives_a_boot_script()`: whenever it holds — every CLI
-action but `-version`, plus an explicit `-boot FILE` — it spawns the service **unregistered**
-(`FileServices::start_unclaimed`), because that route's booted `kernel_sup` starts OTP's own
-`file_server_2` child and owns the name; a runtime that drives no boot script (a host-built one)
-registers the service under the atom `file_server_2` (`FileServices::start`). The served `file_server`
-requests are `open/2` (any mode, incl. write/append),
-`read_file/1`, `write_file/2`, `delete/1`, `make_dir/1`, `del_dir/1`, `read_link/1`, `altname/1`,
-`rename/2`, `make_link/2`, `make_symlink/2`, `get_cwd/0,1`, `list_dir/1`, and
-`read_file_info/1,2`/`read_link_info/1,2` (the whole 14-tuple `#file_info{}`, its `access` slot from
-a real `access(2)` probe); the **io-device** protocol serves `close`, `position/1`, `sync`,
-`datasync`, `truncate`, `get_chars/3`, `put_chars/2`, `get_until/4,5`, `get_line/1,2` and the
-mutable read-mode/encoding surface `getopts`/`setopts(Opts)`, so `file:write_file/2,3` (over the
-write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates the path),
-`file:read_line/1` and `io:getopts/1`/`io:setopts/2` round-trip to disk. **Full detail:
-[`file_server/CONTEXT.md`](file_server/CONTEXT.md).**
-
+**Error mapping** (mirroring `beam_bifs`'s `load_error_tuple`): a `DriverLoadError` whose reason is a fixed `errcode_tab` code becomes the **bare reason atom**; a failed `dlopen` becomes `{open_error, -10}` (`ERL_DE_DYNAMIC_ERROR_OFFSET`); a malformed argument or option is `badarg`, never a fabricated result. **Divergences** (own-state, never a fabricated value): a fresh `loaded_drivers/0` is `{ok,[]}` here where the oracle reports its statically linked `tcp_inet`/`udp_inet`/`ram_file_drv`; `open_port({spawn_driver, Name})` auto-`dlopen`s an unloaded name (a `/`-containing name is the object path, the driver name its file stem) where the oracle answers `badarg`; `try_unload/2` is an immediate `ok` rather than the C's `{ok,pending_process}`/`{ok,pending_driver}` state machine (forgetting an entry only drops it from the list — a live port keeps its driver working); opening a `try_load`ed driver re-`dlopen`s the object, so the entry's `init` runs once per open rather than once per load; a loaded driver's monitor subscription is not delivered.
+### `file_server_2` — the native file service (A.9)
+`file_server.rs` + `file_server/` own the runtime-native **file service**: the `file_server_2` service process (never enqueued, drained by the scheduler-pass step `Runtime::service_file_requests` in `../runtime/scheduler.rs`), its per-`open` native io-devices, and the `gen_server`/`file`/`io` request/reply wire.
+`Runtime::new` consults `RuntimeConfig::drives_a_boot_script()`: whenever it holds (every CLI action but `-version`, plus an explicit `-boot FILE`) the service is spawned **unregistered** (`FileServices::start_unclaimed`), because that route's booted `kernel_sup` starts OTP's own `file_server_2` child and owns the name; a runtime driving no boot script registers it under the atom `file_server_2` (`FileServices::start`).
+**The served-request surface (the `{write_file,…}`/write-mode `{open,…}`/`{get_until,…}`/`{get_line,…}` families and the `getopts`/`setopts` read-mode surface) and the tests are [`file_server/CONTEXT.md`](file_server/CONTEXT.md)'s.**
 ### The `io` device floor (`io.rs`) — the request wrappers, served natively
-`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` are `io.erl`
-wrappers over
-`o_request/2` (`io.erl:160-207`), which resolves the request's **device** — the caller's
-`group_leader()` — posts `{io_request, self(), Mref, Request}` to it and blocks for
-`{io_reply, …}`. This runtime's own root process **is** its own group leader, so
-`execute_request/3` answers `{error, calling_self}` and every such call raises
-`error:calling_self`; that is what replaced the installed **compiler**'s `catch`-handler
-diagnostic (`io:fwrite("Function: ~w/~w\n", …)`, `beam_ssa_opt.erl:197`,
-`beam_ssa_bool.erl:149`, `beam_core_to_ssa.erl:276`, …) with the atom `calling_self`.
-The floor answers the device question itself (`RuntimeContext::io_device`/`io_stream`) and
-renders through the **registered** `io_lib:format/2` — the implementation `io.erl`'s own
-server calls for a `{format, …}` request — so `io.erl` leaves the path and the request never
-leaves the runtime.
-The device rules (probed against the oracle, OTP 29.1.1 / erts-17.1), shared by **every**
-device-taking arm — `io:put_chars/1,2` included: omitted / `standard_io`
-(`request/3` rewrites it to `group_leader()`) / `user` / the caller's **own** group-leader pid
-⇒ the process's output stream; `standard_error` (or its registered pid) ⇒ **fd 2**; another
-**live registered** device pid ⇒ the typed `unsupported` (a BIF may not block on the round
-trip); an **unregistered** atom ⇒ `error:badarg`; a non-atom/non-pid ⇒ the bare
-`function_clause`. The device is resolved **before** the character/format payload is read.
-Pinned end to end against the live oracle by `../../tests/io_device.rs` (the device
-differential) and `../../tests/io_diagnostic_unmask.rs` (the compiler diagnostic is no longer
-`calling_self`).
-
+`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` are `io.erl` wrappers over `o_request/2` (`io.erl:160-207`) whose device is the caller's `group_leader()` — this runtime's own root process, so `execute_request/3` answers `{error, calling_self}` (rationale: `../M1_GAPS.md` *Printing*) — and the floor serves them itself, answering the device question through `RuntimeContext::io_device`/`io_stream` and rendering through the **registered** `io_lib:format/2` (the implementation `io.erl`'s own server calls for a `{format, …}` request), so the request never leaves the runtime.
+The device rules (oracle OTP 29.1.1 / erts-17.1; shared by **every** device-taking arm, `io:put_chars/1,2` included): omitted / `standard_io` (`request/3` rewrites it to `group_leader()`) / `user` / the caller's **own** group-leader pid ⇒ the process's output stream; `standard_error` (or its registered pid) ⇒ **fd 2**; another **live registered** device pid ⇒ the typed `unsupported` (a BIF may not block on the round trip); an **unregistered** atom ⇒ `error:badarg`; a non-atom/non-pid ⇒ the bare `function_clause`; the device is resolved **before** the character/format payload is read. Pinned end to end against the live oracle by `../../tests/io_device.rs` (the device differential) and `../../tests/io_diagnostic_unmask.rs` (the installed compiler's `catch`-handler diagnostic prints rather than raising `error:calling_self`).
 ## Constraints
-- **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
-  read only through `beam_engine::terms` (heap-seam builders/readers), `beam_codec::term`
-  (`&mut beam_alloc::Heap` materializers), `beam_loader::container` (read-only container parsing)
-  and `beam_term`; the parent's `render` drives the registered `io:format/2` printer rather than a
-  private one.
-- **Return-based errors** (workspace `../CONTEXT.md` §3): `Option<Result<Eterm>>`, never a
-  crate-local error enum, never `panic!`/`unwrap()` on runtime data, never a silent swallow. A
-  "value atom" answer the C *returns* (`badarg`, `big`, `no_integer`, `not_a_list`) is `Ok(atom)`.
-- **Consulted before the registry.** A native entry must never shadow or duplicate a `beam_bifs`
-  BIF, with one deliberate exception: the four `erl_ddll` list/load/unload/report keys
-  (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `info/2`) shadow `beam_bifs`'s registry keys of
-  the same name so that the driver list `open_port({spawn_driver, Name})` reads and the one
-  `erl_ddll` reports stay a single view (see the `erl_ddll:*` section). The `erlang`-namespace
-  fallback classifies a known-unimplemented name as the capability gap (`unsupported: …`, CLI exit 3)
-  and anything else as the bare `error:undef`.
-- **`code:*` is the native floor, and the floor's `CodeServer` owns the ONE authoritative code path**
-  — `code.rs`'s behaviour must not change (see `../CONTEXT.md`; a live `code_server` process does run on
-  the boot-driven routes, but it keeps a second path store, so the floor serves the path readers **and**
-  the `code/path.rs` mutators out of `CodeServer` — the store this runtime really searches — and only the
-  un-migrated `code.erl` mutators still edit that second store).
-- **Files ~1000 lines of production code.** Pre-existing oversize (single-responsibility, kept
-  whole because the routing table names them): `application.rs` (~953 production / 1661 total),
-  `process.rs` (~934 production / 1417 total); `prim.rs` (~1088 production / 3942 total) is mostly
-  its comprehensive colocated test module, and `prim_file.rs` (1601 lines, **no colocated tests** —
-  its fd-half bodies are exercised by `prim.rs`'s test module through the `prim_file_call`
-  dispatch). `erts_internal.rs`'s tracing half is split out into `erts_internal/trace.rs` (~309
-  lines), leaving `erts_internal.rs` at ~1114 production / 2483 total. Split by responsibility;
-  every public item documented.
-
+- **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and read only through `beam_engine::terms` (heap-seam builders/readers), `beam_codec::term` (`&mut beam_alloc::Heap` materializers), `beam_loader::container` (read-only container parsing) and `beam_term`; the parent's `render` drives the registered `io:format/2` printer rather than a private one.
+- **Return-based errors** (workspace `../CONTEXT.md` §3): `Option<Result<Eterm>>`, never a crate-local error enum, never `panic!`/`unwrap()` on runtime data, never a silent swallow. A "value atom" answer the C *returns* (`badarg`, `big`, `no_integer`, `not_a_list`) is `Ok(atom)`.
+- **Consulted before the registry.** A native entry must never shadow or duplicate a `beam_bifs` BIF, with one deliberate exception: the four `erl_ddll` list/load/unload/report keys shadow `beam_bifs`'s same-named registry keys so that the driver list `open_port({spawn_driver, Name})` reads and the one `erl_ddll` reports stay a single view (see the `erl_ddll:*` section). The `erlang`-namespace fallback classifies a known-unimplemented name as the capability gap (`unsupported: …`, CLI exit 3) and anything else as the bare `error:undef`.
+- **`code:*` is the native floor, and the floor's `CodeServer` owns the ONE authoritative code path** — `code.rs`'s behaviour must not change (see `../CONTEXT.md`; a live `code_server` process does run on the boot-driven routes, but it keeps a second path store, so the floor serves the path readers **and** the `code/path.rs` mutators out of `CodeServer` — the store this runtime really searches — and only the un-migrated `code.erl` mutators still edit that second store).
+- **`code:ensure_modules_loaded/1` is implemented but not yet reachable from the CLI.** `code.rs::code_ensure_modules_loaded/1` is complete and oracle-cross-checked, but its `try_native` arm must still be registered in `../native.rs` (a sibling file outside this node), beside `("code", "ensure_loaded", 1)`:
+  `("code", "ensure_modules_loaded", 1) => Some(self.code_ensure_modules_loaded(args)),`.
+  Until that arm exists the key falls through to the loaded `code.beam` body, which drives the live `code_server` and crashes it for a missing module — a `kernel_sup` SUPERVISOR REPORT with `reason: {case_clause,{error,enoent}}` and CLI exit 1 — whereas the oracle answers `{error,[{Mod,nofile}]}` with exit 0.
+- **Files ~1000 lines of production code.** Pre-existing oversize (single-responsibility, kept whole because the routing table names them): `application.rs` (~953 production / 1661 total), `process.rs` (~934 / 1417), `prim.rs` (~1088 / 3942, mostly its colocated test module), `prim_file.rs` (1601 lines, **no colocated tests** — its fd-half bodies are exercised by `prim.rs`'s test module through the `prim_file_call` dispatch) and `erts_internal.rs` (~1114 production / 2483 total, its tracing half split out into `erts_internal/trace.rs`, ~309 lines). Split by responsibility; every public item documented.
 ## Test Strategy
-- **Unit tests** colocated per module (`#[cfg(test)] mod tests`), driving the floor through the
-  crate's own dispatch (`test_support::call` ⇒ `RuntimeContext::call_bif` ⇒ `try_native`) so the
-  *served surface* is pinned, not an internal function. Fixtures live once in `test_support.rs`.
-- `memory/tests.rs` pins the `process_info` reply shapes, the failure modes, the `unsupported` set,
-  and the oracle `registered_name` wrapping rules (the root pid is registered as `init`, so a test
-  can `unregister` it to reach the live-unregistered case). `memory/binary_e2e.rs` adds the
-  **end-to-end** case: the `binary` item of a real, test-time-compiled `.beam` spawned through the
-  scheduler and parked holding an off-heap refc binary, compared structurally against the live oracle
-  running the same fixture.
-- **Oracle values** are quoted in each test's doc comment and were re-verified against the system
-  `erl` (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1). Where the runtime answers a typed
-  capability gap the oracle answers a value, the test pins the `unsupported` outcome with a
-  `// documented divergence:` comment. `get_dflags/0` is pinned by byte-comparing the built term's
-  `term_to_binary/1` image against the oracle's; `prim.rs`'s file-system entries run against a real
-  per-test scratch dir (the file's `scratch_dir` helper, which clears any leftover first).
-  `file_server/`'s suites are described in [`file_server/CONTEXT.md`](file_server/CONTEXT.md).
-- Test fixtures that need a real `.beam` or the system Erlang skip **loudly**
-  (`system_runtime()` / the file-local `lists_beam()`); the arithmetic/`term_type` suites need none.
-- **The only external toolchains ever spawned in this node are `erl` and `erlc`** — no
-  `escript`/`cc`/`gcc`/`clang` invocation exists anywhere under `src/native/`. `erlc` appears in
-  exactly one place, `memory/binary_e2e.rs`, which compiles its end-to-end fixture at test time (no
-  path-dependent artifact is committed). Every live-oracle comparison compares
-  the oracle's **stdout** (`~p`/`~w`/`~s` rendering) or its exit status; none compares `term_to_binary`
-  bytes.
-- **Suites that spawn the live `erl` oracle in-process** (skip **loudly** when absent). Each spawn
-  site, its resolution and its bound:
-  * `memory/tests.rs:676` (`oracle_pi_1_keys`, used by `the_implemented_item_order_is_a_subsequence_of_the_oracles`)
-    and `:1028` (`oracle_eval`, used by `the_oracle_reports_zero_catchlevel_outside_a_try_and_a_depth_inside_one`,
-    `the_oracle_backs_the_remaining_gaps_values`, `the_oracle_lists_a_processes_off_heap_binaries`)
-    — resolve via a **bare `$PATH` lookup only** (they do NOT honor `$ERTS_ORACLE`); `oracle_pi_1_keys`
-    is **unbounded**, `oracle_eval` is bounded by `ORACLE_TIMEOUT = 30s`; the probes print inline
-    `eprintln!("SKIPPING …")` (no banner).
-  * `memory/binary_e2e.rs:177` (`oracle_eval_pa`, used by
-    `the_binary_item_matches_the_live_oracle_for_an_off_heap_payload`) — a bare `$PATH` lookup, and
-    the only probe that also passes `-pa <scratch dir>` (its fixture is spawned by `spawn/3`), bounded
-    30 s / 10 ms poll; its fixture half compiles with `erlc` first and skips loudly without it
-    (`build_fixture`, `binary_e2e.rs:126`).
-  * `code.rs:931` (`oracle_probe` over `oracle_erl()`, used by `code_priv_dir_agrees_with_the_oracle`)
-    — `$ERTS_ORACLE` else `$PATH`, `.output()`, **unbounded**, argv `-noshell -eval … -s init stop`;
-    loud skip via `skip_oracle_loudly()` (`code.rs:943`, no arg); gated first by `system_runtime()`.
-  * `prim.rs:3203` (`run_oracle` over `resolve_oracle()`, used by `the_closed_prim_file_families_agree_with_the_erl_oracle`
-    and `the_file_info_family_agrees_with_the_oracle`) — `$ERTS_ORACLE` else `$PATH`, bounded 30 s /
-    10 ms poll; loud skip via `skip_oracle_loudly(why)` (`prim.rs:3163`, takes a reason string).
-    `the_unserved_prim_file_entries_are_typed_capability_gaps` does NOT spawn the oracle.
-  * `file_server/tests.rs:1319` (`oracle_render`/`compare_with_oracle`, used by
-    `the_write_answers_match_the_live_oracle`, `the_getopts_answers_match_the_live_oracle`,
-    `the_buffered_read_answers_match_the_live_oracle`) — `$ERTS_ORACLE` else `$PATH`, bounded 30 s /
-    20 ms poll; multi-line SKIPPED banner.
-  * `file_server/get_line/tests.rs:926` (`run_oracle` over `resolve_oracle()`, used by
-    `the_replies_match_the_live_oracle`) — same convention and bound; multi-line SKIPPED banner.
-  * `file_server/get_until/tests.rs` spawns **nothing** — every oracle value there is quoted in a
-    doc comment (verified out of band).
-- **`process_info(Pid, garbage_collection)` is NEVER compared against a live oracle.**
-  `garbage_collection_matches_the_oracle_for_a_live_process` (`memory/tests.rs:586`) asserts the
-  runtime's own root-process value against a **hard-coded** `expected` array (233 / 46422 / 65535 / 0,
-  `:593-599`) — the name's "oracle" is the constants' documented provenance, not a live run.
-  `erlang:memory/0,1` and `erlang:statistics(garbage_collection)` do not appear in this node at all.
-  The only live-oracle GC-family probe is `the_oracle_backs_the_remaining_gaps_values`
-  (`memory/tests.rs:1003-1026`), which compares `garbage_collection_info`'s **item KEY NAMES** only
-  (via `element(1,…)`, `:1011`), never values.
-- Cross-crate integration (CLI/exit codes, the preloaded `boot/*` corpus, `-eval`) is pinned by the
-  `../tests/` suites, not here. This node's A.9 native-floor surface — `application:get_all_key/1`,
-  `get_key/1,2`, `get_application/0,1`; `init:get_argument/1`'s automatic flags; `init:script_id/0`;
-  `code:lib_dir/2`; the `filelib` existence probes — is pinned end to end, against the live oracle,
-  by `../tests/a9_native_floor.rs`.
-- The `init:*` termination/reboot family (`init:get_arguments/0`'s automatic prefix, `init:stop/0,1`
-  exit codes, `init:restart/0`, `init:boot/1`) and `code:load_file/1`'s real load are pinned by
-  `../tests/native_init.rs` and `../tests/code_load_file.rs`, driving the built binary and
-  cross-checking the live oracle (skipping **loudly** without the toolchain).
-
+- **Unit tests** are colocated per module (`#[cfg(test)] mod tests`) and drive the floor through the crate's own dispatch (`test_support::call` ⇒ `RuntimeContext::call_bif` ⇒ `try_native`), so the *served surface* is pinned, not an internal function; fixtures live once in `test_support.rs`. `memory/tests.rs` pins the `process_info` reply shapes, failure modes, the `unsupported` set and the `registered_name` wrapping rules (the root pid is registered as `init`, so a test can `unregister` it to reach the live-unregistered case); `memory/binary_e2e.rs` adds the **end-to-end** case — the `binary` item of a real, test-time-compiled `.beam` spawned through the scheduler and parked holding an off-heap refc binary, compared structurally against the live oracle running the same fixture.
+- **Oracle values** are quoted in each test's doc comment (re-verified against the system `erl`, OTP 29.1.1 / erts-17.1), and where the runtime answers a typed capability gap the oracle answers a value, the test pins the `unsupported` outcome with a `// documented divergence:` comment. `get_dflags/0` is pinned by byte-comparing the built term's `term_to_binary/1` image; `prim.rs`'s file-system entries run against a real per-test scratch dir; fixtures needing a real `.beam` or the system Erlang skip **loudly** (`system_runtime()` / the file-local `lists_beam()`).
+- **The only external toolchains ever spawned in this node are `erl` and `erlc`** — no `escript`/`cc`/`gcc`/`clang` invocation exists under `src/native/`, and `erlc` appears in exactly one place (`memory/binary_e2e.rs`, which compiles its end-to-end fixture at test time so no path-dependent artifact is committed). Every live-oracle comparison compares the oracle's **stdout** (`~p`/`~w`/`~s` rendering) or its exit status; none compares `term_to_binary` bytes.
+- **Suites that spawn the live `erl` oracle in-process** (skip **loudly** when absent). Unless annotated with `$ERTS_ORACLE`, a site resolves `erl` by a **bare `$PATH` lookup only**; the per-site bound is given:
+  * `memory/tests.rs:676` (`oracle_pi_1_keys`, **unbounded**) and `:1028` (`oracle_eval`, bounded by `ORACLE_TIMEOUT = 30s`) — the probes print an inline `eprintln!("SKIPPING …")` (no banner).
+  * `memory/binary_e2e.rs:177` (`oracle_eval_pa`) — the only probe that also passes `-pa <scratch dir>` (its fixture is spawned by `spawn/3`), bounded 30 s / 10 ms poll; its fixture half compiles with `erlc` first and skips loudly without it (`build_fixture`, `binary_e2e.rs:126`).
+  * `code.rs:931` (`oracle_probe` over `oracle_erl()`, `$ERTS_ORACLE` else `$PATH`, `.output()`, **unbounded**, argv `-noshell -eval … -s init stop`) — loud skip via `skip_oracle_loudly()` (`code.rs:943`, no arg); gated first by `system_runtime()`.
+  * `prim.rs:3203` (`run_oracle` over `resolve_oracle()`, `$ERTS_ORACLE` else `$PATH`, bounded 30 s / 10 ms poll) — loud skip via `skip_oracle_loudly(why)` (`prim.rs:3163`, takes a reason string); `the_unserved_prim_file_entries_are_typed_capability_gaps` does NOT spawn the oracle.
+  * `file_server/tests.rs:1319` (`oracle_render`/`compare_with_oracle`, `$ERTS_ORACLE` else `$PATH`, bounded 30 s / 20 ms poll) and `file_server/get_line/tests.rs:926` (`run_oracle` over `resolve_oracle()`, same convention and bound) — both print a multi-line SKIPPED banner; `file_server/get_until/tests.rs` spawns **nothing** (every oracle value there quoted in a doc comment).
+- **`process_info(Pid, garbage_collection)` is NEVER compared against a live oracle.** `garbage_collection_matches_the_oracle_for_a_live_process` (`memory/tests.rs:586`) asserts the runtime's own root-process value against a **hard-coded** `expected` array (233 / 46422 / 65535 / 0, `:593-599`) — the name's "oracle" is the constants' documented provenance, not a live run. `erlang:memory/0,1` and `erlang:statistics(garbage_collection)` do not appear in this node; the only live-oracle GC-family probe is `the_oracle_backs_the_remaining_gaps_values` (`memory/tests.rs:1003-1026`), which compares `garbage_collection_info`'s **item KEY NAMES** only (`element(1,…)`, `:1011`), never values.
+- Cross-crate integration (CLI/exit codes, the preloaded `boot/*` corpus, `-eval`) is pinned by the `../tests/` suites: this node's A.9 native-floor surface (`application:get_all_key/1`, `get_key/1,2`, `get_application/0,1`; `init:get_argument/1`'s automatic flags; `init:script_id/0`; `code:lib_dir/2`; the `filelib` existence probes) by `../tests/a9_native_floor.rs`; the `init:*` termination/reboot family and `code:load_file/1`'s real load by `../tests/native_init.rs` and `../tests/code_load_file.rs`.
 ## Routing Table
-- `../native.rs` → the dispatch table (`try_native`, `FLOOR_MODULES`, `floor_keys`) + the
-  `erlang`-core, `seq_trace*` and `trace*` arms and the shared helpers (read for
-  the served set; edit there to add an arm)
-- `io.rs` → the `io` **device** floor (`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`,
-  `io:write/1,2`, `io:format/3`): the `o_request/2` device model every arm shares, the
-  `unsupported` gap for a live non-stdio device, and its unit tests; the oracle-cross-checked
-  suites are `../../tests/io_device.rs` and `../../tests/io_diagnostic_unmask.rs`
-- `memory/` → `erlang:process_info/1,2` + `memory/tests.rs` + `memory/binary_e2e.rs` (the
-  end-to-end `binary`-item case against the live oracle over a test-time-compiled `.beam`)
-- `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`): `term_type/1`,
-  `get_dflags/0`, `beamfile_chunk/2`, `beamfile_module_md5/1`, `map_to_tuple_keys/1`,
-  `binary_to_integer/2`, `list_to_integer/2`, `time_unit/0`, `perf_counter_unit/0`,
-  `get_creation/0`, `is_process_alive/1,2`, `process_flag/3`, `group_leader/2,3`,
-  `no_aux_work_threads/0`, `processes_next/1`, `term_to_string/1,2`, `garbage_collect/1`, and the
-  `trace/3` + `trace_pattern/3` dispatch arms + its unit tests
-- `erts_internal/trace.rs` → the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies and
-  their private pattern/target helpers, over `crate::trace`
-- `prim.rs` → the path half of the `prim_file` floor (`prim_file_call`) + its unit tests: the path
-  contract (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries
-  `get_cwd/0,1`, `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`,
-  `make_link/2`, `make_symlink/2`, `altname/1`, `read_file_info/1,2`, `read_link_info/1,2`
-- `prim_file.rs` → the file-descriptor half of the `prim_file` floor + its unit tests: `open/2`
-  (incl. a `directory`-mode `O_DIRECTORY` open), `read/2`, `write/2`, `close/1`, `position/2`,
-  `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
-  `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`
-- `prim_tty.rs` → the built-in `prim_tty` NIF library: `is_builtin_library` (the `NifLoader::load_nif`
-  resolution half) + the `NIF_KEYS`/`prim_tty_call` stubs both routes converge on (exported via
-  `floor_keys("prim_tty")`, local via `../context/execution.rs::resolve_local_call`) + its unit tests;
-  the oracle-cross-checked integration suite is `../../tests/prim_tty.rs`
-- `ddll.rs` → the `erl_ddll:*` loaded-driver list (`loaded_drivers/0`, `try_load/3`, `try_unload/2`,
-  `info/2`) over `../port/driver.rs`'s one name-keyed registry + its unit tests
-- `file_server.rs` (+ `file_server/`) → the native `file_server_2` service, its io-devices, the
-  request/reply wire, the write path (`{write_file,…}` + the delegating write-mode `{open,…}`), the
-  `{get_until,…}`/`{get_line,…}` readers and the `getopts`/`setopts` read-mode surface
-  ([`file_server/CONTEXT.md`](file_server/CONTEXT.md)); the pass step is
-  `Runtime::service_file_requests` (owned by `../runtime/scheduler.rs`)
-- `init.rs` / `code.rs` (+ `code/path.rs`) / `application.rs` → the preloaded-module surfaces (contract
-  A.7) — the `init` automatic flags (`root`/`home`/`progname`/`bindir`) + `init:script_id/0` + the
-  termination/reboot family, the code server's `get_mode/0`, `lib_dir/2`, `priv_dir/1` and the path
-  mutators (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`, `del_path/1`), and the `application`
-  config view (`get_key/1,2`, `get_all_key/1`, `get_application/0,1`)
-- `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl.
-  `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling
-  surfaces, and the port surface (`port_command/2,3`, `port_control/3` and the closed-port/
-  `registered_name` halves of `port_info/1,2`) (contracts A.4/A.7/A.8/A.9)
+- `../native.rs` → the dispatch table (`try_native`, `FLOOR_MODULES`, `floor_keys`) + the `erlang`-core, `seq_trace*` and `trace*` arms and the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`) — read it for the served set; edit there to add an arm
+- `io.rs` → the `io` **device** floor (`io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3`): the `o_request/2` device model every arm shares, the `unsupported` gap for a live non-stdio device, and its unit tests; the oracle-cross-checked suites are `../../tests/io_device.rs` and `../../tests/io_diagnostic_unmask.rs`
+- `memory/` → `erlang:process_info/1,2` + `memory/tests.rs` + `memory/binary_e2e.rs` (the end-to-end `binary`-item case against the live oracle over a test-time-compiled `.beam`)
+- `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`): the served set listed above, plus the `trace/3` + `trace_pattern/3` dispatch arms + its unit tests
+- `erts_internal/trace.rs` → the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies and their private pattern/target helpers, over `crate::trace` (no colocated tests — `../tests/trace*.rs`)
+- `prim.rs` → the path half of the `prim_file` floor (`prim_file_call`) + its unit tests: the path contract (`encode_path`/`collect_path`), the `errno`→atom table, and the served path entries listed above
+- `prim_file.rs` → the file-descriptor half of the `prim_file` floor + its unit tests, incl. the `directory`-mode `O_DIRECTORY` `open/2`
+- `prim_tty.rs` → the built-in `prim_tty` NIF library: `is_builtin_library` (the `NifLoader::load_nif` resolution half) + the `NIF_KEYS`/`prim_tty_call` stubs both routes converge on (exported via `floor_keys("prim_tty")`, local via `../context/execution.rs::resolve_local_call`) + its unit tests; the oracle-cross-checked integration suite is `../../tests/prim_tty.rs`
+- `ddll.rs` → the `erl_ddll:*` loaded-driver list (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `info/2`) over `../port/driver.rs`'s one name-keyed registry + its unit tests
+- `file_server.rs` (+ `file_server/`) → the native `file_server_2` service, its io-devices, the request/reply wire, the write path (`{write_file,…}` + the delegating write-mode `{open,…}`), the `{get_until,…}`/`{get_line,…}` readers and the `getopts`/`setopts` read-mode surface ([`file_server/CONTEXT.md`](file_server/CONTEXT.md)); the pass step is `Runtime::service_file_requests` (owned by `../runtime/scheduler.rs`)
+- `init.rs` / `code.rs` (+ `code/path.rs`) / `application.rs` → the preloaded-module surfaces (A.7): the `init` automatic flags (`root`/`home`/`progname`/`bindir`), `init:script_id/0` and the termination/reboot family; the code server's path/load readers (`get_mode/0`, `load_file/1`, `which/1`, `is_loaded/1`, `get_object_code/1`, `ensure_modules_loaded/1`, `where_is_file/1`, `lib_dir/0,1,2`, `priv_dir/1`) and its path mutators (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`, `del_path/1`); and the `application` config view (`get_key/1,2`, `get_all_key/1`, `get_application/0,1`)
+- `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port surface (`port_command/2,3`, `port_control/3` and the closed-port/`registered_name` halves of `port_info/1,2`) (contracts A.4/A.7/A.8/A.9)
 - `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`)
 - `net.rs` → the node set + connector surface (`nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`)
-- `group_leader.rs` → `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over
-  `Runtime::group_leaders`
+- `group_leader.rs` → `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders`
 - `test_support.rs` → the shared fixtures
 - `../context/mod.rs` → `RuntimeContext::call_bif` / `try_native`'s caller and the host seams
-- `../context/bridges.rs` → `module_md5` (the `.beam` MD5 digest `beamfile_module_md5/1` serves,
-  re-exported `pub(crate)` by `../context/mod.rs` so the floor reuses it instead of re-deriving the
-  chunk parse)
-- `../runtime.rs`, `../codeserver.rs`, `../boot.rs`, `../port.rs`, `../timers.rs`, `../dist.rs` →
-  the runtime state these BIFs read (owned elsewhere)
+- `../context/bridges.rs` → `module_md5` (the `.beam` MD5 digest `beamfile_module_md5/1` serves, re-exported `pub(crate)` by `../context/mod.rs` so the floor reuses it instead of re-deriving the chunk parse)
+- `../runtime.rs`, `../codeserver.rs`, `../boot.rs`, `../port.rs`, `../timers.rs`, `../dist.rs` → the runtime state these BIFs read (owned elsewhere)
 - `../error.rs` → `unsupported`/`undef`/`halt`/`live_reason_term` and the known-unimplemented list
 - `../../../../erts/emulator/beam/` → legacy C ground truth (read-only)
-
 ## Not implemented — the `erts_internal` / `prim_*` BIFs left falling through
-Every name not in a table above answers `None` from `erts_internal_call`/`prim_file_call`, so the
-call falls through to the `beam_bifs` registry and then to a real module load (the `erts` `ebin` is
-on the code path) — an honest failure, never a fabricated value. Grouped by the machinery each
-needs:
-
-- **Distribution / `net_kernel` (A.5 phase 2):** `abort_pending_connection/2`,
-  `await_port_send_result/3`, `create_dist_channel/3`, `dist_ctrl_put_data/2`,
-  `dist_spawn_init/1`, `dist_spawn_request/4`, `dynamic_node_name/0,1`, `new_connection/1`,
-  `spawn_request/4`, `spawn_init/1`. Needs the distribution controller protocol, a live node
-  identity feeding `erlang:node/0`, connection/channel multiplexing, remote spawn, and the
-  `-connect_all`/`+zdbbl` configuration surface.
-- **Tracing / breakpoints (`dbg`) — the debugger half only:** `erts_internal:trace_session_create/3`,
-  `:trace_session_destroy/1`, `:trace/4`, `:trace_pattern/4`, `:trace_info/3`,
-  `:notify_breakpoint_hit/3`, `erts_debug:breakpoint/2`, `erl_debugger:breakpoint/3`,
-  `:breakpoints/1,3` and the `erts_trace_cleaner:*` pair (`bif.tab:799-805`, `:822-825`) stay gaps.
-  The **process-tracing core IS served** (see above). The residual gaps need the
-  debugger/breakpoint machinery and the trace-session bookkeeping, and the `/4` + `trace_info/3`
-  surfaces add a flag/match-spec dimension `crate::trace` does not expose.
-- **Microstate accounting / scheduler wall time:** `await_microstate_accounting_modifications/3`,
-  `gather_microstate_accounting_result/2`, `await_sched_wall_time_modifications/2`,
-  `gather_sched_wall_time_result/1`, `mc_iterator/1`, `mc_refill/1`,
-  `system_flag_scheduler_wall_time/1`. Needs per-scheduler run-time accounting (the M1 scheduler
-  is single-threaded and does not account). The *switch* itself —
-  `erts_internal:scheduler_wall_time/1` — **is served**, by the `RuntimeHooks` bridge
-  (`../context/runtime_hooks.rs`), not by this floor: it records the flag and answers the previous
-  state, and drives no sampling.
-- **System tasks / system monitors:** `request_system_task/3,4`, `spawn_system_process/3`,
-  `system_check/1`, `gather_system_check_result/1`, `is_system_process/1`, `system_monitor/1,3`.
-  Needs the system-task protocol between `init`/the application controller and side-effect-free
-  system processes, plus the monitor subscription set. (`is_system_process/1` is **already served**
-  by the `RuntimeHooks` bridge, `src/context/runtime_hooks.rs::is_process_predicate` — the floor
-  must not shadow it; its one divergence is that the oracle's `true` for `init` is unreachable
-  because nothing calls `beam_process::ProcessFlags::set_system`.)
-- **Code purge / literal areas:** `check_dirty_process_code/2`, `check_process_code/1,3`,
-  `is_process_executing_dirty/1`, `purge_module/2`, `prepare_loading/2`,
-  `set_code_and_literal_cleaner_prio/1`, `wait_release_literal_area_switch/1`,
-  `dirty_process_handle_signals/1`. Needs the code server's purge protocol (scanning every
-  process's stack for references to a module's code) and the literal-area release handshake.
-- **Atomics / counters / persistent terms:** `atomics_new/2`, `counters_new/1`, `counters_add/3`,
-  `counters_get/2`, `counters_info/1`, `counters_put/3` and `erase_persistent_terms/0` are **already
-  served** — the `counters_*`/`atomics_*` entries by the `beam_bifs` registry
-  (`beam_bifs/src/runtime/atomics.rs`) and `erase_persistent_terms/0` by the `RuntimeHooks` bridge —
-  so the floor must NOT claim them (an arm would duplicate the registry). They are listed only so a
-  later reader does not re-add them.
-- **ETS internals:** `ets_lookup_binary_info/2`, `ets_raw_first/1`, `ets_raw_next/2` need the raw
-  `term_to_binary` **block** writer / `db_raw_first|next` key iterator, which `beam_ets`' public API
-  does not expose. `ets_super_user/1` needs an ETS-protection-bypass bit on
-  `beam_process::ProcessFlags` (answering `ok` without it would fabricate a grant).
-  `ets_info_binary/1` is **not a BIF** (absent from `erts/emulator/beam/bif.tab`).
-- **Process & scheduler control/introspection:** `process_display/2` needs a process **stack dump**,
-  which the engine exposes no accessor for. `suspend_process/2` needs suspend/resume signalling;
-  `await_result/1`,
-  `flush_monitor_messages/3` and `'@flush_monitor_messages_refopt'/0` are **pure Erlang** receive
-  loops, not BIFs at all.
-- **Map internals:** `map_hashmap_children/1` and `map_next/3` are **already served** by the
-  `beam_bifs` registry (`beam_bifs/src/erts_internal.rs`) — the floor must not claim them.
-  (`beam_term::map`'s public API really is `map_pairs`/`map_pairs_storage_order`/`map_size`/
-  `map_get`/`map_put`/`map_remove`/`map_words_capacity`, with no interior/path accessor; the
-  registry's own implementation is the answer.)
-- **Allocation/IO introspection & misc:** `gather_alloc_histograms/1`, `gather_carrier_info/1`,
-  `gather_io_bytes/2`, `crasher/6` need the `erts_alloc` carrier/histogram readers, the
-  async-thread pool, and the crash-dump/internals-dump path. `get_internal_state_blocked/1` is
-  **pure Erlang** (it calls the unshipped `erts_debug:get_internal_state/1`) — not a floor
-  candidate.
-- **The port-BIF family** (`open_port/2`, `port_call/3`, `port_close/1`, `port_command/3`,
-  `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here*: the `erlang:*`
-  counterparts are served by `../port.rs` (the `PortHook` seam: `open_port/2`, `port_close/1`, the
-  live-port `port_info/1,2`), by the sibling [`port.rs`](port.rs) (`port_command/2,3`,
-  **`port_control/3`** and the closed-port / `registered_name` halves of `port_info/1,2` — the
-  forms the seam cannot express) and, for the `erts_internal:port_*` spellings this floor does not
-  claim, by the `beam_bifs` registry over its `RuntimeHooks` seam.
-- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` + `prim_file.rs` serve (the
-  **33** entries above) is on the floor; **every other** `prim_file` entry and all of
-  `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval`
-  are **Not implemented** and still fall through to a real preloaded-`.beam` load (they ship in the
-  `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the
-  matching host.
-  * **Served beyond the table above:** `pread/2,3`, `pwrite/2,3` (cursor untouched, via safe
-    `FileExt::read_at`/`write_at`), `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
-    `ipread_s32bu_p32bu/3`, `get_handle/1`; `copy/3` works (pure Erlang); `open(D,[directory,read])`
-    ⇒ `{ok,Fd}` (`std::fs::File` opens with `O_DIRECTORY`; `open(D,[read])` ⇒ `{error,eisdir}`).
-  * **Typed gaps:** `write_file_info/2,3`, `advise/4`,
-    `allocate/3`, `file_desc_to_ref/2`, and `prim_file:read_line/1` (its Erlang body drives the
-    `prim_buffer:*` resource NIFs — the library-level `file:read_line/1` is served by the
-    `file_server_2` `{get_line,…}` arm,
-    [`file_server/get_line.rs`](file_server/get_line.rs)).
-  * `list_dir/1`/`list_dir_all/1` **not** claimed (raw `readdir(3)` order, unpinnable;
-    `file_server.rs` *does* serve the `{list_dir,Name}` request over `std::fs::read_dir`).
-    `prim_zip:splitter/3` unclaimed (pure Erlang, error paths not reproduced).
-  * Deliberately unclaimed (an arm would *create* a divergence — the oracle answers the same):
-    `copy/2`, `write_file/3`, `delayed_close/1` (unexported ⇒ `error:undef`), `sendfile/8`
-    (`{error,enotsup}`/`badarg`), `internal_get_nif_resource/1` (no NIF-resource model).
-  * Remaining machinery: `prim_socket`/`prim_net`/`prim_inet`, `prim_zip` (zlib), `prim_buffer`,
-    `erl_prim_loader` (boot loader protocol), `prim_eval`. **Missing `beam_io` facilities:** a
-    raw-syscall floor
-    `fadvise`/`fallocate`/`chmod`/`chown`/`utimes`.
-
+Every name not in a table above answers `None` and falls through to the `beam_bifs` registry then a real module load — an honest failure, never a fabricated value; the unclaimed names group by the machinery each needs.
+- **Distribution / `net_kernel` (A.5 phase 2)** — the connection/channel-negotiation, dist-spawn and dynamic-node-name family: needs the controller protocol, a live node identity and remote spawn.
+- **Tracing, debugger half only** (`trace_session_create/3`, `trace_session_destroy/1`, `trace/4`, `trace_pattern/4`, `trace_info/3`, `notify_breakpoint_hit/3`, the `erts_debug`/`erl_debugger` breakpoint entries, `erts_trace_cleaner:*`): the **process-tracing core IS served**; the `/4` + `trace_info/3` surfaces would add a flag/match-spec dimension `crate::trace` does not expose.
+- **Microstate accounting / scheduler wall time** — needs per-scheduler run-time accounting (the runtime is single-threaded); `erts_internal:scheduler_wall_time/1` itself **is served** by the `RuntimeHooks` bridge.
+- **System tasks / system monitors** — needs the system-task protocol; `is_system_process/1` **is served** by the same bridge (`is_process_predicate`), whose divergence is that the oracle's `true` for `init` is unreachable because nothing calls `beam_process::ProcessFlags::set_system`.
+- **Code purge / literal areas** — needs the code server's purge protocol (a stack scan for module references) and the literal-area release handshake.
+- **Served elsewhere — the floor must NOT claim them:** `atomics_new/2`, `counters_new/1`, `counters_add/3`, `counters_get/2`, `counters_info/1`, `counters_put/3` (the `beam_bifs` registry), `erase_persistent_terms/0` (the `RuntimeHooks` bridge), `map_hashmap_children/1`/`map_next/3` (`beam_bifs/src/erts_internal.rs`).
+- **ETS internals** (`ets_lookup_binary_info/2`, `ets_raw_first/1`, `ets_raw_next/2`) — need the raw `term_to_binary` **block** writer / the `db_raw_first|next` key iterator, which `beam_ets`' public API does not expose; `ets_super_user/1` needs an ETS-protection-bypass bit on `beam_process::ProcessFlags`; `ets_info_binary/1` is **not a BIF** (absent from `bif.tab`).
+- **Process/scheduler control** — `process_display/2` needs a process **stack dump** (no engine accessor); `suspend_process/2` needs suspend/resume signalling; `await_result/1`, `flush_monitor_messages/3` and `'@flush_monitor_messages_refopt'/0` are **pure Erlang** receive loops, not BIFs.
+- **Allocation/IO introspection and misc** — `gather_alloc_histograms/1`, `gather_carrier_info/1`, `gather_io_bytes/2` and `crasher/6` need the `erts_alloc` carrier/histogram readers, the async-thread pool and the crash-dump path; `get_internal_state_blocked/1` is **pure Erlang**.
+- **The port-BIF family** (`open_port/2`, `port_call/3`, `port_close/1`, `port_command/3`, `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here* — served by `../port.rs` (the `PortHook` seam), by the sibling [`port.rs`](port.rs) (`port_command/2,3`, `port_control/3`, the closed-port/`registered_name` halves of `port_info/1,2`) and, for the `erts_internal:port_*` spellings, by the `beam_bifs` `RuntimeHooks` seam.
+- **`prim_*` preloaded driver modules** — the **33** `prim_file` entries on the floor are all that is served; every other `prim_file` entry and all of `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval` fall through to a preloaded-`.beam` load on the code path whose `-nifs()` entry needs the matching host; `list_dir/1`/`list_dir_all/1` and `prim_zip:splitter/3` (pure Erlang, error paths not reproduced) are **not** claimed, though `file_server.rs` *does* serve `{list_dir,Name}` over `std::fs::read_dir`; the raw-syscall `fadvise`/`fallocate`/`chmod`/`chown`/`utimes` floor is a **missing `beam_io` facility**.
 ## Known Issues
-
-### Curated-gap closability (`../error.rs`; oracle-checked, OTP 29.1.1 / erts-17.1)
-The membership rule is single and strict: a `(function, arity)` belongs in
-`KNOWN_UNIMPLEMENTED_ERLANG_BIFS` **iff** it is an OTP `erlang` BIF the oracle **exports and serves**
-but this runtime does **not** serve. A name the oracle itself rejects as `undef` must never be
-listed — curating one would answer the oracle's exit-1 "no such function" with an exit-3 capability
-gap, a divergence dressed up as a gap. The rule is drift-guarded by
-`a_name_the_otp_release_does_not_export_is_not_a_curated_gap`, which asserts the nine names the
-release does not export (`apply/1`, `function_exported/2`, `load_module/3`, `system_info/2`,
-`statistics/0`, `map_get/3`, `concatenate/2`, `register/3`, `system_profile/1`) are **not** listed
-and classify as the bare `undef`.
-
-The listed set is 18 `(function, arity)` pairs over 11 names: `set_cookie/2` (already served by the
-floor, so an inert entry), `disconnect_node/1`, `port_connect/2`, `port_call/3`,
-`spawn_request/1,2,3,4,5`, `process_flag/3`, `process_display/2`, `suspend_process/1,2`,
-`system_monitor/0,1,2`, `load_module/2`, `localtime_to_universaltime/1`.
-**Closable via an `erlang.erl` wrapper arm** — the public `erlang:` name wraps an `erts_internal:*`
-primitive this floor already serves: `erlang:process_flag/3` (`erlang.erl:5522-5531`) → the
-**served** `erts_internal:process_flag/3`; `erlang:localtime_to_universaltime/1`
-(`erlang.erl:11875-11881`) → the **registered** `/2` (`beam_bifs/src/calendar.rs`). A non-self
-target lowers to `erlang:F(Node,...)`, whose `erlang.erl` clause calls `erts_internal:F(...)`
-(`call_bif`'s `module == "erlang"` fallback, `context/mod.rs`). `erlang:garbage_collect/0,1,2` are
-closable the same way and the floor already serves all three, so none of them stays listed.
-**Needs a new facility (shape-closable only):** `port_connect/2`/`port_call/3`,
-`spawn_request/1..5`, `suspend_process/1,2`, `system_monitor/0,1,2` (`/0` ⇒ `undefined`;
-`erts_internal:system_monitor/1,3` exported but unserved), `process_display/2`, `load_module/2`,
-`disconnect_node/1` (the `"net_kernel"` namespace **is** in `FLOOR_MODULES` and serves
-`connect_node/1` — `net.rs` — but this BIF has no arm). Edit gates: `../error.rs`'s
-`known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry` +
-`the_effective_gap_set_never_shadows_the_registry`, and `native.rs`'s
-`every_floor_module_is_a_real_try_native_arm`.
-
+### Curated gaps (`../error.rs`; oracle OTP 29.1.1 / erts-17.1)
+A `(function, arity)` belongs in `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` **iff** it is an OTP `erlang` BIF the oracle **exports and serves** but this runtime does **not**; a name the oracle itself rejects as `undef` must never be listed (curating one would answer its exit-1 "no such function" with an exit-3 gap).
+The set is 18 `(function, arity)` pairs over 11 names: `set_cookie/2` (already served by the floor, inert), `disconnect_node/1`, `port_connect/2`, `port_call/3`, `spawn_request/1,2,3,4,5`, `process_flag/3`, `process_display/2`, `suspend_process/1,2`, `system_monitor/0,1,2`, `load_module/2`, `localtime_to_universaltime/1`.
+Most are closable via an `erlang.erl` wrapper arm over an `erts_internal:*` primitive the floor already serves or a registered BIF (`erlang:process_flag/3` ⇒ the **served** `erts_internal:process_flag/3`; `erlang:localtime_to_universaltime/1` ⇒ the **registered** `/2`); the rest need a new facility. Drift guards: `../error.rs`'s `known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry` + `the_effective_gap_set_never_shadows_the_registry`, and `native.rs`'s `every_floor_module_is_a_real_try_native_arm`.
 ### The Erlang-level distribution supervisor (`erl_distribution:start_link/0,1`)
-`kernel_sup`'s distribution child is `{erl_distribution, start_link, []}` (`kernel.erl:262-268`), and
-`start_link/1` is the same entry `erl_distribution:start/1` invokes from `net_kernel:start/1`. Both
-start a supervisor whose children are the **Erlang socket stack** (`net_kernel:protocol_childspecs/0`,
-`erl_epmd`, `auth`, `net_kernel`). This runtime has no `prim_inet`/`inet_tcp` driver, so that stack
-cannot run — its distribution is the native `crate::dist::DistNode` the CLI binds and publishes to
-`epmd` itself. Answering both keys with the atom **`ignore`** is exactly how `erl_distribution`
-expresses "nothing to start": its own `do_start_link/1` falls through to `do_start_link([]) -> ignore`
-when no `-sname`/`-name` argument is present, which is what the supervisor sees on the plain route.
-Without it, a `-sname`/`-name` route started `net_sup`, whose `net_kernel:start_link/1` parked in
-`proc_lib:sync_start/2` and folded into the typed `blocked()` gap — and because `kernel` is
-`permanent`, the node was torn down. Both keys are in `floor_keys("erl_distribution")`, so the
-namespace is key-granular (`init/1`, `start/1`, `stop/0` stay ordinary `.beam` bodies);
-`floor_shadows` refusing in-machine entry is what routes the supervisor's
-`apply(erl_distribution, start_link, [])` onto `call_bif` → `try_native` (verified with
-`BEAM_RT_BOOT_TRACE=1`: `seam decline … erl_distribution:start_link/0: floor_shadows` then the
-`call_bif` ENTER line).
-
-**The honest registered-name divergence** (measured side by side, OTP 29.1.1 as the oracle): on a
-`-sname` node the oracle has live pids for `net_sup`, `net_kernel` and `auth`; here all three stay
-`undefined` because the Erlang socket stack they belong to does not exist. Everything else agrees:
-`node()` (`foo@<host>`), `is_alive()` (`true`), and `whereis(kernel_sup)` / `whereis(application_controller)`
-/ `whereis(logger)` are live pids on both; `whereis(timer_server)` is `undefined` on both (OTP starts
-it lazily through `kernel_sup`).
-
+`kernel_sup`'s distribution child is `{erl_distribution, start_link, []}` (`kernel.erl:262-268`), the same entry `erl_distribution:start/1` invokes from `net_kernel:start/1`; both start a supervisor whose children are the **Erlang socket stack** (`net_kernel:protocol_childspecs/0`, `erl_epmd`, `auth`, `net_kernel`), which cannot run here — no `prim_inet`/`inet_tcp` driver exists and the distribution is the native `crate::dist::DistNode` the CLI binds and publishes to `epmd` itself.
+Both keys answer the atom **`ignore`** (how `erl_distribution` expresses "nothing to start": `do_start_link([]) -> ignore` with no `-sname`/`-name` argument) and both are in `floor_keys("erl_distribution")`, so the namespace is key-granular (`init/1`, `start/1`, `stop/0` stay ordinary `.beam` bodies); the measured registered-name divergence (`net_sup`/`net_kernel`/`auth` are live on the oracle and `undefined` here) is in `../M1_GAPS.md` *Distribution and the node (A.5)*.
 ### Recorded gaps and fabricated values
-- **`read_file_info/1,2`, `read_link_info/1,2` and `read_handle_info/1,2` ARE served** (a real
-  14-tuple `#file_info{}`, `access` from two real `access(2)` probes via `beam_io::path_access` for
-  the path forms and `beam_io::process_credentials` + the mode bits for the handle form) — despite
-  `prim.rs`'s module-doc "Not served" list still naming them as typed gaps. Trust the dispatch
-  (`prim.rs`'s `prim_file_call` arms) and the live-oracle cross-check
-  `tests/a9_native_floor.rs::filelib_existence_probes_on_an_existing_path_agree_with_the_oracle`.
-- **`last_calls` ⇒ `false` is a real divergence** — `Process::save_calls()` holds a real flag
-  (`memory/mod.rs:803`).
-- `application.rs`'s `app_env_props` reads the `.app` resource's `env` list verbatim, so kernel's
-  start-time `logger`/`connect_all` injections are absent ⇒ `application:get_env(kernel,connect_all)`
-  is `undefined` here vs `{ok,true}` on the oracle.
-- `init:get_argument(progname)` follows the C rule — `$PROGNAME` when set, else the compile-time
-  `"erl"` (`erlexec.c:1702-1705`); the oracle's `"erl"` comes from the same compile-time default (its
-  launcher sets `PROGNAME` only for a renamed binary), so the two agree. `init:get_argument(root)`
-  and `(home)` agree through the same arm; `bindir` is `<root>/erts-<vsn>/bin` of the installation
-  the runtime resolved (`$ERTS_STDLIB_DIR`, else the filesystem probe), which is the oracle's own
-  emulator directory whenever both run against the same installation.
-- `init:script_id/0` is the **loaded** boot script's `{Name,Vsn}`.
-  Every CLI action but `-version` loads one, so it answers the resolved script's real header — on the default route (no `-boot`) that is **this runtime's own** release's committed `bootstrap/bin/start.boot`, i.e. `{"Erlang/OTP","30"}`.
-  The typed gap `unsupported: init:script_id/0 (no boot script has been loaded)` survives only for a runtime that drives no script.
-  **Self-consistent with the release**: because the default route loads this runtime's own release's script, `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` is `true` here exactly as on the oracle; an explicit `-boot FILE` reports *that* script's header instead (measured `{"Erlang/OTP","29"}` for the consumed OTP-29 installation's `bin/start.boot`).
-- `erlang:module_loaded/1` answers this runtime's **own** loaded set: the boot set is smaller than
-  the oracle's (an app outside the preloaded `primLoad` batches is not yet loaded here), a
-  documented divergence pinned by `../tests/module_loaded.rs`.
-- `code:is_loaded/1` is **load-state**-based (the oracle's `code.erl:755`) and `code:which/1`
-  **path**-based (the oracle's `code.erl:1782-1789`), so on an unloaded-but-findable module
-  `is_loaded` is `false` and `which` is a path — the oracle's own asymmetry. The remaining
-  divergence is the *boot set*: a module the oracle's boot loaded (`lists`) is not loaded here, so
-  `code:is_loaded(lists)` is `false` and `code:which(lists)` still a path until
-  `code:ensure_loaded/1` (or any use) loads it. The differential corpus' `is_loaded(lists)` cases
-  therefore call `ensure_loaded` first.
-- `code:get_object_code/1` is **path**-based like the oracle's, so a module loaded from **off** the
-  code path (`code:load_abs/1`) answers the atom `error` where `code:which/1` reports its load path
-  — the oracle's own behaviour, measured. A non-atom argument is `badarg` here (the oracle raises
-  `function_clause`), and an unreadable-but-found candidate is a diagnostic rather than the atom
-  `error` (the oracle's `mod_to_bin/3` would skip the entry).- `code:load_file/1` really loads with the oracle's `{error,sticky_directory|nofile|badfile}`
-  vocabulary. Divergences: a **non-atom** argument is `badarg` where the oracle raises
-  `function_clause`; a non-sticky module of an application outside `stdlib`/`kernel`/`erts` is
-  `{error,nofile}` unless a `-pa` directory supplies it (this runtime's code path holds only the
-  three system apps, the oracle's holds every application); the loader's typed error is folded into
-  `badfile`; and the oracle's sticky/`badfile` logger report is not reproduced. Pinned by the
-  colocated `code_load_file_*` units and `../tests/code_load_file.rs`.
-- `init:restart/0` is **synchronous** and approximates the oracle's system teardown by re-running the
-  boot sequence (no application-owned process or port exists to take down, and modules are never
-  unloaded); `init:boot/1` returns `ok` where the real `boot/1` never returns (it enters init's
-  receive loop). Pinned by `../tests/native_init.rs`.
-- `application:get_application/1` on a non-atom that is not a pid leaves the function with no clause
-  (`function_clause`, the oracle's own shape); the oracle's extra `is_pid/1` clause answers
-  `undefined` for a pid — a documented divergence (no application-owned process runs here).
-- `context/process_bridge.rs`'s `process_flag(error_handler, A)` accepts an atom where the oracle
-  raises `badarg` (owner `context/`).
-All other constants are truthful defaults or derive from real state (`application.rs`, `code.rs`,
-`init.rs`, `port.rs`).
-
+- **`read_file_info/1,2`, `read_link_info/1,2` and `read_handle_info/1,2` ARE served** — trust the `prim_file:*` served list above rather than `prim.rs`'s module-doc "Not served" list — as a real 14-tuple `#file_info{}` whose `access` comes from real `access(2)` probes (`beam_io::path_access` for the path forms, `beam_io::process_credentials` + the mode bits for the handle form); pinned by `tests/a9_native_floor.rs::filelib_existence_probes_on_an_existing_path_agree_with_the_oracle`.
+- **`code:`/`application:` divergences** — a found-but-unreadable `get_object_code/1` candidate is reported as a diagnostic rather than the atom `error`; `load_file/1` answers `{error,nofile}` for a non-sticky module outside `stdlib`/`kernel`/`erts`; the sticky/`badfile` logger report is omitted; `application:get_application/1`'s non-atom divergence is in the `application` bullet above; the differential corpus' `is_loaded(lists)` cases `ensure_loaded` first.
+- `erlang:module_loaded/1` answers this runtime's **own** loaded set — smaller than the oracle's, since an app outside the preloaded `primLoad` batches is not yet loaded here (`../tests/module_loaded.rs`); `../context/process_bridge.rs`'s `process_flag(error_handler, A)` accepts an atom where the oracle raises `badarg` (owner `context/`); every other constant is a truthful default or derives from real state.
 ## Handoffs (owned by OTHER nodes)
-The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up,
-outside *this* node's scope). The `("code","get_mode",0)` arm is reachable and agrees with the
-oracle (`interactive`), though the parent's module-doc table still omits it (the table now also lists
-`code:load_file/1` and the `init:stop/0,1`/`restart/0`/`boot/1` arms). The `file_server_2` service
-answers a **scheduled** process's `gen_server:call` — `file:read/2`/`file:read_line/1`/`io:*` from a
-`run` process complete through the ordinary `RunOutcome::Wait` suspend/resume
-(`../../tests/scheduled_io_device.rs`), so no cross-node gap remains (detail in
-[`file_server/CONTEXT.md`](file_server/CONTEXT.md)).
-
+Every native BIF needs its per-call `try_native` arm registered in `../native.rs` (outside this node) — incl. the `code:ensure_modules_loaded/1` arm under `## Constraints`; the parent's module-doc table does not list every implemented arm.
+The `file_server_2` service answers a **scheduled** process's `gen_server:call` — a `run` process's `file:read/2`/`file:read_line/1`/`io:*` suspend and resume through the ordinary `RunOutcome::Wait` (`../../tests/scheduled_io_device.rs`).
 ## See Also
-- `../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.
-- [`file_server/CONTEXT.md`](file_server/CONTEXT.md) → the `file_server_2` service (A.9).
+- `../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces and the A.8 contract; [`file_server/CONTEXT.md`](file_server/CONTEXT.md) → the `file_server_2` service (A.9).
 - `../beam_gc`, `../beam_process`, `../beam_message` → the state this floor reads.
-- `../../../../erts/emulator/beam/erl_bif_info.c` → the C ground truth (`pi_1_keys[]`,
-  `process_info_2`'s forms, the `always_wrap`/`nil`-skip rules).
-- `../../../../erts/emulator/beam/erl_map.c` → `term_type/1`'s family table; `dist.c` →
-  `get_dflags/0`/`get_creation/0`; `beam_bif_load.c` → `beamfile_chunk/2`.
-- `../../../../erts/emulator/nifs/` → `prim_file`'s C NIFs (`{common,unix}/prim_file_nif.c`,
-  `unix/unix_prim_file.c`) and `../../../../erts/preloaded/src/prim_file.erl` → the wrappers.
+- `../../../../erts/emulator/beam/` → the C ground truth: `erl_bif_info.c` (`pi_1_keys[]`, `process_info_2`'s forms, the `always_wrap`/`nil`-skip rules), `erl_map.c` (`term_type/1`'s family table), `dist.c` (`get_dflags/0`/`get_creation/0`), `beam_bif_load.c` (`beamfile_chunk/2`); `../../../../erts/emulator/nifs/` and `../../../../erts/preloaded/src/prim_file.erl` → `prim_file`'s C NIFs (`{common,unix}/prim_file_nif.c`) and its Erlang wrappers.

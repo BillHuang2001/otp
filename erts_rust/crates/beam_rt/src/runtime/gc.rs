@@ -69,14 +69,17 @@ use crate::context::RuntimeContext;
 /// A snapshot of this runtime's process-heap collection activity.
 ///
 /// The counters are **measured own-state** figures (they describe this runtime's own
-/// collector, not the oracle's) and exist so a test — or a future `statistics/1` — can see
-/// that the collector really ran, and *why it did not* when it did not.
+/// collector, not the oracle's) and exist so a test and `erlang:statistics(garbage_collection)`
+/// can see that the collector really ran, and *why it did not* when it did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcStatsSnapshot {
     /// How many collections ran (minor **and** major).
     pub collections: u64,
     /// How many of [`collections`](GcStatsSnapshot::collections) were fullsweeps.
     pub major: u64,
+    /// How many words those collections reclaimed — the from-space words a collector **freed**
+    /// rather than copied, accumulated from each collection's own outcome (never an estimate).
+    pub reclaimed: u64,
     /// How many pids are permanently pinned (a live float register was observed).
     pub pinned: usize,
     /// How many pids have their collection halted (a collection failed or mis-sized).
@@ -173,6 +176,9 @@ pub(crate) struct GcState {
     collections: u64,
     /// Fullsweeps among them.
     major: u64,
+    /// The words those collections reclaimed, summed from each collection's own
+    /// [`Collection`](beam_gc::Collection) outcome (see [`GcStatsSnapshot::reclaimed`]).
+    reclaimed: u64,
     /// Engine allocations that fell back to the arena.
     fallbacks: u64,
     /// Collections that failed.
@@ -202,6 +208,7 @@ impl GcState {
             valve_trips: 0,
             collections: 0,
             major: 0,
+            reclaimed: 0,
             fallbacks: 0,
             errors: 0,
             scratch: Vec::new(),
@@ -214,10 +221,17 @@ impl GcState {
 // legitimately unused for now — `gc_disabled_reason` is the one such diagnostic.
 impl Runtime {
     /// The runtime's collection counters and safety state.
+    ///
+    /// These are **node-global** figures: they count the work this runtime really did since it
+    /// started, independently of which processes are live at the read — the shape
+    /// `erlang:statistics(garbage_collection)` needs (the C's per-scheduler accumulators outlive
+    /// every process; summing live processes' collectors cannot, and reads *nothing* at all while
+    /// the scheduler has the process table moved out for a slice).
     pub fn gc_stats(&self) -> GcStatsSnapshot {
         GcStatsSnapshot {
             collections: self.gc.collections,
             major: self.gc.major,
+            reclaimed: self.gc.reclaimed,
             pinned: self.gc.pinned.len(),
             halted: self.gc.halted.len(),
             disabled: self.gc.disabled,
@@ -473,6 +487,7 @@ impl Runtime {
         match process.collect() {
             Ok(collection) => {
                 self.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
+                self.note_gc_reclaimed(collection.stats.words_reclaimed);
                 true
             }
             Err(_) => {
@@ -505,23 +520,30 @@ impl Runtime {
         }
     }
 
-    /// Pins `pid` on the runtime: its heap is never moved again.
-    ///
-    /// Used when the machine's float-register file holds a live term — `Machine::fr` is not
-    /// part of the root set the engine hands `ensure_heap`, and this crate may neither read
-    /// nor write it from there, so a move while a float is live could silently corrupt float
-    /// code. Pinning is permanent for the runtime: the register is only cleared by
-    /// `Machine::reset`, which this crate cannot observe.
-    pub(crate) fn pin_process(&mut self, pid: ProcessId) {
-        self.gc.pinned.insert(pid);
-    }
-
     /// Records that a collection ran.
+    ///
+    /// This is the **kind-only** half: the engine's heap-admission doors
+    /// ([`crate::context::gc`]) hold the machine's root set but report only whether the
+    /// collection was a fullsweep, so they call this one. A site that also holds the
+    /// collection's own outcome records its reclaimed words through
+    /// [`Runtime::note_gc_reclaimed`].
     pub(crate) fn note_gc_collection(&mut self, major: bool) {
         self.gc.collections += 1;
         if major {
             self.gc.major += 1;
         }
+    }
+
+    /// Records the words one collection reclaimed: the from-space words it **freed** instead of
+    /// copying, read from the collection's own outcome
+    /// ([`Collection::stats`](beam_gc::Collection::stats) `words_reclaimed`) — never an estimate.
+    ///
+    /// Summed into [`GcStatsSnapshot::reclaimed`], which `erlang:statistics(garbage_collection)`
+    /// reports as its `WordsReclaimed` element.
+    pub(crate) fn note_gc_reclaimed(&mut self, words: usize) {
+        // A `usize` word count is a small integer on any platform this runtime builds on; the
+        // saturation keeps the conversion total without trapping.
+        self.gc.reclaimed += u64::try_from(words).unwrap_or(u64::MAX);
     }
 
     /// Records that an engine allocation for `pid` could not be served from a process young
@@ -742,7 +764,8 @@ impl Runtime {
 mod tests {
     use beam_common::BeamError;
     use beam_engine::terms;
-    use beam_term::{compare, make_small, Eterm};
+    use beam_engine::ExecutionContext;
+    use beam_term::{compare, make_small, signed_value, Eterm};
 
     use super::*;
     use crate::config::RuntimeConfig;
@@ -797,6 +820,80 @@ mod tests {
         assert_eq!(rt.gc_stats().collections, 1, "and no second collection");
     }
 
+    /// `erlang:statistics(garbage_collection)` read through the **real dispatch** (the
+    /// [`RuntimeHooksBridge`](crate::context) arm), as `(GCs, WordsReclaimed, Reserved)`.
+    fn statistics_garbage_collection(rt: &mut Runtime) -> (i64, i64, i64) {
+        let key = rt.intern("garbage_collection");
+        let mut ctx = RuntimeContext::new(rt);
+        let value = ctx
+            .call_bif("erlang", "statistics", 1, &[key])
+            .expect("statistics(garbage_collection) is a served key");
+        assert_eq!(terms::tuple_arity(value).expect("a 3-tuple"), 3);
+        let element = |i: usize| terms::tuple_element(value, i).expect("a tuple element");
+        (
+            signed_value(element(0)),
+            signed_value(element(1)),
+            signed_value(element(2)),
+        )
+    }
+
+    /// **`statistics(garbage_collection)` reads this runtime's own node-global GC counters.**
+    /// A fresh runtime has run no collection at all — the C's own `{0, 0, 0}` shape — and a
+    /// collection that really ran through [`Runtime::serve_gc_request`] moves **both** served
+    /// figures by its own outcome: the collection count and the words that collection really
+    /// reclaimed (never a placeholder, and never read from the live processes' collectors, which
+    /// are empty of collections precisely when the workload's collections are the interesting
+    /// ones).
+    ///
+    /// No oracle comparison here: the crate's test strategy forbids comparing live GC counters
+    /// against the oracle, so every figure below is this runtime's own.
+    #[test]
+    fn statistics_garbage_collection_reads_the_node_global_collection_counters() {
+        let mut rt = small_runtime();
+        assert_eq!(
+            statistics_garbage_collection(&mut rt),
+            (0, 0, 0),
+            "a fresh runtime has collected nothing, so all three elements are real zeros"
+        );
+
+        // A real collection through the forced-GC latch: the process's young heap carries an
+        // unrooted (garbage) tuple, which the collection frees rather than copies.
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("a process");
+        table
+            .get_mut(pid)
+            .expect("the process is live")
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2), make_small(3)])
+            .expect("a scratch tuple on the young heap");
+
+        rt.request_gc(pid);
+        assert!(rt.serve_gc_request(&mut table, pid), "the request is served");
+        let stats = rt.gc_stats();
+        assert_eq!(stats.collections, 1, "exactly the collection we forced");
+        assert_eq!(stats.errors, 0, "and it did not fail");
+        assert!(
+            stats.reclaimed > 0,
+            "the unrooted tuple really was reclaimed: {}",
+            stats.reclaimed
+        );
+
+        let (gcs, words, reserved) = statistics_garbage_collection(&mut rt);
+        assert_eq!(
+            gcs,
+            i64::try_from(stats.collections).expect("a small collection count"),
+            "the runtime's own cumulative collection count"
+        );
+        assert_eq!(
+            words,
+            i64::try_from(stats.reclaimed).expect("a small reclaimed-word count"),
+            "the words those collections really reclaimed"
+        );
+        assert_eq!(reserved, 0, "the C's reserved third element");
+    }
+
     /// **A valve that forbids the move is never overridden by a request.** A pinned pid's and
     /// a globally-frozen pid's requests are consumed and answered `false`: the counters stay
     /// put, nothing is halted (a refusal is not a failure) and no collection is faked.
@@ -808,7 +905,9 @@ mod tests {
         ));
 
         let pinned = table.spawn_default().expect("a process");
-        rt.pin_process(pinned);
+        // The pin set has no `Runtime` setter: the only production pin site (the runner's
+        // float-register reaction) does not exist, so the valve is driven through its own field.
+        rt.gc.pinned.insert(pinned);
         rt.request_gc(pinned);
         assert!(!rt.serve_gc_request(&mut table, pinned), "a pinned pid stays put");
         assert!(!rt.gc_request_pending(pinned), "the request is consumed either way");

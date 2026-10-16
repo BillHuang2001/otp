@@ -814,3 +814,50 @@ fn a_boot_without_the_boot_flag_drives_the_default_start_script() {
         stderr(&probe)
     );
 }
+
+/// The loader probe every boot-script route must answer: is the name resolved to a pid?
+const LOADER_PROBE: &str = "io:format(\"pl=~p~n\",[is_pid(erlang:whereis(erl_prim_loader))])";
+#[test]
+fn the_booted_route_registers_a_live_erl_prim_loader_like_the_oracle() {
+    // The oracle's own boot registers a live process under `erl_prim_loader` (its C
+    // `erts_prim_loader` state machine, `whereis(erl_prim_loader)` = a pid running
+    // `erl_prim_loader:loop/3`). This runtime serves the loader's *functions* from the native
+    // loader floor and now also owns a `Runnable` service process under the same name,
+    // registered on every route that builds a runtime — so the probe agrees on this boot-script
+    // (`-noshell -eval`) route: exit 0, empty stderr, exactly `pl=true\n`.
+    if booted_runtime().is_none() {
+        return;
+    }
+    eval_probe(LOADER_PROBE, "pl=true\n");
+    // Pin the shape against the oracle's own answer, which is the ground truth it mirrors.
+    let Some(expected) = oracle(&format!("{LOADER_PROBE}, halt(0).")) else {
+        return;
+    };
+    assert_eq!(
+        stdout(&expected),
+        "pl=true\n",
+        "the oracle must agree that `whereis(erl_prim_loader)` is a pid"
+    );
+}
+
+#[test]
+fn the_version_route_builds_no_runtime_and_has_no_loader_name() {
+    // `-version` is the **one** action that never boots: it prints the banner and exits,
+    // building no runtime (`cli::drive`'s `Action::Version` arm), so there is no name registry
+    // on this route and `erl_prim_loader` — like every other registered name — is simply not a
+    // thing here. The honest observable is the banner and nothing else, and a probe smuggled
+    // alongside the flag must therefore never run.
+    let output = beam_rt_boot(&[
+        "-eval",
+        "io:format(\"pl=~p~n\",[is_pid(erlang:whereis(erl_prim_loader))])",
+        "-version",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr {:?}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("erts-17.1"), "the version route prints the banner: {out:?}");
+    assert!(
+        !out.contains("pl="),
+        "no runtime runs on the `-version` route, so no loader probe can answer: {out:?}"
+    );
+    assert!(output.stderr.is_empty(), "stderr {:?}", stderr(&output));
+}

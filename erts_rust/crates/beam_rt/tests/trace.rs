@@ -243,17 +243,19 @@ fn erts_trace_targets_and_capability_gaps() {
     let mut sink = NullSink;
     let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
 
-    // Every group atom selects the runtime's own two processes: the `init` root process and
-    // the native `file_server_2` service (`src/native/file_server.rs`, contract A.9), both
-    // started by `Runtime::new` and neither spawned by user code.
+    // Every group atom selects the runtime's own three processes: the `init` root process, the
+    // native `erl_prim_loader` service and the native `file_server_2` service
+    // (`src/native/file_server.rs`, contract A.9), all started by `Runtime::new` and none spawned
+    // by user code.
     for target in [all, existing, existing_processes, processes] {
         let count = ctx
             .call_bif("erts_internal", "trace", 3, &[target, how_true, flags_list])
             .expect("erts_internal:trace/3");
         assert_eq!(
             signed_value(count),
-            2,
-            "the `init` root process and the native `file_server_2` service are both in the table"
+            3,
+            "the `init` root process, the native `erl_prim_loader` service and the native \
+             `file_server_2` service are all in the table"
         );
     }
 

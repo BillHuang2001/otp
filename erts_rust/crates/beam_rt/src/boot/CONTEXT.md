@@ -449,12 +449,18 @@ The request/reply surface, the errno mapping, the io-device and the remaining ga
   `{get_chars,…}`/`{put_chars,…}`, a `{setopts,…}` selecting an unmodelled `utf16`/`utf32` encoding,
   and a request `Enc` that is neither `latin1` nor `unicode`.
 
+## Notes for Agents — the `erl_prim_loader` name
+`erl_prim_loader` is a **preloaded module** whose functions the runtime serves from the native loader floor (`../native/loader.rs`), and it is also a **registered name**.
+`Runtime::new` spawns its own stand-in process — a `beam_process::Process` born `Runnable` and never enqueued, the same shape as the `init` root and the `file_server_2` service — and registers it under `erl_prim_loader` on **every** route that builds a runtime, so `erlang:whereis(erl_prim_loader)` answers a live pid exactly as the oracle does (the oracle's is its C `erts_prim_loader` state machine).
+Unlike `file_server_2` there is **no** name conflict with the boot script: `init` starts the loader (it is in the script's `{preLoaded, …}` list, not a `{kernelProcess, …}` child), so nothing in `bootstrap/bin/start.boot` registers the name.
+The `-version` action is the only route with no runtime at all, so it has no name registry to answer from.
+
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
 - `./preloaded.rs` → the real preloaded `.beam` loading (`load_preloaded`/`load_names`)
 - `./bootscript.rs` → the OTP boot-script reader (`read`/`BootScript`/`Instruction`/`Mfa`/`Value`) + executor (`execute`/`execute_reporting`/`BootStop`)
 - `./drive.rs` → the bounded scheduler-drive helpers (`drive_scheduler`/`start_kernel_process`/`apply_boot_call`, plus `DRIVE_DEADLINE`/`KERNEL_BURST_*`/`APPLY_BLOCK_SLICES`)
-- `../runtime.rs` → `Runtime::boot` / `boot_if_needed` / `preloaded_loaded` / `is_preloaded_loaded`, and the boot-script glue `boot_from_script` / `load_code_module` / `add_code_path` / `register_boot_process` / `unlink_processes`
+- `../runtime.rs` → `Runtime::boot` / `boot_if_needed` / `preloaded_loaded` / `is_preloaded_loaded`, the boot-script glue `boot_from_script` / `load_code_module` / `add_code_path` / `register_boot_process` / `unlink_processes`, and `Runtime::new`'s registration of the runtime's own `init` and `erl_prim_loader` names
 - `../cli.rs` → `boot_script_to_drive`/`boot_then` (the resolved boot script every action but `-version` drives) and the `Action::Boot` arm that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
