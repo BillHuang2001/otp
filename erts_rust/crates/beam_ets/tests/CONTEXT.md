@@ -46,7 +46,7 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 - `ets_rename.rs` → `ets:rename/2`
 - `ets_access.rs` → access matrix (`public`/`protected`/`private`) over the read/write surface
 - `ets_options.rs` → `TableOptions` parsing/reporting
-- `ets_fixtable.rs` → `safe_fixtable/2` deferred reclamation
+- `ets_fixtable.rs` → `safe_fixtable/2` deferred reclamation; plus the deterministic, always-on split-crossing walk tests (`a_split_crossing_ascending_walk_interleaved_with_mutations_visits_every_key_once`, `a_split_crossing_descending_walk_interleaved_with_mutations_visits_every_key_once`, `an_absent_key_anchor_is_a_range_bound_across_the_split_boundary`) — a `first`+`next` / `last`+`prev` chain over 100 keys (strictly > 2 × `ORDER = 32`) interleaved with mutation, sharing one walk driver
 - `ets_reclamation.rs` → the index key-anchor invariant + memory-accounting stress (see `../CONTEXT.md` Known Issues / Design Decisions); plus `ets_info_memory_is_in_the_oracles_ballpark` (100k objects, `ets:info(T,memory)` same order of magnitude as the live oracle, ratio bounded by 10×, all 4 kinds)
 - `ets_shared.rs` → `Send`/`Sync`, the `SharedTable` lock, no-lost-update concurrency, guard-scoped read aliasing note
 - `ets_concurrency.rs` → lock independence, serial equivalence, no-lost-update check-then-act, live-oracle winner count
