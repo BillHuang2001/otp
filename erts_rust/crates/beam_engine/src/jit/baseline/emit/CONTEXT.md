@@ -35,9 +35,11 @@ them.
   `machine.x`** via `[rbx + x*8]` (`rbx` = `rt->x_regs`, loaded in the prologue).
   A register is either *always* cached in its machine register or *never* cached, fixed for the whole
   block, so the two representations can never disagree.
-- **Both directions of the register cache are partial.** `spill` stores only the block's **written**
-  set — the cached x-registers some inline lowering of the block may write (`Allocation::written`, a
-  static superset populated by `regalloc.rs::cacheable_writes`); `fill` reloads only
+- **Both directions of the register cache are partial.** `spill(buffer, allocation, site, pc)` stores
+  exactly `Allocation::spill_slots_at(pc)` — the cached x-registers **dirty at that pc**
+  (`Allocation::spill_sets`, the `regalloc.rs` forward dirty walk), i.e. the ones an inline lowering has
+  diverged from their `machine.x` slot since the last syncing event, and falls back to the whole
+  `Allocation::written` set when the table is empty; `fill` reloads only
   `Allocation::fill_slots(pc)` — the registers the continuation can still observe, the block-local
   liveness of `liveness.rs::fill_sets` unioned with the write set, `(live ∪ written) ∩ slots` — except
   the prologue load, which is always the whole cache.
@@ -283,17 +285,27 @@ instruction's own operands.
   may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
   (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
   re-publishes the current frame's Y window in one call — then load each cached register from `machine.x`.
-- `regs.rs::spill` / `regs.rs::fill`: `spill` stores every `(x, reg)` in `Allocation::spill_slots()`
-  (the **written** subset of `Allocation::slots`); `fill` loads every `(x, reg)` in
+- `regs.rs::spill` / `regs.rs::fill`: `spill(buffer, allocation, site, pc)` stores exactly
+  `Allocation::spill_slots_at(pc)` — the cached x-registers **dirty at that pc** (`Allocation::spill_sets`,
+  the `regalloc.rs` forward dirty walk) — falling back to the whole `Allocation::written` set when the
+  table is empty (a synthetic `Allocation` a unit test built directly); `fill` loads every `(x, reg)` in
   `Allocation::fill_slots(pc)` — the continuation's block-local liveness unioned with the write set —
   except the prologue load, which is the whole cache (see the **Register cache** section below).
-- **Every helper call spills first.** `mod.rs::emit_helper_call` (used by `emit_step_and_continue`,
-  `emit_ext_call`, `emit_receive`, `emit_family`, the `Call` arm, the frame-discipline trio, the
-  heap/frame-admission family and the comparison-`test` helper) calls `spill` before loading `rdi` from
+- **Every helper call spills first.** `mod.rs::emit_helper_call(buffer, allocation, helper, args, pc)`
+  (used by `emit_step_and_continue`, `emit_ext_call`, `emit_receive`, `emit_family`, the `Call` arm, the
+  frame-discipline trio, the heap/frame-admission family and the comparison-`test` helper) stores the
+  dirty set at that instruction's own `pc` before loading `rdi` from
   the `rt` slot, filling the ABI argument registers `rsi`/`rdx`/`rcx`/`r8`/`r9` with the caller's
   argument words, and `call r11`; it does **not** spill after the call (the helper legitimately wrote
   `machine.x`) — `fill` reloads instead. `link.rs::emit_tail_exit` spills before `call jit_tail_call`.
   No emitted path in this node calls a helper without spilling first.
+- **Every spill site passes the instruction's own `pc`.** `emit_helper_call` stores at the instruction's
+  `pc`; `link.rs::emit_exit`/`emit_tail_exit`/`emit_tail_exit_to_driver` take a trailing `store_pc`
+  **separate** from their branch target `(func, pc)` (a `jump`/`call`/`call_last`/`call_only` passes its
+  own `pc` as `store_pc` and the successor `(func, pc)` as the target; the block's fall-through exit
+  passes the exit pc `end`); the fused `deallocate N; return` pair stores at the pair's **first** `pc`
+  (`emit_deallocate_return`'s `store_pc`) while the helper's recorded position is the `return`'s pc
+  (`position_pc`).
 - **Gated Y-window refresh after an in-block helper.** `emit_continue_check` (the shared continue arm of
   `emit_step_and_continue`, `emit_ext_call`, `emit_receive` and `emit_family`) emits `jit_refresh_y(rt)`
   — after `fill`, on the continue-in-block path only — exactly when a later instruction of the block
@@ -301,13 +313,13 @@ instruction's own operands.
   the interpreter, which may have pushed/`trim`med a frame or **reallocated** `machine.stack` and so
   staled the prologue's window. When no later instruction accesses Y the call is not emitted at all, and
   a helper that leaves the block to the driver pays nothing (the next block's prologue publishes).
-- `link.rs::emit_exit` and `link.rs::emit_tail_exit` spill (the written set) on **both** the linked and
-  the deopt paths.
+- `link.rs::emit_exit`, `link.rs::emit_tail_exit` and `link.rs::emit_tail_exit_to_driver` spill (the
+  dirty set at their own `store_pc`) on **every** path — the linked and the return-to-driver ones alike.
 - The epilogue (`block.rs`: `done` -> `emit_frame_teardown` -> `ret`) does **not** spill: every path reaching
   it has already spilled. The inline fast paths (`move`/`arith`/`compare`/`test`/`select`/`aggregate`) do
   **not** spill themselves — a result lands in a cache register or straight in `machine.x` (the very slot
-  the exit spill writes), and the next helper call or block exit spills it (its destination register is in
-  the block's written set, so that spill stores it).
+  the exit spill writes), and the next helper call or block exit stores it (a result left in a cache
+  register is dirty at that point, so the store set contains it).
 
 ## Register picker (`regalloc.rs::allocate_registers`)
 Liveness-based, by **live interval**. `cacheable_touches` reports the x-register operands **of each
@@ -334,6 +346,13 @@ compile-time gate for the emitter's prologue publish and its post-helper refresh
 x-register, so it is neither a candidate nor charged to any live interval, and it never raises
 `highest_native_register`: a stack slot must not refuse native entry (the driver's bound is
 `machine.x.len() > bound`).
+
+`allocate_registers` also derives `Allocation::spill_sets` — the block's per-`pc` **dirty** set, the store
+set every `spill` uses. It is a forward walk over the block: push the dirty set entering each instruction,
+union `cacheable_writes` when the instruction inlines (`is_inlined`, which mirrors the emitter's own
+compile-time inlining decision and is biased toward "inlined"), and clear it otherwise (a purely-helper
+instruction's own pre-call spill synced the whole cache, so nothing is dirty after it). The final entry
+is the dirty set at the block exit pc `end`.
 
 ## The `Move` literal source and the literal-area guard
 A `Move` whose source is a **literal-area term** (`MoveValue::Literal`, an index into the running
@@ -388,22 +407,40 @@ the driver's decoder.
 - Never hand-edit generated data. Apache-2.0 header on every `.rs` (byte-exact, license scanner
   enforced).
 
+## Test Strategy
+The dirty-set store set is pinned by the `#[cfg(test)] #[path]` submodule `spill_tests`
+(`spill_tests.rs`, declared from `mod.rs`): a write followed by a helper stores the dirty register once,
+an inlined instruction that writes nothing does not reset the set, a fully-deopted one does reset it, an
+empty `spill_sets` table falls back to the whole `written` set, and a corpus consistency pin checks
+`regalloc.rs::is_inlined` against the emitter's own compile-time inlining decision.
+`../counters.rs` unit test `one_run_yields_both_the_written_and_the_full_cache_spill_counts` pins that a
+4-slot cache with a 2-element write set at two spill sites yields **4** written-set stores and **8**
+full-cache stores from one recorded run. The emitted bytes themselves are pinned by
+`baseline/tests.rs` (`every_exit_spills_the_cached_registers_before_leaving_the_frame`,
+`a_tail_exit_spills_pops_the_frame_and_then_jumps_to_the_successor`,
+`a_deallocate_spills_before_calling_the_helper`), which assert against the dirty-set store count.
+Tier-equivalence is proven by the crate's `tests/jit*.rs` real-module gates (interpreter-identical
+by construction).
+
 ## Routing Table
 - `mod.rs` -> the shared emitter wiring: the register-file/scratch constants (`SAVED_REGISTERS`/
   `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/`MOVE_SCRATCH_2`), `touch`, `emit_refresh_y`,
-  `emit_helper_call`, `emit_step_and_continue`, `emit_continue_check`; re-exports
+  `emit_helper_call` (which takes the instruction's own `pc` as the store pc), `emit_step_and_continue`,
+  `emit_continue_check`; re-exports
   `regs::{Allocation, SpillSite, FillSite}` and `pub(crate) use block::emit_block`, `compile_module`/
   `compile_function` (keeping every item path stable for `baseline/mod.rs`, `baseline/code.rs`, the
-  sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`).
+  sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`), plus
+  the `#[path]` submodule `spill_tests` (`spill_tests.rs`; see `## Test Strategy`).
 - `block.rs` -> the compiled-block shape and per-instruction lowering dispatch: `emit_block` (the
   `match instr` dispatch), `try_inline_init_yregs`, `emit_position_store`/`emit_publish_y`/
   `emit_prologue_helper` (the prologue position store / Y-window publish), `emit_deopt`,
   `emit_local_call_probe`, `emit_ext_call`, `emit_receive`.
-- `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`y_last`/`block_start`/
-  `fill_sets`, `slot`/`is_written`/`spill_slots`/`fill_slots`/`refresh_y_after`), `spill` (stores only
-  `written`), `fill` (loads only `fill_slots(pc)`, else the whole cache at the prologue), and the
+- `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`spill_sets`/`y_last`/
+  `block_start`/`fill_sets`, `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/
+  `refresh_y_after`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`), `fill` (loads
+  only `fill_slots(pc)`, else the whole cache at the prologue), and the
   test-only `SpillSite`/`FillSite` classification of the call sites; `liveness.rs` computes the per-pc
-  `fill_sets`.
+  `fill_sets` and `regalloc.rs` the per-pc `spill_sets`.
 - `compile.rs` -> the compilation entry points and what they share: `compile_module` (**eager**:
   whole-module block map + the merged whole-module summary that guards entry, plus `emit_shared_sub_blocks`)
   and `compile_function` (**lazy**: one function's own buffer/entries/sub_entries/summary, sharing
@@ -411,9 +448,11 @@ the driver's decoder.
   `emit_shared_sub_blocks`, `emit_function`, and the code-size budgets (`BLOCK_BYTES`/`INSTRUCTION_BYTES`/
   `FAST_PATH_BYTES`/`COMPARE_PATH_BYTES`/`LIST_PATH_BYTES`/`TUPLE_PATH_BYTES`) with their estimates
   `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate`.
-- `regalloc.rs` -> `allocate_registers` (incl. the `y_last` and `written` derivations) + `cacheable_touches`
+- `regalloc.rs` -> `allocate_registers` (incl. the `y_last`, `written` and `spill_sets` derivations) +
+  `cacheable_touches`
   (the per-instruction native touches) + `cacheable_writes` (the block's written x-registers, mirroring each lowering's shape
-  test but returning destinations).
+  test but returning destinations) + `spill_sets`/`is_inlined`/`test_helper_inlined` (the per-pc
+  dirty-set walk and its inlining mirror).
 - `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`,
   `small_word`, the shared guarded-Y access (`emit_guarded_y_address`/`emit_guarded_y_load`/
   `emit_guarded_y_store`/`guard_y_store`), the `Loc` location abstraction
@@ -456,11 +495,13 @@ the driver's decoder.
 - `aggregate/list.rs` -> the cons-cell/list readers: `NOT_LIST_MASK`/`POINTER_MASK`/`CAR_DISP`/
   `CDR_DISP`, `Half`, `ListShape` + impl, `get_list_shape`/`get_hd_shape`/`get_tl_shape`, `shape`,
   `try_inline_get_list`/`try_inline_get_hd`/`try_inline_get_tl`, `emit_list_read`.
-- `link.rs` -> `Linker` (`is_compiled`, `emit_exit`, `emit_tail_exit`, `emit_tail_exit_to_driver`),
-  `emit_frame_teardown`, and the byte-level linker unit tests (alongside `test.rs`'s own unit tests).
-- `frame.rs` -> `emit_deallocate`, `emit_return`, `emit_deallocate_return`, `emit_word_exit` (the three
-  end-of-body lowerings + the shared `jmp done` exit), plus its unit tests (the frame-discipline bytes
-  and the emitter-side `Deallocate`+`Return` fusion).
+- `link.rs` -> `Linker` (`is_compiled`, `emit_exit`, `emit_tail_exit`, `emit_tail_exit_to_driver` —
+  each taking a trailing `store_pc` separate from the branch target), `emit_frame_teardown`, and the
+  byte-level linker unit tests (alongside `test.rs`'s own unit tests).
+- `frame.rs` -> `emit_deallocate`, `emit_return`, `emit_deallocate_return` (whose `position_pc` — the
+  helper's recorded position — is separate from its `store_pc`, the pair's first pc), `emit_word_exit`
+  (the three end-of-body lowerings + the shared `jmp done` exit), plus its unit tests (the
+  frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
   frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
   `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
@@ -553,14 +594,18 @@ call-dense synthetic body costs ~4× per 4× call count (linear), pinned by
 x-register is either *always* cached or *never* cached and the two representations can
 never disagree. Both directions of the traffic are **partial**:
 
-- `spill(buffer, allocation, SpillSite)` stores exactly `Allocation::written` — the
-  block's statically-derived write set (`regalloc.rs::cacheable_writes`, a superset of
-  what the inline lowerings actually write). A cached register outside that set still
-  holds its `machine.x` value at every program point, so storing it is a no-op. Sites:
+- `spill(buffer, allocation, SpillSite, pc)` stores exactly `Allocation::spill_slots_at(pc)` —
+  the cached x-registers **dirty at `pc`**: those an inline lowering has diverged from their
+  `machine.x` slot since the last syncing event (the prologue, which loads the cache, or a
+  post-helper `fill`, which reloads it). The set is a per-`pc` over-approximation derived by
+  `regalloc.rs`'s forward `spill_sets` dirty walk (union `cacheable_writes` for an inlined
+  instruction, clear it where the emission is entirely a helper, biased toward "inlined" so a
+  missed reset only costs a redundant store). An allocation whose table is empty (a synthetic one
+  a unit test built directly) falls back to the whole-block `Allocation::written` set. Sites:
   `SpillSite::Helper` (before an in-block helper call — the helper *is* the interpreter
   and reads `machine.x`) and `SpillSite::Exit` (the block exit and the tail exit).
   Because `resident ⊆ slots` and a non-resident slot's `machine.x` is already
-  authoritative, storing the write set is exact on every path — including the deopt and
+  authoritative, the dirty set is complete on every path — including the deopt and
   epilogue paths.
 - `fill(buffer, allocation, FillSite, pc)` reloads exactly `Allocation::fill_slots(pc)`:
   the cached registers the continuation at `pc + 1` can still observe, computed
@@ -569,17 +614,21 @@ never disagree. Both directions of the traffic are **partial**:
   in a backwards walk over the block. The write-set term is the **join rule** for a
   guarded lowering's fallback label: on the fast path the destination register is
   authoritative and `machine.x` stale, on the fallback path the reverse — reloading the
-  write set makes them agree, so the exit spill (which stores the write set on both
-  paths) stays exact. A cached register left out of the fill set keeps a stale word,
+  write set makes them agree, and the exit spill's dirty set (which the dirty walk unions
+  the same write set into, on either path) stores it, so the two stay exact. A cached
+  register left out of the fill set keeps a stale word,
   which is safe: a later **read** through its machine register makes it live at that
-  helper (so it is reloaded) and every **store** stores exactly the write set, which the
+  helper (so it is reloaded) and every **store** stores exactly the dirty set, which the
   fill set always contains. The register is only ever overwritten, never read.
 
-`Allocation` carries `block_start` and `fill_sets` (indexed by `pc - block_start`),
-derived once by `regalloc.rs` at allocation time so the emitter stays a pure reader. An
+`Allocation` carries `block_start`, `fill_sets` (indexed by `pc - block_start`, one entry
+per pc of the block) and `spill_sets` (the same indexing, one entry per pc in
+`[start, end]` — the block's own pcs **plus** the exit pc `end`), both derived once by
+`regalloc.rs` at allocation time so the emitter stays a pure reader. An
 **empty** `fill_sets` table (a synthetic `Allocation` a unit test built directly) means
-"no liveness was computed" and makes every fill set the whole cache. The prologue load is always the whole cache (`FillSite::Prologue`),
-and the table is always block-length so an in-block pc always resolves. This keeps
+"no liveness was computed" and makes every fill set the whole cache, and an empty
+`spill_sets` table likewise makes every store set the whole `written` set. The prologue load is always the whole cache (`FillSite::Prologue`),
+and the fill table is always block-length so an in-block pc always resolves. This keeps
 `allocate_registers(module, code, start, end) -> Allocation` and
 `Allocation::slots`' meaning unchanged, so `compile.rs` (and the continuation
 sub-blocks, which drive `emit_block` with their own `start`) compile unchanged.
