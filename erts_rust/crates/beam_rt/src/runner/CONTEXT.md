@@ -34,6 +34,17 @@ figures are in `PERF.md`).
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
   parked-receive deadline rearming and the recorded outcome.
+  An **export** entry is classified once, before the context borrows its budget wrapper, through the
+  runtime's host-dispatch predicate (`RuntimeContext::host_serves` — a runtime-native-floor name, a
+  NIF-loaded module, or a registered `beam_bifs` key): a **host-served** MFA is dispatched through
+  `call_bif` (so `spawn(erlang, send, [Pid, Msg])` — `timer_server:do_apply/2`'s shape — delivers
+  the message instead of entering `erlang.beam`'s `nif_error(undef)` stub), and **every** other
+  entry keeps the export's own label route (`module.export/2`, with its
+  `run_export: export not found` arm). It is deliberately **not** the cross-module seam's
+  `resolve_external_call`, whose `Ok(None)` is overloaded with the module-unresolvable,
+  missing-function-atom and self-observing-callee refusals: reading it as "host-served" routes a
+  resolvable entry to `call_bif`'s nested **non-pumping** `run_export`, where a blocking callee
+  folds into the typed `blocked()` gap and the process never parks.
   The parked `receive … after T` deadline is recovered with the engine's **cross-module-aware**
   `Machine::wait_deadline` (passed the process's entry module; it reads the callee module the machine
   is really parked in, so a `call_ext*` callee's `after T` is not lost), `delay_ms == Some(d)` gates
