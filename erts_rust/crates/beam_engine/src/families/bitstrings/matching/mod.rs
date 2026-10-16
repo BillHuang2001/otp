@@ -69,6 +69,8 @@ mod match_ctx;
 mod reads;
 #[cfg(test)]
 mod rooted;
+#[cfg(test)]
+mod utf_tests;
 
 // Every moved item is re-exported here so its existing
 // `crate::families::bitstrings::matching::…` path keeps resolving. Some are only
@@ -406,18 +408,20 @@ pub(super) fn exec(
             }
         }
         // `bs_get_utf32` is rewritten by `emu/ops.tab` into
-        // `bs_get_integer2 … 32 1` + `i_bs_validate_unicode_retract`; the observable
-        // result is a 32-bit big-endian read that must be a valid Unicode scalar.
+        // `bs_get_integer2 … 32 1 Flags` + `i_bs_validate_unicode_retract`, so the
+        // 32-bit field honours the segment flags (`little`/`native` select the byte
+        // order, `big` is the default) and the result must be a valid Unicode scalar.
         Instr::BsGetUtf32 {
             fail,
             ctx: ctx_op,
             live: _,
-            flags: _,
+            flags,
             dst,
         } => {
+            let flags = *flags;
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_utf32")?;
             let (bytes, off) = raw::subject_bytes(orig)?;
-            match decode_utf32(bytes, start + off, end + off) {
+            match decode_utf32(bytes, start + off, end + off, flags) {
                 Some((value, len)) => {
                     let t = make_small_checked(value as i64)?;
                     write_operand(machine, dst, t)?;
@@ -450,12 +454,27 @@ pub(super) fn exec(
                 None => fail_step(machine, module, labels, *fail, ctx_op, ctx),
             }
         }
+        // `bs_skip_utf32` is `bs_get_integer2 … 32 1 Flags` +
+        // `i_bs_validate_unicode_retract` with the value discarded
+        // (`emu/ops.tab:1305-1307`), so it honours the flags exactly as `bs_get_utf32`
+        // does and advances the context by the same 32 bits.
         Instr::BsSkipUtf32 {
             fail,
             ctx: ctx_op,
             live: _,
-            flags: _,
-        } => skip_utf(machine, module, labels, ctx, ctx_op, *fail, decode_utf32),
+            flags,
+        } => {
+            let flags = *flags;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_skip_utf32")?;
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            match decode_utf32(bytes, start + off, end + off, flags) {
+                Some((_, len)) => {
+                    raw::set_ctx_start(term, start + len);
+                    Ok(Some(Step::Next))
+                }
+                None => fail_step(machine, module, labels, *fail, ctx_op, ctx),
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -565,16 +584,16 @@ mod tests {
     #[test]
     fn utf32_decodes_valid_scalars_and_rejects_the_rest() {
         assert_eq!(
-            decode_utf32(&[0x00, 0x00, 0x20, 0xAC], 0, 32),
+            decode_utf32(&[0x00, 0x00, 0x20, 0xAC], 0, 32, 0),
             Some((0x20AC, 32))
         );
         assert_eq!(
-            decode_utf32(&[0x00, 0x10, 0xFF, 0xFF], 0, 32),
+            decode_utf32(&[0x00, 0x10, 0xFF, 0xFF], 0, 32, 0),
             Some((0x10FFFF, 32))
         );
-        assert_eq!(decode_utf32(&[0x00, 0x00, 0x00], 0, 24), None); // bounded out
-        assert_eq!(decode_utf32(&[0x00, 0x00, 0xD8, 0x00], 0, 32), None); // surrogate
-        assert_eq!(decode_utf32(&[0x00, 0x11, 0x00, 0x00], 0, 32), None); // >U+10FFFF
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0x00], 0, 24, 0), None); // bounded out
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0xD8, 0x00], 0, 32, 0), None); // surrogate
+        assert_eq!(decode_utf32(&[0x00, 0x11, 0x00, 0x00], 0, 32, 0), None); // >U+10FFFF
     }
     // -- f16_to_f32 (erl_bits.c:508) ----------------------------------------
     #[test]
