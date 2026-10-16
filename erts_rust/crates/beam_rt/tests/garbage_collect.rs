@@ -196,19 +196,18 @@ const PROGRAMS: [(&str, &str, &str); 4] = [
 // **scheduled-process** route (the `..._on_the_scheduled_route` test below), because the
 // `-eval` route cannot express its premise. A `spawn`ed `-eval` closure is run
 // **synchronously to completion** by the evaluator (`src/eval/mod.rs`, `apply_eval_closure`),
-// and its `receive … after T` arms poll the port poller once and then fall straight through to
-// the `after` body — there is no host timer to block on in M1 — so a "parked" `-eval` child
-// runs `ok`, returns and terminates before the parent's next statement. The target is then
-// genuinely dead at the `erlang:garbage_collect(P, …)` call, and this runtime answers the
+// and it is applied on the slice's own context (`may_pump_scheduler` is false there), so its
+// `receive … after T` arms never park: a `spawn`ed `-eval` child runs `ok`, returns and
+// terminates before the parent's next statement. (The `-eval` action's **own** `receive …
+// after T` does wait — a mailbox rescan, a bounded scheduler pump, one port-poller pass and
+// `Runtime::wait_for_timer` on the timer heap — but that is the top-level evaluator, not a
+// spawned closure.) The target is then genuinely dead at the
+// `erlang:garbage_collect(P, …)` call, and this runtime answers the
 // oracle's own dead-target `false` — the C's `liveness_notify_sys_task_executed`
 // (`erts/emulator/beam/erl_process.c:11488-11490`), the same `false` as `EXPR_ASYNC_DEAD`. The
 // live-target (`true`) and dead-target (`false`) halves of the completion are therefore pinned
 // here by `EXPR_ASYNC_SELF` / `EXPR_ASYNC_DEAD`, and the live-**blocked**-target half by the
 // scheduled fixture entry `gc_req:ask_async/0`.
-//
-// Owner of the `-eval` capability gap: `src/eval/mod.rs`'s `receive` — the `after T` deadline
-// must actually be waited out (or a spawned `-eval` child otherwise kept alive) before the
-// `-eval` route could carry this case.
 
 /// The requester is the **target** (`self()`): the completion is delivered into the requesting
 /// process's own mailbox, so it can receive it after the call returns.

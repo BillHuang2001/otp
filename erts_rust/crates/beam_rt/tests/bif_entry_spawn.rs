@@ -28,10 +28,15 @@
 //! shape is exactly what `timer_server`'s `do_apply/2` runs for a `timer:apply_after/4` MFA, so
 //! before the fix a fired timer's message never arrived.
 //!
-//! The runner now asks the same cross-module-call seam a `call_ext*` uses
-//! ([`ExecutionContext::resolve_external_call`]): `Ok(None)` means "the host serves this
-//! MFA", and the entry is dispatched through `call_bif`, whose return value becomes the
-//! process's `x(0)`. The `-eval` `receive … after T` window additionally waits out its remaining
+//! The runner now asks the runtime's own host-dispatch predicate
+//! ([`RuntimeContext::host_serves`] — a runtime-native-floor name, a NIF-loaded module, or a
+//! registered `beam_bifs` key), and the entry is dispatched through `call_bif`, whose return
+//! value becomes the process's `x(0)`. That predicate is deliberately **not** the
+//! cross-module-call seam a `call_ext*` uses ([`ExecutionContext::resolve_external_call`]):
+//! that seam's `Ok(None)` is overloaded — it is equally its answer for a module it cannot load,
+//! a function atom the callee's table lacks, an export the callee does not have, and a callee
+//! whose own body observes its call site — so it must never be read as "the host serves this
+//! MFA". The `-eval` `receive … after T` window additionally waits out its remaining
 //! time on the runtime's **timer heap** (`Runtime::wait_for_timer`), so a deadline that falls
 //! inside the window fires (and delivers) instead of the `after` body running early.
 //!

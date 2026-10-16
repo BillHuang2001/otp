@@ -72,8 +72,11 @@
 //! # Known Milestone-1 gaps (typed errors, never wrong results)
 //!
 //! * `receive` without an `after` clause **and** with nothing runnable to deliver a message
-//!   is a typed `unsupported` (there is no host timer to block on); a bare `receive` inside a
-//!   spawned process is too, because that context runs *inside* a scheduler slice and must
+//!   is a typed `unsupported`: there is a host-timer mechanism
+//!   ([`Runtime::wait_for_timer`](crate::runtime::Runtime::wait_for_timer)), but a bare
+//!   `receive` has no deadline to bound a wait on, so it pumps while anything is runnable and
+//!   otherwise reports the gap (never a hang). A bare `receive` inside a spawned process is too,
+//!   because that context runs *inside* a scheduler slice and must
 //!   not re-enter the scheduler.
 //! * `catch Expr` folds **by class**, exactly like `erl_eval`: a `throw` yields the
 //!   reason, an `exit` yields `{'EXIT', Reason}`, and an `error` yields
@@ -1338,7 +1341,9 @@ impl Evaluator<'_, '_> {
     ///   no timer cannot busy-spin.
     /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
     ///   runnable and then reports the typed capability gap `receive: no matching message
-    ///   arrived` rather than hanging (there is no host timer to block on in Milestone 1).
+    ///   arrived` rather than hanging. There *is* a host-timer mechanism
+    ///   ([`Runtime::wait_for_timer`]), but a bare receive carries no deadline to bound a wait
+    ///   on, so there is nothing to wait out.
     fn receive(&mut self, receive: &ast::Receive, env: &mut Env) -> EResult<Eterm> {
         match &receive.after {
             Some((timeout, body)) => {
@@ -1406,8 +1411,9 @@ impl Evaluator<'_, '_> {
                     return self.exprs(&receive.clauses[index].body, &mut clause_env);
                 }
                 // A bare receive inside a spawned process cannot pump the scheduler it is
-                // itself running under (that would run a second process from within a slice),
-                // and there is no host timer to block on — a typed gap, never a hang.
+                // itself running under (that would run a second process from within a slice).
+                // There is a host-timer mechanism ([`Runtime::wait_for_timer`]), but a bare
+                // receive has no deadline to bound a wait on — a typed gap, never a hang.
                 if !self.ctx.may_pump_scheduler() {
                     return Err(Flow::Fatal(error::unsupported(
                         "receive (no after clause) inside a spawned process",
