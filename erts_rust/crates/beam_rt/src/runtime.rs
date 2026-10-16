@@ -2715,7 +2715,7 @@ impl Runtime {
         let previous = std::mem::replace(&mut self.self_pid, action_pid);
         let result = body(self);
         self.self_pid = previous;
-        self.processes.remove(action_pid);
+        // SCRATCH: self.processes.remove(action_pid);
         result
     }
 
