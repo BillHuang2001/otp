@@ -361,9 +361,8 @@ struct Walk<'a> {
 /// The descent runs over the process's whole live object graph (thousands of objects) on the
 /// collections that reach it, so the set's per-key cost is the descent's dominant term. It is
 /// therefore deliberately *not* a `HashSet`: it is an **open-addressing table keyed directly on
-/// the object address** — a word-aligned term pointer, whose own bits already separate the
-/// addresses of one allocation region, so no mixing beyond a shift is needed — and every slot
-/// carries a **generation tag**, so a fresh walk "clears" the table in `O(1)` (one counter
+/// the object address** — a word-aligned term pointer, mixed by [`Visited::probe`] — and every
+/// slot carries a **generation tag**, so a fresh walk "clears" the table in `O(1)` (one counter
 /// increment) instead of touching one word per slot. That is what makes reusing the table across
 /// walks free.
 #[derive(Default)]
@@ -378,11 +377,20 @@ struct Visited {
     generation: u32,
     /// How many slots the current generation occupies.
     len: usize,
-}
-
-/// The table's initial slot count (a power of two). Grown (never shrunk) as a walk deepens, so
+    /// Test-only: the probes the walk in progress has made (the probe-quality test's witness).
+    #[cfg(test)]
+    probes: u64,
+    /// Test-only: the keys the walk in progress has been asked to record.
+    #[cfg(test)]
+    inserts: u64,
+}/// The table's initial slot count (a power of two). Grown (never shrunk) as a walk deepens, so
 /// the table reaches the process's live-set size once and stays there.
 const INITIAL_SLOTS: usize = 1024;
+
+/// The **odd** 64-bit multiplicative constant of the Fibonacci hash — the integer nearest
+/// `2^64 / phi`, so consecutive multiples of it walk the whole word uniformly. Multiplying by an
+/// odd constant is invertible modulo `2^64`, so no address bit is discarded by the multiply.
+const FIBONACCI_HASH: u64 = 0x9E37_79B9_7F4A_7C15;
 
 impl Visited {
     /// Starts a new walk: `O(1)`, without touching a single slot (the generation bump is the
@@ -409,8 +417,16 @@ impl Visited {
             self.grow();
         }
         let mask = self.keys.len() - 1;
+        #[cfg(test)]
+        {
+            self.inserts += 1;
+        }
         let mut slot = Self::probe(key) & mask;
         loop {
+            #[cfg(test)]
+            {
+                self.probes += 1;
+            }
             if self.generations[slot] != self.generation {
                 self.keys[slot] = key;
                 self.generations[slot] = self.generation;
@@ -444,13 +460,24 @@ impl Visited {
         }
     }
 
-    /// The initial probe index of `key`: its word index, with two higher address bits folded in
-    /// so that a region-aligned allocation pattern does not probe a single congruence class.
+    /// The initial probe index of `key` — a **full-width multiplicative (Fibonacci) mix**, the
+    /// **high** bits of the 64-bit product forming the index.
+    ///
+    /// The index must be a function of *every* address bit, because the addresses this table is
+    /// keyed on are **allocation-shaped**, not random: an object address inside one allocation
+    /// region is `base + step * i` for a small number of object sizes, and the immix mature
+    /// generation lays its objects out on 128-byte lines inside 32 KiB blocks
+    /// (`base + (B*4096 + L*16 + w)*8`). Every such pattern leaves the **low** address bits
+    /// structured, so an index built from them alone (`key >> 3`, say) reaches only a fraction of
+    /// the slots — the table then behaves as if it were a small fraction of its size, and its
+    /// linear-probe runs grow without bound as it fills. Taking the *high* product bits instead
+    /// folds every lower address bit into the index, so an aligned or fixed-stride allocation
+    /// pattern lands uniformly and the probe runs stay near one. The mix is one `imul` — the
+    /// multiply is the whole cost, since the caller already masks the result.
     fn probe(key: usize) -> usize {
-        (key >> 3) ^ (key >> 15)
+        ((key as u64).wrapping_mul(FIBONACCI_HASH) >> 32) as usize
     }
 }
-
 impl<'a> Walk<'a> {
     /// Starts a walk over `scratch`, resetting the reused state in `O(1)`.
     fn begin(scratch: &'a mut WalkScratch) -> Walk<'a> {
@@ -550,5 +577,284 @@ impl<'a> Walk<'a> {
                 self.seed(process, *address.add(offset));
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    // ---------------------------------------------------------------------------------------
+    // The probe quality
+    // ---------------------------------------------------------------------------------------
+
+    /// A synthetic allocation region shaped exactly like the immix mature generation: `blocks`
+    /// 32 KiB blocks, each of 256 128-byte lines of 16 words, of which the first `words_per_line`
+    /// are live object addresses — i.e. every address is `base + (B*4096 + L*16 + w) * 8`.
+    fn block_region(base: usize, blocks: usize, words_per_line: usize) -> Vec<usize> {
+        let mut out = Vec::with_capacity(blocks * 256 * words_per_line);
+        for b in 0..blocks {
+            for l in 0..256 {
+                for w in 0..words_per_line {
+                    out.push(base + (b * 4096 + l * 16 + w) * 8);
+                }
+            }
+        }
+        out
+    }
+
+    /// Drives `Visited` over `addrs` exactly as [`Walk::seed`] would (one `insert` per address,
+    /// growing the table as the walk deepens) and reports (mean probes per input address, slots).
+    ///
+    /// The probes the `grow` re-insert performs are charged to the address that triggered the
+    /// grow, so the figure is "probes per address recorded", not "probes per table write".
+    fn mean_probes_per_insert(addrs: &[usize]) -> (f64, usize) {
+        let mut visited = Visited::default();
+        visited.begin();
+        let mut probes = 0u64;
+        for &addr in addrs {
+            let before = visited.probes;
+            visited.insert(addr);
+            probes += visited.probes - before;
+        }
+        (probes as f64 / addrs.len() as f64, visited.keys.len())
+    }
+
+    /// The probe index must depend on **every** address bit.
+    ///
+    /// Every real address this table sees is `base + step * i` for some allocation pattern, so a
+    /// probe built from the low address bits alone maps a whole region onto a small fraction of
+    /// the slots: the table then behaves as if it were a fraction of its size, and its linear
+    /// probe runs grow without bound as it fills. Three line/block geometries (8, 4 and 2 of each
+    /// 128-byte line's 16 words, at disjoint bases) reproduce exactly the shapes the walk sees;
+    /// the mean probes per insert must stay near one, and the table must not balloon.
+    #[test]
+    fn the_probe_mix_spreads_a_line_and_block_organised_region() {
+        let mut addrs = block_region(0x7f00_0000_0000, 2, 8);
+        addrs.extend(block_region(0x7f01_0000_0000, 4, 4));
+        addrs.extend(block_region(0x7f02_0000_0000, 8, 2));
+        assert_eq!(addrs.len(), 12_288);
+        assert!(addrs.len() >= 4_000);
+        assert_eq!(addrs.iter().collect::<BTreeSet<_>>().len(), addrs.len());
+
+        let (mean, slots) = mean_probes_per_insert(&addrs);
+        // The old `(key >> 3) ^ (key >> 15)` probe measures 7.8 probes per insert here (and the
+        // walked shapes are worse); a probe that mixes every address bit measures ~3.1.
+        assert!(
+            mean < 4.0,
+            "mean probes per insert {mean:.3} — the probe index is not mixing the aligned \
+             address bits (slots {slots})"
+        );
+        assert!(
+            (addrs.len() / 2..=addrs.len() * 4).contains(&slots),
+            "table size {slots} out of proportion for {} addresses",
+            addrs.len()
+        );
+    }
+
+    /// The same region must not make the table's fill degenerate: after every address is
+    /// recorded exactly once, every one of them is found by a lookup (no lost key, no false
+    /// "already visited").
+    #[test]
+    fn every_aligned_address_is_recorded_exactly_once() {
+        let addrs = block_region(0x7f00_0000_0000, 2, 8);
+        let mut visited = Visited::default();
+        visited.begin();
+        for &addr in &addrs {
+            assert!(visited.insert(addr), "{addr:#x} reported as already visited");
+        }
+        for &addr in &addrs {
+            assert!(!visited.insert(addr), "{addr:#x} lost");
+        }
+        assert_eq!(visited.len, addrs.len());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The visitation semantics
+    // ---------------------------------------------------------------------------------------
+
+    /// The nodes the table holds for the walk in progress, in the shape a walk's graph has.
+    fn recorded(visited: &Visited) -> BTreeSet<usize> {
+        (0..visited.keys.len())
+            .filter(|&slot| visited.generations[slot] == visited.generation)
+            .map(|slot| visited.keys[slot])
+            .collect()
+    }
+
+    /// The reference reachability: a plain `O(nodes + edges)` traversal of `graph` from `root`.
+    fn reachable(graph: &[Vec<usize>], root: usize) -> BTreeSet<usize> {
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![root];
+        seen.insert(root);
+        while let Some(node) = pending.pop() {
+            for &child in &graph[node] {
+                if seen.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+        seen
+    }
+
+    /// Drives `Visited` exactly the way [`Walk::seed`] does — `if insert(k) { pending.push(k) }` —
+    /// and reports, per node, how many times it was expanded.
+    fn drive(visited: &mut Visited, graph: &[Vec<usize>], root: usize) -> Vec<usize> {
+        let mut expansions = vec![0usize; graph.len()];
+        let mut pending = Vec::new();
+        if visited.insert(root) {
+            pending.push(root);
+        }
+        while let Some(node) = pending.pop() {
+            expansions[node] += 1;
+            for &child in &graph[node] {
+                if visited.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+        expansions
+    }
+
+    /// A deterministic graph with `nodes` **reachable** nodes (`0..nodes`) and `islands`
+    /// unreachable ones (`nodes..nodes + islands`, wired only among themselves). Its edges give
+    /// every shape the walk's real graphs have: a self-loop, several back-edges (cycles), a
+    /// shared hub every node points at (fan-in), a chain plus random forward and backward edges
+    /// (fan-out), and shared subgraphs.
+    fn shared_graph(nodes: usize, islands: usize) -> Vec<Vec<usize>> {
+        let total = nodes + islands;
+        let mut graph = vec![Vec::new(); total];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as usize % bound
+        };
+        for node in 0..nodes {
+            graph[node].push(node); // self-loop
+            graph[node].push(node); // repeated edge (must not be expanded twice)
+            if node + 1 < nodes {
+                graph[node].push(node + 1); // forward edge, so every node is reachable from 0
+            }
+            graph[node].push(if node == 0 { node } else { node - 1 }); // back edge / cycle
+            graph[node].push(0); // shared hub, fan-in
+            graph[node].push(next(nodes)); // random graph edge
+            if node >= 2 {
+                graph[node].push(node - 2); // a longer cycle edge
+            }
+        }
+        for island in nodes..total {
+            graph[island].push(island);
+            graph[island].push(if island == nodes { island } else { island - 1 });
+            graph[island].push(nodes); // points back into the island, never at a reachable node
+        }
+        graph
+    }
+
+    /// The visited set must equal the reachable set **exactly** — no missed node, no extra node —
+    /// and every node must be expanded exactly once, over a graph with cycles, self-loops,
+    /// fan-in/fan-out, repeated edges and shared subgraphs. A larger variant crosses the table's
+    /// `grow` threshold, so the re-insert during the grow is covered too.
+    #[test]
+    fn the_visited_set_is_exactly_the_reachable_set() {
+        for (nodes, islands) in [(40usize, 3usize), (2_000, 500), (9_000, 1_000)] {
+            let graph = shared_graph(nodes, islands);
+            let expected = reachable(&graph, 0);
+            // The chain plus the hub make every one of `0..nodes` reachable, and nothing else.
+            assert_eq!(expected.len(), nodes);
+
+            let mut visited = Visited::default();
+            visited.begin();
+            let expansions = drive(&mut visited, &graph, 0);
+
+            assert_eq!(
+                recorded(&visited),
+                expected,
+                "visited set differs from the reachable set for {nodes} nodes"
+            );
+            assert_eq!(visited.len, expected.len());
+            for node in 0..graph.len() {
+                let want = usize::from(expected.contains(&node));
+                assert_eq!(
+                    expansions[node], want,
+                    "node {node} expanded {} times (want {want}) with {nodes} nodes",
+                    expansions[node]
+                );
+            }
+            // A graph of this size crosses `INITIAL_SLOTS`' growth threshold, so the re-insert
+            // path really ran.
+            if nodes > INITIAL_SLOTS * 3 / 4 {
+                assert!(visited.keys.len() > INITIAL_SLOTS);
+            }
+        }
+    }
+
+    /// A fresh generation must re-admit **every** key: `begin()` is the whole reset, so a walk
+    /// that repeats itself records each key again (and a stale generation must never answer
+    /// "already visited").
+    #[test]
+    fn a_fresh_generation_readmits_every_key() {
+        let graph = shared_graph(1_500, 200);
+        let expected = reachable(&graph, 0);
+        let mut visited = Visited::default();
+
+        for _ in 0..3 {
+            visited.begin();
+            assert!(recorded(&visited).is_empty());
+            assert_eq!(visited.len, 0);
+            let expansions = drive(&mut visited, &graph, 0);
+            assert_eq!(recorded(&visited), expected);
+            assert!(expansions.iter().all(|&count| count <= 1));
+        }
+    }
+
+    /// `begin()` must never be more than `O(1)` in the table's size: it bumps a generation
+    /// counter and resets the occupancy, leaving the slots untouched.
+    #[test]
+    fn begin_is_a_generation_bump() {
+        let mut visited = Visited::default();
+        visited.begin();
+        for addr in block_region(0x7f00_0000_0000, 1, 8) {
+            visited.insert(addr);
+        }
+        let slots = visited.keys.len();
+        let generation = visited.generation;
+        visited.begin();
+        assert_eq!(visited.generation, generation + 1);
+        assert_eq!(visited.len, 0);
+        assert_eq!(visited.keys.len(), slots);
+        assert_eq!(
+            visited
+                .generations
+                .iter()
+                .filter(|&&g| g == visited.generation)
+                .count(),
+            0
+        );
+    }
+
+    /// A probe that ignores the low address bits is what this fix removed: the regression test
+    /// above fails against it. Pinned here directly so a re-introduction is caught wherever it
+    /// happens (the assertion is on the mixing property, not on a particular constant).
+    #[test]
+    fn the_probe_index_uses_the_low_address_bits() {
+        let mut visited = Visited::default();
+        visited.begin();
+        visited.keys.resize(1 << 16, 0);
+        visited.generations.resize(1 << 16, 0);
+        let mask = visited.keys.len() - 1;
+        let probe = |key: usize| Visited::probe(key) & mask;
+        // `key >> 3` maps the 16 words of one line onto 16 slot indices that differ only in the
+        // low four bits; the mix must spread them over the whole table.
+        let line: Vec<usize> = (0..16).map(|w| 0x7f00_0000_0000 + w * 8).collect();
+        let spread: BTreeSet<usize> = line.iter().map(|&k| probe(k)).collect();
+        assert_eq!(spread.len(), line.len());
+        let min = *spread.iter().next().unwrap();
+        let max = *spread.iter().next_back().unwrap();
+        assert!(
+            max - min > 4096,
+            "the 16 words of one line land in [{min}, {max}] — the index ignores the low bits"
+        );
     }
 }
