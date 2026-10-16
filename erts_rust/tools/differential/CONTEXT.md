@@ -131,7 +131,7 @@ Non-corpus modules:
 - `src/allowlist.rs` → `AllowEntry`, `Allowlist::parse`/`load`/`empty`, `get`/`contains`/`entries`/`path`.
 - `src/ratchet.rs` → `RatchetReport::classify`, `has_mismatch`, `report_from_suite`, `suite_exit_code`, `gaps_markdown`/`write_markdown`/`write_gaps` (the one writer `suite --gaps` **and** `merge --gaps` both call).
 - `src/harness.rs` → `RuntimeContext`/`resolve_context`, `run_case`/`run_case_in`/`compare_expr`/`run_suite`, per-side argv planning, env/module/command routing (`run_module_case`, `run_command_case`/`skipped_command_outcome`, `RunPlan.rust_spec` — the Rust side may be `beam_rt` or `dist_probe`), exit-3 classification + exit-code derivation.
-- `src/report/` → `mod.rs`/`model.rs`/`json.rs`/`render.rs`: the serde model + the `summary`/`by_contract`/`ratchet` rollups, the `differential/1` schema + `write_json`, `render_human`/`render_list_grouped`.
+- `src/report/` → `mod.rs`/`model.rs`/`json.rs`/`render.rs`: the serde model + the `summary`/`by_contract`/`ratchet` rollups, the `differential/1` schema + `write_json`/`write_json_to`/`read_report_file`, `RunReport::{read_json,write_json_to,merge}` (hand-written `Deserialize` for the report model, so no `'de: 'static` bound), `render_human`/`render_list_grouped`.
 - `src/main.rs` → thin binary: parse → dispatch → `process::exit`.
 - `src/test_support.rs` → `#[cfg(test)]`-only helpers (`Scratch` dir, compiler stubs) for the `module_build`/`nif_build` tests.
 
