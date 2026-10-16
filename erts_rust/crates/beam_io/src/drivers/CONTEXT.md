@@ -63,6 +63,8 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   read in the text phase, so the held bytes must still reach the port queue at EOF/`stop`.
 
 ## Known Issues
+- **The C `ram_file_drv` answers its two reply families through two different output calls.** `OK`/`ERROR`/`NUMBER` go through `driver_output2` (a plain byte list) while `DATA` goes through `driver_output_binary` (an improper `[header | binary]` iolist on a `[binary]` port), so an oracle probe that reads the raw port message must normalise with `binary_to_list(iolist_to_binary(D))` before comparing — and `io:format("~p", [D])` on the raw term raises. In this crate both families simply become bytes appended to [`DriverContext::input()`](crate::DriverContext::input), which is what the port delivers to the owner.
+- **`ram_file_drv` is not in `DriverRegistry::with_builtins()` yet, and no runtime path opens a port on it.** `with_builtins()` (in `../driver.rs`, a read-only file for this node) registers `"fd"`/`"efile"`/`"tcp_inet"` only; the driver is exported (`make_ram_file`, the `DriverFactory` shape) so a host can register it under `DRIVER_NAME`, but nothing does today, and `beam_rt` has no `ram_file` port path or `ram_file:*` BIF floor. The port's reserved `"close"` is the teardown op for a raw `open_port` port; the driver's own `"close"` verb exists for a direct caller and is what [`Driver::stop`](crate::Driver::stop) runs.
 - **Line framing (`[line]` / `[binary,{line,N}]`) is implemented at the PORT; the remaining half is upstream in `beam_rt`.** The C splits lines in the port, not the driver (`deliver_linebuf_message`, `io.c:3454`), so `SpawnDriver::ready_input` pushing raw bytes into `ctx.input()` is correct, and `FdDriver` carrying the `line`/`text` framing (`spawn.rs:100` says so explicitly) is a driver-level facility for `fd`/`efile`, not the mechanism the oracle's message shape needs.
   `LineBuffer` reproduces the C `read_linebuf`/`flush_linebuf` byte stream and its `LINEBUF_EOL`/`LINEBUF_NOEOL` marker (`io.c:3252-3307`) arm-for-arm — the suspected trailing-`\r` divergence is a **non-issue**: the C appends a `\r` exactly when it is followed by a non-`\n` (`LINEBUF_CR_INSIDE`, `io.c:3290`) and `LineBuffer` does the same (`line_buffer.rs:150-154`; `flush_all` restores the held `\r`), verified against the oracle (`abcd\r` then `x` ⇒ one `{noeol,[13,120]}` frame carrying `\r`+`x`).
   The `{eol|noeol,Data}` wrapper's port half is done: `Port::set_line_mode` drives the framing, the frames ride the separate `PortRegistry::take_line_notifications` channel (`LineNotification`, many per read, empty `eol` frame kept) rather than the raw `PortNotification::Data` one, `take_eof` runs the `driver_eof` flush, and a close never flushes. The whole pinned oracle table is cross-checked byte-for-byte in `tests/spawn.rs::line_framing_matches_the_oracle`.
@@ -104,11 +106,23 @@ children for `spawn`, loopback TCP + `erl`-oracle cross-checks for `inet`. Byte-
 against the C `read_linebuf` cases in `line_buffer.rs`'s in-module suite. The `spawn` suite's
 child-exit and end-of-file waits are **condition-based under a 60 s hang guard**, never a wall-clock
 budget tuned for an idle host (see *Notes for Agents*).
+`ram_file.rs`'s suite (the sibling `ram_file_tests.rs`, 23 tests) needs no OS resource: the reply
+encodings, the mode/whence bit tables, the zero-filled-gap/truncate semantics, the argument faults
+and the two transports' consume-what-you-report accounting are pure in-memory assertions driven
+through a real `DriverContext`, plus a hard-coded matrix of the exact reply bytes the real
+`ram_file_drv` produces. Two tests spawn the system `erl` (through the same `mpsc` + timeout helper
+`inet/tests.rs` uses; a hung/absent `erl` skips **loudly**): one drives every command of the matrix
+through a raw `open_port({spawn,"ram_file_drv"},[binary])` and compares **77 replies byte-for-byte**,
+the other pins the high-level `ram_file:*` API shapes (`get_size`/`get_file`/`position`/`read`/
+`pread`/`pwrite`/`truncate`/`sync`/`datasync`/`advise`/`allocate`/`ipread_s32bu_p32bu`/`close`).
 
 ## Routing Table
 - `fd.rs` → `FdDriver` + `set_nonblocking` (the shared non-blocking wrapper)
 - `efile.rs` → `EfileDriver`/`make_efile`/`FileDataMode`, the `open` grammar + `Access`/`OpenFlags`
 - `spawn.rs` → `SpawnDriver`/`SpawnSpec`/`SpawnOptions`/`StreamOptions`/`build_command`
+- `ram_file.rs` → `RamFileDriver`/`make_ram_file`/`DRIVER_NAME` + the `RAM_FILE_*` command/mode/whence/response
+  constants (the in-memory command-driven file driver); its suite is the sibling `ram_file_tests.rs`
+  (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split pattern)
 - `line_buffer.rs` → `LineBuffer`; `binary_io.rs` → `Phase`/`PhaseChange`
 - `inet/` → the `tcp_inet` driver + read-path framing (child node `inet/CONTEXT.md`)
 - `../abi/` → the driver C-ABI host layer (sibling child node, not a built-in driver)
