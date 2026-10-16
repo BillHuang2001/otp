@@ -104,7 +104,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `new(capacity_words)`/`with_allocator(alloc, capacity_words)`; `base`/`contains`/`contains_term`;
     `capacity_words`/`block_count`/`line_count`/`used_lines`/`free_lines`/`used_words`/`available_words`;
     `counters() -> ImmixCounters`; `reset()`; `unsafe alloc_words(words) -> Result<*mut Eterm>` (line-aligned);
-    `cons`/`tuple`; `can_reserve(words)`.
+    `cons`/`tuple`; `can_reserve(words)`; `release_words(ptr, words)`/`release_lines(start_g, need)` — the
+    inverse of the private `claim` (clear the `allocated` bits, a block whose bitmap empties back to `Free`),
+    documented for undoing a *promotion's own* reservations only; `marked`/`kept`/cursors are left untouched.
   - `mark(roots, promoted) -> Result<()>`; `collect(&mut self, roots: &mut [Eterm], promoted: &mut [Eterm])
     -> Result<ImmixStats>` — mark, classify, release, evacuate `Partial` blocks, pin `AllMarked`, finalize;
     `impl EvacDest for ImmixSpace` (so the shared `copy.rs` protocol can evacuate *into* it).
