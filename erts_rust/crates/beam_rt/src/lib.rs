@@ -46,6 +46,8 @@
 //!   min-heap advanced only by the scheduler loop (`run_scheduler`/`pump_scheduler`).
 //! * [`eval`] — the `-eval` Erlang expression parser and `erl_eval`-style evaluator.
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
+//! * `hasher` — the deterministic, non-cryptographic hasher ([`hasher::FastHasher`]) the
+//!   runtime's internal pid-keyed sets probe with, instead of `RandomState`'s SipHash.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
 //!   `erlang:apply`, `erlang:system_info`, `init:get_argument`) consulted before the registry.
 //! * [`dist`] — the **distributed node** (contract A.5): the `epmd`
@@ -82,6 +84,7 @@ pub mod dist_client;
 pub mod error;
 pub mod eval;
 pub mod format;
+mod hasher;
 pub mod info;
 mod mailbox;
 mod native;

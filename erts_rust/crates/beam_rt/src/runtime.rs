@@ -75,6 +75,7 @@ use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
 use crate::error;
 use crate::eval::FunBody;
 use crate::format;
+use crate::hasher::FastHashMap;
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
@@ -164,7 +165,14 @@ pub struct Runtime {
     /// mailbox is resumed against exactly this position once a message arrives (see
     /// `crate::mailbox`). A pid with no entry has never scanned, which is the default
     /// state (cursor at the first message, no markers).
-    pub(crate) mailboxes: HashMap<ProcessId, MailboxState>,
+    ///
+    /// Keyed by the whole [`ProcessId`] — an id this runtime mints and only ever looks up
+    /// (`contains`-style access; every site is a `get`/`entry`/`insert` on a pid the process
+    /// table already holds), never iterated — so it probes with the crate's own
+    /// [`FastHashMap`] over [`crate::hasher`] instead of `RandomState`'s SipHash, like the
+    /// per-pid GC descent latch ([`crate::runtime::GcState`]'s `foreign` cell): a lookup answer
+    /// is hasher-independent and no observer can see this map's order.
+    pub(crate) mailboxes: FastHashMap<ProcessId, MailboxState>,
     /// The pids a **heap-fragment** delivery woke, waiting to be absorbed into the run queue.
     ///
     /// A delivery into the receiver's own heap records its wake on the process table's wake
@@ -852,7 +860,7 @@ impl Runtime {
             registry: Rc::new(BifRegistry::with_core_bifs()),
             code_server,
             processes,
-            mailboxes: HashMap::new(),
+            mailboxes: FastHashMap::default(),
             fragment_wakes: Vec::new(),
             trace: TraceState::new(),
             preloaded: PreloadedModules::standard(),

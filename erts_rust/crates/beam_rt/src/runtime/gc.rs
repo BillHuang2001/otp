@@ -169,6 +169,12 @@ pub(crate) struct GcState {
     /// The bit is **sticky and add-only**: it is set, never cleared while the process lives (a
     /// gate observed open at one collection stays open at every later one), and the entry is
     /// dropped only when the pid is gone ([`Runtime::prune_gc_requests`]).
+    ///
+    /// The cell is a `HashSet<ProcessId>` over the crate's own [`crate::hasher`] hasher rather
+    /// than SipHash: it is a **verdict-only** set of internal pids (probed once per admission
+    /// point and, on a decline, inserted into again — see [`Runtime::note_foreign_reachable`]),
+    /// never iterated for an observable ordered result, so the seeded hash's cost buys nothing
+    /// here. See the `hasher` module docs for the soundness argument.
     foreign: ForeignLatch,
     /// The reachability walk's **reused** scratch (its worklist and its visited set), so a
     /// collection never allocates the descent's structures (see
@@ -609,7 +615,12 @@ impl Runtime {
     /// recorded the same way, so the gate can never be closed while such a block is reachable.
     pub(crate) fn note_gc_fallback(&mut self, pid: ProcessId) {
         self.gc.fallbacks += 1;
-        self.gc.foreign.borrow_mut().insert(pid);
+        // The set's own verdict (already computed by `insert`) is the latch counters' witness, so
+        // the hot path pays nothing for it: a release build just binds it away.
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let fresh = self.gc.foreign.borrow_mut().insert(pid);
+        #[cfg(test)]
+        latch_counters::note_insert(fresh);
         #[cfg(test)]
         crate::context::gc::valve_counters::note_fallback();
     }
@@ -624,8 +635,17 @@ impl Runtime {
     /// when it observes such a container at a live **root**. It is deliberately **add-only**:
     /// closing it again would let a later collection move a heap under a term the process still
     /// holds, which is the corruption the valve exists to prevent.
+    ///
+    /// This is one of the two hot callers of the latch (the other is
+    /// [`Runtime::foreign_reachable`]): the valve **declines** on essentially every allocating
+    /// instruction of a process that holds an arena/BIF-heap block, so the insert's own verdict is
+    /// taken rather than thrown away (test builds count it — see [`latch_counters`] — and the
+    /// probe itself is the crate's own [`crate::hasher`] word mix, not SipHash).
     pub(crate) fn note_foreign_reachable(&mut self, pid: ProcessId) {
-        self.gc.foreign.borrow_mut().insert(pid);
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let fresh = self.gc.foreign.borrow_mut().insert(pid);
+        #[cfg(test)]
+        latch_counters::note_insert(fresh);
     }
 
     /// Whether `pid`'s descent gate is open (see [`GcState::foreign`]) — i.e. whether the
@@ -636,7 +656,12 @@ impl Runtime {
         // normal workload — so borrow **once**, answer the empty case with a length compare,
         // and probe only when the bit could really be there. `contains`'s verdict, unchanged.
         let foreign = self.gc.foreign.borrow();
-        !foreign.is_empty() && foreign.contains(&pid)
+        if foreign.is_empty() {
+            return false;
+        }
+        #[cfg(test)]
+        latch_counters::note_probe();
+        foreign.contains(&pid)
     }
 
     /// The runtime's **one** shared per-pid descent latch cell (see [`GcState::foreign`]).
@@ -831,6 +856,83 @@ impl Runtime {
             self.gc.scratch.resize(n, beam_term::NIL);
         }
         &self.gc.scratch[..n]
+    }
+}
+
+// The per-pid latch's **probe accounting** for this thread: what a unit test can pin about the
+// hot structure without a clock (a probe is a hash lookup and an insert is a hash lookup plus —
+// only for a fresh pid — a growth, so "which probes happened" is the structural fact).
+//
+// Like `RUN_SLICE_COUNTERS` (`crate::runner`) and the valve counters
+// (`crate::context::gc::valve_counters`) this is a `thread_local!`, never a shared static, so a
+// concurrently running unit test's latch traffic cannot perturb this test's counts. The whole
+// module is `#[cfg(test)]`: a release build has no counters, and the production accessors bind
+// the `insert` verdict away instead of reading it (`#[cfg_attr(not(test), allow(
+// unused_variables))]`), so nothing below costs the runtime anything.
+#[cfg(test)]
+pub(crate) mod latch_counters {
+    use std::cell::Cell;
+
+    /// One thread's latch traffic since the last [`reset`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct LatchCounters {
+        /// `contains` probes that really **reached the set**: the empty-set short circuit in
+        /// [`Runtime::foreign_reachable`](super::Runtime::foreign_reachable) answers `false`
+        /// without a probe, so it is deliberately not counted (that is the point of the
+        /// short circuit).
+        pub(crate) probes: usize,
+        /// `insert` calls — every call, including a re-insert of a pid the latch already holds
+        /// (the valve's decline path inserts on every decline:
+        /// [`Runtime::note_foreign_reachable`](super::Runtime::note_foreign_reachable) and
+        /// [`Runtime::note_gc_fallback`](super::Runtime::note_gc_fallback)).
+        pub(crate) inserts: usize,
+        /// Of those, the calls that **grew** the latch (the pid was not already a member) — so
+        /// `fresh_inserts` counts distinct pids and `inserts - fresh_inserts` counts the
+        /// re-probes the latch's add-only rule absorbs.
+        pub(crate) fresh_inserts: usize,
+    }
+
+    impl LatchCounters {
+        /// The all-zero tally (the `const` form the thread-local's initialiser needs).
+        const ZERO: LatchCounters = LatchCounters {
+            probes: 0,
+            inserts: 0,
+            fresh_inserts: 0,
+        };
+    }
+
+    thread_local! {
+        /// This thread's latch traffic since the last [`reset`].
+        static COUNTERS: Cell<LatchCounters> = const { Cell::new(LatchCounters::ZERO) };
+    }
+
+    /// This thread's latch counters since the last [`reset`].
+    pub(crate) fn snapshot() -> LatchCounters {
+        COUNTERS.with(Cell::get)
+    }
+
+    /// Zeroes this thread's latch counters (a measurement's "before" reading).
+    pub(crate) fn reset() {
+        COUNTERS.with(|counters| counters.set(LatchCounters::ZERO));
+    }
+
+    /// Records one `contains` probe of a **non-empty** latch.
+    pub(crate) fn note_probe() {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.probes += 1;
+            counters.set(value);
+        });
+    }
+
+    /// Records one `insert` call, `fresh` being the set's own verdict (whether it grew).
+    pub(crate) fn note_insert(fresh: bool) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.inserts += 1;
+            value.fresh_inserts += usize::from(fresh);
+            counters.set(value);
+        });
     }
 }
 
@@ -1280,5 +1382,159 @@ mod tests {
         );
         assert_eq!(stats.halted, 1, "exactly the one halt above");
         assert_eq!(stats.pinned, 1, "exactly the one pin above");
+    }
+
+    /// The latch's membership corpus: real table pids (this runtime's dense internal ids) plus
+    /// boundary-shaped synthetic ones, so the equivalence below is not checked over a single key
+    /// shape — the same argument the `hasher` module's own corpus test makes for the hasher.
+    fn latch_corpus(table: &mut ProcessTable) -> Vec<ProcessId> {
+        let mut corpus: Vec<ProcessId> = (0..6)
+            .map(|_| table.spawn_default().expect("a corpus process"))
+            .collect();
+        corpus.push(ProcessId::new(0, 0));
+        corpus.push(ProcessId::new(u64::MAX, u64::MAX));
+        corpus.push(ProcessId::new(1 << 32, u64::from(u32::MAX)));
+        corpus
+    }
+
+    /// **The latch is hasher-independent.** Every membership verdict the runtime's **one shared**
+    /// foreign-reachability cell answers — through the production accessors, and read back through
+    /// [`Runtime::foreign_latch`], the cell the installed
+    /// [`RuntimeCollectionGate`](crate::context::gc_walk::RuntimeCollectionGate) also holds a clone
+    /// of — is exactly the verdict a `RandomState`-backed `HashSet` over the same pids answers, for
+    /// a mixed corpus of present and absent keys.
+    ///
+    /// This is the soundness witness for the latch's own [`crate::hasher`]: a set-membership
+    /// answer does not depend on the hash function (equal keys hash equally, colliding keys are
+    /// separated by the table's equality probe), so the cheaper hasher may change the probe *cost*
+    /// and the (unobservable) iteration order — and nothing else.
+    #[test]
+    fn the_latch_answers_membership_exactly_as_a_default_hasher_set() {
+        let mut rt = small_runtime();
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let corpus = latch_corpus(&mut table);
+        let mut reference: HashSet<ProcessId> = HashSet::new();
+        for (index, pid) in corpus.iter().enumerate() {
+            // A mixed pattern: every third pid is left unrecorded, so both verdicts are exercised
+            // for keys that are and are not members.
+            if index % 3 != 2 {
+                rt.note_foreign_reachable(*pid);
+                reference.insert(*pid);
+            }
+            assert_eq!(
+                rt.foreign_reachable(*pid),
+                reference.contains(pid),
+                "the membership verdict agrees with the default-hasher set for {pid:?}"
+            );
+            assert_eq!(
+                rt.foreign_latch().borrow().len(),
+                reference.len(),
+                "the latch holds exactly the same keys as the default-hasher set"
+            );
+        }
+        // A pid in neither set, and the read-back through the shared cell's own handle.
+        let absent = ProcessId::new(7, 7);
+        assert!(!rt.foreign_reachable(absent), "a pid in neither set misses");
+        assert!(!reference.contains(&absent));
+        assert!(
+            rt.foreign_latch().borrow().contains(&corpus[0]),
+            "the cell `foreign_latch` hands out is the one the accessors wrote"
+        );
+        // The latch holds the reference set's keys — sorted, because the iteration ORDER is the
+        // one thing a hasher change may alter, and nothing in this crate observes it.
+        let mut from_latch: Vec<ProcessId> = rt.foreign_latch().borrow().iter().copied().collect();
+        let mut from_reference: Vec<ProcessId> = reference.iter().copied().collect();
+        from_latch.sort();
+        from_reference.sort();
+        assert_eq!(from_latch, from_reference, "the same keys, whatever the order");
+        assert!(
+            !rt.gc_stats().disabled,
+            "nothing above was a collection or a valve trip"
+        );
+    }
+
+    /// **The latch's traffic is structural, never a clock.** An empty latch is not probed at all
+    /// (the accessor's short circuit), insert-then-lookup hits, a re-insert does **not** grow the
+    /// set, and the thread-local counters see one insert per call with exactly one *fresh* insert
+    /// per distinct pid — including through the arena-fallback door, which opens the same gate.
+    #[test]
+    fn the_latch_grows_only_on_a_fresh_pid_and_counts_every_probe() {
+        let mut rt = small_runtime();
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let mut corpus = latch_corpus(&mut table).into_iter();
+        let a = corpus.next().expect("a corpus pid");
+        let b = corpus.next().expect("another corpus pid");
+        let c = corpus.next().expect("a third corpus pid");
+
+        latch_counters::reset();
+        // --- (b) an empty latch costs no probe, and the inserted pid then hits ---
+        assert!(!rt.foreign_reachable(a), "nothing is recorded yet");
+        assert_eq!(
+            latch_counters::snapshot().probes,
+            0,
+            "an empty latch is answered by the length compare, never by a probe"
+        );
+        rt.note_foreign_reachable(a);
+        assert!(rt.foreign_reachable(a), "insert-then-lookup hits");
+        assert!(!rt.foreign_reachable(b), "an unrecorded pid still misses");
+        assert_eq!(
+            latch_counters::snapshot().probes,
+            2,
+            "both lookups above probed the now-populated latch"
+        );
+        assert_eq!(latch_counters::snapshot().inserts, 1, "one insert so far");
+        // --- (c) re-inserting the same pid does not grow the set ---
+        rt.note_foreign_reachable(a);
+        rt.note_foreign_reachable(a);
+        assert_eq!(
+            rt.foreign_latch().borrow().len(),
+            1,
+            "the latch still holds exactly one pid"
+        );
+        assert_eq!(latch_counters::snapshot().inserts, 3, "three insert calls");
+        assert_eq!(
+            latch_counters::snapshot().fresh_inserts,
+            1,
+            "but only the first one grew the latch"
+        );
+        // --- (d) one fresh insert per distinct pid, however often it is re-inserted ---
+        rt.note_foreign_reachable(b);
+        rt.note_foreign_reachable(c);
+        rt.note_foreign_reachable(b);
+        assert_eq!(
+            rt.foreign_latch().borrow().len(),
+            3,
+            "three distinct pids are latched"
+        );
+        let counters = latch_counters::snapshot();
+        assert_eq!(counters.inserts, 6, "one insert per call");
+        assert_eq!(
+            counters.fresh_inserts, 3,
+            "one FRESH insert per distinct pid, and no more"
+        );
+        assert_eq!(
+            counters.probes, 2,
+            "only the lookups above probed the latch"
+        );
+        // --- the arena-fallback door opens the very same gate, and counts the same way ---
+        rt.note_gc_fallback(c);
+        assert_eq!(
+            rt.foreign_latch().borrow().len(),
+            3,
+            "an already-latched pid does not grow the set"
+        );
+        assert_eq!(rt.gc_stats().fallbacks, 1, "the fallback door really ran");
+        let counters = latch_counters::snapshot();
+        assert_eq!(
+            counters.inserts, 7,
+            "the fallback's insert is counted like any other"
+        );
+        assert_eq!(counters.fresh_inserts, 3, "and it was not fresh");
+        // Nothing above collected, and no verdict pretended otherwise.
+        assert_eq!(rt.gc_stats().collections, 0, "no collection was pretended");
     }
 }
