@@ -452,11 +452,16 @@ impl Runtime {
     /// Serves `pid`'s pending forced-GC request **now** — the runner's park arm (see
     /// [`Runtime::request_gc`] for why the BIF itself cannot collect).
     ///
-    /// This is a legitimate collection site: the caller has just published the parked
-    /// machine's whole live root set into `pid`
-    /// ([`publish_parked_roots`](crate::runner)), and the machine's float-register file is
-    /// *provably* dead — the post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark)
-    /// check pins any pid whose `Machine::fr` holds a term,
+    /// This is a legitimate collection site: by the time the walk below runs, `pid` is **not**
+    /// relocation-exempt (the check above returns `false` first), and a park that is not exempt
+    /// is exactly one that published the parked machine's whole live root set into `pid`
+    /// ([`publish_parked_roots`](crate::runner) — the `Yield` arm's park with a dead
+    /// float-register prefix). The relocation-exempt windows are the parks that **skip** that
+    /// publication — the `Wait` arm's parked window, and a `Yield` arm whose slice ended with a
+    /// live FR prefix — and each is refused right above, so no path reaches the walk with an
+    /// unpublished root set. The machine's float-register file is *provably* dead here — the
+    /// post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark)
+    /// check opens the window exemption for any pid whose `Machine::fr` holds a term,
     /// so a pid that is still [`gc_process_enabled`](Runtime::gc_process_enabled) cannot be
     /// carrying one. The collector therefore relocates exactly what is live, against the
     /// process's own root set.
@@ -484,7 +489,8 @@ impl Runtime {
         }
         // The **unscanned-root valve** ([`crate::context::gc_walk`]) — the same valve the
         // admission point and the collecting allocation seam consult, here over the process's
-        // own root set (the parked machine's roots were just published into it, and a delivery
+        // own root set (the pid is not relocation-exempt here, so this is a park that did publish
+        // the parked machine's roots into it, and a delivery
         // may have filled its mailbox since). A container in a region the collector does not
         // scan, reachable from a live root, makes the move unsound, so it is declined: the
         // request is dropped exactly as the other valves drop it, and nothing is moved.
