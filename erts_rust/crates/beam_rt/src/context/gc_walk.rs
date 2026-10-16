@@ -383,7 +383,9 @@ struct Visited {
     /// Test-only: the keys the walk in progress has been asked to record.
     #[cfg(test)]
     inserts: u64,
-}/// The table's initial slot count (a power of two). Grown (never shrunk) as a walk deepens, so
+}
+
+/// The table's initial slot count (a power of two). Grown (never shrunk) as a walk deepens, so
 /// the table reaches the process's live-set size once and stays there.
 const INITIAL_SLOTS: usize = 1024;
 
@@ -662,7 +664,10 @@ mod tests {
         let mut visited = Visited::default();
         visited.begin();
         for &addr in &addrs {
-            assert!(visited.insert(addr), "{addr:#x} reported as already visited");
+            assert!(
+                visited.insert(addr),
+                "{addr:#x} reported as already visited"
+            );
         }
         for &addr in &addrs {
             assert!(!visited.insert(addr), "{addr:#x} lost");
