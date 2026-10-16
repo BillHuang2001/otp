@@ -34,6 +34,14 @@
 //! **live** under `erl -noshell -eval …`, comparing value-for-value with the Rust
 //! side. It skips **loudly** (and still passes) when no usable `erl` is on `$PATH`,
 //! and it kills a wedged oracle rather than hanging the suite.
+//!
+//! The second half pins the **statically linked built-in driver namespace**
+//! (`tcp_inet`, `udp_inet`, `ram_file_drv`) — the three drivers the emulator links
+//! into the binary, so `erl_ddll:loaded_drivers/0`, `try_unload/2`, `info/2` and
+//! `monitor/2` answer for them with no `dlopen` (`src/runtime/ddll/{registry,live,info}.rs`).
+//! `the_static_driver_namespace_is_pinned` asserts the crate side in-suite;
+//! `oracle_agrees_on_the_static_driver_namespace` re-derives the same probes live and
+//! skips loudly when `erl` is absent.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -42,7 +50,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, needs_runtime_hooks, BifContext, BifRegistry};
+use beam_bifs::{default_registry, needs_runtime_hooks, BifContext, BifRegistry, BytesSink};
 use beam_codec::term::{bitstring_bytes, make_float};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
@@ -200,6 +208,49 @@ impl Fixture {
         &mut self.heap
     }
 
+    /// Interns `names` into the fixture's atom table (idempotent).
+    fn seed(&mut self, names: &[&str]) {
+        self.atoms.seed(names.iter().copied());
+    }
+
+    /// A charlist of `text`'s bytes — the `pick_list_or_atom` name shape every
+    /// `erl_ddll` loading/introspection BIF accepts.
+    fn charlist(&mut self, text: &str) -> Eterm {
+        let values: Vec<i64> = text.bytes().map(i64::from).collect();
+        self.int_list(&values)
+    }
+
+    /// `[term]` — a single-element list on the fixture heap.
+    fn cons(&mut self, term: Eterm) -> Eterm {
+        self.heap.cons(term, NIL).expect("a cons cell fits")
+    }
+
+    /// Renders `term` as the oracle's `~w` (non-printable) `io:format` output, via
+    /// the registered `io:format/2` BIF over a capturing [`BytesSink`] — the same
+    /// path the oracle's `io:format("~w~n",[Term])` takes.
+    fn render(&mut self, term: Eterm) -> String {
+        let format = self.charlist("~w");
+        let args = self.cons(term);
+        let mut sink = BytesSink::new();
+        {
+            let mut ctx = BifContext::new(&mut self.heap, &self.atoms, ProcessId::new(1, 0))
+                .with_output(&mut sink);
+            self.registry
+                .call("io", "format", 2, &mut ctx, &[format, args])
+                .expect("io:format(\"~w\", [Term]) succeeds");
+        }
+        sink.as_str()
+    }
+
+    /// Calls `erl_ddll:function(Args)`, rendering the answer exactly as the oracle
+    /// does: the value as `~w`, or `{error,badarg}` for the plain `badarg` raise.
+    fn ddll(&mut self, function: &str, args: &[Eterm]) -> String {
+        match self.bif("erl_ddll", function, args) {
+            Ok(out) => self.render(out),
+            Err(BeamError::BadArg) => BADARG.to_string(),
+            Err(other) => panic!("erl_ddll:{function} raised {other:?}"),
+        }
+    }
     /// A seeded atom term.
     fn atom(&self, name: &str) -> Eterm {
         make_atom(self.atoms.lookup(name).expect("a seeded atom"))
@@ -717,6 +768,234 @@ fn oracle_agrees_on_the_erl_ddll_error_table() {
 
     eprintln!(
         "[beam_bifs erl_ddll] oracle cross-check RAN against '{}': {} probes agreed.",
+        oracle.display(),
+        probes.len(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The statically linked built-in drivers (crate-side pins + live oracle)
+// ---------------------------------------------------------------------------
+//
+// The emulator links three drivers into the binary (`tcp_inet`, `udp_inet`,
+// `ram_file_drv`) — the oracle's `driver_list` entries whose `handle == NULL`
+// (`erl_bif_ddll.c:282,545,728,743,752,775`). This runtime models them as
+// `registry::STATIC_DRIVERS`, a pure constant every `erl_ddll` namespacing key
+// consults (`try_load/3`, `try_unload/2`, `loaded_drivers/0`, `info/2`), so a
+// fresh VM answers for them with no `dlopen` at all.
+
+/// The three drivers the emulator links in, in `loaded_drivers/0`'s order.
+const STATIC_DRIVERS: [&str; 3] = ["tcp_inet", "udp_inet", "ram_file_drv"];
+
+/// `loaded_drivers/0`'s byte-exact `~w` rendering on a fresh VM: the three static
+/// built-ins, in the oracle's order, each a charlist
+/// (`erl -noshell -eval 'io:format("~w~n",[erl_ddll:loaded_drivers()])'`).
+const LOADED_THREE: &str = "{ok,[[116,99,112,95,105,110,101,116],[117,100,112,95,105,110,101,116],[114,97,109,95,102,105,108,101,95,100,114,118]]}";
+
+/// The `info/2` item atoms and their `~w` answer for a statically linked built-in
+/// (`erl_bif_ddll.c:728,743,752,775` — the `handle == NULL` branch of the item
+/// switch).
+const STATIC_INFO_ITEMS: [(&str, &str); 7] = [
+    ("linked_in_driver", "true"),
+    ("permanent", "false"),
+    ("port_count", "linked_in_driver"),
+    ("driver_options", "linked_in_driver"),
+    ("processes", "linked_in_driver"),
+    ("awaiting_load", "linked_in_driver"),
+    ("awaiting_unload", "linked_in_driver"),
+];
+
+/// The extra atoms the static-driver probes name, on top of [`SEEDED_ATOMS`]
+/// (already holds `linked_in_driver`/`permanent`).
+const STATIC_DRIVER_ATOMS: [&str; 16] = [
+    "ok",
+    "error",
+    "true",
+    "false",
+    "linked_in_driver",
+    "permanent",
+    "port_count",
+    "driver_options",
+    "processes",
+    "awaiting_load",
+    "awaiting_unload",
+    "driver",
+    "bogus",
+    "tcp_inet",
+    "udp_inet",
+    "ram_file_drv",
+];
+
+/// One static-driver probe: a label, the `erl -eval` statement that prints its `~w`
+/// line, and the crate-side rendering the oracle must reproduce.
+struct StaticProbe {
+    label: String,
+    erl: String,
+    rust: String,
+}
+
+/// Builds every static-driver probe, **asserting** each crate-side answer inline
+/// against the oracle's own text and returning the probes for the live-oracle
+/// cross-check.
+///
+/// The crate-side assertions are the load-bearing pins: they hold whether or not an
+/// `erl` is available, and the oracle test only adds the live re-derivation.
+fn static_driver_probes(fx: &mut Fixture) -> Vec<StaticProbe> {
+    fx.seed(&STATIC_DRIVER_ATOMS);
+    let mut probes = Vec::new();
+    let mut probe = |label: String, erl: String, rust: String, expected: &str| {
+        assert_eq!(rust, expected, "crate-side {label}");
+        probes.push(StaticProbe { label, erl, rust });
+    };
+
+    // `loaded_drivers/0` — the three built-ins, in the oracle's order, each a charlist.
+    probe(
+        "loaded_drivers/0".to_string(),
+        "io:format(\"~w~n\",[erl_ddll:loaded_drivers()])".to_string(),
+        fx.ddll("loaded_drivers", &[]),
+        LOADED_THREE,
+    );
+
+    for name in STATIC_DRIVERS {
+        // `try_unload/2` — both the charlist and the atom name form (`pick_list_or_atom`).
+        probe(
+            format!("try_unload(\"{name}\")"),
+            format!("io:format(\"~w~n\",[F(fun() -> erl_ddll:try_unload(\"{name}\",[]) end)])"),
+            {
+                let name_term = fx.charlist(name);
+                fx.ddll("try_unload", &[name_term, NIL])
+            },
+            "{error,linked_in_driver}",
+        );
+        probe(
+            format!("try_unload({name})"),
+            format!("io:format(\"~w~n\",[F(fun() -> erl_ddll:try_unload({name},[]) end)])"),
+            {
+                let name_term = fx.atom(name);
+                fx.ddll("try_unload", &[name_term, NIL])
+            },
+            "{error,linked_in_driver}",
+        );
+
+        // The whole `info/2` item matrix.
+        for (item, expected) in STATIC_INFO_ITEMS {
+            probe(
+                format!("info(\"{name}\", {item})"),
+                format!("io:format(\"~w~n\",[F(fun() -> erl_ddll:info(\"{name}\",{item}) end)])"),
+                {
+                    let name_term = fx.charlist(name);
+                    let item_term = fx.atom(item);
+                    fx.ddll("info", &[name_term, item_term])
+                },
+                expected,
+            );
+        }
+    }
+
+    // An unknown driver name and an unknown item atom are both the plain `badarg`.
+    probe(
+        "info(\"nope\", linked_in_driver)".to_string(),
+        "io:format(\"~w~n\",[F(fun() -> erl_ddll:info(\"nope\",linked_in_driver) end)])".to_string(),
+        {
+            let name_term = fx.charlist("nope");
+            let item_term = fx.atom("linked_in_driver");
+            fx.ddll("info", &[name_term, item_term])
+        },
+        BADARG,
+    );
+    probe(
+        "info(\"tcp_inet\", bogus)".to_string(),
+        "io:format(\"~w~n\",[F(fun() -> erl_ddll:info(\"tcp_inet\",bogus) end)])".to_string(),
+        {
+            let name_term = fx.charlist("tcp_inet");
+            let item_term = fx.atom("bogus");
+            fx.ddll("info", &[name_term, item_term])
+        },
+        BADARG,
+    );
+
+    // `monitor/2` of a static built-in with a non-tuple request is the plain `badarg`.
+    probe(
+        "monitor(driver, \"tcp_inet\")".to_string(),
+        "io:format(\"~w~n\",[F(fun() -> erl_ddll:monitor(driver,\"tcp_inet\") end)])".to_string(),
+        {
+            let driver = fx.atom("driver");
+            let name_term = fx.charlist("tcp_inet");
+            fx.ddll("monitor", &[driver, name_term])
+        },
+        BADARG,
+    );
+
+    probes
+}
+
+/// The static built-in namespace, pinned crate-side through the registered
+/// `erl_ddll` BIFs — independent of any `erl` on `$PATH`.
+#[test]
+fn the_static_driver_namespace_is_pinned() {
+    let mut fx = Fixture::new();
+    // The builder's inline `assert_eq!`s are the pin; the oracle test re-derives the
+    // very same probes live.
+    let probes = static_driver_probes(&mut fx);
+    let expected = 1 // loaded_drivers/0
+        + STATIC_DRIVERS.len() * 2 // try_unload, the charlist and atom name forms
+        + STATIC_DRIVERS.len() * STATIC_INFO_ITEMS.len() // the info/2 item matrix
+        + 3; // info("nope",_), info("tcp_inet",bogus), monitor(driver,"tcp_inet")
+    assert_eq!(probes.len(), expected, "every static-driver probe must be built");
+}
+
+/// The whole static-driver namespace, re-derived live under
+/// `erl -noshell -eval …`.
+///
+/// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH` — the
+/// crate-side pins in [`the_static_driver_namespace_is_pinned`] remain the in-suite
+/// evidence.
+#[test]
+fn oracle_agrees_on_the_static_driver_namespace() {
+    let Some(oracle) = resolve_oracle() else {
+        eprintln!(
+            "[beam_bifs erl_ddll] SKIP: no usable `erl` on $PATH — the static-driver \
+             oracle cross-check did not run."
+        );
+        eprintln!("($ERTS_ORACLE unset or not executable, and no `erl` on $PATH).");
+        eprintln!("This is NOT a pass of the oracle cross-check; the crate-side pins did run.");
+        return;
+    };
+
+    let mut fx = Fixture::new();
+    let probes = static_driver_probes(&mut fx);
+
+    // `F` catches a raise so a badarg probe never crashes the eval; each probe line
+    // renders its call as `~w`, exactly as the Rust side does.
+    let mut stmts = vec![
+        "F = fun(Fun) -> try Fun() catch Cl:Er -> {Cl,Er} end end".to_string(),
+    ];
+    stmts.extend(probes.iter().map(|p| p.erl.clone()));
+    let program = format!("{},\nhalt(0).", stmts.join(",\n"));
+
+    let Some(stdout) = erl_stdout(&oracle, &program) else {
+        eprintln!("[beam_bifs erl_ddll] static-driver oracle cross-check SKIPPED (unusable oracle)");
+        return;
+    };
+
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        probes.len(),
+        "the oracle printed {} lines, expected {}\n--- stdout ---\n{stdout}",
+        lines.len(),
+        probes.len(),
+    );
+    for (i, probe) in probes.iter().enumerate() {
+        assert_eq!(
+            lines[i], probe.rust,
+            "probe `{}` disagrees with the oracle\n--- oracle program ---\n{program}",
+            probe.label,
+        );
+    }
+
+    eprintln!(
+        "[beam_bifs erl_ddll] static-driver oracle cross-check RAN against '{}': {} probes agreed.",
         oracle.display(),
         probes.len(),
     );
