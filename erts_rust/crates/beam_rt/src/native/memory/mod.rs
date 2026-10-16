@@ -205,13 +205,11 @@
 //!   so such a process reports `on_heap` where the oracle would report `off_heap`.
 //! * `registered_name` is the truth of the **queried** process: the name is looked up by the pid
 //!   argument, never by the caller, so asking about another process reports that process's name
-//!   while the caller's own item keeps its own.
-//!   The `-eval`/`-s`/`-run` action routes therefore answer `{registered_name,init}` for the
-//!   caller's own `process_info(self(), registered_name)` where the oracle answers `[]`, because
-//!   `beam_rt` runs those actions in its root process — which is registered as `init` — while the
-//!   oracle runs them in an unregistered child of `init`.
-//!   Closing that divergence belongs to the action routes (`src/eval/`, `src/cli.rs`,
-//!   `src/runtime.rs`), not to this floor, whose per-pid answer is the oracle's.
+//!   while the caller's own item keeps its own. `process_info/1`'s item list **omits** the entry
+//!   for an unregistered process (the C's `nil` skip), so the `-eval`/`-s`/`-run` action routes
+//!   answer `[]` for the caller's own `process_info(self(), registered_name)` — the action runs in
+//!   a spawned, unregistered child of `init` (`src/runtime.rs::as_action_process`), as the oracle's
+//!   does.
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
