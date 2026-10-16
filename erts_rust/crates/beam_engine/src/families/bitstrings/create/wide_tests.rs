@@ -65,7 +65,7 @@ const X_DIGITS: [u64; 2] = [5, 1 << 6];
 
 /// The ETF payload of a flag-atom list such as `[little, signed]` (`LIST_EXT` over
 /// `ATOM_EXT`s, tailed by `NIL_EXT`).
-fn flags_etf(names: &[&str]) -> Vec<u8> {
+pub(super) fn flags_etf(names: &[&str]) -> Vec<u8> {
     let mut payload = vec![131u8, 108]; // VERSION_MAGIC, LIST_EXT
     payload.extend_from_slice(&(names.len() as u32).to_be_bytes());
     for name in names {
@@ -79,7 +79,7 @@ fn flags_etf(names: &[&str]) -> Vec<u8> {
 
 /// A module naming the `integer` segment type whose literal area holds `payloads`
 /// (ETF), in `Operand::Literal(idx)` index order.
-fn literal_module(payloads: &[Vec<u8>]) -> Module {
+pub(super) fn literal_module(payloads: &[Vec<u8>]) -> Module {
     let mut module = Module::default();
     module.atom_table.intern("integer");
     if !payloads.is_empty() {
@@ -92,7 +92,7 @@ fn literal_module(payloads: &[Vec<u8>]) -> Module {
 
 /// A module naming the `integer` segment type and — when `names` is non-empty —
 /// holding the flag list `names` as its literal 0.
-fn seg_module(names: &[&str]) -> Module {
+pub(super) fn seg_module(names: &[&str]) -> Module {
     if names.is_empty() {
         return literal_module(&[]);
     }
@@ -100,7 +100,7 @@ fn seg_module(names: &[&str]) -> Module {
 }
 
 /// The flags operand for a segment: the flag-list literal, or no flags at all.
-fn flag_operand(names: &[&str]) -> Operand {
+pub(super) fn flag_operand(names: &[&str]) -> Operand {
     if names.is_empty() {
         Operand::Nil
     } else {
@@ -109,7 +109,7 @@ fn flag_operand(names: &[&str]) -> Operand {
 }
 
 /// The flag list a `(little, signed)` case asks for.
-fn flag_names(little: bool, signed: bool) -> Vec<&'static str> {
+pub(super) fn flag_names(little: bool, signed: bool) -> Vec<&'static str> {
     let mut names = Vec::new();
     if little {
         names.push("little");
@@ -122,7 +122,7 @@ fn flag_names(little: bool, signed: bool) -> Vec<&'static str> {
 
 /// A bignum term from `digits` (least significant first), asserted to be the shape
 /// the arm's bignum route keys on (`raw::big_parts_safe`).
-fn bignum(
+pub(super) fn bignum(
     machine: &mut Machine,
     ctx: &mut MinimalContext,
     negative: bool,
@@ -139,7 +139,7 @@ fn bignum(
 /// Build one `integer` segment `[type, index, unit, flags, value, size]` and run the
 /// segment walk over it. `fail` is [`NO_FAIL`], so a segment failure raises (and,
 /// with no live catch frame, yields `SegReason::typed`).
-fn build(
+pub(super) fn build(
     module: &Module,
     machine: &mut Machine,
     ctx: &mut MinimalContext,
