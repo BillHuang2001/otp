@@ -102,6 +102,18 @@ fn cross_check(family: &str, rows: &[Row]) {
     let Some(oracle) = support::require_oracle(family) else {
         return;
     };
+
+    // `require_oracle` proves only that `erl` **exists** (a filesystem question, deliberately
+    // never answered by running it). A present-but-unusable oracle would quietly turn every
+    // row below into a per-row "could not answer" skip — a suite that passes without a single
+    // cross-check. Prove the tool actually *answers* first, and skip the family loudly if it
+    // does not (a toolchain problem is never a failure and never a silent pass).
+    if support::oracle_eval(&oracle, None, "io:format(\"~w\",[1+1]), halt(0).").as_deref() != Some("2")
+    {
+        support::skip_loudly(family, "the system `erl` cannot answer a trivial probe");
+        return;
+    }
+
     let binary = Path::new(env!("CARGO_BIN_EXE_beam_rt"));
 
     let mut agreed = 0usize;
