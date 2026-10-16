@@ -73,6 +73,13 @@ The booted kernel's `user`/`user_drv` prints the OTP slogan (`Erlang/OTP 30 [ert
 The `run <file.beam> …` batch action is the exception by construction: `../cli.rs`'s `parse_run_file` records the `noshell` init argument when the command line does not already carry a `-noshell`, so the booted kernel's `user_drv` prints no slogan and a probe or test can assert byte-exact stdout without passing `-noshell`. `-version` is exempt differently: it prints its own banner and never boots.
 Per-directive detail is in `../boot/CONTEXT.md`.
 
+### The action's process identity (the caller `-eval`/`-s`/`-run` see)
+`-eval` (`Action::Eval`), `-s` (`Action::Apply`) and `-run` (`Action::Run`) evaluate their action in a **freshly spawned, unregistered** process (`Runtime::as_action_process`), matching the oracle, whose `-eval` runs in a spawned child of `init`.
+Inside the action `self()` is **not** the pid registered as `init`, `erlang:process_info(self(), registered_name)` is `[]` and `whereis(init) =:= self()` is `false`.
+The child is spawned into the runtime's own process table the way the never-enqueued service stand-ins are, takes the root process's group leader (so `erlang:group_leader/0` is unchanged) and is **removed from the process table when the action ends**, so `erlang:processes/0`, `system_info(process_count)` and the `+JPperf` map describe the node the action left.
+The boot script still runs **first** on the runtime's own root process, which stays registered as `init`; the action's identity is the only thing that moves, so `whereis(init)`, `process_info(init, …)`, `which_applications/0` and `init:get_status/0` keep answering the root.
+`run <file.beam>` (`Action::RunFile`) is unchanged: it runs its own scheduled process through `Runtime::run_scheduled`.
+
 ## `ERL_*FLAGS` — the environment merge
 `parse_with_env` merges four environment variables into the command line before parsing, in real `erl`'s order (`erts/etc/common/erlexec.c`, `initial_argv_massage`):
 `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]`.

@@ -374,8 +374,8 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   own `BLOCKING_PUMP_DEADLINE` (checked between pump rounds, ending in a typed diagnostic
   rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
   `../context/CONTEXT.md`.
-- `bootscript.rs` is ~1855 lines (production lines 1–724, the rest its oracle test module) — the
-  crate's documented long-file precedent; `drive.rs` is ~423 lines. Both are `#![deny(unsafe_code)]`;
+- `bootscript.rs` is ~2022 lines (production lines 1–801, the rest its oracle test module) — the
+  crate's documented long-file precedent; `drive.rs` is ~426 lines. Both are `#![deny(unsafe_code)]`;
   no `unwrap()` on runtime data.
 
 ## Test Strategy
@@ -386,11 +386,13 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   Erlang is installed — never silently pass.
 - `boot/bootscript.rs`: `reads_the_real_start_boot_into_the_oracle_instruction_sequence` (parses the
   committed `bootstrap/bin/start.boot`; pins `{"Erlang/OTP","30"}`, 22 instructions and the instruction
-  list); the bounded prefix test `the_real_start_boot_prefix_loads_its_prim_load_batches`; 
+  list); the bounded prefix test `the_real_start_boot_prefix_loads_only_the_pre_marker_batch` and its
+  embedded-mode counterpart `the_post_marker_batches_load_in_embedded_mode`; 
   `a_synthetic_script_executes_end_to_end` (compiles a fixture with `erlc`, writes a synthetic
   `.boot` with `erl`, asserts the `apply` step really ran); `a_boot_spawned_process_answers_a_blocked_apply`
   (pins `drive.rs`: a `{kernelProcess, …}` burst and a later `{apply, …}` blocked on it, resumed by a
-  scheduler drive, its dictionary side effect read back through `runtime.eval`); 
+  scheduler drive, its dictionary side effect — left on the **boot process** (`init`), where the
+  directive ran — read back through `runtime.eval`, which itself runs in a spawned action process);
   `a_malformed_boot_script_is_a_typed_error`; the full-script pins
   `the_real_start_boot_completes_through_execute_reporting` (asserts all 22 directives ending at
   `{progress,started}`) and
@@ -431,17 +433,18 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   `pump_scheduler_boot` step with a 1 h timer returns `0` in well under 100 ms, timer untouched) and
   `a_boot_drive_step_sleeps_to_an_imminent_deadline_and_fires_it` (a 5 ms timer is slept to, the parked
   receiver is resumed and the message delivered).
-- In-file `#[test]` counts: `bootscript.rs` **12** (lines 725–1855), `preloaded.rs` **3** (lines 75–143),
-  `drive.rs` **0** — directory total **15**; the module root `../boot.rs` adds **9** (its own
-  `#[cfg(test)] mod tests`).
+- In-file `#[test]` counts: `bootscript.rs` **13** (the `#[cfg(test)] mod tests` at lines 802–2022),
+  `preloaded.rs` **3** (lines 75–143), `drive.rs` **0** — directory total **16**; the module root
+  `../boot.rs` adds **9** (its own `#[cfg(test)] mod tests`).
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry;
   `boot_from_script_reporting` is the boot-stop-position entry point, and the in-crate boot-script suite
   exercises the `execute_reporting`/`BootStop` report API a genuine future stop would use.
 - `../tests/boot.rs` (integration, owned by this node): `start_boot()` builds the `-boot` value as a
   canonical absolute path (`<repo>/bootstrap/bin/start`) from `CARGO_MANIFEST_DIR`'s ancestors and, with
   the CLI-equivalent configuration, drives the real script to completion
-  (`the_real_start_boot_runs_to_completion` asserts the full 22-directive run to `{progress,started}`;
-  the `primLoad` batches through index 17 really loaded); the
+  (`the_real_start_boot_runs_to_completion` asserts the full 22-directive run to `{progress,started}`,
+  the pre-marker `primLoad` batch caching `lists`/`gen_server`/`supervisor` while a post-marker batch
+  name such as `application_starter` stays unloaded and uninterned); the
   `-boot` CLI drive of a synthetic script; the CLI running the real `start.boot`
   (`the_cli_runs_the_real_boot_script_to_completion` asserts exit **0** with empty stdout/stderr);
   a synthetic-probe boot (the real script's first 20 directives + a `probe:run/0`
@@ -474,6 +477,11 @@ The request/reply surface, the errno mapping, the io-device and the remaining ga
 `Runtime::new` spawns its own stand-in process — a `beam_process::Process` born `Runnable` and never enqueued, the same shape as the `init` root and the `file_server_2` service — and registers it under `erl_prim_loader` on **every** route that builds a runtime, so `erlang:whereis(erl_prim_loader)` answers a live pid exactly as the oracle does (the oracle's is its C `erts_prim_loader` state machine).
 Unlike `file_server_2` there is **no** name conflict with the boot script: `init` starts the loader (it is in the script's `{preLoaded, …}` list, not a `{kernelProcess, …}` child), so nothing in `bootstrap/bin/start.boot` registers the name.
 The `-version` action is the only route with no runtime at all, so it has no name registry to answer from.
+
+## Notes for Agents — the `-mode`-is-embedded predicate is written twice
+The `-mode`-is-embedded rule (`code.erl`'s `start_get_mode/0`: the **first** `-mode` occurrence must be the single string `"embedded"`) is expressed in **two** places this round — `bootscript.rs::boot_wants_embedded_mode` (the `{kernel_load_completed}` reset of `prim_load`) and the private `native/code.rs::wants_embedded_mode`.
+The duplication was unavoidable while `../native/code.rs` was owned by another agent, and the two **must stay in step**: `bootscript.rs::the_post_marker_batches_load_in_embedded_mode` pins the boot half, `native/code.rs::code_get_mode_follows_the_first_mode_argument` the code half.
+**The fix is one `Runtime` accessor** (a single `Runtime::wants_embedded_mode()` the two call sites share), which removes the drift risk outright.
 
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
