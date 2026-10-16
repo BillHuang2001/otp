@@ -41,8 +41,9 @@ them.
   diverged from their `machine.x` slot since the last syncing event, and falls back to the whole
   `Allocation::written` set when the table is empty; `fill` reloads only
   `Allocation::fill_slots(pc)` — the registers the continuation can still observe, the block-local
-  liveness of `liveness.rs::fill_sets` unioned with the write set, `(live ∪ written) ∩ slots` — except
-  the prologue load, which is always the whole cache.
+  liveness of `liveness.rs::fill_sets` unioned with the write set, `(live ∪ written) ∩ slots` — while the
+  prologue load is the block's **live-in** slot set (`Allocation::entry_fill`), so a cached register the
+  block writes before it reads is never loaded at entry (an absent table falls back to the whole cache).
   The cache itself lives in `regs.rs` (`Allocation`/`spill`/`fill`); the call sites are in `mod.rs`
   (`emit_helper_call`) and the block/link emitters.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
@@ -287,19 +288,24 @@ instruction's own operands.
   position store — emitted before the cached loads, because `rbx` is callee-saved and no cached register
   may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
   (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
-  re-publishes the current frame's Y window in one call — then load each cached register from `machine.x`.
+  re-publishes the current frame's Y window in one call — then load each cached register in
+  `Allocation::entry_fill` from `machine.x` (the block's **live-in** slots: a cached register the block
+  writes before it reads is not loaded at entry, because that writing instruction sets it).
   The frame is **variable-length**: `k = native_frame_regs(allocation).len()` is the block's own push count,
   so the reservation and the teardown's matching `lea rsp,[rsp+frame_slot_len(k)]` always agree
   (`emit/link.rs::emit_frame_teardown` derives both sides from the same `native_frame_regs`). Corpus
   counters (grand total over the generically-discovered installed-OTP corpus): 597 333 blocks /
   756 632 cache slots, push/pop ops 7 167 996 → 2 707 930 (−62.2 %), emitted bytes
-  320 065 790 → 308 853 108 (−3.50 %), with every per-block cache/write set and IR size unchanged.
+  320 065 790 → 306 024 443 (−4.39 %), with every per-block cache/write set and IR size unchanged.
+  The prologue load set is `Allocation::entry_fill`, which cuts corpus prologue loads
+  **756 632 → 352 537** (−53.4 %).
 - `regs.rs::spill` / `regs.rs::fill`: `spill(buffer, allocation, site, pc)` stores exactly
   `Allocation::spill_slots_at(pc)` — the cached x-registers **dirty at that pc** (`Allocation::spill_sets`,
   the `regalloc.rs` forward dirty walk) — falling back to the whole `Allocation::written` set when the
   table is empty (a synthetic `Allocation` a unit test built directly); `fill` loads every `(x, reg)` in
   `Allocation::fill_slots(pc)` — the continuation's block-local liveness unioned with the write set —
-  except the prologue load, which is the whole cache (see the **Register cache** section below).
+  except the prologue load, which is `Allocation::entry_fill` (the block's live-in cached slots; see the
+  **Register cache** section below).
 - **Every helper call spills first.** `mod.rs::emit_helper_call(buffer, allocation, helper, args, pc)`
   (used by `emit_step_and_continue`, `emit_ext_call`, `emit_receive`, `emit_family`, the `Call` arm, the
   frame-discipline trio, the heap/frame-admission family and the comparison-`test` helper) stores the
@@ -446,11 +452,11 @@ by construction).
   `emit_prologue_helper` (the prologue position store / Y-window publish), `emit_deopt`,
   `emit_local_call_probe`, `emit_ext_call`, `emit_receive`.
 - `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`spill_sets`/`y_last`/
-  `block_start`/`fill_sets`, `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/
-  `refresh_y_after`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`), `fill` (loads
-  only `fill_slots(pc)`, else the whole cache at the prologue), and the
+  `block_start`/`fill_sets`/`entry_fill`, `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/
+  `entry_loads`/`refresh_y_after`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`),
+  `fill` (loads only `fill_slots(pc)` at a helper site, and the prologue's `entry_fill` set at entry), and the
   test-only `SpillSite`/`FillSite` classification of the call sites; `liveness.rs` computes the per-pc
-  `fill_sets` and `regalloc.rs` the per-pc `spill_sets`.
+  `fill_sets` **and** the block's live-in `entry_fill` set, `regalloc.rs` the per-pc `spill_sets`.
 - `compile.rs` -> the compilation entry points and what they share: `compile_module` (**eager**:
   whole-module block map + the merged whole-module summary that guards entry, plus `emit_shared_sub_blocks`)
   and `compile_function` (**lazy**: one function's own buffer/entries/sub_entries/summary, sharing
@@ -632,12 +638,13 @@ never disagree. Both directions of the traffic are **partial**:
   fill set always contains. The register is only ever overwritten, never read.
 
 `Allocation` carries `block_start`, `fill_sets` (indexed by `pc - block_start`, one entry
-per pc of the block) and `spill_sets` (the same indexing, one entry per pc in
-`[start, end]` — the block's own pcs **plus** the exit pc `end`), both derived once by
-`regalloc.rs` at allocation time so the emitter stays a pure reader. An
+per pc of the block), `spill_sets` (the same indexing, one entry per pc in
+`[start, end]` — the block's own pcs **plus** the exit pc `end`) and `entry_fill` (the
+block's live-in cached slots), all derived once by `regalloc.rs` at allocation time so the
+emitter stays a pure reader. An
 **empty** `fill_sets` table (a synthetic `Allocation` a unit test built directly) means
 "no liveness was computed" and makes every fill set the whole cache, and an empty
-`spill_sets` table likewise makes every store set the whole `written` set. The prologue load is always the whole cache (`FillSite::Prologue`),
+`spill_sets` table likewise makes every store set the whole `written` set. The prologue load is `entry_fill` (`FillSite::Prologue`), whose absent table likewise falls back to the whole cache,
 and the fill table is always block-length so an in-block pc always resolves. This keeps
 `allocate_registers(module, code, start, end) -> Allocation` and
 `Allocation::slots`' meaning unchanged, so `compile.rs` (and the continuation
