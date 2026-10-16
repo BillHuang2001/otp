@@ -70,9 +70,12 @@
 //!
 //! Both outcomes are legitimate here, because this runtime's in-process compile is *not* yet
 //! oracle-complete: `lib/stdlib/src/erl_tar.erl` currently fails in
-//! `beam_core_to_ssa:function/2` (`{crash,core_to_ssa,badarg,…}`) — a **separate,
-//! out-of-scope defect** in the compiler-runtime surface (a `maps:*` iteration-term
-//! mis-rejection owned by `crates/beam_bifs`), *not* an io defect. An earlier version of this
+//! `beam_core_to_ssa:function/2` (`{crash,core_to_ssa,badarg,…}`) — a **separate, out-of-scope
+//! defect** in the compiler-runtime surface, *not* an io defect: the engine's `bs_create_bin`
+//! `"integer"` arm rejects a **bignum** in a segment of `<= 64` bits instead of masking it into
+//! the field, so the compiler's own synthesized `<<Int:Size>>` constructions fail
+//! (`erts_rust/crates/beam_engine/src/families/bitstrings/create/mod.rs`; the contract is pinned
+//! by `tests/bignum_bit_segment.rs`). An earlier version of this
 //! probe asserted the `Function: ` line **unconditionally**, i.e. it depended on that foreign
 //! defect still being present and would have started failing the moment it was fixed —
 //! blocking the agent fixing it. The assertion is therefore re-pointed at the invariant the
@@ -135,7 +138,7 @@ struct Probed {
 
 /// **The probed set — at least one module per outcome.** It must span a module that compiles
 /// cleanly on both runtimes *and* a module that currently fails here, so the invariant holds
-/// whichever way the out-of-scope `maps:*` residual moves (see the module docs).
+/// whichever way the out-of-scope bignum-segment residual moves (see the module docs).
 const PROBED: &[Probed] = &[
     Probed {
         source: "lib/stdlib/src/ordsets.erl",
@@ -149,8 +152,10 @@ const PROBED: &[Probed] = &[
         module: "erl_tar",
         today: "compiles on the oracle but NOT yet under this runtime (~4.8 s in process here; it \
                 crashes in `beam_core_to_ssa:function/2` because of the separate, out-of-scope \
-                `maps:*` iterator-term defect in `crates/beam_bifs`) — its job is to show a \
-                compiler pass's own `Function: <name>/<arity>` diagnostic reaches the output",
+                bignum-in-a-narrow-bit-segment defect in the engine's `bs_create_bin` \
+                `\"integer\"` arm, `crates/beam_engine/src/families/bitstrings/create/mod.rs`) — \
+                its job is to show a compiler pass's own `Function: <name>/<arity>` diagnostic \
+                reaches the output",
     },
 ];
 
