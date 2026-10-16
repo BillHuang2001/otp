@@ -3579,10 +3579,12 @@ halt(0).
     ///
     /// Nothing writes it between the two halves of the comparison, so every `stat` field but
     /// the symlink's atime is identical for both runtimes. The atime is **not**: resolving a
-    /// symlink refreshes its atime to the traversing run's own wall clock, so
-    /// `read_link_info(l)` can honestly answer a second apart —
-    /// [`assert_file_info_answers_agree`] is what keeps the comparison reliable without
-    /// masking any other difference.
+    /// symlink refreshes its atime to the traversing run's own wall clock, and the two halves
+    /// traverse it at different instants — the runtime's first, the oracle's only after its
+    /// VM has booted — so `read_link_info(l)` can honestly trail the runtime's answer by the
+    /// whole inter-half gap, seconds rather than one. [`assert_file_info_answers_agree`]
+    /// bounds that gap by the **measured** duration of the oracle probe instead of a fixed
+    /// second, so the comparison stays reliable without masking any other difference.
     fn prepare_file_info_tree(dir: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::remove_dir_all(dir);
@@ -3600,8 +3602,8 @@ halt(0).
         // first traversal's atime bump here rather than inside one of the two runs. That
         // narrows the window but does **not** make the answer deterministic: every traversal
         // that follows the link refreshes its atime to that run's own wall clock, so
-        // `read_link_info(l)` may still answer a second apart (the tolerance
-        // `assert_file_info_answers_agree` allows).
+        // `read_link_info(l)` may still answer apart by the whole inter-half gap (the
+        // measured allowance `assert_file_info_answers_agree` derives from the oracle probe).
         let _ = std::fs::metadata(dir.join("l"));
     }
 
@@ -3709,17 +3711,23 @@ halt(0).
     }
 
     /// Compares the runtime's and the oracle's compacted `#file_info{}` answers, tolerating a
-    /// wall-clock drift of at most **one second** in a `{{Y,M,D},{H,M,S}}` time triple.
+    /// wall-clock drift of at most `allowance_seconds` in a `{{Y,M,D},{H,M,S}}` time triple.
+    ///
+    /// `allowance_seconds` is the **measured** inter-half gap, not a constant: the caller
+    /// starts a `std::time::Instant` immediately before launching the oracle probe and passes
+    /// the elapsed time (its whole seconds, plus one for the fractional part). Following the
+    /// symlink `l` (`read_file_info(l)`, answer `A4`) refreshes its atime to the traversing
+    /// run's own "now", and the two halves traverse it at different instants — the runtime's
+    /// first, the oracle's only after its VM has booted — so `read_link_info(l)` (answer `A5`)
+    /// can legitimately trail the runtime by the whole gap, which the oracle's VM boot pushes
+    /// past a single second on a loaded host.
     ///
     /// Everything else must be byte-identical — every tag, size, mode, type, node/inode-ish
     /// field, the answer ordering and the answer count — so a real difference still fails
-    /// loudly, with both full answers. Only the time triples may move, and only because the
-    /// two runs read the clock a second apart: following the symlink `l`
-    /// (`read_file_info(l)`, answer `A4`) refreshes its atime to the traversing run's own
-    /// "now", so `read_link_info(l)` (answer `A5`) may legitimately answer a second apart.
-    /// The tolerance is not a mask: a time triple that differs by two seconds — or a
-    /// non-time token that differs at all — is a mismatch.
-    fn assert_file_info_answers_agree(theirs: &[String], ours: &[String]) {
+    /// loudly, with both full answers. The allowance is not a mask: a time triple that falls
+    /// outside the measured window — or a non-time token that differs at all — is a mismatch,
+    /// so a genuinely wrong timestamp is still caught.
+    fn assert_file_info_answers_agree(theirs: &[String], ours: &[String], allowance_seconds: i64) {
         assert_eq!(
             theirs.len(),
             ours.len(),
@@ -3728,11 +3736,12 @@ halt(0).
             ours.len()
         );
         for (index, (theirs, ours)) in theirs.iter().zip(ours).enumerate() {
-            if theirs == ours || answers_differ_only_by_a_second(theirs, ours) {
+            if theirs == ours || answers_differ_within(theirs, ours, allowance_seconds) {
                 continue;
             }
             panic!(
-                "answer #{index} (A{}) of the #file_info{{}} family disagrees with the oracle\n\
+                "answer #{index} (A{}) of the #file_info{{}} family disagrees with the oracle \
+                 (allowed {allowance_seconds}s of time-triple drift)\n\
                  --- oracle ---\n{theirs}\n\
                  --- runtime ---\n{ours}",
                 index + 1
@@ -3742,15 +3751,24 @@ halt(0).
 
     /// Whether two compacted answers are identical once every `{{Y,M,D},{H,M,S}}` time triple
     /// is taken out of the comparison — with the corresponding triples differing by at most a
-    /// second. Any other difference (a different skeleton, a different number of time triples,
-    /// or two triples more than a second apart) is `false`.
+    /// single second. This is the fixed tolerance the unit tests below pin;
+    /// [`assert_file_info_answers_agree`] uses [`answers_differ_within`] with its **measured**
+    /// allowance instead.
     fn answers_differ_only_by_a_second(theirs: &str, ours: &str) -> bool {
+        answers_differ_within(theirs, ours, 1)
+    }
+
+    /// Whether two compacted answers are identical once every `{{Y,M,D},{H,M,S}}` time triple
+    /// is taken out of the comparison — with the corresponding triples differing by at most
+    /// `allowed_seconds`. Any other difference (a different skeleton, a different number of
+    /// time triples, or two triples further apart than `allowed_seconds`) is `false`.
+    fn answers_differ_within(theirs: &str, ours: &str, allowed_seconds: i64) -> bool {
         let (theirs_shape, theirs_times) = split_time_triples(theirs);
         let (ours_shape, ours_times) = split_time_triples(ours);
         theirs_shape == ours_shape
             && theirs_times.len() == ours_times.len()
             && theirs_times.iter().zip(&ours_times).all(|(theirs, ours)| {
-                (time_triple_scalar(*theirs) - time_triple_scalar(*ours)).abs() <= 1
+                (time_triple_scalar(*theirs) - time_triple_scalar(*ours)).abs() <= allowed_seconds
             })
     }
 
@@ -3867,8 +3885,8 @@ halt(0).
     /// path with and without an option, a NUL path, a non-path term, and the four
     /// `read_handle_info` answers (a `0644` file, a `0444` file, a closed descriptor, a
     /// non-descriptor) — every answer rendered compacted and compared line for line, with a
-    /// wall-clock drift of at most one second allowed **in the time triples only** (see
-    /// [`assert_file_info_answers_agree`]).
+    /// wall-clock drift allowed **in the time triples only**, bounded by the **measured**
+    /// duration of the oracle probe (see [`assert_file_info_answers_agree`]).
     #[test]
     fn the_file_info_family_agrees_with_the_oracle() {
         let Some(oracle) = resolve_oracle() else {
@@ -3882,10 +3900,20 @@ halt(0).
         let ours = file_info_answers(&dir);
         let expression = file_info_expression(&dir_text);
         let args = ["-noshell", "-eval", expression.as_str(), "-s", "init", "stop"];
+        // The runtime's half has already traversed the symlink `l`; the oracle's traversal
+        // happens inside this probe, after its VM has booted. Measure that window — its whole
+        // seconds plus one for the fractional part — to bound how far the oracle's
+        // `read_link_info(l)` timestamp may legitimately trail the runtime's.
+        let probe_started = std::time::Instant::now();
         let Some(output) = run_oracle(&oracle, &args) else {
             skip_oracle_loudly("the oracle probe could not answer within the bound");
             return;
         };
+        let allowance_seconds = probe_started
+            .elapsed()
+            .as_secs()
+            .saturating_add(1)
+            .min(i64::MAX as u64) as i64;
         if !output.status.success() {
             eprintln!(
                 "warning: the oracle exited with {:?}\n--- stderr ---\n{}",
@@ -3903,14 +3931,16 @@ halt(0).
             .filter(|answer| !answer.is_empty())
             .map(str::to_string)
             .collect();
-        assert_file_info_answers_agree(&theirs, &ours);
+        assert_file_info_answers_agree(&theirs, &ours, allowance_seconds);
     }
 
-    /// The tolerance [`assert_file_info_answers_agree`] grants is exactly one second **and only
+    /// The tolerance [`answers_differ_only_by_a_second`] pins is exactly one second **and only
     /// inside** the `{{Y,M,D},{H,M,S}}` time triples: a one-second drift — including one that
     /// rolls over a minute, an hour, a midnight or a leap day, where the *date* triple differs
     /// too — is accepted, while a two-second drift, a different non-time field, an answer that
     /// carries no time triple at all, and an answer a whole day out are all real mismatches.
+    /// (The cross-check itself widens this fixed baseline to the probe's **measured** gap via
+    /// [`answers_differ_within`]; the time-only shape check is identical.)
     #[test]
     fn the_file_info_time_tolerance_is_one_second_and_time_only() {
         // A `read_link_info(l)` answer: a symlink's atime, then its mtime/ctime (held fixed).
@@ -3966,6 +3996,36 @@ halt(0).
             &base,
             &answer("{{2024,5,4},{12,34,56}}")
         ));
+    }
+
+    /// The cross-check's **measured** tolerance widens the time-triple window (so a real gap of
+    /// several seconds is accepted) while keeping every non-time check strict — exactly what
+    /// the flaky `read_link_info(l)` answer needs and nothing more.
+    #[test]
+    fn the_measured_time_tolerance_widens_only_the_time_triples() {
+        let answer = |atime: &str| {
+            format!(
+                "{{file_info,6,symlink,read_write,{atime},{{{{2024,5,1}},{{8,0,0}}}},{{{{2024,5,1}},{{8,0,1}}}},41471,1,0,0,42,1000,1000}}"
+            )
+        };
+        let base = answer("{{2024,5,3},{12,34,56}}");
+        // A three-second gap straddling a minute boundary is within a measured 3 s allowance…
+        let drifted = answer("{{2024,5,3},{12,34,59}}");
+        assert!(!answers_differ_within(&base, &drifted, 2));
+        assert!(answers_differ_within(&base, &drifted, 3));
+        // …but the allowance can never excuse a different non-time field, a missing time triple
+        // or a different skeleton, however large it is.
+        assert!(!answers_differ_within(
+            &base,
+            &base.replacen("{file_info,6,", "{file_info,7,", 1),
+            i64::MAX
+        ));
+        assert!(!answers_differ_within(
+            &base,
+            &answer("1714740896"),
+            i64::MAX
+        ));
+        assert!(!answers_differ_within(&base, &format!("{base},"), i64::MAX));
     }
 
     /// A `function_clause` `Opts` is an **uncaught** raise, never the wrapper's `{error,
