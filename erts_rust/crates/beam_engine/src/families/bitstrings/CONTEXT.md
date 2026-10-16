@@ -52,12 +52,20 @@ is the term `raw::make_ctx` builds; its `orig` word is the subject it reads.
   - `rooted.rs` → `#[cfg(test)]` rooted-allocation tests for the match path.
 - `create/` → the construction side:
   - `mod.rs` → `exec` (`bs_init_writable`, `bs_create_bin`) and `assemble` (the flat
-    six-operand segment walk).
+    six-operand segment walk). The `"integer"` arm routes the value to the shared
+    `push_wide_int` (`mod.rs`, `> 64`-bit byte model) whenever `nbits > 64` **or** the
+    value is a bignum (`raw::big_parts_safe`), so a bignum is masked into a `<= 64`-bit
+    field exactly as C's `fmt_big_be`/`fmt_big_le` do; only a **genuine non-integer**
+    (a float/atom/…) falls through to `SegReason::BadArg`.
   - `segments.rs` → the per-segment-type sources and encoders (`segment_source`,
     `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`).
   - `size.rs` → the segment size validation (`SegSize`/`segment_size`, `seg_nbits`,
     `float_nbits`) and the `SegReason` raise (`fail_seg`).
   - `tests.rs` → `#[cfg(test)]` unit tests for the segment encoders.
+  - `wide_tests.rs` → `#[cfg(test)]` unit tests for the integer segment's value masking
+    (a bignum into a narrow field, big/little endian, signed/unsigned, a literal-operand
+    bignum, a runtime `size(Expr)`), oracle-derived byte vectors, plus the `badarg` /
+    `system_limit` failure classes.
 - `run_tests.rs` → `#[cfg(test)]` **integration** tests driven through the real public
   execution entries (`Machine::run_label` / `Machine::run_export`) over synthetic
   `beam_loader::Module`s + a `MinimalContext`, plus a live `erlc`/`erl` oracle
@@ -95,7 +103,11 @@ Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder cal
 `bs_get_tail`/`bs_get_binary2` over a 70-byte refc subject asserting the off-heap refc
 result bit-exactly), `matching/commands.rs` (the `bs_match` `binary` command over the same
 subject asserting the off-heap refc result), `matching/rooted.rs` (the rooted match path),
-`create/tests.rs` (the segment encoders).
+`create/tests.rs` (the segment encoders), `create/wide_tests.rs` (the integer segment's
+value masking: a bignum into an 8/16/24/32/64-bit field, big/little endian,
+signed/unsigned, a `Literal`-operand bignum, a runtime `size(Expr)`, and the
+`badarg`/`system_limit` failure classes — every expected byte vector taken from the live
+`erl` oracle).
 `run_tests.rs` is the node's **end-to-end** suite: it builds synthetic `Module`s by hand
 and drives them through `Machine::run_label`/`Machine::run_export`, pinning
 - a `bs_start_match3` + `bs_get_tail`/`bs_get_integer2` sequence over a **refc subject
@@ -134,5 +146,7 @@ crate-level ones in `../CONTEXT.md`:
   (`unsupported("bitstring: size is not a non-negative small integer")`);
   `read_uint_le`/`read_uint_le_bits` refuse a non-byte-aligned little-endian field.
 - A non-finite float result and a non-float FR slot are the documented `badarith`
-  failure; a wide (> 64 bit) segment goes through the byte model (`push_wide_int`,
-  `read_wide_integer_field`), so no width is silently truncated.
+  failure; an integer segment of **any** width whose value is a small or a bignum goes
+  through the value-masking path (`push_wide_int` for a wide field or a bignum,
+  `push_uint`/`push_uint_le` for a small narrow one; `read_wide_integer_field` on the
+  match side), so no width is silently truncated.
