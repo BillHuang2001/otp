@@ -6,8 +6,9 @@ Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 fu
 One file per responsibility: `mod.rs` owns the shared emitter wiring (the register-file/scratch
 constants, `touch`, the spill/fill traffic, the helper-sequencing layer every arm shares —
 `emit_helper_call`/`emit_step_and_continue`/`emit_continue_check`/`emit_refresh_y` — plus the
-re-exports); `block.rs` owns the compiled-block shape (the prologue/epilogue, the `emit_block`
-lowering dispatch and its helper-sequence arms, the deopt wrapper); `regs.rs` owns the register cache
+re-exports); `block.rs` owns the compiled-block shape (the `emit_block` lowering dispatch, its
+helper-sequence arms and its epilogue/deopt wrapper) and `prologue.rs` the block prologue it emits
+first (`emit_block_prologue` and its position-store helpers); `regs.rs` owns the register cache
 (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`); `compile.rs` owns the compilation entry points
 — `compile_module` (the **eager** whole-module layout: one shared `CodeBuffer`, a whole-module block
 map) and `compile_function`/`emit_function` (the **lazy** layout's per-function unit: its own
@@ -280,7 +281,8 @@ is a `u32` the helper takes as an argument, computed at compile time by `HeapNee
 instruction's own operands.
 
 ## Spill/fill discipline
-- Prologue (`block.rs::emit_block`): push the block's own frame register set
+- Prologue (`prologue.rs::emit_block_prologue`, emitted first by `block.rs::emit_block`): push the
+  block's own frame register set
   (`native_frame_regs` — `rbx` plus the machine registers the block holds as cache slots),
   reserve the `frame_slot_len(k)`-byte `rt` slot (`8` when `k = 1 + slots.len()` is even,
   `16` when odd, so `rsp` stays 16-byte aligned at every helper call), `rbx = rt->x_regs`,
@@ -447,10 +449,14 @@ by construction).
   `compile_function` (keeping every item path stable for `baseline/mod.rs`, `baseline/code.rs`, the
   sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`), plus
   the `#[path]` submodule `spill_tests` (`spill_tests.rs`; see `## Test Strategy`).
-- `block.rs` -> the compiled-block shape and per-instruction lowering dispatch: `emit_block` (the
-  `match instr` dispatch), `try_inline_init_yregs`, `emit_position_store`/`emit_publish_y`/
-  `emit_prologue_helper` (the prologue position store / Y-window publish), `emit_deopt`,
-  `emit_local_call_probe`, `emit_ext_call`, `emit_receive`.
+- `block.rs` -> the per-instruction lowering dispatch and the compiled-block shape it emits:
+  `emit_block` (the `match instr` dispatch), `try_inline_init_yregs`, `emit_deopt`,
+  `emit_local_call_probe`, `emit_ext_call`, `emit_receive`; the block prologue it emits first is
+  `prologue.rs`.
+- `prologue.rs` -> the compiled-block prologue: `emit_block_prologue` (the frame-register pushes, the
+  `rt`-slot reservation, the `machine.x` base load, the position store / Y-window publish and the
+  live-in cache load) plus the private `emit_position_store`/`emit_publish_y`/`emit_prologue_helper`
+  it uses.
 - `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`spill_sets`/`y_last`/
   `block_start`/`fill_sets`/`entry_fill`, `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/
   `entry_loads`/`refresh_y_after`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`),
@@ -547,13 +553,13 @@ by construction).
   stable across the splits. Keep that in mind when renaming items.
 
 ## Known Issues
-- **`block.rs` (1093 lines) is deliberately above the ~1000-line guidance.** It holds the single
-  per-instruction lowering dispatch (`emit_block`, a `match instr` with one arm per instruction group)
-  plus its prologue/epilogue, position-store/Y-publish, deopt wrapper and the three helper-sequence
-  arms. The `match` is what makes the file cohesive — each arm is one `try_inline_*` call plus an
-  `emit_deopt` fallback — so splitting it would either scatter one decision across files or require
-  inventing a visitor/table abstraction the emitter does not need. The other files are all under the
-  guidance (`mod.rs` 400, `test.rs` 963, `aggregate.rs` 744, …).
+- **`block.rs` holds the single per-instruction lowering dispatch** (`emit_block`, a `match instr` with
+  one arm per instruction group) plus its deopt wrapper and the three helper-sequence arms; the `match`
+  is what makes the file cohesive — each arm is one `try_inline_*` call plus an `emit_deopt` fallback —
+  so splitting it further would scatter one decision across files or require inventing a visitor/table
+  abstraction the emitter does not need. The block prologue it emits first is `prologue.rs`; the other
+  files are under the ~1000-line guidance (`test.rs` 963, `compile.rs` 892, `mod.rs` 401, `aggregate.rs`
+  744, …).
 - **`test.rs` (963) and `aggregate.rs` (744) are under the guidance but still large**: `test.rs` keeps
   the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
   `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers

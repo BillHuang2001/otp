@@ -131,6 +131,7 @@ mod link;
 mod liveness;
 mod r#move;
 mod operands;
+mod prologue;
 mod regalloc;
 mod regs;
 mod select;
