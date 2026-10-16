@@ -801,6 +801,35 @@ fn write_view_exposes_the_ownership_operations() {
         .expect("no poisoned lock"));
 }
 
+/// The **gift-carrying** transfer is reachable from the write view: it moves
+/// ownership and returns the `{'ETS-TRANSFER', …}` obligation
+/// ([`Table::give_away_with_gift`]).
+#[test]
+fn write_view_exposes_the_gift_carrying_transfer() {
+    use crate::table::OwnerId;
+
+    let shared = shared_table(TableKind::Set);
+    let giver = OwnerId::new(1);
+    let recipient = OwnerId::new(2);
+    shared
+        .with_write(|write| write.set_owner(Some(giver)))
+        .expect("no poisoned lock");
+
+    let transfer = shared
+        .with_write(|write| {
+            write.give_away_with_gift(Some(giver), Some(recipient), make_small(9))
+        })
+        .expect("no poisoned lock")
+        .expect("the owner may transfer with a gift");
+    assert_eq!(transfer.to, recipient);
+    assert_eq!(transfer.from, Some(giver));
+    assert_eq!(transfer.data, make_small(9));
+    assert_eq!(
+        shared.with_read(|read| read.owner()).expect("no poisoned lock"),
+        Some(recipient)
+    );
+}
+
 /// **The residual hazard of `as_requester`, pinned.** Its reads are bare `Eterm`s
 /// that alias table storage (by design — it is the raw access-enforcement seam),
 /// so a term read there escapes the guard and silently re-reads as a *different,

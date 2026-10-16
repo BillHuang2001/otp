@@ -27,7 +27,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use super::{OwnerId, RenameOutcome, SetOpt, Table};
+use super::{OwnerId, RenameOutcome, SetOpt, Table, Transfer};
 use crate::kind::Access;
 use crate::select::{MatchContinuation, MatchSpec};
 
@@ -521,6 +521,23 @@ impl TableAccess<'_> {
     /// `protection` mode — it is an ownership operation, not a read/write one.
     pub fn give_away(&mut self, new_owner: Option<OwnerId>) -> Result<()> {
         self.table.give_away(self.requester, new_owner)
+    }
+
+    /// `ets:give_away/3` **with the gift term**: the requester is the caller, the
+    /// gift is deep-copied into table-owned storage, and the returned [`Transfer`]
+    /// is the `{'ETS-TRANSFER', Tid, FromPid, GiftData}` obligation the host owes
+    /// the new owner.
+    ///
+    /// Exactly like [`give_away`](Self::give_away) the ownership rules (and the
+    /// `badarg`s) live in [`Table::give_away_with_gift`]; this view only supplies the
+    /// caller. The `protection` mode is **not** consulted — `ets:give_away/3` is an
+    /// ownership operation, not a read/write one.
+    pub fn give_away_with_gift(
+        &mut self,
+        new_owner: Option<OwnerId>,
+        gift: Eterm,
+    ) -> Result<Transfer> {
+        self.table.give_away_with_gift(self.requester, new_owner, gift)
     }
 
     /// `ets:setopts/2` (the `{heir, ...}` and `{protection, Access}` options): the

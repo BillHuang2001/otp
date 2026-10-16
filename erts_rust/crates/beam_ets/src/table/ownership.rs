@@ -140,6 +140,38 @@ pub struct Heir {
     pub data: Option<Eterm>,
 }
 
+/// The `{'ETS-TRANSFER', Tid, FromPid, GiftData}` delivery a host owes after a
+/// **gift-carrying** `ets:give_away/3` — the obligation
+/// [`Table::give_away_with_gift`] returns.
+///
+/// The crate copies the gift into table-owned storage and hands it back here, but
+/// it cannot build the message term itself: at this layer `Tid` (the table's name
+/// atom for a `named_table`, else the table reference) and `FromPid` are the
+/// host's to construct — the crate has no pid/ref term and no process-liveness
+/// concept (the documented "pid gap"; see the [module docs](self)).
+///
+/// * [`to`](Transfer::to) — the **recipient**, i.e. the table's new owner (the
+///   `NewOwner` argument of the oracle's `ets:give_away/3`, which every
+///   `{'ETS-TRANSFER', …}` message is delivered to).
+/// * [`from`](Transfer::from) — the **giver**, the calling process that was the
+///   table's owner. It is `None` only in this crate's model, where a caller may
+///   itself be identity-less (an [`OwnerId`] is an opaque `u64`, not a pid).
+/// * [`data`](Transfer::data) — a **table-owned, checked-out copy** of the
+///   `GiftData` argument, valid for as long as the table is (the same discipline as
+///   [`Table::take`]'s results: never reused, released only by
+///   `delete_all_objects`/drop). An immediate gift owns no storage, so it is just
+///   its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Transfer {
+    /// The recipient — the table's new owner (the message's target process).
+    pub to: OwnerId,
+    /// The giver — the calling process that was the table's owner.
+    pub from: Option<OwnerId>,
+    /// A table-owned, checked-out copy of the gift data (an immediate is stored by
+    /// value).
+    pub data: Eterm,
+}
+
 /// The parsed `ets:setopts/2` option (the subset this crate models).
 ///
 /// Both options `ets:setopts/2` can carry here require the caller to be the table
@@ -481,5 +513,190 @@ mod tests {
         assert_eq!(t.heir(), Some(Heir { owner: OwnerId::new(4), data: None }));
         assert_eq!(t.heir_data(), None);
         assert_eq!(t.memory(), before, "nothing was allocated for the heir");
+    }
+
+    // --- the gift-carrying transfer (`give_away_with_gift`) ---------------------
+
+    /// A gift-carrying transfer deep-copies a **boxed** gift through the store's
+    /// copy boundary: the returned `data` is structurally the gift but a **distinct
+    /// root** (a genuine copy, never the caller's term shared), the owner moves to
+    /// the target, and the table's arena mapped storage for the copy — which it then
+    /// checks out exactly like [`Table::take`], so it is held (never reused) but,
+    /// being checked out, no longer counted as live table memory.
+    #[test]
+    fn give_away_with_gift_copies_a_boxed_gift_and_moves_ownership() {
+        let mut t = new_table();
+        let from = OwnerId::new(1);
+        let to = OwnerId::new(2);
+        t.set_owner(Some(from));
+
+        let mut heap = Heap::new(16);
+        let gift = heap
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("the test heap has room for the gift tuple");
+
+        let blocks_before = t.store.blocks();
+        let memory_before = t.memory();
+        let transfer = t
+            .give_away_with_gift(Some(from), Some(to), gift)
+            .expect("a boxed gift is copyable");
+
+        assert_eq!(transfer.to, to, "the recipient is the new owner");
+        assert_eq!(transfer.from, Some(from), "the giver is the caller");
+        assert_eq!(t.owner(), Some(to), "ownership moved to the target");
+
+        let atoms = AtomTable::new();
+        assert!(
+            eq(transfer.data, gift, &atoms),
+            "the copy is structurally the gift"
+        );
+        assert_ne!(
+            transfer.data, gift,
+            "a distinct root: the gift was copied, not shared"
+        );
+
+        assert!(
+            t.store.blocks() > blocks_before,
+            "the table allocated table-owned storage for the copy"
+        );
+        // …but the copy is checked out (the `take` discipline), so the *public* live
+        // figure does not grow and a later copy can never reuse the returned words.
+        assert_eq!(
+            t.memory(),
+            memory_before,
+            "a checked-out gift is not counted as live table memory"
+        );
+    }
+
+    /// An **immediate** gift needs no storage: it is returned by value (the very same
+    /// bits) and the table neither counts nor maps anything for it.
+    #[test]
+    fn give_away_with_gift_stores_an_immediate_by_value() {
+        let mut t = new_table();
+        let from = OwnerId::new(1);
+        let to = OwnerId::new(2);
+        t.set_owner(Some(from));
+
+        let gift = make_small(42);
+        let blocks_before = t.store.blocks();
+        let memory_before = t.memory();
+        let transfer = t
+            .give_away_with_gift(Some(from), Some(to), gift)
+            .expect("an immediate gift needs no storage");
+
+        assert_eq!(transfer.data, gift, "an immediate is stored by value");
+        assert_eq!(transfer.data.raw(), gift.raw(), "…the very same bits");
+        assert_eq!(transfer.to, to);
+        assert_eq!(transfer.from, Some(from));
+        assert_eq!(t.owner(), Some(to));
+        assert_eq!(t.memory(), memory_before, "an immediate owns no storage");
+        assert_eq!(t.store.blocks(), blocks_before, "and maps no block");
+    }
+
+    /// Every representable failure is `badarg` and leaves **both** the owner and the
+    /// store untouched: the ownership check runs before the copy, so a denied call
+    /// copies nothing.
+    #[test]
+    fn give_away_with_gift_badarg_cases_leave_the_owner_and_store_untouched() {
+        let mut t = new_table();
+        let owner = OwnerId::new(1);
+        let other = OwnerId::new(2);
+        t.set_owner(Some(owner));
+
+        let mut heap = Heap::new(16);
+        let gift = heap
+            .tuple(&[make_small(1)])
+            .expect("the test heap has room for the gift");
+        let blocks_before = t.store.blocks();
+        let memory_before = t.memory();
+
+        // (a) caller is not the current owner.
+        assert!(matches!(
+            t.give_away_with_gift(Some(other), Some(other), gift),
+            Err(BeamError::BadArg)
+        ));
+        // (b) target is the caller's own pid (== current owner).
+        assert!(matches!(
+            t.give_away_with_gift(Some(owner), Some(owner), gift),
+            Err(BeamError::BadArg)
+        ));
+        // (c) target is `None` — the crate's stand-in for a non-pid/dead pid.
+        assert!(matches!(
+            t.give_away_with_gift(Some(owner), None, gift),
+            Err(BeamError::BadArg)
+        ));
+        // A `None` caller (no live calling process) is likewise not the owner.
+        assert!(matches!(
+            t.give_away_with_gift(None, Some(other), gift),
+            Err(BeamError::BadArg)
+        ));
+
+        assert_eq!(t.owner(), Some(owner), "the owner never moved");
+        assert_eq!(t.memory(), memory_before, "no copy was made");
+        assert_eq!(
+            t.store.blocks(),
+            blocks_before,
+            "…and no block was mapped for a denied call"
+        );
+    }
+
+    /// A gift outside the store's copyable subset (here a **bare header word** — a
+    /// word that is not a term at all; the residual `badarg` case named in
+    /// `store/tests.rs`) is the typed `badarg`, and because the copy runs **before**
+    /// the owner moves, the owner and the store are left untouched.
+    #[test]
+    fn give_away_with_gift_rejects_an_uncopyable_gift_without_moving_the_owner() {
+        let mut t = new_table();
+        let from = OwnerId::new(1);
+        let to = OwnerId::new(2);
+        t.set_owner(Some(from));
+
+        let blocks_before = t.store.blocks();
+        let memory_before = t.memory();
+        // A bare header word (`TAG_PRIMARY_HEADER`) is not a term: `TermStore::copy`
+        // rejects it before any dereference.
+        let bare_header = make_header(1, 0);
+        assert!(matches!(
+            t.give_away_with_gift(Some(from), Some(to), bare_header),
+            Err(BeamError::BadArg)
+        ));
+
+        assert_eq!(
+            t.owner(),
+            Some(from),
+            "the copy-before-mutate order leaves the owner on a rejected gift"
+        );
+        assert_eq!(
+            t.memory(),
+            memory_before,
+            "a rejected copy allocates nothing"
+        );
+        assert_eq!(t.store.blocks(), blocks_before);
+    }
+
+    /// `Transfer` is a plain value type: `Copy` + structural `Eq`/`Debug`.
+    #[test]
+    fn transfer_is_a_value_type() {
+        let transfer = Transfer {
+            to: OwnerId::new(2),
+            from: Some(OwnerId::new(1)),
+            data: make_small(7),
+        };
+        let copied = transfer;
+        assert_eq!(copied, transfer);
+        assert_eq!(copied.to, OwnerId::new(2));
+        assert_eq!(copied.from, Some(OwnerId::new(1)));
+        assert_eq!(copied.data, make_small(7));
+        assert!(format!("{transfer:?}").contains("Transfer"));
+
+        assert_ne!(
+            transfer,
+            Transfer {
+                to: OwnerId::new(2),
+                from: None,
+                data: make_small(7),
+            },
+            "an identity-less giver differs from an owner giver"
+        );
     }
 }

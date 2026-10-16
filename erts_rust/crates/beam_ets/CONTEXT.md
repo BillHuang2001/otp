@@ -95,7 +95,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   the select/match family and the element updates also take `heap: &mut Heap` (scratch space).
 - **Metadata:** `id`, `kind`, `name() -> Option<Atom>` (Some iff a name was recorded), `keypos()`
   (1-based), `access`, `is_named_table() -> bool`, `owner()/set_owner()`, `heir() -> Option<Heir>` /
-  `set_heir()` / `heir_data()`, `give_away(caller, new_owner)`, `setopts(caller, SetOpt)`,
+  `set_heir()` / `heir_data()`, `give_away(caller, new_owner)`,
+  `give_away_with_gift(caller, new_owner, gift) -> Result<Transfer>` (the gift-carrying
+  `ets:give_away/3`), `setopts(caller, SetOpt)`,
   `set_access(&mut self, access: Access)`, `owner_died(dead, is_alive) -> OwnerDeath`, `info() ->
   TableInfo`, `rename(name, is_taken) -> Result<RenameOutcome>`.
 - **Writes** (object = the whole tuple; key from `keypos`): `insert` (upsert), `insert_new -> bool`,
@@ -167,7 +169,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   - `TableWrite<'g>` — metadata, mutations over caller-owned inputs (`insert`, `insert_new`,
     `insert_list`, `delete`, `delete_object`, `delete_all_objects`, `update_counter`,
     `update_counter_with`, `update_element`, `select_delete`, `match_delete`, `select_replace`,
-    `set_fixation`, `set_owner`, `set_heir`, `set_access`, `setopts`, `give_away`),
+    `set_fixation`, `set_owner`, `set_heir`, `set_access`, `setopts`, `give_away`,
+    `give_away_with_gift`),
     `heir() -> Option<HeirView<'_>>`, `take -> Vec<TableTerm<'_>>`, and `as_requester` (the re-scoped
     raw access-enforcement seam — its reads are bare aliasing `Eterm`s by design, see `view/CONTEXT.md`).
   - `pub struct HeirView<'g>` (`view/term.rs`, re-exported at the crate root): `owner() -> OwnerId`
@@ -186,6 +189,15 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `Table::setopts(caller, SetOpt) -> Result<()>` applies the **owner gate first** (`caller != owner` ⇒
   `badarg`, nothing mutated). `give_away` follows the C `ets_give_away_3` order (bad-pid → not-owner →
   self-gift, all `badarg`, owner unchanged on failure).
+- `pub struct Transfer { pub to: OwnerId, pub from: Option<OwnerId>, pub data: Eterm }` — the
+  `{'ETS-TRANSFER', Tid, FromPid, GiftData}` **delivery obligation** a gift-carrying `ets:give_away/3`
+  returns: `to` = the new owner, `from` = the giver, `data` = a table-owned checked-out gift copy (the
+  `Tid`/`FromPid` *terms* are the host's to build — the pid gap).
+- `Table::give_away_with_gift(caller, new_owner, gift) -> Result<Transfer>` — the same C-ordered
+  ownership check (shared private `transfer_target`) **then** a deep copy of `gift` through
+  `TermStore::copy`, checked out with `TermStore::relinquish` like `Table::take` (valid for the table's
+  lifetime, never reused, not counted toward `memory()`). The copy runs **before** the owner moves, so
+  an uncopyable gift is `badarg` with the owner and store untouched. `TableAccess`/`TableWrite` mirror it.
 - `Table::install_heir(owner, data: Option<Eterm>) -> Result<()>` — **copies** the gift data into
   table-owned storage (immediates by value; a non-copyable term is the typed `badarg` and the heir is
   left untouched). `Table::heir_data() -> Option<Eterm>` reads the table-owned copy back.
@@ -220,7 +232,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `member`/`lookup_element(+_or/_all/_all_or)`/`select`/`select_reverse`(+_limit/_continue)/
   `select_count`/`match_object`/`match_`/`first`/`last`/`next`/`prev`/`tab2list`/`slot`/`set_fixation`
   (the oracle gates `safe_fixtable/2` as a READ) plus the `/3`+`/1` limited forms. `ets:match_spec_run/2`
-  has no access concept. `ets:info/1,2` is deliberately **not** gated. `give_away(new_owner)` has no
+  has no access concept. `ets:info/1,2` is deliberately **not** gated. `give_away(new_owner)` and
+  `give_away_with_gift(new_owner, gift)` have no
   protection check (ownership is not a read/write op); `setopts`/`set_access` are owner-gated.
 
 ### `table/update.rs` — `update_counter`/`update_element` operand machinery
@@ -658,8 +671,12 @@ rendering stays host-side (`TableInfo::write_concurrency` is a `bool`).
   silently under-matches (a guard skips its clause, a body yields `EXIT`) where the oracle returns the
   pid; `BifContext` already carries `self_pid` (see `src/select/CONTEXT.md`).
 - **`beam_bifs` (open):** reject `[]` in `ets:match_spec_compile/1` (the oracle `badarg`s; the select
-  family legitimately accepts `[]`) and retain/deliver the `ets:give_away/3` gift term
-  (`{'ETS-TRANSFER', Tid, FromPid, GiftData}`).
+  family legitimately accepts `[]`).
+- **`beam_bifs` (open) — the `ets:give_away/3` delivery:** `beam_ets` does its half via
+  `Table::give_away_with_gift`; the remaining work is the BIF `beam_bifs::ets::adopt::give_away_3` — read
+  `args[2]`, call it, and deliver `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the new owner through its
+  `SendHook` (the `Tid`/`FromPid` terms are the host's; there is no pid/ref term here). Differential case
+  to add: `ets/give_away_gift_data_reaches_the_new_owner` (A.1).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; tests in `src/kind/tests.rs`
@@ -673,7 +690,7 @@ rendering stays host-side (`TableInfo::write_concurrency` is a `bool`).
 - `src/table/view/{mod,read,write,term,iter}.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence) + the view-borrowed traversal API; `view/tests.rs` their unit tests
 - `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior`
 - `src/table/access.rs` → `TableAccess` (the access-enforcing view)
-- `src/table/ownership.rs` → `Heir`/`SetOpt`, the owner-gated `Table::setopts`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`, the `give_away` semantics + the pid-gap docs
+- `src/table/ownership.rs` → `Heir`/`SetOpt`/`Transfer`, the owner-gated `Table::setopts`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`, the `give_away`/`give_away_with_gift` semantics + the pid-gap docs
 - `src/table/lifecycle.rs` → `OwnerDeath` + `Table::owner_died`
 - `src/table/element.rs` → the table-level `update_counter`/`update_element`; `src/table/update.rs` → the counter/element operand machinery (shared with the interiors)
 - `src/champ_interior.rs` → `ChampInterior` — the **default `set`** interior

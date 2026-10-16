@@ -41,7 +41,7 @@ use super::{HeirView, TableTerm};
 use crate::info::TableInfo;
 use crate::kind::{Access, TableKind};
 use crate::select::MatchSpec;
-use crate::table::{Heir, OwnerId, SetOpt, Table, TableAccess, TableId};
+use crate::table::{Heir, OwnerId, SetOpt, Table, TableAccess, TableId, Transfer};
 
 /// An exclusive guard over a [`Table`]: the synchronous writer half of a
 /// [`SharedTable`](super::super::SharedTable).
@@ -330,6 +330,18 @@ impl<'g> TableWrite<'g> {
         new_owner: Option<OwnerId>,
     ) -> Result<()> {
         self.guard.give_away(caller, new_owner)
+    }
+
+    /// `ets:give_away/3` **with the gift term**, with `caller` supplied explicitly:
+    /// delegates to [`Table::give_away_with_gift`] and returns the
+    /// `{'ETS-TRANSFER', …}` obligation the host owes the new owner.
+    pub fn give_away_with_gift(
+        &mut self,
+        caller: Option<OwnerId>,
+        new_owner: Option<OwnerId>,
+        gift: Eterm,
+    ) -> Result<Transfer> {
+        self.guard.give_away_with_gift(caller, new_owner, gift)
     }
 
     /// `ets:setopts/2` for the modelled options (`{heir, ...}` and

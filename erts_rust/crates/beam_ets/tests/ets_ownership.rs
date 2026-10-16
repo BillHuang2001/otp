@@ -362,6 +362,27 @@ fn table_access_routes_ownership() {
         .expect("the (new) owner may set the heir");
     assert_eq!(t.heir(), Some(gift));
     assert_eq!(t.as_requester(Some(other)).requester(), Some(other));
+
+    // The gift-carrying transfer routes the requester as the caller too.
+    let mut source = Heap::new(16);
+    let carrier = int_tuple(&mut source, &[4, 5]);
+    assert!(matches!(
+        t.as_requester(Some(owner))
+            .give_away_with_gift(Some(owner), carrier),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(
+        t.owner(),
+        Some(other),
+        "the denied gift transfer moved nothing"
+    );
+    let transfer = t
+        .as_requester(Some(other))
+        .give_away_with_gift(Some(owner), carrier)
+        .expect("the owner may transfer with a gift");
+    assert_eq!(transfer.to, owner, "the requester names the recipient");
+    assert_eq!(transfer.from, Some(other), "…and is the giver");
+    assert_eq!(t.owner(), Some(owner));
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,4 +1132,214 @@ fn heir_forms_match_the_live_oracle() {
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The gift-carrying `ets:give_away/3` (the crate's transfer obligation)
+// ---------------------------------------------------------------------------
+
+/// The crate's half of the gift-carrying `ets:give_away/3`: the returned
+/// [`Transfer`](beam_ets::Transfer) carries the **recipient**, the **giver** and a
+/// **table-owned copy** of the gift, and the table's owner has moved to the
+/// recipient. The `Tid`/`FromPid` message *terms* are the host's to build — this
+/// crate has no pid/ref term (the "pid gap").
+///
+/// The copy evidence: the gift is deep-copied through the store's copy boundary, so
+/// the delivered term is a **distinct root** that survives the caller's heap. (It is
+/// then checked out — the `take` discipline — so it leaves the table's live-memory
+/// accounting; the live oracle agrees that `ets:info(T, memory)` does **not** grow
+/// across a `give_away/3`, since the gift moves to the recipient.)
+#[test]
+fn give_away_carries_the_gift_to_the_new_owner() {
+    let mut t = new_table(TableKind::Set);
+    let giver = OwnerId::new(1);
+    let recipient = OwnerId::new(2);
+    t.set_owner(Some(giver));
+
+    // A boxed, complex gift term on a caller-owned (process-like) heap.
+    let mut source = Heap::new(64);
+    let gift = int_tuple(&mut source, &[1, 2, 3]);
+
+    let transfer = t
+        .give_away_with_gift(Some(giver), Some(recipient), gift)
+        .expect("a plain tuple is a copyable gift");
+
+    assert_eq!(transfer.to, recipient, "the recipient is the new owner");
+    assert_eq!(transfer.from, Some(giver), "the giver is the calling owner");
+    assert_eq!(t.owner(), Some(recipient), "the owner moved to the target");
+    assert_eq!(t.info().owner, Some(recipient), "info carries the new owner");
+
+    assert_ne!(
+        transfer.data.raw(),
+        gift.raw(),
+        "the gift is deep-copied, never aliased into the caller's heap"
+    );
+
+    // The caller's heap dies here. The delivered copy is table-owned, so it still
+    // reads back intact — the whole point of the copy.
+    drop(source);
+    let mut reference = Heap::new(64);
+    let expected = int_tuple(&mut reference, &[1, 2, 3]);
+    let atoms = AtomTable::new();
+    assert!(
+        eq(transfer.data, expected, &atoms),
+        "the table-owned gift copy survives the caller's heap"
+    );
+
+    // An immediate gift is carried by value (same bits, no storage).
+    let mut t2 = new_table(TableKind::Set);
+    t2.set_owner(Some(giver));
+    let immediate = t2
+        .give_away_with_gift(Some(giver), Some(recipient), make_small(5))
+        .expect("an immediate gift needs no storage");
+    assert_eq!(immediate.data, make_small(5), "an immediate is stored by value");
+    assert_eq!(immediate.to, recipient);
+    assert_eq!(immediate.from, Some(giver));
+    assert_eq!(t2.owner(), Some(recipient));
+}
+
+/// The embedded oracle program (an `escript`) for the gift-carrying
+/// `ets:give_away/3`. It spawns a recipient, has the owner call
+/// `ets:give_away(T, Recipient, Gift)`, and reports the observed facts:
+///
+/// * the recipient receives an arity-4 `{'ETS-TRANSFER', Tid, FromPid, Gift}` whose
+///   `FromPid` is the giver and whose `GiftData` is the gift passed in;
+/// * the `Tid` is the table's **name atom** for a `named_table`, a **reference**
+///   for an unnamed table;
+/// * the table's owner is the recipient afterwards, and the BIF returns `true`;
+/// * the atom `undefined` passed as the gift arrives as the atom `undefined`;
+/// * `ets:info(T, memory)` does **not** grow across the transfer — the gift moves to
+///   the recipient, not into the table.
+///
+/// It prints one canonical line per group; the assertions below pin the exact
+/// output.
+const GIVE_AWAY_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+main(_) ->
+    Parent = self(),
+    Tag = 'ETS-TRANSFER',
+    Gift = {gift, [1, 2, 3], <<"bin">>},
+
+    %% A named table: the tid is the table's name atom.
+    NamedR = spawn(fun() -> receive M -> Parent ! {named_got, M} end,
+                            receive stop -> ok end end),
+    _NamedO = spawn(fun() ->
+        T = ets:new(named_owned, [named_table, public]),
+        Ret = ets:give_away(T, NamedR, Gift),
+        Parent ! {named_ret, Ret, T, self()},
+        receive stop -> ok end
+    end),
+    {named_ret, NamedRet, NamedT, NamedPid} = receive X1 -> X1 end,
+    NamedM = receive {named_got, M1} -> M1 after 5000 -> timeout end,
+    NamedOwner = ets:info(NamedT, owner),
+
+    %% An unnamed table: the tid is a reference; `undefined` is a value gift.
+    UnnamedR = spawn(fun() -> receive M -> Parent ! {unnamed_got, M} end,
+                             receive stop -> ok end end),
+    _UnnamedO = spawn(fun() ->
+        T = ets:new(unnamed_owned, [public]),
+        Ret = ets:give_away(T, UnnamedR, undefined),
+        Parent ! {unnamed_ret, Ret, T, self()},
+        receive stop -> ok end
+    end),
+    {unnamed_ret, UnnamedRet, UnnamedT, _UnnamedPid} = receive X2 -> X2 end,
+    UnnamedM = receive {unnamed_got, M2} -> M2 after 5000 -> timeout end,
+    UnnamedOwner = ets:info(UnnamedT, owner),
+
+    %% The gift moves to the recipient, so the table's own memory does not grow.
+    Big = lists:duplicate(1000, {gift, 42}),
+    MemR = spawn(fun() -> receive _ -> ok end end),
+    MemT = ets:new(mem_owned, [public]),
+    Mem0 = ets:info(MemT, memory),
+    _ = ets:give_away(MemT, MemR, Big),
+    Mem1 = ets:info(MemT, memory),
+
+    NamedFacts = case NamedM of
+        timeout -> timeout;
+        _ ->
+            [element(1, NamedM) =:= Tag, tuple_size(NamedM),
+             element(4, NamedM) =:= Gift, element(3, NamedM) =:= NamedPid,
+             is_atom(element(2, NamedM)), element(2, NamedM) =:= named_owned,
+             NamedOwner =:= NamedR, NamedRet]
+    end,
+    UnnamedFacts = case UnnamedM of
+        timeout -> timeout;
+        _ ->
+            [element(1, UnnamedM) =:= Tag, tuple_size(UnnamedM),
+             element(4, UnnamedM), is_reference(element(2, UnnamedM)),
+             UnnamedOwner =:= UnnamedR, UnnamedRet]
+    end,
+    io:format("named ~p~n", [NamedFacts]),
+    io:format("unnamed ~p~n", [UnnamedFacts]),
+    io:format("memory grows=~p~n", [Mem1 > Mem0]),
+    ok.
+"#;
+
+/// The gift-carrying transfer observations must match the live oracle, and the
+/// crate's model must reproduce the corresponding facts. The oracle is **required by
+/// default**, so a missing one fails this check rather than skipping it
+/// (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out).
+#[test]
+fn give_away_transfer_observations_match_the_live_oracle() {
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "give_away_transfer_observations_match_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable `erl`/`escript` on $PATH)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        GIVE_AWAY_ORACLE_PROGRAM,
+        &[],
+        "give_away",
+        ORACLE_TIMEOUT,
+    );
+    let lines: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .expect("the oracle prints UTF-8")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            // tag, arity, gift, giver, is_atom(tid), tid == name, owner == recipient, ret
+            "named [true,4,true,true,true,true,true,true]",
+            // tag, arity, gift == undefined, is_reference(tid), owner == recipient, ret
+            "unnamed [true,4,undefined,true,true,true]",
+            // the gift leaves the table: no live-memory growth
+            "memory grows=false",
+        ],
+        "the oracle's give_away/3 transfer observations changed — the model is stale:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // The crate's model reproduces the same facts the oracle reported: the recipient
+    // (`to`) is the new owner, the giver (`from`) is the calling owner, and `data` is
+    // the copied gift. The `Tid`/`FromPid` *terms* are the host's to build — this
+    // crate has neither a pid nor a ref term.
+    let giver = OwnerId::new(1);
+    let recipient = OwnerId::new(2);
+    let mut t = new_table(TableKind::Set);
+    t.set_owner(Some(giver));
+
+    let mut source = Heap::new(64);
+    let gift = int_tuple(&mut source, &[1, 2, 3]);
+    let transfer = t
+        .give_away_with_gift(Some(giver), Some(recipient), gift)
+        .expect("the gift is a copyable term");
+
+    assert_eq!(transfer.to, recipient, "the recipient is the new owner");
+    assert_eq!(transfer.from, Some(giver), "the giver is the calling owner");
+    assert_eq!(t.owner(), Some(recipient), "the table's owner is the recipient");
+    let atoms = AtomTable::new();
+    assert!(
+        eq(transfer.data, gift, &atoms),
+        "the delivered payload is the gift passed in"
+    );
+    assert_ne!(
+        transfer.data.raw(),
+        gift.raw(),
+        "…a genuine copy, at a distinct root"
+    );
 }

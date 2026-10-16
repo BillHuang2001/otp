@@ -59,7 +59,7 @@ mod view;
 
 pub use access::TableAccess;
 pub use lifecycle::OwnerDeath;
-pub use ownership::{Heir, SetOpt};
+pub use ownership::{Heir, SetOpt, Transfer};
 pub use rename::RenameOutcome;
 pub use shared::SharedTable;
 pub use view::{HeirView, TableRead, TableTerm, TableWrite};
@@ -358,19 +358,20 @@ impl Table {
         self.owner = owner;
     }
 
-    /// `ets:give_away/3`. Transfers ownership from `caller` to `new_owner`.
+    /// The three C-ordered `ets:give_away/3` checks, in one place: a bad/absent
+    /// target (`new_owner` is `None` — the crate's stand-in for the oracle's
+    /// non-pid/dead-pid target), then a caller that is not the current owner, then a
+    /// **self-gift** (`new_owner` is the current owner). Each is `badarg` and
+    /// mutates nothing.
     ///
-    /// `badarg` (owner unchanged) when `caller` is not the current owner, when
-    /// `new_owner` is `None` (no live target process — the crate's stand-in for the
-    /// oracle's non-pid/dead-pid target), or when `new_owner` is the current owner
-    /// (the caller's own pid). On success the owner becomes `new_owner`; the
-    /// `{'ETS-TRANSFER', …}` message to the new owner is the BIF/runtime layer's
-    /// job, not this crate's (see [`super::ownership`]).
-    pub fn give_away(
-        &mut self,
+    /// Returns the validated target so [`give_away`](Table::give_away) and
+    /// [`give_away_with_gift`](Table::give_away_with_gift) share exactly this order
+    /// (the C `ets_give_away_3`).
+    fn transfer_target(
+        &self,
         caller: Option<OwnerId>,
         new_owner: Option<OwnerId>,
-    ) -> Result<()> {
+    ) -> Result<OwnerId> {
         // Mirror the C `ets_give_away_3` order: bad-pid check, then the
         // not-owner check, then the self-gift check — all `badarg`.
         let Some(new_owner) = new_owner else {
@@ -382,8 +383,73 @@ impl Table {
         if Some(new_owner) == self.owner {
             return Err(badarg());
         }
+        Ok(new_owner)
+    }
+
+    /// `ets:give_away/3`. Transfers ownership from `caller` to `new_owner`.
+    ///
+    /// `badarg` (owner unchanged) when `caller` is not the current owner, when
+    /// `new_owner` is `None` (no live target process — the crate's stand-in for the
+    /// oracle's non-pid/dead-pid target), or when `new_owner` is the current owner
+    /// (the caller's own pid). On success the owner becomes `new_owner`.
+    ///
+    /// This is the **no-gift** form. The gift-carrying
+    /// `ets:give_away(T, NewOwner, GiftData)` is
+    /// [`give_away_with_gift`](Table::give_away_with_gift), which additionally
+    /// deep-copies the gift into table-owned storage and surfaces the
+    /// `{'ETS-TRANSFER', Tid, FromPid, GiftData}` the host owes; the actual message
+    /// *delivery* is the BIF/runtime layer's job, not this crate's (see
+    /// [`super::ownership`]).
+    pub fn give_away(
+        &mut self,
+        caller: Option<OwnerId>,
+        new_owner: Option<OwnerId>,
+    ) -> Result<()> {
+        let new_owner = self.transfer_target(caller, new_owner)?;
         self.owner = Some(new_owner);
         Ok(())
+    }
+
+    /// `ets:give_away/3` **with the gift term**: transfers ownership and hands back
+    /// the [`Transfer`] the host must deliver as
+    /// `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the new owner.
+    ///
+    /// The ownership rules are identical to [`give_away`](Table::give_away) (the
+    /// same [`transfer_target`](Table::transfer_target) check: a bad/absent target,
+    /// a caller that is not the owner and a self-gift are each `badarg`). The gift
+    /// is then deep-copied into the table's own store through the
+    /// [`TermStore`](crate::store::TermStore) copy boundary — the A.1 seam
+    /// [`take`](Table::take) uses — and checked out exactly like a `take` result:
+    /// still valid for the table's lifetime and never handed out again, but no
+    /// longer counted toward [`memory`](Table::memory). An immediate gift owns no
+    /// storage, so it is stored by value.
+    ///
+    /// **The copy happens before the owner moves**, so a gift outside the store's
+    /// copyable subset (see the crate `CONTEXT.md`, Known Issues) is the typed
+    /// `badarg` with the owner and the store left untouched.
+    ///
+    /// The `Tid` and `FromPid` **terms** are the host's to build, never this
+    /// crate's: it has no pid/ref term (the documented "pid gap"). [`Transfer::to`]
+    /// names the recipient, [`Transfer::from`] the giver and [`Transfer::data`] the
+    /// copied gift.
+    #[must_use = "the host must deliver {'ETS-TRANSFER', Tid, FromPid, GiftData} to `to`"]
+    pub fn give_away_with_gift(
+        &mut self,
+        caller: Option<OwnerId>,
+        new_owner: Option<OwnerId>,
+        gift: Eterm,
+    ) -> Result<Transfer> {
+        let new_owner = self.transfer_target(caller, new_owner)?;
+        // Copy into table-owned storage **before** mutating the owner: a copy
+        // failure must leave the owner (and the store) unchanged.
+        let data = self.store.copy(gift)?;
+        self.store.relinquish(data);
+        self.owner = Some(new_owner);
+        Ok(Transfer {
+            to: new_owner,
+            from: caller,
+            data,
+        })
     }
 
     /// The table's current heir, if any. Its `data` field distinguishes the
