@@ -65,7 +65,7 @@ const X_DIGITS: [u64; 2] = [5, 1 << 6];
 
 /// The ETF payload of a flag-atom list such as `[little, signed]` (`LIST_EXT` over
 /// `ATOM_EXT`s, tailed by `NIL_EXT`).
-fn flags_etf(names: &[&str]) -> Vec<u8> {
+pub(super) fn flags_etf(names: &[&str]) -> Vec<u8> {
     let mut payload = vec![131u8, 108]; // VERSION_MAGIC, LIST_EXT
     payload.extend_from_slice(&(names.len() as u32).to_be_bytes());
     for name in names {

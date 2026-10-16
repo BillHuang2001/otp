@@ -408,3 +408,5 @@ fn read_value(
 mod tests;
 #[cfg(test)]
 mod wide_tests;
+#[cfg(test)]
+mod float_seg_tests;
