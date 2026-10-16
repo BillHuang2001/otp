@@ -18,8 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! The `io` **device** floor: `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and
-//! `io:format/3`.
+//! The `io` **device** floor: `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`,
+//! `io:write/1,2` and `io:format/3`.
 //!
 //! # Why these are floor keys and not `lib/stdlib/src/io.erl` bodies
 //!
@@ -45,7 +45,7 @@
 //!
 //! | Device | Oracle | Here |
 //! |---|---|---|
-//! | omitted (`io:nl/0`, `io:fwrite/1,2`, `io:write/1`, `io:format/1,2`) | the caller's **group leader** | the caller's output stream (stdout) |
+//! | omitted (`io:put_chars/1`, `io:nl/0`, `io:fwrite/1,2`, `io:write/1`, `io:format/1,2`) | the caller's **group leader** | the caller's output stream (stdout) |
 //! | `standard_io` | `request/3`'s `standard_io` clause rewrites it to `group_leader()` | stdout |
 //! | `user` | the registered terminal device | stdout |
 //! | `standard_error` | the registered stderr device | stderr |
@@ -68,7 +68,9 @@
 //! non-immediate is `io_lib_format:fwrite("~w", [Term])`; probed **equal** to
 //! `io_lib:format("~w", [Term])` for every term kind this runtime builds, including char
 //! lists, which `~p` would render as a string and `write/1` does not). `io:nl/0,1` writes
-//! the one newline `io_lib:nl/0` is (`io_request/2`'s `nl` clause).
+//! the one newline `io_lib:nl/0` is (`io_request/2`'s `nl` clause), and `io:put_chars/1,2`
+//! flattens its character data (`{put_chars, unicode, Chars}`'s payload) the same way the
+//! output sink does.
 //!
 //! [`RuntimeContext::io_device`]: RuntimeContext
 //! [`RuntimeContext::io_stream`]: RuntimeContext
@@ -123,6 +125,32 @@ const UNREACHABLE_DEVICE: &str = "io: an explicit io-device process (only `stand
                                    the caller's output stream and `standard_error` are served)";
 
 impl RuntimeContext<'_> {
+    /// `io:put_chars/1,2` — write the characters `Chars` to the device and answer `ok`.
+    ///
+    /// `which` is the arity. `/1` is `o_request(default_output(), {put_chars, unicode, Chars})`
+    /// (`default_output/0` is `group_leader()`) and `/2` takes the device **first**
+    /// (`io.erl:160-207`), so the argument is resolved by exactly the same
+    /// [`Self::io_stream`] the other device-taking arms use — a device this runtime serves
+    /// selects a stream, and one it cannot reach is the oracle's own raise (never a silent
+    /// redirect to stdout).
+    pub(super) fn io_put_chars(&mut self, args: &[Eterm], which: usize) -> Result<Eterm> {
+        let (device, chars) = match which {
+            1 => (None, *args.first().ok_or(BeamError::BadArg)?),
+            2 => (
+                Some(*args.first().ok_or(BeamError::BadArg)?),
+                *args.get(1).ok_or(BeamError::BadArg)?,
+            ),
+            _ => return Err(BeamError::BadArg),
+        };
+        // The device is resolved *before* the payload is read, exactly as `o_request/2` +
+        // `request/3` do: both `io:put_chars(foo, …)` and `io:put_chars(1, …)` raise the
+        // device's own reason whatever the character data is.
+        let stream = self.io_stream(device)?;
+        let text = self.chars_to_string(chars)?;
+        self.write_stream(stream, &text)?;
+        self.atom("ok")
+    }
+
     /// `io:nl/0` / `io:nl/1` — write one newline to the device and answer `ok`.
     ///
     /// `which` is the arity. The newline is the one `io_lib:nl/0` returns (`"\n"`), which
@@ -347,6 +375,70 @@ mod tests {
             );
             assert_eq!(out, "\n", "nl({name}) writes to the output stream");
         }
+    }
+
+    /// `io:put_chars/1` writes its characters to the default device (the caller's output
+    /// stream, standing in for `group_leader()`) and answers `ok`; `/2` writes to every
+    /// device this runtime serves.
+    #[test]
+    fn put_chars_writes_to_the_resolved_device() {
+        let mut runtime = runtime();
+        let text = chars(&mut runtime, "hi");
+        let (result, out) = call_capturing(&mut runtime, "put_chars", &[text]);
+        assert_eq!(
+            runtime.atom_name_of(result.expect("put_chars/1")),
+            Some("ok")
+        );
+        assert_eq!(out, "hi");
+
+        for name in ["standard_io", "user"] {
+            let mut served = crate::native::test_support::runtime();
+            let device = atom(&mut served, name);
+            let text = chars(&mut served, "hi");
+            let (result, out) = call_capturing(&mut served, "put_chars", &[device, text]);
+            assert_eq!(
+                served.atom_name_of(result.expect("put_chars/2")),
+                Some("ok"),
+                "put_chars({name}, ...)"
+            );
+            assert_eq!(out, "hi", "put_chars({name}, ...) writes to the output stream");
+        }
+    }
+
+    /// `io:put_chars/2`'s device is resolved by the **same** model as the other arms: an
+    /// unregistered atom is the oracle's `badarg`, a non-atom/non-pid is the bare
+    /// `function_clause`, and a live non-stdio device is the typed `unsupported` — never a
+    /// silent redirect to stdout.
+    #[test]
+    fn put_chars_honours_the_device_rules() {
+        let mut unknown_atom = runtime();
+        let device = atom(&mut unknown_atom, "no_such_io_device");
+        let text = chars(&mut unknown_atom, "x");
+        let error = call(&mut unknown_atom, "io", "put_chars", &[device, text])
+            .expect_err("put_chars/2");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+
+        let mut no_clause = runtime();
+        let text = chars(&mut no_clause, "x");
+        let error = call(&mut no_clause, "io", "put_chars", &[make_small(1), text])
+            .expect_err("put_chars/2");
+        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
+
+        // A pid that is neither the caller's group leader nor the `standard_error` device:
+        // `io.erl` would post an `{io_request, …}` and block, which a BIF may not do.
+        let mut live = runtime();
+        let own = {
+            let mut sink = beam_bifs::NullSink;
+            let context = RuntimeContext::with_output(&mut live, &mut sink);
+            context.pid()
+        };
+        let device = ProcessId::new(own.number() + 1000, own.serial()).to_eterm();
+        let text = chars(&mut live, "x");
+        let error = call(&mut live, "io", "put_chars", &[device, text]).expect_err("put_chars/2");
+        let reason = crate::error::unsupported_reason(&error).unwrap_or_else(|| {
+            panic!("a live non-stdio device must be the typed capability gap: {error}")
+        });
+        assert!(reason.contains("io-device"), "{reason}");
     }
 
     /// `io:fwrite/1,2` renders `Format` with the registered `io_lib:format/2` and writes the

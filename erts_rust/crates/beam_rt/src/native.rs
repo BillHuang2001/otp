@@ -30,8 +30,7 @@
 //! | `erlang:halt/0,1,2` | terminates the runtime: it must travel out of the running code as a raise and become the process exit status |
 //! | `erl_ddll:loaded_drivers/0`, `erl_ddll:try_load/3`, `erl_ddll:try_unload/2`, `erl_ddll:info/2` | the loaded-driver **list** an `open_port({spawn_driver, Name}, …)` resolves the name against: it is the runtime's own `dlopen`/port registry (`crate::port::driver`), not `beam_bifs`'s separate one |
 //! | `erlang:display/1` | writes to the *process's* output sink |
-//! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
-//! | `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3` | the `io.erl` **device** request wrappers: `io.erl`'s own `{io_request, …}` round trip against the caller's group leader (itself) answers `calling_self`, so the runtime answers the device question natively (see [`io`]) |
+//! | `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3` | the `io` **device** surface: the `io.erl` request wrappers' own `{io_request, …}` round trip against the caller's group leader (itself) answers `calling_self`, so the runtime resolves the device and writes to the process's output sink or its standard error itself (see [`io`]) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
 //! | `erlang:process_info/2` | reads a **process's** heap/GC observables out of this runtime's own process table (`beam_gc`'s `HeapInfo`; contract A.8) |
@@ -211,11 +210,11 @@ pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
 /// mirror here (`erlang`); those keep the module-wide exclusion.
 fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
     match module {
-        // The `io` **device** surface: `put_chars/1,2`, whose device argument is accepted
-        // and ignored (Milestone-1 has one output stream), plus the `io.erl` request
-        // wrappers `nl/0,1`, `fwrite/1,2,3`, `write/1,2` and `format/3`, which this runtime
-        // serves natively because `io.erl`'s own `{io_request, …}`/`{io_reply, …}` round trip
+        // The `io` **device** surface: `put_chars/1,2` plus the `io.erl` request wrappers
+        // `nl/0,1`, `fwrite/1,2,3`, `write/1,2` and `format/3`, which this runtime serves
+        // natively because `io.erl`'s own `{io_request, …}`/`{io_reply, …}` round trip
         // against the caller's group leader (itself) answers `calling_self` (see [`io`]).
+        // Every arm resolves its device through the one model in that module.
         // Every *other* `io:*` (`io:getopts/1`, `io:setopts/2`, `io:request/2`,
         // `io:scan_erl_form/4`, `io:format/1,2`, `io:printable_range/0`, …) is an ordinary
         // body in `lib/stdlib/src/io.erl` or a `beam_bifs` registry BIF.
@@ -347,8 +346,8 @@ impl RuntimeContext<'_> {
             ("erlang", "halt", 1) => Some(self.halt_1(args)),
             ("erlang", "halt", 2) => Some(self.halt_2(args)),
             ("erlang", "display", 1) => Some(self.display(args)),
-            ("io", "put_chars", 1) => Some(self.put_chars(args, 1)),
-            ("io", "put_chars", 2) => Some(self.put_chars(args, 2)),
+            ("io", "put_chars", 1) => Some(self.io_put_chars(args, 1)),
+            ("io", "put_chars", 2) => Some(self.io_put_chars(args, 2)),
             // The rest of the `io` **device** surface — the `io.erl` wrappers over
             // `o_request/2`/`execute_request/3`, which this runtime cannot complete against
             // itself (its own root process's group leader is itself, so `io.erl` answers
@@ -703,7 +702,7 @@ impl RuntimeContext<'_> {
     fn record_halt(&mut self, status: i32) -> BeamError {
         self.runtime.halt = Some(status);
         error::halt(status)
-    }    // -- erlang:display/1 and io:put_chars/1,2 --------------------------------
+    }    // -- erlang:display/1 ------------------------------------------------------
 
     /// `erlang:display/1`: print the term on the process's output (`~p` plus a
     /// newline, as the oracle does) and return `true`.
@@ -713,22 +712,6 @@ impl RuntimeContext<'_> {
         self.write_output(&text)?;
         let true_atom = self.atom("true")?;
         Ok(true_atom)
-    }
-
-    /// `io:put_chars(Chars)` / `io:put_chars(Device, Chars)`: write the characters and
-    /// return `ok`.
-    ///
-    /// The device argument of the `/2` form is accepted and ignored (Milestone-1 has
-    /// one output stream).
-    fn put_chars(&mut self, args: &[Eterm], which: usize) -> Result<Eterm> {
-        let chars = match which {
-            1 => *args.first().ok_or(BeamError::BadArg)?,
-            2 => *args.get(1).ok_or(BeamError::BadArg)?,
-            _ => return Err(BeamError::BadArg),
-        };
-        let text = self.chars_to_string(chars)?;
-        self.write_output(&text)?;
-        self.atom("ok")
     }
 
     // -- erlang:apply/2,3 -----------------------------------------------------
@@ -1478,36 +1461,6 @@ mod tests {
         };
         assert_eq!(runtime.atom_name_of(displayed), Some("true"));
         assert_eq!(sink.as_str(), "42\n");
-    }
-
-    #[test]
-    fn put_chars_writes_char_lists_and_binaries() {
-        let mut runtime = runtime();
-        let mut sink = beam_bifs::BytesSink::new();
-        let text = {
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            let chars = terms::make_list(&mut context, &[make_small(104), make_small(105)])
-                .expect("a char list");
-            context
-                .call_bif("io", "put_chars", 1, &[chars])
-                .expect("put_chars/1")
-        };
-        assert_eq!(runtime.atom_name_of(text), Some("ok"));
-        assert_eq!(sink.as_str(), "hi");
-        // The `/2` form takes the device first and ignores it.
-        let mut sink = beam_bifs::BytesSink::new();
-        {
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            // Milestone-1 has one output stream, so the device is accepted and ignored:
-            // a plain small integer stands in for a device handle.
-            let device = make_small(1);
-            let chars =
-                terms::make_list(&mut context, &[make_small(121)]).expect("a char list");
-            context
-                .call_bif("io", "put_chars", 2, &[device, chars])
-                .expect("put_chars/2");
-        }
-        assert_eq!(sink.as_str(), "y");
     }
 
     #[test]

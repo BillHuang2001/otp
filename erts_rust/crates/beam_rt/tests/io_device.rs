@@ -18,9 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! The `io` **device floor** — `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and
-//! `io:format/3` — end to end at the **executable** boundary and cross-checked against the
-//! live system `erl` oracle.
+//! The `io` **device floor** — `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`,
+//! `io:write/1,2` and `io:format/3` — end to end at the **executable** boundary and
+//! cross-checked against the live system `erl` oracle.
 //!
 //! # Why these keys are served natively
 //!
@@ -46,17 +46,14 @@
 //!
 //! A missing `erl` is a **loud** skip, never a silent pass (`tests/support/mod.rs`).
 //!
-//! # The deliberate non-parities
+//! # The deliberate non-parity
 //!
-//! Two probes are **not** oracle-equal by design, and are pinned as such rather than dropped:
-//!
-//! * a **live non-stdio device** (a registered pid other than the caller's group leader or the
-//!   `standard_error` device) needs the `{io_request, …}`/`{io_reply, …}` round trip, which a
-//!   BIF may not perform — this runtime answers the typed `unsupported` (exit 3) instead of
-//!   blocking, so `a_live_non_stdio_device_is_a_typed_gap` asserts only *this* runtime's side;
-//! * `io:put_chars/2` still **accepts and ignores** its device (it predates the device model),
-//!   so `io:put_chars(standard_error, …)` lands on stdout here and on stderr on the oracle —
-//!   `io_put_chars_2_still_ignores_its_device` pins that divergence.
+//! One probe is **not** oracle-equal by design, and is pinned as such rather than dropped:
+//! a **live non-stdio device** (a registered pid other than the caller's group leader or the
+//! `standard_error` device) needs the `{io_request, …}`/`{io_reply, …}` round trip, which a
+//! BIF may not perform — this runtime answers the typed `unsupported` (exit 3) instead of
+//! blocking, so `a_live_non_stdio_device_is_a_typed_gap` asserts only *this* runtime's side.
+//! Every device-taking arm — `io:put_chars/2` included — shares that one model.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape `tests/io_scan.rs`
@@ -416,6 +413,11 @@ fn a_non_live_device_atom_is_the_oracles_badarg() {
             "R = try io:format(no_such_io_device,\"x~n\",[]) catch error:E -> E end, \
              io:format(\"~p~n\",[R]), halt(0).",
         ),
+        (
+            "io:put_chars(no_such_io_device, ...)",
+            "R = try io:put_chars(no_such_io_device,\"x\") catch error:E -> E end, \
+             io:format(\"~p~n\",[R]), halt(0).",
+        ),
     ] {
         pinned_stdout(what, expr, b"badarg\n");
     }
@@ -433,6 +435,11 @@ fn a_non_device_argument_is_function_clause() {
     pinned_stdout(
         "io:write(1, hi)",
         "R = try io:write(1, hi) catch error:E -> E end, io:format(\"~p~n\",[R]), halt(0).",
+        b"function_clause\n",
+    );
+    pinned_stdout(
+        "io:put_chars(1, ...)",
+        "R = try io:put_chars(1, \"x\") catch error:E -> E end, io:format(\"~p~n\",[R]), halt(0).",
         b"function_clause\n",
     );
 }
@@ -466,6 +473,9 @@ fn a_live_non_stdio_device_is_a_typed_gap() {
     for (what, function) in [
         ("io:nl/1", "io:nl(io_device_probe)"),
         ("io:write/2", "io:write(io_device_probe, hi)"),
+        ("io:put_chars/2", "io:put_chars(io_device_probe, \"pp\")"),
+        ("io:fwrite/3", "io:fwrite(io_device_probe, \"pf~n\", [])"),
+        ("io:format/3", "io:format(io_device_probe, \"pg~n\", [])"),
     ] {
         let expr = format!(
             "P = spawn(fun() -> receive _ -> ok end end), register(io_device_probe, P), \
@@ -491,10 +501,9 @@ fn a_live_non_stdio_device_is_a_typed_gap() {
 // ---------------------------------------------------------------------------------------
 
 /// `io:put_chars/1` (the default device) and `io:put_chars/2` on a device this runtime
-/// serves still write their bytes to the output stream — the two floor keys that predate the
-/// device model.
+/// serves write their bytes to the output stream.
 #[test]
-fn io_put_chars_1_and_2_still_answer_ok_on_the_output_stream() {
+fn io_put_chars_1_and_2_answer_ok_on_the_output_stream() {
     pinned_stdout("io:put_chars/1", "io:put_chars(\"pc\"), halt(0).", b"pc");
     pinned_stdout(
         "io:put_chars(standard_io, ...)",
@@ -513,38 +522,14 @@ fn io_put_chars_1_and_2_still_answer_ok_on_the_output_stream() {
     );
 }
 
-/// **A documented residual, pinned rather than hidden.** `io:put_chars/2` predates the
-/// device model and still **accepts and ignores** its device, so
-/// `io:put_chars(standard_error, …)` lands on **stdout** here and on **stderr** on the
-/// oracle — this is not oracle parity and must not be read as such. The test fails loudly if
-/// the residual ever closes (the assertion would flip), which is exactly when the
-/// `io:put_chars/2` arm should join the device-honouring ones.
+/// `io:put_chars/2`'s device is **honoured**, exactly like the other device-taking arms:
+/// the registered `standard_error` device puts its bytes on **fd 2**, never on stdout.
 #[test]
-fn io_put_chars_2_still_ignores_its_device() {
-    let ours = beam_rt_eval("io:put_chars(standard_error,\"pe\"), halt(0).");
-    assert_ok("io:put_chars(standard_error, ...)", &ours);
-    assert_eq!(
-        ours.out, b"pe",
-        "the residual: io:put_chars/2 writes to its own output stream, not to fd 2"
-    );
-    assert!(
-        ours.err.is_empty(),
-        "the residual: nothing reaches stderr — got {:?}",
-        ours.err_str()
-    );
-
-    let Some(oracle) = support::require_oracle("io_device") else {
-        return;
-    };
-    let theirs = oracle_eval(&oracle, "io:put_chars(standard_error,\"pe\"), halt(0).");
-    assert_ok("oracle io:put_chars(standard_error, ...)", &theirs);
-    assert_eq!(
-        theirs.err, b"pe",
-        "the oracle honours the standard_error device: its bytes land on stderr"
-    );
-    assert!(
-        theirs.out.is_empty(),
-        "the oracle writes nothing to stdout for standard_error"
+fn io_put_chars_2_honours_the_standard_error_device() {
+    pinned_stderr(
+        "io:put_chars(standard_error, ...)",
+        "io:put_chars(standard_error,\"pe\"), halt(0).",
+        b"pe",
     );
 }
 
