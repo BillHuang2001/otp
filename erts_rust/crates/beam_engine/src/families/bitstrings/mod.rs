@@ -172,9 +172,13 @@ pub(super) fn goto_label(labels: &LabelMap, label: Label) -> Result<Step> {
 
 /// Read a segment *size* operand: a non-negative small integer.
 ///
-/// A register or a negative/oversized value cannot size a segment; the C
-/// `BS_GET_FIELD_SIZE` macro fails the match there, and this engine reports the
-/// same case as a typed [`crate::error::unsupported`] rather than guessing.
+/// The operand may be a literal in the segment list **or** a register holding a
+/// runtime size (the compiler emits `Operand::X(..)` for `<<V:N>>` with a computed
+/// `N`), which [`read_operand`] resolves — so a runtime-sized segment works
+/// unchanged. A size whose *value* is negative, oversized or not an integer cannot
+/// size a segment, and the C `BS_GET_FIELD_SIZE` macro fails the match there; this
+/// engine reports that case as a typed [`crate::error::unsupported`] rather than
+/// guessing.
 pub(super) fn read_size(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
@@ -429,7 +433,10 @@ pub(super) fn make_int(
 /// build side). A big-endian field is the natural MSB-first encoding; a
 /// little-endian field emits the least-significant 8-bit group first, leaving the
 /// final partial group (`nbits % 8` bits) left-aligned in its byte, exactly as
-/// `fmt_big_le` does with its trailing `*buf <<= 8 - offs`.
+/// `fmt_big_le` does with its trailing `*buf <<= 8 - offs`. That shared rule is
+/// [`BitWriter::push_le_groups`], the same one the machine-word writer
+/// [`BitWriter::push_uint_le`] uses, so a non-byte-multiple width is bit-granular
+/// however wide (or however big) the value is.
 pub(super) fn push_wide_int(
     writer: &mut BitWriter,
     value: Eterm,
@@ -442,17 +449,7 @@ pub(super) fn push_wide_int(
         twos_complement_bits(&mut bytes, nbits);
     }
     if little {
-        let rem = nbits % 8;
-        for j in 0..num_bytes {
-            let width = if j + 1 == num_bytes && rem != 0 {
-                rem
-            } else {
-                8
-            };
-            for k in (0..width).rev() {
-                writer.push_bit((bytes[j] >> k) & 1);
-            }
-        }
+        writer.push_le_groups(&bytes, nbits);
     } else {
         for k in (0..nbits).rev() {
             writer.push_bit((bytes[k / 8] >> (k % 8)) & 1);
@@ -465,9 +462,12 @@ pub(super) fn push_wide_int(
 /// integer term.
 ///
 /// A small integer contributes its `i64` magnitude; a bignum contributes its
-/// `ErtsDigit`s byte by byte. Anything else (a float, atom, …) cannot be an
-/// integer segment value and is a typed [`crate::error::unsupported`] — the C
-/// `erts_bs_put_integer_*` returns 0 there and the instruction fails the match.
+/// `ErtsDigit`s byte by byte. Anything else (a float, atom, …) is not an integer and
+/// is a typed [`crate::error::unsupported`] **defensive floor**: the `bs_create_bin`
+/// arm classifies a non-integer as the oracle's bare `badarg` *before* it reaches
+/// this point ([`super::create`]'s integer arm, C's `erts_bs_put_integer_be`/`_le`
+/// not-an-integer arm `erl_bits.c:952`/`:1152`), so the reason here names the value
+/// type rather than the segment type the caller already knows.
 fn integer_magnitude_bytes(value: Eterm, num_bytes: usize) -> Result<(bool, Vec<u8>)> {
     if let Some(v) = small_value(value) {
         let magnitude = v.unsigned_abs();
@@ -490,7 +490,7 @@ fn integer_magnitude_bytes(value: Eterm, num_bytes: usize) -> Result<(bool, Vec<
         return Ok((negative, bytes));
     }
     Err(error::unsupported(
-        "bs_create_bin: integer segment value is not an integer",
+        "bitstring: integer segment value is not an integer",
     ))
 }
 
@@ -545,13 +545,43 @@ impl BitWriter {
         }
     }
 
-    /// Append the low `width` bits of `value` in little-endian **byte** order
-    /// (`width` must be a multiple of 8): the least-significant byte goes first.
+    /// Append the low `width` bits of `value` in little-endian **bit** order
+    /// (`width` ≤ 64, the machine-word field width).
+    ///
+    /// The field is the value's little-endian bytes, each written most-significant
+    /// bit first, with the final partial group (`width % 8` bits) carrying the
+    /// value's remaining high bits left-aligned in the last byte — exactly
+    /// `fmt_small_le` (`erl_bits.c:686`) and the `restore_and_shift` placement
+    /// (`:891`) of an unaligned destination, so a **non-byte-multiple** width is
+    /// written bit-granularly rather than truncated to whole bytes. The rule itself
+    /// is shared with the bignum writer [`push_wide_int`] through
+    /// [`BitWriter::push_le_groups`].
     pub(super) fn push_uint_le(&mut self, value: u64, width: usize) {
-        for byte in 0..width / 8 {
-            let b = ((value >> (8 * byte)) & 0xFF) as u8;
-            for k in (0..8).rev() {
-                self.push_bit((b >> k) & 1);
+        let mut bytes = [0u8; 8];
+        for (j, byte) in bytes.iter_mut().enumerate() {
+            *byte = ((value >> (8 * j)) & 0xFF) as u8;
+        }
+        self.push_le_groups(&bytes, width);
+    }
+
+    /// Append `nbits` bits of the little-endian byte sequence `bytes` in
+    /// little-endian order: `bytes[0]`'s bits most-significant first, then
+    /// `bytes[1]`'s, and so on, with the final partial group (`nbits % 8` bits)
+    /// taking `bytes`'s **low** remaining bits most-significant first, so the last
+    /// byte ends up left-aligned in the field.
+    ///
+    /// This is the one place the little-endian rule lives: [`BitWriter::push_uint_le`]
+    /// (the machine-word writer) and [`push_wide_int`] (the `fmt_big_le` byte-array
+    /// writer, `erl_bits.c:812`) are the same rule over a `u64` and over a byte slice.
+    /// The caller guarantees `bytes` covers `nbits` bits (for `push_uint_le`:
+    /// `width <= 64`, i.e. within the eight bytes of a `u64`).
+    fn push_le_groups(&mut self, bytes: &[u8], nbits: usize) {
+        let rem = nbits % 8;
+        let nbytes = nbits.div_ceil(8).min(bytes.len());
+        for (j, &byte) in bytes.iter().enumerate().take(nbytes) {
+            let bits = if j + 1 == nbytes && rem != 0 { rem } else { 8 };
+            for k in (0..bits).rev() {
+                self.push_bit((byte >> k) & 1);
             }
         }
     }
@@ -620,5 +650,63 @@ mod tests {
         // The explicit flags keep their own bits, unaffected.
         assert_eq!(bit_of(&module, "little"), BSF_LITTLE);
         assert_eq!(bit_of(&module, "signed"), BSF_SIGNED);
+    }
+
+    /// A little-endian field is written **bit-granular**: the field is the value's
+    /// little-endian bytes, each written most-significant bit first, with the final
+    /// partial group carrying the value's remaining high bits left-aligned in the
+    /// last byte (`fmt_small_le`, `erl_bits.c:686`) — never truncated to whole bytes.
+    ///
+    /// Every expected vector is the live oracle's (system OTP 29.1.1 / erts-17.1, a
+    /// little-endian host): `<<16#0102:12/little>>` = `<<2,1:4>>`,
+    /// `<<16#0102:20/little>>` = `<<2,1,0:4>>`, `<<16#0102:4/little>>` = `<<2:4>>`,
+    /// `<<16#ABC:12/little>>` = `<<188,10:4>>`, `<<16#1ABC:12/little>>` =
+    /// `<<188,10:4>>` (bits 12..15 are outside the field), `<<(-1):12/little>>` =
+    /// `<<255,15:4>>`.
+    #[test]
+    fn push_uint_le_writes_a_bit_granular_little_endian_field() {
+        let le = |value: u64, width: usize| {
+            let mut writer = BitWriter::default();
+            writer.push_uint_le(value, width);
+            writer.finish()
+        };
+        assert_eq!(le(0x0102, 12), (vec![0x02, 0x10], 12));
+        assert_eq!(le(0x0102, 20), (vec![0x02, 0x01, 0x00], 20));
+        assert_eq!(le(0x0102, 4), (vec![0x20], 4));
+        assert_eq!(le(0x0102, 1), (vec![0x00], 1));
+        assert_eq!(le(0xABC, 12), (vec![0xBC, 0xA0], 12));
+        assert_eq!(le(0x1ABC, 12), (vec![0xBC, 0xA0], 12));
+        assert_eq!(le(0, 12), (vec![0x00, 0x00], 12));
+        assert_eq!(le(u64::MAX, 12), (vec![0xFF, 0xF0], 12));
+        assert_eq!(le(0x0102, 0), (vec![], 0));
+        // Byte-aligned widths stay byte-identical (regression guard).
+        assert_eq!(le(0x0102, 8), (vec![0x02], 8));
+        assert_eq!(le(0x0102, 16), (vec![0x02, 0x01], 16));
+        assert_eq!(le(0x0102, 24), (vec![0x02, 0x01, 0x00], 24));
+        assert_eq!(le(0x0102, 32), (vec![0x02, 0x01, 0x00, 0x00], 32));
+        assert_eq!(le(0x0102, 64), (vec![0x02, 0x01, 0, 0, 0, 0, 0, 0], 64));
+    }
+
+    /// The **byte-slice** form of the same rule, which the bignum/wide writer
+    /// ([`push_wide_int`], `fmt_big_le`) uses: `<<X:72/little>>` with
+    /// `X = (1 bsl 70) + 16#ABC` is `<<188,10,0,0,0,0,0,0,64>>` in the oracle, and a
+    /// narrow partial group takes the byte's **low** remaining bits (`X:20/little` is
+    /// `<<188,26,0:4>>`).
+    #[test]
+    fn push_le_groups_writes_a_wide_little_endian_field() {
+        let groups = |bytes: &[u8], nbits: usize| {
+            let mut writer = BitWriter::default();
+            writer.push_le_groups(bytes, nbits);
+            writer.finish()
+        };
+        // The little-endian magnitude bytes of `(1 bsl 70) + 16#ABC` and of
+        // `(1 bsl 70) + 16#1ABC` (byte 1 is `0x0A` / `0x1A`).
+        let y = [0xBC, 0x0A, 0, 0, 0, 0, 0, 0, 0x40];
+        let x = [0xBC, 0x1A, 0, 0, 0, 0, 0, 0, 0x40];
+        assert_eq!(groups(&y, 72), (y.to_vec(), 72));
+        assert_eq!(groups(&x, 20), (vec![0xBC, 0x1A, 0x00], 20));
+        assert_eq!(groups(&x, 12), (vec![0xBC, 0xA0], 12));
+        assert_eq!(groups(&x, 4), (vec![0xC0], 4));
+        assert_eq!(groups(&y, 0), (vec![], 0));
     }
 }

@@ -95,6 +95,7 @@ use crate::context::ExecutionContext;
 use crate::error;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
+use crate::predicates;
 use crate::Step;
 
 use super::{
@@ -218,6 +219,18 @@ fn assemble(
                 // (a negative value becomes its nbits-bit two's complement, `SUBc` on
                 // the build side). `erts_bs_put_integer_*` masks a **narrow** field the
                 // same way, so a bignum into a `<= 64`-bit field routes here too.
+                //
+                // A value that is neither a small nor a big is rejected with the bare
+                // `badarg` **at every field width** — C's `erts_bs_put_integer_be`/`_le`
+                // return 0 for a non-integer (`erl_bits.c:952-955`, `:1152-1155`) and
+                // the construct loop raises `$BS_FAIL_INFO(..., BADARG, am_type, arg)`.
+                // The classifier sits before the width dispatch so the wide/`little`
+                // route cannot turn a `<<3.14:72>>`-shaped operand into a coverage
+                // error (`<<3.14:72>>`, `<<a:72>>`, `<<[1]:72>>` are all
+                // `{error,badarg}` in the oracle, and so is every `<= 64`-bit field).
+                if !predicates::is_integer(value) {
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
+                }
                 if nbits > 64 || raw::big_parts_safe(value).is_some() {
                     push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0)?;
                 } else if let Some(raw_value) = small_value(value) {
@@ -228,8 +241,10 @@ fn assemble(
                         writer.push_uint(raw_value as u64, nbits);
                     }
                 } else {
-                    // `erts_bs_put_integer_*` rejects a genuine non-integer value
-                    // (a float, atom, …) (`erl_bits.c:926`) -> `BADARG`.
+                    // Unreachable: `predicates::is_integer` above is exactly
+                    // `small_value(..).is_some() || raw::big_parts_safe(..).is_some()`,
+                    // so a non-wide, non-bignum value here is a small. Kept as the
+                    // same `badarg` arm rather than a panic.
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
             }
@@ -410,3 +425,5 @@ mod tests;
 mod wide_tests;
 #[cfg(test)]
 mod float_seg_tests;
+#[cfg(test)]
+mod le_tests;
