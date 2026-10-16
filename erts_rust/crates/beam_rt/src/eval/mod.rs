@@ -93,6 +93,7 @@
 
 mod ast;
 mod bits;
+mod bits_decode;
 mod bits_match;
 mod parse;
 
