@@ -333,7 +333,7 @@ Current: **677 passing / 0 failing / 2 ignored** — **477** lib in-module (`#[c
 - `../CONTEXT.md` → crate-layer contracts, the seam types, the Stage-0…6 mapping (§7), wave-5 position.
 - `../../CONTEXT.md` → workspace contracts §1 A.4 (driver C ABI) / A.6 (CLI/config), §3 (error strategy).
 - `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §A (the two clean seams), §H (Stage 5).
-- `src/drivers/inet/CONTEXT.md` → the `tcp_inet` driver + `{packet, N}` framing (read + send paths) (child node).
+- `src/drivers/inet/CONTEXT.md` → the `tcp_inet` + `udp_inet` socket drivers + `{packet, N}` framing (read + send paths) (child node).
 - `src/abi/CONTEXT.md` → the driver C-ABI host layer (child node).
 - `../beam_process/CONTEXT.md` → `PortTable`/`PortId`, `Scheduler`/`ProcessTable`, the scheduler that drives ports.
 - Owed upstream (`../../CHANGE.md`, repo-root owned): the port-task model/`PortNotification`/`port_command`+`port_control`, the `line`/phase/`efile` drivers, the poller regular-file fallback + `FdDriver` EOF de-registration + `EINTR`-tolerant `poll`, the spawn driver (`StreamOptions`, the failed-spawn split + deferred `fork`/`execve` child, the duplex `{fd,N}` form), the bounded `driver_async` pool + round-driven completion + exactly-once release + `KeepAlive`, the sticky `ERL_DRV_USE`/`stop_select` callback, the defaulted driver seams (`take_exit_status`/`take_eof`/`has_pending_async`/`next_timeout`/`port_exit` + `PortExitReason`), the `outputv` write-path preference, `signal`, `cpu_time`, `ddll`.
