@@ -398,7 +398,7 @@ constructors only (no new error enum).
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` live in `space`, `policy`, `mso`, `heap_info`, `config`, `selection`,
-  `any_collector`, `immix_collector` (+ `src/immix_collector/grow_tests.rs`), `immix/tests.rs` and `live`;
+  `any_collector`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`), `immix/tests.rs` and `live`;
   `live`'s module proves `live`/`live_full` equal a real collection's `words_copied`/line need, incl. the
   mature generation (a relocating major; a refc binary counted on-heap only). **`copy.rs` and `collector.rs`
   carry no in-module tests** — the copier is pinned by `tests/copy_correctness.rs`, the driver by
