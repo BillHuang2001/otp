@@ -271,18 +271,43 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
         && !process.collector().mature_contains(ptr as *const Eterm)
 }
 
+/// The width of the blocks [`pointer_prefix_len`]'s fast path skips at a time: one 64-byte cache
+/// line of the backwards sweep, the cheapest unit for the run of `NIL` slots a 1024-slot
+/// register file mostly is.
+const POINTER_PREFIX_BLOCK: usize = 8;
+
 /// One past the last **pointer-bearing** word of `words` — the bound the full-root doors publish
 /// and classify a register file at.
 ///
 /// A word is pointer-bearing when it is boxed or a list ([`beam_term::prelude::is_boxed`] /
 /// [`beam_term::prelude::is_list`]); `NIL` and every other immediate is neither, so an
 /// all-immediate file (the common case: a 1024-slot FR file a process never wrote) answers `0`.
-/// The scan is backwards and stops at the last pointer word, so its cost is proportional to the
-/// immediate tail — and see the module docs' *pointer-bearing prefix* section for why bounding a
-/// register file there can never lose a root: every omitted word is an immediate, which is
-/// neither relocatable nor a reachability edge, and [`root_is_unscanned`] answers `false` for it.
+///
+/// The scan is backwards and skip-runs the immediate tail a [`POINTER_PREFIX_BLOCK`]-word block
+/// at a time: if the bitwise AND of a block's words still carries the `IMMED1` primary tag in
+/// its low two bits, then *every* word of the block carries that tag — a bit is set in the AND
+/// only if it is set in all of them — so all of them are immediates, none is boxed, none is a
+/// list, and the whole block may be skipped. Any other AND tag (a boxed or list pointer, or a
+/// bare header word, whose `HEADER` tag `0` `is_boxed` accepts) stops the fast path there, and
+/// the per-word loop below stays the **authority** on the returned index: it resolves such a
+/// block exactly as it always did, so the bound is identical for every input. Its cost is
+/// therefore proportional to the immediate tail, but paid a cache line at a time — and see the
+/// module docs' *pointer-bearing prefix* section for why bounding a register file there can
+/// never lose a root: every omitted word is an immediate, which is neither relocatable nor a
+/// reachability edge, and [`root_is_unscanned`] answers `false` for it.
 fn pointer_prefix_len(words: &[Eterm]) -> usize {
-    words
+    let mut end = words.len();
+    while end >= POINTER_PREFIX_BLOCK {
+        let block = &words[end - POINTER_PREFIX_BLOCK..end];
+        let tags = block
+            .iter()
+            .fold(!0usize, |acc, word| acc & word.raw());
+        if tags & beam_term::prelude::TAG_PRIMARY_MASK != beam_term::prelude::TAG_PRIMARY_IMMED1 {
+            break;
+        }
+        end -= POINTER_PREFIX_BLOCK;
+    }
+    words[..end]
         .iter()
         .rposition(|&word| beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word))
         .map_or(0, |index| index + 1)
@@ -2066,5 +2091,135 @@ mod tests {
             bounded.declared_words,
             bounded.published_words
         );
+    }
+
+    /// **The block skip is an optimization only: `pointer_prefix_len` returns the same bound
+    /// whether it skips an immediate run a block at a time or walks it word by word.**
+    ///
+    /// A block is skipped only when the AND of its words still carries the `IMMED1` primary
+    /// tag, which can happen only if *every* word of the block carries it. Every case below is
+    /// pinned twice — against an explicit expected index, and against the per-word scan (the
+    /// rule as it was before the block skip, kept here as the reference oracle) — and the mixed
+    /// pseudo-random family at the end covers all four primary tags together.
+    #[test]
+    fn the_block_skip_finds_the_same_pointer_prefix_as_the_per_word_scan() {
+        use beam_term::prelude::{is_boxed, is_immediate, is_list};
+
+        const BLOCK: usize = POINTER_PREFIX_BLOCK;
+        // `NIL`: the filler of an unwritten register slot, and the shape a file's tail is.
+        const IMM: Eterm = NIL;
+        // A `BOXED`-tagged word (primary tag 2) and a `LIST`-tagged one (tag 1): the two
+        // pointer-bearing shapes.
+        const BOXED: Eterm = Eterm::from_raw(0x2);
+        const LIST: Eterm = Eterm::from_raw(0x1);
+        // A bare header word (primary tag 0, value 0 — the C ABI's `THE_NON_VALUE`): not an
+        // immediate, and both mirrored C bit tricks accept it (`is_boxed` is `(x & 0x1) == 0`,
+        // `is_list` is `(x & 0x2) == 0`), so the block skip must stop at the block holding it
+        // and the per-word loop must resolve it exactly as it did before — a header word is not
+        // an immediate run, so it may not be skipped past.
+        const HEADER: Eterm = Eterm::from_raw(0);
+
+        assert!(is_immediate(IMM) && !is_boxed(IMM) && !is_list(IMM));
+        assert!(!is_immediate(BOXED) && is_boxed(BOXED) && !is_list(BOXED));
+        assert!(!is_immediate(LIST) && !is_boxed(LIST) && is_list(LIST));
+        assert!(!is_immediate(HEADER) && is_boxed(HEADER) && is_list(HEADER));
+
+        // The rule the block skip must not change: one past the last boxed-or-list word.
+        fn per_word(words: &[Eterm]) -> usize {
+            words
+                .iter()
+                .rposition(|&word| {
+                    beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word)
+                })
+                .map_or(0, |index| index + 1)
+        }
+
+        // An empty file, and every all-immediate file: nothing to publish — shorter than one
+        // block, exactly one block, and past several.
+        let empty: Vec<Eterm> = Vec::new();
+        assert_eq!(pointer_prefix_len(&empty), 0, "an empty file has no pointer word");
+        for len in 0..=(2 * BLOCK + 1) {
+            let file = vec![IMM; len];
+            assert_eq!(
+                pointer_prefix_len(&file),
+                0,
+                "an all-immediate file of {len} words publishes nothing"
+            );
+            assert_eq!(pointer_prefix_len(&file), per_word(&file));
+        }
+
+        // The only pointer-bearing word at the first index, the last, and the middle — for a
+        // file shorter than one block, exactly one block, and a multi-block file, so the
+        // pointer lands on a block boundary, inside a block and at the very end.
+        for len in [1, 2, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK, 3 * BLOCK] {
+            for index in [0, len - 1, len / 2] {
+                for pointer in [BOXED, LIST] {
+                    let mut file = vec![IMM; len];
+                    file[index] = pointer;
+                    assert_eq!(
+                        pointer_prefix_len(&file),
+                        index + 1,
+                        "the only pointer-bearing word is at {index} of {len}"
+                    );
+                    assert_eq!(pointer_prefix_len(&file), per_word(&file));
+                }
+            }
+        }
+
+        // The **last** pointer word wins: the block loop stops at the block holding it and the
+        // per-word loop resolves its exact index, so a list deep in a long immediate tail is
+        // never dropped.
+        let mut file = vec![IMM; 3 * BLOCK];
+        file[BLOCK - 1] = BOXED;
+        file[2 * BLOCK + 3] = LIST;
+        assert_eq!(pointer_prefix_len(&file), 2 * BLOCK + 4);
+        assert_eq!(pointer_prefix_len(&file), per_word(&file));
+
+        // A header word is not an immediate, so its block is never skipped and the per-word
+        // loop resolves it exactly as before (both `is_boxed` and `is_list` accept the
+        // value-invalid `HEADER` pattern).
+        for index in [0, BLOCK, 2 * BLOCK, 2 * BLOCK + 5] {
+            let header_at = |len: usize| {
+                let mut file = vec![IMM; len];
+                file[index] = HEADER;
+                file
+            };
+            for len in [index + 1, 3 * BLOCK] {
+                let file = header_at(len);
+                assert_eq!(
+                    pointer_prefix_len(&file),
+                    index + 1,
+                    "a header word at {index} of {len} bounds the prefix"
+                );
+                assert_eq!(pointer_prefix_len(&file), per_word(&file));
+            }
+        }
+
+        // An immediate tail shorter than one block is resolved by the per-word loop alone.
+        assert_eq!(pointer_prefix_len(&[BOXED, IMM, IMM]), 1);
+        assert_eq!(pointer_prefix_len(&[IMM, IMM, BOXED]), 3);
+        assert_eq!(pointer_prefix_len(&[IMM, BOXED, IMM]), 2);
+
+        // Deterministic pseudo-random files over all four primary tags.
+        let tags = [IMM, BOXED, LIST, HEADER];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        for case in 0..4_096usize {
+            let len = next() % (4 * BLOCK + 3);
+            let mut file = Vec::with_capacity(len);
+            for _ in 0..len {
+                file.push(tags[next() % tags.len()]);
+            }
+            assert_eq!(
+                pointer_prefix_len(&file),
+                per_word(&file),
+                "case {case}: the block skip changed the bound of {file:?}"
+            );
+        }
     }
 }
