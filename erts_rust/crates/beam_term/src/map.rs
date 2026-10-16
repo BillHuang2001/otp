@@ -308,6 +308,13 @@ fn serialize_node(
 /// [`erts_map_hash`], so its stored pair order equals the oracle's
 /// `maps:to_list/1` order. The pair order of `pairs` is irrelevant.
 ///
+/// The layout is decided by the **input** arity first, because deduplication can
+/// only shrink the key count: an input of at most [`MAP_SMALL_MAP_LIMIT`] pairs is
+/// necessarily a flat map, so it is deduplicated by [`eq`] (no hashing) and sorted
+/// straight into [`write_flatmap`] — one buffer, the same bytes the hash-dedup path
+/// used to produce with two. Only a larger input needs the hash map's
+/// [`erts_map_hash`] placement.
+///
 /// # Safety
 ///
 /// `hp` must point at [`map_words_capacity`]`(pairs.len())` exclusively-owned,
@@ -319,7 +326,29 @@ pub unsafe fn write_map(
     pairs: &[(Eterm, Eterm)],
     atoms: &AtomTable,
 ) -> TermResult<Eterm> {
-    // Collapse duplicates (last value wins) while hashing each key once.
+    if pairs.len() <= MAP_SMALL_MAP_LIMIT {
+        // Collapse duplicates (last value wins) into a single buffer. `eq` is the same
+        // predicate the hash path filters with, and `=:=` keys hash equally, so the
+        // deduplicated key set — and hence the produced bytes — is identical.
+        let mut flat: Vec<(Eterm, Eterm)> = Vec::with_capacity(pairs.len());
+        for &(key, value) in pairs {
+            match flat.iter_mut().find(|(k, _)| eq(*k, key, atoms)) {
+                Some(entry) => entry.1 = value,
+                None => flat.push((key, value)),
+            }
+        }
+        flat.sort_by(|a, b| cmp_flatmap_keys(a.0, b.0, atoms));
+        // SAFETY: the caller reserved `flatmap_size_words(pairs.len())` words, which is
+        // at least `flatmap_size_words(flat.len())` for the deduplicated length, and
+        // `flat.len() <= MAP_SMALL_MAP_LIMIT` — the preconditions `write_flatmap`
+        // documents. `pairs.len() == 0` yields the 3-word empty block, as before.
+        return Ok(unsafe { write_flatmap(hp, &flat) });
+    }
+
+    // More than `MAP_SMALL_MAP_LIMIT` input pairs: collapse duplicates (last value
+    // wins) while hashing each key once, then choose the layout from the *distinct*
+    // count. (Deduplication below the limit is the rare case here, so its extra
+    // collect stays on this branch.)
     let mut entries: Vec<(u64, Eterm, Eterm)> = Vec::with_capacity(pairs.len());
     for &(key, value) in pairs {
         let hash = erts_map_hash(key);
@@ -333,10 +362,6 @@ pub unsafe fn write_map(
     }
     let n = entries.len();
 
-    if n == 0 {
-        // SAFETY: the caller reserved `flatmap_size_words(0) == 3 <= capacity`.
-        return Ok(unsafe { write_flatmap(hp, &[]) });
-    }
     if n <= MAP_SMALL_MAP_LIMIT {
         entries.sort_by(|a, b| cmp_flatmap_keys(a.1, b.1, atoms));
         let flat: Vec<(Eterm, Eterm)> = entries.iter().map(|(_, k, v)| (*k, *v)).collect();
@@ -344,7 +369,6 @@ pub unsafe fn write_map(
         // is at least `flatmap_size_words(n)` for the deduplicated `n`.
         return Ok(unsafe { write_flatmap(hp, &flat) });
     }
-
     // Hash map. Lay the key/value cons cells at the base of the block in
     // *canonical* order — ascending by `swizzle_map_hash(hash)` (the C's
     // `hxnodecmp` order, a nibble reversal of the hash so the trie's per-level

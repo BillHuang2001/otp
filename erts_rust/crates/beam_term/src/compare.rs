@@ -135,7 +135,12 @@ use crate::tuple::{tuple_element, tuple_size};
 /// and the `big`/`float` helpers it dispatches to. Kept in its own file so the
 /// exact integer ↔ float algorithm stays under its own roof (and file-size budget).
 mod numbers;
+/// The map arm of the comparison — flat maps compare straight out of their storage
+/// (no allocation), everything else through the collecting fallback. See the module
+/// docs for the flat-map order precondition.
+mod maps;
 
+use maps::cmp_maps;
 use numbers::cmp_numbers;
 /// Ascending term-order rank of a [`TermClass`].
 ///
@@ -317,36 +322,16 @@ pub fn cmp_flatmap_keys(key_a: Eterm, key_b: Eterm, atoms: &AtomTable) -> Orderi
 /// therefore compared — first), which is exactly a lexicographic comparison of
 /// `(key-list, value-list)`; we reproduce that literally.
 ///
+/// Two flat maps whose keys-tuples are already in [`cmp_flatmap_keys`] order are
+/// compared straight out of their storage — no pair list, no sort, no allocation
+/// (see [`maps`]); everything else uses the collecting fallback. Both paths
+/// compare the same two sequences, so they cannot disagree.
+///
 /// Both operands are, by the caller invariant, well-formed maps. A malformed
 /// map (only reachable if the term was forged outside this crate) falls back to
 /// the deterministic [`fallback_cmp`] rather than panicking.
-fn cmp_maps(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
-    let (pa, pb) = match (
-        crate::map::map_pairs_flatmap_order(a, atoms),
-        crate::map::map_pairs_flatmap_order(b, atoms),
-    ) {
-        (Ok(pa), Ok(pb)) => (pa, pb),
-        _ => return fallback_cmp(a, b),
-    };
-    if pa.len() != pb.len() {
-        return pa.len().cmp(&pb.len());
-    }
-    for i in 0..pa.len() {
-        let ord = cmp_flatmap_keys(pa[i].0, pb[i].0, atoms);
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    for i in 0..pa.len() {
-        // SAFETY: the value sub-terms of two live, well-formed maps.
-        let ord = cmp_impl(pa[i].1, pb[i].1, atoms, exact);
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
-
+///
+/// (The body lives in [`maps::cmp_maps`], which this re-export routes to.)
 /// `erts_cmp_atoms` — lexicographic comparison of the atom *names*.
 ///
 /// The C compares a cached first-bytes ordinal, then `memcmp`s the names and

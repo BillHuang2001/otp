@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::error::{TermError, TermResult};
 
@@ -75,8 +76,16 @@ impl Atom {
 /// [`AtomSnapshot`] / [`AtomTable::appended_since`].
 #[derive(Debug)]
 pub struct AtomTable {
-    names: Vec<String>,
-    index: HashMap<String, Atom>,
+    /// Names in index order: `names[i]` names `Atom(i)`.
+    ///
+    /// The name is stored **once** as a shared, heap-allocated `Arc<str>`; `index` holds another
+    /// handle to the same allocation, so interning a novel name costs exactly one string
+    /// allocation. `Arc` (not `Rc`) keeps the table `Send + Sync`.
+    names: Vec<Arc<str>>,
+    /// Name → index. Keyed by `Arc<str>`, which `Borrow<str>`s and hashes as `str`, so
+    /// `index.get(name: &str)` is allocation-free and semantically identical to the previous
+    /// `HashMap<String, Atom>`.
+    index: HashMap<Arc<str>, Atom>,
     /// A process-global monotonic identity for *this* table. Only distinctness is
     /// meaningful — never the number itself, the ordering, or the spacing. It is not
     /// observable behaviour and is not part of any compatibility contract: the only
@@ -109,20 +118,45 @@ impl Default for AtomTable {
 }
 
 impl Clone for AtomTable {
-    /// Deep-copies the entries and the generation, but assigns a **fresh** identity.
+    /// **Deep-copies** the entries (a fresh name string per table entry) and the generation, but
+    /// assigns a **fresh** identity.
     ///
-    /// A clone is deliberately a *new* identity, not a copy of the original's: the two
-    /// tables start identical but may later diverge by independent appends, so a
-    /// snapshot of either must never validate against the other (see
-    /// [`AtomTable::appended_since`]). This is exactly what makes the witness sound
-    /// under copy-on-write (`Rc::make_mut`): a borrowed shared table that gets cloned
-    /// into a privately-mutated one can never make a stale image look valid. The cost
-    /// is a *conservative* false negative right after a clone — the caller rebuilds its
-    /// memo instead of reusing it — which is the correct trade for soundness.
+    /// Two independent reasons must hold together:
+    ///
+    /// * A clone is a *new* identity, not a copy of the original's: the two tables start
+    ///   identical but may later diverge by independent appends, so a snapshot of either must
+    ///   never validate against the other (see [`AtomTable::appended_since`]). This is exactly
+    ///   what makes the witness sound under copy-on-write (`Rc::make_mut`): a borrowed shared
+    ///   table that gets cloned into a privately-mutated one can never make a stale image look
+    ///   valid. The cost is a *conservative* false negative right after a clone — the caller
+    ///   rebuilds its memo instead of reusing it — which is the correct trade for soundness.
+    /// * The clone **owns** its name storage. Each entry is materialized as a fresh
+    ///   [`Arc<str>`] rather than sharing the source's, so a clone is genuinely independent and
+    ///   a clone of an `N`-atom table allocates `Θ(N)` (one string per entry, plus the two
+    ///   container reservations). Sharing the source's `Arc`s would make the clone `Θ(1)` and
+    ///   silently break `beam_rt/tests/atom_table_commit_alloc.rs` (and
+    ///   `beam_bifs/tests/decode_hot_path.rs`), which use `AtomTable::clone()` as a positive
+    ///   control that *must* scale with the table.
     fn clone(&self) -> AtomTable {
+        // One entry per name, in index order: `intern` assigns `Atom(names.len())` as it appends,
+        // so `names[i]` always names `Atom(i)` and the index can be rebuilt positionally — no
+        // re-hashing and no lookup. The two `with_capacity` reservations mean each container
+        // allocates once, so the whole clone is one string allocation per entry plus two.
+        debug_assert_eq!(
+            self.index.len(),
+            self.names.len(),
+            "the index holds exactly one entry per interned name"
+        );
+        let mut names: Vec<Arc<str>> = Vec::with_capacity(self.names.len());
+        let mut index: HashMap<Arc<str>, Atom> = HashMap::with_capacity(self.names.len());
+        for (position, name) in self.names.iter().enumerate() {
+            let owned: Arc<str> = Arc::from(&**name);
+            index.insert(Arc::clone(&owned), Atom(position as u32));
+            names.push(owned);
+        }
         AtomTable {
-            names: self.names.clone(),
-            index: self.index.clone(),
+            names,
+            index,
             instance: next_instance(),
             generation: self.generation,
         }
@@ -191,8 +225,13 @@ impl AtomTable {
             "atom table exhausted: {idx} exceeds the Atom index space"
         );
         let atom = Atom(idx as u32);
-        self.names.push(name.to_string());
-        self.index.insert(name.to_string(), atom);
+        // The name is stored **once**, in a heap-allocated shared string that both the ordered
+        // `names` view and the `index` map reference: one allocation (plus a refcount bump),
+        // not one `String` per container. A known name takes the `index.get` early return above
+        // and allocates nothing.
+        let shared: Arc<str> = Arc::from(name);
+        self.names.push(Arc::clone(&shared));
+        self.index.insert(shared, atom);
         // Exactly-one-per-append: this is the only place the table grows.
         self.generation = self.generation.wrapping_add(1);
         atom
@@ -267,7 +306,7 @@ impl AtomTable {
 
     /// The name of an interned atom, if the index is in range.
     pub fn name(&self, atom: Atom) -> Option<&str> {
-        self.names.get(atom.raw() as usize).map(String::as_str)
+        self.names.get(atom.raw() as usize).map(|name| &**name)
     }
 
     /// The number of interned atoms.
@@ -281,11 +320,20 @@ impl AtomTable {
     }
 
     /// Pre-intern a run of names in the given order.
+    ///
+    /// The two containers are reserved once from the iterator's size-hint lower bound (a lower
+    /// bound on the number of names about to be seen), so seeding a large table does not
+    /// repeatedly reallocate and rehash as it grows. [`AtomTable::new`] still starts empty, so
+    /// the single-`intern` path pays no eager reservation.
     pub fn seed<'a, I>(&mut self, ordered_names: I)
     where
         I: IntoIterator<Item = &'a str>,
     {
-        for name in ordered_names {
+        let names = ordered_names.into_iter();
+        let (lower, _) = names.size_hint();
+        self.names.reserve(lower);
+        self.index.reserve(lower);
+        for name in names {
             self.intern(name);
         }
     }
@@ -301,31 +349,39 @@ impl AtomTable {
     ///
     /// Lines starting with `#` are comments. For the two quoted forms the
     /// *printname* is the atom name; the `C-name` is only the C alias.
+    ///
+    /// A malformed source stops at the first bad line with [`TermError::InvalidAtomName`]; the
+    /// names of every preceding, well-formed line remain interned (a bad line interns none of
+    /// its own names — it is fully validated before its names are appended).
     pub fn seed_from_atom_names(&mut self, src: &str) -> TermResult<()> {
-        for line in src.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let rest = match trimmed.strip_prefix("atom") {
-                Some(rest)
-                    if rest.is_empty()
-                        || rest.as_bytes()[0].is_ascii_whitespace() =>
-                {
-                    rest
-                }
-                _ => return Err(TermError::InvalidAtomName),
-            };
-            let mut names = Vec::new();
-            parse_atom_list(rest, &mut names)?;
-            if names.is_empty() {
+        // Pass 1 — count (allocates nothing, interns nothing): the number of names that precede
+        // the first malformed line. Best effort, so the error it may carry is ignored here and
+        // reported authoritatively by the interning pass below. Reserving the whole run once
+        // keeps the two containers from growing (and rehashing) name by name.
+        let mut total = 0usize;
+        let _ = for_each_atom_line(src, |rest| {
+            let count = parse_atom_list(rest, |_| Ok(()))?;
+            if count == 0 {
                 return Err(TermError::InvalidAtomName);
             }
-            for name in names {
-                self.intern(&name);
+            total += count;
+            Ok(())
+        });
+        self.names.reserve(total);
+        self.index.reserve(total);
+
+        // Pass 2 — intern. Each line is validate-parsed *before* its names are appended, so a
+        // line that turns out malformed contributes nothing (the previous behaviour).
+        for_each_atom_line(src, |rest| {
+            if parse_atom_list(rest, |_| Ok(()))? == 0 {
+                return Err(TermError::InvalidAtomName);
             }
-        }
-        Ok(())
+            parse_atom_list(rest, |name| {
+                self.intern(name);
+                Ok(())
+            })?;
+            Ok(())
+        })
     }
 
     /// Convenience: a table seeded from an `atom.names` source.
@@ -376,13 +432,44 @@ impl AtomTable {
     }
 }
 
-/// Tokenise the names on one `atom ...` line, appending them to `out`.
+/// Run `visit_line` on the body of each `atom ...` declaration line of `src`, in file order.
 ///
-/// `rest` must be ASCII (`atom.names` guarantees 7-bit ASCII).
-fn parse_atom_list(rest: &str, out: &mut Vec<String>) -> TermResult<()> {
+/// Blank and `#`-comment lines are skipped; the `atom` keyword prefix is validated (the keyword
+/// must be followed by whitespace or end-of-line). Stops at the first malformed line with
+/// [`TermError::InvalidAtomName`]. This is the one place the `atom.names` line structure lives,
+/// shared by [`AtomTable::seed_from_atom_names`]'s counting and interning passes.
+fn for_each_atom_line(
+    src: &str,
+    mut visit_line: impl FnMut(&str) -> TermResult<()>,
+) -> TermResult<()> {
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let rest = match trimmed.strip_prefix("atom") {
+            Some(rest) if rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace() => rest,
+            _ => return Err(TermError::InvalidAtomName),
+        };
+        visit_line(rest)?;
+    }
+    Ok(())
+}
+
+/// Tokenise the names on one `atom ...` line, calling `visit` with each name's printname slice
+/// in file order and returning how many names it visited.
+///
+/// `rest` must be ASCII (`atom.names` guarantees 7-bit ASCII). Handing each printname to a
+/// callback (rather than pushing an owned `String` into a `Vec`) lets the caller intern it
+/// directly, so seeding allocates no throw-away buffer.
+fn parse_atom_list(
+    rest: &str,
+    mut visit: impl FnMut(&str) -> TermResult<()>,
+) -> TermResult<usize> {
     let bytes = rest.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    let mut count = 0usize;
 
     while i < len {
         while i < len && bytes[i].is_ascii_whitespace() {
@@ -402,7 +489,8 @@ fn parse_atom_list(rest: &str, out: &mut Vec<String>) -> TermResult<()> {
             if i >= len {
                 return Err(TermError::InvalidAtomName);
             }
-            out.push(rest[start..i].to_string());
+            visit(&rest[start..i])?;
+            count += 1;
             i += 1; // closing quote
         } else {
             // <atom-name> | <C-name> "=" "'" <printname> "'"
@@ -413,7 +501,6 @@ fn parse_atom_list(rest: &str, out: &mut Vec<String>) -> TermResult<()> {
             if start == i {
                 return Err(TermError::InvalidAtomName);
             }
-            let bare = &rest[start..i];
             if i < len && bytes[i] == b'=' {
                 i += 1; // '='
                 if i >= len || bytes[i] != b'\'' {
@@ -427,15 +514,17 @@ fn parse_atom_list(rest: &str, out: &mut Vec<String>) -> TermResult<()> {
                 if i >= len {
                     return Err(TermError::InvalidAtomName);
                 }
-                out.push(rest[s..i].to_string());
+                visit(&rest[s..i])?;
+                count += 1;
                 i += 1; // closing quote
             } else {
-                out.push(bare.to_string());
+                visit(&rest[start..i])?;
+                count += 1;
             }
         }
     }
 
-    Ok(())
+    Ok(count)
 }
 
 #[cfg(test)]
