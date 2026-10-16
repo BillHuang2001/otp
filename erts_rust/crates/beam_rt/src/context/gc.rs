@@ -57,6 +57,12 @@
 //! [`any_root_is_unscanned`], for [`publish_roots_full`] and for [`scatter_roots_full`]. The
 //! Erlang stack is always published whole, because there are no frame liveness maps.
 //!
+//! [`pointer_prefix_len`] finds that prefix with a backwards **block sweep**: a
+//! [`POINTER_PREFIX_BLOCK`]-word block whose bitwise-ANDed words still carry the `IMMED1` primary
+//! tag is wholly immediate and is skipped on one cache-line read, and the block that stops the
+//! sweep is the only one resolved word by word — the per-word fallback therefore examines at most
+//! one block (or a sub-block tail, for a file whose blocks were all skipped), never the file.
+//!
 //! The bound keeps every live root by construction: it is "last pointer-bearing index + 1", so
 //! a live or boxed word at a high index is always included, and only a tail that is *already*
 //! immediate is left out — an FR file a process never wrote (1024 `NIL` slots) publishes
@@ -276,46 +282,96 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
 /// register file mostly is.
 const POINTER_PREFIX_BLOCK: usize = 8;
 
+/// Whether `word` is a word a copying collector must treat as a **pointer**: a boxed term or a
+/// cons cell ([`beam_term::prelude::is_boxed`] / [`beam_term::prelude::is_list`]). Every other
+/// primary tag — `IMMED1` only — is an immediate, which is neither relocated nor a reachability
+/// edge.
+fn is_pointer_bearing(word: Eterm) -> bool {
+    beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word)
+}
+
 /// One past the last **pointer-bearing** word of `words` — the bound the full-root doors publish
 /// and classify a register file at.
 ///
-/// A word is pointer-bearing when it is boxed or a list ([`beam_term::prelude::is_boxed`] /
-/// [`beam_term::prelude::is_list`]); `NIL` and every other immediate is neither, so an
-/// all-immediate file (the common case: a 1024-slot FR file a process never wrote) answers `0`.
+/// A word is pointer-bearing when it is boxed or a list ([`is_pointer_bearing`]); `NIL` and every
+/// other immediate is neither, so an all-immediate file (the common case: a 1024-slot FR file a
+/// process never wrote) answers `0`.
 ///
-/// The scan is backwards and skip-runs the immediate tail a [`POINTER_PREFIX_BLOCK`]-word block
-/// at a time: if the bitwise AND of a block's words still carries the `IMMED1` primary tag in
-/// its low two bits, then *every* word of the block carries that tag — a bit is set in the AND
-/// only if it is set in all of them — so all of them are immediates, none is boxed, none is a
-/// list, and the whole block may be skipped. Any other AND tag (a boxed or list pointer, or a
-/// bare header word, whose `HEADER` tag `0` `is_boxed` accepts) stops the fast path there, and
-/// the per-word loop below stays the **authority** on the returned index: it resolves such a
-/// block exactly as it always did, so the bound is identical for every input. Its cost is
-/// therefore proportional to the immediate tail, but paid a cache line at a time — and see the
-/// module docs' *pointer-bearing prefix* section for why bounding a register file there can
-/// never lose a root: every omitted word is an immediate, which is neither relocatable nor a
+/// The sweep is backwards and block-wise: while the bitwise AND of a [`POINTER_PREFIX_BLOCK`]-word
+/// block's words still carries the `IMMED1` primary tag in its low two bits, *every* word of the
+/// block carries that tag — a bit is set in the AND only if it is set in all of them — so all of
+/// them are immediates, none is boxed, none is a list, and the whole block is skipped on one
+/// 64-byte read. The block is taken as a `&[Eterm; POINTER_PREFIX_BLOCK]` through `TryInto`, so
+/// its eight word reads carry no per-element bounds check, and the eight raw words are ANDed in a
+/// short unrolled loop.
+///
+/// That AND test is **exactly** the pointer-bearing test: `IMMED1` is the only primary tag that is
+/// neither boxed nor a list, so a tag other than `IMMED1` means some word of the block has a low
+/// tag bit clear (an AND bit is clear only if it is clear in some word) and is therefore
+/// pointer-bearing. The block that stops the sweep thus holds at least one pointer-bearing word,
+/// and every word above it — the whole skipped tail — is an immediate, so the file's last
+/// pointer-bearing word lies **inside that block**. The single fallback `rposition` is therefore
+/// bounded to it: it scans the block that stopped the sweep, or — when *every* whole block was
+/// skipped — the `0..[`POINTER_PREFIX_BLOCK`]`-word tail left in front of it. The returned index
+/// is identical to a full per-word scan's for every input, while the words the fallback examines
+/// are at most [`POINTER_PREFIX_BLOCK`] instead of the whole file, at any file length.
+///
+/// See the module docs' *pointer-bearing prefix* section for why bounding a register file there
+/// can never lose a root: every omitted word is an immediate, which is neither relocatable nor a
 /// reachability edge, and [`root_is_unscanned`] answers `false` for it.
 fn pointer_prefix_len(words: &[Eterm]) -> usize {
+    #[cfg(test)]
+    prefix_counters::note_call();
     let mut end = words.len();
     while end >= POINTER_PREFIX_BLOCK {
-        let block = &words[end - POINTER_PREFIX_BLOCK..end];
-        let tags = block
-            .iter()
-            .fold(!0usize, |acc, word| acc & word.raw());
+        // `words[end - POINTER_PREFIX_BLOCK..end]` is always exactly one block long here, so the
+        // array conversion is infallible; the `break` arm is unreachable and exists only to keep
+        // the function panic-free.
+        let Ok(block) =
+            <&[Eterm; POINTER_PREFIX_BLOCK]>::try_from(&words[end - POINTER_PREFIX_BLOCK..end])
+        else {
+            break;
+        };
+        // The block's eight raw words in one AND. A set bit in the result is set in every word, so
+        // the `IMMED1` tag surviving means the whole block is immediate.
+        let mut tags = !0usize;
+        let mut offset = 0;
+        while offset < POINTER_PREFIX_BLOCK {
+            tags &= block[offset].raw();
+            offset += 1;
+        }
         if tags & beam_term::prelude::TAG_PRIMARY_MASK != beam_term::prelude::TAG_PRIMARY_IMMED1 {
+            // This block stopped the sweep, so it holds the file's last pointer-bearing word.
             break;
         }
+        #[cfg(test)]
+        prefix_counters::note_block_skipped();
         end -= POINTER_PREFIX_BLOCK;
     }
-    words[..end]
+    // `end` is the exclusive end of the only region that can still hold the answer: the block that
+    // stopped the sweep (`end >= POINTER_PREFIX_BLOCK` — and that block holds a pointer-bearing
+    // word, so `rposition` always finds one there and the `map_or` default is unreachable; a test
+    // pins that), or the sub-block tail in front of a file whose whole blocks were all skipped
+    // (`end < POINTER_PREFIX_BLOCK`).
+    let start = end.saturating_sub(POINTER_PREFIX_BLOCK);
+    #[cfg(test)]
+    {
+        if end >= POINTER_PREFIX_BLOCK {
+            prefix_counters::note_block_bounded_fallback();
+        } else {
+            prefix_counters::note_tail_bounded_fallback(end);
+        }
+    }
+    words[start..end]
         .iter()
-        .rposition(|&word| beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word))
-        .map_or(0, |index| index + 1)
+        .rposition(|&word| is_pointer_bearing(word))
+        .map_or(0, |index| start + index + 1)
 }
 
 /// The `(x_count, fr_count)` bound the full-root doors hand the machine's two register files over
-/// at: each file's [`pointer_prefix_len`]. The Erlang stack is published whole — it has no
-/// pointer-only prefix property, because every slot of a live frame is a root.
+/// at: each file's [`pointer_prefix_len`], computed once per file per door call. The Erlang stack
+/// is published whole — it has no pointer-only prefix property, because every slot of a live
+/// frame is a root.
 fn machine_root_bounds(roots: &RootSet<'_>) -> (usize, usize) {
     (pointer_prefix_len(roots.x), pointer_prefix_len(roots.fr))
 }
@@ -569,10 +625,10 @@ fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> 
 /// machine's FR file and a collection here **would** dangle a live float register. The
 /// [`module_may_be_collected`] test on the call site's module is therefore the only thing that
 /// keeps this door sound for float code — and it is this door's **alone**: the full doors
-/// ([`ensure_heap_full`], [`alloc_words_rooted`]) publish the FR file itself
-/// ([`publish_roots_full`]) and apply no float guard at all (see the module docs' float-guard
-/// section). The engine reaches only the full door, so this narrow form is not on the engine's
-/// path today.
+/// ([`ensure_heap_full`], [`alloc_words_rooted`]) publish each register file's pointer-bearing
+/// prefix, the FR file's included ([`publish_roots_full`]), and apply no float guard at all (see
+/// the module docs' float-guard section). The engine reaches only the full door, so this narrow
+/// form is not on the engine's path today.
 ///
 /// # Growth
 ///
@@ -838,10 +894,11 @@ pub(crate) fn ensure_heap_full(
         return Ok(());
     }
     // The door needs a caller module to name at all — a fun entry, or the `-eval` evaluator,
-    // has none — and is otherwise left alone. This is **not** a float guard: this door
-    // publishes the machine's whole FR file ([`publish_roots_full`]), so a live float register
-    // is relocated like any other root and a float-using call site collects exactly like a
-    // float-free one (see the module docs' float-guard section).
+    // has none — and is otherwise left alone. This is **not** a float guard: this door publishes
+    // each register file's pointer-bearing prefix ([`publish_roots_full`]), the FR file's
+    // included, so a live float register — which holds a boxed float term, hence lies inside the
+    // prefix — is relocated like any other root and a float-using call site collects exactly like
+    // a float-free one (see the module docs' float-guard section).
     if ctx.current_module.is_none() {
         return Ok(());
     }
@@ -1764,6 +1821,105 @@ pub(crate) mod valve_counters {
     }
 }
 
+/// **Test-only** deterministic tallies for [`pointer_prefix_len`]'s block sweep.
+///
+/// The sweep's cost is a question about two structural facts — **how many whole blocks it skipped
+/// without resolving their words individually** and **how many words the per-word fallback had to
+/// examine** — never about timings. These counters answer exactly those questions, so a test can
+/// pin the sweep's shape (a fallback of at most one block, block-bounded whenever the fast path
+/// stopped on a block) instead of a wall clock.
+///
+/// They follow the same convention as [`valve_counters`]: a `#[cfg(test)] thread_local!` `Cell`
+/// with a reset/read accessor, so the tallies exist **only in test builds** (a release binary pays
+/// nothing) and a test reads its own thread's tally between a reset and the load it measures.
+#[cfg(test)]
+pub(crate) mod prefix_counters {
+    use std::cell::Cell;
+
+    /// One thread's tallies since the last [`reset`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct PrefixCounts {
+        /// Calls to [`super::pointer_prefix_len`].
+        pub(crate) calls: usize,
+        /// Whole [`super::POINTER_PREFIX_BLOCK`]-word blocks the fast path skipped: their eight
+        /// words were ANDed together and no one of them was resolved on its own.
+        pub(crate) blocks_skipped: usize,
+        /// Words the per-word fallback `rposition` examined, summed over every call — the
+        /// [`super::POINTER_PREFIX_BLOCK`]-word block that stopped the fast path, or the
+        /// sub-block tail left when every whole block was skipped.
+        pub(crate) fallback_words: usize,
+        /// Calls whose fallback was **block-bounded**: the fast path stopped on a block, so the
+        /// scan covered that one block plus its offset.
+        pub(crate) block_bounded: usize,
+        /// Calls whose fallback was **tail-bounded**: every whole block was skipped, so only the
+        /// `0..POINTER_PREFIX_BLOCK`-word tail was scanned.
+        pub(crate) tail_bounded: usize,
+    }
+
+    impl PrefixCounts {
+        /// The all-zero tally (the `const` form the thread-local's initialiser needs).
+        pub(crate) const ZERO: PrefixCounts = PrefixCounts {
+            calls: 0,
+            blocks_skipped: 0,
+            fallback_words: 0,
+            block_bounded: 0,
+            tail_bounded: 0,
+        };
+    }
+
+    thread_local! {
+        /// This thread's tallies since the last [`reset`].
+        static COUNTERS: Cell<PrefixCounts> = const { Cell::new(PrefixCounts::ZERO) };
+    }
+
+    /// This thread's tallies since the last [`reset`].
+    pub(crate) fn snapshot() -> PrefixCounts {
+        COUNTERS.with(Cell::get)
+    }
+
+    /// Zeroes this thread's tallies (a measurement's "before" reading).
+    pub(crate) fn reset() {
+        COUNTERS.with(|counters| counters.set(PrefixCounts::ZERO));
+    }
+
+    /// Records one [`super::pointer_prefix_len`] call.
+    pub(crate) fn note_call() {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.calls += 1;
+            counters.set(value);
+        });
+    }
+
+    /// Records one whole block the fast path skipped as all-immediate.
+    pub(crate) fn note_block_skipped() {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.blocks_skipped += 1;
+            counters.set(value);
+        });
+    }
+
+    /// Records a fallback bounded to the block that stopped the fast path.
+    pub(crate) fn note_block_bounded_fallback() {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.block_bounded += 1;
+            value.fallback_words += super::POINTER_PREFIX_BLOCK;
+            counters.set(value);
+        });
+    }
+
+    /// Records a fallback bounded to a `words`-word sub-block tail.
+    pub(crate) fn note_tail_bounded_fallback(words: usize) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.tail_bounded += 1;
+            value.fallback_words += words;
+            counters.set(value);
+        });
+    }
+}
 #[cfg(test)]
 mod tests {
     //! Unit tests for the mechanical pieces of the adoption: the float guard scan, the safe
@@ -2093,14 +2249,20 @@ mod tests {
         );
     }
 
-    /// **The block skip is an optimization only: `pointer_prefix_len` returns the same bound
-    /// whether it skips an immediate run a block at a time or walks it word by word.**
+    /// **The block sweep is an optimization only: `pointer_prefix_len` returns the same bound
+    /// whether it skips an immediate run a block at a time or walks it word by word — and the
+    /// word-by-word fallback never scans more than one block.**
     ///
     /// A block is skipped only when the AND of its words still carries the `IMMED1` primary
-    /// tag, which can happen only if *every* word of the block carries it. Every case below is
-    /// pinned twice — against an explicit expected index, and against the per-word scan (the
-    /// rule as it was before the block skip, kept here as the reference oracle) — and the mixed
-    /// pseudo-random family at the end covers all four primary tags together.
+    /// tag, which can happen only if *every* word of the block carries it; the block that stops
+    /// the sweep then holds the file's last boxed-or-list word, so the fallback is bounded to it.
+    /// Every case below is pinned twice — against an explicit expected index, and against the
+    /// per-word scan (the independent reference implementation) — **and** against the sweep's own
+    /// counters, which pin that fallback's width. The 8-word-aligned families (exhaustive over one
+    /// block's tag patterns, then exhaustive over the natural indices, then pseudo-random) cover
+    /// the two ends of the sweep: a pointer at index 0, in the middle, at the start of the last
+    /// block and in the very last word of the file, where only the last block carries one. The
+    /// mixed pseudo-random family over all four primary tags covers files of every length.
     #[test]
     fn the_block_skip_finds_the_same_pointer_prefix_as_the_per_word_scan() {
         use beam_term::prelude::{is_boxed, is_immediate, is_list};
@@ -2114,9 +2276,9 @@ mod tests {
         const LIST: Eterm = Eterm::from_raw(0x1);
         // A bare header word (primary tag 0, value 0 — the C ABI's `THE_NON_VALUE`): not an
         // immediate, and both mirrored C bit tricks accept it (`is_boxed` is `(x & 0x1) == 0`,
-        // `is_list` is `(x & 0x2) == 0`), so the block skip must stop at the block holding it
-        // and the per-word loop must resolve it exactly as it did before — a header word is not
-        // an immediate run, so it may not be skipped past.
+        // `is_list` is `(x & 0x2) == 0`), so the sweep must stop at the block holding it and the
+        // per-word fallback must resolve it exactly as before — a header word is not an immediate
+        // run, so it may not be skipped past.
         const HEADER: Eterm = Eterm::from_raw(0);
 
         assert!(is_immediate(IMM) && !is_boxed(IMM) && !is_list(IMM));
@@ -2124,7 +2286,7 @@ mod tests {
         assert!(!is_immediate(LIST) && !is_boxed(LIST) && is_list(LIST));
         assert!(!is_immediate(HEADER) && is_boxed(HEADER) && is_list(HEADER));
 
-        // The rule the block skip must not change: one past the last boxed-or-list word.
+        // The rule the block sweep must not change: one past the last boxed-or-list word.
         fn per_word(words: &[Eterm]) -> usize {
             words
                 .iter()
@@ -2134,18 +2296,57 @@ mod tests {
                 .map_or(0, |index| index + 1)
         }
 
+        // One call, with the sweep's **structure** pinned by its counters: exactly one fallback
+        // scan, never wider than one block — and exactly one block, scanned from the start of
+        // that block, whenever the fast path stopped on one.
+        fn checked(file: &[Eterm]) -> usize {
+            prefix_counters::reset();
+            let bound = pointer_prefix_len(file);
+            let counts = prefix_counters::snapshot();
+            assert_eq!(counts.calls, 1, "one sweep per call; {counts:?}");
+            assert_eq!(
+                counts.block_bounded + counts.tail_bounded,
+                1,
+                "every call ends in exactly one fallback scan; {counts:?}"
+            );
+            if counts.block_bounded == 1 {
+                assert_eq!(
+                    counts.fallback_words, BLOCK,
+                    "the fast path stopped on a block, so the fallback scanned exactly that one \
+                     block and no more; {counts:?}"
+                );
+                assert!(
+                    (counts.blocks_skipped + 1) * BLOCK <= file.len(),
+                    "the block that stopped the sweep lies inside the file; {counts:?}"
+                );
+            } else {
+                assert_eq!(
+                    counts.fallback_words,
+                    file.len() % BLOCK,
+                    "no block stopped the sweep, so only the sub-block tail was scanned; \
+                     {counts:?}"
+                );
+                assert_eq!(
+                    counts.blocks_skipped,
+                    file.len() / BLOCK,
+                    "every whole block was skipped; {counts:?}"
+                );
+            }
+            bound
+        }
+
         // An empty file, and every all-immediate file: nothing to publish — shorter than one
         // block, exactly one block, and past several.
         let empty: Vec<Eterm> = Vec::new();
-        assert_eq!(pointer_prefix_len(&empty), 0, "an empty file has no pointer word");
+        assert_eq!(checked(&empty), 0, "an empty file has no pointer word");
         for len in 0..=(2 * BLOCK + 1) {
             let file = vec![IMM; len];
             assert_eq!(
-                pointer_prefix_len(&file),
+                checked(&file),
                 0,
                 "an all-immediate file of {len} words publishes nothing"
             );
-            assert_eq!(pointer_prefix_len(&file), per_word(&file));
+            assert_eq!(checked(&file), per_word(&file));
         }
 
         // The only pointer-bearing word at the first index, the last, and the middle — for a
@@ -2157,26 +2358,69 @@ mod tests {
                     let mut file = vec![IMM; len];
                     file[index] = pointer;
                     assert_eq!(
-                        pointer_prefix_len(&file),
+                        checked(&file),
                         index + 1,
                         "the only pointer-bearing word is at {index} of {len}"
                     );
-                    assert_eq!(pointer_prefix_len(&file), per_word(&file));
+                    assert_eq!(checked(&file), per_word(&file));
                 }
             }
         }
 
-        // The **last** pointer word wins: the block loop stops at the block holding it and the
-        // per-word loop resolves its exact index, so a list deep in a long immediate tail is
-        // never dropped.
+        // The 8-word-aligned family, exhaustively: a whole-block file whose **last** block carries
+        // every one of the 4^8 tag patterns (the two leading blocks stay all-immediate, so the
+        // sweep must skip them and stop on the last one) — except the all-zero pattern, where it
+        // skips all three and falls back to the empty tail. A pattern with a pointer in the
+        // block's first slot and one with a pointer only in the file's very last word are both in
+        // here, which is exactly the pair of ends the bounded fallback exists for.
+        for pattern in 0..(1usize << (2 * BLOCK)) {
+            let mut file = vec![IMM; 3 * BLOCK];
+            for index in 0..BLOCK {
+                file[2 * BLOCK + index] = match (pattern >> (2 * index)) & 0x3 {
+                    0 => IMM,
+                    1 => BOXED,
+                    2 => LIST,
+                    _ => HEADER,
+                };
+            }
+            let expected = per_word(&file);
+            assert_eq!(
+                checked(&file),
+                expected,
+                "tag pattern {pattern:#06x} of the last block changed the bound"
+            );
+        }
+
+        // The same, one pointer at a time and on whole-block files only: index 0, the middle, the
+        // start of the last block, and the very last word — the last two are the cases where only
+        // the final block carries a pointer.
+        for blocks in 1..=4usize {
+            let len = blocks * BLOCK;
+            for index in [0, len / 2, len - BLOCK, len - 1] {
+                for pointer in [BOXED, LIST] {
+                    let mut file = vec![IMM; len];
+                    file[index] = pointer;
+                    assert_eq!(
+                        checked(&file),
+                        index + 1,
+                        "the only pointer-bearing word is at {index} of {len}"
+                    );
+                    assert_eq!(checked(&file), per_word(&file));
+                }
+            }
+        }
+
+        // The **last** pointer word wins: the sweep stops at the block holding it and the
+        // fallback resolves its exact index, so a list deep in a long immediate tail is never
+        // dropped.
         let mut file = vec![IMM; 3 * BLOCK];
         file[BLOCK - 1] = BOXED;
         file[2 * BLOCK + 3] = LIST;
-        assert_eq!(pointer_prefix_len(&file), 2 * BLOCK + 4);
-        assert_eq!(pointer_prefix_len(&file), per_word(&file));
+        assert_eq!(checked(&file), 2 * BLOCK + 4);
+        assert_eq!(checked(&file), per_word(&file));
 
         // A header word is not an immediate, so its block is never skipped and the per-word
-        // loop resolves it exactly as before (both `is_boxed` and `is_list` accept the
+        // fallback resolves it exactly as before (both `is_boxed` and `is_list` accept the
         // value-invalid `HEADER` pattern).
         for index in [0, BLOCK, 2 * BLOCK, 2 * BLOCK + 5] {
             let header_at = |len: usize| {
@@ -2187,20 +2431,21 @@ mod tests {
             for len in [index + 1, 3 * BLOCK] {
                 let file = header_at(len);
                 assert_eq!(
-                    pointer_prefix_len(&file),
+                    checked(&file),
                     index + 1,
                     "a header word at {index} of {len} bounds the prefix"
                 );
-                assert_eq!(pointer_prefix_len(&file), per_word(&file));
+                assert_eq!(checked(&file), per_word(&file));
             }
         }
 
-        // An immediate tail shorter than one block is resolved by the per-word loop alone.
-        assert_eq!(pointer_prefix_len(&[BOXED, IMM, IMM]), 1);
-        assert_eq!(pointer_prefix_len(&[IMM, IMM, BOXED]), 3);
-        assert_eq!(pointer_prefix_len(&[IMM, BOXED, IMM]), 2);
+        // An immediate tail shorter than one block is resolved by the per-word fallback alone.
+        assert_eq!(checked(&[BOXED, IMM, IMM]), 1);
+        assert_eq!(checked(&[IMM, IMM, BOXED]), 3);
+        assert_eq!(checked(&[IMM, BOXED, IMM]), 2);
 
-        // Deterministic pseudo-random files over all four primary tags.
+        // Deterministic pseudo-random files over all four primary tags, in both shapes: an
+        // arbitrary length, and a whole-block one.
         let tags = [IMM, BOXED, LIST, HEADER];
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move || {
@@ -2216,10 +2461,21 @@ mod tests {
                 file.push(tags[next() % tags.len()]);
             }
             assert_eq!(
-                pointer_prefix_len(&file),
+                checked(&file),
                 per_word(&file),
-                "case {case}: the block skip changed the bound of {file:?}"
+                "case {case}: the block sweep changed the bound of {file:?}"
             );
         }
-    }
-}
+        for case in 0..4_096usize {
+            let len = (next() % 4 + 1) * BLOCK;
+            let mut file = Vec::with_capacity(len);
+            for _ in 0..len {
+                file.push(tags[next() % tags.len()]);
+            }
+            assert_eq!(
+                checked(&file),
+                per_word(&file),
+                "aligned case {case}: the block sweep changed the bound of {file:?}"
+            );
+        }
+    }}

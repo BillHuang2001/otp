@@ -593,6 +593,72 @@ mod tests {
             "the builder owns its own clone of the handle"
         );
     }
+
+    /// The runtime's per-pid **mailbox scan state** map — `Runtime::mailboxes`, the map
+    /// [`RuntimeContext::mailbox_parts`](crate::context::RuntimeContext) resolves every receive
+    /// against — is a `ProcessId`-keyed map over the crate's own deterministic
+    /// [`crate::hasher`], not `RandomState`'s SipHash (the same substitution the GC descent latch
+    /// pins in `runtime::gc::tests`).
+    ///
+    /// The soundness argument is what is pinned here, never a clock: the map is only ever
+    /// `get`/`entry`/`insert`ed by the pid of a process the table already holds (never iterated for
+    /// an observable order), so a cheaper hasher may change the probe cost and the (unobserved)
+    /// order — and nothing else. The `assert_fast_hashed` pin stops compiling if the map ever
+    /// reverts to `RandomState`.
+    #[test]
+    fn the_mailbox_scan_state_map_answers_like_a_default_hasher_map() {
+        use std::collections::HashMap;
+
+        use beam_process::ProcessId;
+
+        use crate::hasher::FastHashMap;
+        use crate::runtime::Runtime;
+
+        /// The type pin: the field really is the crate's fast-hashed map.
+        fn assert_fast_hashed(map: &FastHashMap<ProcessId, MailboxState>) -> usize {
+            map.len()
+        }
+
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let own = rt.self_pid();
+        // A mixed corpus: the running pid, one differing from it in the **serial** alone (so the
+        // whole pid, not just the table slot, is the key) and two boundary-shaped pids.
+        let corpus = [
+            own,
+            ProcessId::new(own.number(), own.serial().wrapping_add(1)),
+            ProcessId::new(0, 0),
+            ProcessId::new(u64::MAX, u64::MAX),
+        ];
+        // A mixed pattern: every other pid's scan state is created, so both verdicts are exercised.
+        let mut reference: HashMap<ProcessId, ()> = HashMap::new();
+        for (index, pid) in corpus.iter().enumerate() {
+            if index % 2 == 0 {
+                rt.mailboxes.entry(*pid).or_default();
+                reference.insert(*pid, ());
+            }
+        }
+        assert_eq!(
+            assert_fast_hashed(&rt.mailboxes),
+            reference.len(),
+            "the map holds exactly the states that were created"
+        );
+        for pid in &corpus {
+            assert_eq!(
+                rt.mailboxes.contains_key(pid),
+                reference.contains_key(pid),
+                "the membership verdict agrees with a default-hasher map for {pid:?}"
+            );
+        }
+        // The scan state is the *process's*: the running pid has one, an unknown pid has none.
+        assert!(
+            rt.mailboxes.contains_key(&own),
+            "the running pid's scan state exists"
+        );
+        assert!(
+            !rt.mailboxes.contains_key(&ProcessId::new(7, 7)),
+            "a pid nobody created a scan state for has none"
+        );
+    }
     /// A payload **larger than the receiver's whole heap** is delivered intact — through the
     /// heap-fragment model — and still wakes the blocked receiver.
     ///

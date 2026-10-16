@@ -224,8 +224,12 @@ pub(crate) fn process_roots_are_unscanned(
 /// reachable term graph, and set again (never cleared) by the valve itself on a root hit. The
 /// runtime owns the one cell and shares it by cloning the `Rc` at the collection gate's install
 /// site, so a `beam_process` signal site decides exactly as an admission point does and never
-/// pays the `O(live objects)` descent for a pid whose bit is clear.
-pub(crate) type ForeignLatch = Rc<RefCell<HashSet<ProcessId>>>;
+/// pays the `O(live objects)` descent for a pid whose bit is clear. It is a **verdict-only** set
+/// of internal pids, so it probes with the crate's own deterministic
+/// [`FastBuildHasher`](crate::hasher::FastBuildHasher) instead of `RandomState`'s SipHash: a
+/// membership answer is hasher-independent, and this cell is never iterated for an observable
+/// ordered result (see the `hasher` module docs for the full soundness argument).
+pub(crate) type ForeignLatch = Rc<RefCell<HashSet<ProcessId, crate::hasher::FastBuildHasher>>>;
 
 /// The host side of the [`beam_process::CollectionGate`] seam: it answers a signal site's
 /// "may this receiver's heap be relocated?" question with **this module's** reachability walk,
