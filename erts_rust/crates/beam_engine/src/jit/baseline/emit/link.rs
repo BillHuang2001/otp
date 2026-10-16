@@ -394,7 +394,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7, pc)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the successor's entry, so the
@@ -459,7 +459,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7, pc)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
             .unwrap();
         let exit_len = buffer.len();
         buffer.bind(target).unwrap();
@@ -504,7 +504,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7, pc)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
             .unwrap();
         let exit_len = buffer.len();
         buffer.bind(done).unwrap();
@@ -629,7 +629,7 @@ mod tests {
         };
 
         linker
-            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, pc)
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the successor's entry, so the jump's
@@ -700,7 +700,7 @@ mod tests {
         let linker = Linker::new(&entries);
         let allocation = Allocation::default();
         let err = linker
-            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, pc)
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0)
             .expect_err("an unlinkable tail target is the documented typed error");
         assert!(
             format!("{err:?}").contains("no compiled block"),
@@ -743,7 +743,7 @@ mod tests {
         };
 
         linker
-            .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3, pc)
+            .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3, 0)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the epilogue, so the trailing jump's
