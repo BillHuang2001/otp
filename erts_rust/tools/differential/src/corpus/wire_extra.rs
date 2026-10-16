@@ -139,6 +139,11 @@
 //!   (`INTEGER_EXT` 98) and the `{ok, Challenge}` / `{ok, Our, Peer, PeerName}` reply
 //!   tuples — each a byte golden, since every shape is an ordinary ETF term that carries
 //!   no per-VM-start id.
+//! * the `bin2term/` block — `binary_to_term/2` `[safe]` over the atom-*name* and
+//!   atom-*index* (`ATOM_INTERNAL_REF2` (73)) forms: a fresh atom name is refused
+//!   (`badarg`), an atom the expression itself seeded in the same VM decodes, and the
+//!   index form is unaffected by `[safe]` (asserted through the `[safe,used]`
+//!   consumed-byte count, since the index→atom mapping is bootstrap-order dependent).
 //!
 //! A live handshake and the on-wire `DOP_*`/`DFLAG_*` negotiation are **not**
 //! expressible through a single CLI process (they need two connected nodes) — an
@@ -457,6 +462,15 @@ pub(crate) fn group() -> Vec<Case> {
         v("wire_extra/b2t_used_two_terms_bytes", "[used] reports the first term of a two-term buffer and its byte count", "binary_to_term(<<(term_to_binary(1))/binary,(term_to_binary(2))/binary>>, [used])", "ok {1,3}"),
         v("wire_extra/b2t_used_local_pid_bytes", "[used] reports the 29-byte size of the runtime's own NEW_PID_EXT (88) image", "element(2, binary_to_term(<<(term_to_binary(self()))/binary,255>>, [used]))", "ok 29"),
         verr("wire_extra/b2t_unknown_option_alongside_safe", "an unknown binary_to_term/2 option alongside [safe] is badarg", "binary_to_term(term_to_binary(1),[safe,bogus])"),
+        // -- the `bin2term/` block: `binary_to_term/2` `[safe]` + the atom-index form ----
+        // `[safe]` refuses only an image that would introduce a new atom *name*; an image
+        // naming an existing atom decodes, and the ATOM_INTERNAL_REF2 (73) index form —
+        // which names an *existing* atom by index, carrying no name — is unaffected. The
+        // index→atom mapping is bootstrap-order dependent, so the index case is asserted
+        // only through the `[safe,used]` consumed-byte count, never by the atom's name.
+        verr("bin2term/safe_unknown_atom_is_badarg", "[safe] refuses an image naming a fresh atom", "binary_to_term(<<131,119,8,122,122,97,98,115,101,110,116>>, [safe])"),
+        v("bin2term/safe_known_atom_decodes", "[safe] decodes an image naming an atom the expression seeded in the same VM", "begin _ = list_to_atom(\"wz_b2t_known_one\"), binary_to_term(term_to_binary(list_to_atom(\"wz_b2t_known_one\")), [safe]) end", "ok wz_b2t_known_one"),
+        v("bin2term/safe_plus_atom_internal_ref2_index", "[safe,used] over an ATOM_INTERNAL_REF2 (73) image reports the 4 consumed bytes", "element(2, binary_to_term(<<131,73,0,5>>, [safe,used]))", "ok 4"),
         // -- local external-id images as shape predicates ----------------------------
         v("wire_extra/ids_self_pid_image_size", "the runtime's own pid image (NEW_PID_EXT 88) is 29 bytes: 2 + a 15-byte node atom + a 12-byte tail", "byte_size(term_to_binary(self()))", "ok 29"),
         v("wire_extra/ids_self_pid_node_prefix", "the 15-byte node-name prefix of the runtime's own pid image names the local node", "binary:part(term_to_binary(self()),2,15)", "ok <<119,13,110,111,110,111,100,101,64,110,111,104,111,115,116>>"),
@@ -749,7 +763,11 @@ mod tests {
         );
         let mut seen = HashSet::new();
         for case in &cases {
-            assert!(case.id.starts_with("wire_extra/"), "unexpected id {}", case.id);
+            assert!(
+                case.id.starts_with("wire_extra/") || case.id.starts_with("bin2term/"),
+                "unexpected id {}",
+                case.id
+            );
             assert!(seen.insert(case.id), "duplicate case id {}", case.id);
             assert!(
                 !case.description.is_empty(),
@@ -1113,6 +1131,8 @@ mod tests {
         // `agree`s); pin the ids and their goldens here so the agreements cannot regress
         // silently.
         for (id, golden) in [
+            ("bin2term/safe_known_atom_decodes", "ok wz_b2t_known_one"),
+            ("bin2term/safe_plus_atom_internal_ref2_index", "ok 4"),
             ("wire_extra/b2t_empty_options_same_as_one_arg", "ok 1"),
             ("wire_extra/b2t_safe_export_fun_call", "ok [3,2,1]"),
             ("wire_extra/b2t_safe_export_fun_image", "ok fun lists:reverse/1"),
@@ -1192,6 +1212,7 @@ mod tests {
         // refusal, the `BIT_BINARY_EXT` bit-count bounds and the invalid-UTF-8 atom bodies —
         // are all badarg.
         for id in [
+            "bin2term/safe_unknown_atom_is_badarg",
             "wire_extra/err_atom_utf8_invalid_badarg",
             "wire_extra/err_b2t_option_not_list_badarg",
             "wire_extra/err_bit_binary_ext_nine_bits_badarg",

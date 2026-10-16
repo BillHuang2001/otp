@@ -48,7 +48,10 @@
 //! against the live oracle:**
 //! - the `eof` option — the oracle delivers `{Port, eof}` once the child closes its output
 //!   (`open_port({spawn,"true"},[binary,eof])` ⇒ `eof`); `beam_rt` never delivers it.
-//! - the `{line, N}` option — the oracle emits `{eol, Line}` messages, `beam_rt` raw bytes.
+//! - the `{line, N}` option — the framing itself now agrees and is pinned by the
+//!   `driver/line_*` cases (the `eol`/`noeol` frame grammar, the boundary at exactly N, the
+//!   512-byte default, and the EOF no-EOL flush of a CR-pending line); only the `eof` option
+//!   above is still missing from `beam_rt`.
 //! - `port_command(P, 42)` (a non-iodata payload) — the oracle raises `badarg`; `beam_rt`
 //!   accepts it and answers `true`.
 //! - `port_info(P, registered_name)` — the oracle answers `[]`; `beam_rt` raises `badarg`.
@@ -1172,6 +1175,133 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "driver/line_option_matrix",
+            description: "open_port/2 accepts line / {line, N} in binary and list mode and tags the frame",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The option matrix: the bare `line` switch (the 512-byte default) and an explicit
+                // `{line, N}`, each in `binary` (a binary frame payload) and list (a char list)
+                // mode. `M` pins that all three accepted forms open a real port.
+                expr: "begin E = begin Q = open_port({spawn,\"echo x\"},[binary,line]), receive {Q,{data,Da}} -> Da after 2000 -> to end end, N = begin Q2 = open_port({spawn,\"echo x\"},[{line,8}]), receive {Q2,{data,Db}} -> Db after 2000 -> to end end, M = [is_port(open_port({spawn,\"cat\"},[binary,line])), is_port(open_port({spawn,\"cat\"},[binary,{line,16}])), is_port(open_port({spawn,\"cat\"},[line]))], {M,E,N} end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                // `{[true,true,true], {eol,<<"x">>}, {eol,"x"}}` — `echo x` writes one terminated
+                // line, whose newline is stripped from the `eol` frame, and the frame payload's
+                // type follows the stream mode (binary vs list).
+                stdout: Some("ok <<131,104,3,108,0,0,0,3,119,4,116,114,117,101,119,4,116,114,117,101,119,4,116,114,117,101,106,104,2,119,3,101,111,108,109,0,0,0,1,120,104,2,119,3,101,111,108,107,0,1,120>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/line_frames_exact_n_noeol_split",
+            description: "a line of exactly N bytes with no EOL is one {noeol, _} frame of exactly N bytes",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `{line, 4}` over a four-byte newline-free write: the frame boundary sits at
+                // exactly N, so the whole line arrives as one `{noeol, _}` frame of N bytes —
+                // never an N-1 + 1 split, and never held back for the port close.
+                expr: "begin P = open_port({spawn,\"printf abcd\"},[binary,{line,4}]), receive {P,{data,Da}} -> Da after 2000 -> no_frame end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,100>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/line_full_line_noeol_flush",
+            description: "a no-EOL line longer than N is released as a full N-byte frame plus the remainder",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // Six newline-free bytes under `{line, 4}`: the *full* N-byte frame is released
+                // first and the two-byte tail follows as a second frame (still no EOL, so both
+                // frames are `noeol`).
+                expr: "begin P = open_port({spawn,\"printf abcdef\"},[binary,{line,4}]), A = receive {P,{data,Da}} -> Da after 2000 -> nf1 end, B = receive {P,{data,Db}} -> Db after 2000 -> nf2 end, {A,B} end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,100,104,2,119,5,110,111,101,111,108,109,0,0,0,2,101,102>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/line_default_512_boundary",
+            description: "the bare line option frames at the documented 512-byte default",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // A 513-byte newline-free write splits at exactly the default 512 (`512` then `1`),
+                // while an exactly-512-byte write is one whole frame — so the default boundary is
+                // 512 and not 511.
+                expr: "begin C1 = \"printf \" ++ lists:duplicate(513,$a), P = open_port({spawn,C1},[binary,line]), A = receive {P,{data,{noeol,Dx}}} -> byte_size(Dx) after 3000 -> nf1 end, B = receive {P,{data,{noeol,Dy}}} -> byte_size(Dy) after 3000 -> nf2 end, C2 = \"printf \" ++ lists:duplicate(512,$b), Q = open_port({spawn,C2},[binary,line]), D3 = receive {Q,{data,{noeol,Dz}}} -> byte_size(Dz) after 3000 -> nf3 end, {A,B,D3} end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                // `{512, 1, 512}` — the two frame sizes of the 513-byte line, then the whole
+                // 512-byte line (only the sizes are pinned; the payload bytes are implied).
+                stdout: Some("ok <<131,104,3,98,0,0,2,0,97,1,98,0,0,2,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/line_frame_term_bytes",
+            description: "an eol and a noeol frame carry the documented {data, {Tag, Line}} term bytes",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The frame term is `{eol, Line}` for a newline-terminated line and `{noeol, Line}`
+                // for one released without an EOL. The goldens are those two terms' ETF images
+                // (`{eol,<<"ab">>}` and `{noeol,<<"cd">>}`) — the frame grammar itself.
+                expr: "begin E = begin P = open_port({spawn,\"echo ab\"},[binary,line]), receive {P,{data,Da}} -> Da after 2000 -> to end end, N = begin Q = open_port({spawn,\"printf cd\"},[binary,line]), receive {Q,{data,Db}} -> Db after 2000 -> to end end, {E,N} end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,104,2,119,3,101,111,108,109,0,0,0,2,97,98,104,2,119,5,110,111,101,111,108,109,0,0,0,2,99,100>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/line_eof_noeol_flush_precedes_exit_status",
+            description: "the EOF no-EOL flush is consumed before the port's exit status",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // A line ending in a bare CR is held back — the parser cannot yet tell CR from CRLF
+                // (`io.c`'s `LINEBUF_CR_INSIDE`) — so it is still pending when the child closes its
+                // output, and the EOF flush is what releases it, as `{noeol, <<"abc\r">>}` (the CR
+                // is included). The flush is consumed ahead of the exit status the same port close
+                // reports; the mailbox order between the two is a delivery artifact, so the flush is
+                // selected for rather than raced against.
+                expr: "begin P = open_port({spawn,\"printf 'abc\" ++ [13] ++ \"'\"},[binary,line,exit_status]), X1 = receive {P,{data,Da}} -> Da after 2000 -> t1 end, X2 = receive {P,{exit_status,S}} -> S after 2000 -> t2 end, {X1,X2} end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,13,97,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/line_eof_noeol_flush_then_exit_status_payloads",
+            description: "the no-EOL flush payloads and the exit status payload of a {line, N} port",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // Five newline-free bytes under `{line, 4}`: the payloads are the two released
+                // frames (`abcd`, then the one-byte tail the port close flushes) and the exit
+                // status of the child, in that consuming order.
+                expr: "begin P = open_port({spawn,\"printf abcde\"},[binary,{line,4},exit_status]), X1 = receive {P,{data,Da}} -> Da after 2000 -> t1 end, X2 = receive {P,{data,Db}} -> Db after 2000 -> t2 end, X3 = receive {P,{exit_status,S}} -> S after 2000 -> t3 end, {X1,X2,X3} end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,3,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,100,104,2,119,5,110,111,101,111,108,109,0,0,0,1,101,97,0>>"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1482,5 +1612,121 @@ mod tests {
         assert_eq!(refusals, 6, "the six refusal shapes");
         assert_eq!(shapes, 17, "the seventeen observed shapes");
         assert_eq!(refusals + shapes, WIDENED_PORT_IDS.len());
+    }
+
+    /// The cases that pin the `line` / `{line, N}` stream option: the option matrix, the frame
+    /// boundary at exactly N, the release of a longer no-EOL line, the 512-byte default boundary,
+    /// the frame's own term bytes, and the EOF no-EOL flush relative to the exit status.
+    const LINE_STREAM_IDS: &[&str] = &[
+        "driver/line_option_matrix",
+        "driver/line_frames_exact_n_noeol_split",
+        "driver/line_full_line_noeol_flush",
+        "driver/line_default_512_boundary",
+        "driver/line_frame_term_bytes",
+        "driver/line_eof_noeol_flush_precedes_exit_status",
+        "driver/line_eof_noeol_flush_then_exit_status_payloads",
+    ];
+
+    /// Every line-stream case is a plain A.4 eval case opening the port in line mode, keeping the
+    /// probe wrapper's reserved variables (`V`/`C`/`R`) untouched, and answered with a stable
+    /// `ok …` stdout *line* (no trailing newline) at exit `0`.
+    #[test]
+    fn line_stream_cases_resolve_with_the_driver_contract() {
+        for id in LINE_STREAM_IDS {
+            let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+            assert_eq!(
+                case.contracts,
+                &[Contract::DriverAbi],
+                "case {id}: contract"
+            );
+            let CaseKind::Eval {
+                expr,
+                extra_argv,
+                probe,
+            } = case.kind
+            else {
+                panic!("case {id} must be a plain eval case");
+            };
+            assert_eq!(probe, Probe::TermToBinary, "case {id}: probe");
+            assert!(extra_argv.is_empty(), "case {id}: no extra argv");
+            assert!(
+                expr.contains("[binary,line") || expr.contains("{line,"),
+                "case {id}: the expression must open the port in line mode"
+            );
+            // The probe wrapper binds `V`/`C`/`R`; an expression re-using one of them makes
+            // the oracle's `erl_eval` fail with `unsafe_var` instead of evaluating.
+            let tokens = identifiers(expr);
+            for reserved in ["V", "C", "R"] {
+                assert!(
+                    !tokens.contains(&reserved),
+                    "case {id}: expression must not bind `{reserved}` (probe-wrapper collision)"
+                );
+            }
+            let golden = case.golden.stdout.expect("case {id}: golden stdout");
+            assert!(!golden.ends_with('\n'), "case {id}: golden is a line");
+            assert!(
+                golden.starts_with("ok "),
+                "case {id}: an answer is an `ok …` line, got {golden:?}"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id}: an answer exits 0");
+        }
+    }
+
+    #[test]
+    fn line_stream_ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for id in LINE_STREAM_IDS {
+            assert!(seen.insert(*id), "duplicate line-stream id {id}");
+        }
+    }
+
+    /// The goldens of the line-stream cases, pinned explicitly: the `{eol|noeol, Line}` frame
+    /// grammar (the newline stripped from an `eol` frame, the payload typed by the stream mode),
+    /// the frame boundary at exactly N, the full-N release plus the remainder, the 512-byte
+    /// default boundary (`513 ⇒ 512 + 1`, `512 ⇒ 512`), and the EOF no-EOL flush of a CR-pending
+    /// line with the exit status consumed after it.
+    #[test]
+    fn line_stream_cases_pin_the_observed_goldens() {
+        for (id, golden) in [
+            // `{[true,true,true], {eol,<<"x">>}, {eol,"x"}}` — accepted forms, then the two modes.
+            (
+                "driver/line_option_matrix",
+                "ok <<131,104,3,108,0,0,0,3,119,4,116,114,117,101,119,4,116,114,117,101,119,4,116,114,117,101,106,104,2,119,3,101,111,108,109,0,0,0,1,120,104,2,119,3,101,111,108,107,0,1,120>>",
+            ),
+            // `{noeol,<<"abcd">>}` — exactly N bytes, no EOL, one whole frame.
+            (
+                "driver/line_frames_exact_n_noeol_split",
+                "ok <<131,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,100>>",
+            ),
+            // `{{noeol,<<"abcd">>},{noeol,<<"ef">>}}` — the full N-byte frame, then the remainder.
+            (
+                "driver/line_full_line_noeol_flush",
+                "ok <<131,104,2,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,100,104,2,119,5,110,111,101,111,108,109,0,0,0,2,101,102>>",
+            ),
+            // `{512,1,512}` — the default boundary: the split, then the whole exactly-512 line.
+            (
+                "driver/line_default_512_boundary",
+                "ok <<131,104,3,98,0,0,2,0,97,1,98,0,0,2,0>>",
+            ),
+            // `{{eol,<<"ab">>},{noeol,<<"cd">>}}` — the frame grammar for both tags.
+            (
+                "driver/line_frame_term_bytes",
+                "ok <<131,104,2,104,2,119,3,101,111,108,109,0,0,0,2,97,98,104,2,119,5,110,111,101,111,108,109,0,0,0,2,99,100>>",
+            ),
+            // `{{noeol,<<"abc\r">>},0}` — the EOF flush (the CR is part of the frame), then status.
+            (
+                "driver/line_eof_noeol_flush_precedes_exit_status",
+                "ok <<131,104,2,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,13,97,0>>",
+            ),
+            // `{{noeol,<<"abcd">>},{noeol,<<"e">>},0}` — both flush payloads, then the status.
+            (
+                "driver/line_eof_noeol_flush_then_exit_status_payloads",
+                "ok <<131,104,3,104,2,119,5,110,111,101,111,108,109,0,0,0,4,97,98,99,100,104,2,119,5,110,111,101,111,108,109,0,0,0,1,101,97,0>>",
+            ),
+        ] {
+            let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
+        }
     }
 }
