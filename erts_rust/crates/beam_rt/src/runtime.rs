@@ -1929,6 +1929,11 @@ impl Runtime {
     /// The export runs under the [`RootAction::Module`] **root execution frame**, so a
     /// `process_info(self(), …)` inside it answers the items that root action sources (see
     /// [`crate::runtime::executing`]); the frame is restored on every exit path.
+    ///
+    /// It also runs **as a freshly spawned, unregistered process** — see
+    /// [`Runtime::as_action_process`] for the identity the oracle gives a `-s`/`-run` process
+    /// (the same one it gives `-eval`). Resolving and loading the module stay on the root
+    /// process: they are the runtime's own code-path work, not the action's.
     pub fn run_named(
         &mut self,
         module: &str,
@@ -1942,13 +1947,15 @@ impl Runtime {
         // fatal: `CodeServer::load` below reports it, naming every directory searched.
         let _ = self.find_module_file(module);
         let loaded = self.code_server.load(module)?;
-        let previous = self.enter_root_action(RootAction::Module);
-        let result = {
-            let mut context = RuntimeContext::new(self);
-            context.run_export(&loaded, function, arity, args)
-        };
-        self.leave_root_action(previous);
-        result
+        self.as_action_process(|runtime| {
+            let previous = runtime.enter_root_action(RootAction::Module);
+            let result = {
+                let mut context = RuntimeContext::new(runtime);
+                context.run_export(&loaded, function, arity, args)
+            };
+            runtime.leave_root_action(previous);
+            result
+        })
     }
 
     // --- spawning and scheduling (the process runner's public API) ------------
@@ -2610,13 +2617,75 @@ impl Runtime {
     /// The whole evaluation runs under the [`RootAction::Eval`] **root execution frame**, so a
     /// `process_info(self(), …)` inside the expression answers the evaluator driver's own
     /// position (see [`crate::runtime::executing`]); the frame is restored on every exit path.
+    ///
+    /// It also runs **as a freshly spawned, unregistered process** — see
+    /// [`Runtime::as_action_process`] for the identity the oracle gives an `-eval` process.
     pub fn eval(&mut self, expr: &str) -> Result<Eterm> {
-        let previous = self.enter_root_action(RootAction::Eval);
-        let result = {
-            let mut ctx = RuntimeContext::new(&mut *self);
-            crate::eval::eval(&mut ctx, expr)
-        };
-        self.leave_root_action(previous);
+        self.as_action_process(|runtime| {
+            let previous = runtime.enter_root_action(RootAction::Eval);
+            let result = {
+                let mut ctx = RuntimeContext::new(&mut *runtime);
+                crate::eval::eval(&mut ctx, expr)
+            };
+            runtime.leave_root_action(previous);
+            result
+        })
+    }
+
+    /// Runs `body` with the runtime's own process identity **moved onto a freshly spawned,
+    /// unregistered child**, and restores the previous identity on every exit path.
+    ///
+    /// # Why (contracts A.6/A.8 — the caller's identity)
+    ///
+    /// The oracle runs an action in a process `init` *spawns*: `erl -noshell -eval
+    /// 'process_info(self(), registered_name)'` answers `[]` while `whereis(init)` answers the
+    /// root pid, so `whereis(init) =:= self()` is `false` and `self()` is a pid no name is
+    /// registered for (probed on OTP 29.1.1 / erts-17.1: `rn=[] self=<0.10.0> init=<0.0.0>
+    /// eq=false ispid=true`). This runtime's `-eval`/`-s`/`-run` action had always run in the
+    /// process it registers as `init` ([`Runtime::self_pid`]), so the action answered
+    /// `{registered_name, init}` and `whereis(init) =:= self()` was `true`.
+    ///
+    /// # How
+    ///
+    /// 1. A child is spawned into the runtime's own process table exactly the way its
+    ///    never-enqueued service stand-ins are (`erl_prim_loader`, `file_server_2`): born
+    ///    `Runnable`, inserted, and **never put on a run queue** — so the scheduler never
+    ///    picks it up and `body` drives it inline, which is what the root process did before.
+    /// 2. It takes the **group leader** of the process it stands in for, so
+    ///    `erlang:group_leader/0` inside the action answers what it answered before. The
+    ///    leader is stored explicitly rather than through [`Runtime::inherit_group_leader`]
+    ///    because that helper leaves the *default* leader (the parent itself) out of the map
+    ///    — and the map's fallback is [`Runtime::self_pid`], which this call is about to move
+    ///    onto the child: skipping the store would silently make the action its own leader.
+    /// 3. [`Runtime::self_pid`] is swapped to the child for the body's duration, which is what
+    ///    every "the running process" constructor reads — `RuntimeContext::new`/`with_output`
+    ///    bind their `mailbox_pid` from it, so `erlang:self/0`, the process dictionary, the
+    ///    mailbox seam, `ProcessBridge` and `process_info(self(), …)` all see the child.
+    /// 4. The previous pid is restored **after** the body returns, whatever it returned — the
+    ///    `Ok`, an ordinary `Err`, and `erlang:halt/0,1`'s (a raise like any other) alike. That
+    ///    is why the swap is captured and restored around the call instead of living in a
+    ///    `Drop`: the restore is one line, and an error path can never leak the child's pid.
+    ///
+    /// Nothing else about the node moves: `whereis(init)`, `process_info(init, …)`,
+    /// `which_applications/0`, `init:get_status/0`, the boot script and the `run <file.beam>`
+    /// action (which runs its own scheduled process) all keep answering the root process,
+    /// because only the *action's own identity* changes.
+    ///
+    /// # Errors
+    ///
+    /// The process table's allocation failure when the child cannot be spawned; anything
+    /// `body` returns otherwise.
+    fn as_action_process<T>(
+        &mut self,
+        body: impl FnOnce(&mut Runtime) -> Result<T>,
+    ) -> Result<T> {
+        let root_pid = self.self_pid;
+        let action_pid = self.processes.spawn(self.default_spawn_policy())?;
+        let leader = self.group_leader_of(root_pid);
+        self.set_group_leader(action_pid, leader);
+        let previous = std::mem::replace(&mut self.self_pid, action_pid);
+        let result = body(self);
+        self.self_pid = previous;
         result
     }
 
