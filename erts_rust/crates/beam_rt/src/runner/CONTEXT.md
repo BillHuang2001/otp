@@ -89,6 +89,15 @@ figures are in `PERF.md`).
   (`RuntimeContext::resolve_local_call` → `crate::native::prim_tty::serves_local_call` for a built-in
   NIF library's stub). Every other method of the seam is forwarded unchanged, so the redirect into
   `inner` is purely mechanical.
+* **The slice's real context is built once per `run` call (one scheduler slice).** [`run`] constructs
+  `RuntimeContext::for_process_with_engines` once, then wraps it in one `BudgetContext` and hands that
+  wrapper to the whole machine run — so every BIF/`call_ext`/`call_bif` a slice makes shares **one**
+  `RuntimeContext` and therefore one `DispatchMemo` (the 8-slot per-context cache); the memo is rebuilt
+  only at a slice boundary (a pre-emption/`receive` park ends the slice) or at the two nested-context
+  sites (`FunBridge::nested`, `SendBridge`, both in `src/context/bridges.rs`). The `RuntimeContext`/
+  `BudgetContext`/`BudgetProbe` construction is **stack-only** (no `Vec`/`String`/`Rc` on the hot path);
+  the only per-slice heap work below the outcome match is the off-heap-payload registration suffix
+  (`payload.clone()` on `Process::register_off_heap_binary`, once per *new* payload the machine built).
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
   `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
@@ -207,6 +216,31 @@ family the pid retained from received messages — refc binaries, MSO handles an
 so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared
 instead of tripping the valve, whether the process built it or received it; a reason that genuinely
 cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
+
+## Per-slice (not per-instruction) host cost
+Beyond the per-instruction `BudgetContext::reduce` charge, one slice's prologue/epilogue does this
+host work (each is amortized over the whole 4000-reduction budget, so it is per-`run`, never
+per-iteration):
+* **O(1), no allocation:** `RunnerState::engines.remove(&pid)` / `insert` (`run.rs:383`/`817`), the
+  FR prefix read `Machine::fr_mark()` (`run.rs:677`), the tier lookup (`run.rs:430-438`),
+  `note_reductions` (`run.rs:602`), `serve_gc_request` (early-returns without a pending request),
+  and — on the `Yield` arm only — `current_code()` (`run.rs:778`) and
+  `reset_reductions`/`bump_reductions` (`run.rs:791-792`).
+* **One allocation per slice:** `RuntimeContext::enter_module` (`run.rs:475` →
+  `../context/runtime_context.rs:501-508`) builds a fresh `String` of the module name on **every**
+  slice (a `RuntimeContext` itself is a stack value: `for_process_with_engines`, no heap alloc).
+* **O(size), on a park only:** both park arms call `publish_parked_roots` (`run.rs:807`, `run.rs:929`)
+  → `gc::publish_roots_full` (`../context/gc.rs:370-395`) copies the whole x file
+  (`min(x.len(), MAX_REG)` = up to 1024 words, `beam_process::registers::MAX_REG`) plus the whole
+  Erlang stack plus the live FR prefix onto the process's root set.
+* **Amortized O(1):** the off-heap registration loop (`run.rs:760-769`) walks only the
+  not-yet-registered reservoir suffix (`ProcessEngine::registered_payloads`), so a loop that builds
+  no off-heap binary pays one comparison.
+* **First entry / flag-gated only:** `record_baseline_code` (`run.rs:692-694`, `+JPperf` only), the
+  `Arc::clone` of the entry module (`run.rs:413-420`), and `describe_site` (debug-trace only).
+  `source_payloads` (`run.rs:840-842`/`970-971`) runs only on the terminating `Returned`/`Err` arms.
+* **No production time read:** `Instant` appears only in `runner/tests.rs`; the slice path does no
+  `sys` call of its own.
 
 ## Measured
 The tier is taken on a process's **first** entry and then carried for its whole life: a pre-empted

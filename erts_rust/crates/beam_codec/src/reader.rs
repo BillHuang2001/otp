@@ -87,6 +87,17 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes(arr))
     }
 
+    /// Reads a big-endian 24-bit value (`0..=16_777_215`).
+    ///
+    /// The ETF's `ATOM_INTERNAL_REF3` index is this width (C `get_int24`:
+    /// `ep[0] << 16 | ep[1] << 8 | ep[2]`, `erts/emulator/beam/sys.h:1300-1302`), so
+    /// it is unsigned with no sign extension. A short read yields `BeamError::BadArg`.
+    pub fn u24be(&mut self) -> Result<u32> {
+        let bytes = self.bytes(3)?;
+        // `bytes` is known to be 3 bytes long, so the indexing cannot panic.
+        Ok((u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]))
+    }
+
     /// Reads a big-endian `u64`.
     ///
     /// A short read yields `BeamError::BadArg`.
@@ -162,6 +173,37 @@ mod tests {
         assert!(reader.is_empty());
         assert_eq!(reader.position(), SAMPLE.len());
         assert_eq!(reader.rest(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn u24be_reads_three_bytes_big_endian() {
+        // `get_int24` is unsigned with no sign extension: `0xFFFFFF` is 16_777_215,
+        // never -1 (`sys.h:1300-1302`).
+        let mut reader = Reader::new(&[0xFF, 0xFF, 0xFF, 0x07]);
+        assert_eq!(reader.u24be().unwrap(), 0xFF_FFFF);
+        assert_eq!(reader.position(), 3, "exactly three bytes are consumed");
+        assert_eq!(reader.u8().unwrap(), 0x07, "the fourth byte is untouched");
+    }
+
+    #[test]
+    fn u24be_round_trips_its_bounds() {
+        for value in [0u32, 1, 0x00_FFFF, 0x01_0000, 0xFF_FFFF] {
+            let bytes = [(value >> 16) as u8, (value >> 8) as u8, value as u8];
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(reader.u24be().unwrap(), value);
+            assert!(reader.is_empty(), "{value:#x} consumed exactly three bytes");
+        }
+    }
+
+    #[test]
+    fn u24be_short_read_is_bad_arg() {
+        for len in 0..3 {
+            let mut reader = Reader::new(&[0xAB, 0xCD, 0xEF][..len]);
+            assert!(
+                matches!(reader.u24be(), Err(BeamError::BadArg)),
+                "len {len} must be a typed BadArg"
+            );
+        }
     }
 
     #[test]

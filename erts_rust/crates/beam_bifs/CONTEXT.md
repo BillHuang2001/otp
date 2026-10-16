@@ -231,8 +231,18 @@ the oracle's class. Entries marked *divergence* are honest but not byte-identica
 - **Arithmetic widens even small ints to a heap `Big`:** `erlang:'-'/2` of two small ints does ~4 small `Vec`
   allocations (a `Big::from_i64` per operand, then `sub`/`add`/`neg`) with no checked-`i64` fast path.
 - **The `AtomTable` deep clone is copy-on-write** (`beam_rt`'s `CodeServer::atoms_mut`): only a call that actually
-  **interns** pays it, and `prefix_matches`'s O(table) revalidation cannot be made O(1) without a table *identity*
-  signal (see Handoffs).
+  **interns** pays it. Independent of that clone, `with_decode_scratch`/`prefix_matches` (`src/binconv.rs:1085-1091`,
+  called from `:1101-1117`) revalidate the decode-scratch image by walking **every** memo index on **every**
+  `binary_to_term` call — Θ(atom-table) `name` lookups + `&str` compares (~4100 atoms after boot) whether or not any
+  atom is novel; only the *allocation* count is table-size-independent (`tests/decode_hot_path.rs`). This is the
+  hotspot the `copy_bound/etf_roundtrip` benchmark's ~110 µs/op (vs sys 0.81 µs) reflects. The O(1) replacement
+  already exists upstream (`beam_term::AtomTable::snapshot()` + `appended_since`, an `{instance, generation, len}`
+  witness — `beam_term/src/atom.rs:212`/`:250`) but is **unadopted** here and in `beam_rt/src/nif.rs` (see Handoffs).
+  Fix direction: store the shared table's `AtomSnapshot` beside the memo and validate with `appended_since`.
+- **`term_to_binary/1` and `binary_to_term/1` allocation inventory** (one 5-key-map round trip): encode = 2 `Vec<u8>`
+  (the `Encoder`'s 128-byte `Writer` + `plain_image`'s `body.len()+1` image) + the on-heap binary block
+  (`beam_alloc` bump, O(size)); decode = 1 `Vec<u8>` (`access::binary_bytes`'s `to_vec`) + 1 `Vec<(Eterm,Eterm)>`
+  (the codec's map `pairs`) + the map block on the context heap; **no** per-call `HashMap`/`HashSet`/`String`/`format!`.
 
 ## A.9 blockers (self-hosted build: booting kernel, running lib/compiler)
 There is **no self-hosted build** yet (the `ets:new/2` link is closed — `./src/ets/CONTEXT.md`; the `ets:foldl/3`/`foldr/3` blocker is in Handoffs).
@@ -245,7 +255,6 @@ There is **no self-hosted build** yet (the `ets:new/2` link is closed — `./src
 - **batch-52 cross-crate findings (verbose detail): `./HANDOFF_batch52.md`** — `-pa`/`-pz` ordering (`-pz` must be a tail, currently merged into the `-pa` head), the `+S Total:Online` online count parsed then discarded, and the `process_info/2` position items (`current_function`/`initial_call`/`current_location`/`current_stacktrace`/`catchlevel`) as typed gaps for a live module-scheduled process.
 - **`ets:foldl/3`/`foldr/3` need the registry *lent* into the nested call.** This crate's side IS done (`BifContext::call_fun` `take`s the registry out and passes it to `FunCaller::call_fun_with_tables`, restoring it on the error path too). **Required:** implement `call_fun_with_tables` on `FunBridge` (`src/context/bridges.rs`) — `with_tables` into the nested `BifContext` — and drop the `reentrancy_capable` special-casing of the two folds; else a nested `ets:*` in the fold's fun fails `try_borrow_mut` (`beam_rt/src/context/calls.rs:326-333`).
 - **`fun_info(F, name)` needs the lambda name plumbed through:** `beam_rt/src/context/bridges.rs` must attach `FunDescriptor.function` (`…with_function(descriptor.function)`), else `name` stays the typed gap for a compiled `make_fun3` fun; `src/context/fun_identity.rs` answers `Ok(None)` for a non-`Local` term, so an `Imported` fun's name also needs this crate's `LocalFunIdentity` seam to resolve `(module, old_index)` for an `Imported` term.
-- **The `FunIdentityBridge` snapshot is rebuilt per BIF call** (`beam_rt/src/context/calls.rs:201`; `new` walks `code_server.loaded()`). **Required:** cache it in `Runtime` behind a generation counter (`new_cached(&Arc<Snapshot>, …)`); re-verify with `copy_bound/etf_roundtrip`.
 - **Two stale near-miss fixtures** at `beam_rt/src/context/tests.rs:666`/`:1022` must name a near-miss other than `erlang:send/3` (now a real `BifFn`), e.g. `("erlang","send",1)`.
 - **`beam_rt` must install the remaining hooks this crate exposes** (each defaults to an honest typed gap): `RecordSource`; `LocalNode` (internal pid/port `term_to_binary` — its `(nonode@nohost, 0)` fallback and the `bm`/`ac` pattern tags need atoms `CORE_ATOMS` lacks — **and** `local_node_hash`); `LocalFunIdentity` (compiled modules' local funs, NOT `-eval`; carry the `function` atom); `ModuleInfo`; `ProcessHook` (the 11 `proc_reg` BIFs); `PersistentTerm`; the defaulted `DictHook::get_all`/`erase_all`; `AtomInterner`/`FunCaller`; `NifLoader` + `with_current_module`; `PortHook`; `fun M:F/A` for `wire/export_ext_encode`. Gate via `needs_*`, never a private copy.
 - **A node-identity + channel seam** (the runtime's node name + a node-name-atom → dist-channel provider) is the only way to close the external-identifier gap: additive to `LocalNode` (`local_node() -> Option<(Eterm, u32)>`) or a new seam (a new dependency edge, so reported, not assumed).

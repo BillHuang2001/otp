@@ -150,6 +150,31 @@ pub const LOCAL_EXT: u8 = 121;
 /// reference, resolved through [`crate::atom_cache::AtomCache`].
 pub const ATOM_CACHE_REF_EXT: u8 = 82;
 
+/// `ATOM_INTERNAL_REF2` (`'I'`, `external.h:70`): an atom named by a 16-bit
+/// atom-table index.
+///
+/// **Decode-only.** The C reaches it in both `dec_term` (`external.c:5177-5184`) and
+/// `dec_atom` (`external.c:3085-3092`) and skips its 2-byte index in the sizing pass
+/// (`SKIP(2+atom_extra_skip)`, `external.c:6405-6408`). Unlike the other
+/// internal-ref tags it is **not** gated on the `internal_tags` flag
+/// (`BINARY_INTERNAL_REF`/`BITSTRING_INTERNAL_REF`/`MAGIC_REF_INTERNAL_REF` are,
+/// `external.c:6413-6434`), so the oracle accepts it unconditionally:
+/// `binary_to_term(<<131,73,0,5>>)` returns the atom at table index 5 (`''` in a
+/// fresh VM), while `binary_to_term(<<131,73,255,255>>)` is `badarg` (index past the
+/// table). The encoder never emits it: the C writes this tag only in its
+/// ETS/distribution internal-tags mode, which is `beam_ets`/`beam_dist`'s.
+pub const ATOM_INTERNAL_REF2_EXT: u8 = 73;
+
+/// `ATOM_INTERNAL_REF3` (`'K'`, `external.h:71`): an atom named by a 24-bit
+/// atom-table index.
+///
+/// The 3-byte-wide twin of [`ATOM_INTERNAL_REF2_EXT`] (`external.c:5185-5192`,
+/// `external.c:3093-3100`; sizing `SKIP(3+atom_extra_skip)`, `external.c:6409-6412`),
+/// likewise **decode-only** and likewise accepted unconditionally by the oracle:
+/// `binary_to_term(<<131,75,0,0,5>>)` returns the atom at table index 5, while
+/// `binary_to_term(<<131,75,255,255,255>>)` is `badarg`.
+pub const ATOM_INTERNAL_REF3_EXT: u8 = 75;
+
 /// `DIST_HEADER` (`'D'`, `external.h:65`): the distribution header.
 ///
 /// A distribution-**transport** wrapper, never a term: the C term decoder has no
@@ -246,6 +271,16 @@ pub enum Tag {
     Local,
     /// `ATOM_CACHE_REF` (`82`).
     AtomCacheRef,
+    /// `ATOM_INTERNAL_REF2` (`73`): an atom named by a 16-bit atom-table index.
+    ///
+    /// Decode-only (the encoder never emits it — see
+    /// [`ATOM_INTERNAL_REF2_EXT`]); accepted by the oracle unconditionally.
+    AtomInternalRef2,
+    /// `ATOM_INTERNAL_REF3` (`75`): an atom named by a 24-bit atom-table index.
+    ///
+    /// Decode-only (the encoder never emits it — see
+    /// [`ATOM_INTERNAL_REF3_EXT`]); accepted by the oracle unconditionally.
+    AtomInternalRef3,
     /// `DIST_HEADER` (`68`).
     ///
     /// A distribution-transport wrapper, never a term: rejected as malformed
@@ -293,6 +328,8 @@ impl Tag {
             V4_PORT_EXT => Tag::V4Port,
             LOCAL_EXT => Tag::Local,
             ATOM_CACHE_REF_EXT => Tag::AtomCacheRef,
+            ATOM_INTERNAL_REF2_EXT => Tag::AtomInternalRef2,
+            ATOM_INTERNAL_REF3_EXT => Tag::AtomInternalRef3,
             DIST_HEADER_EXT => Tag::DistHeader,
             NEW_CACHE_EXT => Tag::NewCache,
             RECORD_EXT => Tag::Record,
@@ -336,6 +373,8 @@ impl Tag {
             Tag::V4Port => V4_PORT_EXT,
             Tag::Local => LOCAL_EXT,
             Tag::AtomCacheRef => ATOM_CACHE_REF_EXT,
+            Tag::AtomInternalRef2 => ATOM_INTERNAL_REF2_EXT,
+            Tag::AtomInternalRef3 => ATOM_INTERNAL_REF3_EXT,
             Tag::DistHeader => DIST_HEADER_EXT,
             Tag::NewCache => NEW_CACHE_EXT,
             Tag::Record => RECORD_EXT,
@@ -378,6 +417,8 @@ impl Tag {
             Tag::V4Port => "V4_PORT_EXT",
             Tag::Local => "LOCAL_EXT",
             Tag::AtomCacheRef => "ATOM_CACHE_REF",
+            Tag::AtomInternalRef2 => "ATOM_INTERNAL_REF2",
+            Tag::AtomInternalRef3 => "ATOM_INTERNAL_REF3",
             Tag::DistHeader => "DIST_HEADER",
             Tag::NewCache => "NEW_CACHE",
             Tag::Record => "RECORD_EXT",
@@ -404,6 +445,12 @@ impl Tag {
     /// back byte-exactly (see `crate::decode`/`crate::encode`). `RECORD_EXT` (`67`) is
     /// covered too: it decodes to a native-record term (`beam_term::record`) and
     /// encodes back through the record family.
+    ///
+    /// `ATOM_INTERNAL_REF2` (`73`) / `ATOM_INTERNAL_REF3` (`75`) are covered as
+    /// **decode-only index forms**: the oracle accepts them unconditionally and the
+    /// decoder materializes the atom the index names (see [`ATOM_INTERNAL_REF2_EXT`]).
+    /// The encoder never emits them, so no round-trip claim attaches to them — exactly
+    /// as for the other legacy decode-only identifier/float forms.
     pub fn covered(self) -> bool {
         matches!(
             self,
@@ -437,6 +484,8 @@ impl Tag {
                 | Tag::Export
                 | Tag::Record
                 | Tag::AtomCacheRef
+                | Tag::AtomInternalRef2
+                | Tag::AtomInternalRef3
                 | Tag::Compressed
                 | Tag::Local
         )
@@ -451,7 +500,7 @@ mod tests {
     ///
     /// Ordering is the declaration order of [`Tag`]; `ALL.len()` is asserted
     /// against the variant count so a new variant forces this table to be updated.
-    const ALL: [(Tag, u8, &str, bool); 35] = [
+    const ALL: [(Tag, u8, &str, bool); 37] = [
         (Tag::SmallInteger, 97, "SMALL_INTEGER_EXT", true),
         (Tag::Integer, 98, "INTEGER_EXT", true),
         (Tag::Float, 99, "FLOAT_EXT", true),
@@ -484,6 +533,8 @@ mod tests {
         (Tag::V4Port, 120, "V4_PORT_EXT", true),
         (Tag::Local, 121, "LOCAL_EXT", true),
         (Tag::AtomCacheRef, 82, "ATOM_CACHE_REF", true),
+        (Tag::AtomInternalRef2, 73, "ATOM_INTERNAL_REF2", true),
+        (Tag::AtomInternalRef3, 75, "ATOM_INTERNAL_REF3", true),
         (Tag::DistHeader, 68, "DIST_HEADER", false),
         (Tag::NewCache, 78, "NEW_CACHE", false),
         (Tag::Record, 67, "RECORD_EXT", true),
@@ -530,6 +581,8 @@ mod tests {
         assert_eq!(V4_PORT_EXT, 120);
         assert_eq!(LOCAL_EXT, 121);
         assert_eq!(ATOM_CACHE_REF_EXT, 82);
+        assert_eq!(ATOM_INTERNAL_REF2_EXT, 73);
+        assert_eq!(ATOM_INTERNAL_REF3_EXT, 75);
         assert_eq!(DIST_HEADER_EXT, 68);
         assert_eq!(NEW_CACHE_EXT, 78);
         assert_eq!(RECORD_EXT, 67);

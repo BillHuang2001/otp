@@ -29,8 +29,9 @@ pub use crate::atom_cache::{AtomCache, AtomCacheWriter};
 pub use crate::compress::{compress, decompress};
 pub use crate::decode::{
     decode_term, decode_term_body, decode_term_body_used, decode_term_used,
-    decode_term_with_local_node, decode_term_with_local_node_used, is_compressed_body,
-    is_compressed_image, Decoder,
+    decode_term_with_local_node, decode_term_with_local_node_used, decode_term_with_options,
+    decode_term_with_options_used, is_compressed_body, is_compressed_image, DecodeOptions,
+    Decoder,
 };
 pub use crate::encode::{
     encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,

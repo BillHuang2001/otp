@@ -100,6 +100,19 @@ impl Writer {
         self.buf.clear();
     }
 
+    /// Applies `mask` to the byte most recently written, leaving every other byte
+    /// untouched.
+    ///
+    /// Like [`Writer::patch_u32be`] this is a backward write, used by the bitstring
+    /// encoder to clear the insignificant trailing bits of the last payload byte
+    /// (`repack_bits`). A call on an empty writer does nothing rather than
+    /// panicking: there is no byte to mask.
+    pub(crate) fn mask_last_byte(&mut self, mask: u8) {
+        if let Some(last) = self.buf.last_mut() {
+            *last &= mask;
+        }
+    }
+
     /// Overwrites the four bytes starting at `pos` with the big-endian encoding of
     /// `value`, leaving every other byte untouched.
     ///

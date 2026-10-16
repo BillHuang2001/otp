@@ -54,12 +54,12 @@ use beam_codec::{
     decode_term, decode_term_with_local_node, encode_term, encode_term_body,
     encode_term_compressed, encode_term_local, encode_term_with_minor_version, AtomCache,
     AtomCacheWriter, AtomEncoding, Decoder, Encoder, MinorVersion, Tag, ATOM_CACHE_REF_EXT,
-    ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT,
-    COMPRESSED_EXT, DIST_HEADER_EXT, EXPORT_EXT, FLOAT_EXT, FUN_EXT, INTEGER_EXT, LARGE_BIG_EXT,
-    LARGE_TUPLE_EXT, LIST_EXT, LOCAL_EXT, MAP_EXT, NEWER_REFERENCE_EXT, NEW_CACHE_EXT,
-    NEW_FLOAT_EXT, NEW_FUN_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, PID_EXT,
-    PORT_EXT, RECORD_EXT, REFERENCE_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT,
-    SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, VERSION_MAGIC,
+    ATOM_EXT, ATOM_INTERNAL_REF2_EXT, ATOM_INTERNAL_REF3_EXT, ATOM_UTF8_EXT, BINARY_EXT,
+    BIT_BINARY_EXT, COMPRESSED_EXT, DIST_HEADER_EXT, EXPORT_EXT, FLOAT_EXT, FUN_EXT, INTEGER_EXT,
+    LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, LOCAL_EXT, MAP_EXT, NEWER_REFERENCE_EXT,
+    NEW_CACHE_EXT, NEW_FLOAT_EXT, NEW_FUN_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT,
+    NIL_EXT, PID_EXT, PORT_EXT, RECORD_EXT, REFERENCE_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT,
+    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, VERSION_MAGIC,
 };
 
 /// The sysname bytes of the smallest node atom (`SMALL_ATOM_UTF8_EXT`, `"n"`).
@@ -197,8 +197,15 @@ fn minimal_image(tag: Tag) -> Option<Vec<u8>> {
             image.extend_from_slice(&[119, 1, b'm']); // module atom
             image.extend_from_slice(&[119, 1, b'r']); // name atom
         }
-        // The wrapper/contextual tags have no plain minimal image.
-        Tag::Compressed | Tag::Local | Tag::AtomCacheRef => return None,
+        // The wrapper/contextual tags have no plain minimal image. `ATOM_INTERNAL_REF2`
+        // (73) / `ATOM_INTERNAL_REF3` (75) name an atom **by index**, so a valid image
+        // needs a non-empty atom table — the plain `decode_term` entry here starts from
+        // an empty one, so they are handled in `every_covered_tag_decodes`.
+        Tag::Compressed
+        | Tag::Local
+        | Tag::AtomCacheRef
+        | Tag::AtomInternalRef2
+        | Tag::AtomInternalRef3 => return None,
         // Uncovered tags: never a term, so no valid image exists.
         Tag::Fun | Tag::NewCache | Tag::DistHeader => return None,
     }
@@ -249,6 +256,24 @@ fn every_covered_tag_decodes() {
                     .decode(&mut heap, &mut atoms)
                     .unwrap_or_else(|e| panic!("ATOM_CACHE_REF image rejected: {e:?}"));
                 assert_eq!(atoms.name(beam_term::prelude::atom_val(term)), Some("cached"));
+            }
+            // `ATOM_INTERNAL_REF2` (`'I'`, 73) / `ATOM_INTERNAL_REF3` (`'K'`, 75) name
+            // an atom by table **index**, so they only decode against a table that
+            // already holds that index. A fresh `erl` answers
+            // `binary_to_term(<<131,73,0,5>>)` with the atom at index 5 (`''`) —
+            // reproduced here by seeding 6 names and reading index 5 back.
+            Tag::AtomInternalRef2 | Tag::AtomInternalRef3 => {
+                let mut atoms = AtomTable::new();
+                atoms.seed(["z0", "z1", "z2", "z3", "z4", "indexed"]);
+                let image = if *tag == Tag::AtomInternalRef2 {
+                    vec![VERSION_MAGIC, ATOM_INTERNAL_REF2_EXT, 0, 5]
+                } else {
+                    vec![VERSION_MAGIC, ATOM_INTERNAL_REF3_EXT, 0, 0, 5]
+                };
+                let mut heap = Heap::new(64).unwrap();
+                let term = decode_term(&image, &mut heap, &mut atoms)
+                    .unwrap_or_else(|e| panic!("{tag:?} image rejected: {e:?}"));
+                assert_eq!(atoms.name(beam_term::prelude::atom_val(term)), Some("indexed"));
             }
             _ => {
                 let image = minimal_image(*tag).expect("a non-contextual covered tag has an image");
@@ -333,6 +358,8 @@ const ALL_TAGS: &[Tag] = &[
     Tag::V4Port,
     Tag::Local,
     Tag::AtomCacheRef,
+    Tag::AtomInternalRef2,
+    Tag::AtomInternalRef3,
     Tag::DistHeader,
     Tag::NewCache,
     Tag::Record,
@@ -494,7 +521,15 @@ fn every_tag_the_oracle_emits_is_covered() {
         let tag = Tag::from_byte(tag_byte)
             .unwrap_or_else(|| panic!("the oracle emitted the unknown tag byte {tag_byte}: {bi:?}"));
         assert!(
-            minimal_image(tag).is_some() || matches!(tag, Tag::Compressed | Tag::Local),
+            minimal_image(tag).is_some()
+                || matches!(
+                    tag,
+                    Tag::Compressed
+                        | Tag::Local
+                        | Tag::AtomCacheRef
+                        | Tag::AtomInternalRef2
+                        | Tag::AtomInternalRef3
+                ),
             "the oracle emitted {tag:?}, which has no minimal image — update the coverage table"
         );
         assert!(
@@ -587,6 +622,10 @@ struct TagCase {
     out_tag: u8,
     /// Whether `encode(decode(image))` must equal `image` byte-for-byte.
     byte_exact: bool,
+    /// Atom names the decoder's table must already hold **before** the image is
+    /// decoded. Empty for every ordinary row; non-empty only for the index-carrying
+    /// `ATOM_INTERNAL_REF2`/`ATOM_INTERNAL_REF3` forms, which name an existing atom.
+    seed: &'static [&'static str],
 }
 
 /// A canonical row: `term` → our encoder's image under `flavour`, tagged `tag`.
@@ -598,14 +637,27 @@ fn canonical(label: &'static str, term: Eterm, atoms: &AtomTable, flavour: Flavo
         "{label}: our encoder emitted tag {} but the row pins {tag}",
         image[1]
     );
-    TagCase { label, tag, image, flavour, out_tag: tag, byte_exact: true }
+    TagCase { label, tag, image, flavour, out_tag: tag, byte_exact: true, seed: &[] }
 }
 
 /// A decode-only row: a hand-written legacy image whose re-encode is the modern form.
 fn decode_only(label: &'static str, tag: u8, image: Vec<u8>, out_tag: u8) -> TagCase {
+    decode_only_seeded(label, tag, image, out_tag, &[])
+}
+
+/// A decode-only row that needs atoms already present in the decoding table — the
+/// index-carrying `ATOM_INTERNAL_REF2` (`73`) / `ATOM_INTERNAL_REF3` (`75`) forms name
+/// an atom by index, so the table must be seeded before the image is decoded.
+fn decode_only_seeded(
+    label: &'static str,
+    tag: u8,
+    image: Vec<u8>,
+    out_tag: u8,
+    seed: &'static [&'static str],
+) -> TagCase {
     assert_eq!(image[0], VERSION_MAGIC, "{label}: version byte");
     assert_eq!(image[1], tag, "{label}: input tag");
-    TagCase { label, tag, image, flavour: Flavour::Default, out_tag, byte_exact: false }
+    TagCase { label, tag, image, flavour: Flavour::Default, out_tag, byte_exact: false, seed }
 }
 
 /// `[VERSION_MAGIC][101][node][id:4 BE][creation:1]` — a legacy `REFERENCE_EXT`.
@@ -810,6 +862,28 @@ fn tag_cases() -> Vec<TagCase> {
         SMALL_BIG_EXT,
     ));
 
+    // ---- decode-only index-carrying atom forms ---------------------------
+    // `ATOM_INTERNAL_REF2` (`'I'`, 73) / `ATOM_INTERNAL_REF3` (`'K'`, 75) name an atom
+    // by atom-table index, which the C accepts unconditionally (`external.c:5177-5192`;
+    // NOT gated on `internal_tags`, `external.c:6413-6434`). Verified against the
+    // oracle: `binary_to_term(<<131,73,0,5>>)` → the atom at index 5, and likewise for
+    // `<<131,75,0,0,5>>`. The table is seeded so the index exists; the re-encode is the
+    // modern UTF-8 atom form, so these are decode-only rows.
+    cases.push(decode_only_seeded(
+        "atom_internal_ref2_73_index_1",
+        ATOM_INTERNAL_REF2_EXT,
+        wi(&[ATOM_INTERNAL_REF2_EXT, 0, 1]),
+        SMALL_ATOM_UTF8_EXT,
+        &["aaa", "bbb"],
+    ));
+    cases.push(decode_only_seeded(
+        "atom_internal_ref3_75_index_1",
+        ATOM_INTERNAL_REF3_EXT,
+        wi(&[ATOM_INTERNAL_REF3_EXT, 0, 0, 1]),
+        SMALL_ATOM_UTF8_EXT,
+        &["aaa", "bbb"],
+    ));
+
     cases
 }
 
@@ -832,6 +906,10 @@ fn every_producible_tag_round_trips_byte_exact() {
 
         let mut heap = new_heap(1 << 18);
         let mut atoms = AtomTable::new();
+        // The index-carrying rows name an atom their table must already hold; every
+        // other row seeds nothing, so its decode starts from an empty table exactly as
+        // before.
+        atoms.seed(c.seed.iter().copied());
         let term = decode_term(&c.image, &mut heap, &mut atoms)
             .unwrap_or_else(|e| panic!("{}: our own image must decode: {e:?}", c.label));
 
@@ -1039,6 +1117,23 @@ fn malformed_cases() -> Vec<Malformed> {
     cases.push(malformed("dead_new_cache_78", wi(&[NEW_CACHE_EXT, 0, 0])));
     cases.push(malformed("dist_header_68", wi(&[DIST_HEADER_EXT, 0])));
 
+    // `ATOM_INTERNAL_REF2` (73) / `ATOM_INTERNAL_REF3` (75): the two forms the plain
+    // decode *does* accept, so their malformed inputs are an index past the table and a
+    // truncated index field. `decode_row` decodes with a fresh (empty) table, so any
+    // index is out of range; the oracle rejects these same images with `badarg`
+    // (verified: `binary_to_term(<<131,73,255,255>>)` and
+    // `binary_to_term(<<131,75,255,255,255>>)` are `badarg`, while index `0`/`5` are
+    // accepted — and the sibling `internal_tags`-gated tags `74`/`76` are `badarg`
+    // too, so they stay unmodelled).
+    cases.push(malformed("atom_internal_ref2_index_out_of_range", wi(&[ATOM_INTERNAL_REF2_EXT, 0xFF, 0xFF])));
+    cases.push(malformed("atom_internal_ref2_index_truncated", wi(&[ATOM_INTERNAL_REF2_EXT, 0x00])));
+    cases.push(malformed("atom_internal_ref2_no_index", wi(&[ATOM_INTERNAL_REF2_EXT])));
+    cases.push(malformed(
+        "atom_internal_ref3_index_out_of_range",
+        wi(&[ATOM_INTERNAL_REF3_EXT, 0xFF, 0xFF, 0xFF]),
+    ));
+    cases.push(malformed("atom_internal_ref3_index_truncated", wi(&[ATOM_INTERNAL_REF3_EXT, 0x00, 0x00])));
+    cases.push(malformed("atom_internal_ref3_no_index", wi(&[ATOM_INTERNAL_REF3_EXT])));
     // Every truncation of a set of small valid images.
     for (name, image) in [
         ("small", vec![VERSION_MAGIC, SMALL_INTEGER_EXT, 7]),

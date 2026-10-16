@@ -33,6 +33,8 @@
         pid_serial, port_number, signed_value,
     };
 
+    use crate::tag::{ATOM_INTERNAL_REF2_EXT, ATOM_INTERNAL_REF3_EXT};
+
     use crate::term::{
         big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
         external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity,
@@ -1391,4 +1393,212 @@
             decode_term_body(&[104, 2, 97, 1], &mut Heap::new(64).unwrap(), &mut AtomTable::new()),
             Err(BeamError::BadArg)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // `ATOM_INTERNAL_REF2` (73) / `ATOM_INTERNAL_REF3` (75) — the index forms
+    // -----------------------------------------------------------------------
+    //
+    // The C accepts both unconditionally in `dec_term` (`external.c:5177-5192`) and
+    // `dec_atom` (`external.c:3085-3100`) — they are **not** gated on the
+    // `internal_tags` flag the sibling `74`/`76`/`78` tags are (`external.c:6413-6434`,
+    // `:6431`) — and the oracle answers `binary_to_term(<<131,73,0,5>>)` /
+    // `binary_to_term(<<131,75,0,0,5>>)` with the atom at table index 5.
+
+    /// Seeds `n` distinct names and returns the table: index `i` then names `a<i>`.
+    fn table_of(n: usize) -> AtomTable {
+        let mut atoms = AtomTable::new();
+        let names: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
+        atoms.seed(names.iter().map(String::as_str));
+        assert_eq!(atoms.len(), n);
+        atoms
+    }
+
+    #[test]
+    fn atom_internal_ref2_reads_a_16_bit_index() {
+        let mut atoms = table_of(6);
+        let mut heap = Heap::new(64).unwrap();
+        // `[73][index:2 BE]` — index 5.
+        let term = decode_term(&[131, ATOM_INTERNAL_REF2_EXT, 0, 5], &mut heap, &mut atoms)
+            .expect("index 5 is in range");
+        assert_eq!(atoms.name(atom_val(term)), Some("a5"));
+        // The index is unsigned big-endian: `0x0105` is 261, not 5.
+        let mut atoms = table_of(262);
+        let mut heap = Heap::new(64).unwrap();
+        let term = decode_term(&[131, ATOM_INTERNAL_REF2_EXT, 1, 5], &mut heap, &mut atoms)
+            .expect("index 261 is in range");
+        assert_eq!(atoms.name(atom_val(term)), Some("a261"));
+    }
+
+    #[test]
+    fn atom_internal_ref3_reads_a_24_bit_index() {
+        let mut atoms = table_of(6);
+        let mut heap = Heap::new(64).unwrap();
+        // `[75][index:3 BE]` — index 5.
+        let term = decode_term(&[131, ATOM_INTERNAL_REF3_EXT, 0, 0, 5], &mut heap, &mut atoms)
+            .expect("index 5 is in range");
+        assert_eq!(atoms.name(atom_val(term)), Some("a5"));
+        // The 3-byte field is unsigned big-endian (`get_int24`, `sys.h:1300-1302`):
+        // `0x000105` is 261. The top byte's `0xFFFFFF` width is pinned by the reader's
+        // `u24be_round_trips_its_bounds` and the out-of-range arm below.
+        let mut atoms = table_of(262);
+        let mut heap = Heap::new(64).unwrap();
+        let term = decode_term(&[131, ATOM_INTERNAL_REF3_EXT, 0, 1, 5], &mut heap, &mut atoms)
+            .expect("index 261 is in range");
+        assert_eq!(atoms.name(atom_val(term)), Some("a261"));
+    }
+
+    #[test]
+    fn atom_internal_ref_index_at_or_past_the_table_is_bad_arg() {
+        // The gate is exactly `erts_is_atom_index_ok` (`ix < entries`, `atom.h:123-135`):
+        // an index == `len` is out of range. The oracle agrees for an index past its own
+        // table (`binary_to_term(<<131,73,255,255>>)` => badarg).
+        let mut atoms = table_of(1);
+        let mut heap = Heap::new(64).unwrap();
+        let mut decoder = Decoder::new(&[131, ATOM_INTERNAL_REF2_EXT, 0, 1]).unwrap();
+        assert!(matches!(
+            decoder.decode(&mut heap, &mut atoms),
+            Err(BeamError::BadArg)
+        ));
+        let mut decoder = Decoder::new(&[131, ATOM_INTERNAL_REF3_EXT, 0, 0, 1]).unwrap();
+        assert!(matches!(
+            decoder.decode(&mut heap, &mut atoms),
+            Err(BeamError::BadArg)
+        ));
+        // An empty table has no index 0 at all (the oracle's fresh `erl` does have one,
+        // which is why `<<131,73,0,5>>` decodes there — but not here).
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF2_EXT, 0, 0]);
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF3_EXT, 0, 0, 0]);
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF2_EXT, 0xFF, 0xFF]);
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF3_EXT, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn atom_internal_ref_with_a_truncated_index_is_bad_arg() {
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF2_EXT]);
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF2_EXT, 0]);
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF3_EXT]);
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF3_EXT, 0]);
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF3_EXT, 0, 0]);
+        // The 1-byte-shorter index is *not* borrowed from the next tag byte: a trailing
+        // term follows the truncated 2-byte index and the image is still rejected.
+        assert_bad_arg(&[131, ATOM_INTERNAL_REF2_EXT, 0, 97, 7]);
+    }
+
+    #[test]
+    fn the_internal_ref_tags_are_never_encoded() {
+        // The encoder emits the modern name-carrying `SMALL_ATOM_UTF8_EXT` for the same
+        // atom, never `73`/`75` (the C writes those only in its ETS/distribution
+        // internal-tags mode, which is `beam_ets`/`beam_dist`'s).
+        let mut atoms = table_of(6);
+        let mut heap = Heap::new(64).unwrap();
+        let term = decode_term(&[131, ATOM_INTERNAL_REF2_EXT, 0, 5], &mut heap, &mut atoms)
+            .expect("index 5 is in range");
+        let out = crate::encode::encode_term(term, &atoms).expect("the indexed atom encodes");
+        assert_eq!(out, vec![VERSION_MAGIC, 119, 2, b'a', b'5']);
+        assert_ne!(out[1], ATOM_INTERNAL_REF2_EXT);
+    }
+
+    // -----------------------------------------------------------------------
+    // `binary_to_term/2 [safe]` — the atom-lookup-only flag
+    // -----------------------------------------------------------------------
+
+    /// `[VERSION_MAGIC][SMALL_ATOM_UTF8_EXT][len]["xyz"]` — an atom **name** on the wire.
+    const ATOM_XYZ: [u8; 6] = [131, 119, 3, b'x', b'y', b'z'];
+
+    #[test]
+    fn safe_rejects_an_unknown_atom_name_and_interns_nothing() {
+        // `erts_atom_get` misses => `goto error` (`external.c:4530-4534`), and — the
+        // whole point — the receiving table is not grown by hostile input.
+        let mut atoms = AtomTable::new();
+        let mut heap = Heap::new(64).unwrap();
+        let mut decoder = Decoder::new(&ATOM_XYZ).unwrap().with_safe();
+        assert!(matches!(
+            decoder.decode(&mut heap, &mut atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(atoms.len(), 0, "a safe decode must not intern the unknown name");
+    }
+
+    #[test]
+    fn safe_accepts_an_already_interned_atom_name() {
+        let mut atoms = AtomTable::new();
+        let known = atoms.intern("xyz");
+        let mut heap = Heap::new(64).unwrap();
+        let mut decoder = Decoder::new(&ATOM_XYZ).unwrap().with_safe();
+        let term = decoder.decode(&mut heap, &mut atoms).expect("a known name resolves");
+        assert_eq!(atom_val(term), known);
+        assert_eq!(atoms.len(), 1, "the lookup adds nothing to the table");
+    }
+
+    #[test]
+    fn without_safe_the_atom_name_is_interned_as_before() {
+        // The default must be byte-for-byte the pre-existing behaviour.
+        let mut atoms = AtomTable::new();
+        let mut heap = Heap::new(64).unwrap();
+        let mut decoder = Decoder::new(&ATOM_XYZ).unwrap();
+        let term = decoder.decode(&mut heap, &mut atoms).expect("the name interns");
+        assert_eq!(atoms.name(atom_val(term)), Some("xyz"));
+        assert_eq!(atoms.len(), 1);
+    }
+
+    #[test]
+    fn set_safe_toggles_the_flag_in_place() {
+        let mut atoms = AtomTable::new();
+        let mut heap = Heap::new(64).unwrap();
+        let mut decoder = Decoder::new(&ATOM_XYZ).unwrap();
+        decoder.set_safe(true);
+        assert!(matches!(
+            decoder.decode(&mut heap, &mut atoms),
+            Err(BeamError::BadArg)
+        ));
+        // A cleared flag interns again (`with_safe`/`set_safe` are the only writers).
+        let mut decoder = Decoder::new(&ATOM_XYZ).unwrap().with_safe();
+        decoder.set_safe(false);
+        let term = decoder.decode(&mut heap, &mut atoms).expect("the flag is off again");
+        assert_eq!(atoms.name(atom_val(term)), Some("xyz"));
+    }
+
+    #[test]
+    fn safe_does_not_apply_to_index_carrying_atom_forms() {
+        // An index names an atom that already exists — there is no lookup to miss, so
+        // the flag is inert (verified against the oracle:
+        // `binary_to_term(<<131,73,0,5>>, [safe])` => the indexed atom, not badarg).
+        let mut atoms = table_of(6);
+        let mut heap = Heap::new(64).unwrap();
+        let mut decoder = Decoder::new(&[131, ATOM_INTERNAL_REF2_EXT, 0, 5])
+            .unwrap()
+            .with_safe();
+        let term = decoder.decode(&mut heap, &mut atoms).expect("an index is not a lookup");
+        assert_eq!(atoms.name(atom_val(term)), Some("a5"));
+
+        let mut atoms = table_of(6);
+        let mut cache = AtomCache::new();
+        cache.set(3, atoms.intern("cached"));
+        let mut decoder = Decoder::new(&[131, 82, 3]).unwrap().with_safe().with_atom_cache(&cache);
+        let term = decoder.decode(&mut heap, &mut atoms).expect("a cache ref is not a lookup");
+        assert_eq!(atoms.name(atom_val(term)), Some("cached"));
+    }
+
+    #[test]
+    fn safe_still_applies_the_atom_length_gate_before_the_lookup() {
+        // The C checks the length *first* in both `erts_atom_put` and `erts_atom_get`
+        // (`atom.c:258-274` / `:392-394`), so an over-long name is `badarg` even under
+        // `safe` — and even when a table happens to hold that exact name (this crate's
+        // `AtomTable` can, unlike the C's). A lookup-first implementation would have
+        // returned the atom here.
+        let long = "a".repeat(256);
+        let mut atoms = AtomTable::new();
+        atoms.intern(&long);
+        // 256 > u8::MAX, so the name must travel as a 16-bit-length `ATOM_UTF8_EXT`.
+        let mut image = vec![131, 118, 1, 0];
+        image.extend_from_slice(long.as_bytes());
+
+        let mut heap = Heap::new(64).unwrap();
+        let mut decoder = Decoder::new(&image).unwrap().with_safe();
+        assert!(matches!(
+            decoder.decode(&mut heap, &mut atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(atoms.len(), 1, "the length gate precedes any table change");
     }

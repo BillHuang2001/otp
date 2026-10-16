@@ -860,9 +860,8 @@ fn resolve_ext_entry(
 /// The instruction's own operand shape selects the frame discipline and the register
 /// arity, exactly as the interpreter's arms do ([`ImportFrame::Only`] for a
 /// `call_only`, [`ImportFrame::Last`] with its `deallocate` for a `call_last`); a
-/// `call` is not in the baseline tier's inline set at all, so it never probes — the
-/// block deopts to [`jit_step_one`], whose `Machine::step_instruction` consults the
-/// seam there. The label is re-resolved through the same per-run label map the
+/// plain `call` is lowered by its own helper ([`jit_call_store`]) and consults the
+/// same seam there, so this probe serves only the `call_only`/`call_last` arms. The label is re-resolved through the same per-run label map the
 /// interpreter uses, and an unresolvable one is a decline.
 ///
 /// Three outcomes, all of them the block ABI's own vocabulary:
