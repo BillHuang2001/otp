@@ -80,13 +80,11 @@
 //!
 //! # The fix-up worklist is allocation-free
 //!
-//! Both writing traversals drive one shared [`WorkStack`] — the explicit stack of pending fix-ups
-//! that makes the copy iterative. Its first [`WORK_INLINE`] entries live *inside* the value (a
-//! `MaybeUninit` array, so constructing one writes no memory), and only a graph past that spills,
-//! **once**, to a heap `Vec`. A message-sized copy therefore touches the allocator not at all: the
-//! whole `copy_bound` `send_recv` payload (70 words, 27 objects) and the 64-key HAMT map probe in
-//! `tests/counters.rs` both copy with zero allocation events, where the per-call `Vec` this
-//! replaces paid two (the payload) and four (the HAMT map).
+//! Both writing traversals drive one shared [`WorkStack`]: its first [`WORK_INLINE`] entries live
+//! *inside* the value (a `MaybeUninit` array, so constructing one writes no memory), and only a
+//! graph past that spills, **once**, to a heap `Vec`. `tests/counters.rs` pins the result — zero
+//! allocation events for the whole `copy_bound` payload and the 64-key HAMT map, where the per-call
+//! `Vec` this replaces paid two and four — and `PERF.md` records the wall-clock cost.
 
 use core::mem::MaybeUninit;
 use std::collections::HashSet;
@@ -229,45 +227,42 @@ pub(crate) type Fixup = (*mut Eterm, Eterm);
 /// The number of pending fix-ups a [`WorkStack`] keeps **inline**, on the copy's own frame, without
 /// touching the allocator.
 ///
-/// Rationale: the worklist's depth is the copy's *pending fan-out*, not the graph's size. One entry
-/// is pushed per non-shared child of a materialised object, so the live depth is the number of
-/// children left to resolve along the current descent path — for the message-sized graphs a `send`
-/// actually carries, that is tiny. The whole `copy_bound` `send_recv` payload (70 words, 27
-/// objects) leaves at most six entries live at once, and the widest single object the term layout
-/// produces, a HAMT node's 16-slot head array, still leaves room to descend several levels inside
-/// 32. So 32 fix-ups (32 × 16 B = 512 B of frame, of which only `len` entries are ever written)
-/// covers every ordinary message for free; a graph past it spills **once** (see [`WorkStack`]).
-///
-/// The value is a deliberate, measured trade: `tests/counters.rs` asserts that all four standard
-/// shapes — including the 64-key HAMT map, the widest one — copy with **zero** allocation events and
-/// that a graph modestly past this capacity pays exactly one (the spill), and `PERF.md` records the
-/// before/after counters and the wall-clock ratio.
+/// The worklist's depth is the copy's *pending fan-out*, not the graph's size — one entry per
+/// non-shared child of a materialised object, i.e. the children left to resolve along the current
+/// descent path. For a real message that is tiny: the whole `copy_bound` `send_recv` payload (70
+/// words, 27 objects) leaves at most six entries live at once, and the widest single object the term
+/// layout produces, a HAMT node's 16-slot head array, still leaves room to descend several levels
+/// inside 32. So 32 fix-ups (32 × 16 B = 512 B of frame, of which only the live entries are ever
+/// written) covers every ordinary message for free; a graph past it spills **once** (see
+/// [`WorkStack`]). `tests/counters.rs` pins both halves — zero allocations for all four standard
+/// shapes, exactly one (1024 B) past the capacity — and `PERF.md` records the wall-clock ratio,
+/// including the one shape that regressed.
 pub(crate) const WORK_INLINE: usize = 32;
 
 /// The copier's worklist of pending fix-ups: the explicit stack that makes the copy iterative, so a
 /// deep cons chain never recurses on the native stack. `push`/`pop` is the whole API — no traversal
-/// logic lives here; both writing traversals ([`try_copy_fast`] and [`copy_struct`]'s sized body)
-/// and the sharing-preserving copier drive this one type.
+/// logic lives here; both writing traversals ([`try_copy_fast`] and [`copy_struct`]'s sized body) and
+/// the sharing-preserving copier drive this one type.
 ///
-/// The first [`WORK_INLINE`] entries live in a `MaybeUninit` array *inside* the value, so
-/// constructing one writes no memory at all — `[MaybeUninit::uninit(); N]` stores nothing, where an
-/// array of *initialised* fix-ups would store 512 B on every copy, more stack traffic than the two
-/// small allocations it removes. Beyond that the stack spills to a `Vec<Fixup>` reserved at **twice**
-/// the inline capacity, so a graph modestly past `WORK_INLINE` (the spill probe in
-/// `tests/counters.rs`) pays exactly one allocation rather than one per doubling.
+/// Entries `0..WORK_INLINE` live in a `MaybeUninit` array *inside* the value, so constructing one
+/// writes no memory — `[MaybeUninit::uninit(); N]` stores nothing, where an array of *initialised*
+/// fix-ups would store 512 B on every copy, more stack traffic than the two small allocations it
+/// removes. The entries past that capacity go to a `Vec`, appended in push order (LIFO at its top),
+/// reserved at **twice** the inline capacity on the first spill so a graph modestly past
+/// `WORK_INLINE` pays exactly one allocation rather than one per doubling.
 ///
-/// The spill preserves the stack discipline: the inline entries are the *older* (deeper) ones, so
-/// they are moved out first and stay below the entries that follow, and the `Vec`'s own `pop`
-/// returns the most recent entry exactly as the inline array does.
-///
+/// The two halves are split by the *total* count alone (`len`; the inline entries are never moved
+/// into the `Vec`), so the fast path is one compare against [`WORK_INLINE`] and the `Vec` — empty,
+/// and allocator-free, for every ordinary message — is touched only above it.
 /// `Fixup` is a pair of machine words with no drop glue, so an inline entry that is never popped
 /// needs no dropping and an abandoned stack (a typed error mid-graph) leaks nothing.
 pub(crate) struct WorkStack {
-    /// The inline entries, live over `[0, len)`; `len` is `0` whenever `spilled` is non-empty.
+    /// The first [`WORK_INLINE`] entries, live over `0..min(len, WORK_INLINE)`.
     inline: [MaybeUninit<Fixup>; WORK_INLINE],
-    /// How many of `inline` are live.
+    /// The **total** number of live entries.
     len: usize,
-    /// The overflow store, empty until the first spill (and allocator-free when it is empty).
+    /// The entries past the inline capacity, in push order — empty, and allocator-free, until the
+    /// first entry past [`WORK_INLINE`].
     spilled: Vec<Fixup>,
 }
 
@@ -281,49 +276,63 @@ impl WorkStack {
         }
     }
 
-    /// Pushes one pending fix-up.
-    ///
-    /// The first [`WORK_INLINE`] pushes are allocator-free; the one that overflows reserves the
-    /// spill `Vec` at twice the inline capacity and moves the inline entries into it.
+    /// Pushes one pending fix-up. `#[inline]`: this is the copy loop's inner operation (one call per
+    /// non-shared child object), so its fast path stays a single compare; the spill is a separate
+    /// `#[cold]` function, out of that path's instruction footprint.
+    #[inline]
     pub(crate) fn push(&mut self, fixup: Fixup) {
-        // The invariant the two halves rely on: once the stack has spilled, the inline array is
-        // empty (its entries were moved into the `Vec`), so `len` and `spilled` are never both live.
-        debug_assert!(
-            self.spilled.is_empty() || self.len == 0,
-            "the inline entries and the spill store are never both live"
-        );
-        if self.spilled.is_empty() {
-            if self.len < WORK_INLINE {
-                self.inline[self.len].write(fixup);
-                self.len += 1;
-                return;
-            }
-            self.spilled.reserve(2 * WORK_INLINE);
-            for i in 0..self.len {
-                // SAFETY: entries `[0, len)` were written by earlier `push`es and have not been read
-                // out — `len` is reset to `0` below, after which their indices are never read again.
-                self.spilled.push(unsafe { self.inline[i].assume_init_read() });
-            }
-            self.len = 0;
+        if self.len < WORK_INLINE {
+            // SAFETY: `len < WORK_INLINE`, so this slot is inside `inline`; it is either never
+            // written or already read out by `pop`, and `write` initialises it with the new fix-up.
+            self.inline[self.len].write(fixup);
+            self.len += 1;
+        } else {
+            self.push_spilled(fixup);
         }
-        self.spilled.push(fixup);
     }
 
-    /// Pops the most recently pushed fix-up, or `None` once the worklist is empty.
-    pub(crate) fn pop(&mut self) -> Option<Fixup> {
-        if let Some(fixup) = self.spilled.pop() {
-            return Some(fixup);
+    /// The overflow half of [`WorkStack::push`]: append to the spill store, reserving it (once) at
+    /// twice the inline capacity. `#[cold]` — no ordinary message reaches this.
+    #[cold]
+    fn push_spilled(&mut self, fixup: Fixup) {
+        if self.spilled.is_empty() {
+            self.spilled.reserve(2 * WORK_INLINE);
         }
+        self.spilled.push(fixup);
+        self.len += 1;
+    }
+
+    /// Pops the most recently pushed fix-up, or `None` once the worklist is empty. `#[inline]`, for
+    /// the same reason as [`WorkStack::push`].
+    #[inline]
+    pub(crate) fn pop(&mut self) -> Option<Fixup> {
         if self.len == 0 {
             return None;
         }
         self.len -= 1;
-        // SAFETY: entry `len` was written by a `push` and has not been read out — its index is
-        // handed out once only, because `len` is decremented here and the next `push` writes the
-        // slot anew before it can be popped again.
-        Some(unsafe { self.inline[self.len].assume_init_read() })
+        if self.len < WORK_INLINE {
+            // SAFETY: entry `len` was written by a `push` and has not been read out — its index is
+            // handed out once only, because `len` is decremented here and the next `push` writes the
+            // slot anew before it can be popped again.
+            Some(unsafe { self.inline[self.len].assume_init_read() })
+        } else {
+            self.pop_spilled()
+        }
+    }
+
+    /// The overflow half of [`WorkStack::pop`]: the top of the spill store, which holds exactly
+    /// `len - WORK_INLINE` entries. `#[cold]` — no ordinary message reaches this.
+    #[cold]
+    fn pop_spilled(&mut self) -> Option<Fixup> {
+        let fixup = self.spilled.pop();
+        debug_assert!(
+            fixup.is_some(),
+            "the spill store holds exactly `len - WORK_INLINE` entries"
+        );
+        fixup
     }
 }
+
 /// Whether `term` is shared as-is rather than copied: an immediate, or a compound (boxed/list)
 /// term word carrying the literal-area bit (`TAG_LITERAL_PTR`, tested only on compound words).
 ///
