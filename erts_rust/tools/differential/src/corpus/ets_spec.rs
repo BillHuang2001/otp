@@ -58,6 +58,17 @@
 //!   matcher grammar uses — yields the atom `'EXIT'` as the match result when that BIF fails (a
 //!   *guard* failure instead drops the match; an arithmetic opcode failure raises out of
 //!   `select`). The case below pins that: `element(2, a)` on the atom `a` fails.
+//!
+//! # Match-spec pivots deliberately *not* pinned here
+//!
+//! `match_spec_compile/1` rejects an **empty** spec: the empty binary `<<>>` raises
+//! `error:badarg`, pinned by the `specs/` case below (the empty *list* `[]` raises the same
+//! reason in the oracle but is accepted by the Rust runtime, so a `[]` case would pin a
+//! divergence rather than a contract). Likewise a body element written as the 1-tuple `{self}`
+//! is a builtin call yielding the *calling pid* in the oracle, while the Rust runtime answers
+//! it with the `'EXIT'` body-failure sentinel — the `beam_ets` `SelfHook` seam is installed by
+//! no crate — so the `self`-as-a-pid behaviour is not pinned either. Only the literal-atom
+//! spelling (`self` alone in a body, which is *not* a call) is a shared observation.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -590,6 +601,25 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok {a,b}"),
+                exit_code: 0,
+            },
+        },
+        // --- `specs/`: the empty-spec pivot -------------------------------------------------
+        Case {
+            id: "specs/match_spec_compile_empty_spec_is_badarg",
+            description: "match_spec_compile/1 rejects the empty binary spec with badarg",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                // `ets:match_spec_compile(<<>>)` raises `error:badarg` (`badarg` is not a valid
+                // clause list), so the reason is read back through a `catch` and the case stays a
+                // value, not a crash. The spec list is compiled eagerly, so no table is needed.
+                // The empty *list* `[]` is deliberately not asserted (see the module docs).
+                expr: "try ets:match_spec_compile(<<>>) catch error:Reason -> Reason end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok badarg"),
                 exit_code: 0,
             },
         },
