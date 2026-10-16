@@ -49,7 +49,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 |---|---|
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` (the whole `io` **device** surface is [`io.rs`](io.rs)) |
 | `io.rs` | the **`io` device floor**: `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` — the `io.erl` wrappers over `o_request/2`, served natively because this runtime cannot complete the `{io_request,…}`/`{io_reply,…}` round trip against its own group leader (see *The `io` device floor*) + its unit tests |
-| `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
+| `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `fetch_loaded/0`, `stop/0,1`, `restart/0`, `boot/1` |
 | `code.rs` (+ `code/path.rs`) | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1`; the path mutators `add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`, `del_path/1` in `code/path.rs` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; `hibernate/0` (the OTP-30 instruction, modelled as **continue**); the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
@@ -75,7 +75,12 @@ it once was: the real boot script boots all 22 directives to completion under th
 those four entries (`root`, `bindir`, `progname`, `home`, each `{Flag,[[Value]]}`, an unavailable
 value omitting its entry — the oracle's own shape) before the command-line flags (boot-chain
 consequence: [`../boot/CONTEXT.md`](../boot/CONTEXT.md)). `init:script_id/0` is the **loaded** boot
-script's `{Name,Vsn}`, or the typed gap when none is loaded. `init:stop/0` records halt status 0 and
+script's `{Name,Vsn}`, or the typed gap when none is loaded. `init:fetch_loaded/0` answers `[]`, the
+oracle's post-boot value: `init` holds the loader's module list only until `code_server:init/3`
+consumes it, and that consume path (`code_server.erl` `init/2`'s `{loaded,Mods}` clause →
+`init:fetch_loaded()`) immediately clears `State#state.loaded` (`init.erl:718-722`), so the list is
+observable only in the window before the code server starts — which no CLI route reaches, so `[]` is
+what every oracle run of the probe reports too (`tests/fetch_loaded.rs`). `init:stop/0` records halt status 0 and
 answers `ok` (the running expression is not interrupted; `cli::run` applies the recorded status
 after the action completes); `stop/1` answers `ok` for a non-negative integer status (recorded),
 raises the `erlang:halt/1` crash-dump slogan for a byte list (incl. `[]`) and `badarg` for anything
