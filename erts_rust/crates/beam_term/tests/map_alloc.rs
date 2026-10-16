@@ -333,7 +333,7 @@ fn a_thirty_two_pair_write_map_allocates_one_buffer() {
 
     eprintln!(
         "map_alloc: write_map(32 pairs) allocations={allocs} bytes={bytes} \
-         (pre-fast-path: one dedup Vec + one collect Vec)"
+         (expect the single dedup/sort buffer; the hash-dedup path used two)"
     );
 
     assert_same_flatmap_block(map, reference, N);
