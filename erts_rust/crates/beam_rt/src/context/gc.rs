@@ -622,6 +622,15 @@ pub(crate) fn ensure_heap(
                 x_regs.iter().chain(stack.iter()),
             ),
         );
+        // This door has no FR slice of its own; the empty slice simply never matches.
+        valve_counters::note_first_decline(
+            valve_counters::Door::EnsureHeap,
+            x_regs,
+            stack,
+            &[],
+            (_live as usize).min(x_regs.len()),
+            process,
+        );
     }
     if declined {
         runtime.note_foreign_reachable(pid);
@@ -812,6 +821,15 @@ pub(crate) fn ensure_heap_full(
                     .chain(roots.fr.iter()),
             ),
         );
+        let live_len = roots.live_len();
+        valve_counters::note_first_decline(
+            valve_counters::Door::EnsureHeapFull,
+            roots.x,
+            roots.stack,
+            roots.fr,
+            live_len,
+            process,
+        );
     }
     if declined {
         runtime.note_foreign_reachable(pid);
@@ -958,14 +976,33 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 ///   a nested run's roots is not the one this context was armed for, so collecting there would
 ///   relocate a heap against the wrong root set.
 /// * **The latch is set** (the slice's own machine): serve the young heap exactly as
-///   [`alloc_words`] does, and run one collection over the handed-in roots and retry the bump
-///   when that bump **fails** — or immediately, when a **forced** collection has been
-///   requested (below). A collection or scatter failure halts collection for that process
+///   [`alloc_words`] does, retrying a **capacity** refusal through the no-relocation
+///   [grow-and-retry](#grow-and-retry-before-the-valve) seam, and run one collection over the
+///   handed-in roots and retry the bump when that bump **fails** — or immediately, when a
+///   **forced** collection has been requested (below). A collection or scatter failure halts
+///   collection for that process
 ///   ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the arena. This door
 ///   applies **no** caller-module float guard — it publishes the machine's **whole FR file**
 ///   ([`publish_roots_full`]), so a live float register is relocated, not corrupted (see the
 ///   module docs' float-guard section) — and it requires only that the run has a caller module
 ///   to name at all, exactly as in [`ensure_heap_full`].
+///
+/// # Grow-and-retry before the valve
+///
+/// A **capacity** refusal of the young-heap bump (or a request the policy's ceiling cannot
+/// reach) is met by [`Process::grow_nursery`] and a retried bump, exactly as in
+/// [`alloc_words`] — a non-forced attempt only. The growth is the **no-relocation** seam: it
+/// retires the space it replaces without moving a live term, so it is legal for a
+/// relocation-exempt process and cannot make a later collection less conservative. It leaves
+/// [`Process::collection_debt`] behind, which the next admission point's occupancy test
+/// ([`ensure_heap_full`]) turns into a real collection.
+///
+/// Serving the block from the process's own — reclaimable — heap is what keeps an arena term
+/// out of the machine's registers: the pointer-stable arena is a region the collector does
+/// not scan, so a block handed out there and written into an x register is a root the
+/// unscanned-root valve ([`root_is_unscanned`]) must decline every later collection over.
+/// Growth that cannot reach the request, or a retry that still does not fit, leaves the
+/// existing valve + arena path byte for byte as it is.
 ///
 /// # Forced collections
 ///
@@ -1035,9 +1072,34 @@ pub(crate) fn alloc_words_rooted(
     // used to be carried, silently, to the pass boundary.
     if !forced {
         if let Some(process) = table.get_mut(pid) {
-            let fill = runtime.gc_scratch(n.saturating_sub(1));
-            if let Ok(block) = bump(process.heap_mut(), n, fill) {
-                return Ok(block);
+            // The first attempt, scoped so the placeholder fill's `&mut runtime` borrow has
+            // ended before the growth call below makes its own.
+            let first = {
+                let fill = runtime.gc_scratch(n.saturating_sub(1));
+                bump(process.heap_mut(), n, fill)
+            };
+            match first {
+                Ok(block) => return Ok(block),
+                // A **capacity** refusal: grow the nursery and retry the bump, exactly as
+                // [`alloc_words`] does. [`Process::grow_nursery`] is the **no-relocation**
+                // growth seam — it retires the space it replaces without moving a live term,
+                // so it is legal for a relocation-exempt process and cannot make a later
+                // collection less conservative — and it leaves
+                // [`Process::collection_debt`], which the next admission point's occupancy
+                // test turns into a real collection. Growth that cannot reach the request
+                // (the policy's ceiling, `+hmax N`), or a retry that still does not fit,
+                // falls through to the valve + arena path byte for byte as before.
+                Err(BeamError::Alloc(_)) => {
+                    if process.grow_nursery(n).is_ok() {
+                        let fill = runtime.gc_scratch(n.saturating_sub(1));
+                        if let Ok(block) = bump(process.heap_mut(), n, fill) {
+                            return Ok(block);
+                        }
+                    }
+                }
+                // Any other refusal (an impossible request past `MAX_ARITYVAL`) cannot be
+                // fixed by growth.
+                Err(_) => {}
             }
         }
     }
@@ -1097,6 +1159,15 @@ pub(crate) fn alloc_words_rooted(
                     .chain(roots.stack.iter())
                     .chain(roots.fr.iter()),
             ),
+        );
+        let live_len = roots.live_len();
+        valve_counters::note_first_decline(
+            valve_counters::Door::AllocWordsRooted,
+            roots.x,
+            roots.stack,
+            roots.fr,
+            live_len,
+            process,
         );
     }
     if declined {
@@ -1292,6 +1363,36 @@ pub(crate) mod valve_counters {
         }
     }
 
+    /// Which of the machine's three root slices an offending word was found in.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RootSlice {
+        /// The x-register file (`RootSet::x`).
+        X,
+        /// The Erlang stack (`RootSet::stack`).
+        Stack,
+        /// The float-register file (`RootSet::fr`).
+        Fr,
+    }
+
+    /// The **first** decline's offending root word, recorded once per measurement.
+    ///
+    /// It separates the two possible shapes the valve's machine-root decline conflates: a word in
+    /// a **live** slot the engine really holds, and one in a slot past the declared live prefix —
+    /// a stale register the engine has already finished with. `live_len` is the count the *same*
+    /// call declared live, so `index < live_len` is a live register and `index >= live_len` is a
+    /// dead one (for the stack slice, which has no live prefix, every slot counts as live).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct FirstDecline {
+        /// The door the decline happened at.
+        pub(crate) door: Door,
+        /// The root slice the word came from.
+        pub(crate) slice: RootSlice,
+        /// The word's index within that slice.
+        pub(crate) index: usize,
+        /// The x-register count the same call declared live.
+        pub(crate) live_len: usize,
+    }
+
     /// Every door's tallies plus the runtime-wide witnesses.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct ValveCounters {
@@ -1312,6 +1413,9 @@ pub(crate) mod valve_counters {
         /// ([`FallbackSite`]). The two tally only where a site can name itself, so
         /// `fallbacks_at(..)` summed over every site is **at most** [`Self::fallbacks`].
         pub(crate) fallbacks_by_site: [usize; 5],
+        /// The first decline's offending machine root word ([`FirstDecline`]), when the door that
+        /// declined was one that hands its slices over. `None` means no door recorded one.
+        pub(crate) first_decline: Option<FirstDecline>,
     }
 
     impl ValveCounters {
@@ -1323,6 +1427,7 @@ pub(crate) mod valve_counters {
             serve_gc_request: DoorCounts::ZERO,
             fallbacks: 0,
             fallbacks_by_site: [0; 5],
+            first_decline: None,
         };
 
         /// How many of the attributed fallbacks came from `site`.
@@ -1451,6 +1556,43 @@ pub(crate) mod valve_counters {
                 DeclineCause::Descent => tally.descent_hits += 1,
             }
             counters.set(value);
+        });
+    }
+
+    /// Records the **first** decline's offending machine root word ([`FirstDecline`]) — the
+    /// slice it came from, its index within that slice and the x-register count the same call
+    /// declared live. Called by the doors that hold their slices as slices; a one-shot, so the
+    /// extra scan costs one phase 1 in a test build and nothing in a release build.
+    pub(crate) fn note_first_decline(
+        door: Door,
+        x: &[Eterm],
+        stack: &[Eterm],
+        fr: &[Eterm],
+        live_len: usize,
+        process: &beam_process::Process,
+    ) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            if value.first_decline.is_some() {
+                return;
+            }
+            let found = [(RootSlice::X, x), (RootSlice::Stack, stack), (RootSlice::Fr, fr)]
+                .into_iter()
+                .find_map(|(slice, words)| {
+                    words
+                        .iter()
+                        .position(|&word| super::root_is_unscanned(process, word))
+                        .map(|index| FirstDecline {
+                            door,
+                            slice,
+                            index,
+                            live_len,
+                        })
+                });
+            if let Some(first) = found {
+                value.first_decline = Some(first);
+                counters.set(value);
+            }
         });
     }
 

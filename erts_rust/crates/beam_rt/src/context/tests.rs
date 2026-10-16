@@ -4759,14 +4759,17 @@ fn the_fr_count_bounds_the_published_region_and_a_mismatch_still_halts() {
 /// [`RootSet`], so the same two roots must survive: an x register beyond the engine's `live`
 /// hint, and a term reachable only through the FR file.
 ///
-/// The nursery is filled with garbage first, so the first bump genuinely fails and the
-/// collection is the only way the retry can be served.
+/// The door is driven by a **forced** collection request (`erlang:garbage_collect/0,1`), which
+/// **bypasses** the young-heap bump — and, with it, the no-relocation
+/// [grow-and-retry](super::gc::alloc_words_rooted) that meets an unforced capacity refusal. That
+/// is what makes this the collecting path: the nursery is filled with garbage first, so the
+/// collection really has to evacuate something before the retry can be served from it.
 #[test]
 fn a_collecting_allocation_roots_every_x_register_and_the_whole_fr_file() {
     let (mut rt, mut table, pid) = gc_root_set_rig();
     let (beyond, fr_only) = gc_root_terms(&mut table, pid);
 
-    // Fill the nursery with unreachable tuples so a 16-word bump cannot be served.
+    // Fill the nursery with unreachable tuples so the post-collection retry is a real one.
     {
         let process = table.get_mut(pid).expect("the spawned process");
         let filler = [make_small(1)];
@@ -4783,6 +4786,7 @@ fn a_collecting_allocation_roots_every_x_register_and_the_whole_fr_file() {
     let mut fr = [fr_only];
 
     let before = rt.gc_stats();
+    rt.request_gc(pid);
     {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         ctx.current_module = Some(GC_CALL_SITE.to_string());
@@ -5357,8 +5361,13 @@ fn the_valve_collects_when_the_nested_graph_is_fully_scanned() {
 /// running process's young bump fails it collects over the handed-in root set — but a root in
 /// an unscanned region makes that move unsound, so the valve must decline the collection and
 /// take the pointer-stable arena fallback instead (`Runtime::gc_stats().fallbacks` advances,
-/// `collections` does not). The nursery is filled with garbage first, so the bump genuinely
-/// fails and the collection is the only way the retry could be served.
+/// `collections` does not).
+///
+/// The door is driven by a **forced** collection request, which **bypasses** the young-heap bump
+/// (and with it the no-relocation grow-and-retry an unforced capacity refusal takes — a growth
+/// collects nothing, so it is safe against any root set and would never reach this valve). The
+/// nursery is filled with garbage as well, so the collection the request asks for is a real one
+/// the valve has to refuse.
 #[test]
 fn a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region() {
     let (mut rt, mut table, pid) = gc_root_set_rig();
@@ -5381,6 +5390,7 @@ fn a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region
     let mut fr = [NIL];
 
     let before = rt.gc_stats();
+    rt.request_gc(pid);
     {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         ctx.current_module = Some(GC_CALL_SITE.to_string());
@@ -5411,6 +5421,86 @@ fn a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region
         terms::tuple_element(head, 0).expect("in range"),
         make_small(7),
         "the aliased young child is still intact"
+    );
+}
+
+/// **An unforced rooted allocation whose bump hits a capacity refusal is served by the
+/// no-relocation growth, never by the valve.**
+///
+/// This is the counterpart of
+/// [`a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region`]: the same
+/// rig, the same filled nursery and the same **live unscanned root** in `x[0]`, but **no forced
+/// request**. The bump's capacity refusal is met by [`Process::grow_nursery`] — which retires the
+/// space it replaces without moving a single live term, so it is safe against any root set — and
+/// the retried bump serves the block. The unscanned root therefore costs nothing here: no
+/// collection runs (the roots are never consulted), no arena fallback is taken, and every word —
+/// the unscanned root included — stays exactly where it was.
+///
+/// What the growth does leave behind is [`Process::collection_debt`]: the retired space can only
+/// be reclaimed by a collection, which the next admission point's occupancy test then forces.
+#[test]
+fn a_rooted_allocation_whose_bump_is_refused_grows_the_nursery_instead_of_declining() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (foreign, _child) = foreign_root_aliasing_a_young_child(&mut rt, &mut table, pid);
+
+    // Fill the nursery with unreachable tuples so a 16-word bump cannot be served.
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+        assert!(
+            process.heap().available() < 16,
+            "the nursery is full: the bump really is refused"
+        );
+        assert!(!process.collection_debt(), "no growth has been taken yet");
+    }
+
+    let mut x = [foreign, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    let block = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(16, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the grown young heap serves the retried bump")
+    };
+    let after = rt.gc_stats();
+
+    assert!(!block.is_null(), "a block was really handed out");
+    assert_eq!(
+        after.collections, before.collections,
+        "the growth collects nothing, so no collection runs: {after:?}"
+    );
+    assert_eq!(
+        after.fallbacks, before.fallbacks,
+        "the block came from the process's own heap, not the pointer-stable arena: {after:?}"
+    );
+    assert_eq!(
+        after.halted, before.halted,
+        "nothing failed, so collection is not halted; {after:?}"
+    );
+    assert_eq!(
+        x[0], foreign,
+        "nothing moved, so the unscanned root is unchanged"
+    );
+    let process = table.get(pid).expect("the spawned process");
+    assert!(
+        process.collection_debt(),
+        "the growth left the retired space behind as collection debt, which the next admission \
+         point's occupancy test turns into a real collection"
+    );
+    assert!(
+        process.heap().available() >= 16,
+        "the retried bump really fitted in the grown space: {} words available",
+        process.heap().available()
     );
 }
 
@@ -7191,6 +7281,17 @@ fn fallback_line(counters: &gc::valve_counters::ValveCounters) -> String {
 /// every reach — always on the same side, a **machine root word** that lies outside every region
 /// the collector scans.**
 ///
+/// The entry point of that self-sustaining loop is the **rooted allocation seam**
+/// ([`gc::valve_counters::Door::AllocWordsRooted`]): the young heap's capacity refusal there used
+/// to go straight to the valve and, on a decline, to the pointer-stable arena
+/// ([`Runtime::alloc_words`](crate::runtime::Runtime)) — and the engine writes that arena block
+/// into an x register, where it is permanent poison: the collector only relocates words that point
+/// *into* the young/mature heap, so an arena pointer in a root slot is never relocated away and
+/// every later admission point must decline. With the seam's no-relocation
+/// **grow-and-retry** (`Process::grow_nursery`, the same one [`gc::alloc_words`] already used) the
+/// refusal is met by a growth instead, the block stays on the process's own reclaimable heap, and
+/// the circle never starts.
+///
 /// This is a **structural, deterministic** pin (never a timing): it drives the workload `perf`
 /// profiles at a small and a large iteration count and reads [`gc::valve_counters`], whose tallies
 /// are counts of calls and of root words — facts about the runtime, identical on an idle and on a
@@ -7198,36 +7299,32 @@ fn fallback_line(counters: &gc::valve_counters::ValveCounters) -> String {
 ///
 /// The measured chain, in the order the counters establish it:
 ///
-/// 1. the engine reaches exactly **two** valve doors per iteration — the `test_heap`/
-///    `allocate_heap` admission point ([`gc::valve_counters::Door::EnsureHeapFull`]) and, when the
-///    young-heap bump cannot serve a term construction, the rooted allocation seam
+/// 1. the engine's two full-root doors are the only ones reached: the `test_heap`/`allocate_heap`
+///    admission point ([`gc::valve_counters::Door::EnsureHeapFull`]) and — only when the young-heap
+///    bump cannot serve a term construction — the rooted allocation seam
 ///    ([`gc::valve_counters::Door::AllocWordsRooted`]). The narrow door and the runner's park arm
 ///    have no call site for this workload (all-zero tallies);
-/// 2. the full-root door is reached **exactly** when its occupancy test says the nursery is full
-///    (`reached == occupancy`, `debt == 0`, `forced == 0`) — the driver's nursery is full from
-///    early on and nothing ever drains it, so the short-circuit can never keep the valve off;
-/// 3. the valve **declines** nearly every call (`hits ≈ reached`), and the decline is attributed
-///    to a **machine root** at essentially every zero-collection call (`process_root_hits == 0`,
-///    `descent_hits == 0`): the engine holds a term from a region the collector does not scan
-///    (the pointer-stable arena [`Runtime::alloc_words`](crate::runtime::Runtime) hands out) in
-///    one of the ~1024 published x-file slots;
-/// 4. the rooted door therefore **never** collects (`collections == 0`) and the driver's term
-///    constructions fall back to that arena — once per iteration, exactly the allocation whose
-///    hand-out keeps the machine root in a register alive: the decline circle is self-sustaining
-///    (`fallbacks` grows with `N`, all of it attributed to
-///    [`gc::valve_counters::FallbackSite::ValveDeclined`]);
-/// 5. each reach classifies the **whole** machine root set — the whole x-register file plus the
-///    whole FR file ([`publish_roots_full`] appends the FR file after the stack) — ~2 Ki words per
-///    reach, so the per-word phase costs ~4 Ki words **per iteration**: the figure that makes it
-///    the dominant term of this workload's profile.
-///
-/// The collections the runtime *does* run (`stats.collections`) are the **worker's**: its received
-/// copies leave no arena term in a register (`descents` > 0), so its own door commits. They are a
-/// small fraction of the iterations — a driver that never collects is the asymmetry under test.
+/// 2. the full-root door is reached when its occupancy test or the growth seam's **collection
+///    debt** says so, and it **commits**: `collections` scales with `N` (≈ 1 per 20 iterations)
+///    while the declines collapse to a small fraction of the reaches. The debt is non-zero because
+///    a young-heap refusal is now met by a growth;
+/// 3. the declines that remain are still attributed to a **machine root** word — the honest answer
+///    for a term from a region the collector does not scan (a [`beam_message`] fragment, the other
+///    unscanned region this route creates) — never to a process root or to the descent;
+/// 4. the rooted seam is therefore **essentially never reached** (`reached` ≈ 0, against ≈ 1 per
+///    iteration before the growth path existed): the capacity refusal it used to turn into a
+///    decline is served by the growth, so no arena block ever enters a register;
+/// 5. the arena fallbacks collapse with it — from ≈ 1 per iteration, all of them attributed to a
+///    refused rooted collection ([`gc::valve_counters::FallbackSite::ValveDeclined`]), to
+///    (essentially) zero and **flat** in `N`;
+/// 6. each reach still classifies the **whole** machine root set — the whole x-register file plus
+///    the whole FR file ([`publish_roots_full`] appends the FR file after the stack), ~2 Ki words
+///    per reach. What collapsed is the number of reaches, so the workload's total classification
+///    work is ~4 Ki words per **iteration** down to a few hundred.
 ///
 /// A missing `erlc` is a **loud skip**, never a silent pass.
 #[test]
-fn the_copy_bound_ping_pong_declines_the_valve_at_every_admission_point() {
+fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
     let Some(erlc) = resolve_erlc() else {
         skip_loudly("srprof-valve", "erlc was not found beside $ERTS_ORACLE or on $PATH");
         return;
@@ -7263,44 +7360,74 @@ fn the_copy_bound_ping_pong_declines_the_valve_at_every_admission_point() {
         for (door, counts) in run.counters.doors() {
             eprintln!("srprof-valve {label}: {}", door_line(door, &counts));
         }
+        match run.counters.first_decline {
+            Some(first) => eprintln!(
+                "srprof-valve {label}: first_decline door={:?} slice={:?} index={} live_len={}",
+                first.door, first.slice, first.index, first.live_len,
+            ),
+            None => eprintln!("srprof-valve {label}: first_decline none"),
+        }
     }
 
     let full = &large.counters.ensure_heap_full;
     let rooted = &large.counters.alloc_words_rooted;
     let reached = full.reached + rooted.reached;
 
-    // (1) The two engine doors are the only ones reached, and the valve is reached many times per
-    //     iteration: the occupancy test passes again and again because the nursery never drains.
-    //     The bound is deliberately loose (a factor of 2 below the measured rate) so the pin states
-    //     the mechanism, not a fragile exact count.
+    // (1) The two engine doors are the only ones reached, and the valve is reached **rarely**
+    //     relative to the iteration count: the nursery really drains, so the occupancy short-circuit
+    //     (or the growth seam's debt) is what lets the door through — never a permanently full heap.
+    //     The bound is deliberately loose so the pin states the mechanism, not a fragile exact count.
     let other = large.counters.ensure_heap.reached + large.counters.serve_gc_request.reached;
     assert_eq!(other, 0, "the engine reaches only the two full-root doors ({other} others)");
     assert!(
-        reached as i64 > LARGE * 2,
-        "the valve must be reached many times per iteration: reached={reached} for N={LARGE} \
-         (full={} rooted={})",
+        reached as i64 * 8 < LARGE,
+        "the valve must be reached rarely — at most an eighth of the iterations: reached={reached} \
+         for N={LARGE} (full={} rooted={})",
         full.reached,
         rooted.reached,
     );
-    // (2) Every one of those reaches had the occupancy test pass: nothing is reached "for free",
-    //     and the collection debt (a no-collect growth) never forces the door.
-    assert_eq!(
-        full.reached, full.occupancy,
-        "the full-root door is reached exactly when its occupancy test says the nursery is full"
-    );
-    assert_eq!(full.debt, 0, "no growth leaves collection debt at the full-root door");
-    assert_eq!(full.forced, 0, "the workload requests no collection");
-    // (3) The valve declines essentially every call, and the decline is a **machine root**: the
-    //     engine holds an unscanned term in a published x-file slot. A process root or a descent
-    //     hit would mean a different mechanism entirely.
+    assert!(reached > 0, "the door must still be reached: the workload allocates");
+    // (2) Every reach had the occupancy test pass or the growth seam's collection debt outstanding:
+    //     nothing is reached "for free", and the debt is the evidence that a young-heap refusal is
+    //     being met by a growth rather than by a decline.
     assert!(
-        full.hits as i64 > LARGE * 3 / 4,
-        "the full-root door must decline at (almost) every admission point: hits={} for N={LARGE}",
+        full.occupancy + full.debt >= full.reached,
+        "every full-root reach had occupancy or debt: reached={} occupancy={} debt={}",
+        full.reached,
+        full.occupancy,
+        full.debt,
+    );
+    assert!(full.occupancy > 0, "the occupancy test still lets the door through");
+    assert!(
+        full.debt > 0,
+        "a no-collect growth leaves collection debt at the full-root door: debt={}",
+        full.debt,
+    );
+    assert_eq!(full.forced, 0, "the workload requests no collection");
+    // (3) The door really **collects** — the circle is broken at its entry point: the collection is
+    //     no longer declined at (almost) every reach, and what remains is a small fraction of the
+    //     iterations. The declines that do remain are still machine roots (the honest answer for a
+    //     term from a region the collector does not scan), never a process root or a descent.
+    assert!(
+        full.hits as i64 * 8 < LARGE,
+        "the full-root door's declines must collapse to a small fraction of the iterations: \
+         hits={} for N={LARGE} (was ≈1 per iteration)",
         full.hits,
+    );
+    assert!(
+        full.collections as i64 * 40 > LARGE,
+        "the full-root door must really collect, at a rate that scales with N: collections={} for \
+         N={LARGE}",
+        full.collections,
+    );
+    assert!(
+        full.descents > 0,
+        "a committed collection runs the descent once the latch is open: descents={}",
+        full.descents,
     );
     assert_eq!(
         full.machine_root_hits, full.hits,
-        "every full-root decline is attributable to a machine root word"
+        "every remaining full-root decline is attributable to a machine root word"
     );
     assert_eq!(
         full.process_root_hits, 0,
@@ -7310,81 +7437,80 @@ fn the_copy_bound_ping_pong_declines_the_valve_at_every_admission_point() {
         full.descent_hits, 0,
         "no decline needed the O(live objects) descent: phase 1 finds the unscanned root itself"
     );
-    // (4) The rooted allocation seam is reached exactly once per iteration, and it never gets past
-    //     the valve: it never collects, so the driver's payload build always lands on the arena.
+    // (4) The rooted allocation seam is (essentially) never reached at all: the capacity refusal it
+    //     used to turn into a decline is met by the no-relocation growth, so the driver's payload
+    //     build lands on the process's own reclaimable heap rather than on the pointer-stable
+    //     arena — which is exactly what keeps an unscanned word out of the machine's registers.
     assert!(
-        rooted.reached == rooted.hits && rooted.collections == 0 && rooted.descents == 0,
-        "every rooted reach must decline without a collection: reached={} hits={} collections={} \
-         descents={}",
-        rooted.reached,
-        rooted.hits,
-        rooted.collections,
-        rooted.descents,
-    );
-    assert!(
-        rooted.reached as i64 >= LARGE * 3 / 4,
-        "the rooted seam is reached ~once per iteration: reached={} for N={LARGE}",
+        rooted.reached * 100 <= LARGE as usize,
+        "the rooted seam must be reached at most ~1% of the iterations: reached={} for N={LARGE}",
         rooted.reached,
     );
-    // The arena fallbacks are the rooted door's declines, and they are the runtime's own total: an
-    // allocation per iteration that the collector never reclaims.
+    assert_eq!(
+        rooted.descents, 0,
+        "the rooted seam runs no descent: it is not the door the collections come from"
+    );
+    // The arena fallbacks are (essentially) gone: a refused rooted collection no longer sends its
+    // allocation to the pointer-stable arena, so no arena block is ever written into a register and
+    // the full-root door's roots stay scannable.
     use gc::valve_counters::FallbackSite;
     assert_eq!(
         large.counters.fallbacks,
         large.stats.fallbacks as usize,
         "the tally must agree with the runtime's own arena-fallback counter"
     );
-    assert_eq!(
-        large.counters.fallbacks_at(FallbackSite::ValveDeclined),
-        rooted.reached,
-        "every rooted decline sends its allocation to the arena"
-    );
-    assert_eq!(
-        large.counters.fallbacks_at(FallbackSite::PostCollection),
-        0,
-        "the rooted seam never reaches its post-collection bump: the valve refuses first"
-    );
     assert!(
-        large.counters.fallbacks as i64 >= LARGE * 3 / 4,
-        "the driver's term construction must fall back to the arena ~once per iteration: {} for \
+        large.counters.fallbacks as i64 * 1000 < LARGE,
+        "the arena fallbacks must collapse from ~1 per iteration to a vanishing fraction: {} for \
          N={LARGE}",
         large.counters.fallbacks,
     );
     assert!(
-        large.counters.fallbacks > small.counters.fallbacks,
-        "the arena fallbacks must scale with the iteration count: small={} large={}",
+        large.counters.fallbacks_at(FallbackSite::ValveDeclined) as i64 * 1000 < LARGE,
+        "no allocation should reach the arena through a refused rooted collection: {} of {} for \
+         N={LARGE}",
+        large.counters.fallbacks_at(FallbackSite::ValveDeclined),
+        large.counters.fallbacks,
+    );
+    assert_eq!(
+        large.counters.fallbacks_at(FallbackSite::PostCollection),
+        0,
+        "the rooted seam never reaches its post-collection bump: it is never reached at all"
+    );
+    // ...and they no longer grow with the iteration count: the flat, vanishing rate is the whole
+    // point (the circled shape's fallbacks scaled with `N`).
+    assert!(
+        large.counters.fallbacks <= small.counters.fallbacks,
+        "the arena fallbacks must not scale with the iteration count: small={} large={}",
         small.counters.fallbacks,
         large.counters.fallbacks,
     );
-    // The collections the runtime runs are not the driver's declines: they are a small fraction of
-    // the iterations (the worker's, whose roots are clean), never one per admission point.
+    // The collections the runtime runs are the driver's own now (its heap really drains), and they
+    // stay a small fraction of the iterations rather than one per admission point.
     assert!(
-        large.stats.collections * 16 < LARGE as u64,
-        "collections must stay rare next to the iterations: {} for N={LARGE}",
+        large.stats.collections > 0 && large.stats.collections * 16 < LARGE as u64,
+        "collections must be real but rare next to the iterations: {} for N={LARGE}",
         large.stats.collections,
     );
-    // (5) The per-word phase is the *whole* machine root set per call, not the live prefix: the
-    //     full-root doors classify the whole x file (1024) plus the whole FR file (1024) plus the
-    //     Erlang stack, so the classification work is ~2 Ki words per reach and ~4 Ki per
-    //     iteration — the numbers that make the per-word phase this workload's dominant term.
+    // (5) The per-word phase is still the *whole* machine root set per call — the whole x file
+    //     (1024) plus the whole FR file (1024) plus the Erlang stack — so the classification work
+    //     per reach is unchanged. What collapsed is the number of reaches, and with it the
+    //     workload's total classification work (~4 Ki words per iteration before).
     const MIN_WORDS_PER_REACH: usize = 2_000;
     assert!(
-        full.machine_words >= full.reached * MIN_WORDS_PER_REACH
-            && rooted.machine_words >= rooted.reached * MIN_WORDS_PER_REACH,
-        "each reach must classify the whole x + FR file: \
-         full={}/{} rooted={}/{}",
+        full.machine_words >= full.reached * MIN_WORDS_PER_REACH,
+        "each reach must classify the whole x + FR file: full={}/{}",
         full.machine_words,
         full.reached,
-        rooted.machine_words,
-        rooted.reached,
     );
     let total_words = full.machine_words + rooted.machine_words;
     assert!(
-        total_words >= (LARGE as usize) * 4_000,
-        "the per-word phase must classify ~4 Ki words per iteration: {total_words} for N={LARGE}"
+        total_words * 100 < (LARGE as usize) * 40_000,
+        "the per-word phase must classify far fewer words per iteration than a reach at every \
+         admission point (~4 Ki): {total_words} for N={LARGE}"
     );
-    // ...and the classification workload therefore scales with the door's own reach count, which
-    // itself scales with the iterations.
+    // ...and it still scales with the iteration count, through the door's own reach count (a fixed
+    // number of reaches per collection, and the collections are linear in `N`).
     let small_reached =
         small.counters.ensure_heap_full.reached + small.counters.alloc_words_rooted.reached;
     assert!(
@@ -7392,16 +7518,14 @@ fn the_copy_bound_ping_pong_declines_the_valve_at_every_admission_point() {
         "the valve's reach count must scale with the iteration count: small={small_reached} \
          large={reached}",
     );
-    // The reach count is *linear* in the iteration count (a fixed number of reaches per
-    // iteration), which is what makes the per-word phase's total cost scale with `N`:
     let mid_reached = mid.counters.ensure_heap_full.reached + mid.counters.alloc_words_rooted.reached;
     assert!(
-        reached > mid_reached && reached < mid_reached * 3,
+        reached > mid_reached * 3 / 2 && reached < mid_reached * 3,
         "the valve's reach count must be linear in the iteration count: mid={mid_reached} \
          large={reached} for {MID} -> {LARGE}",
     );
     eprintln!(
-        "srprof-valve totals: reached={reached} (~{:.1}/iteration) machine_words={total_words} \
+        "srprof-valve totals: reached={reached} (~{:.3}/iteration) machine_words={total_words} \
          (~{:.0} words/iteration) fallbacks={}",
         reached as f64 / LARGE as f64,
         total_words as f64 / LARGE as f64,
