@@ -76,11 +76,9 @@
 //! * `ready_input` is a **documented no-op**. The socket still registers read readiness, so the
 //!   runtime observes the event and issues `recv`; the driver cannot push anything itself.
 //!
-//! This cannot mirror the oracle's `PACKET_REQ_RECV` byte for byte: the C's code-60 request
-//! demands a matching `enq_async` entry and its ancillary-data state, so a live `port_control`
-//! of code `60` answers `[0]einval` in every passively-reachable configuration. The floor
-//! replaces it with the synchronous read-now verb above, which is what a runtime with no driver
-//! message path can actually deliver.
+//! This cannot mirror the oracle's `PACKET_REQ_RECV` byte for byte: the C's code-60 request accepts the `Timeout(4), Length(4)` payload, enqueues an async operation on the descriptor's `INET_MAX_ASYNC = 1` queue, and answers the three-byte async-op id `[1] ++ async_id_be16` — measured against the oracle as `[1,0,0]`, then `[1,0,1]` on the next call — with the datagram itself arriving later as an `{inet_async, Port, Ref, Result}` message.
+//! Only the **empty** argument is `[0]einval`, which the C rejects without enqueuing anything.
+//! With no driver→owner message path, the floor replaces that whole asynchronous request/reply exchange with the synchronous read-now verb above, delivering the datagram in the reply itself.
 //!
 //! # What the real `gen_udp` still needs
 //!
