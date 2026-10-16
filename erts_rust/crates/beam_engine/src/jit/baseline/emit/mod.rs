@@ -262,8 +262,8 @@ pub(super) fn emit_helper_call(
     allocation: &Allocation,
     helper: *const (),
     args: &[i64],
-) -> Result<()> {
-    spill(buffer, allocation, SpillSite::Helper)?;
+pc: u32) -> Result<()> {
+    spill(buffer, allocation, SpillSite::Helper, pc)?;
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     // The `rsi`/`rdx`/`rcx`/`r8`/`r9` argument registers, in ABI order.
     const ARG_REGISTERS: [Reg; 5] = [Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
@@ -306,7 +306,7 @@ pub(super) fn emit_step_and_continue(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 

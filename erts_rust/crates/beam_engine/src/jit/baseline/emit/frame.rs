@@ -100,7 +100,7 @@ pub(super) fn emit_deallocate(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(deallocate)],
-    )?;
+    pc)?;
     // `rax` holds the helper's word; only "the next instruction" continues here.
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
@@ -138,7 +138,7 @@ pub(super) fn emit_return(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    )?;
+    pc)?;
     emit_word_exit(buffer, done)
 }
 
@@ -169,7 +169,7 @@ pub(super) fn emit_deallocate_return(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(deallocate)],
-    )?;
+    pc)?;
     emit_word_exit(buffer, done)
 }
 
@@ -227,7 +227,7 @@ mod tests {
     /// `spill` of `allocation` (its **written** cache), as emitted.
     fn spill_bytes(allocation: &Allocation) -> Vec<u8> {
         encoded(|buffer| {
-            super::super::spill(buffer, allocation, super::super::SpillSite::Exit).unwrap()
+            super::super::spill(buffer, allocation, super::super::SpillSite::Exit, 0).unwrap()
         })
     }
 

@@ -586,7 +586,7 @@ pub(crate) fn emit_block(
                     // A compiled successor is entered **directly** (the linker tears
                     // this block's frame down and jumps to its entry); anything else
                     // returns the `(func, pc)` word to the driver exactly as before.
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc)?;
+                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
                     terminated = true;
                     break;
                 }
@@ -633,7 +633,7 @@ pub(crate) fn emit_block(
                             target_func,
                             target_pc,
                             *deallocate,
-                        )?;
+                        pc)?;
                     } else {
                         linker.emit_tail_exit_to_driver(
                             buffer,
@@ -642,7 +642,7 @@ pub(crate) fn emit_block(
                             target_func,
                             target_pc,
                             *deallocate,
-                        )?;
+                        pc)?;
                     }
                     terminated = true;
                     break;
@@ -662,7 +662,7 @@ pub(crate) fn emit_block(
             Instr::CallOnly { target, .. } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
                     emit_local_call_probe(buffer, allocation, done, func, pc)?;
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc)?;
+                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
                     terminated = true;
                     break;
                 }
@@ -702,11 +702,11 @@ pub(crate) fn emit_block(
                         allocation,
                         jit_call_store as *const (),
                         &[i64::from(func), i64::from(pc)],
-                    )?;
+                    pc)?;
                     buffer.mov_ri(Reg::R11, CALL_STORED)?;
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
                     buffer.jcc(Cond::Ne, done)?;
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc)?;
+                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
                     terminated = true;
                     break;
                 }
@@ -865,7 +865,7 @@ pub(crate) fn emit_block(
     if !terminated {
         // The block ran off its end: hand the next address back to the driver — or,
         // when the following block starts exactly there, jump straight into it.
-        linker.emit_exit(buffer, allocation, done, func, end as u32)?;
+        linker.emit_exit(buffer, allocation, done, func, end as u32, end as u32)?;
     }
 
     // --- epilogue -----------------------------------------------------------
@@ -990,7 +990,7 @@ fn emit_local_call_probe(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    )?;
+    pc)?;
     buffer.mov_ri(Reg::R11, LOCAL_DECLINE)?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)
@@ -1034,7 +1034,7 @@ fn emit_ext_call(
             i64::from(kind),
             i64::from(deallocate),
         ],
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 
@@ -1067,7 +1067,7 @@ fn emit_receive(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 

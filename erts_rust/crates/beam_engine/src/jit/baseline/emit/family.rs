@@ -68,6 +68,6 @@ pub(super) fn emit_family(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }

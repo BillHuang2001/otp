@@ -105,7 +105,7 @@ pub(super) fn emit_allocate(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(stack_need)],
-    )?;
+    pc)?;
     emit_frame_change_continue(buffer, allocation, done, func, pc)
 }
 
@@ -139,7 +139,7 @@ pub(super) fn emit_allocate_heap(
             i64::from(heap_need),
             i64::from(live),
         ],
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 
@@ -170,7 +170,7 @@ pub(super) fn emit_test_heap(
             i64::from(heap_need),
             i64::from(live),
         ],
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 
@@ -196,7 +196,7 @@ pub(super) fn emit_trim(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(n)],
-    )?;
+    pc)?;
     emit_frame_change_continue(buffer, allocation, done, func, pc)
 }
 
@@ -267,7 +267,7 @@ mod tests {
     /// `spill` of `allocation` (its **written** cache), as emitted.
     fn spill_bytes(allocation: &Allocation) -> Vec<u8> {
         encoded(|buffer| {
-            super::super::spill(buffer, allocation, super::super::SpillSite::Exit).unwrap()
+            super::super::spill(buffer, allocation, super::super::SpillSite::Exit, 0).unwrap()
         })
     }
 

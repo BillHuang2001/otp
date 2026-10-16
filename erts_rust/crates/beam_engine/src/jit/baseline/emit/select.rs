@@ -173,12 +173,12 @@ pub(super) fn try_inline_select_val(
     }
 
     // --- no alternative matched: branch to the fail label -------------------
-    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1)?;
+    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1, pc)?;
 
     // --- each alternative: branch to its target ----------------------------
     for ((_, target), case_label) in plan.cases.iter().zip(&case_labels) {
         buffer.bind(*case_label)?;
-        linker.emit_exit(buffer, allocation, done, target.0, target.1)?;
+        linker.emit_exit(buffer, allocation, done, target.0, target.1, pc)?;
     }
 
     // --- the `Y` guard rejected the scrutinee: run the real instruction -----

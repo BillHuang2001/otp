@@ -761,7 +761,7 @@ pub(super) fn try_inline_test(
     // x-registers, leaves this frame and jumps to its entry); any other fail
     // target returns its `(func, pc)` word to the driver exactly as before.
     buffer.bind(failed)?;
-    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1)?;
+    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1, pc)?;
 
     // --- the lowering rejected an operand -----------------------------------
     // Two rejections reach this label: the small-int **guard** (a comparison operand
@@ -889,7 +889,7 @@ fn emit_test_helper(
     )?;
 
     buffer.bind(failed)?;
-    linker.emit_exit(buffer, allocation, done, fail_func, fail_pc)?;
+    linker.emit_exit(buffer, allocation, done, fail_func, fail_pc, pc)?;
 
     buffer.bind(after)?;
     Ok(true)
@@ -931,7 +931,7 @@ fn emit_test_helper_branch(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    )?;
+    pc)?;
 
     buffer.mov_ri(Reg::R11, TEST_TRUE)?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
