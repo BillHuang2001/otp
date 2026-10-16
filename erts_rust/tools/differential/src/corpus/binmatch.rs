@@ -301,10 +301,11 @@ pub(crate) fn group() -> Vec<Case> {
         // oracle truncates rather than raising, even for a bignum far outside the segment and
         // even for `unsigned` with a negative value (`<<256>>` is `<<0>>`). The only
         // `badarg`s here come from an invalid *size* (negative), a non-byte-aligned
-        // `decode_unsigned/1` subject and a negative `encode_unsigned/1` value; the last case
-        // pins those. `size/1` is deliberately not used as a segment-size expression — it
-        // rejects an integer (`size(1 bsl 100)` is `badarg`), so the derived sizing uses
-        // `bit_size(binary:encode_unsigned(N))` instead.
+        // `decode_unsigned/1` subject and a negative `encode_unsigned/1` value; the
+        // `binary/bignum_segment_size_badarg` case pins those. `size/1` cannot size such a
+        // segment — it rejects an integer (`size(1 bsl 100)` is `badarg`, which escapes the
+        // construction as `badarg`; see `binary/bignum_segment_sized_by_size_is_badarg`), so the
+        // derived sizing uses `bit_size(binary:encode_unsigned(N))` instead.
         Case {
             id: "binary/bignum_truncated_into_byte_segment",
             description: "a bignum value truncates to the low 8 bits of an 8-bit segment (2 bsl 64 lands as 0)",
@@ -472,6 +473,22 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok [badarg,badarg,badarg]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/bignum_segment_sized_by_size_is_badarg",
+            description: "sizing a segment with size/1 of a bignum raises badarg, since size/1 rejects an integer",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The segment-size expression is evaluated as part of the construction, so
+                // `size/1`'s own badarg escapes as the construction's badarg.
+                expr: "begin try <<(1 bsl 100):(size(1 bsl 100))>> catch error:ReasonA -> ReasonA end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok badarg"),
                 exit_code: 0,
             },
         },
