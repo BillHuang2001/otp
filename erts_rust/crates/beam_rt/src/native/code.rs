@@ -299,6 +299,96 @@ impl RuntimeContext<'_> {
         self.module_pair(&name)
     }
 
+    /// `code:ensure_modules_loaded(Modules)`: the atom `ok` when every module named is loaded
+    /// (or was loadable), or `{error, [{Module, Reason}]}` naming the ones that are not.
+    ///
+    /// The oracle's pipeline (`code.erl:1319-1358`) is: the `is_list(Modules)` guard, then
+    /// `prepare_ensure/2`, which requires a **proper list of atoms** and otherwise
+    /// `erlang:error(function_clause, [Modules])`; the names that are neither **preloaded** nor
+    /// **already loaded** are `lists:usort`-ed (ascending by atom name) and each is located with
+    /// `code:get_object_code/1` and prepared. A failure is `{Name, nofile | badfile}` and only
+    /// the failures are listed, so a fully loaded or loadable list answers the bare atom `ok`.
+    /// This is [`Self::code_ensure_loaded`]'s machinery applied to a whole list, sharing its
+    /// [`Self::module_file`] lookup and [`CodeServer::load`](crate::CodeServer::load).
+    ///
+    /// Oracle-verified (OTP 29.1.1 / erts-17.1), each a `-noshell -eval '<expr>' -s init stop`
+    /// run compared on stdout **and** exit code: `code:ensure_modules_loaded([])` ⇒ `ok` (0);
+    /// `code:ensure_modules_loaded([lists,maps])` ⇒ `ok` (0);
+    /// `code:ensure_modules_loaded([lists,dets,no_m])` ⇒ `{error,[{no_m,nofile}]}` (0);
+    /// `code:ensure_modules_loaded([lists,no_such_mod_xyz])` ⇒
+    /// `{error,[{no_such_mod_xyz,nofile}]}` (0);
+    /// `code:ensure_modules_loaded([lists,no_m,no_m,dets])` ⇒ `{error,[{no_m,nofile}]}` (0 —
+    /// deduplicated); `code:ensure_modules_loaded([erlang,init])` ⇒ `ok` (0 — preloaded). A
+    /// non-list, an **improper** list and a non-atom element all leave `prepare_ensure/2` with
+    /// the same `error:function_clause` raise (empty stdout, empty stderr, exit 1), reproduced
+    /// here with the bare-atom reason atom exactly as [`Self::code_lib_dir_2`] does.
+    ///
+    /// **Failure order.** The oracle's list is built by `do_par_recv/3`, which **prepends** each
+    /// result as it arrives, so on a fresh single-run host it is the `usort` order **reversed**
+    /// (probed five times, stable: `[b_m,a_m,c_m]` ⇒ `{error,[{c_m,nofile},{b_m,nofile},
+    /// {a_m,nofile}]}`, `[lists,a_m,b_m]` ⇒ `{error,[{b_m,nofile},{a_m,nofile}]}`). It is racy by
+    /// design for large sets, so the deterministic reverse-of-sorted order is emitted — an
+    /// unambiguous match for a single failing module, which is the shape a probe can pin.
+    ///
+    /// **Accepted residual.** For a `<Name>.beam` that *is* on the code path but corrupt, the
+    /// oracle answers `{error,[{Name,badfile}]}` and **also** logs an
+    /// `=ERROR REPORT==== … corrupt file header` line on its default handler; this runtime has no
+    /// logger and emits no such line — only the value, never an invented report.
+    pub(super) fn code_ensure_modules_loaded(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let modules = *args.first().ok_or(BeamError::BadArg)?;
+        // `prepare_ensure/2`'s argument contract: a **proper list of atoms**. Anything else —
+        // a non-list, an improper list, a non-atom element — leaves the wrapper with no matching
+        // clause and raises `error:function_clause` (the bare reason atom, not `badarg`).
+        let Some(elements) = terms::list_elements(modules).ok() else {
+            return Err(super::prim::function_clause());
+        };
+        let mut names = Vec::with_capacity(elements.len());
+        for element in elements {
+            let Some(name) = self.atom_name(element) else {
+                return Err(super::prim::function_clause());
+            };
+            names.push(name);
+        }
+        // Only the names that are not already available, deduplicated and sorted by name — the
+        // oracle's `lists:usort/1` over the not-loaded remainder.
+        names.retain(|name| {
+            !self.runtime.preloaded().is_preloaded(name)
+                && !self.runtime.code_server.is_loaded(name)
+        });
+        names.sort();
+        names.dedup();
+
+        // One locate-and-load per name, in the `usort` order; a found-but-unloadable `.beam` is
+        // `badfile` and is never folded into `nofile`.
+        let mut failures: Vec<(String, &'static str)> = Vec::new();
+        for name in names {
+            let reason = match self.module_file(&name) {
+                None => "nofile",
+                Some(_) => match self.runtime.code_server.load(&name) {
+                    Ok(_) => continue,
+                    Err(_) => "badfile",
+                },
+            };
+            failures.push((name, reason));
+        }
+        if failures.is_empty() {
+            return self.atom("ok");
+        }
+
+        // The oracle prepends each result as it arrives, so the emitted list is the `usort`
+        // order reversed (see the order note above).
+        failures.reverse();
+        let mut pairs = Vec::with_capacity(failures.len());
+        for (name, reason) in failures {
+            let name = self.atom(&name)?;
+            let reason = self.atom(reason)?;
+            pairs.push(terms::make_tuple(self, &[name, reason])?);
+        }
+        let tag = self.atom("error")?;
+        let list = terms::make_list(self, &pairs)?;
+        terms::make_tuple(self, &[tag, list])
+    }
+
     /// `code:load_file(Module)`: load `Module` from its `.beam` on the code path.
     ///
     /// The oracle's `code_server` order, one clause per outcome:
@@ -1238,6 +1328,21 @@ mod tests {
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Runs the oracle `erl` on the `-eval` `program` and answers its trimmed stdout **and** its
+    /// exit code, or `None` when the oracle cannot be resolved or the probe cannot complete.
+    ///
+    /// Unlike [`oracle_probe`] this also reports a **failing** run — the shape an uncaught raise
+    /// produces (empty stdout, exit 1) — which is what `code:ensure_modules_loaded/1`'s guard
+    /// needs. The program still ends with `-s init stop`, so a successful probe terminates on its
+    /// own like every other one.
+    fn oracle_run(program: &str) -> Option<(String, Option<i32>)> {
+        let output = std::process::Command::new(oracle_erl()?)
+            .args(["-noshell", "-eval", program, "-s", "init", "stop"])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Some((stdout, output.status.code()))
+    }
     /// The loud banner for a skipped oracle comparison — a missing toolchain is never a
     /// silent pass.
     fn skip_oracle_loudly() {
@@ -1659,6 +1764,281 @@ mod tests {
             runtime.atom_name_of(terms::tuple_element(again, 0).unwrap()),
             Some("module")
         );
+    }
+
+    /// `names` as a list of atoms on the runtime's own heap — the `ensure_modules_loaded/1`
+    /// argument shape.
+    fn atom_list(runtime: &mut crate::Runtime, names: &[&str]) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = crate::context::RuntimeContext::with_output(runtime, &mut sink);
+        let elements: Vec<Eterm> = names
+            .iter()
+            .map(|name| context.atom(name).expect("the element atom"))
+            .collect();
+        terms::make_list(&mut context, &elements).expect("an atom list")
+    }
+
+    /// The `{Name, Reason}` atom pairs of the `{error, Pairs}` answer `answer`, in order.
+    fn failure_pairs(runtime: &mut crate::Runtime, answer: Eterm) -> Vec<(String, String)> {
+        assert_eq!(terms::tuple_arity(answer).expect("a pair"), 2, "{answer:?}");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("error"),
+            "the answer is an `error` tuple"
+        );
+        let list = terms::tuple_element(answer, 1).unwrap();
+        terms::list_elements(list)
+            .expect("the failure list")
+            .iter()
+            .map(|pair| {
+                assert_eq!(terms::tuple_arity(*pair).expect("a pair"), 2, "{pair:?}");
+                let name = runtime
+                    .atom_name_of(terms::tuple_element(*pair, 0).unwrap())
+                    .expect("the module name is an atom");
+                let reason = runtime
+                    .atom_name_of(terms::tuple_element(*pair, 1).unwrap())
+                    .expect("the reason is an atom");
+                (name.to_string(), reason.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn code_ensure_modules_loaded_answers_ok_for_an_empty_or_loadable_list() {
+        // Oracle-verified (OTP 29.1.1 / erts-17.1): `code:ensure_modules_loaded([])` ⇒ `ok`,
+        // `code:ensure_modules_loaded([lists,maps])` ⇒ `ok` (both need nothing of the code
+        // path), each with exit code 0.
+        let mut runtime = runtime();
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[beam_term::NIL]).expect("eml/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("ok"));
+
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let argument = atom_list(&mut runtime, &["lists", "maps"]);
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("ok"));
+    }
+
+    #[test]
+    fn code_ensure_modules_loaded_reports_only_the_failures() {
+        // Oracle-verified: the loadable/preloaded names are filtered out first, so only the
+        // ones that could not be prepared are listed —
+        // `code:ensure_modules_loaded([lists,dets,no_m])` ⇒ `{error,[{no_m,nofile}]}`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let argument = atom_list(&mut runtime, &["lists", "no_such_mod_xyz"]);
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        assert_eq!(
+            failure_pairs(&mut runtime, answer),
+            vec![("no_such_mod_xyz".to_string(), "nofile".to_string())]
+        );
+
+        // A system module that *is* on the path is loaded, so it is not listed either.
+        let argument = atom_list(&mut runtime, &["lists", "no_m", "dets"]);
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        assert_eq!(
+            failure_pairs(&mut runtime, answer),
+            vec![("no_m".to_string(), "nofile".to_string())]
+        );
+
+        // A repeated name is deduplicated (`lists:usort/1`):
+        // `code:ensure_modules_loaded([lists,no_m,no_m,dets])` ⇒ `{error,[{no_m,nofile}]}`.
+        let argument = atom_list(&mut runtime, &["lists", "no_m", "no_m", "dets"]);
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        assert_eq!(
+            failure_pairs(&mut runtime, answer),
+            vec![("no_m".to_string(), "nofile".to_string())]
+        );
+    }
+
+    #[test]
+    fn code_ensure_modules_loaded_emits_the_reverse_of_the_sorted_failures() {
+        // The oracle's `do_par_recv/3` prepends each result as it arrives, so on a fresh
+        // single-run host the emitted list is the `usort` order reversed. Oracle-verified
+        // (stable over five runs): `code:ensure_modules_loaded([b_m,a_m,c_m])` ⇒
+        // `{error,[{c_m,nofile},{b_m,nofile},{a_m,nofile}]}` (`lists:usort([b_m,a_m,c_m])` ⇒
+        // `[a_m,b_m,c_m]`).
+        let mut runtime = runtime();
+        let argument = atom_list(&mut runtime, &["b_m", "a_m", "c_m"]);
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        assert_eq!(
+            failure_pairs(&mut runtime, answer),
+            vec![
+                ("c_m".to_string(), "nofile".to_string()),
+                ("b_m".to_string(), "nofile".to_string()),
+                ("a_m".to_string(), "nofile".to_string()),
+            ]
+        );
+
+        // The reverse is over the **failures**, not the argument order: a loadable name is
+        // filtered out before the reversal. Oracle-verified:
+        // `code:ensure_modules_loaded([lists,a_m,b_m])` ⇒ `{error,[{b_m,nofile},{a_m,nofile}]}`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let argument = atom_list(&mut runtime, &["lists", "a_m", "b_m"]);
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        assert_eq!(
+            failure_pairs(&mut runtime, answer),
+            vec![
+                ("b_m".to_string(), "nofile".to_string()),
+                ("a_m".to_string(), "nofile".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn code_ensure_modules_loaded_answers_ok_for_preloaded_names() {
+        // Oracle-verified: `code:ensure_modules_loaded([erlang,init])` ⇒ `ok` — the preloaded
+        // modules are available without touching the code path.
+        let mut runtime = runtime();
+        for names in [&["erlang", "init"][..], &["init", "init", "erlang"][..]] {
+            let argument = atom_list(&mut runtime, names);
+            let answer =
+                call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+            assert_eq!(runtime.atom_name_of(answer), Some("ok"), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn code_ensure_modules_loaded_guards_on_a_proper_list_of_atoms() {
+        // `prepare_ensure/2` (`code.erl:1330-1336`) requires a **proper list of atoms** and
+        // otherwise `erlang:error(function_clause, [Modules])`. Oracle-verified (OTP 29.1.1 /
+        // erts-17.1): `code:ensure_modules_loaded(not_a_list)`,
+        // `code:ensure_modules_loaded([lists|foo])` and
+        // `code:ensure_modules_loaded([lists,42])` each print nothing on stdout, nothing on
+        // stderr, and exit 1 — here that is the bare-atom `function_clause` raise, never
+        // `badarg`. No code path is consulted, so this holds on a code-path-less runtime.
+        let mut runtime = runtime();
+        let not_a_list = atom(&mut runtime, "not_a_list");
+        let (improper, non_atom_element) = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = crate::context::RuntimeContext::with_output(&mut runtime, &mut sink);
+            let head = context.atom("lists").expect("the head atom");
+            let tail = context.atom("foo").expect("the tail atom");
+            let improper = terms::make_cons(&mut context, head, tail).expect("an improper list");
+            let head = context.atom("lists").expect("the head atom");
+            let elements = [head, make_small(42)];
+            let non_atom_element =
+                terms::make_list(&mut context, &elements).expect("a list with a non-atom");
+            (improper, non_atom_element)
+        };
+        for argument in [not_a_list, improper, non_atom_element] {
+            let error = call(&mut runtime, "code", "ensure_modules_loaded", &[argument])
+                .expect_err("the guard raises");
+            assert_eq!(error.as_atom(), Some("function_clause"), "{error} for {argument:?}");
+            assert!(
+                crate::error::unsupported_reason(&error).is_none(),
+                "a function_clause raise is a genuine error, not a capability gap: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_ensure_modules_loaded_maps_a_corrupt_beam_to_badfile() {
+        // A `<Name>.beam` that **is** on the code path but corrupt is the oracle's
+        // `{error,[{Name,badfile}]}` — never folded into `nofile`. Oracle-verified (OTP 29.1.1 /
+        // erts-17.1) with a bogus `badmod.beam` on the path:
+        // `code:ensure_modules_loaded([badmod])` ⇒ `{error,[{badmod,badfile}]}`. The oracle
+        // **also** logs an `=ERROR REPORT==== … corrupt file header` line on its default
+        // handler; this runtime has no logger and emits no such line — the one accepted
+        // residual, the value itself is exact.
+        let mut runtime = runtime();
+        let dir = std::env::temp_dir().join(format!("beam_rt_eml_{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("SKIP code:ensure_modules_loaded/1: cannot create {}", dir.display());
+            return;
+        }
+        let path = dir.join("badmod.beam");
+        if std::fs::write(&path, b"garbage-not-a-beam").is_err() {
+            eprintln!("SKIP code:ensure_modules_loaded/1: cannot write {}", path.display());
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let directory = chars(&mut runtime, &dir.display().to_string());
+        call(&mut runtime, "code", "add_patha", &[directory]).expect("code:add_patha/1");
+        let argument = atom_list(&mut runtime, &["badmod"]);
+        let answer =
+            call(&mut runtime, "code", "ensure_modules_loaded", &[argument]).expect("eml/1");
+        let pairs = failure_pairs(&mut runtime, answer);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pairs, vec![("badmod".to_string(), "badfile".to_string())]);
+        assert!(
+            !runtime.code_server.is_loaded("badmod"),
+            "a malformed image must not enter the code server's cache"
+        );
+    }
+
+    #[test]
+    fn code_ensure_modules_loaded_agrees_with_the_oracle() {
+        // The live-oracle cross-check for the answer value, the failure order and the guard's
+        // raise (empty stdout, exit 1) — so the expectations pinned above cannot rot.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let Some(answer) = oracle_probe(
+            "io:format(\"~p~n\",[code:ensure_modules_loaded([lists,no_such_mod_xyz])])",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(answer, "{error,[{no_such_mod_xyz,nofile}]}", "the oracle's own answer");
+        let argument = atom_list(&mut runtime, &["lists", "no_such_mod_xyz"]);
+        let ours = call(&mut runtime, "code", "ensure_modules_loaded", &[argument])
+            .expect("ensure_modules_loaded/1");
+        assert_eq!(
+            failure_pairs(&mut runtime, ours),
+            vec![("no_such_mod_xyz".to_string(), "nofile".to_string())]
+        );
+
+        let Some(answer) =
+            oracle_probe("io:format(\"~p~n\",[code:ensure_modules_loaded([b_m,a_m,c_m])])")
+        else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(
+            answer, "{error,[{c_m,nofile},{b_m,nofile},{a_m,nofile}]}",
+            "the oracle's own reverse order"
+        );
+        let argument = atom_list(&mut runtime, &["b_m", "a_m", "c_m"]);
+        let ours = call(&mut runtime, "code", "ensure_modules_loaded", &[argument])
+            .expect("ensure_modules_loaded/1");
+        assert_eq!(
+            failure_pairs(&mut runtime, ours),
+            vec![
+                ("c_m".to_string(), "nofile".to_string()),
+                ("b_m".to_string(), "nofile".to_string()),
+                ("a_m".to_string(), "nofile".to_string()),
+            ]
+        );
+
+        // A non-list argument: the oracle's run prints nothing and exits 1; this runtime
+        // reports the same bare-atom `function_clause` raise.
+        let Some((stdout, code)) =
+            oracle_run("io:format(\"~p~n\",[code:ensure_modules_loaded(not_a_list)])")
+        else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", Some(1)),
+            "the oracle's own behaviour for a non-list"
+        );
+        let not_a_list = atom(&mut runtime, "not_a_list");
+        let error = call(&mut runtime, "code", "ensure_modules_loaded", &[not_a_list])
+            .expect_err("a non-list raises");
+        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
     }
 
     /// The `{error, Reason}` pair `answer` is, or a panic naming the shape it really is.
