@@ -41,7 +41,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::copy::{identity, is_shared, preflight_words, shallow, CopyContext, Fixup};
+use crate::copy::{identity, is_shared, preflight_words, shallow, CopyContext, WorkStack};
 use crate::error;
 
 /// Copies `term`'s graph into `to`, returning the copied root, **sharing repeated subterms**.
@@ -65,9 +65,10 @@ pub fn copy_struct_shared(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>)
     }
 
     // The one-copy-per-source-identity memo (the `SHTABLE` of the C copier, keyed on the
-    // from-space term address) and the fix-up worklist shared with `copy_struct`'s loop.
+    // from-space term address) and the fix-up worklist shared with `copy_struct`'s loop — the same
+    // allocation-free `WorkStack`, so a message-sized shared copy pays no allocation either.
     let mut memo: HashMap<usize, Eterm> = HashMap::new();
-    let mut work: Vec<Fixup> = Vec::new();
+    let mut work = WorkStack::new();
 
     let root = materialize(term, to, ctx, &mut memo, &mut work)?;
     while let Some((slot, src)) = work.pop() {
@@ -90,7 +91,7 @@ fn materialize(
     to: &mut Heap,
     ctx: &mut CopyContext<'_>,
     memo: &mut HashMap<usize, Eterm>,
-    work: &mut Vec<Fixup>,
+    work: &mut WorkStack,
 ) -> Result<Eterm> {
     if is_shared(src) {
         return Ok(src);

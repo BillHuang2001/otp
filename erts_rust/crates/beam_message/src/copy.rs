@@ -77,7 +77,18 @@
 //! destination's finite free words, so a forged cycle exhausts them (in at most
 //! `available / 2` objects), the attempt is abandoned and the preflight path's
 //! [`is_acyclic`] check re-derives the typed `BadArg`.
+//!
+//! # The fix-up worklist is allocation-free
+//!
+//! Both writing traversals drive one shared [`WorkStack`] — the explicit stack of pending fix-ups
+//! that makes the copy iterative. Its first [`WORK_INLINE`] entries live *inside* the value (a
+//! `MaybeUninit` array, so constructing one writes no memory), and only a graph past that spills,
+//! **once**, to a heap `Vec`. A message-sized copy therefore touches the allocator not at all: the
+//! whole `copy_bound` `send_recv` payload (70 words, 27 objects) and the 64-key HAMT map probe in
+//! `tests/counters.rs` both copy with zero allocation events, where the per-call `Vec` this
+//! replaces paid two (the payload) and four (the HAMT map).
 
+use core::mem::MaybeUninit;
 use std::collections::HashSet;
 
 use beam_alloc::Heap;
@@ -215,6 +226,104 @@ impl<'a> CopyContext<'a> {
 /// object, and the source child term that must be copied into it.
 pub(crate) type Fixup = (*mut Eterm, Eterm);
 
+/// The number of pending fix-ups a [`WorkStack`] keeps **inline**, on the copy's own frame, without
+/// touching the allocator.
+///
+/// Rationale: the worklist's depth is the copy's *pending fan-out*, not the graph's size. One entry
+/// is pushed per non-shared child of a materialised object, so the live depth is the number of
+/// children left to resolve along the current descent path — for the message-sized graphs a `send`
+/// actually carries, that is tiny. The whole `copy_bound` `send_recv` payload (70 words, 27
+/// objects) leaves at most six entries live at once, and the widest single object the term layout
+/// produces, a HAMT node's 16-slot head array, still leaves room to descend several levels inside
+/// 32. So 32 fix-ups (32 × 16 B = 512 B of frame, of which only `len` entries are ever written)
+/// covers every ordinary message for free; a graph past it spills **once** (see [`WorkStack`]).
+///
+/// The value is a deliberate, measured trade: `tests/counters.rs` asserts that all four standard
+/// shapes — including the 64-key HAMT map, the widest one — copy with **zero** allocation events and
+/// that a graph modestly past this capacity pays exactly one (the spill), and `PERF.md` records the
+/// before/after counters and the wall-clock ratio.
+pub(crate) const WORK_INLINE: usize = 32;
+
+/// The copier's worklist of pending fix-ups: the explicit stack that makes the copy iterative, so a
+/// deep cons chain never recurses on the native stack. `push`/`pop` is the whole API — no traversal
+/// logic lives here; both writing traversals ([`try_copy_fast`] and [`copy_struct`]'s sized body)
+/// and the sharing-preserving copier drive this one type.
+///
+/// The first [`WORK_INLINE`] entries live in a `MaybeUninit` array *inside* the value, so
+/// constructing one writes no memory at all — `[MaybeUninit::uninit(); N]` stores nothing, where an
+/// array of *initialised* fix-ups would store 512 B on every copy, more stack traffic than the two
+/// small allocations it removes. Beyond that the stack spills to a `Vec<Fixup>` reserved at **twice**
+/// the inline capacity, so a graph modestly past `WORK_INLINE` (the spill probe in
+/// `tests/counters.rs`) pays exactly one allocation rather than one per doubling.
+///
+/// The spill preserves the stack discipline: the inline entries are the *older* (deeper) ones, so
+/// they are moved out first and stay below the entries that follow, and the `Vec`'s own `pop`
+/// returns the most recent entry exactly as the inline array does.
+///
+/// `Fixup` is a pair of machine words with no drop glue, so an inline entry that is never popped
+/// needs no dropping and an abandoned stack (a typed error mid-graph) leaks nothing.
+pub(crate) struct WorkStack {
+    /// The inline entries, live over `[0, len)`; `len` is `0` whenever `spilled` is non-empty.
+    inline: [MaybeUninit<Fixup>; WORK_INLINE],
+    /// How many of `inline` are live.
+    len: usize,
+    /// The overflow store, empty until the first spill (and allocator-free when it is empty).
+    spilled: Vec<Fixup>,
+}
+
+impl WorkStack {
+    /// An empty worklist — no allocation, no memory written.
+    pub(crate) fn new() -> WorkStack {
+        WorkStack {
+            inline: [MaybeUninit::uninit(); WORK_INLINE],
+            len: 0,
+            spilled: Vec::new(),
+        }
+    }
+
+    /// Pushes one pending fix-up.
+    ///
+    /// The first [`WORK_INLINE`] pushes are allocator-free; the one that overflows reserves the
+    /// spill `Vec` at twice the inline capacity and moves the inline entries into it.
+    pub(crate) fn push(&mut self, fixup: Fixup) {
+        // The invariant the two halves rely on: once the stack has spilled, the inline array is
+        // empty (its entries were moved into the `Vec`), so `len` and `spilled` are never both live.
+        debug_assert!(
+            self.spilled.is_empty() || self.len == 0,
+            "the inline entries and the spill store are never both live"
+        );
+        if self.spilled.is_empty() {
+            if self.len < WORK_INLINE {
+                self.inline[self.len].write(fixup);
+                self.len += 1;
+                return;
+            }
+            self.spilled.reserve(2 * WORK_INLINE);
+            for i in 0..self.len {
+                // SAFETY: entries `[0, len)` were written by earlier `push`es and have not been read
+                // out — `len` is reset to `0` below, after which their indices are never read again.
+                self.spilled.push(unsafe { self.inline[i].assume_init_read() });
+            }
+            self.len = 0;
+        }
+        self.spilled.push(fixup);
+    }
+
+    /// Pops the most recently pushed fix-up, or `None` once the worklist is empty.
+    pub(crate) fn pop(&mut self) -> Option<Fixup> {
+        if let Some(fixup) = self.spilled.pop() {
+            return Some(fixup);
+        }
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: entry `len` was written by a `push` and has not been read out — its index is
+        // handed out once only, because `len` is decremented here and the next `push` writes the
+        // slot anew before it can be popped again.
+        Some(unsafe { self.inline[self.len].assume_init_read() })
+    }
+}
 /// Whether `term` is shared as-is rather than copied: an immediate, or a compound (boxed/list)
 /// term word carrying the literal-area bit (`TAG_LITERAL_PTR`, tested only on compound words).
 ///
@@ -258,7 +367,7 @@ pub(crate) fn identity(term: Eterm) -> Option<usize> {
 /// Records a fix-up when the copied child `child` is a compound the copier must materialise its
 /// own copy of; shared terms (immediates, literals) were already written verbatim and need no
 /// entry.
-fn push_fixup(work: &mut Vec<Fixup>, slot: *mut Eterm, child: Eterm) {
+fn push_fixup(work: &mut WorkStack, slot: *mut Eterm, child: Eterm) {
     if !is_shared(child) {
         work.push((slot, child));
     }
@@ -600,7 +709,7 @@ pub(crate) fn shallow<A: CopyTarget>(
     to: &mut A,
     ctx: &mut CopyContext<'_>,
     src: Eterm,
-    work: &mut Vec<Fixup>,
+    work: &mut WorkStack,
 ) -> Result<Eterm> {
     if is_shared(src) {
         return Ok(src);
@@ -729,7 +838,7 @@ fn is_fast_path_eligible(ctx: &CopyContext<'_>) -> bool {
 /// the caller re-runs the sized path, which re-derives the crate's typed outcome.
 fn try_copy_fast(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
     let mut trial = TrialTarget::over(to);
-    let mut work: Vec<Fixup> = Vec::new();
+    let mut work = WorkStack::new();
     let root = shallow(&mut trial, ctx, term, &mut work)?;
     while let Some((slot, src)) = work.pop() {
         let copied = shallow(&mut trial, ctx, src, &mut work)?;
@@ -806,7 +915,7 @@ pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Res
         return Err(crate::error::heap_exhausted(needed));
     }
 
-    let mut work: Vec<Fixup> = Vec::new();
+    let mut work = WorkStack::new();
     let root = shallow(to, ctx, term, &mut work)?;
     while let Some((slot, src)) = work.pop() {
         let copied = shallow(to, ctx, src, &mut work)?;
