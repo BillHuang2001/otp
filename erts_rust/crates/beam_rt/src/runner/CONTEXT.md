@@ -89,6 +89,15 @@ figures are in `PERF.md`).
   (`RuntimeContext::resolve_local_call` → `crate::native::prim_tty::serves_local_call` for a built-in
   NIF library's stub). Every other method of the seam is forwarded unchanged, so the redirect into
   `inner` is purely mechanical.
+* **The slice's real context is built once per `run` call (one scheduler slice).** [`run`] constructs
+  `RuntimeContext::for_process_with_engines` once, then wraps it in one `BudgetContext` and hands that
+  wrapper to the whole machine run — so every BIF/`call_ext`/`call_bif` a slice makes shares **one**
+  `RuntimeContext` and therefore one `DispatchMemo` (the 8-slot per-context cache); the memo is rebuilt
+  only at a slice boundary (a pre-emption/`receive` park ends the slice) or at the two nested-context
+  sites (`FunBridge::nested`, `SendBridge`, both in `src/context/bridges.rs`). The `RuntimeContext`/
+  `BudgetContext`/`BudgetProbe` construction is **stack-only** (no `Vec`/`String`/`Rc` on the hot path);
+  the only per-slice heap work below the outcome match is the off-heap-payload registration suffix
+  (`payload.clone()` on `Process::register_off_heap_binary`, once per *new* payload the machine built).
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
   `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
