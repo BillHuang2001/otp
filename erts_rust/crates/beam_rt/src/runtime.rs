@@ -699,6 +699,31 @@ impl Runtime {
         processes
             .register(init_name, self_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
+        // The runtime-native **`erl_prim_loader` service process** (contracts A.7/A.9): a
+        // `Runnable`, never-enqueued stand-in for the loader, registered under the loader's own
+        // name.
+        //
+        // `erl_prim_loader` is a **preloaded module** (`erlang:pre_loaded/0` lists it) whose
+        // *functions* this runtime really serves — from the native loader floor
+        // (`src/native/loader.rs`), over the real file system and the real code path. The oracle
+        // also has a **process** registered under that name (its C `erts_prim_loader` state
+        // machine, `whereis(erl_prim_loader)` = a live pid running `erl_prim_loader:loop/3`), so
+        // without one this runtime answered the oracle's pid with a bare `undefined` — a name
+        // that named neither the loader it serves nor anything else. The spawned process is the
+        // same shape as the `init` root and the native `file_server_2` service: `Runnable` and
+        // never put on a run queue, so `Process::wake` never enqueues it and the scheduler's
+        // runner never sees it (the loader floor is what answers a client, not this mailbox).
+        //
+        // Unlike `file_server_2` there is **no** conflict with the boot script: `init` starts the
+        // loader (it is in the script's `{preLoaded, …}` list, not a `{kernelProcess, …}` child),
+        // so nothing in `bootstrap/bin/start.boot` registers the name and the registration is
+        // valid on **every** route that builds a runtime. Only the `-version` action builds none
+        // (it prints the banner and exits), so it never has a name registry to answer from.
+        let loader = processes.spawn(config.heap.policy().clone())?;
+        let loader_name = code_server.atoms_mut().intern("erl_prim_loader");
+        processes.register(loader_name, loader).map_err(|_| {
+            error::message("boot: the `erl_prim_loader` name is already registered")
+        })?;
         // The native **`file_server_2` service** (contract A.9): a `Runnable`, never-enqueued
         // process that answers the OTP file protocol, so a caller like `c:erlangrc/0` finds the
         // service instead of dying with `{noproc,{gen_server,call,[file_server_2,…]}}` (see
@@ -2727,15 +2752,19 @@ mod tests {
         let rt = runtime();
         assert!(rt.atoms().lookup("unix").is_some());
         assert!(rt.atoms().lookup("linux").is_some());
-        // `Runtime::new` starts exactly **two** processes, both of them the runtime's own —
-        // neither was spawned by user code:
+        // `Runtime::new` starts exactly **three** processes, all of them the runtime's own —
+        // none was spawned by user code:
         //   1. the **root process**, registered as `init` (`erlang:whereis(init)` answers it —
-        //      the oracle answers `<0.0.0>`), which every action runs as; and
-        //   2. the native **`file_server_2` service** (contract A.9), a `Runnable`,
+        //      the oracle answers `<0.0.0>`), which every action runs as;
+        //   2. the native **`erl_prim_loader` service** (contracts A.7/A.9), a `Runnable`,
+        //      never-enqueued process that stands in for the loader under the name the oracle
+        //      registers its own loader process as (`erlang:whereis(erl_prim_loader)` answers a
+        //      live pid, never `undefined`); and
+        //   3. the native **`file_server_2` service** (contract A.9), a `Runnable`,
         //      never-enqueued process that answers the OTP file protocol on the routes where it
         //      owns the name (`src/native/file_server.rs`).
-        assert_eq!(rt.processes().len(), 2);
-        for name in ["init", "file_server_2"] {
+        assert_eq!(rt.processes().len(), 3);
+        for name in ["init", "erl_prim_loader", "file_server_2"] {
             let atom = rt
                 .atoms()
                 .lookup(name)
@@ -2747,7 +2776,7 @@ mod tests {
         }
         assert_eq!(
             rt.system_info_value("process_count").expect("count"),
-            InfoValue::Int(2)
+            InfoValue::Int(3)
         );
     }
 
@@ -2778,14 +2807,25 @@ mod tests {
             }
         };
         // The service process is still spawned — the count is the same as on a route that
-        // drives none — and `init` is still registered; only the `file_server_2` name stays free.
-        assert_eq!(booted.processes().len(), 2);
+        // drives none (the root `init` process, the native `erl_prim_loader` service and the
+        // native `file_server_2` service) — and `init` is still registered; only the
+        // `file_server_2` name stays free.
+        assert_eq!(booted.processes().len(), 3);
         assert_eq!(
             booted.system_info_value("process_count").expect("count"),
-            InfoValue::Int(2)
+            InfoValue::Int(3)
         );
         let init = booted.atoms().lookup("init").expect("`init` is a core atom");
         assert!(booted.processes().whereis(init).is_some());
+        // The loader name is **not** gated on the boot-script predicate: nothing in the boot
+        // script starts `erl_prim_loader` (it is preloaded by `init`, not a `{kernelProcess, …}`
+        // child), so this runtime's own loader service keeps the name on **every** route — the
+        // boot-script route included.
+        let loader = booted
+            .atoms()
+            .lookup("erl_prim_loader")
+            .expect("`erl_prim_loader` is registered on the boot-script route");
+        assert!(booted.processes().whereis(loader).is_some());
         if let Some(atom) = booted.atoms().lookup("file_server_2") {
             assert!(
                 booted.processes().whereis(atom).is_none(),
@@ -2800,6 +2840,49 @@ mod tests {
             .lookup("file_server_2")
             .expect("`file_server_2` is registered on the default route");
         assert!(plain.processes().whereis(atom).is_some());
+    }
+
+    #[test]
+    fn the_runtime_registers_its_own_live_erl_prim_loader_process() {
+        // `erl_prim_loader` is a **preloaded module** whose functions the native loader floor
+        // (`src/native/loader.rs`) serves; it is also a **registered name**. The oracle registers
+        // its C `erts_prim_loader` state machine under it (`whereis(erl_prim_loader)` is a live
+        // pid running `erl_prim_loader:loop/3`), so this runtime owns a real, live stand-in
+        // instead of answering `undefined`.
+        let rt = runtime();
+        let loader = rt
+            .atoms()
+            .lookup("erl_prim_loader")
+            .expect("`erl_prim_loader` is a core atom");
+        let pid = rt.processes().whereis(loader).expect(
+            "`whereis(erl_prim_loader)` must answer a live pid, never the atom `undefined`",
+        );
+        // The pid is a live process of this runtime's table...
+        let process = rt
+            .processes()
+            .get(pid)
+            .expect("the registered `erl_prim_loader` pid is a live process");
+        // ...born `Runnable` and never put on a run queue, exactly like the root `init` and the
+        // native `file_server_2` service, so the scheduler's runner never tries to execute it.
+        assert_eq!(process.state(), ProcessState::Runnable);
+        assert!(
+            !process.flags().in_run_queue(),
+            "the loader stand-in must never be enqueued"
+        );
+        // It is its **own** process — not an alias of any other registered name, which would be a
+        // name pointing at an unrelated process.
+        for other in ["init", "file_server_2"] {
+            let atom = rt.atoms().lookup(other).expect("a registered name");
+            assert_ne!(
+                rt.processes().whereis(atom),
+                Some(pid),
+                "`erl_prim_loader` must name its own process, not `{other}`"
+            );
+        }
+        // The `-version` action is the only route that builds no runtime at all, so it never
+        // reaches this constructor and has no name registry to answer from; every other route
+        // (the boot-script ones included) is covered by
+        // `a_boot_script_runtime_spawns_the_native_service_unregistered`.
     }
 
     #[test]
