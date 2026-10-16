@@ -68,58 +68,58 @@ it *executes*, so a compiled caller reaches the callee and returns correctly; th
 (see "Signature and native entry points"). Its own `run_resume_outcome` is the typed error above.
 
 ## Measured verdict — the tier stays DEFAULT-OFF
-The feature is measurement-gated, and the fresh measurement says **no**: Cranelift is a
-correctness-complete mechanism but **not** a performance win over the baseline tier. Every figure is
-the **min of ≥30 samples per tier**, one benchmark process at a time; the sandbox is shared and
-heavily loaded (`/proc/loadavg` 66–86 observed while measuring), so only the min is stable and only
-*paired* ratios are evidence. Column ratios are **cost** ratios (`>1` = slower than the reference).
+The feature is measurement-gated, and the measurement says **no**: Cranelift is a
+correctness-complete mechanism but **not** a performance win over the baseline tier.
+Every figure is a **range over independent runs**, position-balanced, one timing process at a time;
+the sandbox is shared and heavily loaded (14 CPUs, `/proc/loadavg` ≈140–175 while measuring), so a
+single sample is meaningless and only *paired* ratios are evidence.
+Column ratios are **cost** ratios (`>1` = slower than the reference).
 
-Three-way table, in-crate `crate::jit::bench` (`... -p beam_engine --features jit-cranelift --test
-jit_bench -- --ignored --nocapture`), min ns/op:
+Per-workload ratio of Cranelift to the baseline, in-crate `crate::jit::bench` (`... -p beam_engine
+--features jit-cranelift --test jit_bench -- --ignored --nocapture`):
 
-| workload (shape) | interpreter | baseline | cranelift | CL ÷ interp | CL ÷ baseline |
-|---|---|---|---|---|---|
-| `walk/2` — list walk | 4090.7 | 1775.2 | **845.5** | 0.21× | **0.48× (2.10× faster)** |
-| `aggr/2` — aggregate reads + `'*'` | 16259.3 | 2446.6 | 2274.5 | 0.14× | 0.93× |
-| `slice:fib/1` — call chain | 2374.2 | 1110.2 | 1038.9 | 0.44× | 0.94× |
-| `call_ext/0` — declined host seam | 15687.2 | 11852.7 | 12044.1 | 0.77× | 1.02× |
-| `build/0` | 9521.3 | 11231.7 | 11313.4 | 1.19× | 1.01× |
-| `map/2` | 16160.0 | 13595.5 | 14760.1 | 0.91× | 1.09× |
-| `wide/2` — wide tuple/list reads | 9084.6 | 1013.6 | 1071.0 | 0.12× | 1.06× |
-| `select/1` | 3499.2 | 2333.6 | 2758.8 | 0.79× | 1.18× |
-| `cmp/2` — 512 comparison BIFs | 15675.6 | 1780.3 | 2619.1 | 0.17× | **1.47× (slower)** |
-| `kernel/2` — inner-product loop | 7148.3 | 911.3 | 1322.0 | 0.19× | **1.45× (slower)** |
-| `sum/1` — non-tail recursion | 7170.3 | 3506.0 | 8550.4 | **1.19×** | **2.44× (slower)** |
-| `send_recv/2` — two-process mailbox | 23864.3 | 12480.5 | 25324.8 | **1.06×** | **2.03× (slower)** |
-| `cross/2` — cross-module call | 11088.5 | 9881.9 | 15138.4 | **1.37×** | **1.53× (slower)** |
+| workload (shape) | CL ÷ baseline |
+|---|---|
+| `walk/2` — list walk | **0.31–0.54×** (mean ≈0.46×) |
+| `aggr/2` — aggregate reads + `'*'` | tie |
+| `slice:fib/1` — call chain | tie |
+| `call_ext/0` — declined host seam | tie |
+| `build/0` | tie |
+| `map/2` | tie |
+| `select/1` | tie |
+| `wide/2` — wide tuple/list reads | **1.29–1.96×** |
+| `cmp/2` — comparison BIFs | **1.13–1.31×** |
+| `kernel/2` — inner-product loop | **1.09–1.25×** |
+| `sum/1` — non-tail recursion | **2.52–3.07×** |
+| `send_recv/2` — two-process mailbox | **2.02–2.12×** |
+| `cross/2` — cross-module call | **1.27–1.54×** |
 
 The order-balanced ABBA harness (`bench.rs`, the `#[ignore]`d `cl_bench` test, `--lib -- --ignored
---nocapture cl_bench`) was run 6 times; the per-round paired ratio (2 samples/tier × 15 rounds, so
-position drift cancels) brackets the fixed-order table the same way:
+--nocapture cl_bench`) brackets the same picture with per-round paired ratios (2 samples/tier × 15
+rounds, so position drift cancels); paired means over three independent runs:
 
-| kernel | paired cranelift/baseline over 6 runs | range |
-|---|---|---|
-| `aggr` | 1.007 / 1.039 / 1.057 / 1.057 / 1.038 / 1.061 | 0.823–1.243 |
-| `arith` (256 chained `'+'`) | 1.496 / 1.494 / 1.487 / 1.506 / 1.482 / 1.582 | 1.114–1.809 |
-| `cmp` | 1.222 / 1.349 / 1.318 / 1.409 / 1.186 / 1.369 | 0.985–1.573 |
+| kernel | paired cranelift/baseline over 3 runs |
+|---|---|
+| `aggr` | 0.969–1.036× |
+| `arith` (256 chained `'+'`) | 1.502–1.573× |
+| `cmp` | 1.225–1.323× |
 
-So the tier is a **tie to ~6 % slower** on the aggregate-read mix, **≈1.49× slower** on chained
-small-int arithmetic and **≈1.2–1.4× slower** on comparison-BIF streams.
+So the tier is a **tie** on the aggregate-read mix, **≈1.5× slower** on chained small-int arithmetic
+and **≈1.2–1.3× slower** on comparison-BIF streams.
 
-**Codegen cost — what the hot tier must earn.** Cranelift's one-time compile is **≈25–80×** the
-baseline's: `cl_bench` per-kernel cranelift compile 159.7–362.1 ms (`aggr`), 30.0–65.9 ms
-(`arith`), 68.6–123.9 ms (`cmp`); the in-crate `jit_bench` per-workload compile 17.4–251.0 ms for
-cranelift vs 92 µs–3.18 ms for the baseline. A hot tier that compiles 25–80× more expensively must
-win on steady-state throughput to earn that cost, and outside `walk/2` it does not.
+**Codegen cost — what the hot tier must earn.** Cranelift's one-time compile is **≈7–114×** the
+baseline's. A hot tier that compiles that much more expensively must win on steady-state throughput
+to earn that cost, and outside `walk/2` it does not.
 
 Why: Cranelift re-loads/re-stores the x-register slots per instruction and **deopts
 `call_last`/`call_only`** (a strict subset of the baseline's `Instr` set), whereas the baseline is a
 hand-written x86-64 backend that caches the five most-touched x-registers per block, addresses the
 rest directly in `machine.x`, links the local tail calls natively and reuses blocks across runs
-(§F/`../CONTEXT.md`). Its only real win is the list-walk shape (`walk/2`, 2.10× over the baseline);
-everything else is a tie (aggregate reads, the call chain, a declined `call_ext`) or a loss (chained
-arithmetic, comparison streams, non-tail recursion, the mailbox and cross-module shapes) — which
-cannot justify 25–80× the compile latency on a tier whose whole point is being *hot*.
+(§F/`../CONTEXT.md`). Its only real win is the list-walk shape (`walk/2`, ≈0.46× the baseline);
+everything else is a tie (aggregate reads, the call chain, a declined `call_ext`, `build`, `map`,
+`select`) or a loss (chained arithmetic, comparison streams, wide reads, non-tail recursion, the
+mailbox and cross-module shapes) — which cannot justify 7–114× the compile latency on a tier whose
+whole point is being *hot*.
 
 Consequence: `jit-cranelift` **remains default-OFF** — a correctness-complete mechanism and an
 honest negative performance result, not a selected tier. Closing the gap is not a bounded change: it

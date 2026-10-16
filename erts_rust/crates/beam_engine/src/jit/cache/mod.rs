@@ -547,21 +547,13 @@ pub(crate) fn cached_module_blocks(module: &Arc<Module>) -> Option<Rc<CompiledMo
 ///
 /// # Why this exists
 ///
-/// The entry path resolves a module through [`CacheKey`], whose module half for a real
-/// `.beam` is the module's **load-time MD5 digest** ([`Module::checksum`]) — O(1),
-/// already. This call remains useful for the one case the digest cannot serve: a
-/// **synthetic** (zero-checksum) module, whose key is the content hash of its whole
-/// decoded IR. It is also what fills the [`CodeCache::memo`] for the module a host is
-/// about to **enter**, which saves the 16-byte digest read plus one map probe per slice on
-/// the redundant micro-optimisation described in [`CodeCache`].
-///
-/// Historically this call existed because the *entry* module fell to
-/// [`CacheKey::of`] → [`module_fingerprint`] (a full `Debug`-render hash of the whole
-/// decoded IR) **once per slice**, the dominant baseline-tier cost on a message-passing
-/// shape. The digest key removed that cost for real modules; the API is kept because a
-/// host that owns its modules as `Arc<Module>` — the runtime's code server does — still
-/// gets the memo filled for free, and because a synthetic module has no digest to fall
-/// back on.
+/// The entry path already resolves a module's identity in O(1) for a real `.beam` (the
+/// load-time digest plus the namespace snapshot), so this call is an optimisation for two
+/// cases: a **synthetic** (zero-checksum) module, whose key is the content hash of its
+/// whole decoded IR, and a host that owns its modules as `Arc<Module>` — the runtime's
+/// code server does — which gets the [`CodeCache::memo`] filled for the module it is about
+/// to **enter**, saving the digest read plus one map probe per slice on the redundant
+/// micro-optimisation described in [`CodeCache`].
 ///
 /// # Semantics
 ///
