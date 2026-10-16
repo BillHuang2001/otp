@@ -88,12 +88,14 @@
 //! guard at all: a float-using callee is entered in-machine exactly like any other, which is
 //! safe because it runs under the caller's machine and that machine's collection goes through
 //! the full door. A float register still live when a slice ends is caught out of band by the
-//! runner's post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, which pins
-//! the process permanently ([`Runtime::pin_process`](crate::runtime::gc)); `Runtime::gc_process_enabled`
-//! is checked **first** by both doors and refuses a pinned pid outright, so a float-using loop
-//! collects only within a slice that armed a collection before the pin was set — often not even
-//! its first, leaving the whole run at `collections == 0` (`tests.rs::the_post_slice_float_pin_plateaus_a_float_using_loops_collections`).
-//! Note the pin is triggered by float **operations** that write the FR file (`fconv`/`fmul`), not
+//! runner's post-slice [`Machine::fr_mark`](beam_engine::Machine::fr_mark) check, which opens a
+//! **per-slice relocation exemption** on the process (`Process::set_relocation_exempt(true)`),
+//! cleared by the next slice entry. `Runtime::gc_process_enabled` is still checked **first** by
+//! both doors and refuses a pinned, halted or globally-disabled pid outright, but `pinned` is
+//! **never** set in production — the exemption is scoped to the inter-slice window, so a
+//! float-using loop collects again at its own heap-admission points and its `collections`
+//! **scale** with the loop count (`tests.rs::the_post_slice_float_pin_plateaus_a_float_using_loops_collections`).
+//! The exemption is triggered by float **operations** that write the FR file (`fconv`/`fmul`), not
 //! by a float *literal* in a data structure, which the compiler folds into the literal area and
 //! which therefore never writes FR. An unresolvable call site (a fun entry or the `-eval`
 //! evaluator, which have no `current_module`) is not collected over either — conservative,
@@ -633,6 +635,7 @@ pub(crate) fn ensure_heap(
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
+            runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
@@ -781,6 +784,7 @@ pub(crate) fn ensure_heap_full(
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
+            runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
@@ -1033,6 +1037,7 @@ pub(crate) fn alloc_words_rooted(
     match process.collect() {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
+            runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
