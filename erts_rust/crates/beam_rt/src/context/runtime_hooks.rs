@@ -38,7 +38,7 @@
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set — a **local** pid through [`ProcessTable::link`]/`unlink`, a **remote** pid through [`ProcessTable::link_term`]/`unlink_term` (the remote-link set + the wire `DOP_LINK`/`DOP_UNLINK_ID`) |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
-//! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the live processes' own `beam_gc` collector counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined` — the switch is recorded but no per-scheduler wall time is sampled) |
+//! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the runtime's own node-global cumulative collection counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined` — the switch is recorded but no per-scheduler wall time is sampled) |
 //! | `erts_internal:scheduler_wall_time/1` | the node-global sampling switch: any non-`true` argument disables, `true` enables, and the **previous** state is answered as `true`/`false` (the C's `atomic_xchg`, `bif.c:5357-5366`) |
 //! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
 //! | `net_kernel:dflag_unicode_io/1` | `true` for a local pid (a `badarg` for a non-pid; the typed gap for a remote pid) — the io-device read path's unicode fast-path probe |
@@ -803,11 +803,11 @@ impl<'a> RuntimeHooksBridge<'a> {
     ///   [`Self::run_queues`]).
     /// * `garbage_collection` → `{GCs, WordsReclaimed, 0}`, the shape the C's
     ///   `gather_gc_info_result/1` builds (`erlang.erl:13392-13404`: the third element is the
-    ///   reserved constant `0`). Both figures are summed from the real, **cumulative**
-    ///   [`beam_gc::GcStats`] of every live process's own collector — the collections each one
-    ///   ran ([`Runtime::gc_stats`] is the runtime's node-global collection counter; the
-    ///   reclaimed-word figure exists only inside a collector) and the words those
-    ///   collections really reclaimed (see [`Self::garbage_collection`]).
+    ///   reserved constant `0`). Both figures are this runtime's **node-global cumulative**
+    ///   collection counters ([`Runtime::gc_stats`]'s `collections`/`reclaimed`), so the answer
+    ///   is the collection work this runtime really did since it started — never a value summed
+    ///   from whichever processes happen to be **live** at the read (see
+    ///   [`Self::garbage_collection`]).
     /// * `scheduler_wall_time`, `scheduler_wall_time_all` → the atom `undefined`, the
     ///   oracle's own "not enabled" answer. Only
     ///   `erlang:system_flag(scheduler_wall_time, true)` (or
@@ -827,9 +827,9 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// that reads *this* runtime's own state"). The same "different zero" holds for
     /// `reductions` and `context_switches`: they count *this* runtime's own work from its own
     /// start, and the oracle counts far more of both because it runs a much larger emulator.
-    /// `garbage_collection` has the same character: the C keeps a **per-scheduler** accumulator
-    /// that outlives every process, while this runtime's counters live inside each process's
-    /// collector, so the sum covers the processes that are **live** at the read.
+    /// `garbage_collection` has the same character: its two figures are this runtime's own
+    /// cumulative counters since its start, where the oracle's are per-scheduler accumulators
+    /// over its whole far larger emulator (see [`Self::garbage_collection`]).
     ///
     /// Every **other** key the oracle accepts is a genuine statistics key this runtime
     /// cannot measure — `active_tasks*`/`total_active_tasks*` need the C's per-run-queue
@@ -896,7 +896,8 @@ impl<'a> RuntimeHooksBridge<'a> {
                 heap.tuple(&[in_pair, out_pair])
             }
             // `{GCs, WordsReclaimed, 0}` — the C's `gather_gc_info_result/1` shape, built from
-            // the real collector counters of the live processes (see [`Self::garbage_collection`]).
+            // this runtime's own node-global collection counters (see
+            // [`Self::garbage_collection`]).
             "garbage_collection" => self.garbage_collection(heap),
             other if STATISTICS_KEYS.contains(&other) => Err(error::unsupported(&format!(
                 "erlang:statistics/1: the `{other}` counter is not implemented"
@@ -960,37 +961,37 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// `gather_gc_info_result/1` builds (`erts/preloaded/src/erlang.erl:13392-13404`; the
     /// third element is the reserved constant `0`).
     ///
-    /// The C sums two **per-scheduler** accumulators: `gc_info.garbage_cols` (collections run)
-    /// and `gc_info.reclaimed` (words reclaimed), plus the dirty schedulers' own
-    /// (`erl_gc.c:3546-3603`). This runtime keeps neither node-globally — its GC counters live
-    /// inside each process's own [`beam_gc::AnyCollector`]
-    /// ([`Runtime::gc_stats`] is the node-global *collection* count, and there is no
-    /// node-global reclaimed-words figure) — so both figures are summed from every **live**
-    /// process's [`AnyCollector::stats`](beam_gc::AnyCollector::stats): its cumulative
-    /// `minor_collections + major_collections` and its cumulative `words_reclaimed`. Both are
-    /// real measurements of work this runtime really did, and the pair comes from the same
-    /// counter set so the two elements can never describe different scopes.
+    /// The C sums two **per-scheduler** accumulators — `gc_info.garbage_cols` (collections run)
+    /// and `gc_info.reclaimed` (words reclaimed) — plus the dirty schedulers' own
+    /// (`erl_gc.c:3546-3603`); those accumulators outlive every process. This runtime keeps the
+    /// same two quantities **node-globally**, on [`Runtime::gc_stats`]: `collections` (every
+    /// collection this runtime really ran) and `reclaimed` (the words those collections really
+    /// freed, each collection's own outcome — see [`Runtime::note_gc_reclaimed`]). Both are real
+    /// measurements of work this runtime really did, in the same scope, so the two elements can
+    /// never describe different things.
     ///
-    /// **Divergence (scope, documented):** a terminated process's collector goes away with it,
-    /// so its contribution leaves the sum, whereas the C's per-scheduler accumulators persist
-    /// for the emulator's life. The figures are otherwise the same quantity.
+    /// **Why not the live processes' collectors** (an earlier shape of this arm): a
+    /// `statistics/1` read taken from inside a **scheduler slice** is answered while the
+    /// scheduler has the process table moved out of the runtime, so summing the live processes
+    /// sees none of them and answers `{0, 0, 0}` — precisely when a real workload's collections
+    /// are the interesting ones. It also drops a terminated process's contribution, where the
+    /// C's per-scheduler accumulators keep it.
+    ///
+    /// **Divergence (scope, documented):** the counters are this runtime's own cumulative work
+    /// since *its* start, exactly as `reductions`/`context_switches` are, where the oracle's are
+    /// per-scheduler accumulators of a much larger emulator. The quantities are the same, the
+    /// zero and the magnitude are not.
     ///
     /// # Errors
     ///
     /// Propagates the heap's failure when the tuple cannot be built.
     fn garbage_collection(&self, heap: &mut Heap) -> Result<Eterm> {
-        let mut collections: u64 = 0;
-        let mut reclaimed: u64 = 0;
-        for pid in self.runtime.processes().pids() {
-            if let Some(process) = self.runtime.processes().get(pid) {
-                let stats = process.collector().stats();
-                collections += stats.minor_collections + stats.major_collections;
-                // A `usize` word count is a small integer here; the saturation keeps the
-                // conversion total without trapping.
-                reclaimed += u64::try_from(stats.words_reclaimed).unwrap_or(u64::MAX);
-            }
-        }
-        heap.tuple(&[small_u64(collections), small_u64(reclaimed), make_small(0)])
+        let stats = self.runtime.gc_stats();
+        heap.tuple(&[
+            small_u64(stats.collections),
+            small_u64(stats.reclaimed),
+            make_small(0),
+        ])
     }
 
     /// Schedules `message` for `target` at `delay` from now under the reference `reference`,
