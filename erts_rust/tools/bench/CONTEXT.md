@@ -609,7 +609,11 @@ Structural facts that are not numbers (and so belong here):
 The `foreign` per-call, `list_walk` per-element, and `copy_bound`/`gc_bound` per-op gaps (their current values
 are in `RESULTS.md` §3.3–§3.6) are **real runtime costs, not harness artifacts**. The startup-cancelled metric
 reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI
-re-entry, per-call module reloads and per-call GC are all ruled out. It is a `beam_rt` per-call host-context
+re-entry, per-call module reloads and per-call GC are all ruled out. The startup subtraction is **per-side**:
+each runtime's `ns_per_call` subtracts *its own* 0-iteration mean (`src/workloads/foreign.rs:427-437`,
+`per_call_ns` — one `CaseOutcome` per runtime), never a shared or other-side startup, so a milestone's
+boot-cost difference (m12 ≈2.1 s vs head ≈0.72 s vs m10 ≈20 ms, `results/m13-foreign-ladder.csv` `n=0` rows)
+cancels by construction and cannot inflate a cross-milestone per-call ratio. It is a `beam_rt` per-call host-context
 cost: the engine's dispatch arm is itself O(1) and allocation-free per instruction, and the runtime-side costs
 behind it are `beam_rt` measurements owned by `../../crates/beam_rt/PERF.md` (the per-call dispatch section)
 and `../../crates/beam_rt/CONTEXT.md`, not `bench` output.
