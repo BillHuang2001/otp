@@ -108,6 +108,25 @@ these eight directives, the full modelled set:
   `receive … after T` (T ≤ the window) is still slept to and resumed. The boot's blocking calls are
   `infinity` receives, so nothing a directive synchronously awaits lies beyond a slice.
 
+### `{primLoad, …}` is eager here, and each load interns a whole atom chunk
+`execute` (`bootscript.rs:384-388`) loads **every** name in every `{primLoad, […]}` batch
+(`Runtime::load_code_module` → `CodeServer::load`), and `CodeServer::load_bytes`
+(`../codeserver.rs:707-740`) interns the loaded module's **entire `Atoms` chunk** into the runtime's
+single shared `Rc<AtomTable>` — correct ERTS semantics (a real ERTS load interns the module's atoms
+into the global table too: `code:ensure_loaded(auth)` alone makes `erlang:list_to_existing_atom("hello")`
+succeed under the oracle).
+The committed `bootstrap/bin/start.boot` names **202** `primLoad` modules (batches 29/86/87), so atoms
+that belong only to modules the oracle does not load at boot exist in this runtime's table.
+Measured consequence: `erlang:list_to_existing_atom("hello")` answers `hello` here (the atom rides
+`auth.beam`, one of the 202; `world` rides `net_adm.beam`, `foo`/`bar` ride `shell`/`qlc`/`sofs`/
+`dets_v9`/…), where a fresh `erl -noshell -eval` raises `error:badarg`. The installed OTP-29
+`bin/start.boot` names the **same** 202 modules, yet that oracle process holds only **87** of them
+(`code:all_loaded()` = 109; `auth`, `dets_v9`, `array`, `base64`, `calendar`, … stay unloaded), i.e.
+real `init` does not eagerly load every `{primLoad, …}` name while this `execute` does. The divergence
+is this **loaded-module set** (A.9 boot fidelity), never `erlang:list_to_existing_atom/1`: `beam_bifs`'
+`list_to_existing_atom_1` is lookup-only and refuses an absent name correctly
+(`list_to_existing_atom("zzz_absent_zzz")` ⇒ `badarg`).
+
 ### Surviving a `{kernelProcess, …}`'s directive exit (the unlink)
 This runtime runs a `{kernelProcess, …}` MFA in a **short-lived** process that exits when the MFA
 returns, whereas a real `init` runs it in the **one** long-lived `init` process
