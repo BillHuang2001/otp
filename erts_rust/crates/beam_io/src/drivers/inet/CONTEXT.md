@@ -155,6 +155,6 @@ Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p b
 
 ## See Also
 - `../../CONTEXT.md` → the `beam_io` crate root: the `Driver`/`DriverContext` seam, `PortRegistry`, `Port`/`pub(crate) PortArms`, `DriverRegistry`.
-- `../../driver.rs` → the frozen `Driver` trait (`control`/`ready_input`/`ready_output`/`next_timeout`) and `DriverRegistry::with_builtins()` (which registers `"tcp_inet"`).
+- `../../driver.rs` → the frozen `Driver` trait (`control`/`ready_input`/`ready_output`/`next_timeout`) and `DriverRegistry::with_builtins()` (which registers the socket drivers `"tcp_inet"`/`"udp_inet"`).
 - `../../../CONTEXT.md` → the crate-layer contracts (the `beam_io` seam types, the A.4 driver C-ABI contract).
 - `../../../../erts/emulator/drivers/common/inet_drv.c` + `../../../../erts/emulator/beam/packet_parser.{c,h}` + `../../../../erts/preloaded/src/prim_inet.erl` → the legacy ground truth (read-only reference).
