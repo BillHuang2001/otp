@@ -469,50 +469,155 @@ impl<'a> NifHostImpl<'a> {
 // host was built) and therefore the index it assigns when the novel names are committed after the
 // decode.
 //
-// Building that copy per call is `O(table)` **allocations** — ~127 us for the ~3000-atom table of a
-// booted runtime, which is the whole cost of the decode (the term itself decodes in ~1 us). The
-// copy is therefore memoized per thread and **verified** against the live table index by index
-// ([`prefix_matches`]) before it is reused: comparing is allocation-free and far cheaper than
-// rebuilding. The image is shared by **both** of this crate's decoding hosts — [`NifHostImpl`]'s
-// `binary_to_term` (behind `enif_binary_to_term`) and
+// Building that copy per call is `O(table)` **allocations** — ~127 us for the ~2000-atom table of a
+// booted runtime, which is the whole cost of the decode (the term itself decodes in ~1 us). The copy
+// is therefore memoized per thread and validated against the live table through the O(1) **witness**
+// [`beam_term::AtomSnapshot`] + [`AtomTable::appended_since`] held beside it: `AtomTable` is
+// append-only (interning appends exactly one name and bumps the generation by one), so the witness
+// proves in constant time that the memo still names the same atom at every index it covers and the
+// steady state reads **no** atom name at all. The index-by-index [`prefix_matches`] survives only as
+// the fallback for a table the witness cannot vouch for (see [`with_decode_scratch`]). The image is
+// shared by **both** of this crate's decoding hosts — [`NifHostImpl`]'s `binary_to_term` (behind
+// `enif_binary_to_term`) and
 // [`DriverPort::binary_to_term`](crate::port::driver::DriverPort) (behind `erl_drv_binary_to_term` /
 // the term-data machine's `ERL_DRV_EXT2TERM`) — so the two cannot drift.
 //
 // This is a *cache of the caller's own immutable input*, carrying no cross-call semantics; it
 // retains one table image per thread while the process lives. A memo left ahead of the live table
 // by an earlier decode (a failed one, or one whose novel names a different host's commit dropped)
-// fails the prefix check and is rebuilt, so it can never leak a name into a later decode.
+// fails both the witness's exact-length guard and the prefix check and is rebuilt, so it can never
+// leak a name into a later decode.
 thread_local! {
-    static DECODE_SCRATCH: RefCell<Option<AtomTable>> = const { RefCell::new(None) };
+    static DECODE_SCRATCH: RefCell<Option<DecodeScratch>> = const { RefCell::new(None) };
 }
+
+/// The per-thread decode memo: the scratch image plus the O(1) witness that proves it is still an
+/// image of the *shared* table it was taken from.
+struct DecodeScratch {
+    /// The decoder's mutable scratch. It names the same atom as `witness`'s table at every index
+    /// below `witness.len()` (the decoder may append beyond that).
+    memo: AtomTable,
+    /// A snapshot of the **shared** table — never of `memo`, which is a clone and so carries a
+    /// fresh identity that can never satisfy [`AtomTable::appended_since`] — taken at the last
+    /// moment `memo` was known to be index-identical to it over `0..witness.len()`.
+    witness: beam_term::AtomSnapshot,
+}
+
+// Test-only scratch-machinery metrics for this thread: `(name_comparisons, rebuilds)`.
+//
+// `name_comparisons` counts the `AtomTable::name` reads the scratch machinery performs (one per
+// index compared by [`prefix_matches`], one per index copied by the extend loop); `rebuilds`
+// counts the full `AtomTable::clone` rebuilds. Both are read by the `tests` module's scratch pins
+// and are a no-op in a production build (see [`bump_name_comparisons`] and [`bump_rebuild`]) — no
+// production behaviour depends on them.
+#[cfg(test)]
+thread_local! {
+    static DECODE_SCRATCH_METRICS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Adds `n` to this thread's scratch-machinery name-read count (see
+/// [`DECODE_SCRATCH_METRICS`]).
+#[cfg(test)]
+fn bump_name_comparisons(n: usize) {
+    DECODE_SCRATCH_METRICS.with(|metrics| {
+        let (comparisons, rebuilds) = metrics.get();
+        metrics.set((comparisons + n, rebuilds));
+    });
+}
+
+/// Production build: the name-read count is not instrumented.
+#[cfg(not(test))]
+#[inline(always)]
+fn bump_name_comparisons(_n: usize) {}
+
+/// Counts one scratch rebuild — a full `AtomTable::clone` of the shared table — on this thread
+/// (see [`DECODE_SCRATCH_METRICS`]).
+#[cfg(test)]
+fn bump_rebuild() {
+    DECODE_SCRATCH_METRICS.with(|metrics| {
+        let (comparisons, rebuilds) = metrics.get();
+        metrics.set((comparisons, rebuilds + 1));
+    });
+}
+
+/// Production build: the rebuild count is not instrumented.
+#[cfg(not(test))]
+#[inline(always)]
+fn bump_rebuild() {}
 
 /// Whether `memo` names the same atom as `shared` at every index `memo` holds.
 ///
 /// `memo.len() > shared.len()` is `false` by definition: such a memo cannot stand in for `shared`
-/// (its novel-atom prediction would be off by the difference).
+/// (its novel-atom prediction would be off by the difference), which is also why the check never
+/// touches a name in that case.
+///
+/// This is the Θ(table) **fallback** of [`with_decode_scratch`] (allocation-free, but one name read
+/// per index); the steady state is proven in O(1) by that function's witness instead.
 fn prefix_matches(memo: &AtomTable, shared: &AtomTable) -> bool {
-    memo.len() <= shared.len()
-        && (0..memo.len()).all(|index| {
-            let atom = beam_term::Atom::from_raw(index as u32);
-            memo.name(atom) == shared.name(atom)
-        })
+    if memo.len() > shared.len() {
+        return false;
+    }
+    (0..memo.len()).all(|index| {
+        bump_name_comparisons(1);
+        let atom = beam_term::Atom::from_raw(index as u32);
+        memo.name(atom) == shared.name(atom)
+    })
 }
 
-/// Runs `f` on an exact, index-identical image of the host's shared table `shared`, rebuilding or
-/// extending the per-thread memo as needed (see [`DECODE_SCRATCH`]).
+/// Runs `f` on an exact, index-identical image of the host's shared table `shared`, reusing,
+/// extending or rebuilding the per-thread memo as needed (see [`DECODE_SCRATCH`]).
 ///
 /// `f` receives a table that names the same atom as `shared` at every index `shared` holds, and may
 /// extend it (that is what the decoder does with a novel atom); the memo is *not* required to stay an
 /// image of `shared` afterwards, so the next call revalidates. A re-entrant call — which the decode
 /// path cannot produce, since decoding never dispatches back into a host — falls back to a private
 /// copy rather than panicking.
+///
+/// # The witness protocol
+///
+/// `memo` carries a [`beam_term::AtomSnapshot`] of the **shared** table, taken from `shared` itself
+/// — never from `memo`, a clone with its own identity that can never satisfy
+/// [`AtomTable::appended_since`] — at the last moment `memo` was known to name the same atom as
+/// `shared` at every index below the witness's length. Interning appends exactly one name and bumps
+/// the generation by one, so `appended_since` returns `true` precisely when every mutation since the
+/// witness was a pure append: the existing prefix still names the same atoms, and every added name
+/// occupies an index `>= witness.len()`.
+///
+/// Under that invariant the **fast path** is O(1) + O(delta) and reads no atom name:
+/// `memo.len() == witness.len()` together with `shared.appended_since(witness)` proves the memo may
+/// be extended with `shared`'s names at `witness.len()..shared.len()` — normally none, and never
+/// more than the table has actually grown.
+///
+/// Every other shape falls back to the index-by-index [`prefix_matches`]: a different or replaced
+/// table, a clone (what a copy-on-write replacement of `shared` presents), a shrunken table, or a
+/// memo left **longer** than `shared` by an earlier failed decode (whose novel-atom prediction would
+/// be off by the difference — such a memo is rejected by a length check alone, without reading a
+/// name). A memo that fails that scan is discarded and rebuilt from `shared`.
+///
+/// Either way the memo ends up naming exactly what `shared` holds, so the witness is refreshed from
+/// `shared` before `f` runs; a decode that appends to the memo merely leaves it longer than the
+/// witness, which the next call's fast-path guard refuses.
 pub(crate) fn with_decode_scratch<R>(shared: &AtomTable, f: impl FnOnce(&mut AtomTable) -> R) -> R {
     DECODE_SCRATCH.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             return f(&mut shared.clone());
         };
-        if !matches!(slot.as_ref(), Some(memo) if prefix_matches(memo, shared)) {
-            *slot = Some(shared.clone());
+        let usable = slot.as_ref().is_some_and(|scratch| {
+            // O(1): same instance as the witness, pure appends since, and the memo is
+            // exactly as long as the witness vouches for.
+            (scratch.memo.len() == scratch.witness.len()
+                && shared.appended_since(scratch.witness))
+                // Θ(table) fallback: the memo names the same atom as `shared` index for
+                // index, and is no longer than it.
+                || prefix_matches(&scratch.memo, shared)
+        });
+        if !usable {
+            bump_rebuild();
+            *slot = Some(DecodeScratch {
+                memo: shared.clone(),
+                witness: shared.snapshot(),
+            });
         }
         // `slot` is `Some` after the assignment above; the `None` arm is unreachable, and the
         // private-copy fallback keeps this panic-free rather than asserting on it.
@@ -521,12 +626,16 @@ pub(crate) fn with_decode_scratch<R>(shared: &AtomTable, f: impl FnOnce(&mut Ato
         };
         // Extend the memo name-for-name up to the live table's length, so `f` sees a table that
         // names the same atom as `shared` at every index `shared` holds.
-        for index in scratch.len()..shared.len() {
+        for index in scratch.memo.len()..shared.len() {
+            bump_name_comparisons(1);
             if let Some(name) = shared.name(beam_term::Atom::from_raw(index as u32)) {
-                scratch.intern(name);
+                scratch.memo.intern(name);
             }
         }
-        f(scratch)
+        // The memo now names exactly what `shared` holds, so witness it: that is what lets the
+        // next call prove index-identity in O(1) instead of scanning.
+        scratch.witness = shared.snapshot();
+        f(&mut scratch.memo)
     })
 }
 
@@ -1275,16 +1384,31 @@ mod tests {
         );
     }
 
-    // The shared `DECODE_SCRATCH` memo is a per-thread image of the host's table, revalidated index
-    // by index (`prefix_matches`) before each reuse. Its correctness rests on one property: **when
-    // the decoder writes into the memo, the memo must name the same atom as the live table at every
-    // index the live table holds.** If it ever does not — a stale image from an earlier table, a
-    // shorter table, or a memo left ahead of the table by an earlier decode — a name the decoder
-    // *interns* would be recorded at the wrong global index and the decoded term would silently
-    // refer to the wrong atom (or the interner would predict an index the term does not carry).
+    // The shared `DECODE_SCRATCH` memo is a per-thread image of the host's table, proven an exact
+    // index-image before each reuse by the O(1) witness (`AtomSnapshot`/`appended_since`) and, when
+    // the witness cannot vouch for the table, by the index-by-index `prefix_matches` fallback. Its
+    // correctness rests on one property: **when the decoder writes into the memo, the memo must name
+    // the same atom as the live table at every index the live table holds.** If it ever does not — a
+    // stale image from an earlier table, a shorter table, or a memo left ahead of the table by an
+    // earlier decode — a name the decoder *interns* would be recorded at the wrong global index and
+    // the decoded term would silently refer to the wrong atom (or the interner would predict an index
+    // the term does not carry).
     //
     // Each case below issues several decodes inside one test function, so the memo (which is per
-    // thread) is carried across calls and every stale-image shape is exercised.
+    // thread) is carried across calls and every stale-image shape is exercised. A separate group of
+    // pins counts the `AtomTable::name` reads (`name_comparisons`) and rebuilds the machinery
+    // performs, so a regression back to a blind per-call Θ(table) scan is caught: the steady state
+    // must read no name at all.
+
+    /// `(name comparisons, rebuilds)` the scratch machinery performed on this thread.
+    fn scratch_metrics() -> (usize, usize) {
+        DECODE_SCRATCH_METRICS.with(|metrics| metrics.get())
+    }
+
+    /// Zeroes this thread's scratch-machinery counters.
+    fn reset_scratch_metrics() {
+        DECODE_SCRATCH_METRICS.with(|metrics| metrics.set((0, 0)));
+    }
 
     /// `foo` → `[131, 119, 3, 102, 111, 111]`.
     const FOO_IMAGE: &[u8] = &[131u8, 119, 3, b'f', b'o', b'o'];
@@ -1371,6 +1495,105 @@ mod tests {
         let mut committed = (*atoms).clone();
         interner.commit(&mut committed);
         assert_eq!(committed.name(Atom::from_raw(atoms.len() as u32)), Some("bar"));
+    }
+
+    // ---- The witness guard: the scratch's per-call cost ----
+    //
+    // The memo proves index-identity in O(1) through the witness (`AtomSnapshot`/`appended_since`),
+    // reading no atom name at all in the steady state; the Θ(table) `prefix_matches` survives only
+    // as the fallback for a table the witness cannot vouch for. The pins below count the
+    // `AtomTable::name` reads (`name_comparisons`) and full rebuilds the machinery performs, so a
+    // regression back to a blind per-call scan is caught.
+
+    /// The steady state costs no name read and no rebuild: a repeated decode of the same table
+    /// reuses the memo through the O(1) witness.
+    #[test]
+    fn the_witness_keeps_a_repeated_decode_at_zero_name_reads() {
+        let (mut host, atoms, _) = host_with(&["a", "foo"]);
+
+        // Cold: the memo is built by one `AtomTable::clone` — Θ(table) *allocations* — and not one
+        // name is read.
+        reset_scratch_metrics();
+        assert_eq!(decoded_name(&mut host, FOO_IMAGE, &atoms), "foo");
+        assert_eq!(
+            scratch_metrics(),
+            (0, 1),
+            "the cold call rebuilds (clones) without reading a name"
+        );
+
+        // Steady state: the same shared table, so the witness proves index-identity in O(1) — no
+        // name read, no rebuild — however many decodes run.
+        reset_scratch_metrics();
+        for _ in 0..8 {
+            assert_eq!(decoded_name(&mut host, FOO_IMAGE, &atoms), "foo");
+        }
+        assert_eq!(scratch_metrics(), (0, 0), "the steady state must be O(1)");
+    }
+
+    /// Growth of the shared table is still *detected*: an in-place append keeps the witness valid
+    /// over the existing prefix, so only the appended names are read, and a decode still lands a
+    /// novel name at the live table's own next index.
+    #[test]
+    fn an_append_to_the_shared_table_is_detected_and_stays_index_exact() {
+        let mut atoms = AtomTable::new();
+        atoms.seed(["a", "foo"]);
+
+        // Cold: one rebuild, no name read.
+        reset_scratch_metrics();
+        with_decode_scratch(&atoms, |_| ());
+        assert_eq!(scratch_metrics(), (0, 1), "the cold call rebuilds only");
+
+        // The **same** shared instance grows in place: `appended_since` holds, so the memo stays
+        // valid over its whole existing prefix and only the two appended names are copied.
+        atoms.seed(["g1", "g2"]);
+        reset_scratch_metrics();
+        let foo = with_decode_scratch(&atoms, |scratch| scratch.lookup("foo"));
+        assert_eq!(foo, Some(Atom::from_raw(1)), "`foo` stays at index 1");
+        assert_eq!(
+            scratch_metrics(),
+            (2, 0),
+            "exactly the appended names are read — nothing is rebuilt"
+        );
+
+        // A decode that interns a novel name lands it at the live table's own next index: the memo
+        // is now an exact image of the 4-name table, and the witness still vouches.
+        reset_scratch_metrics();
+        let bar = with_decode_scratch(&atoms, |scratch| scratch.intern("bar"));
+        assert_eq!(
+            bar,
+            Atom::from_raw(4),
+            "the novel name is the live table's own next index"
+        );
+        assert_eq!(scratch_metrics(), (0, 0), "still the O(1) fast path");
+    }
+
+    /// A table the witness cannot vouch for — the same names under a **different instance**, which
+    /// is what a copy-on-write replacement of the shared table presents — costs exactly one Θ(table)
+    /// scan and then self-heals to O(1).
+    #[test]
+    fn a_replaced_table_instance_costs_the_theta_scan_once_and_heals() {
+        let mut first = AtomTable::new();
+        first.seed(["a", "b", "c", "foo"]); // foo @3
+        reset_scratch_metrics();
+        with_decode_scratch(&first, |_| ());
+        assert_eq!(scratch_metrics(), (0, 1), "the cold call rebuilds only");
+
+        // Same names, same indices, different instance: the witness refuses it, so the fallback
+        // compares every index exactly once (`foo` resolves to index 3, not to a stale slot).
+        let second = first.clone();
+        reset_scratch_metrics();
+        let foo = with_decode_scratch(&second, |scratch| scratch.lookup("foo"));
+        assert_eq!(foo, Some(Atom::from_raw(3)));
+        assert_eq!(
+            scratch_metrics(),
+            (second.len(), 0),
+            "the fallback compares every index and needs no rebuild"
+        );
+
+        // That fallback re-witnessed the memo for `second`, so the next call is O(1) again.
+        reset_scratch_metrics();
+        with_decode_scratch(&second, |_| ());
+        assert_eq!(scratch_metrics(), (0, 0), "the fallback self-heals");
     }
 
     /// `existing_atom` is a pure lookup: a miss interns nothing and records nothing.
