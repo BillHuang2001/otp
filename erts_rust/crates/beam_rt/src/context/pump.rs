@@ -955,9 +955,33 @@ mod in_process_compile {
     /// source's exhaustion from deciding the rest, and costs one boot plus one boot-script drive
     /// per source. A missing `erl`, or a tree without `lib/stdlib/src`, is a **loud skip** — both
     /// are discovered from the filesystem, and the toolchain is never run to be discovered.
+    ///
+    /// The body runs on a dedicated thread with [`SWEEP_STACK_BYTES`], because the deepest
+    /// sources need a stack comparable to the ~8 MiB main thread the real CLI route runs on while
+    /// libtest's 2 MiB test thread is too small for them; the thread's panic payload is
+    /// propagated with [`std::panic::resume_unwind`], so an assertion message survives the
+    /// boundary.
     #[test]
     #[ignore = "corpus-scale A.9 sweep: compiles every lib/stdlib/src source (tens of minutes)"]
     fn every_stdlib_source_compiles_in_process_like_the_oracle() {
+        let body = std::thread::Builder::new()
+            .name("stdlib-sweep".to_string())
+            .stack_size(SWEEP_STACK_BYTES)
+            .spawn(sweep_body)
+            .expect("the sweep body thread must spawn");
+        if let Err(payload) = body.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// The stack the sweep body runs with: the deepest `lib/stdlib/src` sources recurse too far
+    /// for libtest's 2 MiB test thread, and the real CLI route runs them on an ~8 MiB main
+    /// thread, so the corpus is given the same order of magnitude with headroom.
+    const SWEEP_STACK_BYTES: usize = 32 << 20;
+
+    /// The sweep body: [`every_stdlib_source_compiles_in_process_like_the_oracle`] runs this on a
+    /// thread of its own so the recursion depth the corpus needs is available.
+    fn sweep_body() {
         const BANNER: &str = "in-process stdlib sweep";
         let Some(oracle) = resolve_oracle() else {
             skip_loudly(BANNER, "no `erl` on $PATH (and no executable $ERTS_ORACLE)");
