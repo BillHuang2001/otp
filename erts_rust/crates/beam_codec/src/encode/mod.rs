@@ -68,6 +68,17 @@ const SMALL_BIG_BYTE_MAX: usize = 255;
 /// The OTP atom-name length limit, in **characters** (not bytes).
 const ATOM_CHAR_MAX: usize = 255;
 
+/// The encoder's initial output-buffer reservation, in bytes.
+///
+/// The sink grows by `Vec` doubling, so a zero-capacity start costs five
+/// allocations (`8,16,32,64,128`) for a ~100-byte image. Reserving a single block
+/// up front makes the common small/medium term one allocation instead of five,
+/// and it is an **upper bound only** — a longer image simply grows past it, so no
+/// byte of the output ever changes. It is deliberately modest: a one-word
+/// `term_to_binary(42)` over-reserves by ~124 bytes of *uninitialised* capacity in
+/// the returned `Vec`, which is the price of removing four reallocations per
+/// encode.
+const DEFAULT_IMAGE_CAPACITY: usize = 128;
 /// The node field of an **internal** identifier's wire image (see
 /// [`Encoder::with_local_ext`] / [`Encoder::with_local_node`]).
 #[derive(Clone, Copy)]
@@ -295,7 +306,7 @@ impl<'a> Encoder<'a> {
     pub fn new_body(atoms: &'a AtomTable) -> Encoder<'a> {
         Encoder {
             atoms,
-            buf: Writer::new(),
+            buf: Writer::with_capacity(DEFAULT_IMAGE_CAPACITY),
             atom_encoding: AtomEncoding::Utf8,
             minor_version: MinorVersion::V2,
             atom_cache: None,
@@ -675,8 +686,13 @@ impl<'a> Encoder<'a> {
         }
 
         let name = self.atoms.name(atom_val(term)).ok_or_else(error::bad_arg)?;
-        // OTP caps atom names at 255 *characters*, independent of the encoding.
-        if name.chars().count() > ATOM_CHAR_MAX {
+        // OTP caps atom names at 255 *characters*, independent of the encoding. A
+        // UTF-8 name has at least one byte per character, so a byte length within
+        // the cap can never exceed it: the full `chars().count()` scan is only
+        // needed when the byte length already overflows the cap (and a name longer
+        // than 255 *bytes* is rare enough that the scan costs nothing on the hot
+        // path).
+        if name.len() > ATOM_CHAR_MAX && name.chars().count() > ATOM_CHAR_MAX {
             return Err(error::system_limit());
         }
         match self.atom_flavour() {
@@ -1011,8 +1027,7 @@ impl<'a> Encoder<'a> {
             // `bits` is the number of significant bits in the last byte (`1..=8`).
             self.buf.u8(tail as u8);
         }
-        let payload = repack_bits(bytes, offset_bits, size_bits, n_bytes)?;
-        self.buf.bytes(&payload);
+        repack_bits(&mut self.buf, bytes, offset_bits, size_bits, n_bytes)?;
         Ok(())
     }
 
@@ -1209,39 +1224,46 @@ fn compress_if_smaller(body: &[u8], level: u8) -> Result<Option<Vec<u8>>> {
 /// outside `bytes` yields `BeamError::BadArg` rather than a panic (a well-formed
 /// bitstring never triggers it).
 fn repack_bits(
+    out: &mut Writer,
     bytes: &[u8],
     offset_bits: usize,
     size_bits: usize,
     n_bytes: usize,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     debug_assert_eq!(
         n_bytes,
         bit_count_to_bytes(size_bits),
         "the caller sized the buffer from the bit count"
     );
-    let mut out = vec![0u8; n_bytes];
     if size_bits == 0 {
-        return Ok(out);
+        return Ok(());
     }
     if offset_bits % 8 == 0 {
+        // A byte-aligned source is written straight into the sink: no scratch
+        // buffer, no per-bit work. This is the common case — every on-heap
+        // `ErlHeapBits` binary has `offset_bits == 0`.
         let start = offset_bits / 8;
         let end = start.checked_add(n_bytes).ok_or_else(error::bad_arg)?;
         let src = bytes.get(start..end).ok_or_else(error::bad_arg)?;
-        out.copy_from_slice(src);
+        out.bytes(src);
     } else {
+        // A non-byte-aligned offset (only reachable from a sub-bitstring) needs the
+        // bits shifted, so it still builds the zeroed buffer before appending it.
+        let mut buf = vec![0u8; n_bytes];
         for i in 0..size_bits {
             let bit = offset_bits + i;
             let byte = *bytes.get(bit / 8).ok_or_else(error::bad_arg)?;
             if byte & (0x80 >> (bit % 8)) != 0 {
-                out[i / 8] |= 0x80 >> (i % 8);
+                buf[i / 8] |= 0x80 >> (i % 8);
             }
         }
+        out.bytes(&buf);
     }
     // The source's trailing bits are not significant: clear them.
     if size_bits % 8 != 0 {
-        out[n_bytes - 1] &= 0xFFu8 << (8 - (size_bits % 8));
+        out.mask_last_byte(0xFFu8 << (8 - (size_bits % 8)));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Encodes `term` as a `term_to_binary` image: version byte plus term.
