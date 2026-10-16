@@ -219,6 +219,7 @@ mod frame;
 mod opt;
 pub mod packet;
 mod sys;
+mod udp;
 mod wire;
 
 // The wire vocabulary (control codes, packed-address codec, errno renderer) lives in the
@@ -226,9 +227,15 @@ mod wire;
 // `crate::drivers::inet::*`.
 pub use self::wire::{
     INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_PROTO_TCP,
-    INET_REP_ERROR, INET_REP_OK, INET_TYPE_STREAM, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
+    INET_PROTO_UDP, INET_REP_ERROR, INET_REP_OK, INET_TYPE_DGRAM, INET_TYPE_STREAM, TCP_SHUT_RD,
+    TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 use self::wire::{ctl_error, ctl_ok, ctl_xerror, errno_name, parse_address};
+
+// The built-in datagram driver (the `udp_inet` entry point) is a sibling module that reuses this
+// module's wire vocabulary, option store and `sys` wrappers; its public surface is re-exported
+// the same way the TCP driver's is.
+pub use self::udp::{make_udp_inet, UdpInetDriver, UDP_DRIVER_NAME};
 
 // The `INET_REQ_SETOPTS`/`INET_REQ_GETOPTS` option vocabulary lives in the private `opt`
 // submodule: the four syscall-backed codes (`keepalive`/`sndbuf`/`recbuf`/`nodelay`) plus the

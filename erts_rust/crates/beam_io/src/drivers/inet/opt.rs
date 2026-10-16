@@ -164,6 +164,34 @@ pub const INET_LOPT_TCP_SEND_TIMEOUT_CLOSE: u8 = 35;
 /// **set-only** (`getopts` of this code is the C's `[0]einval`).
 pub const INET_LOPT_LINE_DELIM: u8 = 40;
 
+/// The `reuseaddr` option code (`INET_OPT_REUSEADDR`, `inet_drv.c:874`) — `SO_REUSEADDR`.
+pub const INET_OPT_REUSEADDR: u8 = 0;
+
+/// The `broadcast` option code (`INET_OPT_BROADCAST`, `inet_drv.c:878`) — `SO_BROADCAST`.
+pub const INET_OPT_BROADCAST: u8 = 4;
+
+/// The `{ttl, …}` option code (`INET_OPT_TTL`, `inet_drv.c:921`) — `IP_TTL`.
+pub const INET_OPT_TTL: u8 = 46;
+
+/// The `{mode, …}` option code (`INET_LOPT_MODE`, `inet_drv.c:899`) — driver state.
+pub const INET_LOPT_MODE: u8 = 24;
+
+/// The `{deliver, …}` option code (`INET_LOPT_DELIVER`, `inet_drv.c:900`) — driver state.
+pub const INET_LOPT_DELIVER: u8 = 25;
+
+/// The `{read_packets, …}` option code (`INET_LOPT_UDP_READ_PACKETS`, `inet_drv.c:908`) — driver
+/// state, gated on a datagram socket (`inet_set_opts`, `:7138`).
+pub const INET_LOPT_UDP_READ_PACKETS: u8 = 33;
+
+/// The `{mode, list}` default (`INET_MODE_LIST`, `inet_drv.c:778`).
+const INET_MODE_LIST: i32 = 0;
+
+/// The `{deliver, term}` default (`INET_DELIVER_TERM`, `inet_drv.c:783`).
+const INET_DELIVER_TERM: i32 = 1;
+
+/// The `{read_packets, N}` default (`INET_PACKET_POLL`, `inet_drv.c:1072`).
+const INET_PACKET_POLL: i32 = 5;
+
 /// `{active, false}` (`INET_PASSIVE`, `inet_drv.c:786`) — the default, and what a drained
 /// `{active, N}` counter falls back to.
 pub const INET_PASSIVE: i32 = 0;
@@ -224,6 +252,15 @@ pub(super) struct SocketOptions {
     /// `{line_delim, …}` (code [`INET_LOPT_LINE_DELIM`]) — the C's `inet.delimiter`. Stored but
     /// **not gettable** (`getopts` of code `40` is `[0]einval`).
     pub(super) line_delim: u8,
+    /// `{mode, …}` (code [`INET_LOPT_MODE`]) — the C's `inet.mode`, default `list` (`0`). Served
+    /// only on a datagram socket (see [`set_options`]).
+    pub(super) mode: i32,
+    /// `{deliver, …}` (code [`INET_LOPT_DELIVER`]) — the C's `inet.deliver`, default `term`
+    /// (`1`). Served only on a datagram socket.
+    pub(super) deliver: i32,
+    /// `{read_packets, …}` (code [`INET_LOPT_UDP_READ_PACKETS`]) — the C's
+    /// `inet.read_packets`, default `INET_PACKET_POLL` (`5`), gated on `SOCK_DGRAM`.
+    pub(super) read_packets: i32,
 }
 
 impl Default for SocketOptions {
@@ -236,6 +273,9 @@ impl Default for SocketOptions {
             packet_size: 0,
             send_timeout_close: 0,
             line_delim: DEFAULT_LINE_DELIM,
+            mode: INET_MODE_LIST,
+            deliver: INET_DELIVER_TERM,
+            read_packets: INET_PACKET_POLL,
         }
     }
 }
@@ -245,10 +285,13 @@ impl Default for SocketOptions {
 /// `[0]einval`).
 fn resolve(code: u8) -> Option<(libc::c_int, libc::c_int)> {
     match code {
+        INET_OPT_REUSEADDR => Some((libc::SOL_SOCKET, libc::SO_REUSEADDR)),
         INET_OPT_KEEPALIVE => Some((libc::SOL_SOCKET, libc::SO_KEEPALIVE)),
+        INET_OPT_BROADCAST => Some((libc::SOL_SOCKET, libc::SO_BROADCAST)),
         INET_OPT_SNDBUF => Some((libc::SOL_SOCKET, libc::SO_SNDBUF)),
         INET_OPT_RCVBUF => Some((libc::SOL_SOCKET, libc::SO_RCVBUF)),
         TCP_OPT_NODELAY => Some((libc::IPPROTO_TCP, libc::TCP_NODELAY)),
+        INET_OPT_TTL => Some((libc::IPPROTO_IP, libc::IP_TTL)),
         _ => None,
     }
 }
@@ -321,6 +364,19 @@ pub(super) fn set_options(
             INET_LOPT_TCP_SEND_TIMEOUT if stream => options.send_timeout = value,
             INET_LOPT_TCP_SEND_TIMEOUT_CLOSE if stream => options.send_timeout_close = value,
             INET_LOPT_TCP_SEND_TIMEOUT | INET_LOPT_TCP_SEND_TIMEOUT_CLOSE => {}
+            // The `{mode, …}`/`{deliver, …}`/`{read_packets, …}` driver-state store, served on a
+            // datagram socket only: `read_packets` is `SOCK_DGRAM`-gated in the C
+            // (`inet_drv.c:7138`, a non-positive value its `return -1`), and the two UDP-only
+            // codes are kept off the stream path so a `tcp_inet` reply cannot change. A stream
+            // socket therefore falls through to `resolve` and keeps the unserved `[0]einval`.
+            INET_LOPT_MODE if !stream => options.mode = value,
+            INET_LOPT_DELIVER if !stream => options.deliver = value,
+            INET_LOPT_UDP_READ_PACKETS if !stream && fd.is_some() => {
+                if value <= 0 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                options.read_packets = value;
+            }
             _ => match resolve(code) {
                 Some((level, name)) => {
                     if let Some(fd) = fd {
@@ -390,6 +446,23 @@ pub(super) fn get_options(
                 reply.extend_from_slice(&options.send_timeout_close.to_be_bytes());
             }
             INET_LOPT_TCP_SEND_TIMEOUT | INET_LOPT_TCP_SEND_TIMEOUT_CLOSE => {}
+            // The datagram driver-state read-backs. `read_packets` contributes nothing before a
+            // datagram socket exists — the C's `inet.stype` gate drops the record
+            // (`inet_drv.c:9267`), it is not an error.
+            INET_LOPT_MODE if !stream => {
+                reply.push(code);
+                reply.extend_from_slice(&options.mode.to_be_bytes());
+            }
+            INET_LOPT_DELIVER if !stream => {
+                reply.push(code);
+                reply.extend_from_slice(&options.deliver.to_be_bytes());
+            }
+            INET_LOPT_UDP_READ_PACKETS if !stream => {
+                if fd.is_some() {
+                    reply.push(code);
+                    reply.extend_from_slice(&options.read_packets.to_be_bytes());
+                }
+            }
             _ => {
                 let Some((level, name)) = resolve(code) else {
                     // The C's `default: RETURN_ERROR()` (`inet_drv.c:9719`-`:9720`) discards the
