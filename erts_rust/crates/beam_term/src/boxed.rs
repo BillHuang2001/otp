@@ -465,6 +465,40 @@ pub const INTERNAL_REF_PAYLOAD_WORDS: usize = 3;
 /// This is the **M1 substitution** for the C `ErtsORefThing` (`[header(2,
 /// REF_SUBTAG), num[0..3] as 4 `u32`s]`): the node container of the C layout is not
 /// carried, and the id lives in a *term* rather than inside a packed `u32` array.
+///
+/// # The id slot is one 60-bit small — narrower than ERTS's own id space
+///
+/// Because the whole identity is `make_small(id)` in a single fixed word, the
+/// representable id space is `0..=`[`MAX_SMALL`](crate::immediate::MAX_SMALL)
+/// (`0..= 2^59 - 1`). ERTS's own reference id is wider: the runtime hands out a full
+/// `Uint64` (`value = esdp->ref++`, `erl_bif_unique.h:169-178`) and its identity is
+/// the whole 64 bits, spread over the three wire numbers — `num[0]`'s 18 bits, the
+/// `num[1]` bits 18..31, and all 32 bits of `num[2]`
+/// (`erts_set_ref_numbers`/`erts_get_ref_numbers_value`, `erl_bif_unique.h:117-167`;
+/// the remaining `num[1]` bits are the C scheduler `thr_id` and two markers, which
+/// are not part of the value).
+///
+/// The slot **cannot** be widened without a term-layout break:
+///
+/// * a bignum id needs a *variable*-size thing — `[header, size, limbs…]` — so the
+///   block would no longer be four words and [`INTERNAL_REF_WORDS`],
+///   `beam_gc`/`beam_message`'s sizing and copy walks, [`internal_ref_id`]'s
+///   arity check and the three sibling producers all change;
+/// * repurposing the `node`/`serial` terms as extra id bits is not a widening
+///   either: those words are *semantically* the node container and the serial
+///   number (words 1 and 2 above), all three sibling producers pin them to
+///   `make_small(0)`, `beam_codec`'s codec rebuilds a decoded internal reference
+///   through [`write_internal_ref`] (which zeroes them) — so a reference whose
+///   identity lived there would stop round-tripping
+///   (`binary_to_term(term_to_binary(R)) =:= R`) — and [`crate::compare::cmp`]
+///   compares *all* the payload words, so the identity would then depend on bits the
+///   wire cannot carry back.
+///
+/// An id past the slot is therefore **refused** ([`write_internal_ref`]'s
+/// `TermError::SmallIntOutOfRange`), never truncated or substituted: a caller with a
+/// wider id must keep the reference in its faithful **external** form
+/// (`crate::thing::write_external_ref`, what `beam_codec` does for a wire image whose
+/// packed value does not fit this slot).
 pub const INTERNAL_REF_WORDS: usize = INTERNAL_REF_PAYLOAD_WORDS + 1;
 
 /// `write_internal_ref(hp, id)` — build the **M1 internal-reference thing**.
@@ -496,9 +530,15 @@ pub const INTERNAL_REF_WORDS: usize = INTERNAL_REF_PAYLOAD_WORDS + 1;
 ///
 /// # Errors
 ///
-/// [`TermError::SmallIntOutOfRange`] when `id` does not fit a 60-bit small integer
-/// (the value never fits in the fixed single-word id slot) — never a truncated or
-/// substituted id.
+/// [`TermError::SmallIntOutOfRange`] when `id` does not fit the 60-bit small integer
+/// [`INTERNAL_REF_WORDS`] documents as the block's whole id slot (`id >`
+/// [`MAX_SMALL`](crate::immediate::MAX_SMALL), i.e. `id > 2^59 - 1`) — never a
+/// truncated or substituted id. ERTS's own reference id is a full 64-bit `Uint64`,
+/// so this slot is genuinely narrower; see [`INTERNAL_REF_WORDS`] for why widening it
+/// would break the frozen byte-identical four-word block shared with `beam_process`,
+/// `beam_bifs` and `beam_rt` (a term-layout break). A caller holding a wider id keeps
+/// the reference in its faithful external form
+/// ([`crate::thing::write_external_ref`]) instead of materializing it here.
 pub unsafe fn write_internal_ref(hp: *mut Eterm, id: u64) -> TermResult<Eterm> {
     let id_term = try_make_small(i64::try_from(id).map_err(|_| TermError::SmallIntOutOfRange)?)?;
     // SAFETY: the caller guarantees `hp` addresses `INTERNAL_REF_WORDS` writable
@@ -516,7 +556,8 @@ pub unsafe fn write_internal_ref(hp: *mut Eterm, id: u64) -> TermResult<Eterm> {
 ///
 /// The read-back half of [`write_internal_ref`] (and of the sibling producers it is
 /// byte-identical to): the id is word [`INTERNAL_REF_PAYLOAD_WORDS`] of the block,
-/// a non-negative small integer.
+/// a non-negative small integer — the block's whole id slot, so an id past
+/// `2^59 - 1` is never found here (see [`INTERNAL_REF_WORDS`]).
 ///
 /// # Layout, and why this refuses a C-layout block
 ///

@@ -101,6 +101,30 @@
 //! decode→encode stays byte-exact, a later `beam_engine`/`beam_rt` can call the
 //! fun, and [`crate::compare`]/[`crate::hashing`] can be structural.
 //!
+//! # Where a `Local` fun's `NEW_FUN_EXT` identity comes from (it is not in the term)
+//!
+//! The C `ErlFunEntry` a local fun points at carries `module`, `uniq[16]`, `arity`,
+//! `index`, `old_uniq` and `old_index` (`erl_fun.h:31-59`), and the C's `NEW_FUN_EXT`
+//! encoder reads **all** of them back out of that entry (`external.c:3966-3993`).
+//! This tree inlines only `uniq`/`index` into the term (the table above), so a
+//! `make_fun3` closure's term carries **no** module atom, no 16-byte module MD5, no
+//! `old_index`/`old_uniq` and no creator pid. Nothing is stubbed in their place: the
+//! encoder takes them from the host seam (`beam_codec::FunIdentity`, installed by the
+//! runtime's `LocalFunIdentity` provider), which resolves the **defining module's
+//! `FunT` table** — the entry's position in that table is `old_index`, and the
+//! entry's own `uniq` field (the very word the closure term carries in its `uniq`
+//! slot) is `old_uniq` (`emu_load.c:645-651` passes the lambda-table loop index as
+//! `old_index`). A [`FunKind::Imported`] fun, by contrast,
+//! *does* carry `old_index`/`old_uniq` on the wire and inlines them
+//! ([`write_fun_imported`], [`fun_old_index`], [`fun_old_uniq`]), so its
+//! `NEW_FUN_EXT` image is self-contained.
+//!
+//! The residual gap is a local fun whose defining module cannot supply that identity
+//! — a module that is not loaded here (the `-eval` evaluator's `erl_eval` template
+//! closure, whose `uniq` is a sentinel no `FunT` entry can match). The encoder then
+//! reports its typed `unsupported_local_fun` rather than invent an `old_index`/
+//! `old_uniq`, and the descriptor here stays exactly the frozen `[uniq][index]` pair.
+//!
 //! The `Local` layout is **byte-identical** to what
 //! `beam_engine::terms::make_fun` writes, so the engine needs no change.
 //!
@@ -355,6 +379,12 @@ fn term_fun_kind(t: Eterm) -> TermResult<FunKind> {
 /// words 3 .. 3+n    env[0..num_free]
 /// ```
 ///
+/// The descriptor carries `uniq`/`index` **only**: the C `ErlFunEntry`'s `module`,
+/// `old_index`, `old_uniq` and `function` have no word here (see the module docs,
+/// "Where a `Local` fun's `NEW_FUN_EXT` identity comes from") — a `NEW_FUN_EXT`
+/// encoder obtains them from the host's fun-identity seam, and nothing is stubbed in
+/// the term in their place.
+///
 /// # Safety
 ///
 /// `hp` must point at `fun_words(FunKind::Local, num_free)` exclusively-owned,
@@ -586,6 +616,12 @@ pub unsafe fn fun_index(t: Eterm) -> TermResult<u32> {
 /// The `old_index` of a [`FunKind::Imported`] fun term — descriptor word 5. A
 /// non-fun, or a fun of another kind, yields [`TermError::BadFun`].
 ///
+/// A [`FunKind::Local`] fun has **no** such word: its inlined descriptor is
+/// `[uniq][index]` (module docs), because the C `old_index` lives in that fun's
+/// out-of-line `ErlFunEntry` and this tree does not carry the entry. Nothing is
+/// stubbed here for it — the `NEW_FUN_EXT` encoder takes the value from the host
+/// fun-identity seam (the defining module's `FunT` position), not from the term.
+///
 /// # Safety
 ///
 /// `t` must be a live boxed term; if it is a fun, its whole block must be live.
@@ -597,6 +633,11 @@ pub unsafe fn fun_old_index(t: Eterm) -> TermResult<u32> {
 
 /// The `old_uniq` of a [`FunKind::Imported`] fun term — descriptor word 6. A
 /// non-fun, or a fun of another kind, yields [`TermError::BadFun`].
+///
+/// Like [`fun_old_index`], a [`FunKind::Local`] fun has no such word (the C value
+/// lives in its out-of-line `ErlFunEntry`); the `NEW_FUN_EXT` encoder resolves it
+/// from the defining module's `FunT` entry through the host fun-identity seam
+/// rather than from the term, and nothing is stubbed here for it.
 ///
 /// # Safety
 ///

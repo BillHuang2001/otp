@@ -135,6 +135,33 @@ fn internal_ref_writer_refuses_an_id_that_does_not_fit_a_small() {
     }
 }
 
+/// The block's **whole identity rides one 60-bit small word**: the widest id fills
+/// the block's last word exactly, and the four words stay the frozen block.
+///
+/// ERTS's own reference id is *wider* than that slot — a full 64-bit `Uint64` spread
+/// over the three wire numbers (`erts_set_ref_numbers`/`erts_get_ref_numbers_value`,
+/// `erl_bif_unique.h:117-167`) — which is exactly why an id past the slot is
+/// **refused** here (a typed error, see
+/// [`internal_ref_writer_refuses_an_id_that_does_not_fit_a_small`]) rather than
+/// truncated: such a reference must stay in its faithful *external* form.
+#[test]
+fn the_id_slot_is_one_sixty_bit_small_word() {
+    // The id is the last payload word of a fixed-size block — never a bignum.
+    assert_eq!(INTERNAL_REF_WORDS, INTERNAL_REF_PAYLOAD_WORDS + 1);
+    assert_eq!(INTERNAL_REF_WORDS, 4);
+    // A 60-bit signed small spans `0 ..= 2^59 - 1`: the whole representable id space.
+    assert_eq!(MAX_SMALL, (1 << 59) - 1);
+    assert_eq!(MAX_SMALL as u64, 576_460_752_303_423_487);
+
+    // The widest representable id lands in word 3 and reads back unchanged.
+    let mut words = [Eterm::default(); INTERNAL_REF_WORDS];
+    let widest = m1_ref(&mut words, MAX_SMALL as u64);
+    assert_eq!(words[3], make_small(MAX_SMALL));
+    assert_eq!(id_of(widest), MAX_SMALL as u64);
+    assert_eq!(words[1], make_small(0));
+    assert_eq!(words[2], make_small(0));
+}
+
 /// The accessor refuses every shape that is not an M1 internal reference.
 #[test]
 fn internal_ref_id_refuses_every_other_term_shape() {
