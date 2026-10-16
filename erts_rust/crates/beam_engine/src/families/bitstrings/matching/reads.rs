@@ -405,3 +405,32 @@ pub(crate) fn decode_utf32(
     }
     Some((value, 32))
 }
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the field readers over raw bit patterns; every expected value is
+    //! the system `erl` oracle's answer for the same bits.
+    use super::*;
+    use crate::context::MinimalContext;
+    /// A little-endian integer field whose width is **not** a whole number of bytes is
+    /// read bit-granularly — neither rejected nor mis-read as big-endian.
+    ///
+    /// [`read_uint_le`] only accepts whole bytes, so such a field takes the general
+    /// wide path ([`read_wide_integer_field`], C's `fmt_big_le` trailing
+    /// `*buf <<= 8 - offs` adjustment). The oracle's `<<16#0102:12/little>>` is
+    /// `<<2,1:4>>` (`BitWriter::push_uint_le` in `../mod.rs`), so reading that payload
+    /// back as a 12-bit little-endian field must yield `16#0102`: the first 8-bit group
+    /// is the least-significant byte and the final 4-bit group is the value's high
+    /// nibble. A naive MSB-first read of the same bits would give `16#021`.
+    #[test]
+    fn read_integer_field_accepts_a_non_byte_multiple_little_endian_field() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let term = read_integer_field(&mut machine, &mut ctx, &[0x02, 0x10], 0, 12, BSF_LITTLE)
+            .expect("a 12-bit little-endian field reads bit-granularly");
+        assert!(
+            beam_term::is_small(term),
+            "16#102 fits a small integer, so no bignum is built"
+        );
+        assert_eq!(beam_term::signed_value(term), 0x102);
+    }
+}

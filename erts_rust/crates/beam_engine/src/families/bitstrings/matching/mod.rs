@@ -633,10 +633,11 @@ mod tests {
         );
     }
     #[test]
-    fn read_float_field_rejects_an_unsupported_size_and_an_unaligned_le_field() {
+    fn read_float_field_rejects_an_unsupported_size_and_an_out_of_range_field() {
         // Only 0/16/32/64 are valid; anything else is the typed `unsupported`.
         assert!(read_float_field(&[0, 0, 0, 0], 0, 8, 0).is_err());
-        // A little-endian field is read byte-wise, so it must be byte-aligned.
+        // Not an alignment rule — `read_uint_le_bits` accepts any bit offset; the
+        // **range** check rejects this one (`4 + 32` bits exceed the 4-byte buffer).
         assert!(read_float_field(&[0, 0, 0, 0], 4, 32, BSF_LITTLE).is_err());
     }
     // -- ensure_at_least (the `bs_match` command) ---------------------------

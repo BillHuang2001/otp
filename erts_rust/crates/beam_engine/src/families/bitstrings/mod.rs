@@ -90,11 +90,15 @@ pub(super) const BSF_LITTLE: u32 = 2;
 pub(super) const BSF_SIGNED: u32 = 4;
 /// `BSF_NATIVE` (`erl_bits.h:465`): the field is in native endianness.
 ///
-/// Kept for completeness of the frozen `erl_bits.h` flag table (`:461-465`). No
-/// decoded segment operand ever carries it: [`flag_bit`] resolves `native` to the
-/// machine endianness exactly as the C loader's `NativeEndian` does, so this bit
-/// only ever appears in a flag *set*, never in a decoded one.
-#[allow(dead_code)]
+/// This is a **live** flag, not a flag-table placeholder: the standalone reads whose
+/// flags operand is a raw `u32` (`bs_get_integer2`/`bs_get_float2`/`bs_get_utf16`/
+/// `bs_get_utf32`, which the loader decodes with `as_u32`) really do carry `16#10`
+/// here — `beam_asm:flag_to_bit/1` encodes `native` as `16#10` — and it is consumed by
+/// [`matching::reads::field_is_little`], which reads such a field little-endian on a
+/// little-endian target and big-endian otherwise, mirroring the C loader's
+/// `$NativeEndian` (`erts/emulator/beam/emu/generators.tab:43-55`). [`flag_bit`]
+/// additionally normalises the `native` **flag atom** to that same target order for
+/// the literal-atom-list route ([`decode_flags`]).
 pub(super) const BSF_NATIVE: u32 = 16;
 
 /// Execute a bitstring-family instruction.
@@ -241,10 +245,13 @@ fn flag_bit(module: &Module, elem: Eterm) -> Result<u32> {
         // The C loader collapses the `native` flag at load time (`NativeEndian`,
         // `erts/emulator/beam/generators.tab:43-55`): on a little-endian machine
         // `BSF_NATIVE` is cleared and `BSF_LITTLE` set, on a big-endian machine both
-        // are cleared (`native` is the `big` default there). Every consumer in this
-        // family tests `BSF_LITTLE` alone, so normalise here rather than leaking a
-        // bit no consumer honours (which would encode/decode a `native` segment with
-        // the wrong endianness on every target).
+        // are cleared (`native` is the `big` default there). The build side's
+        // little-endian writers select their path from `BSF_LITTLE` alone (the raw
+        // `BSF_NATIVE` a standalone read's `u32` flags operand can carry is resolved
+        // by `matching::reads::field_is_little` instead), so normalise the `native`
+        // flag *atom* here rather than leaking a bit those writers do not honour —
+        // which would encode a `native` segment with the wrong endianness on every
+        // target.
         return Ok(if cfg!(target_endian = "little") {
             BSF_LITTLE
         } else {
@@ -620,11 +627,13 @@ mod tests {
     /// The C loader collapses the flag at load time (`NativeEndian`,
     /// `erts/emulator/beam/generators.tab:43-55`): on a little-endian machine
     /// `BSF_NATIVE` is cleared and `BSF_LITTLE` set; on a big-endian machine both are
-    /// cleared (`native` is the `big` default there). Every consumer in this family
-    /// tests `BSF_LITTLE` alone, so a `native` segment must never keep `BSF_NATIVE` —
-    /// on this little-endian target such a segment would otherwise be written and read
-    /// **big-endian**, exactly backwards (`<<16#0102:16/native>>` is `<<2,1>>` in the
-    /// oracle, `<<1,2>>` for the big-endian default).
+    /// cleared (`native` is the `big` default there). The build side's little-endian
+    /// writers select their path from `BSF_LITTLE` alone (a raw `u32` flags operand
+    /// keeps `BSF_NATIVE` and is resolved by `matching::reads::field_is_little`
+    /// instead), so a `native` *flag atom* must never keep `BSF_NATIVE` — on this
+    /// little-endian target such a segment would otherwise be written **big-endian**,
+    /// exactly backwards (`<<16#0102:16/native>>` is `<<2,1>>` in the oracle, `<<1,2>>`
+    /// for the big-endian default).
     #[test]
     fn the_native_flag_is_the_machine_endianness() {
         let mut module = Module::default();
@@ -645,7 +654,7 @@ mod tests {
         assert_eq!(
             bit_of(&module, "native") & BSF_NATIVE,
             0,
-            "`native` must never survive as BSF_NATIVE: every consumer tests BSF_LITTLE"
+            "`native` must never survive as BSF_NATIVE on the flag-atom route"
         );
         // The explicit flags keep their own bits, unaffected.
         assert_eq!(bit_of(&module, "little"), BSF_LITTLE);
