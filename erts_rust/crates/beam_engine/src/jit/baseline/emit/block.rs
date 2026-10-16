@@ -28,9 +28,9 @@
 //! `r#move`, `test`, `select`, `arith`, `compare`, `bif`, `aggregate`, `frame`, `heap`,
 //! `link`, `family`) is asked first, and a refusal falls through to [`emit_deopt`] —
 //! which is [`emit_step_and_continue`] plus the test-only static-census attribution, the
-//! one place the "did not lower this instruction" decision is taken. The module also
-//! owns the prologue helpers the compiled-block shape needs ([`emit_position_store`] /
-//! [`emit_publish_y`] / [`emit_prologue_helper`]), the **cross-module** arm
+//! one place the "did not lower this instruction" decision is taken. The compiled-block
+//! prologue ([`emit_block_prologue`](super::prologue::emit_block_prologue)) lives in the
+//! sibling `prologue` module, and this module owns the **cross-module** arm
 //! ([`emit_ext_call`]), the **receive/send** arm ([`emit_receive`]) and the
 //! **local-call seam probe** ([`emit_local_call_probe`]).
 //!
@@ -60,23 +60,19 @@ use super::frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use super::heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
 use super::link::{emit_frame_teardown, Linker};
 use super::operands;
-use super::operands::x_offset;
+use super::prologue::emit_block_prologue;
 use super::r#move::{try_inline_move, try_inline_swap};
 use super::select::try_inline_select_val;
 use super::super::call::{jit_call_store, CALL_STORED};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
-    jit_publish_y, ExtCallHelper, PositionHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
-    EXT_CALL_ONLY, LOCAL_DECLINE, RUNTIME_XREGS_DISP,
+    ExtCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_DECLINE,
 };
-use super::super::{jit_ext_call, jit_local_call, jit_set_position};
+use super::super::{jit_ext_call, jit_local_call};
 use super::test::try_inline_test;
 use super::{
-    emit_continue_check, emit_helper_call, emit_step_and_continue, touch, Allocation, MOVE_SCRATCH,
-    RUNTIME_SLOT_DISP, SAVED_REGISTERS,
+    emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, MOVE_SCRATCH,
 };
-#[cfg(test)]
-use super::FillSite;
 
 /// Emit `init_yregs Registers` natively, or report that the block must helper it.
 ///
@@ -163,43 +159,7 @@ pub(crate) fn emit_block(
     // --- prologue -----------------------------------------------------------
     #[cfg(test)]
     let block_start_bytes = buffer.len();
-    for reg in SAVED_REGISTERS {
-        buffer.push_r(reg)?;
-    }
-    // Reserve the `rt` slot. `lea rsp, [rsp - 24]` is `sub rsp, 24` and keeps `rsp`
-    // 16-byte aligned at the helper call site (see `SAVED_REGISTERS`).
-    buffer.lea(Reg::Rsp, Reg::Rsp, -24)?;
-    buffer.mov_mr(Reg::Rsp, RUNTIME_SLOT_DISP, Reg::Rdi)?;
-    // rbx = rt->x_regs, the base of `machine.x` the cached slots are indexed from.
-    // Loaded **before** the position store below: `rbx` is callee-saved, so the helper
-    // call preserves it, and the cached x-registers are loaded only *after* the call,
-    // so nothing a block keeps live across the call sits in caller-saved scratch.
-    buffer.mov_rm(Reg::Rbx, Reg::Rdi, RUNTIME_XREGS_DISP)?;
-    // Record this block's own `(func, pc)` as the machine's execution position, so
-    // `Machine::current_code` (and the `process_info/2` position items built from it)
-    // advances at block granularity even across a **linked** branch, which never
-    // returns to the driver. A parked `receive` and a raise stay exact because both go
-    // through the interpreted deopt (`jit_step_one`), which records the *instruction*
-    // address itself. See `jit_set_position`.
-    //
-    // A block that accesses a Y slot ([`Allocation::y_last`]) publishes the current
-    // frame's Y window through `jit_publish_y` **instead**, which does the position
-    // store *and* refreshes the window in the one call — so publishing costs such a
-    // block nothing extra, and a Y-free block keeps emitting the plain position store
-    // (it pays literally nothing). See `jit_publish_y` for why the prologue is the
-    // sound, cheapest publish point.
-    if allocation.y_last.is_some() {
-        emit_publish_y(buffer, func, start as u32)?;
-    } else {
-        emit_position_store(buffer, func, start as u32)?;
-    }
-    for (x, reg) in &allocation.slots {
-        touch(highest_touched, *x);
-        buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
-    }
-    // Structural counter: the prologue loaded the whole cache.
-    #[cfg(test)]
-    super::super::counters::record_fill(FillSite::Prologue, allocation.slots.len() as u64);
+    emit_block_prologue(buffer, allocation, highest_touched, func, start)?;
 
     let done: CodeLabel = buffer.label();
     // The direct block-to-block linker: a taken branch to a compiled successor's
@@ -883,7 +843,7 @@ pub(crate) fn emit_block(
     // already spilled the cached x-registers, so the epilogue only leaves the
     // frame — the exact inverse of the prologue.
     buffer.bind(done)?;
-    emit_frame_teardown(buffer)?;
+    emit_frame_teardown(buffer, allocation)?;
     buffer.ret()?;
     // Structural counter: this block's IR size, cache size, write set (the spill's
     // store count on every exit) and emitted native byte length.
@@ -894,54 +854,6 @@ pub(crate) fn emit_block(
         (buffer.len() - block_start_bytes) as u64,
     );
     Ok(())
-}
-
-/// Emit the prologue's position store: call `jit_set_position(rt, func, pc)` so the
-/// machine records this block's entry `(func, pc)` as its current execution position.
-///
-/// `rt` is read out of the prologue-reserved stack slot ([`RUNTIME_SLOT_DISP`]), so
-/// this may be emitted anywhere after that slot is written. The helper clobbers only
-/// caller-saved registers, so a block must have loaded nothing it needs into them at
-/// the call; every cached x-register and `rbx` live in callee-saved registers, which
-/// the helper preserves ([`emit_block`] emits this before loading the cached
-/// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
-/// (see [`SAVED_REGISTERS`]). The helper returns nothing — a position store cannot
-/// fail — so `rax` is not consulted.
-fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
-    let helper: PositionHelper = jit_set_position;
-    emit_prologue_helper(buffer, func, pc, helper as *const ())
-}
-
-/// Emit the prologue's **Y-window publish**: call `jit_publish_y(rt, func, pc)`, which
-/// records this block's entry `(func, pc)` as the machine's position *and* re-publishes
-/// the current frame's Y window.
-///
-/// A block whose body accesses a Y slot ([`Allocation::y_last`]) emits this in place of
-/// [`emit_position_store`] — same three-argument call shape, so the block pays no extra
-/// call for publishing. The window must be live before the block's first Y access
-/// because the Erlang stack is a `Vec` a frame push may reallocate; see `jit_publish_y`.
-fn emit_publish_y(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
-    let helper: PositionHelper = jit_publish_y;
-    emit_prologue_helper(buffer, func, pc, helper as *const ())
-}
-
-/// Emit the prologue's three-argument helper call — `helper(rt, func, pc)` — shared by
-/// [`emit_position_store`] and [`emit_publish_y`] (the two differ only in the helper's
-/// body).
-///
-/// `rt` is read out of the prologue-reserved stack slot ([`RUNTIME_SLOT_DISP`]), so this
-/// may be emitted anywhere after that slot is written. The helper clobbers only
-/// caller-saved registers, so a block must have loaded nothing it needs into them at
-/// the call; every cached x-register and `rbx` live in callee-saved registers, which
-/// the helper preserves ([`emit_block`] emits this before loading the cached
-/// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
-/// (see [`SAVED_REGISTERS`]). Neither helper returns a value, so `rax` is not consulted.
-fn emit_prologue_helper(buffer: &mut CodeBuffer, func: u32, pc: u32, helper: *const ()) -> Result<()> {
-    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-    buffer.mov_ri(Reg::Rsi, i64::from(func))?;
-    buffer.mov_ri(Reg::Rdx, i64::from(pc))?;
-    buffer.mov_ri(Reg::R11, helper as i64)?;
-    buffer.call_r(Reg::R11)
 }
 
 /// [`emit_step_and_continue`] plus the **static-census** deopt attribution: the whole

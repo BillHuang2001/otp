@@ -255,6 +255,24 @@ impl FastArith<'_> {
             FastDest::Y(_) => Vec::new(),
         }
     }
+    /// The x-register indices the shape's native lowering **reads through the block
+    /// register cache** — its two x-register operands, in load order, and nothing else.
+    /// A `Y` operand is a stack slot, never a cached register.
+    ///
+    /// The destination is a pure write (it receives the computed value), so a destination
+    /// register the block also reads is listed as an operand here — which is why an
+    /// in-place `x = x + 1` (destination equal to an operand) still reports its register
+    /// as read. This is what the block prologue's entry-load decision needs (see
+    /// [`super::super::liveness`]).
+    pub(super) fn reads(&self) -> Vec<u32> {
+        let mut reads = Vec::with_capacity(2);
+        for operand in [self.a, self.b] {
+            if let Some(x) = x_register(operand) {
+                reads.push(x);
+            }
+        }
+        reads
+    }
 
     /// Whether the lowered sequence reads the current frame's Y window.
     ///

@@ -154,6 +154,20 @@ impl Inlined {
             Inlined::Value { writes, .. } => writes.clone(),
         }
     }
+    /// The x-register indices the lowered sequence **reads through the block register
+    /// cache** — the operand registers.
+    ///
+    /// The helper-evaluated accessors ([`Inlined::Value`]) read their source out of
+    /// `machine.x` *inside the helper* (the block spills first), so they read **no** cache
+    /// register: only their destination is charged. This is what the block prologue's
+    /// entry-load decision needs (see [`super::super::liveness`]).
+    fn reads(&self) -> Vec<u32> {
+        match self {
+            Inlined::Cons(shape) => shape.reads(),
+            Inlined::Tuple(shape) => shape.reads(),
+            Inlined::Value { .. } => Vec::new(),
+        }
+    }
 
     /// Whether the lowered sequence reads the current frame's `Y` window (a `Y` source or
     /// destination), i.e. whether the block must publish/refresh it
@@ -293,6 +307,12 @@ fn shape(module: &Module, instr: &Instr) -> Option<Inlined> {
 pub(super) fn bif_shape(module: &Module, instr: &Instr) -> Option<(Vec<u32>, Vec<u32>)> {
     let shape = shape(module, instr)?;
     Some((shape.registers(), shape.writes()))
+}
+/// The x-registers the `Bif`'s native lowering **reads through the block register cache**,
+/// or `None` when the instruction is not one of the five lowered BIFs in an inlinable
+/// shape. The read-set twin of [`bif_shape`] (see [`Inlined::reads`]).
+pub(super) fn bif_reads(module: &Module, instr: &Instr) -> Option<Vec<u32>> {
+    shape(module, instr).map(|shape| shape.reads())
 }
 
 /// Whether the `Bif`'s native lowering reads the current frame's `Y` window.

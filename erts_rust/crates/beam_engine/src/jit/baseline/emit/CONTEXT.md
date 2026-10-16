@@ -6,8 +6,9 @@ Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 fu
 One file per responsibility: `mod.rs` owns the shared emitter wiring (the register-file/scratch
 constants, `touch`, the spill/fill traffic, the helper-sequencing layer every arm shares —
 `emit_helper_call`/`emit_step_and_continue`/`emit_continue_check`/`emit_refresh_y` — plus the
-re-exports); `block.rs` owns the compiled-block shape (the prologue/epilogue, the `emit_block`
-lowering dispatch and its helper-sequence arms, the deopt wrapper); `regs.rs` owns the register cache
+re-exports); `block.rs` owns the compiled-block shape (the `emit_block` lowering dispatch, its
+helper-sequence arms and its epilogue/deopt wrapper) and `prologue.rs` the block prologue it emits
+first (`emit_block_prologue` and its position-store helpers); `regs.rs` owns the register cache
 (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`); `compile.rs` owns the compilation entry points
 — `compile_module` (the **eager** whole-module layout: one shared `CodeBuffer`, a whole-module block
 map) and `compile_function`/`emit_function` (the **lazy** layout's per-function unit: its own
@@ -41,8 +42,9 @@ them.
   diverged from their `machine.x` slot since the last syncing event, and falls back to the whole
   `Allocation::written` set when the table is empty; `fill` reloads only
   `Allocation::fill_slots(pc)` — the registers the continuation can still observe, the block-local
-  liveness of `liveness.rs::fill_sets` unioned with the write set, `(live ∪ written) ∩ slots` — except
-  the prologue load, which is always the whole cache.
+  liveness of `liveness.rs::fill_sets` unioned with the write set, `(live ∪ written) ∩ slots` — while the
+  prologue load is the block's **live-in** slot set (`Allocation::entry_fill`), so a cached register the
+  block writes before it reads is never loaded at entry (an absent table falls back to the whole cache).
   The cache itself lives in `regs.rs` (`Allocation`/`spill`/`fill`); the call sites are in `mod.rs`
   (`emit_helper_call`) and the block/link emitters.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
@@ -279,18 +281,33 @@ is a `u32` the helper takes as an argument, computed at compile time by `HeapNee
 instruction's own operands.
 
 ## Spill/fill discipline
-- Prologue (`block.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
-  slot, `rbx = rt->x_regs`, then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
+- Prologue (`prologue.rs::emit_block_prologue`, emitted first by `block.rs::emit_block`): push the
+  block's own frame register set
+  (`native_frame_regs` — `rbx` plus the machine registers the block holds as cache slots),
+  reserve the `frame_slot_len(k)`-byte `rt` slot (`8` when `k = 1 + slots.len()` is even,
+  `16` when odd, so `rsp` stays 16-byte aligned at every helper call), `rbx = rt->x_regs`,
+  then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
   position store — emitted before the cached loads, because `rbx` is callee-saved and no cached register
   may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
   (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
-  re-publishes the current frame's Y window in one call — then load each cached register from `machine.x`.
+  re-publishes the current frame's Y window in one call — then load each cached register in
+  `Allocation::entry_fill` from `machine.x` (the block's **live-in** slots: a cached register the block
+  writes before it reads is not loaded at entry, because that writing instruction sets it).
+  The frame is **variable-length**: `k = native_frame_regs(allocation).len()` is the block's own push count,
+  so the reservation and the teardown's matching `lea rsp,[rsp+frame_slot_len(k)]` always agree
+  (`emit/link.rs::emit_frame_teardown` derives both sides from the same `native_frame_regs`). Corpus
+  counters (grand total over the generically-discovered installed-OTP corpus): 597 333 blocks /
+  756 632 cache slots, push/pop ops 7 167 996 → 2 707 930 (−62.2 %), emitted bytes
+  320 065 790 → 306 024 443 (−4.39 %), with every per-block cache/write set and IR size unchanged.
+  The prologue load set is `Allocation::entry_fill`, which cuts corpus prologue loads
+  **756 632 → 352 537** (−53.4 %).
 - `regs.rs::spill` / `regs.rs::fill`: `spill(buffer, allocation, site, pc)` stores exactly
   `Allocation::spill_slots_at(pc)` — the cached x-registers **dirty at that pc** (`Allocation::spill_sets`,
   the `regalloc.rs` forward dirty walk) — falling back to the whole `Allocation::written` set when the
   table is empty (a synthetic `Allocation` a unit test built directly); `fill` loads every `(x, reg)` in
   `Allocation::fill_slots(pc)` — the continuation's block-local liveness unioned with the write set —
-  except the prologue load, which is the whole cache (see the **Register cache** section below).
+  except the prologue load, which is `Allocation::entry_fill` (the block's live-in cached slots; see the
+  **Register cache** section below).
 - **Every helper call spills first.** `mod.rs::emit_helper_call(buffer, allocation, helper, args, pc)`
   (used by `emit_step_and_continue`, `emit_ext_call`, `emit_receive`, `emit_family`, the `Call` arm, the
   frame-discipline trio, the heap/frame-admission family and the comparison-`test` helper) stores the
@@ -423,24 +440,29 @@ Tier-equivalence is proven by the crate's `tests/jit*.rs` real-module gates (int
 by construction).
 
 ## Routing Table
-- `mod.rs` -> the shared emitter wiring: the register-file/scratch constants (`SAVED_REGISTERS`/
-  `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/`MOVE_SCRATCH_2`), `touch`, `emit_refresh_y`,
-  `emit_helper_call` (which takes the instruction's own `pc` as the store pc), `emit_step_and_continue`,
-  `emit_continue_check`; re-exports
+- `mod.rs` -> the shared emitter wiring: the register-file/scratch constants (`SAVED_REGISTERS`
+  — the canonical full callee-saved set — `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/
+  `MOVE_SCRATCH_2`), the variable-frame helpers `native_frame_regs`/`frame_slot_len`, `touch`,
+  `emit_refresh_y`, `emit_helper_call` (which takes the instruction's own `pc` as the store pc),
+  `emit_step_and_continue`, `emit_continue_check`; re-exports
   `regs::{Allocation, SpillSite, FillSite}` and `pub(crate) use block::emit_block`, `compile_module`/
   `compile_function` (keeping every item path stable for `baseline/mod.rs`, `baseline/code.rs`, the
   sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`), plus
   the `#[path]` submodule `spill_tests` (`spill_tests.rs`; see `## Test Strategy`).
-- `block.rs` -> the compiled-block shape and per-instruction lowering dispatch: `emit_block` (the
-  `match instr` dispatch), `try_inline_init_yregs`, `emit_position_store`/`emit_publish_y`/
-  `emit_prologue_helper` (the prologue position store / Y-window publish), `emit_deopt`,
-  `emit_local_call_probe`, `emit_ext_call`, `emit_receive`.
+- `block.rs` -> the per-instruction lowering dispatch and the compiled-block shape it emits:
+  `emit_block` (the `match instr` dispatch), `try_inline_init_yregs`, `emit_deopt`,
+  `emit_local_call_probe`, `emit_ext_call`, `emit_receive`; the block prologue it emits first is
+  `prologue.rs`.
+- `prologue.rs` -> the compiled-block prologue: `emit_block_prologue` (the frame-register pushes, the
+  `rt`-slot reservation, the `machine.x` base load, the position store / Y-window publish and the
+  live-in cache load) plus the private `emit_position_store`/`emit_publish_y`/`emit_prologue_helper`
+  it uses.
 - `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`spill_sets`/`y_last`/
-  `block_start`/`fill_sets`, `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/
-  `refresh_y_after`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`), `fill` (loads
-  only `fill_slots(pc)`, else the whole cache at the prologue), and the
+  `block_start`/`fill_sets`/`entry_fill`, `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/
+  `entry_loads`/`refresh_y_after`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`),
+  `fill` (loads only `fill_slots(pc)` at a helper site, and the prologue's `entry_fill` set at entry), and the
   test-only `SpillSite`/`FillSite` classification of the call sites; `liveness.rs` computes the per-pc
-  `fill_sets` and `regalloc.rs` the per-pc `spill_sets`.
+  `fill_sets` **and** the block's live-in `entry_fill` set, `regalloc.rs` the per-pc `spill_sets`.
 - `compile.rs` -> the compilation entry points and what they share: `compile_module` (**eager**:
   whole-module block map + the merged whole-module summary that guards entry, plus `emit_shared_sub_blocks`)
   and `compile_function` (**lazy**: one function's own buffer/entries/sub_entries/summary, sharing
@@ -531,14 +553,14 @@ by construction).
   stable across the splits. Keep that in mind when renaming items.
 
 ## Known Issues
-- **`block.rs` (1073 lines) is deliberately above the ~1000-line guidance.** It holds the single
-  per-instruction lowering dispatch (`emit_block`, a `match instr` with one arm per instruction group)
-  plus its prologue/epilogue, position-store/Y-publish, deopt wrapper and the three helper-sequence
-  arms. The `match` is what makes the file cohesive — each arm is one `try_inline_*` call plus an
-  `emit_deopt` fallback — so splitting it would either scatter one decision across files or require
-  inventing a visitor/table abstraction the emitter does not need. The other files are all under the
-  guidance (`mod.rs` 351, `test.rs` 963, `aggregate.rs` 720, …).
-- **`test.rs` (963) and `aggregate.rs` (720) are under the guidance but still large**: `test.rs` keeps
+- **`block.rs` holds the single per-instruction lowering dispatch** (`emit_block`, a `match instr` with
+  one arm per instruction group) plus its deopt wrapper and the three helper-sequence arms; the `match`
+  is what makes the file cohesive — each arm is one `try_inline_*` call plus an `emit_deopt` fallback —
+  so splitting it further would scatter one decision across files or require inventing a visitor/table
+  abstraction the emitter does not need. The block prologue it emits first is `prologue.rs`; the other
+  files are under the ~1000-line guidance (`test.rs` 963, `compile.rs` 892, `mod.rs` 401, `aggregate.rs`
+  744, …).
+- **`test.rs` (963) and `aggregate.rs` (744) are under the guidance but still large**: `test.rs` keeps
   the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
   `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers
   live in `aggregate/list.rs`.
@@ -622,12 +644,13 @@ never disagree. Both directions of the traffic are **partial**:
   fill set always contains. The register is only ever overwritten, never read.
 
 `Allocation` carries `block_start`, `fill_sets` (indexed by `pc - block_start`, one entry
-per pc of the block) and `spill_sets` (the same indexing, one entry per pc in
-`[start, end]` — the block's own pcs **plus** the exit pc `end`), both derived once by
-`regalloc.rs` at allocation time so the emitter stays a pure reader. An
+per pc of the block), `spill_sets` (the same indexing, one entry per pc in
+`[start, end]` — the block's own pcs **plus** the exit pc `end`) and `entry_fill` (the
+block's live-in cached slots), all derived once by `regalloc.rs` at allocation time so the
+emitter stays a pure reader. An
 **empty** `fill_sets` table (a synthetic `Allocation` a unit test built directly) means
 "no liveness was computed" and makes every fill set the whole cache, and an empty
-`spill_sets` table likewise makes every store set the whole `written` set. The prologue load is always the whole cache (`FillSite::Prologue`),
+`spill_sets` table likewise makes every store set the whole `written` set. The prologue load is `entry_fill` (`FillSite::Prologue`), whose absent table likewise falls back to the whole cache,
 and the fill table is always block-length so an in-block pc always resolves. This keeps
 `allocate_registers(module, code, start, end) -> Allocation` and
 `Allocation::slots`' meaning unchanged, so `compile.rs` (and the continuation

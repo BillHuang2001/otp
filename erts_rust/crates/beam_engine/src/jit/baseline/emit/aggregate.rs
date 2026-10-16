@@ -165,6 +165,17 @@ impl TupleReadShape {
     pub(super) fn writes(&self) -> Vec<u32> {
         self.dst.register().into_iter().collect()
     }
+    /// The x-register indices the shape's native lowering **reads through the block
+    /// register cache** — the source tuple, and nothing else. A `Y` source is a stack
+    /// slot, never a cached register.
+    ///
+    /// The destination is a pure write (the element is read out of the source tuple and
+    /// stored into it), so a destination register the block also reads is listed through
+    /// that other instruction. This is what the block prologue's entry-load decision needs
+    /// (see [`super::super::liveness`]).
+    pub(super) fn reads(&self) -> Vec<u32> {
+        self.source.register().into_iter().collect()
+    }
 
     /// Whether the lowered sequence reads the current frame's Y window — a `Y` source
     /// or a `Y` destination ([`super::arith::uses_y`]'s per-shape test).
@@ -251,6 +262,12 @@ impl AritySwitchPlan {
     /// alternative is an immediate, and every path transfers control.
     pub(super) fn writes(&self) -> Vec<u32> {
         Vec::new()
+    }
+    /// The x-register indices the plan's native lowering **reads through the block
+    /// register cache** — the scrutinee, exactly as [`AritySwitchPlan::registers`]. An
+    /// arity switch writes no x-register, so its read set is its whole touch set.
+    pub(super) fn reads(&self) -> Vec<u32> {
+        self.registers()
     }
 }
 
@@ -557,6 +574,13 @@ impl TupleWriteShape {
     /// tuple keeps its `machine.x` value, so the write set is empty.
     pub(super) fn writes(&self) -> Vec<u32> {
         Vec::new()
+    }
+    /// The x-register indices the shape's native lowering **reads through the block
+    /// register cache** — the target tuple and the element value, exactly as
+    /// [`TupleWriteShape::registers`]. A tuple write writes no x-register, so its read set
+    /// is its whole touch set.
+    pub(super) fn reads(&self) -> Vec<u32> {
+        self.registers()
     }
 
     /// Whether the lowered sequence reads the current frame's Y window — a `Y` target

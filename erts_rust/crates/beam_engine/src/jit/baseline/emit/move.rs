@@ -138,6 +138,23 @@ impl MoveShape {
         }
     }
 
+    /// The x-register indices the shape's native lowering **reads through the block
+    /// register cache** — its x-register source, and nothing else.
+    ///
+    /// The destination is a *pure* write (the shuffle computes the new value into a
+    /// scratch and then stores it), so it is not a read — **except** in the degenerate
+    /// `move x x` (source and destination the same register), where the emitted
+    /// `mov dst, src` reads and writes the one register. That case is covered by the
+    /// source being read, so the read set is the source alone.
+    ///
+    /// This is what the block prologue's entry-load decision needs (see
+    /// [`super::super::liveness`]): a register the shape only writes must not be loaded.
+    pub(crate) fn reads(&self) -> Vec<u32> {
+        match self.source {
+            MoveValue::X(x) => vec![x],
+            MoveValue::Y(_) | MoveValue::Constant(_) | MoveValue::Literal(_) => Vec::new(),
+        }
+    }
     /// Whether the lowered sequence reads the current frame's Y window.
     ///
     /// A `Y` source or a `Y` destination is read/written through
@@ -578,6 +595,17 @@ impl SwapShape {
         writes.extend(self.a.register());
         writes.extend(self.b.register());
         writes
+    }
+    /// The x-register indices the exchange **reads through the block register cache** —
+    /// both operands, exactly as [`SwapShape::registers`].
+    ///
+    /// A `swap` is a read-modify-write of both sides (each side's *old* value is stored
+    /// into the other), so unlike every other shape its read set is its whole touch set;
+    /// a register it writes is also a register it reads. This is what the block
+    /// prologue's entry-load decision needs (see [`super::super::liveness`]): a swapped
+    /// register must be loaded even where the block never reads it afterwards.
+    pub(crate) fn reads(&self) -> Vec<u32> {
+        self.registers()
     }
 
     /// Whether the lowered exchange reads or writes the current frame's Y window (a `Y`

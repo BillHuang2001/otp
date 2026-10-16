@@ -70,9 +70,11 @@
 //! A block caches up to [`CACHE_REGISTERS`]` .len()` (five) x-registers in
 //! callee-saved machine registers (`rbp`, `r12`–`r15`); `rbx` is reserved for the
 //! machine base pointer (loaded once from `rt.x_regs`) and the `rt` argument itself
-//! lives in the 24-byte stack slot the prologue reserves (the byte count that keeps
-//! `rsp` 16-byte aligned after the six callee-saved pushes). The prologue pushes
-//! every callee-saved register it touches (so the Rust caller's state is preserved),
+//! lives in the `rt` stack slot the prologue reserves (`emit::frame_slot_len(k)`
+//! bytes — `8` or `16`, the count that keeps `rsp` 16-byte aligned after the `k`
+//! registers the block actually pushes). The prologue pushes only the callee-saved
+//! registers it actually uses — `rbx` plus the machine registers it holds as cache
+//! slots (`emit::native_frame_regs`), so the Rust caller's state is preserved —
 //! loads the cached x-registers out of `machine.x`, and the epilogue **spills the
 //! block's written set back at every block exit** (a cached register the block never
 //! wrote already holds its `machine.x` value, so storing it would be a no-op). That is

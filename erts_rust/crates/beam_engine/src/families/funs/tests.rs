@@ -269,20 +269,34 @@ fn call_fun_dispatches_the_fun_in_x_arity() {
     let mut ctx = MinimalContext::with_apply_hook(Box::new(|_fun, args| {
         Ok(make_small(signed_value(args[0]) + 1))
     }));
+    // The target must be a **real** closure of the called arity: C's `call_fun`
+    // classifies the target before dispatching (`is_not_any_fun` ⇒
+    // `EXC_BADFUN`, a header-arity mismatch ⇒ `EXC_BADARITY`), so a small int in
+    // `x(arity)` would now raise instead of reaching the hook.
+    let fun = terms::make_fun(&mut ctx, 1, 0, 0, &[]).expect("materialize the closure");
     let result = machine
-        .run_label(&module, entry, 2, &[make_small(4), make_small(0)], &mut ctx)
+        .run_label(&module, entry, 2, &[make_small(4), fun], &mut ctx)
         .expect("call_fun");
     assert_eq!(result, make_small(5));
 }
 
 #[test]
 fn call_fun_without_an_apply_hook_is_a_typed_unsupported() {
+    // A host with neither the closure seam nor an apply hook cannot dispatch the
+    // closure: the value-returning `apply_fun` fallback is the trait's typed
+    // `unsupported`, routed through the machine as before.
     let mut fixture = Fixture::new();
+    fixture.add_fun("lambda", 0, 0, 1);
     let entry = fixture.add_function(
         "f",
         1,
         vec![
             Instr::Label(Label(1)),
+            Instr::MakeFun3 {
+                index: 0,
+                dst: beam_loader::Operand::X(0),
+                env: Vec::new(),
+            },
             Instr::CallFun { arity: 0 },
             Instr::Return,
         ],
@@ -292,7 +306,7 @@ fn call_fun_without_an_apply_hook_is_a_typed_unsupported() {
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     let err = machine
-        .run_label(&module, entry, 1, &[make_small(0)], &mut ctx)
+        .run_label(&module, entry, 0, &[], &mut ctx)
         .expect_err("no apply hook must fail");
     assert!(matches!(err, BeamError::Raise(_)));
 }
@@ -345,10 +359,329 @@ fn call_fun2_dispatches_the_fun_in_its_operand() {
         assert!(args.is_empty());
         Ok(make_small(42))
     }));
+    // A 0-ary closure, so the header arity matches the `call_fun2` call arity.
+    let fun = terms::make_fun(&mut ctx, 0, 0, 0, &[]).expect("materialize the closure");
     let result = machine
-        .run_label(&module, entry, 1, &[make_small(0)], &mut ctx)
+        .run_label(&module, entry, 1, &[fun], &mut ctx)
         .expect("call_fun2");
     assert_eq!(result, make_small(42));
+}
+
+// -----------------------------------------------------------------------
+// The structured target-shape reasons (`{badfun,_}` / `{badarity,_}`)
+// -----------------------------------------------------------------------
+
+/// Read the `{Tag, Value}` reason out of a landed raise and return `Value`,
+/// asserting the tag atom.
+///
+/// The landing convention stores the reason in `x(1)` (`Machine::land_exception`).
+fn reason_value(module: &Module, reason: Eterm, tag: &str) -> Eterm {
+    let tag_atom = module
+        .atom_table
+        .lookup(tag)
+        .expect("the fixture interns the reason tag");
+    assert_eq!(
+        terms::tuple_arity(reason).expect("the reason is a boxed tuple"),
+        2,
+        "the reason `{{{tag}, Value}}` must be a 2-tuple"
+    );
+    assert_eq!(
+        terms::tuple_element(reason, 0).expect("element 0"),
+        make_atom(tag_atom),
+        "the reason tag"
+    );
+    terms::tuple_element(reason, 1).expect("element 1")
+}
+
+/// `f(F) -> F(1).` — the `call_fun 1` shape with the target in `x(1)`.
+fn call_fun_caller(fixture: &mut Fixture) -> Label {
+    fixture.add_function(
+        "f",
+        2,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::CallFun { arity: 1 },
+            Instr::Return,
+        ],
+    )
+}
+
+#[test]
+fn call_fun_with_a_non_fun_target_raises_badfun() {
+    // The oracle (OTP 29.1.1): `f(F) -> F(1).` then `f(5)` ⇒ `{error,{badfun,5}}`
+    // and `f(notafun)` ⇒ `{error,{badfun,notafun}}`.
+    //
+    // C's `call_fun` (`beam_common.c:1616-1619`) classifies the target before
+    // dispatching: `is_not_any_fun(fun)` sets `freason = EXC_BADFUN` and puts the
+    // offending term in `fvalue`, and `expand_error_value` (`:754-768`) wraps it as
+    // `TUPLE2(am_badfun, fvalue)` under class `error`.
+    let mut fixture = Fixture::new();
+    fixture.atom("badfun");
+    fixture.atom("error");
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    let mut ctx = MinimalContext::new();
+    // x(1) = the target `5` (a small int, NOT a fun); x(0) = the call argument.
+    machine.set_x(0, make_small(1)).unwrap();
+    machine.set_x(1, make_small(5)).unwrap();
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("the raise lands in the live catch frame");
+    assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+    assert_eq!(machine.x(0), Some(Eterm::non_value()), "x(0) = THE_NON_VALUE");
+    assert_eq!(
+        reason_value(&module, machine.x(1).unwrap(), "badfun"),
+        make_small(5),
+        "the offending TERM rides the reason (C's `fvalue`)"
+    );
+    let _ = entry;
+}
+
+#[test]
+fn call_fun2_with_a_non_fun_operand_raises_badfun() {
+    // The `call_fun2` route reads the target from its `Func` operand; the same
+    // structured `{badfun, Fun}` reason applies (the operand sink must re-read the
+    // operand through the slack, not hold the pre-reserve term).
+    let mut fixture = Fixture::new();
+    let safe = fixture.atom("safe");
+    fixture.atom("badfun");
+    fixture.atom("error");
+    fixture.add_function(
+        "f",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::CallFun2 {
+                tag: beam_loader::Operand::Atom(safe),
+                arity: 0,
+                func: beam_loader::Operand::X(1),
+            },
+            Instr::Return,
+        ],
+    );
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    let mut ctx = MinimalContext::new();
+    machine.set_x(1, make_small(9)).unwrap();
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun2 {
+            tag: beam_loader::Operand::Atom(safe),
+            arity: 0,
+            func: beam_loader::Operand::X(1),
+        },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("the raise lands in the live catch frame");
+    assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+    assert_eq!(
+        reason_value(&module, machine.x(1).unwrap(), "badfun"),
+        make_small(9)
+    );
+}
+
+#[test]
+fn call_fun_with_a_wrong_arity_fun_raises_badarity() {
+    // The oracle (OTP 29.1.1): `am1(F, A) -> F(A).` then
+    // `am1(fun(X, Y) -> X end, one)` ⇒ `{error,{badarity,{#Fun<…>,[one]}}}` — C's
+    // arity mismatch (`beam_common.c:1668-1674`) sets `fvalue = TUPLE2(fun, args)`
+    // with the **actual** argument list, wrapped as `{badarity, _}`.
+    let mut fixture = Fixture::new();
+    fixture.atom("badarity");
+    fixture.atom("error");
+    let one = fixture.atom("one");
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    let mut ctx = MinimalContext::new();
+    // A genuine 2-ary local closure (the `make_fun3` header arity is the descriptor
+    // arity minus the captured variables: 2 - 0), called with ONE argument.
+    let fun = terms::make_fun(&mut ctx, 2, 0, 0, &[]).expect("materialize the closure");
+    machine.set_x(0, make_atom(one)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("the raise lands in the live catch frame");
+    assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+    assert_eq!(machine.x(0), Some(Eterm::non_value()), "x(0) = THE_NON_VALUE");
+    let inner = reason_value(&module, machine.x(1).unwrap(), "badarity");
+    assert_eq!(
+        terms::tuple_arity(inner).expect("`{Fun, Args}` is a 2-tuple"),
+        2
+    );
+    assert_eq!(
+        terms::tuple_element(inner, 0).expect("the fun"),
+        fun,
+        "the offending FUN rides the reason"
+    );
+    assert_eq!(
+        terms::list_elements(terms::tuple_element(inner, 1).expect("the args list"))
+            .expect("a proper list"),
+        vec![make_atom(one)],
+        "the ACTUAL argument list rides the reason"
+    );
+    let _ = entry;
+}
+
+#[test]
+fn call_fun_with_a_matching_arity_still_reaches_the_apply_fun_fallback() {
+    // The shape guard must not reject a well-formed closure: a 1-ary fun called
+    // with one argument reaches the value-returning `apply_fun` fallback exactly as
+    // before (the regression guard for the structured-reason check).
+    let mut fixture = Fixture::new();
+    fixture.atom("badfun");
+    fixture.atom("badarity");
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    let mut ctx = MinimalContext::with_apply_hook(Box::new(|fun, args| {
+        assert!(terms::is_fun(fun), "the fallback receives the genuine fun");
+        assert_eq!(args, [make_small(7)]);
+        Ok(make_small(41))
+    }));
+    let fun = terms::make_fun(&mut ctx, 1, 0, 0, &[]).expect("materialize the closure");
+    machine.set_x(0, make_small(7)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("a matching arity dispatches");
+    assert_eq!(step, Some(Step::Next));
+    assert_eq!(machine.x(0), Some(make_small(41)));
+    let _ = entry;
+}
+
+#[test]
+fn call_fun_without_the_badfun_atom_declines_to_the_apply_fun_fallback() {
+    // The engine's atom-independence convention: a running module that cannot name
+    // the reason atom never substitutes a different atom. There is no structured
+    // reason to raise, so the target-shape classification declines and the call
+    // falls through to the host closure-apply seam exactly as before the shape
+    // check existed — a non-fun target over a `MinimalContext` (no hook) therefore
+    // reaches the trait-default `apply_fun` ⇒ the typed `unsupported_opcode:
+    // apply_fun`.
+    let mut fixture = Fixture::new();
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    machine.set_x(0, make_small(1)).unwrap();
+    machine.set_x(1, make_small(5)).unwrap();
+    let mut ctx = MinimalContext::new();
+
+    let err = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect_err("the module cannot name `badfun`, so the fallback is consulted");
+    let got = match err {
+        BeamError::Raise(raise) => raise
+            .reason
+            .as_atom()
+            .unwrap_or("<non-atom reason>")
+            .to_owned(),
+        other => panic!("expected the typed unsupported, got {other:?}"),
+    };
+    assert_eq!(
+        got, "unsupported_opcode: apply_fun",
+        "an unnameable reason tag declines to the `apply_fun` fallback"
+    );
+    assert_eq!(machine.catch_frame_depth(), 1, "the handler was not used");
+    let _ = entry;
+}
+
+#[test]
+fn call_fun_with_a_non_fun_without_a_catch_frame_keeps_the_live_reason() {
+    // Uncaught, the structured reason propagates on the raise's live-reason slot
+    // (as `{badmatch,_}`/`{badrecord,_}` do) — never collapsed to a bare atom.
+    let mut fixture = Fixture::new();
+    fixture.atom("badfun");
+    fixture.atom("error");
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    let mut ctx = MinimalContext::new();
+    machine.set_x(0, make_small(1)).unwrap();
+    machine.set_x(1, make_small(5)).unwrap();
+
+    let err = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect_err("no catch frame");
+    match err {
+        BeamError::Raise(raise) => {
+            assert_eq!(raise.class, ExceptionClass::Error, "class `error`");
+            let reason = raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied()
+                .expect("the live reason term");
+            assert_eq!(reason_value(&module, reason, "badfun"), make_small(5));
+        }
+        other => panic!("expected a class-`error` raise, got {other:?}"),
+    }
+    let _ = entry;
 }
 
 // -----------------------------------------------------------------------
@@ -1290,6 +1623,11 @@ fn a_resolve_local_fun_error_lands_in_a_live_catch_frame() {
     // (`Machine::raise_bif_error` → `Machine::throw_with_trace`), so it lands in the
     // caller's live `try`/`catch` exactly as C's `handle_error` → `next_catch` does,
     // instead of escaping as a `?`-propagated typed error.
+    //
+    // The target must be a **matching-arity fun** so the call reaches the seam: a
+    // non-fun (or a wrong-arity fun) is classified by `call_fun` itself and never
+    // consults `resolve_local_fun` (see
+    // `call_fun_with_a_non_fun_target_raises_badfun`).
     let mut fixture = Fixture::new();
     fixture.atom("badarg");
     fixture.atom("error");
@@ -1316,6 +1654,9 @@ fn a_resolve_local_fun_error_lands_in_a_live_catch_frame() {
     machine.push_catch_frame(CatchFrame::new(4, 6, 0));
     let mut ctx = MinimalContext::new();
     ctx.set_local_fun_resolver(Box::new(|_fun, _args| Err(BeamError::BadArg)));
+    // x(1) = a 1-ary closure, so the call arity matches and the seam is consulted.
+    let fun = terms::make_fun(&mut ctx, 1, 0, 0, &[]).expect("materialize the closure");
+    machine.set_x(1, fun).unwrap();
 
     let step = exec(
         &mut machine,
@@ -1362,6 +1703,10 @@ fn a_resolve_local_fun_error_without_a_catch_frame_is_the_typed_error() {
     machine.push_frame(0).unwrap();
     let mut ctx = MinimalContext::new();
     ctx.set_local_fun_resolver(Box::new(|_fun, _args| Err(BeamError::BadArg)));
+    // A matching-arity closure, so the seam (not the shape check) is the source of
+    // the error under test.
+    let fun = terms::make_fun(&mut ctx, 1, 0, 0, &[]).expect("materialize the closure");
+    machine.set_x(1, fun).unwrap();
 
     let err = exec(
         &mut machine,
@@ -1409,6 +1754,10 @@ fn an_unsupported_capability_gap_from_the_seam_stays_uncatchable() {
     ctx.set_local_fun_resolver(Box::new(|_fun, _args| {
         Err(crate::error::unsupported("resolve_local_fun: no module"))
     }));
+    // A matching-arity closure, so the seam's `unsupported` (not the shape check) is
+    // the error whose catchability is under test.
+    let fun = terms::make_fun(&mut ctx, 1, 0, 0, &[]).expect("materialize the closure");
+    machine.set_x(1, fun).unwrap();
 
     let err = exec(
         &mut machine,

@@ -222,6 +222,21 @@ impl Comparison<'_> {
     pub(super) fn writes(&self) -> Vec<u32> {
         vec![self.dst_x]
     }
+    /// The x-register indices the shape's native lowering **reads through the block
+    /// register cache** — its two x-register operands, in load order, and nothing else.
+    ///
+    /// The destination is a pure write (it receives `true`/`false`), so a destination
+    /// register the block also reads is listed as an operand here. This is what the block
+    /// prologue's entry-load decision needs (see [`super::super::liveness`]).
+    pub(super) fn reads(&self) -> Vec<u32> {
+        let mut reads = Vec::with_capacity(2);
+        for operand in [self.a, self.b] {
+            if let Some(x) = x_register(operand) {
+                reads.push(x);
+            }
+        }
+        reads
+    }
 }
 
 /// The shape test for `instr` (`Instr::Bif` or `Instr::GcBif`), or `None` when the

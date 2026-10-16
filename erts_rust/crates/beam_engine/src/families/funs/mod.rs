@@ -89,6 +89,19 @@
 //! [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif) as
 //! before.
 //!
+//! **The call target's shape is classified before the seam** — exactly where C's
+//! `call_fun` (`beam_common.c:1604-1622`) does it — so the structured `error`
+//! reasons the oracle raises are reproduced instead of degrading to the bare
+//! `badarg`/`badarity` the host seam can only report:
+//! - a target that is not a fun at all ⇒ `{badfun, Fun}` (`EXC_BADFUN`,
+//!   `expand_error_value`'s `TUPLE2(am_badfun, fvalue)`, `:754-768`);
+//! - a fun whose header arity (`terms::fun_arity`, C's `fun_arity(funp)`) differs
+//!   from the call's arity ⇒ `{badarity, {Fun, Args}}` (`EXC_BADARITY`), with
+//!   `Args` the **actual** argument list.
+//! Both are built through the rooted builders from the running module's own atom
+//! table; a module that cannot name the tag yields the typed
+//! [`error::unsupported`](crate::error::unsupported), never a substituted atom.
+//!
 //! Every failure is a typed [`beam_common::BeamError`]: `read_operand`/
 //! `write_operand` propagate, an out-of-range register is
 //! [`crate::error::bad_register`], a `make_fun3` with no matching descriptor is
@@ -104,17 +117,17 @@
 use crate::interpreter::LabelMap;
 
 use beam_common::{BeamError, ExceptionClass, Result};
-use beam_loader::{Instr, Module};
-use beam_term::{atom_val, is_atom, make_atom, Eterm};
+use beam_loader::{Instr, Module, Operand};
+use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm};
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::families::exceptions::callee;
 use crate::machine::{Continuation, Machine};
 use crate::operand::{
-    operand_slack_words, read_operand, read_operands_slack, write_operand,
+    operand_slack_words, read_operand, read_operand_slack, read_operands_slack, write_operand,
 };
-use crate::terms;
+use crate::terms::{self, Sink, Slack};
 use crate::Step;
 
 /// Execute a fun-family instruction.
@@ -170,13 +183,20 @@ pub(crate) fn exec(
         }
 
         // `call_fun Arity` — the fun is in `x(arity)`, arguments in `x(0..arity)`.
-        Instr::CallFun { arity } => {
-            let fun = machine
-                .x(*arity)
-                .ok_or_else(|| error::bad_register(*arity))?;
-            let args = register_args(machine, *arity)?;
-            call_fun(machine, module, fun, &args, *arity, func, pc, ctx)
-        }
+        //
+        // The target is handed over as a **source**, not a read `Eterm`: the
+        // structured `{badfun,Fun}`/`{badarity,{Fun,Args}}` reasons `call_fun` may
+        // have to build are rooted allocations, so the term is re-read from the
+        // machine's post-collection state (the reserve → read → write discipline).
+        Instr::CallFun { arity } => call_fun(
+            machine,
+            module,
+            FunSource::Register(*arity),
+            *arity,
+            func,
+            pc,
+            ctx,
+        ),
 
         // `call_fun2 Tag Arity Func` — the fun is the `Func` operand, arguments in
         // `x(0..arity)`. The `Tag` hint (an atom or a fun-table index) is ignored.
@@ -184,11 +204,15 @@ pub(crate) fn exec(
             arity,
             func: fun_operand,
             ..
-        } => {
-            let fun = read_operand(machine, ctx, fun_operand)?;
-            let args = register_args(machine, *arity)?;
-            call_fun(machine, module, fun, &args, *arity, func, pc, ctx)
-        }
+        } => call_fun(
+            machine,
+            module,
+            FunSource::Operand(fun_operand),
+            *arity,
+            func,
+            pc,
+            ctx,
+        ),
 
         // `apply Arity` — module = `x(arity)`, function = `x(arity+1)`, arguments
         // in `x(0..arity)` (`fixed_apply`).
@@ -282,14 +306,178 @@ fn register_args(machine: &Machine, arity: u32) -> Result<Vec<Eterm>> {
     Ok(args)
 }
 
+/// Where a `call_fun`/`call_fun2` target lives — a **re-readable source**, not a
+/// captured `Eterm`.
+///
+/// C reads the target from `reg[arity]` in `call_fun` (`beam_common.c:1615`; the
+/// loader rewrites `call_fun2` to `call_fun` over a moved register) and **re-reads**
+/// it after the collection that may run while it builds the `{badarity,_}` reason
+/// (`beam_common.c:1646-1649`). The engine does the same: the term is never held in
+/// a Rust local across a rooted reservation, only the source it came from.
+enum FunSource<'a> {
+    /// `call_fun Arity` — the target is `x(arity)`.
+    Register(u32),
+    /// `call_fun2 Tag Arity Func` — the target is the `Func` operand.
+    Operand(&'a Operand),
+}
+
+impl FunSource<'_> {
+    /// Read the target through `ctx` — the ordinary operand path, byte-identical
+    /// to reading the term up front for a target that is dispatched.
+    fn read(&self, machine: &Machine, ctx: &mut dyn ExecutionContext) -> Result<Eterm> {
+        match self {
+            FunSource::Register(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
+            FunSource::Operand(operand) => read_operand(machine, ctx, operand),
+        }
+    }
+
+    /// Read the target **without allocating from the BEAM heap** — the post-reserve
+    /// half of a reason builder's read closure (a non-small integer operand is
+    /// materialized into `slack`, see [`read_operand_slack`]).
+    fn read_slack(&self, machine: &Machine, slack: &mut Slack) -> Result<Eterm> {
+        match self {
+            FunSource::Register(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
+            FunSource::Operand(operand) => read_operand_slack(machine, operand, slack),
+        }
+    }
+
+    /// The spare tail a reason builder must reserve for [`Self::read_slack`].
+    fn slack_words(&self) -> usize {
+        match self {
+            FunSource::Register(_) => 0,
+            FunSource::Operand(operand) => operand_slack_words(operand),
+        }
+    }
+}
+
+/// The running module's name for an exception-reason tag atom, or the typed
+/// [`error::unsupported`] when it has none.
+///
+/// ERTS resolves `badfun`/`badarity` from its **global** `error_atom` table
+/// (`beam_common.c:382-406`; neither name is interned by a module's own source —
+/// verified with `beam_lib:chunks(F,[atoms])`). This engine's atoms are
+/// module-local indices, so the tag comes from the running module's table — which
+/// `beam_rt` seeds from the shared core-atom set. A module that cannot name the
+/// tag yields the typed `unsupported` rather than a substituted, wrong atom (the
+/// same convention `EXIT`/`badfield`/`{badmatch,_}` follow).
+fn reason_atom(module: &Module, name: &str) -> Result<Atom> {
+    module.atom_table.lookup(name).ok_or_else(|| {
+        error::unsupported(&format!("call_fun: no '{name}' atom in the module"))
+    })
+}
+
+/// Raise `reason` as a class-`error` exception — the shared landing every
+/// structured reason builder in this file uses (the `error` class atom is
+/// installed only when the module names it, exactly as `records::create_failure`
+/// and `exceptions::raise_error_tuple` do).
+fn raise_reason(machine: &mut Machine, module: &Module, reason: Eterm) -> Result<Step> {
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(reason)
+}
+
+/// Raise the C's `EXC_BADFUN` reason `{badfun, Fun}` — the
+/// `call_fun`/`call_fun2` target that is not a fun at all.
+///
+/// `beam_common.c:1616-1619`: `is_not_any_fun(fun)` sets `freason = EXC_BADFUN` and
+/// `fvalue = fun`; `expand_error_value` (`:754-768`) then wraps the value as
+/// `TUPLE2(am_badfun, Fun)`, which an enclosing `try` observes as
+/// `{error,{badfun,Fun}}`. The reason is one rooted 2-tuple reservation whose read
+/// closure re-reads the target from the machine's post-collection state.
+fn raise_badfun(
+    machine: &mut Machine,
+    module: &Module,
+    source: &FunSource<'_>,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Step> {
+    let tag = reason_atom(module, "badfun")?;
+    let extra = source.slack_words();
+    let reason = terms::make_tuple_rooted(
+        machine,
+        ctx,
+        RootSet::ALL_LIVE,
+        2,
+        extra,
+        |m, slack| Ok(vec![make_atom(tag), source.read_slack(m, slack)?]),
+    )?;
+    raise_reason(machine, module, reason)
+}
+
+/// Raise the C's `EXC_BADARITY` reason `{badarity, {Fun, Args}}` — the target IS a
+/// fun, but its arity differs from the call's.
+///
+/// `beam_common.c:1668-1674`: the C builds the argument list from the live
+/// registers, then sets `freason = EXC_BADARITY` and `fvalue = TUPLE2(fun, args)`;
+/// `expand_error_value` wraps that as `TUPLE2(am_badarity, {Fun, Args})`, which a
+/// `catch` observes as `{error,{badarity,{Fun,[Arg,…]}}}`. `arity` is the **call's**
+/// arity, so `Args` is the list of arguments actually passed.
+///
+/// The whole graph — the outer 2-tuple, the inner `{Fun, Args}` and the `arity`
+/// list cells — is carved from **one** rooted reservation (3 + 3 + 2·arity words,
+/// plus the source's slack tail): three successive allocations would strand the
+/// earlier nodes under a moving collector.
+fn raise_badarity(
+    machine: &mut Machine,
+    module: &Module,
+    source: &FunSource<'_>,
+    arity: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Step> {
+    let tag = reason_atom(module, "badarity")?;
+    let extra = 3 + 2 * arity as usize + source.slack_words();
+    let reason = terms::make_tuple_rooted(
+        machine,
+        ctx,
+        RootSet::ALL_LIVE,
+        2,
+        extra,
+        |m, slack| {
+            let fun = source.read_slack(m, slack)?;
+            let args = register_args(m, arity)?;
+            let args_list = slack.list(&args)?;
+            let inner = slack.tuple(&[fun, args_list])?;
+            Ok(vec![make_atom(tag), inner])
+        },
+    )?;
+    raise_reason(machine, module, reason)
+}
+
 /// The shared `call_fun`/`call_fun2` dispatch — the in-machine *closure-apply* seam.
 ///
-/// The host is consulted **first** through
-/// [`ExecutionContext::resolve_local_fun`]: a host that owns the closure's
-/// defining module answers `Some((callee_module, lambda_entry_label))` and the
-/// engine enters the lambda body **in this machine**, exactly as C's `call_fun`
-/// (`../../erts/emulator/beam/beam_common.c:1604`) sets `reg[i + arity] = funp->env[i]`
-/// and dispatches to the fun body's `code_ptr` in the same process:
+/// The target shape is classified **first**, exactly as C's `call_fun`
+/// (`../../erts/emulator/beam/beam_common.c:1604-1622`) does before it reaches the
+/// fun body:
+///
+/// * not a fun ⇒ [`raise_badfun`] (`EXC_BADFUN` ⇒ `{badfun, Fun}`, class `error`);
+/// * a fun whose header arity (`terms::fun_arity` — C's `fun_arity(funp)`, the 8-bit
+///   header field, which is the right field for *both* a `make_fun3` closure and an
+///   external `fun M:F/A`) differs from the call's `arity` ⇒ [`raise_badarity`]
+///   (`EXC_BADARITY` ⇒ `{badarity, {Fun, Args}}`, class `error`).
+///
+/// Both are detected **here**, independently of the host seam, because the seam can
+/// only report a bare `BadArg`/`BadArity` and would lose the offending term — while
+/// the oracle reports the structured reason (verified on OTP 29.1.1: `f(F) -> F(1).`
+/// with `f(5)` ⇒ `{error,{badfun,5}}`, and a 2-ary closure called with one argument
+/// ⇒ `{error,{badarity,{Fun,[one]}}}`).
+///
+/// **The classification is gated on the running module naming the reason tag.** C's
+/// global `error_atom` table always names `badfun`/`badarity`, so C always raises the
+/// structured reason; this engine's atoms are module-local indices, so a module that
+/// cannot name the tag declines to the host *closure-apply* seam
+/// ([`ExecutionContext::resolve_local_fun`] ⇒ [`ExecutionContext::apply_fun`], which
+/// owns a live namespace and produces the faithful reason) rather than fabricating or
+/// substituting an atom — the same "never substitute a wrong atom" convention
+/// [`reason_atom`] follows. A module that *does* name the tag (every `beam_rt`
+/// process, whose core-atom set seeds `badfun`/`badarity`) takes the structured-reason
+/// path unchanged.
+///
+/// A well-formed target then proceeds unchanged: the host is consulted through
+/// [`ExecutionContext::resolve_local_fun`], and a host that owns the closure's
+/// defining module answers `Some((callee_module, lambda_entry_label))` so the engine
+/// enters the lambda body **in this machine**, exactly as C's `call_fun`
+/// (`beam_common.c:1604`) sets `reg[i + arity] = funp->env[i]` and dispatches to the
+/// fun body's code in the same process:
 ///
 /// * the call `args` are already in `x(0..arity)` (C's `reg[i] = args[i]`);
 /// * the closure's free variables are copied into `x(arity..arity + num_free)`
@@ -311,18 +499,31 @@ fn register_args(machine: &Machine, arity: u32) -> Result<Vec<Eterm>> {
 /// `badarg`/`badarity` from a nested machine) lands in a live `try`/`catch` exactly
 /// as C's `handle_error` → `next_catch` does; a genuine capability gap
 /// ([`error::unsupported`], whose reason atom the running module cannot name) stays
-/// the uncatchable typed error.
+/// the uncatchable typed error. That routing is unchanged by the shape check above:
+/// it only replaces the *bare* `badarg`/`badarity` the seam used to produce.
 fn call_fun(
     machine: &mut Machine,
     module: &Module,
-    fun: Eterm,
-    args: &[Eterm],
+    source: FunSource<'_>,
     arity: u32,
     func: u32,
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    match ctx.resolve_local_fun(fun, args) {
+    let fun = source.read(machine, ctx)?;
+    if !terms::is_fun(fun) {
+        // Only raise the structured reason when the running module can actually
+        // name the tag; otherwise fall through to the seam below (see the doc
+        // comment: `beam_rt` seeds `badfun`, so the real runtime always takes this
+        // path, while an atom-poor test module reaches the `apply_fun` fallback).
+        if module.atom_table.lookup("badfun").is_some() {
+            return raise_badfun(machine, module, &source, ctx).map(Some);
+        }
+    } else if terms::fun_arity(fun)? != arity && module.atom_table.lookup("badarity").is_some() {
+        return raise_badarity(machine, module, &source, arity, ctx).map(Some);
+    }
+    let args = register_args(machine, arity)?;
+    match ctx.resolve_local_fun(fun, &args) {
         Ok(Some((callee, label))) => {
             // C's free-variable layout: the call arguments stay in `x(0..arity)`,
             // the closure's captured variables follow at `x(arity..)`. The `fun`
@@ -354,7 +555,7 @@ fn call_fun(
         }
         // The host cannot run this closure in-machine: the value-returning
         // fallback, unchanged for a host without the seam.
-        Ok(None) => match ctx.apply_fun(fun, args) {
+        Ok(None) => match ctx.apply_fun(fun, &args) {
             Ok(result) => {
                 machine.set_x(0, result)?;
                 Ok(Some(Step::Next))

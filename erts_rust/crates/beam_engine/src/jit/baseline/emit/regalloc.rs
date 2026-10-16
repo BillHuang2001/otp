@@ -39,8 +39,11 @@
 //! `machine.x` slot since the last event that synced the two. There are exactly two
 //! syncing events:
 //!
-//! * the **prologue**, which loads the whole cache *from* `machine.x`, so every cached
-//!   register starts the block clean; and
+//! * the **prologue**, which loads the block's **live-in** cache slots *from*
+//!   `machine.x` — a cached register the block writes before it first reads is never
+//!   loaded, and the rule is self-containment (each block and continuation sub-block
+//!   loads its own cache) — so every register the block reads before it writes starts
+//!   the block clean; and
 //! * **any helper call's spill** (a [`super::emit_helper_call`] begins with a
 //!   [`super::regs::spill`]) followed by the helper running: the spill writes the dirty
 //!   registers out, so afterwards every cached register equals its `machine.x` slot — and
@@ -288,7 +291,14 @@ fn allocate_registers_with_labels(
     // helper call at that pc must reload out of `machine.x` (the block-local liveness of
     // the continuation, unioned with the write set above). See `super::liveness`.
     allocation.block_start = start as u32;
-    allocation.fill_sets = super::liveness::fill_sets(module, labels, code, start, end, &allocation);
+    let (fill_sets, entry_fill) =
+        super::liveness::fill_sets(module, labels, code, start, end, &allocation);
+    allocation.fill_sets = fill_sets;
+    // The block's **live-in** set: the cached registers the prologue loads (see
+    // `super::liveness`). A cached register the block writes before it reads is left
+    // unloaded — the writing instruction sets its machine register, and a store of it
+    // stores the write set, which the fill set always contains.
+    allocation.entry_fill = Some(entry_fill);
 
     // The **dirty set at every pc** (`spill_sets`): the cached x-registers a spill at
     // that pc must store (see the module docs). A forward walk from an empty set: an
@@ -594,6 +604,102 @@ pub(crate) fn cacheable_touches(
         _ => {}
     }
     touches
+}
+/// The x-registers one instruction's **native** lowering **reads through the block
+/// register cache** — its operand registers, excluding the destinations it only writes.
+///
+/// The read-set twin of [`cacheable_touches`], mirroring the same per-shape dispatch and
+/// the same shape predicates (so the two always agree on which instructions the block
+/// lowers). It exists for the block prologue's **entry-load** decision
+/// ([`super::liveness::fill_sets`]): a cached register the block only *writes* before it
+/// reads must not be loaded out of `machine.x` at entry. A register claimed here but never
+/// actually read only costs a redundant entry load — never a missing one.
+pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr) -> Vec<u32> {
+    let mut reads = Vec::new();
+    match instr {
+        Instr::Move { src, dst } => {
+            if let Some(shape) = move_shape(src, dst) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::Swap { a, b } => {
+            if let Some(shape) = super::r#move::swap_shape(a, b) {
+                reads.extend(shape.reads());
+            }
+        }
+        // `init_yregs Registers` only writes (`NIL`) — it reads no x-register.
+        Instr::InitYregs { .. } => {}
+        Instr::GetList { source, head, tail } => {
+            if let Some(shape) = get_list_shape(source, head, tail) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::GetHd { source, head } => {
+            if let Some(shape) = get_hd_shape(source, head) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::GetTl { source, tail } => {
+            if let Some(shape) = get_tl_shape(source, tail) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::GetTupleElement {
+            source,
+            element,
+            dst,
+        } => {
+            if let Some(shape) = get_tuple_element_shape(source, *element, dst) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::SetTupleElement {
+            element,
+            tuple,
+            offset,
+        } => {
+            if let Some(shape) = set_tuple_element_shape(element, tuple, *offset) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::SelectTupleArity {
+            tuple,
+            fail,
+            destinations,
+        } => {
+            if let Some(plan) = select_tuple_arity_plan(labels, tuple, *fail, destinations) {
+                reads.extend(plan.reads());
+            }
+        }
+        Instr::GcBif { .. } | Instr::Bif { .. } => {
+            if let Some(fast) = fast_arith(module, instr) {
+                reads.extend(fast.reads());
+            } else if let Some(plan) = comparison_shape(module, instr) {
+                reads.extend(plan.reads());
+            } else if let Some(shape_reads) = super::bif::bif_reads(module, instr) {
+                reads.extend(shape_reads);
+            }
+        }
+        Instr::Test { kind, fail, args } => {
+            if let Some(plan) = test_plan(module, *kind, *fail, args, labels) {
+                if let TestSrc::Reg(x) = plan.lhs {
+                    reads.push(x);
+                }
+                if let Some(TestSrc::Reg(x)) = plan.rhs {
+                    reads.push(x);
+                }
+            }
+        }
+        Instr::SelectVal { value, fail, pairs } => {
+            if let Some(plan) = select_val_plan(labels, value, *fail, pairs) {
+                if let TestSrc::Reg(x) = plan.scrutinee {
+                    reads.push(x);
+                }
+            }
+        }
+        _ => {}
+    }
+    reads
 }
 
 /// The x-registers one instruction's **native** lowering **writes** — the block's
