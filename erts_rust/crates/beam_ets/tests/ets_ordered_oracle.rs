@@ -66,10 +66,10 @@
 //! # The op driver
 //!
 //! Each step consumes exactly four draws on both sides, whatever the op:
-//! `op`, the key index, the value, and an auxiliary key index (used by
-//! `next`/`prev`). The op space is 55 slots: 34 `insert` slots (so the upsert
-//! dominates and the table exceeds `ORDER = 32`), then one slot per remaining
-//! operation:
+//! `op`, the key index, the value, and an auxiliary key index (the anchor that
+//! `next`/`prev` and the anchored walks start from). The op space is 60 slots:
+//! 34 `insert` slots (so the upsert dominates and the table exceeds
+//! `ORDER = 32`), then one slot per remaining operation:
 //!
 //! | slot(s) | operation |
 //! |---------|-----------|
@@ -95,6 +95,38 @@
 //! | `52` | `foldr` |
 //! | `53` | `lookup_element/3` |
 //! | `54` | `lookup_element/4` |
+//! | `55` | `walk_next` (full ascending walk) |
+//! | `56` | `walk_prev` (full descending walk) |
+//! | `57` | `walk_next` from the `aux` anchor |
+//! | `58` | `walk_prev` from the `aux` anchor |
+//! | `59` | `insert_block` (a contiguous integer block) |
+//!
+//! # The walk dimension (slots `55..=58`)
+//!
+//! `first`/`last`/`next`/`prev` each observe a *single* navigation step, so
+//! they pin the successor relation pointwise but never a whole traversal: a
+//! tree whose per-step answers are right can still skip, repeat or mis-order a
+//! key across a chain (a broken leaf link, an unrefreshed branch separator).
+//! The walk slots close that gap by traversing the entire table and rendering
+//! the full key sequence in visit order. `walk_next` chains `next` from
+//! `first`; `walk_prev` chains `prev` from `last`. `walk_next`/`walk_prev` then
+//! repeat from the **`aux` pool term**, which is usually *absent* from the
+//! table: an absent anchor is an `ordered_set` **range bound**, so those two
+//! slots exercise the suffix/prefix around an arbitrary missing key. Every walk
+//! op shares ONE helper — `Trace::walk` in the crate, `walk/2` in the escript —
+//! so there is a single traversal implementation to keep in lockstep.
+//!
+//! # The key-boundary dimension (slot `59`)
+//!
+//! The insert slots draw from a 73-term pool, so a *contiguous* run of keys is
+//! not guaranteed and the tree can stay small. Slot `59` (`insert_block`) makes
+//! the boundary crossing deterministic: it inserts a contiguous ascending
+//! integer block of [`BLOCK_LEN`] = 40 keys — **longer than the B+-tree's
+//! `ORDER = 32` fan-out**, so a single step forces at least one leaf split with
+//! an internal node above it — taken from a sliding window over the pool's
+//! `1..=44` integer run. The window start is
+//! `INT_RUN_START + (key index mod BLOCK_STARTS)`, mirrored index-for-index by
+//! the escript. The walk slots above then traverse the split structure.
 //!
 //! The value drawn per step is in `0..VALUES`; the value element's position (2,
 //! `keypos + 1`) is the one the element-update/element-read operations target, so
@@ -120,9 +152,10 @@ use common::*;
 /// The seeds the trace is driven with. Each is compared step by step.
 const SEEDS: [u64; 3] = [1, 12_345, 20_250_601];
 
-/// Steps per seed. Measured over these seeds the trace reaches 49–63 live keys
+/// Steps per seed. Measured over these seeds the trace reaches 68 live keys
 /// (comfortably past the B+-tree's `ORDER = 32`, so leaves split and internal
-/// nodes are created) and then churns back down (so leaves merge again).
+/// nodes are created), the longest walk traverses 67 of them, and the delete
+/// churn then merges leaves back down. The test asserts these structural facts.
 const STEPS: u64 = 600;
 
 /// How many distinct `Value`s an inserted object may carry.
@@ -164,17 +197,41 @@ const OP_UPDATE_ELEMENT: u64 = OP_UPDATE_COUNTER + 1;
 const OP_FOLDR: u64 = OP_UPDATE_ELEMENT + 1;
 const OP_LOOKUP_ELEMENT: u64 = OP_FOLDR + 1;
 const OP_LOOKUP_ELEMENT_DEFAULT: u64 = OP_LOOKUP_ELEMENT + 1;
+const OP_WALK_NEXT: u64 = OP_LOOKUP_ELEMENT_DEFAULT + 1;
+const OP_WALK_PREV: u64 = OP_WALK_NEXT + 1;
+const OP_WALK_NEXT_FROM: u64 = OP_WALK_PREV + 1;
+const OP_WALK_PREV_FROM: u64 = OP_WALK_NEXT_FROM + 1;
+const OP_INSERT_BLOCK: u64 = OP_WALK_PREV_FROM + 1;
 
 /// The op space size: the last slot plus one.
-const NUM_OPS: u64 = OP_LOOKUP_ELEMENT_DEFAULT + 1;
+const NUM_OPS: u64 = OP_INSERT_BLOCK + 1;
 
-// The slot table in the module docs is only correct if the space is 55 slots wide
+// The slot table in the module docs is only correct if the space is 60 slots wide
 // and the non-`insert` operations begin at `INSERT_SLOTS`.
-const _: () = assert!(NUM_OPS == 55);
+const _: () = assert!(NUM_OPS == 60);
 const _: () = assert!(OP_INSERT_NEW == INSERT_SLOTS);
 
+/// The pool's `1..=44` integer run: it starts at pool index `INT_RUN_START` (just
+/// after the `-7, -1, 0` prefix) and is `INT_RUN_LEN` entries long. `insert_block`
+/// slides a contiguous window over exactly this run, so every key it inserts is a
+/// small integer and the whole block is ascending.
+const INT_RUN_START: usize = 3;
+const INT_RUN_LEN: usize = 44;
+
+/// The ascending, contiguous integer block `insert_block` inserts. It is
+/// **longer than the B+-tree's fan-out** (`ORDER = 32`), so one step always forces
+/// at least one leaf split with an internal node above it; the walk slots then
+/// traverse that structure.
+const BLOCK_LEN: usize = 40;
+
+/// The number of start offsets the block may take inside the integer run
+/// (`INT_RUN_LEN - BLOCK_LEN + 1` = 5), so a window never leaves the pool's integer
+/// run: the start is `INT_RUN_START + (key index mod BLOCK_STARTS)` and the block's
+/// last index is at most `INT_RUN_START + BLOCK_STARTS - 1 + BLOCK_LEN - 1`.
+const BLOCK_STARTS: usize = INT_RUN_LEN - BLOCK_LEN + 1;
+
 /// Wall-clock bound for the oracle program (it drives 1800 steps and writes a
-/// few hundred kilobytes; seconds, not minutes).
+/// ~530 kB trace; seconds, not minutes).
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
@@ -317,6 +374,26 @@ struct Trace<'a> {
     /// The `{'_','_'}` pattern term `ets:match_object/2` is driven with.
     any_object: Eterm,
     out: beam_alloc::Heap,
+    /// The total number of keys every walk op collected (the walk dimension's
+    /// coverage counter: 0 would mean no walk ever traversed a non-empty table).
+    walked: usize,
+    /// The longest single walk — asserted to exceed the B+-tree fan-out, so the
+    /// walks really traverse a split structure rather than a lone leaf.
+    max_walk: usize,
+}
+
+/// The crate-side trace plus the coverage statistics the test asserts on.
+struct TraceRun {
+    /// `"<seed>.<step>" -> "S=<size> T=<objects> R=<result>"`.
+    facts: BTreeMap<String, String>,
+    /// The peak live-key count the trace reached.
+    peak_live: usize,
+    /// How many times each op slot was drawn across all seeds.
+    op_hits: [usize; NUM_OPS as usize],
+    /// The total keys every walk op collected.
+    walked: usize,
+    /// The longest single walk.
+    max_walk: usize,
 }
 
 impl Trace<'_> {
@@ -375,6 +452,45 @@ impl Trace<'_> {
         signed_value(element(object, 2))
     }
 
+    /// The **one** walk helper every walk op shares: chain `advance` from `seed`
+    /// until the `'$end_of_table'` sentinel, collecting every key in visit order.
+    ///
+    /// `seed` is the walk's first key (`None` for an empty table or an anchor past
+    /// the end) and `advance` is the `next`/`prev` successor function, so the same
+    /// routine drives the ascending, descending and anchored traversals. The
+    /// escript's `walk/2` mirrors it exactly.
+    fn walk(
+        &self,
+        seed: Option<Eterm>,
+        mut advance: impl FnMut(Eterm) -> Result<Option<Eterm>, BeamError>,
+    ) -> Result<Vec<Eterm>, BeamError> {
+        let mut keys = Vec::new();
+        let mut cursor = seed;
+        while let Some(key) = cursor {
+            keys.push(key);
+            cursor = advance(key)?;
+        }
+        Ok(keys)
+    }
+
+    /// Run one walk op: walk the table, record the traversal's length (the walk
+    /// dimension's coverage statistics live in one place), and render the keys.
+    /// Every walk op goes through here.
+    fn walk_op(
+        &mut self,
+        seed: Option<Eterm>,
+        advance: impl FnMut(Eterm) -> Result<Option<Eterm>, BeamError>,
+        op: u64,
+    ) -> String {
+        match self.walk(seed, advance) {
+            Ok(keys) => {
+                self.walked += keys.len();
+                self.max_walk = self.max_walk.max(keys.len());
+                self.keys(&keys)
+            }
+            Err(error) => failure(op, error),
+        }
+    }
     /// Drive one step and return the operation's rendered result.
     fn step(
         &mut self,
@@ -382,6 +498,7 @@ impl Trace<'_> {
         op: u64,
         object: Eterm,
         key: Eterm,
+        key_index: usize,
         aux: Eterm,
     ) -> String {
         match op {
@@ -477,6 +594,53 @@ impl Trace<'_> {
                     Err(error) => failure(op, error),
                 }
             }
+            OP_WALK_NEXT => {
+                let atoms = self.atoms;
+                self.walk_op(table.first(atoms), |next_key| table.next(next_key, atoms), op)
+            }
+            OP_WALK_PREV => {
+                let atoms = self.atoms;
+                self.walk_op(table.last(atoms), |prev_key| table.prev(prev_key, atoms), op)
+            }
+            // The anchored walks start from the first key at/after (resp. before)
+            // the `aux` term — an `ordered_set` range bound, so an absent anchor is
+            // the interesting case: the walk covers the suffix/prefix around it.
+            OP_WALK_NEXT_FROM => {
+                let atoms = self.atoms;
+                let seed = match table.next(aux, atoms) {
+                    Ok(seed) => seed,
+                    Err(error) => return failure(op, error),
+                };
+                self.walk_op(seed, |next_key| table.next(next_key, atoms), op)
+            }
+            OP_WALK_PREV_FROM => {
+                let atoms = self.atoms;
+                let seed = match table.prev(aux, atoms) {
+                    Ok(seed) => seed,
+                    Err(error) => return failure(op, error),
+                };
+                self.walk_op(seed, |prev_key| table.prev(prev_key, atoms), op)
+            }
+            // A contiguous ascending integer block of `BLOCK_LEN` keys (> `ORDER`),
+            // inserted one object at a time — the deterministic key-boundary crossing.
+            OP_INSERT_BLOCK => {
+                let base = INT_RUN_START + (key_index % BLOCK_STARTS);
+                let value = make_small(self.value_of(object));
+                for offset in 0..BLOCK_LEN {
+                    let block_key = self.pool[base + offset];
+                    // The block objects ride the scratch bump heap `self.out`; the
+                    // heap never reallocates, so each object stays live until the
+                    // `insert` (which deep-copies it into table storage) returns.
+                    let block_object = self
+                        .out
+                        .tuple(&[block_key, value])
+                        .expect("the scratch heap has room for a block object");
+                    if let Err(error) = table.insert(block_object, self.atoms) {
+                        return failure(op, error);
+                    }
+                }
+                "ok".to_string()
+            }
             _ => unreachable!("`op` is drawn modulo {NUM_OPS}"),
         }
     }
@@ -532,8 +696,9 @@ fn foldr_keys(table: &Table) -> Vec<Eterm> {
 
 /// Drive the trace on the crate's `ordered_set` and collect
 /// `"<seed>.<step>" -> "S=<size> T=<objects> R=<result>"`, alongside the **peak
-/// live-key count** it reached (asserted to exceed the B+-tree's fan-out).
-fn trace() -> (BTreeMap<String, String>, usize) {
+/// live-key count** it reached (asserted to exceed the B+-tree's fan-out) and the
+/// per-slot / walk coverage counters the test asserts on.
+fn trace() -> TraceRun {
     let mut atoms = AtomTable::new();
     let mut heap = Heap::new(1 << 18);
     let pool = key_pool(&mut heap, &mut atoms);
@@ -550,10 +715,13 @@ fn trace() -> (BTreeMap<String, String>, usize) {
         count_spec: &count_spec,
         any_object,
         out: select_heap(),
+        walked: 0,
+        max_walk: 0,
     };
 
     let mut facts = BTreeMap::new();
     let mut peak_live = 0usize;
+    let mut op_hits = [0usize; NUM_OPS as usize];
     for seed in SEEDS {
         // The default `ordered_set` interior is the K-ary B+-tree; assert it so a
         // future change of the default cannot silently retarget this trace.
@@ -563,18 +731,19 @@ fn trace() -> (BTreeMap<String, String>, usize) {
             OrderedInterior::BPlusTree,
             "the randomised ordered-set trace must drive the default B+-tree interior"
         );
-
         let mut lcg = Lcg(seed);
         for step in 1..=STEPS {
             // Exactly four draws per step, whatever the op, so the crate and the
             // escript stay in lockstep.
             let op = lcg.draw(NUM_OPS);
-            let key = pool[lcg.draw(pool_len) as usize];
+            let key_index = lcg.draw(pool_len) as usize;
             let value = lcg.draw(VALUES) as i64;
             let aux = pool[lcg.draw(pool_len) as usize];
+            let key = pool[key_index];
             let object = tuple_of(&mut heap, &[key, make_small(value)]);
 
-            let result = trace.step(&mut table, op, object, key, aux);
+            let result = trace.step(&mut table, op, object, key, key_index, aux);
+            op_hits[op as usize] += 1;
             peak_live = peak_live.max(table.size());
             facts.insert(
                 format!("{seed}.{step}"),
@@ -587,7 +756,13 @@ fn trace() -> (BTreeMap<String, String>, usize) {
             );
         }
     }
-    (facts, peak_live)
+    TraceRun {
+        facts,
+        peak_live,
+        op_hits,
+        walked: trace.walked,
+        max_walk: trace.max_walk,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +791,7 @@ main([OutPath]) ->
            [{a,1}, {b,2}, {}] ++
            [[1,2], [3], []],
     PLen = length(Keys),
-    NumOps = 55,
+    NumOps = 60,
     Steps = 600,
     Seeds = [1, 12345, 20250601],
     {ok, F} = file:open(OutPath, [write, raw, binary]),
@@ -667,7 +842,15 @@ main([OutPath]) ->
                             end;
                       52 -> RKeys(ets:foldr(fun({Kk, _}, Acc) -> [Kk|Acc] end, [], T));
                       53 -> integer_to_list(ets:lookup_element(T, K, 2));
-                      54 -> integer_to_list(ets:lookup_element(T, K, 2, Vi))
+                      54 -> integer_to_list(ets:lookup_element(T, K, 2, Vi));
+                      55 -> RKeys(walk(ets:first(T), fun(Kk) -> ets:next(T, Kk) end));
+                      56 -> RKeys(walk(ets:last(T), fun(Kk) -> ets:prev(T, Kk) end));
+                      57 -> RKeys(walk(ets:next(T, A), fun(Kk) -> ets:next(T, Kk) end));
+                      58 -> RKeys(walk(ets:prev(T, A), fun(Kk) -> ets:prev(T, Kk) end));
+                      59 -> lists:foreach(
+                              fun(Kb) -> ets:insert(T, {Kb, Vi}) end,
+                              lists:sublist(lists:nthtail(3 + (Ki rem 5), Keys), 40)),
+                            "ok"
                     end
                 catch error:badarg -> "badarg"
                 end,
@@ -684,6 +867,12 @@ main([OutPath]) ->
     ok.
 
 next_state(X) -> (X * 1103515245 + 12345) band 16#7FFFFFFF.
+
+%% The one walk helper every walk op shares: chain `Next` from `K` to
+%% `'$end_of_table'`, collecting every key in visit order. Mirrors the crate's
+%% `Trace::walk`.
+walk('$end_of_table', _Next) -> [];
+walk(K, Next) -> [K | walk(Next(K), Next)].
 
 mix(Z0) ->
     M = 16#FFFFFFFFFFFFFFFF,
@@ -745,9 +934,10 @@ fn randomised_ordered_set_trace_matches_the_live_oracle() {
         oracle_facts.len()
     );
 
-    let (ours, peak_live) = trace();
+    let run = trace();
     for (name, want) in &oracle_facts {
-        let got = ours
+        let got = run
+            .facts
             .get(name)
             .unwrap_or_else(|| panic!("the crate's trace has no step `{name}`"));
         assert_eq!(
@@ -756,7 +946,7 @@ fn randomised_ordered_set_trace_matches_the_live_oracle() {
         );
     }
     assert_eq!(
-        ours.len(),
+        run.facts.len(),
         oracle_facts.len(),
         "the crate and the oracle ran different numbers of steps"
     );
@@ -764,15 +954,43 @@ fn randomised_ordered_set_trace_matches_the_live_oracle() {
     // means leaves split and internal nodes form on the way up (and the delete
     // churn merges them back down), which a single-leaf trace would not.
     assert!(
-        peak_live > ORDER,
-        "the trace reached {peak_live} live keys, not more than the B+-tree fan-out \
-         ({ORDER}); it no longer exercises node splits"
+        run.peak_live > ORDER,
+        "the trace reached {} live keys, not more than the B+-tree fan-out \
+         ({ORDER}); it no longer exercises node splits",
+        run.peak_live
+    );
+
+    // Every new op slot must really fire, or the walk/key-boundary dimensions (and
+    // the ~120 steps they add) would be vacuous.
+    for (op, name) in [
+        (OP_WALK_NEXT, "walk_next"),
+        (OP_WALK_PREV, "walk_prev"),
+        (OP_WALK_NEXT_FROM, "walk_next from the `aux` anchor"),
+        (OP_WALK_PREV_FROM, "walk_prev from the `aux` anchor"),
+        (OP_INSERT_BLOCK, "insert_block"),
+    ] {
+        assert!(
+            run.op_hits[op as usize] > 0,
+            "the `{name}` op slot never fired: the trace no longer exercises that dimension"
+        );
+    }
+    // The walks must really traverse: at least one walk must cross the fan-out, so
+    // the walk dimension exercises a split (multi-leaf) structure, not a lone leaf.
+    assert!(
+        run.max_walk > ORDER,
+        "the longest walk yielded {} keys, not more than the B+-tree fan-out ({ORDER}); \
+         the walks no longer traverse a split structure",
+        run.max_walk
     );
 
     println!(
-        "[ordered trace] compared {} steps across {} seeds x {} steps; peak live keys = {peak_live}",
-        ours.len(),
+        "[ordered trace] compared {} steps across {} seeds x {} steps; peak live keys = {}; \
+         walks collected {} keys (longest {})",
+        run.facts.len(),
         SEEDS.len(),
-        STEPS
+        STEPS,
+        run.peak_live,
+        run.walked,
+        run.max_walk
     );
 }
