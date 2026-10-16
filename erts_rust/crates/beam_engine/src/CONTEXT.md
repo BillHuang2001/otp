@@ -131,6 +131,21 @@ reason `Eterm`: it is rooted **host-side** by `beam_rt` via `Registers::extra_ro
 collecting host needs, `Machine::pending_exception_mut`, exists). The other Rust-local vectors are
 recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
 
+## Long files (role-justified, beyond the ~1000-line guideline)
+Each file below is one cohesive unit — a seam module, a dispatch loop, or a comprehensive test
+suite — and is kept whole; its size is a consequence of that single responsibility, not of
+unrelated code accumulating:
+- `context.rs` (~2175) — the entire runtime seam (`ExecutionContext` + `Mailbox` + `RootSet` + the
+  `MinimalContext` region heap).
+- `interpreter/dispatch.rs` (~1367) — the dispatch loop (`impl Machine`, `step_instruction` + every
+  core arm).
+- `interpreter/tests.rs` (~1090) — the dispatch-loop test suite.
+- `families/funs/tests.rs` (~1845) — the comprehensive fun-opcode test suite (incl. the structured
+  `{badfun,_}`/`{badarity,_}` target-shape cases).
+- `families/records/mod.rs` (~1074) — the whole native-record instruction family.
+- `families/exceptions/tests/cross_module.rs` (~1027) — the cross-module exception-containment suite.
+- `families/maps/tests.rs` (~1002) — the map-family unit suite.
+
 ## See Also
 - `../CONTEXT.md` → the crate-level FROZEN API surface, execution model, constraints and handoffs.
 - `../INSTRUCTION_SURFACE.md` → per-opcode/per-family semantics and the full known-gaps list.
