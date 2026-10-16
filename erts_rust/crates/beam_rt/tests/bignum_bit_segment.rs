@@ -21,7 +21,7 @@
 //! The **bignum bit-segment** contract: `<<Int:Size>>` where `Int` is a bignum — plus the
 //! narrower contract that a failure in that field is *typed*, never a wrong value.
 //!
-//! # The two bit-segment builders, and why only one of them is deficient
+//! # The two bit-segment builders
 //!
 //! This runtime has two **independent** implementations of Erlang's `<<…>>` construction, and
 //! this suite pins both:
@@ -32,24 +32,25 @@
 //!   `<<(1 bsl 59):64/little>>`, `<<(1 bsl 59):64/native>>`, `<<-3:64/signed>>`,
 //!   `<<(1 bsl 59):60>>`, `<<(1 bsl 200):64>>` and a bignum followed by a non-byte-aligned tail
 //!   all print the oracle's exact bytes ([`EVAL_BINARY_PROBES`],
-//!   [`the_eval_bit_builder_masks_a_bignum_like_the_oracle`]). **No change was needed there**;
-//!   the probe stays as the regression gate that keeps it that way.
+//!   [`the_eval_bit_builder_masks_a_bignum_like_the_oracle`]). The probe is the regression gate
+//!   that keeps it that way.
 //! * the **engine's** `bs_create_bin` (`crates/beam_engine/src/families/bitstrings/create/mod.rs`,
-//!   the `"integer"` arm): for a field of `nbits <= 64` it calls `small_value(value)` and, when
-//!   that is `None` (a bignum), fails the segment with the **bare `badarg`** instead of masking
-//!   the bignum into the field as the C does (`erts_bs_put_integer_*` / `fmt_big_be` /
-//!   `fmt_big_le`, `erts/emulator/beam/erl_bits.c`). A field of `nbits > 64` takes a **wide
-//!   path that already agrees** with the oracle. That file is **outside this suite's carve-out**,
-//!   so what is pinned here is the weaker but honest *invariant*: a bignum in a narrow segment
-//!   must produce **either the oracle's exact bytes or the typed failure** `beam_rt: badarg`
-//!   (exit 1) — never a different value
-//!   ([`a_narrow_segment_bignum_is_either_the_oracles_bytes_or_a_typed_gap`]).
+//!   the `"integer"` arm): a **bignum** value is masked into the field at **every** width,
+//!   `nbits <= 64` included, through the same `push_wide_int` path the wide fields take — exactly
+//!   as the C's `erts_bs_put_integer_*` / `fmt_big_be` / `fmt_big_le`
+//!   (`erts/emulator/beam/erl_bits.c`) mask it. A **small** value keeps the machine-word path and
+//!   a genuine non-integer is the bare `badarg`. What is pinned here is the honest *invariant*: a
+//!   bignum in a narrow segment must produce **either the oracle's exact bytes or the typed
+//!   failure** `beam_rt: badarg` (exit 1) — never a different value
+//!   ([`a_narrow_segment_bignum_is_either_the_oracles_bytes_or_a_typed_gap`]). All **5** narrow
+//!   probes on this corpus (against **4** wide ones) take the byte-identical branch — **0** gapped
+//!   — so the typed-failure branch is an **empty safety net**, kept because a segment encoding
+//!   that regressed to the typed gap must fail loudly rather than quietly produce a wrong value.
 //!
-//! Both invariant tests are written as that **disjunction**, so they pass today *and* get
-//! strictly stronger once the engine arm is fixed: the "gap" branch (an exact `beam_rt: badarg`
-//! with exit 1) flips **automatically** to the "agree" branch (byte-identity with the oracle),
-//! and each test additionally requires that at least one probe already took the "agree" branch,
-//! so neither can pass by rejecting everything.
+//! Both invariant tests are written as that **disjunction** — the "gap" branch (an exact
+//! `beam_rt: badarg` with exit 1) and the "agree" branch (byte-identity with the oracle) — and
+//! each test additionally requires that at least one probe takes the "agree" branch, so neither
+//! can pass by rejecting everything.
 //!
 //! # Ground truth
 //!
@@ -84,24 +85,28 @@
 //! token the CLI can carry. The bare-integer entry point `mk64/1` is exercised too, on the
 //! control value that fits a small int.
 //!
+//! The `run` route prints its result with `~w` (`src/format.rs::term_to_string_w`), so the oracle
+//! probe prints the same call with `~w` as well. The two controls select *different renderings of
+//! the same bytes*: OTP prints a **printable** binary as `<<"linkpath">>` under `~p` but as
+//! `<<108,105,110,107,112,97,116,104>>` under `~w`, and the comparison here is about the bytes.
+//!
 //! # The compile-route half
 //!
 //! [`the_in_process_erl_tar_compile_reports_a_real_outcome`] is the **real** consumer of the
-//! engine arm: OTP's own `lib/stdlib/src/erl_tar.erl` currently fails its in-process compile with
-//! `{crash,core_to_ssa,badarg,…}` in `beam_core_to_ssa:function/2` (the compiler's synthesized
-//! `<<Int:Size>>` constructions — e.g. `beam_core_to_ssa:select_extract_int/5` — hit the same
-//! `"integer"` arm). As above, the assertion is the disjunction: a **reported**
-//! `{ok, ErlTar, …}` / `{error, …}` outcome with no masked reason, and byte-identity with the
-//! oracle's artifact **only on the `{ok, …}` branch**.
+//! engine arm: OTP's own `lib/stdlib/src/erl_tar.erl` compiles **in process** — the runtime
+//! reports `{ok,erl_tar,[]}` and its artifact is **byte-identical** to the oracle's identical
+//! option list. The compiler's synthesized `<<Int:Size>>` constructions (e.g.
+//! `beam_core_to_ssa:select_extract_int/5`) ride the masking `"integer"` arm above. As above, the
+//! assertion is the disjunction: a **reported** `{ok, ErlTar, …}` / `{error, …}` outcome with no
+//! masked reason, and byte-identity with the oracle's artifact **only on the `{ok, …}` branch**.
 //!
 //! The oracle artifact is produced with the **identical option list** through `compile:file/2`
 //! (not `erlc +deterministic +no_docs`): the `Dbgi` chunk records the compile options, so
 //! `+deterministic +no_docs` alone is *not* byte-comparable (measured on `ordsets.erl`: 2344
 //! bytes from `erlc` vs 2372 from the identical option list). `lib/stdlib/src/erl_lint.erl` is
-//! **deliberately not probed here** twice over: its failure is `{badmap, …}` in
-//! `beam_ssa_opt:phase/4` (the separate, out-of-scope `maps:*` iterator-term defect, not this
-//! one), and its ~23 s in-process compile leaves too little margin under the shared 30 s probe
-//! bound.
+//! **deliberately not probed here**: its in-process compile is minutes long under the debug
+//! runtime (≈60 s measured on this host), far past the shared 30 s probe bound, so a probe on it
+//! would be a flaky timeout rather than a contract.
 //!
 //! A missing toolchain (`erl`/`erlc`) is a **loud** skip, never a silent pass
 //! (`tests/support/mod.rs` discovers both by filesystem only).
@@ -124,8 +129,9 @@ const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
 /// `beam_bifs`/engine gap, with exit code 1 (`src/error.rs` classifiers; `src/cli.rs` at most).
 const TYPED_GAP: &str = "beam_rt: badarg";
 
-/// The I/O-device failure that must never appear in a compiler run: it is what used to *replace* a
-/// pass's real reason (`tests/io_diagnostic_unmask.rs`).
+/// The I/O-device failure that must never appear in a compiler run: it is the raise that *replaces*
+/// a pass's real reason when `io:fwrite/2` reaches the device round trip rather than the io device
+/// floor (`tests/io_diagnostic_unmask.rs`).
 const MASKING_REASON: &str = "calling_self";
 
 /// The diagnostic every crashing compiler pass prints from its `catch` handler
@@ -334,8 +340,8 @@ struct SegmentProbe {
     /// with `list_to_integer/1`); `false` → the bare **integer** token, which the CLI can only
     /// materialize up to `MAX_SMALL`.
     quoted: bool,
-    /// `true` for a **narrow** (`<= 64` bit) field, where the out-of-scope engine gap may show as
-    /// the typed failure; `false` for the **wide** field, where the oracle's bytes are required.
+    /// `true` for a **narrow** (`<= 64` bit) field, where the typed-failure alternative is
+    /// allowed; `false` for the **wide** field, where the oracle's bytes are required.
     narrow: bool,
 }
 
@@ -416,17 +422,17 @@ fn token(probe: &SegmentProbe) -> String {
 ///   stdout at all.
 ///
 /// Anything else (a different value, a different reason, a different exit code, or a crash) fails.
-/// The narrow probes are allowed to take either branch, because of the known out-of-scope engine
-/// gap; the wide probes must agree, and at least one narrow probe must already agree, so the
-/// test can never pass by rejecting every input.
+/// All **5** narrow probes take the **byte-identical** branch (**0** gapped), so the typed-failure
+/// branch is an **empty safety net** kept for a regression; the wide probes must agree, and at
+/// least one narrow probe must agree, so the test can never pass by rejecting every input.
 #[test]
-// NOTE: the narrow-field failure is owned by
+// NOTE: the narrow-field masking is owned by
 // `erts_rust/crates/beam_engine/src/families/bitstrings/create/mod.rs` — the `bs_create_bin`
-// `"integer"` arm, which fails a `nbits <= 64` field whose value is a bignum (`small_value` →
-// `None`) with the bare `badarg` instead of masking it into the field as the C does. Fixing that
-// arm flips the narrow probes from the "typed gap" branch to the "byte-identical" branch
-// **without any change here**; the wide probes and the in-process `erl_tar` compile
-// ([`the_in_process_erl_tar_compile_reports_a_real_outcome`]) tighten the same way.
+// `"integer"` arm routes a bignum (`small_value` → `None`) through `push_wide_int`, so it is
+// masked into a `nbits <= 64` field exactly as the C does, while a genuine non-integer stays the
+// bare `badarg`. Every narrow probe therefore takes the "byte-identical" branch; the "typed gap"
+// branch below stays as the safety net for a regression. The wide probes and the in-process
+// `erl_tar` compile ([`the_in_process_erl_tar_compile_reports_a_real_outcome`]) ride the same arm.
 fn a_narrow_segment_bignum_is_either_the_oracles_bytes_or_a_typed_gap() {
     let Some(oracle) = support::require_oracle("bignum_bit_segment") else {
         return;
@@ -559,10 +565,9 @@ const EVAL_BINARY_PROBES: &[&str] = &[
 /// probe in [`EVAL_BINARY_PROBES`] the built binary and the oracle must print the **same bytes**
 /// and both must exit 0.
 ///
-/// This is the evidence that no fix was needed in `src/eval/**` for this contract: the evaluator
-/// takes an integer segment's value through `Evaluator::integer_magnitude` (a small int or an
-/// exact bignum, as `(sign, limbs)`) and `BitBuf::push_integer_bits` masks it into the field at
-/// any width, matching the C's `bs_put_integer` truncation.
+/// The evaluator takes an integer segment's value through `Evaluator::integer_magnitude` (a small
+/// int or an exact bignum, as `(sign, limbs)`) and `BitBuf::push_integer_bits` masks it into the
+/// field at any width, matching the C's `bs_put_integer` truncation.
 #[test]
 fn the_eval_bit_builder_masks_a_bignum_like_the_oracle() {
     let Some(oracle) = support::require_oracle("bignum_bit_segment") else {
@@ -619,8 +624,8 @@ fn compile_probe(src: &Path, outdir: &Path) -> String {
     )
 }
 
-/// The probed module: the real stdlib module whose compile route hits the engine's narrow-segment
-/// `"integer"` arm.
+/// The probed module: the real stdlib module whose in-process compile drives the compiler's
+/// synthesized `<<Int:Size>>` constructions through the engine's `"integer"` arm.
 const PROBED_MODULE: &str = "erl_tar";
 
 /// How the in-process compile ended, as reported by the probe's own `MARKER` line.
@@ -666,10 +671,10 @@ fn source_root() -> PathBuf {
 /// 4. **conditionally on the outcome being `{ok,erl_tar,…}`**, the artifact must be
 ///    **byte-identical** to the oracle's identical-option artifact.
 ///
-/// Today the runtime takes the `{error,…}` branch (a `badarg` crash in
-/// `beam_core_to_ssa:function/2`), so assertion 4 is skipped; once the engine's narrow-segment
-/// `"integer"` arm is fixed the outcome becomes `{ok,erl_tar,…}` and assertion 4 starts running —
-/// the test gets **strictly stronger** with no edit here.
+/// The runtime reports `{ok,erl_tar,…}`, so assertion 4 runs: the artifact is byte-identical to
+/// the oracle's. The `{error,…}` branch stays an outcome the probe accepts (assertion 3), so a
+/// compile that regressed to the typed error path is caught by its reason rather than by a wrong
+/// value.
 ///
 /// The oracle must report `{ok,erl_tar,…}` (`[]` warnings): the input is demonstrably
 /// compilable, so a rust-side `{error,…}` is a residual of this runtime rather than a broken
@@ -731,8 +736,9 @@ fn the_in_process_erl_tar_compile_reports_a_real_outcome() {
     let combined = ours.combined();
     eprintln!("in-process compile of {PROBED_MODULE}.erl under beam_rt printed:\n{combined}");
 
-    // (1) THE INVARIANT. `calling_self` is exactly what the compiler's diagnostic call used to
-    // raise, replacing the pass's real reason with its own.
+    // (1) THE INVARIANT. `calling_self` is the raise the compiler's diagnostic call replaces a
+    // pass's real reason with when `io:fwrite/2` reaches the device round trip rather than the io
+    // device floor.
     assert!(
         !combined.contains(MASKING_REASON),
         "{PROBED_MODULE}: the compiler's diagnostic call must not raise `{MASKING_REASON}` — the \
@@ -753,8 +759,7 @@ fn the_in_process_erl_tar_compile_reports_a_real_outcome() {
 
     match outcome {
         // (3) CONDITIONAL on a failure: the compiler's own `Function: <name>/<arity>` line must
-        // have been printed. Today's branch: the engine's narrow-segment `"integer"` arm fails
-        // the compiler's synthesized `<<Int:Size>>` construction.
+        // have been printed — a compile failure reports the failing pass, never a masked reason.
         Outcome::Errored => {
             assert!(
                 combined.contains(DIAGNOSTIC),
@@ -763,10 +768,9 @@ fn the_in_process_erl_tar_compile_reports_a_real_outcome() {
                  Captured output: {combined:?}"
             );
             eprintln!(
-                "{PROBED_MODULE}.erl: this runtime reported `{MARKER} {{error, …}}` — the \
-                 out-of-scope engine gap in `crates/beam_engine/src/families/bitstrings/create/\
-                 mod.rs` (`bs_create_bin`'s `\"integer\"` arm). The byte-identity assertion below \
-                 is skipped until it is fixed."
+                "{PROBED_MODULE}.erl: this runtime reported `{MARKER} {{error, …}}` on a source \
+                 the oracle compiles — a residual of this runtime. The byte-identity assertion \
+                 below applies only to the `{{ok, …}}` branch."
             );
         }
         // (4) CONDITIONAL on success: the artifact must be byte-identical to the oracle's.

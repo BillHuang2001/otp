@@ -46,7 +46,7 @@ Each wraps `io.erl`'s `o_request/2`, posting `{io_request, …}` to request's de
 Device rules and per-key detail: `src/native/CONTEXT.md` *The `io` device floor*; stdout/stderr/exit-code differential is `tests/io_device.rs`, in-process compile diagnostic probe `tests/io_diagnostic_unmask.rs`.
 Two residuals: live non-stdio device pid is typed `unsupported` (BIF cannot block on `{io_request, …}` round trip); `io:put_chars/1,2` accepts and ignores its device, so `io:put_chars(standard_error, …)` lands on stdout where oracle writes fd 2.
 The registered `beam_bifs` `io:format` `~w`/`~p` printer rejects non-byte-aligned bitstring (or container past ~80 columns) with `badarg`; corpus reads such values via `bit_size/1`/`is_list`.
-A segment wider than 64 bits is *unsupported*; bignum is `system_limit`.
+A `-eval` integer **pattern** segment wider than 64 bits is `unsupported`; a pattern value beyond the small-int range is `system_limit` (construction masks a bignum like the oracle).
 ## Scheduler / runner
 A blocked receiver resumes on sender (send→wake→resume), due `send_after/3` timer, or fired `receive ... after T` deadline.
 `src/runner/` returns `RunOutcome::Yield` once per-slice budget is spent, keeping parked `Machine` at `current_code` and letting scheduler re-enqueue, so hot loop is pre-empted and second runnable process interleaves (`tests/preempt.rs`).
