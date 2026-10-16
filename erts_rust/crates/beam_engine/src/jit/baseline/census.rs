@@ -19,12 +19,13 @@
 // %CopyrightEnd%
 
 //! The **baseline-JIT deopt census** — a test-only diagnostic that ranks which
-//! `beam_loader::Instr` opcodes the native baseline tier still fails to lower.
+//! `beam_loader::Instr` opcodes the native baseline tier still fails to lower — plus the
+//! **register-cache traffic census** that measures the spill/fill store+load traffic the
+//! emitted blocks carry.
 //!
 //! Widening the JIT's inline set is only worth doing for the opcodes that actually
 //! deopt on real code, so the choice needs *evidence*, not intuition. This module
-//! produces it, in two independent but complementary views:
-//!
+//! produces it, in three independent views://!
 //! 1. **Static census** ([`the_static_deopt_census_over_the_corpus_is_printed`]) —
 //!    *deterministic and offline*: compile a corpus (the crate's committed `erlc`
 //!    fixtures plus a bounded sample of the installed OTP `.beam`s) through the
@@ -40,9 +41,25 @@
 //!    executed instructions produced. This shows which un-lowered opcodes dominate the
 //!    **hot** shapes (where a deopt actually costs run time, e.g. once per loop
 //!    iteration), which the static view cannot know.
+//! 3. **Register-cache traffic census**
+//!    ([`the_register_cache_traffic_census_over_the_corpus_is_printed`]) — *deterministic
+//!    and offline*, like the static view: compile the same corpus and print, per fixture
+//!    module and in total, the spill **store** counts of all three models
+//!    ([`spill_stores`](super::counters::Counters::spill_stores) — what `regs::spill`
+//!    emits today — the written set, and the full cache), the fill **load** counts
+//!    (liveness vs full cache), their per-site splits, and the block cache/write-set
+//!    histograms. This is the evidence for whether a finer spill/fill rule is worth
+//!    adding, independent of any run.
 //!
-//! Both views assert only **liveness/consistency** — never a deopt *threshold* — so
-//! they keep passing as the inline set changes; the printed rankings are the evidence.
+//! All three views assert only **liveness/consistency** — never a deopt *threshold* —
+//! so they keep passing as the inline set changes; the printed rankings are the evidence.
+//!
+//! This module is above the ~1000-line guidance because it hosts four self-contained,
+//! corpus-wide diagnostics (the static and runtime deopt censuses, the per-kind
+//! emitted-code-size table and the register-cache traffic census), each with its own
+//! helpers and printed tables, that deliberately share **one** corpus-discovery and
+//! compilation scaffold (`fixture_corpus`, `otp_lib_root`, `otp_corpus`,
+//! `compile_corpus`, `write_dump`) rather than duplicating it.
 //! Every number is attributed by [`super::counters::variant_name`] (a `Test` is keyed
 //! by its kind), and a deopt here is a *compile-time* refusal: the run-time guard
 //! fallbacks emitted **inside** a `try_inline_*` computation (an inlined shape whose
@@ -54,8 +71,8 @@ use std::process::Command;
 
 use beam_loader::{Instr, Label, Module, Operand, TestKind};
 
-use super::counters;
-use super::emit::{compile_function, compile_module};
+use super::counters::{self, Counters};
+use super::emit::{compile_function, compile_module, FillSite, SpillSite};
 use super::tests::build_module;
 
 /// A safety bound on how many installed-OTP `.beam`s the static census samples.
@@ -875,6 +892,530 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
         .collect();
     let header = "# emitted-code size: kind\tinlined_bytes\tdeopt_block_bytes\tdelta\tper_occurrence\n";
     if let Some(path) = write_dump("code_size", header, body) {
+        println!("machine-readable dump: {}", path.display());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Register-cache (spill/fill) traffic census
+// ---------------------------------------------------------------------------
+//
+// The block register cache's cost is the store/load traffic it emits: a `spill` stores
+// cached x-registers back into `machine.x` and a `fill` reloads them. The emitter has
+// three candidate spill models — the one `regs::spill` emits today, the **written set**
+// (`Allocation::written`) and the **full cache** (`Allocation::slots`), the model the
+// partial spill replaced — and two fill models — the continuation's **liveness**
+// (`Allocation::fill_slots`) and the **full cache**. `counters::record_block` derives the
+// models only the enclosing block can see (see the counters module docs). This section
+// compiles the corpus the static deopt census uses and prints the traffic each model
+// would emit — the deterministic evidence for whether a finer spill/fill rule is worth
+// adding, independent of any run.
+
+/// One register-cache census row: the cache-traffic scalars, the per-site splits and the
+/// block histograms of one module, or of an aggregate of modules.
+///
+/// Every traffic field is a copy of the matching
+/// [`Counters`](super::counters::Counters) field, so [`RegCacheRow::add`] is a plain
+/// field-by-field sum (the maps are keyed sums).
+#[derive(Default)]
+struct RegCacheRow {
+    /// The row's label (a fixture file name, `OTP sample`, or a total).
+    label: String,
+    /// Modules the row covers that loaded.
+    modules: u64,
+    /// Functions the emitter lowered.
+    functions: u64,
+    /// Σ `compile_module(..).code_len()` over the row's modules (0 for the OTP sample and
+    /// the aggregate totals, whose `code_len` the static census' per-kind table reports).
+    code_len: usize,
+    /// Spill stores under the model `regs::spill` currently emits (Σ the counts it passed).
+    spill_stores: u64,
+    /// Spill stores under the written-set model (Σ `written.len()`).
+    spill_stores_written: u64,
+    /// Spill stores under the full-cache model (Σ `slots.len()`).
+    spill_stores_full: u64,
+    /// Fill loads under the liveness model (Σ `fill_slots(pc).len()`).
+    fill_registers: u64,
+    /// Fill loads under the full-cache model (Σ `slots.len()`).
+    fill_registers_full: u64,
+    /// Emitted blocks (IR blocks **and** continuation sub-blocks).
+    blocks: u64,
+    /// Σ over blocks of the cache size.
+    block_cache_slots: u64,
+    /// Σ over blocks of the write-set size.
+    block_written_slots: u64,
+    /// Total native bytes the emitted blocks produced.
+    block_emitted_bytes: u64,
+    /// Total IR instructions the emitted blocks cover.
+    block_ir_instructions: u64,
+    /// `spill` calls by site.
+    spill_calls_by_site: BTreeMap<SpillSite, u64>,
+    /// Spill stores by site under the model `regs::spill` emits.
+    spill_stores_by_site: BTreeMap<SpillSite, u64>,
+    /// Spill stores by site under the written-set model.
+    spill_stores_written_by_site: BTreeMap<SpillSite, u64>,
+    /// Spill stores by site under the full-cache model.
+    spill_stores_by_site_full: BTreeMap<SpillSite, u64>,
+    /// `fill` calls by site.
+    fill_calls_by_site: BTreeMap<FillSite, u64>,
+    /// Fill loads by site under the liveness model.
+    fill_registers_by_site: BTreeMap<FillSite, u64>,
+    /// Fill loads by site under the full-cache model.
+    fill_registers_by_site_full: BTreeMap<FillSite, u64>,
+    /// Blocks by cache size.
+    blocks_by_cache_slots: BTreeMap<u64, u64>,
+    /// Blocks by write-set size.
+    blocks_by_written_slots: BTreeMap<u64, u64>,
+}
+
+impl RegCacheRow {
+    /// Build a row from a `Counters` snapshot plus the module/function/`code_len` tallies
+    /// the counters do not carry.
+    fn from_snapshot(
+        label: String,
+        modules: u64,
+        functions: u64,
+        code_len: usize,
+        counters: &Counters,
+    ) -> RegCacheRow {
+        RegCacheRow {
+            label,
+            modules,
+            functions,
+            code_len,
+            spill_stores: counters.spill_stores,
+            spill_stores_written: counters.spill_stores_written,
+            spill_stores_full: counters.spill_stores_full,
+            fill_registers: counters.fill_registers,
+            fill_registers_full: counters.fill_registers_full,
+            blocks: counters.blocks,
+            block_cache_slots: counters.block_cache_slots,
+            block_written_slots: counters.block_written_slots,
+            block_emitted_bytes: counters.block_emitted_bytes,
+            block_ir_instructions: counters.block_ir_instructions,
+            spill_calls_by_site: counters.spill_calls_by_site.clone(),
+            spill_stores_by_site: counters.spill_stores_by_site.clone(),
+            spill_stores_written_by_site: counters.spill_stores_written_by_site.clone(),
+            spill_stores_by_site_full: counters.spill_stores_by_site_full.clone(),
+            fill_calls_by_site: counters.fill_calls_by_site.clone(),
+            fill_registers_by_site: counters.fill_registers_by_site.clone(),
+            fill_registers_by_site_full: counters.fill_registers_by_site_full.clone(),
+            blocks_by_cache_slots: counters.blocks_by_cache_slots.clone(),
+            blocks_by_written_slots: counters.blocks_by_written_slots.clone(),
+        }
+    }
+
+    /// Fold `other` into this row (plain sums; the maps are keyed sums).
+    fn add(&mut self, other: &RegCacheRow) {
+        self.modules += other.modules;
+        self.functions += other.functions;
+        self.code_len += other.code_len;
+        self.spill_stores += other.spill_stores;
+        self.spill_stores_written += other.spill_stores_written;
+        self.spill_stores_full += other.spill_stores_full;
+        self.fill_registers += other.fill_registers;
+        self.fill_registers_full += other.fill_registers_full;
+        self.blocks += other.blocks;
+        self.block_cache_slots += other.block_cache_slots;
+        self.block_written_slots += other.block_written_slots;
+        self.block_emitted_bytes += other.block_emitted_bytes;
+        self.block_ir_instructions += other.block_ir_instructions;
+        add_sites(&mut self.spill_calls_by_site, &other.spill_calls_by_site);
+        add_sites(&mut self.spill_stores_by_site, &other.spill_stores_by_site);
+        add_sites(
+            &mut self.spill_stores_written_by_site,
+            &other.spill_stores_written_by_site,
+        );
+        add_sites(
+            &mut self.spill_stores_by_site_full,
+            &other.spill_stores_by_site_full,
+        );
+        add_sites(&mut self.fill_calls_by_site, &other.fill_calls_by_site);
+        add_sites(&mut self.fill_registers_by_site, &other.fill_registers_by_site);
+        add_sites(
+            &mut self.fill_registers_by_site_full,
+            &other.fill_registers_by_site_full,
+        );
+        add_counts(&mut self.blocks_by_cache_slots, &other.blocks_by_cache_slots);
+        add_counts(
+            &mut self.blocks_by_written_slots,
+            &other.blocks_by_written_slots,
+        );
+    }
+
+    /// The redundant ("clean") stores the written-set model emits beyond the model
+    /// `regs::spill` currently emits: `written − spill`. It is **0** while `spill` passes
+    /// the written set (the present code) and becomes the exact store count a companion
+    /// dirty-set change removes once `spill` passes only the registers whose in-flight
+    /// machine value was overwritten.
+    fn redundant_clean_stores(&self) -> u64 {
+        self.spill_stores_written.saturating_sub(self.spill_stores)
+    }
+
+    /// The total number of `spill` calls (Σ over the sites).
+    fn spill_calls(&self) -> u64 {
+        self.spill_calls_by_site.values().sum()
+    }
+
+    /// The total number of `fill` calls (Σ over the sites).
+    fn fill_calls(&self) -> u64 {
+        self.fill_calls_by_site.values().sum()
+    }
+}
+
+/// Keyed sum of one `SpillSite`/`FillSite` map into another.
+fn add_sites<K: Ord + Copy>(into: &mut BTreeMap<K, u64>, from: &BTreeMap<K, u64>) {
+    for (site, count) in from {
+        *into.entry(*site).or_insert(0) += *count;
+    }
+}
+
+/// Keyed sum of one `u64`-keyed histogram into another.
+fn add_counts(into: &mut BTreeMap<u64, u64>, from: &BTreeMap<u64, u64>) {
+    for (key, count) in from {
+        *into.entry(*key).or_insert(0) += *count;
+    }
+}
+
+/// The whole-artifact `code_len` of one committed fixture module — the same figure the
+/// static census' per-kind table tabulates. Compiled with recording **off** (the row's
+/// traffic session is already closed), so it never perturbs the counters.
+fn fixture_code_len(path: &Path) -> usize {
+    let module = beam_loader::load_file(path).expect("a committed fixture must load");
+    compile_module(&module)
+        .expect("a committed fixture must compile")
+        .code_len()
+}
+
+/// Print one register-cache row's aggregates, per-site splits and histograms.
+fn print_reg_cache_row(row: &RegCacheRow) {
+    println!("-- {} --", row.label);
+    println!(
+        "  modules={} functions={} code_len={}",
+        row.modules, row.functions, row.code_len
+    );
+    println!(
+        "  spill stores: spill={} written-set={} full-cache={} (redundant clean stores = written − spill = {})",
+        row.spill_stores,
+        row.spill_stores_written,
+        row.spill_stores_full,
+        row.redundant_clean_stores(),
+    );
+    println!(
+        "  fill registers: liveness={} full-cache={}",
+        row.fill_registers, row.fill_registers_full
+    );
+    println!(
+        "  spill calls: total={} by site {:?}",
+        row.spill_calls(),
+        row.spill_calls_by_site
+    );
+    println!("  spill stores by site (spill model): {:?}", row.spill_stores_by_site);
+    println!(
+        "  spill stores by site (written-set): {:?}",
+        row.spill_stores_written_by_site
+    );
+    println!(
+        "  spill stores by site (full-cache): {:?}",
+        row.spill_stores_by_site_full
+    );
+    println!(
+        "  fill calls: total={} by site {:?}",
+        row.fill_calls(),
+        row.fill_calls_by_site
+    );
+    println!(
+        "  fill registers by site (liveness): {:?}",
+        row.fill_registers_by_site
+    );
+    println!(
+        "  fill registers by site (full-cache): {:?}",
+        row.fill_registers_by_site_full
+    );
+    println!(
+        "  blocks={} cache_slots={} written_slots={} emitted_bytes={} ir_instrs={}",
+        row.blocks,
+        row.block_cache_slots,
+        row.block_written_slots,
+        row.block_emitted_bytes,
+        row.block_ir_instructions,
+    );
+    println!("  blocks by cache size: {:?}", row.blocks_by_cache_slots);
+    println!("  blocks by write size: {:?}", row.blocks_by_written_slots);
+    println!();
+}
+
+/// Assert the row's traffic obeys the model orderings (never a threshold):
+/// `spill ≤ written-set ≤ full-cache` for the spill stores, `liveness ≤ full-cache` for
+/// the fill loads, both in total and per site, and that the block histogram is total.
+fn assert_reg_cache_row_consistent(row: &RegCacheRow) {
+    assert!(
+        row.spill_stores <= row.spill_stores_written,
+        "{}: the spill model ({} stores) must not exceed the written-set model ({})",
+        row.label,
+        row.spill_stores,
+        row.spill_stores_written,
+    );
+    assert!(
+        row.spill_stores_written <= row.spill_stores_full,
+        "{}: the written-set model ({} stores) must not exceed the full-cache model ({})",
+        row.label,
+        row.spill_stores_written,
+        row.spill_stores_full,
+    );
+    assert!(
+        row.fill_registers <= row.fill_registers_full,
+        "{}: the liveness fill model ({} loads) must not exceed the full-cache model ({})",
+        row.label,
+        row.fill_registers,
+        row.fill_registers_full,
+    );
+    for (site, stores) in &row.spill_stores_by_site {
+        let written = row
+            .spill_stores_written_by_site
+            .get(site)
+            .copied()
+            .unwrap_or(0);
+        let full = row.spill_stores_by_site_full.get(site).copied().unwrap_or(0);
+        assert!(
+            *stores <= written && written <= full,
+            "{}: spill site {site:?} violates spill ({stores}) ≤ written-set ({written}) \
+             ≤ full-cache ({full})",
+            row.label,
+        );
+    }
+    for (site, loads) in &row.fill_registers_by_site {
+        let full = row
+            .fill_registers_by_site_full
+            .get(site)
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            *loads <= full,
+            "{}: fill site {site:?} violates liveness ({loads}) ≤ full-cache ({full})",
+            row.label,
+        );
+    }
+    assert_eq!(
+        row.blocks_by_cache_slots.values().sum::<u64>(),
+        row.blocks,
+        "{}: the blocks-by-cache-size histogram must total `blocks`",
+        row.label,
+    );
+    assert_eq!(
+        row.blocks_by_written_slots.values().sum::<u64>(),
+        row.blocks,
+        "{}: the blocks-by-write-size histogram must total `blocks`",
+        row.label,
+    );
+}
+
+/// The **register-cache traffic census** — the deterministic, corpus-wide evidence for
+/// the baseline JIT's block register cache: the spill **store** counts of all three
+/// models, the fill **load** counts of both, their per-site splits, and the block
+/// cache/write-set histograms, over the committed fixtures plus a bounded sample of the
+/// installed OTP.
+///
+/// Run with `--nocapture` to read the tables:
+/// ```text
+/// erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
+///     -p beam_engine --lib the_register_cache_traffic_census_over_the_corpus_is_printed -- --nocapture
+/// ```
+#[test]
+fn the_register_cache_traffic_census_over_the_corpus_is_printed() {
+    crate::jit::cache::clear_baseline_cache();
+
+    let fixtures = fixture_corpus();
+    let fixture_count = fixtures.len();
+
+    // Per-fixture-module rows: one recording session per module (the counter block is
+    // thread-local and `reset` zeroes it), so each row's traffic is its own.
+    let mut rows: Vec<RegCacheRow> = Vec::new();
+    for path in &fixtures {
+        counters::set_enabled(true);
+        counters::reset();
+        let tally = compile_corpus(std::slice::from_ref(path));
+        counters::set_enabled(false);
+        let snapshot = counters::snapshot();
+        // `code_len` is a whole-artifact figure the counters do not carry; compile the
+        // module a second time, recording OFF, exactly as the code-size table does.
+        let code_len = fixture_code_len(path);
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        rows.push(RegCacheRow::from_snapshot(
+            label,
+            tally.modules,
+            tally.compiled,
+            code_len,
+            &snapshot,
+        ));
+    }
+
+    let fixture_modules: u64 = rows.iter().map(|r| r.modules).sum();
+    let fixture_functions: u64 = rows.iter().map(|r| r.functions).sum();
+
+    // The OTP sample: one aggregate row (the fixture breakdown is the readable one).
+    // Skipped loudly without a usable `erl`.
+    let otp = otp_lib_root();
+    let otp_modules = match &otp {
+        Some(root) => {
+            let beams = otp_corpus(root, OTP_MODULE_CAP);
+            counters::set_enabled(true);
+            counters::reset();
+            let tally = compile_corpus(&beams);
+            counters::set_enabled(false);
+            let snapshot = counters::snapshot();
+            Some(RegCacheRow::from_snapshot(
+                "OTP sample".to_string(),
+                tally.modules,
+                tally.compiled,
+                0,
+                &snapshot,
+            ))
+        }
+        None => {
+            eprintln!(
+                "register-cache census: no usable `erl` on PATH — the OTP sample is \
+                 SKIPPED; only the committed fixtures are censused"
+            );
+            None
+        }
+    };
+    let otp_module_count = otp_modules.as_ref().map_or(0, |row| row.modules);
+
+    // The totals: the rows fold to a `fixtures total`, and, when the OTP sample ran, a
+    // `grand total` folds that in too.
+    let mut fixtures_total = RegCacheRow {
+        label: "fixtures total".to_string(),
+        ..Default::default()
+    };
+    for row in &rows {
+        fixtures_total.add(row);
+    }
+    let mut grand_total = RegCacheRow::default();
+    grand_total.add(&fixtures_total);
+    match &otp_modules {
+        Some(row) => {
+            grand_total.add(row);
+            grand_total.label = "grand total (fixtures + OTP sample)".to_string();
+        }
+        None => grand_total.label = "grand total (fixtures only)".to_string(),
+    }
+
+    // --- liveness / consistency (never a threshold) -------------------------
+    assert!(
+        !rows.is_empty(),
+        "the committed fixture corpus must yield at least one module row"
+    );
+    assert!(
+        fixture_modules >= 1,
+        "the fixture corpus must compile at least one module (fixtures={fixture_count})"
+    );
+    assert!(
+        fixture_functions > 0,
+        "the fixture corpus must lower at least one function"
+    );
+    for row in rows
+        .iter()
+        .chain(std::iter::once(&fixtures_total))
+        .chain(std::iter::once(&grand_total))
+        .chain(otp_modules.iter())
+    {
+        assert_reg_cache_row_consistent(row);
+    }
+    assert!(
+        grand_total.blocks >= 1,
+        "the corpus must emit at least one block"
+    );
+    assert!(
+        grand_total.block_emitted_bytes > 0,
+        "the emitted blocks must produce native bytes"
+    );
+    let fixture_code_len_total: usize = rows.iter().map(|r| r.code_len).sum();
+    assert!(
+        fixture_code_len_total > 0,
+        "the fixture corpus must produce a positive whole-artifact `code_len`"
+    );
+
+    // --- the tables ---------------------------------------------------------
+    println!("=== baseline-JIT register-cache traffic census ===");
+    println!(
+        "corpus: fixtures={fixture_count} (modules={fixture_modules} functions={fixture_functions}) \
+         otp_modules={otp_module_count} (erl_found={})",
+        otp.is_some(),
+    );
+    println!(
+        "three spill models: `spill` (what regs::spill emits today), written-set (Σ written.len()), \
+         full-cache (Σ slots.len()); two fill models: liveness vs full-cache"
+    );
+    println!();
+    println!(
+        "-- per fixture module: spill(spill/written/full) fill(liveness/full) blocks cache written bytes ir code_len --"
+    );
+    for row in &rows {
+        println!(
+            "  {:<24} spill={:>5}/{:<5}/{:<5} fill={:>5}/{:<5} blocks={:<4} cache={:<4} \
+             written={:<4} bytes={:<7} ir={:<5} code_len={}",
+            row.label,
+            row.spill_stores,
+            row.spill_stores_written,
+            row.spill_stores_full,
+            row.fill_registers,
+            row.fill_registers_full,
+            row.blocks,
+            row.block_cache_slots,
+            row.block_written_slots,
+            row.block_emitted_bytes,
+            row.block_ir_instructions,
+            row.code_len,
+        );
+    }
+    println!();
+    print_reg_cache_row(&fixtures_total);
+    if let Some(row) = &otp_modules {
+        print_reg_cache_row(row);
+    }
+    print_reg_cache_row(&grand_total);
+    println!(
+        "fixture `code_len` total = {fixture_code_len_total} bytes over {} modules",
+        rows.len(),
+    );
+
+    // --- the machine-readable dump ------------------------------------------
+    let mut body = String::new();
+    for row in rows
+        .iter()
+        .chain(std::iter::once(&fixtures_total))
+        .chain(otp_modules.iter())
+        .chain(std::iter::once(&grand_total))
+    {
+        body.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.label,
+            row.modules,
+            row.functions,
+            row.code_len,
+            row.spill_stores,
+            row.spill_stores_written,
+            row.spill_stores_full,
+            row.fill_registers,
+            row.fill_registers_full,
+            row.spill_calls(),
+            row.fill_calls(),
+            row.blocks,
+            row.block_cache_slots,
+            row.block_written_slots,
+            row.block_emitted_bytes,
+            row.block_ir_instructions,
+        ));
+    }
+    let header = "# reg-cache: label\tmodules\tfunctions\tcode_len\tspill_stores\t\
+                  spill_stores_written\tspill_stores_full\tfill_registers\tfill_registers_full\t\
+                  spill_calls\tfill_calls\tblocks\tblock_cache_slots\tblock_written_slots\t\
+                  block_emitted_bytes\tblock_ir_instructions\n";
+    if let Some(path) = write_dump("reg_cache", header, body) {
         println!("machine-readable dump: {}", path.display());
     }
 }
