@@ -67,6 +67,7 @@ fn seeded_atoms() -> AtomTable {
         "_",
         "a",
         "b",
+        "c",
         "tab",
         "no_such_fun",
     ]);
@@ -107,6 +108,27 @@ fn two_object_table(reg: &BifRegistry, ctx: &mut BifContext<'_>) -> Eterm {
     handle
 }
 
+/// The full table `[{a,b},{b,a},{c,a}]` — three objects, one more than the
+/// `limit` 2 of the chunked traversal below, so its first chunk is a *full* chunk
+/// (two results and a continuation) and the resume produces the last object.
+fn three_object_table(reg: &BifRegistry, ctx: &mut BifContext<'_>) -> Eterm {
+    let handle = new_table(reg, ctx, "tab", "set");
+    for (key, name) in [("a", "b"), ("b", "a"), ("c", "a")] {
+        let obj = object(ctx, key, name);
+        reg.call("ets", "insert", 2, ctx, &[handle, obj])
+            .expect("ets:insert/2");
+    }
+    handle
+}
+
+/// `erlang:element(Pos, Term)` — position `Pos` (1-based) of the **tuple**
+/// `Term`. The select family renders a chunk as a 2-tuple, so its halves are read
+/// here rather than through `lists:nth/2` (which would raise on the tuple).
+fn tuple_nth(reg: &BifRegistry, ctx: &mut BifContext<'_>, term: Eterm, pos: i64) -> Eterm {
+    let pos = ctx.int(pos).expect("fits");
+    reg.call("erlang", "element", 2, ctx, &[pos, term])
+        .expect("erlang:element/2")
+}
 /// `{self}` — the match-spec spelling of a `self/0` call.
 fn self_call(ctx: &mut BifContext<'_>) -> Eterm {
     let s = ctx.atom("self").expect("seeded");
@@ -220,6 +242,67 @@ fn ets_select_2_answers_the_calling_pid_for_every_selected_object() {
     }
 }
 
+/// `ets:select(T, [{'$1',[],[{self}]}], 2)` over a **3-object** table, then its
+/// continuation through `ets:select/1` ⇒ `{[Pid,Pid], Cont}` and
+/// `{[Pid], '$end_of_table'}`.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1, a 3-object `set`, `limit` 2): the first chunk
+/// is `{[<0.10.0>,<0.10.0>],Cont}` and the resume `{[<0.10.0>],'$end_of_table'}`.
+///
+/// The resume is a **later** BIF call that re-evaluates the continuation's stored
+/// spec, so the pid can only survive it through `resume_continuation`'s own
+/// install site (`src/ets.rs`) — the `/3` call's guard has long since dropped.
+/// Without that site the resumed `self/0` body silently degrades to the `EXIT`
+/// sentinel while the first chunk stays correct, which is exactly the
+/// silently-wrong class this seam exists to prevent.
+#[test]
+fn a_resumed_continuation_still_answers_the_calling_pid() {
+    let reg = default_registry();
+    let mut heap = test_heap();
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let pid = ProcessId::new(3, 0);
+    let mut ctx = BifContext::new(&mut heap, &atoms, pid).with_tables(&mut tables);
+
+    let handle = three_object_table(&reg, &mut ctx);
+    let spec = self_body_spec(&mut ctx);
+    let limit = ctx.int(2).expect("fits");
+    let end = ctx.atom("$end_of_table").expect("seeded");
+    let pid_term = pid.to_eterm();
+
+    // Chunk 1: the limit is reached exactly, so the chunk carries two pids and a
+    // continuation (the crate returns one even when the limit lands on the last
+    // object, as the oracle does).
+    let chunk1 = reg
+        .call("ets", "select", 3, &mut ctx, &[handle, spec, limit])
+        .expect("ets:select/3");
+    let results1 = tuple_nth(&reg, &mut ctx, chunk1, 1);
+    let cont = tuple_nth(&reg, &mut ctx, chunk1, 2);
+    assert!(
+        !exact(&atoms, cont, end),
+        "a full chunk must carry a continuation, not '$end_of_table'"
+    );
+    assert!(
+        exact(&atoms, results1, twice(&mut ctx, pid_term)),
+        "chunk 1 must answer the calling pid per object, not the EXIT sentinel"
+    );
+
+    // The resume: the remaining object, then the end-of-table terminator.
+    let chunk2 = reg
+        .call("ets", "select", 1, &mut ctx, &[cont])
+        .expect("ets:select/1");
+    let results2 = tuple_nth(&reg, &mut ctx, chunk2, 1);
+    let terminator = tuple_nth(&reg, &mut ctx, chunk2, 2);
+    let expected2 = ctx.list(&[pid_term]).expect("fits");
+    assert!(
+        exact(&atoms, results2, expected2),
+        "the resumed chunk must answer the calling pid, not the EXIT sentinel"
+    );
+    assert!(
+        exact(&atoms, terminator, end),
+        "the resume must terminate with '$end_of_table'"
+    );
+}
 /// `ets:select(T, [{'$1',[{'=:=',{self},{self}}],[ok]}])` ⇒ `[ok, ok]`.
 ///
 /// Oracle: `[ok,ok]` (probed). Without the hook the guard raises, so the clause
