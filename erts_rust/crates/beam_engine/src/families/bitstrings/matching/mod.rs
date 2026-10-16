@@ -311,7 +311,19 @@ pub(super) fn exec(
             if end.saturating_sub(start) < size {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
-            let pattern = module.strings.get(*offset as usize..).unwrap_or(&[]);
+            // The `StrT` offset must name a byte **inside** the module's string
+            // table. `get(offset..)` is `Some(&[])` exactly at `offset == len`
+            // (a legitimately empty pattern), so a single `ok_or_else` tells the
+            // two cases apart. C has no such check (it reads an already-resolved
+            // absolute pointer into its `StrT` copy, `emu_load.c:469-485`), so this
+            // is a deliberate stricter-than-C typed error rather than a silent
+            // degradation to an empty pattern that would merely fail the match.
+            let pattern = module
+                .strings
+                .get(*offset as usize..)
+                .ok_or_else(|| {
+                    crate::error::unsupported("bs_match_string: string table offset out of range")
+                })?;
             let (bytes, off) = raw::subject_bytes(orig)?;
             if size > pattern.len() * 8 || !bits_equal(bytes, start + off, pattern, 0, size) {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
@@ -998,5 +1010,167 @@ mod tests {
             &[] as &[u8],
             "the built result reads as `<<>>`"
         );
+    }
+
+    // -- bs_match_string: the `StrT` offset guard ---------------------------
+    /// The `fail` label every `bs_match_string` test below branches to (a live
+    /// label, so a plain match failure is distinguishable from the typed error).
+    const FAIL: Label = Label(7);
+
+    /// Build a 2-byte subject (`<<16#AB,16#CD>>`) in `x(0)`, start a match over it
+    /// into `x(1)`, and a module whose `StrT` table is `"abc"`. Returns the
+    /// `(machine, module, labels, ctx)` the three `bs_match_string` tests drive.
+    #[allow(clippy::type_complexity)]
+    fn match_string_fixture() -> (Machine, Module, LabelMap, MinimalContext) {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let mut module = Module::default();
+        module.strings = b"abc".to_vec();
+        let subject =
+            raw::make_bits(&mut machine, &mut ctx, &[0xAB, 0xCD], 16).expect("a 2-byte subject");
+        machine.set_x(0, subject).expect("root the subject");
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &LabelMap::new(),
+            &Instr::BsStartMatch3 {
+                fail: NO_FAIL,
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_start_match3 reports no raise")
+        .expect("the family claims bs_start_match3");
+        assert_eq!(step, Step::Next);
+        let mut labels = LabelMap::new();
+        labels.insert(FAIL, (0, 9));
+        (machine, module, labels, ctx)
+    }
+
+    /// Drive one `bs_match_string` over the fixture's context.
+    fn match_string(
+        machine: &mut Machine,
+        module: &Module,
+        labels: &LabelMap,
+        ctx: &mut MinimalContext,
+        bits: u32,
+        offset: u32,
+    ) -> beam_common::Result<Option<Step>> {
+        family_exec(
+            machine,
+            module,
+            labels,
+            &Instr::BsMatchString {
+                fail: FAIL,
+                ctx: Operand::X(1),
+                bits,
+                offset,
+            },
+            0,
+            0,
+            ctx,
+        )
+    }
+
+    /// `StrT` offsets the module does not have are the typed error, never a silent
+    /// degradation to an empty pattern (which would merely fail the match).
+    ///
+    /// The C `i_bs_match_string` reads an already-resolved absolute pointer into a
+    /// copy of the whole `StrT` chunk, so an out-of-range offset is undefined
+    /// behaviour there with no catchable answer; the engine's guard is therefore a
+    /// deliberate, stricter-than-C typed error.
+    #[test]
+    fn bs_match_string_rejects_a_str_table_offset_past_the_end() {
+        let (mut machine, module, labels, mut ctx) = match_string_fixture();
+        // `strings` is 3 bytes; offset 10 is strictly beyond the end.
+        let err = match_string(&mut machine, &module, &labels, &mut ctx, 8, 10)
+            .expect_err("an out-of-range StrT offset is the typed error");
+        match err {
+            beam_common::BeamError::Raise(raise) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("unsupported_opcode: bs_match_string: string table offset out of range"),
+            ),
+            other => panic!("expected the typed unsupported error, got {other:?}"),
+        }
+    }
+
+    /// An offset **exactly at** the end of `StrT` is a legitimately empty pattern:
+    /// a 0-bit `bs_match_string` matches empty input and advances nothing.
+    #[test]
+    fn bs_match_string_accepts_an_offset_exactly_at_the_end_as_an_empty_pattern() {
+        let (mut machine, module, labels, mut ctx) = match_string_fixture();
+        assert_eq!(module.strings.len(), 3, "the fixture's StrT table");
+        let step = match_string(&mut machine, &module, &labels, &mut ctx, 0, 3)
+            .expect("an at-end offset is not an error")
+            .expect("the family claims bs_match_string");
+        assert_eq!(
+            step,
+            Step::Next,
+            "an empty pattern at the end of StrT matches empty input"
+        );
+        // The context stayed put (0 bits consumed) and is still readable.
+        let (_, _, start, _) = read_ctx(&machine, &mut ctx, &Operand::X(1), "test").expect("ctx");
+        assert_eq!(start, 0);
+    }
+
+    /// A genuinely in-range offset still matches bit-for-bit, and a mismatch is a
+    /// plain match failure (the fail label), not an error.
+    #[test]
+    fn bs_match_string_matches_an_in_range_pattern_and_fails_a_mismatch() {
+        let (mut machine, module, labels, mut ctx) = match_string_fixture();
+        // `StrT` is `"abc"`; offset 00 with bits=0xAB00... no: compare the subject's
+        // first 8 bits (`0xAB`) against offset 0 (`0x61` = `a`) — a mismatch, which
+        // must take the fail label rather than raise.
+        let step = match_string(&mut machine, &module, &labels, &mut ctx, 8, 0)
+            .expect("a mismatch is not an error")
+            .expect("the family claims bs_match_string");
+        assert_eq!(step, Step::Goto { func: 0, pc: 9 }, "`0xAB` != `a`");
+
+        // Offset 0 with bits=0 is the empty pattern again: it matches, and because
+        // `bits` is 0 nothing is compared or consumed.
+        let step = match_string(&mut machine, &module, &labels, &mut ctx, 0, 0)
+            .expect("the empty pattern is not an error")
+            .expect("the family claims bs_match_string");
+        assert_eq!(step, Step::Next);
+    }
+
+    /// A **below-range** offset (already `Some`) keeps working: an in-range string
+    /// that *does* match the subject succeeds and advances the position.
+    #[test]
+    fn bs_match_string_matches_an_in_range_string_that_does_match() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let mut module = Module::default();
+        module.strings = b"abc".to_vec();
+        let subject =
+            raw::make_bits(&mut machine, &mut ctx, &[0x61, 0x62], 16).expect("a 2-byte subject");
+        machine.set_x(0, subject).expect("root the subject");
+        let mut labels = LabelMap::new();
+        labels.insert(FAIL, (0, 9));
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &labels,
+            &Instr::BsStartMatch3 {
+                fail: NO_FAIL,
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_start_match3 reports no raise")
+        .expect("the family claims bs_start_match3");
+        assert_eq!(step, Step::Next);
+        let step = match_string(&mut machine, &module, &labels, &mut ctx, 16, 0)
+            .expect("an in-range match is not an error")
+            .expect("the family claims bs_match_string");
+        assert_eq!(step, Step::Next, "`\"ab\"` matches the subject");
     }
 }
