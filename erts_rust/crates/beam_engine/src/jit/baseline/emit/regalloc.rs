@@ -31,10 +31,61 @@
 //! from (a register is in a helper's fill set exactly when it has a later touch), so the
 //! selector and the emitter share **one** definition of liveness rather than agreeing by
 //! coincidence.
+//!
+//! # The dirty set (`spill_sets`): a per-`pc` store set for the block's spills
+//!
+//! A cached register only ever needs to be written back to `machine.x` when it is
+//! **dirty** — when an inline lowering has diverged its machine register from the
+//! `machine.x` slot since the last event that synced the two. There are exactly two
+//! syncing events:
+//!
+//! * the **prologue**, which loads the whole cache *from* `machine.x`, so every cached
+//!   register starts the block clean; and
+//! * **any helper call's spill** (a [`super::emit_helper_call`] begins with a
+//!   [`super::regs::spill`]) followed by the helper running: the spill writes the dirty
+//!   registers out, so afterwards every cached register equals its `machine.x` slot — and
+//!   a helper that *wrote* `machine.x` is followed by a refilling
+//!   [`super::emit_continue_check`] (or the equivalent `test` helper `fill`), which reads
+//!   it back.
+//!
+//! So the true dirty set is empty at every helper boundary and grows only across the
+//! inline lowerings between them. [`Allocation::spill_sets`] models exactly that: a
+//! **forward walk** over the block's pcs that starts empty, unions each instruction's
+//! inline **write** set ([`cacheable_writes`]) when the instruction inlines, and resets to
+//! empty at an instruction whose emission is entirely a helper.
+//!
+//! ## Why the model can only be *conservative*, never wrong
+//!
+//! The walk's reset decision is derived by [`is_inlined`], which mirrors
+//! [`super::emit_block`]'s **compile-time** inlining decision through the very same
+//! `*_shape` predicates the `try_inline_*` entries consult. The soundness direction is
+//! asymmetric and it is why every uncertainty resolves the same way:
+//!
+//! * a register that is truly dirty must be in the store set — otherwise its stale
+//!   machine register would be lost (a **wrong result**);
+//! * a register that is already clean may still be in the store set — the store writes
+//!   back the value it already holds (a harmless redundant store).
+//!
+//! A **missed** reset therefore only ever costs a redundant store, while a **wrong** reset
+//! would silently drop a live value. So `is_inlined` is biased toward "inlined": a variant
+//! without an inline arm at all is a certain reset, an inline-capable variant keeps its
+//! write union (never a reset) even when its run-time guard would reject, and any variant
+//! the mirror does not recognise is treated as inlined. The only variants that may reset
+//! are the ones whose emission unconditionally reaches a helper (the family-owned set, the
+//! receive family, the cross-module calls, the frame-discipline trio, the heap family, and
+//! the `_`-arm sentinel); for those the reset is *exact*, because the helper's spill
+//! provably synced the whole cache.
+//!
+//! The model reproduces the classic "already-clean-aware" store elimination a handwritten
+//! JIT's register cache does — see `ERTS_RUST_REWRITE_DEEPDIVE.md` §F (the baseline/hot
+//! tier split and its correctness-first register-cache design) and the read-only legacy-C
+//! reference `erts/emulator/beam/jit/beam_jit_register_cache.hpp` (its `reg_cache->x_regs[x]
+//! .modified` dirty bit, checked before every `mov [x_regs+x], reg` store) plus the
+//! `erts/emulator/beam/jit/x86/beam_asm*.cpp` emitters that consult it.
 
 use std::collections::BTreeMap;
 
-use beam_loader::{Instr, Module};
+use beam_loader::{Instr, Label, Module, Operand, TestKind, NO_FAIL};
 
 use crate::interpreter::{self, LabelMap};
 use crate::machine::MAX_REGISTER;
@@ -237,7 +288,161 @@ fn allocate_registers_with_labels(
     // the continuation, unioned with the write set above). See `super::liveness`.
     allocation.block_start = start as u32;
     allocation.fill_sets = super::liveness::fill_sets(module, labels, code, start, end, &allocation);
+
+    // The **dirty set at every pc** (`spill_sets`): the cached x-registers a spill at
+    // that pc must store (see the module docs). A forward walk from an empty set: an
+    // instruction that inlines ([`is_inlined`]) unions the cached x-registers it writes
+    // (its `machine` register diverged from `machine.x`), while an instruction whose
+    // emission is entirely a helper **resets** — the helper's own spill synced the whole
+    // cache, so nothing is dirty afterwards. The walk covers `[start, end)`; the final
+    // entry is the block exit pc `end` (the fall-through exit's store set).
+    allocation.spill_sets = spill_sets(module, labels, code, start, end, &allocation);
     allocation
+}
+
+/// The dirty set at every pc of the block `[start, end]`, indexed by `pc - start`.
+///
+/// The block's per-`pc` store set ([`Allocation::spill_sets`]): the cached x-registers
+/// that an inline lowering has diverged from `machine.x` by that pc. Computed by the
+/// forward walk documented on the module — union [`cacheable_writes`] for an inlined
+/// instruction, reset for a purely-helper one, biased toward "inlined" so a missed reset
+/// only costs a redundant store (never a dropped dirty value). The walk emits one entry
+/// per pc in `[start, end)` plus the block exit pc `end`, so every spill site (whose pcs
+/// lie in that range) resolves.
+fn spill_sets(
+    module: &Module,
+    labels: &LabelMap,
+    code: &[Instr],
+    start: usize,
+    end: usize,
+    allocation: &Allocation,
+) -> Vec<Vec<u32>> {
+    let cached: Vec<u32> = allocation.slots.iter().map(|(x, _)| *x).collect();
+    let mut dirty: Vec<u32> = Vec::new();
+    let mut sets: Vec<Vec<u32>> = Vec::with_capacity(end - start + 1);
+    for instr in &code[start..end] {
+        // The store set at this pc is the dirty set *entering* the instruction.
+        sets.push(dirty.clone());
+        if is_inlined(module, labels, instr) {
+            // An inline lowering may diverge its destination registers from `machine.x`;
+            // union them in (the register index is kept only when it is cached — a
+            // non-cached register is written straight to `machine.x`, so it is never
+            // dirty).
+            for x in cacheable_writes(module, labels, instr) {
+                if cached.contains(&x) && !dirty.contains(&x) {
+                    dirty.push(x);
+                }
+            }
+        } else {
+            // A purely-helper instruction: its own spill synced the whole cache, so
+            // nothing is dirty afterwards.
+            dirty.clear();
+        }
+    }
+    // The block exit pc `end` (the fall-through exit).
+    sets.push(dirty);
+    sets
+}
+
+/// Whether [`super::emit_block`] emits an **inline lowering** for `instr` (as opposed to
+/// routing the whole instruction through a helper, which is a *certain* dirty-set reset).
+///
+/// Mirrors the `emit_block` dispatch through exactly the `*_shape` predicates its
+/// `try_inline_*` entries consult — plus the label resolution its terminating arms need —
+/// so [`spill_sets`] agrees with the emitter's own compile-time decision. It is biased
+/// toward `true` wherever the emitter's arm consults more than the shape (the emitter
+/// treats a slightly-wider set as inlined, which only ever costs a redundant store), and
+/// returns `false` only for the variants whose emission unconditionally reaches a helper:
+/// the family-owned set, the receive family, the cross-module calls, the
+/// frame-discipline trio, the heap family, and any variant the emitter's `_` deopt arm
+/// claims.
+///
+/// The bias is the soundness rule (see the module docs): a **wrong** `true` costs a
+/// redundant store, a **wrong** `false` would drop a dirty register's value. So a variant
+/// this mirror does not model — including any future variant added to `emit_block` — must
+/// fall to `false` **only** when the emitter is known to fully helper it; an unmodelled
+/// variant that *might* inline is not distinguishable here, so the match keeps the
+/// certain-reset list explicit and treats everything else as inlined.
+fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> bool {
+    match instr {
+        // Metadata no-ops emit no bytes and write nothing.
+        Instr::Label(_)
+        | Instr::Line(_)
+        | Instr::IntCodeEnd
+        | Instr::ExecutableLine { .. }
+        | Instr::DebugLine { .. } => true,
+        Instr::Move { src, dst } => move_shape(src, dst).is_some(),
+        Instr::Swap { a, b } => super::r#move::swap_shape(a, b).is_some(),
+        Instr::InitYregs { registers } => super::operands::locate_all(registers).is_some(),
+        Instr::GetList { source, head, tail } => get_list_shape(source, head, tail).is_some(),
+        Instr::GetHd { source, head } => get_hd_shape(source, head).is_some(),
+        Instr::GetTl { source, tail } => get_tl_shape(source, tail).is_some(),
+        Instr::GetTupleElement {
+            source,
+            element,
+            dst,
+        } => get_tuple_element_shape(source, *element, dst).is_some(),
+        Instr::SetTupleElement {
+            element,
+            tuple,
+            offset,
+        } => set_tuple_element_shape(element, tuple, *offset).is_some(),
+        Instr::SelectTupleArity {
+            tuple,
+            fail,
+            destinations,
+        } => select_tuple_arity_plan(labels, tuple, *fail, destinations).is_some(),
+        // A `gc_bif`/`bif` inlines when any of its fast-path shapes claims it. Each
+        // predicate is a **superset** of the emitter's actual inline decision (the
+        // emitter's arm may still require a module-wide `true`/`false` or a resolvable
+        // operand), which is the safe direction — an instruction this reports as inlined
+        // but the emitter deopts spills-and-fills through `emit_deopt`, so the retained
+        // dirty bits only cost redundant stores.
+        Instr::GcBif { .. } => {
+            fast_arith(module, instr).is_some()
+                || comparison_shape(module, instr).is_some()
+                || bif_shape(module, instr).is_some()
+        }
+        Instr::Bif { .. } => {
+            comparison_shape(module, instr).is_some() || bif_shape(module, instr).is_some()
+        }
+        // A `test` inlines as a native predicate ([`test_plan`]) or through the shared
+        // `jit_test` comparison helper (the six comparison kinds at two operands with a
+        // resolvable non-`NO_FAIL` fail label) — exactly the emitter's two routes.
+        Instr::Test { kind, fail, args } => {
+            test_plan(module, *kind, *fail, args, labels).is_some()
+                || test_helper_inlined(*kind, *fail, args, labels)
+        }
+        Instr::SelectVal { value, fail, pairs } => {
+            select_val_plan(labels, value, *fail, pairs).is_some()
+        }
+        // A terminating instruction inlines iff its label resolves; an unresolved label
+        // falls to the emitter's `emit_deopt`.
+        Instr::Jump { target } => labels.resolve(*target).is_ok(),
+        Instr::CallLast { target, .. }
+        | Instr::CallOnly { target, .. }
+        | Instr::Call { target, .. } => labels.resolve(*target).is_ok(),
+        // Everything else: a pure helper (`emit_deopt` for the `_` arm, or one of the
+        // dedicated family/receive/frame/heap helpers) — a certain reset.
+        _ => false,
+    }
+}
+
+/// Whether the shared `jit_test` comparison-helper route ([`super::test::emit_test_helper`])
+/// claims this `test` — the six comparison kinds at two operands with a non-`NO_FAIL`,
+/// resolvable fail label (the mirror of that function's own refusals).
+fn test_helper_inlined(kind: TestKind, fail: Label, args: &[Operand], labels: &LabelMap) -> bool {
+    matches!(
+        kind,
+        TestKind::IsEqExact
+            | TestKind::IsNeExact
+            | TestKind::IsEq
+            | TestKind::IsNe
+            | TestKind::IsLt
+            | TestKind::IsGe
+    ) && args.len() == 2
+        && fail != NO_FAIL
+        && labels.resolve(fail).is_ok()
 }
 
 /// The x-registers one instruction's **native** lowering touches — the operands

@@ -29,16 +29,31 @@
 //!
 //! # Which registers a [`spill`] stores, and which a [`fill`] reloads
 //!
-//! [`spill`] writes back only the cached registers the block **writes natively**
-//! ([`Allocation::written`]) — the destination registers of the block's inline
-//! lowerings. A cached register that no inline lowering of the block writes holds
-//! exactly its `machine.x` value at every program point of the block: the prologue
-//! loads it, no lowering diverges the two, and every post-helper [`fill`] that matters
-//! re-syncs it after a helper — which *is* the interpreter, and may have written
-//! `machine.x`. Storing such a register writes back the value it already holds, so
-//! skipping it is a no-op. The write set is a **static superset** of the registers any
-//! lowering actually writes, so an over-approximation costs a redundant store but can
-//! never omit one.
+//! [`spill`] writes back only the cached registers that are **dirty** at the spill's own
+//! `pc` ([`Allocation::spill_slots_at`]) — the registers some inline lowering between the
+//! last point `machine.x` was authoritative for them and that `pc` has since written, and
+//! that the store can therefore actually diverge from `machine.x`. A cached register that
+//! no inline lowering since then has written holds exactly its `machine.x` value, so
+//! storing it would write back an unchanged word.
+//!
+//! Two events make a cached register **clean** again (they sync `machine.x` to the cache):
+//!
+//! * the **prologue** loads the whole cache *from* `machine.x`, so every cached register
+//!   starts the block clean; and
+//! * a **post-helper [`fill`]** reloads from `machine.x` after a helper — which *is* the
+//!   interpreter, and may have written `machine.x` — so every register a fill reloads is
+//!   clean again from that point.
+//!
+//! A register becomes **dirty** when an inline lowering of the block writes its machine
+//! register without writing `machine.x`; the only such lowerings are the block's
+//! destination writers, so `dirty ⊆ [`Allocation::written`]`. The complement — a register
+//! still clean where a store would be a no-op — is exactly what the dirty-set model skips.
+//!
+//! The dirty set is a **static, per-`pc` over-approximation**: it never under-counts (a
+//! register that is truly dirty is always in the set), so a missed transition costs a
+//! redundant store but can never omit a necessary one. [`Allocation::written`] remains the
+//! whole-block union, the conservative fallback an allocation with no dirty table (a
+//! synthetic one a unit test built directly) still stores.
 //!
 //! [`fill`] is **partial**: it reloads only the cached registers a helper at that `pc`
 //! can still be observed through — the block-local liveness set of the continuation
@@ -87,11 +102,29 @@ pub(crate) struct Allocation {
     /// The slots, in assignment order (`src` before `dst` within a `move`).
     pub(crate) slots: Vec<(u32, Reg)>,
     /// The cached x-registers an inline lowering of the block **may write** — a subset
-    /// of `slots`' indices, and exactly the registers [`spill`] stores.
+    /// of `slots`' indices, and the whole-block union of every inline destination.
     ///
-    /// A cached register outside this set holds its `machine.x` value throughout the
-    /// block (see the module docs), so a store of it would be a no-op.
+    /// It is the **conservative fallback** a [`spill`] stores when the allocation has no
+    /// dirty table (see [`Allocation::spill_slots_at`]): a synthetic `Allocation` a unit
+    /// test built directly, or the pre-dirty-set model. A cached register outside this set
+    /// holds its `machine.x` value throughout the block, so a store of it would be a no-op.
     pub(crate) written: Vec<u32>,
+    /// The **dirty set of the cache at every pc of the block**, indexed by
+    /// `pc - block_start`: the cached x-registers a [`spill`] at that pc must store
+    /// because an inline lowering has diverged their machine register from `machine.x`
+    /// since the last point the two were synced (the prologue, or a post-helper
+    /// [`fill`]).
+    ///
+    /// Always one entry per pc in `[start, end]` — **including the block exit pc `end`**
+    /// (the store set of the fall-through exit). An **empty** table (a synthetic
+    /// `Allocation` a unit test built directly) means "no dirty analysis was computed"
+    /// and makes every store set the whole [`Allocation::written`] set (the pre-model
+    /// behaviour).
+    ///
+    /// The set is a per-`pc` over-approximation derived by [`super::regalloc`]'s forward
+    /// dirty-set walk: a register that is truly dirty is always a member, so a missed
+    /// transition costs a redundant store but never omits a necessary one.
+    pub(crate) spill_sets: Vec<Vec<u32>>,
     /// The **highest pc of the block whose instruction accesses a Y slot**, or `None`
     /// when no instruction of the block does.
     ///
@@ -150,8 +183,34 @@ impl Allocation {
     }
 
     /// The registers a [`spill`] of this allocation stores (its **written** cache).
+    ///
+    /// The whole-block conservative set; [`spill`] uses the finer per-`pc`
+    /// [`Allocation::spill_slots_at`] instead, and this is retained for that fallback and
+    /// for the structural counters.
     pub(crate) fn spill_slots(&self) -> impl Iterator<Item = &(u32, Reg)> {
         self.slots.iter().filter(|(x, _)| self.is_written(*x))
+    }
+
+    /// The cached slots a [`spill`] at `pc` stores, as `(x-register index, machine
+    /// register)` pairs: the slots whose x-register is **dirty** at `pc`
+    /// ([`Allocation::spill_sets`]).
+    ///
+    /// A table that does not cover `pc` (an empty one — a synthetic allocation from a
+    /// unit test) conservatively means the **whole** [`Allocation::written`] set, which is
+    /// the pre-dirty-set model and always sound (a superset of the true dirty set).
+    pub(crate) fn spill_slots_at(&self, pc: u32) -> Vec<(u32, Reg)> {
+        match self
+            .spill_sets
+            .get(pc.wrapping_sub(self.block_start) as usize)
+        {
+            Some(set) => self
+                .slots
+                .iter()
+                .filter(|(x, _)| set.contains(x))
+                .copied()
+                .collect(),
+            None => self.spill_slots().copied().collect(),
+        }
     }
 
     /// The cached slots a post-helper [`fill`] at `pc` reloads, as
@@ -191,23 +250,27 @@ impl Allocation {
     }
 }
 
-/// Write the block's **written** cached x-registers back into `machine.x` (`rbx` holds
-/// the base).
+/// Write the block's **dirty** cached x-registers at `pc` back into `machine.x` (`rbx`
+/// holds the base).
 ///
-/// Only [`Allocation::written`] is stored (see the module docs): a cached register no
-/// inline lowering of the block writes still holds exactly its `machine.x` value, so
+/// Only [`Allocation::spill_slots_at`] is stored (see the module docs): a cached register
+/// that no inline lowering has diverged from its `machine.x` value since the last syncing
+/// event (the prologue, or a post-helper [`fill`]) still holds exactly that value, so
 /// storing it would write back an unchanged word. `site` classifies the call for the
-/// test-only structural counters and is otherwise unused.
+/// test-only structural counters and is otherwise unused; the recorded count is the number
+/// of stores actually emitted.
 pub(super) fn spill(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     site: SpillSite,
+    pc: u32,
 ) -> Result<()> {
     let _ = site;
+    let slots = allocation.spill_slots_at(pc);
     #[cfg(test)]
-    super::super::counters::record_spill(site, allocation.written.len() as u64);
-    for (x, reg) in allocation.spill_slots() {
-        buffer.mov_mr(Reg::Rbx, x_offset(*x), *reg)?;
+    super::super::counters::record_spill(site, slots.len() as u64);
+    for (x, reg) in slots {
+        buffer.mov_mr(Reg::Rbx, x_offset(x), reg)?;
     }
     Ok(())
 }
