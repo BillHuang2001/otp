@@ -152,26 +152,40 @@ fn run_with_tier_compiles_once_and_reuses_the_artifact_across_calls() {
 }
 
 #[test]
-fn a_freshly_loaded_copy_of_the_same_content_hits_the_cache() {
+fn a_freshly_loaded_copy_of_the_same_content_is_a_second_namespace() {
     clear_baseline_cache();
     // Two independent loads: different `Module` instances (different addresses), same
-    // content — the key (the load-time MD5 digest) is content-derived, so the second
-    // load is a cache hit.
+    // content — but each load carries its own atom namespace (`beam_loader::load` interns
+    // into a fresh `AtomTable`), and the baseline tier bakes atom *indices* into its code,
+    // so the second load is a separate entry that compiles against its own table. That is
+    // the documented namespace trade — an extra compile, never a wrong answer.
     let first_module = slice_module();
     let second_module = slice_module();
     let args = [make_small(20), make_small(22)];
 
     let first = run_on_tier(&first_module, "add", 2, &args, Tier::BaselineJit).expect("first run");
+    assert_eq!(first, make_small(42));
     assert_eq!(baseline_compile_count(), 1);
 
     let second =
         run_on_tier(&second_module, "add", 2, &args, Tier::BaselineJit).expect("second run");
-    assert_eq!(second, first);
+    assert_eq!(second, first, "both namespaces compute the same answer");
     assert_eq!(second, make_small(42));
     assert_eq!(
         baseline_compile_count(),
-        1,
-        "a re-loaded copy of identical content must reuse the cached code"
+        2,
+        "a re-loaded `.beam` carries its own atom namespace, so it compiles its own artifact"
+    );
+    assert_eq!(baseline_cache_len(), 2, "one entry per (module, namespace)");
+
+    // The *same* module object is still a hit: the digest half is O(1) and the namespace
+    // half is unchanged for a given table.
+    let again = run_on_tier(&first_module, "add", 2, &args, Tier::BaselineJit).expect("re-run");
+    assert_eq!(again, first);
+    assert_eq!(
+        baseline_compile_count(),
+        2,
+        "re-running one module must reuse its artifact"
     );
 }
 

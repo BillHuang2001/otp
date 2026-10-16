@@ -215,13 +215,20 @@ fn an_artifact_with_no_compiled_block_reports_an_empty_map() {
 }
 
 #[test]
-fn the_code_map_is_stable_across_recompiles_of_the_same_content() {
+fn the_code_map_is_stable_across_resolutions_of_the_same_module() {
     clear_baseline_cache();
-    let first = baseline_code_map(&slice_module()).expect("first map");
-    // A second, independently loaded copy of the same content hits the cache: the
-    // reported ranges are the *same* addresses (the artifact was reused).
-    let second = baseline_code_map(&slice_module()).expect("second map");
+    // Resolving one module twice reuses the cached artifact (the digest half is O(1) and
+    // the namespace half is unchanged for a given table), so the reported ranges are the
+    // *same* addresses.
+    let module = slice_module();
+    let first = baseline_code_map(&module).expect("first map");
+    let second = baseline_code_map(&module).expect("second map");
     assert_eq!(first, second);
+    // A second, independently loaded copy of the same `.beam` is a *separate atom
+    // namespace*, so it compiles its own artifact (at different addresses) — but it
+    // describes exactly the same blocks, so the reported *names* agree one-for-one.
+    let fresh = baseline_code_map(&slice_module()).expect("fresh map");
+    assert_eq!(names(&first), names(&fresh));
 }
 
 #[test]
