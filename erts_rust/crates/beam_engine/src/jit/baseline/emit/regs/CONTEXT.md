@@ -50,6 +50,10 @@ and its test-only site classification live in one ~300-line file. Owned by `./er
   `(live ∪ written) ∩ slots` -- except the prologue load, which is the whole cache. A register left out of
   the set keeps a stale word that is only ever overwritten, never read.
 
+## Design Decisions
+- **Already-clean-aware ("dirty-set") stores are the classic handwritten-JIT register-cache store elimination.** The model and its soundness argument follow `ERTS_RUST_REWRITE_DEEPDIVE.md` §F (the baseline/hot tier split and its correctness-first register-cache design) and the read-only legacy-C reference `erts/emulator/beam/jit/x86/beam_asm*.cpp` with `erts/emulator/beam/jit/beam_jit_register_cache.hpp`; note that reference is a *position-keyed whole-cache* cache (`consolidate(offset)`/`validAt(offset)` evict the whole cache when the emit position moves, with **no** per-register dirty bit), so the dirty-set rule is this tier's own, not a port of that file. The full design note (the walk, the reset rule, the citation) is in `../regalloc.rs`'s module docs.
+- **The dirty set is computed statically at emission time, never tracked at run time** — zero cost in emitted code: `spill_slots_at(pc)` is a compile-time table lookup, so a run-time block is the same shape as under the written-set model apart from how many stores it emits.
+
 ## Constraints
 - The crate is `#![deny(unsafe_code)]`; this file dereferences no raw pointer (it only emits bytes).
 - `spill`/`fill` return `beam_common::Result<()>`; a `CodeBuffer` overflow is the typed error, never a panic.
