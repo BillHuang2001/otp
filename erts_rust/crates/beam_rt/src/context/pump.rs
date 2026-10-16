@@ -703,14 +703,9 @@ mod in_process_compile {
     /// script the `-eval` action drives ([`CodeServer::own_bootstrap_boot_script`] — this
     /// runtime's own release's `bootstrap/bin/start.boot`) before its own instruction.
     ///
-    /// The script matters for one concrete reason. Its `kernel_sup` wins the `file_server_2`
-    /// name, so the compiler's `file:open/2` round trips are answered by the **real** Erlang
-    /// server, whose devices implement the `{read_handle_info, Opts}` io request `epp` sends
-    /// while reading a `-moduledoc({file, …})` (`lib/stdlib/src/epp.erl:1437`). With no boot
-    /// script the runtime's own native service owns that name instead, and its device arm has no
-    /// `read_handle_info` — a typed `unsupported` gap in `src/native/file_server.rs`, on a route
-    /// this test and the CLI do not measure. Driving the script here therefore keeps the test on
-    /// the very route its name (and the A.9 blocker's command line) refers to.
+    /// The boot script's `kernel_sup` wins the `file_server_2` name, so the compiler's `file:open/2` round trips are answered by the **real** Erlang server, whose devices implement the `{read_handle_info, Opts}` io request `epp` sends while reading a `-moduledoc({file, …})` (`lib/stdlib/src/epp.erl:1437`).
+    /// With no boot script the runtime's own native service owns that name instead and serves the same `{read_handle_info, Opts}` request.
+    /// Driving the script here therefore keeps the test on the very route its name (and the A.9 blocker's command line) refers to.
     ///
     /// The config names a script (`with_resolved_boot_script`) for the same reason
     /// [`crate::cli`] records one before it builds the runtime:
