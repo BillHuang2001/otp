@@ -33,6 +33,11 @@
 //! * `Name` is a **charlist** or an **atom** (the C `pick_list_or_atom`); `Item` must
 //!   be an **atom**. An unknown driver name *or* an unknown item is the plain
 //!   `error:badarg`.
+//! * For a statically linked built-in (`tcp_inet`, `udp_inet`, `ram_file_drv` — the
+//!   C's `handle == NULL` drivers) the items are `linked_in_driver` -> `true`,
+//!   `permanent` -> `false`, and `port_count`/`driver_options`/`processes`/
+//!   `awaiting_load`/`awaiting_unload` -> the **atom** `linked_in_driver`
+//!   (`erl_bif_ddll.c:728,743,752,775`).
 //! * For a driver loaded through [`super::live::try_load_3`] the item values are:
 //!   `linked_in_driver` -> `false` (it is dynamically loaded, not a statically linked
 //!   built-in); `permanent` -> `false`; `port_count` -> `0` (no ports are opened here);
@@ -43,10 +48,6 @@
 //!
 //! # Honest divergences
 //!
-//! * **No statically linked built-ins.** The oracle reports the three drivers linked
-//!   into the emulator (`tcp_inet`, `udp_inet`, `ram_file_drv`) as
-//!   `linked_in_driver = true`; this runtime links none, so a name that is not in its
-//!   registry is `badarg` exactly like any other unknown name.
 //! * **`processes` counts only the loading process.** The C tracks every process that
 //!   has loaded the driver and its per-process reference count; here the registry
 //!   records the single loader ([`super::registry::Loaded::loader`]) with count `1`.
@@ -85,6 +86,19 @@ fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let Some(item) = atom_name(ctx, args[1]).map(str::to_owned) else {
         return Err(badarg());
     };
+    // A statically linked built-in is not in the registry; the C's `lookup_driver` finds it with
+    // `handle == NULL` and takes the `linked_in_driver` branch of the item switch
+    // (`erl_bif_ddll.c:728,743,752,775`).
+    if registry::is_static(&name) {
+        return match item.as_str() {
+            "linked_in_driver" => ctx.intern_atom("true"),
+            "permanent" => ctx.intern_atom("false"),
+            "port_count" | "driver_options" | "processes" | "awaiting_load" | "awaiting_unload" => {
+                ctx.intern_atom("linked_in_driver")
+            }
+            _ => Err(badarg()),
+        };
+    }
     let Some((kill_ports, loader)) =
         registry::get(&name, |loaded| (loaded.kill_ports, loaded.loader))
     else {
@@ -269,6 +283,68 @@ mod tests {
             fx.call("info", 2, &[path, int]),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// The statically linked built-ins' item matrix
+    /// (`erl_bif_ddll.c:728,743,752,775` — the `handle == NULL` drivers
+    /// `tcp_inet`, `udp_inet`, `ram_file_drv`).
+    #[test]
+    fn the_item_matrix_of_a_static_builtin() {
+        clear_registry();
+        let mut fx = Fixture::new();
+
+        for name in ["tcp_inet", "udp_inet", "ram_file_drv"] {
+            assert_eq!(info(&mut fx, name, "linked_in_driver"), "true", "{name}");
+            assert_eq!(info(&mut fx, name, "permanent"), "false", "{name}");
+            assert_eq!(
+                info(&mut fx, name, "port_count"),
+                "linked_in_driver",
+                "{name}"
+            );
+            assert_eq!(
+                info(&mut fx, name, "driver_options"),
+                "linked_in_driver",
+                "{name}"
+            );
+            assert_eq!(
+                info(&mut fx, name, "processes"),
+                "linked_in_driver",
+                "{name}"
+            );
+            assert_eq!(
+                info(&mut fx, name, "awaiting_load"),
+                "linked_in_driver",
+                "{name}"
+            );
+            assert_eq!(
+                info(&mut fx, name, "awaiting_unload"),
+                "linked_in_driver",
+                "{name}"
+            );
+        }
+
+        // An item outside the seven recognised facets is still the plain `badarg`, exactly as for
+        // any other driver.
+        let name = fx.charlist("tcp_inet");
+        let item = fx.atom("loaded");
+        assert!(matches!(
+            fx.call("info", 2, &[name, item]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// The atom-name form of a static built-in resolves like the charlist form (the C
+    /// `pick_list_or_atom`).
+    #[test]
+    fn a_static_builtin_named_by_atom_is_accepted() {
+        clear_registry();
+        let mut fx = Fixture::new();
+        let name = fx.atom("tcp_inet");
+        let item = fx.atom("linked_in_driver");
+        let out = fx
+            .call("info", 2, &[name, item])
+            .expect("a static atom name is a value");
+        assert_eq!(fx.render(out), "true");
     }
 
     /// The roster is exactly [`REAL_BIFS`] and is registered.

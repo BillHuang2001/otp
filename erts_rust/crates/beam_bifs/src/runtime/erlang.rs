@@ -1222,6 +1222,48 @@ mod tests {
         }
     }
 
+    /// `erlang:statistics/1` is a **seam key and nothing more** on this side of the seam.
+    ///
+    /// This node owns the key + the forward: `src/runtime/erlang.rs` registers it, the
+    /// `RUNTIME_HOOKS_BIFS` roster (the one authoritative set, in `crate::hook_sets`) contains
+    /// it, and the body only calls
+    /// [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif). With no
+    /// `RuntimeHooks` installed **every** argument shape — a real statistics key
+    /// (`garbage_collection`) *and* a name that is not a statistics key at all (`bogus`), a
+    /// non-atom integer and the empty list — answers the same typed `unsupported_bif`: the key
+    /// interprets no argument itself (never `badarg`, the oracle's own non-key answer) and never
+    /// fabricates a counter (a `{0,0,0}` `garbage_collection` included).
+    ///
+    /// The *provider* (the `("erlang", "statistics", 1)` arm of `RuntimeHooks::call`, and the
+    /// per-item wiring behind it) lives in `beam_rt`, not here — see the module `CONTEXT.md`.
+    #[test]
+    fn erlang_statistics_is_a_roster_seam_key_forwarder() {
+        assert!(
+            crate::hook_sets::needs_runtime_hooks("erlang", "statistics", 1),
+            "erlang:statistics/1 must be in the 172-key RuntimeHooks roster"
+        );
+
+        let mut reg = BifRegistry::new();
+        register(&mut reg);
+        assert!(reg.contains("erlang", "statistics", 1));
+
+        with_reg(&["garbage_collection", "bogus"], |reg, ctx| {
+            let key = atom(ctx, "garbage_collection");
+            let bogus = atom(ctx, "bogus");
+            let int = ctx.int(7).expect("small int");
+            for args in [vec![key], vec![bogus], vec![int], vec![NIL]] {
+                match reg.call("erlang", "statistics", 1, ctx, &args) {
+                    Err(BeamError::Raise(r)) => assert_eq!(
+                        r.reason,
+                        beam_common::ExitReason::atom("unsupported_bif"),
+                        "the seam gap, never badarg and never a fabricated counter"
+                    ),
+                    other => panic!("expected unsupported_bif, got {other:?}"),
+                }
+            }
+        });
+    }
+
     /// `$ERTS_ORACLE` if it names an existing file, else `erl` on `$PATH`
     /// (the same helper `crate::numeric`'s live-oracle test uses).
     fn resolve_oracle() -> Option<std::path::PathBuf> {

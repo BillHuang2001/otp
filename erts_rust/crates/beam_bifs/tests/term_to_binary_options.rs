@@ -33,12 +33,15 @@
 //!   N <- lists:seq(1,40)])`, whose storage order is hash-slot order) into full Erlang
 //!   term order. The term is taken from the oracle's own plain image (decoded with
 //!   `binary_to_term/1`), so the two sides start from byte-identical terms.
-//! * `[local]` is the typed `unsupported_bif` gap, with the **evidence** recorded here:
-//!   the oracle image is `[131][121][hash:4][body]` where the body is the plain body
-//!   with the node atom replaced by the `NIL_EXT` marker, and the 4-byte `hash`
-//!   (`local_node_hash`, seeded from the VM's monotonic clock — `external.c:136-200`)
-//!   **differs between VM runs**. It is therefore not reproducible, so fabricating
-//!   four bytes would produce an image the oracle rejects.
+//! * `[local]` is the `LOCAL_EXT` (121) wrapper `[131][121][hash:4][body]`, where the
+//!   body is the plain body with an internal pid/port/ref's node atom replaced by the
+//!   `NIL_EXT` marker, and the 4-byte `hash` (`local_node_hash`, seeded from the VM's
+//!   monotonic clock — `external.c:136-200`) **differs between VM runs**. The hash is
+//!   node-local by design, so the BIF takes it from the
+//!   [`LocalNode::local_node_hash`](beam_bifs::LocalNode) seam: with a stub value the
+//!   image is byte-exact apart from those four bytes (and the oracle's own body shape is
+//!   pinned here); with no seam `[local]` is the typed `unsupported_bif` gap — four
+//!   fabricated bytes would produce an image the oracle rejects.
 //! * `[deterministic,local]` (either order) and an unknown option are the oracle's
 //!   `badarg`.
 //! * `erlang:term_to_binary/3` does **not** exist in the oracle (`undef`), so this
@@ -48,11 +51,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry};
+use beam_bifs::{default_registry, BifContext, BifRegistry, LocalNode};
 use beam_codec::term as codec_term;
 use beam_common::BeamError;
 use beam_process::ProcessId;
-use beam_term::{AtomTable, Eterm};
+use beam_term::{is_small, signed_value, Atom, AtomTable, Eterm};
 
 // ---------------------------------------------------------------------------
 // The oracle
@@ -243,6 +246,31 @@ fn bytes_of(term: Eterm) -> Vec<u8> {
     assert_eq!(offset, 0, "the result is a byte-aligned binary");
     assert_eq!(size_bits % 8, 0, "the result is a whole number of bytes");
     bytes[..size_bits / 8].to_vec()
+}
+
+/// The value of a small-integer term (what `erlang:external_size/1,2` returns).
+fn small_int(term: Eterm) -> i64 {
+    assert!(is_small(term), "expected a small-integer term");
+    signed_value(term)
+}
+
+/// A `LocalNode` stub. The real node hash is a per-VM-start Bob-Jenkins block hash
+/// (`external.c:136-200`), so the runtime owns it and a test supplies a constant to pin
+/// the surrounding image. `node` optionally supplies the `(node_atom, creation)`
+/// identity that encoding an internal pid/port/ref *without* `[local]` needs.
+struct FakeLocalNode {
+    node: Option<(Atom, u32)>,
+    hash: Option<u32>,
+}
+
+impl LocalNode for FakeLocalNode {
+    fn local_node(&mut self) -> Option<(Atom, u32)> {
+        self.node
+    }
+
+    fn local_node_hash(&mut self) -> Option<u32> {
+        self.hash
+    }
 }
 
 /// `binary_to_term(Image)` through the registry.
@@ -450,6 +478,232 @@ fn local_is_the_typed_gap_and_never_a_fabricated_hash() {
     let local = option_atoms(&mut ctx, &["local"]);
     let err = call(&reg, &mut ctx, "erlang", "term_to_binary", 2, &[pid, local]).unwrap_err();
     assert!(matches!(err, BeamError::Raise(_)), "local + pid, got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// `[local]` with a node-hash seam — the wrapper shape, byte for byte
+// ---------------------------------------------------------------------------
+
+#[test]
+fn local_with_a_node_hash_seam_wraps_the_plain_body_byte_for_byte() {
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = atoms();
+    // `[local]` needs no node identity (the wrapper *is* the node field), so the stub
+    // only supplies the hash.
+    let mut node = FakeLocalNode {
+        node: None,
+        hash: Some(0x0102_0304),
+    };
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_local_node(&mut node);
+
+    // An ordinary term: the oracle's `term_to_binary([1,2],[local])` is
+    // `<<131,121,Hash:4/binary,107,0,2,1,2>>`, so with the stub hash the whole image is
+    // pinned here and the plain body follows unchanged.
+    let two = ctx.list(&[ctx.int(1).unwrap(), ctx.int(2).unwrap()]).unwrap();
+    let plain = bytes_of(call(&reg, &mut ctx, "erlang", "term_to_binary", 1, &[two]).unwrap());
+    let local_opts = option_atoms(&mut ctx, &["local"]);
+    let local = image_with(&reg, &mut ctx, two, local_opts);
+    assert_eq!(
+        local,
+        [131, 121, 1, 2, 3, 4, 107, 0, 2, 1, 2],
+        "the seam hash lands in bytes 2..6 and the plain body follows"
+    );
+    assert_eq!(&local[6..], &plain[1..], "the body is exactly the plain body");
+    assert_eq!(local.len(), plain.len() + 5, "the wrapper costs five bytes");
+
+    // `binary_to_term` consumes the wrapper (no hash is installed on the decoder, so it
+    // is read unchecked), so the round trip holds within this runtime.
+    let decoded = decode(&reg, &mut ctx, &local);
+    let re_encoded =
+        bytes_of(call(&reg, &mut ctx, "erlang", "term_to_binary", 1, &[decoded]).unwrap());
+    assert_eq!(re_encoded, plain, "binary_to_term(term_to_binary(T,[local])) =:= T");
+}
+
+#[test]
+fn local_replaces_an_internal_pids_node_with_the_nil_marker() {
+    let reg = default_registry();
+    let mut heap = heap();
+    let mut atoms = atoms();
+    // The plain image needs a resolvable local node, so the stub supplies the M1
+    // identity and the `[local]` body can be compared against the plain one field by
+    // field. (`nonode@nohost` is the atom the M1 fallback would use.)
+    atoms.seed(["nonode@nohost"]);
+    let node_atom = atoms.lookup("nonode@nohost").expect("seeded");
+    let mut node = FakeLocalNode {
+        node: Some((node_atom, 0)),
+        hash: Some(0x0A0B_0C0D),
+    };
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_local_node(&mut node);
+
+    let pid = ctx.self_pid().to_eterm();
+    let plain = bytes_of(call(&reg, &mut ctx, "erlang", "term_to_binary", 1, &[pid]).unwrap());
+    let local_opts = option_atoms(&mut ctx, &["local"]);
+    let local = image_with(&reg, &mut ctx, pid, local_opts);
+
+    // `[131][121][hash:4][NEW_PID_EXT][NIL_EXT][number][serial][creation=0]`: the node
+    // atom is replaced by the internal-node marker and the creation becomes 0
+    // (`enc_internal_pid`'s `DFLAG_LOCAL_EXT` branch, `external.c:2978-2981`; the marker
+    // is written by `:5589`). The oracle's `[local]` `self()` is exactly this shape.
+    assert_eq!(local[0], 131, "VERSION_MAGIC");
+    assert_eq!(local[1], 121, "LOCAL_EXT");
+    assert_eq!(&local[2..6], &[0x0A, 0x0B, 0x0C, 0x0D], "the seam hash");
+    assert_eq!(local[6], 88, "NEW_PID_EXT");
+    assert_eq!(local[7], 106, "NIL_EXT — the internal-node marker");
+    assert_eq!(
+        local.len(),
+        20,
+        "tag + marker + number + serial + creation (no node atom)"
+    );
+    assert_eq!(
+        &local[16..20],
+        &[0, 0, 0, 0],
+        "the [local] marker's creation is 0"
+    );
+
+    // The number/serial/creation are the plain image's — only the node field changed.
+    assert_eq!(&plain[0..2], &[131, 88], "the plain image is a NEW_PID_EXT too");
+    let node_len = 2 + plain[3] as usize; // atom tag byte + length byte + name bytes
+    assert_eq!(
+        &local[8..],
+        &plain[2 + node_len..],
+        "number/serial/creation are unchanged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `erlang:external_size/2` under `[local]`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn external_size_of_local_is_the_wrapped_image_and_gaps_without_a_seam() {
+    let reg = default_registry();
+
+    // No seam: `external_size/2` answers the same typed gap as `term_to_binary/2` —
+    // never a length for an image this runtime cannot produce.
+    {
+        let mut heap = heap();
+        let atoms = atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let two = ctx.list(&[ctx.int(1).unwrap(), ctx.int(2).unwrap()]).unwrap();
+        let local_opts = option_atoms(&mut ctx, &["local"]);
+        let err =
+            call(&reg, &mut ctx, "erlang", "external_size", 2, &[two, local_opts]).unwrap_err();
+        assert!(
+            matches!(err, BeamError::Raise(_)),
+            "external_size + local without a seam, got {err:?}"
+        );
+    }
+
+    // With the seam: the size is the `LOCAL_EXT` image's. Oracle-pinned:
+    // `erlang:external_size([1,2])` is `6` and `erlang:external_size([1,2],[local])` is
+    // `11` (the wrapper's five bytes; `[local,compressed]` is `11` too — the level is
+    // ignored, exactly as for `[compressed]`).
+    let mut heap = heap();
+    let mut atoms = atoms();
+    atoms.seed(["nonode@nohost"]);
+    let node_atom = atoms.lookup("nonode@nohost").expect("seeded");
+    let mut node = FakeLocalNode {
+        node: Some((node_atom, 0)),
+        hash: Some(0x0102_0304),
+    };
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_local_node(&mut node);
+
+    let two = ctx.list(&[ctx.int(1).unwrap(), ctx.int(2).unwrap()]).unwrap();
+    let plain = small_int(call(&reg, &mut ctx, "erlang", "external_size", 1, &[two]).unwrap());
+    let local_opts = option_atoms(&mut ctx, &["local"]);
+    let with_local =
+        small_int(call(&reg, &mut ctx, "erlang", "external_size", 2, &[two, local_opts]).unwrap());
+    let local_compressed =
+        option_atoms(&mut ctx, &["local", "compressed"]);
+    let with_local_compressed = small_int(
+        call(
+            &reg,
+            &mut ctx,
+            "erlang",
+            "external_size",
+            2,
+            &[two, local_compressed],
+        )
+        .unwrap(),
+    );
+    assert_eq!(plain, 6, "the oracle's plain external_size of [1,2]");
+    assert_eq!(with_local, 11, "the oracle's [local] external_size of [1,2]");
+    assert_eq!(with_local, plain + 5, "the wrapper is five bytes");
+    assert_eq!(
+        with_local_compressed, with_local,
+        "compression never changes the size probe"
+    );
+
+    // The internal-id case is where the wrapper is not the only difference: the
+    // `NIL_EXT` substitution removes the 15-byte node atom. Oracle: `self()` is `29`
+    // plain and `20` under `[local]` (-14 for the node atom, +5 for the wrapper).
+    let pid = ctx.self_pid().to_eterm();
+    let plain_pid = small_int(call(&reg, &mut ctx, "erlang", "external_size", 1, &[pid]).unwrap());
+    let local_opts = option_atoms(&mut ctx, &["local"]);
+    let local_pid = small_int(
+        call(&reg, &mut ctx, "erlang", "external_size", 2, &[pid, local_opts]).unwrap(),
+    );
+    assert_eq!(plain_pid, 29, "the oracle's plain external_size of self()");
+    assert_eq!(local_pid, 20, "the oracle's [local] external_size of self()");
+    assert_eq!(local_pid, plain_pid - 14 + 5, "node atom -> marker, plus the wrapper");
+}
+
+// ---------------------------------------------------------------------------
+// `[local]` + `compressed`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn local_combines_with_compression_by_deflating_the_local_body() {
+    // `[local, compressed]` is a valid oracle option list. The C deflates the **local
+    // body** — the `[121][hash:4]` wrapper plus the term body, i.e. the uncompressed
+    // `[local]` image minus its version byte — and frames it
+    // `[131][80][local_body_len:4 BE][zlib]`, reverting to the plain `[local]` image when
+    // compression does not shrink it (`erts_term_to_binary_simple`, `external.c:2265-2298`).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = atoms();
+    let mut node = FakeLocalNode {
+        node: None,
+        hash: Some(0x0102_0304),
+    };
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_local_node(&mut node);
+
+    // A long list of small ints: its body compresses well.
+    let items: Vec<Eterm> = (0..500).map(|n| ctx.int(n % 8).unwrap()).collect();
+    let big = ctx.list(&items).unwrap();
+
+    let local_opts = option_atoms(&mut ctx, &["local"]);
+    let local_plain = image_with(&reg, &mut ctx, big, local_opts);
+    assert_eq!(&local_plain[..6], &[131, 121, 1, 2, 3, 4], "the wrapper");
+
+    let both_opts = option_atoms(&mut ctx, &["local", "compressed"]);
+    let local_compressed = image_with(&reg, &mut ctx, big, both_opts);
+    assert_eq!(local_compressed[0], 131, "VERSION_MAGIC");
+    assert_eq!(local_compressed[1], 80, "COMPRESSED_EXT for such a body");
+    // The inner length is the **local body**'s (the wrapper is inside the deflate).
+    let declared = u32::from_be_bytes([
+        local_compressed[2],
+        local_compressed[3],
+        local_compressed[4],
+        local_compressed[5],
+    ]) as usize;
+    assert_eq!(
+        declared,
+        local_plain.len() - 1,
+        "the declared inner size is the [local] body, not the term body"
+    );
+    let inner = beam_codec::compress::decompress(&local_compressed[6..])
+        .expect("the wrapper's payload is a zlib stream");
+    assert_eq!(
+        inner,
+        &local_plain[1..],
+        "the deflated bytes are exactly the [local] body"
+    );
 }
 
 // ---------------------------------------------------------------------------

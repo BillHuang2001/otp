@@ -17,8 +17,9 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Integration tests for the four self-contained `zlib` functions —
-//! `zlib:compress/1`, `zlib:uncompress/1`, `zlib:zip/1` and `zlib:unzip/1`.
+//! Integration tests for the six self-contained `zlib` functions —
+//! `zlib:compress/1`, `zlib:uncompress/1`, `zlib:zip/1`, `zlib:unzip/1`,
+//! `zlib:gzip/1` and `zlib:gunzip/1`.
 //!
 //! `zlib:zip/1`/`zlib:unzip/1` are the **raw** (RFC 1951, header-less and
 //! checksum-less) pair, and the bytes of what `zip/1` emits are the encoder's, not
@@ -27,6 +28,15 @@
 //! * the two oracle goldens, byte for byte (`zlib:zip(<<"hello">>)` is
 //!   `<<203,72,205,201,201,7,0>>` and `zlib:zip(<<>>)` is `<<3,0>>`, verified live
 //!   against OTP 29.1.1 / erts-17.1);
+//! * `zlib:compress/1`'s byte-exact goldens for **short** bodies (
+//!   `compress_matches_the_oracle_byte_for_byte_on_short_bodies`) and, for a
+//!   repetitive body, the *shape* instead of the bytes: the RFC 1950 header, the
+//!   Adler-32 trailer and both round trips
+//!   (`a_repetitive_body_diverges_in_size_but_stays_a_valid_stream_both_ways`).
+//!   The size divergence on repetitive bodies is the documented A.7 gap — the
+//!   deflate body is `miniz_oxide`'s block-type choice, not the oracle's
+//!   `deflate_slow` one; no level reproduces it and no input is special-cased
+//!   (`src/zlib.rs`, "Byte identity is not promised; interoperability is");
 //! * the full error-class matrix (`badarg` for a non-iodata argument, the bare
 //!   `error:data_error` for a stream the inflater cannot finish — with **no** length
 //!   arm, unlike `uncompress/1`);
@@ -100,6 +110,30 @@ impl Fixture {
         bytes[..size_bits / 8].to_vec()
     }
 
+    /// `zlib:compress(Data)` through the registry.
+    fn compress(&mut self, data: &[u8]) -> Vec<u8> {
+        let term = self.binary(data);
+        let packed = self.ok("zlib", "compress", &[term]);
+        self.bytes_of(packed)
+    }
+
+    /// `zlib:uncompress(Data)` through the registry.
+    fn uncompress(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        let term = self.binary(data);
+        let plain = self.call("zlib", "uncompress", &[term])?;
+        Ok(self.bytes_of(plain))
+    }
+
+    /// `erlang:adler32(Data)` through the registry — the checksum a zlib stream
+    /// carries as its trailer, taken from the crate's own BIF rather than
+    /// re-derived here.
+    fn adler32(&mut self, data: &[u8]) -> u32 {
+        let term = self.binary(data);
+        let sum = self.ok("erlang", "adler32", &[term]);
+        assert!(beam_term::is_small(sum), "adler32/1 returned {sum:?}");
+        beam_term::unsigned_value(sum) as u32
+    }
+
     /// `zlib:zip(Data)` through the registry.
     fn zip(&mut self, data: &[u8]) -> Vec<u8> {
         let term = self.binary(data);
@@ -162,6 +196,139 @@ fn assert_data_error(result: Result<Vec<u8>>, what: &str) {
         }
         other => panic!("{what}: expected error:data_error, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `zlib:compress/1` — the zlib-wrapped encoder
+// ---------------------------------------------------------------------------
+
+/// `zlib:compress/1` is byte-identical to the oracle **only** for bodies both encoders
+/// turn into a single fixed-Huffman block.
+///
+/// All six payloads are oracle-verified goldens (OTP 29.1.1 / erts-17.1, real libz):
+/// a short body is one fixed-Huffman block in zlib's `deflate_slow` *and* in
+/// miniz_oxide, so the two agree byte for byte. The block type is asserted as the
+/// *reason* the bytes coincide, not as an extra guess.
+#[test]
+fn compress_matches_the_oracle_byte_for_byte_on_short_bodies() {
+    let mut fx = Fixture::new();
+
+    assert_eq!(fx.compress(b""), vec![120, 156, 3, 0, 0, 0, 0, 1]);
+    assert_eq!(fx.compress(b"a"), vec![120, 156, 75, 4, 0, 0, 98, 0, 98]);
+    assert_eq!(
+        fx.compress(b"abc"),
+        vec![120, 156, 75, 76, 74, 6, 0, 2, 77, 1, 39]
+    );
+    assert_eq!(
+        fx.compress(b"hello"),
+        vec![120, 156, 203, 72, 205, 201, 201, 7, 0, 6, 44, 2, 21]
+    );
+    assert_eq!(
+        fx.compress(b"world"),
+        vec![120, 156, 43, 207, 47, 202, 73, 1, 0, 6, 166, 2, 41]
+    );
+    assert_eq!(
+        fx.compress(b"abcdefgh"),
+        vec![120, 156, 75, 76, 74, 78, 73, 77, 75, 207, 0, 0, 14, 0, 3, 37]
+    );
+
+    for body in [&b""[..], b"a", b"abc", b"hello", b"world", b"abcdefgh"] {
+        let stream = fx.compress(body);
+        assert_eq!(
+            first_block_type(&stream[2..]),
+            1,
+            "{body:?}: a fixed-Huffman block is why the bytes coincide"
+        );
+    }
+}
+
+/// The **documented A.7 divergence** for a repetitive body, pinned by shape rather than
+/// by bytes.
+///
+/// `zlib:compress(<<0:8192>>)` (`<<0:8192>>` is 8192 *bits* = 1024 zero bytes) is 17 bytes
+/// in the oracle — one **fixed-Huffman** block — and 23 bytes here — one **dynamic-Huffman**
+/// block (`miniz_oxide` 0.9.1 at the default level 6 of `zlib:compress/1`). The zero run
+/// is not special-cased anywhere: the whole level range was swept (`src/zlib.rs` module
+/// docs) and no level reproduces the oracle's 17 bytes, because the block-type/lazy-match
+/// choice is the encoder's, not a knob `flate2`'s `rust_backend` exposes. What *is* pinned
+/// is the RFC 1950 framing (header and Adler-32 trailer, the latter taken from the crate's
+/// own `erlang:adler32/1` BIF) and both round trips — including the oracle's own stream.
+#[test]
+fn a_repetitive_body_diverges_in_size_but_stays_a_valid_stream_both_ways() {
+    let mut fx = Fixture::new();
+    let data = vec![0u8; 1024];
+
+    // `zlib:compress(<<0:8192>>)` under OTP 29.1.1 / erts-17.1.
+    const ORACLE: [u8; 17] = [
+        120, 156, 99, 96, 24, 5, 163, 96, 20, 140, 84, 0, 0, 4, 0, 0, 1,
+    ];
+    assert_eq!(
+        first_block_type(&ORACLE[2..]),
+        1,
+        "the oracle's block is fixed-Huffman"
+    );
+
+    let stream = fx.compress(&data);
+    assert_eq!(
+        stream.len(),
+        23,
+        "miniz_oxide's size for this body (the oracle's is {})",
+        ORACLE.len()
+    );
+    assert_eq!(&stream[..2], &[120, 156], "the RFC 1950 header");
+    assert_eq!(
+        first_block_type(&stream[2..]),
+        2,
+        "a dynamic-Huffman block, where the oracle emits a fixed one"
+    );
+    assert_ne!(
+        &stream[..],
+        &ORACLE[..],
+        "the bodies must differ — this is the divergence"
+    );
+
+    // The trailer is the big-endian Adler-32 of the *payload*, so the stream is a
+    // conforming RFC 1950 stream whatever block the encoder chose. Both streams carry
+    // the same 2-byte header and the same trailer — only the body differs.
+    let trailer = u32::from_be_bytes(stream[stream.len() - 4..].try_into().expect("four bytes"));
+    assert_eq!(trailer, fx.adler32(&data), "the RFC 1950 Adler-32 trailer");
+    assert_eq!(
+        &ORACLE[..2],
+        &stream[..2],
+        "both streams open with the same RFC 1950 header"
+    );
+    assert_eq!(
+        &ORACLE[ORACLE.len() - 4..],
+        &stream[stream.len() - 4..],
+        "both streams close with the same Adler-32 trailer"
+    );
+
+    assert_eq!(
+        fx.uncompress(&stream).expect("this crate's stream"),
+        data,
+        "our own stream must inflate"
+    );
+    assert_eq!(
+        fx.uncompress(&ORACLE).expect("the oracle's stream"),
+        data,
+        "the oracle's fixed-Huffman stream must inflate here too"
+    );
+
+    // The same divergence for a medium body: `list_to_binary(lists:seq(1,100))` is a
+    // 108-byte fixed-Huffman stream in the oracle and a 111-byte stored-block stream here
+    // (miniz_oxide 0.9.1 at level 6); the round trip holds regardless.
+    let seq: Vec<u8> = (1..=100u8).collect();
+    let ours = fx.compress(&seq);
+    assert_eq!(
+        ours.len(),
+        111,
+        "miniz_oxide's size for this body (oracle: 108)"
+    );
+    assert_eq!(
+        fx.uncompress(&ours).expect("round trip"),
+        seq,
+        "the medium body must round-trip too"
+    );
 }
 
 #[test]

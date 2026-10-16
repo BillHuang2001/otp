@@ -44,11 +44,16 @@
 //! the single runtime thread — and it is the same limitation `beam_rt`'s driver-entry list already
 //! carries.
 //!
+//! # The statically linked built-ins
+//!
+//! The emulator links three drivers into the binary — [`STATIC_DRIVERS`] (`tcp_inet`, `udp_inet`,
+//! `ram_file_drv`). They carry no `dlopen` handle, so they cannot be registry entries (an entry owns
+//! a [`DriverLibrary`]); instead they are a pure constant the loading keys and `info/2` consult
+//! ([`is_static`]/[`static_names`]) to answer the C's `handle == NULL` branch. `loaded_drivers/0`
+//! reports them first, ahead of the dynamically loaded drivers.
+//!
 //! # Honest divergences from the C
 //!
-//! * **No statically linked built-ins.** The oracle's `loaded_drivers/0` lists the three drivers
-//!   linked into the emulator (`tcp_inet`, `udp_inet`, `ram_file_drv`); this runtime links none, so
-//!   a fresh registry is empty and only `dlopen`ed drivers appear.
 //! * **Unload is immediate.** The C's `try_unload` is a *pending* state machine (a reload/unload is
 //!   staged and completed by the scheduler); here the entry is removed at once and the
 //!   `DriverLibrary` drops synchronously.
@@ -65,7 +70,30 @@
 use std::cell::RefCell;
 
 use beam_abi::driver::loader::DriverLibrary;
-use beam_process::ProcessId;/// One successfully loaded driver.
+use beam_process::ProcessId;
+
+/// The three drivers the emulator links statically, in the oracle's list order
+/// (`tcp_inet`, `udp_inet`, `ram_file_drv`).
+///
+/// These are the `driver_list` entries whose `handle == NULL`
+/// (`erl_bif_ddll.c:282,545,728,743,752,775`). `erts_add_driver_entry`
+/// (`io.c:7650-7665`) prepends to `driver_list` and `erl_ddll_loaded_drivers_0`
+/// (`:666-687`) walks it front→back CONSing each name onto the front, so this
+/// insertion order is the order `loaded_drivers/0` reports: the three built-ins
+/// first, then the dynamically loaded drivers in load order.
+pub(crate) const STATIC_DRIVERS: [&str; 3] = ["tcp_inet", "udp_inet", "ram_file_drv"];
+
+/// Whether `name` names one of the statically linked built-in drivers.
+pub(crate) fn is_static(name: &str) -> bool {
+    STATIC_DRIVERS.contains(&name)
+}
+
+/// The statically linked driver names, in the oracle's list order.
+pub(crate) fn static_names() -> &'static [&'static str] {
+    &STATIC_DRIVERS
+}
+
+/// One successfully loaded driver.
 ///
 /// The `library` owns the `dlopen` handle: dropping the entry runs the driver's `finish` callback
 /// and closes the object (the C's `do_unload_driver_entry`).
