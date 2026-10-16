@@ -1846,9 +1846,12 @@ impl Evaluator<'_, '_> {
     ///
     /// Returns the number of bits the pattern consumed, or `None` when a segment does
     /// not match (including when not enough bits remain) — an Erlang pattern-match
-    /// failure, never an exception. Sized integer and `binary`/`bytes`/`bitstring`/
-    /// `bits` segments are supported; an unsized `binary`/`bitstring` segment takes the
-    /// remaining bits and must be last.
+    /// failure, never an exception. Every segment type is supported: an integer of any
+    /// width, a `float` field of 16/32/64 bits, a `binary`/`bytes`/`bitstring`/`bits`
+    /// slice, and `utf8`/`utf16`/`utf32` (an unsized `binary`/`bitstring` segment takes the
+    /// remaining bits and must be last). A segment the oracle itself rejects — a `float`
+    /// width other than 16/32/64, a malformed or truncated UTF sequence, a value it does not
+    /// accept — is a match failure too ([`bits_decode`]), never a raise.
     fn match_binary_segments(
         &mut self,
         segments: &[Seg],
@@ -1866,15 +1869,74 @@ impl Evaluator<'_, '_> {
                         Some(bits) => bits,
                         None => 8,
                     };
-                    if bits > 64 {
-                        return Err(Flow::Fatal(error::unsupported(
-                            "an integer binary pattern segment wider than 64 bits",
-                        )));
-                    }
                     if bits > remaining {
                         return Ok(None);
                     }
                     let term = self.integer_segment_term(bytes, offset_bits + consumed, bits, segment)?;
+                    if !self.match_pattern(&segment.value, term, env)? {
+                        return Ok(None);
+                    }
+                    consumed += bits;
+                }
+                Some(SegKind::Float) => {
+                    // An IEEE 754 field: `:16`/`:32`/`:64` (binary16/32/64) or, with no
+                    // `:Size`, the default 64 bits. `signed` is meaningless for a float and
+                    // ignored; `little`/`native` reverse the field's whole byte image.
+                    let bits = match self.segment_size_bits(segment, env, 1)? {
+                        Some(bits) => bits,
+                        None => 64,
+                    };
+                    if bits > remaining {
+                        return Ok(None);
+                    }
+                    // A width the oracle does not accept (`<<F:24/float>>`) fails the match
+                    // (`erts_bs_get_float_2`), rather than raising.
+                    let Some(value) = bits_decode::decode_float(
+                        bytes,
+                        offset_bits + consumed,
+                        bits,
+                        integer_segment_is_little(segment),
+                    ) else {
+                        return Ok(None);
+                    };
+                    let term = heap!(terms::make_float(self.ctx, value));
+                    if !self.match_pattern(&segment.value, term, env)? {
+                        return Ok(None);
+                    }
+                    consumed += bits;
+                }
+                Some(SegKind::Utf8) | Some(SegKind::Utf16) | Some(SegKind::Utf32) => {
+                    // A utf-type pattern segment with an explicit `:Size` or `unit:` does not
+                    // even parse on the oracle (`<<C:8/utf8>>` is a syntax error), so no
+                    // differential case can exist for one: report the typed capability gap
+                    // rather than fabricate a width.
+                    if bits::utf_segment_has_width(segment) {
+                        return Err(Flow::Fatal(error::unsupported(
+                            "a utf binary pattern segment with an explicit size or unit",
+                        )));
+                    }
+                    let little = integer_segment_is_little(segment);
+                    let decoded = match segment.kind {
+                        Some(SegKind::Utf8) => {
+                            bits_decode::decode_utf8(bytes, offset_bits + consumed)
+                        }
+                        Some(SegKind::Utf16) => {
+                            bits_decode::decode_utf16(bytes, offset_bits + consumed, little)
+                        }
+                        _ => bits_decode::decode_utf32(bytes, offset_bits + consumed, little),
+                    };
+                    // An overlong encoding, a surrogate, a code point past `16#10FFFF`, a
+                    // stray continuation byte or a truncated sequence does not match.
+                    let Some((code, bits)) = decoded else {
+                        return Ok(None);
+                    };
+                    // The decoder may look past the value's own window (the payload's last
+                    // byte can carry bits that are not part of it), so the sequence it read
+                    // must still fit in the bits that remain.
+                    if bits > remaining {
+                        return Ok(None);
+                    }
+                    let term = self.small(i64::from(code))?;
                     if !self.match_pattern(&segment.value, term, env)? {
                         return Ok(None);
                     }
@@ -1906,11 +1968,6 @@ impl Evaluator<'_, '_> {
                     }
                     consumed += bits;
                 }
-                _ => {
-                    return Err(Flow::Fatal(error::unsupported(
-                        "this binary pattern segment type",
-                    )))
-                }
             }
         }
         Ok(Some(consumed))
@@ -1918,9 +1975,20 @@ impl Evaluator<'_, '_> {
 
     /// The integer term an integer pattern segment of `bits` bits denotes.
     ///
-    /// Truncation/extension follows the segment's `signed`/endianness specifiers; a
-    /// value beyond the small-integer range is a documented Milestone-1 gap (a bignum is
-    /// not built), reported as `system_limit` rather than a wrong term.
+    /// The field is read in the segment's own endianness (`little`/`native` versus
+    /// `big`, [`integer_segment_is_little`]) and is exact for **any** width — one that is
+    /// neither a multiple of 8 nor of 64 included — so `<<A:65>>`, `<<A:72>>`,
+    /// `<<A:120>>`, `<<A:2/unit:8>>` and a `signed` field wider than 64 bits all match
+    /// exactly as the oracle does. A width of `0` is the integer `0`.
+    ///
+    /// `signed` reinterprets the field as a two's-complement integer of exactly `bits`
+    /// bits (`erts_bs_get_integer_2`'s sign extension, applied over the segment's own
+    /// width rather than over 64 bits): a set top bit makes the value `-(2^bits - raw)`.
+    ///
+    /// The value is materialised as a small int, a one-limb bignum or an exact multi-limb
+    /// bignum ([`terms::make_integer`], else [`beam_codec::term::make_big`]) — **never** a
+    /// `system_limit` raise and never a wrong term, because a `<<A:60>>`-shaped segment is
+    /// a bignum in OTP too.
     fn integer_segment_term(
         &mut self,
         bytes: &[u8],
@@ -1928,18 +1996,81 @@ impl Evaluator<'_, '_> {
         bits: usize,
         segment: &Seg,
     ) -> EResult<Eterm> {
-        let raw = if integer_segment_is_little(segment) {
-            read_bits_le(bytes, start, bits)
+        // A zero-width field (`<<A:0>>`) has no bits to read: it is the integer `0`.
+        if bits == 0 {
+            return Ok(heap!(terms::make_integer(self.ctx, 0)));
+        }
+        let little = integer_segment_is_little(segment);
+        let signed = segment.signed == Some(true);
+        // A field of at most one word — the overwhelmingly common case — is read straight
+        // into a `u64`: `read_bits_be` is bit-exact at any width, and the byte-wise
+        // `read_bits_le` at a whole number of bytes. Elsewhere — a width past a word, or a
+        // little-endian width whose trailing *partial* byte holds the field's high bits —
+        // [`bits_decode::read_integer_limbs`] supplies the magnitude limbs, and it is exact
+        // for every width.
+        let (magnitude, negative) = if bits <= 64 && (!little || bits % 8 == 0) {
+            let raw = if little {
+                read_bits_le(bytes, start, bits)
+            } else {
+                read_bits_be(bytes, start, bits)
+            };
+            if signed {
+                let value = sign_extend(raw, bits);
+                (vec![value.unsigned_abs()], value < 0)
+            } else {
+                // An unsigned 64-bit field with its top bit set is a one-limb bignum, which
+                // the materialisation below builds from this very magnitude.
+                (vec![raw], false)
+            }
         } else {
-            read_bits_be(bytes, start, bits)
+            let mut limbs = bits_decode::read_integer_limbs(bytes, start, bits, little);
+            // A `signed` segment whose top (bit `bits - 1`) bit is set denotes the negative
+            // of its two's-complement magnitude: negate within the field's own width.
+            let negative = signed && (limbs[(bits - 1) / 64] >> ((bits - 1) % 64)) & 1 == 1;
+            if negative {
+                for limb in &mut limbs {
+                    *limb = !*limb;
+                }
+                if bits % 64 != 0 {
+                    // The top limb is partial: drop the bits above the field before adding.
+                    let mask = (1u64 << (bits % 64)) - 1;
+                    if let Some(top) = limbs.last_mut() {
+                        *top &= mask;
+                    }
+                }
+                let mut carry = true;
+                for limb in &mut limbs {
+                    if !carry {
+                        break;
+                    }
+                    let (sum, overflow) = limb.overflowing_add(1);
+                    *limb = sum;
+                    carry = overflow;
+                }
+            }
+            (limbs, negative)
         };
-        if segment.signed == Some(true) {
-            return self.small(sign_extend(raw, bits));
+        let digits = trim_digits(&magnitude);
+        // A one-limb magnitude in `i64` range is exactly what `make_integer` materialises
+        // (a small int, or the oracle's one-limb bignum past the 60-bit small range).
+        if digits.len() == 1 {
+            let magnitude = digits[0];
+            let limit = if negative {
+                1u64 << 63
+            } else {
+                i64::MAX as u64
+            };
+            if magnitude <= limit {
+                let value = if negative {
+                    (magnitude as i64).wrapping_neg()
+                } else {
+                    magnitude as i64
+                };
+                return Ok(heap!(terms::make_integer(self.ctx, value)));
+            }
         }
-        match i64::try_from(raw) {
-            Ok(value) => self.small(value),
-            Err(_) => Err(self.raise(ExceptionClass::Error, "system_limit")),
-        }
+        let heap = self.ctx.eval_heap();
+        Ok(heap!(beam_codec::term::make_big(heap, negative, digits)))
     }
 
     /// The bitstring term for `bits` bits of `bytes` starting at `start`.
