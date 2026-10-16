@@ -82,10 +82,11 @@ const ENCODE_ALLOCS: u64 = 1;
 
 /// One `decode_term` into a fresh `Heap` + a fresh `AtomTable`.
 ///
-/// Exactly **14**: **4** the decoder's own per-container buffers plus **10** the `AtomTable`.
-/// The 3-tuple's element buffer is one `Vec` growth.
-/// The 5-pair map's pair buffer is two `Vec` growths.
-/// `beam_term::map::write_map`'s dedup-and-sort buffer is a third, which completes the 4.
+/// Exactly **13**: **3** the decoder's own per-container buffers plus **10** the `AtomTable`.
+/// Each container buffer is pre-sized from its wire count clamped to
+/// `CONTAINER_PREALLOC_CAP` (64), so each of them is one allocation:
+/// the 3-tuple's element buffer (3 slots), the 5-pair map's pair buffer (5 slots)
+/// and `beam_term::map::write_map`'s dedup-and-sort buffer.
 /// The payload's two lists are byte lists, so they arrive as `STRING_EXT` and build no buffer.
 /// The binary, the float and the smalls allocate nothing.
 /// The remaining **10** belong to the `AtomTable`: one shared `Arc<str>` per novel name (6).
@@ -94,16 +95,19 @@ const ENCODE_ALLOCS: u64 = 1;
 /// Both the ordered `names` view and the `index` map reference that one allocation.
 /// A per-term buffer added to the wire path would make it regress.
 /// So would an `intern` that materializes each name once per container again.
-const DECODE_FRESH_ALLOCS: u64 = 14;
+const DECODE_FRESH_ALLOCS: u64 = 13;
 
 /// One `decode_term` into a `Heap` + an `AtomTable` that already holds the atoms.
 ///
-/// Exactly **4** — the decoder's own allocation floor, the same 4 a fresh decode spends.
+/// Exactly **3** — the decoder's own allocation floor, the same 3 a fresh decode spends:
+/// one pre-sized buffer each for the tuple, the map pairs and `write_map`'s
+/// dedup-and-sort scratch.
 /// Every name the image carries is already interned.
 /// `AtomTable::intern` then takes its `index.get` early return and allocates nothing.
 /// The `AtomTable` share is therefore zero by construction.
-/// The way this regresses is a new per-container buffer in the decoder.
-const DECODE_WARM_ALLOCS: u64 = 4;
+/// The way this regresses is a new per-container buffer in the decoder, or a
+/// container buffer that grows again instead of being pre-sized.
+const DECODE_WARM_ALLOCS: u64 = 3;
 
 #[test]
 fn the_codec_allocation_counts_are_pinned() {
