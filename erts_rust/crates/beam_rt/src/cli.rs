@@ -32,7 +32,7 @@
 //! | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` directories) |
 //! | `-pz Dir` | add `Dir` to the code path (searched after) |
 //! | `+S N[:N]` | normal scheduler count (the first number) |
-//! | `-smp enable\|disable\|auto` | SMP scheduler model (only `disable` changes behaviour) |
+//! | `-smp enable\|disable\|auto` | SMP scheduler model (`disable` is refused in favour of `+S 1`; every other value leaves SMP on) |
 //! | `+A N` | async-thread pool size, preserved verbatim in `extra_emulator_flags` |
 //! | `+P N` | maximum number of processes |
 //! | `+hms N` | minimum heap size, in words (rounded through the growth table) |
@@ -67,9 +67,13 @@
 //!
 //! # Init arguments (`init:get_argument/1`), exactly as the oracle
 //!
-//! A switch that is **not** in the table above is **not** a usage error (real `erl`
-//! accepts unmodeled switches: `erl -noshell --nope -eval 'halt(0).'` exits 0), and
-//! only a **stray positional argument** is a usage error.
+//! A **`-`-switch** that is not in the table above is **not** a usage error (real `erl`
+//! accepts unmodeled `-`-switches: `erl -noshell --nope -eval 'halt(0).'` exits 0), so it
+//! is recorded and ignored. An **unrecognized `+`-flag** is different: the launcher
+//! rewrites it to `-X` for the emulator, which prints `unknown flag -X` and exits **1**
+//! (a *recognized* spelling such as `+Weird` stays accepted). A **plain positional
+//! argument** is accepted and ignored, never a usage error (the launcher forwards it to
+//! `init`, which accepts it).
 //!
 //! Which switches become **init arguments** follows the oracle exactly: a **`-`-switch**
 //! (recognized or not) is recorded, while a **`+`-flag** and the `-eval`/`-s`/`-run`
@@ -102,7 +106,7 @@
 //! |---|---|---|
 //! | `0` | success | — |
 //! | `1` | genuine runtime error (a load/execute/BIF failure), **and** a switch value the oracle's emulator/launcher rejects (`+t 2`, `+P 0`, `+sbt zz`, a `-env` with no operand, an unreadable `-config`) | the oracle-shaped one-line diagnostic, or `beam_rt: <error>` |
-//! | `2` | malformed invocation / usage error (a missing operand of a recognized switch, a stray positional argument, a malformed `run` spec) | `beam_rt: <error>` then [`USAGE`] |
+//! | `2` | malformed invocation / usage error (a missing operand of an ordinary `-`-switch, a malformed `run` spec) | `beam_rt: <error>` then [`USAGE`] |
 //! | `3` | unsupported (capability gap) | exactly one line, `beam_rt: unsupported: <reason>` |
 //!
 //! A malformed value of an **emulator switch** is exit 1, not exit 2: the oracle's
@@ -156,7 +160,8 @@ Switches:
   -pz DIR [DIR...]          add DIR(s) to the tail of the code path (after the system
                             directories; a missing dir is filtered out)
   +S N[:N]                  normal schedulers (total, and optionally the online count)
-  -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
+  -smp enable|disable|auto  SMP scheduler model (SMP stays on; 'disable' is refused in
+                            favour of +S 1)
   +A N                      async-thread pool size (preserved verbatim)
   +P N                      maximum number of processes (legacy, or 1024..=134217727)
   +Q N                      maximum number of ports (legacy, or 1024..=134217727)
@@ -292,17 +297,22 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 /// `-eval`/`-s`/`-run` Start instructions, are consumed by the emulator/`init` and are
 /// **not** init arguments (verified against OTP 29.1.1 / erts-17.1, where
 /// `init:get_argument('S'|'Q'|eval|s|run)` is the bare atom `error`). An unmodeled
-/// switch is never a usage error.
+/// `-`-switch is never a usage error.
 ///
 /// # Errors
 ///
 /// A message-carrying [`beam_common::BeamError`] naming the offending switch or
-/// argument. A **missing operand of a recognized switch**, a **malformed `run`
-/// spec/argument** and a **stray positional argument** are genuine usage errors
-/// (reported with [`USAGE`], exit code [`EXIT_USAGE`]). A **rejected emulator switch
-/// value** is *not* a usage error: [`error::bad_switch_value`] returns the
-/// flag-rejection kind ([`error::flag_rejected_diagnostic`]) and [`run`] reports it as
-/// exit 1 with a single diagnostic line and no [`USAGE`] block, matching the oracle. A malformed
+/// argument. A **missing operand of an ordinary `-`-switch** and a **malformed `run`
+/// spec/argument** are genuine usage errors (reported with [`USAGE`], exit code
+/// [`EXIT_USAGE`]). A **rejected emulator switch value** is *not* a usage error:
+/// [`error::bad_switch_value`] returns the flag-rejection kind
+/// ([`error::flag_rejected_diagnostic`]) and [`run`] reports it as exit 1 with a single
+/// diagnostic line and no [`USAGE`] block, matching the oracle. The same exit 1 covers the
+/// launcher's own rejections — an **unrecognized `+`-flag** ([`error::unknown_flag`]), a
+/// **missing operand of a `+`-switch** or of `-name`/`-sname`
+/// ([`error::missing_switch_operand`]) and the **refused `-smp disable`**
+/// ([`error::smp_disable_not_supported`]). A **plain positional argument** is accepted and
+/// ignored, never a usage error. A malformed
 /// `-eval` expression is *not* decided here — it is a capability gap detected when the
 /// expression is evaluated (exit code [`EXIT_UNSUPPORTED`], see [`crate::eval`]).
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
@@ -352,9 +362,17 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index = next;
             }
             "-name" | "-sname" => {
-                let value = value_of(args, index, argument)?;
+                // The launcher consumes the next token **blindly** (`erlexec.c:775-821`):
+                // `erl -name -env X Y ...` swallows `-env` as the name. Only a value that
+                // does not itself look like a switch is taken as this node's name; the
+                // launcher would reject such a name and force `isdistributed = 0`, which is
+                // a runtime-core fidelity gap (`M1_GAPS.md`), so only the exit status is
+                // matched here.
+                let value = plus_value_of(args, index, argument)?;
                 builder.record(argument, vec![value.clone()]);
-                builder.emulator.node_name = Some(value);
+                if !is_switch(&value) {
+                    builder.emulator.node_name = Some(value);
+                }
                 index += 2;
             }
             "-setcookie" => {
@@ -395,13 +413,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "+Q" => {
-                let value = value_of(args, index, "+Q")?;
+                let value = plus_value_of(args, index, "+Q")?;
                 builder.max_ports = flags::parse_max_ports("+Q", &value)?;
                 builder.preserve("+Q", &value);
                 index += 2;
             }
             "+K" => {
-                let value = value_of(args, index, "+K")?;
+                let value = plus_value_of(args, index, "+K")?;
                 // The emulator only `get_arg`s the value — there is **no** validation
                 // (`erl_check_io.c:2467`) — so every value is accepted, `+K bogus` and bare
                 // `+K` (which consumes whatever follows, blindly) included.
@@ -410,7 +428,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "+sbt" => {
-                let value = value_of(args, index, "+sbt")?;
+                let value = plus_value_of(args, index, "+sbt")?;
                 flags::parse_sbt("+sbt", &value)?;
                 builder.preserve("+sbt", &value);
                 index += 2;
@@ -419,7 +437,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // validated and preserved verbatim, so `atom_limit` can follow it
             // (`crate::info::limits`). Like every `+`-flag it is not an init argument.
             "+t" => {
-                let value = value_of(args, index, "+t")?;
+                let value = plus_value_of(args, index, "+t")?;
                 flags::parse_atom_table_size("+t", &value)?;
                 builder.preserve("+t", &value);
                 index += 2;
@@ -428,7 +446,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // negative value is rejected; `ets_limit` follows the value (see
             // `crate::info::limits`).
             "+e" => {
-                let value = value_of(args, index, "+e")?;
+                let value = plus_value_of(args, index, "+e")?;
                 flags::parse_ets_tables("+e", &value)?;
                 builder.preserve("+e", &value);
                 index += 2;
@@ -463,15 +481,15 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index = flags::parse_allocator(&args[index], args, index)?;
             }
             "+S" => {
-                let value = value_of(args, index, "+S")?;
+                let value = plus_value_of(args, index, "+S")?;
                 let (total, online) = parse_schedulers(&value)?;
                 builder.emulator.schedulers = total;
                 builder.online_schedulers = online;
                 index += 2;
             }
-            "-smp" => index = parse_smp_switch(args, index, &mut builder),
+            "-smp" => index = parse_smp_switch(args, index, &mut builder)?,
             "+A" => {
-                let value = value_of(args, index, "+A")?;
+                let value = plus_value_of(args, index, "+A")?;
                 // The async-thread pool is not modelled by the runtime core; it is
                 // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
                 // The emulator's reader is a bare `atoi`, so any value is accepted (junk
@@ -484,31 +502,31 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "+P" => {
-                let value = value_of(args, index, "+P")?;
+                let value = plus_value_of(args, index, "+P")?;
                 builder.emulator.max_processes = flags::parse_max_processes("+P", &value)?;
                 index += 2;
             }
             "+hms" => {
-                let value = value_of(args, index, "+hms")?;
+                let value = plus_value_of(args, index, "+hms")?;
                 builder.heap.set_min_heap_words(parse_heap_words("+hms", &value)?);
                 index += 2;
             }
             "+hmbs" => {
-                let value = value_of(args, index, "+hmbs")?;
+                let value = plus_value_of(args, index, "+hmbs")?;
                 builder
                     .heap
                     .set_min_bin_vheap_words(parse_heap_words("+hmbs", &value)?);
                 index += 2;
             }
             "+hmax" => {
-                let value = value_of(args, index, "+hmax")?;
+                let value = plus_value_of(args, index, "+hmax")?;
                 builder
                     .heap
                     .set_max_heap_words(parse_max_heap_size(&value)?);
                 index += 2;
             }
             "+hmaxk" | "+hmaxel" | "+hmaxib" => {
-                let value = value_of(args, index, argument)?;
+                let value = plus_value_of(args, index, argument)?;
                 builder.set_max_heap_flag(argument, &value)?;
                 index += 2;
             }
@@ -518,13 +536,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // value is taken verbatim — an unusable directory surfaces as a failed file
             // creation, not as a usage error (`PerfMap::error`), exactly as in the C.
             "+JPperf" => {
-                let value = value_of(args, index, "+JPperf")?;
+                let value = plus_value_of(args, index, "+JPperf")?;
                 builder.perf_map.set_flag(&value)?;
                 builder.preserve("+JPperf", &value);
                 index += 2;
             }
             "+JPperfdirectory" => {
-                let value = value_of(args, index, "+JPperfdirectory")?;
+                let value = plus_value_of(args, index, "+JPperfdirectory")?;
                 builder.perf_map.set_directory(value.clone());
                 builder.preserve("+JPperfdirectory", &value);
                 index += 2;
@@ -532,8 +550,24 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             "-s" => index = builder.parse_apply(args, index, "-s")?,
             "-run" => index = builder.parse_apply(args, index, "-run")?,
             "run" => index = parse_run_file(args, index, &mut builder)?,
-            other if is_switch(other) => index = builder.record_unmodeled(args, index),
-            other => return Err(error::unexpected_argument(other)),
+            // `-smpdisable` is the one-token spelling of the refused `-smp disable`.
+            "-smpdisable" => return Err(error::smp_disable_not_supported()),
+            // The `erlexec` default: an unrecognized `+X` is rewritten to `-X` and handed to
+            // the emulator, which prints `unknown flag -X` and exits **1** for a flag it has
+            // no `case` for (`erl_init.c:2488-2490`). A *recognized* spelling — and any
+            // `-`-switch — is recorded exactly as before.
+            other if is_switch(other) => {
+                if let Some(name) = other.strip_prefix('+') {
+                    if !flags::emulator_flag_recognized(name) {
+                        return Err(error::unknown_flag(other));
+                    }
+                }
+                index = builder.record_unmodeled(args, index);
+            }
+            // A plain positional token: the oracle's launcher forwards it to `init` as an
+            // ordinary argument, which is never a usage error (`erl junk -noshell ...` exits
+            // 0). This runtime ignores it, matching that status.
+            _ => index += 1,
         }
     }
     let code_paths = builder.code_paths();
@@ -732,6 +766,24 @@ fn value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
         .ok_or_else(|| error::missing_value(switch))
 }
 
+/// The operand of a **`+`-switch**, consumed **blindly**.
+///
+/// The oracle launcher's `NEXT_ARG_CHECK_NAMED` (`erts/etc/common/erlexec.c:414-418`, with
+/// `sep = "--"` at 193) rejects the switch only when it is the **last** token or the next
+/// token is exactly `--`; every other following token is taken as the value, even one that
+/// itself looks like a switch. So `erl +K -eval 'halt(0).'` consumes `-eval` as `+K`'s value
+/// (the `-eval` never runs) and exits 0, while `erl -noshell ... +K` and `erl +K -- ...`
+/// exit **1** with `Missing argument(s) for '+K'.`
+///
+/// That diagnostic is the launcher's, so the error is [`error::missing_switch_operand`] (a
+/// flag rejection, exit 1), **not** [`error::missing_value`] (this CLI's usage status).
+fn plus_value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
+    match args.get(index + 1) {
+        Some(next) if next != "--" => Ok(next.clone()),
+        _ => Err(error::missing_switch_operand(switch)),
+    }
+}
+
 /// `-eval` tolerates **one** trailing `.` (the shell-style statement terminator):
 /// `-eval '2+3.'` evaluates `2+3`.
 fn strip_trailing_dot(expr: &str) -> String {
@@ -926,22 +978,28 @@ fn apply_env_switches(args: &[String]) {
 
 /// Parses the `-smp` switch, returning the index of the next switch.
 ///
-/// `-smp` selects the runtime's scheduler model: `disable` turns SMP off
-/// ([`FeatureFlags::smp`](beam_common::FeatureFlags::smp) becomes `false`), while
-/// `enable`/`auto` leave it on (the default). The value is **optional** and any other
-/// value is accepted and recorded but changes nothing — this matches the oracle, which
-/// accepts `-smp` (with or without a value) and ignores every value but `disable`
-/// (`erl -noshell -smp bogus -eval 'halt().'` exits 0). The one documented divergence is
-/// `-smp disable`: real `erl` rejects it outright (`Argument '-smp disable' not supported.
-/// Use "+S 1" instead.`) whereas this runtime accepts it as the honest "SMP off" request.
+/// `-smp` selects the runtime's scheduler model. `disable` (and its one-token spelling
+/// `-smpdisable`) is **refused** exactly as the launcher refuses it — `Argument '-smp
+/// disable' not supported. Use "+S 1" instead.` (`erlexec.c:511-514`, `usage_notsup`),
+/// exit **1** — so SMP always stays on here. `enable`/`auto` and any other value are
+/// accepted and recorded but leave SMP on — this matches the oracle, which accepts `-smp`
+/// (with or without a value) and refuses only `disable` (`erl -noshell -smp bogus -eval
+/// 'halt().'` exits 0). The value is **optional**: a missing value (or one that itself
+/// looks like a switch) leaves SMP on too.
 ///
 /// The switch is recorded as an init argument exactly like every other switch, so a
 /// program can still observe its own command line (`init:get_argument(smp)`).
-fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> usize {
+fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> Result<usize> {
     let value = match args.get(index + 1) {
         Some(candidate) if !is_switch(candidate) => Some(candidate.clone()),
         _ => None,
     };
+    // `-smp disable` is refused by the launcher in favour of `+S 1`
+    // (`erlexec.c:511-514`, `usage_notsup`), exit **1**. Every other value — `enable`,
+    // `auto`, an unknown word and a missing value — is accepted.
+    if value.as_deref() == Some("disable") {
+        return Err(error::smp_disable_not_supported());
+    }
     let has_value = value.is_some();
     if let Some(value) = &value {
         if let Some(enabled) = parse_smp(value) {
@@ -949,11 +1007,7 @@ fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> usi
         }
     }
     builder.record("-smp", value.into_iter().collect());
-    if has_value {
-        index + 2
-    } else {
-        index + 1
-    }
+    Ok(if has_value { index + 2 } else { index + 1 })
 }
 
 /// The [`FeatureFlags::smp`](beam_common::FeatureFlags::smp) an `-smp` *value* selects, or
@@ -2013,30 +2067,40 @@ mod tests {
     }
 
     /// Unmodeled flags keep their behaviour when a modelled heap switch sits next to
-    /// them: a `+`-flag is accepted (and, for `+A`, preserved verbatim) but is not an init
-    /// argument, and parsing continues onto the next switch.
+    /// them: a *recognized* `+`-flag is accepted (and, for `+A`, preserved verbatim) but is
+    /// not an init argument, and parsing continues onto the next switch.
     #[test]
     fn unmodeled_flags_are_unaffected_by_the_heap_switches() {
-        let config = parsed(&["+hms", "1000", "+zzz", "1", "2", "+A", "16"]);
+        // `+Weird` is a *recognized* emulator spelling — `erlexec` rewrites it to
+        // `-Weird`, the `-W` warning-map switch (`erlexec.c:1098-1101`) — so it parses
+        // beside a modelled heap switch and leaves the run continuing.
+        let config = parsed(&["+hms", "1000", "+Weird", "1", "2", "+A", "16"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 1598);
-        assert_eq!(config.init_args.get("zzz"), None);
+        assert_eq!(config.init_args.get("Weird"), None);
         assert_eq!(
             config.emulator.extra_emulator_flags,
             vec!["+A".to_string(), "16".to_string()]
         );
         assert_eq!(config.init_args.get("hms"), None);
-        // An unrecognized flag on its own still boots (accepted, not a usage error).
-        assert_eq!(parsed(&["+Weird"]).heap_options(), &HeapOptions::default());
+        // An **unrecognized** `+X` on its own is the emulator's own rejection (`erlexec`
+        // rewrites it to `-X`, and `beam.smp` prints `unknown flag -X` and exits 1,
+        // `erl_init.c:2488-2490`) — never an accepted no-op, never a recorded init argument.
+        let error = parse_args(&["+zzz"]).expect_err("an unrecognized +X is refused");
+        assert_eq!(
+            error::flag_rejected_diagnostic(&error),
+            Some("unknown flag -zzz")
+        );
     }
 
     #[test]
     fn smp_switch_selects_the_scheduler_model() {
-        // `disable` turns SMP off; it is still recorded as an init argument.
-        let config = parsed(&["-smp", "disable"]);
-        assert!(!config.emulator.features.smp, "disable turns SMP off");
+        // The launcher refuses `-smp disable` outright in favour of `+S 1`
+        // (`erlexec.c:511-514`, `usage_notsup`): `Argument '-smp disable' not supported.
+        // Use "+S 1" instead.`, a flag rejection (exit 1), never a recorded init argument.
+        let error = parse_args(&["-smp", "disable"]).expect_err("-smp disable is refused");
         assert_eq!(
-            config.init_args.get("smp"),
-            Some(vec![&["disable".to_string()][..]])
+            error::flag_rejected_diagnostic(&error),
+            Some("Argument '-smp disable' not supported. Use \"+S 1\" instead.")
         );
         // `enable`/`auto` are the default (SMP on).
         assert!(parsed(&["-smp", "enable"]).emulator.features.smp);
@@ -2054,8 +2118,8 @@ mod tests {
         assert!(config.emulator.features.smp);
         assert_eq!(config.init_args.get("smp"), Some(vec![&[][..]]));
         // `-smp` consumes only its value: the following switch still parses.
-        let config = parsed(&["-smp", "disable", "+S", "2"]);
-        assert!(!config.emulator.features.smp);
+        let config = parsed(&["-smp", "enable", "+S", "2"]);
+        assert!(config.emulator.features.smp);
         assert_eq!(config.emulator.schedulers, Some(2));
     }
 
@@ -2297,10 +2361,10 @@ mod tests {
         );
         assert_eq!(config.emulator.schedulers, Some(3));
 
-        // A stray positional argument is still a *usage* error, not a capability gap.
-        let error = parse_args(&["junk"]).expect_err("stray argument");
-        assert!(error.to_string().contains("junk"), "{error}");
-        assert_eq!(error::unsupported_reason(&error), None);
+        // A plain positional argument is **accepted and ignored**, exactly as the oracle's
+        // launcher forwards it to `init` (`erl junk -noshell …` exits 0) — never a usage
+        // error (`erlexec.c`, the default `case`).
+        assert_eq!(parsed(&["junk"]).action, Action::Boot);
     }
 
     /// The A.6 configuration switches (`-setcookie`/`-config`/`-boot`): a `-`-switch, so
@@ -2584,10 +2648,31 @@ mod tests {
 
     #[test]
     fn a_usage_error_exits_with_the_usage_code() {
-        // A genuine usage error: a missing operand of a known switch and a stray
-        // positional argument.
+        // A genuine usage error: a missing operand of a known `-`-switch. A stray
+        // positional is *not* one — the oracle's launcher forwards it to `init` (exit 0).
         assert_eq!(run(vec!["-eval".to_string()]), EXIT_USAGE);
-        assert_eq!(run(vec!["junk".to_string()]), EXIT_USAGE);
+        assert_eq!(run(vec!["junk".to_string()]), EXIT_OK);
+    }
+
+    #[test]
+    fn an_unrecognized_plus_flag_is_rejected_by_the_emulator() {
+        // `erlexec` rewrites an unrecognized `+X` to `-X`; the emulator prints
+        // `unknown flag -X` and exits 1 for a flag it has no `case` for.
+        assert_eq!(run(vec!["+k".to_string()]), EXIT_RUNTIME);
+        assert_eq!(run(vec!["+YY".to_string()]), EXIT_RUNTIME);
+        // A *recognized* spelling (`-Weird` is the `-W` warning-map switch) is accepted.
+        assert_eq!(run(vec!["+Weird".to_string()]), EXIT_OK);
+    }
+
+    #[test]
+    fn smp_disable_is_refused_in_favour_of_plus_s() {
+        assert_eq!(
+            run(vec!["-smp".to_string(), "disable".to_string()]),
+            EXIT_RUNTIME
+        );
+        assert_eq!(run(vec!["-smpdisable".to_string()]), EXIT_RUNTIME);
+        // `enable`/`auto`/an unknown value and a missing value stay accepted.
+        assert_eq!(run(vec!["-smp".to_string(), "bogus".to_string()]), EXIT_OK);
     }
 
     #[test]

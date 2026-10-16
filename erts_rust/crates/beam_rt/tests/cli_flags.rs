@@ -427,9 +427,10 @@ fn every_env_flag_case_matches_the_oracle() {
 //   forwarded to the emulator, so it always exits 0.
 //
 // A rejected emulator-switch value is now **exit 1** (like the oracle's `beam.smp`), with a
-// one-line `beam_rt: …` diagnostic and **no** usage block; only a missing operand, a stray
-// positional argument and a malformed `run` spec remain exit 2. The table below therefore
-// pins `beam_rt`'s exact code (`rust_code`) alongside the acceptance comparison.
+// one-line `beam_rt: …` diagnostic and **no** usage block; only a missing operand of an
+// ordinary `-`-switch and a malformed `run` spec remain exit 2 (a plain positional argument
+// is accepted and ignored — exit 0). The table below therefore pins `beam_rt`'s exact code
+// (`rust_code`) alongside the acceptance comparison.
 
 /// The self-terminating probe for `init:get_argument(FLAG)`.
 fn argument_probe(flag: &str) -> String {

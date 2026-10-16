@@ -84,11 +84,13 @@ use crate::runner::{ProcessEntry, RunnerState};
 use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
 use crate::trace::TraceState;
+use self::timer_wakes::{TimerSlot, TimerWakes};
 
 pub(crate) mod executing;
 mod ets_owner;
 mod gc;
 mod scheduler;
+mod timer_wakes;
 
 pub use self::gc::GcStatsSnapshot;
 pub(crate) use self::gc::GcState;
@@ -448,6 +450,20 @@ pub struct Runtime {
     /// `beam_process::TimerService` (that wheel is driven by a thread, and the runtime is not
     /// `Send`).
     pub(crate) timers: Timers,
+    /// **Which pending deadline could wake which process** — the mirror of `timers` the run
+    /// route's wait/quiescence test reads (see [`crate::runtime::timer_wakes`]).
+    ///
+    /// The heap answers *when* the next deadline is; this answers *whom* it could wake, which
+    /// is what lets a `run` waiting for one process ignore a deadline aimed somewhere else
+    /// (the boot's own hourly `inet_db` housekeeping `Deliver`, for instance).
+    pub(crate) timer_wake_targets: TimerWakes,
+    /// The process [`Runtime::run_scheduled`] is waiting for, while it waits.
+    ///
+    /// `None` on every other route. While it is set, [`Runtime::is_quiescent`] and
+    /// [`Runtime::timer_wait`] consult [`Runtime::timer_wakes`] instead of the timer heap's
+    /// bare `next_deadline()` — a deadline that cannot wake this process is not a reason to
+    /// sleep a poll slice per round, nor to withhold the typed `blocked` diagnostic.
+    run_wake_pid: Option<ProcessId>,
     /// The **timed-out resume address** of every process whose finite `receive … after T`
     /// deadline has fired, keyed by pid.
     ///
@@ -817,6 +833,8 @@ impl Runtime {
             monitor_nodes: HashMap::new(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
+            timer_wake_targets: TimerWakes::default(),
+            run_wake_pid: None,
             timer_resumes: HashMap::new(),
             timer_wakes: Vec::new(),
             pending_spawns: Vec::new(),
@@ -1061,8 +1079,8 @@ impl Runtime {
     ///
     /// Scheduling and cancellation are the only operations the BIF floor needs; the
     /// deadlines themselves are fired by the scheduler loop (see [`Runtime::scheduler_pass`]).
-    pub(crate) fn timers_mut(&mut self) -> &mut Timers {
-        &mut self.timers
+    pub(crate) fn timers_mut(&mut self) -> TimerSlot<'_> {
+        TimerSlot::new(&mut self.timers, &mut self.timer_wake_targets)
     }
 
     /// Registers the **finite receive timeout** a process just parked on, returning the
@@ -1080,7 +1098,11 @@ impl Runtime {
         func: u32,
         pc: u32,
     ) -> TimerHandle {
-        self.timers.schedule_resume(delay, pid, func, pc)
+        let handle = self.timers.schedule_resume(delay, pid, func, pc);
+        // The wake record is what lets the run route tell this deadline — one that really can
+        // resume `pid` — from a deadline aimed at another process.
+        self.timer_wake_targets.note_resume(handle, pid);
+        handle
     }
 
     /// Cancels a receive deadline [scheduled](Runtime::schedule_receive_timeout) for a
@@ -1089,6 +1111,7 @@ impl Runtime {
     /// Cancelling a deadline that has already fired is a no-op: the process then resumes on
     /// its timed-out path, which is exactly the oracle's own timeout/message race.
     pub(crate) fn cancel_receive_timeout(&mut self, handle: TimerHandle) {
+        self.timer_wake_targets.forget_resume(handle);
         self.timers.cancel_handle(handle);
     }
 

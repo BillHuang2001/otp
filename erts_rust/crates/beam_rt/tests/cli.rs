@@ -178,7 +178,8 @@ fn a_bad_eval_expression_is_unsupported() {
 
 #[test]
 fn a_missing_switch_operand_is_a_usage_error() {
-    for args in [&["-eval"][..], &["-pa"][..], &["-name"][..]] {
+    // The CLI's own `-`-switches report their own usage status (2, with the block).
+    for args in [&["-eval"][..], &["-pa"][..], &["-pz"][..], &["-config"][..]] {
         let output = beam_rt(args);
         assert_eq!(
             output.status.code(),
@@ -191,10 +192,32 @@ fn a_missing_switch_operand_is_a_usage_error() {
 }
 
 #[test]
-fn a_stray_positional_argument_is_a_usage_error() {
+fn a_missing_operand_of_a_launcher_switch_is_a_flag_rejection() {
+    // `-name`/`-sname` and every `+`-switch are consumed by the `erl` launcher/emulator,
+    // whose `NEXT_ARG_CHECK` diagnostic is `Missing argument(s) for '<sw>'.` and exit
+    // **1**, with no `beam_rt` usage block.
+    for switch in [
+        "-name", "-sname", "+K", "+Q", "+A", "+P", "+S", "+t", "+e", "+hms", "+hmbs",
+        "+hmax", "+hmaxk", "+JPperf", "+JPperfdirectory",
+    ] {
+        let output = beam_rt(&[switch]);
+        assert_eq!(output.status.code(), Some(1), "{switch}: {}", stderr(&output));
+        let message = format!("Missing argument(s) for '{switch}'.");
+        assert!(
+            stderr(&output).contains(&message),
+            "{switch}: {}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("Usage:"), "{switch}");
+    }
+}
+
+#[test]
+fn a_stray_positional_argument_is_accepted() {
+    // The oracle's launcher forwards a plain token to `init`, so a stray positional is
+    // **not** a usage error (`erl junk -noshell …` exits 0). This runtime ignores it.
     let output = beam_rt(&["junk"]);
-    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains("Usage:"), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
 }
 
 #[test]

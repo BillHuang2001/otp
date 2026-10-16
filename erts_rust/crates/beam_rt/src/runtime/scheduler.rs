@@ -323,6 +323,31 @@ impl Runtime {
         }
         let pid = self.spawn_process(&name, function, args.to_vec())?;
         let deadline = Instant::now() + RUN_DEADLINE;
+        // Tell the pump **which** process it is waiting for, so a pending deadline only keeps
+        // the pass awake when it could actually wake that process (see
+        // [`Runtime::is_quiescent`] and [`Runtime::timer_wait`]). The previous marker is
+        // restored whatever the outcome, so a nested run cannot leak its own pid outward.
+        let previous = self.set_run_wake_pid(Some(pid));
+        let outcome = self.pump_run_to_completion(&name, function, arity, pid, deadline);
+        self.set_run_wake_pid(previous);
+        outcome
+    }
+
+    /// [`Runtime::run_scheduled`]'s pump body: step the scheduler until `pid`
+    /// **returned**, **raised**, **stalled** (nothing left that could wake it — see
+    /// [`Runtime::is_quiescent`]) or outlived `deadline`.
+    ///
+    /// The caller has already spawned `pid` and marked it as the run route's wait target
+    /// ([`Runtime::set_run_wake_pid`]); every arm returns exactly the value
+    /// [`Runtime::run_scheduled`] documents.
+    fn pump_run_to_completion(
+        &mut self,
+        name: &str,
+        function: &str,
+        arity: u32,
+        pid: ProcessId,
+        deadline: Instant,
+    ) -> Result<Eterm> {
         loop {
             if let Some(value) = self.process_result(pid) {
                 return Ok(value);
@@ -332,8 +357,7 @@ impl Runtime {
             }
             if Instant::now() >= deadline {
                 return Err(error::message(format!(
-                    "run: {}:{function}/{arity} did not terminate within {} ms",
-                    name,
+                    "run: {name}:{function}/{arity} did not terminate within {} ms",
                     RUN_DEADLINE.as_millis()
                 )));
             }
@@ -394,7 +418,14 @@ impl Runtime {
             Err(_) => return false,
             Ok(_) => {}
         }
-        self.timers.next_deadline().is_none()
+        match self.run_wake_pid {
+            // The `run` route waits for **one** process: only a deadline that could actually
+            // wake it counts as work (a `Deliver` to its pid or to a registered name, or its
+            // own `receive … after T`). Every other route keeps the bare heap test — any
+            // pending deadline is something it may have to fire.
+            Some(pid) => !self.timer_wake_targets.can_wake(pid),
+            None => self.timers.next_deadline().is_none(),
+        }
     }
 
     /// Records that a **heap-fragment** delivery woke `pid` (see
@@ -1007,6 +1038,14 @@ impl Runtime {
         if !policy.allows(waits) {
             return None;
         }
+        // The `run` route sleeps only for a deadline that can wake the process it waits for
+        // (see [`Runtime::is_quiescent`]): a boot kernel process's hourly housekeeping
+        // deadline must not make a ready `run` pay a poll slice, nor a stalled one spin.
+        if let Some(pid) = self.run_wake_pid {
+            if !self.timer_wake_targets.can_wake(pid) {
+                return None;
+            }
+        }
         let deadline = self.timers.next_deadline()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         let chosen = match policy {
@@ -1048,7 +1087,7 @@ impl Runtime {
     /// The process table's delivery errors (an allocation failure while copying the message
     /// onto the receiver's heap) — never a swallowed failure.
     fn fire_due_timers(&mut self, table: &mut ProcessTable) -> Result<usize> {
-        let fired = self.timers.take_due(Instant::now());
+        let fired = self.take_due_timers(Instant::now());
         let mut effects = 0;
         for timer in fired {
             match timer.action {
