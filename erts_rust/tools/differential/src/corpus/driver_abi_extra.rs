@@ -69,8 +69,9 @@
 //!   the whole vector), whose observable is the **bytes the owner receives** rather than a status
 //!   byte (`52`–`55`);
 //! * **the built-in driver name resolution** — `open_port({spawn_driver, "tcp_inet"}, Opts)`
-//!   resolves the name the emulator links in statically to a live driver port
-//!   ([`DRIVER_BUILTIN_MODULE_SOURCE`]; no C fixture);
+//!   resolves the name the emulator links in statically to a live driver port, and the port's
+//!   `port_info/1,2` view (`probe/1` and `info/1` over [`DRIVER_BUILTIN_MODULE_SOURCE`]; no C
+//!   fixture — its `port_info` key set / byte counters / `ports/0` membership / clean close);
 //! * **the remaining `ErlDrvTerm` operand tags** — the delivery family over `ERL_DRV_UINT`,
 //!   `ERL_DRV_INT64`, `ERL_DRV_UINT64`, `ERL_DRV_BINARY`, `ERL_DRV_MAP`, `ERL_DRV_TUPLE`,
 //!   `ERL_DRV_STRING_CONS`, `ERL_DRV_BUF2BINARY`, `ERL_DRV_EXT2TERM`, `ERL_DRV_FLOAT` and
@@ -99,7 +100,8 @@
 //!
 //! The **built-in-driver** cases use [`DRIVER_BUILTIN_MODULE_SOURCE`], which opens a driver port by
 //! a name the emulator itself owns; they carry no C fixture (`nif: None`), so they need no C
-//! compiler.
+//! compiler. Its `probe/1` encodes the open/name-resolution shape and its `info/1` encodes one
+//! `port_info/1,2` / `ports/0` observation of a live `tcp_inet` port.
 //!
 //! # The observable (honest, never asserted module-side)
 //!
@@ -181,6 +183,14 @@
 //!   the driver's own `ErlDrvData`, i.e. a pointer), while the Rust hook keeps the `DriverHost`
 //!   trait default, so the call answers `0`. A fabricated key is not *the* key, so no value is
 //!   pinnable even once the hook exists. Owner: `beam_rt` (`DriverHost::async_port_key`).
+//! * **the built-in drivers other than `tcp_inet`** — the oracle's `open_port/2` resolves *any* of
+//!   its statically linked drivers, so `{spawn_driver, "udp_inet"}` and `{spawn_driver,
+//!   "ram_file_drv"}` open live ports (measured: `erlang:port_info(P, name)` answers
+//!   `{name,"udp_inet"}` / `{name,"ram_file_drv"}`), while the Rust runtime's built-in registry
+//!   carries only `tcp_inet` and raises `badarg` for the other two — a divergence, so those two
+//!   names are **not** pinned here. `erl_ddll:loaded_drivers/0` diverges too: the oracle answers
+//!   `{ok,["tcp_inet","udp_inet","ram_file_drv"]}` and the Rust runtime `{ok,[]}`, so no
+//!   loaded-driver *membership* case is pinnable either. Owner: `beam_io` / `beam_rt`.
 //!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
@@ -1351,9 +1361,15 @@ const DRIVER_EXTRA: NifFixture = NifFixture::CompiledLibrary {
 /// divergence), never an exit-code-only difference. A refused/raised open is caught and encoded as
 /// `-1` for the same reason.
 ///
+/// The `info/1` entry point widens the same sub-family over a live built-in port's `port_info/1,2`
+/// view (`probe/1` only covers the open/name resolution): the sorted key set, the `input`/`output`
+/// byte counters, the `id` field's tuple size, membership in `erlang:ports/0` and a clean
+/// `port_close/1`. As in `probe/1` nothing is compared and nothing is raised — the integer is what
+/// the runtime did.
+///
 /// This sub-family needs **no** C fixture: it drives a name the emulator itself owns.
 const DRIVER_BUILTIN_MODULE_SOURCE: &str = r#"-module(driver_builtin).
--export([probe/1]).
+-export([probe/1, info/1]).
 
 %% Open a built-in emulator driver port and encode the observed open/resolution shape as an integer.
 %%
@@ -1383,6 +1399,42 @@ shape(P) ->
         true -> 1;
         false -> 0
     end.
+
+%% Open one live built-in `tcp_inet` port and encode one `port_info`/`ports` observation of it as a
+%% stable integer. As in `probe/1` nothing is compared and nothing is raised: the integer is what
+%% the runtime did, so a divergence shows up as a differing integer (a visible `Mismatch`).
+info(N) ->
+    try
+        P = open_port({spawn_driver, "tcp_inet"}, []),
+        Shape = info_shape(N, P),
+        _ = (catch erlang:port_close(P)),
+        Shape
+    catch
+        _:_ -> -1
+    end.
+
+%%   * 11 — the sorted `port_info/1` key set equals the seven keys the driver port reports;
+%%   * 12 — the `input` byte counter's value (a fresh port has read nothing);
+%%   * 13 — the `output` byte counter's value (a fresh port has written nothing);
+%%   * 14 — the tuple size of the `id` field (the node + serial pair);
+%%   * 15 — the port is a member of `erlang:ports/0`;
+%%   * 16 — `erlang:port_close/1` on the port answers `true`.
+info_shape(11, P) ->
+    bool(lists:sort([K || {K, _} <- erlang:port_info(P)]) =:= [connected,id,input,links,name,os_pid,output]);
+info_shape(12, P) ->
+    element(2, erlang:port_info(P, input));
+info_shape(13, P) ->
+    element(2, erlang:port_info(P, output));
+info_shape(14, P) ->
+    tuple_size(erlang:port_info(P, id));
+info_shape(15, P) ->
+    bool(lists:member(P, erlang:ports()));
+info_shape(16, P) ->
+    _ = erlang:port_close(P),
+    1.
+
+bool(true) -> 1;
+bool(false) -> 0.
 "#;
 
 /// Build one module-run case over [`DRIVER_EXTRA_MODULE_SOURCE`] with [`DRIVER_EXTRA`] as its
@@ -1457,6 +1509,33 @@ fn builtin_case(
             source: DRIVER_BUILTIN_MODULE_SOURCE,
             module: "driver_builtin",
             function: "probe",
+            arity: 1,
+            args: arg,
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The `info/1` twin of [`builtin_case`]: one observation of a live built-in `tcp_inet` port's
+/// `port_info/1,2` view, encoded as the oracle's own integer answer for `arg`.
+fn builtin_info_case(
+    id: &'static str,
+    description: &'static str,
+    arg: &'static [i64],
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::DriverAbi, Contract::BeamAsm],
+        kind: CaseKind::Module(ModuleRun {
+            source: DRIVER_BUILTIN_MODULE_SOURCE,
+            module: "driver_builtin",
+            function: "info",
             arity: 1,
             args: arg,
             nif: None,
@@ -1947,6 +2026,43 @@ pub(crate) fn group() -> Vec<Case> {
             &[2],
             "1",
         ),
+        // --- the built-in port's port_info/ports view (the `info/1` sub-family) -------------
+        builtin_info_case(
+            "driver_extra/builtin_tcp_inet_port_info_key_set",
+            "a live tcp_inet port reports exactly the seven port_info/1 keys connected/id/input/links/name/os_pid/output",
+            &[11],
+            "1",
+        ),
+        builtin_info_case(
+            "driver_extra/builtin_tcp_inet_port_info_input_counter",
+            "a freshly opened tcp_inet port's port_info(P,input) byte counter is zero",
+            &[12],
+            "0",
+        ),
+        builtin_info_case(
+            "driver_extra/builtin_tcp_inet_port_info_output_counter",
+            "a freshly opened tcp_inet port's port_info(P,output) byte counter is zero",
+            &[13],
+            "0",
+        ),
+        builtin_info_case(
+            "driver_extra/builtin_tcp_inet_port_info_id_tuple_size",
+            "a live tcp_inet port's port_info(P,id) field is a 2-tuple (node + serial)",
+            &[14],
+            "2",
+        ),
+        builtin_info_case(
+            "driver_extra/builtin_tcp_inet_is_a_member_of_ports",
+            "a live tcp_inet port is a member of erlang:ports/0",
+            &[15],
+            "1",
+        ),
+        builtin_info_case(
+            "driver_extra/builtin_tcp_inet_port_close_answers_true",
+            "erlang:port_close/1 on a live built-in tcp_inet port answers true",
+            &[16],
+            "1",
+        ),
     ]
 }
 #[cfg(test)]
@@ -1971,6 +2087,8 @@ mod tests {
     /// driver name the emulator itself links in, so they carry no C fixture.
     const BUILTIN_MODULE: &str = "driver_builtin";
     const BUILTIN_FUNCTION: &str = "probe";
+    /// The `info/1` twin of [`BUILTIN_FUNCTION`]: the built-in port's `port_info`/`ports` view.
+    const BUILTIN_INFO_FUNCTION: &str = "info";
 
     /// Whether `run` is a built-in-driver case rather than a fixture case.
     fn is_builtin(run: &ModuleRun) -> bool {
@@ -2019,7 +2137,14 @@ mod tests {
                     "case {}: a built-in-driver case needs no C fixture",
                     case.id
                 );
-                assert_eq!(run.function, BUILTIN_FUNCTION, "case {}", case.id);
+                assert!(
+                    run.function == BUILTIN_FUNCTION || run.function == BUILTIN_INFO_FUNCTION,
+                    "case {}: a built-in-driver case drives `{}` or `{}`, not `{}`",
+                    case.id,
+                    BUILTIN_FUNCTION,
+                    BUILTIN_INFO_FUNCTION,
+                    run.function
+                );
             } else {
                 assert_eq!(run.module, "driver_extra", "case {}", case.id);
                 assert_eq!(
@@ -2057,7 +2182,7 @@ mod tests {
             "every (module, selector) pair is distinct"
         );
         assert_eq!(sources.len(), 1, "the fixture sub-family rests on one C fixture");
-        assert_eq!(builtin, 2, "the two built-in-driver cases");
+        assert_eq!(builtin, 8, "the eight built-in-driver cases");
     }
     #[test]
     fn the_group_is_materially_larger_than_the_status_family_alone() {
@@ -2080,8 +2205,9 @@ mod tests {
     /// The status selectors answer the single status byte `'1'` (integer `49`), so their golden is
     /// `49`; the delivery selectors answer the base-256 value of the delivered term's ETF image —
     /// never `49`; the output-**payload** selectors answer the base-256 value of the bytes the
-    /// fixture emitted on the byte channel — never `49`; the built-in-driver cases answer the
-    /// observed open/resolution shape.
+    /// fixture emitted on the byte channel — never `49`; the built-in-driver `probe/1` cases answer
+    /// the observed open/resolution shape `1`, and its `info/1` cases answer an arbitrary stable
+    /// `port_info`/`ports` integer.
     #[test]
     fn the_goldens_are_the_status_byte_a_delivered_term_value_or_a_builtin_shape() {
         let mut status = 0;
@@ -2093,11 +2219,21 @@ mod tests {
             let golden = case.golden.stdout.unwrap();
             if is_builtin(&run) {
                 builtin += 1;
-                assert_eq!(
-                    golden, "1",
-                    "case {}: a resolved built-in driver port is the shape 1",
-                    case.id
-                );
+                if run.function == BUILTIN_INFO_FUNCTION {
+                    // The `port_info`/`ports` view: an arbitrary stable integer (the key-set
+                    // predicate `1`, a zero byte counter `0`, the `id` tuple size `2`, …).
+                    assert!(
+                        !golden.is_empty(),
+                        "case {}: the built-in info view must answer an integer",
+                        case.id
+                    );
+                } else {
+                    assert_eq!(
+                        golden, "1",
+                        "case {}: a resolved built-in driver port is the shape 1",
+                        case.id
+                    );
+                }
             } else if DELIVERY_SELECTORS.contains(&run.args[0]) {
                 deliveries += 1;
                 assert_ne!(
@@ -2124,7 +2260,7 @@ mod tests {
             PAYLOAD_SELECTORS.count(),
             "one output-payload case per selector"
         );
-        assert_eq!(builtin, 2, "the two built-in-driver cases");
+        assert_eq!(builtin, 8, "the eight built-in-driver cases");
     }
     /// The delivery family must actually cover the operand tags [`super::driver_abi`] left
     /// unexercised — `ERL_DRV_UINT`, `ERL_DRV_INT64`, `ERL_DRV_UINT64`, `ERL_DRV_BINARY`,
