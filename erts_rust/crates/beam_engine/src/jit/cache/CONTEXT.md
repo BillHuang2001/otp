@@ -31,5 +31,6 @@ Verified: no production path mutates a `Module`'s `functions`/`funs`/`records`/`
 - Integration test `../tests/jit_cache.rs::same_name_different_content_does_not_collide` clones a loaded module (inheriting its MD5), mutates it, and asserts a cache miss — false under the digest key by construction (post-load mutation is impossible in production). Needs the `tests/` owner to re-point it (e.g. give the clone a distinct checksum, or use synthetic modules as `tests.rs` does); `tests/` is a sibling of `src/` (read-only here).
 
 ## Routing Table
-- `mod.rs` → `CodeCache`, the per-thread `CODE_CACHE`, the `run_baseline_cached*` / `cached_module_blocks` / `remember_module` free functions, and `ModuleKey`.
+- `mod.rs` → `CodeCache`, the per-thread `CODE_CACHE`, the `run_baseline_cached*` / `cached_module_blocks` / `remember_module` free functions, and the `module_fingerprint` re-export.
+- `key.rs` → the key machinery: `CacheKey`/`ModuleKey` (+ `of`/`with_fingerprint`), the `module_fingerprint`/`HashWriter` fallback content hash, `digest_of`/`module_name`/`module_address`. Split out of `mod.rs` when the cache plus its key machinery exceeded the ~1000-line budget.
 - `tests.rs` → the counter tests (deterministic `fingerprint_calls()`, no wall-clock): real-module zero-rehash, digest-keyed artifact sharing, the synthetic fallback, and priming/entry-path coverage.

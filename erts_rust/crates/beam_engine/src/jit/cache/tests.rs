@@ -32,6 +32,7 @@
 //! (zero-checksum) module, which is what the fallback assertions pin.
 
 use super::*;
+use super::key::ModuleKey;
 use beam_loader::{load_file, Block, Instr, Label, Operand};
 use beam_term::{make_atom, make_small};
 

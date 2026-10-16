@@ -1678,7 +1678,8 @@ fn the_declined_collecting_value_shapes_raise_the_interpreters_badarg() {
 
 // -- (f.3) the static deopt is gone ----------------------------------------
 
-/// **The value accessors no longer cost a per-instruction interpreter step** — the/// structural pin of [`the_lowered_bif_fast_paths_record_no_static_deopt`], in its same two
+/// **The value accessors no longer cost a per-instruction interpreter step** — the
+/// structural pin of [`the_lowered_bif_fast_paths_record_no_static_deopt`], in its same two
 /// halves, for `erlang:byte_size/1` and `erlang:length/1` (whose `counters::variant_name`
 /// is `"Bif"`).
 ///
