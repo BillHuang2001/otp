@@ -33,8 +33,21 @@
 //! | allocations per message, bytes per message | a counting `#[global_allocator]` |
 //! | bytes touched per message | `2 · words · size_of::<Eterm>()` (read once + written once), asserted against the destination `used()` |
 //! | copy-vs-enqueue split | the counting allocator (and `Instant`) around `copy_struct` alone vs the whole `beam_message::send` |
+//! | the work stack's inline capacity and its spill bracket | a scan of `K`-element tuples, `K` pending fix-ups each (see below) |
 //!
-//! The write half of the bytes-touched figure is **asserted** (`used()` advances by exactly the
+//! # The two hard invariants this file now pins
+//!
+//! 1. **The copy path allocates nothing for a standard shape.** The fix-up worklist keeps its first
+//!    entries inline on the copy's own frame (`copy.rs`'s `WORK_INLINE`), so `copy_struct` on all
+//!    four shapes below — the 64-key HAMT map and its 21-node trie included — records **0**
+//!    allocation events, and so does a whole `send` onto a warm mailbox.
+//! 2. **A graph past the inline capacity spills at most once.** The spill probe copies a
+//!    `K`-element tuple of compound children (`K` pending fix-ups live at one instant) for every `K`
+//!    up to [`MAX_PROBE_CHILDREN`], *derives* the inline capacity as `first allocating K − 1`, and
+//!    asserts the bracket: zero allocations up to that capacity, exactly **one** up to twice it.
+//!    The capacity is therefore measured, not restated — a change to `WORK_INLINE` moves the
+//!    transition and the assertions follow it.
+//!//! The write half of the bytes-touched figure is **asserted** (`used()` advances by exactly the
 //! flat word count). The read half is a **model**, and its precondition is asserted too: every
 //! destination here starts with a fully empty off-heap table, which is exactly
 //! `copy.rs::is_fast_path_eligible` — so the copier takes its **single-pass** path (no preflight
@@ -350,6 +363,15 @@ const HEADROOM: usize = 64;
 /// How many times each counter window is measured; every repeat must produce identical counts.
 const REPEATS: usize = 8;
 
+/// The largest work-stack probe arity the spill scan tries (`1..=MAX_PROBE_CHILDREN`).
+///
+/// The scan *derives* the work stack's inline capacity from behaviour — the smallest arity whose
+/// copy allocates is the first arity past it — and then asserts the "one spill" bracket up to
+/// **twice** that capacity, so 96 covers the expected transition (33) and its bracket (64) with
+/// room to spare while keeping the scan cheap. A copy path whose inline capacity ever grew past
+/// this would make the scan find no transition at all and fail loudly on that expect, rather than
+/// silently asserting nothing.
+const MAX_PROBE_CHILDREN: usize = 96;
 /// Builds the list `[e0, e1, ...]` on `heap`, tail-first.
 fn build_list(heap: &mut Heap, elems: &[Eterm]) -> Eterm {
     let mut acc = NIL;
@@ -445,13 +467,33 @@ fn send_recv_payload(s: &mut Src) -> Eterm {
     write_map_term(&mut s.heap, &pairs, &s.atoms)
 }
 
+/// The **work-stack spill probe**: a tuple of `children` distinct *compound* elements, each a
+/// 2-element tuple of small ints.
+///
+/// A tuple is materialised in one step and then hands its children to the copier's worklist
+/// *before any of them is resolved*, so this shape holds exactly `children` pending fix-ups live on
+/// the work stack at one instant. That is the lever the probe below uses to turn the stack's inline
+/// capacity into a measurable allocation count — and because the shape is otherwise trivial (each
+/// popped child is a pair of immediates, which pushes nothing), the copy's total allocation count
+/// is the work stack's and nothing else.
+fn work_stack_probe(s: &mut Src, children: usize) -> Eterm {
+    let elems: Vec<Eterm> = (0..children)
+        .map(|i| {
+            let value = i as i64;
+            s.heap
+                .tuple(&[make_small(value), make_small(value + 1)])
+                .expect("the child tuple fits")
+        })
+        .collect();
+    s.heap.tuple(&elems).expect("the probe tuple fits")
+}
+
 /// A measured payload: how to build it and how many copies to time.
 struct Shape {
     name: &'static str,
     build: fn(&mut Src) -> Eterm,
     iterations: u32,
 }
-
 /// The measured shapes. The last is the `copy_bound` payload; the first three are the contrast
 /// cases (a single small object, a homogeneous cons chain, a many-node trie).
 const SHAPES: &[Shape] = &[
@@ -785,6 +827,31 @@ fn report_deterministic_counters_per_shape() {
             shape.name
         );
 
+        // The allocation-free invariant of the copy path: the fix-up worklist keeps its first
+        // entries inline on the copy's own frame (`copy.rs`'s `WORK_INLINE`), so **every** one of
+        // these shapes — the 64-key HAMT map with its 21-node trie included — copies without
+        // touching the allocator. A graph past the inline capacity spills once; see the spill probe
+        // below, which derives the capacity from behaviour instead of restating it here.
+        assert_eq!(
+            copy.allocs, 0,
+            "{}: the copy path must allocate nothing for a standard shape",
+            shape.name
+        );
+        assert_eq!(
+            copy.deallocs, 0,
+            "{}: an allocation-free copy frees nothing either",
+            shape.name
+        );
+
+        // ... and the whole per-message `send` is allocation-free once its mailbox exists: the
+        // copy, the off-heap drain, the `Message` build and `Queue::enqueue` together ask the
+        // allocator for nothing. (The cold-queue row's single allocation is the mailbox's first
+        // buffer, which a host pays once per mailbox, not once per message.)
+        assert_eq!(
+            send_warm.allocs, 0,
+            "{}: a send onto a warm mailbox must allocate nothing",
+            shape.name
+        );
         // Bytes touched = every source word read once + every destination word written once. The
         // `used()` advance asserted in the phases above is the written half.
         let touched_bytes = 2 * words * core::mem::size_of::<Eterm>();
@@ -872,6 +939,96 @@ fn report_deterministic_counters_per_shape() {
             warm.bytes,
             warm.bytes_per_alloc(),
             warm.deallocs
+        );
+    }
+
+    // (2b) The work-stack spill probe. `copy.rs`'s work stack keeps its first `WORK_INLINE` fix-ups
+    // inline and spills to a `Vec` (reserved at *twice* that capacity) beyond them; this scan
+    // derives that capacity from the allocation counts alone — the smallest probe arity whose copy
+    // allocates is the first arity past it — and then pins the bracket it implies: nothing below,
+    // exactly one allocation up to twice the capacity, more only past that.
+    println!();
+    println!(
+        "== work-stack spill probe (a K-element tuple of compound children = K pending fix-ups) =="
+    );
+    {
+        let mut probe: Vec<(usize, usize, Counters)> = Vec::new();
+        for children in 1..=MAX_PROBE_CHILDREN {
+            let mut src = Src::new();
+            // Building the probe is outside the counted window: only the copy is measured.
+            let term = work_stack_probe(&mut src, children);
+            let words = size_of_copy(term);
+            probe.push((children, words, count_copy(term, &src, words)));
+        }
+
+        let inline_capacity = probe
+            .iter()
+            .find(|(_, _, counters)| counters.allocs > 0)
+            .map(|(children, _, _)| children - 1)
+            .expect(
+                "a probe arity past the work stack's inline capacity must exist within \
+                 MAX_PROBE_CHILDREN — the capacity has grown past the scan",
+            );
+
+        for (children, _, counters) in &probe {
+            if *children <= inline_capacity {
+                assert_eq!(
+                    counters.allocs, 0,
+                    "a {children}-fix-up copy fits the {inline_capacity}-entry inline stack and \
+                     must not allocate"
+                );
+            } else if *children <= 2 * inline_capacity {
+                assert_eq!(
+                    counters.allocs, 1,
+                    "a {children}-fix-up copy is within twice the {inline_capacity}-entry inline \
+                     stack, so it must pay exactly ONE spill allocation"
+                );
+                assert_eq!(
+                    counters.deallocs, 1,
+                    "a {children}-fix-up copy frees exactly the one spill buffer"
+                );
+            }
+        }
+        // The counts can only grow with the graph, and they never grow faster than the graph's
+        // fix-up count (the spill doubles; it does not allocate per entry).
+        assert!(
+            probe.windows(2).all(|w| w[0].2.allocs <= w[1].2.allocs),
+            "the copy's allocation count must not fall as the worklist grows"
+        );
+        assert!(
+            probe
+                .iter()
+                .all(|(children, _, counters)| counters.allocs <= *children),
+            "the copy's allocation count cannot exceed the number of pending fix-ups"
+        );
+
+        println!(
+            "{:<10} {:>8} {:>9} {:>11} {:>10}",
+            "children", "words", "allocs", "bytes", "deallocs"
+        );
+        // Only the transitions: every other arity repeats its predecessor's row.
+        let mut previous: Option<usize> = None;
+        for (children, words, counters) in &probe {
+            let last = *children == MAX_PROBE_CHILDREN;
+            if previous != Some(counters.allocs) || last {
+                println!(
+                    "{:<10} {:>8} {:>9} {:>11} {:>10}",
+                    children, words, counters.allocs, counters.bytes, counters.deallocs
+                );
+                previous = Some(counters.allocs);
+            }
+        }
+        let first_spill = probe
+            .iter()
+            .find(|(children, _, _)| *children == inline_capacity + 1)
+            .expect("the first allocating arity was found");
+        println!(
+            "  derived inline capacity = {inline_capacity} fix-ups (the first arity that allocates \
+             is {}, its spill is {} B = {} entries x {} B)",
+            inline_capacity + 1,
+            first_spill.2.bytes,
+            2 * inline_capacity,
+            core::mem::size_of::<(*mut Eterm, Eterm)>()
         );
     }
 
