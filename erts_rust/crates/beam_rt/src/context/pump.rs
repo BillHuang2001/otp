@@ -896,9 +896,36 @@ mod in_process_compile {
         )
     }
 
+    /// The optional shard selection `BEAM_RT_SWEEP_SHARD=i/n`: keep only the sources whose 0-based
+    /// index in the sorted list is `i` modulo `n`.
+    ///
+    /// The corpus is one long sequential run, so the sweep can be measured in `n` independent
+    /// foreground shards whose printed summaries are aggregated. Each shard computes the oracle's
+    /// compilable set for its own sources, so a shard is self-consistent on its own and the shards
+    /// partition the corpus. A malformed value is a loud harness failure, never a silently
+    /// unfiltered run.
+    fn shard_selection() -> Option<(usize, usize)> {
+        fn malformed(value: &str) -> ! {
+            panic!("BEAM_RT_SWEEP_SHARD must be `i/n` with 0 <= i < n, got `{value}`");
+        }
+        let value = std::env::var("BEAM_RT_SWEEP_SHARD").ok()?;
+        let (index, count) = value.split_once('/').unwrap_or_else(|| malformed(&value));
+        let index: usize = index.trim().parse().unwrap_or_else(|_| malformed(&value));
+        let count: usize = count.trim().parse().unwrap_or_else(|_| malformed(&value));
+        if count == 0 || index >= count {
+            malformed(&value);
+        }
+        Some((index, count))
+    }
+
     /// **The full stdlib sweep** (A.9): every `lib/stdlib/src/*.erl` compiled **in-process** on
     /// the pumping `-eval` route, one fresh runtime per source, against the oracle's own
     /// compilable set for the identical option list.
+    ///
+    /// Setting `BEAM_RT_SWEEP_SHARD=i/n` restricts the run to the sources whose 0-based index in
+    /// the sorted list is `i` modulo `n` (see [`shard_selection`]), so the corpus can be measured as
+    /// `n` parallel foreground shards whose summaries are aggregated afterwards; without the
+    /// variable the whole corpus runs in one go.
     ///
     /// This is the corpus-scale measurement, not an iteration gate: it compiles every source
     /// (≈ 96 of them; tens of minutes of wall clock under the debug runtime on this host —
@@ -944,6 +971,17 @@ mod in_process_compile {
                 &format!("no real stdlib source tree at {}", src_dir.display()),
             );
             return;
+        };
+        let corpus_len = sources.len();
+        let shard = shard_selection();
+        let sources: Vec<(String, PathBuf)> = match shard {
+            Some((index, count)) => sources
+                .into_iter()
+                .enumerate()
+                .filter(|(position, _)| position % count == index)
+                .map(|(_, source)| source)
+                .collect(),
+            None => sources,
         };
 
         let started = Instant::now();
@@ -1032,13 +1070,20 @@ mod in_process_compile {
 
         eprintln!(
             "stdlib sweep: {} sources in {:.1} s; oracle compiled {}, in-process compiled {}, \
-             oracle-only {}, byte-mismatched {}",
+             oracle-only {}, byte-mismatched {}{}",
             sources.len(),
             started.elapsed().as_secs_f64(),
             oracle_ok.len(),
             rust_ok.len(),
             oracle_only.len(),
-            mismatched.len()
+            mismatched.len(),
+            match shard {
+                Some((index, count)) => format!(
+                    " [shard {index}/{count} of {corpus_len} sources; oracle-compiled and \
+                     in-process-compiled sets above are this shard's]"
+                ),
+                None => String::new(),
+            }
         );
         for failure in &failures {
             eprintln!("  residual: {failure}");
