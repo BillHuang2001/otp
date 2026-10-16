@@ -118,15 +118,12 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   bounds; `erl_drv_getenv` sets `size` on an absent key in the rust runtime;
   `driver_dl_error()`'s message length differs (33 vs 25); `driver_dl_open(NULL)` +
   `driver_dl_sym` SIGSEGVs the oracle.
+- The **static driver namespace** resolves only `tcp_inet` in the Rust runtime:
+  `open_port({spawn_driver, "udp_inet"}, [])` and `{spawn_driver, "ram_file_drv"}` open a live port in
+  the oracle (`erlang:port_info(P, name)` answers the driver name) but raise `error:badarg` in the Rust
+  runtime, so that port-open shape is unpinnable. Owner: `beam_rt` (driver lookup) / `crates/beam_io`.
 
 ## A.5 — distribution wire / ETF (owner: `beam_codec`, `beam_rt`)
-- `term_to_binary(Term, [local])` (the `LOCAL_EXT` wrapper) is a **closable** capability gap: the oracle
-  emits a `COMPRESSED`-wrapped `LOCAL_EXT` image (`<<131,109,…,…,121,…>>`, the 4-byte node hash differs
-  per VM start) while `beam_rt` raises its documented `beam_rt: unsupported: bif` (exit `3`).
-  `crates/beam_codec` already models `LOCAL_EXT`, so wiring the option into the `term_to_binary/2` BIF
-  in `crates/beam_rt` closes it. Deliberately kept out of `known-gaps.txt` (the allowlist is for
-  genuinely unclosable gaps): it stays unpinned until then, and the per-VM hash makes a byte golden
-  unpinnable even afterwards (assert the tag/shape).
 - A `[compressed]` image is byte-identical only for a term whose image compresses to a single
   stored block (e.g. `term_to_binary({ok,42}, [compressed])` matches exactly); beyond that the
   framing (`131,80`), the 32-bit uncompressed size and the trailing Adler-32 still match but the
@@ -282,14 +279,35 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 
 ## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
 - Plain `-extra`/`--` arguments are unusable through the harness; a repeated `-eval` is recorded
-  verbatim where `init:get_argument(eval)` -> `error`; an unbound `-eval` variable is a loud error
+  verbatim where `init:get_argument(eval)` -> `error`; an **extra `-eval <instr>` instruction** ahead of
+  the probe's own `-eval` is evaluated by the oracle first (its side effects are observable — a
+  `put(marker,seen)` instruction is read back by the probe, and a printing one emits its output) while
+  the Rust runtime evaluates only the last `-eval`; an unbound `-eval` variable is a loud error
   vs silent.
+- A **non-switch (positional) argv token** before the probe (`erl -noshell foo -eval <probe>`) stops the
+  oracle's switch parsing and enters the interactive shell — the version banner + `Eshell V17.1 …`,
+  never the probe, then `*** Terminating erlang (nonode@nohost)` at stdin EOF, exit `0` — where the Rust
+  runtime ignores the stray token and RUNS the probe (exit `0`, probe output).
+- A `+`-flag with a **missing operand** (bare `+K`) takes the same banner/`Terminating` route in the
+  oracle (exit `0`, no probe output); the Rust runtime produces empty stdout, exit `0`.
+- `-extra foo`: the oracle prints a SIGTERM info report and **hangs** (no exit within a 20 s timeout);
+  the Rust runtime exits `0`.
+- `-env Var` with a single value (and `-env` with no value pair): the oracle prints its banner and
+  terminates (single value) or hangs (no pair); the Rust runtime ignores the switch and runs the probe
+  (the two-token `-env Var Value` shape is the separate entry below).
+- Unknown/unsupported-flag **stderr** shapes are not byte-comparable (stdout + exit agree): `+k` →
+  oracle `unknown flag -k` + the full ~7.4 KB usage, rust `beam_rt: unknown flag -k` (~25 B);
+  `+smp enable` → oracle `bad scheduling option -smp` + usage; `-smp disable` → oracle
+  `Argument '-smp disable' not supported. Use "+S 1" instead.`. Unpinnable: the abort leaves stdout
+  empty (a corpus case needs a non-empty stdout golden) and stderr is compared only for expression cases.
 - `+hmax` overflow: the oracle **kills the process** where the rust evaluator raises
   `error:system_limit`; only the tiny bounded-allocation case is pinned.
 - A large `-eval` iolist raises `error:out_of_memory` in the rust evaluator, so `iolist_size/1`'s
   bignum promotion is not observable and has no case.
 - The `ERL_*FLAGS` merge **order** IS pinned (`flags/env_*`); `ERL_OTP<sysver>_FLAGS` (29 vs 30) and
-  an `-eval` carried by `ERL_FLAGS`/`ERL_AFLAGS` are deliberately not.
+  an `-eval` or `-env VAR VALUE` carried by `ERL_FLAGS`/`ERL_AFLAGS` are deliberately not: the oracle
+  **applies** both (the carried `-eval` runs, the variable reaches the child) where the Rust runtime
+  does not.
 - `-config <missing path>`: both runtimes exit `1` with empty stdout, but the **stderr text
   differs** — the oracle writes `Could not start kernel pid (application_controller) ("error in
   config file \"<path>\" (none): configuration file not found")` plus a crash-dump line, the Rust
@@ -348,9 +366,10 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 ## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
 - `erl_ddll:loaded_drivers/0`'s **list contents** differ: the oracle lists its statically linked
   `["tcp_inet","udp_inet","ram_file_drv"]` (the entries are *strings*, not atoms), the Rust runtime
-  answers `[]`. The members are therefore unpinnable; `ddll.rs` pins only order-stable shapes of
-  the result (`{ok, List}`, the 2-tuple, `is_list/1`, an all-strings fold and a filtered
-  projection that is empty on both).
+  answers `{ok, []}` — its driver namespace holds only `tcp_inet`, the one name
+  `open_port({spawn_driver, _}, [])` resolves (§A.4). The members are therefore unpinnable; `ddll.rs`
+  pins only order-stable shapes of the result (`{ok, List}`, the 2-tuple, `is_list/1`, an all-strings
+  fold and a filtered projection that is empty on both).
 - `erl_ddll:try_load(".", "tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but the
   generic `{error,{open_error,-10}}` in the Rust runtime.
 - `erl_ddll:try_unload("tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but
@@ -402,3 +421,23 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `code:*` and the registered-name manifest are observed live rather than stubbed; the remaining
   boot/init divergences are recorded with the other introspection entries above (A.8 / A.9
   "preloaded / boot").
+
+## A.9 — code server (owner: `beam_rt`)
+- `code:load_binary(Mod, Path, Binary)` raises `error:undef` in the Rust runtime (the BIF is not
+  implemented) where the oracle answers `{module, Mod}` for a valid image and `{error, badfile}` for a
+  bad one — measured `code:load_binary(mymod, "/x/mymod.beam", <<>>)`: oracle `{error,badfile}` exit `0`,
+  Rust `exception error undef` exit `1`. A plain reason, so a case pinning it would be a `mismatch`;
+  it stays unpinned until the BIF lands.
+- `code:fetch_loaded/1` is **not exported** by the Rust `code` module
+  (`erlang:function_exported(code, fetch_loaded, 1)` is `false` there); the `init:fetch_loaded/0` form
+  IS served and agrees.
+
+## A.2 — term/ETF image (owner: `beam_bifs`)
+- `term_to_binary(Term, [local])` (the `LOCAL_EXT` wrapper) is a **closable** capability gap: the oracle
+  emits a `COMPRESSED`-wrapped `LOCAL_EXT` image (`term_to_binary(1, [local])` →
+  `<<131,109,0,0,0,8,131,121,…>>`; the 4-byte node hash inside differs per VM start) while `beam_rt`
+  raises its documented `beam_rt: unsupported: bif` (exit `3`), so a case pinning it is at worst an
+  `unsupported`, never a `mismatch`. `crates/beam_codec` already models `LOCAL_EXT`; wiring the option
+  into the `term_to_binary/2` BIF closes it. Deliberately kept **out of `known-gaps.txt`** — the
+  allowlist records only genuinely unclosable gaps — and it stays unpinned until then (the per-VM hash
+  makes a byte golden unpinnable even afterwards; assert the tag/shape).
