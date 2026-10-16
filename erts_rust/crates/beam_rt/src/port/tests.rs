@@ -2713,6 +2713,63 @@ fn collect_line_frames(rt: &mut Runtime, port: PortId, bound: Duration) -> Vec<(
     panic!("no `{{exit_status, _}}` frame for {port:?} within {bound:?}; got {frames:?}");
 }
 
+/// The arrival-order **kind sequence** of the messages the runtime's port poller produced for
+/// `port`: `'s'` for a `{Port, {exit_status, _}}` report and `'d'` for every `{Port, {data, …}}`
+/// message.
+///
+/// [`collect_line_frames`] deliberately reduces the data frames to their `{eol|noeol, Data}` body
+/// and drops the status report, so it *cannot* observe the order **between** the two kinds — which
+/// is exactly the observable a reaped child's end-of-stream line flush is about (see
+/// `the_trailing_noeol_flush_is_delivered_after_the_exit_status`). This collector keeps both, in
+/// arrival order. A message of neither kind (the port's own `'EXIT'`) is ignored, as the oracle
+/// probe's catch-all clause ignores it.
+///
+/// The collection ends once the status has arrived **and** a further round produced nothing, so a
+/// flush delivered *after* the status is still observed rather than cut off at the status.
+fn collect_message_kinds(rt: &mut Runtime, port: PortId, bound: Duration) -> String {
+    // The `data`/`exit_status` names are interned into the runtime's own table by the message
+    // builders, so they are resolved there — the same table, hence the same indices the built
+    // messages name (see [`collect_line_frames`]).
+    let (data_atom, exit_atom) = {
+        let atoms = rt.code_server_atoms_mut();
+        (atoms.intern("data"), atoms.intern("exit_status"))
+    };
+    let deadline = Instant::now() + bound;
+    let mut kinds = String::new();
+    let mut exited = false;
+    while Instant::now() < deadline {
+        let messages = {
+            let mut ctx = RuntimeContext::new(&mut *rt);
+            ctx.poll_port_messages(Duration::from_millis(50))
+                .expect("the port poll must not fail")
+        };
+        if messages.is_empty() {
+            // Nothing more is coming: the stream is complete once the status has been taken.
+            if exited {
+                return kinds;
+            }
+            continue;
+        }
+        for message in messages {
+            // A message that is not a `{Port, {…}}` pair at all — the port's own `'EXIT'` — says
+            // nothing about the order under test.
+            let Ok(inner) = terms::tuple_element(message, 1) else {
+                continue;
+            };
+            let Ok(tag) = terms::tuple_element(inner, 0) else {
+                continue;
+            };
+            if tag == make_atom(exit_atom) {
+                exited = true;
+                kinds.push('s');
+            } else if tag == make_atom(data_atom) {
+                kinds.push('d');
+            }
+        }
+    }
+    panic!("no `{{exit_status, _}}` message for {port:?} within {bound:?}; got {kinds:?}");
+}
+
 /// The oracle expression that collects a child's whole line-frame sequence: every
 /// `{data, {eol|noeol, D}}` frame in arrival order, ignoring the port's other messages (the
 /// `exit_status` report and the port's own `'EXIT'`), until a quiet second elapses.
@@ -2729,6 +2786,26 @@ fn oracle_line_frames_expr(command: &str, options: &str) -> String {
         "), F = fun F(A) -> receive {P,{data,{eol,D}}} -> F(A ++ [{eol,D}]); ",
         "{P,{data,{noeol,D}}} -> F(A ++ [{noeol,D}]); _ -> F(A) after 1000 -> A end end, ",
         "io:format(\"~w\",[F([])]) end",
+    ]
+    .concat()
+}
+
+/// The oracle expression that reports a child's `{Port, …}` messages as an **arrival-order**
+/// string: `"d"` per `{data, _}` message, `"s"` per `{exit_status, _}`, and nothing for any other
+/// message (the port's own `'EXIT'`).
+///
+/// [`oracle_line_frames_expr`] is blind to that order, because it collects only the data frames;
+/// this one keeps both kinds. The quiet second after the last message is what lets a trailing
+/// `noeol` flush delivered *after* the status be observed.
+fn oracle_message_kinds_expr(command: &str, options: &str) -> String {
+    [
+        "begin P = open_port({spawn,\"",
+        command,
+        "\"},",
+        options,
+        "), F = fun F(A) -> receive {P,{data,_}} -> F(A ++ \"d\"); ",
+        "{P,{exit_status,_}} -> F(A ++ \"s\"); {_P,_E} -> F(A); ",
+        "_ -> F(A) after 1000 -> A end end, io:format(\"~s\",[F([])]) end",
     ]
     .concat()
 }
@@ -2806,8 +2883,57 @@ fn a_real_childs_lines_are_delivered_as_eol_and_noeol_frames() {
     }
 }
 
-/// `[binary, line]` sets **both** state bits, so each frame's payload is a binary where the
-/// list stream's is a char list — the frame boundaries are identical.
+/// The `{Port, {exit_status, Status}}` of a reaped child is delivered **before** that child's
+/// end-of-stream `noeol` flush, deterministically — the oracle's own order, which the C fixes by
+/// reporting the status (`driver_report_exit`) and only then releasing the child's trailing partial
+/// line (`driver_failure_eof` → `flush_linebuf_messages`), both from the one `ready_input` call the
+/// child's exit triggers (`erts/emulator/sys/unix/sys_drivers.c:1250-1252`).
+///
+/// The child is the reproducer's: it writes a partial line and exits, so the round that observes the
+/// end of its stream has **both** messages pending — the only state in which the two orders are a
+/// race at all (take the status before the flush and they arrive `[s,d]`; append the status after
+/// the round's flush and they arrive `[d,s]`). Repeated ten times, because "usually `[s,d]`" is not
+/// the oracle's behaviour: the order must not depend on whether the child happened to be reaped
+/// before the round's poll or during it.
+#[test]
+fn the_trailing_noeol_flush_is_delivered_after_the_exit_status() {
+    if !shell_available() {
+        skip_line_test("the `exit_status`/`noeol` delivery order");
+        return;
+    }
+    // `printf 'xx'` writes a partial line (no newline) and exits. That is the reproducer's
+    // observable too: `{spawn, Cmd}` runs the command line through `/bin/sh -c "exec …"`, so the
+    // reproducer's `printf "xx"; sleep 0.4; printf "\n"` child has `printf` run as a shell
+    // *builtin* under that `exec` — which ends the child right after `xx`, leaving the `sleep` and
+    // the second `printf` unrun. Stating the command this way keeps the child shape (a partial
+    // line released at end-of-stream, plus a reaped child) independent of that shell detail.
+    let command = "printf 'xx'";
+    let mut h = LineHarness::new();
+    for run in 0..10 {
+        // A fresh port each run: the fixture's hook (and so its metadata table) is rebuilt per
+        // `open`, and this runtime keeps a child's port open until an explicit close, so every run
+        // observes a brand-new child — never a leftover.
+        let options = option_list(&mut h.fx, &["line", "binary", "exit_status"], &[]);
+        let port = h.open(command, options);
+        let kinds = collect_message_kinds(&mut h.runtime, port, Duration::from_secs(10));
+        assert_eq!(
+            kinds, "sd",
+            "run {run}: a reaped child's `{{exit_status, _}}` must be delivered before the \
+             trailing `noeol` flush of the partial line it wrote (the oracle's order)"
+        );
+    }
+    // Oracle cross-check: the real runtime delivers that same order for this child.
+    let expr = oracle_message_kinds_expr(command, "[line,binary,exit_status]");
+    match erl_eval(&expr) {
+        Some(oracle) => assert_eq!(
+            oracle, "sd",
+            "the oracle's own delivery order for a reaped child's end-of-stream flush"
+        ),
+        None => skip_oracle_check("the `exit_status`/`noeol` delivery order"),
+    }
+}
+
+/// `[binary, line]` sets **both** state bits, so each frame's payload is a binary where the/// list stream's is a char list — the frame boundaries are identical.
 #[test]
 fn a_binary_line_stream_renders_each_frame_as_a_binary() {
     if !shell_available() {
@@ -2944,4 +3070,299 @@ fn a_rejected_line_option_list_opens_no_port() {
         h.runtime.ports.borrow().is_empty(),
         "a rejected option list must not register a port"
     );
+}
+
+
+// --- the `open_port/2` line-option matrix and the line-frame sequences (contract A.4) ----
+//
+// Every expected value below is the **live oracle's** (system `erl`, OTP 29.1.1 / erts-17.1),
+// collected by [`oracle_line_frames_expr`]/[`oracle_line_sizes_expr`] and compared
+// frame-by-frame. The tests reuse the [`LineHarness`]/[`collect_line_frames`] machinery above
+// rather than duplicating that ~120-line harness into a separate integration file.
+
+/// The `open_port/2` option shapes the live oracle accepts vs rejects — the strict whitelist
+/// and the two **order-independent** mutual-exclusion rules, cross-checked shape by shape
+/// (`erl -noshell -eval 'open_port({spawn,"true"},Opts)'`; six `error:badarg`, fifteen `ok`).
+#[test]
+fn the_open_port_line_option_matrix_matches_the_oracle() {
+    let mut fx = fixture();
+    let line = fx.atom("line");
+    let stream = fx.atom("stream");
+    let stderr_to_stdout = fx.atom("stderr_to_stdout");
+    let use_stdio = fx.atom("use_stdio");
+    let nouse_stdio = fx.atom("nouse_stdio");
+    let binary = fx.atom("binary");
+    let exit_status = fx.atom("exit_status");
+    let eof = fx.atom("eof");
+    let in_atom = fx.atom("in");
+    let out = fx.atom("out");
+    let hide = fx.atom("hide");
+    let packet2 = packet_pair(&mut fx, make_small(2));
+
+    // --- the six shapes the oracle rejects with `error:badarg` ---
+    // line framing cannot also be packet-framed, and a redirected stderr needs `use_stdio`…
+    let rejected = [
+        fx.list(&[line, packet2]),
+        fx.list(&[line, stderr_to_stdout, nouse_stdio]),
+    ];
+    for options in rejected {
+        assert_badarg(fx.hook.port_options(options));
+    }
+    // …a `{line, N}` must be a **positive integer**…
+    for value in [make_small(0), make_small(-1), fx.atom("nope")] {
+        let pair = line_pair(&mut fx, value);
+        let options = fx.list(&[pair]);
+        assert_badarg(fx.hook.port_options(options));
+    }
+    // …and a whitelisted tuple tag with the wrong arity is not a usable option.
+    let tag = fx.atom("line");
+    let ternary = fx.heap.tuple(&[tag, make_small(4), make_small(5)]).expect("a 3-tuple");
+    let options = fx.list(&[ternary]);
+    assert_badarg(fx.hook.port_options(options));
+
+    // --- the fifteen shapes the oracle accepts ---
+    let pair7 = line_pair(&mut fx, make_small(7));
+    let pair5 = line_pair(&mut fx, make_small(5));
+    let parallelism = {
+        let tag = fx.atom("parallelism");
+        let value = fx.atom("true");
+        fx.heap.tuple(&[tag, value]).expect("a {parallelism,true} option")
+    };
+
+    // A bare `line` is the oracle's default 512 (the `linebuf`).
+    let options = fx.list(&[line]);
+    let parsed = fx.hook.port_options(options).expect("[line] is accepted");
+    assert_eq!(parsed.line, Some(512));
+    // `[line, {packet, 2}, stream]` — `stream` cancels the packet framing, so this is legal.
+    let options = fx.list(&[line, packet2, stream]);
+    let parsed = fx.hook.port_options(options).expect("[line,{packet,2},stream] is accepted");
+    assert_eq!(parsed.line, Some(512));
+    // `[line, stderr_to_stdout, use_stdio]` — the second exclusion's valid partner.
+    let options = fx.list(&[line, stderr_to_stdout, use_stdio]);
+    fx.hook
+        .port_options(options)
+        .expect("[line,stderr_to_stdout,use_stdio] is accepted");
+    // `[line, stderr_to_stdout]` — `use_stdio` defaults to `true`, so this is legal too.
+    let options = fx.list(&[line, stderr_to_stdout]);
+    fx.hook.port_options(options).expect("[line,stderr_to_stdout] is accepted");
+    // `[line, {line, 7}]` — the explicit length wins (last-wins).
+    let options = fx.list(&[line, pair7]);
+    let parsed = fx.hook.port_options(options).expect("[line,{line,7}] is accepted");
+    assert_eq!(parsed.line, Some(7));
+    // `[{line, 7}, line]` — the later bare `line` resets the length to the default 512, and
+    // the line state bit is still set (`port_flags() == 2` = `PORT_FLAG_LINE`).
+    let options = fx.list(&[pair7, line]);
+    let parsed = fx.hook.port_options(options).expect("[{line,7},line] is accepted");
+    assert_eq!(parsed.line, Some(512));
+    assert_eq!(parsed.port_flags(), 2, "the line state bit");
+    // The rest of the accepted shapes (a flag, a whitelisted inert atom, an inert tuple).
+    let extras = [
+        fx.list(&[binary, line]),
+        fx.list(&[line, eof]),
+        fx.list(&[line, in_atom]),
+        fx.list(&[line, out]),
+        fx.list(&[line, hide]),
+        fx.list(&[line, parallelism]),
+        fx.list(&[line, use_stdio]),
+        fx.list(&[line, nouse_stdio]),
+        fx.list(&[line, binary, exit_status, pair5]),
+    ];
+    for options in extras {
+        fx.hook
+            .port_options(options)
+            .unwrap_or_else(|error| panic!("the oracle accepts {options:?}: {error}"));
+    }
+}
+
+/// The oracle expression that collects a child's whole line-frame sequence as **sizes** — every
+/// `{data, {eol|noeol, D}}` frame reduced to `{eol|noeol, byte_size(D)}` in arrival order — so a
+/// long frame can be compared without embedding its bytes.
+fn oracle_line_sizes_expr(command: &str, options: &str) -> String {
+    [
+        "begin P = open_port({spawn,\"",
+        command,
+        "\"},",
+        options,
+        "), F = fun F(A) -> receive {P,{data,{eol,D}}} -> F(A ++ [{eol,byte_size(D)}]); ",
+        "{P,{data,{noeol,D}}} -> F(A ++ [{noeol,byte_size(D)}]); _ -> F(A) after 1000 -> A end end, ",
+        "io:format(\"~w\",[F([])]) end",
+    ]
+    .concat()
+}
+
+/// `frames` rendered as the `~w` form of `[{eol|noeol, Size}]`.
+fn frames_sizes_w(frames: &[(bool, Eterm)]) -> String {
+    let parts: Vec<String> = frames
+        .iter()
+        .map(|(eol, payload)| {
+            format!(
+                "{{{},{}}}",
+                if *eol { "eol" } else { "noeol" },
+                payload_bytes(*payload).len()
+            )
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// A line of **exactly** the limit is a single frame (no `noeol` split): the C splits only when
+/// the next byte arrives past the limit (`LINEBUF_FULL`), not at `max_len` itself.
+#[test]
+fn a_line_of_exactly_the_limit_is_a_single_frame() {
+    if !shell_available() {
+        skip_line_test("the exact-limit line frame");
+        return;
+    }
+    // `printf 'abc\n'` at `{line,3}`: the whole newline-terminated line is one `eol` frame.
+    let mut h = LineHarness::new();
+    let pair = line_pair(&mut h.fx, make_small(3));
+    let options = option_list(&mut h.fx, &["exit_status"], &[pair]);
+    let port = h.open("printf 'abc\\n'", options);
+    let frames = collect_line_frames(&mut h.runtime, port, Duration::from_secs(10));
+    assert_frames(&frames, &[(true, "abc")]);
+    // Oracle cross-check: the oracle's `{line,3}` framing of the same write.
+    match erl_eval(&oracle_line_frames_expr("printf 'abc\\\\n'", "[{line,3},exit_status]")) {
+        Some(oracle) => assert_eq!(oracle, frames_w(&frames), "the oracle frames the same"),
+        None => skip_oracle_check("the exact-limit line frame"),
+    }
+
+    // `printf 'abcd\n'` at `{line,3}`: `abc` is a length-split `noeol`, `d` the `eol` remainder.
+    let mut h = LineHarness::new();
+    let pair = line_pair(&mut h.fx, make_small(3));
+    let options = option_list(&mut h.fx, &["exit_status"], &[pair]);
+    let port = h.open("printf 'abcd\\n'", options);
+    let frames = collect_line_frames(&mut h.runtime, port, Duration::from_secs(10));
+    assert_frames(&frames, &[(false, "abc"), (true, "d")]);
+    match erl_eval(&oracle_line_frames_expr("printf 'abcd\\\\n'", "[{line,3},exit_status]")) {
+        Some(oracle) => assert_eq!(oracle, frames_w(&frames), "the oracle splits the same"),
+        None => skip_oracle_check("the over-limit line frame"),
+    }
+}
+
+/// A child that writes a **full** line with no newline has the whole buffer released as the
+/// trailing `noeol` flush at end-of-stream — bytes-perfect, no fabricated terminator.
+#[test]
+fn a_full_line_without_a_newline_flushes_as_noeol() {
+    if !shell_available() {
+        skip_line_test("the exact-length `noeol` flush");
+        return;
+    }
+    let mut h = LineHarness::new();
+    let pair = line_pair(&mut h.fx, make_small(3));
+    let options = option_list(&mut h.fx, &["exit_status"], &[pair]);
+    // Exactly `{line,3}` bytes and no newline: the flush releases them in one `noeol` frame.
+    let port = h.open("printf 'abc'", options);
+    let frames = collect_line_frames(&mut h.runtime, port, Duration::from_secs(10));
+    assert_frames(&frames, &[(false, "abc")]);
+    match erl_eval(&oracle_line_frames_expr("printf 'abc'", "[{line,3},exit_status]")) {
+        Some(oracle) => assert_eq!(oracle, frames_w(&frames), "the oracle flushes the same"),
+        None => skip_oracle_check("the exact-length `noeol` flush"),
+    }
+}
+
+/// The default limit is **512**: a 512-byte line is one `eol` frame; a 513-byte line is a
+/// `noeol` 512-byte split plus the 1-byte `eol` remainder (measured live against the oracle).
+#[test]
+fn the_default_512_limit_splits_only_past_512_bytes() {
+    if !shell_available() {
+        skip_line_test("the default 512-byte line limit");
+        return;
+    }
+    // 512 `a`s then a newline: the line fits, so it is one `eol` frame.
+    let mut h = LineHarness::new();
+    let options = option_list(&mut h.fx, &["line", "binary", "exit_status"], &[]);
+    let port = h.open("printf '%*s' 512 '' | tr ' ' a; printf '\\n'", options);
+    let frames = collect_line_frames(&mut h.runtime, port, Duration::from_secs(10));
+    assert_eq!(frames_sizes_w(&frames), "[{eol,512}]");
+    let oracle = oracle_line_sizes_expr(
+        "printf '%*s' 512 '' | tr ' ' a; printf '\\\\n'",
+        "[line,binary,exit_status]",
+    );
+    match erl_eval(&oracle) {
+        Some(oracle) => assert_eq!(oracle, frames_sizes_w(&frames), "the oracle's 512 boundary"),
+        None => skip_oracle_check("the default 512-byte line limit"),
+    }
+
+    // 513 `a`s then a newline: a `noeol` 512-byte split, then the 1-byte `eol` remainder.
+    let mut h = LineHarness::new();
+    let options = option_list(&mut h.fx, &["line", "binary", "exit_status"], &[]);
+    let port = h.open("printf '%*s' 513 '' | tr ' ' a; printf '\\n'", options);
+    let frames = collect_line_frames(&mut h.runtime, port, Duration::from_secs(10));
+    assert_eq!(frames_sizes_w(&frames), "[{noeol,512},{eol,1}]");
+    let oracle = oracle_line_sizes_expr(
+        "printf '%*s' 513 '' | tr ' ' a; printf '\\\\n'",
+        "[line,binary,exit_status]",
+    );
+    match erl_eval(&oracle) {
+        Some(oracle) => assert_eq!(oracle, frames_sizes_w(&frames), "the oracle's 513 boundary"),
+        None => skip_oracle_check("the default 512-byte line limit"),
+    }
+}
+
+/// The delivered message half `{data, {eol|noeol, Data}}` encodes **byte-for-byte** like the
+/// oracle's `term_to_binary(element(2, Msg))`, for a `binary` stream and a `list` stream.
+#[test]
+fn the_delivered_data_half_encodes_byte_for_byte_like_the_oracle() {
+    if !shell_available() {
+        skip_line_test("the byte-for-byte `term_to_binary(element(2, Msg))` check");
+        return;
+    }
+
+    /// The hex of `bytes`, uppercase (matching `binary:encode_hex/1`).
+    fn encode_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(out, "{byte:02X}").expect("a String write");
+        }
+        out
+    }
+
+    /// The `{data, {tag, Data}}` half of a frame, built on the fixture heap with the runtime's
+    /// own atom indices (so it encodes through the runtime's table).
+    fn data_half(fx: &mut Fixture, data: Eterm, tag: Eterm, payload: Eterm) -> Eterm {
+        let framed = fx.heap.tuple(&[tag, payload]).expect("the framed pair");
+        fx.heap.tuple(&[data, framed]).expect("the {data, _} pair")
+    }
+
+    for (label, names, oracle_options, command) in [
+        ("binary", &["line", "binary", "exit_status"][..], "[line,binary,exit_status]", "printf 'a\\nbb\\nccc'"),
+        ("list", &["line", "exit_status"][..], "[line,exit_status]", "printf 'a\\nbb\\nccc'"),
+    ] {
+        let mut h = LineHarness::new();
+        let options = option_list(&mut h.fx, names, &[]);
+        let port = h.open(command, options);
+        let frames = collect_line_frames(&mut h.runtime, port, Duration::from_secs(10));
+
+        // Encode each frame's `element(2, Msg)` with the runtime's own encoder.
+        let (data, eol, noeol) = {
+            let atoms = h.runtime.code_server_atoms_mut();
+            (atoms.intern("data"), atoms.intern("eol"), atoms.intern("noeol"))
+        };
+        let mixed: Vec<String> = frames
+            .iter()
+            .map(|(is_eol, payload)| {
+                let tag = make_atom(if *is_eol { eol } else { noeol });
+                let half = data_half(&mut h.fx, make_atom(data), tag, *payload);
+                encode_hex(&beam_codec::encode_term(half, h.runtime.atoms()).expect("encode"))
+            })
+            .collect();
+        let ours = mixed.join(",");
+
+        // The oracle emits the same hex for its own `term_to_binary(element(2, Msg))`.
+        let expr = [
+            "begin P = open_port({spawn,\"",
+            command,
+            "\"},",
+            oracle_options,
+            "), F = fun F(A) -> receive {P,{data,_}=M} -> F(A ++ [binary:encode_hex(element(2,M))]); ",
+            "_ -> F(A) after 1000 -> A end end, ",
+            "io:format(\"~s\",[lists:join(\",\",[binary_to_list(H) || H <- F([])])]) end",
+        ]
+        .concat();
+        match erl_eval(&expr) {
+            Some(oracle) => assert_eq!(oracle, ours, "the {label} stream's data halves encode the same"),
+            None => skip_oracle_check("the byte-for-byte `term_to_binary(element(2, Msg))` check"),
+        }
+    }
 }

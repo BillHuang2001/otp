@@ -1245,6 +1245,10 @@ impl PortRegistry {
     /// tasks, a due `TIMEOUT` task is serviced immediately — no busy loop, and the slice's
     /// other work is unchanged.
     ///
+    /// A round reports a reaped child's `exit_status` **before** the round's own end-of-stream
+    /// line flush, which is the order the oracle delivers in (see the ordering note at the
+    /// round's line drain): a partial trailing line released at end-of-stream is therefore never
+    /// seen before the status of the child that wrote it.    ///
     /// A round never blocks when there is nothing that could become ready — no live port and no
     /// armed `tty_select/2` interest (see [`PortRegistry::has_nothing_to_poll`]): an armed but
     /// **idle** signal self-pipe is not a wake source, so a runtime that only handles a signal
@@ -1342,9 +1346,21 @@ impl PortRegistry {
             // The **line channel** is drained on *every* round, immediately after the tasks:
             // `take_line_notifications` empties every line-mode port's staged frames, so
             // deferring it until something else looked non-empty would lose them (see
-            // [`PortEvent::Line`]). The end-of-stream flush runs first: it is what releases a
-            // trailing partial line as a `noeol` frame (the C's `driver_eof` →
-            // `flush_linebuf_messages`).
+            // [`PortEvent::Line`]).
+            //
+            // A due `exit_status` is taken **here**, between the tasks and the end-of-stream
+            // flush, because that is the order the oracle delivers in: the C reports a reaped
+            // child's status (`driver_report_exit`, the `{exit_status, Status}` message) and only
+            // then releases the child's trailing partial line (`driver_failure_eof` →
+            // `flush_linebuf_messages`, `erts/emulator/sys/unix/sys_drivers.c:1250-1252`), both
+            // from the one `ready_input` call the child's exit triggers. Taking the status before
+            // the flush is what keeps the two messages of one round in that order instead of
+            // appending the status after the frames this very round just flushed — the two
+            // orderings a naive round would race between, depending on whether the child happened
+            // to be reaped before the poll or during it.
+            events.extend(self.take_due_exit_statuses()?);
+            // The end-of-stream flush releases a trailing partial line as a `noeol` frame (the
+            // C's `driver_eof` → `flush_linebuf_messages`).
             self.flush_line_stream_ends()?;
             for frame in self.registry.take_line_notifications() {
                 // A frame for a port whose metadata is gone (closed while the task was
