@@ -902,10 +902,11 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
 //
 // The block register cache's cost is the store/load traffic it emits: a `spill` stores
 // cached x-registers back into `machine.x` and a `fill` reloads them. The emitter has
-// three candidate spill models — the one `regs::spill` emits today, the **written set**
-// (`Allocation::written`) and the **full cache** (`Allocation::slots`), the model the
-// partial spill replaced — and two fill models — the continuation's **liveness**
-// (`Allocation::fill_slots`) and the **full cache**. `counters::record_block` derives the
+// three candidate spill models — the **dirty** set `regs::spill` emits today
+// (`Allocation::spill_slots_at(pc)`), the **written set** (`Allocation::written`) and the
+// **full cache** (`Allocation::slots`), the model the partial spill replaced — and two
+// fill models — the continuation's **liveness** (`Allocation::fill_slots`) and the
+// **full cache**. `counters::record_block` derives the
 // models only the enclosing block can see (see the counters module docs). This section
 // compiles the corpus the static deopt census uses and prints the traffic each model
 // would emit — the deterministic evidence for whether a finer spill/fill rule is worth
@@ -928,7 +929,8 @@ struct RegCacheRow {
     /// Σ `compile_module(..).code_len()` over the row's modules (0 for the OTP sample and
     /// the aggregate totals, whose `code_len` the static census' per-kind table reports).
     code_len: usize,
-    /// Spill stores under the model `regs::spill` currently emits (Σ the counts it passed).
+    /// Spill stores under the **dirty-set** model `regs::spill` emits
+    /// (Σ `spill_slots_at(pc).len()`).
     spill_stores: u64,
     /// Spill stores under the written-set model (Σ `written.len()`).
     spill_stores_written: u64,
@@ -950,7 +952,7 @@ struct RegCacheRow {
     block_ir_instructions: u64,
     /// `spill` calls by site.
     spill_calls_by_site: BTreeMap<SpillSite, u64>,
-    /// Spill stores by site under the model `regs::spill` emits.
+    /// Spill stores by site under the dirty-set model `regs::spill` emits.
     spill_stores_by_site: BTreeMap<SpillSite, u64>,
     /// Spill stores by site under the written-set model.
     spill_stores_written_by_site: BTreeMap<SpillSite, u64>,
@@ -1043,11 +1045,11 @@ impl RegCacheRow {
         );
     }
 
-    /// The redundant ("clean") stores the written-set model emits beyond the model
-    /// `regs::spill` currently emits: `written − spill`. It is **0** while `spill` passes
-    /// the written set (the present code) and becomes the exact store count a companion
-    /// dirty-set change removes once `spill` passes only the registers whose in-flight
-    /// machine value was overwritten.
+    /// The redundant ("clean") stores the written-set model emits beyond the **dirty-set**
+    /// model `regs::spill` emits today: `written − spill`. It is the exact store count the
+    /// dirty-set change removes — a cached register the block wrote and then left holding
+    /// its old `machine.x` value, which the dirty walk skips but the whole-block write set
+    /// still stores.
     fn redundant_clean_stores(&self) -> u64 {
         self.spill_stores_written.saturating_sub(self.spill_stores)
     }
@@ -1347,8 +1349,9 @@ fn the_register_cache_traffic_census_over_the_corpus_is_printed() {
         otp.is_some(),
     );
     println!(
-        "three spill models: `spill` (what regs::spill emits today), written-set (Σ written.len()), \
-         full-cache (Σ slots.len()); two fill models: liveness vs full-cache"
+        "three spill models: `spill` (the dirty set it emits today, Σ spill_slots_at(pc)), \
+         written-set (Σ written.len()), full-cache (Σ slots.len()); two fill models: liveness \
+         vs full-cache"
     );
     println!();
     println!(
