@@ -323,10 +323,14 @@ the allocation falls back to the arena). `Process::deliver` grows the nursery th
 message copy; the refusal is what reproduces the raw `AllocKind::Message` that `deliver_message` keys its
 heap-fragment fallback on. A **relocation-exempt** receiver skips the retry entirely. The
 **registered-BIF result** is the one allocation that really leaves its pooled heap (the copy-out
-subsection below). Allocation **outside** the admission point still raises `error::system_limit`: BIFs
-(and the floor) build *intermediate* terms on a `beam_alloc::Heap` (`BifContext::heap()`) caching raw
-`hp`, so the live set is invisible to `roots`, and the bounded heaps
-(`Runtime::bif_heaps`/`eval_heap`) never move.
+subsection below). Allocation **outside** the admission point uses bounded `beam_alloc::Heap` arenas that **never move**
+(`BifContext::heap()`, `Runtime::eval_heap`), so a BIF's *intermediate* terms are invisible to `roots`
+and cannot be collected; a call that really overflows such a heap still raises `error::system_limit`.
+The one growth seam outside the admission point is the **pooled BIF-heap frontier**: on the table-less
+(`-eval`/nested) route — where no process heap exists to move a container result onto —
+`RuntimeContext::take_bif_frontier` retires a near-full region and continues in a larger one (capped only
+by an explicit `+hmax`), so a long table-less compilation grows its result store instead of hitting the
+fixed `DEFAULT_HEAP_WORDS` cap (see the copy-out subsection below).
 
 ### The BIF-result copy-out — a registered BIF's container result moves onto the process's scanned heap
 A registered BIF builds its result on the runtime's pooled 16 MiB `Runtime::bif_heaps`
@@ -361,8 +365,10 @@ process to move onto), a **container** result (`result_is_foreign_container`; an
 a literal lives in the frozen literal area, so such a result rewinds with **no** copy), and a move that
 succeeded.
 **Residuals.** A **NIF** result is **not** copied out (a deliberate M1 residual), so it stays on the
-pooled heap and keeps declining a collection while live; the `-eval`/no-scheduled-process shape, an
-escaping arm and an error result also leave their container on the pooled (`Target::Foreign`) heap; a
+pooled heap and keeps declining a collection while live; an escaping `DispatchHooks` arm and an error
+result also leave their container on the pooled (`Target::Foreign`) heap; on the
+`-eval`/no-scheduled-process shape there is no process to move onto, so the pooled **frontier** instead
+grows (`RuntimeContext::take_bif_frontier`, capped only by an explicit `+hmax`); a
 **nested** cross-module run (`RuntimeContext::run_export`) never reaches a collection point. Pinned by
 `src/context/tests.rs` (`a_bif_container_result_is_moved_onto_the_process_heap_and_the_pool_is_rewound`,
 `an_immediate_result_rewinds_the_pool_without_a_copy`,
