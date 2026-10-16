@@ -208,6 +208,31 @@ so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved an
 instead of tripping the valve, whether the process built it or received it; a reason that genuinely
 cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
 
+## Per-slice (not per-instruction) host cost
+Beyond the per-instruction `BudgetContext::reduce` charge, one slice's prologue/epilogue does this
+host work (each is amortized over the whole 4000-reduction budget, so it is per-`run`, never
+per-iteration):
+* **O(1), no allocation:** `RunnerState::engines.remove(&pid)` / `insert` (`run.rs:383`/`817`), the
+  FR prefix read `Machine::fr_mark()` (`run.rs:677`), the tier lookup (`run.rs:430-438`),
+  `note_reductions` (`run.rs:602`), `serve_gc_request` (early-returns without a pending request),
+  and — on the `Yield` arm only — `current_code()` (`run.rs:778`) and
+  `reset_reductions`/`bump_reductions` (`run.rs:791-792`).
+* **One allocation per slice:** `RuntimeContext::enter_module` (`run.rs:475` →
+  `../context/runtime_context.rs:501-508`) builds a fresh `String` of the module name on **every**
+  slice (a `RuntimeContext` itself is a stack value: `for_process_with_engines`, no heap alloc).
+* **O(size), on a park only:** both park arms call `publish_parked_roots` (`run.rs:807`, `run.rs:929`)
+  → `gc::publish_roots_full` (`../context/gc.rs:370-395`) copies the whole x file
+  (`min(x.len(), MAX_REG)` = up to 1024 words, `beam_process::registers::MAX_REG`) plus the whole
+  Erlang stack plus the live FR prefix onto the process's root set.
+* **Amortized O(1):** the off-heap registration loop (`run.rs:760-769`) walks only the
+  not-yet-registered reservoir suffix (`ProcessEngine::registered_payloads`), so a loop that builds
+  no off-heap binary pays one comparison.
+* **First entry / flag-gated only:** `record_baseline_code` (`run.rs:692-694`, `+JPperf` only), the
+  `Arc::clone` of the entry module (`run.rs:413-420`), and `describe_site` (debug-trace only).
+  `source_payloads` (`run.rs:840-842`/`970-971`) runs only on the terminating `Returned`/`Err` arms.
+* **No production time read:** `Instant` appears only in `runner/tests.rs`; the slice path does no
+  `sys` call of its own.
+
 ## Measured
 The tier is taken on a process's **first** entry and then carried for its whole life: a pre-empted
 slice and a `receive` park both resume through `Machine::resume_outcome_with_tier` on the tier the
