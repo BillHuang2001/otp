@@ -1828,8 +1828,7 @@ mod tests {
         // `code:ensure_modules_loaded([lists,maps])` ⇒ `ok` (both need nothing of the code
         // path), each with exit code 0.
         let mut runtime = runtime();
-        let answer =
-            ensure_modules_loaded(&mut runtime, &[beam_term::NIL]).expect("eml/1");
+        let answer = ensure_modules_loaded(&mut runtime, &[beam_term::NIL]).expect("eml/1");
         assert_eq!(runtime.atom_name_of(answer), Some("ok"));
 
         let Some(mut runtime) = system_runtime() else {
@@ -1916,8 +1915,7 @@ mod tests {
         let mut runtime = runtime();
         for names in [&["erlang", "init"][..], &["init", "init", "erlang"][..]] {
             let argument = atom_list(&mut runtime, names);
-            let answer =
-                ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
+            let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
             assert_eq!(runtime.atom_name_of(answer), Some("ok"), "{names:?}");
         }
     }
