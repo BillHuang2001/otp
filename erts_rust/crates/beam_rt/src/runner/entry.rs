@@ -148,6 +148,25 @@ pub(super) struct ProcessEngine {
     /// a fresh engine (a freshly reset machine's FR is entirely `NIL`, so such a process never
     /// parks before its first slice).
     pub(super) fr_published: usize,
+    /// Whether the park this engine is currently sitting in **published** the machine's root
+    /// set into the process's `Registers` — i.e. whether the parked window is one a collection
+    /// could relocate the heap from.
+    ///
+    /// A park opens one of two windows ([`park_machine`](super::run)): a **relocation-exempt**
+    /// one — every `receive` park, and a `Yield` park whose slice ended with a live FR prefix —
+    /// where every relocation site refuses the move for the whole window, so the parked machine
+    /// itself stays the authoritative root set and the copy into the process would be an
+    /// identity round-trip that nothing ever reads; or a **plain** one (a `Yield` park with a
+    /// dead FR prefix), which a delivery-driven collection *can* relocate over, so the machine's
+    /// roots must be handed over.
+    ///
+    /// The flag is written by the park arm and read by the resume, which re-syncs the machine
+    /// from the process's root set
+    /// ([`resume_from_process_roots`](super::run::resume_from_process_roots)) **only** for a
+    /// publishing window: an un-published (exempt) window's roots were never moved, so the
+    /// machine already holds them. It is `false` on a fresh engine and cleared at every resume,
+    /// so a stale `true` can never re-sync against registers an earlier window published.
+    pub(super) parked_published: bool,
     /// The execution tier this process is running on, chosen at its **first** entry and
     /// remembered for the rest of its life.
     ///
@@ -230,6 +249,9 @@ impl RunnerState {
                 // A freshly reset machine's FR file is all `NIL` (`fr_mark() == 0`), so its
                 // first park (if any) publishes no FR word; the park arm overwrites this.
                 fr_published: 0,
+                // A fresh engine is not parked, so no window has published anything yet; the
+                // park arm writes the real answer (see the field docs).
+                parked_published: false,
                 // Only a placeholder: the process's first entry selects the real tier and
                 // writes it here (see the field docs).
                 tier: Tier::Interpreter,
