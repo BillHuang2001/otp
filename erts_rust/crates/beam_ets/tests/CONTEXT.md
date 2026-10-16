@@ -42,7 +42,7 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 - `ets_update.rs` → `update_counter`/`update_element` operands
 - `ets_replace.rs` → `select_replace/2` + body-runtime-failure (`EXIT`) rule; oracle renderings quoted inline (offline-derived — pin tests, not live cross-checks) + `static_check_*` pinning the oracle's static body check (`db_match_keeps_key`): a rejected body is `badarg` and leaves the table unchanged; `repeated_identical_replacement_on_a_duplicate_bag_is_stable` pins 100 repeats of an identical `duplicate_bag` replacement against the recorded oracle line (its storage-side floor lives in `../src/table/tests.rs`, where the store's own accounting is reachable)
 - `ets_info.rs` → `ets:info` 15-field proplist
-- `ets_ownership.rs` → `give_away`/`heir`/`setopts`/owner-death
+- `ets_ownership.rs` → `give_away`/`heir`/`setopts`/owner-death; incl. the identity/pid-gap pin `give_away_from_an_identityless_caller_follows_owner_identity` (a `None` caller is the owner of an ownerless table; a `None`/non-owner caller on an owned table is `badarg`)
 - `ets_rename.rs` → `ets:rename/2`
 - `ets_access.rs` → access matrix (`public`/`protected`/`private`) over the read/write surface
 - `ets_options.rs` → `TableOptions` parsing/reporting
