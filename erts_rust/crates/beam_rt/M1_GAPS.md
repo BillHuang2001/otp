@@ -535,11 +535,29 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   outcomes — a clean compile and a compiler-pass failure — to never report `calling_self`, to report a
   real result, and, only on a failing module, to carry a `Function: ` line), so a genuine compiler crash reports its real
   reason. The route completes for **72 of the 86** oracle-compilable `lib/stdlib/src/*.erl` with
-  byte-identical `.beam`; the 14 failures are heap-independent compiler-runtime defects (12 —
-  `c`, `dets`, `epp`, `ets`, `io`, `peer`, `qlc`, `shell`, `slave`, `sys`, `timer`, `win32reg` — raise
-  `{badmap, …}` in `beam_ssa_recv:plan_clears/2` through `maps:fold/3` mis-rejecting a
-  `maps:iterator/2` term; `erl_lint` raises `{badmap, …}` in `beam_ssa_opt:phase/4`; `erl_tar` raises
-  `badarg` in `beam_core_to_ssa:function/2`), **none io-related**. The hazard class both cases run through — the
+  byte-identical `.beam`; the 14 failures are heap-independent compiler-runtime defects, **none
+  io-related**, and split into exactly two root causes. **12** — `c`, `dets`, `epp`, `ets`, `io`,
+  `peer`, `qlc`, `shell`, `slave`, `sys`, `timer`, `win32reg` — are the `beam_bifs` `maps:*`
+  iterator-term defect: `map/2`/`fold/3`/`filter/2`/`foreach/2` mis-reject a valid
+  `maps:iterator/1,2` term, so `beam_ssa_recv:plan_clears/2` raises
+  `{crash,beam_ssa_recv,{badmap, Iterator}, …}` (owning crate `erts_rust/crates/beam_bifs`; detail in
+  [`../beam_bifs/CONTEXT.md`](../beam_bifs/CONTEXT.md)). This is the **largest remaining bucket** —
+  12 of the 14. The other **2** are a `beam_engine` defect: `<<Int:Size>>` (BEAM `bs_create_bin`)
+  wrongly rejects a **bignum** in a field of `Size <= 64`, so `erl_tar` fails at
+  `Function: do_merge_pax/2` and `erl_lint` at `Function: start_state/2`, both raising
+  `{crash,beam_core_to_ssa,badarg, …}` where the oracle masks the bignum into the field width
+  (reproducer: a module `bm:mk64(X) -> <<X:64>>.` run as
+  `beam_rt run bm.beam bm:mk64/1 7811896436376826984` → `beam_rt: badarg` here,
+  `<<8,0,0,0,0,0,0,0>>` on the oracle; `X < 2^59` works and `<<X:80>>` works via the wide-integer
+  path; tier-independent, and the `-eval` route is unaffected). The bignum arm's fix is
+  **out-of-scope for this crate** (owner `erts_rust/crates/beam_engine`): in
+  `crates/beam_engine/src/families/bitstrings/create/mod.rs`, the `"integer"` arm of `bs_create_bin`
+  (~lines 215-233) must accept a bignum for `nbits <= 64` through the existing magnitude machinery
+  (`integer_magnitude_bytes` / the `push_wide_int`-style byte+bit writer, which already handles smalls
+  **and** bignums) and mask the value to `nbits`, matching C `erts_bs_put_integer_*` / `fmt_big_be` /
+  `fmt_big_le` (`erts/emulator/beam/erl_bits.c`), instead of requiring `small_value` and returning
+  `fail_seg(machine, module, labels, fail, SegReason::BadArg)`; `BadArg` stays for a genuinely
+  non-integer value only. The hazard class both cases run through — the
   monitor-DOWN branch of `beam_process`'s termination cascade relocating a **woken** monitor watcher's
   heap — is declined in this crate by the host collection gate plus the park exemption (the A.9 class in
   *GC-relocation hazards* below); mechanism:
