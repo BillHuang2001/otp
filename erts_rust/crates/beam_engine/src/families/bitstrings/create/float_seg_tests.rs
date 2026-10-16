@@ -271,18 +271,19 @@ fn a_bignum_float_segment_overflow_still_fails_badarg_like_the_oracle() {
 #[test]
 fn a_small_and_a_float_value_are_unchanged() {
     let module = float_module(&[]);
+    // **One** context for the whole test, shared with every `build_float` below: the
+    // float term is a heap term, so it must live in the same arena the segment walk
+    // allocates the result in, and that arena must outlive every read of it (the
+    // segment's float read dereferences the term). Building it in a context created —
+    // and dropped — inside the tuple below would leave a dangling term whose bytes a
+    // later read only *happens* to see intact.
+    let mut ctx = MinimalContext::new();
+    let float = crate::terms::test_support::make_float(&mut ctx, 5.5).expect("a float");
     for (value, expected) in [
         (make_small(5), vec![64u8, 20, 0, 0, 0, 0, 0, 0]),
-        (
-            {
-                let mut ctx = MinimalContext::new();
-                crate::terms::test_support::make_float(&mut ctx, 5.5).expect("a float")
-            },
-            vec![64u8, 22, 0, 0, 0, 0, 0, 0],
-        ),
+        (float, vec![64u8, 22, 0, 0, 0, 0, 0, 0]),
     ] {
         let mut machine = Machine::new();
-        let mut ctx = MinimalContext::new();
         machine.set_x(0, value).expect("x(0) in range");
         let out = build_float(
             &module,
