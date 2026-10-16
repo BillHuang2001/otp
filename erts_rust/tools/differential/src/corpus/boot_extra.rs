@@ -99,7 +99,6 @@
 //! | `erl_prim_loader:get_path/0` | `{ok,Paths}` | raises `badarg` |
 //! | `erlang:system_info(logical_processors)` | 16 | 14 |
 //! | `erlang:system_info(heap_sizes)` | the sizing list | a list with one extra entry |
-//! | `whereis(erl_prim_loader)` | a pid | the atom `undefined` |
 //! | `erlang:function_exported/3` on `kernel` / `code` | `true` | `false` |
 //! | `erlang:system_info(schedulers\|dirty_cpu_schedulers\|dirty_io_schedulers)` | the host's scheduler counts | different counts |
 //! | `persistent_term:info/0` | the live `count`/`memory` counters | zero-valued counters |
@@ -1852,6 +1851,15 @@ pub(crate) fn group() -> Vec<Case> {
             "boot_extra/whereis_standard_error_is_registered",
             "the boot chain's standard-error I/O server is a live registered process (whereis(standard_error) is a pid)",
             "is_pid(whereis(standard_error))",
+            "ok true",
+        ),
+        // `erl_prim_loader` is not a `{kernelProcess, …}` server — it is the loader's own
+        // process, registered on every route that builds a runtime (the oracle registers its C
+        // `erts_prim_loader` there) — but it too resolves to a live pid in a booted system.
+        eval(
+            "boot_extra/whereis_erl_prim_loader_is_registered",
+            "the primitive loader is a live registered process (whereis(erl_prim_loader) is a pid)",
+            "is_pid(whereis(erl_prim_loader))",
             "ok true",
         ),
         // --- The booted system's builtin/export floor --------------------------------------

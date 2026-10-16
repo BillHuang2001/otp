@@ -621,6 +621,25 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "bifs/ensure_modules_loaded_missing_module_reason",
+            description: "code:ensure_modules_loaded/1 of a module that cannot exist answers its {Module,nofile} reason",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The *modular* form of the load check (`ensure_loaded/1` is pinned above): a
+                // batch request that cannot be satisfied for one member must not crash the code
+                // server — it answers `{error, [{Module, nofile}]}` with the missing module named.
+                // The atom `nonexistent_module_xyz` is deliberately not on any code path, and no
+                // path is ever rendered by the reason, so the golden is host-independent.
+                expr: "code:ensure_modules_loaded([nonexistent_module_xyz])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {error,[{nonexistent_module_xyz,nofile}]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "bifs/erts_debug_size_of_tuple",
             description: "erts_debug:size/1 counts the words of a small tuple",
             contracts: &[Contract::OtpApps],
@@ -1834,6 +1853,29 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok {1640,820,30,ok}"),
+                exit_code: 0,
+            },
+        },
+        // --- The `-eval` evaluator's argument grammar --------------------------------------
+        // The harness drives every case through `-eval <probe>`, so the whole expression is parsed
+        // by the runtime's `-eval` evaluator: a form the evaluator's grammar rejects is a
+        // capability gap (exit `3`), not an observation. A single-quoted atom is one such form —
+        // `'receive'` is a reserved word *unquoted*, and `seq_trace:set_token/2` names its tokens
+        // with exactly those reserved words (`receive`/`send`/`'call'`/`'print'`/`'timestamp'`/
+        // `'monotonic_timestamp'`/`'strict_monotonic_timestamp'`/`'arity'`/`'return_trace'`/
+        // `'exception_trace'`/`'silent'`). The observable is the BIF's own answer: the previous
+        // value of an unset token is `false`.
+        Case {
+            id: "bifs/eval_accepts_a_quoted_atom_argument",
+            description: "the -eval evaluator parses a single-quoted atom as a call argument",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "seq_trace:set_token('receive', true)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
                 exit_code: 0,
             },
         },
