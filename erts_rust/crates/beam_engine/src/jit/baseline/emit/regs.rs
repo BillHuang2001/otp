@@ -38,8 +38,10 @@
 //!
 //! Two events make a cached register **clean** again (they sync `machine.x` to the cache):
 //!
-//! * the **prologue** loads the whole cache *from* `machine.x`, so every cached register
-//!   starts the block clean; and
+//! * the **prologue** loads the block's live-in set *from* `machine.x`, so every cached
+//!   register that starts the block live holds its `machine.x` value (a cached register
+//!   the prologue does not load is one the block writes before it reads, so its stale
+//!   machine register is only ever overwritten first); and
 //! * a **post-helper [`fill`]** reloads from `machine.x` after a helper — which *is* the
 //!   interpreter, and may have written `machine.x` — so every register a fill reloads is
 //!   clean again from that point.
@@ -90,7 +92,7 @@ pub(crate) enum FillSite {
     /// The block prologue's load of the whole cache ([`super::emit_block`]).
     ///
     /// Constructed only from the test-gated prologue counter — in a production build
-    /// the prologue loads the cache inline and no `fill` names this site.
+    /// the prologue loads the entry set inline and no `fill` names this site.
     #[cfg(test)]
     Prologue,
 }
@@ -152,6 +154,18 @@ pub(crate) struct Allocation {
     /// **empty** table (a synthetic `Allocation` a unit test built directly) means "no
     /// liveness was computed" and makes every fill set the whole cache.
     pub(crate) fill_sets: Vec<Vec<u32>>,
+    /// The **cached x-registers the prologue loads**, as x-register indices: the block's
+    /// live-in set ([`super::liveness::fill_sets`]).
+    ///
+    /// A cached register the block **writes before it reads** is not loaded: the writing
+    /// instruction sets its machine register (never `machine.x`), and every later store of
+    /// that register stores the write set, which the fill set always contains — so the
+    /// stale machine register is only ever overwritten before it is read. Loading it would
+    /// be a redundant load of a word the block immediately replaces.
+    ///
+    /// `None` (a synthetic `Allocation` a unit test built directly) conservatively means
+    /// the **whole** cache, which is the pre-live-in model.
+    pub(crate) entry_fill: Option<Vec<u32>>,
     /// Test-only: how many x-registers the allocator's interval scan **ranked** — the
     /// candidate set a resident slot was chosen from ([`super::regalloc`]).
     ///
@@ -235,6 +249,29 @@ impl Allocation {
         }
     }
 
+    /// Whether the prologue must load cached x-register `x` out of `machine.x` at block
+    /// entry ([`Allocation::entry_fill`]).
+    ///
+    /// A table that does not exist (a synthetic allocation from a unit test)
+    /// conservatively loads the whole cache, the pre-live-in model.
+    pub(crate) fn entry_loads(&self, x: u32) -> bool {
+        match &self.entry_fill {
+            Some(set) => set.contains(&x),
+            None => true,
+        }
+    }
+    /// How many cache registers the prologue loads: [`Allocation::entry_loads`] over
+    /// [`Allocation::slots`] (the whole cache when there is no entry table).
+    ///
+    /// Test-only, like [`super::super::counters`] — the prologue's own counter is its
+    /// only caller, so a production build carries no statistic accessor.
+    #[cfg(test)]
+    pub(crate) fn entry_len(&self) -> usize {
+        match &self.entry_fill {
+            Some(set) => self.slots.iter().filter(|(x, _)| set.contains(x)).count(),
+            None => self.slots.len(),
+        }
+    }
     /// Whether a helper call made at `pc` — whose `Step::Next` continues the block
     /// in-block at `pc + 1` — must be followed by a Y-window refresh.
     ///

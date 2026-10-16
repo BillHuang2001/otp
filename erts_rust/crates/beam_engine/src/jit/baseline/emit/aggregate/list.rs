@@ -131,6 +131,17 @@ impl ListShape {
     pub(crate) fn writes(&self) -> Vec<u32> {
         self.destinations.iter().filter_map(|(_, loc)| loc.register()).collect()
     }
+    /// The x-register indices the shape's native lowering **reads through the block
+    /// register cache** — the source cons cell, and nothing else. A `Y` source is a stack
+    /// slot, never a cached register.
+    ///
+    /// The destinations are pure writes (the halves are read out of the source and stored
+    /// into them), so a destination register that the block also reads is listed through
+    /// that other instruction. This is what the block prologue's entry-load decision needs
+    /// (see [`super::super::liveness`]).
+    pub(crate) fn reads(&self) -> Vec<u32> {
+        self.source.register().into_iter().collect()
+    }
 
     /// Whether the lowered sequence reads the current frame's Y window — a `Y` source
     /// or a `Y` destination ([`super::super::arith::uses_y`]'s per-shape test).

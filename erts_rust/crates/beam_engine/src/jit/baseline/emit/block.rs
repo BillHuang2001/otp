@@ -198,13 +198,20 @@ pub(crate) fn emit_block(
     } else {
         emit_position_store(buffer, func, start as u32)?;
     }
+    // Load a cache register only where the block can still **observe** it at entry
+    // ([`Allocation::entry_loads`], the block's live-in set): a register the block writes
+    // before it reads is set by that writing instruction, so loading it here would be a
+    // redundant load. Every slot stays charged to `highest_touched`, so the driver's
+    // register-file bound is unchanged.
     for (x, reg) in &allocation.slots {
         touch(highest_touched, *x);
-        buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
+        if allocation.entry_loads(*x) {
+            buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
+        }
     }
-    // Structural counter: the prologue loaded the whole cache.
+    // Structural counter: the prologue loaded the block's live-in set.
     #[cfg(test)]
-    super::super::counters::record_fill(FillSite::Prologue, allocation.slots.len() as u64);
+    super::super::counters::record_fill(FillSite::Prologue, allocation.entry_len() as u64);
 
     let done: CodeLabel = buffer.label();
     // The direct block-to-block linker: a taken branch to a compiled successor's
