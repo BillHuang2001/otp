@@ -34,13 +34,37 @@
 //! pointer-stable arena, byte for byte as before — see [`crate::runtime::gc`] for the state,
 //! the accounting and the safety valves.
 //!
-//! # The root set is the WHOLE [`RootSet`]
+//! # The root set is the WHOLE [`RootSet`], bounded to its pointer-bearing prefix
 //!
 //! The root set a collection relocates is the **executing machine's whole live root set** as
-//! the engine hands it over: **every** slot of the X-register file, the **whole** Erlang
-//! stack and the FR file — the whole file from the in-slice doors, the machine's live leading
-//! prefix [`Machine::fr_mark`](beam_engine::Machine::fr_mark) from the runner's park arm
+//! the engine hands it over: the X-register file, the **whole** Erlang stack and the FR file.
+//! The two in-slice doors ([`ensure_heap_full`] and [`alloc_words_rooted`]) hand the whole root
+//! set over — each register file bounded to its pointer-bearing prefix, which is *not* the
+//! engine's `live` hint (see below) — while the runner's park arm bounds the FR region to the
+//! machine's live leading prefix [`Machine::fr_mark`](beam_engine::Machine::fr_mark)
 //! ([`publish_roots_full`]/[`scatter_roots_full`]).
+//!
+//! # The pointer-bearing prefix — why a register file may be bounded
+//!
+//! A copying collector acts on a root word only if it is a heap **pointer**: an immediate is
+//! never relocated and is never a reachability edge, so it can neither keep a term alive nor
+//! add a "reaches an unscanned region" fact. [`root_is_unscanned`] itself answers `false` for
+//! any word that is neither boxed nor a list, so **omitting a non-pointer word cannot change
+//! the valve's decision** — it can only skip work. Each in-slice door therefore bounds both
+//! register files to their **pointer-bearing prefix**: one past the **last** boxed-or-list word
+//! of the file (`NIL` and every other immediate is neither), computed **once** per call by
+//! [`machine_root_bounds`] and used consistently for the iterator handed to
+//! [`any_root_is_unscanned`], for [`publish_roots_full`] and for [`scatter_roots_full`]. The
+//! Erlang stack is always published whole, because there are no frame liveness maps.
+//!
+//! The bound keeps every live root by construction: it is "last pointer-bearing index + 1", so
+//! a live or boxed word at a high index is always included, and only a tail that is *already*
+//! immediate is left out — an FR file a process never wrote (1024 `NIL` slots) publishes
+//! nothing from that file. The word order and the length contract survive because the two
+//! halves of a hand-off are given the **same** counts; the omitted tail stays byte-identical
+//! (neither half writes it, since it is not a root) and the machine's `NIL` FR slots beyond
+//! the bound are left untouched exactly as before.
+//!
 //! [`RootSet::live`] is only a *hint* and is deliberately **ignored**: a copying collector may
 //! always over-approximate its root set (it can only keep a term alive that would otherwise
 //! die, never free a live one), and the engine's "dead" x registers are not provably dead —
@@ -76,9 +100,11 @@
 //! the narrow form is not on the engine's path today.
 //!
 //! The **full** doors ([`ensure_heap_full`] and [`alloc_words_rooted`]) hand the machine's whole
-//! [`RootSet`] over, FR file included ([`publish_roots_full`]), so a collection over them is
+//! [`RootSet`] over, the FR file included, each register file bounded only to its
+//! pointer-bearing prefix ([`machine_root_bounds`] — and every **live** float register holds a
+//! boxed float term, so it always lies inside that bound). A collection over them is therefore
 //! FR-safe for **any** module: a live float register is relocated exactly like an x register or
-//! a stack word. They therefore apply **no** float guard at all — [`module_uses_floats`] is not
+//! a stack word. They apply **no** float guard at all — [`module_uses_floats`] is not
 //! consulted there — and a float-using call site collects like any other. What they do keep is
 //! the "no caller module" refusal (a fun entry, the `-eval` evaluator): such a run has no
 //! machine to name, and is left un-collected rather than guessed at.
@@ -245,6 +271,30 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
         && !process.collector().mature_contains(ptr as *const Eterm)
 }
 
+/// One past the last **pointer-bearing** word of `words` — the bound the full-root doors publish
+/// and classify a register file at.
+///
+/// A word is pointer-bearing when it is boxed or a list ([`beam_term::prelude::is_boxed`] /
+/// [`beam_term::prelude::is_list`]); `NIL` and every other immediate is neither, so an
+/// all-immediate file (the common case: a 1024-slot FR file a process never wrote) answers `0`.
+/// The scan is backwards and stops at the last pointer word, so its cost is proportional to the
+/// immediate tail — and see the module docs' *pointer-bearing prefix* section for why bounding a
+/// register file there can never lose a root: every omitted word is an immediate, which is
+/// neither relocatable nor a reachability edge, and [`root_is_unscanned`] answers `false` for it.
+fn pointer_prefix_len(words: &[Eterm]) -> usize {
+    words
+        .iter()
+        .rposition(|&word| beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word))
+        .map_or(0, |index| index + 1)
+}
+
+/// The `(x_count, fr_count)` bound the full-root doors hand the machine's two register files over
+/// at: each file's [`pointer_prefix_len`]. The Erlang stack is published whole — it has no
+/// pointer-only prefix property, because every slot of a live frame is a root.
+fn machine_root_bounds(roots: &RootSet<'_>) -> (usize, usize) {
+    (pointer_prefix_len(roots.x), pointer_prefix_len(roots.fr))
+}
+
 /// Hand the executing machine's live roots to `process` — the **publish** half of the GC
 /// hand-off.
 ///
@@ -316,7 +366,7 @@ pub(crate) fn scatter_roots(
 /// [`publish_roots`].
 ///
 /// Where the narrow [`publish_roots`] takes an *x-register count* and ignores the FR file,
-/// this one takes the engine's [`RootSet`] and publishes **every** slot of it:
+/// this one takes the engine's [`RootSet`] and publishes **every** slot of the value it is handed:
 ///
 /// * all of `roots.x` (the [`RootSet::live`] hint is deliberately **ignored** — a copying
 ///   collector may always over-approximate its root set, so treating every register as live
@@ -324,6 +374,13 @@ pub(crate) fn scatter_roots(
 ///   engine has no way to prove a register dead);
 /// * then every word of `roots.stack`; and
 /// * then the first `fr_count` words of `roots.fr` — the machine's live float-register prefix.
+///
+/// *Which* value a caller hands over is the caller's bound, not this function's business: the
+/// in-slice doors hand a `RootSet` already narrowed to each file's **pointer-bearing prefix**
+/// ([`machine_root_bounds`]), while the park arm hands the machine's whole `x` file with the FR
+/// file bounded by its own live prefix. Either way the published words are the words that can
+/// carry a heap pointer, and every caller passes the very same `fr_count` to
+/// [`scatter_roots_full`].
 ///
 /// # Why the FR file rides in the stack container
 ///
@@ -336,9 +393,9 @@ pub(crate) fn scatter_roots(
 /// came from, so the FR words are relocated like any other root and [`scatter_roots_full`]
 /// copies them back out into `roots.fr`.
 ///
-/// This is the publish implementation shared by the in-slice heap-admission point
-/// ([`ensure_heap_full`]) and the runner's **park** arm, so a parked machine's FR file cannot
-/// dangle either.
+/// This is the publish implementation shared by the in-slice heap-admission doors
+/// ([`ensure_heap_full`] and [`alloc_words_rooted`]) and the runner's **park** arm, so a parked
+/// machine's FR file cannot dangle either.
 ///
 /// # `fr_count` — how much of the FR file is published
 ///
@@ -348,11 +405,13 @@ pub(crate) fn scatter_roots(
 /// all. The two callers pass the two ends of that bound:
 ///
 /// * the **in-slice heap-admission** doors ([`ensure_heap_full`], [`alloc_words_rooted`]) pass
-///   `roots.fr.len()` — the whole FR file — with a "collect, do not reason about it" meaning:
-///   they publish/scatter while the machine is *running*, so the SCATTER half (which writes
-///   renamed words back into the machine) must cover every slot the publish half put on the
-///   stack, their hand-off deliberately carries the FULL root set, and neither can cheaply
-///   prove the FR dead;
+///   the FR file's [`pointer_prefix_len`] ([`machine_root_bounds`]) — one past its last
+///   boxed-or-list slot, `0` for the `NIL`-only file a process that never touched a float
+///   hands over. The hand-off carries the machine's whole live root set: the bound omits only
+///   slots that are *immediates*, which no collection could relocate or keep alive, and every
+///   **live** float register holds a boxed float term and so lies inside the bound. The SCATTER
+///   half (which writes renamed words back into the machine) is given the same count, so it
+///   covers exactly what the publish half put on the stack;
 /// * the runner's **park** arm passes the engine's
 ///   [`Machine::fr_mark`](beam_engine::Machine::fr_mark) — the exact number of live leading FR
 ///   slots, i.e. one past the highest slot a `Machine::set_fr` has written since the machine's
@@ -688,8 +747,8 @@ pub(crate) fn ensure_heap(
 }
 
 /// The engine's heap-admission point for a scheduled slice, taking the machine's **whole**
-/// live root set ([`RootSet`]: the x-register file, the whole Erlang stack **and the whole FR
-/// file**).
+/// live root set ([`RootSet`]: the x-register file, the whole Erlang stack **and the FR
+/// file**, each register file bounded to its pointer-bearing prefix — see below).
 ///
 /// This is the full-root twin of [`ensure_heap`], reached by
 /// `Machine::ensure_heap`/`test_heap`/`allocate_heap` through
@@ -697,9 +756,11 @@ pub(crate) fn ensure_heap(
 /// The gate order is the narrow door's — the latch, the forced-collection request, the
 /// collectability test, the "this door has a caller module" test, the table/process lookup, the
 /// occupancy-or-debt test and the "committed" request consume — and only the root hand-off
-/// differs: it publishes and scatters `roots` (every x slot, the whole stack, the whole FR file)
-/// through [`publish_roots_full`]/[`scatter_roots_full`] instead of a `live`-bounded x prefix.
-/// It applies **no caller-module float guard**: because the FR file is published, this door is
+/// differs: it publishes and scatters `roots` — the whole stack plus each register file's
+/// [`pointer_prefix_len`] ([`machine_root_bounds`]) — through
+/// [`publish_roots_full`]/[`scatter_roots_full`] instead of a `live`-bounded x prefix.
+/// It applies **no caller-module float guard**: because the FR file's pointer-bearing prefix is
+/// published (and a live float register is a boxed float term, hence inside it), this door is
 /// **FR-safe for any module** — a live float register is relocated like any other root — so a
 /// float-using call site collects here exactly like a float-free one (see the module docs'
 /// float-guard section).
@@ -724,7 +785,12 @@ pub(crate) fn ensure_heap(
 /// FR file too, and ignores the hint (see [`publish_roots_full`]). Over-approximating a
 /// copying collector's root set is always safe, and the engine's `live` count is a hint the
 /// collector must not trust: an x slot the engine has declared dead can still be read later
-/// in the same run, so leaving it un-relocated makes the heap move out from under it.
+/// in the same run, so leaving it un-relocated makes the heap move out from under it. Bounding
+/// the file to its **pointer-bearing prefix** is not the same as trusting `live`: a
+/// dead-but-still-read slot holding a term is *boxed*, so it stays inside the bound, and only
+/// a slot that is an immediate is omitted — a word no later read can turn into a heap pointer
+/// (the engine writes a *fresh* pointer into a slot, and the next admission point re-derives
+/// the bound from the machine's then-current registers).
 ///
 /// # Errors
 ///
@@ -734,7 +800,7 @@ pub(crate) fn ensure_heap(
 pub(crate) fn ensure_heap_full(
     ctx: &mut RuntimeContext<'_>,
     heap_need: u32,
-    mut roots: RootSet<'_>,
+    roots: RootSet<'_>,
     armed: bool,
 ) -> Result<()> {
     if !armed {
@@ -780,6 +846,12 @@ pub(crate) fn ensure_heap_full(
     if !forced && !occupancy && !debt {
         return Ok(());
     }
+    // The **pointer-bearing prefix** of each register file, computed **once** (see the module
+    // docs' *pointer-bearing prefix* section): one past the last boxed-or-list word of the x file
+    // and of the FR file, or `0` for a file of immediates. Both the words this call classifies and
+    // the words it hands over are bounded by these two counts, so the valve can never see a word
+    // the hand-off does not carry, and vice versa. The stack is always whole.
+    let (x_count, fr_count) = machine_root_bounds(&roots);
     #[cfg(test)]
     valve_counters::note_reached(
         valve_counters::Door::EnsureHeapFull,
@@ -788,38 +860,37 @@ pub(crate) fn ensure_heap_full(
         forced,
         roots.x.len() + roots.stack.len() + roots.fr.len(),
     );
+    #[cfg(test)]
+    valve_counters::note_root_words(
+        valve_counters::Door::EnsureHeapFull,
+        roots.x.len() + roots.stack.len() + roots.fr.len(),
+        x_count + roots.stack.len() + fr_count,
+    );
     // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root in
     // a region the collector does not scan declines the move (see [`root_is_unscanned`]), so the
     // heap keeps its terms and the unscanned root stays valid. Tested after the occupancy
     // short-circuit and before the request is consumed, so a refused forced collection stays
     // armed for the runner's park arm. The descent is gated on `pid`'s foreign-reachability bit
     // and a hit opens it permanently, exactly as in [`ensure_heap`].
+    //
+    // The iterator is the bounded one, which is the *same* decision the full file would give:
+    // [`root_is_unscanned`] answers `false` for every word past the last pointer (they are
+    // immediates), so the bound can only skip work, never change the verdict.
     let descend = runtime.foreign_reachable(pid);
-    let declined = any_root_is_unscanned(
-        runtime.walk_scratch(),
-        process,
-        roots
-            .x
+    let machine_roots = || {
+        roots.x[..x_count]
             .iter()
             .chain(roots.stack.iter())
-            .chain(roots.fr.iter()),
-        descend,
-    );
+            .chain(roots.fr[..fr_count].iter())
+    };
+    let declined = any_root_is_unscanned(runtime.walk_scratch(), process, machine_roots(), descend);
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::EnsureHeapFull, descend, declined);
     #[cfg(test)]
     if declined {
         valve_counters::note_decline(
             valve_counters::Door::EnsureHeapFull,
-            valve_counters::classify_decline(
-                runtime.walk_scratch(),
-                process,
-                roots
-                    .x
-                    .iter()
-                    .chain(roots.stack.iter())
-                    .chain(roots.fr.iter()),
-            ),
+            valve_counters::classify_decline(runtime.walk_scratch(), process, machine_roots()),
         );
         let live_len = roots.live_len();
         valve_counters::note_first_decline(
@@ -839,10 +910,14 @@ pub(crate) fn ensure_heap_full(
         runtime.take_gc_request(pid);
     }
 
-    // This door publishes the **whole** FR file: it hands the machine's root set over while
-    // the machine is running, so it cannot bound the live prefix — the count is the file's own
-    // length, computed once and used for both halves (see [`publish_roots_full`]).
-    let fr_count = roots.fr.len();
+    // Hand the machine's root set over at exactly those bounds: this door hands it over while the
+    // machine is running, so it cannot bound the live prefix — but it need not, because every
+    // omitted word is an immediate, which no collection relocates and no reachability test reads.
+    // The narrowed `RootSet` is what makes the two halves (publish and scatter) use **one** length
+    // rule: each derives its counts from the slice lengths of the value it is handed, and both are
+    // handed the same narrowed value (see [`publish_roots_full`]).
+    let RootSet { x, stack, fr, live } = roots;
+    let mut roots = RootSet::new(&mut x[..x_count], stack, &mut fr[..fr_count], live);
     if !publish_roots_full(process, &roots, fr_count) {
         runtime.halt_process_gc(pid);
         return Ok(());
@@ -982,10 +1057,12 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 ///   **forced** collection has been requested (below). A collection or scatter failure halts
 ///   collection for that process
 ///   ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the arena. This door
-///   applies **no** caller-module float guard — it publishes the machine's **whole FR file**
-///   ([`publish_roots_full`]), so a live float register is relocated, not corrupted (see the
-///   module docs' float-guard section) — and it requires only that the run has a caller module
-///   to name at all, exactly as in [`ensure_heap_full`].
+///   applies **no** caller-module float guard — it hands the machine's **whole live root set**
+///   over, each register file bounded only to its pointer-bearing prefix
+///   ([`machine_root_bounds`], which always contains every live float register, since a live
+///   float register is a boxed float term), so a live float register is relocated, not corrupted
+///   (see the module docs' float-guard section) — and it requires only that the run has a caller
+///   module to name at all, exactly as in [`ensure_heap_full`].
 ///
 /// # Grow-and-retry before the valve
 ///
@@ -1025,7 +1102,7 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 pub(crate) fn alloc_words_rooted(
     ctx: &mut RuntimeContext<'_>,
     n: usize,
-    mut roots: RootSet<'_>,
+    roots: RootSet<'_>,
     armed: bool,
 ) -> Result<*mut Eterm> {
     let pid = ctx.mailbox_pid;
@@ -1125,6 +1202,10 @@ pub(crate) fn alloc_words_rooted(
     // The descent is gated on `pid`'s foreign-reachability bit and a hit opens it permanently,
     // exactly as in [`ensure_heap`]. A declined collection leaves a forced request **armed**,
     // exactly as at [`ensure_heap_full`], so the runner's park arm may still serve it.
+    // The **pointer-bearing prefix** of each register file, computed once and used for the valve's
+    // iterator *and* for both halves of the hand-off — exactly as at [`ensure_heap_full`] (see the
+    // module docs' *pointer-bearing prefix* section for why the bound loses no root).
+    let (x_count, fr_count) = machine_root_bounds(&roots);
     let descend = runtime.foreign_reachable(pid);
     #[cfg(test)]
     valve_counters::note_reached(
@@ -1134,31 +1215,26 @@ pub(crate) fn alloc_words_rooted(
         forced,
         roots.x.len() + roots.stack.len() + roots.fr.len(),
     );
-    let declined = any_root_is_unscanned(
-        runtime.walk_scratch(),
-        process,
-        roots
-            .x
+    #[cfg(test)]
+    valve_counters::note_root_words(
+        valve_counters::Door::AllocWordsRooted,
+        roots.x.len() + roots.stack.len() + roots.fr.len(),
+        x_count + roots.stack.len() + fr_count,
+    );
+    let machine_roots = || {
+        roots.x[..x_count]
             .iter()
             .chain(roots.stack.iter())
-            .chain(roots.fr.iter()),
-        descend,
-    );
+            .chain(roots.fr[..fr_count].iter())
+    };
+    let declined = any_root_is_unscanned(runtime.walk_scratch(), process, machine_roots(), descend);
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::AllocWordsRooted, descend, declined);
     #[cfg(test)]
     if declined {
         valve_counters::note_decline(
             valve_counters::Door::AllocWordsRooted,
-            valve_counters::classify_decline(
-                runtime.walk_scratch(),
-                process,
-                roots
-                    .x
-                    .iter()
-                    .chain(roots.stack.iter())
-                    .chain(roots.fr.iter()),
-            ),
+            valve_counters::classify_decline(runtime.walk_scratch(), process, machine_roots()),
         );
         let live_len = roots.live_len();
         valve_counters::note_first_decline(
@@ -1184,10 +1260,11 @@ pub(crate) fn alloc_words_rooted(
     if forced {
         runtime.take_gc_request(pid);
     }
-    // This door publishes the **whole** FR file: it hands the machine's root set over while
-    // the machine is running, so it cannot bound the live prefix — the count is the file's own
-    // length, computed once and used for both halves (see [`publish_roots_full`]).
-    let fr_count = roots.fr.len();
+    // The machine's root set is handed over at the same two bounds the valve classified: the
+    // narrowed `RootSet` is what makes the publish and scatter halves share one length rule, and
+    // the omitted tail is immediate-only, so nothing a collection could relocate is left behind.
+    let RootSet { x, stack, fr, live } = roots;
+    let mut roots = RootSet::new(&mut x[..x_count], stack, &mut fr[..fr_count], live);
     if !publish_roots_full(process, &roots, fr_count) {
         runtime.halt_process_gc(pid);
         #[cfg(test)]
@@ -1295,10 +1372,24 @@ pub(crate) mod valve_counters {
         pub(crate) descents: usize,
         /// How many ran a real collection.
         pub(crate) collections: usize,
-        /// The **machine root words** handed to the valve at those calls — the exact size of
-        /// phase 1's `Walk::seed` loop over the caller's own root set (the whole x-register
-        /// file, the whole Erlang stack and the whole FR file for the full-root doors).
+        /// The **machine root words** the door's caller *declared* at those calls — the whole
+        /// x-register file, the whole Erlang stack and the whole FR file for the full-root doors
+        /// (`x.len() + stack.len() + fr.len()`), the x prefix plus the stack for the narrow one.
+        /// This is the size of the root set the door was handed, **not** the size of the phase-1
+        /// seed loop: since the full doors bound each register file to its
+        /// [`pointer_prefix_len`](super::pointer_prefix_len), the words actually classified and
+        /// published are [`Self::published_words`].
         pub(crate) machine_words: usize,
+        /// The same word count, repeated explicitly as the **declared** figure (see
+        /// [`Self::machine_words`]): recorded together with [`Self::published_words`] by
+        /// `note_root_words`, so one measurement pins both halves of the bound.
+        pub(crate) declared_words: usize,
+        /// The machine root words the door actually **handed over** — the pointer-bearing x
+        /// prefix plus the **whole** Erlang stack plus the pointer-bearing FR prefix
+        /// (`x_count + stack.len() + fr_count`). This is the exact size of phase 1's
+        /// `Walk::seed` loop over the caller's own root set, and of the region
+        /// [`super::publish_roots_full`] pushed onto the process stack.
+        pub(crate) published_words: usize,
     }
 
     impl DoorCounts {
@@ -1316,6 +1407,8 @@ pub(crate) mod valve_counters {
             descents: 0,
             collections: 0,
             machine_words: 0,
+            declared_words: 0,
+            published_words: 0,
         };
     }
 
@@ -1488,6 +1581,21 @@ pub(crate) mod valve_counters {
             tally.debt += usize::from(debt);
             tally.forced += usize::from(forced);
             tally.machine_words += machine_words;
+            counters.set(value);
+        });
+    }
+
+    /// Records one valve call's **root-word bound**: the words the caller *declared* and the words
+    /// the door actually **handed over** (`published_words`). Called by the two full-root doors
+    /// next to [`note_reached`], once per reach, so a test can pin the bound as a **structure** —
+    /// the words the bound omits are exactly the declared words minus the published ones — rather
+    /// than as a wall clock (see [`DoorCounts::published_words`]).
+    pub(crate) fn note_root_words(door: Door, declared_words: usize, published_words: usize) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            let tally = value.door_mut(door);
+            tally.declared_words += declared_words;
+            tally.published_words += published_words;
             counters.set(value);
         });
     }
@@ -1799,6 +1907,164 @@ mod tests {
             rt.gc_stats().fallbacks,
             0,
             "no allocation may fall back to the pointer-stable arena once growth is available"
+        );
+    }
+
+    /// The x-prefix and FR-prefix lengths a full-root door's hand-off left in `pid`'s root set:
+    /// the registers' live x count, and the words on the process stack **beyond** `stack_words`
+    /// (the FR words ride there, after the stack — see [`publish_roots_full`]).
+    fn published_register_prefix(
+        table: &ProcessTable,
+        pid: beam_process::ProcessId,
+        stack_words: usize,
+    ) -> (usize, usize) {
+        let registers = table.get(pid).expect("the process").registers();
+        (
+            registers.x().live(),
+            registers.stack().len().saturating_sub(stack_words),
+        )
+    }
+
+    /// **The full-root doors bound each register file to its pointer-bearing prefix.**
+    ///
+    /// The engine always hands over its **whole** register files (`Machine::x` and `Machine::fr`
+    /// are each 1024 slots), and in a real workload they are overwhelmingly `NIL`. A copying
+    /// collector acts on a root word only if it is a heap pointer, and [`root_is_unscanned`]
+    /// answers `false` for every word that is neither boxed nor a list — so the door may bound each
+    /// file to one past its last boxed-or-list word and only skip work: a word past the bound is an
+    /// immediate, which no collection relocates and no reachability test reads.
+    ///
+    /// This pins the bound as a **structure** — the door's own root-word counters plus the root set
+    /// the hand-off leaves in the process — never as a wall clock:
+    ///
+    /// 1. an all-immediate x/FR file publishes **zero** words from either file;
+    /// 2. a boxed word at a **high** index (slot 1000) is included, so the bound is
+    ///    "last pointer-bearing index + 1" and never a low-water guess;
+    /// 3. the published word count is exactly that bound plus the whole stack — the declared
+    ///    (whole-file) count is what the door is *handed*, and the difference between the two
+    ///    counters is exactly the immediate tail the bound omits.
+    #[test]
+    fn the_full_root_doors_publish_only_the_pointer_bearing_prefix_of_each_register_file() {
+        // The rig the other inline cases build: a real runtime plus the pass's own process table
+        // (two separate values, as in the runner's `take_processes` split) and a process in it.
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+
+        // The engine's own shape: a 1024-slot x file, a 1024-slot FR file, a short stack.
+        const FILE: usize = 1024;
+        let mut x = vec![NIL; FILE];
+        let mut fr = vec![NIL; FILE];
+        let mut stack = vec![NIL; 3];
+        let stack_words = stack.len();
+
+        // (1) Every word of both files is an immediate: the door is handed ~2 Ki words and
+        //     publishes only the stack.
+        valve_counters::reset();
+        rt.request_gc(pid);
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.current_module = Some("gc_ints".to_string());
+            ensure_heap_full(
+                &mut ctx,
+                0,
+                RootSet::new(&mut x[..], &mut stack[..], &mut fr[..], 1),
+                true,
+            )
+            .expect("the heap-admission point never fails the program");
+        }
+        let immediates = valve_counters::snapshot().ensure_heap_full;
+        assert_eq!(
+            immediates.reached, 1,
+            "the door's single valve call; {immediates:?}"
+        );
+        assert_eq!(
+            immediates.declared_words,
+            FILE + stack_words + FILE,
+            "the door is handed both whole register files; {immediates:?}"
+        );
+        assert_eq!(
+            immediates.published_words, stack_words,
+            "an all-immediate x/FR file publishes nothing: only the stack is a root; \
+             {immediates:?}"
+        );
+        assert_eq!(
+            published_register_prefix(&table, pid, stack_words),
+            (0, 0),
+            "no x and no FR word may reach the process root set from an all-immediate file"
+        );
+
+        // (2) + (3) A pointer at a **high** index. The two boxed terms live on the process's own
+        //     young heap (built after the collection above emptied it), and they sit at x[1000]
+        //     and fr[5], so the bound is 1001 x words and 6 FR words.
+        let high = table
+            .get_mut(pid)
+            .expect("the process")
+            .heap_mut()
+            .tuple(&[make_small(11), make_small(12)])
+            .expect("the nursery builds {11,12}");
+        let fifth = table
+            .get_mut(pid)
+            .expect("the process")
+            .heap_mut()
+            .tuple(&[make_small(13), make_small(14)])
+            .expect("the nursery builds {13,14}");
+        assert!(
+            beam_term::prelude::is_boxed(high) && beam_term::prelude::is_boxed(fifth),
+            "both terms are boxed heap pointers, so both are pointer-bearing roots"
+        );
+        x[1_000] = high;
+        fr[5] = fifth;
+
+        valve_counters::reset();
+        rt.request_gc(pid);
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.current_module = Some("gc_ints".to_string());
+            ensure_heap_full(
+                &mut ctx,
+                0,
+                RootSet::new(&mut x[..], &mut stack[..], &mut fr[..], 1),
+                true,
+            )
+            .expect("the heap-admission point never fails the program");
+        }
+        let bounded = valve_counters::snapshot().ensure_heap_full;
+        assert_eq!(
+            bounded.reached, 1,
+            "the door's single valve call; {bounded:?}"
+        );
+        assert_eq!(bounded.collections, 1, "the collection really ran; {bounded:?}");
+        assert_eq!(
+            bounded.declared_words,
+            FILE + stack_words + FILE,
+            "the declared count is unchanged by the bound; {bounded:?}"
+        );
+        assert_eq!(
+            bounded.published_words,
+            1_001 + stack_words + 6,
+            "the bound is last-pointer-index + 1 on each file (x[1000] -> 1001, fr[5] -> 6) plus \
+             the whole stack; {bounded:?}"
+        );
+        let (published_x, published_fr) = published_register_prefix(&table, pid, stack_words);
+        assert_eq!(
+            (published_x, published_fr),
+            (1_001, 6),
+            "the hand-off publishes exactly the bound: a high x slot is never dropped"
+        );
+        assert_eq!(
+            bounded.published_words,
+            published_x + stack_words + published_fr,
+            "the counter is the hand-off's own region: x prefix + whole stack + FR prefix"
+        );
+        assert!(
+            bounded.declared_words - bounded.published_words == (FILE - 1_001) + (FILE - 6),
+            "what the bound omits is exactly the immediate tail of each file: \
+             declared={} published={}",
+            bounded.declared_words,
+            bounded.published_words
         );
     }
 }
