@@ -37,6 +37,14 @@ fixtures: real `.beam` images produced by the **system Erlang** toolchain (OTP 2
   that resolves this runtime's `-sname` listener through `epmd` and sends
   `{echo, Node} ! {hello, node()}` makes the message arrive as a `DOP_REG_SEND` in the
   running process's mailbox — the value `wait/0` returns *is* the delivered payload.
+* `bifent.beam` / `tmr.beam` are the **first-entry BIF dispatch** images
+  (`tests/bif_entry_spawn.rs`): `bifent:fire/0` is `spawn(erlang, send, [self(), done])` followed
+  by a bounded receive (`bifent:queued/0` is the regression guard — `self() ! done` then the same
+  receive), and `tmr:fire/0` arms `timer:apply_after(50, erlang, send, [self(), done])`, whose
+  `timer_server` runs the MFA as a **spawned process** (`spawn(erlang, send, …)`). A spawned
+  entry naming a host-served MFA must be dispatched to the BIF; entering `erlang.beam`'s stub
+  instead raises the bare atom `undefined`, so both answer `timeout` where the oracle answers
+  `done`.
 
 ## The scheduled-route `epp` pair (`epp_forms.erl` / `epp_input.erl`, compiled at test time)
 
@@ -247,6 +255,13 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
 cp remote_send.erl "$SCRATCH/gen/"
 ( cd "$SCRATCH/gen" && erlc +deterministic remote_send.erl )
 cp "$SCRATCH/gen/remote_send.beam" remote_send.beam
+
+# bifent.beam (720 bytes) + tmr.beam (660 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_bif_entry_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp bifent.erl tmr.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic bifent.erl tmr.erl )
+cp "$SCRATCH/gen/bifent.beam" "$SCRATCH/gen/tmr.beam" .
 ```
 Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
 absolute checkout path is embedded in any committed `.beam`.
@@ -319,6 +334,25 @@ scheduler quiescent (an empty run queue, nothing to poll, no pending timer), so
 message can arrive. The per-iteration deadline keeps a pass stepping, so the distribution half
 (`pump_dist`) keeps draining the accepted link until the delivery arrives.
 
+`bifent.erl` / `tmr.erl` (the inputs, also committed):
+
+```erlang
+-module(bifent).
+-export([fire/0, queued/0]).
+
+fire()   -> spawn(erlang, send, [self(), done]),
+            receive M -> M after 1500 -> timeout end.
+queued() -> self() ! done,
+            receive M -> M after 1500 -> timeout end.
+```
+
+```erlang
+-module(tmr).
+-export([fire/0]).
+
+fire() -> timer:apply_after(50, erlang, send, [self(), done]),
+          receive M -> M after 1500 -> timeout end.
+```
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 

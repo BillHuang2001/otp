@@ -1335,7 +1335,8 @@ impl Evaluator<'_, '_> {
     ///   window with no pending deadline is slept out, so `receive _ -> ok after 300 -> ok
     ///   end` takes the oracle's 300 ms rather than returning at once — and the loop is
     ///   driven by real deadlines only, so the case with nothing to run, no port output and
-    ///   no timer cannot busy-spin.    /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
+    ///   no timer cannot busy-spin.
+    /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
     ///   runnable and then reports the typed capability gap `receive: no matching message
     ///   arrived` rather than hanging (there is no host timer to block on in Milestone 1).
     fn receive(&mut self, receive: &ast::Receive, env: &mut Env) -> EResult<Eterm> {
@@ -1395,7 +1396,8 @@ impl Evaluator<'_, '_> {
                         // window itself has elapsed, so run the `after` body.
                         break;
                     }
-                }                let mut body_env = env.clone();
+                }
+                let mut body_env = env.clone();
                 self.exprs(body, &mut body_env)
             }
             None => loop {
