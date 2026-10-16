@@ -43,8 +43,9 @@
 //!
 //! * at `N` iterations ⇒ `case_<name>_wall_ms` (end-to-end process wall time),
 //! * at `0` iterations ⇒ `case_<name>_startup_ms` (the same program's pure
-//!   startup/boot cost — the Rust runtime resolves its system code path by spawning
-//!   `erl` once, so this is not zero),
+//!   startup/boot cost — the Rust runtime loads its preloaded-module set and resolves its
+//!   system code path with a native filesystem probe (`crates/beam_rt/src/codeserver.rs`;
+//!   the system `erl` is only *run* as a last resort), so this is not zero),
 //!
 //! and derives the startup-cancelled marginal
 //!

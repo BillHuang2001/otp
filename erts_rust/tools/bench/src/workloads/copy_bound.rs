@@ -22,11 +22,10 @@
 //! *both* runtimes (the system oracle and the Rust runtime `beam_rt`).
 //!
 //! Every repo-backed workload (Cowboy, Khepri, EMQX, PLB, the compilers) is `sys`-only, so
-//! the only cross-runtime signals were `list_walk`/`foreign`, both **compute**-bound. The
-//! rewrite surface that `ERTS_RUST_REWRITE_TEST_PROJECTS.md` calls the *messaging/copy
-//! boundary* — the point where a term must leave its owning process (ETF encoding, ETS,
-//! process-to-process send) — had no cross-runtime measurement at all. This workload
-//! supplies it.
+//! the only cross-runtime signals were `list_walk`/`foreign`, both **compute**-bound. This
+//! workload supplies the *messaging/copy boundary* signal that
+//! `ERTS_RUST_REWRITE_TEST_PROJECTS.md` names — the point where a term must leave its owning
+//! process (ETF encoding, ETS, process-to-process send).
 //!
 //! # The four cases (all in one embedded module)
 //!
@@ -37,62 +36,49 @@
 //!
 //! * `etf_roundtrip` — `term_to_binary/1` + `binary_to_term/1`: the **External Term Format
 //!   wire codec** (contract A.5) — the encoding a distributed node puts on the line.
-//! * `ets_copy` — `ets:insert/2` + `ets:lookup/2`: the **ETS copy boundary** (the term is
-//!   copied into the table and copied back out). One table and one key per process, so the
-//!   table never grows and the measured work is the copy, not table growth.
+//! * `ets_copy` — `ets:insert/2` + `ets:lookup/2`: the **ETS copy boundary** (copied into
+//!   the table and back out). One table and one key per process, so the table never grows
+//!   and the measured work is the copy, not table growth.
 //! * `send_recv` — a term is sent to a second process, round-tripped through
 //!   `term_to_binary/1` there, and sent back: **both directions** of the process copy
 //!   boundary. An `after` guard turns a missing reply into a loud failure, never a hang.
-//! * `send_recv_plain` — the **same two-process delivery shape as `send_recv` with *no*
-//!   ETF codec call in the receiver**: the worker replies the payload *directly*
-//!   (`From ! {self(), T}`). This isolates pure two-way process copy/delivery from the
-//!   codec, so `send_recv − send_recv_plain` attributes the ETF component *inside* the
-//!   two-process path (it mirrors the `beam_process`/`beam_message` delivery shape the
-//!   sibling crates asked for). Identical bound-variable validation and identical
-//!   `after`-guard: a missing reply is a loud `exit(message_timeout)`, never a hang.
+//! * `send_recv_plain` — the **same two-process delivery shape with *no* ETF codec call in
+//!   the receiver** (the worker replies `From ! {self(), T}` directly), so the
+//!   `send_recv − send_recv_plain` difference attributes the codec component *inside* the
+//!   two-process path (the `beam_process`/`beam_message` delivery shape). Same
+//!   bound-variable validation and same `after`-guard.
 //!
 //! The payload is *generated from this crate's constants* (see [`module_source`]), so the
 //! Rust and Erlang sides cannot drift.
 //!
 //! # The measurement (startup-cancelled, per op)
 //!
-//! The two runtimes differ by one to two orders of magnitude per op, so one fixed loop
-//! count cannot give both a measurable marginal: an `N` that is a real signal for the Rust
-//! runtime is below the oracle's own run-to-run startup noise. Each case therefore declares
-//! a **per-runtime loop count** `N` and the workload runs the identical program twice per
-//! sample:
-//!
-//! * at `N` ops ⇒ `case_<name>_wall_ms` (end-to-end process wall time),
-//! * at `0` ops ⇒ `case_<name>_startup_ms` (the same program's pure startup/boot cost — the
-//!   Rust runtime resolves its system code path by spawning `erl` once, so this is not zero),
-//!
-//! and derives the throughput metric
+//! Each case declares a **per-runtime loop count** `N` (calibrated by the rule in the case
+//! table's doc comment) and runs the identical program twice per sample: at `N` ops
+//! (`case_<name>_wall_ms`) and at `0` ops (`case_<name>_startup_ms`, the same program's pure
+//! startup/boot cost — the Rust runtime loads its preloaded-module set and resolves its
+//! system code path with a native filesystem probe (`crates/beam_rt/src/codeserver.rs`; the
+//! system `erl` is only *run* as a last resort), so this is not zero). The derived metric
 //!
 //! ```text
 //! case_<name>_ns_per_op = (mean(wall_ms) - mean(startup_ms)) / N * 1e6
 //! ```
 //!
-//! which cancels the fixed process-startup cost from both sides. It is emitted only when
-//! the marginal is positive; otherwise a note records that the marginal is below timer
-//! resolution — never a fabricated or negative number.
-//!
-//! Because the *timing* is only as stable as the host, the workload also emits
-//! `case_<name>_ops = N`, the deterministic number of copy round-trips the figure was
-//! derived from. That metric is **contention-immune**: it stays correct and comparable on
-//! a loaded machine (a shared benchmark host moves the wall-clock rows several-fold).
+//! cancels the fixed process-startup cost from both sides and is emitted only when the
+//! marginal is positive; otherwise a note records that the marginal is below timer
+//! resolution — never a fabricated or negative number. The deterministic
+//! `case_<name>_ops = N` companion is **contention-immune**, so the `N` behind every wall
+//! figure is always in the report (never compare raw `wall_ms` across sides with different
+//! `N`).
 //!
 //! # Honest reporting
 //!
-//! * Every runtime's stdout must equal the deterministic `N * PER_OP`; a mismatch is
-//!   recorded as a note.
-//! * A Rust exit `3` (`beam_rt: unsupported: …`) records the capability gap and emits
-//!   **no** timing for that case — the row is never a fabricated number.
-//! * `erlc` unavailable ⇒ an honest `skipped(erlc-absent)`.
-//! * The embedded module failing to compile is a **failure**
-//!   (`module-compile-failed`), never a skip: the source is ours.
-//!
-//! Everything is staged in a private, self-cleaning [`ScratchDir`] under `$TMPDIR`; the
-//! workload never writes outside it and never panics.
+//! Every runtime's stdout must equal the deterministic `N * PER_OP` (a mismatch is a note).
+//! A Rust exit `3` (`beam_rt: unsupported: …`) records the capability gap and emits **no**
+//! timing for that case; `erlc` unavailable ⇒ `skipped(erlc-absent)`; the embedded module
+//! failing to compile is a **failure** (`module-compile-failed`), never a skip (the source
+//! is ours). Everything is staged in a private, self-cleaning [`ScratchDir`] under
+//! `$TMPDIR`; the workload never writes outside it and never panics.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -159,7 +145,8 @@ struct Case {
     name: &'static str,
     /// The exported driver function (arity 1: the loop count).
     function: &'static str,
-    /// Loop count calibrated for the Rust runtime (a few hundred ms per run).
+    /// Loop count calibrated for the Rust runtime (target: ≥0.5 s of loop work, ≳1.5 s for
+    /// the case whose marginal had fallen into the boot-jitter band).
     n_rust: i64,
     /// Loop count calibrated for the system-runtime oracle (a marginal well above its own
     /// run-to-run startup noise).
@@ -178,35 +165,44 @@ impl Case {
 
 /// The fixed case table.
 ///
-/// `n_rust`/`n_sys` were calibrated on the reference host (see the crate CONTEXT — a
-/// heavily loaded shared machine) so that one run's *marginal* cost is a few hundred
-/// milliseconds on the Rust runtime and ~0.5–2 s on the oracle, i.e. far above the
-/// oracle's run-to-run startup noise. They are **constants, not measurements**, and the
-/// reported metric is normalized per op; a loop count whose marginal falls below the timer
-/// noise yields **no** per-op metric (an honest note), never a fabricated one.
+/// The `n_rust`/`n_sys` values are **constants, not measurements**, calibrated on the
+/// reference host (a heavily loaded shared machine — see the crate CONTEXT) under one rule:
+/// **a runtime's timed loop must do enough work that its marginal cost stands clear of that
+/// runtime's own run-to-run boot/startup jitter**, measured here at ≈±0.1 s on the rust boot
+/// (≈0.7–1.5 s under load). The rust-side floor is **≥0.5 s of loop work** (≈5× that
+/// jitter); `etf_roundtrip` — the case whose marginal had collapsed *inside* the band — is
+/// targeted at **≳1.5 s** (as is the sibling `list_walk`). Measured rust per-op cost
+/// (2026-10-16, `/proc/loadavg` 45–100, min-of-reps, default baseline-JIT tier): ≈54 µs
+/// (`etf_roundtrip`), ≈7 µs (`ets_copy`), ≈150 µs (`send_recv`), ≈115 µs
+/// (`send_recv_plain`) — so the counts below are ≈1.4–2.2 s of work; the pre-recalibration
+/// `n_rust` (5 000/100 000/2 000/2 000) were ≈0.27/0.7/0.3/0.2 s. The metric is normalized
+/// **per op**, so the counts only have to keep both marginals measurable, and the
+/// deterministic `case_<name>_ops` companion records the `N` behind every figure — never
+/// compare raw `wall_ms` across sides with different `N`. A loop count whose marginal falls
+/// below the timer noise yields **no** per-op metric (an honest note), never a number.
 static CASES: &[Case] = &[
     Case {
         name: "etf_roundtrip",
         function: ETF,
-        n_rust: 5_000,
+        n_rust: 40_000,
         n_sys: 1_500_000,
     },
     Case {
         name: "ets_copy",
         function: ETS,
-        n_rust: 100_000,
+        n_rust: 200_000,
         n_sys: 2_000_000,
     },
     Case {
         name: "send_recv",
         function: SR,
-        n_rust: 2_000,
+        n_rust: 10_000,
         n_sys: 500_000,
     },
     Case {
         name: "send_recv_plain",
         function: SR_PLAIN,
-        n_rust: 2_000,
+        n_rust: 15_000,
         n_sys: 1_000_000,
     },
 ];
@@ -672,28 +668,24 @@ impl Workload for CopyBound {
             let outcome = execute_case(program, kind, dir, case, runs);
             if outcome.ok() {
                 ok_cases += 1;
-                result.metrics.push(Metric::samples(
-                    format!("case_{}_wall_ms", case.name),
-                    "ms",
-                    &outcome.wall,
-                ));
-                if !outcome.startup.is_empty() {
-                    result.metrics.push(Metric::samples(
-                        format!("case_{}_startup_ms", case.name),
-                        "ms",
-                        &outcome.startup,
-                    ));
-                }
-                if !outcome.rss.is_empty() {
-                    result.metrics.push(Metric::samples(
-                        format!("case_{}_peak_rss_bytes", case.name),
-                        "bytes",
-                        &outcome.rss,
-                    ));
-                    for &bytes in &outcome.rss {
-                        let bytes = bytes as u64;
-                        overall_peak = Some(overall_peak.map_or(bytes, |peak| peak.max(bytes)));
+                // One `Metric::samples` row per non-empty sample set (the `0`-op startup
+                // pass can be absent if it broke, so only push what we have).
+                for (suffix, unit, values) in [
+                    ("wall_ms", "ms", &outcome.wall),
+                    ("startup_ms", "ms", &outcome.startup),
+                    ("peak_rss_bytes", "bytes", &outcome.rss),
+                ] {
+                    if !values.is_empty() {
+                        result.metrics.push(Metric::samples(
+                            format!("case_{}_{suffix}", case.name),
+                            unit,
+                            values,
+                        ));
                     }
+                }
+                for &bytes in &outcome.rss {
+                    let bytes = bytes as u64;
+                    overall_peak = Some(overall_peak.map_or(bytes, |peak| peak.max(bytes)));
                 }
                 match ns_per_op(&outcome.wall, &outcome.startup, outcome.n) {
                     Some(ns) => result.metrics.push(Metric::scalar(
@@ -801,6 +793,32 @@ mod tests {
         }
     }
 
+    /// The m14 recalibration: every rust loop count must be large enough that the loop's
+    /// marginal stands clear of the rust side's ≈±0.1 s run-to-run boot jitter (a ≥0.5 s
+    /// floor), and the case whose marginal had actually collapsed inside that band
+    /// (`etf_roundtrip`, ≈0.27 s at the old `N` = 5 000) is targeted at ≳1.5 s.
+    #[test]
+    fn the_rust_loop_counts_clear_the_boot_jitter_band() {
+        // Per-op costs measured on the reference host (2026-10-16, min-of-reps, default
+        // baseline-JIT tier) — see the case table's doc comment. Every rust loop must do
+        // ≥0.5 s of work (≈5× the ≈±0.1 s boot jitter) and stay within a few seconds;
+        // `etf_roundtrip` — the case whose marginal had collapsed into the band — ≳1.5 s.
+        const COST_NS: &[(&str, f64, i64)] = &[
+            ("etf_roundtrip", 54_000.0, 40_000),
+            ("ets_copy", 7_000.0, 200_000),
+            ("send_recv", 150_000.0, 10_000),
+            ("send_recv_plain", 115_000.0, 15_000),
+        ];
+        assert_eq!(COST_NS.len(), CASES.len());
+        for (name, ns_per_op, n_rust) in COST_NS {
+            let case = CASES.iter().find(|c| c.name == *name).expect("case");
+            assert_eq!(case.n_rust, *n_rust, "{name}: the recalibrated count");
+            let work_s = *n_rust as f64 * ns_per_op / 1e9;
+            assert!((0.5..=5.0).contains(&work_s), "{name}: {work_s} s of work");
+        }
+        let etf = CASES.iter().find(|c| c.name == "etf_roundtrip").unwrap();
+        assert!(etf.n_rust as f64 * 54_000.0 / 1e9 >= 1.5);
+    }
     #[test]
     fn argv_carries_the_loop_count_and_the_pa_dir_for_both_runtimes() {
         let dir = Path::new("/tmp/xyz");

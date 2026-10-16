@@ -66,8 +66,9 @@
 //!
 //! * at `N` walks ⇒ `case_list_walk_wall_ms` (end-to-end process wall time),
 //! * at `0` walks ⇒ `case_list_walk_startup_ms` (the same program's pure startup/boot
-//!   cost — the Rust runtime resolves its system code path by spawning `erl` once, so
-//!   this is far from zero),
+//!   cost — the Rust runtime loads its preloaded-module set and resolves its system code
+//!   path with a native filesystem probe (`crates/beam_rt/src/codeserver.rs`; the system
+//!   `erl` is only *run* as a last resort), so this is far from zero),
 //!
 //! and derives the throughput metric
 //!
@@ -133,20 +134,29 @@ const PER_SUM: i64 = LEN * (LEN + 1) / 2;
 /// The one case: the loop counts per runtime.
 ///
 /// `n_rust`/`n_sys` are **constants, not measurements**, calibrated on the reference host
-/// (a heavily loaded shared machine — see the crate CONTEXT) so that a single run's
-/// *marginal* cost stays a few hundred milliseconds on both sides. Measured per-element
-/// cost on that host, as `/proc/loadavg` moved from ~80 to ~270:
+/// (a heavily loaded shared machine — see the crate CONTEXT) under one rule: **a runtime's
+/// timed loop must do enough work that its marginal cost stands clear of that runtime's own
+/// run-to-run boot/startup jitter** (measured at ≈±0.1 s on the rust side's ≈0.7–1.5 s
+/// boot). The rust-side target is **≳1.5 s of loop work**; the oracle's much smaller
+/// startup jitter (tens of ms) needs a correspondingly smaller marginal.
 ///
-/// * Rust: ~250–1200 ns/element ⇒ `n_rust = 1_000` walks (10^6 elements) is 0.25–1.2 s;
-/// * oracle: ~3–12 ns/element ⇒ `n_sys = 100_000` walks (10^8 elements) is 0.3–1.2 s,
-///   i.e. far above its run-to-run startup noise (tens of ms).
+/// Measured per-element cost on that host by direct `beam_rt`/`erl` ladders (2026-10-16,
+/// `/proc/loadavg` 45–100, min-of-reps):
 ///
-/// The reported metric is normalized per element, so the loop counts only have to keep
-/// both marginals measurable — not to equalize the two runtimes' totals.
+/// * Rust, **default (baseline-JIT) tier**: **~31–33 ns/element** ⇒ `n_rust = 50_000` walks
+///   (5×10^7 elements) is ≈1.6 s;
+/// * Rust with `BEAM_RT_TIER=interpreter`: ~400 ns/element (a Rust-vs-Rust tier fact, never
+///   a `sys` comparison);
+/// * oracle: **~5–7 ns/element** ⇒ `n_sys = 100_000` walks (10^8 elements) is ≈0.5–1.0 s.
+///
+/// The reported metric is normalized **per element**, so the loop counts only have to keep
+/// both marginals measurable — not to equalize the two runtimes' totals. Never compare raw
+/// `wall_ms` across two sides with different `N`: the `case_list_walk_elements` companion
+/// records the `N` behind every figure.
 struct Case {
     /// Stable, short case name (used in the metric names, e.g. `case_<name>_wall_ms`).
     name: &'static str,
-    /// Loop count calibrated for the Rust runtime.
+    /// Loop count calibrated for the Rust runtime (target: ≳1.5 s of loop work).
     n_rust: i64,
     /// Loop count calibrated for the system-runtime oracle.
     n_sys: i64,
@@ -165,7 +175,7 @@ impl Case {
 /// The single case.
 static CASE: Case = Case {
     name: "list_walk",
-    n_rust: 1_000,
+    n_rust: 50_000,
     n_sys: 100_000,
 };
 
@@ -626,6 +636,20 @@ mod tests {
             CASE.n_sys > CASE.n_rust,
             "the oracle loop must be the larger one"
         );
+    }
+
+    /// The m14 recalibration: the rust loop count must be large enough that the loop's
+    /// marginal stands clear of the rust side's ≈±0.1 s run-to-run boot jitter. At the
+    /// measured ≈32 ns/element (default baseline-JIT tier, 2026-10-16) the old `N` = 1 000
+    /// was only ≈32 ms of work — inside the jitter band, which is exactly why the metric
+    /// stopped resolving; the new `N` is ≳1.5 s of work and still only a few seconds.
+    #[test]
+    fn the_rust_loop_count_clears_the_boot_jitter_band() {
+        const RUST_NS_PER_ELEMENT: f64 = 32.0; // measured; see the `Case` doc comment
+        assert_eq!(CASE.n_rust, 50_000, "the recalibrated rust loop count");
+        let work_s = CASE.n_rust as f64 * LEN as f64 * RUST_NS_PER_ELEMENT / 1e9;
+        assert!(work_s >= 1.5, "the rust loop must do ≳1.5 s of work: {work_s} s");
+        assert!(work_s <= 5.0, "the rust loop must stay a few seconds: {work_s} s");
     }
 
     #[test]

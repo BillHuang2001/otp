@@ -63,8 +63,9 @@
 //!
 //! * at `N` churns ⇒ `case_churn_wall_ms` (end-to-end process wall time),
 //! * at `0` churns ⇒ `case_churn_startup_ms` (the same program's pure startup/boot cost —
-//!   the Rust runtime resolves its system code path by spawning `erl` once, so this is not
-//!   zero),
+//!   the Rust runtime loads its preloaded-module set and resolves its system code path with
+//!   a native filesystem probe (`crates/beam_rt/src/codeserver.rs`; the system `erl` is only
+//!   *run* as a last resort), so this is not zero),
 //!
 //! and derives the throughput metric
 //!
@@ -154,15 +155,23 @@ impl Case {
 /// The single case.
 ///
 /// `n_rust`/`n_sys` are **constants, not measurements**, calibrated on the reference host
-/// (a heavily loaded shared machine — see the crate CONTEXT) so that a single run's
-/// *marginal* cost is a few hundred milliseconds on the Rust runtime and ~1–2 s on the
-/// oracle, i.e. far above the oracle's run-to-run startup noise. The reported metric is
-/// normalized per op, so the loop counts only have to keep both marginals measurable — not
-/// to equalize the two runtimes' totals. A loop count whose marginal falls below the timer
-/// noise yields **no** per-op metric (an honest note), never a fabricated one.
+/// (a heavily loaded shared machine — see the crate CONTEXT) under one rule: **a runtime's
+/// timed loop must do enough work that its marginal cost stands clear of that runtime's own
+/// run-to-run boot/startup jitter**, measured here at ≈±0.1 s on the rust boot (the boot
+/// itself is ≈0.7–1.5 s under load). The rust-side floor is therefore **≥0.5 s of loop
+/// work** (≈5× that jitter); measured rust churn cost on that host (2026-10-16,
+/// `/proc/loadavg` 45–100, min-of-reps) is ≈130–180 µs/churn, so `n_rust = 5_000` (raised
+/// from 2 000 by the m14 recalibration, whose ≈0.26 s marginal sat inside the band) is
+/// ≈0.7–1.6 s. The oracle's much smaller startup jitter (tens of ms) needs a correspondingly
+/// smaller marginal.
+///
+/// The reported metric is normalized per op, so the loop counts only have to keep both
+/// marginals measurable — not to equalize the two runtimes' totals. A loop count whose
+/// marginal falls below the timer noise yields **no** per-op metric (an honest note), never a
+/// fabricated one.
 static CASE: Case = Case {
     name: "churn",
-    n_rust: 2_000,
+    n_rust: 5_000,
     n_sys: 200_000,
 };
 
