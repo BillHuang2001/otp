@@ -47,11 +47,13 @@
 //! `send_after`/`cancel_timer` semantics) and `erl_hl_timer.c` (the wheel).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::time::{Duration, Instant};
 
 use beam_process::ProcessId;
 use beam_term::prelude::{is_atom, is_small, signed_value, atom_val, Atom, Eterm};
+
+use crate::hasher::FastHashMap;
 
 /// Fallback offset (~68 years) used when `now + delay` would overflow an [`Instant`].
 ///
@@ -321,6 +323,14 @@ struct Pending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TimerHandle(u64);
 
+/// How many entries past `2 * pending.len()` a [`Timers`] heap may hold before
+/// [`Timers::prune_cancelled`] rebuilds it.
+///
+/// The slack keeps a heap that is merely transiently large — a burst of scheduling between two
+/// prunes — from paying for a rebuild it does not need, and it is also the smallest tombstone
+/// count a rebuild can be justified by (see `prune_cancelled`'s amortization note).
+const COMPACT_SLACK: usize = 64;
+
 /// The runtime's pending timer deadlines.
 ///
 /// See the module documentation; the only consumer is the scheduler loop in
@@ -330,14 +340,14 @@ pub(crate) struct Timers {
     /// Pending timers, a min-heap by `(deadline, seq)` (with cancelled tombstones).
     heap: BinaryHeap<HeapEntry>,
     /// The live timers, keyed by id.
-    pending: HashMap<TimerId, Pending>,
+    pending: FastHashMap<TimerId, Pending>,
     /// Every timer **reference** this heap minted, mapped to the timer it identified:
     /// `Some(id)` while it is pending, `None` once it has fired or been cancelled.
     ///
     /// This is what makes `erlang:cancel_timer/1`'s three answers exact: an unknown term is
     /// not a timer reference at all, a `Some` one is cancellable (its remaining time is
     /// answered), and a `None` one already fired (the oracle's `false`).
-    refs: HashMap<Eterm, Option<TimerId>>,
+    refs: FastHashMap<Eterm, Option<TimerId>>,
     /// Monotonic source of unique timer ids.
     next_id: u64,
     /// Monotonic source of insertion sequence numbers (the heap tie-break).
@@ -497,11 +507,48 @@ impl Timers {
         self.pending.len()
     }
 
-    /// Drops cancelled tombstones sitting at the head of the heap.
+    /// The number of heap entries, live timers **and** cancelled tombstones together.
     ///
-    /// Cancellation is lazy: [`Timers::cancel`] removes the payload but leaves the heap
-    /// entry in place. Any tombstone deeper than a live entry can never be the minimum, so
-    /// popping only the cancelled heads is enough to expose the earliest live deadline.
+    /// Test-only instrumentation: the head-only prune plus the watermark compaction keep this
+    /// bounded by `2 * pending_count() + 64` at every prune, so nothing in the runtime needs
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn heap_len(&self) -> usize {
+        self.heap.len()
+    }
+
+    /// Drops cancelled tombstones, rebuilding the heap when they dominate it.
+    ///
+    /// Cancellation is lazy: [`Timers::cancel`] and [`Timers::cancel_handle`] remove the
+    /// payload but leave the heap entry in place as a **tombstone**, and nothing deeper than a
+    /// live entry can ever be the minimum — so popping the cancelled entries *at the head* is
+    /// enough to expose the earliest live deadline, which is all the scheduler needs.
+    ///
+    /// That is not enough to reclaim the tombstones. A live entry with an earlier key holds
+    /// the head for as long as it is pending, and every tombstone behind it is then
+    /// unreachable by the head-popping loop; a workload that repeatedly schedules and cancels
+    /// a deadline while one long-lived, earlier timer stays live (a finite `receive … after T`
+    /// loop beside a `send_after`) therefore accumulates **one permanent tombstone per
+    /// iteration**: unbounded memory, plus a stale multi-megabyte heap that every push has to
+    /// sift through.
+    ///
+    /// So the head-popping loop is followed by a **watermark rebuild**: when the heap holds
+    /// substantially more entries than there are live timers — more than
+    /// `2 * pending.len() + COMPACT_SLACK` — [`Timers::compact`] retains exactly the entries
+    /// whose timer is still pending and re-heapifies them. The heap length is then bounded by
+    /// `2 * pending_count() + COMPACT_SLACK` at every prune instead of growing with the number
+    /// of cancellations.
+    ///
+    /// # Amortized cost
+    ///
+    /// A rebuild costs `O(heap.len())` and runs only when
+    /// `heap.len() > 2 * pending.len() + COMPACT_SLACK`, so at that moment the tombstones it
+    /// removes (`heap.len() - pending.len()`) outnumber the live entries, and the length is
+    /// under twice those tombstones. Charging each rebuild to the tombstones it drops makes it
+    /// `O(1)` amortized per reclaimed tombstone — the same accounting the head-pop already
+    /// has. No tombstone is charged twice (it is removed at most once), and the heap can only
+    /// grow again by holding new timers, which grow `pending` in step and so never cross the
+    /// watermark on their own.
     fn prune_cancelled(&mut self) {
         while let Some(top) = self.heap.peek() {
             if self.pending.contains_key(&top.id) {
@@ -509,6 +556,28 @@ impl Timers {
             }
             self.heap.pop();
         }
+        if self.heap.len() > 2 * self.pending.len() + COMPACT_SLACK {
+            self.compact();
+        }
+    }
+
+    /// Rebuilds the heap from only its live entries, dropping every cancelled tombstone.
+    ///
+    /// Each retained entry keeps its `(deadline, seq)` key **unchanged**, so the earliest live
+    /// deadline and the FIFO tie-break between equal deadlines are exactly what they were; the
+    /// entries dropped are, by definition, the ids that are no longer in `pending`.
+    fn compact(&mut self) {
+        let pending = &self.pending;
+        let live: Vec<HeapEntry> = self
+            .heap
+            .drain()
+            .filter(|entry| pending.contains_key(&entry.id))
+            .collect();
+        debug_assert!(
+            live.len() == pending.len(),
+            "every live timer has exactly one heap entry"
+        );
+        self.heap = BinaryHeap::from(live);
     }
 }
 
@@ -710,6 +779,101 @@ mod tests {
         let other = timers.schedule_resume(Duration::from_millis(0), pid(6), 0, 4);
         assert_eq!(timers.take_due(Instant::now()).len(), 1, "it fired");
         assert!(!timers.cancel_handle(other), "a fired deadline is not cancellable");
+    }
+
+    /// The measured `send_recv_plain` shape: a finite-receive deadline scheduled and cancelled
+    /// every iteration while one long-lived, **earlier** timer holds the head of the heap.
+    ///
+    /// The head-only prune can never reach a tombstone behind a live head, so without the
+    /// watermark rebuild the heap would grow by one permanent tombstone per iteration. This
+    /// asserts the heap stays inside the watermark, that the rebuild drops no live entry, and
+    /// that the live guardian still fires while the cancelled deadlines never do.
+    #[test]
+    fn cancelled_tombstones_are_compacted_away_not_accumulated() {
+        let mut timers = Timers::new();
+        // The **guardian**: an earlier deadline than every cancelled timer, so it holds the
+        // head for the whole run and the tombstones behind it stay unreachable — exactly the
+        // entry that defeats the head-only prune. It is far enough out never to fire here.
+        let guardian = schedule(&mut timers, 3_600_000, 0);
+        for seq in 1..=20_000u64 {
+            // The receive timeout, one step deeper than the guardian, cancelled as a real
+            // message wins the race.
+            let reference = schedule(&mut timers, 7_200_000, seq);
+            assert!(timers.cancel(reference).is_some(), "it was pending");
+            // The scheduler asks for the next deadline once per round; that is the only place
+            // tombstones are reclaimed.
+            let _ = timers.next_deadline();
+        }
+
+        // The heap is bounded by the watermark, not by the number of iterations.
+        let next = timers.next_deadline();
+        assert_eq!(timers.pending_count(), 1, "only the guardian is still live");
+        assert!(
+            timers.heap_len() <= 2 * timers.pending_count() + 64,
+            "the heap must not keep one tombstone per iteration: heap={} pending={}",
+            timers.heap_len(),
+            timers.pending_count()
+        );
+        // ... and the rebuild dropped no live entry: the guardian is still the next deadline.
+        assert!(next.is_some(), "the guardian is still pending");
+        assert!(timers.is_timer_ref(guardian));
+
+        // The guardian fires, once and in order ...
+        let fired = timers.take_due(Instant::now() + Duration::from_secs(5_400));
+        assert_eq!(fired.len(), 1, "exactly the guardian is due");
+        assert_eq!(delivered(&fired[0]), (TimerTarget::Pid(pid(0)), 0));
+        assert_eq!(timers.pending_count(), 0);
+        // ... and the 20 000 cancelled deadlines never fire, even well past their deadlines.
+        assert!(
+            timers
+                .take_due(Instant::now() + Duration::from_secs(86_400))
+                .is_empty(),
+            "a cancelled deadline never fires"
+        );
+    }
+
+    /// A watermark rebuild must be invisible to the timing semantics: it may only drop
+    /// tombstones, never move the next deadline or change the order the live set fires in.
+    #[test]
+    fn a_compaction_preserves_the_next_deadline_and_the_firing_order() {
+        let mut timers = Timers::new();
+        // Three live deadlines, inserted out of order so the heap has to order them.
+        schedule(&mut timers, 2_000, 2);
+        schedule(&mut timers, 1_000, 1);
+        schedule(&mut timers, 3_000, 3);
+        let before = timers.next_deadline().expect("a live deadline");
+        assert_eq!(timers.heap_len(), 3, "nothing to reclaim yet");
+
+        // Bury them under enough cancelled tombstones to cross the watermark. Every one is
+        // deeper than the live three, so none can reach the head.
+        for seq in 100..300u64 {
+            let reference = schedule(&mut timers, 9_000_000, seq);
+            assert!(timers.cancel(reference).is_some(), "it was pending");
+        }
+
+        // The next prune crosses the watermark and rebuilds the heap; the next deadline is
+        // exactly the one it was, and only the live entries survive.
+        let after = timers.next_deadline();
+        assert_eq!(
+            after,
+            Some(before),
+            "a rebuild must not move the next deadline"
+        );
+        assert_eq!(timers.pending_count(), 3, "every live timer survived");
+        assert_eq!(timers.heap_len(), 3, "and only the live entries are left");
+        assert!(timers.heap_len() <= 2 * timers.pending_count() + 64);
+
+        // take_due still fires the live set in deadline order, and the tombstones are gone.
+        let fired = timers.take_due(Instant::now() + Duration::from_secs(10));
+        let messages: Vec<i64> = fired.iter().map(|timer| delivered(timer).1).collect();
+        assert_eq!(messages, vec![1, 2, 3], "deadline order is preserved");
+        assert!(
+            timers
+                .take_due(Instant::now() + Duration::from_secs(9_000))
+                .is_empty(),
+            "the cancelled tombstones are gone for good"
+        );
+        assert_eq!(timers.pending_count(), 0);
     }
 
     /// A bignum term with the given `ErtsDigit`s (least significant first).
