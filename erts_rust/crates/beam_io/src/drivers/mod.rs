@@ -25,9 +25,10 @@
 //! the [`EfileDriver`] (`"efile"`) built on top of it, the OS-child [`SpawnDriver`]
 //! (`"spawn"`, the Rust counterpart of the C `spawn` driver) and the TCP socket
 //! [`TcpInetDriver`] (`"tcp_inet"`, the Rust counterpart of the C TCP driver
-//! `gen_tcp` sits on). The legacy C's `forker` driver and the `inet` driver's
-//! UDP/SCTP/IPv6 halves (`erts/emulator/drivers/common/*.c`) are documented
-//! follow-ups (see the crate `CONTEXT.md`, Known Issues).
+//! `gen_tcp` sits on), plus the in-memory [`RamFileDriver`] (`"ram_file_drv"`, the Rust
+//! counterpart of the C driver `ram_file.erl` talks to). The legacy C's `forker` driver and
+//! the `inet` driver's UDP/SCTP/IPv6 halves (`erts/emulator/drivers/common/*.c`) are
+//! documented follow-ups (see the crate `CONTEXT.md`, Known Issues).
 //!
 //! `SpawnDriver` is constructed **directly** from a [`SpawnSpec`] rather than through the
 //! [`crate::DriverRegistry`]: a [`DriverFactory`](crate::DriverFactory) is a no-argument
@@ -44,13 +45,18 @@
 //! * [`inet`] — the `tcp_inet` socket driver: one TCP socket behind one port, with the
 //!   `gen_tcp` control vocabulary (`open`/`bind`/`listen`/`accept`/`connect`/`send`/
 //!   `recv`/`shutdown`/`close`) and the socket-option verbs
-//!   (`setopts`/`getopts`: `nodelay`/`keepalive`/`recbuf`/`sndbuf`).
+//!   (`setopts`/`getopts`: `nodelay`/`keepalive`/`recbuf`/`sndbuf`); and
+//! * [`ram_file`] — the `ram_file_drv` in-memory file driver: a command-driven port holding
+//!   a byte buffer, with the packed `port_command/2` opcode protocol
+//!   `lib/kernel/src/ram_file.erl` drives (`open`/`read`/`write`/`pread`/`pwrite`/
+//!   `lseek`/`truncate`/`get`/`size`/…).
 
 pub mod binary_io;
 pub mod efile;
 pub mod fd;
 pub mod inet;
 pub mod line_buffer;
+pub mod ram_file;
 pub mod spawn;
 
 pub use crate::drivers::binary_io::{Phase, PhaseChange};
@@ -63,6 +69,9 @@ pub use crate::drivers::inet::{
     TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 pub use crate::drivers::line_buffer::{LineBuffer, DEFAULT_MAX_LINE_LEN};
+pub use crate::drivers::ram_file::{
+    make_ram_file, RamFileDriver, DRIVER_NAME as RAM_FILE_DRIVER_NAME,
+};
 pub use crate::drivers::spawn::{
     build_command, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, StreamOptions,
 };

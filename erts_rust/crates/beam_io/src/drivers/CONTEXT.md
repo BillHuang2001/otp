@@ -2,8 +2,9 @@
 
 ## Intent
 The built-in **port drivers** of the Rust ERTS rewrite: the byte-stream `fd` driver, the `efile`
-file driver composed on top of it, the OS-child `spawn` driver, the `tcp_inet` TCP socket driver, and
-the two port-input framing facilities (`{line,N}` buffering, the ERTS text↔binary *phase change*).
+file driver composed on top of it, the OS-child `spawn` driver, the `tcp_inet` TCP socket driver,
+the in-memory `ram_file_drv` file driver, and the two port-input framing facilities (`{line,N}`
+buffering, the ERTS text↔binary *phase change*).
 Every driver implements the frozen [`crate::driver::Driver`] trait and touches the port only through
 [`crate::driver::DriverContext`] (`input`/`output`/`register`/`reregister`/`deregister`). Each owns
 the descriptors it was given; nothing else may close them. Only `spawn.rs` may fork/`Command::spawn`.
@@ -12,7 +13,8 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
 `ioq`), `erts/emulator/nifs/common/prim_file_nif.c` + `erts/emulator/nifs/unix/unix_prim_file.c` (the
 `efile` mode-list/verb/syscall layer), `erts/emulator/drivers/unix/spawn_driver.c` +
 `erts/emulator/sys/unix/{sys_drivers.c,erl_child_setup.c}`, `erts/emulator/drivers/common/inet_drv.c`
-+ `erts/emulator/beam/packet_parser.{c,h}`.
++ `erts/emulator/beam/packet_parser.{c,h}`, `erts/emulator/drivers/common/ram_file_drv.c` (the
+`ram_file` command protocol).
 
 ## API Surface (summary — the crate root `../CONTEXT.md` carries the frozen detail)
 - `fd.rs` → `FdDriver` (`pipe`/`connected`/`read_only`/`write_only`, line/phase modes, the
@@ -25,6 +27,21 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   (`retry_on_eintr`, `unix_prim_file.c:188-191`).
 - `spawn.rs` → `SpawnDriver`, `SpawnSpec`/`SpawnOptions`/`StreamOptions`/`SpawnStream`,
   `build_command`, the deferred `fork_exec_child`, `ChildProc`/`ForkedChild`.
+- `ram_file.rs` → `RamFileDriver` (`"ram_file_drv"`), `make_ram_file`, `DRIVER_NAME` (aliased
+  `RAM_FILE_DRIVER_NAME` at the crate root) and the `pub` `RAM_FILE_*` command/mode/whence/response
+  constants. A **command-driven** port holding its whole "file" in memory (no descriptor, nothing
+  registered with the poller): [`Driver::output`](crate::Driver::output) drains the port's output
+  queue, reads the **first byte as the command word** and the rest as its operands, and appends the
+  reply to the port's input queue (the C's `rfile_command` in the `output` slot +
+  `driver_output2`/`driver_output_binary`); [`Driver::control`](crate::Driver::control) is the
+  named-verb form of the same core (`open`/`read`/`write`/`pread`/`pwrite`/`lseek`|`position`/
+  `truncate`/`fsync`|`sync`/`fdatasync`|`datasync`/`get`|`get_file`/`size`|`get_size`/`advise`/
+  `allocate`/`close`, plus the **decimal opcode** itself). **Operation-level failures are replies,
+  not Rust errors**: a wrong access mode / a negative offset / an allocation failure emits the C's
+  `ERROR <errno>` reply (`errno_atom`); only an unknown command word or a too-short argument is the
+  typed `badarg`. The logical file is a `Vec<u8>` whose `len()` **is** the C's `end` (the C's
+  separate allocation `size` field is unobservable and has no counterpart); a write past the end
+  zero-fills the gap (the C's `ram_file_expand`).
 - `line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `binary_io.rs` → `Phase`, `PhaseChange`.
 - `mod.rs` → module wiring/re-exports only.
 
