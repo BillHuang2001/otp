@@ -47,7 +47,8 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 ### Files (one responsibility each; per-entry ground truth/oracle probes are in each module's rustdoc)
 | Module | Serves |
 |---|---|
-| `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
+| `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2` (the rest of the `io` **device** surface is [`io.rs`](io.rs)), `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
+| `io.rs` | the **`io` device floor**: `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` — the `io.erl` wrappers over `o_request/2`, served natively because this runtime cannot complete the `{io_request,…}`/`{io_reply,…}` round trip against its own group leader (see *The `io` device floor*) + its unit tests |
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
 | `code.rs` (+ `code/path.rs`) | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0`, `where_is_file/1`; the path mutators `add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`, `del_path/1` in `code/path.rs` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; `hibernate/0` (the OTP-30 instruction, modelled as **continue**); the `monitor_nodes` forms of `process_flag/2` (`process_flag_native`); the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
@@ -582,6 +583,30 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
 `file:read_line/1` and `io:getopts/1`/`io:setopts/2` round-trip to disk. **Full detail:
 [`file_server/CONTEXT.md`](file_server/CONTEXT.md).**
 
+### The `io` device floor (`io.rs`) — the request wrappers, served natively
+`io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2` and `io:format/3` are `io.erl` wrappers over
+`o_request/2` (`io.erl:160-207`), which resolves the request's **device** — the caller's
+`group_leader()` — posts `{io_request, self(), Mref, Request}` to it and blocks for
+`{io_reply, …}`. This runtime's own root process **is** its own group leader, so
+`execute_request/3` answers `{error, calling_self}` and every such call raises
+`error:calling_self`; that is what replaced the installed **compiler**'s `catch`-handler
+diagnostic (`io:fwrite("Function: ~w/~w\n", …)`, `beam_ssa_opt.erl:197`,
+`beam_ssa_bool.erl:149`, `beam_core_to_ssa.erl:276`, …) with the atom `calling_self`.
+The floor answers the device question itself (`RuntimeContext::io_device`/`io_stream`) and
+renders through the **registered** `io_lib:format/2` — the implementation `io.erl`'s own
+server calls for a `{format, …}` request — so `io.erl` leaves the path and the request never
+leaves the runtime.
+The device rules (probed against the oracle, OTP 29.1.1 / erts-17.1): omitted / `standard_io`
+(`request/3` rewrites it to `group_leader()`) / `user` / the caller's **own** group-leader pid
+⇒ the process's output stream; `standard_error` (or its registered pid) ⇒ **fd 2**; another
+**live registered** device pid ⇒ the typed `unsupported` (a BIF may not block on the round
+trip); an **unregistered** atom ⇒ `error:badarg`; a non-atom/non-pid ⇒ the bare
+`function_clause`.
+Residual, unchanged: `io:put_chars/1,2` are the pre-existing keys and still **accept and
+ignore** their device, so `io:put_chars(standard_error, …)` lands on stdout. Pinned end to
+end against the live oracle by `../../tests/io_device.rs` (the device differential) and
+`../../tests/io_diagnostic_unmask.rs` (the compiler diagnostic is no longer `calling_self`).
+
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
   read only through `beam_engine::terms` (heap-seam builders/readers), `beam_codec::term`
@@ -684,9 +709,13 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   cross-checking the live oracle (skipping **loudly** without the toolchain).
 
 ## Routing Table
-- `../native.rs` → the dispatch table (`try_native`, `FLOOR_MODULES`) + the `erlang`-core,
-  `io:put_chars`, `seq_trace*` and `trace*` arms and the shared helpers (read for the served set;
-  edit there to add an arm)
+- `../native.rs` → the dispatch table (`try_native`, `FLOOR_MODULES`, `floor_keys`) + the
+  `erlang`-core, `io:put_chars`, `seq_trace*` and `trace*` arms and the shared helpers (read for
+  the served set; edit there to add an arm)
+- `io.rs` → the `io` **device** floor (`io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2`,
+  `io:format/3`): the `o_request/2` device model, the `unsupported` gap for a live non-stdio
+  device, and its unit tests; the oracle-cross-checked suites are `../../tests/io_device.rs`
+  and `../../tests/io_diagnostic_unmask.rs`
 - `memory/` → `erlang:process_info/1,2` + `memory/tests.rs` + `memory/binary_e2e.rs` (the
   end-to-end `binary`-item case against the live oracle over a test-time-compiled `.beam`)
 - `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`): `term_type/1`,

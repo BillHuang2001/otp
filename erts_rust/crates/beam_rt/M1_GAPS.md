@@ -121,6 +121,20 @@ accepted-and-ignored, so such a process still reports `on_heap` (per-process sto
 is a cross-crate handoff).
 
 ## Printing
+The `io` **device** request wrappers are served by the native floor (`src/native/io.rs`): `io:nl/0,1`,
+`io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3` and the pre-existing `io:put_chars/1,2`. Each is an
+`io.erl` wrapper over `o_request/2` that posts `{io_request, …}` to the request's **device** — the
+caller's `group_leader()`, i.e. itself for this runtime's own root process — and blocks for
+`{io_reply, …}`; `execute_request/3` answers `{error, calling_self}` for that self-device, so every such
+call used to raise `error:calling_self`, which **replaced** the installed compiler's `catch`-handler
+diagnostic (`io:fwrite("Function: ~w/~w\n", …)`). The floor answers the device question itself and
+renders through the **registered** `io_lib:format/2`, so those calls write and the compiler's real reason
+propagates. Device rules and per-key detail: [`src/native/CONTEXT.md`](src/native/CONTEXT.md) *The `io`
+device floor*; the stdout/stderr/exit-code differential is `tests/io_device.rs`, and the in-process
+compile diagnostic probe is `tests/io_diagnostic_unmask.rs`.
+Two residuals: a **live non-stdio device** pid is the typed `unsupported` (a BIF cannot block on the
+`{io_request, …}` round trip), and `io:put_chars/1,2` still **accepts and ignores** its device, so
+`io:put_chars(standard_error, …)` lands on stdout where the oracle writes fd 2.
 The registered `beam_bifs` `io:format` `~w`/`~p` printer rejects a non-byte-aligned bitstring (or a
 container past ~80 columns) with `badarg`; the corpus reads such values via `bit_size/1`/`is_list`. A
 segment wider than 64 bits is *unsupported*; a bignum is `system_limit`.
@@ -515,7 +529,16 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   **per-function** (`erlang:term_to_binary/1,2` / `erlang:external_size/1,2` are guarded only in the
   function that issues the call; the module-wide `erlang:load_nif/2` is unchanged), so a `compile:*`
   function whose own body issues no fun-image BIF is admitted in-machine and its blocking `receive`
-  suspends through the ordinary `RunOutcome::Wait` path. The hazard class both cases run through — the
+  suspends through the ordinary `RunOutcome::Wait` path. The compile route reaches the compiler's own
+  `catch`-handler diagnostics **without** an io-server workaround: the `io` device floor serves
+  `io:fwrite/2` (`tests/io_diagnostic_unmask.rs` pins a real stdlib module's in-process compile to print
+  a `Function: ` line and never report `calling_self`), so a genuine compiler crash reports its real
+  reason. The route completes for **72 of the 86** oracle-compilable `lib/stdlib/src/*.erl` with
+  byte-identical `.beam`; the 14 failures are heap-independent compiler-runtime defects (12 —
+  `c`, `dets`, `epp`, `ets`, `io`, `peer`, `qlc`, `shell`, `slave`, `sys`, `timer`, `win32reg` — raise
+  `{badmap, …}` in `beam_ssa_recv:plan_clears/2` through `maps:fold/3` mis-rejecting a
+  `maps:iterator/2` term; `erl_lint` raises `{badmap, …}` in `beam_ssa_opt:phase/4`; `erl_tar` raises
+  `badarg` in `beam_core_to_ssa:function/2`), **none io-related**. The hazard class both cases run through — the
   monitor-DOWN branch of `beam_process`'s termination cascade relocating a **woken** monitor watcher's
   heap — is declined in this crate by the host collection gate plus the park exemption (the A.9 class in
   *GC-relocation hazards* below); mechanism:
