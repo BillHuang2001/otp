@@ -26,7 +26,7 @@
 //! |---|---|
 //! | `-version`, `--version` | print the version banner and exit 0 |
 //! | `-noshell` | run head-less (Milestone-1 has no interactive shell) |
-//! | `-eval Expr` | evaluate the documented integer subset and print **nothing** |
+//! | `-eval Expr` | evaluate a general Erlang **expression** and print **nothing** |
 //! | `-s Mod Func [Args…]` | apply `Mod:Func(Args…)` with **atom** arguments; the result is **discarded** (real `erl` semantics) |
 //! | `-run Mod Func [Args…]` | apply `Mod:Func(Args…)` with **string** (char list) arguments; the result is **discarded** |
 //! | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` directories) |
@@ -152,7 +152,7 @@ Usage: beam_rt [switch...] [action]
 Switches:
   -version, --version       print the version banner and exit
   -noshell                  run head-less (the only Milestone-1 mode)
-  -eval EXPR                evaluate the documented integer subset (prints nothing)
+  -eval EXPR                evaluate an Erlang expression (prints nothing)
   -s MOD FUNC [ARG...]      apply MOD:FUNC(ARG, ...) with atom arguments (result discarded)
   -run MOD FUNC [ARG...]    apply MOD:FUNC(ARG, ...) with string arguments (result discarded)
   -pa DIR [DIR...]          add DIR(s) to the head of the code path (before the system
