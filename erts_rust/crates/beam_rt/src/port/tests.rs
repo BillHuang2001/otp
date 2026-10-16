@@ -2713,6 +2713,63 @@ fn collect_line_frames(rt: &mut Runtime, port: PortId, bound: Duration) -> Vec<(
     panic!("no `{{exit_status, _}}` frame for {port:?} within {bound:?}; got {frames:?}");
 }
 
+/// The arrival-order **kind sequence** of the messages the runtime's port poller produced for
+/// `port`: `'s'` for a `{Port, {exit_status, _}}` report and `'d'` for every `{Port, {data, …}}`
+/// message.
+///
+/// [`collect_line_frames`] deliberately reduces the data frames to their `{eol|noeol, Data}` body
+/// and drops the status report, so it *cannot* observe the order **between** the two kinds — which
+/// is exactly the observable a reaped child's end-of-stream line flush is about (see
+/// `the_trailing_noeol_flush_is_delivered_after_the_exit_status`). This collector keeps both, in
+/// arrival order. A message of neither kind (the port's own `'EXIT'`) is ignored, as the oracle
+/// probe's catch-all clause ignores it.
+///
+/// The collection ends once the status has arrived **and** a further round produced nothing, so a
+/// flush delivered *after* the status is still observed rather than cut off at the status.
+fn collect_message_kinds(rt: &mut Runtime, port: PortId, bound: Duration) -> String {
+    // The `data`/`exit_status` names are interned into the runtime's own table by the message
+    // builders, so they are resolved there — the same table, hence the same indices the built
+    // messages name (see [`collect_line_frames`]).
+    let (data_atom, exit_atom) = {
+        let atoms = rt.code_server_atoms_mut();
+        (atoms.intern("data"), atoms.intern("exit_status"))
+    };
+    let deadline = Instant::now() + bound;
+    let mut kinds = String::new();
+    let mut exited = false;
+    while Instant::now() < deadline {
+        let messages = {
+            let mut ctx = RuntimeContext::new(&mut *rt);
+            ctx.poll_port_messages(Duration::from_millis(50))
+                .expect("the port poll must not fail")
+        };
+        if messages.is_empty() {
+            // Nothing more is coming: the stream is complete once the status has been taken.
+            if exited {
+                return kinds;
+            }
+            continue;
+        }
+        for message in messages {
+            // A message that is not a `{Port, {…}}` pair at all — the port's own `'EXIT'` — says
+            // nothing about the order under test.
+            let Ok(inner) = terms::tuple_element(message, 1) else {
+                continue;
+            };
+            let Ok(tag) = terms::tuple_element(inner, 0) else {
+                continue;
+            };
+            if tag == make_atom(exit_atom) {
+                exited = true;
+                kinds.push('s');
+            } else if tag == make_atom(data_atom) {
+                kinds.push('d');
+            }
+        }
+    }
+    panic!("no `{{exit_status, _}}` message for {port:?} within {bound:?}; got {kinds:?}");
+}
+
 /// The oracle expression that collects a child's whole line-frame sequence: every
 /// `{data, {eol|noeol, D}}` frame in arrival order, ignoring the port's other messages (the
 /// `exit_status` report and the port's own `'EXIT'`), until a quiet second elapses.
@@ -2729,6 +2786,26 @@ fn oracle_line_frames_expr(command: &str, options: &str) -> String {
         "), F = fun F(A) -> receive {P,{data,{eol,D}}} -> F(A ++ [{eol,D}]); ",
         "{P,{data,{noeol,D}}} -> F(A ++ [{noeol,D}]); _ -> F(A) after 1000 -> A end end, ",
         "io:format(\"~w\",[F([])]) end",
+    ]
+    .concat()
+}
+
+/// The oracle expression that reports a child's `{Port, …}` messages as an **arrival-order**
+/// string: `"d"` per `{data, _}` message, `"s"` per `{exit_status, _}`, and nothing for any other
+/// message (the port's own `'EXIT'`).
+///
+/// [`oracle_line_frames_expr`] is blind to that order, because it collects only the data frames;
+/// this one keeps both kinds. The quiet second after the last message is what lets a trailing
+/// `noeol` flush delivered *after* the status be observed.
+fn oracle_message_kinds_expr(command: &str, options: &str) -> String {
+    [
+        "begin P = open_port({spawn,\"",
+        command,
+        "\"},",
+        options,
+        "), F = fun F(A) -> receive {P,{data,_}} -> F(A ++ \"d\"); ",
+        "{P,{exit_status,_}} -> F(A ++ \"s\"); {_P,_E} -> F(A); ",
+        "_ -> F(A) after 1000 -> A end end, io:format(\"~s\",[F([])]) end",
     ]
     .concat()
 }
@@ -2806,8 +2883,57 @@ fn a_real_childs_lines_are_delivered_as_eol_and_noeol_frames() {
     }
 }
 
-/// `[binary, line]` sets **both** state bits, so each frame's payload is a binary where the
-/// list stream's is a char list — the frame boundaries are identical.
+/// The `{Port, {exit_status, Status}}` of a reaped child is delivered **before** that child's
+/// end-of-stream `noeol` flush, deterministically — the oracle's own order, which the C fixes by
+/// reporting the status (`driver_report_exit`) and only then releasing the child's trailing partial
+/// line (`driver_failure_eof` → `flush_linebuf_messages`), both from the one `ready_input` call the
+/// child's exit triggers (`erts/emulator/sys/unix/sys_drivers.c:1250-1252`).
+///
+/// The child is the reproducer's: it writes a partial line and exits, so the round that observes the
+/// end of its stream has **both** messages pending — the only state in which the two orders are a
+/// race at all (take the status before the flush and they arrive `[s,d]`; append the status after
+/// the round's flush and they arrive `[d,s]`). Repeated ten times, because "usually `[s,d]`" is not
+/// the oracle's behaviour: the order must not depend on whether the child happened to be reaped
+/// before the round's poll or during it.
+#[test]
+fn the_trailing_noeol_flush_is_delivered_after_the_exit_status() {
+    if !shell_available() {
+        skip_line_test("the `exit_status`/`noeol` delivery order");
+        return;
+    }
+    // `printf 'xx'` writes a partial line (no newline) and exits. That is the reproducer's
+    // observable too: `{spawn, Cmd}` runs the command line through `/bin/sh -c "exec …"`, so the
+    // reproducer's `printf "xx"; sleep 0.4; printf "\n"` child has `printf` run as a shell
+    // *builtin* under that `exec` — which ends the child right after `xx`, leaving the `sleep` and
+    // the second `printf` unrun. Stating the command this way keeps the child shape (a partial
+    // line released at end-of-stream, plus a reaped child) independent of that shell detail.
+    let command = "printf 'xx'";
+    let mut h = LineHarness::new();
+    for run in 0..10 {
+        // A fresh port each run: the fixture's hook (and so its metadata table) is rebuilt per
+        // `open`, and this runtime keeps a child's port open until an explicit close, so every run
+        // observes a brand-new child — never a leftover.
+        let options = option_list(&mut h.fx, &["line", "binary", "exit_status"], &[]);
+        let port = h.open(command, options);
+        let kinds = collect_message_kinds(&mut h.runtime, port, Duration::from_secs(10));
+        assert_eq!(
+            kinds, "sd",
+            "run {run}: a reaped child's `{{exit_status, _}}` must be delivered before the \
+             trailing `noeol` flush of the partial line it wrote (the oracle's order)"
+        );
+    }
+    // Oracle cross-check: the real runtime delivers that same order for this child.
+    let expr = oracle_message_kinds_expr(command, "[line,binary,exit_status]");
+    match erl_eval(&expr) {
+        Some(oracle) => assert_eq!(
+            oracle, "sd",
+            "the oracle's own delivery order for a reaped child's end-of-stream flush"
+        ),
+        None => skip_oracle_check("the `exit_status`/`noeol` delivery order"),
+    }
+}
+
+/// `[binary, line]` sets **both** state bits, so each frame's payload is a binary where the/// list stream's is a char list — the frame boundaries are identical.
 #[test]
 fn a_binary_line_stream_renders_each_frame_as_a_binary() {
     if !shell_available() {
