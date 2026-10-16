@@ -1161,8 +1161,9 @@ loop(N, Size, Acc) ->
 /// is never armed (`may_pump_scheduler() == false` for a scheduled slice), so the callee's
 /// blocking `receive` could not suspend: the first slice would end in an exit carrying the
 /// typed unsupported `blocked()` gap instead of `ProcOutcome::Wait`. The seam now enters the
-/// callee in the calling machine, and the full GC door publishes that machine's whole FR file,
-/// so the float registers it leaves live are relocated rather than dangled (see
+/// callee in the calling machine, and the full GC door publishes that machine's FR file up to its
+/// pointer-bearing prefix, so the float registers it leaves live are relocated rather than
+/// dangled (see
 /// `crate::context::gc`).
 #[test]
 fn a_float_using_callee_suspends_and_resumes_a_scheduled_process() {

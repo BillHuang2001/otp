@@ -192,7 +192,8 @@ cleared unconditionally afterwards.
 [`context::gc`](../context/CONTEXT.md)
 (`publish_roots_full`/`scatter_roots_full`, the `fr_count` parameter bounding how many leading FR words
 are published), which the in-slice heap-admission points (`ensure_heap_full`/`alloc_words_rooted`) also
-use — those always pass `roots.fr.len()`, the **whole** file — so the park/resume and the admission
+use — those hand a `RootSet` already narrowed to each register file's pointer-bearing prefix
+(`machine_root_bounds`), with `fr_count` its FR count — so the park/resume and the admission
 points can never drift:
 * `publish_parked_roots` hands the machine's roots over with `RootSet::ALL_LIVE` — the conservative
   (always-safe) choice, since a parked machine's live count is not exposed and over-approximating a
@@ -207,7 +208,8 @@ points can never drift:
   the parked machine's own FR slots are protected from the delivery-driven collection — which is not
   gated by `gc_process_enabled` — by the exemption rather than by a copy. The reaction is **per slice,
   never a permanent pin**: inside a slice the engine reaches only the full door, which publishes the
-  whole FR file, so a float-using call site collects exactly like a float-free one. `fr_mark` is an
+  FR file up to its pointer-bearing prefix and applies no float guard, so a float-using call site
+  collects exactly like a float-free one. `fr_mark` is an
   exact upper bound after a slice — every FR write goes through `Machine::set_fr`, and the baseline JIT
   tier refuses an FR destination (deopting to the interpreter) — and a bound can only err by
   over-protecting: a slot at or above it is `NIL`, and a `NIL` word roots nothing, so a float-free park

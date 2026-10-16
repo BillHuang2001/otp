@@ -335,9 +335,9 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     /// arm the GC latch, then serve the request over the machine's **whole** root set.
     ///
     /// This is the door [`Machine::ensure_heap`](beam_engine::Machine::ensure_heap) actually
-    /// reaches, so the collection it may drive sees every x register, the whole Erlang stack
-    /// **and the whole FR file**. The latch is armed for the slice's own machine only (see the
-    /// type docs), which is exactly the root set
+    /// reaches, so the collection it may drive sees each register file up to its pointer-bearing
+    /// prefix **and the whole Erlang stack**. The latch is armed for the slice's own machine only
+    /// (see the type docs), which is exactly the root set
     /// [`crate::context::gc::ensure_heap_full`] may collect against; it is cleared as the first
     /// statement there (see [`RuntimeContext::arm_gc`]).
     fn ensure_heap_full(&mut self, heap_need: u32, roots: RootSet<'_>) -> Result<()> {

@@ -166,8 +166,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// as a module context and `Step::Enter` the callee's export entry with the caller's
     /// continuation stored in the live frame — so the callee's registers, Erlang stack and
     /// frames are the *same* root set the slice's own machine already hands
-    /// [`ExecutionContext::ensure_heap_full`] (every x register, the whole Erlang stack **and**
-    /// the whole FR file), and the slice's per-call GC latch covers every
+    /// [`ExecutionContext::ensure_heap_full`] (each register file up to its
+    /// pointer-bearing prefix, and the whole Erlang stack), and the slice's per-call GC latch
+    /// covers every
     /// allocation the callee performs (see [`crate::context::gc`]). A recursion through
     /// `call_bif` instead builds a **second** [`Machine`](beam_engine::Machine) whose
     /// admission point is never armed, so every allocation past the process's young heap
@@ -212,7 +213,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// recorded `current_module` (the engine's module-context switch never re-enters this
     /// context) and may leave `Machine::fr` set, but the door the engine reaches on the
     /// slice's own machine is [`ExecutionContext::ensure_heap_full`], which publishes the
-    /// caller's **whole FR file** as a root
+    /// caller's FR file up to its pointer-bearing prefix as a root
     /// ([`publish_roots_full`](crate::context::gc)) — so a collection over that machine
     /// relocates a live float register instead of dangling it, for *any* module. A float
     /// register left live at the end of a slice is additionally caught by the runner's
@@ -490,9 +491,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// handed in, collecting over all of it (see [`crate::context::gc`]).
     ///
     /// This is the primary admission point: `test_heap`/`allocate_heap` reach it through
-    /// [`Machine::ensure_heap`](beam_engine::Machine), so a collection here sees **every** x
-    /// register, the whole Erlang stack **and the whole FR file** — not just the x prefix the
-    /// engine declared live. The [`gc_armed`](Self::gc_armed) latch is
+    /// [`Machine::ensure_heap`](beam_engine::Machine), so a collection here sees each register
+    /// file up to its pointer-bearing prefix and the whole Erlang stack — not just the x prefix
+    /// the engine declared live. The [`gc_armed`](Self::gc_armed) latch is
     /// [`take`](std::mem::take)n exactly as in [`ensure_heap`](Self::ensure_heap), so only the
     /// admission point the slice's own [`BudgetContext`](crate::runner) armed can collect.
     fn ensure_heap_full(&mut self, heap_need: u32, roots: RootSet<'_>) -> Result<()> {

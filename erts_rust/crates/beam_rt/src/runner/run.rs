@@ -775,12 +775,13 @@ impl ProcessRunner for RuntimeRunner<'_> {
         //
         //   * **inside a slice** the engine reaches only the **full** heap-admission door
         //     (`context::gc::ensure_heap_full`, from `test_heap`/`allocate_heap`), which publishes
-        //     the machine's **whole** root set — the FR file included — so a live float register is
-        //     relocated exactly like an x register and a float-using call site collects exactly
-        //     like a float-free one. Declining *that* door — an earlier shape of this valve, which
-        //     marked the process permanently un-collectable — would refuse **every** later
-        //     collection, so a float-operation loop could never collect and its nursery would grow
-        //     with the program's whole allocation history instead.
+        //     each register file up to its pointer-bearing prefix — the FR file included, and with
+        //     no float guard — so a live float register is relocated exactly like an x register and
+        //     a float-using call site collects exactly like a float-free one. Declining *that* door
+        //     — an earlier shape of this valve, which marked the process permanently un-collectable
+        //     — would refuse **every** later collection, so a float-operation loop could never
+        //     collect and its nursery would grow with the program's whole allocation history
+        //     instead.
         //   * **across the inter-slice window** a live FR prefix *is* the window's exemption: the
         //     park skips its root publication entirely (`park_machine`), the machine keeps its FR
         //     slots as they are, and every collection site declines the move for the window — so a
@@ -820,8 +821,9 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // A process whose FR prefix is empty (`fr_mark() == 0`) carries no live FR term at all, so
         // omitting the FR words from its published root set cannot lose a term and the window may
         // collect normally. Every site that can move such a process's heap is then sound: the
-        // full-root in-slice doors publish the whole FR file (all `NIL`, publishing which is a
-        // no-op), `Runtime::serve_gc_request` and `Process::deliver`'s growth cascade collect
+        // full-root in-slice doors publish the FR file only up to its pointer-bearing prefix (which
+        // the all-`NIL` file answers `0`, so nothing), `Runtime::serve_gc_request` and
+        // `Process::deliver`'s growth cascade collect
         // against the process's own root set, and the narrow door (`ensure_heap`) — off the
         // engine's path — is gated by the caller-module float guard.
         let fr_count = engine.machine.fr_mark() as usize;

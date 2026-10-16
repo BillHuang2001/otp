@@ -3754,13 +3754,15 @@ const GC_FLOATS_BEAM: &str = concat!(
 /// blocker (`compile:file/2`, whose code lowers `fconv`).
 ///
 /// It no longer refuses: the door the engine reaches on a slice's own machine is
-/// [`ExecutionContext::ensure_heap_full`], which publishes the machine's **whole FR file** as a
-/// root (`crate::context::gc::publish_roots_full`), so a collection over a callee that left a
-/// float register live relocates it instead of dangling it — for any module.
+/// [`ExecutionContext::ensure_heap_full`], which publishes each register file up to its
+/// pointer-bearing prefix — the FR file included, so every live float register (a boxed float
+/// term) is inside the bound — as a root (`crate::context::gc::publish_roots_full`), so a
+/// collection over a callee that left a float register live relocates it instead of dangling it
+/// — for any module.
 ///
-/// The GC doors keep a caller-module float test of their own; only the **narrow**
-/// [`ExecutionContext::ensure_heap`] door still refuses on it (that door cannot see the FR
-/// file). The full doors apply none. The module is therefore still *not* float-free — the
+/// The caller-module float test (`module_uses_floats`) still exists, but only the **narrow**
+/// [`ExecutionContext::ensure_heap`] door consults it (that door cannot see the FR
+/// file); the two full doors apply none. The module is therefore still *not* float-free — the
 /// property this case needs — and its narrow-door refusal is pinned by
 /// [`the_narrow_door_still_refuses_a_float_using_call_site`].
 #[test]
@@ -4546,7 +4548,7 @@ fn shared_gap(error: &BeamError, expected: &str) {
 }
 
 // ---------------------------------------------------------------------------------------
-// The GC root-set hand-off: every x register and the whole FR file
+// The GC root-set hand-off: each register file's pointer-bearing prefix and the whole Erlang stack
 // ---------------------------------------------------------------------------------------
 
 /// The integer-only fixture (`tests/fixtures/gc_ints.beam`), used here for one property
@@ -6538,9 +6540,9 @@ fn a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected() {
     }
 }
 
-/// **The full door collects over a float-using call site.** The full door publishes the
-/// machine's **whole FR file** ([`super::gc::publish_roots_full`]), so a live float register is
-/// relocated like any x register or stack word and the caller-module float guard would only be
+/// **The full door collects over a float-using call site.** The full door publishes the FR file
+/// up to its pointer-bearing prefix ([`super::gc::publish_roots_full`]), so a live float register
+/// is relocated like any x register or stack word and the caller-module float guard would only be
 /// a redundant conservative extra: the door applies **no** float guard at all. A float-using
 /// call site therefore collects exactly like a float-free one, and the FR-only root comes back
 /// relocated.
@@ -7317,10 +7319,13 @@ fn fallback_line(counters: &gc::valve_counters::ValveCounters) -> String {
 /// 5. the arena fallbacks collapse with it — from ≈ 1 per iteration, all of them attributed to a
 ///    refused rooted collection ([`gc::valve_counters::FallbackSite::ValveDeclined`]), to
 ///    (essentially) zero and **flat** in `N`;
-/// 6. each reach still classifies the **whole** machine root set — the whole x-register file plus
-///    the whole FR file ([`publish_roots_full`] appends the FR file after the stack), ~2 Ki words
-///    per reach. What collapsed is the number of reaches, so the workload's total classification
-///    work is ~4 Ki words per **iteration** down to a few hundred.
+/// 6. each reach's per-word classification covers only the door's **published** region — each
+///    register file's pointer-bearing prefix plus the whole Erlang stack
+///    ([`gc::valve_counters::DoorCounts::published_words`]) — while
+///    [`gc::valve_counters::DoorCounts::machine_words`] still records the **declared** figure, the
+///    whole x-register file plus the whole FR file, ~2 Ki words per reach. What collapsed is the
+///    number of reaches, so the workload's total classification work is down to a few hundred
+///    words per **iteration**.
 ///
 /// A missing `erlc` is a **loud skip**, never a silent pass.
 #[test]
@@ -7492,10 +7497,12 @@ fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
         "collections must be real but rare next to the iterations: {} for N={LARGE}",
         large.stats.collections,
     );
-    // (5) The per-word phase is still the *whole* machine root set per call — the whole x file
-    //     (1024) plus the whole FR file (1024) plus the Erlang stack — so the classification work
-    //     per reach is unchanged. What collapsed is the number of reaches, and with it the
-    //     workload's total classification work (~4 Ki words per iteration before).
+    // (5) `machine_words` is the door's **declared** per-reach figure — the whole x file (1024)
+    //     plus the whole FR file (1024) plus the Erlang stack — so it remains the right per-reach
+    //     bound for the assertion below. The words the per-word phase actually classifies and the
+    //     door hands over are the pointer-bearing prefix of each register file plus the whole
+    //     stack (`published_words`). What collapsed is the number of reaches, and with it the
+    //     workload's total classification work.
     const MIN_WORDS_PER_REACH: usize = 2_000;
     assert!(
         full.machine_words >= full.reached * MIN_WORDS_PER_REACH,
