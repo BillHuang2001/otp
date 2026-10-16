@@ -353,7 +353,7 @@ impl<'a> RuntimeContext<'a> {
     /// `unsupported_bif` rather than dropping the message). The bridge borrows the whole
     /// `Runtime` (it delegates to [`RuntimeContext::send_message`]), so it cannot co-exist with
     /// [`FunBridge`]'s borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the five. A `send` applies no fun
+    /// [`Self::call_registered`] installs exactly one of the nine. A `send` applies no fun
     /// argument and touches no dictionary, so nothing is lost.
     ///
     /// The compiled `Dest ! Msg` operator does **not** come through here: the BEAM compiler
