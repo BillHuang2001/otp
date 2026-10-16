@@ -33,8 +33,8 @@
 //! a flag that was never passed is reported as the atom `error`.
 //!
 //! Only flag forms both runtimes parse to the *same* `init:get_argument/1` answer are
-//! pinned here; forms that diverge (e.g. plain arguments after `-extra`/`--`, which the
-//! oracle treats as `init:get_plain_arguments/0` while this runtime rejects them) are
+//! pinned here; forms that diverge (e.g. a plain argument after `-extra`/`--`, which the
+//! oracle reports through `init:get_plain_arguments/0` while this runtime drops it) are
 //! documented handoffs instead of cases.
 //!
 //! The `flags/env_*` cases drive the *environment half* of the same contract through
@@ -96,6 +96,28 @@
 //! leak their expression into `init:get_plain_arguments/0` (a `-s Mod Func Arg` and a second
 //! `-eval`). `-smp disable` is *not* pinnable: the launcher rejects it before the emulator
 //! starts, so no probe observable exists (see `divergences.md`).
+//!
+//! The very last block widens the `-env` launcher switch and the `--` boundary, and re-probes
+//! the `ERL_*FLAGS`-carried switch surface. Pinned: a repeated `-env VAR VALUE` for one variable
+//! (the launcher applies each pair in turn, so the **last** value wins in the child); the pair
+//! as a two-token value list (the switch that follows it is still recorded); an `-env` *name*
+//! containing `=` (it splits at the first `=`, the remainder joining the value, so
+//! `-env X=Y hello` sets `X` to `Y=hello`); the `--` end-of-emulator-options token (not itself
+//! an `init` argument, and transparent — a `-switch` after it is still recorded, not turned into
+//! a plain argument); and an `-env` pair / an `-eval` instruction **carried by** `ERL_AFLAGS` /
+//! `ERL_FLAGS` (consumed in the merged argv, so the flag that follows it is still recorded).
+//!
+//! Four neighbouring shapes do **not** agree at this revision and are handoffs to the divergence
+//! ledger (owner `beam_rt`), not cases: (1) a **bare non-switch** argv token (a bare `foo`),
+//! where the oracle drops `-noshell` and starts the stock shell on its host-dependent banner
+//! while this runtime ignores the token and evaluates the probe; (2) a **plain argument after
+//! `--`**, which the oracle reports through `init:get_plain_arguments/0` while this runtime
+//! drops it (the `--` token *alone* is pinned, above); (3) a `+`-flag with a **missing operand**
+//! (`+S`/`+P`/`+Q`), where both sides consume the next token and agree on stdout/exit but the
+//! oracle prints the whole `erts_usage()` block on stderr while this runtime prints one
+//! `beam_rt:` line; and (4) an **output-producing extra instruction** — a second `-eval`, or an
+//! `-eval` carried by `ERL_FLAGS` (which merges *after* the command line) — where the oracle
+//! evaluates every instruction in argv order while this runtime evaluates only the last.
 //!
 //! **Why no `-pz`-shadowing case lives in this file.** `-pz D` must *append* `D`, so a
 //! `proplists.beam` living in `D` must not shadow the stdlib module: `code:which(proplists)`
@@ -1988,6 +2010,186 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the widened `-env` / env-carried switch surface -------------------------------
+        // `-env VAR VALUE` is the launcher's own switch (consumed by `erlexec` before `init`),
+        // so it is recorded **neither** under its own name nor under the variable's. The
+        // remaining shapes are the ones a conforming launcher must accept: an extra `-eval`
+        // Start instruction (consumed with its expression, so `init:get_argument(eval)` still
+        // answers the bare atom `error`), a **repeated** `-env` for one variable (the last
+        // occurrence's value wins in the child's environment, observed through `os:getenv/1`),
+        // and the value-list boundary — the pair is consumed blindly, so the *switch* that
+        // follows it survives untouched. Every golden is the live oracle's output
+        // (OTP 29.1.1 / erts-17.1), verified with `differential run <id>`.
+        Case {
+            id: "flags/eval_instruction_extra_is_not_an_init_argument",
+            description: "a second -eval Start instruction is still not recorded as an init argument",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // The harness appends the probe as a *third* `-eval`, so the argv is
+                // `-noshell -eval ok -eval <probe>`: the extra instruction changes nothing about
+                // the recording.
+                expr: "init:get_argument(eval)",
+                extra_argv: &["-eval", "ok"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_switch_repeated_last_value_wins",
+            description: "a repeated -env for one variable sets the variable to the last value",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // The launcher applies each `-env VAR VALUE` pair in turn, so the second
+                // occurrence overwrites the first in the child's environment (a string, whose
+                // `~w` image is a byte list — `v2` is `[118,50]`).
+                expr: "os:getenv(\"differential_env_var\")",
+                extra_argv: &[
+                    "-env",
+                    "differential_env_var",
+                    "v1",
+                    "-env",
+                    "differential_env_var",
+                    "v2",
+                ],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [118,50]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_switch_value_does_not_swallow_the_next_switch",
+            description: "the -env VAR VALUE pair is consumed as two tokens, leaving the next switch intact",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // `-env` takes exactly two tokens; a switch that follows it is still recorded
+                // (`-setcookie cookie` here), so the pair's value list cannot be extended.
+                expr: "init:get_argument(setcookie)",
+                extra_argv: &["-env", "differential_env_var", "hello", "-setcookie", "cookie"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[99,111,111,107,105,101]]]}"),
+                exit_code: 0,
+            },
+        },
+        // The environment half of the same surface: a switch **carried by** `ERL_AFLAGS` /
+        // `ERL_FLAGS` is merged into the effective argv before `init` sees it, so a bare
+        // `-env` pair there is consumed exactly as a command-line one and the `-differential_
+        // env_flag` that follows it is still recorded. `-eval 1+1` is the `ERL_AFLAGS`-carried
+        // Start instruction (silent, so the merge is observed through the flag that follows).
+        // `ERL_FLAGS` is deliberately **not** pinned with an `-eval`: it is merged *after* the
+        // command line, which changes which instruction the runtime evaluates first (a
+        // divergence, see `divergences.md`). Every golden is the live oracle's output.
+        Case {
+            id: "flags/env_erl_flags_carries_env_switch",
+            description: "an ERL_FLAGS-carried -env pair is consumed as two tokens and the following flag recorded",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_env_flag)",
+                extra_argv: &[],
+                env: &[(
+                    "ERL_FLAGS",
+                    "-env differential_env_var hello -differential_env_flag aid",
+                )],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,105,100]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_aflags_carries_env_switch",
+            description: "an ERL_AFLAGS-carried -env pair is consumed as two tokens and the following flag recorded",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_env_flag)",
+                extra_argv: &[],
+                env: &[(
+                    "ERL_AFLAGS",
+                    "-env differential_env_var hello -differential_env_flag aid",
+                )],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,105,100]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_aflags_carries_eval_instruction",
+            description: "an ERL_AFLAGS-carried -eval instruction is consumed with its expression",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_env_flag)",
+                extra_argv: &[],
+                env: &[("ERL_AFLAGS", "-eval 1+1 -differential_env_flag aid")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,105,100]]]}"),
+                exit_code: 0,
+            },
+        },
+        // The `-env` pair's *name* is taken verbatim: the launcher puts the whole
+        // `VAR=VALUE` assignment into the environment, so a name containing `=` splits at the
+        // **first** `=` (`-env X=Y hello` sets `X` to `Y=hello`), observed through
+        // `os:getenv/1`.
+        Case {
+            id: "flags/env_switch_name_containing_equals",
+            description: "an -env name containing '=' splits at the first '=', the rest becoming part of the value",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "os:getenv(\"differential_env_var\")",
+                extra_argv: &["-env", "differential_env_var=suffix", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [115,117,102,102,105,120,61,104,101,108,108,111]"),
+                exit_code: 0,
+            },
+        },
+        // The `--` token: it marks the end of the **emulator** options, so it is not itself an
+        // `init` argument, and it is *transparent* to the flags after it — a `-switch` there is
+        // still a switch (recorded, with its values consumed), not a plain argument. (The bare
+        // non-switch token is the neighbouring shape that does **not** agree, and a plain
+        // argument *after* `--` is this runtime's own divergence — both are documented handoffs,
+        // see `divergences.md`, not cases.)
+        Case {
+            id: "flags/double_dash_is_not_recorded",
+            description: "the -- end-of-emulator-options token is not itself an init argument",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('--')",
+                extra_argv: &["--"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/double_dash_keeps_a_following_switch_a_switch",
+            description: "a -switch after -- is still recorded, not turned into a plain argument",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                // `-differential_test_flag hello` after `--` is consumed as an ordinary recorded
+                // switch (its value is not leaked into `init:get_plain_arguments/0`).
+                expr: "init:get_plain_arguments()",
+                extra_argv: &["--", "-differential_test_flag", "hello"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok []"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -2933,5 +3135,115 @@ mod tests {
         assert_eq!(unset.extra_argv(), env_argv, "the -env argv");
         assert_eq!(unset.expr(), Some("os:getenv(\"differential_env_absent\")"));
         assert_eq!(unset.golden.stdout, Some("ok false"));
+    }
+
+    /// The widened `-env` / env-carried-switch / `--` surface added by the final block: an extra
+    /// `-eval` Start instruction, a repeated `-env` (last value wins), the `-env` pair boundary,
+    /// an `-env` name containing `=`, the `--` end-of-emulator-options token, and the
+    /// `ERL_AFLAGS`/`ERL_FLAGS`-carried switches. Each case pins the live oracle's answer for its
+    /// own argv/environment, so the merge/consumption rules stay anchored individually.
+    #[test]
+    fn the_widened_env_and_env_carried_switch_surface_pins_the_oracle_answers() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+
+        // A second `-eval` Start instruction: consumed with its expression (so it is still not
+        // an `init` argument), and a repeated `-env` for one variable: the last value wins.
+        for (id, argv, expr, golden) in [
+            (
+                "flags/eval_instruction_extra_is_not_an_init_argument",
+                &["-eval", "ok"][..],
+                "init:get_argument(eval)",
+                "ok error",
+            ),
+            (
+                "flags/env_switch_repeated_last_value_wins",
+                &[
+                    "-env",
+                    "differential_env_var",
+                    "v1",
+                    "-env",
+                    "differential_env_var",
+                    "v2",
+                ][..],
+                "os:getenv(\"differential_env_var\")",
+                "ok [118,50]",
+            ),
+            (
+                "flags/env_switch_value_does_not_swallow_the_next_switch",
+                &["-env", "differential_env_var", "hello", "-setcookie", "cookie"][..],
+                "init:get_argument(setcookie)",
+                "ok {ok,[[[99,111,111,107,105,101]]]}",
+            ),
+            (
+                "flags/env_switch_name_containing_equals",
+                &["-env", "differential_env_var=suffix", "hello"][..],
+                "os:getenv(\"differential_env_var\")",
+                "ok [115,117,102,102,105,120,61,104,101,108,108,111]",
+            ),
+            (
+                "flags/double_dash_is_not_recorded",
+                &["--"][..],
+                "init:get_argument('--')",
+                "ok error",
+            ),
+            (
+                "flags/double_dash_keeps_a_following_switch_a_switch",
+                &["--", "-differential_test_flag", "hello"][..],
+                "init:get_plain_arguments()",
+                "ok []",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli], "{id}");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the argv");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert!(case.env().is_empty(), "case {id}: a command-line case");
+            assert!(
+                matches!(case.kind, CaseKind::Eval { .. }),
+                "case {id}: a command-line case is a plain Eval"
+            );
+        }
+
+        // The env-carried switches: an `-env` pair or an `-eval` instruction carried by
+        // `ERL_AFLAGS`/`ERL_FLAGS` is merged into the effective argv before `init` sees it, so it
+        // is consumed there and the following `-differential_env_flag` is still recorded.
+        for (id, var, value) in [
+            (
+                "flags/env_erl_flags_carries_env_switch",
+                "ERL_FLAGS",
+                "-env differential_env_var hello -differential_env_flag aid",
+            ),
+            (
+                "flags/env_erl_aflags_carries_env_switch",
+                "ERL_AFLAGS",
+                "-env differential_env_var hello -differential_env_flag aid",
+            ),
+            (
+                "flags/env_erl_aflags_carries_eval_instruction",
+                "ERL_AFLAGS",
+                "-eval 1+1 -differential_env_flag aid",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::Cli], "{id}");
+            assert!(
+                case.extra_argv().is_empty(),
+                "case {id}: the merge is env-only"
+            );
+            assert_eq!(case.env(), &[(var, value)], "case {id}: the environment");
+            assert_eq!(
+                case.expr(),
+                Some("init:get_argument(differential_env_flag)"),
+                "case {id}"
+            );
+            assert_eq!(case.golden.stdout, Some("ok {ok,[[[97,105,100]]]}"), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
+            assert!(
+                matches!(case.kind, CaseKind::EvalEnv { .. }),
+                "case {id}: an env-carried switch is an EvalEnv"
+            );
+        }
     }
 }

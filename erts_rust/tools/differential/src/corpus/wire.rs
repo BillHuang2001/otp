@@ -67,13 +67,11 @@
 //! * `term_to_binary/2` with `{minor_version, 0|1}` reproduces the *legacy* `ATOM_EXT` (100) /
 //!   `FLOAT_EXT` (99) forms, so the `wire/minor_version_*_legacy_encode` cases `agree`.
 //!   Decoding a `compressed` (80) blob is covered by the `wire/compressed_decode_*` cases.
-//! * The `[local]` option image (`term_to_binary(Term, [local])`) is **implemented in the
-//!   codec** (`beam_codec`'s `LOCAL_EXT` wrapper) but is not callable through the BIF: the
-//!   4-byte payload is the *local node hash*, which the reference runtime randomises on every
-//!   node start (three consecutive oracle starts print three different payloads for the same
-//!   `nonode@nohost` term), so **no cross-runtime byte golden exists by design** and the BIF
-//!   raises the typed `unsupported` instead. It is an honest gap, pinned as `unsupported`,
-//!   never a mismatch.
+//! * The `[local]` option image (`term_to_binary(Term, [local])`) IS served through the BIF: the
+//!   image is `131`, `LOCAL_EXT` (121), a 4-byte *local node hash*, then the ordinary ETF body. The
+//!   hash is randomised on every node start on **both** sides, so no whole-image byte golden exists;
+//!   the `etf/term_to_binary_local_*` cases in [`super::etf`] mask exactly those 4 bytes and compare
+//!   the rest of the image byte-for-byte.
 //! * The `[deterministic]` option is byte-exact only where **no re-sorting is needed**: a map
 //!   already in canonical key order (and any non-map term) encodes identically, while a map
 //!   whose flatmap/HAMT order differs from the canonical one is the BIF's typed

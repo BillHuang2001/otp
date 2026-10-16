@@ -71,7 +71,11 @@
 //!   `multi_scheduling(_blockers)`, `emu_type`, `lock_checking`, `port_parallelism`,
 //!   `scheduler_bind_type`, `min_heap_size`, `min_bin_vheap_size`, `dist`, the `{allocator, …}`
 //!   instance lists and `allocated_areas` (list *shape* only — its sizes are volatile). Each is a
-//!   frozen build constant, a documented default, or a type assertion.
+//!   frozen build constant, a documented default, or a type assertion. `emu_type` is the one
+//!   exception that is *not* a frozen value: it names the emulator's own build tier, so a debug
+//!   `beam_rt` truthfully answers `debug` where the oracle answers `opt`. It is therefore pinned
+//!   by the **build-profile consistency invariant** against `debug_compiled` (a relation that holds
+//!   in either profile), never by one flavour value.
 //! * **`process_info/2` defaults that `self()` cannot show** — `registered_name`, `links` and
 //!   `trap_exit` are read from a **freshly spawned** process (unregistered, unlinked, not trapping
 //!   exits), and `current_function` / `initial_call` / `current_location` / `catchlevel` are pinned
@@ -959,9 +963,11 @@ pub(crate) fn group() -> Vec<Case> {
         ),
         case(
             "system_info/emu_type",
-            "system_info(emu_type) is opt for an optimised emulator build",
-            "erlang:system_info(emu_type)",
-            "ok opt",
+            "system_info(emu_type) is a documented build flavour (opt/debug) that agrees with \
+             debug_compiled: opt with debug_compiled false for a release build, debug with true for \
+             a debug build",
+            "lists:member(erlang:system_info(emu_type), [opt, debug]) andalso ((erlang:system_info(emu_type) =:= opt) =:= (erlang:system_info(debug_compiled) =:= false))",
+            "ok true",
         ),
         case(
             "system_info/lock_checking",
@@ -1471,6 +1477,54 @@ mod tests {
         }
     }
 
+    /// The build-flavour guard. `erlang:system_info(emu_type)` names *this* emulator's own build
+    /// tier — `beam_rt` answers `debug` for a debug build and `opt` for an optimised one (backed by
+    /// `debug_compiled`, `cfg!(debug_assertions)`) — while the oracle answers its own `opt`. The
+    /// gate builds `beam_rt` in **debug** (`cargo build -p beam_rt`; a clean checkout has no
+    /// `target/release/beam_rt`), so pinning the oracle's flavour as a literal golden turned every
+    /// such run into a hard `Mismatch` (exit 1, red CI). No case in this group may pin a flavour
+    /// value; the `emu_type` case must brace the documented `opt`/`debug` set through a relation
+    /// that holds in *either* profile.
+    #[test]
+    fn no_case_pins_a_build_flavour_value() {
+        for case in group() {
+            let golden = case.golden.stdout.expect("a golden");
+            assert!(
+                golden != "ok opt" && golden != "ok debug",
+                "case {} pins the build flavour as the literal golden `{golden}` — the runtime \
+                 answers its OWN profile (via `cfg!(debug_assertions)`/`debug_compiled`) and the \
+                 gate runs a DEBUG `beam_rt`, so this is a mismatch (exit 1, red CI) on every clean \
+                 checkout. Pin a profile-invariant relation instead",
+                case.id
+            );
+        }
+        let case = group()
+            .into_iter()
+            .find(|c| c.id == "system_info/emu_type")
+            .expect("registered");
+        let expr = case.expr().expect("an eval expression");
+        // (b) the flavour case must brace the documented value set ...
+        for flavour in [
+            "[opt, debug]",
+            "system_info(emu_type)",
+            "system_info(debug_compiled)",
+        ] {
+            assert!(
+                expr.contains(flavour),
+                "case {}: the expression `{expr}` must reference both documented flavours and the \
+                 debug_compiled cross-check ({flavour} missing)",
+                case.id
+            );
+        }
+        // ... and its golden must be a profile-invariant boolean, never a flavour value.
+        assert_eq!(
+            case.golden.stdout,
+            Some("ok true"),
+            "case {}: the flavour golden must be a profile-invariant boolean, never a flavour value",
+            case.id
+        );
+    }
+
     /// The widened scheduler / memory / `process_info` / `seq_trace` block: each case pins
     /// either a type, a documented relation, or a tagged key — never a volatile figure.
     #[test]
@@ -1585,7 +1639,7 @@ mod tests {
             ("system_info/break_ignored", "ok false"),
             ("system_info/multi_scheduling", "ok enabled"),
             ("system_info/multi_scheduling_blockers", "ok []"),
-            ("system_info/emu_type", "ok opt"),
+            ("system_info/emu_type", "ok true"),
             ("system_info/lock_checking", "ok false"),
             ("system_info/port_parallelism", "ok false"),
             ("system_info/scheduler_bind_type", "ok unbound"),
