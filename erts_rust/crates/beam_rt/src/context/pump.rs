@@ -642,7 +642,8 @@ call(F) -> F().
 /// `lists` the next step up, and the remaining five are the largest compiles on this route —
 /// per-module `user` time on this host (load-dependent, so the print-out below is the live
 /// figure): `dets` ≈ 100 s, `erl_eval` ≈ 83 s, `erl_lint` ≈ 107 s, `shell` ≈ 81 s, `qlc` ≈ 155 s.
-/// The whole set therefore costs ≈ 9 minutes of wall clock through one runtime. A regression
+/// The whole set therefore costs ≈ 9 minutes of wall clock under the debug runtime on this host,
+/// which is why it is one test and not seven. A regression
 /// either in [`RuntimeContext::pump_once`]'s sleep policy or in [`BLOCKING_PUMP_DEADLINE`]'s
 /// sizing surfaces as the typed `blocking pump` diagnostic or a missing/garbled artifact for one
 /// of them, never as a silent pass: every artifact is byte-compared with the oracle's
@@ -769,12 +770,15 @@ mod in_process_compile {
             }
         }
 
-        // One runtime for every module, on the CLI's own route (see [`cli_route_runtime`]): the
+        // One runtime **per module**, on the CLI's own route (see [`cli_route_runtime`]): the
         // compile's `epp`/`save_binary` round trips then address the booted `kernel_sup`'s real
         // `file_server_2`, exactly as they do for `beam_rt -noshell -eval '<compile:file(…)>'`.
-        let mut runtime = cli_route_runtime(&root);
-
+        // The per-module runtime is load-bearing rather than tidy: the `-eval` route allocates on
+        // an arena this runtime never resets, so driving all seven through **one** runtime retains
+        // every earlier compile's garbage and the largest of them dies on that arena's own
+        // `allocation failure` rather than on anything the pump's bound decides.
         for (module, src) in &sources {
+            let mut runtime = cli_route_runtime(&root);
             let rust_out = scratch_dir(&format!("{module}_rust_out"));
             let oracle_out = scratch_dir(&format!("{module}_oracle_out"));
 
