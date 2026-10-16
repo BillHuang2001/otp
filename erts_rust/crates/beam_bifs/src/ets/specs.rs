@@ -113,9 +113,19 @@ pub(super) fn register(reg: &mut BifRegistry) {
 /// an opaque compiled-spec term (a `#Ref<…>`, as the oracle returns).
 ///
 /// A malformed spec is `badarg` (verified: `ets:match_spec_compile(bad)` and
-/// `ets:match_spec_compile([{bad}])` both raise `badarg`).
+/// `ets:match_spec_compile([{bad}])` both raise `badarg`), as is the **empty** list
+/// (verified: `ets:match_spec_compile([])` ⇒ `error:badarg` — unlike the select
+/// family, which accepts `[]`).
 fn match_spec_compile_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let raw = args[0];
+    // The oracle rejects the **empty** clause list outright (`ets:match_spec_compile([])`
+    // ⇒ `error:badarg`, probed on OTP 29.1.1 / erts-17.1), while the *select* family
+    // legitimately accepts it (`ets:select(T,[])` ⇒ `[]`, `ets:select_count(T,[])`
+    // ⇒ `0`). `beam_ets::compile` maps `[]` to an empty spec (an `Ok`) because the
+    // select family needs that, so the rejection lives here in the wrapper only.
+    if is_nil(raw) {
+        return Err(badarg());
+    }
     // Compiling validates the spec (a malformed one is `badarg`); the compiled form
     // is not retained — `beam_ets::match_spec_run` recompiles the raw term, which
     // is therefore what the registry stores (see the module docs).
@@ -138,10 +148,10 @@ fn match_spec_compile_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
 /// non-reference. `List` must be a proper list; anything else is `badarg` (raised
 /// by [`beam_ets::match_spec_run`]).
 fn match_spec_run_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    // The stored spec's guards/bodies may compute arithmetic; install this crate's
-    // arbitrary-precision `ArithHook` over `beam_ets` for the run
-    // (`super::arith_hook`).
-    let _arith = super::arith_hook::PrecisionArith::install();
+    // The stored spec's guards/bodies may compute arithmetic and may read `self/0`;
+    // install this crate's two match-spec seams over `beam_ets` for the run
+    // (`super::self_hook::SpecEval`).
+    let _eval = super::self_hook::SpecEval::install(ctx.self_pid());
     let handle = ref_thing_id(args[1])?;
     let raw = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
@@ -177,7 +187,7 @@ fn match_spec_run_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// does not know (a table handle, a continuation, a forged id) and any
 /// non-reference. `List` must be a proper list or `[]`; anything else is `badarg`.
 fn match_spec_run_r_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let _arith = super::arith_hook::PrecisionArith::install();
+    let _eval = super::self_hook::SpecEval::install(ctx.self_pid());
     let handle = ref_thing_id(args[1])?;
     let raw = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;

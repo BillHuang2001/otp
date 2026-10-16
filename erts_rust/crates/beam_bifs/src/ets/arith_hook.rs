@@ -31,12 +31,12 @@
 //! # Install point (and why it is scoped)
 //!
 //! A BIF does not own the runtime thread, and the seam has no global "install once"
-//! entry, so the hook is installed **per match-spec evaluation** with
-//! [`PrecisionArith::install`]. The guard is created at the top of every `ets:*`
+//! entry, so the hook is installed **per match-spec evaluation**: the guard is held
+//! by [`super::self_hook::SpecEval`], the aggregate guard the top of every `ets:*`
 //! BIF that evaluates a match spec (`ets:select/1,2,3`, `ets:select_reverse/1,2,3`,
 //! `ets:select_count/2`, `ets:select_delete/2`, `ets:select_replace/2`,
 //! `ets:match_spec_run/2`, `ets:match_spec_run_r/3`,
-//! `ets:internal_select_delete/2`) and of `erlang:match_spec_test/3`, and it
+//! `ets:internal_select_delete/2`) and of `erlang:match_spec_test/3` opens, and it
 //! restores the seam's default when the outermost one drops — so the hook is live
 //! only while a spec is being evaluated and never leaks into unrelated work. The
 //! `ets:select`/`match` continuation resumes (`/1`) run through the same guard, so a
