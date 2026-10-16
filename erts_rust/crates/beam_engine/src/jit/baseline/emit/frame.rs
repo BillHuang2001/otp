@@ -148,19 +148,34 @@ pub(super) fn emit_return(
 /// One helper round-trip ([`jit_deallocate_return`]) performs the interpreter's two
 /// constituents in order (the checked pop, then the continuation read), and the block
 /// then leaves with the helper's word in `rax` — [`HALT`], a `(func, pc)` target,
-/// [`ENTER`] or [`ERROR`]. `func`/`pc` name the **return**: the fused instruction's own
-/// address, or the `return`'s address when the emitter fused a separate pair (exactly
-/// the position the interpreter would have recorded last).
+/// [`ENTER`] or [`ERROR`]. `func`/`position_pc` name the **return**: the fused
+/// instruction's own address, or the `return`'s address when the emitter fused a separate
+/// pair (exactly the position the interpreter would have recorded last).
+///
+/// # The two pcs — `position_pc` is not the store pc
+///
+/// The pair is lowered as **one** helper call, so there is **one** pre-call [`spill`] for
+/// two instruction positions, and the store set must be the dirty set of the moment that
+/// store happens: the dirty set **entering the first instruction of the pair**. Hence
+/// `store_pc` is a parameter of its own, and is *not* `position_pc` when the emitter fused
+/// a separate pair — there the single store covers the `deallocate`, whose `pc` is
+/// `position_pc - 1`, and the `return`'s own entry in the dirty table is already empty
+/// (the dirty walk clears it at the `deallocate`, whose store this call emits). Passing
+/// `position_pc` would therefore store **nothing** for a register the inline prefix of the
+/// pair's block made dirty, leaving `machine.x` stale for the helper (and for the driver
+/// that reads `x(0)` on the bottom-frame [`HALT`]).
 ///
 /// [`HALT`]: super::super::runtime::HALT
 /// [`ENTER`]: super::super::runtime::ENTER
 /// [`ERROR`]: super::super::runtime::ERROR
+/// [`spill`]: super::spill
 pub(super) fn emit_deallocate_return(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     done: CodeLabel,
     func: u32,
-    pc: u32,
+    position_pc: u32,
+    store_pc: u32,
     deallocate: u32,
 ) -> Result<()> {
     let helper: FrameExitHelper = jit_deallocate_return;
@@ -168,8 +183,13 @@ pub(super) fn emit_deallocate_return(
         buffer,
         allocation,
         helper as *const (),
-        &[i64::from(func), i64::from(pc), i64::from(deallocate)],
-    pc)?;
+        &[
+            i64::from(func),
+            i64::from(position_pc),
+            i64::from(deallocate),
+        ],
+        store_pc,
+    )?;
     emit_word_exit(buffer, done)
 }
 
@@ -254,7 +274,7 @@ mod tests {
     fn the_fused_exit_hands_the_helpers_word_to_the_driver() {
         let allocation = Allocation::default();
         let exit = lowered(|buffer, done| {
-            emit_deallocate_return(buffer, &allocation, done, 0, 7, 3)
+            emit_deallocate_return(buffer, &allocation, done, 0, 7, 7, 3)
         });
 
         // The root-set contract: the spill comes first, before the helper reads
@@ -295,7 +315,7 @@ mod tests {
         let allocation = Allocation::default();
         let bare = lowered(|buffer, done| emit_return(buffer, &allocation, done, 0, 7));
         let fused = lowered(|buffer, done| {
-            emit_deallocate_return(buffer, &allocation, done, 0, 7, 0)
+            emit_deallocate_return(buffer, &allocation, done, 0, 7, 7, 0)
         });
         assert!(
             bare.windows(helper_immediate(jit_return as *const ()).len())

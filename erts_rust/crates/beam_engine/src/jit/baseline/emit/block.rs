@@ -501,9 +501,17 @@ pub(crate) fn emit_block(
             // separate pair — is lowered as **one** helper round-trip, the same shape the
             // loaded IR pays, with the `return`'s own `pc` recorded (the position the
             // interpreter would have recorded last in that code shape).
+            //
+            // The one call replaces **two** instruction positions, so it has **one**
+            // pre-call store, whose set must be the dirty set at the moment it happens:
+            // the dirty set entering the **`deallocate`** — this arm's own `pc`. The
+            // `return`'s entry in the dirty table is already empty (the table clears it at
+            // the `deallocate`, whose store *is* this call), so passing the recorded
+            // `pc + 1` as the store pc would store nothing for a register this block's
+            // inline prefix made dirty and leave `machine.x` stale for the helper.
             Instr::Deallocate(n) => {
                 if matches!(code.get(start + i + 1), Some(Instr::Return)) {
-                    emit_deallocate_return(buffer, allocation, done, func, pc + 1, *n)?;
+                    emit_deallocate_return(buffer, allocation, done, func, pc + 1, pc, *n)?;
                     terminated = true;
                     break;
                 }
@@ -527,7 +535,7 @@ pub(crate) fn emit_block(
             // interpreter's checked pop, then the continuation read, in the interpreter's
             // own order.
             Instr::DeallocateReturn(n) => {
-                emit_deallocate_return(buffer, allocation, done, func, pc, *n)?;
+                emit_deallocate_return(buffer, allocation, done, func, pc, pc, *n)?;
                 terminated = true;
                 break;
             }
