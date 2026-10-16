@@ -412,6 +412,18 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
 ## Heap switches
 `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → 1598),
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
+## CLI `run` argument tokens
+`beam_rt run <beam> <m>:<f>/<a> <arg…>` materializes an integer token with
+`beam_term::make_small` (`src/runtime.rs::materialize`, reached from `src/cli.rs::parse_arg_term`'s
+`i64` arm) **without a range check**: a token above `MAX_SMALL` (`2^59 - 1`) aborts on the
+`debug_assert` in a debug build (`beam_term/src/immediate.rs:77`, exit 101) and is **silently
+truncated to a wrong small int in a release build** — `… bm:mk64/1 576460752303423488` prints
+`<<248,0,0,0,0,0,0,0>>` where the oracle prints `<<8,0,0,0,0,0,0,0>>`, a **wrong result**, the one
+class the runtime forbids. The fix belongs in those two files: range-check the parse and build a
+bignum (or reject the token), via `beam_term::try_make_small` + the bignum writer — the same range
+check `src/cli.rs` already applies to `+hmax` (`src/cli.rs:778`). `tests/bignum_bit_segment.rs`
+documents the hazard and reaches the same segment through a string token instead; the `-eval` route
+is unaffected (its integer literals are exact bignums).
 
 ## Cross-node handoff detail
 * **The differential gate.** Every recorded non-agreeing case is an honest capability gap in
@@ -536,20 +548,25 @@ changes; the `beam_message` clean-destination ceiling below is the same lever. F
   real result, and, only on a failing module, to carry a `Function: ` line), so a genuine compiler crash reports its real
   reason. The route completes for **72 of the 86** oracle-compilable `lib/stdlib/src/*.erl` with
   byte-identical `.beam`; the 14 failures are heap-independent compiler-runtime defects, **none
-  io-related**, and split into exactly two root causes. **12** — `c`, `dets`, `epp`, `ets`, `io`,
-  `peer`, `qlc`, `shell`, `slave`, `sys`, `timer`, `win32reg` — are the `beam_bifs` `maps:*`
-  iterator-term defect: `map/2`/`fold/3`/`filter/2`/`foreach/2` mis-reject a valid
-  `maps:iterator/1,2` term, so `beam_ssa_recv:plan_clears/2` raises
-  `{crash,beam_ssa_recv,{badmap, Iterator}, …}` (owning crate `erts_rust/crates/beam_bifs`; detail in
+  io-related**, and split into exactly two root causes. **13** — `c`, `dets`, `epp`, `erl_lint`,
+  `ets`, `io`, `peer`, `qlc`, `shell`, `slave`, `sys`, `timer`, `win32reg` — are the `beam_bifs`
+  `maps:*` iterator-term defect: `map/2`/`fold/3`/`filter/2`/`foreach/2` mis-reject a valid
+  `maps:iterator/1,2` term, so those modules raise
+  `{crash,beam_ssa_recv,{badmap, Iterator}, …}` from `beam_ssa_recv:plan_clears/2` or — `erl_lint` —
+  the same `{badmap, Iterator}` from `beam_ssa_opt:phase/4` (owning crate
+  `erts_rust/crates/beam_bifs`; detail in
   [`../beam_bifs/CONTEXT.md`](../beam_bifs/CONTEXT.md)). This is the **largest remaining bucket** —
-  12 of the 14. The other **2** are a `beam_engine` defect: `<<Int:Size>>` (BEAM `bs_create_bin`)
+  13 of the 14. The remaining **1** is a `beam_engine` defect: `<<Int:Size>>` (BEAM `bs_create_bin`)
   wrongly rejects a **bignum** in a field of `Size <= 64`, so `erl_tar` fails at
-  `Function: do_merge_pax/2` and `erl_lint` at `Function: start_state/2`, both raising
+  `Function: do_merge_pax/2` raising
   `{crash,beam_core_to_ssa,badarg, …}` where the oracle masks the bignum into the field width
-  (reproducer: a module `bm:mk64(X) -> <<X:64>>.` run as
-  `beam_rt run bm.beam bm:mk64/1 7811896436376826984` → `beam_rt: badarg` here,
-  `<<8,0,0,0,0,0,0,0>>` on the oracle; `X < 2^59` works and `<<X:80>>` works via the wide-integer
-  path; tier-independent, and the `-eval` route is unaffected). The bignum arm's fix is
+  (reproducer: a compiled `f(X) -> <<X:64>>` reached with a bignum `X` — e.g. the `bm:mk64s/1`
+  string entry that rebuilds it with `list_to_integer/1`, since a bare `run` integer token above
+  `2^59 - 1` is a separate hazard of its own, see `src/runtime.rs::materialize`; a narrow segment
+  with a small int works and `<<X:80>>` works via the wide-integer
+  path; tier-independent, and the `-eval` route is unaffected).
+  [`tests/bignum_bit_segment.rs`](../crates/beam_rt/tests/bignum_bit_segment.rs) pins the oracle's
+  masking ground truth and the typed-gap invariant. The bignum arm's fix is
   **out-of-scope for this crate** (owner `erts_rust/crates/beam_engine`): in
   `crates/beam_engine/src/families/bitstrings/create/mod.rs`, the `"integer"` arm of `bs_create_bin`
   (~lines 215-233) must accept a bignum for `nbits <= 64` through the existing magnitude machinery
