@@ -65,7 +65,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
   Required: `name()` (+ `flags()` default `empty()`), `start`, `output`, `ready_input`, `stop`.
   Defaulted: `ready_output` (= `output`), `control`, `timeout` (its `Result<()>` is discarded by `Port::run_task`'s `Timeout` arm — no reply channel), `next_timeout() -> Option<Instant>` (the declared deadline, mirrored into the port's `TIMEOUT` after each interaction; default `None`), `port_exit(PortExitReason)` (= `Ok(())`; the once-only advisory port-exit notification, distinct from the teardown `stop`), `drive_async` (= `Ok(0)`; `DriverPort` overrides with `poll_async`), `has_pending_async() -> bool` (= `false`; overridden via `AbiHost`), `take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`; only `SpawnDriver` overrides), `take_eof() -> Result<bool>` (= `Ok(false)`; only `SpawnDriver`).
   Further capabilities must be additive with defaults that keep the built-ins compiling.
-  · `DriverFactory = fn() -> Result<Box<dyn Driver>>`; `DriverRegistry` — name→factory (the `driver_tab.c` seam); `with_builtins()` registers **`"fd"`, `"efile"`, `"tcp_inet"`**.
+  · `DriverFactory = fn() -> Result<Box<dyn Driver>>`; `DriverRegistry` — name→factory (the `driver_tab.c` seam); `with_builtins()` registers **`"fd"`, `"efile"`, `"tcp_inet"`, `"udp_inet"`, `"ram_file_drv"`**.
 
 ### `drivers/` (each module's role is in the Routing Table)
 - `fd.rs` — `FdDriver`, the built-in `"fd"` byte-stream driver; **owns** its fds (closed on `stop`/`Drop`).
