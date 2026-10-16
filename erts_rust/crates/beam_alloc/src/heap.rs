@@ -148,6 +148,38 @@ impl Heap {
         unsafe { self.base.add(self.cap) }
     }
 
+    /// The initialised prefix of the heap (`[0, used)`) as a mutable word slice.
+    ///
+    /// The slice spans **exactly** the [`used`](Heap::used) words handed out so far —
+    /// never the full [`capacity`](Heap::capacity): the words past `used` are
+    /// uninitialised, so exposing (let alone reading) them would be undefined behaviour.
+    /// This is the safe counterpart of [`hp`](Heap::hp)/[`hend`](Heap::hend) — it lets an
+    /// unsafe-free caller (e.g. a loader that patches a tag bit into an already-built
+    /// term) walk and rewrite the live prefix without ever holding a raw pointer.
+    ///
+    /// `&mut self` proves the heap is exclusively borrowed, so no allocation can run
+    /// (and hence no new pointer be handed out) while the slice is live; the borrow
+    /// ends as soon as the slice goes out of scope. A heap with no words handed out
+    /// yields an empty slice.
+    ///
+    /// The words themselves are only as initialised as the caller's own writes left
+    /// them: [`alloc_words`](Heap::alloc_words) hands out uninitialised words, so
+    /// reading a word the caller has not written yet reads uninitialised memory.
+    pub fn used_words_mut(&mut self) -> &mut [Eterm] {
+        let used = self.used;
+        if used == 0 {
+            // A zero-length slice never dereferences its data pointer, so it needs no
+            // valid base: a zero-capacity heap's `base` may be dangling, but it is never
+            // turned into a slice here.
+            return <&mut [Eterm]>::default();
+        }
+        // SAFETY: `base` is the start of the allocator-provided block, valid for `cap >=
+        // used` `Eterm` words; `&mut self` makes this the sole access to those words for
+        // the slice's lifetime, and `used` bounds the slice to the prefix the bump pointer
+        // has reached (never the uninitialised tail).
+        unsafe { core::slice::from_raw_parts_mut(self.base, used) }
+    }
+
     /// The allocator backing this heap.
     pub fn allocator(&self) -> &AllocRef {
         &self.alloc
@@ -550,6 +582,84 @@ mod tests {
         assert_eq!(list_val(head) as usize - list_val(tail) as usize, 2 * WORD);
         assert_eq!(heap.used(), 4);
         assert_eq!(heap.available(), 0);
+    }
+
+    #[test]
+    fn used_words_mut_covers_exactly_the_words_handed_out() {
+        let (_alloc, mut heap) = new_heap(8);
+
+        assert!(
+            heap.used_words_mut().is_empty(),
+            "a fresh heap has no live words"
+        );
+        assert_eq!(heap.used(), 0);
+
+        // SAFETY: the first allocation of a fresh heap starts at `hp`, i.e. the block
+        // base; the single word is written here and never read before that.
+        let first = unsafe { heap.alloc_words(1) }.expect("1 of 8 words fits");
+        // SAFETY: `first` owns exactly one word, written here.
+        unsafe { *first = make_small(3) };
+
+        let (len, base) = {
+            let words = heap.used_words_mut();
+            assert_eq!(words[0], make_small(3));
+            (words.len(), words.as_ptr())
+        };
+        assert_eq!(len, heap.used(), "the slice covers exactly the used words");
+        assert_eq!(base, first, "the slice starts at the block base");
+
+        heap.tuple(&[make_small(1), make_small(2)])
+            .expect("1 + 2 words fit in the remaining 7");
+        let len = heap.used_words_mut().len();
+        assert_eq!(len, heap.used());
+        assert_eq!(len, 4);
+        // The slice is the live prefix, never the whole capacity (the tail is
+        // uninitialised and must never be exposed).
+        assert!(len < heap.capacity());
+    }
+
+    #[test]
+    fn writing_through_used_words_mut_is_visible_to_later_reads() {
+        let (_alloc, mut heap) = new_heap(4);
+        let _term = heap
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("3 of 4 words fit");
+        assert_eq!(heap.used(), 3);
+
+        {
+            let words = heap.used_words_mut();
+            assert_eq!(words.len(), 3);
+            // The slice is the term's own words: the arityval header, then the elements.
+            assert_eq!(words[0], make_arityval(2));
+            assert_eq!(words[1], make_small(1));
+            assert_eq!(words[2], make_small(2));
+            words[0] = make_small(7);
+        }
+
+        {
+            let words = heap.used_words_mut();
+            assert_eq!(words[0], make_small(7), "the write is visible on a later read");
+            assert_eq!(words[1], make_small(1));
+            assert_eq!(words[2], make_small(2));
+        }
+        assert_eq!(heap.used(), 3, "the accessor never moved the bump pointer");
+    }
+
+    #[test]
+    fn an_empty_heap_yields_an_empty_used_words_slice() {
+        // A zero-capacity heap's `base` is the allocator's dangling-but-aligned
+        // pointer; the accessor must answer with an empty slice and never build a
+        // slice over that pointer.
+        let (_alloc, mut heap) = new_heap(0);
+        assert_eq!(heap.capacity(), 0);
+        assert_eq!(heap.used(), 0);
+        assert!(heap.used_words_mut().is_empty());
+
+        // The same holds for a heap with capacity that has handed nothing out.
+        let (_alloc, mut heap) = new_heap(16);
+        assert_eq!(heap.capacity(), 16);
+        assert_eq!(heap.used(), 0);
+        assert!(heap.used_words_mut().is_empty());
     }
 
     #[test]

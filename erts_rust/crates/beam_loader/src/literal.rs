@@ -34,6 +34,13 @@
 //! — and therefore neither is a loaded [`Module`](crate::ir::Module): a module
 //! stays on the thread that loaded it.
 //!
+//! **The arena words carry `TAG_LITERAL_PTR`.** After decoding, the whole
+//! initialized arena and every boxed/list root are tagged through
+//! [`beam_term::literal::tag_literal_area`] — the safe form of the C load-time
+//! step `erts_set_literal_tag` (`../../erts/emulator/beam/erl_term.c`). The bit
+//! sits inside the 3-bit pointer tag, so address resolution is unchanged; it lets
+//! the collector recognize off-heap literal pointers and decline to copy them.
+//!
 //! Heap exhaustion while decoding is handled by *growing the area*: the heap
 //! allocated here is a private, fixed-capacity arena, so an exhausted decode is
 //! retried on a larger arena (a bounded number of attempts) before the allocation
@@ -71,7 +78,9 @@ const MAX_DECODE_ATTEMPTS: u32 = 6;
 /// The struct owns the heap the terms point into; dropping the area frees it. The
 /// terms are handed out by value ([`Eterm`] is a machine word) and stay valid for
 /// as long as the area — and therefore the loaded
-/// [`Module`](crate::ir::Module) — is alive.
+/// [`Module`](crate::ir::Module) — is alive. Both the arena words and the roots
+/// carry `TAG_LITERAL_PTR` (see the module docs): the area is an off-heap literal
+/// region, so the collector leaves its pointers alone.
 pub struct LiteralArea {
     /// The arena the decoded terms live in; `None` exactly when `terms` is empty
     /// (a module without literals allocates nothing).
@@ -99,11 +108,20 @@ impl LiteralArea {
     /// A malformed payload, an unsupported ETF tag or a decode that still does not
     /// fit after the bounded retries yields the corresponding typed [`BeamError`];
     /// nothing is ever silently defaulted.
+    ///
+    /// The decoded arena is literal-tagged before it is published: the initialized
+    /// words and each boxed/list root are ORed with `TAG_LITERAL_PTR` via
+    /// [`beam_term::literal::tag_literal_area`] (the safe form of the C
+    /// `erts_set_literal_tag`). Tagging happens **only** here — the shared
+    /// `decode_terms`/`decode_terms_at_capacity` helpers are also used by
+    /// [`crate::attributes::AttributeTable`], whose terms are ordinary heap terms
+    /// and must not carry the literal bit.
     pub fn decode(raw: &[Vec<u8>], atoms: &mut AtomTable) -> Result<LiteralArea> {
         if raw.is_empty() {
             return Ok(LiteralArea::empty());
         }
-        let (heap, terms) = decode_terms(raw, atoms)?;
+        let (mut heap, mut terms) = decode_terms(raw, atoms)?;
+        beam_term::literal::tag_literal_area(heap.used_words_mut(), &mut terms);
         Ok(LiteralArea {
             heap: Some(heap),
             terms,
