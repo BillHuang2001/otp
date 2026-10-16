@@ -18,6 +18,7 @@ Keys by file (58 here):
 - `src/ets/reverse.rs` (3): `select_reverse/1,2,3`.
 - `src/ets/resolve.rs`: no BIFs — `resolve_handle`/`resolve_handle_opt`, the owner bridge, `parse_options`/`ParsedOptions`, the `TableProfile`, `locks_option`/`normalize_locks`/`pid_arg` and the `Gate` check (below).
 - `src/ets/arith_hook.rs`: no BIFs — `PrecisionArith` (the scoped install guard) and the private `PrecisionArithHook`, the crate's implementation of `beam_ets`'s thread-local match-spec `ArithHook` (below).
+- `src/ets/self_hook.rs`: no BIFs — the private `PidHook` (the crate's `beam_ets` match-spec `SelfHook`, answering the calling process's pid) and `SpecEval`, the aggregate scoped guard that installs **both** match-spec seams (below).
 
 ### The `TableRegistry` public surface
 `insert`/`get`/`get_mut`/`contains`/`remove`/`take`/`forget_profile`/`len`/`is_empty`/`insert_name`/`lookup_name`/`remove_name`/`insert_continuation`/`take_continuation`/`continuation`/`continuation_table`/`insert_spec`/`spec_raw`/`contains_spec`, plus the two **runtime-adoption** entry points (see the adoption-contract section): `handles_owned_by(OwnerId) -> Vec<u64>` and the associated `owner_of(ProcessId) -> OwnerId`.
