@@ -39,7 +39,9 @@ use crate::error;
 /// The lexer's token set.
 ///
 /// Keywords (`case`, `fun`, `when`, …) are lexed as [`Tok::Atom`]; the parser
-/// distinguishes them by position, exactly as the Erlang scanner does.
+/// distinguishes them by position, exactly as the Erlang scanner does. A **quoted**
+/// atom (`'case'`, `'when'`) is lexed as [`Tok::QuotedAtom`]: in Erlang a quoted atom
+/// is *always* an atom — never a keyword, never an infix operator, never a variable.
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     /// An integer literal (an exact `i128`, so a value past 64 bits is still exact).
@@ -48,8 +50,10 @@ enum Tok {
     Float(f64),
     /// A string literal (already unescaped).
     Str(String),
-    /// An atom (bare or quoted) — or a keyword.
+    /// A bare atom word — or a keyword (`of`, `end`, `when`, `after`, `not`, …).
     Atom(String),
+    /// A quoted atom (`'case'`, `'a b'`, `'when'`): always an atom, never a keyword.
+    QuotedAtom(String),
     /// A variable.
     Var(String),
     /// A punctuation / operator token, looked up by its spelling.
@@ -141,7 +145,7 @@ impl<'a> Lexer<'a> {
             } else if c == '"' {
                 out.push(Tok::Str(self.quoted('"')?));
             } else if c == '\'' {
-                out.push(Tok::Atom(self.quoted('\'')?));
+                out.push(Tok::QuotedAtom(self.quoted('\'')?));
             } else if c.is_alphabetic() || c == '_' {
                 out.push(self.word()?);
             } else {
@@ -350,6 +354,8 @@ impl<'a> Lexer<'a> {
 fn binop_of(tok: &Tok, in_segment: bool) -> Option<(BinOp, u8, u8)> {
     let name: &str = match tok {
         Tok::Punct(p) => p,
+        // A **bare** atom word may spell an infix operator (`and`, `div`, `orelse`,
+        // …). A quoted atom never does: `1 'and' 2` is not `1 and 2`.
         Tok::Atom(a) => a.as_str(),
         _ => return None,
     };
@@ -469,6 +475,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Whether the current token is the bare atom/keyword `name`.
+    ///
+    /// A quoted atom is never a keyword, so `'when'`/`'of'`/`'end'`/`'after'`/`'catch'`
+    /// and the prefix operators (`not`/`bnot`/`catch`) are matched only here.
     fn is_atom(&self, name: &str) -> bool {
         matches!(self.peek(), Some(Tok::Atom(a)) if a == name)
     }
@@ -514,9 +523,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Requires an atom (bare or quoted) and returns its name.
+    ///
+    /// Both forms are allowed: a function/module name after `:` and the names in
+    /// `fun M:F/A` may be quoted (`erlang:'addition'(1,2)`, `'lists':reverse(…)`,
+    /// `fun 'erlang':'+'/2`).
     fn expect_atom_name(&mut self) -> Result<String> {
         match self.bump() {
-            Some(Tok::Atom(name)) => Ok(name),
+            Some(Tok::Atom(name) | Tok::QuotedAtom(name)) => Ok(name),
             other => Err(self.err(&format!("expected an atom, found {other:?}"))),
         }
     }
@@ -636,8 +649,11 @@ impl<'a> Parser<'a> {
                 "end" | "of" | "when" | "after" => {
                     Err(self.err(&format!("unexpected keyword {name:?}")))
                 }
-                _ => self.after_atom(name),
+                _ => self.after_atom(name, false),
             },
+            // A quoted atom is always an atom — never a keyword (`'case'` is the atom
+            // `case`, not the control form), but it may still head a call/remote call.
+            Tok::QuotedAtom(name) => self.after_atom(name, true),
             Tok::Punct("(") => self.with_seg_off(|p| p.parse_paren()),
             Tok::Punct("[") => self.with_seg_off(|p| p.parse_list()),
             Tok::Punct("{") => self.with_seg_off(|p| p.parse_tuple()),
@@ -648,8 +664,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Continues after a bare atom: a local call, a remote call, or the atom.
-    fn after_atom(&mut self, name: String) -> Result<Expr> {
+    /// Continues after an atom (bare or quoted): a local call, a remote call, or the
+    /// atom itself.
+    ///
+    /// `quoted` marks a quoted-atom head (`'abs'(1)`, `'lists':reverse(…)`). A quoted
+    /// call head is **always** a function call — an auto-imported local call is exactly
+    /// `erlang:'Name'/Arity` — never a fun-valued variable, so it becomes an
+    /// [`Expr::Remote`] rather than an [`Expr::Call`] (whose head the evaluator would
+    /// otherwise read as a variable when the name is upper-case, e.g. `'Foo'(1)`).
+    fn after_atom(&mut self, name: String, quoted: bool) -> Result<Expr> {
         if !self.no_remote && self.eat_punct(":") {
             let function = self.expect_atom_name()?;
             self.expect_punct("(")?;
@@ -658,6 +681,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_punct("(") {
             let args = self.parse_call_args()?;
+            if quoted {
+                return Ok(Expr::Remote("erlang".into(), name, args));
+            }
             return Ok(Expr::Call(name, args));
         }
         Ok(Expr::Atom(name))
@@ -828,7 +854,7 @@ impl<'a> Parser<'a> {
                     seg.kind = Some(SegKind::Integer);
                     seg.size = Some(Expr::Int(bits));
                 }
-                Some(Tok::Atom(name)) => {
+                Some(Tok::Atom(name) | Tok::QuotedAtom(name)) => {
                     self.pos += 1;
                     match name.as_str() {
                         "integer" => seg.kind = Some(SegKind::Integer),
@@ -1061,39 +1087,48 @@ impl<'a> Parser<'a> {
                     clauses,
                 })
             }
-            Some(Tok::Atom(name)) => {
-                self.pos += 1;
-                if self.eat_punct("/") {
-                    let arity = self.expect_int()?;
-                    return Ok(Expr::FunRef {
-                        module: None,
-                        name,
-                        arity: u32::try_from(arity)
-                            .map_err(|_| self.err("fun arity must be non-negative"))?,
-                    });
-                }
-                if self.eat_punct(":") {
-                    let function = self.expect_atom_name()?;
-                    self.expect_punct("/")?;
-                    let arity = self.expect_int()?;
-                    return Ok(Expr::FunRef {
-                        module: Some(name),
-                        name: function,
-                        arity: u32::try_from(arity)
-                            .map_err(|_| self.err("fun arity must be non-negative"))?,
-                    });
-                }
-                if self.eat_punct("(") {
-                    let clauses = self.parse_fun_clauses()?;
-                    return Ok(Expr::Fun {
-                        name: Some(name),
-                        clauses,
-                    });
-                }
-                Err(self.err("malformed fun expression"))
-            }
+            Some(Tok::Atom(name)) => self.parse_fun_named(name, false),
+            Some(Tok::QuotedAtom(name)) => self.parse_fun_named(name, true),
             other => Err(self.err(&format!("malformed fun expression: {other:?}"))),
         }
+    }
+
+    /// The `fun Name/Arity` / `fun Module:Name/Arity` / named-`fun` continuation after
+    /// the fun's name token (which this consumes).
+    ///
+    /// `quoted` marks a quoted-atom name (`fun 'foo'/0`, `fun 'erlang':'+'/2`). Erlang
+    /// requires the *named*-fun form's name to be a **variable**, so a quoted atom
+    /// followed by `(` (`fun 'foo'(X) -> X end`) is a syntax error.
+    fn parse_fun_named(&mut self, name: String, quoted: bool) -> Result<Expr> {
+        self.pos += 1;
+        if self.eat_punct("/") {
+            let arity = self.expect_int()?;
+            return Ok(Expr::FunRef {
+                module: None,
+                name,
+                arity: u32::try_from(arity)
+                    .map_err(|_| self.err("fun arity must be non-negative"))?,
+            });
+        }
+        if self.eat_punct(":") {
+            let function = self.expect_atom_name()?;
+            self.expect_punct("/")?;
+            let arity = self.expect_int()?;
+            return Ok(Expr::FunRef {
+                module: Some(name),
+                name: function,
+                arity: u32::try_from(arity)
+                    .map_err(|_| self.err("fun arity must be non-negative"))?,
+            });
+        }
+        if !quoted && self.eat_punct("(") {
+            let clauses = self.parse_fun_clauses()?;
+            return Ok(Expr::Fun {
+                name: Some(name),
+                clauses,
+            });
+        }
+        Err(self.err("malformed fun expression"))
     }
 
     /// Whether the token `n` ahead is the punctuation `spelling`.
@@ -1376,8 +1411,149 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_keyword_atom_is_a_plain_atom() {
+        // A quoted atom whose text spells an Erlang keyword is *always* an atom — never the
+        // reserved word — so no control form springs into being. (`erl_scan:string("'case'")`
+        // is `{atom,1,'case'}` where `case` alone is `{'case',1}`.)
+        for name in [
+            "case", "if", "begin", "try", "receive", "fun", "end", "of", "when", "after",
+            "catch", "not", "bnot",
+        ] {
+            assert_eq!(
+                parsed(&format!("'{name}'")),
+                Expr::Atom(name.into()),
+                "'{name}' must lex as a plain atom"
+            );
+        }
+        // … in argument, tuple-element, map-key, comprehension and clause positions.
+        assert_eq!(
+            parsed("f('when')"),
+            Expr::Call("f".into(), vec![Expr::Atom("when".into())])
+        );
+        assert_eq!(
+            parsed("{'when','of'}"),
+            Expr::Tuple(vec![Expr::Atom("when".into()), Expr::Atom("of".into())])
+        );
+        assert_eq!(
+            parsed("#{'case' => 1}"),
+            Expr::Map(vec![MapField {
+                key: Expr::Atom("case".into()),
+                value: Expr::Int(1),
+                update: false,
+            }])
+        );
+        assert_eq!(
+            parsed("[V || V <- ['when','of']]"),
+            Expr::ListComp(
+                Box::new(Expr::Var("V".into())),
+                vec![Qual::Generator {
+                    pattern: Expr::Var("V".into()),
+                    source: Expr::List(
+                        vec![Expr::Atom("when".into()), Expr::Atom("of".into())],
+                        None,
+                    ),
+                }]
+            )
+        );
+    }
+
+    #[test]
+    fn a_quoted_atom_is_never_a_keyword_or_an_operator() {
+        // A quoted `'of'` subject and `'end'`/`'when'` clause terms do not confuse the `case`
+        // delimiters: the `of`/`->`/`end` that structure the form are the *bare* words.
+        let Expr::Case(subject, clauses) = parsed("case 'of' of 'end' -> 'when' end") else {
+            panic!("a quoted `'of'` subject and `'end'` pattern must still be a `case`");
+        };
+        assert_eq!(*subject, Expr::Atom("of".into()));
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].pattern, Some(Expr::Atom("end".into())));
+        assert_eq!(clauses[0].body, vec![Expr::Atom("when".into())]);
+        // A quoted `'when'` in a `receive` clause is the pattern, not a guard introducer
+        // (and the quoted `'after'` is the body, not the timeout keyword).
+        let Expr::Receive(receive) = parsed("receive 'when' -> 'after' end") else {
+            panic!("`receive` must still parse");
+        };
+        assert!(receive.after.is_none(), "a quoted `'after'` must not open a timeout");
+        assert_eq!(receive.clauses[0].guards, Vec::<Vec<Expr>>::new());
+        assert_eq!(receive.clauses[0].body, vec![Expr::Atom("after".into())]);
+        // A quoted atom is never an infix operator: `1 'and' 2` is out-of-grammar Erlang
+        // (the oracle reports a syntax error), so it is a typed capability gap — never
+        // `1 and 2` and never a runtime `badarg`. Same for the prefix spelling `'not' 1`.
+        for src in ["1 'and' 2", "1 'or' 2", "1 'div' 2", "'not' 1", "'bnot' 1"] {
+            let error = parse(src).expect_err(&format!("{src:?} is not Erlang"));
+            assert!(crate::error::unsupported_reason(&error).is_some(), "{src:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_call_head_is_a_function_call() {
+        // A quoted call head is a *function call* — an auto-imported local call is exactly
+        // `erlang:'Name'/Arity` — so it becomes an `Expr::Remote("erlang", …)`, **not** an
+        // `Expr::Call` whose head the evaluator would read as a fun-valued variable when the
+        // name is upper-case (`'Foo'(1)` must reach the oracle's `undef`, not
+        // `variable "Foo" is unbound`). A lowercase quoted head is behaviour-identical to the
+        // bare form (`'abs'(-1)` is still `erlang:abs/1`).
+        assert_eq!(
+            parsed("'abs'(-1)"),
+            Expr::Remote(
+                "erlang".into(),
+                "abs".into(),
+                vec![Expr::Unary(UnOp::Minus, Box::new(Expr::Int(1)))]
+            )
+        );
+        assert!(matches!(
+            parsed("'Foo'(1)"),
+            Expr::Remote(module, name, _) if module == "erlang" && name == "Foo"
+        ));
+        // A quoted *module* name is unchanged, and a quoted function name after `:` is fine.
+        assert!(matches!(
+            parsed("'lists':reverse([1,2])"),
+            Expr::Remote(module, function, _) if module == "lists" && function == "reverse"
+        ));
+        assert!(matches!(
+            parsed("'erlang':'+'(1,2)"),
+            Expr::Remote(module, function, _) if module == "erlang" && function == "+"
+        ));
+        // A quoted head that is not followed by `(`/`:` stays a plain atom.
+        assert_eq!(parsed("'abs'"), Expr::Atom("abs".into()));
+    }
+
+    #[test]
+    fn quoted_fun_names_parse_but_never_name_a_fun_clause() {
+        // `fun 'foo'/0` and `fun 'erlang':'+'/2` are ordinary fun references.
+        assert_eq!(
+            parsed("fun 'foo'/0"),
+            Expr::FunRef {
+                module: None,
+                name: "foo".into(),
+                arity: 0,
+            }
+        );
+        assert_eq!(
+            parsed("fun 'erlang':'+'/2"),
+            Expr::FunRef {
+                module: Some("erlang".into()),
+                name: "+".into(),
+                arity: 2,
+            }
+        );
+        // Erlang requires the *named*-fun form's name to be a **variable**, so a quoted atom
+        // followed by `(` (`fun 'foo'(X) -> X end`) is a syntax error on the oracle and a
+        // typed parse gap here — never silently accepted as `fun foo(X) -> X end`.
+        let error = parse("fun 'foo'(X) -> X end").expect_err("a quoted named fun is invalid");
+        assert!(crate::error::unsupported_reason(&error).is_some(), "{error}");
+        // … while the variable form still parses.
+        assert!(matches!(
+            parsed("fun F(X) -> X end"),
+            Expr::Fun { name: Some(_), .. }
+        ));
+    }
+
+    #[test]
     fn malformed_input_is_a_typed_error() {
-        for src in ["", "1+", "(1", "case", "foo(", "{1,", "[1,", "1 2", "#r{}", "@"] {
+        for src in [
+            "", "1+", "(1", "case", "foo(", "{1,", "[1,", "1 2", "#r{}", "@", "1 'and' 2",
+        ] {
             let error = parse(src).expect_err(&format!("{src:?} must be rejected"));
             assert!(
                 crate::error::unsupported_reason(&error).is_some(),
