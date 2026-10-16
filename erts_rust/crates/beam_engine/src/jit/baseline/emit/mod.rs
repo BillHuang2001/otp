@@ -136,6 +136,13 @@ mod regs;
 mod select;
 mod test;
 
+// The dirty-set store model's unit tests (`Allocation::spill_sets` /
+// `spill_slots_at` / `spill`), plus the consistency pin over the committed
+// fixture corpus. A separate file because the module's own unit tests live in
+// `baseline/tests.rs`, which is not a child of this node.
+#[cfg(test)]
+#[path = "spill_tests.rs"]
+mod spill_tests;
 // The register cache — the `Allocation` and its spill/fill traffic — lives in the
 // `regs` submodule; re-exported here so `emit::Allocation`, `emit::spill`,
 // `emit::fill` and the item paths the other emitter submodules name stay unchanged.
@@ -156,6 +163,8 @@ pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
 pub(crate) use r#move::{move_shape, MoveShape};
 #[cfg(test)]
 pub(crate) use regalloc::cacheable_touches;
+#[cfg(test)]
+pub(crate) use regalloc::is_inlined;
 pub(crate) use regalloc::allocate_registers;
 
 // The compilation entry points live in the `compile` submodule; re-export them here
