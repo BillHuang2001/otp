@@ -789,10 +789,10 @@ impl PendingInterner {
     /// table through `Rc::make_mut` when nothing was interned. Several long-lived handles
     /// (the port registry, the persistent-term/NIF bridges, plus this call's own `atoms`
     /// binding) keep the table's strong count at 2 or more, so `code_server.atoms_mut()`
-    /// would deep-clone the entire `AtomTable` (`Vec<String>` + `HashMap<String, Atom>`,
-    /// thousands of entries after boot) on **every** registered BIF call -- even one that
-    /// interns nothing. Skipping the `atoms_mut()` borrow when nothing was recorded keeps
-    /// the no-copy fast path.
+    /// would deep-clone the entire `AtomTable` (`Vec<Arc<str>>` +
+    /// `HashMap<Arc<str>, Atom>`, thousands of entries after boot) on **every**
+    /// registered BIF call -- even one that interns nothing. Skipping the `atoms_mut()`
+    /// borrow when nothing was recorded keeps the no-copy fast path.
     pub(crate) fn is_empty(&self) -> bool {
         self.with_inner(|inner| inner.names.is_empty())
     }
