@@ -376,6 +376,20 @@ struct Walk<'a> {
 /// smaller table means a higher load factor, and on the `timer.erl` compile workload that raised
 /// the walk's mean probes per insert from 1.42 to 1.69, costing ~9 % more cycles end to end — the
 /// table is memory-bound but with *low* load, so the probe count dominates the footprint.
+///
+/// # Cost
+///
+/// Per walk the table is **near-optimal**: ~1.25–1.45 probes per insert on the real compile
+/// workloads, ~5 grows over a whole `pool.erl` compile, and the walk is **memory-bound** rather
+/// than probe-bound (the compile it sits in runs at ~4.1–5.2 instructions per cycle). What
+/// dominates that compile is instead how *often* the descent runs: `pool.erl` performs ~284 881
+/// descents (≈256 M inserts — a few thousand objects each) against `timer.erl`'s ~2.87e9 inserts,
+/// so on a small compile the set is **starved and cold** on most descents and building it costs
+/// more than probing it. Memoising addresses **across** walks cannot replace the per-walk reset —
+/// a heap address is reused as soon as its object is collected, so one walk's visit says nothing
+/// about the next — and cutting the invocation count (with the caller's per-edge
+/// `root_is_unscanned`/`for_each_child_slot` cost) is a `super::gc` / `beam_engine` policy
+/// question, not this table's.
 #[derive(Default)]
 struct Visited {
     /// The table's slots, each a key and the generation that wrote it.
