@@ -101,7 +101,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use beam_common::{BeamError, ExceptionClass, Raise, Result};
+use beam_common::{BeamError, ExceptionClass, LiveReason, Raise, Result};
 use beam_engine::{terms, ExecutionContext};
 use beam_term::{
     atom_val, is_atom, is_list, is_nil, is_small, make_atom, make_small, signed_value,
@@ -367,6 +367,30 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
 /// A [`Flow::Fatal`] is returned unchanged. A [`Flow::Raise`] that came from a BIF
 /// (`origin`) is returned unchanged too; one the evaluator produced itself is
 /// re-built as a [`BeamError::Raise`] from its live reason term.
+///
+/// # The structured reason
+///
+/// The evaluator's own raises (`{case_clause, Subject}`, `{badmatch, Value}`,
+/// `{bad_generator, X}`, …) are **terms**, but [`ExitReason`](beam_common::ExitReason)
+/// holds no term: [`beam_bifs::exit_reason_from_term`] maps a non-atom to
+/// [`ExitReason::Structured`](beam_common::ExitReason::Structured). The term is therefore
+/// attached to the raise's opaque
+/// [`live_reason`](beam_common::Raise::live_reason) slot — the same convention
+/// `beam_bifs` uses — so a **consumer** of the raise renders the real reason
+/// (`error {case_clause,1}`) instead of the `<structured reason>` placeholder. The
+/// consumers are the one recovery point [`crate::error::live_reason_term`] and everything
+/// built on it: `cli.rs`'s `reported_reason` (the boot and `run`-file routes),
+/// [`crate::runner`](crate::runner)'s `exit_reason` for a process that dies of the raise,
+/// and this module's own [`Evaluator::flow_from_error`] when the raise re-enters the
+/// evaluator. An action arm that prints a raise with `BeamError`'s `Display` instead of
+/// going through that recovery point cannot show the term — the slot is what makes the
+/// term *available*, not the CLI's rendering.
+///
+/// An **atom** reason gets no slot: the atom is the authoritative reason, so a term
+/// attached next to one must never shadow it ([`crate::error::live_reason_term`]
+/// refuses such a raise anyway, and the `unsupported`/`halt` classification reads the
+/// atom). This is the **only** terminal conversion of an evaluator `Flow::Raise`, so
+/// the one arm covers every raise site in this module it is called from.
 fn finish(result: EResult<Eterm>, ctx: &RuntimeContext<'_>) -> Result<Eterm> {
     match result {
         Ok(value) => Ok(value),
@@ -382,11 +406,21 @@ fn finish(result: EResult<Eterm>, ctx: &RuntimeContext<'_>) -> Result<Eterm> {
         }) => match origin {
             Some(err) => Err(err),
             None => {
-                let reason = beam_bifs::exit_reason_from_term(
+                let exit_reason = beam_bifs::exit_reason_from_term(
                     reason,
                     ctx.runtime.code_server.atoms(),
                 );
-                Err(BeamError::Raise(Raise::new(class, reason)))
+                let raise = Raise::new(class, exit_reason);
+                // `ExitReason::as_atom` is the gate (not `BeamError::as_atom`): it answers
+                // `None` for exactly the `Structured` reason whose term would otherwise be
+                // lost, and `Some(..)` for every atom reason — which must keep behaving
+                // exactly as it does today.
+                let raise = if raise.reason.as_atom().is_some() {
+                    raise
+                } else {
+                    raise.with_live_reason(LiveReason::new(reason))
+                };
+                Err(BeamError::Raise(raise))
             }
         },
     }
@@ -2998,6 +3032,183 @@ mod tests {
         .expect("the compound reason survives the raise");
         let printed = ctx.runtime.format_term(reason, None).expect("~p renders it");
         assert_eq!(printed.trim_end(), "{nif_not_loaded,m,f,0}");
+    }
+
+    /// The `{case_clause, V}`/`if_clause` raises the evaluator itself produces are converted
+    /// to a [`BeamError`] by [`finish`] — the module's **only** terminal conversion of a
+    /// [`Flow::Raise`] (both call sites, [`eval`] and [`apply_eval_closure`], go through it).
+    ///
+    /// A **structured** reason (`{case_clause, Subject}`, …) is a term the term-free
+    /// [`ExitReason`](beam_common::ExitReason) cannot hold, so [`finish`] attaches it to the
+    /// raise's live-reason slot: [`crate::error::live_reason_term`] — the runtime's single
+    /// recovery point, and what every rendering route consumes — must find it. Before the
+    /// slot was attached the reason rendered as the `<structured reason>` placeholder.
+    ///
+    /// Every expectation is the system oracle's own `~w` text for that reason, verified live
+    /// by [`the_uncaught_reason_text_is_the_oracles`] below.
+    #[test]
+    fn an_uncaught_structured_reason_carries_its_live_term() {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        for (expr, expected) in [
+            ("case 1 of 2 -> ok end", "{case_clause,1}"),
+            ("case [a,b,c] of [x] -> y end", "{case_clause,[a,b,c]}"),
+            ("case <<1,2>> of <<3,4>> -> ok end", "{case_clause,<<1,2>>}"),
+        ] {
+            let error = eval(&mut ctx, expr).expect_err(expr);
+            let BeamError::Raise(raise) = &error else {
+                panic!("{expr}: expected a raise, got {error:?}");
+            };
+            assert_eq!(raise.class, ExceptionClass::Error, "{expr}");
+            assert_eq!(
+                raise.reason.as_atom(),
+                None,
+                "{expr}: a structured reason names no atom"
+            );
+            let reason = error::live_reason_term(&error)
+                .unwrap_or_else(|| panic!("{expr}: the reason term must be live"));
+            let printed = ctx
+                .runtime
+                .format_term_w(reason, None)
+                .expect("~w renders it");
+            assert_eq!(printed.trim_end(), expected, "{expr}");
+        }
+    }
+
+    /// An evaluator-produced **atom** reason is unchanged: the atom is the authoritative
+    /// reason, so [`finish`] attaches no term next to it and
+    /// [`crate::error::live_reason_term`] keeps answering `None` (an atom reason must never be
+    /// shadowed by a term — see its own doc).
+    ///
+    /// `if` with no matching clause raises the **bare atom** `if_clause` (the oracle prints
+    /// `exc error if_clause`), which is an evaluator raise with `origin: None` — i.e. exactly
+    /// the arm [`finish`] rewrites.
+    #[test]
+    fn an_uncaught_atom_reason_is_not_shadowed_by_a_live_term() {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let error = eval(&mut ctx, "if false -> ok end").expect_err("an unmet `if`");
+        let BeamError::Raise(raise) = &error else {
+            panic!("expected a raise, got {error:?}");
+        };
+        assert_eq!(raise.class, ExceptionClass::Error);
+        // The atom is still the reason, and it still *names* the reason.
+        assert_eq!(raise.reason.as_atom(), Some("if_clause"));
+        assert_eq!(raise.reason.to_string(), "if_clause");
+        assert!(
+            raise.live_reason().is_none(),
+            "an atom reason must not carry a live term"
+        );
+        assert_eq!(error::live_reason_term(&error), None);
+    }
+
+    /// The system `erl`'s stdout for `expression`, or `None` — with a **loud** skip on stderr
+    /// — when no `erl` is on `PATH`, or when the probe outlived `ORACLE_TIMEOUT`.
+    ///
+    /// The bound is not optional: a bare `erl -noshell` never exits, so every probe here ends
+    /// in `halt/0` and a hung `erl` is killed rather than allowed to wedge the suite.
+    fn oracle_stdout(expression: &str) -> Option<String> {
+        const ORACLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut child = match std::process::Command::new("erl")
+            .args(["-noshell", "-eval", expression])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIP: no erl on PATH — the uncaught `-eval` raise reason text is not \
+                     cross-checked against the system Erlang"
+                );
+                return None;
+            }
+            Err(error) => panic!("running the erl oracle: {error}"),
+        };
+        let deadline = std::time::Instant::now() + ORACLE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "SKIP: the erl probe did not exit within {ORACLE_TIMEOUT:?} — the \
+                         uncaught `-eval` raise reason text is not cross-checked"
+                    );
+                    return None;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => panic!("polling the erl oracle: {error}"),
+            }
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take()?, &mut text).expect("oracle stdout");
+        Some(text)
+    }
+
+    /// The reason **text** an uncaught `-eval` raise renders is the oracle's own.
+    ///
+    /// Each expression is run under the system `erl` inside the mandatory self-terminating
+    /// wrapper, so the oracle prints `exc error <Reason>` (its `~w` rendering of the reason)
+    /// and exits 1; this runtime must render the identical `~w` text from its raise — through
+    /// [`crate::error::live_reason_term`] for a structured reason and through the atom itself
+    /// otherwise, which is exactly what `cli.rs`'s `reported_reason` does for a route that
+    /// consumes the slot. This is the live cross-check that keeps the hardcoded
+    /// expectations above honest.
+    #[test]
+    fn the_uncaught_reason_text_is_the_oracles() {
+        // The four reasons below in one `erl` invocation (the oracle is spawned once, not
+        // four times): `W/1` is the mandatory wrapper, applied to each expression in turn.
+        const PROBE: &str = r#"W = fun(E) -> try (fun() -> E() end)() of V -> io:format("ok ~w~n", [V]), ok catch C:R -> io:format("exc ~w ~w~n", [C, R]), ok end end, [W(E) || E <- [fun() -> case 1 of 2 -> ok end end, fun() -> case [a,b,c] of [x] -> y end end, fun() -> case <<1,2>> of <<3,4>> -> ok end end, fun() -> if false -> ok end end]], halt(0)."#;
+        let Some(stdout) = oracle_stdout(PROBE) else {
+            return;
+        };
+        let cases = [
+            ("case 1 of 2 -> ok end", "{case_clause,1}"),
+            ("case [a,b,c] of [x] -> y end", "{case_clause,[a,b,c]}"),
+            ("case <<1,2>> of <<3,4>> -> ok end", "{case_clause,<<1,2>>}"),
+            ("if false -> ok end", "if_clause"),
+        ];
+        let oracle_lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            oracle_lines.len(),
+            cases.len(),
+            "the oracle probe printed {oracle_lines:?}"
+        );
+
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        for (index, (expr, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                oracle_lines[index],
+                format!("exc error {expected}"),
+                "{expr} under the oracle"
+            );
+            let error = eval(&mut ctx, expr).expect_err(expr);
+            let rendered = match error::live_reason_term(&error) {
+                Some(term) => ctx
+                    .runtime
+                    .format_term_w(term, None)
+                    .expect("~w renders the reason")
+                    .trim_end()
+                    .to_string(),
+                None => {
+                    let BeamError::Raise(raise) = &error else {
+                        panic!("{expr}: expected a raise, got {error:?}");
+                    };
+                    raise.reason.to_string()
+                }
+            };
+            assert_eq!(
+                format!("exc error {rendered}"),
+                oracle_lines[index],
+                "{expr}: this runtime's reason text"
+            );
+        }
     }
 
     /// `erlang:raise/3` is **not** served by the evaluator: it falls through to the
