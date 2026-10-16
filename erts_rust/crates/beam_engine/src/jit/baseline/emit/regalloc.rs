@@ -79,8 +79,9 @@
 //! The model reproduces the classic "already-clean-aware" store elimination a handwritten
 //! JIT's register cache does — see `ERTS_RUST_REWRITE_DEEPDIVE.md` §F (the baseline/hot
 //! tier split and its correctness-first register-cache design) and the read-only legacy-C
-//! reference `erts/emulator/beam/jit/beam_jit_register_cache.hpp` (its `reg_cache->x_regs[x]
-//! .modified` dirty bit, checked before every `mov [x_regs+x], reg` store) plus the
+//! reference `erts/emulator/beam/jit/beam_jit_register_cache.hpp` (a position-keyed cache
+//! whose `consolidate(offset)`/`validAt(offset)` evict the whole cache when the emit position
+//! moves; it carries no per-register dirty bit) plus the
 //! `erts/emulator/beam/jit/x86/beam_asm*.cpp` emitters that consult it.
 
 use std::collections::BTreeMap;
