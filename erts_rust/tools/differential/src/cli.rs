@@ -24,9 +24,10 @@
 //!
 //! ```text
 //! differential <SUBCOMMAND> [OPTIONS]
-//!   run     <case-id> [--json] [--out <dir>]
+//!   run     <case-id> [--json] [--out <dir>] [--out-file <path>]
 //!   compare <expr> [--pa <dir>]… [--json] [--out <dir>]
 //!   suite   [--strict] [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>]
+//!   merge   --from <dir> [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>] [--out-file <path>]
 //!   list    [--by-contract] [--json] [--out <dir>]
 //!   help    [topic]
 //! ```
@@ -50,6 +51,8 @@ pub enum Command {
         json: bool,
         /// Also write `<dir>/report.json`.
         out: Option<PathBuf>,
+        /// Write the report to **exactly** this path (instead of `<out>/report.json`).
+        out_file: Option<PathBuf>,
     },
     /// Evaluate an ad-hoc Erlang expression under both runtimes and compare.
     Compare {
@@ -85,6 +88,22 @@ pub enum Command {
         /// Also write `<dir>/report.json`.
         out: Option<PathBuf>,
     },
+    /// Fold the per-case reports written by `run --out-file` into one suite-shaped report
+    /// (and optionally the generated `GAPS.md`), without re-running any case.
+    Merge {
+        /// The directory holding the per-case `*.json` reports to fold.
+        from: PathBuf,
+        /// A known-gaps allowlist: classify the merged cases' gaps against it (the ratchet).
+        allowlist: Option<PathBuf>,
+        /// Also write the generated `GAPS.md` document to this path.
+        gaps: Option<PathBuf>,
+        /// Print the JSON report to stdout.
+        json: bool,
+        /// Also write `<dir>/report.json`.
+        out: Option<PathBuf>,
+        /// Write the merged report to **exactly** this path (instead of `<out>/report.json`).
+        out_file: Option<PathBuf>,
+    },
     /// Print help for the root (`topic == None`) or for a subcommand.
     Help {
         /// The subcommand whose help was requested.
@@ -108,6 +127,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "run" => parse_run(rest),
         "compare" => parse_compare(rest),
         "suite" => parse_suite(rest),
+        "merge" => parse_merge(rest),
         "list" => parse_list(rest),
         "help" => Ok(Command::Help {
             topic: rest.first().map(|topic| topic.to_string()),
@@ -124,15 +144,16 @@ pub fn usage(topic: Option<&str>) -> String {
     match topic {
         None | Some("help") => ROOT_USAGE.to_string(),
         Some("run") => format!(
-            "differential run <case-id> [--json] [--out <dir>]\n\n\
+            "differential run <case-id> [--json] [--out <dir>] [--out-file <path>]\n\n\
              Run one built-in corpus case under the oracle and the Rust runtime, then\n\
              compare the observations (an expression case with one shared argv; a\n\
              module-run case with per-side argv) plus the case golden.\n\
              An unknown <case-id> is a usage error (exit 2).\n\n\
              OPTIONS:\n  \
-             --json        print the JSON report to stdout\n  \
-             --out <dir>   also write <dir>/report.json\n  \
-             -h, --help    show this help\n\n\
+             --json            print the JSON report to stdout\n  \
+             --out <dir>       also write <dir>/report.json\n  \
+             --out-file <path> write the report to exactly <path> (instead of <dir>/report.json)\n  \
+             -h, --help        show this help\n\n\
              See `differential list` for the available case ids.\n"
         ),
         Some("compare") => format!(
@@ -167,6 +188,26 @@ pub fn usage(topic: Option<&str>) -> String {
              --out <dir>   also write <dir>/report.json\n  \
              -h, --help    show this help\n"
         ),
+        Some("merge") => format!(
+            "differential merge --from <dir> [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>] [--out-file <path>]\n\n\
+             Fold the per-case reports written by `run <case-id> --out-file <path>` into one\n\
+             suite-shaped report, without re-running any case. The cases are deduped by\n\
+             case id (first occurrence wins) and sorted by it, so the merged document is\n\
+             deterministic. With --allowlist the known-gaps ratchet is classified and\n\
+             --gaps writes the same generated GAPS.md that `suite --gaps` writes.\n\
+             A missing/unknown <dir>, or a *.json that does not parse, is a usage error\n\
+             (exit 2).\n\n\
+             OPTIONS:\n  \
+             --from <dir>      the directory holding the per-case *.json reports (required)\n  \
+             --allowlist <file> classify the merged gaps against this allowlist (the ratchet)\n  \
+             --gaps <path>     also write the generated GAPS.md document to <path>\n  \
+             --json            print the JSON report to stdout\n  \
+             --out <dir>       also write <dir>/report.json\n  \
+             --out-file <path> write the merged report to exactly <path>\n  \
+             -h, --help        show this help\n\n\
+             EXIT: 0 when every case agreed and the ratchet is clean; 1 on a mismatch or an\n\
+             unauthorized/stale allowlist entry (the same codes as `suite --strict`).\n"
+        ),
         Some(other) => format!(
             "unknown help topic '{other}'\n\n{}",
             usage(None)
@@ -185,15 +226,18 @@ SUBCOMMANDS:
   run <case-id>   run one built-in corpus case under both runtimes and compare
   compare <expr>  evaluate an ad-hoc Erlang expression under both runtimes
   suite           run the whole built-in conformance corpus
+  merge --from <dir>  fold per-case `run --out-file` reports into one suite-shaped report
   list            list the built-in corpus (needs no runtime)
   help [topic]    show this help, or the help of one subcommand
 
 OPTIONS (per subcommand):
   --json          print the JSON report to stdout
   --out <dir>     also write <dir>/report.json
+  --out-file <path> (run, merge) write the report to exactly <path> instead of <dir>/report.json
   --strict        (suite) treat unsupported/skipped cases as failures
-  --allowlist <file> (suite, with --strict) tolerate the recorded known capability gaps
-  --gaps <path>   (suite) also write the generated GAPS.md document to <path>
+  --allowlist <file> (suite, with --strict; merge) tolerate the recorded known capability gaps
+  --gaps <path>   (suite, merge) also write the generated GAPS.md document to <path>
+  --from <dir>    (merge) the directory of per-case `run --out-file` reports to fold
   --by-contract   (list) group the listing by compatibility contract
   --pa <dir>      (compare) add a code path for both runtimes, repeatable
   -h, --help      show help (valid at the root and after any subcommand)
@@ -253,6 +297,40 @@ fn consume_common(
     Ok(false)
 }
 
+/// Handle the `--out-file <path>` option (only `run` and `merge` accept it).
+///
+/// Returns `true` when the option was consumed.
+fn consume_out_file(
+    arg: &str,
+    args: &[String],
+    index: &mut usize,
+    out_file: &mut Option<PathBuf>,
+    subcommand: &str,
+) -> Result<bool> {
+    if arg == "--out-file" {
+        *index += 1;
+        let value = args.get(*index).ok_or_else(|| {
+            Error::usage(format!(
+                "option '--out-file' requires a file argument\n\n{}",
+                usage(Some(subcommand))
+            ))
+        })?;
+        *out_file = Some(PathBuf::from(value));
+        return Ok(true);
+    }
+    if let Some(value) = arg.strip_prefix("--out-file=") {
+        if value.is_empty() {
+            return Err(Error::usage(format!(
+                "option '--out-file' requires a file argument\n\n{}",
+                usage(Some(subcommand))
+            )));
+        }
+        *out_file = Some(PathBuf::from(value));
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn unknown_option(arg: &str, subcommand: &str) -> Error {
     Error::usage(format!(
         "unknown option '{arg}' for '{subcommand}'\n\n{}",
@@ -261,7 +339,7 @@ fn unknown_option(arg: &str, subcommand: &str) -> Error {
 }
 
 fn parse_run(args: &[String]) -> Result<Command> {
-    let (mut json, mut out, mut case_id) = (false, None, None);
+    let (mut json, mut out, mut out_file, mut case_id) = (false, None, None, None);
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -271,6 +349,10 @@ fn parse_run(args: &[String]) -> Result<Command> {
             });
         }
         if consume_common(arg, args, &mut index, &mut json, &mut out, "run")? {
+            index += 1;
+            continue;
+        }
+        if consume_out_file(arg, args, &mut index, &mut out_file, "run")? {
             index += 1;
             continue;
         }
@@ -289,7 +371,12 @@ fn parse_run(args: &[String]) -> Result<Command> {
     let case_id = case_id.ok_or_else(|| {
         Error::usage(format!("'run' requires a <case-id>\n\n{}", usage(Some("run"))))
     })?;
-    Ok(Command::Run { case_id, json, out })
+    Ok(Command::Run {
+        case_id,
+        json,
+        out,
+        out_file,
+    })
 }
 
 fn parse_compare(args: &[String]) -> Result<Command> {
@@ -439,6 +526,116 @@ fn parse_suite(args: &[String]) -> Result<Command> {
     })
 }
 
+fn parse_merge(args: &[String]) -> Result<Command> {
+    let (mut json, mut out, mut out_file) = (false, None, None);
+    let (mut from, mut allowlist, mut gaps): (
+        Option<PathBuf>,
+        Option<PathBuf>,
+        Option<PathBuf>,
+    ) = (None, None, None);
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if is_help(arg) {
+            return Ok(Command::Help {
+                topic: Some("merge".to_string()),
+            });
+        }
+        if arg == "--from" {
+            index += 1;
+            let value = args.get(index).ok_or_else(|| {
+                Error::usage(format!(
+                    "option '--from' requires a directory argument\n\n{}",
+                    usage(Some("merge"))
+                ))
+            })?;
+            from = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--from=") {
+            if value.is_empty() {
+                return Err(Error::usage(format!(
+                    "option '--from' requires a directory argument\n\n{}",
+                    usage(Some("merge"))
+                )));
+            }
+            from = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if arg == "--allowlist" {
+            index += 1;
+            let value = args.get(index).ok_or_else(|| {
+                Error::usage(format!(
+                    "option '--allowlist' requires a file argument\n\n{}",
+                    usage(Some("merge"))
+                ))
+            })?;
+            allowlist = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--allowlist=") {
+            if value.is_empty() {
+                return Err(Error::usage(format!(
+                    "option '--allowlist' requires a file argument\n\n{}",
+                    usage(Some("merge"))
+                )));
+            }
+            allowlist = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if arg == "--gaps" {
+            index += 1;
+            let value = args.get(index).ok_or_else(|| {
+                Error::usage(format!(
+                    "option '--gaps' requires a path argument\n\n{}",
+                    usage(Some("merge"))
+                ))
+            })?;
+            gaps = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--gaps=") {
+            if value.is_empty() {
+                return Err(Error::usage(format!(
+                    "option '--gaps' requires a path argument\n\n{}",
+                    usage(Some("merge"))
+                )));
+            }
+            gaps = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if consume_common(arg, args, &mut index, &mut json, &mut out, "merge")? {
+            index += 1;
+            continue;
+        }
+        if consume_out_file(arg, args, &mut index, &mut out_file, "merge")? {
+            index += 1;
+            continue;
+        }
+        return Err(unknown_option(arg, "merge"));
+    }
+    let from = from.ok_or_else(|| {
+        Error::usage(format!(
+            "'merge' requires a --from <dir>\n\n{}",
+            usage(Some("merge"))
+        ))
+    })?;
+    Ok(Command::Merge {
+        from,
+        allowlist,
+        gaps,
+        json,
+        out,
+        out_file,
+    })
+}
+
 fn parse_list(args: &[String]) -> Result<Command> {
     let (mut json, mut out, mut by_contract) = (false, None, false);
     let mut index = 0;
@@ -497,7 +694,7 @@ mod tests {
 
     #[test]
     fn help_is_recognized_after_any_subcommand() {
-        for sub in ["run", "compare", "suite", "list"] {
+        for sub in ["run", "compare", "suite", "merge", "list"] {
             for spelling in ["-h", "--help"] {
                 let parsed = parse(&argv(&[sub, spelling])).unwrap();
                 assert_eq!(
@@ -528,12 +725,12 @@ mod tests {
     fn every_subcommand_has_usable_help() {
         assert!(usage(None).contains("SUBCOMMANDS"));
         assert_eq!(usage(None), ROOT_USAGE);
-        for sub in ["run", "compare", "suite", "list", "help"] {
+        for sub in ["run", "compare", "suite", "merge", "list", "help"] {
             let text = usage(Some(sub));
             assert!(text.contains(sub), "missing {sub} in its own help");
             assert!(text.contains("-h, --help"), "no help option for {sub}");
         }
-        for sub in ["run", "compare", "suite", "list"] {
+        for sub in ["run", "compare", "suite", "merge", "list"] {
             let text = usage(Some(sub));
             assert!(text.contains("--out <dir>"), "{sub}: no --out documented");
             assert!(text.contains("USAGE") || text.starts_with("differential "), "{sub}");
@@ -549,6 +746,7 @@ mod tests {
                 case_id: "etf/term_to_binary_tuple".to_string(),
                 json: false,
                 out: None,
+                out_file: None,
             }
         );
         assert_eq!(
@@ -564,6 +762,7 @@ mod tests {
                 case_id: "etf/term_to_binary_atom".to_string(),
                 json: true,
                 out: Some(PathBuf::from("/tmp/x")),
+                out_file: None,
             }
         );
         assert_eq!(
@@ -572,8 +771,53 @@ mod tests {
                 case_id: "terms/atom_order".to_string(),
                 json: false,
                 out: Some(PathBuf::from("/tmp/y")),
+                out_file: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_run_accepts_out_file_in_both_spellings() {
+        assert_eq!(
+            parse(&argv(&[
+                "run",
+                "etf/term_to_binary_tuple",
+                "--out-file",
+                "/tmp/x/report.json"
+            ]))
+            .unwrap(),
+            Command::Run {
+                case_id: "etf/term_to_binary_tuple".to_string(),
+                json: false,
+                out: None,
+                out_file: Some(PathBuf::from("/tmp/x/report.json")),
+            }
+        );
+        // The `=` spelling composes with the shared options, in any order.
+        assert_eq!(
+            parse(&argv(&[
+                "run",
+                "etf/term_to_binary_tuple",
+                "--out-file=/tmp/y.json",
+                "--json",
+            ]))
+            .unwrap(),
+            Command::Run {
+                case_id: "etf/term_to_binary_tuple".to_string(),
+                json: true,
+                out: None,
+                out_file: Some(PathBuf::from("/tmp/y.json")),
+            }
+        );
+        // A bare/empty `--out-file` requires a file argument.
+        assert!(matches!(
+            parse(&argv(&["run", "etf/term_to_binary_tuple", "--out-file"])),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["run", "etf/term_to_binary_tuple", "--out-file="])),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]
@@ -582,6 +826,114 @@ mod tests {
         assert!(matches!(parse(&argv(&["run", "--json"])), Err(Error::Usage(_))));
         assert!(matches!(
             parse(&argv(&["run", "a", "b"])),
+            Err(Error::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn parse_merge_accepts_the_from_switch_and_every_option() {
+        assert_eq!(
+            parse(&argv(&["merge", "--from", "reports"])).unwrap(),
+            Command::Merge {
+                from: PathBuf::from("reports"),
+                allowlist: None,
+                gaps: None,
+                json: false,
+                out: None,
+                out_file: None,
+            }
+        );
+        // Every option, in one (order-scrambled) command line.
+        assert_eq!(
+            parse(&argv(&[
+                "merge",
+                "--gaps",
+                "GAPS.md",
+                "--json",
+                "--from=reports",
+                "--out",
+                "/tmp/o",
+                "--allowlist=/tmp/known-gaps.txt",
+                "--out-file",
+                "/tmp/o/merged.json",
+            ]))
+            .unwrap(),
+            Command::Merge {
+                from: PathBuf::from("reports"),
+                allowlist: Some(PathBuf::from("/tmp/known-gaps.txt")),
+                gaps: Some(PathBuf::from("GAPS.md")),
+                json: true,
+                out: Some(PathBuf::from("/tmp/o")),
+                out_file: Some(PathBuf::from("/tmp/o/merged.json")),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_merge_requires_a_from_and_rejects_unknown_options() {
+        for args in [
+            vec!["merge"],
+            vec!["merge", "--json"],
+            vec!["merge", "--from"],
+            vec!["merge", "--from="],
+            vec!["merge", "--gaps"],
+            vec!["merge", "--allowlist"],
+            vec!["merge", "--out-file"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&args)), Err(Error::Usage(_))),
+                "{args:?} must be a usage error"
+            );
+        }
+        assert!(matches!(
+            parse(&argv(&["merge", "--from", "reports", "--strict"])),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["merge", "--from", "reports", "extra"])),
+            Err(Error::Usage(_))
+        ));
+        // The missing-`--from` error names the requirement and points at the merge help.
+        let err = parse(&argv(&["merge", "--json"])).unwrap_err();
+        assert!(
+            err.to_string().contains("--from <dir>"),
+            "the error names the requirement: {err}"
+        );
+        assert!(err.to_string().contains("differential merge"), "{err}");
+    }
+
+    #[test]
+    fn merge_help_is_reachable() {
+        assert_eq!(
+            parse(&argv(&["merge", "--help"])).unwrap(),
+            Command::Help {
+                topic: Some("merge".to_string())
+            }
+        );
+        let text = usage(Some("merge"));
+        assert!(text.contains("--from <dir>"), "{text}");
+        assert!(text.contains("--gaps <path>"), "{text}");
+        assert!(text.contains("--out-file <path>"), "{text}");
+        assert!(ROOT_USAGE.contains("merge --from <dir>"), "{ROOT_USAGE}");
+    }
+
+    #[test]
+    fn out_file_is_only_accepted_by_run_and_merge() {
+        assert!(matches!(
+            parse(&argv(&[
+                "compare",
+                "1 + 1",
+                "--out-file",
+                "/tmp/x.json"
+            ])),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["suite", "--out-file", "/tmp/x.json"])),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["list", "--out-file", "/tmp/x.json"])),
             Err(Error::Usage(_))
         ));
     }

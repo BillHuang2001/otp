@@ -69,6 +69,52 @@ pub fn write_json_value<T: Serialize>(value: &T, out: Option<&Path>) -> Result<P
     Ok(path)
 }
 
+/// Write any serializable report to **exactly** `path`, creating its parent directory.
+///
+/// This is the `--out-file` writer: unlike [`write_json_value`] it does not append
+/// `report.json` to a directory, so the caller controls the file name. It is what lets the
+/// per-case `run --out-file` reports be folded later by the `merge` command. Returns the
+/// file that was written.
+pub fn write_json_to<T: Serialize>(value: &T, path: &Path) -> Result<PathBuf> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|source| {
+                Error::io(
+                    format!(
+                        "failed to create the report directory '{}'",
+                        parent.display()
+                    ),
+                    source,
+                )
+            })?;
+        }
+    }
+    let json = to_json_string(value)?;
+    std::fs::write(path, json).map_err(|source| {
+        Error::io(
+            format!("failed to write the report '{}'", path.display()),
+            source,
+        )
+    })?;
+    Ok(path.to_path_buf())
+}
+
+/// Read a `differential/1` run report back from a JSON file (the `merge` command).
+///
+/// A missing/unreadable file, or a JSON body that is not a run report of the expected
+/// schema, is a loud [`Error`] naming the file — never silently skipped.
+pub fn read_report_file(path: &Path) -> Result<RunReport> {
+    let text = std::fs::read_to_string(path).map_err(|source| {
+        Error::io(format!("reading the report '{}'", path.display()), source)
+    })?;
+    serde_json::from_str(&text).map_err(|source| {
+        Error::io(
+            format!("parsing the report '{}'", path.display()),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        )
+    })
+}
+
 /// Serialize a value as pretty JSON, mapping failures onto a tool error.
 pub fn to_json_string<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string_pretty(value).map_err(|source| {
@@ -171,6 +217,51 @@ mod tests {
         assert_eq!(path, dir.join("report.json"));
         let written = std::fs::read_to_string(&path).expect("read back");
         assert!(written.contains("\"schema\": \"differential/list/1\""));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// `--out-file` writes to EXACTLY the requested path (parent dirs created) and the same
+    /// bytes can be read back as a run report — the round trip `merge` depends on.
+    #[test]
+    fn write_json_to_round_trips_through_read_report_file() {
+        use super::{read_report_file, write_json_to};
+
+        let dir = std::env::temp_dir().join(format!(
+            "differential-out-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let report = report(Verdict::Unsupported, SideResult::unsupported("no beam_rt"), Some(true));
+
+        // A path whose parent does not exist yet: the writer creates it.
+        let path = dir.join("nested").join("case.json");
+        let written = write_json_to(&report, &path).expect("write");
+        assert_eq!(written, path, "the report is written to exactly the requested path");
+        assert!(
+            !path.with_file_name("report.json").exists(),
+            "`--out-file` never also writes a report.json"
+        );
+
+        let read_back = read_report_file(&path).expect("read back");
+        assert_eq!(read_back.schema, SCHEMA);
+        assert_eq!(read_back.mode, "run");
+        assert_eq!(read_back.summary.total, 1);
+        assert_eq!(read_back.summary.unsupported, 1);
+        assert_eq!(read_back.cases.len(), 1);
+        assert_eq!(read_back.cases[0].case_id, "etf/term_to_binary_tuple");
+        assert_eq!(read_back.cases[0].verdict, Verdict::Unsupported);
+        assert_eq!(read_back.cases[0].contracts[0].id(), "A.2");
+        // The rollup is recomputed from the cases rather than trusted from the JSON.
+        assert_eq!(read_back.by_contract["A.2"].unsupported, 1);
+
+        // A missing file and a non-report JSON body are both loud errors naming the file.
+        let missing = read_report_file(&dir.join("nope.json")).unwrap_err();
+        assert!(missing.to_string().contains("nope.json"), "{missing}");
+        let bogus_path = dir.join("bogus.json");
+        std::fs::write(&bogus_path, "{\"hello\": \"world\"}").expect("write bogus");
+        let bogus = read_report_file(&bogus_path).unwrap_err();
+        assert!(bogus.to_string().contains("bogus.json"), "{bogus}");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

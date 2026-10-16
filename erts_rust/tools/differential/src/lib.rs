@@ -74,6 +74,12 @@
 //! assert!(json.contains("\"schema\": \"differential/1\""));
 //! ```
 //!
+//! The generated `GAPS.md` document does not need the (slow) serial `suite --gaps` sweep:
+//! `run <case-id> --out-file <path>` writes each case's report to an exact path, and
+//! `differential merge --from <dir> --allowlist <file> --gaps GAPS.md` folds a whole
+//! directory of them back into one suite-shaped report (the same renderer the gate uses),
+//! so the document can be regenerated from a parallel per-case sweep in seconds.
+//!
 //! # Exit codes
 //!
 //! * `0` — every executed case agreed (unsupported/skipped cases are reported, not fatal)

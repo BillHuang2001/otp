@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::allowlist::Allowlist;
 use crate::compare::Verdict;
@@ -63,7 +63,7 @@ fn has_mismatch(report: &RunReport) -> bool {
 ///
 /// This is the top-level `ratchet` key of a [`RunReport`] produced with an allowlist; it is
 /// omitted entirely from a run without one, so that report is byte-for-byte unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RatchetReport {
     /// The allowlist path as given (verbatim), when there was one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,5 +715,91 @@ mod tests {
         // No allowlist can turn the mismatch into a pass.
         assert_eq!(suite_exit_code(&report, true), 1);
         assert_eq!(suite_exit_code(&report, false), 1);
+    }
+
+    /// The `merge` route folds per-case reports into one suite-shaped report whose gap table
+    /// is byte-identical to what `suite --gaps` renders from the same cases — the whole point
+    /// of the cheap (no re-run) regeneration route.
+    #[test]
+    fn merge_folds_per_case_reports_and_gaps_markdown_lists_the_gap() {
+        // Two `run --out-file` shape reports: one agreeing case and one capability gap, plus a
+        // REDUNDANT re-run of the gap (its own report must be deduped, not double-counted).
+        let agree = report(vec![case("a/agree", Verdict::Agree, None)], None);
+        let gap = report(
+            vec![case(
+                "b/gap",
+                Verdict::Unsupported,
+                Some("beam_rt: unsupported: x"),
+            )],
+            None,
+        );
+        let merged = RunReport::merge(vec![agree, gap.clone(), gap], None).expect("merge");
+
+        assert_eq!(merged.mode, "merge");
+        assert_eq!(merged.schema, crate::report::SCHEMA);
+        assert_eq!(merged.summary.total, 2, "the re-run is deduped");
+        assert_eq!(merged.summary.agree, 1);
+        assert_eq!(merged.summary.unsupported, 1);
+        assert_eq!(merged.summary.mismatch, 0);
+        // Cases are ordered by id, so the merged document is deterministic.
+        assert_eq!(merged.cases[0].case_id, "a/agree");
+        assert_eq!(merged.cases[1].case_id, "b/gap");
+        // The per-contract rollup is recomputed from the merged cases.
+        assert_eq!(merged.by_contract["A.1"].total, 2);
+        assert!(merged.ratchet.is_none(), "no allowlist ⇒ no ratchet block");
+
+        // With the gap recorded, the ratchet is clean and the generated table names it
+        // `allowed`.
+        let list = allowlist("b/gap  beam_bifs  a documented gap\n");
+        let merged = RunReport::merge(
+            vec![
+                report(vec![case("a/agree", Verdict::Agree, None)], None),
+                report(
+                    vec![case(
+                        "b/gap",
+                        Verdict::Unsupported,
+                        Some("beam_rt: unsupported: x"),
+                    )],
+                    None,
+                ),
+            ],
+            Some(&list),
+        )
+        .expect("merge");
+        let ratchet = merged.ratchet.clone().expect("the allowlist attached a ratchet");
+        assert_eq!(
+            (ratchet.allowed, ratchet.unauthorized, ratchet.stale),
+            (1, 0, 0)
+        );
+        assert_eq!(suite_exit_code(&merged, true), 0, "a recorded gap is tolerated");
+
+        let markdown = gaps_markdown(&merged, &list);
+        assert!(
+            markdown.contains("Run: total=2 agree=1 mismatch=0 unsupported=1 skipped=0"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "| b/gap | unsupported | beam_bifs | allowed | beam_rt: unsupported: x |"
+            ),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("| a/agree |"), "only gaps are listed: {markdown}");
+
+        // An unrecorded gap is `unauthorized` ⇒ exit 1 (never silently tolerated).
+        let empty = allowlist("# nothing recorded\n");
+        let merged = RunReport::merge(
+            vec![report(
+                vec![case("b/gap", Verdict::Unsupported, Some("beam_rt: unsupported: x"))],
+                None,
+            )],
+            Some(&empty),
+        )
+        .expect("merge");
+        assert_eq!(merged.ratchet.as_ref().expect("ratchet").unauthorized, 1);
+        assert_eq!(suite_exit_code(&merged, true), 1);
+
+        // An empty fold is a loud usage error, never an empty pass.
+        assert!(RunReport::merge(Vec::new(), None).is_err());
     }
 }
