@@ -106,8 +106,8 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 - Dead/stub remnants (harmless): `bitstrings/mod.rs` `#[allow(dead_code)] const BSF_ALIGNED`.
 
 ## Constraints
-- `#![deny(unsafe_code)]` crate-wide; the node's **only** `#[allow(unsafe_code)]` module is `bitstrings/raw.rs`
-  (every `unsafe` block carries a `// SAFETY:` rationale).
+- `#![deny(unsafe_code)]` crate-wide; the node's two `#[allow(unsafe_code)]` modules are `bitstrings/raw.rs`
+  and `records/raw.rs` (every `unsafe` block carries a `// SAFETY:` rationale).
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no panic, no `unwrap()` on
   loaded data, no wrong result.
 - Term construction/inspection is **only** `beam_term`; ordering uses `beam_term::{cmp, eq}`, never a reimplementation.
