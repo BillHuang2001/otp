@@ -226,6 +226,26 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   compacts or reuses a slot — required because an on-heap off-heap reference stores the slot index in its
   `val` word (`beam_message::layout::make_off_heap_container` / `off_heap_slot`).
 
+### `bounds.rs` — the O(1) aggregate scanned-region filter
+- `pub struct ScannedBounds` — the covering half-open interval `[base, limit)` of **every** live scanned region
+  of a collector (the whole nursery chain — current + every growth-retired space — **and** the mature
+  generation) plus a monotone `generation` epoch: `new(base, limit)`/`at(base, limit, generation)`, `EMPTY`,
+  `base()`, `limit()`, `generation()`, `is_empty()`, `may_contain(addr) -> bool`,
+  `definitely_unscanned(ptr) -> bool`, `span_words()`; `pub(crate)` `covering(other)` (interval `min`/`max`,
+  keeps the receiver's epoch) and `with_generation`.
+- **Semantics: a fast-REJECT filter, never a containment claim.** `may_contain == false` ⇒ the address is in
+  *no* scanned region (so `young_contains`/`mature_contains` are both `false`); `may_contain == true` ⇒
+  nothing is known — it spans the holes between spaces, every space's unallocated tail and the mark-region
+  free lines — and the caller must fall through to the exact tests. A fast accept would be a memory-safety bug.
+- Built from each space's **reserved** extent (`HeapSpace::limit()`, `ImmixSpace base + capacity_words`),
+  never the moving `top()`, so a cached value cannot go stale between allocations; only
+  install/retire/collapse/mature-replacement move it (and the epoch).
+- Exposed as `scanned_bounds() -> ScannedBounds` on `Collector` (nursery chain + copying mature),
+  `GenImmixCollector` (nursery chain + mark-region region) and forwarding on `AnyCollector` — `O(1)`,
+  allocation-free, `&self`, safe Rust. The consumer is `beam_rt/src/context/gc.rs::root_is_unscanned`; the
+  filter's tightness depends on how close a collector's regions sit in address space (measured spans printed by
+  `tests/scanned_bounds.rs --nocapture`), so it is always sound but not always profitable.
+
 ### `stats.rs` / `error.rs`
 `GcStats` — `words_copied`, `words_reclaimed`, `objects_copied`, `minor_collections`, `major_collections`
 (`Clone + Copy + Default + PartialEq + Eq + Debug`). `error.rs` holds `pub(crate)` allocation-failure
