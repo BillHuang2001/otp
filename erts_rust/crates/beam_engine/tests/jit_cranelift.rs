@@ -57,7 +57,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use beam_common::BeamError;
+use beam_common::{BeamError, ExceptionClass, ExitReason};
 use beam_engine::jit::cranelift::{CompiledFunctions, CraneliftJit, SmallArith};
 use beam_engine::jit::JitBackend;
 use beam_engine::{available_tiers, terms, Machine, MinimalContext, Tier, MAX_REGISTER};
@@ -3519,6 +3519,170 @@ fn agree_shape(
     interpreted
 }
 
+/// Run `export/arity` on the interpreter tier **and** on the Cranelift tier (through a
+/// caller-owned compiled artifact) with **caller-owned** contexts, assert the two agree
+/// on the outcome, and hand both outcomes to `check` while the contexts that own their
+/// reason terms are still alive.
+///
+/// A raise's reason term is allocated on the run's own heap, so the check must happen
+/// here rather than on a returned value: [`agree_shape`]'s contexts are temporaries and
+/// die before the caller could read the term.
+fn agree_outcome_with<F>(
+    backend: &CraneliftJit,
+    compiled: &CompiledFunctions,
+    module: &Module,
+    export: &str,
+    arity: u32,
+    args: &[Eterm],
+    mut check: F,
+) where
+    F: FnMut(&str, &Result<Eterm, BeamError>),
+{
+    let mut interpreted_ctx = MinimalContext::new();
+    let interpreted = run_module(
+        Tier::Interpreter,
+        module,
+        export,
+        arity,
+        args,
+        &mut interpreted_ctx,
+    );
+    let mut cranelift_ctx = MinimalContext::new();
+    let mut machine = Machine::new();
+    let cranelift = backend.run_compiled(
+        compiled,
+        &mut machine,
+        module,
+        atom(module, export),
+        arity,
+        args,
+        &mut cranelift_ctx,
+    );
+    assert_same(
+        &cranelift,
+        &interpreted,
+        &format!("cranelift {export}/{arity}"),
+    );
+    check("interpreter", &interpreted);
+    check("cranelift", &cranelift);
+}
+
+/// The live reason **term** an `error`-class raise carries out of the machine.
+///
+/// A family raise ([`Machine::throw_error`]) with no live catch frame leaves the
+/// machine as `Raise::new(Error, Structured)` with the reason term in the opaque
+/// `live_reason` slot, so `ExitReason::as_atom()` stays `None` and a compound reason is
+/// recoverable only as a term.
+fn live_reason_term(result: &Result<Eterm, BeamError>, what: &str) -> Eterm {
+    let raise = match result {
+        Err(BeamError::Raise(raise)) => raise,
+        other => panic!("{what}: expected an error-class raise, got {other:?}"),
+    };
+    assert_eq!(raise.class, ExceptionClass::Error, "{what}: wrong class");
+    assert_eq!(
+        raise.reason,
+        ExitReason::Structured,
+        "{what}: a term reason must stay structured"
+    );
+    assert_eq!(
+        raise.reason.as_atom(),
+        None,
+        "{what}: a term reason must not surface as an atom"
+    );
+    raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .copied()
+        .unwrap_or_else(|| panic!("{what}: the raise carries no live reason term"))
+}
+
+/// Build the `{badmatch, Value}` reason the tuple/list families raise, on the caller's
+/// arena (which must outlive the comparison — the raise's own reason term lives on the
+/// run's heap, so both sides are read while they are alive).
+fn badmatch_expected(arena: &mut MinimalContext, module: &Module, value: Eterm) -> Eterm {
+    let tag = make_atom(
+        module
+            .atom_table
+            .lookup("badmatch")
+            .expect("the shape fixtures intern `badmatch`"),
+    );
+    terms::make_tuple(arena, &[tag, value]).expect("build {badmatch, Value}")
+}
+
+/// Assert **both** tiers reject `export/arity` with the family's exact
+/// `{badmatch, Value}` reason — class `error`, tag `badmatch` resolved from the running
+/// module's own atom table, and `expected` (the offending value) as the second element.
+fn agree_badmatch(
+    backend: &CraneliftJit,
+    compiled: &CompiledFunctions,
+    module: &Module,
+    export: &str,
+    arity: u32,
+    args: &[Eterm],
+    expected: Eterm,
+    what: &str,
+) {
+    agree_outcome_with(
+        backend,
+        compiled,
+        module,
+        export,
+        arity,
+        args,
+        |tier, result| {
+            let live = live_reason_term(result, &format!("{tier} {what}"));
+            assert!(
+                beam_term::eq(live, expected, &module.atom_table),
+                "{tier} {what}: the raise reason is not the exact {{badmatch, Value}}"
+            );
+        },
+    );
+}
+
+/// Assert **both** tiers reject `export/arity` with the exact typed engine error
+/// `unsupported_opcode: <reason>` — an **atom** reason (so no live term), which is the
+/// documented degradation of a `NO_FAIL` guard whose `function_clause` atom the running
+/// module's own table cannot name.
+fn agree_atom_raise(
+    backend: &CraneliftJit,
+    compiled: &CompiledFunctions,
+    module: &Module,
+    export: &str,
+    arity: u32,
+    args: &[Eterm],
+    reason: &str,
+    what: &str,
+) {
+    agree_outcome_with(
+        backend,
+        compiled,
+        module,
+        export,
+        arity,
+        args,
+        |tier, result| {
+            let raise = match result {
+                Err(BeamError::Raise(raise)) => raise,
+                other => panic!("{tier} {what}: expected a typed raise, got {other:?}"),
+            };
+            assert_eq!(
+                raise.class,
+                ExceptionClass::Error,
+                "{tier} {what}: wrong class"
+            );
+            assert_eq!(
+                raise.reason.as_atom(),
+                Some(reason),
+                "{tier} {what}: wrong typed error"
+            );
+            assert!(
+                raise.live_reason().is_none(),
+                "{tier} {what}: an atom reason carries no live term"
+            );
+        },
+    );
+}
+
 #[test]
 fn the_tier_reports_which_shape_instructions_it_inlined() {
     // Artifact-level evidence that the shape fast paths — not `jit_step_one` — were
@@ -3667,12 +3831,21 @@ fn the_inlined_tuple_reads_agree_and_deopt_like_the_interpreter() {
     );
 
     // Deopt: `tuple_elem_oob` on a 2-tuple — the element index is out of range, the
-    // guard rejects, and the helper raises the family's exact `{badmatch, Tuple}`.
-    let got = agree_shape(&backend, &compiled, &module, "tuple_elem_oob", 1, &[pair], None);
-    assert!(
-        got.is_err(),
-        "an out-of-range element must be a typed error, got {got:?}"
+    // guard rejects, and the helper raises the family's exact `{badmatch, Tuple}`:
+    // `badmatch` resolved from the running module's own atom table and the offending
+    // tuple as the reason's second element.
+    let expected_reason = badmatch_expected(&mut arena, &module, pair);
+    agree_badmatch(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_elem_oob",
+        1,
+        &[pair],
+        expected_reason,
+        "an out-of-range element",
     );
+
     // ... and the very same instruction *does* take the fast path for a long enough
     // tuple.
     let twelve: Vec<Eterm> = (0i64..12).map(make_small).collect();
@@ -3688,19 +3861,18 @@ fn the_inlined_tuple_reads_agree_and_deopt_like_the_interpreter() {
     );
 
     // Deopt: the source is a constant operand — the shape test rejects it at compile
-    // time and the helper raises `{badmatch, nil}`.
-    let got = agree_shape(
+    // time and the helper raises `{badmatch, nil}`: the constant source *is* the
+    // offending value, so the reason's second element is `nil`.
+    let expected_reason = badmatch_expected(&mut arena, &module, NIL);
+    agree_badmatch(
         &backend,
         &compiled,
         &module,
         "tuple_elem_const_src",
         1,
         &[pair],
-        None,
-    );
-    assert!(
-        got.is_err(),
-        "a constant source must be a typed error, got {got:?}"
+        expected_reason,
+        "a constant source",
     );
 
     // Deopt: a non-tuple source — the guard rejects at run time. `get_tuple_element`
@@ -3708,10 +3880,16 @@ fn the_inlined_tuple_reads_agree_and_deopt_like_the_interpreter() {
     // match (C's `get_arity` yields `NIL`), so it takes its fail branch and answers
     // the fail arm's `0`.
     for bad in [make_small(1), NIL] {
-        let got = agree_shape(&backend, &compiled, &module, "tuple_elem0", 1, &[bad], None);
-        assert!(
-            got.is_err(),
-            "tuple_elem0({bad:?}) must be a typed error, got {got:?}"
+        let expected_reason = badmatch_expected(&mut arena, &module, bad);
+        agree_badmatch(
+            &backend,
+            &compiled,
+            &module,
+            "tuple_elem0",
+            1,
+            &[bad],
+            expected_reason,
+            &format!("tuple_elem0({bad:?})"),
         );
         let _ = agree_shape(
             &backend,
@@ -3723,9 +3901,8 @@ fn the_inlined_tuple_reads_agree_and_deopt_like_the_interpreter() {
             Some(make_small(0)),
         );
     }
-
     // The `NO_FAIL` arity switch deopts as a whole: a 2-tuple still matches through the
-    // helper, a 4-tuple raises `{badmatch, Tuple}`.
+    // helper, a 4-tuple raises `{badmatch, Tuple}` carrying the unmatched tuple itself.
     let _ = agree_shape(
         &backend,
         &compiled,
@@ -3740,21 +3917,18 @@ fn the_inlined_tuple_reads_agree_and_deopt_like_the_interpreter() {
         &[make_small(1), make_small(2), make_small(3), make_small(4)],
     )
     .expect("arena tuple");
-    let got = agree_shape(
+    let expected_reason = badmatch_expected(&mut arena, &module, quad);
+    agree_badmatch(
         &backend,
         &compiled,
         &module,
         "tuple_arity_nofail",
         1,
         &[quad],
-        None,
-    );
-    assert!(
-        got.is_err(),
-        "a NO_FAIL arity switch with no match must raise, got {got:?}"
+        expected_reason,
+        "a NO_FAIL arity switch with no match",
     );
 }
-
 #[test]
 fn the_inlined_list_reads_agree_and_deopt_like_the_interpreter() {
     let module = shape_fixtures();
@@ -3824,19 +3998,25 @@ fn the_inlined_list_reads_agree_and_deopt_like_the_interpreter() {
     );
 
     // Deopt: `[]`, an integer and a tuple are not cons cells, so the guard rejects and
-    // the helper raises the family's exact `{badmatch, Source}`.
+    // the helper raises the family's exact `{badmatch, Source}` — the rejected source
+    // itself as the reason's second element.
     let a_tuple = terms::make_tuple(&mut arena, &[make_small(1), make_small(2)]).expect("arena tuple");
     for bad in [NIL, make_small(1), a_tuple] {
         for export in ["list_hd", "list_tl", "list_split_head", "list_split_tail"] {
-            let got = agree_shape(&backend, &compiled, &module, export, 1, &[bad], None);
-            assert!(
-                got.is_err(),
-                "{export}({bad:?}) must be a typed error, got {got:?}"
+            let expected_reason = badmatch_expected(&mut arena, &module, bad);
+            agree_badmatch(
+                &backend,
+                &compiled,
+                &module,
+                export,
+                1,
+                &[bad],
+                expected_reason,
+                &format!("{export}({bad:?})"),
             );
         }
     }
 }
-
 #[test]
 fn the_inlined_select_val_agrees_and_deopts_like_the_interpreter() {
     let module = shape_fixtures();
@@ -3956,21 +4136,21 @@ fn the_inlined_select_val_agrees_and_deopts_like_the_interpreter() {
         &[make_small(2)],
         Some(make_small(20)),
     );
-    // ... and no match raises the interpreter's typed error.
-    let got = agree_shape(
+    // ... and no match raises the interpreter's typed error: a `NO_FAIL` switch raises
+    // class `error` with the bare atom `function_clause`, resolved **only** from the
+    // running module's own atom table — and `shape_module` interns `badmatch` but never
+    // `function_clause`, so the documented degradation applies and the exact typed error
+    // is the engine diagnostic below (never a substituted atom).
+    agree_atom_raise(
         &backend,
         &compiled,
         &module,
         "sel_nofail",
         1,
         &[make_small(7)],
-        None,
+        "unsupported_opcode: select_val: no 'function_clause' atom in the module",
+        "a NO_FAIL switch with no match",
     );
-    assert!(
-        got.is_err(),
-        "a NO_FAIL switch with no match must raise, got {got:?}"
-    );
-
     // A register alternative deopts as a whole; the helper's exact (`cmp`) compare
     // answers `10` for a match and `0` for a mismatch.
     let _ = agree_shape(

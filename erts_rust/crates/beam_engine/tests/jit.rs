@@ -575,7 +575,14 @@ fn arithmetic_fast_path_agrees_over_a_sweep_of_small_integers() {
                     (Ok(got), Some(expected)) => {
                         assert_eq!(got, make_small(expected), "{export}({a}, {b})");
                     }
-                    (Err(_), None) => {}
+                    // Out of the small range: the range-checked hook's `BadArith` is the
+                    // only error this fixture can produce (`raised` through the `NO_FAIL`
+                    // `gc_bif`, which has no catch frame here), so pin it exactly — never
+                    // "any error".
+                    (Err(error), None) => assert!(
+                        matches!(&error, BeamError::BadArith),
+                        "{export}({a}, {b}) must be the out-of-range BadArith, got {error:?}"
+                    ),
                     (got, expected) => panic!("{export}({a}, {b}): {got:?} vs {expected:?}"),
                 }
             }
@@ -704,7 +711,13 @@ fn arithmetic_fast_path_times_agrees_over_a_sweep_of_small_integers() {
                 (Ok(got), Some(expected)) => {
                     assert_eq!(got, make_small(expected), "times({a}, {b})");
                 }
-                (Err(_), None) => {}
+                // Out of the small range: `checked_arith_hook`'s `BadArith` is the only
+                // error this fixture can produce (no catch frame, so the `NO_FAIL`
+                // `gc_bif` error propagates unchanged), so pin it exactly.
+                (Err(error), None) => assert!(
+                    matches!(&error, BeamError::BadArith),
+                    "times({a}, {b}) must be the out-of-range BadArith, got {error:?}"
+                ),
                 (got, expected) => panic!("times({a}, {b}): {got:?} vs {expected:?}"),
             }
         }
