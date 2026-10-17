@@ -104,9 +104,11 @@
 //!   found in the port's own pair list ([`PortHook::port_info`] — the one pair producer), or
 //!   `badarg` when the port has no such item;
 //! * `/1` of a **registered** port answers the whole list, *starting* with
-//!   `{registered_name, Name}` followed by the seven `/1` items — because `beam_bifs`'s
-//!   `PORT_INFO_1_ITEMS` filter would drop the prepended pair — and with **no** `monitors`
-//!   item. Measured:
+//!   `{registered_name, Name}` followed by exactly the C's `/1` roster
+//!   (`name`, `links`, `id`, `connected`, `input`, `output`, `os_pid` — `ERTS_PORT_INFO_1_ITEMS`,
+//!   `erts/emulator/beam/erl_port.h:96-105`) — because `beam_bifs`'s `PORT_INFO_1_ITEMS` filter
+//!   would drop the prepended pair — and with **no** `/2`-only item (`monitors`, `queue_size`,
+//!   `memory`, `monitored_by`, `locking`, `parallelism`). Measured:
 //!   `port_info(P)` ⇒ `[{registered_name,myp},{name,"ram_file_drv"},{links,[<0.10.0>]},
 //!   {id,24},{connected,<0.10.0>},{input,0},{output,0},{os_pid,undefined}]`.
 //!
@@ -124,6 +126,27 @@ use beam_term::{is_atom, is_small, make_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
+/// The `Item` keys `erlang:port_info/1` reports — the C's `ERTS_PORT_INFO_1_ITEMS` roster
+/// (`erts/emulator/beam/erl_port.h:96-105`), **without** `registered_name`.
+///
+/// `registered_name` is the roster's first entry there and the C drops it when the port is
+/// unregistered (`io.c:4802-4824`: `if (value[0] == am_undefined) start++`); this runtime
+/// prepends it as the leading pair of a registered port's list (see
+/// [`RuntimeContext::port_info_all`]), so the filter here is the **other seven**.
+///
+/// It is an allowlist, not a skip-list: the hook's pair list also carries the `/2`-only items
+/// (`monitors`, `queue_size`, `memory`, `monitored_by`, `locking`, `parallelism`), and a pair
+/// added there later must not leak into `/1`. `beam_bifs`'s own `port_info/1` carries the same
+/// roster for the unregistered path (`beam_bifs/src/port.rs`), so the two arities agree.
+const PORT_INFO_1_ITEMS: [&str; 7] = [
+    "name",
+    "links",
+    "id",
+    "connected",
+    "input",
+    "output",
+    "os_pid",
+];
 
 /// The two recognized `erlang:port_command/3` options, as
 /// [`RuntimeContext::port_command_options`] parsed them.
@@ -532,11 +555,17 @@ impl RuntimeContext<'_> {
     }
 
     /// The `/1` answer of the live **registered** port `port`: the whole item list, **starting**
-    /// with `{registered_name, Name}` and with no `monitors` item.
+    /// with `{registered_name, Name}` and holding exactly the C's `/1` roster after it.
     ///
     /// The prefix is load-bearing: `beam_bifs`'s `port_info/1` keeps only its seven
-    /// `/1` items, so a prepended `registered_name` pair would be filtered away there — and the
-    /// `monitors` pair is the `/2`-only item, which the oracle's `/1` never reports.
+    /// `/1` items, so a prepended `registered_name` pair would be filtered away there — and
+    /// every `/2`-only pair (`monitors`, `queue_size`, `memory`, `monitored_by`, `locking`,
+    /// `parallelism`) must not reach a registered port's `/1`.
+    ///
+    /// The roster is the C's `ERTS_PORT_INFO_1_ITEMS` (`erts/emulator/beam/erl_port.h:96-105`) —
+    /// `registered_name` (first, dropped by the C when unregistered), then `name`, `links`, `id`,
+    /// `connected`, `input`, `output`, `os_pid` — so this filter is an **allowlist** rather than a
+    /// list of items to skip: a pair added to the hook's list later can never leak into `/1`.
     ///
     /// # Errors
     ///
@@ -549,13 +578,13 @@ impl RuntimeContext<'_> {
         // very pair object the `/2` answer produces, never a second spelling of it).
         listed.push(registered);
         for (key, value) in pairs {
-            // `monitors` is `/2`-only, and `registered_name` was already prepended (moving it
-            // from the pair list's tail to the front is the oracle's order).
-            let skip = matches!(
-                self.atom_name(key).as_deref(),
-                Some("monitors" | "registered_name")
-            );
-            if skip {
+            // The trailing `registered_name` pair was already moved to the front above; every
+            // other pair outside the `/1` roster is `/2`-only.
+            let keep = self
+                .atom_name(key)
+                .as_deref()
+                .is_some_and(|name| PORT_INFO_1_ITEMS.contains(&name));
+            if !keep {
                 continue;
             }
             listed.push(terms::make_tuple(self, &[key, value])?);

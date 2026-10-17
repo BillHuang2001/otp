@@ -104,15 +104,22 @@
 //! # `port_info` items
 //!
 //! The pair list [`PortRegistry::info`] returns **is** the oracle's answer for both
-//! arities: `beam_bifs`'s `erlang:port_info/1` filters it down to the seven `/1` items and
+//! arities: `beam_bifs`'s `erlang:port_info/1` filters it down to the C's `/1` roster
+//! (`ERTS_PORT_INFO_1_ITEMS`, `erts/emulator/beam/erl_port.h:96-105`) and
 //! `erlang:port_info/2` searches it whole. In order:
 //!
 //! `{name, …}`, `{links, [Owner]}`, `{id, N}`, `{connected, Owner}`, `{input, 0}`,
-//! `{output, 0}`, `{os_pid, N|undefined}` and — the `/2`-only extra — `{monitors, []}`.
+//! `{output, 0}`, `{os_pid, N|undefined}`, then the `/2`-only items `{monitors, []}`,
+//! `{queue_size, N}`, `{memory, N}`, `{monitored_by, []}`, `{locking, Atom}` and
+//! `{parallelism, false}` — plus a registered port's `{registered_name, Name}`, which the
+//! oracle reports **first** (it is appended here and moved to the front by the native floor;
+//! see `crate::native::port`).
 //!
 //! `links` is the owner process as a one-element list and `connected` is that owner pid,
-//! matching erts-17.1 (nothing else links or monitors a port in Milestone-1). `input`/
-//! `output` are byte counters — always `0` (the runtime keeps no per-port totals). The
+//! matching erts-17.1 (nothing else links or monitors a port until `port_connect/2` or
+//! `monitor(port, …)`). `input`/`output` are this port's cumulative byte counters. The
+//! derived accounting items — `queue_size`, `memory`, `monitored_by`, `locking`,
+//! `parallelism` — are [`info_extras`]'s, each carrying the reference C's derivation. The
 //! oracle's own `stream` is **not** an item at all: `erlang:port_info(P, stream)` is
 //! `error:badarg`.
 //!
@@ -147,6 +154,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
+pub(crate) mod info_extras;
 pub(crate) mod ops;
 pub(crate) mod tty;
 pub(crate) mod watch;
@@ -221,6 +229,15 @@ pub const PORT_INFO_ATOMS: &[&str] = &[
     "registered_name",
     // The shape of a `monitors` entry.
     "process",
+    // The `/2`-only **derived** items (see [`info_extras`]).
+    "queue_size",
+    "memory",
+    "monitored_by",
+    "locking",
+    "parallelism",
+    // … and the two atoms `locking` answers with.
+    "driver_level",
+    "port_level",
 ];
 
 /// The option **atoms** an `open_port/2` call accepts — the oracle's strict whitelist
@@ -1799,9 +1816,11 @@ impl PortRegistry {
     /// (see the module docs and `RuntimeContext::port_info_closed_port`).
     ///
     /// The list is the oracle's answer for **both** arities: `beam_bifs`'s
-    /// `erlang:port_info/1` keeps the seven `/1` items and drops the final `monitors`
-    /// pair, while `erlang:port_info/2` searches them all. The order and the value shapes
-    /// are the ones erts-17.1 reports (see the module docs).
+    /// `erlang:port_info/1` keeps the seven `/1` items and drops every `/2`-only pair
+    /// (`monitors`, `queue_size`, `memory`, `monitored_by`, `locking`, `parallelism` and
+    /// `registered_name`), while `erlang:port_info/2` searches them all. The order and the
+    /// value shapes are the ones erts-17.1 reports (see the module docs; the derived items are
+    /// [`info_extras`]'s).
     ///
     /// # Errors
     ///
@@ -1850,6 +1869,19 @@ impl PortRegistry {
         // has moved no bytes yet — the oracle's answer right after `open_port`.
         let input = byte_count(meta.input.get())?;
         let output = byte_count(meta.output.get())?;
+        // The **derived** `/2`-only items are answered from state the pairs above do not touch
+        // (see [`info_extras`]). Each is computed to an owned value *before* the arena is
+        // touched, so the immutable borrow of `self` they need cannot overlap the mutable
+        // borrow of `self.heap`.
+        let queue_size = byte_count(self.info_queue_size(port) as u64)?;
+        let memory = byte_count(self.info_memory(port) as u64)?;
+        let watching = self.info_monitored_by(port);
+        let monitored_by = pid_list(&mut self.heap, &watching)?;
+        let locking = item(self.info_locking(port))?;
+        // The C reports the `ERTS_PTS_FLG_PARALLELISM` bit, which `open_port/2`'s `parallelism`
+        // tuple option would set on a driver that supports it — this runtime never grants it, so
+        // the honest answer is `false` (the oracle's own for a `spawn` and a driver port alike).
+        let parallelism = item("false")?;
         let os_pid = match meta.os_pid {
             Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
             // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
@@ -1864,8 +1896,14 @@ impl PortRegistry {
             (item("input")?, input),
             (item("output")?, output),
             (item("os_pid")?, os_pid),
-            // The `/2`-only extra item; `beam_bifs`'s `port_info/1` drops it.
+            // The `/2`-only extras; `beam_bifs`'s `port_info/1` drops them all (and the native
+            // floor's registered-port list keeps the C's own `/1` roster).
             (item("monitors")?, monitors),
+            (item("queue_size")?, queue_size),
+            (item("memory")?, memory),
+            (item("monitored_by")?, monitored_by),
+            (item("locking")?, locking),
+            (item("parallelism")?, parallelism),
         ]
         .into_iter()
         .chain(registered)

@@ -116,10 +116,6 @@ const LINEBUF_BYTES: usize = 32;
 
 /// `LINEBUF_INITIAL` (`io.c:176`): the capped initial overflow size of a line buffer.
 const LINEBUF_INITIAL: usize = 100;
-
-/// The `{line, N}` length the C gives a **bare** `line` option (`erl_bif_port.c:985-986`).
-const LINEBUF_BARE_OPTION: usize = 512;
-
 impl PortRegistry {
     /// The port's `queue_size`: the bytes it is holding that neither the owner nor the device
     /// has consumed yet (see the module docs for why that is the C's `ioq`).
@@ -167,15 +163,21 @@ impl PortRegistry {
         // `erts_port_data_size`: the record's header, plus nothing for the term itself (see the
         // method docs). `port_set_data/2` stores the atom `undefined` as its default, and the C
         // counts an immediate as 0.
-        if meta_data_is_heap(self.extras.port_data(port).ok().flatten()) {
+        //
+        // [`PortRegistry::port_data`] is `badarg` for a port the registry no longer holds, which
+        // is also a port with no stored term — and the `port_info` floor answers `undefined` for
+        // such a port before this is ever reached — so the "no data term" reading is the exact
+        // one, not a swallowed error.
+        let data = self.port_data(port).unwrap_or(None);
+        if meta_data_is_heap(data) {
             size += PORT_DATA_HEAP_BYTES;
         }
         if let Some(max_len) = meta.line {
-            // `allocate_linebuf(bufsiz)`: `ovsiz = min(bufsiz, LINEBUF_INITIAL)`. Our own
-            // `{line, N}` decoding keeps the C's lengths (`None`/`Some(0)`-style "bare line" is
-            // recorded as the C's 512).
-            let bufsiz = if max_len == 0 { LINEBUF_BARE_OPTION } else { max_len };
-            size += LINEBUF_BYTES + bufsiz.min(LINEBUF_INITIAL);
+            // `allocate_linebuf(bufsiz)`: `ovsiz = min(bufsiz, LINEBUF_INITIAL)`. `meta.line`
+            // already holds the C's *resolved* `bufsiz` — `{line, N}` ⇒ `N` and a bare `line`
+            // ⇒ 512, the parent module's `LINE_DEFAULT_MAX_LEN` (`erl_bif_port.c:985-986`) —
+            // so no "bare option" sentinel has to be decoded here.
+            size += LINEBUF_BYTES + max_len.min(LINEBUF_INITIAL);
         }
         size
     }
@@ -206,19 +208,16 @@ impl PortRegistry {
     }
 }
 
-/// Whether a `port_set_data/2` term occupies a C data heap — i.e. it is not the `undefined`
-/// default and not an immediate (which the C stores in the field itself and counts as 0 bytes).
+/// Whether a `port_set_data/2` term occupies a C data heap.
+///
+/// The C keeps an **immediate** in the field itself and reports its size as `0`
+/// (`erts_port_data_size`, `erl_bif_port.c:658-668`: `if ((data & 0x3) != 0) return 0`), and the
+/// field's initial value — `undefined`, which `erts_init_port_data` stores
+/// (`erl_bif_port.c:642`) — is one. Every atom is an immediate, so `undefined` needs no
+/// special case: the `is_immediate` test *is* the C's `(data & 0x3) != 0`.
 fn meta_data_is_heap(data: Option<beam_term::Eterm>) -> bool {
     match data {
-        // `undefined` is the field's initial value; `is_immed` covers it and every other
-        // immediate (small ints, atoms, pids, ports, nil, …).
-        Some(term) => !beam_term::is_immed(term) && !is_undefined(term),
+        Some(term) => !beam_term::is_immediate(term),
         None => false,
     }
-}
-
-/// Whether `term` is the atom `undefined` (the `port_set_data/2` default the C stores inline).
-fn is_undefined(term: beam_term::Eterm) -> bool {
-    beam_term::is_atom(term)
-        && beam_term::atom_name(beam_term::atom_val(term)).as_deref() == Some("undefined")
 }

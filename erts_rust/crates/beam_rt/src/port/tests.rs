@@ -400,8 +400,9 @@ fn spawn_true_opens_a_real_registered_port() {
     assert!(os_pid > 0, "a spawned child has an os pid, got {os_pid}");
 
     // Every item atom resolves through the shared table (never a fabricated index), and
-    // the pair list is exactly the oracle's `/1` roster followed by the `/2`-only
-    // `monitors` — in the oracle's order.
+    // the pair list is exactly the oracle's `/1` roster followed by the `/2`-only items —
+    // in the oracle's order. The five trailing ones are the derived accounting items
+    // (`super::info_extras`), each `error:badarg` on the oracle until it existed here.
     let pairs = fx.hook.port_info(port).expect("port_info");
     let keys: Vec<String> = pairs
         .iter()
@@ -415,7 +416,19 @@ fn spawn_true_opens_a_real_registered_port() {
     assert_eq!(
         keys,
         [
-            "name", "links", "id", "connected", "input", "output", "os_pid", "monitors"
+            "name",
+            "links",
+            "id",
+            "connected",
+            "input",
+            "output",
+            "os_pid",
+            "monitors",
+            "queue_size",
+            "memory",
+            "monitored_by",
+            "locking",
+            "parallelism"
         ]
     );
     assert_eq!(text_of(fx.item(port, "name")), "true");
@@ -1570,8 +1583,9 @@ fn port_info_on_an_unknown_or_closed_port_is_an_empty_pair_list() {
     assert!(fx.registry.borrow().is_live(port));
     assert_eq!(
         fx.hook.port_info(port).expect("a live port").len(),
-        8,
-        "seven `/1` items plus the `/2`-only `monitors`"
+        13,
+        "the seven `/1` items plus the six `/2`-only ones \
+         (`monitors`, `queue_size`, `memory`, `monitored_by`, `locking`, `parallelism`)"
     );
     fx.hook.close_port(port).expect("port_close/1");
     assert!(!fx.registry.borrow().is_live(port));
