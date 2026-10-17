@@ -80,6 +80,9 @@ pub const TCP_SHUT_WR: u8 = 1;
 /// `shutdown(sock, SHUT_RDWR)` (`TCP_SHUT_RDWR`, `inet_drv.c:685`).
 pub const TCP_SHUT_RDWR: u8 = 2;
 
+/// The one `INET_REQ_SUBSCRIBE` op there is (`INET_SUBS_EMPTY_OUT_Q`, `inet_drv.c:850`) — "tell
+/// me when your output queue empties". Any other operand byte is the C's `return -1`.
+pub const INET_SUBS_EMPTY_OUT_Q: u8 = 1;
 /// A decoded IPv4 endpoint from the packed address of the `bind`/`connect` verbs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct InetAddr {
@@ -126,6 +129,47 @@ pub(super) fn ctl_error(err: std::io::Error) -> Vec<u8> {
     ctl_xerror(&errno_name(err.raw_os_error().unwrap_or(0)))
 }
 
+/// The `INET_REQ_SUBSCRIBE`(24) reply — the **shared** `inet_ctl` arm both socket drivers reach
+/// (`inet_subscribe`, `inet_drv.c:10819`-`:10843`).
+///
+/// The C walks the operand one byte at a time and builds `[INET_REP_OK] ++ (op ++ be32(outq))*`,
+/// where `outq` is `driver_sizeq(desc->port)` — the port's **output queue** byte count at that
+/// moment. `queued_output_bytes` is that count ([`crate::DriverContext::output`]'s
+/// `ByteQueue::len`), never a constant: on this floor's ports the queue is normally empty when a
+/// control call runs (a command's bytes are moved by the `Output` port task, so `port_control`
+/// sees them only after a write was refused and the remainder stayed queued), which is why the
+/// oracle also reports `0` in the ordinary probes — but a port holding a refused write reports
+/// its real depth, as the C does.
+///
+/// An operand byte that is not [`INET_SUBS_EMPTY_OUT_Q`] makes the C `return -1`, which the
+/// `inet_ctl` arm turns into `badarg`; the whole reply is discarded, so a valid byte **before**
+/// the bad one is not preserved either. That is [`error::badarg`] here.
+///
+/// # The notification half
+///
+/// The C also *saves the caller as a subscriber* when the count is `> 0` and later sends it
+/// `{empty_out_q, Port}` from `send_empty_out_q_msgs`. This crate has no driver→owner message
+/// channel (the [`crate::PortNotification`] seam carries `Data`/`Closed` only), so **no
+/// notification is ever sent** — the reply is exact, the subscription is not honoured. A caller
+/// that only waits for the reply (all of `prim_inet`'s uses) sees the C's behaviour exactly; one
+/// that waits for the message sees nothing.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] for an operand byte the C's `switch` has no case for.
+pub(super) fn subscribe_reply(queued_output_bytes: usize, arg: &[u8]) -> Result<Vec<u8>> {
+    let mut reply = ctl_ok();
+    for &op in arg {
+        if op != INET_SUBS_EMPTY_OUT_Q {
+            return Err(error::badarg());
+        }
+        reply.push(op);
+        // `put_int32(val, dst)` writes the low 32 bits of the C's `unsigned long val`
+        // (`inet_drv.c:10841`), so the render is a truncating cast of the queue depth.
+        reply.extend_from_slice(&(queued_output_bytes as u32).to_be_bytes());
+    }
+    Ok(reply)
+}
 /// The lowercase name the oracle reports for `errno` (`erl_errno_id`/`errno_str`,
 /// `inet_drv.c:2249`).
 ///

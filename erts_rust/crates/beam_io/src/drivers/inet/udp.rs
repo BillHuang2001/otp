@@ -970,14 +970,12 @@ impl UdpInetDriver {
                 }
                 super::wire::peer_reply(self.socket, self.state.is_connected())
             }
-            // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): its only op
-            // (`INET_SUBS_EMPTY_OUT_Q`) registers a **driver-side subscriber** that the driver must
-            // later notify — `send_to_subscribers(…, am_empty_out_q, …)` — whenever its output
-            // queue empties. This floor has no driver→owner message channel (see the module docs),
-            // so answering the C's `[1] ++ op ++ be32(outq)` would promise a notification it could
-            // never deliver; the C's own `-1` for an unknown op (which the oracle surfaces as a
-            // `badarg` from `port_control`) is likewise not a reply shape worth imitating.
-            Opcode::Subscribe => Err(op.not_served()),
+            // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): the shared `inet_ctl` arm, built
+            // by the same helper the stream driver uses — `[1] ++ (op ++ be32(outq byte count))*`,
+            // with an operand byte other than `INET_SUBS_EMPTY_OUT_Q` the C's `return -1`
+            // (`badarg`). The *subscription* (the later `{empty_out_q, Port}` message) is what
+            // this floor cannot honour — no driver→owner channel exists — not the reply.
+            Opcode::Subscribe => super::wire::subscribe_reply(ctx.output().len(), arg),
             // `INET_REQ_LISTEN` is a case of `packet_inet_ctl` only inside `#ifdef HAVE_SCTP`
             // (`:14846`). With SCTP compiled out the case does not exist and the `default:`
             // delegates to `inet_ctl`, whose own `default:` is `ctl_xerror(EXBADPORT)`

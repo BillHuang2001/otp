@@ -24,10 +24,8 @@
 //! [`opcode_tests`](super::opcode_tests) suite drives the TCP half. The matrix helpers, the port
 //! rig and the oracle plumbing are shared from that file rather than copied.
 use super::opcode_tests::{
-    assert_agrees, erl_stdout, loopback_arg, op, oracle_expression, oracle_replies, reason_of, Call,
-    Rig, Rule, CONTROL_MAGIC,
-};
-use super::opt::{INET_OPT_BROADCAST, INET_OPT_REUSEADDR};
+    assert_agrees, assert_outcomes_agree_with_the_oracle, erl_stdout, loopback_arg, op,
+    oracle_expression, oracle_replies, reason_of, Call, Rig, Rule, CONTROL_MAGIC,};use super::opt::{INET_OPT_BROADCAST, INET_OPT_REUSEADDR};
 use super::wire::{ctl_ok, ctl_xerror};
 use super::{
     UdpInetDriver, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_REP_OK,
@@ -328,11 +326,6 @@ fn a_wrapped_or_unassigned_numeric_command_on_the_datagram_port_is_exbadport() {
 ///
 /// Each survivor needs something the frozen [`crate::Driver`] seam cannot express:
 ///
-/// * `INET_REQ_SUBSCRIBE`(24, `inet_subscribe` `:10819`) — its only op registers a driver-side
-///   subscriber that must later **send** the empty-output-queue notification; this floor has no
-///   driver→owner message channel, so `[1] ++ op ++ be32(outq)` would promise a notification it
-///   could never deliver. (The C's `-1` for an unknown op, which the oracle surfaces as a
-///   `badarg` raise, is likewise not a reply worth imitating.)
 /// * `INET_REQ_FDOPEN`(13) with a *well-formed* operand — adopting a caller's descriptor number
 ///   would mean taking ownership of an fd handed in from Erlang, which no `DriverFactory` ctor can
 ///   express. (The oracle's own answer there is `[0]enotsock`, because it does not validate.)
@@ -343,14 +336,10 @@ fn a_wrapped_or_unassigned_numeric_command_on_the_datagram_port_is_exbadport() {
 ///
 /// Every one of these now answers the C's own `ctl_error(EINVAL)`/`ctl_xerror(EXBADPORT)` refusal
 /// for the argument/state faults around the gap; only the valid-call body is missing.
+/// `INET_REQ_SUBSCRIBE`(24) is **not** on this list any more: its reply is exact (see
+/// [`subscribe_answers_the_c_outq_record_or_badarg`]).
 #[test]
 fn the_surviving_numeric_opcodes_on_the_datagram_port_are_typed_gaps() {
-    // Subscribe is a gap in every state, with and without an operand.
-    let mut bare = bare_port();
-    for arg in [&[][..], &[1u8][..], &[2u8][..]] {
-        assert_typed_gap(&mut bare, 24, arg, "INET_REQ_SUBSCRIBE");
-    }
-
     let mut port = opened_port();
     assert_typed_gap(&mut port, 13, &[1, 2, 0, 0, 0, 1], "a well-formed INET_REQ_FDOPEN");
     assert_typed_gap(&mut port, 13, &[1, 1, 0, 0, 0, 1], "a stream FDOPEN");
@@ -363,20 +352,86 @@ fn the_surviving_numeric_opcodes_on_the_datagram_port_are_typed_gaps() {
     for code in [21u32, 22, 23, 25] {
         assert_typed_gap(&mut port, code, &[1], "the getifaddrs family");
     }
+}
 
-    // The gap's wording still names the switch the C's case belongs to.
-    let err = port
-        .try_control(&op(24), &[1])
-        .expect_err("INET_REQ_SUBSCRIBE is not served here");
+// -----------------------------------------------------------------------
+// `INET_REQ_SUBSCRIBE`(24) on the datagram driver
+// -----------------------------------------------------------------------
+
+/// `INET_REQ_SUBSCRIBE`(24, `inet_subscribe` `:10819`) is the shared `inet_ctl` arm, so the
+/// datagram driver answers exactly what the stream one does: `[1] ++ (op ++ be32(outq))*`, and the
+/// C's `return -1` (`badarg`) for an operand byte its `switch` has no case for.
+#[test]
+fn subscribe_answers_the_c_outq_record_or_badarg() {
+    let mut port = bare_port();
+    assert_eq!(port.control(&op(24), &[]), vec![INET_REP_OK], "an empty operand");
     assert_eq!(
-        reason_of(err),
-        "unsupported: control opcode `subscribe` (inet_ctl) is not served by this driver floor"
+        port.control(&op(24), &[1]),
+        vec![INET_REP_OK, 1, 0, 0, 0, 0],
+        "one INET_SUBS_EMPTY_OUT_Q record, outq 0"
+    );
+    assert_eq!(
+        port.control(&op(24), &[1, 1]),
+        vec![INET_REP_OK, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        "one record per operand byte"
+    );
+    for arg in [vec![2u8], vec![0], vec![1, 2]] {
+        assert!(
+            matches!(port.try_control(&op(24), &arg), Err(BeamError::BadArg)),
+            "operand {arg:?} must be the oracle's badarg"
+        );
+    }
+}
+
+/// The `outq` figure is the port's **real** queued-output depth, not a constant.
+///
+/// A port command on a socket-less datagram port is refused by the driver
+/// ([`super::UdpInetDriver::write_pending`] answers `BadArg`) and its bytes stay queued — exactly
+/// the state the C reports `driver_sizeq(desc->port)` for.
+#[test]
+fn subscribe_reports_the_ports_real_queued_output_depth() {
+    let mut port = bare_port();
+    let err = port
+        .command(&[1, 2, 3])
+        .expect_err("a socket-less datagram port refuses the write");
+    assert!(matches!(err, BeamError::BadArg), "the refusal is badarg: {err:?}");
+
+    assert_eq!(
+        port.control(&op(24), &[1]),
+        vec![INET_REP_OK, 1, 0, 0, 0, 3],
+        "the reply reports the three bytes the refused command left queued"
+    );
+    assert_eq!(
+        port.control(&op(24), &[1, 1]),
+        vec![INET_REP_OK, 1, 0, 0, 0, 3, 1, 0, 0, 0, 3],
+        "every record reports that same depth"
+    );
+    assert_eq!(
+        port.control(&op(24), &[]),
+        vec![INET_REP_OK],
+        "an empty operand reports no depth at all"
     );
 }
+
+/// The compatibility gate for the datagram half of `subscribe`, including both `badarg` shapes —
+/// which need the guarded probe, since a raise would abort a plain `port_control` expression.
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+#[test]
+fn the_subscribe_outcomes_agree_with_the_erl_oracle() {
+    let calls = vec![
+        Call::req(24, vec![], Rule::Exact),
+        Call::req(24, vec![1], Rule::Exact),
+        Call::req(24, vec![1, 1], Rule::Exact),
+        Call::req(24, vec![2], Rule::Exact),
+        Call::req(24, vec![1, 2], Rule::Exact),
+    ];
+    assert_outcomes_agree_with_the_oracle("udp_inet", &calls, bare_port);
+}
+
 // -----------------------------------------------------------------------
 // The C's refusals, promoted to exact replies
 // -----------------------------------------------------------------------
-
 /// `INET_REQ_GETTYPE`(15) switches on the descriptor's **cached** `sfamily`/`stype`
 /// (`inet_drv.c:11165`-`:11203`) — set by `inet_ctl_open` (`:5214`) and `inet_ctl_fdopen` (`:5265`)
 /// and cleared by neither a close nor `inet_stop`. It is therefore **not** an `IS_OPEN` guard: a
@@ -888,7 +943,11 @@ fn oracle_matrix() -> Vec<Call> {
         Call::req(19, vec![INET_AF_INET], Rule::Exact),  // ... einval (one byte)
         Call::req(20, vec![INET_AF_INET], Rule::Exact),  // ... einval (one byte)
         Call::req(19, vec![9, 1, 2], Rule::Exact),       // ... eafnosupport
-        Call::req(21, vec![], Rule::Exact),              // GETIFLIST  -> exbadport
+        // `SUBSCRIBE`: an outq of 0 between port-task rounds, one record per operand byte. The
+        // `badarg` operands ride the guarded probe above — a raise would abort this expression.
+        Call::req(24, vec![], Rule::Exact),              // SUBSCRIBE -> [1]
+        Call::req(24, vec![1], Rule::Exact),             // SUBSCRIBE one record
+        Call::req(24, vec![1, 1], Rule::Exact),          // SUBSCRIBE two records        Call::req(21, vec![], Rule::Exact),              // GETIFLIST  -> exbadport
         Call::req(22, vec![1], Rule::Exact),             // IFGET      -> exbadport
         Call::req(23, vec![1], Rule::Exact),             // IFSET      -> exbadport
         Call::req(25, vec![], Rule::Exact),              // GETIFADDRS -> exbadport

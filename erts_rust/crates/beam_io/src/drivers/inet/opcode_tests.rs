@@ -151,8 +151,26 @@ impl Rig {
             .expect("a live port")
             .input_len()
     }
-}
 
+    /// Queues `bytes` as a port command and runs one port-task round — the pair the runtime's
+    /// `erlang:port_command/2` drives ([`crate::PortRegistry::port_command`] then
+    /// [`crate::PortRegistry::execute_port_tasks`]).
+    ///
+    /// Returns the round's outcome. A driver that **refuses** the write reports it as an error,
+    /// and the command's bytes stay in the port's output queue — the state an
+    /// `INET_REQ_SUBSCRIBE` reply reports the depth of.
+    pub(super) fn command(&mut self, bytes: &[u8]) -> Result<()> {
+        self.registry.port_command(
+            &mut self.poller,
+            self.id,
+            bytes,
+            crate::port::PortCommandOptions::EMPTY,
+        )?;
+        self.registry
+            .execute_port_tasks(&mut self.poller, crate::port::DEFAULT_READINESS_RED_BUDGET)
+            .map(|_round| ())
+    }
+}
 /// How a matrix reply is compared, chosen by whether it can be deterministic in the first place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Rule {
@@ -330,7 +348,113 @@ pub(super) fn oracle_replies(dump: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// A **bare** (socket-less) `tcp_inet` port — the state the driver factory starts in.
+/// What one control call **observably** did: the reply it answered, or the `badarg` raise the C's
+/// `return -1` becomes.
+///
+/// [`oracle_expression`] assumes every call answers a reply, so a raising call aborts the whole
+/// expression; the guarded form below is what a probe of a C refusal needs.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) enum Outcome {
+    /// The call answered these bytes.
+    Reply(Vec<u8>),
+    /// The call raised `error:badarg` (the C's `return -1` from a control arm, which the
+    /// `inet_ctl` caller turns into an argument error).
+    BadArg,
+}
+
+/// The oracle expression for [`Outcome`]: the same `{spawn_driver, Driver}` port and call list as
+/// [`oracle_expression`], but every call runs inside a `try` and prints `R <reply>|` on success or
+/// `B|` when it raised `error:badarg`. Any **other** class/reason is not caught, so an unexpected
+/// raise still fails the probe loudly instead of being read as a refusal.
+pub(super) fn oracle_expression_catching(driver: &str, calls: &[Call]) -> String {
+    let mut body = String::new();
+    for call in calls {
+        let arg = call
+            .arg
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        body.push_str(&format!(
+            "J(fun() -> erlang:port_control(P, {}, <<{arg}>>) end), ",
+            call.value
+        ));
+    }
+    format!(
+        "J = fun(F) -> try F() of R -> io:format(\"R ~w|\", [R]) \
+         catch error:badarg -> io:format(\"B|\") end end, \
+         P = open_port({{spawn_driver, \"{driver}\"}}, [binary]), \
+         {body}erlang:port_close(P)"
+    )
+}
+
+/// Parses a [`oracle_expression_catching`] dump back into one [`Outcome`] per call.
+pub(super) fn oracle_outcomes(dump: &str) -> Vec<Outcome> {
+    dump.split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| match part.strip_prefix("R ") {
+            Some(reply) => {
+                let inner = reply.trim_start_matches('[').trim_end_matches(']');
+                if inner.is_empty() {
+                    Outcome::Reply(Vec::new())
+                } else {
+                    Outcome::Reply(
+                        inner
+                            .split(',')
+                            .map(|number| number.trim().parse::<u8>().expect("a reply byte"))
+                            .collect(),
+                    )
+                }
+            }
+            None => {
+                assert_eq!(part, "B", "an unparsable guarded-oracle outcome: {part:?}");
+                Outcome::BadArg
+            }
+        })
+        .collect()
+}
+
+/// This floor's [`Outcome`] for one call, driven through the runtime's own `port_control` path.
+pub(super) fn rust_outcome(port: &mut Rig, call: &Call) -> Outcome {
+    match port.try_control(&call.value.to_string(), &call.arg) {
+        Ok(reply) => Outcome::Reply(reply),
+        Err(BeamError::BadArg) => Outcome::BadArg,
+        Err(err) => panic!("an unexpected typed error for {}: {err:?}", call.value),
+    }
+}
+
+/// Runs `calls` on both sides — a guarded `erl` probe and this crate's port — and asserts the
+/// outcomes agree one by one. `open_port` builds the bare in-crate port for the same driver, so
+/// each suite supplies its own.
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+pub(super) fn assert_outcomes_agree_with_the_oracle(
+    driver: &str,
+    calls: &[Call],
+    open_port: impl FnOnce() -> Rig,
+) {
+    let Some(dump) = erl_stdout(&oracle_expression_catching(driver, calls)) else {
+        eprintln!("SKIP: no `erl` on PATH — skipping the {driver} guarded-probe cross-check");
+        return;
+    };
+    let oracle = oracle_outcomes(&dump);
+    assert_eq!(
+        oracle.len(),
+        calls.len(),
+        "the oracle answered every call: {dump:?}"
+    );
+
+    let mut port = open_port();
+    for (index, call) in calls.iter().enumerate() {
+        let rust = rust_outcome(&mut port, call);
+        assert_eq!(
+            rust, oracle[index],
+            "call #{index} (`{}` of {:?}) disagrees",
+            call.value, call.arg
+        );
+    }
+}/// A **bare** (socket-less) `tcp_inet` port — the state the driver factory starts in.
 pub(super) fn bare_port() -> Rig {
     Rig::new(Box::new(TcpInetDriver::new()))
 }
@@ -745,24 +869,15 @@ fn a_wrapped_or_unassigned_numeric_command_is_exbadport() {
 /// Each row below is the *one* state in which the C succeeds, i.e. the refusal-only arms
 /// (`gethostname`, `fdopen`, the name-service lookups, the `getifaddrs(3)` family, `ignorefd`,
 /// `tcp_sendfile`) have already answered their exact C refusal for every other operand/state and
-/// only their success path is missing. `subscribe` is a gap in **every** state.
+/// only their success path is missing.
 #[test]
 fn an_unserved_numeric_opcode_is_a_typed_gap() {
-    // `subscribe`(24) registers a driver-side subscriber for the empty-output-queue notification —
-    // a driver→owner message channel this floor has none of, so no operand or state helps.
-    let mut bare = bare_port();
-    let err = bare
-        .try_control(&op(24), &[1])
-        .expect_err("SUBSCRIBE is a typed gap in every state");
-    assert_eq!(reason_of(err), not_served_reason("subscribe", "inet_ctl"));
-
     // The well-formed (`len == 6`) `fdopen` on a bare port.
     let mut port = opened_port();
     let err = port
         .try_control(&op(13), &[INET_AF_INET, INET_TYPE_STREAM, 0, 0, 0, 0])
         .expect_err("FDOPEN adopts a caller's descriptor, which the Driver seam cannot express");
     assert_eq!(reason_of(err), not_served_reason("fdopen", "inet_ctl"));
-
     // The name-service lookups with a well-formed operand: `getservbyname(3)`/`getservbyport(3)`
     // resolve against the system services database, which this floor does not consult.
     let err = port
@@ -903,8 +1018,66 @@ fn the_named_and_the_numeric_route_reply_identically() {
 // The `erl` oracle matrix (skips loudly when `erl` is absent)
 // -----------------------------------------------------------------------
 
-/// The `(opcode, operand)` list the oracle matrix drives, in one port's lifetime order: the bare
-/// (socket-less) queries and refusals, then `open` (plus the fake-address pair and its `NAME`
+// -----------------------------------------------------------------------
+// `INET_REQ_SUBSCRIBE`(24)
+// -----------------------------------------------------------------------
+
+/// `INET_REQ_SUBSCRIBE`(24, `inet_subscribe` `:10819`) — the shared `inet_ctl` arm the kernel's
+/// `inet_config:set_hostname/0` reaches through `prim_inet:close/1`'s
+/// `subscribe(S, [subs_empty_out_q])`.
+///
+/// The reply is `[1] ++ (op ++ be32(outq byte count))*`; an operand byte the C's `switch` has no
+/// case for is its `return -1`, i.e. the oracle's `badarg`, discarding the whole reply (so a valid
+/// byte **before** the bad one does not survive). The counts here are `0` because a control call
+/// runs between port-task rounds, when nothing is queued.
+#[test]
+fn subscribe_answers_the_c_outq_record_or_badarg() {
+    let mut port = bare_port();
+    assert_eq!(port.control(&op(24), &[]), vec![INET_REP_OK], "an empty operand");
+    assert_eq!(
+        port.control(&op(24), &[1]),
+        vec![INET_REP_OK, 1, 0, 0, 0, 0],
+        "one INET_SUBS_EMPTY_OUT_Q record"
+    );
+    assert_eq!(
+        port.control(&op(24), &[1, 1]),
+        vec![INET_REP_OK, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        "one record per operand byte, in order"
+    );
+    assert_eq!(
+        port.control(&op(24), &[1, 1, 1]).len(),
+        1 + 3 * 5,
+        "the reply grows by exactly five bytes per accepted op"
+    );
+    // A byte that is not `INET_SUBS_EMPTY_OUT_Q`: the C's `default: return -1`.
+    for arg in [vec![2u8], vec![0], vec![255], vec![1, 2], vec![1, 1, 0]] {
+        assert!(
+            matches!(port.try_control(&op(24), &arg), Err(BeamError::BadArg)),
+            "operand {arg:?} must be the oracle's badarg"
+        );
+    }
+}
+
+/// The compatibility gate for `subscribe`: the same calls against the real system `tcp_inet`
+/// driver — including both `badarg` shapes, which the guarded probe catches instead of letting
+/// them abort the expression.
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+#[test]
+fn the_subscribe_outcomes_agree_with_the_erl_oracle() {
+    let calls = vec![
+        Call::req(24, vec![], Rule::Exact),
+        Call::req(24, vec![1], Rule::Exact),
+        Call::req(24, vec![1, 1], Rule::Exact),
+        Call::req(24, vec![1, 1, 1], Rule::Exact),
+        Call::req(24, vec![2], Rule::Exact),
+        Call::req(24, vec![1, 2], Rule::Exact),
+        Call::req(24, vec![0], Rule::Exact),
+    ];
+    assert_outcomes_agree_with_the_oracle("tcp_inet", &calls, bare_port);
+}
+
+/// The `(opcode, operand)` list the oracle matrix drives, in one port's lifetime order: the bare/// (socket-less) queries and refusals, then `open` (plus the fake-address pair and its `NAME`
 /// read-back), then the socket lifecycle with the state-dependent operands, then the same
 /// descriptor queries after `close`.
 ///
@@ -958,7 +1131,12 @@ fn oracle_matrix() -> Vec<Call> {
         Call::req(19, vec![1], Rule::Exact),                     // SETNAME len1 -> einval
         Call::req(20, vec![], Rule::Exact),                      // SETPEER len0 -> [1]
         Call::req(20, vec![1], Rule::Exact),                     // SETPEER len1 -> einval
-        // The socket lifecycle.
+        // `SUBSCRIBE`: an outq of 0 (nothing queued between port-task rounds), one record per
+        // operand byte. The `badarg` operands ride the guarded probe above — a raise would abort
+        // this expression.
+        Call::req(24, vec![], Rule::Exact),                      // SUBSCRIBE -> [1]
+        Call::req(24, vec![1], Rule::Exact),                     // SUBSCRIBE one record
+        Call::req(24, vec![1, 1], Rule::Exact),                  // SUBSCRIBE two records        // The socket lifecycle.
         Call::req(1, open_arg().to_vec(), Rule::Exact),   // OPEN
         Call::req(15, vec![], Rule::Exact),               // GETTYPE  -> the cached stream pair
         Call::req(5, vec![], Rule::Exact),                // NAME     -> the unbound address

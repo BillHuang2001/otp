@@ -1580,13 +1580,13 @@ impl TcpInetDriver {
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(wire::getstatus_reply(self.state.state_code())),
             Opcode::Getstat => wire::getstat_reply(arg),
-            // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): its only op registers a
-            // driver-side subscriber for the empty-output-queue notification, i.e. a driver→owner
-            // message channel this floor does not have. Answering `[1] ++ op ++ be32(outq)`
-            // without ever sending that notification would be a wrong promise, so it stays a
-            // typed gap.
-            Opcode::Subscribe => Err(op.not_served()),
-            // `PACKET_REQ_RECV` is a case of `packet_inet_ctl` only, so on a TCP port it is a case
+            // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): the shared `inet_ctl` arm, so
+            // both socket drivers build it through one helper. The reply is exact —
+            // `[1] ++ (op ++ be32(outq byte count))*` — and an operand byte that is not
+            // `INET_SUBS_EMPTY_OUT_Q` is the C's `return -1`, i.e. `badarg`. What this floor
+            // cannot honour is the *subscription* itself (no driver→owner message channel, so no
+            // `{empty_out_q, Port}` is ever sent); see [`wire::subscribe_reply`].
+            Opcode::Subscribe => wire::subscribe_reply(ctx.output().len(), arg),            // `PACKET_REQ_RECV` is a case of `packet_inet_ctl` only, so on a TCP port it is a case
             // of neither `tcp_inet_ctl` nor `inet_ctl`: the C answers `[0]exbadport` (measured),
             // exactly like a wrapped or unassigned number.
             Opcode::PacketRecv | Opcode::Unknown => Ok(ctl_xerror("exbadport")),
