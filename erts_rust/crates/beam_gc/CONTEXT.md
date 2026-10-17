@@ -601,6 +601,22 @@ constructors only (no new error enum).
   (`min_bin_vheap_words`/`fullsweep_after`) and the `HeapInfo` observables are still owed an entry.
 
 ## Notes for Agents
+- **`minor_gcs` is NOT monotone — it is `minor_since_major`, and a major RESETS it to 0** (the only increment sites
+  are `collector.rs`'s `collect_minor` and `immix_collector.rs`'s `run_minor`; both majors — `collect_major`,
+  `run_major`'s in-place path and `relocate_major` — assign 0). Consequence for any observational forensics: a
+  **constant non-zero** `minor_gcs` read at two different workloads proves *no collection of either kind ran in
+  between* (a minor would have raised it, a major would have zeroed it); a major-only workload reports `0`, never a
+  stale count. The monotone lifetime counters are `GcStats::{minor_collections, major_collections}` — reachable via
+  `Collector::stats()`/`AnyCollector::stats()`, but **not** part of `HeapInfo`/`process_info(P, garbage_collection)`,
+  whose only collection counter is `minor_gcs`.
+- **`heap_size`/`total_heap_size` are CAPACITIES (occupancy-independent), so a flat footprint is NOT evidence that
+  collections are running.** `HeapObservable::heap_size_words` = `Nursery::capacity_words` (summed over the chain),
+  `total_heap_size_words` = nursery + mature capacity; neither moves while words are handed out — only a collection
+  (`Nursery::collapse`) or a `grow_nursery`/`ensure_capacity` growth changes them. A collection that runs with a
+  small live set *shrinks* them (`young_after_collection`'s shrink branch: `capacity > 4 * live.max(64)` ⇒
+  `next_words(live.max(64), 0)`, i.e. ~90 words under the floor-less default policy; `collect_major` always passes
+  `live_words = 0`), so a steady state under continuous collection shows a **converged constant** capacity plus a
+  **rising** `minor_gcs`. A constant capacity with a *frozen* `minor_gcs` means no collection.
 - **Address-level membership is public; enumeration of the nursery chain is NOT.** From outside the crate a caller reaches only the **current** nursery space (`young() -> &HeapSpace`), a space **count** (`young_space_count()`) and a membership test over **every** space (`young_contains(ptr)`); the `Nursery` chain itself (`spaces()`, the retired spaces' base/top) is `pub(crate)`, so a grown chain's individual ranges cannot be enumerated externally. The mature side is fully addressable (`mature_base`/`mature_capacity_words`/`mature_used_words`/`mature_contains` on `AnyCollector`; `Collector::mature() -> &HeapSpace` / `GenImmixCollector::mature() -> &ImmixSpace`).
 - **There is no public from-space/"retired spaces"/epoch accessor.** `FromSet` is public and constructible (`new`/`add(&HeapSpace)`/`contains`/`words`) but `ranges()` is `pub(crate)` and the collector builds its from-set internally; a major **drops** the old mature space (`self.mature = fresh`) — so a collection's from-space ranges must be captured from `young()`/`mature_base()` **before** it runs, never queried after.
 - **The single-object size helper is `beam_term::layout::object_words(header, ptr) -> usize` (`pub unsafe`, in `beam_term::prelude`), not `beam_gc::copy::move_size`.** `move_size` is `pub(crate)` and equals `object_words` except for the `ErlSubBits` override (5 vs 8 — Design Decisions). `beam_term::size::size_object(Eterm)` is the whole-graph (public) size; the per-object reference walk `for_each_ref` is likewise `pub(crate)`, and the public enumerator is `beam_term::layout::for_each_child_slot(header, ptr, visit)`.
