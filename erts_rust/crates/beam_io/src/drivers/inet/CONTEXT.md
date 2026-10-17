@@ -21,30 +21,56 @@ The Erlang side never sends a control *verb*: `erlang:port_control(Port, Op, Dat
 
 #### Served vs refused, per driver
 `op` = `code + 0x03f1_a300`. "Served" means the decoded opcode is routed to the **same verb body** the named form uses (never a second implementation).
+Every row is cross-checked byte-for-byte against the system `tcp_inet` port by the `erl` matrix in `opcode_tests.rs::oracle_matrix` (bare / opened / listening / closed states, one `erl` run).
+
+**Served — the reply is exact.** The whole arm is implemented, success included.
 
 | code | opcode | TCP | UDP | operand handling | reply |
 |---|---|---|---|---|---|
 | 1 | `Open` | served | served | `[AF, TYPE, PROTO]` | the `open` verb's |
 | 2 | `Close` | served | served | — | `[1]` |
 | 3 | `Connect` | served | served | `len >= 6`: `Timeout(4), Port(2), Address(N)`; shorter ⇒ `[0]einval` | the `connect` verb's |
-| 4 | `Peer` | served | served | — | `[0]enotconn` unless connected, else `[1,1,port_hi,port_lo,a,b,c,d]` |
-| 5 | `Name` | served | served | — | `getsockname` packed; socket-less ⇒ `[0]ebadf` |
+| 4 | `Peer` | served | served | — | `[0]enotconn` unless connected, else the packed peer — the **fake** `peer_addr` when `SETPEER` installed one |
+| 5 | `Name` | served | served | — | the packed local endpoint — the **fake** `name_addr` when `SETNAME` installed one, else `getsockname`; socket-less and no fake ⇒ `[0]ebadf` |
 | 6 | `Bind` | served | served | packed address | `[1] ++ port_hi ++ port_lo` |
 | 7 | `Setopts` | served | served | `[opt, val_be32]*` records | `[1]`, or the whole-reply `[0]einval` |
 | 8 | `Getopts` | served | served | one-byte codes | `[1] ++ [opt, val_be32]*`, or `[0]einval` |
 | 11 | `Getstat` | served | served | empty ⇒ `[1]`; a bad `INET_STAT_*` op ⇒ `badarg` (the C's `-1` return) | |
+| 12 | `Gethostname` | served (`len != 0` ⇒ `[0]einval`) | typed gap | — | `[1] ++ gethostname(2)` |
 | 14 | `Getfd` | served | served | — | `[1] ++ fd_be32`, socket-less ⇒ `[0]einval` |
-| 15 | `Gettype` | served | served | — | `[1,0,0,0,1,0,0,0,1]` (stream) / `…,2` (dgram); socket-less ⇒ `[0]einval` |
+| 15 | `Gettype` | served | served | — | the **cached** `[1,0,0,0,family_be32,type_be32]` — `[1,0,0,0,1,0,0,0,1]` for a stream, `…,2` for a datagram, and the cached pair **survives a `close`**; nothing cached ⇒ `[0]einval` |
 | 16 | `Getstatus` | served | served | — | `[1,0,0,0,Code]` — `InetState::state_code()`: Closed 0, Open 1, Connected 5, Listening 9, Connecting 17 |
+| 19 | `Setname` | served | typed gap | `len == 0` clears, `len == 1` ⇒ `[0]einval`, else `inet_set_faddress` | `[1]` (stored), or `[0]einval`/`[0]eafnosupport` |
+| 20 | `Setpeer` | served | typed gap | as `Setname` | `[1]` (stored), or `[0]einval`/`[0]eafnosupport` |
 | 26 | `Accept` | served (`len == 4`, else `[0]einval`) | `[0]exbadport` | `Timeout(4)`, validated then unused | the `accept` verb's |
-| 27 | `Listen` | served | **typed gap** (the C's arm is SCTP-only ⇒ its own `[0]exbadport`) | `[backlog_hi, backlog_lo]` | `[1]` |
-| 42 | `TcpRecv` | served (`len == 8`, else `[0]einval`) | `[0]exbadport` | `Timeout(4), Length(4)`, validated then unused | the synchronous `recv` verb's |
-| 44 | `TcpShutdown` | served (`len == 1`, else `[0]einval`) | `[0]exbadport` | the `TCP_SHUT_*` byte | the `shutdown` verb's |
+| 27 | `Listen` | served | `[0]exbadport` (the C's arm is SCTP-only, `:14846`) | `[backlog_hi, backlog_lo]` | `[1]` |
+| 29 | `Getladdrs` | served (`len != 4` ⇒ `[0]einval`, then `!IS_OPEN` ⇒ `[0]exbadport`) | typed gap | — | **byte-identical to the `NAME` reply** — the C's non-SCTP fallback calls `sock_name` and never reads `name_ptr` (`:11341`) |
+| 30 | `Getpaddrs` | served (same guards) | typed gap | — | **byte-identical to the `PEER` reply**, likewise ignoring `peer_ptr` (`:11261`) |
+| 42 | `TcpRecv` | served (connection guard **first**, then `active || len != 8` ⇒ `[0]einval`) | `[0]exbadport` | `Timeout(4), Length(4)`, validated then unused | the synchronous `recv` verb's |
+| 43 | `TcpUnrecv` | served (connection guard first) | `[0]exbadport` | the bytes to push back | `[1]`; the operand is spliced to the **front** of `pending_input`, so the next `recv` yields it first |
+| 44 | `TcpShutdown` | served (connection guard first, then `len != 1` ⇒ `[0]einval`) | `[0]exbadport` | the `TCP_SHUT_*` byte | the `shutdown` verb's |
 | 60 | `PacketRecv` | `[0]exbadport` | served (socket-less ⇒ `[0]exbadport`; `len != 8` ⇒ `[0]einval`) | `Timeout(4), Length(4)`, validated then unused | the synchronous `recv` verb's |
-| 12, 13, 17-25, 28-30 (+ 43 `TcpUnrecv`, 45 `TcpSendfile` on TCP only) | — | **typed gap** | **typed gap** | the C's switches do serve these; this floor answers `Err(Opcode::not_served())` rather than fabricate a reply | |
-| — | `Unknown`, or the other driver's opcode | `[0]exbadport` | `[0]exbadport` | | |
 
-A refused opcode is **never** a fabricated success and never an invented number, and every named verb keeps answering exactly what it answered before (`tests::*` pin those replies byte-for-byte).
+**Refusal-only — the C's refusal is reproduced exactly for every state/operand that selects it; the *success* reply stays a typed gap.** Each row names the capability its success path would need.
+
+| code | opcode | TCP / UDP | refusals served | the missing capability behind the success path |
+|---|---|---|---|---|
+| 13 | `Fdopen` | TCP refusal-only, UDP typed gap | `len` not 6/10 ⇒ `[0]einval`; family ≠ `INET_AF_INET` ⇒ `[0]eafnosupport`; type ≠ `INET_TYPE_STREAM` ⇒ `[0]einval` | adopting a caller's descriptor into the live port and re-registering it (`beam_rt` owns the `open_port({fd,N})` path today) |
+| 17 | `Getservbyname` | TCP refusal-only, UDP typed gap | `len < 2` ⇒ `[0]einval` | the `getservbyname(3)` lookup and its term-encoded service record |
+| 18 | `Getservbyport` | TCP refusal-only, UDP typed gap | `len < 3` ⇒ `[0]einval` | the `getservbyport(3)` lookup (same record shape) |
+| 21, 22, 23, 25 | `Getiflist` / `Ifget` / `Ifset` / `Getifaddrs` | TCP refusal-only, UDP typed gap | `!IS_OPEN` ⇒ `[0]exbadport` | a `getifaddrs(3)` interface walk and the C's address-record encoding (`:11067`-`:11109`) |
+| 28 | `Ignorefd` | TCP refusal-only, UDP typed gap | `!IS_CONNECTED` ⇒ `[0]enotconn`; `stype != SOCK_STREAM` ⇒ `[0]einval` | "suppress read **and** write readiness" — this driver keeps one flipped `Interest` mask, so it could not honour the reply it gave |
+| 45 | `TcpSendfile` | TCP refusal-only, UDP `[0]exbadport` | `len != 20` ⇒ `[0]einval` (**before** the connection check); then `!IS_CONNECTED` ⇒ `[0]enotconn` | `sendfile(2)` plumbing plus the C's dup-file/offset bookkeeping (`:12380`) |
+
+**Typed gap in every state** — no refusal is modelled because the C has no refusal to reproduce:
+
+| code | opcode | why |
+|---|---|---|
+| 24 | `Subscribe` | its only op registers a driver-side subscriber for the empty-output-queue notification (`inet_subscribe`, `:10819`) — a driver→owner message channel this crate's `Driver`/`PortNotification` seam does not have. `Err(Opcode::not_served())` rather than a `[1]` promise that would never be kept. |
+
+**Neither switch owns the number** ⇒ `[0]exbadport` for both drivers: `Unknown`, a wrapped/sub-magic `Op`, and a number that is a case of *the other* driver's switch (`PACKET_REQ_RECV` on TCP, `TCP_REQ_*`/`Accept` on UDP). On the datagram driver `Listen`(27) also lands here (`[0]exbadport`, SCTP compiled out).
+
+A refused opcode is **never** a fabricated success and never an invented number, and every named verb keeps answering exactly what it answered before (`tests::*` pin those replies byte-for-byte). The five unserved shared arms (`Gethostname`/`Fdopen`/`Getserv{by,byname}`/… on **UDP**) are flat typed gaps there — the datagram driver models none of their refusals.
 
 ### `mod.rs` — the driver
 - `DRIVER_NAME: &str = "tcp_inet"`; `make_tcp_inet() -> Result<Box<dyn Driver>>` (the `DriverFactory`).
