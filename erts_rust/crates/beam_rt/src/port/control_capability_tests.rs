@@ -38,9 +38,9 @@
 //!   callback at all, so it is `badarg` for every verb too.
 //!
 //! The gate is [`PortRegistry::has_driver_control`](super::PortRegistry::has_driver_control); the
-//! table that supplies the built-in half of the answer is
-//! [`BUILTIN_DRIVERS_WITHOUT_CONTROL`](super::BUILTIN_DRIVERS_WITHOUT_CONTROL).
-//!
+//! capability itself is the driver's own — [`beam_io::Driver::has_control`], `false` only for a
+//! driver whose C counterpart leaves `control` `NULL` (the built-in `ram_file_drv`; a `dlopen`ed
+//! entry through its own `ErlDrvEntry::control` slot) — captured into the port when it is opened.//!
 //! # What is compared, and how
 //!
 //! [`the_capability_matrix_matches_the_oracle`] drives the same labelled probe set through this

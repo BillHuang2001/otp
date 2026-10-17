@@ -2133,6 +2133,24 @@ impl beam_io::Driver for DriverPortAdapter {
         &self.name
     }
 
+    /// The loaded `ErlDrvEntry`'s own `control` slot: `false` when the C driver left it `NULL`,
+    /// which is the C's `!prt->drv_ptr->control` gate (`io.c:4034-4036`) and therefore makes
+    /// `erlang:port_control/3` the oracle's `badarg` for **every** verb without calling anything.
+    ///
+    /// This adapter fronts a driver it `dlopen`ed itself, so the answer is its
+    /// [`DriverLibrary`]'s entry — exactly the slot `DriverPortAdapter::control` finds absent
+    /// (the same question [`beam_io`]'s own ABI adapter answers for its `DriverPort`,
+    /// `beam_io/src/abi/port.rs`). The runtime captures it once, at `open_port/2`, because the
+    /// boxed driver is moved into the port registry and unreachable afterwards.
+    ///
+    /// `false` after [`DriverPortAdapter::stop`] has taken the driver (there is no entry left to
+    /// consult) — a closed port's answer, and never a claim on a live one.
+    fn has_control(&self) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(|driver| driver.library().entry().control.is_some())
+    }
+
     /// Runs the driver's `start` callback with this port's handle.
     ///
     /// The environment is built here and kept for the port's life (the handle **is** the

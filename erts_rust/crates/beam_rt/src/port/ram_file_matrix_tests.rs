@@ -54,10 +54,10 @@
 //! covers `GET` as that row.
 //!
 //! `erlang:port_control/3` is `error:badarg` for **every** opcode on this port (the driver entry's
-//! `control` slot is `NULL` — this crate's `BUILTIN_DRIVERS_WITHOUT_CONTROL` gate), so `beam_io`'s
-//! named-verb `Driver::control` transport is a Rust-only extension with no oracle counterpart:
-//! nothing here drives it. Everything goes through `port_command`, which is the only transport the
-//! oracle has.
+//! `control` slot is `NULL`, which this driver answers through `Driver::has_control`), so
+//! `beam_io`'s named-verb `Driver::control` transport is a Rust-only extension with no oracle
+//! counterpart: nothing here drives it. Everything goes through `port_command`, which is the only
+//! transport the oracle has.
 //!
 //! # Honest scope
 //!
