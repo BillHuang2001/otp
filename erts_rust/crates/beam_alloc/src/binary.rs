@@ -52,45 +52,148 @@
 //! the atomic reference count changes), so moving a handle to another thread cannot
 //! race.
 //!
-//! `unsafe` is confined to this module's marked blocks (raw payload memory).
+//! # Capacity growth (amortised, in place when possible)
+//!
+//! The payload is *not* fixed-size: it carries a **capacity** in its control header, and
+//! [`RefcBinary::ensure_capacity`] / [`RefcBinary::reserve`] / [`RefcBinary::append`] grow
+//! it by the C's `GROW_PROC_BIN_SIZE` schedule (doubling up to
+//! [`GROW_DOUBLING_LIMIT_BYTES`], then ×1.2). Because the growth step is proportional to
+//! the current size, an append loop is **amortised linear** instead of O(n²) — the point
+//! of the whole capacity word.
+//!
+//! An append loop therefore sees two outcomes (see [`GrowOutcome`](binary::GrowOutcome)):
+//!
+//! * **In place** — the reservation already covers the request, or covers the grown
+//!   target, so only `header.capacity` moves. `data_ptr()` is unchanged, which means every
+//!   on-heap `BinRef.val` word pointing at this payload stays valid and no fixup is owed.
+//! * **Moved** — a bigger reservation was needed, so the payload was reallocated and
+//!   copied. The returned [`Relocation`](binary::Relocation) reports the old/new payload
+//!   addresses, and the host must republish the term over the new pointer (exactly C's
+//!   non-writable fallback arm). Nothing on the *process* heap is affected: the payload is
+//!   off-heap, so no `beam_gc` root set, `StackFrame` or `RootSet` contract changes.
+//!
+//! All capacity metadata lives in this private header, **never in a term**: the on-heap
+//! `[BinRef][ErlSubBits]` pair records only the *logical* bit length, so sparing capacity
+//! is invisible to `beam_term::size::size_object` (the frozen layout is untouched).
+//!
+//! `unsafe` is confined to this module's (and its `growth` submodule's) marked blocks
+//! (raw payload memory).
 
-use core::alloc::Layout;
+mod growth;
+
+pub use growth::{payload_capacity, GrowOutcome, GrowthCounters, Relocation};
+
 use core::ptr::NonNull;
 use core::slice;
 use std::sync::LazyLock;
 
 use beam_common::{BeamError, Result};
 
-use crate::allocator::{AllocRef, MIN_ALIGN};
-use crate::block::UNIT_SIZE;
+use crate::allocator::AllocRef;
+use crate::block::{BLOCK_HEADER_SIZE, MAX_BLOCK_SIZE, UNIT_SIZE};
 use crate::error;
 use crate::refcount::RefCount;
 use crate::registry::{allocator, AllocType};
 use crate::types::TypeId;
 
+/// The C's `GROW_PROC_BIN_SIZE` switch point (`erts/emulator/beam/erl_bits.c:70-73`):
+/// up to this size a writable binary doubles (keeping the amortised cost linear), above
+/// it the growth step drops to 20 %. The C value is `1 << 24` (16 MiB).
+pub const GROW_DOUBLING_LIMIT_BYTES: usize = 1 << 24;
+
+/// How much room a fresh capacity-only payload reserves per requested capacity byte.
+///
+/// [`RefcBinary::with_capacity`] reserves `capacity * DEFAULT_RESERVATION_FACTOR` (rounded
+/// up to [`UNIT_SIZE`]) so that a typical accumulator loop fills the reservation several
+/// times over before it ever needs a move. It is a *reservation* policy, not a limit: the
+/// hard bound is still the payload's `max_capacity`.
+pub const DEFAULT_RESERVATION_FACTOR: usize = 4;
+
+/// The largest payload this allocator can serve in one block.
+///
+/// The packed `bhdr` word (`crate::block::MAX_BLOCK_SIZE`) bounds the whole block
+/// (allocator header + this control header + payload), so a payload reservation can never
+/// exceed what is left. A host that wants a tighter policy cap (e.g. one derived from
+/// `max_heap_words`) passes it as the `max_capacity` of
+/// [`RefcBinary::with_limits`], which must itself be `<= MAX_PAYLOAD_BYTES`.
+pub const MAX_PAYLOAD_BYTES: usize = MAX_BLOCK_SIZE
+    .saturating_sub(BLOCK_HEADER_SIZE)
+    .saturating_sub(HEADER_SIZE);
+
+/// Rounds `n` up to a whole number of allocation units (saturating, never wrapping).
+#[inline]
+fn round_up_unit(n: usize) -> usize {
+    n.saturating_add(UNIT_SIZE - 1) & !(UNIT_SIZE - 1)
+}
+
+/// The C's `GROW_PROC_BIN_SIZE` in integer math: double up to
+/// [`GROW_DOUBLING_LIMIT_BYTES`], then add 20 %. Saturating, so a hostile size can never
+/// wrap (the result is then rejected by the `max_capacity` check rather than allocated).
+#[inline]
+fn grow_span(size: usize) -> usize {
+    if size > GROW_DOUBLING_LIMIT_BYTES {
+        size.saturating_add(size / 5)
+    } else {
+        size.saturating_mul(2)
+    }
+}
+
+/// The reservation [`RefcBinary::with_capacity`] picks for a requested `capacity`:
+/// `round_up_unit(max(capacity, capacity * DEFAULT_RESERVATION_FACTOR))`, clamped to
+/// [`MAX_PAYLOAD_BYTES`].
+#[inline]
+fn reservation_for(capacity: usize) -> usize {
+    let with_slack = capacity.saturating_mul(DEFAULT_RESERVATION_FACTOR);
+    round_up_unit(capacity.max(with_slack)).min(MAX_PAYLOAD_BYTES)
+}
+
 /// The control header stored immediately before the payload bytes.
 ///
-/// It carries the atomic reference count and the payload length; `RefcBinary`
-/// recovers it deterministically from the data pointer (`base`) without an extra
-/// indirection. The `#[repr(C)]` + `len` fields make the header exactly [`UNIT_SIZE`]
-/// bytes, so the payload begins `UNIT_SIZE` bytes into the allocation and is
-/// therefore `UNIT_SIZE`-aligned (the allocator's minimum alignment).
+/// It carries the atomic reference count plus the three payload size words
+/// (`len <= capacity <= reserved`) that make amortised in-place growth possible;
+/// `RefcBinary` recovers it deterministically from the data pointer
+/// (`data_ptr() - HEADER_SIZE`) without an extra indirection, which is what lets
+/// [`payload_capacity`] answer "'how wide is this *live* `BinRef.val`?" from a raw
+/// pointer.
+///
+/// | field | meaning |
+/// |---|---|
+/// | `refc` | the shared reference count (starts at 1 on construction) |
+/// | `len` | the **logical** payload length in bytes |
+/// | `capacity` | the **writable** capacity in bytes (the append ceiling) |
+/// | `reserved` | the payload **reservation**: the payload bytes actually allocated |
+///
+/// The `#[repr(C)]` field order makes the header four machine words, i.e.
+/// [`HEADER_SIZE`] (32) bytes — a multiple of [`UNIT_SIZE`], so
+/// `data_ptr = base + HEADER_SIZE` keeps the allocator's minimum alignment
+/// ([`MIN_ALIGN`] == [`UNIT_SIZE`] == 16) with no padding bytes left in an unspecified
+/// state.
 #[repr(C)]
 struct BinaryHeader {
     /// The shared reference count (starts at 1 on construction).
     refc: RefCount,
-    /// The payload length in bytes (also cached in the handle for O(1) `len`).
+    /// The logical payload length in bytes. Read through [`RefcBinary::len`], never
+    /// cached in the handle, so clones and growth can never disagree about it.
     len: usize,
+    /// The writable capacity in payload bytes (`len <= capacity`). Growing *within* the
+    /// reservation only raises this word; growing past it needs a move.
+    capacity: usize,
+    /// The payload allocation size in bytes (`capacity <= reserved`). [`Drop`] frees with
+    /// exactly this size, so it is what makes a grown payload releasable with the layout
+    /// it was *last* allocated with, and a grown reservation is never under-reported.
+    reserved: usize,
 }
 
 /// The number of bytes of control header between the allocation base and the first
 /// payload byte.
 const HEADER_SIZE: usize = core::mem::size_of::<BinaryHeader>();
 
-// The header must exactly fill one allocation unit, so `data_ptr = base + HEADER_SIZE`
-// lands on the allocator's minimum-alignment boundary and no padding bytes are left
-// in an unspecified state.
-const _: () = assert!(HEADER_SIZE == UNIT_SIZE);
+// The header must fill a whole number of allocation units, so `data_ptr = base +
+// HEADER_SIZE` lands on the allocator's minimum-alignment boundary (the allocator hands
+// out `MIN_ALIGN`-aligned bases and `MIN_ALIGN == UNIT_SIZE`).
+const _: () = assert!(HEADER_SIZE.is_multiple_of(UNIT_SIZE));
+// The header is exactly four machine words (refc, len, capacity, reserved).
+const _: () = assert!(HEADER_SIZE == 4 * crate::block::WORD_SIZE);
 
 /// The allocation type a [`RefcBinary`] payload is attributed to.
 ///
@@ -118,52 +221,144 @@ fn payload_type() -> TypeId {
     *PAYLOAD_TYPE
 }
 
-/// An immutable, reference-counted, off-heap byte buffer.
+/// A reference-counted, off-heap byte buffer with an amortised-growth capacity.
 ///
-/// See the module documentation for the ownership model and the [`RefcBinary::data_ptr`]
-/// contract. The buffer is allocated through the [`AllocType::Binary`] allocator (the
-/// registry's `binary_alloc` instance) unless a caller supplies one via
-/// [`RefcBinary::with_allocator`].
+/// See the module documentation for the ownership model, the growth protocol and the
+/// [`RefcBinary::data_ptr`] contract. The buffer is allocated through the
+/// [`AllocType::Binary`] allocator (the registry's `binary_alloc` instance) unless a
+/// caller supplies one via [`RefcBinary::with_allocator`].
+///
+/// The handle itself is tiny: the payload's `len`/`capacity`/`reserved` all live in the
+/// off-heap control header, so every handle (and every on-heap `BinRef`) agrees about the
+/// payload's geometry by construction.
 pub struct RefcBinary {
     alloc: AllocRef,
     /// The allocation base (the start of the control header). `data_ptr` is
     /// `base + HEADER_SIZE`.
     base: NonNull<u8>,
-    len: usize,
+    /// The hard growth limit for this payload: the host's policy cap, `<= 
+    /// MAX_PAYLOAD_BYTES`. Kept in the handle rather than the header because it is a
+    /// *policy* the host chose, not a property of the bytes; clones inherit it.
+    max_capacity: usize,
+    /// How many growth requests were satisfied by raising `header.capacity` in place.
+    in_place_grows: usize,
+    /// How many relocations this handle performed (each one reallocated the payload).
+    moves: usize,
+    /// How many live payload bytes those relocations copied in total.
+    bytes_copied: usize,
 }
 
-// SAFETY: a `RefcBinary` owns (jointly with its clones) an off-heap byte buffer
-// reached through `base`, and the only shared mutable state is the atomic `RefCount`
-// in the header. The payload bytes are written once at construction and never
-// mutated afterwards, so moving a handle to another thread cannot observe a data
-// race; the `AllocRef` handle is `Send + Sync` by the `Allocator` contract, and every
-// clone participates in the same atomic refcount protocol. (`Sync` is deliberately
-// not implemented: the on-heap `BinRef` ownership model is single-threaded.)
+// SAFETY: a `RefcBinary` owns (jointly with its clones) an off-heap byte buffer reached
+// through `base`, and the only *shared* mutable state is the atomic `RefCount` in the
+// header (the other header words are only written by a handle that owns the payload
+// exclusively). The payload bytes can be mutated after construction only through
+// `&mut self` on a handle whose `refcount() == 1` — i.e. while no other handle exists
+// anywhere, so no clone on another thread can be reading them — so moving a handle to
+// another thread cannot observe a data race. The `AllocRef` handle is `Send + Sync` by the
+// `Allocator` contract, and every clone participates in the same atomic refcount protocol.
+// (`Sync` is deliberately not implemented: the on-heap `BinRef` ownership model is
+// single-threaded.)
 unsafe impl Send for RefcBinary {}
 
 impl RefcBinary {
     /// Allocates an off-heap binary holding a copy of `bytes`.
     ///
     /// The reference count starts at 1; the buffer is allocated through the registry's
-    /// [`AllocType::Binary`] allocator.
+    /// [`AllocType::Binary`] allocator. The payload is allocated with **no spare room**
+    /// (`len == capacity == reserved`), i.e. exactly as before capacity growth existed.
     pub fn new(bytes: &[u8]) -> Result<RefcBinary> {
         RefcBinary::with_allocator(allocator(AllocType::Binary).clone(), bytes)
     }
 
     /// Allocates an off-heap binary holding a copy of `bytes`, backed by `alloc`.
     ///
-    /// The reference count starts at 1. Every clone of the result (and, eventually,
-    /// the final drop) uses *this* allocator and the *same* layout, so the caller may
-    /// supply an injected allocator for tests. The payload is obtained through the
-    /// typed allocation API (`alloc_typed`), attributed to the `BINARY` allocation type
-    /// (see the private `payload_type` helper).
+    /// The reference count starts at 1. Every clone of the result (and, eventually) the
+    /// final drop uses *this* allocator and the *same* layout, so the caller may supply an
+    /// injected allocator for tests. The payload is obtained through the typed allocation
+    /// API (`alloc_typed`), attributed to the `BINARY` allocation type (see the private
+    /// `payload_type` helper).
+    ///
+    /// The payload has **no spare room** (`len == capacity == reserved`); later growth
+    /// memory is bought by [`ensure_capacity`](RefcBinary::ensure_capacity) or, for an
+    /// accumulator, by starting from [`with_capacity`](RefcBinary::with_capacity) instead.
     pub fn with_allocator(alloc: AllocRef, bytes: &[u8]) -> Result<RefcBinary> {
         let len = bytes.len();
+        RefcBinary::allocate(alloc, len, len, MAX_PAYLOAD_BYTES, bytes)
+    }
+
+    /// Allocates an empty off-heap binary with `capacity` writable payload bytes,
+    /// reserving spare room through the registry's [`AllocType::Binary`] allocator.
+    ///
+    /// The reservation is `round_up_unit(capacity * DEFAULT_RESERVATION_FACTOR)`: an
+    /// accumulator that appends into it therefore grows **in place** for several rounds
+    /// before the first move.
+    pub fn with_capacity(capacity: usize) -> Result<RefcBinary> {
+        RefcBinary::with_capacity_and_allocator(allocator(AllocType::Binary).clone(), capacity)
+    }
+
+    /// [`with_capacity`](RefcBinary::with_capacity) over a caller-supplied allocator.
+    ///
+    /// A `capacity` beyond [`MAX_PAYLOAD_BYTES`] is the typed
+    /// `AllocKind::LargeObject` failure (it can never be served), reported before anything
+    /// is allocated.
+    pub fn with_capacity_and_allocator(alloc: AllocRef, capacity: usize) -> Result<RefcBinary> {
+        if capacity > MAX_PAYLOAD_BYTES {
+            return Err(error::large_object_failure(capacity));
+        }
+        let reserved = reservation_for(capacity);
+        RefcBinary::allocate(alloc, reserved, capacity, MAX_PAYLOAD_BYTES, &[])
+    }
+
+    /// Allocates an empty off-heap binary with fully explicit payload limits.
+    ///
+    /// * `capacity` — the writable capacity in bytes (the `append` ceiling);
+    /// * `reserved_bytes` — the payload bytes actually allocated (`>= capacity`); the
+    ///   spare `reserved_bytes - capacity` is what later growth consumes *in place*;
+    /// * `max_capacity` — the hard limit growth may never exceed.
+    ///
+    /// The invariant is `capacity <= reserved_bytes <= max_capacity`, with
+    /// `reserved_bytes <= MAX_PAYLOAD_BYTES` (the allocator's real single-block ceiling);
+    /// a violation is [`BeamError::BadArg`] and allocates nothing. A host with its own
+    /// policy cap (say, derived from `max_heap_words`) passes it as `max_capacity` and
+    /// then every growth operation is bounded by it.
+    pub fn with_limits(
+        alloc: AllocRef,
+        capacity: usize,
+        reserved_bytes: usize,
+        max_capacity: usize,
+    ) -> Result<RefcBinary> {
+        if capacity > reserved_bytes
+            || reserved_bytes > max_capacity
+            || reserved_bytes > MAX_PAYLOAD_BYTES
+        {
+            return Err(error::bad_payload_limits(capacity, reserved_bytes, max_capacity));
+        }
+        RefcBinary::allocate(alloc, reserved_bytes, capacity, max_capacity, &[])
+    }
+
+    /// The one allocation site: reserves `reserved` payload bytes, writes the control
+    /// header for `bytes.len()` / `capacity` / `reserved` and copies `bytes` in.
+    ///
+    /// All constructors funnel through here so the header layout, the type attribution and
+    /// the exhaustion mapping exist exactly once. `bytes.len() <= capacity <= reserved`
+    /// and `reserved <= max_capacity <= MAX_PAYLOAD_BYTES` are the caller's invariants
+    /// (checked by [`with_limits`](RefcBinary::with_limits), true by construction for the
+    /// rest).
+    fn allocate(
+        alloc: AllocRef,
+        reserved: usize,
+        capacity: usize,
+        max_capacity: usize,
+        bytes: &[u8],
+    ) -> Result<RefcBinary> {
+        let len = bytes.len();
+        debug_assert!(len <= capacity, "the live bytes must fit the capacity");
+        debug_assert!(capacity <= reserved, "the capacity must fit the reservation");
+        debug_assert!(reserved <= max_capacity, "the reservation must fit the limit");
         let total = HEADER_SIZE
-            .checked_add(len)
-            .ok_or_else(|| error::large_object_failure(len))?;
-        let layout =
-            Layout::from_size_align(total, MIN_ALIGN).map_err(|_| error::bad_align(MIN_ALIGN))?;
+            .checked_add(reserved)
+            .ok_or_else(|| error::large_object_failure(reserved))?;
+        let layout = growth::payload_layout(reserved)?;
         // Map *any* allocation failure onto the `LargeObject` class: to the workspace,
         // a `RefcBinary` payload is an off-heap large object, regardless of whether the
         // allocator served it from a slab or a dedicated carrier.
@@ -175,21 +370,27 @@ impl RefcBinary {
             Ok(ptr) => ptr,
             Err(BeamError::Alloc(_)) => return Err(error::large_object_failure(total)),
             Err(other) => return Err(other),
+        };        let binary = RefcBinary {
+            alloc,
+            base,
+            max_capacity,
+            in_place_grows: 0,
+            moves: 0,
+            bytes_copied: 0,
         };
-        let binary = RefcBinary { alloc, base, len };
         // SAFETY: `base` is a live allocation of exactly `total >= HEADER_SIZE` bytes
         // owned by `binary`; the header occupies `[base, base + HEADER_SIZE)` and the
         // payload `[base + HEADER_SIZE, base + total)`, so the two writes are in-bounds
         // and disjoint, and `base` is at least `UNIT_SIZE`-aligned (the allocator's
         // guarantee), which suffices for `BinaryHeader` (align 8).
         unsafe {
-            binary
-                .base
-                .cast::<BinaryHeader>()
+            base.cast::<BinaryHeader>()
                 .as_ptr()
                 .write(BinaryHeader {
                     refc: RefCount::new(1),
                     len,
+                    capacity,
+                    reserved,
                 });
             if len > 0 {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), binary.data_ptr(), len);
@@ -198,24 +399,46 @@ impl RefcBinary {
         Ok(binary)
     }
 
-    /// The payload length in bytes.
+    /// The payload length in bytes (read from the control header, never cached).
     pub fn len(&self) -> usize {
-        self.len
+        self.header().len
     }
 
     /// Whether the payload is empty.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
+    }
+
+    /// The writable capacity in bytes: the largest `len` the payload can reach without
+    /// buying more memory (`len() <= capacity() <= reserved_bytes()`).
+    pub fn capacity(&self) -> usize {
+        self.header().capacity
+    }
+
+    /// The payload reservation in bytes — the payload allocation's actual size
+    /// (`capacity() <= reserved_bytes() <= max_capacity()`).
+    ///
+    /// This is the word [`Drop`] frees with, and the one a host reads to decide whether
+    /// the *next* in-place grow is possible without a move.
+    pub fn reserved_bytes(&self) -> usize {
+        self.header().reserved
+    }
+
+    /// The hard limit growth may never exceed (per handle; a fresh payload defaults to
+    /// [`MAX_PAYLOAD_BYTES`], [`with_limits`](RefcBinary::with_limits) sets it explicitly).
+    pub fn max_capacity(&self) -> usize {
+        self.max_capacity
     }
 
     /// The payload bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: the payload is `self.len` initialised bytes starting at `data_ptr`
-        // (written at construction) and the buffer is immutable and owned — jointly
-        // with its clones — by `self`, so the borrow cannot observe a mutation. For an
-        // empty payload `data_ptr` is a valid, aligned (one-past-the-header) pointer
-        // and the zero-length slice reads nothing.
-        unsafe { slice::from_raw_parts(self.data_ptr(), self.len) }
+        // SAFETY: the payload is `len` initialised bytes starting at `data_ptr` (written
+        // at construction, by `append`, or by `set_len`'s zero fill) and the buffer is
+        // owned — jointly with its clones — by `self`, so the borrow cannot observe a
+        // mutation: every mutator takes `&mut self` *and* requires the unique handle
+        // (`refcount == 1`). For an empty payload `data_ptr` is a valid, aligned
+        // (one-past-the-header) pointer and the zero-length slice reads nothing.
+        unsafe { slice::from_raw_parts(self.data_ptr(), self.len()) }
     }
 
     /// The current reference count.
@@ -228,35 +451,59 @@ impl RefcBinary {
     /// This is the value stored in the on-heap `BinRef.val` word: it deliberately
     /// points *past* the beam_alloc-internal control header, so consumers treat it as
     /// a raw byte pointer to the binary's data. The pointer is `UNIT_SIZE`-aligned and
-    /// valid for [`len`](RefcBinary::len) readable bytes for as long as any handle to
-    /// this binary is alive.
+    /// valid for [`len`](RefcBinary::len) readable (and [`capacity`](RefcBinary::capacity)
+    /// writable) bytes for as long as any handle to this binary is alive **and no growth
+    /// moved it**: a [`GrowOutcome::Moved`] invalidates every previously handed-out
+    /// `data_ptr`, which is exactly why the mutators report it.
     pub fn data_ptr(&self) -> *mut u8 {
-        // SAFETY: `base` is the start of an allocation of `total = HEADER_SIZE + len`
-        // bytes, so `base + HEADER_SIZE` is in-bounds (or exactly one-past-the-end for
-        // an empty payload, which is never dereferenced).
+        // SAFETY: `base` is the start of an allocation of `total = HEADER_SIZE +
+        // reserved >= HEADER_SIZE` bytes, so `base + HEADER_SIZE` is in-bounds (never
+        // past the end, since the header is part of the allocation a fortiori).
         unsafe { self.base.as_ptr().add(HEADER_SIZE) }
     }
 
     /// The control header of this binary.
     fn header(&self) -> &BinaryHeader {
         // SAFETY: `base` is the start of a live allocation owned (jointly with clones)
-        // by this binary, and `with_allocator` is the only place that hands out a
-        // `RefcBinary`, always after writing a `BinaryHeader` at `base`. The header is
-        // therefore initialised, and no `&mut` to it is ever formed (only the atomic
-        // `refc` changes, through a shared reference).
+        // by this binary, and `allocate` is the only place that hands out a
+        // `RefcBinary`, always after writing a `BinaryHeader` at `base`; every relocation
+        // (see the `growth` submodule) writes a fresh header before installing the new
+        // base. The header is therefore initialised, and the only `&mut` to it is formed
+        // by `header_mut`, which requires the unique handle.
         unsafe { &*self.base.cast::<BinaryHeader>().as_ptr() }
+    }
+
+    /// A mutable view of the control header.
+    ///
+    /// Private and deliberately blunt: every caller must already have proved that it owns
+    /// the **unique** handle ([`require_unique`](RefcBinary::require_unique), i.e.
+    /// `refcount == 1`), so no clone can be reading the header concurrently and no
+    /// `&BinaryHeader` (from [`header`](RefcBinary::header)) is live across the call.
+    fn header_mut(&mut self) -> &mut BinaryHeader {
+        // SAFETY: `base` is a live, uniquely-owned (per the caller's `refcount == 1`
+        // proof) allocation whose first `HEADER_SIZE` bytes hold an initialised
+        // `BinaryHeader` (see `header`). `&mut self` excludes any other borrow of the
+        // handle, so this is the only live reference to the header for the returned
+        // lifetime.
+        unsafe { &mut *self.base.cast::<BinaryHeader>().as_ptr() }
     }
 }
 
 impl Clone for RefcBinary {
     /// Clones the *handle*, not the bytes: the reference count is incremented and both
-    /// handles then share the same immutable buffer.
+    /// handles then share the same payload and the same header (so `len`, `capacity` and
+    /// `reserved` always agree). The clone's [growth counters](RefcBinary::growth_counters)
+    /// start at zero, because they record what *this* handle did — and sharing the payload
+    /// is exactly what makes both handles refuse to grow it.
     fn clone(&self) -> RefcBinary {
         self.header().refc.inc();
         RefcBinary {
             alloc: self.alloc.clone(),
             base: self.base,
-            len: self.len,
+            max_capacity: self.max_capacity,
+            in_place_grows: 0,
+            moves: 0,
+            bytes_copied: 0,
         }
     }
 }
@@ -267,16 +514,18 @@ impl Drop for RefcBinary {
             // Other handles still reference the buffer; they will free it.
             return;
         }
-        // `total` and `MIN_ALIGN` are exactly the values used by `with_allocator`, which
-        // already proved they form a valid `Layout`; recomputing it here is infallible.
-        let layout = Layout::from_size_align(HEADER_SIZE + self.len, MIN_ALIGN)
-            .expect("RefcBinary layout is valid: it was accepted by with_allocator");
-        // SAFETY: `base`/`layout` are exactly the pointer and layout `with_allocator`
-        // obtained from `self.alloc` through `alloc_typed(payload_type(), ..)`, the
-        // count just reached 0 so no other handle references the buffer, and it is not
-        // used after this call. This is the sole free, through the same allocator the
-        // buffer was allocated from and with the same allocation type, so the per-type
-        // and aggregate counters are unwound together.
+        // `HEADER_SIZE + reserved` and `MIN_ALIGN` are exactly the values the allocation
+        // (the original one, or the most recent relocation — which frees the old block
+        // itself) was made with, and they were already accepted as a valid `Layout`, so
+        // recomputing it here is infallible.
+        let layout = growth::payload_layout(self.reserved_bytes())
+            .expect("RefcBinary layout is valid: it was accepted by allocate");
+        // SAFETY: `base`/`layout` are exactly the pointer and layout the allocation that
+        // currently owns the payload obtained from `self.alloc` through
+        // `alloc_typed(payload_type(), ..)`, the count just reached 0 so no other handle
+        // references the buffer, and it is not used after this call. This is the sole
+        // free, through the same allocator the buffer was allocated from and with the same
+        // allocation type, so the per-type and aggregate counters are unwound together.
         unsafe { self.alloc.dealloc_typed(payload_type(), self.base, layout) };
     }
 }
@@ -284,7 +533,7 @@ impl Drop for RefcBinary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::{AllocatorConfig, CarrierAllocator};
+    use crate::allocator::{AllocatorConfig, CarrierAllocator, MIN_ALIGN};
     use crate::size_class::SizeClasses;
     use crate::types::{types_for_allocator, AllocatorId};
     use beam_common::AllocKind;
