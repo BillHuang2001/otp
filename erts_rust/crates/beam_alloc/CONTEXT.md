@@ -410,7 +410,11 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - `src/reserved_heap.rs` → `ReservedHeap`/`GrowOutcome`: the reservation-capable per-process term heap (in-place growth, `relocate`/delta) + the host-adoption contract
 - `src/bump.rs` → `pub(crate)` bump-pointer term-construction primitives shared by `Heap` and `ReservedHeap`
 - `src/refcount.rs` → `RefCount`: the shared atomic reference count
-- `src/binary.rs` → `RefcBinary`: off-heap refcounted large binaries (attributed to the `BINARY` type)
+- `src/binary.rs` → `RefcBinary`: off-heap refcounted large binaries (attributed to the `BINARY` type);
+  the control header (refcount/length/capacity/reservation), constructors, read accessors, `Clone`/`Drop`
+- `src/binary/growth.rs` → `GrowOutcome`/`Relocation`/`GrowthCounters`, `payload_capacity`, and the
+  growth mutators (`ensure_capacity`/`reserve`/`append`/`set_len`/`compact`, the private `relocate`,
+  `payload_layout` — the one layout every allocation and every free shares)
 - `src/block.rs` → block layout constants + `BlockHdr`/`BlockFlags` (implementation module)
 - `src/carrier.rs` → `Carrier` (mseg-backed block, subdivision into equal class blocks) + the
   process-global `mseg()` handle
