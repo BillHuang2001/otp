@@ -60,6 +60,16 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   what happens on a host with an `erl` on `$PATH` — the resolved default is the system install's
   script (see above).
 
+## File-size overages
+The `../CONTEXT.md` *Files ~1000 lines* constraint is met everywhere except the pre-existing oversize below, which are **not** restructured.
+- `src/port.rs` ~2079 production lines (unit suite lives in `port/tests.rs`, ~2190 lines).
+- `src/runtime.rs` ~2280 lines — the façade is also the colocated home of its own unit tests.
+- `src/context/calls.rs` ~1272 lines of production (the BIF-dispatch + BIF-result-copy-out machinery; suite in `context/calls/tests.rs`).
+- `src/native/file_server.rs` ~1207 lines of production (the io-device request dispatch table; suite in `native/file_server/tests.rs`).
+- `src/runtime/scheduler.rs` ~1288 lines of production, plus a small inline borrow/quiescence test module (suite in `runtime/scheduler/tests.rs`).
+- `src/context/gc.rs` ~2759 lines incl. its inline `#[cfg(test)] mod tests`; the production half is ~1.9 k lines — its unit suite **belongs** in `context/gc/tests.rs` (still owed; the `port.rs`/`port/tests.rs` pattern).
+- `src/context/gc_walk.rs` ~1.7 k lines: ~1.0 k of production (the valved reachability descent, whose module docs carry the soundness argument and the latch-clearing refutation) plus the root-set pinning suite, which **must** stay colocated because it drives the module's private `Walk`/`WalkScratch` types.
+
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the
   boot-script reader/executor and the system code-path resolution (`boot/CONTEXT.md`).

@@ -36,6 +36,13 @@ This directory holds only the sink submodule and this doc; the node half is the 
 - Do not hand-edit generated artifacts; Apache-2.0 header block required on every `.rs` file.
 - Keep each file ~1000 lines; `dist.rs` is ~796, `dist/inbound.rs` is ~865.
 
+## Missing sibling APIs (the still-`Unsupported` families)
+- **The distributed-spawn family** (`SpawnRequest`/`SpawnReply`) needs a `beam_process` spawn-responder/reservation API — a `DOP_SPAWN_REPLY` sender plus the reservation bookkeeping a `DOP_SPAWN_REQUEST` keys into.
+- **`Delivery::Other(_)`** is the link driver's (the C kills the connection outright, `dist.c:2277-2282`).
+- **`beam_dist` still needs three things**: a reply channel on `InboundSink` (the `DOP_EXIT`/`DOP_MONITOR_P_EXIT` `noproc` replies and the `DOP_UNLINK_ID_ACK` cannot be emitted at all — the drain counts only `Delivered`); a connection/peer identity on the sink (the C's arms need the peer's sysname for the envelope and the connection id for the origin checks); and a local-node identity in `decode_control` (inbound references decode as pure external, so a wire reference cannot key an alias or a monitor DOWN).
+- **Routing an inbound creation family through the nearest public `beam_process` entry point would be WRONG today**: those entry points are the *local-initiated outbound* half and route a `DOP_*` through the installed `DistSignalRouter`, whose auto-echo the C's inbound receipt arms never send (`dist.c:2258` `break; /* Done */`).
+- `beam_process`'s route-free receipt primitives (all present, none echoing a `DOP_*`): `record_remote_link`, `apply_remote_exit_signal`, `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote_ref`/`demonitor_from_remote_ref` (the peer-minted wire-reference spellings; the `MonitorRef` ones stay for an internal ref), `remote_monitor_down`, `set_group_leader_from_remote` — the per-family routing table is [`../runtime/CONTEXT.md`](../runtime/CONTEXT.md)'s.
+
 ## Routing Table
 - `dist.rs` (parent) → the node half: `DistNode`/`DistConnection`/`NodeName`/`resolve_cookie`/`NONODE_NAME`; declares `mod inbound;` and re-exports `LocalDeliverySink`.
 - `dist/inbound.rs` → the inbound delivery sink over `beam_dist::InboundSink` (contract A.5): `LocalDeliverySink` + routing helpers.
