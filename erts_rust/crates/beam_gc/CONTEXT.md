@@ -607,6 +607,26 @@ constructors only (no new error enum).
 - **The nursery chain is monotonic *between collections*.** `Nursery::grow` holds the sole `retired.push` and `Nursery::collapse` (the sole `retired.clear()` + `retired_regions.clear()`) runs **only** from `collect_minor`/`collect_major`, so a loop that never reaches a heap-admission point keeps growing `retired` while a loop whose admission door consults `collection_debt()` collapses it back to exactly one space each round.
 - **`ensure_capacity` keeps *both* spaces.** It collects first (which collapses the chain to 1) and then `Nursery::grow` retires that just-created space (chain back to 2); the retired space is freed only by the next collection's `collapse`. `grow_nursery` is the no-collect, no-relocation form with **no** relocation-exempt guard, and it reports that retention through `collection_debt()`. The runtime pairs the two (`beam_rt`'s `collect_or_grow` / `Process::deliver`), so `young_space_count` oscillates ≈`1`→`2`→`1` rather than accumulating.
 
+- **Reading the counters for a leak-vs-recycle diagnosis.** `heap_size_words()` (the runtime's
+  `erlang:process_info(P, heap_size)`) is the **summed** capacity of the nursery chain, so every
+  `grow_nursery` retirement is visible in it: a value that stays constant across N iterations proves **no
+  uncollected retirement is outstanding** (the chain is one space), without reading `collection_debt()`.
+  `minor_gcs()` is **not** cumulative — it is minors *since the last fullsweep* and is zeroed by every
+  major ([`Collector::collect_major`], `GenImmixCollector`'s major), so a stream of majors keeps it low;
+  the cumulative counts are `GcStats::minor_collections`/`major_collections` through `stats()`, which
+  `HeapInfo`/`process_info(P, garbage_collection)` does **not** expose (its 5 keys are `max_heap_size`,
+  `min_bin_vheap_size`, `min_heap_size`, `fullsweep_after`, `minor_gcs`). **No counter of this crate
+  advances on the `grow_nursery` path** except `young_space_count()`, `collection_debt()` and the summed
+  `heap_size_words()` — `stats()` and `minor_gcs()` are untouched, and a growth grows no cumulative
+  "allocated words" figure (this crate has none). The only counter-free reclamation is the bump-pointer
+  rewind `HeapSpace::reset`/`Heap::reset`/`Heap::reset_to`, reachable through `young_mut().heap_mut()`
+  and used by `beam_rt` per BIF call on its *pooled* BIF heap — never on a process heap (a word rewound
+  that way is simply handed out again, with no collection, no chain change and no counter).
+- **Address stability under growth vs. collection.** A `grow_nursery` always installs a **new**
+  `HeapSpace` (so `young().base()` changes and the replaced base joins the non-enumerable chain);
+  `Nursery::collapse` keeps the base when the policy's target capacity equals the current one (it only
+  calls `reset`), and installs a new space (new base) only when the target differs.
+
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet` (its base-sorted
