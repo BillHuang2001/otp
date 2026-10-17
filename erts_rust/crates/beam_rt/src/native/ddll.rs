@@ -60,12 +60,12 @@
 //!
 //! # Honest divergences (documented, never a fabricated value)
 //!
-//! * **The three statically linked built-ins are modelled** as a pure constant
-//!   ([`STATIC_DRIVERS`] — `tcp_inet`, `udp_inet`, `ram_file_drv`, the C's `driver_list` entries
-//!   whose `handle == NULL`): `loaded_drivers/0` lists them **first**, a `try_load`/`try_unload` of
-//!   one answers `{error, linked_in_driver}`, and their `info/2` takes the C's `handle == NULL`
-//!   item branch rather than the dynamically loaded driver's (`erl_bif_ddll.c:281-285`, `:545-547`,
-//!   `:728,743,752,775`).
+//! * **The statically linked emulator drivers are modelled** from `beam_io`'s static set
+//!   ([`beam_io::STATIC_SPAWN_DRIVERS`] — the C's `driver_list` entries whose `handle == NULL`,
+//!   arranged in the generated table's order by [`driver::static_drivers`]): `loaded_drivers/0`
+//!   lists them **first**, a `try_load`/`try_unload` of one answers `{error, linked_in_driver}`, and
+//!   their `info/2` takes the C's `handle == NULL` item branch rather than the dynamically loaded
+//!   driver's (`erl_bif_ddll.c:281-285`, `:545-547`, `:728,743,752,775`).
 //! * **`open_port({spawn_driver, Name})` auto-`dlopen`s an unloaded name** (the Milestone-1
 //!   extension described at [`crate::port::driver_lookup`]) where the oracle answers `badarg` for a
 //!   name it has not loaded. A name the runtime *has* loaded is resolved through the list, exactly
@@ -92,19 +92,6 @@ use crate::port::driver;
 /// `ERL_DE_DYNAMIC_ERROR_OFFSET` (`global.h:181`) — the code a failed `dlopen` reports.
 const OPEN_ERROR_CODE: i64 = -10;
 
-/// The three drivers the emulator links **statically** — the C's `driver_list` entries whose
-/// `handle == NULL` (`erl_bif_ddll.c:282,545,728,743,752,775`) — in the oracle's list order.
-///
-/// `beam_bifs`' `runtime::ddll::registry::STATIC_DRIVERS` mirrors this set, but it is
-/// `pub(crate)` there and therefore unreachable from this crate, so the set is restated here on
-/// purpose — keep the two in sync.
-const STATIC_DRIVERS: [&str; 3] = ["tcp_inet", "udp_inet", "ram_file_drv"];
-
-/// Whether `name` is one of the statically linked built-in drivers.
-fn is_static_driver(name: &str) -> bool {
-    STATIC_DRIVERS.contains(&name)
-}
-
 impl RuntimeContext<'_> {
     /// The runtime-native `erl_ddll:*` floor.
     ///
@@ -127,13 +114,13 @@ impl RuntimeContext<'_> {
         }
     }
 
-    /// `erl_ddll:loaded_drivers/0` — every loaded driver's name as a charlist: the three statically
-    /// linked built-ins first (in the oracle's list order), then the dynamically loaded names in
-    /// load order.
+    /// `erl_ddll:loaded_drivers/0` — every loaded driver's name as a charlist: the emulator's
+    /// statically linked drivers first (in the C `driver_tab.c` order the oracle lists them,
+    /// [`driver::static_drivers`]), then the dynamically loaded names in load order.
     fn ddll_loaded_drivers(&mut self) -> Result<Eterm> {
-        let mut names: Vec<String> = STATIC_DRIVERS
-            .iter()
-            .map(|name| (*name).to_string())
+        let mut names: Vec<String> = driver::static_drivers()
+            .into_iter()
+            .map(str::to_string)
             .collect();
         names.extend(driver::loaded_driver_names());
         let list = self.string_list(&names)?;
@@ -148,7 +135,7 @@ impl RuntimeContext<'_> {
         let kill_ports = self.ddll_options(args[2])?;
         // A statically linked built-in cannot be loaded: the C answers `{error, linked_in_driver}`
         // (`erl_bif_ddll.c:281-285`).
-        if is_static_driver(&name) {
+        if driver::is_static_driver(&name) {
             return self.ddll_error_atom("linked_in_driver");
         }
         if driver::driver_is_loaded(&name) {
@@ -173,7 +160,7 @@ impl RuntimeContext<'_> {
         let _kill_ports = self.ddll_options(args[1])?;
         // A statically linked built-in is never loaded through this path, so it cannot be unloaded:
         // the C answers `{error, linked_in_driver}` (`erl_bif_ddll.c:545-547`).
-        if is_static_driver(&name) {
+        if driver::is_static_driver(&name) {
             return self.ddll_error_atom("linked_in_driver");
         }
         if !driver::forget_driver(&name) {
@@ -190,7 +177,7 @@ impl RuntimeContext<'_> {
         };
         // A statically linked built-in takes the C's `handle == NULL` item branch, whatever the
         // loaded list holds (`erl_bif_ddll.c:728,743,752,775`).
-        if is_static_driver(&name) {
+        if driver::is_static_driver(&name) {
             return self.ddll_static_info(&item);
         }
         // An unknown driver name is `badarg` whatever the item is — the item is resolved against a
@@ -376,7 +363,7 @@ mod tests {
     /// (`erl_bif_ddll.c:281-285`), for the charlist and the atom name form alike.
     #[test]
     fn try_load_of_a_static_driver_is_linked_in_driver() {
-        for name in STATIC_DRIVERS {
+        for name in driver::static_drivers() {
             let mut runtime = runtime();
             let path = chars(&mut runtime, "x");
             let driver_name = chars(&mut runtime, name);
@@ -404,7 +391,7 @@ mod tests {
     /// `{error, linked_in_driver}` (`erl_bif_ddll.c:545-547`).
     #[test]
     fn try_unload_of_a_static_driver_is_linked_in_driver() {
-        for name in STATIC_DRIVERS {
+        for name in driver::static_drivers() {
             let mut runtime = runtime();
             let driver_name = chars(&mut runtime, name);
             let out = call(&mut runtime, "erl_ddll", "try_unload", &[driver_name, NIL])

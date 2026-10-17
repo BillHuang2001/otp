@@ -782,13 +782,17 @@ pub struct PortRegistry {
     registry: IoPortRegistry,
     /// The `port_info/1` metadata, keyed by port number.
     meta: HashMap<u64, PortMeta>,
-    /// The **built-in** driver factories a `{spawn_driver, Name}` port is resolved against
-    /// **before** any `dlopen` — the Rust analogue of the C `driver_tab.c`'s statically linked
-    /// drivers (`fd`, `efile`, `tcp_inet`; see [`beam_io::DriverRegistry::with_builtins`]).
+    /// The **statically linked emulator** driver factories a `{spawn_driver, Name}` port is
+    /// resolved against **before** any `dlopen` — the Rust analogue of the C `driver_tab.c` table
+    /// ([`beam_io::DriverRegistry::with_static_spawn_drivers`], exactly
+    /// [`beam_io::STATIC_SPAWN_DRIVERS`]).
     ///
-    /// Built **once**, when this registry is constructed, so an `open_port/2` only does a hash
-    /// lookup here; a name that misses falls through to the `.so` loader exactly as before.
-    builtin_drivers: DriverRegistry,
+    /// Built **once**, when this registry is constructed, so an `open_port/2` only asks for a
+    /// factory here. The membership gate is [`beam_io::is_static_spawn_driver`], **not** this
+    /// table: `beam_io`'s internal `fd`/`efile` drivers are emulator-internal and the oracle refuses
+    /// `open_port({spawn_driver,"fd"}, …)` with `badarg`, so a non-static name never reaches this
+    /// table — it falls through to the `.so` loader exactly as before.
+    static_spawn_drivers: DriverRegistry,
     /// The arena a `port_info/1` result is built on.
     ///
     /// `port_info/1` hands its `{Item, Value}` pairs to `beam_bifs`, which copies them into
@@ -858,7 +862,7 @@ impl PortRegistry {
             poller: Poller::new()?,
             registry: IoPortRegistry::new(),
             meta: HashMap::new(),
-            builtin_drivers: DriverRegistry::with_builtins(),
+            static_spawn_drivers: DriverRegistry::with_static_spawn_drivers(),
             heap: Heap::new(PORT_HEAP_WORDS)?,
             io_counters: Rc::new(IoCounters::default()),
             watch: watch::SignalWatch::new(),
@@ -870,16 +874,22 @@ impl PortRegistry {
         })
     }
 
-    /// Constructs the **built-in** driver registered under `name`, or `None` when `name` names no
-    /// built-in (so the caller falls through to the `.so` loader).
+    /// Constructs the **statically linked emulator** driver named `name`, or `None` when `name` is
+    /// not one of them (so the caller falls through to the `.so` loader).
     ///
-    /// The `Some` wraps the factory's own `Result`: a **registered** built-in whose construction
-    /// fails (say a descriptor the OS refuses) is reported as that typed failure — never a
-    /// fabricated port — and is distinct from `None`, meaning "no such built-in at all".
-    fn create_builtin_driver(&self, name: &str) -> Option<Result<Box<dyn Driver>>> {
-        self.builtin_drivers
-            .contains(name)
-            .then(|| self.builtin_drivers.create(name))
+    /// The membership test is [`driver::is_static_driver`] — `beam_io`'s emulator `driver_tab.c`
+    /// set — **not** "is a factory registered here": that distinction is the whole point. A name
+    /// outside the set is the oracle's `badarg` whatever this runtime can build, so `"fd"`/`"efile"`
+    /// (this crate's internal drivers, reachable through their own `{fd, N}`/`spawn` forms) and an
+    /// invented name take the `dlopen` route and fail there, exactly as the system runtime fails
+    /// them. [`beam_io::DriverRegistry::create_static_spawn`] applies that gate and then the factory
+    /// lookup.
+    ///
+    /// The `Some` wraps the factory's own `Result`: a **static** driver whose construction fails
+    /// (say a descriptor the OS refuses) is reported as that typed failure — never a fabricated
+    /// port — and is distinct from `None`, meaning "no such emulator driver at all".
+    fn create_static_spawn_driver(&self, name: &str) -> Option<Result<Box<dyn Driver>>> {
+        driver::is_static_driver(name).then(|| self.static_spawn_drivers.create_static_spawn(name))
     }
 
     /// The shared I/O byte counters behind `erlang:statistics(io)` (see [`IoCounters`]).
@@ -2551,16 +2561,18 @@ impl PortHook for RuntimePorts {
             // `dlopen` path builds its host from `self.atoms`/`self.owner`, which are not the
             // registry), so one borrow serves both.
             let mut registry = self.registry_mut()?;
-            // A **built-in** driver — a statically linked emulator driver such as `tcp_inet`
-            // (`erts/emulator/drivers/common/inet_drv.c:1348`) — is resolved against this runtime's
-            // own driver registry **before** any `dlopen`, exactly as the C resolves a name against
+            // A **statically linked emulator** driver — such as `tcp_inet`
+            // (`erts/emulator/drivers/common/inet_drv.c:1348`) — is resolved against
+            // `beam_io`'s static set **before** any `dlopen`, exactly as the C resolves a name against
             // its loaded-driver list (`io.c:599-628`), so `open_port({spawn_driver,"tcp_inet"},_)`
-            // opens a real port rather than failing to load a `.so` that does not exist. Its bytes
-            // arrive through the poller-registered descriptor on the port-task round (not a C
-            // driver's inline `output` callback), so it is recorded as
+            // opens a real port rather than failing to load a `.so` that does not exist. The gate is
+            // `beam_io::is_static_spawn_driver`, so an emulator-internal name (`fd`, `efile`) or an
+            // invented one is *not* a hit: it takes the `dlopen` route below and ends as the oracle's
+            // `badarg`. Its bytes arrive through the poller-registered descriptor on the port-task
+            // round (not a C driver's inline `output` callback), so it is recorded as
             // [`PortName::SpawnDriverBuiltin`] — a driver port for `port_control`, but not for
             // [`PortRegistry::take_driver_outputs`].
-            if let Some(created) = registry.create_builtin_driver(&driver_name) {
+            if let Some(created) = registry.create_static_spawn_driver(&driver_name) {
                 let driver = created?;
                 let meta = PortMeta {
                     command: spec.command,

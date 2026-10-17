@@ -434,16 +434,15 @@ fn loaded_names(runtime: &mut Runtime) -> Vec<String> {
         .collect()
 }
 
-/// The three statically linked built-in drivers every `loaded_drivers/0` answer starts with,
-/// in the oracle's order (`erl_bif_ddll.c:728`; the C `driver_list` entries with `handle == NULL`).
-const STATIC_DRIVERS: [&str; 3] = ["tcp_inet", "udp_inet", "ram_file_drv"];
-
-/// `loaded_drivers/0`'s expected value: the three statics first, then `dynamic` in load order.
+/// `loaded_drivers/0`'s expected value: the statics first — in the order the runtime's own
+/// `erl_ddll` floor derives from `beam_io`'s static set
+/// ([`static_drivers`](super::static_drivers), the C's generated `driver_tab.c` order) — then
+/// `dynamic` in load order.
 fn expect_loaded(dynamic: &[&str]) -> Vec<String> {
-    STATIC_DRIVERS
-        .iter()
-        .chain(dynamic.iter())
-        .map(|s| (*s).to_string())
+    super::static_drivers()
+        .into_iter()
+        .chain(dynamic.iter().copied())
+        .map(str::to_string)
         .collect()
 }
 

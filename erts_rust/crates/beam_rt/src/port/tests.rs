@@ -41,10 +41,10 @@ const OWNER: ProcessId = ProcessId::new(7, 0);
 /// The atom table is interned **before** the provider takes its handle: the handle is
 /// an `Rc` clone, so mutating the table afterwards would fork it (see the module docs).
 pub(super) struct Fixture {
-    registry: Rc<RefCell<PortRegistry>>,
-    atoms: Rc<AtomTable>,
-    hook: RuntimePorts,
-    heap: Heap,
+    pub(super) registry: Rc<RefCell<PortRegistry>>,
+    pub(super) atoms: Rc<AtomTable>,
+    pub(super) hook: RuntimePorts,
+    pub(super) heap: Heap,
 }
 
 /// The vocabulary the tests build `Name`/`Options` terms out of, and the item atoms.
@@ -174,7 +174,7 @@ pub(super) fn text_of(term: Eterm) -> String {
 ///
 /// [`BeamError`] is not `PartialEq` (it carries an owned message and a live BEAM reason
 /// term), so the check is a `matches!` rather than an `assert_eq!`.
-fn assert_badarg<T: std::fmt::Debug>(result: Result<T>) {
+pub(super) fn assert_badarg<T: std::fmt::Debug>(result: Result<T>) {
     assert!(
         matches!(result, Err(BeamError::BadArg)),
         "expected badarg, got {result:?}"
