@@ -423,6 +423,35 @@ constructors only (no new error enum).
   half does. `Nursery::contains` is unchanged (`spaces().any(|s| s.contains(ptr))`), so the aggregate can
   never make it inexact. Why the reserved extent and not the live `top()`: `top()` moves on every allocation,
   which would invalidate a cached bound immediately, and the filter only ever rejects.
+- **No tightening of the aggregate is worth implementing — the reject arm already fires, and the addresses
+  that fall through are the *scanned* ones.** Measured on the real host geometry
+  (`beam_rt`'s `gc/valve_bounds.rs::the_aggregate_span_is_reported_for_both_collector_kinds`, word counts):
+  fresh copying **469** span vs **466** union (3-word hole), fresh immix **2284** vs **2281**, grown **848**
+  / **2662** (5–6-word hole), post-collection **2167** (copying: 90-word nursery + 233-word mature = 323
+  union) and **3982** (immix: 90 + 2048 = 2138) — i.e. the covering equals the union to within one block
+  *except* after a collection, where the re-installed nursery lands ~1844 words (≈14 KB) away from the
+  mature space on both strategies. So a per-space ordered interval list or a nursery-vs-mature split can only
+  gain in that post-collection geometry, and there it is a **lateral** trade, not a win: the population at the
+  call site that falls through tier one is mature- and retired-space pointers, which **every** interval shape
+  must fall through on (they are scanned; `may_contain` is a reject filter by contract), so tightening costs
+  2–4 extra compares on each of them to reject only the foreign addresses that happened to land in the hole.
+  A **sound** fast-*accept* on the mature half would need `AnyCollector::kind()` (the copying space's
+  `[base, top)` is exactly its from-set; the mark-region's is over-inclusive) — a different design from
+  `ScannedBounds`, and its ceiling is the valve's total cost, which `beam_rt`'s `perf` record puts at
+  **≈0.4 % of samples** (`root_is_unscanned` 0.39 %, `Nursery::contains` 0.043 %) with the valve declining
+  **zero** collections on the profiled workload.
+- **`ScannedBounds` acquisition, not its test, is what an optimization should attack.** `Collector::
+  scanned_bounds`/`GenImmixCollector::scanned_bounds` build the value per call (nursery `extent` copy + the
+  mature `base`/`limit` pair + `min`/`max` + a generation `saturating_add`), and `beam_rt::context::gc::
+  outside_scanned` re-reads it **per reference word**, so the two compares of `may_contain` are the cheap half
+  and the per-word acquisition is the bulk of the reject arm. Hoisting one read per walk (a `ScannedBounds`
+  parameter, not a signature change here) is the cheap lever — owner: `beam_rt`.
+  Per-space maintenance itself is free: `Nursery::retired_regions` (`BTreeMap<base, top>`) already **is** the
+  ordered per-space interval list (insert on `grow`, `clear` on `collapse`, `top` frozen on retire), the
+  chain is length 1 in production (`peak_spaces = 1`), and the epoch already advances at exactly the three
+  events a per-space list changes at — so an `epoch` stays sufficient for cache validity; only the mature half
+  is missing from the index. The interval is nevertheless **not monotone** across a collection, so a caller
+  caching the *value* (rather than re-reading it) gains nothing.
 - **The minor→major escalation test is a CAPACITY test on the nursery's occupancy, and for the
   `gc_bound/churn` shape every escalation it takes is genuine.** `Collector::collect` escalates whenever
   `mature.available_words() < nursery.used_words()`; `tests/churn_attribution.rs` records the escalation's own
