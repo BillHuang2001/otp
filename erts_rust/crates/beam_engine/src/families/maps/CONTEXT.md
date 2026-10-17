@@ -157,7 +157,8 @@ Verified against the system `erlc` (OTP 29) disassembly:
   `maps: no 'function_clause' atom in the module` (`:272`, `:300`).
 
 
-  the two expected strings must become `maps: no 'function_clause' atom in the module` (the module in
+  Both read instructions' `no_fail` cases now surface the bare atom `function_clause` (class `error`);
+  an unseeded module surfaces the missing-atom typed gap instead (pinned at `tests/gaps.rs:272`/`:300`).
   <!-- -->
 ## Notes for Agents
 - To make the tags nameable for **any** host (not just a seeding one), the engine would need
