@@ -38,11 +38,13 @@
 //!    accumulator for the whole loop. Its three elements are small integers, so the tuple
 //!    forwards no scanned word. The loop must still collect, and collect **more** the longer it
 //!    runs.
-//! 2. **The count is a derived quantity, not a range.** The measured table (see
-//!    [`counter_table`]) is an exact affine relation in `N` — every iteration's abandoned
-//!    allocation fills the nursery at a constant rate — so the tests pin the **exact** count at
-//!    each measured `N` (the style `src/runner/tests.rs`'s `counter_table` uses for its own
-//!    growth shapes).
+//! 2. **The count is a derived quantity, not a range.** Every iteration of the loop reserves
+//!    exactly [`WORDS_PER_ITERATION`] words for `junk/1`'s abandoned term, so a
+//!    [`EMULATOR_MIN_HEAP_WORDS`]-word nursery holds [`ITERATIONS_PER_COLLECTION`] of them and the
+//!    run's collection count follows the **exact** fill law [`collections_law`] —
+//!    `(N + `[`FILL_OFFSET`]`) / `[`ITERATIONS_PER_COLLECTION`]. Every measured `N` pins that exact
+//!    count (the style `src/runner/tests.rs`'s `counter_table` uses for its own growth shapes);
+//!    no measured row needs the slack a boundary collection could add, see [`collections_law`].
 //! 3. **Memory stays bounded.** The process's `heap_size` (the nursery chain's capacity, the
 //!    number `process_info(self(), heap_size)` reports) is flat in `N`: it sits at one of two
 //!    collector-geometry plateaus, never on a curve.
@@ -88,9 +90,16 @@ use beam_term::{is_small, make_small, signed_value};
 /// The committed fixture: `hold/1` (the loop that keeps the BIF-heap statistics tuple live) and
 /// `control/1` (the same loop with an integer accumulator).
 const VP_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vp.beam");
-/// The iteration counts each measured shape is driven at: a 20× span, so a count that is
-/// *constant* in `N` (the frozen pre-fix behaviour) cannot be mistaken for a count that grows.
-const COUNTS: [i64; 3] = [5_000, 10_000, 100_000];
+/// The iteration counts each measured shape is driven at. A 20× span, so a count that is
+/// *constant* in `N` (the frozen pre-fix behaviour) cannot be mistaken for a count that grows;
+/// every row is a **multi-slice** run (2, 2, 3, 8 and 26 scheduler slices), so the sample-based
+/// heap assertions below always have a live process to read; and `N = 7 000` / `30 000` are the
+/// rows whose remainder modulo [`ITERATIONS_PER_COLLECTION`] makes the [`FILL_OFFSET`] observable
+/// (`7 006 / 17 = 412` against `7 000 / 17 = 411`, `30 006 / 17 = 1 765` against `30 000 / 17 =
+/// 1 764`), so the phase term is load-bearing rather than absorbed by the floor — the three
+/// original counts (`5 000`, `10 000`, `100 000`, remainders 2 / 4 / 6) all happen to sit on the
+/// same floor with or without it.
+const COUNTS: [i64; 5] = [5_000, 7_000, 10_000, 30_000, 100_000];
 /// What a release build's `process_info(P, heap_size)` may report over a whole run: the
 /// collector's two nursery-capacity plateaus, 233 words (the emulator's `min_heap_size`) and
 /// 843 words (that plus a grown space), measured at every slice boundary of every run below.
@@ -209,28 +218,32 @@ fn decode_result(value: beam_term::Eterm, function: &str, n: i64) -> (i64, i64) 
     }
     (ints[0], ints[1])
 }
-/// Runs one shape at three increasing iteration counts (a **fresh** runtime each time, so every
-/// row is a per-run delta) and prints the counter table; every counter is reported so a reader
-/// needs no access to this source to read the numbers.
-fn counter_table(function: &str, counts: [i64; 3]) -> [(i64, LoopRun); 3] {
-    let rows = counts.map(|n| {
-        let mut rt = runtime_with_fixture().expect("the fixture runtime");
-        let row = run_loop(&mut rt, function, n);
-        assert_eq!(row.errors, 0, "no collection may fail: vp:{function}({n}) {row:?}");
-        assert!(
-            !rt.gc_stats().disabled,
-            "the global GC valve must stay closed: vp:{function}({n})"
-        );
-        (n, row)
-    });
+/// Runs one shape at each iteration count in `counts` (a **fresh** runtime each time, so every row
+/// is a per-run delta) and prints the counter table; every counter is reported — including the
+/// fill law's prediction and the measured surplus over it — so a reader needs no access to this
+/// source to read the numbers.
+fn counter_table(function: &str, counts: &[i64]) -> Vec<(i64, LoopRun)> {
+    let rows: Vec<(i64, LoopRun)> = counts
+        .iter()
+        .map(|n| {
+            let mut rt = runtime_with_fixture().expect("the fixture runtime");
+            let row = run_loop(&mut rt, function, *n);
+            assert_eq!(row.errors, 0, "no collection may fail: vp:{function}({n}) {row:?}");
+            assert!(
+                !rt.gc_stats().disabled,
+                "the global GC valve must stay closed: vp:{function}({n})"
+            );
+            (*n, row)
+        })
+        .collect();
     eprintln!(
         "counter_table vp:{function} (N : collections major fallbacks errors slices \
-         peak_heap peak_used returned | collections/N)"
+         peak_heap peak_used returned | law surplus)"
     );
     for (n, row) in &rows {
         eprintln!(
             "counter_table vp:{function} N={n} : collections={} major={} fallbacks={} \
-             errors={} slices={} peak_heap={} peak_used={} returned={:?} | collections/N={:.6}",
+             errors={} slices={} peak_heap={} peak_used={} returned={:?} | law={} surplus={}",
             row.collections,
             row.major,
             row.fallbacks,
@@ -239,38 +252,73 @@ fn counter_table(function: &str, counts: [i64; 3]) -> [(i64, LoopRun); 3] {
             row.peak_heap_size,
             row.peak_used,
             (row.returned_collections, row.returned_heap_size),
-            row.collections as f64 / *n as f64,
+            collections_law(*n),
+            row.collections as i64 - collections_law(*n) as i64,
         );
     }
     rows
 }
-/// The collection count each shape must report at a measured `N`, derived from the measured
-/// table and pinned exactly.
+/// The words one iteration of the loop's body reserves — and uses — on the process heap.
 ///
-/// **The derivation (not a fitted curve).** Every iteration builds the same abandoned term
-/// (`vp:junk/1`: a 3-tuple holding a 3-element list and a 2-tuple) on the process's own young
-/// heap, and the compiler's `test_heap 13 3` reserves exactly **13 words** for it. A fresh
-/// process's nursery holds [`EMULATOR_MIN_HEAP_WORDS`] = **233** words
-/// (`Process::collector().heap_size_words()`, the emulator's `min_heap_size`), and 17
-/// iterations of 13 words fill 221 of them while an 18th (234) would not fit — so a collection
-/// runs every **17** iterations, and the run's count is `N / 17` with **no** additive offset
-/// (the measurement starts from a freshly spawned process, whose collector counters are taken
-/// before its first allocation; `Runtime::gc_stats()` is cumulative for the whole node, so the
-/// per-run figure is the delta across the run).
+/// Read off the fixture's own Erlang assembly (`erlc +deterministic`; the recipe is in
+/// `tests/fixtures/README.md`): `vp:junk/1` emits `test_heap,13,3` and then exactly three
+/// `put_list` and two `put_tuple2` instructions, i.e. three 2-word cons cells (6 words) + the
+/// 2-tuple `{N, N+1}` (1 header + 2 = 3) + the 3-tuple `{N, [N, N+1, N+2], {N, N+1}}` (1 header +
+/// 3 = 4) = **13 words**, `test_heap`'s reserve being exactly that use. Every element is a small
+/// integer, hence an immediate, so nothing else is heap resident: `erlang:statistics/1`'s result is
+/// built on the pooled BIF heap, and `control/1`'s `element/2` read allocates nothing at all.
+const WORDS_PER_ITERATION: u64 = 13;
+/// The nursery capacity a fresh process is created with — the emulator's `min_heap_size` in words
+/// (`Process::collector().heap_size_words()` on a just-spawned process), and the geometry the fill
+/// law is derived from.
+const EMULATOR_MIN_HEAP_WORDS: u64 = 233;
+/// How many loop iterations one nursery space holds — **derived**, not fitted:
+/// `233 / 13 = 17.9`, so 17 iterations consume 221 of the 233 words while an 18th (234) would not
+/// fit. A collection therefore falls on every 17th iteration, and that the rate really is the
+/// space's capacity and not something larger also proves the space is **drained** each cycle: a
+/// collection that kept more than `233 - 221 = 12` words live would hold fewer iterations.
+const ITERATIONS_PER_COLLECTION: u64 = EMULATOR_MIN_HEAP_WORDS / WORDS_PER_ITERATION;
+/// The measured **phase offset** of the fill law, in iterations — the loop's *first* cycle is
+/// `FILL_OFFSET` iterations short of the steady-state 17, because the nursery a freshly spawned
+/// process arrives with already carries its entry frame and stack. Pinned directly by
+/// `the_fill_law_holds_and_its_phase_is_the_entry_frame` (the loop collects `0` times at `N = 10`
+/// and `1` time at `N = 11`, so the first collection lands on iteration
+/// `ITERATIONS_PER_COLLECTION - FILL_OFFSET` = 11).
+const FILL_OFFSET: u64 = 6;
+/// The collection count one measured run of either shape must report at `N` — the **exact** fill
+/// law, `(N + `[`FILL_OFFSET`]`) / `[`ITERATIONS_PER_COLLECTION`]`.
 ///
-/// That reproduces all six measured rows exactly at `N = 5 000 / 10 000 / 100 000` — none of
-/// which is a multiple of 17, so the integer division's floor is pinned too — and it is the
-/// relation a foreign root that declined collections, or a heap that stopped draining, breaks
-/// at one `N` but not the other. (A CLI run of the same fixture reports the same slope with the
-/// node's own start-up collections as a constant offset, which is why only the **per-run**
-/// delta is a clean `N / 17`.)
-const COLLECTIONS_PER_ITERATIONS: u64 = 17;
-/// The nursery capacity a fresh process is created with — the emulator's `min_heap_size` in
-/// words, and the geometry that turns [`COLLECTIONS_PER_ITERATIONS`] into a per-iteration rate.
-const EMULATOR_MIN_HEAP_WORDS: usize = 233;
-/// `N / COLLECTIONS_PER_ITERATIONS` — the derived collection count of one measured run.
-fn collections_slope(n: i64) -> u64 {
-    (n as u64) / COLLECTIONS_PER_ITERATIONS
+/// # The derivation
+///
+/// * **The rate is arithmetic.** Each iteration reserves exactly [`WORDS_PER_ITERATION`] = 13 words
+///   for the abandoned `junk/1` term, and the fresh process's nursery is
+///   [`EMULATOR_MIN_HEAP_WORDS`] = 233 words, so one space absorbs
+///   [`ITERATIONS_PER_COLLECTION`] = `233 / 13` = 17 iterations (`17 × 13 = 221 ≤ 233 < 234 =
+///   18 × 13`). Every steady-state cycle is exactly that many iterations long.
+/// * **The phase is the entry frame.** The space does not start empty — the spawned process's
+///   entry frame and stack are already on it — so the first cycle is short. Measured, not guessed
+///   (`the_fill_law_holds_and_its_phase_is_the_entry_frame` pins both sides of the boundary): the
+///   first collection lands on **iteration 11**, which is what the `+ `[`FILL_OFFSET`]` term
+///   encodes.
+/// * **Nothing else contributes.** The reduction/yield-boundary collection door
+///   (`src/context/gc/reds_door.rs`) could in principle add a collection at a slice boundary that
+///   the heap-admission points would not have run — that is what makes a per-`slices` sandwich the
+///   natural fallback. It does not here: at its 7/8 watermark a boundary collection needs ≥ 204 of
+///   the 233 words used, a depth this loop only reaches inside the very fill an admission point is
+///   about to complete anyway, so a boundary collection can only *coincide* with a cycle and never
+///   steal one. Measured surplus over the law is **0** at every surveyed `N`, so the law is exact
+///   well beyond the one-slice regime and no sandwich term is needed.
+///
+/// # Verified against 71 measured rows, all exact (surplus 0)
+///
+/// `N = 1 … 40` (both sides of every cycle boundary, so [`FILL_OFFSET`] is pinned), `N =
+/// 1 000 … 1 034`, `N = 100 000 … 100 010`, `N = 200 000` and `N = 500 000` (126 slices), plus the
+/// 13-point ladder `1 000 / 2 000 / 3 000 / 5 000 / 7 000 / 10 000 / 15 000 / 20 000 / 30 000 /
+/// 50 000 / 70 000 / 100 000 / 130 000` (up to 33 slices) — every residue class modulo 17 in both
+/// the one-slice and the multi-slice regime. This is the relation a foreign root that declined
+/// collections, a heap that stopped draining, or a boundary collection that stole a cycle breaks.
+fn collections_law(n: i64) -> u64 {
+    (n as u64 + FILL_OFFSET) / ITERATIONS_PER_COLLECTION
 }
 /// **The headline evidence: a loop holding a BIF-heap (foreign) term still collects, more the
 /// longer it runs, on a bounded heap.**
@@ -282,31 +330,40 @@ fn collections_slope(n: i64) -> u64 {
 /// never opens, and the counts must be exactly what the scanned control sees.
 #[test]
 fn a_loop_holding_the_foreign_statistics_tuple_keeps_collecting() {
-    let rows = counter_table("hold", COUNTS);
-    let [(n1, r1), (n2, r2), (n3, r3)] = rows;
+    let rows = counter_table("hold", &COUNTS);
     // The collector really ran, and it ran more the longer the loop ran: the pre-fix behaviour
     // (the foreign root latching collection off) reports the run's start-up count at every N.
-    assert!(r1.collections > 0, "vp:hold must collect at all: {r1:?}");
     assert!(
-        r1.collections < r2.collections && r2.collections < r3.collections,
-        "the collection count must grow with N (N={n1} → {}, N={n2} → {}, N={n3} → {})",
-        r1.collections,
-        r2.collections,
-        r3.collections,
+        rows[0].1.collections > 0,
+        "vp:hold must collect at all: {:?}",
+        rows[0].1
     );
-    // ... and it grows *linearly*, at the derived rate: exactly one collection every
-    // COLLECTIONS_PER_ITERATIONS iterations, at every measured N.
-    for (n, row) in rows {
+    for pair in rows.windows(2) {
+        let (n_a, a) = pair[0];
+        let (n_b, b) = pair[1];
+        assert!(
+            a.collections < b.collections,
+            "the collection count must grow with N (N={n_a} → {}, N={n_b} → {})",
+            a.collections,
+            b.collections,
+        );
+    }
+    // ... and it grows at exactly the derived rate, with exactly the derived phase: the nursery
+    // holds ITERATIONS_PER_COLLECTION (233 / 13) iterations of `junk/1`'s allocation, and the
+    // first cycle is FILL_OFFSET iterations short because the spawned process's entry frame is
+    // already in the space (see `collections_law`).
+    for (n, row) in &rows {
         assert_eq!(
             row.collections,
-            collections_slope(n),
-            "collections must be N/{COLLECTIONS_PER_ITERATIONS} at N={n} \
-             ({EMULATOR_MIN_HEAP_WORDS} nursery words / 13 words per iteration): {row:?}"
+            collections_law(*n),
+            "collections must be (N + {FILL_OFFSET}) / {ITERATIONS_PER_COLLECTION} at N={n} \
+             ({EMULATOR_MIN_HEAP_WORDS} nursery words / {WORDS_PER_ITERATION} words per \
+             iteration): {row:?}"
         );
     }
     // The heap stays bounded: a flat capacity, never a curve in N. (The pre-fix run's
     // `heap_size` climbed to 318 037 words at N = 10 000 and 2 032 432 at N = 100 000.)
-    for (n, row) in rows {
+    for (n, row) in &rows {
         assert!(
             row.peak_heap_size > 0 && row.peak_heap_size <= HEAP_SIZE_BOUND_WORDS,
             "the heap must stay on its geometry plateau at N={n} (peak {} words, bound \
@@ -321,7 +378,7 @@ fn a_loop_holding_the_foreign_statistics_tuple_keeps_collecting() {
     }
     // The run really was the loop (it terminated and returned the loop's value), and every
     // allocation stayed on the process's own young heap — no arena fallback, i.e. no decline.
-    for (n, row) in rows {
+    for (n, row) in &rows {
         assert_eq!(
             row.fallbacks, 0,
             "an inert foreign root must not decline a collection at N={n}: {row:?}"
@@ -336,6 +393,35 @@ fn a_loop_holding_the_foreign_statistics_tuple_keeps_collecting() {
         );
     }
 }
+/// **The fill law's phase, pinned directly: the first collection lands on iteration 11.**
+///
+/// The rate of [`collections_law`] is arithmetic (`233 / 13 = 17` iterations per nursery space);
+/// its `+ `[`FILL_OFFSET`]` phase is the one measured constant, and this test measures it where it
+/// is unambiguous, in the one-slice regime where no boundary collection can be involved. The loop
+/// collects `0` times up to `N = 10` and `1` time from `N = 11` on: the first space fills after 11
+/// iterations (11 × 13 = 143 words) because the process arrives with its entry frame already in it
+/// (the `u0` that satisfies `u0 + 11 × 13 + 13 > 233 ≥ u0 + 10 × 13 + 13` is 78 … 90 words), so
+/// the first cycle is `ITERATIONS_PER_COLLECTION - 11 = `[`FILL_OFFSET`] iterations short — which
+/// is exactly the `+ FILL_OFFSET` phase term, with `(N + 6) / 17` reproducing every row below
+/// including both sides of the next cycle boundary (`N = 27` → 1, `N = 28` → 2).
+#[test]
+fn the_fill_law_holds_and_its_phase_is_the_entry_frame() {
+    // (N, the collections the law predicts and the run must report)
+    let ladder: [(i64, u64); 5] = [(0, 0), (10, 0), (11, 1), (27, 1), (28, 2)];
+    for (n, expected) in ladder {
+        // The law's own prediction, so the table above cannot drift from `collections_law`.
+        assert_eq!(collections_law(n), expected, "the law at N={n}");
+        let rows = counter_table("hold", &[n]);
+        let (_, row) = rows[0];
+        assert_eq!(
+            row.collections,
+            expected,
+            "vp:hold({n}) must collect exactly {expected} time(s): the first space fills on \
+             iteration {first}, then every {ITERATIONS_PER_COLLECTION} iterations: {row:?}",
+            first = ITERATIONS_PER_COLLECTION - FILL_OFFSET,
+        );
+    }
+}
 /// **The control: the foreign root costs exactly nothing.**
 ///
 /// `vp:control/1` is the same loop with an integer accumulator (`element(1, ...)`), so no
@@ -344,8 +430,8 @@ fn a_loop_holding_the_foreign_statistics_tuple_keeps_collecting() {
 /// the signal that the valve classified the statistics tuple as a hazard.
 #[test]
 fn the_foreign_held_loop_matches_its_scanned_control() {
-    let held = counter_table("hold", COUNTS);
-    let control = counter_table("control", COUNTS);
+    let held = counter_table("hold", &COUNTS);
+    let control = counter_table("control", &COUNTS);
     for ((n, held), (_, control)) in held.into_iter().zip(control) {
         assert_eq!(
             (held.collections, held.major, held.fallbacks, held.errors),
