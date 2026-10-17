@@ -1,4 +1,4 @@
-# `beam_message` — Measured: per-send copy cost (single-pass vs the gate-locked two-traversal path)
+# `beam_message` — Measured: per-send copy cost (single-pass copy, the fix-up worklist, the shared-term test)
 
 The measurement artifact for the `beam_message` PERF change that relaxed the copy engine's
 single-pass fast-path gate from a **clean destination** (`Heap::used() == 0` **and** an empty
@@ -132,33 +132,33 @@ prefer ratios.
 
 ## 5. What remains (cross-crate — reported, **not** fixed here)
 
-The `send_recv` workload is **54.7×** the system-ERTS oracle — 79 518.12 ns/op (default tier) /
-36 969 (interpreter) vs 1 453.98 (`erts_rust/tools/bench/RESULTS.md` §8, lines ≈ 247 / 291 / 477 /
-492). The table above shows the `beam_message` copy share of that is **≈ 350–400 ns/op, i.e. ≈ 0.5 %**
-of 79.5 µs (the exact payload's `send` path, including the off-heap drain and the `Message` build).
-Even a free copy would leave the workload at ~79 µs/op. **The residual is not in this crate.** Its
-sources are, with exact paths:
+The `copy_bound` `send_recv` workload is **5.26×** the system-ERTS oracle and `send_recv_plain`
+**2.92×** (`erts_rust/tools/bench/RESULTS.md` m15: 7 696.8 vs 1 464.3 ns/op, and `../beam_rt/src/runner/CONTEXT.md`
+*Measured*: ≈ 1 943 ns/op rust vs 666.5 ns sys). This crate's share of `send_recv_plain` is the whole `send`
+for that payload — **≈ 210 ns in release** (§7), i.e. **≈ 11 %** of the per-op figure, so even a free copy
+leaves the workload at ≈ 1.73 µs/op. The residual is the sender/receiver schedule, owned by:
 
-* **`beam_process` — the delivery path.** `Process::copy_message`
-  (`erts_rust/crates/beam_process/src/process.rs` ~line 1528, the dirty young-heap destination above)
-  plus `Process::deliver` / `deliver_message` / `run_rooted_collection` and the mailbox + cursor
-  selective-receive scan in the same file. This is the largest single component and the natural next
-  target.
-* **`beam_rt` — the runner/scheduler glue.** The single-threaded `ProcessRunner`/scheduler loop and
-  the mailbox bridge under `erts_rust/crates/beam_rt/src/` that drive `beam_process` for the
-  `send`/`receive` in the workload.
-* **`beam_codec` — the ETF codec.** The `{SR}` case of `erts_rust/tools/bench/src/workloads/copy_bound.rs`
-  round-trips the payload through `term_to_binary`/`binary_to_term` (crates/beam_codec), which is
-  outside the copy path entirely and may well dominate the measured per-op time.
+* **`beam_rt` — the per-slice runner/pass work.** `../beam_rt/CONTEXT.md` and its
+  `src/runner/CONTEXT.md` *Measured* enumerate it: the engine moved out of/into a `HashMap` per slice, a
+  fresh `RuntimeContext` + `DispatchMemo` per slice, `ctx.enter_module`'s `String`, the park/resume root
+  publish, the receive-timeout timer heap, and the per-boundary wake sweep. That is where the two-process
+  gap lived: an allocation-door "decline circle" (29 923 arena fallbacks per 30 000 iterations), park
+  hand-offs that copied the 1024-word x file twice per iteration, unbounded register-file scans and a timer
+  tombstone leak — fixed there, taking `send_recv_plain` from 10 127 to ≈ 1 990 ns/op (**−80 %**).
+  An earlier revision of this section blamed a per-scheduler-pass **25 ms `std::thread::sleep`** and the
+  `PORT_POLL_SLICE` probe for that gap. **Refuted:** the run route is progress-aware and issues **0**
+  `clock_nanosleep` on a `send_recv`-shaped run, and `PORT_POLL_SLICE` is a non-destructive zero-timeout
+  probe (`../beam_rt/CONTEXT.md`).
+* **`beam_process` — the delivery path.** `Process::copy_message` (the dirty young-heap destination above),
+  `Process::deliver`/`deliver_message`/`run_rooted_collection`, and the mailbox + `QueueCursor`
+  selective-receive scan.
+* **`beam_codec` — the ETF codec**, for the `{SR}` case only: `tools/bench/src/workloads/copy_bound.rs`'s
+  `send_recv` round-trips the payload through `term_to_binary`/`binary_to_term`, which the `send_recv_plain`
+  case does not (that is what the 5.26× vs 2.92× split measures).
 
-**Suggested measurement for the parent to hand to those nodes:** re-run the bench driver's
-`copy_bound` `send_recv` workload against this crate (the JIT-tier regression noted in
-`erts_rust/tools/bench/RESULTS.md` §8 item 2 is a separate Rust-vs-Rust tier effect, unrelated), and
-instrument the `{SR}` case to time `term_to_binary`/`binary_to_term` separately from the send/receive
-round-trip so the `beam_codec` and `beam_process`/`beam_rt` shares can be split. A `beam_process`
-micro-benchmark mirroring `tests/send_perf.rs` (a payload sent to a second process and back, without
-the ETF round-trip) would isolate the delivery/scheduler cost from this crate's copy cost.
-
+**Measurement this crate can offer those nodes:** `tests/send_perf.rs` is that micro-benchmark already — a
+real `send` into a `words + 64`-word destination over five shapes, `taskset -c 3`-pinnable. Attribution of
+the remaining per-op cost must come from counters in `beam_rt`'s runner, not from this file.
 ## 6. Measured and reverted: the allocation-free fix-up work-stack
 
 The copy path's worklist is the per-call `Vec<Fixup>` in `src/copy.rs`. An allocation-free replacement
@@ -209,3 +209,41 @@ therefore justify it against **that** profile (where the crate ships) with relea
 not against the dev-profile figures this file records — and must keep the `Vec<Fixup>` baseline in the
 same A/B. Until then the `Vec<Fixup>` worklist ships: it is non-regressive in every measured shape and
 profile except the release payloads above, and this crate's benchmarked numbers are the dev ones.
+
+**A later release-profile A/B of the same idea** (`WORK_INLINE = 8`, `[MaybeUninit<Fixup>; 8]`, 0
+allocation events per `copy_struct` on every shape but the 64-key HAMT, deterministic counters
+confirming it) does **not** reproduce the inversion: against the `Vec<Fixup>` baseline at
+`/proc/loadavg` 17–23, `taskset -c 3`, 6 interleaved pairs, the `copy_bound` payload was *neutral*
+(best-of-20 000 187 vs 186 ns) and the `10-int list` was **17 % slower** (best 90 vs 76). An inline
+buffer of either size therefore does not ship; the allocation is not where the per-send cost is
+(§7 — removing a single tag test per object beats removing both allocations).
+
+## 7. Measured and shipped: no shared-term re-test on the worklist pop path
+
+A fix-up is only ever recorded for a child `push_fixup` has already proven **not** shared, so the copy
+loop's pop side was re-deriving what `shallow` recomputes at its head. `shallow` keeps that guard for
+the two root calls; the loops call `shallow_unshared` — one `is_shared` (four tag tests) less per copied
+object, no added state, no allocation change.
+
+**Controlled A/B.** Two pre-built `send_perf` binaries (`before` = the `Vec<Fixup>` loop calling
+`shallow`, `after` = the split), one process at a time, `taskset -c 3`, alternating sides,
+`/proc/loadavg` 17–24 throughout, release profile (`opt-level = 3`, `lto = "thin"` — the profile the
+crate ships). Median of the per-run means (`best` = median of the runs' best-of-20 000, ns/send):
+
+| shape (`clean` destination) | before mean / best | after mean / best | Δ mean | Δ best |
+|---|---|---|---|---|
+| small tuple (4 words) | 57.4 / 39 | 55.0 / 37 | −4.2 % | −5.1 % |
+| 10-int list (20 words) | 89.9 / 71 | 90.7 / 72 | +0.9 % (noise) | — |
+| 8 × 32-byte binaries (72 words) | 250.0 / 178 | 228.6 / 170 | −8.6 % | −4.5 % |
+| HAMT map, 64 keys (234 words) | 714.5 / 605 | 658.7 / 579 | −7.8 % | −4.3 % |
+| **`send_recv` payload (70 words)** | **234.5 / 188** | **210.4 / 181** | **−10.3 %** | **−3.7 %** |
+| `send_recv` payload, min over 6 pairs | 220.9 / 186 | 205.9 / 181 | −6.8 % | −2.7 % |
+
+Every one of the 6 interleaved payload pairs moved the same way (all `after` means below all `before`
+means), the three-run shapes agree on direction except the 10-int list, which is flat — the win scales
+with the number of copied objects, which is what the change removes work per. Deterministic counters are
+**unchanged** by it (2 blocks / 192 B per copy for the payload, 0 for the enqueue half — §6's work-stack
+would have taken that to 0 but was slower, above).
+
+**In per-op terms:** −24 ns on a ≈ 1 943 ns/op `send_recv_plain` round trip is ≈ 1 % of that workload, so
+this is a copy-path win, not a messaging-workload win; the workload's own residual is `beam_rt`'s (§5).
