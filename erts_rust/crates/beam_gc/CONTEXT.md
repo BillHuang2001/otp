@@ -751,7 +751,7 @@ constructors only (no new error enum).
 - `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` — the **slot-stable**
   off-heap list over off-heap refcounted large objects **and** refc binaries
 - `src/stats.rs` → `GcStats`; `src/error.rs` → `pub(crate)` GC allocation-failure constructors
-- `tests/` → the integration test files enumerated in **Test Strategy** above (each line gives the contract it pins), incl. `tests/containment_index.rs` (the indexed nursery range test)
+- `tests/` → the integration test files enumerated in **Test Strategy** above (each line gives the contract it pins), incl. `tests/containment_index.rs` (the indexed nursery range test), `tests/scanned_bounds.rs` (the aggregate fast-reject filter), `tests/immix_promotion_rollback.rs` (the placed-copy rollback) and `tests/churn_attribution.rs` (the churn shape's per-op counters)
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/
   `do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
