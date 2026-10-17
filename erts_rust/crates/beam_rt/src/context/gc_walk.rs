@@ -60,77 +60,79 @@
 //! The descent is `O(live objects)` and ran on *every* candidate collection, which made a
 //! long-lived allocating loop pay a full graph traversal per collection (see the
 //! [`any_root_is_unscanned`] caller). It is therefore gated: the caller passes `descend`, which it
-//! computes from the process's **foreign-reachability flag**
-//! ([`crate::runtime::gc::GcState`]). The flag is a **sticky, add-only** per-process bit, set by
-//! every event that can put a container from an unscanned region into the process's reachable
-//! graph (a registered-BIF result built outside the scanned region, the arena fallback of the
-//! allocation seams, the escape-store stabilisation, a delivered message / retained mailbox
-//! fragment, and a spawn's initial arguments or entry fun).
+//! computes from the process's **foreign-reachability bit**
+//! ([`crate::runtime::gc::GcState`]). The bit is opened by every event that can put a container
+//! from an unscanned region into the process's reachable graph (a registered-BIF / runtime-native
+//! / NIF result that forwards a scanned word, the arena fallback of the allocation seams, the
+//! escape-store stabilisation, a heap-fragment message delivery, and a spawn's initial arguments
+//! or entry fun) and it is **closed again** by a descent that ran over the process's *whole* root
+//! set and reached no foreign container at all ([`ValveVerdict::foreign_free`]).
 //!
 //! Soundness of the gate (this is the whole argument, and it is a *one-way* argument — a wrong
 //! `false` would resurrect the corruption the walk exists to prevent):
 //!
 //! * when `descend` is `false`, **phase 1 still runs**. A foreign container reachable at depth 1
-//!   is a root word, so phase 1 catches it exactly as it always did — the gate removes only the
-//!   *descent*, never the per-word classification.
+//!   is a root word, so phase 1 catches it — the gate removes only the *descent*, never the
+//!   per-word classification.
 //! * for the descent to matter, a foreign container must be reachable at depth ≥ 2, i.e. it must
 //!   be a **child of a scanned container**. A pointer to a foreign container can only be written
 //!   into a scanned container by code that *holds* that foreign container, and the only ways to
-//!   hold one are the events listed above — each of which sets the flag. A foreign container can
+//!   hold one are the events listed above — each of which opens the bit. A foreign container can
 //!   likewise only be a *root word* after one of those events put it there.
-//! * the flag is only ever **set**, never cleared while the process lives (and the per-process
-//!   entry is pruned only when the process itself is gone), so a flag observed `true` at one
-//!   collection stays `true` at every later one.
+//! * the only sound way to **close** the bit is therefore a proof that the process's reachable
+//!   graph holds no foreign container at all, which is precisely what a descent over its
+//!   complete root set answers when it comes back foreign-free.
 //!
-//! # Why there is no "close the latch again" fast path (analysed, **not** implemented)
+//! # Closing the gate again — the current rule, and its residual
 //!
 //! The descent's cost is its **invocation count**: the baseline JIT's `jit_test_heap` reaches the
 //! valve at roughly every heap test, so a real compile pays a walk per heap-admission point
-//! (hundreds of thousands of them — see [`seed_counters`]' measurement test). The obvious next
-//! step is therefore to *re-close* the per-pid latch after an exhaustive descent that found no
-//! foreign container, so a loop that settles into a foreign-free steady state pays the descent once
-//! instead of once per admission point.
+//! (hundreds of thousands of them — see [`seed_counters`]' measurement test). The bit is
+//! therefore cleared as soon as that is provable: [`ValveVerdict::foreign_free`] reports *"the
+//! descent ran and reached no container from a region the collector does not scan"*, and
+//! [`Runtime::close_foreign_reachable`](crate::runtime::Runtime) retires the pid's bit on it.
 //!
-//! **That is unsound as posed.** The refutation is one sentence: *a descent is exhaustive only over
-//! the roots it was handed, and one of the two callers does not have all of them.* The runner's park
-//! arm ([`process_roots_are_unscanned`]) and the collection gate ([`RuntimeCollectionGate`]) run for
-//! a process that is **not** the running one, whose `x`/stack/FR words are unpublished — and an
-//! *exempt* park ([`Process::has_unpublished_roots`], the `Wait` arm and a `Yield` whose slice ended
-//! with a live FR prefix) publishes **nothing at all** (`src/runner/run.rs::park_machine` returns
-//! early). Concrete counterexample:
+//! Two facts make that sound rather than merely plausible:
 //!
-//! 1. the process holds a container from an unscanned region (the bit opens) and stores it into a
-//!    scanned young tuple `T` held **only** in `x[1]`; no admission point has run since;
-//! 2. it parks on `receive` — an exempt park, so `x[1]` is not in the gathered roots;
-//! 3. a signal site (or the parked process's own `Process::deliver`) runs
-//!    [`RuntimeCollectionGate::declines_relocation`]: the descent sees the gathered roots only,
-//!    reaches nothing foreign, and (hypothetically) closes the bit;
-//! 4. the receiver resumes; `x[1] = T` is published at the next admission point, the bit is clear,
-//!    the descent is skipped — and the per-word phase classifies `T` as a *scanned* container, so
-//!    the collection proceeds and leaves the foreign container's child pointing into the evacuated
-//!    from-space.
+//! * **The bit is a hint, never a decision.** While it is open the valve descends; while it is
+//!   closed the always-run per-word phase still classifies every root word, so a foreign container
+//!   held *directly* by a root is caught either way.
+//! * **`foreign_free` is only reported for a walk that descended.** A walk that skipped the
+//!   descent (`descend == false`) can never claim the graph is foreign-free, so a caller cannot
+//!   clear the bit without having looked.
 //!
-//! What a sound version would need, and where each piece lives — **none of it in this file**:
+//! **The residual is the caller's root set, not the walk's answer.** A descent is exhaustive only
+//! over the roots it was handed, so a clear is sound only where the caller handed over the
+//! process's *complete* root set. Exactly two callers may: the full heap-admission doors
+//! (`super::gc::ensure_heap_full` and `super::gc::alloc_words_rooted`), which pass the executing
+//! machine's whole `RootSet` — every live x register, the whole Erlang stack and each register
+//! file at its pointer-bearing prefix. Every other valve call site hands over less and therefore
+//! **cannot** clear:
 //!
-//! * a "the descent saw the *whole* root set" bit, set only by the admission-point walks, whose
-//!   root set is the machine's published `RootSet` (`super::gc::ensure_heap*`) — a clear on any
-//!   other walk (the gate's, the park arm's) is the bug above;
-//! * the **clear site**: the latch itself is only an alias here ([`ForeignLatch`]); the real cell is
-//!   `crate::runtime::gc::GcState::foreign`, written by `Runtime::note_foreign_reachable`;
-//! * a **completeness proof for that writer**: every event that can put a foreign container into the
-//!   reachable graph must open the bit. Today the bit is *add-only*, so a missed event costs only a
-//!   descent; with a clear, a missed event is a memory-safety bug. The known suspects are the ones
-//!   `M1_GAPS.md`'s *GC-relocation hazards* roster names as pinned outside the root set — a
-//!   `beam_bifs` fast-path BIF's Rust-local accumulator, the BIF-result copy-out slot, the
-//!   `beam_engine` `PendingException` reason — an audit across `beam_bifs`/`beam_engine`;
-//! * an **ordering** guarantee: a set that happens while (or just before) the clear runs must not be
-//!   lost, i.e. the clear must be a compare-and-swap against the state the walk started from.
+//! * the narrow `ensure_heap` door (x prefix + stack, no FR file),
+//! * the runner's park arm ([`process_roots_are_unscanned`]), which runs for a process that is not
+//!   the running one — and an *exempt* park ([`Process::has_unpublished_roots`]) publishes **no**
+//!   roots at all, so its whole parked window stays relocation-exempt and its bit stays open,
+//! * the `beam_process` signal sites, whose [`RuntimeCollectionGate`] decision runs inside
+//!   `ProcessTable` with only the receiver's *gathered* roots.
 //!
-//! **Verdict: sound-but-cross-crate at best, and unsound as posed.** The pieces above are owned by
-//! `super::gc`, `src/runtime/gc.rs`, `src/runner/` and `beam_process`'s signal sites; nothing in
-//! this file can make the skip safe on its own, so it is deliberately **not** implemented here. What
-//! this file does own — the per-walk allocation — is fixed instead (see [`WalkScratch`]).
+//! A decline raised at one of those sites keeps the bit open until a full door proves otherwise,
+//! which costs descents and never a wrong result. A stale `true` is the intended
+//! failure direction.
+
+//! # What a decline does *not* prove
 //!
+//! A decline says "a collection of this process is unsound **now**, given the roots I was
+//! handed". It does not say the process's graph will always hold a hazard, and it is not a
+//! declaration of un-collectability: dropping the offending term and reaching a full admission
+//! door clears the bit again (see *Closing the gate again*), so a loop that stops holding a
+//! foreign container resumes collecting without any explicit bookkeeping. The converse — a
+//! foreign container of immediates — never declines at all, because nothing it forwards would be
+//! relocated (`super::gc::forwards_scanned_word`), which is what keeps a program holding a
+//! `make_ref/0` block or a pooled-BIF `erlang:statistics(garbage_collection)` tuple collectable
+//! (`crate::tests`' `foreign_root_loop` suite is the end-to-end witness).
+//!
+
 //! # The same valve installed as the `beam_process` collection gate
 //!
 //! The valve's host call sites — the three heap-admission points in [`super::gc`] and the

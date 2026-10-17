@@ -368,8 +368,11 @@ walks an ever-longer `spaces()` = `retired.chain(current)` through `root_is_unsc
 `Nursery::contains` on every admission. `beam_loader`'s `tag_literal_area`
 (`crates/beam_loader/src/literal.rs`, the safe form of the C load-time `erts_set_literal_tag`) tags
 the decoded literal area, so the walk recognizes these modules' constant literal-area binary as an
-off-heap literal rather than an unscanned container, the valve stays shut, and the retired chain
-stays collapsed instead of growing with the iteration count.
+off-heap literal — not a container in a region the collector does not scan at all
+(`context/gc.rs::word_region` answers `None` for a literal, which no relocation touches) — so the
+valve never declines, the descent latch stays closed, and the retired chain stays collapsed
+instead of growing with the iteration count. A constant payload a module *builds* would instead be
+a foreign container that forwards nothing scanned: also inert, so also collected.
 
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.
