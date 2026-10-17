@@ -426,12 +426,16 @@ the section to read them in.
     `from_spawn_opts`, convergence of both capacities, the per-op counters of the `gc_bound/churn` shape, and a
     system-`erl` cross-check that SKIPS LOUDLY when `erl` is absent.
   - **The nursery chain** — no-relocation growth (live terms keep their original address and no collection
-    runs), the indexed containment answered exactly at long chain lengths, retention/debt semantics, and a
-    bounded plateau under a grow-then-collect loop.
+    runs), the `max_heap_words` summed-cap refusal (a loop that grows to the limit ends in the typed error with the
+    nursery untouched, pinned through `Nursery` and through every collector door), the provably-empty-space
+    re-adoption (capacity and chain length unchanged, the reused base becomes current), the indexed containment
+    answered exactly (over a growth-built chain and over a directly installed one far longer than any reachable
+    growth), retention/debt semantics, and a bounded plateau under a grow-then-collect loop.
   - **The aggregate scanned bounds** — the safety property (a rejected address is in no scanned region, asserted
-    over every region neighbourhood at chain lengths 1/2/3/8/64/1024, for capped and differing-capacity chains,
-    both strategies and the `AnyCollector` forwarding), plus the aggregate's exactness and the epoch moving
-    exactly on growth/no-op growth/collapse/mature-replacement.
+    over every region neighbourhood at chain lengths 1/2/3/8 and the longest chain the budget allows — discovered,
+    never assumed, with a hard floor of 8 — for differing-capacity chains, both strategies and the `AnyCollector`
+    forwarding), plus the aggregate's exactness and the epoch moving exactly on
+    growth/no-op growth/re-adoption/collapse/mature-replacement.
   - **Immix** — geometry/allocation/mark/pin/evacuation/accounting, the break-even rule, the atomic promotion
     rollback (mutation-verified: replacing `rollback` with a no-op fails `tests/immix_promotion_rollback.rs` 4/4
     while `tests/immix_fragmentation.rs` still passes 5/5), the reclaim-first major ordering, region growth
