@@ -371,6 +371,78 @@ impl From<StreamType> for SpawnStream {
     }
 }
 
+/// How one driver output call splits the bytes it delivered into the legacy C's `hbuf`/`buf`
+/// halves.
+///
+/// The C has four output entry points, and its port-message builders
+/// (`deliver_read_message`, `erts/emulator/beam/io.c:3363`, and `deliver_vec_message`, `:3501`)
+/// always render the **header** bytes as list *elements* while the **data** bytes follow the
+/// port's stream bit (`ERTS_PORT_SFLG_BINARY_IO`), a `binary` for a `binary` port and further
+/// list elements for the default `list` one:
+///
+/// | the driver called | header | data | a `[binary]` port's `{data, D}` |
+/// |---|---|---|---|
+/// | `driver_output(buf, len)` | none | `buf` | `<<Data>>` |
+/// | `driver_output2(hbuf, hlen, NULL, 0)` | `hbuf` | none | `[H1..Hh]` — a **proper** list |
+/// | `driver_output2(hbuf, hlen, buf, len)` | `hbuf` | `buf` | `[H1..Hh\|<<Data>>]` |
+/// | `driver_output_binary(hbuf, hlen, bin, off, len)` | `hbuf` | `bin` | `[H1..Hh\|<<Data>>]` |
+///
+/// So a `binary` port does **not** always deliver a binary: the shape is a function of
+/// `(stream, split)`, never of the bytes themselves. The `list` stream is insensitive to the
+/// split — the header and the data are both list elements there.
+///
+/// A driver's reply is the interesting case in practice (`rfile_command`'s `numeric_reply` goes
+/// through `driver_output2` and its `DATA` reply through `driver_output_binary`,
+/// `erts/emulator/drivers/common/ram_file_drv.c:197-228,448-489`), while a byte-stream *read* —
+/// a child's stdout, an `fd` port — is header-less and therefore a binary.
+///
+/// [`beam_io`] currently folds each of those calls into one flat byte queue
+/// ([`beam_io::DriverContext::input`]), so every producer in this runtime reports
+/// [`StreamShape::Data`]; the port node's `CONTEXT.md` records that handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StreamShape {
+    /// `driver_output`: no header — every delivered byte is the driver's data.
+    #[default]
+    Data,
+    // The two header shapes have no producer in this runtime yet: [`beam_io`] folds every output
+    // call into one flat byte queue (`beam_io::DriverContext::input`), so the port layer cannot
+    // tell which call delivered a payload. They are kept — and pinned by `stream_shape_tests` —
+    // because they are what the message builder must render the moment the input channel carries
+    // the split (the handoff is recorded in this node's `CONTEXT.md`).
+    #[allow(dead_code)]
+    /// `driver_output2(hbuf, hlen, NULL, 0)`: the **whole** delivered payload is the header, so a
+    /// `binary` port renders a proper list of byte integers.
+    Header,
+    #[allow(dead_code)]
+    /// A header followed by a data part — `driver_output2(hbuf, hlen, buf, len)` or
+    /// `driver_output_binary(...)`. The first `len` bytes are the header, the rest the data; the
+    /// data part is **present even when it is empty**, which is why a zero-length `DATA` reply
+    /// renders `[H1..Hh|<<>>]` rather than a bare list.
+    HeaderThenData {
+        /// How many leading bytes of the payload are the header.
+        len: usize,
+    },
+}
+
+impl StreamShape {
+    /// The `(header, data)` halves of a delivered payload, `data` being `Some` exactly when the
+    /// driver's call carried a data part.
+    ///
+    /// `len` is clamped to the payload: a shape naming a longer header than was delivered would
+    /// otherwise *drop* bytes, and dropping bytes is a wrong result. No bytes are invented
+    /// either — the clamp only ever widens the header to the whole payload.
+    fn split(self, bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
+        match self {
+            StreamShape::Data => (&[], Some(bytes)),
+            StreamShape::Header => (bytes, None),
+            StreamShape::HeaderThenData { len } => {
+                let len = len.min(bytes.len());
+                (&bytes[..len], Some(&bytes[len..]))
+            }
+        }
+    }
+}
+
 /// The `port_info/1,2` metadata of one live port — what [`beam_io`] deliberately does not
 /// expose.
 ///
@@ -3092,10 +3164,12 @@ impl RuntimeContext<'_> {
 
     /// The `{Port, {data, Data}}` message of one port-stream read.
     ///
-    /// `Data` is an Erlang **binary** for a `binary` stream and a char list otherwise (the
-    /// `list` default, `erl`'s own). The `data` atom is interned into the runtime's one
-    /// shared table, so the message is nameable by the printer and matchable by a `receive`
-    /// clause.
+    /// `Data` is an Erlang **binary** for a header-less read on a `binary` stream and a char list
+    /// otherwise (the `list` default, `erl`'s own). A driver output call that carried a header
+    /// renders the C's `[H1..Hh | <<Data>>]` shapes instead, which is what
+    /// [`Self::port_data_message_shaped`] is for; this entry point is the split-less form
+    /// ([`StreamShape::Data`]). The `data` atom is interned into the runtime's one shared table,
+    /// so the message is nameable by the printer and matchable by a `receive` clause.
     ///
     /// # The binary stream has no width limit
     ///
@@ -3120,8 +3194,27 @@ impl RuntimeContext<'_> {
         bytes: &[u8],
         stream: StreamType,
     ) -> Result<Eterm> {
+        self.port_data_message_shaped(port, bytes, stream, StreamShape::Data)
+    }
+
+    /// [`Self::port_data_message`] for a driver output call that carried a **header**.
+    ///
+    /// `shape` is the [`StreamShape`] of the call that produced `bytes`; see that type for the
+    /// C's four output entry points and the term each one renders. The `list` stream ignores it
+    /// (header and data are both list elements there), so this only changes a `binary` port.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the term does not fit.
+    pub(crate) fn port_data_message_shaped(
+        &mut self,
+        port: PortId,
+        bytes: &[u8],
+        stream: StreamType,
+        shape: StreamShape,
+    ) -> Result<Eterm> {
         let data = make_atom(self.runtime.code_server.atoms_mut().intern("data"));
-        let payload = self.port_data_payload(bytes, stream)?;
+        let payload = self.make_stream_payload(bytes, stream, shape)?;
         let inner = terms::make_tuple(self, &[data, payload])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
@@ -3134,7 +3227,9 @@ impl RuntimeContext<'_> {
     /// process as the `{Port, {data, …}}` body. `eol` (the atom `eol`) means the frame was
     /// newline-terminated; `noeol` means a length-limited `{line, N}` chunk or the trailing
     /// partial line released at end-of-stream. `Data` is shaped by `stream` exactly as
-    /// [`Self::port_data_message`] shapes an unframed read.
+    /// [`Self::port_data_message`] shapes an unframed read — the split-less [`StreamShape::Data`]
+    /// form, because a frame's bytes come from [`beam_io`]'s line accumulator rather than from one
+    /// driver output call (see [`StreamShape`]).
     ///
     /// Unlike the unframed builder this one is reachable with an **empty** `bytes`: a blank
     /// line is the oracle's `{Port, {data, {eol, []}}}` (and an empty `noeol` frame is
@@ -3154,34 +3249,75 @@ impl RuntimeContext<'_> {
             let atoms = self.runtime.code_server.atoms_mut();
             (make_atom(atoms.intern("data")), make_atom(atoms.intern(tag)))
         };
-        let payload = self.port_data_payload(bytes, stream)?;
+        let payload = self.make_stream_payload(bytes, stream, StreamShape::Data)?;
         let framed = terms::make_tuple(self, &[tag, payload])?;
         let inner = terms::make_tuple(self, &[data, framed])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
 
-    /// The `Data` **payload** of a port-stream message, shaped by the port's stream option.
+    /// The `Data` **payload** of a port-stream message, shaped by the port's stream option and by
+    /// the driver output call that produced the bytes.
     ///
-    /// Shared by [`Self::port_data_message`] and [`Self::port_line_message`] so the two
-    /// message shapes can never drift: a `binary` stream yields an Erlang binary (built by
-    /// [`beam_codec::term::make_binary`], see [`Self::port_data_message`] on the width), a
-    /// `list` stream a char list. The block is allocated on the runtime's pointer-stable
-    /// `-eval` arena.
+    /// Shared by [`Self::port_data_message_shaped`] and [`Self::port_line_message`] so the message
+    /// shapes can never drift. The legacy C renders every delivered chunk in two parts — the
+    /// driver's **header** bytes as list elements and its **data** bytes as the stream asks
+    /// (`deliver_read_message`, `erts/emulator/beam/io.c:3404-3435`, and `deliver_vec_message`,
+    /// `:3559-3617`) — so:
+    ///
+    /// * a `list` stream is a char list of **all** the bytes, whatever the split;
+    /// * a `binary` stream is a bare binary for a header-less call ([`StreamShape::Data`]) — built
+    ///   by [`beam_codec::term::make_binary`], see [`Self::port_data_message`] on the width;
+    /// * a `binary` stream is a **proper list** of the byte integers for a header-only call
+    ///   ([`StreamShape::Header`]: `driver_output2(hbuf, hlen, NULL, 0)`, what a `ram_file_drv`
+    ///   `OK`/`NUMBER`/`ERROR` reply makes);
+    /// * a `binary` stream is the **improper** list `[H1..Hh | <<Data>>]` for a header-plus-data
+    ///   call ([`StreamShape::HeaderThenData`]), an empty data part rendering `[...|<<>>]` (a
+    ///   zero-length `DATA` reply, i.e. a read at end-of-file).
+    ///
+    /// Every block is allocated on the runtime's pointer-stable `-eval` arena.
     ///
     /// # Errors
     ///
     /// The arena's allocation failure when the term does not fit.
-    fn port_data_payload(&mut self, bytes: &[u8], stream: StreamType) -> Result<Eterm> {
-        match stream {
-            StreamType::Binary => beam_codec::term::make_binary(self.eval_heap(), bytes),
-            StreamType::List => {
-                let mut list = NIL;
-                for byte in bytes.iter().rev() {
-                    list = terms::make_cons(self, make_small(i64::from(*byte)), list)?;
-                }
-                Ok(list)
+    fn make_stream_payload(
+        &mut self,
+        bytes: &[u8],
+        stream: StreamType,
+        shape: StreamShape,
+    ) -> Result<Eterm> {
+        if stream == StreamType::List {
+            // The header is list elements too, so the split is invisible on this stream.
+            return self.bytes_to_list(bytes, NIL);
+        }
+        let (header, data) = shape.split(bytes);
+        match data {
+            // No data part: the whole reply is the (already-complete) header list.
+            None => self.bytes_to_list(header, NIL),
+            // Otherwise the data part is the term's tail — a binary, empty or not — and the
+            // header bytes are consed in front of it (an empty header leaves the binary bare,
+            // the header-less `driver_output` shape).
+            Some(data) => {
+                let tail = beam_codec::term::make_binary(self.eval_heap(), data)?;
+                self.bytes_to_list(header, tail)
             }
         }
+    }
+
+    /// `bytes` as a char list whose tail is `tail` — `[B1..Bn | Tail]`.
+    ///
+    /// `NIL` builds a proper list; any other `tail` makes the result improper, which is exactly
+    /// the C's `buf_to_intlist` applied to a header list that already ends in a binary
+    /// (`io.c:3426-3428`, `:3613-3617`). The cells live on the runtime's `-eval` arena.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the list does not fit.
+    fn bytes_to_list(&mut self, bytes: &[u8], tail: Eterm) -> Result<Eterm> {
+        let mut list = tail;
+        for byte in bytes.iter().rev() {
+            list = terms::make_cons(self, make_small(i64::from(*byte)), list)?;
+        }
+        Ok(list)
     }
 
     /// The `{Port, {exit_status, Status}}` message of a port whose child has been reaped,

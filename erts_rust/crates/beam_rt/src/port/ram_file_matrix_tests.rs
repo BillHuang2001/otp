@@ -471,7 +471,7 @@ fn reply_payload(message: Eterm) -> (Vec<i64>, bool) {
 /// fails with the VM's own stderr otherwise.
 ///
 /// Returns `None` when the toolchain is absent; the caller prints the loud skip banner.
-fn oracle_output(expr: &str) -> Option<String> {
+pub(super) fn oracle_output(expr: &str) -> Option<String> {
     match std::process::Command::new("erl")
         .args(["-noshell", "-eval", expr, "-s", "init", "stop"])
         .output()
