@@ -331,24 +331,178 @@ round trips, the same two-process shape — makes **0** `clock_nanosleep` calls,
 `the_heap_growth_workloads_per_call_counters_are_flat_in_n` each drive their fixture at three
 increasing iteration counts and print a `counter_table`: N vs slices / yields / waits / collections /
 major / fallbacks / peak young-nursery geometry / debt boundaries, plus the derived per-call ratios.
-Measured: `churn` collections/call 5.997501 / 5.999500 / 5.999875 and slices/call
-0.191904 / 0.191981 / 0.191995 at N=2 000 / 10 000 / 40 000 — flat to within 0.04 %, with
-`collections == 6N + 1` and `major == N + 1` exactly at every N (one fullsweep per iteration);
-`heap_growth` collections/call 0.999700 / 0.999880 / 0.999940 and slices/call 0.000300 / 0.000280 /
-0.000260 at N=10 000 / 25 000 / 50 000, with `collections == N − 2` and `major == 2` exactly at every
-N: the 401-word request cannot fit a fresh nursery, so the door is reached on every iteration bar a
-**constant two** growth warm-ups (a fresh nursery with nothing to free can only be grown), which is
-the derived constant that assertion pins.
-In both shapes `peak_young_spaces == 2` and the young capacity plateaus (609 / 610 words) at every N,
-so the retired-nursery chain the `collection_debt` trigger protects is bounded rather than
-N-dependent, and `yields == slices − 1` with `waits == 0` throughout (neither loop ever parks).
-`peak_mature_capacity` plateaus at 987 words; `churn`'s `peak_mature_used` is 840 there while
-`heap_growth`'s stays 0 (its tuples are garbage the sweep reclaims, so a fullsweep leaves the mature
-space entry-free).
+Measured: `churn` collections/call 7.043978 / 7.047195 / 7.047799 and slices/call
+0.191904 / 0.191981 / 0.191995 at N=2 000 / 10 000 / 40 000 — flat to within 0.06 %, with
+`major`/call flat at 1.630739 / 1.631684 / 1.631984 (the iteration's own collections plus the ones the
+reduction/yield-boundary door adds — the door's own share is separated in the table below);
+`heap_growth` collections/call 1.000100 / 1.000200 / 1.000220 and slices/call 0.000300 / 0.000280 /
+0.000260 at N=10 000 / 25 000 / 50 000: the 401-word request cannot fit a fresh nursery, so the
+growth/collection door is reached on **every** iteration (the run's collection count lands just above
+N), which is the derived relation that assertion pins.
+In both shapes `peak_young_spaces == 1` and the young capacity plateaus at the collector's 233-word
+floor at every N, so the retired-nursery chain the `collection_debt` trigger protects stays collapsed
+rather than N-dependent, and `yields == slices − 1` with `waits == 0` throughout (neither loop ever
+parks). `churn`'s `peak_mature_capacity` plateaus at 987 words with `peak_mature_used` 880;
+`heap_growth`'s mature space plateaus at 610 words with `peak_mature_used` 0 (its tuples are garbage
+the sweep reclaims, so a fullsweep leaves the mature space entry-free).
 Neither loop's cadence is this node's to set: the door decides *whether* a collection may run (and
 the counters above show it declining nothing), the collector's post-collection nursery sizing decides
 *how often* — see [`../context/IMPLEMENTATION.md`](../context/IMPLEMENTATION.md) *What the doors do
 NOT decide*.
+
+**The reduction/yield-boundary door's own cost on the hot shapes — ON vs OFF out of ONE build.**
+`collect_at_reds_boundary` (`../context/gc/reds_door.rs`, reached from the `Yield` arm only) fires on
+a **publishing** slice-end park when `REDS_BOUNDARY_MIN_REDS` reductions have elapsed since that
+process's last boundary check **and** the young heap is **seven eighths** used (or the collector's
+`collection_debt` is set). The watermark was retuned from `1/2` to `7/8` after the churn shape below
+was found to pay a real amplification; the C's own rule (`ERTS_VBUMP_ALLOC_REDS`) fires when the
+allocation area is **exhausted**, not when it is half used. It is judged on per-call counters alone,
+never on wall clock:
+
+* **Both sides come from one build**, interleaved `A B A B …` for 15 pairs, one config per leg, with
+  the door-disabled side reached by a throwaway `#[cfg(test)]` early return and the watermark by a
+  throwaway `#[cfg(test)]` override (both removed with the measurement) — copies of the same tree
+  measured against each other in different processes are not comparable on this host.
+* **The estimator is the paired per-call difference.** Every counter here is deterministic, so the
+  paired difference is identical in all 15 pairs (min = median = max for all 420 rows of the retune
+  sweep) and the whole table is reproducible from any one pair; the pairing exists so a *future*
+  counter change cannot be misread as a door cost.
+* Records: `taskset -c 3`. The retune sweep: host `/proc/loadavg` **3.86 → 3.78**. The earlier
+  whole-shape sweep (whose still-valid rows are kept below): 17.05 → 11.17 over the default tier and
+  5.86 → 5.07 over the interpreter tier (a shared host — the load is reported, the ratios are what is
+  read).
+* Denominators are the shape's own call count `N + 1`. `door checks/call` is the number of publishing
+  `Yield` parks handed to the door, `door colls/call` the number of those that became a collection
+  (`door.unpublished` is **0** on every shape — no hot shape ends a slice with a live float-register
+  prefix); `Δ` is ON − OFF. `fallbacks/call` is 0 on every row, both sides.
+* The **default-tier** sweep is the native baseline JIT, where a compiled block runs past the
+  per-instruction reduction hook: a shape that reaches no heap-admission point never pre-empts, so
+  most rows show ≤1 slice for the whole run. The **interpreter-tier** sweep
+  (`BEAM_RT_TIER=interpreter`) is where a compute-bound shape really pre-empts every ~4 000-reduction
+  budget, which is the only regime in which the door can be reached often.
+
+The retune, at all four waters — `gc_bound` churn, default tier, 15 interleaved pairs
+(`off` = door disabled; `1/2` = the old watermark; `7/8` = the shipped one; `1/1` = the C-exact
+"used ≥ capacity"):
+
+| watermark (N) | door checks | door colls | colls/call | major/call |
+|---|---|---|---|---|
+| off (500) | 95 | 0 | 6.984032 | 1.497006 |
+| 1/2 (500) | 95 | 47 | 7.031936 (+0.047904, **+0.69 %**) | 1.630739 (**+8.9 %**) |
+| **7/8 (500)** | 95 | **11** | **6.984032 (Δ 0)** | **1.497006 (Δ 0)** |
+| 1/1 (500) | 95 | 3 | 6.984032 (Δ 0) | 1.497006 (Δ 0) |
+| off (2 000) | 383 | 0 | 6.996002 | 1.499250 |
+| 1/2 (2 000) | 383 | 191 | 7.043978 (+0.047976, **+0.69 %**) | 1.631684 (**+8.9 %**) |
+| **7/8 (2 000)** | 383 | **47** | **6.996002 (Δ 0)** | **1.499250 (Δ 0)** |
+| 1/1 (2 000) | 383 | 15 | 6.996002 (Δ 0) | 1.499250 (Δ 0) |
+| off (10 000) | 1 919 | 0 | 6.999200 | 1.499850 |
+| 1/2 (10 000) | 1 919 | 959 | 7.047195 (+0.047995) | 1.631937 |
+| **7/8 (10 000)** | 1 919 | **239** | **6.999200 (Δ 0)** | **1.499850 (Δ 0)** |
+| 1/1 (10 000) | 1 919 | 79 | 6.999200 (Δ 0) | 1.499850 (Δ 0) |
+
+So at `7/8` the door is **free on the shape that used to pay**: the totals are the door-off counts
+exactly (`collections == 7N − 1`, `major == 3N / 2`), a boundary collection *substituting for* the
+heap-admission collection the iteration would have taken rather than adding to it — while the door
+still collapses the retired chain (one young space at the **233**-word floor, against the door-off
+**2** spaces / **376** words). `1/1` buys nothing over `7/8` (3 instead of 11 firings at N = 500, the
+same counters) and is *not* taken: the nursery grows in place, so an exact `used == capacity` test is
+satisfied on consecutive boundaries and could chain majors where `7/8` leaves the growth seam room.
+
+The two shapes that must **not** be lost to the tighter watermark (same sweep, interpreter tier):
+
+| shape (N) | watermark | colls | major | door checks → colls | peak heap_size | peak young cap / spaces |
+|---|---|---|---|---|---|---|
+| `churn` (500) | off | 3 499 (6.984032/call) | 750 | 95 → 0 | 609 | 376 / 2 |
+| `churn` (500) | 7/8 | 3 499 | 750 | 95 → 116 | **233** | **233 / 1** |
+| `churn` (2 000) | off | 13 999 (6.996002/call) | 3 000 | 383 → 0 | 609 | 376 / 2 |
+| `churn` (2 000) | 7/8 | 14 000 | 3 001 | 383 → 474 | **233** | **233 / 1** |
+| `reds_boundary` (2 000) | off | **0** | 0 | 6 → 0 | **3 074 841** | 1 727 361 / 10 |
+| `reds_boundary` (2 000) | 7/8 | **6** | 1 | 6 → 6 | **233** | 233 / 1 |
+| `reds_boundary` (20 000) | off | **0** | 0 | 60 → 0 | **29 485 327** | 15 401 305 / 13 |
+| `reds_boundary` (20 000) | 7/8 | **60** | 1 | 60 → 60 | **233** | 233 / 1 |
+| `etf_roundtrip` (10 000) | off | **0** | 0 | 40 → 0 | **1 347 856** | 833 026 / 10 |
+| `etf_roundtrip` (10 000) | 7/8 | **40** | 1 | 40 → 40 | **233** | 233 / 1 |
+| `etf_roundtrip` (40 000) | off | **0** | 0 | 160 → 0 | **3 075 217** | 1 727 361 / 11 |
+| `etf_roundtrip` (40 000) | 7/8 | **160** | 3 | 160 → 160 | **233** | 233 / 1 |
+
+The no-heap-admission shape is **debt-driven** and identical at every watermark ≥ `1/2` (every check
+reports `collection_debt`, so the occupancy arm never decides it): it still collects
+`3 · N / 1 000` times (`collections · 1 000 == 3 · N`, exact at both N) with a flat 233-word
+`heap_size` — the relation is the reduction cost of the loop over the `REDS_BOUNDARY_MIN_REDS`
+interval, not the watermark, which is why the interval is retained unchanged. The `etf_roundtrip`
+sanity shape keeps its fix (0 → `0.004` collections/call, nursery flat at 233 words against the
+door-off 1.7 M / 3.1 M words over 10 / 11 retired spaces).
+
+The remaining rows of the **earlier** whole-shape sweep, whose shapes the watermark cannot move
+(their `door checks/call` is 0 or ≤1 per run, so no gate ever decides them) — default tier unless
+noted; `ets_copy` on the interpreter tier is the one moved row, given at `7/8`:
+
+| shape (N) | door checks/call | door colls/call | colls/call ON | colls/call OFF | Δ colls/call | major/call ON → OFF | young cap ON / OFF |
+|---|---|---|---|---|---|---|---|
+| `etf_roundtrip` (10 000 / 40 000), default | 0 | 0 | 0 | 0 | 0 | 0 → 0 | 0 / 0 |
+| `ets_copy` (10 000 / 40 000), default | 0.000200 / 0.000225 | 0.000100 | 0.333267 / 0.333342 | 0.333267 / 0.333317 | +0.000025 | 0 → 0 | 233 / 233, 233 / 376 |
+| `send_recv` (3 000 / 12 000), both tiers | 0 | 0 | 0.512496 / 0.513041 | identical | 0 | 0 → 0 | 233 / 233 |
+| `send_recv_plain` (3 000 / 12 000), both tiers | 0 | 0 | 0.050650 / 0.051162 | identical | 0 | 0 → 0 | 233 / 233 |
+| `list_walk` (200 / 800), default | 0 | 0 | 0.039801 / 0.009988 | identical | 0 | 0 → 0 | 0 / 0 |
+| `list_walk` (200 / 800), interpreter | 2.004975 / 2.004994 | **0.009950 / 0.002497** | **0.039801 / 0.009988** | 0.039801 / 0.009988 | **Δ 0** | 0 | 233 / 233 |
+| `heap_growth` (3 000 / 12 000), default | 0 / 0.000167 | 0 / 0.000167 | 0.999667 / 1.000083 | 0.999667 / 0.999917 | +0.000167 | 0 → 0 | 0 / 0, 233 / 610 |
+| `gc_bound` churn (500 / 2 000), interpreter | 1.990020 / 1.993503 | **0.232814 / 0.237191** | **6.984032 / 6.994003** | 6.984032 / 6.996002 | **Δ 0 / +0.000001** | 0 | 233 / 376 |
+| `ets_copy` (10 000 / 40 000), interpreter | 0.008699 / 0.008750 | 0.002600 / 0.002500 | 0.333667 / 0.333717 | 0.333267 / 0.333317 | +0.000400 | **+0.000600** (was +0.000800 at 1/2) | 233 / 376 |
+| `slice:fib/1` (200), both tiers | 0 | 0 | 0 | 0 | 0 | 0 → 0 | 0 / 0 |
+| `slice:fib/1` (800), interpreter | 0.001248 | 0.001248 | 0.001248 | 0 | +0.001248 | +0.001248 | 233 / 2 586 |
+
+Per-shape verdicts:
+
+* **Inert — the door never runs and the paired difference is exactly 0.** `send_recv` and
+  `send_recv_plain` on both tiers (the ping-pong parks through the **`Wait`** arm, never `Yield`, so
+  no boundary is ever offered), and on the default tier `etf_roundtrip`, `list_walk`, `slice:fib/1`
+  and `heap_growth` at 3 000 (each completes inside one slice or never pre-empts at all, so there is
+  no boundary to check).
+* **Below measurement resolution.** `ets_copy` on the default tier: 0.0002 checks/call and **one**
+  extra collection over 40 000 calls; `heap_growth` on the default tier: at most two collections over
+  12 000 calls (+0.000167/call). Neither moves `major`, and neither shape's capacity is larger with
+  the door on at the wider N. `slice:fib/1` on the interpreter tier: 1 boundary → 1 collection (the
+  door-off side collects nothing, so this is the intended fix in miniature).
+* **Intended — a shape that never collected now collects, at a bounded nursery.** `etf_roundtrip` on
+  the interpreter tier is the defect the door exists for, on a **hot benchmark shape**: 40 / 160
+  boundaries become collections where the door-off side runs **zero**, and the nursery stays at 233
+  words where the door-off side climbs to **1 347 856 / 3 075 217** words over 10 / 11 retired spaces.
+  `reds_boundary` is the same effect at two orders of magnitude (0 → 6 / 60 collections against
+  3 074 841 / 29 485 327 words).
+* **Nursery resizing is a real effect of one collection.** `heap_growth` on the interpreter tier
+  peaks at **843** words with the door on vs **610** off (+38 %): a boundary collection re-sizes the
+  nursery and every later admission keeps that size. `ets_copy` on the interpreter tier and
+  `gc_bound` churn on the default tier go the other way (233 on vs 376 off — the door's own
+  collection collapses the retired chain the door-off side retains).
+* **The `gc_bound` churn amplification is FIXED by the retune (was the finding of the `1/2` sweep).**
+  This shape already collects at its own heap-admission door on every iteration, so a boundary
+  collection is a *second* collection site on it — and at `1/2` it cost **+0.048 collections/call
+  (+0.69 %)** on the default tier (and **+0.519 / +0.524** on the interpreter tier) with `major`/call
+  rising **+8.9 %** (and **+9.9 %**), ≈13× the collection-rate change. The mechanism was never the
+  door's firing rate but its *action*: `Process::collect()` is unconditional, so a firing boundary
+  also collects the **mature** generation (`beam_gc::Collector::collect` escalates to a major whenever
+  the mature generation is not larger than the nursery in use) on a shape whose iteration had already
+  settled that debt. At `7/8` the nursery is nearly exhausted at only every eighth slice end
+  (`door collections == checks / 8`, a floor: 11/95, 47/383, 239/1 919) and the totals are the
+  door-off counts **exactly** — the default-tier regression is **0** on both counters, and the
+  interpreter tier drops to `Δ 0` (+0.000001 rounding at N = 2 000). No cross-crate seam was needed:
+  the gate alone closes it.
+  **Residual (recorded, optional):** `ets_copy` on the **interpreter** tier still shows `+0.000400`
+  collections/call and `major`/call `+0.000600` (down from `+0.000800` at `1/2`) — 16 extra
+  collections over 40 000 calls, ~3× the collection-rate change. Removing that needs a
+  **policy-kind** collection request ("collect young-only unless a fullsweep is due"), which is a
+  `beam_process`/`beam_gc` API (`Process::collect()` picks minor-vs-major internally), not something
+  this door can express; it is recorded as a cross-node handoff in `../../M1_GAPS.md` *GC / heap
+  model*, not taken.
+  The door's structure on this shape is pinned by
+  [`tests/boundary_cost.rs`](tests/boundary_cost.rs) —
+  `the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape` holds
+  `door checks == yields`, `door collections == checks / 8`, `door.unpublished == 0`, the shape's own
+  totals exactly at the door-off figures (`collections == 7N − 1`, `major == 3N / 2`), one young space
+  and a 233-word capacity floor at N = 2 000 and N = 10 000, so the amplification cannot come back
+  silently. The no-admission shape's relations are pinned by
+  [`tests/reds_door.rs`](tests/reds_door.rs) (`collections · 1 000 == 3 · N`, `minor ==
+  collections − 1`, a flat 233-word `heap_size`).
 
 **`foreign` per-call cost, with the mechanism that keeps the loops from degenerating.** Measured
 2026-10-17 with the committed driver (`bench run --quick --runtime all --workloads foreign`,
@@ -371,8 +525,11 @@ test is `O(1)` for an address outside the aggregate `scanned_bounds` and `O(log 
 never walks `spaces()`). `beam_loader`'s `tag_literal_area`
 (`crates/beam_loader/src/literal.rs`, the safe form of the C load-time `erts_set_literal_tag`) tags
 the decoded literal area, so the walk recognizes these modules' constant literal-area binary as an
-off-heap literal rather than an unscanned container, the valve stays shut, and the retired chain
-stays collapsed instead of growing with the iteration count.
+off-heap literal — not a container in a region the collector does not scan at all
+(`context/gc.rs::word_region` answers `None` for a literal, which no relocation touches) — so the
+valve never declines, the descent latch stays closed, and the retired chain stays collapsed
+instead of growing with the iteration count. A constant payload a module *builds* would instead be
+a foreign container that forwards nothing scanned: also inert, so also collected.
 
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.

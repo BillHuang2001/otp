@@ -179,6 +179,84 @@ pub(crate) fn reset_park_publish_counters() {
     PARK_PUBLISH_COUNTERS.with(|counter| counter.set(ParkPublishCounters::default()));
 }
 
+// The **reduction/yield-boundary** door's hit accounting for this thread, for the
+// **deterministic** cost pin on that door (see `super::tests::boundary_cost`).
+//
+// The door is the one collection site whose *cost* cannot be read off `Runtime::gc_stats()`
+// alone on a shape that also reaches the heap-admission doors, so it is tallied on its own:
+// **how often the door was asked** (one `Yield` park whose window published its root set) and
+// **how many of those became a real collection**. The two are structural facts of the runner
+// and the collector — never timings — so a per-call ratio derived from them is deterministic
+// on a loaded host, which is what makes a "the door is inert here" claim measurable rather
+// than a wall-clock guess.
+//
+// Like `RUN_SLICE_COUNTERS` this is per thread (a `thread_local!`, not a shared static), so a
+// concurrently running unit test's parks cannot perturb this thread's tallies.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BoundaryDoorCounters {
+    /// `Yield` parks handed to the door — the boundary **checks** (the machine published its
+    /// root set, so the door really ran its gates).
+    pub(crate) checks: usize,
+    /// `Yield` parks refused **before** the door: the window was relocation-exempt, so it
+    /// published no root set and the machine stayed the authoritative one.
+    pub(crate) unpublished: usize,
+    /// Checks the door turned into a real collection.
+    pub(crate) collections: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BOUNDARY_DOOR_COUNTERS: std::cell::Cell<BoundaryDoorCounters> =
+        const { std::cell::Cell::new(BoundaryDoorCounters {
+            checks: 0,
+            unpublished: 0,
+            collections: 0,
+        }) };
+}
+
+/// This thread's boundary-door tallies since the last [`reset_boundary_door_counters`].
+#[cfg(test)]
+pub(crate) fn boundary_door_counters() -> BoundaryDoorCounters {
+    BOUNDARY_DOOR_COUNTERS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's boundary-door tallies (a measurement's "before" reading).
+#[cfg(test)]
+pub(crate) fn reset_boundary_door_counters() {
+    BOUNDARY_DOOR_COUNTERS.with(|counter| counter.set(BoundaryDoorCounters::default()));
+}
+
+/// Records one boundary **check** handed to the door (a publishing `Yield` park).
+#[cfg(test)]
+fn note_boundary_door_check() {
+    BOUNDARY_DOOR_COUNTERS.with(|counter| {
+        let mut value = counter.get();
+        value.checks += 1;
+        counter.set(value);
+    });
+}
+
+/// Records one `Yield` park the door never saw (a relocation-exempt window).
+#[cfg(test)]
+fn note_boundary_door_unpublished() {
+    BOUNDARY_DOOR_COUNTERS.with(|counter| {
+        let mut value = counter.get();
+        value.unpublished += 1;
+        counter.set(value);
+    });
+}
+
+/// Records one boundary check the door turned into a collection.
+#[cfg(test)]
+fn note_boundary_door_collection() {
+    BOUNDARY_DOOR_COUNTERS.with(|counter| {
+        let mut value = counter.get();
+        value.collections += 1;
+        counter.set(value);
+    });
+}
+
 /// Records one park: `published` when the arm wrote the machine's root set into the process,
 /// `skipped` when the window was relocation-exempt and it did not.
 #[cfg(test)]
@@ -211,8 +289,84 @@ impl<'a> RuntimeRunner<'a> {
     pub(crate) fn new(runtime: &'a mut Runtime, state: &'a mut RunnerState) -> RuntimeRunner<'a> {
         RuntimeRunner { runtime, state }
     }
+    /// Runs the **reduction/yield-boundary** collection point over a just-parked machine — the
+    /// slice-end door of [`crate::context::gc::collect_at_reds_boundary`].
+    ///
+    /// A slice has already ended here, which is the one moment a process that never reaches a
+    /// heap-admission point can be collected at: a loop whose body allocates only through
+    /// registered BIFs (`_ = list_to_tuple(lists:seq(1, 400)), loop(N - 1)`) emits no
+    /// `test_heap`/`allocate_heap`, so [`RuntimeContext::alloc_words`] and the BIF-result
+    /// copy-out can only **grow** the nursery and its retired-space chain — the summed capacity
+    /// `process_info(P, garbage_collection)` reports as `heap_size` — with the loop count.
+    ///
+    /// # Why it fires far from every slice
+    ///
+    /// The door's own two gates keep this off the per-slice path: the **reduction interval**
+    /// ([`crate::context::gc::REDS_BOUNDARY_MIN_REDS`], accumulated per pid) means at most one
+    /// collection per slice budget, and the **occupancy watermark** means none at all over a
+    /// nursery that is barely used. Both are typed no-ops, so a declined boundary costs one map
+    /// probe and two word counts.
+    ///
+    /// # The window must be a publishing one
+    ///
+    /// `park_machine` publishes the machine's whole root set only for a **non-exempt** window;
+    /// an exempt park (a live FR prefix at the slice's end) published nothing and its machine
+    /// stays the authoritative root set, so a collection here would leave the machine's own
+    /// words dangling into the evacuated from-space. `engine.parked_published` is exactly that
+    /// answer, so an exempt window is refused before any context is built.
+    ///
+    /// The machine is handed over through
+    /// [`Machine::with_roots`](beam_engine::Machine::with_roots) (`RootSet::ALL_LIVE`, which the
+    /// door narrows to each register file's pointer-bearing prefix), and `fr_count` is the count
+    /// this park published — the resume re-reads **the same** count, so a different one here
+    /// would mis-size the FR region and halt the process's collection.
+    ///
+    /// # Errors
+    ///
+    /// The door itself never errs (a failed collection halts collection for that pid). The
+    /// `Result` is for the context's own construction-time failures, propagated with `?` exactly
+    /// as the other slice-level seams do.
+    fn collect_at_reds_boundary(
+        &mut self,
+        table: &mut ProcessTable,
+        pid: ProcessId,
+        engine: &mut ProcessEngine,
+        fr_count: usize,
+        used: u32,
+    ) -> Result<()> {
+        if !engine.parked_published {
+            #[cfg(test)]
+            note_boundary_door_unpublished();
+            return Ok(());
+        }
+        #[cfg(test)]
+        note_boundary_door_check();
+        // The door's own collection is the only one that can run inside the call below (its
+        // hand-off publishes, collects and scatters; nothing else allocates or collects), so
+        // the runtime's collection counter delta over the call is exactly "this door fired".
+        #[cfg(test)]
+        let collections_before = self.runtime.gc_stats().collections;
+        let outcome = {
+            let mut ctx = RuntimeContext::for_process_with_engines(
+                &mut *self.runtime,
+                table,
+                pid,
+                self.state,
+            );
+            if let Some(module) = engine.entry.entry_module() {
+                ctx.enter_module(module);
+            }
+            engine.machine.with_roots(RootSet::ALL_LIVE, |roots| {
+                gc::collect_at_reds_boundary(&mut ctx, roots, fr_count, used)
+            })
+        };
+        #[cfg(test)]
+        if self.runtime.gc_stats().collections > collections_before {
+            note_boundary_door_collection();
+        }
+        outcome
+    }
 }
-
 /// Resolves a process engine's **current execution site** for the debug trace —
 /// `module:function /arity +pc instr=…` — or `None` when no position is resolvable.
 ///
@@ -1046,8 +1200,15 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // resume has cleared the mark — serves it. (An exempt window publishes nothing and
             // collects nothing, so both halves agree: nothing moved.)
             self.runtime.serve_gc_request(table, pid);
-            self.state.engines.insert(pid, engine);
-            // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended at
+            // The **reduction/yield-boundary** collection point: a slice has already ended, so
+            // this is where a process whose loop reaches no heap-admission point (BIF-only
+            // allocation — the unrooted `alloc_words` seam and the BIF-result copy-out can only
+            // grow the nursery) is collected over its just-published root set. Its own interval
+            // and occupancy gates keep it off the per-slice path, and it refuses an **exempt**
+            // park outright (nothing was published for that window, so the machine stays the
+            // authoritative root set). See `RuntimeRunner::collect_at_reds_boundary`.
+            self.collect_at_reds_boundary(table, pid, &mut engine, fr_count, used)?;
+            self.state.engines.insert(pid, engine);            // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended at
             // the `Yield` (pre-emption) arm.
             #[cfg(test)]
             note_slice_parked(true);

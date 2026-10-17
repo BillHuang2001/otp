@@ -60,77 +60,79 @@
 //! The descent is `O(live objects)` and ran on *every* candidate collection, which made a
 //! long-lived allocating loop pay a full graph traversal per collection (see the
 //! [`any_root_is_unscanned`] caller). It is therefore gated: the caller passes `descend`, which it
-//! computes from the process's **foreign-reachability flag**
-//! ([`crate::runtime::gc::GcState`]). The flag is a **sticky, add-only** per-process bit, set by
-//! every event that can put a container from an unscanned region into the process's reachable
-//! graph (a registered-BIF result built outside the scanned region, the arena fallback of the
-//! allocation seams, the escape-store stabilisation, a delivered message / retained mailbox
-//! fragment, and a spawn's initial arguments or entry fun).
+//! computes from the process's **foreign-reachability bit**
+//! ([`crate::runtime::gc::GcState`]). The bit is opened by every event that can put a container
+//! from an unscanned region into the process's reachable graph (a registered-BIF / runtime-native
+//! / NIF result that forwards a scanned word, the arena fallback of the allocation seams, the
+//! escape-store stabilisation, a heap-fragment message delivery, and a spawn's initial arguments
+//! or entry fun) and it is **closed again** by a descent that ran over the process's *whole* root
+//! set and reached no foreign container at all ([`ValveVerdict::foreign_free`]).
 //!
 //! Soundness of the gate (this is the whole argument, and it is a *one-way* argument — a wrong
 //! `false` would resurrect the corruption the walk exists to prevent):
 //!
 //! * when `descend` is `false`, **phase 1 still runs**. A foreign container reachable at depth 1
-//!   is a root word, so phase 1 catches it exactly as it always did — the gate removes only the
-//!   *descent*, never the per-word classification.
+//!   is a root word, so phase 1 catches it — the gate removes only the *descent*, never the
+//!   per-word classification.
 //! * for the descent to matter, a foreign container must be reachable at depth ≥ 2, i.e. it must
 //!   be a **child of a scanned container**. A pointer to a foreign container can only be written
 //!   into a scanned container by code that *holds* that foreign container, and the only ways to
-//!   hold one are the events listed above — each of which sets the flag. A foreign container can
+//!   hold one are the events listed above — each of which opens the bit. A foreign container can
 //!   likewise only be a *root word* after one of those events put it there.
-//! * the flag is only ever **set**, never cleared while the process lives (and the per-process
-//!   entry is pruned only when the process itself is gone), so a flag observed `true` at one
-//!   collection stays `true` at every later one.
+//! * the only sound way to **close** the bit is therefore a proof that the process's reachable
+//!   graph holds no foreign container at all, which is precisely what a descent over its
+//!   complete root set answers when it comes back foreign-free.
 //!
-//! # Why there is no "close the latch again" fast path (analysed, **not** implemented)
+//! # Closing the gate again — the current rule, and its residual
 //!
 //! The descent's cost is its **invocation count**: the baseline JIT's `jit_test_heap` reaches the
 //! valve at roughly every heap test, so a real compile pays a walk per heap-admission point
-//! (hundreds of thousands of them — see [`seed_counters`]' measurement test). The obvious next
-//! step is therefore to *re-close* the per-pid latch after an exhaustive descent that found no
-//! foreign container, so a loop that settles into a foreign-free steady state pays the descent once
-//! instead of once per admission point.
+//! (hundreds of thousands of them — see [`seed_counters`]' measurement test). The bit is
+//! therefore cleared as soon as that is provable: [`ValveVerdict::foreign_free`] reports *"the
+//! descent ran and reached no container from a region the collector does not scan"*, and
+//! [`Runtime::close_foreign_reachable`](crate::runtime::Runtime) retires the pid's bit on it.
 //!
-//! **That is unsound as posed.** The refutation is one sentence: *a descent is exhaustive only over
-//! the roots it was handed, and one of the two callers does not have all of them.* The runner's park
-//! arm ([`process_roots_are_unscanned`]) and the collection gate ([`RuntimeCollectionGate`]) run for
-//! a process that is **not** the running one, whose `x`/stack/FR words are unpublished — and an
-//! *exempt* park ([`Process::has_unpublished_roots`], the `Wait` arm and a `Yield` whose slice ended
-//! with a live FR prefix) publishes **nothing at all** (`src/runner/run.rs::park_machine` returns
-//! early). Concrete counterexample:
+//! Two facts make that sound rather than merely plausible:
 //!
-//! 1. the process holds a container from an unscanned region (the bit opens) and stores it into a
-//!    scanned young tuple `T` held **only** in `x[1]`; no admission point has run since;
-//! 2. it parks on `receive` — an exempt park, so `x[1]` is not in the gathered roots;
-//! 3. a signal site (or the parked process's own `Process::deliver`) runs
-//!    [`RuntimeCollectionGate::declines_relocation`]: the descent sees the gathered roots only,
-//!    reaches nothing foreign, and (hypothetically) closes the bit;
-//! 4. the receiver resumes; `x[1] = T` is published at the next admission point, the bit is clear,
-//!    the descent is skipped — and the per-word phase classifies `T` as a *scanned* container, so
-//!    the collection proceeds and leaves the foreign container's child pointing into the evacuated
-//!    from-space.
+//! * **The bit is a hint, never a decision.** While it is open the valve descends; while it is
+//!   closed the always-run per-word phase still classifies every root word, so a foreign container
+//!   held *directly* by a root is caught either way.
+//! * **`foreign_free` is only reported for a walk that descended.** A walk that skipped the
+//!   descent (`descend == false`) can never claim the graph is foreign-free, so a caller cannot
+//!   clear the bit without having looked.
 //!
-//! What a sound version would need, and where each piece lives — **none of it in this file**:
+//! **The residual is the caller's root set, not the walk's answer.** A descent is exhaustive only
+//! over the roots it was handed, so a clear is sound only where the caller handed over the
+//! process's *complete* root set. Exactly two callers may: the full heap-admission doors
+//! (`super::gc::ensure_heap_full` and `super::gc::alloc_words_rooted`), which pass the executing
+//! machine's whole `RootSet` — every live x register, the whole Erlang stack and each register
+//! file at its pointer-bearing prefix. Every other valve call site hands over less and therefore
+//! **cannot** clear:
 //!
-//! * a "the descent saw the *whole* root set" bit, set only by the admission-point walks, whose
-//!   root set is the machine's published `RootSet` (`super::gc::ensure_heap*`) — a clear on any
-//!   other walk (the gate's, the park arm's) is the bug above;
-//! * the **clear site**: the latch itself is only an alias here ([`ForeignLatch`]); the real cell is
-//!   `crate::runtime::gc::GcState::foreign`, written by `Runtime::note_foreign_reachable`;
-//! * a **completeness proof for that writer**: every event that can put a foreign container into the
-//!   reachable graph must open the bit. Today the bit is *add-only*, so a missed event costs only a
-//!   descent; with a clear, a missed event is a memory-safety bug. The known suspects are the ones
-//!   `M1_GAPS.md`'s *GC-relocation hazards* roster names as pinned outside the root set — a
-//!   `beam_bifs` fast-path BIF's Rust-local accumulator, the BIF-result copy-out slot, the
-//!   `beam_engine` `PendingException` reason — an audit across `beam_bifs`/`beam_engine`;
-//! * an **ordering** guarantee: a set that happens while (or just before) the clear runs must not be
-//!   lost, i.e. the clear must be a compare-and-swap against the state the walk started from.
+//! * the narrow `ensure_heap` door (x prefix + stack, no FR file),
+//! * the runner's park arm ([`process_roots_are_unscanned`]), which runs for a process that is not
+//!   the running one — and an *exempt* park ([`Process::has_unpublished_roots`]) publishes **no**
+//!   roots at all, so its whole parked window stays relocation-exempt and its bit stays open,
+//! * the `beam_process` signal sites, whose [`RuntimeCollectionGate`] decision runs inside
+//!   `ProcessTable` with only the receiver's *gathered* roots.
 //!
-//! **Verdict: sound-but-cross-crate at best, and unsound as posed.** The pieces above are owned by
-//! `super::gc`, `src/runtime/gc.rs`, `src/runner/` and `beam_process`'s signal sites; nothing in
-//! this file can make the skip safe on its own, so it is deliberately **not** implemented here. What
-//! this file does own — the per-walk allocation — is fixed instead (see [`WalkScratch`]).
+//! A decline raised at one of those sites keeps the bit open until a full door proves otherwise,
+//! which costs descents and never a wrong result. A stale `true` is the intended
+//! failure direction.
+
+//! # What a decline does *not* prove
 //!
+//! A decline says "a collection of this process is unsound **now**, given the roots I was
+//! handed". It does not say the process's graph will always hold a hazard, and it is not a
+//! declaration of un-collectability: dropping the offending term and reaching a full admission
+//! door clears the bit again (see *Closing the gate again*), so a loop that stops holding a
+//! foreign container resumes collecting without any explicit bookkeeping. The converse — a
+//! foreign container of immediates — never declines at all, because nothing it forwards would be
+//! relocated (`super::gc::forwards_scanned_word`), which is what keeps a program holding a
+//! `make_ref/0` block or a pooled-BIF `erlang:statistics(garbage_collection)` tuple collectable
+//! (`crate::tests`' `foreign_root_loop` suite is the end-to-end witness).
+//!
+
 //! # The same valve installed as the `beam_process` collection gate
 //!
 //! The valve's host call sites — the three heap-admission points in [`super::gc`] and the
@@ -197,11 +199,11 @@ use std::rc::Rc;
 use beam_process::{Process, ProcessId};
 use beam_term::layout::for_each_child_slot;
 use beam_term::list::ptr_val;
-use beam_term::literal::is_literal;
-use beam_term::prelude::{is_boxed, is_list};
+use beam_term::prelude::is_list;
 use beam_term::Eterm;
 
-use super::gc::root_is_unscanned;
+use super::gc::{forwards_scanned_word, word_region, WordRegion};
+use beam_gc::ScannedBounds;
 
 // ============================ END TEMPORARY POLICY SWITCH ============================
 
@@ -239,8 +241,26 @@ pub(crate) struct WalkScratch {
     roots: Vec<Eterm>,
 }
 
+/// What one valve call over one root set answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ValveVerdict {
+    /// A container in a region the collector does not scan, **forwards a word into one it does**,
+    /// is reachable from the roots — so a collection would leave that word pointing into an
+    /// evacuated from-space and must be declined.
+    pub(crate) declined: bool,
+    /// The descent ran (the caller's gate was open) and reached **no** container in a region the
+    /// collector does not scan at all.
+    ///
+    /// This is deliberately the *stronger* of the two clean answers: "no foreign container is
+    /// reachable" makes a hazard impossible without appealing to the forwarding test's precision,
+    /// so a caller that handed over its **whole** root set may close the process's descent latch
+    /// on it ([`crate::runtime::gc::GcState::foreign`]). A caller that handed over less (the
+    /// narrow admission door, the park arm, the collection gate) must ignore it.
+    pub(crate) foreign_free: bool,
+}
+
 /// Whether a collection of `process` would be **unsound** — whether a container in a region
-/// the collector does not scan is reachable from one it does.
+/// the collector does not scan, forwarding a word into one it does, is reachable from one it does.
 ///
 /// `machine_roots` are the words the caller is about to publish (the engine's x registers, the
 /// whole Erlang stack, and each register file at its own **pointer-bearing prefix** — the FR file
@@ -250,10 +270,10 @@ pub(crate) struct WalkScratch {
 /// collection that might have been sound (the allocation then falls back to the pointer-stable
 /// arena), never allowing one that is not.
 ///
-/// `descend` is the caller's **foreign-reachability gate** ([`WalkScratch`]'s module docs): when
-/// it is `false` the descent is skipped and only the cheap `O(roots)` per-word phase runs. The
-/// gate can only ever cost a collection (an unnecessary descent), never allow a wrong one: see
-/// the module docs' soundness argument.
+/// `descend` is the caller's **foreign-reachability gate** (this module's docs): when it is
+/// `false` the descent is skipped and only the cheap `O(roots)` per-word phase runs. The gate can
+/// only ever cost a collection, never allow a wrong one — and a gate that is *open* is closed
+/// again by a [verdict](ValveVerdict) that reached no foreign container at all.
 pub(crate) fn any_root_is_unscanned<'a, I>(
     scratch: &mut WalkScratch,
     process: &Process,
@@ -263,18 +283,45 @@ pub(crate) fn any_root_is_unscanned<'a, I>(
 where
     I: IntoIterator<Item = &'a Eterm>,
 {
-    let mut walk = Walk::begin(scratch);
+    valve_verdict(scratch, process, machine_roots, descend).declined
+}
+
+/// [`any_root_is_unscanned`], reporting **both** halves of the valve's answer so an admission
+/// point that handed over its whole root set can also close the process's descent latch.
+pub(crate) fn valve_verdict<'a, I>(
+    scratch: &mut WalkScratch,
+    process: &Process,
+    machine_roots: I,
+    descend: bool,
+) -> ValveVerdict
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    // The collector's aggregate geometry is read **once per call** and handed down to every
+    // per-word classification: hygiene, not a claimed win (the whole valve is 0.40 % of samples
+    // in a `beam_gc` peer's profile), but it keeps one decision on one geometry.
+    let bounds = process.collector().scanned_bounds();
+    let mut walk = Walk::begin(scratch, bounds);
     for &word in machine_roots {
         walk.seed(process, word);
         if walk.hit {
-            return true;
+            return ValveVerdict {
+                declined: true,
+                foreign_free: false,
+            };
         }
     }
     walk.seed_process_roots(process);
-    if walk.hit || !descend {
-        return walk.hit;
+    if !walk.hit && descend {
+        walk.run(process);
     }
-    walk.run(process)
+    ValveVerdict {
+        declined: walk.hit,
+        // Only a descent may claim the graph is foreign-free: the per-word phase looked at the
+        // roots alone, and a foreign container nested in a scanned one is exactly what it cannot
+        // see.
+        foreign_free: descend && !walk.foreign_reached,
+    }
 }
 
 /// The [`Process`]-only form of [`any_root_is_unscanned`], for a collection site whose machine
@@ -291,9 +338,13 @@ pub(crate) fn process_roots_are_unscanned(
 
 /// The **one** per-runtime cell holding the pids whose descent latch is open.
 ///
-/// The latch is the host's sticky, add-only per-process bit: it is set by every event that can
+/// The latch is the host's per-process bit: it is set by every event that can
 /// put a container from a region the process's collector does not scan into that process's
-/// reachable term graph, and set again (never cleared) by the valve itself on a root hit. The
+/// reachable term graph, and set again by the valve itself on a root hit. It is cleared by
+/// `Runtime::close_foreign_reachable` from the doors
+/// that hand the walk the machine's **whole** root set (`ensure_heap_full`,
+/// `alloc_words_rooted`, `gc::reds_door`) and only when the walk reports no foreign reach, so a
+/// clear can never hide a container the walk was not shown. The
 /// runtime owns the one cell and shares it by cloning the `Rc` at the collection gate's install
 /// site, so a `beam_process` signal site decides exactly as an admission point does and never
 /// pays the `O(live objects)` descent for a pid whose bit is clear. It is a **verdict-only** set
@@ -425,11 +476,20 @@ impl RuntimeCollectionGate {
     }
 }
 
-/// The walk's mutable state: the reused scratch plus whether an unscanned container has been
-/// reached.
+/// The walk's mutable state: the reused scratch, the scanned geometry the whole walk classifies
+/// against, and whether a hazard (a hit) or any foreign container at all has been reached.
 struct Walk<'a> {
     scratch: &'a mut WalkScratch,
+    /// The collector's aggregate scanned geometry, read once by the caller
+    /// ([`valve_verdict`]) and reused for every word of this walk.
+    bounds: ScannedBounds,
+    /// A hazard was reached: a foreign container forwarding a scanned word — or a root that is
+    /// one.
     hit: bool,
+    /// A container in a region the collector does not scan was reached at all (hazardous or not).
+    /// This is what an admission point that handed over its whole root set needs in order to
+    /// **close** the descent latch again (see [`ValveVerdict::foreign_free`]).
+    foreign_reached: bool,
 }
 
 /// The descent's **visited set**: the object addresses already expanded.
@@ -607,39 +667,54 @@ impl Visited {
 }
 
 impl<'a> Walk<'a> {
-    /// Starts a walk over `scratch`, resetting the reused state in `O(1)`.
-    fn begin(scratch: &'a mut WalkScratch) -> Walk<'a> {
+    /// Starts a walk over `scratch` against `bounds`, resetting the reused state in `O(1)`.
+    fn begin(scratch: &'a mut WalkScratch, bounds: ScannedBounds) -> Walk<'a> {
         scratch.pending.clear();
         scratch.visited.begin();
         Walk {
             scratch,
+            bounds,
             hit: false,
+            foreign_reached: false,
         }
     }
 
-    /// Classifies one root-set word: records a hit for a container in an unscanned region,
-    /// enqueues a container in the scanned region, and ignores everything else.
+    /// Classifies one reachable word: enqueues a container the collector scans, records a hazard
+    /// for a container it does not scan that forwards a scanned word, and ignores everything no
+    /// relocation touches.
     fn seed(&mut self, process: &Process, word: Eterm) {
         if self.hit {
             return;
         }
-        // An immediate (a small integer, an atom, `NIL`, an internal pid/port id) has no
-        // children: neither this walk nor the collector descends into it.
-        if !is_boxed(word) && !is_list(word) {
-            return;
+        // The per-word classifier, over the geometry this walk read once: `None` for an immediate
+        // (a small integer, an atom, `NIL`, an internal pid/port id — no children, and neither
+        // this walk nor the collector descends into it) and for a literal-area pointer (a frozen
+        // code constant; see the module docs).
+        match word_region(process, &self.bounds, word) {
+            None => {}
+            Some(WordRegion::Scanned) => {
+                // A container the collector scans: descend into it (once — the visited set is what
+                // makes a shared or cyclic graph terminate).
+                if self.scratch.visited.insert(ptr_val(word) as usize) {
+                    self.scratch.pending.push(word);
+                }
+            }
+            Some(WordRegion::Foreign) => self.reach_foreign(process, word),
         }
-        // A literal-area pointer is a frozen code constant; see the module docs.
-        if is_literal(word) {
-            return;
-        }
-        // The per-word classifier: `true` for a container in a region the collector does not
-        // scan, so the collection must be declined. Reused verbatim (never re-derived).
-        if root_is_unscanned(process, word) {
+    }
+
+    /// Records a container in a region the collector does not scan and decides what it means: a
+    /// hazard when it forwards a word into a region the collector **does** scan (a collection
+    /// would relocate that word without updating the container), otherwise a container to expand
+    /// so a foreign → foreign → scanned chain is still found.
+    fn reach_foreign(&mut self, process: &Process, word: Eterm) {
+        self.foreign_reached = true;
+        if forwards_scanned_word(process, &self.bounds, word) {
             self.hit = true;
             return;
         }
-        // A container the collector scans: descend into it (once — the visited set is what
-        // makes a shared or cyclic graph terminate).
+        // An inert foreign container (nothing it forwards is relocated) cannot dangle anything
+        // itself — but a foreign child of it can, so it joins the worklist like a scanned one.
         if self.scratch.visited.insert(ptr_val(word) as usize) {
             self.scratch.pending.push(word);
         }
@@ -746,9 +821,10 @@ impl<'a> Walk<'a> {
     /// Classifies every child of the object `word` names.
     fn expand(&mut self, process: &Process, word: Eterm) {
         let address: *const Eterm = ptr_val(word);
-        // SAFETY: `word` reaches the worklist only through `seed`, which enqueues exactly the
-        // boxed/cons words that are (a) genuine terms and (b) addressed inside a region the
-        // process's collector scans — i.e. live objects of the running process. `address`
+        // SAFETY: `word` reaches the worklist only through `seed`/`reach_foreign`, which enqueue
+        // exactly the boxed/cons words that are (a) genuine terms and (b) either addressed inside
+        // a region the process's collector scans or a container the region classifier called
+        // foreign — in both cases live objects of the running process's term graph. `address`
         // therefore heads a live object, so its header word and every payload word the shape
         // implies are live and readable (the same invariant `beam_term`'s own materialization
         // entry points document).
@@ -1217,18 +1293,41 @@ mod tests {
         (table, pid)
     }
 
-    /// The cons cell a case plants: built on a `beam_term` test arena, i.e. outside every region
-    /// the process's collector scans, and header-less — so the collector would have to forward
-    /// both of its words, which is exactly the hazard the valve exists for.
+    /// A **forwarding** foreign cons: built on a `beam_term` test arena — outside every region
+    /// the process's collector scans — header-less, and holding `young`, a word of the asking
+    /// process's own nursery.
+    ///
+    /// Both halves of the valve's predicate are needed for this to be a hazard: the cell is
+    /// *foreign* (so a collection would neither follow nor update it) and it *forwards a scanned
+    /// word* (so the word it holds would be relocated out from under it). That is exactly the
+    /// shape the valve exists for.
     ///
     /// The arena must **outlive** every walk that classifies the cell (the walk reads the cell's
     /// address, and a nested case descends into it).
-    fn foreign_container(arena: &mut Heap) -> Eterm {
+    fn foreign_container_over(arena: &mut Heap, young: Eterm) -> Eterm {
+        arena
+            .cons(young, make_small(12))
+            .expect("the arena builds the cons cell")
+    }
+
+    /// An **inert** foreign cons: the same arena shape over two immediates.
+    ///
+    /// It forwards no word a relocation acts on, so it imposes neither of a collector's two
+    /// obligations toward a container — and the valve must not decline on it (see case (e) of
+    /// [`a_foreign_container_in_every_seeded_root_family_is_detected`]).
+    fn inert_foreign_container(arena: &mut Heap) -> Eterm {
         arena
             .cons(make_small(11), make_small(12))
             .expect("the arena builds the cons cell")
     }
 
+    /// A word of `process`'s **young** heap — the scanned word a forwarding fixture points at.
+    fn young_word(process: &mut Process) -> Eterm {
+        process
+            .heap_mut()
+            .tuple(&[make_small(21), make_small(22)])
+            .expect("the young heap builds `{21,22}`")
+    }
     /// One root family [`Walk::seed_process_roots`] seeds from, and how a word is planted in it.
     struct RootFamily {
         /// The family's name (the failure messages name it).
@@ -1375,20 +1474,31 @@ mod tests {
         total + buf.len()
     }
 
-    /// **The pin: an unscanned container in ANY single root family is detected, and a clean
-    /// process is not.**
+    /// **The pin: an unscanned container that forwards a scanned word in ANY single root family is
+    /// detected, and a clean process is not.**
     ///
-    /// For every family in [`ROOT_FAMILIES`], four cases:
+    /// For every family in [`ROOT_FAMILIES`], five cases:
     ///
     /// * **clean** — nothing planted: neither phase may report a hit (the negative control that
     ///   keeps the assertions below from being satisfied by a walk that always answers `true`);
-    /// * **direct** — the foreign cons cell *is* the root word: the per-word phase must catch it
-    ///   with the descent gate **closed** (so a family the walk seeds only inside the descent
+    /// * **direct** — the forwarding foreign cons *is* the root word: the per-word phase must catch
+    ///   it with the descent gate **closed** (so a family the walk seeds only inside the descent
     ///   would fail here);
     /// * **nested** — a scanned young tuple holding the foreign cell is the root word: the gated
     ///   phase must NOT report a hit (the per-word classifier cannot see through a scanned
     ///   container) and the descent MUST (so the family is really seeded as a descent origin);
-    /// * **safe** — a young tuple holding an immediate: no hit either way.
+    /// * **safe** — a young tuple holding an immediate: no hit either way;
+    /// * **inert** — a foreign cons of *immediates* planted directly: **no** hit either way.
+    ///
+    /// Case (e) is the expectation this suite deliberately **flipped** when the valve grew its
+    /// second fact. The old case pinned "a container from an unscanned region declines", and an
+    /// all-immediate arena cons was such a container — which was the bug: a copying collector owes
+    /// a container exactly two things, *follow* and *update*, and a shape whose cells are all
+    /// immediates imposes neither. Declining on it cost the process every collection it would ever
+    /// run (each admission point refuses, so the heap only grows), and every allocating process
+    /// holds such a block — `make_ref/0`'s childless M1 object is the degenerate case. So the
+    /// hazard-shaped fixture the other cases plant has to **forward a word of the asking process's
+    /// own nursery** ([`foreign_container_over`]) to be a hazard at all.
     ///
     /// The word count of the gathered set is pinned too ([`collect_root_words`]): the walk must
     /// seed exactly the words `Process::collect` gathers.
@@ -1396,9 +1506,6 @@ mod tests {
     fn a_foreign_container_in_every_seeded_root_family_is_detected() {
         for family in ROOT_FAMILIES {
             let name = family.name;
-            // One arena per family: its cell must outlive every walk below that classifies it.
-            let mut arena = Heap::new(64);
-            let foreign = foreign_container(&mut arena);
 
             // (0) The word count, on a process whose every family is non-empty — where they are
             //     plantable at all (an empty root set still pins the register family's length).
@@ -1434,28 +1541,38 @@ mod tests {
                 );
             }
 
-            // (b) direct: the foreign cell is the root word itself.
+            // (b) direct: the forwarding foreign cell is the root word itself.
             {
                 let (mut table, pid) = seeded_process();
+                // The arena outlives every walk below (it is declared before them), and is built
+                // over this process's own nursery word — so it is foreign *and* forwarding.
+                let mut arena = Heap::new(64);
+                let foreign = {
+                    let process = table.get_mut(pid).expect("the spawned process");
+                    let young = young_word(process);
+                    foreign_container_over(&mut arena, young)
+                };
                 (family.plant)(table.get_mut(pid).expect("the spawned process"), foreign);
                 let (gated, descended) = seeded_answers(&table, pid);
                 assert!(
                     gated,
-                    "{name}: a foreign container planted directly in this family must be caught \
-                     by the per-word phase, with the descent gate closed"
+                    "{name}: a foreign container forwarding a nursery word, planted directly in \
+                     this family, must be caught by the per-word phase with the descent gate closed"
                 );
                 assert!(
                     descended,
-                    "{name}: a foreign container planted directly in this family must be caught \
-                     by the full valve"
+                    "{name}: a foreign container forwarding a nursery word, planted directly in \
+                     this family, must be caught by the full valve"
                 );
             }
 
-            // (c) nested: a SCANNED young tuple holding the foreign cell.
+            // (c) nested: a SCANNED young tuple holding the forwarding foreign cell.
             {
                 let (mut table, pid) = seeded_process();
-                let wrapper = {
-                    let process = table.get_mut(pid).expect("the spawned process");
+                let mut arena = Heap::new(64);
+                let wrapper = {                    let process = table.get_mut(pid).expect("the spawned process");
+                    let young = young_word(process);
+                    let foreign = foreign_container_over(&mut arena, young);
                     let wrapper = process
                         .heap_mut()
                         .tuple(&[foreign])
@@ -1494,9 +1611,23 @@ mod tests {
                      (gated {gated}, descended {descended})"
                 );
             }
+
+            // (e) inert: a foreign container that forwards no scanned word.
+            {
+                let (mut table, pid) = seeded_process();
+                let mut arena = Heap::new(64);
+                let inert = inert_foreign_container(&mut arena);
+                (family.plant)(table.get_mut(pid).expect("the spawned process"), inert);
+                let (gated, descended) = seeded_answers(&table, pid);
+                assert!(
+                    !gated && !descended,
+                    "{name}: a foreign container of immediates imposes neither a follow nor an \
+                     update obligation, so it must never decline a collection \
+                     (gated {gated}, descended {descended})"
+                );
+            }
         }
     }
-
     /// **The mailbox envelope contributes three root words per message** — `payload`, `from` and
     /// `token`, exactly as [`Process::collect`] gathers them.
     ///

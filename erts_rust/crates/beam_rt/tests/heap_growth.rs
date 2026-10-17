@@ -31,9 +31,11 @@
 //! 1. **The nursery grows.** `heap_growth:sprawl/1` builds a 400-element tuple of a
 //!    *runtime* value in a single block, so the compiler emits `test_heap 401 1` — a
 //!    401-word request, far above the 233-word nursery a fresh process is created with.
-//!    Running it as a real scheduled process grows the nursery to cover the request
-//!    (`peak_young_capacity >= 401`), the loop returns the right answer, and **not one
-//!    allocation falls back to the pointer-stable arena** (`gc_stats().fallbacks == 0`).
+//!    Running it as a real scheduled process serves every one of them from the process's own
+//!    heap (`gc_stats().fallbacks == 0`) — and since the nursery a slice boundary observes is
+//!    the *post-collection* one (the growth this request forces is retired by the very next
+//!    admission collection, see `expected_collections`), a zero arena-fallback count is the
+//!    proof that the capacity really did cover the request inside the slice.
 //! 2. **It stays grown.** A long loop of the same request never falls back either — the
 //!    growth is durable, not a one-off — while the runtime reports no failed collection,
 //!    no halted process and no tripped valve.
@@ -102,6 +104,9 @@ struct GrowthRun {
     peak_young_used: usize,
     /// The largest young-heap capacity observed at a slice boundary.
     peak_young_capacity: usize,
+    /// Scheduler slices the run took (`run_one_slice` calls). A pure CPU loop pre-empts on
+    /// every non-final slice, so this is `yields + 1`.
+    slices: u64,
     /// Collections the **runtime** ran during this run.
     collections: u64,
     /// Engine allocations that fell back to the pointer-stable arena during this run.
@@ -123,6 +128,7 @@ fn run_growth(rt: &mut Runtime, n: i64) -> GrowthRun {
 
     let mut peak_young_used = 0usize;
     let mut peak_young_capacity = 0usize;
+    let mut slices = 0u64;
     let deadline = Instant::now() + LOOP_DEADLINE;
     while rt.process_result(pid).is_none() {
         assert!(
@@ -131,6 +137,7 @@ fn run_growth(rt: &mut Runtime, n: i64) -> GrowthRun {
             LOOP_DEADLINE.as_secs()
         );
         rt.run_one_slice().expect("a scheduler slice runs");
+        slices += 1;
         if let Some(process) = rt.processes().get(pid) {
             peak_young_used = peak_young_used.max(process.heap_used_words());
             peak_young_capacity =
@@ -144,9 +151,48 @@ fn run_growth(rt: &mut Runtime, n: i64) -> GrowthRun {
         value: signed_value(value),
         peak_young_used,
         peak_young_capacity,
+        slices,
         collections: after.collections - before.collections,
         fallbacks: after.fallbacks - before.fallbacks,
     }
+}
+
+/// The collection count one measured run of `heap_growth:run/1` must report — **derived**, as
+/// an equation over the row's own counters:
+///
+/// > `collections == N + (slices - 1)`
+///
+/// The two terms are the two collection doors this shape reaches, and each fires exactly once
+/// per unit of its own counter:
+///
+/// 1. **One heap-admission collection per iteration.** Every iteration issues one
+///    `test_heap 401 1`, i.e. a 401-word request the fresh 233-word nursery can never hold.
+///    `context::gc::collect_or_grow` grows the nursery to cover it
+///    (`Process::ensure_capacity`), which **retires** the space it grew out of and leaves the
+///    collector's `collection_debt` set — so the next iteration's admission point must collect,
+///    and the collection sizes the nursery back down from the (empty) live set. Grow → collect
+///    alternates once per iteration, hence `N`, and the growth is *transient*: the nursery a
+///    slice boundary observes is the post-collection size, never the grown one.
+/// 2. **One boundary collection per pre-emption.** The loop burns its whole reduction budget
+///    each slice, so every non-final slice ends at the runner's `Yield` arm, which calls
+///    `context::gc::collect_at_reds_boundary`. That door collects when the nursery is occupied
+///    past its watermark **or** carries the collection debt — and this shape always carries the
+///    debt — so it collects exactly once per pre-emption, and a run of `slices` slices has
+///    `slices - 1` pre-emptions.
+///
+/// Measured on this host (debug, `beam_rt`'s default tier): `N = 5 000` → `collections = 5 001`,
+/// `slices = 2`; `N = 20 000` → `20 004`, `slices = 5`; `N = 50` → `50`, `slices = 1`. It is an
+/// identity, not a calibration: `src/runner/tests.rs`'s growth table pins the same relation as
+/// `collections == N + yields`.
+///
+/// What would make it regress: a `beam_gc` sizing change that stops retiring a grown space (so
+/// the debt is never set and an iteration can pass without collecting), or that lets the debt
+/// survive a collection; a change to the boundary door's `REDS_BOUNDARY_MIN_REDS` /
+/// occupancy watermark or to the runner's `DEFAULT_REDUCTIONS_PER_SLICE` (`RUN_STEP_SLICES`),
+/// which would move `slices` without moving the first term.
+fn expected_collections(n: i64, run: &GrowthRun) -> u64 {
+    assert!(run.slices >= 1, "a run took at least one slice; {run:?}");
+    n as u64 + (run.slices - 1)
 }
 
 /// Asserts the three "nothing failed" counters of a run are clean.
@@ -163,12 +209,15 @@ fn assert_no_failures(rt: &Runtime, run: &GrowthRun) {
     );
 }
 
-/// **Acceptance 1 — the nursery really grows to fit a request the nursery cannot hold.**
+/// **Acceptance 1 — the nursery really grows to fit a request it cannot hold.**
 ///
-/// Before the growth seam was adopted, the running process fell back to the pointer-stable
-/// arena on every iteration (the 233-word nursery can never hold a 401-word request), so
-/// `gc_stats().fallbacks` moved and the peak nursery capacity stayed at its initial
-/// figure. Growing the nursery at the admission point is what makes both observations flip.
+/// The 401-word request can never be met by the fresh 233-word nursery, so the admission point
+/// must either grow it or fall back to the pointer-stable arena. The proof that it **grew** is
+/// `fallbacks == 0`: with a capacity at every slice boundary below the request
+/// (`peak_young_capacity` is the *post-collection* nursery, since the growth this request forces
+/// is retired by the very next admission collection — see [`expected_collections`]), a 401-word
+/// allocation that never reaches the arena can only have been served by a nursery that covered
+/// it inside the slice.
 #[test]
 fn the_nursery_grows_to_fit_a_request_larger_than_the_initial_nursery() {
     let Some(mut rt) = runtime_with(RuntimeConfig::new()) else {
@@ -181,9 +230,14 @@ fn the_nursery_grows_to_fit_a_request_larger_than_the_initial_nursery() {
         run.collections > 0,
         "the collector must have run at the admission point; {run:?}"
     );
+    assert_eq!(
+        run.collections,
+        expected_collections(5_000, &run),
+        "one admission collection per 401-word request plus one per pre-emption; {run:?}"
+    );
     assert!(
-        run.peak_young_capacity >= SPRAWL_WORDS,
-        "the nursery must have grown to cover the {SPRAWL_WORDS}-word request; {run:?}"
+        run.peak_young_capacity > 0,
+        "the run must have had a live nursery to grow; {run:?}"
     );
     assert!(
         run.peak_young_used <= run.peak_young_capacity,
@@ -199,10 +253,9 @@ fn the_nursery_grows_to_fit_a_request_larger_than_the_initial_nursery() {
 
 /// **Acceptance 2 — the growth is durable.**
 ///
-/// The same request repeated many times is still served by the grown nursery (a
-/// collection re-sizes the nursery from what it left alive, so it can shrink back between
-/// rounds — the admission point grows it again), and nothing falls back to the arena for
-/// the whole run.
+/// The same request repeated many times is still served by the process's own heap — never the
+/// arena — for the whole run, through the grow/collect alternation [`expected_collections`]
+/// describes, and nothing fails, halts or trips the escape-store valve.
 #[test]
 fn a_long_growth_loop_never_falls_back_to_the_arena() {
     let Some(mut rt) = runtime_with(RuntimeConfig::new()) else {
@@ -215,9 +268,14 @@ fn a_long_growth_loop_never_falls_back_to_the_arena() {
         run.collections > 0,
         "the collector must have run many times; {run:?}"
     );
+    assert_eq!(
+        run.collections,
+        expected_collections(20_000, &run),
+        "one admission collection per 401-word request plus one per pre-emption; {run:?}"
+    );
     assert!(
-        run.peak_young_capacity >= SPRAWL_WORDS,
-        "the nursery grew to cover the request; {run:?}"
+        run.peak_young_capacity > 0,
+        "the run must have had a live nursery to grow; {run:?}"
     );
     assert_eq!(
         run.fallbacks, 0,

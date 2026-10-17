@@ -6226,8 +6226,13 @@ fn an_immediate_result_rewinds_the_pool_without_a_copy() {
 /// the BIF built on `ctx.heap()` escape into state that outlives the call. The case drives one of
 /// them — the process-dictionary arm — with a BIF that **does** allocate on the BIF heap:
 /// `erlang:get_keys/1` builds its key list there. The stored term (`7`) is a small integer, so
-/// the observable proof is the *result*: it stays on the pooled heap (still classified foreign)
-/// and the pool's `used()` is **not** reset.
+/// the observable proof is the *result*: it stays on the pooled heap — its address is outside
+/// every region the process's collector scans — and the pool's `used()` is **not** reset.
+///
+/// The witness is the result's **region**, not `root_is_unscanned`'s verdict: the key list is a
+/// cons of immediates and so, under the valve's forwarding fact, it is an *inert* foreign
+/// container that never declines a collection by itself. What must not happen is the copy-out —
+/// a moved result would sit in the process's young space instead.
 #[test]
 fn an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool() {
     let (mut rt, mut table, pid) = gc_root_set_rig();
@@ -6257,9 +6262,16 @@ fn an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool() {
     );
 
     let process = table.get(pid).expect("the process");
+    // The witness is the result's REGION, not `root_is_unscanned`'s verdict: `[7]` is a cons of
+    // immediates, so under the valve's forwarding fact it is an *inert* foreign container and
+    // never declines a collection by itself. A copy-out would instead have put it in the
+    // process's young space.
     assert!(
-        super::gc::root_is_unscanned(process, keys),
-        "the `dict` arm is an escaping seam, so the result must NOT have been moved"
+        !process
+            .collector()
+            .young_contains(beam_term::list::ptr_val(keys) as *const Eterm),
+        "the `dict` arm is an escaping seam, so the result must NOT have been moved onto the \
+         process's scanned heap"
     );
     assert!(
         rt.bif_heaps.first().expect("the pool owns a heap").used() > 0,
@@ -6386,9 +6398,14 @@ fn an_escaping_arm_does_not_rewind_a_partially_used_pool() {
         "get_keys/1 builds a list on `ctx.heap()`"
     );
     let process = table.get(pid).expect("the process");
+    // As above: the region is the witness, not the valve's verdict — `[7]` forwards no scanned
+    // word, so an inert foreign cons can never decline a collection on its own.
     assert!(
-        super::gc::root_is_unscanned(process, keys),
-        "the `dict` arm is an escaping seam, so the result must NOT have been moved"
+        !process
+            .collector()
+            .young_contains(beam_term::list::ptr_val(keys) as *const Eterm),
+        "the `dict` arm is an escaping seam, so the result must NOT have been moved onto the \
+         process's scanned heap"
     );
     assert!(
         rt.bif_heaps.first().expect("the pool owns a heap").used() > mark,
@@ -7395,11 +7412,27 @@ fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
         full.debt,
     );
     assert!(full.occupancy > 0, "the occupancy test still lets the door through");
-    assert!(
-        full.debt > 0,
-        "a no-collect growth leaves collection debt at the full-root door: debt={}",
-        full.debt,
-    );
+    // The growth seam's collection debt only exists when a reach actually fell through the valve
+    // to a young-heap refusal that a growth met. With the valve's forwarding fact this workload
+    // no longer declines at all (`hits == 0` below), so nothing is refused and no debt is left:
+    // the circle cannot start, which is a stronger answer than breaking it. Pin the disjunction
+    // rather than dropping the claim, so a regression that reintroduces declines must also
+    // produce the debt again.
+    if full.hits > 0 {
+        assert!(
+            full.debt > 0,
+            "a decline that a no-collect growth met must leave collection debt at the full-root \
+             door: debt={} hits={}",
+            full.debt,
+            full.hits,
+        );
+    } else {
+        assert_eq!(
+            full.debt, 0,
+            "nothing was declined and so nothing needed a growth: debt={}",
+            full.debt,
+        );
+    }
     assert_eq!(full.forced, 0, "the workload requests no collection");
     // (3) The door really **collects** — the circle is broken at its entry point: the collection is
     //     no longer declined at (almost) every reach, and what remains is a small fraction of the

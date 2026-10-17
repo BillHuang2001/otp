@@ -414,19 +414,21 @@ worker() ->
 ```
 Oracle: `pingpong:go(N)` answers `N` for every `N` (verified against `erl -noshell`).
 
-## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload` · `pt_gc` · `churn`, committed)
+## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload` · `pt_gc` · `churn` · `vp`, committed)
 
-These seven are committed oracle fixtures for the process-heap collector
+These eight are committed oracle fixtures for the process-heap collector
 (`tests/gc_collect.rs`, `tests/heap_growth.rs`, `tests/gc_strategy.rs`,
-`tests/gc_immix_payload.rs`, `tests/persistent_term.rs` and `tests/rss_bound.rs`):
+`tests/gc_immix_payload.rs`, `tests/persistent_term.rs`, `tests/rss_bound.rs` and
+`tests/foreign_root_loop.rs`):
 * `gc_loop.beam` — `loop/1` tail-recursively conses every iteration (`build/1`), so a
   scheduled process really allocates; the acceptance evidence that the collector runs at the
   engine's heap-admission point.
 * `gc_ints.beam` — `l1/1` accumulates `+`/`rem` on small integers only: it allocates nothing,
   pinning that a non-allocating loop's young heap never moves.
 * `gc_floats.beam` — `l1/1` accumulates `sqrt/1` in one IEEE-754 double: a module with a
-  float-family instruction is never collected over (a live float register is outside the root
-  set), and its result must stay exact.
+  float-family instruction is collected over safely (the engine reaches only the full door,
+  which publishes the machine's whole root set — the FR file included — so a live float
+  register is relocated like any other root), and its result must stay exact.
 * `heap_growth.beam` — `sprawl/1` builds a 400-element tuple of a *runtime* value in one block
   (the compiler emits a single `test_heap 1 401`, far above the 233-word fresh nursery) and
   `run/1` repeats it, discarding each tuple, so a runtime that cannot grow the nursery must
@@ -455,10 +457,23 @@ These seven are committed oracle fixtures for the process-heap collector
   §6.7 grew roughly linearly), and the deterministic companion asserts
   `Runtime::gc_stats().collections > 0` for a scheduled run.
 
-All seven are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
+* `vp.beam` — the **unscanned-root valve** witness (`tests/foreign_root_loop.rs`): `hold/1`
+  keeps the 3-tuple `erlang:statistics(garbage_collection)` returns — a `RuntimeHooks`-served
+  BIF's result, so it lives on the pooled BIF heap, a region the collector does not scan — as
+  its own accumulator for a whole loop, and `control/1` is the same loop reading only
+  `element(1, ...)` (a small integer, so no foreign container is ever a root). Both throw away a
+  fresh runtime-valued `junk/1` term per iteration, which is what gives the loop a
+  heap-admission point at all. The tuple's three elements are small integers, so it forwards no
+  word a relocation would follow or update: it is **inert**, so the loop must keep collecting
+  (`collections == N / 17` — 13 words of `junk` per iteration against a 233-word nursery), its
+  `heap_size` must stay on the collector's geometry plateau, and `hold` must be
+  indistinguishable from `control`. With the pre-rework "any foreign container is a hazard"
+  classification the same fixture reports **0** collections and a heap that grows linearly with
+  `N` (121 387 / 318 037 / 2 032 432 words at N = 5 000 / 10 000 / 100 000).
+All eight are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
 
 ```sh
-for f in gc_loop gc_ints gc_floats heap_growth gc_payload pt_gc churn; do    SCRATCH="$TMPDIR/beam_rt_${f}_fix"
+for f in gc_loop gc_ints gc_floats heap_growth gc_payload pt_gc churn vp; do    SCRATCH="$TMPDIR/beam_rt_${f}_fix"
     rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
     cp "$f.erl" "$SCRATCH/gen/"
     ( cd "$SCRATCH/gen" && erlc +deterministic "$f.erl" )

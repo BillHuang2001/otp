@@ -48,6 +48,8 @@ use super::run::{
     reset_registered_payload_total, reset_run_slice_counters, run_slice_counters, RuntimeRunner,
 };
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
+mod boundary_cost;
+mod reds_door;
 use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
@@ -2865,17 +2867,25 @@ fn growth_runtime(fixture: &str) -> Runtime {
     rt
 }
 
-/// Runs one growth-shaped workload at three increasing iteration counts and prints the counter
-/// table; every counter is reported so a caller can read it without the test source.
-fn counter_table(fixture: &str, module: &str, counts: [i64; 3]) -> [(i64, GrowthCounters); 3] {
-    let rows = counts.map(|n| {
-        let mut rt = growth_runtime(fixture);
-        let row = run_growth_counted(&mut rt, module, n);
-        assert_eq!(row.value, n, "{module}:run({n}) must return its argument");
-        assert_eq!(row.errors, 0, "no collection may fail: N={n} {row:?}");
-        assert_eq!(row.waits, 0, "{module}:run/1 never parks in a receive: {row:?}");
-        (n, row)
-    });
+/// Runs one growth-shaped workload at each of `counts` (increasing iteration counts, a fresh
+/// runtime per row) and prints the counter table; every counter is reported so a caller can read
+/// it without the test source.
+fn counter_table(
+    fixture: &str,
+    module: &str,
+    counts: &[i64],
+) -> Vec<(i64, GrowthCounters)> {
+    let rows: Vec<(i64, GrowthCounters)> = counts
+        .iter()
+        .map(|&n| {
+            let mut rt = growth_runtime(fixture);
+            let row = run_growth_counted(&mut rt, module, n);
+            assert_eq!(row.value, n, "{module}:run({n}) must return its argument");
+            assert_eq!(row.errors, 0, "no collection may fail: N={n} {row:?}");
+            assert_eq!(row.waits, 0, "{module}:run/1 never parks in a receive: {row:?}");
+            (n, row)
+        })
+        .collect();
     eprintln!(
         "counter_table {module} (N : slices yields waits collections major fallbacks \
          peak_spaces peak_cap peak_mature_cap peak_mature_used debt_bounds | \
@@ -2905,7 +2915,6 @@ fn counter_table(fixture: &str, module: &str, counts: [i64; 3]) -> [(i64, Growth
     }
     rows
 }
-
 /// **The headline evidence: on a growth-shaped workload the per-call counters are FLAT in N.**
 ///
 /// `churn:run/1` is driven at three increasing iteration counts on a fresh runtime each time, so
@@ -2916,8 +2925,10 @@ fn counter_table(fixture: &str, module: &str, counts: [i64; 3]) -> [(i64, Growth
 /// the excess wall clock is **not** extra per-call GC/runner work.
 #[test]
 fn the_churn_workloads_per_call_counters_are_flat_in_n() {
-    let rows = counter_table(churn_fixture(), "churn", [2_000, 10_000, 40_000]);
-    let [(n1, r1), (_, r2), (n3, r3)] = rows;
+    let rows = counter_table(churn_fixture(), "churn", &[2_000, 10_000, 40_000]);
+    let (n1, r1) = rows[0];
+    let (n2, r2) = rows[1];
+    let (n3, r3) = rows[2];
 
     // The collector really ran (the loop is allocation-heavy), so a flat ratio is a measured
     // fact, not the vacuous "nothing happens" of a declined collection.
@@ -2946,66 +2957,99 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
         r3.slices as f64 / (n3 + 1) as f64,
     );
     // The second run's ratios must sit between the two (no non-monotonic blow-up either).
-    let mid = r2.collections as f64 / (10_000 + 1) as f64;
+    let mid = r2.collections as f64 / (n2 + 1) as f64;
     assert!(
         mid <= 1.5 * r1.collections as f64 / (n1 + 1) as f64,
         "the middle N must not blow up either: {mid:.6}/call"
     );
 }
 
-/// **The mechanism control: the engine-native growth shape enters the nursery-growth path and
-/// still has flat per-call counters.**
+/// **The mechanism control: the engine-native growth shape is *collected*, not grown, at exactly
+/// one collection per iteration plus one per pre-emption — with flat per-call counters.**
 ///
 /// `heap_growth:run/1` repeats a single 401-word `test_heap` allocation — far above a fresh
-/// process's nursery — so it *must* reach the engine's full heap-admission door
+/// process's nursery (233 words) — so it *must* reach the engine's full heap-admission door
 /// (`RuntimeContext::ensure_heap_full` → `Context::collect_or_grow`) on **every** iteration,
 /// with **no** registered-BIF result copy-out involved. That makes it the control for the
 /// `churn` shape: `churn` drives the BIF-result copy path, `heap_growth` drives the pure
-/// engine-allocation growth path, and if the collection-debt / retired-nursery mechanism were
-/// the source of an N-dependent per-call cost, this shape is where it would show.
+/// engine-allocation path, and if the collection-debt / retired-nursery mechanism were the
+/// source of an N-dependent per-call cost, this shape is where it would show.
 ///
 /// Its iteration counts are chosen so that **every** run spans several reduction slices (the
 /// only window a live process's collector is readable from outside the runner), unlike a small
 /// run that the native baseline tier completes inside a single slice.
 ///
-/// The test pins three structural facts:
+/// # The count is `collections == N + yields`, and it is *derived*
 ///
-/// * **every iteration reaches the collection/growth door** (`collections >= N`), so the
-///   mechanism is genuinely exercised — not declined away;
-/// * **the retired-nursery chain really grows** (`peak_young_spaces >= 2`), so the
-///   no-relocation growth seam (`Process::grow_nursery`) and its collection debt are live;
-/// * the per-call counters nonetheless stay flat in N (`collections/call` and `slices/call`
-///   ratios bounded), so the per-call work is constant on this shape too.
+/// Two independent doors, one collection each:
+///
+/// * **one per iteration — the heap-admission door.** The 401-word request cannot fit the current
+///   space, so `collect_or_grow` collects on *that* iteration; `beam_gc`'s two-step
+///   `adjust_after_fullsweep` rule then sizes the next space from the loop's tiny live set, so the
+///   *following* iteration again cannot fit and collects again. No iteration takes the
+///   no-relocation `grow_nursery` arm, which is why the boundary-sampled retired chain stays at a
+///   single space (`peak_young_spaces == 1`) and no boundary observes an un-settled debt
+///   (`debt_boundaries == 0`): the shape is collected, never grown.
+/// * **one per pre-emption — the reduction/yield-boundary door**
+///   ([`crate::context::gc::reds_door`], called from the runner's `Yield` arm). A slice spends
+///   `DEFAULT_REDUCTIONS_PER_SLICE` = 4 000 reds, which is exactly the door's
+///   `REDS_BOUNDARY_MIN_REDS` interval, and the loop's 401-word allocation per iteration fills the
+///   space well past the door's 7/8 occupancy watermark, so **every** pre-emption collects —
+///   once, never more, because the interval resets at each boundary.
+///
+/// Hence the relation this test pins, over each row's own counters:
+/// `collections == N + yields` — with no constant to calibrate. Measured (this host, debug build)
+/// at N = 5 000 / 10 000 / 25 000 / 50 000 / 100 000: `collections` = 5 001 / 10 002 / 25 006 /
+/// 50 012 / 100 024 against `yields` = 1 / 2 / 6 / 12 / 24.
+///
+/// # What would make it regress
+///
+/// * a `beam_gc` sizing change that re-introduces a growth arm (a collection that leaves the next
+///   space too small to hold the request): the per-iteration collection would disappear, so the
+///   count would fall **below** `N` (and `peak_young_spaces` would rise above 1);
+/// * a change to [`REDS_BOUNDARY_MIN_REDS`](crate::context::gc::reds_door::REDS_BOUNDARY_MIN_REDS)
+///   or to the door's occupancy watermark, or a valve/latch change that made the door decline: the
+///   boundary collections would stop tracking `yields` one-for-one;
+/// * a slice-granularity change (`RUN_STEP_SLICES`, `DEFAULT_REDUCTIONS_PER_SLICE`) that moves
+///   `yields` itself — the equation would still hold, but the measured readings quoted above
+///   would move.
 #[test]
 fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
-    const COUNTS: [i64; 3] = [10_000, 25_000, 50_000];
-    let rows = counter_table(heap_growth_fixture(), "heap_growth", COUNTS);
-    let [(n1, r1), (_, r2), (n3, r3)] = rows;
+    // Five N, spanning a slice boundary count from 2 to 26: the relation is checked on every row
+    // rather than at two endpoints, so a change that only bites in the mid range still shows.
+    const COUNTS: [i64; 5] = [5_000, 10_000, 25_000, 50_000, 100_000];
+    let rows = counter_table(heap_growth_fixture(), "heap_growth", &COUNTS);
+    let (n1, r1) = rows[0];
+    let (n2, r2) = rows[1];
+    let (n3, r3) = rows[3];
+    let (_, last) = rows[4];
 
-    // The 401-word request cannot fit a fresh nursery, so the growth/collection door is reached
-    // on essentially every iteration; the two iterations that do not collect take the
-    // no-relocation **growth** arm instead (a fresh nursery that cannot be grown by collecting —
-    // there is nothing to free — is enlarged, which is why the retired chain is longer than one
-    // space). The count is therefore `N - 2` **exactly**, at every N: a constant offset, derived,
-    // not an inequality — the calibrated form of "every iteration reaches the door".
-    assert_eq!(
-        r1.collections,
-        (n1 as u64) - 2,
-        "the door is reached once per iteration bar the two growth warm-ups: N={n1} collections={}: \
-         {r1:?}",
-        r1.collections
-    );
-    assert_eq!(
-        (r2.collections, r3.collections),
-        ((25_000u64) - 2, (n3 as u64) - 2),
-        "the offset is constant in N (never a per-call work increase): {r2:?} {r3:?}"
-    );
+    // The relation, exact, on every measured row: one collection per iteration (the admission
+    // door) plus one per pre-emption (the boundary door). Derived above, never calibrated.
+    for &(n, row) in &rows {
+        assert_eq!(
+            row.collections,
+            (n as u64) + (row.yields as u64),
+            "N={n}: expected N + yields = {} collections (one per iteration + one per \
+             pre-emption), got {}: {row:?}",
+            (n as u64) + (row.yields as u64),
+            row.collections
+        );
+    }
+    // ... and the shape really is collected rather than grown: no iteration retires a nursery
+    // space through the no-relocation growth arm, so the boundary-sampled chain stays at one
+    // space and no boundary observes a debt the door would have to settle. (This is the inverse
+    // of what the retired-chain check asserted before `beam_gc`'s fullsweep-nursery-sizing fix:
+    // with the C's two-step `adjust_after_fullsweep` rule the door *succeeds* every iteration.)
+    for &(n, row) in &rows {
+        assert_eq!(
+            (row.peak_young_spaces, row.debt_boundaries),
+            (1, 0),
+            "N={n}: the growth shape must be collected, not grown (no retired space, no \
+             un-settled debt): {row:?}"
+        );
+    }
     assert!(r3.collections > r1.collections, "more iterations ⇒ more collections: {r3:?}");
-    assert!(
-        r1.peak_young_spaces >= 2,
-        "the growth shape must retire a nursery (peak_young_spaces={}): {r1:?}",
-        r1.peak_young_spaces
-    );
 
     let collections_per_call_ratio =
         (r3.collections as f64 / (n3 + 1) as f64) / (r1.collections as f64 / (n1 + 1) as f64);
@@ -3017,15 +3061,16 @@ fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
         r3.collections as f64 / (n3 + 1) as f64,
     );
     let slices_per_call_ratio =
-        (r3.slices as f64 / (n3 + 1) as f64) / (r1.slices as f64 / (n1 + 1) as f64);
+        (last.slices as f64 / (last.value + 1) as f64) / (r1.slices as f64 / (n1 + 1) as f64);
     assert!(
         slices_per_call_ratio <= 1.5,
-        "slices/call must not grow with N: N={n1} {:.6}/call, N={n3} {:.6}/call, ratio \
-         {slices_per_call_ratio:.3}",
+        "slices/call must not grow with N: N={n1} {:.6}/call, N={} {:.6}/call, ratio {:.3}",
         r1.slices as f64 / (n1 + 1) as f64,
-        r3.slices as f64 / (n3 + 1) as f64,
+        last.value,
+        last.slices as f64 / (last.value + 1) as f64,
+        slices_per_call_ratio,
     );
-    let mid = r2.collections as f64 / (25_000 + 1) as f64;
+    let mid = r2.collections as f64 / (n2 + 1) as f64;
     assert!(
         mid <= 1.5 * r1.collections as f64 / (n1 + 1) as f64,
         "the middle N must not blow up either: {mid:.6}/call"
