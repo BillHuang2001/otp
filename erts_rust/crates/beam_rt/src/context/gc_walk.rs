@@ -197,11 +197,10 @@ use std::rc::Rc;
 use beam_process::{Process, ProcessId};
 use beam_term::layout::for_each_child_slot;
 use beam_term::list::ptr_val;
-use beam_term::literal::is_literal;
-use beam_term::prelude::{is_boxed, is_list};
+use beam_term::prelude::is_list;
 use beam_term::Eterm;
 
-use super::gc::{forwards_scanned_word, root_is_unscanned_with, word_region, WordRegion};
+use super::gc::{forwards_scanned_word, word_region, WordRegion};
 use beam_gc::ScannedBounds;
 
 // ============================ END TEMPORARY POLICY SWITCH ============================
