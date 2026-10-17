@@ -248,7 +248,7 @@ mod tests {
             assert!(!case.description.is_empty(), "{}", case.id);
             assert!(case.extra_argv().is_empty(), "{}", case.id);
             assert!(case.env().is_empty(), "{}", case.id);
-            let stdout = case.golden.stdout.expect("{} has a golden");
+            let stdout = case.golden.stdout.expect("every case carries a golden");
             assert!(
                 stdout.starts_with("ok "),
                 "{}: a Value golden is `ok …`",
