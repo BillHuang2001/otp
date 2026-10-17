@@ -38,7 +38,7 @@
 //!
 //! # Measured divergences that are deliberately NOT cases (handoffs, never `mismatch`-pinned)
 //!
-//! Each item below is a plain Erlang value/reason, so pinning it would be a `mismatch`; it is
+//! Each item below is a differing observable, so pinning it would be a `mismatch`; it is
 //! reported to the runtime owners (`beam_rt` / `beam_io`) instead. Verified in this
 //! environment (oracle OTP 29.1.1 / `erts-17.1`; the built `beam_rt`) with `differential
 //! compare`:
@@ -51,16 +51,21 @@
 //!   really writes to the process stdout — `"hellook <<…>>"`) but is `error:badarg` under
 //!   `beam_rt`; `open_port({fd, 1}, [out])` is `error:badarg` under the oracle but opens under
 //!   `beam_rt` (`"hellook <<…>>"`). Neither fd grammar can be pinned until they agree.
-//! * **the `{line, N}` option.** With a child that emits a line the oracle frames its input as
-//!   `{Port, {data, {eol, Line}}}` (`Line` without its terminator); `beam_rt` delivers the raw
-//!   bytes `{Port, {data, <<"hello\n">>}}` — no line framing.
 //! * **the `eof` option.** `open_port({spawn, "true"}, [binary, eof])` delivers `{Port, eof}`
-//!   under the oracle once the child closes its output; `beam_rt`'s `eof` is inert.
-//! * **`port_command(P, 42)`** (a non-iodata payload): the oracle raises `error:badarg`;
-//!   `beam_rt` accepts it and answers `true`.
+//!   under the oracle once the child closes its output; `beam_rt`'s `eof` is inert (only the
+//!   live-child no-eof shape is pinned, by `super::driver`'s
+//!   `driver/open_port_eof_option_live_child_no_eof`).
+//! * **`port_command(P, 42)`** (a non-iodata payload): both runtimes raise `error:badarg`, but
+//!   the oracle *also* writes a timestamped `Bad value on output port 'cat'` ERROR REPORT to
+//!   stdout, which `beam_rt` does not, so the child's stdout is not comparable.
 //!
-//! `port_info(P, registered_name)` on an unregistered port is *not* among them: both runtimes
-//! answer `[]` (`super::udp`'s `udp/port_info_registered_name_is_empty` pins the agreement).
+//! Beyond those three, the port-open grammar agrees entry-for-entry: the `{line, N}`/`line`
+//! stream framing (pinned by `super::driver`'s `driver/line_*` cases), the out-of-range
+//! `{packet, N}` widths (`0`/`3`/`8` are `badarg` on both), `{env, …}` on a `{spawn, Cmd}`
+//! port (accepted on both) and `port_info(P, registered_name)` (both answer `[]` for an
+//! unregistered port and `{registered_name, Name}` for a registered one — pinned by
+//! `super::udp`'s `udp/port_info_registered_name_is_empty` and
+//! `driver/register_a_port_under_a_name`).
 //!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
