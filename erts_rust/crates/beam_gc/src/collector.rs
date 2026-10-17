@@ -316,8 +316,17 @@ impl Collector {
     /// [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth table's ceiling) makes
     /// the request unreachable, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned instead — the collector is left
-    /// consistent (never a half-forwarded heap) and, for an unreachable request, untouched.
-    /// The work is bounded, so this never loops forever.
+    /// consistent (never a half-forwarded heap) and, for a request the growth table itself
+    /// cannot reach, untouched. The work is bounded, so this never loops forever.
+    ///
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) bounds the nursery chain's **summed**
+    /// capacity, which is what the explicit [`grow_nursery`](Self::grow_nursery) step enforces:
+    /// a request the remaining budget cannot reach is refused there. That refusal comes *after*
+    /// the collection — deliberately, because the collection collapses the chain and therefore
+    /// gives the budget back, so pre-checking the chain before collecting would refuse requests
+    /// a collection makes reachable. Only the growth table's own ceiling (the single-space
+    /// `next_words` rule, which no collection can change) is checked up front, which is why the
+    /// fast path below reads a per-space size and not the chain.
     pub fn ensure_capacity(
         &mut self,
         need_words: usize,
@@ -344,6 +353,13 @@ impl Collector {
     /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
     /// cannot reach the request, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
+    ///
+    /// The ceiling bounds the chain's **summed** capacity ([`heap_size_words`](Self::heap_size_words)),
+    /// not each individual space, so the fresh space may only claim the budget the chain has left
+    /// and `heap_size_words() <= max_heap_words` after every successful growth — a growth loop can
+    /// no longer append one ceiling-sized space per call. A retired space a previous growth left
+    /// provably **empty** (`used_words() == 0`) is re-adopted instead of replaced, which consumes
+    /// no budget at all.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
         self.nursery.grow(&self.policy, need_words)
     }

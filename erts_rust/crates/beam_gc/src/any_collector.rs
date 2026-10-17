@@ -321,6 +321,13 @@ impl AnyCollector {
     /// table's ceiling) cannot reach the request the typed heap-exhaustion error is returned
     /// instead. This is strategy-agnostic — the caller does not need to know which mature
     /// generation is in use.
+    ///
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) bounds the nursery chain's **summed**
+    /// capacity ([`heap_size_words`](Self::heap_size_words)), not each individual space, so the
+    /// fresh space may only claim the budget the chain has left:
+    /// `heap_size_words() <= max_heap_words` after every successful growth, on both strategies.
+    /// A retired space a previous growth left provably **empty** (`used_words() == 0`) is
+    /// re-adopted instead of replaced, which consumes no budget at all.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
         match self {
             AnyCollector::Copying(c) => c.grow_nursery(need_words),
