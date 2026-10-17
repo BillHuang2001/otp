@@ -245,8 +245,8 @@ fn the_socket_less_command_sequence_matches_the_oracle() {
     );
     assert!(
         dump.contains("badarg"),
-        "the oracle refuses every command after the port died (measured: the `catch`ed \
-         `{'EXIT', {badarg, …}}` raise): {dump:?}"
+        "the oracle refuses every command after the port died (measured: a caught, \
+         exit-shaped badarg raise): {dump:?}"
     );
 
     // Our side: the very first delivered round is refused, and the bytes stay queued.
