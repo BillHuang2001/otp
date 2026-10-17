@@ -41,7 +41,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::copy::{identity, is_shared, preflight_words, shallow, CopyContext, Fixup};
+use crate::copy::{identity, is_shared, preflight_words, shallow_unshared, CopyContext, Fixup};
 use crate::error;
 
 /// Copies `term`'s graph into `to`, returning the copied root, **sharing repeated subterms**.
@@ -97,12 +97,12 @@ fn materialize(
     }
     let Some(key) = identity(src) else {
         // Unreachable for a non-shared word, which is by construction a cons or boxed term.
-        return shallow(to, ctx, src, work);
+        return shallow_unshared(to, ctx, src, work);
     };
     if let Some(&copied) = memo.get(&key) {
         return Ok(copied);
     }
-    let copied = shallow(to, ctx, src, work)?;
+    let copied = shallow_unshared(to, ctx, src, work)?;
     memo.insert(key, copied);
     Ok(copied)
 }
