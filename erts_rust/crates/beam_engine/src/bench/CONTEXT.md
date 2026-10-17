@@ -64,6 +64,12 @@ host; the ratios and the counters are.
 | min / median ns per call, **interpreter** | 17 592 / 17 805 | **13 387 / 13 672** → **1.31×** |
 | min / median ns per call, **baseline JIT (default tier)** | 12 726 / 12 812 | **7 119 / 7 204** → **1.79×** |
 
+A **second**, independent interleaved sweep of the two binaries at the change's final tree (15 samples
+per side, alternating, `taskset -c 3`, `/proc/loadavg` 14.57/7.52/5.51 → 10.30/7.15/5.45) reproduces the
+same ratios on a *busier* host: interpreter 17 776 / **18 258** → 13 293 / **13 617** ns per call
+(**1.34×**), baseline tier 12 771 / **13 277** → 7 233 / **7 382** ns per call (**1.80×**), with every
+counter identical (438 instructions, 62 → 32 rooted calls, 295 → 163 words).
+
 What the difference is: **30 of 62 rooted reservations** (one per character), the bit-at-a-time copy of
 the accumulated binary, and the growable `Vec` it was assembled in. `perf` self time says the same thing
 directly — `BitWriter::push_bits_from` was **27.4 %** of the before binary's samples and is below the
