@@ -99,6 +99,8 @@ pub mod interpreter;
 pub mod jit;
 pub mod machine;
 pub mod operand;
+#[cfg(test)]
+mod bench;
 #[allow(unsafe_code)]
 mod predicates;
 mod step;
