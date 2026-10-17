@@ -139,7 +139,7 @@ pub(super) fn fail_seg(
     labels: &LabelMap,
     fail: Label,
     reason: SegReason,
-) -> Result<std::result::Result<(Vec<u8>, usize), Step>> {
+) -> Result<std::result::Result<super::super::Built, Step>> {
     Ok(Err(seg_fail_step(machine, module, labels, fail, reason)?))
 }
 

@@ -331,6 +331,37 @@ pub struct Machine {
     /// a host may consume the returned `Eterm` afterwards), so a reset must not free
     /// a payload a caller can still read.
     pub(crate) refc_binaries: Vec<beam_alloc::RefcBinary>,
+    /// The `(payload base, capacity in bytes)` pairs of the off-heap payloads this
+    /// machine allocated **for appending** — the `bs_init_writable` accumulator's
+    /// backing store (C's `BIN_FLAG_WRITABLE` binary).
+    ///
+    /// **Why a side list.** The frozen term layout carries no capacity word (C keeps
+    /// it in the out-of-heap `Binary.intern.apparent_size`/`orig_size`, which
+    /// `beam_alloc::RefcBinary` does not expose and this crate cannot add), so the one
+    /// fact an in-place `private_append` needs — "this payload is ours, it is writable,
+    /// and it is `n` bytes wide" — has to live beside the machine. The list is keyed by
+    /// the payload's **first data byte** (`beam_alloc::RefcBinary::data_ptr`, exactly
+    /// the value the term's `BinRef.val` word holds), and only entries deposited by
+    /// [`Machine::mark_writable`] are considered writable: a payload built by
+    /// [`Machine::alloc_refc_binary`] for an ordinary binary is never a target, so its
+    /// immutability is untouched.
+    ///
+    /// **Per-machine, deliberately.** C clears writability when a writable binary
+    /// escapes into another process (`erts_pin_writable_binary`). A per-machine
+    /// registry gives the engine the same property structurally: a payload another
+    /// process's copy points at is not in *this* machine's list, and the copy that
+    /// reaches another process carries a freshly built `ErlSubBits` whose window ends
+    /// at or before this append's start (see
+    /// [`crate::families::bitstrings::raw::InPlace`] for the invariant that makes an
+    /// in-place append invisible to every pre-existing alias).
+    ///
+    /// **Never cleared by [`Machine::reset`]**, for the same reason
+    /// [`Machine::refc_binaries`] is not: an accumulator term may outlive the run that
+    /// built it (C keeps such a binary in `p->wrt_bins`, writable, until it is pinned),
+    /// and a registry entry must never outlive the payload it names — clearing the list
+    /// while the payload stays alive would only lose the optimization, so the two
+    /// rosters move together.
+    pub(crate) writable_payloads: Vec<(usize, usize)>,
     /// A **reusable argument scratch buffer** for the rare wide BIF call.
     ///
     /// The interpreter marshals the arguments of a `gc_bif`/`bif`/`bif0`/
@@ -501,6 +532,7 @@ impl Machine {
             pending_supplied_trace: None,
             raise_supplied_trace: None,
             refc_binaries: Vec::new(),
+            writable_payloads: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,
             reduce_on: false,
@@ -705,14 +737,52 @@ impl Machine {
     /// [`beam_alloc::RefcBinary`] handle that owns the payload in
     /// [`Machine::refc_binaries`], which [`Machine::reset`] never clears.
     ///
-    /// The payload is `beam_alloc`'s `binary_alloc` allocation and is *immutable*:
-    /// there is no in-place growth, so a caller that needs a larger binary builds a
-    /// new one (mirroring C's copy fallback in `erts_bs_private_append_checked`).
+    /// The payload is `beam_alloc`'s `binary_alloc` allocation. It is **immutable by
+    /// default**: there is no in-place growth, so a caller that needs a larger binary
+    /// builds a new one. The one exception is a payload the caller then hands to
+    /// [`Machine::mark_writable`] (the `bs_init_writable` accumulator), which the
+    /// bitstring family appends into **up to its capacity** — never past it, and never
+    /// at a bit offset below the accumulator's own window end.
     pub(crate) fn alloc_refc_binary(&mut self, bytes: &[u8]) -> Result<*mut u8> {
         let binary = beam_alloc::RefcBinary::new(bytes)?;
         let data = binary.data_ptr();
         self.refc_binaries.push(binary);
         Ok(data)
+    }
+
+    /// Record that the off-heap payload starting at `base` was allocated **for
+    /// appending** and is `capacity_bytes` bytes wide — the writable-accumulator half
+    /// of a `bs_init_writable`/`private_append` build (C's `BIN_FLAG_WRITABLE` binary,
+    /// `erl_bits.c:1684-1720`).
+    ///
+    /// Only a payload registered here may be written in place: the lookup
+    /// [`Machine::writable_capacity`] is the gate
+    /// [`crate::families::bitstrings::raw::writable_append_target`] consults, so an
+    /// ordinary refc binary (`Machine::alloc_refc_binary`, never registered) keeps its
+    /// immutability. The deposit is a plain push — no BEAM-heap allocation, no
+    /// collection, no root set involved (`base` is an off-heap address, never a term).
+    ///
+    /// A duplicate registration of the same base is impossible for a live payload
+    /// (each `bs_init_writable` allocates a fresh one and the handle roster keeps it
+    /// alive), and the lookup prefers the newest entry anyway.
+    pub(crate) fn mark_writable(&mut self, base: *mut u8, capacity_bytes: usize) {
+        self.writable_payloads.push((base as usize, capacity_bytes));
+    }
+
+    /// The capacity, in **bytes**, of the writable payload whose first data byte is
+    /// `base` — `Some` only for a payload this machine allocated for appending
+    /// ([`Machine::mark_writable`]).
+    ///
+    /// A linear scan of a per-process list that holds one entry per live
+    /// `bs_init_writable` accumulator (a handful, in practice), so it allocates
+    /// nothing and cannot collect.
+    pub(crate) fn writable_capacity(&self, base: *const u8) -> Option<usize> {
+        let key = base as usize;
+        self.writable_payloads
+            .iter()
+            .rev()
+            .find(|(registered, _)| *registered == key)
+            .map(|(_, capacity)| *capacity)
     }
 
     /// The **off-heap ref-counted binary payload handles** this machine keeps alive

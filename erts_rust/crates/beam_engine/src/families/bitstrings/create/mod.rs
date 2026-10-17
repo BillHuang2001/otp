@@ -44,26 +44,58 @@
 //! explicit bit count), `string` constants from the `StrT` table, `float` (16/32/64
 //! bits, big- or little-endian), `utf8`/`utf16`/`utf32`, an
 //! `append`/`private_append` segment in **any** position (its source's bits are
-//! concatenated at the point it appears), and `bs_init_writable` — combined into one
+//! concatenated at the point it appears — in place when it is the first
+//! `private_append` of a writable accumulator, copy-rebuild otherwise), and
+//! `bs_init_writable` — combined into one
 //! result bitstring of any size (an on-heap `ErlHeapBits` up to the 64-byte limit, an
 //! off-heap refc binary above it; see [`raw::make_binary`]).
 //!
-//! # `append` / `private_append`: copy-rebuild, not in-place growth
+//! # `append` / `private_append`: in place while the payload is writable
 //!
-//! C's `private_append` (and `append` on a writable source) *reallocates and extends*
-//! the source's off-heap payload in place and returns a new `ErlSubBits` aliasing it,
-//! so a loop that appends `n` times is amortised O(n). The engine's payloads are
-//! immutable ([`beam_alloc::RefcBinary`] has no grow operation and `BinRef.val` has no
-//! setter), so an append instead **seeds a bit vector with the source's bits, appends
-//! the remaining segments, and materialises a fresh term** — the same bits C's
-//! `not_writable` arm copies (`erl_bits.c:1855-1924`). The result bytes are identical
-//! for every successful build (so this is observationally correct), but a long append
-//! loop is O(n²) rather than amortised O(n). Three further C observables are
-//! deliberately unmodelled in M1: the `BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER`
-//! flags on the underlying binary, `binary:referenced_byte_size/1`'s "capacity vs
-//! size" answer, and the fact that a `private_append` result lets a *later*
-//! `private_append` reuse the same buffer (the engine's result is an ordinary,
-//! non-writable refc binary — which the next append simply seeds from).
+//! C's `private_append` on a *writable* source (`erts_bs_private_append_checked`,
+//! `erl_bits.c:1943-2020`) writes the new bits into the source's off-heap payload and
+//! bumps `sb->end`, returning the **same** `ErlSubBits` — which is what makes the
+//! compiler's accumulator loop (`bs_init_writable`, then `private_append` in the first
+//! segment position) amortised O(n). The engine reproduces that arm:
+//!
+//! * a `private_append` segment in the **first** position whose source is a refc binary
+//!   with `start == 0` over a payload this machine allocated *for appending*
+//!   ([`raw::writable_append_target`], the writable-payload registry on
+//!   [`Machine::mark_writable`](crate::machine::Machine)) is written **in place** by
+//!   [`raw::InPlace`]: no `Vec`, no fresh payload, no `[BinRef][ErlSubBits]` reservation,
+//!   and `exec` writes the **same** term back to `dst` with a wider `ErlSubBits.end`;
+//! * when the build outgrows the payload's capacity, or a segment source aliases the
+//!   payload, the writer **promotes** to the copy-rebuild form — the bits already written
+//!   are copied out and the build continues in a `Vec` — so the result is byte-identical
+//!   to the copy-rebuild path and the accumulator's window is left unbumped;
+//! * everything else — a plain `append`, an appending segment in a later position, a
+//!   source that is not a writable refc binary (a heap binary, a sub-binary, an ordinary
+//!   refc binary) — keeps the copy-rebuild route: seed a bit vector with the source's bits
+//!   and materialise a fresh term ([`raw::make_binary`]), the same bytes C's
+//!   `not_writable` arm copies (`erl_bits.c:1855-1924`).
+//!
+//! The frozen invariant that makes the in-place mutation unobservable: writes always land
+//! at bit offsets `>=` the source's `end`, so every pre-existing alias of the payload
+//! (whose window ends at or before that offset) reads exactly the bytes it read before;
+//! only the accumulator's own window grows. A **failed** build never bumps `end`, so its
+//! partial writes stay invisible — deliberately stricter than C, which bumps the window
+//! in its sizing pass before writing anything (`erl_bits.c:1975`).
+//!
+//! # Remaining capacity gap (a documented handoff, not implemented here)
+//!
+//! The in-place arm covers the `bs_init_writable` capacity and nothing more. C *grows*
+//! the payload when the build outgrows it (`GROW_PROC_BIN_SIZE`, `erl_bits.c:70-73`:
+//! double, or 1.2x past 16 MB) and tracks the used size in
+//! `Binary.intern.apparent_size`; [`beam_alloc::RefcBinary`] is immutable and offers no
+//! grow operation, so past the initial capacity this build falls back to the
+//! copy-rebuild form and an append loop that outgrows the writable capacity stays
+//! O(n²). Closing that needs payload growth, which is `beam_alloc`/`beam_rt` ownership —
+//! see `HANDOFF_bs_init_writable.md`. Three further C observables stay unmodelled:
+//! `BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER` introspection,
+//! `binary:referenced_byte_size/1`'s "capacity vs size" answer, and the fact that a
+//! copy-rebuild result is an ordinary, non-writable refc binary (so the *next* append of
+//! it starts a fresh rebuild; an in-place result stays writable through the same
+//! registry).
 //!
 //! # `BS_FAIL_INFO`: why a segment failure raises a bare reason atom
 //!
@@ -99,7 +131,7 @@ use crate::predicates;
 use crate::Step;
 
 use super::{
-    decode_flags, is_all, push_wide_int, raw, read_size, small_value, BitWriter, BSF_LITTLE,
+    decode_flags, is_all, push_wide_int, raw, read_size, small_value, BitWriter, Built, BSF_LITTLE,
 };
 
 use self::segments::{
@@ -146,12 +178,17 @@ pub(super) fn exec(
             dst,
             segments,
         } => {
-            let (bytes, nbits) = match assemble(machine, module, labels, *fail, segments, ctx)? {
-                Ok(parts) => parts,
+            let built = match assemble(machine, module, labels, *fail, segments, ctx)? {
+                Ok(built) => built,
                 // `assemble` already produced the failure `Step`.
                 Err(step) => return Ok(Some(step)),
             };
-            let value = raw::make_binary(machine, ctx, &bytes, nbits)?;
+            let value = match built {
+                // An in-place build published the accumulator term itself: no bytes to
+                // materialise, no allocation, no window of another term changed.
+                Built::Term(term) => term,
+                Built::Bytes(bytes, nbits) => raw::make_binary(machine, ctx, &bytes, nbits)?,
+            };
             write_operand(machine, dst, value)?;
             if *fail != beam_loader::NO_FAIL {
                 // The compiler emits `{f,0}`, but a live fail label is harmless: a
@@ -163,7 +200,8 @@ pub(super) fn exec(
     }
 }
 
-/// Walk the flat segment list, appending to one bit vector.
+/// Walk the flat segment list, appending to one bit vector (or, for the compiler's
+/// linear accumulator, in place into its writable payload).
 ///
 /// `Err(step)` is a completed failure `Step` (a branch to `fail`, or a raise) — the
 /// caller returns it verbatim.
@@ -175,7 +213,7 @@ fn assemble(
     fail: Label,
     segments: &[Operand],
     ctx: &mut dyn ExecutionContext,
-) -> Result<std::result::Result<(Vec<u8>, usize), Step>> {
+) -> Result<std::result::Result<Built, Step>> {
     let mut writer = BitWriter::default();
     let mut i = 0usize;
     while i < segments.len() {
@@ -359,11 +397,13 @@ fn assemble(
             // refc binary, both of which [`raw::heap_bits`] reads — at whatever bit
             // offset their window starts.
             //
-            // The engine seeds its bit vector from the source and rebuilds a fresh
-            // term rather than growing the source's payload in place (the engine's
-            // payloads are immutable; C's `not_writable` arm does the same copy). That
-            // is observationally identical for a successful build; see the module docs
-            // for the honest divergences.
+            // **In place** for the compiler's linear accumulator: a `private_append` in
+            // the **first** segment position whose source is a *writable* payload this
+            // machine allocated (`raw::writable_append_target`) continues writing at the
+            // accumulator's own window end and publishes the SAME term with a bumped
+            // `ErlSubBits.end` — C's writable arm (`erl_bits.c:1970-1980`). Everything
+            // else (a plain `append`, an appending segment in a later position, a
+            // non-writable source, a heap binary) keeps the copy-rebuild route.
             "append" | "private_append" => {
                 let value = read_value(machine, module, ctx, value_op)?;
                 let Some((_, src_bits, _)) = raw::heap_bits(value) else {
@@ -377,10 +417,23 @@ fn assemble(
                 if unit != 1 && src_bits % unit != 0 {
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
+                if i == 0 && kind == "private_append" && writer.is_pristine() {
+                    if let Some((base, capacity_bits, end_bits)) =
+                        raw::writable_append_target(machine, value)
+                    {
+                        writer = BitWriter::in_place(raw::InPlace::new(
+                            base,
+                            capacity_bits,
+                            end_bits,
+                            value,
+                        ));
+                        i += 6;
+                        continue;
+                    }
+                }
                 let (bytes, src_off) = raw::subject_bytes(value)?;
                 writer.push_bits_from(bytes, src_off, src_bits);
             }
-
             other => {
                 return Err(error::unsupported(&format!(
                     "bs_create_bin: segment type {other}"
@@ -389,7 +442,7 @@ fn assemble(
         }
         i += 6;
     }
-    Ok(Ok(writer.finish()))
+    Ok(Ok(writer.finish_built()))
 }
 
 /// The `i`-th segment operand, or a typed error when the list is truncated.
@@ -418,6 +471,47 @@ fn read_value(
 // ---------------------------------------------------------------------------
 // Unit tests for the segment encoders
 // ---------------------------------------------------------------------------
+
+/// The **bytes and exact bit count** a [`Built`] build produced — the byte view of an
+/// in-place result included, so a test can compare an in-place build against the
+/// copy-rebuild one bit for bit.
+///
+/// Reading the in-place form goes through the frozen readers (`raw::heap_bits` /
+/// `raw::subject_bytes`), never through a raw-heap dereference here: this module is
+/// under the crate-wide `#![deny(unsafe_code)]`.
+#[cfg(test)]
+pub(super) fn built_bytes(built: Built) -> (Vec<u8>, usize) {
+    match built {
+        Built::Bytes(bytes, nbits) => (bytes, nbits),
+        Built::Term(term) => {
+            let (_, nbits, off) =
+                raw::heap_bits(term).expect("a built term is a readable bitstring");
+            let (bytes, read_off) = raw::subject_bytes(term).expect("readable subject bytes");
+            debug_assert_eq!(read_off, off);
+            let mut out = vec![0u8; nbits.div_ceil(8)];
+            for i in 0..nbits {
+                let bit_index = read_off + i;
+                let bit = (bytes[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+                out[i / 8] |= bit << (7 - (i % 8));
+            }
+            (out, nbits)
+        }
+    }
+}
+
+/// The **term** a [`Built`] build produced, materialising the byte form through
+/// [`raw::make_binary`] (what `exec` does).
+#[cfg(test)]
+pub(super) fn built_term(
+    built: Built,
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Eterm> {
+    match built {
+        Built::Term(term) => Ok(term),
+        Built::Bytes(bytes, nbits) => raw::make_binary(machine, ctx, &bytes, nbits),
+    }
+}
 
 #[cfg(test)]
 mod tests;
