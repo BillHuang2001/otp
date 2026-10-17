@@ -47,7 +47,7 @@
 //! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -75,7 +75,7 @@ use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
 use crate::error;
 use crate::eval::FunBody;
 use crate::format;
-use crate::hasher::FastHashMap;
+use crate::hasher::{FastHashMap, FastHashSet};
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
@@ -405,7 +405,11 @@ pub struct Runtime {
     /// A terminated process leaves its entry behind, which is harmless: a pid's serial is
     /// bumped when its table slot is reused ([`ProcessTable::take`]), so the stale key names
     /// no process that can ever be observed again.
-    pub(crate) group_leaders: HashMap<ProcessId, ProcessId>,
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `get`/`insert`ed (never iterated), so it
+    /// probes with the crate's own [`FastHashMap`] over [`crate::hasher`], like
+    /// [`Runtime::mailboxes`].
+    pub(crate) group_leaders: FastHashMap<ProcessId, ProcessId>,
     /// The pids with `process_flag(async_dist, true)` set — the C's per-process
     /// `F_ASYNC_DIST` PCB bit (`bif.c:2032-2043`).
     ///
@@ -420,7 +424,11 @@ pub struct Runtime {
     /// As with [`Runtime::group_leaders`], a terminated process leaves its entry behind,
     /// which is harmless: a pid's serial is bumped when its table slot is reused, so the stale
     /// key names no process that can ever be observed again.
-    pub(crate) async_dist: HashSet<ProcessId>,
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `contains`/`insert`/`remove`d (never
+    /// iterated), so it probes with the crate's own [`FastHashSet`] over [`crate::hasher`],
+    /// like [`Runtime::mailboxes`].
+    pub(crate) async_dist: FastHashSet<ProcessId>,
     /// The `{monitor_nodes, Options}` registrations of every process — the C's
     /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
     ///
@@ -437,7 +445,11 @@ pub struct Runtime {
     /// forms from it (see [`crate::native::process`]). A terminated process leaves its entry
     /// behind, which is harmless: a pid's serial is bumped when its table slot is reused, so the
     /// stale key names no process that can ever be observed again.
-    pub(crate) monitor_nodes: HashMap<ProcessId, HashMap<u64, u64>>,
+    ///
+    /// Both levels are keyed by a hash-only id (the pid, the option bitmask) and only ever
+    /// `entry`/`get_mut`/`remove`d (never iterated), so they probe with the crate's own
+    /// [`FastHashMap`] over [`crate::hasher`], like [`Runtime::mailboxes`].
+    pub(crate) monitor_nodes: FastHashMap<ProcessId, FastHashMap<u64, u64>>,
     /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
     ///
     /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
@@ -479,7 +491,11 @@ pub struct Runtime {
     /// delivering a message — so the address travels here from the fire
     /// ([`Runtime::fire_due_timers`]) to the runner ([`crate::runner`]), which consumes it
     /// when it next runs the process. See [`crate::timers::TimerAction::Resume`].
-    timer_resumes: HashMap<ProcessId, (u32, u32)>,
+    ///
+    /// Keyed by pid and only ever `insert`/`remove`d — one entry per fired receive deadline,
+    /// never iterated — so it probes with the crate's own [`FastHashMap`] over
+    /// [`crate::hasher`], like [`Runtime::mailboxes`].
+    timer_resumes: FastHashMap<ProcessId, (u32, u32)>,
     /// The pids a fired receive deadline woke, waiting to be absorbed into the run queue.
     ///
     /// The receive-timeout counterpart of [`Runtime::fragment_wakes`]: the fire makes the
@@ -893,14 +909,14 @@ impl Runtime {
             seq_trace: SeqTrace::new(),
             refs: RefAllocator::new(),
             references: HashMap::new(),
-            group_leaders: HashMap::new(),
-            async_dist: HashSet::new(),
-            monitor_nodes: HashMap::new(),
+            group_leaders: FastHashMap::default(),
+            async_dist: FastHashSet::default(),
+            monitor_nodes: FastHashMap::default(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
             timer_wake_targets: TimerWakes::default(),
             run_wake_pid: None,
-            timer_resumes: HashMap::new(),
+            timer_resumes: FastHashMap::default(),
             timer_wakes: Vec::new(),
             pending_spawns: Vec::new(),
             dist,
@@ -3652,5 +3668,63 @@ mod tests {
             rt.code_server.find_file("lists").is_some(),
             "the search route seeded the system `ebin` directories"
         );
+    }
+
+    /// The runtime's per-pid bookkeeping maps — the fired receive-timeout addresses
+    /// (`Runtime::timer_resumes`) and the three per-pid flags ([`Runtime::group_leaders`],
+    /// [`Runtime::async_dist`], [`Runtime::monitor_nodes`]) — are `ProcessId`-keyed maps over the
+    /// crate's own deterministic [`crate::hasher`], not `RandomState`'s SipHash (the same
+    /// substitution [`Runtime::mailboxes`] and the GC descent latch make).
+    ///
+    /// The soundness argument is what is pinned here, never a clock: every site is a
+    /// `get`/`entry`/`insert`/`remove` (or an `any()` over the values), never an observable
+    /// iteration, so the cheaper hasher changes the probe cost and the (unobserved) order — and
+    /// nothing else. The `assert_fast_hashed_*` pins stop compiling if a field reverts to
+    /// `RandomState`.
+    #[test]
+    fn the_runtime_bookkeeping_maps_are_fast_hashed_and_still_behave() {
+        /// The type pin: a `ProcessId`-keyed value map over the crate's own fast hasher.
+        fn assert_fast_hashed_values<V>(map: &crate::hasher::FastHashMap<ProcessId, V>) -> usize {
+            map.len()
+        }
+
+        /// The type pin for a `ProcessId` membership set.
+        fn assert_fast_hashed_members(set: &crate::hasher::FastHashSet<ProcessId>) -> usize {
+            set.len()
+        }
+
+        let mut rt = runtime();
+        let own = rt.self_pid();
+        let child = ProcessId::new(own.number(), own.serial().wrapping_add(1));
+
+        // `timer_resumes`: a fired receive deadline records its resume address, and the runner
+        // consumes it exactly once.
+        assert_eq!(rt.timer_resumes.insert(own, (7, 9)), None);
+        assert_eq!(assert_fast_hashed_values(&rt.timer_resumes), 1);
+        assert_eq!(rt.take_timer_resume(own), Some((7, 9)));
+        assert_eq!(rt.take_timer_resume(own), None, "the address is consumed once");
+
+        // `group_leaders`: the default is `self_pid`, and an explicit set is recorded per pid.
+        assert_eq!(rt.group_leader_of(own), own, "the root is the default leader");
+        rt.set_group_leader(child, own);
+        assert_eq!(rt.group_leader_of(child), own);
+        assert_eq!(rt.group_leaders.get(&child), Some(&own));
+        assert!(assert_fast_hashed_values(&rt.group_leaders) >= 1);
+
+        // `async_dist`: membership *is* the flag's value.
+        assert!(!rt.is_async_dist(own));
+        rt.set_async_dist(own, true);
+        assert!(rt.is_async_dist(own));
+        assert!(assert_fast_hashed_members(&rt.async_dist) >= 1);
+        rt.set_async_dist(own, false);
+        assert!(!rt.is_async_dist(own));
+
+        // `monitor_nodes`: the previous count is answered before the bump, and a removal drops
+        // the whole key once its inner map empties.
+        assert_eq!(rt.monitor_nodes_add(own, 3), 0);
+        assert_eq!(rt.monitor_nodes_add(own, 3), 1);
+        assert_eq!(assert_fast_hashed_values(&rt.monitor_nodes), 1);
+        assert_eq!(rt.monitor_nodes_remove(own, 3), 2);
+        assert_eq!(rt.monitor_nodes_remove(own, 3), 0);
     }
 }
