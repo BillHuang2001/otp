@@ -475,6 +475,38 @@ fn make_fd() -> Result<Box<dyn Driver>> {
     Ok(Box::new(crate::drivers::FdDriver::pipe()?))
 }
 
+/// The emulator's **statically-linked driver set** — the names the C `driver_tab.c` table holds.
+///
+/// These three are the drivers linked *into* the emulator itself, so they are exactly the names an
+/// `open_port({spawn_driver, Name}, …)` can resolve (workspace `../CONTEXT.md` §1 **A.4**). They
+/// are **not** `.so`-loadable: `erts-*/lib/` ships zero `.so` files, so no dynamic load path can
+/// reach them and none may be modelled as a loadable driver. The system oracle's
+/// `erl_ddll:loaded_drivers/0` answers `{ok,["tcp_inet","udp_inet","ram_file_drv"]}` — exactly this
+/// set (the oracle's `driver_tab.c` order; this list is sorted ascending instead, so compare as a
+/// set, not positionally).
+///
+/// [`crate::drivers::FdDriver`] (`"fd"`) and [`crate::drivers::EfileDriver`] (`"efile"`) are this
+/// crate's own internal drivers — they exist so this crate's ports and tests can build a byte
+/// stream / file port, but they are **not** emulator drivers at all: the oracle refuses
+/// `open_port({spawn_driver,"fd"}, …)` and `{spawn_driver,"efile"}` with `badarg`. Hence they are
+/// deliberately absent here even though [`DriverRegistry::with_builtins`] registers them.
+///
+/// A runtime resolving `{spawn_driver, Name}` must gate on [`is_static_spawn_driver`] /
+/// [`DriverRegistry::create_static_spawn`] — *not* on [`DriverRegistry::with_builtins`] — so those
+/// two names produce the oracle's `badarg` instead of a working port.
+pub const STATIC_SPAWN_DRIVERS: [&str; 3] = ["ram_file_drv", "tcp_inet", "udp_inet"];
+
+/// Whether `name` is one of the emulator's statically-linked drivers ([`STATIC_SPAWN_DRIVERS`]).
+///
+/// This is the membership test an `open_port({spawn_driver, Name}, …)` handler must apply before
+/// asking a [`DriverRegistry`] for the driver: an emulator driver name is addressable by that
+/// syntax, any other name is the oracle's `badarg` — including this crate's own internal `"fd"` and
+/// `"efile"`, which [`DriverRegistry::with_builtins`] does register.
+#[must_use]
+pub fn is_static_spawn_driver(name: &str) -> bool {
+    STATIC_SPAWN_DRIVERS.contains(&name)
+}
+
 /// The name→factory table: the Rust analogue of the C `driver_tab.c` (`lib/driver_tab.c`).
 pub struct DriverRegistry {
     /// Registered driver factories, keyed by driver name.
@@ -499,6 +531,13 @@ impl DriverRegistry {
     /// ([`crate::drivers::UdpInetDriver`], the UDP datagram socket driver — the name the oracle
     /// reports for a `gen_udp` socket), and `"ram_file_drv"`
     /// ([`crate::drivers::RamFileDriver`], the in-memory file driver `ram_file.erl` talks to).
+    ///
+    /// Only three of the five are emulator drivers addressable through
+    /// `open_port({spawn_driver, Name}, …)`: `"tcp_inet"`, `"udp_inet"` and `"ram_file_drv"`
+    /// ([`STATIC_SPAWN_DRIVERS`]). `"fd"`/`"efile"` are this crate's internal drivers and the oracle
+    /// refuses them with `badarg`, so a `{spawn_driver, Name}` resolution must go through
+    /// [`DriverRegistry::create_static_spawn`] (see [`is_static_spawn_driver`]) rather than
+    /// [`DriverRegistry::create`] on this registry.
     pub fn with_builtins() -> DriverRegistry {
         let mut registry = DriverRegistry::new();
         registry.register("fd", make_fd);
@@ -507,6 +546,50 @@ impl DriverRegistry {
         registry.register("udp_inet", crate::drivers::make_udp_inet);
         registry.register("ram_file_drv", crate::drivers::make_ram_file);
         registry
+    }
+
+    /// A registry holding **only** the emulator's statically-linked drivers.
+    ///
+    /// Exactly [`STATIC_SPAWN_DRIVERS`] — `"ram_file_drv"`, `"tcp_inet"` and `"udp_inet"`, built from
+    /// the same built-in factories [`DriverRegistry::with_builtins`] uses. The internal
+    /// `"fd"`/`"efile"` drivers are absent, so [`DriverRegistry::names`] is exactly the oracle's
+    /// `erl_ddll:loaded_drivers/0` set and [`DriverRegistry::create_static_spawn`] agrees with
+    /// [`is_static_spawn_driver`] on every name.
+    ///
+    /// This is the registry a runtime should hold if it wants a `{spawn_driver, Name}` resolution
+    /// that is oracle-exact by construction; a runtime that also needs `"fd"`/`"efile"` for its own
+    /// ports keeps [`DriverRegistry::with_builtins`] and gates on [`is_static_spawn_driver`].
+    pub fn with_static_spawn_drivers() -> DriverRegistry {
+        let mut registry = DriverRegistry::new();
+        registry.register("ram_file_drv", crate::drivers::make_ram_file);
+        registry.register("tcp_inet", crate::drivers::make_tcp_inet);
+        registry.register("udp_inet", crate::drivers::make_udp_inet);
+        registry
+    }
+
+    /// Instantiates the emulator driver `name` for an `open_port({spawn_driver, Name}, …)` request.
+    ///
+    /// **This is the resolution path a runtime's `{spawn_driver, Name}` handling should call.** It
+    /// applies two gates in order:
+    ///
+    /// 1. the **static gate** — [`is_static_spawn_driver`] — which is what makes `"fd"`/`"efile"`
+    ///    (and any invented name) the oracle's `badarg` even on a registry that *does* register
+    ///    them, i.e. a membership refusal, not merely a missing entry;
+    /// 2. the **factory lookup** through [`DriverRegistry::create`], so the driver is instantiated
+    ///    by the same factory as everywhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `name` is not in [`STATIC_SPAWN_DRIVERS`] — exactly the
+    /// `badarg` the oracle raises for `{spawn_driver,"fd"}`/`{spawn_driver,"efile"}` — **and** when
+    /// the static name happens to be absent from *this* registry (e.g. a plain
+    /// [`DriverRegistry::new`]: a static name is addressable, but nothing here can build it), or
+    /// whatever the factory itself returns.
+    pub fn create_static_spawn(&self, name: &str) -> Result<Box<dyn Driver>> {
+        if !is_static_spawn_driver(name) {
+            return Err(crate::error::badarg());
+        }
+        self.create(name)
     }
 
     /// Registers `factory` under `name`, reporting whether the name was free.
@@ -548,11 +631,20 @@ impl DriverRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{Driver, DriverContext, DriverFlags, DriverRegistry, PortArms, PortExitReason};
+    use super::{
+        is_static_spawn_driver, Driver, DriverContext, DriverFlags, DriverRegistry, PortArms,
+        PortExitReason, STATIC_SPAWN_DRIVERS,
+    };
     use crate::poller::Poller;
     use crate::queue::ByteQueue;
     use beam_common::{BeamError, Result};
     use beam_process::PortId;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The bounded wait for the `erl` oracle, so a wedged runtime cannot hang the suite.
+    const ERL_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
     fn driver_flags_are_a_bitset() {
@@ -687,6 +779,202 @@ mod tests {
                 format!("{a:?}").starts_with("Closed")
                     || format!("{a:?}").starts_with("OwnerExited")
                     || format!("{a:?}").starts_with("Normal")
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // The emulator's statically-linked driver set (`driver_tab.c`)
+    // -------------------------------------------------------------------------------------------
+
+    #[test]
+    fn every_static_spawn_driver_constructs_its_named_driver() {
+        let registry = DriverRegistry::with_static_spawn_drivers();
+        for name in STATIC_SPAWN_DRIVERS {
+            assert!(
+                is_static_spawn_driver(name),
+                "{name} is a member of STATIC_SPAWN_DRIVERS"
+            );
+            let driver = registry
+                .create_static_spawn(name)
+                .unwrap_or_else(|err| panic!("{name} is a static driver, got {err}"));
+            // The driver reports the very name the request asked for — the property `beam_rt`
+            // renders as `port_info(Port, name)`.
+            assert_eq!(driver.name(), name);
+        }
+        // A `with_static_spawn_drivers()` registry is exactly the static set.
+        assert_eq!(registry.names(), STATIC_SPAWN_DRIVERS.to_vec());
+    }
+
+    #[test]
+    fn the_static_gate_refuses_fd_and_efile_even_where_they_are_registered() {
+        // `with_builtins()` DOES register the two internal drivers ...
+        let registry = DriverRegistry::with_builtins();
+        assert!(registry.contains("fd"));
+        assert!(registry.contains("efile"));
+        assert_eq!(registry.create("fd").expect("registered").name(), "fd");
+        assert_eq!(
+            registry.create("efile").expect("registered").name(),
+            "efile"
+        );
+
+        // ... yet the static gate refuses them: the refusal is the oracle's `badarg` for
+        // `open_port({spawn_driver,"fd"}, …)`, i.e. a membership decision, not a missing entry.
+        for name in ["fd", "efile"] {
+            assert!(
+                !is_static_spawn_driver(name),
+                "{name} is not an emulator driver"
+            );
+            match registry.create_static_spawn(name) {
+                Err(BeamError::BadArg) => {}
+                Err(other) => panic!("expected the oracle's badarg for {name}, got {other}"),
+                Ok(driver) => panic!(
+                    "expected the oracle's badarg for {name}, got a {} driver",
+                    driver.name()
+                ),
+            }
+        }
+
+        // An invented name is likewise refused.
+        assert!(matches!(
+            registry.create_static_spawn("spawn"),
+            Err(BeamError::BadArg)
+        ));
+
+        // And a static name is addressable but unbuildable on a registry that lacks it, which is
+        // still a typed `BadArg` (never a wrong driver).
+        let empty = DriverRegistry::new();
+        assert!(matches!(
+            empty.create_static_spawn("tcp_inet"),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn the_static_set_is_sorted_and_membership_agrees_with_it() {
+        // Sorted ascending, no duplicates — the order `names()`/set comparisons rely on.
+        let mut sorted = STATIC_SPAWN_DRIVERS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(STATIC_SPAWN_DRIVERS.to_vec(), sorted);
+        assert_eq!(STATIC_SPAWN_DRIVERS.len(), 3);
+        for (i, name) in STATIC_SPAWN_DRIVERS.iter().enumerate() {
+            assert!(
+                !STATIC_SPAWN_DRIVERS[..i].contains(name),
+                "{name} appears once"
+            );
+        }
+
+        // Membership, both directions.
+        for name in STATIC_SPAWN_DRIVERS {
+            assert!(is_static_spawn_driver(name));
+        }
+        for name in ["fd", "efile", "spawn", "", "TCP_INET", "tcp_inet "] {
+            assert!(
+                !is_static_spawn_driver(name),
+                "{name:?} is not a static driver name"
+            );
+        }
+    }
+
+    /// Print a loud skip banner (never a silent pass), with the reason.
+    fn loud_skip(reason: &str) {
+        println!("================================================================");
+        println!("SKIP: {reason}");
+        println!("================================================================");
+    }
+
+    /// Runs `erl -noshell -eval <code> -s init stop` and returns its stdout, or `None` — after a
+    /// loud skip message — when `erl` cannot be spawned or does not answer within [`ERL_TIMEOUT`].
+    fn erl_stdout(code: &str) -> Option<String> {
+        let (tx, rx) = mpsc::channel();
+        let code = code.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                Command::new("erl")
+                    .arg("-noshell")
+                    .arg("-eval")
+                    .arg(&code)
+                    .arg("-s")
+                    .arg("init")
+                    .arg("stop")
+                    .output(),
+            );
+        });
+
+        match rx.recv_timeout(ERL_TIMEOUT) {
+            Err(_) => {
+                loud_skip(&format!(
+                    "the `erl` oracle did not answer within {ERL_TIMEOUT:?}"
+                ));
+                None
+            }
+            Ok(Err(err)) => {
+                loud_skip(&format!(
+                    "could not spawn `erl` ({err}); is Erlang on `PATH`?"
+                ));
+                None
+            }
+            Ok(Ok(out)) => {
+                assert!(
+                    out.status.success(),
+                    "the oracle expression failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                Some(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+        }
+    }
+
+    /// The double-quoted strings in `text`, in order — the names inside the oracle's printed
+    /// `{ok,["tcp_inet","udp_inet","ram_file_drv"]}` list.
+    fn quoted_names(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = text;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            names.push(after[..close].to_string());
+            rest = &after[close + 1..];
+        }
+        names
+    }
+
+    /// The oracle's own answer for the static set — `erl_ddll:loaded_drivers/0` — against
+    /// [`STATIC_SPAWN_DRIVERS`].
+    ///
+    /// The system oracle reports `{ok,["tcp_inet","udp_inet","ram_file_drv"]}`: the `driver_tab.c`
+    /// order, whose members are exactly this crate's static set (compare as a set — the oracle's
+    /// list is not sorted, ours is). `fd`/`efile` are absent because they are not emulator drivers
+    /// at all. Parsed rather than matched as a whole string so the test does not pin the oracle's
+    /// print formatting.
+    #[test]
+    fn the_oracle_agrees_on_the_static_driver_set() {
+        let Some(stdout) = erl_stdout("io:format(\"~p~n\", [erl_ddll:loaded_drivers()])") else {
+            return;
+        };
+
+        assert!(
+            stdout.contains("{ok,"),
+            "the oracle answered with something other than {{ok, List}}: {stdout}"
+        );
+        let mut names = quoted_names(&stdout);
+        assert_eq!(
+            names.len(),
+            STATIC_SPAWN_DRIVERS.len(),
+            "the oracle's static driver list is not the three static drivers: {stdout}"
+        );
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            STATIC_SPAWN_DRIVERS.to_vec(),
+            "the oracle's loaded_drivers/0 set differs from STATIC_SPAWN_DRIVERS: {stdout}"
+        );
+
+        // The two internal drivers really are not emulator drivers.
+        for name in ["fd", "efile"] {
+            assert!(
+                !names.iter().any(|n| n == name),
+                "the oracle reports {name} as a loaded driver: {stdout}"
             );
         }
     }
