@@ -235,6 +235,9 @@ fn register_driver_port(
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
+        // This fixture's driver implements `control`, so the captured capability is the driver's
+        // own answer — exactly what `open_port/2` captures from a real one.
+        driver_has_control: true,
         // No driver interned a name and no driver host emitted a term: this fixture only drives
         // the control and monitor paths, so both handles are absent — but the control-flag cell
         // *is* shared, since that is exactly what `port_control` reads back.

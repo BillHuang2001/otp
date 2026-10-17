@@ -414,22 +414,27 @@ fn build_fixture(stem: &str, with_control: bool) -> Option<Fixture> {
 // Driving the port
 // ---------------------------------------------------------------------------------------------
 
-/// Loads `fixture`'s driver and opens one port on it.
+/// Loads `fixture`'s driver into an adapter — the port is **not** opened yet.
 ///
 /// The fixture is handed the marker path in the `command` string (see the module docs), which its
 /// `start` reads.
-fn open_port(fixture: &Fixture) -> (Poller, PortRegistry, PortId) {
+fn load_adapter(fixture: &Fixture) -> DriverPortAdapter {
     // The same anchor `crate::port::PortRegistry::new` uses.
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
     let atoms = Rc::new(AtomTable::new());
     let host = DriverPort::new(Heap::new(256).expect("a test heap"), atoms, ProcessId::new(1, 0));
-    let adapter = DriverPortAdapter::load(
+    DriverPortAdapter::load(
         &[fixture.stem.display().to_string()],
         &fixture.name,
         host,
         fixture.marker.display().to_string(),
     )
-    .expect("the fixture driver loads");
+    .expect("the fixture driver loads")
+}
+
+/// Loads `fixture`'s driver and opens one port on it.
+fn open_port(fixture: &Fixture) -> (Poller, PortRegistry, PortId) {
+    let adapter = load_adapter(fixture);
     let mut poller = Poller::new().expect("a poller");
     let mut ports = PortRegistry::new();
     let id = ports
@@ -437,7 +442,6 @@ fn open_port(fixture: &Fixture) -> (Poller, PortRegistry, PortId) {
         .expect("the port opens (the fixture's `start` opened the marker)");
     (poller, ports, id)
 }
-
 // ---------------------------------------------------------------------------------------------
 // The end-to-end cases (a real C driver, driven through `PortRegistry::port_control`)
 // ---------------------------------------------------------------------------------------------
@@ -567,6 +571,40 @@ fn an_entry_without_a_control_slot_is_badarg() {
     fixture.cleanup();
 }
 
+/// The **capability** the runtime captures at `open_port/2` for the `port_control/3` gate is the
+/// loaded entry's own `control` slot: `true` when the slot is declared, `false` for the `NULL`
+/// build — the C's `!prt->drv_ptr->control` (`io.c:4035`).
+///
+/// That captured bit (not a driver **name**) is what
+/// [`PortMeta::has_driver_control`](crate::port::PortMeta::has_driver_control) answers from, so a
+/// `.so` driver with no `control` callback is refused for every verb without the runtime knowing
+/// anything about the driver's name.
+#[test]
+fn the_captured_control_capability_is_the_loaded_entrys_slot() {
+    let Some(present) = build_fixture("rt_control_present", true) else {
+        return;
+    };
+    {
+        let adapter = load_adapter(&present);
+        assert!(
+            beam_io::Driver::has_control(&adapter),
+            "an entry that declares `control` declares the capability"
+        );
+    }
+    present.cleanup();
+
+    let Some(absent) = build_fixture("rt_control_slotless", false) else {
+        return;
+    };
+    {
+        let adapter = load_adapter(&absent);
+        assert!(
+            !beam_io::Driver::has_control(&adapter),
+            "an entry whose `control` slot is NULL declares none"
+        );
+    }
+    absent.cleanup();
+}
 /// A verb that is not a decimal `c_uint` is the caller's `badarg` — the driver is **never**
 /// entered, so no command is substituted for it.
 #[test]

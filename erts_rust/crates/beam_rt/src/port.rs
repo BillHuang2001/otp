@@ -301,40 +301,15 @@ pub enum PortName {
     /// e.g. `tcp_inet` in `erts/emulator/drivers/common/inet_drv.c:1348`), resolved against
     /// [`beam_io::DriverRegistry`] rather than `dlopen`ed.
     ///
-    /// Like [`PortName::SpawnDriver`] it gives the port a driver `control` callback
-    /// ([`PortMeta::has_driver_control`]), but **unlike** it its bytes do not come from a C
-    /// driver's inline `output` callback: they arrive through the driver's poller-registered
-    /// descriptor on the port-task round, so [`PortRegistry::take_driver_outputs`] must not drain
-    /// it and [`PortRegistry::write_command`] takes the ordinary `port_command` path.
+    /// Like [`PortName::SpawnDriver`] it is a **driver** port — so [`PortMeta::has_driver_control`]
+    /// answers from the driver's own `control` capability, captured when the port is opened — but
+    /// **unlike** it its bytes do not come from a C driver's inline `output` callback: they arrive
+    /// through the driver's poller-registered descriptor on the port-task round, so
+    /// [`PortRegistry::take_driver_outputs`] must not drain it and [`PortRegistry::write_command`]
+    /// takes the ordinary `port_command` path.
     SpawnDriverBuiltin,
     /// `{fd, N}`: a descriptor the Erlang side already owns.
     Fd,
-}
-
-/// The **built-in** drivers whose C `ErlDrvEntry` declares **no** `control` callback — i.e. the
-/// drivers for which `erlang:port_control/3` is the oracle's `error:badarg` for **every** verb,
-/// the C's `!prt->drv_ptr->control` gate (`../../erts/emulator/beam/io.c:4035`).
-///
-/// `ram_file_drv` is the emulator's only such driver: its entry slot is
-/// `NULL, /* control */` (`../../erts/emulator/drivers/common/ram_file_drv.c:116`), while both
-/// socket drivers declare `inet_control` (`erts/emulator/drivers/common/inet_drv.c:1348`) and
-/// [`beam_io`]'s own `fd`/`efile` declare theirs.
-///
-/// This is **not** a driver roster — the only question it answers is "does this driver have a
-/// `control` callback?". A `dlopen`ed driver never consults it: its real `ErlDrvEntry::control`
-/// slot is the answer, enforced by [`beam_io`]'s ABI adapter
-/// (`beam_io/src/abi/port.rs:747`, which raises `badarg` for an entry that declares none), so
-/// this table exists only for **statically linked** drivers. [`beam_io`]'s `Driver::control` has a
-/// permissive default (`Ok(Vec::new())`) and no capability query, so a built-in that overrides it
-/// and one that does not are indistinguishable through that trait — this table is the missing
-/// answer for the one name they differ on. The seam that would replace it is a
-/// `Driver::has_control()` (or a `DriverFlags::CONTROL` bit) in `beam_io`.
-const BUILTIN_DRIVERS_WITHOUT_CONTROL: &[&str] = &["ram_file_drv"];
-
-/// Whether the built-in driver registered under `name` declares a `control` callback — see
-/// [`BUILTIN_DRIVERS_WITHOUT_CONTROL`] for why this cannot be asked of the driver itself.
-fn builtin_driver_has_control(name: &str) -> bool {
-    !BUILTIN_DRIVERS_WITHOUT_CONTROL.contains(&name)
 }
 
 impl PortName {
@@ -524,13 +499,29 @@ struct PortMeta {
     /// Which `Name` form opened the port.
     ///
     /// The two message producers route on it (see [`PortName::bytes_from_driver_output`], and
-    /// [`PortMeta::has_driver_control`] for the `port_control` gate): a `dlopen`ed
-    /// `{spawn_driver, Name}` port's bytes
+    /// [`PortMeta::has_driver_control`] for the `port_control` gate's `Name`-form half): a
+    /// `dlopen`ed `{spawn_driver, Name}` port's bytes
     /// come from the C driver's `output` callback (queued on the port's input queue by
     /// [`driver::DriverPortAdapter`]) and are drained by [`PortRegistry::take_driver_outputs`],
     /// while every other port's — including a **built-in** driver port's — come from a
     /// poller-registered descriptor through the port-task round.
     kind: PortName,
+    /// Whether this port's driver declares a **`control` callback** — the C's
+    /// `prt->drv_ptr->control != NULL` test (`../../erts/emulator/beam/io.c:4035`), captured from
+    /// the driver object **when the port is opened** because that object is moved into
+    /// [`PortRegistry::register`] and is unreachable afterwards.
+    ///
+    /// The answer comes from the driver itself, never from a name: a static driver's
+    /// [`beam_io::Driver::has_control`] (false for `ram_file_drv`, whose C entry leaves `control`
+    /// `NULL`, `../../erts/emulator/drivers/common/ram_file_drv.c:116`), and a `dlopen`ed
+    /// `{spawn_driver, Name}` port's `ErlDrvEntry::control` slot through
+    /// [`driver::DriverPortAdapter::has_control`]. `false` for the `spawn`/`spawn_executable`/`fd`
+    /// family, which is backed by [`beam_io::SpawnDriver`] — a driver with no `control` callback at
+    /// all.
+    ///
+    /// Only [`PortMeta::has_driver_control`] reads it; that method is the gate's whole answer for a
+    /// driver-backed port.
+    driver_has_control: bool,
     /// The term queue of a `{spawn_driver, Name}` port: the terms its C driver emitted through
     /// `erl_drv_output_term`/`erl_drv_send_term`, drained by
     /// [`PortRegistry::take_driver_terms`].
@@ -616,24 +607,19 @@ impl PortMeta {
     /// `prt->drv_ptr->control != NULL` test (`../../erts/emulator/beam/io.c:4035`), which is what
     /// [`PortRegistry::port_control`] gates its `badarg` on.
     ///
-    /// The three answers:
+    /// The answer is the driver's own, captured when the port was opened
+    /// ([`PortMeta::driver_has_control`]): a `{spawn_driver, Name}` port — `dlopen`ed or
+    /// **built in** — carries whatever its driver entry declares, so `{spawn_driver,
+    /// "ram_file_drv"}` (no `control` slot) and `{spawn_driver, "udp_inet"}` (an `inet_control`
+    /// callback) differ on the same `Name` form.
     ///
-    /// * a `{spawn_driver, Name}` port whose driver was `dlopen`ed ([`PortName::SpawnDriver`]) —
-    ///   its real `ErlDrvEntry::control` slot decides: the slot is what the ABI adapter answers
-    ///   through, and an entry that declares none is the C's `badarg`, so the loaded driver is the
-    ///   authority;
-    /// * a `{spawn_driver, Name}` port whose driver is **built in**
-    ///   ([`PortName::SpawnDriverBuiltin`]) — [`builtin_driver_has_control`], the one fact
-    ///   [`beam_io`]'s `Driver` trait cannot express;
-    /// * every other `Name` form — `spawn`/`spawn_executable`/`fd`, all backed by
-    ///   [`beam_io::SpawnDriver`], which has no `control` callback at all, so `port_control/3` is
-    ///   the oracle's `badarg` for **every** verb.
+    /// The `Name` form is still the authority for the rest: every other form —
+    /// `spawn`/`spawn_executable`/`fd`, all backed by [`beam_io::SpawnDriver`], which has no
+    /// `control` callback at all — can never claim the capability, so `port_control/3` is the
+    /// oracle's `badarg` for **every** verb on such a port.
     fn has_driver_control(&self) -> bool {
         match self.kind {
-            PortName::SpawnDriver => true,
-            PortName::SpawnDriverBuiltin => {
-                builtin_driver_has_control(driver_path_name(&self.command))
-            }
+            PortName::SpawnDriver | PortName::SpawnDriverBuiltin => self.driver_has_control,
             PortName::Spawn | PortName::SpawnExecutable | PortName::Fd => false,
         }
     }
@@ -2770,6 +2756,10 @@ impl PortHook for RuntimePorts {
             // [`PortRegistry::take_driver_outputs`].
             if let Some(created) = registry.create_static_spawn_driver(&driver_name) {
                 let driver = created?;
+                // The driver's own `control` capability, read **before** the boxed driver is moved
+                // into `register` — `ram_file_drv`'s C entry leaves the slot `NULL`, the two socket
+                // drivers declare `inet_control`.
+                let driver_has_control = driver.has_control();
                 let meta = PortMeta {
                     command: spec.command,
                     // A built-in driver port owns no OS child; `port_info(Port, os_pid)` is
@@ -2784,6 +2774,7 @@ impl PortHook for RuntimePorts {
                     monitors: Vec::new(),
                     owner: self.owner,
                     kind: PortName::SpawnDriverBuiltin,
+                    driver_has_control,
                     // A built-in driver has no C host, so it has no term queue, interns no name,
                     // sets no control flags and holds no process monitors.
                     driver_terms: None,
@@ -2853,6 +2844,10 @@ impl PortHook for RuntimePorts {
             let adapter =
                 driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
                     .map_err(|_| BeamError::BadArg)?;
+            // The loaded entry's own `control` slot, read **before** the adapter is moved into
+            // `register`: an entry that leaves it `NULL` is the C's `badarg` for every verb
+            // (`io.c:4035`), exactly as [`beam_io`]'s ABI adapter answers the same question.
+            let driver_has_control = adapter.has_control();
             let meta = PortMeta {
                 command: spec.command,
                 // A driver port owns no OS child; `port_info(Port, os_pid)` is `undefined`.
@@ -2866,6 +2861,7 @@ impl PortHook for RuntimePorts {
                 monitors: Vec::new(),
                 owner: self.owner,
                 kind: PortName::SpawnDriver,
+                driver_has_control,
                 driver_terms: Some(driver_terms),
                 driver_atoms: Some(driver_atoms),
                 driver_control_flags: Some(driver_control_flags),
@@ -2901,6 +2897,9 @@ impl PortHook for RuntimePorts {
             monitors: Vec::new(),
             owner: self.owner,
             kind: spec.kind,
+            // `beam_io::SpawnDriver` — this family's driver — has no `control` callback at all, so
+            // `port_control/3` is `badarg` for every verb (the C's `!prt->drv_ptr->control`).
+            driver_has_control: false,
             // A `spawn`/`fd` port has no C driver, so it has neither driver term queue nor names
             // a driver interned, nor control flags, nor a busy state, nor process monitors.
             driver_terms: None,
@@ -3528,8 +3527,9 @@ impl RuntimeContext<'_> {
 /// the C's own rule (`io.c` walks the name to the first blank before matching
 /// `ErlDrvEntry::driver_name`), so `"ram_file_drv extra args"` names the driver `ram_file_drv`.
 ///
-/// Both the driver search ([`driver_lookup`]) and the driver-capability question
-/// ([`PortMeta::has_driver_control`]) read the name through this one truncation.
+/// This is the driver **search**'s rule ([`driver_lookup`]); whether the resolved driver declares a
+/// `control` callback is the driver's own answer, captured at open time
+/// ([`PortMeta::driver_has_control`]), not anything read from this name.
 fn driver_path_name(command: &str) -> &str {
     command.split(' ').next().unwrap_or(command)
 }

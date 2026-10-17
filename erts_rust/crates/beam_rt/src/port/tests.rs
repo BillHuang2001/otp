@@ -288,6 +288,9 @@ fn test_meta(command: &str) -> PortMeta {
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
+        // `PortName::Spawn` is the internal form, backed by `beam_io::SpawnDriver`: no driver
+        // `control` callback exists to claim.
+        driver_has_control: false,
         driver_terms: None,
         driver_atoms: None,
         driver_control_flags: None,
