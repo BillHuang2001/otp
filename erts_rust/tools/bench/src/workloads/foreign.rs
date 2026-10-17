@@ -33,13 +33,13 @@
 //! Repos are **read-only**: the `.erl` sources are only *read*; every `.beam` is
 //! produced into a private, self-cleaning [`ScratchDir`] under `$TMPDIR`.
 //!
-//! # The measurement (startup-corrected, per call)
+//! # The measurement (paired, startup-cancelled, per call)
 //!
 //! A single call is far too short to time, and the two runtimes differ by orders of
 //! magnitude, so a single fixed loop count cannot give both a meaningful marginal. Each
 //! case therefore declares a **per-runtime loop count** `N` (calibrated so a single run
 //! costs a few hundred ms on that runtime) and the workload runs the identical program
-//! twice per sample:
+//! twice:
 //!
 //! * at `N` iterations ⇒ `case_<name>_wall_ms` (end-to-end process wall time),
 //! * at `0` iterations ⇒ `case_<name>_startup_ms` (the same program's pure
@@ -50,59 +50,80 @@
 //! and derives the startup-cancelled marginal
 //!
 //! ```text
-//! case_<name>_ns_per_call = (mean(wall_ms) - mean(startup_ms)) / N * 1e6
+//! case_<name>_ns_per_call = median_i(wall_ms at N - wall_ms at 0) / N * 1e6
 //! ```
 //!
-//! That last metric is the **throughput comparison**: nanoseconds of wall clock per
-//! call of a real foreign function, with the fixed process-startup cost removed from
-//! both sides. It is only emitted when the marginal is positive (otherwise a note
-//! records that the marginal is below timer resolution — never a fabricated number).
+//! The two samples are taken **interleaved, one `(work, startup)` pair per round**: round
+//! `i` runs the `N`-call sample and then the `0`-call sample *back to back*
+//! ([`crate::marginal::sample_pairs`]), so both members of a pair see essentially the same
+//! host conditions. The statistic is the **median of the paired differences** (one per
+//! round), normalized by `N` — the throughput comparison above, with the fixed
+//! process-startup cost removed from both sides.
 //!
-//! Every case that produced a timing also emits the deterministic, contention-immune
-//! companion metric `case_<name>_calls = N` (mirroring `copy_bound`'s
-//! `case_<name>_ops`), so the loop count behind the marginal is **always in the
-//! report** — a `ns/call` figure can never be read without the `N` that produced it.
+//! # Why paired — the old schedule must never come back
+//!
+//! This workload used to take **all `N` samples first, then all `0` samples** and divide
+//! `mean(wall) - mean(startup)` by `N`. That holds only while the boot cost is constant over
+//! the measurement; on this shared, loaded host it drifts by tens — at times hundreds — of
+//! milliseconds *between* the two passes, so the mean-based difference **absorbs the drift
+//! instead of cancelling it** (the only guard being that a negative marginal was refused)
+//! and the published error is dominated by how busy the host was: an interleaved
+//! re-measurement of the sibling `copy_bound` workload's `etf_roundtrip` case gave `2.42×`
+//! where the sequential schedule reported `136×` — a ~56× inflation. Interleaving leaves
+//! only a per-pair residual (at most one sampling interval) and the median keeps a single
+//! contended round from moving the estimate, so a sequential all-`N`-then-all-`0` schedule
+//! is not a stylistic alternative here, it *is* the regression (mechanism and its four
+//! rules: `src/marginal.rs`).
+//!
+//! The figure is **withheld** — no metric, plus a `marginal below timer resolution` note
+//! citing the evidence — whenever the median paired difference fails to clear
+//! `NOISE_MULTIPLE × max(MIN_NOISE_MS, 1.4826 × MAD)` of those differences, so load jitter
+//! is never published as a number; when it *is* published, its `paired median=… ms min=…
+//! ms max=… ms noise=±… ms over k round(s)` detail is recorded as a note too.
+//!
+//! Every timed case also emits the deterministic, contention-immune companion
+//! `case_<name>_calls = N` (mirroring `copy_bound`'s `case_<name>_ops`), so the loop count
+//! behind the marginal is **always in the report**.
 //!
 //! # `ns_per_call` is `N`-dependent on the Rust runtime (read before comparing)
 //!
-//! **On `beam_rt` the per-call cost itself grows with `N`** (measured super-linear;
-//! see `RESULTS.md` §3.4), so `case_<name>_ns_per_call` is only a clean marginal at
-//! the declared `N` and is **only comparable across runs that used the SAME `N`**. The
-//! `sys` (system ERTS) side is ~flat over the same range. The per-runtime `N` values
-//! are unchanged since m10, so the m10↔m11 A/B was taken at **matched `N`** and is a
-//! valid comparison; a run that changes a case's `n_rust` is not. Each Rust row
-//! therefore carries an explicit note stating this, and every row carries the `N` it
-//! used in `case_<name>_calls`.
+//! **On `beam_rt` the per-call cost itself grows with `N`** (measured super-linear; see
+//! `RESULTS.md` §3.4), so `case_<name>_ns_per_call` is only a clean marginal at the declared
+//! `N` and is **only comparable across runs that used the SAME `N`**. The `sys` (system
+//! ERTS) side is ~flat over the same range. The per-runtime `N` values are unchanged since
+//! m10, so the m10↔m11 A/B was taken at **matched `N`** and is a valid comparison; a run
+//! that changes a case's `n_rust` is not. Each Rust row therefore carries an explicit note
+//! stating this, and every row carries the `N` it used in `case_<name>_calls`. The Rust
+//! peak-RSS figure is likewise **not** a like-for-like memory comparison: it is
+//! boot-dominated (the resident preloaded-module set dwarfs the loop's own footprint).
 //!
 //! # Honest reporting
 //!
-//! * Every runtime's stdout must equal `N * per_call` (the driver accumulates a value
-//!   that is linear in `N`); a mismatch is recorded as a note.
+//! * Every runtime's stdout must equal `N * per_call` on the work pass and `0` on the
+//!   startup pass (the driver accumulates a value linear in the loop count); a mismatch is
+//!   recorded as a note, never silently ignored and never fatal.
 //! * A Rust exit `3` (`beam_rt: unsupported: …`) records the capability gap and emits
 //!   **no** timing for that case — never a fabricated number.
-//! * `erlc` unavailable, or every case's sources missing from the (read-only) checkout
-//!   ⇒ an honest `skipped(erlc-absent)` / `skipped(sources-missing)`.
-//! * `erlc` *failing* on the sources we did stage (the embedded driver, or a present
-//!   foreign source) ⇒ a real `failed(module-compile-failed)`, never a benign skip.
+//! * `erlc` unavailable, or every case's sources missing from the (read-only) checkout ⇒ an
+//!   honest `skipped(erlc-absent)` / `skipped(sources-missing)`; `erlc` *failing* on the
+//!   sources we did stage ⇒ a real `failed(module-compile-failed)`, never a benign skip.
 //! * The Rust row records, in a note, that its `ns_per_call` figures are `N`-dependent
 //!   (only comparable at the same `N`) — the caveat is never hidden behind the number.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::{Path, PathBuf};use std::process::Command;
 
+use crate::marginal::{resolve, sample_pairs, Marginal, PairedRuns, Pass, PassError};
 use crate::metrics::{Category, Metric, Probe, Runtimes, Status};
 use crate::proc::{self, Completed};
 use crate::report::{Profile, WorkloadResult};
 use crate::runtime::RuntimeKind;
 use crate::scratch::ScratchDir;
-use crate::stats::mean;
 use crate::workload::{RunContext, Workload};
 use crate::workloads::{resolve_repo, slice};
 
 /// The documented default Cowboy checkout (overridable via `--repo cowboy=<path>` /
 /// `$BENCH_COWBOY_REPO`).
 const COWBOY_ROOT: &str = "/home/bill/Source/cowboy";
-
 /// The documented default EMQX checkout (overridable via `--repo emqx=<path>` /
 /// `$BENCH_EMQX_REPO`).
 const EMQX_ROOT: &str = "/home/bill/Source/emqx";
@@ -402,11 +423,11 @@ fn stage(
 struct CaseOutcome {
     /// The loop count used.
     n: i64,
-    /// Wall-clock samples (ms) of the `n`-iteration runs.
+    /// Wall-clock samples (ms) of the `n`-iteration runs, in interleaved round order.
     wall: Vec<f64>,
-    /// Wall-clock samples (ms) of the `0`-iteration (startup-only) runs.
+    /// Wall-clock samples (ms) of the `0`-iteration (startup-only) runs, one per work sample.
     startup: Vec<f64>,
-    /// Peak-RSS samples (bytes) of the `n`-iteration runs.
+    /// Peak-RSS samples (bytes) of the `n`-iteration (work) runs only.
     rss: Vec<f64>,
     /// The stdout observed on the first successful `n`-iteration run.
     observed: Option<String>,
@@ -414,6 +435,8 @@ struct CaseOutcome {
     unsupported: bool,
     /// Notes about failures/variations (never silent).
     notes: Vec<String>,
+    /// The paired, drift-cancelling marginal the per-call figure is resolved from.
+    marginal: Marginal,
 }
 
 impl CaseOutcome {
@@ -423,38 +446,129 @@ impl CaseOutcome {
     }
 }
 
-/// The startup-cancelled marginal cost per call, in nanoseconds — `None` when either
-/// sample set is unusable or the marginal is not positive (below timer resolution).
-fn per_call_ns(wall: &[f64], startup: &[f64], n: i64) -> Option<f64> {
-    if wall.is_empty() || startup.is_empty() || n <= 0 {
-        return None;
+/// One completed sample of a case: the wall time, the poller's peak RSS, the trimmed stdout
+/// and any note about this particular run.
+struct CaseSample {
+    /// End-to-end process wall time, in milliseconds.
+    wall_ms: f64,
+    /// The process's peak RSS, when the poller could read it.
+    peak_memory_bytes: Option<u64>,
+    /// The run's trimmed stdout.
+    stdout: String,
+    /// Per-sample notes (e.g. an unexpected stdout on this pass).
+    notes: Vec<String>,
+}
+
+/// Runs **one** sample of `case` — the `Work` pass (`n` iterations) or the `Startup` pass
+/// (`0` iterations, i.e. the same program's pure boot cost) — returning the sample, or a
+/// [`PassError`] carrying the classified note when the run fails. The Rust runtime's `exit 3`
+/// capability gap is flagged `unsupported` **only** while no work sample has completed: once
+/// the case has produced a timing, a later failure is a real one.
+fn sample_once(
+    program: &Path, kind: RuntimeKind, dir: &Path, case: &Case, n: i64, pass: Pass,
+    completed_work_samples: usize,
+) -> std::result::Result<CaseSample, PassError> {
+    let loops = n * pass.units();
+    let mut cmd = Command::new(program);
+    cmd.args(argv_for(kind, dir, case, loops));
+    let completed = proc::run(&mut cmd).map_err(|e| PassError {
+        note: format!("case {} ({}): spawn failed: {e}", case.name, kind.as_str()),
+        unsupported: false,
+    })?;
+    if !completed.success {
+        return Err(PassError {
+            note: classify_failure(kind, case, &completed),
+            unsupported: kind == RuntimeKind::Rust
+                && completed.exit_code == Some(3)
+                && completed_work_samples == 0,
+        });
     }
-    let marginal = mean(wall) - mean(startup);
-    if marginal <= 0.0 {
-        None
-    } else {
-        Some(marginal / n as f64 * 1_000_000.0)
+    // The driver's result is linear in the loop count, so the expected stdout is exact on both
+    // passes (`0` on the startup pass). A mismatch is a note, never a fatal error: the timing
+    // is still real.
+    let stdout = completed.stdout_trim().to_string();
+    let expected = (loops * case.per_call).to_string();
+    let mut notes = Vec::new();
+    if stdout != expected {
+        notes.push(format!(
+            "case {}: unexpected stdout on the {} pass `{stdout}` (expected `{expected}`)",
+            case.name,
+            pass.as_str()
+        ));
+    }
+    Ok(CaseSample {
+        wall_ms: completed.wall_ms,
+        peak_memory_bytes: completed.peak_memory_bytes,
+        stdout,
+        notes,
+    })
+}
+
+/// Folds the interleaved runs into a [`CaseOutcome`]: the paired wall times, the work-pass peak
+/// RSS, the first observed stdout, every per-sample note, the resolved marginal and the abort
+/// (if any — the rounds completed before it are **kept** and still reported).
+fn outcome_from(n: i64, sampled: PairedRuns<CaseSample>) -> CaseOutcome {
+    let PairedRuns { pairs, aborted } = sampled;
+    let (mut wall, mut startup) = (Vec::with_capacity(pairs.len()), Vec::with_capacity(pairs.len()));
+    let (mut rss, mut observed, mut notes) = (Vec::new(), None, Vec::new());
+    for (work, baseline) in pairs {
+        wall.push(work.wall_ms);
+        startup.push(baseline.wall_ms);
+        if let Some(bytes) = work.peak_memory_bytes {
+            rss.push(bytes as f64);
+        }
+        if observed.is_none() {
+            observed = Some(work.stdout);
+        }
+        notes.extend(work.notes);
+        notes.extend(baseline.notes);
+    }
+    let deltas: Vec<(f64, f64)> = wall.iter().copied().zip(startup.iter().copied()).collect();
+    // The closure already decided whether an abort was a capability gap (`exit 3` with no
+    // completed work sample), so that classification carries over untouched.
+    let unsupported = matches!(aborted.as_ref(), Some(abort) if abort.unsupported);
+    if let Some(abort) = aborted {
+        notes.push(abort.note);
+    }
+    CaseOutcome {
+        n,
+        wall,
+        startup,
+        rss,
+        observed,
+        unsupported,
+        notes,
+        marginal: resolve(&deltas, n),
     }
 }
 
-/// The deterministic, contention-immune companion metric for a timed case: the loop count
-/// `N` the [`per_call_ns`] marginal was derived from.
-///
-/// It is emitted for **every** case that produced a timing (mirroring `copy_bound`'s
-/// `case_<name>_ops`), so a per-call figure can never be read without the `N` behind it —
-/// which matters because the Rust per-call cost is itself `N`-dependent (see
-/// [`N_DEPENDENCE_NOTE`]).
+/// Emits the per-call metric family for one case: the `case_<name>_ns_per_call` figure plus its
+/// auditable `paired median=…` detail note when the marginal cleared the noise band, or the
+/// withholding note (and **no** metric) when it did not.
+fn emit_per_call(case: &Case, marginal: &Marginal, metrics: &mut Vec<Metric>, notes: &mut Vec<String>) {
+    match marginal.unit_cost_ns() {
+        Some(ns) => {
+            let m = Metric::scalar(format!("case_{}_ns_per_call", case.name), "ns", ns);
+            metrics.push(m);
+            notes.push(format!("case {}: per-call marginal {}", case.name, marginal.detail()));
+        }
+        None => {
+            let why = marginal.below_resolution_note();
+            notes.push(format!("case {}: {why}; no per-call metric", case.name));
+        }
+    }
+}
+
+/// The deterministic, contention-immune companion metric for a timed case: the loop count `N`
+/// the per-call marginal was derived from, emitted for **every** case that produced a timing
+/// (mirroring `copy_bound`'s `case_<name>_ops`) so a figure can never be read without it.
 fn calls_metric(case: &Case, n: i64) -> Metric {
     Metric::scalar(format!("case_{}_calls", case.name), "calls", n as f64)
 }
 
-/// The caveat recorded on a Rust `foreign` row: the per-call metric is `N`-dependent, so it
-/// is only comparable across runs that used the same `N`, and the m10↔m11 A/B was taken at
-/// matched `N`.
-///
-/// Recorded verbatim as a report note so the limitation is machine-visible rather than
-/// buried in prose: a `case_<name>_ns_per_call` value from this workload must never be
-/// quoted across runs with a different `N`.
+/// The caveat recorded on a Rust `foreign` row: the per-call metric is `N`-dependent, so it is
+/// only comparable across runs that used the same `N` (recorded as a report note so the
+/// limitation is machine-visible rather than buried in prose).
 const N_DEPENDENCE_NOTE: &str = "caveat: on the Rust runtime this per-call metric is \
      N-DEPENDENT (the measured per-call cost grows with N, super-linearly), so \
      case_<name>_ns_per_call is only comparable across runs that used the SAME N; the m10 \
@@ -470,96 +584,26 @@ fn classify_failure(kind: RuntimeKind, case: &Case, completed: &Completed) -> St
             format!("case {}: unsupported: {reason}", case.name)
         }
         (_, Some(code)) => format!("case {} ({}): exited {code}: {stderr}", case.name, kind.as_str()),
-        (_, None) => format!(
-            "case {} ({}): terminated by signal: {stderr}",
-            case.name,
-            kind.as_str()
-        ),
+        (_, None) => format!("case {} ({}): terminated by signal: {stderr}", case.name, kind.as_str()),
     }
 }
 
-/// Runs one case at `n` and at `0` iterations, `runs` times each, collecting samples.
-fn execute_case(
-    program: &Path,
-    kind: RuntimeKind,
-    dir: &Path,
-    case: &Case,
-    runs: usize,
-) -> CaseOutcome {
+/// Runs one case `runs` times **interleaved**: every round samples the `n`-iteration pass and
+/// then the `0`-iteration pass back to back, so the boot cost drifts *inside* a pair rather than
+/// between two passes (see the module docs and `crate::marginal`). A failing sample aborts the
+/// measurement; the rounds already completed are kept and reported, and a case whose **first
+/// work** pass failed is flagged `unsupported` instead of timed.
+fn execute_case(program: &Path, kind: RuntimeKind, dir: &Path, case: &Case, runs: usize) -> CaseOutcome {
     let n = case.n_for(kind);
-    let mut outcome = CaseOutcome {
-        n,
-        wall: Vec::new(),
-        startup: Vec::new(),
-        rss: Vec::new(),
-        observed: None,
-        unsupported: false,
-        notes: Vec::new(),
-    };
-    let expected = (n * case.per_call).to_string();
-
-    // Pass 1: the `n`-iteration runs (the measured work).
-    for _ in 0..runs {
-        let mut cmd = Command::new(program);
-        cmd.args(argv_for(kind, dir, case, n));
-        match proc::run(&mut cmd) {
-            Ok(completed) if completed.success => {
-                outcome.wall.push(completed.wall_ms);
-                if let Some(bytes) = completed.peak_memory_bytes {
-                    outcome.rss.push(bytes as f64);
-                }
-                let got = completed.stdout_trim().to_string();
-                if got != expected {
-                    outcome
-                        .notes
-                        .push(format!("case {}: unexpected stdout `{got}`", case.name));
-                }
-                if outcome.observed.is_none() {
-                    outcome.observed = Some(got);
-                }
-            }
-            Ok(completed) => {
-                if kind == RuntimeKind::Rust && completed.exit_code == Some(3) && outcome.wall.is_empty()
-                {
-                    outcome.unsupported = true;
-                }
-                outcome.notes.push(classify_failure(kind, case, &completed));
-                break;
-            }
-            Err(e) => {
-                outcome
-                    .notes
-                    .push(format!("case {} ({}): spawn failed: {e}", case.name, kind.as_str()));
-                break;
-            }
+    let mut completed_work_samples = 0usize;
+    let sampled = sample_pairs(runs, |pass| {
+        let sample = sample_once(program, kind, dir, case, n, pass, completed_work_samples)?;
+        if pass == Pass::Work {
+            completed_work_samples += 1;
         }
-    }
-
-    // Pass 2: the `0`-iteration runs (startup only). Skipped when pass 1 already failed —
-    // a broken case must not be timed at all.
-    if outcome.ok() {
-        for _ in 0..runs {
-            let mut cmd = Command::new(program);
-            cmd.args(argv_for(kind, dir, case, 0));
-            match proc::run(&mut cmd) {
-                Ok(completed) if completed.success => outcome.startup.push(completed.wall_ms),
-                Ok(completed) => {
-                    outcome
-                        .notes
-                        .push(format!("case {}: startup run failed: {}", case.name, classify_failure(kind, case, &completed)));
-                    break;
-                }
-                Err(e) => {
-                    outcome
-                        .notes
-                        .push(format!("case {}: startup spawn failed: {e}", case.name));
-                    break;
-                }
-            }
-        }
-    }
-
-    outcome
+        Ok(sample)
+    });
+    outcome_from(n, sampled)
 }
 
 impl Workload for Foreign {
@@ -570,7 +614,6 @@ impl Workload for Foreign {
     fn description(&self) -> &'static str {
         "real Cowboy/EMQX modules run under each runtime (per-call cost + wall latency)"
     }
-
     fn category(&self) -> Category {
         Category::Compute
     }
@@ -683,17 +726,8 @@ impl Workload for Foreign {
                         &outcome.startup,
                     ));
                 }
-                match per_call_ns(&outcome.wall, &outcome.startup, outcome.n) {
-                    Some(ns) => result.metrics.push(Metric::scalar(
-                        format!("case_{}_ns_per_call", case.name),
-                        "ns",
-                        ns,
-                    )),
-                    None => result.notes.push(format!(
-                        "case {}: marginal below timer resolution; no per-call metric",
-                        case.name
-                    )),
-                }
+                // The paired marginal figure (or an auditable reason it was withheld).
+                emit_per_call(case, &outcome.marginal, &mut result.metrics, &mut result.notes);
                 // The deterministic companion: the loop count the marginal above was derived
                 // from, so the N behind every per-call figure is in the report.
                 result.metrics.push(calls_metric(case, outcome.n));
@@ -724,9 +758,11 @@ impl Workload for Foreign {
             result.notes.push(N_DEPENDENCE_NOTE.to_string());
         }
         result.notes.push(
-            "method: per-call cost = (mean wall at N iterations - mean wall at 0 iterations) / N; \
-             N is per runtime so both marginals are measurable, and the fixed process startup \
-             (incl. the Rust runtime's code-path resolution) cancels out of both sides"
+            "method: per-call cost = median of the paired (wall at N iterations - wall at 0 \
+             iterations) differences / N; each round samples the N pass and then the 0 pass \
+             back to back so a drifting boot cost cancels inside the pair, N is per runtime so \
+             both marginals are measurable, and the fixed process startup (incl. the Rust \
+             runtime's code-path resolution) cancels out of both sides"
                 .to_string(),
         );
         result.notes.push(format!(
@@ -789,17 +825,94 @@ mod tests {
         assert!(sys.iter().any(|a| a.contains(&format!("{DRIVER_MODULE}:{}(9)", case.function))));
     }
 
+    /// A fake sample of `case` on `pass` at `wall_ms`: the deterministic stdout that pass must
+    /// print (the driver's result is linear in the loop count) and a peak RSS on work only.
+    fn fake_sample(case: &Case, pass: Pass, wall_ms: f64) -> CaseSample {
+        let loops = case.n_for(RuntimeKind::Rust) * pass.units();
+        CaseSample {
+            wall_ms,
+            peak_memory_bytes: (pass == Pass::Work).then_some(1_024),
+            stdout: (loops * case.per_call).to_string(),
+            notes: Vec::new(),
+        }
+    }
+
     #[test]
-    fn per_call_ns_cancels_startup_and_rejects_unusable_samples() {
-        // 100 ms at N=100, 10 ms at N=0 ⇒ 0.9 ms/call ⇒ 900_000 ns.
-        assert_eq!(per_call_ns(&[100.0], &[10.0], 100), Some(900_000.0));
-        // Equal or inverted (noise) ⇒ no metric, never a negative number.
-        assert_eq!(per_call_ns(&[100.0], &[100.0], 100), None);
-        assert_eq!(per_call_ns(&[90.0], &[100.0], 100), None);
-        // Missing sample sets / a non-positive count ⇒ no metric.
-        assert_eq!(per_call_ns(&[], &[1.0], 100), None);
-        assert_eq!(per_call_ns(&[1.0], &[], 100), None);
-        assert_eq!(per_call_ns(&[1.0], &[0.0], 0), None);
+    fn rounds_are_paired_work_then_startup() {
+        // The schedule is the whole point: every round must sample the work pass and then the
+        // startup pass immediately after — never all work samples followed by all startup ones.
+        let (case, runs) = (&CASES[0], 3);
+        let mut order: Vec<Pass> = Vec::new();
+        let sampled = sample_pairs(runs, |pass| {
+            order.push(pass);
+            Ok::<CaseSample, PassError>(fake_sample(case, pass, 100.0))
+        });
+        let round = [Pass::Work, Pass::Startup];
+        assert_eq!(order, round.iter().copied().cycle().take(2 * runs).collect::<Vec<_>>());
+        let outcome = outcome_from(case.n_for(RuntimeKind::Rust), sampled);
+        assert_eq!((outcome.wall.len(), outcome.startup.len()), (runs, runs));
+        // Peak RSS comes from the work samples only, one per round.
+        assert_eq!(outcome.rss, vec![1_024.0; runs]);
+    }
+
+    #[test]
+    fn a_failing_startup_pass_keeps_the_completed_pairs() {
+        // Round 1 completes, round 2's startup pass fails: the completed round must survive,
+        // the failure must be recorded (never swallowed) and it is not a capability gap.
+        let (case, n) = (&CASES[0], CASES[0].n_for(RuntimeKind::Rust));
+        let mut calls = 0usize;
+        let sampled = sample_pairs(3, |pass| {
+            calls += 1;
+            if calls == 4 {
+                let note = format!("case {}: startup run failed: exited 1", case.name);
+                return Err(PassError { note, unsupported: false });
+            }
+            Ok::<CaseSample, PassError>(fake_sample(case, pass, 100.0))
+        });
+        let outcome = outcome_from(n, sampled);
+        assert!(outcome.ok(), "the completed round must be reported");
+        assert_eq!((outcome.wall.len(), outcome.startup.len()), (1, 1));
+        assert_eq!((outcome.marginal.rounds, outcome.unsupported), (1, false));
+        assert!(outcome.notes.iter().any(|n| n.contains("startup run failed")), "{:?}", outcome.notes);
+
+        // A first-work-pass failure carrying the Rust capability gap keeps the flag and retains
+        // nothing, so no timing is published for an unsupported case.
+        let gap = PassError {
+            note: format!("case {}: unsupported: unsupported_bif", case.name),
+            unsupported: true,
+        };
+        let outcome = outcome_from(n, sample_pairs(3, |_pass| Err::<CaseSample, PassError>(gap.clone())));
+        assert!(!outcome.ok() && outcome.unsupported);
+        assert_eq!(outcome.marginal.unit_cost_ns(), None);
+    }
+
+    #[test]
+    fn the_metric_is_withheld_inside_the_noise_band() {
+        // Resolve a fake paired measurement (work pass at `work_ms`, startup pass at 100 ms) and
+        // run the metric-emission step over it.
+        let emit = |work_ms: f64| {
+            let (case, n) = (&CASES[0], CASES[0].n_for(RuntimeKind::Rust));
+            let wall = |pass: Pass| if pass == Pass::Work { work_ms } else { 100.0 };
+            let fake = |pass| Ok::<CaseSample, PassError>(fake_sample(case, pass, wall(pass)));
+            let outcome = outcome_from(n, sample_pairs(3, fake));
+            assert!(outcome.ok(), "the samples themselves are usable");
+            let (mut metrics, mut notes) = (Vec::new(), Vec::new());
+            emit_per_call(case, &outcome.marginal, &mut metrics, &mut notes);
+            (n, metrics, notes)
+        };
+
+        // A 0.5 ms paired difference is below `MIN_NOISE_MS` (1 ms): no metric, one note.
+        let (_, metrics, notes) = emit(100.5);
+        assert!(metrics.is_empty(), "no per-call metric inside the band");
+        assert!(notes.len() == 1 && notes[0].contains("marginal below timer resolution"), "{notes:?}");
+
+        // A difference that clears the band publishes the figure *and* its auditable detail.
+        let (n, metrics, notes) = emit(200.0);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, format!("case_{}_ns_per_call", CASES[0].name));
+        assert_eq!(metrics[0].unit, "ns");
+        assert_eq!(metrics[0].value, Some(100.0 / n as f64 * 1e6));
+        assert!(notes[0].contains("paired median="), "{}", notes[0]);
     }
 
     #[test]
