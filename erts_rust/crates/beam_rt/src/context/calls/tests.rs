@@ -750,20 +750,3 @@ fn eval_route_pool_costs() {
         report(label, &rows);
     }
 }
-
-#[test]
-#[ignore]
-fn pool_probe() {
-    for expr in [
-        "1+1",
-        "[element(1,{I}) || I <- lists:seq(1,10)]",
-        "[I || I <- lists:seq(1,10)]",
-        "[list_to_tuple([I]) || I <- lists:seq(1,10)]",
-        "list_to_tuple([1])",
-    ] {
-        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
-            .expect("the default runtime");
-        let _ = rt.eval(expr).expect("probe evaluates");
-        println!("{expr} => pool={:?} eval_heap={} arena_avail={}", pool_snapshot(&rt), rt.eval_heap.used(), rt.arena_available());
-    }
-}
