@@ -51,16 +51,26 @@
 //! The families are the `udp/*` corpus surface `beam_io` reports (its
 //! `drivers/inet/opcode_tests_udp.rs::oracle_matrix` plus the option store): the bare
 //! (socket-less) refusals and fake addresses, the datagram lifecycle, the connected/peer half, the
-//! opcode-scope rules, the option store, and the `tcp_inet` bare refusals of the same bridge.
+//! opcode-scope rules, the option store, the shared `inet_ctl` arms (`subscribe`, a pre-adoption
+//! `fdopen`, the `getservby*` name service, the `getopts` truncate-and-continue rule), the interface
+//! requests (`getiflist`/`ifget`/`ifset`/`getifaddrs`), and the `tcp_inet` bare refusals of the same
+//! bridge.
 //!
-//! # The residuals (`the_documented_datagram_residuals_stay_typed`)
+//! # The residual tables
 //!
-//! A handful of `udp` shapes are **known divergences owned by other nodes** — the `subscribe`
-//! body, a well-formed `fdopen`, the `getservby*`/`getif*` lookups, the asynchronous
-//! `PACKET_REQ_RECV` op-id, plus `getopts` of a `getsockopt` the socket refuses. Each is asserted on
-//! **both** sides: the exact oracle output (so the recorded
-//! divergence cannot rot) and this runtime's current honest answer (a typed error, or the
-//! documented synchronous read-now substitution — never a wrong result).
+//! What this driver floor still answers differently from C ERTS is a **capability gap or a
+//! documented substitution**, never a wrong result, and lives in two tables:
+//!
+//! * [`the_documented_datagram_residuals_stay_typed`] — the rows reached on a `udp_inet` port,
+//!   asserted on **both** sides (the exact oracle output, so the record cannot rot, plus this
+//!   runtime's honest answer): the asynchronous `PACKET_REQ_RECV` op-id (served here as the
+//!   synchronous read-now substitution) and `open` of a non-`AF_INET` family (this floor's own
+//!   `[0]eafnosupport` where the C creates the socket).
+//! * [`the_residuals_no_oracle_column_can_pin_stay_typed`] — the shapes whose oracle reply depends on
+//!   the oracle **process'** own descriptor table (`INET_REQ_FDOPEN`'s adoption form) or on a state
+//!   the C only reaches through its asynchronous `accept`/`connect` protocol (`ignorefd`,
+//!   `tcp_sendfile`, which need a connected stream), so those rows are pinned on this runtime's side
+//!   alone — each asserted to be a typed capability gap naming the request, never a fabricated reply.
 //!
 //! # The oracle
 //!
@@ -89,10 +99,16 @@ enum Rule {
     /// `[1, family, port_hi, port_lo, a, b, c, d]`: two independent sockets bind two different
     /// ephemeral ports, so the tag, the family and the address octets are compared.
     PackedAddress,
+    /// `[0] ++ errno-name`: the C answers with the *descriptor's own* `errno`, which depends on the
+    /// process' file-descriptor table, so only the error tag and the errno-name shape are compared.
+    ErrorReply,
+    /// A **host-dependent** reply (the machine's interface table): both sides must answer the same
+    /// stable prefix — never a literal host list, which would rot on any other machine.
+    Prefix(&'static str),
 }
-
 /// One probe of the matrix: the line label both renderings print, the integer `port_control/3`
 /// receives, the operand bytes and the comparison rule.
+#[derive(Clone)]
 struct Probe {
     /// The line label, spelled identically on both sides so the sessions are comparable.
     label: &'static str,
@@ -120,7 +136,22 @@ impl Probe {
         Probe::req(label, code, arg, Rule::Exact)
     }
 
-    /// A **raw** integer: an opcode below the magic number (whose unsigned subtraction wraps past
+    /// The C request `code` whose reply carries the descriptor's own `errno` (the C's
+    /// `ctl_error(sock_errno())`), so only the error tag and the errno-name shape are compared.
+    fn error_reply(label: &'static str, code: u32, arg: impl Into<Vec<u8>>) -> Probe {
+        Probe::req(label, code, arg, Rule::ErrorReply)
+    }
+
+    /// The C request `code` whose reply lists this machine's interfaces, so only `prefix` — the
+    /// stable part of the answer — is compared.
+    fn prefix(
+        label: &'static str,
+        code: u32,
+        arg: impl Into<Vec<u8>>,
+        prefix: &'static str,
+    ) -> Probe {
+        Probe::req(label, code, arg, Rule::Prefix(prefix))
+    }    /// A **raw** integer: an opcode below the magic number (whose unsigned subtraction wraps past
     /// every `case`) or a retired request number.
     fn raw(label: &'static str, value: u64, arg: impl Into<Vec<u8>>) -> Probe {
         Probe {
@@ -351,7 +382,50 @@ fn assert_agrees(what: &str, probe: &Probe, ours: &Reply, oracle: &str) {
             );
             assert_eq!(&ours[4..8], &theirs[4..8], "{label}: the address octets");
         }
-    }
+        Rule::ErrorReply => {
+            let (ours, theirs) = (ours.bytes(&label), ints_of(oracle));
+            assert_eq!(
+                theirs.first(),
+                Some(&0),
+                "{label}: the oracle's ctl_error reply carries the INET_REP_ERROR tag"
+            );
+            assert_eq!(
+                ours.first(),
+                Some(&0),
+                "{label}: this runtime's ctl_error reply carries the INET_REP_ERROR tag"
+            );
+            for (side, reply) in [("the oracle's", &theirs), ("this runtime's", &ours)] {
+                let name = reply.get(1..).unwrap_or_default();
+                assert!(
+                    !name.is_empty(),
+                    "{label}: {side} error reply names an errno"
+                );
+                assert_eq!(
+                    name[0],
+                    b'e',
+                    "{label}: {side} errno name ({name:?}) starts with `e`"
+                );
+                assert!(
+                    name.iter().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || *byte == b'_'),
+                    "{label}: {side} errno name ({name:?}) is the C's lowercase spelling"
+                );
+            }
+            // The name itself is the *descriptor's* errno — `ebadf` where the number is free,
+            // `enotsock` where it is some other open file — so it is deliberately not compared.
+        }
+        Rule::Prefix(prefix) => {
+            assert!(
+                ours.render().starts_with(prefix),
+                "{label}: this runtime's reply must start with {prefix:?}, got {:?}",
+                ours.render()
+            );
+            assert!(
+                oracle.starts_with(prefix),
+                "{label}: the oracle's reply must start with {prefix:?}, got {oracle:?}"
+            );
+        }    }
 }
 
 /// Runs one family's whole `probes` sequence on both sides and asserts every reply agrees.
@@ -530,8 +604,8 @@ fn opcode_scope() -> Vec<Probe> {
 /// codes, the aggregate/write-only codes, a multi-code request, an unserved code, and the
 /// `setopts`/`getopts` round trip for every served code.
 ///
-/// `nodelay` (code `10`) is **excluded here** and pinned in the residual suite instead: a datagram
-/// socket's `getsockopt(TCP_NODELAY)` fails and the two sides answer differently.
+/// `nodelay` (code `10`) is pinned in [`datagram_shared_arms`] instead, where the C's
+/// truncate-and-continue rule for a `getsockopt` the socket refuses is the shape under test.
 fn datagram_options() -> Vec<Probe> {
     let mut probes = vec![Probe::exact("open_o", 1, vec![1, 2, 0])];
     for code in [0u8, 1, 4, 6, 7, 22, 23, 24, 25, 30, 32, 33, 35, 40, 46, 200] {
@@ -558,6 +632,79 @@ fn datagram_options() -> Vec<Probe> {
     probes
 }
 
+/// The **shared `inet_ctl` arms** on an open datagram socket: the `INET_REQ_SUBSCRIBE`
+/// registration reply, the `INET_REQ_FDOPEN` ladder's pre-adoption check, the name-service lookups,
+/// and `getopts`'s truncate-and-continue rule for a `getsockopt` a datagram socket refuses.
+///
+/// `subscribe`'s reply is `[1] ++ (op ++ be32(queued output bytes))*`. What this driver floor cannot
+/// honour is the *subscription* itself — no driver→owner channel exists, so no later
+/// `{empty_out_q, Port}` message is ever sent — but the **reply** is exact, so all three rows are
+/// ordinary agreement rows. `subscribe_2`'s `2` operand is the C's `return -1`, which the oracle
+/// surfaces as the bare atom `badarg`.
+///
+/// `fdopen_badfd` hands an out-of-range descriptor number to the pre-adoption `sock_name(2)` check,
+/// which is `EBADF` in every process — so it is exact. `fdopen_wellformed` names a descriptor both
+/// sides hold and neither can socket-ise — standard output, which [`erl_eval`] pipes for the oracle
+/// and the test harness captures for this runtime — and is compared by shape because the C answers
+/// with *its* `sock_errno()`. (The successful **adoption** form is a typed gap: see
+/// [`the_residuals_no_oracle_column_can_pin_stay_typed`].)
+///
+/// The name-service rows are the same shared arms over the host's services database: the two
+/// `*_wellformed` operands fail the C's operand arithmetic (`einval`) on both sides, and the
+/// `domain`/`udp` pair exercises a real lookup in both directions (port → name and name → port).
+///
+/// `nodelay` (code `10`) is an option a datagram socket refuses: the C drops **that record** and
+/// keeps the records it already produced, so `getopts_nodelay` answers the bare OK tag and the
+/// `reuseaddr`-then-`nodelay` row keeps the `reuseaddr` record (`inet_drv.c:9734-9741`).
+fn datagram_shared_arms() -> Vec<Probe> {
+    let mut domain_name = vec![6u8];
+    domain_name.extend_from_slice(b"domain");
+    domain_name.push(3);
+    domain_name.extend_from_slice(b"udp");
+    let mut domain_port = vec![0u8, 53, 3];
+    domain_port.extend_from_slice(b"udp");
+    vec![
+        Probe::exact("open_a", 1, vec![1, 2, 0]),
+        Probe::exact("subscribe_empty", 24, vec![]),
+        Probe::exact("subscribe_1", 24, vec![1]),
+        Probe::exact("subscribe_2", 24, vec![2]),
+        Probe::error_reply("fdopen_wellformed", 13, vec![1, 2, 0, 0, 0, 1]),
+        Probe::exact("fdopen_badfd", 13, vec![1, 2, 0x7f, 0xff, 0xff, 0xff]),
+        Probe::exact("getservbyname_wellformed", 17, vec![3, 100]),
+        Probe::exact("getservbyport_wellformed", 18, vec![0, 53, 3]),
+        Probe::exact("getservbyname_domain", 17, domain_name),
+        Probe::exact("getservbyport_domain", 18, domain_port),
+        Probe::exact("getopts_nodelay", 8, vec![10]),
+        Probe::exact("getopts_reuseaddr_nodelay", 8, vec![0, 10]),
+    ]
+}
+/// The **interface requests** on an open datagram socket — `GETIFLIST`(21), `IFGET`(22),
+/// `IFSET`(23) and `GETIFADDRS`(25), the four shared `inet_ctl` arms that walk the host's
+/// interface table.
+///
+/// `getiflist`/`getifaddrs` report **this machine's** interfaces, so they are compared by their
+/// stable prefix (`[1,` — the OK tag followed by at least one interface) rather than by a literal
+/// host list; the two sides still run against the same kernel, so a driver that answered a refusal
+/// here would fail. The `IFGET`/`IFSET` rows use degenerate or **non-existent** interface operands,
+/// whose answers are host-independent: `ifget`'s one-byte operand is the C's name-length guard
+/// (`einval`), `ifget_nonexist` walks a name no host has (the `FLAGS` ioctl fails ⇒ the record
+/// reports `0`, `inet_drv.c:5955`), `ifset`'s one-byte operand parses to no option at all, and
+/// `ifset_lo` parses one `MTU` option and answers the bare OK tag — an `IFSET` only *parses* (the
+/// writes are `(void)`-discarded in the C and not performed here).
+fn datagram_interfaces() -> Vec<Probe> {
+    let mut ifget_nonexist = vec![9u8];
+    ifget_nonexist.extend_from_slice(b"nonexist0");
+    ifget_nonexist.push(6); // INET_IFOPT_FLAGS
+    vec![
+        Probe::exact("open_i", 1, vec![1, 2, 0]),
+        Probe::prefix("getiflist", 21, vec![], "[1,"),
+        Probe::exact("ifget", 22, vec![1]),
+        Probe::exact("ifset", 23, vec![1]),
+        Probe::exact("ifget_nonexist", 22, ifget_nonexist),
+        Probe::exact("ifset_lo", 23, vec![2, b'l', b'o', 4, 0, 0, 0, 0]),
+        Probe::prefix("getifaddrs", 25, vec![], "[1,"),
+    ]
+}
 /// The `tcp_inet` side of the same bridge, on the bare (socket-less) port: the shared queries, the
 /// stream-only requests that need a connection, the datagram-only codes, and the retired numbers.
 fn bare_stream() -> Vec<Probe> {
@@ -666,6 +813,26 @@ fn the_datagram_option_store_matches_the_oracle() {
     run_family("the `udp_inet` option store", "udp_inet", &datagram_options());
 }
 
+/// The shared `inet_ctl` arms: `subscribe`, `fdopen`'s pre-adoption check, the name service and
+/// `getopts`'s truncate-and-continue rule.
+#[test]
+fn the_shared_inet_ctl_arms_match_the_oracle() {
+    run_family(
+        "the shared `udp_inet` control arms",
+        "udp_inet",
+        &datagram_shared_arms(),
+    );
+}
+
+/// The four interface requests, with the host-dependent address lists compared by prefix.
+#[test]
+fn the_interface_requests_match_the_oracle() {
+    run_family(
+        "the `udp_inet` interface requests",
+        "udp_inet",
+        &datagram_interfaces(),
+    );
+}
 /// The `tcp_inet` bare-port refusals of the same bridge.
 #[test]
 fn the_bare_stream_port_refusals_match_the_oracle() {
@@ -676,216 +843,253 @@ fn the_bare_stream_port_refusals_match_the_oracle() {
 // The documented residuals
 // ---------------------------------------------------------------------------
 
-/// How the oracle answers one residual probe.
-enum Oracle {
-    /// The exact `~w` rendering of the reply this oracle version returns.
-    Exact(&'static str),
-    /// A reply that depends on the host: only its leading prefix is stable.
-    Prefix(&'static str),
-}
-
-/// What this runtime answers today for the same probe.
-enum Ours {
-    /// A typed capability gap whose message must contain this fragment.
-    Gap(&'static str),
-    /// The exact reply bytes of a shape this floor deliberately substitutes.
-    Bytes(&'static [u8]),
-    /// A propagated host-syscall failure whose message must contain this fragment (the driver
-    /// floor raising where the C drops the record).
-    Io(&'static str),
-}
-
 /// One documented divergence: the probe, the oracle's answer and this runtime's honest one.
 struct Residual {
     /// The probe itself.
     probe: Probe,
-    /// What the oracle answers.
-    oracle: Oracle,
-    /// What this runtime answers today, and (in the doc comment of the list below) why.
-    ours: Ours,
+    /// The exact `~w` rendering of the reply OTP 29.1.1/erts-17.1 returns.
+    oracle: &'static str,
+    /// The exact reply bytes this runtime returns — the documented substitution for that shape.
+    ours: &'static [u8],
     /// The residual this row records.
     residual: &'static str,
 }
-
-/// The `getsockopt` failure text of the `nodelay`-on-a-datagram-socket residual.
-const IO_RESIDUAL: Ours = Ours::Io("Operation not supported (os error 95)");
+/// One residual **session**: the driver, the setup probes that put the port into the state its rows
+/// need, and the rows probed on it.
+///
+/// Only the rows are divergences. The setup must **agree** on both sides — it is compared exactly
+/// the way an agreement family's probes are ([`assert_agrees`]), so a setup `bind`'s ephemeral port
+/// is still compared by shape.
+struct ResidualSession {
+    /// The session, as it appears in a failure message.
+    what: &'static str,
+    /// The driver the port is opened as `{spawn_driver, Driver}`.
+    driver: &'static str,
+    /// The probes that establish the state the rows are probed in.
+    setup: Vec<Probe>,
+    /// The documented divergences.
+    rows: Vec<Residual>,
+}
 
 /// The `udp` shapes this runtime answers differently, each a **capability gap or a documented
 /// substitution** on the driver side (`beam_io`), never a wrong result.
 ///
-/// The driver floor has no driver→owner message path, so `INET_REQ_SUBSCRIBE`'s notification and the
-/// asynchronous `PACKET_REQ_RECV` op-id cannot be honoured; adopting a caller's descriptor
-/// (`INET_REQ_FDOPEN`), the `getservby*(3)` and `getifaddrs(3)` lookups are not wrapped by its `sys`
-/// layer; and `getopts` of an option the socket refuses propagates the `getsockopt` failure where the
-/// C drops the record (`inet_drv.c:9734-9741`).
+/// Both rows left in this table are the floor's own, and neither is a `beam_io` request that is
+/// merely unimplemented:
 ///
-/// The three `subscribe` rows are the one group that closes **outside** this crate: `beam_io` owes
-/// `INET_REQ_SUBSCRIBE` the `[1]` / `[1,1,0,0,0,0]` / `badarg` answers (its body only registers a
-/// subscriber when the output queue is non-empty, which this floor's port never is). When that lands
-/// they are ordinary agreement rows — the oracle column already holds what both sides will answer —
-/// so they must move out of this table rather than be relaxed.
-fn residuals() -> Vec<Residual> {
-    let gap = |probe: Probe, oracle: Oracle, name: &'static str, residual: &'static str| Residual {
-        probe,
-        oracle,
-        ours: Ours::Gap(name),
-        residual,
-    };
+/// * `PACKET_REQ_RECV`(`60`) is the **synchronous read-now substitution**. The C enqueues an
+///   asynchronous operation and answers its op id (`[1] ++ async_id_be16`, measured `[1,0,0]`),
+///   delivering the datagram later as an `{inet_async, …}` message; with no driver→owner message
+///   path this floor reads now and answers the bare OK tag.
+/// * `open` of a **non-`AF_INET`** family: this floor's sockets are `AF_INET` only, so an
+///   `AF_INET6` open is the driver's own `[0]eafnosupport` refusal, where the C creates the socket
+///   and answers `[1]`. It is probed on a **bare** port: on the C the successful open leaves a
+///   socket behind, so a following `open` there is `exbadseq`, not a second `[1]`.
+fn residual_sessions() -> Vec<ResidualSession> {
     vec![
-        gap(
-            Probe::exact("subscribe_empty", 24, vec![]),
-            Oracle::Exact("[1]"),
-            "`subscribe`",
-            "INET_REQ_SUBSCRIBE's body needs the driver→owner notification the floor has no channel for",
-        ),
-        gap(
-            Probe::exact("subscribe_1", 24, vec![1]),
-            Oracle::Exact("[1,1,0,0,0,0]"),
-            "`subscribe`",
-            "the `[1] ++ op ++ outq_be32` notification registration, same missing channel",
-        ),
-        gap(
-            Probe::exact("subscribe_2", 24, vec![2]),
-            Oracle::Exact("badarg"),
-            "`subscribe`",
-            "the C's -1 for an unknown subscribe op, which the oracle surfaces as a raise",
-        ),
-        gap(
-            Probe::exact("fdopen_wellformed", 13, vec![1, 2, 0, 0, 0, 9]),
-            Oracle::Exact("[0,101,110,111,116,115,111,99,107]"),
-            "`fdopen`",
-            "adopting a caller's descriptor: the oracle answers `[0]enotsock`, the floor cannot adopt at all",
-        ),
-        gap(
-            Probe::exact("getservbyname_wellformed", 17, vec![3, 100]),
-            Oracle::Exact("[0,101,105,110,118,97,108]"),
-            "`getservbyname`",
-            "the `getservbyname(3)` lookup is not wrapped by the driver's `sys` layer",
-        ),
-        gap(
-            Probe::exact("getservbyport_wellformed", 18, vec![0, 53, 3]),
-            Oracle::Exact("[0,101,105,110,118,97,108]"),
-            "`getservbyport`",
-            "the `getservbyport(3)` lookup is not wrapped by the driver's `sys` layer",
-        ),
-        gap(
-            Probe::exact("getiflist", 21, vec![]),
-            Oracle::Prefix("[1,"),
-            "`getiflist`",
-            "the `getifaddrs(3)` interface table (host-dependent, hence the prefix rule)",
-        ),
-        gap(
-            Probe::exact("ifget", 22, vec![1]),
-            Oracle::Exact("[0,101,105,110,118,97,108]"),
-            "`ifget`",
-            "`ifget` over the same `getifaddrs(3)` walk",
-        ),
-        gap(
-            Probe::exact("ifset", 23, vec![1]),
-            Oracle::Exact("[1]"),
-            "`ifset`",
-            "`ifset` over the same `getifaddrs(3)` walk",
-        ),
-        gap(
-            Probe::exact("getifaddrs", 25, vec![]),
-            Oracle::Prefix("[1,"),
-            "`getifaddrs`",
-            "`getifaddrs` over the same `getifaddrs(3)` walk",
-        ),
-        Residual {
-            probe: Probe::exact("getopts_nodelay", 8, vec![10]),
-            oracle: Oracle::Exact("[1]"),
-            ours: IO_RESIDUAL,
-            residual: "`getsockopt(TCP_NODELAY)` on a datagram socket is ENOTSUP; the C drops the record and answers `[1]`",
+        ResidualSession {
+            what: "the open `udp_inet` port",
+            driver: "udp_inet",
+            setup: vec![Probe::exact("open", 1, vec![1, 2, 0])],
+            rows: vec![Residual {
+                probe: Probe::exact("recv_wellformed", 60, vec![0; 8]),
+                oracle: "[1,0,0]",
+                ours: &[1],
+                residual: "PACKET_REQ_RECV is the synchronous read-now substitution (the bare `[1]` \
+                           with no datagram pending) instead of the C's asynchronous \
+                           `[1] ++ async_id_be16`",
+            }],
         },
-        Residual {
-            probe: Probe::exact("recv_wellformed", 60, vec![0; 8]),
-            oracle: Oracle::Exact("[1,0,0]"),
-            ours: Ours::Bytes(&[1]),
-            residual: "PACKET_REQ_RECV is the synchronous read-now substitution (bare `[1]` with no datagram pending) instead of the C's asynchronous `[1] ++ async_id_be16`",
+        ResidualSession {
+            what: "the bare `udp_inet` port",
+            driver: "udp_inet",
+            setup: vec![],
+            rows: vec![Residual {
+                probe: Probe::exact("open_inet6", 1, vec![2, 2, 0]),
+                oracle: "[1]",
+                ours: b"\x00eafnosupport",
+                residual: "`INET_REQ_OPEN` of an `AF_INET6` socket is this floor's `eafnosupport` \
+                           refusal; the C creates it and answers `[1]`",
+            }],
         },
     ]
 }
-
 /// Every documented `udp` residual, asserted on **both** sides.
 ///
 /// The runtime side holds with no toolchain; the oracle side pins the exact output of OTP
-/// 29.1.1/erts-17.1 so the record cannot rot. Nothing here is a relaxed assertion: a residual is
-/// either a typed error or the exact bytes of a documented substitution.
+/// 29.1.1/erts-17.1 so the record cannot rot. Nothing here is a relaxed assertion: a row is the
+/// **exact bytes** of a documented substitution, and the setup sequence around it must agree with
+/// the oracle probe for probe.
 #[test]
 fn the_documented_datagram_residuals_stay_typed() {
-    let residual = residuals();
-    let mut probes = vec![Probe::exact("open", 1, vec![1, 2, 0])];
-    probes.extend(residual.iter().map(|row| {
-        Probe {
-            label: row.probe.label,
-            op: row.probe.op,
-            arg: row.probe.arg.clone(),
-            rule: row.probe.rule,
-        }
-    }));
-
-    let mut session = Session::new();
-    let port = session.open("udp_inet");
-    let mut ours = Vec::new();
-    for probe in &probes {
-        ours.push(session.control(port, probe));
+    for session in residual_sessions() {
+        run_residual_session(&session);
     }
-    let open = &ours[0];
-    assert_eq!(
-        open.render(),
-        "[1]",
-        "the residual session needs the socket `open` creates"
-    );
+}
+/// Runs one residual session: the setup probes are compared with the oracle as an agreement family
+/// is, then every row is asserted to be what the table says — on both sides.
+fn run_residual_session(session: &ResidualSession) {
+    let mut runtime_session = Session::new();
+    let port = runtime_session.open(session.driver);
+    let probes: Vec<Probe> = session
+        .setup
+        .iter()
+        .chain(session.rows.iter().map(|row| &row.probe))
+        .cloned()
+        .collect();
+    let ours: Vec<Reply> = probes
+        .iter()
+        .map(|probe| runtime_session.control(port, probe))
+        .collect();
+    let setup = session.setup.len();
 
-    for (row, reply) in residual.iter().zip(&ours[1..]) {
+    for (row, reply) in session.rows.iter().zip(&ours[setup..]) {
         let label = format!(
-            "the documented residual {:?} ({})",
-            row.probe.label, row.residual
+            "{}: the documented residual {:?} ({})",
+            session.what, row.probe.label, row.residual
         );
-        match (&row.ours, reply) {
-            (Ours::Bytes(expected), Reply::Bytes(bytes)) => {
-                assert_eq!(&bytes[..], *expected, "{label}")
-            }
-            (Ours::Io(fragment), Reply::Gap(message)) => assert!(
-                message.starts_with("io error:") && message.contains(fragment),
-                "{label}: expected the propagated host `getsockopt` failure {fragment:?}, got {message:?}"
-            ),
-            (Ours::Gap(fragment), Reply::Gap(message)) => assert!(
-                message.starts_with("error unsupported:") && message.contains(fragment),
-                "{label}: expected a typed capability gap naming {fragment}, got {message:?}"
-            ),
-            (expected, other) => panic!(
-                "{label}: expected {}, got {} — a residual must stay a typed error, never a \
-                 fabricated reply",
-                match expected {
-                    Ours::Bytes(bytes) => render_bytes(bytes),
-                    Ours::Gap(_) => "a typed capability gap".to_string(),
-                    Ours::Io(fragment) => format!("the host syscall failure {fragment:?}"),
-                },
+        match reply {
+            Reply::Bytes(bytes) => assert_eq!(&bytes[..], row.ours, "{label}"),
+            other => panic!(
+                "{label}: expected the documented substitution {}, got {} — a residual must stay \
+                 what the table records, never a fabricated reply",
+                render_bytes(row.ours),
                 other.render()
             ),
         }
     }
-
-    // The oracle's own answers for the very same list, so the recorded divergence is measured.
-    let Some(oracle) = oracle_lines("udp_inet", &probes) else {
-        skip_oracle_check("the documented `udp_inet` control residuals");
+    // The oracle's own answers for the very same probes, so the recorded divergence is measured —
+    // and so the setup sequence is proven to agree before it is relied on.
+    let Some(oracle) = oracle_lines(session.driver, &probes) else {
+        skip_oracle_check(session.what);
         return;
     };
-    assert_eq!(oracle.len(), probes.len(), "the oracle answered every residual probe");
-    assert_eq!(oracle[0], "[1]", "the residual session's own `open`");
-    for (row, line) in residual.iter().zip(&oracle[1..]) {
-        let label = format!(
-            "the documented residual {:?} ({})",
-            row.probe.label, row.residual
-        );
-        match row.oracle {
-            Oracle::Exact(expected) => assert_eq!(*line, expected, "{label}"),
-            Oracle::Prefix(prefix) => assert!(
-                line.starts_with(prefix),
-                "{label}: expected a reply starting with {prefix:?}, got {line:?}"
-            ),
-        }
+    assert_eq!(
+        oracle.len(),
+        probes.len(),
+        "{}: the oracle answered every probe",
+        session.what
+    );
+    for ((probe, ours), line) in probes[..setup].iter().zip(&ours[..setup]).zip(&oracle[..setup]) {
+        assert_agrees(session.what, probe, ours, line);
     }
+    for (row, line) in session.rows.iter().zip(&oracle[setup..]) {
+        assert_eq!(
+            *line, row.oracle,
+            "{}: the documented residual {:?} ({})",
+            session.what, row.probe.label, row.residual
+        );
+    }
+}
+
+/// Asserts `reply` is a typed capability gap naming `expected`, never a fabricated reply.
+fn assert_typed_gap(what: &str, reply: &Reply, expected: &str) {
+    match reply {
+        Reply::Gap(message) => assert!(
+            message.starts_with("error unsupported:") && message.contains(expected),
+            "{what}: expected a typed capability gap naming {expected}, got {message:?}"
+        ),
+        other => panic!(
+            "{what}: expected a typed capability gap, got {} — a residual must never be a \
+             fabricated reply",
+            other.render()
+        ),
+    }
+}
+
+/// The typed gaps whose oracle reply **no oracle column can pin**, asserted on this runtime's side
+/// alone — and the one test to read before "fixing" a `[1]` here into a row.
+///
+/// Two different reasons put a shape here:
+///
+/// * the reply is the **oracle process' own** descriptor state. `INET_REQ_FDOPEN`'s adoption form
+///   probes a descriptor number *this* process owns (a bound `AF_INET` socket), so the pre-adoption
+///   `sock_name(2)` check the C runs first passes here and would hand the descriptor over
+///   (`inet_drv.c:5266`, `desc->prebound = 1`, then `[1]`), while the same number in the oracle's
+///   descriptor table is an unrelated file and the C answers whatever *its* `sock_name(2)` says
+///   (`enotsock`/`ebadf`, or `[1]` if it happened to be an `AF_INET` socket). Nothing about that
+///   number is a property of the bridge.
+/// * the state is one the C only reaches **asynchronously**. `INET_REQ_IGNOREFD`(`28`) and
+///   `TCP_REQ_SENDFILE`(`45`) are stream-only arms that first require a *connected* socket, and a
+///   `port_control`-only session cannot connect the oracle's driver: the C's `INET_REQ_ACCEPT`
+///   answers the async op id (measured `[1,0,0]`, then `[1,0,1]`) and leaves the driver
+///   `enotconn`, so `ignorefd` there is `[0]enotconn` rather than the `[1]` its body would return.
+///
+/// The C's own answers — `[1]` for both, once a stream is connected — are cited above; what is
+/// asserted here is that this floor answers a **typed capability gap naming the request**, never a
+/// fabricated `[1]`.
+#[test]
+fn the_residuals_no_oracle_column_can_pin_stay_typed() {
+    use std::os::unix::io::AsRawFd;
+
+    let mut session = Session::new();
+
+    // `INET_REQ_FDOPEN`'s adoption form: the ten-byte operand whose `bound` word is non-zero, over a
+    // descriptor this test really owns and has bound (so the pre-adoption check passes).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a bound AF_INET descriptor");
+    let mut adopt = vec![1u8, 1]; // INET_AF_INET, INET_TYPE_STREAM
+    adopt.extend_from_slice(&(listener.as_raw_fd() as u32).to_be_bytes());
+    adopt.extend_from_slice(&[0, 0, 0, 1]); // `bound`
+    let udp = session.open("udp_inet");
+    assert_eq!(
+        session
+            .control(udp, &Probe::exact("open", 1, vec![1, 2, 0]))
+            .render(),
+        "[1]",
+        "the datagram session needs the socket `INET_REQ_OPEN` creates"
+    );
+    assert_typed_gap(
+        "INET_REQ_FDOPEN's adoption form",
+        &session.control(udp, &Probe::exact("fdopen_adopt", 13, adopt)),
+        "`fdopen`",
+    );
+
+    // `INET_REQ_IGNOREFD`/`TCP_REQ_SENDFILE` on a **connected** stream: open → bind → listen →
+    // accept, the accepted connection coming from a plain loopback client of this test.
+    let tcp = session.open("tcp_inet");
+    assert_eq!(
+        session
+            .control(tcp, &Probe::exact("tcp_open", 1, vec![1, 1, 0]))
+            .render(),
+        "[1]",
+        "the stream session needs the socket `INET_REQ_OPEN` creates"
+    );
+    let bound = session.control(tcp, &Probe::req("tcp_bind", 6, vec![4, 0, 0], Rule::BoundPort));
+    let bytes = bound.bytes("tcp_bind");
+    let bound_port = u16::from_be_bytes([bytes[1], bytes[2]]);
+    assert_eq!(
+        session
+            .control(tcp, &Probe::exact("tcp_listen", 27, vec![0, 5]))
+            .render(),
+        "[1]",
+        "the stream session needs a listening socket"
+    );
+    let _client = std::net::TcpStream::connect(("127.0.0.1", bound_port))
+        .expect("a loopback client for the listening port");
+    let accepted = session.control(tcp, &Probe::exact("accept", 26, vec![0, 0, 0, 0]));
+    assert_eq!(
+        accepted.bytes("accept")[0],
+        1,
+        "`INET_REQ_ACCEPT` takes the queued connection"
+    );
+    assert_eq!(
+        session
+            .control(tcp, &Probe::exact("getstatus", 16, vec![]))
+            .render(),
+        "[1,0,0,0,5]",
+        "the port reports the C's connected state (INET_STATE_CONNECTED, 5)"
+    );
+    assert_typed_gap(
+        "INET_REQ_IGNOREFD on a connected stream",
+        &session.control(tcp, &Probe::exact("ignorefd_stream", 28, vec![1])),
+        "`ignorefd`",
+    );
+    let mut sendfile = vec![0x7fu8, 0xff, 0xff, 0xff]; // an out-of-range file descriptor
+    sendfile.extend_from_slice(&0u64.to_be_bytes()); // offset
+    sendfile.extend_from_slice(&0u64.to_be_bytes()); // count
+    assert_typed_gap(
+        "TCP_REQ_SENDFILE on a connected stream",
+        &session.control(tcp, &Probe::exact("tcp_sendfile_stream", 45, sendfile)),
+        "`tcp_sendfile`",
+    );
 }
