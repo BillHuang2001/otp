@@ -120,7 +120,7 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 - `receive.rs` `WaitTimeout`: a non-zero timeout suspends **with no timer** (the engine arms none); only the small integer `0` falls through to `pc+1`. A host recovers the parked deadline through `Machine::wait_deadline` and re-enters at the `timeout` continuation (`../machine/CONTEXT.md`).
 - `receive.rs` `marker_call` classifies "host does not serve markers" by **exact string match** on `unsupported_opcode: {method}` — a fragile, string-based error taxonomy (documented as the discriminator).
 - `bitstrings/matching/reads.rs` `decode_utf8` ignores `BSF_LITTLE` (documented: `bs_get_utf8 -little` is not meaningful in ERTS).
-- `funs/` `call_fun`'s target-shape classification is **engine-side and kind-agnostic** (the header `fun_arity` field, which `beam_term::fun::write_fun_external` populates for an external `fun M:F/A` just as the local writer does). The engine has **no safe external-fun builder** (`crate::terms` builds only `FunKind::Local`), so the external-fun arity shape is pinned by the C source (`fun_arity(funp)`), the header-encoding invariants and an oracle probe rather than an in-node unit test.
+- `funs/` `call_fun`'s target-shape classification is **engine-side and kind-agnostic** (the header `fun_arity` field, which `beam_term::fun::write_fun_external` populates for an external `fun M:F/A` just as the local writer does), so a matching-arity external fun is *dispatched* and a mismatched one raises `{badarity,{Fun,Args}}`. The shape is pinned in-node: `crate::terms::make_fun_external` (`terms/fun.rs`, `#[cfg(test)]`-only — the production builder stays `FunKind::Local`) materializes a real `EXPORT_EXT` term and `funs/tests.rs` pins the arity classification for external `fun M:F/A` on both the dispatch and the `{badarity,_}` route.
 - `records/mod.rs` `write_local_record` writes the same block **twice** (placeholder hash `0`, then the real `compute_record_definition_hash`) — intentional (the hash reads the block) but a double full write.
 - `maps/mod.rs` `lookup`/`position` are O(n) `beam_term::cmp` scans (no hash); `maps/write.rs` makes `put_map_assoc` O(n²) in the pair count.
 - `bitstrings/raw.rs` `subject_bytes` returns `&'a [u8]` with an unconstrained lifetime ("caller keeps it alive") — a safe-signature soundness caveat, documented as the `ExecutionContext` ownership contract.
@@ -146,7 +146,6 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 
 ## Known Issues
 - **`bitstrings` differential-corpus hole (tools-owned).** `bitstrings/CONTEXT.md` records the missing
-  `wire`/bitstring gate cases; the owner is `tools/differential`, not this crate.- **`bitstrings` differential-corpus hole (tools-owned).** `bitstrings/CONTEXT.md` records the missing
   `wire`/bitstring gate cases; the owner is `tools/differential`, not this crate.
 
 ## Handoffs (owned elsewhere — NOT closeable in this node)

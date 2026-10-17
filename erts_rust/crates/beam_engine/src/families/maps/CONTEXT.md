@@ -52,35 +52,34 @@ name it yields the typed `error::unsupported("maps: no 'function_clause' atom in
 instead of a substituted atom.
 
 ## The reason-atom contract (load-bearing)
-- `raise_error_tuple` resolves the tag **only** from the running module's
-  `beam_loader::Module::atom_table` (`mod.rs:287-290`); `raise_function_clause_no_fail`
-  (`dispatch.rs`) likewise resolves `function_clause` only from it. A missing name is
-  the typed `error::unsupported("maps: no '<name>' atom in the module")`, which `error::unsupported`
-  renders as the reason atom `unsupported_opcode: maps: no '<name>' atom in the module`.
-- **The engine has no global/shared atom lookup and no atom-interner seam.**
-  `ExecutionContext` (`../../context.rs`) exposes no atom method; `Machine` holds no atom table;
-  `beam_bifs::AtomInterner` is a `BifContext` seam available only *inside* a BIF call; a
-  `Module` is `Arc`-shared (its `atom_table` is immutable from the engine). An `Eterm` atom is
-  only meaningful against the table it is read with, so the family can never fabricate one.
-- Nameability is therefore a **host load-time obligation**: everything the runtime must be able
-  to name when the module never mentions it must be interned into the shared table *before* the
-  module is loaded, since the host clones that table into each module.
-  - `beam_rt`: `boot::CORE_ATOMS` (`../../../beam_rt/src/boot.rs:123-196`) contains `badmap`
-    (`:176`) and `badkey` (`:177`); `Runtime::new` seeds it before any load
-    (`../../../beam_rt/src/runtime.rs:477-478`); `CodeServer::load_bytes` clones the shared table
-    into each module (`../../../beam_rt/src/codeserver.rs:345`). So in a `beam_rt` run both tags
-    always resolve (and `function_clause`, which `CORE_ATOMS` also carries, resolves there too).
-  - engine test host: `SEED_ATOMS` (`../../../tests/support/atoms.rs:61-95`) is appended to every
-    module loaded through it (`:164-171`).
-  - `beam_loader::load`/`load_file` (`../../../../beam_loader/src/load.rs:43-71`) builds a
-    **private, unseeded** table. Consequence, measured: for a `.beam` produced by the system
-    `erlc` (OTP 29), the compiler interns `badmap` itself (its `test,is_map` guard fail path
-    builds `{badmap,X}`), so the `badmap` tag is nameable even there, but it does **not** intern
-    `badkey` (verified on `../tests/fixtures/mapfx.beam` atoms: `badmap` present, `badkey`
-    absent; likewise for a `put_map_exact`-only module) — the oracle produces `{badkey,Key}` from
-    its globally interned `error_atom` table (`beam_common.c:382-406`). `function_clause` is
-    interned by the compiler for any module with a head clause, so a real matching module names
-    it; a module that does not is the typed gap.
+- `raise_error_tuple` and `raise_function_clause_no_fail` (`interpreter/dispatch.rs:1263`) resolve
+  every reason/class tag through **`machine::namespace_atom(ctx, module, name)`**
+  (`../../machine/catch.rs:761`): `ctx.atoms(module).lookup(name)` **first**, the running module's
+  load-time `atom_table` snapshot **second**. A name **neither** source can name is the typed
+  `error::unsupported("maps: no '<name>' atom in the module")`, which `error::unsupported` renders as
+  the reason atom `unsupported_opcode: maps: no '<name>' atom in the module`.
+- **Why the live namespace comes first.** `ExecutionContext::atoms` (`../../context.rs`) is the
+  comparison/naming seam; a host that owns ONE shared, live atom namespace overrides it (`beam_rt`'s
+  `RuntimeContext` **and** `BudgetContext` both do). A `Module` is `Arc`-shared and its `atom_table` is
+  an immutable load-time snapshot, so an atom interned into the shared namespace *after* the module was
+  loaded has an id beyond the snapshot and the module can never name it — while C resolves reason atoms
+  from its global `am_error`/`am_badmap`/… table and is never in that state.
+- An atom index is only meaningful against the table it is read with, so the seam's host contract is:
+  **the returned index must be valid in the running module's table.** The engine never fabricates or
+  substitutes an index; a miss keeps the typed gap.
+- **Load-time naming is still a host obligation** for a host that does **not** override `atoms`:
+  everything the runtime must be able to name when the module never mentions it must be interned
+  *before* the module is loaded, since the host clones that table into each module.
+  - `beam_rt`: `boot::CORE_ATOMS` contains `badmap`, `badkey` and `function_clause`; `Runtime::new`
+    seeds it before any load, and `CodeServer::load_bytes` clones the shared table into each module —
+    and with the `atoms` override the live namespace answers regardless.
+  - engine test host: `SEED_ATOMS` (`../../../tests/support/atoms.rs`) is appended to every module
+    loaded through it.
+  - `beam_loader::load`/`load_file` builds a **private, unseeded** table: for a `.beam` from the system
+    `erlc` (OTP 29) the compiler interns `badmap` itself (its `test,is_map` guard fail path builds
+    `{badmap,X}`) but **not** `badkey`, and `function_clause` only for a module with a head clause — a
+    module that does not is the typed gap on that host (the oracle produces `{badkey,Key}` from its
+    globally interned table).
 
 ## Reachability of the `NO_FAIL` raises from compiler-emitted code
 Verified against the system `erlc` (OTP 29) disassembly:
@@ -138,39 +137,28 @@ Verified against the system `erlc` (OTP 29) disassembly:
   `CaseKind::Eval` (the `maps:get` BIF path), not a compiled `put_map_*`.
 
 ## Known Issues
-- **Nameability is a host load-time obligation** (see "The reason-atom contract" above). A host
-  loading a module with the private, unseeded `beam_loader::load_file` table gets the typed
-  `unsupported` for the `badkey` case (the installed `erlc` interns `badmap` itself — its
-  `test,is_map` guard fail path builds `{badmap,X}` — but not `badkey`) and for the read
+- **Nameability depends on the host's `atoms` namespace** (see "The reason-atom contract" above). A
+  host that overrides `ExecutionContext::atoms` with ONE live shared table (`beam_rt`) names every
+  tag; a host that does not falls back to the module's load-time snapshot, so a module loaded with
+  the private, unseeded `beam_loader::load_file` table gets the typed `unsupported` for the `badkey`
+  case (the installed `erlc` interns `badmap` itself but not `badkey`) and for the read
   instructions' `function_clause` case when the module does not name it. The seeded hosts
-  (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name `badmap`/`badkey`/`function_clause`,
-  so the raise is the oracle's `{badkey,Key}`/`{badmap,Source}` (and the engine-defined bare
-  `function_clause`) exactly. No engine seam resolves a tag outside the running module's table;
-  none should.
+  (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name all three, so the raise is the oracle's
+  `{badkey,Key}`/`{badmap,Source}` (and the engine-defined bare `function_clause`) exactly.
 - `lookup`/`position` are O(n) scans (no hash) and `put_map_assoc` is O(n²) in the pair count
   (`write.rs:105`); correct but unoptimised.
 - `write.rs:165` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
   for an impossible post-reserve state.
 
 ## Notes for Agents
-- `../../../tests/gaps.rs` pins the two read instructions' `no_fail` cases to
-  `maps: no 'function_clause' atom in the module` (`:272`, `:300`).
-
-
-  Both read instructions' `no_fail` cases now surface the bare atom `function_clause` (class `error`);
-  an unseeded module surfaces the missing-atom typed gap instead (pinned at `tests/gaps.rs:272`/`:300`).
-  <!-- -->
-## Notes for Agents
-- To make the tags nameable for **any** host (not just a seeding one), the engine would need
-  a new **defaulted** `ExecutionContext` method (e.g. `resolve_atom(&mut self, name: &str) ->
-  Option<Atom>`, host contract: the returned index must be valid in the running module's table) —
-  today no such seam exists, and `raise_error_tuple`/`raise_function_clause_no_fail` cannot reach the
-  host's table. Do not substitute a foreign index: an atom index is only meaningful against the
-  table it is read with.
-- `raise_error_tuple` installs the `error` class atom only when the module can name it
-  (`mod.rs:297-299`), and `raise_function_clause_no_fail` does the same
-  (`dispatch.rs`), so an uncaught
-  raise still propagates as `Err(BeamError::Raise(..))`.
+- `../../../tests/gaps.rs:272`/`:300` pin the two read instructions' `no_fail` cases to
+  `maps: no 'function_clause' atom in the module` on an unseeded host; on a seeding host the same
+  shape surfaces the bare atom `function_clause` (class `error`).
+- Do **not** substitute a foreign atom index: an index is meaningful only against the table it is
+  read with, so a name the namespace cannot resolve must stay the typed error.
+- `raise_error_tuple` installs the `error` class atom only when the namespace can name it
+  (`mod.rs:297-299`), and `raise_function_clause_no_fail` does the same (`dispatch.rs`), so an
+  uncaught raise still propagates as `Err(BeamError::Raise(..))`.
 - The same by-name/typed-gap pattern is used by the exceptions family
   (`../exceptions/raise.rs:52-86`), so a change to this contract is a two-site change.
 
