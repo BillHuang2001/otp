@@ -122,10 +122,10 @@
 //!   `prim_inet:async_accept/2` `case_clause` respectively) where the oracle answers
 //!   `{error, einval}`, opens a port, and answers `{error, timeout}`. Owner: `beam_rt`
 //!   (the `inet:getopts/2` reply shape those callers pattern-match on).
-//! * **`erlang:port_command/2` with a nested iolist on a socket-less driver port** raises
-//!   `error:badarg` under the oracle and answers `{error, badarg}` under `beam_rt`. Owner:
-//!   `beam_rt` (port-command error signalling).
-//!
+//! * **`erlang:port_command/2` on a socket-less driver port** is measured and unpinnable rather than
+//!   divergent: the oracle answers `true` and then kills the port (`driver_failure_posix(EINVAL)`,
+//!   a following `port_info/2` is `undefined`), `beam_rt` raises `error:badarg` and leaves the port
+//!   alive. Owner: `beam_rt` / `beam_io` (the port-command bridge).//!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
 //! `tests/abi.rs`.

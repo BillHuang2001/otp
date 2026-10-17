@@ -143,11 +143,10 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   case and the >32-key HAMT round trip). Owner: `beam_codec` / `beam_term`.
 
 ## A.7 — process signals (owner: `beam_bifs` / `beam_process`)
-- A `{'DOWN', …}` for a monitored **port** is not delivered after `port_close/1`: the oracle
-  sends `{'EXIT',Port,normal}` (the link) then `{'DOWN',Ref,port,Port,normal}`, the Rust
-  runtime sends nothing. The `unlink/1` needed to isolate it raises `error:badarg` in the Rust
-  runtime (the port's link is not removable). The monitor **creation** agrees and is pinned.
-
+- `unlink/1` on a **port** raises `error:badarg` in the Rust runtime (the port's link is not
+  removable) where the oracle answers `true`. The port's close signalling itself agrees and is
+  pinned (`driver/port_close_delivers_exit_to_a_trapping_owner`,
+  `driver/port_close_delivers_down_to_a_port_monitor`).
 ## A.7 — program result / CLI (owner: `beam_rt` / `beam_engine`, `beam_bifs`)
 - A bare (unqualified) name in the `-eval` path resolves differently: `phash2(T)` is `error:undef`
   under the oracle's `-eval` (a local call) but `ok …` under the rust runtime (it resolves the
@@ -261,22 +260,45 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 
 ## A.4 — port/driver observable grammar (owner: `beam_rt` / `beam_io`)
 - **`port_command/2` on a socket-less inet port — measured and unpinnable, not a divergence.**
-  The oracle raises `badarg` (the C's `!IS_OPEN` guard, `packet_inet_command`,
-  `inet_drv.c:15051`). `beam_rt`'s first `port_command/2` answers `true` and the port then dies via
-  `driver_failure_posix(EINVAL)`; with a caller-ref prefix the port survives and
-  `{error,enotconn}` arrives out of band, the driver refusing the delivered round with a typed
-  `BadArg` after retaining the bytes. Neither the return value nor the reason is a stable
-  observable on either side, so the shape is deliberately unpinned (a case would be a committed
-  `mismatch`). Owner: `beam_rt` / `beam_io`.
+  The oracle answers `true` and the port then dies via `driver_failure_posix(EINVAL)` (a following
+  `port_info(P,name)` is `undefined`, `port_close/1` raises `badarg`); with a caller-ref prefix
+  (`<<0,0,"hi">>`) the oracle still answers `true`, the port survives and no `{error,enotconn}`
+  ever arrives (a 500 ms receive times out). `beam_rt` raises `badarg` (`{'EXIT',{badarg,[]}}`) and
+  leaves the port alive. Neither the return value, the port's survival nor the reason is a stable
+  observable on both sides, so the shape is deliberately unpinned (a case would be a committed
+  `mismatch`). The related refusal that *does* agree is pinned (`udp/port_command_on_a_closed_port_is_badarg`).
+  Owner: `beam_rt` / `beam_io`.
 - **`port_info(P, memory)` after `port_set_data/2`**: the item agrees on a plain port
-  (`{memory, N}`), but the word count differs once a term is stored on it (oracle `120` vs rust
-  `136`) — an accounting residual, so only the plain-port item and the
-  `port_set_data/2`/`port_get_data/1` round trip are pinned. Owner: `beam_rt`.
-- A `driver_output2` **DATA reply** is unreachable as an improper list in `beam_rt` (the producer
-  flattens the header/body split), so that one delivery shape stays unpinned. Owner: `beam_abi`.- The `{fd,…}` port grammar is disjoint; `eof` is never delivered; a non-iodata `port_command/2`
-  is accepted; only the oracle writes a
-  missing-`{spawn,Cmd}` shell stderr line.
-- The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
+  (`{memory, N}`), but the word count differs once a term is stored on it (oracle `136` vs rust
+  `120`) — an accounting residual, so only the plain-port item and the
+  `port_set_data/2`/`port_get_data/1` round trip (which returns `true`, not `ok`) are pinned.
+  Owner: `beam_rt`.
+- A `driver_output2` **DATA reply** carries a different term shape: the oracle delivers the
+  header/body split as an improper list `{data,[2,0,0,0,N|<<Body>>]}`, the Rust producer flattens
+  it to the proper list `{data,[2,0,0,0,N,…]}`. The bytes are identical, so the delivery family is
+  pinned through `iolist_to_binary/1` (`ram_file/read_write_seek_truncate_replies`), never raw.
+  Owner: `beam_abi`.
+- **`port_connect/2` hands a port to a *different* process only half-way**: after
+  `erlang:port_connect(P, Other)` the old owner's `port_info(P,connected)` is `undefined` in the
+  oracle but still `{connected, Pid}` (the old value) in `beam_rt`, so a caller that matches the
+  oracle shape sees `{case_clause,undefined}`. Only the `port_connect(P, self())` forms are pinned
+  (`driver/port_connect_answers_true`, `driver/erts_internal_port_connect_answers_true`).
+  Owner: `beam_rt`.
+- **The datagram/inet data path is still a gap** (no case pins any of it; owner `beam_io` / `beam_rt`):
+  `gen_udp:send/4` and `inet:getstat/1` reach the C's `inet_fill_stat` counter reply, which this
+  driver does not track, so the call exits `3` typed-`unsupported`; `gen_udp:recv/3` raises
+  `{case_clause,{ok,[]}}` inside `prim_inet` where the oracle answers `{error,einval}`;
+  `gen_tcp:connect/3` to a live listener raises `badarg` where the oracle answers `{ok,Socket}`;
+  `gen_tcp:listen(0,[binary])` and `inet:getopts(S,[mode])` answer `{error,einval}` where the oracle
+  succeeds (an `INET_REQ_SETOPT`/`GETOPT` `mode` arm). The *option/control* half of both drivers is
+  reachable and pinned (`udp/port_control_*`, `inet_control/*`); only the data path waits.
+- The `{fd,…}` port grammar is disjoint: `open_port({fd,1,1},[out])` opens under the oracle and is
+  `error:badarg` under `beam_rt`, `open_port({fd,1},[out])` the reverse. `eof` is never delivered by
+  `beam_rt`. A non-iodata `port_command/2` raises `badarg` on **both** sides now, but the oracle
+  additionally writes a racy timestamped `=ERROR REPORT==== … Bad value on output port` line to
+  stdout (measured agreeing on roughly one run in six), so the shape stays unpinned. A missing
+  `{spawn,Cmd}` shell diagnostic differs only in `argv[0]` (`sh:` vs `/bin/sh:`); the exit status
+  `127` agrees.- The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
   exactly — the `{eol, Line}` / `{noeol, Line}` frames, the split at exactly N bytes with no EOL, the
   512-byte default `line` boundary and the EOF no-EOL flush (the CR payload included)
   (`driver/line_option_matrix`, `driver/line_frames_exact_n_noeol_split`,
@@ -402,20 +424,10 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   matrix); `+Q legacy` / no `+Q` -> 65536.
 
 ## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
-- `erl_ddll:loaded_drivers/0`'s **list contents** differ: the oracle lists its statically linked
-  `["tcp_inet","udp_inet","ram_file_drv"]` (the entries are *strings*, not atoms), the Rust runtime
-  answers `{ok, []}` — its driver namespace holds only `tcp_inet`, the one name
-  `open_port({spawn_driver, _}, [])` resolves (§A.4). The members are therefore unpinnable; `ddll.rs`
-  pins only order-stable shapes of the result (`{ok, List}`, the 2-tuple, `is_list/1`, an all-strings
-  fold and a filtered projection that is empty on both).
-- `erl_ddll:try_load(".", "tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but the
-  generic `{error,{open_error,-10}}` in the Rust runtime.
-- `erl_ddll:try_unload("tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but
-  `{error,not_loaded}` in the Rust runtime.
-  (The missing-object / missing-directory / non-string-name `{error,{open_error,-10}}` and the
-  not-loaded `{error,not_loaded}` shapes, plus every `info/2` `error:badarg` refusal, DO agree and
-  are pinned in `ddll.rs`.)
-- `erlang:decode_packet/3` shows **no observed divergence**: the four integer forms (`0`/`raw`,
+- `erl_ddll`'s refusal shapes all agree and are pinned: the missing-object / missing-directory /
+  non-string-name `{error,{open_error,-10}}`, the not-loaded `{error,not_loaded}`, the
+  `linked_in_driver` answers of `try_load(".", "tcp_inet", [])` and `try_unload("tcp_inet", [])`,
+  and every `info/2` `error:badarg` refusal (`ddll.rs`).- `erlang:decode_packet/3` shows **no observed divergence**: the four integer forms (`0`/`raw`,
   `1`, `2`, `4`) and all twelve named types (`raw`, `asn1`, `sunrm`, `cdr`, `fcgi`, `line`, `tpkt`,
   `ssl_tls`, `http`, `httph`, `http_bin`, `httph_bin`), together with their `{more,N}` /
   `{more,undefined}` / `{error,invalid}` / `error:badarg` shapes, agree and are pinned in
