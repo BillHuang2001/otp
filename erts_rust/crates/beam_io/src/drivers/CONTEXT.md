@@ -42,6 +42,17 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   typed `badarg`. The logical file is a `Vec<u8>` whose `len()` **is** the C's `end` (the C's
   separate allocation `size` field is unobservable and has no counterpart); a write past the end
   zero-fills the gap (the C's `ram_file_expand`).
+- `inet/` → the `tcp_inet`/`udp_inet` socket drivers. [`Driver::control`](crate::Driver::control) takes
+  the C's packed request payload in **two** wire forms: a **decimal** command is
+  `erlang:port_control/3`'s integer `Op`, forwarded by the runtime as its decimal string and decoded
+  by `opcode.rs` (accumulated mod 2³², `wrapping_sub(CONTROL_MAGIC_NUMBER = 0x03f1_a300)`, then the
+  C's three switches) onto the **same** verb body the named form uses, so the numeric and named
+  routes answer identical bytes; any other command is a named verb. The **operand** decode stays the
+  runtime's. A number no table entry matches — including a case of the other driver's switch, and
+  every op below the magic (`"1"`, `"99"`) — answers the C's `[0]exbadport`; an opcode the C serves
+  but this floor does not is the typed `Opcode::not_served()` unsupported raise. `inet/CONTEXT.md`
+  carries the full served-vs-refused opcode table. A command on a socket-less or peerless port is the
+  typed `BeamError::BadArg` refusal of *Known Issues* below.
 - `line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `binary_io.rs` → `Phase`, `PhaseChange`.
 - `mod.rs` → module wiring/re-exports only.
 
@@ -74,6 +85,16 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   `disarm_output` are no-ops for `duplex` (`spawn.rs:913-941`), so the single adopted descriptor stays
   registered both ways after read EOF (`release_stdout` is a no-op for duplex). Harmless under the
   edge-triggered poller, but a spurious `OUTPUT` task is scheduled on every write-readiness event.
+- **A command on a socket-less or peerless inet port is a typed `BeamError::BadArg` refusal with the
+  queued bytes retained** — `inet/mod.rs::write_pending` (`connected_socket()?`) and its `udp.rs`
+  counterpart (`socket.filter(state.is_connected())`), reached from both `output` and
+  `ready_output`. Nothing is consumed, so a re-driven `OUTPUT` task refuses identically instead of
+  losing data; the `Err` short-circuits `Port::check_write_accounting` and surfaces out of
+  `PortRegistry::execute_port_tasks`, and `erlang:port_command/2` raises. The oracle instead answers
+  `true` and then either delivers `{error,enotconn}` out of band (a caller-ref-prefixed payload) or
+  kills the port (`init_caller`'s `EINVAL`) — neither shape is reachable through the frozen `Driver`
+  trait (no `driver_failure` seam, no asynchronous `{inet_reply,…}` channel). The measured oracle
+  shapes are in `inet/CONTEXT.md` › *Known Issues*.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as
   **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an
   unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).
@@ -125,7 +146,7 @@ The crate-level integration suites for this node are the sibling `../../tests/` 
   constants (the in-memory command-driven file driver); its suite is the sibling `ram_file_tests.rs`
   (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split pattern)
 - `line_buffer.rs` → `LineBuffer`; `binary_io.rs` → `Phase`/`PhaseChange`
-- `inet/` → the `tcp_inet` and `udp_inet` socket drivers + read-path framing (child node `inet/CONTEXT.md`)
+- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers, the numeric `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned subtraction, the C's three switches), and `{packet, N}` framing (read + send path) (child node `src/drivers/inet/CONTEXT.md`)
 - `../abi/` → the driver C-ABI host layer (sibling child node, not a built-in driver)
 
 ## See Also
