@@ -457,6 +457,18 @@ in-process compiler route.
      oracle-cross-checked.
 
 ## Known Structural Debt (candidates for the next pass)
+- **A.4 port/driver residuals, each a typed error rather than a wrong result.**
+  (a) A `driver_output2`/`driver_output_binary` **DATA** reply's improper list (`[hdr|<<body>>]`) cannot
+  be rendered because `beam_io`'s stream layer flattens the header/body split producer-side
+  (`DriverContext::input()` is a flat `ByteQueue`; `PortNotification::Data` carries one `Vec<u8>`); the
+  seam needed is `(hbuf, hlen, buf, len)` on that notification, after which `beam_rt` routes it into its
+  existing `StreamShape` builder. Bytes and both counters already agree.
+  (b) The `PACKET_REQ_RECV`/`TCP_REQ_RECV`/`ACCEPT` **async-op queue** (`INET_MAX_ASYNC`,
+  `{inet_async, Port, Ref, Result}` delivery) needs a driver→owner message channel the frozen `Driver`
+  trait lacks, so `recv` is a synchronous read-now substitution.
+  (c) `INET_REQ_FDOPEN`'s adoption form (the C's `prebound` descriptor is never closed, while this
+  floor's `stop`/`Drop` closes everything it owns), `ignorefd` (needs readiness suppression) and
+  `tcp_sendfile` reproduce their refusals only.
 - The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`
   (`src/term/{binary,record}.rs`) but keeps a crate-local oversized-*flat*-map writer. Off-heap refc
   liveness is the process's: `beam_process` sweeps its owned payloads by reachability at the end of a
