@@ -52,8 +52,9 @@
 #[allow(dead_code)]
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------------------
@@ -242,9 +243,165 @@ const ADOPTED_TARGETS: [(&str, &str); 5] = [
 ];
 
 // ---------------------------------------------------------------------------------------
-// The tests
+// The compiled fixture (a `-eval` term is heap-resident; only a module carries a literal)
 // ---------------------------------------------------------------------------------------
 
+/// The `{tag, Tag}` fixture.
+///
+/// `lit/0`'s `{lit, tag}` is a **constant** term, so the compiler places it in the module's
+/// literal area — the one shape `-eval` cannot express, because every term the evaluator builds
+/// lives on a process heap. `heap/0` builds its tag at run time (`{self()}`), which is exactly
+/// the heap-resident shape.
+const MONTAG_SRC: &str = r#"
+-module(montag).
+-export([imm/0, lit/0, heap/0]).
+
+%% An immediate tag (an atom): the DOWN message's head is the tag itself.
+imm() ->
+    P = spawn(fun() -> ok end),
+    R = erlang:monitor(process, P, [{tag, imm}]),
+    receive {imm, R, process, P, _} -> {imm, true}
+    after 1000 -> {imm, timeout}
+    end.
+
+%% A module-literal tag: `{lit, tag}` is a constant, so it lives in the literal area.
+lit() ->
+    P = spawn(fun() -> ok end),
+    R = erlang:monitor(process, P, [{tag, {lit, tag}}]),
+    receive {{lit, tag}, R, process, P, _} -> {{lit, tag}, true}
+    after 1000 -> {{lit, tag}, timeout}
+    end.
+
+%% A heap-resident tag: built at run time, so it is neither an immediate nor a literal.
+heap() ->
+    P = spawn(fun() -> ok end),
+    Tag = {self()},
+    R = erlang:monitor(process, P, [{tag, Tag}]),
+    receive {Tag, R, process, P, _} -> heap_ok
+    after 1000 -> heap_timeout
+    end.
+"#;
+
+/// `erlc` beside `$ERTS_ORACLE` or on `$PATH` — discovered by **filesystem** only, never by
+/// running it.
+fn resolve_erlc() -> Option<PathBuf> {
+    if let Some(dir) = support::resolve_oracle().as_deref().and_then(Path::parent) {
+        let candidate = dir.join("erlc");
+        if support::is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    support::find_on_path("erlc")
+}
+
+/// The compiled fixture module in one scratch directory (removed on drop).
+struct Fixtures {
+    /// The scratch directory; a safe single `-pa` for both runtimes (no `lists.beam`).
+    dir: PathBuf,
+}
+
+impl Fixtures {
+    /// The compiled `<module>.beam` inside the scratch directory.
+    fn beam(&self, module: &str) -> PathBuf {
+        self.dir.join(format!("{module}.beam"))
+    }
+
+    /// The scratch directory as a `&str` for `-pa`.
+    fn dir_str(&self) -> &str {
+        self.dir
+            .to_str()
+            .unwrap_or_else(|| panic!("the scratch dir is not UTF-8: {}", self.dir.display()))
+    }
+}
+
+impl Drop for Fixtures {
+    fn drop(&mut self) {
+        // Best effort, but never silent: a leftover scratch dir must not fail the test, yet a
+        // cleanup failure is reported rather than swallowed.
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            eprintln!(
+                "warning: could not remove the fixture dir {}: {error}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
+/// Writes and compiles the fixture with `erlc`; `None` after a loud skip when the toolchain
+/// cannot produce it.
+fn build_fixtures(erlc: &Path) -> Option<Fixtures> {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // `$TMPDIR` (via `std::env::temp_dir`); the dir is handed to the oracle as a single `-pa`,
+    // so it must not contain a `lists.beam` (this crate's `tests/fixtures/` does; this does not).
+    let dir = std::env::temp_dir().join(format!("beam_rt_montag_{}_{n}", std::process::id()));
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        support::skip_loudly("monitor", &format!("cannot prepare {}: {error}", dir.display()));
+        return None;
+    }
+    let source = dir.join("montag.erl");
+    if let Err(error) = std::fs::write(&source, MONTAG_SRC) {
+        support::skip_loudly("monitor", &format!("cannot write {}: {error}", source.display()));
+        return None;
+    }
+    let output = match Command::new(erlc)
+        .arg("-o")
+        .arg(&dir)
+        .arg("montag.erl")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            support::skip_loudly("monitor", &format!("cannot run `erlc`: {error}"));
+            return None;
+        }
+    };
+    if !output.status.success() {
+        support::skip_loudly(
+            "monitor",
+            &format!(
+                "`erlc` exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        );
+        return None;
+    }
+    if !dir.join("montag.beam").is_file() {
+        support::skip_loudly("monitor", "`erlc` produced no montag.beam");
+        return None;
+    }
+    Some(Fixtures { dir })
+}
+
+/// `beam_rt -noshell -pa DIR run DIR/montag.beam montag:<fun>/0` — the scheduled-process route,
+/// which prints the result as `~w~n`.
+fn run_compiled(fixtures: &Fixtures, function: &str) -> Run {
+    let beam = fixtures.beam("montag");
+    let beam = beam
+        .to_str()
+        .unwrap_or_else(|| panic!("the fixture path is not UTF-8: {}", beam.display()));
+    let spec = format!("montag:{function}/0");
+    run(
+        env!("CARGO_BIN_EXE_beam_rt"),
+        &["-noshell", "-pa", fixtures.dir_str(), "run", beam, &spec],
+    )
+}
+
+/// The live oracle's line for `montag:<fun>/0`, in the shape the `run` action prints.
+fn oracle_compiled(oracle: &Path, fixtures: &Fixtures, function: &str) -> Option<String> {
+    support::oracle_eval(
+        oracle,
+        Some(&fixtures.dir),
+        &format!("io:format(\"~w~n\",[montag:{function}()]), halt(0)."),
+    )
+}
+
+// ---------------------------------------------------------------------------------------
+// The tests
+// ---------------------------------------------------------------------------------------
 /// Every flow prints exactly what the live oracle prints for the same expression: the
 /// reference-answering forms, `demonitor/2`'s real `[info]` boolean and `[flush]`'s removal
 /// of a queued `{'DOWN', …}`.
@@ -356,4 +513,73 @@ fn the_adopted_targets_succeed_silently() {
         assert!(run.out.is_empty(), "{expr}: stdout {}", run.out);
         assert!(run.err.is_empty(), "{expr}: stderr {}", run.err);
     }
+}
+
+/// `erlang:monitor/3`'s `{tag, T}` is served for an **immediate** (an atom here) and for a
+/// **module-literal** tag: both runtimes deliver the `{'DOWN', …}` with that term as its head.
+/// A **heap-resident** tag — a term built on a process heap, so neither immediate nor literal —
+/// is this runtime's typed capability gap (exit 3, one `unsupported:` line), where the oracle
+/// performs the monitor; the acceptance rule is `beam_process`'s `is_heap_independent`, which a
+/// monitor record's plain, unscanned value requires.
+///
+/// The case must run **compiled**: every term the `-eval` evaluator builds is heap-resident, so
+/// it cannot express the literal-area shape at all.
+#[test]
+fn a_tag_is_an_immediate_or_a_module_literal_and_a_heap_resident_one_is_the_typed_gap() {
+    let Some(oracle) = support::require_oracle("monitor") else {
+        return;
+    };
+    let Some(erlc) = resolve_erlc() else {
+        support::skip_loudly("monitor", "no `erlc` available (and none beside $ERTS_ORACLE)");
+        return;
+    };
+    let Some(fixtures) = build_fixtures(&erlc) else {
+        return;
+    };
+
+    for (label, function, expected) in [
+        ("an immediate (atom) tag", "imm", "{imm,true}"),
+        ("a module-literal tag", "lit", "{{lit,tag},true}"),
+    ] {
+        let ours = run_compiled(&fixtures, function);
+        assert_eq!(
+            ours.code, 0,
+            "{label}: `beam_rt run montag:{function}/0` must exit 0, got {}: {}",
+            ours.code, ours.err
+        );
+        assert!(
+            !ours.err.contains("unsupported"),
+            "{label}: an accepted tag is not a capability gap: {}",
+            ours.err
+        );
+        assert_eq!(ours.out, expected, "{label}: beam_rt's answer");
+
+        let theirs = oracle_compiled(&oracle, &fixtures, function)
+            .unwrap_or_else(|| panic!("the live oracle could not answer montag:{function}/0"));
+        assert_eq!(
+            theirs, expected,
+            "{label}: the recorded value must be the live oracle's answer"
+        );
+    }
+
+    // A heap-resident tag. The oracle hands it over; this runtime refuses it with the typed
+    // capability gap rather than storing a word a later collection would invalidate.
+    let heap = run_compiled(&fixtures, "heap");
+    assert_eq!(
+        heap.code, 3,
+        "a heap-resident tag is a capability gap, stderr {}",
+        heap.err
+    );
+    assert!(
+        heap.err.contains("unsupported: monitor/3: tag must be an immediate"),
+        "the gap is named: {}",
+        heap.err
+    );
+    assert!(heap.out.is_empty(), "nothing is printed: {}", heap.out);
+    let theirs = oracle_compiled(&oracle, &fixtures, "heap")
+        .expect("the live oracle could not answer montag:heap/0");
+    assert_eq!(
+        theirs, "heap_ok",
+        "the oracle accepts a heap-resident tag, so the refusal is this runtime's own gap"
+    );
 }

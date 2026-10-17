@@ -81,10 +81,11 @@
 //!
 //! * the bare atom `priority` is accepted and **ignored** (the C sets `ERTS_ML_FLG_PRIO_ML`,
 //!   which has no observable effect here),
-//! * `{tag, Tag}` supplies the `{'DOWN', …}` head atom, honoured for an
-//!   **immediately-representable** tag — one resident in a per-process heap stays the typed
-//!   capability gap (`beam_process`'s `error::unsupported_tag`), because a monitor record is
-//!   a plain value the collector never scans — and
+//! * `{tag, Tag}` supplies the `{'DOWN', …}` head atom, honoured for an **immediate**
+//!   (atom/integer/pid/port) or a **module-literal** tag — `beam_process`'s
+//!   `is_heap_independent` acceptance rule, because a monitor record is a plain value the
+//!   collector never scans — while a **heap-resident** tag (built on a process heap, neither
+//!   immediate nor literal) is that crate's typed `error::unsupported_tag`, and
 //! * `{alias, Mode}` makes the monitor's own reference double as a **reference alias**
 //!   (`explicit_unalias` / `demonitor` / `reply_demonitor`), so a message sent to it is
 //!   delivered to the watcher.
@@ -409,9 +410,9 @@ impl RuntimeContext<'_> {
     /// * the bare atom `priority` is accepted and **ignored** (the C sets
     ///   `ERTS_ML_FLG_PRIO_ML`, whose only effect is on the priority signal queue, which this
     ///   runtime does not model);
-    /// * `{tag, Tag}` supplies the user tag (its *immediacy* is checked downstream, by
-    ///   `beam_process`'s `check_tag`, so a heap-resident tag stays that crate's typed
-    ///   `error::unsupported_tag`);
+    /// * `{tag, Tag}` supplies the user tag (acceptance is checked downstream, by
+    ///   `beam_process`'s `check_tag`: an **immediate** or **module-literal** tag passes, a
+    ///   **heap-resident** one stays that crate's typed `error::unsupported_tag`);
     /// * `{alias, Mode}` selects the reference alias's expiry rule from the atoms
     ///   `explicit_unalias` / `demonitor` / `reply_demonitor`;
     /// * **everything else** — another atom, a tuple of another arity, a non-tuple element, a
@@ -996,8 +997,9 @@ mod tests {
         assert!(is_reference(&mut runtime, reference));
         call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1");
 
-        // A **non-immediate** tag (a heap term) is the typed `beam_process` capability gap:
-        // a monitor record is a plain value the collector never scans.
+        // A **heap-resident** tag — a tuple built here, neither an immediate nor a
+        // module-literal — is the typed `beam_process` capability gap: a monitor record is a
+        // plain value the collector never scans.
         let heap_tag = make_tuple(&mut runtime, &[x, x]);
         let tag_option = make_tuple(&mut runtime, &[tag, heap_tag]);
         let options = make_list(&mut runtime, &[tag_option]);
