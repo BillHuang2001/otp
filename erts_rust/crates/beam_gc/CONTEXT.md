@@ -400,8 +400,36 @@ constructors only (no new error enum).
   `beam_term`'s job, while this crate owns the refcounted off-heap objects, the shared count, and the list —
   whose slot number an on-heap off-heap reference stores, stable for the list's lifetime (`mso.rs`, API
   Surface).
+- **The scanned-region aggregate is cached in the nursery chain and derived, not stored, at the collector.**
+  `Nursery` keeps `extent: ScannedBounds` over the **reserved** extents of every space of the chain: `grow`
+  only *widens* it (`min`/`max`, `O(1)` regardless of chain length) because the retired space was already
+  covered while it was current, `collapse` *re-seeds* it from the single surviving space (a stale widening
+  would keep accepting the retired neighbourhood), and both advance the epoch. `Collector`/
+  `GenImmixCollector` compose it with their mature extent and a separate `mature_generation` counter bumped
+  where the mature space/region is actually replaced (`collect_major`'s fresh `HeapSpace`, `relocate_major`'s
+  fresh `ImmixSpace`; an in-place mark-region reclaim keeps `base`/capacity and therefore does not move the
+  epoch). The reported `generation` is the **sum** of the two monotone counters, so it changes whenever either
+  half does. `Nursery::contains` is unchanged (`spaces().any(|s| s.contains(ptr))`), so the aggregate can
+  never make it inexact. Why the reserved extent and not the live `top()`: `top()` moves on every allocation,
+  which would invalidate a cached bound immediately, and the filter only ever rejects.
+- **The minor→major escalation test is a CAPACITY test on the nursery's occupancy, and for the
+  `gc_bound/churn` shape every escalation it takes is genuine.** `Collector::collect` escalates whenever
+  `mature.available_words() < nursery.used_words()`; `tests/churn_attribution.rs` records the escalation's own
+  inputs (the mature as low as **1** free word against a nursery occupancy up to 550, with the live young set
+  at 464–1 353 words), so the ~0.5 majors/op the shape pays are forced by the mature generation's promoted
+  garbage, not by the test being conservative. An exact-live variant
+  (`mature.available_words() >= live::live(nursery_from_set, roots).words`) would remove false escalations
+  elsewhere but does **not** help this shape (its live set exceeds the mature's room) and costs one extra young
+  traversal per collection — so it is deliberately not adopted.
 
 ### Measured (every figure, table and caveat is in `MEASURED.md`)
+- The `gc_bound/churn` shape's per-op split is recorded there (`tests/churn_attribution.rs`): **806 words
+  allocated/op against 2.00 collections/op (1.50 minor + 0.50 major) in-crate and 7.00 (5.50 + 1.50) on the
+  real runtime at a 376-word nursery**, with **1 269 words copied/op = 1.58× the allocated volume** and
+  ≈0.70 of every admitted young word never handed out. A `perf` profile of the same shape puts this crate's
+  copy loop at **4.2 %** of samples (interpreter 20 %, libc malloc/free/memmove 15 %), so the shape's dominant
+  terms are the interpreted recursion, `beam_bifs`' `Vec`-based list→binary/tuple conversion and the
+  per-collection space installs — not the copy loop (Handoffs).
 - Folding the **young heap's occupancy** into the fullsweep's size request is what makes the mature
   generation reachable at the default policy — the copying default runs **147 minors : 73 fullsweeps**.
 - GenImmix wins **copy work on long-lived data** but pays footprint and pause on the small-heap/high-churn
