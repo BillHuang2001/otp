@@ -37,7 +37,8 @@ use crate::error;
 use crate::families;
 use crate::families::exceptions::callee;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
-use crate::machine::{namespace_atom, Continuation, Machine, RunOutcome};use crate::operand::{read_operand, write_operand};
+use crate::machine::{namespace_atom, Continuation, Machine, RunOutcome};
+use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::terms::{reserve_slack, Sink};
 use crate::Step;
@@ -1249,7 +1250,8 @@ fn unwrap_apply3(list: Eterm) -> Option<(Eterm, Eterm, Eterm)> {
 /// namespace names it; the throw consults it only when the raise actually lands, so a
 /// namespace without it still propagates a typed `BeamError::Raise(..)` uncaught and a
 /// landing fails with a typed `unsupported` — the `install_class_atom` contract
-/// (mirrors `families/exceptions.rs::raise_error_atom`).///
+/// (mirrors `families/exceptions.rs::raise_error_atom`).
+///
 /// `what` names the raising instruction/site (`"func_info"`, `"test"`,
 /// `"select_val"`, `"maps"`) for the typed error above.
 ///
@@ -1332,7 +1334,10 @@ fn function_clause_raise(
 /// The reservation is taken **before** the registers are read: a collecting host may
 /// relocate `x`, and the argument registers are its roots, so reading them first would
 /// capture from-space words.
-fn failed_clause_arglist(
+///
+/// `pub(super)` (not `pub`): the clamp is pinned by the sibling `tests` module, which
+/// is the only other reachable caller.
+pub(super) fn failed_clause_arglist(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     argv: u32,
@@ -1362,7 +1367,8 @@ fn failed_clause_arglist(
                 .ok_or_else(|| error::bad_register(index as u32))?,
         );
     }
-    sink.list(&args)}
+    sink.list(&args)
+}
 
 /// The declared arity of the function at index `func` of `module`: the arity a
 /// `function_clause` raised while executing **anywhere** in that function (a

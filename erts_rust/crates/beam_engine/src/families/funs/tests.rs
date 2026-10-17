@@ -518,7 +518,15 @@ fn call_fun_with_a_wrong_arity_fun_raises_badarity() {
     let mut machine = Machine::new();
     machine.push_frame(0).unwrap();
     machine.push_catch_frame(CatchFrame::new(4, 6, 0));
-    let mut ctx = MinimalContext::new();
+    // The closure-apply seam must never be reached: the arity guard precedes it, so a
+    // mismatched-arity closure can never be entered with the wrong argument count.
+    // (The resolver is installed to *prove* that: it counts its own consultations.)
+    let consulted = Rc::new(RefCell::new(0u32));
+    let counter = Rc::clone(&consulted);
+    let mut ctx = MinimalContext::with_local_fun_resolver(Box::new(move |_fun, _args| {
+        *counter.borrow_mut() += 1;
+        Ok(None)
+    }));
     // A genuine 2-ary local closure (the `make_fun3` header arity is the descriptor
     // arity minus the captured variables: 2 - 0), called with ONE argument.
     let fun = terms::make_fun(&mut ctx, 2, 0, 0, &[]).expect("materialize the closure");
@@ -537,6 +545,7 @@ fn call_fun_with_a_wrong_arity_fun_raises_badarity() {
     )
     .expect("the raise lands in the live catch frame");
     assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+    assert_eq!(*consulted.borrow(), 0, "the seam was never consulted");
     assert_eq!(machine.x(0), Some(Eterm::non_value()), "x(0) = THE_NON_VALUE");
     let inner = reason_value(&module, machine.x(1).unwrap(), "badarity");
     assert_eq!(
@@ -553,6 +562,73 @@ fn call_fun_with_a_wrong_arity_fun_raises_badarity() {
             .expect("a proper list"),
         vec![make_atom(one)],
         "the ACTUAL argument list rides the reason"
+    );
+    let _ = entry;
+}
+
+#[test]
+fn a_wrong_arity_fun_never_reaches_the_seam_when_the_module_cannot_name_badarity() {
+    // The arity test is **unconditional** — only the structured *reason* depends on
+    // the module naming `badarity` (`error_atom` is a global table in C; this engine's
+    // atoms are module-local indices). An atom-poor module therefore still refuses the
+    // mismatched closure: the guard reports the typed `unsupported` naming the missing
+    // atom, and the closure-apply seam is never consulted. Gating the *comparison* on
+    // the lookup instead (the shape this pins against) would hand the host a
+    // wrong-arity closure and, with a host that does not re-validate, enter the lambda
+    // body with the wrong argument count — a wrong value, not a typed error.
+    let mut fixture = Fixture::new();
+    // Deliberately NO `badarity` atom: the module cannot name the reason tag.
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+    assert!(
+        module.atom_table.lookup("badarity").is_none(),
+        "the fixture must not name the reason tag"
+    );
+
+    // The resolver records that it was consulted; the guard must keep it at zero.
+    let consulted = Rc::new(RefCell::new(0u32));
+    let counter = Rc::clone(&consulted);
+    let mut ctx = MinimalContext::with_local_fun_resolver(Box::new(move |_fun, _args| {
+        *counter.borrow_mut() += 1;
+        Ok(None)
+    }));
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    // A genuine 2-ary closure called with ONE argument.
+    let fun = terms::make_fun(&mut ctx, 2, 0, 0, &[]).expect("materialize the closure");
+    machine.set_x(0, make_small(1)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let err = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect_err("an unnameable `badarity` degrades the reason to a typed error");
+    assert_eq!(
+        *consulted.borrow(),
+        0,
+        "the arity guard runs before the closure-apply seam, so the seam is never consulted"
+    );
+    match err {
+        BeamError::Raise(raise) => assert_eq!(
+            raise.reason.as_atom(),
+            Some("unsupported_opcode: call_fun: no 'badarity' atom in the module"),
+            "the refusal names the missing atom; it never substitutes one"
+        ),
+        other => panic!("expected the typed unsupported, got {other:?}"),
+    }
+    assert_eq!(
+        machine.catch_frame_depth(),
+        1,
+        "a capability gap cannot land in a catch frame"
     );
     let _ = entry;
 }

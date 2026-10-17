@@ -574,6 +574,61 @@ fn select_val_with_no_fail_on_a_module_without_function_clause_is_the_typed_gap(
     }
 }
 
+/// `failed_clause_arglist` bounds the argument list by **this machine's own**
+/// register file ([`Machine::register_count`]), never by the `MAX_REGISTER`
+/// constant, and reads every register through the fallible accessor.
+///
+/// A machine built with [`Machine::with_max_register`] holds fewer registers than a
+/// `.beam`'s declared arity may reach, so a constant clamp would let the walk run
+/// past the slots that exist. That must be a shorter (clamped) list — never a list
+/// padded out with a silently substituted value: the pre-clamp code read such a slot
+/// as `unwrap_or(NIL)`, which would hand the caller a `NIL` argument that was never
+/// passed (a wrong value in the cooked stacktrace item, not a typed error).
+#[test]
+fn failed_clause_arglist_clamps_to_the_machines_own_register_file() {
+    use super::dispatch::failed_clause_arglist;
+
+    // Four registers, six demanded: the clamp stops at four.
+    let mut machine = Machine::with_max_register(4);
+    assert_eq!(machine.register_count(), 4);
+    let mut ctx = MinimalContext::new();
+    let populated = [11, 22, 33, 44];
+    for (index, value) in populated.iter().enumerate() {
+        machine.set_x(index as u32, make_small(*value)).unwrap();
+    }
+
+    let args = failed_clause_arglist(&mut machine, &mut ctx, 6)
+        .expect("every clamped index is inside the file");
+    let elements = crate::terms::list_elements(args).expect("a proper list");
+    assert_eq!(
+        elements,
+        populated.iter().copied().map(make_small).collect::<Vec<_>>(),
+        "exactly the populated registers, in order — no padded-out NIL slots"
+    );
+    assert!(
+        !elements.contains(&beam_term::NIL),
+        "a register that does not exist is never substituted into the argument list"
+    );
+
+    // The ordinary case is unchanged: a full-size machine and a live arity yield that
+    // arity's registers, one cell per argument.
+    let mut full = Machine::with_max_register(crate::machine::MAX_REGISTER);
+    let mut ctx = MinimalContext::new();
+    for (index, value) in [7, 8, 9].iter().enumerate() {
+        full.set_x(index as u32, make_small(*value)).unwrap();
+    }
+    let args = failed_clause_arglist(&mut full, &mut ctx, 3).expect("three live registers");
+    assert_eq!(
+        crate::terms::list_elements(args).expect("a proper list"),
+        vec![make_small(7), make_small(8), make_small(9)]
+    );
+
+    // The zero-arity boundary: C's `make_arglist` yields `nil`, which *is* the empty
+    // argument list.
+    let args = failed_clause_arglist(&mut full, &mut ctx, 0).expect("no arguments at all");
+    assert!(beam_term::is_nil(args), "a zero-arity call is the empty list");
+}
+
 /// A live fail label is unchanged: the failed test **branches** to it, it does
 /// not raise.
 #[test]
