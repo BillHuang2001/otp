@@ -493,11 +493,34 @@ constructors only (no new error enum).
   **chained** nursery, each object once, no garbage; a live refc binary's `BinRef` reported and an unreachable
   one not; a 50 000-object chain, a three-tuple ring, `AnyCollector` forwarding, and the safe view — the reached
   range geometry pinned in-module by `reachable.rs`/`space.rs`/`nursery.rs`).
-- **Immix**: `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` +  `tests/gen_immix_collector.rs` (geometry/allocation/mark/pin/evacuation/accounting and the hard major cases;
+- **Aggregate scanned bounds**: `tests/scanned_bounds.rs` (the safety property — a rejected address is in no
+  scanned region, asserted over every region neighbourhood at chain lengths 1/2/3/8/64/1024 and for capped
+  *and* differing-capacity chains, both strategies + `AnyCollector` forwarding; the aggregate's exactness
+  against the reserved extents; the epoch moving exactly on growth/no-op growth/collapse/mature-replacement of
+  both kinds; the over-approximation measured and printed, never asserted); in-module `bounds.rs` (the
+  half-open boundaries, `EMPTY` as `covering`'s identity, `span_words`) and `nursery.rs` (the cache equals the
+  chain's covering at every step).
+- **Per-op attribution**: `tests/churn_attribution.rs` reproduces the `tools/bench` `gc_bound/churn` shape and
+  drives it through the runtime's own admission door (`should_collect`/`collection_debt` →
+  `ensure_capacity`), asserting the collection counts, the garbage share, and the bounded
+  nursery/mature/chain capacities — the table is in `MEASURED.md`.
+- **Immix**: `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` +
+  `tests/gen_immix_collector.rs` (geometry/allocation/mark/pin/evacuation/accounting and the hard major cases;
   one corpus through both strategies behind one structural walker; a multi-block object);
-  `tests/immix_fragmentation.rs` (the atomic promotion: a refused promotion leaves both spaces byte-identical —
-  same roots, no marker, counters unchanged, identical on retry — and the 7-line/100-word and 9-line shapes reach
-  a bounded steady state under both strategies with the live set `compare`-equal to a witness every round);
+  `tests/immix_fragmentation.rs` (the **first-reservation** refusal: every object of the corpus is 7 lines and
+  the region is packed to 112/128, so the *very first* reservation is refused and the rollback's restore list
+  is **empty** — same roots, no marker, counters unchanged, identical on retry — plus the 7-line/100-word and
+  9-line steady states under both strategies with the live set `compare`-equal to a witness every round);
+  `tests/immix_promotion_rollback.rs` (the **non-trivial** refusal: the same packed region — 112 used / 16 free
+  lines, `can_reserve(2) == true`, `can_reserve(100) == false`, up-front `needed == 8 ≤ free_lines()` — with a
+  mixed corpus whose 2-word tuple is **placed, copied and marked** before the 100-word tuple is refused, so
+  `plan.copies` holds one entry when `rollback` runs. Pins the positive half (the released line still holds the
+  placed copy's own words), the negative half (the nursery is byte-identical — a no-op rollback leaves
+  `make_boxed(dst)` in the placed tuple's header), the restored `ImmixCounters` (112/16, 8 partial blocks, same
+  `lines_marked`), the reuse of the released line (the small tuple alone then promotes into a leftover tail
+  line), the reproducible retry, the `collect` escalation to a completing `Major` with witness-equal roots, and
+  the same two outcomes through the `AnyCollector` seam. **Mutation-verified**: with `rollback` replaced by a
+  no-op this file fails 4/4 while `immix_fragmentation.rs` still passes 5/5);
   `tests/immix_break_even.rs` (a geometry `Law` at every point; the 8-block constant pinned NOT one line below);
   `tests/immix_selection_curve.rs` ("moved words are object-size- and occupancy-invariant" asserted);
   `tests/immix_workloads.rs` / `tests/allocation_heavy_workload.rs` (the measurements behind `MEASURED.md`);
