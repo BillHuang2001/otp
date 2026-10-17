@@ -847,11 +847,14 @@ impl UdpInetDriver {
             }
             // `packet_inet_ctl`'s `INET_REQ_FDOPEN` (`:14639`) guards in this order:
             // `len != 6 && len != 10 ⇒ EINVAL` (`:14647`), then the family tag
-            // (`⇒ eafnosupport`, `:14659`), then the type (`⇒ EINVAL`, `:14671`). Adopting the
-            // caller's descriptor — the `inet_ctl_fdopen` call at `:14677` — is a capability this
-            // floor does not have: it would have to take ownership of a descriptor number handed
-            // to it from Erlang and re-derive its state, which the `Driver` seam's construction
-            // path (a `DriverFactory` taking no argument) cannot express, so it stays a typed gap.
+            // (`⇒ eafnosupport`, `:14659`), then the type (`⇒ EINVAL`, `:14671`), and only then
+            // the pre-adoption check `inet_ctl_fdopen` makes on a `bound` descriptor
+            // ([`super::wire::fdopen_precheck`]): a failing `sock_name(2)` is
+            // `enotsock`/`ebadf`, a family mismatch `einval`. Adopting the caller's descriptor is
+            // a capability this floor does not have: `desc->prebound = 1` (`:5266`) makes the C
+            // leave a handed-over descriptor alone for the port's life, while this crate's
+            // `stop`/`Drop` closes whatever the driver owns, so the successful form stays a
+            // typed gap rather than a fabricated `[1]`.
             Opcode::Fdopen => {
                 if arg.len() != 6 && arg.len() != 10 {
                     return Ok(ctl_xerror("einval"));
@@ -862,7 +865,10 @@ impl UdpInetDriver {
                 if arg[1] != INET_TYPE_STREAM && arg[1] != INET_TYPE_DGRAM {
                     return Ok(ctl_xerror("einval"));
                 }
-                Err(op.not_served())
+                match super::wire::fdopen_precheck(arg) {
+                    Ok(()) => Err(op.not_served()),
+                    Err(reply) => Ok(reply),
+                }
             }
             // The name-service lookups (`:11493`, `:11525`): the shared `inet_ctl` arms, built by
             // the same helpers the stream driver uses — the system services database behind
@@ -909,15 +915,13 @@ impl UdpInetDriver {
                     Err(name) => Ok(ctl_xerror(name)),
                 }
             }
-            // The `getifaddrs(3)`-backed family (`:11067`, `:11078`, `:11089`, `:11100`): only the
-            // `!IS_OPEN ⇒ EXBADPORT` refusal is exact; with a socket the reply needs a live
-            // interface walk (`inet_ctl_getiflist`/`_ifget`/`_ifset`/`_ifaddrs`), which is a typed
-            // gap here rather than a fabricated table.
+            // The interface family (`:11067`, `:11078`, `:11089`, `:11100`): the same four shared
+            // `inet_ctl` arms the stream driver reaches — each opens with
+            // `!IS_OPEN ⇒ ctl_xerror(EXBADPORT)` and then walks the host's interfaces
+            // (`SIOCGIFCONF`, the `SIOCGIF*` ioctls, `getifaddrs(3)`), built once in
+            // [`super::wire::interface_reply`].
             Opcode::Getiflist | Opcode::Ifget | Opcode::Ifset | Opcode::Getifaddrs => {
-                if !self.has_socket() {
-                    return Ok(ctl_xerror("exbadport"));
-                }
-                Err(op.not_served())
+                Ok(super::wire::interface_reply(op, self.socket, arg))
             }
             // `INET_REQ_IGNOREFD` (`:11456`): `!IS_CONNECTED ⇒ ENOTCONN` (`:11462`), then
             // `stype != SOCK_STREAM ⇒ EINVAL` (`:11464`) — and then the C reads `*buf` with **no

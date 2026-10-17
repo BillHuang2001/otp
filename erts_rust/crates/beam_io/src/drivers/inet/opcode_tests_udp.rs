@@ -324,20 +324,15 @@ fn a_wrapped_or_unassigned_numeric_command_on_the_datagram_port_is_exbadport() {
 /// The opcodes that stay **typed gaps** on this driver — a capability the C has and this floor
 /// does not, answered with a typed error rather than a fabricated reply.
 ///
-/// Each survivor needs something the frozen [`crate::Driver`] seam cannot express:
+/// The one survivor is `INET_REQ_FDOPEN`(13) with a *well-formed* operand: adopting a caller's
+/// descriptor number would mean taking ownership of an fd handed in from Erlang, which no
+/// `DriverFactory` ctor can express (and which the C deliberately never closes,
+/// `desc->prebound = 1`). Everything else in the `inet_ctl` arm is served: the name-service
+/// lookups (`GETSERVBYNAME`/`GETSERVBYPORT`), the interface family
+/// (`GETIFLIST`/`IFGET`/`IFSET`/`GETIFADDRS`) and `INET_REQ_SUBSCRIBE`(24).
 ///
-/// * `INET_REQ_FDOPEN`(13) with a *well-formed* operand — adopting a caller's descriptor number
-///   would mean taking ownership of an fd handed in from Erlang, which no `DriverFactory` ctor can
-///   express. (The oracle's own answer there is `[0]enotsock`, because it does not validate.)
-/// * `INET_REQ_GETSERVBYNAME`(17)/`GETSERVBYPORT`(18) with a well-formed operand — the lookup is
-///   `getservbyname(3)`/`getservbyport(3)`, which this crate's `sys` layer does not wrap.
-/// * `INET_REQ_GETIFLIST`(21)/`IFGET`(22)/`IFSET`(23)/`GETIFADDRS`(25) on a port that *has* a
-///   socket — the reply is a `getifaddrs(3)` walk.
-///
-/// Every one of these now answers the C's own `ctl_error(EINVAL)`/`ctl_xerror(EXBADPORT)` refusal
-/// for the argument/state faults around the gap; only the valid-call body is missing.
-/// `INET_REQ_SUBSCRIBE`(24) is **not** on this list any more: its reply is exact (see
-/// [`subscribe_answers_the_c_outq_record_or_badarg`]).
+/// The failure shapes around the gap are the C's own `ctl_error(EINVAL)`/`ctl_xerror(EXBADPORT)`
+/// refusals.
 #[test]
 fn the_surviving_numeric_opcodes_on_the_datagram_port_are_typed_gaps() {
     let mut port = opened_port();
@@ -356,13 +351,7 @@ fn the_surviving_numeric_opcodes_on_the_datagram_port_are_typed_gaps() {
         ctl_xerror("einval"),
         "GETSERVBYPORT needs the protocol length byte's string"
     );
-
-    // The interface family needs a live `getifaddrs(3)` walk; a socket-less port is refused.
-    for code in [21u32, 22, 23, 25] {
-        assert_typed_gap(&mut port, code, &[1], "the getifaddrs family");
-    }
 }
-
 // -----------------------------------------------------------------------
 // `INET_REQ_SUBSCRIBE`(24) on the datagram driver
 // -----------------------------------------------------------------------
@@ -612,9 +601,15 @@ fn numeric_fdopen_refuses_a_bad_length_family_and_type() {
         ctl_xerror("einval"),
         "type 9 is neither SOCK_STREAM nor SOCK_DGRAM"
     );
-    // The well-formed adopt is the typed gap (the oracle answers `[0]enotsock`, because its own
-    // `inet_ctl_fdopen` hands the number straight to the kernel).
-    assert_typed_gap(&mut port, 13, &[1, 2, 0, 0, 0, 1], "a well-formed FDOPEN");
+    // The well-formed adopt is the typed gap. The `bound == 0` form is used because it is the one
+    // that reaches the gap without a descriptor probe: any fd this test could name is either not a
+    // socket or not bound, so the `bound = 1` ladder would refuse first.
+    assert_typed_gap(
+        &mut port,
+        13,
+        &[1, 2, 0, 0, 0, 1, 0, 0, 0, 0],
+        "a well-formed unbound FDOPEN",
+    );
 }
 
 /// `INET_REQ_GETSERVBYNAME`(17, `:11493`)/`INET_REQ_GETSERVBYPORT`(18, `:11525`): only the operand
@@ -789,13 +784,7 @@ fn numeric_getif_requests_refuse_a_socket_less_port() {
             "request {code} on a socket-less port"
         );
     }
-    // With a socket the reply needs the live interface walk: a typed gap, not a fabricated table.
-    let mut port = opened_port();
-    for code in [21u32, 22, 23, 25] {
-        assert_typed_gap(&mut port, code, &[1], "the getifaddrs family");
-    }
 }
-
 /// `INET_REQ_IGNOREFD`(28, `:11456`): `!IS_CONNECTED ⇒ ENOTCONN` (`:11462`), then
 /// `stype != SOCK_STREAM ⇒ EINVAL` (`:11464`). A connected socket on this driver is always a
 /// datagram one, so the second guard is the terminal answer (measured `[0]einval`); the C then

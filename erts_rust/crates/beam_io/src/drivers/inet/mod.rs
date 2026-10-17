@@ -1469,8 +1469,9 @@ impl TcpInetDriver {
                 reply.extend_from_slice(&sys::hostname()?);
                 Ok(reply)
             }
-            // `INET_REQ_FDOPEN` (`:12003`): the length/family/type refusals are exact; adopting a
-            // caller's descriptor stays a typed gap.
+            // `INET_REQ_FDOPEN` (`:12003`): the length/family/type refusals are exact, and so is
+            // the pre-adoption `sock_name`/family check of a `bound` descriptor
+            // ([`wire::fdopen_precheck`]). Adopting the caller's descriptor stays a typed gap.
             Opcode::Fdopen => {
                 if arg.len() != 6 && arg.len() != 10 {
                     return Ok(ctl_xerror("einval"));
@@ -1481,7 +1482,11 @@ impl TcpInetDriver {
                 if arg[1] != INET_TYPE_STREAM {
                     return Ok(ctl_xerror("einval"));
                 }
-                Err(op.not_served())
+                match wire::fdopen_precheck(arg) {
+                    // The C would hand the descriptor to `inet_ctl_fdopen` and answer `[1]`.
+                    Ok(()) => Err(op.not_served()),
+                    Err(reply) => Ok(reply),
+                }
             }
             // The name-service lookups (`:11493`, `:11525`): the shared `inet_ctl` arms, served
             // from the system services database through [`sys::service_port`]/
@@ -1508,13 +1513,13 @@ impl TcpInetDriver {
                 }
                 Ok(ctl_ok())
             }
-            // The `getifaddrs(3)`-backed family (`:11067`, `:11078`, `:11089`, `:11100`): only
-            // the `!IS_OPEN` refusal is exact; the open-state reply needs an interface walk.
+            // The interface family (`:11067`, `:11078`, `:11089`, `:11100`): four shared
+            // `inet_ctl` arms, each opening with `!IS_OPEN ⇒ ctl_xerror(EXBADPORT)` and then
+            // walking the host's interfaces through [`super::sys`] — `SIOCGIFCONF` for the name
+            // list, the `SIOCGIF*` ioctls for one interface's records and `getifaddrs(3)` for the
+            // whole list. [`wire::interface_reply`] builds all four.
             Opcode::Getiflist | Opcode::Ifget | Opcode::Ifset | Opcode::Getifaddrs => {
-                if !self.has_socket() {
-                    return Ok(ctl_xerror("exbadport"));
-                }
-                Err(op.not_served())
+                Ok(wire::interface_reply(op, self.socket, arg))
             }
             // `INET_REQ_IGNOREFD` (`:11456`): `!IS_CONNECTED ⇒ enotconn`, then
             // `stype != SOCK_STREAM ⇒ einval`. A connected stream stays a typed gap: its reply

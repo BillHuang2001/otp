@@ -745,20 +745,6 @@ fn sockaddr_to_buf(addr: &libc::sockaddr) -> SockAddr {
     };
     SockAddr { family, body }
 }
-/// The byte count the C's `sockaddr_bufsz_need` (`inet_drv.c:5419`) reports for `addr`.
-///
-/// Only the link-layer arm is consumed (`INET_REQ_GETIFADDRS` asks whether the hardware address
-/// is longer than three bytes before emitting a `HWADDR` record, `:6769`).
-fn sockaddr_bufsz_need(addr: &libc::sockaddr) -> usize {
-    let family = addr.sa_family as libc::c_int;
-    if family == libc::AF_PACKET {
-        // SAFETY: the family check above proves the buffer holds a `sockaddr_ll`, and a
-        // `sockaddr` is at least as large and at least as aligned as one.
-        let sll: libc::sockaddr_ll = unsafe { std::ptr::read(std::ptr::from_ref(addr).cast()) };
-        return 2 + usize::from(sll.sll_halen);
-    }
-    sockaddr_to_buf(addr).body.len()
-}
 /// One `ifreq` the interface ioctls mutate in place, owned as an opaque value.
 ///
 /// The C keeps a single `struct ifreq` across an `INET_REQ_IFGET`/`IFSET` operand and reuses it
@@ -767,43 +753,36 @@ fn sockaddr_bufsz_need(addr: &libc::sockaddr) -> usize {
 /// the accessors read the union afterwards.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct IfReq(libc::ifreq);
-/// The interface ioctl an [`IfReq`] can be driven with — the `SIOCGIF*`/`SIOCSIF*` names the C's
-/// `INET_REQ_IFGET`/`IFSET` arms switch on.
+/// The interface ioctl an [`IfReq`] can be driven with — the `SIOCGIF*` names the C's
+/// `INET_REQ_IFGET` arm switches on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum IfReqIo {
-    /// `SIOCGIFADDR` / `SIOCSIFADDR` (`inet_drv.c:5843`, `:6052`).
+    /// `SIOCGIFADDR` (`inet_drv.c:5843`).
     Addr,
-    /// `SIOCGIFBRDADDR` / `SIOCSIFBRDADDR` (`:5911`, `:6071`).
+    /// `SIOCGIFBRDADDR` (`:5911`).
     BroadAddr,
-    /// `SIOCGIFDSTADDR` / `SIOCSIFDSTADDR` (`:5922`, `:6082`).
+    /// `SIOCGIFDSTADDR` (`:5922`).
     DstAddr,
-    /// `SIOCGIFNETMASK` / `SIOCSIFNETMASK` (`:5933`, `:6090`).
+    /// `SIOCGIFNETMASK` (`:5933`).
     Netmask,
-    /// `SIOCGIFMTU` / `SIOCSIFMTU` (`:5949`, `:6102`).
+    /// `SIOCGIFMTU` (`:5949`).
     Mtu,
-    /// `SIOCGIFFLAGS` / `SIOCSIFFLAGS` (`:5959`, `:6113`).
+    /// `SIOCGIFFLAGS` (`:5959`).
     Flags,
-    /// `SIOCGIFHWADDR` / `SIOCSIFHWADDR` (`:5861`, `:6062`).
+    /// `SIOCGIFHWADDR` (`:5861`).
     HwAddr,
 }
 impl IfReqIo {
-    /// The `ioctl(2)` request number `get` names, or `set` selects the writing variant.
-    fn request(self, set: bool) -> libc::Ioctl {
-        let request = match (self, set) {
-            (IfReqIo::Addr, false) => libc::SIOCGIFADDR,
-            (IfReqIo::Addr, true) => libc::SIOCSIFADDR,
-            (IfReqIo::BroadAddr, false) => libc::SIOCGIFBRDADDR,
-            (IfReqIo::BroadAddr, true) => libc::SIOCSIFBRDADDR,
-            (IfReqIo::DstAddr, false) => libc::SIOCGIFDSTADDR,
-            (IfReqIo::DstAddr, true) => libc::SIOCSIFDSTADDR,
-            (IfReqIo::Netmask, false) => libc::SIOCGIFNETMASK,
-            (IfReqIo::Netmask, true) => libc::SIOCSIFNETMASK,
-            (IfReqIo::Mtu, false) => libc::SIOCGIFMTU,
-            (IfReqIo::Mtu, true) => libc::SIOCSIFMTU,
-            (IfReqIo::Flags, false) => libc::SIOCGIFFLAGS,
-            (IfReqIo::Flags, true) => libc::SIOCSIFFLAGS,
-            (IfReqIo::HwAddr, false) => libc::SIOCGIFHWADDR,
-            (IfReqIo::HwAddr, true) => libc::SIOCSIFHWADDR,
+    /// The `ioctl(2)` request number this variant names.
+    fn request(self) -> libc::Ioctl {
+        let request = match self {
+            IfReqIo::Addr => libc::SIOCGIFADDR,
+            IfReqIo::BroadAddr => libc::SIOCGIFBRDADDR,
+            IfReqIo::DstAddr => libc::SIOCGIFDSTADDR,
+            IfReqIo::Netmask => libc::SIOCGIFNETMASK,
+            IfReqIo::Mtu => libc::SIOCGIFMTU,
+            IfReqIo::Flags => libc::SIOCGIFFLAGS,
+            IfReqIo::HwAddr => libc::SIOCGIFHWADDR,
         };
         request as libc::Ioctl
     }
@@ -855,46 +834,31 @@ impl IfReq {
         let sa = unsafe { &self.0.ifr_ifru.ifru_hwaddr };
         sa.sa_data[..HWADDR_LEN].iter().map(|&b| b as u8).collect()
     }
-    /// Overwrites the `ifru_addr` member with the IPv4 address `octets` named — the C's
-    /// `buf_to_sockaddr` for the `INET_AF_INET` tag (`inet_drv.c:5444`).
-    pub(super) fn set_ipv4(&mut self, octets: [u8; 4]) {
-        // SAFETY: writing any union member is sound for a `#[repr(C)]` union of plain data; a
-        // `sockaddr` and a `sockaddr_in` have the same size and alignment on every platform this
-        // crate builds for, and the family/port fields are assigned before the address.
-        let sa = unsafe { &mut self.0.ifr_ifru.ifru_addr };
-        // SAFETY: `sa` points at an initialized `sockaddr` inside the union; a `sockaddr_in` is
-        // the same size and alignment, so reinterpreting it in place is well defined.
-        let sin = unsafe { &mut *std::ptr::from_mut(sa).cast::<libc::sockaddr_in>() };
-        sin.sin_family = libc::AF_INET as libc::sa_family_t;
-        sin.sin_port = 0;
-        sin.sin_addr = libc::in_addr {
-            s_addr: u32::from_ne_bytes(octets),
-        };
-    }
 }
 /// The number of raw bytes an `HWADDR` record carries (`IFHWADDRLEN`, `inet_drv.c:5800`).
 pub(super) const HWADDR_LEN: usize = 6;
 /// Drives one interface ioctl against `req` (`ioctl(2)` on the driver's socket).
 ///
+/// Only the reading (`SIOCGIF*`) direction exists: the `INET_REQ_IFSET` arm answers purely from
+/// its operand's parse and performs none of the writes it decodes, so no `SIOCSIF*` request is
+/// ever issued from this crate (`super::wire::ifset_reply` states that divergence).
+///
 /// # Errors
 ///
-/// The raw `ioctl(2)` failure — `ENODEV` for an interface that does not exist, `EPERM` for a
-/// privileged set — which every C call site either renders (`ctl_error`) or ignores.
-pub(super) fn ifreq_ioctl(
-    fd: RawFd,
-    req: &mut IfReq,
-    which: IfReqIo,
-    set: bool,
-) -> std::io::Result<()> {
+/// The raw `ioctl(2)` failure — `ENODEV` for an interface that does not exist, which every C call
+/// site renders as "no record for this option" (or, for `FLAGS`, as a zero bit set).
+pub(super) fn ifreq_ioctl(fd: RawFd, req: &mut IfReq, which: IfReqIo) -> std::io::Result<()> {
     // SAFETY: `fd` is the caller's socket, `req` is a live `ifreq` this type owns and the
-    // request is one of the `SIOC[GS]IF*` numbers, all of which take an `ifreq*` as their third
+    // request is one of the `SIOCGIF*` numbers, all of which take an `ifreq*` as their third
     // argument — so the kernel reads/writes at most `size_of::<ifreq>()` bytes of it and never
     // retains the pointer.
-    if unsafe { libc::ioctl(fd, which.request(set), &mut req.0) } < 0 {
+    if unsafe { libc::ioctl(fd, which.request(), &mut req.0) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
-}/// The interface names a `SIOCGIFCONF` walk reports, in kernel order — the C's `get_ifconf`
+}
+
+/// The interface names a `SIOCGIFCONF` walk reports, in kernel order — the C's `get_ifconf`
 /// (`inet_drv.c:5671`) without the reply framing.
 ///
 /// The C grows a heap buffer in `10 * sizeof(struct ifreq)` steps until `SIOCGIFCONF` stops
@@ -1065,16 +1029,16 @@ unsafe fn decode_ifaddr(node: &libc::ifaddrs) -> IfAddrEntry {
         ifu,
     }
 }
-/// The byte count [`sockaddr_bufsz_need`] would report for an [`IfAddrEntry`]'s address, derived
-/// from the encoded body: the C asks whether the link-layer address is longer than three bytes
-/// before emitting a `HWADDR` record (`inet_drv.c:6769`).
+/// The byte count the C's `sockaddr_bufsz_need` (`inet_drv.c:5419`) would report for an
+/// [`IfAddrEntry`]'s address, derived from the encoded body: the C asks whether the link-layer
+/// address is longer than three bytes before emitting a `HWADDR` record (`inet_drv.c:6769`).
 pub(super) fn entry_addr_need(entry: &IfAddrEntry) -> usize {
     entry.addr.len()
 }
 /// Whether `addr` re-encodes as a hardware address of the shape `INET_REQ_GETIFADDRS` emits.
 ///
 /// Split out so the caller never has to reconstruct a `sockaddr` just to ask
-/// [`sockaddr_bufsz_need`] a question the family already answers.
+/// [`entry_addr_need`] a question the family already answers.
 pub(super) fn is_link_layer(family: libc::c_int) -> bool {
     family == libc::AF_PACKET
 }

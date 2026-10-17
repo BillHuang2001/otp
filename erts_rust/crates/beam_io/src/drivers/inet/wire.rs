@@ -22,9 +22,9 @@
 //!
 //! The byte-level vocabulary the `tcp_inet` driver speaks to the Erlang side: the control
 //! codes and result tags the C driver uses (`INET_REP_*`, `INET_AF_*`, `INET_TYPE_*`,
-//! `INET_PROTO_*`, `TCP_SHUT_*`), the C's `ctl_reply` shapes, the packed-address codec
-//! (`inet_set_faddress`/`inet_set_address`) and the lowercase-errno renderer
-//! (`erl_errno_id`).
+//! `INET_PROTO_*`, `TCP_SHUT_*`), the interface option records (`INET_IFOPT_*`/`INET_IFF_*`), the
+//! C's `ctl_reply` shapes, the packed-address codec (`inet_set_faddress`/`inet_set_address`) and
+//! the lowercase-errno renderer (`erl_errno_id`).
 //!
 //! This is a **private** detail of the [`super`] module: every name the crate exposes at
 //! `crate::drivers::inet::*` is re-exported there, so this split is invisible to callers.
@@ -37,6 +37,7 @@ use beam_common::Result;
 
 use crate::error;
 
+use super::opcode::Opcode;
 use super::sys;
 
 /// The result tag of a successful control operation (`INET_REP_OK`, `inet_drv.c:870`).
@@ -53,6 +54,52 @@ pub const INET_AF_INET: u8 = 1;
 pub const INET_AF_INET6: u8 = 2;
 /// The address tag of `INADDR_ANY` (`INET_AF_ANY`, `inet_drv.c:759`).
 pub const INET_AF_ANY: u8 = 3;
+
+/// The `ADDR` option record of an `INET_REQ_IFGET`/`IFSET` operand or reply (`INET_IFOPT_ADDR`,
+/// `inet_drv.c:952`).
+pub(super) const INET_IFOPT_ADDR: u8 = 1;
+
+/// The `BROADADDR` interface option record (`INET_IFOPT_BROADADDR`, `inet_drv.c:953`).
+pub(super) const INET_IFOPT_BROADADDR: u8 = 2;
+
+/// The `DSTADDR` interface option record (`INET_IFOPT_DSTADDR`, `inet_drv.c:954`).
+pub(super) const INET_IFOPT_DSTADDR: u8 = 3;
+
+/// The `MTU` interface option record (`INET_IFOPT_MTU`, `inet_drv.c:955`) — a big-endian 32-bit
+/// value in an `IFGET` reply and a bare four-byte value in an `IFSET` operand.
+pub(super) const INET_IFOPT_MTU: u8 = 4;
+
+/// The `NETMASK` interface option record (`INET_IFOPT_NETMASK`, `inet_drv.c:956`).
+pub(super) const INET_IFOPT_NETMASK: u8 = 5;
+
+/// The `FLAGS` interface option record (`INET_IFOPT_FLAGS`, `inet_drv.c:957`) — always a
+/// big-endian 32-bit [`INET_IFF_*`](INET_IFF_UP) bit set, in both an `IFGET` reply and an `IFSET`
+/// operand.
+pub(super) const INET_IFOPT_FLAGS: u8 = 6;
+
+/// The `HWADDR` interface option record (`INET_IFOPT_HWADDR`, `inet_drv.c:958`) — in an `IFGET`
+/// reply a big-endian 16-bit length followed by that many hardware-address bytes, in an `IFSET`
+/// operand the same pair starting **after** the option byte.
+pub(super) const INET_IFOPT_HWADDR: u8 = 7;
+
+/// The driver's own `UP` flag bit (`INET_IFF_UP`, `inet_drv.c:973`).
+pub(super) const INET_IFF_UP: u32 = 0x0001;
+
+/// The driver's own `BROADCAST` flag bit (`INET_IFF_BROADCAST`, `inet_drv.c:974`).
+pub(super) const INET_IFF_BROADCAST: u32 = 0x0002;
+
+/// The driver's own `LOOPBACK` flag bit (`INET_IFF_LOOPBACK`, `inet_drv.c:975`).
+pub(super) const INET_IFF_LOOPBACK: u32 = 0x0004;
+
+/// The driver's own `POINTTOPOINT` flag bit (`INET_IFF_POINTTOPOINT`, `inet_drv.c:976`).
+pub(super) const INET_IFF_POINTTOPOINT: u32 = 0x0008;
+
+/// The driver's own `RUNNING` flag bit (`INET_IFF_RUNNING`, `inet_drv.c:977`), which the C
+/// **emulates** from the kernel's `IFF_UP`.
+pub(super) const INET_IFF_RUNNING: u32 = 0x0010;
+
+/// The driver's own `MULTICAST` flag bit (`INET_IFF_MULTICAST`, `inet_drv.c:978`).
+pub(super) const INET_IFF_MULTICAST: u32 = 0x0020;
 
 /// The address tag of `INADDR_LOOPBACK` (`INET_AF_LOOPBACK`, `inet_drv.c:760`).
 pub const INET_AF_LOOPBACK: u8 = 4;
@@ -554,4 +601,412 @@ pub(super) fn parse_fake_address(cached_family: u16, arg: &[u8]) -> FakeAddress 
         }
         _ => FakeAddress::Refuse("eafnosupport"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The interface requests: `FDOPEN`(13), `GETIFLIST`(21), `IFGET`(22), `IFSET`(23),
+// `GETIFADDRS`(25)
+// ---------------------------------------------------------------------------
+//
+// All five are **shared `inet_ctl` arms** (`inet_drv.c:11067`-`:11108`), so both socket drivers
+// reach the same builders here. Each builder returns the **reply** rather than an error: every
+// failure the C has in these arms is a `ctl_error`/`ctl_xerror` payload, never a raise.
+
+/// The C's `inet_ctl_fdopen` pre-adoption check (`inet_drv.c:5252`-`:5257`) — everything the
+/// `INET_REQ_FDOPEN`(13) arm does *before* it takes the descriptor over.
+///
+/// The operand has already passed the driver-specific length/family/type ladder, so
+/// `arg` is `[af, type, fd_be32]` (six bytes ⇒ `bound = 1`, `:5264`) or
+/// `[af, type, fd_be32, bound_be32]`. With `bound == 0` the C adopts the number **blind** — no
+/// syscall at all — which is why a garbage descriptor is `[1]` there (measured `[1]` for
+/// `<<1,2,0,0,0,9,0,0,0,0>>`). With a non-zero `bound` it runs `sock_name(s, …)` first
+/// (`⇒ ctl_error(sock_errno())`: `enotsock` for a descriptor that is not a socket, `ebadf` for a
+/// closed number) and only then compares the family (`⇒ ctl_error(EINVAL)`).
+///
+/// `Ok(())` is "the C would adopt"; `Err(reply)` is the refusal reply the arm must answer.
+///
+/// # The adoption itself
+///
+/// This floor does **not** adopt: `desc->prebound = 1` (`:5266`) makes the C leave a handed-over
+/// descriptor alone for the port's whole life, whereas [`crate::Port`]'s `stop`/`Drop` closes
+/// whatever the driver owns — so adopting would close a descriptor the caller still owns. The
+/// successful form is therefore the typed "not served" gap, not a fabricated `[1]`.
+pub(super) fn fdopen_precheck(arg: &[u8]) -> std::result::Result<(), Vec<u8>> {
+    const FIXED_LEN: usize = 6;
+    let (fd_at, bound) = match arg.len() {
+        // `if (len == 6) bound = 1; else bound = get_int32(buf+2+4);` (`:5264`-`:5265`).
+        FIXED_LEN => (&arg[2..], true),
+        10 => (&arg[2..FIXED_LEN], arg[6..10] != [0, 0, 0, 0]),
+        _ => return Err(ctl_xerror("einval")),
+    };
+    // `s = (SOCKET)get_int32(buf+2)` — the C's descriptor is a 32-bit big-endian number.
+    let [a, b, c, d] = [fd_at[0], fd_at[1], fd_at[2], fd_at[3]];
+    let fd = RawFd::from_be_bytes([a, b, c, d]);
+    if !bound {
+        return Ok(());
+    }
+    match sys::socket_family(fd) {
+        Err(err) => Err(ctl_error(err)),
+        // `if (name.sa.sa_family != domain) return ctl_error(EINVAL)`: both ladders above refuse
+        // every family tag but `INET_AF_INET`, so `domain` is always `AF_INET`.
+        Ok(family) if libc::c_int::from(family) != libc::AF_INET => Err(ctl_xerror("einval")),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// The C's `IFGET_FLAGS` (`inet_drv.c:5476`): the kernel's `IFF_*` bits reduced into the driver's
+/// own [`INET_IFF_*`](INET_IFF_UP) vocabulary, which is what an `IFGET`/`GETIFADDRS` record
+/// carries.
+///
+/// `IFF_RUNNING` has no `INET_IFF_*` bit of its own — the C **emulates** it from `IFF_UP`
+/// (`:5481`, "emulate running ?"), which is why a loopback interface reports `0x15`
+/// (`UP|LOOPBACK|RUNNING`, measured on this host).
+pub(super) fn ifget_flags(cflags: libc::c_int) -> u32 {
+    let mut flags = 0u32;
+    if cflags & libc::IFF_UP != 0 {
+        flags |= INET_IFF_UP | INET_IFF_RUNNING;
+    }
+    if cflags & libc::IFF_BROADCAST != 0 {
+        flags |= INET_IFF_BROADCAST;
+    }
+    if cflags & libc::IFF_LOOPBACK != 0 {
+        flags |= INET_IFF_LOOPBACK;
+    }
+    if cflags & libc::IFF_POINTOPOINT != 0 {
+        flags |= INET_IFF_POINTTOPOINT;
+    }
+    if cflags & libc::IFF_MULTICAST != 0 {
+        flags |= INET_IFF_MULTICAST;
+    }
+    flags
+}
+
+/// The reply of one of the four interface requests, whichever driver asked — the
+/// `INET_REQ_GETIFLIST`/`IFGET`/`IFSET`/`GETIFADDRS` arms of `inet_ctl` (`inet_drv.c:11067`,
+/// `:11078`, `:11089`, `:11100`).
+///
+/// Each of the four opens with `if (!IS_OPEN(desc)) return ctl_xerror(EXBADPORT)` — `socket` is
+/// the driver's descriptor, so `None` is that refusal (measured `[0]exbadport` for all four on a
+/// socket-less `udp_inet`/`tcp_inet` port). `op` is known by the caller to be one of the four; a
+/// different opcode answers the `inet_ctl` `default:` arm's `[0]exbadport`.
+pub(super) fn interface_reply(op: Opcode, socket: Option<RawFd>, arg: &[u8]) -> Vec<u8> {
+    let Some(fd) = socket else {
+        return ctl_xerror("exbadport");
+    };
+    match op {
+        Opcode::Getiflist => getiflist_reply(fd),
+        Opcode::Ifget => ifget_reply(fd, arg),
+        Opcode::Ifset => ifset_reply(arg),
+        Opcode::Getifaddrs => getifaddrs_reply(),
+        _ => ctl_xerror("exbadport"),
+    }
+}
+
+/// The `INET_REQ_GETIFLIST`(21) reply — `inet_ctl_getiflist` (`inet_drv.c:5671`).
+///
+/// `[1]` followed by every `AF_INET`/`AF_INET6` interface name in `SIOCGIFCONF` order, each
+/// NUL-terminated (`:5694`-`:5700`: `strncpy(sp, ifr_name, IFNAMSIZ); sp[IFNAMSIZ] = '\0';
+/// sp += strlen(sp), ++sp;`). Measured on this host as
+/// `[1] ++ "lo\0enp44s0\0wlp46s0f0\0nb-personal\0"` — an interface without an IPv4 address is
+/// absent, which is the kernel's `SIOCGIFCONF` answer and not a filter here.
+///
+/// A failing `SIOCGIFCONF` walk is `ctl_error(sock_errno())` (`:5682`), i.e. an `[0]`-tagged
+/// errno reply.
+pub(super) fn getiflist_reply(fd: RawFd) -> Vec<u8> {
+    match sys::ifconf_names(fd) {
+        Ok(names) => {
+            let mut reply = ctl_ok();
+            for name in names {
+                reply.extend_from_slice(&name);
+                reply.push(0);
+            }
+            reply
+        }
+        Err(err) => ctl_error(err),
+    }
+}
+
+/// The C's `sbuf[BUFSIZ]` reply buffer of `inet_ctl_ifget` (`inet_drv.c:5826`).
+///
+/// `BUFSIZ` is a libc **header** constant (8192 with glibc, 1024 with musl), not one the `libc`
+/// crate exposes on every target this crate builds for, so it is spelled here with the glibc value
+/// the oracle was measured against. A record that does not fit is the arm's `goto error`
+/// (`buf_check`, `:5470`) ⇒ the whole reply becomes `[0]einval`, previous records included.
+const IFGET_REPLY_CAP: usize = 8192;
+
+/// The `INET_REQ_IFGET`(22) reply — `inet_ctl_ifget` (`inet_drv.c:5821`).
+///
+/// The operand is `Name-Length(1) Name Option-Code(1)*`. The reply is `[1]` followed by one
+/// `[code][payload]` record per **served** option code, in operand order; a failing `SIOCGIF*`
+/// emits **no** record for `ADDR`/`BROADADDR`/`DSTADDR`/`NETMASK`/`MTU`/`HWADDR` (`break` out of
+/// the `switch`, `:5845`, `:5915`, …) but `FLAGS` still emits one, reporting `0` (`:5955`:
+/// `if (ioctl(SIOCGIFFLAGS) < 0) flags = 0; else flags = ifreq.ifr_flags;`). Measured on this host
+/// with the interface `nonexist0`: `<<9,"nonexist0",6>>` ⇒ `[1,6,0,0,0,0]`.
+///
+/// The name guard is the C's `if ((len == 0) || ((namlen = get_int8(buf)) > len)) goto error`
+/// (`:5831`), plus one determinisation: a name whose declared length **fills** the operand
+/// (`namlen == len`) makes the C's unsigned `len -= namlen+1` underflow and the `while (len--)`
+/// walk whatever memory follows the operand. The measured oracle answer for that operand
+/// (`<<1>>`) is `[0]einval`, and this floor answers that deterministically instead of reading past
+/// the operand.
+pub(super) fn ifget_reply(fd: RawFd, arg: &[u8]) -> Vec<u8> {
+    let Some((name, options)) = split_ifreq_operand(arg) else {
+        return ctl_xerror("einval");
+    };
+    let mut req = sys::IfReq::named(name);
+    let mut reply = ctl_ok();
+    for &option in options {
+        let record = match option {
+            INET_IFOPT_ADDR => option_record(fd, &mut req, sys::IfReqIo::Addr),
+            INET_IFOPT_BROADADDR => option_record(fd, &mut req, sys::IfReqIo::BroadAddr),
+            INET_IFOPT_DSTADDR => option_record(fd, &mut req, sys::IfReqIo::DstAddr),
+            INET_IFOPT_NETMASK => option_record(fd, &mut req, sys::IfReqIo::Netmask),
+            // `put_int32(n, sptr)` over the C's `int ifreq.ifr_mtu` (`:5952`).
+            INET_IFOPT_MTU => match sys::ifreq_ioctl(fd, &mut req, sys::IfReqIo::Mtu) {
+                Ok(()) => with_option(INET_IFOPT_MTU, &(req.mtu() as u32).to_be_bytes()),
+                Err(_) => None,
+            },
+            // `SIOCGIFHWADDR` writes `ifr_hwaddr.sa_data`, and the C copies `IFHWADDRLEN` raw bytes
+            // of it behind a big-endian length (`:5861`-`:5870`) — a fixed six, not the encoded
+            // length `sockaddr_to_buf` would produce for the same member.
+            INET_IFOPT_HWADDR => match sys::ifreq_ioctl(fd, &mut req, sys::IfReqIo::HwAddr) {
+                Ok(()) => {
+                    let mut payload = (sys::HWADDR_LEN as u16).to_be_bytes().to_vec();
+                    payload.extend_from_slice(&req.hwaddr());
+                    with_option(INET_IFOPT_HWADDR, &payload)
+                }
+                Err(_) => None,
+            },
+            // The one arm whose failure is still a record: `flags = 0` (`:5955`).
+            INET_IFOPT_FLAGS => {
+                let flags = match sys::ifreq_ioctl(fd, &mut req, sys::IfReqIo::Flags) {
+                    Ok(()) => req.flags(),
+                    Err(_) => 0,
+                };
+                with_option(INET_IFOPT_FLAGS, &ifget_flags(flags).to_be_bytes())
+            }
+            // The C's `default: goto error` (`:5975`).
+            _ => return ctl_xerror("einval"),
+        };
+        match record {
+            Some(record) if IFGET_REPLY_CAP.saturating_sub(reply.len()) >= record.len() => {
+                reply.extend_from_slice(&record)
+            }
+            // `buf_check` failed, or the syscall arm `break`ed without a record: only the first
+            // case is an error, and the C's `break` leaves the reply untouched.
+            Some(_) => return ctl_xerror("einval"),
+            None => {}
+        }
+    }
+    reply
+}
+
+/// One `[code][sockaddr]` record of an `IFGET` reply, or `None` when the ioctl failed.
+///
+/// Every address-shaped arm is `buf_check(sptr, s_end, 1); *sptr++ = code;` followed by
+/// `sockaddr_to_buf(&ifreq.ifr_<member>, sptr, s_end)` (`:5843`-`:5945`), so the payload is
+/// [`sys::SockAddr`]'s encoding — `[INET_AF_INET, a, b, c, d]`, `[INET_AF_INET6, 16 bytes]` or the
+/// big-endian length plus hardware bytes of a link-layer address. An address that encodes to
+/// nothing is the C's `P_ == ptr` ⇒ the option byte is backed out again.
+fn option_record(fd: RawFd, req: &mut sys::IfReq, which: sys::IfReqIo) -> Option<Vec<u8>> {
+    match sys::ifreq_ioctl(fd, req, which) {
+        Ok(()) => with_option(option_code(which), &req.addr().body),
+        Err(_) => None,
+    }
+}
+
+/// The option byte an [`sys::IfReqIo`] reports under (`INET_IFOPT_*`, `inet_drv.c:952`-`:958`).
+fn option_code(which: sys::IfReqIo) -> u8 {
+    match which {
+        sys::IfReqIo::Addr => INET_IFOPT_ADDR,
+        sys::IfReqIo::BroadAddr => INET_IFOPT_BROADADDR,
+        sys::IfReqIo::DstAddr => INET_IFOPT_DSTADDR,
+        sys::IfReqIo::Netmask => INET_IFOPT_NETMASK,
+        sys::IfReqIo::Mtu => INET_IFOPT_MTU,
+        sys::IfReqIo::Flags => INET_IFOPT_FLAGS,
+        sys::IfReqIo::HwAddr => INET_IFOPT_HWADDR,
+    }
+}
+
+/// `[code][payload]`, or `None` when the payload is empty (the C's backed-out option byte).
+fn with_option(code: u8, payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.is_empty() {
+        return None;
+    }
+    let mut record = Vec::with_capacity(1 + payload.len());
+    record.push(code);
+    record.extend_from_slice(payload);
+    Some(record)
+}
+
+/// The `INET_REQ_IFSET`(23) reply — `inet_ctl_ifset` (`inet_drv.c:6017`).
+///
+/// The operand is `Name-Length(1) Name Option(1)*` with each option's own value inline:
+/// `ADDR`/`BROADADDR`/`DSTADDR`/`NETMASK` take one `buf_to_sockaddr` record, `HWADDR` a big-endian
+/// 16-bit length plus that many bytes, `MTU` and `FLAGS` a bare big-endian 32-bit value. Anything
+/// truncated or unknown is the C's `goto error` ⇒ `[0]einval`; a fully parsed operand is `[1]`,
+/// **regardless of whether the interface exists** (measured `<<2,"lo",4,0,0,0,0>>` ⇒ `[1]`).
+///
+/// # The writes are not performed
+///
+/// The C issues one `SIOCSIFADDR`/`SIOCSIFBRDADDR`/`SIOCSIFDSTADDR`/`SIOCSIFNETMASK`/
+/// `SIOCSIFHWADDR`/`SIOCSIFMTU`/`SIOCSIFFLAGS` per option and **discards every result** (`(void)
+/// ioctl(…)`, `:6055`, `:6075`, `:6086`, `:6094`, `:6110`, `:6127`), so the reply cannot report a
+/// privileged failure and the oracle answers `[1]` for the same operands this floor does. What this
+/// floor does **not** do is the `(void)`-discarded write itself: an interface's address, netmask,
+/// broadcast/destination address, MTU, hardware address or flags are left exactly as they were, so
+/// a caller that expected the interface to change sees nothing change. Reproducing the writes
+/// needs no new seam — [`sys::ifreq_ioctl`] takes the `SIOCSIF*` request numbers — but a test that
+/// exercised them would mutate the host's own network configuration, so the parse-only form is
+/// what ships and the divergence is stated here rather than hidden.
+pub(super) fn ifset_reply(arg: &[u8]) -> Vec<u8> {
+    let options = match split_ifreq_operand(arg) {
+        Some((_, options)) => options,
+        // A name that overruns the operand is the C's explicit `namlen > len` ⇒ `goto error`; one
+        // that exactly fills it leaves `buf` past `b_end`, so the value loop runs zero times.
+        None if arg.is_empty() || usize::from(arg[0]) > arg.len() => return ctl_xerror("einval"),
+        None => &[],
+    };
+    let mut at = 0usize;
+    while at < options.len() {
+        let option = options[at];
+        at += 1;
+        match option {
+            INET_IFOPT_ADDR | INET_IFOPT_BROADADDR | INET_IFOPT_DSTADDR | INET_IFOPT_NETMASK => {
+                match buf_to_sockaddr(&options, at) {
+                    Some(next) => at = next,
+                    None => return ctl_xerror("einval"),
+                }
+            }
+            // `buf_check(buf, b_end, 2)` for the length, then `buf_check(buf, b_end, hwalen)`.
+            INET_IFOPT_HWADDR => match options.get(at..at + 2) {
+                Some([hi, lo]) => {
+                    let hwalen = usize::from(u16::from_be_bytes([*hi, *lo]));
+                    if options.len().saturating_sub(at + 2) < hwalen {
+                        return ctl_xerror("einval");
+                    }
+                    at += 2 + hwalen;
+                }
+                _ => return ctl_xerror("einval"),
+            },
+            // A bare four-byte value (`buf_check(buf, b_end, 4)`, `:6105`, `:6117`).
+            INET_IFOPT_MTU | INET_IFOPT_FLAGS => {
+                if options.len().saturating_sub(at) < 4 {
+                    return ctl_xerror("einval");
+                }
+                at += 4;
+            }
+            // The C's `default: goto error` (`:6134`).
+            _ => return ctl_xerror("einval"),
+        }
+    }
+    ctl_ok()
+}
+
+/// The C's `buf_to_sockaddr` (`inet_drv.c:5440`) over an `IFSET` operand: the offset just past the
+/// record that starts at `at`, or `None` for the C's `NULL` (an unknown family tag or a truncated
+/// record).
+fn buf_to_sockaddr(arg: &[u8], at: usize) -> Option<usize> {
+    let (&tag, rest) = arg.get(at..)?.split_first()?;
+    let consumed = match tag {
+        INET_AF_INET => 4,
+        INET_AF_INET6 => 16,
+        _ => return None,
+    };
+    if rest.len() < consumed {
+        return None;
+    }
+    Some(at + 1 + consumed)
+}
+
+/// Splits the `IFGET`/`IFSET` operand into its interface-name and option halves.
+///
+/// `None` when the declared name does not fit the operand (`namlen + 1 > len`, the C's `namlen >
+/// len` guard plus the `namlen == len` case the C underflows on); otherwise the name bytes
+/// (`at most IFNAMSIZ - 1`, `:5834`) and the option bytes that follow.
+fn split_ifreq_operand(arg: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (&namlen, rest) = arg.split_first()?;
+    let namlen = usize::from(namlen);
+    let name_end = namlen + 1;
+    if name_end > arg.len() {
+        return None;
+    }
+    Some((&rest[..namlen], &arg[name_end..]))
+}
+
+/// The `INET_REQ_GETIFADDRS`(25) reply — `inet_ctl_getifaddrs` (`inet_drv.c:6611`).
+///
+/// `[1]` followed by the `getifaddrs(3)` list in the libc's own order, one record stream per node:
+/// the name (latin-1 → UTF-8, `:6629`/`:6616`), a NUL, the `FLAGS` record, then — only when the
+/// node has an address — the `ADDR`/`NETMASK` records of an `AF_INET`/`AF_INET6` node or the
+/// `HWADDR` record of a link-layer node, and finally a NUL. So the interface name is what opens a
+/// record stream and the trailing NUL byte is what closes it, which is why an interface with one
+/// address per family appears three times on a dual-stack host (measured: the `AF_PACKET` pass
+/// first, then `AF_INET`, then `AF_INET6`).
+///
+/// A link-layer address is only reported when [`sys::entry_addr_need`] says the encoding is longer
+/// than three bytes (`:6769`, the C's `need > 3`), which is what makes a loopback `HWADDR` record
+/// appear at all (its six zero bytes) while skipping a two-byte one.
+///
+/// A failing `getifaddrs(3)` is `ctl_error(save_errno)` (`:6649`), an `[0]`-tagged errno reply.
+pub(super) fn getifaddrs_reply() -> Vec<u8> {
+    match sys::ifaddrs_entries() {
+        Ok(entries) => {
+            let mut reply = ctl_ok();
+            for entry in &entries {
+                reply.extend_from_slice(&latin1_to_utf8(&entry.name));
+                reply.push(0);
+                reply.push(INET_IFOPT_FLAGS);
+                reply.extend_from_slice(&ifget_flags(entry.flags as libc::c_int).to_be_bytes());
+                if entry.family != sys::NO_ADDRESS {
+                    if entry.family == libc::AF_INET || entry.family == libc::AF_INET6 {
+                        push_ifopt(&mut reply, INET_IFOPT_ADDR, &entry.addr);
+                        if let Some(netmask) = &entry.netmask {
+                            push_ifopt(&mut reply, INET_IFOPT_NETMASK, netmask);
+                        }
+                        // `ifa_dstaddr` and `ifa_broadaddr` are one union member, so which record
+                        // it becomes is decided by the node's flags (`:6703`-`:6710`); with
+                        // neither flag set the member is not reported at all.
+                        if let Some(ifu) = &entry.ifu {
+                            if entry.flags & libc::IFF_POINTOPOINT as u32 != 0 {
+                                push_ifopt(&mut reply, INET_IFOPT_DSTADDR, ifu);
+                            } else if entry.flags & libc::IFF_BROADCAST as u32 != 0 {
+                                push_ifopt(&mut reply, INET_IFOPT_BROADADDR, ifu);
+                            }
+                        }
+                    } else if sys::is_link_layer(entry.family) && sys::entry_addr_need(entry) > 3 {
+                        push_ifopt(&mut reply, INET_IFOPT_HWADDR, &entry.addr);
+                    }
+                }
+                reply.push(0);
+            }
+            reply
+        }
+        Err(err) => ctl_error(err),
+    }
+}
+
+/// `SOCKADDR_TO_BUF` (`inet_drv.c:6636`) — `[code][payload]`, or nothing when the address encodes
+/// to no bytes (the C's `if (P_ == buf_p) buf_p--`).
+fn push_ifopt(reply: &mut Vec<u8>, code: u8, payload: &[u8]) {
+    if payload.is_empty() {
+        return;
+    }
+    reply.push(code);
+    reply.extend_from_slice(payload);
+}
+
+/// The C's `utf8_encode` (`inet_drv.c:6617`): a latin-1 interface name widened to UTF-8, so a byte
+/// in `0x80..=0xFF` becomes two bytes and everything else is copied.
+fn latin1_to_utf8(name: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(name.len());
+    for &byte in name {
+        if byte & 0x80 == 0 {
+            encoded.push(byte);
+        } else {
+            encoded.push(0xc0 | (byte >> 6));
+            encoded.push(0x80 | (byte & 0x3f));
+        }
+    }
+    encoded
 }
