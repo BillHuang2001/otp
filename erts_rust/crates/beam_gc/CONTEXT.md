@@ -603,7 +603,10 @@ constructors only (no new error enum).
   and `grow_major` rebuilds a fresh region (fragmentation-free by monotone packing), even at the *current*
   capacity when a ceiling forbids growing; only a ceiling that cannot hold the live set in ANY layout reports
   the typed heap exhaustion, and still before any word is copied. `collect_minor`'s own public contract
-  reports the typed error rather than escalating — escalation is `collect`'s job.
+  reports the typed error rather than escalating — escalation is `collect`'s job. The public-route evidence
+  for the *placed-copy* rollback is `tests/immix_promotion_rollback.rs`; the packed-only corpus in
+  `immix_fragmentation.rs` refuses the **first** reservation, so its restore list is empty and its
+  byte-identity would equally hold for a no-op rollback.
 - **The C `high_water` single-block layout, per-object tenuring (`GEN_GCS`/`MAX_GEN_GCS`) and the
   `F_NEED_FULLSWEEP` flag protocol** — replaced by the simpler two-space young/mature scheme above.
 - **Dirty-scheduler escape for long collections** (`ERTS_POTENTIALLY_LONG_GC_HSIZE`).
