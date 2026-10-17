@@ -499,3 +499,271 @@ fn a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound() {
         "a successful copy-out rewinds the pool to its own mark"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The table-less (`-eval`) route's pooled BIF heap — counters first.
+//
+// The rewind above needs a running process to copy a container result onto. With no process
+// (`RuntimeContext::new`, i.e. `-eval`/`-s`/`-run`/the single-pass `run_*` entries) there is no
+// destination, so the pool was never rewound: the frontier marched through each region's fixed
+// capacity and every fresh page it crossed was touched for the first time. These helpers read
+// the pool's own state and the process's minor-page-fault counter, so the cost is *measured*
+// (never estimated) and the fix is pinned by a counter, not by a wall time.
+// ---------------------------------------------------------------------------------------
+
+/// Every pooled BIF-heap region as `(used, peak_used, capacity)` words, in pool order.
+fn pool_snapshot(rt: &crate::runtime::Runtime) -> Vec<(usize, usize, usize)> {
+    rt.bif_heaps
+        .iter()
+        .map(|heap| (heap.used(), heap.peak_used(), heap.capacity()))
+        .collect()
+}
+
+/// [`pool_snapshot`] in a whitespace-free wire form (`used/peak/capacity` per region, `;`-joined),
+/// so the child's single printed line can be split on spaces.
+fn compact_regions(rt: &crate::runtime::Runtime) -> String {
+    pool_snapshot(rt)
+        .iter()
+        .map(|(used, peak, capacity)| format!("{used}/{peak}/{capacity}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// The **cumulative high-water** of the pool: the words every region has ever handed out.
+///
+/// `peak_used` survives a [`beam_alloc::Heap::reset_to`] (it is a property of the live-word
+/// history, not of the current offset), so this is exactly "how many pool words have been
+/// first-touched", and it is deterministic — no timing, no counter that depends on the host.
+fn pool_words_touched(rt: &crate::runtime::Runtime) -> usize {
+    rt.bif_heaps.iter().map(|heap| heap.peak_used()).sum()
+}
+
+/// This process's minor-page-fault count (`/proc/self/stat` field 10), or `None` where the file
+/// does not exist (non-Linux).
+fn minflt() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // `comm` (field 2) is parenthesized and may itself contain spaces, so the tail is taken
+    // after the LAST `)`: it begins at field 3 (`state`), so minflt (field 10) is index 7.
+    let tail: Vec<&str> = text.get(text.rfind(')')? + 1..)?.split_whitespace().collect();
+    tail.get(7)?.parse().ok()
+}
+
+/// One measured row: `N` calls of `body`'s comprehension on the **table-less** route.
+struct Row {
+    /// Calls (= comprehension elements) in the row.
+    calls: usize,
+    /// Minor faults the whole child process took (`None` where `/proc/self/stat` is unavailable).
+    faults: Option<u64>,
+    /// The child's total wall time for the measured expression, in nanoseconds, divided by
+    /// `calls` — reported only as a **ratio** between two builds on the same host.
+    ns_per_call: f64,
+    /// The pool's cumulative high-water ([`pool_words_touched`]) in the child.
+    pool_words: usize,
+    /// The committed `eval_heap` words in the child.
+    store_words: usize,
+    /// `pool_snapshot` in the child.
+    regions: Vec<(usize, usize, usize)>,
+    /// The child's `/proc/loadavg` after the measured expression.
+    loadavg: String,
+}
+
+impl Row {
+    /// This row's minor faults per call (never a wall time).
+    fn faults_per_call(&self) -> Option<f64> {
+        self.faults.map(|faults| faults as f64 / self.calls as f64)
+    }
+}
+
+/// The workloads: `(label, body)` — the comprehension body the child evaluates `N` times.
+const POOL_WORKLOADS: [(&str, &str); 3] = [
+    // The control: an **immediate** result already rewinds the pool on every call.
+    ("immediate", "element(1, {I})"),
+    // A **container** result: the case the table-less route never rewound.
+    ("container", "list_to_tuple([I])"),
+    // A container result with a large temporary: the bulk shape, where the pool's marching
+    // dominates the call.
+    ("bulk", "list_to_tuple(lists:seq(1,20))"),
+];
+
+/// The env var that turns this test binary into a **single-row child**.
+const POOL_CHILD_ENV: &str = "BEAM_RT_EVAL_POOL_CHILD";
+
+/// `body:calls` → `(body, calls)`.
+fn parse_child_spec(spec: &str) -> (String, usize) {
+    let (body, calls) = spec.rsplit_once(':').expect("a `<body>:<calls>` spec");
+    (body.to_string(), calls.parse().expect("a decimal call count"))
+}
+
+/// The **child** half: one fresh process, one measured expression, one printed row.
+///
+/// A fresh OS process is what makes the fault count mean anything: a pooled region that a
+/// previous row already wrote is fully resident, so a same-process measurement would report the
+/// *carry-over* rather than the first-touch cost. Every page this child touches is cold.
+fn pool_child_row() -> String {
+    let spec = std::env::var(POOL_CHILD_ENV).expect("the child spec");
+    let (body, calls) = parse_child_spec(&spec);
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    // Warm-up: pre-faults the runtime's own one-time regions (boot, the code server, the
+    // evaluator's own first allocations) so the measured window is the workload's own cost.
+    rt.eval(&format!("[{body} || I <- lists:seq(1,64)]"))
+        .expect("the warm-up expression evaluates");
+    let expr = format!("[{body} || I <- lists:seq(1,{calls})]");
+    let before = minflt();
+    let started = std::time::Instant::now();
+    rt.eval(&expr).expect("the measured expression evaluates");
+    let elapsed = started.elapsed();
+    let after = minflt();
+    format!(
+        "calls={calls} faults={} ns={} pool_words={} store_words={} regions={} loadavg={}",
+        before
+            .zip(after)
+            .map(|(before, after)| (after - before).to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        elapsed.as_nanos(),
+        pool_words_touched(&rt),
+        rt.eval_heap.used(),
+        compact_regions(&rt),
+        std::fs::read_to_string("/proc/loadavg")
+            .map(|load| load.trim().replace(' ', "|"))
+            .unwrap_or_else(|_| "unavailable".to_string()),
+    )
+}
+
+/// Runs the child for `(body, calls)` and parses its row.
+fn run_pool_child(body: &str, calls: usize) -> Row {
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "context::calls::tests::eval_route_pool_costs",
+        ])
+        .env(POOL_CHILD_ENV, format!("{body}:{calls}"))
+        .output()
+        .expect("the child test process runs");
+    assert!(
+        output.status.success(),
+        "the child row failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The harness prints the test header and the row on the same line (`test … ... calls=…`),
+    // so the row is located by its first key rather than by a line start.
+    let line = stdout
+        .lines()
+        .find_map(|line| line.find("calls=").map(|at| &line[at..]))
+        .unwrap_or_else(|| panic!("the child printed no row:\n{stdout}"));
+    let mut row = Row {
+        calls,
+        faults: None,
+        ns_per_call: 0.0,
+        pool_words: 0,
+        store_words: 0,
+        regions: Vec::new(),
+        loadavg: String::new(),
+    };
+    for field in line.split_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "faults" => row.faults = value.parse().ok(),
+            "ns" => {
+                let total: f64 = value.parse().expect("a decimal nanosecond count");
+                row.ns_per_call = total / calls as f64;
+            }
+            "pool_words" => row.pool_words = value.parse().expect("a decimal word count"),
+            "store_words" => row.store_words = value.parse().expect("a decimal word count"),
+            "regions" => {
+                row.regions = value
+                    .split(';')
+                    .filter(|region| !region.is_empty())
+                    .map(|region| {
+                        let mut words = region.split('/').map(|word| {
+                            word.parse::<usize>().expect("a decimal word count")
+                        });
+                        (
+                            words.next().expect("used"),
+                            words.next().expect("peak"),
+                            words.next().expect("capacity"),
+                        )
+                    })
+                    .collect();
+            }
+            "loadavg" => row.loadavg = value.replace('|', " "),
+            _ => {}
+        }
+    }
+    row
+}
+
+/// Prints the measured rows as a table (measurement harness, not an assertion).
+fn report(label: &str, rows: &[Row]) {
+    for row in rows {
+        println!(
+            "[{label}] N={:<7} faults={:<7} faults/call={:<8} ns/call={:<9} pool_words={:<8} store_words={:<8} regions={:?} loadavg={}",
+            row.calls,
+            match row.faults {
+                Some(faults) => faults.to_string(),
+                None => "-".to_string(),
+            },
+            match row.faults_per_call() {
+                Some(ratio) => format!("{ratio:.5}"),
+                None => "-".to_string(),
+            },
+            format!("{:.1}", row.ns_per_call),
+            row.pool_words,
+            row.store_words,
+            row.regions,
+            row.loadavg,
+        );
+    }
+}
+
+/// **The measurement harness** for the table-less route's pooled BIF heap: minor faults per call,
+/// the pool's cumulative high-water and (as a *ratio* only) the per-call wall time, over three
+/// `N` so the per-call slope separates from the runtime's constant, for an immediate-result
+/// control and two container-result workloads.
+///
+/// Every row runs in a **fresh child process** (`--ignored --exact` on this very test with
+/// [`POOL_CHILD_ENV`] set), because a pooled region written by an earlier row is already
+/// resident and would hide the first-touch cost this harness exists to measure.
+///
+/// ```text
+/// taskset -c 3 erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt \
+///     --lib eval_route_pool_costs -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "measurement harness (fresh child process per row, reads /proc/self/stat)"]
+fn eval_route_pool_costs() {
+    if std::env::var(POOL_CHILD_ENV).is_ok() {
+        // Child: print one row and finish (the harness's unit of measurement).
+        println!("{}", pool_child_row());
+        return;
+    }
+    const NS: [usize; 3] = [25_000, 50_000, 100_000];
+    for (label, body) in POOL_WORKLOADS {
+        let rows: Vec<Row> = NS.iter().map(|n| run_pool_child(body, *n)).collect();
+        report(label, &rows);
+    }
+}
+
+#[test]
+#[ignore]
+fn pool_probe() {
+    for expr in [
+        "1+1",
+        "[element(1,{I}) || I <- lists:seq(1,10)]",
+        "[I || I <- lists:seq(1,10)]",
+        "[list_to_tuple([I]) || I <- lists:seq(1,10)]",
+        "list_to_tuple([1])",
+    ] {
+        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+            .expect("the default runtime");
+        let _ = rt.eval(expr).expect("probe evaluates");
+        println!("{expr} => pool={:?} eval_heap={} arena_avail={}", pool_snapshot(&rt), rt.eval_heap.used(), rt.arena_available());
+    }
+}

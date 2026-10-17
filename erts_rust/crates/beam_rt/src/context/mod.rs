@@ -45,6 +45,9 @@
 //! * [`calls`] — the registered-BIF call path ([`RuntimeContext::call_bif`]'s routing half, the
 //!   bridge selection and the NIF short-circuit) incl. the module's three dispatch routes and
 //!   the shared-atom-table/predicted-index-commit rationale.
+//! * [`pool`] — the **table-less** route's BIF-result store: a container result is copied onto
+//!   the runtime's long-lived `-eval` store so the pooled BIF heap can be rewound when no
+//!   scheduled process is running to re-home it.
 //! * [`send`] — the send/deliver family, the mailbox scan surface and the alias-aware send
 //!   destination.
 //! * [`apply`] — fun application ([`LocalFunTarget`], `local_fun_target`,
@@ -74,6 +77,7 @@ mod memory_hook;
 mod module_info;
 mod node_hash;
 mod persistent_term;
+mod pool;
 mod position;
 mod process_bridge;
 mod pump;

@@ -758,7 +758,7 @@ impl<'a> RuntimeContext<'a> {
                     // Nothing reachable lives on this heap, so no byte of it was handed out for
                     // anything that survives the call: rewinding disturbs nothing.
                     rewind = true;
-                } else if let Some(copied) = self.move_result_into_process_heap(term) {
+                } else if let Some(copied) = self.rehome_container_result(term) {
                     result = Ok(copied);
                     rewind = true;
                 }
@@ -823,6 +823,28 @@ impl<'a> RuntimeContext<'a> {
     fn result_is_foreign_container(term: Eterm) -> bool {
         (beam_term::prelude::is_boxed(term) || beam_term::prelude::is_list(term))
             && !beam_term::literal::is_literal(term)
+    }
+
+    /// Copies a container result off the pooled BIF heap onto a region that **outlives the call**,
+    /// returning the copy — or `None` when it cannot be re-homed, in which case the caller leaves
+    /// both the result and the pool exactly as they were.
+    ///
+    /// The destination depends on **who is running**:
+    ///
+    /// * a scheduled process → its own scanned young heap
+    ///   ([`Self::move_result_into_process_heap`]), so the copy is collectable;
+    /// * nothing (`RuntimeContext::new` — the `-eval` evaluator, `-s`/`-run` and the single-pass
+    ///   `run_*` entries) → the runtime's long-lived `-eval` store
+    ///   ([`Self::move_result_into_runtime_store`], the table-less arm in
+    ///   [`super::pool`]). Without that arm nothing rewinds the pool on this route, so its
+    ///   frontier marched through every region for the run's whole life and each fresh page it
+    ///   crossed was first-touched — a per-call page-fault tax that grew with the call count.
+    fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
+        if self.mailbox_table.is_some() {
+            self.move_result_into_process_heap(term)
+        } else {
+            self.move_result_into_runtime_store(term)
+        }
     }
 
     /// Moves a registered BIF's result `term` off the pooled BIF heap onto the running process's
@@ -1198,7 +1220,7 @@ impl RuntimeContext<'_> {
 /// (`clone_slot` is `None` ⇒ the copier's `bad_term`). That is why the adopted MSO list is
 /// provably empty on success — `push` can never re-slot a container whose on-heap `val` word would
 /// then name the wrong slot. See [`RuntimeContext::move_result_into_process_heap`].
-fn copy_result_fresh(
+pub(super) fn copy_result_fresh(
     heap: &mut Heap,
     store: &mut beam_message::OffHeapTable,
     term: Eterm,
@@ -1255,7 +1277,7 @@ fn copy_result_fresh(
 ///
 /// A refusal of any other class reports no room request at all; the returned `0` is the
 /// conservative answer, because the caller's floor raises it to a legal growth hint.
-fn copy_shortfall_words(error: &BeamError) -> usize {
+pub(super) fn copy_shortfall_words(error: &BeamError) -> usize {
     match error {
         BeamError::Alloc(failure) => failure.requested / core::mem::size_of::<Eterm>(),
         // Unreachable from [`RuntimeContext::move_result_into_process_heap`], which only reaches

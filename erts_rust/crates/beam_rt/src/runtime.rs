@@ -245,6 +245,16 @@ pub struct Runtime {
     /// runtime-lifetime store (Milestone 1 has no GC), so it can never free a payload a
     /// stabilized term still needs.
     pub(crate) eval_off_heap: beam_message::OffHeapTable,
+    /// The **retired** generations of [`Runtime::eval_heap`], kept alive by
+    /// [`Runtime::grow_eval_heap`].
+    ///
+    /// A [`beam_alloc::Heap`] never moves a term and has a fixed capacity, so handing a bigger
+    /// region to [`Runtime::eval_heap`] must leave the previous one alive — every word it handed
+    /// out stays valid and at its own address. That is the same **region replacement** the pooled
+    /// BIF heap ([`Runtime::bif_heaps`]) and the engine arena's own heap already use; the
+    /// difference is what it holds: only the terms the table-less route had to keep (a BIF's
+    /// container results and the evaluator's own bitstrings), never a call's temporaries.
+    pub(crate) eval_heap_retired: Vec<Heap>,
     /// The `ets:*` tables.
     ///
     /// Shared through an [`Rc`]`<`[`RefCell`]`>` so a BIF call can hold the registry for
@@ -889,6 +899,7 @@ impl Runtime {
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
             eval_off_heap: beam_message::OffHeapTable::new(),
+            eval_heap_retired: Vec::new(),
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
             ports,
@@ -1334,10 +1345,48 @@ impl Runtime {
     /// opened for the **runtime's own process** ([`Runtime::self_pid`]) — the pid every
     /// `-eval`/`run` path reads a stored term as. Latching is deliberately over-approximate: a
     /// spurious latch only ever costs the `O(live objects)` descent, never a wrong result.
-    fn note_escaped_store_roots(&mut self, term: Eterm) {
+    pub(crate) fn note_escaped_store_roots(&mut self, term: Eterm) {
         if beam_term::is_boxed(term) || beam_term::is_list(term) {
             self.note_foreign_reachable(self.self_pid);
         }
+    }
+
+    /// Reserves room for a `needed`-word copy in the long-lived `-eval`/single-pass store
+    /// ([`Runtime::eval_heap`]), replacing the region when it does not fit.
+    ///
+    /// # Why the store grows at all
+    ///
+    /// [`Runtime::eval_heap`] is a fixed-capacity [`beam_alloc::Heap`], and the table-less route's
+    /// BIF results are copied onto it so the pooled BIF heap can be rewound
+    /// ([`crate::context::RuntimeContext::move_result_into_runtime_store`]). Without a growth
+    /// step a single-pass run whose *copied* results pass the region's capacity would silently
+    /// lose that rewind (the copy is refused, so the pool is not rewound and the frontier marches
+    /// again). Growth keeps the frontier bounded for a long run.
+    ///
+    /// # Region replacement, never relocation
+    ///
+    /// The replaced region is moved to [`Runtime::eval_heap_retired`] — never freed and never
+    /// moved — so every word it handed out stays valid and at its own address; the fresh region is
+    /// the old capacity **doubled** ([`usize::saturating_mul`]) with `needed` as a floor, exactly
+    /// the policy [`crate::context::RuntimeContext::take_bif_frontier`] applies to the pooled BIF
+    /// heap. What this retains is strictly **less** than the pool retained before the rewind
+    /// existed: a call's result words are a subset of the words that call handed out of the pool,
+    /// so no new retention is introduced — the same words simply live in a region that is still
+    /// the allocation frontier.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the fresh region's allocation failure. The old region is replaced only **after**
+    /// the new one was allocated, so a failure leaves the store exactly as it was.
+    pub(crate) fn grow_eval_heap(&mut self, needed: usize) -> Result<()> {
+        if self.eval_heap.available() >= needed {
+            return Ok(());
+        }
+        let grown = self.eval_heap.capacity().saturating_mul(2).max(needed);
+        let fresh = Heap::new(grown)?;
+        let retired = core::mem::replace(&mut self.eval_heap, fresh);
+        self.eval_heap_retired.push(retired);
+        Ok(())
     }
 
     /// [`Runtime::stabilize_term`] for a term that may reference the **off-heap payloads** an
