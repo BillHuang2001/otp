@@ -18,9 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! Deterministic, dependency-free pin on the **transient allocation cost** of the
-//! `erlang:term_to_binary/1` / `erlang:binary_to_term/1` round trip in
-//! `src/binconv.rs`.
+//! Deterministic, dependency-free pin on the **transient allocation cost** of
+//! `src/binconv.rs`: the `erlang:term_to_binary/1` / `erlang:binary_to_term/1`
+//! round trip and the `erlang:list_to_binary/1` iolist encode.
 //!
 //! ## Why
 //!
@@ -72,7 +72,32 @@
 //! So the encode no longer copies the image (`plain_image`'s `body.len() + 1` vec is
 //! gone: 128 + 101 = 229 became 128, and 4102 + 4101 = 8203 became 4102), while the
 //! decode's single input copy stands and is *reported* rather than removed — see
-//! `bytes_arg`'s note in `src/binconv.rs` for why that copy cannot become a borrow.
+//! `bytes_arg`'s note in `src/binconv.rs` for why that copy is kept.
+//!
+//! ## The iolist encode (`list_to_binary/1`)
+//!
+//! `flatten_iolist` used to pay three transient costs on every call: a `vec![root]`
+//! work stack (plus one growth once it pushed a cons's tail and head), an `out: Vec<u8>`
+//! grown byte by byte from zero capacity (8, 16, 32, …), and a **temporary `Vec` per
+//! binary element** (`bits::bytes` copies the payload). It is now a validation
+//! pre-pass plus one write pass over a single `WalkStack` — `INLINE_WALK_FRAMES`
+//! (128) frames inline on the Rust stack, spilling to a `Vec` only for a deeply nested
+//! iolist — into **one** buffer reserved to the iolist's exact byte count, with each
+//! binary element copied straight into that buffer through the closure-scoped borrow
+//! `access::with_binary_bytes`:
+//!
+//! | workload | bytes | before (alloc/bytes) | after (alloc/bytes) |
+//! |---|---|---|---|
+//! | `flat` (a 64-element int list)             | 64  | 6 / 96    | **1 / 64**   |
+//! | `mixed` (ints + a 128 B binary + a sublist) | 133 | 6 / 420   | **1 / 133**  |
+//! | `deep` (200 nested one-element lists)       | 1   | 9 / 2056  | **7 / 1025** |
+//! | `empty` (`[]`)                              | 0   | 1 / 8     | **0 / 0**    |
+//!
+//! `deep` still pays the *spill* (its 200 levels exceed the 128 inline frames: the
+//! spill `Vec` grows 4 → 128 `Eterm`s, 1024 bytes over 6 events, once — the same stack
+//! serves both passes). `erlang:iolist_to_binary/1` is measured alongside as the
+//! **unchanged** sibling walk in `src/binary.rs` (6/96, 5/292, 9/2056, 1/8), so a
+//! regression there would be visible here.
 //!
 //! `std`-only: no new dependencies. The `beam_bifs` lib is `#![deny(unsafe_code)]`,
 //! but this file is its own crate root (the `#[global_allocator]` needs
@@ -86,7 +111,7 @@ use std::sync::Mutex;
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, LocalNode};
 use beam_process::ProcessId;
-use beam_term::{make_atom, Atom, AtomTable, Eterm, NIL};
+use beam_term::{make_atom, make_small, Atom, AtomTable, Eterm, NIL};
 
 // ---------------------------------------------------------------------------
 // The counting allocator (as in `tests/registry_hot_path.rs`)
@@ -534,4 +559,238 @@ fn the_local_option_still_costs_a_second_image_buffer_in_beam_codec() {
         local.allocations,
         local.bytes,
     );
+}
+
+// ---------------------------------------------------------------------------
+// The iolist encode: `erlang:list_to_binary/1` and `erlang:iolist_to_binary/1`
+// ---------------------------------------------------------------------------
+
+/// How many nested one-element lists the `deep` workload wraps around its single
+/// byte. Chosen to exceed `INLINE_WALK_FRAMES` (the fixed-size walk stack in
+/// `src/binconv.rs`) several times over, so the spilling fallback is exercised.
+const DEEP_NESTING: usize = 200;
+
+/// The payload of a `term_to_binary` image of a **binary** term — the inverse of
+/// [`binary_image`], used to read a built binary's bytes back out exactly.
+fn binary_payload(image: &[u8]) -> &[u8] {
+    assert_eq!(
+        &image[..2],
+        &[VERSION_MAGIC, BINARY_EXT],
+        "the workload result must encode as a plain binary"
+    );
+    let len = u32::from_be_bytes(image[2..6].try_into().expect("4 bytes")) as usize;
+    assert_eq!(image.len(), 6 + len, "the image length matches its BINARY_EXT header");
+    &image[6..]
+}
+
+/// The flat byte list `[1, 2, …, n]`, built on `heap`.
+fn flat_int_list(heap: &mut Heap, n: u8) -> Eterm {
+    let mut list = NIL;
+    for byte in (1..=n).rev() {
+        list = heap.cons(make_small(i64::from(byte)), list).expect("the flat list fits");
+    }
+    list
+}
+
+/// `depth` nested one-element lists around the byte `7`:
+/// `[[[…[7]…]]]` — the nesting ladder the walk's spilling fallback must survive.
+fn nested_singletons(heap: &mut Heap, depth: usize) -> Eterm {
+    let mut term = make_small(7);
+    for _ in 0..depth {
+        term = heap.cons(term, NIL).expect("the nested list fits");
+    }
+    term
+}
+
+/// The mixed iolist `[1, 2, <<payload/binary>>, [3, 4], 5]`: two loose bytes, one
+/// *binary* element (the per-element copy the accessor used to make), a nested list
+/// and one trailing byte.
+fn mixed_iolist(heap: &mut Heap, atoms: &mut AtomTable, payload: &[u8]) -> Eterm {
+    let binary = term_of(&binary_image(payload), heap, atoms);
+    let inner = heap.cons(make_small(4), NIL).expect("fits");
+    let nested = heap.cons(make_small(3), inner).expect("fits");
+    let mut list = heap.cons(make_small(5), NIL).expect("fits");
+    list = heap.cons(nested, list).expect("fits");
+    list = heap.cons(binary, list).expect("fits");
+    list = heap.cons(make_small(2), list).expect("fits");
+    heap.cons(make_small(1), list).expect("fits")
+}
+
+/// Calls `function/1` once and returns the **bytes** of the binary it built, read
+/// back through `beam_codec` — so the allocation measurements below are pinned to a
+/// call whose exact result is also checked.
+fn built_bytes(
+    reg: &BifRegistry,
+    function: &str,
+    atoms: &AtomTable,
+    dest: &mut Heap,
+    arg: Eterm,
+) -> Vec<u8> {
+    let pid = ProcessId::new(1, 0);
+    dest.reset();
+    let result = {
+        let mut ctx = BifContext::new(dest, atoms, pid);
+        reg.call("erlang", function, 1, &mut ctx, &[arg]).expect("the call succeeds")
+    };
+    let image = beam_codec::encode_term(result, atoms).expect("the result encodes");
+    binary_payload(&image).to_vec()
+}
+
+/// One iolist workload's evidence: the cost of each of the two BIFs over it.
+#[derive(Debug, Clone, Copy)]
+struct IolistCase {
+    /// The number of bytes the iolist denotes.
+    byte_len: usize,
+    /// `erlang:list_to_binary/1`.
+    list_to_binary: Measurement,
+    /// `erlang:iolist_to_binary/1` (the sibling walk in `src/binary.rs`).
+    iolist_to_binary: Measurement,
+}
+
+/// Checks `root` builds `expected` under **both** BIFs, then measures both.
+fn iolist_case(
+    reg: &BifRegistry,
+    atoms: &AtomTable,
+    dest: &mut Heap,
+    root: Eterm,
+    expected: &[u8],
+) -> IolistCase {
+    for function in ["list_to_binary", "iolist_to_binary"] {
+        assert_eq!(
+            built_bytes(reg, function, atoms, dest, root),
+            expected,
+            "{function}/1 must build exactly the iolist's bytes"
+        );
+    }
+    IolistCase {
+        byte_len: expected.len(),
+        list_to_binary: measure(reg, "list_to_binary", atoms, dest, root),
+        iolist_to_binary: measure(reg, "iolist_to_binary", atoms, dest, root),
+    }
+}
+
+/// The iolist encode's transient allocation cost: **one** buffer for the bytes,
+/// whatever the iolist's shape.
+#[test]
+fn the_iolist_encode_allocates_one_byte_buffer() {
+    let reg = default_registry();
+    let mut atoms = AtomTable::new();
+    atoms.seed(["true", "false", "ok", "nonode@nohost"]);
+    // The workload terms live on the *machine* heap (never reset); the BIF's
+    // destination term lives on `dest`, which is rewound between calls.
+    let mut terms = Heap::new(1 << 16).expect("machine heap");
+    let mut dest = Heap::new(1 << 16).expect("destination heap");
+
+    let flat = flat_int_list(&mut terms, 64);
+    let flat_expected: Vec<u8> = (1..=64u8).collect();
+
+    let payload: Vec<u8> = (0..128u32).map(|n| n as u8).collect();
+    let mixed = mixed_iolist(&mut terms, &mut atoms, &payload);
+    let mut mixed_expected = vec![1u8, 2];
+    mixed_expected.extend_from_slice(&payload);
+    mixed_expected.extend([3u8, 4, 5]);
+
+    let deep = nested_singletons(&mut terms, DEEP_NESTING);
+    let deep_expected = vec![7u8];
+
+    // `[]` — the degenerate iolist: no bytes, so not even a byte buffer.
+    let empty = iolist_case(&reg, &atoms, &mut dest, NIL, &[]);
+
+    let cases = [
+        ("flat", iolist_case(&reg, &atoms, &mut dest, flat, &flat_expected)),
+        ("mixed", iolist_case(&reg, &atoms, &mut dest, mixed, &mixed_expected)),
+        ("deep", iolist_case(&reg, &atoms, &mut dest, deep, &deep_expected)),
+        ("empty", empty),
+    ];
+    for (name, case) in cases {
+        eprintln!(
+            "{name} ({} B): list_to_binary {} alloc/{} B, iolist_to_binary {} alloc/{} B",
+            case.byte_len,
+            case.list_to_binary.allocations,
+            case.list_to_binary.bytes,
+            case.iolist_to_binary.allocations,
+            case.iolist_to_binary.bytes,
+        );
+    }
+
+    // ---- `list_to_binary/1`: exactly one allocation, the byte buffer -------
+    //
+    // Pre-fix `flatten_iolist` allocated the work stack (`vec![root]`, then one
+    // growth as it pushed a cons's tail and head), grew `out` byte by byte from zero
+    // capacity (8, 16, 32, …) and copied every *binary* element into a temporary
+    // `Vec` (`bits::bytes`) before appending it. The measured before/after:
+    //
+    // | workload | before (alloc/bytes) | after (alloc/bytes) |
+    // |---|---|---|
+    // | `flat`  (64 B)   | 6 / 96    | **1 / 64**  |
+    // | `mixed` (133 B)  | 6 / 420   | **1 / 133** |
+    // | `deep`  (1 B)    | 9 / 2056  | **7 / 1025** |
+    // | `empty` (0 B)    | 1 / 8     | **0 / 0**   |
+    //
+    // `flat`/`mixed` are the ideal: one `Vec::with_capacity(total)`, exactly the
+    // iolist's byte count (`mixed`'s 128-byte binary element is copied straight into
+    // it, so the pre-fix 420 bytes — the temporary copy plus `out`'s growth — are gone).
+    // `empty` needs no buffer at all, and the walk itself no longer allocates.
+    //
+    // `deep` additionally pays for the **spill**: its 200 nesting levels exceed
+    // `INLINE_WALK_FRAMES` (128), so the frames past that depth grow the spill `Vec`
+    // (4, 8, 16, …, 128 `Eterm`s = 1024 bytes over 6 events) — once, because the same
+    // `WalkStack` serves both passes. That is the spilling fallback's pinned cost, and
+    // it is inherent to walking an iolist of *unbounded* nesting depth iteratively
+    // (C's `erts_iolist_to_buf` recurses and would overflow the C stack).
+    for (name, case) in cases {
+        assert_eq!(
+            case.list_to_binary.allocations,
+            match name {
+                // The byte buffer, plus the spill's growth for the deep nest.
+                "deep" => 7,
+                "empty" => 0,
+                _ => 1,
+            },
+            "{name}: list_to_binary/1 must allocate {} times ({} bytes measured)",
+            match name {
+                "deep" => 7,
+                "empty" => 0,
+                _ => 1,
+            },
+            case.list_to_binary.bytes,
+        );
+    }
+    // The buffer is the exact byte count: no doubling, no spare capacity.
+    for (name, case) in cases {
+        if name == "deep" {
+            // The 1-byte buffer plus the spill's 1024 bytes.
+            assert_eq!(case.list_to_binary.bytes, 1 + 1024, "the deep nest's measured bytes");
+        } else {
+            assert_eq!(
+                case.list_to_binary.bytes, case.byte_len,
+                "{name}: the one allocation must be exactly the iolist's byte count"
+            );
+        }
+    }
+    // A *deep* iolist still builds its bytes correctly (checked in `iolist_case`), so
+    // the spilling fallback is not merely cheap but correct.
+
+    // ---- `iolist_to_binary/1` is the *sibling* walk, unchanged here ----------
+    //
+    // Its yard (`src/binary.rs::collect_byte_unit` + `BitBuf`) is a separate
+    // implementation, so this change does not touch it: measured identically before
+    // and after (6/96, 5/292, 9/2056, 1/8 for `flat`, `mixed`, `deep`, `empty`). The
+    // figures are pinned so that walk cannot silently *regress*, and the `mixed` row's
+    // 292 bytes show it already copies each binary element only once (through
+    // `beam_codec::term::bitstring_bytes`, a borrowed view). Adopting the same
+    // one-buffer shape there is a recorded follow-up, not part of this change.
+    for (name, case) in cases {
+        let (allocations, bytes) = match name {
+            "flat" => (6, 96),
+            "mixed" => (5, 292),
+            "deep" => (9, 2056),
+            _ => (1, 8),
+        };
+        assert_eq!(
+            (case.iolist_to_binary.allocations, case.iolist_to_binary.bytes),
+            (allocations, bytes),
+            "{name}: iolist_to_binary/1's measured cost (unchanged by this change)"
+        );
+    }
 }

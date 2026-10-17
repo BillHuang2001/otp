@@ -539,6 +539,64 @@ pub(crate) fn binary_bytes(term: Eterm) -> Result<Vec<u8>> {
     Ok(unsafe { core::slice::from_raw_parts(data, nbytes) }.to_vec())
 }
 
+/// Hands the bytes of a byte-aligned bitstring (a *binary*) to `body` **without
+/// copying them out of the term**.
+///
+/// This is the borrowing sibling of [`binary_bytes`]: it accepts exactly the same
+/// two frozen representations (an on-heap `ErlHeapBits` and an off-heap
+/// `[BinRef][ErlSubBits]` window) and rejects exactly the same arguments, but instead
+/// of copying the payload into a new `Vec` it lends a byte slice to `body`.
+///
+/// The slice's scope is a **closure** rather than a return value because a returned
+/// `&[u8]` is not expressible: an `Eterm` is a bare machine word that carries no
+/// lifetime (`beam_term::bitstring::bitstring_parts` is an `unsafe` raw-pointer API),
+/// and the payload may be an off-heap refc binary whose refcounted ownership the term
+/// does not express as a Rust lifetime (see `crate::binconv::bytes_arg`). Bounded by
+/// `body` the slice provably cannot outlive the term, and the caller copies it
+/// straight into its own destination — disjoint from term storage at every call site,
+/// so `body` may write while it reads (it must not, however, write into the very
+/// storage the slice borrows).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring; otherwise
+/// whatever `body` returns.
+pub(crate) fn with_binary_bytes<R>(
+    term: Eterm,
+    body: impl FnOnce(&[u8]) -> Result<R>,
+) -> Result<R> {
+    if !is_binary(term) {
+        return Err(BeamError::BadArg);
+    }
+    // SAFETY: [`is_binary`] confirmed `term` is a live, byte-aligned bitstring (heap
+    // or sub), so `bitstring_parts` reads only that term's own words and returns a
+    // base pointer into storage backing bits `offset_bits..offset_bits + size_bits`
+    // — kept alive by `term` for the whole of the borrow handed to `body`.
+    let (base, offset_bits, size_bits) = unsafe { beam_term::bitstring::bitstring_parts(term) };
+    let nbytes = size_bits / 8;
+    if offset_bits & 7 != 0 {
+        // A mid-byte window has no contiguous byte image: re-pack the bits MSB-first
+        // into a scratch buffer. This is the one case that allocates (a *plain*
+        // binary, which is every binary this crate builds, is always byte-aligned).
+        let packed = bitstring_bits(term)?;
+        return body(&packed);
+    }
+    if nbytes == 0 {
+        // No bytes to read — hand out an empty slice without touching `base`, which
+        // may be null or dangling for a zero-length window (`from_raw_parts` is UB for
+        // a zero-length slice built from such a pointer).
+        return body(&[]);
+    }
+    // SAFETY: `offset_bits` and `size_bits` are both multiples of 8 (`is_binary`), so
+    // bits `offset_bits..offset_bits + size_bits` are exactly the `nbytes > 0`
+    // initialised bytes at `base + offset_bits / 8`, all inside the live storage the
+    // base pointer covers. The slice never escapes `body`, which is called inside this
+    // block while `term` is still live; the length is in bytes, so it is
+    // endianness-agnostic.
+    let data = unsafe { base.add(offset_bits / 8) };
+    body(unsafe { core::slice::from_raw_parts(data, nbytes) })
+}
+
 /// Copies the bit data of **any** bitstring (heap or sub, byte-aligned or not) out
 /// of the term.
 ///
@@ -1197,6 +1255,63 @@ mod tests {
         let empty = refc_binary(&mut heap, &payload, 0, 0);
         assert!(is_binary(empty));
         assert_eq!(binary_bytes(empty).unwrap(), Vec::<u8>::new());
+    }
+
+    /// `with_binary_bytes` is `binary_bytes`' borrowing twin: the same
+    /// representations, the same `BadArg` rule, and byte-for-byte the same answer —
+    /// reached without a copy for every window that starts on a byte boundary.
+    #[test]
+    fn with_binary_bytes_lends_the_bytes_binary_bytes_copies() {
+        /// Runs `with_binary_bytes` and copies its slice out, so the borrow's value
+        /// can be compared with [`binary_bytes`]' owned form.
+        fn lent(term: Eterm) -> Result<Vec<u8>> {
+            with_binary_bytes(term, |bytes| Ok(bytes.to_vec()))
+        }
+
+        let mut heap = Heap::new(64).expect("test heap");
+
+        // An on-heap `ErlHeapBits` binary (the shape this crate builds).
+        let on_heap = make_heap_bitstring(&mut heap, b"hello world", 11 * 8).expect("fits");
+        assert_eq!(lent(on_heap).unwrap(), b"hello world".to_vec());
+        assert_eq!(lent(on_heap).unwrap(), binary_bytes(on_heap).unwrap());
+
+        // The off-heap `[BinRef][ErlSubBits]` pair, in each window shape.
+        let data = ramp(96);
+        let payload = RefcBinary::new(&data).expect("the off-heap payload allocates");
+        let whole = refc_binary(&mut heap, &payload, 0, data.len() * 8);
+        assert_eq!(lent(whole).unwrap(), data);
+        // A byte-aligned interior window starts at `offset_bits / 8`.
+        let inner = refc_binary(&mut heap, &payload, 64, 8 * 8);
+        assert_eq!(lent(inner).unwrap(), data[8..16].to_vec());
+        assert_eq!(lent(inner).unwrap(), binary_bytes(inner).unwrap());
+        // A mid-byte window has no contiguous image: it is re-packed (MSB-first) into
+        // a scratch buffer, and the answer still equals the copying form's.
+        let mid = refc_binary(&mut heap, &payload, 4, 8);
+        assert_eq!(lent(mid).unwrap(), vec![0x10]);
+        assert_eq!(lent(mid).unwrap(), binary_bytes(mid).unwrap());
+        // A zero-length window must not touch the base pointer, and lends `&[]`.
+        let empty = refc_binary(&mut heap, &payload, 0, 0);
+        assert_eq!(lent(empty).unwrap(), Vec::<u8>::new());
+        let mut saw_len = usize::MAX;
+        with_binary_bytes(empty, |bytes| {
+            saw_len = bytes.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(saw_len, 0, "an empty binary lends an empty slice");
+
+        // Anything that is not a byte-aligned binary is still `BadArg` — including a
+        // non-byte-aligned bitstring, exactly like the copying form.
+        let bits = make_heap_bitstring(&mut heap, &[0xFF; 2], 9).expect("fits");
+        let tuple = heap.tuple(&[make_small(1)]).expect("fits");
+        for term in [bits, tuple, make_small(7), NIL] {
+            assert!(matches!(with_binary_bytes(term, |_| Ok(())), Err(BeamError::BadArg)));
+            assert!(matches!(binary_bytes(term), Err(BeamError::BadArg)));
+        }
+
+        // `body`'s own error travels out unchanged (the accessor never invents one).
+        let escaped = with_binary_bytes(on_heap, |_| Err::<(), _>(BeamError::BadArity));
+        assert!(matches!(escaped, Err(BeamError::BadArity)));
     }
 
     #[test]
