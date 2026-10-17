@@ -867,15 +867,19 @@ fn a_wrapped_or_unassigned_numeric_command_is_exbadport() {
 /// raise whose reason names the request and the switch that owns it, never a fabricated reply.
 ///
 /// Each row below is the *one* state in which the C succeeds, i.e. the refusal-only arms
-/// (`gethostname`, `fdopen`, the name-service lookups, the `getifaddrs(3)` family, `ignorefd`,
-/// `tcp_sendfile`) have already answered their exact C refusal for every other operand/state and
-/// only their success path is missing.
+/// (`fdopen`, `ignorefd`, `tcp_sendfile`) have already answered their exact C refusal for every
+/// other operand/state and only their success path is missing.
 #[test]
 fn an_unserved_numeric_opcode_is_a_typed_gap() {
-    // The well-formed (`len == 6`) `fdopen` on a bare port.
+    // The `fdopen` form that reaches the C's **blind** adoption: a ten-byte operand whose
+    // `bound` word is zero makes `inet_ctl_fdopen` take the descriptor over with no syscall at
+    // all (`:5264`-`:5266`), which is the one state the refusal ladder cannot answer.
     let mut port = opened_port();
     let err = port
-        .try_control(&op(13), &[INET_AF_INET, INET_TYPE_STREAM, 0, 0, 0, 0])
+        .try_control(
+            &op(13),
+            &[INET_AF_INET, INET_TYPE_STREAM, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
         .expect_err("FDOPEN adopts a caller's descriptor, which the Driver seam cannot express");
     assert_eq!(reason_of(err), not_served_reason("fdopen", "inet_ctl"));
     // The name-service lookups are served, not gapped: an empty name/protocol pair is a lookup
@@ -890,20 +894,6 @@ fn an_unserved_numeric_opcode_is_a_typed_gap() {
         ctl_xerror("einval"),
         "GETSERVBYPORT of port 0"
     );
-
-    // The `getifaddrs(3)`-backed family on a **live** socket: only the `!IS_OPEN` refusal is exact,
-    // so the open state is where the interface walk would be needed.
-    for (code, name) in [
-        (21u32, "getiflist"),
-        (22, "ifget"),
-        (23, "ifset"),
-        (25, "getifaddrs"),
-    ] {
-        let err = port
-            .try_control(&op(code), &[])
-            .expect_err("an interface request needs a getifaddrs(3) walk");
-        assert_eq!(reason_of(err), not_served_reason(name, "inet_ctl"), "code {code}");
-    }
 
     // `ignorefd(28)` on a **connected** stream port: its reply means "suppress read *and* write
     // readiness", which a frozen `Driver` registration cannot express.

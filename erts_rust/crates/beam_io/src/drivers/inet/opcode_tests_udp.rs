@@ -324,7 +324,9 @@ fn a_wrapped_or_unassigned_numeric_command_on_the_datagram_port_is_exbadport() {
 /// The opcodes that stay **typed gaps** on this driver — a capability the C has and this floor
 /// does not, answered with a typed error rather than a fabricated reply.
 ///
-/// The one survivor is `INET_REQ_FDOPEN`(13) with a *well-formed* operand: adopting a caller's
+/// The one survivor is `INET_REQ_FDOPEN`(13) with the operand that reaches the C's **blind**
+/// adoption: a ten-byte form whose `bound` word is zero makes `inet_ctl_fdopen` take the
+/// descriptor over with no syscall at all (`inet_drv.c:5264`-`:5266`). Adopting a caller's
 /// descriptor number would mean taking ownership of an fd handed in from Erlang, which no
 /// `DriverFactory` ctor can express (and which the C deliberately never closes,
 /// `desc->prebound = 1`). Everything else in the `inet_ctl` arm is served: the name-service
@@ -336,8 +338,18 @@ fn a_wrapped_or_unassigned_numeric_command_on_the_datagram_port_is_exbadport() {
 #[test]
 fn the_surviving_numeric_opcodes_on_the_datagram_port_are_typed_gaps() {
     let mut port = opened_port();
-    assert_typed_gap(&mut port, 13, &[1, 2, 0, 0, 0, 1], "a well-formed INET_REQ_FDOPEN");
-    assert_typed_gap(&mut port, 13, &[1, 1, 0, 0, 0, 1], "a stream FDOPEN");
+    assert_typed_gap(
+        &mut port,
+        13,
+        &[1, 2, 0, 0, 0, 1, 0, 0, 0, 0],
+        "a well-formed INET_REQ_FDOPEN",
+    );
+    assert_typed_gap(
+        &mut port,
+        13,
+        &[1, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+        "a stream FDOPEN",
+    );
 
     // The name-service lookups are served (they are shared `inet_ctl` arms); a missing entry is
     // the C's `[0]einval`, never a typed gap.
