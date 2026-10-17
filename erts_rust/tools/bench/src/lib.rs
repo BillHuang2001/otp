@@ -60,6 +60,7 @@ pub mod cli;
 pub mod compare;
 pub mod error;
 pub mod http_load;
+pub mod marginal;
 pub mod metrics;
 pub mod proc;
 pub mod report;
