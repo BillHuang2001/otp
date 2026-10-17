@@ -32,10 +32,12 @@
 //! port for an accepted connection (`erts/emulator/drivers/common/inet_drv.c:1348`,
 //! `:11834`).
 //!
-//! Where the C decodes a magic-offset command integer plus a packed binary, this floor takes
-//! a **named** operation plus raw argument bytes in [`Driver::control`] (the runtime owns the
-//! Erlang term decoding, which is out of scope here). The verbs, and the C request each one
-//! mirrors, are:
+//! [`Driver::control`] serves **both** wire forms. The Erlang side sends an integer, which
+//! arrives as its decimal string: a decimal command is decoded as the C's `unsigned int` control
+//! opcode ([`self::opcode`] — the `0x03f1a300` magic subtracted with wrapping) and routed to the
+//! verb that code number's `case` selects; any non-decimal command is a **named** verb, this
+//! floor's own vocabulary for a direct caller. The *operand* is the C's packed request payload in
+//! both forms and is decoded here. The verbs, and the C request each one mirrors, are:
 //!
 //! | verb | C request | argument | reply |
 //! |---|---|---|---|

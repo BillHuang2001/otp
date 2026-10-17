@@ -37,10 +37,11 @@
 //! The driver registers under `"udp_inet"` — what the oracle's `port_info(Port, name)` reports
 //! for a `gen_udp:open/1` socket, and the C entry `udp_inet_driver_entry` (`:1406`).
 //!
-//! Where the C decodes a magic-offset command integer plus a packed binary, this floor takes a
-//! **named** operation plus raw argument bytes in [`Driver::control`] (the runtime owns the
-//! Erlang term decoding, which is out of scope here). The verbs, and the C request each one
-//! mirrors, are:
+//! [`Driver::control`] serves **both** wire forms: a decimal command is the C's `unsigned int`
+//! control opcode, decoded with wrapping offset subtraction ([`super::opcode`]) and routed to the
+//! verb its `case` selects; a non-decimal command is a **named** verb for a direct caller. The
+//! *operand* is the C's packed request payload in both forms and is decoded here. The verbs, and
+//! the C request each one mirrors, are:
 //!
 //! | verb | C request | argument | reply |
 //! |---|---|---|---|
