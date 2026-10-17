@@ -123,18 +123,26 @@ fn peak_heap_size(module: &str, n: i64) -> usize {
 ///
 /// * **the collections come from this door.** The fixture contains no `test_heap`/
 ///   `allocate_heap` at all, so with the door disabled the same runs measure **0** collections
-///   (measured; see the module docs). Any non-zero count is therefore the boundary door, and
-///   the count is exactly **3 per 1 000 loop iterations** — `collections * 1 000 == 3 * N` — at
-///   every N, because the interpreter charges the loop a fixed number of reductions per
-///   iteration and the door fires once per 4 000-reduction slice
-///   ([`crate::context::gc::REDS_BOUNDARY_MIN_REDS`]) whose nursery is occupied.
+///   (measured; see the module docs). Any non-zero count is therefore the boundary door, and a
+///   slice of this loop holds a **fixed** number of iterations, so the count is a constant rate
+///   per iteration at every N (and never a per-call work increase). The loop's per-iteration
+///   reduction price grew when the slice began **pricing** its `call_ext` resolutions, its
+///   `call`/`call_only` resolutions and its BIF dispatches (one unit each, in
+///   [`crate::runner::BudgetProbe::spend`], on top of the interpreter's per-instruction charge):
+///   measured **17.8–18.0 reds per iteration**, i.e. ~200–225 iterations per 4 000-reduction
+///   slice ([`crate::context::gc::REDS_BOUNDARY_MIN_REDS`]), against ~14 before that pricing.
+///   The band below is that measured rate, not a calibrated constant.
 /// * **`minor_gcs` follows the same relation minus the one fullsweep** the policy's
-///   `fullsweep_after` forces during the run (`collections - 1` at every N measured), which is
-///   what makes the `garbage_collection` item's counter move with real collections instead of
-///   sitting at the pre-fix `0`.
-/// * **`heap_size` is bounded**: the peak chain capacity is the collector's 233-word floor at
-///   **every** N (before the door: 3 074 841 / 29 485 327 / 264 963 824 words for
-///   N = 2 000 / 20 000 / 200 000).
+///   `fullsweep_after` forces during the run (`collections - 1` at every N measured, hence
+///   `(8, 88)` for the two rows below), which is what makes the `garbage_collection` item's
+///   counter move with real collections instead of sitting at the pre-fix `0`.
+/// * **`heap_size` is bounded**: the peak chain capacity **converges** — one young space
+///   ([`heap_size`] 610 words at every N measured, the collector's sizing of the live set the
+///   boundary window actually holds: with the loop priced more finely the door now fires with
+///   the in-flight 400-element list/tuple still live, where it used to fire after the iteration
+///   had abandoned it and settled on the 233-word floor). What the pin is *for* — flatness in N
+///   and a single retired space — is unchanged (before the door: 3 074 841 / 29 485 327 /
+///   264 963 824 words for N = 2 000 / 20 000 / 200 000).
 ///
 /// No collection may fail (`errors`, `halted`) and no run may park in a `receive`.
 #[test]
@@ -172,33 +180,36 @@ fn a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus
         r2.collections,
         "one boundary per pre-emption: {r2:?}"
     );
-    // The derived relation, exact at both N: 3 collections per 1 000 iterations, i.e. a
-    // constant offset from `3 * N / 1 000` — never a per-call work increase.
-    assert_eq!(
-        r1.collections * 1_000,
-        3 * n1 as u64,
-        "N={n1} must collect 3 times per 1 000 iterations: {r1:?}"
-    );
-    assert_eq!(
-        r2.collections * 1_000,
-        3 * n2 as u64,
-        "the relation must hold at N={n2} too — a constant rate, not a growing one: {r2:?}"
-    );
+    // The derived relation: a constant pre-emption rate per iteration (a slice holds a fixed
+    // number of iterations), so the boundary's count is linear in N with no per-call work
+    // increase. The rate is the loop's per-iteration reduction price over the slice's 4 000:
+    // measured 17.8 reds/iteration at N=20 000 (89 slices) and 18.0 at N=2 000 (9), against
+    // ~14 before the call/BIF seams were priced. Pinned as that measured band.
+    for (n, row) in [(n1, &r1), (n2, &r2)] {
+        let reds_per_iteration = row.collections * 4_000 / n as u64;
+        assert!(
+            (17..=20).contains(&reds_per_iteration),
+            "N={n} must collect once per 4 000-reduction slice over a ~17.8-reds iteration \
+             (17..=20 reds/iteration), got {reds_per_iteration}: {row:?}"
+        );
+    }
     assert!(r2.collections > r1.collections, "more iterations ⇒ more collections: {r2:?}");
     // `minor_gcs` is the minors since the last fullsweep, so it is the collection count minus
     // the one fullsweep the policy's `fullsweep_after` forces during each run.
     let minor = |r: &super::GrowthCounters| r.collections - r.major;
     assert_eq!(
         (minor(&r1), minor(&r2)),
-        (5, 59),
+        (8, 88),
         "the garbage_collection item's counter must move with the collections: {r1:?} {r2:?}"
     );
     // The point of the door: a flat `heap_size` instead of a linear climb with N (the pre-door
-    // figures are 3 074 841 and 29 485 327 words — ≈ 1 300 retained words per iteration).
-    assert_eq!(heap1, 233, "the nursery chain must collapse to the floor: N={n1}");
+    // figures are 3 074 841 and 29 485 327 words — ≈ 1 300 retained words per iteration). The
+    // converged capacity is 610 words at this cadence (see the doc comment), and it is the same
+    // at both N — flatness, not the absolute floor, is the property.
+    assert_eq!(heap1, 610, "the nursery must converge, not climb: N={n1}");
     assert_eq!(
         (heap2, r1.peak_young_spaces, r2.peak_young_spaces),
-        (233, 1, 1),
+        (610, 1, 1),
         "heap_size must NOT climb with N, and the chain must stay one space: N={n2}"
     );
 }
