@@ -55,7 +55,7 @@
 //! | row | what it measures |
 //! |---|---|
 //! | `control` | the empty loop, for the marginal of every other row |
-//! | `bin_to_term A` | `erlang:binary_to_term/1` through `RuntimeContext::new` (**copy-out OFF**) |
+//! | `bin_to_term A` | `erlang:binary_to_term/1` through `RuntimeContext::new` (labelled **copy-out OFF**; the result is re-homed onto the `-eval` store) |
 //! | `bin_to_term B` | `erlang:binary_to_term/1` through `RuntimeContext::for_process` (**copy-out ON**) |
 //! | `term_to_bin A` / `B` | the encode direction, the same two shapes |
 //! | `codec decode` | `beam_codec::decode_term` alone, onto a rewound heap |
@@ -65,18 +65,20 @@
 //! | `copy_out wrap` | the full `copy_result_fresh` shape: fresh tables, the copy, the four adoption loops |
 //! | `structural eq` | `beam_term::eq` of the decoded map against the payload (the case's match) |
 //!
-//! **The A/B pair is a construction-level switch, not a flag.** `RuntimeContext::new` leaves
-//! `mailbox_table` as `None`, so `move_result_into_process_heap` returns at its first `?`
-//! (`calls.rs:900`) - no copy, **and** no pool rewind and no adoption loops. The `B - A` delta is
-//! therefore "copy-out + rewind + adoption"; the three `copy*` rows decompose it further, because
-//! they are the same copier called directly.
+//! **The A/B pair is a construction-level switch, not a flag: it selects the copy-out's
+//! DESTINATION.** `RuntimeContext::new` leaves `mailbox_table` as `None`, so the result is re-homed
+//! onto the runtime's long-lived `-eval` store (`move_result_into_runtime_store`); with a table it
+//! goes onto the process's own young heap (`move_result_into_process_heap`). Both pay the copy, the
+//! adoption loops **and** the pool rewind, so the `B - A` delta is the destination's own machinery,
+//! not a copy-out-on/off difference; the three `copy*` rows decompose the shared copier further,
+//! because they call it directly.
 //!
 //! # The guard: is the copy-out actually happening?
 //!
-//! The copy-out is only reachable from a context that has a process table, and its effect is
-//! *deterministic and observable*: after the copy, the process's young heap holds exactly
-//! `size_of_copy(decoded)` more used words. [`Harness::verify_copy_out`] resets the young heap,
-//! makes one call, and asserts the used-word delta **equals** the copier's own flat word count
+//! The copy-out's **process-heap arm** is only reachable from a context that has a process table,
+//! and its effect is *deterministic and observable*: after the copy, the process's young heap holds
+//! exactly `size_of_copy(decoded)` more used words. [`Harness::verify_copy_out`] resets the young
+//! heap, makes one call, and asserts the used-word delta **equals** the copier's own flat word count
 //! (and that two calls double it). A measurement taken on a path that does not copy out cannot
 //! pass that check, which is what makes the `A`/`B` attribution trustworthy. The same section
 //! reports how many `grow_nursery` retries a raw run pays (one retired nursery space per retry),
@@ -165,7 +167,8 @@ const TINY_IMAGE: [u8; 3] = [131, 97, 1];
 enum Row {
     /// The empty loop (the load-invariant baseline every marginal is taken over).
     Control,
-    /// `erlang:binary_to_term/1` on a table-less context: copy-out OFF.
+    /// `erlang:binary_to_term/1` on a table-less context: the printed `copy-out OFF` side of the A/B
+    /// pair, whose result is re-homed onto the runtime's `-eval` store.
     BinaryToTermNoCopy,
     /// `erlang:binary_to_term/1` on a process context: copy-out ON.
     BinaryToTermCopyOut,
@@ -519,10 +522,10 @@ fn time_ns<F: FnMut() -> usize>(n: u64, mut f: F) -> (f64, f64) {
 
 /// One timed row, split into halves so a **within-sample drift** is visible.
 ///
-/// The drift matters for exactly one reason: the copy-out-OFF shape never rewinds the pooled BIF
-/// heap, so each call writes fresh (never touched) anonymous memory and pays a page fault every
-/// ~7 calls. A row whose second half is markedly slower than its first is telling us its cost is
-/// dominated by memory first-touch rather than by the code under test.
+/// The drift matters for exactly one reason: a row whose destination region is still growing writes
+/// fresh (never touched) anonymous memory and pays a page fault every few calls. A row whose second
+/// half is markedly slower than its first is telling us its cost is dominated by memory first-touch
+/// rather than by the code under test.
 struct Timing {
     /// The whole run: nanoseconds per iteration.
     ns: f64,
@@ -531,9 +534,9 @@ struct Timing {
     /// The second half's nanoseconds per iteration.
     second: f64,
     /// Minor page faults the row took, per iteration (`/proc/self/stat` field 10). This is the
-    /// **deterministic** counter that says whether a row's cost is memory first-touch: the
-    /// copy-out-OFF shape never rewinds the pooled BIF heap, so every call writes never-touched
-    /// anonymous memory and faults every few calls.
+    /// **deterministic** counter that says whether a row's cost is memory first-touch: a call whose
+    /// destination region is still growing writes never-touched anonymous memory and faults every
+    /// few calls.
     faults_per_call: f64,
 }
 
@@ -1295,9 +1298,9 @@ fn print_rows(samples: &[Vec<Timing>]) {
 }
 
 /// Prints each row's **within-sample drift**: the minimum of the second halves over the minimum of
-/// the first halves. A ratio well above 1.0 means the row's cost grows as it runs - which, for a
-/// copy-out-OFF row, is the pooled BIF heap being written without a rewind (fresh anonymous memory
-/// every call, i.e. a page fault every few calls), not the code under test.
+/// the first halves. A ratio well above 1.0 means the row's cost grows as it runs - a destination
+/// region written for the first time (fresh anonymous memory every few calls, i.e. a page fault),
+/// not the code under test.
 fn print_drift(samples: &[Vec<Timing>]) {
     println!();
     println!(
