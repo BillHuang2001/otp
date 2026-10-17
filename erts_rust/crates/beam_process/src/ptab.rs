@@ -86,7 +86,9 @@ use beam_alloc::Heap;
 use beam_common::{AllocFailure, AllocKind, BeamError, Result};
 use beam_gc::HeapPolicy;
 use beam_message::{Fragments, HeapFragment, Message, OffHeapTable};
-use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
+use beam_term::prelude::{
+    atom_val, is_atom, is_boxed_term, is_immediate, is_list, is_literal, make_atom, Atom, Eterm,
+};
 use beam_term::size_object;
 
 use crate::error;
@@ -355,16 +357,38 @@ fn copy_reason_onto(
     }
 }
 
+/// Whether `term` may be stored in a `{tag, Tag}` side table: it must be **heap-independent**.
+///
+/// Two shapes qualify (see `monitor.rs`'s user-tag contract):
+///
+/// * an **immediate** — an atom, a small integer, a local pid/port, `nil` — which carries no
+///   pointer at all;
+/// * a term resident in a **literal area** — shared, frozen and never relocated, so the word
+///   stays valid for the life of the runtime.
+///
+/// Everything else (a boxed/list word on some process heap) is refused: the side table holds
+/// plain values the collector never scans, so such a word could not be relocated and would
+/// dangle after a collection.
+///
+/// [`is_literal`] is a plain `TAG_LITERAL_PTR` bit test, which its own doc restricts to
+/// BOXED/LIST words (an immediate's payload bits are unrelated to it), so it is guarded by the
+/// pointer-tag test — exactly the `is_boxed(x) || is_list(x)` guard the C's
+/// `erts_set_literal_tag` trailing rule uses.
+fn is_heap_independent(term: Eterm) -> bool {
+    is_immediate(term) || ((is_boxed_term(term) || is_list(term)) && is_literal(term))
+}
+
 /// Validates an `erlang:monitor/3` `{tag, Tag}` user tag.
 ///
-/// `None` (no option) and an **immediate** tag pass through unchanged; anything else — a term
-/// resident in a per-process heap, which a monitor record (a plain value the collector never
-/// scans) could not keep valid across a collection — is refused with the typed
-/// [`error::unsupported_tag`], so the caller never gets a dangling tag in a `{'DOWN', …}`.
+/// `None` (no option) and a **heap-independent** tag — an immediate, or a term resident in a
+/// literal area ([`is_heap_independent`]) — pass through unchanged. A term resident in a
+/// per-process heap is refused with the typed [`error::unsupported_tag`]: a monitor record is a
+/// plain value the collector never scans, so it could not keep such a word valid across a
+/// collection, and a later `{'DOWN', …}` would carry a dangling tag.
 fn check_tag(tag: Option<Eterm>) -> Result<Option<Eterm>> {
     match tag {
         None => Ok(None),
-        Some(term) if is_immediate(term) => Ok(Some(term)),
+        Some(term) if is_heap_independent(term) => Ok(Some(term)),
         Some(_) => Err(error::unsupported_tag()),
     }
 }
@@ -383,7 +407,7 @@ fn check_tag(tag: Option<Eterm>) -> Result<Option<Eterm>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MonitorOptions {
     /// The `{tag, Tag}` user tag that replaces the `'DOWN'` head atom (see `monitor.rs`'s
-    /// user-tag contract: it must be a heap-independent immediate).
+    /// user-tag contract: it must be heap-independent — an immediate or a literal-area term).
     pub tag: Option<Eterm>,
     /// The `{alias, Mode}` option: when `Some`, the monitor's own reference **doubles as an
     /// alias** for the watcher, so a message sent to it is delivered to the watcher and it
@@ -431,7 +455,8 @@ fn forget_alias(aliases: &mut HashMap<MonitorRef, AliasEntry>, reference: Monito
 ///
 /// Only a supplied tag is stored — an untagged monitor leaves no entry, so a lookup answering
 /// `None` means the default `'DOWN'` head atom (see `monitor.rs`'s user-tag contract). The
-/// stored term is a validated immediate.
+/// stored term has passed [`check_tag`], so it is heap-independent (an immediate or a
+/// literal-area term).
 fn remember_tag(tags: &mut HashMap<MonitorRef, Eterm>, reference: MonitorRef, tag: Option<Eterm>) {
     if let Some(tag) = tag {
         tags.insert(reference, tag);
@@ -501,8 +526,9 @@ pub struct ProcessTable {
     /// A tag cannot be a field of [`Monitor`]/[`MonitoredBy`]/[`PortWatch`] — those are built by
     /// struct literal from other crates, so their shape is fixed — and it is kept here instead,
     /// exactly like [`NamedTarget`] (see `monitor.rs`'s user-tag contract). An entry is created
-    /// only when a tag is supplied, holds a **heap-independent immediate** (so it is not a GC
-    /// root and never needs relocating), and is removed the moment its monitor dies —
+    /// only when a tag is supplied, holds a **heap-independent** term — an immediate or a
+    /// literal-area term (so it is not a GC root and never needs relocating) — and is removed the
+    /// moment its monitor dies —
     /// `demonitor`/`demonitor_flush`, the terminated target's watcher sweep, `demonitor_port` and
     /// `port_closed` — so it cannot leak.
     tags: HashMap<MonitorRef, Eterm>,
@@ -1098,14 +1124,14 @@ impl ProcessTable {
     /// [`ProcessTable::monitor`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
     /// eventual `{'DOWN', Ref, Kind, Target, Reason}` becomes `{Tag, Ref, Kind, Target, Reason}`.
     ///
-    /// `tag = None` reproduces [`ProcessTable::monitor`] byte-for-byte. A tag that is not a
-    /// heap-independent immediate (see `monitor.rs`'s user-tag contract) is refused with the
-    /// typed [`error::unsupported_tag`] rather than stored as a word a collection could
-    /// invalidate.
+    /// `tag = None` reproduces [`ProcessTable::monitor`] byte-for-byte. A tag that is not
+    /// heap-independent (an immediate or a literal-area term — see `monitor.rs`'s user-tag
+    /// contract) is refused with the typed [`error::unsupported_tag`] rather than stored as a
+    /// word a collection could invalidate.
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a non-immediate tag.
+    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a heap-resident tag.
     pub fn monitor_with_tag(
         &mut self,
         watcher: ProcessId,
@@ -1132,7 +1158,7 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a non-immediate tag.
+    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a heap-resident tag.
     pub fn monitor_with_options(
         &mut self,
         watcher: ProcessId,
@@ -1318,12 +1344,12 @@ impl ProcessTable {
 
     /// [`ProcessTable::monitor_named`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**.
     ///
-    /// `tag = None` reproduces [`ProcessTable::monitor_named`] byte-for-byte; a non-immediate
+    /// `tag = None` reproduces [`ProcessTable::monitor_named`] byte-for-byte; a heap-resident
     /// tag is the typed [`error::unsupported_tag`] (see `monitor.rs`'s user-tag contract).
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a non-immediate
+    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a heap-resident
     /// tag.
     pub fn monitor_named_with_tag(
         &mut self,
@@ -1344,7 +1370,7 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a non-immediate
+    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a heap-resident
     /// tag.
     pub fn monitor_named_with_options(
         &mut self,
@@ -1428,12 +1454,12 @@ impl ProcessTable {
     /// [`ProcessTable::monitor_port`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
     /// eventual `{'DOWN', Ref, port, Port, Reason}` becomes `{Tag, Ref, port, Port, Reason}`.
     ///
-    /// `tag = None` reproduces [`ProcessTable::monitor_port`] byte-for-byte; a non-immediate tag
+    /// `tag = None` reproduces [`ProcessTable::monitor_port`] byte-for-byte; a heap-resident tag
     /// is the typed [`error::unsupported_tag`] (see `monitor.rs`'s user-tag contract).
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a non-immediate
+    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a heap-resident
     /// tag.
     pub fn monitor_port_with_tag(
         &mut self,
@@ -1461,7 +1487,7 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a non-immediate tag
+    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a heap-resident tag
     /// and [`error::unsupported_port_monitor_alias`] for an `{alias, Mode}` option.
     pub fn monitor_port_with_options(
         &mut self,
@@ -1524,7 +1550,7 @@ impl ProcessTable {
     /// # Errors
     ///
     /// As [`ProcessTable::monitor_port_term`], plus [`error::unsupported_tag`] for a
-    /// non-immediate tag.
+    /// heap-resident tag.
     pub fn monitor_port_term_with_tag(
         &mut self,
         watcher: ProcessId,
@@ -3001,7 +3027,7 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_term`], plus [`error::unsupported_tag`] for a non-immediate
+    /// As [`ProcessTable::monitor_term`], plus [`error::unsupported_tag`] for a heap-resident
     /// tag and [`error::unsupported`] for a tag on a remote target.
     pub fn monitor_term_with_tag(
         &mut self,

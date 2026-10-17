@@ -66,7 +66,7 @@
 //! pid/port, `nil`) or a literal-area term. The side table holds only plain values — the
 //! crate's collector never scans it — so a term resident in a *per-process* heap could not
 //! be relocated and would dangle after a collection; a literal-area term, by contrast, is
-//! shared and never moves. A tag that is not an immediate is therefore rejected by the
+//! shared and never moves. A tag that is neither is therefore rejected by the
 //! `ptab.rs` entry points with a typed `unsupported`, so a caller never gets a wrong result.
 //!
 //! # Reference aliases (`erlang:alias/1`, `erlang:unalias/1`, `erlang:monitor/3` `{alias, Mode}`)

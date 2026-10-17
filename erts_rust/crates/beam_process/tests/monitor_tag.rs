@@ -30,12 +30,14 @@
 //! from other crates, so their shape is fixed (adding a field would break them). The tag is kept
 //! in a **side table on `ProcessTable`**, keyed by the monitor reference — exactly like the
 //! `{Name, node}` descriptor of a named monitor (see `monitor.rs` and `ptab.rs`, Design
-//! Decisions). A tag must be a heap-independent immediate (an atom, small integer, pid/port or
-//! `nil`); a term resident in a per-process heap cannot be stored safely, because the side table
-//! is not a collector rootset and a collection would relocate the word underneath it. A
-//! non-immediate tag is therefore refused with the typed `unsupported` rather than stored — a
-//! **documented deviation** from the oracle (which accepts any term), pinned by
-//! [`a_non_immediate_tag_is_a_typed_unsupported`].
+//! Decisions). A tag must be **heap-independent**: an immediate (an atom, small integer,
+//! pid/port or `nil`) or a term resident in a **literal area** (shared and never relocated). A
+//! term resident in a per-process heap cannot be stored safely, because the side table is not a
+//! collector rootset and a collection would relocate the word underneath it; such a tag is
+//! therefore refused with the typed `unsupported` rather than stored — a **documented deviation**
+//! from the oracle (which accepts any term), pinned by
+//! [`a_heap_resident_tag_is_a_typed_unsupported`]. A literal-area tag IS accepted and reaches the
+//! notification, pinned by [`a_literal_area_tag_is_accepted_end_to_end`].
 //!
 //! # Oracle protocol (the same text protocol as `tests/registry_monitors.rs`)
 //!
@@ -57,14 +59,19 @@ use beam_common::BeamError;
 use beam_process::prelude::*;
 use beam_term::compare;
 use beam_term::prelude::{
-    is_immediate, make_atom, make_small, tuple_element, tuple_size, Atom, AtomTable, Eterm,
+    is_immediate, is_list, is_literal, make_arityval, make_atom, make_list, make_small,
+    make_tuple, set_literal_tag, tuple_element, tuple_size, Atom, AtomTable, Eterm, LiteralArea,
+    NIL,
 };
 
 use common::expect_oracle;
 
-/// The one `unsupported:` reason naming a tag that is not a heap-independent immediate.
-const UNSUPPORTED_TAG: &str =
-    "unsupported: monitor/3: tag must be an immediately-representable term (atom/integer/pid/port)";
+/// The one `unsupported:` reason naming a tag that is neither an immediate nor a literal-area
+/// term (i.e. a term resident in a per-process heap).
+const UNSUPPORTED_TAG: &str = concat!(
+    "unsupported: monitor/3: tag must be an immediate (atom/integer/pid/port)",
+    " or a literal-area term (a heap-resident term cannot be stored)"
+);
 
 // The oracle driver (`ERL_TIMEOUT`, `erl_stdout`, `expect_oracle` and the stdout normalisation) is
 // shared with the crate's other `oracle_*` files; it lives in `tests/common/mod.rs` so the
@@ -595,11 +602,137 @@ fn a_tagged_monitor_of_a_closed_port_is_born_down_tagged() {
 }
 
 // ---------------------------------------------------------------------------
-// The capability gap: a non-immediate tag
+// Literal-area tags are accepted; heap-resident tags are still refused
 // ---------------------------------------------------------------------------
 
+/// Builds a genuine **literal-area** 1-tuple `{value}` inside `area` and returns its root word.
+///
+/// `area` is a real [`LiteralArea`] — a bump-allocated block outside every process heap, never
+/// reallocated — and the root word is tagged with `TAG_LITERAL_PTR` by the C's own walk
+/// ([`set_literal_tag`]), exactly as a loaded module's literal is. The caller must keep `area`
+/// alive for as long as the word is used.
+fn literal_tuple(area: &mut LiteralArea, value: Eterm) -> Eterm {
+    // SAFETY: two uninitialised words are requested and both are written immediately below,
+    // before anything is read.
+    let words = unsafe { area.alloc_words(2) }.expect("the literal area has room");
+    // SAFETY: `words[0..2]` were just handed out exclusively by `alloc_words` and both are
+    // written here — an arityval header followed by the single element — so nothing is read
+    // uninitialised, and the words live as long as `area`.
+    unsafe {
+        words.write(make_arityval(1));
+        words.add(1).write(value);
+    }
+    let mut term = make_tuple(words);
+    // SAFETY: `words` addresses the two live, initialised words just written inside `area`, and
+    // `&mut term` is a live, aligned, writable root word; the walk only ORs `TAG_LITERAL_PTR`
+    // into BOXED/LIST words, leaving the transparent arityval and the immediate element intact.
+    unsafe { set_literal_tag(&mut term, words, 2) };
+    term
+}
+
+/// Builds a genuine literal-area cons cell `[value | []]` inside `area` and returns its root
+/// word (the `TAG_PRIMARY_LIST` arm of the same rule).
+fn literal_cons(area: &mut LiteralArea, value: Eterm) -> Eterm {
+    // SAFETY: two uninitialised words are requested and both are written immediately below,
+    // before anything is read.
+    let words = unsafe { area.alloc_words(2) }.expect("the literal area has room");
+    // SAFETY: the two words were just handed out exclusively and are both written here (the CAR
+    // and the NIL CDR), and they live as long as `area`.
+    unsafe {
+        words.write(value);
+        words.add(1).write(NIL);
+    }
+    let mut term = make_list(words);
+    // SAFETY: `words` addresses the two live, initialised cons-cell words inside `area` and
+    // `&mut term` is a live, aligned, writable root word, so the walk may tag both.
+    unsafe { set_literal_tag(&mut term, words, 2) };
+    term
+}
+
 #[test]
-fn a_non_immediate_tag_is_a_typed_unsupported() {
+fn a_literal_area_tag_is_accepted_end_to_end() {
+    // No oracle expression exists for this case: a literal area is a *runtime-internal*
+    // representation (there is no Erlang source form for "this term lives in the frozen literal
+    // block"), and the oracle cannot distinguish it from the boxed `{a}` tag that
+    // `a_heap_resident_tag_is_a_typed_unsupported` already cross-checks. What matters here is the
+    // *storage* rule: a shared, never-relocated term is safe in the tag side table, so it must
+    // reach the notification instead of the typed refusal a per-process-heap term gets.
+    let mut f = Fixture::new();
+    let process = f.atom("process");
+    let normal = f.atom_term("normal");
+    let watcher = f.table.spawn_default().expect("a watcher process");
+
+    let mut area = LiteralArea::new(8);
+    let tag = literal_tuple(&mut area, make_small(1234));
+    assert!(
+        is_literal(tag),
+        "the fixture really is a literal-area term (`TAG_LITERAL_PTR` set)"
+    );
+    assert!(
+        !is_immediate(tag),
+        "and it is genuinely a boxed term, not an immediate"
+    );
+
+    let target = f.table.spawn_default().expect("a target process");
+    let reference = f
+        .table
+        .monitor_with_tag(watcher, target, MonitorKind::Process, Some(tag))
+        .expect("a literal-area tag is heap-independent and accepted");
+    f.table.terminate(target, normal).expect("the target is live");
+
+    let payload = f.sole_payload(watcher);
+    // SAFETY: the live DOWN tuple the table built on the watcher's heap; all five element slots
+    // are in bounds.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5, "a DOWN message is a 5-tuple");
+        assert_eq!(
+            tuple_element(payload, 0),
+            tag,
+            "the notification head is the literal-area tag, not the default `'DOWN'` atom"
+        );
+        assert!(
+            is_literal(tuple_element(payload, 0)),
+            "the head word carries the literal-area bit, so it is never relocated"
+        );
+        assert_eq!(
+            MonitorRef::from_eterm(tuple_element(payload, 1)).expect("element 1 is a reference"),
+            reference,
+            "the reference slot is unchanged by the tagged form"
+        );
+        assert_eq!(tuple_element(payload, 2), make_atom(process), "the kind slot");
+        assert_eq!(tuple_element(payload, 3), target.to_eterm(), "the target slot");
+        assert_eq!(tuple_element(payload, 4), normal, "the reason slot");
+    }
+    f.drain_one(watcher);
+
+    // A literal-area *list* tag takes the same route (the predicate's `LIST` arm: a cons cell is
+    // a `TAG_PRIMARY_LIST` word, which `is_boxed_term` does not match).
+    let list_tag = literal_cons(&mut area, make_small(7));
+    assert!(
+        is_list(list_tag) && is_literal(list_tag),
+        "a literal-area cons cell"
+    );
+
+    let target = f.table.spawn_default().expect("a second target");
+    f.table
+        .monitor_with_tag(watcher, target, MonitorKind::Process, Some(list_tag))
+        .expect("a literal-area list tag is accepted too");
+    f.table.terminate(target, normal).expect("the target is live");
+    let payload = f.sole_payload(watcher);
+    // SAFETY: the live DOWN tuple the table built on the watcher's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(
+            tuple_element(payload, 0),
+            list_tag,
+            "the head is the literal-area cons cell"
+        );
+        assert_eq!(tuple_element(payload, 4), normal);
+    }
+}
+
+#[test]
+fn a_heap_resident_tag_is_a_typed_unsupported() {
     // The oracle accepts ANY term as a tag ...
     let expr = r#"
         T = {a},
@@ -621,11 +754,15 @@ fn a_non_immediate_tag_is_a_typed_unsupported() {
     let mut f = Fixture::new();
     let watcher = f.table.spawn_default().expect("a watcher process");
 
-    // A boxed term on the watcher's own heap is the reproducer: it is not an immediate.
+    // A boxed term on the watcher's own heap is the reproducer: it is not an immediate *and* it
+    // is not a literal-area term, which is exactly the pair of shapes `check_tag` accepts.
     let boxed_tag = f.tuple_in(watcher, &[make_small(1)]);
     assert!(!is_immediate(boxed_tag));
+    assert!(
+        !is_literal(boxed_tag),
+        "a term on a process heap carries no literal-area bit — that is what makes it unsafe"
+    );
     let target = f.table.spawn_default().expect("a target process");
-
     assert_typed_unsupported(
         f.table
             .monitor_with_tag(watcher, target, MonitorKind::Process, Some(boxed_tag))

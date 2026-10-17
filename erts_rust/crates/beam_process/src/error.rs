@@ -34,8 +34,8 @@
 //! * pid/port number-space exhaustion ⇒ [`system_limit`] (`SystemLimit`),
 //! * a named **port** monitor (`erlang:monitor(port, Name)`, whose name the local
 //!   process-only registry cannot resolve) ⇒ [`named_port_monitor`],
-//! * an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is not a heap-independent immediate ⇒
-//!   [`unsupported_tag`],
+//! * an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is not heap-independent (neither an
+//!   immediate nor a literal-area term) ⇒ [`unsupported_tag`],
 //! * an `erlang:monitor/3` `{alias, Mode}` option on a **port** monitor (whose DOWN/reply cleanup
 //!   sites hold no port table) ⇒ [`unsupported_port_monitor_alias`],
 //! * a genuinely unimplemented capability ⇒ [`unsupported`] (a BEAM `error` raise), so a caller
@@ -135,14 +135,18 @@ pub(crate) fn unsupported_port_monitor_alias() -> BeamError {
     unsupported("monitor/3: {alias, Mode} on a port monitor (the DOWN and reply paths hold no port table)")
 }
 
-/// The typed diagnostic for an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is **not** a
-/// heap-independent immediate.
+/// The typed diagnostic for an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is **not**
+/// heap-independent.
 ///
 /// A monitor record is a **plain value** the collector never scans (see `monitor.rs`), so a tag
 /// term resident in a per-process heap could not be relocated and would dangle after a
-/// collection. Only an immediate (an atom, small integer, local pid/port, `nil`) — or a
-/// literal-area term — is safe; every other term is refused here rather than silently stored as
-/// a word that a later collection invalidates.
+/// collection. Two shapes are accepted: an **immediate** (an atom, small integer, local pid/port,
+/// `nil`) and a **literal-area** term (shared, frozen and never relocated). Only a *heap-resident*
+/// boxed/list term is refused here, rather than silently stored as a word that a later collection
+/// invalidates.
 pub(crate) fn unsupported_tag() -> BeamError {
-    unsupported("monitor/3: tag must be an immediately-representable term (atom/integer/pid/port)")
+    unsupported(concat!(
+        "monitor/3: tag must be an immediate (atom/integer/pid/port) or a literal-area term",
+        " (a heap-resident term cannot be stored)"
+    ))
 }

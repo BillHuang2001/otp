@@ -32,7 +32,7 @@
 //! The four producers that used a heap term — the `{Name, Node}` pair of a named monitor, and
 //! the heap-materialised external pid of a remote DOWN/EXIT — store an **immediate** now; the
 //! `{Name, Node}` pair and the external pid stay in the message **body**, exactly as the C keeps
-//! them. One test per producer, plus the collection-survival evidence:
+//! them. One test per producer — eight producer cases plus the collection-survival evidence:
 //!
 //! 1. [`a_named_monitor_down_reports_the_resolved_pid_as_from`] — the successful named monitor's
 //!    `from` is the resolved internal pid (`target.to_eterm()`), the body still carries
@@ -47,9 +47,18 @@
 //! 6. [`a_named_monitor_down_from_survives_a_collection`] — the DOWN is queued, the nursery is
 //!    filled **exactly** with unrooted garbage, the owning process collects, and `from` is still
 //!    the same immediate while the relocated payload still carries `{Name, Node}`.
+//! 7. [`a_noproc_monitor_down_reports_the_dead_target_pid_as_from`] — the bare-`noproc` DOWN of a
+//!    monitor on a non-live pid (`deliver_noproc_down`).
+//! 8. [`a_port_monitor_down_reports_the_port_as_from`] — the port-monitor DOWN
+//!    (`enqueue_port_down_message`).
+//! 9. [`a_port_link_exit_reports_the_port_as_from`] — the port link exit
+//!    (`enqueue_port_exit_message`).
 //!
 //! Pre-fix, tests 1, 3, 4, 5 and 6 fail: `from` was the boxed `{Name, Node}` tuple / external
 //! pid thing, so `is_immediate(from)` is false (and the returned term is not the pid/node atom).
+//! Tests 2 and 7-9 pin producers that were already correct but **unpinned** (the port and
+//! bare-`noproc` builders pass a port/pid immediate straight through), so they pass either way —
+//! they close a coverage gap in the crate docs' "one test per producer" claim.
 
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -284,6 +293,133 @@ fn a_remote_exit_reports_the_node_atom_as_from() -> Result<()> {
             rpid,
             "the body still carries the external pid link partner"
         );
+        assert_eq!(tuple_element(payload, 2), reason);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Producer 5: the bare-`noproc` DOWN of a monitor on a non-live pid
+// (`deliver_noproc_down`)
+// ---------------------------------------------------------------------------
+
+/// `monitor/2` on a pid that is already gone delivers `{'DOWN', Ref, process, DeadPid, noproc}`
+/// straight into the watcher's mailbox; its `from` is the **dead target's pid immediate**.
+///
+/// This producer was already correct (it passes its `target` word straight to
+/// `build_signal_message`), but it was unpinned — the crate docs claimed every `from` producer was
+/// covered here.
+#[test]
+fn a_noproc_monitor_down_reports_the_dead_target_pid_as_from() -> Result<()> {
+    let (mut table, mut names, _node) = fixture();
+    let down = names.intern("DOWN");
+    let process_atom = names.intern("process");
+    let noproc = names.intern("noproc");
+
+    let watcher = table.spawn_default()?;
+    // A pid that is no longer live: allocation hands the number back with a bumped serial, so
+    // the term is still a valid pid while `contains` is false.
+    let dead = {
+        let dying = table.spawn_default()?;
+        table.remove(dying);
+        dying
+    };
+    assert!(!table.contains(dead));
+
+    let reference = table.monitor(watcher, dead, MonitorKind::Process)?;
+
+    let (from, payload) = sole_message(&table, watcher);
+    assert!(
+        is_immediate(from),
+        "`from` must be an immediate (the C asserts is_immed(ERL_MESSAGE_FROM))"
+    );
+    assert_eq!(
+        from,
+        dead.to_eterm(),
+        "`from` is the dead target's pid immediate"
+    );
+    // SAFETY: `payload` is the live 5-tuple the table built on the watcher's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), make_atom(down));
+        assert_eq!(
+            MonitorRef::from_eterm(tuple_element(payload, 1))?,
+            reference,
+            "the reference slot still carries the monitor's reference"
+        );
+        assert_eq!(tuple_element(payload, 2), make_atom(process_atom));
+        assert_eq!(tuple_element(payload, 3), dead.to_eterm());
+        assert_eq!(tuple_element(payload, 4), make_atom(noproc));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Producers 6-7: the port signal builders (`enqueue_port_down_message`,
+// `enqueue_port_exit_message`)
+// ---------------------------------------------------------------------------
+
+/// The port-monitor DOWN `{'DOWN', Ref, port, Port, Reason}` — built by
+/// `ProcessTable::enqueue_port_down_message` on `port_closed` — carries the **port immediate** in
+/// `from`.
+#[test]
+fn a_port_monitor_down_reports_the_port_as_from() -> Result<()> {
+    let (mut table, mut names, _node) = fixture();
+    let down = names.intern("DOWN");
+    let port_atom = names.intern("port");
+
+    let watcher = table.spawn_default()?;
+    let owner = table.spawn_default()?;
+    let mut ports = PortTable::new();
+    let port = ports.alloc_owned(owner)?;
+    table.monitor_port(watcher, port, &mut ports)?;
+
+    let reason = make_small(17);
+    table.port_closed(&mut ports, port, reason)?;
+
+    let (from, payload) = sole_message(&table, watcher);
+    assert!(is_immediate(from), "`from` must be an immediate");
+    assert_eq!(from, port.to_eterm(), "`from` is the port immediate");
+    // SAFETY: `payload` is the live 5-tuple the table built on the watcher's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), make_atom(down));
+        assert_eq!(tuple_element(payload, 2), make_atom(port_atom));
+        assert_eq!(tuple_element(payload, 3), port.to_eterm());
+        assert_eq!(tuple_element(payload, 4), reason);
+    }
+    Ok(())
+}
+
+/// The port link exit `{'EXIT', Port, Reason}` — built by
+/// `ProcessTable::enqueue_port_exit_message` for a **trapping** linked process on `port_closed` —
+/// carries the **port immediate** in `from`.
+#[test]
+fn a_port_link_exit_reports_the_port_as_from() -> Result<()> {
+    let (mut table, mut names, _node) = fixture();
+    let exit = names.intern("EXIT");
+
+    let watcher = table.spawn_default()?;
+    let owner = table.spawn_default()?;
+    table
+        .get_mut(watcher)
+        .expect("the watcher is live")
+        .set_trap_exit(true);
+    let mut ports = PortTable::new();
+    let port = ports.alloc_owned(owner)?;
+    assert!(ports.link(port, watcher)?, "the link is new");
+
+    let reason = make_small(21);
+    table.port_closed(&mut ports, port, reason)?;
+
+    let (from, payload) = sole_message(&table, watcher);
+    assert!(is_immediate(from), "`from` must be an immediate");
+    assert_eq!(from, port.to_eterm(), "`from` is the port immediate");
+    // SAFETY: `payload` is the live 3-tuple the table built on the watcher's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), make_atom(exit));
+        assert_eq!(tuple_element(payload, 1), port.to_eterm());
         assert_eq!(tuple_element(payload, 2), reason);
     }
     Ok(())
