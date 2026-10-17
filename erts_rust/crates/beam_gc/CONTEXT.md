@@ -595,6 +595,21 @@ the section to read them in.
   `young().base()` changes and the replaced base joins the non-enumerable chain); a collapse keeps the base when
   the target capacity equals the current one (it only calls `reset`) and installs a new space only when the
   target differs.
+- **`young()` is the CURRENT space; every "nursery" figure in `HeapInfo` is CHAIN-SUMMED.** Neither `Collector` nor
+  `AnyCollector` exposes a chain-summed capacity getter: `young().capacity_words()` (public `HeapSpace`) is the
+  current space only, while `heap_size_words()`/`HeapInfo::heap_size` is `Nursery::capacity_words()`, the sum over
+  the chain (`src/collector.rs:471-473`). They agree only while `young_space_count() == 1` — between a collapse and
+  the next `grow_nursery`, never after a growth.
+- **`GcStats` *returned* by `collect()` is per-collection; `stats()` is lifetime-cumulative for all five fields.**
+  The "per-collection counters are reported for the most recent collection" wording at `src/stats.rs:25-27`
+  describes only the returned value: `words_copied`/`words_reclaimed`/`objects_copied` are `+=`-accumulated into
+  the collector's own `GcStats` (`src/collector.rs:207-210`, `:284-287`, `immix_collector.rs:531-538`), so
+  `stats()` sums the whole collector lifetime.
+- **No collection is ever self-triggered.** Nothing inside the crate calls `collect`/`collect_minor`/`collect_major`;
+  `should_collect` is occupancy-only and advisory, and `grow_nursery`/`Nursery::grow` never collect.
+  `ensure_capacity` is the only method that collects *unconditionally* (no occupancy test,
+  `src/collector.rs:321-334`), so a host that only grows leaves occupancy below capacity indefinitely and its
+  `stats()`/`minor_gcs()` frozen.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
