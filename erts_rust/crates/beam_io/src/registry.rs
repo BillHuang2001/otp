@@ -211,7 +211,11 @@ impl PortRegistry {
     ///
     /// Returns any error raised by a port's driver while the scheduled tasks run; the closes
     /// still pending at that point stay queued (they are reported, and their numbers retired, by
-    /// the next round) rather than being dropped.
+    /// the next round) rather than being dropped. The failing task is never retried — it was
+    /// popped from its port's task queue before it ran and is not re-queued, so a later round
+    /// neither re-runs it nor reports anything for it, and a refused write leaves the command's
+    /// bytes in the port's output queue (the contract [`PortRegistry::execute_port_tasks`] states
+    /// in full).
     pub fn handle_events(
         &mut self,
         poller: &mut Poller,
