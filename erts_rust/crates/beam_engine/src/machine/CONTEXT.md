@@ -19,6 +19,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
   binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine).
+  Also on `mod.rs`: **`Machine::register_count()`** — *this* machine's X-register file size
+  (`x[0..register_count())`, i.e. the bound `Machine::x` indexes into), which is what a caller that walks
+  the argument registers must stop at when the file was narrowed with `Machine::with_max_register`;
+  reporting the machine's own size rather than the `MAX_REGISTER` constant is what keeps such a walk inside
+  the slots that exist. And the class-atom state: `class_atoms: [Eterm; 3]` (indexed by
+  `exception_class_index`, `THE_NON_VALUE` = unresolved) plus the **per-run `class_atoms_live: bool` latch**
+  described under `catch.rs`.
 - `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`; `x_mut`/`fr_mut` as
   the single-view root-set accessors); `fr_mark()` — the **live leading FR-slot count** (the FR high-water
   mark, `0` ⇒ no live FR slot), the FR twin of the `x[0..live)` root-set bound, so a host can publish/scan
@@ -55,6 +62,18 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `Machine::pending_function_clause_args` and stores it as the live `Machine::raise_function_clause_args`
   (a raise that carries no such list clears it, so no later trace can inherit a stale one); it does the same
   for `Machine::pending_supplied_trace` -> `Machine::raise_supplied_trace`.
+  **The exception-class atoms and `namespace_atom`.** `Machine::ensure_class_atoms(ctx, module)` resolves every
+  still-unresolved `error`/`exit`/`throw` atom from the engine's live atom namespace and installs it with
+  `Machine::set_class_atom`; an atom already installed is never overwritten, and the per-run **`class_atoms_live`
+  latch** makes the whole body one `bool` test in steady state (it is cleared by `Machine::reset`, because the class
+  atoms belong to the run that is starting). `Machine::class_atom` then reports the typed
+  `unsupported("exceptions: no atom for the '<class>' exception class …")` for a class neither source can name —
+  never a substituted atom. The name resolution itself is the free function `namespace_atom(ctx, module, name)`:
+  `ctx.atoms(module)` (the host's live namespace seam) first, the running module's load-time snapshot as the
+  fallback, `None` when neither knows the name. C reads its `am_error`/`am_exit`/`am_throw` **globals**, and the
+  seam is the engine's equivalent: `beam_rt` answers with its ONE live shared table, while a host that does not
+  override `atoms` keeps the module snapshot (byte-identical to the pre-seam behaviour). The `atoms` borrow is
+  immutable and ends at the `Copy` `Atom` it yields, so a caller may make its next `&mut ctx` call right after.
   `raise_stacktrace(entry_module: Option<&Module>, func, pc, first_frame_args: Option<Eterm>) -> StackTrace`
   derives the symbolic `StackTrace` (raising function, then every live caller innermost first), giving
   `first_frame_args` to the **raising** frame only; `Machine::with_uncaught_frames(&mut self, err, entry_module, func, pc)`
@@ -123,9 +142,9 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   a raise landing in another context's live catch frame (pinned by `drive.rs`'s tests
   `a_cross_module_return_switches_the_machine_back_into_the_caller_context` and
   `a_raise_landing_in_a_callers_catch_frame_switches_into_the_callers_context`).
-- `reset` clears the register files, stacks, catch frames, contexts, the raise snapshot, the pending exception and
-  the trace gate, but **not** the `refc_binaries` arena; a resume (`resume_outcome`) resets nothing, so the
-  contexts and the raise snapshot both survive it.
+- `reset` clears the register files, stacks, catch frames, contexts, the raise snapshot, the pending exception, the
+  exception-class atoms + their `class_atoms_live` latch and the trace gate, but **not** the `refc_binaries` arena; a
+  resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot both survive it.
 
 ## See Also
 - `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction`, also the JIT deopt target).

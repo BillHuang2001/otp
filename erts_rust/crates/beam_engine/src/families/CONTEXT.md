@@ -17,6 +17,24 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 - All computation goes through `crate::context::ExecutionContext`; term construction via `crate::terms`.
   Families build no term layout of their own **except** `bitstrings/raw.rs` (see Duplication).
 
+## The exception-class-atom choke point (`dispatch`)
+`dispatch` installs the still-missing `error`/`exit`/`throw` class atoms through the engine's **live atom namespace**
+(`Machine::ensure_class_atoms(ctx, module)` → `namespace_atom`, i.e. `ctx.atoms(module)` with the running module's
+load-time snapshot as the fallback) **before** the routing `match` runs.
+- **Why here.** This is the single function **every** family-owned instruction passes through, on **both** tiers (the
+  interpreter's catch-all arm calls it and the native baseline tier's `jit_family` helper reaches the same call), so
+  it is the one place that covers all nine families' raises at once. A family body raises through
+  `Machine::throw`/`throw_error` without naming a class atom; without the resolution here, a landing whose class atom
+  the *running module's* table cannot name would select its catch frame and then abandon it with a typed
+  `unsupported` (C reads the class atoms from its `am_error`/`am_exit`/`am_throw` globals, so it can never be in that
+  state). Resolving in each family (or at each raise site) instead would duplicate the same lookup nine times and
+  still miss `bitstrings`/`records`' internal raises.
+- **Cost.** One `bool` test per instruction in steady state: the per-run `class_atoms_live` latch
+  (`../machine/CONTEXT.md`) short-circuits the body once per run, and an atom already installed is never overwritten.
+- **Honesty.** A class name that **neither** source can name stays unresolved, and the landing reports the typed
+  `unsupported("exceptions: no atom for the '<class>' exception class …")` — never a substituted atom index
+  (pinned by `mod.rs`'s `a_family_raise_lands_…` / `a_family_raise_whose_class_is_unnameable_…` pair).
+
 ## Routing Table (file → owned variants)
 - `tuples.rs` — `PutTuple2` / `GetTupleElement` / `SetTupleElement` / `SelectTupleArity`; `SetTupleElement` is the destructive in-place write (`tuple_val(Tuple)[1 + offset]`, `../terms/update.rs`), whose non-tuple/out-of-range target raises the read path's `{badmatch, Source}` and whose literal-area target is the typed `unsupported`.
 - `records/` (`mod.rs` + `raw.rs` + `tests/`) — `UpdateRecord`, `UpdateRecordId`, and the eight native-record variants (`IsAnyNativeRecord` … `UpdateRecordId`). `raw.rs` **forwards all** record layout to `beam_term::record`.

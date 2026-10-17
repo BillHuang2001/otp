@@ -26,6 +26,10 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
   (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families — `families::funs::apply_target`
   for an applied-target host BIF error, and `families::funs::call_fun` for the closure-apply fallback),
+  `raise_bif_error_with_head` (the same funnel with a synthesized callee head item) and the shared body `raise_error`;
+  all three take `ctx`, because the reason **and** class atoms a landing installs resolve through the engine's live
+  atom namespace (`../machine/catch.rs::namespace_atom` — `ctx.atoms(module)`, with the module snapshot as the
+  fallback), so a `badarg`/`error` the runtime interned after the module was loaded still lands in its handler.
   `dispatch_wide`; `STACK_ARGS = 2` (arities ≤ it marshal through a fixed stack array, larger ones through the
   reusable `args_scratch`).
 - `test.rs` — `Machine::eval_test` (all 25 `TestKind`s) + `eval_is_function2`/`eval_is_tagged_tuple`/`eval_test_arity`.
@@ -93,13 +97,21 @@ shared catch-aware `raise_bif_error`.
 - **The one `function_clause` raise has two entry points.** `raise_function_clause_with_args` (`dispatch.rs`,
   `pub(crate)`) is the definition — class `error`, the **bare atom** `function_clause` as the reason (the failed-clause
   reason: C's plain `FAIL(Fail)` sets no reason, so the `f,0` sentinel goes through `i_func_info_IaaI` →
-  `handle_error`), resolved **only** from the running module's atom table (a module without that atom stays the typed
-  `unsupported("<what>: no 'function_clause' atom in the module")`, never a substituted atom index). `what` names the
-  raising site (`"func_info"`/`"test"`/`"select_val"`/`"maps"`). It additionally builds the failed clause's **real call
-  argument list** — a proper list of the `argv` leading argument registers (`NIL` for a zero-arity call), read *after*
-  the rooted reservation because `x` is in the frozen root set — and parks it on the machine as the one-shot
-  `Machine::pending_function_clause_args` latch, which `Machine::throw_with_trace` promotes to the live
-  `Machine::raise_function_clause_args` state the cooked-trace builders consume.
+  `handle_error`). The reason atom **and** the `error` class atom resolve through the engine's live atom namespace
+  (`../machine/catch.rs::namespace_atom`: `ctx.atoms(module)` — the host's `atoms` seam — with the running module's
+  own table as the fallback), which is why every entry point takes `ctx`; that is the engine's equivalent of C's
+  `am_function_clause`/`am_error` globals. A name **neither** source knows stays the typed
+  `unsupported("<what>: no 'function_clause' atom in the module")`, never a substituted atom index; an `error` class
+  the namespace cannot name is simply left uninstalled, so the raise lands only where the class could be installed.
+  `what` names the raising site (`"func_info"`/`"test"`/`"select_val"`/`"maps"`). It additionally builds the failed
+  clause's **real call argument list** — a proper list of the `argv` leading argument registers (`NIL` for a
+  zero-arity call), read *after* the rooted reservation because `x` is in the frozen root set — and parks it on the
+  machine as the one-shot `Machine::pending_function_clause_args` latch, which `Machine::throw_with_trace` promotes to
+  the live `Machine::raise_function_clause_args` state the cooked-trace builders consume.
+  **`failed_clause_arglist` clamps `argv` to `Machine::register_count()`** — this machine's own register file, not the
+  `MAX_REGISTER` constant — so a machine narrowed with `Machine::with_max_register` can never read a slot that does not
+  exist, and every register read is fallible (an out-of-range slot is the typed `bad_register`, never a substituted
+  `NIL` in the argument list).
   **`raise_function_clause_no_fail`** (`pub(crate)`, re-exported as
   `crate::interpreter::raise_function_clause_no_fail`) is the **argument-free forwarder** to it (it passes no list, so
   the cooked item for the raising function falls back to its declared arity); the maps read path's absent-key `NO_FAIL`
@@ -115,8 +127,9 @@ shared catch-aware `raise_bif_error`.
 
 ## Typed-error inventory (interpreter core) — no fixable "oracle-succeeds but we bail" site
 Every typed error this core (and the `machine/` machinery it drives) can return is one of three classes; a real
-`erl`-compiled `.beam` never hits classes 1 or 2 as a *divergence* — class 1 is malformed-bytecode robustness and
-class 2 is a capability gap owned by another node.
+`erl`-compiled `.beam` never hits classes 1 or 2 as a *divergence* — class 1 is malformed-bytecode robustness, class 2
+is a capability gap owned by another node, and class 3 is the name-only refusal of a reason/class atom that no atom
+source can name.
 - **Class 1 — malformed/hand-built-bytecode robustness (NOT reachable from valid `.beam`, so never a divergence).**
   These mirror C's own `ASSERT`/unchecked invariants; C would move `E`/index and hit UB, this core returns a typed
   error instead.
@@ -145,28 +158,25 @@ class 2 is a capability gap owned by another node.
   - `call: import module atom` / `call: import function atom` (`mod.rs:422/425`): the module's load-time atom table
     cannot name the import's atom. Owner: `beam_rt` (the shared live atom namespace) / the loader.
   - `operand: literal` (`operand.rs:82/165`): the index is past the module's `LitT`. Owner: `beam_loader`/`beam_codec`.
-- **Class 3 — the one arguable FIXABLE-IN-NODE candidate: `function_clause`/class-atom resolution.**
-  `function_clause_raise` (`dispatch.rs:1305-1323`) resolves the `function_clause` reason atom (and installs the
-  `error` class atom, `:1318`) **only** from the running module's own atom table (`:1311`), and returns
-  `error::unsupported("<what>: no 'function_clause' atom in the module")` when absent; the class-atom twin
-  `class_atom` (`machine/catch.rs:259-269`) returns `exceptions: no atom for the '<class>' exception class …` when
-  absent.
-  C resolves these **globally** and unconditionally: `i_func_info_IaaI` sets `c_p->freason = EXC_FUNCTION_CLAUSE`
-  and `goto handle_error` with no module lookup (`emu/beam_emu.c:578-583`), the reason comes from the global
-  `error_atom[]` table (`beam_common.c:382-406`, `EXC_FUNCTION_CLAUSE` → `am_function_clause`), and the class atom
-  is `exception_tag[GET_EXC_CLASS(...)]` (`beam_common.c:544`).
-  An oracle probe confirmed a real module image (`fc.beam`, a failed head clause) has **no** `function_clause`
-  atom while `erl` still raises it — so the gap is real but **masked in production**: `beam_rt` seeds the shared
-  `CORE_ATOMS` prefix with `function_clause`/`error`/`exit`/`throw` (`beam_rt/src/boot.rs:127/161-163`), so the
-  module's post-load snapshot resolves it and `beam_rt` never observes this error.
-  A non-seeding host (`MinimalContext`, a bare embedder) can hit it; the sound in-node fix is a name-resolution
-  seam (a host-supplied global atom namespace), **not** a substituted index — the same shape as the already-adopted
-  `ExecutionContext::atom_name`/`atoms` seams. It is therefore a narrow, host-compensated item, not a divergence
-  through the shipped runtime.
+- **Class 3 — the exception reason/class atoms (resolved through the live atom namespace).**
+  `function_clause_raise` (`dispatch.rs`) resolves the `function_clause` reason atom and installs the `error` class
+  atom through `namespace_atom` (`ctx.atoms(module)` with the running module's own table as the fallback); the
+  landing twin is `Machine::ensure_class_atoms` + `Machine::class_atom` (`machine/catch.rs`).
+  C resolves these **globally**: `i_func_info_IaaI` sets `c_p->freason = EXC_FUNCTION_CLAUSE` and `goto handle_error`
+  with no module lookup (`emu/beam_emu.c:578-583`), the reason comes from the global `error_atom[]` table
+  (`beam_common.c:382-406`, `EXC_FUNCTION_CLAUSE` → `am_function_clause`), and the class atom is
+  `exception_tag[GET_EXC_CLASS(...)]` (`beam_common.c:544`). The `atoms` seam is the engine's equivalent of those
+  globals: `beam_rt` answers from its ONE live shared table (and seeds the `CORE_ATOMS` prefix with
+  `function_clause`/`error`/`exit`/`throw`, `beam_rt/src/boot.rs`), while a bare embedder gets the module snapshot
+  through the seam's default body.
+  The residual is name-only: a name **neither** the live namespace nor the module snapshot knows stays the typed
+  `unsupported("… no '<atom>' atom in the module")` / `exceptions: no atom for the '<class>' exception class …`,
+  never a substituted index. A real module image (`fc.beam`, a failed head clause) whose atom table holds no
+  `function_clause` still raises it under both runtimes.
 
 **Headline:** the interpreter core has **no fixable fallback gap** that the shipped runtime actually hits — every
-typed error here is malformed-bytecode robustness (class 1) or an owner-outside-this-node capability gap (class 2);
-the only arguable in-node item (class 3, `function_clause`) is already compensated by `beam_rt`'s `CORE_ATOMS`.
+typed error here is malformed-bytecode robustness (class 1), an owner-outside-this-node capability gap (class 2), or
+the name-only refusal of class 3, which the live-namespace seam answers for every host that owns a shared table.
 `error::blocked()` (`run.rs:74`) is **not** a gap — the blocking-aware entries report `RunOutcome::Wait`; the
 non-blocking `run_export`/`run_label` fold it (Handoff #1, owner `beam_rt`).
 

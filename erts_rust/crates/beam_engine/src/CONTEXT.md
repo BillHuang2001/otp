@@ -54,6 +54,21 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   context-0 frame) is threaded from the driver through `step_instruction_with_entry` → `exec_bif` /
   `call_bif_named` / `dispatch_wide` / `families::dispatch` → `dispatch_bif_call`, and on the native tier
   through `JitRuntime.entry_module` (a field generated code never reads).
+- **`ExecutionContext::atoms` is the live atom namespace, and it now serves the exception atoms too.** The
+  defaulted `fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable` (default body:
+  `&module.atom_table`) was introduced as the **comparison** namespace (guards/`select_val`/map-key
+  equality order atoms by NAME, not by an id the module's load-time snapshot cannot name — `beam_term`'s
+  `erts_cmp_atoms` falls back to the raw id for an unknown name). It is now also the namespace every
+  **raise** resolves its reason/class atoms through, via the free function
+  `machine::catch::namespace_atom(ctx, module, name)` — `ctx.atoms(module).lookup(name)`, then the module
+  snapshot, then `None`. Consequence for a host: one shared live table answers both, so `beam_rt` overrides
+  `atoms` once (in `RuntimeContext` and `BudgetContext`) and gets name-exact comparisons *and*
+  nameable `badarg`/`function_clause`/`error`/`exit`/`throw` on the raise path. A name **neither** source
+  knows is a typed error at every one of those sites, never a substituted atom index (an index is valid only
+  against the table it was read with). The names reachable through it today: `function_clause` + the `error`
+  class in the failed-clause raise, the reason + class of every BIF-raise landing (`interpreter/bif.rs`), and
+  the three class atoms installed once per run by `Machine::ensure_class_atoms` (called from
+  `families::dispatch`).
 - `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
   `// SAFETY:` rationale, plus the modules carrying a module-local `#![allow(unsafe_code)]` under
   the crate-wide deny (`context.rs` — the `MinimalContext` region heap is the crate's raw
@@ -65,7 +80,8 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `context.rs` → the `ExecutionContext` / `Mailbox` seams (`call_bif` + the defaulted in-machine twin
   `call_bif_in_machine` behind the `wants_bif_in_machine` probe; the resolver seams
-  `resolve_external_call`/`resolve_local_fun`/`resolve_local_call`/`atom_name`), `RootSet`, `MinimalContext` (incl. its
+  `resolve_external_call`/`resolve_local_fun`/`resolve_local_call`/`atom_name`; and `atoms`, the live atom
+  namespace used by comparison AND by the raise path's `machine::catch::namespace_atom`), `RootSet`, `MinimalContext` (incl. its
   `ContextHeap` — a pointer-stable region heap over `beam_alloc::ReservedHeap`: ~4 MiB is reserved up
   front and **grown in place** as terms are built, so an allocation costs its payload only; on
   reservation exhaustion a fresh, larger region starts and **every earlier region is kept alive**, so a
