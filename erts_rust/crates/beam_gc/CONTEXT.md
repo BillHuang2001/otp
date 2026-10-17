@@ -648,6 +648,17 @@ constructors only (no new error enum).
   pointer word, and this crate takes no dependency on `beam_message`'s container interior.
 
 ## Handoffs (owned by other nodes)
+- **The `gc_bound/churn` residual is not this crate's.** The major (fullsweep) count stays capacity-forced by
+  the mature generation's promoted garbage, and this crate's copy loop is only **4.2 %** of a `perf` profile of
+  the shape; the remaining dominant costs are the interpreter tier (20 %), libc malloc/free/memmove (15 %),
+  `beam_rt::context::gc` (12.7 %) and `beam_bifs`' `Vec` churn (4.9 %): `beam_bifs/src/binconv.rs:335-382`
+  (`list_to_binary` builds two `Vec`s), `beam_bifs/src/term_ops.rs:84-139` (`proper_list` `Vec` for
+  `list_to_tuple`), `beam_bifs/src/arith.rs:648-650` (`Big::from_i64` boxes a `Vec<u64>` per small-int
+  operand), and `beam_rt/src/context/gc.rs:667-675` (`collect_or_grow` re-installing a space per op — now
+  ≈0 for this shape). Owners: `beam_bifs` / `beam_engine` / `beam_rt`.
+  The growth ladder also keeps only ~40–60 words of slack, so the nursery settles at 609 words where the op
+  allocates 806; the collection count improves by a third but not more. The one-step-then-doubling rule is
+  not implicated (`peak_spaces = 1`).
 - **The strategy switch is adopted; the residual is an explicit pin on the process-construction path.**
   `beam_process::Process` holds an `AnyCollector` and exposes `collector() -> &AnyCollector`, with
   `run_rooted_collection` bound as `FnOnce(&mut AnyCollector, &mut [Eterm])` (its consumer sites and the
