@@ -102,7 +102,7 @@ pub(super) fn cp(ctx: &mut BifContext<'_>, term: Eterm) -> beam_common::Result<E
             return Ok(beam_term::NIL);
         }
         let tag = error_atom(ctx)?;
-        return Ok(ctx.tuple(&[tag, term])?);
+        return ctx.tuple(&[tag, term]);
     }
     Err(function_clause())
 }
@@ -148,7 +148,7 @@ fn cpl(ctx: &mut BifContext<'_>, list: Eterm, r: Eterm) -> beam_common::Result<E
         // cpl(<<B/binary>>, R) -> {error, [B|R]}
         let tag = error_atom(ctx)?;
         let inner = ctx.cons(list, r)?;
-        return Ok(ctx.tuple(&[tag, inner])?);
+        return ctx.tuple(&[tag, inner]);
     }
     Err(function_clause())
 }
