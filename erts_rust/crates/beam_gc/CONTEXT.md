@@ -105,8 +105,9 @@ and the one-line semantic contract only.
 
 ### `any_collector.rs` — the strategy-dispatching seam
 - `AnyCollector { Copying(Collector), Immix(GenImmixCollector) }` — a **complete drop-in for the concrete
-  `Collector`**: the whole call set a host makes, forwarded with the selected strategy's semantics, so
-  `young_contains` covers every space of the chain and the reachability enumeration is **strategy-agnostic**.
+  `Collector`**: the whole call set a host makes (including the kind-pinned `collect_kind`), forwarded with the
+  selected strategy's semantics, so `young_contains` covers every space of the chain and the reachability
+  enumeration is **strategy-agnostic**.
 - `new(policy)` (= the **automatic rule** decides) / `from_config(&GcConfig)` (dispatches on the **resolved**
   `config.mature()`), `kind() -> MatureKind`, `mature_choice()`, `heap_info() -> HeapInfo`.
 - The two mature types differ, so the mature generation is exposed as **geometry accessors** rather than a
