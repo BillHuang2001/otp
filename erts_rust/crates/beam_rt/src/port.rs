@@ -147,6 +147,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
+pub(crate) mod ops;
 pub(crate) mod tty;
 pub(crate) mod watch;
 use beam_alloc::Heap;
@@ -737,6 +738,10 @@ pub struct PortRegistry {
     /// `driver_monitor_process`'s positive `ERL_DRV_MONITOR_NOT_ALIVE` (see
     /// [`ProcessLiveness`]).
     liveness: Rc<ProcessLiveness>,
+    /// The state `port_set_data/2`, `erlang:register/2` and `port_connect/2` establish
+    /// **after** the port is open — the data term, the registered name and the link set (see
+    /// [`ops::PortExtras`]).
+    extras: ops::PortExtras,
 }
 
 impl PortRegistry {
@@ -763,6 +768,7 @@ impl PortRegistry {
             watch: watch::SignalWatch::new(),
             tty: tty::TtyWatch::new(),
             liveness: ProcessLiveness::new(),
+            extras: ops::PortExtras::default(),
         })
     }
 
@@ -1221,6 +1227,10 @@ impl PortRegistry {
         // The port is leaving this registry either way: a close the runtime has begun is
         // never abandoned halfway, so a failed notification cannot leave the table stale.
         self.meta.remove(&id.number());
+        // The port's name and data term go with it: a closed port is `undefined` for
+        // `whereis/1` and `badarg` for `port_get_data/1`, and a recycled port number starts
+        // clean (see `ops::PortExtras`).
+        self.extras.forget_port(id.number());
         let closed = self.registry.close(&mut self.poller, id);
         // `and` returns the teardown's error when it failed, and the notification's
         // otherwise — so a failure on either path reaches the caller.
@@ -1704,10 +1714,22 @@ impl PortRegistry {
         // `self.meta` and `self.heap` are disjoint fields, so the immutable borrow of the
         // port and the mutable borrow of the arena coexist.
         let name = charlist(&mut self.heap, &meta.command)?;
-        // The owning process is the port's only link (`[]`-shaped as `[Owner]`) and its
-        // `connected` value — both the oracle's answer while the port is live.
+        // The owning process is the port's `connected` value; the **link set** is the owner
+        // alone until `port_connect/2` adds one (the C's `set_port_connected` creates a link
+        // without removing the old one, so the oracle's `links` grows — see
+        // [`ops::PortExtras::links`]).
         let owner = meta.owner.to_eterm();
-        let links = pid_list(&mut self.heap, &[meta.owner])?;
+        let links = match self.extra_links(port.number()) {
+            Some(linked) => pid_list(&mut self.heap, linked)?,
+            None => pid_list(&mut self.heap, &[meta.owner])?,
+        };
+        // A registered port reports `{registered_name, Name}` **first** (the oracle's own
+        // order); `beam_bifs`'s `port_info/1` keeps only its seven items, so the pair is
+        // reachable through `port_info/2`.
+        let registered = match self.port_name(port) {
+            Some(name) => Some((item("registered_name")?, make_atom(name))),
+            None => None,
+        };
         let monitors = monitor_list(&mut self.heap, atoms, &meta.monitors)?;
         // `id` is a **bare small integer** (the oracle's shape), not the port term.
         let id = try_make_small(i64::try_from(port.number()).map_err(|_| BeamError::SystemLimit)?)
@@ -1734,7 +1756,10 @@ impl PortRegistry {
             (item("os_pid")?, os_pid),
             // The `/2`-only extra item; `beam_bifs`'s `port_info/1` drops it.
             (item("monitors")?, monitors),
-        ])
+        ]
+        .into_iter()
+        .chain(registered)
+        .collect())
     }
 }
 
