@@ -493,8 +493,7 @@ constructors only (no new error enum).
   **chained** nursery, each object once, no garbage; a live refc binary's `BinRef` reported and an unreachable
   one not; a 50 000-object chain, a three-tuple ring, `AnyCollector` forwarding, and the safe view — the reached
   range geometry pinned in-module by `reachable.rs`/`space.rs`/`nursery.rs`).
-- **Immix**: `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` +
-  `tests/gen_immix_collector.rs` (geometry/allocation/mark/pin/evacuation/accounting and the hard major cases;
+- **Immix**: `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` +  `tests/gen_immix_collector.rs` (geometry/allocation/mark/pin/evacuation/accounting and the hard major cases;
   one corpus through both strategies behind one structural walker; a multi-block object);
   `tests/immix_fragmentation.rs` (the atomic promotion: a refused promotion leaves both spaces byte-identical —
   same roots, no marker, counters unchanged, identical on retry — and the 7-line/100-word and 9-line shapes reach
