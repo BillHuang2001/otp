@@ -381,23 +381,28 @@ fn emit_sub_blocks(
 /// same non-block-start native entries the lazy layout already exposes through
 /// [`CompiledFunction::sub_entries`](super::super::code::CompiledFunction).
 ///
-/// It mirrors the lazy [`emit_sub_blocks`] loop *exactly* except for two deliberate
-/// differences, both of which keep the eager **whole-module** introspection surface (a
-/// frozen contract asserted byte-exactly by the read-only tests — e.g.
+/// It mirrors the lazy [`emit_sub_blocks`] loop *exactly* except for one deliberate
+/// difference, which keeps the eager **whole-module** introspection surface (a frozen
+/// contract asserted byte-exactly by the read-only tests — e.g.
 /// `block_count`/`cached_registers`/`highest_*`) untouched:
 ///
-/// * **Allocation source** — the **containing IR block's** allocation
-///   ([`allocate_registers`] over `[block.start, block.end)`), not the sub-range's own. The
-///   sub-block's instructions are a subset of that block's, so the block's cache set is
-///   sound for it (every register the sub-block touches natively is already accounted for:
-///   either held resident, or read/written directly in `machine.x`), and — because the
-///   whole-module [`Summary`] was built from exactly this allocation when the IR block was
-///   emitted — reusing it leaves `cached_registers`/`highest_*` unchanged. A sub-range's own
-///   live-interval allocation is *not* necessarily a subset of the block's, so calling
-///   [`allocate_registers`] on `[start, end)` could widen the summary.
-/// * **No summary fold** — [`emit_block`]'s register touches during this pass go to a
-///   throwaway sink, so the eager whole-module [`Summary`] is provably untouched (it is
-///   idempotent anyway: the containing block already touched the same registers).
+/// * **No summary fold** — the allocation is derived for the **emitted range**
+///   (`[start, end)`, exactly as the lazy pass derives it), but [`emit_block`]'s register
+///   touches during this pass go to a throwaway sink instead of `summary`, so the eager
+///   whole-module [`Summary`] is provably untouched: it describes the IR blocks, whose
+///   own [`emit_function`] pass already folded exactly those allocations in.
+///
+/// The allocation must be the sub-range's own, never the containing IR block's: an
+/// [`Allocation`] is **entry-point-relative** (see [`super::regs`]) — `block_start`, the
+/// per-`pc` `fill_sets`/`spill_sets` tables and the live-in `entry_fill` set are all
+/// derived over the range the allocator was handed. A sub-block is a *fresh native
+/// function* whose prologue loads `entry_fill`, so reusing the containing block's
+/// allocation would (a) leave a cached register the block first *writes* (before `start`)
+/// unloaded, and a read of it inside the sub-range would then take whatever the previous
+/// native code left in that machine register instead of its `machine.x` value, and
+/// (b) carry the dirty bits accumulated at pcs `< start`, so the sub-block's first spill
+/// would store such a leftover word into `machine.x`. Deriving the allocation from
+/// `[start, end)` makes the sub-block's cache self-contained, exactly like a lazy one.
 ///
 /// Everything else matches the lazy pass: a `start` at or past the end of the function, one
 /// that is already a compiled block start (`block_labels`), or one no IR block strictly
@@ -437,11 +442,12 @@ fn emit_shared_sub_blocks(
         if start >= end {
             continue;
         }
-        // The containing IR block's allocation (see the doc comment): sound for the
-        // sub-range and identical to what the batch IR-block pass merged into the
-        // whole-module summary, so that summary is unchanged. `allocate_registers`
-        // clamps `end` to `code.len()` itself, so `block.end` needs no pre-clamp here.
-        let allocation = allocate_registers(module, code, block.start, block.end);
+        // The **emitted range's** own allocation (see the doc comment): the sub-block is a
+        // fresh native function, so its cache, its live-in loads and its dirty sets must
+        // describe `[start, end)` — the containing block's allocation is indexed from
+        // `block.start` and is wrong for it. The touches go to `discard`, so the
+        // whole-module summary (built from the IR blocks' own allocations) is unchanged.
+        let allocation = allocate_registers(module, code, start, end);
         let mut discard: Option<u32> = None;
         let offset = buffer.len();
         emit_block(

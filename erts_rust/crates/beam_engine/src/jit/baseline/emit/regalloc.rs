@@ -75,9 +75,9 @@
 //! write union (never a reset) even when its run-time guard would reject, and any variant
 //! the mirror does not recognise is treated as inlined. The only variants that may reset
 //! are the ones whose emission unconditionally reaches a helper (the family-owned set, the
-//! receive family, the cross-module calls, the frame-discipline trio, the heap family, and
-//! the `_`-arm sentinel); for those the reset is *exact*, because the helper's spill
-//! provably synced the whole cache.
+//! receive family, the cross-module calls, the three local call forms, the frame-discipline
+//! trio, the heap family, and the `_`-arm sentinel); for those the reset is *exact*, because
+//! the helper's spill provably synced the whole cache.
 //!
 //! The model reproduces the classic "already-clean-aware" store elimination a handwritten
 //! JIT's register cache does — see `ERTS_RUST_REWRITE_DEEPDIVE.md` §F (the baseline/hot
@@ -364,9 +364,9 @@ fn spill_sets(
 /// toward `true` wherever the emitter's arm consults more than the shape (the emitter
 /// treats a slightly-wider set as inlined, which only ever costs a redundant store), and
 /// returns `false` only for the variants whose emission unconditionally reaches a helper:
-/// the family-owned set, the receive family, the cross-module calls, the
-/// frame-discipline trio, the heap family, and any variant the emitter's `_` deopt arm
-/// claims.
+/// the family-owned set, the receive family, the cross-module calls, the three local call
+/// forms, the frame-discipline trio, the heap family, and any variant the emitter's `_`
+/// deopt arm claims.
 ///
 /// The bias is the soundness rule (see the module docs): a **wrong** `true` costs a
 /// redundant store, a **wrong** `false` would drop a dirty register's value. So a variant
@@ -374,6 +374,12 @@ fn spill_sets(
 /// fall to `false` **only** when the emitter is known to fully helper it; an unmodelled
 /// variant that *might* inline is not distinguishable here, so the match keeps the
 /// certain-reset list explicit and treats everything else as inlined.
+///
+/// Every reset this reports for a *terminating* instruction (`Jump` with a resolved label,
+/// the three local call forms) is inert today: the emitter ends the block there, so no
+/// emitted pc follows it in the same allocation range and the post-instruction dirty state
+/// is never read. The classification is kept exhaustive anyway so it stays a faithful mirror
+/// of the emitter rather than a coincidence.
 pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> bool {
     match instr {
         // Metadata no-ops emit no bytes and write nothing.
@@ -427,12 +433,16 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
-        // A terminating instruction inlines iff its label resolves; an unresolved label
-        // falls to the emitter's `emit_deopt`.
+        // A `jump` inlines iff its label resolves; an unresolved label falls to the
+        // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
+        // call at all, so the label test is the honest classification.)
         Instr::Jump { target } => labels.resolve(*target).is_ok(),
-        Instr::CallLast { target, .. }
-        | Instr::CallOnly { target, .. }
-        | Instr::Call { target, .. } => labels.resolve(*target).is_ok(),
+        // The three **local call** forms are certain helper calls on every path — the
+        // emitter never inlines a call: `call_only`/`call_last` emit the local-call seam
+        // probe followed by the linker's exit, and the frame-preserving `call` emits
+        // `jit_call_store` followed by the same exit — and each terminates the block. So
+        // they belong to the reset group, whatever their label resolves to.
+        Instr::CallLast { .. } | Instr::CallOnly { .. } | Instr::Call { .. } => false,
         // Everything else: a pure helper (`emit_deopt` for the `_` arm, or one of the
         // dedicated family/receive/frame/heap helpers) — a certain reset.
         _ => false,

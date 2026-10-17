@@ -295,9 +295,9 @@ fn the_dirty_set_mirror_agrees_with_the_emitters_static_inline_decision() {
     // `emit_block` actually INLINES is the dangerous drift, and it would silently drop a
     // dirty register. A variant the mirror reports as a reset more often than the emitter
     // statically deopted it fails here. The always-reset dedicated-helper arms (the receive
-    // family, the frame trio, the heap family, the cross-module calls and the family-owned
-    // surface) are deliberately absent: they never reach `emit_deopt`, so `is_inlined`'s
-    // `false` for them is not a deopt claim.
+    // family, the frame trio, the heap family, the cross-module calls, the three local call
+    // forms and the family-owned surface) are deliberately absent: they never reach
+    // `emit_deopt`, so `is_inlined`'s `false` for them is not a deopt claim.
     //
     // Candidates come from the emitter's own accounting (`instr_instances`) as well as the
     // mirror's walks, so a variant the mirror mislabels to *always* reset (its
@@ -384,8 +384,9 @@ fn ends_the_block(code: &[Instr], pc: usize) -> bool {
 /// shape-predicate set plus the metadata no-ops. For every one of these, `false` is a claim
 /// that [`super::emit_block`] statically deopted the instruction, so the emitter's
 /// `instr_deopts` must cover the mirror's `predicted_reset` count. The always-reset
-/// dedicated-helper arms (receive/frame/heap/cross-module/family-owned) are deliberately
-/// **absent**: `is_inlined` falls to its `_` arm for them, which is not a deopt claim.
+/// dedicated-helper arms (receive/frame/heap/cross-module/local-call/family-owned) are
+/// deliberately **absent**: for them `is_inlined`'s `false` is a certain reset, not a deopt
+/// claim.
 ///
 /// Kept in lockstep with `is_inlined`'s match: a variant whose arm is removed there while
 /// still named here (or whose *predicate* is made stricter than the emitter's) trips the
@@ -405,9 +406,6 @@ const SHAPE_MODELS: &[&str] = &[
     "Bif",
     "SelectVal",
     "Jump",
-    "CallLast",
-    "CallOnly",
-    "Call",
     "Label",
     "Line",
     "IntCodeEnd",

@@ -37,7 +37,8 @@
 use super::call::CALL_STORED;
 use super::emit::{allocate_registers, cacheable_touches, compile_function, compile_module};
 use super::*;
-
+use crate::jit::baseline::BaselineJit;
+use crate::jit::JitBackend;
 /// Run exported `name/arity` with `args` on both tiers and hand the two outcomes to
 /// `check` — the arity-parameterised sibling of [`super::with_both_tiers`] (which
 /// hard-codes arity 0), for the multi-argument calls below.
@@ -471,6 +472,195 @@ fn a_local_call_contributes_no_register_touch_or_write() {
     assert_eq!(
         allocation.live_candidates, 0,
         "no register has a live interval in this block"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (f) the eager sub-block's allocation describes its own range
+// ---------------------------------------------------------------------------
+
+/// `f(A, B) -> g(B)` with `g/1` returning the constant `1000`: the call's result is
+/// carried across the continuation by two inlined `move`s and returned.
+///
+/// The shape matters: the frame-preserving `call` sits **strictly inside** the `Label(2)`
+/// IR block (the loader cuts blocks only at labels), so the continuation address `pc + 1`
+/// gets its own native **sub-block**, and `x(0)` — written by the argument `move` before
+/// the call, read by the moves after it — is exactly the register whose cache state the
+/// containing block's allocation and the sub-range's own disagree about.
+///
+/// The trailing reader is deliberately **unguarded**: `move x(0) -> x(1)`,
+/// `move x(1) -> x(0)` are plain inlined register moves, so whatever the sub-block's
+/// cached slot for `x(0)` holds *is* the returned value. A small-int `gc_bif` such as
+/// `'+'/2` would **mask** the defect instead: its run-time small-int guard rejects a stale
+/// machine-register word, deopts to `jit_step_one`, and the interpreter step then reads the
+/// correct `machine.x` — the right answer by accident.
+///
+/// The callee is deliberately **cache-free**: its one value-producing instruction is a
+/// `bif` the emitter does not lower (`erlang:abs/1`), so its block caches no x-register at
+/// all and its `return` leaves `1000` in `machine.x` *only*. Nothing therefore refreshes
+/// the physical register the caller's block cached `x(0)` in (a block's teardown restores
+/// the callee-saved registers it saved, so a returned-to driver holds the *driver's*
+/// leftovers there), which is what makes the sub-block's missing entry load observable as a
+/// value rather than a coincidence of the callee writing the same physical register.
+///
+/// ```text
+/// f/2                       g/1
+///  0 label(1)                0 label(3)
+///  1 label(2)                1 bif abs/1 [1000] -> x(0)   (helper, no cache slot)
+///  2 allocate 0 0            2 return
+///  3 move x(1) -> x(0)     <- x(0)'s first touch in the block is this WRITE
+///  4 call g/1 -> label(3)  <- continuation = pc 5, inside the block
+///  5 move x(0) -> x(1)     <- the sub-block's first instruction READS x(0)
+///  6 move x(1) -> x(0)
+///  7 deallocate_return 0   <- spills x(0)
+/// ```
+fn call_result_passthrough_case() -> Module {
+    build_module(
+        "eager_sub_block",
+        &[("erlang", "abs", 1)],
+        vec![
+            (
+                "f",
+                2,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Label(Label(2)),
+                    Instr::Allocate {
+                        stack_need: beam_loader::HeapNeed::Words(0),
+                        live: 0,
+                    },
+                    Instr::Move {
+                        src: Operand::X(1),
+                        dst: Operand::X(0),
+                    },
+                    Instr::Call {
+                        arity: 1,
+                        target: Label(3),
+                    },
+                    Instr::Move {
+                        src: Operand::X(0),
+                        dst: Operand::X(1),
+                    },
+                    Instr::Move {
+                        src: Operand::X(1),
+                        dst: Operand::X(0),
+                    },
+                    Instr::DeallocateReturn(0),
+                ],
+            ),
+            (
+                "g",
+                1,
+                vec![
+                    Instr::Label(Label(3)),
+                    Instr::Bif {
+                        arity: 1,
+                        bif: ImportRef(0),
+                        fail: NO_FAIL,
+                        args: vec![Operand::Integer(1000)],
+                        dst: Operand::X(0),
+                    },
+                    Instr::Return,
+                ],
+            ),
+        ],
+        &[("f", 2, Label(2))],
+    )
+}
+
+/// A context serving the callee's helper BIF `erlang:abs/1`; nothing else is called.
+fn eager_sub_block_context() -> MinimalContext {
+    MinimalContext::with_bif_hook(Box::new(
+        |module: &str, function: &str, arity: u32, args: &[Eterm]| {
+            if module == "erlang" && function == "abs" && arity == 1 && args.len() == 1 {
+                return Ok(make_small(beam_term::signed_value(args[0]).abs()));
+            }
+            Err(crate::error::unsupported(&format!(
+                "eager sub-block bif {module}:{function}/{arity}"
+            )))
+        },
+    ))
+}
+
+/// **The eager continuation sub-block is allocated over its own range.**
+///
+/// A continuation address the driver re-enters is a **fresh native function**: the caller's
+/// block has already run its frame teardown, so every cached machine register holds whatever
+/// the *driver* left there — not the value the call left in `machine.x`. Its [`Allocation`]
+/// must therefore be entry-point-relative to the address it starts at, exactly like the lazy
+/// layout's: `entry_fill` must load `x(0)` (the call's result, which the sub-range reads
+/// before it writes) and `spill_sets` must not carry the containing block's dirty bits.
+///
+/// With the containing block's whole-range allocation instead, the sub-block's cached slot
+/// for `x(0)` is never loaded from `machine.x`, so the stale machine-register word is copied
+/// into `x(0)` and spilled back into `machine.x` by the exit.
+#[test]
+fn the_eager_sub_block_reads_the_call_result_out_of_machine_x() {
+    let module = call_result_passthrough_case();
+    let name = export_atom(&module, "f");
+    let args = [make_small(10), make_small(20)];
+
+    // The premise, on the two allocations themselves: `x(0)` is cached either way, but only
+    // the sub-range's own allocation has it in the live-in set.
+    let code = &module.functions[0].code;
+    assert!(matches!(code[4], Instr::Call { .. }), "pc 4 is the call");
+    let block = &module.functions[0].blocks[1];
+    assert_eq!((block.start, block.end), (1, 8), "the `Label(2)` IR block");
+    let containing = allocate_registers(&module, code, block.start, block.end);
+    let sub_range = allocate_registers(&module, code, 5, code.len());
+    assert!(
+        containing.slot(0).is_some() && sub_range.slot(0).is_some(),
+        "x(0) is touched natively in both ranges, so both cache it"
+    );
+    assert!(
+        !containing.entry_loads(0),
+        "the containing block writes x(0) before it first reads it, so its live-in set \
+         leaves it unloaded"
+    );
+    assert!(
+        sub_range.entry_loads(0),
+        "the sub-range's first instruction reads x(0), so its prologue must load it"
+    );
+
+    // (1) The interpreter: `g(20) = 1000` and the two moves pass the value through.
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = eager_sub_block_context();
+    let interpreted = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            2,
+            &args,
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect("the interpreter run completes");
+    assert_eq!(
+        interpreted,
+        RunOutcome::Returned(make_small(1000)),
+        "the interpreter's answer is the hand-computed one"
+    );
+
+    // (2) The eager artifact, through the compile-once / run-many entry (the layout
+    // `jit::bench` and `CodeCache::get_or_compile` use — the tier entries go through the
+    // **lazy** artifact, so they can never reach this layout).
+    let mut backend = BaselineJit::new();
+    let compiled = backend.compile(&module).expect("the module compiles eagerly");
+    assert!(
+        compiled.entry(0, 5).is_some(),
+        "the continuation at pc 5 must have a native sub-block entry, or this pin proves \
+         nothing"
+    );
+    let mut machine = Machine::new();
+    let mut ctx = eager_sub_block_context();
+    let eager = backend
+        .run_compiled(&compiled, &mut machine, &module, name, 2, &args, &mut ctx)
+        .expect("the eager run completes");
+    assert_eq!(
+        eager,
+        make_small(1000),
+        "the eager sub-block must read the callee's x(0) from `machine.x`, not the stale \
+         word the machine register holds on entry"
     );
 }
 
