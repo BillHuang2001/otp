@@ -156,7 +156,7 @@ Verified against the system `erlc` (OTP 29) disassembly:
 - `../../../tests/gaps.rs` pins the two read instructions' `no_fail` cases to
   `maps: no 'function_clause' atom in the module` (`:272`, `:300`).
 
-  `function_clause` (class `error`). The unseeded fixture therefore surfaces the missing-atom gap, so
+
   the two expected strings must become `maps: no 'function_clause' atom in the module` (the module in
   <!-- -->
 ## Notes for Agents
