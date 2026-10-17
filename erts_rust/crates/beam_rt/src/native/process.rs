@@ -72,6 +72,7 @@ use beam_gc::HeapPolicy;
 use beam_process::{MonitorKind, MonitorRef, Priority, ProcessId, UnaliasMode};
 use beam_term::{atom_val, is_atom, is_nil, is_small, make_small, signed_value, Eterm, NIL};
 
+use crate::config::MaxHeapSetting;
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::runtime::PendingSpawn;
@@ -79,6 +80,19 @@ use crate::runner::ProcessEntry;
 
 mod exit;
 mod monitor;
+/// Which of a `max_heap_size` map's three boolean flags a key names.
+///
+/// [`RuntimeContext::max_heap_setting`] walks the three keys once and writes the parsed
+/// boolean into the matching [`MaxHeapSetting`](crate::config::MaxHeapSetting) field.
+#[derive(Clone, Copy)]
+enum FlagSlot {
+    /// `kill` — terminate the process at the limit.
+    Kill,
+    /// `error_logger` — log an error report at the limit.
+    ErrorLogger,
+    /// `include_shared_binaries` — count off-heap binaries towards the limit.
+    IncludeSharedBinaries,
+}
 
 /// The `spawn_opt/2,3,4` options the runtime honours.
 ///
@@ -589,8 +603,11 @@ impl RuntimeContext<'_> {
                     // exactly as it is there; only a negative value is rejected.
                     parsed.fullsweep_after = Some(self.spawn_words(value)? as u16 as u32);
                 }
+                // Only the bound is carried into the child's policy; the parsed flags are
+                // dropped on this path, which has no per-process flag store to keep them in
+                // (they are the emulator's `+hmax*` word — see `SpawnOptions::policy`).
                 Some("max_heap_size") => {
-                    parsed.max_heap_words = Some(self.spawn_max_heap_size(value)?)
+                    parsed.max_heap_words = Some(self.max_heap_setting(value)?.size)
                 }
                 Some("message_queue_data") => match self.atom_name(value).as_deref() {
                     Some("off_heap") | Some("on_heap") => parsed.message_queue_data = true,
@@ -647,45 +664,74 @@ impl RuntimeContext<'_> {
         Ok(words as usize)
     }
 
-    /// The word bound a `{max_heap_size, …}` option names — `erts_max_heap_size`
-    /// (`erl_gc.c:3825-3873`): a non-negative integer, or a **map** whose `size` entry is
-    /// one.
+    /// The setting a `{max_heap_size, …}` option / `process_flag(max_heap_size, …)` value
+    /// names — `erts_max_heap_size` (`erl_gc.c:3825-3873`): a non-negative integer, or a
+    /// **map** whose `size` entry is one and whose `kill`/`error_logger`/
+    /// `include_shared_binaries` entries, when present, are `true`/`false`.
     ///
-    /// The map's `kill`/`error_logger`/`include_shared_binaries` entries are validated (the
-    /// C rejects a non-boolean, and with the same `badarg`) but only `size` is stored: this
-    /// runtime carries **one** flag word per emulator (`+hmaxk`/`+hmaxel`/`+hmaxib`), the
-    /// shape `+hmax` already uses, and `process_info(Pid, max_heap_size)` reports it.
-    fn spawn_max_heap_size(&mut self, value: Eterm) -> Result<usize> {
+    /// This is the **one** parser for both call sites: `spawn_opt`'s
+    /// `{max_heap_size, …}` option (`self.spawn_options`) and the `erlang:process_flag/2`
+    /// bridge ([`crate::context::process_bridge`]), so their acceptance sets can never
+    /// drift. It reproduces `erts_max_heap_size` exactly:
+    ///
+    /// * the flags start at the emulator's `H_MAX_FLAGS` (the `+hmaxk`/`+hmaxel`/`+hmaxib`
+    ///   word), and a map entry overrides only the flag it names;
+    /// * a key the C does not look up — `min_bin_vheap_size`, a misspelt flag, a non-atom
+    ///   key — is **ignored** (probed: `#{size => 1000, zzz => 1}` and
+    ///   `#{size => 1000, 1 => 2}` are both accepted);
+    /// * `size` is **mandatory** and must be a small non-negative integer (a float, a
+    ///   bignum, an atom or an absent `size` are all `badarg`);
+    /// * `size` is stored **raw** — `#{size => 1001}` really reports `1001`, not a
+    ///   growth-table rounding.
+    ///
+    /// The *floor* (`size` must be at least the process's `min_heap_size` unless it is `0`)
+    /// is **not** applied here: the C checks it after the parse, and the two call sites use
+    /// different floors — `spawn_opt` the rounded `min_heap_size` the options computed
+    /// (`erl_process.c:12429`), `process_flag` the calling process's own
+    /// `MIN_HEAP_SIZE(p)` (`bif.c:2155`).
+    pub(crate) fn max_heap_setting(&mut self, value: Eterm) -> Result<MaxHeapSetting> {
+        let flags = self.runtime.config().heap_options().max_heap_flags();
+        let mut setting = MaxHeapSetting::unlimited(flags);
         if is_small(value) {
-            return self.spawn_words(value);
+            setting.size = self.spawn_words(value)?;
+            return Ok(setting);
         }
         // The map form: `size` is mandatory. The keys are interned first (interning is a
         // write to the shared table) so the read-only handle below is the only borrow of it.
         let size_key = self.atom("size")?;
         let flag_keys = [
-            self.atom("kill")?,
-            self.atom("error_logger")?,
-            self.atom("include_shared_binaries")?,
+            (self.atom("kill")?, FlagSlot::Kill),
+            (self.atom("error_logger")?, FlagSlot::ErrorLogger),
+            (
+                self.atom("include_shared_binaries")?,
+                FlagSlot::IncludeSharedBinaries,
+            ),
         ];
         let atoms = self.runtime.code_server.atoms_handle();
         let size = beam_term::map::map_get(value, size_key, &atoms)
             .map_err(|_| BeamError::BadArg)?
             .ok_or(BeamError::BadArg)?;
-        let size = self.spawn_words(size)?;
-        for key in flag_keys {
-            // A flag that is absent is a default; one that is present must be a boolean.
+        setting.size = self.spawn_words(size)?;
+        for (key, slot) in flag_keys {
+            // A flag that is absent keeps the emulator default; one that is present must be
+            // the atom `true` or `false`.
             if let Some(flag) = beam_term::map::map_get(value, key, &atoms)
                 .map_err(|_| BeamError::BadArg)?
             {
-                match self.atom_name(flag).as_deref() {
-                    Some("true") | Some("false") => {}
+                let value = match self.atom_name(flag).as_deref() {
+                    Some("true") => true,
+                    Some("false") => false,
                     _ => return Err(BeamError::BadArg),
+                };
+                match slot {
+                    FlagSlot::Kill => setting.flags.kill = value,
+                    FlagSlot::ErrorLogger => setting.flags.error_logger = value,
+                    FlagSlot::IncludeSharedBinaries => setting.flags.include_shared_binaries = value,
                 }
             }
         }
-        Ok(size)
+        Ok(setting)
     }
-
     /// The [`Priority`] the `max|high|normal|low` atom `name` names.
     fn spawn_priority(&self, name: &str) -> Option<Priority> {
         Priority::LEVELS

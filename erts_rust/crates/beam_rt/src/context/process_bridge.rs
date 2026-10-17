@@ -59,6 +59,7 @@ use beam_common::{BeamError, Result};
 use beam_process::{PortId, Priority, ProcessId, ProcessTable};
 use beam_term::{is_atom, is_small, make_atom, signed_value, Atom, AtomTable, Eterm};
 
+use crate::config::MaxHeapSetting;
 use crate::error;
 use crate::port::PortRegistry;
 use crate::runner::RunnerState;
@@ -392,6 +393,50 @@ impl ProcessHook for ProcessBridge<'_> {
                 }
                 let atom = atoms.lookup("on_heap").ok_or(BeamError::TermNotFound)?;
                 Ok(Some(make_atom(atom)))
+            }
+            // `max_heap_size` — the per-process heap bound and its three flags
+            // (`MAX_HEAP_SIZE_GET(p)`/`MAX_HEAP_SIZE_FLAGS_GET(p)`, `bif.c:2148-2166`).
+            //
+            // The value is accepted in the C's two shapes — a non-negative integer, or a map
+            // with a mandatory `size` and optional `kill`/`error_logger`/
+            // `include_shared_binaries` booleans — and the parse is
+            // [`RuntimeContext::max_heap_setting`]'s, the very same one `spawn_opt`'s
+            // `{max_heap_size, …}` option uses (no second acceptance set). A nonzero `size`
+            // below the **process's own** `min_heap_size` is the C's `badarg`
+            // (`bif.c:2155`, `MIN_HEAP_SIZE(BIF_P)`), and a rejected value leaves the current
+            // setting untouched (probed).
+            //
+            // The answer is the **previous** setting as the oracle's four-key map, built by the
+            // same `max_heap_size_map` builder `process_info(Pid, max_heap_size)` renders
+            // through. The new setting is recorded in the runtime's per-pid store
+            // ([`Runtime::max_heap`](crate::Runtime::max_heap)), which is what the
+            // `process_info` items read.
+            //
+            // Residuum: the recorded bound is **not enforced** — no `error_logger` report and no
+            // kill at the limit — because neither `beam_process::Process` nor
+            // `beam_gc::AnyCollector` exposes a policy setter, so the `beam_gc` ceiling a
+            // process was born with cannot be replaced (see `M1_GAPS.md` *Heap switches*).
+            "max_heap_size" => {
+                // The floor is the process's own stored `min_heap_size` (the C's
+                // `MIN_HEAP_SIZE(BIF_P)`), and the current setting is what it reports right
+                // now; both are read off the PCB we already hold, then the borrow ends.
+                let floor = process.collector().policy().min_heap_words;
+                let born_with = process.collector().policy().max_heap_words;
+                let current = self.runtime.max_heap_setting(pid).unwrap_or_else(|| {
+                    MaxHeapSetting {
+                        size: born_with,
+                        flags: self.runtime.config().heap_options().max_heap_flags(),
+                    }
+                });
+                let Ok(setting) = self.with_ctx(|ctx| ctx.max_heap_setting(value)) else {
+                    return Ok(None);
+                };
+                if setting.size != 0 && setting.size < floor {
+                    return Ok(None);
+                }
+                self.runtime.set_max_heap_setting(pid, setting);
+                let previous = self.with_ctx(|ctx| ctx.max_heap_size_map(current))?;
+                Ok(Some(previous))
             }
             // Any other flag (including the ones this milestone has no state for) is the
             // oracle's `badarg` through the hook's `Ok(None)` contract.
@@ -825,5 +870,421 @@ mod tests {
                 .unwrap(),
             ProcessInfoItem::Dead
         );
+    }
+    // -----------------------------------------------------------------------------------
+    // process_flag(max_heap_size, …)
+    // -----------------------------------------------------------------------------------
+    /// The `max_heap_size` map `[("size", 0), ("kill", true), ("error_logger", true),
+    /// ("include_shared_binaries", false)]` as the **term** the flag takes, built by the
+    /// runtime's own map builder (the atoms are interned through the shared table first).
+    ///
+    /// Each entry is `(key, value)` where a `None` value omits the key — the shape an
+    /// omitted flag has (its value is then the emulator default).
+    fn max_heap_arg(rt: &mut Runtime, entries: &[(&str, Option<Eterm>)]) -> Eterm {
+        for (name, _) in entries {
+            atom(rt, name);
+        }
+        let pairs: Vec<(Eterm, Eterm)> = entries
+            .iter()
+            .filter_map(|(name, value)| {
+                let key = rt.code_server.atoms().lookup(name).expect("interned");
+                value.map(|value| (make_atom(key), value))
+            })
+            .collect();
+        let atoms = rt.code_server.atoms_handle();
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(rt, &mut sink);
+        beam_engine::terms::make_map(&mut context, &pairs, &atoms).expect("a map")
+    }
+    /// The `size` entry of a `max_heap_size` map term, and every flag it names.
+    ///
+    /// Read through `beam_term::map::map_get` — the same accessor the flag's own parser uses —
+    /// so a map this bridge built is read back exactly as a caller's map would be.
+    fn max_heap_parts(rt: &mut Runtime, map: Eterm) -> (Option<i64>, Vec<(String, bool)>) {
+        let atoms = rt.code_server.atoms_handle();
+        let mut size = None;
+        if let Some(key) = atoms.lookup("size") {
+            if let Ok(Some(value)) = beam_term::map::map_get(map, make_atom(key), &atoms) {
+                size = is_small(value).then(|| signed_value(value));
+            }
+        }
+        let mut flags = Vec::new();
+        for name in ["kill", "error_logger", "include_shared_binaries"] {
+            let Some(key) = atoms.lookup(name) else {
+                continue;
+            };
+            match beam_term::map::map_get(map, make_atom(key), &atoms) {
+                Ok(Some(value)) => flags.push((
+                    name.to_string(),
+                    atom_name(&atoms, value).as_deref() == Some("true"),
+                )),
+                _ => {}
+            }
+        }
+        (size, flags)
+    }
+    /// The `max_heap_size` map's `size` entry and its three flags, as the tuple the tests
+    /// compare: `(size, kill, error_logger, include_shared_binaries)`.
+    fn max_heap_summary(rt: &mut Runtime, map: Eterm) -> (Option<i64>, Option<bool>, Option<bool>, Option<bool>) {
+        let (size, flags) = max_heap_parts(rt, map);
+        let flag = |name: &str| {
+            flags
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| *value)
+        };
+        (
+            size,
+            flag("kill"),
+            flag("error_logger"),
+            flag("include_shared_binaries"),
+        )
+    }
+    /// `process_info(Pid, max_heap_size)`'s map, read through the bridge's own item builder.
+    fn info_max_heap(rt: &mut Runtime, pid: ProcessId) -> Eterm {
+        let item = atom(rt, "max_heap_size");
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(rt, None, ports, None, pid);
+        let mut pool = heap();
+        match bridge.process_info_item(&mut pool, &atoms, pid, item).unwrap() {
+            ProcessInfoItem::Value(term) => term,
+            other => panic!("expected the max_heap_size item, got {other:?}"),
+        }
+    }
+    /// The oracle probe behind these expectations (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// erl -noshell -eval '
+    ///     P1 = process_flag(max_heap_size, #{size => 1000}),
+    ///     I1 = process_info(self(), max_heap_size),
+    ///     P2 = process_flag(max_heap_size, #{size => 1300, kill => false,
+    ///                                        error_logger => false,
+    ///                                        include_shared_binaries => true}),
+    ///     I2 = process_info(self(), max_heap_size),
+    ///     io:format("~p~n", [{P1, P2, I1, I2}]), halt(0).'
+    /// ```
+    ///
+    /// `P1` is the fresh-process default `#{error_logger => true, include_shared_binaries =>
+    /// false, kill => true, size => 0}`; `I1` reports `size => 1000` with those same flags; `P2`
+    /// is the state `P1` set (all four keys); `I2` reports the new setting.
+    #[test]
+    fn max_heap_size_stores_the_setting_and_answers_the_previous_map() {
+        let mut rt = runtime();
+        let pid = rt.self_pid();
+        let flag = atom(&mut rt, "max_heap_size");
+        let v_true = atom(&mut rt, "true");
+        let v_false = atom(&mut rt, "false");
+
+        // The fresh process has no explicit bound: every flag is the emulator default.
+        let fresh = info_max_heap(&mut rt, pid);
+        assert_eq!(
+            max_heap_summary(&mut rt, fresh),
+            (Some(0), Some(true), Some(true), Some(false))
+        );
+
+        // A first set answers that default and records the new bound.
+        let size = max_heap_arg(&mut rt, &[("size", Some(make_small(1000)))]);
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+        let mut pool = heap();
+        let previous = bridge
+            .process_flag(&mut pool, &atoms, flag, size)
+            .unwrap()
+            .expect("a legal value has a previous value");
+        let previous = max_heap_summary(&mut rt, previous);
+        assert_eq!(
+            previous,
+            (Some(0), Some(true), Some(true), Some(false)),
+            "the previous value of a fresh process is the default map"
+        );
+        let stored = info_max_heap(&mut rt, pid);
+        assert_eq!(
+            max_heap_summary(&mut rt, stored),
+            (Some(1000), Some(true), Some(true), Some(false)),
+            "process_info reports the new bound"
+        );
+
+        // A second set with all four keys answers the *previous* setting and replaces every
+        // flag, which `process_info` then reports.
+        let size = max_heap_arg(
+            &mut rt,
+            &[
+                ("size", Some(make_small(1300))),
+                ("kill", Some(make_atom(v_false))),
+                ("error_logger", Some(make_atom(v_false))),
+                ("include_shared_binaries", Some(make_atom(v_true))),
+            ],
+        );
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+        let mut pool = heap();
+        let previous = bridge
+            .process_flag(&mut pool, &atoms, flag, size)
+            .unwrap()
+            .expect("a legal value has a previous value");
+        assert_eq!(
+            max_heap_summary(&mut rt, previous),
+            (Some(1000), Some(true), Some(true), Some(false))
+        );
+        let stored = info_max_heap(&mut rt, pid);
+        assert_eq!(
+            max_heap_summary(&mut rt, stored),
+            (Some(1300), Some(false), Some(false), Some(true))
+        );
+
+        // The legacy bare-integer form is accepted and answers the same map shape.
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+        let mut pool = heap();
+        let previous = bridge
+            .process_flag(&mut pool, &atoms, flag, make_small(4000))
+            .unwrap()
+            .expect("a bare integer is a legal value");
+        assert_eq!(
+            max_heap_summary(&mut rt, previous),
+            (Some(1300), Some(false), Some(false), Some(true))
+        );
+        let stored = info_max_heap(&mut rt, pid);
+        assert_eq!(
+            max_heap_summary(&mut rt, stored),
+            (Some(4000), Some(true), Some(true), Some(false)),
+            "the integer form resets the flags to the emulator defaults"
+        );
+    }
+    /// Every `badarg` the oracle raises, and every value it **accepts**, at the bridge
+    /// boundary.
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1), each probed in a fresh process:
+    ///
+    /// ```text
+    /// badarg: #{}, #{kill => true}, #{size => 232}, #{size => -1}, #{size => 1.0},
+    ///         #{size => foo}, #{size => 1 bsl 70}, #{size => 1000, kill => 1},
+    ///         #{size => 1000, kill => foo}, #{size => 1000, error_logger => yes},
+    ///         #{size => 1000, include_shared_binaries => no}, #{size => 1000, kill => #{}},
+    ///         232, -1, 1.0, foo, [], {size, 1000}
+    /// ok:     #{size => 0}, #{size => 233}, #{size => 1000, zzz => 1},
+    ///         #{size => 1000, 1 => 2}, #{size => 1000, min_bin_vheap_size => 5000},
+    ///         #{size => 1000, include_shared_binary => true}, 233, 0, 4000
+    /// ```
+    ///
+    /// `232` is below the fresh process's `min_heap_size` (233) and `233` is not, which is the
+    /// C's `max_heap_size < MIN_HEAP_SIZE(BIF_P)` check (`bif.c:2155`).
+    #[test]
+    fn max_heap_size_rejections_and_acceptances_match_the_oracle() {
+        let mut rt = runtime();
+        let flag = atom(&mut rt, "max_heap_size");
+        let v_true = atom(&mut rt, "true");
+        let foo = atom(&mut rt, "foo");
+        let one = make_small(1);
+        // A boxed term that is not a small integer — the `1.0` / `1 bsl 70` probes' branch
+        // (`!is_small`, so `spawn_words` rejects it); a float term needs the crate-forbidden
+        // `unsafe` writer, and a list takes the very same path.
+        let not_a_small = {
+            let mut scratch = Heap::new(16).expect("a scratch heap");
+            scratch.cons(make_small(1), NIL).expect("a cons cell")
+        };
+
+        // The rejected values: `Ok(None)` is the hook's `badarg` contract.
+        let rejected: Vec<(&str, Eterm)> = vec![
+            ("empty map", max_heap_arg(&mut rt, &[])),
+            (
+                "no size, flags only",
+                max_heap_arg(&mut rt, &[("kill", Some(make_atom(v_true)))]),
+            ),
+            (
+                "size 232 (below the min heap)",
+                max_heap_arg(&mut rt, &[("size", Some(make_small(232)))]),
+            ),
+            (
+                "negative size",
+                max_heap_arg(&mut rt, &[("size", Some(make_small(-1)))]),
+            ),
+            (
+                "a boxed (non-small) size",
+                max_heap_arg(&mut rt, &[("size", Some(not_a_small))]),
+            ),
+            (
+                "atom size",
+                max_heap_arg(&mut rt, &[("size", Some(make_atom(foo)))]),
+            ),
+            (
+                "kill => 1",
+                max_heap_arg(
+                    &mut rt,
+                    &[("size", Some(make_small(1000))), ("kill", Some(one))],
+                ),
+            ),
+            (
+                "kill => foo",
+                max_heap_arg(
+                    &mut rt,
+                    &[("size", Some(make_small(1000))), ("kill", Some(make_atom(foo)))],
+                ),
+            ),
+            (
+                "error_logger => foo",
+                max_heap_arg(
+                    &mut rt,
+                    &[
+                        ("size", Some(make_small(1000))),
+                        ("error_logger", Some(make_atom(foo))),
+                    ],
+                ),
+            ),
+            (
+                "include_shared_binaries => foo",
+                max_heap_arg(
+                    &mut rt,
+                    &[
+                        ("size", Some(make_small(1000))),
+                        ("include_shared_binaries", Some(make_atom(foo))),
+                    ],
+                ),
+            ),
+            ("bare atom", make_atom(foo)),
+            ("bare negative integer", make_small(-1)),
+            ("bare boxed term", not_a_small),
+            ("bare nil", NIL),
+        ];
+        for (label, value) in rejected {
+            let atoms = rt.code_server.atoms_handle();
+            let ports = Rc::clone(&rt.ports);
+            let pid = rt.self_pid();
+            let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+            let mut pool = heap();
+            assert!(
+                bridge
+                    .process_flag(&mut pool, &atoms, flag, value)
+                    .unwrap()
+                    .is_none(),
+                "{label} must be the oracle's badarg"
+            );
+        }
+
+        // The accepted values, each in its own fresh runtime so the floor stays 233.
+        let accepted: Vec<(&str, Eterm)> = {
+            let mut rt = runtime();
+            vec![
+                ("size 0", max_heap_arg(&mut rt, &[("size", Some(make_small(0)))])),
+                (
+                    "size 233",
+                    max_heap_arg(&mut rt, &[("size", Some(make_small(233)))]),
+                ),
+                (
+                    "an unknown key",
+                    max_heap_arg(
+                        &mut rt,
+                        &[("size", Some(make_small(1000))), ("zzz", Some(one))],
+                    ),
+                ),
+                (
+                    "a misspelt flag",
+                    max_heap_arg(
+                        &mut rt,
+                        &[
+                            ("size", Some(make_small(1000))),
+                            ("include_shared_binary", Some(make_atom(v_true))),
+                        ],
+                    ),
+                ),
+                (
+                    "min_bin_vheap_size",
+                    max_heap_arg(
+                        &mut rt,
+                        &[("size", Some(make_small(1000))), ("min_bin_vheap_size", Some(one))],
+                    ),
+                ),
+                ("bare 0", make_small(0)),
+                ("bare 233", make_small(233)),
+                ("bare 4000", make_small(4000)),
+            ]
+        };
+        for (label, value) in accepted {
+            let atoms = rt.code_server.atoms_handle();
+            let ports = Rc::clone(&rt.ports);
+            let pid = rt.self_pid();
+            let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+            let mut pool = heap();
+            assert!(
+                bridge
+                    .process_flag(&mut pool, &atoms, flag, value)
+                    .unwrap()
+                    .is_some(),
+                "{label} must be accepted, as the oracle accepts it"
+            );
+        }
+    }
+    /// A rejected value leaves the setting **untouched** (oracle: set 2000, a `#{size => 232}`
+    /// `badarg`, then `process_info` still reports 2000), and the flag applies to the caller
+    /// only — a sibling process keeps the setting it was born with.
+    #[test]
+    fn a_rejected_max_heap_size_changes_nothing_and_the_flag_is_per_process() {
+        let mut rt = runtime();
+        let pid = rt.self_pid();
+        let flag = atom(&mut rt, "max_heap_size");
+        let other = rt.processes.spawn_default().expect("a sibling process");
+
+        let value = max_heap_arg(&mut rt, &[("size", Some(make_small(2000)))]);
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+        let mut pool = heap();
+        assert!(bridge
+            .process_flag(&mut pool, &atoms, flag, value)
+            .unwrap()
+            .is_some());
+        // The sibling is untouched by the caller's setting.
+        let sibling = info_max_heap(&mut rt, other);
+        assert_eq!(
+            max_heap_summary(&mut rt, sibling),
+            (Some(0), Some(true), Some(true), Some(false))
+        );
+
+        // A rejected value answers `badarg` and leaves the current setting in place.
+        let bad = max_heap_arg(&mut rt, &[("size", Some(make_small(232)))]);
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+        let mut pool = heap();
+        assert!(bridge
+            .process_flag(&mut pool, &atoms, flag, bad)
+            .unwrap()
+            .is_none());
+        let stored = info_max_heap(&mut rt, pid);
+        assert_eq!(
+            max_heap_summary(&mut rt, stored),
+            (Some(2000), Some(true), Some(true), Some(false))
+        );
+    }
+    /// The bound's floor is the **process's own** `min_heap_size`, not the emulator default:
+    /// a child spawned with `{min_heap_size, 1000}` has the rounded 1598, so `1597` is
+    /// `badarg` and `1598` is accepted — the oracle's exact boundary (probed).
+    #[test]
+    fn the_max_heap_size_floor_follows_the_process_own_min_heap_size() {
+        let mut rt = runtime();
+        let flag = atom(&mut rt, "max_heap_size");
+        let policy = beam_gc::HeapPolicy::from_spawn_opts(1000, 0, 65535);
+        assert_eq!(policy.min_heap_words, 1598, "the growth table's rounding");
+        let child = rt.processes.spawn(policy).expect("a child");
+
+        for (size, accepted) in [(1597_i64, false), (1598, true)] {
+            let value = max_heap_arg(&mut rt, &[("size", Some(make_small(size)))]);
+            let atoms = rt.code_server.atoms_handle();
+            let ports = Rc::clone(&rt.ports);
+            let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, child);
+            let mut pool = heap();
+            let result = bridge
+                .process_flag(&mut pool, &atoms, flag, value)
+                .unwrap();
+            assert_eq!(
+                result.is_some(),
+                accepted,
+                "size {size} against a 1598-word min_heap_size"
+            );
+        }
     }
 }

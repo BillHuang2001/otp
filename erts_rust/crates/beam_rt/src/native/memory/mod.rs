@@ -218,7 +218,7 @@ use beam_process::{MonitorKind, ProcessId};
 use beam_term::{make_small, Atom, Eterm, NIL};
 
 use super::RuntimeContext;
-use crate::config::MaxHeapFlags;
+use crate::config::MaxHeapSetting;
 
 mod binary;
 /// The C's `pi_1_keys[]` (`erl_bif_info.c:1008-1026`), in order — the item set *and* order
@@ -478,6 +478,14 @@ struct Snapshot {
     /// items are answered from here, so `process_info(Child, min_heap_size)` is the
     /// *child's* figure, never the emulator's.
     policy: beam_gc::HeapPolicy,
+    /// The target process's **own** `max_heap_size` setting — the four-key flag map
+    /// `process_info(Pid, max_heap_size)` and the `garbage_collection` item render.
+    ///
+    /// A process that set one through `erlang:process_flag(max_heap_size, …)` reports the
+    /// store's setting ([`Runtime::max_heap_setting`](crate::Runtime::max_heap_setting));
+    /// every other process reports the one it was born with — the policy's `max_heap_words`
+    /// (so `spawn_opt`'s `{max_heap_size, …}` is visible) plus the emulator's `+hmax*` flags.
+    max_heap: crate::config::MaxHeapSetting,
     /// The off-heap (MSO + refc binary) overhead, in bytes.
     off_heap_bytes: usize,
     /// The process's **live owned off-heap refc binaries**, in slot order, each as
@@ -920,9 +928,8 @@ impl RuntimeContext<'_> {
             "min_bin_vheap_size" => make_small(snapshot.policy.min_bin_vheap_words as i64),
             "fullsweep_after" => make_small(i64::from(snapshot.policy.fullsweep_after)),
             "max_heap_size" => {
-                let size = snapshot.policy.max_heap_words;
-                let flags = self.runtime.config().heap_options().max_heap_flags();
-                self.max_heap_size_map(size, flags)?
+                let setting = snapshot.max_heap;
+                self.max_heap_size_map(setting)?
             }
             // This runtime's real, current queue placement: [`beam_message::Queue`] is
             // heap-resident, so `on_heap` is the true value (an explicit
@@ -999,12 +1006,14 @@ impl RuntimeContext<'_> {
             snapshot.heap_size,
             snapshot.total_heap_size,
         );
-        let flags = self.runtime.config().heap_options().max_heap_flags();
+        let max_heap = snapshot.max_heap;
         let mut entries = Vec::with_capacity(5);
         for (key, value) in info.items() {
             let value = match key {
-                // The one item whose value is a container: the flag map.
-                "max_heap_size" => self.max_heap_size_map(value, flags)?,
+                // The one item whose value is a container, and the one whose figure is the
+                // process's own setting rather than the policy's (`process_flag` can replace
+                // it): the four-key flag map.
+                "max_heap_size" => self.max_heap_size_map(max_heap)?,
                 _ => make_small(value as i64),
             };
             let key = self.atom(key)?;
@@ -1014,12 +1023,17 @@ impl RuntimeContext<'_> {
     }
 
     /// The `max_heap_size` process-flag map: `#{size => N, kill => F, error_logger => F,
-    /// include_shared_binaries => F}` — the OTP defaults for a process with no explicit
-    /// limit (`kill`/`error_logger` on, shared binaries excluded), overridden by
-    /// `+hmaxk`/`+hmaxel`/`+hmaxib`. `size` is the raw word bound (0 = unlimited).
-    fn max_heap_size_map(&mut self, size: usize, flags: MaxHeapFlags) -> Result<Eterm> {
-        // The oracle's entry order (verified against OTP 29.1.1 / erts-17.1) — the same
-        // order the flag *map* is built in, `size` last.
+    /// include_shared_binaries => F}` — the setting the process reports (see
+    /// [`Snapshot::max_heap`]), rendered in the C's own key order
+    /// (`erts_max_heap_size_map`, `erl_gc.c:3807-3822`, verified against OTP 29.1.1 /
+    /// erts-17.1: `error_logger`, `include_shared_binaries`, `kill`, `size`).
+    ///
+    /// `size` is the raw word bound (`0` = unlimited), never a growth-table rounding.
+    /// `pub(crate)`: the `process_flag/2` bridge builds the **previous** value it returns
+    /// through this same builder ([`crate::context::process_bridge`]), so the two can never
+    /// render the map differently.
+    pub(crate) fn max_heap_size_map(&mut self, setting: MaxHeapSetting) -> Result<Eterm> {
+        let flags = setting.flags;
         let booleans = [
             ("error_logger", flags.error_logger),
             ("include_shared_binaries", flags.include_shared_binaries),
@@ -1030,7 +1044,7 @@ impl RuntimeContext<'_> {
             let value = self.atom(bool_atom(flag))?;
             pairs.push((self.atom(key)?, value));
         }
-        pairs.push((self.atom("size")?, make_small(size as i64)));
+        pairs.push((self.atom("size")?, make_small(setting.size as i64)));
         // An owned handle to the shared table keeps the caller's `&mut self` free for the
         // map builder (`terms::make_map` needs both the context and the table).
         let atoms = self.runtime.code_server.atoms_handle();
@@ -1124,6 +1138,14 @@ impl RuntimeContext<'_> {
             reductions: process.reductions(),
             minor_gcs: process.collector().minor_gcs(),
             policy: process.collector().policy().clone(),
+            // The process's own flag store wins; a process that never called
+            // `process_flag(max_heap_size, …)` reports the setting it was born with.
+            max_heap: self.runtime.max_heap_setting(pid).unwrap_or_else(|| {
+                MaxHeapSetting {
+                    size: process.collector().policy().max_heap_words,
+                    flags: self.runtime.config().heap_options().max_heap_flags(),
+                }
+            }),
             off_heap_bytes: process.off_heap().overhead_bytes(),
             off_heap_binaries: process
                 .off_heap_binaries()
