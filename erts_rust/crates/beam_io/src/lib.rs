@@ -38,7 +38,13 @@
 //!    it; the OS-child [`drivers::SpawnDriver`] `"spawn"`; the TCP socket
 //!    [`drivers::TcpInetDriver`] `"tcp_inet"` and the datagram [`drivers::UdpInetDriver`]
 //!    `"udp_inet"`; the in-memory [`drivers::RamFileDriver`] `"ram_file_drv"`) *and* a loaded
-//!    C driver `.so` present. The
+//!    C driver `.so` present. Of those names only `"tcp_inet"`, `"udp_inet"` and
+//!    `"ram_file_drv"` are **emulator** drivers — the statically-linked `driver_tab.c` set
+//!    ([`STATIC_SPAWN_DRIVERS`], the names `open_port({spawn_driver, Name}, …)` can resolve and
+//!    exactly what the oracle's `erl_ddll:loaded_drivers/0` reports); `"fd"`/`"efile"`/`"spawn"`
+//!    are this crate's own internal drivers and the oracle refuses `{spawn_driver,"fd"}` /
+//!    `{spawn_driver,"efile"}` with `badarg`, so a runtime gates on [`is_static_spawn_driver`] /
+//!    [`DriverRegistry::create_static_spawn`]. The
 //!    [`abi`] module is the frozen-C-ABI bridge (contract A.4): [`abi::DriverPort`] adapts a
 //!    `beam_abi::driver::loader::DriverLibrary` to [`Driver`](driver::Driver), [`abi::AbiHost`]
 //!    implements `beam_abi::driver::host::DriverHost` over this crate's poller/queues/timer,
@@ -149,7 +155,9 @@ pub use crate::timer::*;
 /// [`PortRegistry`], [`PortControl`], [`PortCommandOptions`]), the port-task machinery
 /// ([`PortTaskKind`], [`PortTask`], [`PortTaskQueue`], [`PortNotification`],
 /// [`PortTaskOutcome`], [`Readiness`]) the driver seam ([`Driver`], [`DriverContext`],
-/// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`PortExitReason`], [`FdDriver`],
+/// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`PortExitReason`],
+/// the emulator's statically-linked driver set ([`STATIC_SPAWN_DRIVERS`],
+/// [`is_static_spawn_driver`]), [`FdDriver`],
 /// [`EfileDriver`],
 /// [`SpawnDriver`], [`SpawnSpec`], [`SpawnOptions`], [`SpawnStream`], [`build_command`],
 /// [`TcpInetDriver`], [`InetState`]), the driver C-ABI host layer ([`DriverPort`],
