@@ -285,41 +285,39 @@ impl HeapPolicy {
         }
     }
 
-    /// The nursery size (in words) to use after a collection that left `live_words` of a
-    /// `capacity_words` nursery alive — the nursery half of the C's minor-time young-heap
-    /// resize (`next_heap_size(p, stack_size + MAX(size_before, need), 0)`,
-    /// `erl_gc.c:1493`) and of `adjust_after_fullsweep` (`erl_gc.c:2061-2098`).
+    /// The nursery size (in words) to use after a collection, from the `capacity_words` the
+    /// nursery chain had when it was collected and the `demand_words` the round observed — the
+    /// nursery half of the C's minor-time young-heap resize
+    /// (`next_heap_size(p, stack_size + MAX(size_before, need), 0)`, `erl_gc.c:1493`) and of
+    /// `adjust_after_fullsweep` (`erl_gc.c:2061-2098`).
     ///
-    /// The nursery is **bounded**: the *only* branch that grows it is a surviving set larger
-    /// than the nursery itself, so the capacity can never creep upward one collection at a
-    /// time. A nursery the round left mostly empty
-    /// ([`should_shrink`](Self::should_shrink)) falls back towards the live set; one that
-    /// turned out about right keeps its size. Either way the result is at least
-    /// [`need_reserve_words`](Self::need_reserve_words), so a shrunk nursery still starts the
-    /// next round with the documented reserve.
+    /// The nursery is **bounded**: the *only* branch that grows it needs
+    /// `demand_words > capacity_words`, so a demand the round actually demonstrated inside the
+    /// nursery (its occupancy, which can never exceed the chain's capacity) can never enlarge
+    /// it — the capacity can therefore not creep upward one collection at a time. A nursery the
+    /// round found over-provisioned ([`should_shrink`](Self::should_shrink)) falls back towards
+    /// the demand; one that turned out about right keeps its size. Either way the result is at
+    /// least [`need_reserve_words`](Self::need_reserve_words), so a shrunk nursery still starts
+    /// the next round with the documented reserve.
     ///
-    /// `live_words` is the count the collection **left in the nursery**, never its
-    /// pre-collection occupancy (a nursery is only collected when it is full, so the stale
-    /// fill is ≈ the capacity and would grow the nursery on *every* collection — the runaway
-    /// this rule exists to prevent). A minor passes the words it promoted
-    /// ([`GcStats::words_copied`](crate::GcStats), which for a minor is exactly the live young
-    /// words); a fullsweep evacuates the nursery into the mature generation, so it passes
-    /// `0`.
-    ///
-    /// Growing the nursery to cover a *larger single request* is not this rule's job — it is
-    /// [`ensure_capacity`](crate::Collector::ensure_capacity)'s (the explicit,
-    /// request-driven growth seam), which is why the nursery never has to grow merely because
-    /// a collection ran. Bounded by
+    /// `demand_words` is what the mutator needed between two collections, never a request for
+    /// a *single* allocation about to happen: growing the nursery to cover a larger single
+    /// request is [`ensure_capacity`](crate::Collector::ensure_capacity)'s job (the explicit,
+    /// request-driven growth seam), which is why the nursery never has to grow merely because a
+    /// collection ran. The callers pass, respectively, the words a minor **left alive in the
+    /// nursery** (the promoted set — the C's minor-time `size_before`) and the **occupancy a
+    /// fullsweep observed** before it relocated everything out (there is no surviving young set
+    /// to size from, and the C keeps the heap it had in exactly that situation). Bounded by
     /// [`min_heap_words`](Self::min_heap_words)/[`max_heap_words`](Self::max_heap_words).
-    pub fn young_after_collection(&self, capacity_words: usize, live_words: usize) -> usize {
-        let request = live_words.max(self.need_reserve_words);
+    pub fn young_after_collection(&self, capacity_words: usize, demand_words: usize) -> usize {
+        let request = demand_words.max(self.need_reserve_words);
         if request > capacity_words {
-            // A surviving set larger than the nursery: step up to the smallest curated size
-            // that covers it. This is the sole growth path, so the capacity is monotone only
-            // within one request — it can never grow per collection.
+            // A demand larger than the nursery: step up to the smallest curated size that
+            // covers it. This is the sole growth path, so the capacity is monotone only within
+            // one request — it can never grow per collection.
             self.next_words(request, 0)
         } else if self.should_shrink(capacity_words, request) {
-            // The round kept only a small part of the nursery: fall back to the live set.
+            // The round needed only a small part of the nursery: fall back to the demand.
             self.next_words(request, 0)
         } else {
             // The nursery turned out to be about right: keep it.

@@ -27,6 +27,10 @@ Sections:
   reclaims the chain, and why the debt is an opt-in signal.
 * [End-to-end RSS and latency](#end-to-end-rss-and-latency-ets_copy-a-b-at-this-commit) — the same A/B
   binary pair on a real `ets_copy` loop and on the `run` path's own loop probe.
+* [Per-op attribution of the `gc_bound/churn` shape](#per-op-attribution-of-the-gc_boundchurn-shape-the-collectors-own-counters)
+  — what the churn shape pays per operation.
+* [Post-fullsweep nursery sizing](#post-fullsweep-nursery-sizing-the-gc_boundchurn-win) — sizing the
+  young heap from the round's observed demand instead of from zero: the counters and the A/B.
 
 ## The allocation-heavy workload
 
@@ -609,3 +613,130 @@ runtime-spawned process reproduces the small-object/high-churn verdict exactly a
 **6.57×** the mature occupancy. That is why the automatic rule's default stays Copying and
 `MatureKind::Immix` remains an opt-in — `BEAM_RT_GC_STRATEGY=immix` raises the spawned policy's mature
 generation past the break-even. Load-invariant counts only; timings are not asserted.
+
+## Per-op attribution of the `gc_bound/churn` shape (the collector's own counters)
+
+Source: `tests/churn_attribution.rs` (`--nocapture`; deterministic counts only, no timing asserted). It
+reproduces the `tools/bench` `churn/1` allocation shape — LEN = 256 (a 512-word list built one cons cell at a
+time, a 256-byte binary copy-out, a 257-word tuple, two O(1) checks ⇒ **806 words allocated/op**, all of it
+garbage by the next op) — and drives it through the runtime's own heap-admission door
+(`Collector::should_collect` / `collection_debt` → `Collector::ensure_capacity`, i.e. `beam_rt`'s
+`collect_or_grow`) at the **default spawn policy**, with the op's intermediates held as roots.
+
+| per operation | in-crate instrument (4 000 ops) | `beam_rt` runner counters, same shape (`churn.beam`) |
+|---|---|---|
+| environment | `beam_gc` unit-shaped driver, `HeapPolicy::default()` | real runtime, scheduled slice |
+| words allocated | 806 (asserted from the shape) | ≈1 830 (3 × 256 cons + copy-out + tuple) |
+| collections | **2.00** | **7.00** |
+| — minor | 1.50 | 5.50 |
+| — major (fullsweep) | **0.50** | **1.50** |
+| words copied | **1 269.5** (1.58 × the allocated volume) | — |
+| words reclaimed (junk) | 806.6 (≈ all of it) | 1 825.8 |
+| objects copied | 418.0 | — |
+| words copied / collection | 634.6 | — |
+| growth events (space installs) | 1.00 | ≈1 |
+| debt admissions | 0.50 | — |
+| peak nursery capacity / occupancy | 609 / 347 words | 376 / 376 words |
+| peak mature capacity / occupancy | 2 586 / 2 074 words | 987 / 880 words |
+| fullsweep live set (min…peak) | 464 … 1 353 words | ≈500 words |
+
+**Reading the split.** The copy volume is the surprise: the collector copies **1.58× more words than the
+mutator allocates**, because a fullsweep re-copies the whole live set out of the *mature* generation, which
+has meanwhile accumulated promoted garbage (the mature never reclaims between fullsweeps). So per op the cost
+is `allocated words (806) + copied words (1 269) + one fresh mature install`, and the copied half is the
+larger one — but note it is paid *per collection*, so the number of collections per op multiplies whatever the
+copy loop costs.
+
+**Where the escalations come from (mechanism, `src/collector.rs:166-173`).** `Collector::collect` escalates a
+minor to a fullsweep whenever `mature.available_words() < nursery.used_words()` — the test is against the
+nursery's whole **occupancy**, not the live young set a minor would actually copy. The instrument records the
+escalation's inputs: the mature had as little as **1** free word when an escalation fired, against a nursery
+occupancy of up to **550**, so on this shape every escalation is a genuine "the mature is full of promoted
+garbage", not a conservative-test artifact. `fullsweep_after` (65 535) never fires: every one of the 0.5
+majors/op is **capacity**-forced, and the fresh mature space is sized by `mature_after_fullsweep(capacity,
+live, young_occupancy)`, which on this shape takes the grow branch or keeps the capacity — it never shrinks.
+
+**Bounded-growth sanity (asserted).** The nursery stays at a policy size (peak 609 words, `≤ 16 Ki` asserted),
+the mature at ≤ 64 Ki words asserted, and the chain never holds more than the one space a same-round growth
+retired (`peak_spaces ≤ 2`) — so nothing here is capacity creep.
+
+**Caveats.** In-crate numbers come from a debug-profile test binary on a shared host; they are counts, so they
+are load-invariant, but the *shape* is a model (the copy-out binary is a 33-word tuple, and the driver's doors
+sit on the op's own allocation boundaries rather than on the interpreter's `test_heap` instructions), which is
+why the runtime column differs in magnitude while agreeing on the structure: **one collection per few hundred
+admitted words, a fullsweep every second op, and a copy volume that exceeds the allocation volume**.
+
+## Post-fullsweep nursery sizing (the `gc_bound/churn` win)
+
+Source: `tests/churn_attribution.rs` (deterministic counters, load-invariant) plus the interleaved
+A/B of the two `beam_rt` binaries below.
+
+**The mechanism.** `collect_major` collapsed the nursery with `young_after_collection(capacity, 0)`,
+so every fullsweep re-sized the young heap from *nothing surviving* → `next_words(64, 0)` = the
+90-word reserve floor (floored by `min_heap_words` = 233). The half-fullsweep-per-op cadence therefore
+threw away a **settled 609-word nursery** on every second op, and the next op's `tuple need=257`
+allocation had to re-grow through `Nursery::grow` — the per-op space install the `perf` profile
+attributed to `beam_rt::context::gc` (12.7 % of samples, see the attribution section above).
+The C precedent is `erl_gc.c`'s `adjust_after_fullsweep`, whose `need_after = HEAP_TOP(p) -
+HEAP_START(p)` is the **young heap's occupancy**: the same `need` argument this crate's own
+`mature_after_fullsweep(capacity, live, young_occupancy)` already uses. `collect_major`, `run_major`
+and `relocate_major` now pass the occupancy sampled **before** the copy.
+
+| per operation (4 000 ops + 500 warm-up) | before | after |
+|---|---|---|
+| collections | 2.000 | **1.500** |
+| — minor | 1.500 | **1.000** |
+| — major (fullsweep) | 0.500 | 0.500 |
+| words copied | 1 269.5 | 1 283.5 (mildly worse) |
+| words reclaimed (junk) | 806.6 | 806.6 |
+| objects copied | 418.0 | 425.0 |
+| **growth events (space installs)** | **1.0004** | **0.0004** |
+| **debt admissions** | **0.5002** | **0.0002** |
+| peak nursery capacity / occupancy | 609 / 347 | 609 / **461** |
+| peak mature capacity / occupancy | 2 586 / 2 074 | 2 586 / **1 960** |
+| peak spaces | 1 | 1 |
+| fullsweep live set (min…peak) | 464 … 1 353 | 464 … 1 353 |
+| escalation (mature room min vs young occupancy max) | 1 vs 550 | 1 vs 550 |
+
+**What moved and what did not.** The install/displacement churn is gone (1.00 → ≈0 installs/op) and
+the collection count drops by a **third** (2.00 → 1.50/op: one minor/op instead of 1.5). The
+**major** count and the copy volume are *unchanged-to-mildly-worse* (1 269.5 → 1 283.5 words/op):
+the fullsweeps were capacity-forced by the mature generation's promoted garbage, not by the nursery
+collapse, so removing the collapse cannot remove them. The heap also holds more live occupancy
+(461 vs 347 young words) — the retained nursery is real retained space, and that is the trade.
+
+**Bounded-growth argument (asserted, not hoped).** `demand_words` is a space's own occupancy, and an
+occupancy can never exceed the chain's capacity (`demand_words <= capacity_words`); the only enlarging
+branch of `young_after_collection` requires `request > capacity_words`; therefore **`collapse` can
+never grow the nursery** — the post-fullsweep capacity is at most the pre-fullsweep one. The sole
+exception is the policy constant `need_reserve_words` (64) raising a nursery smaller than itself, which
+is a floor, not a workload function. The only enlarging seam stays the request-driven
+`Nursery::grow`/`ensure_capacity`. Pinned by `tests/post_fullsweep_nursery.rs` (capacity kept, floor
+kept over an untouched nursery, never above the collected capacity, a fixed demand converging to ONE
+constant post-fullsweep capacity) and by the re-pinned fixed points in `tests/nursery_chain.rs` and
+`tests/nursery_growth_retention.rs`.
+
+**A/B of the two runtimes on the same `.beam`.** The baseline binary was captured *before* the source
+change, then both binaries ran the extracted `bench_gc_bound:churn/1` module (LEN = 256) on
+`taskset -c 3`, alternating A,B inside every round, N = 2 000 churns, paired work-minus-startup.
+
+| run | paired rounds | base | new | ratio new/base | loadavg before → after |
+|---|---|---|---|---|---|
+| wall clock, 15 rounds | 15 | median 221.0 ms | median 213.0 ms | **0.964** | `4.48 5.80 9.72` → `3.45 5.42 9.47` |
+| wall clock, 21 rounds | 21 | mean 261.2 ms | mean 250.8 ms | **0.960** | `11.78 6.57 8.20` → `10.81 7.03 8.28` |
+| CPU time (`perf stat -e task-clock`), 15 rounds | 15 | 201.9–299.5 ms, mean 238.1 ms | 196.3–242.1 ms, mean 221.2 ms | **0.929** | `11.44 7.36 8.37` → `7.83 6.87 8.17` |
+
+**Caveats.** The host is shared (loadavg 3.5–12 during these runs) and paired wall differences
+alternated in sign across rounds, so **the wall figure is corroboration only** — no absolute time is
+quoted as evidence anywhere. The CPU-time (`task-clock`) run is the stabler of the two and agrees with
+the wall run to ≈3.5 %. The primary evidence is the deterministic counter table above, which is
+identical on every run. The residual costs are the fullsweep itself (capacity-forced by the mature
+garbage) and the copy loop — `beam_gc` is 4.2 % of the profile; the shape is dominated by the
+interpreter tier and `beam_bifs`' `Vec` churn, which is why the win is stated as **fewer collections
+and no per-op space install**, not as a large wall-clock reduction.
+
+**Sibling shapes (no regression).** `tests/allocation_heavy_workload.rs` and the corpus workloads are
+unchanged by construction (the rule only fires at a fullsweep collapse, and only when the round
+observed a non-empty nursery); the A/B on the same binary was not re-run per shape, so the honest
+statement is: no sibling-shape regression is expected or observed in the crate's own suites, but only
+the churn shape was A/B'd.

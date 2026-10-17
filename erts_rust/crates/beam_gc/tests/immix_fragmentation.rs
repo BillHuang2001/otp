@@ -36,7 +36,11 @@
 //! * **the promotion is atomic**: a [minor](GenImmixCollector::collect_minor) whose
 //!   reservation cannot place an object reports the typed heap exhaustion with the nursery
 //!   **byte-identical** (no marker written, no root rewritten) and a retry reproduces it, so
-//!   a half-forwarded heap is never observable;
+//!   a half-forwarded heap is never observable. Every object here is 7 lines and the packed
+//!   region has no 7-line run, so the refusal lands on the *first* reservation — the case
+//!   where nothing was placed yet. The harder case (objects placed, copied and marked, then a
+//!   later object refused, so the rollback really has to restore sources and un-claim lines)
+//!   is `tests/immix_promotion_rollback.rs`;
 //! * **the collector recovers**: [`GenImmixCollector::collect`] escalates such a minor to a
 //!   fullsweep, whose in-place reclaim (and, if needed, a freshly packed region) makes room —
 //!   so the round completes, the live set stays structurally intact, and every count this
@@ -252,7 +256,15 @@ fn a_refused_promotion_leaves_both_spaces_byte_identical() {
     assert_eq!(c.mature().free_lines(), 16);
 
     // A fresh 7-line promotion: the region has 16 free lines (so the region-wide pre-check
-    // passes) but no 7-line run anywhere.
+    // passes) but no 7-line run anywhere. Every object of this corpus is 7 lines, so the
+    // refusal lands on the **very first** reservation and the rollback's restore list is
+    // empty — this pins the "nothing was placed yet" case. The harder case, a refusal that
+    // rolls back copies already placed and lines already claimed, is
+    // `tests/immix_promotion_rollback.rs`.
+    assert!(
+        !c.mature().can_reserve(ELEMS + 1),
+        "no 7-line run exists, so the first reservation is the one refused"
+    );
     let mut roots = corpus(&mut c, ELEMS, round);
     assert_eq!(roots.len(), LIVE);
     let roots_before = roots.clone();
