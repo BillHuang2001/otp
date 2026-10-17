@@ -124,17 +124,20 @@ fn get_record_elements_with_no_fail_raises_function_clause() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::GetRecordElements {
-            fail: NO_FAIL,
-            src: Operand::X(0),
-            fields: vec![(Operand::Atom(z), Operand::X(1))],
-        },
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::GetRecordElements {
+                fail: NO_FAIL,
+                src: Operand::X(0),
+                fields: vec![(Operand::Atom(z), Operand::X(1))],
+            },
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "function_clause");
 }
 
@@ -152,17 +155,20 @@ fn a_no_fail_branch_whose_function_clause_atom_is_unnameable_is_a_typed_error() 
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::GetRecordElements {
-            fail: NO_FAIL,
-            src: Operand::X(0),
-            fields: vec![(Operand::Atom(z), Operand::X(1))],
-        },
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::GetRecordElements {
+                fail: NO_FAIL,
+                src: Operand::X(0),
+                fields: vec![(Operand::Atom(z), Operand::X(1))],
+            },
+            &mut ctx,
+        ),
+    );
     assert_eq!(
         reason,
         "unsupported_opcode: get_record_elements: no 'function_clause' atom in the module"
@@ -237,17 +243,20 @@ fn get_record_elements_id_with_no_fail_raises_function_clause() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::GetRecordElementsId {
-            fail: NO_FAIL,
-            id: Operand::Nil,
-            src: Operand::X(0),
-            fields: vec![(Operand::Atom(z), Operand::X(1))],
-        },
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::GetRecordElementsId {
+                fail: NO_FAIL,
+                id: Operand::Nil,
+                src: Operand::X(0),
+                fields: vec![(Operand::Atom(z), Operand::X(1))],
+            },
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "function_clause");
 }

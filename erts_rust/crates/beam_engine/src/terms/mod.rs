@@ -117,6 +117,8 @@ pub use fun::{
     fun_arity, fun_free, fun_index, fun_num_free, fun_true_arity, fun_uniq, is_fun, make_fun,
 };
 pub use fun::make_fun_rooted;
+#[cfg(test)]
+pub(crate) use fun::make_fun_external;
 pub use map::{is_hashmap, make_flatmap, make_flatmap_rooted, make_map, make_map_rooted, map_entries};
 pub use number::{float_value, make_float, make_float_rooted, make_integer, make_integer_rooted};
 pub(crate) use number::make_integer_unrooted;

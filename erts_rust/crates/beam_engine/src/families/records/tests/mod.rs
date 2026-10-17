@@ -153,18 +153,54 @@ fn run(
     exec(machine, module, labels, instr, 0, 0, ctx)
 }
 
-/// The reason **atom text** of a raise — either an engine diagnostic
-/// (`unsupported_opcode: <what>`) or a program-level reason atom
-/// (`function_clause`).
-fn raise_reason_atom(result: beam_common::Result<Option<Step>>) -> String {
-    match result.expect_err("expected a typed error") {
-        BeamError::Raise(raise) => raise
-            .reason
-            .as_atom()
-            .expect("the reason is an atom")
-            .to_string(),
+/// The reason **atom text** of an uncaught raise, for the two documented shapes the
+/// `NO_FAIL` path produces (see `mod.rs`'s [`fail_step`](super::fail_step)):
+///
+/// * the **engine diagnostic** — `unsupported_opcode: <what>: no 'function_clause'
+///   atom in the module`, carried as an atom [`ExitReason`] (no live reason term);
+/// * the **program-level failed-clause raise** — class `error` whose reason is the
+///   bare atom `function_clause`, resolved through the live atom namespace
+///   (`machine::namespace_atom`) and carried out of the machine as the raise's
+///   **live reason term**. An uncaught structured raise keeps
+///   `ExitReason::Structured` (so `as_atom()` answers `None` by design,
+///   `beam_common::ExitReason` is a unit variant) and the term rides
+///   `Raise::live_reason` ([`Machine::throw_with_trace`]'s uncaught arm), so the
+///   atom is rendered here through `module`'s own atom table — the table the raise
+///   resolved the index against.
+///
+/// A reason that is neither shape is a test failure, never a silently accepted
+/// value.
+fn raise_reason_atom(module: &Module, result: beam_common::Result<Option<Step>>) -> String {
+    let raise = match result.expect_err("expected a typed error") {
+        BeamError::Raise(raise) => raise,
         other => panic!("expected a typed raise, got {other:?}"),
+    };
+    assert_eq!(
+        raise.class,
+        beam_common::ExceptionClass::Error,
+        "both the diagnostic and the failed-clause raise are class `error`"
+    );
+    if let Some(diagnostic) = raise.reason.as_atom() {
+        assert!(
+            raise.live_reason().is_none(),
+            "an engine diagnostic carries no live reason term"
+        );
+        return diagnostic.to_string();
     }
+    let reason = raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .copied()
+        .expect("an uncaught structured raise carries its live reason term");
+    assert!(
+        beam_term::is_atom(reason),
+        "the failed-clause reason is the bare atom, got the term {reason:?}"
+    );
+    module
+        .atom_table
+        .name(beam_term::atom_val(reason))
+        .expect("the reason atom is one the running module can name")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------

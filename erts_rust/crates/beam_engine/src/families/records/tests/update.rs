@@ -145,20 +145,23 @@ fn put_record_with_no_fail_raises_function_clause() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::PutRecord(Box::new(PutRecordArgs {
-            fail: NO_FAIL,
-            id: Operand::Nil,
-            src: Operand::X(0),
-            dst: Operand::X(0),
-            live: 1,
-            updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-        })),
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::PutRecord(Box::new(PutRecordArgs {
+                fail: NO_FAIL,
+                id: Operand::Nil,
+                src: Operand::X(0),
+                dst: Operand::X(0),
+                live: 1,
+                updates: vec![(Operand::Atom(z), Operand::Integer(9))],
+            })),
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "function_clause");
 }
 
@@ -173,20 +176,23 @@ fn put_record_create_with_an_unknown_record_name_is_a_typed_error() {
     let (m, r, a) = (fx.atom("m"), fx.atom("r"), fx.atom("a"));
     let mut machine = Machine::with_max_register(4);
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::PutRecord(Box::new(PutRecordArgs {
-            fail: NO_FAIL,
-            id: Operand::Atom(r),
-            src: Operand::Nil,
-            dst: Operand::X(0),
-            live: 0,
-            updates: vec![(Operand::Atom(a), Operand::Integer(1))],
-        })),
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::PutRecord(Box::new(PutRecordArgs {
+                fail: NO_FAIL,
+                id: Operand::Atom(r),
+                src: Operand::Nil,
+                dst: Operand::X(0),
+                live: 0,
+                updates: vec![(Operand::Atom(a), Operand::Integer(1))],
+            })),
+            &mut ctx,
+        ),
+    );
     let _ = m;
     assert_eq!(
         reason,
@@ -208,20 +214,23 @@ fn put_record_create_for_another_module_is_a_typed_error() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(1, id).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::PutRecord(Box::new(PutRecordArgs {
-            fail: NO_FAIL,
-            id: Operand::X(1),
-            src: Operand::Nil,
-            dst: Operand::X(0),
-            live: 0,
-            updates: vec![(Operand::Atom(a), Operand::Integer(1))],
-        })),
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::PutRecord(Box::new(PutRecordArgs {
+                fail: NO_FAIL,
+                id: Operand::X(1),
+                src: Operand::Nil,
+                dst: Operand::X(0),
+                live: 0,
+                updates: vec![(Operand::Atom(a), Operand::Integer(1))],
+            })),
+            &mut ctx,
+        ),
+    );
     assert_eq!(
         reason,
         "unsupported_opcode: put_record: create: no record definition table for another module"
@@ -304,21 +313,24 @@ fn update_record_id_with_no_fail_raises_function_clause() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
-            fail: NO_FAIL,
-            hint: Operand::Nil,
-            id: Operand::Nil,
-            src: Operand::X(0),
-            dst: Operand::X(0),
-            live: 1,
-            updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-        })),
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
+                fail: NO_FAIL,
+                hint: Operand::Nil,
+                id: Operand::Nil,
+                src: Operand::X(0),
+                dst: Operand::X(0),
+                live: 1,
+                updates: vec![(Operand::Atom(z), Operand::Integer(9))],
+            })),
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "function_clause");
 }
 

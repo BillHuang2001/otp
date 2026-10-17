@@ -139,18 +139,21 @@ fn is_native_record_with_no_fail_raises_function_clause() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::IsNativeRecord {
-            fail: NO_FAIL,
-            src: Operand::X(0),
-            module: Operand::Atom(other),
-            name: Operand::Atom(r),
-        },
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::IsNativeRecord {
+                fail: NO_FAIL,
+                src: Operand::X(0),
+                module: Operand::Atom(other),
+                name: Operand::Atom(r),
+            },
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "function_clause");
 }
 
@@ -166,17 +169,20 @@ fn is_native_record_reads_the_module_and_name_operands_as_atoms() {
     machine.set_x(0, rec).unwrap();
     machine.set_x(1, make_small(3)).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::IsNativeRecord {
-            fail: NO_FAIL,
-            src: Operand::X(0),
-            module: Operand::X(1),
-            name: Operand::Atom(r),
-        },
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::IsNativeRecord {
+                fail: NO_FAIL,
+                src: Operand::X(0),
+                module: Operand::X(1),
+                name: Operand::Atom(r),
+            },
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "unsupported_opcode: is_native_record: module");
 }

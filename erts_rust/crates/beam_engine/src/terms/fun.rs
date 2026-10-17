@@ -91,6 +91,52 @@ pub fn make_fun(
     Ok(beam_term::make_boxed(root))
 }
 
+/// Builds an **external** fun — the `fun Module:Function/Arity` term C calls an
+/// `Export` (`EXPORT_EXT`; `optimize.h:53`, `erl_fun.h:79-85`).
+///
+/// The engine itself only ever *builds* `FunKind::Local` closures (`make_fun3`); an
+/// external fun reaches a process through the ETF decoder or a host seam, so this
+/// builder has **no production caller** in this crate and is compiled for the unit
+/// tests only (whose fixtures are the family tests that pin `call_fun`'s arity
+/// handling of that third kind, `src/families/funs/tests.rs`). It lives here — and
+/// not in the tests — because this module is the crate's **single raw-heap home**:
+/// the tests never write term words.
+///
+/// # Frozen word layout
+///
+/// Owned by [`beam_term::fun`]: the whole block is written by
+/// [`write_fun_external`](beam_term::fun::write_fun_external) and sized by
+/// [`fun_words`](beam_term::fun::fun_words)`(FunKind::External, 0)`. This function
+/// only obtains the storage from the execution context and forwards the call:
+///
+/// ```text
+/// word 0   MAKE_FUN_HEADER(arity & 0xFF, 0, external = 1)
+/// word 1   module    (atom term)
+/// word 2   function  (atom term)
+/// word 3   arity     (raw word — the TRUE arity, `exp->info.mfa.arity`)
+/// ```
+///
+/// An external fun carries no environment (`num_free == 0`) and its header `arity`
+/// field saturates at 255, while [`fun_true_arity`] reads the real arity from word 3.
+/// The pointer is valid until the next [`ExecutionContext::ensure_heap`] call.
+#[cfg(test)]
+pub(crate) fn make_fun_external(
+    ctx: &mut dyn ExecutionContext,
+    arity: u32,
+    module: beam_term::Atom,
+    function: beam_term::Atom,
+) -> Result<Eterm> {
+    let words = beam_term::fun::fun_words(beam_term::fun::FunKind::External, 0);
+    let hp = ctx.alloc_words(words)?;
+    // SAFETY: `alloc_words` returned exactly `fun_words(External, 0)` (4)
+    // exclusively-owned, writable words — the block the callee writes: the header,
+    // the `module` and `function` atom terms and the true arity. Nothing else
+    // reads them before the write completes.
+    let root = unsafe { beam_term::fun::write_fun_external(hp, arity as usize, module, function) }
+        .map_err(BeamError::from)?;
+    Ok(root)
+}
+
 /// The **rooted** twin of [`make_fun`]: builds a local **fun** (closure) term.
 ///
 /// # Frozen word layout

@@ -356,6 +356,14 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
     // -enable-feature native_record` ⇒ "the feature 'native_record' does not
     // exist"), so all 7 opcodes have ZERO corpus occurrences. Pinned anyway so a
     // future toolchain cannot regress them silently.
+    //
+    // A `NO_FAIL` (`fail == 0`) failure is the SAME DEFINED raise the core loop and
+    // the maps family produce: `fail_step` routes it to
+    // `raise_function_clause_no_fail`, i.e. class `error` with the bare atom
+    // `function_clause` resolved through the live atom namespace
+    // (`machine::namespace_atom`). The synthetic modules below cannot name that
+    // atom, so the honest typed gap pinned here is the reason-atom lookup, never a
+    // fall-through with a wrong value.
     {
         // `is_any_native_record` with a non-record source and `NO_FAIL`.
         let mut f = GapFixture::new();
@@ -372,7 +380,7 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         pin(
             "is_any_native_record/no_fail",
             run_gap(&module, entry, &[make_small(0)]),
-            "is_any_native_record/no_fail",
+            "is_any_native_record: no 'function_clause' atom in the module",
         );
     }
     {
@@ -442,7 +450,7 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         pin(
             "put_record/no_fail",
             run_gap(&module, entry, &[make_small(0)]),
-            "put_record/no_fail",
+            "put_record: no 'function_clause' atom in the module",
         );
     }
 

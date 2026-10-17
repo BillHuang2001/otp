@@ -153,16 +153,19 @@ fn is_record_accessible_with_no_fail_raises_function_clause() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::IsRecordAccessible {
-            fail: NO_FAIL,
-            src: Operand::X(0),
-            scope: Operand::Atom(external),
-        },
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::IsRecordAccessible {
+                fail: NO_FAIL,
+                src: Operand::X(0),
+                scope: Operand::Atom(external),
+            },
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "function_clause");
 }

@@ -634,6 +634,253 @@ fn a_wrong_arity_fun_never_reaches_the_seam_when_the_module_cannot_name_badarity
 }
 
 #[test]
+fn call_fun_with_a_matching_arity_external_fun_reaches_the_seam() {
+    // The arity guard is **kind-agnostic**: C compares the 8-bit *header* arity
+    // (`fun_arity(funp)`, `beam_common.c:1616`), which is the right field for a
+    // `make_fun3` closure *and* for an external `fun M:F/A` (`EXPORT_EXT`,
+    // `erl_fun.h:79-85`). A matching arity therefore falls through to the host
+    // closure-apply seam exactly as a local closure does — here the seam answers
+    // `Some((callee, label))`, so the engine enters it in this machine.
+    let mut fixture = Fixture::new();
+    let g = fixture.atom("g");
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+
+    let mut callee = Fixture::named("c");
+    let lambda = callee.add_function("g", 1, vec![Instr::Label(Label(30)), Instr::Return]);
+    let callee = Arc::new(callee.finish());
+
+    // The seam records every consultation: a matching-arity target must reach it
+    // exactly once, with the genuine external fun term and the call's arguments.
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorder = Rc::clone(&seen);
+    let mut ctx = MinimalContext::with_local_fun_resolver(Box::new(move |fun, args| {
+        recorder.borrow_mut().push((fun, args.to_vec()));
+        Ok(Some((Arc::clone(&callee), lambda)))
+    }));
+    // A genuine external `fun m:g/1`, called with ONE argument.
+    let fun = terms::make_fun_external(&mut ctx, 1, module.name, g)
+        .expect("materialize the external fun");
+    assert_eq!(terms::fun_arity(fun).unwrap(), 1, "the header arity is 1");
+    assert_eq!(
+        terms::fun_true_arity(fun).unwrap(),
+        1,
+        "`EXPORT_EXT` stores the true arity in descriptor word 3"
+    );
+    assert_eq!(
+        terms::fun_num_free(fun).unwrap(),
+        0,
+        "an external fun carries no environment"
+    );
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.set_x(0, make_small(7)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        5,
+        7,
+        &mut ctx,
+    )
+    .expect("a matching arity enters the resolved callee");
+    assert_eq!(
+        step,
+        Some(Step::Enter {
+            context: 1,
+            func: 0,
+            pc: 0,
+        })
+    );
+    assert_eq!(
+        *seen.borrow(),
+        vec![(fun, vec![make_small(7)])],
+        "the seam is consulted once with the external fun and the call arguments"
+    );
+    assert_eq!(
+        machine.x(1),
+        Some(fun),
+        "nothing is copied into `x(arity..)`: an external fun has no free variables"
+    );
+    let _ = entry;
+}
+
+#[test]
+fn call_fun_with_a_matching_arity_external_fun_reaches_the_apply_fun_fallback() {
+    // The same shape for a host that declines the in-machine seam (`Ok(None)`):
+    // the value-returning `apply_fun` receives the genuine external fun and the
+    // arguments, and its value lands in `x(0)`.
+    let mut fixture = Fixture::new();
+    let g = fixture.atom("g");
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+    let mut ctx = MinimalContext::with_apply_hook(Box::new(|fun, args| {
+        assert!(terms::is_fun(fun), "the fallback receives the genuine fun");
+        assert_eq!(
+            terms::fun_true_arity(fun).unwrap(),
+            1,
+            "the external fun keeps its true arity"
+        );
+        assert_eq!(args, [make_small(7)]);
+        Ok(make_small(41))
+    }));
+    let fun = terms::make_fun_external(&mut ctx, 1, module.name, g)
+        .expect("materialize the external fun");
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.set_x(0, make_small(7)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("a matching arity dispatches");
+    assert_eq!(step, Some(Step::Next));
+    assert_eq!(machine.x(0), Some(make_small(41)));
+    let _ = entry;
+}
+
+#[test]
+fn call_fun_with_a_wrong_arity_external_fun_raises_badarity() {
+    // A 2-ary external fun called with ONE argument is the same `EXC_BADARITY` the
+    // local-closure test above pins: C builds `fvalue = TUPLE2(fun, args)` from the
+    // **actual** argument list and `expand_error_value` wraps it as
+    // `{badarity, {Fun, Args}}`. The guard must precede the seam, so the seam is
+    // consulted zero times.
+    let mut fixture = Fixture::new();
+    fixture.atom("badarity");
+    fixture.atom("error");
+    let (g, one) = (fixture.atom("g"), fixture.atom("one"));
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    let consulted = Rc::new(RefCell::new(0u32));
+    let counter = Rc::clone(&consulted);
+    let mut ctx = MinimalContext::with_local_fun_resolver(Box::new(move |_fun, _args| {
+        *counter.borrow_mut() += 1;
+        Ok(None)
+    }));
+    // A genuine external `fun m:g/2`, called with ONE argument.
+    let fun = terms::make_fun_external(&mut ctx, 2, module.name, g)
+        .expect("materialize the external fun");
+    machine.set_x(0, make_atom(one)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("the raise lands in the live catch frame");
+    assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+    assert_eq!(*consulted.borrow(), 0, "the seam was never consulted");
+    assert_eq!(machine.x(0), Some(Eterm::non_value()), "x(0) = THE_NON_VALUE");
+    let inner = reason_value(&module, machine.x(1).unwrap(), "badarity");
+    assert_eq!(
+        terms::tuple_arity(inner).expect("`{Fun, Args}` is a 2-tuple"),
+        2
+    );
+    assert_eq!(
+        terms::tuple_element(inner, 0).expect("the fun"),
+        fun,
+        "the offending external FUN rides the reason"
+    );
+    assert_eq!(
+        terms::list_elements(terms::tuple_element(inner, 1).expect("the args list"))
+            .expect("a proper list"),
+        vec![make_atom(one)],
+        "the ACTUAL argument list rides the reason"
+    );
+    let _ = entry;
+}
+
+#[test]
+fn a_wrong_arity_external_fun_never_reaches_the_seam_when_the_module_cannot_name_badarity() {
+    // The arity test is **unconditional** — as for a local closure, only the
+    // structured *reason* depends on the module naming `badarity`. An atom-poor
+    // module therefore still refuses the mismatched external fun: the guard reports
+    // the typed `unsupported` naming the missing atom, and the closure-apply seam is
+    // never consulted (a mismatched target must never reach a host that does not
+    // re-validate).
+    let mut fixture = Fixture::new();
+    // Deliberately NO `badarity` atom: the module cannot name the reason tag.
+    let g = fixture.atom("g");
+    let entry = call_fun_caller(&mut fixture);
+    let module = fixture.finish();
+    assert!(
+        module.atom_table.lookup("badarity").is_none(),
+        "the fixture must not name the reason tag"
+    );
+
+    let consulted = Rc::new(RefCell::new(0u32));
+    let counter = Rc::clone(&consulted);
+    let mut ctx = MinimalContext::with_local_fun_resolver(Box::new(move |_fun, _args| {
+        *counter.borrow_mut() += 1;
+        Ok(None)
+    }));
+    // A genuine external `fun m:g/2`, called with ONE argument.
+    let fun = terms::make_fun_external(&mut ctx, 2, module.name, g)
+        .expect("materialize the external fun");
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    machine.set_x(0, make_small(1)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let err = exec(
+        &mut machine,
+        &module,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect_err("an unnameable `badarity` degrades the reason to a typed error");
+    assert_eq!(
+        *consulted.borrow(),
+        0,
+        "the arity guard runs before the closure-apply seam, so the seam is never consulted"
+    );
+    match err {
+        BeamError::Raise(raise) => assert_eq!(
+            raise.reason.as_atom(),
+            Some("unsupported_opcode: call_fun: no 'badarity' atom in the module"),
+            "the refusal names the missing atom; it never substitutes one"
+        ),
+        other => panic!("expected the typed unsupported, got {other:?}"),
+    }
+    assert_eq!(
+        machine.catch_frame_depth(),
+        1,
+        "a capability gap cannot land in a catch frame"
+    );
+    let _ = entry;
+}
+
+#[test]
 fn call_fun_with_a_matching_arity_still_reaches_the_apply_fun_fallback() {
     // The shape guard must not reject a well-formed closure: a 1-ary fun called
     // with one argument reaches the value-returning `apply_fun` fallback exactly as

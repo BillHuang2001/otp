@@ -262,18 +262,21 @@ fn get_record_field_with_no_fail_raises_function_clause() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(run(
+    let reason = raise_reason_atom(
         fx.module(),
-        &LabelMap::new(),
-        &mut machine,
-        &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
-            fail: NO_FAIL,
-            src: Operand::X(0),
-            id: Operand::Atom(r),
-            field: Operand::Atom(z),
-            dst: Operand::X(1),
-        })),
-        &mut ctx,
-    ));
+        run(
+            fx.module(),
+            &LabelMap::new(),
+            &mut machine,
+            &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
+                fail: NO_FAIL,
+                src: Operand::X(0),
+                id: Operand::Atom(r),
+                field: Operand::Atom(z),
+                dst: Operand::X(1),
+            })),
+            &mut ctx,
+        ),
+    );
     assert_eq!(reason, "function_clause");
 }
