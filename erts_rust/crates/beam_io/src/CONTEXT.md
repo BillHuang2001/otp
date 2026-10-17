@@ -16,6 +16,23 @@ denies `unsafe_code`, cannot issue itself) rather than parts of the I/O pipeline
 `fs_access.rs` (`access(2)` / `geteuid(2)` / `getegid(2)`, for the `file`/`filelib` floor). Their
 frozen APIs are documented in the parent `../CONTEXT.md` and in each module's own rustdoc.
 
+### The statically-linked driver set (`driver.rs` — the C `driver_tab.c` seam)
+Only the drivers the emulator **statically links** are addressable through
+`open_port({spawn_driver, Name}, …)`; `erts-*/lib/` ships zero `.so`, and the oracle's
+`erl_ddll:loaded_drivers/0` answers exactly `{ok,["tcp_inet","udp_inet","ram_file_drv"]}`
+(OTP 29.1.1 / erts-17.1). `driver.rs` exposes that set and nothing else there:
+- `STATIC_SPAWN_DRIVERS: [&str; 3]` — `["ram_file_drv","tcp_inet","udp_inet"]`, sorted; the
+  emulator's `driver_tab` entries, **not** `.so`-loadable.
+- `is_static_spawn_driver(name) -> bool` — membership in that set.
+- `DriverRegistry::with_static_spawn_drivers()` — a registry whose `names()` is exactly the three.
+- `DriverRegistry::create_static_spawn(name)` — the `{spawn_driver, Name}` resolution path: a
+  non-member is `BeamError::BadArg` (the oracle's `badarg` for `{spawn_driver,"fd"}` / `"efile"`)
+  *even on a registry that registers it*, then the ordinary factory lookup (so a static name
+  missing from *this* registry is also `BadArg`, never a wrong driver).
+`DriverRegistry::with_builtins()` still registers five names — `fd` and `efile` are this crate's
+own drivers (its internal users and tests build ports from them) — so a runtime must gate
+`{spawn_driver, Name}` on `create_static_spawn`, **not** on `with_builtins`/`create`.
+
 ### `{line, N}` line framing (`open_port(…, [line])` / `[binary, {line, N}]`)
 The C splits lines **in the port**, not in the driver: `open_port`'s bare `line` option sets
 `ERTS_PORT_SFLG_LINEBUF_IO` with a 512-byte line buffer and `{line, N}` sets it to `N`
