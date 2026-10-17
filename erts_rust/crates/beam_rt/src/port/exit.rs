@@ -169,6 +169,24 @@ impl PendingPortSignals {
         std::mem::take(&mut self.ready)
     }
 
+    /// Drops the deliverable entries whose recipient `alive` reports as gone.
+    ///
+    /// A signal is captured for **every** link/watcher of the closing port, but only the route
+    /// that owns a process table can deliver to all of them; a route that takes just its own
+    /// entries (the `-eval` receive) leaves the others queued for the scheduler. An entry
+    /// addressed to a process that has **already terminated** would otherwise sit in `ready`
+    /// forever — the recipient will never poll again — and would keep `ready` non-empty, so
+    /// [`is_empty`](Self::is_empty) would hold a port round permanently "pending work"
+    /// (`PortRegistry::has_nothing_to_poll`) with nothing to deliver.
+    ///
+    /// `alive` is a caller-supplied predicate rather than a table reference because the queue
+    /// lives in the port registry and the liveness authority is the process table: passing the
+    /// question keeps the two borrows disjoint (the registry borrow must not be held across a
+    /// re-entrant registry call — see `beam_io::PortRegistry::port_table_mut`).
+    fn prune(&mut self, mut alive: impl FnMut(ProcessId) -> bool) {
+        self.ready.retain(|signal| alive(signal.to));
+    }
+
     /// Takes the deliverable entries addressed to `to`, leaving the rest queued in order.
     fn take_for(&mut self, to: ProcessId) -> Vec<PortSignal> {
         let mut taken = Vec::new();
@@ -277,7 +295,17 @@ impl PortRegistry {
     pub(crate) fn take_port_signals_for(&mut self, to: ProcessId) -> Vec<PortSignal> {
         self.pending_port_signals.take_for(to)
     }
-}
+
+    /// Drops the queued signals whose recipient `alive` reports as gone — see
+    /// [`PendingPortSignals::prune`].
+    ///
+    /// Called by the `-eval` route ([`RuntimeContext::poll_port_signals`]), which is the one
+    /// route that takes only *its own* entries and therefore can leave a dead recipient's
+    /// entry behind. The scheduler route takes every entry and skips a dead recipient as it
+    /// delivers, so it never accumulates one.
+    pub(super) fn prune_dead_port_signals(&mut self, alive: impl FnMut(ProcessId) -> bool) {
+        self.pending_port_signals.prune(alive);
+    }}
 
 impl Runtime {
     /// Delivers every message a closing port owes into its recipient's mailbox, returning how
@@ -346,6 +374,15 @@ impl RuntimeContext<'_> {
             let mut registry = cell
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
+            // Every entry this route leaves behind belongs to another recipient — one that the
+            // scheduler route delivers to, or one that has already terminated. The second kind
+            // would never be delivered by anyone and would keep the queue (and therefore
+            // `has_nothing_to_poll`) non-empty forever, so it is dropped here, before the take
+            // that decides whether there is anything to return at all. The liveness question
+            // is asked of the process table while the registry borrow is live; it is a plain
+            // table read, never a re-entrant registry call.
+            let table = self.process_table();
+            registry.prune_dead_port_signals(|to| table.contains(to));
             registry.take_port_signals_for(pid)
         };
         if signals.is_empty() {
