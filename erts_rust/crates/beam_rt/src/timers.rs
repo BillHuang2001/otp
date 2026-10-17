@@ -172,15 +172,18 @@ pub(crate) fn timer_absolute_delay(term: Eterm, now_nanos: i64) -> beam_common::
 ///
 /// The runtime's monotonic clock is read through that registered BIF (see
 /// [`RuntimeHooksBridge::monotonic_now_nanos`][hooks]), so its value arrives as a term and has
-/// to be decoded. A reading is a **non-negative integer** in the runtime's native nanosecond
-/// unit: a small integer directly, or — only past `2^59` ns, i.e. after ~18 years of uptime —
-/// a one-limb bignum, which is folded here so a long-lived node's clock keeps working.
+/// to be decoded. A reading is an integer in the runtime's native nanosecond unit, counted from
+/// the ERTS monotonic epoch — so it is a large **negative** value that grows toward zero, and
+/// the ordinary shape is a **small integer**, which is returned directly (negatives included).
+/// A one-limb bignum (a reading past the 60-bit small range) is folded, so a very long-lived
+/// node's clock keeps working.
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`] for a term that is not an integer at all (unreachable from the BIF)
-/// and [`BeamError::SystemLimit`] for a reading this runtime cannot express as an `i64` (past
-/// ~292 years of uptime, or a negative one) — a typed refusal, never a truncated clock.
+/// [`BeamError::BadArg`] for a term that is not an integer at all (unreachable from the BIF),
+/// and [`BeamError::SystemLimit`] for a reading this runtime cannot express as an `i64` — a
+/// **negative** bignum, or one of two or more limbs (past `i64::MAX`) — a typed refusal, never a
+/// truncated clock.
 ///
 /// [hooks]: crate::context::RuntimeHooksBridge
 pub(crate) fn monotonic_nanos(reading: Eterm) -> beam_common::Result<i64> {
@@ -901,12 +904,17 @@ mod tests {
             reading(monotonic_nanos(make_small(1_234_567_890))),
             Ok(1_234_567_890)
         );
+        // The ordinary shape is a **negative** small: an ERTS-epoch reading just after start.
+        assert_eq!(
+            reading(monotonic_nanos(make_small(-576_460_751_781_294_187))),
+            Ok(-576_460_751_781_294_187)
+        );
     }
 
     #[test]
     fn a_one_limb_bignum_monotonic_reading_is_folded() {
-        // `erlang:monotonic_time/0` crosses the 60-bit small range only after ~18 years of
-        // uptime; the fold keeps a long-lived node's clock usable rather than refusing it.
+        // A reading only leaves the 60-bit small range when it exceeds `2^59` ns; the fold keeps
+        // a long-lived node's clock usable rather than refusing it.
         let mut heap = Heap::new(16).expect("a heap");
         assert_eq!(
             reading(monotonic_nanos(big(&mut heap, false, &[1 << 60]))),
@@ -917,7 +925,9 @@ mod tests {
     #[test]
     fn a_monotonic_reading_this_clock_cannot_express_is_a_typed_refusal() {
         let mut heap = Heap::new(16).expect("a heap");
-        // A negative bignum is not a monotonic reading.
+        // A **negative bignum** is not a reading this clock can produce: an ERTS-epoch reading is
+        // negative but starts just above `MIN_SMALL` and grows toward zero, so every negative
+        // reading is a small, and any bignum one is positive.
         assert_eq!(
             reading(monotonic_nanos(big(&mut heap, true, &[1]))),
             Err(Some("system_limit"))

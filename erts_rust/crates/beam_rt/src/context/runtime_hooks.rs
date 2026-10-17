@@ -53,12 +53,12 @@
 //!
 //! * `{abs, true}` **is** served, and its accepted window is the oracle's exactly
 //!   (`[erlang:system_info(start_time), erlang:system_info(end_time)]` in ms, see
-//!   [`crate::timers::timer_absolute_delay`]) — but this runtime's monotonic **origin** is
-//!   its own process start rather than ERTS's fixed interface instant, so the absolute values
-//!   it hands out are small positives rather than `-576460752000`-and-up. A value the oracle
-//!   rejects is rejected here too (the window is the same one); a value in that window but
-//!   outside *this* runtime's own clock range is accepted and simply fires at the next
-//!   scheduler pass, exactly as the C's wheel does with a deadline in the past.
+//!   [`crate::timers::timer_absolute_delay`]). This runtime's monotonic readings — the
+//!   `erlang:monotonic_time/0` value and [`crate::trace`]'s monotonic time stamps — count from
+//!   that same ERTS epoch, so an absolute time means the same instant under both runtimes. A
+//!   value outside the window is the oracle's `badarg`; a value inside it that lies in this
+//!   runtime's own past fires at the next scheduler pass, exactly as the C's wheel does with a
+//!   deadline in the past.
 //! * `statistics/1` serves **only** the keys this runtime can measure for real
 //!   (`run_queue`, the `run_queues`/`run_queue_lengths*`/`total_run_queue_lengths*` family,
 //!   `wall_clock`, `reductions`/`exact_reductions`, `context_switches`, `runtime`, `io`,
@@ -926,9 +926,9 @@ impl<'a> RuntimeHooksBridge<'a> {
     ///
     /// **Documented divergence (the epoch/scope, never the clock or counter).** The oracle's
     /// `wall_clock` total is measured from emulator start; this runtime anchors it at the
-    /// **first** `statistics(wall_clock)` read, because no earlier anchor is reachable from
-    /// this seam — the runtime's other monotonic origin lives inside `beam_bifs`
-    /// (`src/time.rs`) and exposes no reader. The numbers are therefore real elapsed time with
+    /// **first** `statistics(wall_clock)` read, because this seam carries no earlier anchor —
+    /// the `erlang:monotonic_time/0` clock is built inside `beam_bifs` (`src/time.rs`) and
+    /// exposes no reader to `beam_rt`. The numbers are therefore real elapsed time with
     /// a different zero, exactly the class of divergence as `erlang:processes/0` ("an answer
     /// that reads *this* runtime's own state"). The same "different zero" holds for
     /// `reductions` and `context_switches`: they count *this* runtime's own work from its own
@@ -1138,8 +1138,9 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// [`crate::timers::timer_delay`]. An **absolute** one (`{abs, true}`) is the remaining
     /// time to that Erlang monotonic time, computed by
     /// [`crate::timers::timer_absolute_delay`] against the runtime's own monotonic clock —
-    /// read from the registered `erlang:monotonic_time/0` by [`Self::monotonic_now_nanos`] so
-    /// that the subtraction cancels against the caller's value whatever the clock's origin.
+    /// read from the registered `erlang:monotonic_time/0` by [`Self::monotonic_now_nanos`], so
+    /// the subtraction happens on the very clock (and the very ERTS epoch) the caller's
+    /// absolute value is expressed in.
     ///
     /// The time argument is validated **first**, so a bad time is the oracle's `badarg` even
     /// when the option list also asks for the absolute form.
