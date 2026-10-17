@@ -1,0 +1,9 @@
+### tier control: interpreter (--quick --runtime rust)
+2026-10-17T04:55:09Z
+2.06 3.36 4.81 1/841 4
+### tier control: default baseline JIT (--quick --runtime rust)
+2026-10-17T04:56:35Z
+3.96 3.66 4.78 1/855 824
+### after tier controls
+2026-10-17T04:57:34Z
+2.74 3.35 4.60 1/859 1644
