@@ -811,14 +811,14 @@ impl Machine {
         let apply_atom = module.atom_table.lookup("apply");
         // C's `apply()` checks `is_not_atom(function)` up front, before the loop.
         if !is_atom(function_term) {
-            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
         }
         // C's nested `apply of apply/3` unwrap (`beam_common.c:1462-1497`): while the
         // target is `erlang:apply` and `Args` is exactly `[M, F, Inner]`, replace
         // `(Module, Function, Args)` with `(M, F, Inner)` and repeat.
         loop {
             if !is_atom(module_term) {
-                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
             }
             let is_erlang = erlang_atom.is_some_and(|a| atom_val(module_term) == a);
             let is_apply = apply_atom.is_some_and(|a| atom_val(function_term) == a);
@@ -832,7 +832,7 @@ impl Machine {
             function_term = f;
             args_term = inner;
             if !is_atom(function_term) {
-                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
             }
         }
         // Walk the argument list into `x(0..N)` (C's `beam_common.c:1503-1516`). A
@@ -852,7 +852,7 @@ impl Machine {
             cursor = crate::terms::cons_tail(cursor)?;
         }
         if !is_nil(cursor) {
-            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
         }
         // `fixed_apply`'s register shape for the resolved `M`/`F`: the module is
         // `x(N)` and the function is `x(N+1)`, with the arguments in `x(0..N)`.

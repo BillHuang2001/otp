@@ -85,7 +85,7 @@ pub(super) fn fconv(
         // A non-numeric source, and a bignum that is not a finite double, are
         // both the `$BADARITH0` raise; `fconv` has no fail label, so it goes
         // through the catch machinery.
-        Conv::BadArith => return raise_badarith(machine, module).map(Some),
+        Conv::BadArith => return raise_badarith(machine, module, ctx).map(Some),
     };
     write_operand(machine, dst, value)?;
     Ok(Some(Step::Next))

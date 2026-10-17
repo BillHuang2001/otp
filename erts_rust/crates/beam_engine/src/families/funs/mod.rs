@@ -123,7 +123,7 @@ use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm};
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::families::exceptions::callee;
-use crate::machine::{Continuation, Machine};
+use crate::machine::{namespace_atom, Continuation, Machine};
 use crate::operand::{
     operand_slack_words, read_operand, read_operand_slack, read_operands_slack, write_operand,
 };
@@ -360,8 +360,8 @@ impl FunSource<'_> {
 /// `beam_rt` seeds from the shared core-atom set. A module that cannot name the
 /// tag yields the typed `unsupported` rather than a substituted, wrong atom (the
 /// same convention `EXIT`/`badfield`/`{badmatch,_}` follow).
-fn reason_atom(module: &Module, name: &str) -> Result<Atom> {
-    module.atom_table.lookup(name).ok_or_else(|| {
+fn reason_atom(ctx: &dyn ExecutionContext, module: &Module, name: &str) -> Result<Atom> {
+    namespace_atom(ctx, module, name).ok_or_else(|| {
         error::unsupported(&format!("call_fun: no '{name}' atom in the module"))
     })
 }
@@ -370,8 +370,13 @@ fn reason_atom(module: &Module, name: &str) -> Result<Atom> {
 /// structured reason builder in this file uses (the `error` class atom is
 /// installed only when the module names it, exactly as `records::create_failure`
 /// and `exceptions::raise_error_tuple` do).
-fn raise_reason(machine: &mut Machine, module: &Module, reason: Eterm) -> Result<Step> {
-    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+fn raise_reason(
+    machine: &mut Machine,
+    module: &Module,
+    reason: Eterm,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Step> {
+    if let Some(class_atom) = namespace_atom(ctx, module, ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
     machine.throw_error(reason)
@@ -391,7 +396,7 @@ fn raise_badfun(
     source: &FunSource<'_>,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
-    let tag = reason_atom(module, "badfun")?;
+    let tag = reason_atom(ctx, module, "badfun")?;
     let extra = source.slack_words();
     let reason = terms::make_tuple_rooted(
         machine,
@@ -401,7 +406,7 @@ fn raise_badfun(
         extra,
         |m, slack| Ok(vec![make_atom(tag), source.read_slack(m, slack)?]),
     )?;
-    raise_reason(machine, module, reason)
+    raise_reason(machine, module, reason, ctx)
 }
 
 /// Raise the C's `EXC_BADARITY` reason `{badarity, {Fun, Args}}` — the target IS a
@@ -424,7 +429,7 @@ fn raise_badarity(
     arity: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
-    let tag = reason_atom(module, "badarity")?;
+    let tag = reason_atom(ctx, module, "badarity")?;
     let extra = 3 + 2 * arity as usize + source.slack_words();
     let reason = terms::make_tuple_rooted(
         machine,
@@ -440,7 +445,7 @@ fn raise_badarity(
             Ok(vec![make_atom(tag), inner])
         },
     )?;
-    raise_reason(machine, module, reason)
+    raise_reason(machine, module, reason, ctx)
 }
 
 /// The shared `call_fun`/`call_fun2` dispatch — the in-machine *closure-apply* seam.
@@ -519,7 +524,7 @@ fn call_fun(
         // name the tag; otherwise fall through to the seam below (see the doc
         // comment: `beam_rt` seeds `badfun`, so the real runtime always takes this
         // path, while an atom-poor test module reaches the `apply_fun` fallback).
-        if module.atom_table.lookup("badfun").is_some() {
+        if namespace_atom(ctx, module, "badfun").is_some() {
             return raise_badfun(machine, module, &source, ctx).map(Some);
         }
     } else if terms::fun_arity(fun)? != arity {
@@ -641,7 +646,7 @@ pub(crate) fn apply_target(
         atom_name(ctx, module, function_term),
     ) {
         (Ok(module_name), Ok(function_name)) => (module_name, function_name),
-        _ => return raise_badarg(machine, module).map(ApplyTarget::Raised),
+        _ => return raise_badarg(machine, module, ctx).map(ApplyTarget::Raised),
     };
     let args = register_args(machine, arity)?;
     // The triple handed to the host is exactly the one `call_bif` receives (the
@@ -719,15 +724,18 @@ pub(crate) fn apply_target(
 /// unchanged as the typed [`BeamError::BadArg`] (the same uncaught-error contract
 /// the interpreter's `raise_bif_error` follows). The `error` class atom is
 /// installed when the module has it, which is what a landing places in `x(3)`.
-pub(crate) fn raise_badarg(machine: &mut Machine, module: &Module) -> Result<Step> {
+pub(crate) fn raise_badarg(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Step> {
     if machine.catch_frame_depth() == 0 {
         return Err(BeamError::BadArg);
     }
-    let atom = module
-        .atom_table
-        .lookup("badarg")
-        .ok_or(BeamError::BadArg)?;
-    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+    let Some(atom) = namespace_atom(ctx, module, "badarg") else {
+        return Err(BeamError::BadArg);
+    };
+    if let Some(class_atom) = namespace_atom(ctx, module, ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
     machine.throw_error(make_atom(atom))

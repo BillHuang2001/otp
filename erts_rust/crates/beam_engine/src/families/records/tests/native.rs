@@ -130,15 +130,16 @@ fn is_native_record_branches_to_fail_on_a_non_record() {
 }
 
 #[test]
-fn is_native_record_with_no_fail_is_a_capability_gap() {
+fn is_native_record_with_no_fail_raises_function_clause() {
     let mut fx = Fixture::new();
     let (m, r, other) = (fx.atom("m"), fx.atom("r"), fx.atom("other"));
+    fx.atom("function_clause");
     let mut ctx = MinimalContext::new();
     let rec = record(&mut ctx, m, r, false, &[]);
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -150,7 +151,7 @@ fn is_native_record_with_no_fail_is_a_capability_gap() {
         },
         &mut ctx,
     ));
-    assert_eq!(reason, "unsupported_opcode: is_native_record/no_fail");
+    assert_eq!(reason, "function_clause");
 }
 
 #[test]
@@ -165,7 +166,7 @@ fn is_native_record_reads_the_module_and_name_operands_as_atoms() {
     machine.set_x(0, rec).unwrap();
     machine.set_x(1, make_small(3)).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,

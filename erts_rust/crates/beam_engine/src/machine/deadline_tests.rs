@@ -57,8 +57,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use beam_common::BeamError;
-use beam_loader::{load_file, HeapNeed, Instr, Label, Module, Operand};
-use beam_term::{make_atom, Atom, Eterm};
+use beam_loader::{load_file, HeapNeed, Instr, Label, Module, Operand, Reg, TypeIndex};
+use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 use super::test_support::{seam, EmptyMailbox, Fixture};
 use super::{Machine, RunOutcome, WaitDeadline};
@@ -241,9 +241,7 @@ fn a_blocking_entry_after_timeout_fires_at_the_deadline() {
 
 // ---------------------------------------------------------------------------
 // The cross-module park: the deadline belongs to the callee, not the entry module
-// ---------------------------------------------------------------------------
-
-/// The caller module `m`: `run/0` allocates a frame, `call_ext`s `c:recv_timeout/0`,
+// ---------------------------------------------------------------------------/// The caller module `m`: `run/0` allocates a frame, `call_ext`s `c:recv_timeout/0`,
 /// then deallocates and returns the callee's value.
 fn caller_module() -> (Module, Atom) {
     let mut f = Fixture::new("m");
@@ -345,4 +343,36 @@ fn a_cross_module_park_reads_the_callee_deadline_not_the_entry_module() {
             .expect("the callee's after clause names `timed_out`"),
     );
     assert_eq!(resumed, RunOutcome::Returned(timed_out));
+}
+
+// ---------------------------------------------------------------------------
+// The operand reader: a `z,5` `tr` typed register is its underlying register
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_typed_register_operand_reads_the_delay_of_its_underlying_register() {
+    // `timeout_delay` is the *operand* reader, so it accepts exactly the shapes a
+    // `wait_timeout` carries. The `z,5` `tr` annotated register is one of them: every
+    // other operand reader (`crate::operand::read_operand`) treats it as its underlying
+    // `x`/`y` slot, the `Type` annotation being a compiler hint. Refusing it would
+    // report "no deadline" for a delay that is right there in the register.
+    let module = Module::default();
+    let mut machine = Machine::new();
+    machine.set_x(0, make_small(25)).unwrap();
+    machine.push_frame(1).unwrap();
+    machine.set_y(0, make_small(30)).unwrap();
+
+    let typed = |reg| Operand::Typed {
+        reg,
+        ty: TypeIndex(0),
+    };
+    assert_eq!(machine.timeout_delay(&module, &typed(Reg::X(0))), Some(25));
+    assert_eq!(machine.timeout_delay(&module, &typed(Reg::Y(0))), Some(30));
+    // The plain registers read identically (the typed form widens, it does not change
+    // the answer), and an unreadable value is still "no deadline".
+    assert_eq!(machine.timeout_delay(&module, &Operand::X(0)), Some(25));
+    machine.set_x(1, make_small(0)).unwrap();
+    assert_eq!(machine.timeout_delay(&module, &typed(Reg::X(1))), None);
+    machine.set_x(2, NIL).unwrap();
+    assert_eq!(machine.timeout_delay(&module, &typed(Reg::X(2))), None);
 }

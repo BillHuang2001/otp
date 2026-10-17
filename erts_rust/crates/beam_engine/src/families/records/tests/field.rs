@@ -253,15 +253,16 @@ fn get_record_field_foreign_form_branches_to_fail_on_a_name_mismatch() {
 }
 
 #[test]
-fn get_record_field_with_no_fail_is_a_capability_gap() {
+fn get_record_field_with_no_fail_raises_function_clause() {
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (rec, _a, _b, r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
+    fx.atom("function_clause");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -274,5 +275,5 @@ fn get_record_field_with_no_fail_is_a_capability_gap() {
         })),
         &mut ctx,
     ));
-    assert_eq!(reason, "unsupported_opcode: get_record_field/no_fail");
+    assert_eq!(reason, "function_clause");
 }

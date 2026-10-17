@@ -166,7 +166,7 @@ pub(crate) fn exec(
         // `badrecord Src` ⇒ `{badrecord,Src}` (class error).
         Instr::Badrecord { value } => raise_error_tuple(machine, module, ctx, "badrecord", value),
         // `if_end` ⇒ the bare atom `if_clause` (class error).
-        Instr::IfEnd => raise_error_atom(machine, module, "if_clause"),
+        Instr::IfEnd => raise_error_atom(machine, module, ctx, "if_clause"),
 
         // `raise Trace Value` — the re-raise tail of a handler (`{bif,raise,...}`).
         // C's `i_raise` copies the reason + raw stacktrace but never touches
@@ -177,7 +177,7 @@ pub(crate) fn exec(
             let class = machine.pending_class().ok_or_else(|| {
                 error::unsupported("exceptions: raise with no exception being handled")
             })?;
-            let _ = install_class_atom(machine, module, class);
+            let _ = install_class_atom(machine, module, ctx, class);
             machine.throw_with_trace(class, value, trace).map(Some)
         }
 
@@ -356,7 +356,7 @@ pub(crate) fn exec(
                     // present in the module atom table and the landing can install
                     // it in `x(3)` (C stores the class in the `StackTrace` struct
                     // *and* in `c_p->freason`, `beam_common.c:1151-1175`).
-                    install_class_atom(machine, module, class)?;
+                    install_class_atom(machine, module, ctx, class)?;
                     machine.throw_with_trace(class, value, trace).map(Some)
                 }
                 None => {

@@ -140,9 +140,11 @@
 //!   these through an `ASSERT(is_record(src))` because the compiler always puts the
 //!   corresponding guard in front; treating a non-record as a failed guard is the
 //!   same decision that guard would have made and never fabricates a value.
-//! * `fail == NO_FAIL` (the compiler promised the guard cannot fail) ⇒ the typed
-//!   `error::unsupported("<instr>/no_fail")` — never a fall-through with a wrong
-//!   result, and never a fabricated BEAM exception reason.
+//! * `fail == NO_FAIL` (the compiler promised the guard cannot fail) ⇒ the engine's
+//!   one failed-clause raise, class `error` with the bare atom `function_clause`
+//!   ([`crate::interpreter::raise_function_clause_no_fail`]) — C's branchless
+//!   `FAIL(0)` reaches exactly that raise through `func_info`/`handle_error`, and
+//!   every family routes it the same way. Never a fall-through with a wrong result.
 //! * A genuine **capability gap** ⇒ a typed `error::unsupported("<instr>: <what>")`.
 //!   The one such gap here is the *create* form of [`Instr::PutRecord`] with an
 //!   `Id` naming **another module's** record: the C resolves such a definition
@@ -164,8 +166,6 @@ mod raw;
 #[cfg(test)]
 mod tests;
 
-use crate::interpreter::LabelMap;
-
 use beam_common::{ExceptionClass, Result};
 use beam_loader::{
     GetRecordFieldArgs, Instr, Label, Module, Operand, PutRecordArgs, RecordDefinition,
@@ -175,7 +175,7 @@ use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
-use crate::interpreter::resolve;
+use crate::interpreter::{raise_function_clause_no_fail, resolve, LabelMap};
 use crate::machine::Machine;
 use crate::operand::{operand_slack_words, read_operand, read_operand_slack, write_operand};
 use crate::predicates;
@@ -286,7 +286,7 @@ pub(crate) fn exec(
             if predicates::is_record(source) {
                 Ok(Some(Step::Next))
             } else {
-                Ok(Some(fail_step(labels, *fail, "is_any_native_record")?))
+                Ok(Some(fail_step(machine, module, labels, *fail, "is_any_native_record", ctx)?))
             }
         }
 
@@ -305,7 +305,7 @@ pub(crate) fn exec(
             if raw::record_is_native(source, owner, name) {
                 Ok(Some(Step::Next))
             } else {
-                Ok(Some(fail_step(labels, *fail, "is_native_record")?))
+                Ok(Some(fail_step(machine, module, labels, *fail, "is_native_record", ctx)?))
             }
         }
 
@@ -369,6 +369,7 @@ pub(crate) fn exec(
             }
             Ok(Some(update_native_record(
                 machine,
+                module,
                 labels,
                 "put_record",
                 *fail,
@@ -396,7 +397,7 @@ pub(crate) fn exec(
             if accessible {
                 Ok(Some(Step::Next))
             } else {
-                Ok(Some(fail_step(labels, *fail, "is_record_accessible")?))
+                Ok(Some(fail_step(machine, module, labels, *fail, "is_record_accessible", ctx)?))
             }
         }
 
@@ -442,6 +443,7 @@ pub(crate) fn exec(
             } = &**b;
             Ok(Some(update_native_record(
                 machine,
+                module,
                 labels,
                 "update_record_id",
                 *fail,
@@ -459,16 +461,25 @@ pub(crate) fn exec(
 /// The `$FAIL($Fail)` decision shared by every native-record guard.
 ///
 /// A live label is a jump; [`NO_FAIL`] — the compiler's "this test cannot fail"
-/// marker — is the typed `unsupported("<instruction>/no_fail")`, because falling
-/// through would produce a *wrong result* and inventing a BEAM exception reason
-/// would fabricate ground truth the C keeps in `p->freason`/`p->fvalue`.
+/// marker — is the engine's single failed-clause raise, exactly as the sibling
+/// families route it: C's branchless `FAIL(0)` (`emu/macros.tab:56`) sets **no**
+/// reason and reaches the raise through `func_info`/`handle_error`
+/// (`beam_common.c:448-544`), which is class `error` with the bare atom
+/// `function_clause` — [`crate::interpreter::raise_function_clause_no_fail`]
+/// (`families::maps::fail_or_function_clause` is the same route). The reason and
+/// class atoms resolve through the live atom namespace, so a name only the host's
+/// shared table knows still raises; a name **neither** source knows is the honest
+/// typed `error::unsupported`, never a substituted atom.
 fn fail_step(
+    machine: &mut Machine,
+    module: &Module,
     labels: &LabelMap,
     fail: Label,
     instruction: &str,
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
     if fail == NO_FAIL {
-        return Err(error::unsupported(&format!("{instruction}/no_fail")));
+        return raise_function_clause_no_fail(machine, module, instruction, ctx);
     }
     let (func, pc) = resolve(labels, fail)?;
     Ok(Step::Goto { func, pc })
@@ -568,13 +579,13 @@ fn get_record_elements(
 ) -> Result<Step> {
     let source = read_operand(machine, ctx, src)?;
     if !predicates::is_record(source) {
-        return fail_step(labels, fail, instruction);
+        return fail_step(machine, module, labels, fail, instruction, ctx);
     }
     for (field, dst) in fields {
         let key = read_atom(machine, ctx, field, instruction)?;
         match raw::record_get(source, key, &module.atom_table)? {
             Some(value) => write_operand(machine, dst, value)?,
-            None => return fail_step(labels, fail, instruction),
+            None => return fail_step(machine, module, labels, fail, instruction, ctx),
         }
     }
     Ok(Step::Next)
@@ -604,23 +615,23 @@ fn get_record_field(
     let source = read_operand(machine, ctx, src)?;
     if !predicates::is_record(source) {
         // `is_not_record(src)` ⇒ `badrecord` ⇒ `$FAIL_HEAD_OR_BODY`.
-        return fail_step(labels, fail, instruction);
+        return fail_step(machine, module, labels, fail, instruction, ctx);
     }
     match read_record_id(machine, ctx, id, instruction)? {
         RecordId::Local(name) => {
             // `if (name != am_Underscore && defp->name != name) goto badrecord;`
             if module.atom_name(name) != Some(UNDERSCORE) && !raw::record_name_is(source, name) {
-                return fail_step(labels, fail, instruction);
+                return fail_step(machine, module, labels, fail, instruction, ctx);
             }
         }
         RecordId::Foreign { module: owner, name } => {
             // `if (defp->module != module || defp->name != name) goto badrecord;`
             if !raw::record_is_native(source, owner, name) {
-                return fail_step(labels, fail, instruction);
+                return fail_step(machine, module, labels, fail, instruction, ctx);
             }
             // `if (defp->is_exported == am_false) goto badrecord;`
             if !raw::record_is_exported(source)? {
-                return fail_step(labels, fail, instruction);
+                return fail_step(machine, module, labels, fail, instruction, ctx);
             }
         }
     }
@@ -631,7 +642,7 @@ fn get_record_field(
             Ok(Step::Next)
         }
         // The C's `badfield` after scanning every key.
-        None => fail_step(labels, fail, instruction),
+        None => fail_step(machine, module, labels, fail, instruction, ctx),
     }
 }
 
@@ -861,7 +872,7 @@ fn create_failure(
     field: Atom,
 ) -> Result<Step> {
     if fail != NO_FAIL {
-        return fail_step(labels, fail, instruction);
+        return fail_step(machine, module, labels, fail, instruction, ctx);
     }
     let tag = module.atom_table.lookup(tag).ok_or_else(|| {
         error::unsupported(&format!(
@@ -947,6 +958,7 @@ fn write_local_record(
 /// [`Instr::UpdateRecord`] documents.
 fn update_native_record(
     machine: &mut Machine,
+    module: &Module,
     labels: &LabelMap,
     instruction: &str,
     fail: Label,
@@ -959,7 +971,7 @@ fn update_native_record(
     // source's field count is metadata of the record's own definition.
     let probe = read_operand(machine, ctx, src)?;
     if !predicates::is_record(probe) {
-        return fail_step(labels, fail, instruction);
+        return fail_step(machine, module, labels, fail, instruction, ctx);
     }
     let count = raw::definition_field_count(record_definition(probe, instruction)?)?;
 
@@ -980,7 +992,7 @@ fn update_native_record(
     if !predicates::is_record(source) {
         // Unreachable — `probe` already tested this very term — but reported rather
         // than dereferenced as a record.
-        return fail_step(labels, fail, instruction);
+        return fail_step(machine, module, labels, fail, instruction, ctx);
     }
     let definition = record_definition(source, instruction)?;
     let keys = raw::definition_keys(definition)?;
@@ -990,7 +1002,7 @@ fn update_native_record(
         let key = read_atom(machine, ctx, field, instruction)?;
         let index = match finding(keys.iter(), key) {
             Some(index) => index,
-            None => return fail_step(labels, fail, instruction),
+            None => return fail_step(machine, module, labels, fail, instruction, ctx),
         };
         // Read the value only once its field resolved, and before `Dst` is written.
         values[index] = read_operand(machine, ctx, value)?;

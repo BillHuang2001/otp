@@ -111,15 +111,20 @@ fn get_record_elements_branches_to_fail_on_a_non_record_source() {
 }
 
 #[test]
-fn get_record_elements_with_no_fail_is_a_capability_gap() {
+fn get_record_elements_with_no_fail_raises_function_clause() {
+    // C's branchless `FAIL(0)` (`emu/macros.tab:56`) sets no reason and reaches
+    // `func_info`/`handle_error`, i.e. class `error` with the bare atom
+    // `function_clause` — the same raise the maps family's absent-key `NO_FAIL`
+    // path produces. Falling through would be a wrong result.
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (rec, _a, _b, _r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
+    fx.atom("function_clause");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -130,7 +135,38 @@ fn get_record_elements_with_no_fail_is_a_capability_gap() {
         },
         &mut ctx,
     ));
-    assert_eq!(reason, "unsupported_opcode: get_record_elements/no_fail");
+    assert_eq!(reason, "function_clause");
+}
+
+#[test]
+fn a_no_fail_branch_whose_function_clause_atom_is_unnameable_is_a_typed_error() {
+    // The `function_clause` reason resolves through the live atom namespace
+    // (`machine::namespace_atom`: the host's `atoms` seam, then the module's own
+    // load-time snapshot). A module that names it in *neither* place cannot name the
+    // reason, so the honest typed `unsupported` is reported — never a substituted atom
+    // index (an index is valid only against the table it was read with).
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (rec, _a, _b, _r) = two_field_record(&mut fx, &mut ctx);
+    let z = fx.atom("z");
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, rec).unwrap();
+
+    let reason = raise_reason_atom(run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::GetRecordElements {
+            fail: NO_FAIL,
+            src: Operand::X(0),
+            fields: vec![(Operand::Atom(z), Operand::X(1))],
+        },
+        &mut ctx,
+    ));
+    assert_eq!(
+        reason,
+        "unsupported_opcode: get_record_elements: no 'function_clause' atom in the module"
+    );
 }
 
 #[test]
@@ -192,15 +228,16 @@ fn get_record_elements_id_branches_to_fail_on_an_absent_field() {
 }
 
 #[test]
-fn get_record_elements_id_with_no_fail_is_a_capability_gap() {
+fn get_record_elements_id_with_no_fail_raises_function_clause() {
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (rec, _a, _b, _r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
+    fx.atom("function_clause");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -212,5 +249,5 @@ fn get_record_elements_id_with_no_fail_is_a_capability_gap() {
         },
         &mut ctx,
     ));
-    assert_eq!(reason, "unsupported_opcode: get_record_elements_id/no_fail");
+    assert_eq!(reason, "function_clause");
 }
