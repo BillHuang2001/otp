@@ -225,6 +225,12 @@ pub(crate) fn group() -> Vec<Case> {
             "begin Pt = open_port({spawn_driver,\"ram_file_drv\"},[binary]), port_command(Pt, <<1,0,0,0,1>>), _ = receive {Pt,{data,_}} -> ok after 5000 -> timeout end, port_command(Pt, <<14>>), Rep = receive {Pt,{data,D}} -> D after 5000 -> timeout end, Acc = {erlang:is_list(Rep), length(Rep), Rep}, erlang:port_close(Pt), Acc end",
             "ok {true,7,[1,101,97,99,99,101,115]}",
         ),
+        case(
+            "ram_file/list_stream_number_reply_is_the_same_list",
+            "a NUMBER reply to the open command is the same byte list in the default list stream mode as in [binary] mode (the reply is never a binary)",
+            "begin L = open_port({spawn_driver,\"ram_file_drv\"},[]), B = open_port({spawn_driver,\"ram_file_drv\"},[binary]), port_command(L, <<1,0,0,0,3,\"abc\">>), RL = receive {L,{data,DL}} -> DL after 2000 -> timeout end, port_command(B, <<1,0,0,0,3,\"abc\">>), RB = receive {B,{data,DB}} -> DB after 2000 -> timeout end, Acc = {RL =:= RB, erlang:is_list(RL), erlang:is_binary(RL), erlang:is_list(RB), RL}, erlang:port_close(L), erlang:port_close(B), Acc end",
+            "ok {true,true,false,true,[3,0,0,0,0]}",
+        ),
     ]
 }
 
@@ -239,8 +245,8 @@ mod tests {
         let cases = group();
         assert_eq!(
             cases.len(),
-            20,
-            "the A.4 ram_file_drv group has twenty cases"
+            21,
+            "the A.4 ram_file_drv group has twenty-one cases"
         );
         for case in &cases {
             assert!(case.id.starts_with("ram_file/"), "{}", case.id);
@@ -304,6 +310,7 @@ mod tests {
                 "ram_file/binary_stream_reply_is_not_a_binary",
                 "ram_file/binary_stream_ok_reply_is_a_proper_list",
                 "ram_file/binary_stream_error_reply_is_a_proper_list",
+                "ram_file/list_stream_number_reply_is_the_same_list",
             ]
         );
     }
@@ -320,6 +327,7 @@ mod tests {
             "ram_file/binary_stream_reply_is_not_a_binary",
             "ram_file/binary_stream_ok_reply_is_a_proper_list",
             "ram_file/binary_stream_error_reply_is_a_proper_list",
+            "ram_file/list_stream_number_reply_is_the_same_list",
         ] {
             let case = group()
                 .into_iter()
@@ -327,7 +335,10 @@ mod tests {
                 .expect("registered");
             let expr = case.expr().expect("eval case");
             assert!(expr.contains("receive"), "{id}");
-            assert!(expr.contains("after 5000 ->"), "{id} is bounded");
+            assert!(
+                expr.contains("after 5000 ->") || expr.contains("after 2000 ->"),
+                "{id} is bounded"
+            );
             assert!(
                 !case.golden.stdout.expect("golden").contains("<0."),
                 "{id}: a pid/port/ref image must never be pinned"
