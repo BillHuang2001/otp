@@ -451,6 +451,13 @@ the section to read them in.
   done.
   The only thing that frees a retired space is a collapse, because the collection's from-set covers every space
   and has copied everything reachable out.
+  A growth refuses **only** when the policy/table ceiling lies below the request (`target < need_words`,
+  `src/nursery.rs:285-287`): once the capacity already equals the ceiling, a smaller request installs a **same-size**
+  fresh space and retires the old one — a whole capacity retained per call, nothing reclaimed, and **no error** (the
+  `CAP` test policy builds a 1024-space chain exactly this way, `src/nursery.rs:400-437`).
+  Otherwise growth is bounded only by `max_heap_words` (default `0` = unbounded) and the growth table's last entry
+  (just under `(1<<53)/8` words), so an allocate-and-abandon loop with small requests stays growable indefinitely
+  and never falls through to a refusal.
 - **The chain's collection debt is an opt-in seam; `should_collect` stays occupancy-only.**
   `Nursery::retains_old_spaces` is exported as `collection_debt() -> bool` on all three collector types; `true`
   means *a collection is required to reclaim the chain — a heap-admission door should treat it like a full
