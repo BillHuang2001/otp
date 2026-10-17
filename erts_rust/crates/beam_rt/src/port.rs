@@ -3335,3 +3335,25 @@ mod monitor_tests;
 /// minimal always-ready driver and the port-registration helper (see `src/port/test_support.rs`).
 #[cfg(test)]
 pub(crate) mod test_support;
+/// The `{spawn_driver, Name}` **namespace** suite: the statically linked set, the oracle's
+/// `badarg` for everything else, and the `erl_ddll:loaded_drivers/0` agreement
+/// (see `src/port/spawn_driver_tests.rs`). A separate file so the namespace suite does not grow
+/// this one.
+#[cfg(test)]
+mod spawn_driver_tests;
+/// The **driver-capability** suite behind `erlang:port_control/3`: a driver with no `control`
+/// callback is the oracle's `badarg`, a control-bearing one still answers
+/// (see `src/port/control_capability_tests.rs`). A separate file so the capability matrix does not
+/// grow this one.
+#[cfg(test)]
+mod control_capability_tests;
+/// The **`inet` control-opcode matrix** through `erlang:port_control/3` against the live oracle
+/// (see `src/port/inet_matrix_tests.rs`). A separate file so the matrix's probe expressions do not
+/// grow this one.
+#[cfg(test)]
+mod inet_matrix_tests;
+/// The `[binary]` **stream-shape** suite: the term shape a driver-produced reply takes under the
+/// binary and default list streams (see `src/port/stream_shape_tests.rs`). A separate file so the
+/// shape matrix does not grow this one.
+#[cfg(test)]
+mod stream_shape_tests;
