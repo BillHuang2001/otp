@@ -599,16 +599,17 @@ fn a_builtin_driver_name_opens_a_live_driver_port() {
     // A built-in driver port owns no OS child: `port_info(Port, os_pid)` is the atom `undefined`.
     assert!(is_atom(fx.item(port, "os_pid")), "no OS child");
 
-    // It is a **driver** port (its driver has a `control` callback): `port_control` must reach the
-    // built-in driver rather than answer the internal-port `badarg` (`../port.rs:671-679`).
-    assert!(fx.registry.borrow().is_driver_port(port), "a driver port");
+    // It is a **driver** port whose driver declares a `control` callback: `port_control` must reach
+    // the built-in driver rather than answer the driverless-port `badarg` (`../port.rs:1113-1141`).
+    assert!(
+        fx.registry.borrow().has_driver_control(port),
+        "a driver port with a control callback"
+    );
     // ...but its bytes must **not** be drained from a C driver's inline `output` callback — a
     // built-in driver delivers through its poller-registered descriptor on the port-task round.
     let kind = fx.registry.borrow().meta.get(&port.number()).map(|meta| meta.kind);
     assert_eq!(kind, Some(PortName::SpawnDriverBuiltin));
-    assert!(PortName::SpawnDriverBuiltin.has_driver_control());
     assert!(!PortName::SpawnDriverBuiltin.bytes_from_driver_output());
-
     // `port_close/1` succeeds for it (the oracle's `true`) and releases the id.
     fx.hook.close_port(port).expect("closing the built-in driver port");
     assert!(!fx.registry.borrow().contains(port));

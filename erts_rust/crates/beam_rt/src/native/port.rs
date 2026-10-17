@@ -369,8 +369,9 @@ impl RuntimeContext<'_> {
     /// An **internal** port — a `{spawn, Cmd}` / `{spawn_executable, Path}` / `{fd, N}` port, whose
     /// built-in driver has no `control` callback — is `badarg` for **every** verb: the C rejects it
     /// before any callback (`call_driver_control`, `io.c:4035`) and the oracle answers `badarg`
-    /// (measured). Only a `{spawn_driver, Name}` port carries a user driver whose `control` slot may
-    /// answer ([`PortRegistry::is_driver_port`]).
+    /// (measured). A `{spawn_driver, Name}` port reaches a callback only when its **driver entry**
+    /// declares one ([`PortRegistry::has_driver_control`]) — `{spawn_driver, "ram_file_drv"}`
+    /// declares none (`ram_file_drv.c:116`), so it too is `badarg` for every verb.
     ///
     /// The reply is an Erlang **list of byte integers** — `write_port_control_result`
     /// (`io.c:4098-4175`) renders the bytes with `buf_to_intlist` whenever the driver did **not**
