@@ -284,6 +284,7 @@ fn test_meta(command: &str) -> PortMeta {
         os_pid: None,
         stream: StreamType::List,
         line: None,
+        packet: None,
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
@@ -2808,7 +2809,10 @@ fn the_stream_atom_cancels_the_packet_framing() {
         Some(LINE_DEFAULT_MAX_LEN),
         "the `line` framing itself is untouched by the cancellation"
     );
-    assert!(!parsed.packet, "`stream` cancelled the packet framing");
+    assert_eq!(
+        parsed.packet_bytes, 0,
+        "`stream` cancelled the packet framing"
+    );
 
     // The cancellation only reaches the list it appears in: the `stream` atom *before* the
     // `{packet, 2}` still leaves the framing in effect (`opts.packet_bytes` is set last).
