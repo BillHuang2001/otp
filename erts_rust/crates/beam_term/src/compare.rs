@@ -98,7 +98,8 @@
 //!   `:2212`/`:2235`/`:2288`) compare `serial`, `number` and the node first. The two
 //!   rules agree when the foreign sysname sorts before the local one and disagree
 //!   otherwise — the one known ordering gap for these classes; it is pinned by
-//!   `tests/compare_class_order.rs`.//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
+//!   `tests/compare_class_order.rs`.
+//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
 //!   class first (which is exact), then by object arity, then by the raw term word
 //!   (a stable proxy). This never panics but is not a faithful reproduction of the
 //!   C's structural comparison; a caller that needs exact ordering for it must
@@ -526,8 +527,9 @@ fn cmp_nodes(
 /// (`erts/emulator/beam/utils.c:1777-1811`).
 ///
 /// Field order (`utils.c:1805-1809`): `serial`, then `number`, then the node
-/// (sysname atom, then `creation`). Both operands are external, so the C's
-/// internal/external mixed branches do not apply.
+/// (sysname atom, then `creation`). This arm is reached only when *both* operands
+/// are external pids; a mixed internal/external pair is decided by class rank
+/// instead (the module docs' known ordering gap).
 ///
 /// # Safety
 ///
