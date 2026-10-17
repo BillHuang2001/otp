@@ -21,8 +21,8 @@
 //! Contracts **A.9 + A.2** — the self-hosted build's **in-process** `compile:file/2`: the
 //! **E0 route** (`no_spawn_compiler_process`), the **default, scheduled-process** shape
 //! (the `erl -noshell -s compile …` / `erlc` shape), a **real stdlib module**'s object code,
-//! a **dependent pair** compiled and linked in one run, and the **code-path / load-state**
-//! shapes the route stands on.
+//! a **dependent pair** compiled and linked in one run, a module whose documentation lives in
+//! a **sibling file**, and the **code-path / load-state** shapes the route stands on.
 //!
 //! `../../../CONTEXT.md` (its "A.9 — what an in-process compile actually needs" section) is
 //! the design source: OTP's `compile:file/2` path reaches only `kernel` + `stdlib` (`epp` — an
@@ -31,9 +31,9 @@
 //! route keeps the whole compile in the **calling** process; the default shape spawns
 //! `compile:file/2`'s compiler process, and the caller parks in the receive that waits for it.
 //!
-//! This group is the **evidence scaffold** for that route: five module-run cases whose
-//! goldens are the oracle's own integer lines, so each pins a property of the *produced
-//! object code* rather than a mere "it returned".
+//! This group is the **evidence scaffold** for that route: six module-run cases whose goldens
+//! are the oracle's own integer lines, so each pins a property of the *produced object code*
+//! rather than a mere "it returned".
 //!
 //! # The cases
 //!
@@ -70,6 +70,15 @@
 //!   compile-and-load route consumes. As in every sibling boot case, the load is made
 //!   **explicit** first (`code:ensure_loaded(lists)`), because this runtime's boot set is
 //!   smaller than the oracle's.
+//! * [`docfile_case`] — the **file-borne documentation** case: the module's own source carries
+//!   `-moduledoc({file, "moduledoc.txt"})`, so compiling it in-process forces `epp` to read the
+//!   **sibling doc file** through the file server (`epp`'s `scan_filedoc_content/5` does a
+//!   `file:read_file_info/1` + `file:read/2` — the io-service `read_handle_info` request) while
+//!   the rest of the compile runs in the calling process. The doc file is staged through the
+//!   runtime's own write path first, and `1` asserts that the produced object code's `Docs`
+//!   chunk carries **exactly that text** as the module doc. The content check is load-bearing:
+//!   an *unreadable* doc file only **warns** and yields an empty module doc (so a bare
+//!   `{ok, Mod}` match would happily pass on a runtime that never served the read).
 //!
 //! In every case the compile's own failure is deliberately **not** caught: a runtime that
 //! cannot host the route must raise its typed capability gap (the CLI then exits `3`), never a
@@ -95,10 +104,11 @@
 //!
 //! # Status
 //!
-//! All five cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
+//! All six cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
 //! scheduled shape, an in-process compile of a real stdlib module, the dependent pair (with
-//! the `code:add_patha/1` + `code:load_file/1` link round trip) and the code-path /
-//! load-state shapes. Three contracts are in play and exactly two are claimed:
+//! the `code:add_patha/1` + `code:load_file/1` link round trip), a module whose documentation
+//! the compiler reads from a sibling file, and the code-path / load-state shapes. Three
+//! contracts are in play and exactly two are claimed:
 //! [`Contract::BeamAsm`] (a real `.beam` executes and object code is produced) and
 //! [`Contract::Build`] (the build/bootstrapping route itself). [`Contract::OtpApps`] is
 //! **not** claimed — the routes' whole point is that they reach only `kernel` + `stdlib`, so
@@ -895,6 +905,71 @@ classify({file, File}, true, true, Boot) when is_list(Boot) ->
 classify(_, _, _, _) -> 3.
 "#;
 
+/// The embedded module of the **file-borne documentation** case: a module whose
+/// `-moduledoc` names a **sibling file**, plus the runner below.
+///
+/// Shape rules, all load-bearing:
+///
+/// * the `-moduledoc({file, "moduledoc.txt"})` attribute is the whole point: `epp` cannot take
+///   the doc text from the token stream, so it must **read the file** —
+///   `scan_filedoc_content/5` (`lib/stdlib/src/epp.erl:1431-1463`) opens it with
+///   `[read, binary]`, `file:read_file_info/1`s it and `file:read/2`s exactly `size/1` bytes.
+///   With epp being an io-device client, that walk is the io-service `read_handle_info`
+///   request — the one file-service surface this case exists to pin;
+/// * the doc file is **staged through the runtime's own write path first** (`file:write_file/2`,
+///   like every sibling route), and the path is the case dir, which is where epp resolves a
+///   relative doc file (the head of its include path is the dir of the file being compiled);
+/// * the observable is the produced object code's **`Docs` chunk**, not the compile's return
+///   value: `epp` turns an unreadable doc file into a **warning** plus an empty doc
+///   (`:1458-1463`), so `{ok, Mod}` alone would be satisfied by a runtime that never served the
+///   read. `1` iff the chunk's module doc is byte-identical to the text this run wrote;
+/// * the doc text is plain ASCII with no leading or trailing whitespace, so the compiler's own
+///   normalisation (`string:trim/1`, `lib/compiler/src/beam_doc.erl:519`) is an identity on it
+///   and the chunk's value is exactly the file's bytes.
+const SELFHOST_DOCFILE_SOURCE: &str = r#"-module(selfhost_docfile).
+-moduledoc({file, "moduledoc.txt"}).
+-export([compile_self/0]).
+
+%% A.9: this module's documentation lives in a SIBLING FILE, so `epp` reads it through the
+%% file server (`file:read_file_info/1` + `file:read/2`, the file_io_service
+%% `read_handle_info` request) while `compile:file/2` parses and compiles this very module
+%% IN-PROCESS. `1` iff the produced object code's `Docs` chunk carries exactly the text this
+%% run staged into that file, `2` otherwise.
+compile_self() ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    Source = filename:join(Dir, "selfhost_docfile.erl"),
+    DocFile = filename:join(Dir, "moduledoc.txt"),
+    Doc = list_to_binary(doc_text()),
+    ok = file:write_file(DocFile, Doc),
+    {ok, ?MODULE} = compile:file(Source, [no_spawn_compiler_process, deterministic, {outdir, Dir}]),
+    Beam = filename:join(Dir, "selfhost_docfile.beam"),
+    case module_doc(Beam) =:= Doc of
+        true -> 1;
+        false -> 2
+    end.
+
+%% The module documentation this run stages into the sibling file. Plain ASCII, and no leading
+%% or trailing whitespace, so the compiler's `string:trim/1` normalisation is an identity on it
+%% and the `Docs` chunk's module doc is byte-identical to this file's content.
+doc_text() ->
+    "This module's documentation lives in a sibling file.\n"
+    "\n"
+    "The -moduledoc({file, ...}) attribute makes epp read that file through the file\n"
+    "server, so the compiler's Docs chunk carries the text this run staged.".
+
+%% The module doc the produced object code carries, read back from its `Docs` chunk. The chunk
+%% is a compressed `docs_v1` term whose module-doc field is a bare binary before OTP 27 and a
+%% language-keyed map from OTP 27 on, so both shapes are accepted: the golden is the text
+%% equality, never a doc-format detail of the oracle's release.
+module_doc(Beam) ->
+    {ok, {?MODULE, [{"Docs", Docs}]}} = beam_lib:chunks(Beam, ["Docs"]),
+    case binary_to_term(Docs) of
+        {docs_v1, _Anno, _Mod, _Format, Doc, _Meta, _Docs} when is_binary(Doc) ->
+            Doc;
+        {docs_v1, _Anno, _Mod, _Format, Doc, _Meta, _Docs} when is_map(Doc) ->
+            maps:get(<<"en">>, Doc, <<>>)
+    end.
+"#;
 /// The E0 route case: the in-process `compile:file/2` (`no_spawn_compiler_process`).
 fn case() -> Case {
     Case {
@@ -1027,7 +1102,41 @@ fn path_case() -> Case {
     }
 }
 
-/// The A.9 self-hosted-build group: the five in-process compile / link shapes.
+/// The file-borne documentation case: a module whose `-moduledoc` names a sibling file,
+/// recompiled in-process after that file is staged, with the produced `Docs` chunk's module
+/// doc compared against the staged text.
+///
+/// The observable is deliberately the **doc content**, never the compile's return value: `epp`
+/// downgrades an unreadable doc file to a warning and compiles an empty module doc, so
+/// `{ok, Mod}` would be reproduced by a runtime that never served the doc-file read. It is also
+/// never a hash of the produced `.beam` (a compiler-release artifact — see the module docs):
+/// the text of the doc file is release-independent, so the oracle reproduces the golden on any
+/// OTP release.
+fn docfile_case() -> Case {
+    Case {
+        id: "selfhost/compile_file_of_a_module_whose_moduledoc_lives_in_a_file",
+        description: "the A.9 file-borne documentation shape: recompile in-process \
+                      (no_spawn_compiler_process, deterministic, {outdir, Dir}) a module whose \
+                      source carries -moduledoc({file, \"moduledoc.txt\"}) after staging that \
+                      doc file through the file server, and report whether the produced .beam's \
+                      Docs chunk carries exactly that text as the module doc",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Module(ModuleRun {
+            source: SELFHOST_DOCFILE_SOURCE,
+            module: "selfhost_docfile",
+            function: "compile_self",
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some("1"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The A.9 self-hosted-build group: the six in-process compile / link shapes.
 pub(crate) fn group() -> Vec<Case> {
     vec![
         case(),
@@ -1035,6 +1144,7 @@ pub(crate) fn group() -> Vec<Case> {
         stdlib_case(),
         pair_case(),
         path_case(),
+        docfile_case(),
     ]
 }
 
@@ -1051,12 +1161,13 @@ mod tests {
     }
 
     #[test]
-    fn the_group_is_the_five_self_hosted_build_shapes() {
+    fn the_group_is_the_six_self_hosted_build_shapes() {
         let cases = group();
         assert_eq!(
             cases.len(),
-            5,
-            "the group is the two compile:file/2 routes plus the stdlib, pair and code-path cases"
+            6,
+            "the group is the two compile:file/2 routes plus the stdlib, pair, code-path and \
+             file-borne-documentation cases"
         );
         assert_eq!(
             cases[0].id,
@@ -1072,6 +1183,10 @@ mod tests {
         );
         assert_eq!(cases[3].id, "selfhost/in_process_compile_dependent_pair");
         assert_eq!(cases[4].id, "selfhost/code_patha_and_loaded_module_shapes");
+        assert_eq!(
+            cases[5].id,
+            "selfhost/compile_file_of_a_module_whose_moduledoc_lives_in_a_file"
+        );
         for case in &cases {
             assert_eq!(case.contracts, &[Contract::BeamAsm, Contract::Build]);
             assert_eq!(case.golden.exit_code, 0);
@@ -1093,6 +1208,7 @@ mod tests {
         assert_eq!(run_of(&cases[2]).module, "selfhost_stdlib");
         assert_eq!(run_of(&cases[3]).module, "selfhost_pair");
         assert_eq!(run_of(&cases[4]).module, "selfhost_path");
+        assert_eq!(run_of(&cases[5]).module, "selfhost_docfile");
         for case in &cases {
             assert_eq!(case.golden.stdout, Some("1"));
         }
@@ -1103,6 +1219,7 @@ mod tests {
             (1, "file:write_file(Staged", "compile:file(Source"),
             (3, "file:write_file(A, a_source())", "compile:file(A,"),
             (3, "file:write_file(B, b_source())", "compile:file(B,"),
+            (5, "file:write_file(DocFile, Doc)", "compile:file(Source"),
         ] {
             let source = run_of(&cases[index]).source;
             let write = source.find(write_needle).expect("staging write");
@@ -1336,6 +1453,55 @@ mod tests {
         assert!(
             !source.contains("filename:join(Dir, \"lists"),
             "the observable must not name a resolved module path"
+        );
+        assert!(!source.contains("catch"), "the raise must not be caught");
+    }
+
+    /// The file-borne documentation case: the module's own `-moduledoc` names a sibling file,
+    /// the doc file is staged write-first, and the observable is the produced `Docs` chunk's
+    /// module doc compared against the staged text — never a hash, and never the compile's
+    /// return value (an unreadable doc file is only a warning).
+    #[test]
+    fn the_docfile_case_reads_the_moduledoc_file_and_pins_the_docs_chunk() {
+        let cases = group();
+        let run = run_of(&cases[5]);
+        let source = run.source;
+        for needle in [
+            "-module(selfhost_docfile).",
+            "-moduledoc({file, \"moduledoc.txt\"}).",
+            "code:which(?MODULE)",
+            "file:write_file(DocFile, Doc)",
+            "compile:file(Source, [no_spawn_compiler_process, deterministic, {outdir, Dir}])",
+            "beam_lib:chunks(Beam, [\"Docs\"])",
+            "module_doc(Beam) =:= Doc",
+        ] {
+            assert!(source.contains(needle), "the route needs {needle:?}");
+        }
+        // The doc file must be staged through the runtime's own write path *before* the compile
+        // that makes `epp` read it back.
+        let write = source.find("file:write_file(DocFile, Doc)").expect("staging");
+        let compile = source.find("compile:file(Source").expect("compile");
+        let docs = source.find("beam_lib:chunks(Beam, [\"Docs\"])").expect("docs chunk");
+        assert!(write < compile && compile < docs, "staged write-first, then read back");
+        // The doc-file read is what `epp` drives; `file:read_file_info/2` on an **io device** is
+        // the `read_handle_info` request, so the route must reach it through `file:read/2`'s
+        // io-service walk, never by reading the file some other way (i.e. the doc file must be
+        // named, not inlined).
+        assert!(
+            !source.contains("-moduledoc \""),
+            "the module doc must come from the file, not from an inline string"
+        );
+        // The doc text is the observable, so it must survive the compiler's `string:trim/1`
+        // unchanged: plain ASCII with no trailing newline on the last literal segment.
+        assert!(source.is_ascii(), "the staged doc text must be plain ASCII");
+        assert!(
+            source.contains("carries the text this run staged.\"."),
+            "the doc text's last literal segment must end without a trailing newline"
+        );
+        // No compiler-version-dependent hash may reach the golden (see the module docs).
+        assert!(
+            !source.contains("erlang:md5") && !source.contains("phash2"),
+            "the golden must not embed a compiler-version-dependent hash"
         );
         assert!(!source.contains("catch"), "the raise must not be caught");
     }
