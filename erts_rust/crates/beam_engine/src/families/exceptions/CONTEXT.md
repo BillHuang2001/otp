@@ -29,6 +29,10 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   construction through the **rooted** builders, so a moving collector can run under the
   reserve), `install_class_atom` (never substitutes an atom the module cannot name) and
   `classify_class` (`raw_raise`'s class protocol).
+- Every raise **tag/class** atom in this family resolves through
+  `machine::namespace_atom` — the host's live namespace (`ctx.atoms(module)`) first, the
+  running module's load-time snapshot second; a name **neither** source knows is the typed
+  `unsupported`, never a substituted atom index.
 - `callee.rs`: the synthesized **callee head item** of an `undef` raise —
   `{CalleeModule, CalleeFunction, ArgList, []}` (`is_unresolved_undef`,
   `import_callee_atoms`, `import_callee_head_item`, `callee_head_item`). Real OTP names an
