@@ -38,7 +38,7 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
 - `mod.rs` → the family `exec`, the shared `fail_step`/`goto_label`, the operand helpers
   (`read_size`, `is_all`, `decode_flags`/`flag_bit` + the `BSF_*` bits), the safe bit
   arithmetic (`read_uint_be`/`read_uint_le`/`read_uint_le_bits`/`sign_extend`/
-  `extract_bits`), the wide-integer (`> 64` bit) byte model, and the `BitWriter` sink.
+  `extract_bits`), the wide-integer (`> 64` bit) byte model, and the `BitWriter` (two-mode: `Dest::Vec` copy-rebuild / `Dest::InPlace` writable accumulator) sink.
   `BitWriter::push_le_groups` is the **single** little-endian layout rule (the field is
   `value mod 2^nbits`, laid out as little-endian byte groups written MSB-first, whose
   final partial group is the LOW remaining bits of the last byte, placed at the current
@@ -216,3 +216,28 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   oracle-exact for all of them, and `differential compare` drives the `-eval` route, so
   those ad-hoc `compare` mismatches are not this node's.
 - **`tools/differential` corpus coverage hole** (see Test Strategy).
+
+## `append` / `private_append` — in place while the payload is writable
+
+`create::assemble` walks the segment list into a `BitWriter` whose destination is either
+`Dest::Vec` (the copy-rebuild form: a growable `Vec<u8>` materialised once by `raw::make_binary`)
+or `Dest::InPlace` (a `raw::InPlace` sink over a `bs_init_writable` payload). The in-place mode is
+entered only for a `private_append` in the **first** segment position whose source is an off-heap
+refc binary with `start == 0` over a payload the machine registered through
+`Machine::mark_writable` (`raw::writable_append_target`); it writes the new bits at the payload's
+own window end and publishes the **same** `Eterm` with a widened `ErlSubBits.end`
+(`raw::set_ctx_end`) — C's `erts_bs_private_append_checked` writable arm (`erl_bits.c:1943-2020`).
+
+Promotion, not failure, covers the two bounds: a write that would leave the payload's capacity, and
+a segment source that **overlaps** the payload, both copy the already-written prefix out
+(`raw::InPlace::into_bytes`) and continue in `Dest::Vec`, so the result is byte-identical to the
+copy-rebuild path and the accumulator's window is left unbumped. A **failed** build never bumps
+`end` at all (stricter than C, which bumps in its sizing pass, `erl_bits.c:1975`). `push_bits_from`
+fast-paths whole bytes when both the source offset and the write position are byte-aligned and
+stays bit-exact per-bit otherwise.
+
+Residual (documented, owner `beam_alloc`/`beam_rt`): the payload never *grows*, so a loop that
+outgrows the `bs_init_writable` capacity falls back to the copy-rebuild form and stays O(n²);
+C's `GROW_PROC_BIN_SIZE` (`erl_bits.c:70-73`) + `apparent_size`, the
+`BIN_FLAG_WRITABLE`/`ACTIVE_WRITER` observables and `binary:referenced_byte_size/1`'s
+capacity-vs-size answer are unmodelled — see `../../HANDOFF_bs_init_writable.md`.

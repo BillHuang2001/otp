@@ -521,3 +521,5 @@ mod wide_tests;
 mod float_seg_tests;
 #[cfg(test)]
 mod le_tests;
+#[cfg(test)]
+mod inplace_tests;

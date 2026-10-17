@@ -609,12 +609,6 @@ impl InPlace {
         self.cur
     }
 
-    /// The bit offset this build started writing at (the accumulator's window end).
-    #[cfg(test)]
-    pub(super) fn start_bits(&self) -> usize {
-        self.start
-    }
-
     /// How many more bits fit in the payload.
     pub(super) fn remaining_bits(&self) -> usize {
         self.capacity.saturating_sub(self.cur)
