@@ -651,6 +651,12 @@ mod tests {
         assert_eq!(std::f64::consts::SQRT_2.to_bits(), SQRT2_LITERAL_BITS);
     }
     #[test]
+    // The `expected` column is the oracle's exact `math:*` result, so a value that
+    // coincides with a `std` constant (`acos(0.5)` is π/3, `asin(0.5)` π/6, `atan(1)`
+    // π/4, `exp(1)` e, `log(2)` ln 2, `sqrt(2)` √2) stays the decimal literal the
+    // oracle prints: pinning it is the point, and the constants are only bit-equal
+    // by coincidence of these particular arguments, not a definition of the test.
+    #[allow(clippy::approx_constant)]
     fn unary_trig_is_bit_exact_against_the_oracle() {
         with_ctx(|ctx| {
             let one = ctx.make_float(1.0).unwrap();
@@ -733,6 +739,8 @@ mod tests {
         });
     }
     #[test]
+    // `pow(2, 0.5)` is the oracle's √2, kept as the oracle's decimal literal.
+    #[allow(clippy::approx_constant)]
     fn binary_operators_are_bit_exact_against_the_oracle() {
         with_ctx(|ctx| {
             let two = ctx.make_float(2.0).unwrap();

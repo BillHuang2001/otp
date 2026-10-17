@@ -1248,10 +1248,7 @@ fn ref_to_list_renders_a_runtime_built_reference() {
     let name = ctx.atom("bogus").expect("seeded");
     let tid = call(&reg, &mut ctx, "ets", "new", 2, &[name, NIL]).expect("a table is created");
     assert!(
-        matches!(
-            call(&reg, &mut ctx, "erlang", "is_reference", 1, &[tid]),
-            Ok(_)
-        ),
+        call(&reg, &mut ctx, "erlang", "is_reference", 1, &[tid]).is_ok(),
         "the tid is a reference"
     );
 
@@ -1379,17 +1376,7 @@ fn the_to_binary_variants_return_the_list_bytes() {
     let as_binary = call(&reg, &mut ctx, "erlang", "port_to_binary", 1, &[port]).expect("a port");
     // The oracle's `#Port<0.3>` for `erlang:port_to_list(open_port({spawn,"true"},[]))`.
     assert_eq!(binary_text(as_binary), b"#Port<0.3>");
-    assert!(matches!(
-        call(
-            &reg,
-            &mut ctx,
-            "erlang",
-            "port_to_list",
-            1,
-            &[port]
-        ),
-        Ok(_)
-    ));
+    assert!(call(&reg, &mut ctx, "erlang", "port_to_list", 1, &[port]).is_ok());
 
     // Each variant still type-checks its one argument.
     let five = small(&mut ctx, 5);

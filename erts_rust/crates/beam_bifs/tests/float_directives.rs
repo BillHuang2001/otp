@@ -372,6 +372,10 @@ fn huge_scientific_and_general_renderings_are_not_capped() {
 /// The `~e`/`~f`/`~g` directives of ordinary values are unchanged — the pinned
 /// goldens (the oracle's text).
 #[test]
+// `3.141592653589793` is one ordinary input value of the `~f` sweep (pinned by the
+// oracle's text `"3.141593"`), bit-equal to `f64::consts::PI` but kept a literal so
+// the row reads as a value/expected pair like its neighbours.
+#[allow(clippy::approx_constant)]
 fn ordinary_float_directives_are_unchanged() {
     let reg = default_registry();
     assert_eq!(text(&reg, b"~e", 1.0), "1.00000e+0");

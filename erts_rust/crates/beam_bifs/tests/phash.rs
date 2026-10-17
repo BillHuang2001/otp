@@ -158,6 +158,9 @@ const BIG_DIGITS: [u64; 2] = [14_083_847_773_837_265_618, 6_692_605_942];
 // ---------------------------------------------------------------------------
 
 #[test]
+// The hashed term is the float `3.14` (a three-digit float, not `f64::consts::PI`):
+// the literal is the subject under test, so it must not become the constant.
+#[allow(clippy::approx_constant)]
 fn integers_match_the_oracle() {
     run(|reg, ctx| {
         let range = int_term(ctx, 1_000_000);
@@ -563,6 +566,9 @@ fn invalid_ranges_are_badarg() {
 // unlike `phash/2`.
 
 #[test]
+// The hashed float is the three-digit `3.14` (whose word pair is what
+// `phash2/1` folds), not `f64::consts::PI` — a literal golden by design.
+#[allow(clippy::approx_constant)]
 fn phash2_integers_match_the_oracle() {
     run(|_reg, ctx| {
         // Small integers inside `[-2^27, 2^27)` take the `SINT32_HASH` path; the four

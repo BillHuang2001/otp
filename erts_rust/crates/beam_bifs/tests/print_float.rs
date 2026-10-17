@@ -232,6 +232,11 @@ fn oracle_w_bits(bits: &[u64]) -> Option<Vec<String>> {
 /// Produced by `erl -noshell -eval 'io:format("~p~n",[[{V,float_to_list(V,
 /// [short])} || V <- F]])'` and confirmed to equal `io_lib:format("~w"/"~p"/"~W"/
 /// "~P", …)` for every entry (`~W`/`~P` treat a float leaf identically).
+// The value column is the *input* under test (each row pins the oracle's rendering
+// of that exact float): `3.14159` is a six-digit float whose shortest render is
+// `"3.14159"` — not `f64::consts::PI` — and `3.141592653589793` is pinned by its
+// decimal text, so neither may be replaced by a `std` constant.
+#[allow(clippy::approx_constant)]
 const GOLDENS: &[(f64, &str)] = &[
     (0.0, "0.0"),
     (-0.0, "-0.0"),
@@ -392,6 +397,10 @@ fn floats_nested_in_containers_agree_with_the_oracle() {
 /// (`float_to_list/2` with `{scientific,N}`/`{decimals,N}`) and must be unchanged
 /// by the plain-leaf fix. Goldens are the oracle's, re-derived live.
 #[test]
+// `3.141592653589793` is a value fed to the oracle's `~e`/`~f`/`~g`; it is bit-equal
+// to `f64::consts::PI` but is one input row among ordinary doubled values, so it
+// stays a literal.
+#[allow(clippy::approx_constant)]
 fn the_e_f_g_directives_are_unchanged() {
     let reg = default_registry();
     // `~f` of the largest doubles renders far past 255 characters (316 for
