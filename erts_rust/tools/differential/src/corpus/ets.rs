@@ -37,12 +37,18 @@
 //!   A.1 half of this group); and
 //! * **introspection** — the stable `info/2` items (`size`, `type`, `protection`, `keypos`,
 //!   `name`, `named_table`, `compressed`, `id`-is-a-reference, `memory`-is-an-integer) plus
-//!   `badarg` for an unknown item.
+//!   `badarg` for an unknown item; and
+//! * **ownership transfer** — `ets:give_away/3` (the `ets/give_away_*` cases): the new owner
+//!   really receives the `{'ETS-TRANSFER', Tab, From, Gift}` transfer message, so the gift
+//!   *data* reaches it, and the message body's shape is pinned with the per-VM `Tab`/`From`
+//!   reduced to their types.
 //!
-//! Every case here is one line of setup + one observation (a fresh VM per case, so the table
-//! lives and dies with it), and each is verified `agree` against the live oracle. Multi-key
-//! maps are never rendered and no volatile value (a table id, a pid, a memory figure) is
-//! asserted exactly — only its shape.
+//! Every case here is one expression of setup + one observation (a fresh VM per case, so the
+//! table lives and dies with it), and each is verified `agree` against the live oracle. The
+//! two `ets/give_away_*` cases additionally spawn one short-lived child — the table's new
+//! owner — and both of their receives carry an `after` guard. Multi-key maps are never
+//! rendered and no volatile value (a table id, a pid, a memory figure) is asserted exactly —
+//! only its shape.
 //!
 //! # The match-spec / `select` family lives in the [`super::ets_spec`] group
 //!
@@ -1030,6 +1036,61 @@ pub(crate) fn group() -> Vec<Case> {
             golden: Golden {
                 stdout: Some("exception error badarg"),
                 exit_code: 1,
+            },
+        },
+        // --- widened: ownership transfer (`ets:give_away/3`) ---
+        //
+        // `ets:give_away/3` hands a table over to a new owner and, as part of the transfer,
+        // **sends** the `{'ETS-TRANSFER', Tab, From, Gift}` message to that owner. Returning
+        // `true` is not enough: the gift data only reaches the new owner if the message is
+        // really delivered, so the new owner is a child that receives the transfer and reports
+        // the gift back to the parent, which is what the case observes. Both receives carry an
+        // `after` guard (a lost transfer then observes `timeout` instead of hanging the gate).
+        Case {
+            id: "ets/give_away_gift_data_reaches_the_new_owner",
+            description: "ets:give_away/3 delivers the gift data to the new owner in its {'ETS-TRANSFER',…} message",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin Parent = self(), T = ets:new(ets_give_away, [set]), \
+                       ets:insert(T, {a,1}), \
+                       P = spawn(fun () -> \
+                               receive {'ETS-TRANSFER', _Tab, _From, Gift} -> \
+                                       Parent ! {gift, Gift} \
+                               after 2000 -> Parent ! timeout end end), \
+                       ets:give_away(T, P, my_gift), \
+                       receive {gift, Gift} -> Gift after 2000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok my_gift"),
+                exit_code: 0,
+            },
+        },
+        // The transfer message **body** is `{'ETS-TRANSFER', Tab, From, Gift}`: the tag atom,
+        // the table handle, the previous owner and the gift. `Tab` (a reference) and `From` (a
+        // pid) are per-VM values, so they are reduced to their *types* — never pinned — and
+        // the gift stays at element 4.
+        Case {
+            id: "ets/give_away_transfer_message_body_shape",
+            description: "the transfer message is {'ETS-TRANSFER', Tab, From, Gift} with a reference table and a pid sender",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin Parent = self(), T = ets:new(ets_give_away_shape, [set]), \
+                       P = spawn(fun () -> \
+                               receive Msg -> \
+                                       Parent ! {shape, element(1, Msg), \
+                                                 is_reference(element(2, Msg)), \
+                                                 is_pid(element(3, Msg)), element(4, Msg)} \
+                               after 2000 -> Parent ! timeout end end), \
+                       ets:give_away(T, P, my_gift), \
+                       receive Got -> Got after 2000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {shape,'ETS-TRANSFER',true,true,my_gift}"),
+                exit_code: 0,
             },
         },
     ]

@@ -22,7 +22,12 @@
 //!
 //! The BIFs and `lists` functions every program depends on. They are exercised through
 //! the *value* probe (`~w`), which is a rendering a runtime must reproduce exactly.
-
+//!
+//! The `timer` family is pinned in both of its halves: the *handle* a call answers
+//! (`bifs/timer_apply_after_first_element_is_ok` — `{ok, {once, Ref}}`, identity never
+//! rendered) and the *fired* timer (`bifs/timer_apply_after_message_is_delivered` — the
+//! message `timer:apply_after/4` sends is really delivered to the receiving process, under an
+//! `after` guard so a lost message is an observation, not a hang).
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.7 cases: core BIFs plus the `lists` and `maps` stdlib surface (the `bifs/`, `lists/` and
@@ -1096,6 +1101,26 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // The *fired* timer, not just its handle: `timer:apply_after/4` must actually apply
+        // `erlang:send(self(), done)` once the delay elapses, so the message is what the case
+        // observes. The receive carries an `after` guard, so a timer that never fires observes
+        // `timeout` (a `mismatch`) instead of hanging the gate, and the golden is the received
+        // **value** — no per-VM timer reference and no clock reading is ever pinned.
+        Case {
+            id: "bifs/timer_apply_after_message_is_delivered",
+            description: "timer:apply_after/4 fires and the message it sends reaches the receiving process",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin timer:apply_after(50, erlang, send, [self(), done]), \
+                       receive Msg -> Msg after 2000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok done"),
+                exit_code: 0,
+            },
+        },
         Case {
             id: "bifs/integer_radix_conversions",
             description: "integer_to_binary/2 and binary_to_integer/1,2 across radices, incl. a badarg and a bignum",
@@ -1995,6 +2020,7 @@ mod tests {
             ("bifs/timer_now_diff_of_two_timestamps", "ok -1000002000003"),
             ("bifs/timer_tc_returns_the_fun_value", "ok 42"),
             ("bifs/timer_apply_after_first_element_is_ok", "ok ok"),
+            ("bifs/timer_apply_after_message_is_delivered", "ok done"),
             ("bifs/lists_concat", "ok [97,98,49]"),
             ("bifs/string_concat_two", "ok [97,98]"),
             (
