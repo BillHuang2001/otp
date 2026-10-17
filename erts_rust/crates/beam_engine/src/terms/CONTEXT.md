@@ -138,7 +138,7 @@ sound only because `alloc_words` never collects:
   the rooted builders); `alloc_tests.rs` → the mock moving collector + the rooted-hook/peak-words
   proofs.
 
-## Handoff — the one call site still on the unrooted path (owner: `beam_rt`)
+## Handoff — the unrooted paths still open (owner: `beam_rt`)
 `../machine/location.rs:277`/`:409` — the four `&self` accessors (`current_function`,
 `initial_call`, `current_location`, `current_stacktrace`) cannot lend the machine's `&mut` root
 slices, so they build through the **unrooted** [`ContextSink`]. Sanctioned: every term there
