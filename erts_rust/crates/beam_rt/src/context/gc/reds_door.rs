@@ -39,7 +39,8 @@
 //! — so the question it answers is purely "has this process allocated enough since the last
 //! boundary to be worth collecting?", which is [`collect_at_reds_boundary`]'s two gates: a
 //! **reduction interval** (a collection at most once per pre-emption) and an **occupancy
-//! watermark** (only when the nursery is really in use).
+//! watermark** (only when the allocation area is nearly exhausted — the C's own
+//! `ERTS_VBUMP_ALLOC_REDS` rule, see [`BOUNDARY_OCCUPANCY_NUM`]).
 //!
 //! # Why nothing here can lose a term
 //!
@@ -70,20 +71,66 @@ use super::{machine_root_bounds, publish_roots_full, scatter_roots_full, valve_v
 /// The interval is accumulated per **pid** (`Runtime::accumulate_reds_since_gc_boundary`), not
 /// read from the slice, so a process that pre-empts on a partially spent budget still pays its
 /// way: several short slices add up to one boundary.
-pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
-/// The occupancy watermark's numerator: collect once **half** of the current young space is
-/// used ([`BOUNDARY_OCCUPANCY_DEN`] is the denominator).
 ///
-/// The watermark is what makes `heap_size` **plateau** instead of climbing: the live set of an
-/// allocate-and-abandon loop is a handful of words, so a collection at half occupancy sizes the
-/// nursery from the live set plus the policy's floors and the next round fills that same space
-/// again — the capacity stops growing once it covers one boundary's worth of allocation.
-/// Without the watermark the door would collect on every pre-emption of a process whose nursery
-/// is nearly empty (a mostly-parked or barely-allocating process), paying a full Cheney
-/// traversal for nothing.
-const BOUNDARY_OCCUPANCY_NUM: usize = 1;
+/// **Retained unchanged when the watermark moved to 7/8, and measured to be the wrong knob to
+/// move.** The interval is the *rate limit*: a slice is one budget, so on the default
+/// (native-baseline) tier every pre-emption already arrives with a full
+/// `DEFAULT_REDUCTIONS_PER_SLICE` and the interval never binds — it only stops a process that
+/// yields early from collecting inside the same slice's worth of allocation it is meant to bound.
+/// The figure it does set is the *no-heap-admission* shape's collection rate (`collections == 3N /
+/// 1 000`, see [`crate::runner`]'s `reds_door` suite), which is a property of the reduction cost
+/// of the loop and not of the occupancy watermark; lengthening it would simply collect that shape
+/// less often — eroding the one shape this door exists for — without touching the churn
+/// regression, which the watermark fixed.
+pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
+/// The occupancy watermark's numerator: collect once **seven eighths** of the current young space
+/// is used ([`BOUNDARY_OCCUPANCY_DEN`] is the denominator).
+///
+/// This is the C's own rule in the only unit this door has. The C's allocation-area check
+/// (`ERTS_VBUMP_ALLOC_REDS`, out of `HAlloc`'s v-bump path) runs when the allocation area is
+/// **exhausted**, not when it is half used; this door is handed no allocation request — only the
+/// slice-boundary occupancy — so the faithful transcription is "collect when the space is nearly
+/// gone". Two jobs:
+///
+/// * it is what makes `heap_size` **plateau**: the live set of an allocate-and-abandon loop is a
+///   handful of words, so a collection sizes the nursery from the live set plus the policy's
+///   floors and the next round fills that same space again — the capacity stops growing once it
+///   covers one boundary's worth of allocation;
+/// * without it the door would collect on every pre-emption of a process whose nursery is nearly
+///   empty (a mostly-parked or barely-allocating process), paying a Cheney traversal for nothing.
+///
+/// **Measured (single-build interleaved A/B, `taskset -c 3`, 15 pairs, deterministic counters,
+/// `gc_bound` churn, default native-baseline tier).** The churn shape's own heap-admission door
+/// already settles its collection debt every iteration, so a boundary collection here is nearly
+/// always a duplicate — and an expensive one, because `beam_gc::Collector::collect` escalates to a
+/// **major** whenever the mature generation is not larger than the nursery in use. At a `1/2`
+/// watermark the door fired on **47 of 95** boundaries (N = 500; 191 of 383 at N = 2 000) and cost
+/// **+0.0479 collections/call (+0.69 %)** and **+0.1337 majors/call (+8.9 %)** against a
+/// door-disabled build of the same tree. At `7/8` the same runs measure **exactly** the
+/// door-disabled counts — 6.984032 collections and 1.497006 majors per call at N = 500, 6.996002
+/// and 1.499250 at N = 2 000 — while the door's own 11 / 47 collections still keep the
+/// retired-space chain collapsed (one young space at the 233-word floor, against the door-off two
+/// spaces / 376 words). Closing the gate further buys nothing: the C-exact `used >= capacity`
+/// (`1/1`) measures the *same* counters and only trades 11 firings for 3, so the looser `7/8` is
+/// taken — see just below for why a hard `used == capacity` test is a liability rather than a
+/// virtue on a nursery that grows on demand.
+///
+/// **Not `1/1`.** `Process::grow_nursery` extends the current space in place, so a space one word
+/// short of full refills immediately and satisfies an exact `used == capacity` test on consecutive
+/// boundaries; chained that way the door would amplify majors instead of rationing them. `7/8`
+/// leaves the growth seam its headroom and is measured indistinguishable from `1/1` in the
+/// counters.
+///
+/// **What would regress it:** a shape whose slice-boundary occupancy sits in `[1/2, 7/8)` — it
+/// would then be collected only through the debt arm, and if its growth seam retired no space it
+/// would climb again. Not observed: the churn shape is bimodal in eighths (12 of 95 checks empty,
+/// 24 at ≥ 7/8, the rest spread over `[1/8, 7/8)` but always *after* a collection), the
+/// no-heap-admission shape reports a debt at every check, and the pre-empting-but-not-churning
+/// shapes (`etf_roundtrip`, `list_walk`, `ets_copy`) keep a flat 233/376-word nursery.
+const BOUNDARY_OCCUPANCY_NUM: usize = 7;
 /// The occupancy watermark's denominator (see [`BOUNDARY_OCCUPANCY_NUM`]).
-const BOUNDARY_OCCUPANCY_DEN: usize = 2;
+const BOUNDARY_OCCUPANCY_DEN: usize = 8;
+
 /// Collects the running process's own heap at a **reduction/yield boundary** — the slice-end
 /// collection point for a workload whose loop reaches no heap-admission door.
 ///
@@ -101,7 +148,8 @@ const BOUNDARY_OCCUPANCY_DEN: usize = 2;
 /// 5. **the window is collectable** ([`beam_process::Process::is_relocation_exempt`]: an exempt
 ///    park published nothing and its machine stays authoritative — collecting there would move
 ///    the heap out from under it);
-/// 6. **the nursery is occupied** (half of the current space, or a growth's collection debt);
+/// 6. **the nursery is nearly exhausted** (seven eighths of the current space, or a growth's
+///    collection debt);
 /// 7. **the unscanned-root valve** ([`super::valve_verdict`]), exactly as the full heap-admission
 ///    door runs it — because this door too hands the valve the machine's whole root set, a clean
 ///    descent may also **close** the process's per-pid descent latch.
@@ -168,7 +216,10 @@ pub(crate) fn collect_at_reds_boundary(
     // The **occupancy watermark**, plus the collector's *collection debt* — the growth seam's own
     // signal that the nursery is a chain only a collection can collapse (see
     // [`beam_gc::Collector::collection_debt`]). The two are OR-ed exactly as the heap-admission
-    // door OR-ed its own occupancy test with the debt.
+    // door OR-ed its own occupancy test with the debt: the watermark says "this allocation area is
+    // nearly exhausted" (the C's `ERTS_VBUMP_ALLOC_REDS` moment), the debt says "a growth retired a
+    // space, so only a collection can collapse the chain" — the one collection the watermark alone
+    // would never schedule on a shape whose boundary occupancy stays low.
     let debt = process.collection_debt();
     let (used, capacity) = {
         let young = process.collector().young();

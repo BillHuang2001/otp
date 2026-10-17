@@ -33,14 +33,21 @@
 //!
 //! * **one check per pre-emption** — the door is handed exactly one boundary per `Yield` park
 //!   (`door.checks == yields`), never one per instruction;
-//! * **the occupancy watermark halves it** — of two consecutive boundaries only one collects
-//!   (the boundary that just collected left the nursery below the watermark, so the next one
-//!   declines), which is what keeps the door's own hit rate at ≈0.1 collections per call while
-//!   the shape does ≈7.
+//! * **the seven-eighths watermark rations it to one boundary in eight** —
+//!   `door.collections == door.checks / 8`, exactly: the shape's own heap-admission door settles
+//!   its collection debt on every iteration, so the nursery is nearly exhausted (seven eighths
+//!   used, the C's `ERTS_VBUMP_ALLOC_REDS` moment) at only every eighth slice end, and a boundary
+//!   collection that owns the collector's 233-word floor leaves the boundaries after it below
+//!   the watermark.
 //!
-//! Together they bound the door's contribution: it runs at most one extra collection per two
-//! pre-emptions, which on this shape is **+0.048 collections/call (+0.7 %)** — measured
-//! against a door-disabled build of the same tree, and recorded with the rest of the table.
+//! Together they bound the door's contribution: at most one collection per eight pre-emptions,
+//! which on this shape is **nothing at all** — measured against a door-disabled build of the same
+//! tree (interleaved single-build A/B, `taskset -c 3`, 15 pairs, deterministic counters), the
+//! totals are identical: 6.984032 / 6.996002 / 6.999200 collections and 1.497006 / 1.499250 /
+//! 1.499850 majors per call at N = 500 / 2 000 / 10 000. The door's collections *substitute for*
+//! the heap-admission door's rather than adding to them, and they keep the retired-space chain
+//! collapsed (one young space at the 233-word floor, against the door-off two spaces / 376 words).
+//! The whole table is in `../CONTEXT.md` *Measured*.
 use beam_term::make_small;
 
 use super::super::run::{boundary_door_counters, reset_boundary_door_counters, BoundaryDoorCounters};
@@ -141,14 +148,16 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
 /// * **one boundary check per pre-emption** — `door.checks == yields`, exactly: the door is
 ///   reached from the runner's `Yield` arm and nowhere else, so its check count is the shape's
 ///   own pre-emption count (∈ [0.19, 0.20] per call) and cannot grow with anything else;
-/// * **the occupancy watermark declines the alternating boundary** —
-///   `door.collections == door.checks / 2`, exactly: the boundary that collects leaves the
-///   nursery below the watermark, so the very next one is a typed no-op. That is what bounds
-///   the door's own hit rate at **0.096 collections per call** on a shape that does ≈7.
+/// * **the seven-eighths watermark rations it to one boundary in eight** —
+///   `door.collections == door.checks / 8`, exactly (a floor): the nursery is nearly exhausted at
+///   only every eighth slice end, so the door's own hit rate is **0.024 collections per call** on
+///   a shape that does ≈7.
 ///
-/// The measured consequence, taken against a door-disabled build of the same tree, is a total
-/// of **+0.048 collections/call (+0.69 %)**: less than the door's own hit rate, because each
-/// boundary collection lets the neighbouring heap-admission door decline. The full table
+/// The measured consequence, taken against a door-disabled build of the same tree, is **nothing**:
+/// the shape's totals are the door-off figures *exactly* — `collections == 7N - 1` and
+/// `major == 3N / 2` — pinned below, because a boundary collection substitutes for a heap-admission
+/// one instead of adding to it. (At the previous one-half watermark this shape measured
+/// **+0.048 collections/call (+0.69 %)** and **+0.134 majors/call (+8.9 %)**.) The full table
 /// (every hot shape, both execution tiers, ON vs OFF) is in `../CONTEXT.md` *Measured*.
 ///
 /// Every iteration of this shape already reaches a heap-admission door, so the shape is the
@@ -195,20 +204,19 @@ fn the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape() {
         (0, 0),
         "every churn park publishes its root set: {r1:?} {r2:?}"
     );
-    // 2. The occupancy watermark declines exactly the alternating boundary.
+    // 2. The seven-eighths watermark rations the door to one boundary in eight (a floor).
     assert_eq!(
         (r1.door.collections, r2.door.collections),
-        (r1.door.checks / 2, r2.door.checks / 2),
-        "the boundary that collected leaves the nursery below the watermark, so the next one \
-         declines: {r1:?} {r2:?}"
+        (r1.door.checks / 8, r2.door.checks / 8),
+        "the nursery is nearly exhausted at only every eighth slice end, and the boundary that \
+         collected leaves the space at its floor: {r1:?} {r2:?}"
     );
-    // The bounds that follow (no per-call cost growth, a hit rate far below the shape's own
-    // collection rate) hold at both counts and are what makes the door inert here.
+    // The bounds that follow hold at both counts: no per-call cost growth, and the shape's own
+    // collection totals left exactly where a door-disabled build of this tree measures them.
     for (n, run) in [rows[0], rows[1]] {
         let calls = Run::calls(n);
         let checks_per_call = run.door.checks as f64 / calls;
         let door_per_call = run.door.collections as f64 / calls;
-        let collections_per_call = run.counters.collections as f64 / calls;
         assert!(
             (0.15..0.25).contains(&checks_per_call),
             "one boundary per ~5 calls (a 4 000-reduction slice over a ~20-reduction \
@@ -218,11 +226,14 @@ fn the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape() {
             door_per_call <= checks_per_call,
             "at most one collection per boundary: N={n} {door_per_call:.6} > {checks_per_call:.6}"
         );
-        assert!(
-            collections_per_call <= 7.06,
-            "the door must not move the shape's own ~7.0 collections/call more than its hit \
-             rate can justify (measured 7.044 with the door, 6.996 without): N={n} \
-             {collections_per_call:.6}/call"
+        // The derived relation: the shape's own rate (7 collections and 1.5 majors per
+        // iteration, minus the one collection the final iteration does not need), byte-for-byte
+        // the door-disabled figures — so the door costs the shape nothing.
+        assert_eq!(
+            (run.counters.collections, run.counters.major),
+            (7 * (n as u64) - 1, 3 * (n as u64) / 2),
+            "a boundary collection must substitute for a heap-admission one, never add to it: \
+             N={n} {run:?}"
         );
     }
     // The nursery stays one space and keeps the collector's floor capacity: the door's
