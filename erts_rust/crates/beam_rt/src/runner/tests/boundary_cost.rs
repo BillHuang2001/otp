@@ -89,6 +89,7 @@ impl Run {
 /// collector is readable from outside the runner.
 fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
     let before = rt.gc_stats();
+    let reductions_before = rt.reductions_statistics(false).0;
     reset_boundary_door_counters();
     super::super::run::reset_run_slice_counters();
     let pid = rt
@@ -126,6 +127,7 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
             slices: slices.slices,
             yields: slices.yields,
             waits: slices.waits,
+            reductions: rt.reductions_statistics(false).0 - reductions_before,
             collections: after.collections - before.collections,
             major: after.major - before.major,
             fallbacks: after.fallbacks - before.fallbacks,
