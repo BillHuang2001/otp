@@ -283,7 +283,11 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `src/proc.rs` → subprocess helpers: timed run with stdout/stderr capture, `VmHWM` peak-memory poller.
 - `src/scratch.rs` → **read-only target adapter**: `ScratchDir` (RAII `$TMPDIR` temp dir), `copy_tree`, `copy_files`.
 - `src/http_load.rs` → dependency-free in-process HTTP/1.1 load driver (`LoadConfig`, `drive`, `LoadOutcome`).
-- `src/report.rs` → `Report`, `WorkloadResult`, `SCHEMA_VERSION`, JSON save/load (serde).
+- `src/marginal.rs` → **the paired, drift-cancelling startup-cancelled marginal**: `Pass` (`units`/`as_str`),
+  `PassError`/`Abort`/`PairedRuns`, `sample_pairs(runs, sample)` (Work-then-Startup **within** every round),
+  `resolve(&[(work_ms, startup_ms)], units) -> Marginal` (median of the paired deltas, `1.4826 × MAD`
+  noise band floored at `MIN_NOISE_MS`, published only above `NOISE_MULTIPLE`), `Marginal::{unit_cost_ns,
+  detail, below_resolution_note}`. The sanctioned schedule for every per-unit metric.- `src/report.rs` → `Report`, `WorkloadResult`, `SCHEMA_VERSION`, JSON save/load (serde).
 - `src/compare.rs` → diff two `Report`s into per-(workload,runtime,metric) deltas; one-path mode diffs `sys` vs `rust` within a single report.
 - `src/run.rs` → runner: resolve runtimes, iterate (runtime × workload), assemble `Report`, write JSON.
 - `src/workload.rs` → the `Workload` trait, `RunContext`, `registry()`, `find()`.
