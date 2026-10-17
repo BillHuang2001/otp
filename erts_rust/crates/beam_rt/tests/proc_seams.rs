@@ -123,7 +123,9 @@ fn is_atom_named(rt: &Runtime, term: Eterm, name: &str) -> bool {
 /// Whether `result` is the oracle's plain `badarg` raise.
 fn is_badarg(result: beam_common::Result<Eterm>) -> bool {
     matches!(result, Err(error) if error.as_atom() == Some("badarg"))
-}// ---------------------------------------------------------------------------------------
+}
+
+// ---------------------------------------------------------------------------------------
 // registered/0
 // ---------------------------------------------------------------------------------------
 
