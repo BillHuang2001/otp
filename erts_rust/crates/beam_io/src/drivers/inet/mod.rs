@@ -147,10 +147,11 @@
 //!   C's `connect`/`recv`/`accept` are asynchronous request/reply exchanges through it; this
 //!   floor's `recv` is a **synchronous** read-now verb (empty argument, `[1]` reply; the raw
 //!   bytes — or, under `{packet, N}`, one decoded frame's payload — into the port input queue)
-//!   and its `accept`/`connect` transfer or complete in place. This is
-//!   also why `recv` rejects the C's 8-byte `Timeout(4), Length(4)` payload with `BadArg`
-//!   rather than accepting arguments it cannot honor.
-//! * **IPv6, UDP, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
+//!   and its `accept`/`connect` transfer or complete in place. The numeric `TCP_REQ_RECV`(42)
+//!   therefore validates the C's 8-byte `Timeout(4), Length(4)` payload **after** its connection
+//!   and `active` guards (`:12268`-`:12296`), exactly as the C orders them, and then forwards an
+//!   empty operand to that synchronous verb; only the **named** `recv` verb keeps the `BadArg`
+//!   contract for a non-empty argument.//! * **IPv6, UDP, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_STREAM` (`:11961`-`:11990`) and `bind`/`connect` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms (`:4795`); any other family tag is `BadArg`.
 //! * **Multi-accept** — see the accept divergence below.
