@@ -91,6 +91,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// The test-only foreign-workload measurement harness (`bench/mod.rs`,
+/// `bench/counting.rs`): absent from production builds.
+#[cfg(test)]
+mod bench;
 pub mod context;
 pub mod error;
 mod families;
@@ -99,8 +103,6 @@ pub mod interpreter;
 pub mod jit;
 pub mod machine;
 pub mod operand;
-#[cfg(test)]
-mod bench;
 #[allow(unsafe_code)]
 mod predicates;
 mod step;
