@@ -29,7 +29,9 @@ figures are in `PERF.md`).
 ## API Surface (crate-internal, `pub(crate)`)
 * [`entry`] — `ProcessEntry` (the runtime-scheduled entry: an export or a fun), `ProcessEngine`
   (per-pid machine/entry/parked state + the **remembered `tier`**) and `RunnerState`
-  (per-pid engine state, recorded `result`/`exit`, `jit_mode` override).
+  (per-pid engine state, recorded `result`/`exit`, `jit_mode` override — its four pid-keyed maps
+  `engines`/`results`/`exits`/`errors` are `crate::hasher::FastHashMap`, sound because each is only
+  ever probed by pid and never iterated for an observable order).
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root hand-off (`park_machine`, whose `ProcessEngine::parked_published` flag gates the

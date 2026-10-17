@@ -18,8 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! A small **deterministic, non-cryptographic** hasher for the runtime's pid-keyed bookkeeping
-//! sets — the alternative to [`std::collections::hash_map::RandomState`]'s SipHash-1-3.
+//! A small **deterministic, non-cryptographic** hasher for the runtime's internal, per-pid/per-id
+//! bookkeeping structures — the alternative to [`std::collections::hash_map::RandomState`]'s
+//! SipHash-1-3.
 //!
 //! # Why
 //!
@@ -67,7 +68,7 @@
 //!    [`MIX_MULTIPLIER`] (the constant rustc's `FxHasher` uses) is dense in its low half, so one
 //!    round diffuses both halves.
 //!
-//! # Why this is sound for the latch (and only for the latch)
+//! # Why this is sound for these structures
 //!
 //! A *set-membership* answer does not depend on the hasher: equal keys still hash equally (a
 //! `Hash` impl always uses the same writer for the same type), and two keys that collide are
@@ -77,20 +78,22 @@
 //!
 //! The three properties this crate relies on are therefore:
 //!
-//! * **the latch is never iterated for an observable ordered result** — the only iteration over
-//!   it is `Runtime::prune_gc_requests`' `retain` over process liveness, whose result is a *set*,
-//!   and the latch never reaches a term, a message or a `system_info` value;
-//! * **its keys are not attacker-chosen** — a pid is minted by
-//!   [`beam_process::ProcessTable`] from its own monotonically growing slot numbers, so there is no
+//! * **none of them is iterated for an observable ordered result** — the latch's only iteration is
+//!   `Runtime::prune_gc_requests`' `retain` over process liveness, whose result is a *set*, and the
+//!   rest are `get`/`entry`/`insert`/`remove` probes or an order-independent scan, so nothing here
+//!   reaches a term, a message or a `system_info` value;
+//! * **their keys are not attacker-chosen** — a pid is minted by
+//!   [`beam_process::ProcessTable`] from its own monotonically growing slot numbers and a timer key
+//!   is minted by the runtime itself (its `RefAllocator` or `Timers`' id counter), so there is no
 //!   HashDoS surface for a seeded hasher to defend (nothing in this runtime hashes wire-supplied
 //!   keys with [`FastBuildHasher`]); and
 //! * **determinism is an improvement here, not a regression** — the seed buys unpredictability
-//!   that nothing in this runtime wants, and a fixed basis makes a latch's probe order reproducible
-//!   across runs (which the structural counters' tests rely on) as rustc's own `FxHashMap` relies
-//!   on it.
+//!   that nothing in this runtime wants, and a fixed basis makes each structure's probe order
+//!   reproducible across runs (which the structural counters' tests rely on) as rustc's own
+//!   `FxHashMap` relies on it.
 //!
 //! Anything that *does* hash attacker-supplied keys (the atom table, the code cache) keeps
-//! `RandomState`; this module exists for the internal, pid-keyed, verdict-only cases.
+//! `RandomState`; this module exists for the internal, id-keyed, verdict-only cases.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -251,15 +254,18 @@ pub(crate) type FastBuildHasher = BuildHasherDefault<FastHasher>;
 /// A [`HashSet`] over [`FastBuildHasher`] — the convenience alias for an internal, verdict-only
 /// key set (see the module docs for when this is the right hasher and when it is not).
 ///
-/// The alias is only spelled out where a *typed* set is needed (the latch's `ForeignLatch` writes
-/// the hasher inline at its one definition site, and this module's own tests exercise the alias);
-/// it is kept as the module's declared convenience surface for the next verdict-only set.
+/// The alias is only spelled out where a *typed* set is needed: the latch's `ForeignLatch` writes
+/// the hasher inline at its one definition site, while `Runtime::async_dist` uses this alias, and
+/// this module's own tests exercise it.
 #[allow(dead_code)]
 pub(crate) type FastHashSet<T> = HashSet<T, FastBuildHasher>;
 
 /// A [`HashMap`] over [`FastBuildHasher`] — the convenience alias for an internal map whose
-/// iteration order is not observable (see the module docs). Kept alongside
-/// [`FastHashSet`] as the module's declared convenience surface; today no production map qualifies.
+/// iteration order is not observable (see the module docs). It backs the runtime's internal
+/// id-keyed bookkeeping — the `Timers` `pending`/`refs` indexes, `RunnerState`'s
+/// `engines`/`results`/`exits`/`errors`, `TimerWakes`'s `deliver`/`resume`, `Runtime::mailboxes`
+/// and the façade's `group_leaders`/`monitor_nodes`/`timer_resumes` — each only probed by an
+/// internal id and never iterated for an observable order.
 #[allow(dead_code)]
 pub(crate) type FastHashMap<K, V> = HashMap<K, V, FastBuildHasher>;
 
