@@ -261,10 +261,11 @@ fn fail_or_function_clause(
     machine: &mut Machine,
     module: &Module,
     labels: &LabelMap,
+    ctx: &mut dyn ExecutionContext,
     fail: Label,
 ) -> Result<Step> {
     if fail == NO_FAIL {
-        raise_function_clause_no_fail(machine, module, "maps")
+        raise_function_clause_no_fail(machine, module, "maps", ctx)
     } else {
         goto(labels, fail)
     }

@@ -37,8 +37,9 @@ use beam_common::{
     StackFrame, StackTrace,
 };
 use beam_loader::Module;
-use beam_term::{is_list, is_nil, is_non_value, Eterm, NIL, THE_NON_VALUE};
+use beam_term::{is_list, is_nil, is_non_value, make_atom, Atom, Eterm, NIL, THE_NON_VALUE};
 
+use crate::context::ExecutionContext;
 use crate::error;
 use crate::families::exceptions::stacktrace::nearest_line;
 use crate::Step;
@@ -250,12 +251,58 @@ impl Machine {
         }
     }
 
+    /// Resolve **every still-unresolved** exception-class atom from the engine's
+    /// live atom namespace and install it ([`Machine::set_class_atom`]).
+    ///
+    /// This is the single choke point that keeps a raise from being abandoned when
+    /// the *running module's* atom table cannot name a class atom (`error`/`exit`/
+    /// `throw`): C reads its `am_error`/`am_exit`/`am_throw` **globals**
+    /// (`../../erts/emulator/beam/beam_common.c:541-544`), so every class is
+    /// nameable there, while a module's load-time snapshot only holds the names its
+    /// own source (plus the loader's seeds) interned. The namespace
+    /// ([`ExecutionContext::atoms`]) is the engine's equivalent of those globals —
+    /// the runtime answers with its ONE live shared table — and
+    /// [`namespace_atom`] falls back to the module snapshot, so a host that does not
+    /// override the seam behaves exactly as before.
+    ///
+    /// **Cost and ownership.** The whole body is skipped by one `bool` test once it
+    /// has run (`class_atoms_live`, cleared by [`Machine::reset`] — the class atoms
+    /// belong to the run that is starting), so the only caller
+    /// ([`crate::families::dispatch`], one call per family-owned instruction) pays a
+    /// single load in steady state. An atom **neither** source can name stays
+    /// unresolved on purpose: [`Machine::class_atom`] then reports its typed
+    /// `unsupported` rather than substituting a wrong atom.
+    pub(crate) fn ensure_class_atoms(&mut self, ctx: &mut dyn ExecutionContext, module: &Module) {
+        if self.class_atoms_live {
+            return;
+        }
+        for class in [
+            ExceptionClass::Error,
+            ExceptionClass::Exit,
+            ExceptionClass::Throw,
+        ] {
+            let Some(index) = exception_class_index(class) else {
+                continue;
+            };
+            if !is_non_value(self.class_atoms[index]) {
+                // Already installed by a raise site (from the same namespace, so the
+                // same index) — never overwrite it.
+                continue;
+            }
+            if let Some(atom) = namespace_atom(ctx, module, class.as_str()) {
+                self.class_atoms[index] = make_atom(atom);
+            }
+        }
+        self.class_atoms_live = true;
+    }
     /// The installed atom for `class`, or a typed error when unset/unknown.
     ///
-    /// A missing atom means the class atom is absent from the running module's atom
-    /// table. The engine (correctly) refuses to substitute a different atom: the
-    /// class term would then be a *different, wrong* atom rather than the
-    /// documented `unsupported` error.
+    /// A missing atom means **neither** the engine's live atom namespace nor the
+    /// running module's atom table names the class (see
+    /// [`Machine::ensure_class_atoms`], which resolves all three classes from the
+    /// namespace before the raise lands). The engine (correctly) refuses to
+    /// substitute a different atom: the class term would then be a *different,
+    /// wrong* atom rather than the documented `unsupported` error.
     fn class_atom(&self, class: ExceptionClass) -> Result<Eterm> {
         let atom = exception_class_index(class)
             .map(|index| self.class_atoms[index])
@@ -267,7 +314,6 @@ impl Machine {
             ))
         })
     }
-
     /// Unwind the call-frame stack back to `frame_index` (and drop the Y slots of
     /// every deeper frame), reproducing C's `c_p->stop = prev` in `next_catch`
     /// (`../../erts/emulator/beam/beam_common.c:643-679`).
@@ -693,6 +739,34 @@ fn exception_class_index(class: ExceptionClass) -> Option<usize> {
     }
 }
 
+/// Resolve an atom **name** through the engine's live atom namespace
+/// ([`ExecutionContext::atoms`]) with the running module's load-time snapshot as
+/// the fallback.
+///
+/// This is the one definition of "name an atom for a raise" the raise path uses.
+/// The default [`ExecutionContext::atoms`] body **is** `&module.atom_table`, so a
+/// host that does not override the seam gets exactly the pre-seam behaviour; a host
+/// that owns ONE live shared namespace (the runtime) is asked first, because a
+/// module's snapshot cannot name an atom interned *after* it was loaded (its id is
+/// beyond the snapshot) — and an exception's reason/class atoms are exactly such
+/// runtime-interned names.
+///
+/// A name **neither** source knows yields `None`, and every caller keeps its typed
+/// error / no-substitution path: the engine never invents an atom index, because an
+/// index is valid only against the table it was read with.
+///
+/// Borrow discipline: `atoms` borrows `*ctx` immutably for the length of the
+/// lookup only, and the result is a `Copy` [`Atom`], so the borrow is over before
+/// the caller's next `&mut ctx` call.
+pub(crate) fn namespace_atom(
+    ctx: &dyn ExecutionContext,
+    module: &Module,
+    name: &str,
+) -> Option<Atom> {
+    ctx.atoms(module)
+        .lookup(name)
+        .or_else(|| module.atom_table.lookup(name))
+}
 /// The reason-atom prefix of every **engine diagnostic** raise
 /// ([`crate::error::unsupported`]).
 const ENGINE_DIAGNOSTIC_PREFIX: &str = "unsupported_opcode: ";
@@ -1150,8 +1224,7 @@ mod tests {
     }
 
     /// `pending_exception_mut` is the write half of the `pending_exception` pair: it
-    /// hands out a reference into the machine's own slot, so a relocated reason term
-    /// written through it is what the read accessor observes next.
+    /// hands out a reference into the machine's own slot, so a relocated reason term    /// written through it is what the read accessor observes next.
     #[test]
     fn pending_exception_mut_writes_the_same_slot_the_reader_returns() {
         // A fresh machine has no pending exception: the write half is `None` too.
@@ -1186,5 +1259,99 @@ mod tests {
             Some((ExceptionClass::Exit, relocated))
         );
         assert_eq!(machine.pending_class(), Some(ExceptionClass::Exit));
+    }
+
+    // ---------------------------------------------------------------------
+    // `ensure_class_atoms` — the class-atom choke point (live namespace)
+    // ---------------------------------------------------------------------
+
+    /// A live namespace: the module's load-time snapshot plus `names`, interned
+    /// afterwards (so their ids are beyond the snapshot).
+    fn namespace_with(module: &Module, names: &[&str]) -> beam_term::AtomTable {
+        let mut live = module.atom_table.clone();
+        for name in names {
+            live.intern(name);
+        }
+        live
+    }
+
+    #[test]
+    fn ensure_class_atoms_resolves_the_three_classes_from_the_live_namespace() {
+        // W3: the module names none of the class atoms; the host's namespace names all
+        // three. After the one-shot resolution a class-`error` raise lands instead of
+        // being abandoned with a typed `unsupported`.
+        let module = Module::default();
+        assert!(module.atom_table.lookup("error").is_none());
+        let live = namespace_with(&module, &["error", "exit", "throw"]);
+        let error = live.lookup("error").expect("the namespace names error");
+        let exit = live.lookup("exit").expect("the namespace names exit");
+        let throw = live.lookup("throw").expect("the namespace names throw");
+
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(2, 5, 0));
+        let mut ctx = crate::context::MinimalContext::with_shared_atoms(live);
+
+        machine.ensure_class_atoms(&mut ctx, &module);
+        let reason = Eterm::from_raw(0x77);
+        let step = machine
+            .throw_with_trace(ExceptionClass::Error, reason, NIL)
+            .expect("the class atom came from the namespace");
+        assert_eq!(step, Step::Goto { func: 2, pc: 5 });
+        assert_eq!(machine.x(3), Some(make_atom(error)), "x(3) = the class atom");
+
+        // The other two classes are installed too (never substituted by other atoms).
+        let mut exit_machine = Machine::new();
+        exit_machine.ensure_class_atoms(&mut ctx, &module);
+        exit_machine.push_frame(0).unwrap();
+        exit_machine.push_catch_frame(CatchFrame::new(0, 1, 0));
+        exit_machine
+            .throw(ExceptionClass::Exit, Eterm::from_raw(0x88))
+            .expect("class `exit` is nameable too");
+        assert_eq!(exit_machine.x(3), Some(make_atom(exit)));
+        let mut throw_machine = Machine::new();
+        throw_machine.ensure_class_atoms(&mut ctx, &module);
+        throw_machine.push_frame(0).unwrap();
+        throw_machine.push_catch_frame(CatchFrame::new(0, 2, 0));
+        throw_machine
+            .throw(ExceptionClass::Throw, Eterm::from_raw(0x99))
+            .expect("class `throw` is nameable too");
+        assert_eq!(throw_machine.x(3), Some(make_atom(throw)));
+    }
+
+    #[test]
+    fn ensure_class_atoms_never_overwrites_an_installed_atom_and_survives_a_reset() {
+        // A class atom a raise site already installed (from the same namespace, so the
+        // same index) is left alone, and the per-run latch is invalidated by `reset` —
+        // a stale `true` would make the next run skip the resolution its own namespace
+        // needs.
+        let module = Module::default();
+        let live = namespace_with(&module, &["error", "exit", "throw"]);
+        let error = live.lookup("error").expect("the namespace names error");
+        let mut ctx = crate::context::MinimalContext::with_shared_atoms(live);
+
+        let mut machine = Machine::new();
+        let installed = make_atom(Atom::from_raw(1));
+        machine.set_class_atom(ExceptionClass::Error, installed);
+        machine.ensure_class_atoms(&mut ctx, &module);
+        // Not overwritten.
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(0, 0, 0));
+        machine
+            .throw_error(Eterm::from_raw(0x11))
+            .expect("a live frame catches");
+        assert_eq!(machine.x(3), Some(installed));
+
+        // A reset invalidates the latch *and* the installed atoms, so the next run
+        // resolves them again rather than skipping the resolution.
+        machine.reset();
+        assert!(!machine.class_atoms_live, "reset clears the per-run latch");
+        machine.ensure_class_atoms(&mut ctx, &module);
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(0, 1, 0));
+        machine
+            .throw_error(Eterm::from_raw(0x12))
+            .expect("the namespace is consulted again");
+        assert_eq!(machine.x(3), Some(make_atom(error)));
     }
 }

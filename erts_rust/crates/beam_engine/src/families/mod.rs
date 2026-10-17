@@ -119,8 +119,17 @@ pub(crate) fn dispatch(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
-    let claimed = match instr {
-        // tuples
+    // The single seam every family-owned raise passes through on BOTH tiers (the
+    // interpreter calls this directly; the native baseline tier's `jit_family`
+    // helper reaches the same call), so it is where the machine resolves the three
+    // exception-**class** atoms from the engine's live atom namespace
+    // ([`ExecutionContext::atoms`], with the module snapshot as the fallback) —
+    // one `bool` test per instruction in steady state. Without it a family raise
+    // (`machine.throw`/`throw_error`) whose class atom the *module's* table cannot
+    // name would select its catch frame and then abandon it with a typed
+    // `unsupported` instead of landing (C reads its class atoms from globals).
+    machine.ensure_class_atoms(ctx, module);
+    let claimed = match instr {        // tuples
         Instr::PutTuple2 { .. }
         | Instr::GetTupleElement { .. }
         | Instr::SetTupleElement { .. }
@@ -483,6 +492,68 @@ mod tests {
         assert_eq!(
             dispatch_reason(&generic),
             format!("unsupported_opcode: {UNCLAIMED_PREFIX}: instruction")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The class-atom choke point: a family raise lands in a live catch frame
+    // even when the running module cannot name the class atom (W3)
+    // -----------------------------------------------------------------------
+
+    /// Dispatch `instr` — a family raise — with the given context, returning the
+    /// family's own outcome (the handler landing, or a typed error).
+    fn dispatch_with(
+        instr: &Instr,
+        module: &Module,
+        machine: &mut Machine,
+        ctx: &mut MinimalContext,
+    ) -> beam_common::Result<Step> {
+        dispatch(machine, module, module, &LabelMap::new(), instr, 0, 0, ctx)
+    }
+
+    /// A machine under a live catch frame landing at `(func, pc)`, running `module`.
+    fn machine_under_a_catch_frame() -> Machine {
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("the bottom frame");
+        machine.push_catch_frame(crate::machine::CatchFrame::new(4, 6, 0));
+        machine
+    }
+
+    #[test]
+    fn a_family_raise_lands_through_the_live_namespace_when_the_module_cannot_name_the_class() {
+        // W3: the module names the REASON atom (`if_clause`, so `raise_error_atom`
+        // succeeds) but NOT the `error` class atom; the host's live namespace names it.
+        // Before the fix the raise selected its catch frame and then abandoned it with
+        // a typed `unsupported` (`class_atom` found nothing installed).
+        let mut module = Module::default();
+        module.atom_table.intern("if_clause");
+        assert!(module.atom_table.lookup("error").is_none());
+        let mut live = module.atom_table.clone();
+        let error = live.intern("error");
+        assert!(module.atom_table.lookup("error").is_none(), "beyond the snapshot");
+
+        let mut machine = machine_under_a_catch_frame();
+        let mut ctx = MinimalContext::with_shared_atoms(live);
+        let step = dispatch_with(&Instr::IfEnd, &module, &mut machine, &mut ctx)
+            .expect("the class atom comes from the engine's live namespace");
+        assert_eq!(step, Step::Goto { func: 4, pc: 6 });
+        assert_eq!(machine.x(1), Some(make_atom(module.atom_table.lookup("if_clause").unwrap())));
+        assert_eq!(machine.x(3), Some(make_atom(error)));
+    }
+
+    #[test]
+    fn a_family_raise_whose_class_is_unnameable_stays_the_typed_unsupported() {
+        // The negative half: with no namespace nameable for the class, the refusal is
+        // unchanged — the typed `unsupported`, never a substituted atom.
+        let mut module = Module::default();
+        module.atom_table.intern("if_clause");
+        let mut machine = machine_under_a_catch_frame();
+        let mut ctx = MinimalContext::new();
+        let reason = error_reason(dispatch_with(&Instr::IfEnd, &module, &mut machine, &mut ctx));
+        assert_eq!(
+            reason,
+            "unsupported_opcode: exceptions: no atom for the 'error' exception class in the \
+             module atom table"
         );
     }
 }

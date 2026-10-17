@@ -305,9 +305,12 @@ impl Machine {
         self.catch_frames.clear();
         self.pending_exception = None;
         // The class atoms belong to the module being run, so a reset (the start of
-        // every `run_*`) invalidates them; the exceptions family reinstalls them.
+        // every `run_*`) invalidates them; the exceptions family reinstalls them. The
+        // `class_atoms_live` latch records that they were resolved from the live atom
+        // namespace for the run in progress, so it is invalidated with them — a stale
+        // `true` would make the new run skip the resolution its own namespace needs.
         self.class_atoms = UNRESOLVED_CLASS_ATOMS;
-        // Likewise the literal area: it belongs to the module being run and is
+        self.class_atoms_live = false;        // Likewise the literal area: it belongs to the module being run and is
         // re-bound by `run_loop`.
         self.literals = None;
         self.entry_literals = None;

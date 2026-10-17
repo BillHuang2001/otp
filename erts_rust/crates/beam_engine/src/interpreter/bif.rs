@@ -30,10 +30,8 @@ use beam_term::{make_atom, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::machine::Machine;
-use crate::operand::{read_operand, write_operand};
+use crate::machine::{namespace_atom, Machine};use crate::operand::{read_operand, write_operand};
 use crate::Step;
-
 use super::{resolve, LabelMap};
 
 /// The argument count up to which a BIF/`call_ext` marshals its arguments through
@@ -125,7 +123,7 @@ impl Machine {
             // No fail label ⇒ a *raise*: land in a live catch frame (C falls
             // through to `find_func_info`/`handle_error`) or propagate the typed
             // error.
-            Err(e) if fail == NO_FAIL => self.raise_bif_error(module, e),
+            Err(e) if fail == NO_FAIL => self.raise_bif_error(module, e, ctx),
             // Guard failure: jump to the fail label.
             Err(_) => {
                 let (func, pc) = resolve(labels, fail)?;
@@ -326,18 +324,19 @@ impl Machine {
     ///   (`BADARG`/`BADARITH`/… are `EXTAG_ERROR` reasons) — while a
     ///   [`BeamError::Raise`] whose reason **is an atom** keeps its own class
     ///   (`error`/`exit`/`throw`: the shape `erlang:throw/1`/`exit/1` and every
-    ///   `beam_bifs`-backed no-clause failure raise). The atom is resolved in the
-    ///   running module's atom table and turned into the `x(1)` reason term.
+    ///   `beam_bifs`-backed no-clause failure raise). The reason atom — and the
+    ///   class atom a landing installs in `x(3)` — is resolved through the engine's
+    ///   **live atom namespace** with the running module's load-time snapshot as the
+    ///   fallback ([`namespace_atom`]), so a reason the runtime interned after the
+    ///   module was loaded still lands in the handler.
     /// * An error the engine cannot name as a term propagates unchanged instead: a
     ///   [`BeamError::Raise`] whose reason is
     ///   [`beam_common::ExitReason::Structured`] **without** a live reason slot, a
     ///   variant with no BEAM atom ([`BeamError::TermNotFound`], [`BeamError::Io`]),
-    ///   or an atom the running module's atom table does not hold. Substituting a
-    ///   *different* atom would be a wrong result, so the caller's typed error is
-    ///   preferred — a documented Milestone-1 limit (the [`Module`] reaches the
-    ///   interpreter read-only, so a name the compiler never emitted cannot be
-    ///   interned here, unlike the C runtime's global atom table).
-    ///
+    ///   or an atom **neither** the live namespace nor the module's atom table
+    ///   holds. Substituting a *different* atom would be a wrong result, so the
+    ///   caller's typed error is preferred (the engine never invents an atom index,
+    ///   because an index is valid only against the table it was read with).    ///
     /// A [`BeamError::Raise`] that carries a live reason term
     /// ([`beam_common::Raise::live_reason`], payload [`Eterm`]) is an exception
     /// whose reason is a compound term — the shape [`beam_bifs`]-backed BIFs raise
@@ -360,10 +359,14 @@ impl Machine {
     /// Shared with the instruction families (e.g. `families::receive`'s `send`,
     /// which carries no fail label either), so the landing convention stays defined
     /// in exactly one place.
-    pub(crate) fn raise_bif_error(&mut self, module: &Module, error: BeamError) -> Result<Step> {
-        self.raise_error(module, error, None)
+    pub(crate) fn raise_bif_error(
+        &mut self,
+        module: &Module,
+        error: BeamError,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Step> {
+        self.raise_error(module, error, None, ctx)
     }
-
     /// [`Machine::raise_bif_error`] with a synthesized **callee head item**.
     ///
     /// `head` is the `{CalleeModule, CalleeFunction, ArgList, []}` item a failing
@@ -382,19 +385,29 @@ impl Machine {
         module: &Module,
         error: BeamError,
         head: Option<Eterm>,
+        ctx: &mut dyn ExecutionContext,
     ) -> Result<Step> {
-        self.raise_error(module, error, head)
+        self.raise_error(module, error, head, ctx)
     }
 
     /// The shared body of [`Machine::raise_bif_error`]/
     /// [`Machine::raise_bif_error_with_head`] (see the former for the full contract).
+    ///
+    /// Both the **reason** atom and the **class** atom are resolved through the
+    /// engine's live atom namespace
+    /// ([`crate::machine::namespace_atom`]): a name the host's live namespace    /// knows is nameable even when the running module's load-time snapshot is not
+    /// (the runtime interns `badarg`/`error`/… into its shared table, and a module
+    /// loaded earlier cannot see them). The default
+    /// [`ExecutionContext::atoms`](crate::context::ExecutionContext::atoms) body is
+    /// the module snapshot, so every host that does not override the seam behaves
+    /// exactly as before.
     fn raise_error(
         &mut self,
         module: &Module,
         error: BeamError,
         head: Option<Eterm>,
-    ) -> Result<Step> {
-        // A `None` head leaves every path byte-identical to the pre-head funnel: the
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Step> {        // A `None` head leaves every path byte-identical to the pre-head funnel: the
         // raw trace stays `NIL` and the latch is never armed.
         let has_head = head.is_some();
         let trace = head.unwrap_or(NIL);
@@ -415,10 +428,9 @@ impl Machine {
             {
                 let class = raise.class;
                 let reason = *reason;
-                if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
+                if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
                     self.set_class_atom(class, make_atom(class_atom));
-                }
-                return self.throw_with_trace_headed(
+                }                return self.throw_with_trace_headed(
                     class,
                     reason,
                     trace,
@@ -448,16 +460,16 @@ impl Machine {
         let Some(name) = name else {
             return Err(error);
         };
-        let Some(atom) = module.atom_table.lookup(name) else {
+        let Some(atom) = namespace_atom(ctx, module, name) else {
             return Err(error);
         };
-        // The class atom a landing installs in `x(3)`; a module that cannot name
-        // the class leaves it unset and `throw_with_trace` reports its own typed
-        // error rather than substituting a wrong atom.
-        if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
+        // The class atom a landing installs in `x(3)`; a class **neither** the live
+        // namespace nor the module snapshot can name leaves it unset and
+        // `throw_with_trace` reports its own typed error rather than substituting a
+        // wrong atom.
+        if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
             self.set_class_atom(class, make_atom(class_atom));
-        }
-        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
+        }        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
     }
 
     /// [`Machine::throw_with_trace`] that first arms the one-shot latches the raise
@@ -484,5 +496,132 @@ impl Machine {
             self.pending_supplied_trace = supplied_trace;
         }
         self.throw_with_trace(class, reason, trace)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The raise funnel's **atom-namespace** contract: a catchable raise must land in
+    //! a live catch frame even when the `x(1)` reason atom and the `x(3)` class atom
+    //! are **not** in the running module's load-time snapshot (the runtime interns them
+    //! into its one shared table, and a module loaded earlier cannot see them).
+    use super::*;
+
+    use beam_common::ExceptionClass;
+    use beam_term::{make_small, AtomTable, THE_NON_VALUE};
+
+    use crate::context::MinimalContext;
+    use crate::machine::CatchFrame;
+
+    /// A machine parked under a live catch frame that lands at `(func, pc)`.
+    fn machine_with_a_catch_frame(func: u32, pc: u32) -> Machine {
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("the bottom frame");
+        machine.push_catch_frame(CatchFrame::new(func, pc, 0));
+        machine
+    }
+
+    /// `module` is an atom-poor synthetic module (`Module::default()` interns nothing);
+    /// `namespace` is the engine's **live** shared table — the module's snapshot plus
+    /// the names the runtime interned after it was loaded.
+    fn namespace_with(module: &Module, names: &[&str]) -> AtomTable {
+        let mut live = module.atom_table.clone();
+        for name in names {
+            live.intern(name);
+        }
+        live
+    }
+
+    #[test]
+    fn a_bare_badarg_raise_lands_through_the_live_namespace() {
+        // W2: the module cannot name `badarg` OR `error`; the host's namespace can.
+        // Before the fix the reason-atom lookup was snapshot-only, so the raise
+        // escaped a live catch frame as a hard `Err`.
+        let module = Module::default();
+        assert!(module.atom_table.lookup("badarg").is_none());
+        assert!(module.atom_table.lookup("error").is_none());
+        let live = namespace_with(&module, &["badarg", "error"]);
+        let badarg = live.lookup("badarg").expect("the namespace names badarg");
+        let error = live.lookup("error").expect("the namespace names error");
+        assert!(module.atom_table.lookup("badarg").is_none(), "beyond the snapshot");
+
+        let mut machine = machine_with_a_catch_frame(4, 7);
+        let mut ctx = MinimalContext::with_shared_atoms(live);
+
+        let step = machine
+            .raise_bif_error(&module, BeamError::BadArg, &mut ctx)
+            .expect("a live catch frame must catch the raise");
+        assert_eq!(step, Step::Goto { func: 4, pc: 7 });
+        // The C landing convention: x(0) = THE_NON_VALUE, x(1) = the reason term,
+        // x(3) = the class atom — both resolved from the live namespace.
+        assert_eq!(machine.x(0), Some(THE_NON_VALUE));
+        assert_eq!(machine.x(1), Some(make_atom(badarg)));
+        assert_eq!(machine.x(3), Some(make_atom(error)));
+        assert_eq!(machine.catch_frame_depth(), 1, "the handler pops it");
+    }
+
+    #[test]
+    fn a_bare_badarg_raise_whose_namespace_cannot_name_it_still_propagates() {
+        // The negative half: a namespace that cannot name the reason leaves the raise
+        // untouched (the typed error), never a substituted atom.
+        let module = Module::default();
+        let live = namespace_with(&module, &["error"]);
+        let mut machine = machine_with_a_catch_frame(4, 7);
+        let mut ctx = MinimalContext::with_shared_atoms(live);
+
+        let err = machine
+            .raise_bif_error(&module, BeamError::BadArg, &mut ctx)
+            .expect_err("an unnameable reason cannot land");
+        assert!(matches!(err, BeamError::BadArg));
+        assert_eq!(machine.catch_frame_depth(), 1, "the frame is left untouched");
+    }
+
+    #[test]
+    fn an_equivalent_raise_is_unchanged_without_a_shared_namespace() {
+        // The default `ExecutionContext::atoms` body IS the module snapshot, so a host
+        // that installs no namespace keeps the pre-seam behaviour exactly: a module
+        // that names the atoms lands, and one that does not propagates the typed error.
+        let mut module = Module::default();
+        let badarg = module.atom_table.intern("badarg");
+        module.atom_table.intern("error");
+        let mut machine = machine_with_a_catch_frame(1, 2);
+        let mut ctx = MinimalContext::new();
+
+        let step = machine
+            .raise_bif_error(&module, BeamError::BadArg, &mut ctx)
+            .expect("the module's own snapshot names the atoms");
+        assert_eq!(step, Step::Goto { func: 1, pc: 2 });
+        assert_eq!(machine.x(1), Some(make_atom(badarg)));
+
+        let bare = Module::default();
+        let mut other = machine_with_a_catch_frame(1, 2);
+        let err = other
+            .raise_bif_error(&bare, BeamError::BadArg, &mut ctx)
+            .expect_err("no namespace, no name");
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn the_reason_term_raise_installs_the_class_atom_through_the_namespace() {
+        // The live-reason (compound reason) branch resolves its class atom the same
+        // way, so `{badmap,_}`-shaped raises land in an atom-poor module too.
+        let module = Module::default();
+        let live = namespace_with(&module, &["error"]);
+        let error = live.lookup("error").expect("the namespace names error");
+        let mut machine = machine_with_a_catch_frame(0, 9);
+        let mut ctx = MinimalContext::with_shared_atoms(live);
+        let mut reason_ctx = MinimalContext::new();
+        let reason = crate::terms::make_tuple(&mut reason_ctx, &[make_small(1)]).unwrap();
+
+        let err = BeamError::Raise(
+            beam_common::Raise::new(ExceptionClass::Error, beam_common::ExitReason::Structured)
+                .with_live_reason(beam_common::LiveReason::new(reason)),
+        );
+        let step = machine
+            .raise_bif_error(&module, err, &mut ctx)
+            .expect("a live catch frame must catch the term-carrying raise");
+        assert_eq!(step, Step::Goto { func: 0, pc: 9 });
+        assert_eq!(machine.x(1), Some(reason), "the compound reason lands verbatim");
+        assert_eq!(machine.x(3), Some(make_atom(error)));
     }
 }

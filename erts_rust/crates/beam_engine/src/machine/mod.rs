@@ -72,7 +72,7 @@ use beam_loader::{Module, SharedLiteralArea};
 use beam_term::Eterm;
 
 pub use self::catch::CatchFrame;
-pub(crate) use self::context::{Contexts, ModuleContext};
+pub(crate) use self::catch::namespace_atom;pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
 pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
@@ -162,7 +162,15 @@ pub struct Machine {
     /// and the raise fails with a typed error when the class atom is missing
     /// (never a wrong atom).
     class_atoms: [Eterm; 3],
-    /// The register-file size (a configurable bound, default [`MAX_REGISTER`]).
+    /// Whether [`Machine::ensure_class_atoms`] has already resolved the three
+    /// exception-class atoms from the engine's live atom namespace for the run in
+    /// progress.
+    ///
+    /// A per-run latch: the namespace cannot change mid-run, so the whole resolution
+    /// runs at most once per run and the single caller
+    /// ([`crate::families::dispatch`]) pays one `bool` test in steady state. Cleared
+    /// by [`Machine::reset`] — the class atoms belong to the run that is starting.
+    pub(crate) class_atoms_live: bool,    /// The register-file size (a configurable bound, default [`MAX_REGISTER`]).
     pub(crate) max_register: u32,
     /// The static-literal area of the module currently being executed.
     ///
@@ -519,7 +527,7 @@ impl Machine {
             catch_frames: Vec::new(),
             pending_exception: None,
             class_atoms: UNRESOLVED_CLASS_ATOMS,
-            max_register,
+            class_atoms_live: false,            max_register,
             literals: None,
             entry_literals: None,
             contexts: Contexts::new(),
@@ -545,8 +553,19 @@ impl Machine {
         machine
     }
 
-    /// Bind the literal area of the module context about to be executed.
+    /// The number of registers in **this** machine's X-register file
+    /// (`x[0..register_count())`).
     ///
+    /// It is the bound [`Machine::x`] indexes into, so a register index is readable
+    /// exactly when it is `< register_count()`. Reporting the machine's own size —
+    /// rather than the [`MAX_REGISTER`] constant — is what lets a caller that walks
+    /// the argument registers stop at the ones that exist when the file was narrowed
+    /// with [`Machine::with_max_register`].
+    #[inline]
+    pub fn register_count(&self) -> u32 {
+        self.x.len() as u32
+    }
+    /// Bind the literal area of the module context about to be executed.    ///
     /// Called by the dispatch loop ([`crate::interpreter`]) with the `Arc` cloned
     /// out of the module being executed — the entry module at a run entry, and an
     /// entered callee's module at a context switch; see the field docs for why the

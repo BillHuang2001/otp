@@ -586,9 +586,14 @@ fn cook_the_landed_raise(machine: &mut Machine, module: &Module) -> Eterm {
 fn without_the_latch_the_a_slot_is_the_declared_arity() {
     let module = clause_module();
     let mut machine = machine_in_failing_clause();
-    let step = crate::interpreter::raise_function_clause_no_fail(&mut machine, &module, "maps")
-        .expect("a live catch frame catches the raise");
-    assert!(matches!(step, Step::Goto { .. }));
+    let mut ctx = MinimalContext::new();
+    let step = crate::interpreter::raise_function_clause_no_fail(
+        &mut machine,
+        &module,
+        "maps",
+        &mut ctx,
+    )
+    .expect("a live catch frame catches the raise");    assert!(matches!(step, Step::Goto { .. }));
 
     let cooked = cook_the_landed_raise(&mut machine, &module);
     let items = crate::terms::list_elements(cooked).expect("a proper list");

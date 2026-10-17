@@ -461,17 +461,20 @@ fn raise_badarity(
 /// with `f(5)` ⇒ `{error,{badfun,5}}`, and a 2-ary closure called with one argument
 /// ⇒ `{error,{badarity,{Fun,[one]}}}`).
 ///
-/// **The classification is gated on the running module naming the reason tag.** C's
-/// global `error_atom` table always names `badfun`/`badarity`, so C always raises the
-/// structured reason; this engine's atoms are module-local indices, so a module that
-/// cannot name the tag declines to the host *closure-apply* seam
-/// ([`ExecutionContext::resolve_local_fun`] ⇒ [`ExecutionContext::apply_fun`], which
-/// owns a live namespace and produces the faithful reason) rather than fabricating or
-/// substituting an atom — the same "never substitute a wrong atom" convention
-/// [`reason_atom`] follows. A module that *does* name the tag (every `beam_rt`
-/// process, whose core-atom set seeds `badfun`/`badarity`) takes the structured-reason
-/// path unchanged.
+/// **The arity test is unconditional; only the structured *reason* depends on the
+/// tag atom.** C's global `error_atom` table always names `badfun`/`badarity`, so C
+/// always raises the structured reason; this engine's atoms are module-local indices,
+/// so [`raise_badarity`] resolves its tag from the running module's table and reports
+/// the typed [`error::unsupported`] when it is absent. The arity **comparison** itself
+/// is never gated on that lookup: skipping it would hand a mismatched-arity closure to
+/// the host closure-apply seam ([`ExecutionContext::resolve_local_fun`]), and a host
+/// that does not re-validate would enter the lambda body with the wrong argument count
+/// — a wrong value rather than a typed error. The same "never substitute a wrong atom"
+/// convention [`reason_atom`] follows applies.
 ///
+/// The `badfun` half keeps its fall-through: a non-fun target cannot be resolved by
+/// the seam (which owns a live namespace and answers with its own typed error), so no
+/// wrong value is reachable there.///
 /// A well-formed target then proceeds unchanged: the host is consulted through
 /// [`ExecutionContext::resolve_local_fun`], and a host that owns the closure's
 /// defining module answers `Some((callee_module, lambda_entry_label))` so the engine
@@ -519,10 +522,15 @@ fn call_fun(
         if module.atom_table.lookup("badfun").is_some() {
             return raise_badfun(machine, module, &source, ctx).map(Some);
         }
-    } else if terms::fun_arity(fun)? != arity && module.atom_table.lookup("badarity").is_some() {
+    } else if terms::fun_arity(fun)? != arity {
+        // The arity test is **unconditional**: a mismatched-arity closure must never
+        // reach the host seam, because a host that does not re-validate would enter
+        // the lambda body with the wrong argument count (a wrong value, not a typed
+        // error). When the module cannot name `badarity` the raise builder reports
+        // its own typed `unsupported` — a degraded *diagnostic*, never a skipped
+        // check.
         return raise_badarity(machine, module, &source, arity, ctx).map(Some);
-    }
-    let args = register_args(machine, arity)?;
+    }    let args = register_args(machine, arity)?;
     match ctx.resolve_local_fun(fun, &args) {
         Ok(Some((callee, label))) => {
             // C's free-variable layout: the call arguments stay in `x(0..arity)`,
@@ -562,9 +570,9 @@ fn call_fun(
             }
             // A raise inside the applied closure must route through the
             // catch-aware funnel, not escape the caller's `try`/`catch`.
-            Err(e) => Ok(Some(machine.raise_bif_error(module, e)?)),
+            Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
         },
-        Err(e) => Ok(Some(machine.raise_bif_error(module, e)?)),
+        Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
     }
 }
 
@@ -687,7 +695,7 @@ pub(crate) fn apply_target(
         Err(e) => {
             let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;
             Ok(ApplyTarget::Raised(
-                machine.raise_bif_error_with_head(module, e, head)?,
+                machine.raise_bif_error_with_head(module, e, head, ctx)?,
             ))
         }
     }

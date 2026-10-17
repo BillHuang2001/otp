@@ -228,7 +228,7 @@ fn a_headed_raise_cooks_the_callee_item_in_front_of_the_frames() {
     .unwrap()
     .expect("a live catch frame and a known callee synthesize the item");
     let step = machine
-        .raise_bif_error_with_head(&module, error, Some(head))
+        .raise_bif_error_with_head(&module, error, Some(head), &mut ctx)
         .expect("a live frame catches");
     assert_eq!(step, Step::Goto { func: 1, pc: 0 });
     assert_eq!(machine.frame_depth(), 2, "the raise unwound `outer` away");
@@ -327,7 +327,7 @@ fn a_cooked_trace_without_a_head_is_unchanged() {
     let mut ctx = MinimalContext::new();
     let error = undef_error();
     let step = machine
-        .raise_bif_error_with_head(&module, error, None)
+        .raise_bif_error_with_head(&module, error, None, &mut ctx)
         .expect("a live frame catches");
     assert_eq!(step, Step::Goto { func: 1, pc: 0 });
     let raw = machine.x(2).unwrap();
@@ -371,7 +371,7 @@ fn a_head_is_not_armed_when_the_raise_cannot_land() {
     let mut ctx = MinimalContext::new();
     let item = terms::make_tuple(&mut ctx, &[NIL, NIL, NIL, NIL]).unwrap();
     let err = machine
-        .raise_bif_error_with_head(&module, undef_error(), Some(item))
+        .raise_bif_error_with_head(&module, undef_error(), Some(item), &mut ctx)
         .expect_err("no catch frame");
     assert!(matches!(err, BeamError::Raise(_)));
     assert!(

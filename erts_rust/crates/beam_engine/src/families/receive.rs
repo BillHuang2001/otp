@@ -117,7 +117,7 @@ pub(crate) fn exec(
                     machine.set_x(0, message)?;
                     Ok(Some(Step::Next))
                 }
-                Err(e) => machine.raise_bif_error(module, e).map(Some),
+                Err(e) => machine.raise_bif_error(module, e, ctx).map(Some),
             }
         }
 

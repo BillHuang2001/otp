@@ -37,8 +37,7 @@ use crate::error;
 use crate::families;
 use crate::families::exceptions::callee;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
-use crate::machine::{Continuation, Machine, RunOutcome};
-use crate::operand::{read_operand, write_operand};
+use crate::machine::{namespace_atom, Continuation, Machine, RunOutcome};use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::terms::{reserve_slack, Sink};
 use crate::Step;
@@ -843,7 +842,7 @@ impl Machine {
         while is_list(cursor) {
             if count as usize >= MAX_ARG {
                 return Ok(Some(ApplyTarget::Raised(
-                    self.raise_bif_error(module, beam_common::BeamError::SystemLimit)?,
+                    self.raise_bif_error(module, beam_common::BeamError::SystemLimit, ctx)?,
                 )));
             }
             let element = crate::terms::cons_head(cursor)?;
@@ -948,7 +947,7 @@ impl Machine {
             // byte-identical to the one it replaces — without it, a send to a dead
             // pid would turn from a silent drop into a raise.
             Err(BeamError::TermNotFound) => Ok(Some(ApplyTarget::Called(message))),
-            Err(e) => Ok(Some(ApplyTarget::Raised(self.raise_bif_error(module, e)?))),
+            Err(e) => Ok(Some(ApplyTarget::Raised(self.raise_bif_error(module, e, ctx)?))),
         }
     }
     /// The **single shared body** of the three `call_ext*` arms.
@@ -1026,7 +1025,7 @@ impl Machine {
                             let head =
                                 callee::import_callee_head_item(self, ctx, module, target, arity, &e)?;
                             return self
-                                .raise_bif_error_with_head(module, e, head)
+                                .raise_bif_error_with_head(module, e, head, ctx)
                                 .map_err(Box::new);
                         }
                     },
@@ -1093,7 +1092,7 @@ impl Machine {
             ctx,
         ) {
             Ok(value) => value,
-            Err(e) => return self.raise_bif_error(module, e).map_err(Box::new).map(Some),
+            Err(e) => return self.raise_bif_error(module, e, ctx).map_err(Box::new).map(Some),
         };
         self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
             .map(Some)
@@ -1240,16 +1239,17 @@ fn unwrap_apply3(list: Eterm) -> Option<(Eterm, Eterm, Eterm)> {
 /// `test`/`select_val`/`get_map_elements`/`has_map_fields` (it always supplies a real
 /// fail label), so no corpus case can reach it.
 ///
-/// The reason atom is resolved **only** from the running module's own atom table, so
-/// a module that never mentions `function_clause` yields the honest typed
-/// `error::unsupported("<what>: no 'function_clause' atom in the module")` and NEVER
-/// a substituted atom index (an atom index is valid only against the table it is read
-/// with). The `error` class atom is installed only when the module has it; the throw
-/// consults it only when the raise actually lands, so a module without it still
-/// propagates a typed `BeamError::Raise(..)` uncaught and a landing fails with a typed
-/// `unsupported` — the `install_class_atom` contract (mirrors
-/// `families/exceptions.rs::raise_error_atom`).
-///
+/// The reason atom is resolved through the engine's **live atom namespace**
+/// ([`namespace_atom`] — the host's `atoms` seam, with the running module's own table
+/// as the fallback), so a `function_clause` reason the runtime interned after the
+/// module was loaded is still nameable. A name **neither** source knows yields the
+/// honest typed `error::unsupported("<what>: no 'function_clause' atom in the
+/// module")` and NEVER a substituted atom index (an atom index is valid only against
+/// the table it is read with). The `error` class atom is installed only when the
+/// namespace names it; the throw consults it only when the raise actually lands, so a
+/// namespace without it still propagates a typed `BeamError::Raise(..)` uncaught and a
+/// landing fails with a typed `unsupported` — the `install_class_atom` contract
+/// (mirrors `families/exceptions.rs::raise_error_atom`).///
 /// `what` names the raising instruction/site (`"func_info"`, `"test"`,
 /// `"select_val"`, `"maps"`) for the typed error above.
 ///
@@ -1262,8 +1262,9 @@ pub(crate) fn raise_function_clause_no_fail(
     machine: &mut Machine,
     module: &Module,
     what: &str,
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
-    function_clause_raise(machine, module, what, None)
+    function_clause_raise(machine, module, what, None, ctx)
 }
 
 /// Raise the failed-clause reason **carrying the failed function's real call argument
@@ -1296,26 +1297,28 @@ pub(crate) fn raise_function_clause_with_args(
     argv: u32,
 ) -> Result<Step> {
     let args = failed_clause_arglist(machine, ctx, argv)?;
-    function_clause_raise(machine, module, what, Some(args))
+    function_clause_raise(machine, module, what, Some(args), ctx)
 }
 
 /// The shared body of the two `function_clause` raise entry points: resolve the
-/// reason atom from the running module's own table, install the `error` class atom,
-/// arm `failed_clause_args` when there is one, and throw.
+/// reason atom (through the engine's live atom namespace, falling back to the running
+/// module's own table), install the `error` class atom, arm `failed_clause_args` when
+/// there is one, and throw.
 fn function_clause_raise(
     machine: &mut Machine,
     module: &Module,
     what: &str,
     failed_clause_args: Option<Eterm>,
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
-    let atom = module.atom_table.lookup("function_clause").ok_or_else(|| {
+    let atom = namespace_atom(ctx, module, "function_clause").ok_or_else(|| {
         error::unsupported(&format!(
             "{what}: no 'function_clause' atom in the module"
         ))
     })?;
     let reason = make_atom(atom);
-    // Install the `error` class atom when the module has it (see the doc above).
-    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+    // Install the `error` class atom when the namespace has it (see the doc above).
+    if let Some(class_atom) = namespace_atom(ctx, module, ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
     machine.pending_function_clause_args = failed_clause_args;
@@ -1336,8 +1339,12 @@ fn failed_clause_arglist(
 ) -> Result<Eterm> {
     // A `.beam`'s declared arity is bounded by the register file (the loader rejects
     // anything larger), but clamping keeps a malformed module from reserving an
-    // absurd region and reading past the registers that were populated.
-    let n = (argv as usize).min(crate::machine::MAX_REGISTER as usize);
+    // absurd region and reading past the registers that were populated. The bound is
+    // **this machine's own** register count ([`Machine::register_count`]), not the
+    // [`crate::machine::MAX_REGISTER`] constant: a machine built with
+    // [`Machine::with_max_register`] has a narrower file, and a constant bound would
+    // let the loop reach an index that does not exist.
+    let n = (argv as usize).min(machine.register_count() as usize);
     if n == 0 {
         return Ok(NIL);
     }
@@ -1345,11 +1352,17 @@ fn failed_clause_arglist(
     let mut args = Vec::with_capacity(n);
     for index in 0..n {
         // Read the argument registers AFTER the reservation (`x` is in the root set,
-        // so a collection under the reservation relocates it).
-        args.push(machine.x(index as u32).unwrap_or(NIL));
+        // so a collection under the reservation relocates it). The index is inside the
+        // file by the clamp above, so an out-of-range read is impossible; were it to
+        // happen anyway it would be the typed `bad_register`, never a substituted
+        // `NIL` in the argument list.
+        args.push(
+            machine
+                .x(index as u32)
+                .ok_or_else(|| error::bad_register(index as u32))?,
+        );
     }
-    sink.list(&args)
-}
+    sink.list(&args)}
 
 /// The declared arity of the function at index `func` of `module`: the arity a
 /// `function_clause` raised while executing **anywhere** in that function (a

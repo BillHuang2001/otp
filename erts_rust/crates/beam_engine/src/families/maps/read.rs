@@ -73,7 +73,7 @@ pub(super) fn get_map_elements(
         match found {
             Some(value) => write_operand(machine, dst_operand, value)?,
             None => {
-                return fail_or_function_clause(machine, module, labels, fail);
+                return fail_or_function_clause(machine, module, labels, ctx, fail);
             }
         }
     }
@@ -99,7 +99,7 @@ pub(super) fn has_map_fields(
     for key_operand in keys {
         let key = read_operand(machine, ctx, key_operand)?;
         if lookup(&entries, key, ctx.atoms(module)).is_none() {
-            return fail_or_function_clause(machine, module, labels, fail);
+            return fail_or_function_clause(machine, module, labels, ctx, fail);
         }
     }
     Ok(Step::Next)
