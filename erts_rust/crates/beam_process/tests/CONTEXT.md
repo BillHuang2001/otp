@@ -131,11 +131,13 @@ SMP pool:
     immediately when already there, and invoking the waker), inactive-thread exclusion (reactivation
     re-includes), concurrent `bump`s each happen once, `block`/`unblock` nest, `safepoint` never
     blocks on the caller's own slot, a clone shares the registry/generation/blocking state.
-22. `monitor_tag.rs` (8 tests) — the `erlang:monitor/3` **user tag** cross-checked against the real
+22. `monitor_tag.rs` (9 tests) — the `erlang:monitor/3` **user tag** cross-checked against the real
     `erl` (skips loudly when absent): a tagged live/exit/`noproc` process monitor delivers
     `{Tag, Ref, process, Target, Reason}`, the untagged `monitor/2` DOWN is unchanged, a tagged named
     monitor reports the `{Name, Node}` target, a tagged port monitor delivers `{Tag, Ref, port, Port,
-    Reason}`, and a non-immediate tag is this crate's typed `unsupported` (the oracle accepts any term).
+    Reason}`, a **literal-area** tag (a real `LiteralArea` 1-tuple and cons cell) is accepted and
+    reaches the notification head, and a **heap-resident** tag is this crate's typed `unsupported`
+    (the oracle accepts any term).
 23. `split_borrow.rs` (5 tests) — the two `Process` split borrows. `heap_and_off_heap_mut`: one call hands
     out the process's OWN young heap + off-heap table (identity pinned with `core::ptr::eq` against
     `heap_mut()`/`off_heap_mut()`), and a `beam_message::Fragments` chain is moved onto that heap with
@@ -305,13 +307,17 @@ SMP pool:
     `data_ptr`/refcount after a delivery to that same process, and the queued message owns only what it
     copied (a payload that really references an off-heap binary is still captured). **Both tests FAIL on
     the pre-fix code** (which passed `self.off_heap` as the drained destination) — verified by reverting.
-36. `message_from_is_immediate.rs` (6 tests) — every signal path's `Message::from` is an **immediate**
+36. `message_from_is_immediate.rs` (9 tests) — every signal path's `Message::from` is an **immediate**
     (the C's `is_immed(ERL_MESSAGE_FROM)` invariant) and survives a collection: a named-monitor DOWN
     (`from == target.to_eterm()`, body still `{Name,Node}`), an ordinary-monitor DOWN, a failed-by-name
     named-monitor DOWN (`from == system`), a remote DOWN and a remote EXIT (`from == node`, body still the
-    external pid), and the collection case (a nursery GC then `is_immediate(from)` + `from` unchanged,
-    the relocated payload still carrying `{Name,Node}`). **5 of the 6 FAIL on the pre-fix code** (which
-    stored an on-heap `from`) — verified by reverting.
+    external pid), the bare-`noproc` DOWN of a monitor on a non-live pid (`deliver_noproc_down`,
+    `from == dead.to_eterm()`), the port-monitor DOWN (`enqueue_port_down_message`, `from ==
+    port.to_eterm()`), the port link EXIT for a trapping peer (`enqueue_port_exit_message`, `from ==
+    port.to_eterm()`), and the collection case (a nursery GC then `is_immediate(from)` + `from` unchanged,
+    the relocated payload still carrying `{Name,Node}`). **5 of the 9 FAIL on the pre-fix code** (which
+    stored an on-heap `from`) — verified by reverting; the other 4 pin producers that were already
+    correct but unpinned.
 37. `collector_dispatch.rs` (4 tests) — the **GC strategy dispatch on the production `Process`
     path**: `Process` owns a `beam_gc::AnyCollector`, so the mature generation a real process collects
     with is the one its heap policy resolves to. (i) `a_runtime_spawned_process_selects_the_strategy_its_policy_implies`
@@ -533,6 +539,18 @@ SMP pool:
     immediate `noproc` DOWN; and a port monitor and a remote (external-pid) target each refuse the
     option with their own typed `unsupported`, leaking no relationship or message. Deterministic —
     the mode rules against fixed oracle expressions, no sleeps / wall-clock bounds.
+45. `collection_debt.rs` (4 tests) — the crate's own heap-admission point honouring the collector's
+    **collection debt**: a fresh process carries none (`collection_debt()` false, `should_collect(1)`
+    false, `admission_requires_collection(1)` false, `collect_if_needed(1)` ⇒ `Ok(false)`, `minor_gcs()`
+    `0`); a `grow_nursery(4096)` sets it while the current space is still roomy (`should_collect(1)`
+    false) and one `collect_if_needed(1)` collects once (`Ok(true)`, `minor_gcs()` `1`, debt cleared,
+    chain collapsed to one space), the immediately following admission answering `Ok(false)` with
+    `minor_gcs` unchanged (the debt half is **self-limiting**); eight "grow to twice the current
+    capacity, then admit" rounds each end debt-free with one space and a **bounded** young capacity
+    (90 words every round) while an occupancy-only control that never collects reaches 514 838 words
+    over the same eight rounds with a nine-space chain — the regression the debt OR removes; and a
+    **relocation-exempt** process with debt answers `Ok(false)`, keeps the debt and its two-space
+    chain, with `minor_gcs()` `0`. Deterministic, no wall-clock.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
