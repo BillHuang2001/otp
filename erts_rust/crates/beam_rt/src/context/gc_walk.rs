@@ -1287,18 +1287,41 @@ mod tests {
         (table, pid)
     }
 
-    /// The cons cell a case plants: built on a `beam_term` test arena, i.e. outside every region
-    /// the process's collector scans, and header-less — so the collector would have to forward
-    /// both of its words, which is exactly the hazard the valve exists for.
+    /// A **forwarding** foreign cons: built on a `beam_term` test arena — outside every region
+    /// the process's collector scans — header-less, and holding `young`, a word of the asking
+    /// process's own nursery.
+    ///
+    /// Both halves of the valve's predicate are needed for this to be a hazard: the cell is
+    /// *foreign* (so a collection would neither follow nor update it) and it *forwards a scanned
+    /// word* (so the word it holds would be relocated out from under it). That is exactly the
+    /// shape the valve exists for.
     ///
     /// The arena must **outlive** every walk that classifies the cell (the walk reads the cell's
     /// address, and a nested case descends into it).
-    fn foreign_container(arena: &mut Heap) -> Eterm {
+    fn foreign_container_over(arena: &mut Heap, young: Eterm) -> Eterm {
+        arena
+            .cons(young, make_small(12))
+            .expect("the arena builds the cons cell")
+    }
+
+    /// An **inert** foreign cons: the same arena shape over two immediates.
+    ///
+    /// It forwards no word a relocation acts on, so it imposes neither of a collector's two
+    /// obligations toward a container — and the valve must not decline on it (see case (e) of
+    /// [`a_foreign_container_in_every_seeded_root_family_is_detected`]).
+    fn inert_foreign_container(arena: &mut Heap) -> Eterm {
         arena
             .cons(make_small(11), make_small(12))
             .expect("the arena builds the cons cell")
     }
 
+    /// A word of `process`'s **young** heap — the scanned word a forwarding fixture points at.
+    fn young_word(process: &mut Process) -> Eterm {
+        process
+            .heap_mut()
+            .tuple(&[make_small(21), make_small(22)])
+            .expect("the young heap builds `{21,22}`")
+    }
     /// One root family [`Walk::seed_process_roots`] seeds from, and how a word is planted in it.
     struct RootFamily {
         /// The family's name (the failure messages name it).
@@ -1445,20 +1468,31 @@ mod tests {
         total + buf.len()
     }
 
-    /// **The pin: an unscanned container in ANY single root family is detected, and a clean
-    /// process is not.**
+    /// **The pin: an unscanned container that forwards a scanned word in ANY single root family is
+    /// detected, and a clean process is not.**
     ///
-    /// For every family in [`ROOT_FAMILIES`], four cases:
+    /// For every family in [`ROOT_FAMILIES`], five cases:
     ///
     /// * **clean** — nothing planted: neither phase may report a hit (the negative control that
     ///   keeps the assertions below from being satisfied by a walk that always answers `true`);
-    /// * **direct** — the foreign cons cell *is* the root word: the per-word phase must catch it
-    ///   with the descent gate **closed** (so a family the walk seeds only inside the descent
+    /// * **direct** — the forwarding foreign cons *is* the root word: the per-word phase must catch
+    ///   it with the descent gate **closed** (so a family the walk seeds only inside the descent
     ///   would fail here);
     /// * **nested** — a scanned young tuple holding the foreign cell is the root word: the gated
     ///   phase must NOT report a hit (the per-word classifier cannot see through a scanned
     ///   container) and the descent MUST (so the family is really seeded as a descent origin);
-    /// * **safe** — a young tuple holding an immediate: no hit either way.
+    /// * **safe** — a young tuple holding an immediate: no hit either way;
+    /// * **inert** — a foreign cons of *immediates* planted directly: **no** hit either way.
+    ///
+    /// Case (e) is the expectation this suite deliberately **flipped** when the valve grew its
+    /// second fact. The old case pinned "a container from an unscanned region declines", and an
+    /// all-immediate arena cons was such a container — which was the bug: a copying collector owes
+    /// a container exactly two things, *follow* and *update*, and a shape whose cells are all
+    /// immediates imposes neither. Declining on it cost the process every collection it would ever
+    /// run (each admission point refuses, so the heap only grows), and every allocating process
+    /// holds such a block — `make_ref/0`'s childless M1 object is the degenerate case. So the
+    /// hazard-shaped fixture the other cases plant has to **forward a word of the asking process's
+    /// own nursery** ([`foreign_container_over`]) to be a hazard at all.
     ///
     /// The word count of the gathered set is pinned too ([`collect_root_words`]): the walk must
     /// seed exactly the words `Process::collect` gathers.
@@ -1466,9 +1500,6 @@ mod tests {
     fn a_foreign_container_in_every_seeded_root_family_is_detected() {
         for family in ROOT_FAMILIES {
             let name = family.name;
-            // One arena per family: its cell must outlive every walk below that classifies it.
-            let mut arena = Heap::new(64);
-            let foreign = foreign_container(&mut arena);
 
             // (0) The word count, on a process whose every family is non-empty — where they are
             //     plantable at all (an empty root set still pins the register family's length).
@@ -1504,28 +1535,38 @@ mod tests {
                 );
             }
 
-            // (b) direct: the foreign cell is the root word itself.
+            // (b) direct: the forwarding foreign cell is the root word itself.
             {
                 let (mut table, pid) = seeded_process();
+                // The arena outlives every walk below (it is declared before them), and is built
+                // over this process's own nursery word — so it is foreign *and* forwarding.
+                let mut arena = Heap::new(64);
+                let foreign = {
+                    let process = table.get_mut(pid).expect("the spawned process");
+                    let young = young_word(process);
+                    foreign_container_over(&mut arena, young)
+                };
                 (family.plant)(table.get_mut(pid).expect("the spawned process"), foreign);
                 let (gated, descended) = seeded_answers(&table, pid);
                 assert!(
                     gated,
-                    "{name}: a foreign container planted directly in this family must be caught \
-                     by the per-word phase, with the descent gate closed"
+                    "{name}: a foreign container forwarding a nursery word, planted directly in \
+                     this family, must be caught by the per-word phase with the descent gate closed"
                 );
                 assert!(
                     descended,
-                    "{name}: a foreign container planted directly in this family must be caught \
-                     by the full valve"
+                    "{name}: a foreign container forwarding a nursery word, planted directly in \
+                     this family, must be caught by the full valve"
                 );
             }
 
-            // (c) nested: a SCANNED young tuple holding the foreign cell.
+            // (c) nested: a SCANNED young tuple holding the forwarding foreign cell.
             {
                 let (mut table, pid) = seeded_process();
-                let wrapper = {
-                    let process = table.get_mut(pid).expect("the spawned process");
+                let mut arena = Heap::new(64);
+                let wrapper = {                    let process = table.get_mut(pid).expect("the spawned process");
+                    let young = young_word(process);
+                    let foreign = foreign_container_over(&mut arena, young);
                     let wrapper = process
                         .heap_mut()
                         .tuple(&[foreign])
@@ -1564,9 +1605,23 @@ mod tests {
                      (gated {gated}, descended {descended})"
                 );
             }
+
+            // (e) inert: a foreign container that forwards no scanned word.
+            {
+                let (mut table, pid) = seeded_process();
+                let mut arena = Heap::new(64);
+                let inert = inert_foreign_container(&mut arena);
+                (family.plant)(table.get_mut(pid).expect("the spawned process"), inert);
+                let (gated, descended) = seeded_answers(&table, pid);
+                assert!(
+                    !gated && !descended,
+                    "{name}: a foreign container of immediates imposes neither a follow nor an \
+                     update obligation, so it must never decline a collection \
+                     (gated {gated}, descended {descended})"
+                );
+            }
         }
     }
-
     /// **The mailbox envelope contributes three root words per message** — `payload`, `from` and
     /// `token`, exactly as [`Process::collect`] gathers them.
     ///

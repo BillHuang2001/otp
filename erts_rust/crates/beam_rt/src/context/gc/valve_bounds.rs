@@ -18,10 +18,10 @@
 //
 // %CopyrightEnd%
 
-//! The **two-tier scanned test** of the unscanned-root valve: [`super::outside_scanned`]'s
+//! The **two-tier scanned test** of the unscanned-root valve — [`super::outside_bounds`]'s
 //! aggregate fast reject ([`beam_gc::ScannedBounds`]) in front of the exact
 //! [`young_contains`](beam_gc::AnyCollector::young_contains) /
-//! [`mature_contains`](beam_gc::AnyCollector::mature_contains) pair, and
+//! [`mature_contains`](beam_gc::AnyCollector::mature_contains) pair — and
 //! [`super::root_is_unscanned`] above it.
 //!
 //! # What this pins
@@ -29,8 +29,8 @@
 //! The filter is allowed to skip work, never to change a decision: the aggregate is a superset
 //! of every region its collector scans, so an address it rejects would have been rejected by
 //! both exact tests too. Every case here therefore asserts **the same answer as the plain
-//! per-region predicate** ([`exact_root_is_unscanned`], the pre-filter expression, kept verbatim
-//! as the oracle) for the regions a real process actually produces:
+//! per-region predicate** ([`exact_root_is_unscanned`], the valve's two facts re-derived here
+//! without the filter) for the regions a real process actually produces:
 //!
 //! * a term in the **current** nursery space (accepted — the mutator block's own fast path);
 //! * a term in a nursery space a [`Process::grow_nursery`] **retired** (accepted — the chain
@@ -38,9 +38,19 @@
 //! * a term the **mature** generation owns after a collection promoted it (accepted);
 //! * a container on the runtime's **pooled BIF heap** and a cons in its **pointer-stable
 //!   arena** (rejected: foreign);
-//! * an **immediate** and a **tagged literal** (rejected before any address test, unchanged);
-//! * `make_ref/0`'s childless M1 block on that pooled heap (a foreign **leaf**, exempt);
-//! * a foreign **container** with children and an `ErlSubBits` (declining).
+//! * an **immediate** and a **tagged literal** (rejected before any address test, unchanged).
+//!
+//! The valve's answer for a *foreign* container is the conjunction of the two facts the
+//! production predicate tests — the word sits in a region the collector does not scan **and**
+//! the container forwards at least one word into a region it does. Both halves are covered here,
+//! because the filter sits under both of them:
+//!
+//! * **inert** foreign containers — `make_ref/0`'s childless M1 block, a pooled 2-tuple of
+//!   immediates, a pooled `ErlSubBits` whose `orig` word is an immediate, an arena cons of
+//!   immediates — forward nothing a relocation would act on, so they do **not** decline;
+//! * **forwarding** foreign containers — a pooled 2-tuple or an arena cons (or an `ErlSubBits`
+//!   whose `orig` word is) holding a term from the asking process's **nursery** or **mature**
+//!   generation — do.
 //!
 //! Each region is checked on **both** collector kinds the runtime can select
 //! ([`MatureKind::Copying`] and, through the policy's mature size, [`MatureKind::Immix`]),
@@ -52,26 +62,52 @@ use beam_process::{Process, ProcessTable};
 use beam_term::prelude::{is_boxed, is_list, make_small, Eterm, NIL};
 use beam_term::AtomTable;
 
-use super::{bump, foreign_boxed_has_copy_children, in_heap_block, outside_scanned, root_is_unscanned};
+use super::{
+    bump, forwards_word_matching, in_heap_block, outside_bounds, root_is_unscanned,
+    word_region_exactly, WordRegion,
+};
 
-/// The **pre-filter predicate**: [`root_is_unscanned`] exactly as it read before the aggregate
-/// fast reject was added, kept here verbatim as the equivalence oracle.
+/// The **pre-filter predicate**: the valve's verdict re-derived without the aggregate fast
+/// reject, as the equivalence oracle.
 ///
 /// Every case in this module asserts the production function agrees with this one. It is
-/// deliberately a re-derivation of the *old* code, not of the new code: if the filter ever
-/// changed a decision (an over-eager accept, a superset that is not one), this would catch it.
+/// deliberately a re-derivation, not a delegation: the *region* half runs
+/// [`word_region_exactly`] (the exact per-region tests with no aggregate in front of them) and
+/// the *forwarding* half classifies every child word with [`exact_is_scanned`] — the exact
+/// young/mature tests written out again here — instead of the production
+/// [`word_is_scanned`](super::word_is_scanned). If the aggregate filter ever changed a decision
+/// (an over-eager reject, a superset that is not one) or the forwarding test ever grew a shape
+/// the canonical enumeration does not visit, this catches it.
+///
+/// The child **enumeration** itself is deliberately shared ([`forwards_word_matching`] over
+/// `beam_term::layout::for_each_child_slot`): that is the workspace's canonical model of an
+/// object's reference slots — the one `beam_message`'s copier and the GC itself drive — so
+/// re-implementing it here would only duplicate a layout table, not check it.
 fn exact_root_is_unscanned(process: &Process, term: Eterm) -> bool {
-    if !is_boxed(term) && !is_list(term) {
+    if !matches!(
+        word_region_exactly(process, term),
+        Some(WordRegion::Foreign)
+    ) {
         return false;
     }
-    if beam_term::literal::is_literal(term) {
+    forwards_word_matching(term, |word| exact_is_scanned(process, word))
+}
+
+/// Whether `word` is a heap pointer into a region the collector **relocates**, decided by the
+/// exact per-region tests alone (the young nursery chain, current space or growth-retired space,
+/// then the mature generation). The oracle's own classifier: `in_heap_block` for the current
+/// mutator block, then the collector's per-region predicates — never the aggregate.
+fn exact_is_scanned(process: &Process, word: Eterm) -> bool {
+    if !is_boxed(word) && !is_list(word) {
         return false;
     }
-    let ptr = beam_term::list::ptr_val(term) as usize;
-    let foreign = !in_heap_block(process.heap(), ptr)
-        && !process.collector().young_contains(ptr as *const Eterm)
-        && !process.collector().mature_contains(ptr as *const Eterm);
-    foreign && (is_list(term) || foreign_boxed_has_copy_children(term))
+    if beam_term::literal::is_literal(word) {
+        return false;
+    }
+    let ptr = beam_term::list::ptr_val(word) as usize;
+    in_heap_block(process.heap(), ptr)
+        || process.collector().young_contains(ptr as *const Eterm)
+        || process.collector().mature_contains(ptr as *const Eterm)
 }
 
 /// A `HeapPolicy` whose mature generation the automatic rule resolves to `kind`.
@@ -142,83 +178,185 @@ fn assert_all_agree(process: &Process, kind: MatureKind, cases: &[Case]) {
 }
 
 /// The **foreign half** of a fixture: a pooled BIF heap holding `make_ref/0`'s M1 block, an
-/// ordinary tuple and an `ErlSubBits`, plus a cons in the runtime's pointer-stable arena.
+/// ordinary tuple, two `ErlSubBits` and two containers over a term of the asking process's own
+/// **young** heap, plus two conses in the runtime's pointer-stable arena.
 ///
 /// Both regions are the runtime's own ([`crate::Runtime::take_bif_heap`] — where a
 /// registered-BIF result is built — and [`crate::Runtime::alloc_words`], the allocation doors'
 /// pointer-stable fallback), so the terms are produced by the same code the valve meets in
 /// production, not by a stand-in block.
+///
+/// The fixture is deliberately split by the valve's **second** fact: the `*_inert` terms forward
+/// only immediates and literals, and the `*_over_young` terms forward a word the collector
+/// relocates. The valve must answer `false` for the first group and `true` for the second, which
+/// is what makes it a test of the forwarding test rather than of the region test alone.
 struct Foreign {
     /// Owns the pooled heap's words: the terms below point into it, so it is dropped last.
     _runtime: crate::runtime::Runtime,
     /// `make_ref/0`'s frozen M1 childless block (`_ => None` in the child-slot table).
     reference: Eterm,
-    /// A 2-tuple on the pooled heap: two child slots.
-    tuple: Eterm,
-    /// An `ErlSubBits` on the pooled heap, whose `orig` word **is** forwarded.
-    sub_bits: Eterm,
-    /// A cons cell in the pointer-stable arena: header-less, both words are references.
-    cons: Eterm,
+    /// A 2-tuple of immediates on the pooled heap: two child slots, both immediates.
+    tuple_inert: Eterm,
+    /// An `ErlSubBits` on the pooled heap whose `orig` word is a **tagged literal** — the
+    /// production shape of a bitstring spliced out of a literal binary, and a word no relocation
+    /// touches.
+    sub_bits_inert: Eterm,
+    /// A cons cell in the pointer-stable arena over immediates: header-less, both words
+    /// immediates.
+    cons_inert: Eterm,
+    /// A pooled-heap 2-tuple whose element 0 is the young term below: a foreign container that
+    /// **forwards a scanned word**.
+    tuple_over_young: Eterm,
+    /// A pooled-heap `ErlSubBits` whose `orig` word is the young term below.
+    sub_bits_over_young: Eterm,
+    /// An arena cons whose `car` is the young term below.
+    cons_over_young: Eterm,
+    /// The asking process's own nursery term the forwarding half points at.
+    young: Eterm,
 }
 
 impl Foreign {
-    /// Builds the four foreign terms on a fresh runtime's own unscanned regions.
+    /// Builds the foreign terms on a fresh runtime's own unscanned regions, plus the nursery term
+    /// half of them on `process`'s young heap.
     #[allow(unsafe_code)]
-    fn new() -> Foreign {
+    fn new(process: &mut Process) -> Foreign {
         let mut runtime = crate::runtime::Runtime::with_defaults().expect("the default runtime");
+        // The scanned word the forwarding half of the fixture points at: an ordinary
+        // young-heap tuple, i.e. something the collector must follow and update.
+        let young = process
+            .heap_mut()
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("the young heap builds `{7,8}`");
         let fill = [NIL; 8];
         let mut heap = runtime.take_bif_heap().expect("a pooled BIF heap");
         // SAFETY: each `bump` reserves exactly the words the writer it feeds needs, inside this
         // heap, and every word is written before the term escapes.
-        let (reference, tuple, sub_bits) = unsafe {
+        let (reference, tuple_inert, sub_bits_inert, tuple_over_young, sub_bits_over_young) = unsafe {
             let slot = bump(&mut heap, 4, &fill).expect("four words for the reference");
             let reference =
                 beam_term::boxed::write_internal_ref(slot, 7).expect("an M1 internal reference");
-            let tuple = heap
+            let tuple_inert = heap
                 .tuple(&[make_small(1), make_small(2)])
                 .expect("a 2-tuple");
+            // A sub-bits whose `orig` word is frozen: the `erl_prim_loader`-style literal binary
+            // a `bs_create_bin`-free splice produces. A literal is never relocated, so nothing
+            // this container forwards imposes a follow or an update.
+            let literal = beam_term::literal::make_literal(young);
             let slot = bump(&mut heap, 5, &fill).expect("five words for the ErlSubBits");
-            let sub_bits = beam_term::bitstring::write_sub_bits(
+            let sub_bits_inert = beam_term::bitstring::write_sub_bits(
                 slot,
                 make_small(0),
                 make_small(0),
                 make_small(0),
-                make_small(0),
+                literal,
             );
-            (reference, tuple, sub_bits)
+            let tuple_over_young = heap
+                .tuple(&[young, make_small(9)])
+                .expect("a 2-tuple over the young term");
+            let slot = bump(&mut heap, 5, &fill).expect("five words for the ErlSubBits");
+            let sub_bits_over_young = beam_term::bitstring::write_sub_bits(
+                slot,
+                make_small(0),
+                make_small(0),
+                make_small(0),
+                young,
+            );
+            (
+                reference,
+                tuple_inert,
+                sub_bits_inert,
+                tuple_over_young,
+                sub_bits_over_young,
+            )
         };
         // The heap goes back with its words intact (the pool never resets on return), so the
         // terms above stay valid for the whole fixture's life.
         runtime.put_bif_heap(heap);
-        let slot = runtime
-            .alloc_words(2)
-            .expect("two arena words for the cons");
-        // SAFETY: `alloc_words(2)` handed over exactly two arena words, both written here before
-        // the term escapes, and the arena is pointer-stable for the runtime's whole life.
-        let cons = unsafe {
-            *slot = make_small(3);
-            *slot.add(1) = NIL;
-            beam_term::list::make_list(slot)
+        let (cons_inert, cons_over_young) = {
+            let inert = runtime
+                .alloc_words(2)
+                .expect("two arena words for the inert cons");
+            let forwarding = runtime
+                .alloc_words(2)
+                .expect("two arena words for the forwarding cons");
+            // SAFETY: each `alloc_words(2)` handed over exactly two arena words, both written here
+            // before the term escapes, and the arena is pointer-stable for the runtime's whole
+            // life.
+            unsafe {
+                *inert = make_small(3);
+                *inert.add(1) = NIL;
+                *forwarding = young;
+                *forwarding.add(1) = NIL;
+                (
+                    beam_term::list::make_list(inert),
+                    beam_term::list::make_list(forwarding),
+                )
+            }
         };
         Foreign {
             _runtime: runtime,
             reference,
-            tuple,
-            sub_bits,
-            cons,
+            tuple_inert,
+            sub_bits_inert,
+            cons_inert,
+            tuple_over_young,
+            sub_bits_over_young,
+            cons_over_young,
+            young,
         }
     }
 
+    /// Every term of the fixture, grouped by the verdict it must get: `(label, term, unscanned)`.
+    ///
+    /// The order is the fixture's own: the inert group first, then the forwarding one.
+    fn cases(&self) -> Vec<(&'static str, Eterm, bool)> {
+        vec![
+            ("childless make_ref/0 block", self.reference, false),
+            ("pooled-BIF-heap tuple of immediates", self.tuple_inert, false),
+            ("pooled-BIF-heap ErlSubBits over a literal", self.sub_bits_inert, false),
+            ("pointer-stable-arena cons of immediates", self.cons_inert, false),
+            ("pooled-BIF-heap tuple over a young term", self.tuple_over_young, true),
+            (
+                "pooled-BIF-heap ErlSubBits over a young term",
+                self.sub_bits_over_young,
+                true,
+            ),
+            ("pointer-stable-arena cons over a young term", self.cons_over_young, true),
+        ]
+    }
+
+    /// A **new** pooled-heap 2-tuple over `word`, for a case whose scanned word belongs to
+    /// another process's region (the mature generation) and so could not be part of [`Foreign::new`].
+    ///
+    /// The pool keeps the words it handed out when it goes back, so the term stays valid for the
+    /// fixture's whole life.
+    fn pooled_tuple_over(&mut self, word: Eterm) -> Eterm {
+        let mut heap = self
+            ._runtime
+            .take_bif_heap()
+            .expect("the runtime still owns its pooled BIF heap");
+        let tuple = heap
+            .tuple(&[word, make_small(1)])
+            .expect("a 2-tuple over the other process's word");
+        self._runtime.put_bif_heap(heap);
+        tuple
+    }
+
     /// Asserts each term really is **outside** every scanned region of `process`'s collector —
-    /// the precondition that makes the classifier's answer a statement about the filter rather
-    /// than about the region.
+    /// the precondition that makes the classifier's answer a statement about the forwarding test
+    /// rather than about the region — and that the nursery term the forwarding half points at
+    /// really is **inside** it.
     fn assert_foreign(&self, process: &Process) {
-        for (what, term) in [
-            ("reference", self.reference),
-            ("tuple", self.tuple),
-            ("sub-bits", self.sub_bits),
-            ("cons", self.cons),
-        ] {
+        let young = beam_term::list::ptr_val(self.young) as usize;
+        assert!(
+            in_heap_block(process.heap(), young),
+            "the fixture's young term must live in the asking process's mutator block"
+        );
+        assert!(
+            exact_is_scanned(process, self.young),
+            "the fixture's young term must be a word the collector relocates"
+        );
+        for (what, term, _) in self.cases() {
             let ptr = beam_term::list::ptr_val(term) as usize;
             assert!(
                 !in_heap_block(process.heap(), ptr),
@@ -275,6 +413,9 @@ fn the_two_tier_test_matches_the_exact_predicate_in_every_region() {
             .heap_mut()
             .tuple(&[make_small(8), make_small(9)])
             .expect("a young-heap 2-tuple");
+        // The foreign half is built **before** the process is read immutably: its forwarding
+        // terms point at a nursery term, so it needs the process mutably once.
+        let mut foreign = Foreign::new(chain.get_mut(chain_pid).expect("the process"));
         let chain_process = chain.get(chain_pid).expect("the process");
         assert_eq!(
             chain_process.collector().young_space_count(),
@@ -332,18 +473,12 @@ fn the_two_tier_test_matches_the_exact_predicate_in_every_region() {
         );
 
         // ---- the runtime's own unscanned regions ------------------------------------------
-        let foreign = Foreign::new();
         foreign.assert_foreign(chain_process);
         // Whether the aggregate can reject each foreign term outright — the filter's own hit
         // rate, which is what decides if tier two runs at all for the runtime's real unscanned
         // regions (see `report_span`'s docs on the width).
         let bounds = chain_process.collector().scanned_bounds();
-        for (what, term) in [
-            ("pooled-BIF-heap tuple", foreign.tuple),
-            ("pointer-stable-arena cons", foreign.cons),
-            ("pooled-BIF-heap ErlSubBits", foreign.sub_bits),
-            ("childless make_ref/0 block", foreign.reference),
-        ] {
+        for (what, term, _) in foreign.cases() {
             println!(
                 "{kind:?}: {what} rejected-by-the-aggregate={}",
                 bounds.definitely_unscanned(beam_term::list::ptr_val(term) as *const Eterm)
@@ -354,7 +489,18 @@ fn the_two_tier_test_matches_the_exact_predicate_in_every_region() {
         // moved, rejected before any address test.
         let literal = beam_term::literal::make_literal(retired);
 
-        let chain_cases = [
+        // The whole foreign fixture, at its own verdicts: the inert group must not decline, the
+        // group that forwards a nursery word must.
+        let foreign_cases: Vec<Case> = foreign
+            .cases()
+            .into_iter()
+            .map(|(what, term, unscanned)| Case {
+                what,
+                term,
+                unscanned,
+            })
+            .collect();
+        let mut chain_cases = vec![
             Case {
                 what: "current-space tuple",
                 term: current,
@@ -365,26 +511,13 @@ fn the_two_tier_test_matches_the_exact_predicate_in_every_region() {
                 term: retired,
                 unscanned: false,
             },
-            Case {
-                what: "pooled-BIF-heap tuple",
-                term: foreign.tuple,
-                unscanned: true,
-            },
-            Case {
-                what: "pointer-stable-arena cons",
-                term: foreign.cons,
-                unscanned: true,
-            },
-            Case {
-                what: "pooled-BIF-heap ErlSubBits",
-                term: foreign.sub_bits,
-                unscanned: true,
-            },
-            Case {
-                what: "childless make_ref/0 block",
-                term: foreign.reference,
-                unscanned: false,
-            },
+        ];
+        chain_cases.extend(foreign_cases.iter().map(|case| Case {
+            what: case.what,
+            term: case.term,
+            unscanned: case.unscanned,
+        }));
+        chain_cases.extend([
             Case {
                 what: "tagged literal",
                 term: literal,
@@ -400,20 +533,42 @@ fn the_two_tier_test_matches_the_exact_predicate_in_every_region() {
                 term: NIL,
                 unscanned: false,
             },
-        ];
+        ]);
         assert_all_agree(chain_process, kind, &chain_cases);
+
+        // A foreign container forwarding a **mature** word is a hazard too: the mature
+        // generation is relocated (a major) and updated (a remembered set), so the second fact
+        // must accept it exactly as it accepts a nursery word.
+        let over_mature = foreign.pooled_tuple_over(promoted);
         assert_all_agree(
             promoted_process,
             kind,
-            &[Case {
-                what: "mature-generation tuple",
-                term: promoted,
-                unscanned: false,
-            }],
+            &[
+                Case {
+                    what: "mature-generation tuple",
+                    term: promoted,
+                    unscanned: false,
+                },
+                Case {
+                    what: "pooled-BIF-heap tuple over a mature term",
+                    term: over_mature,
+                    unscanned: true,
+                },
+            ],
         );
         // The foreign answers must not depend on which process asks — the regions are the
-        // runtime's, not the process's.
-        assert_all_agree(promoted_process, kind, &chain_cases[2..6]);
+        // runtime's, not the process's. (The nursery-forwarding group is excluded: its child is a
+        // word of `chain_process`'s nursery, which is foreign *to* `promoted_process`.)
+        let inert: Vec<Case> = foreign_cases
+            .iter()
+            .filter(|case| !case.unscanned)
+            .map(|case| Case {
+                what: case.what,
+                term: case.term,
+                unscanned: case.unscanned,
+            })
+            .collect();
+        assert_all_agree(promoted_process, kind, &inert);
     }
 }
 
@@ -547,7 +702,7 @@ fn the_aggregate_span_is_reported_for_both_collector_kinds() {
             "{kind:?}: an address past the aggregate must be rejected"
         );
         assert!(
-            outside_scanned(collector, far),
+            outside_bounds(collector, &bounds, far),
             "{kind:?}: a far address is outside every scanned space"
         );
     }
