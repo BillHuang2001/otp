@@ -9,8 +9,8 @@ on the young heap*, so the mutator pays zero per-store overhead.
 Reproduce the collector semantics of the legacy C (`../../../erts/emulator/beam/erl_gc.c` + `copy.c`)
 **without** its C structure; the design source is `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §D and the Stage-4 row
 of §H.
-Consumed by `beam_process`, which drives collections at safepoints; depends downward only on `beam_common`,
-`beam_term`, `beam_alloc`, `libc` (wave 1).
+Consumed by `beam_process`, which drives collections at safepoints (wave 1); it depends downward only on
+`beam_common`, `beam_term`, `beam_alloc` and `libc`.
 Honours the crate-layer contracts of `../CONTEXT.md`: the root-set contract (no frame liveness maps), the frozen
 term layout (§2) and the return-based error strategy (§3).
 MMTk/Boehm are **rejected**; GenImmix is a **measurement-gated** mature-generation option (`immix/` +
@@ -109,10 +109,9 @@ and the one-line semantic contract only.
 - The two mature types differ, so the mature generation is exposed as **geometry accessors** rather than a
   common `&`: `mature_capacity_words`/`mature_used_words`/`mature_available_words` (mark-region figures are
   line-rounded — "at least this many words") and `mature_base`/`mature_contains`.
-- `mature_contains` **reuses each concrete space's own range test** — the copying space covers its live region
-  `[base, top)`, the mark-region space its whole region including free lines (**over-inclusive**, harmless: a
-  word the space never hands out cannot be a live reference's target, and a foreign container lies outside every
-  mature range).
+- `mature_contains` **reuses each concrete space's own range test** — the copying space its live region
+  `[base, top)`, the mark-region space its whole region including free lines (**over-inclusive**, harmless: a word
+  the space never hands out cannot be a live reference's target).
 - Forwarding only — the seam owns no collection logic, so neither strategy depends on the other.
 
 ### `config.rs` + `selection.rs` — the mature-generation decision
@@ -189,18 +188,16 @@ and the one-line semantic contract only.
   generational payoff.
   A major (fullsweep) evacuates young **and** mature into one freshly-sized space (the new `mature`), resetting
   the nursery — the C `major_collection`/`full_sweep_heaps`.
-- **The destination is sized and checked up front — no partial-copy rollback.**
+- **The destination is sized and checked up front — no partial-copy rollback — and the fresh mature space is
+  sized from the EXACT reachable live set plus the young heap's occupancy, never the mature occupancy.**
   A minor runs only when `mature.available_words() >= young.used_words()` and the policy allows it; otherwise
-  `collect` escalates to a major, which sizes a fresh space up front (`mature_after_fullsweep` over the **exact
-  reachable live count**) *before* copying, so a collection never leaves the from-space half-forwarded.
-- **The fresh mature space is sized from the EXACT reachable live set plus the young heap's occupancy — never
-  the mature occupancy.** `mature_after_fullsweep(capacity, live, need)` takes `live` from `live.rs` and `need`
-  = the young heap's occupancy (the C `adjust_after_fullsweep` `need_after`).
+  `collect` escalates to a major, which sizes `mature_after_fullsweep(capacity, live, need)` up front — `live`
+  from `live.rs`, `need` = the young heap's occupancy (the C `adjust_after_fullsweep` `need_after`) — *before*
+  copying, so a collection never leaves the from-space half-forwarded.
   The young occupancy lets the mature region receive the **next** nursery's promotion, so minors actually run
   instead of every collection escalating, and it is bounded by the nursery capacity, so the grow branch's target
-  is a fixed point.
-  The **mature** occupancy must never be used: it is garbage-inflated (everything the sweep is about to
-  reclaim), so `should_grow` would fire on every fullsweep and creep the capacity without bound.
+  is a fixed point; the **mature** occupancy must never be used, being garbage-inflated (everything the sweep is
+  about to reclaim), so `should_grow` would fire on every fullsweep and creep the capacity without bound.
 - **The nursery's post-collection size is the C's TWO-STEP rule for a fullsweep, and the single bounded rule for
   a minor.** Step 1 — `major_collection` (`erl_gc.c:1866`) — is the **pre-copy-occupancy** sizing,
   `HeapPolicy::young_after_collection(capacity, observed_occupancy)`: a nursery the mutator genuinely filled
@@ -323,24 +320,24 @@ and the one-line semantic contract only.
   while it was current; a collapse *re-seeds* it from the single surviving space (a stale widening would keep
   accepting the retired neighbourhood); both advance the epoch.
   `Collector`/`GenImmixCollector` compose it with their mature extent and a separate `mature_generation` counter
-  bumped where the mature space is actually replaced (an in-place mark-region reclaim does not move it); the
-  reported `generation` is the **sum** of the two monotone counters.
+  bumped where the mature space is actually replaced (an in-place mark-region reclaim does not move it), the
+  reported `generation` being the **sum** of the two monotone counters.
   The **reserved** extent (not the moving `top()`) is used because `top()` moves on every allocation, which would
-  invalidate a cached bound immediately, and the filter only ever rejects.
-- **Tightening the aggregate is not worth implementing; its acquisition is the only lever.** The covering equals
-  the union of the scanned regions to within one block except after a collection, where the re-installed nursery
-  lands ≈14 KB away from the mature space, and there a per-space interval list or a nursery-vs-mature split is a
-  **lateral** trade: the population falling through tier one is mature- and retired-space pointers, which every
-  interval shape must fall through on (they are scanned; `may_contain` is a reject filter by contract).
-  A sound fast-*accept* on the mature half would be a different design (`AnyCollector::kind()`), bounded by the
-  valve's total cost (see `MEASURED.md`); since `beam_rt` re-reads a freshly built `ScannedBounds` per reference
-  word, hoisting one read per walk (a parameter here) is the cheaper lever.
+  invalidate a cached bound immediately.
 - **The minor→major escalation test is a CAPACITY test on the nursery's occupancy, and on the `gc_bound/churn`
   shape every escalation it takes is genuine** — `tests/churn_attribution.rs` records the mature as low as **1**
   free word against a nursery occupancy up to 550, so the ~0.5 majors/op are forced by the mature generation's
   promoted garbage, not by a conservative test.
   An exact-live variant would remove false escalations elsewhere, does not help this shape, and costs one extra
   young traversal per collection — deliberately not adopted.
+- **Tightening the aggregate is not worth implementing; its acquisition is the only lever.** The covering equals
+  the union of the scanned regions to within one block except after a collection, where the re-installed nursery
+  lands ≈14 KB away from the mature space — and there a per-space interval list or a nursery-vs-mature split is a
+  **lateral** trade, because the population falling through tier one is mature- and retired-space pointers, which
+  every interval shape must fall through on (`may_contain` is a reject filter by contract).
+  A sound fast-*accept* on the mature half would be a different design (`AnyCollector::kind()`); since `beam_rt`
+  re-reads a freshly built `ScannedBounds` per reference word, hoisting one read per walk (a parameter here) is
+  the cheaper lever.
 
 ### Measured
 Every figure, table and caveat is in **`MEASURED.md`**; this section keeps only the load-bearing headlines and
@@ -436,15 +433,14 @@ the section to read them in.
 
 ## Known Gaps (still open)
 - **The mark-region strategy is reachable in production; the DEFAULT remains the copying `Collector`.**
-  `beam_process::Process` owns an `AnyCollector` built from the spawn policy, exposes it as `collector()`, and
-  `beam_rt` drives it at its heap-admission point (`src/context/gc.rs::{ensure_heap, ensure_heap_full}`), reading
-  the mature generation through two geometry accessors (`mature_contains` in the unscanned-root valve,
-  `mature_used_words` in the memory hook).
+  `beam_process::Process` owns an `AnyCollector` built from the spawn policy (`collector()`), and `beam_rt` drives
+  it at its heap-admission point (`src/context/gc.rs::{ensure_heap, ensure_heap_full}`), reading the mature
+  generation through two geometry accessors (`mature_contains` in the unscanned-root valve, `mature_used_words` in
+  the memory hook).
   `select_mature` chooses `Immix` only at/above `IMMIX_BREAK_EVEN_WORDS`, which the default 233-word policy never
   reaches, so `GcConfig::default()` builds the copying `Collector`; Immix needs a large configured mature
   generation (`beam_rt`'s default-OFF `BEAM_RT_GC_STRATEGY=immix` opt-in does exactly that) or an explicit pin.
-  Either way the mature generation is genuinely exercised — the fullsweep room policy sizes the fresh mature for a
-  nursery's worth of promotion, so the default really runs minors (**147 minors : 73 fullsweeps**).
+  Either way the mature generation is genuinely exercised (**147 minors : 73 fullsweeps** at the default).
 - **The Immix region never reallocates in place; the collector grows it by relocation.** `ImmixSpace` wraps a
   `beam_alloc::Heap` and is never resized in place, so a major replaces the whole region — the live set is
   relocated into a fresh `ImmixSpace` sized by the policy (`relocate_major`), or a larger region when an in-place
@@ -452,12 +448,10 @@ the section to read them in.
   A growable heap therefore never fails a collectable collection; only a `max_heap_words` ceiling the promotion
   cannot fit returns the typed `heap_exhausted` (before any copy).
 - **A retired nursery space is freed only by a collection.** `Nursery::grow` supersedes the space the mutator was
-  allocating in **without collecting and without moving a term**, so a live term may still name into it; it
-  therefore keeps that space addressable as a link of the chain, whatever its occupancy.
-  Dropping the provably-empty case would be sound but changes `young_space_count()`, so it is deliberately not
-  done.
-  The only thing that frees a retired space is a collapse, because the collection's from-set covers every space
-  and has copied everything reachable out.
+  allocating in **without collecting and without moving a term**, so a live term may still name into it; the space
+  therefore stays addressable as a chain link, whatever its occupancy (dropping the provably-empty case would be
+  sound but changes `young_space_count()`, so it is deliberately not done), and only a collapse frees it, because
+  the collection's from-set covers every space and has copied everything reachable out.
   A growth refuses **only** when the policy/table ceiling lies below the request (`target < need_words`,
   `src/nursery.rs:285-287`): once the capacity already equals the ceiling, a smaller request installs a **same-size**
   fresh space and retires the old one — a whole capacity retained per call, nothing reclaimed, and **no error** (the
@@ -465,52 +459,46 @@ the section to read them in.
   Otherwise growth is bounded only by `max_heap_words` (default `0` = unbounded) and the growth table's last entry
   (just under `(1<<53)/8` words), so an allocate-and-abandon loop with small requests stays growable indefinitely
   and never falls through to a refusal.
-- **The chain's collection debt is an opt-in seam; `should_collect` stays occupancy-only.**
-  `Nursery::retains_old_spaces` is exported as `collection_debt() -> bool` on all three collector types; `true`
-  means *a collection is required to reclaim the chain — a heap-admission door should treat it like a full
-  nursery*.
-  It is deliberately **not** ORed into `should_collect`, because a door that consults it must first **admit** the
-  collection; when it does, the collapse releases the chain at the next admission and the retention is **one
-  space at most**, however many cycles run (measured: 400 grow+admit cycles → peak chain **2** spaces / **932**
-  words — `MEASURED.md`, "The debt signal and the collection").
-  The cost that makes it opt-in: Handoffs.
+- **The chain's collection debt is an opt-in seam; `should_collect` stays occupancy-only** (seam semantics: Notes
+  for Agents). `Nursery::retains_old_spaces` is exported as `collection_debt() -> bool` on all three collector
+  types; `true` means *a collection is required to reclaim the chain — a heap-admission door should treat it like a
+  full nursery*, and the retention is then **one space at most**, however many cycles run (measured: 400 grow+admit
+  cycles → peak chain **2** spaces / **932** words — `MEASURED.md`, "The debt signal and the collection").
+  Folding it into `should_collect` instead would tax **every** admission, which is why it is a separate accessor.
 - **A refused promotion is ATOMIC; `collect` recovers, `collect_minor` does not.** Line-granular allocation needs
   a *contiguous* run inside one 16-line block, so a fragmented region can refuse an object although region-wide
   `free_lines()` reports room; the promotion driver then rolls BOTH spaces back byte-for-byte and reports
   `PromoteOutcome::WouldNotFit` — no marker, no rewritten root, no counter advanced.
   `collect` escalates that to a fullsweep and `grow_major` rebuilds a fresh region (fragmentation-free by
   monotone packing), even at the current capacity when a ceiling forbids growing; only a ceiling that cannot hold
-  the live set in ANY layout reports the typed heap exhaustion, still before any word is copied.
-  `collect_minor`'s own public contract reports the typed error rather than escalating — escalation is `collect`'s
-  job.
-- **Deliberately NOT ported: the C `high_water` single-block layout, per-object tenuring
-  (`GEN_GCS`/`MAX_GEN_GCS`) and the `F_NEED_FULLSWEEP` flag protocol** — replaced by the two-space young/mature
-  scheme above.
-- **Deliberately NOT ported: the dirty-scheduler escape for long collections**
-  (`ERTS_POTENTIALLY_LONG_GC_HSIZE`), and **literal-area collection** (`erts_garbage_collect_literals`,
-  literal-area purge/`xptr_tag`) — literals are treated as permanent and left verbatim.
+  the live set in ANY layout reports the typed heap exhaustion, still before any word is copied — and
+  `collect_minor`'s own public contract reports that typed error rather than escalating, which is `collect`'s job.
+- **Deliberately NOT ported:** the C `high_water` single-block layout, per-object tenuring
+  (`GEN_GCS`/`MAX_GEN_GCS`) and the `F_NEED_FULLSWEEP` flag protocol (replaced by the two-space young/mature
+  scheme above); the dirty-scheduler escape for long collections (`ERTS_POTENTIALLY_LONG_GC_HSIZE`); and
+  **literal-area collection** (`erts_garbage_collect_literals`, literal-area purge/`xptr_tag`) — literals are
+  treated as permanent and left verbatim.
 - **Out of scope by ownership:** frame-aware stack relocation (`copy_erlang_stack`), the process dictionary,
   on-heap message/signal queues and saved BIF/NIF arguments as sub-rootsets — `beam_process`'s; this crate takes
   a flat root slice. A.6 runtime heap options (`+hms`, `+hmbs`, …) — this crate exposes `HeapPolicy`, not the
   CLI surface (`beam_rt`'s).
 - **`OffHeap` is on the production path as both the MSO slot store and the process's binary store; its liveness
-  predicate is caller-driven.** `OffHeap` holds both MSO and refc-binary entries and IS the production MSO slot
-  store inside `beam_message::OffHeapTable` (which stores the slot index an on-heap container names).
+  predicate is caller-driven.** It holds both MSO and refc-binary entries and IS the production MSO slot store
+  inside `beam_message::OffHeapTable` (which stores the slot index an on-heap container names).
   `beam_process::Process` additionally owns a dedicated `OffHeap` (`owned_binaries`) swept as the last step of
   every rooted collection, in **two halves**: a **reachability-driven** half (enumerate the whole heap through
   `for_each_reachable_object`, record each reachable `BinRef` payload pointer, release every owned payload no
   reachable `BinRef` names; it **declines**, retaining everything, for a process with `has_unpublished_roots()`)
   and a **conservative** half (release exactly the entries the caller declared dead).
-  This crate's half — the marking walk — is public and layout-agnostic: it reports *which* objects are reachable,
-  never what they contain, so the caller applies its own `ErlSubBits`/`BinRef` subtag test and reads the payload
-  pointer word, and this crate takes no dependency on `beam_message`'s container interior.
+  The marking walk is public and layout-agnostic — it reports *which* objects are reachable, never what they
+  contain — so the caller applies its own `ErlSubBits`/`BinRef` subtag test and reads the payload pointer word.
 
 ## Handoffs (owned by other nodes)
 - **The `gc_bound/churn` residual is not this crate's.** The major count stays capacity-forced by the mature
-  generation's promoted garbage and this crate's copy loop is only **4.2 %** of a `perf` profile of the shape;
-  the dominant costs are the interpreter tier (20 %), libc malloc/free/memmove (15 %), `beam_rt::context::gc`
-  (12.7 %) and `beam_bifs`' `Vec` churn (4.9 %) — `beam_bifs/src/binconv.rs:335-382` (`list_to_binary` builds
-  two `Vec`s), `beam_bifs/src/term_ops.rs:84-139` (`proper_list` `Vec` for `list_to_tuple`),
+  generation's promoted garbage and this crate's copy loop is only **4.2 %** of a `perf` profile of the shape; the
+  dominant costs are the interpreter tier (20 %), libc malloc/free/memmove (15 %), `beam_rt::context::gc` (12.7 %)
+  and `beam_bifs`' `Vec` churn (4.9 %) — `beam_bifs/src/binconv.rs:335-382` (`list_to_binary` builds two `Vec`s),
+  `beam_bifs/src/term_ops.rs:84-139` (`proper_list` `Vec` for `list_to_tuple`),
   `beam_bifs/src/arith.rs:648-650` (`Big::from_i64` boxes a `Vec<u64>` per small-int operand) and
   `beam_rt/src/context/gc.rs:667-675` (`collect_or_grow` re-installing a space per op).
   Owners: `beam_bifs` / `beam_engine` / `beam_rt`.
@@ -527,24 +515,25 @@ the section to read them in.
   `sweep_off_heap_binaries_reachable_from` still drives `AnyCollector::for_each_reachable_object`, whose raw
   `(header, ptr)` pairs force the single production `unsafe { *ptr.add(1) }` word read in its
   `reachable_bin_ref_payload` probe; the view removes it with zero caller `unsafe`. Owner: `beam_process`.
-- **The growth seam is adopted by the runtime.** `beam_rt/src/context/gc.rs`'s shared `collect_or_grow` (behind
-  both admission doors) grows the running process's nursery through `Process::ensure_capacity` when the policy
-  admits the request and otherwise collects, and `Process::deliver` retries a refused copy the same way; a
-  bounded `+hmax N` policy the request cannot reach still refuses, and that exhaustion raises
-  `error:system_limit`. `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap".
-- **A `run` process collects only at a `test_heap`/`allocate_heap` admission door; neither allocation seam collects
-  once a growth succeeds.** `beam_rt`'s two `ensure_heap*` doors are the only readers of `collection_debt()`
-  (`context/gc.rs:835-839`, `:1041-1045`), and only an `allocate_heap`/`test_heap` instruction reaches them.
-  The per-term seams short-circuit first: `alloc_words_rooted`'s grow-and-retry (`context/gc.rs:1366-1373`) returns
-  before its `process.collect()` (`:1472`), and the un-rooted `alloc_words` (`:1196-1235`) has no collect branch at
-  all — so a loop emitting no admission instruction retires space after space with `minor_gcs == 0` and
-  `statistics(garbage_collection) == {0,0,0}` while the chain-summed `heap_size` climbs **linearly** in N; that
-  signature needs no valve to decline. An explicit `erlang:garbage_collect()` is honoured before the bump on both
-  seams (`:1332`, `:1457`), so a `heap_size` that collapses after it distinguishes "no door reached" from a valve
+- **The growth seam is adopted; a `run` process collects only at a `test_heap`/`allocate_heap` admission door,
+  so a loop with no admission instruction never collects.** `beam_rt/src/context/gc.rs`'s shared `collect_or_grow`
+  (behind both `ensure_heap*` doors) grows the running process's nursery through `Process::ensure_capacity` when the
+  policy admits the request and otherwise collects, and `Process::deliver` retries a refused copy the same way; a
+  bounded `+hmax N` policy the request cannot reach still refuses, and that exhaustion raises `error:system_limit`
+  (`HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap").
+  Those two doors are the only readers of `collection_debt()` (`context/gc.rs:835-839`, `:1041-1045`), and only an
+  `allocate_heap`/`test_heap` instruction reaches them: the per-term seams short-circuit first —
+  `alloc_words_rooted`'s grow-and-retry (`context/gc.rs:1366-1373`) returns before its `process.collect()`
+  (`:1472`), and the un-rooted `alloc_words` (`:1196-1235`) has no collect branch at all — so such a loop retires
+  space after space with `minor_gcs == 0` and `statistics(garbage_collection) == {0,0,0}` while the chain-summed
+  `heap_size` climbs **linearly** in N.
+  `ensure_capacity` is the only method that collects *unconditionally* (no occupancy test,
+  `src/collector.rs:321-334`), and an explicit `erlang:garbage_collect()` is honoured before the bump on both seams
+  (`:1332`, `:1457`), so a `heap_size` that collapses after it distinguishes "no door reached" from a valve
   decline. Owner of the doors: `beam_rt`.
-  On a route that *does* admit (an `ets:insert`/`ets:lookup` loop over a 5-field payload map) `minor_gcs` advances
-  ≈ `N/3` and `process_info(memory)` is **flat** in N (identical bytes at N = 100 and N = 20 000), so nothing
-  retains per iteration there.
+  Where a route *does* admit (an `ets:insert`/`ets:lookup` loop over a 5-field payload map),
+  `process_info(memory)` is **flat** in N (identical bytes at N = 100 and N = 20 000), so nothing retains per
+  iteration there.
 - **Cross-crate term caveats.** A pid is a heap term via `beam_term::thing::write_external_pid` (4 words) and
   `beam_term::compare::eq` orders it **structurally through its parts** (field order per the C `erts_cmp`), with
   `external_pid_parts` to read them directly; `compare::eq` still **recurses forever on a cycle**.
@@ -575,15 +564,16 @@ the section to read them in.
   converges to one constant capacity), so a steady state under continuous collection shows a **converged
   constant** capacity plus a **rising** `minor_gcs`; a constant capacity with a *frozen* `minor_gcs` means no
   collection.
-- **`should_collect(need)` cannot be true right after a growth that satisfied the same `need`** — it reads only the
-  **current** space (`current().available_words() < need`) and a growth/`ensure_capacity` guarantees that space's
-  room covers `need`, so it answers `false` until the fresh space fills up; the same holds for the two entry points
-  of `ensure_capacity` (its `next_words(need, 0) < need` pre-check and the post-collection `grow`).
-  It also ignores the chain, so a retired space is visible **only** through `collection_debt()`
-  (`!retired.is_empty()`, set unconditionally by every `Nursery::grow` that actually replaces a space — the
-  `available_words() >= need` early return retires nothing — and cleared only by a collapse, i.e. a collection or
-  `ensure_capacity`'s own collect; after `ensure_capacity` the chain is `2` whenever its post-collection `grow`
-  had to install a space).
+- **`should_collect` is occupancy-only and ignores the chain, so a retired space is visible only through
+  `collection_debt()`.** `should_collect(need)` reads the **current** space alone
+  (`current().available_words() < need`) and a growth guarantees that room, so it cannot be true right after a
+  growth that satisfied the same `need` — nor on either `ensure_capacity` entry point (`next_words(need, 0) <
+  need` pre-check, post-collection `grow`).
+  `collection_debt()` is `!retired.is_empty()`, set by every `Nursery::grow` that actually replaces a space (the
+  `available_words() >= need` early return retires nothing, so the chain is monotonic *between* collections) and
+  cleared only by a collapse — a collection, or `ensure_capacity`'s own collect, which then grows again and leaves
+  the chain at `2`, so the runtime's pairing (`collect_or_grow` / `Process::deliver`) makes `young_space_count`
+  oscillate ≈`1`→`2`→`1`.
   `retired.clear()`/`retired_regions.clear()` exist in exactly one place, `Nursery::install_collapsed`
   (`src/nursery.rs:363-364`), and `retired.push` in exactly one, `Nursery::grow` (`src/nursery.rs:292`).
 - **Address-level membership is public; enumeration of the nursery chain is NOT.** From outside the crate a caller
@@ -601,26 +591,13 @@ the section to read them in.
   except for the `ErlSubBits` override; `beam_term::size::size_object(Eterm)` is the whole-graph (public) size;
   the per-object reference walk `for_each_ref` is `pub(crate)`, and the public enumerator is
   `beam_term::layout::for_each_child_slot`.
-- **The nursery chain is monotonic *between collections*.** `Nursery::grow` holds the sole `retired.push` and a
-  collapse (the sole `retired.clear()` + `retired_regions.clear()`) runs **only** from
-  `collect_minor`/`collect_major`, so a loop that never reaches a heap-admission point keeps growing `retired`
-  while a loop whose door consults `collection_debt()` collapses it back to exactly one space each round.
-- **`ensure_capacity` keeps *both* spaces.** It collects first (which collapses the chain to 1) and then
-  `Nursery::grow` retires that just-created space (chain back to 2); the retired space is freed only by the next
-  collection's collapse.
-  `grow_nursery` is the no-collect, no-relocation form with **no** relocation-exempt guard, and it reports that
-  retention through `collection_debt()`.
-  The runtime pairs the two (`beam_rt`'s `collect_or_grow` / `Process::deliver`), so `young_space_count`
-  oscillates ≈`1`→`2`→`1` rather than accumulating.
 - **Reading the counters for a leak-vs-recycle diagnosis.** `heap_size_words()` is the **summed** capacity of the
-  chain, so every `grow_nursery` retirement is visible in it: a value that stays constant across N iterations
-  proves **no uncollected retirement is outstanding**, without reading `collection_debt()`.
-  **No counter of this crate advances on the `grow_nursery` path** except `young_space_count()`,
-  `collection_debt()` and the summed `heap_size_words()` — `stats()` and `minor_gcs()` are untouched, and a
-  growth grows no cumulative "allocated words" figure (this crate has none).
+  chain, so a value constant across N iterations proves **no uncollected retirement is outstanding** without
+  reading `collection_debt()`; no counter of this crate advances on the `grow_nursery` path except
+  `young_space_count()`, `collection_debt()` and that summed `heap_size_words()`.
   The only counter-free reclamation is the bump-pointer rewind `HeapSpace::reset`/`Heap::reset`/`Heap::reset_to`,
-  reachable through `young_mut().heap_mut()` and used by `beam_rt` per BIF call on its *pooled* BIF heap — never
-  on a process heap.
+  reached through `young_mut().heap_mut()` and used by `beam_rt` per BIF call on its *pooled* BIF heap — never on
+  a process heap.
 - **Address stability under growth vs. collection.** A `grow_nursery` always installs a **new** `HeapSpace` (so
   `young().base()` changes and the replaced base joins the non-enumerable chain); a collapse keeps the base when
   the target capacity equals the current one (it only calls `reset`) and installs a new space only when the
@@ -635,11 +612,6 @@ the section to read them in.
   describes only the returned value: `words_copied`/`words_reclaimed`/`objects_copied` are `+=`-accumulated into
   the collector's own `GcStats` (`src/collector.rs:207-210`, `:284-287`, `immix_collector.rs:531-538`), so
   `stats()` sums the whole collector lifetime.
-- **No collection is ever self-triggered.** Nothing inside the crate calls `collect`/`collect_minor`/`collect_major`;
-  `should_collect` is occupancy-only and advisory, and `grow_nursery`/`Nursery::grow` never collect.
-  `ensure_capacity` is the only method that collects *unconditionally* (no occupancy test,
-  `src/collector.rs:321-334`), so a host that only grows leaves occupancy below capacity indefinitely and its
-  `stats()`/`minor_gcs()` frozen.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
