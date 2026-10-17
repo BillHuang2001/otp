@@ -204,7 +204,7 @@ and the one-line semantic contract only.
 - **The nursery's post-collection size is the C's TWO-STEP rule for a fullsweep, and the single bounded rule for
   a minor.** Step 1 — `major_collection` (`erl_gc.c:1866`) — is the **pre-copy-occupancy** sizing,
   `HeapPolicy::young_after_collection(capacity, observed_occupancy)`: a nursery the mutator genuinely filled
-  keeps its capacity, which is what removed the per-fullsweep space-install churn.
+  keeps its capacity, so a steady workload pays no space install per fullsweep.
   Step 2 — `adjust_after_fullsweep` (`erl_gc.c:2062-2098`) — runs **after** the copy:
   `need_after = live_words + need_reserve_words`, and when `should_shrink(kept, need_after)` (the C's
   `4*need_after < HEAP_SIZE && HEAP_SIZE > H_MIN_SIZE`) the nursery shrinks to `next_words(2*need_after, 0)`
