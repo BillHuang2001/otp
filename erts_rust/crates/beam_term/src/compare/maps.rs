@@ -72,7 +72,7 @@
 
 use core::cmp::Ordering;
 
-use super::{cmp_flatmap_keys, cmp_impl, fallback_cmp};
+use super::{cmp_flatmap_keys, cmp_impl, fallback_cmp, CmpCtx};
 use crate::atom::AtomTable;
 use crate::boxed::{boxed_val, is_boxed_term, is_flatmap_header};
 use crate::eterm::Eterm;
@@ -84,17 +84,24 @@ use crate::thing::flatmap_parts;
 /// Both operands are, by the caller invariant, well-formed maps. A malformed map
 /// (only reachable if the term was forged outside this crate) falls back to the
 /// deterministic [`super::fallback_cmp`] rather than panicking.
-pub(super) fn cmp_maps(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
-    if let (Some((ka, va)), Some((kb, vb))) = (
-        sorted_flatmap_parts(a, atoms),
-        sorted_flatmap_parts(b, atoms),
+///
+/// **Key order stays context-free.** `ctx` reaches the *value* comparisons (which take
+/// the full [`super::cmp_impl`], including the local-node-aware mixed pid/port/ref arm),
+/// but the keys are ordered by the canonical [`cmp_flatmap_keys`] — the same order a map
+/// *stores* them in, which cannot depend on which node is asking. A map whose keys are
+/// mixed internal/external pids therefore keeps the class-ladder key order in every
+/// context; the fast path and the collecting fallback apply that one rule, so they
+/// still cannot disagree.
+pub(super) fn cmp_maps(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {    if let (Some((ka, va)), Some((kb, vb))) = (
+        sorted_flatmap_parts(a, ctx.atoms),
+        sorted_flatmap_parts(b, ctx.atoms),
     ) {
-        return cmp_sorted_flatmaps(ka, va, kb, vb, atoms, exact);
+        return cmp_sorted_flatmaps(ka, va, kb, vb, ctx);
     }
 
     let (pa, pb) = match (
-        crate::map::map_pairs_flatmap_order(a, atoms),
-        crate::map::map_pairs_flatmap_order(b, atoms),
+        crate::map::map_pairs_flatmap_order(a, ctx.atoms),
+        crate::map::map_pairs_flatmap_order(b, ctx.atoms),
     ) {
         (Ok(pa), Ok(pb)) => (pa, pb),
         _ => return fallback_cmp(a, b),
@@ -103,14 +110,14 @@ pub(super) fn cmp_maps(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Or
         return pa.len().cmp(&pb.len());
     }
     for i in 0..pa.len() {
-        let ord = cmp_flatmap_keys(pa[i].0, pb[i].0, atoms);
+        let ord = cmp_flatmap_keys(pa[i].0, pb[i].0, ctx.atoms);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     for i in 0..pa.len() {
         // The value terms of two live, well-formed maps.
-        let ord = cmp_impl(pa[i].1, pb[i].1, atoms, exact);
+        let ord = cmp_impl(pa[i].1, pb[i].1, ctx);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -129,21 +136,20 @@ fn cmp_sorted_flatmaps(
     va: &[Eterm],
     kb: &[Eterm],
     vb: &[Eterm],
-    atoms: &AtomTable,
-    exact: bool,
+    ctx: CmpCtx<'_>,
 ) -> Ordering {
     if ka.len() != kb.len() {
         return ka.len().cmp(&kb.len());
     }
     for i in 0..ka.len() {
-        let ord = cmp_flatmap_keys(ka[i], kb[i], atoms);
+        let ord = cmp_flatmap_keys(ka[i], kb[i], ctx.atoms);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     for i in 0..va.len() {
         // The value terms of two live, well-formed flat maps.
-        let ord = cmp_impl(va[i], vb[i], atoms, exact);
+        let ord = cmp_impl(va[i], vb[i], ctx);
         if ord != Ordering::Equal {
             return ord;
         }

@@ -91,15 +91,12 @@
 //!   longer slice's leading zero ids trimmed first); a native record by its
 //!   definition's `module`, `name` and `is_exported` (`false < true`), its field
 //!   count and keys, and finally its field values.
-//!   Those structural arms are reached only when *both* operands are external (or
-//!   both records): a **mixed internal/external** pair of the same category is
-//!   decided by [`class_rank`] instead, whereas the C's `pid_common`/`ref_common`
-//!   arms (`utils.c:1777`/`:2262`, reached from the external cases at
-//!   `:2212`/`:2235`/`:2288`) compare `serial`, `number` and the node first. The two
-//!   rules agree when the foreign sysname sorts before the local one and disagree
-//!   otherwise — the one known ordering gap for these classes; it is pinned by
-//!   `tests/compare_class_order.rs`.
-//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
+//!   Those structural arms are reached when *both* operands are external (or both are
+//!   records). A **mixed internal/external** pair of the same category is decided by
+//!   [`class_rank`] in the *context-free* [`cmp`]/[`cmp_arith`] (the documented
+//!   no-context convention) and field by field by [`cmp_with_local_node`] /
+//!   [`cmp_arith_with_local_node`], which supply the local node the internal word
+//!   cannot carry — see [`identity`] and [`LocalNodeId`].//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
 //!   class first (which is exact), then by object arity, then by the raw term word
 //!   (a stable proxy). This never panics but is not a faithful reproduction of the
 //!   C's structural comparison; a caller that needs exact ordering for it must
@@ -123,7 +120,33 @@
 //! This is a documented **hardening**, not a behavioural change for valid input:
 //! no valid term has the `HEADER` primary tag, so every comparison of terms is
 //! bit-for-bit what it was.
-
+//!
+//! ## Local-node-aware comparison
+//!
+//! An **internal** pid/port/ref word carries no node; the C substitutes
+//! `erts_this_node` when it compares one against an **external** word of the same
+//! category (`utils.c:1751-1811`, `:2219-2308`). [`cmp`]/[`cmp_arith`] have no "this
+//! node" to substitute, so they keep the class-ladder convention above.
+//!
+//! A host that *owns* a node supplies it through [`LocalNodeId`] (sysname atom +
+//! creation) and calls [`cmp_with_local_node`] (exact `=:=` ordering — what
+//! `beam_process`'s monitor/link ordering needs) or
+//! [`cmp_arith_with_local_node`] (arithmetic `==` ordering — what the `<`/`>` BIFs
+//! and `ordered_set` need). Both behave **exactly** like [`cmp`]/[`cmp_arith`] for
+//! every pair that is not a mixed internal/external `pid`/`port`/`ref` pair, and for
+//! those they compare the fields in the C's order (see [`identity`]).
+//!
+//! The three mixed arms, and their documented conventions:
+//!
+//! * **pid** — `serial`, `number`, then the node. `serial`/`number` are compared
+//!   before the node, exactly as `pid_common` does, so a mixed pair can be decided
+//!   without ever looking at the node.
+//! * **port** — the node **only**: the C never compares the numbers
+//!   (`utils.c:1756-1760`, `:2224-2229`). A same-node pair is unreachable in the C
+//!   (it asserts) and is compared by port number here, a documented convention.
+//! * **ref** — the node, then the ids as one big integer.
+//!
+//! With `local: None` the ladder decides, so every existing caller is unaffected.
 use core::cmp::Ordering;
 
 use crate::atom::AtomTable;
@@ -152,10 +175,16 @@ mod numbers;
 /// (no allocation), everything else through the collecting fallback. See the module
 /// docs for the flat-map order precondition.
 mod maps;
+/// The local-node-aware arm — the mixed internal/external `pid`/`port`/`ref`
+/// comparisons, and [`LocalNodeId`] (the local node those need). Split out so the
+/// field-by-field port/ref rules and their documented conventions live together.
+mod identity;
 
+pub use identity::LocalNodeId;
+
+use identity::{cmp_mixed, cmp_ref_ids};
 use maps::cmp_maps;
-use numbers::cmp_numbers;
-/// Ascending term-order rank of a [`TermClass`].
+use numbers::cmp_numbers;/// Ascending term-order rank of a [`TermClass`].
 ///
 /// `rank = 0x10 - _DEF` over the 17 real classes of the C's `*_DEF` ladder
 /// (`erts/emulator/beam/erl_term.h:1441-1457`), with `BIN_REF_DEF` (`0x11`, "not a
@@ -196,6 +225,41 @@ const fn is_number_class(class: TermClass) -> bool {
     )
 }
 
+/// The shared comparison context: the atom namespace, the mode, and — when the
+/// caller owns one — the local node a mixed internal/external pair needs.
+///
+/// `Copy` (it borrows the atom table), so every recursive call site passes it on by
+/// value; `local: None` is exactly the context-free [`cmp`]/[`cmp_arith`] behaviour.
+#[derive(Clone, Copy)]
+struct CmpCtx<'a> {
+    /// The atom namespace every name-based comparison reads.
+    atoms: &'a AtomTable,
+    /// `true` for the exact (`=:=`) order, `false` for the arithmetic (`==`) one.
+    exact: bool,
+    /// The runtime's own node, or `None` for the context-free entry points.
+    local: Option<LocalNodeId>,
+}
+
+impl<'a> CmpCtx<'a> {
+    /// A context with the given atoms and mode and **no** local node.
+    const fn new(atoms: &'a AtomTable, exact: bool) -> Self {
+        Self {
+            atoms,
+            exact,
+            local: None,
+        }
+    }
+
+    /// This context with `local` installed.
+    const fn with_local(self, local: LocalNodeId) -> Self {
+        Self {
+            atoms: self.atoms,
+            exact: self.exact,
+            local: Some(local),
+        }
+    }
+}
+
 /// The exact (`=:=`) ordering of two terms — `erts_cmp(a, b, exact=1, eq_only=0)`.
 ///
 /// `atoms` supplies the atom names needed for [`cmp_atoms`]-style comparison; a
@@ -204,8 +268,12 @@ const fn is_number_class(class: TermClass) -> bool {
 /// A word that is **not a term** (a bare header word — the ABI's `THE_NON_VALUE`
 /// and friends) is not dereferenced: it sorts after every real term, and two such
 /// words order by their raw word. See the module docs and [`cmp_impl`].
+///
+/// This is the **no-context** entry point: a mixed internal/external `pid`/`port`/`ref`
+/// pair is decided by [`class_rank`] (see the module docs). Pass the runtime's own node
+/// to [`cmp_with_local_node`] to compare those field by field instead.
 pub fn cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> Ordering {
-    cmp_impl(a, b, atoms, true)
+    cmp_impl(a, b, CmpCtx::new(atoms, true))
 }
 
 /// `=:=` — whether two terms are exactly equal (`cmp(a, b).is_eq()`).
@@ -223,13 +291,63 @@ pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool {
 /// numerically (`1 == 1.0`). Bignum-to-float conversion is a documented
 /// approximation (see the module `Known Issues`). A non-term word is handled
 /// exactly as in [`cmp`].
+///
+/// Like [`cmp`], this is the **no-context** entry point; see
+/// [`cmp_arith_with_local_node`] for the node-aware twin.
 pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> Ordering {
-    cmp_impl(a, b, atoms, false)
+    cmp_impl(a, b, CmpCtx::new(atoms, false))
 }
 
-/// The shared comparison core, parameterised by `exact`.
-fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
-    // Identical words are always equal (the C `is_same` fast path).
+/// The exact (`=:=`) ordering with the runtime's own node supplied —
+/// `erts_cmp` where the internal operand's implicit node is `local`.
+///
+/// Identical to [`cmp`] for **every** pair that is not a mixed internal/external
+/// `pid`, `port` or `ref` pair. For those it reproduces the C's field-by-field arms
+/// (`erts/emulator/beam/utils.c:1751-1811`, `:2219-2308`) instead of the class ladder:
+///
+/// * **pid** — `serial`, then `number`, then the node (sysname name, then `creation`),
+///   exactly `pid_common`; a pair equal in all three is `Equal` (the C's `CMP_NODES`
+///   no-op when the nodes are the same, then `pop_next`).
+/// * **port** — the **node only**; the C never compares port numbers. A same-node pair
+///   (unreachable in the C, which asserts) compares the port numbers — a documented
+///   convention; see [`identity`].
+/// * **ref** — the node first, then the ids as one big integer (the longer side's
+///   leading high-index zeros trimmed, then compared from the highest index down).
+///   This tree's M1 internal reference carries its whole identity as one 60-bit id,
+///   expressed as the id array `[id as u32, (id >> 32) as u32]` — see [`identity`].
+///
+/// `atoms` is required because node ordering is **name**-based (`erts_cmp_atoms`, a
+/// lexicographic comparison of the sysname bytes), which no hash could reproduce; a
+/// sysname whose name is not interned falls back to the raw atom index, as every other
+/// atom comparison here does.
+///
+/// Total, deterministic and panic-free like [`cmp`], including for a non-term word.
+pub fn cmp_with_local_node(
+    a: Eterm,
+    b: Eterm,
+    local: LocalNodeId,
+    atoms: &AtomTable,
+) -> Ordering {
+    cmp_impl(a, b, CmpCtx::new(atoms, true).with_local(local))
+}
+
+/// The arithmetic (`==`) ordering with the runtime's own node supplied — the
+/// node-aware twin of [`cmp_arith`], for the `<`/`>` BIFs and `ordered_set`.
+///
+/// Behaves like [`cmp_arith`] (IEEE floats, numeric mixed int/float) everywhere,
+/// including in the mixed internal/external arms [`cmp_with_local_node`] documents:
+/// those compare `serial`/`number`/node and ref ids, on which `==` and `=:=` agree.
+pub fn cmp_arith_with_local_node(
+    a: Eterm,
+    b: Eterm,
+    local: LocalNodeId,
+    atoms: &AtomTable,
+) -> Ordering {
+    cmp_impl(a, b, CmpCtx::new(atoms, false).with_local(local))
+}
+
+/// The shared comparison core, parameterised by the [`CmpCtx`].
+fn cmp_impl(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {    // Identical words are always equal (the C `is_same` fast path).
     if a.raw() == b.raw() {
         return Ordering::Equal;
     }
@@ -263,7 +381,7 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
         };
     }
     if is_atom(a) && is_atom(b) {
-        return cmp_atoms(a, b, atoms);
+        return cmp_atoms(a, b, ctx.atoms);
     }
     if is_small(a) && is_small(b) {
         return signed_value(a).cmp(&signed_value(b));
@@ -274,11 +392,18 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
     let (a_float, b_float) = unsafe { (is_float(a), is_float(b)) };
     if a_float && b_float {
         // SAFETY: as above.
-        return unsafe { cmp_floats(a, b, exact) };
+        return unsafe { cmp_floats(a, b, ctx.exact) };
     }
     let (ca, cb) = unsafe { (class(a), class(b)) };
     if is_number_class(ca) && is_number_class(cb) {
-        return cmp_numbers(a, b, ca, cb, exact);
+        return cmp_numbers(a, b, ca, cb, ctx.exact);
+    }
+    // A mixed internal/external `pid`/`port`/`ref` pair is compared field by field —
+    // and so *before* the rank shortcut — when the caller supplied the local node;
+    // the C never uses the `_DEF` ladder for two representations of one category.
+    // SAFETY: `ca`/`cb` were just read off these very terms.
+    if let Some(ord) = unsafe { cmp_mixed(a, b, ca, cb, ctx) } {
+        return ord;
     }
     let (ra, rb) = (class_rank(ca), class_rank(cb));
     if ra != rb {
@@ -286,25 +411,25 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
     }
     // Same non-numeric class: compare within the class.
     match ca {
-        TermClass::Atom => cmp_atoms(a, b, atoms),
+        TermClass::Atom => cmp_atoms(a, b, ctx.atoms),
         // SAFETY: both operands are live terms of the same class.
-        TermClass::Tuple => unsafe { cmp_tuples(a, b, atoms, exact) },
-        TermClass::List => unsafe { cmp_lists(a, b, atoms, exact) },
+        TermClass::Tuple => unsafe { cmp_tuples(a, b, ctx) },
+        TermClass::List => unsafe { cmp_lists(a, b, ctx) },
         TermClass::Bitstring => unsafe { cmp_bitstrings(a, b) },
         TermClass::Pid => internal_pid_data(a).cmp(&internal_pid_data(b)),
         TermClass::Port => internal_port_data(a).cmp(&internal_port_data(b)),
         TermClass::Ref => unsafe { cmp_refs(a, b) },
         TermClass::Nil => Ordering::Equal,
         // SAFETY: both operands are live maps.
-        TermClass::Map => cmp_maps(a, b, atoms, exact),
+        TermClass::Map => cmp_maps(a, b, ctx),
         // SAFETY: both operands are live funs.
-        TermClass::Fun => unsafe { cmp_funs(a, b, atoms, exact) },
+        TermClass::Fun => unsafe { cmp_funs(a, b, ctx) },
         // SAFETY: both operands are live external pids/ports/refs, or live native
         // records — one class per arm, as established by `class_rank` above.
-        TermClass::ExternalPid => unsafe { cmp_external_pids(a, b, atoms, exact) },
-        TermClass::ExternalPort => unsafe { cmp_external_ports(a, b, atoms, exact) },
-        TermClass::ExternalRef => unsafe { cmp_external_refs(a, b, atoms, exact) },
-        TermClass::Record => unsafe { cmp_records(a, b, atoms, exact) },
+        TermClass::ExternalPid => unsafe { cmp_external_pids(a, b, ctx) },
+        TermClass::ExternalPort => unsafe { cmp_external_ports(a, b, ctx) },
+        TermClass::ExternalRef => unsafe { cmp_external_refs(a, b, ctx) },
+        TermClass::Record => unsafe { cmp_records(a, b, ctx) },
         // The on-heap bin ref still uses the documented deterministic fallback (see
         // the module `Known Issues`); the catch-all keeps the match total for any
         // class added later.
@@ -320,15 +445,17 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
 /// which a flat map stores its keys (`erts_validate_and_sort_flatmap`) and the
 /// order the C uses to compare map keys, so it — not the plain term order — is
 /// what [`cmp_maps`] must use to be observable-compatible.
+///
+/// This is deliberately the **canonical** (context-free) order: it is the order a map
+/// *stores* its keys in, which must not depend on which node is asking, so it stays
+/// exact-mode and node-unaware even inside [`cmp_maps`] — see [`maps`].
 pub fn cmp_flatmap_keys(key_a: Eterm, key_b: Eterm, atoms: &AtomTable) -> Ordering {
     if is_atom(key_a) && is_atom(key_b) {
         atom_val(key_a).raw().cmp(&atom_val(key_b).raw())
     } else {
         cmp(key_a, key_b, atoms)
     }
-}
-
-/// Compare two maps — the `MAP_SUBTAG` arm of `erts_cmp_compound`
+}/// Compare two maps — the `MAP_SUBTAG` arm of `erts_cmp_compound`
 /// (`erts/emulator/beam/utils.c:1955-2118`).
 ///
 /// Erlang map order is: **size first**, then the key/value pairs ordered by the
@@ -398,7 +525,7 @@ unsafe fn cmp_floats(a: Eterm, b: Eterm, exact: bool) -> Ordering {
 /// # Safety
 ///
 /// `a` and `b` must be live tuple terms.
-unsafe fn cmp_tuples(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+unsafe fn cmp_tuples(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     // SAFETY: both are tuples.
     let (sa, sb) = unsafe { (tuple_size(a), tuple_size(b)) };
     if sa != sb {
@@ -407,8 +534,7 @@ unsafe fn cmp_tuples(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Orde
     for i in 0..sa {
         // SAFETY: `i < sa`, the tuple's arity.
         let (ea, eb) = unsafe { (tuple_element(a, i), tuple_element(b, i)) };
-        let ord = cmp_impl(ea, eb, atoms, exact);
-        if ord != Ordering::Equal {
+        let ord = cmp_impl(ea, eb, ctx);        if ord != Ordering::Equal {
             return ord;
         }
     }
@@ -421,14 +547,14 @@ unsafe fn cmp_tuples(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Orde
 /// # Safety
 ///
 /// `a` and `b` must be live non-`NIL` cons cells.
-unsafe fn cmp_lists(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+unsafe fn cmp_lists(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     let mut x = a;
     let mut y = b;
     loop {
         // SAFETY: `x` and `y` are cons cells.
         let (ca, cb) = unsafe { (car(x), car(y)) };
         if ca.raw() != cb.raw() {
-            let ord = cmp_impl(ca, cb, atoms, exact);
+            let ord = cmp_impl(ca, cb, ctx);
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -441,9 +567,8 @@ unsafe fn cmp_lists(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Order
         if !is_list(da) || !is_list(db) {
             // At least one tail is `nil` or an improper tail: the general
             // comparison decides (e.g. `nil` < cons).
-            return cmp_impl(da, db, atoms, exact);
-        }
-        x = da;
+            return cmp_impl(da, db, ctx);
+        }        x = da;
         y = db;
     }
 }
@@ -508,33 +633,35 @@ unsafe fn cmp_refs(a: Eterm, b: Eterm) -> Ordering {
 /// M1 substitution documented on [`crate::thing::write_external_pid`]) — so there is
 /// no pointer identity to short-circuit on and both fields are always compared, in
 /// that order.
+///
+/// Two nodes with the same sysname *and* the same `creation` compare `Equal` — the
+/// C's `AN == BN` short-circuit, reproduced by its absence.
 fn cmp_nodes(
     node_a: Eterm,
     creation_a: u32,
     node_b: Eterm,
     creation_b: u32,
-    atoms: &AtomTable,
-    exact: bool,
+    ctx: CmpCtx<'_>,
 ) -> Ordering {
-    let ord = cmp_impl(node_a, node_b, atoms, exact);
+    let ord = cmp_impl(node_a, node_b, ctx);
     if ord != Ordering::Equal {
         return ord;
     }
     creation_a.cmp(&creation_b)
 }
-
 /// Compare two external pids — the `pid_common` block of `erts_cmp_compound`
 /// (`erts/emulator/beam/utils.c:1777-1811`).
 ///
 /// Field order (`utils.c:1805-1809`): `serial`, then `number`, then the node
-/// (sysname atom, then `creation`). This arm is reached only when *both* operands
-/// are external pids; a mixed internal/external pair is decided by class rank
-/// instead (the module docs' known ordering gap).
+/// (sysname atom, then `creation`). This arm is reached when *both* operands are
+/// external pids; a mixed internal/external pair takes the same field order through
+/// [`cmp_with_local_node`] (see [`identity`]) and the class ladder through the
+/// context-free [`cmp`].
 ///
 /// # Safety
 ///
 /// `a` and `b` must be live external pid terms.
-unsafe fn cmp_external_pids(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+unsafe fn cmp_external_pids(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     // SAFETY: the caller guarantees both operands are live external pids written by
     // `crate::thing::write_external_pid`.
     let (node_a, number_a, serial_a, creation_a) = unsafe { external_pid_parts(a) };
@@ -543,9 +670,8 @@ unsafe fn cmp_external_pids(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) 
     serial_a
         .cmp(&serial_b)
         .then_with(|| number_a.cmp(&number_b))
-        .then_with(|| cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact))
+        .then_with(|| cmp_nodes(node_a, creation_a, node_b, creation_b, ctx))
 }
-
 /// Compare two external ports — the `_TAG_HEADER_EXTERNAL_PORT` arm of
 /// `erts_cmp_compound` (`erts/emulator/beam/utils.c:2219-2238`).
 ///
@@ -555,13 +681,13 @@ unsafe fn cmp_external_pids(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) 
 /// # Safety
 ///
 /// `a` and `b` must be live external port terms.
-unsafe fn cmp_external_ports(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+unsafe fn cmp_external_ports(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     // SAFETY: the caller guarantees both operands are live external ports written by
     // `crate::thing::write_external_port`.
     let (node_a, number_a, creation_a) = unsafe { external_port_parts(a) };
     // SAFETY: as above.
     let (node_b, number_b, creation_b) = unsafe { external_port_parts(b) };
-    cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact)
+    cmp_nodes(node_a, creation_a, node_b, creation_b, ctx)
         .then_with(|| number_a.cmp(&number_b))
 }
 
@@ -576,56 +702,24 @@ unsafe fn cmp_external_ports(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool)
 /// decides immediately (the longer slice is the greater one). The surviving ids are
 /// then compared from the highest index down.
 ///
+/// The id tail is the shared [`cmp_ref_ids`], so this arm and the mixed
+/// internal/external one in [`identity`] cannot drift apart.
+///
 /// # Safety
 ///
 /// `a` and `b` must be live external reference terms.
-unsafe fn cmp_external_refs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+unsafe fn cmp_external_refs(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     // SAFETY: the caller guarantees both operands are live external references
     // written by `crate::thing::write_external_ref`.
     let (node_a, ids_a, creation_a) = unsafe { external_ref_parts(a) };
     // SAFETY: as above.
     let (node_b, ids_b, creation_b) = unsafe { external_ref_parts(b) };
-    let ord = cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact);
+    let ord = cmp_nodes(node_a, creation_a, node_b, creation_b, ctx);
     if ord != Ordering::Equal {
         return ord;
     }
-    // Trim the longer slice's leading zero ids — the C's `do { … } while (alen >
-    // blen)` loops reproduced literally, so no index can go out of bounds. The loops
-    // exit with equal lengths (`ASSERT(alen == blen)`, `utils.c:2283`).
-    let (mut la, mut lb) = (ids_a.len(), ids_b.len());
-    if la > lb {
-        loop {
-            if ids_a[la - 1] != 0 {
-                return Ordering::Greater;
-            }
-            la -= 1;
-            if la <= lb {
-                break;
-            }
-        }
-    } else if lb > la {
-        loop {
-            if ids_b[lb - 1] != 0 {
-                return Ordering::Less;
-            }
-            lb -= 1;
-            if la >= lb {
-                break;
-            }
-        }
-    }
-    debug_assert_eq!(la, lb);
-    // Compare the surviving ids from the most significant (highest index) down.
-    let mut i = la.min(lb);
-    while i > 0 {
-        i -= 1;
-        if ids_a[i] != ids_b[i] {
-            return ids_a[i].cmp(&ids_b[i]);
-        }
-    }
-    Ordering::Equal
+    cmp_ref_ids(ids_a, ids_b)
 }
-
 /// The comparable words of a native-record **instance**, as read through the
 /// [`crate::record`] accessors: the field count, the definition's
 /// `(module, name, is_exported)` words, and its *sorted-key-ordered* key and value
@@ -728,18 +822,18 @@ pub(crate) fn exported_rank(is_exported: Eterm) -> u32 {
 /// # Safety
 ///
 /// `a` and `b` must be live native record terms.
-unsafe fn cmp_records(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+unsafe fn cmp_records(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     // SAFETY: the caller guarantees both operands are live native records.
     let (parts_a, parts_b) = unsafe { (record_parts(a), record_parts(b)) };
     let (Some(ra), Some(rb)) = (parts_a, parts_b) else {
         return fallback_cmp(a, b);
     };
     // The definition content, in the C's order (`utils.c:1907-1938`).
-    let ord = cmp_impl(ra.module, rb.module, atoms, exact);
+    let ord = cmp_impl(ra.module, rb.module, ctx);
     if ord != Ordering::Equal {
         return ord;
     }
-    let ord = cmp_impl(ra.name, rb.name, atoms, exact);
+    let ord = cmp_impl(ra.name, rb.name, ctx);
     if ord != Ordering::Equal {
         return ord;
     }
@@ -752,20 +846,19 @@ unsafe fn cmp_records(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ord
         return ord;
     }
     for i in 0..ra.field_count {
-        let ord = cmp_impl(ra.keys[i], rb.keys[i], atoms, exact);
+        let ord = cmp_impl(ra.keys[i], rb.keys[i], ctx);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     for i in 0..ra.field_count {
-        let ord = cmp_impl(ra.values[i], rb.values[i], atoms, exact);
+        let ord = cmp_impl(ra.values[i], rb.values[i], ctx);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
 }
-
 /// The ascending kind rank of a fun, used as the leading key when two funs are
 /// of different kinds.
 ///
@@ -822,7 +915,7 @@ const fn fun_kind_rank(kind: FunKind) -> u8 {
 /// # Safety
 ///
 /// `a` and `b` must be live fun terms.
-unsafe fn cmp_funs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+unsafe fn cmp_funs(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     let (pa, pb) = (boxed_val(a), boxed_val(b));
     // SAFETY: the caller guarantees both operands are live funs, so word 0 of each
     // is its (live) header word.
@@ -836,12 +929,12 @@ unsafe fn cmp_funs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Orderi
         FunKind::External => {
             // SAFETY: an external fun's descriptor words 1 and 2 hold its module and
             // function atoms.
-            let ord = cmp_impl(unsafe { *pa.add(1) }, unsafe { *pb.add(1) }, atoms, exact);
+            let ord = cmp_impl(unsafe { *pa.add(1) }, unsafe { *pb.add(1) }, ctx);
             if ord != Ordering::Equal {
                 return ord;
             }
             // SAFETY: as above — descriptor word 2.
-            let ord = cmp_impl(unsafe { *pa.add(2) }, unsafe { *pb.add(2) }, atoms, exact);
+            let ord = cmp_impl(unsafe { *pa.add(2) }, unsafe { *pb.add(2) }, ctx);
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -867,12 +960,12 @@ unsafe fn cmp_funs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Orderi
                 return ord;
             }
             // SAFETY: both operands are live local-kind funs (see the fn docs).
-            unsafe { cmp_fun_env(pa, pb, ha, hb, atoms, exact) }
+            unsafe { cmp_fun_env(pa, pb, ha, hb, ctx) }
         }
         // The C's local-fun entry fields the wire format also carries.
         FunKind::Imported => {
             // SAFETY: an imported fun's descriptor word 1 holds its module atom.
-            let ord = cmp_impl(unsafe { *pa.add(1) }, unsafe { *pb.add(1) }, atoms, exact);
+            let ord = cmp_impl(unsafe { *pa.add(1) }, unsafe { *pb.add(1) }, ctx);
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -889,7 +982,7 @@ unsafe fn cmp_funs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Orderi
                 return ord;
             }
             // SAFETY: both operands are live local-kind funs (see the fn docs).
-            unsafe { cmp_fun_env(pa, pb, ha, hb, atoms, exact) }
+            unsafe { cmp_fun_env(pa, pb, ha, hb, ctx) }
         }
     }
 }
@@ -906,8 +999,7 @@ unsafe fn cmp_fun_env(
     pb: *mut Eterm,
     ha: Eterm,
     hb: Eterm,
-    atoms: &AtomTable,
-    exact: bool,
+    ctx: CmpCtx<'_>,
 ) -> Ordering {
     let (na, nb) = (fun_num_free(ha), fun_num_free(hb));
     let ord = na.cmp(&nb);
@@ -920,15 +1012,14 @@ unsafe fn cmp_fun_env(
     );
     for i in 0..na {
         // SAFETY: environment word `i` of each live fun (both have `na` of them).
-        let (ea, eb) = unsafe { (*pa.add(oa + i), *pb.add(ob + i)) };
-        let ord = cmp_impl(ea, eb, atoms, exact);
+        let (ea, eb) = unsafe { (*pa.add(i + oa), *pb.add(i + ob)) };
+        let ord = cmp_impl(ea, eb, ctx);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
 }
-
 /// The documented deterministic fallback for classes without a faithful
 /// layout-aware comparison: order by object arity, then by the raw term word.
 ///

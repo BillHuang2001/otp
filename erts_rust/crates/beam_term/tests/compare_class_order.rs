@@ -53,7 +53,17 @@
 //! 5. [`internal_and_external_boundary_pairs`] — the six mixed internal/external
 //!    pairings (`utils.c`'s `pid_common`/`ref_common` arms and its `mixed_types`
 //!    fallbacks).
-//! 6. [`oracle_agrees_on_the_cross_class_ladder`] — the crate-local **system-`erl`
+//! 6. **The local-node-aware mixed arms** (sections 6 below) — the whole reason
+//!    [`cmp_with_local_node`]/[`cmp_arith_with_local_node`] exist: a mixed
+//!    internal/external `pid`/`port`/`ref` pair compared **field by field** with the
+//!    local node supplied (serial → number → node; port node only; ref node → ids),
+//!    both operand orders, plus the proof that the context changes nothing else.
+//! 7. [`oracle_agrees_on_the_mixed_internal_external_pairs`] and its siblings — the
+//!    same field precedences pinned on the real runtime, plus what the oracle does
+//!    with a crafted **local-node** external pid/ref (`binary_to_term/1` demotes it
+//!    to the internal form — detected through `erts_debug:size/1` — while a differing
+//!    `creation` keeps it external).
+//! 8. [`oracle_agrees_on_the_cross_class_ladder`] — the crate-local **system-`erl`
 //!    oracle cross-check (the same text-protocol convention as `tests/oracle.rs` and
 //!    `tests/compare_external.rs`): the real runtime builds one term per rung
 //!    (external things by decoding hand-written ETF with `binary_to_term/1`, the
@@ -71,14 +81,16 @@
 //! cases all jump to `pid_common` (`utils.c:1777`) or `ref_common` (`:2262`),
 //! reached from the external cases at `:2212`/`:2235`/`:2288`; both compare the
 //! fields — `serial`, `number`, then `CMP_NODES` (sysname atom, then `creation`)
-//! — so the *node names decide*, not the ranks. `cmp_impl` instead compares those
-//! pairs by [`class_rank`] (`external_*` below `*`). The two rules agree whenever the
-//! foreign sysname sorts before the local one, which is why every external sample
-//! here uses [`ANODE`] (`anode@ahost` < the oracle's `nonode@nohost`). That is a
-//! genuine (pre-existing, out-of-scope) divergence for other node/field values and is
-//! reported to the parent node rather than changed here: this file changes **no**
-//! comparison behaviour.
-
+//! — so the *node names decide*, not the ranks.
+//!
+//! Section 5 below pins those six pairings under the **context-free** `cmp`, which
+//! compares them by [`class_rank`] (`external_*` below `*`); with [`ANODE`] sorting
+//! before the local node the two rules happen to agree, which is why those samples
+//! pass either way. `cmp` keeps the ladder deliberately: an internal word carries no
+//! node, so without one there is nothing to substitute for `erts_this_node`.
+//! [`cmp_with_local_node`] is the entry point that *does* have the node; sections 6
+//! and 7 pin its field-by-field arms, and [`the_local_node_context_changes_nothing_else`]
+//! proves it agrees with `cmp` on every other pair.
 use std::cmp::Ordering;
 use std::process::Command;
 use std::sync::mpsc;
@@ -99,9 +111,24 @@ const ERL_TIMEOUT: Duration = Duration::from_secs(30);
 /// rank — see the module docs.
 const ANODE: &str = "anode@ahost";
 
-/// Every atom name the [`AtomTable`] must know.
-const ATOM_NAMES: &[&str] = &["a", "b", "mymod", "myrec", ANODE];
+/// The real runtime's own sysname (`node()` under `erl -noshell`), i.e. the node a
+/// [`LocalNodeId`] names when the mixed arms are pinned on the oracle.
+const LOCAL_SYSNAME: &str = "nonode@nohost";
 
+/// A foreign sysname sorting **after** [`LOCAL_SYSNAME`] (`z` > `n`), so a mixed pair
+/// whose node is the only difference orders *against* the class ladder.
+const ZNODE: &str = "zzz@zzz";
+
+/// Every atom name the [`AtomTable`] must know.
+const ATOM_NAMES: &[&str] = &[
+    "a",
+    "b",
+    "mymod",
+    "myrec",
+    ANODE,
+    LOCAL_SYSNAME,
+    ZNODE,
+];
 // ETF tags — `erts/emulator/beam/external.h`.
 /// `VERSION_MAGIC`, the byte `binary_to_term/1` requires first.
 const VERSION_MAGIC: u8 = 131;
@@ -527,10 +554,10 @@ fn a_refc_binary_is_a_bitstring_and_the_raw_bin_ref_word_sorts_last() {
 /// there and compares the node (and `serial`/`number`) first, while `cmp_impl`
 /// uses [`class_rank`] — see the module docs' note; with [`ANODE`] sorting before
 /// the local node both rules give the same verdict, which is what these samples
-/// assert.
+/// assert. The node-aware entry point that *does* compare those fields is pinned by
+/// sections 6 and 7.
 #[test]
-fn internal_and_external_boundary_pairs() {
-    let table = atoms();
+fn internal_and_external_boundary_pairs() {    let table = atoms();
     let mut heap = Heap::new(256);
     let rungs = ladder(&mut heap, &table);
     let find = |name: &str| {
@@ -573,9 +600,394 @@ fn internal_and_external_boundary_pairs() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. oracle cross-check
+// 6. the local-node-aware mixed internal/external arms
 // ---------------------------------------------------------------------------
 
+/// The local node every mixed-arm pin supplies: the oracle's own sysname with
+/// `creation` 0 (what `term_to_binary/1` of a local pid carries under `-noshell`, see
+/// [`the_oracle_demotes_a_local_node_pid_and_honours_a_foreign_creation`]).
+fn local_node(table: &AtomTable) -> LocalNodeId {
+    LocalNodeId::new(node_atom(table, LOCAL_SYSNAME), 0)
+}
+
+/// The atom term of the sysname `name` (a seeded atom).
+fn node_atom(table: &AtomTable, name: &str) -> Eterm {
+    make_atom(table.lookup(name).expect("seeded sysname atom"))
+}
+
+/// An external pid term for `node` — `write_external_pid` over `heap`.
+fn ext_pid(
+    heap: &mut Heap,
+    table: &AtomTable,
+    node: &str,
+    number: u32,
+    serial: u32,
+    creation: u32,
+) -> Eterm {
+    // SAFETY: `heap` hands out `external_pid_size_words()` (4) exclusively-owned,
+    // writable words and `write_external_pid` writes all of them. The heap never
+    // reallocates, so the returned term stays live (and unmoved) with it.
+    unsafe {
+        let hp = heap
+            .alloc_words(external_pid_size_words())
+            .expect("heap room");
+        write_external_pid(hp, node_atom(table, node), number, serial, creation)
+    }
+}
+
+/// An external port term for `node` — `write_external_port` over `heap`.
+fn ext_port(
+    heap: &mut Heap,
+    table: &AtomTable,
+    node: &str,
+    number: u64,
+    creation: u32,
+) -> Eterm {
+    // SAFETY: as `ext_pid` — `external_port_size_words()` (4) writable words, all
+    // written by `write_external_port`.
+    unsafe {
+        let hp = heap
+            .alloc_words(external_port_size_words())
+            .expect("heap room");
+        write_external_port(hp, node_atom(table, node), number, creation)
+    }
+}
+
+/// An external reference term for `node` with the given ids — `write_external_ref`
+/// over `heap`.
+fn ext_ref(heap: &mut Heap, table: &AtomTable, node: &str, ids: &[u32], creation: u32) -> Eterm {
+    // SAFETY: as `ext_pid` — `external_ref_size_words(ids.len())` writable words, all
+    // written by `write_external_ref`.
+    unsafe {
+        let hp = heap
+            .alloc_words(external_ref_size_words(ids.len()))
+            .expect("heap room");
+        write_external_ref(hp, node_atom(table, node), ids, creation)
+    }
+}
+
+/// An internal pid for `<num.ser>` — `make_pid_data` + `make_internal_pid`.
+fn int_pid(serial: u64, number: u64) -> Eterm {
+    make_internal_pid(make_pid_data(serial, number))
+}
+
+/// An internal port for `#Port<num>`.
+fn int_port(number: u64) -> Eterm {
+    make_internal_port(make_port_data(number))
+}
+
+/// An internal (M1) reference carrying the single 60-bit `id` — the sanctioned
+/// [`write_internal_ref`] writer, never hand-written words.
+fn int_ref(heap: &mut Heap, id: u64) -> Eterm {
+    // SAFETY: `heap` hands out `INTERNAL_REF_WORDS` (4) exclusively-owned, writable
+    // words; the writer fills all of them.
+    unsafe {
+        let hp = heap.alloc_words(INTERNAL_REF_WORDS).expect("heap room");
+        write_internal_ref(hp, id).expect("the id fits a small")
+    }
+}
+
+/// A mixed pid pair is decided by `serial`, then `number`, then the node — the C's
+/// `pid_common` (`utils.c:1777-1811`), reached from the internal/external cases at
+/// `:1766-1775`/`:2212-2217`. Each step is pinned with a node that would decide the
+/// other way, so a wrong field order cannot slip through.
+#[test]
+fn mixed_pids_compare_serial_then_number_then_the_node() {
+    let table = atoms();
+    let mut heap = Heap::new(64);
+    let local = local_node(&table);
+    // <0.5.1>: number 5, serial 1.
+    let pid = int_pid(1, 5);
+
+    // (1) serial first: serial 1 > 0 decides, although 'anode@ahost' < 'nonode@nohost'.
+    let serial_differs = ext_pid(&mut heap, &table, ANODE, 0, 0, 0);
+    assert_eq!(
+        cmp_with_local_node(pid, serial_differs, local, &table),
+        Ordering::Greater,
+        "serial is compared before the node",
+    );
+    // (2) number next: 5 < 9 decides, although 'anode@ahost' < 'nonode@nohost'.
+    let number_differs = ext_pid(&mut heap, &table, ANODE, 9, 1, 0);
+    assert_eq!(
+        cmp_with_local_node(pid, number_differs, local, &table),
+        Ordering::Less,
+        "number is compared before the node",
+    );
+    // (3) then the node: with serial and number equal, the sysname decides.
+    let node_before = ext_pid(&mut heap, &table, ANODE, 5, 1, 0);
+    let node_after = ext_pid(&mut heap, &table, ZNODE, 5, 1, 0);
+    assert_eq!(
+        cmp_with_local_node(pid, node_before, local, &table),
+        Ordering::Greater,
+        "equal fields, foreign sysname sorting first ⇒ external pid < internal pid",
+    );
+    assert_eq!(
+        cmp_with_local_node(pid, node_after, local, &table),
+        Ordering::Less,
+        "equal fields, foreign sysname sorting last ⇒ internal pid < external pid",
+    );
+    // (4) the node's `creation` is the node's last field (`CMP_NODES`).
+    let creation_after = ext_pid(&mut heap, &table, LOCAL_SYSNAME, 5, 1, 1);
+    assert_eq!(
+        cmp_with_local_node(pid, creation_after, local, &table),
+        Ordering::Less,
+        "same sysname, later creation ⇒ internal pid < external pid",
+    );
+    // (5) same node, same serial, same number ⇒ `Equal` (the C's `CMP_NODES` no-op
+    // followed by `pop_next`).
+    let same_node = ext_pid(&mut heap, &table, LOCAL_SYSNAME, 5, 1, 0);
+    assert_eq!(
+        cmp_with_local_node(pid, same_node, local, &table),
+        Ordering::Equal,
+    );
+    assert!(cmp_arith_with_local_node(pid, same_node, local, &table).is_eq());
+
+    // Every arm is antisymmetric — the reversed operand order is the reversed verdict.
+    for (ext, expected) in [
+        (serial_differs, Ordering::Less),
+        (number_differs, Ordering::Greater),
+        (node_before, Ordering::Less),
+        (node_after, Ordering::Greater),
+        (creation_after, Ordering::Greater),
+        (same_node, Ordering::Equal),
+    ] {
+        assert_eq!(
+            cmp_with_local_node(ext, pid, local, &table),
+            expected,
+            "reversed operand order",
+        );
+        assert_eq!(
+            cmp_arith_with_local_node(ext, pid, local, &table),
+            expected,
+            "reversed operand order (arithmetic)",
+        );
+    }
+}/// A mixed port pair is decided by the **node alone**: the C never compares the port
+/// numbers (`utils.c:1751-1764` internal-first, `:2219-2233` external-first), so a
+/// foreign port with a *larger* number still sorts below a local one whose node sorts
+/// after it. Pinned on the oracle by
+/// [`oracle_agrees_on_the_mixed_internal_external_pairs`].
+///
+/// The same-node case is unreachable in the C (it raises
+/// `ERTS_INTERNAL_ERROR("different nodes compared equal")`); this crate's documented
+/// convention compares the two port numbers there, so the relation stays total.
+#[test]
+fn mixed_ports_compare_the_node_only() {
+    let table = atoms();
+    let mut heap = Heap::new(64);
+    let local = local_node(&table);
+    // #Port<5>.
+    let port = int_port(5);
+
+    // The number 999 is *ignored*: 'anode@ahost' < 'nonode@nohost' decides alone.
+    let big_number_before = ext_port(&mut heap, &table, ANODE, 999, 0);
+    let small_number_before = ext_port(&mut heap, &table, ANODE, 0, 0);
+    for ext in [big_number_before, small_number_before] {
+        assert_eq!(
+            cmp_with_local_node(port, ext, local, &table),
+            Ordering::Greater,
+            "a foreign port before the local node sorts first, whatever its number",
+        );
+        assert_eq!(
+            cmp_with_local_node(ext, port, local, &table),
+            Ordering::Less,
+        );
+    }
+    // The last node: the local port sorts first even against number 0.
+    let after = ext_port(&mut heap, &table, ZNODE, 0, 0);
+    assert_eq!(
+        cmp_with_local_node(port, after, local, &table),
+        Ordering::Less,
+    );
+    // A later creation at the same sysname is a later node.
+    let later_creation = ext_port(&mut heap, &table, LOCAL_SYSNAME, 0, 2);
+    assert_eq!(
+        cmp_with_local_node(port, later_creation, local, &table),
+        Ordering::Less,
+    );
+
+    // The documented same-node convention: the port numbers decide, and only then.
+    let same_node_bigger = ext_port(&mut heap, &table, LOCAL_SYSNAME, 999, 0);
+    let same_node_smaller = ext_port(&mut heap, &table, LOCAL_SYSNAME, 3, 0);
+    assert_eq!(
+        cmp_with_local_node(port, same_node_bigger, local, &table),
+        Ordering::Less,
+        "same node: 5 < 999 by the documented convention",
+    );
+    assert_eq!(
+        cmp_with_local_node(port, same_node_smaller, local, &table),
+        Ordering::Greater,
+    );
+    let same = ext_port(&mut heap, &table, LOCAL_SYSNAME, 5, 0);
+    assert_eq!(cmp_with_local_node(port, same, local, &table), Ordering::Equal);
+}
+
+/// A mixed reference pair is decided by the node first, then by the ids as one big
+/// integer — the C's `ref_common` (`utils.c:2239-2287`), reached from the
+/// internal-first case at `:2239-2260` and the external-first one at `:2288-2308`.
+///
+/// This tree's M1 internal reference carries its whole identity as one 60-bit id
+/// ([`write_internal_ref`]/[`internal_ref_id`]), expressed as the id array
+/// `[id as u32, (id >> 32) as u32]` — low word at index 0, high word at index 1, i.e.
+/// the id's numeric value in the little-index order ERTS stores its own ref numbers in
+/// (index `len - 1` most significant).
+#[test]
+fn mixed_refs_compare_the_node_then_the_ids() {
+    let table = atoms();
+    let mut heap = Heap::new(128);
+    let local = local_node(&table);
+    let reference = int_ref(&mut heap, 5); // ids [5, 0]
+
+    // The node decides first — even against maximal foreign ids.
+    let max_ids_before = ext_ref(&mut heap, &table, ANODE, &[u32::MAX; 3], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, max_ids_before, local, &table),
+        Ordering::Greater,
+        "the node is compared before the ids",
+    );
+    let zero_ids_after = ext_ref(&mut heap, &table, ZNODE, &[0, 0, 0], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, zero_ids_after, local, &table),
+        Ordering::Less,
+    );
+    assert_eq!(
+        cmp_with_local_node(max_ids_before, reference, local, &table),
+        Ordering::Less,
+    );
+
+    // At the same node the ids decide, highest index (most significant) first.
+    let same_ids = ext_ref(&mut heap, &table, LOCAL_SYSNAME, &[5, 0], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, same_ids, local, &table),
+        Ordering::Equal,
+        "same node, same ids ⇒ Equal",
+    );
+    let low_word_after = ext_ref(&mut heap, &table, LOCAL_SYSNAME, &[6, 0], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, low_word_after, local, &table),
+        Ordering::Less,
+    );
+    let high_word_after = ext_ref(&mut heap, &table, LOCAL_SYSNAME, &[5, 1], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, high_word_after, local, &table),
+        Ordering::Less,
+        "the high id word is the more significant one",
+    );
+    let low_word_before = ext_ref(&mut heap, &table, LOCAL_SYSNAME, &[4], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, low_word_before, local, &table),
+        Ordering::Greater,
+    );
+    // Zero-trimming: a longer foreign slice whose leading (highest-index) ids are zero
+    // is the *same* integer as `[5]`, so it compares Equal to the internal `[5, 0]`.
+    let trimmed = ext_ref(&mut heap, &table, LOCAL_SYSNAME, &[5, 0, 0, 0], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, trimmed, local, &table),
+        Ordering::Equal,
+        "leading zero ids are trimmed before comparing",
+    );
+    // …while a non-zero leading id on the longer side decides immediately.
+    let longer_nonzero = ext_ref(&mut heap, &table, LOCAL_SYSNAME, &[5, 0, 1], 0);
+    assert_eq!(
+        cmp_with_local_node(reference, longer_nonzero, local, &table),
+        Ordering::Less,
+        "a non-zero leading id makes the longer slice the greater one",
+    );
+}
+
+/// Without a [`LocalNodeId`] there is nothing to substitute for `erts_this_node`, so
+/// the **context-free** [`cmp`]/[`cmp_arith`] keep the class-ladder convention for a
+/// mixed internal/external pair — [`class_rank`] (`external_*` below `*`), regardless of
+/// nodes, serials or numbers. This is the documented no-context behaviour, and the
+/// reason the node-aware entry points exist.
+#[test]
+fn mixed_pairs_without_a_local_node_keep_the_class_ladder() {
+    let table = atoms();
+    let mut heap = Heap::new(128);
+    let pid = int_pid(1, 5);
+    let port = int_port(5);
+    let reference = int_ref(&mut heap, 5);
+
+    // The very samples a local node would decide the *other* way (ZNODE sorts after
+    // `nonode@nohost`, and the ports' numbers are ignored): rank says `external_*` <
+    // `*` in every one of them, in both modes and both operand orders.
+    let after_pid = ext_pid(&mut heap, &table, ZNODE, 5, 1, 0);
+    let after_port = ext_port(&mut heap, &table, ZNODE, 0, 0);
+    let before_ref = ext_ref(&mut heap, &table, ANODE, &[u32::MAX; 3], 0);
+    for (ext, internal) in [
+        (after_pid, pid),
+        (after_port, port),
+        (before_ref, reference),
+    ] {
+        assert_eq!(cmp(ext, internal, &table), Ordering::Less);
+        assert_eq!(cmp(internal, ext, &table), Ordering::Greater);
+        assert_eq!(cmp_arith(ext, internal, &table), Ordering::Less);
+        assert!(!eq(ext, internal, &table));
+    }
+}
+
+/// The local-node context is **additive**: it changes nothing outside the three mixed
+/// arms. Every pair of the 18-rung ladder — including the ladder's own mixed
+/// internal/external pid/port/ref pairs, whose node (`ANODE`) sorts before the local
+/// one so both rules agree — gets exactly the same verdict from
+/// [`cmp_with_local_node`]/[`cmp_arith_with_local_node`] as from [`cmp`]/[`cmp_arith`].
+#[test]
+fn the_local_node_context_changes_nothing_else() {
+    let table = atoms();
+    let mut heap = Heap::new(256);
+    let rungs = ladder(&mut heap, &table);
+    let local = local_node(&table);
+    for i in 0..rungs.len() {
+        for j in 0..rungs.len() {
+            let (x, y) = (rungs[i], rungs[j]);
+            assert_eq!(
+                cmp_with_local_node(x.1, y.1, local, &table),
+                cmp(x.1, y.1, &table),
+                "cmp({}, {}) must not depend on the local node",
+                x.0,
+                y.0,
+            );
+            assert_eq!(
+                cmp_arith_with_local_node(x.1, y.1, local, &table),
+                cmp_arith(x.1, y.1, &table),
+                "cmp_arith({}, {}) must not depend on the local node",
+                x.0,
+                y.0,
+            );
+        }
+    }
+}
+
+/// A non-term word is handled exactly as before on the node-aware entry points too
+/// (the [`is_term_word`] guard runs first, so nothing is dereferenced and the relation
+/// stays total): a non-term sorts after every term and two non-terms order by word.
+#[test]
+fn the_local_node_entry_points_still_guard_non_terms() {
+    let table = atoms();
+    let local = local_node(&table);
+    let non_value = THE_NON_VALUE;
+    let pid = int_pid(0, 0);
+    assert_eq!(
+        cmp_with_local_node(non_value, pid, local, &table),
+        Ordering::Greater,
+    );
+    assert_eq!(
+        cmp_with_local_node(pid, non_value, local, &table),
+        Ordering::Less,
+    );
+    assert_eq!(
+        cmp_with_local_node(non_value, non_value, local, &table),
+        Ordering::Equal,
+    );
+    assert_eq!(
+        cmp_arith_with_local_node(non_value, pid, local, &table),
+        Ordering::Greater,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. oracle cross-check
+// ---------------------------------------------------------------------------
 /// Runs `<expr>, halt(0).` under the system `erl` and returns its stdout.
 ///
 /// Returns `None` — after printing a clear skip message — when `erl` cannot be
@@ -649,10 +1061,30 @@ fn parse_bools(s: &str) -> Vec<bool> {
         .collect()
 }
 
+/// Parses a flat Erlang list of non-negative integers printed with `~w`, e.g.
+/// `[0,4]`, into a `Vec<u64>`.
+fn parse_ints(s: &str) -> Vec<u64> {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("expected an Erlang integer list, got {s:?}"));
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|tok| {
+            tok.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("expected an oracle integer, got {tok:?}"))
+        })
+        .collect()
+}
+
 /// Appends an `ATOM_EXT` (latin1, 16-bit length) atom to `out`.
 fn etf_atom(out: &mut Vec<u8>, name: &str) {
-    let bytes = name.as_bytes();
-    assert!(bytes.len() <= u16::MAX as usize, "atom name too long");
+    let bytes = name.as_bytes();    assert!(bytes.len() <= u16::MAX as usize, "atom name too long");
     out.push(ATOM_EXT);
     out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
     out.extend_from_slice(bytes);
@@ -662,11 +1094,19 @@ fn etf_atom(out: &mut Vec<u8>, name: &str) {
 /// `ref_words` u32 ids (`external.c:3610-3624`). Decoding it yields an **external**
 /// reference because [`ANODE`] is not the oracle's own node.
 fn external_ref_etf() -> Vec<u8> {
-    let ids: [u32; 3] = [0, 0, 1];
+    external_ref_etf_for(ANODE, &[0, 0, 1], 3)
+}
+
+/// [`external_ref_etf`] for an arbitrary node, id array and `creation`.
+///
+/// A ref whose sysname **and** creation are the oracle's own is *demoted* to the
+/// internal form by `binary_to_term/1` (`dec_is_this_node`, `external.c:3124-3129`,
+/// `:3170-3175`) — see [`the_oracle_compares_local_node_refs_by_their_ids`].
+fn external_ref_etf_for(node: &str, ids: &[u32], creation: u32) -> Vec<u8> {
     let mut out = vec![VERSION_MAGIC, NEWER_REFERENCE_EXT];
     out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
-    etf_atom(&mut out, ANODE);
-    out.extend_from_slice(&3u32.to_be_bytes()); // creation
+    etf_atom(&mut out, node);
+    out.extend_from_slice(&creation.to_be_bytes());
     for id in ids {
         out.extend_from_slice(&id.to_be_bytes());
     }
@@ -676,24 +1116,37 @@ fn external_ref_etf() -> Vec<u8> {
 /// `V4_PORT_EXT`: tag, sysname atom, `num:64`, `creation:32`
 /// (`external.c:3670-3701`).
 fn external_port_etf() -> Vec<u8> {
+    external_port_etf_for(ANODE, 0, 0)
+}
+
+/// [`external_port_etf`] for an arbitrary node, number and `creation`.
+fn external_port_etf_for(node: &str, number: u64, creation: u32) -> Vec<u8> {
     let mut out = vec![VERSION_MAGIC, V4_PORT_EXT];
-    etf_atom(&mut out, ANODE);
-    out.extend_from_slice(&0u64.to_be_bytes()); // number
-    out.extend_from_slice(&0u32.to_be_bytes()); // creation
+    etf_atom(&mut out, node);
+    out.extend_from_slice(&number.to_be_bytes());
+    out.extend_from_slice(&creation.to_be_bytes());
     out
 }
 
 /// `NEW_PID_EXT`: tag, sysname atom, `num:32`, `serial:32`, `creation:32`
 /// (`external.c:2998-3021`).
 fn external_pid_etf() -> Vec<u8> {
-    let mut out = vec![VERSION_MAGIC, NEW_PID_EXT];
-    etf_atom(&mut out, ANODE);
-    out.extend_from_slice(&0u32.to_be_bytes()); // number
-    out.extend_from_slice(&0u32.to_be_bytes()); // serial
-    out.extend_from_slice(&0u32.to_be_bytes()); // creation
-    out
+    external_pid_etf_for(ANODE, 0, 0, 0)
 }
 
+/// [`external_pid_etf`] for an arbitrary node, number, serial and `creation`.
+///
+/// A pid whose sysname **and** creation are the oracle's own is *demoted* to the
+/// internal form by `binary_to_term/1` (`dec_pid`, `external.c:3164-3175`) — see
+/// [`the_oracle_demotes_a_local_node_pid_and_honours_a_foreign_creation`].
+fn external_pid_etf_for(node: &str, number: u32, serial: u32, creation: u32) -> Vec<u8> {
+    let mut out = vec![VERSION_MAGIC, NEW_PID_EXT];
+    etf_atom(&mut out, node);
+    out.extend_from_slice(&number.to_be_bytes());
+    out.extend_from_slice(&serial.to_be_bytes());
+    out.extend_from_slice(&creation.to_be_bytes());
+    out
+}
 /// `binary_to_term(<<…>>)` over `bytes`.
 fn binary_to_term_expr(bytes: &[u8]) -> String {
     let list: Vec<String> = bytes.iter().map(u8::to_string).collect();
@@ -732,6 +1185,219 @@ fn oracle_expr(name: &str) -> Option<String> {
     })
 }
 
+/// One mixed-pair pin: the two Rust terms, the `-eval` expressions that build the same
+/// two terms in the real runtime, and the verdict both sides must reach.
+struct MixedCase {
+    /// The case's name, for assertion messages.
+    label: &'static str,
+    /// The Rust-side `a` operand.
+    a: Eterm,
+    /// The Rust-side `b` operand.
+    b: Eterm,
+    /// The oracle expression that builds `a`.
+    expr_a: String,
+    /// The oracle expression that builds `b`.
+    expr_b: String,
+    /// The verdict `cmp_with_local_node(a, b, local)` must return.
+    expected: Ordering,
+}
+
+/// The real runtime agrees with [`cmp_with_local_node`]/
+/// [`cmp_arith_with_local_node`] on every mixed internal/external `pid`/`port`/`ref`
+/// arm: `serial` before `number` before the node for a pid, the node **only** for a
+/// port, the node before the ids for a reference, in both operand orders. Every case is
+/// built so a wrong field order gives the opposite verdict. Skipped loudly when `erl` is
+/// unavailable.
+#[test]
+fn oracle_agrees_on_the_mixed_internal_external_pairs() {
+    let table = atoms();
+    let mut heap = Heap::new(256);
+    let local = local_node(&table);
+    // The internal samples, matching the oracle's `<0.5.1>` and `#Port<0.5>`/`make_ref()`.
+    let pid = int_pid(1, 5);
+    let port = int_port(5);
+    let reference = int_ref(&mut heap, 7);
+    let list_to_pid = "erlang:list_to_pid(\"<0.5.1>\")".to_string();
+    let list_to_port = "erlang:list_to_port(\"#Port<0.5>\")".to_string();
+    let make_ref = "make_ref()".to_string();
+
+    let mut cases = Vec::new();
+    // (serial decides before the node: serial 1 > 0 although 'anode@ahost' < local.)
+    // Number decides before the node: 5 < 9 although 'anode@ahost' < local. Equal
+    // serial and number: the sysname decides, both ways round the local node. And the
+    // node's own `creation` is its last field.
+    for (label, node, number, serial, creation, expected) in [
+        (
+            "pid/serial-before-node",
+            ANODE,
+            0u32,
+            0u32,
+            0u32,
+            Ordering::Greater,
+        ),
+        ("pid/number-before-node", ANODE, 9, 1, 0, Ordering::Less),
+        ("pid/node-before", ANODE, 5, 1, 0, Ordering::Greater),
+        ("pid/node-after", ZNODE, 5, 1, 0, Ordering::Less),
+        ("pid/creation-after", LOCAL_SYSNAME, 5, 1, 1, Ordering::Less),
+    ] {
+        cases.push(MixedCase {
+            label,
+            a: pid,
+            b: ext_pid(&mut heap, &table, node, number, serial, creation),
+            expr_a: list_to_pid.clone(),
+            expr_b: binary_to_term_expr(&external_pid_etf_for(node, number, serial, creation)),
+            expected,
+        });
+    }    // The node is the *only* field a mixed port pair compares: number 999 is ignored.
+    for (label, node, number, expected) in [
+        ("port/node-before", ANODE, 999u64, Ordering::Greater),
+        ("port/node-after", ZNODE, 0, Ordering::Less),
+    ] {
+        cases.push(MixedCase {
+            label,
+            a: port,
+            b: ext_port(&mut heap, &table, node, number, 0),
+            expr_a: list_to_port.clone(),
+            expr_b: binary_to_term_expr(&external_port_etf_for(node, number, 0)),
+            expected,
+        });
+    }
+    // The node decides before the ids — even against maximal foreign ones.
+    for (label, node, ids, expected) in [
+        ("ref/node-before", ANODE, vec![u32::MAX; 3], Ordering::Greater),
+        ("ref/node-after", ZNODE, vec![0, 0, 0], Ordering::Less),
+    ] {
+        cases.push(MixedCase {
+            label,
+            a: reference,
+            b: ext_ref(&mut heap, &table, node, &ids, 0),
+            expr_a: make_ref.clone(),
+            expr_b: binary_to_term_expr(&external_ref_etf_for(node, &ids, 0)),
+            expected,
+        });
+    }
+
+    // One binding pair per case plus four booleans: `=:=`, `<`, `>`, and `<` reversed.
+    let assigns: Vec<String> = cases
+        .iter()
+        .enumerate()
+        .flat_map(|(i, c)| [format!("A{i} = {}", c.expr_a), format!("B{i} = {}", c.expr_b)])
+        .collect();
+    let checks: Vec<String> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("[A{i} =:= B{i}, A{i} < B{i}, A{i} > B{i}, B{i} < A{i}]"))
+        .collect();
+    let expr = format!(
+        "{}, io:format(\"~w\", [lists:flatten([{}])])",
+        assigns.join(", "),
+        checks.join(", "),
+    );
+
+    let Some(out) = erl_stdout(&expr) else {
+        return; // skipped loudly
+    };
+    let bools = parse_bools(&out);
+    assert_eq!(
+        bools.len(),
+        cases.len() * 4,
+        "unexpected oracle output: {out:?}"
+    );
+    for (i, case) in cases.iter().enumerate() {
+        let exact = cmp_with_local_node(case.a, case.b, local, &table);
+        let arith = cmp_arith_with_local_node(case.a, case.b, local, &table);
+        assert_eq!(
+            exact, case.expected,
+            "{}: rust cmp_with_local_node gave {exact:?}",
+            case.label,
+        );
+        assert_eq!(
+            arith, case.expected,
+            "{}: rust cmp_arith_with_local_node gave {arith:?}",
+            case.label,
+        );
+        let oracle = [
+            bools[4 * i],
+            bools[4 * i + 1],
+            bools[4 * i + 2],
+            bools[4 * i + 3],
+        ];
+        assert_eq!(
+            oracle,
+            [
+                exact.is_eq(),
+                arith.is_lt(),
+                arith.is_gt(),
+                arith.is_gt(),
+            ],
+            "{}: oracle {oracle:?} vs rust {arith:?}",
+            case.label,
+        );
+    }
+}
+
+/// What the oracle does with a crafted **local-node** external pid: `binary_to_term/1`
+/// **demotes** it to the internal form (`dec_is_this_node`, `external.c:3124-3129`,
+/// `:3164-3175`), so it is `=:=` the internal pid with the same number and serial — and
+/// an internal pid is an immediate, which `erts_debug:size/1` reports as **0** words
+/// while the kept-external variant (a differing `creation`) is a 4-word thing.
+///
+/// That is why the same-node mixed arm is unreachable in ERTS: an external pid for
+/// *this* node cannot exist in its memory, so `pid_common` never has to compare equal
+/// nodes (and this crate's same-node ⇒ `Equal` is the C's `CMP_NODES` no-op falling
+/// through to `pop_next`).
+#[test]
+fn the_oracle_demotes_a_local_node_pid_and_honours_a_foreign_creation() {
+    let local_image = external_pid_etf_for(LOCAL_SYSNAME, 5, 1, 0);
+    let later_creation = external_pid_etf_for(LOCAL_SYSNAME, 5, 1, 7);
+    let setup = format!(
+        "L = erlang:list_to_pid(\"<0.5.1>\"), D = {}, E7 = {}",
+        binary_to_term_expr(&local_image),
+        binary_to_term_expr(&later_creation),
+    );
+
+    let Some(out) = erl_stdout(&format!(
+        "{setup}, io:format(\"~w\", [[D =:= L, E7 =:= L, E7 < L, L < E7]])",
+    )) else {
+        return; // skipped loudly
+    };
+    let bools = parse_bools(&out);
+    assert_eq!(bools.len(), 4, "unexpected oracle output: {out:?}");
+    // Demoted ⇒ exactly the internal pid; a later creation is a *later* node, so the
+    // local pid sorts first.
+    assert_eq!(bools, [true, false, false, true]);
+
+    let Some(out) = erl_stdout(&format!(
+        "{setup}, io:format(\"~w\", [[erts_debug:size(D), erts_debug:size(E7)]])",
+    )) else {
+        return; // skipped loudly
+    };
+    // 0 words = an internal pid *immediate* (demoted); 4 words = the external thing.
+    assert_eq!(parse_ints(&out), [0, 4], "unexpected oracle output: {out:?}");
+}
+
+/// A crafted external reference at the **local** node is demoted to the internal form
+/// too (`dec_is_this_node`, `external.c:3124-3129`), so its ids are compared by the same
+/// big-integer rule at the same node — index `len - 1` most significant. The ids
+/// `[1,2,3]` and `[1,2,4]` differ only in the **highest** index, which decides.
+#[test]
+fn the_oracle_compares_local_node_refs_by_their_ids() {
+    let r1 = external_ref_etf_for(LOCAL_SYSNAME, &[1, 2, 3], 0);
+    let r2 = external_ref_etf_for(LOCAL_SYSNAME, &[1, 2, 4], 0);
+    let expr = format!(
+        "R1 = {a}, R2 = {b}, R3 = {c}, io:format(\"~w\", [[R1 =:= R2, R1 < R2, R1 > R2, R1 =:= R3]])",
+        a = binary_to_term_expr(&r1),
+        b = binary_to_term_expr(&r2),
+        c = binary_to_term_expr(&r1),
+    );
+    let Some(out) = erl_stdout(&expr) else {
+        return; // skipped loudly
+    };
+    let bools = parse_bools(&out);
+    // Not equal, and the highest id index decides the order; a re-decode of the same
+    // bytes is `=:=` the first term.
+    assert_eq!(bools, [false, true, false, true], "unexpected: {out:?}");
+}
 /// The real runtime agrees with this crate on the whole class ladder: for every
 /// pair of rungs, `=:=` decides `eq` (the exact `cmp`-is-`Equal` predicate) and
 /// `<`/`>` decide `cmp_arith`. Skipped loudly when `erl` is unavailable.
@@ -740,8 +1406,6 @@ fn oracle_agrees_on_the_cross_class_ladder() {
     let table = atoms();
     let mut heap = Heap::new(256);
     let rungs = ladder(&mut heap, &table);
-
-    // One oracle expression per rung the real runtime can build, in ladder order.
     let oracled: Vec<(usize, String)> = rungs
         .iter()
         .enumerate()
