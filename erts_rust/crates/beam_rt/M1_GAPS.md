@@ -137,7 +137,7 @@ Pinned by `src/context/tests.rs` (`a_bif_container_result_is_moved_onto_the_proc
 `copy_bound/ets_copy`'s peak RSS is linear in N (**94.68 MiB at N = 100 000, ≈99 words per iteration**) — a structural limit of the copy-out above, not of the ETS adopt path: `safe_to_rewind` is `true` for `ets:*` and the pooled heap is rewound, so it tracks BIF calls, not floats and not ETS table state (a float-free ETS loop of the same shape grows identically; a float-carrying churn loop with no ETS is flat).
 The copy-out cannot collect (the machine's x registers / Erlang stack are unpublished at a BIF call), so a full nursery is met by `Process::grow_nursery(hint)` (`src/context/calls.rs::move_result_into_process_heap`) and the retired young space is retained, the capacity accumulating linearly; no real collection is reached (`ensure_heap_full` returns at `!process.should_collect(heap_need)`, its `test_heap` prefixes being tiny against a 233-word default nursery, and `alloc_words_rooted` is never entered).
 The caller-module float guard is not the mover (relaxing it at the two FR-publishing GC doors changes nothing here and contradicts the pinned float-collection contract, `tests/gc_collect.rs`).
-Closing it needs the same two sibling-crate seams as *The BIF-result copy-out*; figures and bisection: `PERF.md` *COPY-OUT-CUT*.
+Closing it needs the same two sibling-crate seams as *The BIF-result copy-out*; figures and bisection: `PERF_DISPATCH.md` *COPY-OUT-CUT*.
 ## Heap switches
 `+hms`/`+hmbs` set `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000`→1598), `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
 ## CLI `run` argument tokens
