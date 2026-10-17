@@ -215,6 +215,7 @@
 
 use beam_common::Result;
 use beam_term::fun::FunKind;
+use beam_term::prelude::try_make_pid_data;
 use beam_term::{atom_val, AtomTable, Eterm, NIL};
 
 use crate::access;
@@ -533,8 +534,10 @@ fn creator_pid_term(ctx: &mut BifContext<'_>, creator: beam_codec::FunPid) -> Re
     let internal = ctx
         .local_node()
         .is_some_and(|(node, creation)| node == creator.node && creation == creator.creation)
-        && u64::from(creator.number) <= beam_process::MAX_PROCESS_NUMBER
-        && u64::from(creator.serial) <= beam_process::MAX_PROCESS_SERIAL;
+        // The wire fields must fit the internal pid immediate before they can be
+        // packed, so the bound comes from `beam_term`'s one checked constructor
+        // rather than a second copy of `ERTS_MAX_INTERNAL_PID_NUMBER`/`_SERIAL`.
+        && try_make_pid_data(u64::from(creator.serial), u64::from(creator.number)).is_ok();
     if internal {
         return Ok(beam_process::ProcessId::new(
             u64::from(creator.number),
